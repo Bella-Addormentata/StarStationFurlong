@@ -19,10 +19,13 @@
  *
  * CONSENT, NOT VALIDATION: a host the viewer accepted can redirect the
  * request, or resolve, into the viewer's own network, and a browser <video>
- * can see neither — so the ask says so, and the node's media proxy (plan
- * §3.4, TODO) is where destinations are checked after DNS and on every
- * redirect. Until it lands, a direct URL is the viewer's own trust decision,
- * made per origin, per session.
+ * can see neither. The redirect half is closed here all the same: before a
+ * consented third-party URL is mounted, a HEAD with `redirect: 'manual'`
+ * shows whether the host redirects (not where), and a URL that does is not
+ * mounted (probeRedirect, below). The DNS half stays the consent's word —
+ * the ask says so — and the node's media proxy (plan §3.4, TODO) is where
+ * destinations are checked after DNS. Until it lands, a direct URL is the
+ * viewer's own trust decision, made per origin, per session.
  *
  * DOM-free: the theatre asks, this answers, and vitest covers the answers.
  */
@@ -108,7 +111,70 @@ export function acceptMediaOrigin(origin: string): void {
 
 export function forgetMediaConsent(): void {
   accepted.clear();
+  redirectVerdicts.clear();
   forgetMountBudget();
+}
+
+// ── The redirect probe ───────────────────────────────────────────────────────
+//
+// A host the viewer accepted can answer the media request with a redirect
+// into the viewer's own network, and a <video> element follows it blind. A
+// media element shows nothing of the chain — but a fetch with
+// `redirect: 'manual'` does show that a redirect HAPPENED: the response comes
+// back as an opaque-redirect (type 'opaqueredirect', status 0), for a
+// non-CORS host too. Where it points stays hidden, and that is enough: the
+// theatre probes a consented third-party URL with a HEAD before it mounts
+// it, and a URL that redirects is not mounted — the viewer is told to paste
+// the final link instead. What this does NOT see is a hostname that
+// RESOLVES into the viewer's network: that stays the consent's word (the
+// ask says so), and the node's media proxy is where destinations are checked
+// after DNS (plan §3.4).
+
+export type RedirectVerdict = 'direct' | 'redirects';
+
+/** What the probe found, per URL, for the session. */
+const redirectVerdicts = new Map<string, RedirectVerdict>();
+
+/** Whether the theatre owes `source` a redirect probe before mounting it: a
+ *  direct URL on an origin the VIEWER accepted (PLAY FROM <host>) — never
+ *  the viewer's own origin, the node's (this machine serving this viewer),
+ *  or a product lane (archive.org's permalinks 302 to its file servers by
+ *  design, and its own origin is the lane). */
+export function needsRedirectProbe(source: TvSource, now = tvNow(), wall = tvWallNow()): boolean {
+  if (source.kind !== 'url') return false;
+  const origin = normalizeOrigin(source.url);
+  if (!origin) return false;
+  if (ownOrigins.has(origin) || origin === trustedNodeMediaOrigin(now, wall) || PRODUCT_ORIGINS.has(origin)) return false;
+  return accepted.has(origin);
+}
+
+/** The probe's verdict for `url`, or null when it has not been probed. */
+export function redirectVerdict(url: string): RedirectVerdict | null {
+  return redirectVerdicts.get(url) ?? null;
+}
+
+/** Probe `url` with a HEAD that follows no redirect and reads no body: an
+ *  opaque-redirect answer is a redirect; anything else — an opaque 200, a
+ *  405 for the HEAD, a host that does not answer at all — is 'direct',
+ *  since nothing about a redirect was learnt and the <video> itself will
+ *  say (RETRY) when the host is down. The verdict is kept for the session.
+ *  `fetchImpl` is injectable for the tests. */
+export async function probeRedirect(url: string, fetchImpl: typeof fetch = fetch, timeoutMs = 8_000): Promise<RedirectVerdict> {
+  const ctl = new AbortController();
+  const deadline = setTimeout(() => ctl.abort(), timeoutMs);
+  let verdict: RedirectVerdict = 'direct';
+  try {
+    const res = await fetchImpl(url, {
+      method: 'HEAD', mode: 'no-cors', redirect: 'manual', cache: 'no-store', credentials: 'omit', signal: ctl.signal,
+    });
+    if (res.type === 'opaqueredirect') verdict = 'redirects';
+  } catch {
+    // unreachable, or the deadline: nothing learnt about a redirect
+  } finally {
+    clearTimeout(deadline);
+  }
+  redirectVerdicts.set(url, verdict);
+  return verdict;
 }
 
 /** Automatic mounts the theatre may make on its own, per set, within the

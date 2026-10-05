@@ -26,7 +26,8 @@ import {
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
 import {
-  acceptMediaOrigin, allowMount, consentRefusal, mayMountNow, mediaConsent, mediaOrigin, TV_MOUNT_BUDGET,
+  acceptMediaOrigin, allowMount, consentRefusal, mayMountNow, mediaConsent, mediaOrigin, needsRedirectProbe, probeRedirect,
+  redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
@@ -331,6 +332,10 @@ interface Theatre {
   /** The helm's flight stick stands aside while the theatre is up
    *  (freeFlightStick.suspendStickKeys): its release, called on close. */
   releaseStick: () => void;
+  /** The mount key whose URL the redirect probe (tvConsent probeRedirect)
+   *  is out for, '' when none: one probe per programme, and its answer is
+   *  read from tvConsent on the tick after it lands. */
+  probing: string;
 }
 
 let theatre: Theatre | null = null;
@@ -478,6 +483,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     opener: focusReturnTarget(),
     playerFor: -1,
     releaseStick,
+    probing: '',
   };
   // The dialog takes focus (Tab then reaches its controls); it goes back on close.
   root.tabIndex = -1;
@@ -682,18 +688,61 @@ function theatreTick(rtt: () => number): void {
     if (consent !== 'ok') {
       showConsentNotice(t, rec.source!, consent);
     } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
-      // Consent per origin bounds nothing cumulative: a modified client
-      // could rotate shape-valid sources on this viewer's own node and have
-      // every open theatre fetch each in turn without end. So a mount this
-      // theatre makes on its own is counted per set (tvConsent
-      // mayMountNow), and past the budget what is on is shown with PLAY —
-      // the press is the consent that mounts it.
-      if (mayMountNow(t.itemId, tvNow())) mountPlayer(t, rec.source!, key, rtt);
-      else showMountNotice(t, rec.source!, key);
+      // A URL on a host the viewer accepted is probed for a redirect before
+      // anything fetches it (tvConsent needsRedirectProbe / probeRedirect):
+      // the host could answer the <video>'s request with a redirect into the
+      // viewer's own network, which the element would follow blind. One
+      // probe per programme; a URL that redirects is not mounted, and the
+      // viewer is told to paste the final link. The viewer's own origins,
+      // the node and the product lanes are not probed.
+      const url = rec.source!.kind === 'url' ? rec.source!.url : '';
+      const verdict = url && needsRedirectProbe(rec.source!) ? redirectVerdict(url) : 'direct';
+      if (verdict === null) {
+        if (t.probing !== key) startRedirectProbe(t, url, key);
+      } else if (verdict === 'redirects') {
+        showRedirectNotice(t, rec.source!, key);
+      } else if (mayMountNow(t.itemId, tvNow())) {
+        // Consent per origin bounds nothing cumulative: a modified client
+        // could rotate shape-valid sources on this viewer's own node and
+        // have every open theatre fetch each in turn without end. So a
+        // mount this theatre makes on its own is counted per set (tvConsent
+        // mayMountNow), and past the budget what is on is shown with PLAY —
+        // the press is the consent that mounts it.
+        mountPlayer(t, rec.source!, key, rtt);
+      } else {
+        showMountNotice(t, rec.source!, key);
+      }
     }
   }
   t.controller?.tick();
   renderTheatreChrome(t);
+}
+
+/** CHECKING THE LINK… — the redirect probe is out for this programme's URL;
+ *  the tick after it lands reads the verdict from tvConsent and mounts, or
+ *  shows why not. A probe that comes back for an earlier programme, or
+ *  after the theatre closed, changes nothing here: its verdict is kept per
+ *  URL all the same. */
+function startRedirectProbe(t: Theatre, url: string, key: string): void {
+  t.probing = key;
+  let host = url;
+  try { host = new URL(url).host; } catch { /* shown as it is */ }
+  showNotice(t, `<div>CHECKING THE LINK</div>
+    <div class="tv-theatre-lane">asking ${escapeHtml(host)} whether it answers this link itself or sends your browser elsewhere</div>`);
+  void probeRedirect(url).finally(() => {
+    if (theatre === t && t.probing === key) t.probing = '';
+  });
+}
+
+/** NOT PLAYED HERE — the host answered the link with a redirect. Where to,
+ *  the browser does not say and this page cannot know; so the link is not
+ *  mounted, whoever pasted it. */
+function showRedirectNotice(t: Theatre, source: TvSource, key: string): void {
+  t.mounted = `failed:${key}`; // nothing to retry: the same URL answers the same way
+  let host = source.kind === 'url' ? source.url : '';
+  try { host = new URL(host).host; } catch { /* shown as it is */ }
+  showNotice(t, `<div>NOT PLAYED HERE</div>
+    <div class="tv-theatre-lane">${escapeHtml(host || 'this host')} answers this link with a redirect, and your browser would follow it without saying where — paste the link it redirects to instead</div>`);
 }
 
 /** PLAY? — the set's automatic mounts for the minute are spent

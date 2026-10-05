@@ -6,7 +6,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   acceptMediaOrigin, allowMount, consentRefusal, forgetMediaConsent, isPrivateHost, mayMountNow, mediaConsent, mediaOrigin,
-  setNodeMediaOrigin, setOwnMediaOrigins, trustedNodeMediaOrigin, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS,
+  needsRedirectProbe, probeRedirect, redirectVerdict, setNodeMediaOrigin, setOwnMediaOrigins, trustedNodeMediaOrigin,
+  TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
@@ -172,5 +173,38 @@ describe('the node origin\'s trust and a sleep', () => {
     // And the other way: a wall clock stepped back cannot revive a trust the monotonic clock has ended.
     expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS, w0 - 3_600_000)).toBe('refuse');
     setNodeMediaOrigin(null, t0, w0);
+  });
+});
+
+describe('the redirect probe before a consented host is mounted', () => {
+  it('is owed only for a URL on an origin the viewer accepted — never the viewer\'s own, the node\'s or a product lane', () => {
+    setOwnMediaOrigins(['http://localhost:4173']);
+    setNodeMediaOrigin('http://127.0.0.1:8080', 1_000);
+    expect(needsRedirectProbe(url('https://example.org/a.mp4'), 1_000)).toBe(false); // not accepted yet: it is asked about, not probed
+    acceptMediaOrigin('https://example.org');
+    expect(needsRedirectProbe(url('https://example.org/a.mp4'), 1_000)).toBe(true);
+    expect(needsRedirectProbe(url('http://localhost:4173/film.mp4'), 1_000)).toBe(false);
+    expect(needsRedirectProbe(url('http://127.0.0.1:8080/blob/abc'), 1_000)).toBe(false);
+    expect(needsRedirectProbe(url('https://archive.org/download/metropolis/a.mp4'), 1_000)).toBe(false); // its permalinks 302 by design
+    expect(needsRedirectProbe({ kind: 'youtube', videoId: 'uPwPecwX2zs' }, 1_000)).toBe(false);
+    setNodeMediaOrigin(null, 1_000);
+  });
+
+  it('reads an opaque redirect as a redirect, any other answer as direct, and a host that does not answer as nothing learnt; the verdict is kept for the session and forgotten with the consents', async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const answering = (type: string) => (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return { type } as Response;
+    }) as typeof fetch;
+    expect(redirectVerdict('https://example.org/a.mp4')).toBeNull();
+    expect(await probeRedirect('https://example.org/a.mp4', answering('opaqueredirect'))).toBe('redirects');
+    expect(redirectVerdict('https://example.org/a.mp4')).toBe('redirects');
+    expect(calls[0]!.init).toMatchObject({ method: 'HEAD', mode: 'no-cors', redirect: 'manual', credentials: 'omit' });
+    expect(await probeRedirect('https://example.org/b.mp4', answering('opaque'))).toBe('direct'); // a non-CORS 200, or a 405 for the HEAD
+    expect(await probeRedirect('https://example.org/c.mp4', answering('basic'))).toBe('direct');
+    const down = (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch;
+    expect(await probeRedirect('https://example.org/d.mp4', down)).toBe('direct'); // the <video> will say so itself
+    forgetMediaConsent();
+    expect(redirectVerdict('https://example.org/a.mp4')).toBeNull();
   });
 });
