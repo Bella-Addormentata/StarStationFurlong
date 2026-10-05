@@ -9,6 +9,8 @@ import { TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync
 import type { TvPlayer } from './tvSync';
 import { TV_HEARTBEAT_MS, TV_NUDGE_RATE } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
+import * as Y from 'yjs';
+import { bindTvDoc, markTvPageAwake, pickUpRemote, setTvClock, setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay } from './tvDoc';
 
 class FakePlayer implements TvPlayer {
   position = 0;
@@ -1050,5 +1052,73 @@ describe('a reading from before this page slept', () => {
     h.set({ positionMs: 10_000 + 3_600_000 + 500, stale: false });
     h.tick();
     expect(p.log.filter((l) => l.startsWith('seek'))).toHaveLength(1);
+  });
+});
+
+describe('a viewer\'s nudge and a stale reading', () => {
+  it('drops the nudge when the reading goes stale: at 1× until a fresh sample says which way', () => {
+    const p = new FakePlayer(true);
+    const h = harness(p);
+    p.position = 10_000;
+    h.set({ positionMs: 10_600 }); // 600 ms behind: speed up
+    h.tick();
+    expect(p.rate).toBeCloseTo(1 + TV_NUDGE_RATE);
+    // Back from an hour's sleep with the holder's lease lapsed: no fresh beat
+    // comes, and the pre-sleep correction must not run on for good.
+    h.set({ positionMs: 10_600 + 3_600_000, stale: true });
+    h.tick(3_600_000);
+    expect(p.rate).toBe(1);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+  });
+});
+
+describe('a paused record past the player\'s end', () => {
+  it('is seeked to once, where the player can reach, and not again every cooldown', () => {
+    const p = new FakePlayer(true);
+    p.duration = 60_000;
+    p.position = 30_000;
+    const h = harness(p);
+    // The holder's +10 s while paused parked the record at 70 s of a 60 s
+    // file (the holder clamps its own player and heartbeats nothing while
+    // paused): the viewer measures against what it can reach.
+    h.set({ state: 'paused', positionMs: 70_000, running: false });
+    h.tick();
+    expect(p.log).toEqual(['seek:60000']);
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log).toEqual(['seek:60000']); // in step with the reachable end: nothing more
+  });
+});
+
+describe('the controller finds a sleep itself (the real record)', () => {
+  it('a viewer whose theatre ticks before the room after a sleep never seeks to the sleep-extrapolated position', () => {
+    let now = 1_000_000;
+    setTvClock(() => now);
+    setTvHostPredicate(() => false);
+    setTvPageId('A');
+    bindTvDoc(new Y.Doc());
+    setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    // Alice holds the remote and beats from 10 s; this page is a viewer of
+    // the record it holds in another role (iHold false): what matters is the
+    // record's reading.
+    pickUpRemote('tv-1');
+    tvPlay('tv-1', { kind: 'url', url: 'https://example.org/clip.mp4' });
+    markTvPageAwake(now); // the room tick, as World runs it
+    tvHeartbeat('tv-1', 10_000);
+    const p = new FakePlayer(true);
+    p.position = 10_000;
+    const c = new TvSyncController({ itemId: 'tv-1', player: p, now: () => now, iHold: () => false, volume: () => 55 });
+    now += 500;
+    p.position = 10_500; // the player ran on with the clock
+    markTvPageAwake(now);
+    c.tick();
+    expect(p.log).toEqual(['play']); // in step: no seek, no nudge
+    // The lid closed for a minute. The theatre's 400 ms timer runs BEFORE the
+    // room's first tick back: the controller must find the gap itself.
+    now += 60_000; // the OS stopped the player where it was
+    const pb = c.tick();
+    expect(pb.stale).toBe(true);
+    expect(p.log).toEqual(['play']); // no seek to 70 s
+    expect(p.rate).toBe(1);
   });
 });
