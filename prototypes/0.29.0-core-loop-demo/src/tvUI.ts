@@ -382,7 +382,12 @@ function wireTvNav(host: HTMLElement): void {
     e.preventDefault();
     e.stopPropagation(); // a move inside the remote is not a key for the world, nor the phone's Tab
     const here = from ? stops.indexOf(from.closest<HTMLElement>(NAV_STOPS) as HTMLElement) : -1;
-    stops[here < 0 ? 0 : (here + step + stops.length) % stops.length]!.focus({ preventScroll: true });
+    // An explicit step scrolls the control into view: the remote overflows
+    // the phone's viewport (history, several sets), the arrow's own scroll
+    // is prevented above, and a control focused offscreen cannot be seen.
+    // preventScroll is for the repaint's focus restoration, which must not
+    // jolt the view (renderTvPhoneApp).
+    stops[here < 0 ? 0 : (here + step + stops.length) % stops.length]!.focus();
   };
   host.addEventListener('keydown', (e) => {
     if (e.altKey || e.ctrlKey || e.metaKey) return;
@@ -455,24 +460,28 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       // they had focus on, by its data-tv-* identity (a keyboard player
       // stepping through the remote must not be thrown out of it on every
       // heartbeat — and when that control is gone, the view itself keeps
-      // the focus, so ↑/↓ still work), and what they are TYPING — the paste
-      // box only (a focused volume slider is an input too, and its number
-      // must not land in the box).
+      // the focus, so ↑/↓ still work), and what they have PASTED — whether
+      // or not the box has focus: a link pasted, then the finger moved to
+      // PLAY or a tile, must not be wiped by a heartbeat or a power write
+      // in between (it is cleared by a PLAY or SCHEDULE that took it). The
+      // caret is restored only when the box itself had the focus.
       const active = document.activeElement;
       const inside = active instanceof HTMLElement && host.contains(active) ? active : null;
       const focusKey = focusKeyOf(inside);
-      const draft = inside instanceof HTMLInputElement && inside.matches('input[data-tv-paste]')
-        ? { value: inside.value, start: inside.selectionStart, end: inside.selectionEnd }
+      const pasteBox = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+      const draft = pasteBox && pasteBox.value
+        ? { value: pasteBox.value, focused: pasteBox === inside, start: pasteBox.selectionStart, end: pasteBox.selectionEnd }
         : null;
       host.innerHTML = html;
       phoneHtml = html;
       wireTvApp(host, d);
+      const pasteAgain = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+      if (draft && pasteAgain) pasteAgain.value = draft.value;
       if (inside) {
         const again = focusKey ? host.querySelector<HTMLElement>(focusKey) : null;
         (again ?? host).focus({ preventScroll: true });
-        if (draft && again instanceof HTMLInputElement) {
-          again.value = draft.value;
-          try { again.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
+        if (draft?.focused && again === pasteAgain && pasteAgain) {
+          try { pasteAgain.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
         }
       }
     }
@@ -619,9 +628,11 @@ export function playRefusal(source: TvSource): string | null {
   const why = consentRefusal(source);
   return why === 'server-off'
     ? `That link is on another server — ${SERVERLESS_ONLY}: a link on this station's node or your own origin plays here.`
-    : why === 'private'
-      ? 'That host is inside a private network: nobody in the room can ask a browser to fetch from there.'
-      : 'That is not a link the TV can play.';
+    : why === 'node-stale'
+      ? 'That link is on this station\'s node, but the node has not answered lately: it plays once the node is back.'
+      : why === 'private'
+        ? 'That host is inside a private network: nobody in the room can ask a browser to fetch from there.'
+        : 'That is not a link the TV can play.';
 }
 
 /** The archive metadata lookups in flight: a result is applied only when it
@@ -655,10 +666,15 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   }));
   const paste = host.querySelector<HTMLInputElement>('[data-tv-paste]');
   paste?.addEventListener('keydown', (e) => {
-    e.stopPropagation(); // typing must not walk the fox
+    // Typing must not walk the fox: a typed key stays here. Tab is the
+    // phone's own toggle and goes on to it (every other control in the
+    // phone lets it), and keyups are never held back — a W held as the
+    // remote opened and released in this box must reach InputManager, or
+    // the clone walks on until the key is pressed again.
+    if (e.key === 'Tab') return;
+    e.stopPropagation();
     if (e.key === 'Enter') host.querySelector<HTMLButtonElement>('[data-tv-play]')?.click();
   });
-  paste?.addEventListener('keyup', (e) => e.stopPropagation());
 
   const sourceFromBox = async (id: string): Promise<TvSource | null> => {
     const text = paste?.value ?? '';
@@ -700,6 +716,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       if (!src) return;
       const r = tvPlay(id, src);
       feedback(r.ok ? `Now on: ${sourceLabel(src)}` : r.error);
+      if (r.ok && paste) paste.value = ''; // taken: the box is clear for the next link (the repaint keeps a draft otherwise)
       if (r.ok) deps.openTheatre(id);
     });
   });
