@@ -716,6 +716,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
    *  that follows a write must take only that text — not a newer link typed
    *  meanwhile and never submitted. */
   const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string } | null> => {
+    // Every attempt supersedes the lookup before it, a refused or malformed
+    // one included: a PLAY on a bad link must not let an older archive
+    // lookup land its film after the refusal was shown.
+    const gen = ++resolveGen;
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
     if (!parsed) {
@@ -730,7 +734,6 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback(refused);
       return null;
     }
-    const gen = ++resolveGen;
     if (parsed.kind === 'archive' && !parsed.file && deps.resolveArchive) {
       feedback('Asking archive.org which file to play…');
       const epoch = tvDocEpoch();

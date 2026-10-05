@@ -121,6 +121,12 @@ interface SeenPower {
    *  one merged update show only the final ON, `on` unchanged — the moved
    *  revision is what says a cycle completed. */
   seq: number;
+  /** The programme's identity (`started`) as last seen beside the switch:
+   *  a park is owed only to the programme that was running as the set went
+   *  off. POWER ON and a replacement programme arriving in one merged
+   *  update would otherwise owe the park to the new film's jump, and a
+   *  page that later took the remote would pause it. */
+  started: number;
   epoch: number;
   /** An off→on flip still owed its park: the programme's `jump` as the
    *  switch came back, kept until a holder parks it or the programme moves
@@ -164,11 +170,16 @@ function parkIfPowerReturned(id: string): void {
   // PLAY NOW on a set that is off moves the revision with the flip, and the
   // programme's jump with it, so the park it owes is voided below as any
   // other is when the programme moves on.
-  const flipped = same && on && running && (!was.on || power.seq !== was.seq);
+  // …and only for the SAME programme as was running when the switch was
+  // last seen: a flip that arrives merged with a replacement programme
+  // (PLAY NOW from another page while the set was off) owes nothing — the
+  // new film starts as it was written, and is not parked at the old one's
+  // reading by whoever holds the remote next.
+  const flipped = same && on && running && programme.started === was.started && (!was.on || power.seq !== was.seq);
   if (flipped) owed = programme.jump;
   if (owed !== null && (!on || !running || programme.jump !== owed)) owed = null;
   if (owed !== null && iHoldRemote(id)) {
-    lastPower.set(id, { on, seq: power.seq, epoch, owed: null }); // before the write: its notify re-enters here
+    lastPower.set(id, { on, seq: power.seq, started: programme.started, epoch, owed: null }); // before the write: its notify re-enters here
     // Where the room WAS switched off: the presser's own reading, carried
     // by the switch (tvDoc `parkMs`; a reading of 0 is a reading) — not
     // this page's last heartbeat, which a holder asleep before the press
@@ -178,7 +189,7 @@ function parkIfPowerReturned(id: string): void {
     tvPause(id, power.parkMs ?? programme.positionMs);
     return;
   }
-  lastPower.set(id, { on, seq: power.seq, epoch, owed });
+  lastPower.set(id, { on, seq: power.seq, started: programme.started, epoch, owed });
 }
 
 /** The end of the media as the player of record reported it, per set, with

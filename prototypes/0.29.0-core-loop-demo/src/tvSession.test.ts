@@ -7,7 +7,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { isTvKind, tvLabel } from './tvSession';
 import {
-  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, setTvClock,
+  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, remoteKey,
+  setTvClock,
   setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS,
   TV_LEASE_LAPSE_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
@@ -494,6 +495,44 @@ describe('tickTvRoom', () => {
     expect(iHoldRemote(TV)).toBe(true);
     run(500);
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 4_000 }); // parked where it was switched off, not 64 s
+  });
+
+  it('POWER ON arriving merged with a replacement programme owes no park: the new film is not paused by whoever takes the remote next', () => {
+    const doc = new Y.Doc();
+    bindTvDoc(doc);
+    leaveTvRoom([]);
+    armTvDrive(true);
+    setTvPageId('A');
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now); // the switch seen ON, the first film running
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now);
+    // Another page: OFF at 3 s, then — the remote lapsed from here — picks
+    // it up, switches ON and PLAY NOWs a second film; this page receives
+    // the whole sequence in ONE update, the switch and the new programme
+    // together. Written here as the raw records that page's writes leave.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const seq = readPower(TV).seq;
+    const rec = other.getMap('tv').get(tvKey(TV)) as Record<string, unknown>;
+    other.transact(() => {
+      other.getMap('tv').set(powerKey(TV), { on: false, seq: seq + 1, parkMs: 3_000 });
+      other.getMap('tv').set(powerKey(TV), { on: true, seq: seq + 2, parkMs: 3_000 });
+      other.getMap('tv').set(tvKey(TV), {
+        ...rec, source: { kind: 'url', url: 'https://example.org/b.mp4' }, state: 'playing', positionMs: 0,
+        seq: (rec.seq as number) + 1, started: (rec.started as number) + 1, jump: (rec.jump as number) + 1,
+      });
+      other.getMap('tv').set(remoteKey(TV), { holder: 'BBBBbob', name: 'Bob', leaseAt: 1, by: 'BBBBbob', page: 'B' });
+    });
+    run(60_000); // this page ticks on through the minute; its own lease lapses by its own watch, as the other page saw
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(other, Y.encodeStateVector(doc)));
+    expect(readTv(TV)).toMatchObject({ state: 'playing', source: { url: 'https://example.org/b.mp4' } });
+    run(TV_LEASE_LAPSE_MS + 1_000); // Bob's lease, seen just now, lapses by this page's watch…
+    expect(pickUpRemote(TV)).toEqual({ ok: true }); // …and this page takes the remote
+    run(500);
+    expect(readTv(TV).state).toBe('playing'); // the new film runs on: no park was owed to it
+    expect(readTv(TV).source).toMatchObject({ url: 'https://example.org/b.mp4' });
   });
 
   it('a remote picked up on waking takes the room from a peer\'s wake-window beat as it landed, never bridged across the sleep: no beat an hour ahead, no programme closed on the spot', () => {
