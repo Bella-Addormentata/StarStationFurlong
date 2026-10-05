@@ -38,8 +38,17 @@
  * reaches a new name through `this.world`. Between them they cover the two
  * doors a new writer has actually arrived through — `removeFurnitureVisuals`
  * came through the second, which is exactly why it is not an example of the
- * first. A write one further hop out, in a module whose own text names no
- * Yjs, is seen by neither. It keys the call graph on each declaration's
+ * first. A write one further hop out, through a module whose own text names
+ * no Yjs, is narrowed by a third: a relay may not hold a writer by name, so
+ * a wrapper, a rename or a re-export of one is reported. What is left after
+ * that is a relay reaching a write without naming it anywhere, and that is a
+ * limit of the medium rather than an oversight — three cross-module analyses
+ * were built and measured against this tree while closing the #198 audit, and
+ * every one produced false positives and not one true positive, because a
+ * read accessor and a write accessor share their helpers and no amount of
+ * text tells `Map.set` from `Y.Map.set`. An unsound check here would be worse
+ * than none: what people learn from a failure they cannot act on is how to
+ * silence it. It keys the call graph on each declaration's
  * offset, so two units sharing a name stay apart — `isEditModeActive` is
  * both a method and a module-scope function here — but it still matches call
  * sites textually and so cannot follow a call made through a variable.
@@ -66,7 +75,9 @@ import { describe, expect, it } from 'vitest';
 
 /** The directory this test and editMode.ts share; the sibling modules too. */
 const DIR = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(DIR, 'editMode.ts'), 'utf8');
+/** The file under scan. Held as a path, not a basename — see `elsewhere`. */
+const SRC_PATH = join(DIR, 'editMode.ts');
+const SRC = readFileSync(SRC_PATH, 'utf8');
 
 /**
  * The functions that mutate a shared room doc. Reviewed by hand rather than
@@ -266,6 +277,17 @@ const blankOut = (s: string, strings: boolean): string => {
       slash = 'divide'; word = ''; i += 1; // a number is a value
     } else if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
       i += 1; // decides nothing, and must not clear `word`: `if (x) /re/`
+    } else if ((c === '+' || c === '-') && s[i + 1] === c) {
+      // `++` and `--` are transparent to the question this state machine
+      // is asking, unlike their single-character selves. Postfix `i++`
+      // leaves a value behind, so `i++ / 2` divides; prefix `++i` stands
+      // where an operand was already expected, so whatever decided before
+      // it still decides. Carrying `slash` through unchanged is right in
+      // both directions. Falling into the operator branch below is not:
+      // `i++ / 2; … / …` would read as a regex literal and blank out
+      // every gate and write between the two slashes.
+      word = '';
+      i += 2;
     } else {
       if (c === '(') { heads.push(word); slash = 'regex'; } else if (c === ')') {
         // `(a + b) / 2` divides; `if (a) /re/.test(b)` does not. The only
@@ -389,6 +411,42 @@ const FIELD_HANDLER_RE = new RegExp(
 );
 
 /**
+ * The bracket that turns a name into a call, allowing the optional-call form
+ * in front of it. `writeCupolaWall?.('x+')` calls writeCupolaWall and a plain
+ * `\s*\(` does not match it — so every writer, gate, callee and deferral
+ * pattern built from one would have read that line as calling nothing, which
+ * is a room-doc write that needs no gate because the scan cannot see it.
+ * editMode.ts has six `?.(` sites today (:1306, :1307, :1450, :1617, :2083,
+ * :2105) and none of them is a writer, which is a fact about this afternoon
+ * rather than a property of the file.
+ *
+ * Declared up here, above the deferral heads rather than beside the call
+ * graph, because `setTimeout?.(…)` and `p.then?.(…)` defer exactly as their
+ * plain forms do: a head that cannot see them leaves the callback body
+ * standing in the method that scheduled it, under a gate that ran at
+ * scheduling time. That is finding #1 arriving through a different door.
+ */
+const CALL = '\\s*(?:\\?\\.)?\\s*\\(';
+
+/**
+ * A member reached by name, in every shape that reaches the same method:
+ * `.doThing`, `?.doThing`, `['doThing']`, `?.['doThing']`, and the same with
+ * a double-quoted or template key.
+ *
+ * Computed access is the half that used to be missing, and it is the half an
+ * escape hatch gets written in. The caller rule excuses four units on the
+ * grounds that they are private and no sibling module names them, and
+ * `private` is a compile-time word: `ed['removeSelectedDoor']('north')`
+ * compiles, runs, and walked straight past a check spelled with a dot.
+ *
+ * A literal key only. `ed[name]()` cannot be resolved by reading text, and
+ * pretending otherwise would be the guess this file exists to refuse — what
+ * covers that case is the honest-client caveat at the top, not this pattern.
+ */
+const MEMBER = (n: string): string => `\\s*(?:(?:\\?\\.|\\.)\\s*${n}`
+  + `|(?:\\?\\.)?\\s*\\[\\s*(?:'${n}'|"${n}"|\`${n}\`)\\s*\\])`;
+
+/**
  * 🕐 The other way a body runs later, and the one editMode.ts does not use
  * — today. An `addEventListener` callback is only the shape that happened to
  * be here when this carver was written; a timer, a promise continuation and
@@ -426,7 +484,7 @@ const TIMER = '(?:setTimeout|setInterval|requestAnimationFrame|queueMicrotask'
  * downstream would then report as a fault in a file that has none.
  */
 const HANDLER_PROP = '(?<!\\bthis)\\.(on[a-z][\\w$]*)\\s*=\\s*(?!=)';
-const DEFER_HEAD = `(?:\\b(${TIMER})\\s*\\(\\s*|\\.(then|catch|finally)\\s*\\(\\s*|${HANDLER_PROP})`;
+const DEFER_HEAD = `(?:\\b(${TIMER})${CALL}\\s*|\\.(then|catch|finally)${CALL}\\s*|${HANDLER_PROP})`;
 const DEFERRED_RE = new RegExp(`${DEFER_HEAD}${FN_HEAD}\\s*\\{`, 'g');
 
 /** The same, stopping at the arrow — a concise body, which cannot be carved. */
@@ -440,7 +498,7 @@ const DEFERRED_INLINE_RE = new RegExp(`${DEFER_HEAD}${ARROW_HEAD}`, 'g');
  * should not have to be argued about.
  */
 const DEFER_SITE_RE = new RegExp(
-  `\\b${TIMER}\\s*\\(|\\.(?:then|catch|finally)\\s*\\(`
+  `\\b${TIMER}${CALL}|\\.(?:then|catch|finally)${CALL}`
   + `|${HANDLER_PROP}(?=(?:async\\s+)?(?:\\(|function\\b|[A-Za-z_$]))`,
   'g',
 );
@@ -457,7 +515,7 @@ const DEFER_SITE_RE = new RegExp(
  * checker's job; what this file can honestly do is say so here.
  */
 const DEFER_BY_REF_RE = new RegExp(
-  `^(?:\\b${TIMER}\\s*\\(\\s*|\\.(?:then|catch|finally)\\s*\\(\\s*|${HANDLER_PROP})`
+  `^(?:\\b${TIMER}${CALL}\\s*|\\.(?:then|catch|finally)${CALL}\\s*|${HANDLER_PROP})`
   + '(?:this\\.)?[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*'
   + '(?:\\.bind\\([^()]*\\))?\\s*[,);]',
 );
@@ -774,14 +832,15 @@ const units: Unit[] = [...members, ...functions];
 const idOf = (u: Unit): string => `${u.kind}:${u.name}@${u.start}`;
 
 /**
- * How a unit is reached from inside this file: `this.foo(` for a member, a
- * bare `foo(` for a module-scope function. The lookbehind carries the whole
+ * How a unit is reached from inside this file: `this.foo(` — or
+ * `this['foo'](`, or either with `?.` — for a member, a bare `foo(` for a
+ * module-scope function. The lookbehind carries the whole
  * distinction — without it `roomEdit.isEditModeActive()` and
  * `this.isEditModeActive()` would both read as calls to the free function.
  */
 const callPattern = (u: Unit): RegExp => (u.kind === 'member'
-  ? new RegExp(`\\bthis\\.${u.name}\\s*\\(`)
-  : new RegExp(`(?<![.\\w$])${u.name}\\s*\\(`));
+  ? new RegExp(`\\bthis${MEMBER(u.name)}${CALL}`)
+  : new RegExp(`(?<![.\\w$])${u.name}${CALL}`));
 
 const bodyOf = (name: string): string =>
   members.filter((m) => m.name === name).map((m) => m.body).join('\n');
@@ -1091,6 +1150,17 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       ['if (a) /x/.test(b);', 'if (a) /x/.test(b);', 'if (a)    .test(b);'],
       // A keyword is not a value either.
       ['return /x/.test(a);', 'return /x/.test(a);', 'return    .test(a);'],
+      // `++` and `--` end a value where `+` and `-` begin one, so the
+      // operator branch had them backwards: this line used to blank from
+      // the first `/` to the second, swallowing the gate in between.
+      ['i++ / 2; canEditRoom();', 'i++ / 2; canEditRoom();', 'i++ / 2; canEditRoom();'],
+      ['i-- / 2; canEditRoom();', 'i-- / 2; canEditRoom();', 'i-- / 2; canEditRoom();'],
+      // Prefix is the other direction and must still divide afterwards —
+      // the `++` carries the operand position through, and `i` ends it.
+      ['a = ++i / 2; canEditRoom();', 'a = ++i / 2; canEditRoom();',
+        'a = ++i / 2; canEditRoom();'],
+      // And a lone `+` must keep opening one, or the fix overshot.
+      ['a = b + /x/.test(c);', 'a = b + /x/.test(c);', 'a = b +    .test(c);'],
     ];
     for (const [src, noComments, noStrings] of cases) {
       expect(blankOut(src, false), `comments: ${JSON.stringify(src)}`).toBe(noComments);
@@ -1208,10 +1278,10 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
 
   it('gates every method that writes, or that is reached only from gated ones', () => {
     const calls = (body: string, fn: string): boolean =>
-      new RegExp(`\\b${fn}\\s*\\(`).test(body);
+      new RegExp(`\\b${fn}${CALL}`).test(body);
     // Escaped: the gates contain '.' and '()', which are regex syntax.
     const GATE_RE = GATES.map((g) => new RegExp(g.replace(/[.()]/g, '\\$&')));
-    const WRITER_RE = WRITERS.map((w) => new RegExp(`\\b${w}\\s*\\(`));
+    const WRITER_RE = WRITERS.map((w) => new RegExp(`\\b${w}${CALL}`));
     const firstAt = (body: string, res: readonly RegExp[]): number => {
       const hits = res.map((r) => body.search(r)).filter((i) => i >= 0);
       return hits.length > 0 ? Math.min(...hits) : -1;
@@ -1519,7 +1589,13 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     const elsewhere = (d: string): string[] => readdirSync(d, { withFileTypes: true })
       .flatMap((e) => (e.isDirectory() ? elsewhere(join(d, e.name))
         : (/\.tsx?$/.test(e.name) && !/\.(?:test|d)\.tsx?$/.test(e.name)
-          && e.name !== 'editMode.ts' ? [join(d, e.name)] : [])));
+          // By PATH, not by basename. This walk recurses — src/games and
+          // src/network are below it today — so a basename test excludes
+          // every editMode.ts in the tree, and the one it would exclude
+          // by mistake is a sibling that could call these private names.
+          // Skipping the file under scan is the point; skipping an
+          // unrelated namesake is the hole.
+          && join(d, e.name) !== SRC_PATH ? [join(d, e.name)] : [])));
     const others = elsewhere(DIR).map((f) => [f, readFileSync(f, 'utf8')] as const);
     expect(others.length, 'no sibling modules read, so the check below proves nothing')
       .toBeGreaterThan(20);
@@ -1547,10 +1623,15 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
           + 'from another module reaches the write with no gate');
       }
       // (b) Actually named somewhere else. A member is reached through a
-      //     dot and a free function bare, the same split `callPattern`
-      //     makes — see the collision between the two `isEditModeActive`s.
+      //     dot OR a string subscript, and a free function bare — the same
+      //     split `callPattern` makes, see the collision between the two
+      //     `isEditModeActive`s. The subscript half is what makes (a) and
+      //     (b) independent: `private` is erased, so the one call shape
+      //     that defeats arm (a) in a type-checked sibling is the one that
+      //     is not spelled with a dot.
       const re = u.kind === 'member'
-        ? new RegExp(`\\.${u.name}\\s*\\(`) : new RegExp(`(?<![.\\w$])${u.name}\\s*\\(`);
+        ? new RegExp(`${MEMBER(u.name)}${CALL}`)
+        : new RegExp(`(?<![.\\w$])${u.name}${CALL}`);
       for (const [file, text] of others) {
         if (re.test(text)) {
           unsound.push(`${where} is excused by its in-file callers, but ${
@@ -1577,7 +1658,7 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
   it('counts the writes it is actually guarding, so the scan cannot pass on nothing', () => {
     // If a rename made every WRITERS entry miss, the test above would pass with
     // an empty leak list. Pin the floor instead.
-    const found = WRITERS.filter((w) => new RegExp(`\\b${w}\\s*\\(`).test(stripComments(SRC)));
+    const found = WRITERS.filter((w) => new RegExp(`\\b${w}${CALL}`).test(stripComments(SRC)));
     expect(found.length, `writers not found in editMode.ts: ${
       WRITERS.filter((w) => !found.includes(w)).join(', ')}`).toBe(WRITERS.length);
 
@@ -1592,7 +1673,7 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     const bare = stripComments(SRC);
     const homeless: string[] = [];
     for (const w of WRITERS) {
-      for (const hit of bare.matchAll(new RegExp(`\\b${w}\\s*\\(`, 'g'))) {
+      for (const hit of bare.matchAll(new RegExp(`\\b${w}${CALL}`, 'g'))) {
         const at = hit.index ?? 0;
         if (!units.some((u) => u.start <= at && at < u.end)) {
           homeless.push(`line ${lineAt(at)}: ${w}() is outside every member and function slice`);
@@ -1634,9 +1715,22 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     };
     for (const [mod, names] of Object.entries(EXPECTED)) {
       // Value imports only — `import type { … }` can't be called.
-      const m = SRC.match(new RegExp(`import\\s+\\{([^}]*)\\}\\s*from\\s*'${mod}'`));
-      expect(m, `no value import from ${mod}`).not.toBeNull();
-      const got = m![1].split(',').map((x) => x.trim()).filter(Boolean).sort();
+      // EVERY braced import from the module, not the first one. `match`
+      // without /g returns a single result, and a second
+      // `import { … } from './floorPlanDoc'` is legal, is what a merge
+      // leaves behind, and would have carried a new writer in behind a list
+      // that still read as unchanged. Comments are stripped first, so a
+      // commented-out import is not counted as one.
+      //
+      // The specifier is escaped because it goes into a RegExp:
+      // `./doorLayoutDoc` as a pattern has three dots that match any
+      // character, which is close enough to clear the wrong module.
+      const esc = mod.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const ms = [...stripComments(SRC).matchAll(
+        new RegExp(`import\\s+\\{([^}]*)\\}\\s*from\\s*'${esc}'`, 'g'))];
+      expect(ms.length, `no value import from ${mod}`).toBeGreaterThan(0);
+      const got = [...new Set(ms.flatMap((x) => x[1]
+        .split(',').map((y) => y.trim()).filter(Boolean)))].sort();
       expect(got, `${mod}: is any new name here a room-doc writer? If so add it to WRITERS`)
         .toEqual(names);
     }
@@ -1659,6 +1753,7 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
 
     const unwatched: string[] = [];
     const unreadable: string[] = [];
+    const relays: string[] = [];
     const seen = new Set<string>();
     for (const m of stripComments(SRC).matchAll(SPECIFIER)) {
       if (TYPE_ONLY.test(m[0])) continue;
@@ -1690,12 +1785,48 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
         unwatched.push(`${mod} (editMode takes ${
           m[0].match(/\{([^}]*)\}/)?.[1].trim().replace(/\s+/g, ' ') ?? 'the whole module'})`);
       }
+
+      // A RELAY. The test just above asks whether the module can write
+      // ITSELF; this asks whether it can hand a write on. A one-line
+      // wrapper round writeDoorLayout names no Yjs, binds no container,
+      // passes that test, and arrives in editMode.ts as an ordinary
+      // helper with no gate owed. `./doorLayout` is one import away from
+      // being exactly that today.
+      //
+      // Holding the name is the test because holding the name is
+      // decidable from text, and "does this name reach a write" is not.
+      // Three shapes of that walk were built and measured against this
+      // tree while closing the #198 audit: a transitive module closure
+      // (flags 14 of the 21 unpinned modules — noise, not a check), a
+      // name-level call walk ending at a Yjs container op (3 hits, all
+      // false, because casinoDoc's reads and writes share `ensureMap`),
+      // and the same walk ending at a mutating method (3 hits, still all
+      // false). Zero true positives between them. This arm finds 0 of 21
+      // too, but it finds 0 soundly, so a 1 means something.
+      //
+      // A star re-export is reported on its own terms: it carries every
+      // name the far module exports without spelling any of them, so
+      // there is nothing here to match against.
+      const held = WRITERS.filter((w) => new RegExp(`(?<![.\\w$])${w}\\b`).test(body));
+      const stars = [...body.matchAll(/export\s*\*\s*from\s*'([^']+)'/g)];
+      if (held.length > 0) {
+        relays.push(`${mod} names ${held.join(', ')} — a wrapper or rename of a writer `
+          + `reaches a room doc through it, and editMode takes ${
+            m[0].match(/\{([^}]*)\}/)?.[1].trim().replace(/\s+/g, ' ') ?? 'the whole module'}`);
+      }
+      if (stars.length > 0) {
+        relays.push(`${mod} re-exports * from ${stars.map((s) => s[1]).join(', ')}`
+          + ' — every name behind that star is reachable through it and none is written here');
+      }
     }
     expect(unreadable, `cannot read these modules, so cannot say whether they write.\n${
       'Resolve them here or pin them in EXPECTED:\n'}${unreadable.join('\n')}`).toEqual([]);
     expect(unwatched, `these modules can mutate a shared doc and are not pinned above.\n${
       'Add each to EXPECTED, and put any name that writes into WRITERS:\n'}${
       unwatched.join('\n')}`).toEqual([]);
+    expect(relays, `these modules hold a room-doc writer without being a doc module.\n${
+      'Pin each in EXPECTED, and if editMode takes a name that wraps the writer, put '}${
+      'that name in WRITERS too:\n'}${relays.join('\n')}`).toEqual([]);
 
     // The sweep is only worth what it reaches, and "it found nothing" and
     // "it looked at nothing" read identically from here. So pin the floor:
