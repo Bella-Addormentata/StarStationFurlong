@@ -29,7 +29,7 @@
  */
 
 import {
-  driftAction, iHoldRemote, markTvPageAwake, readPlayback, readTv, tvHeartbeat, tvNow, tvStop,
+  driftAction, holderAnchorMs, iHoldRemote, markTvPageAwake, readPlayback, readTv, tvHeartbeat, tvNow, tvStop,
   TV_HEARTBEAT_MS, TV_NUDGE_RATE, TV_SEEK_OVER_MS,
 } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -398,7 +398,11 @@ export class TvSyncController {
       // A target the player cannot reach (+10 s with five left; a rewind
       // out of a live window) is clamped where the player would clamp the
       // seek, or it would never be reached and the programme never closed.
-      const target = reachable(pb.positionMs, p);
+      // A stale reading (a remote picked up on waking, before any fresh
+      // beat) is taken from its takeover anchor (tvDoc holderAnchorMs): a
+      // peer's beat that landed in the wake window is not bridged across
+      // the sleep as though it predated it.
+      const target = reachable(holderAnchorMs(pb), p);
       // While an earlier seek is still landing, the newest target is always
       // reissued — even inside the band of where the player still reads —
       // or the old seek would land later and be heartbeated over this one.
@@ -426,7 +430,7 @@ export class TvSyncController {
       // published; the beat from there is the fresh sample that un-stales
       // everyone, this page included.
       this.rejoining = true;
-      const target = reachable(pb.positionMs, p);
+      const target = reachable(holderAnchorMs(pb), p); // own pre-sleep beat: bridged; a peer's wake-window beat: from its arrival
       if (Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS && (p.canSeek || p.hasClock)) this.aim(p, target, now);
     }
     if (!pb.stale) this.rejoining = false;

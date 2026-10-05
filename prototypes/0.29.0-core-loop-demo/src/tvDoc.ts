@@ -234,7 +234,13 @@ export function tvWallNow(): number {
 interface Sample {
   seq: number;
   positionMs: number;
+  /** When it counts as received: the moment it landed, or — for a sample
+   *  the network delivered in the moment after a sleep, which it may have
+   *  held through it — the last moment before the gap (receiptStamp). */
   receivedAt: number;
+  /** When it actually landed here, by this page's clock, whatever the
+   *  stamp says: the provenance the takeover anchor reads (fromSample). */
+  arrivedAt: number;
   park?: true;
   /** This page's own write (the holder's beat): stamped as written, and
    *  the one stale sample whose bridged reading the switch may carry
@@ -388,7 +394,7 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       powerSeen.set(itemId, power.seq);
       const rec = readProgramme(itemId);
       if (power.on && power.parkMs !== null && (rec.state === 'playing' || scheduleStarted(rec))) {
-        samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: stamp, park: true });
+        samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: stamp, arrivedAt: now, park: true });
       }
       continue;
     }
@@ -401,8 +407,8 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       // is stamped from before the gap (`stamp`), and stale with the rest
       // (readPlayback): not a fresh anchor this page can act on.
       samples.set(itemId, local
-        ? { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, own: true }
-        : { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp });
+        ? { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now, own: true }
+        : { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now });
     }
   }
 }
@@ -1028,13 +1034,22 @@ export interface PlaybackNow {
    *  carries it, its theatre seeks its own player there once (tvSync) —
    *  and never drags the room back to where it slept. */
   stale?: boolean;
+  /** With `stale`: where a HOLDER takes the room from (holderAnchorMs).
+   *  The bridged `positionMs` for a sample from before the sleep — this
+   *  page's own last beat among them; for a peer's beat that landed in the
+   *  moment after waking, where that beat was when it landed plus the time
+   *  since, un-bridged — the earlier of the two readings such a beat could
+   *  mean, which is the safe one to take a room over from. */
+  anchorMs?: number;
 }
 
 /** The sample this page anchored the holder's last position to, or null
  *  before any sample landed for the TV. */
 export function readSample(itemId: string): { positionMs: number; receivedAt: number; seq: number; park?: true } | null {
   const s = samples.get(itemId);
-  return s ? { ...s } : null;
+  if (!s) return null;
+  const { arrivedAt: _arrivedAt, ...rest } = s; // the provenance is fromSample's; the sample's shape to callers is as before
+  return rest;
 }
 
 /** The most a measured round trip may lead a sample by. A bad measurement
@@ -1104,9 +1119,28 @@ function fromSample(sample: Sample, now: number, rttMs: number): PlaybackNow {
   const positionMs = expectedPositionMs(sample, now, rttMs);
   if (sample.receivedAt < lastGapAt) {
     const bridged = Math.max(0, positionMs + gapCorrectionSince(sample.receivedAt));
-    return { state: 'playing', positionMs: bridged, running: true, countdownMs: 0, stale: true };
+    // The TAKEOVER anchor: where a page that picks the remote up on this
+    // reading may take the room from. A sample that landed in the moment
+    // after waking is stamped from before the gap, and so bridged across
+    // the whole sleep — right for a beat the network held through it, and
+    // ahead by the whole sleep for a beat that was simply fresh. Which it
+    // was cannot be known; the safe side for a holder is the earlier one:
+    // from where that beat was when it landed, the time since. (Too early
+    // replays a little for everyone; too late skips the sleep's worth and
+    // can close a finite programme on the spot.) A sample from before the
+    // gap — this page's own last beat among them — is bridged as before.
+    const anchorMs = sample.arrivedAt > lastGapAt
+      ? expectedPositionMs({ positionMs: sample.positionMs, receivedAt: sample.arrivedAt }, now, rttMs)
+      : bridged;
+    return { state: 'playing', positionMs: bridged, running: true, countdownMs: 0, stale: true, anchorMs };
   }
   return { state: 'playing', positionMs, running: true, countdownMs: 0 };
+}
+
+/** Where a HOLDER takes the room from: the takeover anchor of a stale
+ *  reading, else the reading itself. */
+export function holderAnchorMs(pb: PlaybackNow): number {
+  return pb.stale && pb.anchorMs !== undefined ? pb.anchorMs : pb.positionMs;
 }
 
 export type DriftAction = 'none' | 'seek' | 'speed-up' | 'slow-down';

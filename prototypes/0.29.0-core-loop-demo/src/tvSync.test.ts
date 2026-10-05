@@ -1141,3 +1141,19 @@ describe('a live window and the record behind it', () => {
     expect(p.rate).toBe(1);
   });
 });
+
+describe('a holder that picked the remote up on a stale reading', () => {
+  it('takes the room from the takeover anchor, not from the bridged position', () => {
+    const p = new FakePlayer(true);
+    p.position = 0; // the theatre just opened on the new holder's page
+    const h = harness(p, { hold: true });
+    // A peer's beat that landed in the wake window: bridged, it reads an
+    // hour ahead; as it landed, 12 s.
+    h.set({ positionMs: 12_000 + 3_600_000, stale: true, anchorMs: 12_000 });
+    h.tick();
+    expect(p.log).toEqual(['seek:12000', 'play']); // the first acquisition: a seek to the anchor, never to the hour ahead
+    expect(h.beats).toEqual([12_000]); // the seek landed at once (a prompt player): the beat from the anchor is the fresh sample that un-stales the room
+    h.tick();
+    expect(h.beats).toEqual([12_000]); // one beat per TV_HEARTBEAT_MS, as ever
+  });
+});
