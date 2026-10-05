@@ -10,7 +10,13 @@
  * overlay that takes the keyboard for itself (the TV theatre, the arcade
  * stage) asks the stick to stand aside while it is up (suspendStickKeys):
  * its own capture listener comes after the stick's and would never see a
- * keydown the stick had swallowed.
+ * keydown the stick had swallowed. A panel that only wants the keys typed
+ * INTO it (the phone's TV remote) marks itself `data-stick-aside` instead:
+ * a key whose target is inside it passes the stick by, like a key typed in
+ * a text field, while a key pressed with focus elsewhere is still the
+ * stick's — so the pilot is never walked away from the helm by a key that
+ * was not meant for the panel. Such a panel must stop the flight keys it
+ * receives from bubbling on to input.ts itself (isFlightKey says which).
  *
  *   W / ↑  thrust forward        S / ↓  thrust back
  *   A / ←  turn left             D / →  turn right
@@ -51,8 +57,21 @@ function isTyping(target: EventTarget | null): boolean {
   return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true);
 }
 
+/** Whether the key was pressed with focus inside a panel marked
+ *  `data-stick-aside` (the phone's TV remote): the key is the panel's. */
+function insideStandingAsidePanel(target: EventTarget | null): boolean {
+  const el = target as (HTMLElement & { closest?: (sel: string) => Element | null }) | null;
+  return !!el && typeof el.closest === 'function' && el.closest('[data-stick-aside]') !== null;
+}
+
+/** Whether a key code is one the stick binds (W/A/S/D/Q/E/X, the arrows,
+ *  Space): what a `data-stick-aside` panel must keep from reaching input.ts. */
+export function isFlightKey(code: string): boolean {
+  return ACTION_OF.has(code);
+}
+
 function onKeyDown(e: KeyboardEvent): void {
-  if (!taken || standingAside > 0 || isTyping(e.target)) return;
+  if (!taken || standingAside > 0 || isTyping(e.target) || insideStandingAsidePanel(e.target)) return;
   const action = ACTION_OF.get(e.code);
   if (!action) return;
   held.add(e.code);

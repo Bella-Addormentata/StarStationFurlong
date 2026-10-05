@@ -25,7 +25,7 @@ import { tvPlayerCanSeek, tvPlayerPositionMs } from './tvSession';
 import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
-import { suspendStickKeys } from './freeFlightStick';
+import { isFlightKey } from './freeFlightStick';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -389,35 +389,27 @@ function wireTvNav(host: HTMLElement): void {
   }, true);
 }
 
-/** The helm's flight stick stands aside while the app is on screen
- *  (freeFlightStick.suspendStickKeys): when the stick is taken, its capture
- *  listener runs before this view's and swallows the arrows that step
- *  through the remote and the Space that presses its buttons — the ship
- *  turned or braked instead. Held exactly while tvAppOnScreen says so and
- *  released the moment it does not: the phone closes by many paths (Tab,
- *  Escape, WATCH, a pass's auto-enter) and the view changes through
- *  showPhoneView, so visibility is WATCHED — the container's class and the
- *  view's — rather than hooked at each, and the paint timer checks it too.
- *  Its own hold, apart from the theatre's: the phone can stay up while the
- *  theatre closes beneath it, and the other way round. */
-let stickRelease: (() => void) | null = null;
-function syncTvStick(host: HTMLElement): void {
-  const on = tvAppOnScreen(host);
-  if (on && !stickRelease) {
-    stickRelease = suspendStickKeys();
-  } else if (!on && stickRelease) {
-    stickRelease();
-    stickRelease = null;
-  }
-}
-function watchTvStick(host: HTMLElement): void {
-  if (host.dataset.tvStick) return;
-  host.dataset.tvStick = '1';
-  const observer = new MutationObserver(() => syncTvStick(host));
-  observer.observe(host, { attributes: true, attributeFilter: ['class'] });
-  const phone = host.closest<HTMLElement>('#spacephone-container');
-  if (phone) observer.observe(phone, { attributes: true, attributeFilter: ['class'] });
-  syncTvStick(host);
+/** The helm's flight stick and this app share the arrows and Space: when the
+ *  stick is taken, its capture listener runs before this view's and would
+ *  swallow the arrows that step through the remote and the Space that
+ *  presses its buttons — the ship turned or braked instead. The app marks
+ *  its host `data-stick-aside` (freeFlightStick): a key whose TARGET is
+ *  inside the app passes the stick by, like a key typed in a text field,
+ *  while a key pressed with focus elsewhere — the pilot clicked back on the
+ *  world with the phone still up — is still the stick's, so flying never
+ *  walks the pilot away from the helm. The other half of that promise is
+ *  this app's: a flight key it receives must not bubble on to input.ts and
+ *  the camera rig (the stick no longer stops it), so the bubble listener
+ *  below holds every flight key the app's controls were given, after the
+ *  control's own action (the button's click, the slider's step) has had it.
+ *  Tab and Escape are not flight keys and stay the phone's. */
+function wireTvStick(host: HTMLElement): void {
+  if (host.dataset.stickAside) return;
+  host.dataset.stickAside = '1';
+  host.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (tvAppOnScreen(host) && isFlightKey(e.code)) e.stopPropagation();
+  });
 }
 
 /** Land keyboard focus in the app as it opens (main.ts): Tab cannot reach
@@ -435,9 +427,8 @@ export function focusTvApp(host: HTMLElement): void {
  *  active view. */
 export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
   wireTvNav(host);
-  watchTvStick(host);
+  wireTvStick(host);
   const paint = () => {
-    syncTvStick(host); // every second, whatever path hid or showed the view
     if (!host.classList.contains('active')) return;
     const html = renderTvApp(deps);
     // Rebuild only when something other than the clock changed (the status
