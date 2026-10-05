@@ -174,9 +174,13 @@ export function redirectVerdict(url: string): Exclude<RedirectVerdict, 'unknown'
  *  kept, so a RETRY asks again. `fetchImpl` is injectable for the tests;
  *  the request options are the ones the fetch standard allows together
  *  (cors + manual), where no-cors + manual would be an error on every call. */
-export async function probeRedirect(url: string, fetchImpl: typeof fetch = fetch, timeoutMs = 8_000): Promise<RedirectVerdict> {
+export async function probeRedirect(url: string, fetchImpl: typeof fetch = fetch, timeoutMs = 8_000, signal?: AbortSignal): Promise<RedirectVerdict> {
   const ctl = new AbortController();
   const deadline = setTimeout(() => ctl.abort(), timeoutMs);
+  // The caller's abort (the programme moved on, the theatre closed) ends
+  // the request too: a superseded probe is not left running to its deadline.
+  if (signal?.aborted) ctl.abort();
+  signal?.addEventListener('abort', () => ctl.abort(), { once: true });
   let verdict: RedirectVerdict = 'unknown';
   try {
     const res = await fetchImpl(url, {

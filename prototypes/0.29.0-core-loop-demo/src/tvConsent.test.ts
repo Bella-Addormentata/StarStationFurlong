@@ -214,4 +214,17 @@ describe('the redirect probe before a consented host is mounted', () => {
     expect(redirectVerdict('https://example.org/a.mp4')).toBeNull();
     expect(redirectVerdict('https://example.org/b.mp4')).toBeNull();
   });
+
+  it('is ended by the caller\'s abort — the programme moved on, the theatre closed — and keeps nothing for it', async () => {
+    let aborted = false;
+    const hanging = ((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { aborted = true; reject(new DOMException('aborted', 'AbortError')); });
+    })) as typeof fetch;
+    const abort = new AbortController();
+    const probe = probeRedirect('https://example.org/slow.mp4', hanging, 60_000, abort.signal);
+    abort.abort();
+    expect(await probe).toBe('unknown');
+    expect(aborted).toBe(true);
+    expect(redirectVerdict('https://example.org/slow.mp4')).toBeNull();
+  });
 });

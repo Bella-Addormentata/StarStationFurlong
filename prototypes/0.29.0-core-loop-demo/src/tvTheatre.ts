@@ -338,6 +338,12 @@ interface Theatre {
    *  is out for, '' when none: one probe per programme, and its answer is
    *  read from tvConsent on the tick after it lands. */
   probing: string;
+  /** The probe in flight, to abort when its programme is superseded or the
+   *  theatre closes: a superseded probe must not run on to its deadline. */
+  probeAbort: AbortController | null;
+  /** The mount key whose probe spent a unit of the set's mount budget: its
+   *  mount, when the verdict allows one, is not counted a second time. */
+  budgetedKey: string;
 }
 
 let theatre: Theatre | null = null;
@@ -498,6 +504,8 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     playerFor: -1,
     releaseStick,
     probing: '',
+    probeAbort: null,
+    budgetedKey: '',
   };
   // The dialog takes focus (Tab then reaches its controls); it goes back on close.
   root.tabIndex = -1;
@@ -535,6 +543,9 @@ export function closeTvTheatre(): void {
 
 function unmountPlayer(t: Theatre): void {
   t.attempt += 1; // whatever is still being built for the old mount is void
+  t.probeAbort?.abort(); // a probe out for the old programme is not waited for
+  t.probeAbort = null;
+  t.probing = '';
   t.unregister?.();
   t.unregister = null;
   t.controller = null;
@@ -716,17 +727,27 @@ function theatreTick(rtt: () => number): void {
       // own origins, the node and the product lanes are not probed.
       const url = rec.source!.kind === 'url' ? rec.source!.url : '';
       const verdict = url && needsRedirectProbe(rec.source!) ? redirectVerdict(url) : 'direct';
+      // Consent per origin bounds nothing cumulative: a modified client
+      // could rotate shape-valid sources on this viewer's own node — or
+      // query strings on an accepted host — and have every open theatre
+      // fetch each in turn without end. So every request this theatre makes
+      // on its own, a probe as much as a mount, is counted per set
+      // (tvConsent mayMountNow); a probe's unit covers the mount its
+      // verdict allows (budgetedKey), and past the budget what is on is
+      // shown with PLAY — the press is the consent that spends the next.
       if (verdict === null) {
-        if (t.probing !== key) startRedirectProbe(t, url, key);
+        if (t.probing !== key) {
+          if (mayMountNow(t.itemId, tvNow())) {
+            t.budgetedKey = key;
+            startRedirectProbe(t, url, key);
+          } else {
+            showMountNotice(t, rec.source!, key);
+          }
+        }
       } else if (verdict === 'redirects') {
         showRedirectNotice(t, rec.source!, key);
-      } else if (mayMountNow(t.itemId, tvNow())) {
-        // Consent per origin bounds nothing cumulative: a modified client
-        // could rotate shape-valid sources on this viewer's own node and
-        // have every open theatre fetch each in turn without end. So a
-        // mount this theatre makes on its own is counted per set (tvConsent
-        // mayMountNow), and past the budget what is on is shown with PLAY —
-        // the press is the consent that mounts it.
+      } else if (t.budgetedKey === key || mayMountNow(t.itemId, tvNow())) {
+        t.budgetedKey = '';
         mountPlayer(t, rec.source!, key, rtt);
       } else {
         showMountNotice(t, rec.source!, key);
@@ -744,13 +765,17 @@ function theatreTick(rtt: () => number): void {
  *  an earlier programme, or after the theatre closed, changes nothing here;
  *  a kept verdict is kept per URL all the same. */
 function startRedirectProbe(t: Theatre, url: string, key: string): void {
+  t.probeAbort?.abort(); // a probe still out for an earlier programme
+  const abort = new AbortController();
+  t.probeAbort = abort;
   t.probing = key;
   let host = url;
   try { host = new URL(url).host; } catch { /* shown as it is */ }
   showNotice(t, `<div>CHECKING THE LINK</div>
     <div class="tv-theatre-lane">asking ${escapeHtml(host)} whether it answers this link itself or sends your browser elsewhere</div>`);
-  void probeRedirect(url).then((verdict) => {
-    if (theatre !== t || t.probing !== key) return;
+  void probeRedirect(url, undefined, undefined, abort.signal).then((verdict) => {
+    if (theatre !== t || t.probing !== key || t.probeAbort !== abort) return;
+    t.probeAbort = null;
     t.probing = '';
     if (verdict !== 'unknown') return; // the next tick reads the kept verdict
     t.mounted = `failed:${key}`;
@@ -761,7 +786,10 @@ function startRedirectProbe(t: Theatre, url: string, key: string): void {
       t.mounted = '';
     });
   }, () => {
-    if (theatre === t && t.probing === key) t.probing = '';
+    if (theatre === t && t.probing === key && t.probeAbort === abort) {
+      t.probeAbort = null;
+      t.probing = '';
+    }
   });
 }
 
@@ -787,7 +815,13 @@ function showMountNotice(t: Theatre, source: TvSource, key: string): void {
     <div class="tv-theatre-lane">the programme changed more than ${TV_MOUNT_BUDGET} times in a minute — your browser fetches no more on its own until you say so; whoever holds the remote cannot decide that for you</div>
     <button type="button" data-tv-mount="${escapeHtml(key)}">▶ PLAY</button>`);
   t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]')?.addEventListener('click', () => {
-    allowMount(t.itemId);
+    // The press is consent for THE PROGRAMME THE BUTTON NAMED: a peer may
+    // have changed it between the render and the click, and the budget must
+    // not be opened for whatever is on now. The notice comes down either
+    // way; the next tick asks again for what is on.
+    const now = readTv(t.itemId);
+    const current = now.source ? mountKey(now.source, now.started) : '';
+    if (current === key) allowMount(t.itemId);
     hideNotice(t);
   });
 }
