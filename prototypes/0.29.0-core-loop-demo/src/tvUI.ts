@@ -230,10 +230,19 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
         ${mine || owner ? handToBlock(deps, deps.itemId) : ''}
       </div>
     `;
-    // Rebuild only when something other than the clock changed.
+    // Rebuild only when something other than the clock changed — and keep
+    // the keyboard player's place across it (the phone app's rule): the
+    // control they were on, by its data-tv-* identity, else the panel.
     if (html !== lastHtml) {
+      const active = document.activeElement;
+      const inside = active instanceof HTMLElement && panel.contains(active) ? active : null;
+      const focusKey = focusKeyOf(inside);
       panel.innerHTML = html;
       lastHtml = html;
+      if (inside) {
+        const again = focusKey ? panel.querySelector<HTMLElement>(focusKey) : null;
+        (again ?? panel).focus({ preventScroll: true });
+      }
       const note = (text: string) => showNote(panel!, text);
       panel.querySelector<HTMLButtonElement>('[data-tv-power]')?.addEventListener('click', () => { tvTogglePower(deps.itemId); });
       panel.querySelector<HTMLButtonElement>('[data-tv-vol-down]')?.addEventListener('click', () => { tvSetVolume(deps.itemId, readTv(deps.itemId).volume - 10); });
@@ -266,6 +275,15 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
       // The clock and countdown move without a doc write.
       clockTimer = window.setInterval(render, 1000);
       render();
+      // By keyboard (the phone app's traversal, wireTvNav): Tab is the
+      // phone's toggle and never reaches this panel, so ↑/↓ step through
+      // POWER, VOLUME, WATCH and the remote's buttons, Enter and Space press
+      // them, and focus lands on the first control as the panel opens —
+      // Escape steps back from the set as before (deviceFocus). Mounted is
+      // on screen: the overlay is in front of the player while it exists.
+      wireTvNav(panel, () => true);
+      const first = [...panel.querySelectorAll<HTMLElement>(NAV_STOPS)].find((el) => el.offsetParent !== null);
+      (first ?? panel).focus({ preventScroll: true });
     },
     unmount(): void {
       unsubscribe?.();
@@ -372,7 +390,7 @@ function tvAppOnScreen(host: HTMLElement): boolean {
  *  Wired once per host, in the capture phase: the paste box stops its own
  *  keys from bubbling (typing must not walk the fox), and ↑/↓ must still
  *  move out of it. */
-function wireTvNav(host: HTMLElement): void {
+function wireTvNav(host: HTMLElement, onScreen: () => boolean = () => tvAppOnScreen(host)): void {
   if (host.dataset.tvNav) return;
   host.dataset.tvNav = '1';
   host.setAttribute('tabindex', '-1'); // focusable by script, never a tab stop
@@ -391,7 +409,7 @@ function wireTvNav(host: HTMLElement): void {
   };
   host.addEventListener('keydown', (e) => {
     if (e.altKey || e.ctrlKey || e.metaKey) return;
-    if (!tvAppOnScreen(host)) return;
+    if (!onScreen()) return;
     const target = e.target instanceof HTMLElement ? e.target : null;
     const widget = target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === 'range');
     if (widget && e.key === 'Tab') {
