@@ -6162,7 +6162,16 @@ export class World {
         roomPlayers: () => tvRoomPlayers(getIdentityPub()),
         // The deps main.ts installed (setTvTheatreDeps): the same label and
         // round-trip lead as the chip's and the phone's WATCH.
-        openTheatre: () => deviceFocus.releaseThen(() => openTvTheatre(deviceId)),
+        // Opened in the continuation, which runs after the focus eases out:
+        // a room leave may have begun meanwhile (leaveRoomNow closes the
+        // theatre, then awaits the flush while World keeps updating), so the
+        // drive and the set are checked again THERE, as the phone's and the
+        // chip's WATCH check them — else this reopened a theatre no room
+        // tick would close.
+        openTheatre: () =>
+          deviceFocus.releaseThen(() => {
+            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) openTvTheatre(deviceId);
+          }),
         openRemote: () =>
           deviceFocus.releaseThen(() =>
             (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.(),

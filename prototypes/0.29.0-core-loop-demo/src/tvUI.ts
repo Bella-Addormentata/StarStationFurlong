@@ -711,7 +711,11 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     if (e.key === 'Enter') host.querySelector<HTMLButtonElement>('[data-tv-play]')?.click();
   });
 
-  const sourceFromBox = async (id: string): Promise<TvSource | null> => {
+  /** The box's link as a source, with the TEXT it was read from: an archive
+   *  lookup can take seconds while the box stays editable, and the clear
+   *  that follows a write must take only that text — not a newer link typed
+   *  meanwhile and never submitted. */
+  const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string } | null> => {
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
     if (!parsed) {
@@ -739,10 +743,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
         found = await deps.resolveArchive(parsed.identifier);
       } catch { /* fall through to the embed */ }
       if (gen !== resolveGen || epoch !== tvDocEpoch() || tvRevision(id) !== revision) return null; // overtaken
-      if (found) return sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed;
+      if (found) return { source: sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed, text };
       feedback('No playable file found — using their embed (start-time sync only).');
     }
-    return parsed;
+    return { source: parsed, text };
   };
 
   // The box is cleared BEFORE the write that takes its link: the write
@@ -753,11 +757,13 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   // archive lookup may have replaced it), clear, write, and give the text
   // back to whatever box is mounted when the write is refused.
   const liveBox = () => host.querySelector<HTMLInputElement>('input[data-tv-paste]');
-  const takeDraft = (): string => {
+  /** Clear the box of the text that was submitted — and only that: a newer
+   *  link typed during the lookup stays. Says whether it was taken. */
+  const takeDraft = (text: string): boolean => {
     const box = liveBox();
-    const text = box?.value ?? '';
-    if (box) box.value = '';
-    return text;
+    if (!box || box.value !== text) return false;
+    box.value = '';
+    return true;
   };
   const giveBack = (text: string) => {
     const box = liveBox();
@@ -765,24 +771,24 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   };
   host.querySelector<HTMLButtonElement>('[data-tv-play]')?.addEventListener('click', () => {
     const id = host.querySelector<HTMLButtonElement>('[data-tv-play]')!.dataset.tvPlay!;
-    void sourceFromBox(id).then((src) => {
-      if (!src) return;
-      const text = takeDraft();
-      const r = tvPlay(id, src);
-      feedback(r.ok ? `Now on: ${sourceLabel(src)}` : r.error);
-      if (!r.ok) giveBack(text);
+    void sourceFromBox(id).then((got) => {
+      if (!got) return;
+      const taken = takeDraft(got.text);
+      const r = tvPlay(id, got.source);
+      feedback(r.ok ? `Now on: ${sourceLabel(got.source)}` : r.error);
+      if (!r.ok && taken) giveBack(got.text);
       if (r.ok) deps.openTheatre(id);
     });
   });
   host.querySelectorAll<HTMLButtonElement>('[data-tv-schedule]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
     const minutes = Number(b.dataset.tvSchedule);
-    void sourceFromBox(id).then((src) => {
-      if (!src) return;
-      const text = takeDraft();
-      const r = tvSchedule(id, src, Date.now() + minutes * 60_000);
-      feedback(r.ok ? `Scheduled: ${sourceLabel(src)} in ${minutes} min` : r.error);
-      if (!r.ok) giveBack(text);
+    void sourceFromBox(id).then((got) => {
+      if (!got) return;
+      const taken = takeDraft(got.text);
+      const r = tvSchedule(id, got.source, Date.now() + minutes * 60_000);
+      feedback(r.ok ? `Scheduled: ${sourceLabel(got.source)} in ${minutes} min` : r.error);
+      if (!r.ok && taken) giveBack(got.text);
     });
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-history]').forEach((b) => b.addEventListener('click', () => {
