@@ -418,8 +418,20 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
   document.body.appendChild(root);
   const onKey = (e: KeyboardEvent) => {
     // The phone open above the theatre (a hand-over pops it open without
-    // closing this) owns Tab and Escape: its handlers close it or go home.
-    if (phoneIsUp()) return;
+    // closing this): a key typed INTO the phone is the phone's (its TV app
+    // holds its own flight keys), and Tab and Escape are its shortcuts
+    // wherever focus is — they close it or go home. Every other key with
+    // focus OUTSIDE the phone — a theatre button the player clicked, the
+    // body — is still a key pressed over this dialog: held, as below, so W
+    // does not walk the clone behind two overlays (the stick stands aside
+    // for the theatre and cannot hold it).
+    if (phoneIsUp()) {
+      const phone = document.getElementById('spacephone-container');
+      if (phone && e.target instanceof Node && phone.contains(e.target)) return;
+      if (e.key === 'Tab' || e.key === 'Escape') return;
+      e.stopPropagation();
+      return;
+    }
     if (e.key === 'Escape') {
       e.stopPropagation();
       closeTvTheatre();

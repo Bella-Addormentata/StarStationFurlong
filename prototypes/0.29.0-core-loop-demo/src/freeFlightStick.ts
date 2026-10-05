@@ -11,12 +11,14 @@
  * stage) asks the stick to stand aside while it is up (suspendStickKeys):
  * its own capture listener comes after the stick's and would never see a
  * keydown the stick had swallowed. A panel that only wants the keys typed
- * INTO it (the phone's TV remote) marks itself `data-stick-aside` instead:
- * a key whose target is inside it passes the stick by, like a key typed in
- * a text field, while a key pressed with focus elsewhere is still the
- * stick's — so the pilot is never walked away from the helm by a key that
- * was not meant for the panel. Such a panel must stop the flight keys it
- * receives from bubbling on to input.ts itself (isFlightKey says which).
+ * INTO it (the phone's TV remote) marks itself `data-stick-aside` instead,
+ * and only WHILE IT IS ON SCREEN: a key whose target is inside it passes the
+ * stick by, like a key typed in a text field, while a key pressed with
+ * focus elsewhere — or on a control the panel left focused as it slid
+ * offscreen, the mark gone with it — is still the stick's, so the pilot is
+ * never walked away from the helm by a key that was not meant for the
+ * panel. Such a panel must stop the flight keys it receives from bubbling
+ * on to input.ts itself (isFlightKey says which).
  *
  *   W / ↑  thrust forward        S / ↓  thrust back
  *   A / ←  turn left             D / →  turn right

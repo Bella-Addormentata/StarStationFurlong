@@ -440,10 +440,27 @@ function wireTvNav(host: HTMLElement, onScreen: () => boolean = () => tvAppOnScr
  *  the camera rig (the stick no longer stops it), so the bubble listener
  *  below holds every flight key the app's controls were given, after the
  *  control's own action (the button's click, the slider's step) has had it.
- *  Tab and Escape are not flight keys and stay the phone's. */
+ *  Tab and Escape are not flight keys and stay the phone's. The mark and
+ *  the hold go together, and both only while the app is on screen. */
 function wireTvStick(host: HTMLElement): void {
-  if (host.dataset.stickAside) return;
-  host.dataset.stickAside = '1';
+  if (host.dataset.tvStick) return;
+  host.dataset.tvStick = '1';
+  // The mark is carried only while the app is ON SCREEN: the phone slides
+  // offscreen and leaves a focused control behind, and a key on that hidden
+  // control must be the stick's again — with the mark still there the stick
+  // stood aside while this app, not on screen, held nothing back, and W
+  // reached the world. Visibility is watched (the container's class and the
+  // view's), since the phone closes by many paths; closing the phone also
+  // blurs its controls (main.ts), belt and braces.
+  const sync = () => {
+    if (tvAppOnScreen(host)) host.dataset.stickAside = '1';
+    else delete host.dataset.stickAside;
+  };
+  const observer = new MutationObserver(sync);
+  observer.observe(host, { attributes: true, attributeFilter: ['class'] });
+  const phone = host.closest<HTMLElement>('#spacephone-container');
+  if (phone) observer.observe(phone, { attributes: true, attributeFilter: ['class'] });
+  sync();
   host.addEventListener('keydown', (e) => {
     if (e.altKey || e.ctrlKey || e.metaKey) return;
     if (tvAppOnScreen(host) && isFlightKey(e.code)) e.stopPropagation();
