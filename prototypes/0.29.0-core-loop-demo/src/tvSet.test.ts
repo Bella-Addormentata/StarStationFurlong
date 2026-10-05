@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import type { TvScreenView } from './tvDoc';
+import { setConvenienceLanesForTest } from './sovereignty';
 
 let fills = 0;
 function fakeCanvas() {
@@ -128,5 +129,26 @@ describe('the smart TV as built', () => {
     expect(glow!.intensity).toBe(1.1);
     handle.draw(view('off'));
     expect(glow!.intensity).toBe(0);
+  });
+
+  it('draws on the home screen only the tiles this build offers: YOUTUBE and ARCHIVE go with the convenience lanes', () => {
+    const group = build('smart-tv');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
+    const handle = s.tvScreens.get('smart-tv-1')!;
+    try {
+      setConvenienceLanesForTest(false); // the build default: serverless only
+      handle.draw(view('off'));
+      fills = 0;
+      handle.draw(view('home'));
+      const serverless = fills;
+      setConvenienceLanesForTest(true);
+      handle.draw(view('off'));
+      fills = 0;
+      handle.draw(view('home'));
+      expect(fills).toBe(serverless + 2); // one fillRect per tile: two more lanes drawn
+    } finally {
+      setConvenienceLanesForTest(null);
+    }
   });
 });

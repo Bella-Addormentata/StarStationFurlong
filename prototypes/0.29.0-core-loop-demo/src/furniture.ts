@@ -73,6 +73,7 @@ import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
 import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 // 📺 #186: the TV screen draws the view World derives from the room record.
 import type { TvScreenView } from "./tvDoc";
+import { sourceKindAllowed } from "./sovereignty";
 // 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
@@ -9588,6 +9589,19 @@ function buildPartySpeaker(ctx: BuildCtx) {
 // the theatre panel (tvTheatre.ts) plays it and this prop shows status.
 // (Dimensions: TV_W … TV_TEX_H, declared beside the terminal's above.)
 
+/** The home screen's source tiles, in the remote's order (tvUI TILES): the
+ *  source kind each stands for (sovereignty.ts decides which this build
+ *  offers) and whether its lane exists yet (`live`; FILE, TORRENT and
+ *  KARAOKE are plan §3.3's later tiles, drawn dimmed). */
+const TV_HOME_TILES: ReadonlyArray<{ label: string; kind: string; live: boolean }> = [
+  { label: "▶ YOUTUBE", kind: "youtube", live: true },
+  { label: "ARCHIVE", kind: "archive", live: true },
+  { label: "URL", kind: "url", live: true },
+  { label: "FILE", kind: "file", live: false },
+  { label: "TORRENT", kind: "magnet", live: false },
+  { label: "KARAOKE", kind: "karaoke", live: false },
+];
+
 /**
  * The set itself, centred on (0, cy, zFront) with the screen facing +z.
  * Stows the TvScreenHandle on the screen mesh (userData.tvScreen) so both
@@ -9663,16 +9677,21 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
       c2d.fillStyle = g;
       c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
       text("FURLONG TV", TV_TEX_W / 2, 48, "bold 26px monospace", "#f0c060", "center");
-      const tiles = ["▶ YOUTUBE", "ARCHIVE", "URL", "FILE", "TORRENT", "KARAOKE"];
-      tiles.forEach((t, i) => {
+      // The same shelf the phone's remote offers (tvUI visibleTiles): a lane
+      // this build does not offer (sovereignty.ts — YouTube and archive.org
+      // without the convenience lanes) is not drawn, and a tile for a lane
+      // still to come is drawn dimmed. The screen must not show as live
+      // what the remote refuses.
+      const tiles = TV_HOME_TILES.filter((tile) => sourceKindAllowed(tile.kind));
+      tiles.forEach((tile, i) => {
         const x = 24 + (i % 3) * 116;
         const y = 84 + Math.floor(i / 3) * 50;
-        const live = i < 3;
+        const live = tile.live;
         c2d.fillStyle = live ? "rgba(0,229,255,0.10)" : "rgba(255,255,255,0.04)";
         c2d.fillRect(x, y, 104, 38);
         c2d.strokeStyle = live ? "rgba(0,229,255,0.6)" : "rgba(255,255,255,0.12)";
         c2d.strokeRect(x + 0.5, y + 0.5, 103, 37);
-        text(t, x + 52, y + 19, "bold 11px monospace", live ? "#e8f4ff" : "#4a5560", "center");
+        text(tile.label, x + 52, y + 19, "bold 11px monospace", live ? "#e8f4ff" : "#4a5560", "center");
       });
       text(view.detail, TV_TEX_W / 2, 196, "11px monospace", "#8fa3b8", "center");
       glowLevel = 0.5;
