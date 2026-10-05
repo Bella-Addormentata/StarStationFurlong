@@ -232,13 +232,13 @@ import { leaveCoinPusherRoom } from "./pusherCroupier";
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
-import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv, tvNow } from "./tvDoc";
+import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv, tvNow, tvWallNow } from "./tvDoc";
 import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
 import { setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
-import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvLabel, tvRoomPlayers } from "./tvSession";
+import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
 import { FURNITURE } from "./furniture";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -6010,6 +6010,17 @@ function tvLabelFor(itemId: string): string {
 function tvTheatreDeps(itemId: string) {
   return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
 }
+/** WATCH from the phone or the HUD chip: only for a set still in THIS room,
+ *  with the TV drive armed. A WATCH button can outlive its set by up to a
+ *  second (the phone repaints on a timer; the chip on the room tick), and
+ *  the callback stays reachable through a room leave's awaited flush after
+ *  the teardown closed the theatre — opening then would make a theatre no
+ *  room tick ever closes. */
+function openTvTheatreIfPresent(itemId: string): boolean {
+  if (!tvDriveArmed() || !roomTvIds().includes(itemId)) return false;
+  openTvTheatre(itemId);
+  return true;
+}
 
 function currentRoomDeedIsMine(): boolean {
   // The decision lives in roomOwner.ts so it can be unit-tested; this wrapper
@@ -7648,6 +7659,7 @@ function setupSpacePhoneOverlay() {
           myName: () => getPlayerName(),
           roomPlayers: () => tvRoomPlayers(getIdentityPub()),
           openTheatre: (tvId) => {
+            if (!tvDriveArmed() || !roomTvIds().includes(tvId)) return; // the set is gone, or the room is: nothing to watch
             container?.classList.remove("active");
             openTvTheatre(tvId);
           },
@@ -8242,7 +8254,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // trusted for longer than that. (A service impersonating the node
   // deliberately is beyond what this page can tell from here.)
   setOwnMediaOrigins([window.location.origin]);
-  setNodeMediaOrigin(fingerprint ? nodeOrigin : null, tvNow());
+  setNodeMediaOrigin(fingerprint ? nodeOrigin : null, tvNow(), tvWallNow());
   if (!fingerprint) {
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
@@ -9959,7 +9971,7 @@ async function init() {
     return out;
   });
   setTvTheatreDeps(tvTheatreDeps);
-  setTvChipOpener((itemId) => openTvTheatre(itemId));
+  setTvChipOpener((itemId) => { openTvTheatreIfPresent(itemId); });
   // The theatre fetches a peer-written URL only with this viewer's consent
   // (tvConsent.ts). The page's own origin is this viewer's own machine; the
   // node's origin joins it once the node has identified itself through the

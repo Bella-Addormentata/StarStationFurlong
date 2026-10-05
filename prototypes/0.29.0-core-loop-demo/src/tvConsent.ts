@@ -28,7 +28,7 @@
  */
 
 import type { TvSource } from './tvDoc';
-import { tvNow } from './tvDoc';
+import { tvNow, tvWallNow } from './tvDoc';
 import { convenienceLanesEnabled, sourceKindAllowed } from './sovereignty';
 
 export type MediaConsent = 'ok' | 'ask' | 'refuse';
@@ -77,19 +77,26 @@ export function setOwnMediaOrigins(origins: readonly string[]): void {
 export const TV_NODE_TRUST_MS = 90_000;
 
 let nodeOrigin: string | null = null;
+/** Two deadlines, both must hold: the monotonic clock may stop through an
+ *  OS sleep (trust earned a minute before an hour's sleep would still read
+ *  as a minute old on waking, with whatever bound the node's port meanwhile
+ *  trusted at once), and the wall clock may step; the earlier of the two
+ *  ends the trust, so a sleep cannot extend it and a clock step cannot. */
 let nodeTrustUntil = -Infinity;
+let nodeTrustWallUntil = -Infinity;
 
 /** The node's HTTP origin as the fingerprint probe identified it (main.ts),
- *  trusted from `now` for TV_NODE_TRUST_MS; null withdraws it (a probe the
- *  node did not answer). */
-export function setNodeMediaOrigin(origin: string | null, now: number): void {
+ *  trusted from `now` (monotonic) and `wall` for TV_NODE_TRUST_MS; null
+ *  withdraws it (a probe the node did not answer). */
+export function setNodeMediaOrigin(origin: string | null, now: number, wall = tvWallNow()): void {
   nodeOrigin = origin ? normalizeOrigin(origin) : null;
   nodeTrustUntil = nodeOrigin ? now + TV_NODE_TRUST_MS : -Infinity;
+  nodeTrustWallUntil = nodeOrigin ? wall + TV_NODE_TRUST_MS : -Infinity;
 }
 
-/** The node's origin while its trust is live at `now`, else null. */
-export function trustedNodeMediaOrigin(now = tvNow()): string | null {
-  return nodeOrigin && now < nodeTrustUntil ? nodeOrigin : null;
+/** The node's origin while its trust is live at `now` and `wall`, else null. */
+export function trustedNodeMediaOrigin(now = tvNow(), wall = tvWallNow()): string | null {
+  return nodeOrigin && now < nodeTrustUntil && wall < nodeTrustWallUntil ? nodeOrigin : null;
 }
 
 /** The viewer pressed PLAY FROM <host>: that origin is fine for the rest of
@@ -224,11 +231,11 @@ function expandIPv6(ip: string): number[] | null {
  *  The product's own lanes (YouTube, the archive embed) are fetched from
  *  their own origins by their own players: yes with the convenience lanes
  *  on, never with them off (sovereignty.ts). */
-export function mediaConsent(source: TvSource, now = tvNow()): MediaConsent {
+export function mediaConsent(source: TvSource, now = tvNow(), wall = tvWallNow()): MediaConsent {
   if (source.kind !== 'url') return sourceKindAllowed(source.kind) ? 'ok' : 'refuse';
   const origin = normalizeOrigin(source.url);
   if (!origin) return 'refuse';
-  if (ownOrigins.has(origin) || origin === trustedNodeMediaOrigin(now)) return 'ok';
+  if (ownOrigins.has(origin) || origin === trustedNodeMediaOrigin(now, wall)) return 'ok';
   let host: string;
   try {
     host = new URL(origin).hostname;
@@ -246,13 +253,13 @@ export function mediaConsent(source: TvSource, now = tvNow()): MediaConsent {
 
 /** The reason behind a 'refuse' from mediaConsent, for the words on the
  *  screen. */
-export function consentRefusal(source: TvSource, now = tvNow()): ConsentRefusal {
+export function consentRefusal(source: TvSource, now = tvNow(), wall = tvWallNow()): ConsentRefusal {
   if (source.kind !== 'url') return 'lane-off';
   const origin = normalizeOrigin(source.url);
   if (!origin) return 'bad';
   // The node's own origin whose trust has run out: the node, not a stranger,
   // as far as this page last knew — said so, not "a private network".
-  if (nodeOrigin !== null && origin === nodeOrigin && trustedNodeMediaOrigin(now) === null) return 'node-stale';
+  if (nodeOrigin !== null && origin === nodeOrigin && trustedNodeMediaOrigin(now, wall) === null) return 'node-stale';
   let host: string;
   try {
     host = new URL(origin).hostname;

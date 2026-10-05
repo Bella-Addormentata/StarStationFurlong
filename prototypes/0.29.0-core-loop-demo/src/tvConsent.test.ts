@@ -156,3 +156,21 @@ describe('the node origin\'s trust has a lifetime of its own', () => {
     expect(consentRefusal(node, t0 + TV_NODE_TRUST_MS + 20)).toBe('private');
   });
 });
+
+describe('the node origin\'s trust and a sleep', () => {
+  it('ends by wall-clock time too: a frozen monotonic clock through an hour\'s sleep does not extend it', () => {
+    setOwnMediaOrigins(['http://localhost:4173']);
+    const node = url('http://127.0.0.1:8081/blob/abc');
+    const t0 = 5_000_000;
+    const w0 = 1_760_000_000_000;
+    setNodeMediaOrigin('http://127.0.0.1:8081', t0, w0);
+    expect(mediaConsent(node, t0 + 1_000, w0 + 1_000)).toBe('ok');
+    // The lid closes: performance.now() stands still, the wall clock runs on.
+    expect(mediaConsent(node, t0 + 1_000, w0 + 3_600_000)).toBe('refuse');
+    expect(consentRefusal(node, t0 + 1_000, w0 + 3_600_000)).toBe('node-stale');
+    expect(trustedNodeMediaOrigin(t0 + 1_000, w0 + 3_600_000)).toBeNull();
+    // And the other way: a wall clock stepped back cannot revive a trust the monotonic clock has ended.
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS, w0 - 3_600_000)).toBe('refuse');
+    setNodeMediaOrigin(null, t0, w0);
+  });
+});
