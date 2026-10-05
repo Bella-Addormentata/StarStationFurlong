@@ -235,7 +235,7 @@ import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDo
 import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv, tvNow, tvWallNow } from "./tvDoc";
 import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
-import { setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
+import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
 import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
@@ -3171,6 +3171,12 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   closeTvTheatre();
   updateTvChip([]);
   leaveTvRoom(roomTvIds());
+  // What this viewer agreed to fetch was agreed for THIS room: the origins
+  // accepted with PLAY FROM, the probe's verdicts and the sets' mount
+  // budgets go with it, so a peer in the next room cannot reuse an origin
+  // approved here without asking, and a reused set id inherits no spent
+  // budget. The node's trust is the probe's, not the room's, and stays.
+  forgetMediaConsent();
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -8229,7 +8235,12 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     const ctl = new AbortController();
     const deadline = window.setTimeout(() => ctl.abort(), FINGERPRINT_PROBE_MS);
     try {
-      const res = await fetch(`${origin}/api/fingerprint`, { signal: ctl.signal });
+      // No redirect: the trust that follows goes to the origin probed, so the
+      // answer must be that origin's own. A stranger on 8080 redirecting to
+      // the node on 8081 would otherwise have 8080 trusted on the node's
+      // fingerprint; with redirects refused the fetch throws and the next
+      // port is tried.
+      const res = await fetch(`${origin}/api/fingerprint`, { signal: ctl.signal, redirect: "error" });
       if (!res.ok) continue;
       // The body read runs under the same signal: a port that answers the
       // headers and then trickles is cut off at the deadline too.
