@@ -234,11 +234,11 @@ import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDo
 // room-level duties (lease renewals, the hand-back on leave).
 import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv } from "./tvDoc";
 import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
-import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
+import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
 import { setOwnMediaOrigins } from "./tvConsent";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
-import { armTvDrive, leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
+import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvLabel, tvRoomPlayers } from "./tvSession";
 import { FURNITURE } from "./furniture";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -5999,11 +5999,14 @@ function syncVentureLedgerFromCurrentRoom(): void {
  *  `categorizeRoom`, which now files them as 'visited'. */
 // 📺 #186: the room's TVs, as the phone remote and the leave hand-back see them.
 function roomTvIds(): string[] {
-  return FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
+  return FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
 }
 function tvLabelFor(itemId: string): string {
-  return FURNITURE.find((i) => i.id === itemId)?.kind === "tv-stand" ? "TV ON THE STAND" : "WALL TV";
+  return tvLabel(FURNITURE.find((i) => i.id === itemId)?.kind);
 }
+/** Installed on the theatre (setTvTheatreDeps) so every WATCH — the set's
+ *  panel in world.ts, the phone, the HUD chip — opens it with the same label
+ *  and the same round-trip lead. */
 function tvTheatreDeps(itemId: string) {
   return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
 }
@@ -7646,7 +7649,7 @@ function setupSpacePhoneOverlay() {
           roomPlayers: () => tvRoomPlayers(getIdentityPub()),
           openTheatre: (tvId) => {
             container?.classList.remove("active");
-            openTvTheatre(tvId, tvTheatreDeps(tvId));
+            openTvTheatre(tvId);
           },
           resolveArchive: resolveArchiveFile,
         });
@@ -9949,7 +9952,8 @@ async function init() {
     }
     return out;
   });
-  setTvChipOpener((itemId) => openTvTheatre(itemId, tvTheatreDeps(itemId)));
+  setTvTheatreDeps(tvTheatreDeps);
+  setTvChipOpener((itemId) => openTvTheatre(itemId));
   // The theatre fetches a peer-written URL only with this viewer's consent
   // (tvConsent.ts). The page's own origin is this viewer's own machine; the
   // node's origin joins it once the node has identified itself through the

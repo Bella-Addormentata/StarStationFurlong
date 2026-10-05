@@ -342,6 +342,16 @@ export interface TheatreDeps {
   rttMs?: () => number;
 }
 
+/** Where the deps come from when a caller names none: main.ts installs one
+ *  builder (the label from the furniture kind, the round trip from the
+ *  network provider), so the set's panel, the phone's WATCH and the HUD
+ *  chip open the same theatre — one entry point must not run without the
+ *  lead the others apply. */
+let depsProvider: (itemId: string) => TheatreDeps = () => ({});
+export function setTvTheatreDeps(provider: (itemId: string) => TheatreDeps): void {
+  depsProvider = provider;
+}
+
 export function isTvTheatreOpen(itemId?: string): boolean {
   return theatre !== null && (itemId === undefined || theatre.itemId === itemId);
 }
@@ -350,7 +360,7 @@ export function tvTheatreItemId(): string | null {
   return theatre?.itemId ?? null;
 }
 
-export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
+export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(itemId)): void {
   if (theatre && theatre.itemId !== itemId) closeTvTheatre();
   if (theatre) {
     // Already up on this set — the phone's WATCH after a hand-over put the

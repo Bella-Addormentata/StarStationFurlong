@@ -205,7 +205,7 @@ import { listContacts, getContact } from "./contacts";
 // screen view the prop draws.
 import { createSmartTvUI } from "./tvUI";
 import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
-import { forgetTv, tickTvRoom, tvDriveArmed, tvRoomPlayers } from "./tvSession";
+import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
@@ -3180,7 +3180,7 @@ export class World {
     // id is excluded by hand; under the same drive flag as the tick, so a
     // teardown cannot put a departed room's chip back up.
     if (tvDriveArmed()) {
-      updateTvChip(FURNITURE.filter((i) => (i.kind === "smart-tv" || i.kind === "tv-stand") && i.id !== itemId).map((i) => i.id));
+      updateTvChip(FURNITURE.filter((i) => isTvKind(i.kind) && i.id !== itemId).map((i) => i.id));
     }
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
@@ -4025,7 +4025,7 @@ export class World {
       // with the last set gone, an empty list is what takes a stale chip
       // down and clears the session's bookkeeping.
       if (tvDriveArmed()) {
-        const tvIds = FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
+        const tvIds = FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
         for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
         tickTvRoom(tvIds);
         updateTvChip(tvIds);
@@ -6153,15 +6153,16 @@ export class World {
     // 📺 #186: the set's body buttons, WATCH, and the remote. The programme
     // itself is chosen on the remote (the phone's TV app), as on a real set.
     if (device.kind === "smartTv") {
-      const kind = FURNITURE.find((i) => i.id === deviceId)?.kind;
-      const label = kind === "tv-stand" ? "TV ON THE STAND" : "WALL TV";
+      const label = tvLabel(FURNITURE.find((i) => i.id === deviceId)?.kind);
       const ui = createSmartTvUI({
         itemId: deviceId,
         label,
         myPub: () => getIdentityPub(),
         myName: () => getPlayerName(),
         roomPlayers: () => tvRoomPlayers(getIdentityPub()),
-        openTheatre: () => deviceFocus.releaseThen(() => openTvTheatre(deviceId, { label })),
+        // The deps main.ts installed (setTvTheatreDeps): the same label and
+        // round-trip lead as the chip's and the phone's WATCH.
+        openTheatre: () => deviceFocus.releaseThen(() => openTvTheatre(deviceId)),
         openRemote: () =>
           deviceFocus.releaseThen(() =>
             (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.(),

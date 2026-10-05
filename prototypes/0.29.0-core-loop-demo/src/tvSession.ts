@@ -21,6 +21,18 @@ import {
   subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
+/** The furniture kinds that are a TV set, and what each is called in the
+ *  panels, the chip and the theatre — one place for both, so a third
+ *  mounting is a one-line change (world.ts, main.ts and the theatre all
+ *  read these). */
+const TV_KINDS: ReadonlySet<string> = new Set(['smart-tv', 'tv-stand']);
+export function isTvKind(kind: string | undefined): boolean {
+  return kind !== undefined && TV_KINDS.has(kind);
+}
+export function tvLabel(kind: string | undefined): string {
+  return kind === 'tv-stand' ? 'TV ON THE STAND' : 'WALL TV';
+}
+
 export interface RoomPlayer {
   pub: string;
   name: string;

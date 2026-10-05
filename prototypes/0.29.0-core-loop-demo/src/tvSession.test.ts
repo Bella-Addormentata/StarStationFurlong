@@ -5,6 +5,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { isTvKind, tvLabel } from './tvSession';
 import {
   bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, setTvClock,
   setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
@@ -467,5 +468,17 @@ describe('tickTvRoom', () => {
       { pub: 'AAAAme', name: 'Me' }, { pub: 'BBBB', name: 'Bob' }, { pub: '', name: 'legacy' },
     ]);
     expect(tvRoomPlayers('AAAAme')).toEqual([{ pub: 'BBBB', name: 'Bob' }]);
+  });
+});
+
+describe('the TV kinds, in one place', () => {
+  it('names both sets and nothing else, and labels each for the panels, the chip and the theatre', () => {
+    expect(isTvKind('smart-tv')).toBe(true);
+    expect(isTvKind('tv-stand')).toBe(true);
+    expect(isTvKind('wall-computer')).toBe(false);
+    expect(isTvKind(undefined)).toBe(false);
+    expect(tvLabel('tv-stand')).toBe('TV ON THE STAND');
+    expect(tvLabel('smart-tv')).toBe('WALL TV');
+    expect(tvLabel(undefined)).toBe('WALL TV'); // a set whose record is gone still has a name on the chip
   });
 });
