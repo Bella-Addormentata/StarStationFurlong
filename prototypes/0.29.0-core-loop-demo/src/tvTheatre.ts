@@ -792,7 +792,7 @@ function renderTheatreChrome(t: Theatre): void {
     // a frame that never loaded gives no sign of it: RELOAD is the retry.
     startOnly
       ? '<span class="tv-theatre-lane">volume: in archive.org\'s player</span>'
-      : `<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="1" aria-label="Set volume"></label>`,
+      : '<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" data-tv-volume="1" aria-label="Set volume"></label>',
     startOnly && t.player ? btn('data-tv-reload="1"', '↻ RELOAD PLAYER', "archive.org's player did not load? Reload it") : '',
     !mine && mayPickUpRemote(t.itemId) ? btn('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE') : '',
     !mine && held ? `<span class="tv-theatre-lane">${escapeHtml(remote.name || 'someone')} has the remote</span>` : '',
@@ -826,6 +826,15 @@ function renderTheatreChrome(t: Theatre): void {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));
     });
     c.querySelector<HTMLButtonElement>('[data-tv-reload]')?.addEventListener('click', () => { t.mounted = ''; });
+  }
+  // The slider's level is a property, not part of the row's HTML: a peer's
+  // VOLUME press on the set moves the knob without rebuilding the row under
+  // a pointer mid-drag, and a slider the player is on keeps its own reading
+  // until its change lands.
+  const slider = t.controls.querySelector<HTMLInputElement>('[data-tv-volume]');
+  if (slider && document.activeElement !== slider) {
+    const level = String(rec.volume);
+    if (slider.value !== level) slider.value = level;
   }
 }
 

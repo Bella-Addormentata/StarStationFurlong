@@ -119,6 +119,18 @@ function refreshStatus(root: HTMLElement): void {
   });
 }
 
+/** The volume sliders' level, set as a property rather than written into
+ *  the panel's HTML: a peer's VOLUME press on the set then moves the knob
+ *  without rebuilding the panel under a pointer mid-drag, and a slider the
+ *  player is on keeps its own reading until its change lands. */
+function syncVolumeSliders(root: HTMLElement): void {
+  root.querySelectorAll<HTMLInputElement>('input[data-tv-volume]').forEach((i) => {
+    if (document.activeElement === i) return;
+    const level = String(readTv(i.dataset.tvVolume!).volume);
+    if (i.value !== level) i.value = level;
+  });
+}
+
 function remoteLine(itemId: string, myPub: string): string {
   const r = readRemote(itemId);
   if (!r.holder || remoteLapsed(itemId)) return 'The remote is on the set.';
@@ -315,8 +327,11 @@ const SCHEDULE_CHOICES: Array<{ label: string; minutes: number }> = [
 
 let phoneSubscribed = false;
 let activeTile = '';
-let phoneClockTimer = 0;
 let phoneHtml = '';
+/** The deps of the latest renderTvPhoneApp call: the one subscribed paint
+ *  reads these, so a view reopened with fresh deps repaints with them, not
+ *  with the ones the first open happened to capture. */
+let phoneDeps: TvPhoneDeps | null = null;
 
 /** The controls ↑/↓ step through, and that focus lands on. */
 const NAV_STOPS = 'button:not([disabled]), input, select';
@@ -428,9 +443,11 @@ export function focusTvApp(host: HTMLElement): void {
 export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
   wireTvNav(host);
   wireTvStick(host);
+  phoneDeps = deps;
   const paint = () => {
     if (!host.classList.contains('active')) return;
-    const html = renderTvApp(deps);
+    const d = phoneDeps ?? deps;
+    const html = renderTvApp(d);
     // Rebuild only when something other than the clock changed (the status
     // spans tick in place); the clocks move on the timer without a write.
     if (html !== phoneHtml || host.childElementCount === 0) {
@@ -449,7 +466,7 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
         : null;
       host.innerHTML = html;
       phoneHtml = html;
-      wireTvApp(host, deps);
+      wireTvApp(host, d);
       if (inside) {
         const again = focusKey ? host.querySelector<HTMLElement>(focusKey) : null;
         (again ?? host).focus({ preventScroll: true });
@@ -460,13 +477,16 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       }
     }
     refreshStatus(host);
+    syncVolumeSliders(host);
   };
+  // One subscription and one clock for the life of the page: the view
+  // element is the same on every open (main.ts's #phone-app-tv), and the
+  // paint reads the latest deps through phoneDeps.
   if (!phoneSubscribed) {
     phoneSubscribed = true;
     subscribeTv(paint);
-    phoneClockTimer = window.setInterval(paint, 1000);
+    window.setInterval(paint, 1000);
   }
-  void phoneClockTimer;
   paint();
 }
 
@@ -547,7 +567,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
         ${seekable && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
         ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek or volume from here</span>` : ''}
         ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
-        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
+        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
       </div>`
     : '';
   const history = rec.history.length
