@@ -100,9 +100,14 @@ export interface TvProgramme {
   /** …stamped with a per-write counter: a NEW seq is a new sample, which is
    *  what a receiver anchors its own clock to. Never a wall-clock time. */
   seq: number;
-  /** The seq of the write that STARTED the current programme (PLAY NOW, a
-   *  schedule): a replay of the same source is a new start, which a player
-   *  that cannot seek (the archive embed) needs to know. */
+  /** The programme revision: a counter of its own, moved by every write
+   *  that STARTS a programme (PLAY NOW, a schedule) and by nothing else — a
+   *  replay of the same source is a new start, which a player that cannot
+   *  seek (the archive embed) needs to know, and which the sync loop tells
+   *  from drift by this moving. Its own counter, not derived from `seq`: a
+   *  shape-valid peer record with `seq: 0, started: 1` would otherwise leave
+   *  it unmoved by the next start, and a same-source replay would read as
+   *  ordinary drift. */
   started: number;
   /** The programme-ACTION revision: bumped by every transport write (play,
    *  schedule, pause, resume, seek, stop, power) and never by a heartbeat.
@@ -805,7 +810,7 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock()): TvA
     startAt: 0,
     positionMs: 0,
     seq: bump(rec.seq),
-    started: bump(rec.seq),
+    started: bump(rec.started),
     jump: bump(rec.jump),
     endMs: 0, // a new programme: its player says where it ends
     history: withHistory(rec, clean, now),
@@ -830,7 +835,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     startAt: Math.floor(startAt),
     positionMs: 0,
     seq: bump(rec.seq),
-    started: bump(rec.seq),
+    started: bump(rec.started),
     jump: bump(rec.jump),
     endMs: 0,
     history: withHistory(rec, clean, now),

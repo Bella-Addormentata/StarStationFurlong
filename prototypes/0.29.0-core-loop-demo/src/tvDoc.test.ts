@@ -312,7 +312,7 @@ describe('the programme', () => {
     tvResume(TV);
     expect(readTv(TV).jump).toBe(4);
     tvPlay(TV, FILM); // the same film again is a new START
-    expect(readTv(TV)).toMatchObject({ seq: 6, started: 6, jump: 5 });
+    expect(readTv(TV)).toMatchObject({ seq: 6, started: 2, jump: 5 }); // `started` counts starts, not writes
     tvStop(TV);
     expect(readTv(TV).jump).toBe(6);
     // POWER is its own key: it moves the lookup revision, never the programme.
@@ -958,5 +958,26 @@ describe('the in-world screen', () => {
     expect(tvScreenView(TV)).toMatchObject({ state: 'playing', title: 'METROPOLIS', lane: 'CONVENIENCE', clockText: '1:01' });
     tvPause(TV, 61_000);
     expect(tvScreenView(TV).detail).toBe('PAUSED · REMOTE · Alice');
+  });
+});
+
+describe('`started` is a counter of its own', () => {
+  it('moves on every start whatever a peer wrote into seq and started — a start never reads as drift', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    // A shape-valid peer record with the counters out of step: derived from
+    // seq, `started` would come back as 1 — unmoved — on the next start.
+    doc.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), seq: 0, started: 1 });
+    expect(readTv(TV)).toMatchObject({ seq: 0, started: 1 });
+    tvPlay(TV, FILM);
+    expect(readTv(TV).started).toBe(2);
+    tvSchedule(TV, FILM, now + 60_000, now);
+    expect(readTv(TV).started).toBe(3);
+    tvHeartbeat(TV, 1_000); // never a heartbeat
+    expect(readTv(TV).started).toBe(3);
+    // The other way round too: a peer's `started` far ahead of `seq`.
+    doc.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), seq: 1, started: 40 });
+    tvPlay(TV, FILM);
+    expect(readTv(TV).started).toBe(41);
   });
 });
