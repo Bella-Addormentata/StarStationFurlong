@@ -111,10 +111,12 @@ class YouTubePlayerAdapter implements Adapter {
   private state = -1;
   private readonly readyTimer: number;
 
-  /** `autoplay` only when the room is playing at mount time: a countdown or
-   *  a paused set must not sound for the 400 ms before the controller's
-   *  first tick — the controller starts the player when the record says. */
-  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void, autoplay = true) {
+  /** No `autoplay`: the controller starts the player when the record says,
+   *  on its first tick after the player is ready — and only after it has
+   *  applied the set's volume. With autoplay the iframe sounded at the
+   *  player's own level for the tick before that, a set at volume 0
+   *  included; and a countdown or a paused set must not sound at all. */
+  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void, autoplay = false) {
     const mount = document.createElement('div');
     host.appendChild(mount);
     const playerVars: Record<string, unknown> = {
@@ -601,9 +603,13 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
   if (source.kind === 'youtube') {
     showNotice(t, `<div>REACHING YOUTUBE…</div><div class="tv-theatre-lane">CONVENIENCE LANE</div>`);
     loadYouTubeApi().then(
-      (yt) => adopt(new YouTubePlayerAdapter(
-        t.screen, source.videoId, yt, fail, readPlayback(t.itemId).state === 'playing',
-      )),
+      (yt) => {
+        // The programme moved on (or the theatre closed) while the API
+        // loaded: build no iframe for it — adopt() would destroy one, but
+        // the constructor had already inserted it and started its load.
+        if (!live()) return;
+        adopt(new YouTubePlayerAdapter(t.screen, source.videoId, yt, fail));
+      },
       (err: Error) => fail(err.message || 'YouTube is unreachable'),
     );
     return;
@@ -881,7 +887,11 @@ function renderTheatreChrome(t: Theatre): void {
     c.querySelector<HTMLInputElement>('[data-tv-volume]')?.addEventListener('change', (e) => {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));
     });
-    c.querySelector<HTMLButtonElement>('[data-tv-reload]')?.addEventListener('click', () => { t.mounted = ''; });
+    // RELOAD takes the old embed down first (unmountPlayer clears the key):
+    // clearing the key alone left the iframe and its controller alive
+    // behind the PLAY notice when the replacement had to wait for the
+    // mount budget, the old film still playing.
+    c.querySelector<HTMLButtonElement>('[data-tv-reload]')?.addEventListener('click', () => { unmountPlayer(t); });
   }
   // The slider's level is a property, not part of the row's HTML: a peer's
   // VOLUME press on the set moves the knob without rebuilding the row under
