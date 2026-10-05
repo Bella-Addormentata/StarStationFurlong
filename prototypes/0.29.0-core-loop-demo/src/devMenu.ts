@@ -120,6 +120,8 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
   'coin-pusher': '🪙 COIN PUSHER',
+  'smart-tv': '📺 SMART TV (WALL)',
+  'tv-stand': '📺 TV ON A STAND',
   'cake-table': '🎂 CAKE TABLE',
   'gift-box': '🎁 GIFT BOX',
   'birthday-banner': '🎊 BIRTHDAY BANNER',
@@ -520,7 +522,7 @@ function spawnFurniture(kind: FurnitureKind): void {
   const spot: { x: number; z: number; rot?: Rot; mountParent?: string } | null =
     FURNITURE_DEFS[kind].mount === 'exterior-wall'
       ? findFreeExteriorSpot(kind, item, world.getPlayer().getPosition())
-      : findSpawnSpot(world, item);
+      : findSpawnSpot(world, item); // 📺 interior wall kinds (the TV) hang on the wall it finds
   if (!spot) {
     showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (room is full).`);
     return;

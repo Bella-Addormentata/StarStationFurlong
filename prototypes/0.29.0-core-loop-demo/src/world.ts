@@ -169,6 +169,7 @@ import { registerFurnitureHandles } from "./furnitureHandles";
 import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
+  TvScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
@@ -200,6 +201,12 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerId, getPlayerName } from "./identity";
 import { listContacts, getContact } from "./contacts";
+// 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
+// screen view the prop draws.
+import { createSmartTvUI } from "./tvUI";
+import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
+import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
+import { tvScreenView } from "./tvDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -446,6 +453,11 @@ export class World {
    *  slot-machine visuals; the userData key on the upper platform mesh carries
    *  the handle so the traversal below picks it up. */
   private coinPusherVisuals: Map<string, CoinPusherVisualHandle> = new Map();
+  /** 📺 Smart-TV screens (#186), keyed by item id — redrawn at ~2 Hz from
+   *  the room record (tvDoc.tvScreenView); the handle dedupes identical views. */
+  private tvScreens: Map<string, TvScreenHandle> = new Map();
+  /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the chip). */
+  private tvTimer = 0;
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -1729,6 +1741,7 @@ export class World {
       coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
+      tvScreens: this.tvScreens,
     };
   }
 
@@ -3155,6 +3168,20 @@ export class World {
     this.coinPusherVisuals.delete(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
+    this.tvScreens.delete(itemId);
+    // 📺 #186: a removed set takes its theatre and this client's hold on its
+    // remote with it — nothing keeps playing, or heartbeating, to a record
+    // whose set is gone (no-ops for every other kind).
+    if (isTvTheatreOpen(itemId)) closeTvTheatre();
+    forgetTv(itemId);
+    // And its WATCH chip, now, not at the next half-second tick: a chip
+    // left clickable in that gap would reopen the removed set's theatre,
+    // which later ticks would never close. Runs pre-splice, so the removed
+    // id is excluded by hand; under the same drive flag as the tick, so a
+    // teardown cannot put a departed room's chip back up.
+    if (tvDriveArmed()) {
+      updateTvChip(FURNITURE.filter((i) => isTvKind(i.kind) && i.id !== itemId).map((i) => i.id));
+    }
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3979,6 +4006,29 @@ export class World {
             screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
           );
         }
+      }
+    }
+
+    // 📺 #186: the TVs at 2 Hz — each screen draws the view the room record
+    // implies (the handle skips unchanged views), a holder renews its remote
+    // and keeps the room's clock alive, and the HUD chip says what is on.
+    // Driven here, not by timers of their own, so a removed set stops dead.
+    this.tvTimer += deltaTime;
+    if (this.tvTimer >= 0.5) {
+      this.tvTimer = 0;
+      // Nothing while a room is being left (tvSession's drive flag, cleared
+      // synchronously by leaveRoomNow and armed again once the next room's
+      // docs and layout are bound): this loop keeps running through the
+      // leave's awaited flush, with the old furniture and the old TV doc
+      // still here — a tick then would put the departed room's WATCH chip
+      // back up, with its theatre a click away. Otherwise unconditionally:
+      // with the last set gone, an empty list is what takes a stale chip
+      // down and clears the session's bookkeeping.
+      if (tvDriveArmed()) {
+        const tvIds = FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
+        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+        tickTvRoom(tvIds);
+        updateTvChip(tvIds);
       }
     }
 
@@ -6095,6 +6145,37 @@ export class World {
         defaultGate: () => boardGate(null, roomGates()),
         // Dim the in-world screen while focused, as the terminal does (D0.4).
         onEngagedChange: (engaged) => screen?.setEngaged(engaged),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // 📺 #186: the set's body buttons, WATCH, and the remote. The programme
+    // itself is chosen on the remote (the phone's TV app), as on a real set.
+    if (device.kind === "smartTv") {
+      const label = tvLabel(FURNITURE.find((i) => i.id === deviceId)?.kind);
+      const ui = createSmartTvUI({
+        itemId: deviceId,
+        label,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        roomPlayers: () => tvRoomPlayers(getIdentityPub()),
+        // The deps main.ts installed (setTvTheatreDeps): the same label and
+        // round-trip lead as the chip's and the phone's WATCH.
+        // Opened in the continuation, which runs after the focus eases out:
+        // a room leave may have begun meanwhile (leaveRoomNow closes the
+        // theatre, then awaits the flush while World keeps updating), so the
+        // drive and the set are checked again THERE, as the phone's and the
+        // chip's WATCH check them — else this reopened a theatre no room
+        // tick would close.
+        openTheatre: () =>
+          deviceFocus.releaseThen(() => {
+            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) openTvTheatre(deviceId);
+          }),
+        openRemote: () =>
+          deviceFocus.releaseThen(() =>
+            (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.(),
+          ),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

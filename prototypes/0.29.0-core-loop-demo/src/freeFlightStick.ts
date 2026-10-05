@@ -6,7 +6,19 @@
  * listener swallows their keydowns before the avatar's WASD (input.ts), the
  * camera rig's keys or the device focus see them, so flying never walks the
  * pilot away from the helm. Key-ups pass through, so nothing else is left
- * holding a key down. Esc still steps back from the helm as usual.
+ * holding a key down. Esc still steps back from the helm as usual. An
+ * overlay that takes the keyboard for itself (the TV theatre, the arcade
+ * stage) asks the stick to stand aside while it is up (suspendStickKeys):
+ * its own capture listener comes after the stick's and would never see a
+ * keydown the stick had swallowed. A panel that only wants the keys typed
+ * INTO it (the phone's TV remote) marks itself `data-stick-aside` instead,
+ * and only WHILE IT IS ON SCREEN: a key whose target is inside it passes the
+ * stick by, like a key typed in a text field, while a key pressed with
+ * focus elsewhere — or on a control the panel left focused as it slid
+ * offscreen, the mark gone with it — is still the stick's, so the pilot is
+ * never walked away from the helm by a key that was not meant for the
+ * panel. Such a panel must stop the flight keys it receives from bubbling
+ * on to input.ts itself (isFlightKey says which).
  *
  *   W / ↑  thrust forward        S / ↓  thrust back
  *   A / ←  turn left             D / →  turn right
@@ -37,14 +49,31 @@ const DEADZONE = 0.15;
 
 let taken = false;
 const held = new Set<string>();
+/** How many overlays that take the keyboard are up above the helm: while
+ *  any is, the flight keys pass the stick by. A count, as one may open above
+ *  another (the phone over the theatre). */
+let standingAside = 0;
 
 function isTyping(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true);
 }
 
+/** Whether the key was pressed with focus inside a panel marked
+ *  `data-stick-aside` (the phone's TV remote): the key is the panel's. */
+function insideStandingAsidePanel(target: EventTarget | null): boolean {
+  const el = target as (HTMLElement & { closest?: (sel: string) => Element | null }) | null;
+  return !!el && typeof el.closest === 'function' && el.closest('[data-stick-aside]') !== null;
+}
+
+/** Whether a key code is one the stick binds (W/A/S/D/Q/E/X, the arrows,
+ *  Space): what a `data-stick-aside` panel must keep from reaching input.ts. */
+export function isFlightKey(code: string): boolean {
+  return ACTION_OF.has(code);
+}
+
 function onKeyDown(e: KeyboardEvent): void {
-  if (!taken || isTyping(e.target)) return;
+  if (!taken || standingAside > 0 || isTyping(e.target) || insideStandingAsidePanel(e.target)) return;
   const action = ACTION_OF.get(e.code);
   if (!action) return;
   held.add(e.code);
@@ -81,6 +110,23 @@ export function releaseStickKeys(): void {
 
 export function stickKeysTaken(): boolean {
   return taken;
+}
+
+/** An overlay that takes the keyboard has opened above the helm: the flight
+ *  keys are its until the returned release is called (once; a second call
+ *  does nothing). Keys held at that moment are let go, as on a blur, so
+ *  nothing flies the ship from behind a dialog; the gamepad is not the
+ *  keyboard and is untouched. Fine to call while the stick is not taken: a
+ *  stick taken while the overlay is up stands aside the same. */
+export function suspendStickKeys(): () => void {
+  standingAside += 1;
+  held.clear();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    standingAside -= 1;
+  };
 }
 
 function axis(v: number | undefined): number {

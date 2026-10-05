@@ -32,6 +32,7 @@ import type {
   DeviceTemplate,
   WallComputerStatus,
   WallScreenHandle,
+  TvScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
@@ -70,6 +71,9 @@ import {
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
 import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
+// 📺 #186: the TV screen draws the view World derives from the room record.
+import type { TvScreenView } from "./tvDoc";
+import { sourceKindAllowed } from "./sovereignty";
 // 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
@@ -188,7 +192,10 @@ export type FurnitureKind =
   | "beach-raft"
   | "jungle-plant"
   // 🌹 Tall yellow climbing rose on a trellis — hangs on an interior wall.
-  | "climbing-rose";
+  | "climbing-rose"
+  // 📺 The smart TV (#186): on the wall like the terminal, or on a low stand.
+  | "smart-tv"
+  | "tv-stand";
 
 export interface FurnitureItem {
   id: string;
@@ -1712,6 +1719,24 @@ const WC_W = 0.9; // housing width
 const WC_H = 0.7; // housing height
 const WC_D = 0.12; // housing depth
 const WC_Y = 1.6; // mount height (panel centre)
+
+// 📺 Smart TV dimensions (#186) — declared beside the terminal's because the
+// registry table below reads them (consts are not hoisted); the builders
+// themselves sit after the party props.
+/** Set width / height (the panel, bezel included): a 1.3 m set (≈58"),
+ *  16:9 plus a bezel — big enough to read across a room, narrow enough to
+ *  hang between a doorway and a corner in the default 2×2 module. */
+const TV_W = 1.3;
+const TV_H = 0.8;
+const TV_D = 0.07;
+/** Wall mount: panel centre height — eye level, like the terminal. */
+const TV_WALL_Y = 1.55;
+/** The stand's cabinet, and the panel's centre standing on it. */
+const TV_STAND_CAB_H = 0.5;
+const TV_STAND_SCREEN_Y = TV_STAND_CAB_H + 0.06 + TV_H / 2;
+/** Screen texture: 16:9, pixel-text sharp at the prop's size. */
+const TV_TEX_W = 384;
+const TV_TEX_H = 216;
 
 const buildWallComputer = (ctx: BuildCtx) => {
   const { m, place } = ctx;
@@ -4048,6 +4073,38 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.30, z: -0.85 },
       anchor: { x: 0, y: 0.90, z: 0.05 },
+    },
+  },
+  // 📺 Smart TV on the wall (#186): the terminal's frame — flush-mounted,
+  // screen faces local +z into the room, never an obstacle. The device front
+  // is a pace back so the set reads as a whole from the focus camera.
+  "smart-tv": {
+    kind: "smart-tv",
+    build: buildSmartTv,
+    footprint: null,
+    wallMount: { halfW: TV_W / 2 + 0.05 },
+    functions: ["smartTv"],
+    device: {
+      kind: "smartTv",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.5, z: 1.1 },
+      anchor: { x: 0, y: TV_WALL_Y, z: 0.05 },
+    },
+  },
+  // 📺 The same set on a low cabinet: a 2×1 floor item (a real obstacle),
+  // screen facing local +z. Same focus idiom as the game table.
+  "tv-stand": {
+    kind: "tv-stand",
+    build: buildTvStand,
+    footprint: { w: 2, d: 1 },
+    functions: ["smartTv"],
+    device: {
+      kind: "smartTv",
+      front: { x: 0, z: 1.5 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.3, z: 1.4 },
+      anchor: { x: 0, y: TV_STAND_SCREEN_Y, z: 0.1 },
     },
   },
 };
@@ -9519,6 +9576,194 @@ function buildPartySpeaker(ctx: BuildCtx) {
   };
   carrier.userData.propAnim = anim;
   carrier.userData.disposeAudio = () => voice.dispose();
+}
+
+// ── 📺 Smart TV (#186) ────────────────────────────────────────────────────────
+// A flat set with a live CanvasTexture screen, in two mountings: on the wall
+// (the terminal's flush-mount idiom) and on a low stand (a 2×1 floor item).
+// The screen draws the view World derives from the room record at ~2 Hz
+// (tvDoc.tvScreenView): the home screen with its source tiles, the
+// scheduled countdown, the now-playing card with its lane badge, or black.
+// The PICTURE is not on this plane in v1 (plan §3.4): a cross-origin iframe
+// cannot be sampled into a texture and a CORS-less <video> taints one, so
+// the theatre panel (tvTheatre.ts) plays it and this prop shows status.
+// (Dimensions: TV_W … TV_TEX_H, declared beside the terminal's above.)
+
+/** The home screen's source tiles, in the remote's order (tvUI TILES): the
+ *  source kind each stands for (sovereignty.ts decides which this build
+ *  offers) and whether its lane exists yet (`live`; FILE, TORRENT and
+ *  KARAOKE are plan §3.3's later tiles, drawn dimmed). */
+const TV_HOME_TILES: ReadonlyArray<{ label: string; kind: string; live: boolean }> = [
+  { label: "▶ YOUTUBE", kind: "youtube", live: true },
+  { label: "ARCHIVE", kind: "archive", live: true },
+  { label: "URL", kind: "url", live: true },
+  { label: "FILE", kind: "file", live: false },
+  { label: "TORRENT", kind: "magnet", live: false },
+  { label: "KARAOKE", kind: "karaoke", live: false },
+];
+
+/**
+ * The set itself, centred on (0, cy, zFront) with the screen facing +z.
+ * Stows the TvScreenHandle on the screen mesh (userData.tvScreen) so both
+ * registration paths file it (furnitureHandles.ts).
+ */
+function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
+  const { m, place, addLight } = ctx;
+  const HOUSING = 0x1a1f2a; // near-black bezel
+  const TRIM = 0x3d4a5e;
+  const ACCENT = 0xd4a84b;
+
+  place(new THREE.BoxGeometry(TV_W, TV_H, TV_D - 0.02), m(HOUSING, 0.55, 0.35), 0, cy, zBack + TV_D / 2 - 0.01);
+  // A thin gold trim along the bottom edge — the "soundbar".
+  place(new THREE.BoxGeometry(TV_W * 0.92, 0.03, 0.03), m(ACCENT, 0.4, 0.5), 0, cy - TV_H / 2 + 0.03, zBack + TV_D - 0.005);
+  place(new THREE.BoxGeometry(TV_W - 0.06, TV_H - 0.06, 0.012), m(TRIM, 0.5, 0.3), 0, cy, zBack + TV_D - 0.012);
+
+  const cv = document.createElement("canvas");
+  cv.width = TV_TEX_W;
+  cv.height = TV_TEX_H;
+  const c2d = cv.getContext("2d")!;
+  const screenTex = new THREE.CanvasTexture(cv);
+  screenTex.minFilter = THREE.LinearFilter;
+  screenTex.magFilter = THREE.LinearFilter;
+  screenTex.generateMipmaps = false;
+  screenTex.colorSpace = THREE.SRGBColorSpace;
+  const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 });
+  const screen = place(new THREE.PlaneGeometry(TV_W - 0.1, TV_H - 0.1), screenMat, 0, cy, zBack + TV_D + 0.002);
+  // The set's glow on the wall and floor while it is on: driven with the view.
+  // Registered with World at target 0, so the room's morph pass (which
+  // fades every furniture light toward its registered target) zeroes it on
+  // each frame while the room is appearing; the handle re-applies the
+  // view's level on every tick (below), so a set already on HOME or PAUSED
+  // when a player joins is lit again the moment the morph is over.
+  const glow = new THREE.PointLight(0x9fd8ff, 0, 5);
+  addLight(glow, 0, cy, zBack + 0.6, 0);
+  let glowLevel = 0;
+
+  const fill = (color: string) => {
+    c2d.fillStyle = color;
+    c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
+  };
+  const text = (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
+    c2d.font = font;
+    c2d.fillStyle = color;
+    c2d.textAlign = align;
+    c2d.textBaseline = "middle";
+    c2d.fillText(s, x, y);
+  };
+  const badge = (lane: string) => {
+    if (!lane) return;
+    c2d.font = "bold 10px monospace";
+    const w = c2d.measureText(lane).width + 12;
+    c2d.strokeStyle = lane === "SOVEREIGN" ? "#2fe6a0" : lane === "PLAYER-RUN" ? "#00e5ff" : lane === "PUBLIC SWARM" ? "#f0c060" : "#ff8a50";
+    c2d.strokeRect(TV_TEX_W - w - 12.5, 12.5, w, 18);
+    text(lane, TV_TEX_W - 12 - w / 2, 22, "bold 10px monospace", c2d.strokeStyle, "center");
+  };
+  const draw = (view: TvScreenView): void => {
+    c2d.imageSmoothingEnabled = false;
+    if (view.state === "off") {
+      fill("#05070c");
+      // A faint reflection so a dark set still reads as glass, not a hole.
+      const g = c2d.createLinearGradient(0, 0, TV_TEX_W, TV_TEX_H);
+      g.addColorStop(0, "rgba(255,255,255,0.05)");
+      g.addColorStop(0.5, "rgba(255,255,255,0)");
+      g.addColorStop(1, "rgba(255,255,255,0.03)");
+      c2d.fillStyle = g;
+      c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
+      glowLevel = 0;
+    } else if (view.state === "home") {
+      const g = c2d.createLinearGradient(0, 0, 0, TV_TEX_H);
+      g.addColorStop(0, "#0b1a3a");
+      g.addColorStop(1, "#06101f");
+      c2d.fillStyle = g;
+      c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
+      text("FURLONG TV", TV_TEX_W / 2, 48, "bold 26px monospace", "#f0c060", "center");
+      // The same shelf the phone's remote offers (tvUI visibleTiles): a lane
+      // this build does not offer (sovereignty.ts — YouTube and archive.org
+      // without the convenience lanes) is not drawn, and a tile for a lane
+      // still to come is drawn dimmed. The screen must not show as live
+      // what the remote refuses.
+      const tiles = TV_HOME_TILES.filter((tile) => sourceKindAllowed(tile.kind));
+      tiles.forEach((tile, i) => {
+        const x = 24 + (i % 3) * 116;
+        const y = 84 + Math.floor(i / 3) * 50;
+        const live = tile.live;
+        c2d.fillStyle = live ? "rgba(0,229,255,0.10)" : "rgba(255,255,255,0.04)";
+        c2d.fillRect(x, y, 104, 38);
+        c2d.strokeStyle = live ? "rgba(0,229,255,0.6)" : "rgba(255,255,255,0.12)";
+        c2d.strokeRect(x + 0.5, y + 0.5, 103, 37);
+        text(tile.label, x + 52, y + 19, "bold 11px monospace", live ? "#e8f4ff" : "#4a5560", "center");
+      });
+      text(view.detail, TV_TEX_W / 2, 196, "11px monospace", "#8fa3b8", "center");
+      glowLevel = 0.5;
+    } else {
+      fill(view.state === "scheduled" ? "#0a1222" : "#000000");
+      badge(view.lane);
+      const t = view.title.length > 28 ? `${view.title.slice(0, 27)}…` : view.title;
+      text(t, 16, 60, "bold 20px monospace", "#f0f4ff");
+      if (view.state === "scheduled") {
+        text("MOVIE NIGHT", 16, 100, "bold 12px monospace", "#f0c060");
+        text(view.detail, 16, 140, "bold 30px monospace", "#2fe6a0");
+      } else if (view.state === "paused") {
+        text("❚❚  PAUSED", 16, 120, "bold 22px monospace", "#f0c060");
+        text(view.clockText, TV_TEX_W - 16, 196, "bold 14px monospace", "#8fa3b8", "right");
+        text(view.detail, 16, 196, "11px monospace", "#8fa3b8");
+      } else {
+        // Playing: a "picture" the prop can honestly show — colour bars on
+        // the station palette, with the clock. The real picture is in the
+        // theatre (plan §3.4).
+        const bars = ["#d4a84b", "#00e5ff", "#2fe6a0", "#ff8a50", "#8fa3b8", "#3e92b8"];
+        bars.forEach((c, i) => {
+          c2d.fillStyle = c;
+          c2d.globalAlpha = 0.35;
+          c2d.fillRect(16 + i * 58, 82, 54, 70);
+          c2d.globalAlpha = 1;
+        });
+        text("● LIVE", 16, 196, "bold 12px monospace", "#ff5252");
+        text(view.detail, 90, 196, "11px monospace", "#8fa3b8");
+        text(view.clockText, TV_TEX_W - 16, 196, "bold 14px monospace", "#f0f4ff", "right");
+      }
+      glowLevel = 1.1;
+    }
+    screenTex.needsUpdate = true;
+  };
+
+  let last = "";
+  const handle: TvScreenHandle = {
+    draw: (view) => {
+      const key = JSON.stringify(view);
+      if (key !== last) {
+        last = key;
+        draw(view);
+      }
+      glow.intensity = glowLevel; // every tick, past the canvas dedupe: the morph pass may have zeroed it
+    },
+  };
+  draw({ state: "off", title: "", detail: "", lane: "", clockText: "" }); // never a black rectangle before the first tick
+  screen.userData.tvScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
+}
+
+function buildSmartTv(ctx: BuildCtx) {
+  // Wall frame (snapInteriorWall): origin on the flush-mount plane, +z into
+  // the room — everything sits in z ≥ 0.
+  attachTvSet(ctx, TV_WALL_Y, 0);
+}
+
+function buildTvStand(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const CAB = 0x3b2a1e; // dark walnut
+  const LEG = 0x1a1f2a;
+  // Low cabinet: 1.8 × 0.5 × 0.45 within the 2×1 footprint, doors hinted by
+  // two shallow panels; the set stands on it, centred, screen to +z.
+  place(new THREE.BoxGeometry(1.8, TV_STAND_CAB_H - 0.08, 0.45), m(CAB, 0.6, 0.1), 0, 0.08 + (TV_STAND_CAB_H - 0.08) / 2, 0);
+  for (const sx of [-0.45, 0.45]) {
+    place(new THREE.BoxGeometry(0.8, TV_STAND_CAB_H - 0.16, 0.02), m(0x4a3728, 0.65, 0.08), sx, TV_STAND_CAB_H / 2 + 0.02, 0.235);
+  }
+  for (const [sx, sz] of [[-0.8, -0.18], [0.8, -0.18], [-0.8, 0.18], [0.8, 0.18]] as const) {
+    place(new THREE.BoxGeometry(0.06, 0.08, 0.06), m(LEG, 0.6, 0.4), sx, 0.04, sz);
+  }
+  // A small foot under the panel.
+  place(new THREE.BoxGeometry(0.5, 0.06, 0.2), m(LEG, 0.55, 0.4), 0, TV_STAND_CAB_H + 0.03, 0.05);
+  attachTvSet(ctx, TV_STAND_SCREEN_Y, 0.02);
 }
 
 /**

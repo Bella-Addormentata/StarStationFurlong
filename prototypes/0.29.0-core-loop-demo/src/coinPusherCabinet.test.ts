@@ -63,6 +63,7 @@ function buildCabinet(): { group: THREE.Group; handle: CoinPusherVisualHandle } 
     coinPusherVisuals: new Map(),
     propAnims: new Map(),
     airHockeyVisuals: new Map(),
+    tvScreens: new Map(),
   };
   group.traverse((obj) => {
     if (obj instanceof THREE.Mesh) registerFurnitureHandles(sinks, MACHINE, obj);
