@@ -9616,8 +9616,14 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
   const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 });
   const screen = place(new THREE.PlaneGeometry(TV_W - 0.1, TV_H - 0.1), screenMat, 0, cy, zBack + TV_D + 0.002);
   // The set's glow on the wall and floor while it is on: driven with the view.
+  // Registered with World at target 0, so the room's morph pass (which
+  // fades every furniture light toward its registered target) zeroes it on
+  // each frame while the room is appearing; the handle re-applies the
+  // view's level on every tick (below), so a set already on HOME or PAUSED
+  // when a player joins is lit again the moment the morph is over.
   const glow = new THREE.PointLight(0x9fd8ff, 0, 5);
   addLight(glow, 0, cy, zBack + 0.6, 0);
+  let glowLevel = 0;
 
   const fill = (color: string) => {
     c2d.fillStyle = color;
@@ -9649,8 +9655,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
       g.addColorStop(1, "rgba(255,255,255,0.03)");
       c2d.fillStyle = g;
       c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
-      glow.userData.targetIntensity = 0;
-      glow.intensity = 0;
+      glowLevel = 0;
     } else if (view.state === "home") {
       const g = c2d.createLinearGradient(0, 0, 0, TV_TEX_H);
       g.addColorStop(0, "#0b1a3a");
@@ -9670,8 +9675,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
         text(t, x + 52, y + 19, "bold 11px monospace", live ? "#e8f4ff" : "#4a5560", "center");
       });
       text(view.detail, TV_TEX_W / 2, 196, "11px monospace", "#8fa3b8", "center");
-      glow.userData.targetIntensity = 0.5;
-      glow.intensity = 0.5;
+      glowLevel = 0.5;
     } else {
       fill(view.state === "scheduled" ? "#0a1222" : "#000000");
       badge(view.lane);
@@ -9699,8 +9703,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
         text(view.detail, 90, 196, "11px monospace", "#8fa3b8");
         text(view.clockText, TV_TEX_W - 16, 196, "bold 14px monospace", "#f0f4ff", "right");
       }
-      glow.userData.targetIntensity = 1.1;
-      glow.intensity = 1.1;
+      glowLevel = 1.1;
     }
     screenTex.needsUpdate = true;
   };
@@ -9709,9 +9712,11 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
   const handle: TvScreenHandle = {
     draw: (view) => {
       const key = JSON.stringify(view);
-      if (key === last) return;
-      last = key;
-      draw(view);
+      if (key !== last) {
+        last = key;
+        draw(view);
+      }
+      glow.intensity = glowLevel; // every tick, past the canvas dedupe: the morph pass may have zeroed it
     },
   };
   draw({ state: "off", title: "", detail: "", lane: "", clockText: "" }); // never a black rectangle before the first tick

@@ -107,4 +107,26 @@ describe('the smart TV as built', () => {
     handle.draw(view('off'));
     expect(fills).toBeGreaterThan(afterHome);
   });
+
+  it('keeps the set\'s glow lit through the room morph: the level is re-applied on every tick, even an unchanged view', () => {
+    const group = build('smart-tv');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
+    const handle = s.tvScreens.get('smart-tv-1')!;
+    let glow: THREE.PointLight | null = null;
+    group.traverse((obj) => { if (obj instanceof THREE.PointLight) glow = obj; });
+    expect(glow).not.toBeNull();
+    expect(glow!.intensity).toBe(0); // off, as built
+    handle.draw(view('home'));
+    expect(glow!.intensity).toBe(0.5);
+    glow!.intensity = 0; // World's morph pass: eased × the registered target (0)
+    fills = 0;
+    handle.draw(view('home')); // the same view: no redraw…
+    expect(fills).toBe(0);
+    expect(glow!.intensity).toBe(0.5); // …but the glow is the view's again
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(glow!.intensity).toBe(1.1);
+    handle.draw(view('off'));
+    expect(glow!.intensity).toBe(0);
+  });
 });
