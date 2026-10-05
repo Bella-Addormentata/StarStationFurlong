@@ -728,13 +728,32 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     return parsed;
   };
 
+  // The box is cleared BEFORE the write that takes its link: the write
+  // notifies the phone synchronously, the repaint may rebuild the box and
+  // carry its draft into the replacement, and clearing the detached old box
+  // after that would leave the consumed link showing. So: take the text
+  // (the box read live, not the one wired here — a repaint during the
+  // archive lookup may have replaced it), clear, write, and give the text
+  // back to whatever box is mounted when the write is refused.
+  const liveBox = () => host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+  const takeDraft = (): string => {
+    const box = liveBox();
+    const text = box?.value ?? '';
+    if (box) box.value = '';
+    return text;
+  };
+  const giveBack = (text: string) => {
+    const box = liveBox();
+    if (box && !box.value) box.value = text;
+  };
   host.querySelector<HTMLButtonElement>('[data-tv-play]')?.addEventListener('click', () => {
     const id = host.querySelector<HTMLButtonElement>('[data-tv-play]')!.dataset.tvPlay!;
     void sourceFromBox(id).then((src) => {
       if (!src) return;
+      const text = takeDraft();
       const r = tvPlay(id, src);
       feedback(r.ok ? `Now on: ${sourceLabel(src)}` : r.error);
-      if (r.ok && paste) paste.value = ''; // taken: the box is clear for the next link (the repaint keeps a draft otherwise)
+      if (!r.ok) giveBack(text);
       if (r.ok) deps.openTheatre(id);
     });
   });
@@ -743,8 +762,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     const minutes = Number(b.dataset.tvSchedule);
     void sourceFromBox(id).then((src) => {
       if (!src) return;
+      const text = takeDraft();
       const r = tvSchedule(id, src, Date.now() + minutes * 60_000);
       feedback(r.ok ? `Scheduled: ${sourceLabel(src)} in ${minutes} min` : r.error);
+      if (!r.ok) giveBack(text);
     });
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-history]').forEach((b) => b.addEventListener('click', () => {
