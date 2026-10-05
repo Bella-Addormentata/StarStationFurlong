@@ -356,6 +356,20 @@ export function isTvTheatreOpen(itemId?: string): boolean {
   return theatre !== null && (itemId === undefined || theatre.itemId === itemId);
 }
 
+/** Where focus goes back when the theatre closes: whatever had it as the
+ *  theatre opened — unless that is a control inside the phone. The phone's
+ *  WATCH hides the phone without blurring its button, and focus returned to
+ *  an offscreen control would answer the next Enter or Space from a phone
+ *  nobody can see (and reopen this). main.ts's phoneOpener refuses openers
+ *  inside the phone for the same reason; the theatre applies the same rule
+ *  and lets focus fall to the body, where the world's keys are its own. */
+function focusReturnTarget(): HTMLElement | null {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) return null;
+  const phone = document.getElementById('spacephone-container');
+  return phone && phone.contains(active) ? null : active;
+}
+
 export function tvTheatreItemId(): string | null {
   return theatre?.itemId ?? null;
 }
@@ -461,7 +475,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     lastHead: '',
     lastNotice: '',
     onKey,
-    opener: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+    opener: focusReturnTarget(),
     playerFor: -1,
     releaseStick,
   };
