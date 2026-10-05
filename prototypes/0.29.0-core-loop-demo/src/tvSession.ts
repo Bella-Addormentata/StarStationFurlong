@@ -16,8 +16,8 @@
  */
 
 import {
-  claimRemote, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv, renewRemote,
-  scheduleStarted,
+  claimRemote, holderAnchorMs, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv,
+  renewRemote, scheduleStarted,
   subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
@@ -81,8 +81,15 @@ export function registerTvPlayerOfRecord(itemId: string, live?: LivePlayer): () 
     // The player's last word on where its media ends, taken as it goes: a
     // theatre closed between the metadata's arrival and the next room tick
     // would otherwise take the only duration report with it, and the
-    // headless beat would run the programme past its end for good.
-    if (driveArmed && stored) noteKnownEnd(itemId, stored, readTv(itemId));
+    // headless beat would run the programme past its end for good. And
+    // filed in the record at once while this page still holds the remote:
+    // a hand-over before the next tick would otherwise carry no end to the
+    // new holder, whose headless beat has no player to ask.
+    if (driveArmed && stored) {
+      const rec = readTv(itemId);
+      noteKnownEnd(itemId, stored, rec);
+      if (iHoldRemote(itemId)) publishEnd(itemId, rec);
+    }
     playersOfRecord.delete(itemId);
   };
 }
@@ -110,6 +117,10 @@ const lastHeadlessBeat = new Map<string, number>();
  *  (another room, another doc) forgets it all. */
 interface SeenPower {
   on: boolean;
+  /** The switch's revision as last seen: an OFF and an ON that arrive in
+   *  one merged update show only the final ON, `on` unchanged — the moved
+   *  revision is what says a cycle completed. */
+  seq: number;
   epoch: number;
   /** An off→on flip still owed its park: the programme's `jump` as the
    *  switch came back, kept until a holder parks it or the programme moves
@@ -147,10 +158,17 @@ function parkIfPowerReturned(id: string): void {
   // lapsed does.
   const running = programme.state === 'playing' || (scheduleStarted(programme) && power.parkMs !== null);
   let owed = same ? was.owed : null;
-  if (same && !was.on && on && running) owed = programme.jump;
+  // Back on: an off→on flip seen as such — or a whole OFF→ON cycle that
+  // arrived in one merged update, `on` true on both sides and only the
+  // switch's revision moved. A set already on and untouched moves nothing;
+  // PLAY NOW on a set that is off moves the revision with the flip, and the
+  // programme's jump with it, so the park it owes is voided below as any
+  // other is when the programme moves on.
+  const flipped = same && on && running && (!was.on || power.seq !== was.seq);
+  if (flipped) owed = programme.jump;
   if (owed !== null && (!on || !running || programme.jump !== owed)) owed = null;
   if (owed !== null && iHoldRemote(id)) {
-    lastPower.set(id, { on, epoch, owed: null }); // before the write: its notify re-enters here
+    lastPower.set(id, { on, seq: power.seq, epoch, owed: null }); // before the write: its notify re-enters here
     // Where the room WAS switched off: the presser's own reading, carried
     // by the switch (tvDoc `parkMs`; a reading of 0 is a reading) — not
     // this page's last heartbeat, which a holder asleep before the press
@@ -160,7 +178,7 @@ function parkIfPowerReturned(id: string): void {
     tvPause(id, power.parkMs ?? programme.positionMs);
     return;
   }
-  lastPower.set(id, { on, epoch, owed });
+  lastPower.set(id, { on, seq: power.seq, epoch, owed });
 }
 
 /** The end of the media as the player of record reported it, per set, with
@@ -303,14 +321,19 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     // the file — has no player to ask. This page's own word wins, the
     // unbounded marker included.
     const end = known ? known.endMs : rec.endMs > 0 ? rec.endMs : null;
-    if (end !== null && pb.positionMs >= end) {
+    // Where this holder takes the room from: a stale reading's takeover
+    // anchor (tvDoc holderAnchorMs) — a remote picked up on waking must not
+    // close the programme, or beat, on a peer's wake-window beat bridged
+    // across the sleep as though it predated it.
+    const at = holderAnchorMs(pb);
+    if (end !== null && at >= end) {
       tvStop(id);
       lastHeadlessBeat.delete(id);
       knownEnds.delete(id);
       continue;
     }
     if (now - (lastHeadlessBeat.get(id) ?? -Infinity) >= TV_HEARTBEAT_MS) {
-      tvHeartbeat(id, pb.positionMs);
+      tvHeartbeat(id, at);
       lastHeadlessBeat.set(id, now);
     }
   }
