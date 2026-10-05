@@ -22,14 +22,38 @@
  * ⚠️ What it still cannot see, stated so nobody reads a pass as more than it
  * is. It matches text, so it believes a gate and a write in the same method
  * are on the same path even when they sit in mutually exclusive branches —
- * it checks the gate comes FIRST, which is necessary and not sufficient. It
+ * it checks the gate comes FIRST, which is necessary and not sufficient.
+ * "First" now means before the first EFFECT, counting a call to anything
+ * that reaches a write as well as a write of its own, because a method that
+ * names no writer used to skip the ordering test entirely and lend its gate
+ * to whatever it had already called. Units that re-check at the moment they
+ * act stop that walk, since a caller has nothing to answer for in front of
+ * them — but ordering is still only offsets, and offsets stop describing
+ * execution at the first `await`, which is why there is a canary for that
+ * rather than a claim about it. It
  * knows only the writers in WRITERS below, so a write reached indirectly
- * through another module (`world.removeFurnitureVisuals`, say) is invisible
- * to it; the import-surface test is the thing that makes a new name get
- * noticed. It keys the call graph on each declaration's offset, so two units
- * sharing a name stay apart — `isEditModeActive` is both a method and a
- * module-scope function here — but it still matches call sites textually and
- * so cannot follow a call made through a variable.
+ * through another module is invisible to it. Two tests narrow that and
+ * neither closes it: the import-surface test fails when editMode imports a
+ * new name from a doc module, and the World-surface test fails when it
+ * reaches a new name through `this.world`. Between them they cover the two
+ * doors a new writer has actually arrived through — `removeFurnitureVisuals`
+ * came through the second, which is exactly why it is not an example of the
+ * first. A write one further hop out, in a module whose own text names no
+ * Yjs, is seen by neither. It keys the call graph on each declaration's
+ * offset, so two units sharing a name stay apart — `isEditModeActive` is
+ * both a method and a module-scope function here — but it still matches call
+ * sites textually and so cannot follow a call made through a variable.
+ *
+ * ⚠️ And the scope, which is one file. Every unit, caller and gate below is
+ * read out of editMode.ts, so "no room-doc write without an owner check"
+ * means no such write FROM THIS FILE. The same writers are called from four
+ * others — main.ts (claim-time defaults), devMenu.ts (dev spawn), docking.ts
+ * (the door panel's slide), roomTemplates.ts (releaseDroppedDocks under a
+ * template apply) — and each answers to its own path. docking.ts guards that
+ * branch with `isRoomOwner()` (:2213), which is not a name in GATES, and
+ * that is the point rather than a complaint: a sibling can be properly gated
+ * in a vocabulary this scan does not speak, so a pass here is not a claim
+ * about it in either direction.
  *
  * It is also worth saying plainly what the gate is NOT. Nothing authorises a
  * room-doc write today — roomOwner.ts says so outright — so a modified client
@@ -56,7 +80,13 @@ const WRITERS = [
   'writeWindowLayout', 'deleteWindowLayout', // windowLayoutDoc
   'writeWallpaper', // wallpaperLayoutDoc
   'writeAirHockeyTheme', // airHockeyThemeDoc
-  'addToRoomInventory', // roomInventory
+  // The one entry that is NOT a shared-doc write, listed so the exception is
+  // visible rather than inferred from the name: addToRoomInventory ends at
+  // localStorage.setItem plus a window event (roomInventory.ts:83-96), so no
+  // other client ever sees it. It stays because it is per-room persisted
+  // state on the ✕ REMOVE path, which has to be gated for deleteFurnitureItem
+  // anyway — requiring the gate here costs nothing and asserts the obvious.
+  'addToRoomInventory',
   'clearDoorSlide', // floorPlanDoc — planMap.delete inside a transact
   'writeCupolaWall', // floorPlanDoc — planMap.set/delete inside a transact
   'clearRobotConfig', // robotDoc — setConfigIn inside a transact on the room doc
@@ -310,12 +340,12 @@ const MEMBER_RE =
 const PARAMS = '\\((?:[^()]|\\([^()]*\\))*\\)'; // one level of nesting is enough
 const RETTYPE = '(?:\\s*:[^=;{()]*)?'; // `(e: E): void => {`
 const EVENT = "(?:'([\\w-]+)'|([A-Za-z_$][\\w$]*))";
-const LISTENER_RE = new RegExp(
-  `\\.addEventListener\\(\\s*${EVENT}\\s*,\\s*(?:async\\s+)?`
-  + `(?:(?:${PARAMS}|[A-Za-z_$][\\w$]*)${RETTYPE}\\s*=>`
-  + `|function\\s*(?:[A-Za-z_$][\\w$]*)?\\s*${PARAMS}${RETTYPE})\\s*\\{`,
-  'g',
-);
+/** An arrow's head, up to and including the `=>`. */
+const ARROW_HEAD = `(?:async\\s+)?(?:${PARAMS}|[A-Za-z_$][\\w$]*)${RETTYPE}\\s*=>`;
+/** Either function syntax's head, up to where a braced body would open. */
+const FN_HEAD = `(?:${ARROW_HEAD}|(?:async\\s+)?function\\s*(?:[A-Za-z_$][\\w$]*)?`
+  + `\\s*${PARAMS}${RETTYPE})`;
+const LISTENER_RE = new RegExp(`\\.addEventListener\\(\\s*${EVENT}\\s*,\\s*${FN_HEAD}\\s*\\{`, 'g');
 
 /**
  * The same registration, but stopping at the arrow — so a callback with a
@@ -324,11 +354,7 @@ const LISTENER_RE = new RegExp(
  * canary below reports any that appear rather than letting one fold back
  * into the registering method and borrow its gate. editMode.ts has none.
  */
-const INLINE_RE = new RegExp(
-  `\\.addEventListener\\(\\s*${EVENT}\\s*,\\s*(?:async\\s+)?`
-  + `(?:${PARAMS}|[A-Za-z_$][\\w$]*)${RETTYPE}\\s*=>`,
-  'g',
-);
+const INLINE_RE = new RegExp(`\\.addEventListener\\(\\s*${EVENT}\\s*,\\s*${ARROW_HEAD}`, 'g');
 
 /**
  * A registration whose callback is only NAMED — `window.addEventListener(
@@ -358,9 +384,82 @@ const BY_REF_RE = new RegExp(
  * of its own; carving it again would cut the member out of itself.
  */
 const FIELD_HANDLER_RE = new RegExp(
-  `\\bthis\\.([A-Za-z_$][\\w$]*)\\s*=\\s*(?:async\\s+)?`
-  + `(?:${PARAMS}|[A-Za-z_$][\\w$]*)${RETTYPE}\\s*=>\\s*\\{`,
+  `\\bthis\\.([A-Za-z_$][\\w$]*)\\s*=\\s*${ARROW_HEAD}\\s*\\{`,
   'g',
+);
+
+/**
+ * 🕐 The other way a body runs later, and the one editMode.ts does not use
+ * — today. An `addEventListener` callback is only the shape that happened to
+ * be here when this carver was written; a timer, a promise continuation and
+ * a handler property defer in exactly the same way and were walked straight
+ * past, their bodies left standing in the method that scheduled them, under
+ * a gate that ran at scheduling time. The #198 audit put each of them in as
+ * a mutant and every one PASSED, which is the only evidence that matters:
+ * the scan would have reported clean on a file with a deferred, ungated
+ * room-doc write in it.
+ *
+ * So they are carved like listeners rather than named in a blocklist. The
+ * difference matters both ways round: a deferred callback that writes then
+ * has to carry its own gate, and one that does not write — most of them,
+ * `setTimeout(() => this.hideHint(), 2000)` — carves cleanly and is free.
+ * A rule that merely refused the primitive would fail the harmless case and
+ * teach people to work around it.
+ *
+ * `.then`/`.catch`/`.finally` are included as syntax, not as a claim that a
+ * Promise is in play: a method named `then` on some other object reads the
+ * same, and carving it is harmless where refusing it would not be.
+ */
+const TIMER = '(?:setTimeout|setInterval|requestAnimationFrame|queueMicrotask'
+  + '|setImmediate|requestIdleCallback)';
+/**
+ * A handler PROPERTY, `el.onclick = …`. Matched from the dot, so it lines up
+ * with the other heads, and loose about the name: `.only`, `.online` and
+ * `.onlyChild` match too. That is deliberate — the alternative is a list of
+ * DOM event names that goes stale — and it costs nothing, because a
+ * non-function right-hand side is not a site at all (see DEFER_SITE_RE) and
+ * an identifier one is absorbed by the by-reference rule.
+ *
+ * `(?<!\bthis)` keeps it off FIELD_HANDLER_RE's ground. `this.onMouseMove =
+ * (e) => {…}` is one callback, and without this both heads would match it
+ * at different offsets — two spans over one body, which the overlap check
+ * downstream would then report as a fault in a file that has none.
+ */
+const HANDLER_PROP = '(?<!\\bthis)\\.(on[a-z][\\w$]*)\\s*=\\s*(?!=)';
+const DEFER_HEAD = `(?:\\b(${TIMER})\\s*\\(\\s*|\\.(then|catch|finally)\\s*\\(\\s*|${HANDLER_PROP})`;
+const DEFERRED_RE = new RegExp(`${DEFER_HEAD}${FN_HEAD}\\s*\\{`, 'g');
+
+/** The same, stopping at the arrow — a concise body, which cannot be carved. */
+const DEFERRED_INLINE_RE = new RegExp(`${DEFER_HEAD}${ARROW_HEAD}`, 'g');
+
+/**
+ * Every deferral site, in whatever shape — the exhaustiveness canary's
+ * input, the way `.addEventListener(` is for listeners. A handler property
+ * counts only when something function-shaped is assigned: `(`, an
+ * identifier or `function`. `this.onlyChild = 3` is not a deferral and
+ * should not have to be argued about.
+ */
+const DEFER_SITE_RE = new RegExp(
+  `\\b${TIMER}\\s*\\(|\\.(?:then|catch|finally)\\s*\\(`
+  + `|${HANDLER_PROP}(?=(?:async\\s+)?(?:\\(|function\\b|[A-Za-z_$]))`,
+  'g',
+);
+
+/**
+ * A deferral handed something already declared: `setTimeout(this.tick, 16)`,
+ * `p.then(this.onDone)`, `el.onclick = this.onClick`. Nothing to carve, and
+ * for a member nothing to carve it from — the thing named is a unit of its
+ * own with no in-file caller, so it already answers for itself.
+ *
+ * ⚠️ The limit, shared with BY_REF_RE: a LOCAL arrow handed over by name
+ * (`const h = () => {…}; setTimeout(h)`) is not a unit, so nothing answers
+ * for it. Tracking that would mean tracking local bindings, which is a type
+ * checker's job; what this file can honestly do is say so here.
+ */
+const DEFER_BY_REF_RE = new RegExp(
+  `^(?:\\b${TIMER}\\s*\\(\\s*|\\.(?:then|catch|finally)\\s*\\(\\s*|${HANDLER_PROP})`
+  + '(?:this\\.)?[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*'
+  + '(?:\\.bind\\([^()]*\\))?\\s*[,);]',
 );
 
 const lineAt = (index: number): number => SRC.slice(0, index).split('\n').length;
@@ -396,6 +495,14 @@ const classEnd = SRC.indexOf('\n}', classAt);
 type Unit = {
   name: string; body: string; callBody: string; gateBody: string;
   start: number; end: number; kind: 'member' | 'function';
+  // How a failure names this unit to a reader. A declared one is
+  // `enter() at line 412`; a carved one already reads as a phrase with its
+  // own line in it — "removeSelectedDoor's 'setTimeout' deferral at line
+  // 2671" — and appending the declaration form to that produced
+  // `…at line 2671() at line 2671`. Composed once here so a message cannot
+  // pick the wrong shape, and `name` stays the bare identifier the
+  // cross-module and privacy checks match on.
+  label: string;
   // Carved out of the member that registers it, rather than declared. Kept
   // as a flag rather than sniffed back out of `name`, because the checks
   // below that apply only to carved spans are the ones that catch a carver
@@ -456,6 +563,16 @@ const carveListeners = (text: string, offset: number) => {
   // #198 audit, would carve a registration written inside a comment.
   const seen = stripComments(text);
   const code = blankOut(text, true);
+  // Each head captures its own name in whichever group its alternative
+  // owns — the event for a listener, the field for an assigned handler, the
+  // primitive for a deferral — so take the first one that fired rather than
+  // numbering them, which would have to be renumbered on every new shape.
+  const nameOf = (h: RegExpExecArray): string => h.slice(1).find((g) => g !== undefined) ?? '?';
+  // `code[at] === seen[at]` asks whether this position is real code: a head
+  // found inside a string is blanked in `code` and not in `seen`, so the two
+  // disagree exactly there. Comments are blanked in both, and no head can
+  // start on a space, so a match can never have begun in one.
+  const isCode = (at: number): boolean => code[at] === seen[at];
   const spans: { event: string; start: number; end: number; closed: boolean; how: string }[] = [];
   const carve = (re: RegExp, how: string): void => {
     for (const h of seen.matchAll(re)) {
@@ -477,13 +594,16 @@ const carveListeners = (text: string, offset: number) => {
       // name every bad span at once. A matcher that ran off the end used to
       // stop at the member's end and still look like a clean carve.
       spans.push({
-        event: h[1] ?? h[2] ?? '?', start: offset + at, end: offset + j, closed, how,
+        event: nameOf(h), start: offset + at, end: offset + j, closed, how,
       });
     }
   };
   carve(LISTENER_RE, 'listener');
   // Assigned handlers are named for the field, so a failure says which one.
   carve(FIELD_HANDLER_RE, 'handler');
+  // Timers, promise continuations and handler properties — the same defect
+  // class as a listener, and none of them present in editMode.ts today.
+  carve(DEFERRED_RE, 'deferral');
   spans.sort((a, b) => a.start - b.start);
 
   // A registration whose callback is inline but has no brace to match: a
@@ -491,12 +611,15 @@ const carveListeners = (text: string, offset: number) => {
   // the registering method and borrow its gate — the defect this carver
   // exists to close. Reported by the caller, never absorbed.
   const concise: { event: string; at: number }[] = [];
-  for (const h of seen.matchAll(INLINE_RE)) {
-    const at = h.index ?? 0;
-    // The head, for the same reason the brace is checked above.
-    if (code[at] !== '.') continue;
-    if (!spans.some((l) => l.start === offset + at)) {
-      concise.push({ event: h[1] ?? h[2] ?? '?', at: offset + at });
+  for (const re of [INLINE_RE, DEFERRED_INLINE_RE]) {
+    for (const h of seen.matchAll(re)) {
+      const at = h.index ?? 0;
+      // The head, for the same reason the brace is checked above.
+      if (!isCode(at)) continue;
+      if (!spans.some((l) => l.start === offset + at)
+        && !concise.some((c) => c.at === offset + at)) {
+        concise.push({ event: nameOf(h), at: offset + at });
+      }
     }
   }
 
@@ -508,13 +631,18 @@ const carveListeners = (text: string, offset: number) => {
   // without a word — is otherwise absorbed into the registering method and
   // handed a gate that ran once, at registration time.
   const unknown: number[] = [];
-  for (const h of code.matchAll(/\.addEventListener\(/g)) {
-    const at = h.index ?? 0;
-    if (spans.some((l) => l.start === offset + at)) continue;
-    if (concise.some((c) => c.at === offset + at)) continue;
-    if (BY_REF_RE.test(seen.slice(at))) continue;
-    unknown.push(offset + at);
+  for (const [re, byRef] of [
+    [/\.addEventListener\(/g, BY_REF_RE], [DEFER_SITE_RE, DEFER_BY_REF_RE],
+  ] as const) {
+    for (const h of code.matchAll(re)) {
+      const at = h.index ?? 0;
+      if (spans.some((l) => l.start === offset + at)) continue;
+      if (concise.some((c) => c.at === offset + at)) continue;
+      if (byRef.test(seen.slice(at))) continue;
+      if (!unknown.includes(offset + at)) unknown.push(offset + at);
+    }
   }
+  unknown.sort((a, b) => a - b);
   return { spans, concise, unknown };
 };
 
@@ -560,13 +688,13 @@ for (const m of cut(SRC.slice(classAt, classEnd), classAt, MEMBER_RE, (h) => h[1
   // Concise-body arrows: nothing to brace-match, so nothing to carve, so
   // the body is still standing in this method holding this method's gate.
   for (const c of concise) {
-    carveFaults.push(`${m.name}: the '${c.event}' listener at line ${lineAt(c.at)
+    carveFaults.push(`${m.name}: the '${c.event}' callback at line ${lineAt(c.at)
     } has a concise body, so it cannot be carved and is borrowing this method's gate`);
   }
   for (const at of unknown) {
-    carveFaults.push(`${m.name}: the registration at line ${lineAt(at)
+    carveFaults.push(`${m.name}: the deferral at line ${lineAt(at)
     } is in a callback shape this file does not know, so its body is still standing `
-    + 'in this method holding a gate that ran when the listener was registered');
+    + 'in this method holding a gate that ran when the body was scheduled');
   }
 
   const parts = [
@@ -582,6 +710,7 @@ for (const m of cut(SRC.slice(classAt, classEnd), classAt, MEMBER_RE, (h) => h[1
     const body = stripComments(p.text);
     members.push({
       name: p.name, start: p.start, end: p.end, kind: 'member', carved: p.carved,
+      label: p.carved ? p.name : `${p.name}() at line ${lineAt(p.start)}`,
       body,
       callBody: blankDecl(body, p.decl),
       // Declaration-blanked as well, or a unit is gated by its own name:
@@ -623,6 +752,7 @@ const functions: Unit[] = [...SRC.matchAll(FREE_RE)].map((h) => {
   const body = stripComments(SRC.slice(start, end));
   return {
     name: h[1], start, end, kind: 'function' as const, body, carved: false,
+    label: `${h[1]}() at line ${lineAt(start)}`,
     callBody: blankDecl(body, h[0]),
     // Declaration-blanked for the same reason as a member's — and this is
     // the half where it bites, since `canEditRoom` is itself one of these.
@@ -736,14 +866,16 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // the pattern did not know simply was not carved.
     expect(carveFaults, carveFaults.join('\n')).toEqual([]);
 
-    // The carver only ever looks inside members, so a registration written
-    // at module scope is one it cannot reach — and `carveFaults` would stay
-    // empty while saying nothing about it. All nineteen are in the class
-    // today; this is what notices the twentieth if it is written outside.
-    const stray = [...blankOut(SRC, true).matchAll(/\.addEventListener\(/g)]
-      .map((h) => h.index ?? 0)
+    // The carver only ever looks inside members, so a deferral written at
+    // module scope is one it cannot reach — and `carveFaults` would stay
+    // empty while saying nothing about it. All nineteen listeners are in the
+    // class today and there are no other deferrals at all; this is what
+    // notices the first one written outside.
+    const stray = [/\.addEventListener\(/g, DEFER_SITE_RE]
+      .flatMap((re) => [...blankOut(SRC, true).matchAll(re)].map((h) => h.index ?? 0))
       .filter((at) => at < classAt || at > classEnd)
-      .map((at) => `line ${lineAt(at)}: registered outside the class, so never carved`);
+      .sort((a, b) => a - b)
+      .map((at) => `line ${lineAt(at)}: defers outside the class, so never carved`);
     expect(stray, stray.join('\n')).toEqual([]);
 
     // Each carved span must be a whole callback inside the member that
@@ -807,15 +939,53 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     expect(field.spans.map((s) => [s.event, s.how, s.closed]))
       .toEqual([['ctxDismissKey', 'handler', true]]);
 
+    // 🕐 The deferrals editMode.ts does not contain. Each of these was a
+    // mutant in the #198 audit and each one PASSED: the body stayed inside
+    // the scheduling method, the room-doc write inside it counted as
+    // covered by whatever gate that method held, and the scan said clean.
+    // A listener is not a special case of anything — it was just the shape
+    // that happened to be in the file when the carver was written.
+    for (const [src, event] of [
+      ['setTimeout(() => { writeWallpaper(s, v); }, 0);', 'setTimeout'],
+      ['setInterval(() => { a(); }, 16);', 'setInterval'],
+      ['requestAnimationFrame((t: number) => { a(); });', 'requestAnimationFrame'],
+      ['queueMicrotask(function () { a(); });', 'queueMicrotask'],
+      ['p.then(async (v) => { a(); });', 'then'],
+      ['p.catch((e) => { a(); });', 'catch'],
+      ['el.onclick = (e) => { a(); };', 'onclick'],
+    ] as const) {
+      const got = one(src);
+      expect(got.spans.map((s) => [s.event, s.how, s.closed]), `not carved: ${src}`)
+        .toEqual([[event, 'deferral', true]]);
+      expect(got.concise.concat(got.unknown as never[]), src).toEqual([]);
+    }
+
     // Named, not written: nothing to carve, and nothing wrong either. The
     // thing named is declared somewhere this scan already reads.
     for (const src of [
       "el.addEventListener('click', this.onMouseMove);",
       "el.addEventListener('click', this.ctxDismissKey, true);",
       "el.addEventListener('click', onClick.bind(this));",
+      'setTimeout(this.tick, 16);',
+      'setTimeout(onTick.bind(this), 1);',
+      'p.then(this.onDone);',
+      'el.onclick = this.onClick;',
+      // Not a deferral at all: nothing function-shaped is assigned, so the
+      // loose `on…` name costs nobody an argument.
+      'node.onlyChild = 3;',
+      // FIELD_HANDLER_RE's ground, and it carves this one as a 'handler' —
+      // asserted above. What matters here is that the new head does NOT
+      // also match it, which would be two spans over one body.
+      'this.onMouseMove = other;',
     ]) {
       expect(one(src), src).toEqual({ spans: [], concise: [], unknown: [] });
     }
+
+    // And the one shape that must stay with FIELD_HANDLER_RE rather than
+    // being claimed twice: one span, found by one pattern, named for the
+    // field rather than for the `on…` property.
+    expect(one('this.onMouseMove = (e) => { a(); };').spans.map((s) => [s.event, s.how]))
+      .toEqual([['onMouseMove', 'handler']]);
 
     // Cannot be carved, so must be reported. A concise body has no brace to
     // match; a callback that is the RESULT of a call has no body here at
@@ -827,6 +997,13 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       .toEqual([{ event: 'click', at: 2 }]);
     expect(one("el.addEventListener('click', makeHandler(x));").unknown).toEqual([2]);
     expect(one("el.addEventListener('click', handlers['click']);").unknown).toEqual([2]);
+    // The same two failures for a deferral, because the same two shapes
+    // defeat it the same way.
+    expect(one('setTimeout(() => writeWallpaper(s, v), 0);').concise)
+      .toEqual([{ event: 'setTimeout', at: 0 }]);
+    expect(one('el.onclick = () => a();').concise).toEqual([{ event: 'onclick', at: 2 }]);
+    expect(one('setTimeout(makeTick(), 0);').unknown).toEqual([0]);
+    expect(one("p.then(handlers['done']);").unknown).toEqual([1]);
 
     // Not code: a registration written inside a string or a comment is not
     // a registration, and brace-matching from one would close on some
@@ -1053,13 +1230,26 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // fixed, while a gate found inside a message is a false negative that
     // quietly manufactures coverage. `showHint('ask canEditRoom() first')`
     // is not an owner check, and before this it counted as one.
-    const gated = new Set(units.filter((u) => {
-      const gate = firstAt(u.gateBody, GATE_RE);
-      if (gate < 0) return false;
-      const write = firstAt(u.body, WRITER_RE);
-      return write < 0 || gate < write;
-    }).map(idOf));
-
+    //
+    // ⚠️ AND A WRITE IS NOT ONLY A WRITER'S NAME. The rule above compared
+    // the gate against the first WRITERS call in the same slice, so in a
+    // unit that performs no write of its own there was nothing to compare
+    // against and the ordering test was skipped — a gate anywhere in the
+    // body made it gated, including a gate that runs AFTER it has already
+    // handed off:
+    //
+    //     private doThing(): void {
+    //       this.applyLayout();          // writes; runs first, ungated
+    //       if (!canEditRoom()) return;  // too late to matter
+    //     }
+    //
+    // `doThing` names no writer, so it was gated; `applyLayout`'s only
+    // caller was then covered, so the fixpoint covered it too. One
+    // misplaced line laundered a gate onto a write that had already
+    // happened. So the thing a gate must precede is the first EFFECT —
+    // either a direct write or a call to a unit that reaches one — which
+    // needs the call graph and reachability built first, below.
+    //
     // Who calls whom, by identity rather than by name — see `idOf`. A unit
     // with no in-file caller is an entry point: main.ts drives it, and for
     // the module-scope functions that is the only way in, so gating is the
@@ -1076,6 +1266,199 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
         }
       }
     }
+
+    // Which units lead to a room-doc write, transitively. Note what this
+    // does NOT depend on: gates. It is a property of the call graph and
+    // WRITERS alone, which is why it can be built here, before anything
+    // has been declared gated, and then used by both the ordering rule
+    // below and the caller-rule premise further down.
+    const nameOfId = new Map(units.map((u) => [idOf(u), u.name] as const));
+    const reaches = new Set(units.filter((u) => WRITERS.some((w) => calls(u.body, w))).map(idOf));
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const id of [...reaches]) {
+        for (const c of callersOf.get(id) ?? []) {
+          if (!reaches.has(c)) { reaches.add(c); changed = true; }
+        }
+      }
+    }
+
+    /**
+     * The same walk, but stopping at units that check for themselves: a
+     * map from each unit that leads to a write WITH NO FURTHER OWNER
+     * CHECK, to one concrete chain showing how. A self-gated unit is a
+     * sink rather than an excused edge — it re-reads the gate at the
+     * moment it acts, so nothing behind it inherits an answer to give,
+     * however many hops back the caller sits. That distinction is the
+     * whole difference between this and `reaches` above, and it is not
+     * academic: the right-click handler calls cancelCarry, which five
+     * hops later arrives at writeWallpaper through cycleWallpaperPreset —
+     * a method whose first line is its own mayWriteRoomDoc() check, put
+     * there (editMode.ts:4296-4302) precisely because a wallpaper panel
+     * can sit open across a permission change. Nothing upstream of that
+     * line has a question to answer, and a rule that said otherwise would
+     * be demanding the weaker check in front of the stronger one.
+     *
+     * The chain string costs one entry per unit and buys the difference
+     * between "delegated at line 1292" and a name-by-name route to the
+     * write, which is the question a reader has at that point: the call
+     * that counts as an effect is rarely one that looks like one.
+     */
+    const exposure = (selfGated: ReadonlySet<string>): Map<string, string> => {
+      const via = new Map<string, string>();
+      for (const u of units) {
+        const w = WRITERS.find((x) => calls(u.body, x));
+        if (w !== undefined && !selfGated.has(idOf(u))) via.set(idOf(u), w);
+      }
+      for (let changed = true; changed; ) {
+        changed = false;
+        for (const id of [...via.keys()]) {
+          for (const c of callersOf.get(id) ?? []) {
+            if (via.has(c) || selfGated.has(c)) continue;
+            via.set(c, `${nameOfId.get(id)} → ${via.get(id)}`);
+            changed = true;
+          }
+        }
+      }
+      return via;
+    };
+
+    /**
+     * Where `u` first does something a gate was supposed to come before: a
+     * direct writer call, or a call to a unit that reaches a write and
+     * does not check for itself. `at` is -1 if it does neither, which is
+     * the only case where a trailing gate is harmless. Offsets from `body`
+     * and `callBody` are compared directly because the three views of a
+     * unit are the same span with different characters blanked, never
+     * re-indexed.
+     *
+     * `via` is an `exposure` map, and is why a call to a self-checking
+     * callee does not count. Its own direct writes always do, however:
+     * a unit that gates itself still has to do so before writing, or the
+     * gate is a comment with parentheses. Only `gated` feeds `exposure`,
+     * never `covered` — coverage is derived from callers, so letting it
+     * stop the walk would be circular in exactly the direction that lets
+     * a hole excuse itself.
+     */
+    const firstEffect = (u: Unit, via: ReadonlyMap<string, string>):
+    { at: number; why: string } => {
+      const self = idOf(u);
+      const hits: { at: number; why: string }[] = [];
+      const direct = firstAt(u.body, WRITER_RE);
+      if (direct >= 0) {
+        hits.push({ at: direct, why: `it writes (${WRITERS.find((w) => calls(u.body, w))})` });
+      }
+      for (const c of units) {
+        const to = idOf(c);
+        if (to === self || !via.has(to)) continue;
+        const at = u.callBody.search(pattern.get(to)!);
+        if (at >= 0) hits.push({ at, why: `it calls ${c.name} → ${via.get(to)}` });
+      }
+      // Earliest wins: a gate has to precede the FIRST effect, not some
+      // effect. No seed — a `-1` one would compare as smaller than every
+      // real offset and win every time, which is the no-effect answer
+      // handed back for a unit full of effects.
+      if (hits.length === 0) return { at: -1, why: '' };
+      return hits.reduce((a, b) => (b.at < a.at ? b : a));
+    };
+
+    // Least fixpoint, climbing from "nothing checks for itself". Growing
+    // the set can only turn calls into non-effects, never the reverse, so
+    // each pass is monotone and this terminates — and starting from EMPTY
+    // rather than from "everything holding a gate" is what makes it the
+    // conservative answer: a ring of methods that each gate only after
+    // calling the next never bootstraps itself in, where an optimistic
+    // pass descending from the full set would have left the whole ring
+    // marked. The same posture as the `covered` fixpoint below.
+    const gated = new Set<string>();
+    for (let changed = true; changed; ) {
+      changed = false;
+      const via = exposure(gated);
+      for (const u of units) {
+        const id = idOf(u);
+        if (gated.has(id)) continue;
+        const gate = firstAt(u.gateBody, GATE_RE);
+        if (gate < 0) continue;
+        const { at } = firstEffect(u, via);
+        if (at < 0 || gate < at) { gated.add(id); changed = true; }
+      }
+    }
+    const exposed = exposure(gated);
+    const effectOf = new Map(units.map((u) => [idOf(u), firstEffect(u, exposed)] as const));
+
+    // The ordering rule is clean when `exposed` is empty — and so is a
+    // broken WRITERS list, a broken call graph, or an `exposure` whose
+    // barrier swallowed everything. Name the set rather than counting it:
+    // a floor is a guess at the scale, and the scale here is two. 196
+    // units, 34 of which reach a write, 13 of which check before doing
+    // it, and the barrier accounts for all the rest — which is what a
+    // well-gated file is supposed to look like, and is only worth
+    // believing if a change to it has to be read.
+    //
+    // Both survivors write directly with no check of their own
+    // (deleteDoorLayout at :2725, deleteWindowLayout at :3147) and both
+    // are excused by the caller rule below. That is not a coincidence,
+    // it is the same fact twice: they are the units nothing but their
+    // callers is protecting. A third name here is a third thing resting
+    // on a premise that only holds while this file is the whole story.
+    expect([...exposed.keys()].map((k) => nameOfId.get(k)).sort(),
+      'the set of units that reach a room-doc write with no owner check of their own '
+      + 'has changed')
+      .toEqual(['removeSelectedDoor', 'removeSelectedWindow']);
+
+    // And the barrier is load-bearing rather than decorative. This one
+    // unit is what stands between the right-click handler at :1289 and a
+    // reported late gate: cycleWallpaperPreset checks mayWriteRoomDoc()
+    // at editMode.ts:4302 before writeWallpaper at :4306, so it must be
+    // gated, must reach a write, and must NOT be exposed. If that ever
+    // changes, :1289 starts failing again — and the fix is to read why,
+    // not to move a check in front of a carry-cancel that is deliberately
+    // allowed to a player who has just lost permission.
+    const wp = units.filter((u) => u.name === 'cycleWallpaperPreset');
+    expect(wp.length, 'cycleWallpaperPreset not found — the pin below is testing nothing').toBe(1);
+    expect(gated.has(idOf(wp[0])), 'cycleWallpaperPreset no longer gates itself').toBe(true);
+    expect(reaches.has(idOf(wp[0])), 'cycleWallpaperPreset no longer reaches a write').toBe(true);
+    expect(exposed.has(idOf(wp[0])),
+      'a unit that gates itself before writing must not be exposed to its callers').toBe(false);
+
+    // A unit holding a gate it has already acted ahead of is worse than an
+    // ungated one: the tightened rule above drops it out of `gated`, so
+    // the hole does surface, but it surfaces as a leak somewhere down the
+    // call chain, pointing at the callee rather than at the line that
+    // actually needs moving. Name it here, where the diagnosis is exact.
+    const lateGates = units
+      .map((u) => ({ u, gate: firstAt(u.gateBody, GATE_RE), ...effectOf.get(idOf(u))! }))
+      .filter(({ gate, at }) => gate >= 0 && at >= 0 && gate > at)
+      .map(({ u, gate, at, why }) => `${u.label} checks the owner at line ${
+        lineAt(u.start + gate)}, after line ${lineAt(u.start + at)}, where ${why}`
+        + ' — move the check above that line, or gate the callee itself');
+    expect(lateGates, lateGates.join('\n')).toEqual([]);
+
+    // ── The other way an ordering can be a lie ───────────────────────────
+    //
+    // Everything above compares OFFSETS, which is a model of execution
+    // that holds only while a unit runs start to finish. An `await` ends
+    // that: the gate's answer was read before the suspension and the
+    // write happens after it, with every other handler in the page free
+    // to run in between — the same staleness the carved deferrals are
+    // about, arriving inside one unit instead of across two.
+    //
+    // editMode.ts contains no `async` and no `await` today, both counted,
+    // so this is a canary and not a repair. It is deliberately a canary:
+    // extending the ordering model to suspension points properly means
+    // deciding what a gate before an await is worth, and that is a
+    // decision to make with the first real async writer in hand rather
+    // than against an imagined one. What it must not do is pass quietly
+    // on the day that writer arrives. It stays cheap for everyone else —
+    // an async unit that neither writes nor reaches a write never fires.
+    const stale = units
+      .map((u) => ({ u, aw: u.gateBody.search(/\bawait\b/), ...effectOf.get(idOf(u))! }))
+      .filter(({ aw, at }) => aw >= 0 && at >= 0)
+      .map(({ u, aw, at, why }) => `${u.label} suspends at the await on line ${
+        lineAt(u.start + aw)} and then reaches line ${lineAt(u.start + at)}, where ${why}`
+        + ' — an owner check either side of a suspension is a check of a stale answer,'
+        + ' and the offset comparisons in this test cannot model that. Extend them.');
+    expect(stale, stale.join('\n')).toEqual([]);
 
     // Least fixpoint: gated, or every caller is itself covered. A cycle of
     // ungated methods never gets marked, which is the conservative answer.
@@ -1097,7 +1480,7 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       .filter((u) => !covered.has(idOf(u)))
       .map((u) => ({ u, writers: WRITERS.filter((w) => calls(u.body, w)) }))
       .filter(({ writers }) => writers.length > 0)
-      .map(({ u, writers }) => `${u.name}() at line ${lineAt(u.start)} calls ${
+      .map(({ u, writers }) => `${u.label} calls ${
         writers.join(', ')} with no owner check on any path`);
 
     expect(leaks, leaks.join('\n')).toEqual([]);
@@ -1115,15 +1498,6 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // This is not academic: units are excused this way today and reach a
     // room-doc write. So check the premise rather than assuming it, in
     // both of the ways it can fail.
-    const reaches = new Set(units.filter((u) => WRITERS.some((w) => calls(u.body, w))).map(idOf));
-    for (let changed = true; changed; ) {
-      changed = false;
-      for (const id of [...reaches]) {
-        for (const c of callersOf.get(id) ?? []) {
-          if (!reaches.has(c)) { reaches.add(c); changed = true; }
-        }
-      }
-    }
     // Reachability is transitive, so this asks about a unit that merely
     // leads to a write as well as one that performs it — an ungated public
     // step in front of a gated one is the same hole wearing a hat.
@@ -1152,10 +1526,17 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
 
     const unsound: string[] = [];
     for (const u of excused) {
-      const where = `${u.name}() at line ${lineAt(u.start)}`;
+      const where = u.label;
       // (a) Declared reachable. `private` is erased at runtime, so this is
       //     a statement of intent rather than a guarantee — which is why
-      //     (b) exists as well, and why neither is sufficient alone.
+      //     (b) exists as well, and why neither is sufficient alone. Nor
+      //     can they be: editMode.ts:4344 publishes the instance on
+      //     `window.__roomEdit` as a permanent debug handle, so a console
+      //     reaches every one of these in one line, and a console is in no
+      //     file for (b) to read. That is the honest-client caveat at the
+      //     top of this file arriving in person rather than a new hole —
+      //     the handle is deliberate, and what these two arms are for is
+      //     the SHIPPED caller set, which is where a regression comes from.
       const decl = SRC.slice(u.start, SRC.indexOf('\n', u.start));
       if (u.kind === 'member' && !/^\s*(?:private\b|protected\b|#)/.test(decl)) {
         unsound.push(`${where} is excused by its callers but is not private, so a call `
@@ -1181,11 +1562,16 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       unsound.join('\n')}`).toEqual([]);
 
     // And the floor, because an empty `excused` list would pass the block
-    // above while checking nothing. The four that are excused and reach a
-    // write — ctxMove, ctxDelete, removeSelectedDoor, removeSelectedWindow
-    // — are what makes the premise load-bearing rather than decorative.
-    expect(excused.length, 'nothing is excused by the caller rule any more, so the check '
-      + 'above is vacuous — if that is genuinely true, delete it').toBeGreaterThan(0);
+    // above while checking nothing. Named rather than counted: a count says
+    // the premise is load-bearing, the names say WHICH units are riding on
+    // it, and a unit newly riding on it is the one thing here worth a human
+    // glance. Both directions fail loudly — one leaving means its gate or
+    // its callers changed, one arriving means a write is now covered by an
+    // argument rather than by a check.
+    expect([...excused].map((u) => u.name).sort(),
+      'the set of units excused by the caller rule has changed. Nothing is wrong yet — '
+      + 'the block above still has to pass — but somebody should look at why')
+      .toEqual(['ctxDelete', 'ctxMove', 'removeSelectedDoor', 'removeSelectedWindow']);
   });
 
   it('counts the writes it is actually guarding, so the scan cannot pass on nothing', () => {
@@ -1239,8 +1625,11 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       './robotDoc': ['clearRobotConfig', 'readRobotConfig'],
       // shipRoute transacts in ten places, but neither name editMode takes
       // is one of them: readShipRoute resolves a cached snapshot, and
-      // routeRulesFlightNow is a type guard over it (pilotRoute.ts). Pinned
-      // so that importing one of the ten would have to be argued for.
+      // routeRulesFlightNow (shipRoute.ts:1236) is a two-call read over one
+      // — readRouteFlight (:1188) then routeRulesFlight, which is where the
+      // type guard actually lives (pilotRoute.ts:1484, `f is RouteFlight`,
+      // a null-and-paused test). Pinned so that importing one of the ten
+      // would have to be argued for.
       './shipRoute': ['readShipRoute', 'routeRulesFlightNow'],
     };
     for (const [mod, names] of Object.entries(EXPECTED)) {
@@ -1379,7 +1768,12 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // robotDoc. A name is not evidence either way.
     const WORLD_SURFACE: Record<string, boolean> = {
       // true ⇒ reaches a shared-doc write, so it must also be in WRITERS.
+      // Fields are listed beside methods: a field is a door in the same
+      // wall, and what editMode calls through one is pinned in WORLD_HOPS.
       removeFurnitureVisuals: true, // -> gamesDoc.clearTable, croupier.closeTable
+      dockingSystem: false, // public field (world.ts:379); its methods are below
+      furnitureGroups: false, // public Map field (world.ts:425)
+      getClickPlane: false, // returns this.clickPlane (world.ts:4353)
       getPlayer: false, // returns this.player (world.ts:4349)
       getRemotePlayerPositions: false, // reads remotePlayers rig positions (:4333)
       getWindowGroups: false, // returns this.windowGroups (:1345)
@@ -1389,34 +1783,99 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       setHullEditView: false, // toggles wall visibility (:2077)
       windowClearsDoors: false, // a margin test over the door layout
     };
-    // `\bworld\.` rather than `this.world.`: most call sites first resolve
+    // One hop further: what editMode calls on what the line above handed
+    // back, and what it calls on the two fields. Keyed by the whole path,
+    // because `get` on its own says nothing — the name that would go into
+    // WRITERS is the tail, and the tail is what the cross-check reads.
+    //
+    // This stops at the second hop, and says so rather than implying more:
+    // `dockingSystem?.getDoorGroups().get(id)` has a third, and a scan that
+    // followed every chain would be a type checker. The second hop is where
+    // the subsystem methods live, so it is where the answers are needed.
+    const WORLD_HOPS: Record<string, boolean> = {
+      'dockingSystem.getDoorGroups': false, // returns doorObjects (docking.ts:1147)
+      'dockingSystem.isDoorPaired': false, // reads doorState (docking.ts:1156)
+      'furnitureGroups.get': false, // Map read
+      'furnitureGroups.has': false, // Map read
+      'getClickPlane().parent': false, // THREE.Object3D field
+      'getPlayer().onObstaclesChanged': false, // player.ts:1264, nav/path state only
+      'getWindowGroups().get': false, // Map read
+    };
+
+    // `\bworld` rather than `this.world`: most call sites first resolve
     // `const world = this.world ?? worldProvider?.()`, and the spread form
     // `...world.getRemotePlayerPositions()` has a dot in front of it.
-    const asked = new Set(
-      [...stripComments(SRC).matchAll(/\bworld\.([A-Za-z_$][\w$]*)\s*\(/g)].map((m) => m[1]),
-    );
+    //
+    // The `\??` is not decoration. Without it this sweep could not see a
+    // `this.world?.` hop at all, and nine of them exist — which is how
+    // `getClickPlane` came to be called five times and classified never,
+    // in a test whose entire purpose is to stop exactly that. A regex that
+    // quietly matches less than the name it is named for is the same class
+    // of bug as a lexer that guesses.
+    //
+    // Two views at the same offsets: names are read from `TEXT`, where
+    // string text survives and a `world.` inside one is a loud false
+    // positive worth the glance it costs, while parentheses are balanced in
+    // `CODE`, where a `)` in a message cannot close a call that never
+    // opened.
+    const TEXT = stripComments(SRC);
+    const CODE = blankOut(SRC, true);
+    const NAME = '([A-Za-z_$][\\w$]*)(?![\\w$])';
+    /** Just past the `)` closing the call whose `(` sits at `open`. */
+    const closeOf = (open: number): number => {
+      if (CODE[open] !== '(') throw new Error(`no call at offset ${open}`);
+      for (let i = open, depth = 0; i < CODE.length; i += 1) {
+        if (CODE[i] === '(') depth += 1;
+        else if (CODE[i] === ')' && (depth -= 1) === 0) return i + 1;
+      }
+      throw new Error(`unbalanced call at line ${lineAt(open)}`);
+    };
+
+    // A hop is a call or it is a field — `(\()?` is what tells them apart,
+    // and both have to be pinned. `furnitureGroups` and `dockingSystem` are
+    // plain public fields, so a sweep for calls alone never saw either, and
+    // `dockingSystem` is a whole second object editMode calls methods on.
+    const calls = new Set<string>();
+    const fields = new Set<string>();
+    const chains = new Set<string>();
+    for (const m of TEXT.matchAll(new RegExp(`\\bworld\\s*\\??\\.\\s*${NAME}\\s*(\\()?`, 'g'))) {
+      if (m[2] === undefined) { fields.add(m[1]); continue; }
+      calls.add(m[1]);
+      const tail = /^\s*\??\.\s*([A-Za-z_$][\w$]*)/
+        .exec(CODE.slice(closeOf((m.index ?? -1) + m[0].length - 1)));
+      if (tail) chains.add(`${m[1]}().${tail[1]}`);
+    }
+    for (const f of fields) {
+      for (const h of TEXT.matchAll(
+        new RegExp(`\\bworld\\s*\\??\\.\\s*${f}\\s*\\??\\.\\s*${NAME}`, 'g'))) {
+        chains.add(`${f}.${h[1]}`);
+      }
+    }
+    const asked = new Set([...calls, ...fields]);
+
     const unclassified = [...asked].filter((n) => !(n in WORLD_SURFACE)).sort();
     expect(unclassified, `editMode now asks the World for these. Does any of them reach a ${
       'room-doc write? If so add it to WRITERS as well:\n'}${unclassified.join('\n')}`)
       .toEqual([]);
-    // And the other direction, so the list cannot rot into a record of
-    // calls that were removed years ago.
+    const unhopped = [...chains].filter((n) => !(n in WORLD_HOPS)).sort();
+    expect(unhopped, `editMode now reaches these one hop past the World. Does any of ${
+      'them write? If so add the tail to WRITERS as well:\n'}${unhopped.join('\n')}`)
+      .toEqual([]);
+    // And the other direction for both, so neither list can rot into a
+    // record of calls that were removed years ago.
     expect([...Object.keys(WORLD_SURFACE)].filter((n) => !asked.has(n)).sort(),
-      'listed here but no longer called — drop it').toEqual([]);
-    for (const [name, writes] of Object.entries(WORLD_SURFACE)) {
+      'listed here but no longer reached — drop it').toEqual([]);
+    expect([...Object.keys(WORLD_HOPS)].filter((n) => !chains.has(n)).sort(),
+      'listed here but no longer reached — drop it').toEqual([]);
+    // A path's answer is about its tail, which is the name a gate scan
+    // would see at the call site: `world.dockingSystem?.isDoorPaired(id)`
+    // contains `isDoorPaired(`, so WRITERS can match it like any other.
+    for (const [path, writes] of [...Object.entries(WORLD_SURFACE), ...Object.entries(WORLD_HOPS)]) {
+      const name = path.slice(path.lastIndexOf('.') + 1);
       expect((WRITERS as readonly string[]).includes(name), writes
-        ? `${name} reaches a room-doc write and must be in WRITERS`
-        : `${name} does not write, so WRITERS claims a gate it does not need`).toBe(writes);
+        ? `${path} reaches a room-doc write and must be in WRITERS`
+        : `${path} does not write, so WRITERS claims a gate it does not need`).toBe(writes);
     }
-
-    // One level of chaining is reached too, and only one exists today.
-    // Stated rather than swept, because a scan that followed every chain
-    // would be a type checker; what this can honestly do is fail when a
-    // second one appears and make someone look at it.
-    const chained = [...stripComments(SRC).matchAll(/\bworld\.getPlayer\(\)\s*\.\s*(\w+)/g)]
-      .map((m) => m[1]);
-    expect([...new Set(chained)], 'a new Player call through the World — does it write?')
-      .toEqual(['onObstaclesChanged']); // player.ts:1264, nav/path state only
   });
 
   it('starts a session behind the same gate, so a write is never the first check', () => {
