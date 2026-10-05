@@ -1731,11 +1731,23 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // which is what a canary is.
     //
     // It also measured the two shapes that would make a nested body safe
-    // anyway: an immediately-invoked function, and a callback to an array
-    // method that runs it on the spot. There are none of either in the
-    // file, so the honest rule needs no exception list, and the message
-    // below names the remedy for both rather than this file guessing at
-    // the type of a receiver it can only read as text.
+    // anyway, because they run on the spot rather than later: an
+    // immediately-invoked function, of which this file has none, and a
+    // callback to an array method, of which it has twenty-six — nine
+    // `filter`, eight `find`, four `some`, two `map`, two `findIndex` and
+    // one `every`, all but one of them concise. None holds a write, so
+    // none is reported today; adding concise bodies to `runsLater` below
+    // took that surface from one to twenty-six, which is the honest price
+    // of closing the hole they were hiding.
+    //
+    // They still get no exception list, and the twenty-six are the reason
+    // to say why rather than to start one. Deciding that a receiver is an
+    // array means knowing its type, and this file can only read text: a
+    // `.filter(` is a guess the moment anyone writes a `filter` of their
+    // own that defers, and a guess here is a silent pass. So the rule
+    // stays the one that needs no types — a nested body is a nested body —
+    // and the message below names the remedy instead: lift the write out,
+    // or make the callback a unit this file knows.
     //
     // Which braces open a function body is a question about the grammar,
     // and the grammar is not small enough to answer by looking backwards
@@ -1755,6 +1767,16 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // offsets it reports are offsets into that same text — the unit list
     // and the carver line up with it unchanged. Exact by construction, and
     // there is nothing left here to be wrong about.
+    //
+    // Not asserted: the parse's own diagnostics. `parseDiagnostics` is not
+    // in the compiler's public types, and the one public route to them —
+    // `createProgram(...).getSyntacticDiagnostics()` — probes node_modules
+    // 495 times for this file's own imports even under `noResolve`, which
+    // is precisely the resolution this whole file exists to avoid. It is
+    // not needed: a parse that went wrong moves the body count in one
+    // direction or the other (164 → 169 on a stray `(((`, → 65 on a
+    // truncated file), and both directions land in `bodiless` or
+    // `misaligned` below, loudly.
     const ast = ts.createSourceFile(SRC_PATH, SRC, ts.ScriptTarget.Latest, true);
     const bodies: { open: number; end: number }[] = [];
     // Function, method, constructor, getter, setter, arrow, function
@@ -1764,8 +1786,17 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // but not a Block is a concise arrow, `() => expr`; it is left out
     // here because the two checks reading this list are about braces, and
     // picked up again in `runsLater` below, which is about what runs.
+    //
+    // A class static block is the one other thing in the grammar with a
+    // braced body, and `isFunctionLike` does not admit it — it is not a
+    // signature. There are none in editMode.ts, and the member canary
+    // would name one anyway, since MEMBER_RE cannot start a unit at
+    // `static {`. It is collected regardless, because leaving the single
+    // known gap open and arguing it is covered elsewhere is how the walk
+    // this replaced went wrong.
     const collect = (n: ts.Node): void => {
-      if (ts.isFunctionLike(n) && 'body' in n && n.body !== undefined && ts.isBlock(n.body)) {
+      if ((ts.isFunctionLike(n) || ts.isClassStaticBlockDeclaration(n))
+          && 'body' in n && n.body !== undefined && ts.isBlock(n.body)) {
         bodies.push({ open: n.body.getStart(ast), end: n.body.end });
       }
       ts.forEachChild(n, collect);
@@ -1789,6 +1820,29 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
      * quietly into the bucket for data.
      */
     const members: { start: number; name: string; fn: boolean; what: string }[] = [];
+    /**
+     * `(() => { … })`, `(() => { … }) as H`, `(() => { … }) satisfies H`:
+     * three ways to write an initializer that is still a function, and the
+     * parser reports the wrapper. Ask what is underneath before calling the
+     * member data.
+     *
+     * None of the three is in editMode.ts today. It is unwrapped anyway
+     * because a miss here is quiet exactly where this file cares: a
+     * wrapped function sorts as a field, never joins `fnUnits`, and so
+     * never reaches `bodiless` to be named. An ungated write inside one is
+     * still caught — the gate test works off the write, not off this flag
+     * — so what is lost is the early warning, not the catch.
+     *
+     * Measured both ways, on a concise arrow behind an `as` cast holding an
+     * ungated write: with the unwrap that arm fails twice and `bodiless`
+     * names `probeW`; without it, once, and nothing says which member went
+     * missing. Same species as the brace walk above — a guess about syntax
+     * — and this one costs three predicates to stop guessing about.
+     */
+    const unwrap = (e: ts.Expression): ts.Expression =>
+      (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression(e))
+        ? unwrap(e.expression)
+        : e;
     const collectMembers = (n: ts.Node): void => {
       if (ts.isClassLike(n)) {
         for (const m of n.members) {
@@ -1797,7 +1851,7 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
             start: m.getStart(ast),
             name: ts.isConstructorDeclaration(m) ? 'constructor'
               : (m.name !== undefined && ts.isIdentifier(m.name) ? m.name.text : ''),
-            fn: ts.isFunctionLike(m) || (init !== undefined && ts.isFunctionLike(init)),
+            fn: ts.isFunctionLike(m) || (init !== undefined && ts.isFunctionLike(unwrap(init))),
             what: ts.SyntaxKind[m.kind],
           });
         }
