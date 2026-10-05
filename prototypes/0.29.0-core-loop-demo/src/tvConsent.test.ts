@@ -190,7 +190,7 @@ describe('the redirect probe before a consented host is mounted', () => {
     setNodeMediaOrigin(null, 1_000);
   });
 
-  it('reads an opaque redirect as a redirect, any other answer as direct, and a host that does not answer as nothing learnt; the verdict is kept for the session and forgotten with the consents', async () => {
+  it('is a CORS HEAD that follows no redirect: an opaque redirect is a redirect, any answer that came through is direct, and no answer is unknown — kept for the first two only, and forgotten with the consents', async () => {
     const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
     const answering = (type: string) => (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(input), init });
@@ -199,12 +199,19 @@ describe('the redirect probe before a consented host is mounted', () => {
     expect(redirectVerdict('https://example.org/a.mp4')).toBeNull();
     expect(await probeRedirect('https://example.org/a.mp4', answering('opaqueredirect'))).toBe('redirects');
     expect(redirectVerdict('https://example.org/a.mp4')).toBe('redirects');
-    expect(calls[0]!.init).toMatchObject({ method: 'HEAD', mode: 'no-cors', redirect: 'manual', credentials: 'omit' });
-    expect(await probeRedirect('https://example.org/b.mp4', answering('opaque'))).toBe('direct'); // a non-CORS 200, or a 405 for the HEAD
-    expect(await probeRedirect('https://example.org/c.mp4', answering('basic'))).toBe('direct');
+    // cors + manual is the one pair the fetch standard allows here: no-cors
+    // with a redirect mode other than follow is a network error on every
+    // call, and a probe built on it would learn nothing and fail open.
+    expect(calls[0]!.init).toMatchObject({ method: 'HEAD', mode: 'cors', redirect: 'manual', credentials: 'omit' });
+    expect(await probeRedirect('https://example.org/b.mp4', answering('cors'))).toBe('direct'); // a CORS host's 200, 405 for the HEAD, or 404 alike
+    expect(redirectVerdict('https://example.org/b.mp4')).toBe('direct');
+    // A host without CORS headers, or one that is down: a network error.
+    // Nothing is learnt, nothing is authorised, nothing is kept — RETRY asks again.
     const down = (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch;
-    expect(await probeRedirect('https://example.org/d.mp4', down)).toBe('direct'); // the <video> will say so itself
+    expect(await probeRedirect('https://example.org/d.mp4', down)).toBe('unknown');
+    expect(redirectVerdict('https://example.org/d.mp4')).toBeNull();
     forgetMediaConsent();
     expect(redirectVerdict('https://example.org/a.mp4')).toBeNull();
+    expect(redirectVerdict('https://example.org/b.mp4')).toBeNull();
   });
 });

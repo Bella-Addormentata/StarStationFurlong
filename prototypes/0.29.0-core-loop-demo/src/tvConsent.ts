@@ -19,13 +19,17 @@
  *
  * CONSENT, NOT VALIDATION: a host the viewer accepted can redirect the
  * request, or resolve, into the viewer's own network, and a browser <video>
- * can see neither. The redirect half is closed here all the same: before a
- * consented third-party URL is mounted, a HEAD with `redirect: 'manual'`
- * shows whether the host redirects (not where), and a URL that does is not
- * mounted (probeRedirect, below). The DNS half stays the consent's word —
- * the ask says so — and the node's media proxy (plan §3.4, TODO) is where
- * destinations are checked after DNS. Until it lands, a direct URL is the
- * viewer's own trust decision, made per origin, per session.
+ * can see neither — so the ask says so, and the node's media proxy (plan
+ * §3.4, TODO) is where destinations are checked after DNS and on every
+ * redirect. Until it lands, a direct URL is the viewer's own trust decision,
+ * made per origin, per session. What this page CAN do before mounting a
+ * consented third-party URL is ask the host once, with a CORS HEAD that
+ * follows no redirect (probeRedirect, below): a host that answers it plays,
+ * one that answers with a redirect does not, and one that does not answer
+ * it — no CORS, or down — does not either. That is a check of one answer
+ * at one moment, not validation of the <video>'s later GET, which the host
+ * may answer differently; it narrows the URL tile to CORS-clean hosts, which
+ * is what the plan names for it (a VideoTexture needs CORS too).
  *
  * DOM-free: the theatre asks, this answers, and vitest covers the answers.
  */
@@ -119,21 +123,29 @@ export function forgetMediaConsent(): void {
 //
 // A host the viewer accepted can answer the media request with a redirect
 // into the viewer's own network, and a <video> element follows it blind. A
-// media element shows nothing of the chain — but a fetch with
-// `redirect: 'manual'` does show that a redirect HAPPENED: the response comes
-// back as an opaque-redirect (type 'opaqueredirect', status 0), for a
-// non-CORS host too. Where it points stays hidden, and that is enough: the
-// theatre probes a consented third-party URL with a HEAD before it mounts
-// it, and a URL that redirects is not mounted — the viewer is told to paste
-// the final link instead. What this does NOT see is a hostname that
-// RESOLVES into the viewer's network: that stays the consent's word (the
-// ask says so), and the node's media proxy is where destinations are checked
-// after DNS (plan §3.4).
+// media element shows nothing of the chain. A fetch can show a little, and
+// only in CORS mode: with `redirect: 'manual'` a redirect comes back as an
+// opaque-redirect (type 'opaqueredirect') BEFORE any CORS check — the fetch
+// standard files the manual-redirect response before the tainting check in
+// HTTP fetch — while a direct answer passes only when the host sends CORS
+// headers, and everything else is a network error. (`no-cors` with any
+// redirect mode but 'follow' is a network error outright: the standard's
+// main fetch refuses it, so a no-cors probe learns nothing at all.) So the
+// probe is a CORS HEAD, and it FAILS CLOSED: a direct CORS answer plays, a
+// redirect does not, and no answer — a host without CORS, or one that is
+// down — does not either, since nothing that could not be asked may
+// authorise a mount. That narrows the URL tile to CORS-clean hosts, which
+// is what the plan names for it. It remains a check of one answer at one
+// moment: the <video>'s GET may be answered differently, and a hostname
+// that RESOLVES into the viewer's network is not seen at all. Destination
+// validation is the node proxy's (plan §3.4).
 
-export type RedirectVerdict = 'direct' | 'redirects';
+export type RedirectVerdict = 'direct' | 'redirects' | 'unknown';
 
-/** What the probe found, per URL, for the session. */
-const redirectVerdicts = new Map<string, RedirectVerdict>();
+/** What the probe found, per URL, for the session — 'direct' and
+ *  'redirects' only: an 'unknown' (no answer) is not kept, so a RETRY asks
+ *  again. */
+const redirectVerdicts = new Map<string, Exclude<RedirectVerdict, 'unknown'>>();
 
 /** Whether the theatre owes `source` a redirect probe before mounting it: a
  *  direct URL on an origin the VIEWER accepted (PLAY FROM <host>) — never
@@ -148,32 +160,35 @@ export function needsRedirectProbe(source: TvSource, now = tvNow(), wall = tvWal
   return accepted.has(origin);
 }
 
-/** The probe's verdict for `url`, or null when it has not been probed. */
-export function redirectVerdict(url: string): RedirectVerdict | null {
+/** The probe's kept verdict for `url`, or null when it has none (never
+ *  probed, or the probe got no answer). */
+export function redirectVerdict(url: string): Exclude<RedirectVerdict, 'unknown'> | null {
   return redirectVerdicts.get(url) ?? null;
 }
 
-/** Probe `url` with a HEAD that follows no redirect and reads no body: an
- *  opaque-redirect answer is a redirect; anything else — an opaque 200, a
- *  405 for the HEAD, a host that does not answer at all — is 'direct',
- *  since nothing about a redirect was learnt and the <video> itself will
- *  say (RETRY) when the host is down. The verdict is kept for the session.
- *  `fetchImpl` is injectable for the tests. */
+/** Probe `url` with a CORS HEAD that follows no redirect and reads no body.
+ *  An opaque-redirect answer is 'redirects'; any answer that came through
+ *  (the host sends CORS headers — a 200, a 405 for the HEAD, a 404) is
+ *  'direct'; a network error — a host without CORS headers, one that is
+ *  down, the deadline — is 'unknown', which authorises nothing and is not
+ *  kept, so a RETRY asks again. `fetchImpl` is injectable for the tests;
+ *  the request options are the ones the fetch standard allows together
+ *  (cors + manual), where no-cors + manual would be an error on every call. */
 export async function probeRedirect(url: string, fetchImpl: typeof fetch = fetch, timeoutMs = 8_000): Promise<RedirectVerdict> {
   const ctl = new AbortController();
   const deadline = setTimeout(() => ctl.abort(), timeoutMs);
-  let verdict: RedirectVerdict = 'direct';
+  let verdict: RedirectVerdict = 'unknown';
   try {
     const res = await fetchImpl(url, {
-      method: 'HEAD', mode: 'no-cors', redirect: 'manual', cache: 'no-store', credentials: 'omit', signal: ctl.signal,
+      method: 'HEAD', mode: 'cors', redirect: 'manual', cache: 'no-store', credentials: 'omit', signal: ctl.signal,
     });
-    if (res.type === 'opaqueredirect') verdict = 'redirects';
+    verdict = res.type === 'opaqueredirect' ? 'redirects' : 'direct';
   } catch {
-    // unreachable, or the deadline: nothing learnt about a redirect
+    // a host without CORS, unreachable, or the deadline: nothing learnt, nothing authorised
   } finally {
     clearTimeout(deadline);
   }
-  redirectVerdicts.set(url, verdict);
+  if (verdict !== 'unknown') redirectVerdicts.set(url, verdict);
   return verdict;
 }
 

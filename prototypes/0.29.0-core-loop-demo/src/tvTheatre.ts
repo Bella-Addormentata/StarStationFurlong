@@ -694,13 +694,14 @@ function theatreTick(rtt: () => number): void {
     if (consent !== 'ok') {
       showConsentNotice(t, rec.source!, consent);
     } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
-      // A URL on a host the viewer accepted is probed for a redirect before
-      // anything fetches it (tvConsent needsRedirectProbe / probeRedirect):
-      // the host could answer the <video>'s request with a redirect into the
-      // viewer's own network, which the element would follow blind. One
-      // probe per programme; a URL that redirects is not mounted, and the
-      // viewer is told to paste the final link. The viewer's own origins,
-      // the node and the product lanes are not probed.
+      // A URL on a host the viewer accepted is asked about before anything
+      // fetches it (tvConsent needsRedirectProbe / probeRedirect): a CORS
+      // HEAD that follows no redirect. A direct answer mounts; a redirect
+      // does not (the <video> would follow it blind, into the viewer's own
+      // network for all this page can tell); no answer — a host without
+      // CORS, or down — does not either: what could not be asked authorises
+      // nothing, and RETRY asks again. One probe per programme. The viewer's
+      // own origins, the node and the product lanes are not probed.
       const url = rec.source!.kind === 'url' ? rec.source!.url : '';
       const verdict = url && needsRedirectProbe(rec.source!) ? redirectVerdict(url) : 'direct';
       if (verdict === null) {
@@ -724,18 +725,30 @@ function theatreTick(rtt: () => number): void {
   renderTheatreChrome(t);
 }
 
-/** CHECKING THE LINK… — the redirect probe is out for this programme's URL;
- *  the tick after it lands reads the verdict from tvConsent and mounts, or
- *  shows why not. A probe that comes back for an earlier programme, or
- *  after the theatre closed, changes nothing here: its verdict is kept per
- *  URL all the same. */
+/** CHECKING THE LINK… — the probe is out for this programme's URL; the tick
+ *  after it lands reads the kept verdict from tvConsent and mounts, or shows
+ *  why not. No answer keeps no verdict: that is said here, with RETRY, so
+ *  the next tick does not ask again on its own. A probe that comes back for
+ *  an earlier programme, or after the theatre closed, changes nothing here;
+ *  a kept verdict is kept per URL all the same. */
 function startRedirectProbe(t: Theatre, url: string, key: string): void {
   t.probing = key;
   let host = url;
   try { host = new URL(url).host; } catch { /* shown as it is */ }
   showNotice(t, `<div>CHECKING THE LINK</div>
     <div class="tv-theatre-lane">asking ${escapeHtml(host)} whether it answers this link itself or sends your browser elsewhere</div>`);
-  void probeRedirect(url).finally(() => {
+  void probeRedirect(url).then((verdict) => {
+    if (theatre !== t || t.probing !== key) return;
+    t.probing = '';
+    if (verdict !== 'unknown') return; // the next tick reads the kept verdict
+    t.mounted = `failed:${key}`;
+    showNotice(t, `<div>NOT PLAYED HERE</div>
+      <div class="tv-theatre-lane">${escapeHtml(host)} did not answer a cross-origin check — no CORS headers, or not reachable — and a link that cannot be asked about is not fetched; a CORS-enabled host, your own origin or this station's node plays here</div>
+      <button type="button" data-tv-retry="1">RETRY</button>`);
+    t.notice.querySelector<HTMLButtonElement>('[data-tv-retry]')?.addEventListener('click', () => {
+      t.mounted = '';
+    });
+  }, () => {
     if (theatre === t && t.probing === key) t.probing = '';
   });
 }
