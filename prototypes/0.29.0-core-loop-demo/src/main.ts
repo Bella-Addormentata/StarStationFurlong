@@ -7880,6 +7880,13 @@ function setupSpacePhoneOverlay() {
           logToPhoneSystem("Entering SpacePhone net...");
         } else {
           chatInput?.blur();
+          // Any control left focused inside the phone lets go too: the phone
+          // is only moved offscreen, so a focused control in it keeps taking
+          // keys nobody can see — the TV remote's paste box swallowing WASD,
+          // its PLAY still answering Enter — whether or not an opener exists
+          // to hand focus back to.
+          const focused = document.activeElement;
+          if (focused instanceof HTMLElement && container.contains(focused)) focused.blur();
           // Hand focus back to whatever opened the phone from outside it. The
           // phone is only moved offscreen, never display:none, so a control
           // left focused inside it keeps answering the arrow keys against
