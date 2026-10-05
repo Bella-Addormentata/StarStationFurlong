@@ -1122,3 +1122,22 @@ describe('the controller finds a sleep itself (the real record)', () => {
     expect(p.rate).toBe(1);
   });
 });
+
+describe('a live window and the record behind it', () => {
+  it('a player at the edge of its window is in step with a record it cannot reach: no seek every cooldown', () => {
+    const p = new FakePlayer(true);
+    p.window = { startMs: 50_000, endMs: 60_000 }; // the stream's DVR window
+    p.position = 50_000; // already at the oldest point it has
+    const h = harness(p);
+    h.set({ positionMs: 20_000 }); // the holder is 30 s further back than this stream keeps
+    h.tick();
+    expect(p.log).toEqual(['play']);
+    h.set({ positionMs: 20_500 });
+    p.position = 50_500;
+    p.window = { startMs: 50_500, endMs: 60_500 }; // the window slides with the stream; the player stays on its edge
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log).toEqual(['play']); // nothing to do: the reachable position is where the player is
+    expect(p.rate).toBe(1);
+  });
+});

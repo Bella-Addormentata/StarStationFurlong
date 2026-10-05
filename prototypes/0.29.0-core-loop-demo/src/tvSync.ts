@@ -596,12 +596,15 @@ export class TvSyncController {
       return pb;
     }
     this.seenStarted = started;
-    const action = driftAction(p.currentMs(), pb.positionMs, p.canNudge);
+    // Measured against what this player can reach, as the seek is: the
+    // record may name a position this viewer's media does not have (a live
+    // window that has moved on), and a player already at the window's edge
+    // is in step with it, not 30 s out and seeked there again every cooldown.
+    const target = reachable(pb.positionMs, p);
+    const action = driftAction(p.currentMs(), target, p.canNudge);
     if (action === 'seek') {
       if (p.canSeek && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
-        // Into this player's own range: the record may name a position this
-        // viewer's media does not have (a live window that has moved on).
-        p.seek(reachable(pb.positionMs, p));
+        p.seek(target);
         this.lastSeekAt = now;
         this.setRate(1);
       }
