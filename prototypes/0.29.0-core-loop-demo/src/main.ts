@@ -232,10 +232,10 @@ import { leaveCoinPusherRoom } from "./pusherCroupier";
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
-import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv } from "./tvDoc";
+import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv, tvNow } from "./tvDoc";
 import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
-import { setOwnMediaOrigins } from "./tvConsent";
+import { setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
 import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvLabel, tvRoomPlayers } from "./tvSession";
@@ -8235,11 +8235,14 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // that meets its contract, not merely on a loopback port. The trust is
   // decided afresh on every probe, so a round the node does not answer
   // withdraws it: once the node is gone, whatever next binds its port is a
-  // stranger, until a fingerprint says otherwise. (A service impersonating
-  // the node deliberately is beyond what this page can tell from here.)
-  setOwnMediaOrigins(
-    fingerprint ? [window.location.origin, nodeOrigin] : [window.location.origin],
-  );
+  // stranger, until a fingerprint says otherwise. And it has a lifetime of
+  // its own (TV_NODE_TRUST_MS, one probe interval and a margin): a probe
+  // that never runs — a throttled tab, a stalled interval — withdraws it
+  // by lapse, so a stranger on the node's port between probes is not
+  // trusted for longer than that. (A service impersonating the node
+  // deliberately is beyond what this page can tell from here.)
+  setOwnMediaOrigins([window.location.origin]);
+  setNodeMediaOrigin(fingerprint ? nodeOrigin : null, tvNow());
   if (!fingerprint) {
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
@@ -8849,6 +8852,9 @@ function setupNetworkDetailsPanel() {
   // R1: keep the REACHABILITY row (and the cached fingerprint feeding invite
   // hints) live. Portmapper mappings and the echo advert appear/heal minutes
   // after node startup, and the node classifies per request — poll gently.
+  // This interval is also what renews the node origin's media trust
+  // (tvConsent TV_NODE_TRUST_MS is sized to it, with a margin): lengthen one
+  // and the other must follow.
   void refreshLocalFingerprint();
   window.setInterval(() => {
     void refreshLocalFingerprint();

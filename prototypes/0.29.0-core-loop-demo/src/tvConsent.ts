@@ -28,15 +28,17 @@
  */
 
 import type { TvSource } from './tvDoc';
+import { tvNow } from './tvDoc';
 import { convenienceLanesEnabled, sourceKindAllowed } from './sovereignty';
 
 export type MediaConsent = 'ok' | 'ask' | 'refuse';
 
 /** Why a 'refuse' is a refuse, for the words on the screen: the lane is
  *  off in this build; the link is on another server and this build plays
- *  serverless sources only; the host is inside a private network; or the
- *  link is not a URL at all. */
-export type ConsentRefusal = 'lane-off' | 'server-off' | 'private' | 'bad';
+ *  serverless sources only; the link is on the node's origin but the node's
+ *  trust has run out (no fingerprint answer lately); the host is inside a
+ *  private network; or the link is not a URL at all. */
+export type ConsentRefusal = 'lane-off' | 'server-off' | 'node-stale' | 'private' | 'bad';
 
 /** The product's own lanes: where the start screen's tiles fetch from. */
 const PRODUCT_ORIGINS: ReadonlySet<string> = new Set([
@@ -56,10 +58,38 @@ function normalizeOrigin(s: string): string | null {
   }
 }
 
-/** This page's own origin and its node's HTTP origin(s). Media from there
- *  is the viewer's own machine serving the viewer: no asking. */
+/** This page's own origin(s). Media from there is the viewer's own machine
+ *  serving the viewer: no asking, and no expiry — the page is where it is. */
 export function setOwnMediaOrigins(origins: readonly string[]): void {
   ownOrigins = new Set(origins.map(normalizeOrigin).filter((o): o is string => o !== null));
+}
+
+/** How long the node's origin stays trusted after a fingerprint probe said
+ *  it was the node's: one probe interval (main.ts refreshes every 60 s) and
+ *  a margin. The node's port is a loopback port like any other: if the node
+ *  exits and another local service binds its port between probes, a
+ *  peer-written URL on that origin must not go on passing without asking
+ *  until the next probe happens to run (a throttled tab's may not). So the
+ *  trust has a lifetime of its own, separate from the cached fingerprint,
+ *  and a successful probe is what renews it; past it, the origin is refused
+ *  like any loopback host ('node-stale') until the node answers again. This
+ *  bounds stale trust; it does not see a service impersonating the node. */
+export const TV_NODE_TRUST_MS = 90_000;
+
+let nodeOrigin: string | null = null;
+let nodeTrustUntil = -Infinity;
+
+/** The node's HTTP origin as the fingerprint probe identified it (main.ts),
+ *  trusted from `now` for TV_NODE_TRUST_MS; null withdraws it (a probe the
+ *  node did not answer). */
+export function setNodeMediaOrigin(origin: string | null, now: number): void {
+  nodeOrigin = origin ? normalizeOrigin(origin) : null;
+  nodeTrustUntil = nodeOrigin ? now + TV_NODE_TRUST_MS : -Infinity;
+}
+
+/** The node's origin while its trust is live at `now`, else null. */
+export function trustedNodeMediaOrigin(now = tvNow()): string | null {
+  return nodeOrigin && now < nodeTrustUntil ? nodeOrigin : null;
 }
 
 /** The viewer pressed PLAY FROM <host>: that origin is fine for the rest of
@@ -194,11 +224,11 @@ function expandIPv6(ip: string): number[] | null {
  *  The product's own lanes (YouTube, the archive embed) are fetched from
  *  their own origins by their own players: yes with the convenience lanes
  *  on, never with them off (sovereignty.ts). */
-export function mediaConsent(source: TvSource): MediaConsent {
+export function mediaConsent(source: TvSource, now = tvNow()): MediaConsent {
   if (source.kind !== 'url') return sourceKindAllowed(source.kind) ? 'ok' : 'refuse';
   const origin = normalizeOrigin(source.url);
   if (!origin) return 'refuse';
-  if (ownOrigins.has(origin)) return 'ok';
+  if (ownOrigins.has(origin) || origin === trustedNodeMediaOrigin(now)) return 'ok';
   let host: string;
   try {
     host = new URL(origin).hostname;
@@ -216,10 +246,13 @@ export function mediaConsent(source: TvSource): MediaConsent {
 
 /** The reason behind a 'refuse' from mediaConsent, for the words on the
  *  screen. */
-export function consentRefusal(source: TvSource): ConsentRefusal {
+export function consentRefusal(source: TvSource, now = tvNow()): ConsentRefusal {
   if (source.kind !== 'url') return 'lane-off';
   const origin = normalizeOrigin(source.url);
   if (!origin) return 'bad';
+  // The node's own origin whose trust has run out: the node, not a stranger,
+  // as far as this page last knew — said so, not "a private network".
+  if (nodeOrigin !== null && origin === nodeOrigin && trustedNodeMediaOrigin(now) === null) return 'node-stale';
   let host: string;
   try {
     host = new URL(origin).hostname;

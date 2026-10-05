@@ -729,6 +729,13 @@ function showConsentNotice(t: Theatre, source: TvSource, consent: 'ask' | 'refus
     } else if (why === 'server-off') {
       showNotice(t, `<div>NOT IN THIS BUILD</div>
       <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is another server — ${escapeHtml(SERVERLESS_ONLY)}: a link on your own origin or this station's node plays here</div>`);
+    } else if (why === 'node-stale') {
+      // The node's origin, but the node has not answered a fingerprint probe
+      // within its trust lifetime (tvConsent TV_NODE_TRUST_MS): whatever is
+      // on that port now is not known to be the node. The next probe that
+      // the node answers renews the trust and the theatre mounts on its own.
+      showNotice(t, `<div>WAITING FOR THE NODE</div>
+      <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is this station's node, but it has not answered lately — the picture returns when it does</div>`);
     } else {
       showNotice(t, `<div>NOT PLAYED HERE</div>
       <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is inside a private network — nobody in the room can ask your browser to fetch from there</div>`);

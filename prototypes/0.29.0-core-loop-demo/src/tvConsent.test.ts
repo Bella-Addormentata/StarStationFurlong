@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   acceptMediaOrigin, allowMount, consentRefusal, forgetMediaConsent, isPrivateHost, mayMountNow, mediaConsent, mediaOrigin,
-  setOwnMediaOrigins, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS,
+  setNodeMediaOrigin, setOwnMediaOrigins, trustedNodeMediaOrigin, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
@@ -126,5 +126,33 @@ describe('the mount budget: consent per origin bounds nothing cumulative', () =>
     expect(mayMountNow('tv-1', t0 + 9_000 + TV_MOUNT_WINDOW_MS)).toBe(true);
     forgetMediaConsent(); // leaving the room forgets the budget with the consents
     expect(mayMountNow('tv-1', t0 + 9_001 + TV_MOUNT_WINDOW_MS)).toBe(true);
+  });
+});
+
+describe('the node origin\'s trust has a lifetime of its own', () => {
+  it('holds for TV_NODE_TRUST_MS from the probe, lapses to node-stale, is renewed by the next probe and withdrawn by a probe the node did not answer; the other candidate port is a stranger throughout', () => {
+    setOwnMediaOrigins(['http://localhost:4173']); // the page alone: the node is registered by the probe
+    const t0 = 5_000_000;
+    const node = url('http://127.0.0.1:8081/blob/abc');
+    const other = url('http://127.0.0.1:8080/blob/abc');
+    expect(mediaConsent(node, t0)).toBe('refuse'); // nothing identified yet
+    setNodeMediaOrigin('http://127.0.0.1:8081', t0);
+    expect(trustedNodeMediaOrigin(t0)).toBe('http://127.0.0.1:8081');
+    expect(mediaConsent(node, t0)).toBe('ok');
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS - 1)).toBe('ok');
+    expect(mediaConsent(other, t0)).toBe('refuse'); // 8080 answered as a stranger (or not at all)
+    expect(consentRefusal(other, t0)).toBe('private');
+    // No probe ran (a throttled tab): the trust lapses by itself.
+    expect(trustedNodeMediaOrigin(t0 + TV_NODE_TRUST_MS)).toBeNull();
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS)).toBe('refuse');
+    expect(consentRefusal(node, t0 + TV_NODE_TRUST_MS)).toBe('node-stale'); // the node, not "a private network"
+    // The next probe the node answers renews it.
+    setNodeMediaOrigin('http://127.0.0.1:8081', t0 + TV_NODE_TRUST_MS + 10);
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS + 10)).toBe('ok');
+    // A probe the node did not answer withdraws it at once, and the port is
+    // then a loopback port like any other.
+    setNodeMediaOrigin(null, t0 + TV_NODE_TRUST_MS + 20);
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS + 20)).toBe('refuse');
+    expect(consentRefusal(node, t0 + TV_NODE_TRUST_MS + 20)).toBe('private');
   });
 });
