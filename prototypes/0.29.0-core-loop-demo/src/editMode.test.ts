@@ -1667,9 +1667,14 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // nothing. This fired for real once: #184 merged `settleCupolaConflicts`,
     // a module-scope writer, into a file whose model knew only class members.
     // The answer was to teach the model about module-scope functions, not to
-    // wave the call through, so what is left over here is now a shorter list
-    // — a write in bare module scope, or in a helper nested inside something
-    // else, where neither a member slice nor a function slice can see it.
+    // wave the call through, so what is left over here is now a shorter list:
+    // a write at bare module scope, or inside a module-scope arrow const,
+    // which no member slice and no function slice covers.
+    //
+    // A write nested INSIDE a slice is a different fault and this cannot
+    // see it: the call is within the enclosing member’s offsets, so a unit
+    // does contain it — the wrong one. The test straight after this is the
+    // one that asks which.
     const bare = stripComments(SRC);
     const homeless: string[] = [];
     for (const w of WRITERS) {
@@ -1681,6 +1686,215 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       }
     }
     expect(homeless, homeless.join('\n')).toEqual([]);
+  });
+
+  it('refuses a write in a nested callback, whose gate ran at some other time', () => {
+    // `homeless` above asks whether ANY slice contains the call. This asks
+    // whether the slice containing it is the one that RUNS it.
+    //
+    // A gate is checked by offset: a gate earlier in the slice covers a
+    // write later in it. That holds for straight-line code and for an `if`,
+    // a `for`, a `switch` or a `try`, every one of which runs where it is
+    // written. It does not hold for a function body. Inside a gated method,
+    //
+    //     this.pending = () => { writeWallpaper(surface, next); };
+    //
+    // puts the write after the gate textually and at an arbitrary later
+    // time in fact, and the scan scores it covered.
+    //
+    // The carvers lift five such shapes into units of their own — a
+    // listener, a field handler, a timer, a promise continuation, a handler
+    // property — and the exhaustiveness canary asks that every registration
+    // SITE they know of be claimed by one of them. Neither reaches a
+    // function body nobody registered: a callback handed to a method this
+    // file has never heard of, an object-literal method, a helper put in a
+    // local and passed on. This is the complement, and it needs no list of
+    // shapes to ask its question — is the innermost function body holding
+    // this write a unit, or is it borrowing one?
+    //
+    // Measured before it was written, by the walk below rather than by a
+    // guess about it. editMode.ts has 168 braced function bodies, 33 of
+    // them inside another, and 15 of those 33 belong to no carver.
+    // Exactly one nested body holds a writer call — the carved 'click'
+    // listener, which is a unit already — and the other twenty writes sit
+    // directly in a member or in settleCupolaConflicts. So this reports
+    // nothing today and is one callback away from reporting, which is
+    // what a canary is.
+    //
+    // It also measured the two shapes that would make a nested body safe
+    // anyway: an immediately-invoked function, and a callback to an array
+    // method that runs it on the spot. There are none of either in the
+    // file, so the honest rule needs no exception list, and the message
+    // below names the remedy for both rather than this file guessing at
+    // the type of a receiver it can only read as text.
+    const code = blankOut(SRC, true);
+    // The only `)` before a `{` that is not a parameter list.
+    const BLOCK = new Set(['if', 'for', 'while', 'switch', 'catch', 'with']);
+    // Index just past a `}` -> index of its `{`, filled as each pair closes.
+    const openOf = new Map<number, number>();
+
+    /**
+     * Whether the `{` at `open` begins a function body.
+     *
+     * Exact rather than guessed, because the grammar is small: every
+     * function body in the language opens either straight after `=>` or
+     * straight after a parameter list, with at most a return annotation in
+     * between. So the question is only whether a `=>` or a `)` precedes the
+     * brace — and the sole `)` that is not a parameter list heads one of
+     * six control statements.
+     *
+     * Everything it cannot read as one of those is answered YES. A brace
+     * this walk does not understand is reported as a function body rather
+     * than waved through as a block, because the way this file has gone
+     * wrong twice is a shape nobody listed being absorbed in silence.
+     */
+    const opensFn = (open: number): boolean => {
+      let j = open - 1;
+      const skip = (): void => { while (j >= 0 && /\s/.test(code[j])) j -= 1; };
+      skip();
+      // `(): { ok: boolean } {` — a return type written as an object type
+      // puts a brace of its own between the parameters and the body. It has
+      // already closed, so `openOf` knows where it started.
+      const typed = openOf.get(j + 1);
+      if (code[j] === '}' && typed !== undefined) { j = typed - 1; skip(); }
+      // The rest of an annotation: `): void {`, `): x is Door {`. Windowed,
+      // because this runs once for every closing brace in the file, and an
+      // unbounded backward slice would copy the file each time.
+      //
+      // `:` is excluded from the tail so the match binds to the LAST
+      // colon in the window rather than the leftmost one that happens to
+      // reach the end — a regex is matched left to right, and an
+      // unrelated colon two statements back would otherwise claim it and
+      // strip away the parameter list with everything else.
+      const win = code.slice(Math.max(0, j - 200), j + 1);
+      const ann = /:[^:=;{()]*$/.exec(win);
+      if (ann !== null) { j -= win.length - ann.index; skip(); }
+      if (j >= 1 && code[j] === '>' && code[j - 1] === '=') return true;
+      if (j < 0 || code[j] !== ')') return false;
+      let k = j;
+      for (let d = 0; k >= 0; k -= 1) {
+        if (code[k] === ')') d += 1;
+        else if (code[k] === '(' && (d -= 1) === 0) break;
+      }
+      // An unbalanced parameter list is not a block, and saying so would be
+      // the quiet answer. Both exits here are the loud one.
+      if (k < 0) return true;
+      k -= 1;
+      while (k >= 0 && /\s/.test(code[k])) k -= 1;
+      if (k < 0) return true;
+      const w = /[A-Za-z_$][\w$]*$/.exec(code.slice(Math.max(0, k - 40), k + 1));
+      return w === null || !BLOCK.has(w[0]);
+    };
+
+    // Braces are counted in `code`, where a brace inside a message is gone —
+    // the same split the carver makes, and for the same reason.
+    const bodies: { open: number; end: number }[] = [];
+    const stack: number[] = [];
+    for (let i = 0; i < code.length; i += 1) {
+      if (code[i] === '{') stack.push(i);
+      else if (code[i] === '}') {
+        const open = stack.pop();
+        if (open === undefined) continue;
+        openOf.set(i + 1, open);
+        if (opensFn(open)) bodies.push({ open, end: i + 1 });
+      }
+    }
+
+    // The walk has to have found the file, or every check below passes on an
+    // empty list — and it has to be checked against something that fails
+    // when it is half working, which a count of its own output never does.
+    // The unit list is that something, once it is read properly: MEMBER_RE
+    // claims data fields as well as methods, and a field has no body to
+    // find — `private lastPointer = { x: 0, y: 0, has: false };` opens a
+    // brace the walk is right to refuse.
+    //
+    // So sort them first, by the one thing that separates the two in this
+    // grammar: a declaration whose name is followed straight by `(` is a
+    // method, because a property declaration cannot be — a field written
+    // `private f = (x) => {}` has its `=` in the way, and an overload
+    // signature would end in `;` with no body at all. Neither shape is in
+    // this file today, and both would land in `unsorted` rather than be
+    // waved into one bucket or the other, so the day this discriminator
+    // stops holding is a failure and not a quiet pass.
+    const fnUnits: Unit[] = [];
+    const unsorted: string[] = [];
+    for (const u of units) {
+      const nl = u.body.indexOf('\n');
+      const head = u.body.slice(0, nl < 0 ? u.body.length : nl);
+      // `<[^;(){}]*>` so a generic method is sorted as a method. The class
+      // has none today; the day it has one it should be sorted, not
+      // reported. A field cannot be taken for one in passing, because a
+      // field's name is followed by `:` or `=`, never by `<` and then `(`.
+      const METHOD = new RegExp(`\\b${u.name}\\s*(?:<[^;(){}]*>)?\\s*\\(`);
+      if (u.kind === 'function' || u.carved || METHOD.test(head)) {
+        fnUnits.push(u);
+      } else if (!/^[^A-Za-z_$]*[:=]/.test(head.slice(head.indexOf(u.name) + u.name.length))) {
+        unsorted.push(`${u.label}: reads as neither a method nor a field — ${head.trim()}`);
+      }
+    }
+    expect(unsorted, unsorted.join('\n')).toEqual([]);
+
+    // And now the demand: every one of those owes the walk a body opening
+    // inside its slice. This is not hypothetical. The annotation strip
+    // above landed ON the `:` rather than before it in the first draft, so
+    // every method written `): void {` was read as a block and the walk
+    // came back holding the thirty-five arrows and nothing else — a fifth
+    // of the function bodies in the file, and still enough to clear the
+    // floor of twenty that the first draft asserted instead of this.
+    const bodiless = fnUnits
+      .filter((u) => !bodies.some((b) => u.start <= b.open && b.open < u.end))
+      .map((u) => `${u.label}: the brace walk found no function body inside it`);
+    expect(bodiless, bodiless.join('\n')).toEqual([]);
+
+    const nested = new Set(bodies
+      .filter((b) => bodies.some((o) => o.open < b.open && b.end <= o.end))
+      .map((b) => b.open));
+
+    // The carved spans are where the two machines have to meet, and they
+    // have to meet on both counts: a carved span ends on the same `}` as the
+    // callback body it carved, and it was found INSIDE a member, so the walk
+    // must report a body with that end and must hold that body nested. A
+    // disagreement turns every carved listener that writes into a false
+    // report, and an empty list below would not tell that apart from
+    // agreement. Eighteen carved spans assert the nesting half of the walk
+    // here, so no floor below has to pick a number.
+    const misaligned: string[] = [];
+    for (const u of units.filter((h) => h.carved)) {
+      const body = bodies.find((b) => b.end === u.end);
+      if (body === undefined) {
+        misaligned.push(`${u.label}: ends where no function body does`);
+      } else if (!nested.has(body.open)) {
+        misaligned.push(`${u.label}: the walk cannot see it inside the member registering it`);
+      }
+    }
+    expect(misaligned, misaligned.join('\n')).toEqual([]);
+    const carvedEnd = new Set(units.filter((u) => u.carved).map((u) => u.end));
+
+    const bare = stripComments(SRC);
+    const borrowed: string[] = [];
+    for (const w of WRITERS) {
+      for (const hit of bare.matchAll(new RegExp(`\\b${w}${CALL}`, 'g'))) {
+        const at = hit.index ?? 0;
+        // Innermost first: a nested arrow inside a carved listener is still
+        // nested, and it is the arrow that answers, not the listener.
+        const host = bodies.filter((b) => b.open < at && at < b.end)
+          .sort((a, b) => b.open - a.open)[0];
+        // No function body at all is module scope, which `homeless` owns;
+        // a top-level body is a member or a module-scope function, which
+        // the gate test owns; a carved body is a unit in its own right.
+        if (host === undefined || !nested.has(host.open) || carvedEnd.has(host.end)) continue;
+        const owner = units.filter((u) => u.start <= at && at < u.end)
+          .sort((a, b) => b.start - a.start)[0];
+        borrowed.push(`line ${lineAt(at)}: ${w}() sits in a nested function opening at line ${
+          lineAt(host.open)}, and is credited to ${owner?.label ?? 'no unit at all'}`);
+      }
+    }
+    expect(borrowed, `${borrowed.join('\n')}\n\nEach of these is scored against a gate that `
+      + 'ran when the function was created, not when its body runs. If the body runs later, '
+      + "give it a unit of its own by teaching the carver its registration shape, so it "
+      + 'answers for its own gate. If it runs where it is written, lift the write out of it: '
+      + 'a `for` loop keeps the write in the method holding the gate, and says as much to a '
+      + 'reader.').toEqual([]);
   });
 
   it('pins what editMode imports from the doc modules, so a new writer is noticed', () => {
