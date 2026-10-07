@@ -1814,11 +1814,28 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     //
     // Five, because one syntax error cascades: the unbalanced `}` probe
     // reports 1116 of them and the first is the one worth reading.
-    const syntax = ts.transpileModule(SRC, {
-      fileName: SRC_PATH,
+    //
+    // One more thing has to hold for any of that to mean anything: the
+    // route has to still be reporting. `reportDiagnostics` is optional
+    // going in and `diagnostics` is optional coming out, and dropping the
+    // flag does not give the `undefined` the type suggests — measured, it
+    // returns an empty array, which is exactly what a clean parse returns.
+    // No null check separates those two. A later edit that trims the flag
+    // as noise would leave this assert passing for ever on a file nobody
+    // is checking any more, which is the shape of failure this file exists
+    // to refuse. So the options are built once and handed to both calls,
+    // and the first asks a question whose answer is known.
+    const parseOpts = (fileName: string): ts.TranspileOptions => ({
+      fileName,
       reportDiagnostics: true,
       compilerOptions: { target: ts.ScriptTarget.Latest },
-    }).diagnostics ?? [];
+    });
+    const control = ts.transpileModule('const x = (((;', parseOpts('control.ts'))
+      .diagnostics ?? [];
+    expect(control.length, 'the syntax route reported nothing on text that '
+      + 'cannot parse, so the assert below attests nothing either')
+      .toBeGreaterThan(0);
+    const syntax = ts.transpileModule(SRC, parseOpts(SRC_PATH)).diagnostics ?? [];
     const unparsed = syntax.slice(0, 5).map((d) => `${lineAt(d.start ?? 0)}: ${
       ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
     expect(unparsed, `the compiler rejects the text this scan parsed${
