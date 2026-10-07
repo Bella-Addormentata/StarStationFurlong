@@ -1016,8 +1016,9 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // merge, a bad rebase — would make `classAt` open the first and
     // `classEnd` close it, leaving every member of the second outside every
     // slice. A room-doc write out there is not silent: `homeless`, in
-    // 'refuses a write in a nested callback', scans the whole file and
-    // reports a write that lands inside no unit at all. What would go
+    // 'counts the writes it is actually guarding, so the scan cannot pass on
+    // nothing', scans the whole file and reports a write that lands inside
+    // no unit at all. What would go
     // unsaid is everything else about those members — their gates, their
     // callers, whether the call graph can reach them — so the duplicate is
     // named here as a duplicate, by count rather than `.find`, instead of
@@ -1087,41 +1088,73 @@ ${unopened.join('\n')}`).toEqual([]);
     //
     // A second arm used to stand here, re-scanning the raw class text for
     // `^ {2}[A-Za-z_$#'"@[]` and reporting any such line the carver did not
-    // open a unit on. It was kept for one commit after the parser arm
-    // landed, on the theory that it caught spellings the parser might not
-    // report. It did not: every line it caught, the parser arm caught too,
-    // and what it caught ALONE was prose indented two spaces inside a
-    // template literal and inside a block comment. It matched text, so it
-    // could not tell a declaration from the inside of a string, and both
-    // of those are false reports about a file that is fine.
+    // open a unit on. It was deleted one commit after the parser arm
+    // landed, and the sentence written here to justify that — that every
+    // line it caught the parser arm caught too — was false. Measured since,
+    // and the correction matters more than the arm did: it caught three
+    // false-positive classes alone, prose indented two spaces inside a
+    // template literal, the same inside a block comment, and a method whose
+    // own body statements are indented two instead of four; and it ALSO
+    // caught, alone, five spellings of a real ungated room-doc write. Those
+    // five are not a loss of this arm, though, because the arm was reading a
+    // symptom. Each was a function stored by a member's INITIALISER, behind
+    // a gate call evaluated in that same initialiser, and the arm saw them
+    // only because they happened to be indented two spaces: the same hazard
+    // at four spaces, or written on one line, it never saw at all. The
+    // repair went to the root instead — `borrowed`, in 'refuses a write in a
+    // nested callback', now asks whether a host body is a member's own body
+    // rather than whether it looks top-level — and that reports all seven
+    // spellings, these five included. Restoring a text arm here would add
+    // back three false reports about a file that is fine, to re-cover five
+    // of the seven.
     //
     // And the other direction, which is what makes the first list mean
     // something: a unit opened where the parser declares no member is a
     // real member cut in half, and the half that keeps the gate is not
     // necessarily the half that holds the write.
     //
-    // Nothing can reach that list today, and the reason is structural
-    // rather than lucky, so it is worth writing down. A line that reads as
-    // a declaration without being one has to sit inside a multi-line
-    // construct: a template literal, a block comment, and a quoted string
-    // continued with a backslash are the only three ways to begin a line
-    // with `  private` and have the compiler not read it as code. A unit
-    // cut at such a line is a span that opens inside that construct and
-    // never closes it — which is the one thing `blankOut` refuses outright.
-    // Measured, all three: `unterminated template literal`, `unterminated
-    // block comment`, `unterminated string literal`, each thrown before a
-    // single test runs, so the suite reports no tests at all rather than a
-    // tidy pass. The fourth way in is a decorated member, where `getStart`
-    // points at the `@` and MEMBER_RE at the `private` a line below, and
-    // that one is reported by `unopened` above — asserted first, so the
-    // test stops there and this list is never built. Measured: a decorated
-    // method fails two of sixteen and the message names the method.
+    // Five ways in, and the first draft of this comment said there were
+    // none — that the list was unreachable for a structural reason. It is
+    // not, and the fifth way is the one that matters, because it is live
+    // code rather than text the compiler is not reading.
     //
-    // The list stays, and so does the branch inside it, because an unread
-    // message still has to be true. `the parser declares no class member on
-    // that line` would be a lie about a decorated member, whose declaration
-    // `unopened` has just named one line up; so when a member's span does
-    // cover the line, the message says that instead.
+    // Three of the five are multi-line constructs: a template literal, a
+    // block comment, and a quoted string continued with a backslash are
+    // the only ways to begin a line with `  private` and have the compiler
+    // not read it as code at all. None of those three reaches the list,
+    // and for a structural reason: a unit cut at such a line is a span
+    // that opens inside the construct and never closes it, which is the
+    // one thing `blankOut` refuses outright. Measured, all three:
+    // `unterminated template literal`, `unterminated block comment`,
+    // `unterminated string literal`, each thrown before a single test
+    // runs, so the suite reports no tests at all rather than a tidy pass.
+    //
+    // The fourth is a decorated member, where `getStart` points at the `@`
+    // and MEMBER_RE at the `private` a line below. That one is reported by
+    // `unopened` above — asserted first, so the test stops there and this
+    // list is never built. Measured: a decorated method fails two of
+    // sixteen and the message names the method.
+    //
+    // The fifth is MEMBER_RE's own second alternative. `^ {2}(constructor)`
+    // has no visibility word in front of it, so it matches `  constructor`
+    // wherever that word begins a line at member indentation — and an
+    // object literal may have a property called `constructor`, as may a
+    // type literal's member list. Both are ordinary code the compiler
+    // reads normally, so nothing refuses them and nothing reports them
+    // sooner. Measured, three spellings: `  constructor: 1,` as an
+    // object-literal key, `  constructor(): void;` as a type member, and
+    // an object-literal `constructor()` METHOD holding an ungated write.
+    // Each fails two of sixteen through this list — the third, three, the
+    // write being caught by the gate test as well — and each message
+    // correctly names the member the spurious cut lands inside.
+    //
+    // So the branch is read, not merely true-if-read, and the message has
+    // to be exact about what it does and does not know. It knows which
+    // member the line falls inside, because it asked the parser. It does
+    // not know that member has a gate: `  private probeK50 = {` holds
+    // none, and an earlier wording that ended "and the gate is in the
+    // front" said otherwise. What is true either way is which half of the
+    // member the unit kept.
     const phantom = members.filter((m) => !m.carved && !decls.has(m.start))
       .map((m) => {
         const over = declared.find((d) => d.getStart(ast) <= m.start && m.start < d.end);
@@ -1129,7 +1162,8 @@ ${unopened.join('\n')}`).toEqual([]);
           ? `${m.label}: the parser declares no class member on that line`
           : `${m.label}: the parser reads that line as the middle of a member `
             + `declared at line ${lineAt(declLine(over.getStart(ast)))}, so this `
-            + `unit holds the back half of one member and the gate is in the front`;
+            + `unit holds the back half of that member and whatever gate it has `
+            + `stayed in the front half`;
       });
     expect(phantom, phantom.join('\n')).toEqual([]);
 
@@ -2266,23 +2300,40 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // deliberately, and cheap because the gate test still catches an ungated
     // write in such a listener — measured, both ways.
     //
-    // And only the static block, because it is the only member the GRAMMAR
-    // gives no name to. An earlier version of this comment said it was
-    // "the only thing at class top level that is both unnestable and
-    // unnameable", which is false: a generator `*gen()` is unnestable and
-    // was just as invisible to MEMBER_RE. The difference is that `*gen()`
-    // HAS a name and a pattern can be taught to open a unit on it, which
-    // is how that hole was closed. `static {` offers no name in any
-    // spelling, so no pattern can ever carve it and its offsets have to
-    // come from the parse — which is this block.
+    // And only the static block, because it is the only NAMELESS member
+    // that can hold runtime code. Two earlier versions of this sentence
+    // were wrong in the same direction, each claiming a uniqueness wider
+    // than the one that holds. "The only thing at class top level that is
+    // both unnestable and unnameable" is false because a generator
+    // `*gen()` is unnestable and was just as invisible to MEMBER_RE —
+    // closed by teaching the pattern that spelling, which `*gen()` admits
+    // because it HAS a name. "The only member the grammar gives no name
+    // to" is false too, and measurably: asked directly, the parser reports
+    // `name === undefined` for ClassStaticBlockDeclaration, IndexSignature,
+    // SemicolonClassElement and Constructor alike — and `carvable`, up at
+    // the top of this file, says as much about the semicolon in its own
+    // words. Of those four, an index signature and a semicolon hold nothing
+    // that could run, and a constructor hands MEMBER_RE the keyword it
+    // already matches. The static block is what is left.
+    //
+    // Nor is "no pattern can ever carve it" right as stated: `cut` takes a
+    // name CALLBACK, not a capture group, so `^ {2}static \{` would carve
+    // one perfectly well under a synthetic name. What is true is that the
+    // name would have to be invented rather than read, and a unit named
+    // something the source does not say is a unit no message can point at.
+    // The offsets come from the parse instead — which is this block.
     //
     // A property initialiser holding an arrow sits in the same place and
-    // also never nests, but MEMBER_RE opens a unit on the name in front of
-    // it, so it answers for its own gate and the gate test catches an
-    // ungated write there. Measured on four shapes — a braced arrow, a
-    // concise one, a public one, and one nested a level deeper — all four
-    // caught, the first three by the gate test and the last by
-    // `borrowed`'s ordinary nested arm.
+    // also never nests, and MEMBER_RE does open a unit on the name in
+    // front of it — but "so it answers for its own gate" was too strong,
+    // and the distinction is the whole of `stored` below. What the gate
+    // test catches there is an UNGATED write: measured on four shapes, a
+    // braced arrow, a concise one, a public one, and one nested a level
+    // deeper, all four caught, the first three by the gate test and the
+    // last by `borrowed`'s ordinary nested arm. What it does not catch is
+    // a write behind a gate call evaluated in the SAME initialiser, which
+    // ran once while the field was being built and not when the arrow
+    // runs. Measured silent until `stored` existed.
     const staticOpens = new Set<number>();
     const collectStatic = (n: ts.Node): void => {
       if (ts.isClassStaticBlockDeclaration(n)) {
@@ -2318,6 +2369,72 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     expect(misaligned, misaligned.join('\n')).toEqual([]);
     const carvedEnd = new Set(units.filter((u) => u.carved).map((u) => u.end));
 
+    // Which leaves the third kind of host, and the one the skip below used
+    // to read wrong. A body that is neither nested nor a static block is
+    // skipped there on the ground stated in place: "a top-level body is a
+    // member or a module-scope function, which the gate test owns". For
+    // those two that is exact. There is a third kind of body it reads as
+    // top-level, and the gate test does not own that one:
+    //
+    //     private pending = this.mayWriteRoomDoc() ? class {
+    //     m(): void { writeWallpaper(surface, next); }
+    //     } : null;
+    //
+    // MEMBER_RE opens a unit on `private pending`; the slice holds the
+    // text `this.mayWriteRoomDoc()`; the gate test finds a gate before the
+    // write and scores it covered. The gate ran once, while the field was
+    // being initialised. `m` runs whenever something calls it, which may
+    // be after the permission went away — the fault this test is named
+    // for, arriving through an initialiser instead of through a callback.
+    // Nothing lexically encloses `m`'s body but the class, so `nested`
+    // does not hold it, and it is not a static block, so it was skipped.
+    //
+    // Measured, nine spellings, each a room-doc write that is ungated in
+    // fact and passed sixteen of sixteen before this: a class expression,
+    // an object literal, an object-literal getter, an object-literal
+    // generator, a function expression in an array, an object literal
+    // indented four spaces, an arrow property on one line, an object
+    // literal on one line, and a class expression on one line. All nine
+    // red with it, each naming the line and the member it was credited to.
+    // Five of the nine were out of reach of the text arm this replaced: it
+    // matched a line opening with two spaces and an identifier character,
+    // so a hazard indented four spaces, one written on a single line with
+    // no line of its own at all, and a generator opening with a `*` were
+    // all invisible to it.
+    //
+    // Three controls, because a list that reports nine shapes is only worth
+    // having if it is quiet about the rest. The same object literal with no
+    // gate text anywhere is caught by the gate test by itself — so the
+    // family was never hidden for want of a write, only for want of a gate
+    // to borrow. A stored function one level deeper is reported by the
+    // ordinary nested arm below, with the nested wording and exactly once:
+    // `stored` and `nested` do not overlap. And an ordinary gated method
+    // holding a write stays silent, which is the shape most of this class
+    // is made of.
+    //
+    // `memberBodies` is what draws the line, and it holds the bodies of
+    // THIS class's own members rather than of any class. A method of a
+    // nested class expression is a member body too, and it is exactly the
+    // one that must not be excused. If that lookup ever came back empty
+    // the list would name every write in the file rather than none, so the
+    // failure direction is loud; it is asserted anyway, because a reader
+    // should not have to derive that to trust the list.
+    const ctrl = ast.statements.find((n): n is ts.ClassDeclaration =>
+      ts.isClassDeclaration(n) && n.name?.text === 'RoomEditController');
+    expect(ctrl, 'the parser sees no top-level class RoomEditController, so '
+      + 'nothing below could tell a member body from a stored one').toBeDefined();
+    const memberBodies = new Set((ctrl?.members ?? []).flatMap((m) => (
+      ts.isFunctionLike(m) && 'body' in m && m.body !== undefined && ts.isBlock(m.body)
+        ? [m.body.getStart(ast)] : [])));
+    // `classEnd + 2` is the span the member canary pins the parser to:
+    // `classAt` indexes the newline before `class` and `classEnd` the `\n}`
+    // that closes it. A module-scope function falls outside it and keeps
+    // the old reading, which for a module-scope function is the right one —
+    // it is a unit, and the gate test does scan it.
+    const stored = (b: { open: number; end: number }): boolean =>
+      !nested.has(b.open) && !staticOpens.has(b.open)
+      && b.open > classAt && b.end <= classEnd + 2 && !memberBodies.has(b.open);
+
     const bare = stripComments(SRC);
     const borrowed: string[] = [];
     for (const w of WRITERS) {
@@ -2340,14 +2457,18 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         // A static block answers without being nested: nothing lexically
         // encloses it, and it still runs at a time no gate reaches.
         if (host === undefined
-          || (!nested.has(host.open) && !staticOpens.has(host.open))
+          || (!nested.has(host.open) && !staticOpens.has(host.open) && !stored(host))
           || carvedEnd.has(host.end)) continue;
         const owner = units.filter((u) => u.start <= at && at < u.end)
           .sort((a, b) => b.start - a.start)[0];
         const where = staticOpens.has(host.open)
           ? `a class static block opening at line ${lineAt(host.open)}, which runs at `
             + 'class-definition time'
-          : `a nested function opening at line ${lineAt(host.open)}`;
+          : stored(host)
+            ? `a function opening at line ${lineAt(host.open)} that no member of this `
+              + 'class owns as its body, so it is a value a member stores and runs when '
+              + 'something calls it rather than when the member was initialised'
+            : `a nested function opening at line ${lineAt(host.open)}`;
         borrowed.push(`line ${lineAt(at)}: ${w}() sits in ${where}, and is credited to ${
           owner?.label ?? 'no unit at all'}`);
       }
@@ -2359,7 +2480,11 @@ opened no unit on it, so everything it does is credited to this one's gate`);
       + 'a `for` loop keeps the write in the method holding the gate, and says as much to a '
       + 'reader. A class static block is the third case and takes neither fix: it runs '
       + 'before any instance exists, so there is no gate to give it and nowhere to lift the '
-      + 'write to. Move the write into a method that can be gated.').toEqual([]);
+      + 'write to. Move the write into a method that can be gated. A function a '
+      + 'member STORES — a method of an object literal or a class expression, an arrow '
+      + 'in an initialiser — is the fourth case, and it takes the same fix for the same '
+      + 'reason: its gate ran once while the field was being built, so move the write '
+      + 'into a gated method and have the stored function call that.').toEqual([]);
   });
 
   it('pins what editMode imports from the doc modules, so a new writer is noticed', () => {
