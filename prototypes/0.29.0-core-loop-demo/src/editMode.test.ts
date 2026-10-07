@@ -2789,14 +2789,34 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         // offset, and `<` read that arrow as not containing its own write.
         // A braced body cannot be caught by the widening: its `open` is a
         // `{`, and no writer call begins on one.
-        // `runsLater` first, and a deferred span only when no function body
-        // contains the write at all. Innermost-of-the-union let a deferred
-        // span strictly inside a nested host win the sort, and the write was
-        // then judged as a deferred one -- eligible for the `gatedInside` and
-        // `carvedEnd` silencing that the `nested` arm permits under no
-        // circumstances. The comment above says this arm does not widen that
-        // policy; choosing in this order is what makes that true rather than
-        // aspirational.
+        // Innermost of the union: whichever span starts latest around the
+        // write is the one that answers for it, function body or deferred
+        // position, with no preference between the two kinds.
+        //
+        // This was `innermost(runsLater) ?? innermost(deferred)` for one
+        // commit, and the `??` made the deferred list unreachable in the
+        // position where it mattered most. A parameter default sits inside
+        // the body of whatever function declares it, so that body is always
+        // an enclosing `runsLater` span, so `innermost(runsLater)` always
+        // answered and `deferred` was never consulted. The commit that
+        // started collecting parameter defaults as deferred and the commit
+        // that introduced the `??` were the same commit: it built the
+        // mechanism and then made it dead code, and left a comment below
+        // asserting the mechanism was live. Measured, the escape it left is
+        //
+        //   private probe(): void {
+        //     if (!this.mayWriteRoomDoc()) { return; }
+        //     this.cb = (a = writeWallpaper(surface, next)) => a;
+        //   }
+        //
+        // where the gate runs once, at `probe()`, and the write runs on
+        // every later `this.cb()` with no owner check at that moment. Both
+        // arms were silent: here because the host was `probe`'s body, which
+        // `memberBodies` holds so `stored` is false; and in the gate test
+        // because the write is textually after the gate. Moving the write
+        // one character to the right, inside the arrow's braces, is a shape
+        // both arms report -- identical temporal meaning, opposite verdict,
+        // and the brace was the whole difference.
         //
         // An IIFE body is skipped rather than chosen: it runs when its
         // surroundings run, so the span that answers for the write is the
@@ -2805,7 +2825,7 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         const innermost = (bs: readonly { open: number; end: number }[]) => bs
           .filter((b) => b.open <= at && at < b.end && !iifeOpens.has(b.open))
           .sort((a, b) => b.open - a.open)[0];
-        const host = innermost(runsLater) ?? innermost(deferred);
+        const host = innermost([...runsLater, ...deferred]);
         // No function body and no deferred span around it means one of
         // two things, and this list owns neither of them. Either the write
         // is at module scope, which `homeless` above owns, or it sits in
@@ -2819,7 +2839,9 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         // silent. That wording also named a parameter default, which does
         // NOT belong on the list: a default runs when its function is
         // called, so it is deferred by definition. It is collected as
-        // deferred above now instead of being excused here.
+        // deferred above and, since the union restored its reachability,
+        // actually consulted -- for one commit this sentence was true of
+        // the collection and false of the effect.
         if (host === undefined) { continue; }
         // The question is temporal, not structural: does this host run at a
         // time other than when its member's initialiser ran, without
@@ -2830,19 +2852,57 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         // carved unit shares is a unit in its own right, with a gate of
         // its own to answer for, and `carvedEnd` just below is what sets
         // those aside.
+        // Nested-ness is asked of the write's SURROUNDINGS, not only of the
+        // host, and that is what keeps the `nested` arm absolute now that a
+        // deferred span can win the sort. A parameter default inside a
+        // nested callback is a deferred span whose `open` is an expression
+        // start, so it is in neither `nested` nor `staticOpens`; judged on
+        // the host alone it would become eligible for the `gatedInside`
+        // excusal, and a gate written inside that default would silence a
+        // write the `nested` arm refuses whatever gate precedes it. That is
+        // the hole the `??` ordering was guarding, kept shut without making
+        // the deferred list unreachable to do it.
+        //
+        // `iifeOpens` is skipped here for the same reason `innermost` skips
+        // it, and leaving it out was measurable: an IIFE body IS a
+        // `runsLater` span strictly inside the method's, so `nested` holds
+        // it, and the surroundings test fired on a write that runs at the
+        // gate's own moment. Measured on `Z34-iife-inside-gated-method` --
+        //
+        //     private probeZ34(): void {
+        //       if (!this.mayWriteRoomDoc()) { return; }
+        //       ((): void => { writeWallpaper(…); })();
+        //     }
+        //
+        // -- which went SILENT -> RED, a false positive, and on
+        // `Z41`/`Z42`, already red from the gate arm, which gained a second
+        // arm blaming a nested callback for an immediate call. Structural
+        // nesting is not the question; the question is whether the span runs
+        // at some other time, and an IIFE runs now.
+        const inNested = runsLater.some((b) => b.open <= at && at < b.end
+          && !iifeOpens.has(b.open)
+          && (nested.has(b.open) || staticOpens.has(b.open)));
         const borrows = (deferredOpens.has(host.open) || stored(host))
-          && !gatedInside(host, at);
-        if ((!nested.has(host.open) && !staticOpens.has(host.open) && !borrows)
-          || carvedEnd.has(host.end)) { continue; }
+          && !inNested && !gatedInside(host, at);
+        if ((!inNested && !nested.has(host.open) && !staticOpens.has(host.open)
+          && !borrows) || carvedEnd.has(host.end)) { continue; }
         const owner = units.filter((u) => u.start <= at && at < u.end)
           .sort((a, b) => b.start - a.start)[0];
         const where = staticOpens.has(host.open)
           ? `a class static block opening at line ${lineAt(host.open)}, which runs at `
             + 'class-definition time'
           : paramOpens.has(host.open)
+            // "rather than at whatever earlier moment the gate was checked",
+            // not "when the member holding the gate was initialised". The
+            // narrower wording was accurate while this branch could only be
+            // reached from a field initialiser; the union above makes it
+            // reachable from a gated METHOD, where the gate ran at a call.
+            // `Z43` is that shape, and the first reading of its failure said
+            // the write ran at some other time than an initialisation that
+            // never happened.
             ? `a parameter default at line ${lineAt(host.open)}, which runs every time `
-              + 'that function is called without the argument, rather than when the '
-              + 'member holding the gate was initialised'
+              + 'that function is called without the argument, rather than at whatever '
+              + 'earlier moment the gate was checked'
             : deferredOpens.has(host.open)
               ? `an initialiser at line ${lineAt(host.open)} belonging to a class this `
                 + 'member builds but never constructs, so it runs whenever something '
