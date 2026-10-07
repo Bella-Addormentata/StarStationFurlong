@@ -1823,8 +1823,9 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // No null check separates those two. A later edit that trims the flag
     // as noise would leave this assert passing for ever on a file nobody
     // is checking any more, which is the shape of failure this file exists
-    // to refuse. So the options are built once and handed to both calls,
-    // and the first asks a question whose answer is known.
+    // to refuse. So both calls take their options from one builder — not
+    // one object, it is called twice, but one place to delete the flag
+    // from — and the first asks a question whose answer is known.
     const parseOpts = (fileName: string): ts.TranspileOptions => ({
       fileName,
       reportDiagnostics: true,
@@ -1838,9 +1839,12 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     const syntax = ts.transpileModule(SRC, parseOpts(SRC_PATH)).diagnostics ?? [];
     const unparsed = syntax.slice(0, 5).map((d) => `${lineAt(d.start ?? 0)}: ${
       ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
-    expect(unparsed, `the compiler rejects the text this scan parsed${
+    // Asserted on the count, not on `unparsed`, which is a slice: narrow
+    // that slice to nothing and an assert against `[]` is green for ever,
+    // control and all. The slice is for reading; the count is the claim.
+    expect(syntax.length, `the compiler rejects the text this scan parsed${
       syntax.length > 5 ? ` (${syntax.length} errors, first five)` : ''}:\n${
-      unparsed.join('\n')}`).toEqual([]);
+      unparsed.join('\n')}`).toBe(0);
     const bodies: { open: number; end: number }[] = [];
     // Function, method, constructor, getter, setter, arrow, function
     // expression: `isFunctionLike` is all seven. It also admits the
@@ -2025,28 +2029,45 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     collectConcise(ast);
 
     // The class static block, collected here instead of in `bodies`. It
-    // runs once, at class-definition time, which is earlier than anything
-    // a gate could have decided — so a write in one is a hazard, and a
-    // listener registered in one defers a body that `nested` has to be
-    // able to see. Neither is in editMode.ts today; both are collected
-    // because "there are none" is the argument the brace walk above made.
+    // runs once, at class-definition time — before any instance exists, so
+    // earlier than any gate could have decided anything. Two things can sit
+    // in one: a write, which is a hazard outright, and a listener
+    // registration, which defers a body `nested` has to be able to see.
+    // Neither is in editMode.ts today; collected anyway, because "there are
+    // none" is the argument the brace walk above made.
     //
-    // In this list it can only strengthen, which is why it is the right
-    // list. `nested` grows only by genuine lexical containment — offsets,
-    // not inference — so a body inside a block becomes nested, which is
-    // what it is, and no existing body stops being. Measured on a deferred
-    // arrow inside a block holding an ungated write: `borrowed` names it
-    // with the block in this list, and is silent without it.
+    // `runsLater` is the right list for both, and for the write it is not
+    // enough on its own — which an earlier version of this comment claimed
+    // it was. `borrowed` skips any host it cannot see as `nested`, and a
+    // block at class top level sits in the class body, which is not a
+    // function body and is therefore in no list here. It can never be
+    // nested. Measured: an ungated write in a four-space-indented block
+    // passes sixteen of sixteen in silence, credited to the gated member
+    // above it, because MEMBER_RE cannot open a unit at `static {` and the
+    // block folds into that member's slice. At two spaces the member canary
+    // does fire — but on the regex gap, naming no write. So the block's own
+    // offsets are kept below, and `borrowed` reads them as a second reason a
+    // host has to answer: not nested, but running at a time no gate reaches.
     //
-    // A carved listener inside a block is a different case, and not this
-    // one — the carver makes it a unit, and `borrowed` skips units by
-    // design. What the block buys there is the removal of a false report:
-    // without it the parse cannot see the listener nested inside anything,
-    // and `misaligned` says so against the member declared above the
-    // block, which did not register it.
+    // The effect on the other reader runs the other way, and is worth saying
+    // plainly rather than calling this a pure gain. `nested` has two
+    // consumers of opposing polarity: `borrowed` reads `!nested.has(...)`
+    // and skips, so growth strengthens it, while `misaligned` reads
+    // `!nested.has(body.open)` and pushes, so growth SILENCES it. A listener
+    // carved inside a block is reported without this collection and not with
+    // it, and that report is not false — the carver credited the listener to
+    // the member above the block, which did not register it, so "the parse
+    // cannot see it inside the member registering it" is the literal truth
+    // about a real mis-attribution. Collecting the block trades that true
+    // report for the deferred-body nesting `borrowed` needs. Taken
+    // deliberately, and cheap because the gate test still catches an ungated
+    // write in such a listener — measured, both ways.
+    const staticOpens = new Set<number>();
     const collectStatic = (n: ts.Node): void => {
       if (ts.isClassStaticBlockDeclaration(n)) {
-        runsLater.push({ open: n.body.getStart(ast), end: n.body.end });
+        const span = { open: n.body.getStart(ast), end: n.body.end };
+        runsLater.push(span);
+        staticOpens.add(span.open);
       }
       ts.forEachChild(n, collectStatic);
     };
@@ -2094,11 +2115,20 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
         // No function body at all is module scope, which `homeless` owns;
         // a top-level body is a member or a module-scope function, which
         // the gate test owns; a carved body is a unit in its own right.
-        if (host === undefined || !nested.has(host.open) || carvedEnd.has(host.end)) continue;
+        //
+        // A static block answers without being nested: nothing lexically
+        // encloses it, and it still runs at a time no gate reaches.
+        if (host === undefined
+          || (!nested.has(host.open) && !staticOpens.has(host.open))
+          || carvedEnd.has(host.end)) continue;
         const owner = units.filter((u) => u.start <= at && at < u.end)
           .sort((a, b) => b.start - a.start)[0];
-        borrowed.push(`line ${lineAt(at)}: ${w}() sits in a nested function opening at line ${
-          lineAt(host.open)}, and is credited to ${owner?.label ?? 'no unit at all'}`);
+        const where = staticOpens.has(host.open)
+          ? `a class static block opening at line ${lineAt(host.open)}, which runs at `
+            + 'class-definition time'
+          : `a nested function opening at line ${lineAt(host.open)}`;
+        borrowed.push(`line ${lineAt(at)}: ${w}() sits in ${where}, and is credited to ${
+          owner?.label ?? 'no unit at all'}`);
       }
     }
     expect(borrowed, `${borrowed.join('\n')}\n\nEach of these is scored against a gate that `
@@ -2106,7 +2136,9 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       + "give it a unit of its own by teaching the carver its registration shape, so it "
       + 'answers for its own gate. If it runs where it is written, lift the write out of it: '
       + 'a `for` loop keeps the write in the method holding the gate, and says as much to a '
-      + 'reader.').toEqual([]);
+      + 'reader. A class static block is the third case and takes neither fix: it runs '
+      + 'before any instance exists, so there is no gate to give it and nowhere to lift the '
+      + 'write to. Move the write into a method that can be gated.').toEqual([]);
   });
 
   it('pins what editMode imports from the doc modules, so a new writer is noticed', () => {
