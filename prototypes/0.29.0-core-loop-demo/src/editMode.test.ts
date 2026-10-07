@@ -2711,6 +2711,7 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // skipping asks the enclosing span the same question, which is what
     // "transparent" has to mean to be worth saying.
     const iifeOpens = new Set<number>();
+    const iifeLater = new Map<number, 'async' | 'generator'>();
     const collectIife = (n: ts.Node): void => {
       if (ts.isCallExpression(n)) {
         let callee: ts.Node = n.expression;
@@ -2728,7 +2729,19 @@ opened no unit on it, so everything it does is credited to this one's gate`);
             (x) => x.kind === ts.SyntaxKind.AsyncKeyword) === true;
           const isGen = ts.isFunctionExpression(callee)
             && callee.asteriskToken !== undefined;
-          if (!isAsync && !isGen) { iifeOpens.add(callee.body.getStart(ast)); }
+          // Excluding them from the excusal is only half of it. They have to
+          // be REMEMBERED, because the reason they are not init-time is not
+          // the reason anything else in the cascade below is not init-time,
+          // and the one the cascade reached for was `stored` — measured on
+          // `Z05`, whose only failing arm said the write "is a value a
+          // member stores and runs when something calls it". Nothing stores
+          // an immediately-invoked function and nothing calls it later. An
+          // async generator counts as the generator case: its body waits for
+          // a `.next()` as well, so that is the first thing a reader needs
+          // to know about it.
+          if (isAsync || isGen) {
+            iifeLater.set(callee.body.getStart(ast), isGen ? 'generator' : 'async');
+          } else { iifeOpens.add(callee.body.getStart(ast)); }
         }
       }
       ts.forEachChild(n, collectIife);
@@ -2755,9 +2768,13 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // message is a false positive that fails loudly and gets fixed, while a
     // gate found inside a message is a false negative that quietly
     // manufactures coverage. `showHint('ask canEditRoom() first')` is not an
-    // owner check. Reading gates out of `bare` made this arm the one gate
-    // reader in the file that a quoted gate could fool, which is the defect
-    // the gate test says it had and fixed -- reintroduced here in a new arm.
+    // owner check. Reading gates out of `bare` reintroduced in a new arm the
+    // defect the gate test says it had and fixed. It did NOT make this arm
+    // the only gate reader a quoted gate could fool, which is what this
+    // comment claimed when it was written: the four tests that name one unit
+    // each were reading `bodyOf`, which keeps strings, and a later commit had
+    // to route all four through `gateBodyOf`. Two of them accepted a mutation
+    // of the real file that the whole suite then passed.
     // `blankOut` is length-preserving, pinned by the lexer's own test, so an
     // offset in either copy is the same offset in SRC.
     const bareGate = blankOut(SRC, true);
@@ -2802,14 +2819,53 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // own right and not this one.
     const gatedInside = (b: { open: number; end: number }, at: number): boolean => {
       const code = bare.slice(b.open, b.end);
+      // The writes are NOT filtered the way the gates are below. A write in
+      // a nested arrow nothing calls still pulls `limit` earlier, which can
+      // only make this arm accept fewer gates and report more — the loud
+      // direction. Filtering it would move the arm quieter for a shape no
+      // one has measured, so it stays as it is, deliberately and not by
+      // omission.
       const writes = WRITERS
         .map((w) => code.search(new RegExp(`\\b${w}${CALL}`)))
         .filter((i) => i >= 0);
       const limit = writes.length > 0 ? Math.min(at, b.open + Math.min(...writes)) : at;
+      // Textual containment answers "does a gate run before the write" only
+      // where every offset in the span runs when the host runs, and these do
+      // not: a nested function body, a parameter default, a nested class's
+      // field initialiser. Measured, a stored callback whose only gate sat
+      // in a nested arrow nothing ever calls was SILENT across the whole
+      // suite — the one direction this file must never have:
+      //
+      //     private readonly onPick = (): void => {
+      //       const check = (): boolean => this.mayWriteRoomDoc();
+      //       void check;
+      //       writeWallpaper(surface, next);
+      //     };
+      //
+      // The arrow is concise, so `runsLater` holds the expression itself and
+      // the gate offset lands inside it. `r.open > b.open` is what keeps the
+      // host from discounting ITSELF, which also settles the host's own
+      // parameter default: that sits textually before the body's `{`, so it
+      // is outside this slice entirely and was never a candidate. An IIFE
+      // body is excluded because it runs where it sits — the same exception,
+      // and the same reason for it, as `innermost` and `inNested`.
+      const elsewhere = [...runsLater, ...deferred]
+        .filter((r) => r.open > b.open && r.end <= b.end && !iifeOpens.has(r.open));
+      const unreachable = (g: number): boolean =>
+        elsewhere.some((r) => r.open <= g && g < r.end);
       const span = bareGate.slice(b.open, b.end);
+      // Every occurrence, not the first: discounting one has to continue the
+      // search, and `search` only ever answers about the earliest. Matches
+      // arrive in increasing order, so the first one at or past `limit` ends
+      // this gate's chances and there is no point reading further.
       return GATE_IN_RE.some((re) => {
-        const i = span.search(re);
-        return i >= 0 && b.open + i < limit;
+        const all = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
+        for (let m = all.exec(span); m !== null; m = all.exec(span)) {
+          const g = b.open + m.index;
+          if (g >= limit) { return false; }
+          if (!unreachable(g)) { return true; }
+        }
+        return false;
       });
     };
 
@@ -2943,11 +2999,26 @@ opened no unit on it, so everything it does is credited to this one's gate`);
               ? `an initialiser at line ${lineAt(host.open)} belonging to a class this `
                 + 'member builds but never constructs, so it runs whenever something '
                 + 'else constructs that class rather than when the member was initialised'
-              : stored(host)
-                ? `a function opening at line ${lineAt(host.open)} that no member of this `
-                  + 'class owns as its body, so it is a value a member stores and runs '
-                  + 'when something calls it rather than when the member was initialised'
-                : `a nested function opening at line ${lineAt(host.open)}`;
+              // Ahead of `stored`, which is the branch these two were
+              // falling into and the one answer that is wrong about them:
+              // nothing stores an immediately-invoked function. They are
+              // kept apart from each other as well, because "it has not run
+              // yet" and "it has run and will resume" are different things
+              // to go and look at.
+              : iifeLater.get(host.open) === 'generator'
+                ? `an immediately-invoked generator body at line ${lineAt(host.open)}, `
+                  + 'which that call does not run at all — it makes an iterator, and the '
+                  + 'body runs on a first next() that may come at any time, or never'
+                : iifeLater.get(host.open) === 'async'
+                  ? `an immediately-invoked async body at line ${lineAt(host.open)}, which `
+                    + 'starts where it sits but resumes after its first await, by which '
+                    + 'time the gate has been answered and the answer can be stale'
+                  : stored(host)
+                    ? `a function opening at line ${lineAt(host.open)} that no member of `
+                      + 'this class owns as its body, so it is a value a member stores and '
+                      + 'runs when something calls it rather than when the member was '
+                      + 'initialised'
+                    : `a nested function opening at line ${lineAt(host.open)}`;
         borrowed.push(`line ${lineAt(at)}: ${w}() sits in ${where}, and is credited to ${
           owner?.label ?? 'no unit at all'}`);
       }
@@ -2966,7 +3037,11 @@ opened no unit on it, so everything it does is credited to this one's gate`);
       + 'into a gated method and have the stored function call that. A write in the '
       + 'INITIALISER of a class a member builds but does not construct, or in a parameter '
       + 'default of one of that class\'s members, is the fifth case and takes that same '
-      + 'fix: it runs at the constructing caller\'s convenience, not at this member\'s.'
+      + 'fix: it runs at the constructing caller\'s convenience, not at this member\'s. '
+      + 'An immediately-invoked async or generator body is the sixth, and the one where '
+      + 'the write can sit a few lines under a live gate and still be ungated — the call '
+      + 'does not carry the body to the end. Re-ask inside the body, after the await or '
+      + 'before the write, or move the write into a gated method and call that.'
       ).toEqual([]);
   });
 
