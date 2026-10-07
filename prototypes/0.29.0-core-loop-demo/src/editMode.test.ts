@@ -1129,15 +1129,42 @@ ${unopened.join('\n')}`).toEqual([]);
     // live code rather than text the compiler is not reading.
     //
     // Three of the six are multi-line constructs: a template literal, a
-    // block comment, and a quoted string continued with a backslash are
-    // the only ways to begin a line with `  private` and have the compiler
-    // not read it as code at all. None of those three reaches the list,
-    // and for a structural reason: a unit cut at such a line is a span
-    // that opens inside the construct and never closes it, which is the
-    // one thing `blankOut` refuses outright. Measured, all three:
-    // `unterminated template literal`, `unterminated block comment`,
-    // `unterminated string literal`, each thrown before a single test
-    // runs, so the suite reports no tests at all rather than a tidy pass.
+    // block comment, and a quoted string continued with a backslash can
+    // each begin a line with `  private` and have the compiler not read it
+    // as code at all. None of the three reaches the list, and for a
+    // structural reason: a cut at such a line leaves a span that opens
+    // OUTSIDE the construct and ends inside it, which is the one thing
+    // `blankOut` refuses outright.
+    //
+    // The span it refuses is the PRECEDING member's unit, not the phantom
+    // one — the cut ends that unit mid-construct — so the refusal arrives
+    // before this list is reached rather than while it is being built. An
+    // earlier wording had the phantom unit being refused, which is the
+    // same throw credited to the wrong span; the line numbers are what
+    // settle it. Measured, all three, and each lands on the line where the
+    // preceding unit's own opening construct sits: `unterminated template
+    // literal` at line 2, where its backtick is; `unterminated block
+    // comment` at line 15, where the `/*` is, fifteen lines into the real
+    // member above; `unterminated string literal` at line 1, where the
+    // quote is. All three thrown before a single test runs, so the suite
+    // reports no tests at all rather than a tidy pass.
+    //
+    // The third of those three has a SECOND SPELLING, and an earlier
+    // wording ruled it out by calling the backslash continuation one of
+    // "the only ways" a line can begin inside an ordinary string. A U+2028
+    // or U+2029 line separator is the other: `/m` treats both as line
+    // terminators, so `^` matches after one, while ES2019 made both legal
+    // inside a string literal, so the string closes normally and the
+    // compiler reads no declaration there. Measured, it fails exactly
+    // where the backslash spelling does — `unterminated string literal` at
+    // line 1 of the preceding unit.
+    //
+    // Which machine knows about U+2028 is the part worth keeping: not the
+    // lexer, whose string scan ends at a matching quote or a `\n` and
+    // walks straight past a line separator, but MEMBER_RE, whose `/m` cuts
+    // there. So the throw is the lexer correctly declining a span the
+    // carver truncated mid-string — the two-machines problem this whole
+    // file is built around, in one character.
     //
     // The fourth is a decorated member, where `getStart` points at the `@`
     // and MEMBER_RE at the `private` a line below. That one is reported by
@@ -1161,9 +1188,20 @@ ${unopened.join('\n')}`).toEqual([]);
     // nested class EXPRESSION whose own `constructor` sits at two spaces,
     // holding one as well; and `  constructor:` as a statement LABEL,
     // which is a legal thing to call a label. Four of the six fail two of
-    // sixteen through this list; the two that hold a write fail three, the
-    // write being caught by the gate test as well. Each message correctly
-    // names the member the spurious cut lands inside.
+    // sixteen, and only ONE of the two is this list. An earlier wording
+    // credited both here; they are two canaries in two different tests,
+    // and the messages say so. This list speaks in 'finds EVERY member':
+    // `the parser reads that line as the middle of a member declared at
+    // line N, so this unit holds the back half of that member and whatever
+    // gate it has stayed in the front half`. The other is in 'refuses a
+    // write in a nested callback': `the parser sees no class member
+    // declared in its span`. The two spellings that hold a write fail
+    // three, the write being caught by the gate test as well.
+    //
+    // Each message identifies the member the spurious cut lands inside by
+    // the LINE its declaration sits on, never by name — an earlier wording
+    // said it "names the member", which the paragraph below gets right.
+    // Correct in all six spellings.
     //
     // The sixth way is the FIRST alternative, reached for the same reason:
     // a nested class expression writes its own members at two spaces too,
@@ -1186,8 +1224,37 @@ ${unopened.join('\n')}`).toEqual([]);
     // repair and the wrong one — it would make the two agree by
     // construction, and a canary that cannot disagree with the thing it
     // watches is not worth a separate assertion. Left loose, and loose in
-    // the safe direction: it can over-report a type annotation, it cannot
-    // under-report a cut.
+    // the safe direction -- it over-reports a type annotation rather than
+    // missing a cut.
+    //
+    // That is as far as it goes, and an earlier wording went further: "it
+    // cannot under-report a cut". It can, in every spelling the list above
+    // enumerates. Measured, both patterns run over all nine of them:
+    // MEMBER_RE misses eight, and `swallowed` misses the SAME eight — a
+    // `#private` field, a computed name, a string name, a bare method, a
+    // `static` with no visibility word, a generator, a numeric name and a
+    // tab indent each fold into the unit above and go unmentioned here.
+    // The ninth is the decorated member, which BOTH patterns match; its
+    // failure is a position disagreement, not a line nobody saw.
+    //
+    // So the two agree on all nine, and the only place they disagree is
+    // the type annotation above — the over-report. That is the whole of
+    // what the looseness buys: one false positive, and not one extra cut
+    // detected. Which does not argue for tightening; it narrows the reason
+    // not to. The case rests entirely on keeping a canary able to disagree
+    // with the carver, and not at all on the looseness catching anything
+    // the carver misses — it catches none. What keeps the suite sound on
+    // those eight is not this canary at all: it is `unopened`, which asks
+    // the PARSER and is asserted first, so the test stops there and never
+    // reaches this line.
+    //
+    // A third repair the rejected one hides, left deliberately undone:
+    // keep the loose text pattern and drop the matches the PARSER places
+    // inside a type literal. That removes the over-report without making
+    // the two agree by construction, because the exclusion would come from
+    // the parse rather than from MEMBER_RE. Not done here because it makes
+    // a canary quieter, and quieter is the direction that needs its own
+    // commit and its own measurement.
     //
     // So the branch is read, not merely true-if-read, and the message has
     // to be exact about what it does and does not know. It knows which
@@ -1606,7 +1673,25 @@ ${unopened.join('\n')}`).toEqual([]);
     const calls = (body: string, fn: string): boolean =>
       new RegExp(`\\b${fn}${CALL}`).test(body);
     // Escaped: the gates contain '.' and '()', which are regex syntax.
-    const GATE_RE = GATES.map((g) => new RegExp(g.replace(/[.()]/g, '\\$&')));
+    // Word-bounded as well, and that is not cosmetic. Without the `\b`
+    // this matched a gate name as the TAIL of a longer identifier, so
+    // `notMycanEditRoom()` contained `canEditRoom()` and counted as an
+    // owner check. Measured silent on both committed versions of this file
+    // and on this one before the fix, with the write directly in the method
+    // body — no nesting, no IIFE, nothing clever; and measured loud again
+    // for `thing.mayWriteRoomDoc2()`, where the containment does not hold.
+    //
+    // The line below had the boundary all along: writers were word-bounded
+    // and gates were not, one line apart, and the asymmetry ran in the
+    // dangerous direction. Three paragraphs down this test says why, about
+    // strings rather than identifiers but for the same reason — a write
+    // found where there is none is a loud false positive, while a gate
+    // found where there is none quietly manufactures coverage.
+    //
+    // `\b` is right for both spellings: it falls after the `!` or the space
+    // ahead of `this.`, and after the `.` in `this.canEditRoom()`, so every
+    // real gate still matches. What it stops is the longer identifier.
+    const GATE_RE = GATES.map((g) => new RegExp(`\\b${g.replace(/[.()]/g, '\\$&')}`));
     const WRITER_RE = WRITERS.map((w) => new RegExp(`\\b${w}${CALL}`));
     const firstAt = (body: string, res: readonly RegExp[]): number => {
       const hits = res.map((r) => body.search(r)).filter((i) => i >= 0);
@@ -2350,9 +2435,15 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // were wrong in the same direction, each claiming a uniqueness wider
     // than the one that holds. "The only thing at class top level that is
     // both unnestable and unnameable" is false because a generator
-    // `*gen()` is unnestable and was just as invisible to MEMBER_RE —
-    // closed by teaching the pattern that spelling, which `*gen()` admits
-    // because it HAS a name. "The only member the grammar gives no name
+    // `*gen()` is unnestable and is just as invisible to MEMBER_RE. An
+    // earlier wording here said that was "closed by teaching the pattern
+    // that spelling"; it was not, and the pattern above holds no `*` to
+    // this day. What makes the gap safe is `unopened`, which asks the
+    // PARSER for the member list and is asserted first — measured, a
+    // `  private *probeGen()` fails two of sixteen, the first of them
+    // saying MEMBER_RE opened no unit on it. The list above says the same
+    // thing in its own words, which is the tell: a comment claiming a
+    // repair the file contradicts forty lines up. "The only member the grammar gives no name
     // to" is false too, and measurably: asked directly, the parser reports
     // `name === undefined` for ClassStaticBlockDeclaration, IndexSignature,
     // SemicolonClassElement and Constructor alike — and `carvable`, up at
@@ -2491,7 +2582,7 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // than an optimisation: ITS instance fields and parameter defaults run
     // when the gate in the same initialiser ran, so they are not deferred
     // relative to it and the gate test owns them.
-    const deferred: { open: number; end: number }[] = [];
+    const deferred: { open: number; end: number; kind: 'field' | 'param' }[] = [];
     const collectDeferred = (n: ts.Node): void => {
       if (ts.isClassLike(n) && n !== ctrl) {
         for (const m of n.members) {
@@ -2499,14 +2590,25 @@ opened no unit on it, so everything it does is credited to this one's gate`);
           // beside the gate, so it is init-time like any other initialiser.
           if (ts.isPropertyDeclaration(m) && m.initializer !== undefined
             && m.modifiers?.some((x) => x.kind === ts.SyntaxKind.StaticKeyword) !== true) {
-            deferred.push({ open: m.initializer.getStart(ast), end: m.initializer.end });
+            deferred.push({
+              open: m.initializer.getStart(ast), end: m.initializer.end, kind: 'field' });
           }
-          if (ts.isFunctionLike(m)) {
-            for (const p of m.parameters) {
-              if (p.initializer !== undefined) {
-                deferred.push({ open: p.initializer.getStart(ast), end: p.initializer.end });
-              }
-            }
+        }
+      }
+      // A parameter default runs when its function is CALLED, wherever that
+      // function lives, so this asks every function-like node and not only a
+      // nested class's members. Asking only there decided the same hazard on
+      // a detail with nothing to do with it: a default on a nested-class
+      // method was reported, while the identical default on a function a
+      // member merely STORES was collected by nothing, found no host, and
+      // left through the `host === undefined` door below. Both run at call
+      // time. Neither is init-time, and an earlier comment on that door
+      // claimed otherwise.
+      if (ts.isFunctionLike(n)) {
+        for (const p of n.parameters) {
+          if (p.initializer !== undefined) {
+            deferred.push({
+              open: p.initializer.getStart(ast), end: p.initializer.end, kind: 'param' });
           }
         }
       }
@@ -2514,19 +2616,45 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     };
     collectDeferred(ast);
     const deferredOpens = new Set(deferred.map((b) => b.open));
+    const paramOpens = new Set(deferred.filter((b) => b.kind === 'param')
+      .map((b) => b.open));
 
-    // And one position that looks stored and is not. An immediately-invoked
-    // body runs exactly when the member's initialiser ran, beside the gate,
-    // so the gate test owns it like any other init-time expression. Nothing
-    // stores it and it does not run later, which is both halves of what
-    // `stored` is supposed to mean.
+    // And one position that is TRANSPARENT: an immediately-invoked body runs
+    // exactly when the code around it runs, so it answers nothing on its own
+    // and the question passes through it to whatever encloses it. In a member
+    // initialiser of this class that means init-time, beside the gate, and
+    // the gate test owns it. Inside a stored function it means stored.
+    // Inside a deferred span it means deferred.
+    //
+    // An earlier wording said the first of those three as though it were the
+    // only one -- "runs exactly when the member's initialiser ran, beside the
+    // gate" -- and the same arm that wrote it had just introduced the spans
+    // that make it false. A write one IIFE deep inside a nested class's field
+    // initialiser, or inside a parameter default, was excused on the grounds
+    // that it ran beside a gate it does not run beside, and the suite passed
+    // all sixteen on an ungated write. These offsets are therefore SKIPPED
+    // when the host is chosen, below, rather than used to excuse a write:
+    // skipping asks the enclosing span the same question, which is what
+    // "transparent" has to mean to be worth saying.
     const iifeOpens = new Set<number>();
     const collectIife = (n: ts.Node): void => {
       if (ts.isCallExpression(n)) {
         let callee: ts.Node = n.expression;
         while (ts.isParenthesizedExpression(callee)) { callee = callee.expression; }
         if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) {
-          iifeOpens.add(callee.body.getStart(ast));
+          // `async` and `function*` callees are not init-time, so neither is
+          // excused. A generator's body does not run on the call at all --
+          // it runs on the first `.next()`, at any time or never, so a
+          // single `*` would otherwise buy silence. An async body does start
+          // on the spot, but it stops at its first `await` and resumes
+          // later, and a write past that await runs when the gate's answer
+          // has already gone stale. Both are asked for by name rather than
+          // left to the shape, because the shape of all four is identical.
+          const isAsync = callee.modifiers?.some(
+            (x) => x.kind === ts.SyntaxKind.AsyncKeyword) === true;
+          const isGen = ts.isFunctionExpression(callee)
+            && callee.asteriskToken !== undefined;
+          if (!isAsync && !isGen) { iifeOpens.add(callee.body.getStart(ast)); }
         }
       }
       ts.forEachChild(n, collectIife);
@@ -2538,11 +2666,27 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // that closes it. A module-scope function falls outside it and keeps
     // the old reading, which for a module-scope function is the right one —
     // it is a unit, and the gate test does scan it.
+    // No `iifeOpens` test here. It used to carry one, which is how the
+    // excusal reached positions its reasoning did not cover; the question is
+    // asked once now, where the host is chosen, and an IIFE body can no
+    // longer BE the host -- so a test for it here could never be false.
     const stored = (b: { open: number; end: number }): boolean =>
-      !nested.has(b.open) && !staticOpens.has(b.open) && !iifeOpens.has(b.open)
+      !nested.has(b.open) && !staticOpens.has(b.open)
       && b.open > classAt && b.end <= classEnd + 2 && !memberBodies.has(b.open);
 
     const bare = stripComments(SRC);
+    // Writes are read from `bare`, gates from a copy with string text blanked
+    // as well -- the same span, blanked differently, exactly as the gate test
+    // does above and for the reason stated there: a write found inside a
+    // message is a false positive that fails loudly and gets fixed, while a
+    // gate found inside a message is a false negative that quietly
+    // manufactures coverage. `showHint('ask canEditRoom() first')` is not an
+    // owner check. Reading gates out of `bare` made this arm the one gate
+    // reader in the file that a quoted gate could fool, which is the defect
+    // the gate test says it had and fixed -- reintroduced here in a new arm.
+    // `blankOut` is length-preserving, pinned by the lexer's own test, so an
+    // offset in either copy is the same offset in SRC.
+    const bareGate = blankOut(SRC, true);
 
     // A gate INSIDE the host body is the one gate that does run every time
     // the body runs, so a host holding one ahead of the write is not
@@ -2558,11 +2702,33 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // arm's policy is "carve it, or lift the write out", it is reconciled
     // against the carved spans by `misaligned` above, and widening it is
     // not this commit's business.
-    const gatedInside = (b: { open: number; end: number }, at: number): boolean =>
-      GATES.some((g) => {
-        const i = bare.indexOf(g, b.open);
-        return i >= 0 && i < at;
+    // Word-bounded, so `notMycanEditRoom()` does not read as a gate. The
+    // receiver is still unchecked -- `strangersRoom.canEditRoom()` counts as
+    // one -- and that weakness is shared with the gate test's own GATE_RE, so
+    // it is one question to answer in one place rather than twice, here.
+    const GATE_IN_RE = GATES.map((g) => new RegExp(`\\b${g.replace(/[.()]/g, '\\$&')}`));
+    // Measured against the host's FIRST write, not against the write being
+    // judged. A host that writes, then gates, then writes again has not
+    // gated the first one, and asking only about the later write accepts it.
+    // That is the gate test's own "before the first effect" rule, narrowed to
+    // the effects this arm can see directly: a host calling a write-REACHING
+    // helper ahead of its gate is still accepted here, because the reach
+    // closure lives inside the gate test and `lateGates` answers that shape
+    // at unit level. Widening this to full effects means hoisting that
+    // closure out of the file's primary assertion, which is a change in its
+    // own right and not this one.
+    const gatedInside = (b: { open: number; end: number }, at: number): boolean => {
+      const code = bare.slice(b.open, b.end);
+      const writes = WRITERS
+        .map((w) => code.search(new RegExp(`\\b${w}${CALL}`)))
+        .filter((i) => i >= 0);
+      const limit = writes.length > 0 ? Math.min(at, b.open + Math.min(...writes)) : at;
+      const span = bareGate.slice(b.open, b.end);
+      return GATE_IN_RE.some((re) => {
+        const i = span.search(re);
+        return i >= 0 && b.open + i < limit;
       });
+    };
 
     const borrowed: string[] = [];
     for (const w of WRITERS) {
@@ -2576,20 +2742,37 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         // offset, and `<` read that arrow as not containing its own write.
         // A braced body cannot be caught by the widening: its `open` is a
         // `{`, and no writer call begins on one.
-        const host = [...runsLater, ...deferred]
-          .filter((b) => b.open <= at && at < b.end)
+        // `runsLater` first, and a deferred span only when no function body
+        // contains the write at all. Innermost-of-the-union let a deferred
+        // span strictly inside a nested host win the sort, and the write was
+        // then judged as a deferred one -- eligible for the `gatedInside` and
+        // `carvedEnd` silencing that the `nested` arm permits under no
+        // circumstances. The comment above says this arm does not widen that
+        // policy; choosing in this order is what makes that true rather than
+        // aspirational.
+        //
+        // An IIFE body is skipped rather than chosen: it runs when its
+        // surroundings run, so the span that answers for the write is the
+        // one outside it. Without the skip the IIFE won the sort, answered
+        // for nothing, and the write left silently -- see `iifeOpens`.
+        const innermost = (bs: readonly { open: number; end: number }[]) => bs
+          .filter((b) => b.open <= at && at < b.end && !iifeOpens.has(b.open))
           .sort((a, b) => b.open - a.open)[0];
+        const host = innermost(runsLater) ?? innermost(deferred);
         // No function body and no deferred span around it means one of
         // two things, and this list owns neither of them. Either the write
         // is at module scope, which `homeless` above owns, or it sits in
         // an initialiser position that runs at the very moment the
         // member's own initialiser ran — a static field of a nested class
-        // expression, a parameter default, a field initialiser of THIS
-        // class — where a gate in the same expression has already settled
-        // whether the write happens at all, so the gate test is what owns
-        // it. An earlier wording here named only the first, which reads as
-        // a claim that nothing else can arrive at this line. Three shapes
-        // do, and all three measure silent, before and after this change.
+        // expression, or a field initialiser of THIS class — where a gate
+        // in the same expression has already settled whether the write
+        // happens at all, so the gate test is what owns it. An earlier
+        // wording named only module scope, which reads as a claim that
+        // nothing else arrives here; two shapes do, and both measure
+        // silent. That wording also named a parameter default, which does
+        // NOT belong on the list: a default runs when its function is
+        // called, so it is deferred by definition. It is collected as
+        // deferred above now instead of being excused here.
         if (host === undefined) { continue; }
         // The question is temporal, not structural: does this host run at a
         // time other than when its member's initialiser ran, without
@@ -2609,15 +2792,19 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         const where = staticOpens.has(host.open)
           ? `a class static block opening at line ${lineAt(host.open)}, which runs at `
             + 'class-definition time'
-          : deferredOpens.has(host.open)
-            ? `an initialiser at line ${lineAt(host.open)} belonging to a class this `
-              + 'member builds but never constructs, so it runs whenever something else '
-              + 'constructs that class rather than when the member was initialised'
-            : stored(host)
-              ? `a function opening at line ${lineAt(host.open)} that no member of this `
-                + 'class owns as its body, so it is a value a member stores and runs when '
-                + 'something calls it rather than when the member was initialised'
-              : `a nested function opening at line ${lineAt(host.open)}`;
+          : paramOpens.has(host.open)
+            ? `a parameter default at line ${lineAt(host.open)}, which runs every time `
+              + 'that function is called without the argument, rather than when the '
+              + 'member holding the gate was initialised'
+            : deferredOpens.has(host.open)
+              ? `an initialiser at line ${lineAt(host.open)} belonging to a class this `
+                + 'member builds but never constructs, so it runs whenever something '
+                + 'else constructs that class rather than when the member was initialised'
+              : stored(host)
+                ? `a function opening at line ${lineAt(host.open)} that no member of this `
+                  + 'class owns as its body, so it is a value a member stores and runs '
+                  + 'when something calls it rather than when the member was initialised'
+                : `a nested function opening at line ${lineAt(host.open)}`;
         borrowed.push(`line ${lineAt(at)}: ${w}() sits in ${where}, and is credited to ${
           owner?.label ?? 'no unit at all'}`);
       }
