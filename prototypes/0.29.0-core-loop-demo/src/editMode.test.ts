@@ -125,6 +125,44 @@ const WRITERS = [
 const GATES = ['this.mayWriteRoomDoc()', 'canEditRoom()'];
 
 /**
+ * A gate name, matched only where it is a WHOLE identifier.
+ *
+ * Built here rather than at each reader, because there are two of them and
+ * the previous commit had to fix this in both — it word-bounded `GATE_RE`
+ * and `GATE_IN_RE` with identical code on two lines 1015 apart, which is
+ * the arrangement that lets one be tightened and the other forgotten. One
+ * definition, consumed twice, cannot drift.
+ *
+ * The boundary is a lookbehind and not `\b`, and that is the correction.
+ * `\b` is defined against `\w`, which is `[A-Za-z0-9_]` — so it does NOT
+ * include `$`, the non-ASCII letters, or the `#` of a private name, every
+ * one of which is legal in a JavaScript identifier. `\b` therefore matched
+ * a gate name as the tail of a longer identifier whenever the extra
+ * characters were not plain ASCII: measured, `$canEditRoom()`,
+ * `x$canEditRoom()`, `écanEditRoom()`, `日canEditRoom()` and
+ * `this.#canEditRoom()` all read as owner checks, 9 of 10 adversarial
+ * spellings. That is the SAME defect the `\b` was added to close, one
+ * character class short — `notMycanEditRoom()` with a `$` in place of the
+ * `y`. `\p{ID_Continue}` is the character class the language actually
+ * uses, so the question is asked the way the compiler asks it.
+ *
+ * `#` is excluded as well, so `this.#canEditRoom()` does not read as
+ * `canEditRoom()`. A private method is a different method; if a gate is
+ * ever renamed to one, `GATES` above is what changes. Failing to see a
+ * real gate is the safe direction here — an unrecognised gate leaves its
+ * unit UNGATED, and an ungated unit that writes is reported. It is the
+ * opposite direction, a gate seen where there is none, that silently
+ * manufactures coverage.
+ *
+ * Measured against the real file: 0 of 10 lookalikes accepted where `\b`
+ * accepted 9, no real spelling lost, and the hit count on editMode.ts is
+ * unchanged at 9 and 7 — so this tightening moves no verdict today. It is
+ * the next rename that it is here for.
+ */
+const gateMatchers = (): RegExp[] => GATES
+  .map((g) => new RegExp(`(?<![\\p{ID_Continue}$#])${g.replace(/[.()]/g, '\\$&')}`, 'u'));
+
+/**
  * Every relative module specifier in a file, in any of the seven forms, as
  * capture 1. Used by the derived half of the import-surface test to decide
  * which modules it is obliged to read.
@@ -1672,26 +1710,26 @@ ${unopened.join('\n')}`).toEqual([]);
   it('gates every method that writes, or that is reached only from gated ones', () => {
     const calls = (body: string, fn: string): boolean =>
       new RegExp(`\\b${fn}${CALL}`).test(body);
-    // Escaped: the gates contain '.' and '()', which are regex syntax.
-    // Word-bounded as well, and that is not cosmetic. Without the `\b`
-    // this matched a gate name as the TAIL of a longer identifier, so
+    // Identifier-bounded, and that is not cosmetic. Unbounded, this matched
+    // a gate name as the TAIL of a longer identifier, so
     // `notMycanEditRoom()` contained `canEditRoom()` and counted as an
-    // owner check. Measured silent on both committed versions of this file
-    // and on this one before the fix, with the write directly in the method
-    // body — no nesting, no IIFE, nothing clever; and measured loud again
-    // for `thing.mayWriteRoomDoc2()`, where the containment does not hold.
+    // owner check. Measured silent on both committed versions of this file,
+    // with the write directly in the method body — no nesting, no IIFE,
+    // nothing clever; and measured loud for `thing.mayWriteRoomDoc2()`,
+    // where the containment does not hold.
     //
-    // The line below had the boundary all along: writers were word-bounded
-    // and gates were not, one line apart, and the asymmetry ran in the
+    // The line below had a boundary all along: writers were bounded and
+    // gates were not, one line apart, and the asymmetry ran in the
     // dangerous direction. Three paragraphs down this test says why, about
     // strings rather than identifiers but for the same reason — a write
     // found where there is none is a loud false positive, while a gate
     // found where there is none quietly manufactures coverage.
     //
-    // `\b` is right for both spellings: it falls after the `!` or the space
-    // ahead of `this.`, and after the `.` in `this.canEditRoom()`, so every
-    // real gate still matches. What it stops is the longer identifier.
-    const GATE_RE = GATES.map((g) => new RegExp(`\\b${g.replace(/[.()]/g, '\\$&')}`));
+    // The boundary itself, and why it is a lookbehind rather than the `\b`
+    // the first repair used, is at `gateMatchers`. It lives at module scope
+    // because `GATE_IN_RE` below needs the identical question asked, and
+    // asking it twice is how the first repair came to be half a repair.
+    const GATE_RE = gateMatchers();
     const WRITER_RE = WRITERS.map((w) => new RegExp(`\\b${w}${CALL}`));
     const firstAt = (body: string, res: readonly RegExp[]): number => {
       const hits = res.map((r) => body.search(r)).filter((i) => i >= 0);
@@ -2702,11 +2740,20 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // arm's policy is "carve it, or lift the write out", it is reconciled
     // against the carved spans by `misaligned` above, and widening it is
     // not this commit's business.
-    // Word-bounded, so `notMycanEditRoom()` does not read as a gate. The
-    // receiver is still unchecked -- `strangersRoom.canEditRoom()` counts as
-    // one -- and that weakness is shared with the gate test's own GATE_RE, so
-    // it is one question to answer in one place rather than twice, here.
-    const GATE_IN_RE = GATES.map((g) => new RegExp(`\\b${g.replace(/[.()]/g, '\\$&')}`));
+    // Identifier-bounded, so `notMycanEditRoom()` does not read as a gate,
+    // and `$canEditRoom()` does not either — see `gateMatchers`, which is
+    // now the single definition both readers call. It used to be this line
+    // and the gate test's own, spelled identically 1015 lines apart, and the
+    // boundary they shared was `\b`, which is blind to `$` and to every
+    // non-ASCII identifier character.
+    //
+    // The RECEIVER is still unchecked: `strangersRoom.canEditRoom()` counts
+    // as an owner check, because the `.` satisfies any boundary. That is a
+    // different question from the name, it is shared with the gate test by
+    // construction now rather than by coincidence, and there is no probe for
+    // it yet — G3 tests a wrong name on `this`, not a right name on a wrong
+    // receiver. `editMode.ts` has no such spelling today.
+    const GATE_IN_RE = gateMatchers();
     // Measured against the host's FIRST write, not against the write being
     // judged. A host that writes, then gates, then writes again has not
     // gated the first one, and asking only about the later write accepts it.
