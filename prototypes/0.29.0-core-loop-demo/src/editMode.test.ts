@@ -1095,30 +1095,40 @@ ${unopened.join('\n')}`).toEqual([]);
     // false-positive classes alone, prose indented two spaces inside a
     // template literal, the same inside a block comment, and a method whose
     // own body statements are indented two instead of four; and it ALSO
-    // caught, alone, five spellings of a real ungated room-doc write. Those
-    // five are not a loss of this arm, though, because the arm was reading a
+    // caught, alone, four spellings of a real ungated room-doc write. Those
+    // four are not a loss of this arm, though, because the arm was reading a
     // symptom. Each was a function stored by a member's INITIALISER, behind
     // a gate call evaluated in that same initialiser, and the arm saw them
     // only because they happened to be indented two spaces: the same hazard
     // at four spaces, or written on one line, it never saw at all. The
     // repair went to the root instead — `borrowed`, in 'refuses a write in a
-    // nested callback', now asks whether a host body is a member's own body
-    // rather than whether it looks top-level — and that reports all seven
-    // spellings, these five included. Restoring a text arm here would add
-    // back three false reports about a file that is fine, to re-cover five
-    // of the seven.
+    // nested callback', now asks the temporal question, whether a host body
+    // runs at a time other than the one its member's initialiser ran at —
+    // and that reports all nine spellings, these four included. Restoring a
+    // text arm here would add back three false reports about a file that is
+    // fine, to re-cover four of the nine.
+    //
+    // Both counts are measured twice, by two methods that could disagree:
+    // once by running all nine spellings through this file with and without
+    // the repair, and once by lifting the deleted arm's own regex out of
+    // the commit that removed it and asking it directly which of the nine
+    // lines it matches. Both say four, and both name the same four. The
+    // five it misses are one indented four spaces, one opening with a `*`,
+    // and three written on a single line — and a single line is one the
+    // carver has already opened a unit on, so there is nothing left over
+    // for a text arm to notice.
     //
     // And the other direction, which is what makes the first list mean
     // something: a unit opened where the parser declares no member is a
     // real member cut in half, and the half that keeps the gate is not
     // necessarily the half that holds the write.
     //
-    // Five ways in, and the first draft of this comment said there were
+    // Six ways in, and the first draft of this comment said there were
     // none — that the list was unreachable for a structural reason. It is
-    // not, and the fifth way is the one that matters, because it is live
-    // code rather than text the compiler is not reading.
+    // not, and the last two are the ones that matter, because they are
+    // live code rather than text the compiler is not reading.
     //
-    // Three of the five are multi-line constructs: a template literal, a
+    // Three of the six are multi-line constructs: a template literal, a
     // block comment, and a quoted string continued with a backslash are
     // the only ways to begin a line with `  private` and have the compiler
     // not read it as code at all. None of those three reaches the list,
@@ -1133,20 +1143,51 @@ ${unopened.join('\n')}`).toEqual([]);
     // and MEMBER_RE at the `private` a line below. That one is reported by
     // `unopened` above — asserted first, so the test stops there and this
     // list is never built. Measured: a decorated method fails two of
-    // sixteen and the message names the method.
+    // sixteen, and `unopened`'s message quotes the DECORATOR line rather
+    // than the method — which is the preceding sentence read back out of
+    // the output, the `@` being where `getStart` lands. The second of the
+    // two failures is 'refuses a write in a nested callback', and its
+    // message does name the method, and the unit the parse found it in.
     //
     // The fifth is MEMBER_RE's own second alternative. `^ {2}(constructor)`
     // has no visibility word in front of it, so it matches `  constructor`
-    // wherever that word begins a line at member indentation — and an
-    // object literal may have a property called `constructor`, as may a
-    // type literal's member list. Both are ordinary code the compiler
-    // reads normally, so nothing refuses them and nothing reports them
-    // sooner. Measured, three spellings: `  constructor: 1,` as an
-    // object-literal key, `  constructor(): void;` as a type member, and
-    // an object-literal `constructor()` METHOD holding an ungated write.
-    // Each fails two of sixteen through this list — the third, three, the
-    // write being caught by the gate test as well — and each message
-    // correctly names the member the spurious cut lands inside.
+    // wherever that word begins a line at member indentation, and a good
+    // many ordinary constructs put it there. All of them are code the
+    // compiler reads normally, so nothing refuses them and nothing reports
+    // them sooner. Measured, six spellings: `  constructor: 1,` as an
+    // object-literal key; `  constructor(): void;` as a type member, once
+    // in a property's annotation and again in a parameter's; an
+    // object-literal `constructor()` METHOD holding an ungated write; a
+    // nested class EXPRESSION whose own `constructor` sits at two spaces,
+    // holding one as well; and `  constructor:` as a statement LABEL,
+    // which is a legal thing to call a label. Four of the six fail two of
+    // sixteen through this list; the two that hold a write fail three, the
+    // write being caught by the gate test as well. Each message correctly
+    // names the member the spurious cut lands inside.
+    //
+    // The sixth way is the FIRST alternative, reached for the same reason:
+    // a nested class expression writes its own members at two spaces too,
+    // so a `  private inner = 1;` inside one is cut as though it were a
+    // member of this class. That one fails exactly one of sixteen, through
+    // this list and nothing else, with no write anywhere near it — which
+    // makes it the plainest evidence that the branch is read at all, since
+    // no other assertion in the suite has a word to say about it.
+    //
+    // One neighbour of these is a defect rather than a way in, and it is
+    // recorded here rather than fixed. A `  public: number;` inside a type
+    // literal declares nothing, and MEMBER_RE does not cut there, because
+    // it wants a space after the visibility word and a colon is not one.
+    // `swallowed`, below, deliberately does not want that space: it asks
+    // for a line break, two spaces, and one of the four words on a word
+    // boundary, so it matches the annotation and reports a unit as
+    // containing another member's declaration when what it contains is no
+    // declaration at all. Measured: one of sixteen, through `swallowed`.
+    // Tightening its pattern to MEMBER_RE's exact shape is the obvious
+    // repair and the wrong one — it would make the two agree by
+    // construction, and a canary that cannot disagree with the thing it
+    // watches is not worth a separate assertion. Left loose, and loose in
+    // the safe direction: it can over-report a type annotation, it cannot
+    // under-report a cut.
     //
     // So the branch is read, not merely true-if-read, and the message has
     // to be exact about what it does and does not know. It knows which
@@ -2301,7 +2342,11 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // write in such a listener — measured, both ways.
     //
     // And only the static block, because it is the only NAMELESS member
-    // that can hold runtime code. Two earlier versions of this sentence
+    // that can hold runtime code AND that MEMBER_RE does not already
+    // match. The second half of that is load-bearing, and the end of this
+    // paragraph is where it gets spent: a constructor is nameless to the
+    // parser and holds runtime code too, and it is out on the other
+    // ground. Two earlier versions of this sentence
     // were wrong in the same direction, each claiming a uniqueness wider
     // than the one that holds. "The only thing at class top level that is
     // both unnestable and unnameable" is false because a generator
@@ -2329,11 +2374,15 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // and the distinction is the whole of `stored` below. What the gate
     // test catches there is an UNGATED write: measured on four shapes, a
     // braced arrow, a concise one, a public one, and one nested a level
-    // deeper, all four caught, the first three by the gate test and the
-    // last by `borrowed`'s ordinary nested arm. What it does not catch is
-    // a write behind a gate call evaluated in the SAME initialiser, which
-    // ran once while the field was being built and not when the arrow
-    // runs. Measured silent until `stored` existed.
+    // deeper, all four caught by the gate test — all four of them, not
+    // three — and each caught a second time by an arm of its own: the
+    // braced arrow and the public one by `stored` below, the deeper one by
+    // `borrowed`'s ordinary nested arm, and the concise one by `bodiless`,
+    // which finds in it no braced body to look inside. Two of sixteen
+    // apiece, and the same both before and after this change. What it does
+    // not catch is a write behind a gate call evaluated in the SAME
+    // initialiser, which ran once while the field was being built and not
+    // when the arrow runs. Measured silent until `stored` existed.
     const staticOpens = new Set<number>();
     const collectStatic = (n: ts.Node): void => {
       if (ts.isClassStaticBlockDeclaration(n)) {
@@ -2404,9 +2453,10 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     //
     // Three controls, because a list that reports nine shapes is only worth
     // having if it is quiet about the rest. The same object literal with no
-    // gate text anywhere is caught by the gate test by itself — so the
-    // family was never hidden for want of a write, only for want of a gate
-    // to borrow. A stored function one level deeper is reported by the
+    // gate text anywhere is caught twice, by the gate test and by this
+    // list both — two of sixteen, measured — so the family was never
+    // hidden for want of a write, only for want of a gate to borrow. A
+    // stored function one level deeper is reported by the
     // ordinary nested arm below, with the nested wording and exactly once:
     // `stored` and `nested` do not overlap. And an ordinary gated method
     // holding a write stays silent, which is the shape most of this class
@@ -2426,16 +2476,94 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     const memberBodies = new Set((ctrl?.members ?? []).flatMap((m) => (
       ts.isFunctionLike(m) && 'body' in m && m.body !== undefined && ts.isBlock(m.body)
         ? [m.body.getStart(ast)] : [])));
+    // Two positions run later while sitting inside no function body at
+    // all, so the host search below comes back empty for them and `stored`
+    // is never asked. A nested class's instance field initialiser, and a
+    // parameter default on one of its members, both run at `new`-time —
+    // arbitrarily later than the initialiser that built the field and
+    // evaluated the gate:
+    //
+    //     private pending = this.mayWriteRoomDoc() ? class {
+    //     f = writeWallpaper(surface, next);
+    //     } : null;
+    //
+    // The outer class is excluded, and that exclusion is the point rather
+    // than an optimisation: ITS instance fields and parameter defaults run
+    // when the gate in the same initialiser ran, so they are not deferred
+    // relative to it and the gate test owns them.
+    const deferred: { open: number; end: number }[] = [];
+    const collectDeferred = (n: ts.Node): void => {
+      if (ts.isClassLike(n) && n !== ctrl) {
+        for (const m of n.members) {
+          // A static field runs when the class EXPRESSION is evaluated,
+          // beside the gate, so it is init-time like any other initialiser.
+          if (ts.isPropertyDeclaration(m) && m.initializer !== undefined
+            && m.modifiers?.some((x) => x.kind === ts.SyntaxKind.StaticKeyword) !== true) {
+            deferred.push({ open: m.initializer.getStart(ast), end: m.initializer.end });
+          }
+          if (ts.isFunctionLike(m)) {
+            for (const p of m.parameters) {
+              if (p.initializer !== undefined) {
+                deferred.push({ open: p.initializer.getStart(ast), end: p.initializer.end });
+              }
+            }
+          }
+        }
+      }
+      ts.forEachChild(n, collectDeferred);
+    };
+    collectDeferred(ast);
+    const deferredOpens = new Set(deferred.map((b) => b.open));
+
+    // And one position that looks stored and is not. An immediately-invoked
+    // body runs exactly when the member's initialiser ran, beside the gate,
+    // so the gate test owns it like any other init-time expression. Nothing
+    // stores it and it does not run later, which is both halves of what
+    // `stored` is supposed to mean.
+    const iifeOpens = new Set<number>();
+    const collectIife = (n: ts.Node): void => {
+      if (ts.isCallExpression(n)) {
+        let callee: ts.Node = n.expression;
+        while (ts.isParenthesizedExpression(callee)) { callee = callee.expression; }
+        if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) {
+          iifeOpens.add(callee.body.getStart(ast));
+        }
+      }
+      ts.forEachChild(n, collectIife);
+    };
+    collectIife(ast);
+
     // `classEnd + 2` is the span the member canary pins the parser to:
     // `classAt` indexes the newline before `class` and `classEnd` the `\n}`
     // that closes it. A module-scope function falls outside it and keeps
     // the old reading, which for a module-scope function is the right one —
     // it is a unit, and the gate test does scan it.
     const stored = (b: { open: number; end: number }): boolean =>
-      !nested.has(b.open) && !staticOpens.has(b.open)
+      !nested.has(b.open) && !staticOpens.has(b.open) && !iifeOpens.has(b.open)
       && b.open > classAt && b.end <= classEnd + 2 && !memberBodies.has(b.open);
 
     const bare = stripComments(SRC);
+
+    // A gate INSIDE the host body is the one gate that does run every time
+    // the body runs, so a host holding one ahead of the write is not
+    // borrowing anything. Without this the fix reported the very shape a
+    // reader would write as its remedy:
+    //
+    //     private readonly onPick = (): void => {
+    //       if (!this.mayWriteRoomDoc()) { return; }
+    //       writeWallpaper(surface, next);
+    //     };
+    //
+    // Scoped to the `stored` and deferred arms on purpose. The `nested`
+    // arm's policy is "carve it, or lift the write out", it is reconciled
+    // against the carved spans by `misaligned` above, and widening it is
+    // not this commit's business.
+    const gatedInside = (b: { open: number; end: number }, at: number): boolean =>
+      GATES.some((g) => {
+        const i = bare.indexOf(g, b.open);
+        return i >= 0 && i < at;
+      });
+
     const borrowed: string[] = [];
     for (const w of WRITERS) {
       for (const hit of bare.matchAll(new RegExp(`\\b${w}${CALL}`, 'g'))) {
@@ -2448,27 +2576,48 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         // offset, and `<` read that arrow as not containing its own write.
         // A braced body cannot be caught by the widening: its `open` is a
         // `{`, and no writer call begins on one.
-        const host = runsLater.filter((b) => b.open <= at && at < b.end)
+        const host = [...runsLater, ...deferred]
+          .filter((b) => b.open <= at && at < b.end)
           .sort((a, b) => b.open - a.open)[0];
-        // No function body at all is module scope, which `homeless` owns;
-        // a top-level body is a member or a module-scope function, which
-        // the gate test owns; a carved body is a unit in its own right.
-        //
-        // A static block answers without being nested: nothing lexically
-        // encloses it, and it still runs at a time no gate reaches.
-        if (host === undefined
-          || (!nested.has(host.open) && !staticOpens.has(host.open) && !stored(host))
-          || carvedEnd.has(host.end)) continue;
+        // No function body and no deferred span around it means one of
+        // two things, and this list owns neither of them. Either the write
+        // is at module scope, which `homeless` above owns, or it sits in
+        // an initialiser position that runs at the very moment the
+        // member's own initialiser ran — a static field of a nested class
+        // expression, a parameter default, a field initialiser of THIS
+        // class — where a gate in the same expression has already settled
+        // whether the write happens at all, so the gate test is what owns
+        // it. An earlier wording here named only the first, which reads as
+        // a claim that nothing else can arrive at this line. Three shapes
+        // do, and all three measure silent, before and after this change.
+        if (host === undefined) { continue; }
+        // The question is temporal, not structural: does this host run at a
+        // time other than when its member's initialiser ran, without
+        // re-checking a gate of its own on the way to the write? A static
+        // block answers without being nested — nothing lexically encloses
+        // it, and it runs before any instance exists, so no gate reaches it
+        // and `gatedInside` is not consulted for it. A host whose end a
+        // carved unit shares is a unit in its own right, with a gate of
+        // its own to answer for, and `carvedEnd` just below is what sets
+        // those aside.
+        const borrows = (deferredOpens.has(host.open) || stored(host))
+          && !gatedInside(host, at);
+        if ((!nested.has(host.open) && !staticOpens.has(host.open) && !borrows)
+          || carvedEnd.has(host.end)) { continue; }
         const owner = units.filter((u) => u.start <= at && at < u.end)
           .sort((a, b) => b.start - a.start)[0];
         const where = staticOpens.has(host.open)
           ? `a class static block opening at line ${lineAt(host.open)}, which runs at `
             + 'class-definition time'
-          : stored(host)
-            ? `a function opening at line ${lineAt(host.open)} that no member of this `
-              + 'class owns as its body, so it is a value a member stores and runs when '
-              + 'something calls it rather than when the member was initialised'
-            : `a nested function opening at line ${lineAt(host.open)}`;
+          : deferredOpens.has(host.open)
+            ? `an initialiser at line ${lineAt(host.open)} belonging to a class this `
+              + 'member builds but never constructs, so it runs whenever something else '
+              + 'constructs that class rather than when the member was initialised'
+            : stored(host)
+              ? `a function opening at line ${lineAt(host.open)} that no member of this `
+                + 'class owns as its body, so it is a value a member stores and runs when '
+                + 'something calls it rather than when the member was initialised'
+              : `a nested function opening at line ${lineAt(host.open)}`;
         borrowed.push(`line ${lineAt(at)}: ${w}() sits in ${where}, and is credited to ${
           owner?.label ?? 'no unit at all'}`);
       }
@@ -2484,7 +2633,11 @@ opened no unit on it, so everything it does is credited to this one's gate`);
       + 'member STORES — a method of an object literal or a class expression, an arrow '
       + 'in an initialiser — is the fourth case, and it takes the same fix for the same '
       + 'reason: its gate ran once while the field was being built, so move the write '
-      + 'into a gated method and have the stored function call that.').toEqual([]);
+      + 'into a gated method and have the stored function call that. A write in the '
+      + 'INITIALISER of a class a member builds but does not construct, or in a parameter '
+      + 'default of one of that class\'s members, is the fifth case and takes that same '
+      + 'fix: it runs at the constructing caller\'s convenience, not at this member\'s.'
+      ).toEqual([]);
   });
 
   it('pins what editMode imports from the doc modules, so a new writer is noticed', () => {
