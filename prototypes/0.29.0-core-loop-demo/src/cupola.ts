@@ -2,8 +2,8 @@
  * 🔭 Cupola end wall — the pure geometry of a room whose END WALL is an
  * eight-sided observation cupola (the ISS cupola, a starship's bridge glass).
  *
- * A cupola is a WALL TYPE, not a module type: any ordinary module can make one
- * of its two octagon END CAPS a cupola (floorPlan `cupola` key, floorPlanDoc).
+ * A cupola is a WALL TYPE, not a module type: any ordinary module can make
+ * either or both octagon END CAPS cupolas (floorPlan `cupola` key, floorPlanDoc).
  * The room keeps its size, its floor plan and every other wall; only the last
  * `depth` metres at that end change. There the octagon barrel tapers into a
  * frustum: each of the octagon's 8 edges runs inward to a smaller, ALIGNED
@@ -60,6 +60,10 @@ export type CupolaCap = 'cap-neg' | 'cap-pos';
  *  extrudes along z (narrowAxisFor ties → 'x'), so its ends are y− and y+. */
 export function cupolaEndWalls(halfX: number, halfZ: number): [CupolaWall, CupolaWall] {
   return narrowAxisFor(halfX, halfZ) === 'x' ? ['y-', 'y+'] : ['x-', 'x+'];
+}
+
+export function cupolaWallSelections(ends: readonly [CupolaWall, CupolaWall]): CupolaWall[][] {
+  return [[], [ends[0]], [ends[1]], [...ends]];
 }
 
 /** The end cap a wall is, or null when the wall is a side wall. */
@@ -148,6 +152,15 @@ export function cupolaPlan(
   };
 }
 
+export function cupolaPlans(
+  opts: HullSectionOpts,
+  walls: readonly CupolaWall[] | CupolaWall | null | undefined,
+): CupolaPlan[] {
+  return (Array.isArray(walls) ? walls : walls ? [walls] : [])
+    .map((wall) => cupolaPlan(opts, wall))
+    .filter((plan): plan is CupolaPlan => plan !== null);
+}
+
 /** A plan-view point split into the cross-section axis `a` and extrude `b`. */
 function toAB(plan: CupolaPlan, x: number, z: number): { a: number; b: number } {
   return plan.profile.narrowAxis === 'x' ? { a: x, b: z } : { a: z, b: x };
@@ -187,20 +200,31 @@ export function clampOutOfCupolaCorners(
 }
 
 /** The floor outline in world XZ (CCW seen from above): the room rectangle
- *  with the two cupola-end corners cut at 45°. */
-export function cupolaFloorOutline(plan: CupolaPlan): Array<{ x: number; z: number }> {
-  const { narrowHalf: n, longHalf: l, narrowAxis } = plan.profile;
-  const s = plan.sign;
-  const d = plan.depth;
-  // In (a, b): the far end is plain, the cupola end steps in by d.
-  const ab: Array<{ a: number; b: number }> = [
-    { a: -n, b: -s * l },
-    { a: n, b: -s * l },
-    { a: n, b: s * (l - d) },
-    { a: n - d, b: s * l },
-    { a: -(n - d), b: s * l },
-    { a: -n, b: s * (l - d) },
-  ];
+ *  with the cupola-end corners cut at 45°. */
+export function cupolaFloorOutline(input: CupolaPlan | readonly CupolaPlan[]): Array<{ x: number; z: number }> {
+  const plans = Array.isArray(input) ? input : [input];
+  if (!plans.length) return [];
+  const { narrowHalf: n, longHalf: l, narrowAxis } = plans[0].profile;
+  const atEnd = new Map(plans.map((plan) => [plan.sign, plan.depth]));
+  const negDepth = atEnd.get(-1) ?? 0;
+  const posDepth = atEnd.get(1) ?? 0;
+  // Walk clockwise in (a, b), stepping each cupola end in by its depth.
+  const ab: Array<{ a: number; b: number }> = negDepth > 0
+    ? [
+        { a: -n, b: -l + negDepth },
+        { a: -n + negDepth, b: -l },
+        { a: n - negDepth, b: -l },
+        { a: n, b: -l + negDepth },
+      ]
+    : [{ a: -n, b: -l }, { a: n, b: -l }];
+  ab.push(...(posDepth > 0
+    ? [
+        { a: n, b: l - posDepth },
+        { a: n - posDepth, b: l },
+        { a: -n + posDepth, b: l },
+        { a: -n, b: l - posDepth },
+      ]
+    : [{ a: n, b: l }, { a: -n, b: l }]));
   const pts = ab.map(({ a, b }) => (narrowAxis === 'x' ? { x: a, z: b } : { x: b, z: a }));
   // Normalise winding so consumers can rely on it (signed area in x/z).
   let area = 0;
@@ -239,9 +263,11 @@ export function boxClearOfCupolaCorners(
 
 /** The extrude-axis run [lo, hi] the barrel strips (and so windows) cover:
  *  the whole ±longHalf, or up to where a cupola starts tapering. */
-export function cupolaStripRun(plan: CupolaPlan | null, longHalf: number): [number, number] {
-  if (!plan) return [-longHalf, longHalf];
-  return plan.sign > 0 ? [-longHalf, plan.b0] : [plan.b0, longHalf];
+export function cupolaStripRun(input: CupolaPlan | readonly CupolaPlan[] | null, longHalf: number): [number, number] {
+  const plans = input ? (Array.isArray(input) ? input : [input]) : [];
+  const neg = plans.find((plan) => plan.sign < 0);
+  const pos = plans.find((plan) => plan.sign > 0);
+  return [neg?.b0 ?? -longHalf, pos?.b0 ?? longHalf];
 }
 
 /** True when a plan box reaches past where the cupola starts tapering — a

@@ -42,7 +42,7 @@ import {
 import type { VestibuleDoorId } from "./adapter";
 import { buildOctagonShell } from "./octagonHull";
 import { collectWindowOpenings } from "./windowLayout";
-import { roomHalfExtents, roomCupola } from "./floorPlanDoc";
+import { roomHalfExtents, roomCupolas } from "./floorPlanDoc";
 
 /** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
  *  (the new cross-section) instead of the flat box. Now the DEFAULT — disable
@@ -173,8 +173,8 @@ function buildGroup(): THREE.Group {
     // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
     // exterior barrel (neighbour shells below stay windowless — other modules'
     // windows aren't loaded here, by design).
-    // 🔭 …and an end wall made a cupola shows as its framed glass.
-    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings(), roomCupola()?.wall ?? null).group);
+    // 🔭 …and any cupola end walls show as framed glass.
+    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings(), roomCupolas().map((cupola) => cupola.wall)).group);
   } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.
