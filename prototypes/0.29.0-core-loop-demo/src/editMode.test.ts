@@ -547,8 +547,8 @@ const classEnd = SRC.indexOf('\n}', classAt);
  * The file as the compiler reads it, parsed once.
  *
  * Every check that needs to know what a brace or a declaration IS asks
- * this tree rather than a pattern; the long note in 'gates every method
- * that writes' is why the patterns were given up on. It is parsed here
+ * this tree rather than a pattern; the long note in 'refuses a write in a
+ * nested callback' is why the patterns were given up on. It is parsed here
  * rather than inside the test that first needed it because the member
  * canary needs the same answer, and the canary's whole claim is that the
  * carver and the parser agree about where the members are — a claim two
@@ -567,9 +567,9 @@ const ast = ts.createSourceFile(SRC_PATH, SRC, ts.ScriptTarget.Latest, true);
  * something that cannot be fooled by indentation or by a modifier it
  * has not been taught.
  *
- * `fn` is the one bit `unsorted`, down in the gate test, needs: is this
- * member a function at all. A method, constructor, getter or setter is.
- * A property is
+ * `fn` is the one bit `unsorted`, down in 'refuses a write in a nested
+ * callback', needs: is this member a function at all. A method,
+ * constructor, getter or setter is. A property is
  * not — unless it holds one, `private onTick = () => { … }`, which the
  * regex this replaced read as a field and dropped on the floor.
  *
@@ -578,7 +578,15 @@ const ast = ts.createSourceFile(SRC_PATH, SRC, ts.ScriptTarget.Latest, true);
  * here is what sends them to `bodiless` to be named rather than sorted
  * quietly into the bucket for data.
  */
-const parsed: { start: number; name: string; fn: boolean; what: string }[] = [];
+const parsed: {
+  start: number; name: string; fn: boolean; what: string;
+  // Which class declared it. A property holding a class expression has
+  // that class's members inside its own span, and they are not siblings
+  // of it — without this the check below would read `private x = class
+  // { m() {} };` as a member that folded into another's slice and say so
+  // about a file that is fine.
+  cls: ts.ClassLikeDeclaration;
+}[] = [];
 /**
  * `(() => { … })` and `… as H`, `… satisfies H`, `…!`, `<H>…`: five
  * ways to write an initializer that is still a function, and the parser
@@ -600,8 +608,8 @@ const parsed: { start: number; name: string; fn: boolean; what: string }[] = [];
  * ungated write: with the unwrap that arm fails twice and `bodiless`
  * names `probeW`; without it, once, and nothing says which member went
  * missing. Same species as the brace walk `collect` replaced, down in
- * the gate test — a guess about syntax — and this one costs five
- * predicates to stop guessing about.
+ * 'refuses a write in a nested callback' — a guess about syntax — and
+ * this one costs five predicates to stop guessing about.
  *
  * The return type is load-bearing, not decoration: without it a
  * self-referential arrow is TS7023, `implicitly has return type 'any'`,
@@ -623,6 +631,7 @@ const collectParsed = (n: ts.Node): void => {
           : (m.name !== undefined && ts.isIdentifier(m.name) ? m.name.text : ''),
         fn: ts.isFunctionLike(m) || (init !== undefined && ts.isFunctionLike(unwrap(init))),
         what: ts.SyntaxKind[m.kind],
+        cls: n,
       });
     }
   }
@@ -963,7 +972,66 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     expect(classAt, 'class RoomEditController not found').toBeGreaterThan(0);
     expect(classEnd, 'class RoomEditController never closes at column 0')
       .toBeGreaterThan(classAt);
+
+    // Both of those are text searches, and the carver cuts between them, so
+    // everything below is taken over whatever they happened to find. Ask the
+    // parser for the same two numbers. The `+ 1` and `+ 2` are part of the
+    // claim rather than slack: `classAt` is the index OF the newline before
+    // `class`, and `classEnd` the index of the `\n}` that closes it, so the
+    // span the text found is `[classAt + 1, classEnd + 2)` and the two must
+    // match exactly. A second `class RoomEditController` — a declaration
+    // merge, a bad rebase — would make `classEnd` close the first and
+    // `classAt` open it, and the members of the second would be outside
+    // every slice with nothing said; hence the count, not `.find`.
+    const classes = ast.statements.filter((n): n is ts.ClassDeclaration =>
+      ts.isClassDeclaration(n) && n.name?.text === 'RoomEditController');
+    expect(classes.length, 'the parser does not see exactly one top-level '
+      + 'class RoomEditController').toBe(1);
+    const cls = classes[0];
+    expect(classAt + 1, 'the class the text found and the class the parser '
+      + 'found do not start in the same place').toBe(cls.getStart(ast));
+    expect(classEnd + 2, 'the class the text found and the class the parser '
+      + 'found do not end in the same place').toBe(cls.end);
+
     const starts = new Set(members.map((m) => m.start));
+
+    // Now the claim itself, and it is a claim about two machines agreeing:
+    // the carver's units and the parser's members are the same list. Said
+    // as a pattern it cannot be — MEMBER_RE has to be taught every modifier
+    // and every indentation, and three ordinary shapes defeated it before
+    // this was written. A `*gen()` generator, a `123()` numeric name and an
+    // ordinary `private` method indented four spaces instead of two were
+    // each invisible to it, and an ungated room-doc write inside any of the
+    // three passed sixteen of sixteen in silence when the member declared
+    // above it happened to be gated. Measured, all three, both ways: red
+    // behind an ungated neighbour, green behind a gated one. Which is the
+    // worst kind of pass this file can produce, because whether the write
+    // is caught depends on who its neighbour is.
+    //
+    // A member is identified by the line its declaration opens on, not by
+    // the declaration's own offset: a unit starts at column 0 of that line
+    // and the parser's `getStart` points at the first token on it.
+    const declLine = (at: number): number => SRC.lastIndexOf('\n', at - 1) + 1;
+    const decls = new Set(cls.members.map((m) => declLine(m.getStart(ast))));
+    // Two members on one line would leave both sets agreeing while one of
+    // them still has no slice of its own, so the sizes are asserted before
+    // the sets are.
+    expect(decls.size, 'two class members share a declaration line, so at '
+      + 'most one of them can be the start of a slice').toBe(cls.members.length);
+    const unopened = cls.members
+      .map((m) => declLine(m.getStart(ast)))
+      .filter((at) => !starts.has(at))
+      .map((at) => `line ${lineAt(at)}: ${SRC.slice(at, SRC.indexOf('\n', at)).trim()}`);
+    expect(unopened, `MEMBER_RE opened no unit on these, so each one folded \
+into the slice of the member above it and is credited to that member's gate:
+${unopened.join('\n')}`).toEqual([]);
+    // And the other direction, which is what makes the first one mean
+    // something: a unit opened where the parser declares no member is a
+    // real member cut in half, and the half that keeps the gate is not
+    // necessarily the half that holds the write.
+    const phantom = members.filter((m) => !m.carved && !decls.has(m.start))
+      .map((m) => `${m.label}: the parser declares no class member on that line`);
+    expect(phantom, phantom.join('\n')).toEqual([]);
     const unmatched: string[] = [];
     // The class covers `[computed]` names, `'string'` names and `@decorator`
     // lines as well as identifiers. MEMBER_RE matches none of those three,
@@ -2000,15 +2068,35 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       // construction — one was cut at `function`, the other at a `{` the
       // carver brace-matched — so neither needs a member to vouch for it.
       if (u.kind === 'function' || u.carved) { fnUnits.push(u); continue; }
-      const own = parsed.filter((m) => u.start <= m.start && m.start < u.end)
-        .sort((a, b) => a.start - b.start)[0];
+      const mine = parsed.filter((m) => u.start <= m.start && m.start < u.end)
+        .sort((a, b) => a.start - b.start);
+      const own = mine[0];
       if (own === undefined) {
         unsorted.push(`${u.label}: the parser sees no class member declared in its span`);
       } else if (own.name !== u.name) {
         unsorted.push(`${u.label}: the parser reads that declaration as ${
           own.name === '' ? `an unnamed ${own.what}` : own.name}`);
-      } else if (own.fn) {
-        fnUnits.push(u);
+      } else {
+        // Exactly one, not at least one. `own` is the FIRST member the
+        // parser sees in the span and for years the rest were dropped,
+        // which is precisely the fault the canary above now names from the
+        // other end: a member MEMBER_RE cannot open a unit on is a member
+        // sitting inside someone else's slice. Reported here as well
+        // because this is where the consequence lands — the fold is what
+        // decides whether `u` counts as a function or as data — and
+        // because the two messages name different halves of it, the line
+        // that went missing up there and the unit that swallowed it here.
+        //
+        // Same class only. A property holding a class expression has that
+        // class's members inside its span and they are nobody's siblings;
+        // `cls` is carried on each entry for this one comparison.
+        for (const m of mine.filter((p) => p !== own && p.cls === own.cls)) {
+          unsorted.push(`${u.label}: the parser declares ${
+            m.name === '' ? `an unnamed ${m.what}` : `${m.name}, a ${m.what},`
+          } at line ${lineAt(m.start)} inside this unit's span, and MEMBER_RE \
+opened no unit on it, so everything it does is credited to this one's gate`);
+        }
+        if (own.fn) { fnUnits.push(u); }
       }
       // Anything left is a data field, and a field owes the parse nothing.
     }
