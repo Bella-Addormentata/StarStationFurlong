@@ -621,9 +621,42 @@ const unwrap = (e: ts.Expression): ts.Expression =>
     || ts.isTypeAssertionExpression(e))
     ? unwrap(e.expression)
     : e;
+/**
+ * Members the carver is expected to open a unit on, which is not quite
+ * every member the parser reports.
+ *
+ * A `;` alone at class level — a stray one after a method's closing brace,
+ * or a line of its own — parses as a `SemicolonClassElement`. The grammar
+ * gives it no name, no body, no initializer and no children at all, so it
+ * holds nothing that could run and nothing can fold into it. The canary
+ * below asks for one slice per member, and for one commit it asked for one
+ * on these too, which reported a semicolon as a member whose work had been
+ * credited to its neighbour's gate. Measured both ways: `  };` closing a
+ * method and a lone `  ;` each failed two of sixteen with that message and
+ * are silent with this predicate, while the pristine file is sixteen of
+ * sixteen either way.
+ *
+ * Nothing else is excused, and an index signature is the near miss worth
+ * naming. `  [k: string]: unknown;` holds no runtime code either, so its
+ * report reads as the same unfairness — but it is the one member shape
+ * whose declaration line cannot be told from a computed-name METHOD's by
+ * text alone, and `  [KEY]() { … }` does hold code. MEMBER_RE matches
+ * neither. So an index signature arriving in this class is proof that the
+ * carver has a `[`-shaped gap, and the repair is to teach MEMBER_RE that
+ * spelling, which covers the dangerous shape in the same edit. A semicolon
+ * has no such sibling: nothing opening with `;` can carry a write.
+ * Measured: `  [k: string]: unknown;` still fails two of sixteen, and so
+ * does a computed-name method holding an ungated write, bare and with a
+ * `private` in front of it alike.
+ */
+const carvable = (m: ts.ClassElement): boolean => !ts.isSemicolonClassElement(m);
 const collectParsed = (n: ts.Node): void => {
   if (ts.isClassLike(n)) {
     for (const m of n.members) {
+      // Kept out of `parsed` and not merely out of the canary, so the two
+      // readers cannot drift: `unsorted` reports a second member inside a
+      // unit's span, and a semicolon is not one.
+      if (!carvable(m)) { continue; }
       const init = ts.isPropertyDeclaration(m) ? m.initializer : undefined;
       parsed.push({
         start: m.getStart(ast),
@@ -980,9 +1013,15 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // `class`, and `classEnd` the index of the `\n}` that closes it, so the
     // span the text found is `[classAt + 1, classEnd + 2)` and the two must
     // match exactly. A second `class RoomEditController` — a declaration
-    // merge, a bad rebase — would make `classEnd` close the first and
-    // `classAt` open it, and the members of the second would be outside
-    // every slice with nothing said; hence the count, not `.find`.
+    // merge, a bad rebase — would make `classAt` open the first and
+    // `classEnd` close it, leaving every member of the second outside every
+    // slice. A room-doc write out there is not silent: `homeless`, in
+    // 'refuses a write in a nested callback', scans the whole file and
+    // reports a write that lands inside no unit at all. What would go
+    // unsaid is everything else about those members — their gates, their
+    // callers, whether the call graph can reach them — so the duplicate is
+    // named here as a duplicate, by count rather than `.find`, instead of
+    // arriving later as a write with no home.
     const classes = ast.statements.filter((n): n is ts.ClassDeclaration =>
       ts.isClassDeclaration(n) && n.name?.text === 'RoomEditController');
     expect(classes.length, 'the parser does not see exactly one top-level '
@@ -1012,38 +1051,87 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // the declaration's own offset: a unit starts at column 0 of that line
     // and the parser's `getStart` points at the first token on it.
     const declLine = (at: number): number => SRC.lastIndexOf('\n', at - 1) + 1;
-    const decls = new Set(cls.members.map((m) => declLine(m.getStart(ast))));
+    const declared = cls.members.filter(carvable);
+    const decls = new Set(declared.map((m) => declLine(m.getStart(ast))));
     // Two members on one line would leave both sets agreeing while one of
     // them still has no slice of its own, so the sizes are asserted before
     // the sets are.
     expect(decls.size, 'two class members share a declaration line, so at '
-      + 'most one of them can be the start of a slice').toBe(cls.members.length);
-    const unopened = cls.members
+      + 'most one of them can be the start of a slice').toBe(declared.length);
+    const unopened = declared
       .map((m) => declLine(m.getStart(ast)))
       .filter((at) => !starts.has(at))
       .map((at) => `line ${lineAt(at)}: ${SRC.slice(at, SRC.indexOf('\n', at)).trim()}`);
     expect(unopened, `MEMBER_RE opened no unit on these, so each one folded \
 into the slice of the member above it and is credited to that member's gate:
 ${unopened.join('\n')}`).toEqual([]);
-    // And the other direction, which is what makes the first one mean
+    // What that list enforces is stricter than it looks, and saying so is
+    // part of the test: every member of this class has to be spelled one of
+    // the ways MEMBER_RE accepts — two spaces of indent, a `public`,
+    // `private` or `protected` in front, or `constructor`, and an
+    // identifier for a name. A `#private` field, a `[computed]` or
+    // `'string'` name, a `@decorator` on the line above, a bare
+    // `name() {}`, a `static` with no visibility word, a generator
+    // `*gen()`, a numeric `123()`, a tab instead of spaces: each is legal
+    // TypeScript and each fails this test. That is deliberate, and it is a
+    // style rule this file imposes on editMode.ts rather than a claim that
+    // the spelling is wrong.
+    //
+    // The repair when one arrives is to teach MEMBER_RE the spelling and
+    // check what it captures as the NAME — never to exempt the shape here,
+    // because an exemption is silent and the fold it hides is not. The
+    // name half is the part that goes wrong: `public get size(): number`
+    // matches today and MEMBER_RE captures `get`, and until the parser was
+    // asked nothing in this file would have said so. `unsorted`, down in
+    // 'refuses a write in a nested callback', is what asks.
+    //
+    // A second arm used to stand here, re-scanning the raw class text for
+    // `^ {2}[A-Za-z_$#'"@[]` and reporting any such line the carver did not
+    // open a unit on. It was kept for one commit after the parser arm
+    // landed, on the theory that it caught spellings the parser might not
+    // report. It did not: every line it caught, the parser arm caught too,
+    // and what it caught ALONE was prose indented two spaces inside a
+    // template literal and inside a block comment. It matched text, so it
+    // could not tell a declaration from the inside of a string, and both
+    // of those are false reports about a file that is fine.
+    //
+    // And the other direction, which is what makes the first list mean
     // something: a unit opened where the parser declares no member is a
     // real member cut in half, and the half that keeps the gate is not
     // necessarily the half that holds the write.
+    //
+    // Nothing can reach that list today, and the reason is structural
+    // rather than lucky, so it is worth writing down. A line that reads as
+    // a declaration without being one has to sit inside a multi-line
+    // construct: a template literal, a block comment, and a quoted string
+    // continued with a backslash are the only three ways to begin a line
+    // with `  private` and have the compiler not read it as code. A unit
+    // cut at such a line is a span that opens inside that construct and
+    // never closes it — which is the one thing `blankOut` refuses outright.
+    // Measured, all three: `unterminated template literal`, `unterminated
+    // block comment`, `unterminated string literal`, each thrown before a
+    // single test runs, so the suite reports no tests at all rather than a
+    // tidy pass. The fourth way in is a decorated member, where `getStart`
+    // points at the `@` and MEMBER_RE at the `private` a line below, and
+    // that one is reported by `unopened` above — asserted first, so the
+    // test stops there and this list is never built. Measured: a decorated
+    // method fails two of sixteen and the message names the method.
+    //
+    // The list stays, and so does the branch inside it, because an unread
+    // message still has to be true. `the parser declares no class member on
+    // that line` would be a lie about a decorated member, whose declaration
+    // `unopened` has just named one line up; so when a member's span does
+    // cover the line, the message says that instead.
     const phantom = members.filter((m) => !m.carved && !decls.has(m.start))
-      .map((m) => `${m.label}: the parser declares no class member on that line`);
+      .map((m) => {
+        const over = declared.find((d) => d.getStart(ast) <= m.start && m.start < d.end);
+        return over === undefined
+          ? `${m.label}: the parser declares no class member on that line`
+          : `${m.label}: the parser reads that line as the middle of a member `
+            + `declared at line ${lineAt(declLine(over.getStart(ast)))}, so this `
+            + `unit holds the back half of one member and the gate is in the front`;
+      });
     expect(phantom, phantom.join('\n')).toEqual([]);
-    const unmatched: string[] = [];
-    // The class covers `[computed]` names, `'string'` names and `@decorator`
-    // lines as well as identifiers. MEMBER_RE matches none of those three,
-    // so without them here a member declared that way would fold into the
-    // slice above it with nothing said — which is the single failure this
-    // canary exists to make loud. editMode.ts has none of the three today.
-    for (const m of SRC.slice(classAt, classEnd).matchAll(/^ {2}[A-Za-z_$#'"@[][^\n]*/gm)) {
-      const at = classAt + (m.index ?? 0);
-      if (!starts.has(at)) unmatched.push(`line ${lineAt(at)}: ${m[0].trim()}`);
-    }
-    expect(unmatched, `MEMBER_RE missed these, so they folded into the slice above:\n${
-      unmatched.join('\n')}`).toEqual([]);
 
     // Said the other way round, without depending on a member's name: no
     // slice may contain a second member's declaration. This follows from the
@@ -2151,13 +2239,18 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // it was. `borrowed` skips any host it cannot see as `nested`, and a
     // block at class top level sits in the class body, which is not a
     // function body and is therefore in no list here. It can never be
-    // nested. Measured: an ungated write in a four-space-indented block
-    // passes sixteen of sixteen in silence, credited to the gated member
-    // above it, because MEMBER_RE cannot open a unit at `static {` and the
-    // block folds into that member's slice. At two spaces the member canary
-    // does fire — but on the regex gap, naming no write. So the block's own
-    // offsets are kept below, and `borrowed` reads them as a second reason a
-    // host has to answer: not nested, but running at a time no gate reaches.
+    // nested. Measured on the commit that added this collection, and the
+    // numbers have since moved: an ungated write in a four-space-indented
+    // block passed sixteen of sixteen in silence then, credited to the
+    // gated member above it, because MEMBER_RE cannot open a unit at
+    // `static {` and the block folded into that member's slice. The member
+    // canary closes that from the other end now — it asks the parser for
+    // the member list, a static block is in it, and a block MEMBER_RE
+    // cannot carve is reported there at any indentation, write or no
+    // write. What it reports is the missing slice, not the write. So the
+    // block's own offsets are still kept below, and `borrowed` reads them
+    // as a second reason a host has to answer: not nested, but running at
+    // a time no gate reaches.
     //
     // The effect on the other reader runs the other way, and is worth saying
     // plainly rather than calling this a pure gain. `nested` has two
@@ -2173,16 +2266,23 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // deliberately, and cheap because the gate test still catches an ungated
     // write in such a listener — measured, both ways.
     //
-    // And only the static block, because it is the only thing at class top
-    // level that is both unnestable and unnameable. A property initialiser
-    // holding an arrow sits in the same place and also never nests, but
-    // MEMBER_RE opens a unit on the name in front of it, so it answers for
-    // its own gate and the gate test catches an ungated write there.
-    // Measured on four shapes — a braced arrow, a concise one, a public
-    // one, and one nested a level deeper — all four caught, the first three
-    // by the gate test and the last by `borrowed`'s ordinary nested arm.
-    // `static {` offers the regex no name to open on, which is why it alone
-    // fell through and why nothing else needs this treatment.
+    // And only the static block, because it is the only member the GRAMMAR
+    // gives no name to. An earlier version of this comment said it was
+    // "the only thing at class top level that is both unnestable and
+    // unnameable", which is false: a generator `*gen()` is unnestable and
+    // was just as invisible to MEMBER_RE. The difference is that `*gen()`
+    // HAS a name and a pattern can be taught to open a unit on it, which
+    // is how that hole was closed. `static {` offers no name in any
+    // spelling, so no pattern can ever carve it and its offsets have to
+    // come from the parse — which is this block.
+    //
+    // A property initialiser holding an arrow sits in the same place and
+    // also never nests, but MEMBER_RE opens a unit on the name in front of
+    // it, so it answers for its own gate and the gate test catches an
+    // ungated write there. Measured on four shapes — a braced arrow, a
+    // concise one, a public one, and one nested a level deeper — all four
+    // caught, the first three by the gate test and the last by
+    // `borrowed`'s ordinary nested arm.
     const staticOpens = new Set<number>();
     const collectStatic = (n: ts.Node): void => {
       if (ts.isClassStaticBlockDeclaration(n)) {
