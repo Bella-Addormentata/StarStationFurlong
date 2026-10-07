@@ -1730,24 +1730,36 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // this reports nothing today and is one callback away from reporting,
     // which is what a canary is.
     //
-    // It also measured the two shapes that would make a nested body safe
-    // anyway, because they run on the spot rather than later: an
-    // immediately-invoked function, of which this file has none, and a
-    // callback to an array method, of which it has twenty-six — nine
-    // `filter`, eight `find`, four `some`, two `map`, two `findIndex` and
-    // one `every`, all but one of them concise. None holds a write, so
-    // none is reported today; adding concise bodies to `runsLater` below
-    // took that surface from one to twenty-six, which is the honest price
-    // of closing the hole they were hiding.
+    // A nested body that runs on the spot rather than later would be safe
+    // anyway, so the shapes that do were counted — not the ones that came
+    // to mind, but every call site in the file that hands a function
+    // literal to a method, all forty-seven of them:
     //
-    // They still get no exception list, and the twenty-six are the reason
-    // to say why rather than to start one. Deciding that a receiver is an
-    // array means knowing its type, and this file can only read text: a
-    // `.filter(` is a guess the moment anyone writes a `filter` of their
-    // own that defers, and a guess here is a silent pass. So the rule
-    // stays the one that needs no types — a nested body is a nested body —
-    // and the message below names the remedy instead: lift the write out,
-    // or make the callback a unit this file knows.
+    //     16  `.addEventListener`   deferred, the carver's business
+    //      9  `.filter`     8  `.find`      4  `.some`
+    //      2  `.map`        2  `.findIndex` 1  `.every`
+    //      5  `.traverse`   THREE's own walk, and synchronous
+    //
+    // and no immediately-invoked function anywhere. So thirty-one bodies
+    // run on the spot: twenty-six array callbacks, twenty-five of them
+    // concise, and five `.traverse`, all braced. None holds a write, so
+    // none is reported today. Adding concise bodies to `runsLater` below
+    // took the array surface from one to twenty-six — the honest price of
+    // closing the hole they hid — while `.traverse`'s five were braced
+    // and in it all along.
+    //
+    // They still get no exception list, and `.traverse` is why starting
+    // one would be a mistake rather than a chore. Asking whether a
+    // receiver is an array was always a guess: knowing that needs a type,
+    // this file can only read text, and a `.filter(` is wrong the moment
+    // someone writes a `filter` of their own that defers. `.traverse`
+    // shows the question was wrong too — not an array method, runs on the
+    // spot, and five of the six braced synchronous bodies here. The list
+    // would grow by API forever, and every entry is a silent pass when it
+    // is wrong. So the rule stays the one that needs no types — a nested
+    // body is a nested body — and the message below names the remedy
+    // instead: lift the write out, or make the callback a unit this file
+    // knows.
     //
     // Which braces open a function body is a question about the grammar,
     // and the grammar is not small enough to answer by looking backwards
@@ -1768,16 +1780,50 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // and the carver line up with it unchanged. Exact by construction, and
     // there is nothing left here to be wrong about.
     //
-    // Not asserted: the parse's own diagnostics. `parseDiagnostics` is not
-    // in the compiler's public types, and the one public route to them —
-    // `createProgram(...).getSyntacticDiagnostics()` — probes node_modules
-    // 495 times for this file's own imports even under `noResolve`, which
-    // is precisely the resolution this whole file exists to avoid. It is
-    // not needed: a parse that went wrong moves the body count in one
-    // direction or the other (164 → 169 on a stray `(((`, → 65 on a
-    // truncated file), and both directions land in `bodiless` or
-    // `misaligned` below, loudly.
     const ast = ts.createSourceFile(SRC_PATH, SRC, ts.ScriptTarget.Latest, true);
+
+    // And then ask whether that parse went well, because every check below
+    // inherits the answer. This block first argued the question away: a
+    // broken parse moves the body count, the count feeds `bodiless` and
+    // `misaligned`, so corruption fails loudly there. Two of three cases
+    // hold — a stray `(((` inside the class body takes 164 bodies to 169,
+    // a file truncated in half to 65 — and the third does not. The same
+    // `(((` appended at EOF leaves the count at exactly 164 and the file
+    // passes, sixteen of sixteen. A silent pass, defended by a count that
+    // cannot see it, in the file whose whole argument is that an unsound
+    // check is worse than none.
+    //
+    // `parseDiagnostics`, on the node above, is the direct answer and is
+    // not in the compiler's public types. `transpileModule` reaches the
+    // same parser's complaints through types that are — `reportDiagnostics`
+    // in, `diagnostics` out — and reaches them without a `Program`, which
+    // is the part that matters: measured on this file it makes zero
+    // `ts.sys` calls, resolves no import, reads nothing under
+    // `node_modules`, and costs 238 ms. It parses the text a second time
+    // rather than reporting on the node above, so it is handed the same
+    // target; what it attests is that this text holds no syntax error,
+    // which is exactly the claim being relied on.
+    //
+    // It reports the EOF case the count misses, at `4346: Expression
+    // expected.` A false failure here would be worse than the gap, so the
+    // legal constructs a later refactor might add were measured too:
+    // `const enum`, `enum`, `namespace`, `declare`, `abstract`, a
+    // decorator, a static block, `satisfies`, an `accessor` field, and a
+    // type re-exported without `export type` — that last being the
+    // complaint this route is known for. All ten report nothing.
+    //
+    // Five, because one syntax error cascades: the unbalanced `}` probe
+    // reports 1116 of them and the first is the one worth reading.
+    const syntax = ts.transpileModule(SRC, {
+      fileName: SRC_PATH,
+      reportDiagnostics: true,
+      compilerOptions: { target: ts.ScriptTarget.Latest },
+    }).diagnostics ?? [];
+    const unparsed = syntax.slice(0, 5).map((d) => `${lineAt(d.start ?? 0)}: ${
+      ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
+    expect(unparsed, `the compiler rejects the text this scan parsed${
+      syntax.length > 5 ? ` (${syntax.length} errors, first five)` : ''}:\n${
+      unparsed.join('\n')}`).toEqual([]);
     const bodies: { open: number; end: number }[] = [];
     // Function, method, constructor, getter, setter, arrow, function
     // expression: `isFunctionLike` is all seven. It also admits the
@@ -1789,14 +1835,27 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     //
     // A class static block is the one other thing in the grammar with a
     // braced body, and `isFunctionLike` does not admit it — it is not a
-    // signature. There are none in editMode.ts, and the member canary
-    // would name one anyway, since MEMBER_RE cannot start a unit at
-    // `static {`. It is collected regardless, because leaving the single
-    // known gap open and arguing it is covered elsewhere is how the walk
-    // this replaced went wrong.
+    // signature. It is deliberately NOT collected here. It was, for one
+    // commit, and that was a weakening rather than the gap-closing it was
+    // written up as: both checks reading this list ask whether SOME body
+    // falls inside a span, so every entry added to it makes them easier to
+    // satisfy, never harder. MEMBER_RE cannot start a unit at `  static {`,
+    // which was offered as the reason the block was harmless — it is the
+    // reason it was not. Unable to start a unit of its own, the block
+    // falls inside the span of the member declared above it, and a
+    // bodiless member above one, an overload signature say, stopped being
+    // reported: vouched for by a brace that is not its own. Measured both
+    // ways on exactly that shape — `bodiless` names `probeOverload` with
+    // the block out of this list, and says nothing with it in.
+    //
+    // Which is the rule stated twenty lines below `runsLater`, reached
+    // from the other side: this list is braces that are function bodies,
+    // and folding anything else in lets a unit satisfy `bodiless` with
+    // something that is not one. The block belongs in `runsLater`, which
+    // asks what runs rather than what is a body, and it is collected
+    // there.
     const collect = (n: ts.Node): void => {
-      if ((ts.isFunctionLike(n) || ts.isClassStaticBlockDeclaration(n))
-          && 'body' in n && n.body !== undefined && ts.isBlock(n.body)) {
+      if (ts.isFunctionLike(n) && 'body' in n && n.body !== undefined && ts.isBlock(n.body)) {
         bodies.push({ open: n.body.getStart(ast), end: n.body.end });
       }
       ts.forEachChild(n, collect);
@@ -1821,12 +1880,16 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
      */
     const members: { start: number; name: string; fn: boolean; what: string }[] = [];
     /**
-     * `(() => { … })`, `(() => { … }) as H`, `(() => { … }) satisfies H`:
-     * three ways to write an initializer that is still a function, and the
-     * parser reports the wrapper. Ask what is underneath before calling the
-     * member data.
+     * `(() => { … })` and `… as H`, `… satisfies H`, `…!`, `<H>…`: five
+     * ways to write an initializer that is still a function, and the parser
+     * reports the wrapper. Ask what is underneath before calling the member
+     * data. All five were checked against the project's own `tsc` over a
+     * function literal, because a wrapper the compiler rejects is not a
+     * shape this needs to handle — which is what rules out
+     * `ExpressionWithTypeArguments`, a call's type arguments rather than a
+     * cast, and TS2635 over a literal.
      *
-     * None of the three is in editMode.ts today. It is unwrapped anyway
+     * None of the five is in editMode.ts today. They are unwrapped anyway
      * because a miss here is quiet exactly where this file cares: a
      * wrapped function sorts as a field, never joins `fnUnits`, and so
      * never reaches `bodiless` to be named. An ungated write inside one is
@@ -1837,10 +1900,16 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
      * ungated write: with the unwrap that arm fails twice and `bodiless`
      * names `probeW`; without it, once, and nothing says which member went
      * missing. Same species as the brace walk above — a guess about syntax
-     * — and this one costs three predicates to stop guessing about.
+     * — and this one costs five predicates to stop guessing about.
+     *
+     * The return type is load-bearing, not decoration: without it a
+     * self-referential arrow is TS7023, `implicitly has return type 'any'`,
+     * and `tsc` exits 2.
      */
     const unwrap = (e: ts.Expression): ts.Expression =>
-      (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression(e))
+      (ts.isParenthesizedExpression(e) || ts.isAsExpression(e)
+        || ts.isSatisfiesExpression(e) || ts.isNonNullExpression(e)
+        || ts.isTypeAssertionExpression(e))
         ? unwrap(e.expression)
         : e;
     const collectMembers = (n: ts.Node): void => {
@@ -1914,7 +1983,7 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // that has drifted away from the source fails here just as loudly.
     const bodiless = fnUnits
       .filter((u) => !bodies.some((b) => u.start <= b.open && b.open < u.end))
-      .map((u) => `${u.label}: the parse found no function body inside it`);
+      .map((u) => `${u.label}: the parse found no braced function body inside it`);
     expect(bodiless, bodiless.join('\n')).toEqual([]);
 
     // A concise arrow has no brace, so it is in none of the lists above —
@@ -1937,6 +2006,34 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       ts.forEachChild(n, collectConcise);
     };
     collectConcise(ast);
+
+    // The class static block, collected here instead of in `bodies`. It
+    // runs once, at class-definition time, which is earlier than anything
+    // a gate could have decided — so a write in one is a hazard, and a
+    // listener registered in one defers a body that `nested` has to be
+    // able to see. Neither is in editMode.ts today; both are collected
+    // because "there are none" is the argument the brace walk above made.
+    //
+    // In this list it can only strengthen, which is why it is the right
+    // list. `nested` grows only by genuine lexical containment — offsets,
+    // not inference — so a body inside a block becomes nested, which is
+    // what it is, and no existing body stops being. Measured on a deferred
+    // arrow inside a block holding an ungated write: `borrowed` names it
+    // with the block in this list, and is silent without it.
+    //
+    // A carved listener inside a block is a different case, and not this
+    // one — the carver makes it a unit, and `borrowed` skips units by
+    // design. What the block buys there is the removal of a false report:
+    // without it the parse cannot see the listener nested inside anything,
+    // and `misaligned` says so against the member declared above the
+    // block, which did not register it.
+    const collectStatic = (n: ts.Node): void => {
+      if (ts.isClassStaticBlockDeclaration(n)) {
+        runsLater.push({ open: n.body.getStart(ast), end: n.body.end });
+      }
+      ts.forEachChild(n, collectStatic);
+    };
+    collectStatic(ast);
 
     const nested = new Set(runsLater
       .filter((b) => runsLater.some((o) => o.open < b.open && b.end <= o.end))
