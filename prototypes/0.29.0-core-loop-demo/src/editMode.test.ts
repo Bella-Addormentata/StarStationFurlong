@@ -2062,6 +2062,17 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // report for the deferred-body nesting `borrowed` needs. Taken
     // deliberately, and cheap because the gate test still catches an ungated
     // write in such a listener — measured, both ways.
+    //
+    // And only the static block, because it is the only thing at class top
+    // level that is both unnestable and unnameable. A property initialiser
+    // holding an arrow sits in the same place and also never nests, but
+    // MEMBER_RE opens a unit on the name in front of it, so it answers for
+    // its own gate and the gate test catches an ungated write there.
+    // Measured on four shapes — a braced arrow, a concise one, a public
+    // one, and one nested a level deeper — all four caught, the first three
+    // by the gate test and the last by `borrowed`'s ordinary nested arm.
+    // `static {` offers the regex no name to open on, which is why it alone
+    // fell through and why nothing else needs this treatment.
     const staticOpens = new Set<number>();
     const collectStatic = (n: ts.Node): void => {
       if (ts.isClassStaticBlockDeclaration(n)) {
