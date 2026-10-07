@@ -125,13 +125,13 @@ const WRITERS = [
 const GATES = ['this.mayWriteRoomDoc()', 'canEditRoom()'];
 
 /**
- * A gate name, matched only where it is a WHOLE identifier.
+ * A call, matched only where its leading name is a WHOLE identifier.
  *
- * Built here rather than at each reader, because there are two of them and
- * the previous commit had to fix this in both — it word-bounded `GATE_RE`
- * and `GATE_IN_RE` with identical code on two lines 1015 apart, which is
- * the arrangement that lets one be tightened and the other forgotten. One
- * definition, consumed twice, cannot drift.
+ * Built here rather than at each reader, because there are many of them and
+ * one earlier commit had to fix this in two at once — it word-bounded
+ * `GATE_RE` and `GATE_IN_RE` with identical code on two lines 1015 apart,
+ * which is the arrangement that lets one be tightened and the other
+ * forgotten. One definition, consumed everywhere, cannot drift.
  *
  * The boundary is a lookbehind and not `\b`, and that is the correction.
  * `\b` is defined against `\w`, which is `[A-Za-z0-9_]` — so it does NOT
@@ -158,9 +158,19 @@ const GATES = ['this.mayWriteRoomDoc()', 'canEditRoom()'];
  * accepted 9, no real spelling lost, and the hit count on editMode.ts is
  * unchanged at 9 and 7 — so this tightening moves no verdict today. It is
  * the next rename that it is here for.
+ *
+ * Takes any call and not only a gate, because the named tests below assert
+ * one specific spelling each — `canEditRoom()` for the write outside the
+ * class, `this.mayWriteRoomDoc()` for the 🔭 button — and the teardown test
+ * asserts three calls that are not gates but are asserted for the same
+ * reason: a quiet pass there is a protective call believed to exist where
+ * there is none. Only the escaping is call-shaped (`.`, `(` and `)`); the
+ * boundary question is the same one for every name.
  */
-const gateMatchers = (): RegExp[] => GATES
-  .map((g) => new RegExp(`(?<![\\p{ID_Continue}$#])${g.replace(/[.()]/g, '\\$&')}`, 'u'));
+const boundedCall = (call: string): RegExp => new RegExp(
+  `(?<![\\p{ID_Continue}$#])${call.replace(/[.()]/g, '\\$&')}`, 'u');
+
+const gateMatchers = (): RegExp[] => GATES.map(boundedCall);
 
 /**
  * Every relative module specifier in a file, in any of the seven forms, as
@@ -1020,6 +1030,31 @@ const callPattern = (u: Unit): RegExp => (u.kind === 'member'
 const bodyOf = (name: string): string =>
   members.filter((m) => m.name === name).map((m) => m.body).join('\n');
 
+/**
+ * The same text, in the view that hides string and template TEXT.
+ *
+ * `bodyOf` returns `stripComments(...)`: comments blanked, strings KEPT. That
+ * is the right view for WRITES — a writer named inside a message is a loud
+ * false positive, which gets fixed. It is the wrong view for anything a test
+ * asserts the EXISTENCE of, because there the same looseness runs the other
+ * way: `showHint('ask canEditRoom() first')` satisfies
+ * `toContain('canEditRoom()')` and manufactures the coverage the assertion
+ * was written to demand. The generic arm has read gates from `gateBody` for
+ * exactly this reason, and said so; the four named tests below were still
+ * reading `bodyOf`. Measured on fixtures, the shipped readers accepted 4 of
+ * 5 adversarial spellings of `canEditRoom()` — quoted, `notMy`-prefixed,
+ * `$`-prefixed and `this.#`-private — and 4 of 4 of
+ * `this.mayWriteRoomDoc()`; through this view and `boundedCall`, 0.
+ *
+ * Offsets stay interchangeable with `bodyOf`'s, which the ordering
+ * assertions depend on: `blankOut` and `blankDecl` are both
+ * length-preserving, the filter and its order are the same expression, and
+ * the separator is the same one character. So a gate offset found here is
+ * directly comparable with a write offset found there.
+ */
+const gateBodyOf = (name: string): string =>
+  members.filter((m) => m.name === name).map((m) => m.gateBody).join('\n');
+
 describe('edit mode: no room-doc write without a live owner check (source scan)', () => {
   it('finds the class at all, so a silent zero-method pass is impossible', () => {
     // Every assertion below is vacuously true on an empty member list. This is
@@ -1726,9 +1761,10 @@ ${unopened.join('\n')}`).toEqual([]);
     // found where there is none quietly manufactures coverage.
     //
     // The boundary itself, and why it is a lookbehind rather than the `\b`
-    // the first repair used, is at `gateMatchers`. It lives at module scope
+    // the first repair used, is at `boundedCall`. It lives at module scope
     // because `GATE_IN_RE` below needs the identical question asked, and
-    // asking it twice is how the first repair came to be half a repair.
+    // asking it twice is how the first repair came to be half a repair —
+    // nine readers ask it now, two through here and the rest by name.
     const GATE_RE = gateMatchers();
     const WRITER_RE = WRITERS.map((w) => new RegExp(`\\b${w}${CALL}`));
     const firstAt = (body: string, res: readonly RegExp[]): number => {
@@ -2741,11 +2777,11 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // against the carved spans by `misaligned` above, and widening it is
     // not this commit's business.
     // Identifier-bounded, so `notMycanEditRoom()` does not read as a gate,
-    // and `$canEditRoom()` does not either — see `gateMatchers`, which is
-    // now the single definition both readers call. It used to be this line
-    // and the gate test's own, spelled identically 1015 lines apart, and the
-    // boundary they shared was `\b`, which is blind to `$` and to every
-    // non-ASCII identifier character.
+    // and `$canEditRoom()` does not either — see `boundedCall`, which is now
+    // the single definition every reader in the file calls. It used to be
+    // this line and the gate test's own, spelled identically 1015 lines
+    // apart, and the boundary they shared was `\b`, which is blind to `$`
+    // and to every non-ASCII identifier character.
     //
     // The RECEIVER is still unchecked: `strangersRoom.canEditRoom()` counts
     // as an owner check, because the `.` satisfies any boundary. That is a
@@ -3261,7 +3297,8 @@ opened no unit on it, so everything it does is credited to this one's gate`);
   });
 
   it('starts a session behind the same gate, so a write is never the first check', () => {
-    expect(bodyOf('enter')).toContain('canEditRoom()');
+    expect(gateBodyOf('enter'), 'enter opens a session with no owner check')
+      .toMatch(boundedCall('canEditRoom()'));
   });
 
   it('ends the session on a refusal rather than refusing one write at a time', () => {
@@ -3270,12 +3307,17 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // 🖼 WALLPAPER still on screen and beginCarry still ungated — all of which
     // would refuse in turn. exit() is also what restores a carry or door drag
     // that was in flight, so the two properties are the same line.
-    const body = bodyOf('mayWriteRoomDoc');
-    expect(body).toContain('canEditRoom()');
-    expect(body).toContain('this.exit()');
-    expect(body).toContain('this.hideContextMenu()');
+    // Read in the gate view, and not because any of these three is a gate.
+    // `exit()` and `hideContextMenu()` are the teardown this test exists to
+    // pin, and a test that accepts them quoted in a message pins nothing —
+    // see `gateBodyOf`. The hint is matched the same way for the same reason.
+    const gateBody = gateBodyOf('mayWriteRoomDoc');
+    expect(gateBody).toMatch(boundedCall('canEditRoom()'));
+    expect(gateBody).toMatch(boundedCall('this.exit()'));
+    expect(gateBody).toMatch(boundedCall('this.hideContextMenu()'));
     // The reason must be hinted AFTER the teardown, or exit()'s own hints win.
-    expect(body.indexOf('showHint(perm.reason)')).toBeGreaterThan(body.indexOf('this.exit()'));
+    expect(gateBody.search(boundedCall('showHint(perm.reason)')))
+      .toBeGreaterThan(gateBody.search(boundedCall('this.exit()')));
   });
 
   it('re-asks before the 🔭 button writes, not once when the session opened', () => {
@@ -3287,9 +3329,13 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // the same defect class as the five writers this file was written for,
     // and the generic scan above catches it; this names it, so the failure
     // says which button rather than which method.
+    //
+    // The gate is read in the string-blanked view and the write in the view
+    // that keeps strings — the same asymmetry, and the same reason for it,
+    // as the generic arm above. See `gateBodyOf`.
     const body = bodyOf('cycleCupola');
     expect(body, 'cycleCupola not found').not.toBe('');
-    const gate = body.indexOf('this.mayWriteRoomDoc()');
+    const gate = gateBodyOf('cycleCupola').search(boundedCall('this.mayWriteRoomDoc()'));
     expect(gate, 'the 🔭 button writes the floor plan with no owner check')
       .toBeGreaterThanOrEqual(0);
     expect(gate, 'the owner check must come before the first write, not after')
@@ -3305,7 +3351,9 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // because there is no session here to end.
     const f = functions.find((x) => x.name === 'settleCupolaConflicts');
     expect(f, 'settleCupolaConflicts not found').toBeDefined();
-    const gate = f!.body.indexOf('canEditRoom()');
+    // `functions` carries the same three views as `members`, so the gate is
+    // read string-blanked and the write is not — see `gateBodyOf`.
+    const gate = f!.gateBody.search(boundedCall('canEditRoom()'));
     const write = f!.body.search(/\bwriteCupolaWall\s*\(/);
     expect(write, 'settleCupolaConflicts no longer writes — is this test still earning its place?')
       .toBeGreaterThanOrEqual(0);
