@@ -544,6 +544,93 @@ const classAt = SRC.indexOf('\nclass RoomEditController {');
 const classEnd = SRC.indexOf('\n}', classAt);
 
 /**
+ * The file as the compiler reads it, parsed once.
+ *
+ * Every check that needs to know what a brace or a declaration IS asks
+ * this tree rather than a pattern; the long note in 'gates every method
+ * that writes' is why the patterns were given up on. It is parsed here
+ * rather than inside the test that first needed it because the member
+ * canary needs the same answer, and the canary's whole claim is that the
+ * carver and the parser agree about where the members are — a claim two
+ * separate parses could not make, since a later edit is free to change
+ * the options of one and not the other.
+ *
+ * `setParentNodes` is the fourth argument and is what makes `getStart`
+ * work. Nothing here loads, resolves or executes editMode.ts: this is the
+ * text already read off disk, handed to a parser.
+ */
+const ast = ts.createSourceFile(SRC_PATH, SRC, ts.ScriptTarget.Latest, true);
+
+/**
+ * Every class member the parser can see, by where its declaration
+ * starts — the same question MEMBER_RE answers by pattern, asked of
+ * something that cannot be fooled by indentation or by a modifier it
+ * has not been taught.
+ *
+ * `fn` is the one bit `unsorted`, down in the gate test, needs: is this
+ * member a function at all. A method, constructor, getter or setter is.
+ * A property is
+ * not — unless it holds one, `private onTick = () => { … }`, which the
+ * regex this replaced read as a field and dropped on the floor.
+ *
+ * Deliberately not "has a body": an overload signature and an abstract
+ * method are both functions with nothing to run, and answering YES
+ * here is what sends them to `bodiless` to be named rather than sorted
+ * quietly into the bucket for data.
+ */
+const parsed: { start: number; name: string; fn: boolean; what: string }[] = [];
+/**
+ * `(() => { … })` and `… as H`, `… satisfies H`, `…!`, `<H>…`: five
+ * ways to write an initializer that is still a function, and the parser
+ * reports the wrapper. Ask what is underneath before calling the member
+ * data. All five were checked against the project's own `tsc` over a
+ * function literal, because a wrapper the compiler rejects is not a
+ * shape this needs to handle — which is what rules out
+ * `ExpressionWithTypeArguments`, a call's type arguments rather than a
+ * cast, and TS2635 over a literal.
+ *
+ * None of the five is in editMode.ts today. They are unwrapped anyway
+ * because a miss here is quiet exactly where this file cares: a
+ * wrapped function sorts as a field, never joins `fnUnits`, and so
+ * never reaches `bodiless` to be named. An ungated write inside one is
+ * still caught — the gate test works off the write, not off this flag
+ * — so what is lost is the early warning, not the catch.
+ *
+ * Measured both ways, on a concise arrow behind an `as` cast holding an
+ * ungated write: with the unwrap that arm fails twice and `bodiless`
+ * names `probeW`; without it, once, and nothing says which member went
+ * missing. Same species as the brace walk `collect` replaced, down in
+ * the gate test — a guess about syntax — and this one costs five
+ * predicates to stop guessing about.
+ *
+ * The return type is load-bearing, not decoration: without it a
+ * self-referential arrow is TS7023, `implicitly has return type 'any'`,
+ * and `tsc` exits 2.
+ */
+const unwrap = (e: ts.Expression): ts.Expression =>
+  (ts.isParenthesizedExpression(e) || ts.isAsExpression(e)
+    || ts.isSatisfiesExpression(e) || ts.isNonNullExpression(e)
+    || ts.isTypeAssertionExpression(e))
+    ? unwrap(e.expression)
+    : e;
+const collectParsed = (n: ts.Node): void => {
+  if (ts.isClassLike(n)) {
+    for (const m of n.members) {
+      const init = ts.isPropertyDeclaration(m) ? m.initializer : undefined;
+      parsed.push({
+        start: m.getStart(ast),
+        name: ts.isConstructorDeclaration(m) ? 'constructor'
+          : (m.name !== undefined && ts.isIdentifier(m.name) ? m.name.text : ''),
+        fn: ts.isFunctionLike(m) || (init !== undefined && ts.isFunctionLike(unwrap(init))),
+        what: ts.SyntaxKind[m.kind],
+      });
+    }
+  }
+  ts.forEachChild(n, collectParsed);
+};
+collectParsed(ast);
+
+/**
  * A named region of source the scan can look inside. `kind` is not
  * decoration: it decides how the unit is CALLED, and therefore how the call
  * graph below finds its callers — `this.foo(` for a member, bare `foo(` for a
@@ -1780,7 +1867,9 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // and the carver line up with it unchanged. Exact by construction, and
     // there is nothing left here to be wrong about.
     //
-    const ast = ts.createSourceFile(SRC_PATH, SRC, ts.ScriptTarget.Latest, true);
+    // The parse itself is at module scope — `ast`, declared with the
+    // class bounds — because the member canary needs the same tree and
+    // two parses of one file are two chances to disagree.
 
     // And then ask whether that parse went well, because every check below
     // inherits the answer. This block first argued the question away: a
@@ -1883,73 +1972,6 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     };
     collect(ast);
 
-    /**
-     * Every class member the parser can see, by where its declaration
-     * starts — the same question MEMBER_RE answers by pattern, asked of
-     * something that cannot be fooled by indentation or by a modifier it
-     * has not been taught.
-     *
-     * `fn` is the one bit the sort below needs: is this member a function
-     * at all. A method, constructor, getter or setter is. A property is
-     * not — unless it holds one, `private onTick = () => { … }`, which the
-     * regex this replaced read as a field and dropped on the floor.
-     *
-     * Deliberately not "has a body": an overload signature and an abstract
-     * method are both functions with nothing to run, and answering YES
-     * here is what sends them to `bodiless` to be named rather than sorted
-     * quietly into the bucket for data.
-     */
-    const members: { start: number; name: string; fn: boolean; what: string }[] = [];
-    /**
-     * `(() => { … })` and `… as H`, `… satisfies H`, `…!`, `<H>…`: five
-     * ways to write an initializer that is still a function, and the parser
-     * reports the wrapper. Ask what is underneath before calling the member
-     * data. All five were checked against the project's own `tsc` over a
-     * function literal, because a wrapper the compiler rejects is not a
-     * shape this needs to handle — which is what rules out
-     * `ExpressionWithTypeArguments`, a call's type arguments rather than a
-     * cast, and TS2635 over a literal.
-     *
-     * None of the five is in editMode.ts today. They are unwrapped anyway
-     * because a miss here is quiet exactly where this file cares: a
-     * wrapped function sorts as a field, never joins `fnUnits`, and so
-     * never reaches `bodiless` to be named. An ungated write inside one is
-     * still caught — the gate test works off the write, not off this flag
-     * — so what is lost is the early warning, not the catch.
-     *
-     * Measured both ways, on a concise arrow behind an `as` cast holding an
-     * ungated write: with the unwrap that arm fails twice and `bodiless`
-     * names `probeW`; without it, once, and nothing says which member went
-     * missing. Same species as the brace walk above — a guess about syntax
-     * — and this one costs five predicates to stop guessing about.
-     *
-     * The return type is load-bearing, not decoration: without it a
-     * self-referential arrow is TS7023, `implicitly has return type 'any'`,
-     * and `tsc` exits 2.
-     */
-    const unwrap = (e: ts.Expression): ts.Expression =>
-      (ts.isParenthesizedExpression(e) || ts.isAsExpression(e)
-        || ts.isSatisfiesExpression(e) || ts.isNonNullExpression(e)
-        || ts.isTypeAssertionExpression(e))
-        ? unwrap(e.expression)
-        : e;
-    const collectMembers = (n: ts.Node): void => {
-      if (ts.isClassLike(n)) {
-        for (const m of n.members) {
-          const init = ts.isPropertyDeclaration(m) ? m.initializer : undefined;
-          members.push({
-            start: m.getStart(ast),
-            name: ts.isConstructorDeclaration(m) ? 'constructor'
-              : (m.name !== undefined && ts.isIdentifier(m.name) ? m.name.text : ''),
-            fn: ts.isFunctionLike(m) || (init !== undefined && ts.isFunctionLike(unwrap(init))),
-            what: ts.SyntaxKind[m.kind],
-          });
-        }
-      }
-      ts.forEachChild(n, collectMembers);
-    };
-    collectMembers(ast);
-
     // The parse has to have found the file, or every check below passes on
     // an empty list — and it has to be checked against something that fails
     // when it is half working, which a count of its own output never does.
@@ -1978,7 +2000,7 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       // construction — one was cut at `function`, the other at a `{` the
       // carver brace-matched — so neither needs a member to vouch for it.
       if (u.kind === 'function' || u.carved) { fnUnits.push(u); continue; }
-      const own = members.filter((m) => u.start <= m.start && m.start < u.end)
+      const own = parsed.filter((m) => u.start <= m.start && m.start < u.end)
         .sort((a, b) => a.start - b.start)[0];
       if (own === undefined) {
         unsorted.push(`${u.label}: the parser sees no class member declared in its span`);
