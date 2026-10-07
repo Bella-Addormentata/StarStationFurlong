@@ -2160,6 +2160,26 @@ ${unopened.join('\n')}`).toEqual([]);
     // see it: the call is within the enclosing member’s offsets, so a unit
     // does contain it — the wrong one. The test straight after this is the
     // one that asks which.
+    //
+    // A write in a module-scope function's PARAMETER DEFAULT is a third
+    // case, and this arm is silent on it correctly rather than by accident.
+    // `FREE_RE` starts the unit at the declaration's first keyword, so the
+    // span covers the parameter list and a unit genuinely does contain the
+    // write. Measured, on `export function settleStray(plan =
+    // roomDoc.getMap('floorPlan').set(...))` with a gate as the body's
+    // first statement: the span is [85,218), the write sits at 123, and
+    // this arm finds it an owner and says nothing.
+    //
+    // The GATE arm is what catches that shape. A parameter default is
+    // textually before the body, so the write at 123 precedes the body's
+    // gate at 175, and that arm credits a unit as gated only where the gate
+    // precedes the FIRST effect. Note this is not the `deferred` / `param`
+    // machinery doing it: `stored` bounds that to the class, so it never
+    // sees a module-scope default and does not need to. The class-side twin
+    // of this shape is probed and the module-scope one is its unprobed
+    // sibling; when it is written, the result to hold it to is RED from the
+    // gate arm, because SILENT would mean the ordering rule was defeated by
+    // something this reading did not model.
     const bare = stripComments(SRC);
     const homeless: string[] = [];
     for (const w of WRITERS) {
