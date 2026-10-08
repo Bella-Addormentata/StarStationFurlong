@@ -23,6 +23,14 @@
  * is. It matches text, so it believes a gate and a write in the same method
  * are on the same path even when they sit in mutually exclusive branches —
  * it checks the gate comes FIRST, which is necessary and not sufficient.
+ * Measured, three shapes that pass here and should not: a gate nested in an
+ * `if` the write sits outside of, a gate present only in an `else` arm, and
+ * a gate inside a `for` over a collection that may be empty. Both arms
+ * agree on all three, because the ordering rule and `gatedInside` compare
+ * the same offsets the same way, so this is the one measured route to
+ * silence on a write that can genuinely run ungated. Closing it means
+ * asking whether the gate's branch DOMINATES the write, which is a
+ * different machine and not a tightening of this one.
  * "First" now means before the first EFFECT, counting a call to anything
  * that reaches a write as well as a write of its own, because a method that
  * names no writer used to skip the ordering test entirely and lend its gate
@@ -164,11 +172,44 @@ const GATES = ['this.mayWriteRoomDoc()', 'canEditRoom()'];
  * class, `this.mayWriteRoomDoc()` for the 🔭 button — and the teardown test
  * asserts three calls that are not gates but are asserted for the same
  * reason: a quiet pass there is a protective call believed to exist where
- * there is none. Only the escaping is call-shaped (`.`, `(` and `)`); the
- * boundary question is the same one for every name.
+ * there is none. Only the escaping is call-shaped; the boundary question is
+ * the same one for every name.
  */
-const boundedCall = (call: string): RegExp => new RegExp(
-  `(?<![\\p{ID_Continue}$#])${call.replace(/[.()]/g, '\\$&')}`, 'u');
+const boundedCall = (call: string): RegExp => {
+  // EVERY regex metacharacter, not only the three a method call happens to
+  // contain today. This escaped `/[.()]/` and left `?`, `*`, `+`, `[`, `]`,
+  // `{`, `}`, `|`, `^`, `$` and `\` live inside a value that reads like a
+  // literal method name — and the result is not a stricter matcher but a
+  // wronger one, in the silent direction. Measured: the old escaping built
+  // `canEditRoom?\.\(\)` from `canEditRoom?.()`, which REJECTS the spelling
+  // it was asked for and ACCEPTS `canEditRoom.()` and `canEditRoo.()`. That
+  // is a gate seen where there is none, which is the one thing this helper
+  // exists to prevent. `mayWrite[0]()` built a character class and matched
+  // `mayWrite0()`; `a+b()` matched `aaab()`. Of six spellings a rename could
+  // plausibly introduce, the old form missed five of its own.
+  //
+  // Nothing moves today: all five spellings the file asks for —
+  // `this.mayWriteRoomDoc()`, `canEditRoom()`, `this.exit()`,
+  // `this.hideContextMenu()`, `showHint(perm.reason)` — contain nothing
+  // outside `.()`, so each builds a byte-identical pattern, and the hit
+  // counts on editMode.ts are unchanged at 9, 7, 8, 7 and 3. It is the next
+  // spelling this is here for, exactly as the lookbehind above is.
+  const lit = call.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // A call that escapes to nothing leaves the LOOKBEHIND as the whole
+  // pattern, and a lookbehind-only pattern matches the empty string at
+  // offset 0 of almost any span. That is silence, not a crash, and it is not
+  // confined to one reader: `firstAt` takes `search(...)` → 0 as a gate at
+  // offset 0, earlier than every write, so the generic arm credits the unit
+  // as gated; `gatedInside`'s exec loop returns `true` on its first
+  // iteration whenever the host opens before the write. Measured both ways.
+  // Ten readers ask this question, so a guard in any one of them leaves nine
+  // — it is refused here instead, once, where the pattern is built, and
+  // loudly, because an empty entry in `GATES` is a mistake and not a shape.
+  if (lit.length === 0) {
+    throw new Error('editMode.test boundedCall: empty call matches everywhere');
+  }
+  return new RegExp(`(?<![\\p{ID_Continue}$#])${lit}`, 'u');
+};
 
 const gateMatchers = (): RegExp[] => GATES.map(boundedCall);
 
@@ -1041,10 +1082,24 @@ const bodyOf = (name: string): string =>
  * `toContain('canEditRoom()')` and manufactures the coverage the assertion
  * was written to demand. The generic arm has read gates from `gateBody` for
  * exactly this reason, and said so; the four named tests below were still
- * reading `bodyOf`. Measured on fixtures, the shipped readers accepted 4 of
- * 5 adversarial spellings of `canEditRoom()` — quoted, `notMy`-prefixed,
- * `$`-prefixed and `this.#`-private — and 4 of 4 of
- * `this.mayWriteRoomDoc()`; through this view and `boundedCall`, 0.
+ * reading `bodyOf`.
+ *
+ * The ratio this used to quote — "4 of 5 adversarial spellings of
+ * `canEditRoom()`" — named only the four it counted as ACCEPTED: quoted,
+ * `notMy`-prefixed, `$`-prefixed and `this.#`-private. The fifth, the
+ * REJECTED one, was recorded neither here nor in 344a4b91's message, so the
+ * ratio was not a thing a reader could check. Re-measured over a named set
+ * of eleven spellings, with `boundedCall` rebuilt from its own source text
+ * so the measurement cannot drift away from the matcher: the old reader's
+ * `includes('canEditRoom()')` accepts 9 of the 11 and `boundedCall` accepts
+ * 3, so the fix closes 6. Of the 3 kept, one is the real spelling, one is
+ * `this?.canEditRoom()` — a real gate, correctly kept — and one is the
+ * quoted row, which THIS VIEW rejects rather than the boundary. Two rows,
+ * `canEditRoom?.()` and `canEditRoom ()`, are rejected by both columns, so
+ * whichever of them was the unnamed fifth it was never a hole: an
+ * unrecognised gate leaves its write uncovered and reported, which is the
+ * loud direction. `this.mayWriteRoomDoc()` was 4 of 4; through this view
+ * and `boundedCall`, 0.
  *
  * Offsets stay interchangeable with `bodyOf`'s, which the ordering
  * assertions depend on: `blankOut` and `blankDecl` are both
@@ -1764,7 +1819,11 @@ ${unopened.join('\n')}`).toEqual([]);
     // the first repair used, is at `boundedCall`. It lives at module scope
     // because `GATE_IN_RE` below needs the identical question asked, and
     // asking it twice is how the first repair came to be half a repair —
-    // nine readers ask it now, two through here and the rest by name.
+    // ten readers ask it now: two through `gateMatchers()` — this `GATE_RE`
+    // and `GATE_IN_RE` in the borrowed arm — and eight by name, in the four
+    // tests that name one unit each. The comment said nine, which was the
+    // count on the day it was written; the structure is what to read, not
+    // the number, and the structure is those two routes.
     const GATE_RE = gateMatchers();
     const WRITER_RE = WRITERS.map((w) => new RegExp(`\\b${w}${CALL}`));
     const firstAt = (body: string, res: readonly RegExp[]): number => {
@@ -2165,21 +2224,53 @@ ${unopened.join('\n')}`).toEqual([]);
     // case, and this arm is silent on it correctly rather than by accident.
     // `FREE_RE` starts the unit at the declaration's first keyword, so the
     // span covers the parameter list and a unit genuinely does contain the
-    // write. Measured, on `export function settleStray(plan =
-    // roomDoc.getMap('floorPlan').set(...))` with a gate as the body's
-    // first statement: the span is [85,218), the write sits at 123, and
-    // this arm finds it an owner and says nothing.
+    // write.
     //
-    // The GATE arm is what catches that shape. A parameter default is
-    // textually before the body, so the write at 123 precedes the body's
-    // gate at 175, and that arm credits a unit as gated only where the gate
-    // precedes the FIRST effect. Note this is not the `deferred` / `param`
-    // machinery doing it: `stored` bounds that to the class, so it never
-    // sees a module-scope default and does not need to. The class-side twin
-    // of this shape is probed and the module-scope one is its unprobed
-    // sibling; when it is written, the result to hold it to is RED from the
-    // gate arm, because SILENT would mean the ordering rule was defeated by
-    // something this reading did not model.
+    // That much was right. The rest of what this comment said was not, and
+    // the module-scope probe set it called for — `probesM`, spliced above
+    // the class instead of inside it — is what found that out. Three
+    // claims, each reasoned from the code rather than run:
+    //
+    //   - The offsets it quoted ([85,218), write at 123, gate at 175) were
+    //     measured on a sample whose write was spelled
+    //     `roomDoc.getMap('floorPlan').set(...)`, which is not a `WRITERS`
+    //     name, so no arm could see it. On that sample the gate arm is
+    //     SILENT as well, for want of any effect at all — the opposite of
+    //     the verdict the comment claimed for it.
+    //
+    //   - "The GATE arm is what catches that shape" is half of it. Spelled
+    //     with a real writer, `M01` (gate as the body's first statement)
+    //     and `M05` (no gate anywhere) are both RED 2f: the gate arm and
+    //     the arm below both speak.
+    //
+    //   - "This is not the `deferred` / `param` machinery doing it:
+    //     `stored` bounds that to the class" is false, and it is the one
+    //     that matters. `collectDeferred` walks the whole file and its
+    //     parameter-default half is gated on `ts.isFunctionLike` alone;
+    //     `innermost` applies no class bound either; and `stored` is one
+    //     DISJUNCT of `borrows`, short-circuited whenever the host is a
+    //     deferred span. `f47f346d` had said so correctly, and this
+    //     comment then contradicted it in the next commit.
+    //
+    // `M07` settles it, being built so the two arms must disagree:
+    // `function probeM07(ok = canEditRoom().ok, plan =
+    // writeCupolaWall(null))`. The gate is textually before the write, so
+    // the ordering rule reads the unit as gated and the gate arm says
+    // nothing; a parameter list cannot branch, so the write happens on
+    // every call whatever the gate returned. Measured RED 1f, and the only
+    // arm that speaks is the one below, naming a parameter default. At
+    // module scope that arm is not a second opinion — it is the only thing
+    // between this shape and silence, which is exactly the jurisdiction the
+    // sentence above denied it had.
+    //
+    // The controls that let those be read: `M02`, gate then write, SILENT —
+    // so the splice point does not make shapes fail by itself; `M03`, an
+    // ungated write, RED — so the region is examined at all; `M04`, a
+    // default that gates itself in the same expression, SILENT — so the arm
+    // discriminates rather than refusing every default. The two shapes the
+    // paragraph above leaves to THIS arm are measured there too: `M06`, a
+    // module-scope arrow const, and `M08`, a module-scope IIFE, are both
+    // RED through this test and through no other.
     const bare = stripComments(SRC);
     const homeless: string[] = [];
     for (const w of WRITERS) {
@@ -2736,6 +2827,26 @@ opened no unit on it, so everything it does is credited to this one's gate`);
       if (ts.isCallExpression(n)) {
         let callee: ts.Node = n.expression;
         while (ts.isParenthesizedExpression(callee)) { callee = callee.expression; }
+        // The unwrap strips PARENTHESES and nothing else, so four spellings
+        // of an immediately-invoked body are not recognised. Measured, on
+        // the AST: `(0, () => {…})()` and `((0, () => {…}))()` leave a
+        // binary comma expression as the callee, and
+        // `(function () {…}).call(this)` and `.apply(this, [])` leave a
+        // property access. `!function () {…}()` and any depth of plain
+        // parentheses ARE recognised, and async / generator callees go to
+        // `iifeLater` below as intended.
+        //
+        // Unrecognised is the LOUD direction, which is why this is written
+        // down rather than fixed: the body stays in `elsewhere`, so a gate
+        // inside it reads as unreachable, so the write is REPORTED. A false
+        // positive costs one glance; the opposite mistake — calling a body
+        // init-time when it is not — is the one that bought silence before
+        // and is what the paragraph above is about. `editMode.ts` has none
+        // of the four today (`iifeOpens` and `iifeLater` are both empty —
+        // see the measurement at `borrows`), so widening this would move no
+        // verdict and would add a new way to assert "runs now" about
+        // something that may not. The day one of those spellings appears,
+        // the test says so by failing.
         if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) {
           // `async` and `function*` callees are not init-time, so neither is
           // excused. A generator's body does not run on the call at all --
@@ -2752,10 +2863,19 @@ opened no unit on it, so everything it does is credited to this one's gate`);
           // Excluding them from the excusal is only half of it. They have to
           // be REMEMBERED, because the reason they are not init-time is not
           // the reason anything else in the cascade below is not init-time,
-          // and the one the cascade reached for was `stored` — measured on
-          // `Z05`, whose only failing arm said the write "is a value a
-          // member stores and runs when something calls it". Nothing stores
-          // an immediately-invoked function and nothing calls it later. An
+          // and on `Z05` the branch the cascade reached for was `stored`:
+          // its only failing arm said the write "is a value a member stores
+          // and runs when something calls it". Nothing stores an
+          // immediately-invoked function and nothing calls it later.
+          //
+          // WHICH branch it is depends on where the IIFE sits, and this
+          // comment used to read as though it did not. `Z05` is a class
+          // FIELD initialiser, so nothing encloses the generator body and
+          // `stored` is the branch left standing; the same IIFE inside a
+          // method body is a `runsLater` span strictly inside the method's,
+          // so `nested` holds it instead — measured on `Z34`, and that is
+          // what `iifeOpens` is for (the reasoning is at `inNested`). The
+          // reason to remember these is the same wherever they sit. An
           // async generator counts as the generator case: its body waits for
           // a `.next()` as well, so that is the first thing a reader needs
           // to know about it.
@@ -2792,9 +2912,22 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // defect the gate test says it had and fixed. It did NOT make this arm
     // the only gate reader a quoted gate could fool, which is what this
     // comment claimed when it was written: the four tests that name one unit
-    // each were reading `bodyOf`, which keeps strings, and a later commit had
-    // to route all four through `gateBodyOf`. Two of them accepted a mutation
-    // of the real file that the whole suite then passed.
+    // each were reading `bodyOf`, which keeps strings, and a later commit
+    // moved all four onto the string-blanked view. Three of them reach it
+    // through `gateBodyOf`; the fourth, `settleCupolaConflicts`, reads
+    // `f!.gateBody` off `functions`, because it is the one room-doc write
+    // OUTSIDE the class and `gateBodyOf` filters `members`. Same view and
+    // the same reason, a different list — this used to say all four went
+    // through `gateBodyOf`, which would need that helper to see a
+    // module-scope function, and by construction it cannot.
+    //
+    // Two of the four accepted a mutation of the real file that the whole
+    // sixteen-test suite then passed: `enter`'s gate renamed to the
+    // lookalike `$canEditRoom()`, and mayWriteRoomDoc's `this.exit()`
+    // demoted to a string. 344a4b91's message carries that run's table,
+    // five mutants with the suite run twice over each and both tracked
+    // files restored byte-for-byte; it is cited here rather than redone,
+    // because reproducing it means mutating a tracked file.
     // `blankOut` is length-preserving, pinned by the lexer's own test, so an
     // offset in either copy is the same offset in SRC.
     const bareGate = blankOut(SRC, true);
@@ -2878,6 +3011,25 @@ opened no unit on it, so everything it does is credited to this one's gate`);
       // search, and `search` only ever answers about the earliest. Matches
       // arrive in increasing order, so the first one at or past `limit` ends
       // this gate's chances and there is no point reading further.
+      //
+      // `g` is added instead of `search` precisely because of that, and a
+      // `g`-flagged loop is the one place in this file whose TERMINATION
+      // depends on the pattern. It cannot match the empty string: every
+      // `GATE_IN_RE` entry comes from `boundedCall`, which refuses a call
+      // that escapes to nothing, so each pattern ends in at least one
+      // required character. The dependency is stated rather than guarded
+      // again here because a second guard would be unreachable, and because
+      // the empty case is not merely a hang — `boundedCall` has the
+      // measurement, and silence is the half of it that matters.
+      //
+      // The two returns below are what make even the degenerate case finite:
+      // a zero-length match gives `g === b.open`, and every member of
+      // `elsewhere` is filtered to `r.open > b.open`, so `unreachable(g)` is
+      // false by construction and iteration one returns. Measured, on the
+      // lookbehind-only pattern: 1 iteration with these returns in place,
+      // non-terminating with them removed. Which is the answer to "is a
+      // `break` needed" as well — it is not, and `return false` is the
+      // honest spelling, since no later match can take a different branch.
       return GATE_IN_RE.some((re) => {
         const all = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
         for (let m = all.exec(span); m !== null; m = all.exec(span)) {
@@ -2906,15 +3058,27 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         // position, with no preference between the two kinds.
         //
         // This was `innermost(runsLater) ?? innermost(deferred)` for one
-        // commit, and the `??` made the deferred list unreachable in the
-        // position where it mattered most. A parameter default sits inside
-        // the body of whatever function declares it, so that body is always
-        // an enclosing `runsLater` span, so `innermost(runsLater)` always
-        // answered and `deferred` was never consulted. The commit that
-        // started collecting parameter defaults as deferred and the commit
-        // that introduced the `??` were the same commit: it built the
-        // mechanism and then made it dead code, and left a comment below
-        // asserting the mechanism was live. Measured, the escape it left is
+        // commit, and the `??` hid the deferred list from the host choice
+        // exactly where it mattered. Not everywhere, and the difference is
+        // worth being exact about: a `bodies` span starts at its body's
+        // `{`, so a function's OWN parameter list lies in front of it, and
+        // `innermost(runsLater)` is undefined for the defaults of a
+        // method, a constructor, a module-scope function, or an arrow in a
+        // field initialiser -- there the right-hand side did run.
+        // Measured, 4 of 7 shapes fell through to it, and all four
+        // parameter defaults on today's editMode.ts (lines 848, 1438,
+        // 2981 and 3432) fall through, so the `??` and this union pick the
+        // same host on the file as it stands. What the `??` swallowed is
+        // the default of a function nested inside another function's body,
+        // where an enclosing span always exists and always won -- an arrow
+        // assigned inside a gated method, which is the one shape where the
+        // gate ran at a different time from the write, and so the one
+        // shape the deferred list was built for. Two commits, not one:
+        // a660bf36 started collecting parameter defaults and read them
+        // through `deferredOpens`; f47f346d added `innermost` and the `??`
+        // one commit later, hiding them from the host choice in the
+        // position that had motivated collecting them. Measured, the
+        // escape it left is
         //
         //   private probe(): void {
         //     if (!this.mayWriteRoomDoc()) { return; }
@@ -2994,6 +3158,20 @@ opened no unit on it, so everything it does is credited to this one's gate`);
         const inNested = runsLater.some((b) => b.open <= at && at < b.end
           && !iifeOpens.has(b.open)
           && (nested.has(b.open) || staticOpens.has(b.open)));
+        // Measured on today's editMode.ts, so a reader knows what this arm
+        // is and is not currently doing: `staticOpens`, `iifeOpens` and
+        // `iifeLater` are all EMPTY, and `deferred` is four entries, every
+        // one a parameter default, holding `[]`, `'interior'`, `false` and
+        // `false` — none of them containing a WRITERS call, and one of them
+        // (line 848) above `classAt` entirely. So `deferredOpens.has(...)`
+        // is false at every writer site the arm visits and `gatedInside` is
+        // not consulted at all. None of this machinery moves a verdict on
+        // the file as it stands; it is here for the shape that arrives next,
+        // which is why the probe sets exist and why a measurement on them is
+        // the only thing that can check it. Re-measurable in isolation —
+        // `collectIife`, `collectStatic` and `collectDeferred` need only the
+        // AST — and worth re-measuring, because the day one of those sets
+        // stops being empty is the day this paragraph stops being true.
         const borrows = (deferredOpens.has(host.open) || stored(host))
           && !inNested && !gatedInside(host, at);
         if ((!inNested && !nested.has(host.open) && !staticOpens.has(host.open)
