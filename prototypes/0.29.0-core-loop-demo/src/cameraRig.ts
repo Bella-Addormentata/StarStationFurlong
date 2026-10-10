@@ -28,6 +28,7 @@
 
 import * as THREE from 'three';
 import { showHint } from './hud';
+import { isFormFieldTarget } from './typingFocus';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -396,8 +397,9 @@ export function initCameraRig(rigGuards: RigGuards): void {
     else if (e.shiftKey && e.code === 'Period') dir = 1;  // Shift+. → '>'
     if (dir === 0) return;
     if (e.repeat) return;
-    const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+    // A focused <select> turns its options with these arrows; so does a
+    // range slider or a radio group.
+    if (isFormFieldTarget(e.target as HTMLElement | null)) return;
     if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
     if (!canRotate()) return; // silent — keys shouldn't toast like misclicks
     e.preventDefault();

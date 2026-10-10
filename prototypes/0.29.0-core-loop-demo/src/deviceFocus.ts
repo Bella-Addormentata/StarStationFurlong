@@ -44,6 +44,7 @@ import * as THREE from 'three';
 import { rotateIsoOffset } from './cameraRig';
 import type { DeviceTarget, DeviceUI } from './devices';
 import type { Player } from './player';
+import { isFormFieldTarget } from './typingFocus';
 
 /**
  * PREPARING (TR2 of #35) sits between arrival and the camera ease: devices
@@ -113,7 +114,7 @@ class DeviceFocusController {
     window.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+      if (target && isFormFieldTarget(target)) {
         if (this.host && this.host.contains(target)) target.blur(); // blur only
         return;
       }

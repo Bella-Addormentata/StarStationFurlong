@@ -16,7 +16,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { isTextEntryTarget } from './typingFocus';
+import { isFormFieldTarget, isTextEntryTarget } from './typingFocus';
 import { InputManager } from './input';
 
 describe('isTextEntryTarget', () => {
@@ -98,6 +98,40 @@ describe('isTextEntryTarget', () => {
     expect(isTextEntryTarget({ tagName: 'SPAN', isContentEditable: true })).toBe(true);
     expect(isTextEntryTarget({ isContentEditable: true })).toBe(true);
     expect(isTextEntryTarget({ tagName: 'SPAN', isContentEditable: false })).toBe(false);
+  });
+});
+
+describe('isFormFieldTarget — the hotkey guard', () => {
+  it('refuses every surface isTextEntryTarget does', () => {
+    for (const t of [
+      { tagName: 'INPUT' },
+      { tagName: 'INPUT', type: 'number' },
+      { tagName: 'TEXTAREA' },
+      { tagName: 'SPAN', isContentEditable: true },
+    ]) {
+      expect(isFormFieldTarget(t)).toBe(true);
+    }
+  });
+
+  it('also refuses the <input> types that take keys without typing them', () => {
+    // The arrows move a range slider and a radio group, Space ticks a
+    // checkbox, Enter submits: the old hand-rolled guards refused every
+    // <input>, and the hotkeys they protected must keep refusing these.
+    for (const type of ['range', 'radio', 'checkbox', 'submit', 'button', 'color']) {
+      expect(isFormFieldTarget({ tagName: 'INPUT', type })).toBe(true);
+      expect(isTextEntryTarget({ tagName: 'INPUT', type })).toBe(false);
+    }
+  });
+
+  it('covers the <select> the old guards missed — its arrows turned the camera', () => {
+    expect(isFormFieldTarget({ tagName: 'SELECT' })).toBe(true);
+  });
+
+  it('lets the world have keys pressed anywhere else', () => {
+    expect(isFormFieldTarget(null)).toBe(false);
+    expect(isFormFieldTarget({ tagName: 'CANVAS' })).toBe(false);
+    expect(isFormFieldTarget({ tagName: 'BODY' })).toBe(false);
+    expect(isFormFieldTarget({ tagName: 'BUTTON' })).toBe(false);
   });
 });
 

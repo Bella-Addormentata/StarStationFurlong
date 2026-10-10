@@ -10,6 +10,7 @@ import { renderWithFarPass } from "./farOrbitView";
 import type { World } from "./world";
 import type { DoorId } from "./doors";
 import type { InputManager } from "./input";
+import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { YjsSync } from "./network/YjsSync";
@@ -7684,11 +7685,7 @@ function setupSpacePhoneOverlay() {
     }
     if (!container || !container.classList.contains("active")) return;
     const target = e.target as HTMLElement | null;
-    if (
-      target &&
-      target !== chatInput &&
-      (target.tagName === "INPUT" || target.tagName === "TEXTAREA")
-    ) {
+    if (target && target !== chatInput && isFormFieldTarget(target)) {
       return; // e.g. room-name editor owns Escape for cancel
     }
     if (currentPhoneView !== "home") {
@@ -7745,8 +7742,7 @@ function setupSpacePhoneOverlay() {
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" || miniChatOpen) return;
     if (container?.classList.contains("active")) return;
-    const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (isFormFieldTarget(e.target as HTMLElement | null)) return;
     const welcome = document.getElementById("welcome");
     if (welcome && getComputedStyle(welcome).display !== "none") return;
     if (roomEdit.isEditModeActive() || isDeviceFocusActive()) return;

@@ -125,6 +125,7 @@ import { isRouteRunning } from './pilotRoute';
 import { clearRobotConfig, readRobotConfig } from './robotDoc';
 import { keptRoutePartTaken, routePortTaken, tanksLockedByRoute, ROUTE_PORT_REFUSAL, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
+import { isFormFieldTarget } from './typingFocus';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
 
@@ -1228,7 +1229,7 @@ class RoomEditController {
   constructor() {
     // Esc precedence — same e.target guards as the phone (#31) and
     // device-focus (#33 D0.3) handlers, deferring to both owners:
-    //  (1) a focused INPUT/TEXTAREA owns Esc (room-name editor, chat) —
+    //  (1) a focused form field owns Esc (room-name editor, chat) —
     //      guard on e.target, not document.activeElement (#31's lesson).
     //  (2) phone open → #31's handler owns Esc.
     //  (3) device focus live → deviceFocus's handler owns Esc (can't overlap
@@ -1236,8 +1237,7 @@ class RoomEditController {
     //  (4) otherwise Esc exits an active edit mode.
     window.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape' || !this.active) return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+      if (isFormFieldTarget(e.target as HTMLElement | null)) {
         return;
       }
       if (document.getElementById('spacephone-container')?.classList.contains('active')) {
@@ -1314,8 +1314,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || !this.addWindowMode) return;
       if (e.key !== '[' && e.key !== ']') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       this.cycleWindowSurface(e.key === ']' ? 1 : -1);
     });
@@ -1337,8 +1336,7 @@ class RoomEditController {
       else if (e.key === 'ArrowDown') dh = -WINDOW_RESIZE_STEP;
       else if (e.key === 'f' || e.key === 'F') auto = true;
       else return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       if (armed) {
         if (auto) this.resetGhostAuto();
@@ -1354,8 +1352,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || !this.carrying) return;
       if (e.key !== 'r' && e.key !== 'R') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       this.rotateCarry();
     });
 
@@ -1367,8 +1364,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || this.carrying || this.doorDrag || !this.selectedId) return;
       if (e.key !== 'x' && e.key !== 'X' && e.key !== 'Delete') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       this.removeSelected();
     });

@@ -93,6 +93,7 @@ import {
 import { showHint } from './hud';
 import type { World } from './world';
 import type { Player } from './player';
+import { isFormFieldTarget } from './typingFocus';
 
 // ── Palette: dashed AMBER — deliberately unlike any shipped UI ───────────────
 const DEV_AMBER = '#FFB300';
@@ -1292,8 +1293,7 @@ export function initDevMenu(getWorldRef: GetWorld): void {
   });
 
   window.addEventListener('keydown', (e) => {
-    const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+    if (isFormFieldTarget(e.target as HTMLElement | null)) {
       return; // typing ` or Esc in an input never drives the dev menu
     }
     if (e.code === 'Backquote') {

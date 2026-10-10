@@ -22,6 +22,7 @@ import { isExteriorOrbitView, setExteriorActive, setExteriorOrbitView } from './
 import { isDeviceFocusActive } from './deviceFocus';
 import { rotateIsoOffset } from './cameraRig';
 import { STAND_EYE_OFFSET } from './player';
+import { isFormFieldTarget } from './typingFocus';
 
 // Base (yaw-0) isometric offsets for the ortho levels — the camera rig
 // (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
@@ -333,9 +334,10 @@ export class MultiScaleZoomView {
     });
 
     window.addEventListener('keydown', (e) => {
-      // Ignore toggling when focused in inputs
-      const active = document.activeElement;
-      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      // Ignore toggling when focused in inputs. The event's TARGET, not
+      // document.activeElement: an editor that replaceWith()s its input
+      // before the event bubbles leaves activeElement on <body> (#31).
+      if (isFormFieldTarget(e.target as HTMLElement | null)) {
         return;
       }
 
