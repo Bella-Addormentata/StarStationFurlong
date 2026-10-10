@@ -1,8 +1,8 @@
 /**
- * 🔭 The space view's three passes (farOrbitView.renderWithFarPass): the sky
- * alone, the far scene after a depth clear, then the station on top after
- * another, and every bit of borrowed state put back afterwards, even when a
- * pass throws. The renderer is a stand-in that records what each render saw;
+ * 🔭 The space view's passes (farOrbitView.renderWithFarPass): the sky alone,
+ * then the station on top after a depth clear in the station view, or the
+ * far scene instead in the planet view (issue 218), and every bit of
+ * borrowed state put back afterwards, even when a pass throws. The renderer is a stand-in that records what each render saw;
  * the scenes are real.
  */
 
@@ -16,8 +16,12 @@ vi.stubGlobal('window', fakeWindow);
 let SKY_LAYER: typeof import('./farOrbitView').SKY_LAYER;
 let renderWithFarPass: typeof import('./farOrbitView').renderWithFarPass;
 let setFarPassActive: typeof import('./farOrbitView').setFarPassActive;
+let setFarPassOrbit: typeof import('./farOrbitView').setFarPassOrbit;
+let shapeOfPlan: typeof import('./farOrbitView').shapeOfPlan;
+let fallbackShape: typeof import('./farOrbitView').fallbackShape;
+let bodyKey: typeof import('./farOrbitView').bodyKey;
 beforeAll(async () => {
-  ({ SKY_LAYER, renderWithFarPass, setFarPassActive } = await import('./farOrbitView'));
+  ({ SKY_LAYER, renderWithFarPass, setFarPassActive, setFarPassOrbit, shapeOfPlan, fallbackShape, bodyKey } = await import('./farOrbitView'));
 });
 
 /** What one render call saw. */
@@ -99,7 +103,7 @@ describe('renderWithFarPass', () => {
     expect(t.renderer.clearDepth).not.toHaveBeenCalled();
   });
 
-  it('draws the sky alone, then the far scene, then the station on top', () => {
+  it('station view: the sky alone, then the station on top', () => {
     const t = setup();
     setFarPassActive(true);
     t.render();
@@ -108,13 +112,39 @@ describe('renderWithFarPass', () => {
     expect(t.log).toEqual([
       // 1. The sky alone, shown for the pass, clearing with the background.
       { scene: 'main', mask: skyOnly.mask, skyVisible: [true, true], planetVisible: false, background: t.background, autoClear: true },
-      // 2. The far scene, over the sky's colour but not its depth.
-      'clearDepth',
-      { scene: 'far', mask: t.cameraMask, skyVisible: [true, true], planetVisible: false, background: t.background, autoClear: false },
-      // 3. The station, with no sky and no clearing background.
+      // 2. The station, with no sky and no clearing background.
       'clearDepth',
       { scene: 'main', mask: t.cameraMask, skyVisible: [false, false], planetVisible: false, background: null, autoClear: false },
     ]);
+  });
+
+  it('planet view: the sky alone, then the far scene, with no isometric station over it', () => {
+    const t = setup();
+    setFarPassActive(true);
+    setFarPassOrbit(true);
+    t.render();
+    const skyOnly = new THREE.Layers();
+    skyOnly.set(SKY_LAYER);
+    expect(t.log).toEqual([
+      { scene: 'main', mask: skyOnly.mask, skyVisible: [true, true], planetVisible: false, background: t.background, autoClear: true },
+      // The far scene, over the sky's colour but not its depth.
+      'clearDepth',
+      { scene: 'far', mask: t.cameraMask, skyVisible: [true, true], planetVisible: false, background: t.background, autoClear: false },
+    ]);
+  });
+
+  it('back in to the station view, and no planet view outside the space view', () => {
+    const t = setup();
+    setFarPassActive(true);
+    setFarPassOrbit(true);
+    setFarPassOrbit(false);
+    t.render();
+    expect(t.log.filter((e) => e !== 'clearDepth').map((e) => (e as Seen).scene)).toEqual(['main', 'main']);
+    setFarPassActive(false);
+    setFarPassOrbit(true);
+    t.log.length = 0;
+    t.render();
+    expect(t.log).toHaveLength(1);
   });
 
   it('puts everything back after the passes', () => {
@@ -138,11 +168,12 @@ describe('renderWithFarPass', () => {
     expect(t.renderer.autoClear).toBe(false);
   });
 
-  for (const [pass, n] of [['sky', 1], ['far scene', 2], ['station', 3]] as const) {
+  for (const [pass, n, orbit] of [['sky', 1, false], ['station', 2, false], ['far scene', 2, true]] as const) {
     it(`puts everything back when the ${pass} pass throws`, () => {
       const t = setup();
       t.sky[0].visible = true; // a deck: its nebula shows
       setFarPassActive(true);
+      setFarPassOrbit(orbit);
       t.failOnRender((i) => i === n);
       expect(() => t.render()).toThrow('render failed');
       expect(t.sky.map((o) => o.visible)).toEqual([true, false]);
@@ -156,11 +187,61 @@ describe('renderWithFarPass', () => {
   it('renders plainly again once the space view closes', () => {
     const t = setup();
     setFarPassActive(true);
+    setFarPassOrbit(true);
     t.render();
     setFarPassActive(false);
     t.log.length = 0;
     t.render();
     expect(t.log).toHaveLength(1);
     expect(t.log[0]).toMatchObject({ scene: 'main', mask: t.cameraMask, background: t.background });
+  });
+});
+
+describe("a station's shape in the planet view (issue 218)", () => {
+  const mod = (roomId: string, x: number, z: number, links: string[], kind: 'module' | 'ship' = 'module') => ({
+    roomId, name: roomId, x, z, rotY: kind === 'ship' ? Math.PI / 2 : 0, halfX: 6, halfZ: 9, hops: 0, kind, here: false,
+    gates: [], pairedFromInside: true,
+    links: links.map((to, i) => ({ doorId: `d${i}`, toRoomId: to, berth: kind === 'ship' })),
+  });
+
+  it('keeps every module where the atlas puts it, docked ships too, and each connection once', () => {
+    const plan = {
+      rootRoomId: 'a',
+      modules: [mod('a', 0, 0, ['b', 'c']), mod('b', 0, -28, ['a']), mod('c', 17, -35, ['a'])],
+      ships: [mod('s', -20, 0, ['a'], 'ship')],
+      bounds: { minX: -26, maxX: 23, minZ: -44, maxZ: 9 },
+    };
+    const shape = shapeOfPlan(plan)!;
+    expect(shape.modules).toEqual([
+      { x: 0, z: 0, rotY: 0, halfX: 6, halfZ: 9, ship: false },
+      { x: 0, z: -28, rotY: 0, halfX: 6, halfZ: 9, ship: false },
+      { x: 17, z: -35, rotY: 0, halfX: 6, halfZ: 9, ship: false },
+      { x: -20, z: 0, rotY: Math.PI / 2, halfX: 6, halfZ: 9, ship: true },
+    ]);
+    // a–b and a–c from both ends, and the ship's berth: three links.
+    expect(shape.links).toEqual([
+      { ax: 0, az: 0, bx: 0, bz: -28 },
+      { ax: 0, az: 0, bx: 17, bz: -35 },
+      { ax: -20, az: 0, bx: 0, bz: 0 },
+    ]);
+  });
+
+  it("keeps a station whose id is the viewer's apart from the viewer", () => {
+    const at = { x: 0, y: 0, z: 0 };
+    const viewer = { id: 'viewer', kind: 'station' as const, name: 'HOME', position: at, angle: 0, modules: 1, own: true };
+    const namesake = { id: 'viewer', kind: 'station' as const, name: 'VIEWER', position: at, angle: 0, modules: 1 };
+    expect(bodyKey(viewer)).not.toBe(bodyKey(namesake));
+  });
+
+  it('has none when the atlas does not know the station', () => {
+    expect(shapeOfPlan({ rootRoomId: 'x', modules: [], ships: [], bounds: { minX: 0, maxX: 0, minZ: 0, maxZ: 0 } })).toBeUndefined();
+  });
+
+  it('falls back to a grid of default modules, one per module counted', () => {
+    const grid = fallbackShape(10);
+    expect(grid.modules).toHaveLength(10);
+    expect(grid.links).toHaveLength(0);
+    const xs = new Set(grid.modules.map((m) => m.x));
+    expect(xs.size).toBe(2); // eight to a row, two rows
   });
 });
