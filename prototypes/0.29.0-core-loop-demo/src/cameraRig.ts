@@ -1,6 +1,6 @@
 /**
  * Camera Rig — 45° isometric view rotation.
- * Inputs: bottom-left HUD arrows, ←/→, and Shift+< / Shift+> hotkeys.
+ * Inputs: the top-right HUD cross's arrows, ←/→, and Shift+< / Shift+> hotkeys.
  *
  * The room camera has always been LOCKED to a single three-quarter angle
  * (renderer.ts parks it on the +X/+Z diagonal looking at the origin). That
@@ -76,6 +76,14 @@ interface RigGuards {
    *  a stately continuous yaw so the station slowly rotates on screen.
    *  Injected like the other probes to stay import-cycle-free. */
   isExteriorDrifting?: () => boolean;
+  /** ➕➖ #223: the HUD zoom buttons step the same levels as the +/- keys
+   *  (MultiScaleZoomView). Injected, not imported: zoom.ts imports this. */
+  zoom?: {
+    stepIn: () => void;
+    stepOut: () => void;
+    canZoomIn: () => boolean;
+    canZoomOut: () => boolean;
+  };
 }
 
 /** 🎬 Exterior drift rate (rad/s) — one revolution ≈ 5 minutes. */
@@ -134,11 +142,37 @@ export function resetStationBias(): void {
 
 let leftBtn: HTMLButtonElement | null = null;
 let rightBtn: HTMLButtonElement | null = null;
+let zoomInBtn: HTMLButtonElement | null = null;
+let zoomOutBtn: HTMLButtonElement | null = null;
 let angleChip: HTMLDivElement | null = null;
-/** The whole rotate HUD (arrows + chip) — gated on body.in-room per frame. */
+/** The whole view HUD (rotate arrows, chip, zoom) — gated on body.in-room per frame. */
 let hudWrap: HTMLDivElement | null = null;
 /** Last availability pushed to the DOM — avoids per-frame style writes. */
 let lastEnabledState: boolean | null = null;
+const lastZoomState = { in: null as boolean | null, out: null as boolean | null };
+
+/** Dim a HUD button that would do nothing right now. */
+function setButtonEnabled(btn: HTMLButtonElement, enabled: boolean): void {
+  btn.style.opacity = enabled ? '1' : '0.35';
+  btn.style.cursor = enabled ? 'pointer' : 'default';
+}
+
+/** ➕➖ Grey out a zoom step that would do nothing (only touch DOM on flips). */
+function refreshZoomButtons(): void {
+  const zoom = guards?.zoom;
+  if (!zoom) return;
+  const busy = guards!.isCameraBusy();
+  const canIn = !busy && zoom.canZoomIn();
+  const canOut = !busy && zoom.canZoomOut();
+  if (zoomInBtn && canIn !== lastZoomState.in) {
+    lastZoomState.in = canIn;
+    setButtonEnabled(zoomInBtn, canIn);
+  }
+  if (zoomOutBtn && canOut !== lastZoomState.out) {
+    lastZoomState.out = canOut;
+    setButtonEnabled(zoomOutBtn, canOut);
+  }
+}
 
 // ── Public math API (consumed by zoom.ts / deviceFocus.ts / input.ts) ────────
 
@@ -231,8 +265,9 @@ export function updateCameraRig(deltaTime: number): void {
   // enforcement per frame (belt) on top of the CSS body:not(.in-room) rule
   // (braces) — the inline display here must agree with the class gate.
   if (hudWrap) {
-    hudWrap.style.display = document.body.classList.contains('in-room') ? 'flex' : 'none';
+    hudWrap.style.display = document.body.classList.contains('in-room') ? 'grid' : 'none';
   }
+  refreshZoomButtons();
 
   // 🎬 Space-view drift: a slow continuous yaw UNDER the detent machinery —
   // both yaws advance together so the user's 45° arrow steps still tween
@@ -282,9 +317,7 @@ export function updateCameraRig(deltaTime: number): void {
   if (enabled !== lastEnabledState) {
     lastEnabledState = enabled;
     for (const btn of [leftBtn, rightBtn]) {
-      if (!btn) continue;
-      btn.style.opacity = enabled ? '1' : '0.35';
-      btn.style.cursor = enabled ? 'pointer' : 'default';
+      if (btn) setButtonEnabled(btn, enabled);
     }
   }
 
@@ -304,9 +337,10 @@ export function updateCameraRig(deltaTime: number): void {
 // ── Init: HUD buttons + arrow-key bindings ────────────────────────────────────
 
 /**
- * Build the bottom-left rotation cluster and bind ←/→ keys. Call once from
- * main.ts init, after the zoom view exists. Sits to the right of the DEV
- * button (left: 24px) in the same bottom row.
+ * Build the top-right view cross and bind ←/→ keys. Call once from main.ts
+ * init, after the zoom view exists. #223 (owner request): zoom joins rotate
+ * in one cross — + above, − below, ◀ angle ▶ across the middle — in the
+ * top-right corner, across the top from the DEV button in the top-left.
  */
 export function initCameraRig(rigGuards: RigGuards): void {
   guards = rigGuards;
@@ -316,23 +350,28 @@ export function initCameraRig(rigGuards: RigGuards): void {
   wrap.id = 'camera-rotate-hud';
   wrap.style.cssText = `
     position: fixed;
-    left: 92px;
-    bottom: 24px;
+    top: 24px;
+    right: 24px;
     z-index: ${ROT_Z};
-    display: flex;
-    align-items: stretch;
-    gap: 6px;
+    display: grid;
+    grid-template-columns: 34px minmax(42px, auto) 34px;
+    grid-template-areas:
+      ".    in   ."
+      "left chip right"
+      ".    out  .";
+    gap: 4px;
     font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
     user-select: none;
   `;
 
-  const makeButton = (glyph: string, title: string, dir: 1 | -1): HTMLButtonElement => {
+  const makeButton = (glyph: string, title: string, area: string, act: () => void): HTMLButtonElement => {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = glyph;
     btn.title = title;
     btn.style.cssText = `
-      width: 34px;
+      grid-area: ${area};
+      width: 100%;
       padding: 6px 0;
       background: rgba(4, 8, 22, 0.95);
       border: 1px solid rgba(212, 168, 75, 0.28);
@@ -352,20 +391,26 @@ export function initCameraRig(rigGuards: RigGuards): void {
       btn.style.color = '#d4a84b';
     });
     btn.addEventListener('click', (e) => {
-      // Never let the rotate click double as click-to-enter / canvas click.
+      // Never let a view click double as click-to-enter / canvas click.
       e.stopPropagation();
       btn.blur();
-      rotateStep(dir);
+      act();
     });
     return btn;
   };
 
-  leftBtn = makeButton('◀', 'Rotate view 45° left (← or <)', -1);
-  rightBtn = makeButton('▶', 'Rotate view 45° right (→ or >)', 1);
+  leftBtn = makeButton('◀', 'Rotate view 45° left (← or <)', 'left', () => rotateStep(-1));
+  rightBtn = makeButton('▶', 'Rotate view 45° right (→ or >)', 'right', () => rotateStep(1));
+  const zoom = rigGuards.zoom;
+  if (zoom) {
+    zoomInBtn = makeButton('+', 'Zoom in (+)', 'in', () => zoom.stepIn());
+    zoomOutBtn = makeButton('−', 'Zoom out (-)', 'out', () => zoom.stepOut());
+  }
 
   angleChip = document.createElement('div');
   angleChip.title = 'View rotation';
   angleChip.style.cssText = `
+    grid-area: chip;
     min-width: 42px;
     display: flex;
     align-items: center;
@@ -378,11 +423,12 @@ export function initCameraRig(rigGuards: RigGuards): void {
     letter-spacing: 1px;
   `;
 
-  wrap.appendChild(leftBtn);
-  wrap.appendChild(angleChip);
-  wrap.appendChild(rightBtn);
+  for (const el of [zoomInBtn, leftBtn, angleChip, rightBtn, zoomOutBtn]) {
+    if (el) wrap.appendChild(el);
+  }
   document.body.appendChild(wrap);
   refreshAngleChip();
+  refreshZoomButtons();
 
   // Keyboard complement: ←/→, plus Shift+< / Shift+> (owner request — the
   // SHIFT gate keeps the bare ,/. typing keys inert; matched via e.code so
@@ -406,5 +452,5 @@ export function initCameraRig(rigGuards: RigGuards): void {
     rotateStep(dir);
   });
 
-  console.log('✅ Camera rig initialized (45° view rotation, bottom-left HUD)');
+  console.log('✅ Camera rig initialized (45° view rotation, top-right HUD)');
 }

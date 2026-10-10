@@ -270,9 +270,11 @@ export class MultiScaleZoomView {
     // Context Sidebar details for upper views (levels >= 3)
     const sidebar = document.createElement('div');
     sidebar.id = 'zoom-sidebar';
+    // Starts below the top-right view cross (cameraRig, #223), which now
+    // holds that corner from top 24px down to ~124px.
     sidebar.style.cssText = `
       position: absolute;
-      top: 100px;
+      top: 140px;
       right: 24px;
       width: 320px;
       background: rgba(4, 8, 22, 0.92);
@@ -462,9 +464,8 @@ export class MultiScaleZoomView {
    */
   private zoomHintText(): string {
     const parts: string[] = [];
-    // room→exterior and station→planet view are normal play now
-    if (DEVZOOM || this.currentLevel <= 2 || (this.currentLevel === 3 && !isExteriorOrbitView())) parts.push('[-] TO OUT');
-    if (this.currentLevel > 1) parts.push('[+] TO IN');
+    if (this.canZoomOut()) parts.push('[-] TO OUT');
+    if (this.canZoomIn()) parts.push('[+] TO IN');
     let hint = `PRESS ${parts.join(' / ')}`;
     if (this.currentLevel === 1) {
       // #49 cursor model: click frees the cursor to interact; a click on
@@ -472,6 +473,30 @@ export class MultiScaleZoomView {
       hint += ' · WASD WALK · CLICK TOGGLES CURSOR/LOOK';
     }
     return hint;
+  }
+
+  /** Would [+] / the HUD + button do anything? (Device focus aside — the
+   *  steps refuse that themselves.) */
+  public canZoomIn(): boolean {
+    return this.currentLevel > 1;
+  }
+
+  /** Would [-] / the HUD − button do anything? Room → exterior and station →
+   *  planet view are normal play; past that only behind ?devzoom=1. */
+  public canZoomOut(): boolean {
+    if (this.currentLevel <= 2) return true;
+    if (this.currentLevel === 3 && !isExteriorOrbitView()) return true;
+    return DEVZOOM && this.currentLevel < 8;
+  }
+
+  /** ➕ #223: the HUD + button — one step in, exactly as the [+] key. */
+  public stepIn(): void {
+    this.zoomIn();
+  }
+
+  /** ➖ #223: the HUD − button — one step out, exactly as the [-] key. */
+  public stepOut(): void {
+    this.zoomOut();
   }
 
   private zoomIn() {

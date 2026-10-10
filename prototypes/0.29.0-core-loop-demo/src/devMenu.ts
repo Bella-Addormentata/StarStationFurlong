@@ -833,10 +833,11 @@ function sectionHtml(title: string, note: string | null, rows: string[]): string
 function buildPanel(): HTMLDivElement {
   const el = document.createElement('div');
   el.id = 'dev-menu-panel';
+  // Opens BELOW the top-left DEV button (#223).
   el.style.cssText = `
     position: fixed;
     left: 24px;
-    bottom: 64px;
+    top: 64px;
     width: 300px;
     max-height: min(66vh, 620px);
     display: none;
@@ -1262,10 +1263,11 @@ export function initDevMenu(getWorldRef: GetWorld): void {
 
   const btn = document.getElementById('dev-menu-btn');
   if (btn) {
+    // #223: top-left corner (the view cross holds the top-right).
     btn.style.cssText = `
       position: fixed;
       left: 24px;
-      bottom: 24px;
+      top: 24px;
       z-index: ${DEV_Z};
       background: ${DEV_BG};
       color: ${DEV_AMBER};
