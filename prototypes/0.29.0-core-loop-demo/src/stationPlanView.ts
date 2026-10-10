@@ -29,7 +29,8 @@ import type { StationRecord } from './stations';
 import type { AtlasEntry } from './stationAtlas';
 import type { ShipSummary } from './planetSummary';
 import type { PlanModule, StationPlan, VisitingShip } from './stationPlan';
-import { editAccess, moduleCorners, planModuleAt, stationPlan, visitingShips } from './stationPlan';
+import { editAccess, moduleCupolaGlass, moduleOutline, planModuleAt, stationPlan, visitingShips } from './stationPlan';
+import { cupolaWallsLabel } from './cupola';
 import { TILE_SIZE } from './floorPlanDoc';
 import { legacyOwnerMarker } from './roomOwner';
 import type { DisassemblyCandidate, DisassemblyJob } from './disassembly';
@@ -73,6 +74,9 @@ const GOLD_BRIGHT = '#F0C060';
 const DIM = 'rgba(212,168,75,0.5)';
 const CYAN = '#00d4ff';
 const SHIP = '#7fd7a8';
+/** 🔭 Cupola glass on the plan. */
+const CUPOLA_GLASS = '#9fe8ff';
+const CUPOLA_GLASS_FILL = 'rgba(159,232,255,0.22)';
 /** A full-width action button in the side panel. */
 const ACTION_CSS = `margin-top:5px; width:100%; text-align:left; border-radius:6px; border:1px solid rgba(212,168,75,0.35); background:rgba(212,168,75,0.08); color:${GOLD}; padding:6px 8px; cursor:pointer; font-size:10px; font-family:inherit;`;
 
@@ -356,7 +360,8 @@ export class StationPlanView {
     // other berth is stale.
     const listed = new Set(this.visiting.filter((s) => s.state === 'docked' && s.onPlan).map((s) => s.roomId));
     for (const m of [...plan.modules, ...plan.ships]) {
-      const corners = moduleCorners(m).map((c) => toPx(c.x, c.z));
+      // 🔭 The footprint, its corners cut at a cupola end (issue 219).
+      const corners = moduleOutline(m).map((c) => toPx(c.x, c.z));
       const isShip = m.kind === 'ship';
       // A berth the ship itself says it left is drawn faint.
       const stale = isShip && !listed.has(m.roomId);
@@ -401,6 +406,23 @@ export class StationPlanView {
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // 🔭 Each cupola end: its glass taper tinted, the tip window bright.
+      for (const glass of moduleCupolaGlass(m)) {
+        const taper = glass.taper.map((p) => toPx(p.x, p.z));
+        ctx.beginPath();
+        taper.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+        ctx.closePath();
+        ctx.fillStyle = CUPOLA_GLASS_FILL;
+        ctx.fill();
+        const [a, b] = glass.tip.map((p) => toPx(p.x, p.z));
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = CUPOLA_GLASS;
+        ctx.stroke();
+      }
+
       const c = toPx(m.x, m.z);
       // 🔧 Being taken apart: hatched, with how far the robots have got.
       const job = isShip ? undefined : this.jobs.get(m.roomId);
@@ -441,6 +463,14 @@ export class StationPlanView {
     }
   }
 
+  /** 🔭 Which end walls are cupolas, as the room editor's button names them. */
+  private cupolaText(m: PlanModule): string {
+    if (m.cupola === undefined) return 'Not known yet (someone must stand in it once).';
+    if (m.cupola.length === 0) return 'None';
+    if (m.cupola.length === 2) return `🔭 Both ends (${cupolaWallsLabel(m.cupola)})`;
+    return `🔭 The ${m.cupola[0]} end`;
+  }
+
   private ownerText(m: PlanModule): string {
     if (m.owner === undefined) return 'Owner not known yet (someone must stand in it once).';
     // null, or the pre-S2 marker: no verifiable owner (roomOwner.ts).
@@ -473,6 +503,8 @@ export class StationPlanView {
       row(this.ownerText(m), CYAN),
       heading('Size'),
       row(m.dims ? `${m.dims.cols} × ${m.dims.rows} tiles` : 'Not known yet (drawn at the default 2 × 2)'),
+      heading('Cupola'),
+      row(this.cupolaText(m), m.cupola?.length ? CUPOLA_GLASS : undefined),
     );
     if (isShip) {
       if (m.dockedAt) {
