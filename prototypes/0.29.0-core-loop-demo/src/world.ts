@@ -107,7 +107,7 @@ import {
   writeDoorTombstone,
   type DoorRecord,
 } from "./doorsDoc";
-import { roomHalfExtents, roomWalkBounds, roomCupola, readCupolaWall } from "./floorPlanDoc";
+import { roomHalfExtents, roomWalkBounds, roomCupolas, readCupolaWalls } from "./floorPlanDoc";
 import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled, sharedRoomsNaming } from "./stationAtlas";
@@ -1144,7 +1144,7 @@ export class World {
       collectWindowOpenings(),
       this.collectWallpaper(),
       doorOpenings,
-      readCupolaWall(),
+      readCupolaWalls(),
     );
     this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
@@ -1486,10 +1486,10 @@ export class World {
     this.addOctagonHull();
   }
 
-  /** 🔭 What the cupola rendering depends on: the stored wall and the room
+  /** 🔭 What the cupola rendering depends on: the stored walls and the room
    *  size it is resolved against. */
   private cupolaSignature(): string {
-    return JSON.stringify([roomHalfExtents(), readCupolaWall()]);
+    return JSON.stringify([roomHalfExtents(), readCupolaWalls()]);
   }
 
   /**
@@ -1533,14 +1533,14 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     const w = 2 * halfX,
       d = 2 * halfZ;
-    // 🔭 a cupola end wall cuts the floor's two corners at that end at 45°.
-    const cupola = OCTAGON_HULL ? roomCupola() : null;
-    if (!cupola && this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
+    // 🔭 cupola end walls cut their floor corners at 45°.
+    const cupolas = OCTAGON_HULL ? roomCupolas() : [];
+    if (!cupolas.length && this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
       return new THREE.PlaneGeometry(w, d);
     }
     const shape = new THREE.Shape();
-    if (cupola) {
-      const outline = cupolaFloorOutline(cupola);
+    if (cupolas.length) {
+      const outline = cupolaFloorOutline(cupolas);
       outline.forEach((p, i) => (i === 0 ? shape.moveTo(p.x, -p.z) : shape.lineTo(p.x, -p.z)));
     } else {
       shape.moveTo(-halfX, -halfZ);
