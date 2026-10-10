@@ -371,6 +371,15 @@ export function forwardClearOf(
   return { x: 0, y: -1, z: 0 };
 }
 
+/** The sphere the camera keeps its line to the viewer clear of: the
+ *  planet's air (1.025 of its radius) and a little more, but always short
+ *  of the viewer itself (`viewerDistanceKm` from the planet's centre): a
+ *  viewer on a low orbit sits inside that margin once its altitude is
+ *  compressed, and a sphere around it would leave no tilt that clears. */
+export function clearanceRadiusKm(planetRadiusKm: number, viewerDistanceKm: number): number {
+  return Math.min(planetRadiusKm * 1.04, planetRadiusKm + 0.9 * Math.max(0, viewerDistanceKm - planetRadiusKm));
+}
+
 /** Does the segment from `from` to the origin pass through the sphere? */
 function segmentHitsSphere(from: FramePoint, centre: FramePoint, radius: number): boolean {
   // Closest point of the segment P(t) = from·(1 − t), t ∈ [0, 1], to the centre.

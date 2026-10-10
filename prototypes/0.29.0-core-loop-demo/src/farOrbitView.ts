@@ -40,7 +40,7 @@ import {
   wrapAngle,
 } from './orbits';
 import type { OrbitPoint, TransferPlan } from './orbits';
-import { forwardClearOf, frozenCourse, planetLayout, transitLayout } from './farOrbits';
+import { clearanceRadiusKm, forwardClearOf, frozenCourse, planetLayout, transitLayout } from './farOrbits';
 import type {
   FarBody, FarLayout, FarShipInput, FarStationInput, FarViewerBody, FrozenCourses, StationShape,
 } from './farOrbits';
@@ -610,8 +610,8 @@ let lastRefresh = 0;
 /** OLD_PLANET_NAMES found in the scene, re-found after a refresh. */
 let oldPlanets: THREE.Object3D[] | null = null;
 /** Bodies are keyed by kind AND id: a station's id is free text and could
- *  equal a ship's `ship:<room>`. */
-const bodyKey = (b: FarBody): string => `${b.kind}\u0000${b.id}`;
+ *  equal a ship's `ship:<room>`, or the viewer's own body's id. */
+export const bodyKey = (b: FarBody): string => `${b.kind}\u0000${b.own ? 'own' : ''}\u0000${b.id}`;
 /** Body key → its object and how it is sized: `px` per local unit on
  *  screen (ships, planets, the sun), or 0 for a station, drawn at the one
  *  station scale. */
@@ -882,9 +882,6 @@ function lineHitsSphere(a: THREE.Vector3, b: THREE.Vector3, centre: THREE.Vector
 const tmpAb = new THREE.Vector3();
 const tmpAc = new THREE.Vector3();
 
-/** The sphere the camera keeps its line to this station clear of: the
- *  planet's air (1.025 of its radius) and a little more. */
-const PLANET_CLEARANCE = 1.04;
 
 const tmp = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
@@ -948,8 +945,8 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
   planetSphere = layout?.planet && frame
     ? { centre: frame.position.clone(), radius: layout.planet.radiusKm } : null;
   if (layout?.planet && frame) {
-    const r = layout.planet.radiusKm * PLANET_CLEARANCE;
     const c = frame.position;
+    const r = clearanceRadiusKm(layout.planet.radiusKm, c.length());
     const clear = forwardClearOf(forward, { x: c.x, y: c.y, z: c.z }, r, EYE_DISTANCE);
     if (clear !== forward) {
       forward.set(clear.x, clear.y, clear.z);

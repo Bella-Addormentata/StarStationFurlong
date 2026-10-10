@@ -17,6 +17,7 @@ import {
   compressAltitudeKm,
   compressPlanetPoint,
   compressRadiusKm,
+  clearanceRadiusKm,
   forwardClearOf,
   frozenCourse,
   planetLayout,
@@ -229,6 +230,18 @@ describe('forwardClearOf: the planet never hides the viewer (issue 218)', () => 
     // No steeper than it needs: a quarter degree less still hits.
     const e = Math.asin(-clear.y) - Math.PI / 720;
     expect(hits({ x: Math.cos(e), y: -Math.sin(e), z: 0 })).toBe(true);
+  });
+
+  it('on the lowest orbit allowed, still tips only as far as it needs', () => {
+    // 200 km up compresses to ~162 km, inside a flat 4% margin (~255 km).
+    const low = { x: -(planet.radiusKm + compressAltitudeKm(200)), y: 0, z: 0 };
+    const r = clearanceRadiusKm(planet.radiusKm, -low.x);
+    expect(r).toBeLessThan(-low.x);
+    expect(r).toBeGreaterThan(planet.radiusKm);
+    const e = Math.atan(1 / Math.SQRT2);
+    const f = { x: Math.cos(e), y: -Math.sin(e), z: 0 };
+    const clear = forwardClearOf(f, low, r, d);
+    expect(clear.y).toBeGreaterThan(-0.999); // not straight down
   });
 
   it('clears the planet at every heading of the camera rig', () => {

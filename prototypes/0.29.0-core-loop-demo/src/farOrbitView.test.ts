@@ -19,8 +19,9 @@ let setFarPassActive: typeof import('./farOrbitView').setFarPassActive;
 let setFarPassOrbit: typeof import('./farOrbitView').setFarPassOrbit;
 let shapeOfPlan: typeof import('./farOrbitView').shapeOfPlan;
 let fallbackShape: typeof import('./farOrbitView').fallbackShape;
+let bodyKey: typeof import('./farOrbitView').bodyKey;
 beforeAll(async () => {
-  ({ SKY_LAYER, renderWithFarPass, setFarPassActive, setFarPassOrbit, shapeOfPlan, fallbackShape } = await import('./farOrbitView'));
+  ({ SKY_LAYER, renderWithFarPass, setFarPassActive, setFarPassOrbit, shapeOfPlan, fallbackShape, bodyKey } = await import('./farOrbitView'));
 });
 
 /** What one render call saw. */
@@ -223,6 +224,13 @@ describe("a station's shape in the planet view (issue 218)", () => {
       { ax: 0, az: 0, bx: 17, bz: -35 },
       { ax: -20, az: 0, bx: 0, bz: 0 },
     ]);
+  });
+
+  it("keeps a station whose id is the viewer's apart from the viewer", () => {
+    const at = { x: 0, y: 0, z: 0 };
+    const viewer = { id: 'viewer', kind: 'station' as const, name: 'HOME', position: at, angle: 0, modules: 1, own: true };
+    const namesake = { id: 'viewer', kind: 'station' as const, name: 'VIEWER', position: at, angle: 0, modules: 1 };
+    expect(bodyKey(viewer)).not.toBe(bodyKey(namesake));
   });
 
   it('has none when the atlas does not know the station', () => {
