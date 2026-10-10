@@ -2850,6 +2850,63 @@ const BRIDGE_PLANK_HALF = 0.04; // plank half-thickness → deck TOP offset
 /** ♨️ Tub water disc height (buildHotTub water mesh) — splash spawn point. */
 export const HOT_TUB_WATER_Y = 0.565;
 
+/**
+ * ♨️ Hot-tub radii (local metres) — ONE table, read by both tub builders AND
+ * by the seat templates.
+ *
+ * The seats are derived FROM the basin rather than hand-placed beside it:
+ * #187 asked for four usable places with room between the occupants, and
+ * "how far out can a fox sit" is a question about the water disc, not about
+ * the art. Sharing the table is also what stops the two tub kinds drifting
+ * apart again — the classic deck tub carried a byte-identical copy of the
+ * broken seat list, so #187's defect existed twice.
+ *
+ * #187 widened the BASIN and deliberately left `pedestal` alone. The
+ * pedestal is load-bearing in the layout sense: it stands on the lazy-pool
+ * island (island cylinder r 1.65), it is what a walker's body meets at the
+ * classic tub's 3×3 obstacle edge, and the footbridge's island end tucks
+ * under it. Growing it would drag the island disc, the river's hole in
+ * lazyRiverShape(), the swim-exclusion ellipse in getPoolIsland(),
+ * BRIDGE_Z_ISLAND and the deck standoff along with it, for a change the
+ * player reads at the rim anyway. The water grew INSIDE the pedestal
+ * instead: the rim wall thinned from 0.42 m to 0.28 m, and the basin went
+ * from ⌀2.56 m to ⌀2.84 m.
+ */
+export const HOT_TUB_R = {
+  /** Tiled base step, on the deck or on the pool island. UNCHANGED by #187. */
+  pedestal: 1.7,
+  /** Tiled drum wall; 0.08 inside the pedestal, which reads as its lip. */
+  drum: 1.62,
+  /** White cap-ring centre line. */
+  cap: 1.51,
+  /** Cap tube radius ⇒ the rim spans 1.41 → 1.61, flush with the drum. */
+  capTube: 0.1,
+  /**
+   * Cyan LED line, a flat torus of tube 0.04 at y 0.5 — inside the drum's
+   * 0.12 → 0.58 band, so the drum wall is what decides whether it is seen.
+   * It sits 0.05 short of that wall, the clearance it has always had (it
+   * was 1.46 + 0.04 against a 1.55 drum). It is deliberately NOT pinned to
+   * the cap's outer edge any more: #187 brings the cap out flush with the
+   * drum, and following it there would thread this ring THROUGH the wall.
+   */
+  glow: 1.53,
+  /** Dark disc just under the waterline — the basin falling away. */
+  shadow: 1.44,
+  /** The water surface. Every seat position is measured from this. */
+  water: 1.42,
+  /** Foam ring hugging the rim. */
+  foam: 1.3,
+  /** Ring the six jet swirls churn on. */
+  jets: 1.14,
+} as const;
+
+/**
+ * The surface bubbles were hand-scattered against the pre-#187 water disc
+ * (r 1.28), so their POSITIONS ride the same factor the basin grew by and
+ * keep that composition. Their radii do not: a bubble is a bubble.
+ */
+const HOT_TUB_BUBBLE_SPREAD = HOT_TUB_R.water / 1.28;
+
 /** Deck-TOP height of the footbridge at local z ∈ [island, shore]. */
 function bridgeTopAt(lz: number): number {
   const t = (lz - BRIDGE_Z_ISLAND) / (BRIDGE_Z_SHORE - BRIDGE_Z_ISLAND);
@@ -2898,6 +2955,26 @@ export function isBridgeClick(
     lz >= BRIDGE_Z_ISLAND - 0.2 &&
     lz <= BRIDGE_Z_SHORE + 0.2
   );
+}
+
+/**
+ * 🌉 World point where the footbridge meets the tub island, or null when the
+ * room has no hot tub.
+ *
+ * findSeatAt routes a click on the bridge DECK into the tub, and has to pick
+ * which of the four spots. "Greatest sit.z" answered that while the seats
+ * were an east/west/north/south cross; #187's quadrant layout puts two seats
+ * on the south side, so the rule needs the thing it always meant — the spot
+ * nearest where the walk ends. Deriving it here keeps the bridge's geometry
+ * (and its unrotated-tub assumption, shared with bridgeDeckY/isBridgeClick)
+ * in the one module that owns it.
+ */
+export function hotTubBridgeLanding(
+  items: FurnitureItem[],
+): { x: number; z: number } | null {
+  const tub = items.find((item) => item.id === "pool-hot-tub");
+  if (!tub) return null;
+  return { x: tub.pos.x + BRIDGE_X, z: tub.pos.z + BRIDGE_Z_ISLAND };
 }
 const bunkBedSeats: SeatTemplate[] = [
   // 🛏️ The bed splits down the middle of its LONG axis: the FOOT half — the end
@@ -3083,37 +3160,90 @@ const poolSeats: SeatTemplate[] = [
   },
 ];
 
-// ── 🛁 Hot-tub seats — soak together (hot-tub, 4 spots) ──────────────────────
-// sitY 0.28: chest above the waterline of the raised drum, legs hidden inside.
-// Fronts are just outside the 3×3 obstacle (blocked ones fall back to the
-// nearest walkable cell via computeFront); sit positions are inside the tub.
+// ── 🛁 Hot-tub seats — four soakers, one per QUADRANT (#187) ────────────────
+/**
+ * The four spots have always existed; only two of them could ever be reached.
+ * The old boxes were an east half and a west half — each the FULL 3×3 depth —
+ * followed by a south half and a north half, and findSeatAt returns the first
+ * box that contains the point. The two halves listed first therefore covered
+ * the entire footprint: seat 2 was reachable only through the footbridge
+ * branch and seat 3 was unreachable by any click. The bunk bed hit this exact
+ * wall and was fixed this exact way (see bunkBedSeats) — boxes that PARTITION
+ * the footprint, one per seat.
+ *
+ * So: quadrants, with the occupants on the diagonals at the quadrant centres.
+ * Each box contains exactly its own seat, the four tile the 3×3 with no gap
+ * (a click anywhere on the tub lands in one of them) and no overlap beyond
+ * the shared edges, where the earlier-listed box wins deterministically.
+ *
+ * SPACING — the other half of #187. The occupants sit on a ring of radius
+ * HOT_TUB_SIT_R; neighbours are a quarter-turn apart, so their roots are
+ * HOT_TUB_SIT_R·√2 apart and the gap between two bodies is that less twice
+ * PLAYER_R (0.38 each, player.ts). At the old ring radius of 0.62 the gap was
+ * 0.12 m — shoulder to shoulder. At 0.82 it is 0.40 m, and a body's outer
+ * edge (1.20) still clears the rim's inner face (cap − capTube = 1.41) by
+ * 0.21 m. That pair of numbers is what sized the basin: a 1.28 m water disc
+ * cannot hold four foxes with room to spare, a 1.42 m one can.
+ *
+ * faceAngle points INWARD — the occupant's back is to the rim — on the π/4
+ * detents the avatar rig already snaps to.
+ *
+ * FRONTS stay on the AXES, one per side, rather than on the seat diagonals.
+ * A front has to be a walkable cell just outside the 3×3 obstacle, and the
+ * diagonal of that box at this radius is still inside the box's own x/z span;
+ * spreading the four approaches over the four sides also stops arrivals
+ * queueing on one.
+ *
+ * Today NEITHER tub reads them. buildSeatList replaces the front of every
+ * seat whose ITEM ID is "pool-hot-tub" with the lazy pool's footbridge shore
+ * — and the Classic Lido deck tub carries that same id (roomTemplates.ts),
+ * though it is a different kind standing on a pool with no bridge, so it
+ * inherits the approach and the scripted bridge walk as well. That predates
+ * #187 and is left alone here. These four are kept correct and per-quadrant
+ * so that the day the special case keys on KIND instead of id, the right
+ * approaches are already in place.
+ *
+ * sitY 0.28: chest above the waterline of the raised drum, legs hidden inside.
+ */
+/** Radius of the ring the four occupants sit on — see the spacing note above. */
+const HOT_TUB_SIT_R = 0.82;
+/** That ring resolved onto each axis: a seat sits at (±HOT_TUB_SIT_XZ, ±…). */
+const HOT_TUB_SIT_XZ = HOT_TUB_SIT_R / Math.SQRT2;
+/** Dry-land approach distance — just outside the 3×3 obstacle's half-extent. */
+const HOT_TUB_FRONT_R = 1.85;
+
 const hotTubSeats: SeatTemplate[] = [
+  // NE quadrant, approached from the NORTH deck.
   {
-    clickBox: { x0: 0.0, z0: -1.5, x1: 1.5, z1: 1.5 },
-    front: { x: 1.85, z: 0.0 },
-    sit: { x: 0.62, z: 0.0 },
-    faceAngle: -Math.PI / 2,
+    clickBox: { x0: 0.0, z0: -1.5, x1: 1.5, z1: 0.0 },
+    front: { x: 0.0, z: -HOT_TUB_FRONT_R },
+    sit: { x: HOT_TUB_SIT_XZ, z: -HOT_TUB_SIT_XZ },
+    faceAngle: -Math.PI / 4,
     sitY: 0.28,
   },
+  // SE quadrant, approached from the EAST deck.
   {
-    clickBox: { x0: -1.5, z0: -1.5, x1: 0.0, z1: 1.5 },
-    front: { x: -1.85, z: 0.0 },
-    sit: { x: -0.62, z: 0.0 },
-    faceAngle: Math.PI / 2,
+    clickBox: { x0: 0.0, z0: 0.0, x1: 1.5, z1: 1.5 },
+    front: { x: HOT_TUB_FRONT_R, z: 0.0 },
+    sit: { x: HOT_TUB_SIT_XZ, z: HOT_TUB_SIT_XZ },
+    faceAngle: (-3 * Math.PI) / 4,
     sitY: 0.28,
   },
+  // SW quadrant, approached from the SOUTH deck — and the spot the lazy
+  // pool's footbridge lands next to (hotTubBridgeLanding sits at x -0.2).
   {
-    clickBox: { x0: -1.5, z0: 0.0, x1: 1.5, z1: 1.5 },
-    front: { x: 0.0, z: 1.85 },
-    sit: { x: 0.0, z: 0.62 },
-    faceAngle: Math.PI,
+    clickBox: { x0: -1.5, z0: 0.0, x1: 0.0, z1: 1.5 },
+    front: { x: 0.0, z: HOT_TUB_FRONT_R },
+    sit: { x: -HOT_TUB_SIT_XZ, z: HOT_TUB_SIT_XZ },
+    faceAngle: (3 * Math.PI) / 4,
     sitY: 0.28,
   },
+  // NW quadrant, approached from the WEST deck.
   {
-    clickBox: { x0: -1.5, z0: -1.5, x1: 1.5, z1: 0.0 },
-    front: { x: 0.0, z: -1.85 },
-    sit: { x: 0.0, z: -0.62 },
-    faceAngle: 0,
+    clickBox: { x0: -1.5, z0: -1.5, x1: 0.0, z1: 0.0 },
+    front: { x: -HOT_TUB_FRONT_R, z: 0.0 },
+    sit: { x: -HOT_TUB_SIT_XZ, z: -HOT_TUB_SIT_XZ },
+    faceAngle: Math.PI / 4,
     sitY: 0.28,
   },
 ];
@@ -3163,20 +3293,11 @@ const classicPoolSeats: SeatTemplate[] = [
     faceAngle: -Math.PI / 4, sitY: POOL_SWIM_Y, swim: true },
 ];
 
-const classicHotTubSeats: SeatTemplate[] = [
-  { clickBox: { x0: 0.0, z0: -1.5, x1: 1.5, z1: 1.5 },
-    front: { x: 1.85, z: 0.0 }, sit: { x: 0.62, z: 0.0 },
-    faceAngle: -Math.PI / 2, sitY: 0.28 },
-  { clickBox: { x0: -1.5, z0: -1.5, x1: 0.0, z1: 1.5 },
-    front: { x: -1.85, z: 0.0 }, sit: { x: -0.62, z: 0.0 },
-    faceAngle: Math.PI / 2, sitY: 0.28 },
-  { clickBox: { x0: -1.5, z0: 0.0, x1: 1.5, z1: 1.5 },
-    front: { x: 0.0, z: 1.85 }, sit: { x: 0.0, z: 0.62 },
-    faceAngle: Math.PI, sitY: 0.28 },
-  { clickBox: { x0: -1.5, z0: -1.5, x1: 1.5, z1: 0.0 },
-    front: { x: 0.0, z: -1.85 }, sit: { x: 0.0, z: -0.62 },
-    faceAngle: 0, sitY: 0.28 },
-];
+// 🛁 The classic pool's deck tub used to carry a byte-identical copy of the
+// hot-tub seat list, which is why #187's "only two of the four spots can be
+// clicked" was one bug in two places. There is one list now — hotTubSeats,
+// above — and the registry points both tub kinds at it. The two tubs are the
+// same object with different paint; only their builders differ.
 
 // 🎰 Roulette table (2×1 footprint): 6 standing positions ringing it. The -x
 // SHORT END is the WHEEL HEAD — reserved for the owner / their croupier robot.
@@ -3923,7 +4044,7 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     kind: "classic-hot-tub",
     build: buildClassicHotTub,
     footprint: { w: 3, d: 3 },
-    seats: classicHotTubSeats,
+    seats: hotTubSeats,
   },
   // ── 🎰 Casino fixtures (#69 G1/G2) — device fronts face -z (helm idiom). ──
   "cashier-atm": {
@@ -5447,22 +5568,22 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
   // Stepped pedestal + drum — clad in the SAME pale-blue tile as the dive
   // tower (poolTileMat blue variant; repeat ≈ circumference × height).
   place(
-    new THREE.CylinderGeometry(1.7, 1.7, 0.14, 36),
-    poolTileMat(10.7, 0.3, true),
+    new THREE.CylinderGeometry(HOT_TUB_R.pedestal, HOT_TUB_R.pedestal, 0.14, 36),
+    poolTileMat(2 * Math.PI * HOT_TUB_R.pedestal, 0.3, true),
     0,
     0.07,
     0,
   );
   place(
-    new THREE.CylinderGeometry(1.55, 1.55, 0.46, 36, 1, true),
-    poolTileMat(9.7, 0.46, true),
+    new THREE.CylinderGeometry(HOT_TUB_R.drum, HOT_TUB_R.drum, 0.46, 36, 1, true),
+    poolTileMat(2 * Math.PI * HOT_TUB_R.drum, 0.46, true),
     0,
     0.35,
     0,
   );
   // White cap ring.
   const capRing = place(
-    new THREE.TorusGeometry(1.36, 0.1, 8, 36),
+    new THREE.TorusGeometry(HOT_TUB_R.cap, HOT_TUB_R.capTube, 8, 36),
     m(TRIM, 0.7, 0.08),
     0,
     0.62,
@@ -5472,7 +5593,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
 
   // Dark shadow disc just under the waterline — the basin falling away.
   const shadow = place(
-    new THREE.CylinderGeometry(1.3, 1.3, 0.012, 36),
+    new THREE.CylinderGeometry(HOT_TUB_R.shadow, HOT_TUB_R.shadow, 0.012, 36),
     flat(0x0f4a60),
     0,
     0.552,
@@ -5484,7 +5605,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
   // light rim, the same colour stops as the main pool's water. Continuous
   // like real water, no ring banding.
   const water = place(
-    new THREE.CylinderGeometry(1.28, 1.28, 0.014, 36),
+    new THREE.CylinderGeometry(HOT_TUB_R.water, HOT_TUB_R.water, 0.014, 36),
     radialWaterMat(["#082E44", "#0E5872", "#2D8EA5"]),
     0,
     0.565,
@@ -5521,9 +5642,9 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
     const bub = place(
       new THREE.SphereGeometry(br, 8, 6),
       m(0xf6fdff, 0.85, 0.0),
-      bx,
+      bx * HOT_TUB_BUBBLE_SPREAD,
       0.59,
-      bz,
+      bz * HOT_TUB_BUBBLE_SPREAD,
     );
     bub.scale.y = 0.4;
     (bub.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.55;
@@ -5533,9 +5654,9 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
     const swirl = place(
       new THREE.SphereGeometry(0.12, 8, 6),
       m(0xeffcff, 0.85, 0.0),
-      Math.cos(a) * 1.02,
+      Math.cos(a) * HOT_TUB_R.jets,
       0.585,
-      Math.sin(a) * 1.02,
+      Math.sin(a) * HOT_TUB_R.jets,
     );
     swirl.scale.set(1.2, 0.28, 0.6);
     swirl.rotation.y = -a;
@@ -5544,7 +5665,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
 
   // Foam ring hugging the rim + cyan LED line beneath the cap.
   const foam = place(
-    new THREE.TorusGeometry(1.16, 0.04, 6, 36),
+    new THREE.TorusGeometry(HOT_TUB_R.foam, 0.04, 6, 36),
     flat(0xeffcff),
     0,
     0.575,
@@ -5553,7 +5674,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
   foam.rotation.x = Math.PI / 2;
   (foam.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.85;
   const rim = place(
-    new THREE.TorusGeometry(1.46, 0.04, 6, 36),
+    new THREE.TorusGeometry(HOT_TUB_R.glow, 0.04, 6, 36),
     flat(GLOW),
     0,
     0.5,
@@ -10657,13 +10778,13 @@ function buildClassicPool({ m, flat, place, addLight }: BuildCtx) {
 function buildClassicHotTub({ m, flat, place, addLight }: BuildCtx) {
   const TRIM = 0xfafdfe,
     GLOW = 0x69ceff;
-  place(new THREE.CylinderGeometry(1.7, 1.7, 0.14, 36), poolTileMat(10.7, 0.3, true), 0, 0.07, 0);
-  place(new THREE.CylinderGeometry(1.55, 1.55, 0.46, 36), poolTileMat(9.7, 0.46, true), 0, 0.35, 0);
-  const capRing = place(new THREE.TorusGeometry(1.36, 0.1, 8, 36), m(TRIM, 0.7, 0.08), 0, 0.62, 0);
+  place(new THREE.CylinderGeometry(HOT_TUB_R.pedestal, HOT_TUB_R.pedestal, 0.14, 36), poolTileMat(2 * Math.PI * HOT_TUB_R.pedestal, 0.3, true), 0, 0.07, 0);
+  place(new THREE.CylinderGeometry(HOT_TUB_R.drum, HOT_TUB_R.drum, 0.46, 36), poolTileMat(2 * Math.PI * HOT_TUB_R.drum, 0.46, true), 0, 0.35, 0);
+  const capRing = place(new THREE.TorusGeometry(HOT_TUB_R.cap, HOT_TUB_R.capTube, 8, 36), m(TRIM, 0.7, 0.08), 0, 0.62, 0);
   capRing.rotation.x = Math.PI / 2;
-  const shadow = place(new THREE.CylinderGeometry(1.3, 1.3, 0.012, 36), flat(0x0f4a60), 0, 0.552, 0);
+  const shadow = place(new THREE.CylinderGeometry(HOT_TUB_R.shadow, HOT_TUB_R.shadow, 0.012, 36), flat(0x0f4a60), 0, 0.552, 0);
   (shadow.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.92;
-  const water = place(new THREE.CylinderGeometry(1.28, 1.28, 0.014, 36), radialWaterMat(["#1F6E88", "#3FA9BC", "#7CD8DF"]), 0, 0.565, 0);
+  const water = place(new THREE.CylinderGeometry(HOT_TUB_R.water, HOT_TUB_R.water, 0.014, 36), radialWaterMat(["#1F6E88", "#3FA9BC", "#7CD8DF"]), 0, 0.565, 0);
   (water.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.94;
   const boil = place(new THREE.SphereGeometry(0.22, 12, 8), m(0xf2fbfd, 0.9, 0.0), 0, 0.585, 0);
   boil.scale.y = 0.32;
@@ -10674,21 +10795,21 @@ function buildClassicHotTub({ m, flat, place, addLight }: BuildCtx) {
     [0.1, 0.28, 0.035], [-0.31, -0.65, 0.04], [0.85, 0.25, 0.04], [-0.8, -0.5, 0.035],
   ];
   for (const [bx, bz, br] of bubbles) {
-    const bub = place(new THREE.SphereGeometry(br, 8, 6), m(0xf6fdff, 0.85, 0.0), bx, 0.59, bz);
+    const bub = place(new THREE.SphereGeometry(br, 8, 6), m(0xf6fdff, 0.85, 0.0), bx * HOT_TUB_BUBBLE_SPREAD, 0.59, bz * HOT_TUB_BUBBLE_SPREAD);
     bub.scale.y = 0.4;
     (bub.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.8;
   }
   for (let i = 0; i < 6; i++) {
     const a = (i / 6) * Math.PI * 2 + 0.3;
-    const swirl = place(new THREE.SphereGeometry(0.12, 8, 6), m(0xeffcff, 0.85, 0.0), Math.cos(a) * 1.02, 0.585, Math.sin(a) * 1.02);
+    const swirl = place(new THREE.SphereGeometry(0.12, 8, 6), m(0xeffcff, 0.85, 0.0), Math.cos(a) * HOT_TUB_R.jets, 0.585, Math.sin(a) * HOT_TUB_R.jets);
     swirl.scale.set(1.2, 0.28, 0.6);
     swirl.rotation.y = -a;
     (swirl.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.75;
   }
-  const foam = place(new THREE.TorusGeometry(1.16, 0.04, 6, 36), flat(0xeffcff), 0, 0.575, 0);
+  const foam = place(new THREE.TorusGeometry(HOT_TUB_R.foam, 0.04, 6, 36), flat(0xeffcff), 0, 0.575, 0);
   foam.rotation.x = Math.PI / 2;
   (foam.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.85;
-  const rim = place(new THREE.TorusGeometry(1.46, 0.04, 6, 36), flat(GLOW), 0, 0.5, 0);
+  const rim = place(new THREE.TorusGeometry(HOT_TUB_R.glow, 0.04, 6, 36), flat(GLOW), 0, 0.5, 0);
   rim.rotation.x = Math.PI / 2;
   (rim.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.92;
   for (const [sx, sy, sz, sc] of [[-0.22, 0.87, -0.1, 0.11], [0.18, 0.93, 0.15, 0.1], [0.06, 0.83, -0.22, 0.09]] as [number, number, number, number][]) {
