@@ -3084,6 +3084,7 @@ async function joinRoomAtEpoch(
         (tick.flags & 8) === 8,
         (tick.flags & 16) === 16,
         (tick.flags & 32) === 32,
+        tick.seq,
       );
     } catch (e) {
       console.warn("Error unpacking incoming remote peer datagram tick:", e);
@@ -10613,6 +10614,8 @@ function animate() {
 
       const packed = packTick(tickData);
       networkProvider.sendTick(packed);
+      // 🪑 The counter a peer will see — breaks a seat clash (seatOccupancy).
+      world.noteSentTickSeq(tickData.seq);
       lastTickSent = currentTime;
     }
   } else {

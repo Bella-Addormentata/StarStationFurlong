@@ -22,7 +22,8 @@ import {
 } from "./poolWaiter";
 import type { WorkoutPose } from "./voxelCharacter";
 import { InputManager } from "./input";
-import { findSeatAt, rebuildSeats, SEATS } from "./seats";
+import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
+import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
 import {
@@ -256,6 +257,12 @@ interface RemoteAvatar {
   diveAge: number | null;
   /** 🏊‍♂️ replica y at arc start — the receiver replays its own parabola. */
   diveStartY: number;
+  /** 🪑 The seat this peer is in or sliding onto (seatOccupancy), or null. */
+  seatId: string | null;
+  /** 🪑 When this client first saw that claim (performance.now ms). */
+  seatSince: number;
+  /** 🪑 The peer's latest movement-tick counter — breaks a seat clash. */
+  seq: number;
 }
 
 /** 🛑📐 #80: render each room as an OCTAGON barrel (walls + 45° roof + basement)
@@ -556,6 +563,10 @@ export class World {
     this.player.onSeatSettled = (seat) => {
       if (seat.firstPerson) this.onFirstPersonSeat?.(seat.faceAngle);
     };
+    // 🪑 One person per seat: the walk re-checks on arrival, because someone
+    // can sit down while we are on the way.
+    this.player.seatGate = (seat) => this.freeSeatForLocal(seat);
+    this.player.onSeatRefused = (seat) => showHint(World.seatTakenHint(seat));
 
     // Furniture layout sync (issue #60 E4): reconcile the local room to the
     // shared `furniture` map whenever it changes. Subscribed ONCE here (not per
@@ -3838,6 +3849,8 @@ export class World {
     if (this.isPlayerActive()) {
       this.player.update(deltaTime, inputManager);
     }
+    // 🪑 Stamp the moment a local seat claim begins (a seat clash compares it).
+    this.syncLocalSeat();
 
     // Animate networked peer replicas (issue #21 — fox avatars, not spheres)
     this.updateRemoteAvatars(deltaTime);
@@ -4015,6 +4028,71 @@ export class World {
 
   public remotePlayers: Map<string, RemoteAvatar> = new Map();
 
+  // ── 🪑 One person per seat (seatOccupancy.ts) ──────────────────────────────
+  /** The seat the local player is in or sliding onto, as last seen. */
+  private localSeatId: string | null = null;
+  /** When that claim began (performance.now ms). */
+  private localSeatSince = 0;
+  /** The local movement-tick counter as last sent (main.ts). */
+  private localTickSeq = 0;
+
+  /** main.ts reports each movement tick it sends — the local half of the
+   *  counter comparison that breaks a seat clash. */
+  public noteSentTickSeq(seq: number): void {
+    this.localTickSeq = seq & 0xffff;
+  }
+
+  /** Re-read the local player's seat, stamping when a new claim began. */
+  private syncLocalSeat(): string | null {
+    const id = this.player.getSeatedSeatId();
+    if (id !== this.localSeatId) {
+      this.localSeatId = id;
+      this.localSeatSince = performance.now();
+    }
+    return id;
+  }
+
+  /** What to say when every spot of the kind asked for is taken. */
+  private static seatTakenHint(seat: Seat): string {
+    return seat.lie
+      ? "Someone is already in that bunk."
+      : "Someone is already sitting there.";
+  }
+
+  /** Seats other players are in or sliding onto. */
+  private seatsTakenByOthers(): Set<string> {
+    const taken = new Set<string>();
+    for (const avatar of this.remotePlayers.values()) {
+      if (avatar.seatId) taken.add(avatar.seatId);
+    }
+    return taken;
+  }
+
+  /** The seat to send the local player to for `seat` — see freeSeatFor. */
+  private freeSeatForLocal(seat: Seat): Seat | null {
+    return freeSeatFor(SEATS, seat, this.seatsTakenByOthers());
+  }
+
+  /**
+   * 🪑 A peer has just been placed in the seat the local player is in: both
+   * sat down within one network delay of each other (the click and the last
+   * step before sitting refuse a taken seat, so nothing slower gets here).
+   * keepsSeat gives the two games the same answer from opposite sides; the
+   * one it does not keep stands up.
+   */
+  private settleSeatClash(avatar: RemoteAvatar): void {
+    if (!avatar.seatId || avatar.seatId !== this.syncLocalSeat()) return;
+    const keep = keepsSeat({
+      mineSince: this.localSeatSince,
+      theirsSince: avatar.seatSince,
+      mySeq: this.localTickSeq,
+      theirSeq: avatar.seq,
+    });
+    if (keep) return;
+    this.player.evictFromSeat();
+    showHint("Someone sat down there at the same moment.");
+  }
+
   /** Stable [0,1) hash of a peer id (FNV-1a) — drives the per-peer fur tint. */
   private static peerHue01(id: string): number {
     let h = 0x811c9dc5;
@@ -4063,6 +4141,7 @@ export class World {
     elevated: boolean = false,
     swimming: boolean = false,
     diving: boolean = false,
+    seq: number = 0,
   ) {
     // 🏊/🛏️ The tick carries no y — derive the seat height locally: SEATS is
     // built from the SAME synced furniture doc on every client, so the seat
@@ -4107,6 +4186,16 @@ export class World {
             seated && priorAvatar
             ? priorAvatar.elevY
             : 0;
+    // 🪑 The seat this peer holds, settled on it or still sliding in. A seated
+    // peer the lookup misses keeps the claim it had, for the same reason the
+    // height above is held: this end's SEATS can lag the sender's. A wade
+    // into the pool is "seated" for its slide too, but it is open water and
+    // no seat (swimming, bit4, is up for that whole slide).
+    const seatId = seated && !swimming
+      ? (seatClaimedBy(SEATS, { x, z, facing, elevated })?.id ??
+        priorAvatar?.seatId ??
+        null)
+      : null;
     const avatar = priorAvatar;
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
@@ -4135,7 +4224,11 @@ export class World {
         diving,
         diveAge: diving ? 0 : null,
         diveStartY: 0,
+        seatId,
+        seatSince: performance.now(),
+        seq,
       });
+      this.settleSeatClash(this.remotePlayers.get(id)!);
       return;
     }
     // 🏊‍♂️ bit5 rising edge: start the local arc replay from wherever the
@@ -4163,6 +4256,12 @@ export class World {
     avatar.elevY = elevY;
     avatar.swimming = swimming;
     avatar.diving = diving;
+    if (seatId !== avatar.seatId) {
+      avatar.seatId = seatId;
+      avatar.seatSince = performance.now();
+    }
+    avatar.seq = seq;
+    this.settleSeatClash(avatar);
   }
 
   /**
@@ -4348,9 +4447,13 @@ export class World {
       }
       // Clicks landing on a chair/sofa footprint become sit requests:
       // walk to the seat front, turn back-to-the-chair, and sit down.
+      // 🪑 One person per seat: a taken seat sends the click to a free spot
+      // on the same piece, and a full piece says so instead of walking over.
       const seat = findSeatAt(x, z);
       if (seat) {
-        this.player.navigateToSeat(seat);
+        const free = this.freeSeatForLocal(seat);
+        if (free) this.player.navigateToSeat(free);
+        else showHint(World.seatTakenHint(seat));
       } else {
         this.player.navigateTo(x, z);
       }
