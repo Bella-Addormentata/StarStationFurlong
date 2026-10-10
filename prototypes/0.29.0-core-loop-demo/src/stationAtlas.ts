@@ -1802,16 +1802,19 @@ export function isSaneDims(d: unknown): d is { cols: number; rows: number } {
   return ok(v.cols) && ok(v.rows);
 }
 
-/** 🔭 A gossiped cupola list: at most two distinct wall names. */
+/** 🔭 A gossiped cupola list: none, one wall, or the two ends of one axis
+ *  (x-/x+ or y-/y+), the only pair a module can have. */
 function isPlainCupola(v: unknown): v is CupolaWall[] {
   return Array.isArray(v) && v.length <= 2
-    && v.every((w, i) => (CUPOLA_WALLS as readonly unknown[]).includes(w) && v.indexOf(w) === i);
+    && v.every((w, i) => (CUPOLA_WALLS as readonly unknown[]).includes(w) && v.indexOf(w) === i)
+    && (v.length < 2 || (v[0] as string)[0] === (v[1] as string)[0]);
 }
 
-/** 🔭 A cupola list copied out of whatever produced it, at most two distinct
- *  wall names. */
+/** 🔭 A cupola list copied out of whatever produced it, held to what
+ *  isPlainCupola accepts: a cross-axis pair keeps its first wall. */
 function cleanCupola(walls: readonly CupolaWall[]): CupolaWall[] {
-  return walls.filter((w, i) => CUPOLA_WALLS.includes(w) && walls.indexOf(w) === i).slice(0, 2);
+  const out = walls.filter((w, i) => CUPOLA_WALLS.includes(w) && walls.indexOf(w) === i).slice(0, 2);
+  return out.length === 2 && out[0][0] !== out[1][0] ? [out[0]] : out;
 }
 
 /** `{ cupola }` when the cupola walls are known (empty included), else nothing. */
@@ -2124,10 +2127,13 @@ export function pushAtlasToDoc(): void {
         const docOwner = ownerOf(known.owner);
         const owner = docOwner === undefined ? entry.owner : withOwnerDetails(docOwner, entry.owner);
         const owned = known.dismantledAt === undefined && owner !== undefined && !sameOwner(owner, docOwner);
-        if (flagged || owned) {
+        // 🔭 …and so do cupola walls we know and that copy lacks.
+        const domed = known.dismantledAt === undefined && known.cupola === undefined && entry.cupola !== undefined;
+        if (flagged || owned || domed) {
           sharedMap!.set(entry.roomId, {
             ...(flagged ?? known),
             ...(owned ? { owner } : {}),
+            ...(domed ? cupolaSpread(entry.cupola) : {}),
             updatedAt: Math.min(known.updatedAt + 1, Date.now() + MAX_GOSSIP_SKEW_MS),
           });
         }

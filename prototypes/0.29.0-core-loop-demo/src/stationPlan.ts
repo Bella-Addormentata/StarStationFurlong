@@ -128,13 +128,33 @@ export function moduleCupolaGlass(
 }
 
 /** Is the plan point (x, z) inside the module's footprint? */
-export function moduleContains(m: Pick<PlanModule, 'x' | 'z' | 'rotY' | 'halfX' | 'halfZ'>, x: number, z: number): boolean {
+export function moduleContains(
+  m: Pick<PlanModule, 'x' | 'z' | 'rotY' | 'halfX' | 'halfZ' | 'cupola'>,
+  x: number,
+  z: number,
+): boolean {
   // Into the module's own frame: the inverse of moduleCorners' rotation.
   const dx = x - m.x, dz = z - m.z;
   const cos = Math.cos(m.rotY), sin = Math.sin(m.rotY);
   const lx = dx * cos - dz * sin;
   const lz = dx * sin + dz * cos;
-  return Math.abs(lx) <= m.halfX && Math.abs(lz) <= m.halfZ;
+  if (Math.abs(lx) > m.halfX || Math.abs(lz) > m.halfZ) return false;
+  // 🔭 …and not in a corner a cupola end cuts off (moduleOutline).
+  const plans = cupolaPlans({ halfX: m.halfX, halfZ: m.halfZ }, m.cupola ?? null);
+  return plans.length === 0 || insideConvex(cupolaFloorOutline(plans), lx, lz);
+}
+
+/** Is (x, z) inside or on a convex polygon, whichever way it winds? */
+function insideConvex(poly: Array<{ x: number; z: number }>, x: number, z: number): boolean {
+  let sign = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const cross = (b.x - a.x) * (z - a.z) - (b.z - a.z) * (x - a.x);
+    if (Math.abs(cross) < 1e-9) continue;
+    if (sign === 0) sign = Math.sign(cross);
+    else if (Math.sign(cross) !== sign) return false;
+  }
+  return true;
 }
 
 /** The topmost module or ship under a plan point: ships draw over modules,

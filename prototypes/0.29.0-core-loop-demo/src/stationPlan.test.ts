@@ -765,3 +765,15 @@ describe('🔭 cupolas on the plan (issue 219)', () => {
     expect(moduleCupolaGlass(old)).toEqual([]);
   });
 });
+
+describe('🔭 picking a module with a cupola (issue 219)', () => {
+  it('a click in a corner the cupola cuts off misses the module', () => {
+    harvestIntoAtlas({ roomId: 'room-c', name: 'DOME', dims: { cols: 2, rows: 3 }, cupola: ['y+'], doors: [] });
+    const plan = stationPlan(readAtlas(), 'room-c');
+    const [m] = plan.modules;
+    expect(planModuleAt(plan, 0, 8.9)?.roomId).toBe('room-c');   // the tip window's middle
+    expect(planModuleAt(plan, 5.9, 8.9)).toBeNull();            // the cut corner
+    expect(planModuleAt(plan, 5.9, -8.9)?.roomId).toBe('room-c'); // the plain end's corner
+    expect(moduleContains(m, 0, 0)).toBe(true);
+  });
+});

@@ -721,3 +721,24 @@ describe('🔭 cupola walls travel with the atlas (issue 219)', () => {
     expect(readAtlas()['module-a'].cupola).toEqual([]);
   });
 });
+
+describe('🔭 cupola gossip edges (issue 219, review)', () => {
+  it('refuses a cross-axis pair', () => {
+    doc.getMap('atlas').set('module-x', {
+      roomId: 'module-x', name: 'X', doors: { n: { targetRoomId: 'module-nbr' } },
+      cupola: ['x-', 'y-'], updatedAt: Date.now() - 1000,
+    });
+    bind('module-self');
+    expect(readAtlas()['module-x']).toBeUndefined();
+  });
+
+  it("adds the cupola we know to an older client's copy that is as new as ours", () => {
+    harvestIntoAtlas({ roomId: 'module-a', name: 'A', cupola: ['y-'], doors: [{ doorId: 'n', targetSeed: 'ssf://room#room=module-nbr' }] });
+    const ours = readAtlas()['module-a'];
+    doc.getMap('atlas').set('module-a', {
+      roomId: 'module-a', name: 'A', doors: { n: { targetRoomId: 'module-nbr' } }, updatedAt: ours.lastSeen + 1000,
+    });
+    bind('module-self');
+    expect((doc.getMap('atlas').get('module-a') as { cupola?: unknown }).cupola).toEqual(['y-']);
+  });
+});
