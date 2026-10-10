@@ -1,25 +1,29 @@
 /**
- * 🔭 The far pass — a perspective backdrop behind the isometric station
- * (owner ask, 2026-09-27; geometry in farOrbits.ts).
+ * 🔭 The far pass — the planet view outside the station (owner ask,
+ * 2026-09-27; geometry in farOrbits.ts).
  *
- * While the exterior view is up, each frame is drawn in three passes:
- *   1. the main scene's SKY only (nebula + stars, on SKY_LAYER), through the
- *      game's orthographic camera — the backdrop it always had;
- *   2. the FAR scene through a perspective camera that copies the ortho
- *      camera's orientation (so the rig's 45° detents and the slow drift turn
- *      it too) and sits EYE_DISTANCE behind the viewer: the planet at its
- *      true size off the station's −X, every known orbit ring, the other
- *      stations (a box per module) and ships in flight on their transfers;
- *   3. the main scene WITHOUT the sky, depth cleared, so the isometric station
- *      always sits on top — unchanged from before.
+ * The exterior view has two zoom steps (issue 218):
+ *  - the STATION VIEW: the main scene's SKY only (nebula + stars, on
+ *    SKY_LAYER), then the isometric station on top, depth cleared — our
+ *    station alone, as it was before the far view;
+ *  - the PLANET VIEW, one step further out: the sky, then the FAR scene
+ *    through a perspective camera that turns with the ortho camera (so the
+ *    rig's 45° detents and the slow drift turn it too) and sits EYE_DISTANCE
+ *    behind the viewer: the planet at its true size off the station's −X,
+ *    every known orbit ring, every station (this one included) laid out as
+ *    its atlas knows it, all at one scale, and ships in flight on their
+ *    transfers. The isometric station is not drawn over it: this station is
+ *    one of the stations out there. The camera tips up when the planet would
+ *    hide this station (farOrbits.forwardClearOf).
  * Outside the exterior view `renderWithFarPass` is one plain render.
  *
- * Distant bodies are impostors at a fixed SCREEN size (a real station 2,000 km
- * off is far below a pixel): each frame their scale follows their distance.
- * Their places are exact angles on the shared clock with compressed
- * altitudes (farOrbits.ts); what is known about them comes from the station
- * list and the per-planet summary (planetSummary.ts) — never another
- * station's full atlas.
+ * Stations are drawn at one common scale (STATION_PX_PER_UNIT at the
+ * camera's distance from this station), so a real module 2,000 km off is
+ * still seen. Ships and planets are impostors at a fixed SCREEN size. Places
+ * are exact angles on the shared clock with compressed altitudes
+ * (farOrbits.ts); what is known about other stations comes from the station
+ * list, the per-planet summary (planetSummary.ts) and the shared station
+ * atlas (stationPlan.ts), as the holotable reads it.
  *
  * A station moving between planets shows the sun's frame instead
  * (farOrbits.transitLayout): the old planet is gone from outside the windows
@@ -36,8 +40,13 @@ import {
   wrapAngle,
 } from './orbits';
 import type { OrbitPoint, TransferPlan } from './orbits';
-import { frozenCourse, planetLayout, transitLayout } from './farOrbits';
-import type { FarBody, FarLayout, FarShipInput, FarStationInput, FrozenCourses } from './farOrbits';
+import { forwardClearOf, frozenCourse, planetLayout, transitLayout } from './farOrbits';
+import type {
+  FarBody, FarLayout, FarShipInput, FarStationInput, FarViewerBody, FrozenCourses, StationShape,
+} from './farOrbits';
+import { stationPlan } from './stationPlan';
+import type { StationPlan } from './stationPlan';
+import type { AtlasEntry } from './stationAtlas';
 import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt, stationPointWithMoveAt } from './stationMove';
 import { isShipReady } from './devices';
@@ -75,20 +84,32 @@ const OLD_PLANET_NAMES = ['ambientPlanet', 'ambientPlanetGlow', 'deckPlanet'];
 const EYE_DISTANCE = 14_000;
 const FOV_DEG = 40;
 /** On-screen sizes, CSS px. */
-const MODULE_PX = 7;
 const SHIP_PX = 9;
 const PLANET_PX = 16;
 const SUN_PX = 30;
-/** Boxes per row of a station impostor; bigger stations wrap to more rows.
- *  Every module gets a box (a station's count is bounded by the atlas cap,
- *  stationAtlas.MAX_ENTRIES, and every box shares one geometry and material). */
+/** Every station's scale: CSS px per room unit (a 2×2 module is 12 units)
+ *  at the camera's distance from this station. One scale for all of them,
+ *  this station included (issue 218); a nearer station looks bigger. */
+const STATION_PX_PER_UNIT = 0.8;
+/** Station labels' height, CSS px at that same distance. */
+const LABEL_PX = 14;
+/** A module's height, room units (its footprint comes from the atlas). */
+const MODULE_HEIGHT = 8;
+/** A connection's width and height between two modules, room units. */
+const LINK_WIDTH = 2.5;
+/** The footprint of a module the atlas never learned the size of, and the
+ *  grid a station known only by its module count is laid out on. */
+const FALLBACK_HALF = 6;
 const MODULES_PER_ROW = 8;
+const FALLBACK_GAP = 6;
 /** How often the list of what is out there is re-read, real ms. */
 const REFRESH_MS = 1000;
 
 const RING_COLOR = 0x9fd4ff;
 const PATH_COLOR = 0xffa040;
 const STATION_COLOR = 0xd8e2ee;
+const OWN_STATION_COLOR = 0xf0c060;
+const LINK_COLOR = 0x8a9bb0;
 const SHIP_COLOR = 0xffa040;
 
 // ── What is out there (re-read every REFRESH_MS) ────────────────────────────
@@ -99,13 +120,14 @@ type Source =
       planetId: string;
       viewer: (ms: number) => OrbitPoint;
       viewerRingRadiusKm?: number;
-      stations: Array<{ record: StationRecord; modules: number }>;
+      stations: Array<{ record: StationRecord; modules: number; shape?: StationShape }>;
       ships: FarShipInput[];
+      own: FarViewerBody;
       key: string;
       /** See stationYaw. */
       yaw: number;
     }
-  | { mode: 'sun'; move: StationMove; key: string; yaw: number };
+  | { mode: 'sun'; move: StationMove; own: FarViewerBody; key: string; yaw: number };
 
 /** The far frame is the station's (its welcome room's): the iso scene is
  *  drawn in the current room's, which atlasLayout anchors at zero yaw, so a
@@ -237,6 +259,46 @@ function modulesOf(station: StationRecord, components: Set<string>[], atlas: Rec
   return Math.min(MAX_ENTRIES, Math.max(1, n));
 }
 
+/** 🛰️ A station's shape from its plan (the holotable's layout of its atlas),
+ *  docked ships included; undefined when the atlas does not know it. */
+export function shapeOfPlan(plan: StationPlan): StationShape | undefined {
+  if (plan.modules.length === 0) return undefined;
+  const all = [...plan.modules, ...plan.ships];
+  const byId = new Map(all.map((m) => [m.roomId, m]));
+  const modules = all.map((m) => ({
+    x: m.x, z: m.z, rotY: m.rotY, halfX: m.halfX, halfZ: m.halfZ, ship: m.kind === 'ship',
+  }));
+  const links: StationShape['links'] = [];
+  const seen = new Set<string>();
+  for (const m of all) {
+    for (const l of m.links) {
+      const to = byId.get(l.toRoomId);
+      if (!to || to === m) continue;
+      const pair = JSON.stringify(m.roomId < to.roomId ? [m.roomId, to.roomId] : [to.roomId, m.roomId]);
+      if (seen.has(pair)) continue;
+      seen.add(pair);
+      links.push({ ax: m.x, az: m.z, bx: to.x, bz: to.z });
+    }
+  }
+  return { modules, links };
+}
+
+/** The shape of the station holding `rootRoomId`, as this client knows it. */
+function shapeOf(atlas: Record<string, AtlasEntry>, rootRoomId: string | undefined, liveRoomId: string): StationShape | undefined {
+  if (!rootRoomId) return undefined;
+  return shapeOfPlan(stationPlan(atlas, rootRoomId, liveRoomId));
+}
+
+/** A shape's part of a rebuild key: what buildFrame draws from it. */
+function shapeKey(shape: StationShape | undefined): unknown {
+  if (!shape) return null;
+  const r = (n: number) => Math.round(n * 10) / 10;
+  return [
+    shape.modules.map((m) => [r(m.x), r(m.z), r(m.rotY * 100), r(m.halfX), r(m.halfZ), m.ship ? 1 : 0]),
+    shape.links.map((l) => [r(l.ax), r(l.az), r(l.bx), r(l.bz)]),
+  ];
+}
+
 /** What is out there now. Old plans are dropped after the read, not before
  *  it, so a flight it looks up is kept however long the far pass was off. */
 function gather(now: number): Source {
@@ -365,11 +427,22 @@ function readSource(now: number): Source {
   // malformed record, say both ends on one planet, has none): otherwise the
   // planet view below, never an empty backdrop.
   const yaw = me ? stationYaw(me.welcomeRoomId, roomId) : 0;
+  // 🛰️ This station drawn among the others (issue 218): laid out from its
+  // welcome room, the far frame's own; aboard a ship, the ship's room.
+  const ownRoot = me?.welcomeRoomId && Object.prototype.hasOwnProperty.call(atlas, me.welcomeRoomId)
+    ? me.welcomeRoomId : roomId;
+  const ownShape = shapeOf(atlas, ownRoot, roomId);
+  const roomName = Object.prototype.hasOwnProperty.call(atlas, roomId) ? atlas[roomId].name : '';
+  const own: FarViewerBody = {
+    name: me?.name || roomName || 'HERE',
+    ...(ownShape ? { shape: ownShape } : {}),
+  };
   if (me && reallyMoving(me, now) && me.move) {
     const m = me.move;
     // JSON, not a joined string: ids come from peers and may hold any delimiter.
-    return { mode: 'sun', move: m, yaw, key: JSON.stringify([
+    return { mode: 'sun', move: m, yaw, own, key: JSON.stringify([
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
+        own.name, shapeKey(own.shape),
       ]) };
   }
 
@@ -472,33 +545,40 @@ function readSource(now: number): Source {
     // lasts; parked, it is one again.
     .filter((s) => !stationFlyingFree(s, now) && (!flying.has(s.welcomeRoomId) || !s.derived))
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
-    .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
+    .map((record) => {
+      const shape = shapeOf(atlas, record.welcomeRoomId, roomId);
+      return { record, modules: modulesOf(record, components, atlas), ...(shape ? { shape } : {}) };
+    });
 
   const key = JSON.stringify([
     'planet',
     planetId,
     viewerRingRadiusKm ?? 'x',
+    own.name, shapeKey(own.shape),
     // Everything buildFrame draws once: ring radii (a trim moves a ring
-    // without changing its slot), names, module counts and each course.
-    ...stations.map((s) => [s.record.id, stationOrbit(s.record).radiusKm.toFixed(3), s.modules, s.record.name]),
+    // without changing its slot), names, module counts, shapes and each course.
+    ...stations.map((s) => [
+      s.record.id, stationOrbit(s.record).radiusKm.toFixed(3), s.modules, s.record.name, shapeKey(s.shape),
+    ]),
     ...ships.map((s) => s.plan ? [
       s.id, s.name, s.plan.departAt, s.plan.arriveAt,
       s.plan.from.radiusKm.toFixed(3), s.plan.from.phase0, s.plan.to.radiusKm.toFixed(3), s.plan.to.phase0,
     ] : [s.id, s.name, 'free']),
   ]);
-  return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key, yaw };
+  return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, own, key, yaw };
 }
 
 /** The layout now; `withPaths` samples the courses too, which only a
  *  rebuild of the static geometry needs. */
 function layoutFor(source: Source, now: number, withPaths: boolean): FarLayout | null {
-  if (source.mode === 'sun') return transitLayout(source.move, now, withPaths);
-  const stations: FarStationInput[] = source.stations.map(({ record, modules }) => ({
+  if (source.mode === 'sun') return transitLayout(source.move, now, withPaths, source.own);
+  const stations: FarStationInput[] = source.stations.map(({ record, modules, shape }) => ({
     id: record.id,
     name: record.name,
     point: stationPointWithMoveAt(record, now),
     ringRadiusKm: stationOrbit(record).radiusKm,
     modules,
+    ...(shape ? { shape } : {}),
   }));
   return planetLayout({
     planetId: source.planetId,
@@ -508,12 +588,16 @@ function layoutFor(source: Source, now: number, withPaths: boolean): FarLayout |
     stations,
     ships: source.ships,
     withPaths,
+    viewerBody: source.own,
   });
 }
 
 // ── The far scene ────────────────────────────────────────────────────────────
 
+/** The exterior view is up (station or planet view). */
 let active = false;
+/** …and zoomed out to the planet view. */
+let orbit = false;
 let farScene: THREE.Scene | null = null;
 let farCamera: THREE.PerspectiveCamera | null = null;
 /** The planet (or sun) frame, re-posed each frame so the viewer sits at the
@@ -528,8 +612,10 @@ let oldPlanets: THREE.Object3D[] | null = null;
 /** Bodies are keyed by kind AND id: a station's id is free text and could
  *  equal a ship's `ship:<room>`. */
 const bodyKey = (b: FarBody): string => `${b.kind}\u0000${b.id}`;
-/** Screen-sized objects: body key → [object, px per local unit]. */
-const bodies = new Map<string, { obj: THREE.Object3D; px: number }>();
+/** Body key → its object and how it is sized: `px` per local unit on
+ *  screen (ships, planets, the sun), or 0 for a station, drawn at the one
+ *  station scale. */
+const bodies = new Map<string, { obj: THREE.Object3D; px: number; label?: THREE.Sprite }>();
 
 function ensureScene(): void {
   if (farScene) return;
@@ -605,21 +691,69 @@ function circle(radius: number, color: number, opacity: number): THREE.LineLoop 
   );
 }
 
-function stationImpostor(body: FarBody): THREE.Object3D {
-  const g = new THREE.Group();
-  const n = body.modules;
+/** A station known only by its module count: a grid of default modules
+ *  along the direction of travel (local −Z), stacked outward (+X). */
+export function fallbackShape(modules: number): StationShape {
+  const n = Math.max(1, Math.floor(modules));
   const perRow = Math.min(MODULES_PER_ROW, n);
   const rows = Math.ceil(n / perRow);
-  const geo = new THREE.BoxGeometry(1, 0.8, 1);
-  const mat = new THREE.MeshStandardMaterial({ color: STATION_COLOR, roughness: 0.6, metalness: 0.3, emissive: 0x223344 });
-  // Rows of modules along the direction of travel (local −Z), stacked
-  // outward (+X), centred.
+  const pitch = FALLBACK_HALF * 2 + FALLBACK_GAP;
+  const out: StationShape = { modules: [], links: [] };
   for (let i = 0; i < n; i++) {
-    const box = new THREE.Mesh(geo, mat);
-    box.position.z = -((i % perRow) - (perRow - 1) / 2) * 1.25;
-    box.position.x = (Math.floor(i / perRow) - (rows - 1) / 2) * 1.25;
-    g.add(box);
+    out.modules.push({
+      x: (Math.floor(i / perRow) - (rows - 1) / 2) * pitch,
+      z: -((i % perRow) - (perRow - 1) / 2) * pitch,
+      rotY: 0, halfX: FALLBACK_HALF, halfZ: FALLBACK_HALF, ship: false,
+    });
   }
+  return out;
+}
+
+/** A station as its atlas lays it out, in room units about its welcome
+ *  room: a box per module (its true footprint when known) and a beam for
+ *  each connection between two of them, with its name above. */
+function stationModel(body: FarBody): THREE.Object3D {
+  const g = new THREE.Group();
+  const shape = body.shape ?? fallbackShape(body.modules);
+  const moduleMat = new THREE.MeshStandardMaterial({
+    color: body.own ? OWN_STATION_COLOR : STATION_COLOR,
+    roughness: 0.6, metalness: 0.3, emissive: body.own ? 0x3a2a10 : 0x223344,
+  });
+  const shipMat = new THREE.MeshStandardMaterial({ color: SHIP_COLOR, roughness: 0.6, metalness: 0.3, emissive: 0x331a00 });
+  const linkMat = new THREE.MeshStandardMaterial({ color: LINK_COLOR, roughness: 0.7, metalness: 0.3, emissive: 0x1a222c });
+  const unitBox = new THREE.BoxGeometry(1, 1, 1);
+  let reach = 0;
+  for (const l of shape.links) {
+    const len = Math.hypot(l.bx - l.ax, l.bz - l.az);
+    if (!(len > 0)) continue;
+    const beam = new THREE.Mesh(unitBox, linkMat);
+    beam.scale.set(LINK_WIDTH, LINK_WIDTH, len);
+    beam.position.set((l.ax + l.bx) / 2, 0, (l.az + l.bz) / 2);
+    // Local +Z along the link: rotation.y = atan2(dx, dz).
+    beam.rotation.y = Math.atan2(l.bx - l.ax, l.bz - l.az);
+    g.add(beam);
+  }
+  for (const m of shape.modules) {
+    const box = new THREE.Mesh(unitBox, m.ship ? shipMat : moduleMat);
+    box.scale.set(m.halfX * 2, MODULE_HEIGHT, m.halfZ * 2);
+    box.position.set(m.x, 0, m.z);
+    box.rotation.y = m.rotY;
+    g.add(box);
+    reach = Math.max(reach, Math.hypot(m.x, m.z) + Math.hypot(m.halfX, m.halfZ));
+  }
+  const label = labelSprite(body.name, body.own ? '#f6d68a' : '#e8f2ff');
+  // A sprite is sized in its parent's units: LABEL_PX at the station scale.
+  const h = LABEL_PX / STATION_PX_PER_UNIT;
+  label.scale.multiplyScalar(h / 2);
+  label.center.set(0.5, 0);
+  label.position.set(0, reach + MODULE_HEIGHT, 0);
+  // At this scale the label is hundreds of km wide and would cut into the
+  // planet: it is drawn over everything, and hidden instead while its
+  // station is behind the planet (sizeBodies).
+  label.material.depthTest = false;
+  label.renderOrder = 10;
+  label.name = 'far-station-label';
+  g.add(label);
   return g;
 }
 
@@ -684,9 +818,11 @@ function buildFrame(layout: FarLayout): void {
   for (const b of layout.bodies) {
     let obj: THREE.Object3D;
     let px: number;
+    let label: THREE.Sprite | undefined;
     if (b.kind === 'station') {
-      obj = stationImpostor(b);
-      px = MODULE_PX;
+      obj = stationModel(b);
+      px = 0;
+      label = obj.getObjectByName('far-station-label') as THREE.Sprite | undefined;
     } else if (b.kind === 'ship') {
       obj = shipImpostor();
       px = SHIP_PX;
@@ -697,12 +833,14 @@ function buildFrame(layout: FarLayout): void {
       obj = sphereImpostor(planetById(b.id).color);
       px = PLANET_PX;
     }
-    const label = labelSprite(b.name, b.kind === 'ship' ? '#ffc080' : '#e8f2ff');
-    label.position.set(0.8, 0.8, 0);
-    obj.add(label);
+    if (b.kind !== 'station') {
+      const label = labelSprite(b.name, b.kind === 'ship' ? '#ffc080' : '#e8f2ff');
+      label.position.set(0.8, 0.8, 0);
+      obj.add(label);
+    }
     obj.name = `far-body-${b.id}`;
     frame.add(obj);
-    bodies.set(bodyKey(b), { obj, px });
+    bodies.set(bodyKey(b), { obj, px, ...(label ? { label } : {}) });
   }
 
   farScene.add(frame);
@@ -731,14 +869,41 @@ function poseFrame(layout: FarLayout, yaw: number): void {
   }
 }
 
+/** The planet in the far camera's world, while one is drawn. */
+let planetSphere: { centre: THREE.Vector3; radius: number } | null = null;
+
+/** Does the segment from `a` to `b` pass through the sphere? */
+function lineHitsSphere(a: THREE.Vector3, b: THREE.Vector3, centre: THREE.Vector3, radius: number): boolean {
+  const ab = tmpAb.subVectors(b, a);
+  const len2 = ab.lengthSq();
+  const t = len2 > 0 ? Math.min(1, Math.max(0, tmpAc.subVectors(centre, a).dot(ab) / len2)) : 0;
+  return tmpAc.copy(a).addScaledVector(ab, t).distanceTo(centre) < radius;
+}
+const tmpAb = new THREE.Vector3();
+const tmpAc = new THREE.Vector3();
+
+/** The sphere the camera keeps its line to this station clear of: the
+ *  planet's air (1.025 of its radius) and a little more. */
+const PLANET_CLEARANCE = 1.04;
+
 const tmp = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
 
-/** Keep every impostor at its on-screen size. */
+/** Keep every impostor at its on-screen size, and every station at the one
+ *  station scale. */
 function sizeBodies(heightPx: number): void {
   if (!farCamera) return;
   const perPxAt1 = (2 * Math.tan(THREE.MathUtils.degToRad(farCamera.fov) / 2)) / Math.max(1, heightPx);
-  for (const { obj, px } of bodies.values()) {
+  const stationScale = EYE_DISTANCE * perPxAt1 * STATION_PX_PER_UNIT;
+  for (const { obj, px, label } of bodies.values()) {
+    if (px === 0) {
+      obj.scale.setScalar(stationScale);
+      if (label) {
+        obj.getWorldPosition(tmp);
+        label.visible = !planetSphere || !lineHitsSphere(farCamera.position, tmp, planetSphere.centre, planetSphere.radius);
+      }
+      continue;
+    }
     obj.getWorldPosition(tmp);
     // Camera-space depth, not distance: a perspective projection scales
     // by depth, so an off-axis body keeps its size as the view drifts.
@@ -778,7 +943,22 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
   cam.aspect = size.x / Math.max(1, size.y);
   cam.quaternion.copy(ortho.quaternion);
   const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(ortho.quaternion);
-  cam.position.copy(forward.multiplyScalar(-EYE_DISTANCE));
+  // 🛰️ Tip the camera up while the planet would hide this station (issue
+  // 218): the planet sits at the frame's origin, with its air around it.
+  planetSphere = layout?.planet && frame
+    ? { centre: frame.position.clone(), radius: layout.planet.radiusKm } : null;
+  if (layout?.planet && frame) {
+    const r = layout.planet.radiusKm * PLANET_CLEARANCE;
+    const c = frame.position;
+    const clear = forwardClearOf(forward, { x: c.x, y: c.y, z: c.z }, r, EYE_DISTANCE);
+    if (clear !== forward) {
+      forward.set(clear.x, clear.y, clear.z);
+      cam.position.copy(forward).multiplyScalar(-EYE_DISTANCE);
+      cam.up.set(0, 1, 0);
+      cam.lookAt(0, 0, 0);
+    }
+  }
+  cam.position.copy(forward).multiplyScalar(-EYE_DISTANCE);
   cam.updateProjectionMatrix();
   cam.updateMatrixWorld();
   frame?.updateMatrixWorld(true);
@@ -791,9 +971,18 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
 /** exteriorView turns the far pass on and off with the space view. */
 export function setFarPassActive(on: boolean): void {
   active = on;
+  if (!on) orbit = false;
   source = null;
   oldPlanets = null;
-  if (!on) clearFrame();
+  if (!on || !orbit) clearFrame();
+}
+
+/** exteriorView's planet view (issue 218): the far scene instead of the
+ *  isometric station. Only while the space view is up. */
+export function setFarPassOrbit(on: boolean): void {
+  orbit = on && active;
+  source = null;
+  if (!orbit) clearFrame();
 }
 
 /** Re-read what is out there on the next frame (room swapped, stations
@@ -803,8 +992,8 @@ export function refreshFarPass(): void {
   oldPlanets = null;
 }
 
-/** The frame's render: one plain render, or sky → far pass → station while
- *  the exterior view is up. */
+/** The frame's render: one plain render; sky → station in the station view;
+ *  sky → far scene in the planet view. */
 export function renderWithFarPass(
   renderer: THREE.WebGLRenderer,
   scene: THREE.Scene,
@@ -827,7 +1016,7 @@ export function renderWithFarPass(
   const cameraLayers = camera.layers.mask;
   const autoClear = renderer.autoClear;
   try {
-    update(renderer, camera);
+    if (orbit) update(renderer, camera);
     // 1. The sky alone (clears with the scene background as usual). A room
     //    shows its nebula only on a deck, so the sky is shown for this pass.
     for (const o of sky) o.visible = true;
@@ -835,12 +1024,16 @@ export function renderWithFarPass(
     renderer.render(scene, camera);
     camera.layers.mask = cameraLayers;
     renderer.autoClear = false;
-    // 2. The far scene.
-    if (farScene && farCamera && frame) {
-      renderer.clearDepth();
-      renderer.render(farScene, farCamera);
+    // 2. The planet view: the far scene, this station among the others.
+    if (orbit) {
+      if (farScene && farCamera && frame) {
+        renderer.clearDepth();
+        renderer.render(farScene, farCamera);
+      }
+      return;
     }
-    // 3. The station, on top, without the sky or a clearing background.
+    // 2. The station view: the station, without the sky or a clearing
+    //    background.
     renderer.clearDepth();
     for (const o of sky) o.visible = false;
     scene.background = null;

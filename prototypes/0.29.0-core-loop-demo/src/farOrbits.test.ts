@@ -17,8 +17,10 @@ import {
   compressAltitudeKm,
   compressPlanetPoint,
   compressRadiusKm,
+  forwardClearOf,
   frozenCourse,
   planetLayout,
+  VIEWER_BODY_ID,
   sampleCourse,
   sunDirectionAround,
   transitLayout,
@@ -156,6 +158,84 @@ describe('planetLayout', () => {
   });
 });
 
+describe('the viewer drawn among the stations (issue 218)', () => {
+  const me = station(0);
+  const shape = {
+    modules: [{ x: 0, z: 0, rotY: 0, halfX: 6, halfZ: 6, ship: false }, { x: 30, z: 0, rotY: Math.PI / 2, halfX: 6, halfZ: 9, ship: false }],
+    links: [{ ax: 0, az: 0, bx: 30, bz: 0 }],
+  };
+
+  it("sits at the viewer's place, lined up with its orbit, carrying its shape", () => {
+    const layout = planetLayout({
+      planetId: SOV, nowMs: T, viewer: stationPointAt(me, T), stations: [], ships: [],
+      viewerBody: { name: 'HOME', shape },
+    });
+    const own = layout.bodies.find((b) => b.id === VIEWER_BODY_ID)!;
+    expect(own).toMatchObject({ kind: 'station', name: 'HOME', own: true, modules: 2, shape });
+    expect(own.angle).toBeCloseTo(stationPointAt(me, T).angle, 12);
+    // In the viewer's frame it is at the origin, where the camera looks.
+    const seen = applyFrameTransform(layout.transform, own.position);
+    expect(Math.hypot(seen.x, seen.y, seen.z)).toBeLessThan(1e-6);
+  });
+
+  it('is left out unless asked for, and other stations keep their shapes', () => {
+    const other = { id: 's3', name: 'S3', point: stationPointAt(station(3), T), ringRadiusKm: stationOrbit(station(3)).radiusKm, modules: 2, shape };
+    const layout = planetLayout({ planetId: SOV, nowMs: T, viewer: stationPointAt(me, T), stations: [other], ships: [] });
+    expect(layout.bodies.map((b) => b.id)).toEqual(['s3']);
+    expect(layout.bodies[0].shape).toBe(shape);
+  });
+
+});
+
+describe('forwardClearOf: the planet never hides the viewer (issue 218)', () => {
+  const R = planet.radiusKm * 1.04;
+  const d = 14_000;
+  // The planet off the viewer's −X, as in the far frame: centre at the
+  // viewer's compressed orbit radius.
+  const centre = { x: -compressRadiusKm(stationOrbit(station(0)).radiusKm, planet), y: 0, z: 0 };
+  const iso = (azimuth: number) => {
+    // An isometric look: 35.26° down, heading `azimuth` about +Y.
+    const e = Math.atan(1 / Math.SQRT2);
+    return { x: Math.cos(e) * Math.sin(azimuth), y: -Math.sin(e), z: -Math.cos(e) * Math.cos(azimuth) };
+  };
+  const hits = (f: { x: number; y: number; z: number }) => {
+    // Sample the line from the camera to the viewer.
+    for (let i = 0; i <= 400; i++) {
+      const t = i / 400;
+      const p = { x: -f.x * d * (1 - t), y: -f.y * d * (1 - t), z: -f.z * d * (1 - t) };
+      if (Math.hypot(p.x - centre.x, p.y - centre.y, p.z - centre.z) < R - 1e-6) return true;
+    }
+    return false;
+  };
+
+  it('keeps a view from the side away from the planet as it is', () => {
+    // Looking toward −X from out past +X: the planet is behind the viewer.
+    const e = Math.atan(1 / Math.SQRT2);
+    const away = { x: -Math.cos(e), y: -Math.sin(e), z: 0 };
+    expect(hits(away)).toBe(false);
+    expect(forwardClearOf(away, centre, R, d)).toBe(away);
+  });
+
+  it('tips the camera up, heading kept, when it looks across the planet', () => {
+    // Looking toward +X: the camera sits out past the planet's side.
+    const f = { x: Math.cos(Math.atan(1 / Math.SQRT2)), y: -Math.sin(Math.atan(1 / Math.SQRT2)), z: 0 };
+    expect(hits(f)).toBe(true);
+    const clear = forwardClearOf(f, centre, R, d);
+    expect(hits(clear)).toBe(false);
+    expect(Math.hypot(clear.x, clear.y, clear.z)).toBeCloseTo(1, 9);
+    expect(clear.y).toBeLessThan(f.y); // steeper
+    expect(Math.sign(clear.x)).toBe(1); // same heading
+    expect(Math.abs(clear.z)).toBeLessThan(1e-9);
+    // No steeper than it needs: a quarter degree less still hits.
+    const e = Math.asin(-clear.y) - Math.PI / 720;
+    expect(hits({ x: Math.cos(e), y: -Math.sin(e), z: 0 })).toBe(true);
+  });
+
+  it('clears the planet at every heading of the camera rig', () => {
+    for (let k = 0; k < 16; k++) expect(hits(forwardClearOf(iso((k * Math.PI) / 8), centre, R, d))).toBe(false);
+  });
+});
+
 describe('transitLayout', () => {
   const tow = planTow('planet-sovereign', 'planet-aris', T)!;
   const move: StationMove = {
@@ -182,6 +262,14 @@ describe('transitLayout', () => {
     const bad: StationMove = { ...move, toPlanetId: 'no-such-planet' };
     expect(planetById(bad.toPlanetId).id).toBe(planetById(bad.fromPlanetId).id);
     expect(transitLayout(bad, (move.departAt + move.arriveAt) / 2)).toBeNull();
+  });
+
+  it('draws the viewer at its own place, as the planet view does (issue 218)', () => {
+    const layout = transitLayout(move, (move.departAt + move.arriveAt) / 2, false, { name: 'HOME' })!;
+    const own = layout.bodies.find((b) => b.id === VIEWER_BODY_ID)!;
+    expect(own).toMatchObject({ kind: 'station', own: true, name: 'HOME' });
+    const seen = applyFrameTransform(layout.transform, own.position);
+    expect(Math.hypot(seen.x, seen.y, seen.z)).toBeLessThan(1e-6);
   });
 
   it('is null outside the transit', () => {

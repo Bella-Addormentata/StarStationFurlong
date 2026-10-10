@@ -32,7 +32,7 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
-import { refreshFarPass, setFarPassActive } from "./farOrbitView";
+import { refreshFarPass, setFarPassActive, setFarPassOrbit } from "./farOrbitView";
 import type { AtlasDoor } from "./stationAtlas";
 import {
   buildConnectorChain,
@@ -92,6 +92,9 @@ const worldRef = (): WorldRef =>
   (window as unknown as { world?: WorldRef }).world ?? {};
 
 let active = false;
+/** 🪐 Zoomed out past the station to the planet view (issue 218): the far
+ *  pass draws the planet and every station, ours at their scale. */
+let orbitView = false;
 let group: THREE.Group | null = null;
 let toolbar: HTMLDivElement | null = null;
 let editor: HTMLDivElement | null = null;
@@ -494,7 +497,7 @@ function renderToolbar(): void {
     const slot = nextFreeExteriorSlot();
     if (slot !== null) writeExteriorSlot(slot, { kind: "solar" });
   });
-  t.style.display = owner ? "flex" : "none";
+  t.style.display = owner && !orbitView ? "flex" : "none";
 }
 
 /** Transient toolbar message (click-to-connect feedback) — shows the bar for
@@ -586,6 +589,8 @@ function onClickCapture(e: MouseEvent): void {
   if (t && (gameCanvas ? t !== gameCanvas : t.tagName !== "CANVAS")) return;
   // The exterior view owns canvas clicks — never walk-to-point from space.
   e.stopPropagation();
+  // 🪐 The planet view draws no isometric station to click.
+  if (orbitView) return;
   const camera = gr().camera;
   if (!camera) return;
   const ndc = new THREE.Vector2(
@@ -753,6 +758,8 @@ export function setExteriorActive(on: boolean): void {
   if (on === active) return;
   active = on;
   setFarPassActive(on);
+  // Every trip outside starts at the station view.
+  orbitView = false;
   // 🧹 First descent from space ⇒ the player is IN the room: reveals the
   // room-only HUD (the SpacePhone tip's body.in-room gate). Sticky by
   // design — later trips to space re-hide via body.exterior-active.
@@ -797,4 +804,21 @@ export function setExteriorActive(on: boolean): void {
 
 export function isExteriorActive(): boolean {
   return active;
+}
+
+/** 🪐 zoom.ts's step between the station view and the planet view (issue
+ *  218), both at level 3. Off whenever the exterior view is. */
+export function setExteriorOrbitView(on: boolean): void {
+  const next = on && active;
+  if (next === orbitView) return;
+  orbitView = next;
+  setFarPassOrbit(next);
+  // The isometric station's own controls belong to the station view.
+  closeEditor();
+  if (enterBubble) enterBubble.style.display = next ? "none" : "";
+  if (toolbar) renderToolbar();
+}
+
+export function isExteriorOrbitView(): boolean {
+  return orbitView;
 }
