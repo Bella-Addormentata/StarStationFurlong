@@ -2907,6 +2907,33 @@ export const HOT_TUB_R = {
  */
 const HOT_TUB_BUBBLE_SPREAD = HOT_TUB_R.water / 1.28;
 
+/**
+ * 🌉 The hot tub standing on the lazy pool's island — the one tub the
+ * footbridge reaches — or null when the room has none.
+ *
+ * Keyed on what the bridge actually belongs to, not on an item id. The
+ * Classic Lido's deck tub was seeded with the island tub's id
+ * ("pool-hot-tub"), so every bridge rule that matched on that id handed a
+ * corner tub on open deck an arched walk over a bridge that is not there, a
+ * phantom bridge click strip, and a swim-exclusion island in its pool's
+ * corner. The bridge is drawn by buildLazyPool, so: a lazy pool, and a
+ * "hot-tub" standing on its island (the pool's own centre). Rooms seeded
+ * before the deck tub got its own id still carry the old one; keying on kind
+ * and place is what fixes those without a doc migration.
+ */
+export function islandHotTub(items: readonly FurnitureItem[]): FurnitureItem | null {
+  const pool = items.find((item) => item.kind === "lazy-pool");
+  if (!pool) return null;
+  return (
+    items.find(
+      (item) =>
+        item.kind === "hot-tub" &&
+        Math.abs(item.pos.x - pool.pos.x) < 1e-6 &&
+        Math.abs(item.pos.z - pool.pos.z) < 1e-6,
+    ) ?? null
+  );
+}
+
 /** Deck-TOP height of the footbridge at local z ∈ [island, shore]. */
 function bridgeTopAt(lz: number): number {
   const t = (lz - BRIDGE_Z_ISLAND) / (BRIDGE_Z_SHORE - BRIDGE_Z_ISLAND);
@@ -2925,7 +2952,7 @@ export function bridgeDeckY(
   x: number,
   z: number,
 ): number | null {
-  const tub = items.find((item) => item.id === "pool-hot-tub");
+  const tub = islandHotTub(items);
   if (!tub) return null;
   const lx = x - tub.pos.x;
   const lz = z - tub.pos.z;
@@ -2946,7 +2973,7 @@ export function isBridgeClick(
   x: number,
   z: number,
 ): boolean {
-  const tub = items.find((item) => item.id === "pool-hot-tub");
+  const tub = islandHotTub(items);
   if (!tub) return false;
   const lx = x - tub.pos.x;
   const lz = z - tub.pos.z;
@@ -2972,7 +2999,7 @@ export function isBridgeClick(
 export function hotTubBridgeLanding(
   items: FurnitureItem[],
 ): { x: number; z: number } | null {
-  const tub = items.find((item) => item.id === "pool-hot-tub");
+  const tub = islandHotTub(items);
   if (!tub) return null;
   return { x: tub.pos.x + BRIDGE_X, z: tub.pos.z + BRIDGE_Z_ISLAND };
 }
@@ -3194,14 +3221,10 @@ const poolSeats: SeatTemplate[] = [
  * spreading the four approaches over the four sides also stops arrivals
  * queueing on one.
  *
- * Today NEITHER tub reads them. buildSeatList replaces the front of every
- * seat whose ITEM ID is "pool-hot-tub" with the lazy pool's footbridge shore
- * — and the Classic Lido deck tub carries that same id (roomTemplates.ts),
- * though it is a different kind standing on a pool with no bridge, so it
- * inherits the approach and the scripted bridge walk as well. That predates
- * #187 and is left alone here. These four are kept correct and per-quadrant
- * so that the day the special case keys on KIND instead of id, the right
- * approaches are already in place.
+ * The lazy pool's island tub does not read them: buildSeatList replaces the
+ * front of all four with the footbridge's shore end (islandHotTub). Every
+ * other tub — the Classic Lido's corner tub on open deck — walks up to the
+ * quadrant it was asked for.
  *
  * sitY 0.28: chest above the waterline of the raised drum, legs hidden inside.
  */
@@ -11367,14 +11390,17 @@ export function poolHoleRect(
   return null;
 }
 
-/** Central hot-tub island excluded from the lazy-river swim channel. */
+/** Central hot-tub island excluded from the lazy-river swim channel. Only the
+ *  lazy pool has one: keyed on its island tub (islandHotTub), not on the
+ *  "pool-hot-tub" id the Classic Lido's corner tub also carried, which carved
+ *  a phantom island out of that pool's north-west corner. */
 export function getPoolIsland(items: FurnitureItem[]): {
   x: number;
   z: number;
   rx: number;
   rz: number;
 } | null {
-  const hotTub = items.find((item) => item.id === "pool-hot-tub");
+  const hotTub = islandHotTub(items);
   if (!hotTub) return null;
   return { x: hotTub.pos.x, z: hotTub.pos.z, rx: 1.72, rz: 1.48 };
 }
@@ -11583,6 +11609,7 @@ export function buildSeatList(
   isWalkable: (x: number, z: number) => boolean,
 ): Seat[] {
   const seats: Seat[] = [];
+  const bridgeTub = islandHotTub(items);
   for (const item of items) {
     const templates = FURNITURE_DEFS[item.kind].seats;
     if (!templates) continue;
@@ -11591,16 +11618,18 @@ export function buildSeatList(
       const fr = rotXZ(t.front.x, t.front.z, item.rot);
       const c0 = rotXZ(t.clickBox.x0, t.clickBox.z0, item.rot);
       const c1 = rotXZ(t.clickBox.x1, t.clickBox.z1, item.rot);
-      // The central hot tub is reachable only over its south footbridge. All
-      // four seats share the same dry-land approach; the scripted `path` then
-      // WALKS the arched bridge (shore → crest, y following the deck) and the
-      // SIT_DOWN hop covers the last stretch over the rim (player.ts).
+      // The lazy pool's island tub is reachable only over its south
+      // footbridge. All four seats share the same dry-land approach; the
+      // scripted `path` then WALKS the arched bridge (shore → crest, y
+      // following the deck) and the SIT_DOWN hop covers the last stretch over
+      // the rim (player.ts). Any other tub stands on dry deck and keeps its
+      // own per-quadrant fronts.
       const preferred =
-        item.id === "pool-hot-tub"
+        item === bridgeTub
           ? { x: item.pos.x + BRIDGE_X, z: item.pos.z + 3.75 }
           : { x: item.pos.x + fr.x, z: item.pos.z + fr.z };
       const path =
-        item.id === "pool-hot-tub"
+        item === bridgeTub
           ? [3.26, 2.96, 2.66, 2.42, 2.22, 2.05].map((lz) => ({
               x: item.pos.x + BRIDGE_X,
               y: bridgeTopAt(lz),
