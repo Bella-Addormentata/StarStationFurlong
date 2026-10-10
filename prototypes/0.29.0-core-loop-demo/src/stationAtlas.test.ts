@@ -9,7 +9,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  atlasComponent, atlasLayout, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, moduleOverlapAt, pushAtlasToDoc,
+  atlasComponent, atlasLayout, atlasPoses, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, moduleOverlapAt, pushAtlasToDoc,
   readAtlas, seedAtlasDefaults,
 } from './stationAtlas';
 import type { BundledAtlasEntry } from './stationAtlas';
@@ -668,5 +668,77 @@ describe('transient berths (a visiting ship\'s dock)', () => {
     const peer = readAtlas()['module-peer'];
     expect(peer.doors['d:dock'].transient).toBe(true);
     expect(peer.doors['d:junk'].transient).toBeUndefined();
+  });
+});
+
+describe('🔭 cupola walls travel with the atlas (issue 219)', () => {
+  const door = { doorId: 'n', targetSeed: 'ssf://room#room=module-nbr', wall: 'y-' as const, lateral: 0 };
+
+  it('harvests, publishes and pulls both ends, and poses carry them', () => {
+    bind('module-self');
+    harvestIntoAtlas({ roomId: 'module-self', name: 'SELF', dims: { cols: 2, rows: 3 }, cupola: ['y-', 'y+'], doors: [door] });
+    pushAtlasToDoc();
+    expect((doc.getMap('atlas').get('module-self') as { cupola?: unknown }).cupola).toEqual(['y-', 'y+']);
+
+    // A peer who has never stood in the module learns it from the doc.
+    const published = doc.getMap('atlas').get('module-self');
+    store.clear();
+    const peer = new Y.Doc();
+    peer.getMap('atlas').set('module-self', published);
+    bindStationAtlasDoc(peer, { roomId: 'module-other', isPassagePublic: () => false });
+    expect(readAtlas()['module-self'].cupola).toEqual(['y-', 'y+']);
+    expect(atlasPoses(readAtlas(), 'module-self')[0].cupola).toEqual(['y-', 'y+']);
+  });
+
+  it('a newer copy saying none clears it, and an older client\'s silence keeps it', () => {
+    harvestIntoAtlas({ roomId: 'module-a', name: 'A', cupola: ['x+'], doors: [door] });
+    doc.getMap('atlas').set('module-a', {
+      roomId: 'module-a', name: 'A', doors: { n: { targetRoomId: 'module-nbr' } }, updatedAt: Date.now() + 1000,
+    });
+    bind('module-self');
+    expect(readAtlas()['module-a'].cupola).toEqual(['x+']);
+
+    doc.getMap('atlas').set('module-a', {
+      roomId: 'module-a', name: 'A', doors: { n: { targetRoomId: 'module-nbr' } }, cupola: [], updatedAt: Date.now() + 2000,
+    });
+    expect(readAtlas()['module-a'].cupola).toEqual([]);
+  });
+
+  it('refuses a malformed cupola list from a peer', () => {
+    doc.getMap('atlas').set('module-bad', {
+      roomId: 'module-bad', name: 'BAD', doors: { n: { targetRoomId: 'module-nbr' } },
+      cupola: ['y-', 'y-', 'up'], updatedAt: Date.now() - 1000,
+    });
+    bind('module-self');
+    expect(readAtlas()['module-bad']).toBeUndefined();
+  });
+
+  it('a harvest that does not read the cupola keeps what we knew', () => {
+    harvestIntoAtlas({ roomId: 'module-a', name: 'A', cupola: ['y+'], doors: [] });
+    harvestIntoAtlas({ roomId: 'module-a', name: 'A', doors: [] });
+    expect(readAtlas()['module-a'].cupola).toEqual(['y+']);
+    harvestIntoAtlas({ roomId: 'module-a', name: 'A', cupola: [], doors: [] });
+    expect(readAtlas()['module-a'].cupola).toEqual([]);
+  });
+});
+
+describe('🔭 cupola gossip edges (issue 219, review)', () => {
+  it('refuses a cross-axis pair', () => {
+    doc.getMap('atlas').set('module-x', {
+      roomId: 'module-x', name: 'X', doors: { n: { targetRoomId: 'module-nbr' } },
+      cupola: ['x-', 'y-'], updatedAt: Date.now() - 1000,
+    });
+    bind('module-self');
+    expect(readAtlas()['module-x']).toBeUndefined();
+  });
+
+  it("adds the cupola we know to an older client's copy that is as new as ours", () => {
+    harvestIntoAtlas({ roomId: 'module-a', name: 'A', cupola: ['y-'], doors: [{ doorId: 'n', targetSeed: 'ssf://room#room=module-nbr' }] });
+    const ours = readAtlas()['module-a'];
+    doc.getMap('atlas').set('module-a', {
+      roomId: 'module-a', name: 'A', doors: { n: { targetRoomId: 'module-nbr' } }, updatedAt: ours.lastSeen + 1000,
+    });
+    bind('module-self');
+    expect((doc.getMap('atlas').get('module-a') as { cupola?: unknown }).cupola).toEqual(['y-']);
   });
 });

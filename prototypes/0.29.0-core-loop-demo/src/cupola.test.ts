@@ -7,7 +7,10 @@ import * as Y from 'yjs';
 import * as THREE from 'three';
 import {
   cupolaEndWalls,
+  cupolaWallSelections,
+  cupolaWallsLabel,
   cupolaPlan,
+  cupolaPlans,
   cupolaTipOutline,
   cupolaFloorOutline,
   cupolaCornerClearance,
@@ -23,8 +26,12 @@ import {
   bindFloorPlan,
   writeRoomDims,
   readCupolaWall,
+  readCupolaWalls,
+  endCupolaWalls,
   writeCupolaWall,
+  writeCupolaWalls,
   roomCupola,
+  roomCupolas,
   insideRoomWalk,
   clampToRoomWalk,
 } from './floorPlanDoc';
@@ -41,6 +48,8 @@ describe('cupolaEndWalls / cupolaPlan', () => {
     expect(cupolaPlan(SQUARE, 'x+')).toBeNull();
     expect(cupolaPlan(WIDE, 'y-')).toBeNull();
     expect(cupolaPlan(SQUARE, null)).toBeNull();
+    expect(cupolaWallSelections(cupolaEndWalls(6, 6))).toEqual([[], ['y-'], ['y+'], ['y-', 'y+']]);
+    expect(cupolaPlans(SQUARE, ['y-', 'y+'])).toHaveLength(2);
   });
 
   it('runs 2 m into a 12 m wide room and less into a narrow one', () => {
@@ -93,6 +102,17 @@ describe('floor and walk shape', () => {
     expect(pts.map(key).sort()).toEqual(['-4,6', '-6,-6', '-6,4', '4,6', '6,-6', '6,4'].sort());
   });
 
+  it('cuts both end corners and shortens the barrel from both ends', () => {
+    const plans = cupolaPlans(SQUARE, ['y-', 'y+']);
+    const outline = cupolaFloorOutline(plans).map((p) => `${p.x},${p.z}`);
+    expect(outline).toHaveLength(8);
+    expect(outline.sort()).toEqual([
+      '-4,-6', '-4,6', '-6,-4', '-6,4',
+      '4,-6', '4,6', '6,-4', '6,4',
+    ].sort());
+    expect(cupolaStripRun(plans, 6)).toEqual([-4, 4]);
+  });
+
   it('works on the x axis too', () => {
     const plan = cupolaPlan(WIDE, 'x-')!;
     const pts = cupolaFloorOutline(plan).map((p) => `${p.x},${p.z}`);
@@ -119,9 +139,12 @@ describe('floor and walk shape', () => {
   });
 });
 
+let testDoc: Y.Doc;
+
 describe('floorPlan cupola setting', () => {
   beforeEach(() => {
-    bindFloorPlan(new Y.Doc());
+    testDoc = new Y.Doc();
+    bindFloorPlan(testDoc);
   });
 
   it('stores the wall, resolves it against the room size, and walks round it', () => {
@@ -139,6 +162,17 @@ describe('floorPlan cupola setting', () => {
     expect(roomCupola()).toBeNull();
   });
 
+  it('stores and walks around cupolas on both ends', () => {
+    writeCupolaWalls(['y-', 'y+']);
+    expect(readCupolaWalls()).toEqual(['y-', 'y+']);
+    expect(roomCupolas().map((plan) => plan.wall)).toEqual(['y-', 'y+']);
+    expect(insideRoomWalk(0, 0)).toBe(true);
+    expect(insideRoomWalk(5.25, 5.25)).toBe(false);
+    expect(insideRoomWalk(5.25, -5.25)).toBe(false);
+    const p = clampToRoomWalk(5.25, 5.25);
+    expect(insideRoomWalk(p.x, p.z)).toBe(true);
+  });
+
   it('ends the cupola when a resize makes its wall a side wall', () => {
     writeCupolaWall('y-');
     writeRoomDims(2, 3); // 12 × 18: still extrudes along z, y− still an end
@@ -148,6 +182,29 @@ describe('floorPlan cupola setting', () => {
     expect(roomCupola()).toBeNull();
     writeRoomDims(2, 2);
     expect(roomCupola()).toBeNull(); // not revived over whatever went there meanwhile
+  });
+
+  it('keeps the first end in `wall` beside both, so an older build still draws one', () => {
+    writeCupolaWalls(['y-', 'y+']);
+    const doc = testDoc;
+    expect(doc.getMap('floorPlan').get('cupola')).toEqual({ wall: 'y-', walls: ['y-', 'y+'] });
+    writeCupolaWalls(['y+']);
+    expect(doc.getMap('floorPlan').get('cupola')).toEqual({ wall: 'y+' });
+    // A one-end record from an older build still reads.
+    doc.getMap('floorPlan').set('cupola', { wall: 'y-' });
+    expect(readCupolaWalls()).toEqual(['y-']);
+  });
+
+  it('labels both ends the way the editor button names them', () => {
+    expect(cupolaWallsLabel(['y+', 'y-'])).toBe('y-/+');
+    expect(cupolaWallsLabel(['x-'])).toBe('x-');
+  });
+
+  it('clears both cupolas when a resize turns their ends into side walls', () => {
+    writeCupolaWalls(['y-', 'y+']);
+    writeRoomDims(3, 2);
+    expect(readCupolaWalls()).toEqual([]);
+    expect(roomCupolas()).toEqual([]);
   });
 
   it('drops a cupola left dormant by a racing resize on the next resize', () => {
@@ -179,6 +236,22 @@ describe('buildOctagonHull with a cupola', () => {
       expect(box.max.z).toBeCloseTo(4, 6);
     }
     hull.dispose();
+  });
+
+  it('replaces both end caps with cupolas', () => {
+    const walls = ['y-', 'y+'] as const;
+    const hull = buildOctagonHull(SQUARE, {}, {}, [], walls);
+    const ms = meshes(hull.group);
+    expect(ms.filter((m) => m.name === 'octagon-cap-wall')).toHaveLength(0);
+    expect(ms.filter((m) => m.name === 'cupola-frame')).toHaveLength(22);
+    expect(ms.filter((m) => m.name === 'cupola-glass')).toHaveLength(22);
+    hull.dispose();
+
+    const shell = buildOctagonShell(SQUARE, {}, {}, walls);
+    const shellMeshes = meshes(shell.group);
+    expect(shellMeshes.filter((m) => m.name === 'octagon-shell-cap')).toHaveLength(0);
+    expect(shellMeshes.filter((m) => m.name === 'octagon-shell-cupola-glass')).toHaveLength(22);
+    shell.dispose();
   });
 
   it('keeps side-wall doors out of the taper and drops a door on the cupola wall', () => {
@@ -221,5 +294,33 @@ describe('the taper and the things near it', () => {
     expect(clampWindowAlong(6, 3)).toBeCloseTo(4 - 1.5 - 0.05, 9);
     expect(windowFitsSurface('wall-pos', 9.95, 1)).toBe(false);
     expect(windowFitsSurface('wall-pos', 9.8, 1)).toBe(true);
+    writeCupolaWalls(['y-', 'y+']);
+    expect(clampWindowAlong(6, 3)).toBeCloseTo(4 - 1.5 - 0.05, 9);
+  });
+});
+
+describe('🔭 a peer\'s malformed cupola record (issue 219, review)', () => {
+  beforeEach(() => {
+    testDoc = new Y.Doc();
+    bindFloorPlan(testDoc);
+  });
+
+  it('reads only `wall` when `walls` is not the two ends of one axis or disagrees with it', () => {
+    const plan = testDoc.getMap('floorPlan');
+    plan.set('cupola', { wall: 'y-', walls: ['y-', 'y+', 'x-'] });
+    expect(readCupolaWalls()).toEqual(['y-']);
+    plan.set('cupola', { wall: 'y-', walls: ['x-', 'y-'] });
+    expect(readCupolaWalls()).toEqual(['y-']);
+    plan.set('cupola', { wall: 'y+', walls: ['y-', 'y+'] });
+    expect(readCupolaWalls()).toEqual(['y+']);
+    plan.set('cupola', { walls: ['y-', 'y+'] });
+    expect(readCupolaWalls()).toEqual(['y-', 'y+']);
+  });
+
+  it('leaves a dormant side wall out of the walls the atlas is told about', () => {
+    writeRoomDims(3, 2); // 18 × 12: y± are side walls
+    testDoc.getMap('floorPlan').set('cupola', { wall: 'y+' }); // a peer's write that raced the resize
+    expect(readCupolaWalls()).toEqual(['y+']);
+    expect(endCupolaWalls()).toEqual([]);
   });
 });
