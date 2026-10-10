@@ -325,12 +325,24 @@ export function readCupolaWalls(): CupolaWall[] {
   if (!docAlive()) return [];
   const raw = planMap!.get('cupola') as { wall?: unknown; walls?: unknown } | undefined;
   if (!raw || typeof raw !== 'object') return [];
-  const values = Array.isArray(raw.walls) ? raw.walls : [raw.wall];
-  return values.filter((wall, index): wall is CupolaWall =>
-    typeof wall === 'string' &&
-    CUPOLA_WALLS.includes(wall as CupolaWall) &&
-    values.indexOf(wall) === index,
-  ) as CupolaWall[];
+  const isWall = (w: unknown): w is CupolaWall => typeof w === 'string' && CUPOLA_WALLS.includes(w as CupolaWall);
+  // Both ends: exactly the two ends of one axis, with `wall` naming the first
+  // (cupolaRecord). Anything else falls back to `wall` alone, which is what
+  // an older build draws, so the two never disagree about a peer's record.
+  const walls = raw.walls;
+  if (
+    Array.isArray(walls) && walls.length === 2 && isWall(walls[0]) && isWall(walls[1]) &&
+    walls[0] !== walls[1] && walls[0][0] === walls[1][0] && (raw.wall === undefined || raw.wall === walls[0])
+  ) {
+    return [walls[0], walls[1]];
+  }
+  return isWall(raw.wall) ? [raw.wall] : [];
+}
+
+/** 🔭 The stored cupola walls that are end walls at the room's current size:
+ *  the ones the hull draws (a dormant one, left by a racing resize, is not). */
+export function endCupolaWalls(): CupolaWall[] {
+  return readCupolaWalls().filter((wall) => cupolaPlans(roomHalf, wall).length > 0);
 }
 
 /** Legacy single-wall reader; new code should use readCupolaWalls. */

@@ -27,6 +27,7 @@ import {
   writeRoomDims,
   readCupolaWall,
   readCupolaWalls,
+  endCupolaWalls,
   writeCupolaWall,
   writeCupolaWalls,
   roomCupola,
@@ -295,5 +296,31 @@ describe('the taper and the things near it', () => {
     expect(windowFitsSurface('wall-pos', 9.8, 1)).toBe(true);
     writeCupolaWalls(['y-', 'y+']);
     expect(clampWindowAlong(6, 3)).toBeCloseTo(4 - 1.5 - 0.05, 9);
+  });
+});
+
+describe('🔭 a peer\'s malformed cupola record (issue 219, review)', () => {
+  beforeEach(() => {
+    testDoc = new Y.Doc();
+    bindFloorPlan(testDoc);
+  });
+
+  it('reads only `wall` when `walls` is not the two ends of one axis or disagrees with it', () => {
+    const plan = testDoc.getMap('floorPlan');
+    plan.set('cupola', { wall: 'y-', walls: ['y-', 'y+', 'x-'] });
+    expect(readCupolaWalls()).toEqual(['y-']);
+    plan.set('cupola', { wall: 'y-', walls: ['x-', 'y-'] });
+    expect(readCupolaWalls()).toEqual(['y-']);
+    plan.set('cupola', { wall: 'y+', walls: ['y-', 'y+'] });
+    expect(readCupolaWalls()).toEqual(['y+']);
+    plan.set('cupola', { walls: ['y-', 'y+'] });
+    expect(readCupolaWalls()).toEqual(['y-', 'y+']);
+  });
+
+  it('leaves a dormant side wall out of the walls the atlas is told about', () => {
+    writeRoomDims(3, 2); // 18 × 12: y± are side walls
+    testDoc.getMap('floorPlan').set('cupola', { wall: 'y+' }); // a peer's write that raced the resize
+    expect(readCupolaWalls()).toEqual(['y+']);
+    expect(endCupolaWalls()).toEqual([]);
   });
 });
