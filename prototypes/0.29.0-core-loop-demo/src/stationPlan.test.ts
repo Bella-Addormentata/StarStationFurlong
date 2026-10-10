@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
 import { atlasLayout, atlasPoses, bindStationAtlasDoc, cleanAtlasOwner, harvestIntoAtlas, readAtlas } from './stationAtlas';
-import { beamAfterStepBack, beamPassFor, editAccess, moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
+import { beamAfterStepBack, beamPassFor, editAccess, moduleContains, moduleCupolaGlass, moduleOutline, planModuleAt, stationPlan, visitingShips } from './stationPlan';
 import type { ShipSummary } from './planetSummary';
 import { statusFromWire } from './departuresBoard';
 
@@ -736,5 +736,32 @@ describe("the plan's ship list (source scan)", () => {
     expect(statusFromWire('on-time')).toBe('ON TIME');
     expect(statusFromWire('not-docked')).toBe('NOT DOCKED');
     expect(statusFromWire('blocked')).toBe('ROUTE BLOCKED');
+  });
+});
+
+describe('🔭 cupolas on the plan (issue 219)', () => {
+  it('cuts the footprint\'s corners at each cupola end and lists the glass', () => {
+    harvestIntoAtlas({ roomId: 'room-c', name: 'DOME', dims: { cols: 2, rows: 3 }, cupola: ['y-', 'y+'], doors: [] });
+    const [m] = stationPlan(readAtlas(), 'room-c').modules;
+    expect(m.cupola).toEqual(['y-', 'y+']);
+    expect(moduleOutline(m)).toHaveLength(8);
+    const glass = moduleCupolaGlass(m);
+    expect(glass.map((g) => g.wall).sort()).toEqual(['y+', 'y-']);
+    // Each tip window sits on its end wall, narrower than the module.
+    for (const g of glass) {
+      expect(Math.abs(g.tip[0].z)).toBeCloseTo(9);
+      expect(Math.abs(g.tip[1].x - g.tip[0].x)).toBeLessThan(12);
+    }
+  });
+
+  it('draws a module without a cupola, or one not known, as its rectangle', () => {
+    harvestIntoAtlas({ roomId: 'room-c', name: 'PLAIN', dims: { cols: 2, rows: 3 }, cupola: [], doors: [] });
+    harvestIntoAtlas({ roomId: 'room-d', name: 'OLD', dims: { cols: 2, rows: 3 }, doors: [] });
+    const [plain] = stationPlan(readAtlas(), 'room-c').modules;
+    const [old] = stationPlan(readAtlas(), 'room-d').modules;
+    expect(plain.cupola).toEqual([]);
+    expect(old.cupola).toBeUndefined();
+    expect(moduleOutline(plain)).toHaveLength(4);
+    expect(moduleCupolaGlass(old)).toEqual([]);
   });
 });

@@ -78,7 +78,7 @@ import {
   roomCupolas, readCupolaWalls, writeCupolaWalls,
 } from './floorPlanDoc';
 import {
-  cupolaPlan, cupolaEndWalls, cupolaWallSelections, cupolaSideWallRun, cupolaCornerClearance,
+  cupolaPlan, cupolaEndWalls, cupolaWallSelections, cupolaWallsLabel, cupolaSideWallRun, cupolaCornerClearance,
   boxClearOfCupolaCorners, boxInCupolaTaper, cupolaStripRun, type CupolaPlan, type CupolaWall,
 } from './cupola';
 import { SEATS, rebuildSeats } from './seats';
@@ -3925,7 +3925,7 @@ class RoomEditController {
     const { halfX, halfZ } = roomHalfExtents();
     const active = new Set(roomCupolas().map((plan) => plan.wall));
     const walls = cupolaEndWalls(halfX, halfZ).filter((wall) => active.has(wall));
-    this.cupolaBtnEl.textContent = walls.length ? `🔭 CUPOLA ${walls.join('/')}` : '🔭 CUPOLA OFF';
+    this.cupolaBtnEl.textContent = walls.length ? `🔭 CUPOLA ${cupolaWallsLabel(walls)}` : '🔭 CUPOLA OFF';
   }
 
   /** Step to the next cupola setting that validates (OFF always does). */
@@ -3951,7 +3951,9 @@ class RoomEditController {
         continue;
       }
       writeCupolaWalls(next);
-      showHint(`The ${next.join('/')} walls are cupolas now — no doors can go on them.`, 3000);
+      showHint(next.length === 1
+        ? `The ${next[0]} wall is a cupola now — no doors can go on it.`
+        : `Both end walls (${cupolaWallsLabel(next)}) are cupolas now — no doors can go on them.`, 3000);
       break;
     }
     this.syncCupolaButton();

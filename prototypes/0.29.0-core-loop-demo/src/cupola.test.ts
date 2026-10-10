@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import {
   cupolaEndWalls,
   cupolaWallSelections,
+  cupolaWallsLabel,
   cupolaPlan,
   cupolaPlans,
   cupolaTipOutline,
@@ -137,9 +138,12 @@ describe('floor and walk shape', () => {
   });
 });
 
+let testDoc: Y.Doc;
+
 describe('floorPlan cupola setting', () => {
   beforeEach(() => {
-    bindFloorPlan(new Y.Doc());
+    testDoc = new Y.Doc();
+    bindFloorPlan(testDoc);
   });
 
   it('stores the wall, resolves it against the room size, and walks round it', () => {
@@ -177,6 +181,22 @@ describe('floorPlan cupola setting', () => {
     expect(roomCupola()).toBeNull();
     writeRoomDims(2, 2);
     expect(roomCupola()).toBeNull(); // not revived over whatever went there meanwhile
+  });
+
+  it('keeps the first end in `wall` beside both, so an older build still draws one', () => {
+    writeCupolaWalls(['y-', 'y+']);
+    const doc = testDoc;
+    expect(doc.getMap('floorPlan').get('cupola')).toEqual({ wall: 'y-', walls: ['y-', 'y+'] });
+    writeCupolaWalls(['y+']);
+    expect(doc.getMap('floorPlan').get('cupola')).toEqual({ wall: 'y+' });
+    // A one-end record from an older build still reads.
+    doc.getMap('floorPlan').set('cupola', { wall: 'y-' });
+    expect(readCupolaWalls()).toEqual(['y-']);
+  });
+
+  it('labels both ends the way the editor button names them', () => {
+    expect(cupolaWallsLabel(['y+', 'y-'])).toBe('y-/+');
+    expect(cupolaWallsLabel(['x-'])).toBe('x-');
   });
 
   it('clears both cupolas when a resize turns their ends into side walls', () => {

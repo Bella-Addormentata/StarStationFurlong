@@ -62,8 +62,17 @@ export function cupolaEndWalls(halfX: number, halfZ: number): [CupolaWall, Cupol
   return narrowAxisFor(halfX, halfZ) === 'x' ? ['y-', 'y+'] : ['x-', 'x+'];
 }
 
+/** The editor's cupola cycle for a room's two end walls: none, either end,
+ *  then both (issue 219). */
 export function cupolaWallSelections(ends: readonly [CupolaWall, CupolaWall]): CupolaWall[][] {
   return [[], [ends[0]], [ends[1]], [...ends]];
+}
+
+/** A short label for a set of cupola walls: `y-`, or `y-/+` for both ends. */
+export function cupolaWallsLabel(walls: readonly CupolaWall[]): string {
+  const sorted = [...walls].sort();
+  if (sorted.length === 2 && sorted[0][0] === sorted[1][0]) return `${sorted[0][0]}-/+`;
+  return sorted.join('/');
 }
 
 /** The end cap a wall is, or null when the wall is a side wall. */

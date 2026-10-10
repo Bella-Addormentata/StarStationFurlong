@@ -313,7 +313,7 @@ import {
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
-  bindFloorPlan, subscribeFloorPlan, readRoomDims,
+  bindFloorPlan, subscribeFloorPlan, readRoomDims, readCupolaWalls,
 } from "./floorPlanDoc";
 import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
@@ -2273,6 +2273,15 @@ async function joinRoomAtEpoch(
     // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
       queueCupolaSettle();
+      // 🔭 A resize or a cupola set / cleared changes what the atlas maps
+      // draw of this module (issue 219): harvest it then, not on every door
+      // slide the floor plan also carries.
+      const shape = JSON.stringify([readRoomDims(), readCupolaWalls()]);
+      if (shape !== atlasShapeHarvested) {
+        atlasShapeHarvested = shape;
+        harvestStationAtlas();
+        world?.refreshFpNeighbourShells();
+      }
       world?.reconcileDoorPlacements();
       world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
       roomEdit.onFloorPlanChanged(); // …and an open edit session's 🔭 label
@@ -4379,6 +4388,8 @@ export function setAtlasHarvestArmed(on: boolean): void {
  *  room's state landed): until then the planet summary does not take the
  *  atlas's copy of them, which may be an earlier visit's, as news. */
 let gatesReadIn: string | null = null;
+/** 🔭 The size and cupola walls the floor-plan listener last harvested. */
+let atlasShapeHarvested = "";
 
 function harvestStationAtlas(): void {
   if (!atlasHarvestArmed) return;
@@ -4481,7 +4492,7 @@ function harvestStationAtlas(): void {
   const ownerName = typeof ownerEntry?.name === "string" && ownerEntry.name ? ownerEntry.name : undefined;
   const ownerKey = typeof ownerEntry?.keyB64 === "string" && ownerEntry.keyB64 ? ownerEntry.keyB64 : undefined;
   harvestIntoAtlas({
-    roomId, name, seed, dims: readRoomDims(), doors,
+    roomId, name, seed, dims: readRoomDims(), cupola: readCupolaWalls(), doors,
     ...(gates ?? { gates: null }),
     // null: this synced room has no verifiable owner (clears a stale one),
     // and neither has one whose id the atlas can't carry (cleanAtlasOwner

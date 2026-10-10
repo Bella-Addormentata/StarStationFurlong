@@ -306,7 +306,7 @@ function recomputeRoomHalf(): void {
 }
 
 // ── 🔭 Cupola end wall (cupola.ts) ───────────────────────────────────────────
-// `floorPlan.cupola → { wall } | { walls }`: which END walls are observation
+// `floorPlan.cupola → { wall, walls? }`: which END walls are observation
 // cupolas. Absent / malformed ⇒ none (every existing room, unchanged). A resize
 // that turns an end into a side wall clears that end (writeRoomDims); a peer's
 // invalid wall likewise renders plain.
@@ -339,15 +339,20 @@ export function readCupolaWall(): CupolaWall | null {
 }
 
 /** Owner UI: set the room's cupola ends. The editor gates end walls and
- *  conflicts before writing. A single end retains the legacy document shape. */
+ *  conflicts before writing. */
 export function writeCupolaWalls(walls: readonly CupolaWall[]): void {
   if (!docAlive()) return;
   const valid = [...new Set(walls)].filter((wall) => CUPOLA_WALLS.includes(wall));
   boundDoc!.transact(() => {
     if (valid.length === 0) planMap!.delete('cupola');
-    else if (valid.length === 1) planMap!.set('cupola', { wall: valid[0] });
-    else planMap!.set('cupola', { walls: valid });
+    else planMap!.set('cupola', cupolaRecord(valid));
   });
+}
+
+/** The stored shape: `{ wall }` for one end; both ends also keep `wall` (the
+ *  first) beside `walls`, so an older build still draws one of them. */
+function cupolaRecord(walls: readonly CupolaWall[]): { wall: CupolaWall; walls?: CupolaWall[] } {
+  return walls.length === 1 ? { wall: walls[0] } : { wall: walls[0], walls: [...walls] };
 }
 
 /** Legacy single-wall writer; new code should use writeCupolaWalls. */
@@ -474,7 +479,7 @@ export function writeRoomDims(cols: number, rows: number): void {
     );
     if (nextCupolas.length !== currentCupolas.length) {
       if (nextCupolas.length) {
-        planMap!.set('cupola', nextCupolas.length === 1 ? { wall: nextCupolas[0] } : { walls: nextCupolas });
+        planMap!.set('cupola', cupolaRecord(nextCupolas));
       } else {
         planMap!.delete('cupola');
       }

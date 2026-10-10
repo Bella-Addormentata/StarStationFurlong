@@ -342,6 +342,8 @@ function buildGroup(): THREE.Group {
           buildOctagonShell(
             { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
             { opacity: 0.82 },
+            {},
+            pose.cupola ?? null, // 🔭 its cupola end walls, when gossiped
           ).group,
         );
       } else {

@@ -1235,6 +1235,8 @@ export class World {
       const shell = buildOctagonShell(
         { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
         { opacity: 0.85 },
+        {},
+        pose.cupola ?? null, // 🔭 its cupola end walls, when gossiped
       );
       this.disableFog(shell.group); // stay crisp at station distances
       mod.add(shell.group);
