@@ -17,7 +17,8 @@ vi.mock('./deviceFocus', () => ({ isDeviceFocusActive: () => false, deviceFocus:
 import { FURNITURE } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { validatePlacement } from './editMode';
-import { roomHalfExtents } from './floorPlanDoc';
+import * as Y from 'yjs';
+import { bindFloorPlan, roomHalfExtents, writeCupolaWall } from './floorPlanDoc';
 
 const ctx = { playerPositions: [], floodFrom: { x: 0, z: 0 }, requiredReachable: [] };
 const chair: FurnitureItem = { id: 'test-chair', kind: 'armchair-left', pos: { x: 0, z: 0 }, rot: 0, movable: true };
@@ -54,6 +55,26 @@ describe('placement on the squares along the walls', () => {
     const verdict = validatePlacement(chair, { x: halfX - 0.5, z: 0.5 }, 0, ctx);
     expect(verdict.ok).toBe(false);
     expect(verdict.ok ? '' : verdict.reason).toMatch(/^in the way of /);
+  });
+
+  it('lets a piece stand under a climbing rose, whichever comes first', () => {
+    const { halfX } = roomHalfExtents();
+    const rose: FurnitureItem = { id: 'test-rose', kind: 'climbing-rose', pos: { x: halfX, z: 3.5 }, rot: 3, movable: true };
+    FURNITURE.push(rose);
+    expect(validatePlacement(chair, { x: halfX - 0.5, z: 3.5 }, 0, ctx)).toEqual({ ok: true });
+  });
+
+  it('lets a piece stand flush against cupola glass, not past it', () => {
+    bindFloorPlan(new Y.Doc());
+    writeCupolaWall('y+');
+    try {
+      // 12 × 12 room, cupola on y+: the glass runs along |x| + z = 10.
+      expect(validatePlacement(chair, { x: 4.5, z: 4.5 }, 0, ctx)).toEqual({ ok: true }); // corner (5,5) on the glass
+      expect(validatePlacement(chair, { x: 3.5, z: 5.5 }, 0, ctx)).toEqual({ ok: true }); // corner (4,6) on the glass
+      expect(validatePlacement(chair, { x: 5.5, z: 4.5 }, 0, ctx)).toEqual({ ok: false, reason: 'in the cupola glass' });
+    } finally {
+      writeCupolaWall(null);
+    }
   });
 
   it('keeps a hung wall panel clear', () => {

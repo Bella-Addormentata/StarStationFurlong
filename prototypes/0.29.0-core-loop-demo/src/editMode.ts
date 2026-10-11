@@ -642,9 +642,12 @@ function wallMountVerdict(
 /**
  * 🧱 May a footprint stand where it is, as far as the fixtures ON the walls
  * go? Its box must stay out of every doorway's opening band (doorOpeningAabb)
- * and must not stand inside another item's hung wall panel (wallMountBox).
- * Needed since footprints may reach the wall (validatePlacement check 1);
- * before that the 1 m placement box kept every footprint out of both.
+ * and must not stand inside a hung DEVICE panel (wallMountBox) — the mirror of
+ * wallMountVerdict rule 3, which refuses to hang a device over furniture.
+ * A DECORATIVE mount (the climbing rose) is skipped, as wallMountVerdict skips
+ * rule 3 for it: it hangs above and behind what stands on the floor, so either
+ * may come first. Needed since footprints may reach the wall (validatePlacement
+ * check 1); before that the 1 m placement box kept every footprint out of both.
  */
 function wallFixturesVerdict(item: FurnitureItem, box: Box): PlacementVerdict {
   for (const door of currentDoorOpenings()) {
@@ -654,7 +657,7 @@ function wallFixturesVerdict(item: FurnitureItem, box: Box): PlacementVerdict {
     }
   }
   for (const other of FURNITURE) {
-    if (other.id === item.id || !isWallMounted(other.kind)) continue;
+    if (other.id === item.id || !isWallMounted(other.kind) || !FURNITURE_DEFS[other.kind].device) continue;
     const panel = wallMountBox(other.kind, other.pos, other.rot);
     if (!panel) continue;
     if (box.x0 < panel.x1 && box.x1 > panel.x0 && box.z0 < panel.z1 && box.z1 > panel.z0) {
@@ -872,8 +875,8 @@ const WINDOW_END_INSET = 0.05;
 const CUPOLA_DOOR_MARGIN = 0.4;
 
 /** True when a piece stays out of the cupola. Wall panels must hang short
- *  of the taper. A footprint (`box`) keeps the placement box's 1 m inside
- *  the cut corners; a generated feature's blocked area (`featureBoxes`: sea,
+ *  of the taper. A footprint (`box`) may touch the cut line (flush against
+ *  the glass, as against a wall) but not cross it; a generated feature's blocked area (`featureBoxes`: sea,
  *  river, pool — they meet the walls by design) only has to stay out of the
  *  cut-off corners; a piece with neither is tested at its origin. */
 function cupolaClearsItem(
