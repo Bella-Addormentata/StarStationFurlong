@@ -346,7 +346,10 @@ function reconcile(itemId: string, s: CabinetSession, m: ArcadeMatch | null): vo
     }
     return;
   }
-  if (copy && copy.matchId === m.id) return;
+  // The same match, and still ours to host if we were: two pages that
+  // claimed the cabinet at once under the same id leave one record, and the
+  // other page's copy follows it from here.
+  if (copy && copy.matchId === m.id && (copy.role !== 'host' || m.hostPage === PAGE)) return;
   if (m.hostPage === PAGE) {
     // A record naming this page that it no longer runs (it was reloaded:
     // a new page id, so this can only be a leftover): end it.
@@ -489,7 +492,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   const machine = copy.machine;
   if (!machine || !copy.started) return;
   let m = readArcade(itemId);
-  if (!m || m.id !== copy.matchId) return; // reconcile has it next update
+  if (!m || m.id !== copy.matchId || m.hostPage !== PAGE) return; // reconcile has it next update
   if (mustYieldId(itemId, m)) {
     // Ticks carry only the id: move to a fresh one. Copies that followed
     // the old id start over (from a save state if they missed the start).

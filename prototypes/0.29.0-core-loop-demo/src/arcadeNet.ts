@@ -222,11 +222,14 @@ export class PadLog {
 
   /** File a FRAMES tick's runs. The earlier run is placed only when the
    *  current one's start is exact (run0 not capped at 255) and isn't the
-   *  match's first frame, which has nothing before it. */
+   *  match's first frame, which has nothing before it. A run starting at
+   *  frame 0 is the first frame unless the log already heard of the frames
+   *  just before it: then the clock wrapped, and the earlier run counts. */
   addTick(t: { frame: number; cur: number; run0: number; prev: number; run1: number }): void {
     const curFrom = frameAdd(t.frame, -t.run0);
     this.fill(curFrom, t.frame, t.cur);
-    if (t.run0 < 255 && curFrom !== 0) {
+    const wrapped = this.latest !== null && frameDiff(curFrom, this.latest) > 0;
+    if (t.run0 < 255 && (curFrom !== 0 || wrapped)) {
       const prevTo = frameAdd(curFrom, -1);
       const prevFrom = frameAdd(prevTo, -t.run1);
       this.fill(prevFrom, prevTo, t.prev);
