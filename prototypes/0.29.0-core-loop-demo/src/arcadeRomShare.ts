@@ -292,14 +292,19 @@ function receiveTick(sha: string, want: Want, now: number): void {
   const bytes = new Uint8Array(rec.size);
   parts.forEach((c, i) => bytes.set(c, i * ROM_CHUNK_BYTES));
   want.checking = true;
+  const epoch = arcadeDocEpoch();
   void sha256Hex(bytes).then(
     (hash) => {
       want.checking = false;
       if (wants.get(sha) !== want) return;
       if (hash !== sha) {
-        // Not the file the owner put on: ask again, from whoever sends next.
+        // Not the file the owner put on. No page that hashed what it holds
+        // sends this, so a peer wrote it: clear it, so it isn't checked
+        // again every tick and the next holder to send writes every chunk
+        // afresh (a sender skips chunks already there). Still asking.
         want.bad = true;
         want.got = 0;
+        if (arcadeDocEpoch() === epoch) clearSend(sha, rec.size);
         return;
       }
       holdRom(sha, bytes);

@@ -169,6 +169,30 @@ describe('sending the owner\'s file to the player who pressed play', () => {
     if (p.state === 'asking') expect(p.bad).toBe(true);
   });
 
+  it('bad bytes a peer left in the room are cleared, and the next sender starts clean', async () => {
+    const owner = await page('owner');
+    const player = await page('player');
+    link(owner, player);
+    const file = rom(owner.share.ROM_CHUNK_BYTES + 5_000);
+    const sha = await owner.share.sha256Hex(file);
+    player.share.wantRom(sha, file.length);
+    // A peer wrote other bytes under the owner's hash, under a fresh claim.
+    const bad = rom(file.length, 99);
+    const map = owner.y.getMap('arcade');
+    map.set(`romsend:${sha}`, { size: file.length, chunks: 2, by: 'x', at: 1 });
+    map.set(`romc:${sha}:0`, bad.slice(0, owner.share.ROM_CHUNK_BYTES));
+    map.set(`romc:${sha}:1`, bad.slice(owner.share.ROM_CHUNK_BYTES));
+    await run([player], 1);
+    expect(player.share.romProgress(sha)).toMatchObject({ state: 'asking', bad: true });
+    expect(romKeys(owner)).toEqual([`romask:${sha}:player`]); // the claim and its chunks are gone
+
+    owner.share.holdRom(sha, file); // the owner comes back: nothing to wait out, nothing to skip
+    await run([owner, player], 1);
+    const p = player.share.romProgress(sha);
+    expect(p.state).toBe('have');
+    if (p.state === 'have') expect(p.bytes).toEqual(file);
+  });
+
   it('reads nothing a peer shaped wrong, and asks for nothing too big', async () => {
     const owner = await page('owner');
     const player = await page('player');
