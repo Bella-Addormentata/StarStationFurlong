@@ -88,12 +88,21 @@ export function commitSeedSync(seed: string, ctx: TableSeedContext): string {
   return bytesToHex(sha256(new TextEncoder().encode(tableCommitMessage(seed, ctx))));
 }
 
+/** Bound a Map/Set by dropping its OLDEST entries (insertion order), never
+ *  clearing it wholesale: a clear could drop a round still in play. */
+function evictOldest(m: Map<string, unknown> | Set<string>, max: number): void {
+  while (m.size > max) {
+    const first = m.keys().next().value as string;
+    m.delete(first);
+  }
+}
+
 const SEED_STORE_PREFIX = 'ssf-fair-seed:';
 const memSeeds = new Map<string, string>();
 
 function keepSeed(commit: string, seed: string): void {
-  if (memSeeds.size > 256) memSeeds.clear();
   memSeeds.set(commit, seed);
+  evictOldest(memSeeds, 256);
   try {
     localStorage.setItem(SEED_STORE_PREFIX + commit, seed);
   } catch {
@@ -183,7 +192,13 @@ interface FrozenSnapshot {
   commits: Record<string, string>;
   wagers?: Record<string, string>;
 }
-const frozenSeen = new Map<string, FrozenSnapshot>();
+/** Per table (epoch:table), its last few rounds' snapshots, oldest first. */
+const frozenSeen = new Map<string, Map<string, FrozenSnapshot>>();
+const SNAPSHOTS_PER_TABLE = 4;
+
+function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
+  return frozenSeen.get(`${casinoDocEpoch()}:${tableId}`)?.get(roundKey(tableId, s.round, s.houseCommit));
+}
 
 function snapshot(s: TableState & { wagers?: Record<string, string> }): FrozenSnapshot {
   return {
@@ -200,16 +215,25 @@ export function frozenFields(
   tableId: string,
   s: TableState & { wagers?: Record<string, string> },
 ): { commits?: Record<string, string>; wagers?: Record<string, string> } {
-  const seen = frozenSeen.get(roundKey(tableId, s.round, s.houseCommit));
+  const seen = seenFor(tableId, s);
   if (!seen) return { ...(s.commits ? { commits: s.commits } : {}), ...(s.wagers ? { wagers: s.wagers } : {}) };
   return { commits: seen.commits, ...(seen.wagers ? { wagers: seen.wagers } : {}) };
 }
 
 function noteFrozen(tableId: string, s: TableState & { wagers?: Record<string, string> }, overwrite: boolean): void {
   const k = roundKey(tableId, s.round, s.houseCommit);
-  if (!overwrite && frozenSeen.has(k)) return;
-  if (frozenSeen.size > 64) frozenSeen.clear();
-  frozenSeen.set(k, snapshot(s));
+  const tk = `${casinoDocEpoch()}:${tableId}`;
+  let rounds = frozenSeen.get(tk);
+  if (rounds?.has(k) && !overwrite) return;
+  if (!rounds) {
+    rounds = new Map();
+    frozenSeen.set(tk, rounds);
+    evictOldest(frozenSeen, 256);
+  }
+  rounds.delete(k); // re-insert as newest
+  rounds.set(k, snapshot(s));
+  // Only this table's older rounds make way: other tables keep theirs.
+  evictOldest(rounds, SNAPSHOTS_PER_TABLE);
 }
 
 function roundKey(tableId: string, round: number, house: string | undefined): string {
@@ -229,8 +253,9 @@ function sameCommits(a: Record<string, string>, b: Record<string, string>): bool
 export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now(), force = false): void {
   const tickKey = `${tableId}:${me}`;
   if (!force && now - (lastTick.get(tickKey) ?? 0) < 200) return;
-  if (lastTick.size > 256) lastTick.clear();
+  lastTick.delete(tickKey);
   lastTick.set(tickKey, now);
+  evictOldest(lastTick, 256);
   const s = readState(tableId, game);
   if (!s?.houseCommit) return;
   if (s.phase === 'closing') {
@@ -246,10 +271,10 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
     const seed = randomSeedHex();
     const commit = commitSeedSync(seed, bettorCtx(tableId, s, me));
     keepSeed(commit, seed);
-    if (authored.size > 256) authored.clear();
-    if (authoredRounds.size > 256) authoredRounds.clear();
     authored.add(commit);
     authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
+    evictOldest(authored, 512);
+    evictOldest(authoredRounds, 512);
     writeMySeedRecord(tableId, me, { round: s.round, house: s.houseCommit, commit });
   } else if (s.phase === 'closing') {
     const frozen = s.commits?.[me];
@@ -265,6 +290,8 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
     if (myFrozen && seedFor(myFrozen, bettorCtx(tableId, s, me))) {
       authored.add(myFrozen);
       authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
+      evictOldest(authored, 512);
+      evictOldest(authoredRounds, 512);
     }
     if (rec && rec.round === s.round) forgetSeed(rec.commit, { table: tableId, round: rec.round, party: me, house: rec.house });
     if (myFrozen) forgetSeed(myFrozen, bettorCtx(tableId, s, me));
@@ -351,8 +378,8 @@ export interface GatheredRound {
 export function gatherRound(tableId: string, s: TableState, now = Date.now()): GatheredRound | null {
   const key = roundKey(tableId, s.round, s.houseCommit);
   if (!settleDueAt.has(key)) {
-    if (settleDueAt.size > 64) settleDueAt.clear();
     settleDueAt.set(key, now);
+    evictOldest(settleDueAt, 256);
   }
   const graceOver = now - settleDueAt.get(key)! >= REVEAL_GRACE_MS;
   const houseCommit = s.houseCommit ?? '';
@@ -421,7 +448,7 @@ export async function verifySettledRound(
   if (!t?.parties || !t.commits || !t.seeds) return { kind: 'unproven' };
   const frozen = s.commits ?? {};
   // The party set must be the one this page saw frozen before the reveals.
-  const seen = frozenSeen.get(roundKey(tableId, s.round, s.houseCommit));
+  const seen = seenFor(tableId, s);
   if (seen && (seen.house !== s.houseCommit || !sameCommits(seen.commits, frozen)
     || (seen.wagers && !sameCommits(seen.wagers, s.wagers ?? {})))) return { kind: 'failed' };
   const bettors = t.parties.slice(1);

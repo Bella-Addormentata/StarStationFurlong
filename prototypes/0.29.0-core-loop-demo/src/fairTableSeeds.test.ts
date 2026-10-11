@@ -294,6 +294,26 @@ describe('a Fair roulette round', () => {
     expect(closing?.unseeded).toBeUndefined();
   });
 
+  it("many other tables closing doesn't evict this table's frozen snapshot", async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette'); // reveals, and snapshots the frozen set
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    // Seventy other tables close on this page afterwards.
+    for (let i = 0; i < 70; i++) {
+      const o = freshTable();
+      tickAutoCroupier(o);
+      const st = readTableState(o)!;
+      writeTableState(o, { ...st, phase: 'closing', commits: {} });
+      tickFairSeeds(o, 'roulette', AMY, Date.now(), true);
+    }
+    const v = await verifySettledRound('roulette', t, s, { pocket: s.result! });
+    expect(v).toMatchObject({ kind: 'verified', watchedClose: true });
+  });
+
   it("a seed revealed last round can't be replayed as this round's", async () => {
     const t = freshTable();
     rouletteToClosing(t);
