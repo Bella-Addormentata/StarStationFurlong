@@ -409,6 +409,7 @@ describe('NetworkProvider — the faucet request stream', () => {
     expect(sent[0].kind).toBe('faucet');
     expect(sent[0].room).toBe(BOOT.roomId);
     expect(JSON.parse(atob(sent[0].payload as string))).toEqual({ op: 'give', amount: 1234 });
+    expect(sent[0].seq).toBe(1);
     // The writable is closed after that one frame: the node's read loop ends at
     // our FIN and it can finish its side after replying, so the stream ends
     // instead of living (and holding a node task) until disconnect.
@@ -420,6 +421,9 @@ describe('NetworkProvider — the faucet request stream', () => {
     await vi.waitFor(() => expect(replies).toHaveLength(1));
     expect(replies[0]).toEqual(reply);
     expect(envelopes).toHaveLength(0);
+    // Every request carries the next seq, so the node's echo orders the replies.
+    await provider.requestFaucet('status');
+    expect(unframe(wt.opened[1].written)[0].seq).toBe(2);
     await provider.disconnect();
   });
 

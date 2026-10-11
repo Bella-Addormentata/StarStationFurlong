@@ -194,6 +194,8 @@ interface Pending {
 const latest = new Map<string, FaucetStatus>();
 const lastError = new Map<string, string>();
 const pending = new Map<string, Pending>();
+/** The request seq of the newest status filed per room (see setFaucetReply). */
+const latestSeq = new Map<string, number>();
 const listeners = new Set<() => void>();
 
 function notify(): void {
@@ -226,13 +228,24 @@ export function markFaucetPending(roomId: string, op: FaucetOp, now: number = Da
 
 /** File a reply from the node for `roomId`. A status replaces the last one and
  *  clears a pending spend once the wallet/jar shows it (claim: our wallet now
- *  holds a coin; give: fewer wallet mojos); an error is kept for the screen. */
-export function setFaucetReply(roomId: string, reply: FaucetReply): void {
+ *  holds a coin; give: fewer wallet mojos); an error is kept for the screen.
+ *
+ *  `seq` is the request's number, echoed by the node: the 20 s and 60 s polls
+ *  and the post-action read each run on their own stream and can complete out
+ *  of order, so a status whose seq is below the newest one filed is an older
+ *  snapshot and is dropped (it could put a pre-claim balance back and re-enable
+ *  TAKE). An older node echoes 0 for every reply, which orders nothing. */
+export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
   if (!reply.ok) {
     lastError.set(roomId, reply.error ?? 'the node refused');
     if (reply.op === 'claim' || reply.op === 'give') pending.delete(roomId);
     notify();
     return;
+  }
+  if (reply.status && seq !== undefined && seq > 0) {
+    const newest = latestSeq.get(roomId) ?? 0;
+    if (seq < newest) return; // an older snapshot answered late
+    latestSeq.set(roomId, seq);
   }
   lastError.delete(roomId);
   if (reply.status) {
@@ -270,5 +283,6 @@ export function clearFaucetRoom(roomId: string): void {
   latest.delete(roomId);
   lastError.delete(roomId);
   pending.delete(roomId);
+  latestSeq.delete(roomId);
   notify();
 }

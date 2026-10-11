@@ -58,6 +58,11 @@ pub const RECONCILE_GRACE: Duration = Duration::from_secs(20);
 /// still unconfirmed after an hour has left the mempool.
 pub const PENDING_FALLBACK_TTL: Duration = Duration::from_secs(3600);
 
+/// Pages of `get_coin_records_by_names` a reconciliation follows (one HTTPS
+/// call each). Parked coins number a handful; a listing still cut short after
+/// this many pages is treated as INCOMPLETE and settles nothing it left out.
+pub const MAX_RECONCILE_PAGES: usize = 8;
+
 /// 🔒 Wallet spend lease (#245 review). Every spend from OUR wallet — the
 /// presence heartbeat (`publish_presence`, also the startup publish hook), the
 /// craps fairness hook's commit and reveal (`chia_craps_fair`), the faucet
@@ -159,46 +164,79 @@ impl WalletLease {
         }
     }
 
-    /// The parked coins old enough to ask the gateway about.
-    pub fn due_at(&self, now: Instant) -> Vec<Bytes32> {
+    /// The parked coins old enough to ask the gateway about, each with the
+    /// instant it was parked: a verdict releases exactly that parking (see
+    /// [`WalletLease::release`]).
+    pub fn due_at(&self, now: Instant) -> Vec<(Bytes32, Instant)> {
         self.pending
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, at)| now.duration_since(**at) >= RECONCILE_GRACE)
-            .map(|(id, _)| *id)
+            .map(|(id, at)| (*id, *at))
             .collect()
     }
 
-    /// Forget parked coins the chain or the mempool settled.
-    pub fn release(&self, coin_ids: &[Bytes32]) {
+    /// Forget parked coins the chain or the mempool settled. Compare-and-
+    /// release: an entry is removed only while it still carries the instant
+    /// the verdict was formed for, so a coin released and parked AGAIN by a
+    /// writer in the meantime (a new spend of a coin the chain had let go)
+    /// keeps its fresh marker whatever a stale verdict says (#245 review,
+    /// round 8).
+    pub fn release(&self, settled: &[(Bytes32, Instant)]) {
         let mut pending = self.pending.lock().unwrap();
-        for id in coin_ids {
-            pending.remove(id);
+        for (id, at) in settled {
+            if pending.get(id) == Some(at) {
+                pending.remove(id);
+            }
         }
     }
 
     /// Settle the parked coins against the chain and the mempool: ask the
     /// gateway about every coin past the grace, then release what [`settle`]
     /// says. Lookups that fail leave their coins parked (the fallback TTL
-    /// bounds that); nothing here is decided by the clock.
+    /// bounds that); nothing here is decided by the clock. Callers hold the
+    /// lease gate (every writer does; the dish's status read takes it for
+    /// this), and `release` is compare-and-release besides, so a verdict can
+    /// never remove a marker parked after it was formed.
     pub async fn reconcile(&self, client: &CoinsetClient) {
-        let due = self.due_at(Instant::now());
-        if due.is_empty() {
+        let parked = self.due_at(Instant::now());
+        if parked.is_empty() {
             return;
         }
-        let records = match client
-            .get_coin_records_by_names(due.clone(), None, None, Some(true), None)
-            .await
-        {
-            Ok(resp) if resp.success => resp.coin_records.unwrap_or_default(),
-            Ok(resp) => {
-                eprintln!("⛓️ wallet lease: coin lookup unsuccessful ({:?}); parked coins stay parked", resp.error);
-                return;
-            }
-            Err(e) => {
-                eprintln!("⛓️ wallet lease: coin lookup failed ({e}); parked coins stay parked");
-                return;
+        let due: Vec<Bytes32> = parked.iter().map(|(id, _)| *id).collect();
+        // The listing is paged like every coinset listing: follow the cursor,
+        // and if it is still cut short at the cap (or truncated with no
+        // cursor), the listing is INCOMPLETE and a coin it left out is kept.
+        let mut records = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        let complete = loop {
+            let resp = match client
+                .get_coin_records_by_names(due.clone(), None, None, Some(true), cursor.take())
+                .await
+            {
+                Ok(resp) if resp.success => resp,
+                Ok(resp) => {
+                    eprintln!("⛓️ wallet lease: coin lookup unsuccessful ({:?}); parked coins stay parked", resp.error);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("⛓️ wallet lease: coin lookup failed ({e}); parked coins stay parked");
+                    return;
+                }
+            };
+            pages += 1;
+            records.extend(resp.coin_records.unwrap_or_default());
+            let truncated = resp.truncated.unwrap_or(false);
+            match resp.next_cursor {
+                Some(next) if truncated => {
+                    if pages >= MAX_RECONCILE_PAGES {
+                        break false;
+                    }
+                    cursor = Some(next);
+                }
+                _ => break !truncated,
             }
         };
         let spent_on_chain: HashMap<Bytes32, bool> = records.iter().map(|r| (r.coin.coin_id(), r.spent)).collect();
@@ -218,9 +256,11 @@ impl WalletLease {
             };
             in_mempool.insert(*id, seen);
         }
-        let released = settle(&due, &spent_on_chain, &in_mempool);
+        let released = settle(&due, &spent_on_chain, &in_mempool, complete);
         if !released.is_empty() {
-            self.release(&released);
+            let settled: Vec<(Bytes32, Instant)> =
+                parked.into_iter().filter(|(id, _)| released.contains(id)).collect();
+            self.release(&settled);
         }
     }
 }
@@ -229,18 +269,21 @@ impl WalletLease {
 /// SPENT on chain, the spend confirmed and the coin is gone; UNSPENT and not in
 /// the mempool, the spend was dropped and the coin is free again; unspent and
 /// still in the mempool (or the mempool could not be asked, `None`), it stays
-/// parked; not on the chain at all, there is nothing to double-spend.
+/// parked. A coin the listing does not mention is released only when the
+/// listing was COMPLETE (then there is no such coin on chain, nothing to
+/// double-spend); a listing cut short says nothing about what it left out.
 pub fn settle(
     due: &[Bytes32],
     spent_on_chain: &HashMap<Bytes32, bool>,
     in_mempool: &HashMap<Bytes32, Option<bool>>,
+    complete: bool,
 ) -> Vec<Bytes32> {
     due.iter()
         .copied()
         .filter(|id| match spent_on_chain.get(id) {
             Some(true) => true,
             Some(false) => in_mempool.get(id).copied().flatten() == Some(false),
-            None => true,
+            None => complete,
         })
         .collect()
 }
@@ -554,11 +597,30 @@ mod tests {
         // …only the chain/mempool verdict does (release), or the hour-long
         // fallback for a coin the gateway never settled.
         assert!(lease.due_at(t0 + Duration::from_secs(5)).is_empty(), "inside the grace: not asked yet");
-        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![a]);
-        lease.release(&[a]);
+        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![(a, t0)]);
+        lease.release(&[(a, t0)]);
         assert!(!lease.is_pending_at(&a, t0 + Duration::from_secs(1)));
         lease.mark_spent_at([b], t0);
         assert!(!lease.is_pending_at(&b, t0 + PENDING_FALLBACK_TTL));
+    }
+
+    #[test]
+    fn a_stale_verdict_cannot_release_a_coin_parked_again_since() {
+        let lease = WalletLease::new();
+        let a = Bytes32::new([1u8; 32]);
+        let t0 = Instant::now();
+        lease.mark_spent_at([a], t0);
+        let verdict = lease.due_at(t0 + RECONCILE_GRACE); // formed for the t0 parking
+        // Meanwhile a writer saw the coin released and spent it again.
+        let t1 = t0 + Duration::from_secs(30);
+        lease.release(&[(a, t0)]);
+        lease.mark_spent_at([a], t1);
+        // The stale verdict lands: the fresh marker stays.
+        lease.release(&verdict);
+        assert!(lease.is_pending_at(&a, t1 + Duration::from_secs(1)));
+        // The verdict formed for the new parking does release it.
+        lease.release(&lease.due_at(t1 + RECONCILE_GRACE));
+        assert!(!lease.is_pending_at(&a, t1 + Duration::from_secs(1)));
     }
 
     #[test]
@@ -570,9 +632,15 @@ mod tests {
             [(confirmed, true), (dropped, false), (waiting, false), (unknown, false)].into_iter().collect();
         let in_mempool: HashMap<Bytes32, Option<bool>> =
             [(dropped, Some(false)), (waiting, Some(true)), (unknown, None)].into_iter().collect();
-        let mut released = settle(&due, &spent_on_chain, &in_mempool);
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, true);
         released.sort();
         let mut expected = vec![confirmed, dropped, never_existed];
+        expected.sort();
+        assert_eq!(released, expected);
+        // A listing cut short says nothing about the coins it left out: they stay.
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, false);
+        released.sort();
+        let mut expected = vec![confirmed, dropped];
         expected.sort();
         assert_eq!(released, expected);
     }
@@ -590,7 +658,7 @@ mod tests {
         assert!(lease.incoming_pending_at(t0 + PENDING_FALLBACK_TTL - Duration::from_secs(1)));
         // …until the chain or the mempool settles the claim (confirmed: the gift
         // is in the wallet; dropped: the wallet is still empty and may ask again).
-        lease.release(&[faucet_coin]);
+        lease.release(&[(faucet_coin, t0)]);
         assert!(!lease.incoming_pending_at(t0 + Duration::from_secs(2)));
     }
 

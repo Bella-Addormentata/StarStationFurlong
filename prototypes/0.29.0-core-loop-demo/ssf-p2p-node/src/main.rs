@@ -1694,7 +1694,7 @@ async fn handle_wt_connection_inner(
                                     chia_faucet::FaucetReply::refused("faucet requests are the LOCAL browser's alone")
                                 };
                                 let mut s = send.lock().await;
-                                let _ = write_faucet_reply(&mut *s, &envelope.room, &reply).await;
+                                let _ = write_faucet_reply(&mut *s, &envelope.room, envelope.seq, &reply).await;
                                 // One request per stream: FIN our side after the reply so the
                                 // browser's reader ends cleanly; its own FIN ends this loop at the
                                 // next read (it closes its writer after the single frame).
@@ -2878,17 +2878,20 @@ async fn broadcast_bridge_status(
 
 /// ⛓️🥣 Answer a `faucet` request on the stream it came in on (same framing as
 /// every browser lane message: `[u32-LE len][JSON SsfEnvelope]`, JSON payload).
+/// The request's `seq` is echoed so the browser can drop a status answered
+/// out of order (its polls run on independent streams).
 #[cfg(feature = "chia-read")]
 async fn write_faucet_reply<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     room_id: &str,
+    seq: u32,
     reply: &chia_faucet::FaucetReply,
 ) -> Result<()> {
     let env = SsfEnvelope {
         v: 1,
         room: room_id.to_string(),
         kind: "faucet".to_string(),
-        seq: 0,
+        seq,
         author: vec![],
         payload: serde_json::to_vec(reply)?,
         sig: None,

@@ -403,7 +403,11 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
         match &ctx.wallet {
             Some(sk) => {
                 // What the chain and the mempool say about parked coins decides
-                // what reads as confirming or landing, not a timer.
+                // what reads as confirming or landing, not a timer. Under the
+                // lease gate like every writer: a verdict formed here must not
+                // land on a coin a writer parked again in the meantime, and the
+                // wallet snapshot must match the markers it is read against.
+                let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
                 crate::chia_publish::WALLET_LEASE.reconcile(client).await;
                 let wallet = wallet_view(client, sk).await?;
                 st.wallet_mojos = Some(wallet.owned_mojos());

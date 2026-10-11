@@ -9913,13 +9913,15 @@ async function init() {
   // ~1 Hz for the jar level and the mojo in the dish. A slow poll keeps the
   // prop honest for players who never focus the screen (18.75 s blocks).
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
-  networkProvider.onFaucetReply((env: { payload?: string; room?: string }) => {
+  networkProvider.onFaucetReply((env: { payload?: string; room?: string; seq?: number }) => {
     if (typeof env.payload !== "string" || typeof env.room !== "string") return;
     // Only the room joined right now: a reply for a room already left (or
     // never joined) is dropped, not filed.
     if (env.room !== faucetRepliesFor) return;
     const reply = parseFaucetReply(env.payload);
-    if (reply) setFaucetReply(env.room, reply);
+    // The node echoes the request's seq, so an older status answered late
+    // cannot overwrite a newer one (see setFaucetReply).
+    if (reply) setFaucetReply(env.room, reply, typeof env.seq === "number" ? env.seq : undefined);
   });
   window.setInterval(() => {
     if (world.hasFaucetDish()) networkProvider.requestFaucet("status").catch(() => {});

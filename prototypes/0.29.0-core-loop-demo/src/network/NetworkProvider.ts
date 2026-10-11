@@ -62,6 +62,10 @@ export class NetworkProvider implements NetworkProviderPort {
    *  request went out on, never from a node-opened stream (a peer's forwarded
    *  envelope must not pass for the node's answer). */
   #faucetReplyHandler: ((env: any) => void) | null = null;
+  /** Monotonic `seq` on faucet requests; the node echoes it on the reply, so
+   *  the dish can drop a status answered out of order (each poll is its own
+   *  stream, and streams complete in any order). */
+  #faucetSeq = 0;
   #isActive = false;
 
   #pingSent = 0;
@@ -321,7 +325,7 @@ export class NetworkProvider implements NetworkProviderPort {
       if (op === 'give') body.amount = Math.max(0, Math.floor(amount ?? 0));
       const payloadBytes = new TextEncoder().encode(JSON.stringify(body));
       const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
-      const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq: 0, author: '', payload: payloadB64 };
+      const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq: ++this.#faucetSeq, author: '', payload: payloadB64 };
       const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
       const packet = new Uint8Array(4 + jsonBytes.length);
       new DataView(packet.buffer).setUint32(0, jsonBytes.length, true);

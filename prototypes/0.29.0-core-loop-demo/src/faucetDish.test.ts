@@ -174,6 +174,23 @@ describe('faucet dish: per-room store', () => {
     clearFaucetRoom(room);
   });
 
+  it('drops a status answered out of order, keeping the newest snapshot', () => {
+    const room = 'home-store-4';
+    clearFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true }) }, 7);
+    // The post-claim read (seq 9) lands first, then the older poll (seq 8) answers late.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 1n, canClaim: false }) }, 9);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true }) }, 8);
+    expect(latestFaucetStatus(room)?.walletMojos).toBe(1n);
+    expect(latestFaucetStatus(room)?.canClaim).toBe(false);
+    // A newer one still replaces it; an older node's unnumbered replies always do.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 2n }) }, 10);
+    expect(latestFaucetStatus(room)?.walletMojos).toBe(2n);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 3n }) }, 0);
+    expect(latestFaucetStatus(room)?.walletMojos).toBe(3n);
+    clearFaucetRoom(room);
+  });
+
   it('drops a pending take at once when the request never reached the node, and says why', () => {
     const room = 'home-store-3';
     clearFaucetRoom(room);
