@@ -26,7 +26,8 @@ import {
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
 import {
-  acceptMediaOrigin, allowMount, consentRefusal, mayMountNow, mediaConsent, mediaOrigin, TV_MOUNT_BUDGET,
+  acceptMediaOrigin, allowMount, consentRefusal, mayMountNow, mediaConsent, mediaOrigin, needsRedirectProbe, probeRedirect,
+  redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
@@ -110,10 +111,12 @@ class YouTubePlayerAdapter implements Adapter {
   private state = -1;
   private readonly readyTimer: number;
 
-  /** `autoplay` only when the room is playing at mount time: a countdown or
-   *  a paused set must not sound for the 400 ms before the controller's
-   *  first tick — the controller starts the player when the record says. */
-  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void, autoplay = true) {
+  /** No `autoplay`: the controller starts the player when the record says,
+   *  on its first tick after the player is ready — and only after it has
+   *  applied the set's volume. With autoplay the iframe sounded at the
+   *  player's own level for the tick before that, a set at volume 0
+   *  included; and a countdown or a paused set must not sound at all. */
+  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void, autoplay = false) {
     const mount = document.createElement('div');
     host.appendChild(mount);
     const playerVars: Record<string, unknown> = {
@@ -331,6 +334,16 @@ interface Theatre {
   /** The helm's flight stick stands aside while the theatre is up
    *  (freeFlightStick.suspendStickKeys): its release, called on close. */
   releaseStick: () => void;
+  /** The mount key whose URL the redirect probe (tvConsent probeRedirect)
+   *  is out for, '' when none: one probe per programme, and its answer is
+   *  read from tvConsent on the tick after it lands. */
+  probing: string;
+  /** The probe in flight, to abort when its programme is superseded or the
+   *  theatre closes: a superseded probe must not run on to its deadline. */
+  probeAbort: AbortController | null;
+  /** The mount key whose probe spent a unit of the set's mount budget: its
+   *  mount, when the verdict allows one, is not counted a second time. */
+  budgetedKey: string;
 }
 
 let theatre: Theatre | null = null;
@@ -342,15 +355,39 @@ export interface TheatreDeps {
   rttMs?: () => number;
 }
 
+/** Where the deps come from when a caller names none: main.ts installs one
+ *  builder (the label from the furniture kind, the round trip from the
+ *  network provider), so the set's panel, the phone's WATCH and the HUD
+ *  chip open the same theatre — one entry point must not run without the
+ *  lead the others apply. */
+let depsProvider: (itemId: string) => TheatreDeps = () => ({});
+export function setTvTheatreDeps(provider: (itemId: string) => TheatreDeps): void {
+  depsProvider = provider;
+}
+
 export function isTvTheatreOpen(itemId?: string): boolean {
   return theatre !== null && (itemId === undefined || theatre.itemId === itemId);
+}
+
+/** Where focus goes back when the theatre closes: whatever had it as the
+ *  theatre opened — unless that is a control inside the phone. The phone's
+ *  WATCH hides the phone without blurring its button, and focus returned to
+ *  an offscreen control would answer the next Enter or Space from a phone
+ *  nobody can see (and reopen this). main.ts's phoneOpener refuses openers
+ *  inside the phone for the same reason; the theatre applies the same rule
+ *  and lets focus fall to the body, where the world's keys are its own. */
+function focusReturnTarget(): HTMLElement | null {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) return null;
+  const phone = document.getElementById('spacephone-container');
+  return phone && phone.contains(active) ? null : active;
 }
 
 export function tvTheatreItemId(): string | null {
   return theatre?.itemId ?? null;
 }
 
-export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
+export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(itemId)): void {
   if (theatre && theatre.itemId !== itemId) closeTvTheatre();
   if (theatre) {
     // Already up on this set — the phone's WATCH after a hand-over put the
@@ -387,8 +424,20 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
   document.body.appendChild(root);
   const onKey = (e: KeyboardEvent) => {
     // The phone open above the theatre (a hand-over pops it open without
-    // closing this) owns Tab and Escape: its handlers close it or go home.
-    if (phoneIsUp()) return;
+    // closing this): a key typed INTO the phone is the phone's (its TV app
+    // holds its own flight keys), and Tab and Escape are its shortcuts
+    // wherever focus is — they close it or go home. Every other key with
+    // focus OUTSIDE the phone — a theatre button the player clicked, the
+    // body — is still a key pressed over this dialog: held, as below, so W
+    // does not walk the clone behind two overlays (the stick stands aside
+    // for the theatre and cannot hold it).
+    if (phoneIsUp()) {
+      const phone = document.getElementById('spacephone-container');
+      if (phone && e.target instanceof Node && phone.contains(e.target)) return;
+      if (e.key === 'Tab' || e.key === 'Escape') return;
+      e.stopPropagation();
+      return;
+    }
     if (e.key === 'Escape') {
       e.stopPropagation();
       closeTvTheatre();
@@ -451,9 +500,12 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     lastHead: '',
     lastNotice: '',
     onKey,
-    opener: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+    opener: focusReturnTarget(),
     playerFor: -1,
     releaseStick,
+    probing: '',
+    probeAbort: null,
+    budgetedKey: '',
   };
   // The dialog takes focus (Tab then reaches its controls); it goes back on close.
   root.tabIndex = -1;
@@ -491,6 +543,9 @@ export function closeTvTheatre(): void {
 
 function unmountPlayer(t: Theatre): void {
   t.attempt += 1; // whatever is still being built for the old mount is void
+  t.probeAbort?.abort(); // a probe out for the old programme is not waited for
+  t.probeAbort = null;
+  t.probing = '';
   t.unregister?.();
   t.unregister = null;
   t.controller = null;
@@ -571,9 +626,13 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
   if (source.kind === 'youtube') {
     showNotice(t, `<div>REACHING YOUTUBE…</div><div class="tv-theatre-lane">CONVENIENCE LANE</div>`);
     loadYouTubeApi().then(
-      (yt) => adopt(new YouTubePlayerAdapter(
-        t.screen, source.videoId, yt, fail, readPlayback(t.itemId).state === 'playing',
-      )),
+      (yt) => {
+        // The programme moved on (or the theatre closed) while the API
+        // loaded: build no iframe for it — adopt() would destroy one, but
+        // the constructor had already inserted it and started its load.
+        if (!live()) return;
+        adopt(new YouTubePlayerAdapter(t.screen, source.videoId, yt, fail));
+      },
       (err: Error) => fail(err.message || 'YouTube is unreachable'),
     );
     return;
@@ -658,18 +717,91 @@ function theatreTick(rtt: () => number): void {
     if (consent !== 'ok') {
       showConsentNotice(t, rec.source!, consent);
     } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
+      // A URL on a host the viewer accepted is asked about before anything
+      // fetches it (tvConsent needsRedirectProbe / probeRedirect): a CORS
+      // HEAD that follows no redirect. A direct answer mounts; a redirect
+      // does not (the <video> would follow it blind, into the viewer's own
+      // network for all this page can tell); no answer — a host without
+      // CORS, or down — does not either: what could not be asked authorises
+      // nothing, and RETRY asks again. One probe per programme. The viewer's
+      // own origins, the node and the product lanes are not probed.
+      const url = rec.source!.kind === 'url' ? rec.source!.url : '';
+      const verdict = url && needsRedirectProbe(rec.source!) ? redirectVerdict(url) : 'direct';
       // Consent per origin bounds nothing cumulative: a modified client
-      // could rotate shape-valid sources on this viewer's own node and have
-      // every open theatre fetch each in turn without end. So a mount this
-      // theatre makes on its own is counted per set (tvConsent
-      // mayMountNow), and past the budget what is on is shown with PLAY —
-      // the press is the consent that mounts it.
-      if (mayMountNow(t.itemId, tvNow())) mountPlayer(t, rec.source!, key, rtt);
-      else showMountNotice(t, rec.source!, key);
+      // could rotate shape-valid sources on this viewer's own node — or
+      // query strings on an accepted host — and have every open theatre
+      // fetch each in turn without end. So every request this theatre makes
+      // on its own, a probe as much as a mount, is counted per set
+      // (tvConsent mayMountNow); a probe's unit covers the mount its
+      // verdict allows (budgetedKey), and past the budget what is on is
+      // shown with PLAY — the press is the consent that spends the next.
+      if (verdict === null) {
+        if (t.probing !== key) {
+          if (mayMountNow(t.itemId, tvNow())) {
+            t.budgetedKey = key;
+            startRedirectProbe(t, url, key);
+          } else {
+            showMountNotice(t, rec.source!, key);
+          }
+        }
+      } else if (verdict === 'redirects') {
+        showRedirectNotice(t, rec.source!, key);
+      } else if (t.budgetedKey === key || mayMountNow(t.itemId, tvNow())) {
+        t.budgetedKey = '';
+        mountPlayer(t, rec.source!, key, rtt);
+      } else {
+        showMountNotice(t, rec.source!, key);
+      }
     }
   }
   t.controller?.tick();
   renderTheatreChrome(t);
+}
+
+/** CHECKING THE LINK… — the probe is out for this programme's URL; the tick
+ *  after it lands reads the kept verdict from tvConsent and mounts, or shows
+ *  why not. No answer keeps no verdict: that is said here, with RETRY, so
+ *  the next tick does not ask again on its own. A probe that comes back for
+ *  an earlier programme, or after the theatre closed, changes nothing here;
+ *  a kept verdict is kept per URL all the same. */
+function startRedirectProbe(t: Theatre, url: string, key: string): void {
+  t.probeAbort?.abort(); // a probe still out for an earlier programme
+  const abort = new AbortController();
+  t.probeAbort = abort;
+  t.probing = key;
+  let host = url;
+  try { host = new URL(url).host; } catch { /* shown as it is */ }
+  showNotice(t, `<div>CHECKING THE LINK</div>
+    <div class="tv-theatre-lane">asking ${escapeHtml(host)} whether it answers this link itself or sends your browser elsewhere</div>`);
+  void probeRedirect(url, undefined, undefined, abort.signal).then((verdict) => {
+    if (theatre !== t || t.probing !== key || t.probeAbort !== abort) return;
+    t.probeAbort = null;
+    t.probing = '';
+    if (verdict !== 'unknown') return; // the next tick reads the kept verdict
+    t.mounted = `failed:${key}`;
+    showNotice(t, `<div>NOT PLAYED HERE</div>
+      <div class="tv-theatre-lane">${escapeHtml(host)} did not answer a cross-origin check — no CORS headers, or not reachable — and a link that cannot be asked about is not fetched; a CORS-enabled host, your own origin or this station's node plays here</div>
+      <button type="button" data-tv-retry="1">RETRY</button>`);
+    t.notice.querySelector<HTMLButtonElement>('[data-tv-retry]')?.addEventListener('click', () => {
+      t.mounted = '';
+    });
+  }, () => {
+    if (theatre === t && t.probing === key && t.probeAbort === abort) {
+      t.probeAbort = null;
+      t.probing = '';
+    }
+  });
+}
+
+/** NOT PLAYED HERE — the host answered the link with a redirect. Where to,
+ *  the browser does not say and this page cannot know; so the link is not
+ *  mounted, whoever pasted it. */
+function showRedirectNotice(t: Theatre, source: TvSource, key: string): void {
+  t.mounted = `failed:${key}`; // nothing to retry: the same URL answers the same way
+  let host = source.kind === 'url' ? source.url : '';
+  try { host = new URL(host).host; } catch { /* shown as it is */ }
+  showNotice(t, `<div>NOT PLAYED HERE</div>
+    <div class="tv-theatre-lane">${escapeHtml(host || 'this host')} answers this link with a redirect, and your browser would follow it without saying where — paste the link it redirects to instead</div>`);
 }
 
 /** PLAY? — the set's automatic mounts for the minute are spent
@@ -683,7 +815,13 @@ function showMountNotice(t: Theatre, source: TvSource, key: string): void {
     <div class="tv-theatre-lane">the programme changed more than ${TV_MOUNT_BUDGET} times in a minute — your browser fetches no more on its own until you say so; whoever holds the remote cannot decide that for you</div>
     <button type="button" data-tv-mount="${escapeHtml(key)}">▶ PLAY</button>`);
   t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]')?.addEventListener('click', () => {
-    allowMount(t.itemId);
+    // The press is consent for THE PROGRAMME THE BUTTON NAMED: a peer may
+    // have changed it between the render and the click, and the budget must
+    // not be opened for whatever is on now. The notice comes down either
+    // way; the next tick asks again for what is on.
+    const now = readTv(t.itemId);
+    const current = now.source ? mountKey(now.source, now.started) : '';
+    if (current === key) allowMount(t.itemId);
     hideNotice(t);
   });
 }
@@ -705,6 +843,13 @@ function showConsentNotice(t: Theatre, source: TvSource, consent: 'ask' | 'refus
     } else if (why === 'server-off') {
       showNotice(t, `<div>NOT IN THIS BUILD</div>
       <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is another server — ${escapeHtml(SERVERLESS_ONLY)}: a link on your own origin or this station's node plays here</div>`);
+    } else if (why === 'node-stale') {
+      // The node's origin, but the node has not answered a fingerprint probe
+      // within its trust lifetime (tvConsent TV_NODE_TRUST_MS): whatever is
+      // on that port now is not known to be the node. The next probe that
+      // the node answers renews the trust and the theatre mounts on its own.
+      showNotice(t, `<div>WAITING FOR THE NODE</div>
+      <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is this station's node, but it has not answered lately — the picture returns when it does</div>`);
     } else {
       showNotice(t, `<div>NOT PLAYED HERE</div>
       <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is inside a private network — nobody in the room can ask your browser to fetch from there</div>`);
@@ -768,7 +913,7 @@ function renderTheatreChrome(t: Theatre): void {
     // a frame that never loaded gives no sign of it: RELOAD is the retry.
     startOnly
       ? '<span class="tv-theatre-lane">volume: in archive.org\'s player</span>'
-      : `<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="1" aria-label="Set volume"></label>`,
+      : '<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" data-tv-volume="1" aria-label="Set volume"></label>',
     startOnly && t.player ? btn('data-tv-reload="1"', '↻ RELOAD PLAYER', "archive.org's player did not load? Reload it") : '',
     !mine && mayPickUpRemote(t.itemId) ? btn('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE') : '',
     !mine && held ? `<span class="tv-theatre-lane">${escapeHtml(remote.name || 'someone')} has the remote</span>` : '',
@@ -801,7 +946,20 @@ function renderTheatreChrome(t: Theatre): void {
     c.querySelector<HTMLInputElement>('[data-tv-volume]')?.addEventListener('change', (e) => {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));
     });
-    c.querySelector<HTMLButtonElement>('[data-tv-reload]')?.addEventListener('click', () => { t.mounted = ''; });
+    // RELOAD takes the old embed down first (unmountPlayer clears the key):
+    // clearing the key alone left the iframe and its controller alive
+    // behind the PLAY notice when the replacement had to wait for the
+    // mount budget, the old film still playing.
+    c.querySelector<HTMLButtonElement>('[data-tv-reload]')?.addEventListener('click', () => { unmountPlayer(t); });
+  }
+  // The slider's level is a property, not part of the row's HTML: a peer's
+  // VOLUME press on the set moves the knob without rebuilding the row under
+  // a pointer mid-drag, and a slider the player is on keeps its own reading
+  // until its change lands.
+  const slider = t.controls.querySelector<HTMLInputElement>('[data-tv-volume]');
+  if (slider && document.activeElement !== slider) {
+    const level = String(rec.volume);
+    if (slider.value !== level) slider.value = level;
   }
 }
 

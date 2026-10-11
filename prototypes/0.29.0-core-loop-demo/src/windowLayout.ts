@@ -16,7 +16,7 @@
 import * as THREE from 'three';
 import { computeOctagonProfile, sectionToWorld, surfaceEdge } from './hullSection';
 import type { HullSurface } from './hullSection';
-import { roomHalfExtents, roomCupola } from './floorPlanDoc';
+import { roomHalfExtents, roomCupolas } from './floorPlanDoc';
 import { cupolaStripRun } from './cupola';
 import { readAllWindowLayout, WINDOW_DEFAULT } from './windowLayoutDoc';
 import type { HullWindows, WindowOpening } from './octagonHull';
@@ -71,7 +71,7 @@ export function surfaceBasis(surface: HullSurface): {
 /** 🔭 The along-axis run a window may use: the strip's, which a cupola end
  *  wall shortens (the same run octagonHull cuts the strips to). */
 function windowRun(): [number, number] {
-  return cupolaStripRun(roomCupola(), profile().longHalf);
+  return cupolaStripRun(roomCupolas(), profile().longHalf);
 }
 
 /** Snap an along/across coordinate to the 1 m lattice (windows sit on metre

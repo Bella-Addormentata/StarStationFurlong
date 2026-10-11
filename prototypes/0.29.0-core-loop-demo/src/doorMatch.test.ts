@@ -6,13 +6,16 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  CROSSING_BAND,
   WALL_YAW,
   angDiff,
   candidateFarDoors,
   chooseArrivalDoor,
+  doorBeingCrossed,
   doorFaceWorld,
   pickFacingDoor,
   type ArrivalDoor,
+  type CrossingDoor,
   type FarDoorCandidate,
   type ModulePose,
 } from './doorMatch';
@@ -320,5 +323,154 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     const doors = [door('north', 'y-', null, 0, false), door('south', 'y+', null)];
     const pick = chooseArrivalDoor(doors, { departureDoorId: 'south', departureWall: 'y+', fromRoomId: 'r' });
     expect(pick?.id).toBe('south');
+  });
+});
+
+
+/**
+ * 🚶🚪 #182 — "walk through a door in first person and you can sometimes be
+ * placed in the wrong room that doesn't match the station's atlas", and
+ * (dorkmo) "phantom doors along walls that dont actually have doors visible.
+ * you can walk into a wall with no door and then be taken to another room."
+ *
+ * One root cause: the crossing test measured depth into the wall as an
+ * UNSIGNED distance from the room centre, so every door also answered for its
+ * mirror on the opposite wall. These pin both reported symptoms against the
+ * real default-room geometry.
+ */
+describe('🚶 the door the walker is pressed into (#182)', () => {
+  // The default room: 2×2 tiles ⇒ half-extents 6 m, walkable to ±5.5
+  // (floorPlanDoc.WALL_CLEARANCE), stand points 1.5 m inside the wall
+  // (doorLayout.FRONT_INSET), 2 m opening (doorLayout.DOOR_OPENING_WIDTH).
+  const BOUNDS = { boundX: 5.5, boundZ: 5.5 };
+  const OPENING = 2;
+
+  /** A door on `wall`, `lateral` metres along it from centre. */
+  function doorOn(id: string, wall: DoorWall, lateral = 0): CrossingDoor {
+    const front =
+      wall === 'y-' ? { x: lateral, z: -4.5 }
+      : wall === 'y+' ? { x: lateral, z: 4.5 }
+      : wall === 'x-' ? { x: -4.5, z: lateral }
+      : { x: 4.5, z: lateral };
+    return { id, wall, front };
+  }
+
+  /** The four cardinals, in the order the live DOORS array holds them. */
+  const ROOM: CrossingDoor[] = [
+    doorOn('north', 'y-'),
+    doorOn('south', 'y+'),
+    doorOn('west', 'x-'),
+    doorOn('east', 'x+'),
+  ];
+
+  const crossing = (doors: CrossingDoor[], x: number, z: number): string | null =>
+    doorBeingCrossed(doors, { x, z }, BOUNDS, OPENING)?.id ?? null;
+
+  it('answers for the doorway the body is actually in, on all four walls', () => {
+    expect(crossing(ROOM, 0, -5.5)).toBe('north');
+    expect(crossing(ROOM, 0, 5.5)).toBe('south');
+    expect(crossing(ROOM, -5.5, 0)).toBe('west');
+    expect(crossing(ROOM, 5.5, 0)).toBe('east');
+  });
+
+  it('does not send an EAST crossing through the west door (the #182 report)', () => {
+    // Both sit at lateral 0, so the unsigned test matched west as well — and
+    // west is earlier in DOORS, so it transited first and the walker arrived
+    // in the WEST neighbour. Walking west worked, which is why the owner saw
+    // it only "sometimes".
+    const pick = doorBeingCrossed(ROOM, { x: 5.5, z: 0 }, BOUNDS, OPENING);
+    expect(pick?.id).toBe('east');
+    expect(pick?.wall).toBe('x+');
+    // …and the mirror case stays correct rather than flipping the other way.
+    expect(crossing(ROOM, -5.5, 0)).toBe('west');
+  });
+
+  it('does not send a SOUTH crossing through the north door', () => {
+    expect(crossing(ROOM, 0, 5.5)).toBe('south');
+    expect(crossing(ROOM, 0, -5.5)).toBe('north');
+  });
+
+  it('grows no phantom door on the wall facing a real one (dorkmo)', () => {
+    // A room with exactly ONE door. The facing wall is blank — the avatar can
+    // press into it, and nothing may happen.
+    for (const [wall, blankX, blankZ] of [
+      ['y-', 0, 5.5],
+      ['y+', 0, -5.5],
+      ['x-', 5.5, 0],
+      ['x+', -5.5, 0],
+    ] as Array<[DoorWall, number, number]>) {
+      const solo = [doorOn('d:solo', wall)];
+      expect(crossing(solo, blankX, blankZ)).toBeNull();
+      // The door itself still works, so this is not simply "nothing matches".
+      const own = doorOn('d:solo', wall).front;
+      const ownX = wall === 'x-' ? -5.5 : wall === 'x+' ? 5.5 : own.x;
+      const ownZ = wall === 'y-' ? -5.5 : wall === 'y+' ? 5.5 : own.z;
+      expect(crossing(solo, ownX, ownZ)).toBe('d:solo');
+    }
+  });
+
+  it('grows no phantom door at a mirrored OFF-CENTRE position either', () => {
+    // A free door slid 3 m along the north wall used to arm the same spot on
+    // the south wall.
+    const solo = [doorOn('d:free', 'y-', 3)];
+    expect(crossing(solo, 3, -5.5)).toBe('d:free');
+    expect(crossing(solo, 3, 5.5)).toBeNull();
+  });
+
+  it('is not tripped by walking ALONG the wall past a door', () => {
+    // Pressed to the wall but beyond the opening's half-width.
+    expect(crossing(ROOM, 5.5, 1.2)).toBeNull();
+    expect(crossing(ROOM, 1.2, 5.5)).toBeNull();
+    // The opening's edge is exclusive: half a width out is already wall.
+    expect(crossing(ROOM, 5.5, OPENING / 2)).toBeNull();
+    expect(crossing(ROOM, 5.5, OPENING / 2 - 0.001)).toBe('east');
+  });
+
+  it('is not tripped by ordinary floor short of the wall', () => {
+    // The band is the last few centimetres of travel, not a strip of room.
+    expect(crossing(ROOM, BOUNDS.boundX - CROSSING_BAND, 0)).toBeNull();
+    expect(crossing(ROOM, BOUNDS.boundX - 0.35, 0)).toBeNull();
+    expect(crossing(ROOM, BOUNDS.boundX - CROSSING_BAND + 0.01, 0)).toBe('east');
+  });
+
+  it('picks the NEARER door where two bands meet at a corner, not the first', () => {
+    // MIN_DOOR_GAP keeps two doors on ONE wall 4 m apart, so their bands can
+    // never overlap — but it says nothing across a corner. Array order
+    // deciding that is exactly how #182 read.
+    const corner: CrossingDoor[] = [
+      doorOn('on-x', 'x-', -5),
+      doorOn('on-y', 'y-', -5),
+    ];
+    // Deeper into the y- wall ⇒ the y- door, although it is second.
+    expect(crossing(corner, -5.5, -5.46)).toBe('on-y');
+    // Deeper into the x- wall ⇒ the x- door.
+    expect(crossing(corner, -5.46, -5.5)).toBe('on-x');
+    // Reversing the array changes nothing.
+    expect(crossing([...corner].reverse(), -5.5, -5.46)).toBe('on-y');
+    expect(crossing([...corner].reverse(), -5.46, -5.5)).toBe('on-x');
+  });
+
+  it('knows nothing of pairing or enablement — that is the caller\'s gate', () => {
+    // North is the fireplace-blocked door: never walkable. It is still
+    // reported, which is what keeps world.ts honest about re-arming the
+    // transit latch only once the body steps clear of EVERY doorway.
+    expect(crossing(ROOM, 0, -5.5)).toBe('north');
+  });
+
+  it('scales with the room, taking its bounds from the caller', () => {
+    // A 4×4 room: half-extents 12, walkable to ±11.5. The stand point stays
+    // 1.5 m inside the wall, so only the bound moves.
+    const big: CrossingDoor[] = [{ id: 'e', wall: 'x+', front: { x: 10.5, z: 0 } }];
+    const bounds = { boundX: 11.5, boundZ: 11.5 };
+    expect(doorBeingCrossed(big, { x: 11.5, z: 0 }, bounds, OPENING)?.id).toBe('e');
+    // The DEFAULT room's threshold is now ordinary floor, not a crossing.
+    expect(doorBeingCrossed(big, { x: 5.5, z: 0 }, bounds, OPENING)).toBeNull();
+    // …and the far wall is still blank.
+    expect(doorBeingCrossed(big, { x: -11.5, z: 0 }, bounds, OPENING)).toBeNull();
+  });
+
+  it('returns null for a doorless room', () => {
+    expect(crossing([], 5.5, 0)).toBeNull();
+    expect(crossing([], 0, 0)).toBeNull();
   });
 });

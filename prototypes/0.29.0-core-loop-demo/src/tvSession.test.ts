@@ -5,10 +5,12 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { isTvKind, tvLabel } from './tvSession';
 import {
-  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, setTvClock,
-  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
-  TV_LEASE_RENEW_MS,
+  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, remoteKey,
+  setTvClock,
+  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS,
+  TV_LEASE_LAPSE_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import {
   armTvDrive, forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvDriveArmed,
@@ -26,12 +28,16 @@ const run = (ms: number, ids: readonly string[] = [TV]) => {
   }
 };
 
+let bound: Y.Doc;
+/** The doc beforeEach bound, for a test that syncs another page's writes into it. */
+const doc0 = () => bound;
+
 beforeEach(() => {
   now = 5_000_000;
   setTvClock(() => now);
   setTvHostPredicate(() => false);
   setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
-  bindTvDoc(new Y.Doc());
+  bindTvDoc(bound = new Y.Doc());
   leaveTvRoom([]); // the room's cadences (renewals, beats, known ends) start over with the doc
   armTvDrive(true); // the room's docs are bound: World may drive its TVs
 });
@@ -435,6 +441,143 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'home', source: null }); // past 30 s: over, from the end the record carried
   });
 
+  it('an end the player learned just before the holder closed the theatre is filed in the record at once: a hand-over before the next tick still carries it', () => {
+    setTvPageId('A');
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    const started = readTv(TV).started;
+    run(500); // a tick with no player yet: nothing known of the end
+    expect(readTv(TV).endMs).toBe(0);
+    // The metadata lands and the theatre is closed in the same breath, with
+    // no room tick between — then the remote is handed on before the next.
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 5_000, canSeek: () => true, started: () => started, endMs: () => 30_000 });
+    unregister();
+    expect(readTv(TV).endMs).toBe(30_000); // filed as it went, while this page still held the remote
+    handRemote(TV, 'BBBBbob', 'Bob');
+    setTvIdentity(() => ({ pub: 'BBBBbob', name: 'Bob' }));
+    setTvPageId('B');
+    forgetTv(TV); // Bob's page knows nothing of the film…
+    run(500);
+    expect(iHoldRemote(TV)).toBe(true);
+    run(30_000); // …and still ends it where the record says
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
+  });
+
+  it('an OFF and an ON that arrive in one merged update are a power cycle too: the holder parks where the room was switched off', () => {
+    const doc = new Y.Doc();
+    bindTvDoc(doc);
+    leaveTvRoom([]);
+    armTvDrive(true);
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    const started = readTv(TV).started;
+    tickTvRoom([TV], now); // the baseline beat, at 0 — and the switch seen ON
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now); // at 3 s
+    // The holder's theatre is open: its player is the room's clock and would
+    // beat its own position over any anchor the switch carried.
+    let position = 4_000;
+    registerTvPlayerOfRecord(TV, { positionMs: () => position, canSeek: () => true, started: () => started, endMs: () => null });
+    // Another page switched the set OFF at 4 s and, a minute later, ON —
+    // and this page receives both writes in ONE update (a catch-up after a
+    // hiccup): the observer sees only the final ON, `on` unchanged.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const seq = readPower(TV).seq;
+    other.transact(() => {
+      other.getMap('tv').set(powerKey(TV), { on: false, seq: seq + 1, parkMs: 4_000 });
+      other.getMap('tv').set(powerKey(TV), { on: true, seq: seq + 2, parkMs: 4_000 });
+    });
+    run(60_000); // the minute passes HERE with the holder ticking and renewing (it never saw the OFF)
+    position = 64_000; // the holder's player ran on through it, as a <video> does
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(other, Y.encodeStateVector(doc)));
+    expect(readPower(TV)).toMatchObject({ on: true, seq: seq + 2, parkMs: 4_000 });
+    expect(iHoldRemote(TV)).toBe(true);
+    run(500);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 4_000 }); // parked where it was switched off, not 64 s
+  });
+
+  it('POWER ON arriving merged with a replacement programme owes no park: the new film is not paused by whoever takes the remote next', () => {
+    const doc = new Y.Doc();
+    bindTvDoc(doc);
+    leaveTvRoom([]);
+    armTvDrive(true);
+    setTvPageId('A');
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now); // the switch seen ON, the first film running
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now);
+    // Another page: OFF at 3 s, then — the remote lapsed from here — picks
+    // it up, switches ON and PLAY NOWs a second film; this page receives
+    // the whole sequence in ONE update, the switch and the new programme
+    // together. Written here as the raw records that page's writes leave.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const seq = readPower(TV).seq;
+    const rec = other.getMap('tv').get(tvKey(TV)) as Record<string, unknown>;
+    other.transact(() => {
+      other.getMap('tv').set(powerKey(TV), { on: false, seq: seq + 1, parkMs: 3_000 });
+      other.getMap('tv').set(powerKey(TV), { on: true, seq: seq + 2, parkMs: 3_000 });
+      other.getMap('tv').set(tvKey(TV), {
+        ...rec, source: { kind: 'url', url: 'https://example.org/b.mp4' }, state: 'playing', positionMs: 0,
+        seq: (rec.seq as number) + 1, started: (rec.started as number) + 1, jump: (rec.jump as number) + 1,
+      });
+      other.getMap('tv').set(remoteKey(TV), { holder: 'BBBBbob', name: 'Bob', leaseAt: 1, by: 'BBBBbob', page: 'B' });
+    });
+    run(60_000); // this page ticks on through the minute; its own lease lapses by its own watch, as the other page saw
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(other, Y.encodeStateVector(doc)));
+    expect(readTv(TV)).toMatchObject({ state: 'playing', source: { url: 'https://example.org/b.mp4' } });
+    run(TV_LEASE_LAPSE_MS + 1_000); // Bob's lease, seen just now, lapses by this page's watch…
+    expect(pickUpRemote(TV)).toEqual({ ok: true }); // …and this page takes the remote
+    run(500);
+    expect(readTv(TV).state).toBe('playing'); // the new film runs on: no park was owed to it
+    expect(readTv(TV).source).toMatchObject({ url: 'https://example.org/b.mp4' });
+  });
+
+  it('a remote picked up on waking takes the room from a peer\'s wake-window beat as it landed, never bridged across the sleep: no beat an hour ahead, no programme closed on the spot', () => {
+    let wall = 1_700_000_000_000;
+    setTvClock(() => now, () => wall);
+    const step = (ms: number) => { now += ms; wall += ms; };
+    setTvPageId('A');
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    expect(tvNoteEnd(TV, 30_000)).toEqual({ ok: true }); // the film is 30 s long, says the record
+    handRemote(TV, 'BBBBbob', 'Bob'); // Bob holds and beats from his own page
+    tickTvRoom([TV], now); // this page: a viewer, awake
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc0()));
+    const bobBeats = (positionMs: number) => {
+      Y.applyUpdate(other, Y.encodeStateAsUpdate(doc0(), Y.encodeStateVector(other)));
+      const rec = other.getMap('tv').get(tvKey(TV)) as Record<string, unknown>;
+      other.getMap('tv').set(tvKey(TV), { ...rec, positionMs, seq: (rec.seq as number) + 1 });
+      Y.applyUpdate(doc0(), Y.encodeStateAsUpdate(other, Y.encodeStateVector(doc0())));
+    };
+    bobBeats(5_000);
+    step(500);
+    tickTvRoom([TV], now);
+    expect(readPlayback(TV, now)).toMatchObject({ positionMs: 5_500 });
+    // This page sleeps an hour (the monotonic clock ran on; the wall clock
+    // agrees, so the bridge adds nothing). The first tick back finds the gap.
+    step(3_600_000);
+    tickTvRoom([TV], now);
+    // In the moment after waking, Bob's latest beat lands: he is at 12 s.
+    // Stamped from before the gap, it reads an hour ahead — and stale.
+    step(200);
+    bobBeats(12_000);
+    const woke = readPlayback(TV, now);
+    expect(woke.stale).toBe(true);
+    expect(woke.positionMs).toBeGreaterThan(3_600_000); // the bridged reading: shown, never acted on by a viewer
+    expect(woke.anchorMs).toBe(12_000); // the takeover anchor: where Bob's beat was as it landed
+    // Bob's lease, seen last before the sleep, has lapsed by this page's
+    // watch: this page picks the remote up and beats headlessly.
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    run(500);
+    expect(readTv(TV).state).toBe('playing'); // not closed as "past 30 s"
+    expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(12_000);
+    expect(readTv(TV).positionMs).toBeLessThan(13_500); // the beat from the anchor, not from an hour ahead
+  });
+
   it('leaving disarms the drive at once: a tick during the leave\'s flush claims and beats nothing until the next room arms it', () => {
     setTvIdentity(() => ({ pub: 'BBBBgiver', name: 'Giver' }));
     pickUpRemote(TV);
@@ -467,5 +610,17 @@ describe('tickTvRoom', () => {
       { pub: 'AAAAme', name: 'Me' }, { pub: 'BBBB', name: 'Bob' }, { pub: '', name: 'legacy' },
     ]);
     expect(tvRoomPlayers('AAAAme')).toEqual([{ pub: 'BBBB', name: 'Bob' }]);
+  });
+});
+
+describe('the TV kinds, in one place', () => {
+  it('names both sets and nothing else, and labels each for the panels, the chip and the theatre', () => {
+    expect(isTvKind('smart-tv')).toBe(true);
+    expect(isTvKind('tv-stand')).toBe(true);
+    expect(isTvKind('wall-computer')).toBe(false);
+    expect(isTvKind(undefined)).toBe(false);
+    expect(tvLabel('tv-stand')).toBe('TV ON THE STAND');
+    expect(tvLabel('smart-tv')).toBe('WALL TV');
+    expect(tvLabel(undefined)).toBe('WALL TV'); // a set whose record is gone still has a name on the chip
   });
 });

@@ -427,3 +427,90 @@ export function chooseArrivalDoor(doors: ArrivalDoor[], intent: ArrivalIntent): 
     (east?.enabled ? east : undefined) ?? doors.find((d) => d.enabled) ?? doors[0];
   return legacy ? { id: legacy.id, tier: 'fallback', conflict: true } : null;
 }
+
+
+// ── 🚶🚪 #182: which door the walker is pressed into ─────────────────────────
+
+/**
+ * A door as the first-person crossing test sees it: its PHYSICAL wall and the
+ * walkable stand point just inside the opening (doors.DoorTarget.front).
+ */
+export interface CrossingDoor {
+  id: string;
+  wall: DoorWall;
+  front: { x: number; z: number };
+}
+
+/**
+ * How far inside the walkable bound the body counts as "through", in metres.
+ *
+ * The manual-movement clamp already stops the avatar at the bound, so pressing
+ * into the wall IS the last few centimetres of travel and this band is only
+ * ever entered deliberately. It has to stay this thin: anything wider is
+ * ordinary floor, and strolling ALONG a wall past a paired door would fire an
+ * unrequested transit.
+ */
+export const CROSSING_BAND = 0.05;
+
+/**
+ * The one door the walker is crossing, or null.
+ *
+ * 🚪 OWNER REPORT #182 (first person puts you in a room the atlas disagrees
+ * with; dorkmo: phantom doors on walls with no door visible). The old test
+ * measured depth into the wall as `Math.abs(p.z)` for a north/south door and
+ * `Math.abs(p.x)` for an east/west one — an UNSIGNED distance from the room
+ * centre. That threw away which side of the room the door is on, so every door
+ * also answered for its mirror image on the opposite wall, at the same offset
+ * along it:
+ *
+ *   - In the default four-cardinal room, west and east both sit at lateral 0,
+ *     so pressing into the EAST doorway satisfied west's test too. West is
+ *     earlier in DOORS, so it transited first and the walker arrived in the
+ *     west neighbour — through a door they could see was on the other side.
+ *     Walking WEST worked, because west is checked first. Hence "sometimes".
+ *   - A room with a door on one wall only grew an invisible trigger on the
+ *     facing wall. The door never opened (the slide is driven by a correctly
+ *     signed 2-D distance) — you walked into blank wall and were taken away.
+ *
+ * Both symptoms are the same missing sign. Depth is measured along the wall's
+ * OUTWARD normal now, so a door answers only for its own side.
+ *
+ * Returns the NEAREST match rather than the first. Two doors on one wall are
+ * kept MIN_DOOR_GAP (4 m) apart and so cannot share an aperture, but that gap
+ * is an editor rule and says nothing about two doors meeting at a CORNER — one
+ * on `x-` late along its wall, one on `y-` late along its — whose bands do
+ * overlap. Array order deciding that is how #182 read in the first place; the
+ * door you are physically standing in is the honest answer.
+ *
+ * Pure: no pairing, no policy, no enablement. The caller still gates the
+ * transit on all three, and uses a null return to re-arm the latch — so a
+ * DISABLED door (the fireplace-blocked north) keeps holding the latch down
+ * while you stand in it, exactly as before.
+ */
+export function doorBeingCrossed(
+  doors: readonly CrossingDoor[],
+  at: { x: number; z: number },
+  bounds: { boundX: number; boundZ: number },
+  openingWidth: number,
+): CrossingDoor | null {
+  let best: CrossingDoor | null = null;
+  let bestDist = Infinity;
+  for (const door of doors) {
+    const northSouth = door.wall === 'y-' || door.wall === 'y+';
+    // +1 for the far side of each axis, -1 for the near side — poseFromWall's
+    // sign convention, and the reason this function exists.
+    const outward = door.wall === 'y+' || door.wall === 'x+' ? 1 : -1;
+    // Offset ALONG the wall: how far off-centre of the opening we are.
+    const lateral = Math.abs(northSouth ? at.x - door.front.x : at.z - door.front.z);
+    if (lateral >= openingWidth / 2) continue;
+    // Depth INTO the wall, signed by that wall's outward normal.
+    const into = outward * (northSouth ? at.z : at.x);
+    if (into <= (northSouth ? bounds.boundZ : bounds.boundX) - CROSSING_BAND) continue;
+    const dist = Math.hypot(at.x - door.front.x, at.z - door.front.z);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = door;
+    }
+  }
+  return best;
+}

@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import type { TvScreenView } from './tvDoc';
+import { setConvenienceLanesForTest } from './sovereignty';
 
 let fills = 0;
 function fakeCanvas() {
@@ -38,7 +39,7 @@ function sinks(): FurnitureHandleSinks {
   return {
     wallScreens: new Map(), holoSpinners: [], trunkLids: new Map(), gameTableTops: new Map(),
     cloneVats: new Map(), slotMachineVisuals: new Map(), coinPusherVisuals: new Map(),
-    propAnims: new Map(), airHockeyVisuals: new Map(), tvScreens: new Map(), arcadeScreens: new Map(),
+    propAnims: new Map(), airHockeyVisuals: new Map(), tvScreens: new Map(), arcadeScreens: new Map(), alligatorsVisuals: new Map(),
   };
 }
 
@@ -106,5 +107,48 @@ describe('the smart TV as built', () => {
     expect(fills).toBeGreaterThan(afterHome);
     handle.draw(view('off'));
     expect(fills).toBeGreaterThan(afterHome);
+  });
+
+  it('keeps the set\'s glow lit through the room morph: the level is re-applied on every tick, even an unchanged view', () => {
+    const group = build('smart-tv');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
+    const handle = s.tvScreens.get('smart-tv-1')!;
+    let glow: THREE.PointLight | null = null;
+    group.traverse((obj) => { if (obj instanceof THREE.PointLight) glow = obj; });
+    expect(glow).not.toBeNull();
+    expect(glow!.intensity).toBe(0); // off, as built
+    handle.draw(view('home'));
+    expect(glow!.intensity).toBe(0.5);
+    glow!.intensity = 0; // World's morph pass: eased × the registered target (0)
+    fills = 0;
+    handle.draw(view('home')); // the same view: no redraw…
+    expect(fills).toBe(0);
+    expect(glow!.intensity).toBe(0.5); // …but the glow is the view's again
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(glow!.intensity).toBe(1.1);
+    handle.draw(view('off'));
+    expect(glow!.intensity).toBe(0);
+  });
+
+  it('draws on the home screen only the tiles this build offers: YOUTUBE and ARCHIVE go with the convenience lanes', () => {
+    const group = build('smart-tv');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
+    const handle = s.tvScreens.get('smart-tv-1')!;
+    try {
+      setConvenienceLanesForTest(false); // the build default: serverless only
+      handle.draw(view('off'));
+      fills = 0;
+      handle.draw(view('home'));
+      const serverless = fills;
+      setConvenienceLanesForTest(true);
+      handle.draw(view('off'));
+      fills = 0;
+      handle.draw(view('home'));
+      expect(fills).toBe(serverless + 2); // one fillRect per tile: two more lanes drawn
+    } finally {
+      setConvenienceLanesForTest(null);
+    }
   });
 });

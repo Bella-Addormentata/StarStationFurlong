@@ -37,6 +37,7 @@ import { normalizeWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { isDockChain, projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 import { halfAlongWall } from './doorMatch';
+import { CUPOLA_WALLS, type CupolaWall } from './cupola';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -80,6 +81,11 @@ export interface AtlasEntry {
    *  the exterior view render each module at its TRUE size. Absent for rooms we
    *  only know as neighbours (stub entries) → the renderer falls back. */
   dims?: { cols: number; rows: number };
+  /** 🔭 The module's cupola end walls (floorPlanDoc readCupolaWalls), learned
+   *  while we were in it, so the atlas maps draw them (issue 219). Empty:
+   *  known to have none; absent: not known (an older client's gossip, or a
+   *  room never harvested), drawn plain. */
+  cupola?: CupolaWall[];
   /** Keyed by DOOR ID — cardinal or free `d:`. */
   doors: Record<string, AtlasDoor>;
   /** ⚓🚦 The room's DOCK PORTS with their gate numbers, by door id — free
@@ -554,6 +560,8 @@ export function harvestIntoAtlas(entry: {
   name: string;
   seed?: string;
   dims?: { cols: number; rows: number };
+  /** 🔭 The room's cupola end walls; absent when unread (what we knew stands). */
+  cupola?: readonly CupolaWall[];
   doors: Array<{
     doorId: string; targetSeed: string; segments?: ConnectorSegment[];
     farDoor?: string; farWall?: DoorWall; farLateral?: number; farYawDeg?: 0 | 45;
@@ -629,6 +637,7 @@ export function harvestIntoAtlas(entry: {
     name: entry.name || prior?.name || 'Module',
     seed: entry.seed ?? prior?.seed,
     dims: entry.dims ?? prior?.dims,
+    ...cupolaSpread(entry.cupola !== undefined ? cleanCupola(entry.cupola) : prior?.cupola),
     doors,
     ...(entryGates ? { gates: entryGates } : !gatesUnknown && prior?.gates ? { gates: prior.gates } : {}),
     ...(entryGates
@@ -690,6 +699,7 @@ export function dismantleInAtlas(roomId: string, at: number): void {
     roomId,
     name: prior?.name || 'Module',
     ...(prior?.dims ? { dims: prior.dims } : {}),
+    ...cupolaSpread(prior?.cupola),
     doors: {},
     dismantledAt: at,
     dismantledHere: true,
@@ -811,6 +821,7 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
       name: prior?.name && prior.name !== 'Module' ? prior.name : (b.name || 'Module'),
       seed: prior?.seed || b.seed,
       dims: prior?.dims ?? b.dims,
+      ...cupolaSpread(prior?.cupola),
       doors,
       lastSeen: prior?.lastSeen ?? 0,
       // Deliberately no localSeenAt: bundled knowledge is second-hand.
@@ -1386,6 +1397,8 @@ export interface AtlasPose {
   /** The module's true tile dims when known (learned by visiting it); absent
    *  for neighbours we've only heard about — the renderer falls back. */
   dims?: { cols: number; rows: number };
+  /** 🔭 Its cupola end walls, when known (AtlasEntry.cupola). */
+  cupola?: CupolaWall[];
   x: number;
   z: number;
   rotY: number;
@@ -1491,6 +1504,7 @@ export function atlasPoses(
     name: root.name,
     seed: root.seed,
     dims: root.dims,
+    ...cupolaSpread(root.cupola),
     x: 0, z: 0, rotY: 0, hops: 0,
   });
   const berths = opts.berths;
@@ -1517,6 +1531,7 @@ export function atlasPoses(
           name: target?.name ?? 'Module',
           seed: target?.seed ?? door.targetSeed,
           dims: target?.dims,
+          ...cupolaSpread(target?.cupola),
           x: wx,
           z: wz,
           rotY: from.rotY + local.rotY,
@@ -1542,6 +1557,7 @@ export function atlasPoses(
           name: other.name,
           seed: other.seed,
           dims: other.dims,
+          ...cupolaSpread(other.cupola),
           x: from.x - (l.x * cos + l.z * sin),
           z: from.z - (-l.x * sin + l.z * cos),
           rotY,
@@ -1668,6 +1684,10 @@ interface SharedAtlasEntry {
    *  a module's outside: its size, its position and its connections. Only the
    *  SEED (the credential that dials you in) is access-controlled. */
   dims?: { cols: number; rows: number };
+  /** 🔭 Cupola end walls (AtlasEntry.cupola). Public like dims: part of
+   *  the module's outside. Sent whenever known, empty included, so a newer
+   *  copy can say a cupola came off. */
+  cupola?: CupolaWall[];
   /** ⚓🚦 Dock ports → gate numbers (AtlasEntry.gates). Public layout. */
   gates?: Record<string, number>;
   /** ⚓🚦 Non-open gate access (AtlasEntry.gateAccess). Public: a captain
@@ -1733,6 +1753,8 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     // know this module's size" (the renderer's existing fallback) instead of
     // asking Three.js for a 10-billion-tile hull.
     && (e.dims === undefined || isSaneDims(e.dims))
+    // 🔭 Cupola walls feed the renderers too: a short list of wall names.
+    && (e.cupola === undefined || isPlainCupola(e.cupola))
     // ⚓🚦 Gates ride as plain door-keyed maps, bounded like `doors`, so an
     // oversized peer value never becomes `known` (and never gets stringified).
     && (e.gates === undefined || isPlainGates(e.gates))
@@ -1778,6 +1800,26 @@ export function isSaneDims(d: unknown): d is { cols: number; rows: number } {
     typeof n === 'number' && Number.isInteger(n)
     && n >= ROOM_TILE_MIN && n <= ROOM_TILE_MAX;
   return ok(v.cols) && ok(v.rows);
+}
+
+/** 🔭 A gossiped cupola list: none, one wall, or the two ends of one axis
+ *  (x-/x+ or y-/y+), the only pair a module can have. */
+function isPlainCupola(v: unknown): v is CupolaWall[] {
+  return Array.isArray(v) && v.length <= 2
+    && v.every((w, i) => (CUPOLA_WALLS as readonly unknown[]).includes(w) && v.indexOf(w) === i)
+    && (v.length < 2 || (v[0] as string)[0] === (v[1] as string)[0]);
+}
+
+/** 🔭 A cupola list copied out of whatever produced it, held to what
+ *  isPlainCupola accepts: a cross-axis pair keeps its first wall. */
+function cleanCupola(walls: readonly CupolaWall[]): CupolaWall[] {
+  const out = walls.filter((w, i) => CUPOLA_WALLS.includes(w) && walls.indexOf(w) === i).slice(0, 2);
+  return out.length === 2 && out[0][0] !== out[1][0] ? [out[0]] : out;
+}
+
+/** `{ cupola }` when the cupola walls are known (empty included), else nothing. */
+function cupolaSpread(cupola: readonly CupolaWall[] | undefined): { cupola?: CupolaWall[] } {
+  return cupola !== undefined ? { cupola: [...cupola] } : {};
 }
 
 /**
@@ -1886,6 +1928,11 @@ function pullSharedAtlas(): void {
         prior.owner = owner;
         changed = true;
       }
+      // 🔭 …and cupola walls our copy never learned (an older build's harvest).
+      if (prior.cupola === undefined && value.cupola !== undefined && prior.dismantledAt === undefined) {
+        prior.cupola = cleanCupola(value.cupola);
+        changed = true;
+      }
       continue;
     }
     const doors: Record<string, AtlasDoor> = {};
@@ -1953,6 +2000,8 @@ function pullSharedAtlas(): void {
       name: value.name || prior?.name || 'Module',
       seed: value.seed ?? prior?.seed,
       dims: value.dims ?? prior?.dims,
+      // 🔭 Silence (an older client) keeps what we knew, like dims.
+      ...cupolaSpread(value.cupola !== undefined ? cleanCupola(value.cupola) : prior?.cupola),
       doors,
       ...(listed ? { gates: listed } : !gatesUnknown && prior?.gates ? { gates: prior.gates } : {}),
       // Access rides with the gates it belongs to: a publisher that sent
@@ -2078,10 +2127,13 @@ export function pushAtlasToDoc(): void {
         const docOwner = ownerOf(known.owner);
         const owner = docOwner === undefined ? entry.owner : withOwnerDetails(docOwner, entry.owner);
         const owned = known.dismantledAt === undefined && owner !== undefined && !sameOwner(owner, docOwner);
-        if (flagged || owned) {
+        // 🔭 …and so do cupola walls we know and that copy lacks.
+        const domed = known.dismantledAt === undefined && known.cupola === undefined && entry.cupola !== undefined;
+        if (flagged || owned || domed) {
           sharedMap!.set(entry.roomId, {
             ...(flagged ?? known),
             ...(owned ? { owner } : {}),
+            ...(domed ? cupolaSpread(entry.cupola) : {}),
             updatedAt: Math.min(known.updatedAt + 1, Date.now() + MAX_GOSSIP_SKEW_MS),
           });
         }
@@ -2116,6 +2168,8 @@ export function pushAtlasToDoc(): void {
         // size, so the station's shape was only ever right for rooms you had
         // walked through yourself.
         ...(!onlyGates && entry.dims ? { dims: entry.dims } : {}),
+        // 🔭 Cupolas travel with the size, so every atlas map draws them.
+        ...cupolaSpread(onlyGates ? known!.cupola : entry.cupola),
         // ⚓🚦 Gates travel with the layout, so a board or an arriving ship in
         // any room of the station knows every gate.
         ...(entry.gates ? { gates: entry.gates } : entry.gatesUnknown ? { gatesUnknown: true as const } : {}),

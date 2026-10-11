@@ -17,7 +17,8 @@
  * ~1,700 km away and a station there is far below a pixel, so each altitude
  * is mapped through a log (`compressAltitudeKm`) that keeps every ring in
  * order and clear of the planet while fitting all sixteen slots into view.
- * Distant stations are drawn as one box per module at a fixed screen size.
+ * Every station, this one included, is drawn as its atlas lays it out
+ * (StationShape), all at one common scale (issue 218).
  *
  * The frame is orbits.ts's planet frame (+Y north, the equator in XZ, angles
  * from +X counter-clockwise seen from the north), with every radius
@@ -101,6 +102,25 @@ export function applyFrameTransform(t: FrameTransform, p: FramePoint): FramePoin
 
 // ── Planet view ──────────────────────────────────────────────────────────────
 
+/** 🛰️ A station's shape as its atlas lays it out (stationPlan.ts), in the
+ *  station's own frame (planet off −X, travel toward −Z), in room units:
+ *  each module's footprint, and a line for each connection between two of
+ *  them. Absent when the atlas does not know the station. */
+export interface StationShape {
+  modules: Array<{ x: number; z: number; rotY: number; halfX: number; halfZ: number; ship: boolean }>;
+  links: Array<{ ax: number; az: number; bx: number; bz: number }>;
+}
+
+/** This station (or ship) itself, drawn at the viewer's place like any
+ *  other: the planet view shows it at the same scale as its neighbours. */
+export interface FarViewerBody {
+  name: string;
+  shape?: StationShape;
+}
+
+/** Id of the viewer's own body. */
+export const VIEWER_BODY_ID = 'viewer';
+
 export interface FarStationInput {
   id: string;
   name: string;
@@ -110,6 +130,7 @@ export interface FarStationInput {
   ringRadiusKm: number;
   /** Modules to draw, ≥ 1. */
   modules: number;
+  shape?: StationShape;
 }
 
 export interface FarShipInput {
@@ -131,6 +152,9 @@ export interface FarBody {
   /** Prograde heading (the orbit angle) — impostors line up along it. */
   angle: number;
   modules: number;
+  shape?: StationShape;
+  /** The viewer's own station. */
+  own?: boolean;
 }
 
 export interface FarRing {
@@ -193,6 +217,8 @@ export function planetLayout(input: {
   /** Sample each ship's course (default true). The courses only change when
    *  a flight does, so a per-frame caller passes false and keeps its own. */
   withPaths?: boolean;
+  /** Draw the viewer's own station at its place too. */
+  viewerBody?: FarViewerBody;
 }): FarLayout {
   const planet = planetById(input.planetId);
   const squash = (p: OrbitPoint) => toPlanetFrame(compressPlanetPoint(p, planet));
@@ -213,6 +239,7 @@ export function planetLayout(input: {
   if (input.viewerRingRadiusKm !== undefined) addRing(input.viewerRingRadiusKm, true);
 
   const bodies: FarBody[] = [];
+  if (input.viewerBody) bodies.push(viewerBodyAt(input.viewerBody, toPlanetFrame(viewer), viewer.angle));
   for (const s of input.stations) {
     addRing(s.ringRadiusKm, false);
     bodies.push({
@@ -222,6 +249,7 @@ export function planetLayout(input: {
       position: squash(s.point),
       angle: s.point.angle,
       modules: Math.max(1, Math.floor(s.modules)),
+      ...(s.shape ? { shape: s.shape } : {}),
     });
   }
 
@@ -255,6 +283,19 @@ export function planetLayout(input: {
   };
 }
 
+function viewerBodyAt(v: FarViewerBody, position: FramePoint, angle: number): FarBody {
+  return {
+    id: VIEWER_BODY_ID,
+    kind: 'station',
+    name: v.name,
+    position,
+    angle,
+    modules: Math.max(1, v.shape?.modules.length ?? 1),
+    ...(v.shape ? { shape: v.shape } : {}),
+    own: true,
+  };
+}
+
 // ── Sun view (a station between planets) ────────────────────────────────────
 
 /**
@@ -263,7 +304,9 @@ export function planetLayout(input: {
  * planet-locked), every planet on its compressed orbit and true angle, and
  * the station's course from departure to capture. null outside the transit.
  */
-export function transitLayout(move: StationMove, nowMs: number, withPaths = true): FarLayout | null {
+export function transitLayout(
+  move: StationMove, nowMs: number, withPaths = true, viewerBody?: FarViewerBody,
+): FarLayout | null {
   // Moves come from peers: one whose ends normalize to the same planet (a
   // tug's course would be a chord between two places of that planet) has none.
   if (planetById(move.fromPlanetId).id === planetById(move.toPlanetId).id) return null;
@@ -280,6 +323,7 @@ export function transitLayout(move: StationMove, nowMs: number, withPaths = true
     rings.push({ radius: compressSunPoint(p).radiusKm, own: false });
     bodies.push({ id: planet.id, kind: 'planet', name: planet.name, position: squash(p), angle: p.angle, modules: 1 });
   }
+  if (viewerBody) bodies.push(viewerBodyAt(viewerBody, toPlanetFrame(viewer), viewer.angle));
   const course = !withPaths ? [] : sampleCourse((ms) => {
     const p = moveTransitPointAt(move, Math.min(Math.max(ms, move.departAt + 1), move.arriveAt - 1));
     return squash(p ?? here);
@@ -293,6 +337,58 @@ export function transitLayout(move: StationMove, nowMs: number, withPaths = true
     paths: course.length > 0 ? [{ id: 'course', points: course }] : [],
     sunDirection: { x: -1, y: 0, z: 0 },
   };
+}
+
+// ── Keeping the planet out of the way ───────────────────────────────────────
+
+/**
+ * 🛰️ The far camera's viewing direction, tipped up just enough that the
+ * planet never hides the viewer (issue 218). The camera sits `distance`
+ * back along `forward` from the viewer at the origin; when the line from it
+ * to the viewer passes through the sphere at `centre` (the planet with its
+ * air), the camera climbs, keeping its heading, until the line clears.
+ * Straight down always clears a
+ * viewer that is outside the sphere. A view already clear comes back as
+ * the very object passed in.
+ */
+export function forwardClearOf(
+  forward: FramePoint, centre: FramePoint, radius: number, distance: number,
+): FramePoint {
+  const blocked = (f: FramePoint) => segmentHitsSphere(
+    { x: -f.x * distance, y: -f.y * distance, z: -f.z * distance }, centre, radius,
+  );
+  const f = unit(forward);
+  if (!blocked(f)) return forward;
+  const flat = Math.hypot(f.x, f.z);
+  const hx = flat > 1e-9 ? f.x / flat : 1;
+  const hz = flat > 1e-9 ? f.z / flat : 0;
+  const from = Math.asin(Math.min(1, Math.max(-1, -f.y)));
+  const STEP = Math.PI / 720; // a quarter degree
+  for (let e = Math.max(from, 0); e < Math.PI / 2; e += STEP) {
+    const tipped = { x: hx * Math.cos(e), y: -Math.sin(e), z: hz * Math.cos(e) };
+    if (!blocked(tipped)) return tipped;
+  }
+  return { x: 0, y: -1, z: 0 };
+}
+
+/** The sphere the camera keeps its line to the viewer clear of: the
+ *  planet's air (1.025 of its radius) and a little more, but always short
+ *  of the viewer itself (`viewerDistanceKm` from the planet's centre): a
+ *  viewer on a low orbit sits inside that margin once its altitude is
+ *  compressed, and a sphere around it would leave no tilt that clears. */
+export function clearanceRadiusKm(planetRadiusKm: number, viewerDistanceKm: number): number {
+  return Math.min(planetRadiusKm * 1.04, planetRadiusKm + 0.9 * Math.max(0, viewerDistanceKm - planetRadiusKm));
+}
+
+/** Does the segment from `from` to the origin pass through the sphere? */
+function segmentHitsSphere(from: FramePoint, centre: FramePoint, radius: number): boolean {
+  // Closest point of the segment P(t) = from·(1 − t), t ∈ [0, 1], to the centre.
+  const len2 = from.x * from.x + from.y * from.y + from.z * from.z;
+  if (len2 === 0) return Math.hypot(centre.x, centre.y, centre.z) < radius;
+  const dot = (centre.x - from.x) * -from.x + (centre.y - from.y) * -from.y + (centre.z - from.z) * -from.z;
+  const t = Math.min(1, Math.max(0, dot / len2));
+  const px = from.x * (1 - t), py = from.y * (1 - t), pz = from.z * (1 - t);
+  return Math.hypot(px - centre.x, py - centre.y, pz - centre.z) < radius;
 }
 
 // ── Courses already drawn ────────────────────────────────────────────────────
