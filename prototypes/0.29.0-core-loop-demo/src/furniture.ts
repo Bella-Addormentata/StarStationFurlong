@@ -59,9 +59,9 @@ import {
   IA_BALL_R, IA_BASE_R, IA_HEAD_LEN, IA_MAX_BALLS, IA_MOUTH_R, IA_SEATS,
   IA_SEAT_COLORS, IA_SURFACE_Y, IA_TABLE_R, birdAngle, pivotOf, seatAngle,
 } from "./games/alligators";
-// 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
-// order/colors from the pure engine — one source of truth with the focused UI.
-import { WHEEL_ORDER, pocketColor } from "./games/roulette";
+// 🎲🎡 #226: the craps and roulette tables' live 3D pieces (felt, chips,
+// dice, pucks, wheel) — built here, driven by casinoTableSession.ts.
+import { buildCrapsPieces, buildRoulettePieces } from "./casinoTable3d";
 import { pieceColor, isKing } from "./games/checkers";
 import type { CheckersColor } from "./games/checkers";
 import {
@@ -6507,8 +6507,8 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
 // ── 🎰 Casino fixtures (#69 G1/G2) — cashier ATM + roulette table ────────────
 // Canvas-textured faces follow the game-table idiom: MeshBasicMaterial with
 // transparent + opacity 0 so the morph fade-in machinery raises them with
-// everything else. Focused UIs live in devices.ts (createCashierUI /
-// createRouletteUI); these builders are the in-world halves.
+// everything else. The cashier UI lives in devices.ts (createCashierUI); the tables play in 3D
+// (casinoTable3d.ts + casinoTableSession.ts, #226).
 
 /** Cashier sign face: 'CASHIER · CHIPS' gold on dark with a chip pip. */
 function drawCashierSign(c2d: CanvasRenderingContext2D): void {
@@ -6545,46 +6545,6 @@ function drawCashierScreen(c2d: CanvasRenderingContext2D): void {
   c2d.fillStyle = "#F0C060";
   c2d.font = "16px monospace";
   c2d.fillText("WALK UP TO BEGIN", W / 2, 146);
-}
-
-/** Roulette felt: green baize, gold trim, betting-grid motif on the +x half
- *  (the wheel occupies -x). Painted once — the LIVE board is the focused UI. */
-function drawRouletteFelt(c2d: CanvasRenderingContext2D): void {
-  const W = 512,
-    H = 256;
-  c2d.fillStyle = "#14532D";
-  c2d.fillRect(0, 0, W, H);
-  c2d.fillStyle = "#1B6B3A";
-  c2d.fillRect(8, 8, W - 16, H - 16);
-  c2d.strokeStyle = "rgba(240, 224, 180, 0.8)";
-  c2d.lineWidth = 3;
-  // Grid motif: 12×3 cells on the right half + a zero wedge.
-  const gx = 280,
-    gy = 40,
-    cw = 16,
-    ch = 56;
-  for (let col = 0; col <= 12; col++) {
-    c2d.beginPath();
-    c2d.moveTo(gx + col * cw, gy);
-    c2d.lineTo(gx + col * cw, gy + 3 * ch);
-    c2d.stroke();
-  }
-  for (let row = 0; row <= 3; row++) {
-    c2d.beginPath();
-    c2d.moveTo(gx, gy + row * ch);
-    c2d.lineTo(gx + 12 * cw, gy + row * ch);
-    c2d.stroke();
-  }
-  c2d.beginPath(); // zero wedge left of the grid
-  c2d.moveTo(gx, gy);
-  c2d.lineTo(gx - 28, gy + 1.5 * ch);
-  c2d.lineTo(gx, gy + 3 * ch);
-  c2d.closePath();
-  c2d.stroke();
-  // Outside-bet boxes under the grid.
-  for (let b = 0; b < 6; b++) {
-    c2d.strokeRect(gx + b * 32, gy + 3 * ch + 10, 32, 24);
-  }
 }
 
 function buildCashierAtm({ m, flat, place }: BuildCtx) {
@@ -6740,155 +6700,19 @@ function buildRouletteTable(ctx: BuildCtx) {
     [0.08, 0.96, -0.94, 0],
     [0.08, 0.96, 0.94, 0],
   ] as [number, number, number, number][]) {
+    // #226: a low padded rim (top 0.855) so a player's view over it still
+    // reaches the near pass line / even-money boxes; the chip rail rides it.
     place(
-      new THREE.BoxGeometry(w, 0.09, d),
+      new THREE.BoxGeometry(w, 0.05, d),
       m(0x3a2417, 0.6, 0.1),
       lx,
-      0.845,
+      0.83,
       lz,
     );
   }
-  // Felt (canvas) across the top.
-  const feltCv = document.createElement("canvas");
-  feltCv.width = 512;
-  feltCv.height = 256;
-  drawRouletteFelt(feltCv.getContext("2d")!);
-  const feltTex = new THREE.CanvasTexture(feltCv);
-  feltTex.minFilter = THREE.NearestFilter;
-  feltTex.magFilter = THREE.NearestFilter;
-  feltTex.generateMipmaps = false;
-  feltTex.colorSpace = THREE.SRGBColorSpace;
-  const feltGeo = new THREE.PlaneGeometry(1.84, 0.84);
-  feltGeo.rotateX(-Math.PI / 2);
-  place(
-    feltGeo,
-    new THREE.MeshBasicMaterial({
-      map: feltTex,
-      transparent: true,
-      opacity: 0,
-    }),
-    0,
-    0.812,
-    0,
-  );
-  // Wheel at the -x end: bowl + pocket disc (canvas) + gold hub and rim.
-  place(
-    new THREE.CylinderGeometry(0.34, 0.36, 0.06, 28),
-    m(0x2a1a10, 0.5, 0.3),
-    -0.58,
-    0.845,
-    0,
-  );
-  const wheelCv = document.createElement("canvas");
-  wheelCv.width = 256;
-  wheelCv.height = 256;
-  const wc = wheelCv.getContext("2d")!;
-  const CX = 128,
-    CY = 128;
-  wc.fillStyle = "#2A1A10";
-  wc.fillRect(0, 0, 256, 256);
-  for (let i = 0; i < WHEEL_ORDER.length; i++) {
-    const a0 = (i / WHEEL_ORDER.length) * Math.PI * 2;
-    const a1 = ((i + 1) / WHEEL_ORDER.length) * Math.PI * 2;
-    const col = pocketColor(WHEEL_ORDER[i]);
-    wc.beginPath();
-    wc.moveTo(CX, CY);
-    wc.arc(CX, CY, 120, a0, a1);
-    wc.closePath();
-    wc.fillStyle =
-      col === "green" ? "#1B6B3A" : col === "red" ? "#C43C3C" : "#23252E";
-    wc.fill();
-  }
-  wc.beginPath();
-  wc.arc(CX, CY, 52, 0, Math.PI * 2);
-  wc.fillStyle = "#4A2F1B";
-  wc.fill();
-  wc.beginPath();
-  wc.arc(CX, CY, 120, 0, Math.PI * 2);
-  wc.lineWidth = 5;
-  wc.strokeStyle = "#D4A84B";
-  wc.stroke();
-  const wheelTex = new THREE.CanvasTexture(wheelCv);
-  wheelTex.minFilter = THREE.NearestFilter;
-  wheelTex.magFilter = THREE.NearestFilter;
-  wheelTex.generateMipmaps = false;
-  wheelTex.colorSpace = THREE.SRGBColorSpace;
-  const wheelGeo = new THREE.CircleGeometry(0.31, 48);
-  wheelGeo.rotateX(-Math.PI / 2);
-  place(
-    wheelGeo,
-    new THREE.MeshBasicMaterial({
-      map: wheelTex,
-      transparent: true,
-      opacity: 0,
-    }),
-    -0.58,
-    0.877,
-    0,
-  );
-  const hub = place(
-    new THREE.ConeGeometry(0.06, 0.09, 12),
-    m(0xd4a84b, 0.4, 0.6),
-    -0.58,
-    0.92,
-    0,
-  );
-  hub.rotation.y = 0.3;
-  const rim = place(
-    new THREE.TorusGeometry(0.335, 0.018, 8, 32),
-    m(0xd4a84b, 0.45, 0.5),
-    -0.58,
-    0.877,
-    0,
-  );
-  rim.rotation.x = Math.PI / 2;
-  // Chip stacks near the +x end (deco).
-  const chipColors = [0xc43c3c, 0x3e92b8, 0xf0c060];
-  chipColors.forEach((col, i) => {
-    place(
-      new THREE.CylinderGeometry(0.045, 0.045, 0.06, 12),
-      m(col, 0.5, 0.25),
-      0.52 + (i % 2) * 0.12,
-      0.845,
-      -0.18 + i * 0.14,
-    );
-  });
-}
-
-/** Craps felt (canvas 768×256, a 3:1 table): green baize with the classic
- *  layout schematic — PASS LINE / DON'T PASS along the rails, the number boxes
- *  and FIELD across the centre. Painted once; the LIVE board is the focused UI. */
-function drawCrapsFelt(c2d: CanvasRenderingContext2D): void {
-  const W = 768, H = 256;
-  c2d.fillStyle = "#14532D";
-  c2d.fillRect(0, 0, W, H);
-  c2d.fillStyle = "#1B6B3A";
-  c2d.fillRect(10, 10, W - 20, H - 20);
-  c2d.strokeStyle = "rgba(240, 224, 180, 0.85)";
-  c2d.lineWidth = 3;
-  c2d.strokeRect(10, 10, W - 20, H - 20);
-  c2d.fillStyle = "#F0E6C8";
-  c2d.textAlign = "center";
-  c2d.textBaseline = "middle";
-  // The point-number boxes across the top (4 5 6 8 9 10 — the felt's spine).
-  const nums = [4, 5, 6, 8, 9, 10];
-  const bw = 108, bx0 = 44, by = 34, bh = 74;
-  nums.forEach((n, i) => {
-    const bx = bx0 + i * bw;
-    c2d.strokeRect(bx, by, bw - 8, bh);
-    c2d.font = "bold 40px monospace";
-    c2d.fillText(String(n), bx + (bw - 8) / 2, by + bh / 2);
-  });
-  // FIELD strip.
-  c2d.strokeRect(44, 128, W - 88, 44);
-  c2d.font = "bold 24px monospace";
-  c2d.fillText("FIELD  ·  2  3  4  9  10  11  12", W / 2, 150);
-  // PASS / DON'T PASS rails along the bottom.
-  c2d.strokeRect(44, 186, (W - 96) / 2, 44);
-  c2d.strokeRect(52 + (W - 96) / 2, 186, (W - 96) / 2, 44);
-  c2d.font = "bold 26px monospace";
-  c2d.fillText("PASS  LINE", 44 + (W - 96) / 4, 208);
-  c2d.fillText("DON'T  PASS", 52 + (W - 96) * 0.75, 208);
+  // 🎡 #226: the live felt, the wheel + ball and the chips are 3D pieces now
+  // (casinoTable3d.ts) — the table plays on the table, no popup.
+  buildRoulettePieces(ctx, 0.94, 0.44);
 }
 
 /** 🎲 Craps table (#69 G3): a long green baize table — 50% longer than the
@@ -6927,62 +6751,27 @@ function buildCrapsTable(ctx: BuildCtx) {
     [0.08, HALF_Z * 2, -HALF_X, 0],
     [0.08, HALF_Z * 2, HALF_X, 0],
   ] as [number, number, number, number][]) {
-    place(new THREE.BoxGeometry(w, 0.09, d), m(0x3a2417, 0.6, 0.1), lx, 0.845, lz);
+    // #226: low rim, as the roulette table's (top 0.855).
+    place(new THREE.BoxGeometry(w, 0.05, d), m(0x3a2417, 0.6, 0.1), lx, 0.83, lz);
   }
-  // Felt (canvas) across the top.
-  const feltCv = document.createElement("canvas");
-  feltCv.width = 768;
-  feltCv.height = 256;
-  drawCrapsFelt(feltCv.getContext("2d")!);
-  const feltTex = new THREE.CanvasTexture(feltCv);
-  feltTex.minFilter = THREE.NearestFilter;
-  feltTex.magFilter = THREE.NearestFilter;
-  feltTex.generateMipmaps = false;
-  feltTex.colorSpace = THREE.SRGBColorSpace;
-  const feltGeo = new THREE.PlaneGeometry(HALF_X * 2 - 0.12, HALF_Z * 2 - 0.12);
-  feltGeo.rotateX(-Math.PI / 2);
-  place(
-    feltGeo,
-    new THREE.MeshBasicMaterial({ map: feltTex, transparent: true, opacity: 0 }),
-    0, 0.812, 0,
-  );
-  // Chip rails along both long sides (raised troughs).
-  for (const rz of [-HALF_Z + 0.06, HALF_Z - 0.06]) {
-    place(new THREE.BoxGeometry(HALF_X * 2 - 0.3, 0.03, 0.07), m(0x3a2417, 0.6, 0.1), 0, 0.86, rz);
-  }
-  // Deco chip stacks in the rails.
-  const chipColors = [0xc43c3c, 0x3e92b8, 0xf0c060, 0x2e7d46];
-  chipColors.forEach((col, i) => {
-    place(
-      new THREE.CylinderGeometry(0.045, 0.045, 0.06, 12),
-      m(col, 0.5, 0.25),
-      -1.0 + i * 0.12,
-      0.9,
-      HALF_Z - 0.06,
-    );
-  });
+  // 🎲 #226: the real layout felt, the oversized dice, the ON/OFF pucks and
+  // every chip are live 3D pieces (casinoTable3d.ts); the padded rail is the
+  // chip rail each player picks up from.
+  buildCrapsPieces(ctx, HALF_X, HALF_Z);
   // 🎲 The STICKMAN's dice stick — a slim curved stick resting on the +z rail at
   // the middle (the reserved operator's tool). A shaft + a small hook at the end.
   const stick = place(
     new THREE.CylinderGeometry(0.014, 0.014, 0.9, 8),
     m(0x8a5a2a, 0.5, 0.2),
-    0.0, 0.905, HALF_Z - 0.02,
+    0.0, 0.87, HALF_Z - 0.02,
   );
   stick.rotation.z = Math.PI / 2; // lie flat along x
   const hook = place(
     new THREE.TorusGeometry(0.05, 0.012, 6, 12, Math.PI),
     m(0x8a5a2a, 0.5, 0.2),
-    0.45, 0.905, HALF_Z - 0.02,
+    0.45, 0.87, HALF_Z - 0.02,
   );
   hook.rotation.x = Math.PI / 2;
-  // Two dice resting at the stickman's spot (deco).
-  for (const dx of [-0.05, 0.05]) {
-    place(
-      new THREE.BoxGeometry(0.05, 0.05, 0.05),
-      m(0xf4efe2, 0.4, 0.1),
-      dx, 0.87, HALF_Z - 0.14,
-    );
-  }
 }
 
 // ── 🛏️ Bunk bed (owner request) — two stacked sleep berths ───────────────────
