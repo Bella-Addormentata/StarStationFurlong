@@ -27,7 +27,7 @@
  * What it shows before the game runs, honestly: CHECKING / LOADING /
  * STARTING, NOT PROVISIONED with the command when this station has no
  * emulator files, BRING YOUR COPY when the game is a file on its owner's
- * disk (the copy must be the same size as the shelf's), YOUR COPY WOULD
+ * disk (the copy must be the same size as the cabinet's), YOUR COPY WOULD
  * RUN UNDER CDN CODE when that file would be handed to engine code from
  * another origin (the player's consent, not a claim that it is safe), and
  * a RETRY on any fault.
@@ -260,9 +260,17 @@ function stageTick(): void {
     if (t.mounted !== 'nogame') {
       unmountFrame(t);
       t.mounted = 'nogame';
-      showNotice(t, 'NO GAME ON THE CABINET', 'Pick one from the shelf at the cabinet, or ask the owner to load one.');
+      showNotice(t, 'NO GAME ON THE CABINET', 'The owner picks the cabinet\'s game in its ⚙️ settings.');
     }
     renderStageChrome(t);
+    return;
+  }
+  if (game.bundled) {
+    // The owner put a built-in game on: it plays on the cabinet's screen,
+    // not here. The stage stands P1 up and goes; the cabinet takes over.
+    teardown(t);
+    standUp(t.itemId);
+    showHint(`🕹 ${game.name} is on the cabinet now: walk up and press play.`);
     return;
   }
   const key = `${gameId(game)}@${rec.data}`;
@@ -483,10 +491,10 @@ function renderStageChrome(t: Stage): void {
       const file = input.files?.[0];
       const g = readCabinet(t.itemId).game;
       if (!file || !g) return;
-      // The shelf's copy has a size: a file of another size is another file,
+      // The cabinet's copy has a size: a file of another size is another file,
       // whatever its name says — it is not launched under this game's name.
       if (g.size > 0 && file.size !== g.size) {
-        t.fileNote = `${file.name} is ${file.size.toLocaleString()} bytes; the shelf's ${g.name} is ${g.size.toLocaleString()}. Not the same file.`;
+        t.fileNote = `${file.name} is ${file.size.toLocaleString()} bytes; the cabinet's ${g.name} is ${g.size.toLocaleString()}. Not the same file.`;
         input.value = '';
         waitingNotice(t, g);
         return;

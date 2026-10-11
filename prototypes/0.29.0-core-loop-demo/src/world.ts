@@ -247,7 +247,7 @@ import { tvScreenView } from "./tvDoc";
 import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
 import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
 import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
-import { arcadeScreenView } from "./arcadeDoc";
+import { arcadeScreenView, builtInEntry, countBuiltInPlay, readCabinet } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -6025,10 +6025,31 @@ export class World {
    * DeviceFocusController, which wires its hooks into navigateToDevice.
    */
   /**
-   * 🕹 The arcade cabinet's panel in one of its views (#193): PLAY at the
-   * controls, SETTINGS from the ⚙️. Each view swaps to the other in place.
+   * 🕹 The arcade cabinet's UI in one of its views (#193). PLAY is at the
+   * controls and depends on the cabinet's one game, the owner's pick: a
+   * built-in game plays on the cabinet's own screen (arcadeNesCabinet.ts —
+   * `seat` is the stand stepped up to, of `seats`), the owner's own game in
+   * the panel whose INSERT COIN opens EmulatorJS's stage. SETTINGS, from
+   * the ⚙️, is the panel's for both. Each swaps to the other in place, and
+   * PLAY is rebuilt when the owner changes the game.
    */
-  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView): DeviceUI {
+  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView, seat: 0 | 1 = 0, seats: 1 | 2 = 1): DeviceUI {
+    const swap = (next: ArcadePanelView) => () => {
+      deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, next, seat, seats));
+    };
+    if (view === "play" && builtInEntry(readCabinet(deviceId).game)) {
+      return createNesCabinetUI({
+        itemId: deviceId,
+        visual: this.arcadeCabinetVisuals.get(deviceId),
+        game: () => builtInEntry(readCabinet(deviceId).game),
+        onGameChanged: swap("play"),
+        openSettings: swap("settings"),
+        onPlay: () => countBuiltInPlay(deviceId),
+        seat,
+        seats,
+        requestRelease: () => deviceFocus.release(),
+      });
+    }
     return createArcadeCabinetUI({
       itemId: deviceId,
       myPub: () => getIdentityPub(),
@@ -6036,8 +6057,8 @@ export class World {
       canEdit: () => canEditRoom().ok,
       openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId)),
       view,
-      openSettings: () => { deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, "settings")); },
-      openPlay: () => { deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, "play")); },
+      openSettings: swap("settings"),
+      openPlay: swap("play"),
     });
   }
 
@@ -6408,33 +6429,6 @@ export class World {
       return;
     }
 
-    // 🕹️ The two-player arcade cabinet — the menu and the game play on the
-    // cabinet's own screen; the UI only adds a key strip and keeps stray
-    // clicks from releasing the focus mid-game.
-    if (device.kind === "arcade" && FURNITURE.find((i) => i.id === deviceId)?.kind === "arcade-cabinet-2p") {
-      // 🕹️ The two-player cabinet has a stand per player (s0 = player 1):
-      // walk to the free one, and its index is the seat. The one-player
-      // cabinet has no stands, just the device front.
-      const twoPlayer = standsForItem(deviceId).length > 0;
-      const stand = twoPlayer ? this.pickFreeStand(deviceId) : null;
-      const seat = stand && stand.id.endsWith(":s1") ? 1 : 0;
-      const target: DeviceTarget = stand
-        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
-        : device;
-      deviceFocus.beginFocus(
-        this.player,
-        target,
-        createNesCabinetUI({
-          itemId: deviceId,
-          visual: this.arcadeCabinetVisuals.get(deviceId),
-          seat,
-          seats: twoPlayer ? 2 : 1,
-          requestRelease: () => deviceFocus.release(),
-        }),
-      );
-      return;
-    }
-
     // 🪙 Coin pusher (#135) — the DOM panel writes the player's drop request
     // (and the owner's door request); the operator settles them. The cabinet
     // mirrors the selected hole and the panel's messages, and lights every
@@ -6564,11 +6558,23 @@ export class World {
       return;
     }
 
-    // 🕹 #193: the cabinet's panel — the owner's shelf and game, INSERT COIN
-    // for P1 — and the stage the coin opens (the emulator in a frame of our
-    // own), after the focus is released, as the TV hands off to its theatre.
+    // 🕹 #193: the cabinet and its one game. A built-in game plays on the
+    // cabinet's own screen (the UI only adds a key strip and keeps stray
+    // clicks from releasing the focus mid-game); the owner's own game opens
+    // the panel — INSERT COIN for P1 — and the stage the coin opens (the
+    // emulator in a frame of our own), after the focus is released, as the
+    // TV hands off to its theatre.
     if (device.kind === "arcade") {
-      deviceFocus.beginFocus(this.player, device, this.arcadeCabinetUI(deviceId, "play"));
+      // The two-player cabinet has a stand per player (s0 = player 1):
+      // walk to the free one, and its index is the seat. The one-player
+      // cabinet has no stands, just the device front.
+      const twoPlayer = standsForItem(deviceId).length > 0;
+      const stand = twoPlayer ? this.pickFreeStand(deviceId) : null;
+      const seat = stand && stand.id.endsWith(":s1") ? 1 : 0;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        : device;
+      deviceFocus.beginFocus(this.player, target, this.arcadeCabinetUI(deviceId, "play", seat, twoPlayer ? 2 : 1));
       return;
     }
 

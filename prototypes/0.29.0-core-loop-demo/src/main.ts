@@ -2006,7 +2006,7 @@ async function joinRoomAtEpoch(
   // remote. Same T0 seam — a joiner walks in on a movie already running and
   // anchors its clock to the sample it finds.
   bindTvDoc(sync.doc);
-  // 🕹 Bind the shared arcade map (#193): each cabinet's shelf and game, and
+  // 🕹 Bind the shared arcade map (#193): each cabinet's game, and
   // who is at its controls. Same T0 seam.
   bindArcadeDoc(sync.doc);
 
@@ -4273,7 +4273,7 @@ function resolveOwnerLabel(owner: string): string {
  *      handing theirs on — setTvHostPredicate; the panels paint from it)
  *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
  *      (#193 — setArcadeEjectPredicate; the panel paints from it). The
- *      cabinet's CURATION (shelf, game, emulator files) stays with the
+ *      cabinet's CURATION (its game, emulator files) stays with the
  *      shareholder-extended gate above (setArcadeHostPredicate).
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
@@ -10042,7 +10042,7 @@ async function init() {
       : `page-${Math.random().toString(36).slice(2, 12)}`,
   );
   // 🕹 #193: two authorities for the cabinet (#142's split, in the
-  // isLocalPlayerRoomOwner docblock). Curation — the shelf, the game, the
+  // isLocalPlayerRoomOwner docblock). Curation — the game, the
   // emulator files — is the edit gate's, shareholder-extended. Unseating
   // P1 (EJECT, sitting down over a held seat) is the DEED holder's alone:
   // a peer-written venture record can satisfy the edit gate, and nobody is

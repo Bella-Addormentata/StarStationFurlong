@@ -36,11 +36,12 @@ npm.
   NESert Golfing by Brad Smith (<https://rainwarrior.itch.io/nesert-golfing>),
   built without changes from the source linked above.
 
-## Your own cartridge
+## One game per cabinet
 
-The cabinet's INSERT YOUR OWN CARTRIDGE slot reads a `.nes` file from your own
-device into memory for that play session only. It is never uploaded, stored or
-shared with other players.
+A cabinet plays one game, picked by the room's owner in the cabinet's ⚙️
+settings: one of the games above on the built-in emulator (it plays on the
+cabinet's screen and the room watches), or the owner's own game in EmulatorJS.
+Players don't pick games; they walk up and press play.
 
 ## Adding a game
 

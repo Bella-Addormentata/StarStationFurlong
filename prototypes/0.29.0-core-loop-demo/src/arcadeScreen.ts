@@ -181,8 +181,8 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
         text('EMULATOR: JSNES (APACHE-2.0)', SCREEN_W / 2, 130, 18, PHOSPHOR, 'center');
         text('EVERY GAME HERE IS HOMEBREW', SCREEN_W / 2, 190, 16, PHOSPHOR_DIM, 'center');
         text('ITS AUTHOR CHOSE TO SHARE.', SCREEN_W / 2, 214, 16, PHOSPHOR_DIM, 'center');
-        text('YOUR OWN CARTRIDGE STAYS ON', SCREEN_W / 2, 264, 16, PHOSPHOR_DIM, 'center');
-        text('YOUR DEVICE. NOTHING IS SHARED.', SCREEN_W / 2, 288, 16, PHOSPHOR_DIM, 'center');
+        text('THE OWNER PICKS THE CABINET\'S', SCREEN_W / 2, 264, 16, PHOSPHOR_DIM, 'center');
+        text('GAME IN ITS ⚙️ SETTINGS.', SCREEN_W / 2, 288, 16, PHOSPHOR_DIM, 'center');
         text('FULL LIST: arcade/README.md', SCREEN_W / 2, 338, 16, PHOSPHOR_DIM, 'center');
       }
       text(`◀ ${page + 1}/${CREDIT_PAGES} ▶   ENTER BACK`, SCREEN_W / 2, SCREEN_H - 24, 16, AMBER, 'center');

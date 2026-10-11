@@ -7,14 +7,14 @@
  * bundled ROM through this class. The cabinet UI (arcadeNesCabinet.ts) owns
  * input, painting and sound.
  *
- * Two ways to drive it. A private game (your own cartridge) uses step() and
- * press()/release(): wall-clock paced, buttons as they happen. A shared game
- * (arcadeNesSession.ts) uses runFrame(), one frame at a time with both pads set
- * from bytes, because every copy in the room must see the same buttons on the
- * same frame. jsnes is deterministic: the same ROM and the same pad bytes per
- * frame give the same game on every machine, whatever its audio sample rate
- * (arcadeNet.test.ts pins this), and saveState()/loadState() carry a game to
- * a copy that joins late.
+ * Two ways to drive it. A private game uses step() and press()/release():
+ * wall-clock paced, buttons as they happen. A shared game — every game a
+ * cabinet plays (arcadeNesSession.ts) — uses runFrame(), one frame at a time
+ * with both pads set from bytes, because every copy in the room must see the
+ * same buttons on the same frame. jsnes is deterministic: the same ROM and
+ * the same pad bytes per frame give the same game on every machine, whatever
+ * its audio sample rate (arcadeNet.test.ts pins this), and
+ * saveState()/loadState() carry a game to a copy that joins late.
  */
 
 import { Controller, NES } from 'jsnes';

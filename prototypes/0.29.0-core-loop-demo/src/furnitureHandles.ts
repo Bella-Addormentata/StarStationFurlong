@@ -65,7 +65,7 @@ export interface FurnitureHandleSinks {
   /** 🪙 Coin-pusher cabinet visuals (pusher sweep, chips, hole lamps), keyed by item id. */
   coinPusherVisuals: Map<string, CoinPusherVisualHandle>;
   /** 🕹️ Arcade-cabinet screens, keyed by item id — handed to the cabinet's
-   *  focus UI (arcadeCabinet.ts), which paints the menu and the game. */
+   *  focus UI (arcadeNesCabinet.ts), which paints the menu and the game. */
   arcadeCabinetVisuals: Map<string, ArcadeCabinetVisualHandle>;
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
   propAnims: Map<string, PropAnimHandle>;

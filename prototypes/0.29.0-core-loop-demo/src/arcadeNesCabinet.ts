@@ -1,30 +1,31 @@
 /**
- * 🕹️ The arcade cabinet's focus UI: step up to the cabinet and the game menu
- * comes up ON the cabinet's own screen — no popup. The keyboard (or a
- * gamepad) drives the menu, then the game.
+ * 🕹️ The arcade cabinet's focus UI for a BUILT-IN game: step up to the
+ * cabinet and its one game — the owner's pick (arcadeDoc) — comes up ON the
+ * cabinet's own screen, no popup. Press Enter (or Start) and it plays.
  *
- *   MENU     ↑/↓ choose · Enter or X play · the last two rows are
- *            INSERT YOUR OWN CARTRIDGE (a local .nes file, never shared)
- *            and CREDITS & LICENSES
+ *   MENU     the cabinet's game, then CREDITS & LICENSES · ↑/↓ choose ·
+ *            Enter or X play
  *   PLAYING  the NES pad; Backspace (or Select+Start held on a gamepad)
  *            ends the game and returns to the menu
+ *   ⚙️       the strip's SETTINGS button: what the owner set (World swaps
+ *            in arcadeUI's SETTINGS view)
  *   Esc      leaves the cabinet, as at every device
  *
- * A bundled game is SHARED (arcadeNesSession.ts): everyone in the room runs it
+ * The game is SHARED (arcadeNesSession.ts): everyone in the room runs it
  * from this player's button presses and sees it on the cabinet. At a
  * two-player cabinet, whoever steps up to the other stand plays player 2.
  * Stepping up to a cabinet whose game is already running watches it, or
  * joins it from the free stand (hand player 2 back with Backspace, take it
- * again with Enter). Your own cartridge stays on this page: the room sees
- * the attract card.
+ * again with Enter). Players never pick the game: when the owner changes
+ * it, World rebuilds this UI for the new one (onGameChanged).
  *
  * Keys are taken in the capture phase while focused (freeFlightStick's
  * idiom), so WASD steers the game instead of walking away from the cabinet;
  * Esc and Tab pass through untouched.
  */
 
-import { ARCADE_GAMES, LICENSE_LABEL, parseInesHeader, type ArcadeGame } from './arcadeLibrary';
-import { ArcadeMachine, type NesButton, type NesPlayer } from './arcadeMachine';
+import { ARCADE_GAMES, LICENSE_LABEL, type ArcadeGame } from './arcadeLibrary';
+import type { NesButton, NesPlayer } from './arcadeMachine';
 import { padByte } from './arcadeNet';
 import { CREDIT_PAGES, type ArcadeMenuRow } from './arcadeScreen';
 import { linkArcade, type ArcadeLink, type SharedView } from './arcadeNesSession';
@@ -36,58 +37,52 @@ import { isFormFieldTarget } from './typingFocus';
 
 export type MenuEntry =
   | { kind: 'game'; game: ArcadeGame }
-  | { kind: 'own' }
   | { kind: 'credits' };
 
-export const MENU: readonly MenuEntry[] = [
-  ...ARCADE_GAMES.map((game) => ({ kind: 'game' as const, game })),
-  { kind: 'own' },
-  { kind: 'credits' },
-];
+/** The cabinet's menu: its one game, then the credits. */
+export function menuFor(game: ArcadeGame | null): MenuEntry[] {
+  return game ? [{ kind: 'game', game }, { kind: 'credits' }] : [{ kind: 'credits' }];
+}
 
-export function menuRows(): ArcadeMenuRow[] {
-  return MENU.map((entry) => {
+export function menuRows(menu: readonly MenuEntry[]): ArcadeMenuRow[] {
+  return menu.map((entry) => {
     if (entry.kind === 'game') {
       return { label: entry.game.title, detail: [entry.game.blurb, entry.game.controls] };
     }
-    if (entry.kind === 'own') {
-      return {
-        label: 'INSERT YOUR OWN CARTRIDGE',
-        detail: ['PICK A .NES FILE FROM THIS DEVICE.', 'IT STAYS HERE. NOTHING IS UPLOADED.'],
-      };
-    }
-    return { label: 'CREDITS & LICENSES', detail: ['WHO MADE THESE GAMES, AND', 'THE LICENSES THAT LET US SHARE THEM.'] };
+    return { label: 'CREDITS & LICENSES', detail: ['WHO MADE THIS GAME, AND', 'THE LICENSE THAT LETS US SHARE IT.'] };
   });
+}
+
+/** The credits page a menu opens on: its game's, else the closing page. */
+function firstCreditPage(menu: readonly MenuEntry[]): number {
+  const entry = menu.find((e) => e.kind === 'game');
+  const page = entry?.kind === 'game' ? ARCADE_GAMES.findIndex((g) => g.id === entry.game.id) : -1;
+  return page >= 0 ? page : CREDIT_PAGES - 1;
 }
 
 export type ArcadeView =
   | { screen: 'menu'; cursor: number; status: string | null }
   | { screen: 'credits'; page: number }
-  | { screen: 'loading'; title: string }
-  /** Your own cartridge, on this page only. */
-  | { screen: 'playing'; title: string }
-  /** A shared game: hosting it, playing player 2, or watching. */
+  /** The shared game: hosting it, playing player 2, or watching. */
   | ({ screen: 'shared' } & SharedView);
 
 export type MenuAction =
   | { kind: 'none' }
-  | { kind: 'start'; game: ArcadeGame }
-  | { kind: 'pickFile' };
+  | { kind: 'start'; game: ArcadeGame };
 
 /** A button pressed while the menu or credits are up. */
-export function menuInput(view: ArcadeView, button: NesButton): { view: ArcadeView; action: MenuAction } {
+export function menuInput(view: ArcadeView, button: NesButton, menu: readonly MenuEntry[]): { view: ArcadeView; action: MenuAction } {
   const none = { kind: 'none' } as const;
   if (view.screen === 'menu') {
-    const n = MENU.length;
+    const n = menu.length;
     if (button === 'UP') return { view: { ...view, cursor: (view.cursor + n - 1) % n, status: null }, action: none };
     if (button === 'DOWN' || button === 'SELECT') {
       return { view: { ...view, cursor: (view.cursor + 1) % n, status: null }, action: none };
     }
     if (button === 'START' || button === 'A') {
-      const entry = MENU[view.cursor];
-      if (entry.kind === 'game') return { view, action: { kind: 'start', game: entry.game } };
-      if (entry.kind === 'own') return { view, action: { kind: 'pickFile' } };
-      return { view: { screen: 'credits', page: 0 }, action: none };
+      const entry = menu[view.cursor];
+      if (entry?.kind === 'game') return { view, action: { kind: 'start', game: entry.game } };
+      return { view: { screen: 'credits', page: firstCreditPage(menu) }, action: none };
     }
     return { view, action: none };
   }
@@ -99,7 +94,7 @@ export function menuInput(view: ArcadeView, button: NesButton): { view: ArcadeVi
       return { view: { screen: 'credits', page: (view.page + 1) % CREDIT_PAGES }, action: none };
     }
     if (button === 'START' || button === 'A' || button === 'B') {
-      return { view: { screen: 'menu', cursor: MENU.findIndex((e) => e.kind === 'credits'), status: null }, action: none };
+      return { view: { screen: 'menu', cursor: menu.findIndex((e) => e.kind === 'credits'), status: null }, action: none };
     }
   }
   return { view, action: none };
@@ -110,10 +105,10 @@ export function menuInput(view: ArcadeView, button: NesButton): { view: ArcadeVi
  * the menu and credits are painted into a 3D texture, which assistive tech
  * cannot read.
  */
-export function describeView(view: ArcadeView): string {
+export function describeView(view: ArcadeView, menu: readonly MenuEntry[]): string {
   if (view.screen === 'menu') {
-    const row = menuRows()[view.cursor];
-    const parts = [`${row.label}, ${view.cursor + 1} of ${MENU.length}.`, ...(row.detail ?? [])];
+    const row = menuRows(menu)[view.cursor];
+    const parts = row ? [`${row.label}, ${view.cursor + 1} of ${menu.length}.`, ...(row.detail ?? [])] : [];
     if (view.status) parts.unshift(`${view.status}.`);
     return parts.join(' ');
   }
@@ -121,22 +116,18 @@ export function describeView(view: ArcadeView): string {
     const game = ARCADE_GAMES[view.page];
     return game
       ? `Credits ${view.page + 1} of ${CREDIT_PAGES}: ${game.title} by ${game.author}, ${game.year}. License ${LICENSE_LABEL[game.license]}. Source ${game.sourceUrl}.`
-      : `Credits ${view.page + 1} of ${CREDIT_PAGES}: emulator jsnes, Apache-2.0. Your own cartridge stays on your device.`;
+      : `Credits ${view.page + 1} of ${CREDIT_PAGES}: emulator jsnes, Apache-2.0. The owner picks the cabinet's game in its settings.`;
   }
-  if (view.screen === 'loading') return `Loading ${view.title}.`;
-  if (view.screen === 'shared') {
-    if (view.phase === 'ended') return `${view.title}: player 1 left. Escape leaves the cabinet.`;
-    if (view.phase === 'loading') return `Loading ${view.title}.`;
-    if (view.phase === 'joining') return `Joining ${view.title}.`;
-    if (view.role === 'watcher') {
-      return view.joinAs
-        ? `Watching ${view.title}. Enter plays player ${view.joinAs}, Escape leaves the cabinet.`
-        : `Watching ${view.title}. Escape leaves the cabinet.`;
-    }
-    const back = view.role === 'host' ? 'Backspace ends the game' : 'Backspace stops playing';
-    return `Playing ${view.title} as player ${view.player}. ${back}, Escape leaves the cabinet.`;
+  if (view.phase === 'ended') return `${view.title}: player 1 left. Escape leaves the cabinet.`;
+  if (view.phase === 'loading') return `Loading ${view.title}.`;
+  if (view.phase === 'joining') return `Joining ${view.title}.`;
+  if (view.role === 'watcher') {
+    return view.joinAs
+      ? `Watching ${view.title}. Enter plays player ${view.joinAs}, Escape leaves the cabinet.`
+      : `Watching ${view.title}. Escape leaves the cabinet.`;
   }
-  return `Playing ${view.title}. Backspace returns to the menu, Escape leaves the cabinet.`;
+  const back = view.role === 'host' ? 'Backspace ends the game' : 'Backspace stops playing';
+  return `Playing ${view.title} as player ${view.player}. ${back}, Escape leaves the cabinet.`;
 }
 
 /** Keyboard → NES pad (player 1). Arrows or WASD; X/K = A, Z/J = B. */
@@ -184,19 +175,23 @@ export function connectedPads(): Gamepad[] {
   }
 }
 
-/** Upper-cased, printable, short: a file name fit for the cabinet screen. */
-export function cartridgeTitle(fileName: string): string {
-  const stem = fileName.replace(/\.[^.]*$/, '').replace(/[^\x20-\x7e]/g, '').trim().toUpperCase();
-  return (stem || 'YOUR CARTRIDGE').slice(0, 24);
-}
-
-
 // ── The focus UI ─────────────────────────────────────────────────────────────
 
 export interface ArcadeCabinetUIDeps {
   /** The cabinet's furniture id (its shared game's doc key). */
   itemId: string;
   visual: ArcadeCabinetVisualHandle | undefined;
+  /** The built-in game on the cabinet now (arcadeDoc, the owner's pick), or
+   *  null when it has none or the owner's own. Read every update; default:
+   *  the library's first game. */
+  game?: () => ArcadeGame | null;
+  /** The cabinet's game is no longer the one this UI was built for: World
+   *  builds the UI for the new one in its place. */
+  onGameChanged?: () => void;
+  /** The strip's ⚙️ SETTINGS button (absent: no button). */
+  openSettings?: () => void;
+  /** A game started here: the cabinet's tally counts it. */
+  onPlay?: () => void;
   /** The stand this player stepped up to (0 = player 1's) and how many the
    *  cabinet has (1, or 2 for the two-player cabinet). */
   seat?: 0 | 1;
@@ -207,12 +202,10 @@ export interface ArcadeCabinetUIDeps {
   link?: ArcadeLink;
 }
 
-const STRIP_MENU = '↑↓ CHOOSE · ENTER PLAY · ESC LEAVE';
+const STRIP_MENU = 'ENTER PLAY · ↑↓ CHOOSE · ESC LEAVE';
 const STRIP_KEYS = 'ARROWS/WASD PAD · X = A · Z = B · ENTER START · SHIFT SELECT';
-const STRIP_PLAY = `${STRIP_KEYS} · ⌫ MENU · ESC LEAVE`;
 
 function stripFor(view: ArcadeView): string {
-  if (view.screen === 'playing') return STRIP_PLAY;
   if (view.screen !== 'shared') return STRIP_MENU;
   if (view.phase === 'ended') return 'PLAYER 1 LEFT · ESC LEAVE';
   if (view.phase === 'loading') return 'LOADING… · ESC LEAVE';
@@ -230,16 +223,16 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const painter = deps.visual?.painter;
   const seat = deps.seat ?? 0;
   const seats = deps.seats ?? 1;
+  const currentGame = deps.game ?? (() => ARCADE_GAMES[0] ?? null);
+  /** The game this UI was built for; the menu is its game and the credits. */
+  const game = currentGame();
+  const menu = menuFor(game);
 
   let view: ArcadeView = { screen: 'menu', cursor: 0, status: null };
   /** The menu row last selected, so leaving a game lands back on it. */
   let menuCursor = 0;
   let link: ArcadeLink | null = null;
   let speaker: ArcadeSpeaker | null = null;
-  /** Your own cartridge's console (shared games run in the session). */
-  let machine: ArcadeMachine | null = null;
-  /** Bumped on every load and on unmount: a late file read checks it. */
-  let loadSeq = 0;
   let mounted = false;
   /** Step up to a two-player cabinet's free stand and you play player 2;
    *  after handing it back you watch until you press Start. */
@@ -252,10 +245,6 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const keysDown = new Map<string, NesButton>();
   /** Per gamepad index, the NES buttons held last poll (edge detection). */
   const padHeld: Array<Set<NesButton>> = [new Set(), new Set()];
-  /** Some key or pad still holds this button down. */
-  const stillHeld = (player: NesPlayer, button: NesButton): boolean =>
-    padHeld[player - 1].has(button) || (player === 1 && [...keysDown.values()].includes(button));
-  let fileInput: HTMLInputElement | null = null;
 
   let capture: HTMLDivElement | null = null;
   let strip: HTMLDivElement | null = null;
@@ -271,29 +260,25 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     dirty = true;
     if (stripText) stripText.textContent = stripFor(next);
     if (spoken) {
-      const words = describeView(next);
+      const words = describeView(next, menu);
       if (spoken.textContent !== words) spoken.textContent = words;
     }
-    // The UI's own screens and your own cartridge are painted here; a shared
-    // game is painted by the session, which this page also hears.
-    const own = next.screen !== 'shared';
-    link?.setUiScreen(own);
-    link?.setAudio(next.screen === 'playing' ? null : (speaker?.push ?? null), speaker?.sampleRate ?? 48000);
+    // The UI's own screens are painted here; the shared game is painted by
+    // the session, which this page also hears.
+    link?.setUiScreen(next.screen !== 'shared');
+    link?.setAudio(speaker?.push ?? null, speaker?.sampleRate ?? 48000);
   };
 
   const paint = () => {
     if (!painter) return;
-    if (view.screen === 'menu') painter.drawMenu(menuRows(), view.cursor, view.status, blinkOn);
+    if (view.screen === 'menu') painter.drawMenu(menuRows(menu), view.cursor, view.status, blinkOn);
     else if (view.screen === 'credits') painter.drawCredits(view.page);
-    else if (view.screen === 'loading') painter.drawCard(view.title, 'LOADING…');
-    else return; // playing: the frames paint themselves
+    else return; // the shared game: the session paints it
     present();
     dirty = false;
   };
 
   const backToMenu = (status: string | null = null) => {
-    loadSeq++;
-    machine?.stop();
     speaker?.clear();
     padHold = 0;
     setView({ screen: 'menu', cursor: menuCursor, status });
@@ -311,72 +296,31 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     if (wasHost) backToMenu();
   };
 
-  const playOwn = (bytes: Uint8Array, title: string) => {
-    const header = parseInesHeader(bytes);
-    if (!header.ok) return backToMenu(header.reason);
-    machine ??= new ArcadeMachine({ sampleRate: speaker?.sampleRate, onAudioSample: speaker?.push });
-    const loaded = machine.load(bytes);
-    if (!loaded.ok) return backToMenu(loaded.reason);
-    setView({ screen: 'playing', title });
-  };
-
   const startShared = (game: ArcadeGame) => {
     if (!link) return;
     link.host(game);
     const shared = link.shared();
-    if (shared) setView({ screen: 'shared', ...shared });
-  };
-
-  /** Runs inside the key handler: a file picker needs the user's gesture. */
-  const pickFile = () => {
-    fileInput ??= document.createElement('input');
-    fileInput.type = 'file';
-    fileInput.accept = '.nes';
-    fileInput.value = '';
-    fileInput.onchange = () => {
-      const file = fileInput?.files?.[0];
-      if (!file || !mounted) return;
-      if (file.size > 4 * 1024 * 1024) return backToMenu('FILE TOO LARGE');
-      const seq = ++loadSeq;
-      const title = cartridgeTitle(file.name);
-      setView({ screen: 'loading', title });
-      file.arrayBuffer().then(
-        (buf) => {
-          if (seq !== loadSeq || !mounted) return;
-          playOwn(new Uint8Array(buf), title);
-        },
-        () => {
-          if (seq !== loadSeq || !mounted) return;
-          backToMenu('COULD NOT READ THAT FILE');
-        },
-      );
-    };
-    fileInput.click();
-  };
-
-  /** A press while the menu/credits are up; `gesture` = from a key event. */
-  const menuPress = (button: NesButton, gesture: boolean) => {
-    const { view: next, action } = menuInput(view, button);
-    if (next !== view) setView(next);
-    if (action.kind === 'start') startShared(action.game);
-    else if (action.kind === 'pickFile') {
-      if (gesture) pickFile();
-      else setView({ ...(view as Extract<ArcadeView, { screen: 'menu' }>), status: 'PRESS ENTER ON THE KEYBOARD TO PICK A FILE' });
+    if (shared) {
+      setView({ screen: 'shared', ...shared });
+      deps.onPlay?.();
     }
   };
 
-  const buttonDown = (player: NesPlayer, button: NesButton, gesture: boolean) => {
-    if (view.screen === 'playing') machine?.press(player, button);
-    else if (view.screen === 'menu' || view.screen === 'credits') {
-      if (player === 1) menuPress(button, gesture);
-    } else if (view.screen === 'shared' && view.joinAs && player === 1 && button === 'START') {
+  /** A press while the menu/credits are up. */
+  const menuPress = (button: NesButton) => {
+    const { view: next, action } = menuInput(view, button, menu);
+    if (next !== view) setView(next);
+    if (action.kind === 'start') startShared(action.game);
+  };
+
+  const buttonDown = (player: NesPlayer, button: NesButton) => {
+    if (view.screen === 'menu' || view.screen === 'credits') {
+      if (player === 1) menuPress(button);
+    } else if (view.joinAs && player === 1 && button === 'START') {
       autoJoin = true;
       link?.join();
     }
-    // shared, playing: the pads are read as bytes every update
-  };
-  const buttonUp = (player: NesPlayer, button: NesButton) => {
-    if (view.screen === 'playing') machine?.release(player, button);
+    // the shared game, playing: the pads are read as bytes every update
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -390,7 +334,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       e.preventDefault();
       e.stopImmediatePropagation();
       if (view.screen === 'shared') leaveShared();
-      else if (view.screen !== 'menu') backToMenu();
+      else if (view.screen === 'credits') backToMenu();
       return;
     }
     const button = keyToButton(e.code);
@@ -401,19 +345,16 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     keysDown.set(e.code, button);
     // Held keys auto-repeat: let that scroll the menu, never re-press the pad.
     if (e.repeat && view.screen !== 'menu' && view.screen !== 'credits') return;
-    buttonDown(1, button, true);
+    buttonDown(1, button);
   };
-  /** A button lets go when the last key or pad holding it does; a key whose
-   *  press the cabinet never took (Ctrl+X) lets go of nothing. */
+  /** A key whose press the cabinet never took (Ctrl+X) lets go of nothing;
+   *  the shared game reads the pad byte, which keeps a button any other key
+   *  or pad still holds. */
   const onKeyUp = (e: KeyboardEvent) => {
-    const button = keysDown.get(e.code);
-    if (!button) return;
     keysDown.delete(e.code);
-    if (!stillHeld(1, button)) buttonUp(1, button);
   };
   const onBlur = () => {
     keysDown.clear();
-    machine?.releaseAll();
   };
 
   const pollPads = (dt: number) => {
@@ -435,17 +376,13 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       for (const button of now) {
         if (before.has(button)) continue;
         speaker?.resume(); // browsers that count a pad press as a gesture
-        buttonDown(player, button, false);
+        buttonDown(player, button);
       }
-      for (const button of before) if (!now.has(button) && !stillHeld(player, button)) buttonUp(player, button);
     }
     const combo = padHeld[0].has('SELECT') && padHeld[0].has('START');
-    const inGame = view.screen === 'playing' || (view.screen === 'shared' && view.role !== 'watcher');
+    const inGame = view.screen === 'shared' && view.role !== 'watcher';
     padHold = combo && inGame ? padHold + dt : 0;
-    if (padHold >= PAD_MENU_HOLD_S) {
-      if (view.screen === 'shared') leaveShared();
-      else backToMenu();
-    }
+    if (padHold >= PAD_MENU_HOLD_S) leaveShared();
   };
 
   /** Follow the shared game on the cabinet: one starting, changing hands,
@@ -453,7 +390,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const followShared = () => {
     if (!link) return;
     const shared = link.shared();
-    if (shared?.joinAs && autoJoin && view.screen !== 'playing') link.join(); // the free stand plays the other player
+    if (shared?.joinAs && autoJoin) link.join(); // the free stand plays the other player
     if (view.screen === 'shared') {
       if (!shared) {
         const left = view.phase === 'ended' ? 'PLAYER 1 LEFT' : null;
@@ -461,7 +398,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       } else if (!sameShared(shared, view)) {
         setView({ screen: 'shared', ...shared });
       }
-    } else if (shared && view.screen !== 'playing' && view.screen !== 'loading') {
+    } else if (shared) {
       speaker?.clear();
       setView({ screen: 'shared', ...shared });
     } else if (!shared) {
@@ -474,7 +411,6 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     mount(host: HTMLElement): void {
       mounted = true;
       speaker = new ArcadeSpeaker();
-      machine = null;
       keysDown.clear();
       padHeld[0] = new Set();
       padHeld[1] = new Set();
@@ -515,14 +451,27 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
         e.stopPropagation();
         deps.requestRelease();
       });
+      // ⚙️ What the owner set, for anyone to read (the cabinet front's gear
+      // opens the same view).
+      let settings: HTMLButtonElement | null = null;
+      if (deps.openSettings) {
+        settings = document.createElement('button');
+        settings.textContent = '⚙️ SETTINGS';
+        settings.style.cssText = leave.style.cssText;
+        const openSettings = deps.openSettings;
+        settings.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openSettings();
+        });
+      }
       spoken = document.createElement('span');
       spoken.setAttribute('role', 'status');
       spoken.setAttribute('aria-live', 'polite');
       spoken.style.cssText = `
         position:absolute; width:1px; height:1px; overflow:hidden;
         clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap;`;
-      spoken.textContent = describeView(view);
-      strip.append(stripText, leave, spoken);
+      spoken.textContent = describeView(view, menu);
+      strip.append(...[stripText, settings, leave, spoken].filter((el): el is HTMLElement => el !== null));
       host.append(capture, strip);
 
       window.addEventListener('keydown', onKeyDown, CAPTURE);
@@ -534,12 +483,9 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
 
     unmount(): void {
       mounted = false;
-      loadSeq++;
       window.removeEventListener('keydown', onKeyDown, CAPTURE);
       window.removeEventListener('keyup', onKeyUp, CAPTURE);
       window.removeEventListener('blur', onBlur);
-      machine?.stop();
-      machine = null;
       // Leaving ends a game this page hosts and frees player 2; the session
       // repaints the cabinet for the room (a game still running, or the
       // attract card).
@@ -550,30 +496,20 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       capture?.remove();
       strip?.remove();
       capture = strip = stripText = spoken = null;
-      if (fileInput) fileInput.onchange = null;
     },
 
     update(dt: number): void {
       if (!mounted) return;
+      // The owner changed the cabinet's game: World builds the UI for it in
+      // this one's place (and unmounts this one, ending a game it hosts).
+      if (deps.onGameChanged && (currentGame()?.id ?? null) !== (game?.id ?? null)) {
+        deps.onGameChanged();
+        return;
+      }
       pollPads(dt);
       followShared();
       link?.setButtons(padByte([...keysDown.values(), ...padHeld[0]]));
       link?.setLocalPad2(padByte(padHeld[1]));
-      if (view.screen === 'playing' && machine) {
-        let frames = 0;
-        try {
-          frames = machine.step(dt);
-        } catch {
-          backToMenu('THE GAME CRASHED');
-        }
-        const frame = machine.frameBuffer();
-        if (frames > 0 && frame && painter) {
-          painter.drawFrame(frame);
-          present();
-        }
-        speaker?.flush();
-        return;
-      }
       if (view.screen === 'shared') {
         speaker?.flush();
         return;

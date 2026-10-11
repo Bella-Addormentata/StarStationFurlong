@@ -2,8 +2,8 @@
  * 🕹️ Arcade cabinet tests: the menu model and key map, the frame conversion
  * behind the CRT look, the cabinet builds (their screen handles are filed and
  * they free what they made), and the focus UI end to end with a stubbed DOM
- * and the real shared-game session — menu, a bundled game shared with the
- * room, back to the menu, your own cartridge, and leaving.
+ * and the real shared-game session — the cabinet's one game shared with the
+ * room, back to the menu, the owner changing the game, and leaving.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -11,17 +11,16 @@ import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
 import * as Y from 'yjs';
 import {
-  MENU,
-  cartridgeTitle,
   connectedPads,
   createArcadeCabinetUI,
   describeView,
   keyToButton,
+  menuFor,
   menuInput,
+  menuRows,
   type ArcadeView,
 } from './arcadeNesCabinet';
 import { ARCADE_GAMES } from './arcadeLibrary';
-import { ArcadeMachine } from './arcadeMachine';
 import { isArcadeTickFlags, unpackArcadeTick } from './arcadeNet';
 import {
   arcadeFrame, registerArcadeVisual, resetArcadeSessions, setArcadeRomFetcher, setArcadeSender,
@@ -34,37 +33,38 @@ import { registerFurnitureHandles, type FurnitureHandleSinks } from './furniture
 import { bindGamesDoc, readArcade } from './games/gamesDoc';
 
 const menu = (cursor = 0): ArcadeView => ({ screen: 'menu', cursor, status: null });
-const OWN = MENU.findIndex((e) => e.kind === 'own');
-const CREDITS = MENU.findIndex((e) => e.kind === 'credits');
+/** The cabinet's menu with the second built-in game on it. */
+const MENU = menuFor(ARCADE_GAMES[1]);
+const CREDITS = 1;
 
 describe('menu model', () => {
-  it('lists every bundled game, then your own cartridge, then credits', () => {
-    expect(MENU.length).toBe(ARCADE_GAMES.length + 2);
-    expect(OWN).toBe(ARCADE_GAMES.length);
-    expect(CREDITS).toBe(ARCADE_GAMES.length + 1);
+  it('is the cabinet\'s one game, then the credits: players never pick another', () => {
+    expect(MENU).toEqual([{ kind: 'game', game: ARCADE_GAMES[1] }, { kind: 'credits' }]);
+    expect(menuRows(MENU).map((r) => r.label)).toEqual([ARCADE_GAMES[1].title, 'CREDITS & LICENSES']);
+    expect(menuFor(null)).toEqual([{ kind: 'credits' }]);
   });
 
   it('moves the cursor with wrap-around', () => {
-    expect(menuInput(menu(0), 'UP').view).toEqual(menu(MENU.length - 1));
-    expect(menuInput(menu(MENU.length - 1), 'DOWN').view).toEqual(menu(0));
-    expect(menuInput(menu(1), 'SELECT').view).toEqual(menu(2));
+    expect(menuInput(menu(0), 'UP', MENU).view).toEqual(menu(1));
+    expect(menuInput(menu(1), 'DOWN', MENU).view).toEqual(menu(0));
+    expect(menuInput(menu(0), 'SELECT', MENU).view).toEqual(menu(1));
     // A move clears a status line.
-    expect(menuInput({ screen: 'menu', cursor: 0, status: 'NOT AN NES ROM' }, 'DOWN').view).toEqual(menu(1));
+    expect(menuInput({ screen: 'menu', cursor: 0, status: 'COULD NOT LOAD THAT GAME' }, 'DOWN', MENU).view).toEqual(menu(1));
   });
 
-  it('starts a game, asks for a file, or opens the credits', () => {
-    expect(menuInput(menu(0), 'START').action).toEqual({ kind: 'start', game: ARCADE_GAMES[0] });
-    expect(menuInput(menu(1), 'A').action).toEqual({ kind: 'start', game: ARCADE_GAMES[1] });
-    expect(menuInput(menu(OWN), 'START').action).toEqual({ kind: 'pickFile' });
-    expect(menuInput(menu(CREDITS), 'START').view).toEqual({ screen: 'credits', page: 0 });
+  it('starts the game, or opens the credits on its page', () => {
+    expect(menuInput(menu(0), 'START', MENU).action).toEqual({ kind: 'start', game: ARCADE_GAMES[1] });
+    expect(menuInput(menu(0), 'A', MENU).action).toEqual({ kind: 'start', game: ARCADE_GAMES[1] });
+    expect(menuInput(menu(CREDITS), 'START', MENU).view).toEqual({ screen: 'credits', page: 1 });
+    expect(menuInput(menu(0), 'START', menuFor(null)).view).toEqual({ screen: 'credits', page: CREDIT_PAGES - 1 });
     // B does nothing on the menu.
-    expect(menuInput(menu(0), 'B')).toEqual({ view: menu(0), action: { kind: 'none' } });
+    expect(menuInput(menu(0), 'B', MENU)).toEqual({ view: menu(0), action: { kind: 'none' } });
   });
 
   it('pages through the credits and returns to the credits row', () => {
-    expect(menuInput({ screen: 'credits', page: 0 }, 'LEFT').view).toEqual({ screen: 'credits', page: CREDIT_PAGES - 1 });
-    expect(menuInput({ screen: 'credits', page: CREDIT_PAGES - 1 }, 'RIGHT').view).toEqual({ screen: 'credits', page: 0 });
-    expect(menuInput({ screen: 'credits', page: 2 }, 'B').view).toEqual(menu(CREDITS));
+    expect(menuInput({ screen: 'credits', page: 0 }, 'LEFT', MENU).view).toEqual({ screen: 'credits', page: CREDIT_PAGES - 1 });
+    expect(menuInput({ screen: 'credits', page: CREDIT_PAGES - 1 }, 'RIGHT', MENU).view).toEqual({ screen: 'credits', page: 0 });
+    expect(menuInput({ screen: 'credits', page: 2 }, 'B', MENU).view).toEqual(menu(CREDITS));
   });
 });
 
@@ -78,13 +78,6 @@ describe('keys', () => {
 
   it('leaves Esc, Tab and everything else alone', () => {
     expect(['Escape', 'Tab', 'KeyM', 'Space', 'Backspace'].map(keyToButton)).toEqual([null, null, null, null, null]);
-  });
-
-  it('turns a file name into a screen title', () => {
-    expect(cartridgeTitle('my game (v1.2).nes')).toBe('MY GAME (V1.2)');
-    expect(cartridgeTitle('.nes')).toBe('YOUR CARTRIDGE');
-    expect(cartridgeTitle('ゲーム.nes')).toBe('YOUR CARTRIDGE');
-    expect(cartridgeTitle(`${'x'.repeat(40)}.nes`)).toHaveLength(24);
   });
 });
 
@@ -444,36 +437,6 @@ describe('the focus UI', () => {
     ui.unmount();
   });
 
-  it('loads your own cartridge from a local file, and refuses a file that is not a ROM', async () => {
-    const { ui, painter, fetchRom, host } = setup();
-    ui.mount(host as unknown as HTMLElement);
-    for (let i = 0; i < OWN; i++) win.dispatchEvent(key('keydown', 'ArrowDown'));
-    win.dispatchEvent(key('keydown', 'Enter'));
-    const input = created.find((el) => el.tag === 'input');
-    expect(input?.click).toHaveBeenCalled();
-    expect(fetchRom).not.toHaveBeenCalled();
-
-    input!.files = [{ name: 'notes.txt', size: 5, arrayBuffer: async () => new TextEncoder().encode('hello').buffer as ArrayBuffer }];
-    input!.onchange!();
-    await flush();
-    ui.update(1 / 60);
-    expect(painter.drawMenu.mock.lastCall?.[2]).toBe('FILE TOO SMALL');
-    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(OWN);
-
-    win.dispatchEvent(key('keydown', 'Enter'));
-    input!.files = [{ name: 'my homebrew.nes', size: thwaite.length, arrayBuffer: async () => thwaite.slice().buffer as ArrayBuffer }];
-    input!.onchange!();
-    ui.update(1 / 60);
-    expect(painter.drawCard).toHaveBeenLastCalledWith('MY HOMEBREW', 'LOADING…');
-    await flush();
-    tick(ui, 10);
-    expect(painter.drawFrame).toHaveBeenCalled();
-    // Your own cartridge stays on this page: nothing reaches the room.
-    expect(readArcade(ITEM)).toBeNull();
-    expect(sent).toEqual([]);
-    ui.unmount();
-  });
-
   it('a ROM that arrives after the player left is dropped', async () => {
     const { ui, painter, host } = setup();
     ui.mount(host as unknown as HTMLElement);
@@ -508,6 +471,64 @@ describe('the focus UI', () => {
       expect(event.stopPropagation, name).toHaveBeenCalled();
     }
     expect(requestRelease).toHaveBeenCalledTimes(1);
+    ui.unmount();
+  });
+  it('plays the game the owner put on the cabinet, counts it, and hands over when the owner changes it', async () => {
+    const painter = recordingPainter();
+    const visual: ArcadeCabinetVisualHandle = { painter, present: vi.fn(), showAttract: vi.fn() };
+    const fetchRom = vi.fn(async () => thwaite);
+    setArcadeRomFetcher(fetchRom);
+    registerArcadeVisual(ITEM, visual, { x: 0, z: 0 });
+    let onCabinet: (typeof ARCADE_GAMES)[number] | null = ARCADE_GAMES[2];
+    const onGameChanged = vi.fn();
+    const onPlay = vi.fn();
+    const ui = createArcadeCabinetUI({
+      itemId: ITEM, visual, requestRelease: vi.fn(), game: () => onCabinet, onGameChanged, onPlay,
+    });
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    expect(painter.drawMenu.mock.lastCall?.[0].map((r: { label: string }) => r.label)).toEqual([ARCADE_GAMES[2].title, 'CREDITS & LICENSES']);
+    win.dispatchEvent(key('keydown', 'Enter'));
+    expect(fetchRom).toHaveBeenCalledWith(ARCADE_GAMES[2].romUrl);
+    expect(onPlay).toHaveBeenCalledTimes(1);
+    await flush();
+    tick(ui, 5);
+    expect(readArcade(ITEM)?.game).toBe(ARCADE_GAMES[2].id);
+    expect(onGameChanged).not.toHaveBeenCalled();
+
+    // The owner puts another game on: World builds the UI for it.
+    onCabinet = ARCADE_GAMES[0];
+    const drawn = painter.drawFrame.mock.calls.length;
+    ui.update(1 / 60);
+    expect(onGameChanged).toHaveBeenCalledTimes(1);
+    ui.unmount(); // what World's swap does: the game this page hosted ends
+    arcadeFrame(1 / 60, null);
+    expect(readArcade(ITEM)).toBeNull();
+    expect(painter.drawFrame.mock.calls.length).toBe(drawn);
+  });
+
+  it('a ⚙️ SETTINGS button sits in the strip beside LEAVE when World offers the settings', () => {
+    const { host } = setup();
+    const openSettings = vi.fn();
+    const clicks = new Map<string, (e: MouseEvent) => void>();
+    vi.stubGlobal('document', {
+      createElement: (tag: string) => {
+        const el = fakeElement(tag);
+        el.addEventListener = ((type: string, fn: (e: MouseEvent) => void) => {
+          if (type === 'click' && tag === 'button') clicks.set(el.textContent || `button-${clicks.size}`, fn);
+        }) as never;
+        return el;
+      },
+    });
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual: undefined, requestRelease: vi.fn(), openSettings });
+    ui.mount(host as unknown as HTMLElement);
+    const buttons = created.filter((el) => el.tag === 'button').map((el) => el.textContent);
+    expect(buttons).toEqual(['LEAVE', '⚙️ SETTINGS']);
+    const strip = created.find((el) => el.id === 'arcade-strip')!;
+    expect(strip.children.map((c) => c.textContent)).toContain('⚙️ SETTINGS');
+    const stop = vi.fn();
+    clicks.get('⚙️ SETTINGS')!({ stopPropagation: stop } as unknown as MouseEvent);
+    expect(openSettings).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalled();
     ui.unmount();
   });
 });
@@ -553,13 +574,13 @@ describe('gamepads at the cabinet', () => {
     expect(painter.drawMenu.mock.lastCall?.[1]).toBe(1);
     pads[0].releaseAll();
     ui.update(1 / 60);
-    pads[0].stick(0, 0.9); // stick down
+    pads[0].stick(0, 0.9); // stick down: past the credits, round to the game
     ui.update(1 / 60);
-    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(2);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(0);
     pads[0].releaseAll();
     pads[1].press(13);
     ui.update(1 / 60);
-    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(2);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(0);
     ui.unmount();
   });
 
@@ -581,42 +602,6 @@ describe('gamepads at the cabinet', () => {
     tick(ui, 35);
     expect(painter.drawMenu.mock.calls.length).toBeGreaterThan(menuDraws);
     expect(readArcade(ITEM)).toBeNull();
-    ui.unmount();
-  });
-
-  it('a button lets go only when the last key or pad holding it does', async () => {
-    const { ui, pads } = setupWithPads(1);
-    // Your own cartridge runs on this page, so its machine's releases show it.
-    for (let i = 0; i < OWN; i++) win.dispatchEvent(key('keydown', 'ArrowDown'));
-    win.dispatchEvent(key('keydown', 'Enter'));
-    win.dispatchEvent(key('keyup', 'ArrowDown'));
-    win.dispatchEvent(key('keyup', 'Enter'));
-    const input = created.find((el) => el.tag === 'input')!;
-    input.files = [{ name: 'mine.nes', size: thwaite.length, arrayBuffer: async () => thwaite.slice().buffer as ArrayBuffer }];
-    input.onchange!();
-    await flush();
-    ui.update(1 / 60);
-    const release = vi.spyOn(ArcadeMachine.prototype, 'release');
-    const releasedA = () => release.mock.calls.filter(([player, button]) => player === 1 && button === 'A').length;
-
-    // X and K are both A: letting go of one keeps A held.
-    win.dispatchEvent(key('keydown', 'KeyX'));
-    win.dispatchEvent(key('keydown', 'KeyK'));
-    win.dispatchEvent(key('keyup', 'KeyX'));
-    expect(releasedA()).toBe(0);
-    // The pad's A holds it too.
-    pads[0].press(1);
-    ui.update(1 / 60);
-    win.dispatchEvent(key('keyup', 'KeyK'));
-    expect(releasedA()).toBe(0);
-    // Ctrl+X was the browser's: its key-up lets go of nothing.
-    win.dispatchEvent(key('keydown', 'KeyX', { mod: 'ctrlKey' }));
-    win.dispatchEvent(key('keyup', 'KeyX'));
-    expect(releasedA()).toBe(0);
-    // The last one lets go.
-    pads[0].release(1);
-    ui.update(1 / 60);
-    expect(releasedA()).toBe(1);
     ui.unmount();
   });
 
@@ -660,42 +645,28 @@ describe('gamepads at the cabinet', () => {
     ui.unmount();
   });
 
-  it('picking your own cartridge from a pad asks for the keyboard', () => {
-    const { ui, painter, pads } = setupWithPads(1);
-    for (let i = 0; i < OWN; i++) {
-      pads[0].press(13);
-      ui.update(1 / 60);
-      pads[0].releaseAll();
-      ui.update(1 / 60);
-    }
-    pads[0].press(9); // Start
-    ui.update(1 / 60);
-    expect(created.some((el) => el.tag === 'input')).toBe(false);
-    expect(painter.drawMenu.mock.lastCall?.[2]).toBe('PRESS ENTER ON THE KEYBOARD TO PICK A FILE');
-    ui.unmount();
-  });
 });
 
 describe('describeView (the screen-reader status line)', () => {
   it('says what the cabinet screen shows', () => {
-    expect(describeView(menu(0))).toContain(`${ARCADE_GAMES[0].title}, 1 of ${MENU.length}.`);
-    expect(describeView({ screen: 'menu', cursor: OWN, status: 'NOT AN NES ROM' })).toMatch(/^NOT AN NES ROM\. INSERT YOUR OWN CARTRIDGE/);
-    expect(describeView({ screen: 'credits', page: 0 })).toContain(ARCADE_GAMES[0].author);
-    expect(describeView({ screen: 'loading', title: 'THWAITE' })).toBe('Loading THWAITE.');
-    expect(describeView({ screen: 'playing', title: 'THWAITE' })).toMatch(/^Playing THWAITE\./);
+    expect(describeView(menu(0), MENU)).toContain(`${ARCADE_GAMES[1].title}, 1 of 2.`);
+    expect(describeView({ screen: 'menu', cursor: CREDITS, status: 'COULD NOT LOAD THAT GAME' }, MENU))
+      .toMatch(/^COULD NOT LOAD THAT GAME\. CREDITS & LICENSES, 2 of 2\./);
+    expect(describeView({ screen: 'credits', page: 0 }, MENU)).toContain(ARCADE_GAMES[0].author);
+    expect(describeView({ screen: 'credits', page: CREDIT_PAGES - 1 }, MENU)).toMatch(/jsnes/);
   });
 
   it('says who plays a shared game, and how to stop', () => {
     const shared = (over: Partial<SharedView>): ArcadeView => ({
       screen: 'shared', role: 'host', title: 'THWAITE', phase: 'playing', joinAs: null, player: 1, ...over,
     });
-    expect(describeView(shared({}))).toBe('Playing THWAITE as player 1. Backspace ends the game, Escape leaves the cabinet.');
-    expect(describeView(shared({ role: 'guest', player: 2 }))).toMatch(/^Playing THWAITE as player 2\. Backspace stops playing/);
-    expect(describeView(shared({ role: 'watcher', player: null }))).toBe('Watching THWAITE. Escape leaves the cabinet.');
-    expect(describeView(shared({ role: 'watcher', player: null, joinAs: 1 })))
+    expect(describeView(shared({}), MENU)).toBe('Playing THWAITE as player 1. Backspace ends the game, Escape leaves the cabinet.');
+    expect(describeView(shared({ role: 'guest', player: 2 }), MENU)).toMatch(/^Playing THWAITE as player 2\. Backspace stops playing/);
+    expect(describeView(shared({ role: 'watcher', player: null }), MENU)).toBe('Watching THWAITE. Escape leaves the cabinet.');
+    expect(describeView(shared({ role: 'watcher', player: null, joinAs: 1 }), MENU))
       .toBe('Watching THWAITE. Enter plays player 1, Escape leaves the cabinet.');
-    expect(describeView(shared({ phase: 'loading' }))).toBe('Loading THWAITE.');
-    expect(describeView(shared({ role: 'watcher', phase: 'joining', player: null }))).toBe('Joining THWAITE.');
-    expect(describeView(shared({ role: 'watcher', phase: 'ended', player: null }))).toMatch(/player 1 left/);
+    expect(describeView(shared({ phase: 'loading' }), MENU)).toBe('Loading THWAITE.');
+    expect(describeView(shared({ role: 'watcher', phase: 'joining', player: null }), MENU)).toBe('Joining THWAITE.');
+    expect(describeView(shared({ role: 'watcher', phase: 'ended', player: null }), MENU)).toMatch(/player 1 left/);
   });
 });

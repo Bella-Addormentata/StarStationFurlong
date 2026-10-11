@@ -23,9 +23,9 @@
  * every frame up close, every 3rd frame across the room and every 6th from
  * far away; the page at the cabinet always repaints every frame.
  *
- * Only bundled games are shared. A player's own cartridge stays in the
- * cabinet UI (arcadeNesCabinet.ts), private to their page, and while the UI
- * shows its own screen (the menu, an own cartridge) this layer doesn't paint.
+ * Only built-in games run here: the cabinet's one game, the owner's pick
+ * (arcadeDoc). While the cabinet UI (arcadeNesCabinet.ts) shows its own
+ * screen (the menu, the credits) this layer doesn't paint.
  */
 
 import { ARCADE_GAMES, type ArcadeGame } from './arcadeLibrary';
@@ -183,7 +183,7 @@ interface LinkState {
   localP2: number;
   audio: ((left: number, right: number) => void) | null;
   sampleRate: number;
-  /** The UI is showing its own screen (menu, credits, an own cartridge). */
+  /** The UI is showing its own screen (the menu, the credits). */
   uiScreen: boolean;
   /** Why the last host() failed, for the menu's status line. */
   error: string | null;

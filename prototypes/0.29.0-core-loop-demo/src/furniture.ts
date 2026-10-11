@@ -8259,9 +8259,14 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
 
   // ── Monitor: black bezel and the tilted CRT screen ────────────────────────
   // Tilted back by SCREEN_TILT about x so its face meets the focus eye, which
-  // sits ~11 cm above the screen's centre.
+  // sits ~11 cm above the screen's centre. Tilted back, its top edge leans
+  // toward the housing: the screen stands out far enough that the top edge
+  // stays just in front of the housing's face (z −0.07), or the housing
+  // would hide the top of the picture.
   const SCREEN_TILT = 0.12;
-  const bezel = place(new THREE.BoxGeometry(spec.screenW + 0.10, screenH + 0.11, 0.02), m(0x07090c, 0.9, 0.05), 0, screenY, -0.075);
+  const HOUSING_FACE_Z = 0.18 - 0.25;
+  const screenZ = HOUSING_FACE_Z - 0.005 - (screenH / 2) * Math.sin(SCREEN_TILT);
+  const bezel = place(new THREE.BoxGeometry(spec.screenW + 0.10, screenH + 0.11, 0.02), m(0x07090c, 0.9, 0.05), 0, screenY, screenZ + 0.013);
   bezel.rotation.x = SCREEN_TILT;
 
   // The marquee's lit name and the screen both emulators paint
@@ -8276,7 +8281,7 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
   const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
   screenMat.userData.baseOpacity = 1;
   // NES aspect 256:240; the plane faces −z (ry = π), then tilts back.
-  const screen = place(new THREE.PlaneGeometry(spec.screenW, screenH), screenMat, 0, screenY, -0.088, Math.PI);
+  const screen = place(new THREE.PlaneGeometry(spec.screenW, screenH), screenMat, 0, screenY, screenZ, Math.PI);
   screen.rotation.x = SCREEN_TILT;
 
   // ── Marquee ───────────────────────────────────────────────────────────────

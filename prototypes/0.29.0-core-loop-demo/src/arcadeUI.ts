@@ -1,20 +1,24 @@
 /**
- * 🕹 arcadeUI — the panel at the cabinet (a DeviceUI, the TV panel's shell):
- * what is on the cabinet, PLAYER ONE (INSERT COIN · STAND UP · the owner's
- * EJECT), the owner's shelf, and the owner's LOAD A GAME block — a file from
- * their own disk (SOVEREIGN) or a link: one on this station's node or this
- * page's own origin (SOVEREIGN — all a serverless-only build takes, the
- * default: sovereignty.ts), or any server a player's browser can reach
- * (CONVENIENCE, with the lanes on) — the core, and where the emulator's own
- * files come from. The game itself runs in the stage (arcadeStage.ts) that
- * INSERT COIN opens.
+ * 🕹 arcadeUI — the panel at the cabinet (a DeviceUI, the TV panel's shell).
+ * A cabinet plays ONE game, the owner's pick (arcadeDoc).
  *
- * Two views of one panel. PLAY, at the cabinet: what is on it, PLAYER ONE,
- * the shelf to pick from. SETTINGS, from the ⚙️ low on the cabinet's front
- * (or the panel's own ⚙️ button): what the owner set — the game, the shelf,
- * where the emulator's files come from — readable by anyone, and changed
- * there by the owner alone (the slot machine's and the casino tables' ⚙️
- * card: THE OWNER SETS THIS · ANYONE CAN LOOK).
+ * Two views of one panel. PLAY, at the cabinet, for the owner's own game
+ * (EmulatorJS): what is on it and PLAYER ONE (INSERT COIN · STAND UP · the
+ * owner's EJECT); the game runs in the stage (arcadeStage.ts) that INSERT
+ * COIN opens. A built-in game plays on the cabinet's screen instead
+ * (arcadeNesCabinet.ts), so World opens that in place of PLAY.
+ *
+ * SETTINGS, from the ⚙️ low on the cabinet's front (or the ⚙️ at the
+ * controls): the game on the cabinet and where EmulatorJS's files come
+ * from, readable by anyone, and changed there by the owner alone (the slot
+ * machine's and the casino tables' ⚙️ card: THE OWNER SETS THIS · ANYONE
+ * CAN LOOK). The owner picks one of two kinds of game: a FREE GAME the app
+ * ships (the built-in emulator, on the cabinet's screen, for the room), or
+ * THEIR OWN — a file from their disk (SOVEREIGN) or a link: one on this
+ * station's node or this page's own origin (SOVEREIGN — all a
+ * serverless-only build takes, the default: sovereignty.ts), or any server
+ * a player's browser can reach (CONVENIENCE, with the lanes on) — and its
+ * core, for EmulatorJS.
  *
  * Every state change goes through arcadeDoc; this module renders and asks.
  * Peer strings are escaped before they reach innerHTML (the #116 lesson).
@@ -24,12 +28,13 @@
 
 import type { DeviceUI } from './devices';
 import {
-  addToShelf, cabinetKey, coreForName, coreLabel, gameLane, iAmP1, insertCoin, mayEjectP1, maySit, parseRomUrl,
-  pickFromShelf, putOnCabinet, readCabinet, readSeat, removeFromShelf, seatKey, seatLapsed,
+  builtInEntry, builtInGame, cabinetKey, coreForName, coreLabel, gameLane, iAmP1, insertCoin, mayEjectP1, maySit,
+  parseRomUrl, putOnCabinet, readCabinet, readSeat, seatKey, seatLapsed,
   setEmulatorData, standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_CORES, ARCADE_MAX_NAME,
   isArcadeCore,
 } from './arcadeDoc';
 import type { ArcadeCore, ArcadeGame } from './arcadeDoc';
+import { ARCADE_GAMES as BUILT_IN_GAMES, LICENSE_LABEL } from './arcadeLibrary';
 import { rememberLocalRom, romAcceptList, EMULATOR_FETCH_COMMAND } from './arcadeEmulator';
 import { urlConsent, urlRefusal } from './tvConsent';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
@@ -48,7 +53,7 @@ export interface ArcadeDeviceDeps {
   itemId: string;
   myPub: () => string;
   myName: () => string;
-  /** Room-owner gate — the shelf, the game, the emulator files (curation).
+  /** Room-owner gate — the game, the emulator files (curation).
    *  EJECT is the deed holder's and is asked of arcadeDoc (mayEjectP1), the
    *  predicate that gates the write. */
   canEdit: () => boolean;
@@ -56,7 +61,9 @@ export interface ArcadeDeviceDeps {
   openStage: () => void;
   /** Which view this panel shows (default 'play'). */
   view?: ArcadePanelView;
-  /** Swap to the other view in place (the focus stays on the cabinet). */
+  /** Swap to the other view in place (the focus stays on the cabinet).
+   *  openPlay also takes the PLAY view to the cabinet's screen when the
+   *  owner puts a built-in game on (World picks the UI for the game). */
   openSettings?: () => void;
   openPlay?: () => void;
 }
@@ -112,9 +119,9 @@ function statusText(itemId: string): string {
   const rec = readCabinet(itemId);
   const seat = readSeat(itemId);
   const held = seat.holder !== '' && !seatLapsed(itemId);
-  if (!rec.game && rec.shelf.length === 0) return 'nothing on the cabinet';
-  const what = rec.game ? rec.game.name : `${rec.shelf.length} game${rec.shelf.length === 1 ? '' : 's'} on the shelf`;
-  return held ? `${what} · P1 · ${seat.name || 'a clone'}` : `${what} · INSERT COIN`;
+  if (!rec.game) return 'nothing on the cabinet';
+  if (rec.game.bundled) return `${rec.game.name} · on the cabinet's screen`;
+  return held ? `${rec.game.name} · P1 · ${seat.name || 'a clone'}` : `${rec.game.name} · INSERT COIN`;
 }
 
 function refreshStatus(root: HTMLElement, itemId: string): void {
@@ -135,7 +142,7 @@ function showNote(panel: HTMLElement, text: string): void {
   note.textContent = text;
 }
 
-// ── The owner's LOAD A GAME draft, kept across repaints ──────────────────────
+// ── The owner's YOUR OWN GAME draft, kept across repaints ────────────────────
 // (A File cannot be put back into an <input>, so the panel shows the name.)
 
 let draftFile: File | null = null;
@@ -166,17 +173,29 @@ function draftGame(): { game: ArcadeGame; file: File | null } | { error: string 
 
 function gameRow(g: ArcadeGame): string {
   return `<span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;">${esc(g.name)}</span>
-    <span style="font-size:9px; color:${DIM}; white-space:nowrap;">${esc(coreLabel(g.core))}</span>
+    <span style="font-size:9px; color:${DIM}; white-space:nowrap;">${g.bundled ? 'NES · BUILT-IN' : esc(coreLabel(g.core))}</span>
     ${laneBadge(gameLane(g))}`;
+}
+
+/** Under a game: where it plays, and a built-in game's credits. */
+function gameNote(g: ArcadeGame): string {
+  const lib = builtInEntry(g);
+  const where = lib
+    ? 'Plays on the cabinet\'s screen with the built-in emulator; the room watches, and the two-player cabinet seats two.'
+    : 'Plays in the EmulatorJS window that INSERT COIN opens, for player one.';
+  const credits = lib
+    ? `<br>${esc(lib.author)}, ${lib.year} · ${esc(LICENSE_LABEL[lib.license])} · <a href="${esc(lib.sourceUrl)}" target="_blank" rel="noopener noreferrer" style="color:${CYAN};">source</a>`
+    : '';
+  return `<div style="font-size:9px; color:${DIM}; line-height:1.4;">${where}${credits}</div>`;
 }
 
 function emulatorFilesText(lanesOn: boolean): string {
   return lanesOn
-    ? `This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it) — but under the CDN the emulator's own code reads the file, so each P1 is asked before their copy goes to it; THIS STATION's files keep it on their machine.`
-    : `This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) — ${esc(SERVERLESS_ONLY)}, so the public CDN is not offered. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it), and the emulator runs under a policy that reaches this origin and the player's own node, nothing else.`;
+    ? `For your own games. This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it) — but under the CDN the emulator's own code reads the file, so each P1 is asked before their copy goes to it; THIS STATION's files keep it on their machine.`
+    : `For your own games. This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) — ${esc(SERVERLESS_ONLY)}, so the public CDN is not offered. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it), and the emulator runs under a policy that reaches this origin and the player's own node, nothing else.`;
 }
 
-/** PLAY: at the cabinet — what is on it, PLAYER ONE, the shelf to pick from. */
+/** PLAY: at the cabinet — the owner's own game, and PLAYER ONE. */
 function renderPlay(itemId: string, deps: ArcadeDeviceDeps): string {
   const rec = readCabinet(itemId);
   const seat = readSeat(itemId);
@@ -187,7 +206,7 @@ function renderPlay(itemId: string, deps: ArcadeDeviceDeps): string {
 
   const onCabinet = game
     ? `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">${gameRow(game)}</div>`
-    : `<div style="font-size:10px; color:${DIM};">nothing — the owner loads a game</div>`;
+    : `<div style="font-size:10px; color:${DIM};">nothing — the owner picks a game in ⚙️ SETTINGS</div>`;
 
   const p1Line = mine ? 'You are at the controls.'
     : held ? `${esc(seat.name || 'A clone')} is at the controls.`
@@ -196,16 +215,8 @@ function renderPlay(itemId: string, deps: ArcadeDeviceDeps): string {
     mine ? bigButton('data-arcade-stage="1"', '🕹 BACK TO THE CONTROLS', '47,230,160') : '',
     mine ? smallButton('data-arcade-standup="1"', '🪑 STAND UP') : '',
     !mine && maySit(itemId) && game ? bigButton('data-arcade-coin="1"', '🪙 INSERT COIN · PLAY', '212,168,75') : '',
-    !mine && maySit(itemId) && !game && rec.shelf.length ? bigButton('data-arcade-coin="1"', '🪙 INSERT COIN · PICK FROM THE SHELF', '212,168,75') : '',
     !mine && held && mayEjectP1() ? smallButton('data-arcade-eject="1"', '⏏ EJECT P1 (OWNER)') : '',
   ].join('');
-
-  const shelf = rec.shelf.length
-    ? rec.shelf.map((g, i) => `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">
-        ${gameRow(g)}
-        ${mine || owner ? smallButton(`data-arcade-pick="${i}"`, '▶ PUT ON') : ''}
-      </div>`).join('')
-    : `<div style="font-size:10px; color:${DIM};">empty</div>`;
 
   return `
     <div>
@@ -214,7 +225,6 @@ function renderPlay(itemId: string, deps: ArcadeDeviceDeps): string {
     </div>
     ${section('ON THE CABINET', onCabinet)}
     ${section('PLAYER ONE', `<div style="font-size:11px; color:${GOLD_BRIGHT}; line-height:1.4;">${p1Line}</div>${p1Buttons}`)}
-    ${section('THE SHELF', shelf)}
     <div style="display:flex; gap:6px; align-items:center; justify-content:space-between;">
       <div style="font-size:9px; color:${DIM}; line-height:1.4;">At the controls: arrows + Z X A S · ENTER start · SHIFT select · gamepads plug straight in · ESC stands up.</div>
       ${smallButton('data-arcade-settings="1"', owner ? '⚙️ SETTINGS' : '⚙️ SEE SETTINGS')}
@@ -230,20 +240,26 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
   const lanesOn = convenienceLanesEnabled();
 
   const onCabinet = `${game
-    ? `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">${gameRow(game)}</div>`
-    : `<div style="font-size:10px; color:${DIM};">nothing — the owner loads a game</div>`}
+    ? `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">${gameRow(game)}</div>${gameNote(game)}`
+    : `<div style="font-size:10px; color:${DIM};">nothing — the owner picks a game</div>`}
     <div style="display:flex; gap:6px; align-items:center; justify-content:space-between; font-size:10px; color:${DIM};">
       <span>PLAYED ${rec.plays} TIME${rec.plays === 1 ? '' : 'S'}</span>
       ${owner && game ? smallButton('data-arcade-takeoff="1"', '⏏ TAKE IT OFF') : ''}
     </div>`;
 
-  const shelf = rec.shelf.length
-    ? rec.shelf.map((g, i) => `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">
-        ${gameRow(g)}
-        ${owner ? smallButton(`data-arcade-pick="${i}"`, '▶ PUT ON') : ''}
-        ${owner ? smallButton(`data-arcade-unshelve="${i}"`, '✕') : ''}
-      </div>`).join('')
-    : `<div style="font-size:10px; color:${DIM};">empty</div>`;
+  // The owner's pick, one of two kinds: a free game the app ships, on the
+  // built-in emulator…
+  const builtIn = owner ? section('FREE GAMES · BUILT-IN EMULATOR', `
+    <div style="font-size:9px; color:${DIM}; line-height:1.4;">Ship with the game, play on the cabinet's screen, and the room watches. Players just walk up and press play.</div>
+    ${BUILT_IN_GAMES.map((lib) => {
+      const on = game?.bundled === lib.id;
+      return `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">
+        <span style="color:${GOLD_BRIGHT}; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(lib.title)}</span>
+        <span style="font-size:9px; color:${DIM}; white-space:nowrap;">${esc(LICENSE_LABEL[lib.license])}</span>
+        ${smallButton(`data-arcade-builtin="${esc(lib.id)}"`, on ? '✓ ON' : '▶ PUT ON', !on, on)}
+      </div>`;
+    }).join('')}
+  `) : '';
 
   // Everyone reads where the emulator's files come from; the owner picks.
   const files = owner
@@ -259,9 +275,11 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
     <option value="" ${draftCore ? '' : 'selected'}>CORE — picked from the file's extension</option>
     ${ARCADE_CORES.map((c) => `<option value="${c.core}" ${c.core === draftCore ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}
   </select>`;
-  // Serverless only, the build default: a link is one on this station's
-  // node or this page's own origin, and the CDN is not offered.
-  const load = owner ? section('LOAD A GAME', `
+  // …or their own, in EmulatorJS. Serverless only, the build default: a
+  // link is one on this station's node or this page's own origin, and the
+  // CDN is not offered.
+  const load = owner ? section('YOUR OWN GAME · EMULATORJS', `
+    <div style="font-size:9px; color:${DIM}; line-height:1.4;">Any console or arcade board EmulatorJS runs. Player one plays it in a window that INSERT COIN opens.</div>
     <label style="display:flex; flex-direction:column; gap:4px; font-size:10px; color:${GOLD_BRIGHT};">
       <span>📁 YOUR OWN FILE ${laneBadge('SOVEREIGN')}</span>
       <input type="file" data-arcade-file="1" accept="${romAcceptList()}" style="font-size:10px; color:#8fa3b8;">
@@ -274,7 +292,6 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
     ${cores}
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
       ${smallButton('data-arcade-put="1"', '▶ PUT ON THE CABINET')}
-      ${smallButton('data-arcade-shelve="1"', '＋ ADD TO THE SHELF')}
     </div>
   `) : '';
 
@@ -283,10 +300,10 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
       <div style="font-size:13px; font-weight:800; letter-spacing:1px; color:${GOLD_BRIGHT};">⚙️ ARCADE CABINET</div>
       <div data-arcade-role="1" style="font-size:9px; color:${DIM}; letter-spacing:1px; margin-top:3px;">${owner ? 'YOU RUN THIS CABINET' : 'THE OWNER SETS THIS CABINET · ANYONE CAN LOOK'}</div>
     </div>
-    ${section('ON THE CABINET', onCabinet)}
-    ${section('THE SHELF', shelf)}
-    ${section('EMULATOR FILES', `${files}<div style="font-size:9px; color:${DIM}; line-height:1.4;">${emulatorFilesText(lanesOn)}</div>`)}
+    ${section('ON THE CABINET · ONE GAME', onCabinet)}
+    ${builtIn}
     ${load}
+    ${section('EMULATORJS FILES', `${files}<div style="font-size:9px; color:${DIM}; line-height:1.4;">${emulatorFilesText(lanesOn)}</div>`)}
     ${smallButton('data-arcade-play="1"', '🕹 BACK TO THE CABINET')}
   `;
 }
@@ -306,7 +323,7 @@ function wirePanel(panel: HTMLElement, itemId: string, deps: ArcadeDeviceDeps, r
       return;
     }
     if (readCabinet(itemId).game) deps.openStage();
-    else note('Pick a game from the shelf below.');
+    else note('The owner has not picked a game yet.');
   });
   q<HTMLButtonElement>('[data-arcade-stage]')?.addEventListener('click', () => deps.openStage());
   q<HTMLButtonElement>('[data-arcade-settings]')?.addEventListener('click', () => deps.openSettings?.());
@@ -316,17 +333,10 @@ function wirePanel(panel: HTMLElement, itemId: string, deps: ArcadeDeviceDeps, r
     const r = standUp(itemId);
     if (!r.ok) note(r.error);
   });
-  panel.querySelectorAll<HTMLButtonElement>('[data-arcade-pick]').forEach((b) => b.addEventListener('click', () => {
-    const r = pickFromShelf(itemId, Number(b.dataset.arcadePick));
-    if (!r.ok) {
-      note(r.error);
-      return;
-    }
-    if (iAmP1(itemId)) deps.openStage();
-  }));
-  panel.querySelectorAll<HTMLButtonElement>('[data-arcade-unshelve]').forEach((b) => b.addEventListener('click', () => {
-    const r = removeFromShelf(itemId, Number(b.dataset.arcadeUnshelve));
-    if (!r.ok) note(r.error);
+  panel.querySelectorAll<HTMLButtonElement>('[data-arcade-builtin]').forEach((b) => b.addEventListener('click', () => {
+    const game = builtInGame(b.dataset.arcadeBuiltin ?? '');
+    const r = game ? putOnCabinet(itemId, game) : { ok: false as const, error: 'That game is not in this build.' };
+    note(r.ok ? `On the cabinet: ${game!.name}` : r.error);
   }));
   q<HTMLButtonElement>('[data-arcade-takeoff]')?.addEventListener('click', () => {
     const r = takeOffCabinet(itemId);
@@ -360,7 +370,7 @@ function wirePanel(panel: HTMLElement, itemId: string, deps: ArcadeDeviceDeps, r
     const v = (e.target as HTMLSelectElement).value;
     draftCore = isArcadeCore(v) ? v : '';
   });
-  const commit = (put: boolean) => {
+  q<HTMLButtonElement>('[data-arcade-put]')?.addEventListener('click', () => {
     const sel = q<HTMLSelectElement>('[data-arcade-core]');
     if (sel && !draftCore && isArcadeCore(sel.value)) draftCore = sel.value;
     const d = draftGame();
@@ -368,12 +378,10 @@ function wirePanel(panel: HTMLElement, itemId: string, deps: ArcadeDeviceDeps, r
       note(d.error);
       return;
     }
-    const r = put ? putOnCabinet(itemId, d.game) : addToShelf(itemId, d.game);
+    const r = putOnCabinet(itemId, d.game);
     if (r.ok && d.file) rememberLocalRom(d.game, d.file);
-    note(r.ok ? `${put ? 'On the cabinet' : 'On the shelf'}: ${d.game.name}` : r.error);
-  };
-  q<HTMLButtonElement>('[data-arcade-put]')?.addEventListener('click', () => commit(true));
-  q<HTMLButtonElement>('[data-arcade-shelve]')?.addEventListener('click', () => commit(false));
+    note(r.ok ? `On the cabinet: ${d.game.name}` : r.error);
+  });
 }
 
 // ── The DeviceUI ─────────────────────────────────────────────────────────────
@@ -386,6 +394,13 @@ export function createArcadeCabinetUI(deps: ArcadeDeviceDeps): DeviceUI {
 
   const render = (): void => {
     if (!panel) return;
+    // A built-in game plays on the cabinet's screen: PLAY hands over to it
+    // (World builds that UI in this one's place, unmounting it; until the
+    // focus has landed, the panel stays and the next repaint asks again).
+    if (deps.view !== 'settings' && readCabinet(deps.itemId).game?.bundled && deps.openPlay) {
+      deps.openPlay();
+      if (!panel) return;
+    }
     const html = renderArcadePanel(deps.itemId, deps);
     if (html !== lastHtml) {
       panel.innerHTML = html;

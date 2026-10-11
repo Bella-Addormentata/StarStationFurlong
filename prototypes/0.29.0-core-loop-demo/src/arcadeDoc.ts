@@ -3,15 +3,14 @@
  *
  * Three keys per cabinet in the room doc's `arcade` map, plain JSON, whole-
  * value transacted writes, LWW per key (the tvDoc / partyDoc discipline):
- *   arcade:<itemId> → the curation   the shelf, the game on the cabinet, the
- *                                    emulator-files choice (the owner's, P1's
- *                                    pick from the shelf)
+ *   arcade:<itemId> → the curation   the ONE game on the cabinet and the
+ *                                    emulator-files choice (the owner's)
  *   seat:<itemId>   → SeatRecord     who is at the controls — PLAYER ONE — as
  *                                    a lease (the TV remote's shape)
  *   plays:<itemId>  → PlaysRecord    the attract card's tally, P1's write
- * One key per writer: a seat renewal never collides with a shelf edit, and
- * a play counted the moment the owner edits the shelf never reverts the
- * edit (nor the edit the count) — whole-value LWW keeps one of two writes
+ * One key per writer: a seat renewal never collides with a change of game, and
+ * a play counted the moment the owner changes the game never reverts the
+ * change (nor the change the count) — whole-value LWW keeps one of two writes
  * to a key, so each thing that changes on its own has a key of its own.
  * readCabinet joins the tally on read.
  *
@@ -31,19 +30,25 @@
  *
  * TWO AUTHORITIES, NOT ONE (main.ts's #142 split): the HOST predicate is the
  * shareholder-extended edit gate and curates — a peer-written venture
- * record can satisfy it, which is acceptable reach for a shelf. The EJECT
+ * record can satisfy it, which is acceptable reach for a game. The EJECT
  * predicate is the raw deed holder and is the only one that unseats P1
  * (EJECT, or sitting down over a held seat): nobody is taken off the
  * controls on the strength of a record any peer could have written.
  *
- * THE OWNER CURATES: the shelf (the cabinet's menu), the game on the
- * cabinet, and where the emulator's own files come from — this station's
- * /emulatorjs/ (SOVEREIGN, fetched by scripts/fetch-emulatorjs.mjs) or
- * cdn.emulatorjs.org (CONVENIENCE, an opt-in per cabinet that exists only
- * in a build with the convenience lanes on: sovereignty.ts). A game is an
- * http(s) URL any P1 can fetch, or a file on the player's own disk (url '')
- * — then every P1 brings their own copy, until the blob lane (spike #18)
- * carries it. P1 may put a SHELF game on the cabinet; only the owner adds.
+ * ONE GAME PER CABINET, THE OWNER'S PICK: players walk up and press play;
+ * only the owner changes the game, in the cabinet's ⚙️ settings. Two kinds:
+ *  - a BUILT-IN game (`bundled`: an arcadeLibrary id — the free NES games
+ *    this app ships) runs on the built-in emulator ON the cabinet's screen,
+ *    shared with the room (arcadeNesSession.ts), two players at the
+ *    two-player cabinet. A cabinet nobody has set yet plays the first one.
+ *  - the owner's OWN game — any console or arcade board EmulatorJS runs —
+ *    in P1's play window (arcadeStage.ts), from an http(s) URL any P1 can
+ *    fetch, or a file on the owner's disk (url ''): then every P1 brings
+ *    their own copy, until the blob lane (spike #18) carries it.
+ * And where EmulatorJS's own files come from — this station's /emulatorjs/
+ * (SOVEREIGN, fetched by scripts/fetch-emulatorjs.mjs) or cdn.emulatorjs.org
+ * (CONVENIENCE, an opt-in per cabinet that exists only in a build with the
+ * convenience lanes on: sovereignty.ts).
  *
  * ENFORCEMENT POSTURE (dev phase, the doorPolicy.ts rule): every write is
  * gated here and every read is shape-checked, so a peer running edited code
@@ -56,6 +61,7 @@
  */
 
 import * as Y from 'yjs';
+import { ARCADE_GAMES as BUILT_IN_GAMES, type ArcadeGame as BuiltInGame } from './arcadeLibrary';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
 import { ownMediaOrigins } from './tvConsent';
 
@@ -65,7 +71,6 @@ import { ownMediaOrigins } from './tvConsent';
 export const ARCADE_SEAT_RENEW_MS = 3_000;
 /** A seat not renewed for this long (as THIS page saw it) is free again. */
 export const ARCADE_SEAT_LAPSE_MS = 8_000;
-export const ARCADE_SHELF_MAX = 12;
 export const ARCADE_MAX_NAME = 80;
 export const ARCADE_MAX_URL = 2048;
 export const ARCADE_MAX_PLAYER = 32;
@@ -115,26 +120,51 @@ export function coreForName(name: string): ArcadeCore | null {
 
 export interface ArcadeGame {
   /** Display name: the file's name, which arcade cores also need (the
-   *  romset name is the zip's name). */
+   *  romset name is the zip's name); a built-in game's title. */
   name: string;
   core: ArcadeCore;
   /** An http(s) URL any P1 can fetch (same origin or CORS-clean), or ''
-   *  when the game is a file on the player's own disk. */
+   *  when the game is a file on the player's own disk (or built in). */
   url: string;
   /** Bytes when known — a cheap "same file" check until the station
    *  library's BLAKE3 hash (plan §7). 0 = unknown. */
   size: number;
+  /** A built-in game's arcadeLibrary id: it runs on the built-in emulator,
+   *  on the cabinet's screen, for the room. Absent: the owner's own game,
+   *  in EmulatorJS. */
+  bundled?: string;
+}
+
+/** A built-in game as it goes on a cabinet — always rebuilt from the
+ *  library, so a peer's record can name one and nothing else about it. */
+export function builtInGame(id: string): ArcadeGame | null {
+  const lib = BUILT_IN_GAMES.find((g) => g.id === id);
+  return lib ? { name: lib.title, core: 'nes', url: '', size: 0, bundled: lib.id } : null;
+}
+
+/** The library entry behind a cabinet's game, or null for the owner's own. */
+export function builtInEntry(g: ArcadeGame | null): BuiltInGame | null {
+  return (g?.bundled && BUILT_IN_GAMES.find((b) => b.id === g.bundled)) || null;
+}
+
+/** What a cabinet nobody has set up plays: walk up and press play. */
+export const ARCADE_DEFAULT_GAME: ArcadeGame | null = BUILT_IN_GAMES[0] ? builtInGame(BUILT_IN_GAMES[0].id) : null;
+
+/** The name the marquee and the attract card show: a built-in game's title,
+ *  or the file's name without its extension. */
+export function gameTitle(g: ArcadeGame): string {
+  const lib = builtInEntry(g);
+  if (lib) return lib.title;
+  return (g.name.replace(/\.[a-z0-9]{1,5}$/i, '').trim() || g.name).toUpperCase();
 }
 
 /** Where the emulator's own files (loader, engine, cores) come from. */
 export type EmulatorData = 'station' | 'cdn';
 
 export interface CabinetRecord {
-  /** The game on the cabinet right now (the owner put it there, or P1 took
-   *  it off the shelf). */
+  /** The one game on the cabinet (the owner's pick), or null when the owner
+   *  took it off. */
   game: ArcadeGame | null;
-  /** The owner's curated shelf — the cabinet's menu. */
-  shelf: ArcadeGame[];
   data: EmulatorData;
   /** Times a game started on this cabinet (the attract card's tally) —
    *  joined from its own key on read, never stored with the curation. */
@@ -166,7 +196,7 @@ export interface SeatRecord {
   by: string;
 }
 
-export const CABINET_DEFAULT: CabinetRecord = { game: null, shelf: [], data: 'station', plays: 0, seq: 0 };
+export const CABINET_DEFAULT: CabinetRecord = { game: ARCADE_DEFAULT_GAME, data: 'station', plays: 0, seq: 0 };
 export const SEAT_FREE: SeatRecord = { holder: '', name: '', page: '', leaseAt: 0, by: '' };
 export const PLAYS_DEFAULT: PlaysRecord = { plays: 0 };
 
@@ -299,8 +329,8 @@ let identityProvider: () => { pub: string; name: string } = () => ({ pub: '', na
 export function setArcadeIdentity(provider: () => { pub: string; name: string }): void {
   identityProvider = provider;
 }
-/** Curation: the shelf, the game, the emulator files — the room's edit
- *  gate (shareholder-extended, see main.ts's authority split). */
+/** Curation: the game, the emulator files — the room's edit gate
+ *  (shareholder-extended, see main.ts's authority split). */
 let hostPredicate: () => boolean = () => false;
 export function setArcadeHostPredicate(predicate: () => boolean): void {
   hostPredicate = predicate;
@@ -335,7 +365,7 @@ const counter = (v: unknown): number => (Number.isSafeInteger(v) && (v as number
 const bump = (v: number): number => (v >= ARCADE_COUNTER_MAX ? 0 : v + 1);
 
 /** http(s) only, and never a URL carrying credentials: a game's link goes
- *  into the room-shared record and the shelf, where `user:password@host`
+ *  into the room-shared record, where `user:password@host`
  *  would be read by every peer, not just the host serving the file. */
 export function isHttpUrl(s: string): boolean {
   try {
@@ -352,6 +382,9 @@ export function isHttpUrl(s: string): boolean {
 export function sanitizeGame(raw: unknown): ArcadeGame | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
+  // A built-in game is its id and nothing else: one this build doesn't
+  // ship (a newer client's) reads as no game.
+  if (r.bundled !== undefined) return typeof r.bundled === 'string' ? builtInGame(r.bundled) : null;
   const name = str(r.name, ARCADE_MAX_NAME).trim();
   if (!name || !isArcadeCore(r.core)) return null;
   const url = str(r.url, ARCADE_MAX_URL);
@@ -362,15 +395,9 @@ export function sanitizeGame(raw: unknown): ArcadeGame | null {
 /** The `arcade:` key as a peer may have written it: the curation alone. */
 export function readCuration(itemId: string): CabinetCuration {
   const raw = ensureMap().get(cabinetKey(itemId)) as Partial<CabinetCuration> | undefined;
-  if (!raw || typeof raw !== 'object') return { game: null, shelf: [], data: 'station', seq: 0 };
-  const shelf = Array.isArray(raw.shelf)
-    ? raw.shelf
-        .slice(0, ARCADE_SHELF_MAX) // bound the work before the shape check: a peer's array is not
-        .map(sanitizeGame).filter((g): g is ArcadeGame => g !== null)
-    : [];
+  if (!raw || typeof raw !== 'object') return { game: ARCADE_DEFAULT_GAME, data: 'station', seq: 0 };
   return {
     game: sanitizeGame(raw.game),
-    shelf,
     // Serverless only (sovereignty.ts): a record that says `cdn` — written
     // by a build with the convenience lanes on, or by any peer — reads as
     // the station's own files here. The CDN is a server, whoever opted in.
@@ -485,13 +512,13 @@ export function standUp(itemId: string, now = clock()): ArcadeAction {
   return { ok: true };
 }
 
-// ── The cabinet: the owner curates, P1 chooses from the shelf ───────────────
+// ── The cabinet: the owner picks its one game ───────────────────────────────
 
 function ownerGate(): ArcadeAction {
   return hostPredicate() ? { ok: true } : { ok: false, error: 'Only the room owner changes the cabinet.' };
 }
 
-/** Put a game on the cabinet (the owner, any game). */
+/** Put a game on the cabinet in place of the last (the owner, any game). */
 export function putOnCabinet(itemId: string, game: ArcadeGame): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
@@ -511,40 +538,6 @@ export function takeOffCabinet(itemId: string): ArcadeAction {
   return { ok: true };
 }
 
-/** P1 (or the owner) puts a SHELF game on the cabinet — the menu. */
-export function pickFromShelf(itemId: string, index: number): ArcadeAction {
-  if (!iAmP1(itemId) && !hostPredicate()) return { ok: false, error: 'Insert a coin first.' };
-  const rec = readCuration(itemId);
-  const game = rec.shelf[index];
-  if (!game) return { ok: false, error: 'Nothing on that shelf.' };
-  write(cabinetKey(itemId), { ...rec, game, seq: bump(rec.seq) } satisfies CabinetCuration);
-  return { ok: true };
-}
-
-/** Add to the shelf (the owner). A game already there is moved to the top. */
-export function addToShelf(itemId: string, game: ArcadeGame): ArcadeAction {
-  const gate = ownerGate();
-  if (!gate.ok) return gate;
-  const clean = sanitizeGame(game);
-  if (!clean) return { ok: false, error: 'That is not a game the cabinet can run.' };
-  const rec = readCuration(itemId);
-  const rest = rec.shelf.filter((g) => gameId(g) !== gameId(clean));
-  if (rest.length >= ARCADE_SHELF_MAX) return { ok: false, error: `The shelf holds ${ARCADE_SHELF_MAX} games.` };
-  write(cabinetKey(itemId), { ...rec, shelf: [clean, ...rest], seq: bump(rec.seq) } satisfies CabinetCuration);
-  return { ok: true };
-}
-
-export function removeFromShelf(itemId: string, index: number): ArcadeAction {
-  const gate = ownerGate();
-  if (!gate.ok) return gate;
-  const rec = readCuration(itemId);
-  if (!rec.shelf[index]) return { ok: false, error: 'Nothing on that shelf.' };
-  write(cabinetKey(itemId), {
-    ...rec, shelf: rec.shelf.filter((_, i) => i !== index), seq: bump(rec.seq),
-  } satisfies CabinetCuration);
-  return { ok: true };
-}
-
 /** Where the emulator's own files come from (the owner's call, per cabinet).
  *  The CDN is an opt-in the build has to allow (sovereignty.ts). */
 export function setEmulatorData(itemId: string, data: EmulatorData): ArcadeAction {
@@ -559,27 +552,36 @@ export function setEmulatorData(itemId: string, data: EmulatorData): ArcadeActio
 }
 
 /** A game started under P1: one more on the tally — its own key, so a
- *  play counted as the owner edits the shelf reverts neither the edit nor
- *  the count. */
+ *  play counted as the owner changes the game reverts neither the change
+ *  nor the count. */
 export function countPlay(itemId: string): void {
   if (!iAmP1(itemId)) return;
   write(playsKey(itemId), { plays: bump(readPlays(itemId)) } satisfies PlaysRecord);
 }
 
+/** A built-in game started on the cabinet: the page that hosts it counts
+ *  it (there is no P1 seat — the shared game is its host's). */
+export function countBuiltInPlay(itemId: string): void {
+  if (!builtInEntry(readCuration(itemId).game)) return;
+  write(playsKey(itemId), { plays: bump(readPlays(itemId)) } satisfies PlaysRecord);
+}
+
 // ── Games: identity, lanes, parsing (pure) ───────────────────────────────────
 
-/** Stable identity of a game: the link, or — for a file on a player's disk —
- *  its name AND size, so two different ROMs that happen to share a name do
- *  not share an identity (the page keeps local files by this id). */
+/** Stable identity of a game: a built-in one's id, the link, or — for a
+ *  file on a player's disk — its name AND size, so two different ROMs that
+ *  happen to share a name do not share an identity (the page keeps local
+ *  files by this id). */
 export function gameId(g: ArcadeGame): string {
+  if (g.bundled) return `built-in:${g.bundled}`;
   return `${g.core}:${g.url || `file:${g.name}:${g.size}`}`;
 }
 
 export type ArcadeLane = 'SOVEREIGN' | 'CONVENIENCE';
 
-/** The lane badge: a file on the player's own disk, or a loopback URL (the
- *  node's own listener), is sovereign; anything fetched from the web is a
- *  convenience lane. */
+/** The lane badge: a built-in game (this app's own files), a file on the
+ *  player's own disk, or a loopback URL (the node's own listener), is
+ *  sovereign; anything fetched from the web is a convenience lane. */
 export function gameLane(g: ArcadeGame): ArcadeLane {
   if (!g.url) return 'SOVEREIGN';
   try {
@@ -643,22 +645,24 @@ export interface ArcadeScreenView {
 export function arcadeScreenView(itemId: string, now = clock()): ArcadeScreenView {
   const rec = readCabinet(itemId);
   const seat = readSeat(itemId);
-  const inPlay = seat.holder !== '' && !seatLapsed(itemId, now);
-  if (inPlay && rec.game) {
+  if (!rec.game) {
+    return { mode: 'empty', title: 'FURLONG ARCADE', line: 'THE OWNER PICKS A GAME', lane: '', blink: false, plays: rec.plays };
+  }
+  // A built-in game's picture is the shared game itself (arcadeNesSession
+  // paints over this card while one runs); P1's seat is EmulatorJS's.
+  const inPlay = !rec.game.bundled && seat.holder !== '' && !seatLapsed(itemId, now);
+  if (inPlay) {
     return {
-      mode: 'inplay', title: rec.game.name.toUpperCase(), line: `P1 · ${seat.name || 'a clone'}`,
+      mode: 'inplay', title: gameTitle(rec.game), line: `P1 · ${seat.name || 'a clone'}`,
       lane: gameLane(rec.game), blink: false, plays: rec.plays,
     };
-  }
-  if (!rec.game && rec.shelf.length === 0) {
-    return { mode: 'empty', title: 'FURLONG ARCADE', line: 'THE OWNER LOADS A GAME', lane: '', blink: false, plays: rec.plays };
   }
   const blink = Math.floor(now / ARCADE_BLINK_MS) % 2 === 0;
   return {
     mode: 'attract',
-    title: rec.game ? rec.game.name.toUpperCase() : `${rec.shelf.length} GAME${rec.shelf.length === 1 ? '' : 'S'} ON THE SHELF`,
-    line: 'INSERT COIN',
-    lane: rec.game ? gameLane(rec.game) : '',
+    title: gameTitle(rec.game),
+    line: rec.game.bundled ? 'PRESS START' : 'INSERT COIN',
+    lane: gameLane(rec.game),
     blink,
     plays: rec.plays,
   };

@@ -592,7 +592,7 @@ export interface CoinPusherVisualHandle {
  * 🕹️ The arcade cabinet's screen. The builder (furniture.ts) makes the
  * 512×480 canvas, its CanvasTexture and the painter, paints the attract card,
  * and stows this in the screen mesh's userData.arcadeCabinet. The focused
- * cabinet UI (arcadeCabinet.ts) paints the menu and the running game through
+ * cabinet UI (arcadeNesCabinet.ts) paints the menu and the running game through
  * `painter`, then calls present() to push the canvas to the texture.
  */
 export interface ArcadeCabinetVisualHandle {
