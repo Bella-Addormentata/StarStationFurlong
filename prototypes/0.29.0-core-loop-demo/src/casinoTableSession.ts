@@ -30,7 +30,7 @@
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips,
+  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readAllSeedRecords, readChips,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
@@ -1080,7 +1080,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     const forRound = s.round;
     const forEpoch = casinoDocEpoch();
-    const inFlight = JSON.stringify([forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null]);
+    // Everything the verdict reads goes in the key: a late reveal landing in a
+    // forfeited party's seed record can change "a revealed seed was left out".
+    const all = readAllSeedRecords(itemId);
+    const records = Object.keys(s.commits ?? {}).sort().map((pid) => all[pid] ?? null);
+    const inFlight = JSON.stringify([
+      forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null, s.unseeded ?? null, records,
+    ]);
     const v = verdicts.get(inFlight);
     if (v) return v;
     if (!verifying.has(inFlight)) {
@@ -1229,7 +1235,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  commitments), then settle as soon as the bettors have revealed. */
   const spinByHand = (): void => {
     const s = rouletteState();
-    if (!s || s.phase === 'settled') return;
+    // A manual table nobody has run yet: this press opens round 1, so its
+    // house commitment is out before a later press freezes the bets.
+    if (!s) {
+      openBetting(itemId, 1);
+      return;
+    }
+    if (s.phase === 'settled') return;
     if (s.phase === 'betting') closeBetting(itemId, s);
     const r = s.round;
     const epoch = casinoDocEpoch();
