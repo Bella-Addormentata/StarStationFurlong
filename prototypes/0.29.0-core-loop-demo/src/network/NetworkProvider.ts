@@ -313,8 +313,9 @@ export class NetworkProvider implements NetworkProviderPort {
    *  it already holds from `cap`, so nothing secret travels here.
    *
    *  Resolves once the request is on the wire; REJECTS when it never left
-   *  (no node connection, or the stream failed), so the caller can drop its
-   *  pending TAKE/GIVE instead of showing it until the timeout.
+   *  (no node connection, or the stream failed before the frame was written),
+   *  so the caller can drop its pending TAKE/GIVE at once. A failure AFTER the
+   *  write is indeterminate and resolves (see below).
    *
    *  The reply is accepted only while the transport this request went out on
    *  is still the live one: a stream of a session since left can outlive
@@ -343,7 +344,17 @@ export class NetworkProvider implements NetworkProviderPort {
       // One request per stream: close() sends FIN, so after its reply the node
       // finishes its side too and this stream ends instead of living (and
       // holding a node task) until disconnect — one leak per status poll.
-      await writer.close();
+      // The frame is on the wire once write() resolves, so a close() that fails
+      // (a reset while the FIN is in flight) is a failure of the stream's
+      // cleanup, not of the request: the node may well have read the frame and
+      // be acting on it. It is logged, the reply is still awaited, and the
+      // request is NOT reported as never sent — that would drop a pending
+      // TAKE/GIVE and invite a second one.
+      try {
+        await writer.close();
+      } catch (e) {
+        console.warn('Faucet request stream did not close cleanly (the node may still answer):', e);
+      }
       // The reply comes back on THIS stream, and only a reply is accepted from
       // it: the generic envelope path never sees it, and nothing that arrives
       // on a node-opened stream can pass for it. Bound to `wt`: the drain

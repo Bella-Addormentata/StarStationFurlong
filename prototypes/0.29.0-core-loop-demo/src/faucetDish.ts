@@ -49,6 +49,11 @@ export interface FaucetStatus {
   partial: boolean;
   /** Why take/give are off, in the node's words. */
   note: string;
+  /** A spend from our wallet is still settling (coins of ours are parked by a
+   *  push the chain and the mempool have not settled yet). */
+  spending: boolean;
+  /** A gift from the dish is still landing in our wallet. */
+  landing: boolean;
   /** The node's number for this snapshot. The node captures status snapshots
    *  one at a time and numbers them as they complete, so a higher number is a
    *  later look at the chain and the wallet whatever order the requests went
@@ -73,9 +78,6 @@ export type FaucetOp = 'status' | 'claim' | 'give';
 export const SECONDS_PER_BLOCK = 18.75;
 /** Coins (gift slots) at which the jar reads FULL. One lobby drip is one coin. */
 export const FULL_JAR_COINS = 8;
-/** A spend is "pending" until a status read shows it landed, or this long. */
-export const PENDING_TIMEOUT_MS = 120_000;
-
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
 /** A mojo total off the wire: a decimal string (the node's form; it sums coins
@@ -123,6 +125,8 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
     walletPartial: r.walletPartial === true,
     partial: r.partial === true,
     note: typeof r.note === 'string' ? r.note : '',
+    spending: r.spending === true,
+    landing: r.landing === true,
     snapshot: isNum(r.snapshot) && r.snapshot > 0 ? Math.floor(r.snapshot) : 0,
   };
 }
@@ -194,9 +198,13 @@ export function dishLine(status: FaucetStatus | null): string {
 
 // ── Per-room store: the last status the node sent, and in-flight spends ──────
 
+/** A TAKE or GIVE from the click until the node settles it (see setFaucetReply).
+ *  `floor` is the snapshot number of the first status captured AFTER the push
+ *  (the node sends it with the reply): a status numbered below it predates the
+ *  spend and says nothing about it. Null until the reply arrives. */
 interface Pending {
   op: FaucetOp;
-  since: number;
+  floor: number | null;
 }
 
 const latest = new Map<string, FaucetStatus>();
@@ -218,25 +226,34 @@ export function latestFaucetError(roomId: string): string | null {
   return lastError.get(roomId) ?? null;
 }
 
-/** A take or give is in flight (until a status shows it, or the timeout). */
-export function faucetPending(roomId: string, now: number = Date.now()): FaucetOp | null {
-  const p = pending.get(roomId);
-  if (!p) return null;
-  if (now - p.since > PENDING_TIMEOUT_MS) {
-    pending.delete(roomId);
-    return null;
-  }
-  return p.op;
+/** A take or give is in flight: from the click until the node reports it
+ *  settled (landed, dropped or refused). Never cleared on elapsed time: a
+ *  zero-fee spend can wait in the mempool for longer than any timeout, and a
+ *  GIVE button re-enabled by the clock while the first gift still waits would
+ *  invite a second one (#245 review, round 11). */
+export function faucetPending(roomId: string): FaucetOp | null {
+  return pending.get(roomId)?.op ?? null;
 }
 
-export function markFaucetPending(roomId: string, op: FaucetOp, now: number = Date.now()): void {
-  pending.set(roomId, { op, since: now });
+export function markFaucetPending(roomId: string, op: FaucetOp): void {
+  pending.set(roomId, { op, floor: null });
   notify();
 }
 
-/** File a reply from the node for `roomId`. A status replaces the last one and
- *  clears a pending spend once the wallet/jar shows it (claim: our wallet now
- *  holds a coin; give: fewer wallet mojos); an error is kept for the screen.
+/** File a reply from the node for `roomId`. A status replaces the last one; an
+ *  error is kept for the screen and drops a pending TAKE/GIVE (refused).
+ *
+ *  A pending TAKE/GIVE clears on what the node reports, not on the clock. The
+ *  take/give reply carries the first status captured after the push; from that
+ *  snapshot number on, a status that no longer shows the spend settling
+ *  (`spending` for a give, `landing` for a take) means the chain or the mempool
+ *  settled it — landed or dropped — and the action is over either way; a status
+ *  that shows the spend LANDED (take: our wallet holds a coin; give: fewer
+ *  wallet mojos) clears it whatever its number. A status numbered below the
+ *  reply's predates the push and is not read as "nothing in flight". Until the
+ *  reply arrives only a landing clears it; a reply lost with its stream keeps
+ *  the action pending until the spend lands or the room is left, rather than
+ *  risk a second gift.
  *
  *  Statuses are ordered by the node's snapshot number, not by request: the
  *  20 s and 60 s polls and the post-action read each run on their own stream,
@@ -259,16 +276,24 @@ export function setFaucetReply(roomId: string, reply: FaucetReply): void {
     latestSnapshot.set(roomId, reply.status.snapshot);
   }
   lastError.delete(roomId);
+  const p = pending.get(roomId);
+  if (p && p.op === reply.op && (reply.op === 'claim' || reply.op === 'give')) {
+    // The spend went out: statuses from the one captured after it count. An
+    // older node (or a failed read) sends none; then only a landing clears it.
+    p.floor = reply.status && reply.status.snapshot > 0 ? reply.status.snapshot : null;
+  }
   if (reply.status) {
+    const st = reply.status;
     const prev = latest.get(roomId);
-    latest.set(roomId, reply.status);
-    const p = pending.get(roomId);
-    if (p && prev) {
+    latest.set(roomId, st);
+    if (p) {
       const landed =
-        (p.op === 'claim' && (reply.status.walletMojos ?? 0n) > 0n) ||
-        (p.op === 'give' && reply.status.walletMojos !== null && prev.walletMojos !== null
-          && reply.status.walletMojos < prev.walletMojos);
-      if (landed) pending.delete(roomId);
+        (p.op === 'claim' && (st.walletMojos ?? 0n) > 0n) ||
+        (p.op === 'give' && prev !== undefined && st.walletMojos !== null && prev.walletMojos !== null
+          && st.walletMojos < prev.walletMojos);
+      const settling = p.op === 'claim' ? st.landing : st.spending;
+      const afterPush = p.floor !== null && st.snapshot >= p.floor;
+      if (landed || (afterPush && !settling)) pending.delete(roomId);
     }
   }
   notify();

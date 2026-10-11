@@ -204,6 +204,15 @@ pub struct FaucetStatus {
     pub partial: bool,
     /// Why claim/give are off, in the dish's words.
     pub note: String,
+    /// A spend FROM our wallet is still settling: some of the coins the chain
+    /// lists as ours are parked by a push the chain and the mempool have not
+    /// settled yet (see `chia_publish::WalletLease`). The browser keeps its
+    /// GIVING… pending while this holds and clears it from a later snapshot
+    /// that no longer says so, never on elapsed time (#245 review, round 11).
+    pub spending: bool,
+    /// A gift from the dish is still landing in our wallet (the faucet coin the
+    /// claim spent is parked): same for the browser's TAKING….
+    pub landing: bool,
     /// This snapshot's number: status reads are captured ONE AT A TIME (see
     /// `STATUS_TURN`) and numbered as they complete, so a higher number is a
     /// later look at the chain and the wallet whatever order the browser's
@@ -282,6 +291,8 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
         wallet_partial: false,
         partial,
         note: String::new(),
+        spending: false,
+        landing: false,
         snapshot: 0,
     }
 }
@@ -405,7 +416,23 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
         other => Err(anyhow!("unknown faucet op {other:?}")),
     };
     match result {
-        Ok(reply) => reply,
+        Ok(mut reply) => {
+            // A TAKE or GIVE that went out carries the first look AFTER its push
+            // (#245 review, round 11): captured under STATUS_TURN once the writer
+            // has let the wallet lease go, so it is numbered above every snapshot
+            // captured before the push, and the browser can tell a poll that
+            // predates the spend from one that reflects it. Its TAKING…/GIVING…
+            // then clears only from a snapshot numbered from this one on that
+            // shows the spend settled (or the gift landed). A status read that
+            // fails here leaves the reply without one; the polls follow.
+            if reply.ok && reply.status.is_none() && matches!(reply.op.as_str(), "claim" | "give") {
+                match status(ctx, &client, &params).await {
+                    Ok(st) => reply.status = Some(st),
+                    Err(e) => eprintln!("⛓️🥣 faucet: {} went out but the status read after it failed: {e:#}", reply.op),
+                }
+            }
+            reply
+        }
         Err(e) => FaucetReply::fail(&req.op, format!("{e:#}")),
     }
 }
@@ -442,6 +469,8 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
                 // chain lists it only once the block confirms).
                 let landing = crate::chia_publish::WALLET_LEASE.incoming_pending();
                 st.can_claim = wallet.owned.is_empty() && !landing && st.ready > 0;
+                st.spending = wallet.spendable.len() < wallet.owned.len();
+                st.landing = landing;
                 st.note = if wallet.owned.is_empty() && landing {
                     "your mojo from the dish is on its way (about a minute); the wallet shows it when the block lands".into()
                 } else if !wallet.owned.is_empty() && st.ready > 0 {
@@ -936,6 +965,7 @@ mod tests {
         assert!(json.contains("\"partial\":false") && json.contains("\"walletPartial\":false"));
         // Numbered only by `status` itself, as the snapshot completes.
         assert!(json.contains("\"snapshot\":0"), "{json}");
+        assert!(json.contains("\"spending\":false") && json.contains("\"landing\":false"), "{json}");
     }
 
     #[test]

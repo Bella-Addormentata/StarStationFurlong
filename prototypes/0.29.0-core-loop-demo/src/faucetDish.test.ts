@@ -34,6 +34,8 @@ const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
   walletPartial: false,
   partial: false,
   note: '',
+  spending: false,
+  landing: false,
   snapshot: 0,
   ...over,
 });
@@ -67,6 +69,9 @@ describe('faucet dish: node replies', () => {
     const older = wire() as Record<string, unknown>;
     delete older.walletPartial;
     expect(asFaucetStatus(older)?.walletPartial).toBe(false);
+    // The node's settling flags ride along; an older node that sends none reads as "nothing in flight".
+    expect(parseFaucetReply(b64({ op: 'status', ok: true, status: wire({ spending: true, landing: true }) }))?.status).toMatchObject({ spending: true, landing: true });
+    expect(asFaucetStatus(older)).toMatchObject({ spending: false, landing: false });
     // The node's snapshot number rides along; an older node that sends none orders nothing (0).
     expect(parseFaucetReply(b64({ op: 'status', ok: true, status: wire({ snapshot: 12 }) }))?.status?.snapshot).toBe(12);
     delete older.snapshot;
@@ -148,35 +153,68 @@ describe('faucet dish: what it shows', () => {
 });
 
 describe('faucet dish: per-room store', () => {
-  it('files statuses and clears a pending take once the wallet holds a coin', () => {
+  it('keeps a pending take until the node reports the gift landed or the claim settled, never on the clock', () => {
     const room = 'home-store-1';
     clearFaucetRoom(room);
     expect(latestFaucetStatus(room)).toBeNull();
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true }) });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true, snapshot: 4 }) });
     expect(latestFaucetStatus(room)?.canClaim).toBe(true);
-    markFaucetPending(room, 'claim', 1_000);
-    expect(faucetPending(room, 2_000)).toBe('claim');
-    // A status that still shows an empty wallet keeps the take pending…
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n }) });
-    expect(faucetPending(room, 3_000)).toBe('claim');
-    // …the one that shows the mojo landed clears it.
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 1n, ready: 0 }) });
-    expect(faucetPending(room, 4_000)).toBeNull();
+    markFaucetPending(room, 'claim');
+    expect(faucetPending(room)).toBe('claim');
+    // A poll captured BEFORE the push (numbered below the reply's) answers late
+    // with nothing in flight: it says nothing about the claim, so it stays.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, snapshot: 5 }) });
+    expect(faucetPending(room)).toBe('claim');
+    // The claim reply carries the first look after the push: the gift is landing.
+    setFaucetReply(room, { op: 'claim', ok: true, spentCoin: 'ab'.repeat(32), status: status({ walletMojos: 0n, landing: true, canClaim: false, snapshot: 6 }) });
+    expect(faucetPending(room)).toBe('claim');
+    // Still landing an hour of polls later: still pending (no timeout).
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, landing: true, snapshot: 200 }) });
+    expect(faucetPending(room)).toBe('claim');
+    // The snapshot that shows the mojo landed clears it.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 1n, ready: 0, snapshot: 201 }) });
+    expect(faucetPending(room)).toBeNull();
+    // A claim the chain DROPPED: the wallet is still empty, nothing is landing
+    // any more — the action is over and the dish may be asked again.
+    markFaucetPending(room, 'claim');
+    setFaucetReply(room, { op: 'claim', ok: true, status: status({ walletMojos: 0n, landing: true, snapshot: 202 }) });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, landing: false, canClaim: true, snapshot: 203 }) });
+    expect(faucetPending(room)).toBeNull();
     clearFaucetRoom(room);
   });
 
-  it('clears a pending give when the wallet shrinks, drops it on a refusal, and times out', () => {
+  it('keeps a pending give while the node says the spend is settling, clears it when settled or refused', () => {
     const room = 'home-store-2';
     clearFaucetRoom(room);
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n }) });
-    markFaucetPending(room, 'give', 10_000);
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n }) });
-    expect(faucetPending(room, 11_000)).toBeNull();
-    markFaucetPending(room, 'give', 20_000);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 10 }) });
+    markFaucetPending(room, 'give');
+    // The give reply: coins parked, the spend settling.
+    setFaucetReply(room, { op: 'give', ok: true, spentCoin: 'cd'.repeat(32), status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 11 }) });
+    expect(faucetPending(room)).toBe('give');
+    // Polls that still see it settling keep it, however many.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 12 }) });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 90 }) });
+    expect(faucetPending(room)).toBe('give');
+    // Landed: fewer mojos, nothing settling.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 91 }) });
+    expect(faucetPending(room)).toBeNull();
+    // Dropped: the balance is back in full and nothing is settling — over too.
+    markFaucetPending(room, 'give');
+    setFaucetReply(room, { op: 'give', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 0n, spending: true, snapshot: 92 }) });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 93 }) });
+    expect(faucetPending(room)).toBeNull();
+    // Before the reply arrives, a poll showing nothing in flight is not trusted
+    // (it may predate the push); only the reply or a landing clears it.
+    markFaucetPending(room, 'give');
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 94 }) });
+    expect(faucetPending(room)).toBe('give');
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 3_000n, walletSpendableMojos: 3_000n, snapshot: 95 }) });
+    expect(faucetPending(room)).toBeNull();
+    // Refused: dropped at once, and the screen keeps the reason.
+    markFaucetPending(room, 'give');
     setFaucetReply(room, { op: 'give', ok: false, error: 'your wallet is empty' });
-    expect(faucetPending(room, 21_000)).toBeNull();
-    markFaucetPending(room, 'claim', 30_000);
-    expect(faucetPending(room, 30_000 + 120_001)).toBeNull();
+    expect(faucetPending(room)).toBeNull();
+    expect(latestFaucetError(room)).toBe('your wallet is empty');
     clearFaucetRoom(room);
   });
 
@@ -201,10 +239,10 @@ describe('faucet dish: per-room store', () => {
   it('drops a pending take at once when the request never reached the node, and says why', () => {
     const room = 'home-store-3';
     clearFaucetRoom(room);
-    markFaucetPending(room, 'claim', 1_000);
-    expect(faucetPending(room, 2_000)).toBe('claim');
+    markFaucetPending(room, 'claim');
+    expect(faucetPending(room)).toBe('claim');
     failFaucetRequest(room, 'claim', new Error('no connection to your node'));
-    expect(faucetPending(room, 2_000)).toBeNull();
+    expect(faucetPending(room)).toBeNull();
     expect(latestFaucetError(room)).toBe('the request did not reach your node (no connection to your node)');
     // A status that does arrive later clears the error.
     setFaucetReply(room, { op: 'status', ok: true, status: status() });

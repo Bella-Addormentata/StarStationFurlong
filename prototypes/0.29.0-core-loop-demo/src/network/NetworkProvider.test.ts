@@ -61,6 +61,8 @@ const faucetEnvelope = (reply: object, kind = 'faucet') => ({
 class FakeBiStream {
   written: Uint8Array[] = [];
   closed = false;
+  /** Make close() reject, as a stream reset while the FIN is in flight does. */
+  closeFails = false;
   readable: ReadableStream<Uint8Array>;
   writable: WritableStream<Uint8Array>;
   #push!: ReadableStreamDefaultController<Uint8Array>;
@@ -77,6 +79,7 @@ class FakeBiStream {
       },
       close: () => {
         this.closed = true;
+        if (this.closeFails) throw new Error('stream reset');
       },
     });
   }
@@ -201,6 +204,7 @@ function queueTransports(...fakes: FakeTransport[]): void {
 beforeEach(() => {
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
 afterEach(() => {
@@ -477,6 +481,38 @@ describe('NetworkProvider — the faucet request stream', () => {
     // Both went down the generic path (where main.ts ignores `faucet`); none was a reply.
     expect(envelopes.map((e) => e.kind)).toEqual(['faucet', 'bridge']);
     expect(replies).toHaveLength(0);
+    await provider.disconnect();
+  });
+
+  it('does not report a request as unsent when only the close after the write fails, and still takes the reply', async () => {
+    const wt = new FakeTransport();
+    wt.acceptHandshake();
+    queueTransports(wt);
+    const provider = new NetworkProvider();
+    const replies: unknown[] = [];
+    provider.onFaucetReply((env) => {
+      replies.push(env);
+    });
+    await provider.connect(BOOT);
+    // The provider's next stream will take the frame but fail to close.
+    const real = wt.createBidirectionalStream.bind(wt);
+    wt.createBidirectionalStream = async () => {
+      const stream = await real();
+      stream.closeFails = true;
+      return stream;
+    };
+    // The frame went out, so the node may be acting on it: this must RESOLVE
+    // (a rejection would drop the pending GIVE and invite a second one)…
+    await expect(provider.requestFaucet('give', 1000)).resolves.toBeUndefined();
+    const stream = wt.opened[0];
+    expect(unframe(stream.written)).toHaveLength(1);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('did not close cleanly'), expect.anything());
+    // …and the reply on that stream is still taken.
+    const reply = faucetEnvelope({ op: 'give', ok: true, spentCoin: 'ef'.repeat(32) });
+    stream.reply(reply);
+    stream.end();
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    expect(replies[0]).toEqual(reply);
     await provider.disconnect();
   });
 
