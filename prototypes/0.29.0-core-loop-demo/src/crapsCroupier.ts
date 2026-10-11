@@ -138,7 +138,7 @@ export function openCrapsBetting(
     payouts: null,
     ...(shooter !== undefined ? { shooter } : {}),
     ...(lastShooter !== undefined ? { lastShooter } : {}),
-    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit() } : {}),
+    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
   });
 }
 

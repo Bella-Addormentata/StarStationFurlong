@@ -117,7 +117,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   let result: number;
   let fairness: FairnessTranscript | undefined;
   let forfeited: string[] = [];
-  if (isFairTable(tableId)) {
+  // A round opened Fair (it carries a house commit) settles Fair, whatever the
+  // owner switched the table to since; the switch takes effect next round.
+  if (closing.houseCommit) {
     const gathered = gatherRound(tableId, closing);
     if (!gathered) return; // reveals still due
     forfeited = gathered.forfeited;
@@ -170,7 +172,7 @@ export function openBetting(tableId: string, round: number): void {
     result: null,
     resultAt: 0,
     payouts: null,
-    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit() } : {}),
+    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
   });
 }
 

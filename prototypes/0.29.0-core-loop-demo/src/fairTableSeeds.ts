@@ -28,8 +28,10 @@
  * the room doc is flagged too — the operator must not drop a seed it saw.
  *
  * Seeds survive a reload in localStorage (keyed by commitment), so a refreshed
- * page can still reveal. SHA-256 here is @noble/hashes (sync), producing the
- * very same commitment as fairDice.commitToSeed (SubtleCrypto, async).
+ * page can still reveal. Each commitment is bound to its table, round, party
+ * and (for a bettor) the house commit (diceFairness.tableCommitMessage), so a
+ * revealed seed can't be replayed into another round. SHA-256 here is
+ * @noble/hashes (sync), the same bytes as diceFairness.commitTableSeed.
  */
 
 import { sha256 } from '@noble/hashes/sha256';
@@ -48,8 +50,8 @@ import {
 import { HOUSE_PARTY } from './games/craps';
 import type { CrapsTableState, FairnessTranscript } from './games/craps';
 import type { RouletteTableState } from './games/roulette';
-import { getCrapsFairnessMode, verifyParties } from './games/diceFairness';
-import type { RoundParty, TableGame } from './games/diceFairness';
+import { getCrapsFairnessMode, tableCommitMessage, verifyParties } from './games/diceFairness';
+import type { RoundParty, TableGame, TableSeedContext } from './games/diceFairness';
 import { randomSeedHex } from './games/fairDice';
 
 /** How long the settle waits for frozen parties' reveals once it is due. */
@@ -72,9 +74,9 @@ export function isFairTable(tableId: string): boolean {
 
 // ── Commitments + local seed keeping ─────────────────────────────────────────
 
-/** Same bytes as fairDice.commitToSeed, synchronously. */
-export function commitSeedSync(seed: string): string {
-  return bytesToHex(sha256(new TextEncoder().encode(`ssf-craps-commit-v1|${seed}`)));
+/** Same bytes as diceFairness.commitTableSeed, synchronously. */
+export function commitSeedSync(seed: string, ctx: TableSeedContext): string {
+  return bytesToHex(sha256(new TextEncoder().encode(tableCommitMessage(seed, ctx))));
 }
 
 const SEED_STORE_PREFIX = 'ssf-fair-seed:';
@@ -90,13 +92,14 @@ function keepSeed(commit: string, seed: string): void {
   }
 }
 
-/** The secret behind `commit`, if THIS device made it. */
-function seedFor(commit: string): string | null {
+/** The secret behind `commit`, if THIS device made it (checked against the
+ *  commitment, so a stale or edited store entry is never revealed). */
+function seedFor(commit: string, ctx: TableSeedContext): string | null {
   const mem = memSeeds.get(commit);
   if (mem) return mem;
   try {
     const stored = localStorage.getItem(SEED_STORE_PREFIX + commit);
-    if (stored && commitSeedSync(stored) === commit) return stored;
+    if (stored && commitSeedSync(stored, ctx) === commit) return stored;
   } catch {
     // Unreadable storage ⇒ the seed is simply gone.
   }
@@ -112,13 +115,21 @@ function forgetSeed(commit: string): void {
   }
 }
 
-/** A fresh house seed for a round about to open: kept on this device, its
+/** A fresh house seed for `round` about to open: kept on this device, its
  *  commitment returned for the table state. */
-export function newHouseCommit(): string {
+export function newHouseCommit(tableId: string, round: number): string {
   const seed = randomSeedHex();
-  const commit = commitSeedSync(seed);
+  const commit = commitSeedSync(seed, houseCtx(tableId, round));
   keepSeed(commit, seed);
   return commit;
+}
+
+function houseCtx(table: string, round: number): TableSeedContext {
+  return { table, round, party: HOUSE_PARTY, house: '' };
+}
+
+function bettorCtx(table: string, s: TableState, pid: string): TableSeedContext {
+  return { table, round: s.round, party: pid, house: s.houseCommit ?? '' };
 }
 
 // ── Who has a stake ──────────────────────────────────────────────────────────
@@ -155,13 +166,13 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
     if (rec && rec.round === s.round && rec.house === s.houseCommit) return;
     if (!stakedPlayers(tableId, game, s.round).has(me)) return;
     const seed = randomSeedHex();
-    const commit = commitSeedSync(seed);
+    const commit = commitSeedSync(seed, bettorCtx(tableId, s, me));
     keepSeed(commit, seed);
     writeMySeedRecord(tableId, me, { round: s.round, house: s.houseCommit, commit });
   } else if (s.phase === 'closing') {
     const frozen = s.commits?.[me];
     if (!frozen || !rec || rec.commit !== frozen || rec.round !== s.round || rec.seed) return;
-    const seed = seedFor(frozen);
+    const seed = seedFor(frozen, bettorCtx(tableId, s, me));
     if (seed) writeMySeedRecord(tableId, me, { ...rec, seed });
   } else if (rec?.seed && rec.round === s.round) {
     // Settled: the seed is public now — no need to keep it.
@@ -212,13 +223,13 @@ export function gatherRound(tableId: string, s: TableState, now = Date.now()): G
   const parties: RoundParty[] = [{
     id: HOUSE_PARTY,
     commit: houseCommit,
-    seed: houseCommit ? seedFor(houseCommit) : null,
+    seed: houseCommit ? seedFor(houseCommit, houseCtx(tableId, s.round)) : null,
   }];
   const forfeited: string[] = [];
   for (const [pid, commit] of Object.entries(s.commits ?? {})) {
     const r = readSeedRecord(tableId, pid);
     const seed = r && r.round === s.round && r.commit === commit && r.seed
-      && commitSeedSync(r.seed) === commit ? r.seed : null;
+      && commitSeedSync(r.seed, bettorCtx(tableId, s, pid)) === commit ? r.seed : null;
     if (!seed) {
       if (!graceOver) return null;
       forfeited.push(pid);
@@ -267,7 +278,7 @@ export async function verifySettledRound(
   const forfeited = bettors.filter((_, i) => t.seeds![i + 1] === '');
   const droppedReveal = forfeited.some((pid) => {
     const r = readSeedRecord(tableId, pid);
-    return !!r?.seed && r.round === s.round && commitSeedSync(r.seed) === frozen[pid];
+    return !!r?.seed && r.round === s.round && commitSeedSync(r.seed, bettorCtx(tableId, s, pid)) === frozen[pid];
   });
   return { kind: 'verified', forfeited, houseMissing: t.seeds[0] === '', droppedReveal };
 }

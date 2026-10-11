@@ -903,6 +903,12 @@ function buildFairPlaque(ctx: PiecesCtx, b: { x: number; z: number; r: number },
   const c = fairPlaqueCentre(b, at);
   const mesh = ctx.place(geo, fairMat, c.x, FELT_Y + 0.002, c.z);
   let shown = true;
+  // World's teardown frees the material on the mesh; free the spare too.
+  mesh.userData.disposePlaqueSpare = () => {
+    const spare = mesh.material === fairMat ? friendlyMat : fairMat;
+    spare.map?.dispose();
+    spare.dispose();
+  };
   return {
     set(fair) {
       if (fair === shown) return;

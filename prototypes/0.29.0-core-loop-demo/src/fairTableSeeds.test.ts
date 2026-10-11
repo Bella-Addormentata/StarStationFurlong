@@ -15,12 +15,13 @@ const {
   readTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyBets, writeMyCrapsBets,
   writeMySeedRecord, writeTableState,
 } = await import('./casinoDoc');
-const { BET_WINDOW_MS, CLOSING_MS, setSoleCroupierPredicate, tickAutoCroupier } = await import('./croupier');
+const { BET_WINDOW_MS, CLOSING_MS, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier } = await import('./croupier');
 const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, tickAutoStickman } = await import('./crapsCroupier');
 const {
   commitSeedSync, isFairTable, REVEAL_GRACE_MS, tickFairSeeds, verifySettledRound,
 } = await import('./fairTableSeeds');
-const { commitToSeed, pocketFromMaterial } = await import('./games/fairDice');
+const { pocketFromMaterial } = await import('./games/fairDice');
+const { commitTableSeed } = await import('./games/diceFairness');
 type RouletteTableState = import('./games/roulette').RouletteTableState;
 type CrapsTableState = import('./games/craps').CrapsTableState;
 
@@ -67,7 +68,17 @@ afterEach(() => {
 describe('commitments and the wheel', () => {
   it('the sync commitment matches the async one byte for byte', async () => {
     const seed = 'ab'.repeat(32);
-    expect(commitSeedSync(seed)).toBe(await commitToSeed(seed));
+    const ctx = { table: 't', round: 3, party: AMY, house: 'c'.repeat(64) };
+    expect(commitSeedSync(seed, ctx)).toBe(await commitTableSeed(seed, ctx));
+  });
+
+  it('binds a commitment to its table, round, party and house commit', () => {
+    const seed = 'ab'.repeat(32);
+    const ctx = { table: 't', round: 3, party: AMY, house: 'c'.repeat(64) };
+    const c = commitSeedSync(seed, ctx);
+    for (const other of [
+      { ...ctx, table: 'u' }, { ...ctx, round: 4 }, { ...ctx, party: BOB }, { ...ctx, house: 'd'.repeat(64) },
+    ]) expect(commitSeedSync(seed, other)).not.toBe(c);
   });
 
   it('a pocket is always 0–36, and every pocket comes up', async () => {
@@ -180,6 +191,58 @@ describe('a Fair roulette round', () => {
       fairness: { ...f, parties: f.parties!.slice(0, 2), commits: f.commits!.slice(0, 2), seeds: f.seeds!.slice(0, 2) },
     };
     expect((await verifySettledRound('roulette', t, dropped, { pocket: s.result! })).kind).toBe('failed');
+  });
+
+  it("a seed revealed last round can't be replayed as this round's", async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const r1 = readTableState(t)!;
+    const bobSeed = r1.fairness!.seeds![2];
+    const bobCommit = r1.fairness!.commits![2];
+    later(SHOW_MS);
+    tickAutoCroupier(t); // round 2 opens
+    const r2 = readTableState(t)!;
+    writeMyBets(t, AMY, 2, [{ type: 'red', amount: 10 }]);
+    writeMyBets(t, BOB, 2, [{ type: 'black', amount: 10 }]);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette', [AMY]);
+    // Bob's client replays round 1's public commit + seed instead of a fresh one.
+    writeMySeedRecord(t, BOB, { round: 2, house: r2.houseCommit!, commit: bobCommit });
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    expect(readTableState(t)?.commits?.[BOB]).toBe(bobCommit);
+    playersLook(t, 'roulette', [AMY]);
+    writeMySeedRecord(t, BOB, { round: 2, house: r2.houseCommit!, commit: bobCommit, seed: bobSeed });
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    later(REVEAL_GRACE_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    // The old seed doesn't open a round-2 commitment: Bob counts as withheld.
+    expect(s.fairness?.seeds?.[s.fairness.parties!.indexOf(BOB)]).toBe('');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+  });
+
+  it('a round opened Fair settles Fair even if the owner switches to RNG mid-round', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    writeCrapsFairnessPref(t, 'rng');
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.fairness?.parties).toEqual(['house', AMY, BOB]);
+    later(SHOW_MS);
+    tickAutoCroupier(t); // the next round opens as RNG
+    expect(readTableState(t)?.houseCommit).toBeUndefined();
   });
 
   it('a bettor who joins after "no more bets" is not a party', () => {

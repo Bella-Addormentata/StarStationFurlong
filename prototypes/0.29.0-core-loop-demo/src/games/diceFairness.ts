@@ -206,9 +206,28 @@ export function combinePocketSeeds(seeds: string[], table: string, round: number
   return pocketFromMaterial(`ssf-roulette-combine-v1|${ordered.join('|')}|${table}|${round}`);
 }
 
-/** The same commitment the dice use, for any table seed (house or bettor). */
-export function commitTableSeed(seed: string): Promise<string> {
-  return commitToSeed(seed);
+/** Who a table-seed commitment belongs to, and where: the table, the round,
+ *  the party ('house' or a player id) and — for a bettor — the house commit
+ *  it answers ('' for the house's own). Hashed into the commitment, so a seed
+ *  revealed in one round can never be replayed as fresh entropy in another,
+ *  by another party, or against another house commit. */
+export interface TableSeedContext {
+  table: string;
+  round: number;
+  party: string;
+  house: string;
+}
+
+/** The exact message a table-seed commitment hashes. */
+export function tableCommitMessage(seed: string, ctx: TableSeedContext): string {
+  return `ssf-table-commit-v2|${ctx.table}|${ctx.round}|${ctx.party}|${ctx.house}|${seed}`;
+}
+
+/** A table seed's commitment (async SubtleCrypto; fairTableSeeds has the
+ *  sync twin for the live exchange). */
+export async function commitTableSeed(seed: string, ctx: TableSeedContext): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(tableCommitMessage(seed, ctx)));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /** Mix the revealed seeds of `parties` into the round's outcome and its public
@@ -251,7 +270,8 @@ export async function verifyParties(
   const revealed: string[] = [];
   for (let i = 0; i < parties.length; i++) {
     if (seeds[i] === '') continue;
-    if ((await commitToSeed(seeds[i])) !== commits[i]) return false;
+    const ctx = { table, round, party: parties[i], house: i === 0 ? '' : commits[0] };
+    if ((await commitTableSeed(seeds[i], ctx)) !== commits[i]) return false;
     revealed.push(seeds[i]);
   }
   if (revealed.length === 0) return false;

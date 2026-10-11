@@ -1084,7 +1084,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           if (r.kind === 'failed') return { text: `✗ ${what} · CHECK FAILED`, color: '#FF8A80' };
           if (r.kind === 'unproven') return { text: `⚠ ${what} · UNPROVEN`, color: '#F5C26B' };
           const n = r.forfeited.length;
-          const parts = [`🔒 ${what} · ✓ VERIFIED · ${fx.parties!.length - n} SEEDS MIXED`];
+          const mixed = fx.seeds!.filter((x) => x !== '').length;
+          const parts = [`🔒 ${what} · ✓ VERIFIED · ${mixed} SEED${mixed === 1 ? '' : 'S'} MIXED`];
           if (n > 0) parts.push(`${n} WITHHELD (BETS FORFEITED)`);
           if (r.houseMissing) parts.push('⚠ HOUSE SEED MISSING');
           if (r.droppedReveal) parts.push('✗ A REVEALED SEED WAS LEFT OUT');

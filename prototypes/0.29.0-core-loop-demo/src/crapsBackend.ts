@@ -95,7 +95,9 @@ class LocalCrapsBackend implements CrapsBackend {
     let transcript: FairnessTranscript | undefined;
     let forfeited: string[] = [];
     const closing = readCrapsTableState(tableId);
-    if (mode === 'multiparty' && closing?.phase === 'closing' && closing.round === round) {
+    // A roll opened Fair (it carries a house commit) settles Fair, whatever the
+    // owner switched the table to since; the switch takes effect next window.
+    if (closing?.houseCommit && closing.phase === 'closing' && closing.round === round) {
       // ⚖️ The live Fair roll: the house seed + every frozen bettor's reveal.
       const gathered = gatherRound(tableId, closing);
       if (!gathered) return null; // reveals still due
@@ -107,7 +109,9 @@ class LocalCrapsBackend implements CrapsBackend {
         ? { dice: mixed.dice, transcript: mixed.transcript }
         : await produceRoll('rng', tableId, round));
     } else {
-      ({ dice, transcript } = await produceRoll(mode, tableId, round));
+      // Switched to Fair mid-window: no house commit to settle against, so
+      // this one roll is plain RNG (and shows unproven).
+      ({ dice, transcript } = await produceRoll(mode === 'multiparty' ? 'rng' : mode, tableId, round));
     }
     // The hashing yielded — the table may have been REMOVED meanwhile
     // (closeCrapsTable refunded every felt and wiped the table keys, #87
