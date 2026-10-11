@@ -484,8 +484,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       windowRound = saved.round;
     }
   }
-  /** round → verdict line of the fairness check, so the card never re-hashes. */
-  const verdicts = new Map<number, { text: string; color: string }>();
+  /** Fingerprint of a settled result (epoch, round, outcome, transcript and
+   *  commitments) → its check's verdict line: the card re-hashes only when
+   *  something it checked changes, never shows a stale verdict if it does. */
+  const verdicts = new Map<string, { text: string; color: string }>();
   /** `epoch:round` checks in flight, so re-renders don't start them again. */
   const verifying = new Set<string>();
   /** The room doc this focus began in: rounds and bets from another room's
@@ -643,8 +645,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
     writeBets([...mine, ...placed]);
-    if (!isFairTable(itemId) && !friendlyWarned.has(itemId)) {
-      friendlyWarned.add(itemId);
+    const warnKey = `${casinoDocEpoch()}:${itemId}`;
+    if (!isFairTable(itemId) && !friendlyWarned.has(warnKey)) {
+      friendlyWarned.add(warnKey);
       say("🤝 FRIENDLY TABLE — THE OWNER COULD STEER RESULTS · BET WITH PEOPLE YOU TRUST");
     }
     const key = spotKey(rg.bet);
@@ -1059,7 +1062,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     `<button data-act="${id}" ${enabled ? '' : 'disabled'} style="padding:6px 10px;background:rgba(212,168,75,${enabled ? 0.12 : 0.04});border:1px solid rgba(212,168,75,${enabled ? 0.5 : 0.18});border-radius:6px;color:${enabled ? GOLD_BRIGHT : DIM};font:inherit;font-size:10px;font-weight:800;letter-spacing:1.2px;cursor:${enabled ? 'pointer' : 'not-allowed'};">${label}</button>`;
 
   /** The card's line for the last settled result's fairness check (async the
-   *  first time; cached per round). null when there is nothing to check. */
+   *  first time; cached per checked content). null when there is nothing to check. */
   const lastResultCheck = (): { text: string; color: string } | null => {
     const cs = game === 'craps' ? crapsState() : null;
     const rs = game === 'roulette' ? rouletteState() : null;
@@ -1072,11 +1075,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (!fx) {
       return s.houseCommit ? { text: `⚠ ${what} · UNPROVEN (NO SEEDS WERE REVEALED)`, color: '#F5C26B' } : null;
     }
-    const v = verdicts.get(s.round);
-    if (v) return v;
     const forRound = s.round;
     const forEpoch = casinoDocEpoch();
-    const inFlight = `${forEpoch}:${forRound}`;
+    const inFlight = JSON.stringify([forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null]);
+    const v = verdicts.get(inFlight);
+    if (v) return v;
     if (!verifying.has(inFlight)) {
       verifying.add(inFlight);
       const check: Promise<{ text: string; color: string }> = fx.parties
@@ -1103,7 +1106,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         // A check started in another room's doc says nothing about this one.
         if (forEpoch !== casinoDocEpoch()) return;
         if (verdicts.size > 32) verdicts.clear();
-        verdicts.set(forRound, line);
+        verdicts.set(inFlight, line);
         renderCard();
       }, () => verifying.delete(inFlight));
     }

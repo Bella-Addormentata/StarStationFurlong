@@ -42,6 +42,8 @@ import {
   readAllCrapsBets,
   readAllSeedRecords,
   readCrapsFairnessPref,
+  readMyBets,
+  readMyCrapsBets,
   readCrapsTableState,
   readSeedRecord,
   readTableState,
@@ -164,7 +166,9 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
   const rec = readSeedRecord(tableId, me);
   if (s.phase === 'betting') {
     if (rec && rec.round === s.round && rec.house === s.houseCommit) return;
-    if (!stakedPlayers(tableId, game, s.round).has(me)) return;
+    // O(1) look at my own bets: this runs for every table, several times a second.
+    const mine = game === 'craps' ? readMyCrapsBets(tableId, me) : readMyBets(tableId, me, s.round);
+    if (mine.length === 0) return;
     const seed = randomSeedHex();
     const commit = commitSeedSync(seed, bettorCtx(tableId, s, me));
     keepSeed(commit, seed);
