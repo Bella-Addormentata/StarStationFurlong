@@ -303,7 +303,7 @@ function stationFliesFree(stationId: string, now: number): boolean {
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -477,6 +477,35 @@ export interface AirHockeyVisualHandle {
   /** Strobe the scored-on goal lamp; decays inside update(dt). */
   flashGoal(side: 'a' | 'b'): void;
   /** Per-frame animation (goal flash, mallet hover ease). World drives this. */
+  update(dt: number): void;
+}
+
+// ── 🐊 Insatiable-alligators table handle (#185 — shared with the builder) ──
+
+/**
+ * Handle onto an insatiable-alligators table's animated pieces: eight heads
+ * on the rim, the balls, the spinning table top, the eight birds and their
+ * counter displays. The builder (furniture.ts) stows it in the felt mesh's
+ * userData.alligators; World collects it and hands it to alligatorsSession,
+ * which drives every piece for EVERYONE (the diegetic-display rule — the
+ * air-hockey handle's contract). All coordinates are LOCAL table space.
+ */
+export interface AlligatorsVisualHandle {
+  /** Place seat `seat`'s head. `raised` false folds it away under the table
+   *  (issue #185: heads fold up only when a player joins); `swing` (rad) and
+   *  `ext` (lunge, m) follow games/alligators.ts headDir/mouthOf; `jawOpen`
+   *  is 1 open … 0 shut on the table. */
+  setHead(seat: number, raised: boolean, swing: number, ext: number, jawOpen: number): void;
+  /** Place ball `index` (hidden when not visible: unlaid, eaten, no round). */
+  setBall(index: number, x: number, z: number, visible: boolean): void;
+  /** Turn the table top (rad) — the every-10-seconds spin. */
+  setSpin(angle: number): void;
+  /** Redraw seat `seat`'s counter (deduped): `lit` while the seat is played,
+   *  `flashing` for a round's winner. */
+  setDisplay(seat: number, count: number, lit: boolean, flashing: boolean): void;
+  /** Bird `bird` lays an egg — a squat-and-pop animation, decayed in update. */
+  layEgg(bird: number): void;
+  /** Per-frame animation (fold ease, bird squats, display flash). */
   update(dt: number): void;
 }
 
@@ -1829,7 +1858,8 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     // air-hockey UI writes only under its own table's item id, so this can
     // only be a malformed/hostile peer write. No participants are derivable
     // for a game this table can't host: let ANYONE clear it (unwedge rule).
-    if (t.kind === 'airhockey') return true;
+    // 🐊 Insatiable alligators (#185) is foreign here the same way.
+    if (t.kind === 'airhockey' || t.kind === 'alligators') return true;
     const s = t.state;
     if (s.status !== 'waiting' && s.status !== 'playing') return true;
     if (s.bot) return true;
@@ -2067,8 +2097,8 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
         </div>`;
     } else {
-      // 🏒 Foreign state: an air-hockey record under this GAME TABLE's key.
-      // The air-hockey UI writes only under its own table's item id, so this
+      // 🏒 Foreign state: an air-hockey (or 🐊 alligators) record under this
+      // GAME TABLE's key. Those UIs write only under their own table's id, so this
       // can only come from a malformed or hostile peer write. Render a
       // recovery strip instead of wedging — RESET (enabled for anyone via
       // canClearTable's airhockey arm) clears it back to the game picker.
@@ -2076,7 +2106,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:#FF6E40;">UNRECOGNISED TABLE STATE</div>
         <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.6;">
           This table's synced entry holds a game this surface can't host
-          (air hockey). RESET clears it back to the game menu.
+          (${table.kind === 'airhockey' ? 'air hockey' : 'insatiable alligators'}). RESET clears it back to the game menu.
         </div>
         <div style="display:flex; gap:8px; justify-content:flex-end;">
           ${btn('gt-reset', 'RESET', !canClearTable(), 'Clear the table (back to the game menu)')}

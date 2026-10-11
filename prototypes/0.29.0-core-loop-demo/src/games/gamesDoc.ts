@@ -28,16 +28,20 @@ import { isChessState } from './chess';
 import type { ChessState } from './chess';
 import { isAirHockeyState } from './airHockey';
 import type { AirHockeyState } from './airHockey';
+import { isAlligatorsState } from './alligators';
+import type { AlligatorsState } from './alligators';
 import type { RoomOwnerKey } from '../treasuryView';
 
-/** A table hosts ONE game at a time. Chess states carry `kind: 'chess'` and
- *  air hockey `kind: 'airhockey'` (#115 — its own furniture, same map);
+/** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`,
+ *  air hockey `kind: 'airhockey'` (#115) and insatiable alligators
+ *  `kind: 'alligators'` (#185) — each its own furniture, same map;
  *  legacy checkers states are kind-less (isCheckersState identifies them) —
  *  the additive discriminator keeps every pre-chess doc entry working. */
 export type TableGame =
   | { kind: 'checkers'; state: CheckersState }
   | { kind: 'chess'; state: ChessState }
-  | { kind: 'airhockey'; state: AirHockeyState };
+  | { kind: 'airhockey'; state: AirHockeyState }
+  | { kind: 'alligators'; state: AlligatorsState };
 
 let boundDoc: Y.Doc | null = null;
 let gamesMap: Y.Map<unknown> | null = null;
@@ -102,6 +106,7 @@ export function readGame(tableId: string): CheckersState | null {
 export function readTable(tableId: string): TableGame | null {
   const value = ensureMap().get(tableId);
   if (isAirHockeyState(value)) return { kind: 'airhockey', state: value };
+  if (isAlligatorsState(value)) return { kind: 'alligators', state: value };
   if (isChessState(value)) return { kind: 'chess', state: value };
   if (isCheckersState(value)) return { kind: 'checkers', state: value };
   return null;
@@ -113,8 +118,17 @@ export function readAirHockey(tableId: string): AirHockeyState | null {
   return isAirHockeyState(value) ? value : null;
 }
 
+/** Insatiable-alligators read for one table (#185) — null for other/absent games. */
+export function readAlligators(tableId: string): AlligatorsState | null {
+  const value = ensureMap().get(tableId);
+  return isAlligatorsState(value) ? value : null;
+}
+
 /** Transacted whole-value write of one table's state (LWW per table key). */
-export function writeGame(tableId: string, state: CheckersState | ChessState | AirHockeyState): void {
+export function writeGame(
+  tableId: string,
+  state: CheckersState | ChessState | AirHockeyState | AlligatorsState,
+): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(tableId, state);

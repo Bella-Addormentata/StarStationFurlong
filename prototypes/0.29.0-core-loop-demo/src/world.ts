@@ -181,6 +181,7 @@ import type {
   SlotMachineCabinetControl,
   CoinPusherVisualHandle,
   AirHockeyVisualHandle,
+  AlligatorsVisualHandle,
   DeviceUI,
   DeviceTarget,
 } from "./devices";
@@ -193,6 +194,15 @@ import {
   createAirHockeyUI,
   registerAirHockeyVisual,
 } from "./airHockeySession";
+// 🐊 #185: the insatiable-alligators live layer — the same hand-off as air
+// hockey's: built handles + frame time in, everything else in the session.
+import {
+  alligatorsFrame,
+  closeAlligatorsTable,
+  createAlligatorsUI,
+  registerAlligatorsVisual,
+} from "./alligatorsSession";
+import { IA_SEATS } from "./games/alligators";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
 import { showHint } from "./hud";
@@ -480,6 +490,9 @@ export class World {
   /** 🏒 Air-hockey table visuals, keyed by item id — filed here, then handed
    *  to the session layer, which drives them (airHockeyFrame). */
   private airHockeyVisuals: Map<string, AirHockeyVisualHandle> = new Map();
+  /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — filed
+   *  here, then handed to the session layer, which drives them. */
+  private alligatorsVisuals: Map<string, AlligatorsVisualHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -1701,6 +1714,15 @@ export class World {
             rot: item.rot,
           });
         }
+        // 🐊 #185: the same hand-off for an alligators table.
+        const gators = sinks.alligatorsVisuals.get(item.id);
+        if (gators) {
+          registerAlligatorsVisual(item.id, gators, {
+            x: item.pos.x,
+            z: item.pos.z,
+            rot: item.rot,
+          });
+        }
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -1745,6 +1767,7 @@ export class World {
       coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
+      alligatorsVisuals: this.alligatorsVisuals,
     };
   }
 
@@ -3171,6 +3194,7 @@ export class World {
     this.coinPusherVisuals.delete(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
+    this.alligatorsVisuals.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3195,6 +3219,10 @@ export class World {
       // only fires on true removals; the delete is idempotent, safe for every
       // observing client to run.
       closeAirHockeyTable(itemId);
+      clearTable(itemId);
+    } else if (removedKind === "alligators-table") {
+      // 🐊 #185: the same as air hockey — runtime session out, doc state wiped.
+      closeAlligatorsTable(itemId);
       clearTable(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
@@ -3933,6 +3961,9 @@ export class World {
     // writes, 30/20 Hz tick sends, remote smoothing, scoreboard/goal lamps.
     // The session module owns the registry; this is its only clock.
     airHockeyFrame(deltaTime);
+    // 🐊 #185: and every alligators table — operator ball sim, bites → doc
+    // writes, head/ball tick sends, remote smoothing, heads/birds/displays.
+    alligatorsFrame(deltaTime);
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -6240,6 +6271,34 @@ export class World {
         ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
         : { ...device, eye };
       const ui = createAirHockeyUI({ itemId: deviceId, side });
+      deviceFocus.beginFocus(this.player, target, ui);
+      return;
+    }
+
+    if (device.kind === "alligators") {
+      // 🐊 #185: walk to the nearest FREE seat round the table (the
+      // craps/roulette stand picker) and play first-person from it. The
+      // stand template INDEX is the seat, read from the `${itemId}:s${n}`
+      // slot id; every stand taken falls back to seat 0.
+      const stand = this.pickFreeStand(deviceId);
+      const seat = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) % IA_SEATS
+        : 0;
+      // The def bakes seat 0's eye; seat n's is that eye turned n·45° round
+      // the table centre (anchor). Rotations commute, so turning the WORLD
+      // offset is the same as turning the local one before the item's rot.
+      const turn = (seat * 2 * Math.PI) / IA_SEATS;
+      const ox = device.eye.x - device.anchor.x;
+      const oz = device.eye.z - device.anchor.z;
+      const eye = new THREE.Vector3(
+        device.anchor.x + ox * Math.cos(turn) - oz * Math.sin(turn),
+        device.eye.y,
+        device.anchor.z + ox * Math.sin(turn) + oz * Math.cos(turn),
+      );
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : { ...device, eye };
+      const ui = createAlligatorsUI({ itemId: deviceId, seat });
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
