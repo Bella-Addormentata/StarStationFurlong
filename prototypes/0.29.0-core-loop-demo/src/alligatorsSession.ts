@@ -48,7 +48,7 @@ import type {
   AlligatorsState, BallSim, HeadPose, OtherHead,
 } from './games/alligators';
 import {
-  readAlligators, readPlayerDisplayName, readRoomOwner, subscribeGames,
+  readAlligators, readPlayerDisplayName, subscribeGames,
   writeGame,
 } from './games/gamesDoc';
 import { casinoDocEpoch } from './casinoDoc';
@@ -60,6 +60,7 @@ import { FURNITURE, rotXZ } from './furniture';
 import type { Rot } from './furniture';
 import type { AlligatorsVisualHandle, DeviceUI } from './devices';
 import { activeRoomId } from './roomInventory';
+import { canEditRoom } from './editMode';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -349,7 +350,8 @@ function tableAtWorld(x: number, z: number): { id: string; st: TableSession } | 
  */
 export function routeAlligatorsTick(senderId: string, tick: MovementTick): void {
   if (tickKind(tick.flags) !== TICK_KIND_ALLIGATORS) return;
-  if (!Number.isFinite(tick.x) || !Number.isFinite(tick.z)) return;
+  // A ball tick's yaw is its heading; a non-finite one would poison the sim.
+  if (!Number.isFinite(tick.x) || !Number.isFinite(tick.z) || !Number.isFinite(tick.yaw)) return;
   const found = tableAtWorld(tick.x, tick.z);
   if (!found) return;
   const { id, st } = found;
@@ -886,11 +888,13 @@ export function createAlligatorsUI(deps: AlligatorsUIDeps): DeviceUI {
   };
 
   /** RESET TABLE gate (air hockey's canReset): anyone once a round ended;
-   *  seated players or the room owner otherwise (frees seats players left). */
+   *  seated players or whoever may edit the room otherwise (frees seats
+   *  players left). The owner half goes through the shared edit gate, so a
+   *  legacy room stays read-only and venture shareholders count (#141). */
   const canReset = (s: AlligatorsState | null): boolean => {
     if (!s) return false;
     if (s.status === 'ended') return true;
-    return s.players.includes(myId) || readRoomOwner() === myId;
+    return s.players.includes(myId) || canEditRoom().ok;
   };
 
   const doReset = (): void => {

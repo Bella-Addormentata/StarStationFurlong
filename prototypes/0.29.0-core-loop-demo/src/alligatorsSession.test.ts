@@ -10,8 +10,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 
 // The module publishes a debug handle on `window` when it loads (and
-// furniture.ts reads the page's query string).
-vi.stubGlobal('window', { location: { search: '' } });
+// furniture.ts reads the page's query string; editMode listens for keys).
+vi.stubGlobal('window', { location: { search: '' }, addEventListener: () => {}, removeEventListener: () => {} });
 
 const { bindCasinoDoc } = await import('./casinoDoc');
 const { bindGamesDoc, readAlligators, writeGame } = await import('./games/gamesDoc');
@@ -202,6 +202,22 @@ describe('the operator', () => {
 });
 
 describe('a spectator', () => {
+  it('ignores a ball tick whose heading is not a number', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T);
+    joinRoom();
+    const h = handle();
+    registerAlligatorsVisual(TABLE, h, POSE);
+    const s = startPractice(claimSeat(initialAlligatorsState(), 2, 'peer-player', 'peer-page')!, 2, 'peer-player', T)!;
+    writeGame(TABLE, s);
+    alligatorsFrame(1 / 60);
+    const bad = { ...ballToTick({ x: 0.3, z: -0.2, heading: 0, speed: 1, index: 4, seq: 1 }), yaw: NaN };
+    routeAlligatorsTick('peer', bad);
+    h.setBall.mockClear();
+    alligatorsFrame(1 / 60);
+    expect(h.setBall).not.toHaveBeenCalledWith(4, expect.any(Number), expect.any(Number), true);
+  });
+
   it("shows the operator's ball ticks, and hides an eaten ball", () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(T);
