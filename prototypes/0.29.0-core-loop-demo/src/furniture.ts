@@ -7694,6 +7694,43 @@ function buildSlotMachine({
   // Tray interior (slightly recessed dark)
   place(new THREE.BoxGeometry(0.40, 0.03, 0.10), m(0x14181e, 0.85, 0.1), 0, 0.64, -0.135);
 
+  // ── ⚙️ Settings buttons on the kick panel near the floor ─────────────────
+  // A dark kick panel fills the gap between the front legs, and two gold-rimmed
+  // ⚙️ buttons sit on it. Anyone can press one to read the machine's card
+  // (paytable, RTP, fairness); for the owner the same card is editable.
+  place(new THREE.BoxGeometry(0.40, 0.26, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.20, -0.07);
+  {
+    const gearCanvas = document.createElement("canvas");
+    gearCanvas.width = gearCanvas.height = 128;
+    const gc = gearCanvas.getContext("2d")!;
+    gc.fillStyle = "#20262F";
+    gc.beginPath();
+    gc.arc(64, 64, 62, 0, Math.PI * 2);
+    gc.fill();
+    gc.font = '84px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+    gc.textAlign = "center";
+    gc.textBaseline = "middle";
+    gc.fillText("⚙️", 64, 70);
+    const gearTexture = new THREE.CanvasTexture(gearCanvas);
+    gearTexture.colorSpace = THREE.SRGBColorSpace;
+    const gearMaterial = new THREE.MeshBasicMaterial({
+      map: gearTexture,
+      transparent: true,
+      opacity: 0,
+    });
+    gearMaterial.userData.baseOpacity = 1;
+    const rimGeometry = new THREE.CylinderGeometry(0.058, 0.058, 0.012, 24);
+    rimGeometry.rotateX(Math.PI / 2);
+    for (const gx of [-0.10, 0.10]) {
+      const rim = place(rimGeometry, m(GOLD, 0.35, 0.6), gx, 0.20, -0.084);
+      const face = place(new THREE.PlaneGeometry(0.10, 0.10), gearMaterial, gx, 0.20, -0.0915, Math.PI);
+      for (const gear of [rim, face]) {
+        gear.userData.slotControl = "settings";
+        gear.userData.slotMachineId = itemId;
+      }
+    }
+  }
+
   // ── Pull lever (right side, +x) ───────────────────────────────────────────
   // A horizontal axle projects perpendicular to the cabinet's right side.
   // Shaft and grip share one centerline at its outer end; the whole axle group
