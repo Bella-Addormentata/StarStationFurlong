@@ -13,7 +13,8 @@
  *        [--query "rom=/emulatorjs/roms/lj65.nes&latency=40&jitter=30"] [--chromium /path/to/chrome]
  *        [--screenshot out.png]
  *
- * Exits non-zero when any compared hash differed or nothing was compared.
+ * Exits non-zero when any compared hash differed or nothing was compared
+ * (the negative control, `--query drop=N`, is expected to).
  */
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -74,6 +75,8 @@ console.log(JSON.stringify({
   wireBytes: last?.wireBytes,
   wireBytesPerSecond: Math.round((last?.wireBytes ?? 0) / seconds),
   snapshotBytes: last?.snapshotBytes,
+  distinctHashes: last?.distinctHashes,
+  dropped: last?.dropped,
   stalls: last?.stalls,
   lagFrames: { p50: pct(50), p95: pct(95), max: sorted.at(-1) ?? null, samples: sorted.length },
   errors: last?.errors,

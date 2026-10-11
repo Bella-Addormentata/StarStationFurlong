@@ -175,10 +175,12 @@ export interface ReplayStatus {
   /** The latest `through` it holds. */
   through?: number;
   /** Set once, as a save state lands: its frame, the hash after loading,
-   *  and whether that matched the hash the source sent with it. */
+   *  whether that matched the hash the source sent with it, and how many
+   *  iterations the load took to land. */
   loaded?: number;
   hash?: string;
   matches?: boolean;
+  tries?: number;
 }
 
 /** Whether engine files at `pathToData` come from another origin than the
@@ -293,6 +295,7 @@ export function readReplayStatus(data: unknown): ReplayStatus | null {
   if (int(d.loaded)) out.loaded = d.loaded as number;
   if (typeof d.hash === 'string' && /^[0-9a-f]{1,8}:\d{1,9}$/.test(d.hash)) out.hash = d.hash;
   if (typeof d.matches === 'boolean') out.matches = d.matches;
+  if (typeof d.tries === 'number' && Number.isInteger(d.tries) && d.tries >= 0 && d.tries <= 1000) out.tries = d.tries;
   return out;
 }
 

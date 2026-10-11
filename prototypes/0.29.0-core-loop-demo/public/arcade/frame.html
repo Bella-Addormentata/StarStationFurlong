@@ -242,11 +242,22 @@
           var offset = 0;
           var phase = 'waiting';
           var snap = null;
+          var loadTries = 0;
+          var LOAD_RETRY = 8;
+          var LOAD_TRIES = 64;
           var applying = false;
           var lastStatus = 0;
+          // What the replay holds down on this emulator now: a save state
+          // carries none of it, so a load has to set it to player one's.
+          var down = {};
           // Nothing local drives a spectator's emulator: only the replay.
           gm.functions.simulateInput = function (p, i, v) { if (applying) return apply(p, i, v); };
-          function feed(p, i, v) { applying = true; try { apply(p, i, v); } finally { applying = false; } }
+          function feed(p, i, v) {
+            if (v !== 0) down[p + ':' + i] = [p, i];
+            else delete down[p + ':' + i];
+            applying = true;
+            try { apply(p, i, v); } finally { applying = false; }
+          }
           function status(extra) {
             var m = { phase: phase, frame: gm.getFrameNum() + offset, through: through };
             if (extra) for (var k in extra) m[k] = extra[k];
@@ -274,14 +285,30 @@
           };
           hooks.post = function () {
             if (phase === 'loading') {
-              // The iteration that landed the save state: no frame of its
-              // own ran, so the state now is the source's at snap.frame.
-              offset = snap.frame - gm.getFrameNum();
+              // A save state lands between a frame and this hook, and the
+              // iteration that lands it runs no frame after it: so it has
+              // landed when the state IS player one's. On a fresh spectator
+              // that is the first iteration. On a running one EmulatorJS
+              // sometimes drops the load outright (measured on fceumm: no
+              // sign of it 120 iterations on), and asking again lands it —
+              // so it asks again every LOAD_RETRY iterations until the
+              // state matches, and gives up after LOAD_TRIES. The frames
+              // run while it waits ran on the old state, which the load
+              // throws away.
+              loadTries += 1;
               var h = stateHash(gm.getState());
+              if (h !== snap.hash && loadTries < LOAD_TRIES) {
+                if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+                return;
+              }
+              offset = snap.frame - gm.getFrameNum();
+              // Let go of what player one does not hold, then hold what it
+              // does: after a drift, the old state's buttons are stale too.
+              for (var d in down) if (!snap.held.some(function (r) { return r[0] + ':' + r[1] === d; })) feed(down[d][0], down[d][1], 0);
               for (var k = 0; k < snap.held.length; k++) feed(snap.held[k][0], snap.held[k][1], snap.held[k][2]);
               for (var q in queue) if (+q < snap.frame) delete queue[q];
               phase = 'stalled';
-              status({ loaded: snap.frame, hash: h, matches: h === snap.hash });
+              status({ loaded: snap.frame, hash: h, matches: h === snap.hash, tries: loadTries });
               return;
             }
             var s = gm.getFrameNum() + offset;
@@ -302,6 +329,7 @@
             snapshot: function (d) {
               if (!(d.state instanceof Uint8Array) || !Array.isArray(d.held) || typeof d.frame !== 'number') return;
               snap = d;
+              loadTries = 0;
               gm.loadState(d.state);
               phase = 'loading';
             },
@@ -371,6 +399,11 @@
         window.EJS_ready = function () { post('arcade-ready'); };
         var replayRole = c.replay === 'source' || c.replay === 'follower' ? c.replay : null;
         if (replayRole) hookMainLoop();
+        // EmulatorJS focuses its player when the game starts, and focus in
+        // this frame is the keyboard leaving the world: a spectator's frame,
+        // which takes no input, mounts while its avatar is walking past and
+        // must not take the keys with it (the spike caught it doing so).
+        if (replayRole === 'follower') window.EJS_noAutoFocus = true;
         window.EJS_onGameStart = function () {
           if (replayRole) startReplay(replayRole, c);
           post('arcade-started');

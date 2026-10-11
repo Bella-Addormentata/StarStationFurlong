@@ -21,7 +21,8 @@
  * provides), join (ms after player one starts before the spectator joins;
  * 3000), latency and jitter (ms, one way; 0), bot (0 turns the random
  * presses off), seed, hashEvery (60), lead (12), resync (1: on a mismatch,
- * hand the spectator a fresh save state).
+ * hand the spectator a fresh save state), drop (the spectator never gets
+ * player one's Nth input: the negative control, the ledger has to catch it).
  *
  * window.__replaySpike.stats() returns the numbers (scripts/arcade-replay-spike.mjs
  * drives this page in a headless browser and prints them).
@@ -46,6 +47,7 @@ const botOn = q.get('bot') !== '0';
 const hashEvery = num('hashEvery', 60);
 const lead = num('lead', 12);
 const resync = q.get('resync') === '1';
+const dropAt = num('drop', 0);
 
 /** mulberry32: the bot's presses repeat for a seed. */
 function rng(seed: number): () => number {
@@ -72,14 +74,21 @@ const stats = {
   wireBytes: 0,
   snapshots: 0,
   snapshotBytes: 0,
-  loads: [] as Array<{ frame: number; matches: boolean | undefined; atMs: number }>,
+  loads: [] as Array<{ frame: number; matches: boolean | undefined; tries: number | undefined; atMs: number }>,
   stalls: 0,
   presses: 0,
   sourceFrame: 0,
   follower: null as ReplayStatus | null,
   lagFrames: [] as number[],
+  /** Distinct state hashes player one posted: a ledger that matched a
+   *  handful of identical hashes would prove nothing. */
+  distinctHashes: 0,
+  dropped: null as { frame: number; index: number; value: number } | null,
   errors: [] as string[],
 };
+const seenHashes = new Set<string>();
+/** Inputs delivered so far, for `drop`. */
+let delivered = 0;
 
 const el = (id: string) => document.getElementById(id) as HTMLElement;
 let source: EmulatorHandle | null = null;
@@ -115,6 +124,12 @@ function onSource(ev: EmulatorEvent): void {
       deliver(() => {
         const batch = unpackInputBatch(bytes);
         if (!batch) return;
+        if (dropAt > 0 && delivered < dropAt && delivered + batch.inputs.length >= dropAt) {
+          const [gone] = batch.inputs.splice(dropAt - delivered - 1, 1);
+          if (gone) stats.dropped = { frame: gone.frame, index: gone.index, value: gone.value };
+          delivered += 1;
+        }
+        delivered += batch.inputs.length;
         for (const b of reassembler.push(batch)) {
           follower?.send({ type: 'arcade-replay-inputs', from: b.from, through: b.through, inputs: batchRows(b) });
         }
@@ -123,6 +138,8 @@ function onSource(ev: EmulatorEvent): void {
     }
     case 'replay-hash':
       ledger.sourceHash(ev.hash.frame, ev.hash.hash);
+      if (seenHashes.size < 100_000) seenHashes.add(ev.hash.hash);
+      stats.distinctHashes = seenHashes.size;
       break;
     case 'replay-snapshot': {
       const s = ev.snapshot;
@@ -156,7 +173,7 @@ function onFollower(ev: EmulatorEvent): void {
     case 'replay-status': {
       const st = ev.status;
       if (st.phase === 'stalled' && stats.follower?.phase === 'running') stats.stalls += 1;
-      if (st.loaded !== undefined) stats.loads.push({ frame: st.loaded, matches: st.matches, atMs: Math.round(performance.now() - stats.startedAt) });
+      if (st.loaded !== undefined) stats.loads.push({ frame: st.loaded, matches: st.matches, tries: st.tries, atMs: Math.round(performance.now() - stats.startedAt) });
       if (st.phase === 'running' && st.frame !== undefined) stats.lagFrames.push(stats.sourceFrame - st.frame);
       stats.follower = st;
       break;
@@ -222,6 +239,7 @@ function render(): void {
     `inputs ${stats.inputs} in ${stats.batches} batches · ${(stats.wireBytes / Math.max(1, elapsed)).toFixed(0)} B/s on the wire`,
     `save states ${stats.snapshots} · ${stats.snapshotBytes} B · loads ${stats.loads.map((l) => `${l.frame}${l.matches ? '✓' : '✗'}`).join(' ')}`,
     `stalls ${stats.stalls} · lag (frames, last ${lag.length}) ${lag.join(' ')}`,
+    stats.dropped ? `dropped input: frame ${stats.dropped.frame}, index ${stats.dropped.index} = ${stats.dropped.value}` : '',
     stats.errors.length ? `errors: ${stats.errors.join('; ')}` : '',
   ].filter(Boolean).join('\n');
 }

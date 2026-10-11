@@ -141,8 +141,8 @@ describe('where the emulator files come from', () => {
 describe('a spectator frame\'s replay status is read field by field', () => {
   it('keeps what is well-formed and drops the rest', () => {
     expect(readReplayStatus({ phase: 'running', frame: 600, through: 611 })).toEqual({ phase: 'running', frame: 600, through: 611 });
-    expect(readReplayStatus({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, frame: 213 }))
-      .toEqual({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, frame: 213 });
+    expect(readReplayStatus({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, tries: 2, frame: 213 }))
+      .toEqual({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, tries: 2, frame: 213 });
     expect(readReplayStatus({ phase: 'running', frame: 1.5, hash: '<b>', matches: 'yes' })).toEqual({ phase: 'running' });
     expect(readReplayStatus({ phase: 'dancing' })).toBeNull();
     expect(readReplayStatus(null)).toBeNull();
