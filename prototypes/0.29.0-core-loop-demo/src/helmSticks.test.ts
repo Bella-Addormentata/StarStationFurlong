@@ -68,6 +68,7 @@ function buildHelm(): { group: THREE.Group; anim: PropAnimHandle; dispose: () =>
     propAnims: new Map(),
     airHockeyVisuals: new Map(),
     alligatorsVisuals: new Map(),
+    casinoTableVisuals: new Map(),
   };
   const disposers: Array<() => void> = [];
   group.traverse((obj) => {

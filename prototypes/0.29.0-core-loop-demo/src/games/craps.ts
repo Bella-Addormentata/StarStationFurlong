@@ -28,17 +28,31 @@
 /** The six point numbers (a come-out roll of one of these sets the point). */
 export const POINT_NUMBERS = new Set([4, 5, 6, 8, 9, 10]);
 
+/** The four hardway numbers (a pair: 2+2, 3+3, 4+4, 5+5). */
+export const HARD_NUMBERS = new Set([4, 6, 8, 10]);
+
 export type CrapsBetType =
   | 'pass'      // pass line — even money, travels with the point
   | 'dontpass'  // don't pass — even money, 12 pushes on the come-out
+  | 'come'      // come — a pass line of its own, made while a point is on
+  | 'dontcome'  // don't come — a don't pass of its own, made while a point is on
   | 'field'     // one-roll: 2,3,4,9,10,11,12 (2 & 12 pay double)
   | 'place'     // place 4/5/6/8/9/10 — working during the point, off on come-out
+  | 'big6'      // big 6 — even money on a 6 before a 7, stays up
+  | 'big8'      // big 8 — even money on an 8 before a 7, stays up
+  | 'hard'      // hardway 4/6/8/10 — the pair before a 7 or the easy way
   | 'anyseven'  // one-roll: any 7, pays 4:1
-  | 'anycraps'; // one-roll: 2/3/12, pays 7:1
+  | 'anycraps'  // one-roll: 2/3/12, pays 7:1
+  | 'two'       // one-roll: snake eyes, pays 30:1
+  | 'three'     // one-roll: ace-deuce, pays 15:1
+  | 'yo'        // one-roll: eleven, pays 15:1
+  | 'twelve';   // one-roll: boxcars, pays 30:1
 
 export interface CrapsBet {
   type: CrapsBetType;
-  /** place: the number (4,5,6,8,9,10). Absent for every other bet. */
+  /** place: the number (4,5,6,8,9,10); hard: 4/6/8/10; come / dontcome: the
+   *  number the bet TRAVELLED to (absent while it still sits in the come box).
+   *  Absent for every other bet. */
   pick?: number;
   /** Chips staked (already deducted from the bettor's balance). */
   amount: number;
@@ -80,6 +94,17 @@ export interface CrapsTableState {
    *  (the operator's Date.now() is the reference; everyone else's countdown is
    *  display-only). Absent ⇒ a manual/idle table with no timer. */
   phaseDeadline?: number;
+  /** 🎲 #226: the player holding the dice for this hand (a player id), or
+   *  absent when the stickman throws. Set by the operator when it slides the
+   *  dice to a player at the table; kept roll to roll until a seven-out. */
+  shooter?: string;
+  /** 🎲 #226: on a manual table (no robot), the page whose ROLL slid the dice
+   *  out — the one client that settles the shooter's throw or times them out,
+   *  so several room editors never race one settle. Absent on robot tables. */
+  operator?: string;
+  /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
+   *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
+  lastShooter?: string;
 }
 
 /** Which fairness scheme produced a table's dice (see diceFairness.ts). All four
@@ -137,7 +162,8 @@ export function initialCrapsState(): CrapsTableState {
 }
 
 const BET_TYPES: readonly string[] = [
-  'pass', 'dontpass', 'field', 'place', 'anyseven', 'anycraps',
+  'pass', 'dontpass', 'come', 'dontcome', 'field', 'place', 'big6', 'big8',
+  'hard', 'anyseven', 'anycraps', 'two', 'three', 'yo', 'twelve',
 ];
 
 /** Shape guard — bets cross the room-doc trust boundary (peer writes). */
@@ -149,7 +175,19 @@ export function isCrapsBet(value: unknown): value is CrapsBet {
   if (b.type === 'place') {
     return Number.isInteger(b.pick) && POINT_NUMBERS.has(b.pick as number);
   }
-  return true;
+  if (b.type === 'hard') {
+    return Number.isInteger(b.pick) && HARD_NUMBERS.has(b.pick as number);
+  }
+  if (b.type === 'come' || b.type === 'dontcome') {
+    return b.pick === undefined
+      || (Number.isInteger(b.pick) && POINT_NUMBERS.has(b.pick as number));
+  }
+  return b.pick === undefined;
+}
+
+/** A player id as it may appear in a peer-written table record. */
+function isPlayerIdField(v: unknown): boolean {
+  return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 128);
 }
 
 function isDicePair(value: unknown): value is [number, number] {
@@ -179,7 +217,10 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.phaseDeadline === undefined
-        || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
+        || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
+    && isPlayerIdField(s.shooter)
+    && isPlayerIdField(s.lastShooter)
+    && isPlayerIdField(s.operator);
 }
 
 /** The point AFTER a roll of `sum`, given the point in force before it:
@@ -201,10 +242,13 @@ export function shooterHandOver(pointBefore: number | null, sum: number): boolea
 }
 
 /** Whether a NEW bet of this type may be placed given the point in force.
- *  Pass / don't pass are come-out wagers (point must be OFF); everything else
- *  is always available. (Mirrors the felt: the line is "closed" during a point.) */
+ *  Pass / don't pass are come-out wagers (point must be OFF); come / don't come
+ *  are their point-phase twins (point must be ON); everything else is always
+ *  available. (Mirrors the felt: the line is "closed" during a point, and the
+ *  come box only opens once there is one.) */
 export function canPlaceBet(type: CrapsBetType, point: number | null): boolean {
   if (type === 'pass' || type === 'dontpass') return point === null;
+  if (type === 'come' || type === 'dontcome') return point !== null;
   return true;
 }
 
@@ -215,6 +259,9 @@ export interface BetResolution {
   keep: boolean;
   /** For narration/UI only. 'stay' = no decision this roll. */
   outcome: 'win' | 'lose' | 'push' | 'stay';
+  /** A come / don't come bet that TRAVELLED this roll: the bet as it now
+   *  stands (same stake, `pick` = the number it moved to). keep is true. */
+  moved?: CrapsBet;
 }
 
 const won = (credited: number): BetResolution => ({ credited, keep: false, outcome: 'win' });
@@ -226,6 +273,12 @@ const stay: BetResolution = { credited: 0, keep: true, outcome: 'stay' };
 const PLACE_ODDS: Record<number, [number, number]> = {
   4: [9, 5], 5: [7, 5], 6: [7, 6], 8: [7, 6], 9: [7, 5], 10: [9, 5],
 };
+
+/** Hardway payout X:1 by number (the casino's standard 7:1 / 9:1). */
+const HARD_ODDS: Record<number, number> = { 4: 7, 6: 9, 8: 9, 10: 7 };
+
+/** A bet that stays up after it wins: only the winnings come back. */
+const paidAndStays = (credited: number): BetResolution => ({ credited, keep: true, outcome: 'win' });
 
 /** Resolve ONE bet against a roll, given the point in force BEFORE the roll. */
 export function resolveCrapsBet(
@@ -256,6 +309,51 @@ export function resolveCrapsBet(
       if (sum === 7) return won(a * 2);                    // 7 before the point
       if (sum === pointBefore) return lost;                // point made
       return stay;
+    case 'come':
+      // In the come box: its own come-out roll, whatever the table's point.
+      if (bet.pick === undefined) {
+        if (sum === 7 || sum === 11) return won(a * 2);
+        if (sum === 2 || sum === 3 || sum === 12) return lost;
+        return { ...stay, moved: { type: 'come', pick: sum, amount: a } };
+      }
+      if (sum === bet.pick) return won(a * 2);              // its number came
+      if (sum === 7) return lost;
+      return stay;
+    case 'dontcome':
+      if (bet.pick === undefined) {
+        if (sum === 2 || sum === 3) return won(a * 2);
+        if (sum === 12) return push(a);                    // bar 12
+        if (sum === 7 || sum === 11) return lost;
+        return { ...stay, moved: { type: 'dontcome', pick: sum, amount: a } };
+      }
+      if (sum === 7) return won(a * 2);                    // 7 before its number
+      if (sum === bet.pick) return lost;
+      return stay;
+    case 'big6':
+    case 'big8': {
+      const n = bet.type === 'big6' ? 6 : 8;
+      if (sum === n) return paidAndStays(a);               // even money, stays up
+      if (sum === 7) return lost;
+      return stay;
+    }
+    case 'hard': {
+      const n = bet.pick ?? 0;
+      // Off on the come-out (the casino's default) — no decision, stays up.
+      if (pointBefore === null) return stay;
+      if (sum === 7) return lost;
+      if (sum === n) {
+        return d1 === d2 ? paidAndStays(a * (HARD_ODDS[n] ?? 0)) : lost; // easy way loses
+      }
+      return stay;
+    }
+    case 'two':
+      return sum === 2 ? won(a * 31) : lost;               // 30:1
+    case 'three':
+      return sum === 3 ? won(a * 16) : lost;               // 15:1
+    case 'yo':
+      return sum === 11 ? won(a * 16) : lost;              // 15:1
+    case 'twelve':
+      return sum === 12 ? won(a * 31) : lost;              // 30:1
     case 'field':
       if (sum === 2 || sum === 12) return won(a * 3);      // 2:1
       if (sum === 3 || sum === 4 || sum === 9 || sum === 10 || sum === 11) return won(a * 2);
@@ -306,7 +404,7 @@ export function resolveCrapsRound(
     const placePaidPick = new Set<number>();
     for (const bet of bets) {
       const r = resolveCrapsBet(bet, d1, d2, pointBefore);
-      if (r.keep) kept.push(bet);
+      if (r.keep) kept.push(r.moved ?? bet);
       if (bet.type === 'place' && bet.pick != null && r.outcome === 'win') {
         // Credit the aggregate payout once per pick number to avoid per-chip floor loss.
         if (!placePaidPick.has(bet.pick)) {
@@ -329,10 +427,19 @@ export function crapsBetLabel(bet: CrapsBet): string {
   switch (bet.type) {
     case 'pass': return 'PASS LINE';
     case 'dontpass': return "DON'T PASS";
+    case 'come': return bet.pick === undefined ? 'COME' : `COME ${bet.pick}`;
+    case 'dontcome': return bet.pick === undefined ? "DON'T COME" : `DON'T COME ${bet.pick}`;
     case 'field': return 'FIELD';
     case 'place': return `PLACE ${bet.pick}`;
+    case 'big6': return 'BIG 6';
+    case 'big8': return 'BIG 8';
+    case 'hard': return `HARD ${bet.pick}`;
     case 'anyseven': return 'ANY 7';
     case 'anycraps': return 'ANY CRAPS';
+    case 'two': return 'TWO';
+    case 'three': return 'THREE';
+    case 'yo': return 'YO 11';
+    case 'twelve': return 'TWELVE';
     default: return '?';
   }
 }
@@ -347,4 +454,51 @@ export function rollCall(sum: number, pointBefore: number | null, pointAfter: nu
   if (sum === 7) return '7 — SEVEN OUT';
   if (sum === pointBefore) return `${sum} — WINNER, POINT MADE`;
   return `${sum} — ROLL AGAIN, POINT IS ${pointBefore}`;
+}
+
+// ── 🎲 #226: the shooter ──────────────────────────────────────────────────────
+
+/** A player standing at the table, placed by the angle of their stand around
+ *  the table centre (atan2(z, x) in the table's local frame — increasing angle
+ *  runs clockwise seen from above, the way the dice travel). */
+export interface SeatedPlayer {
+  pid: string;
+  angle: number;
+}
+
+/** True when the player has a line bet down (pass or don't pass) — the house
+ *  rule for taking the dice on a come-out. */
+export function hasLineBet(bets: readonly CrapsBet[]): boolean {
+  return bets.some((b) => b.type === 'pass' || b.type === 'dontpass');
+}
+
+/**
+ * Who gets the dice next: the first ELIGIBLE player clockwise after `after`
+ * (the last shooter). `after` itself comes last in the ring, so a lone player
+ * keeps shooting. When `after` is not standing at the table any more, the ring
+ * starts from the lowest angle. null ⇒ nobody eligible: the stickman throws.
+ */
+export function pickShooter(
+  seated: readonly SeatedPlayer[],
+  eligible: (pid: string) => boolean,
+  after?: string,
+): string | null {
+  const ring = [...seated].sort((a, b) => a.angle - b.angle || (a.pid < b.pid ? -1 : 1));
+  const at = after === undefined ? -1 : ring.findIndex((p) => p.pid === after);
+  for (let i = 1; i <= ring.length; i++) {
+    const p = ring[(at + i + ring.length) % ring.length];
+    if (eligible(p.pid)) return p.pid;
+  }
+  return null;
+}
+
+/** Was a point on going into this settled roll? The state carries only the
+ *  point after it, but that, the sum and the seven-out flag pin it down:
+ *  a made point clears it, a come-out 4–10 sets it equal to the sum, and a
+ *  point-phase roll that decides nothing leaves it alone. */
+export function pointWasOn(s: Pick<CrapsTableState, 'point' | 'result' | 'sevenOut'>): boolean {
+  if (s.result === null) return s.point !== null;
+  if (s.point !== null) return s.point !== s.result;
+  if (s.result === 7) return s.sevenOut === true;
+  return [4, 5, 6, 8, 9, 10].includes(s.result);
 }

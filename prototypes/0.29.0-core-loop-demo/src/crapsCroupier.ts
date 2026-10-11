@@ -27,14 +27,22 @@
  */
 
 import { canRunCroupier } from './croupier';
+import { getPlayerId } from './identity';
+import { FURNITURE_DEFS } from './furniture';
 import {
+  casinoDocEpoch,
   clearTableKeys,
   creditChips,
   readAllCrapsBets,
   readCrapsTableState,
+  readDiceThrow,
+  readSeats,
   writeCrapsTableState,
+  writeDiceThrow,
 } from './casinoDoc';
-import type { CrapsTableState } from './games/craps';
+import { CRAPS_DICE_SPOT } from './games/casinoLayout';
+import { hasLineBet, pickShooter } from './games/craps';
+import type { CrapsTableState, SeatedPlayer } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
 import { selectCrapsBackend } from './crapsBackend';
@@ -47,6 +55,14 @@ export const CRAPS_CLOSING_MS = 2_500;
 /** How long the settled roll + payouts stay up before the next window opens
  *  (≥ the local dice-tumble animation, so the number lingers after it stops). */
 export const CRAPS_SHOW_MS = 6_000;
+/** 🎲 #226: how long a shooter has to pick the dice up and fling them before
+ *  the stickman throws for them. */
+export const CRAPS_SHOOTER_MS = 20_000;
+/** A seat whose heartbeat has not moved for this long (operator clock) is
+ *  gone — the page crashed or lost its connection without clearing it. */
+export const SEAT_STALE_MS = 15_000;
+/** The stickman's spot on the felt (the layout's dice spot). */
+export const STICKMAN_DICE_SPOT = CRAPS_DICE_SPOT;
 
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
@@ -94,8 +110,18 @@ export function rollAndSettleCraps(
 }
 
 /** Open a fresh betting window carrying the point forward (idle — no timer until
- *  a bet, or a standing bet, arms it). */
-export function openCrapsBetting(tableId: string, round: number, point: number | null): void {
+ *  a bet, or a standing bet, arms it). `after` is the roll that just settled:
+ *  its shooter keeps the dice, unless it sevened out — then the dice pass on
+ *  (the next shooter is picked clockwise from them when the window closes). */
+export function openCrapsBetting(
+  tableId: string,
+  round: number,
+  point: number | null,
+  after?: CrapsTableState | null,
+): void {
+  const handOver = after?.sevenOut === true;
+  const shooter = handOver ? undefined : after?.shooter;
+  const lastShooter = handOver ? after?.shooter ?? after?.lastShooter : after?.lastShooter;
   writeCrapsTableState(tableId, {
     kind: 'craps',
     phase: 'betting',
@@ -105,12 +131,252 @@ export function openCrapsBetting(tableId: string, round: number, point: number |
     result: null,
     resultAt: 0,
     payouts: null,
+    ...(shooter !== undefined ? { shooter } : {}),
+    ...(lastShooter !== undefined ? { lastShooter } : {}),
   });
+}
+
+// ── 🎲 #226: the shooter ──────────────────────────────────────────────────────
+
+/** table:player → [its `at`, when THIS client last saw `at` change, and
+ *  whether it has seen it change at all]. Scoped to one room doc: another
+ *  room's table can share the id, the player and even the heartbeat value, so
+ *  a rebind starts it over. */
+const seatSeen = new Map<string, { at: number; seenAt: number; moved: boolean }>();
+let seatSeenEpoch = -1;
+
+/** `table:player` seats THIS page is writing right now (its own focused
+ *  table): live by construction, so they count without waiting to see a
+ *  second heartbeat. */
+const localSeats = new Set<string>();
+
+/** The focused table UI marks its own seat while it heartbeats it. */
+export function markLocalSeat(tableId: string, playerId: string, on: boolean): void {
+  if (on) localSeats.add(`${tableId}:${playerId}`);
+  else localSeats.delete(`${tableId}:${playerId}`);
+}
+
+/** How long a newly seen seat may wait for its second heartbeat before a
+ *  manual ROLL stops waiting for it (a little over one beat). */
+const SEAT_CONFIRM_MS = 7_000;
+
+/** Players standing at the table right now, judged on the operator's own clock:
+ *  a seat counts once this client has watched its heartbeat move, and while it
+ *  keeps moving. A seat left behind by a crashed page never moves, so it never
+ *  counts — however fresh the operator. The operator samples every tick. */
+export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[] {
+  if (seatSeenEpoch !== casinoDocEpoch()) {
+    seatSeenEpoch = casinoDocEpoch();
+    seatSeen.clear();
+  }
+  const out: SeatedPlayer[] = [];
+  for (const [pid, seat] of Object.entries(readSeats(tableId))) {
+    const key = `${tableId}:${pid}`;
+    const prev = seatSeen.get(key);
+    if (!prev) seatSeen.set(key, { at: seat.at, seenAt: now, moved: false });
+    else if (prev.at !== seat.at) seatSeen.set(key, { at: seat.at, seenAt: now, moved: true });
+    const seen = seatSeen.get(key)!;
+    // The seat is peer-written: only a real player stand counts, and its
+    // place in the ring comes from the table's layout, not the stored angle.
+    const t = FURNITURE_DEFS['craps-table'].stands?.[seat.stand];
+    if (!t || t.role) continue;
+    if (localSeats.has(key) || (seen.moved && now - seen.seenAt < SEAT_STALE_MS)) {
+      out.push({ pid, angle: Math.atan2(t.stand.z, t.stand.x) });
+    }
+  }
+  return out;
+}
+
+/** Seats with a line bet that this client has only just seen and can't yet
+ *  call live or stale (no second heartbeat yet, and not long enough to give
+ *  up on one): a manual ROLL waits for them rather than skip a real shooter. */
+function seatsUnconfirmed(tableId: string, now: number): boolean {
+  const bets = readAllCrapsBets(tableId);
+  for (const pid of Object.keys(readSeats(tableId))) {
+    const key = `${tableId}:${pid}`;
+    const seen = seatSeen.get(key);
+    if (!seen || seen.moved || localSeats.has(key)) continue;
+    if (now - seen.seenAt < SEAT_CONFIRM_MS && hasLineBet(bets[pid] ?? [])) return true;
+  }
+  return false;
+}
+
+/** Who throws when betting closes on `s`: the hand's shooter while they are
+ *  still at the table; on a come-out with nobody holding the dice, the next
+ *  player clockwise with a line bet; otherwise nobody (the stickman throws). */
+export function shooterForClose(tableId: string, s: CrapsTableState, now = Date.now()): string | undefined {
+  const seated = seatedPlayers(tableId, now);
+  const stillHere = s.shooter !== undefined && seated.some((p) => p.pid === s.shooter);
+  if (s.point !== null) {
+    // Mid-hand the shooter keeps the dice; if they left, the stickman finishes.
+    return stillHere ? s.shooter : undefined;
+  }
+  // A come-out needs a line bet from whoever rolls — the shooter included.
+  const bets = readAllCrapsBets(tableId);
+  const eligible = (pid: string) => hasLineBet(bets[pid] ?? []);
+  if (stillHere && eligible(s.shooter!)) return s.shooter;
+  return pickShooter(seated, eligible, s.shooter ?? s.lastShooter) ?? undefined;
+}
+
+/** The stickman throws for the table (no shooter, or the shooter ran out of
+ *  time): record the throw so every client animates it, then settle. */
+export function stickmanThrows(tableId: string, s: CrapsTableState, autoShowMs?: number): void {
+  // The operator ticks every frame while the async settle is in flight: one
+  // throw per roll, or every client's dice would restart their tumble.
+  if (settling.has(tableId)) return;
+  writeDiceThrow(tableId, {
+    round: s.round,
+    by: 'stickman',
+    sx: STICKMAN_DICE_SPOT.x,
+    sz: STICKMAN_DICE_SPOT.z,
+    dx: (Math.random() - 0.5) * 0.5,
+    dz: -1,
+    power: 0.55,
+    seed: Math.floor(Math.random() * 2 ** 31),
+  });
+  rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
 }
 
 /** Any chips on the felt (fresh bets OR standing pass/place from prior rolls)? */
 function hasLiveBets(tableId: string): boolean {
   return Object.keys(readAllCrapsBets(tableId)).length > 0;
+}
+
+/** When the operator last sampled each table's seats. */
+const seatSampledAt = new Map<string, number>();
+
+/** Watch the seats' heartbeats all window long (once a second: each look
+ *  scans the room doc), so the shooter pick at the close judges them on what
+ *  this client actually saw move. */
+export function sampleSeats(tableId: string, now = Date.now()): void {
+  if (now - (seatSampledAt.get(tableId) ?? 0) < 1000) return;
+  seatSampledAt.set(tableId, now);
+  seatedPlayers(tableId, now);
+}
+
+/** "No more bets": the stickman pushes the dice to the shooter, who then has
+ *  CRAPS_SHOOTER_MS to fling them (#226); with no shooter the stickman throws
+ *  after the usual beat. The robot's tick and the house's manual ROLL share it. */
+export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Date.now(), manual = false): void {
+  const shooter = shooterForClose(tableId, s, now);
+  const next: CrapsTableState = {
+    ...s,
+    phase: 'closing',
+    phaseDeadline: now + (shooter ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS),
+  };
+  if (shooter) next.shooter = shooter;
+  else delete next.shooter;
+  if (manual) next.operator = PAGE_ID;
+  else delete next.operator;
+  writeCrapsTableState(tableId, next);
+}
+
+/** While the dice are with the shooter: settle their throw when it lands in
+ *  the doc, or have the stickman throw at the deadline. */
+export function tickCrapsClosing(tableId: string, s: CrapsTableState, autoShowMs?: number, now = Date.now()): void {
+  if (s.shooter !== undefined) {
+    const t = readDiceThrow(tableId);
+    if (t && t.round === s.round && t.by === s.shooter) {
+      rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
+      return;
+    }
+  }
+  if (now >= (s.phaseDeadline ?? now)) stickmanThrows(tableId, s, autoShowMs);
+}
+
+/** This page, as a manual table's operator: player id plus a per-load nonce,
+ *  so two tabs of one player are still two operators. */
+const PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).slice(2, 10)}`;
+
+/** A manual craps table (no robot stickman): the page whose ROLL slid the
+ *  dice out runs only that shooter's turn — watching the seats, settling the
+ *  shooter's throw, timing them out. World ticks it every frame on every
+ *  editor's client whatever they're looking at; only the operator page acts,
+ *  so shareholders in a venture room never race the settle. If that page
+ *  goes away, any editor's next ROLL press finishes the turn. */
+export function tickManualCraps(tableId: string, now = Date.now()): void {
+  // Every editor samples (throttled), so whoever presses ROLL has already
+  // seen the seated players' heartbeats move and can slide them the dice.
+  sampleSeats(tableId, now);
+  const s = readCrapsTableState(tableId);
+  noteClosing(tableId, s, now);
+  // A takeover marker counts only for the turn it took, in this room doc;
+  // losing the turn (or it ending) drops it.
+  const mark = tookOverAt.get(tableId);
+  const took = mark && s && mark.epoch === casinoDocEpoch() && mark.round === s.round ? mark.at : undefined;
+  if (s?.phase !== 'closing' || s.operator !== PAGE_ID) {
+    tookOverAt.delete(tableId);
+    return;
+  }
+  // Just took the turn over: let the operator stamp converge first, so a
+  // rival takeover's write wins or loses before either page settles.
+  if (took !== undefined && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
+  tickCrapsClosing(tableId, s, undefined, took !== undefined ? Infinity : now);
+  tookOverAt.delete(tableId);
+}
+
+/** How long this page must have watched one manual turn stay closing, under
+ *  one operator, before it counts as abandoned (that page is gone) and this
+ *  page's ROLL may take it over: the shooter's whole window plus a margin.
+ *  Measured on this page's own clock only — phaseDeadline was written by the
+ *  operator's clock, which isn't comparable with ours. */
+export const MANUAL_TAKEOVER_MS = CRAPS_SHOOTER_MS + 10_000;
+
+/** When this page first saw each table's current closing turn (its epoch,
+ *  round and operator), by this page's clock. tickManualCraps notes it every
+ *  frame on every editor's page, so the watch starts as the turn does. */
+const closingSeen = new Map<string, { epoch: number; round: number; operator: string | undefined; at: number }>();
+
+function noteClosing(tableId: string, s: CrapsTableState | null, now: number): number {
+  if (s?.phase !== 'closing') {
+    closingSeen.delete(tableId);
+    return now;
+  }
+  const epoch = casinoDocEpoch();
+  const seen = closingSeen.get(tableId);
+  if (seen && seen.epoch === epoch && seen.round === s.round && seen.operator === s.operator) return seen.at;
+  closingSeen.set(tableId, { epoch, round: s.round, operator: s.operator, at: now });
+  return now;
+}
+const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
+/** Turns this page took over: when (this page's own clock), and which. */
+const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>();
+
+/**
+ * The house's ROLL on a manual table. Returns a notice for the press, or
+ * null when it acted.
+ *  • No state yet: opens round 1 (as tickAutoStickman does), then closes it.
+ *  • Betting: closes, slides the dice out, and stamps this page as operator.
+ *  • Closing, this page operates: settles the throw that landed, else the
+ *    stickman throws now.
+ *  • Closing, another page operates: refused until this page has watched
+ *    the turn sit for MANUAL_TAKEOVER_MS (that page is gone); then this page stamps itself
+ *    operator and finishes the turn from tickManualCraps once the stamp has
+ *    converged — never two settles from two shareholders' presses.
+ */
+export function pressManualRoll(tableId: string, now = Date.now()): string | null {
+  if (!readCrapsTableState(tableId)) openCrapsBetting(tableId, 1, null);
+  const s = readCrapsTableState(tableId);
+  if (!s) return null;
+  if (s.phase === 'betting') {
+    seatedPlayers(tableId, now);
+    if (seatsUnconfirmed(tableId, now)) return 'CHECKING WHO IS AT THE TABLE — PRESS AGAIN IN A MOMENT';
+    tookOverAt.delete(tableId);
+    closeCrapsBetting(tableId, s, now, true);
+    return null;
+  }
+  if (s.phase !== 'closing') return null;
+  if (s.operator === PAGE_ID) {
+    tickCrapsClosing(tableId, s, undefined, Infinity);
+    tookOverAt.delete(tableId);
+    return null;
+  }
+  if (now - noteClosing(tableId, s, now) < MANUAL_TAKEOVER_MS) {
+    return 'THE DICE ARE OUT — ANOTHER HOUSE MEMBER IS RUNNING THIS ROLL';
+  }
+  writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
+  tookOverAt.set(tableId, { at: now, round: s.round, epoch: casinoDocEpoch() });
+  return null;
 }
 
 /**
@@ -122,6 +388,7 @@ function hasLiveBets(tableId: string): boolean {
  */
 export function tickAutoStickman(tableId: string): void {
   const now = Date.now();
+  sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
   if (!s) {
     openCrapsBetting(tableId, 1, null);
@@ -133,19 +400,13 @@ export function tickAutoStickman(tableId: string): void {
         writeCrapsTableState(tableId, { ...s, phaseDeadline: now + CRAPS_BET_WINDOW_MS });
       }
     } else if (now >= s.phaseDeadline) {
-      writeCrapsTableState(tableId, {
-        ...s,
-        phase: 'closing',
-        phaseDeadline: now + CRAPS_CLOSING_MS,
-      });
+      closeCrapsBetting(tableId, s, now);
     }
   } else if (s.phase === 'closing') {
-    if (now >= (s.phaseDeadline ?? now)) {
-      rollAndSettleCraps(tableId, s.round, s.point, CRAPS_SHOW_MS);
-    }
+    tickCrapsClosing(tableId, s, CRAPS_SHOW_MS, now);
   } else if (s.phase === 'settled') {
     if (s.phaseDeadline != null && now >= s.phaseDeadline) {
-      openCrapsBetting(tableId, s.round + 1, s.point);
+      openCrapsBetting(tableId, s.round + 1, s.point, s);
     }
   }
 }
