@@ -38,7 +38,7 @@
 import {
   AH_GOAL_PAUSE_MS, AH_GOALS_TO_WIN, AH_HALF_L, AH_HALF_W, AH_PUCK_R,
   AH_SERVE_DELAY_MS, AH_STUCK_SPEED, AH_STUCK_TIMEOUT_MS,
-  claimSide, clampMallet, initialAirHockeyState, isVersus, otherSide, releaseSide,
+  canResetAirHockey, claimSide, clampMallet, initialAirHockeyState, isVersus, otherSide, releaseSide,
   malletFromTick, malletToTick, puckFromTick, puckToTick, seatOf,
   servePosition, setReady, setUnready, startIfReady, startPractice, stepPuck,
   takeSeat, withForfeit, withGoal,
@@ -47,10 +47,11 @@ import type {
   AirHockeySide, AirHockeyState, MalletInput, PuckSim,
 } from './games/airHockey';
 import {
-  readAirHockey, readPlayerDisplayName, readRoomOwner, subscribeGames,
+  readAirHockey, readPlayerDisplayName, subscribeGames,
   writeGame,
 } from './games/gamesDoc';
 import { casinoDocEpoch } from './casinoDoc';
+import { canEditRoom } from './editMode';
 // #116 review fix: HTML escaper for peer-authored strings that reach
 // innerHTML (the seat-row display-name interpolation, previously an XSS).
 import { escapeHtml } from './htmlEscape';
@@ -950,13 +951,10 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     if (ns) writeGame(deps.itemId, ns);
   };
 
-  /** RESET/NEW MATCH gate (checkers canReset precedent): anyone once ended;
-   *  participants or the room owner otherwise (recovers crash-leaked claims). */
-  const canReset = (s: AirHockeyState | null): boolean => {
-    if (!s) return false;
-    if (s.status === 'ended') return true;
-    return s.players.a === myId || s.players.b === myId || readRoomOwner() === myId;
-  };
+  /** RESET/NEW MATCH gate — the pure rule is canResetAirHockey; the owner
+   *  half goes through the shared edit gate (recovers crash-leaked claims). */
+  const canReset = (s: AirHockeyState | null): boolean =>
+    canResetAirHockey(s, myId, canEditRoom().ok);
 
   const doReset = (): void => {
     const s = state();
