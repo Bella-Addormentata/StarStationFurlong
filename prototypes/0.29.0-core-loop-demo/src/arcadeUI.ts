@@ -9,8 +9,9 @@
  * (arcadeNesCabinet.ts), so World opens that in place of PLAY.
  *
  * SETTINGS, from the ⚙️ low on the cabinet's front (or the ⚙️ at the
- * controls): the game on the cabinet and where EmulatorJS's files come
- * from, readable by anyone, and changed there by the owner alone (the slot
+ * controls): the game on the cabinet, who is playing it at which stand, and
+ * where EmulatorJS's files come from, readable by anyone, and changed there
+ * by the owner alone, who can also RESET a stuck cabinet (the slot
  * machine's and the casino tables' ⚙️ card: THE OWNER SETS THIS · ANYONE
  * CAN LOOK). The owner picks one of two kinds of game: a FREE GAME the app
  * ships (the built-in emulator, on the cabinet's screen, for the room), or
@@ -37,6 +38,9 @@ import type { ArcadeCore, ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES as BUILT_IN_GAMES, LICENSE_LABEL } from './arcadeLibrary';
 import { rememberLocalRom, romAcceptList, EMULATOR_FETCH_COMMAND } from './arcadeEmulator';
 import { heldRom, holdRom, sha256Hex, ROM_SHARE_MAX_BYTES } from './arcadeRomShare';
+import type { ArcadeMatch } from './games/arcade';
+import { readArcade, readPlayerDisplayName, subscribeGames, writeArcade } from './games/gamesDoc';
+import { getPlayerId } from './identity';
 import { urlConsent, urlRefusal } from './tvConsent';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
@@ -67,6 +71,8 @@ export interface ArcadeDeviceDeps {
    *  owner puts a built-in game on (World picks the UI for the game). */
   openSettings?: () => void;
   openPlay?: () => void;
+  /** The cabinet's stands: 2 for the two-player cabinet (default 1). */
+  seats?: 1 | 2;
 }
 
 export type ArcadePanelView = 'play' | 'settings';
@@ -209,6 +215,75 @@ function fileNote(g: ArcadeGame, owner: boolean): string {
   return `<div style="font-size:9px; color:${DIM}; line-height:1.4;">Sent to each player who presses play, through the room, from whoever has it here: the owner's computer, or a player who got it. ${here}</div>`;
 }
 
+/** Who holds player 1 and player 2 of a built-in game's match, in words
+ *  (#246's card): YOU for this player, an open stand on the two-player
+ *  cabinet, or a second gamepad on player one's computer on the other. */
+export function matchPlayers(m: ArcadeMatch, seats: 1 | 2, me: string): Array<{ player: 1 | 2; who: string }> {
+  const name = (id: string) => (id === me ? 'YOU' : readPlayerDisplayName(id).toUpperCase());
+  const hostPlayer: 1 | 2 = m.hostSeat === 0 ? 1 : 2;
+  const other: 1 | 2 = hostPlayer === 1 ? 2 : 1;
+  const players = [{ player: hostPlayer, who: name(m.host) }];
+  if (m.guest) players.push({ player: other, who: name(m.guest) });
+  else if (seats === 2) players.push({ player: other, who: `OPEN · STEP UP TO THE ${other === 1 ? 'LEFT' : 'RIGHT'} STAND` });
+  else players.push({ player: other, who: "A SECOND GAMEPAD ON PLAYER 1'S COMPUTER" });
+  return players.sort((a, b) => a.player - b.player);
+}
+
+/** What RESET would end on the cabinet now: a built-in game's match (for
+ *  everyone watching or playing), player one's seat at the owner's own game
+ *  (when this page may free it: the deed holder's EJECT), or nothing. */
+function resettable(itemId: string): 'match' | 'seat' | null {
+  const game = readCabinet(itemId).game;
+  if (game?.bundled) return readArcade(itemId) ? 'match' : null;
+  const seat = readSeat(itemId);
+  const held = seat.holder !== '' && !seatLapsed(itemId);
+  return held && (iAmP1(itemId) || mayEjectP1()) ? 'seat' : null;
+}
+
+/** SETTINGS' NOW PLAYING: who is at which stand, and the owner's RESET. */
+function nowPlaying(itemId: string, deps: ArcadeDeviceDeps, owner: boolean): string {
+  const game = readCabinet(itemId).game;
+  const line = (text: string) => `<div style="font-size:10px; color:${GOLD_BRIGHT}; line-height:1.5;">${text}</div>`;
+  let lines: string;
+  if (game?.bundled) {
+    const m = readArcade(itemId);
+    lines = m
+      ? matchPlayers(m, deps.seats ?? 1, getPlayerId()).map((p) => line(`PLAYER ${p.player} · ${esc(p.who)}`)).join('')
+      : line('Nobody · step up and press Enter to play.');
+  } else if (game) {
+    const seat = readSeat(itemId);
+    const held = seat.holder !== '' && !seatLapsed(itemId);
+    lines = held
+      ? line(`PLAYER 1 · ${iAmP1(itemId) ? 'YOU' : esc((seat.name || 'a clone').toUpperCase())}`)
+      : line('Nobody · step up and INSERT COIN to play.');
+  } else {
+    lines = line('Nothing is on the cabinet.');
+  }
+  const reset = owner
+    ? `<div style="display:flex; gap:6px; align-items:center; justify-content:space-between;">
+        <span style="font-size:9px; color:${DIM}; line-height:1.4;">RESET ends the game running here for everyone and frees the stands.</span>
+        ${smallButton('data-arcade-reset="1"', '↺ RESET', resettable(itemId) !== null)}
+      </div>`
+    : '';
+  return section('NOW PLAYING', `${lines}${reset}`);
+}
+
+/** The owner's RESET: end the match or free player one's seat. The note
+ *  (null: not the owner's press). Exported for its tests. */
+export function resetArcadeCabinet(itemId: string, owner: boolean): string | null {
+  if (!owner) return null;
+  const what = resettable(itemId);
+  if (what === 'match') {
+    writeArcade(itemId, null);
+    return 'The game ended · the cabinet is free.';
+  }
+  if (what === 'seat') {
+    const r = standUp(itemId);
+    return r.ok ? 'Player one stood up · the cabinet is free.' : r.error;
+  }
+  return 'Nothing is running here.';
+}
+
 /** PLAY: at the cabinet — the owner's own game, and PLAYER ONE. */
 function renderPlay(itemId: string, deps: ArcadeDeviceDeps): string {
   const rec = readCabinet(itemId);
@@ -315,6 +390,7 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
       <div data-arcade-role="1" style="font-size:9px; color:${DIM}; letter-spacing:1px; margin-top:3px;">${owner ? 'YOU RUN THIS CABINET' : 'THE OWNER SETS THIS CABINET · ANYONE CAN LOOK'}</div>
     </div>
     ${section('ON THE CABINET · ONE GAME', onCabinet)}
+    ${nowPlaying(itemId, deps, owner)}
     ${builtIn}
     ${load}
     ${section('EMULATORJS FILES', `${files}<div style="font-size:9px; color:${DIM}; line-height:1.4;">${emulatorFilesText(lanesOn)}</div>`)}
@@ -352,6 +428,10 @@ function wirePanel(panel: HTMLElement, itemId: string, deps: ArcadeDeviceDeps, r
     const r = game ? putOnCabinet(itemId, game) : { ok: false as const, error: 'That game is not in this build.' };
     note(r.ok ? `On the cabinet: ${game!.name}` : r.error);
   }));
+  q<HTMLButtonElement>('[data-arcade-reset]')?.addEventListener('click', () => {
+    const text = resetArcadeCabinet(itemId, deps.canEdit());
+    if (text) note(text);
+  });
   q<HTMLButtonElement>('[data-arcade-takeoff]')?.addEventListener('click', () => {
     const r = takeOffCabinet(itemId);
     if (!r.ok) note(r.error);
@@ -464,6 +544,7 @@ export function createArcadeCabinetUI(deps: ArcadeDeviceDeps): DeviceUI {
       const subs = [
         subscribeArcadeKey(cabinetKey(deps.itemId), render),
         subscribeArcadeKey(seatKey(deps.itemId), render),
+        subscribeGames(render), // a built-in game's match: who is at which stand
       ];
       unsubscribe = () => { for (const s of subs) s(); };
       // The seat lapses without a write; the status line moves with it.

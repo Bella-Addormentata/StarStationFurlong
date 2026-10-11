@@ -6067,6 +6067,7 @@ export class World {
       view,
       openSettings: swap("settings"),
       openPlay: swap("play"),
+      seats: standsForItem(deviceId).length > 0 ? 2 : 1,
     });
   }
 

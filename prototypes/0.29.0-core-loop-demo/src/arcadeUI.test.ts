@@ -7,12 +7,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { setConvenienceLanesForTest } from './sovereignty';
 import {
-  bindArcadeDoc, putOnCabinet, takeOffCabinet, setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate,
+  bindArcadeDoc, insertCoin, putOnCabinet, takeOffCabinet, setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate,
   setArcadeIdentity, setArcadePageId, setEmulatorData,
 } from './arcadeDoc';
 import type { ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES } from './arcadeLibrary';
-import { renderArcadePanel, type ArcadeDeviceDeps } from './arcadeUI';
+import { matchPlayers, renderArcadePanel, resetArcadeCabinet, type ArcadeDeviceDeps } from './arcadeUI';
+import { newMatch, type ArcadeMatch } from './games/arcade';
+import { bindGamesDoc, readArcade, writeArcade } from './games/gamesDoc';
 
 const CAB = 'arcade-cabinet-1';
 const LJ65: ArcadeGame = { name: 'lj65.nes', core: 'nes', url: '', size: 40_976 };
@@ -38,6 +40,9 @@ beforeEach(() => {
   setArcadePageId('tab-a');
   setArcadeIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
   bindArcadeDoc(new Y.Doc());
+  const games = new Y.Doc();
+  games.getMap('players').set('bob-id', { name: 'Bob <b>' });
+  bindGamesDoc(games);
   setConvenienceLanesForTest(true);
   owner = true;
   expect(setEmulatorData(CAB, 'cdn').ok).toBe(true);
@@ -99,6 +104,60 @@ describe('the SETTINGS view (the ⚙️)', () => {
     ownerPuts({ ...LJ65, name: '<img src=x onerror=alert(1)>.nes' });
     const html = renderArcadePanel(CAB, deps('settings', false));
     expect(html).not.toContain('<img');
+  });
+});
+
+describe('NOW PLAYING and the owner\'s RESET (#246\'s card)', () => {
+  const match = (over: Partial<ArcadeMatch> = {}): ArcadeMatch => ({
+    ...newMatch({ game: 'thwaite', host: 'bob-id', hostPage: 'tab-b', hostSeat: 0, now: 1 }), ...over,
+  });
+
+  it('names who holds each player of a built-in game, and what the other stand is', () => {
+    expect(matchPlayers(match(), 2, 'me')).toEqual([
+      { player: 1, who: 'BOB <B>' },
+      { player: 2, who: 'OPEN · STEP UP TO THE RIGHT STAND' },
+    ]);
+    expect(matchPlayers(match({ hostSeat: 1 }), 2, 'bob-id')).toEqual([
+      { player: 1, who: 'OPEN · STEP UP TO THE LEFT STAND' },
+      { player: 2, who: 'YOU' },
+    ]);
+    expect(matchPlayers(match(), 1, 'me')[1].who).toBe("A SECOND GAMEPAD ON PLAYER 1'S COMPUTER");
+
+    writeArcade(CAB, match());
+    const html = renderArcadePanel(CAB, { ...deps('settings', false), seats: 2 });
+    expect(html).toContain('NOW PLAYING');
+    expect(html).toContain('PLAYER 1 · BOB &lt;B&gt;'); // a peer's name, escaped
+    expect(html).toContain('PLAYER 2 · OPEN · STEP UP TO THE RIGHT STAND');
+    expect(html).not.toContain('data-arcade-reset'); // a visitor reads it
+  });
+
+  it('lets the owner end a built-in game for everyone, and nobody else', () => {
+    writeArcade(CAB, match());
+    const html = renderArcadePanel(CAB, deps('settings', true));
+    expect(html).toContain('data-arcade-reset="1"');
+    expect(html).not.toContain('data-arcade-reset="1" disabled');
+    expect(resetArcadeCabinet(CAB, false)).toBeNull();
+    expect(readArcade(CAB)).not.toBeNull();
+    expect(resetArcadeCabinet(CAB, true)).toBe('The game ended · the cabinet is free.');
+    expect(readArcade(CAB)).toBeNull();
+    const after = renderArcadePanel(CAB, deps('settings', true));
+    expect(after).toContain('Nobody · step up and press Enter to play.');
+    expect(after).toContain('data-arcade-reset="1" disabled');
+  });
+
+  it('frees player one\'s seat at the owner\'s own game, when this page may eject', () => {
+    ownerPuts(LJ65);
+    setArcadeIdentity(() => ({ pub: 'BBBBbobpub', name: 'Bob' }));
+    setArcadePageId('tab-b');
+    expect(insertCoin(CAB).ok).toBe(true);
+    setArcadeIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    setArcadePageId('tab-a');
+    const html = renderArcadePanel(CAB, deps('settings', true));
+    expect(html).toContain('PLAYER 1 · BOB');
+    expect(html).toContain('data-arcade-reset="1" disabled'); // no EJECT here (not the deed holder)
+    setArcadeEjectPredicate(() => true);
+    expect(resetArcadeCabinet(CAB, true)).toBe('Player one stood up · the cabinet is free.');
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Nobody · step up and INSERT COIN to play.');
   });
 });
 
