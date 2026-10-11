@@ -506,9 +506,18 @@ export function alligatorsFrame(dt: number): void {
     // meanwhile, so this page comes back as a fresh operator. Landings the
     // network queued during the stall were judged by that other seat
     // already; replaying them on adopted positions would eat phantom balls.
+    // A bite of this page's own that was mid-air when the frames stopped is
+    // cancelled for the same reason.
     if (now - st.lastFrameAt > OPERATOR_TAKEOVER_MS) {
       st.wasOperator = false;
       st.pendingBites = [];
+      if (st.engaged) {
+        st.engaged.biteT = null;
+        st.engaged.landed = false;
+        st.engaged.lunge = false;
+        st.engaged.pushes = [];
+        st.engaged.pushSinceClick = 0;
+      }
     }
     st.lastFrameAt = now;
 

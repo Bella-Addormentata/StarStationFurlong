@@ -167,6 +167,18 @@ describe('the operator', () => {
     expect(readAlligators(TABLE)!.eaten[0]).toBe(IA_LIVE);
   });
 
+  it('cancels its own bite that was mid-air when its frames stalled', () => {
+    const { st } = versus();
+    run(IA_LAY_START_MS + 300);
+    const m = mouthOf(0, { swing: 0, ext: 0 });
+    st.balls[0] = { x: m.x, z: m.z, vx: 0, vz: 0 };
+    (st.engaged as { biteT: number | null }).biteT = 0;
+    vi.setSystemTime(Date.now() + 5000);
+    alligatorsFrame(0.1); // main.ts clamps a resumed frame's dt to 0.1 s
+    run(IA_BITE_DONE_S * 1000);
+    expect(readAlligators(TABLE)!.eaten[0]).toBe(IA_LIVE);
+  });
+
   it("adopts the newer operator's ball over its own stale one on takeover", () => {
     const { st } = versus();
     run(IA_LAY_START_MS + 300);

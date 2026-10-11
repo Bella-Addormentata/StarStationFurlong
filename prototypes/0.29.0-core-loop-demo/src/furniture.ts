@@ -3922,7 +3922,8 @@ const buildAlligatorsTable = (ctx: BuildCtx): void => {
       b.position.z = z;
     },
     setSpin(angle): void {
-      top.rotation.y = angle;
+      // The engine turns +x toward +z; three's +rotation.y turns +x toward −z.
+      top.rotation.y = -angle;
     },
     setDisplay(seat, count, lit, flashing): void {
       const d = displays[seat];

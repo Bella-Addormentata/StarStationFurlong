@@ -93,6 +93,21 @@ describe('the alligators table as built', () => {
     expect(shown).toBe(IA_MAX_BALLS);
   });
 
+  it('turns the felt the way the engine drags the balls', () => {
+    const { group, handle } = buildTable();
+    const before = new Map<THREE.Object3D, number>();
+    group.traverse((obj) => before.set(obj, obj.rotation.y));
+    handle.setSpin(0.3);
+    let felt: THREE.Object3D | null = null;
+    group.traverse((obj) => {
+      if (obj.rotation.y !== before.get(obj)) felt = obj;
+    });
+    expect(felt).not.toBeNull();
+    // The engine's surface velocity at (1, 0) is (0, +ω): +x turns toward +z.
+    const p = new THREE.Vector3(1, 0, 0).applyEuler(felt!.rotation);
+    expect(p.z).toBeGreaterThan(0);
+  });
+
   it('rings the table with one stand per seat, each facing the centre', () => {
     const stands = FURNITURE_DEFS['alligators-table'].stands!;
     expect(stands).toHaveLength(IA_SEATS);
