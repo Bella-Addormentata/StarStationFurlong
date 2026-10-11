@@ -16,6 +16,9 @@
  *   cashed:<playerId>         → number   lifetime chips returned to the cage
  *   table:<tableId>           → RouletteTableState (croupier-written)
  *   bets:<tableId>:<playerId> → { round, bets: RouletteBet[] } (owner-written)
+ *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
+ *   throw:<tableId>           → DiceThrow (the shooter's fling, or the
+ *                                        stickman's when it throws for them)
  *
  * Every player-scoped key is written by exactly one writer in normal play, so
  * per-key LWW is safe. The one shared writer pair is bal:<pid> (owner spends,
@@ -264,8 +267,10 @@ export function clearTableKeys(tableId: string): void {
     // never writes them).
     map.delete(`cfg:backend:${tableId}`);
     map.delete(`cfg:fairness:${tableId}`);
+    map.delete(`throw:${tableId}`);
+    const seatPrefix = `seat:${tableId}:`;
     for (const key of [...map.keys()]) {
-      if (key.startsWith(betPrefix)) map.delete(key);
+      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix)) map.delete(key);
     }
   });
 }
@@ -372,6 +377,108 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
     out[key.slice(prefix.length)] = value.bets;
   }
   return out;
+}
+
+// ── 🎲🎡 #226: who stands where, and the shooter's throw ─────────────────────
+// A player at a table writes `seat:<tableId>:<pid>` while they are focused
+// there: which stand they took (so their chips sit in front of them on every
+// client) and the stand's angle round the table (the clockwise order the dice
+// travel in). `at` is refreshed every few seconds — the operator treats a seat
+// whose `at` stops changing as gone, on ITS OWN clock (see crapsCroupier), so
+// a crashed page cannot hold the dice forever.
+
+export interface TableSeat {
+  /** Index into the table's stand list. */
+  stand: number;
+  /** atan2(z, x) of the stand in the table's local frame. */
+  angle: number;
+  /** The writer's clock at the last refresh (only ever compared to itself). */
+  at: number;
+}
+
+function isTableSeat(v: unknown): v is TableSeat {
+  if (typeof v !== 'object' || v === null) return false;
+  const s = v as Partial<TableSeat>;
+  return Number.isInteger(s.stand) && (s.stand as number) >= 0 && (s.stand as number) < 32
+    && typeof s.angle === 'number' && Number.isFinite(s.angle)
+    && typeof s.at === 'number' && Number.isFinite(s.at);
+}
+
+export function writeMySeat(tableId: string, playerId: string, seat: TableSeat): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`seat:${tableId}:${playerId}`, seat);
+  });
+}
+
+export function clearMySeat(tableId: string, playerId: string): void {
+  const map = ensureMap();
+  if (!map.has(`seat:${tableId}:${playerId}`)) return;
+  boundDoc!.transact(() => {
+    map.delete(`seat:${tableId}:${playerId}`);
+  });
+}
+
+/** One player's seat on one table (a keyed read — no scan). */
+export function readSeat(tableId: string, playerId: string): TableSeat | null {
+  const v = ensureMap().get(`seat:${tableId}:${playerId}`);
+  return isTableSeat(v) ? v : null;
+}
+
+/** Every seat record on one table, playerId → seat (freshness is the
+ *  reader's call — the operator's, or the renderer's "anyone here?"). */
+export function readSeats(tableId: string): Record<string, TableSeat> {
+  const prefix = `seat:${tableId}:`;
+  const out: Record<string, TableSeat> = {};
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix) || !isTableSeat(value)) continue;
+    const pid = key.slice(prefix.length);
+    // The key is peer-written too: a seat whose player id the table state
+    // can't hold (isCrapsTableState's 1–128 chars) could never be the
+    // shooter, so it isn't a seat.
+    if (pid.length === 0 || pid.length > 128) continue;
+    out[pid] = value;
+  }
+  return out;
+}
+
+/** 🎲 One throw of the dice: who threw on which roll, from where and how hard
+ *  (table-local felt coords, a unit direction, power 0..1) and the tumble
+ *  seed. COSMETIC — the dice faces come from the table's fairness mode at the
+ *  settle; this only lets every client animate the same fling. */
+export interface DiceThrow {
+  round: number;
+  /** The shooter's player id, or 'stickman'. */
+  by: string;
+  sx: number;
+  sz: number;
+  dx: number;
+  dz: number;
+  power: number;
+  seed: number;
+}
+
+function isDiceThrow(v: unknown): v is DiceThrow {
+  if (typeof v !== 'object' || v === null) return false;
+  const t = v as Partial<DiceThrow>;
+  const fin = (n: unknown) => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) < 100;
+  return Number.isInteger(t.round) && (t.round as number) >= 1
+    && typeof t.by === 'string' && t.by.length > 0 && t.by.length <= 128
+    && fin(t.sx) && fin(t.sz) && fin(t.dx) && fin(t.dz)
+    && typeof t.power === 'number' && t.power >= 0 && t.power <= 1
+    && Number.isInteger(t.seed);
+}
+
+export function readDiceThrow(tableId: string): DiceThrow | null {
+  const v = ensureMap().get(`throw:${tableId}`);
+  return isDiceThrow(v) ? v : null;
+}
+
+export function writeDiceThrow(tableId: string, t: DiceThrow): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`throw:${tableId}`, t);
+  });
 }
 
 // ── 🎲🔗 Craps settlement backend preference (#69 G5 seam) ────────────────────
