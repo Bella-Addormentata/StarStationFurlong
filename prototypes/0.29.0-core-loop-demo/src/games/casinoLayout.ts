@@ -108,6 +108,45 @@ export function hitRegion<B>(layout: FeltLayout<B>, p: FeltPoint): FeltRegion<B>
   return null;
 }
 
+/** A region's anchor: the centre of its largest rect (where its caption is
+ *  printed, and where keyboard play points at it). */
+export function regionCenter<B>(rg: FeltRegion<B>): FeltPoint {
+  const main = rg.rects.reduce((a, b) =>
+    (b.x1 - b.x0) * (b.z1 - b.z0) > (a.x1 - a.x0) * (a.z1 - a.z0) ? b : a);
+  return { x: (main.x0 + main.x1) / 2, z: (main.z0 + main.z1) / 2 };
+}
+
+/**
+ * Keyboard play's arrow keys: from point `from`, the nearest other point
+ * lying in direction (dx, dy) — screen space, so ↑ is up on screen whichever
+ * side of the table you stand. Points well off the arrow's axis cost more
+ * than points straight along it. -1 when nothing lies that way.
+ */
+export function nearestInDirection(
+  points: ReadonlyArray<{ x: number; y: number } | null>,
+  from: number,
+  dx: number,
+  dy: number,
+): number {
+  const o = points[from];
+  if (!o) return -1;
+  let best = -1;
+  let bestCost = Infinity;
+  points.forEach((q, i) => {
+    if (!q || i === from) return;
+    const vx = q.x - o.x, vy = q.y - o.y;
+    const along = vx * dx + vy * dy;
+    if (along <= 1e-6) return;
+    const across = Math.abs(vx * dy - vy * dx);
+    const cost = along + across * 2.5;
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = i;
+    }
+  });
+  return best;
+}
+
 export function hitSettings(layout: FeltLayout<unknown>, p: FeltPoint): boolean {
   const b = layout.settings;
   return Math.hypot(p.x - b.x, p.z - b.z) <= b.r;

@@ -16,6 +16,8 @@ import {
   crapsPuckSpot,
   hitRegion,
   hitSettings,
+  nearestInDirection,
+  regionCenter,
   inRect,
   rectCentre,
   ROULETTE_LAYOUT,
@@ -148,5 +150,38 @@ describe('chip slots', () => {
       { pid: 'b', anchor: null },
     ]);
     expect(got.size).toBe(2);
+  });
+});
+
+describe('keyboard play', () => {
+  it('anchors every box inside itself, so it hit-tests as that box', () => {
+    for (const layout of [CRAPS_LAYOUT, ROULETTE_LAYOUT] as FeltLayout<unknown>[]) {
+      for (const rg of layout.regions) expect(hitRegion(layout, regionCenter(rg))?.id).toBe(rg.id);
+    }
+  });
+
+  it('arrows step to the nearest point that way, preferring straight lines', () => {
+    const pts = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0.6, y: 0.5 }, { x: 0, y: 1 }, { x: -1, y: 0.1 }];
+    expect(nearestInDirection(pts, 0, 1, 0)).toBe(1);
+    expect(nearestInDirection(pts, 0, 0, 1)).toBe(3);
+    expect(nearestInDirection(pts, 0, -1, 0)).toBe(4);
+    expect(nearestInDirection(pts, 0, 0, -1)).toBe(-1);
+    expect(nearestInDirection([null, { x: 1, y: 0 }], 0, 1, 0)).toBe(-1);
+  });
+
+  it('reaches every box on both felts', () => {
+    for (const layout of [CRAPS_LAYOUT, ROULETTE_LAYOUT] as FeltLayout<unknown>[]) {
+      const pts = layout.regions.map((rg) => { const c = regionCenter(rg); return { x: -c.x, y: c.z }; });
+      const seen = new Set([0]);
+      const queue = [0];
+      while (queue.length) {
+        const i = queue.shift()!;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const j = nearestInDirection(pts, i, dx, dy);
+          if (j >= 0 && !seen.has(j)) { seen.add(j); queue.push(j); }
+        }
+      }
+      expect(seen.size).toBe(layout.regions.length);
+    }
   });
 });

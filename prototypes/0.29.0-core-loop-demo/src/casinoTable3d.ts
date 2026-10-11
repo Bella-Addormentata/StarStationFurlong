@@ -104,6 +104,11 @@ export interface CasinoTableVisualHandle {
   /** Ball resting in `result` (null: ball off the wheel, betting open). */
   wheelRest(result: number | null): void;
   wheelSpinning(): boolean;
+  /** Keyboard play's selected box, ringed on the felt (null: none). */
+  setFocusRegion(id: string | null): void;
+  /** Where a felt point appears on screen, in normalised device coords
+   *  (x right, y up, both −1..1), or null when the table isn't placed. */
+  toScreen(p: FeltPoint, camera: THREE.Camera): { x: number; y: number } | null;
   /** Is `p` on one of the local player's own stacks on the felt? */
   onMyStack(ray: THREE.Raycaster, p: FeltPoint): FeltPoint | null;
   /** Back to an empty table: no chips, nothing lit, puck off, any throw or
@@ -169,7 +174,7 @@ const FELT_PX_PER_M = 760;
 interface FeltCanvas {
   cv: HTMLCanvasElement;
   mat: THREE.MeshBasicMaterial;
-  repaint(highlight: ReadonlySet<string>): void;
+  repaint(highlight: ReadonlySet<string>, focus?: string | null): void;
 }
 
 /** Canvas px for a felt point. The texture is NOT flipped, so canvas-up is +z
@@ -189,7 +194,7 @@ function rectToPx(f: FeltRect, W: number, H: number, r: FeltRect): { x: number; 
 
 function paintRegion<B>(
   c: CanvasRenderingContext2D, f: FeltRect, W: number, H: number,
-  rg: FeltRegion<B>, lit: boolean,
+  rg: FeltRegion<B>, lit: boolean, focused = false,
 ): void {
   const k = FELT_PX_PER_M;
   for (const r of rg.rects) {
@@ -205,6 +210,15 @@ function paintRegion<B>(
     c.lineWidth = lit ? 6 : 3;
     c.strokeStyle = lit ? '#FFD666' : LINE;
     c.strokeRect(q.x + 1.5, q.y + 1.5, q.w - 3, q.h - 3);
+    if (focused) {
+      // Keyboard play's selected box: a bright dashed ring inside the line.
+      c.save();
+      c.setLineDash([14, 8]);
+      c.lineWidth = 7;
+      c.strokeStyle = '#7FE7FF';
+      c.strokeRect(q.x + 8, q.y + 8, q.w - 16, q.h - 16);
+      c.restore();
+    }
   }
   // Caption at the centre of the region's first (largest) rect.
   const main = rg.rects.reduce((a, b) =>
@@ -263,7 +277,7 @@ function makeFeltCanvas<B>(
     mat.map.repeat.x = -1;
     mat.map.offset.x = 1;
   }
-  const repaint = (highlight: ReadonlySet<string>): void => {
+  const repaint = (highlight: ReadonlySet<string>, focus: string | null = null): void => {
     const c = cv.getContext('2d');
     if (!c) return;
     const px = (x: number, z: number) => feltToPx(f, W, H, x, z);
@@ -272,7 +286,7 @@ function makeFeltCanvas<B>(
     c.fillStyle = FELT_LIGHT;
     c.fillRect(10, 10, W - 20, H - 20);
     decorate(c, px);
-    for (const rg of layout.regions) paintRegion(c, f, W, H, rg, highlight.has(rg.id));
+    for (const rg of layout.regions) paintRegion(c, f, W, H, rg, highlight.has(rg.id), rg.id === focus);
     // The ⚙️ table-settings ring printed under the raised button.
     const b = layout.settings;
     const [bx, by] = px(b.x, b.z);
@@ -1084,6 +1098,8 @@ class TableHandle implements CasinoTableVisualHandle {
   private hand: { p: FeltPoint; chips: readonly number[] } | null = null;
   private dirty = true;
   private highlightKey = '';
+  private highlightIds: ReadonlySet<string> = new Set();
+  private focusId: string | null = null;
   private readonly plane = new THREE.Plane();
   private readonly v = new THREE.Vector3();
 
@@ -1152,7 +1168,22 @@ class TableHandle implements CasinoTableVisualHandle {
     const key = [...ids].sort().join('|');
     if (key === this.highlightKey) return;
     this.highlightKey = key;
-    this.c.felt.repaint(ids);
+    this.highlightIds = ids;
+    this.c.felt.repaint(ids, this.focusId);
+  }
+
+  setFocusRegion(id: string | null): void {
+    if (id === this.focusId) return;
+    this.focusId = id;
+    this.c.felt.repaint(this.highlightIds, id);
+  }
+
+  toScreen(p: FeltPoint, camera: THREE.Camera): { x: number; y: number } | null {
+    const g = this.group();
+    if (!g) return null;
+    g.updateMatrixWorld();
+    const v = g.localToWorld(new THREE.Vector3(p.x, FELT_Y, p.z)).project(camera);
+    return { x: v.x, y: v.y };
   }
 
   setSettingsHot(hot: boolean): void {

@@ -50,7 +50,7 @@ import type { DeviceUI } from './devices';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import {
   assignSlots, chipSlots, crapsChipRect, crapsSideFor, CRAPS_LAYOUT, hitRegion,
-  hitSettings, ROULETTE_LAYOUT, spotKey,
+  hitSettings, nearestInDirection, regionCenter, ROULETTE_LAYOUT, spotKey,
 } from './games/casinoLayout';
 import type { FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
 import { canPlaceBet, crapsBetLabel, pointWasOn } from './games/craps';
@@ -396,6 +396,13 @@ type AnyBet = { type: string; pick?: number; amount: number };
 
 const sumOf = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0);
 
+/** "Forward" for a player at `stand` (table-local): away from their own
+ *  rail, toward the far side. */
+function inwardFrom(stand: FeltPoint, halfZ: number): FeltPoint {
+  const endRail = Math.abs(stand.z) > halfZ;
+  return { x: -Math.sign(endRail ? 0 : stand.x), z: -Math.sign(endRail ? stand.z : 0) };
+}
+
 /**
  * The focused craps / roulette table: no panel, the table is the game. Mounts
  * a capture layer over the 3D view, a status bar and (on ⚙️) the settings
@@ -429,6 +436,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let held: Array<{ t: number; p: FeltPoint }> | null = null;
   let flash = '';
   let flashUntil = 0;
+  /** What the screen-reader live region says (notices and keyboard play). */
+  let liveText = '';
+  let liveTick = false;
+  /** Keyboard play's selected box (an index into layout.regions), -1: none. */
+  let focusIdx = -1;
   /** Chips I put down this betting window, by spot (the only ones I may take
    *  back — a craps bet from an earlier roll is a contract on the felt). */
   let added = new Map<string, number[]>();
@@ -492,10 +504,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
   };
 
+  /** Tell a screen reader, without the on-screen notice. A trailing
+   *  zero-width space alternates so the same words are read again. */
+  const announce = (text: string): void => {
+    liveTick = !liveTick;
+    liveText = text + (liveTick ? '\u200b' : '');
+    renderBar();
+  };
+
   const say = (text: string): void => {
     flash = text;
     flashUntil = performance.now() + 2600;
-    renderBar();
+    announce(text);
   };
 
   // ── Rail + hand ───────────────────────────────────────────────────────────
@@ -625,7 +645,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const vz = (b.p.z - a.p.z) / dt;
     const speed = Math.hypot(vx, vz);
     // "Forward" is away from the shooter's own rail, toward the far side.
-    const inward = stand ? { x: -Math.sign(Math.abs(stand.z) > h.halfZ ? 0 : stand.x), z: -Math.sign(Math.abs(stand.z) > h.halfZ ? stand.z : 0) } : { x: 0, z: 1 };
+    const inward = stand ? inwardFrom(stand, h.halfZ) : { x: 0, z: 1 };
     const forward = (vx * inward.x + vz * inward.z) / (speed || 1);
     if (!s || !myThrowPending() || speed < FLING_MIN_SPEED || forward < 0.35) {
       say('FLING THE DICE FORWARD, ACROSS THE TABLE');
@@ -741,6 +761,137 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (held) throwDice();
   };
 
+  // ── Keyboard ──────────────────────────────────────────────────────────────
+  // The same game without a pointer: arrows pick a box on the felt (ringed,
+  // and read out), number keys pick chips off the rail, Enter bets them.
+
+  const KEY_HELP = `${game === 'craps' ? 'Craps' : 'Roulette'} table. Arrow keys choose a box on the felt. `
+    + '1 to 6 pick up a 1, 5, 25, 100, 500 or 1000 chip. Enter or Space bets your hand on the box. '
+    + 'Delete takes back the chips you put there this round. 0 puts your hand back. '
+    + `${game === 'craps' ? 'R throws the dice when they are yours. ' : ''}`
+    + 'I reads the table. S opens the table card. Escape steps away.';
+
+  const handLine = (): string => (hand.length
+    ? `Holding ${sumOf(hand)} in ${hand.length} chip${hand.length === 1 ? '' : 's'}.`
+    : 'Your hand is empty.');
+
+  const describeRegion = (rg: FeltRegion<Spot>): string => {
+    const key = spotKey(rg.bet);
+    const mine = myBets().filter((b) => spotKey(b) === key).reduce((a, b) => a + b.amount, 0);
+    return `${labelOf(rg.bet)}${rg.sub ? `, pays ${rg.sub}` : ''}. ${mine > 0 ? `Your chips here: ${mine}.` : 'None of your chips here.'} ${handLine()}`;
+  };
+
+  const selectRegion = (i: number): void => {
+    const rg = layout.regions[i];
+    if (!rg || !h) return;
+    focusIdx = i;
+    h.setFocusRegion(rg.id);
+    cursor = regionCenter(rg);
+    h.setHand(cursor, hand);
+    announce(describeRegion(rg));
+  };
+
+  const moveFocus = (dx: number, dy: number): void => {
+    const cam = deviceFocus.getCamera();
+    if (!h || !cam || layout.regions.length === 0) return;
+    const pts = layout.regions.map((rg) => h.toScreen(regionCenter(rg), cam));
+    if (focusIdx < 0) {
+      // First press: the box nearest the middle of the view.
+      let best = 0;
+      let bd = Infinity;
+      pts.forEach((q, i) => {
+        const d = q ? Math.hypot(q.x, q.y) : Infinity;
+        if (d < bd) {
+          bd = d;
+          best = i;
+        }
+      });
+      selectRegion(best);
+      return;
+    }
+    const j = nearestInDirection(pts, focusIdx, dx, dy);
+    if (j < 0) announce(`Edge of the table. ${labelOf(layout.regions[focusIdx].bet)}.`);
+    else selectRegion(j);
+  };
+
+  const pickDenom = (d: number): void => {
+    const i = railView.findIndex((st) => st.denom === d && st.count > 0);
+    if (i < 0) {
+      announce(`No ${d} chips in your rail. ${handLine()}`);
+      return;
+    }
+    if (hand.length >= HAND_MAX) {
+      announce(`Your hand is full. ${handLine()}`);
+      return;
+    }
+    takeFromStack(i);
+    announce(handLine());
+  };
+
+  const keyThrow = (): void => {
+    const s = crapsState();
+    if (!s || !myThrowPending() || !h) {
+      announce('The dice are not yours to throw.');
+      return;
+    }
+    const inward = stand ? inwardFrom(stand, h.halfZ) : { x: 0, z: 1 };
+    const from = rail
+      ? { x: rail.x + inward.x * 0.12, z: rail.z + inward.z * 0.12 }
+      : { x: 0, z: 0 };
+    const spread = (Math.random() - 0.5) * 0.4;
+    const dx = inward.x - inward.z * spread, dz = inward.z + inward.x * spread;
+    const len = Math.hypot(dx, dz) || 1;
+    writeDiceThrow(itemId, {
+      round: s.round,
+      by: me,
+      sx: from.x,
+      sz: from.z,
+      dx: dx / len,
+      dz: dz / len,
+      power: 0.6 + Math.random() * 0.3,
+      seed: Math.floor(Math.random() * 2 ** 31),
+    });
+    announce('You throw the dice.');
+  };
+
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    const k = e.key;
+    let handled = true;
+    if (k === 'ArrowLeft') moveFocus(-1, 0);
+    else if (k === 'ArrowRight') moveFocus(1, 0);
+    else if (k === 'ArrowUp') moveFocus(0, 1);
+    else if (k === 'ArrowDown') moveFocus(0, -1);
+    else if (k === 'Enter' || k === ' ') {
+      const rg = layout.regions[focusIdx];
+      if (!rg) moveFocus(0, 0);
+      else if (hand.length > 0) {
+        placeHand(rg);
+        announce(describeRegion(rg));
+      } else say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
+    } else if (k === 'Delete' || k === 'Backspace') {
+      const rg = layout.regions[focusIdx];
+      if (rg && takeBack(rg)) announce(describeRegion(rg));
+      else announce('Nothing of yours to take back here this round.');
+    } else if (k >= '1' && k <= '6') {
+      pickDenom([...CHIP_DENOMS].sort((a, b) => a - b)[Number(k) - 1]);
+    } else if (k === '0') {
+      hand = [];
+      refreshRail();
+      announce('Your chips are back in your rail.');
+    } else if ((k === 'r' || k === 'R') && game === 'craps') keyThrow();
+    else if (k === 'i' || k === 'I') {
+      announce(`${status().line}. You have ${readChips(me)} chips. ${handLine()}`);
+    } else if (k === 's' || k === 'S') {
+      toggleCard();
+      card?.querySelector<HTMLElement>('button')?.focus();
+    } else if (k === '?' || k === 'h' || k === 'H') announce(KEY_HELP);
+    else handled = false;
+    if (!handled) return;
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
   // ── Status bar ────────────────────────────────────────────────────────────
 
   const status = (): { line: string; color: string } => {
@@ -794,8 +945,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     // Screen readers hear each notice once (the status line ticks every
     // second, so it stays out of the live region).
     const live = bar.querySelector<HTMLDivElement>('[data-live]')!;
-    const said = showFlash ? flash : '';
-    if (live.textContent !== said) live.textContent = said;
+    if (live.textContent !== liveText) live.textContent = liveText;
   };
 
   // ── ⚙️ settings card ──────────────────────────────────────────────────────
@@ -870,8 +1020,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     rows.push(`<div style="font-size:9px;color:#56606C;border-top:1px solid rgba(212,168,75,0.12);padding-top:8px;line-height:1.6;">
       DRAG ACROSS THE CHIPS IN YOUR RAIL TO PICK THEM UP · CLICK A BOX TO BET THEM · CLICK AGAIN ELSEWHERE TO BET THE SAME ·
-      CLICK YOUR OWN CHIPS TO TAKE THEM BACK · RIGHT-CLICK PUTS YOUR HAND BACK · ESC STEPS AWAY</div>`);
+      CLICK YOUR OWN CHIPS TO TAKE THEM BACK · RIGHT-CLICK PUTS YOUR HAND BACK · ESC STEPS AWAY<br>
+      KEYS: ARROWS CHOOSE A BOX · 1–6 PICK UP CHIPS · ENTER BETS · DELETE TAKES BACK · 0 HAND BACK${game === 'craps' ? ' · R THROWS' : ''} · I READS THE TABLE</div>`);
+    // The card re-renders on every room change: keep keyboard focus on the
+    // same control across it.
+    const act = (document.activeElement as HTMLElement | null)?.closest?.('[data-act]');
+    const focusedAct = act && card.contains(act) ? (act as HTMLElement).dataset.act : null;
     card.innerHTML = rows.join('');
+    if (focusedAct) card.querySelector<HTMLElement>(`[data-act="${focusedAct}"]`)?.focus();
   };
 
   const onCardClick = (e: MouseEvent): void => {
@@ -881,6 +1037,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const house = deps.isHouse();
     if (act === 'close') {
       toggleCard();
+      capture?.focus({ preventScroll: true });
       return;
     }
     if (!house) return;
@@ -920,12 +1077,25 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (!host) return;
     card = document.createElement('div');
     card.id = 'casino-table-settings';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-label', `${game === 'craps' ? 'Craps' : 'Roulette'} table card`);
     card.style.cssText = `
       position:absolute; top:76px; right:24px; width:340px; max-height:80vh; overflow-y:auto;
       background:rgba(4,8,22,0.94); border:1px solid rgba(212,168,75,0.3); border-radius:10px;
       box-shadow:0 10px 48px rgba(0,0,0,0.85); padding:14px; display:flex; flex-direction:column; gap:10px;
       font-family:'SF Mono','Monaco','Consolas',monospace; color:${GOLD}; pointer-events:auto; box-sizing:border-box;`;
     card.addEventListener('click', onCardClick);
+    card.addEventListener('keydown', (e) => {
+      // Esc closes the card back to the table, not the whole table.
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleCard();
+        capture?.focus({ preventScroll: true });
+      } else if (e.key !== 'Tab') {
+        e.stopPropagation();
+      }
+    });
     for (const ev of ['mousedown', 'mouseup', 'pointerdown', 'pointerup'] as const) {
       card.addEventListener(ev, (e) => e.stopPropagation());
     }
@@ -947,7 +1117,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       syncWindow();
       capture = document.createElement('div');
       capture.id = 'casino-table-capture';
-      capture.style.cssText = 'position:absolute; inset:0; pointer-events:auto; touch-action:none;';
+      capture.style.cssText = 'position:absolute; inset:0; pointer-events:auto; touch-action:none; outline:none;';
+      // Keyboard + screen-reader play: the table itself takes focus (the
+      // ringed box on the felt is the focus indicator).
+      capture.tabIndex = 0;
+      capture.setAttribute('role', 'application');
+      capture.setAttribute('aria-roledescription', `${game} table`);
+      capture.setAttribute('aria-label', KEY_HELP);
+      capture.addEventListener('keydown', onKey);
       capture.addEventListener('pointermove', onMove);
       capture.addEventListener('pointerdown', onDown);
       capture.addEventListener('pointerup', onUp);
@@ -958,6 +1135,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         capture.addEventListener(ev, (e) => e.stopPropagation());
       }
       host.appendChild(capture);
+      capture.focus({ preventScroll: true });
 
       bar = document.createElement('div');
       bar.id = 'casino-table-bar';
@@ -971,7 +1149,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         <div data-flash style="display:none;font-size:10px;font-weight:800;color:#FF8A80;letter-spacing:1px;margin-top:3px;"></div>
         <div data-live role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;"></div>
         <div style="font-size:9px;color:rgba(212,168,75,0.55);letter-spacing:1px;margin-top:4px;">
-          DRAG ACROSS YOUR RAIL TO PICK UP CHIPS · CLICK THE FELT TO BET · RIGHT-CLICK TO PUT THEM BACK · ⚙️ TABLE · ESC TO STEP BACK</div>`;
+          DRAG ACROSS YOUR RAIL TO PICK UP CHIPS · CLICK THE FELT TO BET · RIGHT-CLICK TO PUT THEM BACK · ⚙️ TABLE · ESC TO STEP BACK<br>
+          OR KEYS: ARROWS · 1–6 · ENTER · H FOR HELP</div>`;
       host.appendChild(bar);
 
       beatSeat();
@@ -999,6 +1178,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       h?.setRailStacks([]);
       h?.setHand(null, []);
       h?.setSettingsHot(false);
+      h?.setFocusRegion(null);
+      focusIdx = -1;
       card?.remove();
       card = null;
       bar?.remove();
