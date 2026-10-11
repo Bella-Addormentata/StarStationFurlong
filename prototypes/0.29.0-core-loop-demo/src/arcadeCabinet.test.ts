@@ -350,13 +350,13 @@ describe('the focus UI', () => {
   });
 
   it("at a two-player cabinet's free stand you play player 2; hand it back and Enter takes it again", () => {
-    let shared: SharedView = { role: 'watcher', title: 'THWAITE', phase: 'playing', canJoin: true, player: null };
+    let shared: SharedView = { role: 'watcher', title: 'THWAITE', phase: 'playing', joinAs: 2, player: null };
     const link: ArcadeLink = {
       shared: () => shared,
       takeError: () => null,
       host: vi.fn(),
-      stop: vi.fn(() => void (shared = { ...shared, role: 'watcher', canJoin: true, player: null })),
-      join: vi.fn(() => void (shared = { ...shared, role: 'guest', canJoin: false, player: 2 })),
+      stop: vi.fn(() => void (shared = { ...shared, role: 'watcher', joinAs: 2, player: null })),
+      join: vi.fn(() => void (shared = { ...shared, role: 'guest', joinAs: null, player: 2 })),
       setButtons: vi.fn(),
       setLocalPad2: vi.fn(),
       setAudio: vi.fn(),
@@ -602,11 +602,13 @@ describe('describeView (the screen-reader status line)', () => {
 
   it('says who plays a shared game, and how to stop', () => {
     const shared = (over: Partial<SharedView>): ArcadeView => ({
-      screen: 'shared', role: 'host', title: 'THWAITE', phase: 'playing', canJoin: false, player: 1, ...over,
+      screen: 'shared', role: 'host', title: 'THWAITE', phase: 'playing', joinAs: null, player: 1, ...over,
     });
     expect(describeView(shared({}))).toBe('Playing THWAITE as player 1. Backspace ends the game, Escape leaves the cabinet.');
     expect(describeView(shared({ role: 'guest', player: 2 }))).toMatch(/^Playing THWAITE as player 2\. Backspace stops playing/);
     expect(describeView(shared({ role: 'watcher', player: null }))).toBe('Watching THWAITE. Escape leaves the cabinet.');
+    expect(describeView(shared({ role: 'watcher', player: null, joinAs: 1 })))
+      .toBe('Watching THWAITE. Enter plays player 1, Escape leaves the cabinet.');
     expect(describeView(shared({ phase: 'loading' }))).toBe('Loading THWAITE.');
     expect(describeView(shared({ role: 'watcher', phase: 'joining', player: null }))).toBe('Joining THWAITE.');
     expect(describeView(shared({ role: 'watcher', phase: 'ended', player: null }))).toMatch(/player 1 left/);

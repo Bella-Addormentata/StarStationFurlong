@@ -60,8 +60,12 @@ const STALL_SYNC_MS = 1000;
 const HOST_SILENT_MS = 4000;
 /** …and this long: the match is over as far as a watcher's cabinet shows. */
 const HOST_GONE_MS = 12000;
-/** The guest silent this long: player 2's pad lets go. */
+/** The guest silent this long: player 2's pad lets go… */
 const GUEST_SILENT_MS = 2000;
+/** …and this long: the guest closed the tab or lost the link, so the host
+ *  frees the stand for someone else. A new guest gets this long to send its
+ *  first tick. */
+const GUEST_GONE_MS = 6000;
 /** The host writes at most one save state this often. */
 const SNAPSHOT_MIN_GAP_MS = 1000;
 /** The guest repeats its pad every this many updates, changed or not. */
@@ -142,6 +146,8 @@ interface Copy {
   pending: ArcadeMatch | null;
   runs: PadRuns;
   guestPad: GuestPad;
+  /** The guest token guestPad belongs to (0: no guest). */
+  guestToken: number;
   lastGuestAt: number;
   syncAsked: boolean;
   snapshotBusy: boolean;
@@ -240,7 +246,7 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
   const copy: Copy = {
     matchId, game, role,
     machine: null, rom: null, failed: false, started: false, next: 0, acc: 0, createdAt: now, ranNow: 0,
-    pending: null, runs: new PadRuns(), guestPad: new GuestPad(), lastGuestAt: 0,
+    pending: null, runs: new PadRuns(), guestPad: new GuestPad(), guestToken: 0, lastGuestAt: 0,
     syncAsked: false, snapshotBusy: false, lastSnapshotAt: 0, latestCheck: 0, sendToggle: false,
     log: new PadLog(), hostLane: null, lastFramesAt: 0, stalledSince: null, needSync: false,
     syncFrom: null, lastSyncAskAt: 0, restoring: false, triedSnapshot: null,
@@ -363,6 +369,7 @@ export function routeArcadeTick(senderId: string, bytes: Uint8Array): void {
     if (copy.role !== 'host') return;
     const m = readArcade(itemId);
     if (!m || m.guestToken === 0 || t.token !== m.guestToken) return;
+    seatGuest(copy, m, now);
     copy.guestPad.onTick(t);
     copy.lastGuestAt = now;
     return;
@@ -422,11 +429,27 @@ export function arcadeFrame(dt: number, viewer: { x: number; z: number } | null)
   }
 }
 
+/** Host: keep the guest pad with whoever holds the seat now. A new holder's
+ *  sequence starts over, so it starts from a clean pad, and gets a grace
+ *  period for its first tick. */
+function seatGuest(copy: Copy, m: ArcadeMatch, now: number): void {
+  if (m.guestToken === copy.guestToken) return;
+  copy.guestToken = m.guestToken;
+  copy.guestPad.reset();
+  copy.lastGuestAt = now;
+}
+
 function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, now: number): void {
   const machine = copy.machine;
   if (!machine || !copy.started) return;
-  const m = readArcade(itemId);
+  let m = readArcade(itemId);
   if (!m || m.id !== copy.matchId) return; // reconcile has it next update
+  seatGuest(copy, m, now);
+  if (m.guestPage && now - copy.lastGuestAt > GUEST_GONE_MS) {
+    m = withoutGuest(m, m.guestPage);
+    writeArcade(itemId, m);
+    seatGuest(copy, m, now);
+  }
   if (now - copy.lastGuestAt > GUEST_SILENT_MS) copy.guestPad.reset();
   copy.acc += dt;
   while (copy.acc >= FRAME_S && copy.ranNow < HOST_STEP_MAX) {
@@ -478,9 +501,10 @@ async function writeSnapshot(itemId: string, s: CabinetSession, copy: Copy): Pro
 }
 
 function followFrame(itemId: string, s: CabinetSession, copy: Copy, m: ArcadeMatch, dt: number, now: number): void {
+  // The guest's heartbeat holds its seat, even while its ROM is loading.
+  if (m.guestPage === PAGE) sendGuestPad(s, copy, m);
   const machine = copy.machine;
   if (!machine) return;
-  if (m.guestPage === PAGE) sendGuestPad(s, copy, m);
   if (hostSilentFor(s, copy, now) > HOST_SILENT_MS) return; // nothing to run until the host is back
 
   if (!copy.started && !copy.needSync) {
@@ -631,8 +655,9 @@ export interface SharedView {
   role: 'host' | 'guest' | 'watcher';
   title: string;
   phase: SharedPhase;
-  /** A watcher at the free stand of a two-player cabinet can take player 2. */
-  canJoin: boolean;
+  /** A watcher at a two-player cabinet's free stand: the player it would
+   *  play (the one the host doesn't), else null. */
+  joinAs: 1 | 2 | null;
   /** Player number this page plays (1 or 2), or null for a watcher. */
   player: 1 | 2 | null;
 }
@@ -682,7 +707,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       if (copy?.role === 'host') {
         if (copy.failed) return null;
         return {
-          role: 'host', title: copy.game.title, phase: copy.started ? 'playing' : 'loading', canJoin: false,
+          role: 'host', title: copy.game.title, phase: copy.started ? 'playing' : 'loading', joinAs: null,
           player: seat === 0 || seats === 1 ? 1 : 2,
         };
       }
@@ -692,11 +717,13 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       if (silent > HOST_GONE_MS) return null; // gone: the cabinet is free
       const phase: SharedPhase = silent > HOST_SILENT_MS ? 'ended' : copy.started && !copy.needSync ? 'playing' : 'joining';
       if (m.guestPage === PAGE) {
-        return { role: 'guest', title: copy.game.title, phase, canJoin: false, player: m.hostSeat === 0 ? 2 : 1 };
+        return { role: 'guest', title: copy.game.title, phase, joinAs: null, player: m.hostSeat === 0 ? 2 : 1 };
       }
       return {
         role: 'watcher', title: copy.game.title, phase,
-        canJoin: seats === 2 && m.guestPage === null && seat !== m.hostSeat && phase !== 'ended',
+        joinAs: seats === 2 && m.guestPage === null && seat !== m.hostSeat && phase !== 'ended'
+          ? (m.hostSeat === 0 ? 2 : 1)
+          : null,
         player: null,
       };
     },

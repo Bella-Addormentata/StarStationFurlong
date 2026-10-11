@@ -13,6 +13,7 @@ import {
   isArcadeTickFlags, packArcadeTick, padByte, unpackArcadeTick, type ArcadeTick,
 } from './arcadeNet';
 import { packTick, tickKind, unpackTick, TICK_KIND_AH_MALLET } from './network/protocol';
+import { MAX_SNAPSHOT_BYTES } from './games/arcade';
 import { malletToTick } from './games/airHockey';
 
 const rom = (id: string) =>
@@ -228,6 +229,15 @@ describe('every copy runs the same game', () => {
     },
     30_000,
   );
+
+  it('gives up on a save state that inflates past the limit, without inflating all of it', async () => {
+    const boot = ArcadeMachine.bootState(rom('thwaite'))!;
+    // 64 MiB of zeros deflates to about 64 KB: under the doc's size limit.
+    const zeros = new Blob([new Uint8Array(64 * 1024 * 1024)]).stream().pipeThrough(new CompressionStream('deflate'));
+    const bomb = new Uint8Array(await new Response(zeros).arrayBuffer());
+    expect(bomb.byteLength).toBeLessThan(MAX_SNAPSHOT_BYTES);
+    await expect(decodeSnapshot(bomb, boot)).rejects.toThrow('too large');
+  }, 30_000);
 
   it('refuses a save state that is not one', async () => {
     const boot = ArcadeMachine.bootState(rom('thwaite'))!;

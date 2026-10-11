@@ -3105,6 +3105,10 @@ export class World {
           group.position.set(rec.x, 0, rec.z);
           group.rotation.y = furnitureVisualYaw(existing);
         }
+        // 🕹️ A moved cabinet keeps its screen; its new spot sets how often
+        // watchers repaint it.
+        const arcade = this.arcadeCabinetVisuals.get(id);
+        if (arcade) registerArcadeVisual(id, arcade, { x: rec.x, z: rec.z });
         changedIds.add(id);
       }
     }
@@ -3982,10 +3986,6 @@ export class World {
     // 🐊 #185: and every alligators table — operator ball sim, bites → doc
     // writes, head/ball tick sends, remote smoothing, heads/birds/displays.
     alligatorsFrame(deltaTime);
-    // 🕹️ And every arcade cabinet's shared game: the host's copy runs and
-    // sends its pads, the others follow and repaint by distance.
-    const me = this.player.getPosition();
-    arcadeFrame(deltaTime, { x: me.x, z: me.z });
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -4027,6 +4027,11 @@ export class World {
 
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
+    // 🕹️ Every arcade cabinet's shared game: the host's copy runs and sends
+    // its pads, the others follow and repaint by distance. After the focused
+    // UI, so a host's game runs on this update's buttons, not the last one's.
+    const me = this.player.getPosition();
+    arcadeFrame(deltaTime, { x: me.x, z: me.z });
 
     // Drive room-edit mode (E2 of #25): force-exit when the view leaves the
     // plain isometric room (zoom ≠ 2 / solar map) + selection-label tracking.

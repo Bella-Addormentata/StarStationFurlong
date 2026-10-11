@@ -341,9 +341,37 @@ function undoDelta(d: unknown, r: unknown): unknown {
   return d;
 }
 
-async function pipe(bytes: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
-  const body = new Blob([bytes as BlobPart]).stream().pipeThrough(stream);
-  return new Uint8Array(await new Response(body).arrayBuffer());
+/** The most JSON a save state may inflate to (a whole jsnes state is about
+ *  a megabyte; its difference from power-on is less). */
+export const MAX_SNAPSHOT_JSON_BYTES = 8 * 1024 * 1024;
+
+/** Run bytes through a (de)compression stream, read chunk by chunk, giving
+ *  up the moment the output passes `maxOut` (a deflate bomb in the doc). */
+async function pipe(
+  bytes: Uint8Array,
+  stream: CompressionStream | DecompressionStream,
+  maxOut = Infinity,
+): Promise<Uint8Array> {
+  const reader = new Blob([bytes as BlobPart]).stream().pipeThrough(stream).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxOut) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error('save state too large');
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
 }
 
 /**
@@ -360,8 +388,7 @@ export async function encodeSnapshot(state: MachineState, boot: MachineState): P
  *  anything that isn't one (a corrupt or hostile doc entry). */
 export async function decodeSnapshot(data: Uint8Array, boot: MachineState): Promise<MachineState> {
   if (data.byteLength > MAX_SNAPSHOT_BYTES) throw new Error('save state too large');
-  const json = await pipe(data, new DecompressionStream('deflate'));
-  if (json.byteLength > 64 * 1024 * 1024) throw new Error('save state too large');
+  const json = await pipe(data, new DecompressionStream('deflate'), MAX_SNAPSHOT_JSON_BYTES);
   const state = undoDelta(JSON.parse(new TextDecoder().decode(json)), boot);
   if (!state || typeof state !== 'object') throw new Error('not a save state');
   for (const part of ['cpu', 'mmap', 'ppu', 'papu']) {

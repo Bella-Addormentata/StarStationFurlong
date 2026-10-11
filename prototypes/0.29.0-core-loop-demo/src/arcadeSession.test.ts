@@ -186,7 +186,7 @@ describe('a shared game, played by two and watched by a third', () => {
     const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
     const host = await startGame(a, 0, 2);
     const guest = link(b, 1, 2);
-    expect(guest.shared()).toMatchObject({ role: 'watcher', canJoin: true });
+    expect(guest.shared()).toMatchObject({ role: 'watcher', joinAs: 2 });
     guest.join();
     await run(50);
     expect(guest.shared()).toMatchObject({ role: 'guest', player: 2 });
@@ -229,7 +229,7 @@ describe('a shared game, played by two and watched by a third', () => {
     guest.stop();
     await run(50);
     expect(a.games.readArcade(ITEM)).toMatchObject({ guest: null, guestPage: null, guestToken: 0 });
-    expect(guest.shared()).toMatchObject({ role: 'watcher', canJoin: true, phase: 'playing' });
+    expect(guest.shared()).toMatchObject({ role: 'watcher', joinAs: 2, phase: 'playing' });
     guest.join();
     await run(50);
     expect(guest.shared()).toMatchObject({ role: 'guest' });
@@ -246,6 +246,52 @@ describe('a shared game, played by two and watched by a third', () => {
     await run(100);
     const p2 = ticksOf(a, 'frames').map((t) => (unpackArcadeTick(t) as { cur: number }).cur >> 8);
     expect(p2.every((pad) => pad === 0)).toBe(true);
+  }, 30_000);
+
+  it('a guest who closes the tab frees the stand; the next one plays at once', async () => {
+    const [a, b, d] = await room(['a', null], ['b', null], ['d', null]);
+    const host = await startGame(a, 0, 2);
+    host.setButtons(0);
+    const first = link(b, 1, 2);
+    first.join();
+    await run(300, () => first.setButtons(PAD_BIT.RIGHT));
+    b.closed = true; // gone mid-press, without handing the seat back
+    const next = link(d, 1, 2);
+    await run(3000);
+    expect(next.shared()).toMatchObject({ role: 'watcher', joinAs: null }); // still held…
+    await run(4000);
+    expect(a.games.readArcade(ITEM)?.guestPage).toBeNull(); // …until the host gives up on it
+    expect(next.shared()).toMatchObject({ role: 'watcher', joinAs: 2 });
+
+    next.join();
+    await run(500, () => next.setButtons(PAD_BIT.LEFT));
+    const p2 = ticksOf(a, 'frames').slice(-10).map((t) => (unpackArcadeTick(t) as { cur: number }).cur >> 8);
+    expect(p2.every((pad) => pad === PAD_BIT.LEFT)).toBe(true);
+  }, 60_000);
+
+  it("a new guest's presses count straight away, even right after another's", async () => {
+    const [a, b, d] = await room(['a', null], ['b', null], ['d', null]);
+    await startGame(a, 0, 2);
+    const first = link(b, 1, 2);
+    first.join();
+    await run(1500, () => first.setButtons(PAD_BIT.B));
+    first.stop();
+    const next = link(d, 1, 2);
+    next.join();
+    await run(300, () => next.setButtons(PAD_BIT.UP));
+    const p2 = ticksOf(a, 'frames').slice(-5).map((t) => (unpackArcadeTick(t) as { cur: number }).cur >> 8);
+    expect(p2.every((pad) => pad === PAD_BIT.UP)).toBe(true);
+  }, 60_000);
+
+  it('a host at the second stand plays player 2; the free stand offers player 1', async () => {
+    const [a, b] = await room(['a', null], ['b', null]);
+    const host = await startGame(a, 1, 2);
+    expect(host.shared()).toMatchObject({ role: 'host', player: 2 });
+    const other = link(b, 0, 2);
+    expect(other.shared()).toMatchObject({ role: 'watcher', joinAs: 1 });
+    other.join();
+    await run(50);
+    expect(other.shared()).toMatchObject({ role: 'guest', player: 1 });
   }, 30_000);
 });
 

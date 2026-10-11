@@ -129,8 +129,8 @@ export function describeView(view: ArcadeView): string {
     if (view.phase === 'loading') return `Loading ${view.title}.`;
     if (view.phase === 'joining') return `Joining ${view.title}.`;
     if (view.role === 'watcher') {
-      return view.canJoin
-        ? `Watching ${view.title}. Enter plays player 2, Escape leaves the cabinet.`
+      return view.joinAs
+        ? `Watching ${view.title}. Enter plays player ${view.joinAs}, Escape leaves the cabinet.`
         : `Watching ${view.title}. Escape leaves the cabinet.`;
     }
     const back = view.role === 'host' ? 'Backspace ends the game' : 'Backspace stops playing';
@@ -217,14 +217,14 @@ function stripFor(view: ArcadeView): string {
   if (view.phase === 'ended') return 'PLAYER 1 LEFT · ESC LEAVE';
   if (view.phase === 'loading') return 'LOADING… · ESC LEAVE';
   if (view.phase === 'joining') return 'JOINING THE GAME… · ESC LEAVE';
-  if (view.role === 'watcher') return view.canJoin ? 'WATCHING · ENTER PLAYS PLAYER 2 · ESC LEAVE' : 'WATCHING · ESC LEAVE';
+  if (view.role === 'watcher') return view.joinAs ? `WATCHING · ENTER PLAYS PLAYER ${view.joinAs} · ESC LEAVE` : 'WATCHING · ESC LEAVE';
   const back = view.role === 'host' ? '⌫ END GAME' : '⌫ STOP PLAYING';
   return `PLAYER ${view.player} · ${STRIP_KEYS} · ${back} · ESC LEAVE`;
 }
 
 const sameShared = (a: SharedView, b: ArcadeView): boolean =>
   b.screen === 'shared' && a.role === b.role && a.title === b.title && a.phase === b.phase
-  && a.player === b.player && a.canJoin === b.canJoin;
+  && a.player === b.player && a.joinAs === b.joinAs;
 
 export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const painter = deps.visual?.painter;
@@ -366,7 +366,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     if (view.screen === 'playing') machine?.press(player, button);
     else if (view.screen === 'menu' || view.screen === 'credits') {
       if (player === 1) menuPress(button, gesture);
-    } else if (view.screen === 'shared' && view.canJoin && player === 1 && button === 'START') {
+    } else if (view.screen === 'shared' && view.joinAs && player === 1 && button === 'START') {
       autoJoin = true;
       link?.join();
     }
@@ -448,7 +448,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const followShared = () => {
     if (!link) return;
     const shared = link.shared();
-    if (shared?.canJoin && autoJoin && view.screen !== 'playing') link.join(); // the free stand plays player 2
+    if (shared?.joinAs && autoJoin && view.screen !== 'playing') link.join(); // the free stand plays the other player
     if (view.screen === 'shared') {
       if (!shared) {
         const left = view.phase === 'ended' ? 'PLAYER 1 LEFT' : null;

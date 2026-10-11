@@ -58,9 +58,9 @@ export function isArcadeMatch(v: unknown): v is ArcadeMatch {
     && isU16(m.id) && m.id !== 0
     && isStr(m.game) && isStr(m.host) && isStr(m.hostPage)
     && (m.hostSeat === 0 || m.hostSeat === 1)
-    && (m.guest === null || isStr(m.guest))
-    && (m.guestPage === null || isStr(m.guestPage))
-    && isU16(m.guestToken)
+    // A guest is all there (player, page, token) or not there at all.
+    && ((m.guest === null && m.guestPage === null && m.guestToken === 0)
+      || (isStr(m.guest) && isStr(m.guestPage) && isU16(m.guestToken) && m.guestToken !== 0))
     && typeof m.startedAt === 'number' && Number.isFinite(m.startedAt);
 }
 
