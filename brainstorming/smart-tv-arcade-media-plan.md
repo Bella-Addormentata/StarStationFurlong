@@ -1001,8 +1001,21 @@ set, bounded by the same accounting and cleared with the room), the
 room read-only, ROOM FULL, until compacted. Compaction is a new DOCUMENT
 EPOCH: the owner signs `room-compact { epoch, at, root }` — a fresh Yjs
 document built from the current state, its epoch carried in every
-`ysync` envelope beside the room id — and a replica that has seen the
-compaction rejects any update stamped with an older epoch, so an old
+`ysync` envelope beside the room id — accepted only under an
+AUTHORIZATION ROOT a replica can verify without the room's say-so,
+since the epoch switch discards every older update: the room's
+pass-anchored owner key (`ownerPubB64` in a `RoomBootstrap` v3 pass,
+verified under its `sigB64` — the off-chain ownership root item in the
+TODO, its step 1), or a key the chain-verified authority head names
+where the room has one (§7); never the key the peer-writable
+`roomInfo.owner → players[…]` chain resolves to, which any member can
+point at themselves and which therefore authorizes nothing. A room with
+no verifiable owner — every legacy room until that pass lands — cannot
+be compacted: past the bound it stays read-only until it has one, and a
+`room-compact` from any other signer is dropped and charged to the link
+like a forged op. That ownership root is a PREREQUISITE of the bound's
+compaction, as it is of the library's removals. A replica that has seen
+the compaction rejects any update stamped with an older epoch, so an old
 peer's history never merges back in: it resyncs from the new baseline
 under the new epoch, its unsent writes lost (what the owner's
 compaction warns of), and the node relays no envelope whose epoch is
