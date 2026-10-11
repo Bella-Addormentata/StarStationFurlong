@@ -86,9 +86,11 @@ export function toggleGearCard(spec: GearCardSpec): void {
   card.setAttribute('aria-label', `${spec.title} card`);
   card.style.cssText = `
     position:fixed; top:76px; right:24px; width:340px; max-width:calc(100vw - 32px); max-height:80vh; overflow-y:auto;
-    z-index:1000; background:rgba(4,8,22,0.94); border:1px solid rgba(212,168,75,0.3); border-radius:10px;
+    z-index:4600; background:rgba(4,8,22,0.94); border:1px solid rgba(212,168,75,0.3); border-radius:10px;
     box-shadow:0 10px 48px rgba(0,0,0,0.85); padding:14px; display:flex; flex-direction:column; gap:10px;
     font-family:'SF Mono','Monaco','Consolas',monospace; color:${GOLD}; pointer-events:auto; box-sizing:border-box;`;
+  // z-index 4600: above the focused-device host (4500, whose games lay a
+  // full-screen capture layer) and below the SpacePhone (5000).
   // The card owns its clicks: none reaches the canvas (a click-away release)
   // or a focused game's capture layer.
   for (const ev of ['mousedown', 'mouseup', 'pointerdown', 'pointerup'] as const) {
