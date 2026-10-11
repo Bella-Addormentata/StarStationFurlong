@@ -40,6 +40,10 @@ export interface FaucetStatus {
    *  already consumed but the chain has not confirmed yet. GIVE is gated on
    *  this; an older node omits it (then it equals walletMojos). */
   walletSpendableMojos: bigint | null;
+  /** The node's WALLET listing was cut short the same way (our address is as
+   *  permissionless as the faucet's): the two wallet totals cover the pages it
+   *  read, the wallet holds more, and GIVE spends from the coins it read. */
+  walletPartial: boolean;
   /** The node's coin listing was cut short (a flood of outputs): coins, ready
    *  and totalMojos cover the pages it read; the jar holds more. */
   partial: boolean;
@@ -109,6 +113,7 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
     canGive: r.canGive === true,
     walletMojos: wallet,
     walletSpendableMojos: spendable ?? wallet,
+    walletPartial: r.walletPartial === true,
     partial: r.partial === true,
     note: typeof r.note === 'string' ? r.note : '',
   };

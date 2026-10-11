@@ -31,6 +31,7 @@ const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
   canGive: false,
   walletMojos: null,
   walletSpendableMojos: null,
+  walletPartial: false,
   partial: false,
   note: '',
   ...over,
@@ -60,6 +61,11 @@ describe('faucet dish: node replies', () => {
     // nextReadyInBlocks null is a legal "everything is ready" value.
     expect(parseFaucetReply(b64({ op: 'status', ok: true, status: wire({ nextReadyInBlocks: null }) }))?.status?.nextReadyInBlocks).toBeNull();
     expect(parseFaucetReply(b64({ op: 'status', ok: true, status: wire({ partial: true }) }))?.status?.partial).toBe(true);
+    // The wallet listing can be cut short too; an older node that never says so means "complete".
+    expect(parseFaucetReply(b64({ op: 'status', ok: true, status: wire({ walletPartial: true }) }))?.status?.walletPartial).toBe(true);
+    const older = wire() as Record<string, unknown>;
+    delete older.walletPartial;
+    expect(asFaucetStatus(older)?.walletPartial).toBe(false);
   });
 
   it('keeps mojo totals exact past 2^53 and still reads a plain safe number', () => {

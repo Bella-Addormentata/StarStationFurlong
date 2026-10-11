@@ -9895,10 +9895,14 @@ async function init() {
   (window as any).world = world;
 
   // 🥣 Faucet dish (#231 onboarding): the fixture's take / give / status
-  // requests go to the LOCAL node over the faucet lane; replies come back
-  // through onEnvelope (joinRoomAtEpoch) into faucetDish.ts, which World
-  // reads ~1 Hz for the jar level and the mojo in the dish. A slow poll keeps
-  // the prop honest for players who never focus the screen (18.75 s blocks).
+  // requests go to the LOCAL node over the faucet lane, one stream each, and
+  // the node's reply comes back ON THAT STREAM, through onFaucetReply below
+  // and nowhere else: a `faucet` envelope on a node-opened stream is
+  // forwarded traffic a room peer could have sent, and the generic onEnvelope
+  // path (joinRoomAtEpoch) ignores it, so nothing a peer sends can pass for
+  // the node's answer. The reply lands in faucetDish.ts, which World reads
+  // ~1 Hz for the jar level and the mojo in the dish. A slow poll keeps the
+  // prop honest for players who never focus the screen (18.75 s blocks).
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
   networkProvider.onFaucetReply((env: { payload?: string; room?: string }) => {
     if (typeof env.payload !== "string" || typeof env.room !== "string") return;

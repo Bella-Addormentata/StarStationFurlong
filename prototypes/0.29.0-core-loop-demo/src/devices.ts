@@ -4640,8 +4640,9 @@ export interface FaucetDishUIDeps {
   request: (op: FaucetOp, amount?: number) => Promise<void>;
 }
 
-/** Give buttons, in mojos. 1,000 mojos is a thousand lobby gifts; 0.001 TXCH
- *  is the smallest amount a faucet drip hands out in one go. */
+/** Give buttons, in mojos. The lobby gift is one mojo, so 1,000 mojos is a
+ *  thousand gifts; the largest button, 0.001 TXCH (a billion mojos), is still
+ *  small change on testnet11. */
 export const FAUCET_GIVE_AMOUNTS: ReadonlyArray<{ mojos: number; label: string }> = [
   { mojos: 1_000, label: '+1,000 MOJOS' },
   { mojos: 1_000_000, label: '+1,000,000' },
@@ -4725,7 +4726,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>
         <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
           ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
-          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming a spend)` : ''}.` : ''}
+          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}${st?.walletPartial ? '+ (listing cut short; it holds more)' : ''}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming a spend)` : ''}.` : ''}
         </div>
       </div>
       <div>
