@@ -79,6 +79,10 @@ const FRICTION_RATE = 0.9;
 /** Outward acceleration per metre from the centre (s⁻²): the table is a
  *  shallow dome, so no ball can park at the dead centre, out of every reach. */
 const DOME_K = 0.45;
+/** A ball this still, this near the centre, is nudged off it (m, m/s). */
+const CENTRE_EPS = 1e-3;
+/** …to this offset (m), from which the dome carries it out in seconds. */
+const CENTRE_NUDGE = 0.01;
 /** Rim / base-housing bounce energy retention. */
 const WALL_RESTITUTION = 0.75;
 /** Ball-on-ball bounce. */
@@ -679,6 +683,13 @@ export function stepBalls(
     for (let k = 0; k < balls.length; k++) {
       if (!live[k]) continue;
       const b = balls[k];
+      // The dome's push is zero at the exact centre, out of every mouth's
+      // reach: a ball resting there would never leave and the round could
+      // not end. Nudge it off, always the same way, so every page agrees.
+      if (Math.abs(b.x) < CENTRE_EPS && Math.abs(b.z) < CENTRE_EPS
+        && Math.abs(b.vx) < CENTRE_EPS && Math.abs(b.vz) < CENTRE_EPS) {
+        b.x = CENTRE_NUDGE;
+      }
       // Dome: outward push proportional to the distance from the centre.
       let ax = DOME_K * b.x;
       let az = DOME_K * b.z;

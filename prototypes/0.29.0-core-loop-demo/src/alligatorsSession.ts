@@ -644,8 +644,10 @@ export function alligatorsFrame(dt: number): void {
     st.wasOperator = operator;
 
     // ── Head broadcast at 30 Hz while engaged as a claimant (waiting too —
-    // presence for the operator election), plus at once when the jaw lands. ──
-    if (input && iAmClaimant && s && s.status !== 'ended') {
+    // presence for the operator election), plus at once when the jaw lands.
+    // A winning bite ends the round with the jaw down: keep sending until
+    // the jaw-up has gone out, or peers show it shut. ──
+    if (input && iAmClaimant && s && (s.status !== 'ended' || st.lastSentJaw)) {
       st.headSendAccum += dt;
       const interval = 1 / HEAD_SEND_HZ;
       if (jawDownOf(input) !== st.lastSentJaw) {
@@ -912,9 +914,15 @@ export function createAlligatorsUI(deps: AlligatorsUIDeps): DeviceUI {
     writeGame(deps.itemId, initialAlligatorsState());
   };
 
+  /** PLAY AGAIN keeps every seat, so only someone holding one may call it:
+   *  a spectator's PLAY AGAIN would turn an ended table (anyone may reset)
+   *  back into a waiting one they can no longer clear. */
+  const canAgain = (s: AlligatorsState | null): s is AlligatorsState =>
+    s !== null && s.players.includes(myId);
+
   const doAgain = (): void => {
     const s = state();
-    const ns = s ? nextRound(s) : null;
+    const ns = canAgain(s) ? nextRound(s) : null;
     if (ns) writeGame(deps.itemId, ns);
   };
 
@@ -1082,7 +1090,7 @@ export function createAlligatorsUI(deps: AlligatorsUIDeps): DeviceUI {
         : note(alligatorsStatusLine(s, 0));
       actions = `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
         ${head}
-        ${btn('ia-again', 'PLAY AGAIN', false, 'Same seats, new round — everyone readies up again')}
+        ${btn('ia-again', 'PLAY AGAIN', !canAgain(s), 'Same seats, new round — everyone readies up again')}
         ${btn('ia-reset', 'RESET TABLE', !canReset(s), 'Clear every seat')}
       </div>
       <div style="font-size:10px; letter-spacing:1px;">${standings(s)}</div>`;

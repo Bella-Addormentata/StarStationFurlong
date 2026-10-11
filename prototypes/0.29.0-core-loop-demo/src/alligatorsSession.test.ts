@@ -21,7 +21,7 @@ const {
   registerAlligatorsVisual, routeAlligatorsTick, setAlligatorsSender,
 } = await import('./alligatorsSession');
 const {
-  IA_BITE_DONE_S, IA_LAY_START_MS, IA_LIVE, ballToTick, claimSeat, headToTick,
+  IA_BITE_DONE_S, IA_LAY_START_MS, IA_LIVE, ballToTick, claimSeat, headFromTick, headToTick, isBallTick,
   initialAlligatorsState, layTimeMs, mouthOf, setReady, startIfReady, startPractice,
 } = await import('./games/alligators');
 const { unpackTick, tickKind, TICK_KIND_ALLIGATORS } = await import('./network/protocol');
@@ -124,6 +124,25 @@ describe('the operator', () => {
     const s = readAlligators(TABLE)!;
     expect(s.eaten[0]).toBe(0);
     expect(s.eaten.filter((e) => e !== IA_LIVE)).toHaveLength(1);
+  });
+
+  it('sends the jaw back up after the bite that ends the round', () => {
+    const { st } = versus();
+    run(IA_LAY_START_MS + 200);
+    const live = readAlligators(TABLE)!;
+    writeGame(TABLE, { ...live, eaten: live.eaten.map((_, k) => (k === 0 ? IA_LIVE : 3)) });
+    const m = mouthOf(0, { swing: 0, ext: 0 });
+    st.balls[0] = { x: m.x, z: m.z, vx: 0, vz: 0 };
+    const jaws: boolean[] = [];
+    setAlligatorsSender((buf) => {
+      const t = unpackTick(buf);
+      if (!isBallTick(t)) jaws.push(headFromTick(t).jawDown);
+    });
+    (st.engaged as { biteT: number | null }).biteT = 0;
+    run(IA_BITE_DONE_S * 1000 + 100);
+    expect(readAlligators(TABLE)!.status).toBe('ended');
+    expect(jaws).toContain(true);
+    expect(jaws[jaws.length - 1]).toBe(false);
   });
 
   it("eats for a peer whose head tick says its jaw came down", () => {

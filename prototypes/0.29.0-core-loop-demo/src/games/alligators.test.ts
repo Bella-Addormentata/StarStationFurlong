@@ -290,6 +290,12 @@ describe('ball physics', () => {
     expect(Math.hypot(balls[0].vx, balls[0].vz)).toBeLessThan(0.2);
   });
 
+  it('nudges a ball resting on the exact centre off it', () => {
+    const balls: BallSim[] = [{ x: 0, z: 0, vx: 0, vz: 0 }];
+    for (let f = 0; f < 60 * 20; f++) stepBalls(balls, [true], 1 / 60);
+    expect(Math.hypot(balls[0].x, balls[0].z)).toBeGreaterThan(0.5);
+  });
+
   it('drags balls round when the table spins', () => {
     const balls: BallSim[] = [{ x: 0.6, z: 0, vx: 0, vz: 0 }];
     stepBalls(balls, [true], 0.1, 2.4);
