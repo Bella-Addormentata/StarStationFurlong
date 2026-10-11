@@ -377,7 +377,7 @@ describe('the programme', () => {
     expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_500 });
   });
 
-  it('whoever turns the set on has the remote placed in their hand; a live holder keeps it (#186)', () => {
+  it('whoever turns the set on has the remote placed in their hand, a live holder\'s included (#186 as written)', () => {
     putDownRemote(TV);
     expect(remoteStatus(TV)).toBe('free');
     expect(tvTogglePower(TV)).toBe(true);
@@ -385,17 +385,19 @@ describe('the programme', () => {
     expect(tvTogglePower(TV)).toBe(false); // off: the remote stays in hand
     expect(readRemote(TV).holder).toBe(ALICE);
     iAm(BOB, 'Bob');
-    expect(tvTogglePower(TV)).toBe(true); // Alice's hold is live: she keeps it
+    expect(tvTogglePower(TV)).toBe(true); // Alice's hold is live, and the switch takes it: whoever turns the set on holds the remote
+    expect(readRemote(TV)).toMatchObject({ holder: BOB, by: BOB, page: 'A' });
+    iAm(ALICE, 'Alice');
+    expect(remoteStatus(TV)).toBe('held'); // Alice sees the switch took it…
+    expect(tvTogglePower(TV)).toBe(false); // …and OFF moves nothing
+    expect(readRemote(TV).holder).toBe(BOB);
+    expect(tvTogglePower(TV)).toBe(true); // …but her own ON takes it back, like anyone's
     expect(readRemote(TV).holder).toBe(ALICE);
-    setTvHostPredicate(() => true); // the owner's spare is not the switch's to use
     tvTogglePower(TV);
-    expect(tvTogglePower(TV)).toBe(true);
-    expect(readRemote(TV).holder).toBe(ALICE);
-    setTvHostPredicate(() => false);
-    tvTogglePower(TV);
+    iAm(BOB, 'Bob');
     tick(TV_LEASE_LAPSE_MS); // Alice went quiet
     expect(tvTogglePower(TV)).toBe(true);
-    expect(readRemote(TV)).toMatchObject({ holder: BOB, page: 'A' }); // lapsed → the presser's
+    expect(readRemote(TV)).toMatchObject({ holder: BOB, page: 'A' }); // lapsed → the presser's, as any
   });
 
   it('the body buttons need no remote: power keeps the programme, volume is the set\'s', () => {
@@ -650,7 +652,7 @@ describe('the programme', () => {
     expect(tvTogglePower(TV)).toBe(false);
     expect(readPower(TV).parkMs).toBe(2_000);
     iAm(ALICE, 'Alice');
-    expect(tvTogglePower(TV)).toBe(true); // Alice's hold is live: the remote stays hers
+    expect(tvTogglePower(TV)).toBe(true); // Alice turns it on: the remote is hers, as it was
     expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_000 }); // the holder reads the anchor, not the time since T0
     // A countdown still ahead: nothing running, no reading to carry, and
     // the start stays at T0.

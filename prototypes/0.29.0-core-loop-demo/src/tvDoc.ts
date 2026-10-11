@@ -999,15 +999,18 @@ export function tvStop(itemId: string): TvAction {
  *  programme, like a real TV; on brings it back: the holder's tick parks a
  *  programme that was playing where it was (tvSession), and a set with
  *  nothing on shows the home screen. Returns the new state of the switch.
- *  Whoever turns the set ON has the remote placed in their hand (#186) —
- *  when it is on the set or lapsed. A live holder keeps it: a body button
- *  moves nothing out of a hand, and the owner's spare is not the switch's
- *  to use (the holder turns the set on, or hands the remote over). The
- *  pickup lands BEFORE the switch's write, so the page that parks the
- *  programme as the switch is seen (tvSession) is already the holder. */
+ *  Whoever turns the set ON has the remote placed in their hand (#186, as
+ *  written) — on every OFF→ON, a remote on the set, lapsed, or in a live
+ *  hand alike: the previous holder sees the switch take it, and takes it
+ *  back by pressing ON themselves or asking. (The alternative, a live
+ *  holder keeping the remote across a body press, is an open option for
+ *  the owner in the plan's §10: `takeRemoteBySwitch` only when the remote
+ *  is free or lapsed.) The pickup lands BEFORE the switch's write, so the
+ *  page that parks the programme as the switch is seen (tvSession) is
+ *  already the holder. */
 export function tvTogglePower(itemId: string, now = clock()): boolean {
   const power = readPower(itemId);
-  if (!power.on && remoteStatus(itemId, now) === 'free') pickUpRemote(itemId, now);
+  if (!power.on) takeRemoteBySwitch(itemId);
   // Going off: where the room is, by this page's own reading
   // (roomPositionMs: a programme playing, or a schedule past its T0 —
   // playing by the clock, its record not yet flipped), carried by the
@@ -1019,6 +1022,15 @@ export function tvTogglePower(itemId: string, now = clock()): boolean {
   const parkMs = power.on ? roomPositionMs(itemId, now) : power.parkMs;
   write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord);
   return !power.on;
+}
+
+/** The switch's pickup: the presser's, whoever held the remote — written
+ *  as any pickup is (pickUpRemote), the gate skipped, since the rule is
+ *  the switch's and not the hand's. A page with no identity takes nothing. */
+function takeRemoteBySwitch(itemId: string): void {
+  const { pub, name } = identityProvider();
+  if (!pub) return;
+  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: pageId } satisfies RemoteRecord);
 }
 
 /** A schedule past its T0: playing by the clock (readPlayback), whoever
