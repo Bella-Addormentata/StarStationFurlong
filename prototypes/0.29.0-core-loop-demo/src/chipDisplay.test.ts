@@ -38,4 +38,8 @@ describe('railChips', () => {
   it('does not flood the rail for a big balance', () => {
     expect(railChips(50000).length).toBeLessThan(80);
   });
+
+  it('stays bounded for an enormous balance', () => {
+    expect(railChips(1e12).length).toBeLessThanOrEqual(400 + 34);
+  });
 });

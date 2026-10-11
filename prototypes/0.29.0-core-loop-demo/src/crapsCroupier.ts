@@ -252,6 +252,16 @@ export function tickCrapsClosing(tableId: string, s: CrapsTableState, autoShowMs
   if (now >= (s.phaseDeadline ?? now)) stickmanThrows(tableId, s, autoShowMs);
 }
 
+/** A manual craps table (no robot stickman): the house's client runs only
+ *  the shooter's turn that a manual ROLL started — watching the seats,
+ *  settling the shooter's throw, timing them out. World ticks it every frame
+ *  whatever the house is looking at. */
+export function tickManualCraps(tableId: string, now = Date.now()): void {
+  sampleSeats(tableId, now);
+  const s = readCrapsTableState(tableId);
+  if (s?.phase === 'closing') tickCrapsClosing(tableId, s, undefined, now);
+}
+
 /**
  * One operator tick for one craps table. Idempotent per frame — only writes on a
  * real transition. The window ARMS when there are live bets (so an empty come-out

@@ -49,10 +49,13 @@ export function chipsFor(balance: number): number[] {
  * black chip they cannot bet a 5 from. Each denomination keeps a working
  * float of the next one down (five whites, five reds, four greens, five
  * blacks) whenever the balance is big enough to spare it, the way a dealer
- * colours a buy-in down. Σ result === balance for every non-negative integer;
- * largest first.
+ * colours a buy-in down. Largest first. The big chips are counted, not
+ * looped one by one, and at most `maxBig` of them are returned (the rail
+ * only draws a few dozen), so Σ result === balance for every non-negative
+ * integer up to roughly maxBig × 1000 and the allocation stays bounded
+ * beyond it.
  */
-export function railChips(balance: number): number[] {
+export function railChips(balance: number, maxBig = 400): number[] {
   let left = Math.max(0, Math.floor(balance));
   // [denomination, its next one up, how many of it to keep as a float]
   const floats: Array<[number, number, number]> = [[1, 5, 5], [5, 25, 5], [25, 100, 4], [100, 500, 5]];
@@ -63,7 +66,12 @@ export function railChips(balance: number): number[] {
     small.set(d, n);
     left -= n * d;
   }
-  const big = chipsFor(left);
+  const big: number[] = [];
+  for (const d of CHIP_DENOMS) {
+    const n = Math.min(Math.floor(left / d), maxBig - big.length);
+    for (let i = 0; i < n; i++) big.push(d);
+    left -= Math.floor(left / d) * d;
+  }
   for (const d of [100, 25, 5, 1]) {
     for (let i = 0; i < (small.get(d) ?? 0); i++) big.push(d);
   }

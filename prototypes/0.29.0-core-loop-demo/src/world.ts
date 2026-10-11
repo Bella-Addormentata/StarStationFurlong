@@ -41,6 +41,7 @@ import {
   closeCrapsTable,
   crapsBeatLine,
   tickAutoStickman,
+  tickManualCraps,
 } from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
@@ -5793,6 +5794,11 @@ export class World {
         if (t.kind === "craps-table") tickAutoStickman(t.id);
         else tickAutoCroupier(t.id);
       }
+    }
+    // 🎲 #226: a manual craps table (no robot running it): the house's client
+    // carries the shooter's turn a manual ROLL started, focused or not.
+    else if (crapsTables.length && canEditRoom().ok) {
+      for (const t of crapsTables) if (!isCroupierLive(t.id)) tickManualCraps(t.id);
     }
 
     // 🎰 Slot machines: ONE session operates every machine in the room (one

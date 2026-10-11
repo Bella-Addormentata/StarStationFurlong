@@ -43,8 +43,7 @@ import { CHIP_DENOMS, railChips } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
-  closeCrapsBetting, openCrapsBetting, sampleSeats, STICKMAN_DICE_SPOT, stickmanThrows,
-  tickCrapsClosing,
+  closeCrapsBetting, openCrapsBetting, STICKMAN_DICE_SPOT, stickmanThrows,
 } from './crapsCroupier';
 import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
@@ -709,9 +708,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return;
     }
     if (!rg) return;
-    // Your own chips from this round come back first; anywhere else, the
-    // hand bets.
-    if (takeBack(rg)) return;
+    // A click on your own stack takes this round's chips back; anywhere
+    // else in the box, the hand bets.
+    if (h.onMyStack(ray, hit.p) && takeBack(rg)) return;
     if (hand.length > 0) placeHand(rg);
     else say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
   };
@@ -994,13 +993,6 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     },
     update(): void {
       syncEpoch();
-      // A manual table (no robot): the house's page runs the shooter's turn —
-      // watching seats, settling the shooter's throw, timing them out.
-      if (game === 'craps' && deps.isHouse() && !isCroupierLive(itemId)) {
-        sampleSeats(itemId);
-        const s = crapsState();
-        if (s?.phase === 'closing') tickCrapsClosing(itemId, s);
-      }
       // Holding over one stack keeps picking chips off it, a little faster each time.
       if (pickup && performance.now() >= pickup.nextAt) {
         takeFromStack(pickup.stack);
