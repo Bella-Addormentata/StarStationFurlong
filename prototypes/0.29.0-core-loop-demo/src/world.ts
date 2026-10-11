@@ -5926,7 +5926,7 @@ export class World {
    */
   public handleSlotMachineControl(
     deviceId: string,
-    control: SlotMachineCabinetControl | "service",
+    control: SlotMachineCabinetControl | "service" | "settings",
     value?: number,
   ): boolean {
     const device = findDevice(deviceId);
@@ -5938,9 +5938,11 @@ export class World {
       onDenominationChange: (amount: number) => visual?.setDenomination(amount),
       onMessage: (message: string) => visual?.showMessage(message),
     };
-    if (control === "service") {
+    // ⚙️ (kick panel) opens the machine's card for anyone, read-only unless
+    // they can edit the room; the marquee's service key stays owner-only.
+    if (control === "service" || control === "settings") {
       const permission = canEditRoom();
-      if (!permission.ok) {
+      if (control === "service" && !permission.ok) {
         visual?.showMessage("OWNER ONLY");
         showHint(permission.reason);
         return true;

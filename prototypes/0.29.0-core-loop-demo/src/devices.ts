@@ -5497,6 +5497,9 @@ export function createSlotMachineUI(
       `THEORETICAL RTP ${paytableRtp.toFixed(2)}%`;
     panel.querySelector<HTMLElement>('#sl-service-status')!.textContent = flash;
     const house = deps.isHouse();
+    panel.querySelector<HTMLElement>('#sl-role')!.textContent = house
+      ? 'YOU RUN THIS MACHINE'
+      : 'THE OWNER SETS THIS MACHINE · ANYONE CAN LOOK';
     renderPaytable(paytable, house);
     const owner = panel.querySelector<HTMLElement>('#sl-owner');
     if (owner) owner.style.display = house ? 'flex' : 'none';
@@ -5579,7 +5582,9 @@ export function createSlotMachineUI(
         pointer-events:auto; box-shadow:0 12px 64px rgba(0,0,0,0.9);
       `;
       panel.innerHTML = `
-        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🎰 SLOT MACHINE SERVICE</div>
+        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">⚙️ SLOT MACHINE</div>
+        <div id="sl-role" style="font-size:9px;color:${GT_DIM};letter-spacing:1px;"></div>
+        <div style="font-size:9px;color:#7CF5B0;">🔒 FAIR · YOUR SEED AND THE HOUSE SEED DECIDE EVERY SPIN</div>
         <div id="sl-service-status" style="min-height:14px;text-align:center;font-size:9px;font-weight:800;color:${GT_GOLD_BRIGHT};"></div>
         <div id="sl-rtp" style="font-size:9px;color:${GT_DIM};"></div>
         <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:9px;color:#E8ECF2;"></div>

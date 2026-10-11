@@ -10177,7 +10177,7 @@ function setupClickToEnter() {
 
 function findSlotMachineControl(scene: THREE.Scene): {
   deviceId: string;
-  control: "denomination" | "pull" | "service";
+  control: "denomination" | "pull" | "service" | "settings";
   value?: number;
 } | null {
   const controls: THREE.Object3D[] = [];
@@ -10189,7 +10189,7 @@ function findSlotMachineControl(scene: THREE.Scene): {
   const hit = raycaster.intersectObjects(controls, false)[0];
   if (!hit) return null;
   const control = hit.object.userData.slotControl;
-  if (control !== "denomination" && control !== "pull" && control !== "service") return null;
+  if (control !== "denomination" && control !== "pull" && control !== "service" && control !== "settings") return null;
   return {
     deviceId: hit.object.userData.slotMachineId as string,
     control,
