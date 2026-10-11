@@ -25,7 +25,7 @@ import { tvPlayerCanSeek, tvPlayerPositionMs } from './tvSession';
 import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
-import { suspendStickKeys } from './freeFlightStick';
+import { isFlightKey } from './freeFlightStick';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -116,6 +116,18 @@ function refreshStatus(root: HTMLElement): void {
   root.querySelectorAll<HTMLElement>('[data-tv-status]').forEach((el) => {
     const text = statusText(el.dataset.tvStatus!);
     if (el.textContent !== text) el.textContent = text;
+  });
+}
+
+/** The volume sliders' level, set as a property rather than written into
+ *  the panel's HTML: a peer's VOLUME press on the set then moves the knob
+ *  without rebuilding the panel under a pointer mid-drag, and a slider the
+ *  player is on keeps its own reading until its change lands. */
+function syncVolumeSliders(root: HTMLElement): void {
+  root.querySelectorAll<HTMLInputElement>('input[data-tv-volume]').forEach((i) => {
+    if (document.activeElement === i) return;
+    const level = String(readTv(i.dataset.tvVolume!).volume);
+    if (i.value !== level) i.value = level;
   });
 }
 
@@ -218,10 +230,19 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
         ${mine || owner ? handToBlock(deps, deps.itemId) : ''}
       </div>
     `;
-    // Rebuild only when something other than the clock changed.
+    // Rebuild only when something other than the clock changed — and keep
+    // the keyboard player's place across it (the phone app's rule): the
+    // control they were on, by its data-tv-* identity, else the panel.
     if (html !== lastHtml) {
+      const active = document.activeElement;
+      const inside = active instanceof HTMLElement && panel.contains(active) ? active : null;
+      const focusKey = focusKeyOf(inside);
       panel.innerHTML = html;
       lastHtml = html;
+      if (inside) {
+        const again = focusKey ? panel.querySelector<HTMLElement>(focusKey) : null;
+        (again ?? panel).focus({ preventScroll: true });
+      }
       const note = (text: string) => showNote(panel!, text);
       panel.querySelector<HTMLButtonElement>('[data-tv-power]')?.addEventListener('click', () => { tvTogglePower(deps.itemId); });
       panel.querySelector<HTMLButtonElement>('[data-tv-vol-down]')?.addEventListener('click', () => { tvSetVolume(deps.itemId, readTv(deps.itemId).volume - 10); });
@@ -254,6 +275,15 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
       // The clock and countdown move without a doc write.
       clockTimer = window.setInterval(render, 1000);
       render();
+      // By keyboard (the phone app's traversal, wireTvNav): Tab is the
+      // phone's toggle and never reaches this panel, so ↑/↓ step through
+      // POWER, VOLUME, WATCH and the remote's buttons, Enter and Space press
+      // them, and focus lands on the first control as the panel opens —
+      // Escape steps back from the set as before (deviceFocus). Mounted is
+      // on screen: the overlay is in front of the player while it exists.
+      wireTvNav(panel, () => true);
+      const first = [...panel.querySelectorAll<HTMLElement>(NAV_STOPS)].find((el) => el.offsetParent !== null);
+      (first ?? panel).focus({ preventScroll: true });
     },
     unmount(): void {
       unsubscribe?.();
@@ -315,8 +345,11 @@ const SCHEDULE_CHOICES: Array<{ label: string; minutes: number }> = [
 
 let phoneSubscribed = false;
 let activeTile = '';
-let phoneClockTimer = 0;
 let phoneHtml = '';
+/** The deps of the latest renderTvPhoneApp call: the one subscribed paint
+ *  reads these, so a view reopened with fresh deps repaints with them, not
+ *  with the ones the first open happened to capture. */
+let phoneDeps: TvPhoneDeps | null = null;
 
 /** The controls ↑/↓ step through, and that focus lands on. */
 const NAV_STOPS = 'button:not([disabled]), input, select';
@@ -357,7 +390,7 @@ function tvAppOnScreen(host: HTMLElement): boolean {
  *  Wired once per host, in the capture phase: the paste box stops its own
  *  keys from bubbling (typing must not walk the fox), and ↑/↓ must still
  *  move out of it. */
-function wireTvNav(host: HTMLElement): void {
+function wireTvNav(host: HTMLElement, onScreen: () => boolean = () => tvAppOnScreen(host)): void {
   if (host.dataset.tvNav) return;
   host.dataset.tvNav = '1';
   host.setAttribute('tabindex', '-1'); // focusable by script, never a tab stop
@@ -367,11 +400,16 @@ function wireTvNav(host: HTMLElement): void {
     e.preventDefault();
     e.stopPropagation(); // a move inside the remote is not a key for the world, nor the phone's Tab
     const here = from ? stops.indexOf(from.closest<HTMLElement>(NAV_STOPS) as HTMLElement) : -1;
-    stops[here < 0 ? 0 : (here + step + stops.length) % stops.length]!.focus({ preventScroll: true });
+    // An explicit step scrolls the control into view: the remote overflows
+    // the phone's viewport (history, several sets), the arrow's own scroll
+    // is prevented above, and a control focused offscreen cannot be seen.
+    // preventScroll is for the repaint's focus restoration, which must not
+    // jolt the view (renderTvPhoneApp).
+    stops[here < 0 ? 0 : (here + step + stops.length) % stops.length]!.focus();
   };
   host.addEventListener('keydown', (e) => {
     if (e.altKey || e.ctrlKey || e.metaKey) return;
-    if (!tvAppOnScreen(host)) return;
+    if (!onScreen()) return;
     const target = e.target instanceof HTMLElement ? e.target : null;
     const widget = target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === 'range');
     if (widget && e.key === 'Tab') {
@@ -389,35 +427,44 @@ function wireTvNav(host: HTMLElement): void {
   }, true);
 }
 
-/** The helm's flight stick stands aside while the app is on screen
- *  (freeFlightStick.suspendStickKeys): when the stick is taken, its capture
- *  listener runs before this view's and swallows the arrows that step
- *  through the remote and the Space that presses its buttons — the ship
- *  turned or braked instead. Held exactly while tvAppOnScreen says so and
- *  released the moment it does not: the phone closes by many paths (Tab,
- *  Escape, WATCH, a pass's auto-enter) and the view changes through
- *  showPhoneView, so visibility is WATCHED — the container's class and the
- *  view's — rather than hooked at each, and the paint timer checks it too.
- *  Its own hold, apart from the theatre's: the phone can stay up while the
- *  theatre closes beneath it, and the other way round. */
-let stickRelease: (() => void) | null = null;
-function syncTvStick(host: HTMLElement): void {
-  const on = tvAppOnScreen(host);
-  if (on && !stickRelease) {
-    stickRelease = suspendStickKeys();
-  } else if (!on && stickRelease) {
-    stickRelease();
-    stickRelease = null;
-  }
-}
-function watchTvStick(host: HTMLElement): void {
+/** The helm's flight stick and this app share the arrows and Space: when the
+ *  stick is taken, its capture listener runs before this view's and would
+ *  swallow the arrows that step through the remote and the Space that
+ *  presses its buttons — the ship turned or braked instead. The app marks
+ *  its host `data-stick-aside` (freeFlightStick): a key whose TARGET is
+ *  inside the app passes the stick by, like a key typed in a text field,
+ *  while a key pressed with focus elsewhere — the pilot clicked back on the
+ *  world with the phone still up — is still the stick's, so flying never
+ *  walks the pilot away from the helm. The other half of that promise is
+ *  this app's: a flight key it receives must not bubble on to input.ts and
+ *  the camera rig (the stick no longer stops it), so the bubble listener
+ *  below holds every flight key the app's controls were given, after the
+ *  control's own action (the button's click, the slider's step) has had it.
+ *  Tab and Escape are not flight keys and stay the phone's. The mark and
+ *  the hold go together, and both only while the app is on screen. */
+function wireTvStick(host: HTMLElement): void {
   if (host.dataset.tvStick) return;
   host.dataset.tvStick = '1';
-  const observer = new MutationObserver(() => syncTvStick(host));
+  // The mark is carried only while the app is ON SCREEN: the phone slides
+  // offscreen and leaves a focused control behind, and a key on that hidden
+  // control must be the stick's again — with the mark still there the stick
+  // stood aside while this app, not on screen, held nothing back, and W
+  // reached the world. Visibility is watched (the container's class and the
+  // view's), since the phone closes by many paths; closing the phone also
+  // blurs its controls (main.ts), belt and braces.
+  const sync = () => {
+    if (tvAppOnScreen(host)) host.dataset.stickAside = '1';
+    else delete host.dataset.stickAside;
+  };
+  const observer = new MutationObserver(sync);
   observer.observe(host, { attributes: true, attributeFilter: ['class'] });
   const phone = host.closest<HTMLElement>('#spacephone-container');
   if (phone) observer.observe(phone, { attributes: true, attributeFilter: ['class'] });
-  syncTvStick(host);
+  sync();
+  host.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (tvAppOnScreen(host) && isFlightKey(e.code)) e.stopPropagation();
+  });
 }
 
 /** Land keyboard focus in the app as it opens (main.ts): Tab cannot reach
@@ -435,11 +482,12 @@ export function focusTvApp(host: HTMLElement): void {
  *  active view. */
 export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
   wireTvNav(host);
-  watchTvStick(host);
+  wireTvStick(host);
+  phoneDeps = deps;
   const paint = () => {
-    syncTvStick(host); // every second, whatever path hid or showed the view
     if (!host.classList.contains('active')) return;
-    const html = renderTvApp(deps);
+    const d = phoneDeps ?? deps;
+    const html = renderTvApp(d);
     // Rebuild only when something other than the clock changed (the status
     // spans tick in place); the clocks move on the timer without a write.
     if (html !== phoneHtml || host.childElementCount === 0) {
@@ -447,35 +495,42 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       // they had focus on, by its data-tv-* identity (a keyboard player
       // stepping through the remote must not be thrown out of it on every
       // heartbeat — and when that control is gone, the view itself keeps
-      // the focus, so ↑/↓ still work), and what they are TYPING — the paste
-      // box only (a focused volume slider is an input too, and its number
-      // must not land in the box).
+      // the focus, so ↑/↓ still work), and what they have PASTED — whether
+      // or not the box has focus: a link pasted, then the finger moved to
+      // PLAY or a tile, must not be wiped by a heartbeat or a power write
+      // in between (it is cleared by a PLAY or SCHEDULE that took it). The
+      // caret is restored only when the box itself had the focus.
       const active = document.activeElement;
       const inside = active instanceof HTMLElement && host.contains(active) ? active : null;
       const focusKey = focusKeyOf(inside);
-      const draft = inside instanceof HTMLInputElement && inside.matches('input[data-tv-paste]')
-        ? { value: inside.value, start: inside.selectionStart, end: inside.selectionEnd }
+      const pasteBox = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+      const draft = pasteBox && pasteBox.value
+        ? { value: pasteBox.value, focused: pasteBox === inside, start: pasteBox.selectionStart, end: pasteBox.selectionEnd }
         : null;
       host.innerHTML = html;
       phoneHtml = html;
-      wireTvApp(host, deps);
+      wireTvApp(host, d);
+      const pasteAgain = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+      if (draft && pasteAgain) pasteAgain.value = draft.value;
       if (inside) {
         const again = focusKey ? host.querySelector<HTMLElement>(focusKey) : null;
         (again ?? host).focus({ preventScroll: true });
-        if (draft && again instanceof HTMLInputElement) {
-          again.value = draft.value;
-          try { again.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
+        if (draft?.focused && again === pasteAgain && pasteAgain) {
+          try { pasteAgain.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
         }
       }
     }
     refreshStatus(host);
+    syncVolumeSliders(host);
   };
+  // One subscription and one clock for the life of the page: the view
+  // element is the same on every open (main.ts's #phone-app-tv), and the
+  // paint reads the latest deps through phoneDeps.
   if (!phoneSubscribed) {
     phoneSubscribed = true;
     subscribeTv(paint);
-    phoneClockTimer = window.setInterval(paint, 1000);
+    window.setInterval(paint, 1000);
   }
-  void phoneClockTimer;
   paint();
 }
 
@@ -556,7 +611,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
         ${seekable && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
         ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek or volume from here</span>` : ''}
         ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
-        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
+        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
       </div>`
     : '';
   const history = rec.history.length
@@ -608,9 +663,11 @@ export function playRefusal(source: TvSource): string | null {
   const why = consentRefusal(source);
   return why === 'server-off'
     ? `That link is on another server — ${SERVERLESS_ONLY}: a link on this station's node or your own origin plays here.`
-    : why === 'private'
-      ? 'That host is inside a private network: nobody in the room can ask a browser to fetch from there.'
-      : 'That is not a link the TV can play.';
+    : why === 'node-stale'
+      ? 'That link is on this station\'s node, but the node has not answered lately: it plays once the node is back.'
+      : why === 'private'
+        ? 'That host is inside a private network: nobody in the room can ask a browser to fetch from there.'
+        : 'That is not a link the TV can play.';
 }
 
 /** The archive metadata lookups in flight: a result is applied only when it
@@ -644,12 +701,25 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   }));
   const paste = host.querySelector<HTMLInputElement>('[data-tv-paste]');
   paste?.addEventListener('keydown', (e) => {
-    e.stopPropagation(); // typing must not walk the fox
+    // Typing must not walk the fox: a typed key stays here. Tab is the
+    // phone's own toggle and goes on to it (every other control in the
+    // phone lets it), and keyups are never held back — a W held as the
+    // remote opened and released in this box must reach InputManager, or
+    // the clone walks on until the key is pressed again.
+    if (e.key === 'Tab') return;
+    e.stopPropagation();
     if (e.key === 'Enter') host.querySelector<HTMLButtonElement>('[data-tv-play]')?.click();
   });
-  paste?.addEventListener('keyup', (e) => e.stopPropagation());
 
-  const sourceFromBox = async (id: string): Promise<TvSource | null> => {
+  /** The box's link as a source, with the TEXT it was read from: an archive
+   *  lookup can take seconds while the box stays editable, and the clear
+   *  that follows a write must take only that text — not a newer link typed
+   *  meanwhile and never submitted. */
+  const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string } | null> => {
+    // Every attempt supersedes the lookup before it, a refused or malformed
+    // one included: a PLAY on a bad link must not let an older archive
+    // lookup land its film after the refusal was shown.
+    const gen = ++resolveGen;
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
     if (!parsed) {
@@ -664,7 +734,6 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback(refused);
       return null;
     }
-    const gen = ++resolveGen;
     if (parsed.kind === 'archive' && !parsed.file && deps.resolveArchive) {
       feedback('Asking archive.org which file to play…');
       const epoch = tvDocEpoch();
@@ -677,28 +746,52 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
         found = await deps.resolveArchive(parsed.identifier);
       } catch { /* fall through to the embed */ }
       if (gen !== resolveGen || epoch !== tvDocEpoch() || tvRevision(id) !== revision) return null; // overtaken
-      if (found) return sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed;
+      if (found) return { source: sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed, text };
       feedback('No playable file found — using their embed (start-time sync only).');
     }
-    return parsed;
+    return { source: parsed, text };
   };
 
+  // The box is cleared BEFORE the write that takes its link: the write
+  // notifies the phone synchronously, the repaint may rebuild the box and
+  // carry its draft into the replacement, and clearing the detached old box
+  // after that would leave the consumed link showing. So: take the text
+  // (the box read live, not the one wired here — a repaint during the
+  // archive lookup may have replaced it), clear, write, and give the text
+  // back to whatever box is mounted when the write is refused.
+  const liveBox = () => host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+  /** Clear the box of the text that was submitted — and only that: a newer
+   *  link typed during the lookup stays. Says whether it was taken. */
+  const takeDraft = (text: string): boolean => {
+    const box = liveBox();
+    if (!box || box.value !== text) return false;
+    box.value = '';
+    return true;
+  };
+  const giveBack = (text: string) => {
+    const box = liveBox();
+    if (box && !box.value) box.value = text;
+  };
   host.querySelector<HTMLButtonElement>('[data-tv-play]')?.addEventListener('click', () => {
     const id = host.querySelector<HTMLButtonElement>('[data-tv-play]')!.dataset.tvPlay!;
-    void sourceFromBox(id).then((src) => {
-      if (!src) return;
-      const r = tvPlay(id, src);
-      feedback(r.ok ? `Now on: ${sourceLabel(src)}` : r.error);
+    void sourceFromBox(id).then((got) => {
+      if (!got) return;
+      const taken = takeDraft(got.text);
+      const r = tvPlay(id, got.source);
+      feedback(r.ok ? `Now on: ${sourceLabel(got.source)}` : r.error);
+      if (!r.ok && taken) giveBack(got.text);
       if (r.ok) deps.openTheatre(id);
     });
   });
   host.querySelectorAll<HTMLButtonElement>('[data-tv-schedule]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
     const minutes = Number(b.dataset.tvSchedule);
-    void sourceFromBox(id).then((src) => {
-      if (!src) return;
-      const r = tvSchedule(id, src, Date.now() + minutes * 60_000);
-      feedback(r.ok ? `Scheduled: ${sourceLabel(src)} in ${minutes} min` : r.error);
+    void sourceFromBox(id).then((got) => {
+      if (!got) return;
+      const taken = takeDraft(got.text);
+      const r = tvSchedule(id, got.source, Date.now() + minutes * 60_000);
+      feedback(r.ok ? `Scheduled: ${sourceLabel(got.source)} in ${minutes} min` : r.error);
+      if (!r.ok && taken) giveBack(got.text);
     });
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-history]').forEach((b) => b.addEventListener('click', () => {

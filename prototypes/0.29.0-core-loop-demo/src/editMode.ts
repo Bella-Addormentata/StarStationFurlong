@@ -75,10 +75,10 @@ import {
 } from './pathfinding';
 import {
   roomHalfExtents, roomPlaceBounds, doorLateralLimitForWall, clearDoorSlide,
-  roomCupola, readCupolaWall, writeCupolaWall,
+  roomCupolas, readCupolaWalls, writeCupolaWalls,
 } from './floorPlanDoc';
 import {
-  cupolaPlan, cupolaEndWalls, cupolaSideWallRun, cupolaCornerClearance,
+  cupolaPlan, cupolaEndWalls, cupolaWallSelections, cupolaWallsLabel, cupolaSideWallRun, cupolaCornerClearance,
   boxClearOfCupolaCorners, boxInCupolaTaper, cupolaStripRun, type CupolaPlan, type CupolaWall,
 } from './cupola';
 import { SEATS, rebuildSeats } from './seats';
@@ -125,6 +125,7 @@ import { isRouteRunning } from './pilotRoute';
 import { clearRobotConfig, readRobotConfig } from './robotDoc';
 import { keptRoutePartTaken, routePortTaken, tanksLockedByRoute, ROUTE_PORT_REFUSAL, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
+import { isFormFieldTarget } from './typingFocus';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
 
@@ -321,8 +322,8 @@ export function validatePlacement(
   //     clearance the placement box keeps.
   //     A wall panel may not hang anywhere past where the taper starts (on
   //     the glass, or on side wall the taper removed).
-  const cupola = roomCupola();
-  if (cupola && !cupolaClearsItem(cupola, item.kind, pos, rot, box, featureBoxes)) {
+  const cupolas = roomCupolas();
+  if (cupolas.some((cupola) => !cupolaClearsItem(cupola, item.kind, pos, rot, box, featureBoxes))) {
     return { ok: false, reason: 'in the cupola glass' };
   }
 
@@ -715,8 +716,8 @@ export function validateDoorPlacement(
   excludeId?: string,
 ): DoorPlacementVerdict {
   // 0. 🔭 A cupola wall is all glass — no doors on it.
-  const cupola = roomCupola();
-  if (cupola && cupola.wall === wall) {
+  const cupolas = roomCupolas();
+  if (cupolas.some((cupola) => cupola.wall === wall)) {
     return { ok: false, reason: 'the cupola wall takes no doors' };
   }
 
@@ -725,7 +726,7 @@ export function validateDoorPlacement(
     return { ok: false, reason: 'too close to a corner' };
   }
   // 1b. 🔭 …and, on a side wall, clear of where a cupola starts tapering.
-  if (cupola && !doorClearOfCupola(cupola, wall, lateral)) {
+  if (cupolas.some((cupola) => !doorClearOfCupola(cupola, wall, lateral))) {
     return { ok: false, reason: 'too close to the cupola' };
   }
 
@@ -919,15 +920,12 @@ export function validateCupolaWall(wall: CupolaWall): CupolaVerdict {
  * when it cleared.
  */
 export function settleCupolaConflicts(): boolean {
-  const raw = readCupolaWall();
-  if (!raw) return false;
-  // A stored wall that is not an end wall at this size is stale too (a peer
-  // set it while another resized): left dormant it would return on a resize.
-  const dormant = !cupolaPlan(roomHalfExtents(), raw);
-  const wall = roomCupola()?.wall;
-  if (!dormant && (!wall || validateCupolaWall(wall).ok)) return false;
+  const walls = readCupolaWalls();
+  if (!walls.length) return false;
+  const valid = walls.filter((wall) => cupolaPlan(roomHalfExtents(), wall) && validateCupolaWall(wall).ok);
+  if (valid.length === walls.length) return false;
   if (!canEditRoom().ok) return false;
-  writeCupolaWall(null);
+  writeCupolaWalls(valid);
   return true;
 }
 
@@ -1228,7 +1226,7 @@ class RoomEditController {
   constructor() {
     // Esc precedence — same e.target guards as the phone (#31) and
     // device-focus (#33 D0.3) handlers, deferring to both owners:
-    //  (1) a focused INPUT/TEXTAREA owns Esc (room-name editor, chat) —
+    //  (1) a focused form field owns Esc (room-name editor, chat) —
     //      guard on e.target, not document.activeElement (#31's lesson).
     //  (2) phone open → #31's handler owns Esc.
     //  (3) device focus live → deviceFocus's handler owns Esc (can't overlap
@@ -1236,8 +1234,7 @@ class RoomEditController {
     //  (4) otherwise Esc exits an active edit mode.
     window.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape' || !this.active) return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+      if (isFormFieldTarget(e.target as HTMLElement | null)) {
         return;
       }
       if (document.getElementById('spacephone-container')?.classList.contains('active')) {
@@ -1314,8 +1311,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || !this.addWindowMode) return;
       if (e.key !== '[' && e.key !== ']') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       this.cycleWindowSurface(e.key === ']' ? 1 : -1);
     });
@@ -1337,8 +1333,7 @@ class RoomEditController {
       else if (e.key === 'ArrowDown') dh = -WINDOW_RESIZE_STEP;
       else if (e.key === 'f' || e.key === 'F') auto = true;
       else return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       if (armed) {
         if (auto) this.resetGhostAuto();
@@ -1354,8 +1349,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || !this.carrying) return;
       if (e.key !== 'r' && e.key !== 'R') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       this.rotateCarry();
     });
 
@@ -1367,8 +1361,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || this.carrying || this.doorDrag || !this.selectedId) return;
       if (e.key !== 'x' && e.key !== 'X' && e.key !== 'Delete') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       this.removeSelected();
     });
@@ -3925,31 +3918,38 @@ class RoomEditController {
   /** Label the button with the room's current cupola wall (or OFF). */
   private syncCupolaButton(): void {
     if (!this.cupolaBtnEl) return;
-    const plan = roomCupola();
-    this.cupolaBtnEl.textContent = plan ? `🔭 CUPOLA ${plan.wall}` : '🔭 CUPOLA OFF';
+    const { halfX, halfZ } = roomHalfExtents();
+    const active = new Set(roomCupolas().map((plan) => plan.wall));
+    const walls = cupolaEndWalls(halfX, halfZ).filter((wall) => active.has(wall));
+    this.cupolaBtnEl.textContent = walls.length ? `🔭 CUPOLA ${cupolaWallsLabel(walls)}` : '🔭 CUPOLA OFF';
   }
 
   /** Step to the next cupola setting that validates (OFF always does). */
   private cycleCupola(): void {
     const { halfX, halfZ } = roomHalfExtents();
-    const order: Array<CupolaWall | null> = [null, ...cupolaEndWalls(halfX, halfZ)];
-    const current = roomCupola()?.wall ?? null;
-    const start = order.indexOf(current);
+    const ends = cupolaEndWalls(halfX, halfZ);
+    const order = cupolaWallSelections(ends);
+    const current = roomCupolas().map((plan) => plan.wall);
+    const key = (walls: CupolaWall[]) => [...walls].sort().join('/');
+    const start = order.findIndex((walls) => key(walls) === key(current));
     const refused: string[] = [];
     for (let step = 1; step <= order.length; step++) {
-      const next = order[(start + step) % order.length];
-      if (next === null) {
-        if (readCupolaWall() !== null) writeCupolaWall(null);
+      const next = order[(start + step + order.length) % order.length];
+      if (!next.length) {
+        if (readCupolaWalls().length) writeCupolaWalls([]);
         showHint(refused.length ? `No cupola — ${refused.join('; ')}.` : 'Cupola removed — a plain end wall again.', 3600);
         break;
       }
-      const verdict = validateCupolaWall(next);
-      if (!verdict.ok) {
-        refused.push(verdict.reason);
+      const verdicts = next.map(validateCupolaWall);
+      const refusal = verdicts.find((verdict) => !verdict.ok);
+      if (refusal && !refusal.ok) {
+        refused.push(refusal.reason);
         continue;
       }
-      writeCupolaWall(next);
-      showHint(`The ${next} wall is a cupola now — no doors can go on it.`, 3000);
+      writeCupolaWalls(next);
+      showHint(next.length === 1
+        ? `The ${next[0]} wall is a cupola now — no doors can go on it.`
+        : `Both end walls (${cupolaWallsLabel(next)}) are cupolas now — no doors can go on them.`, 3000);
       break;
     }
     this.syncCupolaButton();

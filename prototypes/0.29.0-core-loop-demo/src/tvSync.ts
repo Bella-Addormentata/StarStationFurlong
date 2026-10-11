@@ -29,7 +29,7 @@
  */
 
 import {
-  driftAction, iHoldRemote, readPlayback, readTv, tvHeartbeat, tvNow, tvStop,
+  driftAction, holderAnchorMs, iHoldRemote, markTvPageAwake, readPlayback, readTv, tvHeartbeat, tvNow, tvStop,
   TV_HEARTBEAT_MS, TV_NUDGE_RATE, TV_SEEK_OVER_MS,
 } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -233,6 +233,13 @@ export class TvSyncController {
   tick(): PlaybackNow {
     const now = this.now();
     const hold = this.iHold();
+    // This page is awake, as of this tick: the controller's own timer can
+    // run before World's first room tick after a suspension (the theatre's
+    // 400 ms against the room's 500 ms), and the sleep must be found before
+    // the record is read, or a viewer seeks to a sleep-extrapolated position
+    // in the one tick before the room marks the gap (readPlayback `stale`
+    // reads the last gap recorded; it detects none itself).
+    markTvPageAwake(now);
     const pb = this.playback(now, this.lead());
     const p = this.deps.player;
     if (!p.isReady()) return pb;
@@ -321,10 +328,16 @@ export class TvSyncController {
         // player that cannot seek YET (an HTML video before its ranges)
         // keeps it for the first tick it can, paused or resumed
         // (tickViewer); one that never can (no clock) has nothing to rewind.
+        // Into this player's own range, for the comparison as for the seek:
+        // a holder's +10 s while paused can park the record past the file's
+        // end (the holder clamps its own player, and heartbeats nothing
+        // while paused), and a viewer measured against that unreachable
+        // position would seek to it again every cooldown for good.
         const rewind = newProgramme && p.canSeek;
-        if (rewind || (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS
+        const target = reachable(pb.positionMs, p);
+        if (rewind || (p.canSeek && Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS
           && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
-          p.seek(pb.positionMs);
+          p.seek(target);
           this.lastSeekAt = now;
         }
         if (!newProgramme || rewind || !p.hasClock) this.seenStarted = started;
@@ -385,7 +398,11 @@ export class TvSyncController {
       // A target the player cannot reach (+10 s with five left; a rewind
       // out of a live window) is clamped where the player would clamp the
       // seek, or it would never be reached and the programme never closed.
-      const target = reachable(pb.positionMs, p);
+      // A stale reading (a remote picked up on waking, before any fresh
+      // beat) is taken from its takeover anchor (tvDoc holderAnchorMs): a
+      // peer's beat that landed in the wake window is not bridged across
+      // the sleep as though it predated it.
+      const target = reachable(holderAnchorMs(pb), p);
       // While an earlier seek is still landing, the newest target is always
       // reissued — even inside the band of where the player still reads —
       // or the old seek would land later and be heartbeated over this one.
@@ -413,7 +430,7 @@ export class TvSyncController {
       // published; the beat from there is the fresh sample that un-stales
       // everyone, this page included.
       this.rejoining = true;
-      const target = reachable(pb.positionMs, p);
+      const target = reachable(holderAnchorMs(pb), p); // own pre-sleep beat: bridged; a peer's wake-window beat: from its arrival
       if (Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS && (p.canSeek || p.hasClock)) this.aim(p, target, now);
     }
     if (!pb.stale) this.rejoining = false;
@@ -526,6 +543,9 @@ export class TvSyncController {
     // the fresh sample near zero and inside the band of the player's end,
     // would otherwise read as drift and never be replayed.
     if (pb.stale) {
+      // A nudge from before the sleep is a correction toward a sample this
+      // page no longer trusts: at 1× until a fresh one says which way.
+      this.setRate(1);
       if (!p.isPlaying() && !p.isEnded()) p.play();
       return pb;
     }
@@ -580,12 +600,15 @@ export class TvSyncController {
       return pb;
     }
     this.seenStarted = started;
-    const action = driftAction(p.currentMs(), pb.positionMs, p.canNudge);
+    // Measured against what this player can reach, as the seek is: the
+    // record may name a position this viewer's media does not have (a live
+    // window that has moved on), and a player already at the window's edge
+    // is in step with it, not 30 s out and seeked there again every cooldown.
+    const target = reachable(pb.positionMs, p);
+    const action = driftAction(p.currentMs(), target, p.canNudge);
     if (action === 'seek') {
       if (p.canSeek && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
-        // Into this player's own range: the record may name a position this
-        // viewer's media does not have (a live window that has moved on).
-        p.seek(reachable(pb.positionMs, p));
+        p.seek(target);
         this.lastSeekAt = now;
         this.setRate(1);
       }

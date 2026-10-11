@@ -10,6 +10,7 @@ import { renderWithFarPass } from "./farOrbitView";
 import type { World } from "./world";
 import type { DoorId } from "./doors";
 import type { InputManager } from "./input";
+import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { YjsSync } from "./network/YjsSync";
@@ -19,6 +20,7 @@ import {
   unpackAddressedTick,
   tickKind,
   TICK_KIND_MOVEMENT,
+  TICK_KIND_ALLIGATORS,
   ADDRESSED_TICK_BYTES,
   TICK_BYTES,
   type MovementTick,
@@ -31,6 +33,11 @@ import {
   routeAirHockeyTick,
   setAirHockeySender,
 } from "./airHockeySession";
+// 🐊 #185: insatiable-alligators heads and balls ride lane kind 3.
+import {
+  routeAlligatorsTick,
+  setAlligatorsSender,
+} from "./alligatorsSession";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -232,13 +239,13 @@ import { leaveCoinPusherRoom } from "./pusherCroupier";
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
-import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv } from "./tvDoc";
+import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv, tvNow, tvWallNow } from "./tvDoc";
 import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
-import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
-import { setOwnMediaOrigins } from "./tvConsent";
+import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
+import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
-import { armTvDrive, leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
+import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
 import { leaveArcadeRoom } from "./arcadeSession";
@@ -327,7 +334,7 @@ import {
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
-  bindFloorPlan, subscribeFloorPlan, readRoomDims,
+  bindFloorPlan, subscribeFloorPlan, readRoomDims, endCupolaWalls,
 } from "./floorPlanDoc";
 import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
@@ -575,6 +582,7 @@ const networkProvider = new NetworkProvider();
 // provider is a boot-time singleton and sendTick self-gates on connection
 // state (clean no-op offline), so one wiring here covers every room join.
 setAirHockeySender((buf) => networkProvider.sendTick(buf));
+setAlligatorsSender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -2286,6 +2294,15 @@ async function joinRoomAtEpoch(
     // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
       queueCupolaSettle();
+      // 🔭 A resize or a cupola set / cleared changes what the atlas maps
+      // draw of this module (issue 219): harvest it then, not on every door
+      // slide the floor plan also carries.
+      const shape = JSON.stringify([readRoomDims(), endCupolaWalls()]);
+      if (shape !== atlasShapeHarvested) {
+        atlasShapeHarvested = shape;
+        harvestStationAtlas();
+        world?.refreshFpNeighbourShells();
+      }
       world?.reconcileDoorPlacements();
       world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
       roomEdit.onFloorPlanChanged(); // …and an open edit session's 🔭 label
@@ -3080,7 +3097,9 @@ async function joinRoomAtEpoch(
         seenPeers.add(peerId);
         receivedTicks++;
         remoteLastSeen.set(peerId, performance.now());
-        routeAirHockeyTick(peerId, tick);
+        // 🐊 #185: kind 3 is the alligators lane; 1–2 stay air hockey's.
+        if (tickKind(tick.flags) === TICK_KIND_ALLIGATORS) routeAlligatorsTick(peerId, tick);
+        else routeAirHockeyTick(peerId, tick);
         return;
       }
       seenPeers.add(peerId);
@@ -3097,6 +3116,7 @@ async function joinRoomAtEpoch(
         (tick.flags & 8) === 8,
         (tick.flags & 16) === 16,
         (tick.flags & 32) === 32,
+        tick.seq,
       );
     } catch (e) {
       console.warn("Error unpacking incoming remote peer datagram tick:", e);
@@ -3182,6 +3202,12 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // renewals) is this room's; a P1 who leaves stands up before the doc goes.
   closeArcadeStage();
   leaveArcadeRoom(roomArcadeIds());
+  // What this viewer agreed to fetch was agreed for THIS room: the origins
+  // accepted with PLAY FROM, the probe's verdicts and the sets' mount
+  // budgets go with it, so a peer in the next room cannot reuse an origin
+  // approved here without asking, and a reused set id inherits no spent
+  // budget. The node's trust is the probe's, not the room's, and stays.
+  forgetMediaConsent();
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -4410,6 +4436,8 @@ export function setAtlasHarvestArmed(on: boolean): void {
  *  room's state landed): until then the planet summary does not take the
  *  atlas's copy of them, which may be an earlier visit's, as news. */
 let gatesReadIn: string | null = null;
+/** 🔭 The size and cupola walls the floor-plan listener last harvested. */
+let atlasShapeHarvested = "";
 
 function harvestStationAtlas(): void {
   if (!atlasHarvestArmed) return;
@@ -4512,7 +4540,7 @@ function harvestStationAtlas(): void {
   const ownerName = typeof ownerEntry?.name === "string" && ownerEntry.name ? ownerEntry.name : undefined;
   const ownerKey = typeof ownerEntry?.keyB64 === "string" && ownerEntry.keyB64 ? ownerEntry.keyB64 : undefined;
   harvestIntoAtlas({
-    roomId, name, seed, dims: readRoomDims(), doors,
+    roomId, name, seed, dims: readRoomDims(), cupola: endCupolaWalls(), doors,
     ...(gates ?? { gates: null }),
     // null: this synced room has no verifiable owner (clears a stale one),
     // and neither has one whose id the atlas can't carry (cleanAtlasOwner
@@ -6014,17 +6042,32 @@ function syncVentureLedgerFromCurrentRoom(): void {
  *  `categorizeRoom`, which now files them as 'visited'. */
 // 📺 #186: the room's TVs, as the phone remote and the leave hand-back see them.
 function roomTvIds(): string[] {
-  return FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
+  return FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
 }
 function tvLabelFor(itemId: string): string {
-  return FURNITURE.find((i) => i.id === itemId)?.kind === "tv-stand" ? "TV ON THE STAND" : "WALL TV";
+  return tvLabel(FURNITURE.find((i) => i.id === itemId)?.kind);
 }
+/** Installed on the theatre (setTvTheatreDeps) so every WATCH — the set's
+ *  panel in world.ts, the phone, the HUD chip — opens it with the same label
+ *  and the same round-trip lead. */
 function tvTheatreDeps(itemId: string) {
   return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
 }
 // 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
 function roomArcadeIds(): string[] {
   return FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+}
+
+/** WATCH from the phone or the HUD chip: only for a set still in THIS room,
+ *  with the TV drive armed. A WATCH button can outlive its set by up to a
+ *  second (the phone repaints on a timer; the chip on the room tick), and
+ *  the callback stays reachable through a room leave's awaited flush after
+ *  the teardown closed the theatre — opening then would make a theatre no
+ *  room tick ever closes. */
+function openTvTheatreIfPresent(itemId: string): boolean {
+  if (!tvDriveArmed() || !roomTvIds().includes(itemId)) return false;
+  openTvTheatre(itemId);
+  return true;
 }
 
 function currentRoomDeedIsMine(): boolean {
@@ -7664,8 +7707,9 @@ function setupSpacePhoneOverlay() {
           myName: () => getPlayerName(),
           roomPlayers: () => tvRoomPlayers(getIdentityPub()),
           openTheatre: (tvId) => {
+            if (!tvDriveArmed() || !roomTvIds().includes(tvId)) return; // the set is gone, or the room is: nothing to watch
             container?.classList.remove("active");
-            openTvTheatre(tvId, tvTheatreDeps(tvId));
+            openTvTheatre(tvId);
           },
           resolveArchive: resolveArchiveFile,
         });
@@ -7773,11 +7817,7 @@ function setupSpacePhoneOverlay() {
     }
     if (!container || !container.classList.contains("active")) return;
     const target = e.target as HTMLElement | null;
-    if (
-      target &&
-      target !== chatInput &&
-      (target.tagName === "INPUT" || target.tagName === "TEXTAREA")
-    ) {
+    if (target && target !== chatInput && isFormFieldTarget(target)) {
       return; // e.g. room-name editor owns Escape for cancel
     }
     if (currentPhoneView !== "home") {
@@ -7822,9 +7862,70 @@ function setupSpacePhoneOverlay() {
     });
   }
 
+  // 📱 Open/close the phone: Tab, or a click on its bezel.
+  const togglePhone = (): void => {
+    if (tipIndicator) {
+      removeTipIndicator();
+    }
+
+    // 💬 QUICK CHAT: from the mini bar, EXPAND to the full phone on the CHAT
+    // app (scrollable history) instead of the home-screen toggle.
+    if (miniChatOpen) {
+      closeMiniChat();
+      if (container && !container.classList.contains("active")) {
+        container.classList.add("active");
+        showPhoneView("chat");
+        logToPhoneSystem("Entering SpacePhone net...");
+      }
+      return;
+    }
+
+    if (container) {
+      // Don't OPEN the SpacePhone while editing the room: an open phone
+      // latches the #spacephone-container.active guard that swallows the
+      // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
+      // (zoom.ts), stranding the player in edit mode with no working exit.
+      // An already-open phone may still CLOSE.
+      if (
+        roomEdit.isEditModeActive() &&
+        !container.classList.contains("active")
+      )
+        return;
+      container.classList.toggle("active");
+      if (container.classList.contains("active")) {
+        // Always land on the home screen (see view-router policy note above)
+        showPhoneView("home");
+        logToPhoneSystem("Entering SpacePhone net...");
+      } else {
+        chatInput?.blur();
+        // Any control left focused inside the phone lets go too: the phone
+        // is only moved offscreen, so a focused control in it keeps taking
+        // keys nobody can see — the TV remote's paste box swallowing WASD,
+        // its PLAY still answering Enter — whether or not an opener exists
+        // to hand focus back to.
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        // Hand focus back to whatever opened the phone from outside it. The
+        // phone is only moved offscreen, never display:none, so a control
+        // left focused inside it keeps answering the arrow keys against
+        // hidden rows — a keyboard player who opened TREASURY from the room
+        // terminal could not get back to the terminal at all.
+        releasePhoneOpener();
+      }
+    }
+  };
+
   if (container) {
+    const bezel = document.getElementById("phone-bezel");
     container.addEventListener("click", (e) => {
       e.stopPropagation();
+      // 📱 #223: the bezel is the phone's handle, and a click on it does what
+      // Tab does. A put-away phone shows nothing BUT its bezel, so any click
+      // on it counts; open or peeking, only the bezel itself does, so the
+      // screen and the quick-chat field below it keep their own clicks.
+      const putAway =
+        !container.classList.contains("active") && !miniChatOpen;
+      if (putAway || bezel?.contains(e.target as Node)) togglePhone();
     });
   }
 
@@ -7834,8 +7935,7 @@ function setupSpacePhoneOverlay() {
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" || miniChatOpen) return;
     if (container?.classList.contains("active")) return;
-    const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (isFormFieldTarget(e.target as HTMLElement | null)) return;
     const welcome = document.getElementById("welcome");
     if (welcome && getComputedStyle(welcome).display !== "none") return;
     if (roomEdit.isEditModeActive() || isDeviceFocusActive()) return;
@@ -7849,49 +7949,7 @@ function setupSpacePhoneOverlay() {
       // Suppress the browser's focus-cycling so Tab acts as a pure toggle,
       // and let it close the phone even while the chat input has focus.
       e.preventDefault();
-
-      if (tipIndicator) {
-        removeTipIndicator();
-      }
-
-      // 💬 QUICK CHAT: Tab from the mini bar EXPANDS to the full phone on the
-      // CHAT app (scrollable history) instead of the home-screen toggle.
-      if (miniChatOpen) {
-        closeMiniChat();
-        if (container && !container.classList.contains("active")) {
-          container.classList.add("active");
-          showPhoneView("chat");
-          logToPhoneSystem("Entering SpacePhone net...");
-        }
-        return;
-      }
-
-      if (container) {
-        // Don't let Tab OPEN the SpacePhone while editing the room: an open
-        // phone latches the #spacephone-container.active guard that swallows the
-        // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
-        // (zoom.ts), stranding the player in edit mode with no working exit.
-        // Tab may still CLOSE an already-open phone.
-        if (
-          roomEdit.isEditModeActive() &&
-          !container.classList.contains("active")
-        )
-          return;
-        container.classList.toggle("active");
-        if (container.classList.contains("active")) {
-          // Always land on the home screen (see view-router policy note above)
-          showPhoneView("home");
-          logToPhoneSystem("Entering SpacePhone net...");
-        } else {
-          chatInput?.blur();
-          // Hand focus back to whatever opened the phone from outside it. The
-          // phone is only moved offscreen, never display:none, so a control
-          // left focused inside it keeps answering the arrow keys against
-          // hidden rows — a keyboard player who opened TREASURY from the room
-          // terminal could not get back to the terminal at all.
-          releasePhoneOpener();
-        }
-      }
+      togglePhone();
     }
   });
 
@@ -8226,7 +8284,12 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     const ctl = new AbortController();
     const deadline = window.setTimeout(() => ctl.abort(), FINGERPRINT_PROBE_MS);
     try {
-      const res = await fetch(`${origin}/api/fingerprint`, { signal: ctl.signal });
+      // No redirect: the trust that follows goes to the origin probed, so the
+      // answer must be that origin's own. A stranger on 8080 redirecting to
+      // the node on 8081 would otherwise have 8080 trusted on the node's
+      // fingerprint; with redirects refused the fetch throws and the next
+      // port is tried.
+      const res = await fetch(`${origin}/api/fingerprint`, { signal: ctl.signal, redirect: "error" });
       if (!res.ok) continue;
       // The body read runs under the same signal: a port that answers the
       // headers and then trickles is cut off at the deadline too.
@@ -8251,11 +8314,14 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // that meets its contract, not merely on a loopback port. The trust is
   // decided afresh on every probe, so a round the node does not answer
   // withdraws it: once the node is gone, whatever next binds its port is a
-  // stranger, until a fingerprint says otherwise. (A service impersonating
-  // the node deliberately is beyond what this page can tell from here.)
-  setOwnMediaOrigins(
-    fingerprint ? [window.location.origin, nodeOrigin] : [window.location.origin],
-  );
+  // stranger, until a fingerprint says otherwise. And it has a lifetime of
+  // its own (TV_NODE_TRUST_MS, one probe interval and a margin): a probe
+  // that never runs — a throttled tab, a stalled interval — withdraws it
+  // by lapse, so a stranger on the node's port between probes is not
+  // trusted for longer than that. (A service impersonating the node
+  // deliberately is beyond what this page can tell from here.)
+  setOwnMediaOrigins([window.location.origin]);
+  setNodeMediaOrigin(fingerprint ? nodeOrigin : null, tvNow(), tvWallNow());
   if (!fingerprint) {
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
@@ -8865,6 +8931,9 @@ function setupNetworkDetailsPanel() {
   // R1: keep the REACHABILITY row (and the cached fingerprint feeding invite
   // hints) live. Portmapper mappings and the echo advert appear/heal minutes
   // after node startup, and the node classifies per request — poll gently.
+  // This interval is also what renews the node origin's media trust
+  // (tvConsent TV_NODE_TRUST_MS is sized to it, with a margin): lengthen one
+  // and the other must follow.
   void refreshLocalFingerprint();
   window.setInterval(() => {
     void refreshLocalFingerprint();
@@ -9883,12 +9952,13 @@ function updateHUDP2P(status: string, color: string) {
   }
 }
 
-// M-dep of #33: the fullscreen solar-map overlay is retired — the 'm' hotkey,
-// the #solarmap-toggle-btn and the +/- HUD zoom buttons are gone. The solar
-// map now lives INSIDE the world: click the holographic map table (M4) and
-// the same SolarSystemMap mounts into the device-focus panel (devices.ts
-// createMapTableUI). Keyboard +/- zoom survives in zoom.ts, clamped at
-// level 2 unless ?devzoom=1.
+// M-dep of #33: the fullscreen solar-map overlay is retired — the 'm' hotkey
+// and the #solarmap-toggle-btn are gone. The solar map now lives INSIDE the
+// world: click the holographic map table (M4) and the same SolarSystemMap
+// mounts into the device-focus panel (devices.ts createMapTableUI). The +/-
+// zoom keys live in zoom.ts; since #223 the HUD has +/- buttons again too, in
+// cameraRig's top-right view cross. Past the planet view both need
+// ?devzoom=1.
 function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
@@ -9978,7 +10048,8 @@ async function init() {
     }
     return out;
   });
-  setTvChipOpener((itemId) => openTvTheatre(itemId, tvTheatreDeps(itemId)));
+  setTvTheatreDeps(tvTheatreDeps);
+  setTvChipOpener((itemId) => { openTvTheatreIfPresent(itemId); });
   // The theatre fetches a peer-written URL only with this viewer's consent
   // (tvConsent.ts). The page's own origin is this viewer's own machine; the
   // node's origin joins it once the node has identified itself through the
@@ -10111,7 +10182,7 @@ async function init() {
   setupNetworkDetailsPanel();
   setupZoomView();
 
-  // Camera rig: 45° view-rotation arrows (bottom-left HUD, next to DEV).
+  // Camera rig: the top-right view cross — 45° rotation arrows + zoom (#223).
   // Injected probes keep cameraRig.ts import-cycle-free: it must not import
   // zoom.ts (which imports it for rotated level snaps) nor deviceFocus.ts.
   initCameraRig({
@@ -10119,6 +10190,13 @@ async function init() {
     isCameraBusy: () => isDeviceFocusActive(),
     // 🎬 The rig adds the slow station drift while the space view is up.
     isExteriorDrifting: () => isExteriorActive(),
+    // ➕➖ #223: the HUD cross's zoom buttons, the same steps as +/-.
+    zoom: {
+      stepIn: () => multiScaleZoom?.stepIn(),
+      stepOut: () => multiScaleZoom?.stepOut(),
+      canZoomIn: () => multiScaleZoom?.canZoomIn() ?? false,
+      canZoomOut: () => multiScaleZoom?.canZoomOut() ?? false,
+    },
   });
 
   // DEV1: temporary Development menu (owner request, demo phase — will be
@@ -10802,6 +10880,8 @@ function animate() {
 
       const packed = packTick(tickData);
       networkProvider.sendTick(packed);
+      // 🪑 The counter a peer will see — breaks a seat clash (seatOccupancy).
+      world.noteSentTickSeq(tickData.seq);
       lastTickSent = currentTime;
     }
   } else {

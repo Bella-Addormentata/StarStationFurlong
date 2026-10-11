@@ -129,7 +129,7 @@ import {
   doorLateralLimitForWall,
   clearDoorSlide,
   roomHalfExtents,
-  roomCupola,
+  roomCupolas,
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
@@ -636,7 +636,7 @@ export class DoorDockingPortSystem {
       { halfX, halfZ },
       { opacity: 0.2, edge: 0xd4a84b },
       {},
-      roomCupola()?.wall ?? null, // the resolved cupola (none in legacy view)
+      roomCupolas().map((cupola) => cupola.wall), // resolved cupolas (none in legacy view)
     );
     own.group.traverse((o) => {
       o.raycast = () => {};

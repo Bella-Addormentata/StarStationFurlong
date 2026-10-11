@@ -6,7 +6,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   acceptMediaOrigin, allowMount, consentRefusal, forgetMediaConsent, isPrivateHost, mayMountNow, mediaConsent, mediaOrigin,
-  ownMediaOrigins, setOwnMediaOrigins, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, urlConsent, urlRefusal,
+  needsRedirectProbe, ownMediaOrigins, probeRedirect, redirectVerdict, setNodeMediaOrigin, setOwnMediaOrigins,
+  trustedNodeMediaOrigin, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS, urlConsent, urlRefusal,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
@@ -82,6 +83,15 @@ describe('urlConsent — the one answer for any URL the room hands this browser 
   it('hands back the own origins it was given, normalized', () => {
     setOwnMediaOrigins(['http://localhost:4173/some/path', 'http://127.0.0.1:8080', 'not an origin']);
     expect(ownMediaOrigins().sort()).toEqual(['http://127.0.0.1:8080', 'http://localhost:4173']);
+  });
+
+  it('counts the probed node among them while its trust is live, and not after', () => {
+    setOwnMediaOrigins(['http://localhost:4173']);
+    setNodeMediaOrigin('http://127.0.0.1:8081', 1_000, 5_000);
+    expect(ownMediaOrigins(1_000, 5_000).sort()).toEqual(['http://127.0.0.1:8081', 'http://localhost:4173']);
+    expect(ownMediaOrigins(1_000 + TV_NODE_TRUST_MS, 5_000)).toEqual(['http://localhost:4173']);
+    expect(urlRefusal('http://127.0.0.1:8081/rom.zip', 1_000 + TV_NODE_TRUST_MS, 5_000)).toBe('node-stale');
+    setNodeMediaOrigin(null, 1_000);
   });
 });
 
@@ -167,5 +177,104 @@ describe('the mount budget: consent per origin bounds nothing cumulative', () =>
     expect(mayMountNow('tv-1', t0 + 9_000 + TV_MOUNT_WINDOW_MS)).toBe(true);
     forgetMediaConsent(); // leaving the room forgets the budget with the consents
     expect(mayMountNow('tv-1', t0 + 9_001 + TV_MOUNT_WINDOW_MS)).toBe(true);
+  });
+});
+
+describe('the node origin\'s trust has a lifetime of its own', () => {
+  it('holds for TV_NODE_TRUST_MS from the probe, lapses to node-stale, is renewed by the next probe and withdrawn by a probe the node did not answer; the other candidate port is a stranger throughout', () => {
+    setOwnMediaOrigins(['http://localhost:4173']); // the page alone: the node is registered by the probe
+    const t0 = 5_000_000;
+    const node = url('http://127.0.0.1:8081/blob/abc');
+    const other = url('http://127.0.0.1:8080/blob/abc');
+    expect(mediaConsent(node, t0)).toBe('refuse'); // nothing identified yet
+    setNodeMediaOrigin('http://127.0.0.1:8081', t0);
+    expect(trustedNodeMediaOrigin(t0)).toBe('http://127.0.0.1:8081');
+    expect(mediaConsent(node, t0)).toBe('ok');
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS - 1)).toBe('ok');
+    expect(mediaConsent(other, t0)).toBe('refuse'); // 8080 answered as a stranger (or not at all)
+    expect(consentRefusal(other, t0)).toBe('private');
+    // No probe ran (a throttled tab): the trust lapses by itself.
+    expect(trustedNodeMediaOrigin(t0 + TV_NODE_TRUST_MS)).toBeNull();
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS)).toBe('refuse');
+    expect(consentRefusal(node, t0 + TV_NODE_TRUST_MS)).toBe('node-stale'); // the node, not "a private network"
+    // The next probe the node answers renews it.
+    setNodeMediaOrigin('http://127.0.0.1:8081', t0 + TV_NODE_TRUST_MS + 10);
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS + 10)).toBe('ok');
+    // A probe the node did not answer withdraws it at once, and the port is
+    // then a loopback port like any other.
+    setNodeMediaOrigin(null, t0 + TV_NODE_TRUST_MS + 20);
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS + 20)).toBe('refuse');
+    expect(consentRefusal(node, t0 + TV_NODE_TRUST_MS + 20)).toBe('private');
+  });
+});
+
+describe('the node origin\'s trust and a sleep', () => {
+  it('ends by wall-clock time too: a frozen monotonic clock through an hour\'s sleep does not extend it', () => {
+    setOwnMediaOrigins(['http://localhost:4173']);
+    const node = url('http://127.0.0.1:8081/blob/abc');
+    const t0 = 5_000_000;
+    const w0 = 1_760_000_000_000;
+    setNodeMediaOrigin('http://127.0.0.1:8081', t0, w0);
+    expect(mediaConsent(node, t0 + 1_000, w0 + 1_000)).toBe('ok');
+    // The lid closes: performance.now() stands still, the wall clock runs on.
+    expect(mediaConsent(node, t0 + 1_000, w0 + 3_600_000)).toBe('refuse');
+    expect(consentRefusal(node, t0 + 1_000, w0 + 3_600_000)).toBe('node-stale');
+    expect(trustedNodeMediaOrigin(t0 + 1_000, w0 + 3_600_000)).toBeNull();
+    // And the other way: a wall clock stepped back cannot revive a trust the monotonic clock has ended.
+    expect(mediaConsent(node, t0 + TV_NODE_TRUST_MS, w0 - 3_600_000)).toBe('refuse');
+    setNodeMediaOrigin(null, t0, w0);
+  });
+});
+
+describe('the redirect probe before a consented host is mounted', () => {
+  it('is owed only for a URL on an origin the viewer accepted — never the viewer\'s own, the node\'s or a product lane', () => {
+    setOwnMediaOrigins(['http://localhost:4173']);
+    setNodeMediaOrigin('http://127.0.0.1:8080', 1_000);
+    expect(needsRedirectProbe(url('https://example.org/a.mp4'), 1_000)).toBe(false); // not accepted yet: it is asked about, not probed
+    acceptMediaOrigin('https://example.org');
+    expect(needsRedirectProbe(url('https://example.org/a.mp4'), 1_000)).toBe(true);
+    expect(needsRedirectProbe(url('http://localhost:4173/film.mp4'), 1_000)).toBe(false);
+    expect(needsRedirectProbe(url('http://127.0.0.1:8080/blob/abc'), 1_000)).toBe(false);
+    expect(needsRedirectProbe(url('https://archive.org/download/metropolis/a.mp4'), 1_000)).toBe(false); // its permalinks 302 by design
+    expect(needsRedirectProbe({ kind: 'youtube', videoId: 'uPwPecwX2zs' }, 1_000)).toBe(false);
+    setNodeMediaOrigin(null, 1_000);
+  });
+
+  it('is a CORS HEAD that follows no redirect: an opaque redirect is a redirect, any answer that came through is direct, and no answer is unknown — kept for the first two only, and forgotten with the consents', async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const answering = (type: string) => (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return { type } as Response;
+    }) as typeof fetch;
+    expect(redirectVerdict('https://example.org/a.mp4')).toBeNull();
+    expect(await probeRedirect('https://example.org/a.mp4', answering('opaqueredirect'))).toBe('redirects');
+    expect(redirectVerdict('https://example.org/a.mp4')).toBe('redirects');
+    // cors + manual is the one pair the fetch standard allows here: no-cors
+    // with a redirect mode other than follow is a network error on every
+    // call, and a probe built on it would learn nothing and fail open.
+    expect(calls[0]!.init).toMatchObject({ method: 'HEAD', mode: 'cors', redirect: 'manual', credentials: 'omit' });
+    expect(await probeRedirect('https://example.org/b.mp4', answering('cors'))).toBe('direct'); // a CORS host's 200, 405 for the HEAD, or 404 alike
+    expect(redirectVerdict('https://example.org/b.mp4')).toBe('direct');
+    // A host without CORS headers, or one that is down: a network error.
+    // Nothing is learnt, nothing is authorised, nothing is kept — RETRY asks again.
+    const down = (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch;
+    expect(await probeRedirect('https://example.org/d.mp4', down)).toBe('unknown');
+    expect(redirectVerdict('https://example.org/d.mp4')).toBeNull();
+    forgetMediaConsent();
+    expect(redirectVerdict('https://example.org/a.mp4')).toBeNull();
+    expect(redirectVerdict('https://example.org/b.mp4')).toBeNull();
+  });
+
+  it('is ended by the caller\'s abort — the programme moved on, the theatre closed — and keeps nothing for it', async () => {
+    let aborted = false;
+    const hanging = ((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { aborted = true; reject(new DOMException('aborted', 'AbortError')); });
+    })) as typeof fetch;
+    const abort = new AbortController();
+    const probe = probeRedirect('https://example.org/slow.mp4', hanging, 60_000, abort.signal);
+    abort.abort();
+    expect(await probe).toBe('unknown');
+    expect(aborted).toBe(true);
+    expect(redirectVerdict('https://example.org/slow.mp4')).toBeNull();
   });
 });

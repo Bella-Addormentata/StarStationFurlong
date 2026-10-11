@@ -2,7 +2,7 @@
  * 🕹️ freeFlightStick — the flight keys and a gamepad or joystick (issue 203).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, suspendStickKeys, takeStickKeys } from './freeFlightStick';
+import { isFlightKey, readStick, releaseStickKeys, stickKeysTaken, stickPadName, suspendStickKeys, takeStickKeys } from './freeFlightStick';
 
 type Listener = (e: unknown) => void;
 const listeners = new Map<string, Set<Listener>>();
@@ -93,6 +93,23 @@ describe('the flight keys', () => {
     expect(key('keydown', 'KeyW')).toBe(false);
     stage();
     expect(key('keydown', 'KeyW')).toBe(true);
+  });
+
+  it('let a key typed into a panel marked data-stick-aside through (the phone\'s TV remote), and keep every other key', () => {
+    takeStickKeys();
+    const remote = { tagName: 'BUTTON', closest: (sel: string) => (sel === '[data-stick-aside]' ? {} : null) };
+    expect(key('keydown', 'ArrowDown', remote)).toBe(false); // the remote's own ↓, not thrust
+    expect(key('keydown', 'Space', remote)).toBe(false); // presses the remote's button, not the brake
+    expect(readStick()).toEqual({ thrust: 0, yaw: 0, strafe: 0, brake: false });
+    const world = { tagName: 'CANVAS', closest: () => null };
+    expect(key('keydown', 'KeyW', world)).toBe(true); // focus back on the world with the phone still up: the pilot flies
+    expect(readStick().thrust).toBe(1);
+    expect(key('keydown', 'KeyW', { tagName: 'DIV' })).toBe(true); // a target with no closest() is the world's too
+  });
+
+  it('names the flight keys a standing-aside panel must hold back from input.ts', () => {
+    for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'KeyX', 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) expect(isFlightKey(code)).toBe(true);
+    for (const code of ['Tab', 'Escape', 'Enter', 'KeyF', 'KeyK']) expect(isFlightKey(code)).toBe(false);
   });
 });
 

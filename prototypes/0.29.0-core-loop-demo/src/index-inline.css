@@ -525,6 +525,11 @@
         justify-content: center;
         align-items: center;
         border-bottom: 1px solid rgba(212, 168, 75, 0.08);
+        cursor: pointer; /* #223: the bezel opens and puts away the phone */
+      }
+      /* A put-away phone is nothing but its bezel sliver: all of it opens. */
+      #spacephone-container:not(.active):not(.peek) {
+        cursor: pointer;
       }
 
       #notch-speaker {
@@ -915,13 +920,6 @@
       }
       #exterior-toolbar-title { font-size: 12px; font-weight: 800; letter-spacing: 1px; color: #f0c060; }
       #exterior-toolbar-hint { font-size: 9px; color: rgba(212, 168, 75, 0.55); }
-      #exterior-add-solar {
-        font-family: inherit; font-size: 10px; font-weight: 700;
-        padding: 4px 10px; border-radius: 6px; cursor: pointer;
-        color: #ffd54f; background: rgba(255, 213, 79, 0.10);
-        border: 1px solid rgba(255, 213, 79, 0.35);
-      }
-      #exterior-add-solar:disabled { opacity: 0.4; cursor: default; }
 
       #exterior-bend-editor {
         position: fixed;

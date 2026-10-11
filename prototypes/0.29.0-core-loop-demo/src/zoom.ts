@@ -18,10 +18,11 @@
  */
 
 import * as THREE from 'three';
-import { setExteriorActive } from './exteriorView';
+import { isExteriorOrbitView, setExteriorActive, setExteriorOrbitView } from './exteriorView';
 import { isDeviceFocusActive } from './deviceFocus';
 import { rotateIsoOffset } from './cameraRig';
 import { STAND_EYE_OFFSET } from './player';
+import { isFormFieldTarget } from './typingFocus';
 
 // Base (yaw-0) isometric offsets for the ortho levels — the camera rig
 // (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
@@ -73,7 +74,7 @@ export const ZOOM_LEVELS: ZoomScaleDef[] = [
   },
   {
     level: 3,
-    name: 'OUTSIDE ROOM & MODULE EXPANSIONS',
+    name: 'STATION VIEW (OUTSIDE)',
     gridColor: 'rgba(212, 80, 75, 0.22)',
     focusId: 'module-structures',
     fuelCostMultiplier: 1,
@@ -120,6 +121,9 @@ export const ZOOM_LEVELS: ZoomScaleDef[] = [
     description: 'Infinite serverless seed networks connecting clusters in deep expanding paths.',
   }
 ];
+
+/** 🪐 Issue 218: level 3's second step, the planet view. */
+const PLANET_VIEW_NAME = 'PLANET ORBIT VIEW';
 
 // 🪐 Mouse-Look / Free Look states for First Person Level 1
 let yaw = 0;   // Left-Right rotation (radians)
@@ -266,9 +270,11 @@ export class MultiScaleZoomView {
     // Context Sidebar details for upper views (levels >= 3)
     const sidebar = document.createElement('div');
     sidebar.id = 'zoom-sidebar';
+    // Starts below the top-right view cross (cameraRig, #223), which now
+    // holds that corner from top 24px down to ~124px.
     sidebar.style.cssText = `
       position: absolute;
-      top: 100px;
+      top: 140px;
       right: 24px;
       width: 320px;
       background: rgba(4, 8, 22, 0.92);
@@ -330,9 +336,10 @@ export class MultiScaleZoomView {
     });
 
     window.addEventListener('keydown', (e) => {
-      // Ignore toggling when focused in inputs
-      const active = document.activeElement;
-      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      // Ignore toggling when focused in inputs. The event's TARGET, not
+      // document.activeElement: an editor that replaceWith()s its input
+      // before the event bubbles leaves activeElement on <body> (#31).
+      if (isFormFieldTarget(e.target as HTMLElement | null)) {
         return;
       }
 
@@ -457,8 +464,8 @@ export class MultiScaleZoomView {
    */
   private zoomHintText(): string {
     const parts: string[] = [];
-    if (DEVZOOM || this.currentLevel <= 2) parts.push('[-] TO OUT'); // room→exterior is normal play now
-    if (this.currentLevel > 1) parts.push('[+] TO IN');
+    if (this.canZoomOut()) parts.push('[-] TO OUT');
+    if (this.canZoomIn()) parts.push('[+] TO IN');
     let hint = `PRESS ${parts.join(' / ')}`;
     if (this.currentLevel === 1) {
       // #49 cursor model: click frees the cursor to interact; a click on
@@ -468,10 +475,40 @@ export class MultiScaleZoomView {
     return hint;
   }
 
+  /** Would [+] / the HUD + button do anything? (Device focus aside — the
+   *  steps refuse that themselves.) */
+  public canZoomIn(): boolean {
+    return this.currentLevel > 1;
+  }
+
+  /** Would [-] / the HUD − button do anything? Room → exterior and station →
+   *  planet view are normal play; past that only behind ?devzoom=1. */
+  public canZoomOut(): boolean {
+    if (this.currentLevel <= 2) return true;
+    if (this.currentLevel === 3 && !isExteriorOrbitView()) return true;
+    return DEVZOOM && this.currentLevel < 8;
+  }
+
+  /** ➕ #223: the HUD + button — one step in, exactly as the [+] key. */
+  public stepIn(): void {
+    this.zoomIn();
+  }
+
+  /** ➖ #223: the HUD − button — one step out, exactly as the [-] key. */
+  public stepOut(): void {
+    this.zoomOut();
+  }
+
   private zoomIn() {
     // Device focus owns the camera — HUD zoom buttons must not steal it
     // (the keydown path is guarded upstream; this covers the buttons).
     if (isDeviceFocusActive()) return;
+    // 🪐 Issue 218: in from the planet view is the station view, still level 3.
+    if (this.currentLevel === 3 && isExteriorOrbitView()) {
+      setExteriorOrbitView(false);
+      this.showIndicator(ZOOM_LEVELS[2].name);
+      return;
+    }
     if (this.currentLevel > 1) {
       if (this.currentLevel === 2) {
         // Trigger smooth trajectory transition to Level 1 (First Person) from current camera position
@@ -517,8 +554,15 @@ export class MultiScaleZoomView {
         return; // Pause zooming out until eyelids are fully closed at 0.5 progress
       }
       // 🛰️ Level 3 is now the REAL 3D exterior view (#65) — reachable in
-      // normal play: [-] from the room view goes outside. The M-dep clamp
+      // normal play: [-] from the room view goes outside. 🪐 Issue 218: it
+      // has two steps, our station alone, then [-] again to the planet view
+      // with every station around the planet at one scale. The M-dep clamp
       // still guards the DEPRECATED 2D schematics (levels 4+, dev-flag only).
+      if (this.currentLevel === 3 && !isExteriorOrbitView()) {
+        setExteriorOrbitView(true);
+        this.showIndicator(PLANET_VIEW_NAME);
+        return;
+      }
       if (this.currentLevel >= 3 && !DEVZOOM) return;
       this.currentLevel++;
       this.updateViewContext();
@@ -541,6 +585,24 @@ export class MultiScaleZoomView {
   private indicatorUnlocked = false;
   private indicatorHideTimer: number | null = null;
 
+  /** The level pill, shown for a moment (once unlocked; see below). */
+  private showIndicator(name: string): void {
+    const ind = this.indicatorUnlocked ? document.getElementById('zoom-hud-indicator') : null;
+    if (!ind) return;
+    ind.innerHTML = `
+      <span style="color:#00d4ff;">LEVEL ${this.currentLevel}: ${name}</span>
+      <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">${this.zoomHintText()}</span>
+    `;
+    ind.style.opacity = '1';
+    ind.style.visibility = 'visible';
+    if (this.indicatorHideTimer !== null) window.clearTimeout(this.indicatorHideTimer);
+    this.indicatorHideTimer = window.setTimeout(() => {
+      this.indicatorHideTimer = null;
+      ind.style.opacity = '0';
+      ind.style.visibility = 'hidden'; // transitions out with the opacity
+    }, 2_500);
+  }
+
   private updateViewContext() {
     const def = ZOOM_LEVELS[this.currentLevel - 1];
 
@@ -559,21 +621,7 @@ export class MultiScaleZoomView {
         this.indicatorUnlocked = true;
       }
       this.lastIndicatorLevel = def.level;
-      const ind = this.indicatorUnlocked ? document.getElementById('zoom-hud-indicator') : null;
-      if (ind) {
-        ind.innerHTML = `
-          <span style="color:#00d4ff;">LEVEL ${def.level}: ${def.name}</span>
-          <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">${this.zoomHintText()}</span>
-        `;
-        ind.style.opacity = '1';
-        ind.style.visibility = 'visible';
-        if (this.indicatorHideTimer !== null) window.clearTimeout(this.indicatorHideTimer);
-        this.indicatorHideTimer = window.setTimeout(() => {
-          this.indicatorHideTimer = null;
-          ind.style.opacity = '0';
-          ind.style.visibility = 'hidden'; // transitions out with the opacity
-        }, 2_500);
-      }
+      this.showIndicator(def.name);
     }
 
     // Adjust global 3D Three.js camera zooms dynamically

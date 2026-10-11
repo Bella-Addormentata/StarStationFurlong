@@ -22,21 +22,30 @@
  * can see neither — so the ask says so, and the node's media proxy (plan
  * §3.4, TODO) is where destinations are checked after DNS and on every
  * redirect. Until it lands, a direct URL is the viewer's own trust decision,
- * made per origin, per session.
+ * made per origin, per session. What this page CAN do before mounting a
+ * consented third-party URL is ask the host once, with a CORS HEAD that
+ * follows no redirect (probeRedirect, below): a host that answers it plays,
+ * one that answers with a redirect does not, and one that does not answer
+ * it — no CORS, or down — does not either. That is a check of one answer
+ * at one moment, not validation of the <video>'s later GET, which the host
+ * may answer differently; it narrows the URL tile to CORS-clean hosts, which
+ * is what the plan names for it (a VideoTexture needs CORS too).
  *
  * DOM-free: the theatre asks, this answers, and vitest covers the answers.
  */
 
 import type { TvSource } from './tvDoc';
+import { tvNow, tvWallNow } from './tvDoc';
 import { convenienceLanesEnabled, sourceKindAllowed } from './sovereignty';
 
 export type MediaConsent = 'ok' | 'ask' | 'refuse';
 
 /** Why a 'refuse' is a refuse, for the words on the screen: the lane is
  *  off in this build; the link is on another server and this build plays
- *  serverless sources only; the host is inside a private network; or the
- *  link is not a URL at all. */
-export type ConsentRefusal = 'lane-off' | 'server-off' | 'private' | 'bad';
+ *  serverless sources only; the link is on the node's origin but the node's
+ *  trust has run out (no fingerprint answer lately); the host is inside a
+ *  private network; or the link is not a URL at all. */
+export type ConsentRefusal = 'lane-off' | 'server-off' | 'node-stale' | 'private' | 'bad';
 
 /** The product's own lanes: where the start screen's tiles fetch from. */
 const PRODUCT_ORIGINS: ReadonlySet<string> = new Set([
@@ -56,16 +65,53 @@ function normalizeOrigin(s: string): string | null {
   }
 }
 
-/** This page's own origin and its node's HTTP origin(s). Media from there
- *  is the viewer's own machine serving the viewer: no asking. */
+/** This page's own origin(s). Media from there is the viewer's own machine
+ *  serving the viewer: no asking, and no expiry — the page is where it is. */
 export function setOwnMediaOrigins(origins: readonly string[]): void {
   ownOrigins = new Set(origins.map(normalizeOrigin).filter((o): o is string => o !== null));
 }
 
-/** The origins setOwnMediaOrigins registered, normalized — for an allow-list
+/** How long the node's origin stays trusted after a fingerprint probe said
+ *  it was the node's: one probe interval (main.ts refreshes every 60 s) and
+ *  a margin. The node's port is a loopback port like any other: if the node
+ *  exits and another local service binds its port between probes, a
+ *  peer-written URL on that origin must not go on passing without asking
+ *  until the next probe happens to run (a throttled tab's may not). So the
+ *  trust has a lifetime of its own, separate from the cached fingerprint,
+ *  and a successful probe is what renews it; past it, the origin is refused
+ *  like any loopback host ('node-stale') until the node answers again. This
+ *  bounds stale trust; it does not see a service impersonating the node. */
+export const TV_NODE_TRUST_MS = 90_000;
+
+let nodeOrigin: string | null = null;
+/** Two deadlines, both must hold: the monotonic clock may stop through an
+ *  OS sleep (trust earned a minute before an hour's sleep would still read
+ *  as a minute old on waking, with whatever bound the node's port meanwhile
+ *  trusted at once), and the wall clock may step; the earlier of the two
+ *  ends the trust, so a sleep cannot extend it and a clock step cannot. */
+let nodeTrustUntil = -Infinity;
+let nodeTrustWallUntil = -Infinity;
+
+/** The node's HTTP origin as the fingerprint probe identified it (main.ts),
+ *  trusted from `now` (monotonic) and `wall` for TV_NODE_TRUST_MS; null
+ *  withdraws it (a probe the node did not answer). */
+export function setNodeMediaOrigin(origin: string | null, now: number, wall = tvWallNow()): void {
+  nodeOrigin = origin ? normalizeOrigin(origin) : null;
+  nodeTrustUntil = nodeOrigin ? now + TV_NODE_TRUST_MS : -Infinity;
+  nodeTrustWallUntil = nodeOrigin ? wall + TV_NODE_TRUST_MS : -Infinity;
+}
+
+/** The node's origin while its trust is live at `now` and `wall`, else null. */
+export function trustedNodeMediaOrigin(now = tvNow(), wall = tvWallNow()): string | null {
+  return nodeOrigin && now < nodeTrustUntil && wall < nodeTrustWallUntil ? nodeOrigin : null;
+}
+
+/** The origins this page fetches from as itself — setOwnMediaOrigins' list,
+ *  normalized, and the node's while its trust is live — for an allow-list
  *  handed to a frame that fetches on the viewer's behalf (the cabinet's). */
-export function ownMediaOrigins(): string[] {
-  return [...ownOrigins];
+export function ownMediaOrigins(now = tvNow(), wall = tvWallNow()): string[] {
+  const node = trustedNodeMediaOrigin(now, wall);
+  return node !== null && !ownOrigins.has(node) ? [...ownOrigins, node] : [...ownOrigins];
 }
 
 /** The viewer pressed PLAY FROM <host>: that origin is fine for the rest of
@@ -77,7 +123,85 @@ export function acceptMediaOrigin(origin: string): void {
 
 export function forgetMediaConsent(): void {
   accepted.clear();
+  redirectVerdicts.clear();
   forgetMountBudget();
+}
+
+// ── The redirect probe ───────────────────────────────────────────────────────
+//
+// A host the viewer accepted can answer the media request with a redirect
+// into the viewer's own network, and a <video> element follows it blind. A
+// media element shows nothing of the chain. A fetch can show a little, and
+// only in CORS mode: with `redirect: 'manual'` a redirect comes back as an
+// opaque-redirect (type 'opaqueredirect') BEFORE any CORS check — the fetch
+// standard files the manual-redirect response before the tainting check in
+// HTTP fetch — while a direct answer passes only when the host sends CORS
+// headers, and everything else is a network error. (`no-cors` with any
+// redirect mode but 'follow' is a network error outright: the standard's
+// main fetch refuses it, so a no-cors probe learns nothing at all.) So the
+// probe is a CORS HEAD, and it FAILS CLOSED: a direct CORS answer plays, a
+// redirect does not, and no answer — a host without CORS, or one that is
+// down — does not either, since nothing that could not be asked may
+// authorise a mount. That narrows the URL tile to CORS-clean hosts, which
+// is what the plan names for it. It remains a check of one answer at one
+// moment: the <video>'s GET may be answered differently, and a hostname
+// that RESOLVES into the viewer's network is not seen at all. Destination
+// validation is the node proxy's (plan §3.4).
+
+export type RedirectVerdict = 'direct' | 'redirects' | 'unknown';
+
+/** What the probe found, per URL, for the session — 'direct' and
+ *  'redirects' only: an 'unknown' (no answer) is not kept, so a RETRY asks
+ *  again. */
+const redirectVerdicts = new Map<string, Exclude<RedirectVerdict, 'unknown'>>();
+
+/** Whether the theatre owes `source` a redirect probe before mounting it: a
+ *  direct URL on an origin the VIEWER accepted (PLAY FROM <host>) — never
+ *  the viewer's own origin, the node's (this machine serving this viewer),
+ *  or a product lane (archive.org's permalinks 302 to its file servers by
+ *  design, and its own origin is the lane). */
+export function needsRedirectProbe(source: TvSource, now = tvNow(), wall = tvWallNow()): boolean {
+  if (source.kind !== 'url') return false;
+  const origin = normalizeOrigin(source.url);
+  if (!origin) return false;
+  if (ownOrigins.has(origin) || origin === trustedNodeMediaOrigin(now, wall) || PRODUCT_ORIGINS.has(origin)) return false;
+  return accepted.has(origin);
+}
+
+/** The probe's kept verdict for `url`, or null when it has none (never
+ *  probed, or the probe got no answer). */
+export function redirectVerdict(url: string): Exclude<RedirectVerdict, 'unknown'> | null {
+  return redirectVerdicts.get(url) ?? null;
+}
+
+/** Probe `url` with a CORS HEAD that follows no redirect and reads no body.
+ *  An opaque-redirect answer is 'redirects'; any answer that came through
+ *  (the host sends CORS headers — a 200, a 405 for the HEAD, a 404) is
+ *  'direct'; a network error — a host without CORS headers, one that is
+ *  down, the deadline — is 'unknown', which authorises nothing and is not
+ *  kept, so a RETRY asks again. `fetchImpl` is injectable for the tests;
+ *  the request options are the ones the fetch standard allows together
+ *  (cors + manual), where no-cors + manual would be an error on every call. */
+export async function probeRedirect(url: string, fetchImpl: typeof fetch = fetch, timeoutMs = 8_000, signal?: AbortSignal): Promise<RedirectVerdict> {
+  const ctl = new AbortController();
+  const deadline = setTimeout(() => ctl.abort(), timeoutMs);
+  // The caller's abort (the programme moved on, the theatre closed) ends
+  // the request too: a superseded probe is not left running to its deadline.
+  if (signal?.aborted) ctl.abort();
+  signal?.addEventListener('abort', () => ctl.abort(), { once: true });
+  let verdict: RedirectVerdict = 'unknown';
+  try {
+    const res = await fetchImpl(url, {
+      method: 'HEAD', mode: 'cors', redirect: 'manual', cache: 'no-store', credentials: 'omit', signal: ctl.signal,
+    });
+    verdict = res.type === 'opaqueredirect' ? 'redirects' : 'direct';
+  } catch {
+    // a host without CORS, unreachable, or the deadline: nothing learnt, nothing authorised
+  } finally {
+    clearTimeout(deadline);
+  }
+  if (verdict !== 'unknown') redirectVerdicts.set(url, verdict);
+  return verdict;
 }
 
 /** Automatic mounts the theatre may make on its own, per set, within the
@@ -203,10 +327,10 @@ function expandIPv6(ip: string): number[] | null {
  *  other server, yes for the product's lanes and ask first for the rest
  *  with the convenience lanes on, never with them off — the build default
  *  (sovereignty.ts): serverless sources only. */
-export function urlConsent(url: string): MediaConsent {
+export function urlConsent(url: string, now = tvNow(), wall = tvWallNow()): MediaConsent {
   const origin = normalizeOrigin(url);
   if (!origin) return 'refuse';
-  if (ownOrigins.has(origin)) return 'ok';
+  if (ownOrigins.has(origin) || origin === trustedNodeMediaOrigin(now, wall)) return 'ok';
   let host: string;
   try {
     host = new URL(origin).hostname;
@@ -224,9 +348,12 @@ export function urlConsent(url: string): MediaConsent {
 
 /** The reason behind a 'refuse' from urlConsent, for the words on the
  *  screen. */
-export function urlRefusal(url: string): ConsentRefusal {
+export function urlRefusal(url: string, now = tvNow(), wall = tvWallNow()): ConsentRefusal {
   const origin = normalizeOrigin(url);
   if (!origin) return 'bad';
+  // The node's own origin whose trust has run out: the node, not a stranger,
+  // as far as this page last knew — said so, not "a private network".
+  if (nodeOrigin !== null && origin === nodeOrigin && trustedNodeMediaOrigin(now, wall) === null) return 'node-stale';
   let host: string;
   try {
     host = new URL(origin).hostname;
@@ -241,14 +368,14 @@ export function urlRefusal(url: string): ConsentRefusal {
  *  The product's own lanes (YouTube, the archive embed) are fetched from
  *  their own origins by their own players: yes with the convenience lanes
  *  on, never with them off (sovereignty.ts). */
-export function mediaConsent(source: TvSource): MediaConsent {
+export function mediaConsent(source: TvSource, now = tvNow(), wall = tvWallNow()): MediaConsent {
   if (source.kind !== 'url') return sourceKindAllowed(source.kind) ? 'ok' : 'refuse';
-  return urlConsent(source.url);
+  return urlConsent(source.url, now, wall);
 }
 
 /** The reason behind a 'refuse' from mediaConsent, for the words on the
  *  screen. */
-export function consentRefusal(source: TvSource): ConsentRefusal {
+export function consentRefusal(source: TvSource, now = tvNow(), wall = tvWallNow()): ConsentRefusal {
   if (source.kind !== 'url') return 'lane-off';
-  return urlRefusal(source.url);
+  return urlRefusal(source.url, now, wall);
 }

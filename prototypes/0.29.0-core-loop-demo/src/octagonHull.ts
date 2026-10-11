@@ -38,7 +38,7 @@ import {
   type HullSurface,
 } from './hullSection';
 import { resolveWallpaper, type WallpaperPresetId, type WallpaperSpec } from './wallpaper';
-import { cupolaPlan, cupolaStripRun, cupolaTipOutline, type CupolaPlan, type CupolaWall } from './cupola';
+import { cupolaPlans, cupolaStripRun, cupolaTipOutline, type CupolaPlan, type CupolaWall } from './cupola';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
 /** First-person resting opacities (you're INSIDE — see everything). The roof is
@@ -125,12 +125,12 @@ export function buildOctagonHull(
   windows: HullWindows = {},
   wallpapers: HullWallpapers = {},
   doors: HullDoorOpening[] = [],
-  cupolaWall: CupolaWall | null = null,
+  cupolaWall: CupolaWall | readonly CupolaWall[] | null = null,
 ): OctagonHull {
   const profile = computeOctagonProfile(opts);
-  // 🔭 an end wall made a cupola (cupola.ts): the strips stop where it tapers.
-  const cupola = cupolaPlan(opts, cupolaWall);
-  const [bLo, bHi] = stripRun(profile, cupola);
+  // 🔭 cupola end walls (cupola.ts): the strips stop where either tapers.
+  const cupolas = cupolaPlans(opts, cupolaWall);
+  const [bLo, bHi] = stripRun(profile, cupolas);
   const {
     narrowAxis,
     longHalf,
@@ -176,8 +176,8 @@ export function buildOctagonHull(
   // shortens the side walls and takes no doors itself (the editor refuses
   // both; this only keeps a stray peer record from breaking the outline).
   const doorNotches = doorNotchesByFace(profile, doors);
-  if (cupola) {
-    doorNotches[cupola.cap] = [];
+  if (cupolas.length) {
+    for (const cupola of cupolas) doorNotches[cupola.cap] = [];
     doorNotches['wall-neg'] = clipNotches(doorNotches['wall-neg'], bLo, bHi);
     doorNotches['wall-pos'] = clipNotches(doorNotches['wall-pos'], bLo, bHi);
   }
@@ -247,7 +247,7 @@ export function buildOctagonHull(
   // ── The 2 octagon END CAPS (gable ends) — split into wall band / roof gable /
   //    basement gable so each obeys the same cutaway rule as the strips. ──────
   for (const sign of [-1, 1] as const) {
-    if (cupola && cupola.sign === sign) continue; // 🔭 built as glass below
+    if (cupolas.some((cupola) => cupola.sign === sign)) continue; // 🔭 built as glass below
     const b = sign * longHalf;
     const normal = verticalFaceNormal(narrowAxis, sign > 0 ? 'cap-pos' : 'cap-neg');
     const capQuad = (
@@ -322,7 +322,7 @@ export function buildOctagonHull(
 
   // ── 🔭 The cupola: 8 framed glass faces tapering to the framed tip window.
   //    Each piece joins the cutaway group of the hull region it continues. ──
-  if (cupola) {
+  for (const cupola of cupolas) {
     for (const piece of cupolaPieces(cupola)) {
       const color =
         piece.region === 'wall' ? HULL_COLOR.wall : piece.region === 'roof' ? HULL_COLOR.roof : HULL_COLOR.basement;
@@ -429,12 +429,12 @@ export function buildOctagonShell(
   opts: HullSectionOpts,
   style: OctagonShellStyle = {},
   windows: HullWindows = {},
-  cupolaWall: CupolaWall | null = null,
+  cupolaWall: CupolaWall | readonly CupolaWall[] | null = null,
 ): OctagonShell {
   const profile = computeOctagonProfile(opts);
   const { narrowAxis, longHalf, outline, edges } = profile;
-  const cupola = cupolaPlan(opts, cupolaWall);
-  const [bLo, bHi] = stripRun(profile, cupola);
+  const cupolas = cupolaPlans(opts, cupolaWall);
+  const [bLo, bHi] = stripRun(profile, cupolas);
   const hull = style.hull ?? 0x3a4556;
   const roofC = style.roof ?? 0x2f3a4c;
   const baseC = style.basement ?? 0x27303d;
@@ -484,7 +484,7 @@ export function buildOctagonShell(
     }
   });
   for (const sign of [-1, 1] as const) {
-    if (cupola && cupola.sign === sign) continue; // 🔭 the cupola closes this end
+    if (cupolas.some((cupola) => cupola.sign === sign)) continue; // 🔭 the cupola closes this end
     const geo = capGeometry(profile, sign * longHalf);
     geometries.push(geo);
     const mesh = new THREE.Mesh(geo, mk(hull));
@@ -493,7 +493,7 @@ export function buildOctagonShell(
   }
 
   // 🔭 the cupola's framed glass, seen from outside.
-  if (cupola) {
+  for (const cupola of cupolas) {
     for (const piece of cupolaPieces(cupola)) {
       const pane = framedPane(piece.corners, CUPOLA_FRAME);
       if (!pane) continue;
@@ -519,16 +519,15 @@ export function buildOctagonShell(
     const push = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) =>
       pts.push(a.x, a.y, a.z, b.x, b.y, b.z);
     const n = outline.length;
-    // 🔭 with a cupola the barrel's rings stand at the strip ends (bLo/bHi)
-    // and the tip octagon is ringed and joined to the base.
-    const tip = cupola ? cupolaTipOutline(profile, cupola.depth) : null;
+    // 🔭 cupola tips are ringed and joined to their barrel bases.
     for (let i = 0; i < n; i++) {
       const p = outline[i];
       const q = outline[(i + 1) % n];
       push(sectionToWorld(narrowAxis, p.a, p.y, bLo), sectionToWorld(narrowAxis, q.a, q.y, bLo));
       push(sectionToWorld(narrowAxis, p.a, p.y, bHi), sectionToWorld(narrowAxis, q.a, q.y, bHi));
       push(sectionToWorld(narrowAxis, p.a, p.y, bLo), sectionToWorld(narrowAxis, p.a, p.y, bHi));
-      if (tip && cupola) {
+      for (const cupola of cupolas) {
+        const tip = cupolaTipOutline(profile, cupola.depth);
         const tp = tip[i];
         const tq = tip[(i + 1) % n];
         push(sectionToWorld(narrowAxis, tp.a, tp.y, cupola.tipB), sectionToWorld(narrowAxis, tq.a, tq.y, cupola.tipB));
@@ -975,8 +974,8 @@ const CUPOLA_FRAME = 0.14;
 
 /** The extrude-axis run the barrel strips cover (cupola.cupolaStripRun — the
  *  window editor clamps to the same run). */
-function stripRun(profile: OctagonProfile, cupola: CupolaPlan | null): [number, number] {
-  return cupolaStripRun(cupola, profile.longHalf);
+function stripRun(profile: OctagonProfile, cupolas: readonly CupolaPlan[]): [number, number] {
+  return cupolaStripRun(cupolas, profile.longHalf);
 }
 
 /** Door notches trimmed to a shortened side wall (DOOR_FACE_INSET kept at its
