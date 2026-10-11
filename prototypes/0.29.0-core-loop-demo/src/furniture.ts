@@ -37,6 +37,7 @@ import type {
   CloneVatHandle,
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
+  ArcadeCabinetVisualHandle,
   AirHockeyVisualHandle,
   AlligatorsVisualHandle,
   PropAnimHandle,
@@ -47,6 +48,8 @@ import {
   CHIP_R, HOLE_XS, PLAT_LOW_BACK, PLAT_LOW_FRONT, PLAT_UP_FRONT,
   currentPusherPhase, pusherFaceX, unseenDropHoles,
 } from "./games/coinPusher";
+// 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
+import { createArcadeScreenPainter } from "./arcadeScreen";
 // 🏒 #115: the table sculpt is sized by the SAME playfield constants the pure
 // engine simulates — one source of truth for rails, goals, puck and mallets.
 import {
@@ -174,6 +177,7 @@ export type FurnitureKind =
   | "clone-vat"
   | "slot-machine"
   | "coin-pusher"
+  | "arcade-cabinet"
   | "air-hockey-table"
   | "alligators-table"
   // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
@@ -4776,6 +4780,24 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 0.90, z: 0.05 },
     },
   },
+  // 🕹️ Arcade cabinet — 1×1 stand-up upright with a NES emulator behind the
+  // glass (arcadeCabinet.ts). Standing device like the coin pusher: the
+  // player walks to the −z side and the focus camera frames the screen, where
+  // the game menu and then the game itself are drawn. The eye sits a little
+  // above the screen's centre; the screen tilts back to meet it.
+  "arcade-cabinet": {
+    kind: "arcade-cabinet",
+    build: buildArcadeCabinet,
+    footprint: { w: 1, d: 1 },
+    functions: ["arcadeCabinet"],
+    device: {
+      kind: "arcadeCabinet",
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.44, z: -0.95 },
+      anchor: { x: 0, y: 1.33, z: -0.09 },
+    },
+  },
 };
 
 // ── 🚀 Ship fittings (#30 SH1) — the parts that turn a module into a ship ────
@@ -8072,6 +8094,113 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   // The upper platform mesh carries the handle so world.ts collects it the
   // same way it collects SlotMachineVisualHandle.
   upperPlatform.userData.coinPusherVisual = handle;
+}
+
+// ── 🕹️ Arcade cabinet ────────────────────────────────────────────────────────
+// A classic upright: lower body with a coin door, a control panel with a
+// stick and two buttons, the monitor housing with a tilted CRT, and a lit
+// marquee on top. The screen is a live CanvasTexture painted by
+// arcadeScreen.ts — the attract card while idle, the menu and the game while
+// someone is focused on it (arcadeCabinet.ts).
+//
+// Coordinate scheme (metres, item origin at rot 0): the player stands at
+// (0, −1.0) facing +z; the cabinet fills z ∈ [−0.36, +0.43].
+function buildArcadeCabinet({ m, place, addLight }: BuildCtx) {
+  const BODY = 0x232a3a; // deep gunmetal (the coin pusher's family, darker)
+  const TRIM = 0x14181e; // black trim / kick plate
+  const MAGENTA = 0xff3fa4;
+  const CYAN = 0x2ee6ff;
+  const GOLD = 0xd4a84b;
+
+  // ── Body: lower cabinet, monitor housing, marquee box, top cap ────────────
+  place(new THREE.BoxGeometry(0.64, 0.90, 0.62), m(BODY, 0.6, 0.35), 0, 0.45, 0.12);
+  place(new THREE.BoxGeometry(0.64, 0.06, 0.02), m(TRIM, 0.9, 0.1), 0, 0.03, -0.195);
+  place(new THREE.BoxGeometry(0.64, 0.80, 0.50), m(BODY, 0.6, 0.35), 0, 1.35, 0.18);
+  place(new THREE.BoxGeometry(0.66, 0.20, 0.30), m(BODY, 0.6, 0.35), 0, 1.85, 0.09);
+  place(new THREE.BoxGeometry(0.68, 0.03, 0.54), m(TRIM, 0.8, 0.2), 0, 1.965, 0.16);
+  // Neon edge strips down both front corners (the cabinet's side art).
+  for (const sx of [-0.325, 0.325]) {
+    place(new THREE.BoxGeometry(0.012, 0.80, 0.012), m(MAGENTA, 0.4, 0.1, MAGENTA, 0.9), sx, 1.35, -0.075);
+    place(new THREE.BoxGeometry(0.012, 0.86, 0.012), m(CYAN, 0.4, 0.1, CYAN, 0.7), sx, 0.47, -0.195);
+  }
+
+  // ── Coin door: two lit slots and a return flap ────────────────────────────
+  place(new THREE.BoxGeometry(0.30, 0.30, 0.012), m(TRIM, 0.7, 0.4), 0, 0.42, -0.200);
+  for (const sx of [-0.07, 0.07]) {
+    place(new THREE.BoxGeometry(0.05, 0.07, 0.012), m(0xff3030, 0.5, 0.1, 0xff3030, 0.8), sx, 0.49, -0.208);
+    place(new THREE.BoxGeometry(0.008, 0.04, 0.014), m(TRIM, 0.9, 0.1), sx, 0.49, -0.212);
+  }
+  place(new THREE.BoxGeometry(0.16, 0.05, 0.014), m(GOLD, 0.4, 0.6), 0, 0.33, -0.208);
+
+  // ── Control panel: angled deck, stick, two buttons ────────────────────────
+  const deck = place(new THREE.BoxGeometry(0.68, 0.06, 0.30), m(BODY, 0.55, 0.4), 0, 0.93, -0.21);
+  deck.rotation.x = 0.18; // front edge dips toward the player
+  place(new THREE.BoxGeometry(0.68, 0.012, 0.28), m(0x1a1f2b, 0.8, 0.1), 0, 0.963, -0.21).rotation.x = 0.18;
+  place(new THREE.CylinderGeometry(0.035, 0.035, 0.012, 16), m(TRIM, 0.8, 0.2), -0.14, 0.972, -0.23);
+  place(new THREE.CylinderGeometry(0.008, 0.008, 0.08, 8), m(0xc0c8d0, 0.3, 0.8), -0.14, 1.01, -0.23);
+  place(new THREE.SphereGeometry(0.026, 14, 10), m(0xe02030, 0.35, 0.1), -0.14, 1.06, -0.23);
+  for (const [bx, color] of [[0.06, 0xe02030], [0.16, 0x2050e0]] as const) {
+    place(new THREE.CylinderGeometry(0.026, 0.026, 0.02, 16), m(color, 0.35, 0.1, color, 0.35), bx, 0.978, -0.23);
+  }
+
+  // ── Monitor: black bezel and the tilted CRT screen ────────────────────────
+  // Tilted back by SCREEN_TILT about x so its face meets the focus eye, which
+  // sits ~11 cm above the screen's centre.
+  const SCREEN_TILT = 0.12;
+  const bezel = place(new THREE.BoxGeometry(0.60, 0.58, 0.02), m(0x07090c, 0.9, 0.05), 0, 1.33, -0.075);
+  bezel.rotation.x = SCREEN_TILT;
+
+  const canvas = document.createElement("canvas");
+  const painter = createArcadeScreenPainter(canvas);
+  const screenTex = new THREE.CanvasTexture(canvas);
+  // Linear filtering over the 2× pixel grid is the CRT's soft bleed.
+  screenTex.minFilter = THREE.LinearFilter;
+  screenTex.magFilter = THREE.LinearFilter;
+  screenTex.generateMipmaps = false;
+  screenTex.colorSpace = THREE.SRGBColorSpace;
+  const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0, toneMapped: false });
+  screenMat.userData.baseOpacity = 1;
+  // NES aspect 256:240; the plane faces −z (ry = π), then tilts back.
+  const screen = place(new THREE.PlaneGeometry(0.50, 0.469), screenMat, 0, 1.33, -0.088, Math.PI);
+  screen.rotation.x = SCREEN_TILT;
+  addLight(new THREE.PointLight(0x9fe8ff, 0, 1.6), 0, 1.33, -0.40, 0.22);
+
+  // ── Marquee ───────────────────────────────────────────────────────────────
+  const marqueeCanvas = document.createElement("canvas");
+  marqueeCanvas.width = 512;
+  marqueeCanvas.height = 128;
+  const mctx = marqueeCanvas.getContext("2d")!;
+  mctx.fillStyle = "#12051c";
+  mctx.fillRect(0, 0, 512, 128);
+  mctx.strokeStyle = "#ff3fa4";
+  mctx.lineWidth = 6;
+  mctx.strokeRect(5, 5, 502, 118);
+  mctx.fillStyle = "#2ee6ff";
+  mctx.font = "bold 64px 'SF Mono','Consolas',monospace";
+  mctx.textAlign = "center";
+  mctx.textBaseline = "middle";
+  mctx.fillText("SSF ARCADE", 256, 68, 480);
+  const marqueeTex = new THREE.CanvasTexture(marqueeCanvas);
+  marqueeTex.colorSpace = THREE.SRGBColorSpace;
+  const marqueeMat = new THREE.MeshBasicMaterial({ map: marqueeTex, transparent: true, opacity: 0 });
+  marqueeMat.userData.baseOpacity = 0.97;
+  place(new THREE.PlaneGeometry(0.62, 0.155), marqueeMat, 0, 1.85, -0.062, Math.PI);
+  addLight(new THREE.PointLight(0xff7ac8, 0, 1.4), 0, 1.85, -0.30, 0.18);
+
+  painter.drawAttract();
+  screenTex.needsUpdate = true;
+  const handle: ArcadeCabinetVisualHandle = {
+    painter,
+    present(): void {
+      screenTex.needsUpdate = true;
+    },
+    showAttract(): void {
+      painter.drawAttract();
+      screenTex.needsUpdate = true;
+    },
+  };
+  // The screen mesh carries the handle (furnitureHandles.ts files it).
+  screen.userData.arcadeCabinet = handle;
 }
 
 

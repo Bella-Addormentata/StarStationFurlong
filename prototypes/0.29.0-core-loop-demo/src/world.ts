@@ -180,6 +180,7 @@ import type {
   PropAnimHandle,
   SlotMachineCabinetControl,
   CoinPusherVisualHandle,
+  ArcadeCabinetVisualHandle,
   AirHockeyVisualHandle,
   AlligatorsVisualHandle,
   DeviceUI,
@@ -188,6 +189,7 @@ import type {
 import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
 import { seatOf, standIndexFor } from "./games/checkersTable";
 import { createCheckersTableLayer, paintCheckersTable } from "./checkersSession";
+import { createArcadeCabinetUI } from "./arcadeCabinet";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -468,6 +470,8 @@ export class World {
    *  slot-machine visuals; the userData key on the upper platform mesh carries
    *  the handle so the traversal below picks it up. */
   private coinPusherVisuals: Map<string, CoinPusherVisualHandle> = new Map();
+  /** 🕹️ Arcade-cabinet screens — painted only by a focused cabinet's UI. */
+  private arcadeCabinetVisuals: Map<string, ArcadeCabinetVisualHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -1765,6 +1769,7 @@ export class World {
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
       coinPusherVisuals: this.coinPusherVisuals,
+      arcadeCabinetVisuals: this.arcadeCabinetVisuals,
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
       alligatorsVisuals: this.alligatorsVisuals,
@@ -3192,6 +3197,7 @@ export class World {
     // before any chip is drawn, so the traversal below can't reach them all.
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
+    this.arcadeCabinetVisuals.delete(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.alligatorsVisuals.delete(itemId);
@@ -6193,6 +6199,21 @@ export class World {
           isHouse: () => canEditRoom().ok,
           onDenominationChange: (amount) => visual?.setDenomination(amount),
           onMessage: (message) => visual?.showMessage(message),
+        }),
+      );
+      return;
+    }
+
+    // 🕹️ Arcade cabinet — the menu and the game play on the cabinet's own
+    // screen; the UI only adds a key strip and keeps stray clicks from
+    // releasing the focus mid-game.
+    if (device.kind === "arcadeCabinet") {
+      deviceFocus.beginFocus(
+        this.player,
+        device,
+        createArcadeCabinetUI({
+          visual: this.arcadeCabinetVisuals.get(deviceId),
+          requestRelease: () => deviceFocus.release(),
         }),
       );
       return;

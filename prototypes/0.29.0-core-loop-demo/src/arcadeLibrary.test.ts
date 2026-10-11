@@ -1,0 +1,115 @@
+/**
+ * 🕹️ Arcade library tests: every bundled game ships with its ROM, its license
+ * and (for copyleft games) its source, is credited in public/arcade/README.md,
+ * and actually boots in the emulator; and the cartridge checks refuse junk.
+ */
+
+import { describe, expect, it } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { ARCADE_GAMES, MAX_ROM_BYTES, parseInesHeader } from './arcadeLibrary';
+import { ArcadeMachine } from './arcadeMachine';
+
+const publicFile = (url: string): string => new URL(`../public${url}`, import.meta.url).pathname;
+const romBytes = (url: string): Uint8Array => new Uint8Array(readFileSync(publicFile(url)));
+
+/** A minimal iNES image: header + the PRG/CHR banks it declares. */
+function ines(prg: number, chr: number, mapper = 0): Uint8Array {
+  const bytes = new Uint8Array(16 + prg * 16384 + chr * 8192);
+  bytes.set([0x4e, 0x45, 0x53, 0x1a, prg, chr, (mapper & 0x0f) << 4, mapper & 0xf0]);
+  return bytes;
+}
+
+describe('arcade library', () => {
+  it('has unique ids and titles', () => {
+    expect(new Set(ARCADE_GAMES.map((g) => g.id)).size).toBe(ARCADE_GAMES.length);
+    expect(new Set(ARCADE_GAMES.map((g) => g.title)).size).toBe(ARCADE_GAMES.length);
+  });
+
+  it.each(ARCADE_GAMES.map((g) => [g.id, g] as const))('%s ships its ROM, license and source', (_id, game) => {
+    expect(existsSync(publicFile(game.romUrl)), game.romUrl).toBe(true);
+    if (game.licenseUrl.startsWith('/')) expect(existsSync(publicFile(game.licenseUrl)), game.licenseUrl).toBe(true);
+    // Copyleft: the corresponding source travels with the binary.
+    if (game.license.startsWith('GPL')) {
+      expect(game.bundledSource, 'a GPL game must bundle its source').toBeTruthy();
+      expect(existsSync(publicFile(game.bundledSource!))).toBe(true);
+    }
+    expect(game.sourceCommit).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it('credits every game, its license and its commit on the README page', () => {
+    const readme = readFileSync(publicFile('/arcade/README.md'), 'utf8');
+    for (const game of ARCADE_GAMES) {
+      expect(readme).toContain(game.romUrl.replace('/arcade/', ''));
+      expect(readme).toContain(game.sourceCommit);
+      expect(readme).toContain(game.author);
+    }
+  });
+
+  it.each(ARCADE_GAMES.map((g) => [g.id, g] as const))('%s boots and draws in the emulator', (_id, game) => {
+    const bytes = romBytes(game.romUrl);
+    expect(parseInesHeader(bytes).ok).toBe(true);
+    const machine = new ArcadeMachine();
+    expect(machine.load(bytes)).toEqual({ ok: true });
+    // ~4 s of attract/title, Start, then ~2 s more.
+    for (let i = 0; i < 240; i++) machine.step(1 / 60);
+    machine.press(1, 'START');
+    for (let i = 0; i < 6; i++) machine.step(1 / 60);
+    machine.release(1, 'START');
+    for (let i = 0; i < 120; i++) machine.step(1 / 60);
+    const frame = machine.frameBuffer();
+    expect(frame).not.toBeNull();
+    expect(frame!.length).toBe(256 * 240);
+    // Something is on screen: more than one colour.
+    expect(new Set(frame!).size).toBeGreaterThan(1);
+  });
+});
+
+describe('parseInesHeader', () => {
+  it('reads mapper and bank counts', () => {
+    expect(parseInesHeader(ines(2, 1, 0))).toEqual({ ok: true, mapper: 0, prgBanks: 2, chrBanks: 1 });
+    expect(parseInesHeader(ines(1, 0, 0x42))).toEqual({ ok: true, mapper: 0x42, prgBanks: 1, chrBanks: 0 });
+  });
+
+  it('refuses what is not a whole NES ROM', () => {
+    expect(parseInesHeader(new Uint8Array(8))).toEqual({ ok: false, reason: 'FILE TOO SMALL' });
+    expect(parseInesHeader(new TextEncoder().encode('<html>not a rom at all</html>'))).toEqual({
+      ok: false,
+      reason: 'NOT AN NES ROM',
+    });
+    expect(parseInesHeader(ines(0, 1))).toEqual({ ok: false, reason: 'NO PROGRAM DATA' });
+    expect(parseInesHeader(ines(2, 1).subarray(0, 20000))).toEqual({ ok: false, reason: 'ROM IS TRUNCATED' });
+    expect(parseInesHeader(new Uint8Array(MAX_ROM_BYTES + 1))).toEqual({ ok: false, reason: 'FILE TOO LARGE' });
+  });
+});
+
+describe('ArcadeMachine', () => {
+  it('reports a mapper jsnes cannot run instead of throwing', () => {
+    expect(new ArcadeMachine().load(ines(2, 1, 0xfe))).toEqual({
+      ok: false,
+      reason: 'THIS CARTRIDGE TYPE IS NOT SUPPORTED',
+    });
+  });
+
+  it('runs at most three frames per step and drops a long backlog', () => {
+    const machine = new ArcadeMachine();
+    machine.load(romBytes(ARCADE_GAMES[0].romUrl));
+    expect(machine.step(1 / 60)).toBe(1);
+    expect(machine.step(1)).toBe(3);
+    // The backlog from that 1 s hitch was dropped, not queued.
+    expect(machine.step(0)).toBe(0);
+    expect(machine.step(-5)).toBe(0);
+    expect(machine.step(Number.NaN)).toBe(0);
+  });
+
+  it('does nothing before a ROM is loaded or after stop()', () => {
+    const machine = new ArcadeMachine();
+    expect(machine.running).toBe(false);
+    expect(machine.step(1)).toBe(0);
+    machine.press(1, 'A'); // no console: ignored, no throw
+    machine.load(romBytes(ARCADE_GAMES[0].romUrl));
+    expect(machine.running).toBe(true);
+    machine.stop();
+    expect(machine.running).toBe(false);
+    expect(machine.frameBuffer()).toBeNull();
+  });
+});
