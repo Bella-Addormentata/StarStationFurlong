@@ -4,48 +4,29 @@
  *
  * ELECTION: only the room's deed holder operates (canRunCroupier — the rule
  * every casino operator follows since #141/#142), and only ONE of their
- * browser sessions, for every coin pusher in the room: one `pusher-operator`
- * lease is written for the room, the session waits OPERATOR_LEASE_SETTLE_MS
- * for the doc to converge, then works while it keeps the lease (renewed every
- * OPERATOR_LEASE_RENEW_MS, lapsing after OPERATOR_LEASE_MS). One operator for
- * the room, not one per cabinet: a player's `bal:` is a whole value, so two
- * sessions settling that player's drops on two cabinets at once would each
- * write it, and the merge would keep only one of the two writes. World ticks
- * the room every frame (tickCoinPusherRoom); there is no start/stop control to
- * fight the tick, and a session whose room has no cabinet left lets the lease
- * go.
+ * browser sessions, for every coin pusher in the room, under the room's one
+ * casino-operator lease, which the slot machines share (casinoOperator.ts,
+ * ELECTION: the take, its settling wait, renewals and lapse). One operator
+ * for the room, not one per cabinet: a player's `bal:` is a whole value, so
+ * two sessions settling that player's drops on two cabinets at once would
+ * each write it, and the merge would keep only one of the two writes. World
+ * ticks the room every frame (tickCoinPusherRoom): the tick reports whether
+ * this game needs the room (a cabinet to operate or one to drain, and the
+ * deed), runs the election, and works only while it says this session holds
+ * the lease past its settling wait, and the check before every write
+ * (stillOperates) agrees. There is no start/stop control to fight the tick;
+ * a session whose room has no cabinet left needs the room no more, and the
+ * lease goes once no game does.
  *
- * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
- * could each take it and settle drops; when the docs merge only one machine
- * value survives while both players' balance writes do (or one balance write
- * survives where both debited it). Settling can't be made partition-safe
- * without an authoritative ledger (the Registry-anchored chips), so a session
- * on ANOTHER device takes over a lease it has seen lapse only
- * OPERATOR_UNCLEAN_TAKEOVER_MS later, in case its holder is only cut off.
- * (Only the deed holder operates, so another device's lease is the deed
- * holder's own, whatever player id it names: an install that restored their
- * identity key has its own.) Tabs on one device share its local node, so they
- * take over as soon as the lease lapses (a reload, a closed tab); a session
- * that stops operating releases its lease so a successor needn't wait. That
- * window guards only a lease this page has seen. One that sees no lease at all
- * (cut off from the operator, or joining from a cached copy of the room before
- * its live state arrives) takes it at once and operates after the settling
- * wait, which is enough only where the two are connected: each sees the
- * other's take, and the merge keeps one. So a split of any length that begins
- * before a device has seen the other's lease can put two operators in one
- * room; once it has, only a split outlasting the window can.
- *
- * CLOCKS: devices' clocks aren't synchronised, so a lease written on another
- * device is never judged by the expiry it claims: it lapses one
- * OPERATOR_LEASE_MS after this page last saw it renewed (leaseLapsesAt). Only
- * a tab on this device, which shares the clock, is also held to its own
- * expiry. Every client watches the renewals (World ticks the room on every
- * client), and the panel asks the same question: its DROP waits until the
- * operator is past its settling wait (coinPusherOperatorState). A request is
- * aged on this page's clock too, from when it arrived in this page's doc
- * (readCoinPusherRequestArrival), however deep in the queue it waits; its
- * `requestedAt`, the player's clock, decides only whether the drop's timing is
- * kept.
+ * SPLITS and CLOCKS: why another device waits a window before taking over a
+ * lease it has seen lapse, and how a lease is judged lapsed without
+ * comparing clocks across devices, are the election's (casinoOperator.ts,
+ * SPLITS and CLOCKS). The panel asks it the same question: its DROP waits
+ * until the operator is past its settling wait (coinPusherOperatorState). A
+ * request is aged on this page's clock too, from when it arrived in this
+ * page's doc (readCoinPusherRequestArrival), however deep in the queue it
+ * waits; its `requestedAt`, the player's clock, decides only whether the
+ * drop's timing is kept.
  *
  * OWNERSHIP: the operator creates a missing machine with itself as owner, and
  * re-owns one whose owner is anyone else (a deed transfer, a peer-written
@@ -86,14 +67,12 @@
  */
 import {
   casinoDocEpoch,
-  clearCoinPusherOperatorLease,
   commitCoinPusherEmpty,
   continueCoinPusherKeySweep,
   drainAndClearCoinPusher,
   isCoinPusherRecordUnreadable,
   readChips,
   readCoinPusherEmptyRequest,
-  readCoinPusherOperatorLease,
   readCoinPusherRequestArrival,
   readCoinPusherRequests,
   readCoinPusherState,
@@ -101,10 +80,24 @@ import {
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
   startCoinPusherKeySweep,
-  writeCoinPusherOperatorLease,
   writeCoinPusherState,
 } from './casinoDoc';
-import type { CoinPusherKeySweep, CoinPusherOperatorLease } from './casinoDoc';
+import type { CoinPusherKeySweep } from './casinoDoc';
+import {
+  casinoLeaseObserved,
+  casinoOperatorSession,
+  coinPusherOperatorState,
+  currentTake,
+  electCasinoOperator,
+  isLeavingCasinoRoom,
+  leaveCasinoRoom,
+  operatorReady,
+  ownsCasinoOperatorLease,
+  registerOperatorGame,
+  releaseCasinoOperatorLease,
+  reportOperatorNeed,
+  stillOperates,
+} from './casinoOperator';
 import { canRunCroupier } from './croupier';
 import {
   chipsInMachine,
@@ -125,18 +118,11 @@ import type {
 } from './games/coinPusher';
 import { getPlayerId } from './identity';
 
-interface PusherOperatorSession {
-  docEpoch: number;
-  playerId: string;
-  /** This turn's token in the lease record, fresh for every take and kept
-   *  across its renewals (CoinPusherOperatorLease.tenure). */
-  tenure: string;
-  readyAt: number;
-  renewedAt: number;
-}
+/** The lease's timing and the panel's state are the election's
+ *  (casinoOperator.ts); the names this module exported stay. */
+export { OPERATOR_UNCLEAN_TAKEOVER_MS, coinPusherOperatorState } from './casinoOperator';
+export type { CasinoOperatorState as CoinPusherOperatorState } from './casinoOperator';
 
-/** This session's turn as the room's operator, if it has one. */
-let operator: PusherOperatorSession | null = null;
 const lastPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
 /** Removed cabinets this session is to clear once no other session may be
  *  operating them (closeCoinPusher), with the doc epoch each was removed in:
@@ -149,125 +135,25 @@ const sweeps = new Map<string, CoinPusherKeySweep>();
 const REQUEST_POLL_MS = 100;
 /** Inserts settled or refused per poll (≤ 40 a second per machine). */
 export const MAX_REQUESTS_PER_POLL = 4;
-const OPERATOR_LEASE_MS = 8_000;
-const OPERATOR_LEASE_SETTLE_MS = 2_000;
-const OPERATOR_LEASE_RENEW_MS = 3_000;
-/** How much longer than a lapse another device of the same deed holder waits
- *  before taking over (see SPLITS above). */
-export const OPERATOR_UNCLEAN_TAKEOVER_MS = 60_000;
-const DEVICE_KEY = 'ssf-pusher-operator-device';
 
-/** One id per browser profile (localStorage), shared by its tabs. */
-function loadDeviceId(): string {
-  try {
-    const stored = localStorage.getItem(DEVICE_KEY);
-    if (stored && /^[0-9a-f-]{36}$/.test(stored)) return stored;
-    const fresh = crypto.randomUUID();
-    localStorage.setItem(DEVICE_KEY, fresh);
-    return fresh;
-  } catch {
-    return crypto.randomUUID(); // private mode: this page is its own device
-  }
-}
-
-const deviceId = loadDeviceId();
-/** `<device>:<page load>` — the lease record's sessionId. */
-const operatorSessionId = `${deviceId}:${crypto.randomUUID()}`;
+/**
+ * This game's part in the room's one lease (casinoOperator.ts). A take that
+ * has ended, whichever call ended it, leaves the polls made under it stale;
+ * never the queues: a removed cabinet stays to be drained under the next take
+ * (TEARDOWN), and a sweep needs no lease. Leaving the room forgets all three.
+ */
+registerOperatorGame('pusher', {
+  onStop() { lastPolls.clear(); },
+  onLeave() { pendingTeardowns.clear(); sweeps.clear(); lastPolls.clear(); },
+});
 
 /** This page's operator session id (`<device>:<page load>`). */
 export function coinPusherOperatorSession(): string {
-  return operatorSessionId;
-}
-
-/** The room's lease as this page saw it in this room's doc: when it first
- *  saw the current record (`at` — the operator rewrites its record at every
- *  renewal, so this is when this page last saw the lease renewed), and when it
- *  first saw the record's holder hold it in this tenure (`heldSince`). */
-let leaseSeen: { id: string; holder: string; at: number; heldSince: number } | null = null;
-
-/** The doc epoch of the room this session is leaving (leaveCoinPusherRoom):
- *  nothing there is operated or watched again, even while its last writes
- *  are being sent. The next room's doc has another epoch. */
-let leavingDocEpoch: number | null = null;
-
-function isLeavingRoom(): boolean {
-  return leavingDocEpoch === casinoDocEpoch();
-}
-
-/**
- * When `lease` lapses as far as this page can tell, without comparing clocks
- * across devices (CLOCKS above): one OPERATOR_LEASE_MS after this page first
- * saw that exact record in this room's doc (what a previous room's doc showed
- * never counts). A tab on this device shares this clock, so its own expiry
- * counts too, though never past that. The record is peer-writable: one
- * claiming a far-future expiry holds the room for one lease term, not
- * forever.
- */
-function leaseLapsesAt(lease: CoinPusherOperatorLease, now: number): number {
-  const heldUntil = seeLease(lease, now).at + OPERATOR_LEASE_MS;
-  return isThisDevice(lease) ? Math.min(lease.expiresAt, heldUntil) : heldUntil;
-}
-
-/** Note the room's lease as this page sees it now (leaseSeen). A new record
- *  by the same holder in the same tenure is a renewal: it keeps `heldSince`.
- *  A new tenure is a new take, with its own settling wait, even when this
- *  page never saw the lease go. */
-function seeLease(lease: CoinPusherOperatorLease, now: number) {
-  // Scoped to the bound doc: another room's same record starts afresh.
-  const holder = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}|${lease.tenure ?? ''}`;
-  const id = `${holder}|${lease.expiresAt}`;
-  let seen = leaseSeen;
-  if (seen?.id !== id) {
-    seen = { id, holder, at: now, heldSince: seen?.holder === holder ? seen.heldSince : now };
-    leaseSeen = seen;
-  }
-  return seen;
-}
-
-/** Whether a lease was written by a session on this device (its tabs share
- *  the clock and the local node). */
-function isThisDevice(lease: CoinPusherOperatorLease): boolean {
-  return lease.sessionId.startsWith(`${deviceId}:`);
-}
-
-/** Earliest time this session may take `lease` over: when it lapses, plus
- *  the split window when it is another device's (SPLITS). Only the deed
- *  holder operates, so a lease from another device is the deed holder's own,
- *  whatever player id it names: an install that restored the deed holder's
- *  identity key has a player id of its own. */
-function takeoverAt(lease: CoinPusherOperatorLease, now: number): number {
-  const lapsesAt = leaseLapsesAt(lease, now);
-  return isThisDevice(lease) ? lapsesAt : lapsesAt + OPERATOR_UNCLEAN_TAKEOVER_MS;
-}
-
-/** The room's coin-pusher operator as this page can tell it: none with a
- *  live lease (`offline`), one still in its OPERATOR_LEASE_SETTLE_MS wait
- *  after taking the lease (`starting` — a drop made now would reach it too
- *  late to keep its timing), or one at work (`ready`). */
-export type CoinPusherOperatorState = 'offline' | 'starting' | 'ready';
-
-/**
- * The room's operator state (every cabinet's DROP and door): this session by
- * its own lease and wait, any other while its lease hasn't lapsed by
- * leaseLapsesAt, ready OPERATOR_LEASE_SETTLE_MS after this page first saw its
- * holder take it — never sooner than the holder itself, which waits that long
- * from its own write. Renewals don't restart the wait; a new take does (its
- * record carries a new tenure), even one this page saw no gap before.
- */
-export function coinPusherOperatorState(now = Date.now()): CoinPusherOperatorState {
-  if (isLeavingRoom()) return 'offline';
-  const lease = readCoinPusherOperatorLease();
-  if (!lease) return 'offline';
-  if (lease.sessionId === operatorSessionId) {
-    if (!operator || operator.docEpoch !== casinoDocEpoch() || lease.expiresAt <= now) return 'offline';
-    return now < operator.readyAt ? 'starting' : 'ready';
-  }
-  if (now >= leaseLapsesAt(lease, now)) return 'offline';
-  return now < seeLease(lease, now).heldSince + OPERATOR_LEASE_SETTLE_MS ? 'starting' : 'ready';
+  return casinoOperatorSession();
 }
 
 /** Whether some session is operating the room's coin pushers (starting or at
- *  work), as far as this page can tell. */
+ *  work), as far as this page can tell (coinPusherOperatorState). */
 export function isCoinPusherOperatorLive(now = Date.now()): boolean {
   return coinPusherOperatorState(now) !== 'offline';
 }
@@ -281,122 +167,57 @@ export function randomPusherSeed(): number {
   return buf[0];
 }
 
-/** Stop operating the room's coin pushers here, releasing the lease if this
- *  session holds it. */
-export function stopCoinPusherOperator(): void {
-  if (!operator) return;
-  operator = null;
-  lastPolls.clear();
-  if (readCoinPusherOperatorLease()?.sessionId === operatorSessionId) {
-    clearCoinPusherOperatorLease();
-  }
-}
-
-/** True while this browser session holds a live operator lease on the room. */
+/** True while this browser session holds the room's live lease, in its
+ *  current take (casinoOperator.ts ownsCasinoOperatorLease). */
 export function isCoinPusherOperator(now = Date.now()): boolean {
-  const lease = readCoinPusherOperatorLease();
-  return operator?.docEpoch === casinoDocEpoch()
-    && lease?.sessionId === operatorSessionId
-    && lease.expiresAt > now;
+  return ownsCasinoOperatorLease(getPlayerId(), now);
 }
 
 /**
- * World calls this every frame with the room's coin-pusher cabinets. It runs
- * the room's election (this session keeps, takes or gives up the one lease
+ * World calls this every frame with the room's coin-pusher cabinets. It
+ * reports this game's need for the room and runs the room's election
+ * (casinoOperator.ts: this session keeps, takes or gives up the one lease
  * under which it operates every cabinet), then the operator's work on each
- * cabinet when due. With no cabinet left, this session lets its lease go.
+ * cabinet when due. With no cabinet left and nothing to drain, this game
+ * needs the room no more, and the lease goes once no game does.
  */
 export function tickCoinPusherRoom(machineIds: readonly string[], now = Date.now()): void {
   // A room this session is leaving isn't operated again: its released lease
   // stays released while the release is being sent (leaveCoinPusherRoom).
-  if (isLeavingRoom()) return;
+  if (isLeavingCasinoRoom()) return;
   // World ticks only cabinets in the room, so one put back before its
   // teardown ran (or finished) is no longer to be torn down.
   for (const machineId of machineIds) {
     pendingTeardowns.delete(machineId);
     sweeps.delete(machineId);
   }
-  // Every client watches the lease's renewals, a frame at a time: that is
-  // how it tells a live operator from a lapsed one (CLOCKS above). With no
-  // lease, whoever takes it next starts its wait afresh.
-  const lease = readCoinPusherOperatorLease();
-  if (!lease) leaseSeen = null;
-  else if (lease.sessionId !== operatorSessionId) seeLease(lease, now);
-  // Nothing left to operate or to tear down: let the lease go, so a cabinet
-  // placed later needn't wait it out on another device.
-  if (machineIds.length === 0 && !hasTeardownsHere()) {
-    stopCoinPusherOperator();
-    return;
-  }
-  const operatorId = electCoinPusherOperator(lease, now);
-  if (operatorId === null) return;
-  const docEpoch = casinoDocEpoch();
+  // The deed holder needs the room while a cabinet is to be operated or torn
+  // down; nobody else ever does. The election watches the room's records on
+  // every client, every frame (that is how it tells a live operator from a
+  // lapsed one), and tidies earlier builds' lapsed leases for a session that
+  // may operate.
+  const may = canRunCroupier();
+  reportOperatorNeed('pusher', may && (machineIds.length > 0 || hasTeardownsHere()));
+  const outcome = electCasinoOperator(now, may);
+  // The lease may be held here for the slot machines alone (a venture room's
+  // manual operator): the pushers' work still takes the deed.
+  if (outcome.kind !== 'ready' || !may) return;
+  const { docEpoch, playerId: operatorId, tenure } = outcome;
   // Past its settling wait, the operator drains the cabinets removed meanwhile
   // (TEARDOWN).
   for (const [machineId, removedIn] of [...pendingTeardowns]) {
-    if (removedIn === docEpoch) tearDown(machineId, operatorId);
+    if (removedIn === docEpoch) tearDown(machineId, operatorId, now);
     else pendingTeardowns.delete(machineId);
   }
+  // The check every write under the lease makes (casinoOperator.ts
+  // stillOperates), once for the frame's passes: no await lies between them.
+  if (!stillOperates(docEpoch, tenure, now)) return;
   for (const machineId of machineIds) {
     const lastPoll = lastPolls.get(machineId);
     if (lastPoll?.docEpoch === docEpoch && now - lastPoll.checkedAt < REQUEST_POLL_MS) continue;
     lastPolls.set(machineId, { docEpoch, checkedAt: now });
     operateCoinPusher(machineId, operatorId, now);
   }
-}
-
-/**
- * The room's election, once a frame (ELECTION above): take the lease when no
- * other session may hold it, renew it, or give it up. Returns the operator's
- * player id once it is past its settling wait, else null.
- */
-function electCoinPusherOperator(lease: CoinPusherOperatorLease | null, now: number): string | null {
-  if (!canRunCroupier()) {
-    stopCoinPusherOperator();
-    return null;
-  }
-  const playerId = getPlayerId();
-  if (!operator
-    || operator.docEpoch !== casinoDocEpoch()
-    || operator.playerId !== playerId) {
-    if (lease && lease.sessionId !== operatorSessionId
-      && now < takeoverAt(lease, now)) return null;
-    const tenure = crypto.randomUUID();
-    writeCoinPusherOperatorLease({
-      playerId,
-      sessionId: operatorSessionId,
-      tenure,
-      expiresAt: now + OPERATOR_LEASE_MS,
-    });
-    operator = {
-      docEpoch: casinoDocEpoch(),
-      playerId,
-      tenure,
-      readyAt: now + OPERATOR_LEASE_SETTLE_MS,
-      renewedAt: now,
-    };
-    return null;
-  }
-  if (lease?.playerId !== playerId
-    || lease.sessionId !== operatorSessionId
-    || lease.expiresAt <= now) {
-    // Lost, or lapsed. A lapsed record of this session's own goes now: once
-    // this session stops operating, a release has nothing to find, so a page
-    // leaving before the next frame would otherwise leave it for another
-    // device to wait out. The next frame takes the lease afresh.
-    stopCoinPusherOperator();
-    return null;
-  }
-  if (now - operator.renewedAt >= OPERATOR_LEASE_RENEW_MS) {
-    writeCoinPusherOperatorLease({
-      playerId,
-      sessionId: operatorSessionId,
-      tenure: operator.tenure,
-      expiresAt: now + OPERATOR_LEASE_MS,
-    });
-    operator.renewedAt = now;
-  }
-  return now < operator.readyAt ? null : playerId;
 }
 
 /**
@@ -541,26 +362,15 @@ export function closeCoinPusher(
 ): void {
   lastPolls.delete(machineId);
   // A room this session is leaving is left to the sessions still in it.
-  if (!canManage || isLeavingRoom()) {
+  if (!canManage || isLeavingCasinoRoom()) {
     pendingTeardowns.delete(machineId);
     sweeps.delete(machineId);
     return;
   }
   pendingTeardowns.set(machineId, casinoDocEpoch());
-  if (isOperatorReady(now)) tearDown(machineId, operator!.playerId);
-}
-
-/** Whether this session operates the room's coin pushers and is past its
- *  settling wait: the election's own test for handing out work. */
-function isOperatorReady(now: number): boolean {
-  const lease = readCoinPusherOperatorLease();
-  return operator !== null
-    && operator.docEpoch === casinoDocEpoch()
-    && operator.playerId === getPlayerId()
-    && lease?.playerId === operator.playerId
-    && lease.sessionId === operatorSessionId
-    && lease.expiresAt > now
-    && now >= operator.readyAt;
+  // By the room's shared take, read afresh (casinoOperator.ts operatorReady):
+  // never under a take the slot side has already ended.
+  if (operatorReady(now)) tearDown(machineId, currentTake()!.playerId, now);
 }
 
 /** Whether a cabinet removed in this room's doc is waiting to be drained. */
@@ -570,14 +380,18 @@ function hasTeardownsHere(): boolean {
   return false;
 }
 
-/** Drain a removed cabinet, as the room's operator past its settling wait.
- *  The chips and the machine's own keys go in one transaction. Its per-player
- *  keys (no chips in any) are left to the teardown tick, which World runs
- *  after the room tick: it deletes them a batch a frame, never a second batch
- *  in the frame that drained. When the chips inside can't be credited yet,
- *  nothing is written and the teardown stays pending: the operator tries
- *  again on its next pass. */
-function tearDown(machineId: string, recipient: string): void {
+/** Drain a removed cabinet, as the room's operator past its settling wait,
+ *  checked once more just before the write for both callers (stillOperates):
+ *  a take that has ended since — lost, lapsed, released or ended by the slot
+ *  side — drains nothing. The chips and the machine's own keys go in one
+ *  transaction. Its per-player keys (no chips in any) are left to the
+ *  teardown tick, which World runs after the room tick: it deletes them a
+ *  batch a frame, never a second batch in the frame that drained. When the
+ *  chips inside can't be credited yet, nothing is written and the teardown
+ *  stays pending: the operator tries again on its next pass. */
+function tearDown(machineId: string, recipient: string, now: number): void {
+  const take = currentTake();
+  if (!take || !stillOperates(take.docEpoch, take.tenure, now)) return;
   if (drainAndClearCoinPusher(machineId, recipient) === null) return;
   pendingTeardowns.delete(machineId);
   sweeps.set(machineId, startCoinPusherKeySweep(machineId));
@@ -610,34 +424,29 @@ export function tickCoinPusherTeardowns(): void {
   }
 }
 
-/** Stop operating here, releasing the room's lease if this session holds it,
- *  so another tab or device needn't wait it out. */
+/** Stop operating here, releasing the room's lease if this session holds it
+ *  (casinoOperator.ts releaseCasinoOperatorLease), so another tab or device
+ *  needn't wait it out. The page's one pagehide listener calls the same. */
 export function releaseCoinPusherLease(): void {
-  stopCoinPusherOperator();
+  releaseCasinoOperatorLease();
 }
 
 /**
  * Leaving the room (main.ts leaveRoom, while the room's doc is still bound):
  * release the lease if this session holds it, and operate or watch nothing
  * more in this room, so no frame takes the lease back while the release is
- * being sent. The room's lease observation, request sightings, pending
- * teardowns and key sweeps go with it. The next room's doc lifts this by its
- * own epoch.
+ * being sent (casinoOperator.ts leaveCasinoRoom). The room's lease
+ * observation, pending teardowns and key sweeps go with it (onLeave). The
+ * next room's doc lifts this by its own epoch. The slot side's wrapper does
+ * the same, so the second of the two calls is a no-op.
  */
 export function leaveCoinPusherRoom(): void {
-  leavingDocEpoch = casinoDocEpoch();
-  releaseCoinPusherLease();
-  leaseSeen = null;
-  pendingTeardowns.clear();
-  sweeps.clear();
+  leaveCasinoRoom();
 }
 
-/** How much this session is watching or tidying up (the room's lease
- *  observation, pending teardowns, key sweeps): tests and debugging. */
+/** How much this session is watching or tidying up (another session's room
+ *  record, as the election memoises it; pending teardowns; key sweeps):
+ *  tests and debugging. */
 export function coinPusherWatchCount(): number {
-  return (leaseSeen ? 1 : 0) + pendingTeardowns.size + sweeps.size;
+  return casinoLeaseObserved() + pendingTeardowns.size + sweeps.size;
 }
-
-// Best effort on page close: the write may not flush. (A page restored from
-// the back/forward cache simply takes the lease again.)
-if (typeof window !== 'undefined') window.addEventListener('pagehide', releaseCoinPusherLease);

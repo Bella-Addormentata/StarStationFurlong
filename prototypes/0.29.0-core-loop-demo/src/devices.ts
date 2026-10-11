@@ -197,13 +197,13 @@ import {
   // operator (pusherCroupier.ts) moves the chips.
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
   cancelCoinPusherRequest, coinPusherRequestKey, coinPusherResultKey, readCoinPusherResult,
-  COIN_PUSHER_OPERATOR_KEY,
+  CASINO_OPERATOR_KEY, COIN_PUSHER_OPERATOR_KEY,
   readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest, readCoinPusherDoorResult,
   isCoinPusherRecordUnreadable,
   subscribeCasinoKey,
 } from './casinoDoc';
 // 🪙 Whether the room's coin pushers are operated, and ready for a drop,
-// judged without comparing clocks across devices (pusherCroupier.ts CLOCKS).
+// judged without comparing clocks across devices (casinoOperator.ts CLOCKS).
 import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
@@ -7489,6 +7489,10 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         coinPusherResultKey(deps.itemId, myId),
         `pusher-empty:${deps.itemId}`,
         `pusher-door:${deps.itemId}`,
+        // The room's operator record, under the shared lease's key and the
+        // v0.38 key it shadows (casinoOperator.ts, V0.38 ROOMS): a renewal
+        // under either repaints.
+        CASINO_OPERATOR_KEY,
         COIN_PUSHER_OPERATOR_KEY,
         `bal:${myId}`,
       ]) {
