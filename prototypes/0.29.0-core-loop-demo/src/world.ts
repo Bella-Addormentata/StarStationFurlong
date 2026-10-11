@@ -6038,17 +6038,21 @@ export class World {
       // top handle simply rides along so FLIP can drive the tween.
       // 🎰 #76: walk to an open STANDING position at the table, then the UI
       // opens. 🎲 #227: a seated checkers player goes to their OWN end and
-      // looks from it (stand s0 = red at −z, s1 = black at +z) when it can
-      // be walked to; everyone else takes the nearest open end, and the
-      // camera follows that end.
+      // looks from it (stand s0 = red at −z, s1 = black at +z) when it is
+      // open and can be walked to (pickFreeStand's rules); otherwise, and for
+      // everyone else, the nearest open end — the camera follows that end.
       const game = readGame(deviceId);
       const mine = game ? seatOf(game, getPlayerId()) : null;
       const ownEnd = mine
         ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${standIndexFor(mine)}`)
         : undefined;
-      const stand =
-        (ownEnd && this.standReachability()(ownEnd) ? ownEnd : null) ??
-        this.pickFreeStand(deviceId);
+      const ownEndFree =
+        !!ownEnd &&
+        !this.getRemoteAvatarSnapshots().some(
+          (a) => Math.hypot(a.x - ownEnd.front.x, a.z - ownEnd.front.z) < 0.7,
+        ) &&
+        this.standReachability()(ownEnd);
+      const stand = (ownEndFree ? ownEnd : null) ?? this.pickFreeStand(deviceId);
       const farEnd = stand ? stand.id.endsWith(":s1") : false;
       const top = this.gameTableTops.get(deviceId) ?? null;
       const ui = createGameTableUI({

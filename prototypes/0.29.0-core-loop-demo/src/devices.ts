@@ -1799,7 +1799,8 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
    * while the layer has it — the panel then stays hidden and unrendered.
    */
   const syncCheckersLayer = (): boolean => {
-    const want = !!deps.checkers && !!host
+    // No top → nothing to pick on; keep the panel (its RESET stays reachable).
+    const want = !!deps.checkers && !!deps.top && !!host
       && readTable(deps.itemId)?.kind === 'checkers'
       && !(deps.top?.isCardsUp() ?? false) && !(deps.top?.isFlipping() ?? false);
     if (want && !checkersMounted && host) {
