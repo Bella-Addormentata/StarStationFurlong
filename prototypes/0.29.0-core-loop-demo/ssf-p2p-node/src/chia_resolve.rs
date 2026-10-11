@@ -1,15 +1,36 @@
-//! ChiaHub C1 Slice 5: RESOLVE a peer's presence record from testnet11 by the
-//! room-derived hint — the READ side of mesh introduction ("identity known,
-//! route unknown"), consulted only at dial-exhaustion.
+//! The GENERIC HINT READER — the read side of the ChiaHub lane (#231 P1, on by
+//! default since D3). Everything a node learns from the chain comes through
+//! here: today the room-keyed presence records, later the per-node presence,
+//! inbox and beacon kinds of P6, which only change the hint and the opener.
 //!
-//! Flow (all source-verified 0.34 API, audit surfaces D + E):
-//!   derive_hint -> get_coin_records_by_hint -> get_puzzle_and_solution on the
-//!   PARENT coin -> run_puzzle -> pull the create_coin `[hint, ciphertext]`
-//!   memos -> chia_lane::open (room key) -> decode_signed -> ChiaPresenceRecord.
+//! Flow (source-verified chia-sdk 0.34 API):
+//!   hint -> get_coin_records_by_hint (spent coins INCLUDED — every publish
+//!   spends the previous record coin; pages followed via `next_cursor`) ->
+//!   get_puzzle_and_solution on the PARENT coin -> run_puzzle -> the create_coin
+//!   whose memos are `[hint, ciphertext]` -> chia_lane::open (room key) ->
+//!   decode_signed -> freshness checks.
 //!
-//! The chain is the swarm's address book + metronome, never its pipe: this reads
-//! at ~19 s block latency and hands the record's addrs into exactly one more dial.
-#![cfg(feature = "chia-lane")]
+//! Rules the reader lives by (third follow-up on #231, verified against the
+//! full node's `hint_store` and the coinset gateway):
+//!   * `include_spent_coins=true` always — the current record's coin is spent
+//!     the moment its publisher republishes.
+//!   * Reads are INCREMENTAL: a [`HintCursor`] remembers the highest confirmed
+//!     height examined and resumes `CURSOR_OVERLAP_BLOCKS` below it; coins
+//!     already examined are skipped by coin id.
+//!   * Parent fetches are capped per poll ([`MAX_PARENT_FETCHES_PER_POLL`]); a
+//!     flooded hint costs a bounded number of calls, not a scan of 50,000 ids.
+//!   * Records are RANKED by their signed `issued_at`, never by block height:
+//!     the publisher signs the time, the block only proves "after". Replayed old
+//!     ciphertexts therefore never outrank a fresh record.
+//!   * Freshness: `expires_at` enforced (0 = never expires, P2 decides its
+//!     future), and an `issued_at` more than [`MAX_FUTURE_SKEW_SECS`] ahead of
+//!     the reader's clock is refused.
+//!
+//! The chain is the swarm's address book + metronome, never its pipe: a read
+//! costs a few KB at ~19 s block latency and hands addresses to a dial.
+#![cfg(feature = "chia-read")]
+
+use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes, Bytes32, CoinSpend};
@@ -21,91 +42,221 @@ use clvmr::{Allocator, NodePtr};
 
 use crate::chia_lane::{self, ChiaPresenceRecord};
 
-/// Resolve the freshest presence record published under `room_key` (any member).
-pub async fn resolve_by_room_key(room_key: &[u8; 32]) -> Result<Option<ChiaPresenceRecord>> {
-    resolve_inner(room_key, None).await
+/// Parent-spend fetches per hint per poll. Bounds the cost of a flooded hint.
+pub const MAX_PARENT_FETCHES_PER_POLL: usize = 50;
+/// Gateway pages followed per hint per poll (each page is one HTTPS call).
+pub const MAX_PAGES_PER_POLL: usize = 8;
+/// Blocks re-read below the cursor on every poll: a late-confirming spend or a
+/// short reorg still gets seen.
+pub const CURSOR_OVERLAP_BLOCKS: u32 = 32;
+/// Signed `issued_at` further ahead than this is refused (publisher clock skew
+/// bound; a day, matching the daily epoch rotation).
+pub const MAX_FUTURE_SKEW_SECS: u64 = 86_400;
+/// Coin ids remembered per cursor before the set is cleared (the height
+/// window then does the de-duplication alone for one poll).
+const SEEN_CAP: usize = 512;
+
+/// A verified record plus where it sat on chain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoundRecord {
+    pub record: ChiaPresenceRecord,
+    pub coin_id: Bytes32,
+    pub confirmed_height: u32,
+    pub hint: Bytes32,
 }
 
-/// Resolve the freshest record for a SPECIFIC peer (`target_node_id`, the iroh
-/// node-id hex) under `room_key` — the introduction lookup at dial-exhaustion.
-pub async fn resolve_target(
-    room_key: &[u8; 32],
-    target_node_id: &str,
-) -> Result<Option<ChiaPresenceRecord>> {
-    resolve_inner(room_key, Some(target_node_id)).await
+/// Per-hint read position for incremental polls.
+#[derive(Clone, Debug, Default)]
+pub struct HintCursor {
+    /// Highest confirmed height fully examined (0 = never read: full scan).
+    pub last_height: u32,
+    /// Coin ids already examined (decoded or rejected) — skipped on re-reads
+    /// inside the overlap window. Bounded by `SEEN_CAP`.
+    pub seen: HashSet<[u8; 32]>,
 }
 
-/// Scans the current epoch and the previous one (records straddling midnight stay
-/// found), verifies signature + freshness, and returns the first matching record.
-async fn resolve_inner(
-    room_key: &[u8; 32],
-    target: Option<&str>,
-) -> Result<Option<ChiaPresenceRecord>> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let client = CoinsetClient::testnet11();
-    let epoch = chia_lane::epoch_now(now);
-    for e in [epoch, epoch.saturating_sub(1)] {
-        let hint = Bytes32::new(chia_lane::derive_hint(room_key, e));
-        if let Some(rec) = resolve_one_hint(&client, hint, room_key, now, target).await? {
-            return Ok(Some(rec));
+impl HintCursor {
+    /// `start_height` for the next query: resume a little below the last
+    /// examined height; `None` means scan the hint from genesis.
+    pub fn start_height(&self) -> Option<u32> {
+        if self.last_height == 0 {
+            None
+        } else {
+            Some(self.last_height.saturating_sub(CURSOR_OVERLAP_BLOCKS))
         }
     }
-    Ok(None)
+
+    fn mark_seen(&mut self, coin_id: [u8; 32]) {
+        if self.seen.len() >= SEEN_CAP {
+            self.seen.clear();
+        }
+        self.seen.insert(coin_id);
+    }
 }
 
-async fn resolve_one_hint(
+/// The epochs a reader scans at `now`: next, current and previous. The next
+/// one catches a publisher whose clock runs ahead of ours (invisible before
+/// P1); the previous one keeps records straddling midnight findable.
+pub fn scan_epochs(now: u64) -> [u64; 3] {
+    let e = chia_lane::epoch_now(now);
+    [e + 1, e, e.saturating_sub(1)]
+}
+
+/// Open + verify + freshness-check one ciphertext. `None` = not for us,
+/// tampered, expired or from the future.
+pub fn decode_blob(room_key: &[u8; 32], ciphertext: &[u8], now: u64) -> Option<ChiaPresenceRecord> {
+    let blob = chia_lane::open(room_key, ciphertext).ok()?; // wrong room key / not for us
+    let record = chia_lane::decode_signed(&blob).ok()?; // tampered / bad signature
+    if record.expires_at != 0 && record.expires_at < now {
+        return None; // stale — a newer heartbeat should exist
+    }
+    if record.issued_at > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+        return None; // publisher clock absurdly ahead (or a forged time)
+    }
+    Some(record)
+}
+
+/// Rank newest-first by SIGNED `issued_at` and keep one record per node id (its
+/// newest). Block height never enters the ranking.
+pub fn rank_and_dedupe(mut found: Vec<FoundRecord>) -> Vec<FoundRecord> {
+    found.sort_by(|a, b| {
+        b.record
+            .issued_at
+            .cmp(&a.record.issued_at)
+            .then_with(|| b.confirmed_height.cmp(&a.confirmed_height))
+    });
+    let mut seen_nodes: HashSet<String> = HashSet::new();
+    found.retain(|f| seen_nodes.insert(f.record.node_id.clone()));
+    found
+}
+
+/// Read every record under `hint` not yet examined by `cursor`. Follows gateway
+/// pages, reads spent coins, caps parent fetches, verifies and filters. The
+/// cursor advances only when the whole new range was examined, so a capped or
+/// failed poll re-reads what it skipped next time.
+pub async fn read_hint(
     client: &CoinsetClient,
     hint: Bytes32,
     room_key: &[u8; 32],
     now: u64,
-    target: Option<&str>,
-) -> Result<Option<ChiaPresenceRecord>> {
-    let resp = client
-        .get_coin_records_by_hint(hint, None, None, Some(true), None)
-        .await
-        .map_err(|e| anyhow!("get_coin_records_by_hint: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("hint lookup unsuccessful: {:?}", resp.error));
+    cursor: &mut HintCursor,
+) -> Result<Vec<FoundRecord>> {
+    let start = cursor.start_height();
+    let mut page: Option<String> = None;
+    let mut coins = Vec::new();
+    for _ in 0..MAX_PAGES_PER_POLL {
+        let resp = client
+            .get_coin_records_by_hint(hint, start, None, Some(true), page.clone())
+            .await
+            .map_err(|e| anyhow!("get_coin_records_by_hint: {e}"))?;
+        if !resp.success {
+            return Err(anyhow!("hint lookup unsuccessful: {:?}", resp.error));
+        }
+        coins.extend(resp.coin_records.unwrap_or_default());
+        match (resp.truncated, resp.next_cursor) {
+            (Some(true), Some(next)) => page = Some(next),
+            _ => break,
+        }
     }
-    let mut records = resp.coin_records.unwrap_or_default();
-    // Newest first — take the latest presence a member published.
-    records.sort_by_key(|r| std::cmp::Reverse(r.confirmed_block_index));
-    for rec in records {
-        let coin = rec.coin;
+    // Newest first, so a capped poll examines the freshest coins.
+    coins.sort_by_key(|r| std::cmp::Reverse(r.confirmed_block_index));
+    let max_height = coins.iter().map(|r| r.confirmed_block_index).max().unwrap_or(0);
+
+    let mut out = Vec::new();
+    let mut fetched = 0usize;
+    let mut capped = false;
+    for rec in coins {
+        let coin_id: [u8; 32] = rec.coin.coin_id().to_bytes();
+        if cursor.seen.contains(&coin_id) {
+            continue;
+        }
+        if fetched >= MAX_PARENT_FETCHES_PER_POLL {
+            capped = true;
+            break;
+        }
+        fetched += 1;
         // The memos live in the PARENT's spend (the create_coin that made this coin).
         let parent_spend =
-            match fetch_coin_spend(client, coin.parent_coin_info, rec.confirmed_block_index).await? {
+            match fetch_coin_spend(client, rec.coin.parent_coin_info, rec.confirmed_block_index).await? {
                 Some(cs) => cs,
-                None => continue,
+                None => {
+                    cursor.mark_seen(coin_id);
+                    continue;
+                }
             };
+        cursor.mark_seen(coin_id);
         let ciphertext = match extract_ciphertext(&parent_spend, hint)? {
             Some(ct) => ct,
             None => continue,
         };
-        // Decrypt with the room key, verify the self-signature, enforce freshness.
-        let blob = match chia_lane::open(room_key, &ciphertext) {
-            Ok(b) => b,
-            Err(_) => continue, // wrong room key / not for us
-        };
-        let record = match chia_lane::decode_signed(&blob) {
-            Ok(r) => r,
-            Err(_) => continue, // tampered / bad signature
-        };
-        // Introduction wants a SPECIFIC peer — skip other members' records.
-        if let Some(want) = target {
-            if record.node_id != want {
-                continue;
-            }
+        if let Some(record) = decode_blob(room_key, &ciphertext, now) {
+            out.push(FoundRecord {
+                record,
+                coin_id: Bytes32::new(coin_id),
+                confirmed_height: rec.confirmed_block_index,
+                hint,
+            });
         }
-        if record.expires_at != 0 && record.expires_at < now {
-            continue; // stale — a newer heartbeat should exist
-        }
-        return Ok(Some(record));
     }
-    Ok(None)
+    if !capped && max_height > cursor.last_height {
+        cursor.last_height = max_height;
+    }
+    Ok(out)
+}
+
+/// Every member's freshest record under `room_key` (P1 `resolve_all`): one
+/// full read of the three scan epochs, ranked and de-duplicated.
+pub async fn resolve_all(room_key: &[u8; 32]) -> Result<Vec<FoundRecord>> {
+    let now = unix_now();
+    let client = CoinsetClient::testnet11();
+    let mut all = Vec::new();
+    for e in scan_epochs(now) {
+        let hint = Bytes32::new(chia_lane::derive_hint(room_key, e));
+        let mut cursor = HintCursor::default();
+        all.extend(read_hint(&client, hint, room_key, now, &mut cursor).await?);
+    }
+    Ok(rank_and_dedupe(all))
+}
+
+/// The freshest record for a SPECIFIC peer (`target_node_id`, the iroh node-id
+/// hex) — the introduction lookup at dial-exhaustion (rung 6).
+pub async fn resolve_target(
+    room_key: &[u8; 32],
+    target_node_id: &str,
+) -> Result<Option<ChiaPresenceRecord>> {
+    Ok(resolve_all(room_key)
+        .await?
+        .into_iter()
+        .find(|f| f.record.node_id == target_node_id)
+        .map(|f| f.record))
+}
+
+/// The freshest record any member published under `room_key`.
+pub async fn resolve_by_room_key(room_key: &[u8; 32]) -> Result<Option<ChiaPresenceRecord>> {
+    Ok(resolve_all(room_key).await?.into_iter().next().map(|f| f.record))
+}
+
+/// The chain's current peak height from the gateway, or `None` when the call
+/// fails (the caller logs and keeps its last beat).
+pub async fn peak_height(client: &CoinsetClient) -> Option<u32> {
+    match client.get_blockchain_state().await {
+        Ok(resp) if resp.success => resp.blockchain_state.map(|s| s.peak.height),
+        Ok(resp) => {
+            eprintln!("⛓️ ChiaHub reader: get_blockchain_state unsuccessful: {:?}", resp.error);
+            None
+        }
+        Err(e) => {
+            eprintln!("⛓️ ChiaHub reader: get_blockchain_state failed: {e}");
+            None
+        }
+    }
+}
+
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub(crate) async fn fetch_coin_spend(
@@ -156,4 +307,100 @@ pub(crate) fn extract_ciphertext(coin_spend: &CoinSpend, hint: Bytes32) -> Resul
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sealed_record(room_key: &[u8; 32], sk: &iroh::SecretKey, issued_at: u64, expires_at: u64) -> Vec<u8> {
+        let record = ChiaPresenceRecord {
+            v: 1,
+            node_id: sk.public().to_string(),
+            addrs: vec!["[2001:db8::1]:4445".into(), "198.51.100.7:4444".into()],
+            relay_urls: vec![],
+            issued_at,
+            expires_at,
+        };
+        let blob = chia_lane::encode_signed(&record, sk).unwrap();
+        chia_lane::seal(room_key, &blob).unwrap()
+    }
+
+    fn found(node: &str, issued_at: u64, height: u32) -> FoundRecord {
+        FoundRecord {
+            record: ChiaPresenceRecord {
+                v: 1,
+                node_id: node.to_string(),
+                addrs: vec![],
+                relay_urls: vec![],
+                issued_at,
+                expires_at: 0,
+            },
+            coin_id: Bytes32::new([height as u8; 32]),
+            confirmed_height: height,
+            hint: Bytes32::new([1u8; 32]),
+        }
+    }
+
+    #[test]
+    fn scan_epochs_covers_next_current_previous() {
+        let now = 1_791_700_000; // 2026-10-11
+        let e = chia_lane::epoch_now(now);
+        assert_eq!(scan_epochs(now), [e + 1, e, e - 1]);
+        assert_eq!(scan_epochs(0), [1, 0, 0], "no underflow at genesis");
+    }
+
+    #[test]
+    fn cursor_resumes_below_last_height_and_bounds_seen_set() {
+        let mut c = HintCursor::default();
+        assert_eq!(c.start_height(), None, "first read scans the whole hint");
+        c.last_height = 10;
+        assert_eq!(c.start_height(), Some(0), "overlap saturates at genesis");
+        c.last_height = 5_000;
+        assert_eq!(c.start_height(), Some(5_000 - CURSOR_OVERLAP_BLOCKS));
+        for i in 0..(SEEN_CAP as u32 + 3) {
+            c.mark_seen([(i % 251) as u8, (i / 251) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        assert!(c.seen.len() <= SEEN_CAP, "seen set is bounded, got {}", c.seen.len());
+    }
+
+    #[test]
+    fn decode_blob_accepts_fresh_rejects_expired_future_and_foreign() {
+        let room = [42u8; 32];
+        let sk = iroh::SecretKey::generate();
+        let now = 1_791_700_000u64;
+        let fresh = sealed_record(&room, &sk, now - 60, now + 3600);
+        let rec = decode_blob(&room, &fresh, now).expect("fresh record decodes");
+        assert_eq!(rec.node_id, sk.public().to_string());
+        assert_eq!(rec.addrs.len(), 2);
+
+        let expired = sealed_record(&room, &sk, now - 7200, now - 1);
+        assert!(decode_blob(&room, &expired, now).is_none(), "expired record is dropped");
+
+        let never_expires = sealed_record(&room, &sk, now - 60, 0);
+        assert!(decode_blob(&room, &never_expires, now).is_some(), "expires_at == 0 means never (until P2 decides)");
+
+        let future = sealed_record(&room, &sk, now + MAX_FUTURE_SKEW_SECS + 1, now + MAX_FUTURE_SKEW_SECS + 3600);
+        assert!(decode_blob(&room, &future, now).is_none(), "a record from the far future is refused");
+
+        assert!(decode_blob(&[7u8; 32], &fresh, now).is_none(), "another room's key cannot open it");
+    }
+
+    #[test]
+    fn ranking_is_by_signed_time_not_height_and_one_per_node() {
+        // Replayed old ciphertext confirmed LATER (height 900) must lose to the
+        // record whose signed time is newer (height 100).
+        let ranked = rank_and_dedupe(vec![
+            found("alice", 1_000, 900),
+            found("alice", 2_000, 100),
+            found("bob", 1_500, 500),
+            found("bob", 1_500, 400),
+        ]);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].record.node_id, "alice");
+        assert_eq!(ranked[0].record.issued_at, 2_000);
+        assert_eq!(ranked[0].confirmed_height, 100);
+        assert_eq!(ranked[1].record.node_id, "bob");
+        assert_eq!(ranked[1].confirmed_height, 500, "equal times: the later-confirmed copy wins");
+    }
 }

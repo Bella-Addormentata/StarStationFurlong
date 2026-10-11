@@ -366,7 +366,9 @@ jobs:
         if: matrix.platform != 'macos-latest'
         shell: bash
         run: |
-          cargo build --release --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
+          # One node binary (#231 D3): chain reads are in the default build and
+          # publishing is compiled in too, behind the SSF_CHIA_LANE=1 runtime toggle.
+          cargo build --release --features chia-publish --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
           triple=$(rustc -vV | sed -n 's/^host: //p')
           mkdir -p "$RELEASE_FRONTEND/src-tauri/binaries"
           if [ -f "$RELEASE_FRONTEND/ssf-p2p-node/target/release/ssf-p2p-node.exe" ]; then
@@ -416,6 +418,9 @@ jobs:
   # (staged in step 4b above), so fresh installs need no separate download.
   # This standalone asset remains for headless/always-on node operators
   # (reachable members, future beacons) and for patching older installs.
+  # Since #231 D3 it is ONE binary: chain reads on by default, publishing
+  # compiled in behind SSF_CHIA_LANE=1 (the separate `ssf-p2p-node-chia.exe`
+  # opt-in asset is retired).
   # Independent job: if it fails, the installers above are unaffected.
   publish-p2p-node:
     needs: create-release
@@ -436,20 +441,17 @@ jobs:
         with:
           workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
 
-      - name: 🛰️ Build sovereign P2P node (release — default + chia-lane)
+      - name: 🛰️ Build sovereign P2P node (release — one binary, chia-read + chia-publish)
         shell: bash
         run: |
           NODE="$RELEASE_FRONTEND/ssf-p2p-node"
-          # Default node — the one bundled in installers and the standalone asset.
-          cargo build --release --manifest-path "$NODE/Cargo.toml"
+          # The one node binary (#231 D3): chain reads in the default feature set,
+          # publishing compiled in behind the SSF_CHIA_LANE=1 runtime toggle. CI is
+          # MSVC, so the Windows-GNU iroh-relay cdylib export-ordinal wall does NOT
+          # apply here and no special linker flag is needed (that flag is a
+          # local-GNU-only workaround).
+          cargo build --release --features chia-publish --manifest-path "$NODE/Cargo.toml"
           cp "$NODE/target/release/ssf-p2p-node.exe" ssf-p2p-node.exe
-          # Experimental ChiaHub introduction lane (opt-in test build). CI is MSVC,
-          # so the Windows-GNU iroh-relay cdylib export-ordinal wall does NOT apply
-          # here and no special linker flag is needed (that flag is a local-GNU-only
-          # workaround). Overwrites target/release/ssf-p2p-node.exe, so the default
-          # copy above must already be staged.
-          cargo build --release --features chia-lane --manifest-path "$NODE/Cargo.toml"
-          cp "$NODE/target/release/ssf-p2p-node.exe" ssf-p2p-node-chia.exe
           ls -la ssf-p2p-node*.exe
 
       - name: ⬆️ Upload node binaries to the shared draft release
@@ -458,11 +460,10 @@ jobs:
           script: |
             const fs = require('fs');
             const release_id = Number('${{ needs.create-release.outputs.release_id }}');
-            // Default keeps the exact name the app's exe-adjacent spawn probe looks
-            // for; the chia-lane build ships as a SEPARATE opt-in asset testers swap in.
+            // The exact name the app's exe-adjacent spawn probe looks for. One
+            // binary since #231 D3 (the separate chia asset is retired).
             const assets = [
               { file: 'ssf-p2p-node.exe', name: 'ssf-p2p-node.exe' },
-              { file: 'ssf-p2p-node-chia.exe', name: 'ssf-p2p-node-chia.exe' },
             ];
             for (const a of assets) {
               const data = fs.readFileSync(a.file);

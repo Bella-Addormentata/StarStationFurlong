@@ -23,6 +23,7 @@ import type {
   TransportMode,
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
+import { buildRoomCapPayload, readChiaMode } from './roomCap.ts';
 
 export interface NetworkDebugInfo {
   mode: TransportMode;
@@ -67,6 +68,8 @@ export class NetworkProvider implements NetworkProviderPort {
   #openChannels = 0;
   #connectedAt = 0;
   #boot: RoomBootstrap | null = null;
+  /** N8 probe: is this room public space? Installed by main.ts. */
+  #publicRoomProbe: ((roomId: string) => boolean) | null = null;
 
   async connect(boot: RoomBootstrap): Promise<void> {
     if (this.#isActive) {
@@ -134,16 +137,15 @@ export class NetworkProvider implements NetworkProviderPort {
       // 3. Start RTT Ping/Pong probe loop (Task 3.4 / v006 §3.8 Chrome fallback)
       this.#startPingProbe(wt);
 
-      // 4. ChiaHub Slice 3: hand our LOCAL node this room's key + per-room
-      // chia-mode flag over a one-shot `cap` stream, so it can derive the room's
-      // chia lookup hint and (later) publish/resolve presence. Loopback only; the
-      // node drops it entirely unless it was built with the chia-lane feature AND
-      // SSF_CHIA_LANE=1. The chia-mode flag is the "advanced chia mesh mode"
-      // toggle — sourced from localStorage until the management-computer UI sets it.
+      // 4. ChiaHub Slice 3: hand our LOCAL node this room's key + flags over a
+      // one-shot `cap` stream, so it can derive the room's chia lookup hint,
+      // read presence for it (on by default, #231 D3) and publish presence when
+      // armed. Loopback only. The chia-mode flag is the "advanced chia mesh
+      // mode" toggle — sourced from localStorage until the management-computer
+      // UI sets it; the public-room flag (N8) comes from the probe main.ts
+      // installs and is re-sent whenever the door policy changes.
       if (boot.roomKeyB64) {
-        let chiaMode = false;
-        try { chiaMode = localStorage.getItem(`ssf-chia-mode-${boot.roomId}`) === '1'; } catch { /* privacy mode */ }
-        void this.sendRoomCap(boot.roomId, boot.roomKeyB64, chiaMode);
+        void this.sendRoomCap(boot.roomId, boot.roomKeyB64, readChiaMode(boot.roomId));
       }
 
     } catch (err: any) {
@@ -225,13 +227,16 @@ export class NetworkProvider implements NetworkProviderPort {
    *  LOCAL node over a one-shot `cap` stream. The node needs the room key to
    *  derive the room's chia lookup hint and seal presence records; it holds the
    *  room's plaintext doc already, so this is loopback-only and exposes nothing
-   *  new. Fire-and-forget: the node silently drops it unless it was built with
-   *  the chia-lane feature and SSF_CHIA_LANE=1. Same `[u32-LE len][JSON]` framing
-   *  the node reads on every browser->node stream. */
+   *  new. Fire-and-forget. The payload also carries N8's `publicRoom` flag from
+   *  the installed probe (defaults to PUBLIC — fail closed — until main.ts
+   *  installs one). Same `[u32-LE len][JSON]` framing the node reads on every
+   *  browser->node stream. */
   async sendRoomCap(roomId: string, roomKeyB64: string, chiaMode: boolean): Promise<void> {
     if (!this.#wt || this.#mode === 'offline') return;
     try {
-      const payloadBytes = new TextEncoder().encode(JSON.stringify({ roomKeyB64, chiaMode }));
+      const publicRoom = this.#publicRoomProbe ? this.#publicRoomProbe(roomId) : true;
+      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom);
+      const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
       // Small payload (<128 B) — a single btoa is safe. Node decodes with
       // BASE64_STANDARD, which btoa produces.
       const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
@@ -256,6 +261,23 @@ export class NetworkProvider implements NetworkProviderPort {
     const boot = this.#boot;
     if (boot?.roomKeyB64) {
       await this.sendRoomCap(boot.roomId, boot.roomKeyB64, chiaMode);
+    }
+  }
+
+  /** N8: who decides whether a room is public space (bundled seed or PUBLIC
+   *  passage). main.ts installs it; until then every cap says PUBLIC, so a node
+   *  never publishes under a key the browser has not vouched for. */
+  setPublicRoomProbe(probe: (roomId: string) => boolean): void {
+    this.#publicRoomProbe = probe;
+  }
+
+  /** Re-send the current room's cap with its CURRENT flags — called when the
+   *  door policy changes, so a room flipping between public and private passage
+   *  reaches the node without a reconnect. */
+  async refreshRoomCap(): Promise<void> {
+    const boot = this.#boot;
+    if (boot?.roomKeyB64) {
+      await this.sendRoomCap(boot.roomId, boot.roomKeyB64, readChiaMode(boot.roomId));
     }
   }
 

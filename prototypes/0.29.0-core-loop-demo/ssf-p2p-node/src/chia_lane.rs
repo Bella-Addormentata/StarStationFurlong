@@ -1,25 +1,12 @@
-//! ChiaHub lane scaffold — C0/C1 groundwork per REVIEW-20260710-ChiaHub.md.
+//! ChiaHub lane — the chain-independent half: record types, canonical signing,
+//! room-key-derived encryption, epoch-rotated lookup hints and a startup
+//! self-test. All of it runs and is unit-tested without touching a network.
 //!
-//! What this module IS (0.18.0): the chain-independent half of the lane —
-//! record types, canonical signing, room-key-derived encryption + epoch-rotated
-//! lookup hints, and a startup self-test. All of it runs and is unit-tested
-//! without touching a network.
-//!
-//! What this module IS NOT yet: chain IO. Publishing (spend-to-self with
-//! `[hint, ciphertext]` memos) and resolving (lookup-by-hint) land in C1,
-//! AFTER spike B-7 verifies the exact chia-wallet-sdk API surface — no
-//! fabricated SDK calls ship here.
-//!
-//! [C0-VERIFY] items owned by B-7 (see ChiaHub review §9):
-//!   1. memo attachment on spend construction (exact API)
-//!   2. lookup-by-hint query surface (light-wallet vs full-node RPC)
-//!   3. dust threshold + minimum fee for reliable mempool acceptance
-//!   4. mempool subscription surface for the ~5s fast path
-//! [C1-DESIGN] room-key plumbing: the node currently never sees room KEYS
-//!   (only room ids — keys live in browser tickets). C1 must either pass
-//!   `roomKeyB64` node-ward in a `cap`-style envelope or manage room keys
-//!   node-side. Decide alongside the S2 challenge work, which has the same
-//!   need.
+//! The chain IO lives next door: `chia_resolve` (the generic hint reader, on by
+//! default since #231 D3), `chia_watch` (the P1 beat/hold watcher), `chia_rooms`
+//! (the per-room `cap` plumbing with the N8 public-room guard) and, behind the
+//! `chia-publish` feature, `chia_wallet` + `chia_publish` (spend-to-self with
+//! `[hint, ciphertext]` memos). Plan of record: issue #231 (phases P0–P10).
 
 use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -138,11 +125,10 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Startup self-test + status line. Proves the lane's crypto machinery on a
-/// throwaway key so `SSF_CHIA_LANE=1` users see exactly where the lane stands.
+/// throwaway key and says what THIS build does with the chain: reads are on by
+/// default (#231 D3, `SSF_CHIA_WATCH=0` turns the watcher off), publishing waits
+/// for `SSF_CHIA_LANE=1` and a build with the `chia-publish` feature.
 pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String]) {
-    if std::env::var("SSF_CHIA_LANE").ok().as_deref() != Some("1") {
-        return;
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -162,18 +148,25 @@ pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String]) {
         .and_then(|blob| decode_signed(&blob))
         .map(|round| round == record)
         .unwrap_or(false);
-    let hint = derive_hint(&test_room_key, epoch_now(now));
+    let reads = if !cfg!(feature = "chia-read") {
+        "not built"
+    } else if std::env::var("SSF_CHIA_WATCH").ok().as_deref() == Some("0") {
+        "rung-6 only (watcher off: SSF_CHIA_WATCH=0)"
+    } else {
+        "on (rung-6 resolve + beat watcher)"
+    };
+    let publish = if !cfg!(feature = "chia-publish") {
+        "not built"
+    } else if std::env::var("SSF_CHIA_LANE").ok().as_deref() == Some("1") {
+        "on (SSF_CHIA_LANE=1; testnet11, faucet TXCH)"
+    } else {
+        "off (set SSF_CHIA_LANE=1 to publish presence)"
+    };
     println!(
-        "⛓️ ChiaHub lane SCAFFOLD (C0): crypto self-test {} · sample epoch hint {} · chain IO lands in C1 after spike B-7 (testnet11 first — faucet TXCH, no real XCH needed)",
+        "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
         if ok { "PASSED" } else { "FAILED" },
-        hex::encode(&hint[..8]),
     );
 }
-// [C1-HOOK realized in Slice 5b] The dial-exhaustion resolve now lives in
-// `chia_resolve` (room-key-keyed, per the [C1-DESIGN] resolution: the node holds
-// the room key via Slice 3's `cap` lane, and filters resolved records by the
-// target node-id). `dial_peer_inner` calls `chia_resolve::resolve_target` and
-// feeds the public addrs into one more node-id-authenticated dial.
 
 #[cfg(test)]
 mod tests {

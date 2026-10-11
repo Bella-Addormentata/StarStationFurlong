@@ -13,6 +13,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
+import { roomIsPublicSpace } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
   packTick,
@@ -564,6 +565,34 @@ const mouse = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+
+/** 🔑 May a stranger walk into the CURRENT room? Decides whether its seed rides
+ *  in the shared atlas (stationAtlas) and, since #231 N8, whether the node may
+ *  publish an address under its key. An UN-MIGRATED room presents the four
+ *  cardinal defaults everywhere else, so treat it the same here rather than
+ *  making "never opened the door editor" mean "unreachable". A room that has
+ *  DECLARED an empty door set is a different thing: nobody can walk in, so
+ *  nobody should be handed its address either — that falls out of `some` over
+ *  an empty list, which is exactly the fail-closed answer. With no doc bound
+ *  yet the defaults read PUBLIC, which for N8 is the safe answer too. */
+function roomPassageIsPublic(): boolean {
+  const ids = [...readAllDoorLayout().keys()];
+  const doors = doorSetIsAuthoritative() ? ids : ["north", "south", "east", "west"];
+  return doors.some((d) => readDoorPolicy(d).passage === "public");
+}
+
+// ⛓️ N8 (#231): the node learns from us whether a room is PUBLIC SPACE — the
+// bundled welcome room, or a room anyone may walk into — and never publishes
+// an address under such a room's key (anyone can derive its hint). Until the
+// probe answers the node assumes public, so a wrong answer can only withhold
+// a publish. Re-stamped on every door-policy change (and on every room bind,
+// which also notifies) so a room flipping public/private reaches the node live.
+networkProvider.setPublicRoomProbe((roomId) =>
+  roomIsPublicSpace(roomId === DEFAULT_STATION.welcomeRoomId, roomPassageIsPublic()),
+);
+subscribeDoorPolicy(() => {
+  void networkProvider.refreshRoomCap();
+});
 // 🏒 #115: give the air-hockey session its outbound datagram seam. The
 // provider is a boot-time singleton and sendTick self-gates on connection
 // state (clean no-op offline), so one wiring here covers every room join.
@@ -2015,19 +2044,7 @@ async function joinRoomAtEpoch(
     // the default `public` for a cardinal the room does not even have — so the
     // predicate was ALWAYS TRUE and no room could be unlisted. Iterate the
     // doors the room actually has, and fail CLOSED when it has none public.
-    isPassagePublic: () => {
-      const ids = [...readAllDoorLayout().keys()];
-      // An UN-MIGRATED room presents the four cardinal defaults everywhere
-      // else, so treat it the same here rather than making "never opened the
-      // door editor" mean "unreachable". A room that has DECLARED an empty
-      // door set is a different thing: nobody can walk in, so nobody should be
-      // handed its address either — that falls out of `some` over an empty
-      // list, which is exactly the fail-closed answer.
-      const doors = doorSetIsAuthoritative()
-        ? ids
-        : ["north", "south", "east", "west"];
-      return doors.some((d) => readDoorPolicy(d).passage === "public");
-    },
+    isPassagePublic: roomPassageIsPublic,
   });
 
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
@@ -8620,7 +8637,7 @@ function setupNetworkDetailsPanel() {
       void networkProvider.resendRoomCap(on);
       if (feedback) {
         feedback.textContent = on
-          ? "Advanced Chia mesh mode ON for this room (experimental — needs a chia-lane node + funded testnet wallet; otherwise a harmless no-op)."
+          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once SSF_CHIA_LANE=1 and its testnet wallet is funded; chain reads are on for every node, and public rooms never publish)."
           : "Advanced Chia mesh mode OFF for this room.";
         setTimeout(() => {
           if (feedback) feedback.textContent = "";
