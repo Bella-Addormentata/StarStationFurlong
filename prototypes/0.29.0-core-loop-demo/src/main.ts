@@ -3,6 +3,7 @@
  * Main entry point — orthographic camera + hybrid WASD / point-and-click nav.
  */
 
+import { pickSettingsGear } from "./gearCardParts";
 import * as THREE from "three";
 import "./style.css";
 import { updateDebugHUD, showHint } from "./hud";
@@ -10221,6 +10222,8 @@ function onCanvasClick(event: MouseEvent): void {
     mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
     mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
     raycaster.setFromCamera(mouse, deviceFocus.getCamera() ?? focusRenderer.camera);
+    const gearItem = pickSettingsGear(focusRenderer.scene, raycaster);
+    if (gearItem && world.openSettingsCard(gearItem)) return;
     const slotControl = findSlotMachineControl(focusRenderer.scene);
     if (slotControl
       && world.handleSlotMachineControl(
@@ -10252,6 +10255,9 @@ function onCanvasClick(event: MouseEvent): void {
   mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
   raycaster.setFromCamera(mouse, camera);
+
+  const gearItem = pickSettingsGear(scene, raycaster);
+  if (gearItem && world.openSettingsCard(gearItem)) return;
 
   const slotControl = findSlotMachineControl(scene);
   if (slotControl

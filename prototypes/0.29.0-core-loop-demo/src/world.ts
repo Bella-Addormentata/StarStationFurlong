@@ -164,6 +164,7 @@ import {
   operateActiveSlotMachine,
   clearPendingSlotPlays,
   createCoinPusherUI,
+  coinPusherGearCard,
   createRobotDockUI,
   createCloneVatUI,
   createDeparturesBoardUI,
@@ -206,6 +207,7 @@ import {
   closeAirHockeyTable,
   createAirHockeyUI,
   registerAirHockeyVisual,
+  airHockeyGearCard,
 } from "./airHockeySession";
 // 🐊 #185: the insatiable-alligators live layer — the same hand-off as air
 // hockey's: built handles + frame time in, everything else in the session.
@@ -214,7 +216,9 @@ import {
   closeAlligatorsTable,
   createAlligatorsUI,
   registerAlligatorsVisual,
+  alligatorsGearCard,
 } from "./alligatorsSession";
+import { closeGearCard, toggleGearCard } from "./settingsGear";
 import { IA_SEATS } from "./games/alligators";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
@@ -3207,6 +3211,7 @@ export class World {
     // before any chip is drawn, so the traversal below can't reach them all.
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
+    closeGearCard(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.alligatorsVisuals.delete(itemId);
@@ -5970,6 +5975,19 @@ export class World {
     const operated = operateActiveSlotMachine(deviceId, control, value);
     if (operated && control === "pull") visual?.pullLever();
     return operated;
+  }
+
+  /** ⚙ A settings gear was clicked (settingsGear.ts): open or close that
+   *  item's card. False when the item has no gear card. */
+  public openSettingsCard(itemId: string): boolean {
+    const kind = FURNITURE.find((item) => item.id === itemId)?.kind;
+    const spec = kind === "air-hockey-table" ? airHockeyGearCard(itemId)
+      : kind === "alligators-table" ? alligatorsGearCard(itemId)
+      : kind === "coin-pusher" ? coinPusherGearCard(itemId, () => canEditRoom().ok)
+      : null;
+    if (!spec) return false;
+    toggleGearCard(spec);
+    return true;
   }
 
   private updateSeatedSlotSession(): void {
