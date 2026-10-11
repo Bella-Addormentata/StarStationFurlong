@@ -144,6 +144,21 @@ function padScript(seed: number) {
   };
 }
 
+/** Another cabinet on the page, whose screen nobody checks. */
+function addCabinet(page: Page, itemId: string): void {
+  page.mod.registerArcadeVisual(itemId, {
+    painter: {
+      drawFrame: () => undefined,
+      drawMenu: () => undefined,
+      drawCredits: () => undefined,
+      drawCard: () => undefined,
+      drawAttract: () => undefined,
+    },
+    present: () => undefined,
+    showAttract: () => undefined,
+  }, { x: 4, z: 0 });
+}
+
 /** Frames both pages painted, and how many of them disagree. */
 function compare(a: Page, b: Page, from = 0): { common: number; differ: number[] } {
   let common = 0;
@@ -450,6 +465,38 @@ describe('rooms and builds', () => {
     expect(a.games.readArcade(ITEM)?.hostPage).toBe(a.mod.arcadePage());
     expect(l.shared()).toMatchObject({ role: 'host', phase: 'playing' });
   }, 30_000);
+
+  it('two cabinets never share a match id, even when they claim one at once', async () => {
+    const [a, c] = await room(['a', null], ['c', null]);
+    addCabinet(a, 'arcade-2');
+    // Both games pick the same id before either is in the room doc.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const one = link(a, 0, 1);
+    const two = a.mod.linkArcade('arcade-2', 0, 1);
+    two.setUiScreen(false);
+    one.host(THWAITE);
+    two.host(THWAITE);
+    await run(100);
+    random.mockRestore();
+    const m1 = c.games.readArcade(ITEM)!;
+    const m2 = c.games.readArcade('arcade-2')!;
+    expect(m1.id).not.toBe(m2.id); // one of them moved
+
+    // A cabinet in another page's view of the room claimed this game's id
+    // at the same moment, and started first: this game moves to a new id.
+    c.games.writeArcade('arcade-3', { ...m1, host: 'someone', hostPage: 'their-page', startedAt: m1.startedAt - 1 });
+    const p1 = padScript(5);
+    await run(3000, () => one.setButtons(p1()));
+    const moved = c.games.readArcade(ITEM)!;
+    expect(moved.id).not.toBe(m1.id);
+    expect(moved.id).not.toBe(m2.id);
+    expect(c.games.readArcade('arcade-2')!.id).toBe(m2.id); // no clash there
+    // The watcher followed it to the new id, and shows the same game.
+    expect(c.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
+    const { common, differ } = compare(a, c);
+    expect(common).toBeGreaterThan(60);
+    expect(differ).toEqual([]);
+  }, 60_000);
 
   it("a game this build doesn't have clears the last game off the cabinet", async () => {
     const [a, c] = await room(['a', null], ['c', null]);

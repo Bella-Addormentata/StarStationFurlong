@@ -34,8 +34,10 @@ import {
   GuestPad, PadLog, PadRuns, decodeSnapshot, encodeSnapshot, frameAdd, frameDiff,
   packArcadeTick, unpackArcadeTick,
 } from './arcadeNet';
-import { newMatch, randomU16, withGuest, withoutGuest, type ArcadeMatch } from './games/arcade';
-import { readArcade, readArcadeSnapshot, writeArcade, writeArcadeSnapshot } from './games/gamesDoc';
+import {
+  freshMatchId, newMatch, randomU16, withGuest, withoutGuest, yieldsMatchId, type ArcadeMatch,
+} from './games/arcade';
+import { readArcade, readArcadeMatches, readArcadeSnapshot, writeArcade, writeArcadeSnapshot } from './games/gamesDoc';
 import { casinoDocEpoch } from './casinoDoc';
 import { getPlayerId } from './identity';
 import type { ArcadeCabinetVisualHandle } from './devices';
@@ -289,7 +291,11 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
       copy.rom = rom;
       copy.machine = machine;
       if (role === 'host' && copy.pending) {
-        // The reference copy is ready at frame 0: tell the room.
+        // The reference copy is ready at frame 0: tell the room, under an id
+        // no other cabinet took while the ROM loaded.
+        const taken = idsTakenBesides(itemId);
+        if (taken.has(copy.pending.id)) copy.pending = { ...copy.pending, id: freshMatchId(taken) };
+        copy.matchId = copy.pending.id;
         writeArcade(itemId, copy.pending);
         copy.pending = null;
         copy.started = true;
@@ -303,6 +309,21 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
 }
 
 const gameById = (id: string): ArcadeGame | undefined => ARCADE_GAMES.find((g) => g.id === id);
+
+/** The ids the room's other cabinets' matches hold. */
+function idsTakenBesides(itemId: string): Set<number> {
+  const taken = new Set<number>();
+  for (const [cabinet, m] of readArcadeMatches()) if (cabinet !== itemId) taken.add(m.id);
+  return taken;
+}
+
+/** Did another cabinet claim this match's id at the same moment, and keep it? */
+function mustYieldId(itemId: string, m: ArcadeMatch): boolean {
+  for (const [cabinet, other] of readArcadeMatches()) {
+    if (yieldsMatchId({ cabinet: itemId, match: m }, { cabinet, match: other })) return true;
+  }
+  return false;
+}
 
 /** Is the match's host still there, as far as this page can tell? */
 function hostSilentFor(s: CabinetSession, copy: Copy | null, now: number): number {
@@ -374,6 +395,9 @@ export function routeArcadeTick(senderId: string, bytes: Uint8Array): void {
   if (t.type === 'frames') {
     if (copy.role === 'host') return; // an echo, or someone else's claim
     // One host lane at a time; a new one takes over once the old falls silent.
+    // This keeps a stale tab from fighting the host; it is not a security
+    // boundary. Lane ids aren't signed across the mesh and anyone in the
+    // room can rewrite the match record, as with every table game's ticks.
     if (copy.hostLane && copy.hostLane !== senderId && now - copy.lastFramesAt < HOST_SILENT_MS) return;
     copy.hostLane = senderId;
     copy.lastFramesAt = now;
@@ -464,6 +488,13 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   if (!machine || !copy.started) return;
   let m = readArcade(itemId);
   if (!m || m.id !== copy.matchId) return; // reconcile has it next update
+  if (mustYieldId(itemId, m)) {
+    // Ticks carry only the id: move to a fresh one. Copies that followed
+    // the old id start over (from a save state if they missed the start).
+    m = { ...m, id: freshMatchId(idsTakenBesides(itemId)) };
+    writeArcade(itemId, m);
+    copy.matchId = m.id;
+  }
   seatGuest(copy, m, now);
   if (m.guestPage && now - copy.lastGuestAt > GUEST_GONE_MS) {
     m = withoutGuest(m, m.guestPage);
@@ -768,7 +799,9 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       if (!s) return;
       const hostSeat: 0 | 1 = seats === 2 ? seat : 0;
       const copy = newCopy(s, itemId, 0, game, 'host');
-      const match = newMatch({ game: game.id, host: getPlayerId(), hostPage: PAGE, hostSeat, now: Date.now() });
+      const match = newMatch({
+        game: game.id, host: getPlayerId(), hostPage: PAGE, hostSeat, now: Date.now(), taken: idsTakenBesides(itemId),
+      });
       copy.matchId = match.id;
       copy.pending = match;
       link.error = null;

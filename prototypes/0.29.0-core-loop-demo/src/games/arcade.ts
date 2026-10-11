@@ -81,17 +81,46 @@ export function randomU16(random: () => number = Math.random): number {
   return 1 + Math.floor(random() * 0xffff);
 }
 
+/**
+ * A match id no other cabinet's match in the room holds. Ticks carry only
+ * the id, so two live matches sharing one would feed each other's pads.
+ */
+export function freshMatchId(taken: ReadonlySet<number>, random: () => number = Math.random): number {
+  const start = randomU16(random);
+  for (let i = 0; i < 0xffff; i++) {
+    const id = ((start - 1 + i) % 0xffff) + 1;
+    if (!taken.has(id)) return id;
+  }
+  return start; // every id taken: a room can't hold that many cabinets
+}
+
+/**
+ * Two cabinets claimed the same id at once (neither had seen the other's
+ * record): the later claim, by start time and then cabinet id, takes a new
+ * one. Every page agrees on which, so exactly one host moves.
+ */
+export function yieldsMatchId(
+  mine: { cabinet: string; match: ArcadeMatch },
+  other: { cabinet: string; match: ArcadeMatch },
+): boolean {
+  if (mine.match.id !== other.match.id || mine.cabinet === other.cabinet) return false;
+  if (mine.match.startedAt !== other.match.startedAt) return mine.match.startedAt > other.match.startedAt;
+  return mine.cabinet > other.cabinet;
+}
+
 export function newMatch(args: {
   game: string;
   host: string;
   hostPage: string;
   hostSeat: 0 | 1;
   now: number;
+  /** Ids the room's other matches hold. */
+  taken?: ReadonlySet<number>;
   random?: () => number;
 }): ArcadeMatch {
   return {
     kind: 'arcade',
-    id: randomU16(args.random),
+    id: freshMatchId(args.taken ?? new Set(), args.random),
     game: args.game,
     host: args.host,
     hostPage: args.hostPage,

@@ -143,6 +143,15 @@ export function readArcade(cabinetId: string): ArcadeMatch | null {
   return isArcadeMatch(value) ? value : null;
 }
 
+/** 🕹️ Every cabinet's shared game in the room, by cabinet id. */
+export function readArcadeMatches(): Map<string, ArcadeMatch> {
+  const out = new Map<string, ArcadeMatch>();
+  ensureMap().forEach((value, key) => {
+    if (isArcadeMatch(value)) out.set(key, value);
+  });
+  return out;
+}
+
 /** 🕹️ Start, change or (null) end a cabinet's shared game. Ending also
  *  drops its save state, which is no use to anyone after the match. */
 export function writeArcade(cabinetId: string, match: ArcadeMatch | null): void {

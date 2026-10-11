@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { isArcadeMatch, newMatch, withGuest, withoutGuest } from './arcade';
+import { freshMatchId, isArcadeMatch, newMatch, withGuest, withoutGuest, yieldsMatchId } from './arcade';
 
 const match = () => newMatch({ game: 'thwaite', host: 'p1', hostPage: 'page-1', hostSeat: 0, now: 1, random: () => 0.5 });
 
@@ -29,5 +29,31 @@ describe('arcade match', () => {
     expect(isArcadeMatch({ ...m, guestToken: 7 })).toBe(false); // a token with nobody behind it
     expect(isArcadeMatch({ ...seated, guestToken: 0 })).toBe(false);
     expect(isArcadeMatch({ ...seated, guest: null })).toBe(false);
+  });
+
+  it("picks an id no other cabinet's match holds", () => {
+    const half = () => 0.5;
+    const id = freshMatchId(new Set(), half);
+    expect(freshMatchId(new Set([id]), half)).toBe(id + 1);
+    expect(freshMatchId(new Set([id, id + 1]), half)).toBe(id + 2);
+    // From the top it wraps to 1, never 0.
+    expect(freshMatchId(new Set([0xffff]), () => 0.99999999)).toBe(1);
+    expect(newMatch({ game: 'g', host: 'h', hostPage: 'p', hostSeat: 0, now: 1, taken: new Set([id]), random: half }).id)
+      .toBe(id + 1);
+  });
+
+  it('of two cabinets that claimed one id at once, exactly the later claim moves', () => {
+    const early = { cabinet: 'b', match: { ...match(), startedAt: 1 } };
+    const late = { cabinet: 'a', match: { ...match(), startedAt: 2 } };
+    expect(yieldsMatchId(late, early)).toBe(true);
+    expect(yieldsMatchId(early, late)).toBe(false);
+    // Started together: the larger cabinet id moves.
+    const x = { cabinet: 'x', match: match() };
+    const y = { cabinet: 'y', match: match() };
+    expect(yieldsMatchId(y, x)).toBe(true);
+    expect(yieldsMatchId(x, y)).toBe(false);
+    // Different ids, or the same cabinet: nothing to do.
+    expect(yieldsMatchId(late, { cabinet: 'b', match: { ...early.match, id: early.match.id + 1 } })).toBe(false);
+    expect(yieldsMatchId(late, { cabinet: 'a', match: early.match })).toBe(false);
   });
 });
