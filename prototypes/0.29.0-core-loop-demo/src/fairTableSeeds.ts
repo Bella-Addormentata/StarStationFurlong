@@ -40,7 +40,6 @@ import {
   casinoDocEpoch,
   readAllBets,
   readAllCrapsBets,
-  readAllSeedRecords,
   readCrapsFairnessPref,
   readMyBets,
   readMyCrapsBets,
@@ -248,11 +247,12 @@ export function freezeCommits(
   if (!s.houseCommit) return {};
   const staked = stakedPlayers(tableId, game, s.round);
   const commits: Record<string, string> = {};
-  const recs = readAllSeedRecords(tableId);
-  for (const pid of Object.keys(recs).sort()) {
-    const r = recs[pid];
+  // Read only the staked players' records: anyone can add fseed keys, so a
+  // scan of every key on the table would let a peer stall the close.
+  for (const pid of [...staked].sort()) {
     if (Object.keys(commits).length >= MAX_BETTOR_PARTIES) break;
-    if (staked.has(pid) && r.round === s.round && r.house === s.houseCommit) commits[pid] = r.commit;
+    const r = readSeedRecord(tableId, pid);
+    if (r && r.round === s.round && r.house === s.houseCommit) commits[pid] = r.commit;
   }
   // Staked but no seed (offline with standing bets, too quick a close, or
   // past the cap — a table's stands keep it far below 15): on the record, so

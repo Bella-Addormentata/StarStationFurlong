@@ -30,7 +30,7 @@
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readAllSeedRecords, readChips,
+  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
@@ -1082,8 +1082,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const forEpoch = casinoDocEpoch();
     // Everything the verdict reads goes in the key: a late reveal landing in a
     // forfeited party's seed record can change "a revealed seed was left out".
-    const all = readAllSeedRecords(itemId);
-    const records = Object.keys(s.commits ?? {}).sort().map((pid) => all[pid] ?? null);
+    const records = Object.keys(s.commits ?? {}).sort().map((pid) => readSeedRecord(itemId, pid));
     const inFlight = JSON.stringify([
       forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null, s.unseeded ?? null, records,
     ]);
@@ -1109,13 +1108,17 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           if (r.droppedReveal) parts.push('✗ A REVEALED SEED WAS LEFT OUT');
           // Your own part is the check that matters most to you: with your
           // seed in, nobody could have steered the result against you.
+          // A page that only saw the round after it settled can't tell
+          // whether the operator dropped a party from both the frozen set
+          // and the transcript: checkable maths, unwitnessed party set.
+          if (!r.watchedClose) parts.push('⚠ PARTY SET NOT WITNESSED (OPENED AFTER BETS CLOSED)');
           if (r.mine === 'in') parts.push('✓ YOUR SEED IS IN');
           if (r.mine === 'left-out') parts.push('✗ YOUR SEED WAS LEFT OUT');
           if (r.mine === 'replaced') parts.push('✗ YOUR SEED WAS SWAPPED FOR ONE YOU DID NOT MAKE');
           const bad = r.droppedReveal || r.mine === 'left-out' || r.mine === 'replaced';
           return {
             text: parts.join(' · '),
-            color: bad ? '#FF8A80' : r.houseMissing || houseOnly || u > 0 ? '#F5C26B' : '#7CF5B0',
+            color: bad ? '#FF8A80' : r.houseMissing || houseOnly || u > 0 || !r.watchedClose ? '#F5C26B' : '#7CF5B0',
           };
         })
         : verifyTranscript(fx, itemId, forRound, cs?.dice ?? [0, 0]).then((ok) => ({

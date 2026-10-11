@@ -554,19 +554,6 @@ export function readSeedRecord(tableId: string, playerId: string): TableSeedReco
   return isTableSeedRecord(v) ? v : null;
 }
 
-/** Every bettor's seed record on a table, by player id. */
-export function readAllSeedRecords(tableId: string): Record<string, TableSeedRecord> {
-  const prefix = `fseed:${tableId}:`;
-  const out: Record<string, TableSeedRecord> = {};
-  for (const [key, value] of ensureMap().entries()) {
-    if (!key.startsWith(prefix) || !isTableSeedRecord(value)) continue;
-    const pid = key.slice(prefix.length);
-    if (pid.length === 0 || pid.length > 128) continue;
-    out[pid] = value;
-  }
-  return out;
-}
-
 export function writeMySeedRecord(tableId: string, playerId: string, rec: TableSeedRecord): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
