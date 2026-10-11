@@ -37,6 +37,7 @@ import {
   isMyTurn,
   pruneSelection,
   seatOf,
+  standIndexFor,
   startBot,
   statusLine,
 } from './games/checkersTable';
@@ -62,6 +63,12 @@ export interface CheckersTableLayer {
 export interface CheckersTableDeps {
   itemId: string;
   top: GameTableTopHandle | null;
+  /** Which end this focus looks from (furniture.ts gameTableStands index:
+   *  0 = −z, red's end; 1 = +z, black's end). */
+  end?: 0 | 1;
+  /** Called when the local player takes the side whose end is NOT `end`,
+   *  so World can walk them round and look from their own side. */
+  onSeatTaken?: () => void;
 }
 
 const GOLD = '#d4a84b';
@@ -92,6 +99,18 @@ export function createCheckersTableLayer(deps: CheckersTableDeps): CheckersTable
   const ndc = new THREE.Vector2();
 
   const state = (): CheckersState | null => readGame(deps.itemId);
+
+  /** Write a transition; when it seats me at the other end, hand off to
+   *  World to walk me round (my own pieces nearest, #227). */
+  const commit = (next: CheckersState): void => {
+    const before = state();
+    writeGame(deps.itemId, next);
+    const seat = seatOf(next, myId);
+    if (seat && (!before || seatOf(before, myId) !== seat)
+      && deps.end !== undefined && standIndexFor(seat) !== deps.end) {
+      deps.onSeatTaken?.();
+    }
+  };
   const mayEdit = (): boolean => canEditRoom().ok;
   const canReset = (): boolean => canResetTable(state(), myId, mayEdit());
 
@@ -164,7 +183,7 @@ export function createCheckersTableLayer(deps: CheckersTableDeps): CheckersTable
         ${live && seat ? button('forfeit', 'FORFEIT', true, 'Concede the game') : ''}
         ${button('flip', '⟲ FLIP TABLE', !!deps.top && !flipping, 'Turn the top over to the card felt')}
         ${button('reset', 'RESET TABLE', resetOk,
-          resetOk ? 'Clear the table back to the game menu' : 'Players at the table or the room owner can reset a live game')}
+          resetOk ? 'Clear the table back to the game menu' : 'Players at the table or anyone who can edit this room can reset a live game')}
       </div>`;
   };
 
@@ -176,7 +195,7 @@ export function createCheckersTableLayer(deps: CheckersTableDeps): CheckersTable
       const next = !s ? null : what === 'bot' ? startBot(s, myId) : forfeit(s, myId);
       settingsOpen = false;
       if (next) {
-        writeGame(deps.itemId, next); // observer renders
+        commit(next); // observer renders
         return;
       }
     } else if (what === 'flip') {
@@ -234,7 +253,7 @@ export function createCheckersTableLayer(deps: CheckersTableDeps): CheckersTable
     }
     const result = clickCell(state(), myId, selected, cell);
     selected = result.selected;
-    if (result.write) writeGame(deps.itemId, result.write); // observer renders
+    if (result.write) commit(result.write); // observer renders
     else render();
   };
 

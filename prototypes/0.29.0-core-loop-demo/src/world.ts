@@ -5200,6 +5200,26 @@ export class World {
     if (slots.length === 0) return null;
     const others = this.getRemoteAvatarSnapshots();
     const me = this.player.getPosition();
+    const reachable = this.standReachability();
+    const free = slots.filter(
+      (s) =>
+        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
+        reachable(s),
+    );
+    if (free.length === 0) return null;
+    free.sort(
+      (a, b) =>
+        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
+        Math.hypot(b.front.x - me.x, b.front.z - me.z),
+    );
+    return free[0];
+  }
+
+  /** "Can the player walk to this stand?" — A* from the player's cell (snapped
+   *  to solid ground first), or already standing at it. Shared by
+   *  pickFreeStand and the 🎲 #227 own-end pick at a checkers table. */
+  private standReachability(): (s: StandSlot) => boolean {
+    const me = this.player.getPosition();
     let mr = worldToRow(me.z);
     let mc = worldToCol(me.x);
     // The player can be standing ON a non-walkable cell (the clone-vat spawn
@@ -5219,21 +5239,9 @@ export class World {
         }
       }
     }
-    const reachable = (s: StandSlot) =>
+    return (s: StandSlot) =>
       Math.hypot(s.front.x - me.x, s.front.z - me.z) < 0.6 ||
       findPath(mr, mc, worldToRow(s.front.z), worldToCol(s.front.x)).length > 0;
-    const free = slots.filter(
-      (s) =>
-        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
-        reachable(s),
-    );
-    if (free.length === 0) return null;
-    free.sort(
-      (a, b) =>
-        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
-        Math.hypot(b.front.x - me.x, b.front.z - me.z),
-    );
-    return free[0];
   }
 
   /**
@@ -6028,24 +6036,33 @@ export class World {
       // #45 v1: flippable surface + doc-synced games. The flip is a UI
       // affordance (button), not focus choreography — no prepare hook; the
       // top handle simply rides along so FLIP can drive the tween.
-      const top = this.gameTableTops.get(deviceId) ?? null;
-      const ui = createGameTableUI({
-        itemId: deviceId,
-        top,
-        // 🎲 #227: checkers is played on the 3D table itself.
-        checkers: createCheckersTableLayer({ itemId: deviceId, top }),
-      });
       // 🎰 #76: walk to an open STANDING position at the table, then the UI
       // opens. 🎲 #227: a seated checkers player goes to their OWN end and
-      // looks from it (stand s0 = red at −z, s1 = black at +z); everyone
-      // else takes the nearest open end, and the camera follows that end.
+      // looks from it (stand s0 = red at −z, s1 = black at +z) when it can
+      // be walked to; everyone else takes the nearest open end, and the
+      // camera follows that end.
       const game = readGame(deviceId);
       const mine = game ? seatOf(game, getPlayerId()) : null;
       const ownEnd = mine
         ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${standIndexFor(mine)}`)
         : undefined;
-      const stand = ownEnd ?? this.pickFreeStand(deviceId);
+      const stand =
+        (ownEnd && this.standReachability()(ownEnd) ? ownEnd : null) ??
+        this.pickFreeStand(deviceId);
       const farEnd = stand ? stand.id.endsWith(":s1") : false;
+      const top = this.gameTableTops.get(deviceId) ?? null;
+      const ui = createGameTableUI({
+        itemId: deviceId,
+        top,
+        // 🎲 #227: checkers is played on the 3D table itself. Taking a side
+        // from the other end walks the player round to their own end.
+        checkers: createCheckersTableLayer({
+          itemId: deviceId,
+          top,
+          end: farEnd ? 1 : 0,
+          onSeatTaken: () => deviceFocus.releaseThen(() => this.requestDeviceFocus(deviceId)),
+        }),
+      });
       // The def bakes the −z eye; the +z end's is its point reflection
       // through the board centre (air hockey's mirrored-end rule).
       const eye = farEnd
