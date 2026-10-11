@@ -573,6 +573,23 @@ describe('rooms and builds', () => {
     expect(differ).toEqual([]);
   }, 60_000);
 
+  it('a watcher who walks in as an old match wraps to frame 0 asks for a save state, not power-on', async () => {
+    const [a] = await room(['a', null]);
+    await startGame(a, 0, 1);
+    // As if this match began 20 minutes ago: its frame 0 now is the u16
+    // clock wrapping (65536 frames), not its first frame.
+    const m = a.games.readArcade(ITEM)!;
+    a.games.writeArcade(ITEM, { ...m, startedAt: m.startedAt - 20 * 60_000 });
+    await run(300);
+    const c = await openPage('c');
+    await run(3000);
+    expect(ticksOf(c, 'sync').length).toBeGreaterThan(0);
+    expect(c.mod.arcadeCopyInfo(ITEM)?.started).toBe(true); // from the save state
+    const { common, differ } = compare(a, c);
+    expect(common).toBeGreaterThan(60);
+    expect(differ).toEqual([]);
+  }, 60_000);
+
   it("a game this build doesn't have clears the last game off the cabinet", async () => {
     const [a, c] = await room(['a', null], ['c', null]);
     await startGame(a, 0, 1);
