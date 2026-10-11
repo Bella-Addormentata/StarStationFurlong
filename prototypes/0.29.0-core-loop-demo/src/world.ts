@@ -5955,12 +5955,6 @@ export class World {
   }
 
   /**
-   * Route a device click into the walk-to + first-person focus sequence
-   * (#33 D0/M1 — mirrors requestDoorWalkthrough): find the DeviceTarget,
-   * build the kind-appropriate focused UI, and hand both to the
-   * DeviceFocusController, which wires its hooks into navigateToDevice.
-   */
-  /**
    * 🕹️⚙️ A ⚙️ on an arcade cabinet's kick panel: the cabinet's card over the
    * room view, for anyone. It is read-only unless they can edit the room.
    */
@@ -6063,6 +6057,12 @@ export class World {
     this.onFirstPersonSeat?.(this.player.getSeatedFacing());
   }
 
+  /**
+   * Route a device click into the walk-to + first-person focus sequence
+   * (#33 D0/M1 — mirrors requestDoorWalkthrough): find the DeviceTarget,
+   * build the kind-appropriate focused UI, and hand both to the
+   * DeviceFocusController, which wires its hooks into navigateToDevice.
+   */
   public requestDeviceFocus(deviceId: string): void {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;

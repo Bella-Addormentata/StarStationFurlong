@@ -16,6 +16,7 @@ import {
   readArcade, readArcadeSettings, readPlayerDisplayName, subscribeGames, writeArcade, writeArcadeSettings,
 } from './games/gamesDoc';
 import { getPlayerId } from './identity';
+import { isFormFieldTarget } from './typingFocus';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -215,6 +216,7 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
     open = false;
     unsubscribe();
     clearInterval(refresh);
+    window.removeEventListener('keydown', onEsc, { capture: true });
     el.remove();
     deps.onClose?.();
   };
@@ -228,16 +230,20 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
     notice = cardAction(deps.itemId, act, deps.isOwner());
     render();
   });
-  el.addEventListener('keydown', (e) => {
-    // Keys stay with the card: Tab moves between its buttons (the room's
-    // Tab would open the phone instead), and Esc closes the card, not the
-    // cabinet or the room view behind it.
-    e.stopPropagation();
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      close();
-    }
-  });
+  // Keys stay with the card: Tab moves between its buttons (the room's Tab
+  // would open the phone instead).
+  el.addEventListener('keydown', (e) => e.stopPropagation());
+  // Esc closes the card, not the cabinet or the room view behind it, wherever
+  // focus went (Tab past its last button, or a RESET that re-rendered
+  // disabled): a capture listener on window runs before theirs and stops
+  // them. A text field (the chat, a room-name edit) keeps its own Esc.
+  const onEsc = (e: KeyboardEvent): void => {
+    if (e.key !== 'Escape' || isFormFieldTarget(e.target as HTMLElement | null)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    close();
+  };
+  window.addEventListener('keydown', onEsc, { capture: true });
   // Keep presses on the card from walking the player or releasing a focus.
   for (const ev of ['mousedown', 'mouseup', 'pointerdown', 'pointerup'] as const) {
     el.addEventListener(ev, (e) => e.stopPropagation());
@@ -253,7 +259,7 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
   const refresh = setInterval(render, CARD_REFRESH_MS);
   host.appendChild(el);
   render();
-  // Into the dialog: its Esc closes it, and a screen reader follows focus.
+  // Into the dialog: Tab walks its buttons, and a screen reader follows focus.
   el.querySelector<HTMLElement>('button')?.focus();
   return { itemId: deps.itemId, el, close };
 }

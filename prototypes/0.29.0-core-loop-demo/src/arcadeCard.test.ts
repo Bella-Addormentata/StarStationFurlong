@@ -193,7 +193,20 @@ describe('the dialog', () => {
   };
   const press = (el: Fake, act: string) => fire(el, 'click', { target: { closest: () => ({ dataset: { act } }) } });
 
-  beforeEach(() => vi.stubGlobal('document', { createElement: fake }));
+  /** An Esc pressed with focus on `target` (the page's body unless given). */
+  const esc = (target?: { tagName: string }): Event => {
+    const e = new Event('keydown', { cancelable: true });
+    Object.defineProperty(e, 'key', { value: 'Escape' });
+    if (target) Object.defineProperty(e, 'target', { value: target });
+    return e;
+  };
+
+  let win: EventTarget;
+  beforeEach(() => {
+    win = new EventTarget();
+    vi.stubGlobal('window', win);
+    vi.stubGlobal('document', { createElement: fake });
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
     delete (globalThis as { __ssfRoomId?: string }).__ssfRoomId;
@@ -245,7 +258,7 @@ describe('the dialog', () => {
       const card = openArcadeCard(fake() as unknown as HTMLElement, { itemId: ITEM, seats: 1, isOwner: () => false, onClose }, 'absolute');
       const el = card.el as unknown as Fake;
       if (how === 'x') press(el, 'close');
-      else fire(el, 'keydown', { key: 'Escape' });
+      else win.dispatchEvent(esc());
       expect(el.removed).toBe(true);
       expect(onClose).toHaveBeenCalledTimes(1);
       const before = el.innerHTML;
@@ -253,6 +266,36 @@ describe('the dialog', () => {
       expect(el.innerHTML).toBe(before);
       writeArcade(ITEM, null);
     }
+  });
+
+  it('Esc closes it wherever focus went, before the cabinet or the room sees the key', () => {
+    const card = openArcadeCard(fake() as unknown as HTMLElement, { itemId: ITEM, seats: 1, isOwner: () => true }, 'fixed');
+    // The cabinet's or the room view's own Esc, on window too. Node's
+    // EventTarget has no capture phase and runs listeners in the order they
+    // were added, so this one goes in after the card's.
+    const behind = vi.fn();
+    win.addEventListener('keydown', behind);
+    const el = card.el as unknown as Fake;
+
+    // Typing in the chat: that field keeps its Esc.
+    const typing = esc({ tagName: 'INPUT' });
+    win.dispatchEvent(typing);
+    expect(el.removed).toBe(false);
+    expect(behind).toHaveBeenCalledTimes(1);
+
+    // Focus fell to the page (Tab past the last button, or a RESET that
+    // re-rendered disabled): Esc still closes the card, and only the card.
+    const first = esc();
+    win.dispatchEvent(first);
+    expect(el.removed).toBe(true);
+    expect(first.defaultPrevented).toBe(true);
+    expect(behind).toHaveBeenCalledTimes(1);
+
+    // Closed: the next Esc is the cabinet's again.
+    const next = esc();
+    win.dispatchEvent(next);
+    expect(next.defaultPrevented).toBe(false);
+    expect(behind).toHaveBeenCalledTimes(2);
   });
 
   it('keeps every key, Tab included, so Tab walks its buttons instead of opening the phone', () => {
