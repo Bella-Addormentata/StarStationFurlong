@@ -81,8 +81,18 @@ import {
   bridgeDeckY,
   floorCutOutlines,
   isFloorCutKind,
+  rotXZ,
+  type Rot,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
+// 🎲🎡 #226: craps + roulette play on the 3D table — the frame driver, the
+// focused-table controls, and the pieces' handle type.
+import {
+  casinoTablesFrame,
+  createCasinoTableUI,
+  forgetCasinoTable,
+} from "./casinoTableSession";
+import type { CasinoTableVisualHandle } from "./casinoTable3d";
 import { northDoorUnlocked } from "./stationParts";
 import { rebuildObstacles } from "./obstacles";
 import {
@@ -149,8 +159,6 @@ import {
   createGameTableUI,
   createHelmUI,
   createCashierUI,
-  createRouletteUI,
-  createCrapsUI,
   createSlotMachineUI,
   operateActiveSlotMachine,
   clearPendingSlotPlays,
@@ -493,6 +501,9 @@ export class World {
   /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — filed
    *  here, then handed to the session layer, which drives them. */
   private alligatorsVisuals: Map<string, AlligatorsVisualHandle> = new Map();
+  /** 🎲🎡 #226: craps / roulette table pieces, keyed by item id — driven every
+   *  frame by casinoTablesFrame. */
+  private casinoTableVisuals: Map<string, CasinoTableVisualHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -1768,6 +1779,7 @@ export class World {
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
       alligatorsVisuals: this.alligatorsVisuals,
+      casinoTableVisuals: this.casinoTableVisuals,
     };
   }
 
@@ -3195,6 +3207,8 @@ export class World {
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.alligatorsVisuals.delete(itemId);
+    this.casinoTableVisuals.delete(itemId);
+    forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3964,6 +3978,9 @@ export class World {
     // 🐊 #185: and every alligators table — operator ball sim, bites → doc
     // writes, head/ball tick sends, remote smoothing, heads/birds/displays.
     alligatorsFrame(deltaTime);
+    // 🎲🎡 #226: lay every craps / roulette table's synced state onto its 3D
+    // pieces (chips, dice, pucks, wheel) — for every client, focused or not.
+    casinoTablesFrame(deltaTime, this.casinoTableVisuals);
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -6116,23 +6133,69 @@ export class World {
       return;
     }
 
-    if (device.kind === "cashier" || device.kind === "roulette" || device.kind === "craps") {
-      // 🎰 #69 G1/G2/G3: the HOUSE side (cashier book, croupier spin, stickman
-      // throw) rides the same owner-equivalent seam as room editing —
-      // canEditRoom funnels main.ts's isLocalPlayerRoomOwner, so a venture-owned
-      // room makes every shareholder the house (the #68 V1 rule, applied to the
-      // casino).
-      const isHouse = () => canEditRoom().ok;
-      const ui =
-        device.kind === "cashier"
-          ? createCashierUI({ isHouse })
-          : device.kind === "craps"
-          ? createCrapsUI({ itemId: deviceId, isHouse })
-          : createRouletteUI({ itemId: deviceId, isHouse });
-      // 🎰 #76: the game tables gather players at their open standing slots (the
-      // cashier is not a table — it keeps its single front).
-      const target =
-        device.kind === "cashier" ? device : this.standTarget(device);
+    if (device.kind === "cashier") {
+      // 🎰 #69 G1: the HOUSE side (the cage book) rides the same owner-
+      // equivalent seam as room editing — canEditRoom funnels main.ts's
+      // isLocalPlayerRoomOwner, so a venture-owned room makes every
+      // shareholder the house (the #68 V1 rule, applied to the casino).
+      deviceFocus.beginFocus(this.player, device, createCashierUI({ isHouse: () => canEditRoom().ok }));
+      return;
+    }
+
+    if (device.kind === "roulette" || device.kind === "craps") {
+      // 🎲🎡 #226: no popup — the player plays on the 3D table from an open
+      // standing slot (#76). The camera stands behind THAT slot looking over
+      // the felt, so the rail in front of them (their chips) sits at the
+      // bottom of the view; the house side (settings, manual roll/spin) rides
+      // canEditRoom like every casino device.
+      const stand = this.pickFreeStand(deviceId);
+      const item = FURNITURE.find((i) => i.id === deviceId);
+      // With no open, reachable stand the avatar keeps the device's own front,
+      // but the player still needs a rail of chips and a camera: play from the
+      // (non-operator) stand nearest where they are.
+      let standIdx = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
+        : null;
+      if (standIdx === null && item) {
+        const me = this.player.getPosition();
+        const inv = ((4 - item.rot) % 4) as Rot;
+        const p = rotXZ(me.x - item.pos.x, me.z - item.pos.z, inv);
+        let best = Infinity;
+        (FURNITURE_DEFS[item.kind].stands ?? []).forEach((t, i) => {
+          const d = Math.hypot(t.stand.x - p.x, t.stand.z - p.z);
+          if (!t.role && d < best) {
+            best = d;
+            standIdx = i;
+          }
+        });
+      }
+      const tmpl =
+        item && standIdx !== null
+          ? FURNITURE_DEFS[item.kind].stands?.[standIdx]
+          : undefined;
+      let target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        : device;
+      if (item && tmpl) {
+        const local = (x: number, y: number, z: number) => {
+          const r = rotXZ(x, z, item.rot);
+          return new THREE.Vector3(item.pos.x + r.x, y, item.pos.z + r.z);
+        };
+        const sx = tmpl.stand.x;
+        const sz = tmpl.stand.z;
+        target = {
+          ...target,
+          eye: local(sx * 0.85, 1.9, sz * 0.85),
+          anchor: local(sx * 0.35, 0.8, sz * 0.15),
+        };
+      }
+      const ui = createCasinoTableUI({
+        itemId: deviceId,
+        game: device.kind,
+        isHouse: () => canEditRoom().ok,
+        stand: tmpl ? standIdx : null,
+        visual: this.casinoTableVisuals.get(deviceId) ?? null,
+      });
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }

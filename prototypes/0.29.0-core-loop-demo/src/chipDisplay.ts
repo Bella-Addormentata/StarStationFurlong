@@ -43,6 +43,33 @@ export function chipsFor(balance: number): number[] {
   return chips;
 }
 
+/**
+ * 🎲 #226: the chips in a player's table RAIL — the same total as chipsFor,
+ * but made playable: a pure greedy split hands someone with 100 a single
+ * black chip they cannot bet a 5 from. Each denomination keeps a working
+ * float of the next one down (five whites, five reds, four greens, five
+ * blacks) whenever the balance is big enough to spare it, the way a dealer
+ * colours a buy-in down. Σ result === balance for every non-negative integer;
+ * largest first.
+ */
+export function railChips(balance: number): number[] {
+  let left = Math.max(0, Math.floor(balance));
+  // [denomination, its next one up, how many of it to keep as a float]
+  const floats: Array<[number, number, number]> = [[1, 5, 5], [5, 25, 5], [25, 100, 4], [100, 500, 5]];
+  const small = new Map<number, number>();
+  for (const [d, up, keep] of floats) {
+    let n = (left % up) / d; // what can't make up a whole chip of the next size
+    if (left - n * d >= keep * d + up) n += keep;
+    small.set(d, n);
+    left -= n * d;
+  }
+  const big = chipsFor(left);
+  for (const d of [100, 25, 5, 1]) {
+    for (let i = 0; i < (small.get(d) ?? 0); i++) big.push(d);
+  }
+  return big.sort((a, b) => b - a);
+}
+
 /** Group a flat chip list by denomination, largest first. */
 export function groupChips(chips: number[]): Array<{ denom: number; count: number }> {
   const counts = new Map<number, number>();
@@ -192,4 +219,7 @@ export function chipDotsHtml(balance: number): string {
 
 // Debug handle (the __ssfGames/__ssfCasino precedent): decomposition
 // accuracy is console-checkable without UI plumbing.
-(window as unknown as { __ssfChips: unknown }).__ssfChips = { chipsFor, groupChips };
+// Guarded: the 3D tables import this module, and tests load them without a window.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfChips: unknown }).__ssfChips = { chipsFor, groupChips };
+}

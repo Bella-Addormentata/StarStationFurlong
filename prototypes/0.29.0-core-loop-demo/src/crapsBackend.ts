@@ -89,7 +89,8 @@ class LocalCrapsBackend implements CrapsBackend {
     // (closeCrapsTable refunded every felt and wiped the table keys, #87
     // review). Writing now would resurrect the dead table's state and pay
     // out bets that were already refunded — abort instead.
-    if (readCrapsTableState(tableId) == null) return dice;
+    const before = readCrapsTableState(tableId);
+    if (before == null) return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     const { payouts, remaining } = resolveCrapsRound(
@@ -109,6 +110,10 @@ class LocalCrapsBackend implements CrapsBackend {
       resultAt: now,
       payouts,
       sevenOut: shooterHandOver(pointBefore, sum),
+      // 🎲 #226: the hand's shooter rides through the settle (the operator
+      // passes the dice on when it opens the next window after a seven-out).
+      ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
+      ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
       ...(transcript ? { fairness: transcript } : {}),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });

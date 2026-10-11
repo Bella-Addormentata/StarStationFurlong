@@ -32,9 +32,13 @@ import {
   creditChips,
   readAllCrapsBets,
   readCrapsTableState,
+  readDiceThrow,
+  readSeats,
   writeCrapsTableState,
+  writeDiceThrow,
 } from './casinoDoc';
-import type { CrapsTableState } from './games/craps';
+import { hasLineBet, pickShooter } from './games/craps';
+import type { CrapsTableState, SeatedPlayer } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
 import { selectCrapsBackend } from './crapsBackend';
@@ -47,6 +51,14 @@ export const CRAPS_CLOSING_MS = 2_500;
 /** How long the settled roll + payouts stay up before the next window opens
  *  (≥ the local dice-tumble animation, so the number lingers after it stops). */
 export const CRAPS_SHOW_MS = 6_000;
+/** 🎲 #226: how long a shooter has to pick the dice up and fling them before
+ *  the stickman throws for them. */
+export const CRAPS_SHOOTER_MS = 20_000;
+/** A seat whose heartbeat has not moved for this long (operator clock) is
+ *  gone — the page crashed or lost its connection without clearing it. */
+export const SEAT_STALE_MS = 15_000;
+/** The stickman's spot on the felt: beside the ⚙️ button, by the +z rail. */
+export const STICKMAN_DICE_SPOT = { x: 0.17, z: 0.36 };
 
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
@@ -94,8 +106,18 @@ export function rollAndSettleCraps(
 }
 
 /** Open a fresh betting window carrying the point forward (idle — no timer until
- *  a bet, or a standing bet, arms it). */
-export function openCrapsBetting(tableId: string, round: number, point: number | null): void {
+ *  a bet, or a standing bet, arms it). `after` is the roll that just settled:
+ *  its shooter keeps the dice, unless it sevened out — then the dice pass on
+ *  (the next shooter is picked clockwise from them when the window closes). */
+export function openCrapsBetting(
+  tableId: string,
+  round: number,
+  point: number | null,
+  after?: CrapsTableState | null,
+): void {
+  const handOver = after?.sevenOut === true;
+  const shooter = handOver ? undefined : after?.shooter;
+  const lastShooter = handOver ? after?.shooter ?? after?.lastShooter : after?.lastShooter;
   writeCrapsTableState(tableId, {
     kind: 'craps',
     phase: 'betting',
@@ -105,7 +127,58 @@ export function openCrapsBetting(tableId: string, round: number, point: number |
     result: null,
     resultAt: 0,
     payouts: null,
+    ...(shooter !== undefined ? { shooter } : {}),
+    ...(lastShooter !== undefined ? { lastShooter } : {}),
   });
+}
+
+// ── 🎲 #226: the shooter ──────────────────────────────────────────────────────
+
+/** seat key → [its `at`, when THIS client last saw `at` change]. */
+const seatSeen = new Map<string, { at: number; seenAt: number }>();
+
+/** Players standing at the table right now, judged on the operator's own clock:
+ *  a seat counts while its heartbeat keeps moving. */
+export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[] {
+  const out: SeatedPlayer[] = [];
+  for (const [pid, seat] of Object.entries(readSeats(tableId))) {
+    const key = `${tableId}:${pid}`;
+    const prev = seatSeen.get(key);
+    if (!prev || prev.at !== seat.at) seatSeen.set(key, { at: seat.at, seenAt: now });
+    const seenAt = seatSeen.get(key)!.seenAt;
+    if (now - seenAt < SEAT_STALE_MS) out.push({ pid, angle: seat.angle });
+  }
+  return out;
+}
+
+/** Who throws when betting closes on `s`: the hand's shooter while they are
+ *  still at the table; on a come-out with nobody holding the dice, the next
+ *  player clockwise with a line bet; otherwise nobody (the stickman throws). */
+export function shooterForClose(tableId: string, s: CrapsTableState, now = Date.now()): string | undefined {
+  const seated = seatedPlayers(tableId, now);
+  if (s.shooter !== undefined && seated.some((p) => p.pid === s.shooter)) return s.shooter;
+  if (s.point !== null) return undefined; // the shooter left mid-hand: the stickman finishes it
+  const bets = readAllCrapsBets(tableId);
+  return pickShooter(seated, (pid) => hasLineBet(bets[pid] ?? []), s.shooter ?? s.lastShooter) ?? undefined;
+}
+
+/** The stickman throws for the table (no shooter, or the shooter ran out of
+ *  time): record the throw so every client animates it, then settle. */
+export function stickmanThrows(tableId: string, s: CrapsTableState, autoShowMs?: number): void {
+  // The operator ticks every frame while the async settle is in flight: one
+  // throw per roll, or every client's dice would restart their tumble.
+  if (settling.has(tableId)) return;
+  writeDiceThrow(tableId, {
+    round: s.round,
+    by: 'stickman',
+    sx: STICKMAN_DICE_SPOT.x,
+    sz: STICKMAN_DICE_SPOT.z,
+    dx: (Math.random() - 0.5) * 0.5,
+    dz: -1,
+    power: 0.55,
+    seed: Math.floor(Math.random() * 2 ** 31),
+  });
+  rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
 }
 
 /** Any chips on the felt (fresh bets OR standing pass/place from prior rolls)? */
@@ -133,19 +206,33 @@ export function tickAutoStickman(tableId: string): void {
         writeCrapsTableState(tableId, { ...s, phaseDeadline: now + CRAPS_BET_WINDOW_MS });
       }
     } else if (now >= s.phaseDeadline) {
-      writeCrapsTableState(tableId, {
+      // "No more bets": the stickman pushes the dice to the shooter, who then
+      // has CRAPS_SHOOTER_MS to fling them (#226); with no shooter the stickman
+      // throws after the usual beat.
+      const shooter = shooterForClose(tableId, s, now);
+      const next: CrapsTableState = {
         ...s,
         phase: 'closing',
-        phaseDeadline: now + CRAPS_CLOSING_MS,
-      });
+        phaseDeadline: now + (shooter ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS),
+      };
+      if (shooter) next.shooter = shooter;
+      else delete next.shooter;
+      writeCrapsTableState(tableId, next);
     }
   } else if (s.phase === 'closing') {
-    if (now >= (s.phaseDeadline ?? now)) {
-      rollAndSettleCraps(tableId, s.round, s.point, CRAPS_SHOW_MS);
+    if (s.shooter !== undefined) {
+      const t = readDiceThrow(tableId);
+      if (t && t.round === s.round && t.by === s.shooter) {
+        rollAndSettleCraps(tableId, s.round, s.point, CRAPS_SHOW_MS);
+      } else if (now >= (s.phaseDeadline ?? now)) {
+        stickmanThrows(tableId, s, CRAPS_SHOW_MS);
+      }
+    } else if (now >= (s.phaseDeadline ?? now)) {
+      stickmanThrows(tableId, s, CRAPS_SHOW_MS);
     }
   } else if (s.phase === 'settled') {
     if (s.phaseDeadline != null && now >= s.phaseDeadline) {
-      openCrapsBetting(tableId, s.round + 1, s.point);
+      openCrapsBetting(tableId, s.round + 1, s.point, s);
     }
   }
 }
