@@ -225,7 +225,7 @@ import {
   registerAlligatorsVisual,
   alligatorsGearCard,
 } from "./alligatorsSession";
-import { closeGearCard, toggleGearCard } from "./settingsGear";
+import { closeGearCard, setGearCardNeighbour, toggleGearCard } from "./settingsGear";
 import { IA_SEATS } from "./games/alligators";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
@@ -588,6 +588,10 @@ export class World {
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
+    // ⚙️ cards share a corner: a gear card opened from anywhere (a room-view
+    // gear, or one in a focused air hockey or alligators game) closes the
+    // arcade cabinet's card, and handleArcadeSettings does the reverse.
+    setGearCardNeighbour(() => closeArcadeCardFor());
     this.platformGroup = new THREE.Group();
     this.platformGroup.position.set(0, 0, 0);
     this.scene.add(this.platformGroup);
@@ -6027,8 +6031,7 @@ export class World {
       : kind === "coin-pusher" ? coinPusherGearCard(itemId, () => canEditRoom().ok)
       : null;
     if (!spec) return false;
-    closeArcadeCardFor();
-    toggleGearCard(spec);
+    toggleGearCard(spec); // closes the arcade card (the constructor's neighbour)
     return true;
   }
 

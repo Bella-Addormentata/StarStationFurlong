@@ -62,6 +62,17 @@ function render(): void {
   if (focusedAct) card.querySelector<HTMLElement>(`[data-act="${focusedAct}"]`)?.focus();
 }
 
+/** Closes the other page-level card that opens in this corner (the arcade
+ *  cabinet's, arcadeCard.ts), if one is set. */
+let closeNeighbour: (() => void) | null = null;
+
+/** Set what a gear card opening closes first, whichever path opened it (a
+ *  room-view gear, or one inside a focused game): one card in the corner,
+ *  and its Esc is the visible card's. */
+export function setGearCardNeighbour(close: (() => void) | null): void {
+  closeNeighbour = close;
+}
+
 /** Close the open card (only if it is `itemId`'s, when given). */
 export function closeGearCard(itemId?: string): void {
   if (!open || (itemId !== undefined && open.spec.itemId !== itemId)) return;
@@ -80,6 +91,7 @@ export function toggleGearCard(spec: GearCardSpec): void {
   const same = open?.spec.itemId === spec.itemId;
   closeGearCard();
   if (same) return;
+  closeNeighbour?.();
   const card = document.createElement('div');
   card.id = 'settings-gear-card';
   card.setAttribute('role', 'dialog');
