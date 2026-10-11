@@ -148,8 +148,12 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
     return id === myId ? `${name} (YOU)` : name;
   };
 
-  const button = (id: string, label: string, enabled: boolean, title: string, on = false): string => `
-    <button data-act="${id}" ${enabled ? '' : 'disabled'} title="${title}" aria-pressed="${on}" style="
+  const button = (id: string, label: string, enabled: boolean, title: string, toggled?: boolean): string => {
+    const on = toggled === true;
+    // Only the promotion choices are toggles; actions get no pressed state.
+    const pressed = toggled === undefined ? '' : `aria-pressed="${on}"`;
+    return `
+    <button data-act="${id}" ${enabled ? '' : 'disabled'} title="${title}" ${pressed} style="
       padding: 7px 10px; border-radius: 6px; font: inherit; font-size: 10px;
       font-weight: 800; letter-spacing: 1.5px;
       background: rgba(212, 168, 75, ${on ? '0.32' : enabled ? '0.12' : '0.04'});
@@ -157,6 +161,7 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
       color: ${enabled ? GOLD_BRIGHT : DIM};
       cursor: ${enabled ? 'pointer' : 'not-allowed'};
     ">${label}</button>`;
+  };
 
   /** True when the selected piece has a promoting move — the strip then
    *  says what the pawn will become. */
@@ -225,6 +230,10 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
     } else if (what.startsWith('promo-')) {
       const p = what.slice('promo-'.length) as ChessPromotion;
       if (PROMOTION_CHOICES.includes(p)) promotionChoice = p;
+      // The card is rebuilt: keep keyboard focus on the chosen piece.
+      render();
+      card?.querySelector<HTMLButtonElement>(`button[data-act="promo-${promotionChoice}"]`)?.focus();
+      return;
     } else if (what === 'bot' || what === 'forfeit') {
       // Both hand the game back to the board, so the card gets out of the way.
       const next = !s ? null : what === 'bot' ? startChessBot(s, myId) : forfeitChess(s, myId);
