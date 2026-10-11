@@ -501,8 +501,13 @@ export function alligatorsFrame(dt: number): void {
     }
 
     // Frames stopped past a takeover's grace: another seat ran the balls
-    // meanwhile, so this page comes back as a fresh operator.
-    if (now - st.lastFrameAt > OPERATOR_TAKEOVER_MS) st.wasOperator = false;
+    // meanwhile, so this page comes back as a fresh operator. Landings the
+    // network queued during the stall were judged by that other seat
+    // already; replaying them on adopted positions would eat phantom balls.
+    if (now - st.lastFrameAt > OPERATOR_TAKEOVER_MS) {
+      st.wasOperator = false;
+      st.pendingBites = [];
+    }
     st.lastFrameAt = now;
 
     const s = readAlligators(itemId);

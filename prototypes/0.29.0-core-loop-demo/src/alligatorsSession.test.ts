@@ -155,6 +155,18 @@ describe('the operator', () => {
     expect(st.balls[0].z).toBeCloseTo(before.z, 2);
   });
 
+  it('drops peer landings queued while its frames were stalled', () => {
+    const { st } = versus();
+    run(IA_LAY_START_MS + 300);
+    const m = mouthOf(3, { swing: 0, ext: 0 });
+    st.balls[0] = { x: m.x, z: m.z, vx: 0, vz: 0 };
+    routeAlligatorsTick('peer', headToTick({ x: m.x, z: m.z, seat: 3, jawDown: false, seq: 1 }));
+    vi.setSystemTime(Date.now() + 5000); // a hidden tab: ticks still arrive
+    routeAlligatorsTick('peer', headToTick({ x: m.x, z: m.z, seat: 3, jawDown: true, seq: 2 }));
+    alligatorsFrame(1 / 60);
+    expect(readAlligators(TABLE)!.eaten[0]).toBe(IA_LIVE);
+  });
+
   it("adopts the newer operator's ball over its own stale one on takeover", () => {
     const { st } = versus();
     run(IA_LAY_START_MS + 300);
