@@ -54,6 +54,18 @@ import {
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
+import { pieceColor, isKing } from "./games/checkers";
+import type { CheckersColor } from "./games/checkers";
+import {
+  BOARD_TEX_PX,
+  BOARD_PAD_PX,
+  BOARD_SQ_PX,
+  BOARD_SQ_M,
+  BOARD_SIZE_M,
+  cellCenterLocal,
+  cellFromUV,
+} from "./games/checkersTable";
+import type { BoardMarks } from "./games/checkersTable";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey, readCoinPusherState } from "./casinoDoc";
@@ -2375,20 +2387,36 @@ const GT_SQ_LIGHT = "#EAD9B0";
 const GT_SQ_DARK = "#7A4A28";
 const GT_FRAME = "#4A2F1B";
 const GT_RED = "#C43C3C";
-const GT_RED_RIM = "#8E2626";
 const GT_BLACK = "#23252E";
-const GT_BLACK_RIM = "#0E0F14";
 const GT_CROWN = "#F0C060";
+const GT_TURN_BLACK = "#9AA3B2"; // black's turn strip — dark-on-dark would vanish
+/** Checker piece size (m): radius a little under half a square, and height. */
+const GT_PIECE_R = BOARD_SQ_M * 0.38;
+const GT_PIECE_H = 0.013;
+/** Board-face surface height in the top group's frame (slab half-height). */
+const GT_FACE_Y = 0.037;
+/** Where the ⚙ token sits on the top (beside the board, toward +x). */
+const GT_GEAR_X = 0.6;
+const GT_GEAR_R = 0.055;
 
-/** Board-face painter shared by the builder (in-world texture). Kept board-
- *  code-compatible with games/checkers.ts (1/2 red man/king, 3/4 black). */
+/** Board-face painter (in-world texture). Since #227 the pieces are 3D
+ *  meshes, so the face carries only what belongs ON the wood: the squares,
+ *  the frame, a glowing strip on the frame at the end whose turn it is (so
+ *  spectators read the turn from across the room), and the LOCAL player's
+ *  move marks. Geometry comes from games/checkersTable.ts — the same numbers
+ *  place the pieces and pick the clicked cell. */
 function drawCheckerboard(
   c2d: CanvasRenderingContext2D,
-  board: number[] | null,
+  turn: CheckersColor | null,
+  marks: BoardMarks | null,
 ): void {
-  const S = 512,
-    PAD = 32,
-    SQ = (S - PAD * 2) / 8; // 56 px squares
+  const S = BOARD_TEX_PX,
+    PAD = BOARD_PAD_PX,
+    SQ = BOARD_SQ_PX;
+  const at = (idx: number) => ({
+    x: PAD + (idx % 8) * SQ,
+    y: PAD + Math.floor(idx / 8) * SQ,
+  });
   c2d.imageSmoothingEnabled = false;
   c2d.fillStyle = GT_FRAME;
   c2d.fillRect(0, 0, S, S);
@@ -2398,29 +2426,75 @@ function drawCheckerboard(
       c2d.fillRect(PAD + c * SQ, PAD + r * SQ, SQ, SQ);
     }
   }
-  if (!board) return;
-  for (let idx = 0; idx < 64; idx++) {
-    const v = board[idx];
-    if (v === 0) continue;
-    const red = v === 1 || v === 2;
-    const king = v === 2 || v === 4;
-    const cx = PAD + (idx % 8) * SQ + SQ / 2;
-    const cy = PAD + Math.floor(idx / 8) * SQ + SQ / 2;
-    c2d.beginPath();
-    c2d.arc(cx, cy, SQ * 0.36, 0, Math.PI * 2);
-    c2d.fillStyle = red ? GT_RED : GT_BLACK;
-    c2d.fill();
-    c2d.lineWidth = 4;
-    c2d.strokeStyle = red ? GT_RED_RIM : GT_BLACK_RIM;
-    c2d.stroke();
-    if (king) {
-      c2d.fillStyle = GT_CROWN;
-      c2d.font = "bold 26px monospace";
-      c2d.textAlign = "center";
-      c2d.textBaseline = "middle";
-      c2d.fillText("K", cx, cy + 1);
-    }
+  // Turn strip: red plays from the canvas bottom (rows 5–7), black the top.
+  if (turn) {
+    c2d.fillStyle = turn === "red" ? GT_RED : GT_TURN_BLACK;
+    const y = turn === "red" ? S - PAD + 8 : 8;
+    c2d.fillRect(PAD, y, S - PAD * 2, PAD - 16);
   }
+  if (!marks) return;
+  // Movable pieces: a gold ring that shows past the disc's edge.
+  c2d.lineWidth = 4;
+  c2d.strokeStyle = "rgba(240, 192, 96, 0.8)";
+  for (const idx of marks.movable) {
+    const { x, y } = at(idx);
+    c2d.beginPath();
+    c2d.arc(x + SQ / 2, y + SQ / 2, SQ * 0.45, 0, Math.PI * 2);
+    c2d.stroke();
+  }
+  if (marks.selected !== null) {
+    const { x, y } = at(marks.selected);
+    c2d.lineWidth = 6;
+    c2d.strokeStyle = GT_CROWN;
+    c2d.strokeRect(x + 3, y + 3, SQ - 6, SQ - 6);
+  }
+  c2d.fillStyle = GT_CROWN;
+  for (const idx of marks.targets) {
+    const { x, y } = at(idx);
+    c2d.beginPath();
+    c2d.arc(x + SQ / 2, y + SQ / 2, SQ * 0.16, 0, Math.PI * 2);
+    c2d.fill();
+  }
+  if (marks.hover !== null) {
+    const { x, y } = at(marks.hover);
+    c2d.lineWidth = 3;
+    c2d.strokeStyle = "#FFFFFF";
+    c2d.strokeRect(x + 1.5, y + 1.5, SQ - 3, SQ - 3);
+  }
+}
+
+/** The ⚙ settings token (#227, after #226's settings button): a brass disc
+ *  with a procedurally drawn gear, so it reads the same on every platform
+ *  (no emoji font in a CanvasTexture). */
+function drawSettingsToken(c2d: CanvasRenderingContext2D): void {
+  const S = 128,
+    C = S / 2;
+  c2d.clearRect(0, 0, S, S);
+  c2d.beginPath();
+  c2d.arc(C, C, C - 2, 0, Math.PI * 2);
+  c2d.fillStyle = "#2A1A0E";
+  c2d.fill();
+  c2d.lineWidth = 6;
+  c2d.strokeStyle = GT_CROWN;
+  c2d.stroke();
+  const teeth = 8,
+    outer = 40,
+    inner = 31;
+  c2d.beginPath();
+  for (let i = 0; i < teeth * 2; i++) {
+    const a0 = (i / (teeth * 2)) * Math.PI * 2;
+    const a1 = ((i + 1) / (teeth * 2)) * Math.PI * 2;
+    const rad = i % 2 === 0 ? outer : inner;
+    c2d.lineTo(C + Math.cos(a0) * rad, C + Math.sin(a0) * rad);
+    c2d.lineTo(C + Math.cos(a1) * rad, C + Math.sin(a1) * rad);
+  }
+  c2d.closePath();
+  c2d.fillStyle = GT_CROWN;
+  c2d.fill();
+  c2d.beginPath();
+  c2d.arc(C, C, 13, 0, Math.PI * 2);
+  c2d.fillStyle = "#2A1A0E";
+  c2d.fill();
 }
 
 /** One-shot card-felt face: green baize, darker border, two card outlines +
@@ -2540,15 +2614,15 @@ const buildGameTable = (ctx: BuildCtx) => {
 
   // FACE A — checkerboard CanvasTexture (NearestFilter, wall-screen idiom).
   const boardCv = document.createElement("canvas");
-  boardCv.width = 512;
-  boardCv.height = 512;
+  boardCv.width = BOARD_TEX_PX;
+  boardCv.height = BOARD_TEX_PX;
   const boardC2d = boardCv.getContext("2d")!;
   const boardTex = new THREE.CanvasTexture(boardCv);
   boardTex.minFilter = THREE.NearestFilter;
   boardTex.magFilter = THREE.NearestFilter;
   boardTex.generateMipmaps = false;
   boardTex.colorSpace = THREE.SRGBColorSpace;
-  drawCheckerboard(boardC2d, null); // bare board until a game exists
+  drawCheckerboard(boardC2d, null, null); // bare board until a game exists
   const boardMat = new THREE.MeshBasicMaterial({
     map: boardTex,
     transparent: true,
@@ -2557,10 +2631,81 @@ const buildGameTable = (ctx: BuildCtx) => {
   // rotateX(-π/2) faces +y; the extra rotateY(π) points texture-up AWAY from
   // the device front (-z), so board row 0 (black home) reads at the far side
   // for the focused viewer — matching the DOM board's fixed orientation.
-  const boardGeo = new THREE.PlaneGeometry(0.74, 0.74);
+  // games/checkersTable.ts cellCenterLocal / cellFromUV mirror this exact
+  // lay-down — change one, change the other (checkersTable.test.ts pins it).
+  const boardGeo = new THREE.PlaneGeometry(BOARD_SIZE_M, BOARD_SIZE_M);
   boardGeo.rotateX(-Math.PI / 2);
   boardGeo.rotateY(Math.PI);
-  addTop(boardGeo, boardMat, 0, 0.037, 0);
+  const boardMesh = addTop(boardGeo, boardMat, 0, GT_FACE_Y, 0);
+
+  // 🎲 #227: the pieces are REAL 3D checkers on face A, seen by everyone in
+  // the room. Instanced (one draw per layer, capacity 64 — a malformed peer
+  // board can't overflow it): a base disc per piece, a second stacked disc
+  // for kings (the real-set crowning), and a gold band on the king's top.
+  // Children of the top group, so they ride the morph fade-in (ctx.m) and
+  // hide while the table flips / shows the card felt.
+  const pieces = new THREE.Group();
+  top.add(pieces);
+  const discGeo = new THREE.CylinderGeometry(GT_PIECE_R, GT_PIECE_R, GT_PIECE_H, 28);
+  const bandGeo = new THREE.TorusGeometry(GT_PIECE_R * 0.62, 0.0035, 6, 28);
+  bandGeo.rotateX(Math.PI / 2);
+  const layer = (geo: THREE.BufferGeometry, mat: THREE.Material) => {
+    const mesh = new THREE.InstancedMesh(geo, mat, 64);
+    mesh.count = 0;
+    mesh.frustumCulled = false; // instances span the board, not the origin
+    pieces.add(mesh);
+    return mesh;
+  };
+  const redMat = m(new THREE.Color(GT_RED).getHex(), 0.45, 0.05);
+  const blackMat = m(new THREE.Color(GT_BLACK).getHex(), 0.4, 0.1);
+  const goldMat = m(new THREE.Color(GT_CROWN).getHex(), 0.3, 0.7);
+  const redBase = layer(discGeo, redMat);
+  const blackBase = layer(discGeo, blackMat);
+  const redKing = layer(discGeo, redMat);
+  const blackKing = layer(discGeo, blackMat);
+  const crowns = layer(bandGeo, goldMat);
+  const placeAt = new THREE.Matrix4();
+  const layPieces = (board: number[] | null): void => {
+    const layers = [redBase, blackBase, redKing, blackKing, crowns];
+    const n = [0, 0, 0, 0, 0];
+    const put = (li: number, idx: number, y: number) => {
+      const { x, z } = cellCenterLocal(idx);
+      placeAt.makeTranslation(x, y, z);
+      layers[li].setMatrixAt(n[li]++, placeAt);
+    };
+    for (let idx = 0; board && idx < 64; idx++) {
+      const v = board[idx];
+      const color = pieceColor(v);
+      if (!color) continue;
+      const red = color === "red";
+      put(red ? 0 : 1, idx, GT_FACE_Y + GT_PIECE_H / 2);
+      if (isKing(v)) {
+        put(red ? 2 : 3, idx, GT_FACE_Y + GT_PIECE_H * 1.5 + 0.001);
+        put(4, idx, GT_FACE_Y + GT_PIECE_H * 2 + 0.0015);
+      }
+    }
+    layers.forEach((mesh, i) => {
+      mesh.count = n[i];
+      mesh.instanceMatrix.needsUpdate = true;
+    });
+  };
+
+  // ⚙ settings token beside the board (#227) — where players open the
+  // table's options and anyone can read who plays which side.
+  const gearCv = document.createElement("canvas");
+  gearCv.width = 128;
+  gearCv.height = 128;
+  drawSettingsToken(gearCv.getContext("2d")!);
+  const gearTex = new THREE.CanvasTexture(gearCv);
+  gearTex.colorSpace = THREE.SRGBColorSpace;
+  const gearMat = new THREE.MeshBasicMaterial({
+    map: gearTex,
+    transparent: true,
+    opacity: 0,
+  });
+  const gearGeo = new THREE.CircleGeometry(GT_GEAR_R, 32);
+  gearGeo.rotateX(-Math.PI / 2);
+  const gear = addTop(gearGeo, gearMat, GT_GEAR_X, GT_FACE_Y + 0.002, 0);
 
   // FACE B — card felt, facing -y until a flip brings it up.
   const feltCv = document.createElement("canvas");
@@ -2593,6 +2738,19 @@ const buildGameTable = (ctx: BuildCtx) => {
   let toAngle = 0;
   let cardsUp = false;
   let pendingComplete: (() => void) | null = null;
+  // The face's inputs, kept so either one can change without the other.
+  let board: number[] | null = null;
+  let turn: CheckersColor | null = null;
+  let marks: BoardMarks | null = null;
+  const repaint = (): void => {
+    drawCheckerboard(boardC2d, turn, marks);
+    boardTex.needsUpdate = true;
+  };
+  /** First hit on one of the face's meshes, only while it is face up. */
+  const hitFace = (ray: THREE.Raycaster, mesh: THREE.Object3D) => {
+    if (cardsUp || flipT < 1) return null;
+    return ray.intersectObject(mesh, false)[0] ?? null;
+  };
 
   const handle: GameTableTopHandle = {
     flip(onComplete?: () => void): boolean {
@@ -2601,6 +2759,7 @@ const buildGameTable = (ctx: BuildCtx) => {
       toAngle = fromAngle + Math.PI;
       flipT = 0;
       pendingComplete = onComplete ?? null;
+      pieces.visible = false; // the checkers don't swing round with the top
       return true;
     },
     isFlipping(): boolean {
@@ -2609,9 +2768,22 @@ const buildGameTable = (ctx: BuildCtx) => {
     isCardsUp(): boolean {
       return cardsUp;
     },
-    setBoard(board: number[] | null): void {
-      drawCheckerboard(boardC2d, board);
-      boardTex.needsUpdate = true;
+    setBoard(next: number[] | null, nextTurn: CheckersColor | null = null): void {
+      board = next;
+      turn = nextTurn;
+      layPieces(board);
+      repaint();
+    },
+    setMarks(next: BoardMarks | null): void {
+      marks = next;
+      repaint();
+    },
+    pickCell(ray: THREE.Raycaster): number | null {
+      const uv = hitFace(ray, boardMesh)?.uv;
+      return uv ? cellFromUV(uv.x, uv.y) : null;
+    },
+    pickSettings(ray: THREE.Raycaster): boolean {
+      return hitFace(ray, gear) !== null;
     },
     update(deltaTime: number): void {
       if (flipT >= 1) return;
@@ -2625,6 +2797,7 @@ const buildGameTable = (ctx: BuildCtx) => {
         top.rotation.x = toAngle;
         top.position.y = GT_TOP_Y;
         cardsUp = !cardsUp;
+        pieces.visible = !cardsUp;
         if (pendingComplete) {
           const cb = pendingComplete;
           pendingComplete = null; // exactly once

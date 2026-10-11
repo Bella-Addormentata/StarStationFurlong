@@ -55,7 +55,7 @@ import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
 import { addFurniture, writeFurnitureItem } from './furnitureDoc';
 // #45 board mirror: spawned game tables paint the doc's current game at once.
-import { readGame } from './games/gamesDoc';
+import { paintCheckersTable } from './checkersSession';
 import {
   ROOM_TEMPLATES, applyRoomTemplate, addRoomTemplateItems, exportCurrentRoomAsTemplate,
   findTemplate,
@@ -429,7 +429,7 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       // Read back the FILED handle, not obj.userData — see the note at the
       // World call site on why this side must not keep its own key list.
       const spawnedTop = sinks.gameTableTops.get(item.id);
-      if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+      if (spawnedTop) paintCheckersTable(spawnedTop, item.id);
       // 🏒 #115 — mirrors World.registerFurnitureGroup's hand-off.
       const hockey = sinks.airHockeyVisuals.get(item.id);
       if (hockey) registerAirHockeyVisual(item.id, hockey, { x: item.pos.x, z: item.pos.z, rot: item.rot });
