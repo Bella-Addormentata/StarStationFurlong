@@ -122,6 +122,23 @@ const PAD_MENU_HOLD_S = 1;
  *  tests) fails to match a bare `true` when the listener is removed. */
 const CAPTURE: AddEventListenerOptions = { capture: true };
 
+/**
+ * The first two connected gamepads, in order: player 1, then player 2. The
+ * browser's list keeps empty slots after a disconnect, so a lone pad can sit
+ * at index 1 or higher. A Permissions Policy that blocks gamepads makes
+ * getGamepads() throw; that reads as no pads (freeFlightStick's rule).
+ */
+export function connectedPads(): Gamepad[] {
+  try {
+    const all = typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : [];
+    const pads: Gamepad[] = [];
+    for (const pad of all ?? []) if (pad?.connected && pads.push(pad) === 2) break;
+    return pads;
+  } catch {
+    return [];
+  }
+}
+
 /** Upper-cased, printable, short: a file name fit for the cabinet screen. */
 export function cartridgeTitle(fileName: string): string {
   const stem = fileName.replace(/\.[^.]*$/, '').replace(/[^\x20-\x7e]/g, '').trim().toUpperCase();
@@ -295,7 +312,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const onBlur = () => machine?.releaseAll();
 
   const pollPads = (dt: number) => {
-    const pads = typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : [];
+    const pads = connectedPads();
     for (let i = 0; i < 2; i++) {
       const pad = pads[i];
       const now = new Set<NesButton>();
@@ -309,7 +326,11 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       }
       const player = (i + 1) as NesPlayer;
       const before = padHeld[i];
-      for (const button of now) if (!before.has(button)) buttonDown(player, button, false);
+      for (const button of now) {
+        if (before.has(button)) continue;
+        speaker?.resume(); // browsers that count a pad press as a gesture
+        buttonDown(player, button, false);
+      }
       for (const button of before) if (!now.has(button)) buttonUp(player, button);
       padHeld[i] = now;
     }
@@ -332,6 +353,13 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       capture = document.createElement('div');
       capture.id = 'arcade-capture';
       capture.style.cssText = 'position:absolute; inset:0; pointer-events:auto; background:transparent;';
+      // main.ts releases the focus on any window click: keep these here. A
+      // click is also a gesture, so it lets a gamepad player switch sound on.
+      const keepClick = (e: MouseEvent) => {
+        e.stopPropagation();
+        speaker?.resume();
+      };
+      capture.addEventListener('click', keepClick);
       strip = document.createElement('div');
       strip.id = 'arcade-strip';
       strip.style.cssText = `
@@ -348,7 +376,11 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       leave.style.cssText = `
         background:transparent; color:#FFC860; border:1px solid rgba(255,200,96,0.5);
         border-radius:6px; padding:4px 10px; font:inherit; cursor:pointer;`;
-      leave.addEventListener('click', () => deps.requestRelease());
+      strip.addEventListener('click', keepClick);
+      leave.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deps.requestRelease();
+      });
       strip.append(stripText, leave);
       host.append(capture, strip);
 

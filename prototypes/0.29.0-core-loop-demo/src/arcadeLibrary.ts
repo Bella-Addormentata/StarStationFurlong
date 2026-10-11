@@ -97,7 +97,7 @@ export const ARCADE_GAMES: readonly ArcadeGame[] = [
 
 /** Short license names for the cabinet screen. */
 export const LICENSE_LABEL: Record<ArcadeLicense, string> = {
-  'GPL-3.0-or-later': 'GPL-3.0',
+  'GPL-3.0-or-later': 'GPL-3.0 OR LATER',
   zlib: 'ZLIB',
   'CC-BY-4.0': 'CC BY 4.0',
 };

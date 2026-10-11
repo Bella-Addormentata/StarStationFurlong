@@ -11,6 +11,7 @@ import * as THREE from 'three';
 import {
   MENU,
   cartridgeTitle,
+  connectedPads,
   createArcadeCabinetUI,
   keyToButton,
   menuInput,
@@ -74,6 +75,26 @@ describe('keys', () => {
     expect(cartridgeTitle('.nes')).toBe('YOUR CARTRIDGE');
     expect(cartridgeTitle('ゲーム.nes')).toBe('YOUR CARTRIDGE');
     expect(cartridgeTitle(`${'x'.repeat(40)}.nes`)).toHaveLength(24);
+  });
+});
+
+describe('connectedPads', () => {
+  const pad = (id: string, connected = true) => ({ id, connected }) as unknown as Gamepad;
+
+  it('skips the empty slots a disconnect leaves, so a lone pad is player 1', () => {
+    vi.stubGlobal('navigator', { getGamepads: () => [null, pad('b'), pad('c', false), pad('d'), pad('e')] });
+    expect(connectedPads().map((p) => p.id)).toEqual(['b', 'd']);
+  });
+
+  it('reads a blocked Gamepad API as no pads', () => {
+    vi.stubGlobal('navigator', {
+      getGamepads: () => {
+        throw new DOMException('blocked', 'SecurityError');
+      },
+    });
+    expect(connectedPads()).toEqual([]);
+    vi.stubGlobal('navigator', {});
+    expect(connectedPads()).toEqual([]);
   });
 });
 
@@ -306,19 +327,29 @@ describe('the focus UI', () => {
     expect(painter.drawFrame).not.toHaveBeenCalled();
   });
 
-  it('LEAVE on the strip releases the focus', () => {
+  it('clicks on the view stay with the cabinet; LEAVE releases the focus', () => {
     const { ui, requestRelease, host } = setup();
-    let leave: (() => void) | null = null;
+    const clicks = new Map<string, (e: MouseEvent) => void>();
     vi.stubGlobal('document', {
       createElement: (tag: string) => {
         const el = fakeElement(tag);
-        if (tag === 'button') el.addEventListener = ((_type: string, fn: () => void) => { leave = fn; }) as never;
+        el.addEventListener = ((type: string, fn: (e: MouseEvent) => void) => {
+          if (type === 'click') clicks.set(tag === 'button' ? 'leave' : `${tag}-${clicks.size}`, fn);
+        }) as never;
         return el;
       },
     });
     ui.mount(host as unknown as HTMLElement);
-    leave!();
-    expect(requestRelease).toHaveBeenCalled();
+    const click = () => ({ stopPropagation: vi.fn() }) as unknown as MouseEvent & { stopPropagation: ReturnType<typeof vi.fn> };
+    // main.ts releases the focus on any click that reaches window: the
+    // capture layer, the strip and LEAVE all stop it there.
+    expect(clicks.size).toBe(3);
+    for (const [name, handler] of clicks) {
+      const event = click();
+      handler(event);
+      expect(event.stopPropagation, name).toHaveBeenCalled();
+    }
+    expect(requestRelease).toHaveBeenCalledTimes(1);
     ui.unmount();
   });
 });
