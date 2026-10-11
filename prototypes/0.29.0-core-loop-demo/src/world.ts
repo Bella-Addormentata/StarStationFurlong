@@ -69,6 +69,7 @@ import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
   FURNITURE,
+  ARCADE_CABINET_KINDS,
   FURNITURE_DEFS,
   DEFAULT_FOOTPRINT_OVERRIDES,
   buildItemGroup,
@@ -191,6 +192,7 @@ import type {
   PropAnimHandle,
   SlotMachineCabinetControl,
   CoinPusherVisualHandle,
+  ArcadeCabinetVisualHandle,
   AirHockeyVisualHandle,
   AlligatorsVisualHandle,
   DeviceUI,
@@ -201,6 +203,11 @@ import { seatOf, standIndexFor } from "./games/checkersTable";
 import { chessSeatOf, chessStandIndexFor } from "./games/chessTable";
 import { createCheckersTableLayer } from "./checkersSession";
 import { createChessTableLayer, paintGameTable } from "./chessSession";
+import { createArcadeCabinetUI as createNesCabinetUI } from "./arcadeNesCabinet";
+// 🕹️ Shared arcade games: every cabinet's game runs on every page in the
+// room from the host's button presses (arcadeNesSession.ts).
+import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeNesSession";
+import { writeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -501,6 +508,8 @@ export class World {
   /** 🕹 Arcade cabinet screens (#193), keyed by item id — redrawn at ~2 Hz
    *  from the room record (arcadeDoc.arcadeScreenView), on the TV's timer. */
   private arcadeScreens: Map<string, ArcadeScreenHandle> = new Map();
+  /** 🕹️ Arcade-cabinet screens — painted only by a focused cabinet's UI. */
+  private arcadeCabinetVisuals: Map<string, ArcadeCabinetVisualHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -1759,6 +1768,10 @@ export class World {
             rot: item.rot,
           });
         }
+        // 🕹️ And an arcade cabinet's screen, which the session paints with
+        // the room's shared game (its position sets the watcher repaint rate).
+        const arcade = sinks.arcadeCabinetVisuals.get(item.id);
+        if (arcade) registerArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -1801,6 +1814,7 @@ export class World {
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
       coinPusherVisuals: this.coinPusherVisuals,
+      arcadeCabinetVisuals: this.arcadeCabinetVisuals,
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
       tvScreens: this.tvScreens,
@@ -3131,6 +3145,10 @@ export class World {
           group.position.set(rec.x, 0, rec.z);
           group.rotation.y = furnitureVisualYaw(existing);
         }
+        // 🕹️ A moved cabinet keeps its screen; its new spot sets how often
+        // watchers repaint it.
+        const arcade = this.arcadeCabinetVisuals.get(id);
+        if (arcade) registerArcadeVisual(id, arcade, { x: rec.x, z: rec.z });
         changedIds.add(id);
       }
     }
@@ -3231,6 +3249,7 @@ export class World {
     // before any chip is drawn, so the traversal below can't reach them all.
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
+    this.arcadeCabinetVisuals.delete(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.tvScreens.delete(itemId);
@@ -3284,6 +3303,10 @@ export class World {
       // 🐊 #185: the same as air hockey — runtime session out, doc state wiped.
       closeAlligatorsTable(itemId);
       clearTable(itemId);
+    } else if (removedKind && ARCADE_CABINET_KINDS.has(removedKind)) {
+      // 🕹️ A removed cabinet's shared game ends with it, for everyone.
+      closeArcadeCabinet(itemId);
+      writeArcade(itemId, null);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -4068,6 +4091,11 @@ export class World {
 
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
+    // 🕹️ Every arcade cabinet's shared game: the host's copy runs and sends
+    // its pads, the others follow and repaint by distance. After the focused
+    // UI, so a host's game runs on this update's buttons, not the last one's.
+    const me = this.player.getPosition();
+    arcadeFrame(deltaTime, { x: me.x, z: me.z });
 
     // Drive room-edit mode (E2 of #25): force-exit when the view leaves the
     // plain isometric room (zoom ≠ 2 / solar map) + selection-label tracking.
@@ -4117,7 +4145,7 @@ export class World {
         // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
         // P1 page renews its seat — with an empty list too, and under the
         // same flag: a seat is not renewed into a room being left either.
-        const arcadeIds = FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+        const arcadeIds = FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
         for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
         tickArcadeRoom(arcadeIds);
       }
@@ -6375,6 +6403,33 @@ export class World {
           isHouse: () => canEditRoom().ok,
           onDenominationChange: (amount) => visual?.setDenomination(amount),
           onMessage: (message) => visual?.showMessage(message),
+        }),
+      );
+      return;
+    }
+
+    // 🕹️ The two-player arcade cabinet — the menu and the game play on the
+    // cabinet's own screen; the UI only adds a key strip and keeps stray
+    // clicks from releasing the focus mid-game.
+    if (device.kind === "arcade" && FURNITURE.find((i) => i.id === deviceId)?.kind === "arcade-cabinet-2p") {
+      // 🕹️ The two-player cabinet has a stand per player (s0 = player 1):
+      // walk to the free one, and its index is the seat. The one-player
+      // cabinet has no stands, just the device front.
+      const twoPlayer = standsForItem(deviceId).length > 0;
+      const stand = twoPlayer ? this.pickFreeStand(deviceId) : null;
+      const seat = stand && stand.id.endsWith(":s1") ? 1 : 0;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        : device;
+      deviceFocus.beginFocus(
+        this.player,
+        target,
+        createNesCabinetUI({
+          itemId: deviceId,
+          visual: this.arcadeCabinetVisuals.get(deviceId),
+          seat,
+          seats: twoPlayer ? 2 : 1,
+          requestRelease: () => deviceFocus.release(),
         }),
       );
       return;

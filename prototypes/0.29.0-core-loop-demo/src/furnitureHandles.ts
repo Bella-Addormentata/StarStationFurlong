@@ -32,6 +32,7 @@ import type {
   CloneVatHandle,
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
+  ArcadeCabinetVisualHandle,
   PropAnimHandle,
   AirHockeyVisualHandle,
   TvScreenHandle,
@@ -63,6 +64,9 @@ export interface FurnitureHandleSinks {
   slotMachineVisuals: Map<string, SlotMachineVisualHandle>;
   /** 🪙 Coin-pusher cabinet visuals (pusher sweep, chips, hole lamps), keyed by item id. */
   coinPusherVisuals: Map<string, CoinPusherVisualHandle>;
+  /** 🕹️ Arcade-cabinet screens, keyed by item id — handed to the cabinet's
+   *  focus UI (arcadeCabinet.ts), which paints the menu and the game. */
+  arcadeCabinetVisuals: Map<string, ArcadeCabinetVisualHandle>;
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
   propAnims: Map<string, PropAnimHandle>;
   /** 🏒 Air-hockey table visuals (mallets/puck/scoreboard), keyed by item id.
@@ -108,6 +112,9 @@ export function registerFurnitureHandles(
   }
   if (d.coinPusherVisual) {
     sinks.coinPusherVisuals.set(itemId, d.coinPusherVisual as CoinPusherVisualHandle);
+  }
+  if (d.arcadeCabinet) {
+    sinks.arcadeCabinetVisuals.set(itemId, d.arcadeCabinet as ArcadeCabinetVisualHandle);
   }
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
   if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);

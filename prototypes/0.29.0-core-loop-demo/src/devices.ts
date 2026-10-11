@@ -207,6 +207,7 @@ import {
   PUSHER_REQUEST_TTL_MS,
 } from './games/coinPusher';
 import type { CoinPusherState, PusherHole, PusherRefusalReason } from './games/coinPusher';
+import type { ArcadeScreenPainter } from './arcadeScreen';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier } from './croupier';
@@ -585,6 +586,21 @@ export interface CoinPusherVisualHandle {
    *  traversal of the cabinet can't reach them all. World calls this once,
    *  as it removes the cabinet. */
   dispose(): void;
+}
+
+/**
+ * 🕹️ The arcade cabinet's screen. The builder (furniture.ts) makes the
+ * 512×480 canvas, its CanvasTexture and the painter, paints the attract card,
+ * and stows this in the screen mesh's userData.arcadeCabinet. The focused
+ * cabinet UI (arcadeCabinet.ts) paints the menu and the running game through
+ * `painter`, then calls present() to push the canvas to the texture.
+ */
+export interface ArcadeCabinetVisualHandle {
+  readonly painter: ArcadeScreenPainter;
+  /** Mark the screen texture for upload after a paint. */
+  present(): void;
+  /** Back to the idle attract card (the player stepped away). */
+  showAttract(): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
