@@ -807,7 +807,18 @@ leg (1) ‖ key epoch (4, big-endian) ‖ counter (8, big-endian) ‖ timestamp
 microsecond count, on the source's one capture clock, which both legs
 share — a sender starts that clock at zero or above and a receiver drops
 a negative value as malformed, so the sign bit is never set on the wire
-and Rust and TypeScript read the field alike) ‖ config (2, big-endian:
+and Rust and TypeScript read the field alike; and since a signed source
+controls every non-negative value, the jitter buffer is bounded by
+ARRIVAL and never by the source's clock: its playout position is
+anchored to arrival time and slewed on its own occupancy as any jitter
+buffer's is, a frame whose timestamp lies more than the jitter window
+plus 500 ms ahead of that position is dropped as out of horizon rather
+than held until its time comes, one behind it by more than the window is
+dropped as late, and the buffer holds at most twice the window's frames
+at the tier's rate (eight at least) and twice the window's bytes at the
+tier's ceiling per source, the frame farthest ahead dropped first past
+either cap — so a far-future timestamp, inside every wire budget,
+neither stalls playback nor grows the buffer) ‖ config (2, big-endian:
 the generation of the decoder configuration the frame decodes under) ‖
 flags (1: bit 0 the keyframe, bit 1 a batch) — 57 bytes — and the
 signature below covers that header and the ciphertext with its tag. The
@@ -946,7 +957,9 @@ signed by the sender's identity key under the domain tag
 `ssf-media-key:v1` as every envelope `signBytes.ts` signs is, so a hub can
 neither forge one nor move one between recipients or epochs, a message
 whose signature or opening fails dropped and charged to the link; the
-HPKE runtime is the PAGE's alone — `@hpke/core` with its X25519 KEM, or
+HPKE runtime is the PAGE's alone — `@hpke/core` with `@hpke/dhkem-x25519`
+(hpke-js ships the X25519 KEM as a package of its own; `@hpke/core` alone
+constructs no DHKEM(X25519) suite), or
 the RFC's four steps over `@noble/curves`, `@noble/hashes` and
 `@noble/ciphers` — since the media key is minted and sealed in the
 sender's page and a recipient's identity secret never leaves its browser
@@ -1908,9 +1921,13 @@ origin forbids by design and an earlier draft of this paragraph relied
 on. And since the frame is attacker-controlled after a core exploit, the
 source check says only WHO is posting; what crosses is bounded as input
 from an attacker: one versioned shape per message kind (`arcade-*`,
-known keys only, a string field at most 256 characters, anything else
-dropped on receipt), a message budget of twenty a second per frame, past
-which the page tears the frame down (`flood`) and re-mounts it only on
+known keys only, a string field at most 256 characters — and a message
+of any other shape tears the frame down at the first word (`malformed`):
+no game sends one, a frame that does is exploited or broken, and dropping
+it would pay the clone below for every such message up to the budget), a
+message budget of twenty a second per frame, counted shape or no shape,
+past which the page tears the frame down (`flood`); either torn-down
+frame is re-mounted only on
 the player's RETRY, and not before a doubling backoff from 5 s (five
 minutes at most, forgiven by a clean start); a save state at
 most 16 MB by `byteLength`; a picture at most the core's native size
@@ -1921,9 +1938,10 @@ dropped as it arrives. What remains is the structured clone the browser
 performs BEFORE any handler runs, so one oversized message costs the
 page its clone once — the memory and the stalled event loop of that one
 message — after which the frame is gone: the residual availability cost,
-stated as one. #208 carries the shape, the budget and the teardown for
-the status messages (`arcadeEmulator.ts`); the picture and save-state
-caps come with the lanes that carry them. The frame still runs under a
+stated as one. #208 carries the shape, the budget and both teardowns for
+the status messages (`arcadeEmulator.ts`: `frameMessage`, `MessageBudget`,
+`malformed` and `flood`; `arcadeStage.ts` the backoff); the picture and
+save-state caps come with the lanes that carry them. The frame still runs under a
 content-security policy on EVERY lane,
 set by the frame itself on receipt of the page's config and before its
 loader is fetched: its own origin, `blob:`, `data:`, the viewer's own node
