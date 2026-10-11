@@ -290,8 +290,13 @@ function isPrivateIPv6(ip: string): boolean {
   // in the last 32, inverted) and ISATAP (RFC 5214: under ANY prefix, an
   // interface identifier of 0:5efe or 200:5efe in bits 64–95 and the IPv4
   // in the last 32) — the last three read as global unicast on paper, and
-  // 2002:7f00:1:: is loopback in fact. Every IPv4 an address carries is
-  // judged: a 6to4 or Teredo prefix over an ISATAP identifier names two.
+  // 2002:7f00:1:: is loopback in fact — and NAT64 (RFC 6052): under the
+  // well-known 64:ff9b::/96 the IPv4 is the last 32 bits, judged like the
+  // rest; under the local-use 64:ff9b:1::/48 (RFC 8215) it sits where the
+  // network's own prefix length puts it, which the host as written does
+  // not say, so that prefix is refused outright. Every IPv4 an address
+  // carries is judged: a 6to4 or Teredo prefix over an ISATAP identifier
+  // names two.
   const g = expandIPv6(s);
   if (!g) return false;
   const quad = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
@@ -301,6 +306,10 @@ function isPrivateIPv6(ip: string): boolean {
   if (g[0] === 0x2002 && isPrivateHost(quad(g[1]!, g[2]!))) return true; // 6to4
   if (g[0] === 0x2001 && g[1] === 0 // Teredo
     && (isPrivateHost(quad(g[2]!, g[3]!)) || isPrivateHost(quad(g[6]! ^ 0xffff, g[7]! ^ 0xffff)))) return true;
+  if (g[0] === 0x64 && g[1] === 0xff9b) { // NAT64
+    if (g[2] === 1) return true; // 64:ff9b:1::/48, the IPv4's place unknowable here: refused as written
+    if (zeroTo(6) || (g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0)) return isPrivateHost(quad(g[6]!, g[7]!)); // 64:ff9b::/96
+  }
   if ((g[4] === 0 || g[4] === 0x0200) && g[5] === 0x5efe) return isPrivateHost(quad(g[6]!, g[7]!)); // ISATAP
   return false;
 }
