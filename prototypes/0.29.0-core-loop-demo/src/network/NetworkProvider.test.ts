@@ -421,9 +421,48 @@ describe('NetworkProvider — the faucet request stream', () => {
     await vi.waitFor(() => expect(replies).toHaveLength(1));
     expect(replies[0]).toEqual(reply);
     expect(envelopes).toHaveLength(0);
-    // Every request carries the next seq, so the node's echo orders the replies.
+    // Every request carries the next seq (its id on the wire, echoed by the
+    // node; snapshot ORDER comes from the node's own numbering, see faucetDish).
     await provider.requestFaucet('status');
     expect(unframe(wt.opened[1].written)[0].seq).toBe(2);
+    await provider.disconnect();
+  });
+
+  it('drops a reply that arrives on a stream of a session since left, even after a reconnect', async () => {
+    const left = new FakeTransport();
+    left.acceptHandshake();
+    const live = new FakeTransport();
+    live.acceptHandshake();
+    queueTransports(left, live);
+    const provider = new NetworkProvider();
+    const replies: unknown[] = [];
+    provider.onFaucetReply((env) => {
+      replies.push(env);
+    });
+
+    await provider.connect(BOOT);
+    await provider.requestFaucet('status'); // its drain is now awaiting the node's reply
+    const stale = left.opened[0];
+    await provider.disconnect(); // leave: the read on `stale` is still pending
+    await provider.connect(BOOT); // and the same room is joined again, on `live`
+    expect(provider.mode()).toBe('direct-unreliable');
+
+    // The old session's node answers late. Without the transport binding the
+    // drain, active again, would hand this to the new session (main.ts has
+    // cleared the room's dish state at the leave; this would repopulate it).
+    stale.reply(faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1stale' } }));
+    stale.end();
+    await settle();
+    expect(replies).toHaveLength(0);
+
+    // The live session's own request stream still delivers.
+    await provider.requestFaucet('status');
+    const fresh = live.opened[0];
+    const reply = faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1fresh' } });
+    fresh.reply(reply);
+    fresh.end();
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    expect(replies[0]).toEqual(reply);
     await provider.disconnect();
   });
 

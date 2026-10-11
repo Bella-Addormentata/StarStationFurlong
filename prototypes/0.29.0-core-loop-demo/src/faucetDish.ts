@@ -49,6 +49,13 @@ export interface FaucetStatus {
   partial: boolean;
   /** Why take/give are off, in the node's words. */
   note: string;
+  /** The node's number for this snapshot. The node captures status snapshots
+   *  one at a time and numbers them as they complete, so a higher number is a
+   *  later look at the chain and the wallet whatever order the requests went
+   *  out in (they run on separate streams and the node serves them
+   *  concurrently, so request order is not capture order). 0 from an older
+   *  node, which orders nothing. */
+  snapshot: number;
 }
 
 export interface FaucetReply {
@@ -116,6 +123,7 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
     walletPartial: r.walletPartial === true,
     partial: r.partial === true,
     note: typeof r.note === 'string' ? r.note : '',
+    snapshot: isNum(r.snapshot) && r.snapshot > 0 ? Math.floor(r.snapshot) : 0,
   };
 }
 
@@ -194,8 +202,8 @@ interface Pending {
 const latest = new Map<string, FaucetStatus>();
 const lastError = new Map<string, string>();
 const pending = new Map<string, Pending>();
-/** The request seq of the newest status filed per room (see setFaucetReply). */
-const latestSeq = new Map<string, number>();
+/** The node's snapshot number of the newest status filed per room (see setFaucetReply). */
+const latestSnapshot = new Map<string, number>();
 const listeners = new Set<() => void>();
 
 function notify(): void {
@@ -230,22 +238,25 @@ export function markFaucetPending(roomId: string, op: FaucetOp, now: number = Da
  *  clears a pending spend once the wallet/jar shows it (claim: our wallet now
  *  holds a coin; give: fewer wallet mojos); an error is kept for the screen.
  *
- *  `seq` is the request's number, echoed by the node: the 20 s and 60 s polls
- *  and the post-action read each run on their own stream and can complete out
- *  of order, so a status whose seq is below the newest one filed is an older
- *  snapshot and is dropped (it could put a pre-claim balance back and re-enable
- *  TAKE). An older node echoes 0 for every reply, which orders nothing. */
-export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
+ *  Statuses are ordered by the node's snapshot number, not by request: the
+ *  20 s and 60 s polls and the post-action read each run on their own stream,
+ *  the node serves them concurrently, and a later request can be captured
+ *  before an earlier one, so request order says nothing about which view is
+ *  newer. The node numbers snapshots as it captures them, one at a time; a
+ *  status numbered below the newest filed is an older look and is dropped (it
+ *  could put a pre-claim balance back and re-enable TAKE). An older node sends
+ *  no number (0), which orders nothing. */
+export function setFaucetReply(roomId: string, reply: FaucetReply): void {
   if (!reply.ok) {
     lastError.set(roomId, reply.error ?? 'the node refused');
     if (reply.op === 'claim' || reply.op === 'give') pending.delete(roomId);
     notify();
     return;
   }
-  if (reply.status && seq !== undefined && seq > 0) {
-    const newest = latestSeq.get(roomId) ?? 0;
-    if (seq < newest) return; // an older snapshot answered late
-    latestSeq.set(roomId, seq);
+  if (reply.status && reply.status.snapshot > 0) {
+    const newest = latestSnapshot.get(roomId) ?? 0;
+    if (reply.status.snapshot < newest) return; // an older snapshot answered late
+    latestSnapshot.set(roomId, reply.status.snapshot);
   }
   lastError.delete(roomId);
   if (reply.status) {
@@ -283,6 +294,6 @@ export function clearFaucetRoom(roomId: string): void {
   latest.delete(roomId);
   lastError.delete(roomId);
   pending.delete(roomId);
-  latestSeq.delete(roomId);
+  latestSnapshot.delete(roomId);
   notify();
 }

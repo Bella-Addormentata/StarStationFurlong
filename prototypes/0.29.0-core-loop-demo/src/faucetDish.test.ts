@@ -34,6 +34,7 @@ const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
   walletPartial: false,
   partial: false,
   note: '',
+  snapshot: 0,
   ...over,
 });
 
@@ -66,6 +67,11 @@ describe('faucet dish: node replies', () => {
     const older = wire() as Record<string, unknown>;
     delete older.walletPartial;
     expect(asFaucetStatus(older)?.walletPartial).toBe(false);
+    // The node's snapshot number rides along; an older node that sends none orders nothing (0).
+    expect(parseFaucetReply(b64({ op: 'status', ok: true, status: wire({ snapshot: 12 }) }))?.status?.snapshot).toBe(12);
+    delete older.snapshot;
+    expect(asFaucetStatus(older)?.snapshot).toBe(0);
+    expect(asFaucetStatus({ ...wire(), snapshot: 'twelve' })?.snapshot).toBe(0);
   });
 
   it('keeps mojo totals exact past 2^53 and still reads a plain safe number', () => {
@@ -174,19 +180,20 @@ describe('faucet dish: per-room store', () => {
     clearFaucetRoom(room);
   });
 
-  it('drops a status answered out of order, keeping the newest snapshot', () => {
+  it('keeps the newest snapshot by the node\'s numbering, whatever order the replies arrive in', () => {
     const room = 'home-store-4';
     clearFaucetRoom(room);
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true }) }, 7);
-    // The post-claim read (seq 9) lands first, then the older poll (seq 8) answers late.
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 1n, canClaim: false }) }, 9);
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true }) }, 8);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true, snapshot: 7 }) });
+    // The node captured the post-claim read as snapshot 9 and an older poll as
+    // 8 — the poll was SENT first but served second, or simply answered late.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 1n, canClaim: false, snapshot: 9 }) });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true, snapshot: 8 }) });
     expect(latestFaucetStatus(room)?.walletMojos).toBe(1n);
     expect(latestFaucetStatus(room)?.canClaim).toBe(false);
     // A newer one still replaces it; an older node's unnumbered replies always do.
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 2n }) }, 10);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 2n, snapshot: 10 }) });
     expect(latestFaucetStatus(room)?.walletMojos).toBe(2n);
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 3n }) }, 0);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 3n }) });
     expect(latestFaucetStatus(room)?.walletMojos).toBe(3n);
     clearFaucetRoom(room);
   });

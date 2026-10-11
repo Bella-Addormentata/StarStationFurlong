@@ -204,7 +204,24 @@ pub struct FaucetStatus {
     pub partial: bool,
     /// Why claim/give are off, in the dish's words.
     pub note: String,
+    /// This snapshot's number: status reads are captured ONE AT A TIME (see
+    /// `STATUS_TURN`) and numbered as they complete, so a higher number is a
+    /// later look at the chain and the wallet whatever order the browser's
+    /// requests were sent in. The browser keeps the highest it has seen. 0
+    /// from `summarize` alone (a snapshot `status` has not numbered).
+    pub snapshot: u64,
 }
+
+/// Status reads take turns, and each snapshot is numbered as it completes
+/// (#245 review, round 9). The browser's polls and its post-action read run on
+/// separate streams the node serves concurrently, so REQUEST order is not
+/// capture order: a later request can reach the node first and read an older
+/// view, and ordering replies by request number kept that older view. The
+/// turn makes one snapshot's coin and wallet reads an indivisible look, and
+/// the number taken under it orders the snapshots by when they were captured.
+static STATUS_TURN: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+static STATUS_SNAPSHOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Mojo totals travel as DECIMAL STRINGS: a JSON number is a double in the
 /// browser, exact only below 2^53 (about 9,007 XCH), and the screen promises
@@ -265,6 +282,7 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
         wallet_partial: false,
         partial,
         note: String::new(),
+        snapshot: 0,
     }
 }
 
@@ -393,6 +411,10 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
 }
 
 async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetParams) -> Result<FaucetStatus> {
+    // One snapshot at a time, numbered as it completes (see STATUS_TURN). Taken
+    // before the wallet lease below, never after it: the writers take the lease
+    // alone, so the two never wait on each other in a cycle.
+    let _turn = STATUS_TURN.lock().await;
     let peak = crate::chia_resolve::peak_height(client)
         .await
         .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
@@ -444,6 +466,7 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
         let _ = ctx;
         st.note = "this node was built without publishing; it can show the dish but not take or give".into();
     }
+    st.snapshot = STATUS_SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     Ok(st)
 }
 
@@ -565,12 +588,16 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
     );
     // Keyless: no AGG_SIG condition anywhere, so the aggregate is the identity.
     let bundle = SpendBundle::new(vec![coin_spend], chia_bls::Signature::default());
-    push(client, bundle).await?;
-    // Not our coin, but a second TAKE before this one confirms must not pick it;
+    // Not our coin, but a second TAKE before this one confirms must not pick it,
     // and while it stays parked (until the chain or the mempool settles the
-    // claim) our wallet counts as holding the gift.
-    crate::chia_publish::WALLET_LEASE.mark_spent([target.coin.coin_id()]);
+    // claim) our wallet counts as holding the gift. Both marks go on BEFORE the
+    // push (round 9): a push that times out may still have landed, and a wallet
+    // reading empty with no gift landing would let a second TAKE through.
+    // push_parked parks the coin first and hands it back only on an outright
+    // rejection — then the gift is not landing either (incoming_pending reads
+    // the parking).
     crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id());
+    crate::chia_publish::push_parked(client, bundle, [target.coin.coin_id()]).await?;
     println!(
         "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
         params.gift,
@@ -645,8 +672,8 @@ async fn give(
             .map_err(|e| anyhow!("standard-layer spend: {e:?}"))?;
     }
     let bundle = crate::chia_publish::sign_standard_spends(sk, ctx_spend.take())?;
-    push(client, bundle).await?;
-    crate::chia_publish::WALLET_LEASE.mark_spent(coins.iter().map(|c| c.coin_id()));
+    // Coins parked before the push leaves (round 9): see push_parked.
+    crate::chia_publish::push_parked(client, bundle, coins.iter().map(|c| c.coin_id())).await?;
     println!(
         "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",
         params.address(),
@@ -669,18 +696,6 @@ async fn give(
     _amount: u64,
 ) -> Result<FaucetReply> {
     Err(anyhow!("this node was built without publishing; it cannot give"))
-}
-
-#[cfg(feature = "chia-publish")]
-async fn push(client: &CoinsetClient, bundle: chia_protocol::SpendBundle) -> Result<()> {
-    let resp = client
-        .push_tx(bundle)
-        .await
-        .map_err(|e| anyhow!("coinset push_tx failed: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("push_tx rejected: {:?}", resp.error));
-    }
-    Ok(())
 }
 
 // ── bech32m (BIP-350), enough to print a Chia address ───────────────────────
@@ -919,6 +934,8 @@ mod tests {
         let json = serde_json::to_string(&st).unwrap();
         assert!(json.contains("\"nextReadyInBlocks\":null") && json.contains("\"canClaim\":false"));
         assert!(json.contains("\"partial\":false") && json.contains("\"walletPartial\":false"));
+        // Numbered only by `status` itself, as the snapshot completes.
+        assert!(json.contains("\"snapshot\":0"), "{json}");
     }
 
     #[test]

@@ -314,10 +314,17 @@ export class NetworkProvider implements NetworkProviderPort {
    *
    *  Resolves once the request is on the wire; REJECTS when it never left
    *  (no node connection, or the stream failed), so the caller can drop its
-   *  pending TAKE/GIVE instead of showing it until the timeout. */
+   *  pending TAKE/GIVE instead of showing it until the timeout.
+   *
+   *  The reply is accepted only while the transport this request went out on
+   *  is still the live one: a stream of a session since left can outlive
+   *  disconnect() (its read is still pending), and a reconnect that lands the
+   *  same room before it ends must not take that session's stale status or
+   *  error as its own. */
   async requestFaucet(op: FaucetOp, amount?: number): Promise<void> {
     const boot = this.#boot;
-    if (!this.#wt || this.#mode === 'offline' || !boot) {
+    const wt = this.#wt;
+    if (!wt || this.#mode === 'offline' || !boot) {
       throw new Error('no connection to your node');
     }
     try {
@@ -330,7 +337,7 @@ export class NetworkProvider implements NetworkProviderPort {
       const packet = new Uint8Array(4 + jsonBytes.length);
       new DataView(packet.buffer).setUint32(0, jsonBytes.length, true);
       packet.set(jsonBytes, 4);
-      const stream = await this.#wt.createBidirectionalStream();
+      const stream = await wt.createBidirectionalStream();
       const writer = stream.writable.getWriter();
       await writer.write(packet);
       // One request per stream: close() sends FIN, so after its reply the node
@@ -339,8 +346,9 @@ export class NetworkProvider implements NetworkProviderPort {
       await writer.close();
       // The reply comes back on THIS stream, and only a reply is accepted from
       // it: the generic envelope path never sees it, and nothing that arrives
-      // on a node-opened stream can pass for it.
-      void this.#drainNodeStream(stream, (env) => {
+      // on a node-opened stream can pass for it. Bound to `wt`: the drain
+      // stops delivering the moment that transport is no longer the live one.
+      void this.#drainNodeStream(stream, wt, (env) => {
         if (env?.kind === 'faucet') this.#faucetReplyHandler?.(env);
       });
     } catch (e) {
@@ -364,14 +372,17 @@ export class NetworkProvider implements NetworkProviderPort {
    *  Each stream carries u32-LE length-framed JSON SsfEnvelopes (same wire
    *  format as browser→node streams). */
   async #listenIncomingStreams(): Promise<void> {
-    if (!this.#wt) return;
+    // THIS session's transport: every stream it hands us is drained for as long
+    // as it stays the live one, and not a read longer.
+    const wt = this.#wt;
+    if (!wt) return;
     try {
-      const reader = this.#wt.incomingBidirectionalStreams.getReader();
-      while (this.#isActive) {
+      const reader = wt.incomingBidirectionalStreams.getReader();
+      while (this.#isActive && this.#wt === wt) {
         const { value: stream, done } = await reader.read();
         if (done) break;
         this.#openChannels++;
-        void this.#drainNodeStream(stream);
+        void this.#drainNodeStream(stream, wt);
       }
     } catch (e) {
       if (this.#isActive) {
@@ -382,17 +393,25 @@ export class NetworkProvider implements NetworkProviderPort {
 
   /** Read length-framed envelopes off `stream` until it ends. Node-opened
    *  streams deliver to the generic handler; a request stream we opened passes
-   *  its own `deliver`, so its replies never mix with forwarded traffic. */
+   *  its own `deliver`, so its replies never mix with forwarded traffic.
+   *
+   *  `owner` is the transport the stream belongs to. A read already pending
+   *  when disconnect() runs resolves later — possibly after a reconnect has
+   *  made the provider active again on a NEW transport — and what it read then
+   *  belongs to the session that was left, not to the live one: nothing is
+   *  delivered, and the drain ends, once `owner` is no longer `this.#wt`. */
   async #drainNodeStream(
     stream: { readable: ReadableStream<Uint8Array> },
+    owner: unknown,
     deliver: (env: any) => void = (env) => this.#envelopeHandler?.(env),
   ): Promise<void> {
     const reader = stream.readable.getReader();
     let buffer = new Uint8Array(0);
+    const live = (): boolean => this.#isActive && this.#wt === owner;
     try {
-      while (this.#isActive) {
+      while (live()) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done || !live()) break;
         const merged = new Uint8Array(buffer.length + value.length);
         merged.set(buffer, 0);
         merged.set(value, buffer.length);

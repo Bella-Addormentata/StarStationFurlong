@@ -67,12 +67,20 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// presence heartbeat (`publish_presence`, also the startup publish hook), the
 /// craps fairness hook's commit and reveal (`chia_craps_fair`), the faucet
 /// dish's GIVE (`chia_faucet`) — selects its coins, builds and pushes while
-/// holding `gate`, and records the coin ids it consumed in `pending`. Until a
-/// pushed spend confirms, the chain still lists its coins as unspent, so a
-/// second spend started in that window would pick the same coin and die in the
-/// mempool as a double-spend; with the lease it skips them. (The heartbeat's
-/// one-publish-per-tick rule serialized its own publishes; this covers every
-/// writer.)
+/// holding `gate`, and parks the coin ids it consumes in `pending` BEFORE the
+/// push leaves (see [`push_parked`]). Until a pushed spend confirms, the chain
+/// still lists its coins as unspent, so a second spend started in that window
+/// would pick the same coin and die in the mempool as a double-spend; with the
+/// lease it skips them. (The heartbeat's one-publish-per-tick rule serialized
+/// its own publishes; this covers every writer.)
+///
+/// Parked before, not after, the push (#245 review, round 9): a push that
+/// fails on the TRANSPORT (a timeout above all) is indeterminate — the gateway
+/// may hold the bundle — and a coin parked only on success would be free for
+/// the next writer to select while its spend sits in the mempool. So the
+/// inputs are parked first; an explicit REJECTION from the gateway (it holds
+/// nothing of the spend) hands them back at once, a transport error leaves
+/// them parked for the reconciliation below to settle.
 ///
 /// A parked coin is released by what the chain and the mempool say, not by a
 /// timer (#245 review, round 7: a zero-fee spend can wait in the mempool for
@@ -115,16 +123,32 @@ impl WalletLease {
         self.gate.lock().await
     }
 
-    /// Record the coins a just-pushed spend consumed.
-    pub fn mark_spent(&self, coin_ids: impl IntoIterator<Item = Bytes32>) {
-        self.mark_spent_at(coin_ids, Instant::now());
-    }
-
+    /// Park `coin_ids` as of `now`: the primitive under [`WalletLease::park_at`].
     pub fn mark_spent_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) {
         let mut pending = self.pending.lock().unwrap();
         for id in coin_ids {
             pending.insert(id, now);
         }
+    }
+
+    /// Park the coins a spend is ABOUT to consume, before its push leaves (see
+    /// [`push_parked`]). The returned [`Parking`] hands exactly this parking
+    /// back on an explicit rejection; a transport error keeps it.
+    pub fn park(&self, coin_ids: impl IntoIterator<Item = Bytes32>) -> Parking {
+        self.park_at(coin_ids, Instant::now())
+    }
+
+    pub fn park_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) -> Parking {
+        let ids: Vec<(Bytes32, Instant)> = coin_ids.into_iter().map(|id| (id, now)).collect();
+        self.mark_spent_at(ids.iter().map(|(id, _)| *id), now);
+        Parking(ids)
+    }
+
+    /// The gateway REJECTED the spend outright, so it holds nothing of it and
+    /// the coins are free again. Compare-and-release like [`WalletLease::release`]:
+    /// a coin a later writer parked again since keeps its newer marker.
+    pub fn unpark(&self, parking: &Parking) {
+        self.release(&parking.0);
     }
 
     /// A coin some pushed spend consumed, as far as the chain and the mempool
@@ -265,6 +289,48 @@ impl WalletLease {
     }
 }
 
+/// One spend's parking: the coins it consumes, each with the instant it was
+/// parked, as [`WalletLease::park`] recorded them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parking(Vec<(Bytes32, Instant)>);
+
+/// Push `bundle`, which consumes `inputs`, with the inputs PARKED FIRST (#245
+/// review, round 9). The three outcomes of a push, and what each leaves:
+///   - accepted: the inputs stay parked until the chain or the mempool settles
+///     the spend ([`WalletLease::reconcile`]);
+///   - rejected by the gateway (an explicit `success: false`): it holds nothing
+///     of the spend, so the inputs are handed back at once;
+///   - a transport error (a timeout above all): INDETERMINATE — the request may
+///     have reached the gateway and the spend may be in the mempool while the
+///     chain still lists the inputs unspent — so the inputs stay parked and
+///     reconciliation settles them (dropped: free again after the grace;
+///     landed: gone with the confirmation).
+/// Parking only on success, as the writers first did, left the third case
+/// free for the next writer to select and double-spend.
+///
+/// Callers hold the lease gate. For the dish's TAKE the input is the FAUCET
+/// coin, not ours: parking it keeps a second TAKE off it the same way.
+pub async fn push_parked(
+    client: &CoinsetClient,
+    bundle: SpendBundle,
+    inputs: impl IntoIterator<Item = Bytes32>,
+) -> Result<()> {
+    let parking = WALLET_LEASE.park(inputs);
+    let resp = match client.push_tx(bundle).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Err(anyhow!(
+                "coinset push_tx failed: {e} (the coins it spends stay parked until the chain or the mempool settles them)"
+            ))
+        }
+    };
+    if !resp.success {
+        WALLET_LEASE.unpark(&parking);
+        return Err(anyhow!("push_tx rejected: {:?}", resp.error));
+    }
+    Ok(())
+}
+
 /// Which parked coins to release, from what the chain and the mempool said:
 /// SPENT on chain, the spend confirmed and the coin is gone; UNSPENT and not in
 /// the mempool, the spend was dropped and the coin is free again; unspent and
@@ -296,25 +362,28 @@ impl Default for WalletLease {
 
 /// Find our largest UNSPENT coin — the one to spend-to-self — skipping coins a
 /// spend is already pending for (see [`WalletLease`]). `None` if unfunded.
+///
+/// Every page of the listing is read, up to the bound every wallet listing
+/// shares (`chia_faucet::MAX_FAUCET_PAGES`): the first page can hold only
+/// parked coins while a free one sits on the next, and a one-page read then
+/// called a funded wallet unfunded (#245 review, round 9).
 pub async fn find_spendable_coin(
     client: &CoinsetClient,
     puzzle_hash: Bytes32,
 ) -> Result<Option<Coin>> {
-    let resp = client
-        .get_coin_records_by_puzzle_hash(puzzle_hash, None, None, Some(false), None)
-        .await
-        .map_err(|e| anyhow!("coinset get_coin_records_by_puzzle_hash failed: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("coin lookup unsuccessful: {:?}", resp.error));
-    }
-    let mut coins: Vec<Coin> = resp
-        .coin_records
-        .unwrap_or_default()
+    let listing = crate::chia_faucet::unspent_at(client, puzzle_hash).await?;
+    let mut coins: Vec<Coin> = listing
+        .coins
         .into_iter()
-        .filter(|r| !r.spent)
-        .map(|r| r.coin)
+        .map(|c| c.coin)
         .filter(|c| !WALLET_LEASE.is_pending(&c.coin_id()))
         .collect();
+    if coins.is_empty() && listing.partial {
+        eprintln!(
+            "⛓️ wallet: no free coin in the first {} pages at {puzzle_hash}; the listing was cut short, so there may be one further on",
+            crate::chia_faucet::MAX_FAUCET_PAGES
+        );
+    }
     // Largest first — the recreated coin keeps the most value for future republishes.
     coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
     Ok(coins.into_iter().next())
@@ -560,16 +629,10 @@ pub async fn publish_presence(
         .await?
         .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
 
-    // 3. Build + sign the spend-to-self, then push to the mempool.
+    // 3. Build + sign the spend-to-self, then push to the mempool with the coin
+    //    parked first (push_parked: a timed-out push may still have landed).
     let bundle = build_publish_bundle(chia_sk, coin, hint, ciphertext)?;
-    let resp = client
-        .push_tx(bundle)
-        .await
-        .map_err(|e| anyhow!("coinset push_tx failed: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("push_tx rejected: {:?}", resp.error));
-    }
-    WALLET_LEASE.mark_spent([coin.coin_id()]);
+    push_parked(&client, bundle, [coin.coin_id()]).await?;
     Ok(hint)
 }
 
@@ -621,6 +684,30 @@ mod tests {
         // The verdict formed for the new parking does release it.
         lease.release(&lease.due_at(t1 + RECONCILE_GRACE));
         assert!(!lease.is_pending_at(&a, t1 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn inputs_are_parked_before_dispatch_and_only_an_explicit_rejection_frees_them() {
+        let lease = WalletLease::new();
+        let a = Bytes32::new([7u8; 32]);
+        let b = Bytes32::new([8u8; 32]);
+        let t0 = Instant::now();
+        // Parked the moment the writer commits to the spend, before any push.
+        let parking = lease.park_at([a, b], t0);
+        assert!(lease.is_pending_at(&a, t0) && lease.is_pending_at(&b, t0));
+        // A transport error leaves the parking alone (push_parked calls nothing):
+        // both coins stay parked and come due for reconciliation after the grace.
+        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE).len(), 2);
+        // An explicit rejection hands exactly this parking back.
+        lease.unpark(&parking);
+        assert!(!lease.is_pending_at(&a, t0) && !lease.is_pending_at(&b, t0));
+        // …but never a NEWER parking of the same coin: a later writer's spend of
+        // a coin the gateway rejected the first time keeps its marker.
+        let first = lease.park_at([a], t0);
+        lease.unpark(&first);
+        let _second = lease.park_at([a], t0 + Duration::from_secs(1));
+        lease.unpark(&first); // stale: the first spend's rejection, arriving late
+        assert!(lease.is_pending_at(&a, t0 + Duration::from_secs(2)));
     }
 
     #[test]

@@ -33,7 +33,7 @@ use chia_protocol::{Bytes, Bytes32, Coin};
 use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
 use sha2::{Digest, Sha256};
 
-use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, WALLET_LEASE};
+use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, push_parked, WALLET_LEASE};
 use crate::chia_resolve::{extract_ciphertext, fetch_coin_spend};
 
 /// Domain for the PUBLIC craps-fairness lookup hint. Unlike presence (keyed on a
@@ -92,7 +92,10 @@ pub fn derive_dice(seed_hex: &str, beacon_hex: &str, table: &str, round: u64) ->
 }
 
 /// Spend a specific `coin` back to self carrying `[fair_hint, payload]` memos —
-/// the plaintext fairness record. Reuses the presence lane's `build_publish_bundle`.
+/// the plaintext fairness record. Reuses the presence lane's `build_publish_bundle`
+/// and pushes with the coin parked first (`push_parked`: a push that times out
+/// may still have landed, so the coin stays parked until the chain or the
+/// mempool settles it; an outright rejection frees it).
 async fn push_fair_record(
     client: &CoinsetClient,
     chia_sk: &SecretKey,
@@ -103,14 +106,7 @@ async fn push_fair_record(
 ) -> Result<()> {
     let hint = fair_hint(table, round);
     let bundle = build_publish_bundle(chia_sk, coin, hint, Bytes::new(payload.to_vec()))?;
-    let resp = client
-        .push_tx(bundle)
-        .await
-        .map_err(|e| anyhow!("coinset push_tx failed: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("push_tx rejected: {:?}", resp.error));
-    }
-    Ok(())
+    push_parked(client, bundle, [coin.coin_id()]).await
 }
 
 /// Poll until `spent` is no longer in the unspent set, then return the largest
@@ -225,7 +221,6 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
             .await?
             .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; fund it at a testnet11 faucet"))?;
         push_fair_record(&client, chia_sk, coin.clone(), table, round, &commit_payload).await?;
-        WALLET_LEASE.mark_spent([coin.coin_id()]);
         coin
     };
     println!("   ✅ commit published; waiting for confirmation…");
@@ -244,7 +239,6 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
             .await?
             .ok_or_else(|| anyhow!("no spendable coin for the reveal (the commit's change not confirmed yet?)"))?;
         push_fair_record(&client, chia_sk, coin.clone(), table, round, &reveal_payload).await?;
-        WALLET_LEASE.mark_spent([coin.coin_id()]);
         coin
     };
     println!("   ✅ reveal published; waiting for confirmation…");
