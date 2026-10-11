@@ -176,6 +176,27 @@ describe('pad runs over a lossy lane', () => {
     expect(log.run(65500)).toBe(99);
   });
 
+  it('a burst of changes between ticks makes the host send early, so no run goes unsent', () => {
+    // Pads change on every frame; the host means to send every third frame
+    // (a slow update), and sends sooner whenever a change would push out a
+    // run no tick has carried.
+    const pads = new Uint16Array(300).map((_, i) => (i * 7) % 5);
+    const runs = new PadRuns();
+    const log = new PadLog();
+    let early = 0;
+    pads.forEach((p, i) => {
+      if (runs.needsTickBefore(p)) {
+        log.addTick(runs.tick()!);
+        early++;
+      }
+      runs.record(i, p);
+      if (i % 3 === 2) log.addTick(runs.tick()!);
+    });
+    expect(early).toBeGreaterThan(0);
+    expect(log.run(0)).toBe(300);
+    pads.forEach((p, f) => expect(log.get(f)).toBe(p));
+  });
+
   it('places nothing before the first frame of a match', () => {
     const runs = new PadRuns();
     const log = new PadLog();

@@ -514,6 +514,9 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     m = { ...m, id: freshMatchId(idsInUse()) };
     writeArcade(itemId, m);
     copy.matchId = m.id;
+    // The guest's copy starts over on the new id, its tick count with it.
+    copy.guestPad.reset();
+    copy.lastGuestAt = now;
   }
   seatGuest(copy, m, now);
   if (m.guestPage && now - copy.lastGuestAt > GUEST_GONE_MS) {
@@ -522,14 +525,21 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     seatGuest(copy, m, now);
   }
   if (now - copy.lastGuestAt > GUEST_SILENT_MS) copy.guestPad.reset();
+  const id = m.id;
+  const sendFrames = (): void => {
+    const runs = copy.runs.tick();
+    if (runs) send({ type: 'frames', match: id, ...runs, check: copy.latestCheck });
+  };
   copy.acc += dt;
   while (copy.acc >= FRAME_S && copy.ranNow < HOST_STEP_MAX) {
     const mine = s.link?.buttons ?? 0;
     const other = m.guestToken ? copy.guestPad.next() : (s.link?.localP2 ?? 0);
     const p1 = m.hostSeat === 0 ? mine : other;
     const p2 = m.hostSeat === 0 ? other : mine;
+    const pads = p1 | (p2 << 8);
+    if (copy.runs.needsTickBefore(pads)) sendFrames(); // or a run goes unsent
     machine.runFrame(p1, p2);
-    copy.runs.record(copy.next, p1 | (p2 << 8));
+    copy.runs.record(copy.next, pads);
     copy.next = frameAdd(copy.next, 1);
     if ((copy.next & (CHECK_EVERY - 1)) === 0) copy.latestCheck = machine.check();
     copy.acc -= FRAME_S;
@@ -540,10 +550,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     // Every frame while someone plays player 2 remotely (their delay is a
     // round trip), every other frame for watchers alone.
     copy.sendToggle = !copy.sendToggle;
-    const runs = copy.runs.tick();
-    if (runs && (m.guestToken !== 0 || copy.sendToggle)) {
-      send({ type: 'frames', match: m.id, ...runs, check: copy.latestCheck });
-    }
+    if (m.guestToken !== 0 || copy.sendToggle) sendFrames();
   }
   if (copy.syncAsked && !copy.snapshotBusy && now - copy.lastSnapshotAt >= SNAPSHOT_MIN_GAP_MS) {
     copy.syncAsked = false;
