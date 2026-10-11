@@ -64,11 +64,13 @@ import { getPlayerId } from './identity';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/** ⚖️ The plaque line for the round on a table: Fair (nobody can steer the
- *  result) or Friendly (you are trusting the owner's client). */
+/** ⚖️ The plaque line for the round on a table: Fair (the round runs the
+ *  seed exchange) or Friendly (you are trusting the owner's client). It names
+ *  the mode, not the outcome: whether a given result really took bettors'
+ *  seeds is the ⚙ card's verdict line, which warns on house-seed-only. */
 export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { text: string; color: string; fair: boolean } {
   return roundIsFair(tableId, game)
-    ? { text: '✔ FAIR TABLE · NOBODY CAN STEER THE RESULT', color: '#7CF5B0', fair: true }
+    ? { text: '✔ FAIR TABLE · EVERY BETTOR ADDS A SEED · CHECK EACH RESULT ON ⚙', color: '#7CF5B0', fair: true }
     : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F5C26B', fair: false };
 }
 

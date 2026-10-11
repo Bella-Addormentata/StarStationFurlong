@@ -104,8 +104,10 @@ function keepSeed(commit: string, seed: string): void {
 /** The secret behind `commit`, if THIS device made it (checked against the
  *  commitment, so a stale or edited store entry is never revealed). */
 function seedFor(commit: string, ctx: TableSeedContext): string | null {
+  // Commitments are public, so a peer can copy one from another open round
+  // into this one: the seed must open it in THIS context, memory copy too.
   const mem = memSeeds.get(commit);
-  if (mem) return mem;
+  if (mem && commitSeedSync(mem, ctx) === commit) return mem;
   try {
     const stored = localStorage.getItem(SEED_STORE_PREFIX + commit);
     if (stored && commitSeedSync(stored, ctx) === commit) return stored;
@@ -115,7 +117,10 @@ function seedFor(commit: string, ctx: TableSeedContext): string | null {
   return null;
 }
 
-function forgetSeed(commit: string): void {
+/** Drop the secret behind `commit` — only if it belongs to `ctx`, so a
+ *  commitment copied in from another open round can't erase that round's. */
+function forgetSeed(commit: string, ctx: TableSeedContext): void {
+  if (!seedFor(commit, ctx)) return;
   memSeeds.delete(commit);
   try {
     localStorage.removeItem(SEED_STORE_PREFIX + commit);
@@ -229,9 +234,9 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
       authored.add(myFrozen);
       authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
     }
-    if (rec && rec.round === s.round) forgetSeed(rec.commit);
-    if (myFrozen) forgetSeed(myFrozen);
-    forgetSeed(s.houseCommit);
+    if (rec && rec.round === s.round) forgetSeed(rec.commit, { table: tableId, round: rec.round, party: me, house: rec.house });
+    if (myFrozen) forgetSeed(myFrozen, bettorCtx(tableId, s, me));
+    forgetSeed(s.houseCommit, houseCtx(tableId, s.round));
   }
 }
 
@@ -306,7 +311,7 @@ export function gatherRound(tableId: string, s: TableState, now = Date.now()): G
 /** The round settled: the house seed is public now. */
 export function settledRound(tableId: string, s: TableState): void {
   settleDueAt.delete(roundKey(tableId, s.round, s.houseCommit));
-  if (s.houseCommit) forgetSeed(s.houseCommit);
+  if (s.houseCommit) forgetSeed(s.houseCommit, houseCtx(tableId, s.round));
 }
 
 // ── Anyone's check ────────────────────────────────────────────────────────────

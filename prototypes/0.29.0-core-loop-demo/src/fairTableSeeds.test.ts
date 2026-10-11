@@ -221,6 +221,28 @@ describe('a Fair roulette round', () => {
     expect((await verifySettledRound('roulette', t, forged, { pocket: forged.result! })).kind).toBe('failed');
   });
 
+  it("a commitment copied in from another open table doesn't make this page reveal that table's seed", () => {
+    const a = freshTable();
+    const closingA = rouletteToClosing(a);
+    const amyOnA = closingA.commits![AMY];
+    const b = freshTable();
+    tickAutoCroupier(b);
+    writeMyBets(b, AMY, 1, [{ type: 'red', amount: 5 }]);
+    const openB = readTableState(b)!;
+    // B's operator writes Amy's public commitment from table A as her record
+    // on B, and freezes it.
+    writeMySeedRecord(b, AMY, { round: 1, house: openB.houseCommit!, commit: amyOnA });
+    writeTableState(b, { ...openB, phase: 'closing', commits: { [AMY]: amyOnA } });
+    playersLook(b, 'roulette', [AMY]);
+    const onB = readSeedRecord(b, AMY);
+    expect(onB?.commit === amyOnA && onB.seed).toBeFalsy();
+    // Table A still reveals normally.
+    playersLook(a, 'roulette', [AMY]);
+    const onA = readSeedRecord(a, AMY)!;
+    expect(onA.seed).toBeTruthy();
+    expect(commitSeedSync(onA.seed!, { table: a, round: 1, party: AMY, house: closingA.houseCommit! })).toBe(amyOnA);
+  });
+
   it("a seed revealed last round can't be replayed as this round's", async () => {
     const t = freshTable();
     rouletteToClosing(t);
