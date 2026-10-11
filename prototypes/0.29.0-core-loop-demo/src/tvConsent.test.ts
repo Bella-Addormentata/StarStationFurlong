@@ -151,6 +151,8 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
       '[2001:0:c0a8:101::]', '[2001:0:808:808::3f57:fffe]', '[2001::a9fe:a9fe:0:0:0:0]', // Teredo: a private server, a private client (inverted), the metadata server
       '[2001:db8::5efe:7f00:1]', '[2001:db8::200:5efe:c0a8:101]', '[2001:db8:1:2:0:5efe:a9fe:a9fe]', '[2001:db8::5efe:a00:1]', // ISATAP under a global prefix: loopback, private (the u/l form), the metadata address, 10/8
       '[2002:808:808::5efe:c0a8:101]', // a public 6to4 prefix over a private ISATAP identifier: every IPv4 inside is judged
+      '[64:ff9b::7f00:1]', '[64:ff9b::c0a8:101]', '[64:ff9b::a9fe:a9fe]', '[64:ff9b::a00:1]', // NAT64, the well-known prefix: loopback, private, the metadata address, 10/8
+      '[64:ff9b:1::808:808]', '[64:ff9b:1:2:3::4]', // the local-use NAT64 prefix: refused whatever it carries, its IPv4's place being the network's to know
     ];
     for (const h of inside) expect(isPrivateHost(h), h).toBe(true);
     const outside = [
@@ -158,6 +160,7 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
       '198.17.255.255', '198.20.0.1', '192.0.1.1', '192.0.3.1', '198.51.101.1', '203.0.114.1', // the neighbours of those ranges are public
       '[2002:808:808::]', '[2001:0:808:808::f7f7:f7f7]', '[2001:4860:4860::8888]', '[::808:808]', '[2002:808:808::1:2:3]',
       '[2001:db8::5efe:808:808]', '[2001:db8::1:5efe:7f00:1]', // ISATAP naming a public host; an identifier that is not ISATAP's (1:5efe)
+      '[64:ff9b::808:808]', '[64:ff9c::7f00:1]', '[64:ff9b:2::7f00:1]', // NAT64 naming a public host; the well-known prefix's neighbours are no NAT64 prefix
     ];
     for (const h of outside) expect(isPrivateHost(h), h).toBe(false);
     for (const h of ['[2002::1::]', '[2002:zz::]', '[1:2:3:4:5:6:7:8:9]']) expect(isPrivateHost(h), h).toBe(false); // not addresses: nothing inside to judge
