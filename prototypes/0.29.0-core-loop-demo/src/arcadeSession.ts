@@ -292,8 +292,8 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
       copy.machine = machine;
       if (role === 'host' && copy.pending) {
         // The reference copy is ready at frame 0: tell the room, under an id
-        // no other cabinet took while the ROM loaded.
-        const taken = idsTakenBesides(itemId);
+        // no cabinet took while the ROM loaded.
+        const taken = idsInUse();
         if (taken.has(copy.pending.id)) copy.pending = { ...copy.pending, id: freshMatchId(taken) };
         copy.matchId = copy.pending.id;
         writeArcade(itemId, copy.pending);
@@ -310,10 +310,12 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
 
 const gameById = (id: string): ArcadeGame | undefined => ARCADE_GAMES.find((g) => g.id === id);
 
-/** The ids the room's other cabinets' matches hold. */
-function idsTakenBesides(itemId: string): Set<number> {
+/** The ids the room's matches hold, this cabinet's own last one included:
+ *  a new game there under its last host's id would look, to a page still
+ *  following that one, like the same game, and it would never switch. */
+function idsInUse(): Set<number> {
   const taken = new Set<number>();
-  for (const [cabinet, m] of readArcadeMatches()) if (cabinet !== itemId) taken.add(m.id);
+  for (const m of readArcadeMatches().values()) taken.add(m.id);
   return taken;
 }
 
@@ -491,7 +493,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   if (mustYieldId(itemId, m)) {
     // Ticks carry only the id: move to a fresh one. Copies that followed
     // the old id start over (from a save state if they missed the start).
-    m = { ...m, id: freshMatchId(idsTakenBesides(itemId)) };
+    m = { ...m, id: freshMatchId(idsInUse()) };
     writeArcade(itemId, m);
     copy.matchId = m.id;
   }
@@ -800,7 +802,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       const hostSeat: 0 | 1 = seats === 2 ? seat : 0;
       const copy = newCopy(s, itemId, 0, game, 'host');
       const match = newMatch({
-        game: game.id, host: getPlayerId(), hostPage: PAGE, hostSeat, now: Date.now(), taken: idsTakenBesides(itemId),
+        game: game.id, host: getPlayerId(), hostPage: PAGE, hostSeat, now: Date.now(), taken: idsInUse(),
       });
       copy.matchId = match.id;
       copy.pending = match;

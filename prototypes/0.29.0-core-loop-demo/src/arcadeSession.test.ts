@@ -415,6 +415,36 @@ describe('when the host goes', () => {
   }, 60_000);
 });
 
+describe('a new host after one who left', () => {
+  it("never reuses the last game's id, so a watcher still on that one follows the new game", async () => {
+    const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
+    // Every id pick lands on the same number unless it is taken.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    await startGame(a, 0, 2);
+    random.mockRestore();
+    const old = c.games.readArcade(ITEM)!.id;
+    await run(500);
+    expect(c.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
+    a.closed = true;
+    await run(13_000); // the cabinet is free again; a's record is still there
+    expect(c.games.readArcade(ITEM)?.id).toBe(old);
+
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const l = link(b, 1, 2);
+    l.host(THWAITE);
+    await run(100);
+    vi.restoreAllMocks();
+    expect(c.games.readArcade(ITEM)!.id).not.toBe(old);
+    const from = b.mod.arcadeCopyInfo(ITEM)!.next;
+    const p1 = padScript(9);
+    await run(3000, () => l.setButtons(p1()));
+    // The watcher dropped the old copy and shows b's game from its start.
+    const { common, differ } = compare(b, c, from);
+    expect(common).toBeGreaterThan(60);
+    expect(differ).toEqual([]);
+  }, 60_000);
+});
+
 describe('watching from across the room', () => {
   it('repaints less the farther away the watcher stands; the network is the same', async () => {
     const [a, near, far] = await room(['a', null], ['near', { x: 2, z: 0 }], ['far', { x: 20, z: 0 }]);
