@@ -48,6 +48,9 @@ interface Page {
   viewer: { x: number; z: number } | null;
   /** Closed the tab: no frames, no ticks, no doc updates either way. */
   closed: boolean;
+  /** Updates once every this many steps, with all their time (a slow
+   *  device; 1 = every step). */
+  every: number;
 }
 
 /** Ticks from → to that get lost (default: none). */
@@ -72,7 +75,7 @@ async function openPage(name: string, viewer: { x: number; z: number } | null = 
   games.bindGamesDoc(doc);
   const page: Page = {
     name, lane: `lane-${name}`, mod, games, casino, Y, doc,
-    hashes: new Map(), cards: [], attract: 0, outbox: [], sent: [], viewer, closed: false,
+    hashes: new Map(), cards: [], attract: 0, outbox: [], sent: [], viewer, closed: false, every: 1,
   };
   doc.on('update', (update: Uint8Array, origin: unknown) => {
     if (origin === 'room' || page.closed) return;
@@ -114,6 +117,12 @@ function heal(): void {
   }
 }
 
+/** While split, hand `to` the doc updates `from` made so far (the rest of
+ *  the room still waits for heal()). */
+function deliver(from: Page, to: Page): void {
+  for (const h of held ?? []) if (h.from === from) to.Y.applyUpdate(to.doc, h.update, 'room');
+}
+
 /** Run every open page for `ms` of game time at 60 updates a second.
  *  `each` runs before every update (set pads, join…). */
 async function run(ms: number, each?: (step: number) => void): Promise<void> {
@@ -121,7 +130,7 @@ async function run(ms: number, each?: (step: number) => void): Promise<void> {
   for (let i = 0; i < steps; i++) {
     vi.setSystemTime(Date.now() + 1000 / 60);
     each?.(i);
-    for (const p of pages) if (!p.closed) p.mod.arcadeFrame(1 / 60, p.viewer);
+    for (const p of pages) if (!p.closed && (i + 1) % p.every === 0) p.mod.arcadeFrame(p.every / 60, p.viewer);
     for (const from of pages) {
       for (const bytes of from.outbox) {
         for (const to of pages) {
@@ -325,6 +334,80 @@ describe('a shared game, played by two and watched by a third', () => {
     await run(300, () => next.setButtons(PAD_BIT.UP));
     const p2 = ticksOf(a, 'frames').slice(-5).map((t) => (unpackArcadeTick(t) as { cur: number }).cur >> 8);
     expect(p2.every((pad) => pad === PAD_BIT.UP)).toBe(true);
+  }, 60_000);
+
+  it("a slow host's burst of player 2 presses inside one update reaches every page", async () => {
+    const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
+    const host = await startGame(a, 0, 2);
+    host.setButtons(0);
+    const guest = link(b, 1, 2);
+    guest.join();
+    await run(100);
+    // The host's page updates every third step (20 fps), so each update runs
+    // up to three frames, and the guest's pad changes on every one of them:
+    // more runs than one tick holds.
+    a.every = 3;
+    const from = a.mod.arcadeCopyInfo(ITEM)!.next;
+    await run(3000, (i) => guest.setButtons(i % 2 ? PAD_BIT.A : PAD_BIT.B));
+    for (const p of [b, c]) {
+      const { common, differ } = compare(a, p, from);
+      expect(common, p.name).toBeGreaterThan(40); // the host paints once an update
+      expect(differ, p.name).toEqual([]);
+    }
+    expect(ticksOf(b, 'sync').length + ticksOf(c, 'sync').length).toBe(0); // nobody stalled
+  }, 60_000);
+
+  it("player 2's presses still count after the game moves to a new id", async () => {
+    const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
+    const host = await startGame(a, 0, 2);
+    host.setButtons(0);
+    const guest = link(b, 1, 2);
+    guest.join();
+    await run(1500, (i) => guest.setButtons(i % 20 < 10 ? PAD_BIT.B : 0)); // the guest's ticks count up
+    // A cabinet in another page's view of the room claimed this game's id at
+    // the same moment, and started first: the host moves the game to a new id,
+    // and the guest's copy (and its tick count) starts over.
+    const m = c.games.readArcade(ITEM)!;
+    c.games.writeArcade('arcade-3', {
+      ...m, host: 'someone', hostPage: 'their-page', guest: null, guestPage: null, guestToken: 0, startedAt: m.startedAt - 1,
+    });
+    await run(500, () => guest.setButtons(PAD_BIT.LEFT));
+    expect(a.games.readArcade(ITEM)).toMatchObject({ guestPage: b.mod.arcadePage() });
+    expect(a.games.readArcade(ITEM)!.id).not.toBe(m.id);
+    const p2 = ticksOf(a, 'frames').slice(-5).map((t) => (unpackArcadeTick(t) as { cur: number }).cur >> 8);
+    expect(p2.every((pad) => pad === PAD_BIT.LEFT)).toBe(true);
+  }, 60_000);
+
+  it("a guest whose game didn't load gives the stand back, and tries again later", async () => {
+    const [a, b] = await room(['a', null], ['b', null]);
+    // b's first fetch of the ROM hangs, then fails (a network blip).
+    let blip: (() => void) | null = null;
+    b.mod.setArcadeRomFetcher((url) => blip === null
+      ? new Promise((_, reject) => { blip = () => reject(new Error('offline')); })
+      : Promise.resolve(romBytes.get(url)!));
+    await startGame(a, 0, 2);
+    const guest = link(b, 1, 2);
+    guest.join(); // while its copy is still loading
+    await run(100);
+    expect(a.games.readArcade(ITEM)?.guestPage).toBe(b.mod.arcadePage());
+
+    blip!();
+    await run(100);
+    expect(b.cards).toContain('COULD NOT LOAD THIS GAME');
+    expect(a.games.readArcade(ITEM)?.guestPage).toBeNull(); // the stand is free again…
+    expect(guest.shared()?.joinAs).toBeNull(); // …for someone who can play
+    guest.join();
+    await run(100);
+    expect(a.games.readArcade(ITEM)?.guestPage).toBeNull();
+
+    await run(12_000); // the retry loads it, and catches up from a save state
+    expect(b.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
+    expect(guest.shared()).toMatchObject({ role: 'watcher', phase: 'playing', joinAs: 2 });
+    const from = a.mod.arcadeCopyInfo(ITEM)!.next;
+    await run(1000);
+    const { common, differ } = compare(a, b, from);
+    expect(common).toBeGreaterThan(30);
+    expect(differ).toEqual([]);
   }, 60_000);
 
   it('a host at the second stand plays player 2; the free stand offers player 1', async () => {
@@ -569,6 +652,61 @@ describe('rooms and builds', () => {
     expect(ticksOf(loser, 'frames').length).toBe(sentBefore); // it stopped hosting
     expect(loser.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
     const { common, differ } = compare(winner, loser, 60);
+    expect(common).toBeGreaterThan(60);
+    expect(differ).toEqual([]);
+  }, 60_000);
+
+  it('a watcher who saw the losing claim of a same-id clash switches to the game that stood', async () => {
+    const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
+    const CROOM = ARCADE_GAMES.find((g) => g.id === 'concentration-room')!;
+    split();
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    link(a, 0, 1).host(THWAITE);
+    link(b, 0, 1).host(CROOM);
+    await run(100);
+    random.mockRestore();
+    expect(a.games.readArcade(ITEM)!.id).toBe(b.games.readArcade(ITEM)!.id);
+
+    // Which claim the merge keeps, worked out on a scratch doc.
+    const probe = new c.Y.Doc();
+    c.Y.applyUpdate(probe, c.Y.encodeStateAsUpdate(c.doc));
+    for (const h of held!) c.Y.applyUpdate(probe, h.update);
+    const kept = (probe.getMap('games').get(ITEM) as { hostPage: string }).hostPage;
+    const [winner, loser] = kept === a.mod.arcadePage() ? [a, b] : [b, a];
+    const [won, lost] = winner === a ? [THWAITE, CROOM] : [CROOM, THWAITE];
+
+    // c hears the losing claim first, and follows it…
+    deliver(loser, c);
+    await run(300);
+    expect(c.mod.arcadeCopyInfo(ITEM)).toMatchObject({ role: 'follow', game: lost.id });
+
+    // …then the docs merge: same id, but another host's game. c switches
+    // on its next update, not only once the wrong ROM trips over the pads.
+    heal();
+    await run(1000 / 60);
+    expect(c.mod.arcadeCopyInfo(ITEM)).toMatchObject({ role: 'follow', game: won.id });
+    await run(3000);
+    expect(c.mod.arcadeCopyInfo(ITEM)).toMatchObject({ role: 'follow', game: won.id, started: true });
+    const from = winner.mod.arcadeCopyInfo(ITEM)!.next;
+    await run(1000);
+    const { common, differ } = compare(winner, c, from);
+    expect(common).toBeGreaterThan(30);
+    expect(differ).toEqual([]);
+  }, 60_000);
+
+  it('a watcher who walks in as an old match wraps to frame 0 asks for a save state, not power-on', async () => {
+    const [a] = await room(['a', null]);
+    await startGame(a, 0, 1);
+    // As if this match began 20 minutes ago: its frame 0 now is the u16
+    // clock wrapping (65536 frames), not its first frame.
+    const m = a.games.readArcade(ITEM)!;
+    a.games.writeArcade(ITEM, { ...m, startedAt: m.startedAt - 20 * 60_000 });
+    await run(300);
+    const c = await openPage('c');
+    await run(3000);
+    expect(ticksOf(c, 'sync').length).toBeGreaterThan(0);
+    expect(c.mod.arcadeCopyInfo(ITEM)?.started).toBe(true); // from the save state
+    const { common, differ } = compare(a, c);
     expect(common).toBeGreaterThan(60);
     expect(differ).toEqual([]);
   }, 60_000);

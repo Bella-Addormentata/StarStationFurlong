@@ -62,6 +62,10 @@ const STALL_SYNC_MS = 1000;
 const HOST_SILENT_MS = 4000;
 /** …and this long: the match is over as far as a watcher's cabinet shows. */
 const HOST_GONE_MS = 12000;
+/** Frame 0 comes round again every 65536 frames (the u16 clock, ~18
+ *  minutes at 60 a second). Only a match younger than this, by its start
+ *  time, can be at its first frame; the margin covers clocks that differ. */
+const FIRST_FRAME_WITHIN_MS = 10 * 60 * 1000;
 /** The guest silent this long: player 2's pad lets go… */
 const GUEST_SILENT_MS = 2000;
 /** …and this long: the guest closed the tab or lost the link, so the host
@@ -70,6 +74,8 @@ const GUEST_SILENT_MS = 2000;
 const GUEST_GONE_MS = 6000;
 /** The host writes at most one save state this often. */
 const SNAPSHOT_MIN_GAP_MS = 1000;
+/** A follower whose game didn't load (a network blip) tries again this often. */
+const LOAD_RETRY_MS = 10_000;
 /** The guest repeats its pad every this many updates, changed or not. */
 const GUEST_HEARTBEAT = 4;
 /** Watcher repaint by distance (metres): every frame, every 3rd, every 6th. */
@@ -130,11 +136,15 @@ function romFor(game: ArcadeGame): Promise<Uint8Array> {
 /** This page's copy of one match. */
 interface Copy {
   matchId: number;
+  /** The record's host page: with the id and game, which record this runs. */
+  hostPage: string;
   game: ArcadeGame;
   role: 'host' | 'follow';
   machine: ArcadeMachine | null;
   rom: Uint8Array | null;
   failed: boolean;
+  /** When it failed (Date.now()), for a follower's retry. */
+  failedAt: number;
   /** Has a state to run from (booted at frame 0, or restored). */
   started: boolean;
   /** The u16 frame it runs next. */
@@ -253,12 +263,14 @@ export function closeArcadeCabinet(itemId: string): void {
   sessions.delete(itemId);
 }
 
-function newCopy(s: CabinetSession, itemId: string, matchId: number, game: ArcadeGame, role: 'host' | 'follow'): Copy {
+function newCopy(
+  s: CabinetSession, itemId: string, matchId: number, hostPage: string, game: ArcadeGame, role: 'host' | 'follow',
+): Copy {
   s.copy?.machine?.stop();
   const now = Date.now();
   const copy: Copy = {
-    matchId, game, role,
-    machine: null, rom: null, failed: false, started: false, next: 0, acc: 0, createdAt: now, ranNow: 0,
+    matchId, hostPage, game, role,
+    machine: null, rom: null, failed: false, failedAt: 0, started: false, next: 0, acc: 0, createdAt: now, ranNow: 0,
     pending: null, runs: new PadRuns(), guestPad: new GuestPad(), guestToken: 0, lastGuestAt: 0,
     syncAsked: false, snapshotBusy: false, lastSnapshotAt: 0, latestCheck: 0, sendToggle: false,
     log: new PadLog(), hostLane: null, lastFramesAt: 0, stalledSince: null, needSync: false,
@@ -269,10 +281,16 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
   s.copy = copy;
   s.shown = null;
   /** A host's game that won't load never starts (the menu says why); a
-   *  follower's shows it on the cabinet. */
+   *  follower's shows it on the cabinet, gives back the second stand if it
+   *  had taken it (it can't play), and tries again later (reconcile). */
   const failed = () => {
     copy.failed = true;
-    if (role !== 'host') return;
+    copy.failedAt = Date.now();
+    if (role !== 'host') {
+      const m = inBoundRoom(s) ? readArcade(itemId) : null;
+      if (m && m.guestPage === PAGE && isCopyOf(copy, m)) writeArcade(itemId, withoutGuest(m, PAGE));
+      return;
+    }
     if (s.link) s.link.error = 'COULD NOT LOAD THAT GAME';
     s.copy = null;
     s.shown = null;
@@ -310,6 +328,17 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
 
 const gameById = (id: string): ArcadeGame | undefined => ARCADE_GAMES.find((g) => g.id === id);
 
+/** A follower whose game didn't load, due another try. */
+const loadRetryDue = (copy: Copy): boolean =>
+  copy.role === 'follow' && copy.failed && Date.now() - copy.failedAt >= LOAD_RETRY_MS;
+
+/** Is `copy` running the record `m`? Ticks carry only the id, but two pages
+ *  that claim a cabinet at once can draw the same one: the host page and the
+ *  game tell their records apart. */
+function isCopyOf(copy: Copy, m: ArcadeMatch): boolean {
+  return copy.matchId === m.id && copy.hostPage === m.hostPage && copy.game.id === m.game;
+}
+
 /** The ids the room's matches hold, this cabinet's own last one included:
  *  a new game there under its last host's id would look, to a page still
  *  following that one, like the same game, and it would never switch. */
@@ -346,10 +375,10 @@ function reconcile(itemId: string, s: CabinetSession, m: ArcadeMatch | null): vo
     }
     return;
   }
-  // The same match, and still ours to host if we were: two pages that
-  // claimed the cabinet at once under the same id leave one record, and the
-  // other page's copy follows it from here.
-  if (copy && copy.matchId === m.id && (copy.role !== 'host' || m.hostPage === PAGE)) return;
+  // The same match (a host's own record, too): two pages that claimed the
+  // cabinet at once leave one record, and a copy of the other one, host or
+  // follower, starts over on it here, even under the same id.
+  if (copy && isCopyOf(copy, m) && !loadRetryDue(copy)) return;
   if (m.hostPage === PAGE) {
     // A record naming this page that it no longer runs (it was reloaded:
     // a new page id, so this can only be a leftover): end it.
@@ -367,7 +396,7 @@ function reconcile(itemId: string, s: CabinetSession, m: ArcadeMatch | null): vo
     }
     return;
   }
-  newCopy(s, itemId, m.id, game, 'follow');
+  newCopy(s, itemId, m.id, m.hostPage, game, 'follow');
 }
 
 // ── Inbound ticks (main.ts, for every arcade tick) ───────────────────────────
@@ -463,7 +492,7 @@ export function arcadeFrame(dt: number, viewer: { x: number; z: number } | null)
     if (copy) copy.ranNow = 0;
     try {
       if (copy?.role === 'host') hostFrame(itemId, s, copy, step, now);
-      else if (copy && m && copy.matchId === m.id) followFrame(itemId, s, copy, m, step, now);
+      else if (copy && m && isCopyOf(copy, m)) followFrame(itemId, s, copy, m, step, now);
     } catch {
       // The emulator threw mid-frame (a bad save state, a jsnes bug): drop
       // this copy; a follower starts over, a host ends its game.
@@ -492,13 +521,16 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   const machine = copy.machine;
   if (!machine || !copy.started) return;
   let m = readArcade(itemId);
-  if (!m || m.id !== copy.matchId || m.hostPage !== PAGE) return; // reconcile has it next update
+  if (!m || !isCopyOf(copy, m)) return; // reconcile has it next update
   if (mustYieldId(itemId, m)) {
     // Ticks carry only the id: move to a fresh one. Copies that followed
     // the old id start over (from a save state if they missed the start).
     m = { ...m, id: freshMatchId(idsInUse()) };
     writeArcade(itemId, m);
     copy.matchId = m.id;
+    // The guest's copy starts over on the new id, its tick count with it.
+    copy.guestPad.reset();
+    copy.lastGuestAt = now;
   }
   seatGuest(copy, m, now);
   if (m.guestPage && now - copy.lastGuestAt > GUEST_GONE_MS) {
@@ -507,14 +539,21 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     seatGuest(copy, m, now);
   }
   if (now - copy.lastGuestAt > GUEST_SILENT_MS) copy.guestPad.reset();
+  const id = m.id;
+  const sendFrames = (): void => {
+    const runs = copy.runs.tick();
+    if (runs) send({ type: 'frames', match: id, ...runs, check: copy.latestCheck });
+  };
   copy.acc += dt;
   while (copy.acc >= FRAME_S && copy.ranNow < HOST_STEP_MAX) {
     const mine = s.link?.buttons ?? 0;
     const other = m.guestToken ? copy.guestPad.next() : (s.link?.localP2 ?? 0);
     const p1 = m.hostSeat === 0 ? mine : other;
     const p2 = m.hostSeat === 0 ? other : mine;
+    const pads = p1 | (p2 << 8);
+    if (copy.runs.needsTickBefore(pads)) sendFrames(); // or a run goes unsent
     machine.runFrame(p1, p2);
-    copy.runs.record(copy.next, p1 | (p2 << 8));
+    copy.runs.record(copy.next, pads);
     copy.next = frameAdd(copy.next, 1);
     if ((copy.next & (CHECK_EVERY - 1)) === 0) copy.latestCheck = machine.check();
     copy.acc -= FRAME_S;
@@ -525,10 +564,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     // Every frame while someone plays player 2 remotely (their delay is a
     // round trip), every other frame for watchers alone.
     copy.sendToggle = !copy.sendToggle;
-    const runs = copy.runs.tick();
-    if (runs && (m.guestToken !== 0 || copy.sendToggle)) {
-      send({ type: 'frames', match: m.id, ...runs, check: copy.latestCheck });
-    }
+    if (m.guestToken !== 0 || copy.sendToggle) sendFrames();
   }
   if (copy.syncAsked && !copy.snapshotBusy && now - copy.lastSnapshotAt >= SNAPSHOT_MIN_GAP_MS) {
     copy.syncAsked = false;
@@ -545,7 +581,10 @@ async function writeSnapshot(itemId: string, s: CabinetSession, copy: Copy): Pro
   copy.snapshotBusy = true;
   try {
     const data = await encodeSnapshot(state, boot);
-    if (s.copy === copy && inBoundRoom(s) && readArcade(itemId)?.id === copy.matchId) {
+    // Still this page's game: a claim that lost the cabinet meanwhile, even
+    // under the same id, must not write its state over the winner's.
+    const m = readArcade(itemId);
+    if (s.copy === copy && inBoundRoom(s) && m && isCopyOf(copy, m)) {
       writeArcadeSnapshot(itemId, { kind: 'arcade-snapshot', id: copy.matchId, next, data });
     }
   } catch {
@@ -557,15 +596,18 @@ async function writeSnapshot(itemId: string, s: CabinetSession, copy: Copy): Pro
 }
 
 function followFrame(itemId: string, s: CabinetSession, copy: Copy, m: ArcadeMatch, dt: number, now: number): void {
-  // The guest's heartbeat holds its seat, even while its ROM is loading.
-  if (m.guestPage === PAGE) sendGuestPad(s, copy, m);
+  // The guest's heartbeat holds its seat, even while its ROM is loading
+  // (not once it failed to: that copy can't play).
+  if (m.guestPage === PAGE && !copy.failed) sendGuestPad(s, copy, m);
   const machine = copy.machine;
   if (!machine) return;
   if (hostSilentFor(s, copy, now) > HOST_SILENT_MS) return; // nothing to run until the host is back
 
   if (!copy.started && !copy.needSync) {
-    // Heard the match from its first frame: run it from power-on.
-    if (copy.log.has(0) && copy.log.latest !== null && frameDiff(copy.log.latest, 0) < 4096) copy.started = true;
+    // Heard the match from its first frame: run it from power-on. (A frame
+    // 0 in an older match is the clock wrapping: that needs a save state.)
+    const young = now - m.startedAt < FIRST_FRAME_WITHIN_MS;
+    if (young && copy.log.has(0) && copy.log.latest !== null && frameDiff(copy.log.latest, 0) < 4096) copy.started = true;
     else if (copy.log.latest !== null) copy.needSync = true;
   }
   if (copy.needSync) {
@@ -777,7 +819,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
         };
       }
       const m = readArcade(itemId);
-      if (!m || !copy || copy.matchId !== m.id) return null;
+      if (!m || !copy || !isCopyOf(copy, m)) return null;
       const silent = hostSilentFor(s, copy, Date.now());
       if (silent > HOST_GONE_MS) return null; // gone: the cabinet is free
       const phase: SharedPhase = silent > HOST_SILENT_MS ? 'ended' : copy.started && !copy.needSync ? 'playing' : 'joining';
@@ -786,7 +828,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       }
       return {
         role: 'watcher', title: copy.game.title, phase,
-        joinAs: seats === 2 && m.guestPage === null && seat !== m.hostSeat && phase !== 'ended'
+        joinAs: seats === 2 && m.guestPage === null && seat !== m.hostSeat && phase !== 'ended' && !copy.failed
           ? (m.hostSeat === 0 ? 2 : 1)
           : null,
         player: null,
@@ -803,7 +845,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       const s = session();
       if (!s) return;
       const hostSeat: 0 | 1 = seats === 2 ? seat : 0;
-      const copy = newCopy(s, itemId, 0, game, 'host');
+      const copy = newCopy(s, itemId, 0, PAGE, game, 'host');
       const match = newMatch({
         game: game.id, host: getPlayerId(), hostPage: PAGE, hostSeat, now: Date.now(), taken: idsInUse(),
       });
@@ -828,7 +870,8 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
     },
 
     join(): void {
-      if (!session()) return;
+      const s = session();
+      if (!s || s.copy?.failed) return; // a game this page couldn't load: nothing to play
       const m = readArcade(itemId);
       if (!m || seats !== 2 || seat === m.hostSeat) return;
       const next = withGuest(m, getPlayerId(), PAGE);
@@ -871,11 +914,13 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
 
 // ── Tests and debugging ──────────────────────────────────────────────────────
 
-/** This page's copy of the cabinet's shared game: its role, the frame it
+/** This page's copy of the cabinet's shared game: its role and game, the frame it
  *  runs next, and whether it is running yet. */
-export function arcadeCopyInfo(itemId: string): { role: 'host' | 'follow'; next: number; started: boolean } | null {
+export function arcadeCopyInfo(
+  itemId: string,
+): { role: 'host' | 'follow'; game: string; next: number; started: boolean } | null {
   const copy = sessions.get(itemId)?.copy;
-  return copy ? { role: copy.role, next: copy.next, started: copy.started && !copy.needSync } : null;
+  return copy ? { role: copy.role, game: copy.game.id, next: copy.next, started: copy.started && !copy.needSync } : null;
 }
 
 /** Forget every cabinet (tests). */

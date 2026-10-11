@@ -48,9 +48,9 @@ export type TableGame =
 let boundDoc: Y.Doc | null = null;
 let gamesMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
-/** Bumped by every change to the bound map, and every rebind: the key of
- *  readArcadeMatches' copy, which a hosting cabinet reads every frame. */
-let mapVersion = 0;
+/** readArcadeMatches' answer until the games map next changes: a host
+ *  checks it every frame, and the map holds every table's game. */
+let arcadeMatches: ReadonlyMap<string, ArcadeMatch> | null = null;
 
 function notify(): void {
   // Copy: a listener may unsubscribe (or mount a new UI) mid-notify.
@@ -80,9 +80,9 @@ function docAlive(): boolean {
 export function bindGamesDoc(doc: Y.Doc): void {
   boundDoc = doc;
   gamesMap = doc.getMap('games');
-  mapVersion++;
+  arcadeMatches = null;
   gamesMap.observe(() => {
-    mapVersion++;
+    arcadeMatches = null;
     notify();
   });
   notify(); // repaint subscribers from the fresh doc (mirror of rebuildChatLog)
@@ -150,19 +150,15 @@ export function readArcade(cabinetId: string): ArcadeMatch | null {
   return isArcadeMatch(value) ? value : null;
 }
 
-let arcadeMatches: { version: number; matches: ReadonlyMap<string, ArcadeMatch> } | null = null;
-
-/** 🕹️ Every cabinet's shared game in the room, by cabinet id. The map is
- *  walked once per change to it (a peer can add any number of entries),
- *  not once per call: a hosting cabinet asks every frame. */
+/** 🕹️ Every cabinet's shared game in the room, by cabinet id. */
 export function readArcadeMatches(): ReadonlyMap<string, ArcadeMatch> {
   const map = ensureMap();
-  if (arcadeMatches?.version === mapVersion) return arcadeMatches.matches;
+  if (arcadeMatches) return arcadeMatches;
   const out = new Map<string, ArcadeMatch>();
   map.forEach((value, key) => {
     if (isArcadeMatch(value)) out.set(key, value);
   });
-  arcadeMatches = { version: mapVersion, matches: out };
+  arcadeMatches = out;
   return out;
 }
 
