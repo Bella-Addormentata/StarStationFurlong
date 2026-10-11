@@ -195,6 +195,9 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
     const promoButtons = PROMOTION_CHOICES.map((p) =>
       button(`promo-${p}`, `${PROMO_GLYPH[p]} ${p.toUpperCase()}`, true, `Promote pawns to a ${p}`, p === promotionChoice),
     ).join('');
+    // A remote move re-renders the card: keep keyboard focus on the same button.
+    const focusedAct = card.contains(document.activeElement)
+      ? (document.activeElement as HTMLElement).dataset?.act : undefined;
     card.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline;">
         <span style="font-size:11px; font-weight:800; letter-spacing:1.5px; color:${GOLD_BRIGHT};">⚙ CHESS TABLE</span>
@@ -216,6 +219,10 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
         ${button('reset', 'RESET TABLE', resetOk,
           resetOk ? 'Clear the table back to the game menu' : 'Players at the table or anyone who can edit this room can reset a live game')}
       </div>`;
+    if (focusedAct) {
+      (card.querySelector<HTMLButtonElement>(`button[data-act="${focusedAct}"]:not([disabled])`)
+        ?? card.querySelector<HTMLButtonElement>('button:not([disabled])'))?.focus();
+    }
   };
 
   const act = (what: string): void => {
