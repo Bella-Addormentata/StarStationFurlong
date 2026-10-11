@@ -294,7 +294,10 @@ export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Dat
   writeCrapsTableState(tableId, next);
   // ⚖️ A Fair window this page can't reveal the house seed for is void: settle
   // it now, before any shooter or the stickman throws dice for it.
-  if (next.houseCommit && !houseSeedHeld(tableId, next)) rollAndSettleCraps(tableId, next.round, next.point);
+  // (A robot-run table gets its usual show beat, so it opens the next window.)
+  if (next.houseCommit && !houseSeedHeld(tableId, next)) {
+    rollAndSettleCraps(tableId, next.round, next.point, manual ? undefined : CRAPS_SHOW_MS);
+  }
 }
 
 /** While the dice are with the shooter: settle their throw when it lands in

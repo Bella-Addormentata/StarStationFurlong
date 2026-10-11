@@ -18,7 +18,7 @@ const {
 const {
   BET_WINDOW_MS, CLOSING_MS, rollAndSettle, ROULETTE_PAGE_ID, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier,
 } = await import('./croupier');
-const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, pressManualRoll, stickmanThrows, tickAutoStickman } = await import('./crapsCroupier');
+const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, CRAPS_SHOW_MS, pressManualRoll, stickmanThrows, tickAutoStickman } = await import('./crapsCroupier');
 const {
   commitSeedSync, forgetMissingTables, keyFor, seedSigBytes, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
   wagerFingerprint,
@@ -954,6 +954,10 @@ describe('a Fair craps roll', () => {
     await flush();
     expect(readCrapsTableState(t)).toMatchObject({ phase: 'settled', voided: true, dice: null });
     expect(readDiceThrow(t)).toBeNull();
+    // A robot-run table moves on to the next roll after the usual beat.
+    later(CRAPS_SHOW_MS);
+    tickAutoStickman(t);
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'betting', round: 2 });
   });
 
   it('a played round stamped void fails the state guard', () => {
