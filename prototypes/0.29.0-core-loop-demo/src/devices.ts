@@ -4684,8 +4684,12 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <span style="color:${CH_DIM};">${k}</span><span style="color:${CH_GOLD}; text-align:right;">${v}</span>
       </div>`;
     const wallet = st?.walletMojos ?? null;
+    // GIVE spends what the node can spend NOW (owned minus coins still confirming
+    // an earlier spend); the balance line shows what the wallet owns.
+    const spendable = st?.walletSpendableMojos ?? wallet;
+    const confirming = wallet !== null && spendable !== null && spendable < wallet ? wallet - spendable : 0n;
     const canTake = !!st?.canClaim && pending === null;
-    const canGive = (mojos: number): boolean => !!st?.canGive && wallet !== null && wallet >= BigInt(mojos) && pending === null;
+    const canGive = (mojos: number): boolean => !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
     const pendingLine = pending === 'claim'
       ? 'TAKING… the mojo lands when the next block confirms it (about a minute)'
       : pending === 'give'
@@ -4714,7 +4718,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>
         <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
           ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
-          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}.` : ''}
+          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming a spend)` : ''}.` : ''}
         </div>
       </div>
       <div>

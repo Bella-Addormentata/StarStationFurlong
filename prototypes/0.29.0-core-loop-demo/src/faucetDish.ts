@@ -34,8 +34,12 @@ export interface FaucetStatus {
   /** This node can submit a claim / pay into the jar. */
   canClaim: boolean;
   canGive: boolean;
-  /** Our wallet's unspent mojos when the node has a wallet loaded. */
+  /** Mojos our wallet OWNS on chain, when the node has a wallet loaded. */
   walletMojos: bigint | null;
+  /** Of those, what the node can SPEND right now: owned minus coins a spend
+   *  already consumed but the chain has not confirmed yet. GIVE is gated on
+   *  this; an older node omits it (then it equals walletMojos). */
+  walletSpendableMojos: bigint | null;
   /** The node's coin listing was cut short (a flood of outputs): coins, ready
    *  and totalMojos cover the pages it read; the jar holds more. */
   partial: boolean;
@@ -85,8 +89,11 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
   if (total === null) return null;
   const next = r.nextReadyInBlocks;
   if (!(next === null || next === undefined || isNum(next))) return null;
-  const wallet = r.walletMojos === null || r.walletMojos === undefined ? null : asMojos(r.walletMojos);
-  if (r.walletMojos !== null && r.walletMojos !== undefined && wallet === null) return null;
+  const optMojos = (v: unknown): bigint | null | undefined => (v === null || v === undefined ? null : (asMojos(v) ?? undefined));
+  const wallet = optMojos(r.walletMojos);
+  if (wallet === undefined) return null;
+  const spendable = optMojos(r.walletSpendableMojos);
+  if (spendable === undefined) return null;
   return {
     address: r.address,
     puzzleHash: r.puzzleHash,
@@ -100,6 +107,7 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
     canClaim: r.canClaim === true,
     canGive: r.canGive === true,
     walletMojos: wallet,
+    walletSpendableMojos: spendable ?? wallet,
     partial: r.partial === true,
     note: typeof r.note === 'string' ? r.note : '',
   };

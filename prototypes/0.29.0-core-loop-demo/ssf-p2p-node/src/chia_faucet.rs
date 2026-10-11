@@ -179,9 +179,14 @@ pub struct FaucetStatus {
     pub can_claim: bool,
     /// This node can pay into the jar: wallet loaded and funded.
     pub can_give: bool,
-    /// Our wallet's unspent mojos, when a wallet is loaded (decimal string).
+    /// Mojos our wallet OWNS on chain, when a wallet is loaded (decimal string).
     #[serde(with = "opt_mojo_string")]
     pub wallet_mojos: Option<u64>,
+    /// Of those, the mojos we may SPEND right now: owned minus coins a pushed
+    /// spend already consumed but the chain has not confirmed yet (decimal
+    /// string). GIVE is gated on this; the empty-wallet courtesy check on `wallet_mojos`.
+    #[serde(with = "opt_mojo_string")]
+    pub wallet_spendable_mojos: Option<u64>,
     /// The coin listing hit [`MAX_FAUCET_PAGES`]: `coins`, `ready` and
     /// `total_mojos` cover the pages read, the jar holds more.
     pub partial: bool,
@@ -244,6 +249,7 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
         can_claim: false,
         can_give: false,
         wallet_mojos: None,
+        wallet_spendable_mojos: None,
         partial,
         note: String::new(),
     }
@@ -383,15 +389,19 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
     {
         match &ctx.wallet {
             Some(sk) => {
-                let mine = wallet_unspent(client, sk).await?;
-                let balance: u64 = mine.iter().map(|c| c.amount).sum();
-                st.wallet_mojos = Some(balance);
-                st.can_give = balance >= params.gift;
-                st.can_claim = mine.is_empty() && st.ready > 0;
-                st.note = if !mine.is_empty() && st.ready > 0 {
+                let wallet = wallet_view(client, sk).await?;
+                st.wallet_mojos = Some(wallet.owned_mojos());
+                st.wallet_spendable_mojos = Some(wallet.spendable_mojos());
+                st.can_give = wallet.spendable_mojos() >= params.gift;
+                // The courtesy check reads what we OWN: a coin parked by a spend
+                // in flight is still ours, so the wallet is not empty.
+                st.can_claim = wallet.owned.is_empty() && st.ready > 0;
+                st.note = if !wallet.owned.is_empty() && st.ready > 0 {
                     "the dish is for players with an empty wallet; yours already holds a coin".into()
-                } else if mine.is_empty() && st.ready == 0 {
+                } else if wallet.owned.is_empty() && st.ready == 0 {
                     "no mojo in the dish yet; it refills on the block clock".into()
+                } else if wallet.spendable_mojos() < wallet.owned_mojos() {
+                    "a spend from your wallet is still confirming (about a minute); giving waits for it".into()
                 } else {
                     String::new()
                 };
@@ -409,17 +419,38 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
     Ok(st)
 }
 
-/// Our wallet's unspent coins, minus those a spend is already pending for.
+/// Our wallet as the dish needs it: what the chain says we OWN (the courtesy
+/// "is my wallet empty" check, and the balance on the screen) and what we may
+/// SPEND right now (owned minus coins a pushed spend already consumed, see
+/// `chia_publish::WALLET_LEASE`). The two differ while a spend confirms, and the
+/// empty-wallet check must read the owned view: a funded wallet with a heartbeat
+/// in flight is not empty, and must not TAKE a mojo (#245 review, round 2).
 #[cfg(feature = "chia-publish")]
-async fn wallet_unspent(client: &CoinsetClient, sk: &chia_bls::SecretKey) -> Result<Vec<Coin>> {
+struct WalletView {
+    owned: Vec<Coin>,
+    spendable: Vec<Coin>,
+}
+
+#[cfg(feature = "chia-publish")]
+impl WalletView {
+    fn owned_mojos(&self) -> u64 {
+        self.owned.iter().map(|c| c.amount).sum()
+    }
+    fn spendable_mojos(&self) -> u64 {
+        self.spendable.iter().map(|c| c.amount).sum()
+    }
+}
+
+#[cfg(feature = "chia-publish")]
+async fn wallet_view(client: &CoinsetClient, sk: &chia_bls::SecretKey) -> Result<WalletView> {
     let ph = crate::chia_publish::our_puzzle_hash(sk);
-    Ok(unspent_at(client, ph)
-        .await?
-        .coins
-        .into_iter()
-        .map(|c| c.coin)
+    let owned: Vec<Coin> = unspent_at(client, ph).await?.coins.into_iter().map(|c| c.coin).collect();
+    let spendable = owned
+        .iter()
+        .copied()
         .filter(|c| !crate::chia_publish::WALLET_LEASE.is_pending(&c.coin_id()))
-        .collect())
+        .collect();
+    Ok(WalletView { owned, spendable })
 }
 
 /// Which of our coins pay a gift of `amount`: largest first until they cover it,
@@ -450,8 +481,8 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
         .wallet
         .as_ref()
         .ok_or_else(|| anyhow!("no wallet loaded: start the node with SSF_CHIA_LANE=1 to take a mojo"))?;
-    let mine = wallet_unspent(client, sk).await?;
-    if !mine.is_empty() {
+    // Owned, not spendable: a coin parked by a spend in flight is still ours.
+    if !wallet_view(client, sk).await?.owned.is_empty() {
         return Err(anyhow!("your wallet already holds a coin; the dish is for players with an empty wallet"));
     }
     let peak = crate::chia_resolve::peak_height(client)
@@ -528,13 +559,16 @@ async fn give(
     // Select, build and push under the lease: the heartbeat (or a second GIVE)
     // must not pick the same coins before this spend confirms.
     let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
-    let mine = wallet_unspent(client, sk).await?;
-    if mine.is_empty() {
+    let wallet = wallet_view(client, sk).await?;
+    if wallet.owned.is_empty() {
         return Err(anyhow!("your wallet is empty; fund it first (the dish takes, it does not lend)"));
     }
-    let total: u64 = mine.iter().map(|c| c.amount).sum();
-    let Some((coins, change)) = pick_give_coins(mine, amount) else {
-        return Err(anyhow!("your wallet holds {total} mojos; give at most that in one go"));
+    if wallet.spendable.is_empty() {
+        return Err(anyhow!("a spend from your wallet is still confirming (about a minute); give again after it lands"));
+    }
+    let total = wallet.spendable_mojos();
+    let Some((coins, change)) = pick_give_coins(wallet.spendable, amount) else {
+        return Err(anyhow!("your wallet can spend {total} mojos right now; give at most that in one go"));
     };
     let our_ph = crate::chia_publish::our_puzzle_hash(sk);
     let faucet_ph = params.puzzle_hash();
@@ -819,6 +853,7 @@ mod tests {
         assert_eq!(st.next_ready_in_blocks, Some(22));
         assert_eq!(st.address, params.address());
         assert!(!st.can_claim && !st.can_give && st.wallet_mojos.is_none() && !st.partial);
+        assert!(st.wallet_spendable_mojos.is_none());
         // Everyone ready: no "next".
         let st = summarize(&params, 200, &coins, true);
         assert_eq!((st.ready, st.next_ready_in_blocks, st.partial), (2, None, true));
@@ -836,12 +871,15 @@ mod tests {
         let mut st = summarize(&test_params(), 1, &[], false);
         st.total_mojos = u64::MAX;
         st.wallet_mojos = Some(9_007_199_254_740_993);
+        st.wallet_spendable_mojos = Some(9_007_199_254_740_000);
         let json = serde_json::to_string(&st).unwrap();
         assert!(json.contains("\"totalMojos\":\"18446744073709551615\""), "{json}");
         assert!(json.contains("\"walletMojos\":\"9007199254740993\""), "{json}");
+        assert!(json.contains("\"walletSpendableMojos\":\"9007199254740000\""), "{json}");
         let back: FaucetStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, st);
         st.wallet_mojos = None;
+        st.wallet_spendable_mojos = None;
         let json = serde_json::to_string(&st).unwrap();
         assert!(json.contains("\"walletMojos\":null"), "{json}");
         assert_eq!(serde_json::from_str::<FaucetStatus>(&json).unwrap(), st);

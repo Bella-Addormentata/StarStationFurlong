@@ -33,7 +33,7 @@ use chia_protocol::{Bytes, Bytes32, Coin};
 use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
 use sha2::{Digest, Sha256};
 
-use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash};
+use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, WALLET_LEASE};
 use crate::chia_resolve::{extract_ciphertext, fetch_coin_spend};
 
 /// Domain for the PUBLIC craps-fairness lookup hint. Unlike presence (keyed on a
@@ -212,22 +212,39 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
     println!("🎲⛓️ craps-fair selftest — table={table} round={round}");
     println!("   commit = {commit}");
 
-    // 1. COMMIT.
-    let coin_a = find_spendable_coin(&client, our_ph)
-        .await?
-        .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; fund it at a testnet11 faucet"))?;
+    // 1. COMMIT. Select + push under the wallet lease (chia_publish::WALLET_LEASE):
+    //    the heartbeat or the faucet dish must not pick the same coin before this
+    //    spend confirms. The confirmation wait below runs with the lease released.
     let commit_payload = serde_json::to_vec(&serde_json::json!({
         "t": table, "r": round, "k": "commit", "commit": commit,
     }))?;
-    push_fair_record(&client, chia_sk, coin_a.clone(), table, round, &commit_payload).await?;
+    let coin_a = {
+        let _lease = WALLET_LEASE.lock().await;
+        let coin = find_spendable_coin(&client, our_ph)
+            .await?
+            .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; fund it at a testnet11 faucet"))?;
+        push_fair_record(&client, chia_sk, coin.clone(), table, round, &commit_payload).await?;
+        WALLET_LEASE.mark_spent([coin.coin_id()]);
+        coin
+    };
     println!("   ✅ commit published; waiting for confirmation…");
-    let coin_b = wait_for_next_coin(&client, our_ph, &coin_a).await?;
+    wait_for_next_coin(&client, our_ph, &coin_a).await?;
 
     // 2. REVEAL (after the "betting window" — here, once the commit confirmed).
+    //    Selected afresh under the lease: `wait_for_next_coin`'s pick could have
+    //    been taken by another writer in the meantime.
     let reveal_payload = serde_json::to_vec(&serde_json::json!({
         "t": table, "r": round, "k": "reveal", "seed": seed_hex, "beacon": beacon_hex,
     }))?;
-    push_fair_record(&client, chia_sk, coin_b.clone(), table, round, &reveal_payload).await?;
+    let coin_b = {
+        let _lease = WALLET_LEASE.lock().await;
+        let coin = find_spendable_coin(&client, our_ph)
+            .await?
+            .ok_or_else(|| anyhow!("no spendable coin for the reveal (the commit's change not confirmed yet?)"))?;
+        push_fair_record(&client, chia_sk, coin.clone(), table, round, &reveal_payload).await?;
+        WALLET_LEASE.mark_spent([coin.coin_id()]);
+        coin
+    };
     println!("   ✅ reveal published; waiting for confirmation…");
     wait_for_next_coin(&client, our_ph, &coin_b).await?;
 

@@ -53,9 +53,11 @@ pub fn our_puzzle_hash(chia_sk: &SecretKey) -> Bytes32 {
 pub const PENDING_SPEND_TTL: Duration = Duration::from_secs(180);
 
 /// 🔒 Wallet spend lease (#245 review). Every spend from OUR wallet — the
-/// presence heartbeat, the startup hooks, the faucet dish's GIVE — selects its
-/// coins, builds and pushes while holding `gate`, and records the coin ids it
-/// consumed in `pending` for [`PENDING_SPEND_TTL`]. Until a pushed spend
+/// presence heartbeat (`publish_presence`, also the startup publish hook), the
+/// craps fairness hook's commit and reveal (`chia_craps_fair`), the faucet
+/// dish's GIVE (`chia_faucet`) — selects its coins, builds and pushes while
+/// holding `gate`, and records the coin ids it consumed in `pending` for
+/// [`PENDING_SPEND_TTL`]. Until a pushed spend
 /// confirms, the chain still lists its coins as unspent, so a second spend
 /// started in that window would pick the same coin and die in the mempool as a
 /// double-spend; with the lease it skips them. (The heartbeat's one-publish-per-

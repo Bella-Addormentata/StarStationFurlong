@@ -28,6 +28,7 @@ const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
   canClaim: false,
   canGive: false,
   walletMojos: null,
+  walletSpendableMojos: null,
   partial: false,
   note: '',
   ...over,
@@ -36,7 +37,12 @@ const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
 /** A status as the node puts it on the wire: mojo totals are decimal strings. */
 const wire = (over: Partial<FaucetStatus> = {}): Record<string, unknown> => {
   const st = status(over);
-  return { ...st, totalMojos: st.totalMojos.toString(), walletMojos: st.walletMojos === null ? null : st.walletMojos.toString() };
+  return {
+    ...st,
+    totalMojos: st.totalMojos.toString(),
+    walletMojos: st.walletMojos === null ? null : st.walletMojos.toString(),
+    walletSpendableMojos: st.walletSpendableMojos === null ? null : st.walletSpendableMojos.toString(),
+  };
 };
 
 const b64 = (v: unknown): string => btoa(JSON.stringify(v));
@@ -59,6 +65,13 @@ describe('faucet dish: node replies', () => {
     const big = parseFaucetReply(b64({ op: 'status', ok: true, status: { ...wire(), totalMojos: '18446744073709551615', walletMojos: '9007199254740993' } }));
     expect(big?.status?.totalMojos).toBe(18446744073709551615n);
     expect(big?.status?.walletMojos).toBe(9007199254740993n);
+    // Spendable rides along as its own string; an older node that omits it means "all of it".
+    const split = parseFaucetReply(b64({ op: 'status', ok: true, status: { ...wire(), walletMojos: '5000', walletSpendableMojos: '1200' } }));
+    expect(split?.status?.walletSpendableMojos).toBe(1200n);
+    const legacy = { ...wire(), walletMojos: '5000' } as Record<string, unknown>;
+    delete legacy.walletSpendableMojos;
+    expect(parseFaucetReply(b64({ op: 'status', ok: true, status: legacy }))?.status?.walletSpendableMojos).toBe(5000n);
+    expect(asFaucetStatus({ ...wire(), walletSpendableMojos: 'some' })).toBeNull();
     expect(asMojos(1005)).toBe(1005n);
     expect(asMojos('0')).toBe(0n);
     expect(asMojos('-1')).toBeNull();
