@@ -6363,10 +6363,15 @@ export class World {
           deviceFocus.releaseThen(() => {
             if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) openTvTheatre(deviceId);
           }),
+        // The same guard in the remote's continuation: a phone reopened on a
+        // set that left with its room, after the drive was disarmed, would
+        // show a remote nothing ticks for.
         openRemote: () =>
-          deviceFocus.releaseThen(() =>
-            (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.(),
-          ),
+          deviceFocus.releaseThen(() => {
+            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) {
+              (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
+            }
+          }),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

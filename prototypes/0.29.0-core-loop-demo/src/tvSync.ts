@@ -321,7 +321,6 @@ export class TvSyncController {
         this.settlePending(p, now);
         this.seenStarted = started;
       } else {
-        this.appliedJump = jump;
         this.pendingTarget = null;
         // A viewer's new programme while paused is a seek whatever the band
         // says, for the same reason, and the revision is consumed with it: a
@@ -335,12 +334,21 @@ export class TvSyncController {
         // position would seek to it again every cooldown for good.
         const rewind = newProgramme && p.canSeek;
         const target = reachable(pb.positionMs, p);
-        if (rewind || (p.canSeek && Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS
-          && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
+        const far = Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS;
+        let seeked = false;
+        if (rewind || (p.canSeek && far && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
           p.seek(target);
           this.lastSeekAt = now;
+          seeked = true;
         }
         if (!newProgramme || rewind || !p.hasClock) this.seenStarted = started;
+        // The transport revision is followed once this player has been sent
+        // where the record says, is there already, or never can be (no
+        // clock) — not before: a viewer that cannot seek yet, handed the
+        // remote while still paused, takes the jump up as its own target on
+        // the holder's first tick (above), and a RESUME then writes the
+        // target, not the player's un-rewound position.
+        if (seeked || !p.hasClock || (p.canSeek && !far && !newProgramme)) this.appliedJump = jump;
       }
       return pb;
     }
@@ -571,7 +579,15 @@ export class TvSyncController {
       const far = pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS;
       const owed = this.replayDue !== null;
       const fresh = owed && this.replayDue !== this.replayIssuedFor;
-      if (p.canSeek && (far || owed) && (fresh || now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
+      // A record at or past this player's end is nowhere to go: a new
+      // programme the holder already ran out (PLAY NOW, then +10 s past a
+      // short file's end before this tick) leaves the player at the end
+      // with the room, and a play() from here would start the file over.
+      // The replay stays owed: the record moving back before the end (a
+      // rewind) is followed on that tick, as any.
+      const range = p.seekableRange();
+      const atEnd = range !== null && pb.positionMs >= range.endMs;
+      if (!atEnd && p.canSeek && (far || owed) && (fresh || now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
         p.seek(pb.positionMs);
         this.lastSeekAt = now;
         this.replayIssuedFor = this.replayDue;

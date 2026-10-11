@@ -243,10 +243,13 @@ export function mediaOrigin(source: TvSource): string | null {
 }
 
 /** A host on this machine or its networks: loopback, link-local, the
- *  private and CGNAT ranges, multicast, IPv4-mapped IPv6 of the same, and
- *  intranet names (no dot, `.local`, `.internal`, `.lan`, `.home.arpa`).
- *  Conservative on purpose: a miss here costs a viewer a button press; a
- *  miss the other way costs them a request into their own LAN. */
+ *  private and CGNAT ranges, the benchmarking range (198.18.0.0/15, routed
+ *  only inside test networks), the IETF and documentation ranges (which
+ *  nothing public answers from), multicast, IPv4-mapped IPv6 of the same,
+ *  and intranet names (no dot, `.local`, `.internal`, `.lan`,
+ *  `.home.arpa`). Conservative on purpose: a miss here costs a viewer a
+ *  button press; a miss the other way costs them a request into their own
+ *  LAN. */
 export function isPrivateHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, '');
   if (!h) return true;
@@ -257,11 +260,16 @@ export function isPrivateHost(hostname: string): boolean {
   if (v4) {
     const a = Number(v4[1]);
     const b = Number(v4[2]);
+    const c = Number(v4[3]);
     return a === 0 || a === 10 || a === 127
       || (a === 169 && b === 254)
       || (a === 172 && b >= 16 && b <= 31)
       || (a === 192 && b === 168)
       || (a === 100 && b >= 64 && b <= 127)
+      || (a === 198 && (b === 18 || b === 19)) // 198.18.0.0/15, benchmarking (RFC 2544)
+      || (a === 192 && b === 0 && (c === 0 || c === 2)) // 192.0.0.0/24 IETF assignments, 192.0.2.0/24 TEST-NET-1
+      || (a === 198 && b === 51 && c === 100) // TEST-NET-2
+      || (a === 203 && b === 0 && c === 113) // TEST-NET-3
       || a >= 224;
   }
   return !h.includes('.'); // a bare intranet name: "nas", "printer"
