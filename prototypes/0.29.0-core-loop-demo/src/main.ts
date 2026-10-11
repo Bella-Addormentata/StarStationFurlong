@@ -20,6 +20,7 @@ import {
   unpackAddressedTick,
   tickKind,
   TICK_KIND_MOVEMENT,
+  TICK_KIND_ALLIGATORS,
   ADDRESSED_TICK_BYTES,
   TICK_BYTES,
   type MovementTick,
@@ -32,6 +33,11 @@ import {
   routeAirHockeyTick,
   setAirHockeySender,
 } from "./airHockeySession";
+// 🐊 #185: insatiable-alligators heads and balls ride lane kind 3.
+import {
+  routeAlligatorsTick,
+  setAlligatorsSender,
+} from "./alligatorsSession";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -562,6 +568,7 @@ const networkProvider = new NetworkProvider();
 // provider is a boot-time singleton and sendTick self-gates on connection
 // state (clean no-op offline), so one wiring here covers every room join.
 setAirHockeySender((buf) => networkProvider.sendTick(buf));
+setAlligatorsSender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -3077,7 +3084,9 @@ async function joinRoomAtEpoch(
         seenPeers.add(peerId);
         receivedTicks++;
         remoteLastSeen.set(peerId, performance.now());
-        routeAirHockeyTick(peerId, tick);
+        // 🐊 #185: kind 3 is the alligators lane; 1–2 stay air hockey's.
+        if (tickKind(tick.flags) === TICK_KIND_ALLIGATORS) routeAlligatorsTick(peerId, tick);
+        else routeAirHockeyTick(peerId, tick);
         return;
       }
       seenPeers.add(peerId);
