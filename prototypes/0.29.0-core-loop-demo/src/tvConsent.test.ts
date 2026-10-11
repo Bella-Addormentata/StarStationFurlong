@@ -143,6 +143,7 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
     const inside = [
       '127.0.0.1', '127.9.9.9', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.0.1', '169.254.1.1', '0.0.0.0',
       '100.64.0.1', '224.0.0.1', '255.255.255.255', 'localhost', 'foo.localhost', 'nas', 'printer.local',
+      '198.18.0.1', '198.19.255.255', '192.0.0.1', '192.0.2.1', '198.51.100.7', '203.0.113.9', // benchmarking, IETF, the three TEST-NETs
       'box.internal', 'tv.lan', 'pi.home.arpa', '[::1]', '[::]', '[fe80::1]', '[fd00::1]', '[fc00::1]',
       '[::ffff:7f00:1]', '[::ffff:c0a8:101]', '[::ffff:127.0.0.1]', '[ff02::1]', '[ff15::efc0:988f]', '[ff0e::1]',
       '[::7f00:1]', // IPv4-compatible 127.0.0.1
@@ -154,6 +155,7 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
     for (const h of inside) expect(isPrivateHost(h), h).toBe(true);
     const outside = [
       'example.org', 'archive.org', '8.8.8.8', '172.15.0.1', '172.32.0.1', '100.63.0.1', '[2001:db8::1]', '[::ffff:808:808]',
+      '198.17.255.255', '198.20.0.1', '192.0.1.1', '192.0.3.1', '198.51.101.1', '203.0.114.1', // the neighbours of those ranges are public
       '[2002:808:808::]', '[2001:0:808:808::f7f7:f7f7]', '[2001:4860:4860::8888]', '[::808:808]', '[2002:808:808::1:2:3]',
       '[2001:db8::5efe:808:808]', '[2001:db8::1:5efe:7f00:1]', // ISATAP naming a public host; an identifier that is not ISATAP's (1:5efe)
     ];

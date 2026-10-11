@@ -275,7 +275,8 @@ const seenLeases = new Map<string, SeenLease>();
  *  tick back), is stamped with the last mark BEFORE the gap: the latest
  *  moment this page can vouch it was awake to receive anything. A page
  *  that never marks (no room tick running) stamps every lease on arrival,
- *  as before. */
+ *  as before. The gap is measured by both clocks (gapSince): the monotonic
+ *  clock may have stood still through the sleep. */
 export const TV_SUSPEND_GAP_MS = 2_500;
 export const TV_WAKE_WINDOW_MS = 1_000;
 let awakeAt = -Infinity;
@@ -302,8 +303,21 @@ interface GapBridge { at: number; correctionMs: number }
 const gapBridges: GapBridge[] = [];
 const GAP_BRIDGES_KEPT = 16;
 let awakeWallAt = NaN;
+/** Whether the marks have a gap in them as of `now`: by EITHER clock. The
+ *  monotonic clock may stand still through a sleep (macOS, Linux) and show a
+ *  tick's worth where an hour passed; the wall clock ran on. The cost of
+ *  listening to it: a forward wall-clock step wider than the threshold
+ *  between two ticks (an NTP correction, a manual change) reads as a sleep
+ *  too — every sample from before it is stale for one wake window, bridged
+ *  by the step, until the holder's next beat lands fresh. A backward step
+ *  reads as nothing (never a negative gap). */
+function gapSince(now: number, wall: number): boolean {
+  if (awakeAt === -Infinity) return false;
+  if (now - awakeAt > TV_SUSPEND_GAP_MS) return true;
+  return Number.isFinite(awakeWallAt) && wall - awakeWallAt > TV_SUSPEND_GAP_MS;
+}
 export function markTvPageAwake(now = clock(), wall = wallClock()): void {
-  if (awakeAt !== -Infinity && now - awakeAt > TV_SUSPEND_GAP_MS) {
+  if (gapSince(now, wall)) {
     preGapAwake = awakeAt;
     wakeWindowUntil = now + TV_WAKE_WINDOW_MS;
     lastGapAt = now;
@@ -322,11 +336,29 @@ function gapCorrectionSince(receivedAt: number): number {
   for (const g of gapBridges) if (g.at > receivedAt) sum += g.correctionMs;
   return sum;
 }
+/** What has really elapsed since a moment on the receipt timeline (a lease
+ *  as this page saw it): the monotonic clock's account, with the wall
+ *  clock's measure of every gap since in place of the monotonic clock's —
+ *  the gaps marked (gapBridges) and one not yet marked, found here as the
+ *  tick finds it (gapSince). A lapse measured on the monotonic clock alone
+ *  would give a lease seen before a sleep that clock stood still through a
+ *  fresh eight seconds on waking. */
+function elapsedSince(at: number, now: number, wall: number): number {
+  let elapsed = now - at + gapCorrectionSince(at);
+  if (at <= awakeAt && gapSince(now, wall)) {
+    const monotonic = now - awakeAt;
+    const real = Number.isFinite(awakeWallAt) ? Math.max(0, wall - awakeWallAt) : monotonic;
+    elapsed += real - monotonic;
+  }
+  return elapsed;
+}
 /** The moment a lease landing now counts as seen: now, unless this page
- *  was not awake to see it — then the last moment it provably was. */
-function receiptStamp(now: number): number {
+ *  was not awake to see it — then the last moment it provably was. A gap
+ *  not yet marked (the update applies before the first tick back) is found
+ *  here by either clock, as the tick finds it (gapSince). */
+function receiptStamp(now: number, wall: number): number {
   if (awakeAt === -Infinity) return now;
-  if (now - awakeAt > TV_SUSPEND_GAP_MS) return awakeAt;
+  if (gapSince(now, wall)) return awakeAt;
   if (now <= wakeWindowUntil) return preGapAwake;
   return now;
 }
@@ -367,7 +399,7 @@ function noteSamples(keys: Iterable<string>, local = false): void {
   // the network delivers is stamped from before the gap when it lands in
   // the moment after waking (receiptStamp), since the network may have
   // held it through the sleep.
-  const stamp = local ? now : receiptStamp(now);
+  const stamp = local ? now : receiptStamp(now, wallClock());
   for (const key of keys) {
     if (key.startsWith('remote:')) {
       const itemId = key.slice(7);
@@ -679,8 +711,9 @@ function seeLease(itemId: string, rec: RemoteRecord, now: number): SeenLease {
 export function remoteLapsed(itemId: string, now = clock()): boolean {
   const rec = readRemote(itemId);
   if (!rec.holder) return true;
-  const seen = seeLease(itemId, rec, receiptStamp(now));
-  return now - seen.at >= TV_LEASE_LAPSE_MS;
+  const wall = wallClock();
+  const seen = seeLease(itemId, rec, receiptStamp(now, wall));
+  return elapsedSince(seen.at, now, wall) >= TV_LEASE_LAPSE_MS;
 }
 
 export function remoteStatus(itemId: string, now = clock()): RemoteStatus {

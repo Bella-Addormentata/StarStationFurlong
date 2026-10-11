@@ -4,7 +4,7 @@
  * never written — from the paste box and from PREVIOUSLY ON alike.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { playRefusal } from './tvUI';
+import { playRefusal, tvNavIndex } from './tvUI';
 import { forgetMediaConsent, setOwnMediaOrigins } from './tvConsent';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -29,6 +29,21 @@ describe('what the remote refuses to write, serverless only (the build default)'
   it('a link on this page\'s own origin or its node plays here: nothing to refuse', () => {
     expect(playRefusal({ kind: 'url', url: 'http://localhost:4173/film.mp4' })).toBeNull();
     expect(playRefusal({ kind: 'url', url: 'http://127.0.0.1:8080/blob/abc' })).toBeNull();
+  });
+});
+
+describe('the remote by keyboard: ↑/↓ step through the visible controls and wrap', () => {
+  it('steps and wraps at both ends, lands on the first from nowhere, and has nowhere to go with no control', () => {
+    expect(tvNavIndex(5, 0, 1)).toBe(1);
+    expect(tvNavIndex(5, 4, 1)).toBe(0); // ↓ from the last wraps to the first
+    expect(tvNavIndex(5, 0, -1)).toBe(4); // ↑ from the first wraps to the last
+    expect(tvNavIndex(5, 2, -1)).toBe(1);
+    expect(tvNavIndex(5, -1, 1)).toBe(0); // focus on the view itself: the first control
+    expect(tvNavIndex(5, -1, -1)).toBe(0);
+    expect(tvNavIndex(5, 9, 1)).toBe(0); // a control that just left the list (a repaint): the first
+    expect(tvNavIndex(1, 0, 1)).toBe(0); // one control: it stays
+    expect(tvNavIndex(1, 0, -1)).toBe(0);
+    expect(tvNavIndex(0, -1, 1)).toBe(-1); // nothing visible: nowhere to go
   });
 });
 

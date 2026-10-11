@@ -531,6 +531,46 @@ describe('a replay of a clip shorter than the seek band', () => {
     g.tick();
     expect(q.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // consumed
   });
+
+  it('a viewer paused on a new programme before its ranges arrived, handed the remote still paused, takes the rewind up as its own target: the room reads the target, and the seek goes out on the first tick it can', () => {
+    const p = new FakePlayer(true, false);
+    p.duration = 1_000;
+    const opts = { hold: false };
+    const h = harness(p, opts);
+    h.tick();
+    p.position = 800;
+    h.set({ positionMs: 800 });
+    h.tick();
+    h.replay({ state: 'paused', positionMs: 0, running: false }); // PLAY NOW, then PAUSE
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]); // cannot yet, as a viewer
+    opts.hold = true; // the remote handed over while still paused
+    h.tick();
+    expect(h.c.positionMs()).toBe(0); // the holder names the target, not the player's old 800
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]); // still cannot
+    p.canSeek = true;
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // the holder's own seek, once able
+    expect(p.position).toBe(0);
+    h.transport({ state: 'playing', positionMs: 0, running: true }); // RESUME from the top
+    h.tick();
+    expect(h.beats).toEqual([0]); // the beat from the target, landed, never from 800
+    // The same hand-over to a viewer that is IN STEP already (the band) aims nothing.
+    const q = new FakePlayer(true, false);
+    q.duration = 1_000;
+    const qo = { hold: false };
+    const g = harness(q, qo);
+    g.tick();
+    q.position = 500;
+    g.transport({ state: 'paused', positionMs: 500, running: false });
+    g.tick();
+    qo.hold = true;
+    g.tick();
+    expect(g.c.positionMs()).toBe(500);
+    q.canSeek = true;
+    g.tick();
+    expect(q.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+  });
 });
 
 describe('an ended programme', () => {
@@ -557,6 +597,31 @@ describe('an ended programme', () => {
     now += 500; c.tick();
     now += 500; c.tick();
     expect(ended).toBe(1);
+  });
+
+  it('a new programme the holder already ran out (its record at or past this player\'s end) is not played from the top by a viewer: the player is at the end with the room, until a rewind moves the record back', () => {
+    const viewer = new FakePlayer(true);
+    viewer.duration = 1_000;
+    const hv = harness(viewer);
+    hv.tick();
+    viewer.position = 1_000;
+    viewer.playing = false;
+    viewer.ended = true;
+    hv.set({ positionMs: 1_000 });
+    hv.tick();
+    expect(viewer.log).toEqual(['play']);
+    // PLAY NOW again, then +10 s past the file's end before this viewer's tick.
+    hv.replay({ positionMs: 1_200 });
+    hv.tick();
+    hv.tick(TV_SEEK_COOLDOWN_MS);
+    expect(viewer.log).toEqual(['play']); // no seek to the end, no play() that would start over
+    expect(viewer.ended).toBe(true);
+    // The holder rewinds: the replay owed is followed.
+    hv.transport({ positionMs: 0 });
+    hv.tick();
+    expect(viewer.log).toEqual(['play', 'seek:0', 'play']);
+    expect(viewer.ended).toBe(false);
+    expect(viewer.playing).toBe(true);
   });
 });
 

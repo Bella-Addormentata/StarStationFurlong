@@ -90,6 +90,37 @@ describe('tickTvRoom', () => {
     now += 2_600;
     wall += 3_600_000;
     tickTvRoom([TV], now);
+    // The hold lapsed by this page's own watch, the hour the wall clock
+    // measured: picked up again, like anyone's, and the beat goes on from
+    // the bridged reading, never from the pre-sleep position.
+    expect(iHoldRemote(TV)).toBe(false);
+    expect(readTv(TV).positionMs).toBe(before);
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    runBoth(TV_HEARTBEAT_MS);
+    expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(before + 3_600_000);
+    expect(readTv(TV).positionMs).toBeLessThan(before + 3_600_000 + 10_000);
+  });
+
+  it('a holder whose monotonic clock stood still through the sleep (one tick\'s worth where an hour passed) still beats on from where the room is: the wall clock finds the gap', () => {
+    let wall = 1_700_000_000_000;
+    setTvClock(() => now, () => wall);
+    const runBoth = (ms: number) => {
+      for (let t = 0; t < ms; t += 500) {
+        now += 500;
+        wall += 500;
+        tickTvRoom([TV], now);
+      }
+    };
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    runBoth(1_000);
+    const before = readTv(TV).positionMs;
+    now += 500; // no gap by this clock at all
+    wall += 3_600_000;
+    tickTvRoom([TV], now);
+    expect(iHoldRemote(TV)).toBe(false); // lapsed by the hour the wall clock measured, not renewed over a takeover
+    expect(readTv(TV).positionMs).toBe(before);
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
     runBoth(TV_HEARTBEAT_MS);
     expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(before + 3_600_000);
     expect(readTv(TV).positionMs).toBeLessThan(before + 3_600_000 + 10_000);
