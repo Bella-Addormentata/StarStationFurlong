@@ -21,6 +21,7 @@ import {
   type ArcadeView,
 } from './arcadeCabinet';
 import { ARCADE_GAMES } from './arcadeLibrary';
+import { ArcadeMachine } from './arcadeMachine';
 import { isArcadeTickFlags, unpackArcadeTick } from './arcadeNet';
 import {
   arcadeFrame, registerArcadeVisual, resetArcadeSessions, setArcadeRomFetcher, setArcadeSender,
@@ -514,6 +515,7 @@ describe('gamepads at the cabinet', () => {
     return {
       pad: pad as unknown as Gamepad,
       press: (...indices: number[]) => indices.forEach((i) => (buttons[i].pressed = true)),
+      release: (...indices: number[]) => indices.forEach((i) => (buttons[i].pressed = false)),
       releaseAll: () => {
         buttons.forEach((b) => (b.pressed = false));
         pad.axes = [0, 0];
@@ -572,6 +574,82 @@ describe('gamepads at the cabinet', () => {
     tick(ui, 35);
     expect(painter.drawMenu.mock.calls.length).toBeGreaterThan(menuDraws);
     expect(readArcade(ITEM)).toBeNull();
+    ui.unmount();
+  });
+
+  it('a button lets go only when the last key or pad holding it does', async () => {
+    const { ui, pads } = setupWithPads(1);
+    // Your own cartridge runs on this page, so its machine's releases show it.
+    for (let i = 0; i < OWN; i++) win.dispatchEvent(key('keydown', 'ArrowDown'));
+    win.dispatchEvent(key('keydown', 'Enter'));
+    win.dispatchEvent(key('keyup', 'ArrowDown'));
+    win.dispatchEvent(key('keyup', 'Enter'));
+    const input = created.find((el) => el.tag === 'input')!;
+    input.files = [{ name: 'mine.nes', size: thwaite.length, arrayBuffer: async () => thwaite.slice().buffer as ArrayBuffer }];
+    input.onchange!();
+    await flush();
+    ui.update(1 / 60);
+    const release = vi.spyOn(ArcadeMachine.prototype, 'release');
+    const releasedA = () => release.mock.calls.filter(([player, button]) => player === 1 && button === 'A').length;
+
+    // X and K are both A: letting go of one keeps A held.
+    win.dispatchEvent(key('keydown', 'KeyX'));
+    win.dispatchEvent(key('keydown', 'KeyK'));
+    win.dispatchEvent(key('keyup', 'KeyX'));
+    expect(releasedA()).toBe(0);
+    // The pad's A holds it too.
+    pads[0].press(1);
+    ui.update(1 / 60);
+    win.dispatchEvent(key('keyup', 'KeyK'));
+    expect(releasedA()).toBe(0);
+    // Ctrl+X was the browser's: its key-up lets go of nothing.
+    win.dispatchEvent(key('keydown', 'KeyX', { mod: 'ctrlKey' }));
+    win.dispatchEvent(key('keyup', 'KeyX'));
+    expect(releasedA()).toBe(0);
+    // The last one lets go.
+    pads[0].release(1);
+    ui.update(1 / 60);
+    expect(releasedA()).toBe(1);
+    ui.unmount();
+  });
+
+  it("a shared game's pad byte keeps a button while any key or pad holds it", () => {
+    const pad = fakePad();
+    vi.stubGlobal('navigator', { getGamepads: () => [pad.pad] });
+    const shared: SharedView = { role: 'host', title: 'THWAITE', phase: 'playing', joinAs: null, player: 1 };
+    const link: ArcadeLink = {
+      shared: () => shared,
+      takeError: () => null,
+      host: vi.fn(),
+      stop: vi.fn(),
+      join: vi.fn(),
+      setButtons: vi.fn(),
+      setLocalPad2: vi.fn(),
+      setAudio: vi.fn(),
+      setUiScreen: vi.fn(),
+      release: vi.fn(),
+    };
+    const visual: ArcadeCabinetVisualHandle = { painter: recordingPainter(), present: vi.fn(), showAttract: vi.fn() };
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual, requestRelease: vi.fn(), link });
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    ui.update(1 / 60); // on the shared game, not the menu
+    const byte = () => {
+      ui.update(1 / 60);
+      return (link.setButtons as ReturnType<typeof vi.fn>).mock.lastCall?.[0];
+    };
+
+    win.dispatchEvent(key('keydown', 'KeyX'));
+    win.dispatchEvent(key('keydown', 'KeyK'));
+    win.dispatchEvent(key('keyup', 'KeyX'));
+    expect(byte()).toBe(0b1); // K still holds A
+    pad.press(1);
+    win.dispatchEvent(key('keyup', 'KeyK'));
+    expect(byte()).toBe(0b1); // the pad still holds A
+    win.dispatchEvent(key('keydown', 'KeyX', { mod: 'ctrlKey' }));
+    win.dispatchEvent(key('keyup', 'KeyX'));
+    expect(byte()).toBe(0b1);
+    pad.release(1);
+    expect(byte()).toBe(0);
     ui.unmount();
   });
 

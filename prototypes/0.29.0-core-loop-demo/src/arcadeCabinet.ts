@@ -248,10 +248,13 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   let blinkOn = true;
   let dirty = true;
   let padHold = 0;
-  /** NES buttons held on the keyboard (player 1). */
-  const keysHeld = new Set<NesButton>();
+  /** Keys held down that press player 1's pad, by key (X and K are both A). */
+  const keysDown = new Map<string, NesButton>();
   /** Per gamepad index, the NES buttons held last poll (edge detection). */
   const padHeld: Array<Set<NesButton>> = [new Set(), new Set()];
+  /** Some key or pad still holds this button down. */
+  const stillHeld = (player: NesPlayer, button: NesButton): boolean =>
+    padHeld[player - 1].has(button) || (player === 1 && [...keysDown.values()].includes(button));
   let fileInput: HTMLInputElement | null = null;
 
   let capture: HTMLDivElement | null = null;
@@ -395,19 +398,21 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     e.preventDefault();
     e.stopImmediatePropagation();
     speaker?.resume();
+    keysDown.set(e.code, button);
     // Held keys auto-repeat: let that scroll the menu, never re-press the pad.
     if (e.repeat && view.screen !== 'menu' && view.screen !== 'credits') return;
-    keysHeld.add(button);
     buttonDown(1, button, true);
   };
+  /** A button lets go when the last key or pad holding it does; a key whose
+   *  press the cabinet never took (Ctrl+X) lets go of nothing. */
   const onKeyUp = (e: KeyboardEvent) => {
-    const button = keyToButton(e.code);
+    const button = keysDown.get(e.code);
     if (!button) return;
-    keysHeld.delete(button);
-    buttonUp(1, button);
+    keysDown.delete(e.code);
+    if (!stillHeld(1, button)) buttonUp(1, button);
   };
   const onBlur = () => {
-    keysHeld.clear();
+    keysDown.clear();
     machine?.releaseAll();
   };
 
@@ -426,13 +431,13 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       }
       const player = (i + 1) as NesPlayer;
       const before = padHeld[i];
+      padHeld[i] = now;
       for (const button of now) {
         if (before.has(button)) continue;
         speaker?.resume(); // browsers that count a pad press as a gesture
         buttonDown(player, button, false);
       }
-      for (const button of before) if (!now.has(button)) buttonUp(player, button);
-      padHeld[i] = now;
+      for (const button of before) if (!now.has(button) && !stillHeld(player, button)) buttonUp(player, button);
     }
     const combo = padHeld[0].has('SELECT') && padHeld[0].has('START');
     const inGame = view.screen === 'playing' || (view.screen === 'shared' && view.role !== 'watcher');
@@ -470,7 +475,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       mounted = true;
       speaker = new ArcadeSpeaker();
       machine = null;
-      keysHeld.clear();
+      keysDown.clear();
       padHeld[0] = new Set();
       padHeld[1] = new Set();
       link = deps.link ?? linkArcade(deps.itemId, seat, seats);
@@ -552,7 +557,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       if (!mounted) return;
       pollPads(dt);
       followShared();
-      link?.setButtons(padByte([...keysHeld, ...padHeld[0]]));
+      link?.setButtons(padByte([...keysDown.values(), ...padHeld[0]]));
       link?.setLocalPad2(padByte(padHeld[1]));
       if (view.screen === 'playing' && machine) {
         let frames = 0;
