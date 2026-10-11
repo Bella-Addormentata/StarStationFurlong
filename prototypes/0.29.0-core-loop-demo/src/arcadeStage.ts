@@ -65,6 +65,12 @@ interface Stage {
   mounted: string;
   phase: Phase;
   counted: boolean;
+  /** A frame torn down for its messages (arcadeEmulator's budget or its
+   *  shapes: `flood`, `malformed`) is not remounted before this moment, on
+   *  RETRY or otherwise, and the wait doubles each time until a game
+   *  starts cleanly. */
+  floodUntil: number;
+  floodBackoffMs: number;
   timer: number;
   onKey: (e: KeyboardEvent) => void;
   lastHead: string;
@@ -153,6 +159,8 @@ export function openArcadeStage(itemId: string): void {
     mounted: '',
     phase: 'idle',
     counted: false,
+    floodUntil: 0,
+    floodBackoffMs: FLOOD_BACKOFF_MS,
     timer: 0,
     onKey,
     lastHead: '',
@@ -205,10 +213,22 @@ function showNotice(t: Stage, title: string, hint: string, retry = false): void 
     ${retry ? '<button type="button" data-arcade-retry="1">RETRY</button>' : ''}`;
   t.notice.hidden = false;
   t.notice.querySelector<HTMLButtonElement>('[data-arcade-retry]')?.addEventListener('click', () => {
+    // A frame torn down for its messages waits out its backoff before any
+    // remount: the player's press is the only way back in, and not yet.
+    const wait = t.floodUntil - Date.now();
+    if (wait > 0) {
+      showNotice(t, title, `${hint}<br>Try again in ${Math.ceil(wait / 1000)} s.`, true);
+      return;
+    }
     t.mounted = '';
     stageTick();
   });
 }
+
+/** The first wait after a flood or a malformed message; doubled on each
+ *  until a clean start. */
+export const FLOOD_BACKOFF_MS = 5_000;
+export const FLOOD_BACKOFF_MAX_MS = 5 * 60_000;
 
 function hideNotice(t: Stage): void {
   t.notice.hidden = true;
@@ -408,13 +428,20 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
       t.frame?.focus();
     } else if (ev.type === 'started') {
       t.phase = 'in play';
+      t.floodBackoffMs = FLOOD_BACKOFF_MS; // a clean start forgives the floods before it
       if (!t.counted) {
         t.counted = true;
         countPlay(t.itemId);
       }
       t.frame?.focus();
     } else if (ev.type === 'exit') closeArcadeStage();
-    else if (ev.type === 'error') fail(t, key, emulatorErrorText(ev.why, data));
+    else if (ev.type === 'error') {
+      if (ev.why === 'flood' || ev.why === 'malformed') {
+        t.floodUntil = Date.now() + t.floodBackoffMs;
+        t.floodBackoffMs = Math.min(t.floodBackoffMs * 2, FLOOD_BACKOFF_MAX_MS);
+      }
+      fail(t, key, emulatorErrorText(ev.why, data));
+    }
     if (stage === t) renderStageChrome(t);
   });
   // The CRT overlay must stay above the frame.

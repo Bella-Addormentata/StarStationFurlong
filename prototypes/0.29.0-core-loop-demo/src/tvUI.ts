@@ -377,6 +377,18 @@ function tvAppOnScreen(host: HTMLElement): boolean {
   return !phone || phone.classList.contains('active');
 }
 
+/** Which of `count` visible controls a step of ±1 from the one at `here`
+ *  lands on, wrapping at both ends; from no control at all (`here` < 0,
+ *  focus on the view itself or outside the stops) the first. The one
+ *  piece of the traversal that is arithmetic rather than DOM, so vitest
+ *  pins it; the key handling itself is plain DOM, verified in the browser
+ *  smoke. */
+export function tvNavIndex(count: number, here: number, step: number): number {
+  if (count <= 0) return -1;
+  if (here < 0 || here >= count) return 0;
+  return (((here + step) % count) + count) % count;
+}
+
 /** The remote by keyboard. Tab is the phone's own open/close toggle (main.ts
  *  preventDefaults every press), so this view carries its own movement
  *  between controls, the treasury view's pattern: ↑/↓ step through the
@@ -405,7 +417,7 @@ function wireTvNav(host: HTMLElement, onScreen: () => boolean = () => tvAppOnScr
     // is prevented above, and a control focused offscreen cannot be seen.
     // preventScroll is for the repaint's focus restoration, which must not
     // jolt the view (renderTvPhoneApp).
-    stops[here < 0 ? 0 : (here + step + stops.length) % stops.length]!.focus();
+    stops[tvNavIndex(stops.length, here, step)]!.focus();
   };
   host.addEventListener('keydown', (e) => {
     if (e.altKey || e.ctrlKey || e.metaKey) return;

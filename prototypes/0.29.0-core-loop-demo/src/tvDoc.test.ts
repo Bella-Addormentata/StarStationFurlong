@@ -755,7 +755,12 @@ describe('the programme', () => {
     const woke = readPlayback(TV);
     expect(woke.stale).toBe(true);
     expect(woke.positionMs).toBe(10_000 + 500 + 3_600_000);
-    // The holder's own beat from there is fresh, and runs on from it.
+    // The hold lapsed by this page's own watch — an hour, as the wall clock
+    // measures the gap, whatever the monotonic clock saw of it (remoteLapsed)
+    // — and is taken up again, like anyone's. The holder's own beat from
+    // there is fresh, and runs on from it.
+    expect(iHoldRemote(TV)).toBe(false);
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
     expect(tvHeartbeat(TV, woke.positionMs)).toEqual({ ok: true });
     expect(readPlayback(TV).stale).toBeUndefined();
     tick(500);
@@ -768,6 +773,77 @@ describe('the programme', () => {
     wall += 3_600_000;
     markTvPageAwake(now);
     expect(readPlayback(TV)).toMatchObject({ stale: true, positionMs: 10_000 + 500 + 3_600_000 + 500 + 3_600_000 });
+  });
+
+  it('a gap the wall clock alone finds (the monotonic clock stood still through a sleep, or stepped while awake: one tick\'s worth where an hour passed) is AMBIGUOUS — stale and lapsed as a sleep, never bridged as one — and a hand-over delivered on waking is stamped from before it', () => {
+    let wall = 1_700_000_000_000;
+    setTvClock(() => now, () => wall);
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    markTvPageAwake(now);
+    tvHeartbeat(TV, 10_000);
+    tick(500);
+    wall += 500;
+    markTvPageAwake(now);
+    // The lid closed for an hour — or the wall clock stepped an hour while
+    // the page ran: the monotonic clock shows the usual 500 ms between ticks
+    // either way, and nothing in the page tells the two apart. Stale, so
+    // nothing acts on it; run on by the monotonic clock alone, since an hour
+    // is never added to playback on the wall clock's word.
+    tick(500);
+    wall += 3_600_000;
+    markTvPageAwake(now);
+    const woke = readPlayback(TV);
+    expect(woke.stale).toBe(true);
+    expect(woke.positionMs).toBe(10_000 + 1_000);
+    // A hand-over held by the network through that sleep, delivered on
+    // waking BEFORE the first tick back: stamped with the last mark before
+    // the gap, which the wall clock finds where the monotonic clock sees
+    // none — lapsed by this page's own watch, not claimed.
+    tick(500);
+    wall += 500;
+    markTvPageAwake(now);
+    iAm(BOB, 'Bob');
+    setTvPageId('B1');
+    const giver = new Y.Doc();
+    giver.getMap('tv').set(remoteKey(TV), { holder: BOB, name: 'Bob', leaseAt: now, by: ALICE, page: '' });
+    const update = Y.encodeStateAsUpdate(giver);
+    tick(500);
+    wall += TV_LEASE_LAPSE_MS + 60_000; // the second sleep: no tick yet
+    Y.applyUpdate(doc, update);
+    expect(claimRemote(TV)).toBe(false);
+    expect(remoteStatus(TV)).toBe('free');
+    // The first tick back marks the gap; a hold taken up after it is seen
+    // afresh, and the lease that lapsed stays lapsed by the bridged measure.
+    markTvPageAwake(now);
+    expect(remoteStatus(TV)).toBe('free');
+    tick(500);
+    wall += 500;
+    markTvPageAwake(now);
+    iAm(ALICE, 'Alice');
+    setTvPageId('A');
+    expect(pickUpRemote(TV)).toEqual({ ok: true }); // lapsed by this page's own watch: taken up again, like anyone
+    expect(tvHeartbeat(TV, 20_000)).toEqual({ ok: true });
+    expect(readPlayback(TV).stale).toBeUndefined();
+    // A forward wall-clock step shorter than the lapse: stale for one wake
+    // window, not bridged, and the hold kept — the room is never seeked
+    // forward by a step, and a holder keeps beating from its player.
+    tick(500);
+    wall += 500 + 5_000; // the step
+    markTvPageAwake(now);
+    expect(readPlayback(TV)).toMatchObject({ stale: true, positionMs: 20_000 + 500 });
+    expect(iHoldRemote(TV)).toBe(true);
+    // A backward step is no gap at all.
+    tick(500);
+    wall -= 60_000;
+    markTvPageAwake(now);
+    expect(tvHeartbeat(TV, 21_000)).toEqual({ ok: true });
+    tick(500);
+    wall -= 60_000;
+    markTvPageAwake(now);
+    expect(readPlayback(TV)).toMatchObject({ positionMs: 21_500 });
+    expect(readPlayback(TV).stale).toBeUndefined();
+    expect(iHoldRemote(TV)).toBe(true);
   });
 
   it('a volume press on one device never carries a stale programme over a seek on another', () => {

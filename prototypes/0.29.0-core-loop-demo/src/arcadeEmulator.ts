@@ -236,6 +236,111 @@ export type EmulatorEvent =
   | { type: 'replay-snapshot'; snapshot: ReplaySnapshot }
   | { type: 'replay-status'; status: ReplayStatus };
 
+/** What the frame may say, and how much. The frame is attacker-controlled
+ *  after a core exploit, so a message from it is input from an attacker:
+ *  matching the event's source says only WHO is posting. So one shape per
+ *  kind — known keys, a short string — and a message of any other shape
+ *  brings the frame down at the first word (`malformed`): no game sends
+ *  one, a frame that does is exploited or broken, and dropping it would
+ *  pay the clone below for every such message up to the budget; and a
+ *  budget of messages a second, past which the frame comes down
+ *  (`flood`): the page is not the frame's to keep busy. What no handler
+ *  can refuse is the structured clone the browser performs BEFORE the
+ *  handler runs: one oversized message costs the page its clone once, and
+ *  then the frame is gone (plan §9). */
+export const FRAME_MESSAGE_BUDGET = 20;
+export const FRAME_MESSAGE_WINDOW_MS = 1_000;
+export const FRAME_STRING_MAX = 256;
+
+export type FrameMessage =
+  | { type: 'arcade-frame-ready' }
+  | { type: 'arcade-ready' }
+  | { type: 'arcade-started' }
+  | { type: 'arcade-exit' }
+  | { type: 'arcade-error'; why: string }
+  | { type: 'arcade-replay-inputs'; batch: ReplayBatch }
+  | { type: 'arcade-replay-hash'; hash: ReplayHash }
+  | { type: 'arcade-replay-snapshot'; snapshot: ReplaySnapshot }
+  | { type: 'arcade-replay-status'; status: ReplayStatus };
+
+const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
+  'arcade-frame-ready': ['type'],
+  'arcade-ready': ['type'],
+  'arcade-started': ['type'],
+  'arcade-exit': ['type'],
+  'arcade-error': ['type', 'why'],
+  'arcade-replay-inputs': ['type', 'from', 'through', 'inputs'],
+  'arcade-replay-hash': ['type', 'frame', 'hash'],
+  'arcade-replay-snapshot': ['type', 'frame', 'state', 'held', 'hash'],
+  'arcade-replay-status': ['type', 'phase', 'frame', 'through', 'loaded', 'hash', 'matches', 'tries'],
+};
+
+/** The replay kinds a frame may post, by the role its config gave it
+ *  (arcadeReplay.ts): player one's frame its batches, hashes and save
+ *  states; a spectator's its hashes and where it stands; either that it
+ *  cannot replay at all. A frame given no role posts none: from it, or
+ *  from the other role, a replay kind is a message no game sends. */
+const REPLAY_KINDS: Record<EmulatorReplayConfig['role'], ReadonlySet<string>> = {
+  source: new Set(['arcade-replay-inputs', 'arcade-replay-hash', 'arcade-replay-snapshot', 'arcade-replay-status']),
+  follower: new Set(['arcade-replay-hash', 'arcade-replay-status']),
+};
+
+/** The frame's message as one of the shapes above, or null — an unknown
+ *  kind, a key the kind does not have, a `why` that is not a string or is
+ *  longer than FRAME_STRING_MAX, a replay kind its role does not post or
+ *  whose payload arcadeReplay.ts will not read, no object at all: read no
+ *  further, and the frame is torn down for it (mountEmulatorFrame,
+ *  `malformed`). */
+export function frameMessage(data: unknown, replay?: EmulatorReplayConfig['role']): FrameMessage | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const d = data as Record<string, unknown>;
+  const type = d.type;
+  if (typeof type !== 'string' || !Object.prototype.hasOwnProperty.call(FRAME_MESSAGE_KEYS, type)) return null;
+  const kind = type as FrameMessage['type'];
+  const keys = FRAME_MESSAGE_KEYS[kind];
+  for (const k of Object.keys(d)) if (!keys.includes(k)) return null;
+  if (kind.startsWith('arcade-replay-') && !(replay && REPLAY_KINDS[replay].has(kind))) return null;
+  switch (kind) {
+    case 'arcade-error': {
+      const why = d.why;
+      if (typeof why !== 'string' || why.length > FRAME_STRING_MAX) return null;
+      return { type: kind, why };
+    }
+    case 'arcade-replay-inputs': {
+      const batch = readFrameBatch(d);
+      return batch ? { type: kind, batch } : null;
+    }
+    case 'arcade-replay-hash': {
+      const hash = readFrameHash(d);
+      return hash ? { type: kind, hash } : null;
+    }
+    case 'arcade-replay-snapshot': {
+      const snapshot = readFrameSnapshot(d);
+      return snapshot ? { type: kind, snapshot } : null;
+    }
+    case 'arcade-replay-status': {
+      const status = readReplayStatus(d);
+      return status ? { type: kind, status } : null;
+    }
+    default:
+      return { type: kind };
+  }
+}
+
+/** Messages a second from one frame, counted on every message it posts,
+ *  shape or no shape: a flood of garbage is a flood. */
+export class MessageBudget {
+  private readonly stamps: number[] = [];
+  constructor(private readonly limit = FRAME_MESSAGE_BUDGET, private readonly windowMs = FRAME_MESSAGE_WINDOW_MS) {}
+  /** True while the message fits the budget; false on the one that breaks it. */
+  take(now: number): boolean {
+    while (this.stamps.length && now - this.stamps[0]! >= this.windowMs) this.stamps.shift();
+    if (this.stamps.length >= this.limit) return false;
+    this.stamps.push(now);
+    return true;
+  }
+}
+
 export interface EmulatorHandle {
   /** The wall in the stage: this page's own document around the frame. */
   readonly wall: HTMLIFrameElement;
@@ -283,19 +388,32 @@ export function emulatorWallPolicy(frameUrl: string, href = typeof location === 
 
 const REPLAY_PHASES: ReadonlySet<string> = new Set(['waiting', 'loading', 'stalled', 'running', 'unsupported']);
 
-/** A follower's status as the frame posts it, checked field by field. */
+/** A follower's status as the frame posts it: every field it carries in
+ *  its shape, or none of it (a field out of shape is a malformed message,
+ *  frameMessage). */
 export function readReplayStatus(data: unknown): ReplayStatus | null {
   if (!data || typeof data !== 'object') return null;
   const d = data as Record<string, unknown>;
   if (typeof d.phase !== 'string' || !REPLAY_PHASES.has(d.phase)) return null;
   const out: ReplayStatus = { phase: d.phase as ReplayStatus['phase'] };
   const int = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= -1 && v <= 0xffff_ffff;
-  if (int(d.frame)) out.frame = d.frame as number;
-  if (int(d.through)) out.through = d.through as number;
-  if (int(d.loaded)) out.loaded = d.loaded as number;
-  if (typeof d.hash === 'string' && /^[0-9a-f]{1,8}:\d{1,9}$/.test(d.hash)) out.hash = d.hash;
-  if (typeof d.matches === 'boolean') out.matches = d.matches;
-  if (typeof d.tries === 'number' && Number.isInteger(d.tries) && d.tries >= 0 && d.tries <= 1000) out.tries = d.tries;
+  for (const k of ['frame', 'through', 'loaded'] as const) {
+    if (d[k] === undefined) continue;
+    if (!int(d[k])) return null;
+    out[k] = d[k] as number;
+  }
+  if (d.hash !== undefined) {
+    if (typeof d.hash !== 'string' || !/^[0-9a-f]{1,8}:\d{1,9}$/.test(d.hash)) return null;
+    out.hash = d.hash;
+  }
+  if (d.matches !== undefined) {
+    if (typeof d.matches !== 'boolean') return null;
+    out.matches = d.matches;
+  }
+  if (d.tries !== undefined) {
+    if (typeof d.tries !== 'number' || !Number.isInteger(d.tries) || d.tries < 0 || d.tries > 1000) return null;
+    out.tries = d.tries;
+  }
   return out;
 }
 
@@ -330,11 +448,32 @@ export function mountEmulatorFrame(
   // but to its own URL — and the config carries the game's bytes, which
   // were the frame's to have, and nothing of this page's.
   const target = '*';
+  // The frame's messages are input from an attacker (the header on
+  // FRAME_MESSAGE_BUDGET): counted before they are read, read into one
+  // shape or the frame torn down, each state reported once.
+  const budget = new MessageBudget();
+  let silenced = false;
+  let readySeen = false;
+  let startedSeen = false;
+  let snapshotWanted = false;
   const onMessage = (e: MessageEvent) => {
-    if (!alive || !frame || e.source !== frame.contentWindow) return;
-    const d = e.data as { type?: unknown; why?: unknown } | null;
-    if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
-    switch (d.type) {
+    if (!alive || silenced || !frame || e.source !== frame.contentWindow) return;
+    if (!budget.take(performance.now())) {
+      silenced = true;
+      onEvent({ type: 'error', why: 'flood' });
+      return;
+    }
+    const m = frameMessage(e.data, config.replay?.role);
+    // A save state is the one large message a frame may post, so only in
+    // answer to the page's request (send, `arcade-replay-want-snapshot`):
+    // one it was not asked for is out of turn.
+    if (!m || (m.type === 'arcade-replay-snapshot' && !snapshotWanted)) {
+      silenced = true;
+      onEvent({ type: 'error', why: 'malformed' });
+      return;
+    }
+    if (m.type === 'arcade-replay-snapshot') snapshotWanted = false;
+    switch (m.type) {
       case 'arcade-frame-ready':
         if (configured) return;
         configured = true;
@@ -357,37 +496,14 @@ export function mountEmulatorFrame(
           replayBatchFrames: config.replay?.batchFrames,
         }, target);
         break;
-      case 'arcade-ready': onEvent({ type: 'ready' }); break;
-      case 'arcade-started': onEvent({ type: 'started' }); break;
+      case 'arcade-ready': if (!readySeen) { readySeen = true; onEvent({ type: 'ready' }); } break;
+      case 'arcade-started': if (!startedSeen) { startedSeen = true; onEvent({ type: 'started' }); } break;
       case 'arcade-exit': onEvent({ type: 'exit' }); break;
-      case 'arcade-error': onEvent({ type: 'error', why: typeof d.why === 'string' ? d.why : 'unknown' }); break;
-      // Replay messages only from a frame configured for one, and only in
-      // the shape arcadeReplay.ts reads: the frame is a third party's
-      // engine on a ROM, and a batch is what the page would forward.
-      case 'arcade-replay-inputs': {
-        if (config.replay?.role !== 'source') break;
-        const batch = readFrameBatch(d);
-        if (batch) onEvent({ type: 'replay-inputs', batch });
-        break;
-      }
-      case 'arcade-replay-hash': {
-        if (!config.replay) break;
-        const hash = readFrameHash(d);
-        if (hash) onEvent({ type: 'replay-hash', hash });
-        break;
-      }
-      case 'arcade-replay-snapshot': {
-        if (config.replay?.role !== 'source') break;
-        const snapshot = readFrameSnapshot(d);
-        if (snapshot) onEvent({ type: 'replay-snapshot', snapshot });
-        break;
-      }
-      case 'arcade-replay-status': {
-        if (!config.replay) break;
-        const status = readReplayStatus(d);
-        if (status) onEvent({ type: 'replay-status', status });
-        break;
-      }
+      case 'arcade-error': onEvent({ type: 'error', why: m.why }); break;
+      case 'arcade-replay-inputs': onEvent({ type: 'replay-inputs', batch: m.batch }); break;
+      case 'arcade-replay-hash': onEvent({ type: 'replay-hash', hash: m.hash }); break;
+      case 'arcade-replay-snapshot': onEvent({ type: 'replay-snapshot', snapshot: m.snapshot }); break;
+      case 'arcade-replay-status': onEvent({ type: 'replay-status', status: m.status }); break;
       default: break;
     }
   };
@@ -482,6 +598,7 @@ export function mountEmulatorFrame(
     },
     send(message, transfer = []) {
       if (!alive || !configured) return;
+      if (message.type === 'arcade-replay-want-snapshot' && config.replay?.role === 'source') snapshotWanted = true;
       frame?.contentWindow?.postMessage(message, target, transfer);
     },
     destroy() {
@@ -510,6 +627,8 @@ export function emulatorErrorText(why: string, data: EmulatorData): { title: str
   if (why === 'frame') return { title: 'THE ARCADE FRAME DID NOT LOAD', hint: 'public/arcade/frame.html is missing from this build.' };
   if (why === 'barred') return { title: 'THE EMULATOR FRAME TRIED TO LEAVE THE CABINET', hint: 'The frame asked for another page. The cabinet\'s policy refused it before any request went out, and the frame was torn down. RETRY reloads it.' };
   if (why === 'navigated') return { title: 'THE EMULATOR FRAME LEFT THE CABINET', hint: 'The frame loaded a second document — its own page again, the only one the cabinet\'s policy allows — so it was torn down. RETRY reloads it.' };
+  if (why === 'flood') return { title: 'THE EMULATOR FRAME WOULD NOT STOP TALKING', hint: `The frame posted more than ${FRAME_MESSAGE_BUDGET} messages in a second, which no game needs, so it was torn down. RETRY reloads it.` };
+  if (why === 'malformed') return { title: 'THE EMULATOR FRAME SPOKE OUT OF TURN', hint: 'The frame posted a message the cabinet does not know, or one larger than any it takes, which no game needs, so it was torn down. RETRY reloads it.' };
   if (why === 'game') return { title: 'THE GAME DID NOT LOAD', hint: 'The link may be blocked by CORS, the file may not be for this core, or the romset name may not match.' };
   return { title: 'THE CABINET FAULTED', hint: why };
 }

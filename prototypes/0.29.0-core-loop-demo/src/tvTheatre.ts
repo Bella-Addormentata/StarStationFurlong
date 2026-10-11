@@ -278,6 +278,7 @@ class ArchiveEmbedAdapter implements Adapter {
   constructor(host: HTMLElement, identifier: string) {
     const f = document.createElement('iframe');
     f.src = `https://archive.org/embed/${encodeURIComponent(identifier)}?autoplay=1`;
+    f.title = 'archive.org player'; // the frame's accessible name in the theatre's focus order
     f.allow = 'autoplay; fullscreen';
     f.referrerPolicy = 'strict-origin-when-cross-origin';
     f.style.cssText = 'width:100%; height:100%; border:0; display:block; background:#000;';
@@ -891,7 +892,9 @@ function renderTheatreChrome(t: Theatre): void {
   // ranges) is start-only too, whatever the source kind promised.
   const seekable = !startOnly && (t.player ? t.player.canSeek : true);
   const sync = startOnly || !seekable ? ' · start-time sync only' : '';
-  const who = held ? `REMOTE · ${escapeHtml(remote.name || 'a clone')}` : 'REMOTE ON THE SET';
+  // Plain text, set with textContent below: the raw shape-checked name, never
+  // an escaped one (an escaped `&` would show as `&amp;`).
+  const who = held ? `REMOTE · ${remote.name || 'a clone'}` : 'REMOTE ON THE SET';
   const where = pb.state === 'scheduled' ? countdownText(pb.countdownMs)
     : pb.state === 'paused' ? `PAUSED · ${formatClock(pb.positionMs)}`
     : pb.state === 'playing' ? `● ${formatClock(pb.positionMs)}` : '';

@@ -7,8 +7,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameOrigins,
-  emulatorIsolated, emulatorWallPolicy, localRomExposureAllowed, localRomFor, probeEmulatorData, readReplayStatus,
-  rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
+  emulatorIsolated, emulatorWallPolicy, frameMessage, localRomExposureAllowed, localRomFor, MessageBudget, probeEmulatorData,
+  readReplayStatus, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
+  FRAME_MESSAGE_BUDGET, FRAME_MESSAGE_WINDOW_MS, FRAME_STRING_MAX,
 } from './arcadeEmulator';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -26,6 +27,46 @@ const answering = (r: Response | Error, calls: string[] = []): typeof fetch =>
     if (r instanceof Error) throw r;
     return r;
   }) as unknown as typeof fetch;
+
+describe('what the frame may say, and how much — its messages are input from an attacker', () => {
+  it('reads one shape per kind — known keys, a short string — and drops the rest unread', () => {
+    expect(frameMessage({ type: 'arcade-frame-ready' })).toEqual({ type: 'arcade-frame-ready' });
+    expect(frameMessage({ type: 'arcade-started' })).toEqual({ type: 'arcade-started' });
+    expect(frameMessage({ type: 'arcade-error', why: 'loader' })).toEqual({ type: 'arcade-error', why: 'loader' });
+    expect(frameMessage({ type: 'arcade-error', why: 'x'.repeat(FRAME_STRING_MAX) })).not.toBeNull();
+    expect(frameMessage({ type: 'arcade-error', why: 'x'.repeat(FRAME_STRING_MAX + 1) })).toBeNull(); // a string past the cap
+    expect(frameMessage({ type: 'arcade-error' })).toBeNull(); // a `why` that is not a string
+    expect(frameMessage({ type: 'arcade-error', why: { huge: true } })).toBeNull();
+    expect(frameMessage({ type: 'arcade-ready', why: 'x' })).toBeNull(); // a key the kind does not have
+    expect(frameMessage({ type: 'arcade-ready', state: new ArrayBuffer(8) })).toBeNull();
+    expect(frameMessage({ type: 'arcade-config' })).toBeNull(); // the page's own kind, never the frame's
+    expect(frameMessage({ type: 'constructor' })).toBeNull(); // a prototype's key is no kind
+    expect(frameMessage({ type: 'toString' })).toBeNull();
+    expect(frameMessage({ type: 42 })).toBeNull();
+    expect(frameMessage(['arcade-ready'])).toBeNull();
+    expect(frameMessage('arcade-ready')).toBeNull();
+    expect(frameMessage(null)).toBeNull();
+  });
+
+  it('budgets the frame\'s messages a second, shape or no shape, and the one that breaks it is the last', () => {
+    const b = new MessageBudget();
+    for (let i = 0; i < FRAME_MESSAGE_BUDGET; i++) expect(b.take(1_000 + i)).toBe(true);
+    expect(b.take(1_000 + FRAME_MESSAGE_BUDGET)).toBe(false); // the twenty-first inside the second
+    expect(b.take(1_000 + FRAME_MESSAGE_WINDOW_MS)).toBe(true); // the window has moved on: the first is a second old
+    expect(b.take(1_000 + FRAME_MESSAGE_WINDOW_MS)).toBe(false); // one slot freed, one taken
+    const slow = new MessageBudget(2, 100);
+    expect(slow.take(0)).toBe(true);
+    expect(slow.take(50)).toBe(true);
+    expect(slow.take(99)).toBe(false);
+    expect(slow.take(100)).toBe(true);
+    expect(emulatorErrorText('flood', 'station').title).toContain('WOULD NOT STOP');
+    expect(emulatorErrorText('flood', 'station').hint).toContain(String(FRAME_MESSAGE_BUDGET));
+    // A message of no known shape brings the frame down at the first word
+    // (mountEmulatorFrame): its own notice, and RETRY waits out the same backoff.
+    expect(emulatorErrorText('malformed', 'station').title).toContain('OUT OF TURN');
+    expect(emulatorErrorText('malformed', 'station').hint).toContain('RETRY');
+  });
+});
 
 describe('where the emulator files come from', () => {
   it('the station path sits under the base, the CDN is itself; each has its lane', () => {
@@ -139,12 +180,50 @@ describe('where the emulator files come from', () => {
 });
 
 describe('a spectator frame\'s replay status is read field by field', () => {
-  it('keeps what is well-formed and drops the rest', () => {
+  it('reads every field in its shape, or none of it', () => {
     expect(readReplayStatus({ phase: 'running', frame: 600, through: 611 })).toEqual({ phase: 'running', frame: 600, through: 611 });
+    expect(readReplayStatus({ phase: 'waiting', frame: 0, through: -1 })).toEqual({ phase: 'waiting', frame: 0, through: -1 });
     expect(readReplayStatus({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, tries: 2, frame: 213 }))
       .toEqual({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, tries: 2, frame: 213 });
-    expect(readReplayStatus({ phase: 'running', frame: 1.5, hash: '<b>', matches: 'yes' })).toEqual({ phase: 'running' });
+    expect(readReplayStatus({ phase: 'running', frame: 1.5 })).toBeNull();
+    expect(readReplayStatus({ phase: 'running', hash: '<b>' })).toBeNull();
+    expect(readReplayStatus({ phase: 'running', matches: 'yes' })).toBeNull();
+    expect(readReplayStatus({ phase: 'stalled', tries: -1 })).toBeNull();
     expect(readReplayStatus({ phase: 'dancing' })).toBeNull();
     expect(readReplayStatus(null)).toBeNull();
+  });
+});
+
+describe('a replay frame says only what its role posts, in its shape', () => {
+  const batch = { type: 'arcade-replay-inputs', from: 994, through: 1_000, inputs: [[994, 0, 8, 1]] };
+  const hash = { type: 'arcade-replay-hash', frame: 60, hash: 'd5d7dc6e:13752' };
+  const state = new Uint8Array([1, 2, 3]);
+  const snapshot = { type: 'arcade-replay-snapshot', frame: 9, state, held: [], hash: 'a:3' };
+  const status = { type: 'arcade-replay-status', phase: 'running', frame: 600, through: 611 };
+
+  it('player one\'s frame: batches, hashes, save states and its status', () => {
+    expect(frameMessage(batch, 'source')).toEqual({ type: 'arcade-replay-inputs', batch: { from: 994, through: 1_000, inputs: [{ frame: 994, player: 0, index: 8, value: 1 }] } });
+    expect(frameMessage(hash, 'source')).toEqual({ type: 'arcade-replay-hash', hash: { frame: 60, hash: 'd5d7dc6e:13752' } });
+    expect(frameMessage(snapshot, 'source')?.type).toBe('arcade-replay-snapshot');
+    expect(frameMessage({ type: 'arcade-replay-status', phase: 'unsupported' }, 'source')).not.toBeNull();
+  });
+
+  it('a spectator\'s frame: hashes and its status, never a batch or a save state', () => {
+    expect(frameMessage(hash, 'follower')).not.toBeNull();
+    expect(frameMessage(status, 'follower')).toEqual({ type: 'arcade-replay-status', status: { phase: 'running', frame: 600, through: 611 } });
+    expect(frameMessage(batch, 'follower')).toBeNull();
+    expect(frameMessage(snapshot, 'follower')).toBeNull();
+  });
+
+  it('a frame given no role, any replay kind is out of turn', () => {
+    for (const m of [batch, hash, snapshot, status]) expect(frameMessage(m)).toBeNull();
+  });
+
+  it('a replay kind out of shape: a key it does not have, a payload arcadeReplay will not read', () => {
+    expect(frameMessage({ ...hash, extra: 1 }, 'source')).toBeNull();
+    expect(frameMessage({ ...hash, hash: '<script>' }, 'source')).toBeNull();
+    expect(frameMessage({ ...batch, inputs: [[1_001, 0, 8, 1]] }, 'source')).toBeNull(); // an input after `through`
+    expect(frameMessage({ ...snapshot, state: [1, 2, 3] }, 'source')).toBeNull();
+    expect(frameMessage({ ...status, frame: 'x' }, 'follower')).toBeNull();
   });
 });

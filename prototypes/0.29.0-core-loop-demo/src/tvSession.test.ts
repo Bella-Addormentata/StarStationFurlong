@@ -90,9 +90,43 @@ describe('tickTvRoom', () => {
     now += 2_600;
     wall += 3_600_000;
     tickTvRoom([TV], now);
+    // The hold lapsed by this page's own watch, the hour the wall clock
+    // measured: picked up again, like anyone's, and the beat goes on from
+    // the bridged reading, never from the pre-sleep position.
+    expect(iHoldRemote(TV)).toBe(false);
+    expect(readTv(TV).positionMs).toBe(before);
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
     runBoth(TV_HEARTBEAT_MS);
     expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(before + 3_600_000);
     expect(readTv(TV).positionMs).toBeLessThan(before + 3_600_000 + 10_000);
+  });
+
+  it('a holder whose monotonic clock stood still through the sleep (one tick\'s worth where an hour passed — or a wall-clock step, which looks the same) lets the remote go, and picked up again beats on from where it slept: a wall delta it cannot vouch for is never added to playback', () => {
+    let wall = 1_700_000_000_000;
+    setTvClock(() => now, () => wall);
+    const runBoth = (ms: number) => {
+      for (let t = 0; t < ms; t += 500) {
+        now += 500;
+        wall += 500;
+        tickTvRoom([TV], now);
+      }
+    };
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    runBoth(1_000);
+    const before = readTv(TV).positionMs;
+    now += 500; // no gap by this clock at all
+    wall += 3_600_000;
+    tickTvRoom([TV], now);
+    expect(iHoldRemote(TV)).toBe(false); // lapsed by the hour the wall clock measured, not renewed over a takeover
+    expect(readTv(TV).positionMs).toBe(before);
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    runBoth(TV_HEARTBEAT_MS);
+    // The ambiguous hour is not in the beat: the room is not jumped forward on
+    // the wall clock's word (a step while awake would jump everyone), the
+    // cost being a rejoin where it slept when the hour was a real sleep.
+    expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(before);
+    expect(readTv(TV).positionMs).toBeLessThan(before + 10_000);
   });
 
   it('flips a scheduled programme to playing at T0 the way the theatre would', () => {
