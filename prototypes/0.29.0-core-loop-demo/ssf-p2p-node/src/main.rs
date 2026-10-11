@@ -1587,11 +1587,26 @@ async fn handle_wt_connection_inner(
                         // default build ingests it with no runtime switch (#231 D3).
                         if envelope.kind == "cap" {
                             #[cfg(feature = "chia-read")]
-                            chia_rooms::ingest_room_cap(
-                                &hub_clone.chia_rooms,
-                                &envelope.room,
-                                &envelope.payload,
-                            );
+                            {
+                                // The WebTransport listener binds every interface (remote
+                                // browsers dial nodes too), so "local" is checked, not
+                                // assumed: a cap from anywhere but loopback is dropped. A
+                                // remote session could otherwise hand us a key of ITS
+                                // choosing marked private and armed, and have this node
+                                // publish its addresses under it — or out-sequence the
+                                // local browser's caps for a room.
+                                if chia_rooms::cap_source_is_local(&remote_addr_inner) {
+                                    chia_rooms::ingest_room_cap(
+                                        &hub_clone.chia_rooms,
+                                        &envelope.room,
+                                        &envelope.payload,
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "⛓️ ChiaHub lane: ignoring a room cap from a non-loopback browser session ({remote_addr_inner}) — caps are the LOCAL browser's alone"
+                                    );
+                                }
+                            }
                             continue;
                         }
 

@@ -111,6 +111,17 @@ struct RoomCapPayload {
     seq: u64,
 }
 
+/// May a `cap` from a browser session at `source` be trusted? Only loopback:
+/// the node's WebTransport listener is open to remote browsers too, and a room
+/// key is the LOCAL browser's to hand over, nobody else's. IPv4 loopback, IPv6
+/// loopback and the IPv4-mapped form all count.
+pub fn cap_source_is_local(source: &std::net::SocketAddr) -> bool {
+    match source.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
 /// Decode a 32-byte room key from whatever base64 flavor the browser emits
 /// (`getOrCreateRoomKeyB64` uses base64url-no-pad; be tolerant of all four).
 pub fn decode_room_key(s: &str) -> Option<[u8; 32]> {
@@ -287,6 +298,18 @@ mod tests {
         assert!(rooms.lock().unwrap()["r1"].chia_mode);
         ingest_room_cap(&rooms, "r1", b"garbage");
         assert!(rooms.lock().unwrap()["r1"].chia_mode, "malformed cap leaves the stored one alone");
+    }
+
+    #[test]
+    fn caps_are_trusted_from_loopback_only() {
+        let ok = ["127.0.0.1:50000", "127.9.9.9:1", "[::1]:4443", "[::ffff:127.0.0.1]:4443"];
+        for a in ok {
+            assert!(cap_source_is_local(&a.parse().unwrap()), "{a} is loopback");
+        }
+        let bad = ["192.168.1.20:4443", "10.0.0.5:1", "203.0.113.7:4443", "[2001:db8::1]:4443", "[::ffff:10.0.0.5]:1"];
+        for a in bad {
+            assert!(!cap_source_is_local(&a.parse().unwrap()), "{a} is not loopback");
+        }
     }
 
     #[test]

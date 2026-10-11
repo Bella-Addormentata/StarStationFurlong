@@ -165,9 +165,12 @@ struct RoomCache {
 }
 
 impl RoomCache {
-    /// Merge a read's records (newest signed time wins per node). Returns true
-    /// when OUR OWN record appeared at a height not seen before — the signal
-    /// that peers will see us at their next beat.
+    /// Merge a read's records: per node the newest signed time wins, and on an
+    /// equal signed second the higher confirmation height — the same order as
+    /// `rank_and_dedupe`, so a page that arrives late cannot put an older
+    /// same-second record (and its stale addresses) back. Returns true when OUR
+    /// OWN record appeared at a height not seen before — the signal that peers
+    /// will see us at their next beat.
     fn merge(&mut self, found: Vec<FoundRecord>, self_id: &str) -> bool {
         let mut fresh_own = false;
         for f in chia_resolve::rank_and_dedupe(found) {
@@ -176,7 +179,9 @@ impl RoomCache {
                 fresh_own = true;
             }
             let newer = match self.records.get(&f.record.node_id) {
-                Some(prev) => f.record.issued_at >= prev.record.issued_at,
+                Some(prev) => {
+                    (f.record.issued_at, f.confirmed_height) > (prev.record.issued_at, prev.confirmed_height)
+                }
                 None => true,
             };
             if newer {
@@ -524,6 +529,12 @@ mod tests {
         assert_eq!(c.records["bob"].record.issued_at, 10, "an older signed time never replaces a newer one, whatever its height");
         c.merge(vec![mk("bob", 30, 90)], "me");
         assert_eq!(c.records["bob"].record.issued_at, 30);
+        // Same signed second: the higher confirmation height wins, as in
+        // rank_and_dedupe — a page arriving late cannot restore stale addresses.
+        c.merge(vec![mk("bob", 30, 80)], "me");
+        assert_eq!(c.records["bob"].confirmed_height, 90, "same second, lower height: the cached one stays");
+        c.merge(vec![mk("bob", 30, 95)], "me");
+        assert_eq!(c.records["bob"].confirmed_height, 95, "same second, higher height: replaced");
         assert_eq!(c.live_records(0).len(), 2);
     }
 }
