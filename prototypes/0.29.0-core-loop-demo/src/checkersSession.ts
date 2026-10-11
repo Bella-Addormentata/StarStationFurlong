@@ -20,7 +20,8 @@
  * every repaint is observer-driven.
  *
  * Mounted by devices.ts createGameTableUI, which owns the table's other
- * faces (game picker, chess, card felt) and swaps this layer in and out.
+ * faces (game picker, card felt) and swaps this layer — or chessSession.ts's
+ * — in and out.
  * World builds it (this module imports editMode, which devices.ts cannot
  * without an import cycle).
  */
