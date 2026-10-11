@@ -299,17 +299,30 @@ let lastGapAt = -Infinity;
  *  the error an NTP step the sleep hid and never the sleep itself. About
  *  zero where the monotonic clock ran on, the sleep where it stood still.
  *  The last few gaps are kept, for a sample older than one. */
-interface GapBridge { at: number; correctionMs: number }
+/** `sure`: the monotonic clock itself saw the gap — the event loop did not
+ *  run for longer than the threshold, a suspension beyond doubt. A gap the
+ *  WALL clock alone found is AMBIGUOUS: a sleep the monotonic clock stood
+ *  still through, or a wall-clock step while the page ran, and nothing in
+ *  the page tells the two apart — in either, the only clock that moved is
+ *  the one that steps, and timers, players and marks all show one tick's
+ *  worth. So an ambiguous gap is a sleep for everything that WAITS (the
+ *  samples before it stale, leases lapsed by the wall clock's measure, a
+ *  holder past the lapse letting the remote go) and a step for everything
+ *  that MOVES: its wall delta is never added to playback, so no holder
+ *  seeks its player or beats the room forward on the wall clock's word
+ *  alone. The cost, said once: a holder whose monotonic clock stood still
+ *  through a sleep rejoins where it slept, not where the room ran on to,
+ *  once it picks the remote up again. */
+interface GapBridge { at: number; correctionMs: number; sure: boolean }
 const gapBridges: GapBridge[] = [];
 const GAP_BRIDGES_KEPT = 16;
 let awakeWallAt = NaN;
 /** Whether the marks have a gap in them as of `now`: by EITHER clock. The
  *  monotonic clock may stand still through a sleep (macOS, Linux) and show a
- *  tick's worth where an hour passed; the wall clock ran on. The cost of
- *  listening to it: a forward wall-clock step wider than the threshold
- *  between two ticks (an NTP correction, a manual change) reads as a sleep
- *  too — every sample from before it is stale for one wake window, bridged
- *  by the step, until the holder's next beat lands fresh. A backward step
+ *  tick's worth where an hour passed; the wall clock ran on. A forward
+ *  wall-clock step wider than the threshold between two ticks (an NTP
+ *  correction, a manual change) reads as a gap too — an AMBIGUOUS one
+ *  (GapBridge): stale for one wake window, never bridged. A backward step
  *  reads as nothing (never a negative gap). */
 function gapSince(now: number, wall: number): boolean {
   if (awakeAt === -Infinity) return false;
@@ -323,17 +336,26 @@ export function markTvPageAwake(now = clock(), wall = wallClock()): void {
     lastGapAt = now;
     const monotonic = now - awakeAt;
     const real = Number.isFinite(awakeWallAt) ? Math.max(0, wall - awakeWallAt) : monotonic;
-    gapBridges.push({ at: now, correctionMs: real - monotonic });
+    gapBridges.push({ at: now, correctionMs: real - monotonic, sure: monotonic > TV_SUSPEND_GAP_MS });
     if (gapBridges.length > GAP_BRIDGES_KEPT) gapBridges.shift();
   }
   awakeAt = now;
   awakeWallAt = wall;
 }
 /** What a sample received at `receivedAt` is owed for every gap since: the
- *  wall clock's measure of each in place of the monotonic clock's. */
+ *  wall clock's measure of each SURE gap in place of the monotonic clock's;
+ *  an ambiguous gap adds nothing to playback (GapBridge). */
 function gapCorrectionSince(receivedAt: number): number {
   let sum = 0;
-  for (const g of gapBridges) if (g.at > receivedAt) sum += g.correctionMs;
+  for (const g of gapBridges) if (g.at > receivedAt && g.sure) sum += g.correctionMs;
+  return sum;
+}
+/** The same for time that merely passes — a lease's lapse — where an
+ *  ambiguous gap counts in full: a page that may have slept cannot vouch
+ *  for the renewals it may have missed. */
+function gapElapsedSince(at: number): number {
+  let sum = 0;
+  for (const g of gapBridges) if (g.at > at) sum += g.correctionMs;
   return sum;
 }
 /** What has really elapsed since a moment on the receipt timeline (a lease
@@ -344,7 +366,7 @@ function gapCorrectionSince(receivedAt: number): number {
  *  would give a lease seen before a sleep that clock stood still through a
  *  fresh eight seconds on waking. */
 function elapsedSince(at: number, now: number, wall: number): number {
-  let elapsed = now - at + gapCorrectionSince(at);
+  let elapsed = now - at + gapElapsedSince(at);
   if (at <= awakeAt && gapSince(now, wall)) {
     const monotonic = now - awakeAt;
     const real = Number.isFinite(awakeWallAt) ? Math.max(0, wall - awakeWallAt) : monotonic;

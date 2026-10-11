@@ -775,7 +775,7 @@ describe('the programme', () => {
     expect(readPlayback(TV)).toMatchObject({ stale: true, positionMs: 10_000 + 500 + 3_600_000 + 500 + 3_600_000 });
   });
 
-  it('a sleep the monotonic clock never saw (it stood still: one tick\'s worth where an hour passed) is found by the wall clock: the reading is stale and bridged, and a hand-over delivered on waking is stamped from before it', () => {
+  it('a gap the wall clock alone finds (the monotonic clock stood still through a sleep, or stepped while awake: one tick\'s worth where an hour passed) is AMBIGUOUS — stale and lapsed as a sleep, never bridged as one — and a hand-over delivered on waking is stamped from before it', () => {
     let wall = 1_700_000_000_000;
     setTvClock(() => now, () => wall);
     pickUpRemote(TV);
@@ -785,14 +785,17 @@ describe('the programme', () => {
     tick(500);
     wall += 500;
     markTvPageAwake(now);
-    // The lid closed for an hour; the monotonic clock shows the usual 500 ms
-    // between ticks, as if nothing had happened. The wall clock says an hour.
+    // The lid closed for an hour — or the wall clock stepped an hour while
+    // the page ran: the monotonic clock shows the usual 500 ms between ticks
+    // either way, and nothing in the page tells the two apart. Stale, so
+    // nothing acts on it; run on by the monotonic clock alone, since an hour
+    // is never added to playback on the wall clock's word.
     tick(500);
     wall += 3_600_000;
     markTvPageAwake(now);
     const woke = readPlayback(TV);
     expect(woke.stale).toBe(true);
-    expect(woke.positionMs).toBe(10_000 + 500 + 3_600_000);
+    expect(woke.positionMs).toBe(10_000 + 1_000);
     // A hand-over held by the network through that sleep, delivered on
     // waking BEFORE the first tick back: stamped with the last mark before
     // the gap, which the wall clock finds where the monotonic clock sees
@@ -822,14 +825,13 @@ describe('the programme', () => {
     expect(pickUpRemote(TV)).toEqual({ ok: true }); // lapsed by this page's own watch: taken up again, like anyone
     expect(tvHeartbeat(TV, 20_000)).toEqual({ ok: true });
     expect(readPlayback(TV).stale).toBeUndefined();
-    // A forward wall-clock step wider than the threshold with no sleep (an
-    // NTP correction) reads the same way, the cost of listening to the wall
-    // clock: stale for one wake window, bridged by the step, until a fresh
-    // beat lands; a step shorter than the lapse leaves the hold.
+    // A forward wall-clock step shorter than the lapse: stale for one wake
+    // window, not bridged, and the hold kept — the room is never seeked
+    // forward by a step, and a holder keeps beating from its player.
     tick(500);
     wall += 500 + 5_000; // the step
     markTvPageAwake(now);
-    expect(readPlayback(TV)).toMatchObject({ stale: true, positionMs: 20_000 + 500 + 5_000 });
+    expect(readPlayback(TV)).toMatchObject({ stale: true, positionMs: 20_000 + 500 });
     expect(iHoldRemote(TV)).toBe(true);
     // A backward step is no gap at all.
     tick(500);
