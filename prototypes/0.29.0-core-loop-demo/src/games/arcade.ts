@@ -134,7 +134,7 @@ export function newMatch(args: {
   hostPage: string;
   hostSeat: 0 | 1;
   now: number;
-  /** Ids the room's other matches hold. */
+  /** Ids the room's matches hold (the cabinet's last one too). */
   taken?: ReadonlySet<number>;
   random?: () => number;
 }): ArcadeMatch {

@@ -246,6 +246,44 @@ describe('every copy runs the same game', () => {
     await expect(decodeSnapshot(notState, boot)).rejects.toThrow('not a save state');
   });
 
+  it("takes every bundled game's running state, and refuses one bent out of the power-on shape", async () => {
+    type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+    for (const game of ARCADE_GAMES) {
+      const bytes = rom(game.id);
+      const boot = ArcadeMachine.bootState(bytes)!;
+      const m = new ArcadeMachine();
+      m.load(bytes);
+      const pads = script(600, 3);
+      for (let f = 0; f < pads.length; f++) m.runFrame(pads[f] & 0xff, pads[f] >> 8);
+      const state = m.saveState()!;
+      // Running fills in what power-on leaves null (PPU registers, the tile
+      // cache): still a save state.
+      await expect(decodeSnapshot(await encodeSnapshot(state, boot), boot)).resolves.toBeTruthy();
+
+      const bent = async (bend: (s: Json) => void) => {
+        const s = JSON.parse(JSON.stringify(state)) as Json;
+        bend(s);
+        return decodeSnapshot(await encodeSnapshot(s as never, boot), boot);
+      };
+      const hostile: Array<[string, (s: Json) => void]> = [
+        ['the four parts, empty', (s) => { for (const k of Object.keys(s)) delete s[k]; Object.assign(s, { cpu: {}, mmap: {}, ppu: {}, papu: {} }); }],
+        ['a part missing', (s) => delete s.papu],
+        ['an extra part', (s) => (s.extra = 1)],
+        ['work RAM cut short', (s) => (s.cpu.mem = s.cpu.mem.slice(0, 16))],
+        ['work RAM as an object', (s) => (s.cpu.mem = { 0: 1 })],
+        ['a register as text', (s) => (s.cpu.REG_PC = 'x')],
+        ['a register out of range', (s) => (s.cpu.REG_PC = 1e400)],
+        ['a pattern tile missing', (s) => s.ppu.ptTile.pop()],
+        ['a cached tile as a number', (s) => (s.ppu.scantile[0] = 7)],
+        ['a cached tile without its pixels', (s) => (s.ppu.scantile[0] = { opaque: [0, 0, 0, 0, 0, 0, 0, 0], pix: [] })],
+        ['a null register as an object', (s) => (s.ppu.curNt = {})],
+      ];
+      for (const [what, bend] of hostile) {
+        await expect(bent(bend), `${game.id}: ${what}`).rejects.toThrow('not a save state');
+      }
+    }
+  }, 60_000);
+
   it('a different pad on one frame shows up in the check soon after', () => {
     const bytes = rom('thwaite');
     const a = new ArcadeMachine();
