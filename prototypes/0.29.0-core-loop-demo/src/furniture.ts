@@ -38,6 +38,7 @@ import type {
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
   AirHockeyVisualHandle,
+  AlligatorsVisualHandle,
   PropAnimHandle,
 } from "./devices";
 // 🪙 Coin pusher visual driver: the cabinet draws the engine's cross-section —
@@ -51,6 +52,12 @@ import {
 import {
   AH_SURFACE_Y, AH_HALF_W, AH_HALF_L, AH_GOAL_HALF_W, AH_PUCK_R, AH_MALLET_R,
 } from "./games/airHockey";
+// 🐊 #185: the alligators table is sized by the engine's geometry the same
+// way — pivots, mouths, the rim and the ball all come from one source.
+import {
+  IA_BALL_R, IA_BASE_R, IA_HEAD_LEN, IA_MAX_BALLS, IA_MOUTH_R, IA_SEATS,
+  IA_SEAT_COLORS, IA_SURFACE_Y, IA_TABLE_R, birdAngle, pivotOf, seatAngle,
+} from "./games/alligators";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
@@ -156,6 +163,7 @@ export type FurnitureKind =
   | "slot-machine"
   | "coin-pusher"
   | "air-hockey-table"
+  | "alligators-table"
   // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
   | "cake-table"
   | "gift-box"
@@ -3593,6 +3601,374 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   felt.userData.airHockey = handle; // collected by World.registerFurnitureGroup
 };
 
+// 🐊 Insatiable alligators (#185): eight stands ringing the round table, one
+// behind each head's pivot. The craps/roulette stand model — the walk-up
+// picker takes the nearest free one, and the template INDEX is the seat.
+// Each stand sits on the seat's outward ray where it clears the 3×3
+// footprint by 0.4 m on its far axis (the air-hockey clearance rule), so the
+// diagonal seats stand out at the footprint's corners.
+const alligatorsStands: StandTemplate[] = Array.from({ length: IA_SEATS }, (_, i) => {
+  const a = seatAngle(i);
+  const dx = Math.cos(a);
+  const dz = Math.sin(a);
+  const k = 1.9 / Math.max(Math.abs(dx), Math.abs(dz));
+  return {
+    stand: { x: Math.round(dx * k * 1000) / 1000, z: Math.round(dz * k * 1000) / 1000 },
+    faceAngle: Math.atan2(-dx, -dz), // toward the table centre
+  };
+});
+
+// ── 🐊 Insatiable-alligators table builder (#185) ────────────────────────────
+// A round 2.2 m table on a pedestal inside the 3×3 footprint, its playfield
+// sized exactly by the engine constants. The felt turns on a separate group
+// (the every-10-seconds spin); the rim, the eight heads on their base
+// housings, the eight counter displays with a bird on each, and the balls are
+// fixed to the table. Everything animated is driven through the
+// AlligatorsVisualHandle — heads fold up from under the table only when their
+// seat is claimed.
+/** How far a head's snout tilts up while its mouth is open (rad). */
+const IA_JAW_TILT = 0.55;
+/** A stowed head's fold (rad): pitched down past vertical, under the rim. */
+const IA_STOW_PITCH = 1.75;
+/** Head hinge height above the surface. */
+const IA_HINGE_Y = 0.07;
+/** Ball colours — pastel eggs. */
+const IA_EGG_COLORS = [0xf4efe2, 0xf2c6d8, 0xc6e2f2, 0xf2e6a8, 0xcdeec0, 0xe0cdf2];
+
+const buildAlligatorsTable = (ctx: BuildCtx): void => {
+  const { m, place, attach } = ctx;
+  const S = IA_SURFACE_Y;
+
+  // Pedestal, foot and the round cabinet (top face AT the playing surface).
+  place(new THREE.CylinderGeometry(0.72, 0.78, 0.06, 40), m(0x17261d, 0.6, 0.2), 0, 0.03, 0);
+  place(new THREE.CylinderGeometry(0.32, 0.46, S - 0.26, 28), m(0x1d3326, 0.55, 0.25), 0, 0.06 + (S - 0.26) / 2, 0);
+  const cabinet = place(
+    new THREE.CylinderGeometry(1.12, 1.0, 0.22, 56),
+    m(0x24452f, 0.5, 0.2),
+    0, S - 0.11, 0,
+  );
+  // Rim: a raised ring round the playfield.
+  const rimGeo = new THREE.TorusGeometry(IA_TABLE_R + 0.05, 0.05, 10, 72);
+  rimGeo.rotateX(Math.PI / 2);
+  place(rimGeo, m(0xb8a46a, 0.35, 0.55), 0, S + 0.02, 0);
+
+  // The spinning top — CanvasTexture (NearestFilter, the wall-screen idiom):
+  // a lily-pond swirl whose spokes and pads make the spin readable.
+  const feltCv = document.createElement("canvas");
+  feltCv.width = 512;
+  feltCv.height = 512;
+  const c2d = feltCv.getContext("2d")!;
+  c2d.fillStyle = "#123a3a";
+  c2d.fillRect(0, 0, 512, 512);
+  for (let ring = 5; ring >= 1; ring--) {
+    c2d.fillStyle = ring % 2 === 0 ? "#174848" : "#1b5450";
+    c2d.beginPath();
+    c2d.arc(256, 256, ring * 50, 0, Math.PI * 2);
+    c2d.fill();
+  }
+  c2d.strokeStyle = "#2f7a62";
+  c2d.lineWidth = 5;
+  for (let spoke = 0; spoke < 16; spoke++) {
+    const a = (spoke / 16) * Math.PI * 2;
+    c2d.beginPath();
+    c2d.moveTo(256 + Math.cos(a) * 40, 256 + Math.sin(a) * 40);
+    c2d.quadraticCurveTo(
+      256 + Math.cos(a + 0.5) * 150, 256 + Math.sin(a + 0.5) * 150,
+      256 + Math.cos(a + 0.8) * 250, 256 + Math.sin(a + 0.8) * 250,
+    );
+    c2d.stroke();
+  }
+  c2d.fillStyle = "#3f9a5a"; // lily pads
+  for (let pad = 0; pad < 6; pad++) {
+    const a = (pad / 6) * Math.PI * 2 + 0.3;
+    c2d.beginPath();
+    c2d.arc(256 + Math.cos(a) * 165, 256 + Math.sin(a) * 165, 18, 0.4, Math.PI * 2);
+    c2d.lineTo(256 + Math.cos(a) * 165, 256 + Math.sin(a) * 165);
+    c2d.fill();
+  }
+  c2d.fillStyle = "#e8d070"; // centre boss
+  c2d.beginPath();
+  c2d.arc(256, 256, 22, 0, Math.PI * 2);
+  c2d.fill();
+  const feltTex = new THREE.CanvasTexture(feltCv);
+  feltTex.minFilter = THREE.NearestFilter;
+  feltTex.magFilter = THREE.NearestFilter;
+  feltTex.generateMipmaps = false;
+  feltTex.colorSpace = THREE.SRGBColorSpace;
+  const feltGeo = new THREE.CircleGeometry(IA_TABLE_R, 72);
+  feltGeo.rotateX(-Math.PI / 2);
+  const top = new THREE.Group();
+  top.position.y = S + 0.002;
+  top.add(new THREE.Mesh(feltGeo, new THREE.MeshBasicMaterial({
+    map: feltTex,
+    transparent: true,
+    opacity: 0, // morph fade-in contract — World tweens it up
+  })));
+  attach(top);
+
+  // ── Heads: base housing (a solid bumper in the engine), and the head
+  // itself: hinge (inward) → fold (stow pitch) → swing → lunge → skull
+  // (jaw tilt about its back). Upper jaw only, as the issue asks. ──
+  interface HeadRig {
+    fold: THREE.Group;
+    swing: THREE.Group;
+    lunge: THREE.Group;
+    skull: THREE.Group;
+    foldNow: number;
+    foldTarget: number;
+  }
+  const heads: HeadRig[] = [];
+  const toothGeo = new THREE.ConeGeometry(0.013, 0.04, 4);
+  toothGeo.rotateX(Math.PI); // points down
+  for (let seat = 0; seat < IA_SEATS; seat++) {
+    const p = pivotOf(seat);
+    const a = seatAngle(seat);
+    const inward = Math.atan2(-Math.cos(a), -Math.sin(a));
+    const collar = IA_SEAT_COLORS[seat];
+
+    // A low mossy mound the head rises out of, ringed at its foot in the
+    // seat's colour.
+    const moundGeo = new THREE.SphereGeometry(IA_BASE_R, 28, 10, 0, Math.PI * 2, 0, Math.PI / 2);
+    moundGeo.scale(1, 0.32, 1);
+    place(moundGeo, m(0x2c5a3a, 0.7, 0.05), p.x, S, p.z);
+    const collarGeo = new THREE.TorusGeometry(IA_BASE_R, 0.016, 6, 32);
+    collarGeo.rotateX(Math.PI / 2);
+    place(collarGeo, m(collar, 0.4, 0.2, collar, 0.35), p.x, S + 0.012, p.z);
+
+    const hinge = new THREE.Group();
+    hinge.position.set(p.x, S + IA_HINGE_Y, p.z);
+    hinge.rotation.y = inward;
+    const fold = new THREE.Group();
+    fold.rotation.x = IA_STOW_PITCH;
+    fold.visible = false;
+    const swing = new THREE.Group();
+    const lunge = new THREE.Group();
+    const skull = new THREE.Group();
+    hinge.add(fold);
+    fold.add(swing);
+    swing.add(lunge);
+    lunge.add(skull);
+
+    const green = m(0x3f8f3a, 0.55, 0.1);
+    const dark = m(0x2e6b2b, 0.6, 0.1);
+    const belly = m(0xc9d98a, 0.6, 0.05);
+    const tooth = m(0xf6f2e4, 0.3, 0.05);
+    const mesh = (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number, parent: THREE.Object3D): THREE.Mesh => {
+      const o = new THREE.Mesh(geo, mat);
+      o.position.set(x, y, z);
+      parent.add(o);
+      return o;
+    };
+    // Little hands at the base (they stay put while the head lunges).
+    for (const sx of [-1, 1]) {
+      mesh(new THREE.BoxGeometry(0.06, 0.035, 0.09), green, sx * 0.13, -0.035, 0.07, swing);
+      for (const cx of [-0.018, 0, 0.018]) {
+        mesh(new THREE.BoxGeometry(0.01, 0.012, 0.025), tooth, sx * 0.13 + cx, -0.045, 0.125, swing);
+      }
+    }
+    // Neck collar in the seat's colour.
+    const neckRing = new THREE.TorusGeometry(0.1, 0.018, 6, 20);
+    mesh(neckRing, m(collar, 0.4, 0.2, collar, 0.3), 0, 0.01, 0.03, swing);
+    // Skull: the back of the head with the eyes, then the long snout and its
+    // wide rounded tip — the mouth footprint (IA_MOUTH_R) sits under the tip.
+    mesh(new THREE.BoxGeometry(0.21, 0.12, 0.2), green, 0, 0.02, 0.09, skull);
+    const snoutLen = IA_HEAD_LEN - 0.16;
+    mesh(new THREE.BoxGeometry(0.17, 0.065, snoutLen), green, 0, -0.005, 0.16 + snoutLen / 2, skull);
+    mesh(new THREE.BoxGeometry(0.15, 0.012, snoutLen), belly, 0, -0.04, 0.16 + snoutLen / 2, skull);
+    const tip = mesh(new THREE.CylinderGeometry(IA_MOUTH_R - 0.01, IA_MOUTH_R - 0.005, 0.065, 20), green, 0, -0.005, IA_HEAD_LEN, skull);
+    tip.scale.set(1, 1, 0.85);
+    for (let t = 0; t < 11; t++) {
+      // Teeth round the front half of the tip and along both jaw edges.
+      const ang = -Math.PI / 2 + (t / 10) * Math.PI;
+      mesh(toothGeo, tooth, Math.sin(ang) * (IA_MOUTH_R - 0.02), -0.05, IA_HEAD_LEN + Math.cos(ang) * (IA_MOUTH_R - 0.03) * 0.85, skull);
+    }
+    for (const sx of [-1, 1]) {
+      for (let t = 0; t < 4; t++) {
+        mesh(toothGeo, tooth, sx * 0.075, -0.05, 0.19 + t * 0.045, skull);
+      }
+      // Eyes on top of the head, nostrils on the tip, bumps along the snout.
+      const eye = mesh(new THREE.SphereGeometry(0.038, 12, 8), m(0xf0d040, 0.3, 0.05), sx * 0.065, 0.085, 0.07, skull);
+      mesh(new THREE.SphereGeometry(0.018, 8, 6), m(0x101010, 0.3, 0.05), 0, 0.012, 0.024, eye);
+      mesh(new THREE.SphereGeometry(0.014, 8, 6), dark, sx * 0.035, 0.032, IA_HEAD_LEN + 0.05, skull);
+      mesh(new THREE.BoxGeometry(0.03, 0.02, 0.03), dark, sx * 0.04, 0.032, 0.22, skull);
+    }
+    attach(hinge);
+    heads.push({ fold, swing, lunge, skull, foldNow: IA_STOW_PITCH, foldTarget: IA_STOW_PITCH });
+  }
+
+  // ── Counter displays (one per seat, beside it) with a bird on each ──
+  const DISPLAY_R = 1.2;
+  const DISPLAY_W = 0.26;
+  const DISPLAY_H = 0.17;
+  const DISPLAY_Y = S + 0.13;
+  interface DisplayRig {
+    cv: HTMLCanvasElement;
+    tex: THREE.CanvasTexture;
+    key: string;
+    count: number;
+    lit: boolean;
+    flashing: boolean;
+  }
+  const displays: DisplayRig[] = [];
+  interface BirdRig {
+    body: THREE.Group;
+    squat: number;
+  }
+  const birds: BirdRig[] = [];
+  for (let j = 0; j < IA_SEATS; j++) {
+    const a = birdAngle(j);
+    const dx = Math.cos(a);
+    const dz = Math.sin(a);
+    const out = Math.atan2(dx, dz); // plane +z → outward
+    // Bracket from the cabinet edge out to the display, then the casing.
+    place(new THREE.BoxGeometry(0.06, 0.05, 0.16), m(0x2a3644, 0.5, 0.4), dx * 1.1, S + 0.0, dz * 1.1, out);
+    place(new THREE.BoxGeometry(0.05, 0.1, 0.05), m(0x2a3644, 0.5, 0.4), dx * DISPLAY_R, S + 0.02, dz * DISPLAY_R, out);
+    place(new THREE.BoxGeometry(DISPLAY_W + 0.03, DISPLAY_H + 0.03, 0.06), m(0x141c24, 0.5, 0.4), dx * DISPLAY_R, DISPLAY_Y, dz * DISPLAY_R, out);
+    const cv = document.createElement("canvas");
+    cv.width = 128;
+    cv.height = 84;
+    const tex = new THREE.CanvasTexture(cv);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    // One texture on both faces (the air-hockey scoreboard note: the back
+    // plane's half turn already reads the right way round).
+    for (const face of [0, Math.PI]) {
+      const ox = dx * (DISPLAY_R + (face === 0 ? 0.031 : -0.031));
+      const oz = dz * (DISPLAY_R + (face === 0 ? 0.031 : -0.031));
+      place(new THREE.PlaneGeometry(DISPLAY_W, DISPLAY_H), new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 }), ox, DISPLAY_Y, oz, out + face);
+    }
+    displays.push({ cv, tex, key: "", count: 0, lit: false, flashing: false });
+
+    // The bird, facing in over the table, sitting on the display.
+    const bird = new THREE.Group();
+    bird.position.set(dx * DISPLAY_R, DISPLAY_Y + DISPLAY_H / 2 + 0.015, dz * DISPLAY_R);
+    bird.rotation.y = out + Math.PI;
+    const body = new THREE.Group();
+    bird.add(body);
+    const plume = m(0xf2a0b8, 0.6, 0.05);
+    const bodyMesh = new THREE.Mesh(new THREE.SphereGeometry(0.055, 14, 10), plume);
+    bodyMesh.scale.set(1, 0.85, 1.25);
+    bodyMesh.position.y = 0.047;
+    body.add(bodyMesh);
+    const headMesh = new THREE.Mesh(new THREE.SphereGeometry(0.034, 12, 8), plume);
+    headMesh.position.set(0, 0.105, 0.05);
+    body.add(headMesh);
+    const beak = new THREE.Mesh(new THREE.ConeGeometry(0.012, 0.04, 6), m(0xf0a030, 0.4, 0.05));
+    beak.rotation.x = Math.PI / 2;
+    beak.position.set(0, 0.1, 0.095);
+    body.add(beak);
+    for (const sx of [-1, 1]) {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.008, 6, 4), m(0x101010, 0.3, 0.05));
+      eye.position.set(sx * 0.022, 0.115, 0.075);
+      body.add(eye);
+      const wing = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.04, 0.08), m(0xe888a8, 0.6, 0.05));
+      wing.position.set(sx * 0.056, 0.05, -0.005);
+      body.add(wing);
+    }
+    attach(bird);
+    birds.push({ body, squat: 0 });
+  }
+
+  const drawDisplay = (seat: number, flashOn: boolean): void => {
+    const d = displays[seat];
+    const g = d.cv.getContext("2d")!;
+    const color = `#${IA_SEAT_COLORS[seat].toString(16).padStart(6, "0")}`;
+    const inverse = d.flashing && flashOn;
+    g.fillStyle = inverse ? color : "#070b10";
+    g.fillRect(0, 0, 128, 84);
+    g.strokeStyle = d.lit ? color : "#1c2630";
+    g.lineWidth = 4;
+    g.strokeRect(3, 3, 122, 78);
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.font = "bold 54px monospace";
+    g.fillStyle = !d.lit ? "#1c2630" : inverse ? "#070b10" : color;
+    g.fillText(d.lit ? String(d.count) : "--", 64, 46);
+    d.tex.needsUpdate = true;
+  };
+  for (let seat = 0; seat < IA_SEATS; seat++) drawDisplay(seat, false);
+
+  // ── Balls — hidden until a session shows them; shared egg materials. ──
+  const ballGeo = new THREE.SphereGeometry(IA_BALL_R, 14, 10);
+  const eggMats = IA_EGG_COLORS.map((c) => m(c, 0.35, 0.05));
+  const balls: THREE.Mesh[] = [];
+  for (let k = 0; k < IA_MAX_BALLS; k++) {
+    const ball = new THREE.Mesh(ballGeo, eggMats[k % eggMats.length]);
+    ball.position.y = S + IA_BALL_R;
+    ball.visible = false;
+    attach(ball);
+    balls.push(ball);
+  }
+
+  let flashClock = 0;
+  const handle: AlligatorsVisualHandle = {
+    setHead(seat, raised, swing, ext, jawOpen): void {
+      const h = heads[seat];
+      if (!h) return;
+      h.foldTarget = raised ? 0 : IA_STOW_PITCH;
+      // swing is + toward the seated player's screen-right; inside the hinge
+      // (whose +z points in) that is a turn toward local −x: rotation −swing.
+      h.swing.rotation.y = -swing;
+      h.lunge.position.z = ext;
+      h.skull.rotation.x = -IA_JAW_TILT * Math.max(0, Math.min(1, jawOpen));
+    },
+    setBall(index, x, z, visible): void {
+      const b = balls[index];
+      if (!b) return;
+      b.visible = visible;
+      b.position.x = x;
+      b.position.z = z;
+    },
+    setSpin(angle): void {
+      top.rotation.y = angle;
+    },
+    setDisplay(seat, count, lit, flashing): void {
+      const d = displays[seat];
+      if (!d) return;
+      const key = `${count}|${lit}|${flashing}`;
+      if (key === d.key) return; // dedupe — callers repeat every frame
+      d.key = key;
+      d.count = count;
+      d.lit = lit;
+      d.flashing = flashing;
+      drawDisplay(seat, false);
+    },
+    layEgg(bird): void {
+      const b = birds[bird];
+      if (b) b.squat = 1;
+    },
+    update(dt: number): void {
+      const t = Math.max(0, dt);
+      for (const h of heads) {
+        h.foldNow += (h.foldTarget - h.foldNow) * Math.min(1, t * 6);
+        if (Math.abs(h.foldTarget - h.foldNow) < 0.002) h.foldNow = h.foldTarget;
+        h.fold.rotation.x = h.foldNow;
+        // Fully stowed heads are hidden under the table.
+        h.fold.visible = h.foldNow < IA_STOW_PITCH - 0.01;
+      }
+      for (const b of birds) {
+        // Squat, then pop up as the egg comes out.
+        b.squat = Math.max(0, b.squat - t * 2.6);
+        const phase = 1 - b.squat;
+        const s = b.squat > 0 ? 1 - 0.35 * Math.sin(Math.PI * phase) : 1;
+        b.body.scale.set(1 + (1 - s) * 0.5, s, 1 + (1 - s) * 0.5);
+      }
+      // Winners' displays strobe four times a second.
+      const before = Math.floor(flashClock * 4) % 2;
+      flashClock += t;
+      const now = Math.floor(flashClock * 4) % 2;
+      if (now !== before) {
+        displays.forEach((d, seat) => {
+          if (d.flashing) drawDisplay(seat, now === 1);
+        });
+      }
+    },
+  };
+  cabinet.userData.alligators = handle; // collected by World.registerFurnitureGroup
+};
+
 export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "fireplace-wall": {
     kind: "fireplace-wall",
@@ -4008,6 +4384,24 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.62, z: -1.85 },
       anchor: { x: 0, y: AH_SURFACE_Y, z: 0 },
+    },
+  },
+  // 🐊 Insatiable alligators (#185): a round table in a 3×3 footprint, eight
+  // seats round it. The device template holds SEAT 0's values (local −z);
+  // World's requestDeviceFocus turns the front/eye round the table centre to
+  // the seat the player walked to.
+  "alligators-table": {
+    kind: "alligators-table",
+    build: buildAlligatorsTable,
+    footprint: { w: 3, d: 3 },
+    functions: ["alligatorsTable"],
+    stands: alligatorsStands,
+    device: {
+      kind: "alligators",
+      front: { x: 0, z: -1.9 },
+      faceAngle: 0,
+      eye: { x: 0, y: 2.3, z: -1.75 },
+      anchor: { x: 0, y: IA_SURFACE_Y, z: 0 },
     },
   },
   // ── 🚀 Ship fittings (#30 SH1) — capability = the `functions` TAG, not the
