@@ -185,6 +185,8 @@ import type {
   DeviceTarget,
 } from "./devices";
 import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
+import { seatOf, standIndexFor } from "./games/checkersTable";
+import { createCheckersTableLayer, paintCheckersTable } from "./checkersSession";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -1646,9 +1648,7 @@ export class World {
     // the previous listener first, so rebuilds never stack duplicates.
     this.unsubscribeGameBoards?.();
     const repaintBoards = () => {
-      for (const [id, top] of this.gameTableTops) {
-        top.setBoard(readGame(id)?.board ?? null);
-      }
+      for (const [id, top] of this.gameTableTops) paintCheckersTable(top, id);
     };
     this.unsubscribeGameBoards = subscribeGames(repaintBoards);
     repaintBoards();
@@ -1688,7 +1688,7 @@ export class World {
         // degrades correctly — if the helper ever stops filing this kind,
         // the paint no-ops rather than driving a handle nothing tracks.
         const spawnedTop = sinks.gameTableTops.get(item.id);
-        if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+        if (spawnedTop) paintCheckersTable(spawnedTop, item.id);
         // 🏒 #115: hand the filed air-hockey handle to the session layer,
         // which drives it every frame (airHockeyFrame) and converts its LOCAL
         // coords to the world-space tick wire — read back from the sink for
@@ -6025,15 +6025,40 @@ export class World {
     }
 
     if (device.kind === "gameTable") {
-      // #45 v1: flippable surface + doc-synced checkers. The flip is a UI
+      // #45 v1: flippable surface + doc-synced games. The flip is a UI
       // affordance (button), not focus choreography — no prepare hook; the
       // top handle simply rides along so FLIP can drive the tween.
+      const top = this.gameTableTops.get(deviceId) ?? null;
       const ui = createGameTableUI({
         itemId: deviceId,
-        top: this.gameTableTops.get(deviceId) ?? null,
+        top,
+        // 🎲 #227: checkers is played on the 3D table itself.
+        checkers: createCheckersTableLayer({ itemId: deviceId, top }),
       });
-      // 🎰 #76: walk to an open STANDING position at the table, then the UI opens.
-      deviceFocus.beginFocus(this.player, this.standTarget(device), ui);
+      // 🎰 #76: walk to an open STANDING position at the table, then the UI
+      // opens. 🎲 #227: a seated checkers player goes to their OWN end and
+      // looks from it (stand s0 = red at −z, s1 = black at +z); everyone
+      // else takes the nearest open end, and the camera follows that end.
+      const game = readGame(deviceId);
+      const mine = game ? seatOf(game, getPlayerId()) : null;
+      const ownEnd = mine
+        ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${standIndexFor(mine)}`)
+        : undefined;
+      const stand = ownEnd ?? this.pickFreeStand(deviceId);
+      const farEnd = stand ? stand.id.endsWith(":s1") : false;
+      // The def bakes the −z eye; the +z end's is its point reflection
+      // through the board centre (air hockey's mirrored-end rule).
+      const eye = farEnd
+        ? new THREE.Vector3(
+            2 * device.anchor.x - device.eye.x,
+            device.eye.y,
+            2 * device.anchor.z - device.eye.z,
+          )
+        : device.eye;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : device;
+      deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 

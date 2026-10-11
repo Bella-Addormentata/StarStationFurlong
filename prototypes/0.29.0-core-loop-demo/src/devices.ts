@@ -165,11 +165,9 @@ import {
 import type { ItemDef } from './items';
 import { loadSavedOutfitId } from './outfits';
 import type { RoomEditPermission } from './editMode';
-import {
-  initialState, legalMoves, applyMove, chooseBotMove, pieceColor, otherColor,
-  RED_KING, BLACK_KING,
-} from './games/checkers';
-import type { CheckersState, CheckersColor } from './games/checkers';
+import { initialState } from './games/checkers';
+import type { CheckersColor } from './games/checkers';
+import type { BoardMarks } from './games/checkersTable';
 import {
   initialChessState, legalChessMoves, applyChessMove, chooseChessBotMove,
   chessPieceColor, otherChessColor, inCheck,
@@ -177,7 +175,7 @@ import {
   B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
 } from './games/chess';
 import type { ChessState, ChessColor } from './games/chess';
-import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
+import { writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
@@ -581,11 +579,20 @@ export interface GameTableTopHandle {
   /** True when the card-felt face is up (checkerboard face down). */
   isCardsUp(): boolean;
   /**
-   * Repaint the in-world checkerboard texture from a 64-cell board array
-   * (games/checkers.ts codes), or null for the bare board. Lets spectators
-   * see the live game without focusing (wall-screen hybrid idiom, §D0.4).
+   * Lay the 3D checkers out from a 64-cell board array (games/checkers.ts
+   * codes), or null for a bare board, and light the frame strip at the end
+   * whose `turn` it is (null: no game running). Everyone in the room sees
+   * this — spectators follow the live game without focusing (#227).
    */
-  setBoard(board: number[] | null): void;
+  setBoard(board: number[] | null, turn?: CheckersColor | null): void;
+  /** The LOCAL player's move marks (selection, destinations, movable
+   *  pieces, hover) painted on the board face; null clears them. */
+  setMarks(marks: BoardMarks | null): void;
+  /** Cell under a ray (focus camera + pointer), or null off the squares,
+   *  while the board face is up and at rest. */
+  pickCell(ray: THREE.Raycaster): number | null;
+  /** True when a ray hits the ⚙ settings token beside the board. */
+  pickSettings(ray: THREE.Raycaster): boolean;
   /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
   update(deltaTime: number): void;
 }
@@ -1540,7 +1547,7 @@ export function createStorageTrunkUI(deps: StorageTrunkUIDeps): DeviceUI {
   };
 }
 
-// ── #45 v1 game-table focused UI — flippable surface + doc-synced checkers ───
+// ── #45 v1 game-table focused UI — flippable surface, game picker, chess ────
 
 export interface GameTableUIDeps {
   /** Furniture item id — the key into the room doc's `games` map. */
@@ -1550,212 +1557,57 @@ export interface GameTableUIDeps {
    * handle was never collected — the FLIP affordance disables itself).
    */
   top: GameTableTopHandle | null;
+  /**
+   * 🎲 #227: the fully-3D checkers layer (checkersSession.ts, built by
+   * World). While the table holds checkers with its board face up, this
+   * UI hides its panel and mounts the layer instead — play happens on the
+   * 3D table. Null: checkers has no surface here (headless tests).
+   */
+  checkers: CheckersTableLayer | null;
+}
+
+/** The slice of checkersSession.ts's layer this UI drives (declared here so
+ *  devices.ts never imports the session module — editMode would cycle). */
+export interface CheckersTableLayer {
+  mount(host: HTMLElement, refresh: () => void): void;
+  unmount(): void;
+  update(dt: number): void;
+  canReset(): boolean;
 }
 
 const GT_GOLD = '#d4a84b';
 const GT_GOLD_BRIGHT = '#F0C060';
 const GT_DIM = '#4A5560';
 
-/** DOM-board palette (mirrors the in-world texture painter in furniture.ts). */
-const DOM_SQ_LIGHT = '#EAD9B0';
-const DOM_SQ_DARK = '#7A4A28';
-const DOM_RED = '#C43C3C';
-const DOM_BLACK = '#23252E';
-
 /**
  * The game table's focused DOM UI (#45 v1): FLIP affordance for the two-face
- * top, and the checkers game on face A — seat claiming (first two claimants,
- * keyed by S2 player id), click-to-move with mandatory-capture highlighting,
- * VS BOT single-player, forfeit/reset, live spectator view. ALL game state
- * lives in the room doc's `games` map (games/gamesDoc.ts): every transition
- * is read → pure-engine compute → transacted write, and every repaint is
- * observer-driven — a second tab (or a rejoin) converges from the doc alone.
+ * top, the GAME PICKER, and chess on face A — seat claiming (first two
+ * claimants, keyed by S2 player id), click-to-move, VS BOT single-player,
+ * forfeit/reset, live spectator view. ALL game state lives in the room doc's
+ * `games` map (games/gamesDoc.ts): every transition is read → pure-engine
+ * compute → transacted write, and every repaint is observer-driven — a
+ * second tab (or a rejoin) converges from the doc alone.
+ *
+ * 🎲 #227: checkers no longer lives in this panel. When the table holds a
+ * checkers game with its board face up, the panel steps aside and the 3D
+ * layer (deps.checkers) takes over — pieces on the table, clicks on the
+ * table, a ⚙ token for options.
  *
  * Honest-scope notes baked into the panel: the card face has no games yet
  * (war/poker/solitaire arrive per brainstorming/games-plan.md), and the
- * trivial bot only "thinks" while the RED claimant has the table focused.
+ * trivial bot only "thinks" while its human player has the table focused.
  */
 export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let boardCanvas: HTMLCanvasElement | null = null;
   let unsubscribe: (() => void) | null = null;
-  /** Selected own-piece cell, or null. Local-only — never written to the doc. */
-  let selected: number | null = null;
-  let botTimer = 0;
+  let host: HTMLElement | null = null;
+  /** True while the 3D checkers layer owns the view (panel hidden). */
+  let checkersMounted = false;
   const myId = getPlayerId();
 
   const BOARD_CSS = 320;  // CSS px (square)
   const BOARD_RES = 640;  // backing-store px (2x for crisp squares)
-
-  const mySeat = (s: CheckersState): CheckersColor | null =>
-    s.players.red === myId ? 'red' : s.players.black === myId ? 'black' : null;
-
-  /** May I interact with the board right now (seat + turn + not the bot's)? */
-  const myTurn = (s: CheckersState): boolean => {
-    const seat = mySeat(s);
-    return s.status === 'playing' && seat !== null && s.turn === seat
-      && !(s.bot && s.turn === 'black');
-  };
-
-  const seatLabel = (s: CheckersState, color: CheckersColor): string => {
-    if (color === 'black' && s.bot) return 'BOT';
-    const id = s.players[color];
-    if (!id) return 'OPEN';
-    const name = readPlayerDisplayName(id).toUpperCase();
-    return id === myId ? `${name} (YOU)` : name;
-  };
-
-  const statusText = (s: CheckersState): string => {
-    if (s.status === 'waiting') return 'WAITING FOR PLAYERS — SIT DOWN TO CLAIM A COLOR';
-    if (s.status === 'red-won') return '● RED WINS';
-    if (s.status === 'black-won') return '● BLACK WINS';
-    const who = s.turn.toUpperCase();
-    const yours = myTurn(s) ? ' — YOUR MOVE' : '';
-    const chain = s.chain !== null ? ' · MULTI-JUMP: SAME PIECE CONTINUES' : '';
-    return `${who} TO MOVE${yours}${chain}`;
-  };
-
-  // ── Doc transitions (read → pure engine → transacted write) ────────────────
-
-  const claimSeat = (color: CheckersColor): void => {
-    const s = readGame(deps.itemId) ?? initialState();
-    if (s.status !== 'waiting') return;            // claims only pre-game (v1)
-    if (s.players[color] !== null) return;         // taken (doc LWW settles races)
-    if (s.players[otherColor(color)] === myId) return; // one seat per player (v1)
-    if (s.bot && color === 'black') return;        // bot holds black
-    const players = { ...s.players, [color]: myId };
-    const status = players.red && players.black ? 'playing' as const : s.status;
-    writeGame(deps.itemId, { ...s, players, status });
-  };
-
-  const startBotGame = (): void => {
-    const s = readGame(deps.itemId) ?? initialState();
-    if (s.status !== 'waiting' || s.players.black !== null) return;
-    if (s.players.red !== null && s.players.red !== myId) return; // not alone
-    writeGame(deps.itemId, {
-      ...s,
-      players: { ...s.players, red: myId },
-      bot: true,
-      status: 'playing',
-    });
-  };
-
-  const forfeit = (): void => {
-    const s = readGame(deps.itemId);
-    if (!s || s.status !== 'playing') return;
-    const seat = mySeat(s);
-    if (!seat) return;
-    writeGame(deps.itemId, {
-      ...s,
-      status: seat === 'red' ? 'black-won' : 'red-won',
-      chain: null,
-    });
-  };
-
-  /** RESET gate: participants or the room owner mid-game; ANYONE once the
-   *  game is finished (otherwise departed winners would pin the seats).
-   *  Bot games are always resettable (review F5): the bot holds no real seat,
-   *  so if the red claimant leaves mid-game no seat-holder remains — without
-   *  this an owner-absent room's table is pinned at BLACK (BOT) forever. */
-  const canReset = (s: CheckersState | null): boolean => {
-    if (!s) return false;
-    if (s.status === 'red-won' || s.status === 'black-won') return true;
-    if (s.bot) return true;
-    return mySeat(s) !== null || readRoomOwner() === myId;
-  };
-
-  // (The old per-game reset became clearToPicker — RESET now clears the whole
-  // table back to the game menu for BOTH kinds. The LWW caveat still applies:
-  // an in-flight opponent move-write may win over the clear; RESET again
-  // recovers. canReset above remains the checkers half of canClearTable.)
-
-  // ── Board rendering + click-to-move ────────────────────────────────────────
-
-  const drawBoard = (s: CheckersState | null): void => {
-    if (!boardCanvas) return;
-    const ctx = boardCanvas.getContext('2d');
-    if (!ctx) return;
-    const state = s ?? initialState();
-    const SQ = BOARD_RES / 8;
-    ctx.imageSmoothingEnabled = false;
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        ctx.fillStyle = (r + c) % 2 === 1 ? DOM_SQ_DARK : DOM_SQ_LIGHT;
-        ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
-      }
-    }
-    const moves = s && myTurn(s) ? legalMoves(s) : [];
-    // Selected piece: gold frame; its legal destinations: gold dots.
-    if (selected !== null) {
-      ctx.lineWidth = 6;
-      ctx.strokeStyle = GT_GOLD_BRIGHT;
-      ctx.strokeRect((selected % 8) * SQ + 3, Math.floor(selected / 8) * SQ + 3, SQ - 6, SQ - 6);
-      for (const m of moves) {
-        if (m.from !== selected) continue;
-        ctx.beginPath();
-        ctx.arc((m.to % 8) * SQ + SQ / 2, Math.floor(m.to / 8) * SQ + SQ / 2, SQ * 0.14, 0, Math.PI * 2);
-        ctx.fillStyle = GT_GOLD_BRIGHT;
-        ctx.fill();
-      }
-    }
-    for (let idx = 0; idx < 64; idx++) {
-      const v = state.board[idx];
-      if (v === 0) continue;
-      const red = pieceColor(v) === 'red';
-      const cx = (idx % 8) * SQ + SQ / 2;
-      const cy = Math.floor(idx / 8) * SQ + SQ / 2;
-      ctx.beginPath();
-      ctx.arc(cx, cy, SQ * 0.36, 0, Math.PI * 2);
-      ctx.fillStyle = red ? DOM_RED : DOM_BLACK;
-      ctx.fill();
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = red ? '#8E2626' : '#0E0F14';
-      ctx.stroke();
-      // Movable pieces get a soft halo on your turn (mandatory captures make
-      // "why can't I move THIS piece?" a real question — show the answer).
-      if (moves.some((m) => m.from === idx)) {
-        ctx.beginPath();
-        ctx.arc(cx, cy, SQ * 0.44, 0, Math.PI * 2);
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(240, 192, 96, 0.65)';
-        ctx.stroke();
-      }
-      if (v === RED_KING || v === BLACK_KING) {
-        ctx.fillStyle = GT_GOLD_BRIGHT;
-        ctx.font = 'bold 30px monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('K', cx, cy + 2);
-      }
-    }
-  };
-
-  const onBoardClick = (e: MouseEvent): void => {
-    if (!boardCanvas) return;
-    const s = readGame(deps.itemId);
-    if (!s || !myTurn(s)) return; // spectators/off-turn: view only
-    const rect = boardCanvas.getBoundingClientRect();
-    const c = Math.floor(((e.clientX - rect.left) / rect.width) * 8);
-    const r = Math.floor(((e.clientY - rect.top) / rect.height) * 8);
-    if (r < 0 || r > 7 || c < 0 || c > 7) return;
-    const idx = r * 8 + c;
-    const moves = legalMoves(s);
-    if (selected !== null) {
-      const move = moves.find((m) => m.from === selected && m.to === idx);
-      if (move) {
-        const next = applyMove(s, move);
-        // Multi-jump: keep the chained piece selected so the continuation
-        // reads as one gesture; otherwise clear.
-        selected = next.chain;
-        writeGame(deps.itemId, next); // observer repaints
-        return;
-      }
-    }
-    // (Re)select one of my movable pieces; anything else clears.
-    selected = pieceColor(s.board[idx]) === s.turn && moves.some((m) => m.from === idx)
-      ? idx : null;
-    drawBoard(s); // selection is local — no doc write, repaint directly
-  };
 
   // ── ♟ Chess (#45 — the board face's second game; checkers' sibling) ────────
 
@@ -1824,7 +1676,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   const canClearTable = (): boolean => {
     const t = readTable(deps.itemId);
     if (!t) return false;
-    if (t.kind === 'checkers') return canReset(t.state);
+    if (t.kind === 'checkers') return deps.checkers?.canReset() ?? false;
     // 🏒 An air-hockey state under a GAME TABLE's key is foreign — the
     // air-hockey UI writes only under its own table's item id, so this can
     // only be a malformed/hostile peer write. No participants are derivable
@@ -1841,7 +1693,6 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
    *  switch games; the whole-value LWW caveat from reset() applies). */
   const clearToPicker = (): void => {
     if (!canClearTable()) return;
-    selected = null;
     chessSelected = null;
     clearTable(deps.itemId);
   };
@@ -1942,14 +1793,29 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
 
   // ── Panel rendering (trunk-UI idiom: re-render + re-attach on change) ──────
 
+  /**
+   * 🎲 #227: hand the view to the 3D checkers layer while checkers owns the
+   * board face (face up, at rest), and take it back otherwise. Returns true
+   * while the layer has it — the panel then stays hidden and unrendered.
+   */
+  const syncCheckersLayer = (): boolean => {
+    const want = !!deps.checkers && !!host
+      && readTable(deps.itemId)?.kind === 'checkers'
+      && !(deps.top?.isCardsUp() ?? false) && !(deps.top?.isFlipping() ?? false);
+    if (want && !checkersMounted && host) {
+      deps.checkers?.mount(host, () => render());
+      checkersMounted = true;
+    } else if (!want && checkersMounted) {
+      deps.checkers?.unmount();
+      checkersMounted = false;
+    }
+    if (panel) panel.style.display = checkersMounted ? 'none' : 'flex';
+    return checkersMounted;
+  };
+
   const render = (): void => {
     if (!panel) return;
-    const s = readGame(deps.itemId);
-    // Prune a stale selection (an opponent/bot move landed, or a reset).
-    if (selected !== null
-      && (!s || !myTurn(s) || !legalMoves(s).some((m) => m.from === selected))) {
-      selected = s?.chain ?? null;
-    }
+    if (syncCheckersLayer()) return;
     const cardsUp = deps.top?.isCardsUp() ?? false;
     const flipping = deps.top?.isFlipping() ?? false;
     const surface = flipping ? 'FLIPPING…' : cardsUp ? 'CARD FELT' : 'CHECKERBOARD';
@@ -1968,22 +1834,6 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         cursor: ${disabled ? 'not-allowed' : 'pointer'};
         opacity: ${disabled ? '0.5' : '1'};
       ">${label}</button>`;
-
-    const seatCell = (color: CheckersColor): string => {
-      const state = s ?? initialState();
-      const label = seatLabel(state, color);
-      const claimable = state.status === 'waiting'
-        && state.players[color] === null
-        && !(state.bot && color === 'black')
-        && state.players[otherColor(color)] !== myId;
-      const dot = color === 'red' ? DOM_RED : '#9AA3B2';
-      return `
-        <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:7px 10px;">
-          <span style="width:10px; height:10px; border-radius:50%; background:${dot}; flex:none;"></span>
-          <span style="flex:1; font-size:10px; letter-spacing:1px; color:${GT_GOLD};">${color.toUpperCase()} — ${label}</span>
-          ${claimable ? btn(`gt-sit-${color}`, 'SIT', false, `Claim ${color}`) : ''}
-        </div>`;
-    };
 
     const table = readTable(deps.itemId);
 
@@ -2047,22 +1897,11 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
         </div>`;
     } else if (table.kind === 'checkers') {
-      const state = table.state;
-      const showBot = state.status === 'waiting' && state.players.black === null
-        && (state.players.red === null || state.players.red === myId);
-      const showForfeit = state.status === 'playing' && mySeat(state) !== null;
+      // 🎲 #227: checkers is played on the 3D table — this face only shows
+      // for the instant the top is mid-flip (the layer steps aside then).
       boardFace = `
-        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
-          state.status === 'playing' ? GT_GOLD_BRIGHT : state.status === 'waiting' ? GT_DIM : '#00E676'
-        };">${statusText(state)}</div>
-        <div style="display:flex; gap:8px;">
-          ${seatCell('red')}
-          ${seatCell('black')}
-        </div>
-        ${showBot ? `<div>${btn('gt-bot', '⚙ VS BOT — PLAY ALONE', false, 'Start a single-player game against a trivial AI')}</div>` : ''}
-        ${canvasHtml(myTurn(state))}
+        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${GT_GOLD_BRIGHT};">⛀ CHECKERS IS PLAYED ON THE TABLE</div>
         <div style="display:flex; gap:8px; justify-content:flex-end;">
-          ${showForfeit ? btn('gt-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
           ${btn('gt-reset', 'RESET', !canClearTable(),
             canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
         </div>`;
@@ -2103,13 +1942,12 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         </div>
       </div>` : boardFace}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF GAME TABLE · chess (full rules, auto-queen) + checkers (American rules) · state synced via room doc · flip is per-player (only you see the other face)
+        SSF GAME TABLE · chess (full rules, auto-queen) here · checkers (American rules) plays on the 3D table · state synced via room doc · flip is per-player (only you see the other face)
       </div>
     `;
 
     panel.querySelector<HTMLButtonElement>('#gt-flip')?.addEventListener('click', () => {
       if (!deps.top || deps.top.isFlipping()) return;
-      selected = null;
       chessSelected = null;
       deps.top.flip(() => render()); // completion swaps the panel face
       render();                      // immediate: show FLIPPING…
@@ -2121,11 +1959,6 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#gt-pick-checkers')?.addEventListener('click', () => {
       if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialState());
     });
-    // Checkers controls.
-    panel.querySelector<HTMLButtonElement>('#gt-sit-red')?.addEventListener('click', () => claimSeat('red'));
-    panel.querySelector<HTMLButtonElement>('#gt-sit-black')?.addEventListener('click', () => claimSeat('black'));
-    panel.querySelector<HTMLButtonElement>('#gt-bot')?.addEventListener('click', () => startBotGame());
-    panel.querySelector<HTMLButtonElement>('#gt-forfeit')?.addEventListener('click', () => forfeit());
     // Chess controls.
     panel.querySelector<HTMLButtonElement>('#gt-chess-sit-white')?.addEventListener('click', () => claimChessSeat('white'));
     panel.querySelector<HTMLButtonElement>('#gt-chess-sit-black')?.addEventListener('click', () => claimChessSeat('black'));
@@ -2137,16 +1970,12 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     if (table?.kind === 'chess') {
       boardCanvas?.addEventListener('click', onChessBoardClick);
       drawChessBoard(table.state);
-    } else {
-      boardCanvas?.addEventListener('click', onBoardClick);
-      // Checkers state feeds the board; picker (null) and the foreign
-      // air-hockey face draw the empty felt (no #gt-board in that face).
-      drawBoard(table?.kind === 'checkers' ? table.state : null);
     }
   };
 
   return {
-    mount(host: HTMLElement): void {
+    mount(into: HTMLElement): void {
+      host = into;
       panel = document.createElement('div');
       panel.id = 'device-gametable-pane';
       // Gold-on-dark monospace shell (room-terminal idiom), nudged above
@@ -2175,9 +2004,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       // Input capture (plan §D0.3): clicks inside the device UI never reach
       // the canvas handler — clicks that DO reach it release the focus.
       panel.addEventListener('click', (e) => e.stopPropagation());
-      host.appendChild(panel);
-      selected = null;
-      botTimer = 0;
+      into.appendChild(panel);
       // Observer-driven repaint: doc changes (peer moves, claims, resets,
       // rebinds after a rejoin) re-render the whole panel from the doc.
       unsubscribe = subscribeGames(() => render());
@@ -2187,8 +2014,11 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      if (checkersMounted) deps.checkers?.unmount();
+      checkersMounted = false;
       panel?.remove();
       panel = null;
+      host = null;
       boardCanvas = null;
     },
 
@@ -2196,18 +2026,10 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       // Single-player bot pumps: the human claimant's client plays the bot
       // side with a small think-delay. Runs only while this UI is mounted —
       // the trivial bots sleep when the table is not focused (documented v1).
+      // Checkers' pump lives in its 3D layer (#227).
+      if (checkersMounted) deps.checkers?.update(dt);
       const t = readTable(deps.itemId);
-      if (t?.kind === 'checkers') {
-        const s = t.state;
-        if (s.bot && s.status === 'playing' && s.turn === 'black' && s.players.red === myId) {
-          botTimer += dt;
-          if (botTimer >= 0.7) {
-            botTimer = 0;
-            const move = chooseBotMove(s);
-            if (move) writeGame(deps.itemId, applyMove(s, move));
-          }
-        } else botTimer = 0;
-      } else if (t?.kind === 'chess') {
+      if (t?.kind === 'chess') {
         const s = t.state;
         if (s.bot && s.status === 'playing' && s.turn === 'black' && s.players.white === myId) {
           chessBotTimer += dt;
@@ -2218,7 +2040,6 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           }
         } else chessBotTimer = 0;
       } else {
-        botTimer = 0;
         chessBotTimer = 0;
       }
     },
