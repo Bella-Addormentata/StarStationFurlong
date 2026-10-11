@@ -378,6 +378,38 @@ describe('a shared game, played by two and watched by a third', () => {
     expect(p2.every((pad) => pad === PAD_BIT.LEFT)).toBe(true);
   }, 60_000);
 
+  it("a guest whose game didn't load gives the stand back, and tries again later", async () => {
+    const [a, b] = await room(['a', null], ['b', null]);
+    // b's first fetch of the ROM hangs, then fails (a network blip).
+    let blip: (() => void) | null = null;
+    b.mod.setArcadeRomFetcher((url) => blip === null
+      ? new Promise((_, reject) => { blip = () => reject(new Error('offline')); })
+      : Promise.resolve(romBytes.get(url)!));
+    await startGame(a, 0, 2);
+    const guest = link(b, 1, 2);
+    guest.join(); // while its copy is still loading
+    await run(100);
+    expect(a.games.readArcade(ITEM)?.guestPage).toBe(b.mod.arcadePage());
+
+    blip!();
+    await run(100);
+    expect(b.cards).toContain('COULD NOT LOAD THIS GAME');
+    expect(a.games.readArcade(ITEM)?.guestPage).toBeNull(); // the stand is free again…
+    expect(guest.shared()?.joinAs).toBeNull(); // …for someone who can play
+    guest.join();
+    await run(100);
+    expect(a.games.readArcade(ITEM)?.guestPage).toBeNull();
+
+    await run(12_000); // the retry loads it, and catches up from a save state
+    expect(b.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
+    expect(guest.shared()).toMatchObject({ role: 'watcher', phase: 'playing', joinAs: 2 });
+    const from = a.mod.arcadeCopyInfo(ITEM)!.next;
+    await run(1000);
+    const { common, differ } = compare(a, b, from);
+    expect(common).toBeGreaterThan(30);
+    expect(differ).toEqual([]);
+  }, 60_000);
+
   it('a host at the second stand plays player 2; the free stand offers player 1', async () => {
     const [a, b] = await room(['a', null], ['b', null]);
     const host = await startGame(a, 1, 2);
