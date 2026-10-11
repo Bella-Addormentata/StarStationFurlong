@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  batchRows, DriftLedger, packInputBatch, readFrameBatch, readFrameHash, readFrameSnapshot, replayStateHash,
+  batchRows, DriftLedger, LockstepLedger, packInputBatch, readFrameBatch, readFrameHash, readFrameSnapshot, replayStateHash,
   unpackInputBatch, ReplayReassembler, REPLAY_MAX_BATCH_INPUTS, REPLAY_MAX_FRAME, REPLAY_WIRE_VERSION,
 } from './arcadeReplay';
 import type { ReplayBatch } from './arcadeReplay';
@@ -162,5 +162,28 @@ describe('the drift ledger', () => {
     l.sourceHash(3, 'c:1');
     expect(l.followerHash(1, 'a:1')).toBeNull();
     expect(l.followerHash(2, 'b:1')).toBe(true);
+  });
+});
+
+describe('the lockstep ledger', () => {
+  it('compares a frame once every seat has hashed it, in any order', () => {
+    const l = new LockstepLedger(4);
+    expect(l.record(2, 60, 'a:1')).toBeNull();
+    expect(l.record(0, 60, 'a:1')).toBeNull();
+    expect(l.record(3, 120, 'b:1')).toBeNull(); // a seat ahead of the rest
+    expect(l.record(1, 60, 'a:1')).toBeNull();
+    expect(l.record(3, 60, 'a:1')).toBe(true);
+    for (const seat of [0, 1]) l.record(seat, 120, 'b:1');
+    expect(l.record(2, 120, 'x:1')).toBe(false);
+    expect(l.read()).toEqual({ compared: 2, matched: 1, mismatched: 1, firstMismatch: 120, lastCompared: 120 });
+  });
+
+  it('keeps a bounded number of frames waiting', () => {
+    const l = new LockstepLedger(2, 2);
+    l.record(0, 1, 'a:1');
+    l.record(0, 2, 'b:1');
+    l.record(0, 3, 'c:1'); // frame 1 is dropped to make room
+    expect(l.record(1, 1, 'a:1')).toBeNull();
+    expect(l.record(1, 3, 'c:1')).toBe(true);
   });
 });

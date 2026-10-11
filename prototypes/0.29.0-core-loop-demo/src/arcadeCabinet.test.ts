@@ -26,7 +26,7 @@ function fakeCanvas() {
 
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
-const { buildItemGroup, FURNITURE_DEFS } = await import('./furniture');
+const { buildItemGroup, ARCADE_CABINET_KINDS, FURNITURE_DEFS } = await import('./furniture');
 
 const ID = 'arcade-cabinet-1';
 
@@ -109,6 +109,60 @@ describe('the arcade cabinet as built', () => {
     const afterPlay = fills;
     handle.draw(view('empty', false, 'FURLONG ARCADE'));
     expect(fills).toBeGreaterThan(afterPlay);
+  });
+});
+
+describe('the double-wide cabinet as built', () => {
+  const WIDE = 'arcade-cabinet-wide-1';
+  const buildWide = (): THREE.Group => {
+    const group = buildItemGroup({ id: WIDE, kind: 'arcade-cabinet-wide', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    group.updateMatrixWorld(true);
+    return group;
+  };
+
+  it('keeps every mesh inside its 2×1 footprint', () => {
+    const { w, d: depth } = FURNITURE_DEFS['arcade-cabinet-wide'].footprint!;
+    expect([w, depth]).toEqual([2, 1]);
+    let meshes = 0;
+    buildWide().traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      meshes++;
+      const box = new THREE.Box3().setFromObject(obj);
+      expect(box.min.x).toBeGreaterThanOrEqual(-w / 2 - 1e-9);
+      expect(box.max.x).toBeLessThanOrEqual(w / 2 + 1e-9);
+      expect(box.min.z).toBeGreaterThanOrEqual(-depth / 2 - 1e-9);
+      expect(box.max.z).toBeLessThanOrEqual(depth / 2 + 1e-9);
+      expect(box.min.y).toBeGreaterThanOrEqual(-1e-9);
+    });
+    expect(meshes).toBeGreaterThan(30); // four stations of stick, ball, two buttons and a coin slot
+  });
+
+  it('shows one wide card on two screens side by side, and files one handle', () => {
+    const group = buildWide();
+    const planes: THREE.Mesh[] = [];
+    group.traverse((obj) => {
+      if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) planes.push(obj);
+    });
+    expect(planes).toHaveLength(2);
+    const [left, right] = planes.map((p) => new THREE.Box3().setFromObject(p).getCenter(new THREE.Vector3())).sort((a, b) => a.x - b.x);
+    expect(left!.x).toBeLessThan(0);
+    expect(right!.x).toBeGreaterThan(0);
+    // The halves of one canvas: the left plane shows the left half.
+    const maps = planes.map((p) => (p.material as THREE.MeshBasicMaterial).map as THREE.CanvasTexture);
+    expect(maps[0]!.image).toBe(maps[1]!.image);
+    expect(maps.map((t) => t.repeat.x)).toEqual([0.5, 0.5]);
+    expect(maps.map((t) => t.offset.x).sort()).toEqual([0, 0.5]);
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, WIDE, obj); });
+    expect(s.arcadeScreens.size).toBe(1);
+    expect(s.arcadeScreens.has(WIDE)).toBe(true);
+    const def = FURNITURE_DEFS['arcade-cabinet-wide'];
+    expect(def.device?.kind).toBe('arcade');
+    expect(def.device?.front.z).toBeGreaterThan(d(def));
+  });
+
+  it('counts both kinds as arcade cabinets', () => {
+    expect([...ARCADE_CABINET_KINDS].sort()).toEqual(['arcade-cabinet', 'arcade-cabinet-wide']);
   });
 });
 

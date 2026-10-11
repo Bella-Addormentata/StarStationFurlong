@@ -8,8 +8,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameOrigins,
   emulatorIsolated, emulatorWallPolicy, frameMessage, localRomExposureAllowed, localRomFor, MessageBudget, probeEmulatorData,
-  readReplayStatus, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
-  FRAME_MESSAGE_BUDGET, FRAME_MESSAGE_WINDOW_MS, FRAME_STRING_MAX,
+  peerOwnSeat, readReplayStatus, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
+  FRAME_MESSAGE_BUDGET, FRAME_MESSAGE_BUDGET_LOCKSTEP, FRAME_MESSAGE_WINDOW_MS, FRAME_STRING_MAX,
 } from './arcadeEmulator';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -192,6 +192,15 @@ describe('a spectator frame\'s replay status is read field by field', () => {
     expect(readReplayStatus({ phase: 'dancing' })).toBeNull();
     expect(readReplayStatus(null)).toBeNull();
   });
+
+  it('a lockstep peer\'s phases and its counts of waits', () => {
+    expect(readReplayStatus({ phase: 'free', frame: 40 })).toEqual({ phase: 'free', frame: 40 });
+    expect(readReplayStatus({ phase: 'lockstep', frame: 600, through: 607, stalls: 3, waits: 11, iters: 612 }))
+      .toEqual({ phase: 'lockstep', frame: 600, through: 607, stalls: 3, waits: 11, iters: 612 });
+    expect(readReplayStatus({ phase: 'lockstep', stalls: -1 })).toBeNull();
+    expect(readReplayStatus({ phase: 'lockstep', waits: 0.5 })).toBeNull();
+    expect(readReplayStatus({ phase: 'lockstep', iters: '612' })).toBeNull();
+  });
 });
 
 describe('a replay frame says only what its role posts, in its shape', () => {
@@ -225,5 +234,27 @@ describe('a replay frame says only what its role posts, in its shape', () => {
     expect(frameMessage({ ...batch, inputs: [[1_001, 0, 8, 1]] }, 'source')).toBeNull(); // an input after `through`
     expect(frameMessage({ ...snapshot, state: [1, 2, 3] }, 'source')).toBeNull();
     expect(frameMessage({ ...status, frame: 'x' }, 'follower')).toBeNull();
+  });
+
+  it('a lockstep peer\'s frame: every replay kind, its own seat\'s buttons only', () => {
+    const seat2 = { ...batch, inputs: [[994, 2, 8, 1], [996, 2, 8, 0]] };
+    for (const m of [seat2, hash, snapshot, status]) expect(frameMessage(m, 'peer')).not.toBeNull();
+    const read = frameMessage(seat2, 'peer')!;
+    expect(peerOwnSeat(read, { role: 'peer', seat: 2, seats: 4 })).toBe(true);
+    expect(peerOwnSeat(read, { role: 'peer', seat: 1, seats: 4 })).toBe(false); // speaking for another seat
+    const mixed = frameMessage({ ...batch, inputs: [[994, 2, 8, 1], [995, 0, 8, 1]] }, 'peer')!;
+    expect(peerOwnSeat(mixed, { role: 'peer', seat: 2, seats: 4 })).toBe(false);
+    // Only a peer is held to one seat: player one's frame posts player 0's
+    // buttons, and a frame's other kinds name no seat.
+    expect(peerOwnSeat(frameMessage(batch, 'source')!, { role: 'source' })).toBe(true);
+    expect(peerOwnSeat(frameMessage(hash, 'peer')!, { role: 'peer', seat: 3, seats: 4 })).toBe(true);
+  });
+
+  it('a lockstep peer gets the larger budget: a batch can go out every frame its player presses', () => {
+    expect(FRAME_MESSAGE_BUDGET_LOCKSTEP).toBeGreaterThanOrEqual(60);
+    const b = new MessageBudget(FRAME_MESSAGE_BUDGET_LOCKSTEP);
+    for (let i = 0; i < FRAME_MESSAGE_BUDGET_LOCKSTEP; i++) expect(b.take(i * 16)).toBe(true);
+    expect(b.take(FRAME_MESSAGE_BUDGET_LOCKSTEP * 16)).toBe(false); // the sixty-first inside the second
+    expect(b.take(FRAME_MESSAGE_WINDOW_MS + 16)).toBe(true);
   });
 });

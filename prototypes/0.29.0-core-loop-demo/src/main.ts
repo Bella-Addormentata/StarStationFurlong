@@ -250,7 +250,7 @@ import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArm
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
 import { leaveArcadeRoom } from "./arcadeSession";
 import { closeArcadeStage } from "./arcadeStage";
-import { FURNITURE } from "./furniture";
+import { ARCADE_CABINET_KINDS, FURNITURE } from "./furniture";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -6055,7 +6055,7 @@ function tvTheatreDeps(itemId: string) {
 }
 // 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
 function roomArcadeIds(): string[] {
-  return FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+  return FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
 }
 
 /** WATCH from the phone or the HUD chip: only for a set still in THIS room,

@@ -326,3 +326,46 @@ export class DriftLedger {
     return { ...this.stats };
   }
 }
+
+/**
+ * Lockstep peers' state hashes, compared across every seat by frame: a
+ * frame counts once all `seats` have hashed it, matched only when all
+ * agree. Peers run within a few frames of each other but in no fixed
+ * order, so every seat's hash waits (a bounded number of frames) for the
+ * rest.
+ */
+export class LockstepLedger {
+  private readonly frames = new Map<number, Map<number, string>>();
+  private stats: DriftStats = { compared: 0, matched: 0, mismatched: 0, firstMismatch: null, lastCompared: null };
+
+  constructor(private readonly seats: number, private readonly keep = 256) {}
+
+  /** Seat `seat` hashed `frame`: true or false once every seat has (did
+   *  they all agree), null while some have not. */
+  record(seat: number, frame: number, hash: string): boolean | null {
+    let byseat = this.frames.get(frame);
+    if (!byseat) {
+      if (this.frames.size >= this.keep) this.frames.delete(Math.min(...this.frames.keys()));
+      byseat = new Map();
+      this.frames.set(frame, byseat);
+    }
+    byseat.set(seat, hash);
+    if (byseat.size < this.seats) return null;
+    this.frames.delete(frame);
+    const hashes = [...byseat.values()];
+    const ok = hashes.every((h) => h === hashes[0]);
+    const s = this.stats;
+    this.stats = {
+      compared: s.compared + 1,
+      matched: s.matched + (ok ? 1 : 0),
+      mismatched: s.mismatched + (ok ? 0 : 1),
+      firstMismatch: s.firstMismatch ?? (ok ? null : frame),
+      lastCompared: Math.max(frame, s.lastCompared ?? frame),
+    };
+    return ok;
+  }
+
+  read(): DriftStats {
+    return { ...this.stats };
+  }
+}

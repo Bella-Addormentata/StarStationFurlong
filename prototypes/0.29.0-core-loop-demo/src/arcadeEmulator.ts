@@ -158,18 +158,29 @@ export interface EmulatorConfig {
 }
 
 export interface EmulatorReplayConfig {
-  role: 'source' | 'follower';
+  /** 'source': player one's frame, watched; 'follower': a spectator's;
+   *  'peer': one seat of a lockstep game (up to four players, every seat
+   *  running the game and holding each frame for every seat's buttons). */
+  role: 'source' | 'follower' | 'peer';
   /** Hash the state every this many frames (default 60). */
   hashEvery?: number;
   /** A follower out of a stall waits for this many frames of input (12). */
   lead?: number;
-  /** The source posts a batch every this many frames (6). */
+  /** The source posts a batch every this many frames (6); a peer posts one
+   *  at least this often, and at once with any buttons in it. */
   batchFrames?: number;
+  /** A peer's seat, 0–3 (seat 0 starts the game), and how many seats. */
+  seat?: number;
+  seats?: number;
+  /** A peer's input delay: its player's buttons land this many frames
+   *  after they are pressed (default 8), the time every other seat has to
+   *  hear of them before it must run that frame. */
+  delay?: number;
 }
 
 /** A follower's report of where it stands. */
 export interface ReplayStatus {
-  phase: 'waiting' | 'loading' | 'stalled' | 'running' | 'unsupported';
+  phase: 'waiting' | 'loading' | 'stalled' | 'running' | 'free' | 'lockstep' | 'unsupported';
   /** The source frame the follower's state is at. */
   frame?: number;
   /** The latest `through` it holds. */
@@ -181,6 +192,12 @@ export interface ReplayStatus {
   hash?: string;
   matches?: boolean;
   tries?: number;
+  /** A lockstep peer's waits so far: the times it held a frame for another
+   *  seat's buttons, and the iterations it held them (each a frame late). */
+  stalls?: number;
+  waits?: number;
+  /** Main-loop iterations since lockstep began, held or not. */
+  iters?: number;
 }
 
 /** Whether engine files at `pathToData` come from another origin than the
@@ -249,6 +266,9 @@ export type EmulatorEvent =
  *  handler runs: one oversized message costs the page its clone once, and
  *  then the frame is gone (plan §9). */
 export const FRAME_MESSAGE_BUDGET = 20;
+/** A lockstep peer's budget: a batch as often as every frame while its
+ *  player presses, beside its hashes and status. */
+export const FRAME_MESSAGE_BUDGET_LOCKSTEP = 60;
 export const FRAME_MESSAGE_WINDOW_MS = 1_000;
 export const FRAME_STRING_MAX = 256;
 
@@ -272,17 +292,19 @@ const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
   'arcade-replay-inputs': ['type', 'from', 'through', 'inputs'],
   'arcade-replay-hash': ['type', 'frame', 'hash'],
   'arcade-replay-snapshot': ['type', 'frame', 'state', 'held', 'hash'],
-  'arcade-replay-status': ['type', 'phase', 'frame', 'through', 'loaded', 'hash', 'matches', 'tries'],
+  'arcade-replay-status': ['type', 'phase', 'frame', 'through', 'loaded', 'hash', 'matches', 'tries', 'stalls', 'waits', 'iters'],
 };
 
 /** The replay kinds a frame may post, by the role its config gave it
  *  (arcadeReplay.ts): player one's frame its batches, hashes and save
- *  states; a spectator's its hashes and where it stands; either that it
- *  cannot replay at all. A frame given no role posts none: from it, or
+ *  states; a spectator's its hashes and where it stands; a lockstep peer's
+ *  all of them (seat 0's save state starts the game for the others); any
+ *  that it cannot replay at all. A frame given no role posts none: from it, or
  *  from the other role, a replay kind is a message no game sends. */
 const REPLAY_KINDS: Record<EmulatorReplayConfig['role'], ReadonlySet<string>> = {
   source: new Set(['arcade-replay-inputs', 'arcade-replay-hash', 'arcade-replay-snapshot', 'arcade-replay-status']),
   follower: new Set(['arcade-replay-hash', 'arcade-replay-status']),
+  peer: new Set(['arcade-replay-inputs', 'arcade-replay-hash', 'arcade-replay-snapshot', 'arcade-replay-status']),
 };
 
 /** The frame's message as one of the shapes above, or null — an unknown
@@ -386,7 +408,15 @@ export function emulatorWallPolicy(frameUrl: string, href = typeof location === 
   return `default-src 'none'; frame-src ${source}`;
 }
 
-const REPLAY_PHASES: ReadonlySet<string> = new Set(['waiting', 'loading', 'stalled', 'running', 'unsupported']);
+/** A lockstep peer speaks for its own seat only: a batch with another
+ *  seat's buttons in it is out of turn (mountEmulatorFrame tears the frame
+ *  down as malformed). Any other role, or kind, names no seat to check. */
+export function peerOwnSeat(m: FrameMessage, replay?: EmulatorReplayConfig): boolean {
+  if (m.type !== 'arcade-replay-inputs' || replay?.role !== 'peer') return true;
+  return m.batch.inputs.every((i) => i.player === replay.seat);
+}
+
+const REPLAY_PHASES: ReadonlySet<string> = new Set(['waiting', 'loading', 'stalled', 'running', 'free', 'lockstep', 'unsupported']);
 
 /** A follower's status as the frame posts it: every field it carries in
  *  its shape, or none of it (a field out of shape is a malformed message,
@@ -413,6 +443,11 @@ export function readReplayStatus(data: unknown): ReplayStatus | null {
   if (d.tries !== undefined) {
     if (typeof d.tries !== 'number' || !Number.isInteger(d.tries) || d.tries < 0 || d.tries > 1000) return null;
     out.tries = d.tries;
+  }
+  for (const k of ['stalls', 'waits', 'iters'] as const) {
+    if (d[k] === undefined) continue;
+    if (!int(d[k]) || (d[k] as number) < 0) return null;
+    out[k] = d[k] as number;
   }
   return out;
 }
@@ -451,7 +486,7 @@ export function mountEmulatorFrame(
   // The frame's messages are input from an attacker (the header on
   // FRAME_MESSAGE_BUDGET): counted before they are read, read into one
   // shape or the frame torn down, each state reported once.
-  const budget = new MessageBudget();
+  const budget = new MessageBudget(config.replay?.role === 'peer' ? FRAME_MESSAGE_BUDGET_LOCKSTEP : FRAME_MESSAGE_BUDGET);
   let silenced = false;
   let readySeen = false;
   let startedSeen = false;
@@ -467,7 +502,7 @@ export function mountEmulatorFrame(
     // A save state is the one large message a frame may post, so only in
     // answer to the page's request (send, `arcade-replay-want-snapshot`):
     // one it was not asked for is out of turn.
-    if (!m || (m.type === 'arcade-replay-snapshot' && !snapshotWanted)) {
+    if (!m || (m.type === 'arcade-replay-snapshot' && !snapshotWanted) || !peerOwnSeat(m, config.replay)) {
       silenced = true;
       onEvent({ type: 'error', why: 'malformed' });
       return;
@@ -494,6 +529,9 @@ export function mountEmulatorFrame(
           replayHashEvery: config.replay?.hashEvery,
           replayLead: config.replay?.lead,
           replayBatchFrames: config.replay?.batchFrames,
+          replaySeat: config.replay?.seat,
+          replaySeats: config.replay?.seats,
+          replayDelay: config.replay?.delay,
         }, target);
         break;
       case 'arcade-ready': if (!readySeen) { readySeen = true; onEvent({ type: 'ready' }); } break;
@@ -599,6 +637,7 @@ export function mountEmulatorFrame(
     send(message, transfer = []) {
       if (!alive || !configured) return;
       if (message.type === 'arcade-replay-want-snapshot' && config.replay?.role === 'source') snapshotWanted = true;
+      if (message.type === 'arcade-replay-begin' && config.replay?.role === 'peer' && config.replay.seat === 0) snapshotWanted = true;
       frame?.contentWindow?.postMessage(message, target, transfer);
     },
     destroy() {

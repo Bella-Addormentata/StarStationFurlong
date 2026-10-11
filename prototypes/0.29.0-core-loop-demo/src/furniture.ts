@@ -219,7 +219,10 @@ export type FurnitureKind =
   | "smart-tv"
   | "tv-stand"
   // 🕹 The arcade cabinet (#193): P1 at the controls, the attract card on a canvas.
-  | "arcade-cabinet";
+  | "arcade-cabinet"
+  // 🕹🕹 The double-wide cabinet (#193): two screens as one wide picture,
+  // four control panels — the deluxe four-player cabinet.
+  | "arcade-cabinet-wide";
 
 export interface FurnitureItem {
   id: string;
@@ -1771,6 +1774,15 @@ const ARCADE_SCREEN_Y = 1.3;
 /** Screen texture: 4:3, the cabinet's own ratio. */
 const ARCADE_TEX_W = 320;
 const ARCADE_TEX_H = 240;
+/** The double-wide cabinet: a 1.6 m body in a 2×1 footprint, two 4:3
+ *  screens side by side drawn from one 8:3 canvas, four players' panels. */
+const ARCADE_WIDE_W = 1.6;
+const ARCADE_WIDE_D = 0.8;
+const ARCADE_WIDE_SEATS = 4;
+
+/** The furniture kinds that are arcade cabinets (main.ts and world.ts tick
+ *  them, arcadeDoc keys them by item id alike). */
+export const ARCADE_CABINET_KINDS: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>(["arcade-cabinet", "arcade-cabinet-wide"]);
 
 const buildWallComputer = (ctx: BuildCtx) => {
   const { m, place } = ctx;
@@ -4860,6 +4872,21 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       front: { x: 0, z: 1.0 },
       faceAngle: Math.PI,
       eye: { x: 0, y: 1.45, z: 0.95 },
+      anchor: { x: 0, y: ARCADE_SCREEN_Y, z: 0.2 },
+    },
+  },
+  // 🕹🕹 The double-wide cabinet (#193): 2×1, two screens and four panels,
+  // the players a pace back along its front.
+  "arcade-cabinet-wide": {
+    kind: "arcade-cabinet-wide",
+    build: buildWideArcadeCabinet,
+    footprint: { w: 2, d: 1 },
+    functions: ["arcade"],
+    device: {
+      kind: "arcade",
+      front: { x: 0, z: 1.05 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.5, z: 1.25 },
       anchor: { x: 0, y: ARCADE_SCREEN_Y, z: 0.2 },
     },
   },
@@ -10585,61 +10612,12 @@ function buildArcadeCabinet(ctx: BuildCtx) {
   const glow = new THREE.PointLight(0x7fd8ff, 0, 3);
   addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
 
-  const text = (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
-    c2d.font = font;
-    c2d.fillStyle = color;
-    c2d.textAlign = align;
-    c2d.textBaseline = "middle";
-    c2d.fillText(s, x, y);
-  };
-  const badge = (lane: string) => {
-    c2d.font = "bold 10px monospace";
-    const bw = c2d.measureText(lane).width + 12;
-    const color = lane === "SOVEREIGN" ? "#2fe6a0" : "#ff8a50";
-    c2d.strokeStyle = color;
-    c2d.strokeRect(ARCADE_TEX_W - bw - 12.5, 12.5, bw, 18);
-    text(lane, ARCADE_TEX_W - 12 - bw / 2, 22, "bold 10px monospace", color, "center");
-  };
   const setGlow = (i: number) => {
     glow.userData.targetIntensity = i;
     glow.intensity = i;
   };
   const draw = (view: ArcadeScreenView): void => {
-    c2d.imageSmoothingEnabled = false;
-    const g = c2d.createLinearGradient(0, 0, 0, ARCADE_TEX_H);
-    g.addColorStop(0, "#071021");
-    g.addColorStop(1, "#030509");
-    c2d.fillStyle = g;
-    c2d.fillRect(0, 0, ARCADE_TEX_W, ARCADE_TEX_H);
-    c2d.strokeStyle = "rgba(0,229,255,0.35)";
-    c2d.strokeRect(6.5, 6.5, ARCADE_TEX_W - 13, ARCADE_TEX_H - 13);
-    text("FURLONG ARCADE", ARCADE_TEX_W / 2, 30, "bold 16px monospace", "#f0c060", "center");
-    if (view.lane) badge(view.lane);
-    const title = view.title.length > 22 ? `${view.title.slice(0, 21)}…` : view.title;
-    if (view.mode === "empty") {
-      text(title, ARCADE_TEX_W / 2, 110, "bold 20px monospace", "#8fa3b8", "center");
-      text(view.line, ARCADE_TEX_W / 2, 150, "11px monospace", "#4a5560", "center");
-      setGlow(0.25);
-    } else if (view.mode === "attract") {
-      text(title, ARCADE_TEX_W / 2, 100, "bold 20px monospace", "#00e5ff", "center");
-      // The classic: INSERT COIN blinking over the tally.
-      if (view.blink) text(view.line, ARCADE_TEX_W / 2, 150, "bold 18px monospace", "#f0c060", "center");
-      text(`PLAYS ${view.plays}`, 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#8fa3b8");
-      text("1 PLAYER", ARCADE_TEX_W - 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#8fa3b8", "right");
-      setGlow(view.blink ? 0.95 : 0.8);
-    } else {
-      text(title, ARCADE_TEX_W / 2, 100, "bold 20px monospace", "#00e5ff", "center");
-      // The picture is on P1's stage (plan §9): the prop says who is playing.
-      c2d.fillStyle = "rgba(47,230,160,0.12)";
-      c2d.fillRect(40, 124, ARCADE_TEX_W - 80, 44);
-      text(view.line, ARCADE_TEX_W / 2, 146, "bold 16px monospace", "#2fe6a0", "center");
-      text("● IN PLAY", 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#ff5252");
-      text(`PLAYS ${view.plays}`, ARCADE_TEX_W - 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#8fa3b8", "right");
-      setGlow(1.0);
-    }
-    // Scanlines: the #194 CRT pass in its cheapest form.
-    c2d.fillStyle = "rgba(0,0,0,0.18)";
-    for (let y = 0; y < ARCADE_TEX_H; y += 3) c2d.fillRect(0, y, ARCADE_TEX_W, 1);
+    setGlow(paintArcadeScreen(c2d, ARCADE_TEX_W, ARCADE_TEX_H, view, "1 PLAYER"));
     screenTex.needsUpdate = true;
   };
 
@@ -10654,6 +10632,166 @@ function buildArcadeCabinet(ctx: BuildCtx) {
   };
   draw({ mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER LOADS A GAME", lane: "", blink: false, plays: 0 });
   screen.userData.arcadeScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
+}
+
+/**
+ * The cabinet's screen card, on a canvas `w` × `h`: the attract card
+ * (FURLONG ARCADE, the game, a blinking INSERT COIN, the tally and how many
+ * play), "P1 · <name>" while someone plays, or the empty card — with
+ * scanlines over it (the #194 pass in its cheapest form). Returns the
+ * glow's intensity for the view. Shared by the cabinet and the double-wide
+ * one, whose 8:3 canvas spans its two screens as one picture.
+ */
+function paintArcadeScreen(c2d: CanvasRenderingContext2D, w: number, h: number, view: ArcadeScreenView, players: string): number {
+  const text = (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
+    c2d.font = font;
+    c2d.fillStyle = color;
+    c2d.textAlign = align;
+    c2d.textBaseline = "middle";
+    c2d.fillText(s, x, y);
+  };
+  const badge = (lane: string) => {
+    c2d.font = "bold 10px monospace";
+    const bw = c2d.measureText(lane).width + 12;
+    const color = lane === "SOVEREIGN" ? "#2fe6a0" : "#ff8a50";
+    c2d.strokeStyle = color;
+    c2d.strokeRect(w - bw - 12.5, 12.5, bw, 18);
+    text(lane, w - 12 - bw / 2, 22, "bold 10px monospace", color, "center");
+  };
+  c2d.imageSmoothingEnabled = false;
+  const g = c2d.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, "#071021");
+  g.addColorStop(1, "#030509");
+  c2d.fillStyle = g;
+  c2d.fillRect(0, 0, w, h);
+  c2d.strokeStyle = "rgba(0,229,255,0.35)";
+  c2d.strokeRect(6.5, 6.5, w - 13, h - 13);
+  text("FURLONG ARCADE", w / 2, 30, "bold 16px monospace", "#f0c060", "center");
+  if (view.lane) badge(view.lane);
+  const title = view.title.length > 22 ? `${view.title.slice(0, 21)}…` : view.title;
+  let glow: number;
+  if (view.mode === "empty") {
+    text(title, w / 2, 110, "bold 20px monospace", "#8fa3b8", "center");
+    text(view.line, w / 2, 150, "11px monospace", "#4a5560", "center");
+    glow = 0.25;
+  } else if (view.mode === "attract") {
+    text(title, w / 2, 100, "bold 20px monospace", "#00e5ff", "center");
+    // The classic: INSERT COIN blinking over the tally.
+    if (view.blink) text(view.line, w / 2, 150, "bold 18px monospace", "#f0c060", "center");
+    text(`PLAYS ${view.plays}`, 16, h - 20, "bold 11px monospace", "#8fa3b8");
+    text(players, w - 16, h - 20, "bold 11px monospace", "#8fa3b8", "right");
+    glow = view.blink ? 0.95 : 0.8;
+  } else {
+    text(title, w / 2, 100, "bold 20px monospace", "#00e5ff", "center");
+    // The picture is on P1's stage (plan §9): the prop says who is playing.
+    c2d.fillStyle = "rgba(47,230,160,0.12)";
+    c2d.fillRect(40, 124, w - 80, 44);
+    text(view.line, w / 2, 146, "bold 16px monospace", "#2fe6a0", "center");
+    text("● IN PLAY", 16, h - 20, "bold 11px monospace", "#ff5252");
+    text(`PLAYS ${view.plays}`, w - 16, h - 20, "bold 11px monospace", "#8fa3b8", "right");
+    glow = 1.0;
+  }
+  // Scanlines: the #194 CRT pass in its cheapest form.
+  c2d.fillStyle = "rgba(0,0,0,0.18)";
+  for (let y = 0; y < h; y += 3) c2d.fillRect(0, y, w, 1);
+  return glow;
+}
+
+/**
+ * 🕹🕹 The double-wide cabinet (#193): the deluxe four-player cabinet of the
+ * early nineties — two monitors side by side making one wide picture, and a
+ * control deck long enough for four players shoulder to shoulder, each with
+ * a stick, two buttons and a coin slot in their player colour. A 1.6 m body
+ * in a 2×1 footprint, screens to local +z. The two screens are one 8:3
+ * canvas (the attract card spans the pair, as a dual-screen game's picture
+ * does), each plane showing its half. Stows one ArcadeScreenHandle
+ * (userData.arcadeScreen, on the left plane) for registerFurnitureHandles.
+ */
+function buildWideArcadeCabinet(ctx: BuildCtx) {
+  const { m, place, addLight } = ctx;
+  const BODY = 0x141a2e;
+  const TRIM = 0xd4a84b;
+  const PANEL = 0x1a1f2a;
+  const SIDE = 0x00e5ff;
+  /** P1 to P4, left to right: the colours four-player cabinets used. */
+  const PLAYER = [0xff3b3b, 0x3b8bff, 0x2fe6a0, 0xffd23b];
+  const w = ARCADE_WIDE_W;
+  const d = ARCADE_WIDE_D;
+
+  // Plinth, lower body, upper body, cap.
+  place(new THREE.BoxGeometry(w, 0.12, d), m(0x0a0d16, 0.7, 0.2), 0, 0.06, 0);
+  place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
+  place(new THREE.BoxGeometry(w, 0.7, d - 0.25), m(BODY, 0.6, 0.15), 0, 1.25, -0.11);
+  place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
+  for (const sx of [-1, 1]) {
+    place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 - 0.006), 1.0, 0.05);
+  }
+  // The control deck: four stations, a stick and two buttons each, and a
+  // coin slot each below, lit in the player's colour.
+  const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
+  deck.rotation.x = -0.22;
+  for (let p = 0; p < ARCADE_WIDE_SEATS; p++) {
+    const cx = (p - (ARCADE_WIDE_SEATS - 1) / 2) * (w / ARCADE_WIDE_SEATS);
+    const color = PLAYER[p]!;
+    place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), cx - 0.08, 1.04, 0.3);
+    place(new THREE.SphereGeometry(0.028, 10, 8), m(color, 0.4, 0.1), cx - 0.08, 1.09, 0.3);
+    for (const bx of [0.04, 0.11]) {
+      place(new THREE.CylinderGeometry(0.02, 0.02, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), cx + bx, 1.0, 0.31);
+    }
+    place(new THREE.BoxGeometry(0.08, 0.1, 0.02), m(0x3d4a5e, 0.5, 0.5), cx, 0.5, d / 2 - 0.005);
+    place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 - 0.006);
+  }
+  // Marquee across the top.
+  place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
+  place(new THREE.PlaneGeometry(w - 0.08, 0.1), m(TRIM, 0.5, 0.1, TRIM, 0.6), 0, 1.74, 0.111);
+
+  // Two screens, one canvas: each plane shows its half of the 8:3 card.
+  const cv = document.createElement("canvas");
+  cv.width = ARCADE_TEX_W * 2;
+  cv.height = ARCADE_TEX_H;
+  const c2d = cv.getContext("2d")!;
+  const halves: THREE.CanvasTexture[] = [];
+  let handleMesh: THREE.Object3D | null = null;
+  for (const half of [0, 1]) {
+    const x = (half === 0 ? -1 : 1) * 0.34;
+    const bezel = place(new THREE.BoxGeometry(0.66, 0.5, 0.03), m(PANEL, 0.5, 0.3), x, ARCADE_SCREEN_Y, 0.15);
+    bezel.rotation.x = -0.14;
+    const tex = new THREE.CanvasTexture(cv);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.repeat.set(0.5, 1);
+    tex.offset.set(half * 0.5, 0);
+    halves.push(tex);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
+    const plane = place(new THREE.PlaneGeometry(0.6, 0.45), mat, x, ARCADE_SCREEN_Y + 0.002, 0.168);
+    plane.rotation.x = -0.14;
+    if (half === 0) handleMesh = plane;
+  }
+  // The pair's glow on the deck and the floor: driven with the view.
+  const glow = new THREE.PointLight(0x7fd8ff, 0, 4);
+  addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
+  const setGlow = (i: number) => {
+    glow.userData.targetIntensity = i;
+    glow.intensity = i;
+  };
+  const draw = (view: ArcadeScreenView): void => {
+    setGlow(paintArcadeScreen(c2d, cv.width, cv.height, view, `${ARCADE_WIDE_SEATS} PLAYERS`));
+    for (const t of halves) t.needsUpdate = true;
+  };
+
+  let last = "";
+  const handle: ArcadeScreenHandle = {
+    draw: (view) => {
+      const key = JSON.stringify(view);
+      if (key === last) return;
+      last = key;
+      draw(view);
+    },
+  };
+  draw({ mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER LOADS A GAME", lane: "", blink: false, plays: 0 });
+  handleMesh!.userData.arcadeScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 }
 
 /**

@@ -67,6 +67,7 @@ import { pilotLine, pilotPost, pilotSpeechAfter, readPilotView, type PilotSpeech
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
+  ARCADE_CABINET_KINDS,
   FURNITURE,
   FURNITURE_DEFS,
   DEFAULT_FOOTPRINT_OVERRIDES,
@@ -4097,7 +4098,7 @@ export class World {
         // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
         // P1 page renews its seat — with an empty list too, and under the
         // same flag: a seat is not renewed into a room being left either.
-        const arcadeIds = FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+        const arcadeIds = FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
         for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
         tickArcadeRoom(arcadeIds);
       }

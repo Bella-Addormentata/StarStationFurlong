@@ -236,6 +236,186 @@
             }
           };
           replay = { role: role, want: function () { wantSnapshot = true; }, press: function (p, i, v) { gm.simulateInput(p, i, v); } };
+        } else if (role === 'peer') {
+          // ── 🕹🕹🕹🕹 Lockstep: every seated player runs the game ────────────
+          // A peer's frame (role 'peer') is one seat of up to four. Its own
+          // player's buttons (player one's controls, whoever plays) are
+          // played AS its seat, never at once: each is stamped `delay`
+          // frames ahead — the frame counter now plus delay — and posted in
+          // batches like a source's. A frame runs only once every OTHER
+          // seat's batches cover it, so every peer applies the same buttons
+          // at the same frames, in seat order, and hashes alike. Seat 0
+          // starts the game alone ('free'), and on the page's word
+          // (`arcade-replay-begin`) saves its state and enters lockstep at
+          // that frame; the other seats load that save state and join there.
+          var seat = c.replaySeat | 0;
+          var seats = c.replaySeats | 0;
+          var delay = c.replayDelay >= 1 ? c.replayDelay | 0 : 8;
+          if (!(seats >= 1 && seats <= 4 && seat >= 0 && seat < seats)) {
+            post('arcade-replay-status', { phase: 'unsupported' });
+            return;
+          }
+          var queue = {};
+          var thru = [];
+          for (var n = 0; n < seats; n++) thru.push(-1);
+          var phase = seat === 0 ? 'free' : 'waiting';
+          var offset = 0;
+          var start = 0;
+          var snap = null;
+          var loadTries = 0;
+          var LOAD_RETRY = 8;
+          var LOAD_TRIES = 240;
+          var applying = false;
+          var lastStatus = 0;
+          var pending = [];
+          var nextFrom = 0;
+          var lastBatch = 0;
+          var wantBegin = false;
+          var held = {};
+          var down = {};
+          // How the lockstep went: times it had to wait, and the iterations
+          // it waited (a frame skipped is a stutter on screen).
+          var stalls = 0;
+          var waits = 0;
+          var iters = 0;
+          function feed(p, i, v) {
+            if (v !== 0) down[p + ':' + i] = [p, i];
+            else delete down[p + ':' + i];
+            applying = true;
+            try { apply(p, i, v); } finally { applying = false; }
+          }
+          function at() { return gm.getFrameNum() + offset; }
+          function enqueue(k, row) {
+            var f = row[0];
+            if (f < start) return;
+            var bySeat = queue[f] || (queue[f] = []);
+            (bySeat[k] || (bySeat[k] = [])).push([row[1], row[2], row[3]]);
+          }
+          function status() {
+            var others = Infinity;
+            for (var k = 0; k < seats; k++) if (k !== seat && thru[k] < others) others = thru[k];
+            post('arcade-replay-status', { phase: phase, frame: at(), through: others === Infinity ? -1 : others, stalls: stalls, waits: waits, iters: iters });
+          }
+          // Everything stamped at or before now + delay - 1 is final: a
+          // button pressed from here on lands at now + delay or later. A
+          // batch goes out with any buttons in it, every batchFrames frames
+          // without, and whenever this peer stalls — the others may be
+          // waiting on exactly that.
+          function flush() {
+            var through = at() + delay - 1;
+            if (through < nextFrom) return;
+            var out = [];
+            var keep = [];
+            for (var r = 0; r < pending.length; r++) (pending[r][0] <= through ? out : keep).push(pending[r]);
+            post('arcade-replay-inputs', { from: nextFrom, through: through, inputs: out });
+            pending = keep;
+            nextFrom = through + 1;
+            lastBatch = at();
+          }
+          // The local player's buttons: player one's controls, played as
+          // this seat. Before lockstep, seat 0 plays at once (the game is
+          // its alone); a joining seat's buttons go nowhere until it is in.
+          gm.functions.simulateInput = function (p, i, v) {
+            if (applying) return apply(p, i, v);
+            if (p !== 0) return;
+            if (phase === 'free') {
+              held[seat + ':' + i] = [seat, i, v];
+              return feed(seat, i, v);
+            }
+            if (phase !== 'lockstep' && phase !== 'stalled') return;
+            var row = [at() + delay, seat, i, v];
+            pending.push(row);
+            enqueue(seat, row);
+          };
+          hooks.pre = function () {
+            if (phase === 'free' || phase === 'loading') return undefined;
+            if (phase === 'waiting') return false;
+            iters += 1;
+            var s = at();
+            // Frame s + 1 runs next: every other seat's buttons through s
+            // must be in hand. This seat's own are, by construction.
+            for (var k = 0; k < seats; k++) {
+              if (k === seat || thru[k] >= s) continue;
+              if (phase !== 'stalled') { phase = 'stalled'; stalls += 1; }
+              waits += 1;
+              flush();
+              return false;
+            }
+            phase = 'lockstep';
+            var bySeat = queue[s];
+            if (bySeat) {
+              for (var k2 = 0; k2 < seats; k2++) {
+                var rows = bySeat[k2];
+                if (rows) for (var r = 0; r < rows.length; r++) feed(rows[r][0], rows[r][1], rows[r][2]);
+              }
+              delete queue[s];
+            }
+            return undefined;
+          };
+          hooks.post = function () {
+            if (phase === 'free') {
+              if (!wantBegin) return;
+              // Lockstep begins here: the state now is every seat's start.
+              wantBegin = false;
+              var st = gm.getState();
+              var heldRows = [];
+              for (var hk in held) if (held[hk][2] !== 0) heldRows.push(held[hk]);
+              start = gm.getFrameNum();
+              nextFrom = start;
+              lastBatch = start;
+              phase = 'lockstep';
+              pageWin.postMessage({ type: 'arcade-replay-snapshot', frame: start, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
+              status();
+              return;
+            }
+            if (phase === 'loading') {
+              // As a spectator's load (above): landed when the state is seat
+              // 0's, asked again every LOAD_RETRY iterations meanwhile.
+              loadTries += 1;
+              var h = stateHash(gm.getState());
+              if (h !== snap.hash && loadTries < LOAD_TRIES) {
+                if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+                return;
+              }
+              offset = snap.frame - gm.getFrameNum();
+              start = snap.frame;
+              nextFrom = start;
+              lastBatch = start;
+              for (var d in down) if (!snap.held.some(function (r) { return r[0] + ':' + r[1] === d; })) feed(down[d][0], down[d][1], 0);
+              for (var q = 0; q < snap.held.length; q++) feed(snap.held[q][0], snap.held[q][1], snap.held[q][2]);
+              for (var qf in queue) if (+qf < start) delete queue[qf];
+              phase = 'stalled';
+              post('arcade-replay-status', { phase: phase, frame: at(), through: -1, loaded: snap.frame, hash: h, matches: h === snap.hash, tries: loadTries });
+              return;
+            }
+            var s = at();
+            if (pending.length || s - lastBatch >= batchFrames) flush();
+            if (s % hashEvery === 0) post('arcade-replay-hash', { frame: s, hash: stateHash(gm.getState()) });
+            var now = Date.now();
+            if (now - lastStatus > 1000) { lastStatus = now; status(); }
+          };
+          replay = {
+            role: role,
+            begin: function () { if (seat === 0 && phase === 'free') wantBegin = true; },
+            press: function (p, i, v) { gm.simulateInput(p, i, v); },
+            inputs: function (d) {
+              var k = d.seat;
+              if (typeof k !== 'number' || k === seat || !(k >= 0 && k < seats) || typeof d.through !== 'number' || !Array.isArray(d.inputs)) return;
+              for (var n = 0; n < d.inputs.length; n++) {
+                var row = d.inputs[n];
+                if (Array.isArray(row) && row[1] === k) enqueue(k, row);
+              }
+              if (d.through > thru[k]) thru[k] = d.through;
+            },
+            snapshot: function (d) {
+              if (seat === 0 || phase !== 'waiting') return;
+              if (!(d.state instanceof Uint8Array) || !Array.isArray(d.held) || typeof d.frame !== 'number') return;
+              snap = d;
+              loadTries = 0;
+              gm.loadState(d.state);
+              phase = 'loading';
+            },
+          };
         } else {
           var queue = {};
           var through = -1;
@@ -343,6 +523,11 @@
         if (replay.role === 'source') {
           if (d.type === 'arcade-replay-want-snapshot') replay.want();
           else if (d.type === 'arcade-replay-press' && typeof d.player === 'number') replay.press(d.player, d.index, d.value);
+        } else if (replay.role === 'peer') {
+          if (d.type === 'arcade-replay-inputs') replay.inputs(d);
+          else if (d.type === 'arcade-replay-snapshot') replay.snapshot(d);
+          else if (d.type === 'arcade-replay-begin') replay.begin();
+          else if (d.type === 'arcade-replay-press' && typeof d.player === 'number') replay.press(d.player, d.index, d.value);
         } else {
           if (d.type === 'arcade-replay-inputs') replay.inputs(d);
           else if (d.type === 'arcade-replay-snapshot') replay.snapshot(d);
@@ -398,13 +583,14 @@
           });
         }
         window.EJS_ready = function () { post('arcade-ready'); };
-        var replayRole = c.replay === 'source' || c.replay === 'follower' ? c.replay : null;
+        var replayRole = c.replay === 'source' || c.replay === 'follower' || c.replay === 'peer' ? c.replay : null;
         if (replayRole) hookMainLoop();
         // EmulatorJS focuses its player when the game starts, and focus in
         // this frame is the keyboard leaving the world: a spectator's frame,
         // which takes no input, mounts while its avatar is walking past and
         // must not take the keys with it (the spike caught it doing so).
-        if (replayRole === 'follower') window.EJS_noAutoFocus = true;
+        // A lockstep peer's page decides which frame has the keys, too.
+        if (replayRole === 'follower' || replayRole === 'peer') window.EJS_noAutoFocus = true;
         window.EJS_onGameStart = function () {
           if (replayRole) startReplay(replayRole, c);
           post('arcade-started');
