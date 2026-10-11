@@ -27,6 +27,12 @@
  * device) is flagged on the table card. A forfeited party whose reveal IS in
  * the room doc is flagged too — the operator must not drop a seed it saw.
  *
+ * SIGNED: each bettor's record carries a signature over its commitment by
+ * that player's identity key (keypair.ts; the key players[pid].keyB64 names,
+ * pinned the first time this page sees it). The close freezes only records
+ * whose signature checks, and the signatures ride on the round, so nobody can
+ * put a seed in under another player's name — not even the operator.
+ *
  * Seeds survive a reload in localStorage (keyed by commitment), so a refreshed
  * page can still reveal. Each commitment is bound to its table, round, party
  * and (for a bettor) the house commit (diceFairness.tableCommitMessage), so a
@@ -45,6 +51,7 @@ import {
   readMyBets,
   readMyCrapsBets,
   readCrapsTableState,
+  readPlayerKey,
   readSeedRecord,
   readTableState,
   writeMySeedRecord,
@@ -55,6 +62,8 @@ import type { RouletteTableState } from './games/roulette';
 import { getCrapsFairnessMode, tableCommitMessage, verifyParties } from './games/diceFairness';
 import type { RoundParty, TableGame, TableSeedContext } from './games/diceFairness';
 import { randomSeedHex } from './games/fairDice';
+import { getPlayerId } from './identity';
+import { getIdentityPub, signIdentity, verifyIdentity } from './keypair';
 
 /** How long the settle waits for frozen parties' reveals once it is due. */
 export const REVEAL_GRACE_MS = 4_000;
@@ -161,6 +170,51 @@ function bettorCtx(table: string, s: TableState, pid: string): TableSeedContext 
   return { room: casinoRoomId(), table, round: s.round, party: pid, house: s.houseCommit ?? '' };
 }
 
+// ── Signatures ───────────────────────────────────────────────────────────────
+
+/** What a bettor signs: its commitment in full context, domain-tagged. */
+export function seedSigBytes(ctx: TableSeedContext, commit: string): Uint8Array {
+  return new TextEncoder().encode(
+    `ssf-seed-sig-v1|${ctx.room ?? ''}|${ctx.table}|${ctx.round}|${ctx.party}|${ctx.house}|${commit}`,
+  );
+}
+
+/** Each player's key as THIS page first saw it in this room (epoch:pid): a
+ *  later rewrite of players[pid].keyB64 can't hand their seat to another key. */
+const pinnedKeys = new Map<string, string>();
+
+/** The identity key a player's records must be signed with: this page's own
+ *  key for its own player, else the pinned (first-seen) players-map key. */
+export function keyFor(pid: string): string | undefined {
+  if (pid === getPlayerId()) return getIdentityPub();
+  const k = `${casinoDocEpoch()}:${pid}`;
+  const pinned = pinnedKeys.get(k);
+  if (pinned) return pinned;
+  const key = readPlayerKey(pid);
+  if (key) {
+    pinnedKeys.set(k, key);
+    evictOldest(pinnedKeys, 1024);
+  }
+  return key;
+}
+
+const sigChecks = new Map<string, boolean>();
+
+/** Does `sig` sign `commit` for `pid` in this round, under pid's key? */
+function signedBy(tableId: string, s: TableState, pid: string, commit: string, sig: string | undefined): boolean {
+  const key = keyFor(pid);
+  if (!key || !sig) return false;
+  const ctx = bettorCtx(tableId, s, pid);
+  const ck = `${key}|${sig}|${ctx.room}|${tableId}|${s.round}|${pid}|${ctx.house}|${commit}`;
+  let ok = sigChecks.get(ck);
+  if (ok === undefined) {
+    ok = verifyIdentity(key, seedSigBytes(ctx, commit), sig);
+    sigChecks.set(ck, ok);
+    evictOldest(sigChecks, 512);
+  }
+  return ok;
+}
+
 // ── Who has a stake ──────────────────────────────────────────────────────────
 
 function readState(tableId: string, game: TableGame): TableState | null {
@@ -198,6 +252,7 @@ interface FrozenSnapshot {
   house: string;
   commits: Record<string, string>;
   wagers?: Record<string, string>;
+  sigs?: Record<string, string>;
 }
 /** Per table (epoch:table), its last few rounds' snapshots, oldest first. */
 const frozenSeen = new Map<string, Map<string, FrozenSnapshot>>();
@@ -210,11 +265,12 @@ function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
   return frozenSeen.get(`${casinoDocEpoch()}:${tableId}`)?.get(String(s.round));
 }
 
-function snapshot(s: TableState & { wagers?: Record<string, string> }): FrozenSnapshot {
+function snapshot(s: TableState): FrozenSnapshot {
   return {
     house: s.houseCommit ?? '',
     commits: { ...(s.commits ?? {}) },
     ...(s.wagers ? { wagers: { ...s.wagers } } : {}),
+    ...(s.sigs ? { sigs: { ...s.sigs } } : {}),
   };
 }
 
@@ -223,14 +279,21 @@ function snapshot(s: TableState & { wagers?: Record<string, string> }): FrozenSn
  *  reveals, so the settle and the check go by this copy when there is one. */
 export function frozenFields(
   tableId: string,
-  s: TableState & { wagers?: Record<string, string> },
-): { houseCommit?: string; commits?: Record<string, string>; wagers?: Record<string, string> } {
+  s: TableState,
+): { houseCommit?: string; commits?: Record<string, string>; wagers?: Record<string, string>; sigs?: Record<string, string> } {
   const seen = seenFor(tableId, s);
-  if (!seen) return { ...(s.commits ? { commits: s.commits } : {}), ...(s.wagers ? { wagers: s.wagers } : {}) };
+  if (!seen) {
+    return {
+      ...(s.commits ? { commits: s.commits } : {}),
+      ...(s.wagers ? { wagers: s.wagers } : {}),
+      ...(s.sigs ? { sigs: s.sigs } : {}),
+    };
+  }
   return {
     ...(seen.house ? { houseCommit: seen.house } : {}),
     commits: seen.commits,
     ...(seen.wagers ? { wagers: seen.wagers } : {}),
+    ...(seen.sigs ? { sigs: seen.sigs } : {}),
   };
 }
 
@@ -246,7 +309,7 @@ export function forgetMissingTables(live: ReadonlySet<string>): void {
   }
 }
 
-function noteFrozen(tableId: string, s: TableState & { wagers?: Record<string, string> }, overwrite: boolean): void {
+function noteFrozen(tableId: string, s: TableState, overwrite: boolean): void {
   const k = String(s.round);
   const tk = `${casinoDocEpoch()}:${tableId}`;
   let rounds = frozenSeen.get(tk);
@@ -315,11 +378,12 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
     const seed = randomSeedHex();
     const commit = commitSeedSync(seed, bettorCtx(tableId, s, me));
     keepSeed(commit, seed);
+    const sig = signIdentity(seedSigBytes(bettorCtx(tableId, s, me), commit));
     authored.add(authoredKey(tableId, s, commit));
     authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
     evictOldest(authored, 512);
     evictOldest(authoredRounds, 512);
-    writeMySeedRecord(tableId, me, { round: s.round, house: s.houseCommit, commit });
+    writeMySeedRecord(tableId, me, { round: s.round, house: s.houseCommit, commit, sig });
   } else if (s.phase === 'closing') {
     const frozen = s.commits?.[me];
     if (!frozen || !rec || rec.commit !== frozen || rec.round !== s.round || rec.seed) return;
@@ -351,16 +415,22 @@ export function freezeCommits(
   tableId: string,
   game: TableGame,
   s: TableState,
-): { commits?: Record<string, string>; unseeded?: string[]; wagers?: Record<string, string> } {
+): { commits?: Record<string, string>; unseeded?: string[]; wagers?: Record<string, string>; sigs?: Record<string, string> } {
   if (!s.houseCommit) return {};
   const staked = stakedPlayers(tableId, game, s.round);
   const commits: Record<string, string> = {};
+  const sigs: Record<string, string> = {};
   // Read only the staked players' records: anyone can add fseed keys, so a
   // scan of every key on the table would let a peer stall the close.
   for (const pid of [...staked].sort()) {
     if (Object.keys(commits).length >= MAX_BETTOR_PARTIES) break;
     const r = readSeedRecord(tableId, pid);
-    if (r && r.round === s.round && r.house === s.houseCommit) commits[pid] = r.commit;
+    // Only a record signed by the player's own key: anyone can write under
+    // their id, nobody else can sign for them.
+    if (r && r.round === s.round && r.house === s.houseCommit && signedBy(tableId, s, pid, r.commit, r.sig)) {
+      commits[pid] = r.commit;
+      sigs[pid] = r.sig!;
+    }
   }
   // Staked but no seed (offline with standing bets, too quick a close, or
   // past the cap — a table's stands keep it far below 15): on the record, so
@@ -373,8 +443,8 @@ export function freezeCommits(
     wagers[pid] = wagerFingerprint(game === 'craps' ? readMyCrapsBets(tableId, pid) : readMyBets(tableId, pid, s.round));
   }
   // The operator's own copy of what it froze: its settle goes by this.
-  noteFrozen(tableId, { ...s, commits, wagers }, true);
-  return unseeded.length > 0 ? { commits, unseeded, wagers } : { commits, wagers };
+  noteFrozen(tableId, { ...s, commits, wagers, sigs }, true);
+  return unseeded.length > 0 ? { commits, unseeded, wagers, sigs } : { commits, wagers, sigs };
 }
 
 /** A bettor's wager list, hashed: what "no more bets" froze for them. */
@@ -388,7 +458,7 @@ export function wagerFingerprint(bets: readonly unknown[]): string {
  *  A round without frozen wagers (RNG) settles the bets as they stand. */
 export function frozenWagers<T>(
   tableId: string,
-  s: TableState & { wagers?: Record<string, string> },
+  s: TableState,
   bets: Record<string, T[]>,
 ): { bets: Record<string, T[]>; voided: string[]; omitted: string[] } {
   const { wagers } = frozenFields(tableId, s);
@@ -512,6 +582,10 @@ export async function verifySettledRound(
   // after seeing every reveal: the operator voids such a round instead, so a
   // published one fails.
   if (t.seeds[0] === '') return { kind: 'failed' };
+  // Every bettor's commitment must carry its own signature: an operator can
+  // leave a player out (their card says so), but not seed in their name.
+  const fzSigs = frozenFields(tableId, s).sigs ?? {};
+  if (bettors.some((pid) => !signedBy(tableId, s, pid, frozen[pid], fzSigs[pid]))) return { kind: 'failed' };
   if (!(await verifyParties(t, game, tableId, s.round, outcome, casinoRoomId()))) return { kind: 'failed' };
   const forfeited = bettors.filter((_, i) => t.seeds![i + 1] === '');
   const droppedReveal = forfeited.some((pid) => {

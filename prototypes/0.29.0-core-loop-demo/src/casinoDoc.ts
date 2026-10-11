@@ -547,6 +547,9 @@ export interface TableSeedRecord {
   commit: string;
   /** The revealed seed — absent until the commit set is frozen. */
   seed?: string;
+  /** The bettor's identity-key signature over the commitment (base64url,
+   *  fairTableSeeds.seedSigBytes): a record without a valid one is no party. */
+  sig?: string;
 }
 
 function isTableSeedRecord(v: unknown): v is TableSeedRecord {
@@ -555,12 +558,21 @@ function isTableSeedRecord(v: unknown): v is TableSeedRecord {
   const hex = (x: unknown) => typeof x === 'string' && x.length > 0 && x.length <= 128;
   return Number.isInteger(r.round) && (r.round as number) >= 1
     && hex(r.house) && hex(r.commit)
-    && (r.seed === undefined || hex(r.seed));
+    && (r.seed === undefined || hex(r.seed))
+    && (r.sig === undefined || hex(r.sig));
 }
 
 export function readSeedRecord(tableId: string, playerId: string): TableSeedRecord | null {
   const v = ensureMap().get(`fseed:${tableId}:${playerId}`);
   return isTableSeedRecord(v) ? v : null;
+}
+
+/** A player's identity key as the room's players map carries it (the same
+ *  base64url string keypair.getIdentityPub writes), or undefined. */
+export function readPlayerKey(playerId: string): string | undefined {
+  if (!docAlive() || !boundDoc) return undefined;
+  const entry = boundDoc.getMap('players').get(playerId) as { keyB64?: unknown } | undefined;
+  return typeof entry?.keyB64 === 'string' && entry.keyB64.length > 0 && entry.keyB64.length <= 128 ? entry.keyB64 : undefined;
 }
 
 export function writeMySeedRecord(tableId: string, playerId: string, rec: TableSeedRecord): void {

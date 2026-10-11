@@ -20,11 +20,25 @@ const {
 } = await import('./croupier');
 const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, pressManualRoll, tickAutoStickman } = await import('./crapsCroupier');
 const {
-  commitSeedSync, forgetMissingTables, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
+  commitSeedSync, forgetMissingTables, keyFor, seedSigBytes, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
   wagerFingerprint,
 } = await import('./fairTableSeeds');
 const { pocketFromMaterial } = await import('./games/fairDice');
 const { commitTableSeed } = await import('./games/diceFairness');
+const { getIdentityPub, signIdentity } = await import('./keypair');
+
+const ed = await import('@noble/ed25519');
+const b64url = (b: Uint8Array): string => btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+/** Someone else's identity key: signs anything, but isn't Amy's or Bob's. */
+const ATTACKER = (() => {
+  const priv = ed.etc.randomBytes(32);
+  return { pub: b64url(ed.getPublicKey(priv)), sign: (m: Uint8Array) => b64url(ed.sign(m, priv)) };
+})();
+
+/** A bettor's signature over `commit`, as its own client would make it. */
+function signFor(table: string, round: number, party: string, house: string, commit: string, room = ''): string {
+  return signIdentity(seedSigBytes({ room, table, round, party, house }, commit));
+}
 type RouletteTableState = import('./games/roulette').RouletteTableState;
 type CrapsTableState = import('./games/craps').CrapsTableState;
 
@@ -32,6 +46,7 @@ const T0 = 2_000_000_000;
 const AMY = 'player-Amy';
 const BOB = 'player-Bob';
 
+let room: Y.Doc;
 let tableN = 0;
 const freshTable = (): string => `fair-test-${++tableN}`;
 
@@ -55,10 +70,19 @@ function playersLook(tableId: string, game: 'craps' | 'roulette', who = [AMY, BO
   for (const pid of who) tickFairSeeds(tableId, game, pid);
 }
 
+/** A fresh room doc where Amy and Bob carry this page's identity key (one
+ *  page plays both of them here). */
+function freshRoom(roomId = ''): Y.Doc {
+  const doc = new Y.Doc();
+  for (const pid of [AMY, BOB]) doc.getMap('players').set(pid, { name: pid, keyB64: getIdentityPub() });
+  bindCasinoDoc(doc, roomId);
+  return doc;
+}
+
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
   at(T0);
-  bindCasinoDoc(new Y.Doc());
+  room = freshRoom();
   setSoleCroupierPredicate(() => true);
   buyInChips(AMY, 100);
   buyInChips(BOB, 100);
@@ -422,13 +446,66 @@ describe('a Fair roulette round', () => {
     const t = freshTable();
     tickAutoCroupier(t);
     tickFairSeeds(t, 'roulette', AMY); // throttles this table for Amy, in the old room
-    bindCasinoDoc(new Y.Doc());
+    freshRoom();
     buyInChips(AMY, 100);
     tickAutoCroupier(t);
     writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
     tickAutoCroupier(t);
     tickFairSeeds(t, 'roulette', AMY); // same instant, new room
     expect(readSeedRecord(t, AMY)?.house).toBe(readTableState(t)?.houseCommit);
+  });
+
+  it("a seed record under Amy's name that her key didn't sign is no party", () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    const open = readTableState(t)!;
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    tickAutoCroupier(t);
+    // Amy's page never looks; someone else writes a record in her name.
+    const commit = commitSeedSync('ab'.repeat(32), { room: '', table: t, round: 1, party: AMY, house: open.houseCommit! });
+    const sig = ATTACKER.sign(seedSigBytes({ room: '', table: t, round: 1, party: AMY, house: open.houseCommit! }, commit));
+    writeMySeedRecord(t, AMY, { round: 1, house: open.houseCommit!, commit, sig });
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    const closing = readTableState(t)!;
+    expect(closing.commits?.[AMY]).toBeUndefined();
+    expect(closing.unseeded).toEqual([AMY]);
+  });
+
+  it("rewriting Amy's key in the players map after this page saw it doesn't let another key sign for her", () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    const open = readTableState(t)!;
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    tickAutoCroupier(t);
+    expect(keyFor(AMY)).toBe(getIdentityPub()); // seen (and pinned) here
+    room.getMap('players').set(AMY, { name: AMY, keyB64: ATTACKER.pub });
+    const ctx = { room: '', table: t, round: 1, party: AMY, house: open.houseCommit! };
+    const commit = commitSeedSync('ab'.repeat(32), ctx);
+    writeMySeedRecord(t, AMY, { round: 1, house: open.houseCommit!, commit, sig: ATTACKER.sign(seedSigBytes(ctx, commit)) });
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    expect(readTableState(t)?.commits?.[AMY]).toBeUndefined();
+  });
+
+  it("a published round that seeds in Amy's name without her signature fails the check", async () => {
+    const t = freshTable();
+    const { settleParties } = await import('./games/diceFairness');
+    const hs = 'cd'.repeat(32);
+    const house = commitSeedSync(hs, { room: '', table: t, round: 1, party: 'house', house: '' });
+    const as = 'ef'.repeat(32);
+    const ctx = { room: '', table: t, round: 1, party: AMY, house };
+    const commit = commitSeedSync(as, ctx);
+    const mixed = await settleParties('roulette', [{ id: 'house', commit: house, seed: hs }, { id: AMY, commit, seed: as }], t, 1);
+    const base: RouletteTableState = {
+      kind: 'roulette', phase: 'settled', round: 1, result: mixed!.pocket!, resultAt: 0, payouts: {},
+      houseCommit: house, commits: { [AMY]: commit }, fairness: mixed!.transcript,
+    };
+    const forged = { ...base, sigs: { [AMY]: ATTACKER.sign(seedSigBytes(ctx, commit)) } };
+    expect((await verifySettledRound('roulette', t, forged, { pocket: base.result! })).kind).toBe('failed');
+    expect((await verifySettledRound('roulette', t, base, { pocket: base.result! })).kind).toBe('failed');
+    const honest = { ...base, sigs: { [AMY]: signFor(t, 1, AMY, house, commit) } };
+    expect((await verifySettledRound('roulette', t, honest, { pocket: base.result! })).kind).toBe('verified');
   });
 
   it('a bet that missed the freeze is returned, not lost', async () => {
@@ -533,12 +610,13 @@ describe('a Fair roulette round', () => {
     tickAutoCroupier(t);
     playersLook(t, 'roulette', [AMY]);
     // Bob's client replays round 1's public commit + seed instead of a fresh one.
-    writeMySeedRecord(t, BOB, { round: 2, house: r2.houseCommit!, commit: bobCommit });
+    const sig = signFor(t, 2, BOB, r2.houseCommit!, bobCommit);
+    writeMySeedRecord(t, BOB, { round: 2, house: r2.houseCommit!, commit: bobCommit, sig });
     later(BET_WINDOW_MS);
     tickAutoCroupier(t);
     expect(readTableState(t)?.commits?.[BOB]).toBe(bobCommit);
     playersLook(t, 'roulette', [AMY]);
-    writeMySeedRecord(t, BOB, { round: 2, house: r2.houseCommit!, commit: bobCommit, seed: bobSeed });
+    writeMySeedRecord(t, BOB, { round: 2, house: r2.houseCommit!, commit: bobCommit, seed: bobSeed, sig });
     later(CLOSING_MS);
     tickAutoCroupier(t);
     await flush();
@@ -590,14 +668,14 @@ describe('a Fair roulette round', () => {
   });
 
   it("a record copied in from the same table and round in another room isn't revealed", () => {
-    bindCasinoDoc(new Y.Doc(), 'room-A');
+    freshRoom('room-A');
     buyInChips(AMY, 100);
     buyInChips(BOB, 100);
     const t = 'shared-table-id';
     const closingA = rouletteToClosing(t);
     const amyOnA = closingA.commits![AMY];
     // Room B: same table id, same round, the attacker copies Amy's record.
-    bindCasinoDoc(new Y.Doc(), 'room-B');
+    freshRoom('room-B');
     tickAutoCroupier(t);
     writeMyBets(t, AMY, 1, [{ type: 'red', amount: 5 }]);
     const openB = readTableState(t)!;

@@ -113,6 +113,7 @@ export interface CrapsTableState {
   commits?: Record<string, string>;
   unseeded?: string[];
   wagers?: Record<string, string>;
+  sigs?: Record<string, string>;
   /** ⚖️ The fairness mode locked in when this window opened; the settle uses
    *  it, so an owner's switch mid-window applies from the next one. */
   fairMode?: FairnessMode;
@@ -193,6 +194,9 @@ export interface SeedRoundFields {
   /** Each frozen bettor's wager list, hashed at "no more bets": the settle
    *  pays only lists that still match. */
   wagers?: Record<string, string>;
+  /** Each frozen bettor's signature over its commitment (its identity key,
+   *  players[pid].keyB64): nobody else can put a seed in under its name. */
+  sigs?: Record<string, string>;
 }
 
 function isPidMap(v: unknown, max: number): boolean {
@@ -209,6 +213,7 @@ export function isSeedRoundFields(s: SeedRoundFields): boolean {
     && (typeof s.houseCommit !== 'string' || s.houseCommit.length > FAIRNESS_MAX_STRING)) return false;
   if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
   if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
+  if (s.sigs !== undefined && !isPidMap(s.sigs, FAIRNESS_MAX_PARTIES - 1)) return false;
   return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 

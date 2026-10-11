@@ -1120,7 +1120,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     // forfeited party's seed record can change "a revealed seed was left out".
     const records = Object.keys(s.commits ?? {}).sort().map((pid) => readSeedRecord(itemId, pid));
     const inFlight = JSON.stringify([
-      forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null, s.unseeded ?? null, s.wagers ?? null,
+      forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null, s.unseeded ?? null, s.wagers ?? null, s.sigs ?? null,
       records,
     ]);
     const v = verdicts.get(inFlight);
