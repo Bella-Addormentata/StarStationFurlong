@@ -84,6 +84,17 @@ describe('the SETTINGS view (the ⚙️)', () => {
     expect(html).toContain('EmulatorJS window');
   });
 
+  it('says who sends the owner\'s file to the players', () => {
+    ownerPuts({ ...LJ65, sha256: 'cd'.repeat(32) });
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Sent to each player who presses play');
+    // The owner's page lost the file (a reload): it says how to send it again.
+    expect(renderArcadePanel(CAB, deps('settings', true))).toContain('pick it again below');
+    ownerPuts(LJ65); // no hash: from a build before sending
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Not sent to players');
+    ownerPuts({ ...LJ65, size: 9 * 1024 * 1024, sha256: 'cd'.repeat(32) });
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Not sent to players (over 8 MB)');
+  });
+
   it('escapes a peer\'s game name', () => {
     ownerPuts({ ...LJ65, name: '<img src=x onerror=alert(1)>.nes' });
     const html = renderArcadePanel(CAB, deps('settings', false));

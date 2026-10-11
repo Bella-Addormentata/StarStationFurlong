@@ -36,6 +36,7 @@ import {
 import type { ArcadeCore, ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES as BUILT_IN_GAMES, LICENSE_LABEL } from './arcadeLibrary';
 import { rememberLocalRom, romAcceptList, EMULATOR_FETCH_COMMAND } from './arcadeEmulator';
+import { heldRom, holdRom, sha256Hex, ROM_SHARE_MAX_BYTES } from './arcadeRomShare';
 import { urlConsent, urlRefusal } from './tvConsent';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
@@ -191,8 +192,21 @@ function gameNote(g: ArcadeGame): string {
 
 function emulatorFilesText(lanesOn: boolean): string {
   return lanesOn
-    ? `For your own games. This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it) — but under the CDN the emulator's own code reads the file, so each P1 is asked before their copy goes to it; THIS STATION's files keep it on their machine.`
-    : `For your own games. This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) — ${esc(SERVERLESS_ONLY)}, so the public CDN is not offered. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it), and the emulator runs under a policy that reaches this origin and the player's own node, nothing else.`;
+    ? `For your own games. This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. Under the CDN the emulator's own code reads the game file, so each player is asked before it goes to it; THIS STATION's files keep it on their machine.`
+    : `For your own games. This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) — ${esc(SERVERLESS_ONLY)}, so the public CDN is not offered, and the emulator runs under a policy that reaches this origin and the player's own node, nothing else.`;
+}
+
+/** Under the owner's own file: who sends it to the players. */
+function fileNote(g: ArcadeGame, owner: boolean): string {
+  if (g.url || g.bundled) return '';
+  const mb = ROM_SHARE_MAX_BYTES / (1024 * 1024);
+  if (!g.sha256 || g.size > ROM_SHARE_MAX_BYTES) {
+    return `<div style="font-size:9px; color:${WARN}; line-height:1.4;">Not sent to players${g.size > ROM_SHARE_MAX_BYTES ? ` (over ${mb} MB)` : ''}: each brings their own copy.</div>`;
+  }
+  const here = heldRom(g.sha256)
+    ? 'This page has it and sends it.'
+    : owner ? 'This page no longer has it (reloaded?): pick it again below to send it, unless a player who has it is here.' : '';
+  return `<div style="font-size:9px; color:${DIM}; line-height:1.4;">Sent to each player who presses play, through the room, from whoever has it here: the owner's computer, or a player who got it. ${here}</div>`;
 }
 
 /** PLAY: at the cabinet — the owner's own game, and PLAYER ONE. */
@@ -240,7 +254,7 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
   const lanesOn = convenienceLanesEnabled();
 
   const onCabinet = `${game
-    ? `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">${gameRow(game)}</div>${gameNote(game)}`
+    ? `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">${gameRow(game)}</div>${gameNote(game)}${fileNote(game, owner)}`
     : `<div style="font-size:10px; color:${DIM};">nothing — the owner picks a game</div>`}
     <div style="display:flex; gap:6px; align-items:center; justify-content:space-between; font-size:10px; color:${DIM};">
       <span>PLAYED ${rec.plays} TIME${rec.plays === 1 ? '' : 'S'}</span>
@@ -279,7 +293,7 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
   // link is one on this station's node or this page's own origin, and the
   // CDN is not offered.
   const load = owner ? section('YOUR OWN GAME · EMULATORJS', `
-    <div style="font-size:9px; color:${DIM}; line-height:1.4;">Any console or arcade board EmulatorJS runs. Player one plays it in a window that INSERT COIN opens.</div>
+    <div style="font-size:9px; color:${DIM}; line-height:1.4;">Any console or arcade board EmulatorJS runs. Player one plays it in a window that INSERT COIN opens. A file from your disk is sent to each player who presses play (up to ${ROM_SHARE_MAX_BYTES / (1024 * 1024)} MB).</div>
     <label style="display:flex; flex-direction:column; gap:4px; font-size:10px; color:${GOLD_BRIGHT};">
       <span>📁 YOUR OWN FILE ${laneBadge('SOVEREIGN')}</span>
       <input type="file" data-arcade-file="1" accept="${romAcceptList()}" style="font-size:10px; color:#8fa3b8;">
@@ -378,10 +392,39 @@ function wirePanel(panel: HTMLElement, itemId: string, deps: ArcadeDeviceDeps, r
       note(d.error);
       return;
     }
-    const r = putOnCabinet(itemId, d.game);
-    if (r.ok && d.file) rememberLocalRom(d.game, d.file);
-    note(r.ok ? `On the cabinet: ${d.game.name}` : r.error);
+    if (!d.file) {
+      const r = putOnCabinet(itemId, d.game);
+      note(r.ok ? `On the cabinet: ${d.game.name}` : r.error);
+      return;
+    }
+    // A file from the owner's disk goes on with its hash, and this page
+    // holds its bytes to send to each player who presses play.
+    const file = d.file;
+    note(`Reading ${file.name}…`);
+    void putOnOwnFile(itemId, d.game, file).then(note);
   });
+}
+
+/** Put the owner's own file on the cabinet: hashed, so players who press
+ *  play can be sent it and check it (arcadeRomShare). The note to show. */
+async function putOnOwnFile(itemId: string, game: ArcadeGame, file: File): Promise<string> {
+  let bytes: Uint8Array;
+  let sha: string;
+  try {
+    bytes = new Uint8Array(await file.arrayBuffer());
+    sha = await sha256Hex(bytes);
+  } catch {
+    return `Could not read ${file.name}.`;
+  }
+  const withHash: ArcadeGame = { ...game, size: bytes.length, sha256: sha };
+  const r = putOnCabinet(itemId, withHash);
+  if (!r.ok) return r.error;
+  rememberLocalRom(withHash, file);
+  if (bytes.length > ROM_SHARE_MAX_BYTES) {
+    return `On the cabinet: ${game.name}. It is over ${ROM_SHARE_MAX_BYTES / (1024 * 1024)} MB, so it is not sent: players bring their own copy.`;
+  }
+  holdRom(sha, bytes);
+  return `On the cabinet: ${game.name}. Players who press play get it from your computer.`;
 }
 
 // ── The DeviceUI ─────────────────────────────────────────────────────────────

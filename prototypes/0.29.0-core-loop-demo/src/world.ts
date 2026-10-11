@@ -247,6 +247,7 @@ import { tvScreenView } from "./tvDoc";
 import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
 import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
 import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
+import { tickRomShare } from "./arcadeRomShare";
 import { arcadeScreenView, builtInEntry, countBuiltInPlay, readCabinet } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
@@ -4148,6 +4149,8 @@ export class World {
         const arcadeIds = FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
         for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
         tickArcadeRoom(arcadeIds);
+        // …and the owner's game file, sent to whoever pressed play.
+        tickRomShare();
       }
     }
 

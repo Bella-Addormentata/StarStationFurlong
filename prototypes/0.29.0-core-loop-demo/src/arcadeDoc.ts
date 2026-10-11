@@ -133,6 +133,10 @@ export interface ArcadeGame {
    *  on the cabinet's screen, for the room. Absent: the owner's own game,
    *  in EmulatorJS. */
   bundled?: string;
+  /** A file from the owner's disk: its SHA-256 (hex). The owner's page —
+   *  and every page that got it since — sends the bytes to a player who
+   *  presses play (arcadeRomShare), checked against this. */
+  sha256?: string;
 }
 
 /** A built-in game as it goes on a cabinet — always rebuilt from the
@@ -313,6 +317,34 @@ function write(key: string, value: unknown): void {
   });
 }
 
+/** Raw access for arcadeRomShare's own keys (`rom…:`), which carry the
+ *  owner's game file to the players who press play: their shapes are that
+ *  module's to check. Each write is its own transaction (one update each). */
+export function arcadeRawGet(key: string): unknown {
+  return ensureMap().get(key);
+}
+export function arcadeRawSet(key: string, value: unknown): void {
+  write(key, value);
+}
+export function arcadeRawDelete(keys: readonly string[]): void {
+  const map = ensureMap();
+  if (!keys.some((k) => map.has(k))) return;
+  boundDoc!.transact(() => {
+    for (const k of keys) map.delete(k);
+  });
+}
+/** The keys under a prefix, at most `max` of them (a peer's keys are
+ *  bounded before anything looks at them). */
+export function arcadeRawKeys(prefix: string, max = 4096): string[] {
+  const out: string[] = [];
+  for (const k of ensureMap().keys()) {
+    if (!k.startsWith(prefix)) continue;
+    out.push(k);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 export function cabinetKey(itemId: string): string {
   return `arcade:${itemId}`;
 }
@@ -389,7 +421,10 @@ export function sanitizeGame(raw: unknown): ArcadeGame | null {
   if (!name || !isArcadeCore(r.core)) return null;
   const url = str(r.url, ARCADE_MAX_URL);
   if (url && !isHttpUrl(url)) return null;
-  return { name, core: r.core, url, size: Math.max(0, Math.floor(num(r.size))) };
+  const game: ArcadeGame = { name, core: r.core, url, size: Math.max(0, Math.floor(num(r.size))) };
+  // A file's hash, for the copy the room sends (a link is fetched instead).
+  if (!url && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)) game.sha256 = r.sha256;
+  return game;
 }
 
 /** The `arcade:` key as a peer may have written it: the curation alone. */

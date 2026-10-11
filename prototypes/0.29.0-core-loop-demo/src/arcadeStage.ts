@@ -26,8 +26,10 @@
  *
  * What it shows before the game runs, honestly: CHECKING / LOADING /
  * STARTING, NOT PROVISIONED with the command when this station has no
- * emulator files, BRING YOUR COPY when the game is a file on its owner's
- * disk (the copy must be the same size as the cabinet's), YOUR COPY WOULD
+ * emulator files, GETTING THE GAME while a file from the owner's disk comes
+ * from whoever has it here (arcadeRomShare), BRING YOUR COPY when nobody
+ * here has it or it is too big to send (the copy must be the same size as
+ * the cabinet's), YOUR COPY WOULD
  * RUN UNDER CDN CODE when that file would be handed to engine code from
  * another origin (the player's consent, not a claim that it is safe), and
  * a RETRY on any fault.
@@ -41,6 +43,7 @@ import {
   romAcceptList, EMULATOR_FETCH_COMMAND,
 } from './arcadeEmulator';
 import type { EmulatorHandle } from './arcadeEmulator';
+import { dropWant, romProgress, wantRom, ROM_SHARE_MAX_BYTES } from './arcadeRomShare';
 import { acceptMediaOrigin, ownMediaOrigins, urlConsent, urlRefusal } from './tvConsent';
 import type { MediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
@@ -59,9 +62,10 @@ interface Stage {
   status: HTMLDivElement;
   controls: HTMLDivElement;
   frame: EmulatorHandle | null;
-  /** `<gameId>@<data>` of what is mounted, 'waiting:…' for a file to bring,
-   *  'consent:…' for a file the player has not yet agreed to hand to CDN
-   *  code, 'failed:…' after a fault (RETRY clears it), '' for nothing. */
+  /** `<gameId>@<data>` of what is mounted, 'receiving:…' while the owner's
+   *  file comes from the room, 'waiting:…' for a file to bring, 'consent:…'
+   *  for a file the player has not yet agreed to hand to CDN code,
+   *  'failed:…' after a fault (RETRY clears it), '' for nothing. */
   mounted: string;
   phase: Phase;
   counted: boolean;
@@ -78,6 +82,9 @@ interface Stage {
   lastControls: string;
   /** A wrong file picked for BRING YOUR COPY: said once, under the notice. */
   fileNote: string;
+  /** The file this stage asked the room for (its hash), to withdraw on close. */
+  wanted: string | undefined;
+  lastReceiving: string;
   /** What had focus when the stage opened: focus goes back there on close. */
   opener: HTMLElement | null;
   /** The helm's flight stick stands aside while the stage is up
@@ -167,6 +174,8 @@ export function openArcadeStage(itemId: string): void {
     lastStatus: '',
     lastControls: '',
     fileNote: '',
+    wanted: undefined,
+    lastReceiving: '',
     opener,
     releaseStick,
   };
@@ -192,6 +201,7 @@ export function closeArcadeStage(): void {
 
 function teardown(t: Stage): void {
   if (stage === t) stage = null;
+  dropWant(t.wanted);
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
   t.releaseStick();
@@ -274,6 +284,11 @@ function stageTick(): void {
     return;
   }
   const key = `${gameId(game)}@${rec.data}`;
+  if (t.mounted === `receiving:${key}`) {
+    // The owner's file, on its way from whoever has it here.
+    if (romProgress(game.sha256).state === 'have') t.mounted = '';
+    else receivingNotice(t, game);
+  }
   // A game's link is a peer-written URL this browser would fetch: asked of
   // every tick, as the theatre asks (tvConsent) — a mounted game whose
   // origin loses its consent (the node's origin losing its fingerprint
@@ -284,7 +299,7 @@ function stageTick(): void {
     t.mounted = `consent:${key}`;
     t.phase = 'waiting';
     urlConsentNotice(t, game, consent);
-  } else if (t.mounted !== key && t.mounted !== `failed:${key}` && t.mounted !== `waiting:${key}` && t.mounted !== `consent:${key}`) {
+  } else if (t.mounted !== key && t.mounted !== `failed:${key}` && t.mounted !== `waiting:${key}` && t.mounted !== `consent:${key}` && t.mounted !== `receiving:${key}`) {
     void mountGame(t, game, rec.data, key);
   }
   renderStageChrome(t);
@@ -319,6 +334,26 @@ function urlConsentNotice(t: Stage, game: ArcadeGame, consent: Exclude<MediaCons
     t.mounted = '';
     stageTick();
   });
+}
+
+/** Nobody answered an ask this long: say so, and offer the file picker. */
+const NOBODY_HERE_MS = 12_000;
+
+/** GETTING THE GAME: the owner's file on its way, or nobody here has it. */
+function receivingNotice(t: Stage, game: ArcadeGame): void {
+  const p = romProgress(game.sha256);
+  let text: string;
+  if (p.state === 'receiving') {
+    text = `GETTING ${game.name.toUpperCase()}|${Math.floor((100 * p.got) / Math.max(1, p.of))}% · from a player in the room who has it.`;
+  } else if (p.state === 'asking' && Date.now() - p.since >= NOBODY_HERE_MS) {
+    text = `WAITING FOR ${game.name.toUpperCase()}|Nobody here has sent it yet: the owner's computer sends it while they are in the room, and so does any player who has played it. Or pick your own copy below.${p.bad ? ' (A copy that came did not match the owner\'s file, so it was not used.)' : ''}`;
+  } else {
+    text = `GETTING ${game.name.toUpperCase()}|Asking the room for the owner's file…`;
+  }
+  if (text === t.lastReceiving) return;
+  t.lastReceiving = text;
+  const [title, body] = text.split('|');
+  showNotice(t, title!, escapeHtml(body!));
 }
 
 function waitingNotice(t: Stage, game: ArcadeGame): void {
@@ -373,7 +408,20 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
   }
   let bytes: Blob;
   if (!game.url) {
-    const file = localRomFor(game);
+    const got = romProgress(game.sha256);
+    const file: Blob | null = localRomFor(game) ?? (got.state === 'have' ? new Blob([got.bytes as Uint8Array<ArrayBuffer>]) : null);
+    if (!file && game.sha256 && game.size > 0 && game.size <= ROM_SHARE_MAX_BYTES) {
+      // The owner's file: ask the room for it (arcadeRomShare); the tick
+      // mounts it once it is here and checks out.
+      wantRom(game.sha256, game.size);
+      t.wanted = game.sha256;
+      t.mounted = `receiving:${key}`;
+      t.phase = 'waiting';
+      t.lastReceiving = '';
+      receivingNotice(t, game);
+      renderStageChrome(t);
+      return;
+    }
     if (!file) {
       t.mounted = `waiting:${key}`;
       t.phase = 'waiting';
@@ -478,7 +526,7 @@ function renderStageChrome(t: Stage): void {
     t.status.textContent = status;
     t.lastStatus = status;
   }
-  const waiting = t.mounted.startsWith('waiting:');
+  const waiting = t.mounted.startsWith('waiting:') || t.mounted.startsWith('receiving:');
   const controls = `<button type="button" data-arcade-standup="1">🪑 STAND UP</button>
     ${waiting ? `<label>📁 PICK YOUR COPY <input type="file" data-arcade-stage-file="1" accept="${romAcceptList()}" aria-label="Pick your copy of the game"></label>` : ''}
     <span class="arcade-stage-lane">arrows + Z X A S · ENTER start · SHIFT select · gamepads plug in · ESC stands up</span>`;
@@ -501,6 +549,8 @@ function renderStageChrome(t: Stage): void {
       }
       t.fileNote = '';
       rememberLocalRom(g, file);
+      dropWant(t.wanted); // brought their own: the room need not send it
+      t.wanted = undefined;
       t.mounted = '';
       stageTick();
     });

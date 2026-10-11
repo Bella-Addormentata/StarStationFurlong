@@ -106,6 +106,14 @@ describe('reads', () => {
     expect(sanitizeGame(null)).toBeNull();
   });
 
+  it('a file keeps its SHA-256 (the room sends it by that); a link or a malformed hash does not', () => {
+    const sha = 'ab'.repeat(32);
+    expect(sanitizeGame({ ...TETRIS, sha256: sha })).toEqual({ ...TETRIS, sha256: sha });
+    expect(sanitizeGame({ ...TETRIS, sha256: sha.toUpperCase() })).toEqual(TETRIS);
+    expect(sanitizeGame({ ...TETRIS, sha256: `${sha}0` })).toEqual(TETRIS);
+    expect(sanitizeGame({ ...PACMAN, sha256: sha })).toEqual(PACMAN);
+  });
+
   it('a built-in game is its id: rebuilt from the library, and one this build lacks is no game', () => {
     for (const lib of ARCADE_GAMES) {
       expect(builtInGame(lib.id)).toEqual({ name: lib.title, core: 'nes', url: '', size: 0, bundled: lib.id });
