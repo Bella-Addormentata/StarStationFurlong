@@ -58,6 +58,10 @@ export class NetworkProvider implements NetworkProviderPort {
   #datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #tickHandler: ((buf: Uint8Array) => void) | null = null;
   #envelopeHandler: ((env: any) => void) | null = null;
+  /** Replies to our own `faucet` requests: delivered ONLY from the stream the
+   *  request went out on, never from a node-opened stream (a peer's forwarded
+   *  envelope must not pass for the node's answer). */
+  #faucetReplyHandler: ((env: any) => void) | null = null;
   #isActive = false;
 
   #pingSent = 0;
@@ -300,12 +304,18 @@ export class NetworkProvider implements NetworkProviderPort {
    *  in the jar and the dish), `claim` (take the ready mojo to our wallet) or
    *  `give` (pay `amount` mojos from our wallet into the jar). One fresh
    *  bidirectional stream per request, the `cap` framing; the node answers on
-   *  that stream with a `faucet` envelope, which arrives through onEnvelope.
-   *  The node derives the faucet address from the room key it already holds
-   *  from `cap`, so nothing secret travels here. */
+   *  that stream with a `faucet` envelope, which arrives through onFaucetReply
+   *  and nowhere else. The node derives the faucet address from the room key
+   *  it already holds from `cap`, so nothing secret travels here.
+   *
+   *  Resolves once the request is on the wire; REJECTS when it never left
+   *  (no node connection, or the stream failed), so the caller can drop its
+   *  pending TAKE/GIVE instead of showing it until the timeout. */
   async requestFaucet(op: FaucetOp, amount?: number): Promise<void> {
     const boot = this.#boot;
-    if (!this.#wt || this.#mode === 'offline' || !boot) return;
+    if (!this.#wt || this.#mode === 'offline' || !boot) {
+      throw new Error('no connection to your node');
+    }
     try {
       const body: { op: FaucetOp; amount?: number } = { op };
       if (op === 'give') body.amount = Math.max(0, Math.floor(amount ?? 0));
@@ -323,10 +333,15 @@ export class NetworkProvider implements NetworkProviderPort {
       // finishes its side too and this stream ends instead of living (and
       // holding a node task) until disconnect — one leak per status poll.
       await writer.close();
-      // The reply comes back on THIS stream: drain it like a node-opened one.
-      void this.#drainNodeStream(stream);
+      // The reply comes back on THIS stream, and only a reply is accepted from
+      // it: the generic envelope path never sees it, and nothing that arrives
+      // on a node-opened stream can pass for it.
+      void this.#drainNodeStream(stream, (env) => {
+        if (env?.kind === 'faucet') this.#faucetReplyHandler?.(env);
+      });
     } catch (e) {
       console.warn('Failed to send faucet request to node:', e);
+      throw e instanceof Error ? e : new Error(String(e));
     }
   }
 
@@ -334,6 +349,11 @@ export class NetworkProvider implements NetworkProviderPort {
    *  (remote peers' ysync updates, bridge dial-status, future chat lanes). */
   onEnvelope(handler: (env: any) => void): void {
     this.#envelopeHandler = handler;
+  }
+
+  /** Register the handler for the node's replies to requestFaucet. */
+  onFaucetReply(handler: (env: any) => void): void {
+    this.#faucetReplyHandler = handler;
   }
 
   /** Accept and drain every bidirectional stream the NODE opens toward us.
@@ -356,7 +376,13 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
-  async #drainNodeStream(stream: { readable: ReadableStream<Uint8Array> }): Promise<void> {
+  /** Read length-framed envelopes off `stream` until it ends. Node-opened
+   *  streams deliver to the generic handler; a request stream we opened passes
+   *  its own `deliver`, so its replies never mix with forwarded traffic. */
+  async #drainNodeStream(
+    stream: { readable: ReadableStream<Uint8Array> },
+    deliver: (env: any) => void = (env) => this.#envelopeHandler?.(env),
+  ): Promise<void> {
     const reader = stream.readable.getReader();
     let buffer = new Uint8Array(0);
     try {
@@ -376,7 +402,7 @@ export class NetworkProvider implements NetworkProviderPort {
           buffer = buffer.subarray(4 + len);
           try {
             const envelope = JSON.parse(new TextDecoder().decode(payloadBytes));
-            this.#envelopeHandler?.(envelope);
+            deliver(envelope);
           } catch (e) {
             console.warn('Failed to parse node-initiated envelope:', e);
           }

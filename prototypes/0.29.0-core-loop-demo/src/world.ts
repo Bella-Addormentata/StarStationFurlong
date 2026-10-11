@@ -6229,7 +6229,8 @@ export class World {
       const request = this.onFaucetRequest;
       const ui = createFaucetDishUI({
         roomId: () => World.activeRoomId(),
-        request: (op, amount) => (request ? request(op, amount) : Promise.resolve()),
+        request: (op, amount) =>
+          request ? request(op, amount) : Promise.reject(new Error("no node request path installed")),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

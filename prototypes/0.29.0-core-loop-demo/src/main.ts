@@ -1972,13 +1972,12 @@ async function joinRoomAtEpoch(
         return;
       }
       // 🥣 Faucet lane (#231 onboarding): the node answers the dish's
-      // status / take / give requests on the stream they came in on; the
-      // reply lands in faucetDish.ts, which the fixture and its screen read.
-      if (env.kind === "faucet" && typeof env.payload === "string" && typeof env.room === "string") {
-        const reply = parseFaucetReply(env.payload);
-        if (reply) setFaucetReply(env.room, reply);
-        return;
-      }
+      // status / take / give requests on the stream they came in on, and that
+      // reply reaches faucetDish.ts through onFaucetReply below. A `faucet`
+      // envelope on a node-opened stream is NOT the node's answer (the node
+      // drops peer-sent ones, but an older node forwards them), so it is
+      // ignored here: nothing a room peer sends may set the dish's address.
+      if (env.kind === "faucet") return;
       if (env.kind === "bridge" && typeof env.payload === "string") {
         try {
           const status = JSON.parse(atob(env.payload)) as {
@@ -9894,6 +9893,11 @@ async function init() {
   // reads ~1 Hz for the jar level and the mojo in the dish. A slow poll keeps
   // the prop honest for players who never focus the screen (18.75 s blocks).
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
+  networkProvider.onFaucetReply((env: { payload?: string; room?: string }) => {
+    if (typeof env.payload !== "string" || typeof env.room !== "string") return;
+    const reply = parseFaucetReply(env.payload);
+    if (reply) setFaucetReply(env.room, reply);
+  });
   window.setInterval(() => {
     if (world.hasFaucetDish()) networkProvider.requestFaucet("status").catch(() => {});
   }, 60_000);

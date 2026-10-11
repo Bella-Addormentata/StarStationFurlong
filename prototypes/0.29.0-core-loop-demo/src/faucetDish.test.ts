@@ -5,7 +5,9 @@ import {
   blocksToMinutes,
   clearFaucetRoom,
   dishLine,
+  failFaucetRequest,
   faucetPending,
+  latestFaucetError,
   formatMojos,
   jarLevel,
   latestFaucetStatus,
@@ -159,6 +161,20 @@ describe('faucet dish: per-room store', () => {
     expect(faucetPending(room, 21_000)).toBeNull();
     markFaucetPending(room, 'claim', 30_000);
     expect(faucetPending(room, 30_000 + 120_001)).toBeNull();
+    clearFaucetRoom(room);
+  });
+
+  it('drops a pending take at once when the request never reached the node, and says why', () => {
+    const room = 'home-store-3';
+    clearFaucetRoom(room);
+    markFaucetPending(room, 'claim', 1_000);
+    expect(faucetPending(room, 2_000)).toBe('claim');
+    failFaucetRequest(room, 'claim', new Error('no connection to your node'));
+    expect(faucetPending(room, 2_000)).toBeNull();
+    expect(latestFaucetError(room)).toBe('the request did not reach your node (no connection to your node)');
+    // A status that does arrive later clears the error.
+    setFaucetReply(room, { op: 'status', ok: true, status: status() });
+    expect(latestFaucetError(room)).toBeNull();
     clearFaucetRoom(room);
   });
 });

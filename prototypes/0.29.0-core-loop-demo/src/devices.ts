@@ -245,6 +245,7 @@ import { readStore as readPlanetStore, subscribePlanetSummary } from './planetSu
 import { chipsFor, drawChips, groupChips } from './chipDisplay';
 import {
   dishLine,
+  failFaucetRequest,
   faucetPending,
   formatMojos,
   jarLevel,
@@ -4663,6 +4664,12 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
   let pollTimer: number | null = null;
   let copied = false;
 
+  /** Ask the node for a status; a request that cannot leave is shown as such
+   *  (the screen otherwise reads "READING THE CHAIN…" with no node at all). */
+  const poll = (roomId: string): void => {
+    deps.request('status').catch((e: unknown) => failFaucetRequest(roomId, 'status', e));
+  };
+
   const render = (): void => {
     if (!panel) return;
     const roomId = deps.roomId();
@@ -4738,15 +4745,20 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         SSF FAUCET DISH v1 · a keyless Chia coin per room · one gift per coin per ${st?.gap ?? 32} blocks · testnet11
       </div>
     `;
-    panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => {
-      markFaucetPending(roomId, 'claim');
-      void deps.request('claim').then(() => window.setTimeout(() => void deps.request('status'), 2_000));
-    });
+    // A TAKE or GIVE is pending from the click until a status shows it landed
+    // (or the node refuses). A request that never reaches the node rejects,
+    // and the pending state goes with it: otherwise TAKING…/GIVING… would show
+    // for the whole timeout after a disconnect (#245 review, round 3).
+    const send = (op: FaucetOp, amount?: number): void => {
+      markFaucetPending(roomId, op);
+      deps.request(op, amount).then(
+        () => window.setTimeout(() => poll(roomId), 2_000),
+        (e: unknown) => failFaucetRequest(roomId, op, e),
+      );
+    };
+    panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => send('claim'));
     FAUCET_GIVE_AMOUNTS.forEach((g, i) => {
-      panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => {
-        markFaucetPending(roomId, 'give');
-        void deps.request('give', g.mojos).then(() => window.setTimeout(() => void deps.request('status'), 2_000));
-      });
+      panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => send('give', g.mojos));
     });
     panel.querySelector<HTMLButtonElement>('#faucet-copy')?.addEventListener('click', () => {
       if (!st) return;
@@ -4775,8 +4787,8 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       host.appendChild(panel);
       unsubscribe = subscribeFaucet(() => render());
       render();
-      void deps.request('status');
-      pollTimer = window.setInterval(() => void deps.request('status'), FAUCET_SCREEN_POLL_MS);
+      poll(deps.roomId());
+      pollTimer = window.setInterval(() => poll(deps.roomId()), FAUCET_SCREEN_POLL_MS);
     },
     unmount(): void {
       if (pollTimer !== null) window.clearInterval(pollTimer);

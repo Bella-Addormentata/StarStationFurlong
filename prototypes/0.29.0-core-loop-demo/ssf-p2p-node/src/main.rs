@@ -2543,6 +2543,23 @@ fn handle_iroh_connection(
                         // control envelope must be sig-Valid (not merely Unsigned, which
                         // warn-mode would wave through) or it is dropped, so a forged/unsigned
                         // roster entry can't hijack routing.
+                        // ⛓️ Node-local lanes never arrive from a peer. `cap` (the room
+                        // key + flags) and `faucet` (the dish's request and reply) are
+                        // spoken only between this node and ITS loopback browser, and
+                        // `bridge` only by this node to its tabs; none is ever relayed,
+                        // so one coming in over iroh is a forgery. Dropped here, before
+                        // dedup, the tab forward and the hub relay: forwarded, a peer's
+                        // `faucet` envelope would reach the local tabs as if this node
+                        // had answered, and a spoofed status could put an attacker's
+                        // address under the dish's COPY button (#245 review, round 3).
+                        if is_local_lane_kind(&envelope.kind) {
+                            eprintln!(
+                                "🔒 LANE-DROP {} from remote peer {} (node-local kind, never relayed)",
+                                envelope.kind, remote_id
+                            );
+                            continue;
+                        }
+
                         if is_control_kind(&envelope.kind) {
                             if control_should_admit(&envelope) {
                                 dispatch_control(&hub_clone, room_id, remote_id, &envelope).await;
@@ -2953,6 +2970,15 @@ struct IdsPayload {
 /// the reader loop's branch and any future sender agree on the set.
 fn is_control_kind(kind: &str) -> bool {
     matches!(kind, "roster" | "mesh-join" | "graft" | "prune" | "px" | "ihave" | "iwant")
+}
+
+/// Kinds this node speaks only with its own browser tabs (`cap` and `faucet`
+/// in from the loopback browser, `faucet` and `bridge` out to the tabs). They
+/// are consumed or authored locally and never relayed, so one arriving from a
+/// remote peer is dropped at the iroh ingress before it can be forwarded to
+/// the tabs as if the node had said it.
+fn is_local_lane_kind(kind: &str) -> bool {
+    matches!(kind, "cap" | "faucet" | "bridge")
 }
 
 /// M5.0 STRICT admission: a control envelope must be sig-Valid. Unlike

@@ -62,9 +62,17 @@ pub const PENDING_SPEND_TTL: Duration = Duration::from_secs(180);
 /// started in that window would pick the same coin and die in the mempool as a
 /// double-spend; with the lease it skips them. (The heartbeat's one-publish-per-
 /// tick rule serialized its own publishes; this covers every writer.)
+///
+/// The faucet dish's TAKE is the one spend INTO our wallet: it runs under
+/// `gate` too (its "is my wallet empty" courtesy check, coin pick and push are
+/// one critical section) and records in `incoming` that a gift is landing.
+/// Until that gift confirms the chain still shows the wallet empty, so without
+/// the marker a second TAKE in that window would pass the courtesy check and
+/// draw another mojo from another ready coin (#245 review, round 3).
 pub struct WalletLease {
     gate: tokio::sync::Mutex<()>,
     pending: std::sync::Mutex<HashMap<Bytes32, Instant>>,
+    incoming: std::sync::Mutex<Option<Instant>>,
 }
 
 /// The process-wide lease: one wallet per node, so one lease.
@@ -72,7 +80,11 @@ pub static WALLET_LEASE: std::sync::LazyLock<WalletLease> = std::sync::LazyLock:
 
 impl WalletLease {
     pub fn new() -> Self {
-        Self { gate: tokio::sync::Mutex::new(()), pending: std::sync::Mutex::new(HashMap::new()) }
+        Self {
+            gate: tokio::sync::Mutex::new(()),
+            pending: std::sync::Mutex::new(HashMap::new()),
+            incoming: std::sync::Mutex::new(None),
+        }
     }
 
     /// Hold the guard across select → build → push.
@@ -101,6 +113,33 @@ impl WalletLease {
         let mut pending = self.pending.lock().unwrap();
         pending.retain(|_, at| now.duration_since(*at) < PENDING_SPEND_TTL);
         pending.contains_key(coin_id)
+    }
+
+    /// Record that a gift INTO our wallet (a faucet claim) was just pushed.
+    pub fn mark_incoming(&self) {
+        self.mark_incoming_at(Instant::now());
+    }
+
+    pub fn mark_incoming_at(&self, now: Instant) {
+        *self.incoming.lock().unwrap() = Some(now);
+    }
+
+    /// A pushed gift to our wallet is still inside the TTL: the wallet is not
+    /// empty even though the chain does not list the coin yet.
+    pub fn incoming_pending(&self) -> bool {
+        self.incoming_pending_at(Instant::now())
+    }
+
+    pub fn incoming_pending_at(&self, now: Instant) -> bool {
+        let mut slot = self.incoming.lock().unwrap();
+        match *slot {
+            Some(at) if now.duration_since(at) < PENDING_SPEND_TTL => true,
+            Some(_) => {
+                *slot = None;
+                false
+            }
+            None => false,
+        }
     }
 }
 
@@ -408,6 +447,19 @@ mod tests {
         assert!(!lease.is_pending_at(&b, t0 + Duration::from_secs(1)));
         // Confirmed long ago (or dropped by the mempool): the coin is fair game again.
         assert!(!lease.is_pending_at(&a, t0 + PENDING_SPEND_TTL));
+    }
+
+    #[test]
+    fn wallet_lease_remembers_a_landing_gift_for_the_ttl() {
+        let lease = WalletLease::new();
+        let t0 = Instant::now();
+        assert!(!lease.incoming_pending_at(t0));
+        lease.mark_incoming_at(t0);
+        // A second TAKE a moment later sees the first one still landing…
+        assert!(lease.incoming_pending_at(t0 + Duration::from_secs(1)));
+        assert!(lease.incoming_pending_at(t0 + PENDING_SPEND_TTL - Duration::from_secs(1)));
+        // …and once the TTL is up the chain's own view (owned coins) decides again.
+        assert!(!lease.incoming_pending_at(t0 + PENDING_SPEND_TTL));
     }
 
     #[test]

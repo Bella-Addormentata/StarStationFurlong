@@ -17,9 +17,12 @@
 //! from. Publish side (`chia-publish` with the wallet loaded, i.e.
 //! `SSF_CHIA_LANE=1`): the CLAIM spend — keyless, puzzle reveal + solution and an
 //! EMPTY aggregated signature, the faucet coin the spend's only input — and the
-//! GIVE spend, our standard-puzzle coins paying into the faucet address under
-//! the wallet spend lease (`chia_publish::WALLET_LEASE`). Testnet11 only until
-//! P8 (every gift and donation links addresses on a public chain).
+//! GIVE spend, our standard-puzzle coins paying into the faucet address. Both
+//! run under the wallet spend lease (`chia_publish::WALLET_LEASE`): GIVE so it
+//! never picks a coin another spend is consuming, CLAIM so the courtesy check,
+//! the coin pick and the push are one critical section and a gift still
+//! landing counts as a coin in the wallet. Testnet11 only until P8 (every gift
+//! and donation links addresses on a public chain).
 #![cfg(feature = "chia-read")]
 
 use std::collections::HashMap;
@@ -394,9 +397,14 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
                 st.wallet_spendable_mojos = Some(wallet.spendable_mojos());
                 st.can_give = wallet.spendable_mojos() >= params.gift;
                 // The courtesy check reads what we OWN: a coin parked by a spend
-                // in flight is still ours, so the wallet is not empty.
-                st.can_claim = wallet.owned.is_empty() && st.ready > 0;
-                st.note = if !wallet.owned.is_empty() && st.ready > 0 {
+                // in flight is still ours, so the wallet is not empty. A gift
+                // from the dish that is still landing counts the same way (the
+                // chain lists it only once the block confirms).
+                let landing = crate::chia_publish::WALLET_LEASE.incoming_pending();
+                st.can_claim = wallet.owned.is_empty() && !landing && st.ready > 0;
+                st.note = if wallet.owned.is_empty() && landing {
+                    "your mojo from the dish is on its way (about a minute); the wallet shows it when the block lands".into()
+                } else if !wallet.owned.is_empty() && st.ready > 0 {
                     "the dish is for players with an empty wallet; yours already holds a coin".into()
                 } else if wallet.owned.is_empty() && st.ready == 0 {
                     "no mojo in the dish yet; it refills on the block clock".into()
@@ -481,6 +489,19 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
         .wallet
         .as_ref()
         .ok_or_else(|| anyhow!("no wallet loaded: start the node with SSF_CHIA_LANE=1 to take a mojo"))?;
+    // One TAKE at a time, serialized with every other wallet writer: the
+    // courtesy check, the coin pick and the push are one critical section, and
+    // a gift still landing counts as a coin in the wallet. Without this, two
+    // loopback requests could both see an empty wallet before either gift
+    // confirms and each draw a mojo from a different ready coin (#245 review,
+    // round 3). The lease is held across the gateway reads, as the heartbeat
+    // holds it across its own.
+    let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
+    if crate::chia_publish::WALLET_LEASE.incoming_pending() {
+        return Err(anyhow!(
+            "your mojo from the dish is still on its way (about a minute); the wallet shows it when the block lands"
+        ));
+    }
     // Owned, not spendable: a coin parked by a spend in flight is still ours.
     if !wallet_view(client, sk).await?.owned.is_empty() {
         return Err(anyhow!("your wallet already holds a coin; the dish is for players with an empty wallet"));
@@ -514,8 +535,10 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
     // Keyless: no AGG_SIG condition anywhere, so the aggregate is the identity.
     let bundle = SpendBundle::new(vec![coin_spend], chia_bls::Signature::default());
     push(client, bundle).await?;
-    // Not our coin, but a second TAKE before this one confirms must not pick it.
+    // Not our coin, but a second TAKE before this one confirms must not pick it;
+    // and until the gift lands our wallet counts as holding it.
     crate::chia_publish::WALLET_LEASE.mark_spent([target.coin.coin_id()]);
+    crate::chia_publish::WALLET_LEASE.mark_incoming();
     println!(
         "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
         params.gift,

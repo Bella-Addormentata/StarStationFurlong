@@ -244,6 +244,14 @@ export function setFaucetReply(roomId: string, reply: FaucetReply): void {
   notify();
 }
 
+/** A request never reached the node (no connection, a failed stream): no spend
+ *  was made, so a pending TAKE/GIVE is dropped at once instead of showing until
+ *  the timeout, and the screen says why. */
+export function failFaucetRequest(roomId: string, op: FaucetOp, reason: unknown): void {
+  const why = reason instanceof Error ? reason.message : String(reason ?? 'unknown error');
+  setFaucetReply(roomId, { op, ok: false, error: `the request did not reach your node (${why})` });
+}
+
 export function subscribeFaucet(cb: () => void): () => void {
   listeners.add(cb);
   return () => {
