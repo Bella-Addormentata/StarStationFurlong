@@ -175,8 +175,10 @@ const localHold = new Set<string>();
 const MAX_BETS_DRAWN_PER_PLAYER = 400;
 const MAX_STACK_CHIPS = 60;
 /** And a table-wide chip budget, so many modest peer records can't grow the
- *  GPU pools without limit either. Players draw in player-id order, so every
- *  client draws the same chips in the same slots. */
+ *  GPU pools without limit either. The budget is spent in player-id order,
+ *  the same on every client, so everyone draws the same chips of everyone
+ *  else; your own bets are always drawn for you (you need them to take them
+ *  back), spending the budget exactly as they would on anyone's screen. */
 const MAX_TABLE_CHIPS = 2400;
 
 /** chipsFor, stopping at `max` chips (largest first) without looping per chip. */
@@ -203,9 +205,10 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
   let budget = MAX_TABLE_CHIPS;
   for (const pid of pidOrder) {
     const bets = betsByPlayer[pid];
-    if (budget <= 0) break;
+    const mine = pid === me;
+    if (budget <= 0 && !mine) continue;
     for (const b of bets.slice(0, MAX_BETS_DRAWN_PER_PLAYER)) {
-      if (budget <= 0) break;
+      if (budget <= 0 && !mine) break;
       const rect = rectFor(b, pid);
       if (!rect) continue;
       const key = `${spotKey(b)}|${rect.x0.toFixed(3)},${rect.z0.toFixed(3)}`;
@@ -218,8 +221,9 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
       if (list.length >= MAX_STACK_CHIPS) continue;
       // One chip per bet record when it's a real chip; any other stake (an
       // older client's 10 or 250) shows as the chips it breaks into.
-      const add = chipsUpTo(b.amount, Math.min(MAX_STACK_CHIPS - list.length, budget));
-      budget -= add.length;
+      const room = MAX_STACK_CHIPS - list.length;
+      const add = chipsUpTo(b.amount, mine ? room : Math.min(room, budget));
+      budget -= Math.min(add.length, Math.max(0, budget));
       list.push(...add);
       g.chips.set(pid, list);
     }
@@ -293,6 +297,9 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     rt.thrownSeed = t.seed;
     localHold.delete(id);
     h.diceThrow({ x: t.sx, z: t.sz }, { x: t.dx, z: t.dz }, t.power, t.seed);
+    // The settle can reach this client before the throw (two writers): the
+    // roll already landed here, so give the new flight its faces at once.
+    if (s.phase === 'settled' && s.dice && rt.landedRound === s.round) h.diceLand(s.dice);
   }
   if (s.phase === 'settled' && s.dice && rt.landedRound !== s.round) {
     rt.landedRound = s.round;
@@ -396,6 +403,11 @@ type AnyBet = { type: string; pick?: number; amount: number };
 
 const sumOf = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0);
 
+/** Each table's take-back ledger for this player (the chips they put down
+ *  this betting window, by spot), outliving the focused UI. One entry per
+ *  table visited; tagged with the room doc and round it belongs to. */
+const takeBackLedgers = new Map<string, { epoch: number; round: number; added: Map<string, number[]> }>();
+
 /** "Forward" for a player at `stand` (table-local): away from their own
  *  rail, toward the far side. */
 function inwardFrom(stand: FeltPoint, halfZ: number): FeltPoint {
@@ -445,6 +457,19 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  back — a craps bet from an earlier roll is a contract on the felt). */
   let added = new Map<string, number[]>();
   let windowRound = -1;
+  // Kept across focus: stepping away and back mid-round keeps what you may
+  // take back (this room doc, this table, this round only).
+  const ledgerKey = `${itemId}|${me}`;
+  const saveLedger = (): void => {
+    takeBackLedgers.set(ledgerKey, { epoch: casinoDocEpoch(), round: windowRound, added });
+  };
+  {
+    const saved = takeBackLedgers.get(ledgerKey);
+    if (saved && saved.epoch === casinoDocEpoch()) {
+      added = saved.added;
+      windowRound = saved.round;
+    }
+  }
   /** round → verdict of the fairness check, so the card never re-hashes. */
   const verdicts = new Map<number, boolean>();
   /** The room doc this focus began in: rounds and bets from another room's
@@ -455,6 +480,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     mountEpoch = casinoDocEpoch();
     windowRound = -1;
     added = new Map();
+    saveLedger();
     verdicts.clear();
     hand = [];
     pickup = null;
@@ -502,6 +528,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       windowRound = r;
       added = new Map();
     }
+    saveLedger();
   };
 
   /** Tell a screen reader, without the on-screen notice. A trailing
