@@ -270,6 +270,10 @@ function clearance(seat: number, pose: HeadPose, others: OtherHead[]): number {
  * one (the other moved into it) may still move in any way that doesn't close
  * the gap further — so two locked heads always come apart.
  */
+/** Sweep sample spacing (rad of swing, or m of lunge): finer than any
+ *  overlap a head pair can have, so no move passes through a neighbour. */
+const SWEEP_STEP = 0.02;
+
 export function resolveHeadPose(
   seat: number,
   from: HeadPose,
@@ -278,26 +282,38 @@ export function resolveHeadPose(
 ): HeadPose {
   const target = clampPose(to);
   const start = clampPose(from);
-  const cTo = clearance(seat, target, others);
-  if (cTo >= 0) return target;
+  const at = (t: number): HeadPose => ({
+    swing: start.swing + (target.swing - start.swing) * t,
+    ext: start.ext + (target.ext - start.ext) * t,
+  });
   const cFrom = clearance(seat, start, others);
-  if (cFrom < 0) return cTo >= cFrom ? target : start;
-  // Binary search the last free point on the straight line from → to.
+  if (cFrom < 0) {
+    const cTo = clearance(seat, target, others);
+    return cTo >= cFrom ? target : start;
+  }
+  // Sweep the straight line from → to: a big mouse jump can land clear on
+  // the far side of a neighbour, so the end pose alone isn't enough. Find
+  // the first sample that overlaps…
+  const span = Math.max(Math.abs(target.swing - start.swing), Math.abs(target.ext - start.ext));
+  const samples = Math.max(1, Math.ceil(span / SWEEP_STEP));
   let lo = 0;
-  let hi = 1;
+  let hi = -1;
+  for (let i = 1; i <= samples; i++) {
+    const t = i / samples;
+    if (clearance(seat, at(t), others) < 0) {
+      hi = t;
+      break;
+    }
+    lo = t;
+  }
+  if (hi < 0) return target;
+  // …then binary search the last free point inside that bracket.
   for (let i = 0; i < 14; i++) {
     const mid = (lo + hi) / 2;
-    const p = {
-      swing: start.swing + (target.swing - start.swing) * mid,
-      ext: start.ext + (target.ext - start.ext) * mid,
-    };
-    if (clearance(seat, p, others) >= 0) lo = mid;
+    if (clearance(seat, at(mid), others) >= 0) lo = mid;
     else hi = mid;
   }
-  return {
-    swing: start.swing + (target.swing - start.swing) * lo,
-    ext: start.ext + (target.ext - start.ext) * lo,
-  };
+  return at(lo);
 }
 
 // ── Bite timeline (shared by the session and the in-world head) ──────────────

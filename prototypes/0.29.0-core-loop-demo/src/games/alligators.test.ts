@@ -236,6 +236,21 @@ describe('head geometry', () => {
     expect(resolveHeadPose(0, overlapped, { swing: -0.5, ext: 0 }, inside).swing).toBeCloseTo(-0.4);
   });
 
+  it("doesn't let a big swing jump clean through a neighbour", () => {
+    // Both ends are clear of seat 1, but the swing between them crosses it.
+    const others = [{ seat: 1, pose: { swing: 0.2, ext: 0 } }];
+    const from = { swing: -1, ext: 0 };
+    const to = { swing: -0.45, ext: 0 };
+    expect(headGap(0, from, 1, others[0].pose)).toBeGreaterThan(0);
+    expect(headGap(0, to, 1, others[0].pose)).toBeGreaterThan(0);
+    const got = resolveHeadPose(0, from, to, others);
+    expect(got.swing).toBeLessThan(to.swing - 0.05);
+    for (let t = 0; t <= 1; t += 0.01) {
+      const p = { swing: from.swing + (got.swing - from.swing) * t, ext: 0 };
+      expect(headGap(0, p, 1, others[0].pose)).toBeGreaterThanOrEqual(-1e-3);
+    }
+  });
+
   it('lunges along the swing, and a blocked lunge stops short', () => {
     const free = resolveHeadPose(0, { swing: 0, ext: 0 }, { swing: 0, ext: IA_LUNGE }, []);
     expect(free.ext).toBeCloseTo(IA_LUNGE);
