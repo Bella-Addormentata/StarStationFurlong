@@ -220,6 +220,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
     }))?;
     let coin_a = {
         let _lease = WALLET_LEASE.lock().await;
+        WALLET_LEASE.reconcile(&client).await;
         let coin = find_spendable_coin(&client, our_ph)
             .await?
             .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; fund it at a testnet11 faucet"))?;
@@ -238,6 +239,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
     }))?;
     let coin_b = {
         let _lease = WALLET_LEASE.lock().await;
+        WALLET_LEASE.reconcile(&client).await;
         let coin = find_spendable_coin(&client, our_ph)
             .await?
             .ok_or_else(|| anyhow!("no spendable coin for the reveal (the commit's change not confirmed yet?)"))?;

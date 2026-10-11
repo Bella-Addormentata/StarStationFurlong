@@ -402,6 +402,9 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
     {
         match &ctx.wallet {
             Some(sk) => {
+                // What the chain and the mempool say about parked coins decides
+                // what reads as confirming or landing, not a timer.
+                crate::chia_publish::WALLET_LEASE.reconcile(client).await;
                 let wallet = wallet_view(client, sk).await?;
                 st.wallet_mojos = Some(wallet.owned_mojos());
                 st.wallet_spendable_mojos = Some(wallet.spendable_mojos());
@@ -513,12 +516,14 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
         .ok_or_else(|| anyhow!("no wallet loaded: start the node with SSF_CHIA_LANE=1 to take a mojo"))?;
     // One TAKE at a time, serialized with every other wallet writer: the
     // courtesy check, the coin pick and the push are one critical section, and
-    // a gift still landing counts as a coin in the wallet. Without this, two
-    // loopback requests could both see an empty wallet before either gift
+    // a gift still landing (its faucet coin parked until the chain or the
+    // mempool settles the claim) counts as a coin in the wallet. Without this,
+    // two loopback requests could both see an empty wallet before either gift
     // confirms and each draw a mojo from a different ready coin (#245 review,
     // round 3). The lease is held across the gateway reads, as the heartbeat
     // holds it across its own.
     let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
+    crate::chia_publish::WALLET_LEASE.reconcile(client).await;
     if crate::chia_publish::WALLET_LEASE.incoming_pending() {
         return Err(anyhow!(
             "your mojo from the dish is still on its way (about a minute); the wallet shows it when the block lands"
@@ -558,9 +563,10 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
     let bundle = SpendBundle::new(vec![coin_spend], chia_bls::Signature::default());
     push(client, bundle).await?;
     // Not our coin, but a second TAKE before this one confirms must not pick it;
-    // and until the gift lands our wallet counts as holding it.
+    // and while it stays parked (until the chain or the mempool settles the
+    // claim) our wallet counts as holding the gift.
     crate::chia_publish::WALLET_LEASE.mark_spent([target.coin.coin_id()]);
-    crate::chia_publish::WALLET_LEASE.mark_incoming();
+    crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id());
     println!(
         "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
         params.gift,
@@ -604,6 +610,7 @@ async fn give(
     // Select, build and push under the lease: the heartbeat (or a second GIVE)
     // must not pick the same coins before this spend confirms.
     let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
+    crate::chia_publish::WALLET_LEASE.reconcile(client).await;
     let wallet = wallet_view(client, sk).await?;
     if wallet.owned.is_empty() {
         return Err(anyhow!("your wallet is empty; fund it first (the dish takes, it does not lend)"));

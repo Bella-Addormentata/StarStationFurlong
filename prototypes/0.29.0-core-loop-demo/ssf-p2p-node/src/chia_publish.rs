@@ -47,32 +47,50 @@ pub fn our_puzzle_hash(chia_sk: &SecretKey) -> Bytes32 {
     StandardArgs::curry_tree_hash(synthetic_pk).into()
 }
 
-/// How long a coin we pushed a spend for stays off-limits to the next spend.
-/// Testnet11 confirms in about a block (18.75 s); three minutes covers a slow
-/// block without parking a coin for long should the mempool drop the spend.
-pub const PENDING_SPEND_TTL: Duration = Duration::from_secs(180);
+/// A spend pushed a moment ago may not show on the gateway yet (its coins still
+/// unspent, the mempool item not indexed): parked coins younger than this are
+/// not asked about. Testnet11 confirms in about a block (18.75 s).
+pub const RECONCILE_GRACE: Duration = Duration::from_secs(20);
+
+/// The one place wall time decides anything: a parked coin the gateway could
+/// NOT settle (its lookups failing, or a gateway without the mempool endpoint)
+/// is released after this long rather than parking the wallet for good. A spend
+/// still unconfirmed after an hour has left the mempool.
+pub const PENDING_FALLBACK_TTL: Duration = Duration::from_secs(3600);
 
 /// 🔒 Wallet spend lease (#245 review). Every spend from OUR wallet — the
 /// presence heartbeat (`publish_presence`, also the startup publish hook), the
 /// craps fairness hook's commit and reveal (`chia_craps_fair`), the faucet
 /// dish's GIVE (`chia_faucet`) — selects its coins, builds and pushes while
-/// holding `gate`, and records the coin ids it consumed in `pending` for
-/// [`PENDING_SPEND_TTL`]. Until a pushed spend
-/// confirms, the chain still lists its coins as unspent, so a second spend
-/// started in that window would pick the same coin and die in the mempool as a
-/// double-spend; with the lease it skips them. (The heartbeat's one-publish-per-
-/// tick rule serialized its own publishes; this covers every writer.)
+/// holding `gate`, and records the coin ids it consumed in `pending`. Until a
+/// pushed spend confirms, the chain still lists its coins as unspent, so a
+/// second spend started in that window would pick the same coin and die in the
+/// mempool as a double-spend; with the lease it skips them. (The heartbeat's
+/// one-publish-per-tick rule serialized its own publishes; this covers every
+/// writer.)
+///
+/// A parked coin is released by what the chain and the mempool say, not by a
+/// timer (#245 review, round 7: a zero-fee spend can wait in the mempool for
+/// longer than any fixed window). [`WalletLease::reconcile`], run by every
+/// writer under the lease before it selects and by the dish's status read,
+/// releases a coin whose spend CONFIRMED (the chain lists it spent: it is
+/// gone) or was DROPPED (still unspent on chain and no longer in the mempool:
+/// it is free again), and keeps one whose spend still waits in the mempool,
+/// however long that takes.
 ///
 /// The faucet dish's TAKE is the one spend INTO our wallet: it runs under
 /// `gate` too (its "is my wallet empty" courtesy check, coin pick and push are
-/// one critical section) and records in `incoming` that a gift is landing.
-/// Until that gift confirms the chain still shows the wallet empty, so without
-/// the marker a second TAKE in that window would pass the courtesy check and
-/// draw another mojo from another ready coin (#245 review, round 3).
+/// one critical section) and records in `incoming` the faucet coin its claim
+/// spent. Until that claim confirms the chain still shows the wallet empty, so
+/// without the marker a second TAKE in that window would pass the courtesy
+/// check and draw another mojo from another ready coin (#245 review, round 3).
+/// The gift reads as landing exactly while that coin is parked: confirmed, it
+/// is in the wallet and the owned-coins check takes over; dropped, the wallet
+/// is still empty and the dish may be asked again.
 pub struct WalletLease {
     gate: tokio::sync::Mutex<()>,
     pending: std::sync::Mutex<HashMap<Bytes32, Instant>>,
-    incoming: std::sync::Mutex<Option<Instant>>,
+    incoming: std::sync::Mutex<Option<Bytes32>>,
 }
 
 /// The process-wide lease: one wallet per node, so one lease.
@@ -104,43 +122,127 @@ impl WalletLease {
         }
     }
 
-    /// A coin some spend was pushed for inside the TTL: skip it when selecting.
+    /// A coin some pushed spend consumed, as far as the chain and the mempool
+    /// have told us (see [`WalletLease::reconcile`]): skip it when selecting.
     pub fn is_pending(&self, coin_id: &Bytes32) -> bool {
         self.is_pending_at(coin_id, Instant::now())
     }
 
     pub fn is_pending_at(&self, coin_id: &Bytes32, now: Instant) -> bool {
         let mut pending = self.pending.lock().unwrap();
-        pending.retain(|_, at| now.duration_since(*at) < PENDING_SPEND_TTL);
+        // The fallback only: an entry the gateway never settled (see above).
+        pending.retain(|_, at| now.duration_since(*at) < PENDING_FALLBACK_TTL);
         pending.contains_key(coin_id)
     }
 
-    /// Record that a gift INTO our wallet (a faucet claim) was just pushed.
-    pub fn mark_incoming(&self) {
-        self.mark_incoming_at(Instant::now());
+    /// Record the faucet coin a claim just spent: the gift INTO our wallet is
+    /// landing for as long as that coin stays parked.
+    pub fn mark_incoming(&self, faucet_coin: Bytes32) {
+        *self.incoming.lock().unwrap() = Some(faucet_coin);
     }
 
-    pub fn mark_incoming_at(&self, now: Instant) {
-        *self.incoming.lock().unwrap() = Some(now);
-    }
-
-    /// A pushed gift to our wallet is still inside the TTL: the wallet is not
-    /// empty even though the chain does not list the coin yet.
+    /// A gift to our wallet is still landing: the wallet is not empty even
+    /// though the chain does not list the coin yet.
     pub fn incoming_pending(&self) -> bool {
         self.incoming_pending_at(Instant::now())
     }
 
     pub fn incoming_pending_at(&self, now: Instant) -> bool {
-        let mut slot = self.incoming.lock().unwrap();
-        match *slot {
-            Some(at) if now.duration_since(at) < PENDING_SPEND_TTL => true,
+        let coin = *self.incoming.lock().unwrap();
+        match coin {
+            Some(id) if self.is_pending_at(&id, now) => true,
             Some(_) => {
-                *slot = None;
+                *self.incoming.lock().unwrap() = None;
                 false
             }
             None => false,
         }
     }
+
+    /// The parked coins old enough to ask the gateway about.
+    pub fn due_at(&self, now: Instant) -> Vec<Bytes32> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) >= RECONCILE_GRACE)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Forget parked coins the chain or the mempool settled.
+    pub fn release(&self, coin_ids: &[Bytes32]) {
+        let mut pending = self.pending.lock().unwrap();
+        for id in coin_ids {
+            pending.remove(id);
+        }
+    }
+
+    /// Settle the parked coins against the chain and the mempool: ask the
+    /// gateway about every coin past the grace, then release what [`settle`]
+    /// says. Lookups that fail leave their coins parked (the fallback TTL
+    /// bounds that); nothing here is decided by the clock.
+    pub async fn reconcile(&self, client: &CoinsetClient) {
+        let due = self.due_at(Instant::now());
+        if due.is_empty() {
+            return;
+        }
+        let records = match client
+            .get_coin_records_by_names(due.clone(), None, None, Some(true), None)
+            .await
+        {
+            Ok(resp) if resp.success => resp.coin_records.unwrap_or_default(),
+            Ok(resp) => {
+                eprintln!("⛓️ wallet lease: coin lookup unsuccessful ({:?}); parked coins stay parked", resp.error);
+                return;
+            }
+            Err(e) => {
+                eprintln!("⛓️ wallet lease: coin lookup failed ({e}); parked coins stay parked");
+                return;
+            }
+        };
+        let spent_on_chain: HashMap<Bytes32, bool> = records.iter().map(|r| (r.coin.coin_id(), r.spent)).collect();
+        // Only a coin the chain still lists unspent needs the mempool's word.
+        let mut in_mempool: HashMap<Bytes32, Option<bool>> = HashMap::new();
+        for id in due.iter().filter(|id| spent_on_chain.get(*id) == Some(&false)) {
+            let seen = match client.get_mempool_items_by_coin_name(*id).await {
+                Ok(resp) if resp.success => Some(resp.mempool_items.is_some_and(|items| !items.is_empty())),
+                Ok(resp) => {
+                    eprintln!("⛓️ wallet lease: mempool lookup unsuccessful ({:?}); coin stays parked", resp.error);
+                    None
+                }
+                Err(e) => {
+                    eprintln!("⛓️ wallet lease: mempool lookup failed ({e}); coin stays parked");
+                    None
+                }
+            };
+            in_mempool.insert(*id, seen);
+        }
+        let released = settle(&due, &spent_on_chain, &in_mempool);
+        if !released.is_empty() {
+            self.release(&released);
+        }
+    }
+}
+
+/// Which parked coins to release, from what the chain and the mempool said:
+/// SPENT on chain, the spend confirmed and the coin is gone; UNSPENT and not in
+/// the mempool, the spend was dropped and the coin is free again; unspent and
+/// still in the mempool (or the mempool could not be asked, `None`), it stays
+/// parked; not on the chain at all, there is nothing to double-spend.
+pub fn settle(
+    due: &[Bytes32],
+    spent_on_chain: &HashMap<Bytes32, bool>,
+    in_mempool: &HashMap<Bytes32, Option<bool>>,
+) -> Vec<Bytes32> {
+    due.iter()
+        .copied()
+        .filter(|id| match spent_on_chain.get(id) {
+            Some(true) => true,
+            Some(false) => in_mempool.get(id).copied().flatten() == Some(false),
+            None => true,
+        })
+        .collect()
 }
 
 impl Default for WalletLease {
@@ -409,6 +511,7 @@ pub async fn publish_presence(
     //    so no other writer picks the same coin before this spend confirms.
     let _lease = WALLET_LEASE.lock().await;
     let client = CoinsetClient::testnet11();
+    WALLET_LEASE.reconcile(&client).await;
     let our_ph = our_puzzle_hash(chia_sk);
     let coin = find_spendable_coin(&client, our_ph)
         .await?
@@ -436,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_lease_parks_spent_coins_for_the_ttl() {
+    fn wallet_lease_parks_spent_coins_until_the_chain_or_mempool_settles_them() {
         let lease = WalletLease::new();
         let a = Bytes32::new([1u8; 32]);
         let b = Bytes32::new([2u8; 32]);
@@ -445,21 +548,50 @@ mod tests {
         lease.mark_spent_at([a], t0);
         assert!(lease.is_pending_at(&a, t0 + Duration::from_secs(1)));
         assert!(!lease.is_pending_at(&b, t0 + Duration::from_secs(1)));
-        // Confirmed long ago (or dropped by the mempool): the coin is fair game again.
-        assert!(!lease.is_pending_at(&a, t0 + PENDING_SPEND_TTL));
+        // No timer releases it: three minutes, thirty, fifty-nine, still parked…
+        assert!(lease.is_pending_at(&a, t0 + Duration::from_secs(180)));
+        assert!(lease.is_pending_at(&a, t0 + PENDING_FALLBACK_TTL - Duration::from_secs(1)));
+        // …only the chain/mempool verdict does (release), or the hour-long
+        // fallback for a coin the gateway never settled.
+        assert!(lease.due_at(t0 + Duration::from_secs(5)).is_empty(), "inside the grace: not asked yet");
+        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![a]);
+        lease.release(&[a]);
+        assert!(!lease.is_pending_at(&a, t0 + Duration::from_secs(1)));
+        lease.mark_spent_at([b], t0);
+        assert!(!lease.is_pending_at(&b, t0 + PENDING_FALLBACK_TTL));
     }
 
     #[test]
-    fn wallet_lease_remembers_a_landing_gift_for_the_ttl() {
+    fn settle_releases_confirmed_and_dropped_spends_and_keeps_the_waiting_ones() {
+        let id = |n: u8| Bytes32::new([n; 32]);
+        let (confirmed, dropped, waiting, unknown, never_existed) = (id(1), id(2), id(3), id(4), id(5));
+        let due = vec![confirmed, dropped, waiting, unknown, never_existed];
+        let spent_on_chain: HashMap<Bytes32, bool> =
+            [(confirmed, true), (dropped, false), (waiting, false), (unknown, false)].into_iter().collect();
+        let in_mempool: HashMap<Bytes32, Option<bool>> =
+            [(dropped, Some(false)), (waiting, Some(true)), (unknown, None)].into_iter().collect();
+        let mut released = settle(&due, &spent_on_chain, &in_mempool);
+        released.sort();
+        let mut expected = vec![confirmed, dropped, never_existed];
+        expected.sort();
+        assert_eq!(released, expected);
+    }
+
+    #[test]
+    fn a_landing_gift_reads_as_pending_while_its_faucet_coin_is_parked() {
         let lease = WalletLease::new();
+        let faucet_coin = Bytes32::new([9u8; 32]);
         let t0 = Instant::now();
         assert!(!lease.incoming_pending_at(t0));
-        lease.mark_incoming_at(t0);
-        // A second TAKE a moment later sees the first one still landing…
+        lease.mark_spent_at([faucet_coin], t0);
+        lease.mark_incoming(faucet_coin);
+        // A second TAKE a moment, or an hour less a second, later sees it landing…
         assert!(lease.incoming_pending_at(t0 + Duration::from_secs(1)));
-        assert!(lease.incoming_pending_at(t0 + PENDING_SPEND_TTL - Duration::from_secs(1)));
-        // …and once the TTL is up the chain's own view (owned coins) decides again.
-        assert!(!lease.incoming_pending_at(t0 + PENDING_SPEND_TTL));
+        assert!(lease.incoming_pending_at(t0 + PENDING_FALLBACK_TTL - Duration::from_secs(1)));
+        // …until the chain or the mempool settles the claim (confirmed: the gift
+        // is in the wallet; dropped: the wallet is still empty and may ask again).
+        lease.release(&[faucet_coin]);
+        assert!(!lease.incoming_pending_at(t0 + Duration::from_secs(2)));
     }
 
     #[test]
