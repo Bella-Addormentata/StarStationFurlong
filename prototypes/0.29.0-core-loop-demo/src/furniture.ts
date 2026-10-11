@@ -25,6 +25,7 @@
  */
 
 import * as THREE from "three";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { Seat } from "./seats";
 import type {
   DepartureScreen,
@@ -73,6 +74,9 @@ import {
   cellFromUV,
 } from "./games/checkersTable";
 import type { BoardMarks } from "./games/checkersTable";
+import type { ChessColor } from "./games/chess";
+import { CHESS_PIECE_TYPES, chessPieceOf } from "./games/chessTable";
+import type { ChessPieceType } from "./games/chessTable";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey, readCoinPusherState } from "./casinoDoc";
@@ -2398,6 +2402,10 @@ const GT_RED = "#C43C3C";
 const GT_BLACK = "#23252E";
 const GT_CROWN = "#F0C060";
 const GT_TURN_BLACK = "#9AA3B2"; // black's turn strip — dark-on-dark would vanish
+/** ♟ Chess set colors: ivory and ebony (ebony a touch lifted off the dark
+ *  squares so it never vanishes into them). */
+const GT_CHESS_WHITE = "#ECE3CC";
+const GT_CHESS_BLACK = "#2A2C35";
 /** Checker piece size (m): radius a little under half a square, and height. */
 const GT_PIECE_R = BOARD_SQ_M * 0.38;
 const GT_PIECE_H = 0.013;
@@ -2413,10 +2421,24 @@ const GT_GEAR_R = 0.055;
  *  spectators read the turn from across the room), and the LOCAL player's
  *  move marks. Geometry comes from games/checkersTable.ts — the same numbers
  *  place the pieces and pick the clicked cell. */
+/** The glowing strip on the frame at the end whose turn it is: `near` is
+ *  the canvas bottom (the device-front, −z end: red / white). */
+interface TurnStrip {
+  near: boolean;
+  color: string;
+}
+/** Shared (everyone-sees) chess echo on the wood: the last move's two
+ *  squares and a checked king's square. */
+interface BoardEcho {
+  last: { from: number; to: number } | null;
+  check: number | null;
+}
+
 function drawCheckerboard(
   c2d: CanvasRenderingContext2D,
-  turn: CheckersColor | null,
+  strip: TurnStrip | null,
   marks: BoardMarks | null,
+  echo: BoardEcho | null = null,
 ): void {
   const S = BOARD_TEX_PX,
     PAD = BOARD_PAD_PX,
@@ -2434,12 +2456,23 @@ function drawCheckerboard(
       c2d.fillRect(PAD + c * SQ, PAD + r * SQ, SQ, SQ);
     }
   }
-  // Turn strip: red plays from the canvas bottom (rows 5–7), black the top.
-  if (turn) {
-    c2d.fillStyle = turn === "red" ? GT_RED : GT_TURN_BLACK;
-    const y = turn === "red" ? S - PAD + 8 : 8;
+  // Turn strip: red / white play from the canvas bottom, black the top.
+  if (strip) {
+    c2d.fillStyle = strip.color;
+    const y = strip.near ? S - PAD + 8 : 8;
     c2d.fillRect(PAD, y, S - PAD * 2, PAD - 16);
   }
+  const tint = (idx: number, color: string) => {
+    if (!Number.isInteger(idx) || idx < 0 || idx > 63) return;
+    const { x, y } = at(idx);
+    c2d.fillStyle = color;
+    c2d.fillRect(x, y, SQ, SQ);
+  };
+  if (echo?.last) {
+    tint(echo.last.from, "rgba(240, 192, 96, 0.32)");
+    tint(echo.last.to, "rgba(240, 192, 96, 0.32)");
+  }
+  if (echo && echo.check !== null) tint(echo.check, "rgba(255, 23, 68, 0.45)");
   if (!marks) return;
   // Movable pieces: a gold ring that shows past the disc's edge.
   c2d.lineWidth = 4;
@@ -2468,6 +2501,116 @@ function drawCheckerboard(
     c2d.lineWidth = 3;
     c2d.strokeStyle = "#FFFFFF";
     c2d.strokeRect(x + 1.5, y + 1.5, SQ - 3, SQ - 3);
+  }
+}
+
+/**
+ * ♟ Low-poly chess pieces from three.js primitives: a lathed body per piece
+ * (shared base + collar, distinct crown) with boxes for the rook's
+ * battlements, the knight's head and the king's cross. Origin at the
+ * piece's foot, knight facing +z (white's forward; black's are turned).
+ * Sized to the board square (BOARD_SQ_M ≈ 8 cm).
+ */
+function buildChessPieceGeometry(type: ChessPieceType): THREE.BufferGeometry {
+  const R = BOARD_SQ_M * 0.33; // base radius
+  const lathe = (pts: [number, number][]) =>
+    new THREE.LatheGeometry(
+      pts.map(([r, y]) => new THREE.Vector2(r, y)),
+      18,
+    );
+  /** Base disc + collar every piece stands on. */
+  const base: [number, number][] = [
+    [0, 0],
+    [R, 0],
+    [R, 0.006],
+    [R * 0.82, 0.009],
+    [R * 0.82, 0.011],
+    [R * 0.62, 0.014],
+  ];
+  /** A ball of radius `rr` centred `cy` up, as lathe points. */
+  const ball = (cy: number, rr: number): [number, number][] => {
+    const out: [number, number][] = [];
+    for (let i = 1; i <= 8; i++) {
+      const a = -Math.PI / 2 + (Math.PI * i) / 8;
+      out.push([Math.max(0, rr * Math.cos(a)), cy + rr * Math.sin(a)]);
+    }
+    return out;
+  };
+  const box = (w: number, h: number, d: number, x: number, y: number, z: number, rx = 0) => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    if (rx) g.rotateX(rx);
+    g.translate(x, y, z);
+    return g;
+  };
+  const merge = (parts: THREE.BufferGeometry[]) => {
+    // Boxes are indexed like lathes, so the parts merge as-is.
+    const g = parts.length > 1 ? (mergeGeometries(parts, false) ?? parts[0]) : parts[0];
+    g.computeBoundingSphere();
+    return g;
+  };
+  switch (type) {
+    case "pawn":
+      return merge([
+        lathe([...base, [R * 0.4, 0.022], [R * 0.62, 0.025], [R * 0.3, 0.027], ...ball(0.035, R * 0.42)]),
+      ]);
+    case "rook": {
+      const top = 0.046;
+      const parts: THREE.BufferGeometry[] = [
+        lathe([...base, [R * 0.56, 0.034], [R * 0.78, 0.037], [R * 0.78, top], [0, top]]),
+      ];
+      for (let i = 0; i < 4; i++) {
+        const a = (i * Math.PI) / 2 + Math.PI / 4;
+        parts.push(box(R * 0.42, 0.008, R * 0.42, Math.cos(a) * R * 0.52, top + 0.004, Math.sin(a) * R * 0.52));
+      }
+      return merge(parts);
+    }
+    case "knight":
+      return merge([
+        lathe([...base, [R * 0.6, 0.02], [R * 0.7, 0.022], [0, 0.022]]),
+        box(R * 0.62, 0.032, R * 0.8, 0, 0.034, -R * 0.12, 0.28), // neck
+        box(R * 0.56, R * 0.5, R * 1.25, 0, 0.049, R * 0.22), // head + muzzle
+        box(R * 0.2, 0.008, R * 0.2, 0, 0.058, -R * 0.12), // ears
+      ]);
+    case "bishop":
+      return merge([
+        lathe([
+          ...base,
+          [R * 0.36, 0.03],
+          [R * 0.6, 0.032],
+          [R * 0.3, 0.034],
+          [R * 0.5, 0.042],
+          [R * 0.46, 0.05],
+          [R * 0.2, 0.056],
+          ...ball(0.059, R * 0.16),
+        ]),
+      ]);
+    case "queen":
+      return merge([
+        lathe([
+          ...base,
+          [R * 0.36, 0.038],
+          [R * 0.64, 0.04],
+          [R * 0.34, 0.043],
+          [R * 0.46, 0.054],
+          [R * 0.66, 0.06],
+          [R * 0.3, 0.061],
+          ...ball(0.066, R * 0.2),
+        ]),
+      ]);
+    case "king":
+      return merge([
+        lathe([
+          ...base,
+          [R * 0.38, 0.042],
+          [R * 0.66, 0.044],
+          [R * 0.36, 0.047],
+          [R * 0.5, 0.058],
+          [R * 0.6, 0.064],
+          [0, 0.064],
+        ]),
+        box(R * 0.16, 0.018, R * 0.16, 0, 0.073, 0), // cross upright
+        box(R * 0.5, R * 0.16, R * 0.16, 0, 0.075, 0), // cross bar
+      ]);
   }
 }
 
@@ -2703,6 +2846,47 @@ const buildGameTable = (ctx: BuildCtx) => {
     });
   };
 
+  // ♟ The chess set, laid out the same way: one instanced layer per piece
+  // shape × color (12 draws, capacity 64 each — a malformed peer board
+  // still can't overflow), children of the same pieces group so they fade,
+  // flip-hide and pick exactly like the checkers.
+  const chessMats: Record<ChessColor, THREE.Material> = {
+    white: m(new THREE.Color(GT_CHESS_WHITE).getHex(), 0.42, 0.05),
+    black: m(new THREE.Color(GT_CHESS_BLACK).getHex(), 0.38, 0.12),
+  };
+  const chessGeos = CHESS_PIECE_TYPES.map((t) => buildChessPieceGeometry(t));
+  const chessLayerList = [
+    ...chessGeos.map((g) => layer(g, chessMats.white)),
+    ...chessGeos.map((g) => layer(g, chessMats.black)),
+  ];
+  const chessCells: number[][] = chessLayerList.map(() => []);
+  const turnBlack = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+  const noTurn = new THREE.Quaternion();
+  const one = new THREE.Vector3(1, 1, 1);
+  const placePos = new THREE.Vector3();
+  const layChess = (board: number[] | null): void => {
+    const n = chessLayerList.map(() => 0);
+    for (let idx = 0; board && idx < 64; idx++) {
+      const piece = chessPieceOf(board[idx]);
+      if (!piece) continue;
+      const li = (piece.color === "white" ? 0 : 6) + CHESS_PIECE_TYPES.indexOf(piece.type);
+      const { x, z } = cellCenterLocal(idx);
+      placePos.set(x, GT_FACE_Y, z);
+      // Black's pieces face −z (toward white): only the knight shows it.
+      placeAt.compose(placePos, piece.color === "black" ? turnBlack : noTurn, one);
+      chessCells[li][n[li]] = idx;
+      chessLayerList[li].setMatrixAt(n[li]++, placeAt);
+    }
+    chessLayerList.forEach((mesh, i) => {
+      mesh.count = n[i];
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    });
+  };
+  /** Every pickable piece layer, with its per-instance cells. */
+  const pickLayers = [...layers, ...chessLayerList];
+  const pickCells = [...instanceCells, ...chessCells];
+
   // ⚙ settings token beside the board (#227) — where players open the
   // table's options and anyone can read who plays which side.
   const gearCv = document.createElement("canvas");
@@ -2752,11 +2936,11 @@ const buildGameTable = (ctx: BuildCtx) => {
   let cardsUp = false;
   let pendingComplete: (() => void) | null = null;
   // The face's inputs, kept so either one can change without the other.
-  let board: number[] | null = null;
-  let turn: CheckersColor | null = null;
+  let strip: TurnStrip | null = null;
   let marks: BoardMarks | null = null;
+  let echo: BoardEcho | null = null;
   const repaint = (): void => {
-    drawCheckerboard(boardC2d, turn, marks);
+    drawCheckerboard(boardC2d, strip, marks, echo);
     boardTex.needsUpdate = true;
   };
   /** First hit on one of the face's meshes, only while it is face up. */
@@ -2772,7 +2956,7 @@ const buildGameTable = (ctx: BuildCtx) => {
       toAngle = fromAngle + Math.PI;
       flipT = 0;
       pendingComplete = onComplete ?? null;
-      pieces.visible = false; // the checkers don't swing round with the top
+      pieces.visible = false; // the pieces don't swing round with the top
       return true;
     },
     isFlipping(): boolean {
@@ -2782,9 +2966,19 @@ const buildGameTable = (ctx: BuildCtx) => {
       return cardsUp;
     },
     setBoard(next: number[] | null, nextTurn: CheckersColor | null = null): void {
-      board = next;
-      turn = nextTurn;
-      layPieces(board);
+      layPieces(next);
+      layChess(null);
+      strip = nextTurn ? { near: nextTurn === "red", color: nextTurn === "red" ? GT_RED : GT_TURN_BLACK } : null;
+      echo = null;
+      repaint();
+    },
+    setChess(next, nextTurn = null, nextEcho = null): void {
+      layChess(next);
+      layPieces(null);
+      strip = nextTurn
+        ? { near: nextTurn === "white", color: nextTurn === "white" ? GT_CHESS_WHITE : GT_TURN_BLACK }
+        : null;
+      echo = nextEcho;
       repaint();
     },
     setMarks(next: BoardMarks | null): void {
@@ -2793,12 +2987,13 @@ const buildGameTable = (ctx: BuildCtx) => {
     },
     pickCell(ray: THREE.Raycaster): number | null {
       if (cardsUp || flipT < 1) return null;
-      // Checkers first: from the oblique focus camera, a ray over a king's
-      // top lands ~5 cm further on when continued down to the board.
-      const piece = ray.intersectObjects(layers, false)[0];
+      // Pieces first: from the oblique focus camera, a ray over a king's
+      // top lands several cm further on when continued down to the board
+      // (a chess king stands ~8 cm tall, so this matters even more).
+      const piece = ray.intersectObjects(pickLayers, false)[0];
       if (piece?.instanceId !== undefined) {
-        const li = layers.findIndex((mesh) => mesh === piece.object);
-        const cell = instanceCells[li]?.[piece.instanceId];
+        const li = pickLayers.findIndex((mesh) => mesh === piece.object);
+        const cell = pickCells[li]?.[piece.instanceId];
         if (cell !== undefined) return cell;
       }
       const uv = hitFace(ray, boardMesh)?.uv;
