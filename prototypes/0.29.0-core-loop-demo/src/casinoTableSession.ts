@@ -726,9 +726,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (held.length > 40) held.shift();
       h.diceHold(cursor);
     }
-    if (pickup && hit?.kind === 'rail') {
-      const i = stackAt(hit.p);
-      if (i >= 0 && i !== pickup.stack) {
+    if (pickup) {
+      const i = hit?.kind === 'rail' ? stackAt(hit.p) : -1;
+      // Off the rail (or between stacks) the pickup pauses; over a new stack
+      // it takes from that one.
+      if (i < 0) pickup.stack = -1;
+      else if (i !== pickup.stack) {
         pickup.stack = i;
         pickup.interval = PICKUP_REPEAT_MS;
         pickup.nextAt = performance.now() + pickup.interval;
@@ -791,6 +794,21 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (!rg) return;
     if (hand.length > 0) placeHand(rg);
     else say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
+  };
+
+  /** The browser dropped the gesture (lost capture, a touch interrupted):
+   *  put down what's held without acting on it — no throw, no more pickup. */
+  const onCancel = (e: PointerEvent): void => {
+    e.stopPropagation();
+    if (capture?.hasPointerCapture(e.pointerId)) capture.releasePointerCapture(e.pointerId);
+    if (pickup) {
+      pickup = null;
+      refreshRail();
+    }
+    if (held) {
+      held = null;
+      localHold.delete(itemId); // the frame driver slides the dice back
+    }
   };
 
   const onUp = (e: PointerEvent): void => {
@@ -1174,7 +1192,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       capture.addEventListener('pointermove', onMove);
       capture.addEventListener('pointerdown', onDown);
       capture.addEventListener('pointerup', onUp);
-      capture.addEventListener('pointercancel', onUp);
+      capture.addEventListener('pointercancel', onCancel);
       capture.addEventListener('contextmenu', (e) => e.preventDefault());
       // Never a click-away release: the table owns every click on it.
       for (const ev of ['click', 'mousedown', 'mouseup'] as const) {
@@ -1237,7 +1255,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     update(): void {
       syncEpoch();
       // Holding over one stack keeps picking chips off it, a little faster each time.
-      if (pickup && performance.now() >= pickup.nextAt) {
+      if (pickup && pickup.stack >= 0 && performance.now() >= pickup.nextAt) {
         takeFromStack(pickup.stack);
         pickup.interval = Math.max(PICKUP_REPEAT_MIN_MS, pickup.interval * 0.8);
         pickup.nextAt = performance.now() + pickup.interval;
