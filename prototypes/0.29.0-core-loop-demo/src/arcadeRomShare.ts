@@ -293,7 +293,7 @@ function receiveTick(sha: string, want: Want, now: number): void {
   parts.forEach((c, i) => bytes.set(c, i * ROM_CHUNK_BYTES));
   want.checking = true;
   const epoch = arcadeDocEpoch();
-  void sha256Hex(bytes).then(
+  const check = sha256Hex(bytes).then(
     (hash) => {
       want.checking = false;
       if (wants.get(sha) !== want) return;
@@ -314,6 +314,16 @@ function receiveTick(sha: string, want: Want, now: number): void {
       want.checking = false;
     },
   );
+  checks.add(check);
+  void check.finally(() => checks.delete(check));
+}
+
+/** Hash checks still running. */
+const checks = new Set<Promise<void>>();
+
+/** Resolves once every hash check running now has finished (tests). */
+export async function romShareSettled(): Promise<void> {
+  await Promise.all([...checks]);
 }
 
 // ── The tick (World's arcade beat) ───────────────────────────────────────────

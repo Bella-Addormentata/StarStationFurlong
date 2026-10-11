@@ -47,7 +47,6 @@ function link(...pages: Page[]): void {
   for (const a of pages) for (const b of pages) if (a !== b) Y.applyUpdate(b.y, Y.encodeStateAsUpdate(a.y), 'mesh');
 }
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function rom(size: number, seed = 7): Uint8Array {
   const b = new Uint8Array(size);
@@ -63,7 +62,7 @@ function rom(size: number, seed = 7): Uint8Array {
 async function run(pages: Page[], rounds: number, ms = 500): Promise<void> {
   for (let r = 0; r < rounds; r++) {
     for (const p of pages) p.tick(ms);
-    await flush();
+    await Promise.all(pages.map((p) => p.share.romShareSettled()));
   }
 }
 
