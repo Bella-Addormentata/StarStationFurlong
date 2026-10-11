@@ -39,7 +39,7 @@ import {
 import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
-import { chipsFor, railChips } from './chipDisplay';
+import { CHIP_DENOMS, railChips } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
@@ -169,6 +169,25 @@ const localHold = new Set<string>();
 
 /** Bets laid out as stacks: one per player per box, each in front of its
  *  owner (assignSlots), bottom chip the largest. */
+/** Render bounds on what peers wrote to the room doc: the bet guards accept
+ *  any positive stake and any list length, and the felt must never expand one
+ *  wild record into millions of chips. Settlement still sees the real bets. */
+const MAX_BETS_DRAWN_PER_PLAYER = 400;
+const MAX_STACK_CHIPS = 60;
+
+/** chipsFor, stopping at `max` chips (largest first) without looping per chip. */
+function chipsUpTo(amount: number, max: number): number[] {
+  const out: number[] = [];
+  let left = Math.max(0, Math.floor(amount));
+  for (const d of CHIP_DENOMS) {
+    const n = Math.min(Math.floor(left / d), max - out.length);
+    for (let i = 0; i < n; i++) out.push(d);
+    left -= n * d;
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 function layoutStacks<B extends { type: string; pick?: number; amount: number }>(
   betsByPlayer: Record<string, B[]>,
   anchors: Map<string, FeltPoint>,
@@ -177,7 +196,7 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
 ): FeltStack[] {
   const groups = new Map<string, { rect: FeltRect; chips: Map<string, number[]> }>();
   for (const [pid, bets] of Object.entries(betsByPlayer)) {
-    for (const b of bets) {
+    for (const b of bets.slice(0, MAX_BETS_DRAWN_PER_PLAYER)) {
       const rect = rectFor(b, pid);
       if (!rect) continue;
       const key = `${spotKey(b)}|${rect.x0.toFixed(3)},${rect.z0.toFixed(3)}`;
@@ -187,9 +206,10 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
         groups.set(key, g);
       }
       const list = g.chips.get(pid) ?? [];
+      if (list.length >= MAX_STACK_CHIPS) continue;
       // One chip per bet record when it's a real chip; any other stake (an
       // older client's 10 or 250) shows as the chips it breaks into.
-      list.push(...chipsFor(b.amount));
+      list.push(...chipsUpTo(b.amount, MAX_STACK_CHIPS - list.length));
       g.chips.set(pid, list);
     }
   }
@@ -363,19 +383,6 @@ export interface CasinoTableUIDeps {
 
 type AnyBet = { type: string; pick?: number; amount: number };
 
-/** Keep chips from the top of the hand while they still fit in `balance`. */
-function trimHand(hand: number[], balance: number): number[] {
-  const out: number[] = [];
-  let sum = 0;
-  for (const c of [...hand].sort((a, b) => b - a)) {
-    if (sum + c <= balance) {
-      out.push(c);
-      sum += c;
-    }
-  }
-  return out;
-}
-
 const sumOf = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0);
 
 /**
@@ -485,7 +492,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const refreshRail = (): void => {
     if (!h) return;
     const balance = readChips(me);
-    if (sumOf(hand) > balance) hand = trimHand(hand, balance);
+    if (hand.length > 0 && sumOf(hand) > balance) {
+      // Can't cover the same stake again: drop the hand rather than quietly
+      // betting a different amount on the next click.
+      hand = [];
+      say('NOT ENOUGH CHIPS FOR THAT STAKE AGAIN — PICK UP FROM YOUR RAIL');
+    }
     if (!pickup) railView = rail ? railStacks(rail, railChips(balance - sumOf(hand))) : [];
     h.setRailStacks(railView);
     h.setHand(cursor, hand);

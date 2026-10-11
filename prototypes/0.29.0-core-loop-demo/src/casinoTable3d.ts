@@ -531,13 +531,16 @@ interface DieBody {
   slideTo: THREE.Vector3;
 }
 
+/** The faces the dice show before any roll (and after a reset). */
+const NEUTRAL_FACES: [number, number] = [5, 2];
+
 class DicePair {
   readonly group = new THREE.Group();
   readonly bodies: DieBody[] = [];
   private mode: 'rest' | 'held' | 'flying' | 'settling' | 'sliding' = 'rest';
   private t = 0;
   private landing: [number, number] | null = null;
-  private faces: [number, number] = [5, 2];
+  private faces: [number, number] = [...NEUTRAL_FACES];
   private rand: () => number = prng(1);
   private readonly half = DIE_SIZE / 2;
 
@@ -1167,7 +1170,7 @@ class TableHandle implements CasinoTableVisualHandle {
     this.setPuck(null);
     if (this.dice) {
       this.dice.cancel();
-      this.dice.restAt(CRAPS_DICE_SPOT);
+      this.dice.restAt(CRAPS_DICE_SPOT, NEUTRAL_FACES);
     }
     this.wheel?.cancel();
     this.wheel?.restOn(null);

@@ -136,14 +136,17 @@ export function openCrapsBetting(
 
 // ── 🎲 #226: the shooter ──────────────────────────────────────────────────────
 
-/** table:player → [its `at`, when THIS client last saw `at` change]. Scoped
- *  to one room doc: another room's table can share the id, the player and
- *  even the heartbeat value, so a rebind starts it over. */
-const seatSeen = new Map<string, { at: number; seenAt: number }>();
+/** table:player → [its `at`, when THIS client last saw `at` change, and
+ *  whether it has seen it change at all]. Scoped to one room doc: another
+ *  room's table can share the id, the player and even the heartbeat value, so
+ *  a rebind starts it over. */
+const seatSeen = new Map<string, { at: number; seenAt: number; moved: boolean }>();
 let seatSeenEpoch = -1;
 
 /** Players standing at the table right now, judged on the operator's own clock:
- *  a seat counts while its heartbeat keeps moving. */
+ *  a seat counts once this client has watched its heartbeat move, and while it
+ *  keeps moving. A seat left behind by a crashed page never moves, so it never
+ *  counts — however fresh the operator. The operator samples every tick. */
 export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[] {
   if (seatSeenEpoch !== casinoDocEpoch()) {
     seatSeenEpoch = casinoDocEpoch();
@@ -153,9 +156,10 @@ export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[]
   for (const [pid, seat] of Object.entries(readSeats(tableId))) {
     const key = `${tableId}:${pid}`;
     const prev = seatSeen.get(key);
-    if (!prev || prev.at !== seat.at) seatSeen.set(key, { at: seat.at, seenAt: now });
-    const seenAt = seatSeen.get(key)!.seenAt;
-    if (now - seenAt < SEAT_STALE_MS) out.push({ pid, angle: seat.angle });
+    if (!prev) seatSeen.set(key, { at: seat.at, seenAt: now, moved: false });
+    else if (prev.at !== seat.at) seatSeen.set(key, { at: seat.at, seenAt: now, moved: true });
+    const seen = seatSeen.get(key)!;
+    if (seen.moved && now - seen.seenAt < SEAT_STALE_MS) out.push({ pid, angle: seat.angle });
   }
   return out;
 }
@@ -210,6 +214,9 @@ function hasLiveBets(tableId: string): boolean {
  */
 export function tickAutoStickman(tableId: string): void {
   const now = Date.now();
+  // Watch the seats' heartbeats all window long, so the shooter pick at the
+  // close judges them on what this client actually saw move.
+  seatedPlayers(tableId, now);
   const s = readCrapsTableState(tableId);
   if (!s) {
     openCrapsBetting(tableId, 1, null);
