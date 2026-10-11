@@ -94,8 +94,10 @@ class LocalCrapsBackend implements CrapsBackend {
     const before = readCrapsTableState(tableId);
     if (before == null) return dice;
     // 🎲 #226: or the room doc rebound / the table was recreated under the
-    // same id: only settle the very roll this call was started for.
-    if (casinoDocEpoch() !== epoch || before.round !== round || before.phase === 'settled') return dice;
+    // same id: only settle the very roll this call was started for. Every
+    // caller closes the table first, so a table back in 'betting' at the same
+    // round is a recreated one, not this roll's.
+    if (casinoDocEpoch() !== epoch || before.round !== round || before.phase !== 'closing') return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     const { payouts, remaining } = resolveCrapsRound(

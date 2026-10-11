@@ -175,8 +175,8 @@ const localHold = new Set<string>();
 const MAX_BETS_DRAWN_PER_PLAYER = 400;
 const MAX_STACK_CHIPS = 60;
 /** And a table-wide chip budget, so many modest peer records can't grow the
- *  GPU pools without limit either. Your own bets draw first, then everyone
- *  else's in player-id order, so every client draws the same chips. */
+ *  GPU pools without limit either. Players draw in player-id order, so every
+ *  client draws the same chips in the same slots. */
 const MAX_TABLE_CHIPS = 2400;
 
 /** chipsFor, stopping at `max` chips (largest first) without looping per chip. */
@@ -199,7 +199,7 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
   me: string,
 ): FeltStack[] {
   const groups = new Map<string, { rect: FeltRect; chips: Map<string, number[]> }>();
-  const pidOrder = Object.keys(betsByPlayer).sort((a, b) => (a === me ? -1 : b === me ? 1 : a < b ? -1 : a > b ? 1 : 0));
+  const pidOrder = Object.keys(betsByPlayer).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   let budget = MAX_TABLE_CHIPS;
   for (const pid of pidOrder) {
     const bets = betsByPlayer[pid];

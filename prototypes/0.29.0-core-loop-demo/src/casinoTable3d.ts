@@ -391,6 +391,9 @@ class ChipPools {
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.count = 0;
     mesh.frustumCulled = false;
+    // World's furniture teardown runs every userData dispose* hook: free the
+    // instance buffers (it disposes the shared geometry + materials itself).
+    mesh.userData.disposeInstances = () => mesh.dispose();
     // setColorAt allocates instanceColor; prime it so dim/lit always works.
     mesh.setColorAt(0, this.lit);
     return mesh;
@@ -629,8 +632,11 @@ class DicePair {
     this.landing = values;
     this.faces = values;
     if (this.mode === 'rest' || this.mode === 'sliding' || this.mode === 'held') {
-      // No throw seen (joined mid-roll): just show the faces where they lie.
+      // No throw seen (joined mid-roll): just show the faces where they lie
+      // (where a pending slide was taking them, if one was).
+      const sliding = this.mode === 'sliding';
       this.bodies.forEach((b, i) => {
+        if (sliding) b.pos.copy(b.slideTo);
         b.quat.copy(this.restQuat(values[i], i * 0.35));
         b.pos.y = FELT_Y + this.half;
       });
