@@ -715,8 +715,20 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return true;
   };
 
+  /** The dice in my hand once they're no longer mine to throw (the shooter's
+   *  time ran out and the stickman threw): let go, and put the settled faces
+   *  back where the landing left them. */
+  const dropStaleHold = (): void => {
+    if (!held || myThrowPending()) return;
+    held = null;
+    localHold.delete(itemId);
+    const s = crapsState();
+    if (h && s?.phase === 'settled' && s.dice) h.diceLand(s.dice);
+  };
+
   const onMove = (e: PointerEvent): void => {
     if (!h || !aim(e)) return;
+    dropStaleHold();
     cursor = h.projectToFelt(ray);
     const hit = h.pick(ray, myThrowPending());
     h.setSettingsHot(hit?.kind === 'settings');
@@ -944,7 +956,6 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       announce(`${status().line}. You have ${readChips(me)} chips. ${handLine()}`);
     } else if (k === 's' || k === 'S') {
       toggleCard();
-      card?.querySelector<HTMLElement>('button')?.focus();
     } else if (k === '?' || k === 'h' || k === 'H') announce(KEY_HELP);
     else handled = false;
     if (!handled) return;
@@ -1164,6 +1175,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     host.appendChild(card);
     renderCard();
+    // Into the dialog, however it was opened: its Esc closes it, and a screen
+    // reader follows focus there.
+    card.querySelector<HTMLElement>('button')?.focus();
   };
 
   // ── Seat ──────────────────────────────────────────────────────────────────
@@ -1254,6 +1268,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     },
     update(): void {
       syncEpoch();
+      dropStaleHold();
       // Holding over one stack keeps picking chips off it, a little faster each time.
       if (pickup && pickup.stack >= 0 && performance.now() >= pickup.nextAt) {
         takeFromStack(pickup.stack);
