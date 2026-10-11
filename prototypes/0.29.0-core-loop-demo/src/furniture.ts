@@ -2665,12 +2665,16 @@ const buildGameTable = (ctx: BuildCtx) => {
   const blackKing = layer(discGeo, blackMat);
   const crowns = layer(bandGeo, goldMat);
   const placeAt = new THREE.Matrix4();
+  const layers = [redBase, blackBase, redKing, blackKing, crowns];
+  /** Cell of each instance, per layer — a ray that hits a raised checker
+   *  picks ITS cell (pickCell), not the board square behind it. */
+  const instanceCells: number[][] = layers.map(() => []);
   const layPieces = (board: number[] | null): void => {
-    const layers = [redBase, blackBase, redKing, blackKing, crowns];
     const n = [0, 0, 0, 0, 0];
     const put = (li: number, idx: number, y: number) => {
       const { x, z } = cellCenterLocal(idx);
       placeAt.makeTranslation(x, y, z);
+      instanceCells[li][n[li]] = idx;
       layers[li].setMatrixAt(n[li]++, placeAt);
     };
     for (let idx = 0; board && idx < 64; idx++) {
@@ -2687,6 +2691,7 @@ const buildGameTable = (ctx: BuildCtx) => {
     layers.forEach((mesh, i) => {
       mesh.count = n[i];
       mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere(); // raycasts cull on it; instances moved
     });
   };
 
@@ -2779,6 +2784,15 @@ const buildGameTable = (ctx: BuildCtx) => {
       repaint();
     },
     pickCell(ray: THREE.Raycaster): number | null {
+      if (cardsUp || flipT < 1) return null;
+      // Checkers first: from the oblique focus camera, a ray over a king's
+      // top lands ~5 cm further on when continued down to the board.
+      const piece = ray.intersectObjects(layers, false)[0];
+      if (piece?.instanceId !== undefined) {
+        const li = layers.findIndex((mesh) => mesh === piece.object);
+        const cell = instanceCells[li]?.[piece.instanceId];
+        if (cell !== undefined) return cell;
+      }
       const uv = hitFace(ray, boardMesh)?.uv;
       return uv ? cellFromUV(uv.x, uv.y) : null;
     },
