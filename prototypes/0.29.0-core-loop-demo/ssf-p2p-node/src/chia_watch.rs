@@ -249,7 +249,21 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             cache.remove(room);
             sched.forget(room);
         }
-        cursors.retain(|(room, _), _| readable.iter().any(|(r, _)| r == room));
+        // Keep only the cursors of hints still in play: this tick's three scan
+        // epochs of each readable room. A hint that rotated out of
+        // `scan_epochs` is never read again, so its cursor (and up to SEEN_CAP
+        // coin ids) would otherwise sit in memory for the life of the node —
+        // three more per room every day.
+        let now_unix = chia_resolve::unix_now();
+        let live_hints: HashSet<(String, [u8; 32])> = readable
+            .iter()
+            .flat_map(|(room, key)| {
+                chia_resolve::scan_epochs(now_unix)
+                    .into_iter()
+                    .map(move |e| (room.clone(), chia_lane::derive_hint(key, e)))
+            })
+            .collect();
+        cursors.retain(|k, _| live_hints.contains(k));
         if readable.is_empty() {
             continue;
         }
@@ -268,8 +282,6 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 0
             }
         };
-        let now_unix = chia_resolve::unix_now();
-
         for (room, room_key) in readable {
             let (connected, dialing) = snapshot_peers(&hub, &room);
             let rc = cache.entry(room.clone()).or_default();
@@ -464,7 +476,8 @@ mod tests {
     fn planner_respects_free_hold_slots_and_expired_cooldowns() {
         let now = Instant::now();
         let empty: HashSet<String> = HashSet::new();
-        let cooled: HashMap<String, Instant> = [("a".to_string(), now - Duration::from_secs(1))].into_iter().collect();
+        // Six records, "f" the freshest. Its cooldown EXPIRED a second ago.
+        let expired: HashMap<String, Instant> = [("f".to_string(), now - Duration::from_secs(1))].into_iter().collect();
         let records: Vec<ChiaPresenceRecord> = (0..6)
             .map(|i| rec(&format!("{}", (b'a' + i) as char), 1_000 + i as u64, 0, &["198.51.100.9:1"]))
             .collect();
@@ -472,20 +485,27 @@ mod tests {
             self_id: "me",
             connected: &empty,
             dialing: &empty,
-            cooldown_until: &cooled,
+            cooldown_until: &expired,
             active_holds: MAX_HOLDS_PER_ROOM - 1,
             now_unix: 5,
             now,
         };
         let plan = plan_holds(&records, &ctx, &parse_all);
         assert_eq!(plan.len(), 1, "one free slot -> one hold");
-        assert_eq!(plan[0].node_id, "f", "the freshest record takes the slot");
+        assert_eq!(plan[0].node_id, "f", "an expired cooldown no longer blocks the freshest record");
+        // The same target still COOLING is skipped and the next freshest takes the slot.
+        let cooling: HashMap<String, Instant> = [("f".to_string(), now + Duration::from_secs(60))].into_iter().collect();
+        let ctx_cooling = PlanContext { cooldown_until: &cooling, ..ctx };
+        let plan = plan_holds(&records, &ctx_cooling, &parse_all);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].node_id, "e", "a live cooldown skips 'f'; 'e' is next");
+        // No free slot: nothing, whatever the records say. All slots free: the cap holds.
         let ctx_full = PlanContext { active_holds: MAX_HOLDS_PER_ROOM, ..ctx };
         assert!(plan_holds(&records, &ctx_full, &parse_all).is_empty());
         let ctx_free = PlanContext { active_holds: 0, ..ctx_full };
         let ids: Vec<String> = plan_holds(&records, &ctx_free, &parse_all).into_iter().map(|c| c.node_id).collect();
-        assert_eq!(ids.len(), MAX_HOLDS_PER_ROOM);
-        assert!(ids.contains(&"a".to_string()) || ids.len() == MAX_HOLDS_PER_ROOM, "an expired cooldown no longer blocks 'a'");
+        assert_eq!(ids.len(), MAX_HOLDS_PER_ROOM, "never more holds than the per-room cap");
+        assert_eq!(ids[0], "f", "freshest first, its expired cooldown ignored");
     }
 
     #[test]

@@ -2079,9 +2079,10 @@ async fn dial_peer_inner(
 /// links the peer first. The repeated Initials keep OUR NAT pinhole warm while
 /// the other side's own hold — started a few beats later by its watcher, the
 /// symmetric trigger — does the same, so two NATed nodes meet with no live
-/// introducer. `addrs` arrive public-only and v6-first from
-/// [`chia_public_dial_addrs`]. The CALLER owns the `hub.dialing` single-flight
-/// claim. Reports dialing/connected/failed to the browser; returns true on link.
+/// introducer. `addrs` arrive public-only from [`chia_public_dial_addrs`]; the
+/// first attempt tries the IPv6 ones alone (see below), later attempts all of
+/// them. The CALLER owns the `hub.dialing` single-flight claim. Reports
+/// dialing/connected/failed to the browser; returns true on link.
 #[cfg(feature = "chia-read")]
 pub(crate) async fn hold_dial(
     hub: SharedHub,
@@ -2097,6 +2098,12 @@ pub(crate) async fn hold_dial(
     let started_hold = std::time::Instant::now();
     let deadline = started_hold + HOLD_WINDOW;
     report_dial_status(&hub, &send, &room_id, &target_str, "dialing", Some("chain hold")).await;
+    // IPv6 FIRST, for real: iroh keeps an endpoint's addresses in a set, so the
+    // order we add them in says nothing about the order it probes them. The
+    // first attempt therefore carries the IPv6 addresses ALONE when there are
+    // any (a v6 path needs no punch and lands or fails fast); every later
+    // attempt carries both families, which iroh probes together.
+    let v6_only: Vec<SocketAddr> = addrs.iter().copied().filter(|sa| sa.is_ipv6()).collect();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -2110,8 +2117,10 @@ pub(crate) async fn hold_dial(
         if !still_needs {
             return true; // linked by another path (or the room is gone) — nothing to do
         }
+        let this_attempt: &[SocketAddr] =
+            if attempt == 1 && !v6_only.is_empty() && v6_only.len() < addrs.len() { &v6_only } else { &addrs };
         let mut addr = EndpointAddr::new(target_pub_key);
-        for sa in &addrs {
+        for sa in this_attempt {
             addr = addr.with_ip_addr(*sa);
         }
         let attempt_started = std::time::Instant::now();

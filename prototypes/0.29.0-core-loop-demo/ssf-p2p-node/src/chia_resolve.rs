@@ -79,6 +79,10 @@ pub struct HintCursor {
     /// the next poll continues it from the gateway's cursor instead of starting
     /// over, and `last_height` never moves past pages nobody has fetched.
     pub pending: Option<PendingPage>,
+    /// The last poll hit `MAX_PARENT_FETCHES_PER_POLL` and left listed coins
+    /// unexamined; `last_height` stayed put, so the next poll re-lists them and
+    /// takes the next batch. Together with `pending`, "there is more to read".
+    pub backlog: bool,
 }
 
 /// Where a page-capped poll stopped, so the next poll continues the SAME
@@ -106,6 +110,11 @@ struct Resume {
 }
 
 impl HintCursor {
+    /// More to read under this hint: a parked listing or an unexamined backlog.
+    pub fn has_more(&self) -> bool {
+        self.pending.is_some() || self.backlog
+    }
+
     /// `start_height` for the next FRESH query: resume a little below the last
     /// examined height; `None` means scan the hint from genesis.
     pub fn start_height(&self) -> Option<u32> {
@@ -250,6 +259,7 @@ pub async fn read_hint(
             });
         }
     }
+    cursor.backlog = capped;
     if capped {
         examined_all = false;
     }
@@ -265,8 +275,17 @@ pub async fn read_hint(
     Ok(out)
 }
 
+/// How many `read_hint` rounds a ONE-SHOT lookup ([`resolve_all`]) spends per
+/// epoch hint when a listing runs past one round's page or parent budget. The
+/// watcher carries its cursors from beat to beat and needs no such loop; the
+/// one-shot has no next beat, so it keeps reading until the hint is examined
+/// or this bound is spent (≤ 32 pages and ≤ 200 parent fetches per hint).
+pub const ONE_SHOT_MAX_ROUNDS: usize = 4;
+
 /// Every member's freshest record under `room_key` (P1 `resolve_all`): one
-/// full read of the three scan epochs, ranked and de-duplicated.
+/// full read of the three scan epochs, ranked and de-duplicated. A hint whose
+/// listing outruns one round's budget is read on, round after round, until it
+/// is examined or [`ONE_SHOT_MAX_ROUNDS`] is spent — never left at page 8.
 pub async fn resolve_all(room_key: &[u8; 32]) -> Result<Vec<FoundRecord>> {
     let now = unix_now();
     let client = CoinsetClient::testnet11();
@@ -274,7 +293,18 @@ pub async fn resolve_all(room_key: &[u8; 32]) -> Result<Vec<FoundRecord>> {
     for e in scan_epochs(now) {
         let hint = Bytes32::new(chia_lane::derive_hint(room_key, e));
         let mut cursor = HintCursor::default();
-        all.extend(read_hint(&client, hint, room_key, now, &mut cursor).await?);
+        for round in 1..=ONE_SHOT_MAX_ROUNDS {
+            all.extend(read_hint(&client, hint, room_key, now, &mut cursor).await?);
+            if !cursor.has_more() {
+                break;
+            }
+            if round == ONE_SHOT_MAX_ROUNDS {
+                eprintln!(
+                    "⛓️ ChiaHub resolve: hint {} still had more after {round} rounds — budget spent, result may be partial",
+                    hex::encode(&hint.to_bytes()[..8])
+                );
+            }
+        }
     }
     Ok(rank_and_dedupe(all))
 }
@@ -449,6 +479,9 @@ mod tests {
         assert!(!resumed.examined_all, "an earlier parent-capped poll taints the whole listing");
         assert!(c.pending.is_none(), "taken: a cursor the gateway refuses fails once, then we start fresh");
         assert_eq!(c.last_height, 5_000, "resuming alone never advances the height");
+        assert!(!c.has_more(), "nothing parked and no backlog: the hint is examined");
+        c.backlog = true;
+        assert!(c.has_more(), "an unexamined backlog is 'more to read' for the one-shot loop");
     }
 
     #[test]

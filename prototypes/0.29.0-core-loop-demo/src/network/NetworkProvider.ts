@@ -230,13 +230,21 @@ export class NetworkProvider implements NetworkProviderPort {
    *  derive the room's chia lookup hint and seal presence records; it holds the
    *  room's plaintext doc already, so this is loopback-only and exposes nothing
    *  new. Fire-and-forget. The payload also carries N8's `publicRoom` flag from
-   *  the installed probe (defaults to PUBLIC — fail closed — until main.ts
-   *  installs one). Same `[u32-LE len][JSON]` framing the node reads on every
-   *  browser->node stream. */
+   *  the installed probe; a provider with no probe (every background provider)
+   *  sends no cap at all — see the guard below. Same `[u32-LE len][JSON]`
+   *  framing the node reads on every browser->node stream. */
   async sendRoomCap(roomId: string, roomKeyB64: string, chiaMode: boolean): Promise<void> {
     if (!this.#wt || this.#mode === 'offline') return;
+    // N8: only a provider that can vouch for the room's posture speaks. The
+    // background providers (passes, far-door and departure writes, direct
+    // messages, room sessions) have no probe; a cap from one of them would
+    // overwrite the primary session's reading for that room with a blanket
+    // PUBLIC — fail-closed, but it would switch reads off for a room the
+    // player is standing in. The node holds no cap for a room nobody vouched
+    // for, which is the same fail-closed outcome without the override.
+    if (!this.#publicRoomProbe) return;
     try {
-      const publicRoom = this.#publicRoomProbe ? this.#publicRoomProbe(roomId) : true;
+      const publicRoom = this.#publicRoomProbe(roomId);
       this.#capSeq = nextCapSeq(this.#capSeq);
       const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq);
       const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
@@ -268,8 +276,9 @@ export class NetworkProvider implements NetworkProviderPort {
   }
 
   /** N8: who decides whether a room is public space (bundled seed or PUBLIC
-   *  passage). main.ts installs it; until then every cap says PUBLIC, so a node
-   *  never publishes under a key the browser has not vouched for. */
+   *  passage). main.ts installs it on the primary provider at boot, before any
+   *  join; a provider without one never sends a cap, so a node never publishes
+   *  under a key the browser has not vouched for. */
   setPublicRoomProbe(probe: (roomId: string) => boolean): void {
     this.#publicRoomProbe = probe;
   }
