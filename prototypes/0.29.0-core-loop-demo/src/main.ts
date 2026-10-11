@@ -10,6 +10,7 @@ import { renderWithFarPass } from "./farOrbitView";
 import type { World } from "./world";
 import type { DoorId } from "./doors";
 import type { InputManager } from "./input";
+import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { YjsSync } from "./network/YjsSync";
@@ -3093,6 +3094,7 @@ async function joinRoomAtEpoch(
         (tick.flags & 8) === 8,
         (tick.flags & 16) === 16,
         (tick.flags & 32) === 32,
+        tick.seq,
       );
     } catch (e) {
       console.warn("Error unpacking incoming remote peer datagram tick:", e);
@@ -7694,11 +7696,7 @@ function setupSpacePhoneOverlay() {
     }
     if (!container || !container.classList.contains("active")) return;
     const target = e.target as HTMLElement | null;
-    if (
-      target &&
-      target !== chatInput &&
-      (target.tagName === "INPUT" || target.tagName === "TEXTAREA")
-    ) {
+    if (target && target !== chatInput && isFormFieldTarget(target)) {
       return; // e.g. room-name editor owns Escape for cancel
     }
     if (currentPhoneView !== "home") {
@@ -7743,9 +7741,63 @@ function setupSpacePhoneOverlay() {
     });
   }
 
+  // 📱 Open/close the phone: Tab, or a click on its bezel.
+  const togglePhone = (): void => {
+    if (tipIndicator) {
+      removeTipIndicator();
+    }
+
+    // 💬 QUICK CHAT: from the mini bar, EXPAND to the full phone on the CHAT
+    // app (scrollable history) instead of the home-screen toggle.
+    if (miniChatOpen) {
+      closeMiniChat();
+      if (container && !container.classList.contains("active")) {
+        container.classList.add("active");
+        showPhoneView("chat");
+        logToPhoneSystem("Entering SpacePhone net...");
+      }
+      return;
+    }
+
+    if (container) {
+      // Don't OPEN the SpacePhone while editing the room: an open phone
+      // latches the #spacephone-container.active guard that swallows the
+      // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
+      // (zoom.ts), stranding the player in edit mode with no working exit.
+      // An already-open phone may still CLOSE.
+      if (
+        roomEdit.isEditModeActive() &&
+        !container.classList.contains("active")
+      )
+        return;
+      container.classList.toggle("active");
+      if (container.classList.contains("active")) {
+        // Always land on the home screen (see view-router policy note above)
+        showPhoneView("home");
+        logToPhoneSystem("Entering SpacePhone net...");
+      } else {
+        chatInput?.blur();
+        // Hand focus back to whatever opened the phone from outside it. The
+        // phone is only moved offscreen, never display:none, so a control
+        // left focused inside it keeps answering the arrow keys against
+        // hidden rows — a keyboard player who opened TREASURY from the room
+        // terminal could not get back to the terminal at all.
+        releasePhoneOpener();
+      }
+    }
+  };
+
   if (container) {
+    const bezel = document.getElementById("phone-bezel");
     container.addEventListener("click", (e) => {
       e.stopPropagation();
+      // 📱 #223: the bezel is the phone's handle, and a click on it does what
+      // Tab does. A put-away phone shows nothing BUT its bezel, so any click
+      // on it counts; open or peeking, only the bezel itself does, so the
+      // screen and the quick-chat field below it keep their own clicks.
+      const putAway =
+        !container.classList.contains("active") && !miniChatOpen;
+      if (putAway || bezel?.contains(e.target as Node)) togglePhone();
     });
   }
 
@@ -7755,8 +7807,7 @@ function setupSpacePhoneOverlay() {
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" || miniChatOpen) return;
     if (container?.classList.contains("active")) return;
-    const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (isFormFieldTarget(e.target as HTMLElement | null)) return;
     const welcome = document.getElementById("welcome");
     if (welcome && getComputedStyle(welcome).display !== "none") return;
     if (roomEdit.isEditModeActive() || isDeviceFocusActive()) return;
@@ -7770,49 +7821,7 @@ function setupSpacePhoneOverlay() {
       // Suppress the browser's focus-cycling so Tab acts as a pure toggle,
       // and let it close the phone even while the chat input has focus.
       e.preventDefault();
-
-      if (tipIndicator) {
-        removeTipIndicator();
-      }
-
-      // 💬 QUICK CHAT: Tab from the mini bar EXPANDS to the full phone on the
-      // CHAT app (scrollable history) instead of the home-screen toggle.
-      if (miniChatOpen) {
-        closeMiniChat();
-        if (container && !container.classList.contains("active")) {
-          container.classList.add("active");
-          showPhoneView("chat");
-          logToPhoneSystem("Entering SpacePhone net...");
-        }
-        return;
-      }
-
-      if (container) {
-        // Don't let Tab OPEN the SpacePhone while editing the room: an open
-        // phone latches the #spacephone-container.active guard that swallows the
-        // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
-        // (zoom.ts), stranding the player in edit mode with no working exit.
-        // Tab may still CLOSE an already-open phone.
-        if (
-          roomEdit.isEditModeActive() &&
-          !container.classList.contains("active")
-        )
-          return;
-        container.classList.toggle("active");
-        if (container.classList.contains("active")) {
-          // Always land on the home screen (see view-router policy note above)
-          showPhoneView("home");
-          logToPhoneSystem("Entering SpacePhone net...");
-        } else {
-          chatInput?.blur();
-          // Hand focus back to whatever opened the phone from outside it. The
-          // phone is only moved offscreen, never display:none, so a control
-          // left focused inside it keeps answering the arrow keys against
-          // hidden rows — a keyboard player who opened TREASURY from the room
-          // terminal could not get back to the terminal at all.
-          releasePhoneOpener();
-        }
-      }
+      togglePhone();
     }
   });
 
@@ -9769,12 +9778,13 @@ function updateHUDP2P(status: string, color: string) {
   }
 }
 
-// M-dep of #33: the fullscreen solar-map overlay is retired — the 'm' hotkey,
-// the #solarmap-toggle-btn and the +/- HUD zoom buttons are gone. The solar
-// map now lives INSIDE the world: click the holographic map table (M4) and
-// the same SolarSystemMap mounts into the device-focus panel (devices.ts
-// createMapTableUI). Keyboard +/- zoom survives in zoom.ts, clamped at
-// level 2 unless ?devzoom=1.
+// M-dep of #33: the fullscreen solar-map overlay is retired — the 'm' hotkey
+// and the #solarmap-toggle-btn are gone. The solar map now lives INSIDE the
+// world: click the holographic map table (M4) and the same SolarSystemMap
+// mounts into the device-focus panel (devices.ts createMapTableUI). The +/-
+// zoom keys live in zoom.ts; since #223 the HUD has +/- buttons again too, in
+// cameraRig's top-right view cross. Past the planet view both need
+// ?devzoom=1.
 function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
@@ -9933,7 +9943,7 @@ async function init() {
   setupNetworkDetailsPanel();
   setupZoomView();
 
-  // Camera rig: 45° view-rotation arrows (bottom-left HUD, next to DEV).
+  // Camera rig: the top-right view cross — 45° rotation arrows + zoom (#223).
   // Injected probes keep cameraRig.ts import-cycle-free: it must not import
   // zoom.ts (which imports it for rotated level snaps) nor deviceFocus.ts.
   initCameraRig({
@@ -9941,6 +9951,13 @@ async function init() {
     isCameraBusy: () => isDeviceFocusActive(),
     // 🎬 The rig adds the slow station drift while the space view is up.
     isExteriorDrifting: () => isExteriorActive(),
+    // ➕➖ #223: the HUD cross's zoom buttons, the same steps as +/-.
+    zoom: {
+      stepIn: () => multiScaleZoom?.stepIn(),
+      stepOut: () => multiScaleZoom?.stepOut(),
+      canZoomIn: () => multiScaleZoom?.canZoomIn() ?? false,
+      canZoomOut: () => multiScaleZoom?.canZoomOut() ?? false,
+    },
   });
 
   // DEV1: temporary Development menu (owner request, demo phase — will be
@@ -10624,6 +10641,8 @@ function animate() {
 
       const packed = packTick(tickData);
       networkProvider.sendTick(packed);
+      // 🪑 The counter a peer will see — breaks a seat clash (seatOccupancy).
+      world.noteSentTickSeq(tickData.seq);
       lastTickSent = currentTime;
     }
   } else {

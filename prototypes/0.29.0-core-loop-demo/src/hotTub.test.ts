@@ -30,7 +30,11 @@ import {
   FURNITURE_DEFS,
   HOT_TUB_R,
   OUTDOOR_FURNITURE,
+  bridgeDeckY,
+  getPoolIsland,
   hotTubBridgeLanding,
+  isBridgeClick,
+  islandHotTub,
   type FurnitureItem,
   type SeatTemplate,
 } from './furniture';
@@ -74,9 +78,13 @@ const loadRoom = (items: readonly FurnitureItem[]): void => {
   rebuildSeats();
 };
 
+/** The loaded room's tub — the island tub or the Classic Lido's corner tub. */
+const loadedTub = (): FurnitureItem =>
+  FURNITURE.find((i) => i.kind === 'hot-tub' || i.kind === 'classic-hot-tub')!;
+
 /** The tub's own seats, in registry order. */
 const tubSeats = (): Seat[] =>
-  SEATS.filter((s) => s.id.startsWith('pool-hot-tub:'));
+  SEATS.filter((s) => s.id.startsWith(`${loadedTub().id}:`));
 
 const hypot = (a: { x: number; z: number }, b: { x: number; z: number }) =>
   Math.hypot(a.x - b.x, a.z - b.z);
@@ -361,11 +369,9 @@ describe('the classic deck tub is the same tub', () => {
   });
 
   it('still reaches a dry-land approach the walker can stand on', () => {
-    // Not the per-quadrant fronts: buildSeatList overrides the front of any
-    // seat whose item id is "pool-hot-tub", and this tub carries that id too
-    // (see the note on hotTubSeats), so all four collapse to one substituted
-    // point. What has to hold is that the point is real — inside the room and
-    // on a walkable cell — which is the property #187 must not break.
+    // Its own per-quadrant fronts, through computeFront's walkable fallback
+    // where a preferred point is off the deck. What has to hold is that each
+    // point is real — inside the room and on a walkable cell.
     const fronts = tubSeats().map((s) => s.front);
     expect(fronts).toHaveLength(4);
     for (const front of fronts) {
@@ -373,5 +379,65 @@ describe('the classic deck tub is the same tub', () => {
       expect(Math.abs(front.z)).toBeLessThanOrEqual(5.5);
       expect(walkable[worldToRow(front.z)]?.[worldToCol(front.x)]).toBe(true);
     }
+  });
+});
+
+describe('the Classic Lido deck tub has no footbridge', () => {
+  // The bridge is drawn by the lazy pool alone. The deck tub used to share
+  // the island tub's id, "pool-hot-tub", and every bridge rule keyed on that
+  // id: an arched 6-waypoint walk over open deck, a click strip over the pool
+  // that routed into the tub, and a swim-exclusion island in the pool's
+  // north-west corner. Rooms seeded before the rename still hold the old id,
+  // so both ids are checked: the fix keys on what the bridge belongs to.
+  for (const tubId of ['lido-hot-tub', 'pool-hot-tub']) {
+    describe(`with the tub's id "${tubId}"`, () => {
+      beforeAll(() =>
+        loadRoom(
+          classicPoolItems.map((i) =>
+            i.kind === 'classic-hot-tub' ? { ...i, id: tubId } : i,
+          ),
+        ),
+      );
+
+      it('finds no island tub, no landing and no island', () => {
+        expect(islandHotTub(FURNITURE)).toBeNull();
+        expect(hotTubBridgeLanding(FURNITURE)).toBeNull();
+        expect(getPoolIsland(FURNITURE)).toBeNull();
+      });
+
+      it('has no bridge to click or to stand on', () => {
+        // The middle of the strip the phantom bridge used to claim.
+        const x = CLASSIC_TUB.x - 0.2;
+        const z = CLASSIC_TUB.z + 2.2;
+        expect(isBridgeClick(FURNITURE, x, z)).toBe(false);
+        expect(bridgeDeckY(FURNITURE, x, z)).toBeNull();
+        const seat = findSeatAt(x, z);
+        expect(seat?.id.startsWith(`${tubId}:`) ?? false).toBe(false);
+      });
+
+      it('walks straight up to the tub instead of over an arch', () => {
+        for (const seat of tubSeats()) {
+          expect(seat.path).toBeUndefined();
+          // An approach beside THIS tub, not the lazy pool's shore across
+          // the room (which every seat used to be sent to).
+          expect(hypot(seat.front, CLASSIC_TUB)).toBeLessThan(3);
+        }
+      });
+    });
+  }
+});
+
+describe('islandHotTub', () => {
+  it('is the lazy pool\'s tub, found by kind and place rather than id', () => {
+    const tub = islandHotTub(OUTDOOR_FURNITURE);
+    expect(tub?.kind).toBe('hot-tub');
+    expect(tub?.pos).toEqual({ x: 0, z: 0 });
+  });
+
+  it('is nobody once the tub has been carried off the island', () => {
+    const moved = OUTDOOR_FURNITURE.map((i) =>
+      i.kind === 'hot-tub' ? { ...i, pos: { x: 3, z: 4 } } : i,
+    );
+    expect(islandHotTub(moved)).toBeNull();
   });
 });

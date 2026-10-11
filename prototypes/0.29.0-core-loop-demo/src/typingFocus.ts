@@ -13,6 +13,16 @@
  * (#31's lesson, recorded in deviceFocus.ts: the room-name editor
  * replaceWith()s its input before the event bubbles, leaving activeElement
  * on <body> while the keystroke plainly belongs to the field being replaced).
+ *
+ * Two questions, two answers:
+ *  - isTextEntryTarget — does the field TYPE the key? The guard for walking:
+ *    "w" on a checkbox types nothing, so the avatar should still move.
+ *  - isFormFieldTarget — does the field take the key at all? The guard for
+ *    every hotkey: a range slider and a radio group take the arrows, a
+ *    checkbox takes Space, a submit takes Enter, and Escape belongs to
+ *    whatever has focus. It is every <input> (what the hand-rolled guards it
+ *    replaced always refused) plus the surfaces they all missed: <select>,
+ *    whose arrows were also turning the camera, and contenteditable.
  */
 
 /**
@@ -80,4 +90,21 @@ export function isTextEntryTarget(
     default:
       return false;
   }
+}
+
+/**
+ * True when `target` is a form field that takes keys of its own: every
+ * text-entry surface, plus every other `<input>` (checkbox, range, radio,
+ * button…). The guard for hotkeys — see the module note for why walking uses
+ * the narrower isTextEntryTarget instead.
+ *
+ * @param target the event's target, as for isTextEntryTarget.
+ */
+export function isFormFieldTarget(
+  target: TextEntryTarget | null | undefined,
+): boolean {
+  return (
+    isTextEntryTarget(target) ||
+    (target?.tagName ?? '').toUpperCase() === 'INPUT'
+  );
 }

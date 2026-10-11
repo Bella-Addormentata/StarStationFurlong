@@ -232,6 +232,17 @@ export class Player {
     | null = null;
   /** Fired once after a sit-down slide reaches its authored seat. */
   public onSeatSettled: ((seat: Seat) => void) | null = null;
+  /**
+   * 🪑 Wired by World: the seat to sit in NOW — `seat` itself while nobody
+   * else is in it, another free spot on the same piece once someone is, null
+   * when the piece is full (seatOccupancy.freeSeatFor). Asked at the front
+   * point and again on the last step before sitting, because someone can sit
+   * down in it while we walk over. Unwired ⇒ every seat is free.
+   */
+  public seatGate: ((seat: Seat) => Seat | null) | null = null;
+  /** 🪑 Wired by World: the seat was taken on the way and nothing else on
+   *  that piece was free, so the sit was called off. */
+  public onSeatRefused: ((seat: Seat) => void) | null = null;
   // ── 🏊 Free-swim mode ─────────────────────────────────────────────────────
   /** True while freely swimming inside the pool basin (not seat-bound). */
   private swimMode = false;
@@ -1597,16 +1608,19 @@ export class Player {
     if (dist < 0.06) {
       pos.x = seat.front.x;
       pos.z = seat.front.z;
+      // 🪑 Someone may have sat down while we walked over.
+      const free = this._gateSeat(seat, false);
+      if (!free) return;
       // 🌉 Seat reached over a scripted path (hot-tub bridge): WALK the
       // waypoints instead — the TURN pause is skipped, the crest hop into the
       // tub replaces it.
-      if (seat.path && seat.path.length > 0) {
+      if (free.path && free.path.length > 0) {
         this.sitPathIndex = 0;
         this.sitPhase = "BRIDGE_IN";
         return;
       }
       // Turn so the avatar's BACK faces the chair (i.e. face away from it).
-      this.logicalAngle = seat.faceAngle;
+      this.logicalAngle = free.faceAngle;
       this.turnTimer = 0;
       this.sitPhase = "TURN";
       this.character.setState("idle", this.logicalAngle);
@@ -1633,9 +1647,60 @@ export class Player {
     this.character.setState("idle", seat.faceAngle);
     this.turnTimer += deltaTime;
     if (this.turnTimer >= this.TURN_TIME) {
+      // 🪑 Last look before committing: the seated flag goes up on the
+      // slide's first frame, and from then on peers see this seat as ours.
+      if (!this._gateSeat(seat, false)) return;
       this.sitAnim = 0;
       this.sitPhase = "SIT_DOWN";
     }
+  }
+
+  /**
+   * 🪑 Ask the World's seatGate whether `seat` is still free. Returns the
+   * seat to carry on with — `seat`, or a free spot on the same piece that is
+   * reached the same way, which simply becomes the target (the four island
+   * hot-tub spots share one approach and one bridge walk). Returns null when
+   * this call has already dealt with it: re-routed to a free spot reached
+   * some other way, or called the sit off because the piece is full — on the
+   * spot, or, from the bridge crest (`atCrest`), by walking back to shore.
+   */
+  private _gateSeat(seat: Seat, atCrest: boolean): Seat | null {
+    const next = this.seatGate ? this.seatGate(seat) : seat;
+    if (next === seat) return seat;
+    if (next && this._sameApproach(next, seat)) {
+      this.sitTarget = next;
+      return next;
+    }
+    if (atCrest && seat.path && seat.path.length > 0) {
+      // Already up on the bridge: walk back down it (BRIDGE_OUT finishes the
+      // way a stand-up from the tub does, at the shore front point).
+      this._removeReticle();
+      this.pendingSeat = null;
+      this.sitSlideFrom = null;
+      this.sitPathIndex = seat.path.length - 2;
+      this.sitPhase = "BRIDGE_OUT";
+      this.onSeatRefused?.(seat);
+      return null;
+    }
+    this._clearPath();
+    this.sitPhase = "NONE";
+    this.sitTarget = null;
+    this.navMode = "MANUAL";
+    this.character.setState("idle", this.logicalAngle);
+    if (next) this.navigateToSeat(next);
+    else this.onSeatRefused?.(seat);
+    return null;
+  }
+
+  /** Two seats walked to the same way: one front point, one scripted path. */
+  private _sameApproach(a: Seat, b: Seat): boolean {
+    const pa = a.path ?? [];
+    const pb = b.path ?? [];
+    return (
+      Math.hypot(a.front.x - b.front.x, a.front.z - b.front.z) < 1e-6 &&
+      pa.length === pb.length &&
+      pa.every((p, i) => Math.hypot(p.x - pb[i].x, p.z - pb[i].z) < 1e-6)
+    );
   }
 
   /** Scripted slide from the front point back onto the seat (no collision). */
@@ -2117,7 +2182,10 @@ export class Player {
         this.sitPathIndex++;
         return;
       }
-      // Crest reached — hop from here over the rim into the tub.
+      // Crest reached — hop from here over the rim into the tub, unless
+      // someone took the spot during the walk (🪑 another free spot on the
+      // tub is taken instead; a full tub sends us back down the bridge).
+      if (!this._gateSeat(seat, true)) return;
       this.sitSlideFrom = { ...path[path.length - 1] };
       this.sitAnim = 0;
       this.sitPhase = "SIT_DOWN";

@@ -19,6 +19,7 @@
  */
 
 import type { StickInput } from './freeFlight';
+import { isFormFieldTarget } from './typingFocus';
 
 const BINDINGS: Array<[string[], string]> = [
   [['KeyW', 'ArrowUp'], 'thrust+'],
@@ -38,13 +39,8 @@ const DEADZONE = 0.15;
 let taken = false;
 const held = new Set<string>();
 
-function isTyping(target: EventTarget | null): boolean {
-  const el = target as HTMLElement | null;
-  return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true);
-}
-
 function onKeyDown(e: KeyboardEvent): void {
-  if (!taken || isTyping(e.target)) return;
+  if (!taken || isFormFieldTarget(e.target as HTMLElement | null)) return;
   const action = ACTION_OF.get(e.code);
   if (!action) return;
   held.add(e.code);

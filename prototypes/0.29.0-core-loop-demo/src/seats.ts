@@ -22,7 +22,7 @@
  * rebakeWalkableGrid → rebuildSeats).
  */
 
-import { FURNITURE, buildSeatList, hotTubBridgeLanding, isBridgeClick } from './furniture';
+import { FURNITURE, buildSeatList, hotTubBridgeLanding, isBridgeClick, islandHotTub } from './furniture';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 
 export interface Seat {
@@ -86,11 +86,12 @@ export function findSeatAt(x: number, z: number): Seat | null {
     // puts TWO seats on the south side, so the rule is now the thing it
     // always meant — and it stays right whatever the seat list becomes.
     const landing = hotTubBridgeLanding(FURNITURE);
-    if (landing) {
+    const tub = islandHotTub(FURNITURE);
+    if (landing && tub) {
       let best: Seat | null = null;
       let bestDist = Infinity;
       for (const seat of SEATS) {
-        if (!seat.id.startsWith('pool-hot-tub:')) continue;
+        if (!seat.id.startsWith(`${tub.id}:`)) continue;
         const d =
           (seat.sit.x - landing.x) ** 2 + (seat.sit.z - landing.z) ** 2;
         if (d < bestDist) {

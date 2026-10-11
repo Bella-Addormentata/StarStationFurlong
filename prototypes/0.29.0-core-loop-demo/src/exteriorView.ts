@@ -20,11 +20,7 @@
  */
 
 import * as THREE from "three";
-import {
-  readExterior,
-  nextFreeExteriorSlot,
-  writeExteriorSlot,
-} from "./exteriorDoc";
+import { readExterior, writeExteriorSlot } from "./exteriorDoc";
 import { doorDisplayName } from "./doorLayoutDoc";
 import type { DoorWall } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
@@ -486,20 +482,17 @@ function ensureToolbar(): HTMLDivElement {
 
 function renderToolbar(): void {
   const t = ensureToolbar();
-  const owner = ownerCheck();
-  const free = nextFreeExteriorSlot();
   // Owner request: the "🛰️ EXTERIOR VIEW · click a bellows joint…" bubble is
-  // GONE. The bar only appears when it holds something real — the owner's
-  // solar button, or a transient click-to-connect message (showToolbarHint).
-  t.innerHTML = `
-    <span id="exterior-toolbar-hint"></span>
-    ${owner ? `<button type="button" id="exterior-add-solar" ${free === null ? "disabled" : ""}>☀️ ADD SOLAR PANEL${free === null ? " (FULL)" : ""}</button>` : ""}
-  `;
-  t.querySelector("#exterior-add-solar")?.addEventListener("click", () => {
-    const slot = nextFreeExteriorSlot();
-    if (slot !== null) writeExteriorSlot(slot, { kind: "solar" });
-  });
-  t.style.display = owner && !orbitView ? "flex" : "none";
+  // GONE, and so (#223, for now) is the owner's ☀️ ADD SOLAR PANEL button —
+  // it needs a home somewhere else. Adding a panel is still
+  // exteriorDoc.nextFreeExteriorSlot + writeExteriorSlot(slot, { kind:
+  // "solar" }), and an owner still removes one by clicking it. The bar is left
+  // holding only the transient click-to-connect message (showToolbarHint), so
+  // it shows while that message does.
+  if (!document.getElementById("exterior-toolbar-hint")) {
+    t.innerHTML = `<span id="exterior-toolbar-hint"></span>`;
+  }
+  if (toolbarHintTimer === null || orbitView) t.style.display = "none";
 }
 
 /** Transient toolbar message (click-to-connect feedback) — shows the bar for
@@ -515,7 +508,7 @@ function showToolbarHint(msg: string): void {
   toolbarHintTimer = window.setTimeout(() => {
     toolbarHintTimer = null;
     hint.textContent = "";
-    if (!ownerCheck()) t.style.display = "none";
+    t.style.display = "none";
   }, 5000);
 }
 
