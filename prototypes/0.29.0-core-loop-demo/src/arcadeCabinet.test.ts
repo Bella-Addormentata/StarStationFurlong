@@ -168,11 +168,16 @@ function fakeElement(tag: string): FakeElement {
   return el;
 }
 
-function key(type: 'keydown' | 'keyup', code: string, extra: { key?: string; repeat?: boolean } = {}): Event {
+function key(
+  type: 'keydown' | 'keyup',
+  code: string,
+  extra: { key?: string; repeat?: boolean; target?: { tagName: string } } = {},
+): Event {
   const event = new Event(type, { cancelable: true });
   Object.defineProperty(event, 'code', { value: code });
   Object.defineProperty(event, 'key', { value: extra.key ?? code });
   Object.defineProperty(event, 'repeat', { value: extra.repeat ?? false });
+  if (extra.target) Object.defineProperty(event, 'target', { value: extra.target });
   return event;
 }
 
@@ -290,6 +295,22 @@ describe('the focus UI', () => {
       win.dispatchEvent(event);
       expect(event.defaultPrevented).toBe(false);
     }
+    ui.unmount();
+  });
+
+  it('leaves Enter to a focused button, so LEAVE works from the keyboard', () => {
+    const { ui, painter, fetchRom, host } = setup();
+    ui.mount(host as unknown as HTMLElement);
+    const onButton = key('keydown', 'Enter', { key: 'Enter', target: { tagName: 'BUTTON' } });
+    win.dispatchEvent(onButton);
+    expect(onButton.defaultPrevented).toBe(false);
+    expect(fetchRom).not.toHaveBeenCalled();
+    // Other keys on the button still drive the cabinet.
+    const arrow = key('keydown', 'ArrowDown', { target: { tagName: 'BUTTON' } });
+    win.dispatchEvent(arrow);
+    expect(arrow.defaultPrevented).toBe(true);
+    ui.update(1 / 60);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(1);
     ui.unmount();
   });
 
