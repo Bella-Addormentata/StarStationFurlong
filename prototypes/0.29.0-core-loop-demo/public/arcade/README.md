@@ -5,8 +5,10 @@ under licenses that allow redistribution. Each ROM below was built, unmodified,
 from the author's published source at the commit named, using cc65 2.19.
 Nothing here is a commercial ROM, and none came from archive.org.
 
-The emulator is [jsnes](https://github.com/bfirsh/jsnes) (Apache-2.0), bundled
-from npm.
+The emulator is [jsnes](https://github.com/bfirsh/jsnes) by Ben Firshman and
+contributors (Apache-2.0, license text in
+[`licenses/Apache-2.0-jsnes.txt`](licenses/Apache-2.0-jsnes.txt)), bundled from
+npm.
 
 | Game | Author | License | Source (commit) |
 |---|---|---|---|

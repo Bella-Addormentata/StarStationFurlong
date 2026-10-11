@@ -17,7 +17,7 @@
  * pass through untouched.
  */
 
-import { ARCADE_GAMES, parseInesHeader, type ArcadeGame } from './arcadeLibrary';
+import { ARCADE_GAMES, LICENSE_LABEL, parseInesHeader, type ArcadeGame } from './arcadeLibrary';
 import { ArcadeMachine, type NesButton, type NesPlayer } from './arcadeMachine';
 import { CREDIT_PAGES, type ArcadeMenuRow } from './arcadeScreen';
 import { ArcadeSpeaker } from './arcadeSpeaker';
@@ -92,6 +92,28 @@ export function menuInput(view: ArcadeView, button: NesButton): { view: ArcadeVi
     }
   }
   return { view, action: none };
+}
+
+/**
+ * The cabinet screen in words, for the strip's screen-reader status line:
+ * the menu and credits are painted into a 3D texture, which assistive tech
+ * cannot read.
+ */
+export function describeView(view: ArcadeView): string {
+  if (view.screen === 'menu') {
+    const row = menuRows()[view.cursor];
+    const parts = [`${row.label}, ${view.cursor + 1} of ${MENU.length}.`, ...(row.detail ?? [])];
+    if (view.status) parts.unshift(`${view.status}.`);
+    return parts.join(' ');
+  }
+  if (view.screen === 'credits') {
+    const game = ARCADE_GAMES[view.page];
+    return game
+      ? `Credits ${view.page + 1} of ${CREDIT_PAGES}: ${game.title} by ${game.author}, ${game.year}. License ${LICENSE_LABEL[game.license]}. Source ${game.sourceUrl}.`
+      : `Credits ${view.page + 1} of ${CREDIT_PAGES}: emulator jsnes, Apache-2.0. Your own cartridge stays on your device.`;
+  }
+  if (view.screen === 'loading') return `Loading ${view.title}.`;
+  return `Playing ${view.title}. Backspace returns to the menu, Escape leaves the cabinet.`;
 }
 
 /** Keyboard → NES pad (player 1). Arrows or WASD; X/K = A, Z/J = B. */
@@ -187,6 +209,8 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   let capture: HTMLDivElement | null = null;
   let strip: HTMLDivElement | null = null;
   let stripText: HTMLSpanElement | null = null;
+  /** Visually hidden live region: the screen's content, read aloud. */
+  let spoken: HTMLSpanElement | null = null;
 
   const present = () => deps.visual?.present();
 
@@ -195,6 +219,10 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     if (next.screen === 'menu') menuCursor = next.cursor;
     dirty = true;
     if (stripText) stripText.textContent = next.screen === 'playing' ? STRIP_PLAY : STRIP_MENU;
+    if (spoken) {
+      const words = describeView(next);
+      if (spoken.textContent !== words) spoken.textContent = words;
+    }
   };
 
   const paint = () => {
@@ -381,7 +409,14 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
         e.stopPropagation();
         deps.requestRelease();
       });
-      strip.append(stripText, leave);
+      spoken = document.createElement('span');
+      spoken.setAttribute('role', 'status');
+      spoken.setAttribute('aria-live', 'polite');
+      spoken.style.cssText = `
+        position:absolute; width:1px; height:1px; overflow:hidden;
+        clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap;`;
+      spoken.textContent = describeView(view);
+      strip.append(stripText, leave, spoken);
       host.append(capture, strip);
 
       window.addEventListener('keydown', onKeyDown, CAPTURE);
@@ -402,7 +437,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       speaker = null;
       capture?.remove();
       strip?.remove();
-      capture = strip = stripText = null;
+      capture = strip = stripText = spoken = null;
       if (fileInput) fileInput.onchange = null;
       deps.visual?.showAttract();
     },

@@ -45,6 +45,13 @@ describe('arcade library', () => {
     }
   });
 
+  it('every file the README links to ships (license texts, sources)', () => {
+    const readme = readFileSync(publicFile('/arcade/README.md'), 'utf8');
+    const links = [...readme.matchAll(/\]\(((?:licenses|source|roms)\/[^)]+)\)/g)].map((m) => m[1]);
+    expect(links).toContain('licenses/Apache-2.0-jsnes.txt');
+    for (const link of links) expect(existsSync(publicFile(`/arcade/${link}`)), link).toBe(true);
+  });
+
   it.each(ARCADE_GAMES.map((g) => [g.id, g] as const))('%s boots and draws in the emulator', (_id, game) => {
     const bytes = romBytes(game.romUrl);
     expect(parseInesHeader(bytes).ok).toBe(true);

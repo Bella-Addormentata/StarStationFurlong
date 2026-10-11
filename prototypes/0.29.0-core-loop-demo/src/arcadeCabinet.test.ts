@@ -13,6 +13,7 @@ import {
   cartridgeTitle,
   connectedPads,
   createArcadeCabinetUI,
+  describeView,
   keyToButton,
   menuInput,
   type ArcadeView,
@@ -142,6 +143,7 @@ interface FakeElement {
   append: (...els: FakeElement[]) => void;
   remove: () => void;
   addEventListener: () => void;
+  setAttribute: () => void;
 }
 
 const created: FakeElement[] = [];
@@ -160,6 +162,7 @@ function fakeElement(tag: string): FakeElement {
     append: (...els) => el.children.push(...els),
     remove: () => undefined,
     addEventListener: () => undefined,
+    setAttribute: () => undefined,
   };
   created.push(el);
   return el;
@@ -351,5 +354,98 @@ describe('the focus UI', () => {
     }
     expect(requestRelease).toHaveBeenCalledTimes(1);
     ui.unmount();
+  });
+});
+
+describe('gamepads at the cabinet', () => {
+  const thwaite = new Uint8Array(readFileSync(new URL('../public/arcade/roms/thwaite.nes', import.meta.url)));
+
+  /** A standard-mapping pad whose buttons and stick the test sets. */
+  function fakePad() {
+    const buttons = Array.from({ length: 17 }, () => ({ pressed: false }));
+    const pad = { connected: true, buttons, axes: [0, 0] };
+    return {
+      pad: pad as unknown as Gamepad,
+      press: (...indices: number[]) => indices.forEach((i) => (buttons[i].pressed = true)),
+      releaseAll: () => {
+        buttons.forEach((b) => (b.pressed = false));
+        pad.axes = [0, 0];
+      },
+      stick: (x: number, y: number) => (pad.axes = [x, y]),
+    };
+  }
+
+  function setupWithPads(count: number) {
+    const pads = Array.from({ length: count }, fakePad);
+    // A disconnect left slot 0 empty: the pads still map to players 1 and 2.
+    vi.stubGlobal('navigator', { getGamepads: () => [null, ...pads.map((p) => p.pad)] });
+    const painter = recordingPainter();
+    const visual: ArcadeCabinetVisualHandle = { painter, present: vi.fn(), showAttract: vi.fn() };
+    const fetchRom = vi.fn(async () => thwaite);
+    const ui = createArcadeCabinetUI({ visual, fetchRom, requestRelease: vi.fn() });
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    return { ui, painter, fetchRom, pads };
+  }
+
+  it("player 1's pad drives the menu by D-pad or stick, edge by edge; player 2's does not", () => {
+    const { ui, painter, pads } = setupWithPads(2);
+    pads[0].press(13); // D-pad down
+    ui.update(1 / 60);
+    ui.update(1 / 60); // still held: no second move
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(1);
+    pads[0].releaseAll();
+    ui.update(1 / 60);
+    pads[0].stick(0, 0.9); // stick down
+    ui.update(1 / 60);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(2);
+    pads[0].releaseAll();
+    pads[1].press(13);
+    ui.update(1 / 60);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(2);
+    ui.unmount();
+  });
+
+  it('A starts the game; holding Select+Start for a second returns to the menu', async () => {
+    const { ui, painter, fetchRom, pads } = setupWithPads(1);
+    pads[0].press(1); // A (right face button)
+    ui.update(1 / 60);
+    expect(fetchRom).toHaveBeenCalledWith(ARCADE_GAMES[0].romUrl);
+    pads[0].releaseAll();
+    await flush();
+    for (let i = 0; i < 10; i++) ui.update(1 / 60);
+    expect(painter.drawFrame).toHaveBeenCalled();
+
+    const menuDraws = painter.drawMenu.mock.calls.length;
+    pads[0].press(8, 9);
+    for (let i = 0; i < 30; i++) ui.update(1 / 60); // half a second: still playing
+    expect(painter.drawMenu.mock.calls.length).toBe(menuDraws);
+    for (let i = 0; i < 35; i++) ui.update(1 / 60);
+    expect(painter.drawMenu.mock.calls.length).toBeGreaterThan(menuDraws);
+    ui.unmount();
+  });
+
+  it('picking your own cartridge from a pad asks for the keyboard', () => {
+    const { ui, painter, pads } = setupWithPads(1);
+    for (let i = 0; i < OWN; i++) {
+      pads[0].press(13);
+      ui.update(1 / 60);
+      pads[0].releaseAll();
+      ui.update(1 / 60);
+    }
+    pads[0].press(9); // Start
+    ui.update(1 / 60);
+    expect(created.some((el) => el.tag === 'input')).toBe(false);
+    expect(painter.drawMenu.mock.lastCall?.[2]).toBe('PRESS ENTER ON THE KEYBOARD TO PICK A FILE');
+    ui.unmount();
+  });
+});
+
+describe('describeView (the screen-reader status line)', () => {
+  it('says what the cabinet screen shows', () => {
+    expect(describeView(menu(0))).toContain(`${ARCADE_GAMES[0].title}, 1 of ${MENU.length}.`);
+    expect(describeView({ screen: 'menu', cursor: OWN, status: 'NOT AN NES ROM' })).toMatch(/^NOT AN NES ROM\. INSERT YOUR OWN CARTRIDGE/);
+    expect(describeView({ screen: 'credits', page: 0 })).toContain(ARCADE_GAMES[0].author);
+    expect(describeView({ screen: 'loading', title: 'THWAITE' })).toBe('Loading THWAITE.');
+    expect(describeView({ screen: 'playing', title: 'THWAITE' })).toMatch(/^Playing THWAITE\./);
   });
 });

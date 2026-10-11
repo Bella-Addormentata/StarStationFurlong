@@ -25,6 +25,8 @@ export class ArcadeSpeaker {
   private right = new Float32Array(CAPACITY);
   private count = 0;
   private nextTime = 0;
+  /** Chunks queued on the audio clock and not yet ended (clear() stops them). */
+  private queued = new Set<AudioBufferSourceNode>();
   readonly sampleRate: number;
 
   constructor() {
@@ -69,17 +71,29 @@ export class ArcadeSpeaker {
     source.connect(this.gain);
     const now = ctx.currentTime;
     if (this.nextTime < now || this.nextTime > now + MAX_AHEAD_S) this.nextTime = now + LEAD_S;
+    source.onended = () => this.queued.delete(source);
+    this.queued.add(source);
     source.start(this.nextTime);
     this.nextTime += n / this.sampleRate;
   }
 
-  /** Drop whatever is buffered (back to the menu). */
+  /** Silence the cabinet now (back to the menu): drop what is buffered and
+   *  stop what is already queued, so the next game starts a fresh queue. */
   clear(): void {
     this.count = 0;
+    for (const source of this.queued) {
+      try {
+        source.stop();
+      } catch {
+        /* never started: nothing to stop */
+      }
+    }
+    this.queued.clear();
+    this.nextTime = 0;
   }
 
   close(): void {
-    this.count = 0;
+    this.clear();
     const ctx = this.ctx;
     this.ctx = null;
     this.gain = null;
