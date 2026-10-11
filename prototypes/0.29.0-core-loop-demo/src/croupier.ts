@@ -158,7 +158,8 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // but never revealed forfeits this round's bets.
   const live = readAllBets(tableId, round);
   const { bets, omitted } = frozenWagers(tableId, before, live);
-  for (const pid of forfeited) delete bets[pid];
+  // (A void round produced no pocket, so nobody's reveal mattered: no forfeits.)
+  if (!voided) for (const pid of forfeited) delete bets[pid];
   // A void round returns every stake on it; otherwise a bet that missed the
   // freeze (it arrived just after "no more bets") goes back to its bettor.
   const refunds: Record<string, number> = {};

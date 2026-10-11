@@ -388,6 +388,28 @@ describe('a Fair roulette round', () => {
     expect(readChips(AMY)).toBe(before);
   });
 
+  it("a void round refunds a bettor who never revealed, too", async () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    writeTableState(t, { ...readTableState(t)!, houseCommit: 'f'.repeat(64) });
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    writeMyBets(t, BOB, 1, [{ type: 'black', amount: 10 }]);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette');
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette', [AMY]); // Bob never reveals
+    const before = readChips(BOB);
+    later(CLOSING_MS);
+    tickAutoCroupier(t); // the settle waits on Bob
+    await flush();
+    later(REVEAL_GRACE_MS);
+    tickAutoCroupier(t);
+    await flush();
+    expect(readTableState(t)).toMatchObject({ phase: 'settled', voided: true });
+    expect(readChips(BOB)).toBe(before + 10);
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);
