@@ -872,7 +872,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const KEY_HELP = `${game === 'craps' ? 'Craps' : 'Roulette'} table. Arrow keys choose a box on the felt. `
     + '1 to 6 pick up a 1, 5, 25, 100, 500 or 1000 chip. Enter or Space bets your hand on the box. '
-    + 'Delete takes back the chips you put there this round. 0 puts your hand back. '
+    + 'Delete takes back the chips you put there this round, or your odds there. 0 puts your hand back. '
     + `${game === 'craps' ? 'R throws the dice when they are yours. ' : ''}`
     + 'I reads the table. S opens the table card. Escape steps away.';
 
