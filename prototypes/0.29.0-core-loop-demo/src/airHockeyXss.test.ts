@@ -21,8 +21,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { escapeHtml } from './htmlEscape';
 
 // airHockeySession publishes a debug handle on `window` when it loads (and
-// furniture.ts reads the page's query string).
-vi.stubGlobal('window', { location: { search: '' } });
+// furniture.ts reads the page's query string; editMode listens for keys).
+vi.stubGlobal('window', { location: { search: '' }, addEventListener: () => {}, removeEventListener: () => {} });
 const { airHockeySeatRowHtml } = await import('./airHockeySession');
 const { claimSide, initialAirHockeyState } = await import('./games/airHockey');
 const { PLAYER_NAME_MAX_LENGTH } = await import('./identity');
