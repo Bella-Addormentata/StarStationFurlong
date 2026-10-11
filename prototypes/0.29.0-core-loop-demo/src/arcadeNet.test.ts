@@ -153,6 +153,16 @@ describe('pad runs over a lossy lane', () => {
     expect(log.get(frameAdd(65400, 399))).toBe(pads[399]);
   });
 
+  it('across the wrap, a pad change on frame 0 still places the run before it', () => {
+    // Every other tick lost, so frame 65535 is only in frame 0's tick, as
+    // the earlier run.
+    const pads = new Uint16Array(100).map((_, i) => (i < 36 ? 1 : 2));
+    const log = relay(pads, (i) => i % 2 === 1, 65500);
+    expect(frameAdd(65500, 36)).toBe(0);
+    expect(log.get(65535)).toBe(1);
+    expect(log.run(65500)).toBe(99);
+  });
+
   it('places nothing before the first frame of a match', () => {
     const runs = new PadRuns();
     const log = new PadLog();
