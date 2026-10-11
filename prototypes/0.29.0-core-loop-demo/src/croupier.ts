@@ -116,8 +116,12 @@ export const ROULETTE_PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).s
 
 async function settleRoulette(tableId: string, round: number, autoShowMs?: number): Promise<void> {
   const epoch = casinoDocEpoch();
-  const closing = readTableState(tableId);
-  if (closing?.phase !== 'closing' || closing.round !== round) return;
+  const live0 = readTableState(tableId);
+  if (live0?.phase !== 'closing' || live0.round !== round) return;
+  // Fair or not goes by the house commit this page froze, when it froze one:
+  // erasing the live field after the close mustn't downgrade the round.
+  const frozenHouse = frozenFields(tableId, live0).houseCommit;
+  const closing: RouletteTableState = frozenHouse ? { ...live0, houseCommit: frozenHouse } : live0;
   let result: number | null;
   let fairness: FairnessTranscript | undefined;
   let forfeited: string[] = [];
@@ -158,7 +162,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // A void round returns every stake on it; otherwise a bet that missed the
   // freeze (it arrived just after "no more bets") goes back to its bettor.
   const refunds: Record<string, number> = {};
-  for (const pid of voided ? Object.keys(live) : omitted) {
+  // (A list rewritten after the close is refunded by nobody: its frozen
+  // amounts can't be rebuilt from the hash, and the rewrite could inflate them.)
+  for (const pid of voided ? [...Object.keys(bets), ...omitted] : omitted) {
     const sum = live[pid].reduce((n, b) => n + b.amount, 0);
     if (sum > 0) refunds[pid] = sum;
   }

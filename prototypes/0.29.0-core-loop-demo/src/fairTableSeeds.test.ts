@@ -354,6 +354,40 @@ describe('a Fair roulette round', () => {
     expect(readChips(AMY)).toBe(before + 10);
   });
 
+  it('erasing the house commit after the close still settles Fair, by the frozen one', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    writeTableState(t, { ...readTableState(t)!, houseCommit: undefined });
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.voided).toBeUndefined();
+    expect(s.fairness?.parties?.[0]).toBe('house');
+    expect(s.houseCommit).toBeTruthy();
+  });
+
+  it('a void round refunds only the frozen stake, not a list inflated after the close', async () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    writeTableState(t, { ...readTableState(t)!, houseCommit: 'f'.repeat(64) });
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette', [AMY]);
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette', [AMY]);
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 90 }]); // rewritten after the close
+    const before = readChips(AMY);
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    expect(readTableState(t)).toMatchObject({ phase: 'settled', voided: true });
+    expect(readChips(AMY)).toBe(before);
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);
@@ -655,6 +689,25 @@ describe('a Fair craps roll', () => {
     expect(s.phase).toBe('settled');
     expect(s.payouts?.[BOB]).toBeUndefined();
     expect(readAllCrapsBets(t)[BOB]).toBeUndefined();
+  });
+
+  it('erasing the house commit after the close still rolls Fair, by the frozen one', async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    writeCrapsTableState(t, { ...readCrapsTableState(t)!, houseCommit: undefined });
+    later(CRAPS_CLOSING_MS);
+    tickAutoStickman(t);
+    await flush();
+    const s = readCrapsTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.voided).toBeUndefined();
+    expect(s.fairness?.parties).toEqual(['house', AMY]);
   });
 
   it('settles only frozen bettors whose wager lists still match', () => {
