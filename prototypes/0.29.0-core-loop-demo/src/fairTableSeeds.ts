@@ -179,23 +179,11 @@ export function seedSigBytes(ctx: TableSeedContext, commit: string): Uint8Array 
   );
 }
 
-/** Each player's key as THIS page first saw it in this room (epoch:pid): a
- *  later rewrite of players[pid].keyB64 can't hand their seat to another key. */
-const pinnedKeys = new Map<string, string>();
-
 /** The identity key a player's records must be signed with: this page's own
- *  key for its own player, else the pinned (first-seen) players-map key. */
+ *  key for its own player, else the key pinned when this page first saw the
+ *  player in the room (casinoDoc.readPlayerKey). */
 export function keyFor(pid: string): string | undefined {
-  if (pid === getPlayerId()) return getIdentityPub();
-  const k = `${casinoDocEpoch()}:${pid}`;
-  const pinned = pinnedKeys.get(k);
-  if (pinned) return pinned;
-  const key = readPlayerKey(pid);
-  if (key) {
-    pinnedKeys.set(k, key);
-    evictOldest(pinnedKeys, 1024);
-  }
-  return key;
+  return pid === getPlayerId() ? getIdentityPub() : readPlayerKey(pid);
 }
 
 const sigChecks = new Map<string, boolean>();

@@ -18,7 +18,7 @@ const {
 const {
   BET_WINDOW_MS, CLOSING_MS, rollAndSettle, ROULETTE_PAGE_ID, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier,
 } = await import('./croupier');
-const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, pressManualRoll, tickAutoStickman } = await import('./crapsCroupier');
+const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, pressManualRoll, stickmanThrows, tickAutoStickman } = await import('./crapsCroupier');
 const {
   commitSeedSync, forgetMissingTables, keyFor, seedSigBytes, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
   wagerFingerprint,
@@ -508,6 +508,27 @@ describe('a Fair roulette round', () => {
     expect((await verifySettledRound('roulette', t, honest, { pocket: base.result! })).kind).toBe('verified');
   });
 
+  it("a player's key is pinned when the room shows it, before any seed is checked", () => {
+    const t = freshTable();
+    // Rewritten right after this page joined, before Amy ever bets.
+    room.getMap('players').set(AMY, { name: AMY, keyB64: ATTACKER.pub });
+    // A player who arrives later is pinned on arrival too.
+    room.getMap('players').set('player-Cat', { name: 'Cat', keyB64: getIdentityPub() });
+    room.getMap('players').set('player-Cat', { name: 'Cat', keyB64: ATTACKER.pub });
+    expect(keyFor(AMY)).toBe(getIdentityPub());
+    expect(keyFor('player-Cat')).toBe(getIdentityPub());
+    tickAutoCroupier(t);
+    const open = readTableState(t)!;
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    tickAutoCroupier(t);
+    const ctx = { room: '', table: t, round: 1, party: AMY, house: open.houseCommit! };
+    const commit = commitSeedSync('ab'.repeat(32), ctx);
+    writeMySeedRecord(t, AMY, { round: 1, house: open.houseCommit!, commit, sig: ATTACKER.sign(seedSigBytes(ctx, commit)) });
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    expect(readTableState(t)?.commits?.[AMY]).toBeUndefined();
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);
@@ -829,6 +850,25 @@ describe('a Fair craps roll', () => {
     expect(s.phase).toBe('settled');
     expect(s.voided).toBeUndefined();
     expect(s.fairness?.parties).toEqual(['house', AMY]);
+  });
+
+  it("a takeover stickman who doesn't hold the house seed voids the roll without throwing", async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    // Another house member's page took the round over: it never had the seed.
+    const closing = readCrapsTableState(t)!;
+    const foreign = { ...closing, houseCommit: 'e'.repeat(64) };
+    writeCrapsTableState(t, foreign);
+    forgetMissingTables(new Set()); // and never saw the close
+    stickmanThrows(t, foreign);
+    await flush();
+    expect(readDiceThrow(t)).toBeNull();
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'settled', voided: true, dice: null });
   });
 
   it('settles only frozen bettors whose wager lists still match', () => {

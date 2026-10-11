@@ -118,6 +118,7 @@ export function bindCasinoDoc(doc: Y.Doc, roomId = ''): void {
   bindingEpoch += 1;
   boundRoomId = roomId;
   boundDoc = doc;
+  pinPlayerKeys(doc);
   casinoMap = doc.getMap('casino');
   // 🪙 Index the coin pushers' requests now, outside any operator poll, and
   // observe ahead of notify() so listeners never see a stale index.
@@ -567,12 +568,41 @@ export function readSeedRecord(tableId: string, playerId: string): TableSeedReco
   return isTableSeedRecord(v) ? v : null;
 }
 
-/** A player's identity key as the room's players map carries it (the same
- *  base64url string keypair.getIdentityPub writes), or undefined. */
+// ⚖️ Each player's identity key as THIS page first saw it in the bound room
+// (trust on first use): pinned the moment the players map shows it — at bind,
+// then as entries sync or arrive — so a later rewrite of players[pid].keyB64
+// can't hand a player's seat to another key. Pins last as long as the doc
+// binding and are never evicted; past the cap, new players simply go unpinned
+// (and so can't add a signed seed) rather than unseat anyone.
+const MAX_PINNED_KEYS = 4096;
+let pinnedKeys = new Map<string, string>();
+
+function entryKey(v: unknown): string | undefined {
+  const k = (v as { keyB64?: unknown } | undefined)?.keyB64;
+  return typeof k === 'string' && k.length > 0 && k.length <= 128 ? k : undefined;
+}
+
+function pinPlayerKeys(doc: Y.Doc): void {
+  const pins = new Map<string, string>();
+  pinnedKeys = pins;
+  const players = doc.getMap('players');
+  const pin = (pid: string, v: unknown): void => {
+    if (pins.has(pid) || pins.size >= MAX_PINNED_KEYS || pid.length === 0 || pid.length > 128) return;
+    const k = entryKey(v);
+    if (k) pins.set(pid, k);
+  };
+  players.forEach((v, pid) => pin(pid, v));
+  players.observe((e) => {
+    for (const pid of e.keysChanged) pin(pid, players.get(pid));
+  });
+}
+
+/** A player's identity key as this page first saw it in the room's players
+ *  map (the same base64url string keypair.getIdentityPub writes), or
+ *  undefined while none has shown up. */
 export function readPlayerKey(playerId: string): string | undefined {
   if (!docAlive() || !boundDoc) return undefined;
-  const entry = boundDoc.getMap('players').get(playerId) as { keyB64?: unknown } | undefined;
-  return typeof entry?.keyB64 === 'string' && entry.keyB64.length > 0 && entry.keyB64.length <= 128 ? entry.keyB64 : undefined;
+  return pinnedKeys.get(playerId);
 }
 
 export function writeMySeedRecord(tableId: string, playerId: string, rec: TableSeedRecord): void {

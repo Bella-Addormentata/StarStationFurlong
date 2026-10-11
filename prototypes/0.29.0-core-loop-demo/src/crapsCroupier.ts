@@ -51,7 +51,7 @@ import { selectCrapsBackend } from './crapsBackend';
 import { getCrapsFairnessMode } from './games/diceFairness';
 // ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
 // at "no more bets" (fairTableSeeds.ts).
-import { freezeCommits, houseSeedHeld, isFairTable, newHouseCommit } from './fairTableSeeds';
+import { freezeCommits, frozenFields, houseSeedHeld, isFairTable, newHouseCommit } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet come-out table never throws to an empty felt). */
@@ -233,6 +233,12 @@ export function stickmanThrows(tableId: string, s: CrapsTableState, autoShowMs?:
   // The operator ticks every frame while the async settle is in flight: one
   // throw per roll, or every client's dice would restart their tumble.
   if (settling.has(tableId)) return;
+  // ⚖️ A Fair round whose house seed this page doesn't hold (a takeover) is
+  // void: settle it with no throw, so no client animates dice for it.
+  if ((s.houseCommit || frozenFields(tableId, s).houseCommit) && !houseSeedHeld(tableId, s)) {
+    rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
+    return;
+  }
   // ⚖️ A Fair settle can wait a beat on the bettors' reveals, and the tick
   // comes back every frame meanwhile: the stickman throws once per roll.
   const prev = readDiceThrow(tableId);
