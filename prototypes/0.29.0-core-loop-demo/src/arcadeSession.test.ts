@@ -114,6 +114,12 @@ function heal(): void {
   }
 }
 
+/** While split, hand `to` the doc updates `from` made so far (the rest of
+ *  the room still waits for heal()). */
+function deliver(from: Page, to: Page): void {
+  for (const h of held ?? []) if (h.from === from) to.Y.applyUpdate(to.doc, h.update, 'room');
+}
+
 /** Run every open page for `ms` of game time at 60 updates a second.
  *  `each` runs before every update (set pads, join…). */
 async function run(ms: number, each?: (step: number) => void): Promise<void> {
@@ -570,6 +576,44 @@ describe('rooms and builds', () => {
     expect(loser.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
     const { common, differ } = compare(winner, loser, 60);
     expect(common).toBeGreaterThan(60);
+    expect(differ).toEqual([]);
+  }, 60_000);
+
+  it('a watcher who saw the losing claim of a same-id clash switches to the game that stood', async () => {
+    const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
+    const CROOM = ARCADE_GAMES.find((g) => g.id === 'concentration-room')!;
+    split();
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    link(a, 0, 1).host(THWAITE);
+    link(b, 0, 1).host(CROOM);
+    await run(100);
+    random.mockRestore();
+    expect(a.games.readArcade(ITEM)!.id).toBe(b.games.readArcade(ITEM)!.id);
+
+    // Which claim the merge keeps, worked out on a scratch doc.
+    const probe = new c.Y.Doc();
+    c.Y.applyUpdate(probe, c.Y.encodeStateAsUpdate(c.doc));
+    for (const h of held!) c.Y.applyUpdate(probe, h.update);
+    const kept = (probe.getMap('games').get(ITEM) as { hostPage: string }).hostPage;
+    const [winner, loser] = kept === a.mod.arcadePage() ? [a, b] : [b, a];
+    const [won, lost] = winner === a ? [THWAITE, CROOM] : [CROOM, THWAITE];
+
+    // c hears the losing claim first, and follows it…
+    deliver(loser, c);
+    await run(300);
+    expect(c.mod.arcadeCopyInfo(ITEM)).toMatchObject({ role: 'follow', game: lost.id });
+
+    // …then the docs merge: same id, but another host's game. c switches
+    // on its next update, not only once the wrong ROM trips over the pads.
+    heal();
+    await run(1000 / 60);
+    expect(c.mod.arcadeCopyInfo(ITEM)).toMatchObject({ role: 'follow', game: won.id });
+    await run(3000);
+    expect(c.mod.arcadeCopyInfo(ITEM)).toMatchObject({ role: 'follow', game: won.id, started: true });
+    const from = winner.mod.arcadeCopyInfo(ITEM)!.next;
+    await run(1000);
+    const { common, differ } = compare(winner, c, from);
+    expect(common).toBeGreaterThan(30);
     expect(differ).toEqual([]);
   }, 60_000);
 

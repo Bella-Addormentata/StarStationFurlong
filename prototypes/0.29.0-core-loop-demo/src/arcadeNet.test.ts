@@ -146,6 +146,19 @@ describe('pad runs over a lossy lane', () => {
     expect(log.has(299)).toBe(false); // the earlier run's place isn't known
   });
 
+  it('a pad held for over half the u16 clock still reaches every frame', () => {
+    // Nobody touched the pad for ~10 minutes (32768+ frames): the run's
+    // length must not read as negative, or the tick would say only its own
+    // frame, and with every other tick sent the frames between go unknown.
+    const pads = new Uint16Array(40_000);
+    pads.fill(PAD_BIT.A, 0, 5);
+    const log = relay(pads, (i) => i % 2 === 0 || (i > 1000 && i < 39_000));
+    expect(log.run(39_000)).toBe(1000);
+    const runs = new PadRuns();
+    for (let f = 0; f < 34_000; f++) runs.record(f, 0);
+    expect(runs.tick()).toMatchObject({ frame: 33_999, run0: 255 });
+  });
+
   it('keeps counting across the u16 wrap', () => {
     const pads = script(400, 5);
     const log = relay(pads, (i) => i % 4 === 1, 65400);

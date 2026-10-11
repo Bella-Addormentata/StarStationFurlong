@@ -134,6 +134,8 @@ function romFor(game: ArcadeGame): Promise<Uint8Array> {
 /** This page's copy of one match. */
 interface Copy {
   matchId: number;
+  /** The record's host page: with the id and game, which record this runs. */
+  hostPage: string;
   game: ArcadeGame;
   role: 'host' | 'follow';
   machine: ArcadeMachine | null;
@@ -257,11 +259,13 @@ export function closeArcadeCabinet(itemId: string): void {
   sessions.delete(itemId);
 }
 
-function newCopy(s: CabinetSession, itemId: string, matchId: number, game: ArcadeGame, role: 'host' | 'follow'): Copy {
+function newCopy(
+  s: CabinetSession, itemId: string, matchId: number, hostPage: string, game: ArcadeGame, role: 'host' | 'follow',
+): Copy {
   s.copy?.machine?.stop();
   const now = Date.now();
   const copy: Copy = {
-    matchId, game, role,
+    matchId, hostPage, game, role,
     machine: null, rom: null, failed: false, started: false, next: 0, acc: 0, createdAt: now, ranNow: 0,
     pending: null, runs: new PadRuns(), guestPad: new GuestPad(), guestToken: 0, lastGuestAt: 0,
     syncAsked: false, snapshotBusy: false, lastSnapshotAt: 0, latestCheck: 0, sendToggle: false,
@@ -314,6 +318,13 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
 
 const gameById = (id: string): ArcadeGame | undefined => ARCADE_GAMES.find((g) => g.id === id);
 
+/** Is `copy` running the record `m`? Ticks carry only the id, but two pages
+ *  that claim a cabinet at once can draw the same one: the host page and the
+ *  game tell their records apart. */
+function isCopyOf(copy: Copy, m: ArcadeMatch): boolean {
+  return copy.matchId === m.id && copy.hostPage === m.hostPage && copy.game.id === m.game;
+}
+
 /** The ids the room's matches hold, this cabinet's own last one included:
  *  a new game there under its last host's id would look, to a page still
  *  following that one, like the same game, and it would never switch. */
@@ -350,10 +361,10 @@ function reconcile(itemId: string, s: CabinetSession, m: ArcadeMatch | null): vo
     }
     return;
   }
-  // The same match, and still ours to host if we were: two pages that
-  // claimed the cabinet at once under the same id leave one record, and the
-  // other page's copy follows it from here.
-  if (copy && copy.matchId === m.id && (copy.role !== 'host' || m.hostPage === PAGE)) return;
+  // The same match (a host's own record, too): two pages that claimed the
+  // cabinet at once leave one record, and a copy of the other one, host or
+  // follower, starts over on it here, even under the same id.
+  if (copy && isCopyOf(copy, m)) return;
   if (m.hostPage === PAGE) {
     // A record naming this page that it no longer runs (it was reloaded:
     // a new page id, so this can only be a leftover): end it.
@@ -371,7 +382,7 @@ function reconcile(itemId: string, s: CabinetSession, m: ArcadeMatch | null): vo
     }
     return;
   }
-  newCopy(s, itemId, m.id, game, 'follow');
+  newCopy(s, itemId, m.id, m.hostPage, game, 'follow');
 }
 
 // ── Inbound ticks (main.ts, for every arcade tick) ───────────────────────────
@@ -467,7 +478,7 @@ export function arcadeFrame(dt: number, viewer: { x: number; z: number } | null)
     if (copy) copy.ranNow = 0;
     try {
       if (copy?.role === 'host') hostFrame(itemId, s, copy, step, now);
-      else if (copy && m && copy.matchId === m.id) followFrame(itemId, s, copy, m, step, now);
+      else if (copy && m && isCopyOf(copy, m)) followFrame(itemId, s, copy, m, step, now);
     } catch {
       // The emulator threw mid-frame (a bad save state, a jsnes bug): drop
       // this copy; a follower starts over, a host ends its game.
@@ -496,7 +507,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   const machine = copy.machine;
   if (!machine || !copy.started) return;
   let m = readArcade(itemId);
-  if (!m || m.id !== copy.matchId || m.hostPage !== PAGE) return; // reconcile has it next update
+  if (!m || !isCopyOf(copy, m)) return; // reconcile has it next update
   if (mustYieldId(itemId, m)) {
     // Ticks carry only the id: move to a fresh one. Copies that followed
     // the old id start over (from a save state if they missed the start).
@@ -549,7 +560,10 @@ async function writeSnapshot(itemId: string, s: CabinetSession, copy: Copy): Pro
   copy.snapshotBusy = true;
   try {
     const data = await encodeSnapshot(state, boot);
-    if (s.copy === copy && inBoundRoom(s) && readArcade(itemId)?.id === copy.matchId) {
+    // Still this page's game: a claim that lost the cabinet meanwhile, even
+    // under the same id, must not write its state over the winner's.
+    const m = readArcade(itemId);
+    if (s.copy === copy && inBoundRoom(s) && m && isCopyOf(copy, m)) {
       writeArcadeSnapshot(itemId, { kind: 'arcade-snapshot', id: copy.matchId, next, data });
     }
   } catch {
@@ -783,7 +797,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
         };
       }
       const m = readArcade(itemId);
-      if (!m || !copy || copy.matchId !== m.id) return null;
+      if (!m || !copy || !isCopyOf(copy, m)) return null;
       const silent = hostSilentFor(s, copy, Date.now());
       if (silent > HOST_GONE_MS) return null; // gone: the cabinet is free
       const phase: SharedPhase = silent > HOST_SILENT_MS ? 'ended' : copy.started && !copy.needSync ? 'playing' : 'joining';
@@ -809,7 +823,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       const s = session();
       if (!s) return;
       const hostSeat: 0 | 1 = seats === 2 ? seat : 0;
-      const copy = newCopy(s, itemId, 0, game, 'host');
+      const copy = newCopy(s, itemId, 0, PAGE, game, 'host');
       const match = newMatch({
         game: game.id, host: getPlayerId(), hostPage: PAGE, hostSeat, now: Date.now(), taken: idsInUse(),
       });
@@ -877,11 +891,13 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
 
 // ── Tests and debugging ──────────────────────────────────────────────────────
 
-/** This page's copy of the cabinet's shared game: its role, the frame it
+/** This page's copy of the cabinet's shared game: its role and game, the frame it
  *  runs next, and whether it is running yet. */
-export function arcadeCopyInfo(itemId: string): { role: 'host' | 'follow'; next: number; started: boolean } | null {
+export function arcadeCopyInfo(
+  itemId: string,
+): { role: 'host' | 'follow'; game: string; next: number; started: boolean } | null {
   const copy = sessions.get(itemId)?.copy;
-  return copy ? { role: copy.role, next: copy.next, started: copy.started && !copy.needSync } : null;
+  return copy ? { role: copy.role, game: copy.game.id, next: copy.next, started: copy.started && !copy.needSync } : null;
 }
 
 /** Forget every cabinet (tests). */
