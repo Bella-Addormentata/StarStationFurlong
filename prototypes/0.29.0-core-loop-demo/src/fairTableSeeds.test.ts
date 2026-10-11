@@ -658,12 +658,42 @@ describe('a Fair craps roll', () => {
     later(CRAPS_BET_WINDOW_MS);
     tickAutoStickman(t);
     playersLook(t, 'craps', [AMY]);
+    writeMyCrapsBets(t, BOB, [{ type: 'field', amount: 5 }]); // lands after the close
     later(CRAPS_CLOSING_MS);
     tickAutoStickman(t);
     await flush();
     const s = readCrapsTableState(t)!;
     expect(s).toMatchObject({ phase: 'settled', dice: null, voided: true, point: null });
     expect(readAllCrapsBets(t)[AMY]).toEqual([{ type: 'pass', amount: 10 }]);
+    // Bob wasn't staked at the close, so his late list just rides (craps).
+    expect(readAllCrapsBets(t)[BOB]).toEqual([{ type: 'field', amount: 5 }]);
+  });
+
+  it('a void roll clears a list rewritten after the close instead of letting it ride', async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeCrapsTableState(t, { ...readCrapsTableState(t)!, houseCommit: 'f'.repeat(64) });
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    writeMyCrapsBets(t, AMY, [{ type: 'anyseven', amount: 50 }]); // rewritten after the close
+    later(CRAPS_CLOSING_MS);
+    tickAutoStickman(t);
+    await flush();
+    expect(readCrapsTableState(t)?.voided).toBe(true);
+    expect(readAllCrapsBets(t)[AMY]).toBeUndefined();
+  });
+
+  it('a played round stamped void fails the state guard', () => {
+    const t = freshTable();
+    writeCrapsTableState(t, {
+      kind: 'craps', phase: 'settled', round: 1, point: null, dice: [3, 4], result: 7,
+      resultAt: T0, payouts: {}, voided: true,
+    } as CrapsTableState);
+    expect(readCrapsTableState(t)).toBeNull();
   });
 
   it('an RNG table skips the exchange and carries no transcript', async () => {

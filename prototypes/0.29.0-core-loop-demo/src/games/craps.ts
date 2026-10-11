@@ -273,7 +273,9 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
         )
     ))
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
-    && (s.voided === undefined || typeof s.voided === 'boolean')
+    // A void is the canonical no-outcome shape: no dice, no transcript.
+    && (s.voided === undefined || (typeof s.voided === 'boolean'
+      && (!s.voided || (s.dice === null && s.result === null && s.fairness === undefined))))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))

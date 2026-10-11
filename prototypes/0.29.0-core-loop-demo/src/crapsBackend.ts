@@ -120,6 +120,11 @@ class LocalCrapsBackend implements CrapsBackend {
           ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
         });
         settledRound(tableId, before);
+        // Every bet stands — as frozen at "no more bets". A list rewritten
+        // since can't be restored from its hash, so it's cleared like a
+        // forfeit rather than left to ride into the next roll.
+        const { voided } = frozenWagers(tableId, before, readAllCrapsBets(tableId));
+        for (const pid of voided) writeMyCrapsBets(tableId, pid, []);
         return null;
       }
       const mixed = await settleParties('craps', gathered.parties, tableId, round);

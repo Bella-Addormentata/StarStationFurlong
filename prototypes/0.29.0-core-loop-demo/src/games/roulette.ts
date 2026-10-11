@@ -114,7 +114,9 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.operator === undefined || (typeof s.operator === 'string' && s.operator.length <= 192))
-    && (s.voided === undefined || typeof s.voided === 'boolean')
+    // A void is the canonical no-outcome shape: no pocket, no transcript.
+    && (s.voided === undefined || (typeof s.voided === 'boolean'
+      && (!s.voided || (s.result === null && s.fairness === undefined))))
     && isSeedRoundFields(s);
 }
 

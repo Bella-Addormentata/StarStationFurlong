@@ -1098,6 +1098,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (s?.phase !== 'settled') return null;
     const what = game === 'craps' ? 'LAST ROLL' : 'LAST SPIN';
     if (s.voided) {
+      // A void is only the canonical no-outcome shape: no result, no payouts,
+      // no transcript. `voided` stamped on a played round is a failed check.
+      const played = s.result !== null || (cs?.dice ?? null) !== null || !!s.fairness
+        || Object.keys(s.payouts ?? {}).length > 0;
+      if (played) return { text: `✗ ${what} · CHECK FAILED (A PLAYED ROUND MARKED VOID)`, color: '#FF8A80' };
       return {
         text: `⚠ ${what} VOIDED · THE HOUSE SEED WAS UNAVAILABLE · ${game === 'craps' ? 'EVERY BET STANDS' : 'STAKES RETURNED'}`,
         color: '#F5C26B',
