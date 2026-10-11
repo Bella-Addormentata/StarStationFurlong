@@ -30,6 +30,7 @@ import type {
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
+  FaucetDishHandle,
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
   PropAnimHandle,
@@ -73,6 +74,8 @@ export interface FurnitureHandleSinks {
   /** 🎲🎡 #226: craps / roulette table pieces (felt, chips, dice, wheel),
    *  keyed by item id — driven every frame by casinoTableSession.ts. */
   casinoTableVisuals: Map<string, CasinoTableVisualHandle>;
+  /** ⛓️🥣 Faucet dish fixtures (jar level + the mojo in the dish), keyed by item id — driven at ~1 Hz. */
+  faucetDishes: Map<string, FaucetDishHandle>;
 }
 
 /**
@@ -107,4 +110,5 @@ export function registerFurnitureHandles(
   if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);
   if (d.alligators) sinks.alligatorsVisuals.set(itemId, d.alligators as AlligatorsVisualHandle);
   if (d.casinoTable) sinks.casinoTableVisuals.set(itemId, d.casinoTable as CasinoTableVisualHandle);
+  if (d.faucetDish) sinks.faucetDishes.set(itemId, d.faucetDish as FaucetDishHandle);
 }

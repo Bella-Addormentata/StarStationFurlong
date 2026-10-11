@@ -99,9 +99,15 @@ pub fn build_publish_bundle(
     StandardLayer::new(synthetic_pk)
         .spend(&mut ctx, coin, conditions)
         .map_err(|e| anyhow!("standard-layer spend: {e:?}"))?;
-    let coin_spends: Vec<CoinSpend> = ctx.take();
+    sign_standard_spends(chia_sk, ctx.take())
+}
 
-    // Sign for testnet11: agg_sig_me additional data == testnet11 genesis challenge.
+/// Sign standard-puzzle coin spends with our SYNTHETIC key for testnet11
+/// (agg_sig_me additional data == the testnet11 genesis challenge) and bundle
+/// them. Shared by the presence publisher and the faucet dish's GIVE spend.
+pub fn sign_standard_spends(chia_sk: &SecretKey, coin_spends: Vec<CoinSpend>) -> Result<SpendBundle> {
+    let synthetic_sk: SecretKey = chia_sk.derive_synthetic();
+    let synthetic_pk: PublicKey = synthetic_sk.public_key();
     let mut allocator = Allocator::new();
     let constants = AggSigConstants::from(&*TESTNET11_CONSTANTS);
     let required = RequiredSignature::from_coin_spends(&mut allocator, &coin_spends, &constants)

@@ -13,6 +13,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
+import { parseFaucetReply, setFaucetReply } from "./faucetDish";
 import { roomIsPublicSpace } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
@@ -1968,6 +1969,14 @@ async function joinRoomAtEpoch(
     (env: { kind?: string; payload?: string; room?: string }) => {
       if (env.kind === "ysync") {
         yjsSync?.ingestEnvelope(env);
+        return;
+      }
+      // 🥣 Faucet lane (#231 onboarding): the node answers the dish's
+      // status / take / give requests on the stream they came in on; the
+      // reply lands in faucetDish.ts, which the fixture and its screen read.
+      if (env.kind === "faucet" && typeof env.payload === "string" && typeof env.room === "string") {
+        const reply = parseFaucetReply(env.payload);
+        if (reply) setFaucetReply(env.room, reply);
         return;
       }
       if (env.kind === "bridge" && typeof env.payload === "string") {
@@ -9878,6 +9887,16 @@ async function init() {
   // Create world
   world = new worldModule.World(scene);
   (window as any).world = world;
+
+  // 🥣 Faucet dish (#231 onboarding): the fixture's take / give / status
+  // requests go to the LOCAL node over the faucet lane; replies come back
+  // through onEnvelope (joinRoomAtEpoch) into faucetDish.ts, which World
+  // reads ~1 Hz for the jar level and the mojo in the dish. A slow poll keeps
+  // the prop honest for players who never focus the screen (18.75 s blocks).
+  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
+  window.setInterval(() => {
+    if (world.hasFaucetDish()) networkProvider.requestFaucet("status").catch(() => {});
+  }, 60_000);
 
   // 🖱️ Right-click context menu (MOVE / DELETE on furniture) needs the world
   // OUTSIDE an edit session — same registration idiom as the owner gate below.

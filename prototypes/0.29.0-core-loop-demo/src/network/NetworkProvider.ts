@@ -24,6 +24,7 @@ import type {
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
 import { buildRoomCapPayload, nextCapSeq, readChiaMode } from './roomCap.ts';
+import type { FaucetOp } from '../faucetDish.ts';
 
 export interface NetworkDebugInfo {
   mode: TransportMode;
@@ -290,6 +291,37 @@ export class NetworkProvider implements NetworkProviderPort {
     const boot = this.#boot;
     if (boot?.roomKeyB64) {
       await this.sendRoomCap(boot.roomId, boot.roomKeyB64, readChiaMode(boot.roomId));
+    }
+  }
+
+  /** ⛓️🥣 Ask the LOCAL node about this room's faucet dish — `status` (what is
+   *  in the jar and the dish), `claim` (take the ready mojo to our wallet) or
+   *  `give` (pay `amount` mojos from our wallet into the jar). One fresh
+   *  bidirectional stream per request, the `cap` framing; the node answers on
+   *  that stream with a `faucet` envelope, which arrives through onEnvelope.
+   *  The node derives the faucet address from the room key it already holds
+   *  from `cap`, so nothing secret travels here. */
+  async requestFaucet(op: FaucetOp, amount?: number): Promise<void> {
+    const boot = this.#boot;
+    if (!this.#wt || this.#mode === 'offline' || !boot) return;
+    try {
+      const body: { op: FaucetOp; amount?: number } = { op };
+      if (op === 'give') body.amount = Math.max(0, Math.floor(amount ?? 0));
+      const payloadBytes = new TextEncoder().encode(JSON.stringify(body));
+      const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
+      const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq: 0, author: '', payload: payloadB64 };
+      const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
+      const packet = new Uint8Array(4 + jsonBytes.length);
+      new DataView(packet.buffer).setUint32(0, jsonBytes.length, true);
+      packet.set(jsonBytes, 4);
+      const stream = await this.#wt.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(packet);
+      writer.releaseLock();
+      // The reply comes back on THIS stream: drain it like a node-opened one.
+      void this.#drainNodeStream(stream);
+    } catch (e) {
+      console.warn('Failed to send faucet request to node:', e);
     }
   }
 

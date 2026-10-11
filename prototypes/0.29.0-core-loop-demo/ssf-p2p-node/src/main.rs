@@ -24,6 +24,10 @@ mod chia_rooms;
 mod chia_resolve;
 #[cfg(feature = "chia-read")]
 mod chia_watch;
+// The faucet dish's coin (#231 onboarding phase): per-room address, status,
+// and — in a publish build — the keyless claim and the give spend.
+#[cfg(feature = "chia-read")]
+mod chia_faucet;
 // Chain WRITES (`chia-publish`, runtime-gated by SSF_CHIA_LANE=1): wallet seed,
 // spend-to-self publish, craps fairness.
 #[cfg(feature = "chia-publish")]
@@ -53,7 +57,7 @@ mod b64 {
 pub struct SsfEnvelope {
     pub v: u32,
     pub room: String,
-    pub kind: String, // tick | awareness | ysync | roomlog | asset | cap | ping | pong
+    pub kind: String, // tick | awareness | ysync | roomlog | asset | cap | faucet | ping | pong
     pub seq: u32,
     #[serde(with = "b64")]
     pub author: Vec<u8>,
@@ -367,6 +371,11 @@ pub struct HubState {
     /// so it is in the default build.
     #[cfg(feature = "chia-read")]
     pub chia_rooms: Mutex<HashMap<String, chia_rooms::ChiaRoomCap>>,
+    /// ⛓️🥣 The wallet key `SSF_CHIA_LANE=1` loaded at startup (publish build),
+    /// so the faucet dish can TAKE (claim to our address) and GIVE (pay from our
+    /// coin) on the local browser's request. `None` while publishing is off.
+    #[cfg(feature = "chia-publish")]
+    pub chia_wallet: Mutex<Option<chia_bls::SecretKey>>,
 }
 
 /// R1 live reachability posture. The auto public-IP echo loop writes here as
@@ -1313,6 +1322,8 @@ async fn main() -> Result<()> {
         reach: reach.clone(),
         #[cfg(feature = "chia-read")]
         chia_rooms: Mutex::new(HashMap::new()),
+        #[cfg(feature = "chia-publish")]
+        chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
     });
 
     // 💾 C4/B restore: load persisted room docs and serve them from boot.
@@ -1656,6 +1667,34 @@ async fn handle_wt_connection_inner(
                                         "⛓️ ChiaHub lane: ignoring a room cap from a non-loopback browser session ({remote_addr_inner}) — caps are the LOCAL browser's alone"
                                     );
                                 }
+                            }
+                            continue;
+                        }
+
+                        // ⛓️🥣 A `faucet` request from the LOCAL browser (the dish's
+                        // status / take / give). The browser opens one stream per
+                        // request, like `cap`, so it is served inline here and answered
+                        // on the same stream; never relayed. Loopback-only for the same
+                        // reason as `cap`: a remote session could otherwise spend from
+                        // THIS node's wallet or claim to its address.
+                        if envelope.kind == "faucet" {
+                            #[cfg(feature = "chia-read")]
+                            {
+                                let reply = if chia_rooms::cap_source_is_local(&remote_addr_inner) {
+                                    let ctx = chia_faucet::FaucetContext {
+                                        rooms: &hub_clone.chia_rooms,
+                                        #[cfg(feature = "chia-publish")]
+                                        wallet: hub_clone.chia_wallet.lock().unwrap().clone(),
+                                    };
+                                    chia_faucet::handle_request(&ctx, &envelope.room, &envelope.payload).await
+                                } else {
+                                    eprintln!(
+                                        "⛓️🥣 faucet: refusing a request from a non-loopback browser session ({remote_addr_inner})"
+                                    );
+                                    chia_faucet::FaucetReply::refused("faucet requests are the LOCAL browser's alone")
+                                };
+                                let mut s = send.lock().await;
+                                let _ = write_faucet_reply(&mut *s, &envelope.room, &reply).await;
                             }
                             continue;
                         }
@@ -2814,6 +2853,34 @@ async fn broadcast_bridge_status(
             }
         });
     }
+}
+
+/// ⛓️🥣 Answer a `faucet` request on the stream it came in on (same framing as
+/// every browser lane message: `[u32-LE len][JSON SsfEnvelope]`, JSON payload).
+#[cfg(feature = "chia-read")]
+async fn write_faucet_reply<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    room_id: &str,
+    reply: &chia_faucet::FaucetReply,
+) -> Result<()> {
+    let env = SsfEnvelope {
+        v: 1,
+        room: room_id.to_string(),
+        kind: "faucet".to_string(),
+        seq: 0,
+        author: vec![],
+        payload: serde_json::to_vec(reply)?,
+        sig: None,
+        iroh_node_id: None,
+        iroh_relay_urls: None,
+        iroh_direct_addrs: None,
+        trust_tier: None,
+        iroh_member_hints: None,
+    };
+    let bytes = serde_json::to_vec(&env)?;
+    writer.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+    writer.write_all(&bytes).await?;
+    Ok(())
 }
 
 /// Push a `bridge` status envelope to the local browser so the UI can show

@@ -1,0 +1,123 @@
+import { describe, expect, it } from 'vitest';
+import {
+  asFaucetStatus,
+  blocksToMinutes,
+  clearFaucetRoom,
+  dishLine,
+  faucetPending,
+  formatMojos,
+  jarLevel,
+  latestFaucetStatus,
+  markFaucetPending,
+  parseFaucetReply,
+  setFaucetReply,
+  type FaucetStatus,
+} from './faucetDish';
+
+const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
+  address: 'txch1qqqq',
+  puzzleHash: '00'.repeat(32),
+  gift: 1,
+  gap: 32,
+  peak: 140,
+  totalMojos: 1005,
+  coins: 2,
+  ready: 1,
+  nextReadyInBlocks: 22,
+  canClaim: false,
+  canGive: false,
+  walletMojos: null,
+  note: '',
+  ...over,
+});
+
+const b64 = (v: unknown): string => btoa(JSON.stringify(v));
+
+describe('faucet dish: node replies', () => {
+  it('parses a status reply and shape-guards it', () => {
+    const reply = parseFaucetReply(b64({ op: 'status', ok: true, status: status() }));
+    expect(reply?.ok).toBe(true);
+    expect(reply?.status?.coins).toBe(2);
+    expect(reply?.status?.nextReadyInBlocks).toBe(22);
+    // nextReadyInBlocks null is a legal "everything is ready" value.
+    expect(parseFaucetReply(b64({ op: 'status', ok: true, status: status({ nextReadyInBlocks: null }) }))?.status?.nextReadyInBlocks).toBeNull();
+  });
+
+  it('rejects junk, bad shapes and negative numbers', () => {
+    expect(parseFaucetReply('not base64 json')).toBeNull();
+    expect(parseFaucetReply(b64({ ok: true }))).toBeNull();
+    expect(parseFaucetReply(b64({ op: 'status', ok: true, status: { address: 1 } }))).toBeNull();
+    expect(asFaucetStatus(status({ coins: -1 }))).toBeNull();
+    expect(asFaucetStatus({ ...status(), ready: 'two' })).toBeNull();
+    expect(asFaucetStatus({ ...status(), walletMojos: 'lots' })).toBeNull();
+  });
+
+  it('keeps an error reply and a spent coin', () => {
+    const err = parseFaucetReply(b64({ op: 'claim', ok: false, error: 'no mojo in the dish right now' }));
+    expect(err).toEqual({ op: 'claim', ok: false, error: 'no mojo in the dish right now' });
+    const took = parseFaucetReply(b64({ op: 'claim', ok: true, spentCoin: 'ab'.repeat(32) }));
+    expect(took?.spentCoin).toBe('ab'.repeat(32));
+  });
+});
+
+describe('faucet dish: what it shows', () => {
+  it('fills the jar by gift slots, not mojos', () => {
+    expect(jarLevel(null)).toBe(0);
+    expect(jarLevel(status({ coins: 0, totalMojos: 0 }))).toBe(0);
+    expect(jarLevel(status({ coins: 2 }))).toBeCloseTo(0.25);
+    expect(jarLevel(status({ coins: 8 }))).toBe(1);
+    expect(jarLevel(status({ coins: 50, totalMojos: 10 ** 12 }))).toBe(1);
+  });
+
+  it('says what is in the dish', () => {
+    expect(dishLine(null)).toBe('READING THE CHAIN…');
+    expect(dishLine(status({ coins: 0, ready: 0 }))).toContain('JAR IS EMPTY');
+    expect(dishLine(status({ ready: 1 }))).toBe('1 MOJO IN THE DISH');
+    expect(dishLine(status({ ready: 3 }))).toBe('3 MOJOS IN THE DISH');
+    expect(dishLine(status({ ready: 0, nextReadyInBlocks: 22 }))).toBe('DISH EMPTY · REFILLS IN 22 BLOCKS (~7 MIN)');
+    expect(dishLine(status({ ready: 0, nextReadyInBlocks: 1 }))).toBe('DISH EMPTY · REFILLS IN 1 BLOCK (~1 MIN)');
+    expect(dishLine(status({ ready: 0, nextReadyInBlocks: null }))).toBe('DISH EMPTY');
+  });
+
+  it('formats mojos with TXCH from a billion up', () => {
+    expect(blocksToMinutes(32)).toBe(10);
+    expect(formatMojos(1)).toBe('1 mojo');
+    expect(formatMojos(1005)).toBe('1,005 mojos');
+    expect(formatMojos(1_000_000_000)).toBe('1,000,000,000 mojos (0.001 TXCH)');
+    expect(formatMojos(2.5e12)).toBe('2,500,000,000,000 mojos (2.500 TXCH)');
+  });
+});
+
+describe('faucet dish: per-room store', () => {
+  it('files statuses and clears a pending take once the wallet holds a coin', () => {
+    const room = 'home-store-1';
+    clearFaucetRoom(room);
+    expect(latestFaucetStatus(room)).toBeNull();
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0, canClaim: true }) });
+    expect(latestFaucetStatus(room)?.canClaim).toBe(true);
+    markFaucetPending(room, 'claim', 1_000);
+    expect(faucetPending(room, 2_000)).toBe('claim');
+    // A status that still shows an empty wallet keeps the take pending…
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0 }) });
+    expect(faucetPending(room, 3_000)).toBe('claim');
+    // …the one that shows the mojo landed clears it.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 1, ready: 0 }) });
+    expect(faucetPending(room, 4_000)).toBeNull();
+    clearFaucetRoom(room);
+  });
+
+  it('clears a pending give when the wallet shrinks, drops it on a refusal, and times out', () => {
+    const room = 'home-store-2';
+    clearFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000 }) });
+    markFaucetPending(room, 'give', 10_000);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000 }) });
+    expect(faucetPending(room, 11_000)).toBeNull();
+    markFaucetPending(room, 'give', 20_000);
+    setFaucetReply(room, { op: 'give', ok: false, error: 'your wallet is empty' });
+    expect(faucetPending(room, 21_000)).toBeNull();
+    markFaucetPending(room, 'claim', 30_000);
+    expect(faucetPending(room, 30_000 + 120_001)).toBeNull();
+    clearFaucetRoom(room);
+  });
+});
