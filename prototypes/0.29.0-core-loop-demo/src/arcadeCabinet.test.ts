@@ -26,7 +26,7 @@ function fakeCanvas() {
 
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
-const { buildItemGroup, FURNITURE_DEFS } = await import('./furniture');
+const { buildItemGroup, ARCADE_GEAR_Y, FURNITURE_DEFS } = await import('./furniture');
 
 const ID = 'arcade-cabinet-1';
 
@@ -45,10 +45,13 @@ function sinks(): FurnitureHandleSinks {
   };
 }
 
+/** The screen: the canvas-textured plane that carries the screen handle
+ *  (the ⚙️'s face is canvas-textured too). */
 function screenPlane(group: THREE.Group): THREE.Mesh | null {
   let found: THREE.Mesh | null = null;
   group.traverse((obj) => {
-    if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) found = obj;
+    if (obj instanceof THREE.Mesh && obj.userData.arcadeScreen
+      && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) found = obj;
   });
   return found;
 }
@@ -88,6 +91,29 @@ describe('the arcade cabinet as built', () => {
     const def = FURNITURE_DEFS['arcade-cabinet'];
     expect(def.device?.kind).toBe('arcade');
     expect(def.device?.front.z).toBeGreaterThan(d(def));
+  });
+
+  it('has a ⚙️ low on its front, by the floor, that names the cabinet it opens', () => {
+    const group = build();
+    const gears: THREE.Mesh[] = [];
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.arcadeControl) gears.push(obj); });
+    expect(gears.length).toBe(2); // the rim and the emoji's face
+    const deck = new THREE.Box3().setFromObject(screenPlane(group)!);
+    for (const gear of gears) {
+      expect(gear.userData).toMatchObject({ arcadeControl: 'settings', arcadeCabinetId: ID });
+      const box = new THREE.Box3().setFromObject(gear);
+      expect(box.max.y).toBeLessThan(0.3); // below the coin door, far under the screen
+      expect(box.max.y).toBeLessThan(deck.min.y);
+      expect(box.getCenter(new THREE.Vector3()).y).toBeCloseTo(ARCADE_GEAR_Y, 5);
+      expect(box.max.z).toBeGreaterThan(FURNITURE_DEFS['arcade-cabinet'].footprint!.d / 2 - 0.15); // on the front face
+    }
+    const face = gears.find((g) => (g.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture);
+    expect(face).toBeDefined();
+    expect((face!.material as THREE.MeshBasicMaterial).userData.baseOpacity).toBe(1); // fades in with the rest
+    // Not the screen: the handle is still the one on the screen plane.
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, ID, obj); });
+    expect(s.arcadeScreens.size).toBe(1);
   });
 
   it('redraws only when the view changes — a blink is a change', () => {
