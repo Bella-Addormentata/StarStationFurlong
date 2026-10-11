@@ -213,7 +213,30 @@ describe('the dialog', () => {
     press(el, 'reset');
     expect(readArcade(ITEM)).toBeNull();
     expect(el.innerHTML).toContain('THE GAME ENDED · THE CABINET IS FREE');
+    start(0); // someone starts another: the notice no longer holds
+    expect(el.innerHTML).not.toContain('THE GAME ENDED');
+    expect(el.innerHTML).toContain('PLAYER 1 · ADA');
     card.close();
+  });
+
+  it('keeps up with a renamed player and with who may edit the room', () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      start(0);
+      let owner = false;
+      const card = openArcadeCard(fake() as unknown as HTMLElement, { itemId: ITEM, seats: 2, isOwner: () => owner }, 'fixed');
+      const el = card.el as unknown as Fake;
+      expect(el.innerHTML).toContain('PLAYER 1 · ADA');
+      name('ada-id', 'Ada Lovelace'); // the players map, not the games map
+      owner = true; // the deed changed hands
+      vi.advanceTimersByTime(1000);
+      expect(el.innerHTML).toContain('PLAYER 1 · ADA LOVELACE');
+      expect(el.innerHTML).toContain('YOU RUN THIS CABINET');
+      card.close();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('closes on ✕ or Esc, and stops following the doc', () => {

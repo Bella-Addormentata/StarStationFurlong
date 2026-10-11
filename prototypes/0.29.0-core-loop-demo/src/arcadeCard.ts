@@ -172,6 +172,10 @@ export interface ArcadeCard {
 
 const roomNow = (): unknown => (globalThis as { __ssfRoomId?: unknown }).__ssfRoomId;
 
+/** Player names and who may edit the room live outside the games map: an
+ *  open card looks again this often (and repaints only if it changed). */
+const CARD_REFRESH_MS = 1000;
+
 /**
  * Open the card in `host`: `fixed` over the room view (below its rotate and
  * zoom buttons), `absolute` inside a focus UI. It follows the room doc while it is open, and closes itself if
@@ -191,14 +195,18 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
     box-shadow:0 10px 48px rgba(0,0,0,0.85); padding:14px; display:flex; flex-direction:column; gap:10px;
     font-family:'SF Mono','Monaco','Consolas',monospace; color:${GOLD}; pointer-events:auto; box-sizing:border-box; z-index:40;`;
 
+  let shown = '';
   const render = (): void => {
     if (!open) return;
     if (roomNow() !== room) return close();
-    // Re-rendered on every room-doc change: keep keyboard focus on the same
+    const html = arcadeCardHtml(arcadeCardModel(deps.itemId, deps.seats, deps.isOwner()), notice);
+    if (html === shown) return;
+    shown = html;
+    // Re-rendered on room-doc changes: keep keyboard focus on the same
     // control across it.
     const active = (document.activeElement as HTMLElement | null)?.closest?.('[data-act]');
     const focused = active && el.contains(active) ? (active as HTMLElement).dataset.act : null;
-    el.innerHTML = arcadeCardHtml(arcadeCardModel(deps.itemId, deps.seats, deps.isOwner()), notice);
+    el.innerHTML = html;
     if (focused) el.querySelector<HTMLElement>(`[data-act="${focused}"]`)?.focus();
   };
 
@@ -206,6 +214,7 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
     if (!open) return;
     open = false;
     unsubscribe();
+    clearInterval(refresh);
     el.remove();
     deps.onClose?.();
   };
@@ -234,7 +243,14 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
     el.addEventListener(ev, (e) => e.stopPropagation());
   }
 
-  const unsubscribe = subscribeGames(render);
+  // Someone else's change to the cabinet: an earlier press's notice (THE
+  // GAME ENDED) no longer holds. A press's own write lands here first, and
+  // its notice is set after.
+  const unsubscribe = subscribeGames(() => {
+    notice = null;
+    render();
+  });
+  const refresh = setInterval(render, CARD_REFRESH_MS);
   host.appendChild(el);
   render();
   // Into the dialog: its Esc closes it, and a screen reader follows focus.

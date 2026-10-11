@@ -20,6 +20,7 @@ import {
   menuInput,
   type ArcadeView,
 } from './arcadeCabinet';
+import { showArcadeCard } from './arcadeCard';
 import { ARCADE_GAMES } from './arcadeLibrary';
 import { ArcadeMachine } from './arcadeMachine';
 import { isArcadeTickFlags, unpackArcadeTick } from './arcadeNet';
@@ -576,6 +577,19 @@ describe('the focus UI', () => {
     const card = created.find((el) => el.id === 'arcade-card');
     expect(host.children).toContain(card);
     expect(card?.innerHTML).toContain('THE OWNER SETS THIS CABINET · ANYONE CAN LOOK');
+    ui.unmount();
+  });
+
+  it("stepping up closes the room view's card, so only the strip's ⚙️ card can show", () => {
+    const body = fakeElement('body');
+    vi.stubGlobal('document', { createElement: fakeElement, body });
+    showArcadeCard({ itemId: ITEM, seats: 1, isOwner: () => false });
+    const roomCard = body.children[0];
+    expect(roomCard.id).toBe('arcade-card');
+    const removed = vi.spyOn(roomCard, 'remove');
+    const { ui, host } = setup();
+    ui.mount(host as unknown as HTMLElement);
+    expect(removed).toHaveBeenCalled();
     ui.unmount();
   });
 });

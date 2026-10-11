@@ -23,7 +23,7 @@
  * Esc and Tab pass through untouched.
  */
 
-import { openArcadeCard, type ArcadeCard } from './arcadeCard';
+import { closeArcadeCardFor, openArcadeCard, type ArcadeCard } from './arcadeCard';
 import { ARCADE_GAMES, LICENSE_LABEL, parseInesHeader, type ArcadeGame } from './arcadeLibrary';
 import { ArcadeMachine, type NesButton, type NesPlayer } from './arcadeMachine';
 import { padByte } from './arcadeNet';
@@ -551,6 +551,9 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     mount(host: HTMLElement): void {
       mounted = true;
       focusHost = host;
+      // A card opened from the room view would sit hidden behind this view
+      // (and reappear after it): the strip's ⚙️ opens this one instead.
+      closeArcadeCardFor();
       refreshMenu();
       speaker = new ArcadeSpeaker();
       machine = null;
