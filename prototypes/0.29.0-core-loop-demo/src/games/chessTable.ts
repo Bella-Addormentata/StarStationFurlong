@@ -110,14 +110,16 @@ export function forfeitChess(s: ChessState, myId: string): ChessState | null {
 /**
  * RESET gate (the old panel's chess rule, with the owner check moved onto
  * the room's shared edit gate as checkers did): anyone once the game is
- * over, vs the bot, or before anyone committed to a game; seated players or
- * whoever may edit the room (editMode.canEditRoom) mid-game.
+ * over, vs the bot, or while neither side is claimed; seated players or
+ * whoever may edit the room (editMode.canEditRoom) once a side is claimed.
  */
 export function canResetChessTable(s: ChessState | null, myId: string, mayEditRoom: boolean): boolean {
   if (!s) return false;
   if (s.status !== 'waiting' && s.status !== 'playing') return true;
   if (s.bot) return true;
-  if (s.status === 'waiting') return true;
+  // Before the game, anyone may clear an empty table, but not a side
+  // someone has already claimed while they wait for an opponent.
+  if (s.status === 'waiting' && !s.players.white && !s.players.black) return true;
   return chessSeatOf(s, myId) !== null || mayEditRoom;
 }
 

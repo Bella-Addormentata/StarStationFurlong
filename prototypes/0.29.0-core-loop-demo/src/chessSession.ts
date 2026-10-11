@@ -178,6 +178,21 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
     const over = !!s && !live && s.status !== 'waiting';
     const promo = promotionPending(s)
       ? ` · PAWN PROMOTES TO ${promotionChoice.toUpperCase()} (⚙ TO CHANGE)` : '';
+    // A remote move re-renders the strip and card: keep keyboard focus on
+    // the same button, or on OPTIONS when the card it was in has closed.
+    const active = document.activeElement as HTMLElement | null;
+    const focusedAct = active && (strip.contains(active) || card.contains(active))
+      ? active.dataset?.act : undefined;
+    const st = strip;
+    const cd = card;
+    const refocus = (): void => {
+      if (!focusedAct) return;
+      const sel = `button[data-act="${focusedAct}"]:not([disabled])`;
+      (st.querySelector<HTMLButtonElement>(sel)
+        ?? (settingsOpen ? cd.querySelector<HTMLButtonElement>(sel)
+          ?? cd.querySelector<HTMLButtonElement>('button:not([disabled])') : null)
+        ?? st.querySelector<HTMLButtonElement>('button[data-act="options"]'))?.focus();
+    };
     strip.innerHTML = `
       <div style="font-size:12px; font-weight:800; letter-spacing:1.5px; color:${
         over ? '#00E676' : live ? GOLD_BRIGHT : GOLD
@@ -188,16 +203,16 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
       <div style="margin-top:6px;">${button('options', settingsOpen ? '✕ CLOSE OPTIONS' : '⚙ OPTIONS', true, 'Table options (same as the ⚙ on the table)')}</div>`;
 
     card.style.display = settingsOpen ? 'flex' : 'none';
-    if (!settingsOpen || !s) return;
+    if (!settingsOpen || !s) {
+      refocus();
+      return;
+    }
     const seat = chessSeatOf(s, myId);
     const resetOk = canReset();
     const flipping = deps.top?.isFlipping() ?? true;
     const promoButtons = PROMOTION_CHOICES.map((p) =>
       button(`promo-${p}`, `${PROMO_GLYPH[p]} ${p.toUpperCase()}`, true, `Promote pawns to a ${p}`, p === promotionChoice),
     ).join('');
-    // A remote move re-renders the card: keep keyboard focus on the same button.
-    const focusedAct = card.contains(document.activeElement)
-      ? (document.activeElement as HTMLElement).dataset?.act : undefined;
     card.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline;">
         <span style="font-size:11px; font-weight:800; letter-spacing:1.5px; color:${GOLD_BRIGHT};">⚙ CHESS TABLE</span>
@@ -219,10 +234,7 @@ export function createChessTableLayer(deps: ChessTableDeps): BoardGameTableLayer
         ${button('reset', 'RESET TABLE', resetOk,
           resetOk ? 'Clear the table back to the game menu' : 'Players at the table or anyone who can edit this room can reset a live game')}
       </div>`;
-    if (focusedAct) {
-      (card.querySelector<HTMLButtonElement>(`button[data-act="${focusedAct}"]:not([disabled])`)
-        ?? card.querySelector<HTMLButtonElement>('button:not([disabled])'))?.focus();
-    }
+    refocus();
   };
 
   const act = (what: string): void => {

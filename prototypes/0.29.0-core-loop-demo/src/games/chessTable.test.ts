@@ -237,6 +237,10 @@ describe('options-card transitions', () => {
     expect(canResetChessTable({ ...playing(), status: 'white-won' }, STRANGER, false)).toBe(true);
     expect(canResetChessTable({ ...playing(), bot: true }, STRANGER, false)).toBe(true);
     expect(canResetChessTable(initialChessState(), STRANGER, false)).toBe(true);
+    const claimed = { ...initialChessState(), players: { ...initialChessState().players, white: WHITE } };
+    expect(canResetChessTable(claimed, STRANGER, false)).toBe(false);
+    expect(canResetChessTable(claimed, WHITE, false)).toBe(true);
+    expect(canResetChessTable(claimed, STRANGER, true)).toBe(true);
     expect(canResetChessTable(null, WHITE, true)).toBe(false);
   });
 });
