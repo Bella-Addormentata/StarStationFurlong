@@ -6,10 +6,11 @@
 
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { ARCADE_GAMES, MAX_ROM_BYTES, parseInesHeader } from './arcadeLibrary';
 import { ArcadeMachine } from './arcadeMachine';
 
-const publicFile = (url: string): string => new URL(`../public${url}`, import.meta.url).pathname;
+const publicFile = (url: string): string => fileURLToPath(new URL(`../public${url}`, import.meta.url));
 const romBytes = (url: string): Uint8Array => new Uint8Array(readFileSync(publicFile(url)));
 
 /** A minimal iNES image: header + the PRG/CHR banks it declares. */
@@ -44,6 +45,8 @@ describe('arcade library', () => {
       expect(readme).toContain(game.romUrl.replace('/arcade/', ''));
       expect(readme).toContain(game.sourceCommit);
       expect(readme).toContain(game.author);
+      // A static build has no directory listing: link the source archive itself.
+      if (game.bundledSource) expect(readme).toContain(`](${game.bundledSource.replace('/arcade/', '')})`);
     }
   });
 

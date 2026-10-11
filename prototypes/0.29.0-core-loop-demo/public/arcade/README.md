@@ -24,9 +24,12 @@ npm.
   them under the terms of the GNU General Public License as published by the
   Free Software Foundation, either version 3 of the License, or (at your
   option) any later version. They are distributed WITHOUT ANY WARRANTY. The
-  complete corresponding source for each ROM ships next to it in
-  [`source/`](source/) (a `git archive` of the commit above), so the source
-  travels with every copy of the app.
+  complete corresponding source for each ROM ships with it, a `git archive`
+  of the commit above: Thwaite in
+  [`source/thwaite-nes-00e3674.tar.gz`](source/thwaite-nes-00e3674.tar.gz) and
+  Concentration Room in
+  [`source/croom-nes-ed19c3c.tar.gz`](source/croom-nes-ed19c3c.tar.gz), so
+  the source travels with every copy of the app.
 - **zlib** (robotfindskitten): [`licenses/zlib-robotfindskitten.txt`](licenses/zlib-robotfindskitten.txt).
 - **CC BY 4.0** (NESert Golfing): [`licenses/CC-BY-4.0.txt`](licenses/CC-BY-4.0.txt)
   (also at <https://creativecommons.org/licenses/by/4.0/>).
