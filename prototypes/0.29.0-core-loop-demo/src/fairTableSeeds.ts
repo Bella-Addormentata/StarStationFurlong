@@ -156,7 +156,11 @@ function readState(tableId: string, game: TableGame): TableState | null {
  *  bets ride from roll to roll), or a bet for this very round on roulette. */
 function stakedPlayers(tableId: string, game: TableGame, round: number): Set<string> {
   const bets = game === 'craps' ? readAllCrapsBets(tableId) : readAllBets(tableId, round);
-  return new Set(Object.entries(bets).filter(([, list]) => list.length > 0).map(([pid]) => pid));
+  // Ids outside 1–128 chars would fail the closing state's shape guard and
+  // wedge the table: such a bettor is simply not in the round.
+  return new Set(Object.entries(bets)
+    .filter(([pid, list]) => list.length > 0 && pid.length > 0 && pid.length <= 128)
+    .map(([pid]) => pid));
 }
 
 // ── The bettor's side (every client, every frame) ────────────────────────────
@@ -248,7 +252,7 @@ export function freezeCommits(
   tableId: string,
   game: TableGame,
   s: TableState,
-): { commits?: Record<string, string>; unseeded?: string[] } {
+): { commits?: Record<string, string>; unseeded?: string[]; wagers?: Record<string, string> } {
   if (!s.houseCommit) return {};
   const staked = stakedPlayers(tableId, game, s.round);
   const commits: Record<string, string> = {};
@@ -263,7 +267,38 @@ export function freezeCommits(
   // past the cap — a table's stands keep it far below 15): on the record, so
   // the card can say who the result didn't take a seed from.
   const unseeded = [...staked].filter((pid) => !(pid in commits)).sort().slice(0, MAX_BETTOR_PARTIES + 1);
-  return unseeded.length > 0 ? { commits, unseeded } : { commits };
+  // The wagers freeze too: the reveals make the result computable before the
+  // settle, so a bet rewritten after "no more bets" must not be paid.
+  const wagers: Record<string, string> = {};
+  for (const pid of [...Object.keys(commits), ...unseeded]) {
+    wagers[pid] = wagerFingerprint(game === 'craps' ? readMyCrapsBets(tableId, pid) : readMyBets(tableId, pid, s.round));
+  }
+  return unseeded.length > 0 ? { commits, unseeded, wagers } : { commits, wagers };
+}
+
+/** A bettor's wager list, hashed: what "no more bets" froze for them. */
+export function wagerFingerprint(bets: readonly unknown[]): string {
+  return bytesToHex(sha256(new TextEncoder().encode(`ssf-wagers-v1|${JSON.stringify(bets)}`)));
+}
+
+/** The settle's bets on a round that froze its wagers: only the frozen
+ *  bettors, and only lists unchanged since the close. A list rewritten after
+ *  "no more bets" is `voided` (its bets are not paid — the settle clears them).
+ *  A round without frozen wagers (RNG) settles the bets as they stand. */
+export function frozenWagers<T>(
+  s: { wagers?: Record<string, string> },
+  bets: Record<string, T[]>,
+): { bets: Record<string, T[]>; voided: string[] } {
+  if (!s.wagers) return { bets, voided: [] };
+  const out: Record<string, T[]> = {};
+  const voided: string[] = [];
+  for (const [pid, list] of Object.entries(bets)) {
+    const want = s.wagers[pid];
+    if (want === undefined) continue; // not in the round: untouched
+    if (wagerFingerprint(list) === want) out[pid] = list;
+    else voided.push(pid);
+  }
+  return { bets: out, voided: voided.sort() };
 }
 
 /** When this page first tried to settle each round (its own clock). */

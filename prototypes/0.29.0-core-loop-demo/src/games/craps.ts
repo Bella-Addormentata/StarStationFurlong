@@ -109,6 +109,7 @@ export interface CrapsTableState {
   houseCommit?: string;
   commits?: Record<string, string>;
   unseeded?: string[];
+  wagers?: Record<string, string>;
   /** ⚖️ The fairness mode locked in when this window opened; the settle uses
    *  it, so an owner's switch mid-window applies from the next one. */
   fairMode?: FairnessMode;
@@ -186,6 +187,17 @@ export interface SeedRoundFields {
    *  client never committed in time, or the party cap was full). They are
    *  protected only by the other parties' seeds — shown on the table card. */
   unseeded?: string[];
+  /** Each frozen bettor's wager list, hashed at "no more bets": the settle
+   *  pays only lists that still match. */
+  wagers?: Record<string, string>;
+}
+
+function isPidMap(v: unknown, max: number): boolean {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const entries = Object.entries(v);
+  return entries.length <= max
+    && entries.every(([pid, c]) => pid.length > 0 && pid.length <= 128
+      && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
 }
 
 /** Shape guard for the peer-written seed fields (bounded like transcripts). */
@@ -193,12 +205,8 @@ export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.houseCommit !== undefined
     && (typeof s.houseCommit !== 'string' || s.houseCommit.length > FAIRNESS_MAX_STRING)) return false;
   if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
-  if (s.commits === undefined) return true;
-  if (typeof s.commits !== 'object' || s.commits === null || Array.isArray(s.commits)) return false;
-  const entries = Object.entries(s.commits);
-  return entries.length < FAIRNESS_MAX_PARTIES
-    && entries.every(([pid, c]) => pid.length > 0 && pid.length <= 128
-      && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
+  if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
+  return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 
 export function initialCrapsState(): CrapsTableState {

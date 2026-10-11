@@ -45,7 +45,7 @@ import { settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the house + bettors' seed exchange (fairTableSeeds.ts).
 import {
-  freezeCommits, gatherRound, isFairTable, newHouseCommit, settledRound,
+  freezeCommits, frozenWagers, gatherRound, isFairTable, newHouseCommit, settledRound,
 } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
@@ -133,8 +133,10 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // same room doc (a removed or recreated table, or a rival settle, is not).
   const before = readTableState(tableId);
   if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return;
-  // ⚖️ A bettor who committed but never revealed forfeits this round's bets.
-  const bets = readAllBets(tableId, round);
+  // ⚖️ Only the wagers frozen at "no more bets" settle (the reveals made the
+  // pocket computable; a rewritten list is void), and a bettor who committed
+  // but never revealed forfeits this round's bets.
+  const { bets } = frozenWagers(before, readAllBets(tableId, round));
   for (const pid of forfeited) delete bets[pid];
   const payouts = resolveRound(bets, result);
   const now = Date.now();

@@ -43,7 +43,7 @@ import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
-import { gatherRound, settledRound } from './fairTableSeeds';
+import { frozenWagers, gatherRound, settledRound } from './fairTableSeeds';
 
 export type { CrapsBackendKind };
 
@@ -129,7 +129,10 @@ class LocalCrapsBackend implements CrapsBackend {
     const sum = d1 + d2;
     // ⚖️ A bettor who committed but never revealed forfeits every bet on the
     // felt this roll — withholding a seed to dodge a result must cost them.
-    const allBets = readAllCrapsBets(tableId);
+    // Only wagers frozen at "no more bets" settle: the reveals made the dice
+    // computable, so a list rewritten since is void and cleared like a forfeit.
+    const { bets: allBets, voided } = frozenWagers(before, readAllCrapsBets(tableId));
+    forfeited = [...forfeited, ...voided];
     for (const pid of forfeited) delete allBets[pid];
     const { payouts, remaining } = resolveCrapsRound(
       allBets,

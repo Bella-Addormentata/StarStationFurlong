@@ -18,7 +18,8 @@ const {
 const { BET_WINDOW_MS, CLOSING_MS, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier } = await import('./croupier');
 const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, pressManualRoll, tickAutoStickman } = await import('./crapsCroupier');
 const {
-  commitSeedSync, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
+  commitSeedSync, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
+  wagerFingerprint,
 } = await import('./fairTableSeeds');
 const { pocketFromMaterial } = await import('./games/fairDice');
 const { commitTableSeed } = await import('./games/diceFairness');
@@ -243,6 +244,37 @@ describe('a Fair roulette round', () => {
     expect(commitSeedSync(onA.seed!, { table: a, round: 1, party: AMY, house: closingA.houseCommit! })).toBe(amyOnA);
   });
 
+  it('a bet rewritten after "no more bets" is not paid', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette'); // both reveal: the pocket is computable now
+    // Bob swaps his black for bets that win on any pocket.
+    writeMyBets(t, BOB, 1, [
+      { type: 'red', amount: 10 }, { type: 'black', amount: 10 }, { type: 'straight', pick: 0, amount: 10 },
+    ]);
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+  });
+
+  it('a bettor id too long for the closing state is left out instead of wedging the table', () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    writeMyBets(t, 'x'.repeat(200), 1, [{ type: 'black', amount: 10 }]);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette', [AMY]);
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    const closing = readTableState(t);
+    expect(closing?.phase).toBe('closing');
+    expect(Object.keys(closing?.commits ?? {})).toEqual([AMY]);
+    expect(closing?.unseeded).toBeUndefined();
+  });
+
   it("a seed revealed last round can't be replayed as this round's", async () => {
     const t = freshTable();
     rouletteToClosing(t);
@@ -415,6 +447,35 @@ describe('a Fair craps roll', () => {
     expect(s.phase).toBe('closing');
     expect(Object.keys(s.commits ?? {})).toEqual([AMY]);
     expect(s.unseeded ?? []).toEqual([]);
+  });
+
+  it('craps voids a wager list rewritten after the close, clearing it like a forfeit', async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    writeMyCrapsBets(t, BOB, [{ type: 'field', amount: 5 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps');
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    expect(Object.keys(readCrapsTableState(t)?.wagers ?? {}).sort()).toEqual([AMY, BOB]);
+    playersLook(t, 'craps');
+    writeMyCrapsBets(t, BOB, [{ type: 'anyseven', amount: 50 }]);
+    later(CRAPS_CLOSING_MS);
+    tickAutoStickman(t);
+    await flush();
+    const s = readCrapsTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(readAllCrapsBets(t)[BOB]).toBeUndefined();
+  });
+
+  it('settles only frozen bettors whose wager lists still match', () => {
+    const a = [{ type: 'pass', amount: 10 }];
+    const wagers = { [AMY]: wagerFingerprint(a), [BOB]: wagerFingerprint([{ type: 'field', amount: 5 }]) };
+    const out = frozenWagers({ wagers }, { [AMY]: a, [BOB]: [{ type: 'anyseven', amount: 50 }], 'player-Late': a });
+    expect(out).toEqual({ bets: { [AMY]: a }, voided: [BOB] });
+    expect(frozenWagers({}, { [BOB]: a })).toEqual({ bets: { [BOB]: a }, voided: [] });
   });
 
   it('an RNG table skips the exchange and carries no transcript', async () => {

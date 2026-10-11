@@ -69,6 +69,7 @@ export interface RouletteTableState {
   houseCommit?: string;
   commits?: Record<string, string>;
   unseeded?: string[];
+  wagers?: Record<string, string>;
 }
 
 export function initialRouletteState(): RouletteTableState {

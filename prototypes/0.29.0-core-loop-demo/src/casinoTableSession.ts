@@ -453,6 +453,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let card: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
   let seatTimer: number | null = null;
+  /** The manual SPIN's settle poll: one per focused table. */
+  let spinPoll: number | null = null;
+  const stopSpinPoll = (): void => {
+    if (spinPoll !== null) window.clearInterval(spinPoll);
+    spinPoll = null;
+  };
 
   /** Chips in hand (denominations). Spent only when they land on the felt. */
   let hand: number[] = [];
@@ -1248,14 +1254,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     if (s.phase === 'settled') return;
     if (s.phase === 'betting') closeBetting(itemId, s);
+    if (spinPoll !== null) return; // already settling this round
     const r = s.round;
     const epoch = casinoDocEpoch();
     const until = Date.now() + REVEAL_GRACE_MS + 6_000;
-    const poll = window.setInterval(() => {
+    spinPoll = window.setInterval(() => {
       const now = rouletteState();
       // Another room's table can share this id and round: stop on a rebind.
       if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || Date.now() > until) {
-        window.clearInterval(poll);
+        stopSpinPoll();
         return;
       }
       rollAndSettle(itemId, r);
@@ -1369,6 +1376,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       unsubscribe = null;
       if (seatTimer !== null) window.clearInterval(seatTimer);
       seatTimer = null;
+      stopSpinPoll();
       clearMySeat(itemId, me);
       markLocalSeat(itemId, me, false);
       localHold.delete(itemId);
