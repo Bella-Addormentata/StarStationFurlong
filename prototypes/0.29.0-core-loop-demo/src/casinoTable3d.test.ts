@@ -68,3 +68,35 @@ describe('the craps table chips', () => {
     expect(rail.map((s) => s.denom)).toEqual([...rail.map((s) => s.denom)].sort((a, b) => b - a));
   });
 });
+
+describe('the Fair / Friendly plaque', () => {
+  it('lies on clear felt: no betting box, the dice spot or the wheel under it', async () => {
+    const { fairPlaqueCentre, FAIR_PLAQUE_SIZE } = await import('./casinoTable3d');
+    const { CRAPS_DICE_SPOT, CRAPS_LAYOUT, ROULETTE_LAYOUT, ROULETTE_WHEEL } = await import('./games/casinoLayout');
+    const { w, h } = FAIR_PLAQUE_SIZE;
+    const cases: Array<{ layout: { settings: typeof CRAPS_LAYOUT.settings; felt: typeof CRAPS_LAYOUT.felt; regions: Array<{ rects: typeof CRAPS_LAYOUT.felt[] }> }; at: 'right' | 'front' }> = [
+      { layout: CRAPS_LAYOUT, at: 'right' },
+      { layout: ROULETTE_LAYOUT, at: 'front' },
+    ];
+    for (const { layout, at } of cases) {
+      const c = fairPlaqueCentre(layout.settings, at);
+      const p = { x0: c.x - w / 2, x1: c.x + w / 2, z0: c.z - h / 2, z1: c.z + h / 2 };
+      expect(p.x0 > layout.felt.x0 && p.x1 < layout.felt.x1 && p.z0 > layout.felt.z0 && p.z1 < layout.felt.z1).toBe(true);
+      for (const rg of layout.regions) {
+        for (const r of rg.rects) {
+          expect(r.x0 < p.x1 && r.x1 > p.x0 && r.z0 < p.z1 && r.z1 > p.z0).toBe(false);
+        }
+      }
+      // Clear of the ⚙️ itself.
+      const g = layout.settings;
+      expect(g.x + g.r < p.x0 || g.x - g.r > p.x1 || g.z + g.r < p.z0 || g.z - g.r > p.z1).toBe(true);
+    }
+    const crapsP = fairPlaqueCentre(CRAPS_LAYOUT.settings, 'right');
+    expect(Math.abs(crapsP.x - CRAPS_DICE_SPOT.x)).toBeGreaterThan(w / 2 + 0.03);
+    // The roulette plaque's nearest corner stays outside the wheel's surround.
+    const rp = fairPlaqueCentre(ROULETTE_LAYOUT.settings, 'front');
+    const dx = Math.max(0, Math.abs(rp.x - ROULETTE_WHEEL.x) - w / 2);
+    const dz = Math.max(0, Math.abs(rp.z - ROULETTE_WHEEL.z) - h / 2);
+    expect(Math.hypot(dx, dz)).toBeGreaterThan(ROULETTE_WHEEL.r + 0.03);
+  });
+});

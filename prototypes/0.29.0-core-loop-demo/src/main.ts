@@ -1983,7 +1983,7 @@ async function joinRoomAtEpoch(
 
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
   // table state. Rebinds per join like games/furniture (T0 seam).
-  bindCasinoDoc(sync.doc);
+  bindCasinoDoc(sync.doc, boot.roomId);
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);
