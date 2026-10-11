@@ -43,6 +43,38 @@ export function chipsFor(balance: number): number[] {
   return chips;
 }
 
+/**
+ * 🎲 #226: the chips in a player's table RAIL, as counts per denomination —
+ * the same total as chipsFor, but made playable: a pure greedy split hands
+ * someone with 100 a single black chip they cannot bet a 5 from. Each
+ * denomination keeps a working float of the next one down (five whites, five
+ * reds, four greens, five blacks) whenever the balance is big enough to spare
+ * it, the way a dealer colours a buy-in down. Counted, never one entry per
+ * chip, so Σ denom × count === balance for every non-negative safe integer
+ * and the result is at most one entry per denomination. Largest first.
+ */
+export function railChipCounts(balance: number): Array<{ denom: number; count: number }> {
+  let left = Math.max(0, Math.floor(balance));
+  // [denomination, its next one up, how many of it to keep as a float]
+  const floats: Array<[number, number, number]> = [[1, 5, 5], [5, 25, 5], [25, 100, 4], [100, 500, 5]];
+  const counts = new Map<number, number>();
+  for (const [d, up, keep] of floats) {
+    let n = (left % up) / d; // what can't make up a whole chip of the next size
+    if (left - n * d >= keep * d + up) n += keep;
+    counts.set(d, n);
+    left -= n * d;
+  }
+  for (const d of CHIP_DENOMS) {
+    const n = Math.floor(left / d);
+    counts.set(d, (counts.get(d) ?? 0) + n);
+    left -= n * d;
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[0] - a[0])
+    .map(([denom, count]) => ({ denom, count }));
+}
+
 /** Group a flat chip list by denomination, largest first. */
 export function groupChips(chips: number[]): Array<{ denom: number; count: number }> {
   const counts = new Map<number, number>();
@@ -192,4 +224,7 @@ export function chipDotsHtml(balance: number): string {
 
 // Debug handle (the __ssfGames/__ssfCasino precedent): decomposition
 // accuracy is console-checkable without UI plumbing.
-(window as unknown as { __ssfChips: unknown }).__ssfChips = { chipsFor, groupChips };
+// Guarded: the 3D tables import this module, and tests load them without a window.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfChips: unknown }).__ssfChips = { chipsFor, groupChips };
+}
