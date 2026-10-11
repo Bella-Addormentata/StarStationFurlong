@@ -195,9 +195,11 @@ import type {
   DeviceUI,
   DeviceTarget,
 } from "./devices";
-import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
+import { subscribeGames, readTable, clearTable } from "./games/gamesDoc";
 import { seatOf, standIndexFor } from "./games/checkersTable";
-import { createCheckersTableLayer, paintCheckersTable } from "./checkersSession";
+import { chessSeatOf, chessStandIndexFor } from "./games/chessTable";
+import { createCheckersTableLayer } from "./checkersSession";
+import { createChessTableLayer, paintGameTable } from "./chessSession";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -1674,7 +1676,7 @@ export class World {
     // the previous listener first, so rebuilds never stack duplicates.
     this.unsubscribeGameBoards?.();
     const repaintBoards = () => {
-      for (const [id, top] of this.gameTableTops) paintCheckersTable(top, id);
+      for (const [id, top] of this.gameTableTops) paintGameTable(top, id);
     };
     this.unsubscribeGameBoards = subscribeGames(repaintBoards);
     repaintBoards();
@@ -1714,7 +1716,7 @@ export class World {
         // degrades correctly — if the helper ever stops filing this kind,
         // the paint no-ops rather than driving a handle nothing tracks.
         const spawnedTop = sinks.gameTableTops.get(item.id);
-        if (spawnedTop) paintCheckersTable(spawnedTop, item.id);
+        if (spawnedTop) paintGameTable(spawnedTop, item.id);
         // 🏒 #115: hand the filed air-hockey handle to the session layer,
         // which drives it every frame (airHockeyFrame) and converts its LOCAL
         // coords to the world-space tick wire — read back from the sink for
@@ -6084,15 +6086,29 @@ export class World {
       // affordance (button), not focus choreography — no prepare hook; the
       // top handle simply rides along so FLIP can drive the tween.
       // 🎰 #76: walk to an open STANDING position at the table, then the UI
-      // opens. 🎲 #227: a seated checkers player goes to their OWN end and
-      // looks from it (stand s0 = red at −z, s1 = black at +z) when it is
-      // open and can be walked to (pickFreeStand's rules); otherwise, and for
-      // everyone else, the nearest open end — the camera follows that end.
-      const game = readGame(deviceId);
-      const mine = game ? seatOf(game, getPlayerId()) : null;
-      const ownEnd = mine
-        ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${standIndexFor(mine)}`)
-        : undefined;
+      // opens. 🎲 #227: a seated checkers or ♟ chess player goes to their
+      // OWN end and looks from it (stand s0 = red / white at −z, s1 = black
+      // at +z) when it is open and can be walked to (pickFreeStand's rules);
+      // otherwise, and for everyone else, the nearest open end — the camera
+      // follows that end.
+      const game = readTable(deviceId);
+      const myId = getPlayerId();
+      const mySeat =
+        game?.kind === "checkers"
+          ? (() => {
+              const c = seatOf(game.state, myId);
+              return c ? standIndexFor(c) : null;
+            })()
+          : game?.kind === "chess"
+            ? (() => {
+                const c = chessSeatOf(game.state, myId);
+                return c ? chessStandIndexFor(c) : null;
+              })()
+            : null;
+      const ownEnd =
+        mySeat !== null
+          ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${mySeat}`)
+          : undefined;
       const ownEndFree =
         !!ownEnd &&
         !this.getRemoteAvatarSnapshots().some(
@@ -6108,6 +6124,13 @@ export class World {
         // 🎲 #227: checkers is played on the 3D table itself. Taking a side
         // from the other end walks the player round to their own end.
         checkers: createCheckersTableLayer({
+          itemId: deviceId,
+          top,
+          end: farEnd ? 1 : 0,
+          onSeatTaken: () => deviceFocus.releaseThen(() => this.requestDeviceFocus(deviceId)),
+        }),
+        // ♟ Chess plays on the table the same way (white's end is −z).
+        chess: createChessTableLayer({
           itemId: deviceId,
           top,
           end: farEnd ? 1 : 0,

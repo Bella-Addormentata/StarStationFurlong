@@ -17,6 +17,7 @@ import {
   AH_MALLET_R,
   AH_PUCK_MAX_SPEED,
   AH_PUCK_R,
+  canResetAirHockey,
   claimSide,
   clampMallet,
   initialAirHockeyState,
@@ -101,6 +102,52 @@ describe('isAirHockeyState guard', () => {
     expect(isAirHockeyState({ ...base, players: { a: 'x'.repeat(129), b: null } })).toBe(false);
     expect(isAirHockeyState({ ...base, players: null })).toBe(false);
     expect(isAirHockeyState({ ...base, ready: { a: 1, b: false } })).toBe(false);
+  });
+});
+
+describe('canResetAirHockey (RESET TABLE / NEW MATCH gate)', () => {
+  const A = 'p-a';
+  const B = 'p-b';
+  const STRANGER = 'p-x';
+  const live = (): AirHockeyState => ({
+    ...initialAirHockeyState(),
+    players: { a: A, b: B },
+    ready: { a: true, b: true },
+    score: { a: 2, b: 1 },
+    status: 'playing',
+    startedAt: 1755599990000,
+  });
+
+  it('nothing to reset without a record', () => {
+    expect(canResetAirHockey(null, A, true)).toBe(false);
+  });
+
+  it('anyone may reset when no match is live (empty or ended)', () => {
+    expect(canResetAirHockey(initialAirHockeyState(), STRANGER, false)).toBe(true);
+    const ended: AirHockeyState = { ...live(), status: 'ended', winner: 'a' };
+    expect(canResetAirHockey(ended, STRANGER, false)).toBe(true);
+  });
+
+  it('a stranger cannot wipe a live match', () => {
+    expect(canResetAirHockey(live(), STRANGER, false)).toBe(false);
+  });
+
+  it('a stranger cannot wipe a held claim or a practice either', () => {
+    const claimed: AirHockeyState = { ...initialAirHockeyState(), players: { a: A, b: null } };
+    expect(canResetAirHockey(claimed, STRANGER, false)).toBe(false);
+    const practice: AirHockeyState = { ...live(), players: { a: A, b: null } };
+    expect(canResetAirHockey(practice, STRANGER, false)).toBe(false);
+  });
+
+  it('players in the match may reset it', () => {
+    expect(canResetAirHockey(live(), A, false)).toBe(true);
+    expect(canResetAirHockey(live(), B, false)).toBe(true);
+  });
+
+  it('whoever may edit the room may reset mid-match (crash-leaked claims)', () => {
+    expect(canResetAirHockey(live(), STRANGER, true)).toBe(true);
+    const claimed: AirHockeyState = { ...initialAirHockeyState(), players: { a: null, b: B } };
+    expect(canResetAirHockey(claimed, STRANGER, true)).toBe(true);
   });
 });
 
