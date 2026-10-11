@@ -101,7 +101,7 @@ describe('tickTvRoom', () => {
     expect(readTv(TV).positionMs).toBeLessThan(before + 3_600_000 + 10_000);
   });
 
-  it('a holder whose monotonic clock stood still through the sleep (one tick\'s worth where an hour passed) still beats on from where the room is: the wall clock finds the gap', () => {
+  it('a holder whose monotonic clock stood still through the sleep (one tick\'s worth where an hour passed — or a wall-clock step, which looks the same) lets the remote go, and picked up again beats on from where it slept: a wall delta it cannot vouch for is never added to playback', () => {
     let wall = 1_700_000_000_000;
     setTvClock(() => now, () => wall);
     const runBoth = (ms: number) => {
@@ -122,8 +122,11 @@ describe('tickTvRoom', () => {
     expect(readTv(TV).positionMs).toBe(before);
     expect(pickUpRemote(TV)).toEqual({ ok: true });
     runBoth(TV_HEARTBEAT_MS);
-    expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(before + 3_600_000);
-    expect(readTv(TV).positionMs).toBeLessThan(before + 3_600_000 + 10_000);
+    // The ambiguous hour is not in the beat: the room is not jumped forward on
+    // the wall clock's word (a step while awake would jump everyone), the
+    // cost being a rejoin where it slept when the hour was a real sleep.
+    expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(before);
+    expect(readTv(TV).positionMs).toBeLessThan(before + 10_000);
   });
 
   it('flips a scheduled programme to playing at T0 the way the theatre would', () => {
