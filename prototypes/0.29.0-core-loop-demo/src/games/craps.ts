@@ -98,6 +98,10 @@ export interface CrapsTableState {
    *  absent when the stickman throws. Set by the operator when it slides the
    *  dice to a player at the table; kept roll to roll until a seven-out. */
   shooter?: string;
+  /** 🎲 #226: on a manual table (no robot), the page whose ROLL slid the dice
+   *  out — the one client that settles the shooter's throw or times them out,
+   *  so several room editors never race one settle. Absent on robot tables. */
+  operator?: string;
   /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
    *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
   lastShooter?: string;

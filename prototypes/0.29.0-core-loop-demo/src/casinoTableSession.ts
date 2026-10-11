@@ -43,7 +43,7 @@ import { CHIP_DENOMS, railChips } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
-  closeCrapsBetting, openCrapsBetting, STICKMAN_DICE_SPOT, stickmanThrows,
+  closeCrapsBetting, openCrapsBetting, STICKMAN_DICE_SPOT, tickCrapsClosing,
 } from './crapsCroupier';
 import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
@@ -174,6 +174,10 @@ const localHold = new Set<string>();
  *  wild record into millions of chips. Settlement still sees the real bets. */
 const MAX_BETS_DRAWN_PER_PLAYER = 400;
 const MAX_STACK_CHIPS = 60;
+/** And a table-wide chip budget, so many modest peer records can't grow the
+ *  GPU pools without limit either. Your own bets draw first, then everyone
+ *  else's in player-id order, so every client draws the same chips. */
+const MAX_TABLE_CHIPS = 2400;
 
 /** chipsFor, stopping at `max` chips (largest first) without looping per chip. */
 function chipsUpTo(amount: number, max: number): number[] {
@@ -195,8 +199,13 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
   me: string,
 ): FeltStack[] {
   const groups = new Map<string, { rect: FeltRect; chips: Map<string, number[]> }>();
-  for (const [pid, bets] of Object.entries(betsByPlayer)) {
+  const pidOrder = Object.keys(betsByPlayer).sort((a, b) => (a === me ? -1 : b === me ? 1 : a < b ? -1 : a > b ? 1 : 0));
+  let budget = MAX_TABLE_CHIPS;
+  for (const pid of pidOrder) {
+    const bets = betsByPlayer[pid];
+    if (budget <= 0) break;
     for (const b of bets.slice(0, MAX_BETS_DRAWN_PER_PLAYER)) {
+      if (budget <= 0) break;
       const rect = rectFor(b, pid);
       if (!rect) continue;
       const key = `${spotKey(b)}|${rect.x0.toFixed(3)},${rect.z0.toFixed(3)}`;
@@ -209,7 +218,9 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
       if (list.length >= MAX_STACK_CHIPS) continue;
       // One chip per bet record when it's a real chip; any other stake (an
       // older client's 10 or 250) shows as the chips it breaks into.
-      list.push(...chipsUpTo(b.amount, MAX_STACK_CHIPS - list.length));
+      const add = chipsUpTo(b.amount, Math.min(MAX_STACK_CHIPS - list.length, budget));
+      budget -= add.length;
+      list.push(...add);
       g.chips.set(pid, list);
     }
   }
@@ -878,9 +889,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       // Manual ROLL takes the same close as the robot: the dice go to a
       // seated shooter with a line bet first; a second press (or nobody to
       // shoot) has the stickman throw.
+      // A table no robot has opened yet starts at round 1 here. A press
+      // while the dice are out settles the shooter's throw if it landed,
+      // else the stickman throws; either way this client finishes it.
+      if (!crapsState()) openCrapsBetting(itemId, 1, null);
       const s = crapsState();
-      if (s?.phase === 'betting') closeCrapsBetting(itemId, s);
-      else if (s?.phase === 'closing') stickmanThrows(itemId, s);
+      if (s?.phase === 'betting') closeCrapsBetting(itemId, s, Date.now(), true);
+      else if (s?.phase === 'closing') tickCrapsClosing(itemId, s, undefined, Infinity);
     } else if (act === 'spin') {
       if (phase() === 'betting' || phase() === 'closing') rollAndSettle(itemId, round());
     } else if (act === 'next') {

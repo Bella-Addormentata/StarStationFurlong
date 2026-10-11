@@ -27,6 +27,7 @@
  */
 
 import { canRunCroupier } from './croupier';
+import { getPlayerId } from './identity';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
@@ -227,7 +228,7 @@ export function sampleSeats(tableId: string, now = Date.now()): void {
 /** "No more bets": the stickman pushes the dice to the shooter, who then has
  *  CRAPS_SHOOTER_MS to fling them (#226); with no shooter the stickman throws
  *  after the usual beat. The robot's tick and the house's manual ROLL share it. */
-export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Date.now()): void {
+export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Date.now(), manual = false): void {
   const shooter = shooterForClose(tableId, s, now);
   const next: CrapsTableState = {
     ...s,
@@ -236,6 +237,8 @@ export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Dat
   };
   if (shooter) next.shooter = shooter;
   else delete next.shooter;
+  if (manual) next.operator = PAGE_ID;
+  else delete next.operator;
   writeCrapsTableState(tableId, next);
 }
 
@@ -252,14 +255,21 @@ export function tickCrapsClosing(tableId: string, s: CrapsTableState, autoShowMs
   if (now >= (s.phaseDeadline ?? now)) stickmanThrows(tableId, s, autoShowMs);
 }
 
-/** A manual craps table (no robot stickman): the house's client runs only
- *  the shooter's turn that a manual ROLL started — watching the seats,
- *  settling the shooter's throw, timing them out. World ticks it every frame
- *  whatever the house is looking at. */
+/** This page, as a manual table's operator: player id plus a per-load nonce,
+ *  so two tabs of one player are still two operators. */
+const PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).slice(2, 10)}`;
+
+/** A manual craps table (no robot stickman): the page whose ROLL slid the
+ *  dice out runs only that shooter's turn — watching the seats, settling the
+ *  shooter's throw, timing them out. World ticks it every frame on every
+ *  editor's client whatever they're looking at; only the operator page acts,
+ *  so shareholders in a venture room never race the settle. If that page
+ *  goes away, any editor's next ROLL press finishes the turn. */
 export function tickManualCraps(tableId: string, now = Date.now()): void {
-  sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
-  if (s?.phase === 'closing') tickCrapsClosing(tableId, s, undefined, now);
+  if (s?.phase !== 'closing' || s.operator !== PAGE_ID) return;
+  sampleSeats(tableId, now);
+  tickCrapsClosing(tableId, s, undefined, now);
 }
 
 /**

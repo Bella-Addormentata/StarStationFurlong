@@ -5795,8 +5795,9 @@ export class World {
         else tickAutoCroupier(t.id);
       }
     }
-    // 🎲 #226: a manual craps table (no robot running it): the house's client
-    // carries the shooter's turn a manual ROLL started, focused or not.
+    // 🎲 #226: a manual craps table (no robot running it): the page whose
+    // manual ROLL slid the dice out carries that shooter's turn, focused or
+    // not (tickManualCraps returns at once on every other editor's page).
     else if (crapsTables.length && canEditRoom().ok) {
       for (const t of crapsTables) if (!isCroupierLive(t.id)) tickManualCraps(t.id);
     }
