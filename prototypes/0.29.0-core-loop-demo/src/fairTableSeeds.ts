@@ -180,7 +180,8 @@ function stakedPlayers(tableId: string, game: TableGame, round: number): Set<str
 
 const lastTick = new Map<string, number>();
 
-/** Commitments THIS page made as a bettor (public values, not secrets): how
+/** Commitments THIS page made as a bettor, keyed by the round they were made
+ *  for (public values, not secrets): how
  *  it tells its own record from one someone else wrote under its id. */
 const authored = new Set<string>();
 /** Rounds (roundKey) THIS page committed a seed in — the own-seed check only
@@ -259,6 +260,18 @@ function noteFrozen(tableId: string, s: TableState & { wagers?: Record<string, s
   evictOldest(rounds, SNAPSHOTS_PER_TABLE);
 }
 
+/** A commitment this page authored, bound to the round it was made for. */
+function authoredKey(tableId: string, s: TableState, commit: string): string {
+  return `${roundKey(tableId, s.round, s.houseCommit)}|${commit}`;
+}
+
+/** Whether THIS page holds the round's (frozen) house seed — without it a
+ *  Fair round is void, decided before any dice are thrown. */
+export function houseSeedHeld(tableId: string, s: TableState): boolean {
+  const house = frozenFields(tableId, s).houseCommit ?? s.houseCommit;
+  return !!house && !!seedFor(house, houseCtx(tableId, s.round));
+}
+
 function roundKey(tableId: string, round: number, house: string | undefined): string {
   return `${casinoDocEpoch()}:${tableId}:${round}:${house ?? ''}`;
 }
@@ -290,14 +303,17 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
   const rec = readSeedRecord(tableId, me);
   if (s.phase === 'betting') {
     // A record under my id that I didn't write is replaced with my own.
-    if (rec && rec.round === s.round && rec.house === s.houseCommit && authored.has(rec.commit)) return;
+    // "Mine" is per round: a commitment of mine copied in from an earlier
+    // round can't be revealed here, and would only get my bets forfeited.
+    if (rec && rec.round === s.round && rec.house === s.houseCommit && authored.has(authoredKey(tableId, s, rec.commit))
+      && seedFor(rec.commit, bettorCtx(tableId, s, me))) return;
     // O(1) look at my own bets: this runs for every table, several times a second.
     const mine = game === 'craps' ? readMyCrapsBets(tableId, me) : readMyBets(tableId, me, s.round);
     if (mine.length === 0) return;
     const seed = randomSeedHex();
     const commit = commitSeedSync(seed, bettorCtx(tableId, s, me));
     keepSeed(commit, seed);
-    authored.add(commit);
+    authored.add(authoredKey(tableId, s, commit));
     authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
     evictOldest(authored, 512);
     evictOldest(authoredRounds, 512);
@@ -314,7 +330,7 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
     // reloaded mid-round still knows its own part for the card's check.)
     const myFrozen = s.commits?.[me];
     if (myFrozen && seedFor(myFrozen, bettorCtx(tableId, s, me))) {
-      authored.add(myFrozen);
+      authored.add(authoredKey(tableId, s, myFrozen));
       authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
       evictOldest(authored, 512);
       evictOldest(authoredRounds, 512);
@@ -503,7 +519,7 @@ export async function verifySettledRound(
   let mine: 'in' | 'left-out' | 'replaced' | undefined;
   if (me && me in frozen && authoredRounds.has(roundKey(tableId, s.round, s.houseCommit))) {
     const i = bettors.indexOf(me);
-    mine = !authored.has(frozen[me]) ? 'replaced' : i >= 0 && t.seeds[i + 1] !== '' ? 'in' : 'left-out';
+    mine = !authored.has(authoredKey(tableId, s, frozen[me])) ? 'replaced' : i >= 0 && t.seeds[i + 1] !== '' ? 'in' : 'left-out';
   }
   // Who had chips down but added no seed: the frozen wager keys minus the
   // frozen commit keys — not the peer-writable `unseeded` list, which an

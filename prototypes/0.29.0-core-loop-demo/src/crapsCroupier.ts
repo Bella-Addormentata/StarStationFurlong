@@ -51,7 +51,7 @@ import { selectCrapsBackend } from './crapsBackend';
 import { getCrapsFairnessMode } from './games/diceFairness';
 // ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
 // at "no more bets" (fairTableSeeds.ts).
-import { freezeCommits, isFairTable, newHouseCommit } from './fairTableSeeds';
+import { freezeCommits, houseSeedHeld, isFairTable, newHouseCommit } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet come-out table never throws to an empty felt). */
@@ -286,6 +286,9 @@ export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Dat
   if (manual) next.operator = PAGE_ID;
   else delete next.operator;
   writeCrapsTableState(tableId, next);
+  // ⚖️ A Fair window this page can't reveal the house seed for is void: settle
+  // it now, before any shooter or the stickman throws dice for it.
+  if (next.houseCommit && !houseSeedHeld(tableId, next)) rollAndSettleCraps(tableId, next.round, next.point);
 }
 
 /** While the dice are with the shooter: settle their throw when it lands in

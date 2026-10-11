@@ -386,6 +386,23 @@ describe('a Fair roulette round', () => {
     expect((await verifySettledRound('roulette', t, forged, { pocket: forged.result! })).kind).toBe('failed');
   });
 
+  it("an earlier round's commitment of mine copied into this round is replaced, not kept", async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    const amyR1 = readTableState(t)!.commits![AMY];
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    later(SHOW_MS);
+    tickAutoCroupier(t); // round 2 opens
+    const r2 = readTableState(t)!;
+    writeMyBets(t, AMY, 2, [{ type: 'red', amount: 10 }]);
+    writeMySeedRecord(t, AMY, { round: 2, house: r2.houseCommit!, commit: amyR1 }); // copied in
+    playersLook(t, 'roulette', [AMY]);
+    expect(readSeedRecord(t, AMY)?.commit).not.toBe(amyR1);
+  });
+
   it('a bettor id too long for the closing state is left out instead of wedging the table', () => {
     const t = freshTable();
     tickAutoCroupier(t);
@@ -669,7 +686,7 @@ describe('a Fair craps roll', () => {
     expect(readAllCrapsBets(t)[BOB]).toEqual([{ type: 'field', amount: 5 }]);
   });
 
-  it('a void roll clears a list rewritten after the close instead of letting it ride', async () => {
+  it('a roll the house seed is gone for is void at the close, before any dice are thrown', async () => {
     const t = freshTable();
     tickAutoStickman(t);
     writeCrapsTableState(t, { ...readCrapsTableState(t)!, houseCommit: 'f'.repeat(64) });
@@ -677,14 +694,10 @@ describe('a Fair craps roll', () => {
     tickAutoStickman(t);
     playersLook(t, 'craps', [AMY]);
     later(CRAPS_BET_WINDOW_MS);
-    tickAutoStickman(t);
-    playersLook(t, 'craps', [AMY]);
-    writeMyCrapsBets(t, AMY, [{ type: 'anyseven', amount: 50 }]); // rewritten after the close
-    later(CRAPS_CLOSING_MS);
-    tickAutoStickman(t);
+    tickAutoStickman(t); // closes, and voids at once
     await flush();
-    expect(readCrapsTableState(t)?.voided).toBe(true);
-    expect(readAllCrapsBets(t)[AMY]).toBeUndefined();
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'settled', voided: true, dice: null });
+    expect(readDiceThrow(t)).toBeNull();
   });
 
   it('a played round stamped void fails the state guard', () => {

@@ -43,7 +43,7 @@ import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
-import { frozenFields, frozenWagers, gatherRound, settledRound } from './fairTableSeeds';
+import { frozenFields, frozenWagers, gatherRound, houseSeedHeld, settledRound } from './fairTableSeeds';
 
 export type { CrapsBackendKind };
 
@@ -100,10 +100,7 @@ class LocalCrapsBackend implements CrapsBackend {
     // owner switched the table to since; the switch takes effect next window.
     if (closing?.houseCommit && closing.phase === 'closing' && closing.round === round) {
       // ⚖️ The live Fair roll: the house seed + every frozen bettor's reveal.
-      const gathered = gatherRound(tableId, closing);
-      if (!gathered) return null; // reveals still due
-      forfeited = gathered.forfeited;
-      if (!gathered.parties[0].seed) {
+      if (!houseSeedHeld(tableId, closing)) {
         // ⚖️ No house seed to reveal (this page lost it): having seen every
         // bettor's reveal, the house could pick between outcomes by settling
         // without its seed. The roll is void: no dice, every bet stands.
@@ -127,6 +124,9 @@ class LocalCrapsBackend implements CrapsBackend {
         for (const pid of voided) writeMyCrapsBets(tableId, pid, []);
         return null;
       }
+      const gathered = gatherRound(tableId, closing);
+      if (!gathered) return null; // reveals still due
+      forfeited = gathered.forfeited;
       const mixed = await settleParties('craps', gathered.parties, tableId, round);
       // Nobody revealed anything (no house seed on this device, no bettors):
       // an unproven roll, shown as such on the table card.
