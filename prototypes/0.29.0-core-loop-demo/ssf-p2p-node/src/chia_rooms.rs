@@ -18,6 +18,21 @@
 //!
 //! D3 (#231): reads are on by default, so ingest no longer waits for
 //! `SSF_CHIA_LANE=1`; that switch now gates publishing only.
+//!
+//! KNOWN LIMIT — the private→public flip. This guard looks at a room's posture
+//! NOW. Records a member published while the room was private stay on chain
+//! forever, sealed under the room key; if the room's passage is later made
+//! public, the station atlas starts sharing the room's bootstrap seed (room key
+//! included) with anyone who walks in, and that key opens every record ever
+//! sealed under it. The flip stops further publishing at once, but it cannot
+//! take back what is already written. Rotating the room key on the flip is not
+//! this guard's to do: every pass and seed for the room carries that key, so a
+//! rotation re-keys the room for all its members — a room-model change, not a
+//! node-side check. The fix of record is #231 P6: presence moves off room keys
+//! to a per-node contact key that never travels in a room seed, so nothing on
+//! chain is keyed by a room. Until P6 lands, publishing stays a per-room opt-in
+//! (the `chiaMode` toggle), so the exposure is limited to rooms a member armed
+//! by hand and later opened up.
 #![cfg(feature = "chia-read")]
 
 use std::collections::HashMap;

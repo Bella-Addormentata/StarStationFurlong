@@ -585,12 +585,18 @@ function roomPassageIsPublic(): boolean {
 // bundled welcome room, or a room anyone may walk into — and never publishes
 // an address under such a room's key (anyone can derive its hint). Until the
 // probe answers the node assumes public, so a wrong answer can only withhold
-// a publish. Re-stamped on every door-policy change (and on every room bind,
-// which also notifies) so a room flipping public/private reaches the node live.
+// a publish. Re-stamped on every door-policy change AND every door-layout
+// change (a door fitted with no policy record of its own takes the default,
+// which is public, so a new door alone can open the room), and on every room
+// bind, which notifies both; so a room flipping public/private reaches the
+// node live whichever record flipped it.
 networkProvider.setPublicRoomProbe((roomId) =>
   roomIsPublicSpace(roomId === DEFAULT_STATION.welcomeRoomId, roomPassageIsPublic()),
 );
 subscribeDoorPolicy(() => {
+  void networkProvider.refreshRoomCap();
+});
+subscribeDoorLayout(() => {
   void networkProvider.refreshRoomCap();
 });
 // 🏒 #115: give the air-hockey session its outbound datagram seam. The

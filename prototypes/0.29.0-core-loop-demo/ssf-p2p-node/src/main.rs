@@ -2115,9 +2115,11 @@ pub(crate) async fn hold_dial(
             addr = addr.with_ip_addr(*sa);
         }
         let attempt_started = std::time::Instant::now();
-        // Each attempt gets two periods: long enough for a punch, short enough
-        // that the next Initial still goes out inside the window.
-        match tokio::time::timeout(HOLD_PERIOD * 2, iroh_ep.connect(addr, b"ssf")).await {
+        // Each attempt is bounded by ONE period, so a hung attempt (the NAT
+        // drops every Initial, the usual failure) never stretches the cadence:
+        // the next Initial leaves on the 15 s beat whatever happened to the
+        // last one. A handshake that needs longer than 15 s has already lost.
+        match tokio::time::timeout(HOLD_PERIOD, iroh_ep.connect(addr, b"ssf")).await {
             Ok(Ok(iroh_conn)) => {
                 println!(
                     "🎯 ChiaHub hold: connection secured to {target_str} on attempt {attempt} after {}s",

@@ -16,7 +16,9 @@
 //!     the moment its publisher republishes.
 //!   * Reads are INCREMENTAL: a [`HintCursor`] remembers the highest confirmed
 //!     height examined and resumes `CURSOR_OVERLAP_BLOCKS` below it; coins
-//!     already examined are skipped by coin id.
+//!     already examined are skipped by coin id. A listing longer than
+//!     [`MAX_PAGES_PER_POLL`] is continued next poll from the gateway's parked
+//!     cursor, and the height only moves once a listing ended fully examined.
 //!   * Parent fetches are capped per poll ([`MAX_PARENT_FETCHES_PER_POLL`]); a
 //!     flooded hint costs a bounded number of calls, not a scan of 50,000 ids.
 //!   * Records are RANKED by their signed `issued_at`, never by block height:
@@ -73,16 +75,59 @@ pub struct HintCursor {
     /// Coin ids already examined (decoded or rejected) — skipped on re-reads
     /// inside the overlap window. Bounded by `SEEN_CAP`.
     pub seen: HashSet<[u8; 32]>,
+    /// A listing the last poll could not finish inside `MAX_PAGES_PER_POLL`:
+    /// the next poll continues it from the gateway's cursor instead of starting
+    /// over, and `last_height` never moves past pages nobody has fetched.
+    pub pending: Option<PendingPage>,
+}
+
+/// Where a page-capped poll stopped, so the next poll continues the SAME
+/// listing. A gateway cursor is only meaningful for the query that produced
+/// it, so the query's `start_height` travels with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPage {
+    pub start_height: Option<u32>,
+    /// The gateway's `next_cursor` for the first page not yet fetched.
+    pub next_cursor: String,
+    /// Highest confirmed height on the pages fetched so far.
+    pub max_height: u32,
+    /// False once any poll of this listing left coins unexamined (parent-fetch
+    /// cap): the listing then cannot advance `last_height` when it ends.
+    pub examined_all: bool,
+}
+
+/// What one poll starts from: the query's `start_height`, the page cursor (None
+/// = first page) and the listing's running `max_height` / `examined_all`.
+struct Resume {
+    start: Option<u32>,
+    page: Option<String>,
+    max_height: u32,
+    examined_all: bool,
 }
 
 impl HintCursor {
-    /// `start_height` for the next query: resume a little below the last
+    /// `start_height` for the next FRESH query: resume a little below the last
     /// examined height; `None` means scan the hint from genesis.
     pub fn start_height(&self) -> Option<u32> {
         if self.last_height == 0 {
             None
         } else {
             Some(self.last_height.saturating_sub(CURSOR_OVERLAP_BLOCKS))
+        }
+    }
+
+    /// Take the next poll's starting point: the pending listing if there is
+    /// one (taken, so a cursor the gateway no longer honours fails once and
+    /// the poll after starts fresh), else a fresh listing from `start_height`.
+    fn resume(&mut self) -> Resume {
+        match self.pending.take() {
+            Some(p) => Resume {
+                start: p.start_height,
+                page: Some(p.next_cursor),
+                max_height: p.max_height,
+                examined_all: p.examined_all,
+            },
+            None => Resume { start: self.start_height(), page: None, max_height: 0, examined_all: true },
         }
     }
 
@@ -132,8 +177,11 @@ pub fn rank_and_dedupe(mut found: Vec<FoundRecord>) -> Vec<FoundRecord> {
 
 /// Read every record under `hint` not yet examined by `cursor`. Follows gateway
 /// pages, reads spent coins, caps parent fetches, verifies and filters. The
-/// cursor advances only when the whole new range was examined, so a capped or
-/// failed poll re-reads what it skipped next time.
+/// cursor's `last_height` advances only when a listing ENDED (the gateway sent
+/// its last page) and every coin it listed was examined; a poll that spends its
+/// page budget first parks the gateway cursor in `pending` and the next poll
+/// continues the same listing, so no page is ever skipped. A capped or failed
+/// poll re-reads what it skipped next time.
 pub async fn read_hint(
     client: &CoinsetClient,
     hint: Bytes32,
@@ -141,9 +189,10 @@ pub async fn read_hint(
     now: u64,
     cursor: &mut HintCursor,
 ) -> Result<Vec<FoundRecord>> {
-    let start = cursor.start_height();
-    let mut page: Option<String> = None;
+    let Resume { start, mut page, mut max_height, mut examined_all } = cursor.resume();
     let mut coins = Vec::new();
+    // `listed` = the gateway reported the listing's last page this poll.
+    let mut listed = false;
     for _ in 0..MAX_PAGES_PER_POLL {
         let resp = client
             .get_coin_records_by_hint(hint, start, None, Some(true), page.clone())
@@ -155,12 +204,15 @@ pub async fn read_hint(
         coins.extend(resp.coin_records.unwrap_or_default());
         match (resp.truncated, resp.next_cursor) {
             (Some(true), Some(next)) => page = Some(next),
-            _ => break,
+            _ => {
+                listed = true;
+                break;
+            }
         }
     }
     // Newest first, so a capped poll examines the freshest coins.
     coins.sort_by_key(|r| std::cmp::Reverse(r.confirmed_block_index));
-    let max_height = coins.iter().map(|r| r.confirmed_block_index).max().unwrap_or(0);
+    max_height = max_height.max(coins.iter().map(|r| r.confirmed_block_index).max().unwrap_or(0));
 
     let mut out = Vec::new();
     let mut fetched = 0usize;
@@ -198,8 +250,17 @@ pub async fn read_hint(
             });
         }
     }
-    if !capped && max_height > cursor.last_height {
-        cursor.last_height = max_height;
+    if capped {
+        examined_all = false;
+    }
+    if listed {
+        if examined_all && max_height > cursor.last_height {
+            cursor.last_height = max_height;
+        }
+    } else if let Some(next) = page {
+        // Page budget spent before the listing ended: park the cursor so the
+        // next poll fetches the pages after it, under the same start height.
+        cursor.pending = Some(PendingPage { start_height: start, next_cursor: next, max_height, examined_all });
     }
     Ok(out)
 }
@@ -362,6 +423,32 @@ mod tests {
             c.mark_seen([(i % 251) as u8, (i / 251) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         }
         assert!(c.seen.len() <= SEEN_CAP, "seen set is bounded, got {}", c.seen.len());
+    }
+
+    #[test]
+    fn cursor_continues_a_parked_listing_once_then_starts_fresh() {
+        let mut c = HintCursor { last_height: 5_000, ..Default::default() };
+        // Nothing parked: a fresh listing from the overlap start, first page.
+        let fresh = c.resume();
+        assert_eq!(fresh.start, Some(5_000 - CURSOR_OVERLAP_BLOCKS));
+        assert_eq!(fresh.page, None);
+        assert!(fresh.examined_all);
+        assert_eq!(fresh.max_height, 0);
+
+        // A poll that ran out of pages parks where it stopped, under ITS start.
+        c.pending = Some(PendingPage {
+            start_height: Some(4_968),
+            next_cursor: "page-9".into(),
+            max_height: 5_300,
+            examined_all: false,
+        });
+        let resumed = c.resume();
+        assert_eq!(resumed.start, Some(4_968), "a cursor is only valid for the query that made it");
+        assert_eq!(resumed.page.as_deref(), Some("page-9"));
+        assert_eq!(resumed.max_height, 5_300);
+        assert!(!resumed.examined_all, "an earlier parent-capped poll taints the whole listing");
+        assert!(c.pending.is_none(), "taken: a cursor the gateway refuses fails once, then we start fresh");
+        assert_eq!(c.last_height, 5_000, "resuming alone never advances the height");
     }
 
     #[test]
