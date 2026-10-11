@@ -74,6 +74,10 @@ describe('faucet dish: node replies', () => {
     delete legacy.walletSpendableMojos;
     expect(parseFaucetReply(b64({ op: 'status', ok: true, status: legacy }))?.status?.walletSpendableMojos).toBe(5000n);
     expect(asFaucetStatus({ ...wire(), walletSpendableMojos: 'some' })).toBeNull();
+    // Several u64 coins can pass u64 together (the node sums in u128): 20 digits, up to 39, still exact.
+    expect(asMojos('36893488147419103230')).toBe(36893488147419103230n);
+    expect(asMojos('1'.repeat(39))).toBe(BigInt('1'.repeat(39)));
+    expect(asMojos('1'.repeat(40))).toBeNull();
     expect(asMojos(1005)).toBe(1005n);
     expect(asMojos('0')).toBe(0n);
     expect(asMojos('-1')).toBeNull();

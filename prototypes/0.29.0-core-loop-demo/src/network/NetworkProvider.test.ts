@@ -22,6 +22,73 @@ const settle = () => new Promise((r) => setTimeout(r, 20));
 
 type WriteOutcome = { chunk: Uint8Array; outcome: 'written' | 'rejected' };
 
+/** The browser lane's framing: `[u32-LE len][JSON envelope]`. */
+const frame = (env: object): Uint8Array => {
+  const json = new TextEncoder().encode(JSON.stringify(env));
+  const packet = new Uint8Array(4 + json.length);
+  new DataView(packet.buffer).setUint32(0, json.length, true);
+  packet.set(json, 4);
+  return packet;
+};
+/** Every whole frame in what the provider wrote, decoded. */
+const unframe = (chunks: Uint8Array[]): Array<Record<string, unknown>> => {
+  let buf = new Uint8Array(0);
+  for (const c of chunks) {
+    const merged = new Uint8Array(buf.length + c.length);
+    merged.set(buf, 0);
+    merged.set(c, buf.length);
+    buf = merged;
+  }
+  const out: Array<Record<string, unknown>> = [];
+  while (buf.length >= 4) {
+    const len = new DataView(buf.buffer, buf.byteOffset, 4).getUint32(0, true);
+    if (buf.length < 4 + len) break;
+    out.push(JSON.parse(new TextDecoder().decode(buf.subarray(4, 4 + len))) as Record<string, unknown>);
+    buf = buf.subarray(4 + len);
+  }
+  return out;
+};
+/** A `faucet` envelope as the node writes it (base64 JSON payload). */
+const faucetEnvelope = (reply: object, kind = 'faucet') => ({
+  v: 1, room: BOOT.roomId, kind, seq: 0, author: '', payload: btoa(JSON.stringify(reply)),
+});
+
+/**
+ * One bidirectional stream of the fake transport. The test reads what the
+ * provider wrote on it and whether it closed its side (FIN), and plays the
+ * node's part on the readable: `reply()` writes a frame, `end()` finishes.
+ */
+class FakeBiStream {
+  written: Uint8Array[] = [];
+  closed = false;
+  readable: ReadableStream<Uint8Array>;
+  writable: WritableStream<Uint8Array>;
+  #push!: ReadableStreamDefaultController<Uint8Array>;
+
+  constructor() {
+    this.readable = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        this.#push = controller;
+      },
+    });
+    this.writable = new WritableStream<Uint8Array>({
+      write: (chunk) => {
+        this.written.push(chunk);
+      },
+      close: () => {
+        this.closed = true;
+      },
+    });
+  }
+
+  reply(env: object): void {
+    this.#push.enqueue(frame(env));
+  }
+  end(): void {
+    this.#push.close();
+  }
+}
+
 /**
  * A WebTransport stand-in.
  *  - `hold()` shuts the datagram sink, so every write stays pending until
@@ -45,9 +112,18 @@ class FakeTransport {
   #open: () => void = () => {};
   #controller!: WritableStreamDefaultController;
   datagrams: { writable: WritableStream<Uint8Array>; readable: ReadableStream<Uint8Array> };
-  incomingBidirectionalStreams = new ReadableStream({});
+  /** Streams the PROVIDER opened (createBidirectionalStream), in order. */
+  opened: FakeBiStream[] = [];
+  /** Streams the NODE opens toward the browser (forwarded traffic). */
+  incomingBidirectionalStreams: ReadableStream<FakeBiStream>;
+  #incoming!: ReadableStreamDefaultController<FakeBiStream>;
 
   constructor() {
+    this.incomingBidirectionalStreams = new ReadableStream<FakeBiStream>({
+      start: (controller) => {
+        this.#incoming = controller;
+      },
+    });
     this.ready = new Promise<void>((resolve, reject) => {
       this.acceptHandshake = resolve;
       this.failHandshake = reject;
@@ -98,6 +174,17 @@ class FakeTransport {
   async outcomeOf(match: (c: Uint8Array) => boolean): Promise<WriteOutcome['outcome'] | 'never-issued'> {
     const all = await Promise.all(this.outcomes);
     return all.find((o) => match(o.chunk))?.outcome ?? 'never-issued';
+  }
+  async createBidirectionalStream(): Promise<FakeBiStream> {
+    const stream = new FakeBiStream();
+    this.opened.push(stream);
+    return stream;
+  }
+  /** The node opens a stream toward the browser, as it does to forward a peer's envelope. */
+  nodeOpens(): FakeBiStream {
+    const stream = new FakeBiStream();
+    this.#incoming.enqueue(stream);
+    return stream;
   }
 }
 
@@ -283,5 +370,82 @@ describe('NetworkProvider — a dial it still owns', () => {
     await provider.connect(BOOT);
     expect(provider.mode()).toBe('direct-unreliable');
     await provider.disconnect();
+  });
+});
+
+/**
+ * 🥣 The faucet request stream (#245): one request per bidirectional stream,
+ * FIN after the single frame so the node can finish its side (the leak fix),
+ * and the reply taken ONLY from that stream — a `faucet` envelope on a stream
+ * the node opened is forwarded traffic, which a room peer could have sent, and
+ * must never pass for the node's answer (the spoofing fix).
+ */
+describe('NetworkProvider — the faucet request stream', () => {
+  async function connected(): Promise<{ wt: FakeTransport; provider: NetworkProvider; replies: unknown[]; envelopes: Array<{ kind?: string }> }> {
+    const wt = new FakeTransport();
+    wt.acceptHandshake();
+    queueTransports(wt);
+    const provider = new NetworkProvider();
+    await provider.connect(BOOT);
+    const replies: unknown[] = [];
+    const envelopes: Array<{ kind?: string }> = [];
+    provider.onFaucetReply((env) => {
+      replies.push(env);
+    });
+    provider.onEnvelope((env) => {
+      envelopes.push(env);
+    });
+    return { wt, provider, replies, envelopes };
+  }
+
+  it('sends one framed request then FIN, and the reply on that stream reaches onFaucetReply only', async () => {
+    const { wt, provider, replies, envelopes } = await connected();
+    await provider.requestFaucet('give', 1234.9);
+
+    expect(wt.opened).toHaveLength(1);
+    const stream = wt.opened[0];
+    const sent = unframe(stream.written);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].kind).toBe('faucet');
+    expect(sent[0].room).toBe(BOOT.roomId);
+    expect(JSON.parse(atob(sent[0].payload as string))).toEqual({ op: 'give', amount: 1234 });
+    // The writable is closed after that one frame: the node's read loop ends at
+    // our FIN and it can finish its side after replying, so the stream ends
+    // instead of living (and holding a node task) until disconnect.
+    expect(stream.closed).toBe(true);
+
+    const reply = faucetEnvelope({ op: 'give', ok: true, spentCoin: 'ab'.repeat(32) });
+    stream.reply(reply);
+    stream.end();
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    expect(replies[0]).toEqual(reply);
+    expect(envelopes).toHaveLength(0);
+    await provider.disconnect();
+  });
+
+  it('never takes a faucet envelope from a node-opened stream as a reply', async () => {
+    const { wt, provider, replies, envelopes } = await connected();
+    const forwarded = wt.nodeOpens();
+    // What a room peer could inject through an older node: a status with its own address.
+    forwarded.reply(faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1attacker' } }));
+    forwarded.reply(faucetEnvelope({ target: 'x', status: 'dialing' }, 'bridge'));
+    forwarded.end();
+    await vi.waitFor(() => expect(envelopes).toHaveLength(2));
+    // Both went down the generic path (where main.ts ignores `faucet`); none was a reply.
+    expect(envelopes.map((e) => e.kind)).toEqual(['faucet', 'bridge']);
+    expect(replies).toHaveLength(0);
+    await provider.disconnect();
+  });
+
+  it('rejects a request it cannot send instead of resolving as if it had', async () => {
+    const provider = new NetworkProvider();
+    await expect(provider.requestFaucet('status')).rejects.toThrow('no connection to your node');
+    const wt = new FakeTransport();
+    wt.acceptHandshake();
+    queueTransports(wt);
+    await provider.connect(BOOT);
+    await provider.disconnect();
+    await expect(provider.requestFaucet('claim')).rejects.toThrow('no connection to your node');
+    expect(wt.opened).toHaveLength(0);
   });
 });

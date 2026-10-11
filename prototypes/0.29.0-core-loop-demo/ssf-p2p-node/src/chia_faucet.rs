@@ -169,9 +169,12 @@ pub struct FaucetStatus {
     pub gap: u32,
     pub peak: u32,
     /// Mojos in claimable coins (dust below GIFT is not counted: it can never
-    /// leave). A decimal STRING on the wire — see [`mojo_string`].
+    /// leave). A decimal STRING on the wire — see [`mojo_string`]. `u128`: one
+    /// coin holds up to `u64::MAX` mojos and the address is permissionless, so
+    /// a SUM of coins can pass `u64` (Chia's own supply does); a `u64` sum
+    /// would panic in debug builds and wrap in release (#245 review, round 4).
     #[serde(with = "mojo_string")]
-    pub total_mojos: u64,
+    pub total_mojos: u128,
     /// Claimable coins = gift slots per GAP.
     pub coins: u32,
     /// Coins past their GAP right now: mojos sitting in the dish.
@@ -184,12 +187,12 @@ pub struct FaucetStatus {
     pub can_give: bool,
     /// Mojos our wallet OWNS on chain, when a wallet is loaded (decimal string).
     #[serde(with = "opt_mojo_string")]
-    pub wallet_mojos: Option<u64>,
+    pub wallet_mojos: Option<u128>,
     /// Of those, the mojos we may SPEND right now: owned minus coins a pushed
     /// spend already consumed but the chain has not confirmed yet (decimal
     /// string). GIVE is gated on this; the empty-wallet courtesy check on `wallet_mojos`.
     #[serde(with = "opt_mojo_string")]
-    pub wallet_spendable_mojos: Option<u64>,
+    pub wallet_spendable_mojos: Option<u128>,
     /// The coin listing hit [`MAX_FAUCET_PAGES`]: `coins`, `ready` and
     /// `total_mojos` cover the pages read, the jar holds more.
     pub partial: bool,
@@ -203,11 +206,11 @@ pub struct FaucetStatus {
 mod mojo_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(v)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
         String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
     }
 }
@@ -215,14 +218,14 @@ mod mojo_string {
 mod opt_mojo_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(v: &Option<u128>, s: S) -> Result<S::Ok, S::Error> {
         match v {
             Some(n) => s.collect_str(n),
             None => s.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
         Option::<String>::deserialize(d)?
             .map(|text| text.parse().map_err(serde::de::Error::custom))
             .transpose()
@@ -245,7 +248,7 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
         gift: params.gift,
         gap: params.gap,
         peak,
-        total_mojos: claimable.iter().map(|c| c.coin.amount).sum(),
+        total_mojos: claimable.iter().map(|c| u128::from(c.coin.amount)).sum(),
         coins: claimable.len() as u32,
         ready,
         next_ready_in_blocks,
@@ -395,7 +398,7 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
                 let wallet = wallet_view(client, sk).await?;
                 st.wallet_mojos = Some(wallet.owned_mojos());
                 st.wallet_spendable_mojos = Some(wallet.spendable_mojos());
-                st.can_give = wallet.spendable_mojos() >= params.gift;
+                st.can_give = wallet.spendable_mojos() >= u128::from(params.gift);
                 // The courtesy check reads what we OWN: a coin parked by a spend
                 // in flight is still ours, so the wallet is not empty. A gift
                 // from the dish that is still landing counts the same way (the
@@ -441,11 +444,12 @@ struct WalletView {
 
 #[cfg(feature = "chia-publish")]
 impl WalletView {
-    fn owned_mojos(&self) -> u64 {
-        self.owned.iter().map(|c| c.amount).sum()
+    /// Sums in `u128`: several `u64` coins can pass `u64` together.
+    fn owned_mojos(&self) -> u128 {
+        self.owned.iter().map(|c| u128::from(c.amount)).sum()
     }
-    fn spendable_mojos(&self) -> u64 {
-        self.spendable.iter().map(|c| c.amount).sum()
+    fn spendable_mojos(&self) -> u128 {
+        self.spendable.iter().map(|c| u128::from(c.amount)).sum()
     }
 }
 
@@ -468,12 +472,16 @@ async fn wallet_view(client: &CoinsetClient, sk: &chia_bls::SecretKey) -> Result
 pub fn pick_give_coins(mut coins: Vec<Coin>, amount: u64) -> Option<(Vec<Coin>, u64)> {
     coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
     let mut chosen = Vec::new();
-    let mut sum: u64 = 0;
+    // The running sum is `u128`: it may pass `u64::MAX` on the last coin taken.
+    // The change never does: before that coin the sum was below `amount`, so
+    // change < that coin's amount ≤ `u64::MAX`.
+    let amount = u128::from(amount);
+    let mut sum: u128 = 0;
     for coin in coins {
-        sum = sum.saturating_add(coin.amount);
+        sum += u128::from(coin.amount);
         chosen.push(coin);
         if sum >= amount {
-            return Some((chosen, sum - amount));
+            return Some((chosen, (sum - amount) as u64));
         }
     }
     None
@@ -890,13 +898,20 @@ mod tests {
 
     #[test]
     fn mojo_totals_travel_as_decimal_strings() {
-        // Exact past 2^53 — a JSON number would round in the browser.
-        let mut st = summarize(&test_params(), 1, &[], false);
-        st.total_mojos = u64::MAX;
+        // Exact past 2^53 — a JSON number would round in the browser — and past
+        // u64: two coins of u64::MAX each sum to 36893488147419103230.
+        let params = test_params();
+        let ph = params.puzzle_hash();
+        let coin = |n: u8, amount: u64| FaucetCoin {
+            coin: Coin::new(Bytes32::new([n; 32]), ph, amount),
+            confirmed_height: 1,
+        };
+        let mut st = summarize(&params, 100, &[coin(1, u64::MAX), coin(2, u64::MAX)], false);
+        assert_eq!(st.total_mojos, 2 * u128::from(u64::MAX));
         st.wallet_mojos = Some(9_007_199_254_740_993);
         st.wallet_spendable_mojos = Some(9_007_199_254_740_000);
         let json = serde_json::to_string(&st).unwrap();
-        assert!(json.contains("\"totalMojos\":\"18446744073709551615\""), "{json}");
+        assert!(json.contains("\"totalMojos\":\"36893488147419103230\""), "{json}");
         assert!(json.contains("\"walletMojos\":\"9007199254740993\""), "{json}");
         assert!(json.contains("\"walletSpendableMojos\":\"9007199254740000\""), "{json}");
         let back: FaucetStatus = serde_json::from_str(&json).unwrap();
@@ -921,6 +936,10 @@ mod tests {
         assert_eq!((chosen.len(), chosen[0].amount, change), (1, 5000, 4000));
         // An exact cover leaves no change; an uncoverable gift is refused.
         assert_eq!(pick_give_coins(vec![coin(1, 400), coin(2, 600)], 1000).unwrap().1, 0);
+        // The running sum passes u64::MAX here; the change is still exact (a
+        // saturating u64 sum reported 0 change for this pair).
+        let (chosen, change) = pick_give_coins(vec![coin(1, u64::MAX - 1), coin(2, 2)], u64::MAX).unwrap();
+        assert_eq!((chosen.len(), change), (2, 1));
         assert!(pick_give_coins(vec![coin(1, 400), coin(2, 500)], 1000).is_none());
         assert!(pick_give_coins(vec![], 1).is_none());
     }

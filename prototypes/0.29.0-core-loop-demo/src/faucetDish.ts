@@ -67,11 +67,12 @@ export const PENDING_TIMEOUT_MS = 120_000;
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
-/** A mojo total off the wire: a decimal string (the node's form), or a safe
- *  non-negative integer number (older nodes). Anything else is refused. */
+/** A mojo total off the wire: a decimal string (the node's form; it sums coins
+ *  in u128, so up to 39 digits, since several u64 coins can pass u64 together),
+ *  or a safe non-negative integer number (older nodes). Anything else is refused. */
 export function asMojos(v: unknown): bigint | null {
   if (typeof v === 'bigint') return v >= 0n ? v : null;
-  if (typeof v === 'string') return /^\d{1,30}$/.test(v) ? BigInt(v) : null;
+  if (typeof v === 'string') return /^\d{1,39}$/.test(v) ? BigInt(v) : null;
   if (isNum(v) && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
   return null;
 }

@@ -13,7 +13,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
-import { parseFaucetReply, setFaucetReply } from "./faucetDish";
+import { clearFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
 import { roomIsPublicSpace } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
@@ -3229,6 +3229,13 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   setActivePassRoom(null);
   // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
   clearChatBubbles();
+  // 🥣 The faucet dish's last status, error and pending TAKE/GIVE belong to
+  // this room's node session: forget them, so a revisit reads the chain
+  // afresh instead of showing stale balances or a stale TAKING… line.
+  {
+    const leavingRoomId = activeBootstrap?.roomId ?? networkProvider.getBootRecord()?.roomId;
+    if (leavingRoomId) clearFaucetRoom(leavingRoomId);
+  }
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
   settleReqUnsub?.();
   settleReqUnsub = null;
