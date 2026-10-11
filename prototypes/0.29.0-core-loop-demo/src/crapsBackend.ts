@@ -89,12 +89,13 @@ class LocalCrapsBackend implements CrapsBackend {
   ): Promise<[number, number] | null> {
     // HOW the dice are produced is the table's fairness mode (rng / commit-reveal
     // / multiparty / block-beacon), per-table override or the global default.
-    const mode = readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
+    const closing = readCrapsTableState(tableId);
+    // The mode locked in when this window opened (older records: the setting).
+    const mode = closing?.fairMode ?? readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
     const epoch = casinoDocEpoch();
     let dice: [number, number];
     let transcript: FairnessTranscript | undefined;
     let forfeited: string[] = [];
-    const closing = readCrapsTableState(tableId);
     // A roll opened Fair (it carries a house commit) settles Fair, whatever the
     // owner switched the table to since; the switch takes effect next window.
     if (closing?.houseCommit && closing.phase === 'closing' && closing.round === round) {

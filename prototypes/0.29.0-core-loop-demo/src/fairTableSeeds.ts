@@ -159,6 +159,28 @@ function stakedPlayers(tableId: string, game: TableGame, round: number): Set<str
 
 const lastTick = new Map<string, number>();
 
+/** Commitments THIS page made as a bettor (public values, not secrets): how
+ *  it tells its own record from one someone else wrote under its id. */
+const authored = new Set<string>();
+/** Rounds (roundKey) THIS page committed a seed in — the own-seed check only
+ *  speaks for rounds it took part in on this page. */
+const authoredRounds = new Set<string>();
+
+/** The frozen commit set each round showed when THIS page first saw it
+ *  closing — before any reveal, so before anyone could know the result. The
+ *  check compares the settled record against it: an operator who rewrites the
+ *  party set after the reveals (to drop or add a seed) is caught here. */
+const frozenSeen = new Map<string, { house: string; commits: Record<string, string> }>();
+
+function roundKey(tableId: string, round: number, house: string | undefined): string {
+  return `${casinoDocEpoch()}:${tableId}:${round}:${house ?? ''}`;
+}
+
+function sameCommits(a: Record<string, string>, b: Record<string, string>): boolean {
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => a[k] === b[k]);
+}
+
 /**
  * Commit while the window is open and this player has chips down; reveal once
  * "no more bets" froze a commit set that includes us. Cheap and idempotent:
@@ -171,24 +193,46 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
   lastTick.set(tickKey, now);
   const s = readState(tableId, game);
   if (!s?.houseCommit) return;
+  if (s.phase === 'closing') {
+    const k = roundKey(tableId, s.round, s.houseCommit);
+    if (!frozenSeen.has(k)) {
+      if (frozenSeen.size > 64) frozenSeen.clear();
+      frozenSeen.set(k, { house: s.houseCommit, commits: { ...(s.commits ?? {}) } });
+    }
+  }
   const rec = readSeedRecord(tableId, me);
   if (s.phase === 'betting') {
-    if (rec && rec.round === s.round && rec.house === s.houseCommit) return;
+    // A record under my id that I didn't write is replaced with my own.
+    if (rec && rec.round === s.round && rec.house === s.houseCommit && authored.has(rec.commit)) return;
     // O(1) look at my own bets: this runs for every table, several times a second.
     const mine = game === 'craps' ? readMyCrapsBets(tableId, me) : readMyBets(tableId, me, s.round);
     if (mine.length === 0) return;
     const seed = randomSeedHex();
     const commit = commitSeedSync(seed, bettorCtx(tableId, s, me));
     keepSeed(commit, seed);
+    if (authored.size > 256) authored.clear();
+    if (authoredRounds.size > 256) authoredRounds.clear();
+    authored.add(commit);
+    authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
     writeMySeedRecord(tableId, me, { round: s.round, house: s.houseCommit, commit });
   } else if (s.phase === 'closing') {
     const frozen = s.commits?.[me];
     if (!frozen || !rec || rec.commit !== frozen || rec.round !== s.round || rec.seed) return;
     const seed = seedFor(frozen, bettorCtx(tableId, s, me));
     if (seed) writeMySeedRecord(tableId, me, { ...rec, seed });
-  } else if (rec?.seed && rec.round === s.round) {
-    // Settled: the seed is public now — no need to keep it.
-    forgetSeed(rec.commit);
+  } else {
+    // Settled: this round's secrets are public or moot now — mine (revealed
+    // or not) and the house's, if this page opened the round.
+    // (First note my frozen commitment as mine if I hold its seed — a page
+    // reloaded mid-round still knows its own part for the card's check.)
+    const myFrozen = s.commits?.[me];
+    if (myFrozen && seedFor(myFrozen, bettorCtx(tableId, s, me))) {
+      authored.add(myFrozen);
+      authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
+    }
+    if (rec && rec.round === s.round) forgetSeed(rec.commit);
+    if (myFrozen) forgetSeed(myFrozen);
+    forgetSeed(s.houseCommit);
   }
 }
 
@@ -233,7 +277,7 @@ export interface GatheredRound {
  * counts as missing.
  */
 export function gatherRound(tableId: string, s: TableState, now = Date.now()): GatheredRound | null {
-  const key = `${casinoDocEpoch()}:${tableId}:${s.round}`;
+  const key = roundKey(tableId, s.round, s.houseCommit);
   if (!settleDueAt.has(key)) {
     if (settleDueAt.size > 64) settleDueAt.clear();
     settleDueAt.set(key, now);
@@ -261,7 +305,7 @@ export function gatherRound(tableId: string, s: TableState, now = Date.now()): G
 
 /** The round settled: the house seed is public now. */
 export function settledRound(tableId: string, s: TableState): void {
-  settleDueAt.delete(`${casinoDocEpoch()}:${tableId}:${s.round}`);
+  settleDueAt.delete(roundKey(tableId, s.round, s.houseCommit));
   if (s.houseCommit) forgetSeed(s.houseCommit);
 }
 
@@ -277,6 +321,12 @@ export type RoundVerdict =
     unseeded: string[];
     /** Bettors whose revealed seed went into the mix. */
     bettorSeeds: number;
+    /** The viewer's own seed: in the mix, left out, or replaced by a
+     *  commitment it never made (undefined: the viewer had no part). */
+    mine?: 'in' | 'left-out' | 'replaced';
+    /** False when this page never saw the round close, so it could not
+     *  compare the party set with the one frozen before the reveals. */
+    watchedClose: boolean;
   }
   | { kind: 'failed' }
   | { kind: 'unproven' };
@@ -293,10 +343,14 @@ export async function verifySettledRound(
   tableId: string,
   s: TableState,
   outcome: { dice?: [number, number]; pocket?: number },
+  me?: string,
 ): Promise<RoundVerdict> {
   const t: FairnessTranscript | undefined = s.fairness;
   if (!t?.parties || !t.commits || !t.seeds) return { kind: 'unproven' };
   const frozen = s.commits ?? {};
+  // The party set must be the one this page saw frozen before the reveals.
+  const seen = frozenSeen.get(roundKey(tableId, s.round, s.houseCommit));
+  if (seen && (seen.house !== s.houseCommit || !sameCommits(seen.commits, frozen))) return { kind: 'failed' };
   const bettors = t.parties.slice(1);
   if (t.commits[0] !== (s.houseCommit ?? '')
     || bettors.length !== Object.keys(frozen).length
@@ -309,6 +363,11 @@ export async function verifySettledRound(
     const r = readSeedRecord(tableId, pid);
     return !!r?.seed && r.round === s.round && commitSeedSync(r.seed, bettorCtx(tableId, s, pid)) === frozen[pid];
   });
+  let mine: 'in' | 'left-out' | 'replaced' | undefined;
+  if (me && me in frozen && authoredRounds.has(roundKey(tableId, s.round, s.houseCommit))) {
+    const i = bettors.indexOf(me);
+    mine = !authored.has(frozen[me]) ? 'replaced' : i >= 0 && t.seeds[i + 1] !== '' ? 'in' : 'left-out';
+  }
   return {
     kind: 'verified',
     forfeited,
@@ -316,5 +375,7 @@ export async function verifySettledRound(
     droppedReveal,
     unseeded: s.unseeded ?? [],
     bettorSeeds: bettors.length - forfeited.length,
+    mine,
+    watchedClose: !!seen,
   };
 }

@@ -35,6 +35,7 @@ import {
   clearTableKeys,
   creditChips,
   readAllCrapsBets,
+  readCrapsFairnessPref,
   readCrapsTableState,
   readDiceThrow,
   readSeats,
@@ -47,6 +48,7 @@ import type { CrapsTableState, SeatedPlayer } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
 import { selectCrapsBackend } from './crapsBackend';
+import { getCrapsFairnessMode } from './games/diceFairness';
 // ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
 // at "no more bets" (fairTableSeeds.ts).
 import { freezeCommits, isFairTable, newHouseCommit } from './fairTableSeeds';
@@ -138,6 +140,7 @@ export function openCrapsBetting(
     payouts: null,
     ...(shooter !== undefined ? { shooter } : {}),
     ...(lastShooter !== undefined ? { lastShooter } : {}),
+    fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
   });
 }

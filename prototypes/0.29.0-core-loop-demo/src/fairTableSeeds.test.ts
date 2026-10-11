@@ -131,9 +131,13 @@ describe('a Fair roulette round', () => {
     expect(s.fairness?.parties).toEqual(['house', AMY, BOB]);
     expect(s.fairness?.seeds?.every((x) => x.length === 64)).toBe(true);
     const v = await verifySettledRound('roulette', t, s, { pocket: s.result! });
-    expect(v).toEqual({
+    expect(v).toMatchObject({
       kind: 'verified', forfeited: [], houseMissing: false, droppedReveal: false, unseeded: [], bettorSeeds: 2,
+      watchedClose: true,
     });
+    expect(v.kind === 'verified' && v.mine).toBeUndefined(); // no player named
+    const amy = await verifySettledRound('roulette', t, s, { pocket: s.result! }, AMY);
+    expect(amy).toMatchObject({ kind: 'verified', mine: 'in' });
     // A different pocket fails the check.
     const wrong = await verifySettledRound('roulette', t, s, { pocket: (s.result! + 1) % 37 });
     expect(wrong.kind).toBe('failed');
@@ -153,8 +157,8 @@ describe('a Fair roulette round', () => {
     const s = readTableState(t)!;
     expect(s.phase).toBe('settled');
     expect(s.payouts?.[BOB]).toBeUndefined();
-    const v = await verifySettledRound('roulette', t, s, { pocket: s.result! });
-    expect(v).toMatchObject({ kind: 'verified', forfeited: [BOB], droppedReveal: false });
+    const v = await verifySettledRound('roulette', t, s, { pocket: s.result! }, BOB);
+    expect(v).toMatchObject({ kind: 'verified', forfeited: [BOB], droppedReveal: false, mine: 'left-out' });
   });
 
   it('flags an operator who left out a seed it could see', async () => {
@@ -193,6 +197,28 @@ describe('a Fair roulette round', () => {
       fairness: { ...f, parties: f.parties!.slice(0, 2), commits: f.commits!.slice(0, 2), seeds: f.seeds!.slice(0, 2) },
     };
     expect((await verifySettledRound('roulette', t, dropped, { pocket: s.result! })).kind).toBe('failed');
+  });
+
+  it('refuses a settled round whose commit set differs from the one frozen before reveals', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette'); // both reveal (and snapshot the frozen set)
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    // The operator drops Bob from both the frozen set and the transcript after
+    // seeing the reveals: self-consistent, but not what was frozen.
+    const { settleParties } = await import('./games/diceFairness');
+    const f = s.fairness!;
+    const mixed = await settleParties('roulette', [
+      { id: 'house', commit: f.commits![0], seed: f.seeds![0] },
+      { id: AMY, commit: f.commits![1], seed: f.seeds![1] },
+    ], t, 1);
+    const forged: RouletteTableState = {
+      ...s, commits: { [AMY]: s.commits![AMY] }, result: mixed!.pocket!, fairness: mixed!.transcript,
+    };
+    expect((await verifySettledRound('roulette', t, forged, { pocket: forged.result! })).kind).toBe('failed');
   });
 
   it("a seed revealed last round can't be replayed as this round's", async () => {
@@ -335,6 +361,25 @@ describe('a Fair craps roll', () => {
     expect(s.phase).toBe('settled');
     expect(readAllCrapsBets(t)[BOB]).toBeUndefined();
     expect(s.payouts?.[BOB]).toBeUndefined();
+  });
+
+  it('a window opened Fair settles Fair even if the owner switches to RNG mid-window', async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    expect(readCrapsTableState(t)?.fairMode).toBe('multiparty');
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    writeCrapsFairnessPref(t, 'rng');
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_CLOSING_MS);
+    tickAutoStickman(t);
+    await flush();
+    const s = readCrapsTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.fairness?.parties).toEqual(['house', AMY]);
   });
 
   it('an RNG table skips the exchange and carries no transcript', async () => {

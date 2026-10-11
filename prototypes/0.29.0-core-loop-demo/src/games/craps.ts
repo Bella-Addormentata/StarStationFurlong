@@ -109,6 +109,9 @@ export interface CrapsTableState {
   houseCommit?: string;
   commits?: Record<string, string>;
   unseeded?: string[];
+  /** ⚖️ The fairness mode locked in when this window opened; the settle uses
+   *  it, so an owner's switch mid-window applies from the next one. */
+  fairMode?: FairnessMode;
 }
 
 /** Which fairness scheme produced a table's dice (see diceFairness.ts). All four
@@ -265,7 +268,8 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && isPlayerIdField(s.shooter)
     && isPlayerIdField(s.lastShooter)
     && isPlayerIdField(s.operator)
-    && isSeedRoundFields(s);
+    && isSeedRoundFields(s)
+    && (s.fairMode === undefined || FAIRNESS_MODES.includes(s.fairMode));
 }
 
 /** The point AFTER a roll of `sum`, given the point in force before it:

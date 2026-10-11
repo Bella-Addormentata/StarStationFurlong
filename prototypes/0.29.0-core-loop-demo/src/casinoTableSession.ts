@@ -1086,7 +1086,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (!verifying.has(inFlight)) {
       verifying.add(inFlight);
       const check: Promise<{ text: string; color: string }> = fx.parties
-        ? verifySettledRound(game, itemId, s, outcome).then((r) => {
+        ? verifySettledRound(game, itemId, s, outcome, me).then((r) => {
           if (r.kind === 'failed') return { text: `✗ ${what} · CHECK FAILED`, color: '#FF8A80' };
           if (r.kind === 'unproven') return { text: `⚠ ${what} · UNPROVEN`, color: '#F5C26B' };
           const n = r.forfeited.length;
@@ -1101,9 +1101,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           if (houseOnly) parts.push('⚠ HOUSE SEED ONLY');
           if (r.houseMissing) parts.push('⚠ HOUSE SEED MISSING');
           if (r.droppedReveal) parts.push('✗ A REVEALED SEED WAS LEFT OUT');
+          // Your own part is the check that matters most to you: with your
+          // seed in, nobody could have steered the result against you.
+          if (r.mine === 'in') parts.push('✓ YOUR SEED IS IN');
+          if (r.mine === 'left-out') parts.push('✗ YOUR SEED WAS LEFT OUT');
+          if (r.mine === 'replaced') parts.push('✗ YOUR SEED WAS SWAPPED FOR ONE YOU DID NOT MAKE');
+          const bad = r.droppedReveal || r.mine === 'left-out' || r.mine === 'replaced';
           return {
             text: parts.join(' · '),
-            color: r.droppedReveal ? '#FF8A80' : r.houseMissing || houseOnly || u > 0 ? '#F5C26B' : '#7CF5B0',
+            color: bad ? '#FF8A80' : r.houseMissing || houseOnly || u > 0 ? '#F5C26B' : '#7CF5B0',
           };
         })
         : verifyTranscript(fx, itemId, forRound, cs?.dice ?? [0, 0]).then((ok) => ({
@@ -1226,10 +1232,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (!s || s.phase === 'settled') return;
     if (s.phase === 'betting') closeBetting(itemId, s);
     const r = s.round;
+    const epoch = casinoDocEpoch();
     const until = Date.now() + REVEAL_GRACE_MS + 6_000;
     const poll = window.setInterval(() => {
       const now = rouletteState();
-      if (now?.phase !== 'closing' || now.round !== r || Date.now() > until) {
+      // Another room's table can share this id and round: stop on a rebind.
+      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || Date.now() > until) {
         window.clearInterval(poll);
         return;
       }
