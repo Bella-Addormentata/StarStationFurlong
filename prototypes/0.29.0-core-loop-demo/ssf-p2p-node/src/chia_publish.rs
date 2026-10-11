@@ -151,8 +151,9 @@ pub struct PublishMark {
 }
 
 /// N8 in one place: of the rooms the browser handed us, which may publish right
-/// now (armed AND not public space) and which are armed but refused because
-/// their key is public space (bundled seed or PUBLIC passage).
+/// now (armed AND known private) and which are armed but refused — their key is
+/// public space (bundled seed or PUBLIC passage), or the browser predates N8 and
+/// never said which, and silence fails closed.
 pub fn publishable_rooms(caps: &[(String, ChiaRoomCap)]) -> (Vec<(String, [u8; 32])>, Vec<String>) {
     let mut armed = Vec::new();
     let mut refused = Vec::new();
@@ -227,7 +228,7 @@ pub async fn heartbeat_loop(
         for room in &refused {
             if refused_logged.insert(room.clone()) {
                 println!(
-                    "⛓️ ChiaHub heartbeat: room {room} is armed but is public space (bundled seed or PUBLIC passage) — N8: no address is ever published under its key"
+                    "⛓️ ChiaHub heartbeat: room {room} is armed but N8 refuses it — its key is public space (bundled seed or PUBLIC passage), or the browser predates N8 and never said; no address is published under its key until the browser says private"
                 );
             }
         }
@@ -317,21 +318,27 @@ pub async fn publish_presence(
 mod tests {
     use super::*;
 
-    fn cap(key: u8, chia_mode: bool, public_room: bool) -> ChiaRoomCap {
+    fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
         ChiaRoomCap { room_key: [key; 32], chia_mode, public_room }
     }
 
     #[test]
-    fn n8_only_armed_private_rooms_publish() {
+    fn n8_only_armed_known_private_rooms_publish() {
         let caps = vec![
-            ("private-armed".to_string(), cap(1, true, false)),
-            ("private-off".to_string(), cap(2, false, false)),
-            ("public-armed".to_string(), cap(3, true, true)),
-            ("public-off".to_string(), cap(4, false, true)),
+            ("private-armed".to_string(), cap(1, true, Some(false))),
+            ("private-off".to_string(), cap(2, false, Some(false))),
+            ("public-armed".to_string(), cap(3, true, Some(true))),
+            ("public-off".to_string(), cap(4, false, Some(true))),
+            ("unknown-armed".to_string(), cap(5, true, None)),
+            ("unknown-off".to_string(), cap(6, false, None)),
         ];
         let (armed, refused) = publishable_rooms(&caps);
         assert_eq!(armed, vec![("private-armed".to_string(), [1u8; 32])]);
-        assert_eq!(refused, vec!["public-armed".to_string()], "armed public rooms are named so the operator learns why nothing publishes");
+        assert_eq!(
+            refused,
+            vec!["public-armed".to_string(), "unknown-armed".to_string()],
+            "armed rooms that are public, or whose posture an old browser never sent, are named so the operator learns why nothing publishes"
+        );
     }
 
     #[test]

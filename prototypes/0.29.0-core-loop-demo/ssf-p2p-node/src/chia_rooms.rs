@@ -53,23 +53,36 @@ pub struct ChiaRoomCap {
     /// The per-room "publish my presence here" toggle (the arming switch; P3/D4
     /// give it its default). Publishing only — reads never consult it.
     pub chia_mode: bool,
-    /// N8: bundled-seed or PUBLIC-passage room. Never published under, never
-    /// read under. Set by the browser OR by the bundled-key check below.
-    pub public_room: bool,
+    /// N8 posture. `Some(true)`: bundled-seed or PUBLIC-passage room — never
+    /// published under, never read under. `Some(false)`: the browser resolved
+    /// the door policy and the room is private. `None`: the browser never said
+    /// (a build from before N8 sends no flag). Silence FAILS CLOSED for
+    /// publishing — the unsafe direction is writing an address under a key that
+    /// turns out to be public — and counts as unknown for reading, which is
+    /// free and harmless either way. Set by the browser OR forced to
+    /// `Some(true)` by the bundled-key check below.
+    pub public_room: Option<bool>,
 }
 
 impl ChiaRoomCap {
     /// May the publisher write a presence record under this room's key?
-    /// Armed AND not public space — the N8 guard in one place.
+    /// Armed AND KNOWN private — the N8 guard in one place. An absent flag is
+    /// not "private": an older browser cannot vouch for the room's posture.
     pub fn may_publish(&self) -> bool {
-        self.chia_mode && !self.public_room
+        self.chia_mode && self.public_room == Some(false)
     }
 
     /// Should the reader (rung-6 resolve, P1 watcher) read this room's hint?
-    /// Everything that is not public space — reads are free and need no arming
-    /// (D3); public rooms carry nothing under their hint by construction (D6).
+    /// Everything not KNOWN to be public space — reads are free and need no
+    /// arming (D3); public rooms carry nothing under their hint by
+    /// construction (D6), so skipping them only saves gateway calls.
     pub fn may_read(&self) -> bool {
-        !self.public_room
+        self.public_room != Some(true)
+    }
+
+    /// True when the browser never sent the N8 flag (pre-N8 build).
+    pub fn posture_unknown(&self) -> bool {
+        self.public_room.is_none()
     }
 }
 
@@ -80,8 +93,9 @@ struct RoomCapPayload {
     room_key_b64: String,
     #[serde(rename = "chiaMode", default)]
     chia_mode: bool,
+    /// Absent in caps from browsers that predate N8 — see [`ChiaRoomCap::public_room`].
     #[serde(rename = "publicRoom", default)]
-    public_room: bool,
+    public_room: Option<bool>,
 }
 
 /// Decode a 32-byte room key from whatever base64 flavor the browser emits
@@ -114,11 +128,12 @@ pub fn is_bundled_room_key(room_key: &[u8; 32]) -> bool {
 
 /// Pure parse of a `cap` payload — the testable core of [`ingest_room_cap`].
 /// `None` on bad JSON or a key that isn't 32 bytes of (any-flavor) base64. A
-/// bundled key forces `public_room` on whatever the browser said.
+/// bundled key forces `public_room` to `Some(true)` whatever the browser said
+/// (or did not say).
 pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
     let parsed: RoomCapPayload = serde_json::from_slice(payload).ok()?;
     let room_key = decode_room_key(&parsed.room_key_b64)?;
-    let public_room = parsed.public_room || is_bundled_room_key(&room_key);
+    let public_room = if is_bundled_room_key(&room_key) { Some(true) } else { parsed.public_room };
     Some(ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room })
 }
 
@@ -149,8 +164,10 @@ pub fn ingest_room_cap(rooms: &Mutex<HashMap<String, ChiaRoomCap>>, room: &str, 
         }
     };
     if changed {
-        let posture = if cap.public_room {
+        let posture = if cap.public_room == Some(true) {
             "public space — N8: never published or read under this key"
+        } else if cap.posture_unknown() {
+            "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private"
         } else if cap.chia_mode {
             "armed — reads on, presence publishes while SSF_CHIA_LANE=1"
         } else {
@@ -179,19 +196,20 @@ mod tests {
         let cap = parse_room_cap(&payload(key, ",\"chiaMode\":true,\"publicRoom\":false")).unwrap();
         assert_eq!(cap.room_key, key);
         assert!(cap.chia_mode);
-        assert!(!cap.public_room);
+        assert_eq!(cap.public_room, Some(false));
         assert!(cap.may_publish());
         assert!(cap.may_read());
     }
 
     #[test]
-    fn room_cap_defaults_flags_false_and_rejects_junk() {
+    fn room_cap_defaults_and_rejects_junk() {
         let key = [3u8; 32];
         let cap = parse_room_cap(&payload(key, "")).expect("parses");
         assert!(!cap.chia_mode);
-        assert!(!cap.public_room);
+        assert_eq!(cap.public_room, None, "no flag = the browser never said");
+        assert!(cap.posture_unknown());
         assert!(!cap.may_publish(), "unarmed rooms never publish");
-        assert!(cap.may_read(), "reads need no arming (D3)");
+        assert!(cap.may_read(), "reads need no arming (D3) and no posture");
         assert!(parse_room_cap(b"not json at all").is_none());
         assert!(parse_room_cap(b"{\"roomKeyB64\":\"c2hvcnQ\"}").is_none());
     }
@@ -200,9 +218,24 @@ mod tests {
     fn n8_public_room_flag_blocks_publish_and_read() {
         let key = [5u8; 32];
         let cap = parse_room_cap(&payload(key, ",\"chiaMode\":true,\"publicRoom\":true")).unwrap();
-        assert!(cap.public_room);
+        assert_eq!(cap.public_room, Some(true));
         assert!(!cap.may_publish(), "N8: armed but public — never publish");
         assert!(!cap.may_read(), "D6: nothing lives under a public room's hint");
+    }
+
+    #[test]
+    fn n8_absent_flag_fails_closed_for_publishing_only() {
+        // A browser from before N8 arms a room but cannot say whether its
+        // passage is public: the node must not publish under that key (the
+        // room may well be public space) but may still read it.
+        let key = [6u8; 32];
+        let cap = parse_room_cap(&payload(key, ",\"chiaMode\":true")).unwrap();
+        assert_eq!(cap.public_room, None);
+        assert!(!cap.may_publish(), "N8: silence is not 'private'");
+        assert!(cap.may_read(), "reads stay on for an unknown posture");
+        // Once the browser resolves the door policy and says private, publishing opens.
+        let cap = parse_room_cap(&payload(key, ",\"chiaMode\":true,\"publicRoom\":false")).unwrap();
+        assert!(cap.may_publish());
     }
 
     #[test]
@@ -212,8 +245,12 @@ mod tests {
         assert!(!is_bundled_room_key(&[0u8; 32]));
         // An old browser build sends no publicRoom flag and arms the room: still refused.
         let cap = parse_room_cap(&payload(welcome, ",\"chiaMode\":true")).unwrap();
-        assert!(cap.public_room);
+        assert_eq!(cap.public_room, Some(true), "bundled key: public, flag or no flag");
         assert!(!cap.may_publish());
+        assert!(!cap.may_read());
+        // Even an explicit `false` from the browser cannot make the bundled key private.
+        let cap = parse_room_cap(&payload(welcome, ",\"chiaMode\":true,\"publicRoom\":false")).unwrap();
+        assert_eq!(cap.public_room, Some(true));
     }
 
     #[test]
