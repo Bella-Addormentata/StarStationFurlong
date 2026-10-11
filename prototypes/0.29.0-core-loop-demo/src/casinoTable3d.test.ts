@@ -5,7 +5,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
-import type { CasinoTableVisualHandle } from './casinoTable3d';
+import { railStacks, type CasinoTableVisualHandle } from './casinoTable3d';
+import { railChips } from './chipDisplay';
 import { buildItemGroup } from './furniture';
 
 /** A canvas whose 2-D context draws nothing: the felt paints through one. */
@@ -51,5 +52,13 @@ describe('the craps table chips', () => {
     h.setFeltChips([]);
     h.update(0);
     expect(chipsDrawn(group)).toBeLessThan(1000);
+  });
+
+  it('keeps small chips on a crowded rail', () => {
+    const rail = railStacks({ x: 0, z: -0.48, axis: 'x', len: 0.62 }, railChips(123456));
+    const denoms = new Set(rail.map((s) => s.denom));
+    for (const d of [1, 5, 25, 100]) expect(denoms.has(d), `$${d}`).toBe(true);
+    // Still largest first along the rail.
+    expect(rail.map((s) => s.denom)).toEqual([...rail.map((s) => s.denom)].sort((a, b) => b - a));
   });
 });

@@ -28,6 +28,7 @@
 
 import { canRunCroupier } from './croupier';
 import {
+  casinoDocEpoch,
   clearTableKeys,
   creditChips,
   readAllCrapsBets,
@@ -37,6 +38,7 @@ import {
   writeCrapsTableState,
   writeDiceThrow,
 } from './casinoDoc';
+import { CRAPS_DICE_SPOT } from './games/casinoLayout';
 import { hasLineBet, pickShooter } from './games/craps';
 import type { CrapsTableState, SeatedPlayer } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
@@ -57,8 +59,8 @@ export const CRAPS_SHOOTER_MS = 20_000;
 /** A seat whose heartbeat has not moved for this long (operator clock) is
  *  gone — the page crashed or lost its connection without clearing it. */
 export const SEAT_STALE_MS = 15_000;
-/** The stickman's spot on the felt: beside the ⚙️ button, by the +z rail. */
-export const STICKMAN_DICE_SPOT = { x: 0.17, z: 0.36 };
+/** The stickman's spot on the felt (the layout's dice spot). */
+export const STICKMAN_DICE_SPOT = CRAPS_DICE_SPOT;
 
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
@@ -134,12 +136,19 @@ export function openCrapsBetting(
 
 // ── 🎲 #226: the shooter ──────────────────────────────────────────────────────
 
-/** seat key → [its `at`, when THIS client last saw `at` change]. */
+/** table:player → [its `at`, when THIS client last saw `at` change]. Scoped
+ *  to one room doc: another room's table can share the id, the player and
+ *  even the heartbeat value, so a rebind starts it over. */
 const seatSeen = new Map<string, { at: number; seenAt: number }>();
+let seatSeenEpoch = -1;
 
 /** Players standing at the table right now, judged on the operator's own clock:
  *  a seat counts while its heartbeat keeps moving. */
 export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[] {
+  if (seatSeenEpoch !== casinoDocEpoch()) {
+    seatSeenEpoch = casinoDocEpoch();
+    seatSeen.clear();
+  }
   const out: SeatedPlayer[] = [];
   for (const [pid, seat] of Object.entries(readSeats(tableId))) {
     const key = `${tableId}:${pid}`;

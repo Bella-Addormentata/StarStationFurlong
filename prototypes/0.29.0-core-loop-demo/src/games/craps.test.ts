@@ -14,6 +14,7 @@ import {
   isCrapsBet,
   isCrapsTableState,
   pickShooter,
+  pointWasOn,
   resolveCrapsBet,
   resolveCrapsRound,
   type CrapsBet,
@@ -194,5 +195,18 @@ describe('the shooter ring', () => {
   it('needs a pass or don\'t pass bet to shoot', () => {
     expect(hasLineBet([bet('field'), bet('place', 5, 6)])).toBe(false);
     expect(hasLineBet([bet('dontpass')])).toBe(true);
+  });
+});
+
+describe('pointWasOn', () => {
+  const settled = (point: number | null, result: number, sevenOut = false) => ({ point, result, sevenOut });
+  it('reads the point in force before a settled roll', () => {
+    expect(pointWasOn(settled(6, 6))).toBe(false); // come-out set the point
+    expect(pointWasOn(settled(null, 6))).toBe(true); // the point was made
+    expect(pointWasOn(settled(8, 5))).toBe(true); // a roll that decided nothing
+    expect(pointWasOn(settled(null, 7, true))).toBe(true); // seven-out
+    expect(pointWasOn(settled(null, 7))).toBe(false); // come-out natural
+    expect(pointWasOn(settled(null, 12))).toBe(false); // come-out craps
+    expect(pointWasOn(settled(9, 2))).toBe(true); // craps with a point on
   });
 });

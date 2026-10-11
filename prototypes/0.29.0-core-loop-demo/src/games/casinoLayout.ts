@@ -134,6 +134,9 @@ export const CRAPS_NUMBERS = [4, 5, 6, 8, 9, 10] as const;
 
 const NUM_W = (CR.endIn - CR.numIn) / 6;
 
+/** Where the stickman keeps the dice: beside the ⚙️ button, by the +z rail. */
+export const CRAPS_DICE_SPOT: FeltPoint = { x: 0.17, z: 0.36 };
+
 /** A number box (place / travelled come bets) on one end. */
 export function crapsNumberBox(n: number, side: -1 | 1): FeltRect {
   const i = CRAPS_NUMBERS.indexOf(n as (typeof CRAPS_NUMBERS)[number]);

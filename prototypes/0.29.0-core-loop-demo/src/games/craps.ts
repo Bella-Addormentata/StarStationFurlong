@@ -486,3 +486,14 @@ export function pickShooter(
   }
   return null;
 }
+
+/** Was a point on going into this settled roll? The state carries only the
+ *  point after it, but that, the sum and the seven-out flag pin it down:
+ *  a made point clears it, a come-out 4–10 sets it equal to the sum, and a
+ *  point-phase roll that decides nothing leaves it alone. */
+export function pointWasOn(s: Pick<CrapsTableState, 'point' | 'result' | 'sevenOut'>): boolean {
+  if (s.result === null) return s.point !== null;
+  if (s.point !== null) return s.point !== s.result;
+  if (s.result === 7) return s.sevenOut === true;
+  return [4, 5, 6, 8, 9, 10].includes(s.result);
+}

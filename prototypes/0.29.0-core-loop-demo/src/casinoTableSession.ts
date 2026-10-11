@@ -39,7 +39,7 @@ import {
 import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
-import { railChips } from './chipDisplay';
+import { chipsFor, railChips } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
@@ -53,7 +53,7 @@ import {
   hitSettings, ROULETTE_LAYOUT, spotKey,
 } from './games/casinoLayout';
 import type { FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
-import { canPlaceBet, crapsBetLabel } from './games/craps';
+import { canPlaceBet, crapsBetLabel, pointWasOn } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/diceFairness';
 import { readPlayerDisplayName } from './games/gamesDoc';
@@ -187,7 +187,9 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
         groups.set(key, g);
       }
       const list = g.chips.get(pid) ?? [];
-      list.push(b.amount);
+      // One chip per bet record when it's a real chip; any other stake (an
+      // older client's 10 or 250) shows as the chips it breaks into.
+      list.push(...chipsFor(b.amount));
       g.chips.set(pid, list);
     }
   }
@@ -204,17 +206,19 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
   return out;
 }
 
-/** Felt boxes a settled craps roll paid (lit once the dice are down). */
-function crapsWinners(d1: number, d2: number): Set<string> {
+/** Felt boxes a settled craps roll paid (lit once the dice are down). Place
+ *  and hardway bets are off on the come-out, so they light only with a point
+ *  on. */
+function crapsWinners(d1: number, d2: number, working: boolean): Set<string> {
   const sum = d1 + d2;
   const ids = new Set<string>();
   for (const rg of CRAPS_LAYOUT.regions) {
     const b = rg.bet;
     const hit =
-      (b.type === 'place' && b.pick === sum)
+      (b.type === 'place' && working && b.pick === sum)
       || (b.type === 'big6' && sum === 6)
       || (b.type === 'big8' && sum === 8)
-      || (b.type === 'hard' && b.pick === sum && d1 === d2)
+      || (b.type === 'hard' && working && b.pick === sum && d1 === d2)
       || (b.type === 'field' && [2, 3, 4, 9, 10, 11, 12].includes(sum))
       || (b.type === 'anyseven' && sum === 7)
       || (b.type === 'anycraps' && (sum === 2 || sum === 3 || sum === 12))
@@ -241,8 +245,10 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
   const s = readCrapsTableState(id);
   const t = readDiceThrow(id);
   if (!rt.primed) {
-    // Walking in mid-game: show where things stand, animate nothing old.
+    // Walking in mid-game (or a room rebind): clear whatever the pieces still
+    // show, then show where things stand, animating nothing old.
     rt.primed = true;
+    h.reset();
     rt.thrownSeed = t?.seed ?? null;
     if (s?.phase === 'settled' && s.dice) {
       rt.landedRound = s.round;
@@ -284,7 +290,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
         (b: CrapsBet, pid) => crapsChipRect(b, crapsSideFor(anchors.get(pid)?.x ?? 1)),
         me,
       ));
-      h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1]) : NO_HIGHLIGHT);
+      h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1], pointWasOn(s)) : NO_HIGHLIGHT);
     }
   }
 }
@@ -293,6 +299,7 @@ function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime,
   const s = readTableState(id);
   if (!rt.primed) {
     rt.primed = true;
+    h.reset();
     if (s?.phase === 'settled' && s.result !== null) rt.spunRound = s.round;
   }
   if (!s) return;
@@ -805,7 +812,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         rows.push(`<div style="font-size:9px;color:${v === false ? '#FF8A80' : '#7CF5B0'};">${txt}</div>`);
         if (v === undefined) {
           const forRound = s.round;
+          const forEpoch = casinoDocEpoch();
           verifyTranscript(fx, itemId, forRound, s.dice).then((ok) => {
+            // A check started in another room's doc says nothing about this one.
+            if (forEpoch !== casinoDocEpoch()) return;
             if (verdicts.size > 32) verdicts.clear();
             verdicts.set(forRound, ok);
             renderCard();

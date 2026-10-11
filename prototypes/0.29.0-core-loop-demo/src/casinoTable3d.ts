@@ -24,7 +24,7 @@
 import * as THREE from 'three';
 import { CHIP_STYLE } from './chipDisplay';
 import {
-  CHIP_RADIUS, crapsPuckSpot, CRAPS_LAYOUT, ROULETTE_LAYOUT, ROULETTE_WHEEL,
+  CHIP_RADIUS, CRAPS_DICE_SPOT, crapsPuckSpot, CRAPS_LAYOUT, ROULETTE_LAYOUT, ROULETTE_WHEEL,
 } from './games/casinoLayout';
 import type {
   CrapsSpot, FeltLayout, FeltPoint, FeltRect, FeltRegion, RouletteSpot,
@@ -104,6 +104,9 @@ export interface CasinoTableVisualHandle {
   /** Ball resting in `result` (null: ball off the wheel, betting open). */
   wheelRest(result: number | null): void;
   wheelSpinning(): boolean;
+  /** Back to an empty table: no chips, nothing lit, puck off, any throw or
+   *  spin dropped — for a room rebind, so nothing carries over. */
+  reset(): void;
   /** Per-frame animation; World drives it. */
   update(dt: number): void;
 }
@@ -573,6 +576,12 @@ class DicePair {
     return y.multiply(faceUpQuat(value));
   }
 
+  /** Drop any throw in progress where it is (the next restAt slides home). */
+  cancel(): void {
+    this.mode = 'rest';
+    this.landing = null;
+  }
+
   restAt(p: FeltPoint, values?: [number, number]): void {
     if (this.mode === 'flying' || this.mode === 'settling') return;
     if (values) this.faces = values;
@@ -941,6 +950,11 @@ class RouletteWheel {
     this.ballGroup.visible = true;
   }
 
+  /** Stop a spin in progress (the wheel idles on). */
+  cancel(): void {
+    this.spin = null;
+  }
+
   restOn(result: number | null): void {
     if (this.spin) return;
     this.rest = result;
@@ -1042,7 +1056,17 @@ export function railStacks(spec: RailSpec, chips: readonly number[]): RailStack[
   }
   const pitch = RAIL_PITCH;
   const fit = Math.max(1, Math.floor(spec.len / pitch));
-  const shown = raw.slice(0, fit);
+  // Too many stacks for the rail: keep one of every denomination first
+  // (smallest first, so a rich player still has small chips to bet), then
+  // as many of the rest as fit, largest first.
+  const keep = new Set<number>();
+  if (raw.length > fit) {
+    for (let i = raw.length - 1; i >= 0 && keep.size < fit; i--) {
+      if (i === raw.findIndex((r) => r.denom === raw[i].denom)) keep.add(i);
+    }
+  }
+  for (let i = 0; i < raw.length && keep.size < fit; i++) keep.add(i);
+  const shown = raw.filter((_, i) => keep.has(i));
   const start = -((shown.length - 1) * pitch) / 2;
   return shown.map((s, i) => {
     const off = start + i * pitch;
@@ -1137,6 +1161,18 @@ class TableHandle implements CasinoTableVisualHandle {
     for (const p of this.pucks) p.set(point);
   }
 
+  reset(): void {
+    this.setFeltChips([]);
+    this.setHighlight(new Set());
+    this.setPuck(null);
+    if (this.dice) {
+      this.dice.cancel();
+      this.dice.restAt(CRAPS_DICE_SPOT);
+    }
+    this.wheel?.cancel();
+    this.wheel?.restOn(null);
+  }
+
   diceRestAt(p: FeltPoint, values?: [number, number]): void {
     this.dice?.restAt(p, values);
   }
@@ -1204,7 +1240,7 @@ export function buildCrapsPieces(ctx: PiecesCtx, halfX: number, halfZ: number): 
   const handle = new TableHandle('craps', halfX, halfZ, c, dice, pucks, null);
   c.feltMesh.userData.casinoTable = handle;
   // Dice start at the stickman's spot, in front of the ⚙️ button.
-  dice.restAt({ x: 0, z: 0.27 });
+  dice.restAt(CRAPS_DICE_SPOT);
   return handle;
 }
 
