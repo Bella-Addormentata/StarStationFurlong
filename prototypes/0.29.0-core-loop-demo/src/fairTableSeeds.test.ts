@@ -538,6 +538,33 @@ describe('a Fair roulette round', () => {
     expect(readSeedRecord(t, AMY)?.seed).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  it('a reloaded bettor still reveals past an erased house commit, from its stored seed', () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, v); },
+      removeItem: (k: string) => { store.delete(k); },
+    });
+    try {
+      const t = freshTable();
+      tickAutoCroupier(t);
+      const open = readTableState(t)!;
+      writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+      // Committed before the reload: only the stored seed survives it.
+      const seed = 'ab'.repeat(32);
+      const ctx = { room: '', table: t, round: 1, party: AMY, house: open.houseCommit! };
+      const commit = commitSeedSync(seed, ctx);
+      store.set(`ssf-fair-seed:${commit}`, seed);
+      writeMySeedRecord(t, AMY, { round: 1, house: open.houseCommit!, commit, sig: signFor(t, 1, AMY, open.houseCommit!, commit) });
+      writeTableState(t, { ...open, phase: 'closing', houseCommit: undefined, commits: { [AMY]: commit } });
+      playersLook(t, 'roulette', [AMY]);
+      expect(readSeedRecord(t, AMY)?.seed).toBe(seed);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.stubGlobal('window', { location: { search: '' } });
+    }
+  });
+
   it('the stored seeds stay capped when rounds are abandoned before they settle', async () => {
     const store = new Map<string, string>();
     vi.stubGlobal('localStorage', {

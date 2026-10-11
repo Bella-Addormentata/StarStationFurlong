@@ -375,8 +375,11 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
   // forfeit me).
   let house = live.houseCommit;
   if (live.phase !== 'betting') {
+    // Mine: authored on this page, or (after a reload) opened by a seed this
+    // device kept for exactly that commitment.
     const mineRec = rec && rec.round === live.round
-      && authored.has(authoredKey(tableId, { ...live, houseCommit: rec.house }, rec.commit)) ? rec.house : undefined;
+      && (authored.has(authoredKey(tableId, { ...live, houseCommit: rec.house }, rec.commit))
+        || seedFor(rec.commit, bettorCtx(tableId, { ...live, houseCommit: rec.house }, me))) ? rec.house : undefined;
     house = frozenFields(tableId, live).houseCommit ?? house ?? mineRec;
   }
   if (!house) return;
