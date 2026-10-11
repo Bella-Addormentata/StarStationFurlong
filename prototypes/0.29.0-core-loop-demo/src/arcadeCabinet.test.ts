@@ -1,13 +1,15 @@
 /**
  * 🕹️ Arcade cabinet tests: the menu model and key map, the frame conversion
- * behind the CRT look, the cabinet build (its screen handle is filed and it
- * frees what it made), and the focus UI end to end with a stubbed DOM —
- * menu, a bundled game, back to the menu, your own cartridge, and leaving.
+ * behind the CRT look, the cabinet builds (their screen handles are filed and
+ * they free what they made), and the focus UI end to end with a stubbed DOM
+ * and the real shared-game session — menu, a bundled game shared with the
+ * room, back to the menu, your own cartridge, and leaving.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
+import * as Y from 'yjs';
 import {
   MENU,
   cartridgeTitle,
@@ -19,10 +21,16 @@ import {
   type ArcadeView,
 } from './arcadeCabinet';
 import { ARCADE_GAMES } from './arcadeLibrary';
+import { isArcadeTickFlags, unpackArcadeTick } from './arcadeNet';
+import {
+  arcadeFrame, registerArcadeVisual, resetArcadeSessions, setArcadeRomFetcher, setArcadeSender,
+} from './arcadeSession';
 import { BLACK_LIFT, CREDIT_PAGES, writeFrameRgba, type ArcadeScreenPainter } from './arcadeScreen';
+import type { ArcadeLink, SharedView } from './arcadeSession';
 import type { ArcadeCabinetVisualHandle } from './devices';
 import { FURNITURE_DEFS, buildItemGroup } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
+import { bindGamesDoc, readArcade } from './games/gamesDoc';
 
 const menu = (cursor = 0): ArcadeView => ({ screen: 'menu', cursor, status: null });
 const OWN = MENU.findIndex((e) => e.kind === 'own');
@@ -197,16 +205,35 @@ function recordingPainter() {
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 let win: EventTarget;
+/** Every datagram the session sent to the room. */
+let sent: Uint8Array[];
 beforeEach(() => {
   created.length = 0;
   win = new EventTarget();
   vi.stubGlobal('window', win);
   vi.stubGlobal('document', { createElement: fakeElement });
+  bindGamesDoc(new Y.Doc());
+  resetArcadeSessions();
+  sent = [];
+  setArcadeSender((buf) => sent.push(buf));
 });
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  setArcadeSender(null);
+  setArcadeRomFetcher(null);
 });
+
+const ITEM = 'arcade-1';
+const framesSent = () => sent.filter((b) => isArcadeTickFlags(b[0]) && unpackArcadeTick(b)?.type === 'frames').length;
+
+/** One render frame: the focus UI, then the session (World.update's order). */
+function tick(ui: { update(dt: number): void }, n = 1): void {
+  for (let i = 0; i < n; i++) {
+    ui.update(1 / 60);
+    arcadeFrame(1 / 60, null);
+  }
+}
 
 describe('the cabinet', () => {
   it('is a focusable 1×1 device whose screen handle is filed and whose parts are all freed', () => {
@@ -238,6 +265,31 @@ describe('the cabinet', () => {
     });
     expect(maps.size).toBe(2); // screen + marquee
   });
+
+  it('comes in a two-player size: 2×1, a wider screen, a stand for each player', () => {
+    const one = FURNITURE_DEFS['arcade-cabinet'];
+    const two = FURNITURE_DEFS['arcade-cabinet-2p'];
+    expect(two.footprint).toEqual({ w: 2, d: 1 });
+    expect(two.device?.kind).toBe('arcadeCabinet');
+    expect(two.functions).toEqual(one.functions);
+
+    const screens = (kind: 'arcade-cabinet' | 'arcade-cabinet-2p') => {
+      const group = buildItemGroup({ id: kind, kind, pos: { x: 0, z: 0 }, rot: 0, movable: true });
+      const sinks = { arcadeCabinetVisuals: new Map() } as unknown as FurnitureHandleSinks;
+      let width = 0;
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh)) return;
+        registerFurnitureHandles(sinks, kind, obj);
+        if (obj.userData.arcadeCabinet) {
+          obj.geometry.computeBoundingBox();
+          width = obj.geometry.boundingBox!.max.x - obj.geometry.boundingBox!.min.x;
+        }
+      });
+      expect(sinks.arcadeCabinetVisuals.get(kind)).toBeDefined();
+      return width;
+    };
+    expect(screens('arcade-cabinet-2p')).toBeGreaterThan(screens('arcade-cabinet') * 1.4);
+  });
 });
 
 describe('the focus UI', () => {
@@ -247,13 +299,15 @@ describe('the focus UI', () => {
     const painter = recordingPainter();
     const visual: ArcadeCabinetVisualHandle = { painter, present: vi.fn(), showAttract: vi.fn() };
     const fetchRom = vi.fn(async () => thwaite);
+    setArcadeRomFetcher(fetchRom);
+    registerArcadeVisual(ITEM, visual, { x: 0, z: 0 });
     const requestRelease = vi.fn();
-    const ui = createArcadeCabinetUI({ visual, fetchRom, requestRelease });
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual, requestRelease });
     const host = fakeElement('div');
     return { ui, painter, visual, fetchRom, requestRelease, host };
   }
 
-  it('shows the menu, plays a bundled game, and Backspace returns to the menu', async () => {
+  it('shows the menu, shares a bundled game with the room, and Backspace ends it', async () => {
     const { ui, painter, visual, fetchRom, host } = setup();
     ui.mount(host as unknown as HTMLElement);
     expect(host.children.map((c) => c.id)).toEqual(['arcade-capture', 'arcade-strip']);
@@ -262,32 +316,77 @@ describe('the focus UI', () => {
     const down = key('keydown', 'ArrowDown');
     win.dispatchEvent(down);
     expect(down.defaultPrevented).toBe(true);
-    ui.update(1 / 60);
+    tick(ui);
     expect(painter.drawMenu.mock.lastCall?.[1]).toBe(1);
     win.dispatchEvent(key('keydown', 'ArrowUp'));
 
     win.dispatchEvent(key('keydown', 'Enter'));
     expect(fetchRom).toHaveBeenCalledWith(ARCADE_GAMES[0].romUrl);
-    ui.update(1 / 60);
+    tick(ui);
     expect(painter.drawCard).toHaveBeenCalledWith(ARCADE_GAMES[0].title, 'LOADING…');
+    expect(readArcade(ITEM)).toBeNull(); // the room hears of it once it can run
     await flush();
 
-    for (let i = 0; i < 30; i++) ui.update(1 / 60);
+    tick(ui, 30);
+    expect(readArcade(ITEM)?.game).toBe(ARCADE_GAMES[0].id);
     expect(painter.drawFrame).toHaveBeenCalled();
     expect(visual.present).toHaveBeenCalled();
+    expect(framesSent()).toBeGreaterThan(10); // the room runs it from these
 
     const menuDraws = painter.drawMenu.mock.calls.length;
     win.dispatchEvent(key('keydown', 'Backspace'));
-    ui.update(1 / 60);
+    tick(ui);
     expect(painter.drawMenu.mock.calls.length).toBeGreaterThan(menuDraws);
     expect(painter.drawMenu.mock.lastCall?.[1]).toBe(0); // back on the game's row
+    expect(readArcade(ITEM)).toBeNull(); // over for the room too
 
     ui.unmount();
+    arcadeFrame(1 / 60, null);
     expect(visual.showAttract).toHaveBeenCalled();
     // Unmounted: keys go back to the room.
     const after = key('keydown', 'ArrowDown');
     win.dispatchEvent(after);
     expect(after.defaultPrevented).toBe(false);
+  });
+
+  it("at a two-player cabinet's free stand you play player 2; hand it back and Enter takes it again", () => {
+    let shared: SharedView = { role: 'watcher', title: 'THWAITE', phase: 'playing', canJoin: true, player: null };
+    const link: ArcadeLink = {
+      shared: () => shared,
+      takeError: () => null,
+      host: vi.fn(),
+      stop: vi.fn(() => void (shared = { ...shared, role: 'watcher', canJoin: true, player: null })),
+      join: vi.fn(() => void (shared = { ...shared, role: 'guest', canJoin: false, player: 2 })),
+      setButtons: vi.fn(),
+      setLocalPad2: vi.fn(),
+      setAudio: vi.fn(),
+      setUiScreen: vi.fn(),
+      release: vi.fn(),
+    };
+    const visual: ArcadeCabinetVisualHandle = { painter: recordingPainter(), present: vi.fn(), showAttract: vi.fn() };
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual, seat: 1, seats: 2, requestRelease: vi.fn(), link });
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    const strip = created.find((el) => el.tag === 'span')!;
+    expect(link.join).toHaveBeenCalledTimes(1);
+    ui.update(1 / 60);
+    expect(strip.textContent).toMatch(/^PLAYER 2 · .* · ⌫ STOP PLAYING · ESC LEAVE$/);
+
+    win.dispatchEvent(key('keydown', 'KeyX'));
+    ui.update(1 / 60);
+    expect(link.setButtons).toHaveBeenLastCalledWith(0b1); // A, as a pad byte
+
+    win.dispatchEvent(key('keydown', 'Backspace'));
+    expect(link.stop).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 5; i++) ui.update(1 / 60);
+    expect(link.join).toHaveBeenCalledTimes(1); // watching now: it doesn't grab the pad back
+    expect(strip.textContent).toBe('WATCHING · ENTER PLAYS PLAYER 2 · ESC LEAVE');
+
+    win.dispatchEvent(key('keydown', 'Enter'));
+    expect(link.join).toHaveBeenCalledTimes(2);
+    ui.update(1 / 60);
+    expect(strip.textContent).toMatch(/^PLAYER 2 · /);
+    ui.unmount();
+    expect(link.release).toHaveBeenCalled();
   });
 
   it('never takes Esc or Tab, so leaving and the phone still work', () => {
@@ -359,8 +458,11 @@ describe('the focus UI', () => {
     ui.update(1 / 60);
     expect(painter.drawCard).toHaveBeenLastCalledWith('MY HOMEBREW', 'LOADING…');
     await flush();
-    for (let i = 0; i < 10; i++) ui.update(1 / 60);
+    tick(ui, 10);
     expect(painter.drawFrame).toHaveBeenCalled();
+    // Your own cartridge stays on this page: nothing reaches the room.
+    expect(readArcade(ITEM)).toBeNull();
+    expect(sent).toEqual([]);
     ui.unmount();
   });
 
@@ -370,8 +472,9 @@ describe('the focus UI', () => {
     win.dispatchEvent(key('keydown', 'Enter'));
     ui.unmount();
     await flush();
-    ui.update(1 / 60);
+    tick(ui);
     expect(painter.drawFrame).not.toHaveBeenCalled();
+    expect(readArcade(ITEM)).toBeNull();
   });
 
   it('clicks on the view stay with the cabinet; LEAVE releases the focus', () => {
@@ -426,7 +529,9 @@ describe('gamepads at the cabinet', () => {
     const painter = recordingPainter();
     const visual: ArcadeCabinetVisualHandle = { painter, present: vi.fn(), showAttract: vi.fn() };
     const fetchRom = vi.fn(async () => thwaite);
-    const ui = createArcadeCabinetUI({ visual, fetchRom, requestRelease: vi.fn() });
+    setArcadeRomFetcher(fetchRom);
+    registerArcadeVisual(ITEM, visual, { x: 0, z: 0 });
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual, requestRelease: vi.fn() });
     ui.mount(fakeElement('div') as unknown as HTMLElement);
     return { ui, painter, fetchRom, pads };
   }
@@ -456,15 +561,17 @@ describe('gamepads at the cabinet', () => {
     expect(fetchRom).toHaveBeenCalledWith(ARCADE_GAMES[0].romUrl);
     pads[0].releaseAll();
     await flush();
-    for (let i = 0; i < 10; i++) ui.update(1 / 60);
+    tick(ui, 10);
     expect(painter.drawFrame).toHaveBeenCalled();
 
     const menuDraws = painter.drawMenu.mock.calls.length;
     pads[0].press(8, 9);
-    for (let i = 0; i < 30; i++) ui.update(1 / 60); // half a second: still playing
+    tick(ui, 30); // half a second: still playing
     expect(painter.drawMenu.mock.calls.length).toBe(menuDraws);
-    for (let i = 0; i < 35; i++) ui.update(1 / 60);
+    expect(readArcade(ITEM)).not.toBeNull();
+    tick(ui, 35);
     expect(painter.drawMenu.mock.calls.length).toBeGreaterThan(menuDraws);
+    expect(readArcade(ITEM)).toBeNull();
     ui.unmount();
   });
 
@@ -491,5 +598,17 @@ describe('describeView (the screen-reader status line)', () => {
     expect(describeView({ screen: 'credits', page: 0 })).toContain(ARCADE_GAMES[0].author);
     expect(describeView({ screen: 'loading', title: 'THWAITE' })).toBe('Loading THWAITE.');
     expect(describeView({ screen: 'playing', title: 'THWAITE' })).toMatch(/^Playing THWAITE\./);
+  });
+
+  it('says who plays a shared game, and how to stop', () => {
+    const shared = (over: Partial<SharedView>): ArcadeView => ({
+      screen: 'shared', role: 'host', title: 'THWAITE', phase: 'playing', canJoin: false, player: 1, ...over,
+    });
+    expect(describeView(shared({}))).toBe('Playing THWAITE as player 1. Backspace ends the game, Escape leaves the cabinet.');
+    expect(describeView(shared({ role: 'guest', player: 2 }))).toMatch(/^Playing THWAITE as player 2\. Backspace stops playing/);
+    expect(describeView(shared({ role: 'watcher', player: null }))).toBe('Watching THWAITE. Escape leaves the cabinet.');
+    expect(describeView(shared({ phase: 'loading' }))).toBe('Loading THWAITE.');
+    expect(describeView(shared({ role: 'watcher', phase: 'joining', player: null }))).toBe('Joining THWAITE.');
+    expect(describeView(shared({ role: 'watcher', phase: 'ended', player: null }))).toMatch(/player 1 left/);
   });
 });

@@ -178,6 +178,7 @@ export type FurnitureKind =
   | "slot-machine"
   | "coin-pusher"
   | "arcade-cabinet"
+  | "arcade-cabinet-2p"
   | "air-hockey-table"
   | "alligators-table"
   // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
@@ -3572,6 +3573,13 @@ const airHockeyStands: StandTemplate[] = [
   { stand: { x: 0.0, z: 1.9 }, faceAngle: Math.PI },
 ];
 
+// 🕹️ Two-player arcade cabinet: stand s0 is player 1 (left as you face the
+// screen, local +x), s1 player 2 — the template index is the seat.
+const arcadeCabinet2PStands: StandTemplate[] = [
+  { stand: { x: 0.5, z: -1.0 }, faceAngle: 0 },
+  { stand: { x: -0.5, z: -1.0 }, faceAngle: 0 },
+];
+
 // ── 🏒 Air-hockey table builder (#115) ───────────────────────────────────────
 // A 1.7×2.7 m cabinet inside the 2×3 footprint, playfield sized exactly by the
 // engine constants, rails with real goal gaps, colour-keyed ends (side 'a'
@@ -4796,6 +4804,25 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.44, z: -0.95 },
       anchor: { x: 0, y: 1.33, z: -0.09 },
+    },
+  },
+  // 🕹️ Two-player arcade cabinet — 2×1, one wide screen and two control
+  // panels. Its two STANDS are the players: player 1 on the left as you face
+  // the screen (local +x), player 2 on the right. Whoever starts a game plays
+  // from their stand; whoever steps up to the other one joins as the other
+  // player (arcadeSession.ts). Both share the centred focus eye.
+  "arcade-cabinet-2p": {
+    kind: "arcade-cabinet-2p",
+    build: buildArcadeCabinet2P,
+    footprint: { w: 2, d: 1 },
+    functions: ["arcadeCabinet"],
+    stands: arcadeCabinet2PStands,
+    device: {
+      kind: "arcadeCabinet",
+      front: { x: 0.5, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.54, z: -1.12 },
+      anchor: { x: 0, y: 1.41, z: -0.09 },
     },
   },
 };
@@ -8100,54 +8127,87 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
 // A classic upright: lower body with a coin door, a control panel with a
 // stick and two buttons, the monitor housing with a tilted CRT, and a lit
 // marquee on top. The screen is a live CanvasTexture painted by
-// arcadeScreen.ts — the attract card while idle, the menu and the game while
-// someone is focused on it (arcadeCabinet.ts).
+// arcadeScreen.ts — the attract card while idle, the menu while someone is at
+// it, and a game, which everyone in the room sees (arcadeSession.ts).
 //
 // Coordinate scheme (metres, item origin at rot 0): the player stands at
-// (0, −1.0) facing +z; the cabinet fills z ∈ [−0.36, +0.43].
-function buildArcadeCabinet({ m, place, addLight }: BuildCtx) {
+// (0, −1.0) facing +z; the cabinet fills z ∈ [−0.36, +0.43]. The two-player
+// cabinet is the same upright, wider, with a bigger screen and a stick and
+// buttons for each player.
+function buildArcadeCabinet(ctx: BuildCtx) {
+  buildUprightCabinet(ctx, { width: 0.64, housingH: 0.80, screenW: 0.50, players: [0], marquee: "SSF ARCADE" });
+}
+
+function buildArcadeCabinet2P(ctx: BuildCtx) {
+  buildUprightCabinet(ctx, { width: 1.40, housingH: 0.96, screenW: 0.82, players: [0.34, -0.34], marquee: "SSF ARCADE · 2 PLAYER" });
+}
+
+interface UprightSpec {
+  /** Body width (x). */
+  width: number;
+  /** Monitor housing height; the screen sits at its centre. */
+  housingH: number;
+  /** Screen width; its height keeps the NES's 256:240. */
+  screenW: number;
+  /** Control-panel centre x for each player, player 1 first. */
+  players: number[];
+  marquee: string;
+}
+
+function buildUprightCabinet({ m, place, addLight }: BuildCtx, spec: UprightSpec) {
   const BODY = 0x232a3a; // deep gunmetal (the coin pusher's family, darker)
   const TRIM = 0x14181e; // black trim / kick plate
   const MAGENTA = 0xff3fa4;
   const CYAN = 0x2ee6ff;
   const GOLD = 0xd4a84b;
+  const W = spec.width;
+  const housingY = 0.95 + spec.housingH / 2;
+  const marqueeY = 0.95 + spec.housingH + 0.10;
+  const screenY = housingY - 0.02;
+  const screenH = spec.screenW * (240 / 256);
 
   // ── Body: lower cabinet, monitor housing, marquee box, top cap ────────────
-  place(new THREE.BoxGeometry(0.64, 0.90, 0.62), m(BODY, 0.6, 0.35), 0, 0.45, 0.12);
-  place(new THREE.BoxGeometry(0.64, 0.06, 0.02), m(TRIM, 0.9, 0.1), 0, 0.03, -0.195);
-  place(new THREE.BoxGeometry(0.64, 0.80, 0.50), m(BODY, 0.6, 0.35), 0, 1.35, 0.18);
-  place(new THREE.BoxGeometry(0.66, 0.20, 0.30), m(BODY, 0.6, 0.35), 0, 1.85, 0.09);
-  place(new THREE.BoxGeometry(0.68, 0.03, 0.54), m(TRIM, 0.8, 0.2), 0, 1.965, 0.16);
+  place(new THREE.BoxGeometry(W, 0.90, 0.62), m(BODY, 0.6, 0.35), 0, 0.45, 0.12);
+  place(new THREE.BoxGeometry(W, 0.06, 0.02), m(TRIM, 0.9, 0.1), 0, 0.03, -0.195);
+  place(new THREE.BoxGeometry(W, spec.housingH, 0.50), m(BODY, 0.6, 0.35), 0, housingY, 0.18);
+  place(new THREE.BoxGeometry(W + 0.02, 0.20, 0.30), m(BODY, 0.6, 0.35), 0, marqueeY, 0.09);
+  place(new THREE.BoxGeometry(W + 0.04, 0.03, 0.54), m(TRIM, 0.8, 0.2), 0, marqueeY + 0.115, 0.16);
   // Neon edge strips down both front corners (the cabinet's side art).
-  for (const sx of [-0.325, 0.325]) {
-    place(new THREE.BoxGeometry(0.012, 0.80, 0.012), m(MAGENTA, 0.4, 0.1, MAGENTA, 0.9), sx, 1.35, -0.075);
+  for (const sx of [-(W / 2 + 0.005), W / 2 + 0.005]) {
+    place(new THREE.BoxGeometry(0.012, spec.housingH, 0.012), m(MAGENTA, 0.4, 0.1, MAGENTA, 0.9), sx, housingY, -0.075);
     place(new THREE.BoxGeometry(0.012, 0.86, 0.012), m(CYAN, 0.4, 0.1, CYAN, 0.7), sx, 0.47, -0.195);
   }
 
-  // ── Coin door: two lit slots and a return flap ────────────────────────────
-  place(new THREE.BoxGeometry(0.30, 0.30, 0.012), m(TRIM, 0.7, 0.4), 0, 0.42, -0.200);
-  for (const sx of [-0.07, 0.07]) {
-    place(new THREE.BoxGeometry(0.05, 0.07, 0.012), m(0xff3030, 0.5, 0.1, 0xff3030, 0.8), sx, 0.49, -0.208);
-    place(new THREE.BoxGeometry(0.008, 0.04, 0.014), m(TRIM, 0.9, 0.1), sx, 0.49, -0.212);
+  // ── Coin doors (one per player): two lit slots and a return flap ──────────
+  for (const px of spec.players) {
+    place(new THREE.BoxGeometry(0.30, 0.30, 0.012), m(TRIM, 0.7, 0.4), px, 0.42, -0.200);
+    for (const sx of [-0.07, 0.07]) {
+      place(new THREE.BoxGeometry(0.05, 0.07, 0.012), m(0xff3030, 0.5, 0.1, 0xff3030, 0.8), px + sx, 0.49, -0.208);
+      place(new THREE.BoxGeometry(0.008, 0.04, 0.014), m(TRIM, 0.9, 0.1), px + sx, 0.49, -0.212);
+    }
+    place(new THREE.BoxGeometry(0.16, 0.05, 0.014), m(GOLD, 0.4, 0.6), px, 0.33, -0.208);
   }
-  place(new THREE.BoxGeometry(0.16, 0.05, 0.014), m(GOLD, 0.4, 0.6), 0, 0.33, -0.208);
 
-  // ── Control panel: angled deck, stick, two buttons ────────────────────────
-  const deck = place(new THREE.BoxGeometry(0.68, 0.06, 0.30), m(BODY, 0.55, 0.4), 0, 0.93, -0.21);
+  // ── Control panel: angled deck; a stick and two buttons per player ────────
+  const deck = place(new THREE.BoxGeometry(W + 0.04, 0.06, 0.30), m(BODY, 0.55, 0.4), 0, 0.93, -0.21);
   deck.rotation.x = 0.18; // front edge dips toward the player
-  place(new THREE.BoxGeometry(0.68, 0.012, 0.28), m(0x1a1f2b, 0.8, 0.1), 0, 0.963, -0.21).rotation.x = 0.18;
-  place(new THREE.CylinderGeometry(0.035, 0.035, 0.012, 16), m(TRIM, 0.8, 0.2), -0.14, 0.972, -0.23);
-  place(new THREE.CylinderGeometry(0.008, 0.008, 0.08, 8), m(0xc0c8d0, 0.3, 0.8), -0.14, 1.01, -0.23);
-  place(new THREE.SphereGeometry(0.026, 14, 10), m(0xe02030, 0.35, 0.1), -0.14, 1.06, -0.23);
-  for (const [bx, color] of [[0.06, 0xe02030], [0.16, 0x2050e0]] as const) {
-    place(new THREE.CylinderGeometry(0.026, 0.026, 0.02, 16), m(color, 0.35, 0.1, color, 0.35), bx, 0.978, -0.23);
-  }
+  place(new THREE.BoxGeometry(W + 0.04, 0.012, 0.28), m(0x1a1f2b, 0.8, 0.1), 0, 0.963, -0.21).rotation.x = 0.18;
+  spec.players.forEach((px, i) => {
+    const ball = i === 0 ? 0xe02030 : 0x20c060;
+    const buttons = i === 0 ? ([0xe02030, 0x2050e0] as const) : ([0x20c060, 0xe0c020] as const);
+    place(new THREE.CylinderGeometry(0.035, 0.035, 0.012, 16), m(TRIM, 0.8, 0.2), px - 0.14, 0.972, -0.23);
+    place(new THREE.CylinderGeometry(0.008, 0.008, 0.08, 8), m(0xc0c8d0, 0.3, 0.8), px - 0.14, 1.01, -0.23);
+    place(new THREE.SphereGeometry(0.026, 14, 10), m(ball, 0.35, 0.1), px - 0.14, 1.06, -0.23);
+    buttons.forEach((color, b) => {
+      place(new THREE.CylinderGeometry(0.026, 0.026, 0.02, 16), m(color, 0.35, 0.1, color, 0.35), px + 0.06 + b * 0.10, 0.978, -0.23);
+    });
+  });
 
   // ── Monitor: black bezel and the tilted CRT screen ────────────────────────
   // Tilted back by SCREEN_TILT about x so its face meets the focus eye, which
   // sits ~11 cm above the screen's centre.
   const SCREEN_TILT = 0.12;
-  const bezel = place(new THREE.BoxGeometry(0.60, 0.58, 0.02), m(0x07090c, 0.9, 0.05), 0, 1.33, -0.075);
+  const bezel = place(new THREE.BoxGeometry(spec.screenW + 0.10, screenH + 0.11, 0.02), m(0x07090c, 0.9, 0.05), 0, screenY, -0.075);
   bezel.rotation.x = SCREEN_TILT;
 
   const canvas = document.createElement("canvas");
@@ -8161,9 +8221,9 @@ function buildArcadeCabinet({ m, place, addLight }: BuildCtx) {
   const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0, toneMapped: false });
   screenMat.userData.baseOpacity = 1;
   // NES aspect 256:240; the plane faces −z (ry = π), then tilts back.
-  const screen = place(new THREE.PlaneGeometry(0.50, 0.469), screenMat, 0, 1.33, -0.088, Math.PI);
+  const screen = place(new THREE.PlaneGeometry(spec.screenW, screenH), screenMat, 0, screenY, -0.088, Math.PI);
   screen.rotation.x = SCREEN_TILT;
-  addLight(new THREE.PointLight(0x9fe8ff, 0, 1.6), 0, 1.33, -0.40, 0.22);
+  addLight(new THREE.PointLight(0x9fe8ff, 0, 1.6), 0, screenY, -0.40, 0.22);
 
   // ── Marquee ───────────────────────────────────────────────────────────────
   const marqueeCanvas = document.createElement("canvas");
@@ -8179,13 +8239,13 @@ function buildArcadeCabinet({ m, place, addLight }: BuildCtx) {
   mctx.font = "bold 64px 'SF Mono','Consolas',monospace";
   mctx.textAlign = "center";
   mctx.textBaseline = "middle";
-  mctx.fillText("SSF ARCADE", 256, 68, 480);
+  mctx.fillText(spec.marquee, 256, 68, 480);
   const marqueeTex = new THREE.CanvasTexture(marqueeCanvas);
   marqueeTex.colorSpace = THREE.SRGBColorSpace;
   const marqueeMat = new THREE.MeshBasicMaterial({ map: marqueeTex, transparent: true, opacity: 0 });
   marqueeMat.userData.baseOpacity = 0.97;
-  place(new THREE.PlaneGeometry(0.62, 0.155), marqueeMat, 0, 1.85, -0.062, Math.PI);
-  addLight(new THREE.PointLight(0xff7ac8, 0, 1.4), 0, 1.85, -0.30, 0.18);
+  place(new THREE.PlaneGeometry(W - 0.02, 0.155), marqueeMat, 0, marqueeY, -0.062, Math.PI);
+  addLight(new THREE.PointLight(0xff7ac8, 0, 1.4), 0, marqueeY, -0.30, 0.18);
 
   painter.drawAttract();
   screenTex.needsUpdate = true;

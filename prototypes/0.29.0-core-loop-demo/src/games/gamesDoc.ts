@@ -31,6 +31,8 @@ import type { AirHockeyState } from './airHockey';
 import { isAlligatorsState } from './alligators';
 import type { AlligatorsState } from './alligators';
 import type { RoomOwnerKey } from '../treasuryView';
+import { isArcadeMatch, isArcadeSnapshot, snapshotKey } from './arcade';
+import type { ArcadeMatch, ArcadeSnapshot } from './arcade';
 
 /** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`,
  *  air hockey `kind: 'airhockey'` (#115) and insatiable alligators
@@ -132,6 +134,39 @@ export function writeGame(
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(tableId, state);
+  });
+}
+
+/** 🕹️ The shared game on an arcade cabinet, or null (none, or malformed). */
+export function readArcade(cabinetId: string): ArcadeMatch | null {
+  const value = ensureMap().get(cabinetId);
+  return isArcadeMatch(value) ? value : null;
+}
+
+/** 🕹️ Start, change or (null) end a cabinet's shared game. Ending also
+ *  drops its save state, which is no use to anyone after the match. */
+export function writeArcade(cabinetId: string, match: ArcadeMatch | null): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    if (match) {
+      map.set(cabinetId, match);
+    } else {
+      map.delete(cabinetId);
+      map.delete(snapshotKey(cabinetId));
+    }
+  });
+}
+
+/** 🕹️ The cabinet's latest save state for late copies, or null. */
+export function readArcadeSnapshot(cabinetId: string): ArcadeSnapshot | null {
+  const value = ensureMap().get(snapshotKey(cabinetId));
+  return isArcadeSnapshot(value) ? value : null;
+}
+
+export function writeArcadeSnapshot(cabinetId: string, snapshot: ArcadeSnapshot): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(snapshotKey(cabinetId), snapshot);
   });
 }
 

@@ -190,6 +190,10 @@ import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
 import { seatOf, standIndexFor } from "./games/checkersTable";
 import { createCheckersTableLayer, paintCheckersTable } from "./checkersSession";
 import { createArcadeCabinetUI } from "./arcadeCabinet";
+// 🕹️ Shared arcade games: every cabinet's game runs on every page in the
+// room from the host's button presses (arcadeSession.ts).
+import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeSession";
+import { writeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -1727,6 +1731,10 @@ export class World {
             rot: item.rot,
           });
         }
+        // 🕹️ And an arcade cabinet's screen, which the session paints with
+        // the room's shared game (its position sets the watcher repaint rate).
+        const arcade = sinks.arcadeCabinetVisuals.get(item.id);
+        if (arcade) registerArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -3230,6 +3238,10 @@ export class World {
       // 🐊 #185: the same as air hockey — runtime session out, doc state wiped.
       closeAlligatorsTable(itemId);
       clearTable(itemId);
+    } else if (removedKind === "arcade-cabinet" || removedKind === "arcade-cabinet-2p") {
+      // 🕹️ A removed cabinet's shared game ends with it, for everyone.
+      closeArcadeCabinet(itemId);
+      writeArcade(itemId, null);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -3970,6 +3982,10 @@ export class World {
     // 🐊 #185: and every alligators table — operator ball sim, bites → doc
     // writes, head/ball tick sends, remote smoothing, heads/birds/displays.
     alligatorsFrame(deltaTime);
+    // 🕹️ And every arcade cabinet's shared game: the host's copy runs and
+    // sends its pads, the others follow and repaint by distance.
+    const me = this.player.getPosition();
+    arcadeFrame(deltaTime, { x: me.x, z: me.z });
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -6208,11 +6224,23 @@ export class World {
     // screen; the UI only adds a key strip and keeps stray clicks from
     // releasing the focus mid-game.
     if (device.kind === "arcadeCabinet") {
+      // 🕹️ The two-player cabinet has a stand per player (s0 = player 1):
+      // walk to the free one, and its index is the seat. The one-player
+      // cabinet has no stands, just the device front.
+      const twoPlayer = standsForItem(deviceId).length > 0;
+      const stand = twoPlayer ? this.pickFreeStand(deviceId) : null;
+      const seat = stand && stand.id.endsWith(":s1") ? 1 : 0;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        : device;
       deviceFocus.beginFocus(
         this.player,
-        device,
+        target,
         createArcadeCabinetUI({
+          itemId: deviceId,
           visual: this.arcadeCabinetVisuals.get(deviceId),
+          seat,
+          seats: twoPlayer ? 2 : 1,
           requestRelease: () => deviceFocus.release(),
         }),
       );

@@ -38,6 +38,9 @@ import {
   routeAlligatorsTick,
   setAlligatorsSender,
 } from "./alligatorsSession";
+// 🕹️ Shared arcade games: their pad bytes ride lane kind 1 as a subtype.
+import { routeArcadeTick, setArcadeSender } from "./arcadeSession";
+import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -569,6 +572,7 @@ const networkProvider = new NetworkProvider();
 // state (clean no-op offline), so one wiring here covers every room join.
 setAirHockeySender((buf) => networkProvider.sendTick(buf));
 setAlligatorsSender((buf) => networkProvider.sendTick(buf));
+setArcadeSender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -3074,6 +3078,17 @@ async function joinRoomAtEpoch(
         tick = unpackTick(buf);
       } else {
         return; // unknown datagram framing — ignore
+      }
+      // 🕹️ Arcade ticks ride the kind-1 lane with flags bit 5 set and a NaN
+      // where a mallet keeps its x (arcadeNet.ts): route them on the raw
+      // bytes, before anything reads that x as a position.
+      const raw = buf.byteLength === ADDRESSED_TICK_BYTES ? buf.subarray(buf.byteLength - TICK_BYTES) : buf;
+      if (isArcadeTickFlags(tick.flags)) {
+        seenPeers.add(peerId);
+        receivedTicks++;
+        remoteLastSeen.set(peerId, performance.now());
+        routeArcadeTick(peerId, raw);
+        return;
       }
       // 🏒 #115: flags bits 6–7 select the tick lane. Mallet/puck ticks are
       // game traffic for the air-hockey session, NOT avatar movement —
