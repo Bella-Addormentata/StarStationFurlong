@@ -158,20 +158,25 @@ export function unpackArcadeTick(b: Uint8Array): ArcadeTick | null {
 export class PadRuns {
   private last = -1;
   private cur = 0;
-  private curStart = 0;
+  /** Frames the current run has gone on before `last`, held at 255 (the
+   *  tick's limit): counted, since a run can outlast the u16 clock's half. */
+  private curRun = 0;
   private prev = 0;
-  private prevStart = -1;
+  /** The previous run's curRun at its last frame, or -1 before one. */
+  private prevRun = -1;
 
-  /** Frame `frame` (u16) ran with `pads`. Frames arrive in order. */
+  /** Frame `frame` (u16) ran with `pads`. Frames arrive in order, one apart. */
   record(frame: number, pads: number): void {
     if (this.last < 0) {
       this.cur = pads;
-      this.curStart = frame;
+      this.curRun = 0;
     } else if (pads !== this.cur) {
       this.prev = this.cur;
-      this.prevStart = this.curStart;
+      this.prevRun = this.curRun;
       this.cur = pads;
-      this.curStart = frame;
+      this.curRun = 0;
+    } else {
+      this.curRun = Math.min(255, this.curRun + 1);
     }
     this.last = frame;
   }
@@ -179,14 +184,14 @@ export class PadRuns {
   /** The FRAMES fields for the latest frame, or null before any. */
   tick(): { frame: number; cur: number; run0: number; prev: number; run1: number } | null {
     if (this.last < 0) return null;
-    const run0 = Math.min(255, frameDiff(this.last, this.curStart));
-    const hasPrev = this.prevStart >= 0 && run0 < 255;
+    const run0 = this.curRun;
+    const hasPrev = this.prevRun >= 0 && run0 < 255;
     return {
       frame: this.last,
       cur: this.cur,
       run0,
       prev: hasPrev ? this.prev : 0,
-      run1: hasPrev ? Math.min(255, frameDiff(this.curStart, this.prevStart) - 1) : 0,
+      run1: hasPrev ? this.prevRun : 0,
     };
   }
 }
