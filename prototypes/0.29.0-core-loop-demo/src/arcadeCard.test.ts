@@ -8,7 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  arcadeCardHtml, arcadeCardModel, cardAction, nextPinned, openArcadeCard, pinnedGame,
+  arcadeCardHtml, arcadeCardModel, cardAction, closeArcadeCardFor, nextPinned, openArcadeCard, pinnedGame, showArcadeCard,
 } from './arcadeCard';
 import { ARCADE_GAMES } from './arcadeLibrary';
 import { newMatch, withGuest } from './games/arcade';
@@ -224,6 +224,19 @@ describe('the dialog', () => {
     (globalThis as { __ssfRoomId?: string }).__ssfRoomId = 'room-b';
     bindGamesDoc(new Y.Doc()); // the new room's doc
     expect((card.el as unknown as Fake).removed).toBe(true);
+  });
+
+  it('over the room view: one card at a time, closed for its cabinet or for any other ⚙️ card', () => {
+    const body = fake();
+    vi.stubGlobal('document', { createElement: fake, body });
+    showArcadeCard({ itemId: ITEM, seats: 1, isOwner: () => false });
+    showArcadeCard({ itemId: 'arcade-2', seats: 1, isOwner: () => false });
+    const [first, second] = body.children;
+    expect(first.removed).toBe(true); // the second cabinet's card replaced it
+    closeArcadeCardFor(ITEM);
+    expect(second.removed).toBe(false); // not that cabinet's card
+    closeArcadeCardFor();
+    expect(second.removed).toBe(true); // another game's card opened
   });
 
   it("a visitor's presses change nothing", () => {

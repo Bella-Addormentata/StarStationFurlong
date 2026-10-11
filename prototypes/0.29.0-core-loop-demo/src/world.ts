@@ -5967,6 +5967,7 @@ export class World {
   public handleArcadeSettings(itemId: string): boolean {
     const device = findDevice(itemId);
     if (!device || device.kind !== "arcadeCabinet" || !this.isPlayerActive()) return false;
+    closeGearCard(); // one ⚙️ card at a time: they open in the same corner
     showArcadeCard({
       itemId,
       seats: FURNITURE.find((item) => item.id === itemId)?.kind === "arcade-cabinet-2p" ? 2 : 1,
@@ -6032,6 +6033,7 @@ export class World {
       : kind === "coin-pusher" ? coinPusherGearCard(itemId, () => canEditRoom().ok)
       : null;
     if (!spec) return false;
+    closeArcadeCardFor();
     toggleGearCard(spec);
     return true;
   }

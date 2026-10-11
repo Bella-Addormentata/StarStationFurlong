@@ -255,7 +255,8 @@ export function showArcadeCard(deps: ArcadeCardDeps): void {
   roomCard = card;
 }
 
-/** A removed cabinet's card goes with it. */
-export function closeArcadeCardFor(itemId: string): void {
-  if (roomCard?.itemId === itemId) roomCard.close();
+/** Close the room view's card (only if it is `itemId`'s, when given): a
+ *  removed cabinet's card goes with it, and another game's ⚙️ card replaces it. */
+export function closeArcadeCardFor(itemId?: string): void {
+  if (roomCard && (itemId === undefined || roomCard.itemId === itemId)) roomCard.close();
 }

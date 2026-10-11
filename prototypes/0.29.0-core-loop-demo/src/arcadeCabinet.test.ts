@@ -280,21 +280,27 @@ describe('the cabinet', () => {
     expect(maps.size).toBe(3); // screen, marquee, ⚙️
   });
 
-  it('has a ⚙️ on its kick panel for each stand, near the floor, facing the player', () => {
+  it('has the drawn gold ⚙️ on its kick panel for each stand, near the floor, facing the player', () => {
     const gears = (kind: 'arcade-cabinet' | 'arcade-cabinet-2p') => {
       const group = buildItemGroup({ id: kind, kind, pos: { x: 0, z: 0 }, rot: 0, movable: true });
       const faces: THREE.Mesh[] = [];
+      let rims = 0;
       group.traverse((obj) => {
         if (obj instanceof THREE.Mesh && obj.userData.arcadeControl === 'settings') {
           expect(obj.userData.arcadeItemId).toBe(kind);
-          if (obj.geometry instanceof THREE.PlaneGeometry) faces.push(obj);
+          // The slot machine's gear (addSettingsGear): a gold torus rim round
+          // a disc with the drawn gear on it, not an emoji.
+          if (obj.geometry instanceof THREE.CircleGeometry) faces.push(obj);
+          else if (obj.geometry instanceof THREE.TorusGeometry) rims++;
         }
       });
+      expect(rims).toBe(faces.length);
       for (const face of faces) {
         expect(face.position.y).toBeLessThan(0.3);
         expect(new THREE.Vector3(0, 0, 1).applyEuler(face.rotation).z).toBeLessThan(-0.9);
+        expect((face.material as THREE.MeshBasicMaterial).map).toBeInstanceOf(THREE.CanvasTexture);
       }
-      return faces.map((f) => f.position.x).sort((a, b) => a - b);
+      return faces.map((f) => Math.round(f.position.x * 100) / 100).sort((a, b) => a - b);
     };
     expect(gears('arcade-cabinet')).toEqual([0]);
     expect(gears('arcade-cabinet-2p')).toEqual([-0.34, 0.34]);
