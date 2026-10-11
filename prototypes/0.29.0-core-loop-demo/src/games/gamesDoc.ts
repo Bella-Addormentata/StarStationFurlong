@@ -31,8 +31,8 @@ import type { AirHockeyState } from './airHockey';
 import { isAlligatorsState } from './alligators';
 import type { AlligatorsState } from './alligators';
 import type { RoomOwnerKey } from '../treasuryView';
-import { isArcadeMatch, isArcadeSnapshot, snapshotKey } from './arcade';
-import type { ArcadeMatch, ArcadeSnapshot } from './arcade';
+import { isArcadeMatch, isArcadeSettings, isArcadeSnapshot, settingsKey, snapshotKey } from './arcade';
+import type { ArcadeMatch, ArcadeSettings, ArcadeSnapshot } from './arcade';
 
 /** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`,
  *  air hockey `kind: 'airhockey'` (#115) and insatiable alligators
@@ -176,6 +176,21 @@ export function writeArcadeSnapshot(cabinetId: string, snapshot: ArcadeSnapshot)
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(snapshotKey(cabinetId), snapshot);
+  });
+}
+
+/** 🕹️ What the owner set on a cabinet, or null (never set: the defaults). */
+export function readArcadeSettings(cabinetId: string): ArcadeSettings | null {
+  const value = ensureMap().get(settingsKey(cabinetId));
+  return isArcadeSettings(value) ? value : null;
+}
+
+/** 🕹️ Set a cabinet's settings, or (null) drop them with the cabinet. */
+export function writeArcadeSettings(cabinetId: string, settings: ArcadeSettings | null): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    if (settings) map.set(settingsKey(cabinetId), settings);
+    else map.delete(settingsKey(cabinetId));
   });
 }
 

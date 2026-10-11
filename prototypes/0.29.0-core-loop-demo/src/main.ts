@@ -10214,6 +10214,16 @@ function findSlotMachineControl(scene: THREE.Scene): {
   };
 }
 
+/** 🕹️⚙️ A ⚙️ on an arcade cabinet's kick panel under the cursor ray. */
+function findArcadeControl(scene: THREE.Scene): string | null {
+  const controls: THREE.Object3D[] = [];
+  scene.traverse((child) => {
+    if (child.userData?.arcadeControl === "settings" && child.userData.arcadeItemId) controls.push(child);
+  });
+  const hit = raycaster.intersectObjects(controls, false)[0];
+  return hit ? (hit.object.userData.arcadeItemId as string) : null;
+}
+
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
 
@@ -10275,6 +10285,9 @@ function onCanvasClick(event: MouseEvent): void {
       slotControl.control,
       slotControl.value,
     )) return;
+
+  const arcadeGear = findArcadeControl(scene);
+  if (arcadeGear && world.handleArcadeSettings(arcadeGear)) return;
 
   // ── Intercept Golden Keypad Clicks for our Docking System
   if (world.dockingSystem) {

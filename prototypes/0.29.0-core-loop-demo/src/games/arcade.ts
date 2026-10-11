@@ -64,6 +64,26 @@ export function isArcadeMatch(v: unknown): v is ArcadeMatch {
     && typeof m.startedAt === 'number' && Number.isFinite(m.startedAt);
 }
 
+/** What the room's owner set on a cabinet (its ⚙ card), under its own key
+ *  so it outlives every match. */
+export interface ArcadeSettings {
+  kind: 'arcade-settings';
+  /** The one bundled game (ARCADE_GAMES id) the cabinet offers, or null for
+   *  the whole menu. */
+  game: string | null;
+}
+
+/** The doc key a cabinet's settings live under. */
+export function settingsKey(cabinetId: string): string {
+  return `${cabinetId}#arcade-settings`;
+}
+
+export function isArcadeSettings(v: unknown): v is ArcadeSettings {
+  if (!v || typeof v !== 'object') return false;
+  const s = v as Record<string, unknown>;
+  return s.kind === 'arcade-settings' && (s.game === null || isStr(s.game));
+}
+
 /** The largest save state a reader accepts (a real one is 10–20 KB). */
 export const MAX_SNAPSHOT_BYTES = 256 * 1024;
 

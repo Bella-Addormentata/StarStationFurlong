@@ -31,7 +31,7 @@ import type { ArcadeLink, SharedView } from './arcadeSession';
 import type { ArcadeCabinetVisualHandle } from './devices';
 import { FURNITURE_DEFS, buildItemGroup } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
-import { bindGamesDoc, readArcade } from './games/gamesDoc';
+import { bindGamesDoc, readArcade, writeArcadeSettings } from './games/gamesDoc';
 
 const menu = (cursor = 0): ArcadeView => ({ screen: 'menu', cursor, status: null });
 const OWN = MENU.findIndex((e) => e.kind === 'own');
@@ -150,9 +150,16 @@ interface FakeElement {
   height: number;
   getContext: () => unknown;
   append: (...els: FakeElement[]) => void;
+  appendChild: (el: FakeElement) => void;
   remove: () => void;
   addEventListener: () => void;
   setAttribute: () => void;
+  /** Enough for the ⚙️ card (arcadeCard.ts) to open in the fake DOM. */
+  innerHTML: string;
+  title: string;
+  querySelector: () => null;
+  contains: () => boolean;
+  focus: () => void;
 }
 
 const created: FakeElement[] = [];
@@ -169,9 +176,15 @@ function fakeElement(tag: string): FakeElement {
     height: 0,
     getContext: () => fakeContext(),
     append: (...els) => el.children.push(...els),
+    appendChild: (child) => void el.children.push(child),
     remove: () => undefined,
     addEventListener: () => undefined,
     setAttribute: () => undefined,
+    innerHTML: '',
+    title: '',
+    querySelector: () => null,
+    contains: () => false,
+    focus: () => undefined,
   };
   created.push(el);
   return el;
@@ -264,7 +277,27 @@ describe('the cabinet', () => {
       const mat = (obj as THREE.Mesh).material as THREE.MeshBasicMaterial | undefined;
       if (mat?.map) maps.add(mat.map);
     });
-    expect(maps.size).toBe(2); // screen + marquee
+    expect(maps.size).toBe(3); // screen, marquee, ⚙️
+  });
+
+  it('has a ⚙️ on its kick panel for each stand, near the floor, facing the player', () => {
+    const gears = (kind: 'arcade-cabinet' | 'arcade-cabinet-2p') => {
+      const group = buildItemGroup({ id: kind, kind, pos: { x: 0, z: 0 }, rot: 0, movable: true });
+      const faces: THREE.Mesh[] = [];
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh && obj.userData.arcadeControl === 'settings') {
+          expect(obj.userData.arcadeItemId).toBe(kind);
+          if (obj.geometry instanceof THREE.PlaneGeometry) faces.push(obj);
+        }
+      });
+      for (const face of faces) {
+        expect(face.position.y).toBeLessThan(0.3);
+        expect(new THREE.Vector3(0, 0, 1).applyEuler(face.rotation).z).toBeLessThan(-0.9);
+      }
+      return faces.map((f) => f.position.x).sort((a, b) => a - b);
+    };
+    expect(gears('arcade-cabinet')).toEqual([0]);
+    expect(gears('arcade-cabinet-2p')).toEqual([-0.34, 0.34]);
   });
 
   it('comes in a two-player size: 2×1, a wider screen, a stand for each player', () => {
@@ -421,6 +454,27 @@ describe('the focus UI', () => {
     ui.unmount();
   });
 
+  it('offers only the game the owner set, and keeps the cursor on its row when that changes', () => {
+    const { ui, painter, host } = setup();
+    ui.mount(host as unknown as HTMLElement);
+    win.dispatchEvent(key('keydown', 'ArrowDown'));
+    win.dispatchEvent(key('keyup', 'ArrowDown'));
+    tick(ui);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(1);
+
+    writeArcadeSettings(ITEM, { kind: 'arcade-settings', game: ARCADE_GAMES[1].id });
+    tick(ui);
+    const rows = painter.drawMenu.mock.lastCall![0] as Array<{ label: string }>;
+    expect(rows.map((r) => r.label)).toEqual([ARCADE_GAMES[1].title, 'INSERT YOUR OWN CARTRIDGE', 'CREDITS & LICENSES']);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(0); // still on that game
+
+    writeArcadeSettings(ITEM, null);
+    tick(ui);
+    expect(painter.drawMenu.mock.lastCall?.[0]).toHaveLength(MENU.length);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(1);
+    ui.unmount();
+  });
+
   it('leaves Enter to a focused button, so LEAVE works from the keyboard', () => {
     const { ui, painter, fetchRom, host } = setup();
     ui.mount(host as unknown as HTMLElement);
@@ -485,7 +539,7 @@ describe('the focus UI', () => {
       createElement: (tag: string) => {
         const el = fakeElement(tag);
         el.addEventListener = ((type: string, fn: (e: MouseEvent) => void) => {
-          if (type === 'click') clicks.set(tag === 'button' ? 'leave' : `${tag}-${clicks.size}`, fn);
+          if (type === 'click') clicks.set(`${tag}-${clicks.size}`, fn);
         }) as never;
         return el;
       },
@@ -493,14 +547,18 @@ describe('the focus UI', () => {
     ui.mount(host as unknown as HTMLElement);
     const click = () => ({ stopPropagation: vi.fn() }) as unknown as MouseEvent & { stopPropagation: ReturnType<typeof vi.fn> };
     // main.ts releases the focus on any click that reaches window: the
-    // capture layer, the strip and LEAVE all stop it there.
-    expect(clicks.size).toBe(3);
-    for (const [name, handler] of clicks) {
+    // capture layer, the strip, ⚙️ and LEAVE all stop it there.
+    expect(clicks.size).toBe(4);
+    for (const [name, handler] of [...clicks]) {
       const event = click();
       handler(event);
       expect(event.stopPropagation, name).toHaveBeenCalled();
     }
     expect(requestRelease).toHaveBeenCalledTimes(1);
+    // ⚙️ opened the cabinet's card over the view, read-only for a visitor.
+    const card = created.find((el) => el.id === 'arcade-card');
+    expect(host.children).toContain(card);
+    expect(card?.innerHTML).toContain('THE OWNER SETS THIS CABINET · ANYONE CAN LOOK');
     ui.unmount();
   });
 });

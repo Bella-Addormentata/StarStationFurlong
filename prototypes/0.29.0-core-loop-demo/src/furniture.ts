@@ -8138,7 +8138,7 @@ interface UprightSpec {
   marquee: string;
 }
 
-function buildUprightCabinet({ m, place, addLight }: BuildCtx, spec: UprightSpec) {
+function buildUprightCabinet({ itemId, m, place, addLight }: BuildCtx, spec: UprightSpec) {
   const BODY = 0x232a3a; // deep gunmetal (the coin pusher's family, darker)
   const TRIM = 0x14181e; // black trim / kick plate
   const MAGENTA = 0xff3fa4;
@@ -8170,6 +8170,40 @@ function buildUprightCabinet({ m, place, addLight }: BuildCtx, spec: UprightSpec
       place(new THREE.BoxGeometry(0.008, 0.04, 0.014), m(TRIM, 0.9, 0.1), px + sx, 0.49, -0.212);
     }
     place(new THREE.BoxGeometry(0.16, 0.05, 0.014), m(GOLD, 0.4, 0.6), px, 0.33, -0.208);
+  }
+
+  // ── ⚙️ Settings buttons on the kick panel near the floor ─────────────────
+  // A dark kick panel runs along the base under the coin doors, with a
+  // gold-rimmed ⚙️ for each stand (the slot machine's kick-panel gears).
+  // Anyone can press one to read the cabinet's card; for the room's owner
+  // the same card is editable (arcadeCard.ts).
+  place(new THREE.BoxGeometry(W - 0.06, 0.15, 0.012), m(TRIM, 0.85, 0.1), 0, 0.15, -0.200);
+  {
+    const gearCanvas = document.createElement("canvas");
+    gearCanvas.width = gearCanvas.height = 128;
+    const gc = gearCanvas.getContext("2d")!;
+    gc.fillStyle = "#20262F";
+    gc.beginPath();
+    gc.arc(64, 64, 62, 0, Math.PI * 2);
+    gc.fill();
+    gc.font = '84px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+    gc.textAlign = "center";
+    gc.textBaseline = "middle";
+    gc.fillText("⚙️", 64, 70);
+    const gearTexture = new THREE.CanvasTexture(gearCanvas);
+    gearTexture.colorSpace = THREE.SRGBColorSpace;
+    const gearMaterial = new THREE.MeshBasicMaterial({ map: gearTexture, transparent: true, opacity: 0 });
+    gearMaterial.userData.baseOpacity = 1;
+    const rimGeometry = new THREE.CylinderGeometry(0.052, 0.052, 0.012, 24);
+    rimGeometry.rotateX(Math.PI / 2);
+    for (const px of spec.players) {
+      const rim = place(rimGeometry, m(GOLD, 0.35, 0.6), px, 0.15, -0.210);
+      const face = place(new THREE.PlaneGeometry(0.09, 0.09), gearMaterial, px, 0.15, -0.2175, Math.PI);
+      for (const gear of [rim, face]) {
+        gear.userData.arcadeControl = "settings";
+        gear.userData.arcadeItemId = itemId;
+      }
+    }
   }
 
   // ── Control panel: angled deck; a stick and two buttons per player ────────

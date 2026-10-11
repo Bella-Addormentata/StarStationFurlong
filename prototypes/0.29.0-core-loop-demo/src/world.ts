@@ -200,11 +200,12 @@ import { seatOf, standIndexFor } from "./games/checkersTable";
 import { chessSeatOf, chessStandIndexFor } from "./games/chessTable";
 import { createCheckersTableLayer } from "./checkersSession";
 import { createChessTableLayer, paintGameTable } from "./chessSession";
+import { closeArcadeCardFor, showArcadeCard } from "./arcadeCard";
 import { createArcadeCabinetUI } from "./arcadeCabinet";
 // 🕹️ Shared arcade games: every cabinet's game runs on every page in the
 // room from the host's button presses (arcadeSession.ts).
 import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeSession";
-import { writeArcade } from "./games/gamesDoc";
+import { writeArcade, writeArcadeSettings } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -3260,9 +3261,12 @@ export class World {
       closeAlligatorsTable(itemId);
       clearTable(itemId);
     } else if (removedKind === "arcade-cabinet" || removedKind === "arcade-cabinet-2p") {
-      // 🕹️ A removed cabinet's shared game ends with it, for everyone.
+      // 🕹️ A removed cabinet's shared game ends with it, for everyone, and
+      // its ⚙️ settings and card go too.
       closeArcadeCabinet(itemId);
+      closeArcadeCardFor(itemId);
       writeArcade(itemId, null);
+      writeArcadeSettings(itemId, null);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -5951,6 +5955,21 @@ export class World {
    * build the kind-appropriate focused UI, and hand both to the
    * DeviceFocusController, which wires its hooks into navigateToDevice.
    */
+  /**
+   * 🕹️⚙️ A ⚙️ on an arcade cabinet's kick panel: the cabinet's card over the
+   * room view, for anyone. It is read-only unless they can edit the room.
+   */
+  public handleArcadeSettings(itemId: string): boolean {
+    const device = findDevice(itemId);
+    if (!device || device.kind !== "arcadeCabinet" || !this.isPlayerActive()) return false;
+    showArcadeCard({
+      itemId,
+      seats: FURNITURE.find((item) => item.id === itemId)?.kind === "arcade-cabinet-2p" ? 2 : 1,
+      isOwner: () => canEditRoom().ok,
+    });
+    return true;
+  }
+
   public handleSlotMachineControl(
     deviceId: string,
     control: SlotMachineCabinetControl | "service",
@@ -6324,6 +6343,7 @@ export class World {
           seat,
           seats: twoPlayer ? 2 : 1,
           requestRelease: () => deviceFocus.release(),
+          isOwner: () => canEditRoom().ok,
         }),
       );
       return;

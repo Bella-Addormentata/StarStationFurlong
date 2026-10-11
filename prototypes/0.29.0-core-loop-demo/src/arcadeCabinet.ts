@@ -23,6 +23,7 @@
  * Esc and Tab pass through untouched.
  */
 
+import { openArcadeCard, type ArcadeCard } from './arcadeCard';
 import { ARCADE_GAMES, LICENSE_LABEL, parseInesHeader, type ArcadeGame } from './arcadeLibrary';
 import { ArcadeMachine, type NesButton, type NesPlayer } from './arcadeMachine';
 import { padByte } from './arcadeNet';
@@ -30,6 +31,7 @@ import { CREDIT_PAGES, type ArcadeMenuRow } from './arcadeScreen';
 import { linkArcade, type ArcadeLink, type SharedView } from './arcadeSession';
 import { ArcadeSpeaker } from './arcadeSpeaker';
 import type { ArcadeCabinetVisualHandle, DeviceUI } from './devices';
+import { readArcadeSettings } from './games/gamesDoc';
 import { isFormFieldTarget } from './typingFocus';
 
 // ── Pure menu model (tested) ─────────────────────────────────────────────────
@@ -39,14 +41,36 @@ export type MenuEntry =
   | { kind: 'own' }
   | { kind: 'credits' };
 
-export const MENU: readonly MenuEntry[] = [
-  ...ARCADE_GAMES.map((game) => ({ kind: 'game' as const, game })),
-  { kind: 'own' },
-  { kind: 'credits' },
-];
+/** A cabinet's menu: the bundled games it offers, then your own cartridge
+ *  and the credits, which every cabinet keeps. */
+export function menuFor(games: readonly ArcadeGame[]): readonly MenuEntry[] {
+  return [
+    ...games.map((game) => ({ kind: 'game' as const, game })),
+    { kind: 'own' },
+    { kind: 'credits' },
+  ];
+}
 
-export function menuRows(): ArcadeMenuRow[] {
-  return MENU.map((entry) => {
+/** Every bundled game: a cabinet whose owner hasn't picked one. */
+export const MENU: readonly MenuEntry[] = menuFor(ARCADE_GAMES);
+
+/** The bundled games a cabinet set to `game` offers: just that one, or all
+ *  of them (unset, or a game this build doesn't have). */
+export function offeredGames(game: string | null | undefined): readonly ArcadeGame[] {
+  const one = game ? ARCADE_GAMES.find((g) => g.id === game) : undefined;
+  return one ? [one] : ARCADE_GAMES;
+}
+
+/** Where row `cursor` of `from` sits in `to` (the same game, your own
+ *  cartridge or the credits), or 0 if `to` hasn't got it. */
+export function sameRow(from: readonly MenuEntry[], to: readonly MenuEntry[], cursor: number): number {
+  const was = from[cursor];
+  const at = to.findIndex((e) => e.kind === was?.kind && (e.kind !== 'game' || (was.kind === 'game' && e.game.id === was.game.id)));
+  return Math.max(0, at);
+}
+
+export function menuRows(menu: readonly MenuEntry[] = MENU): ArcadeMenuRow[] {
+  return menu.map((entry) => {
     if (entry.kind === 'game') {
       return { label: entry.game.title, detail: [entry.game.blurb, entry.game.controls] };
     }
@@ -75,16 +99,20 @@ export type MenuAction =
   | { kind: 'pickFile' };
 
 /** A button pressed while the menu or credits are up. */
-export function menuInput(view: ArcadeView, button: NesButton): { view: ArcadeView; action: MenuAction } {
+export function menuInput(
+  view: ArcadeView,
+  button: NesButton,
+  menu: readonly MenuEntry[] = MENU,
+): { view: ArcadeView; action: MenuAction } {
   const none = { kind: 'none' } as const;
   if (view.screen === 'menu') {
-    const n = MENU.length;
+    const n = menu.length;
     if (button === 'UP') return { view: { ...view, cursor: (view.cursor + n - 1) % n, status: null }, action: none };
     if (button === 'DOWN' || button === 'SELECT') {
       return { view: { ...view, cursor: (view.cursor + 1) % n, status: null }, action: none };
     }
     if (button === 'START' || button === 'A') {
-      const entry = MENU[view.cursor];
+      const entry = menu[view.cursor];
       if (entry.kind === 'game') return { view, action: { kind: 'start', game: entry.game } };
       if (entry.kind === 'own') return { view, action: { kind: 'pickFile' } };
       return { view: { screen: 'credits', page: 0 }, action: none };
@@ -99,7 +127,7 @@ export function menuInput(view: ArcadeView, button: NesButton): { view: ArcadeVi
       return { view: { screen: 'credits', page: (view.page + 1) % CREDIT_PAGES }, action: none };
     }
     if (button === 'START' || button === 'A' || button === 'B') {
-      return { view: { screen: 'menu', cursor: MENU.findIndex((e) => e.kind === 'credits'), status: null }, action: none };
+      return { view: { screen: 'menu', cursor: menu.findIndex((e) => e.kind === 'credits'), status: null }, action: none };
     }
   }
   return { view, action: none };
@@ -110,10 +138,10 @@ export function menuInput(view: ArcadeView, button: NesButton): { view: ArcadeVi
  * the menu and credits are painted into a 3D texture, which assistive tech
  * cannot read.
  */
-export function describeView(view: ArcadeView): string {
+export function describeView(view: ArcadeView, menu: readonly MenuEntry[] = MENU): string {
   if (view.screen === 'menu') {
-    const row = menuRows()[view.cursor];
-    const parts = [`${row.label}, ${view.cursor + 1} of ${MENU.length}.`, ...(row.detail ?? [])];
+    const row = menuRows(menu)[view.cursor];
+    const parts = [`${row.label}, ${view.cursor + 1} of ${menu.length}.`, ...(row.detail ?? [])];
     if (view.status) parts.unshift(`${view.status}.`);
     return parts.join(' ');
   }
@@ -203,6 +231,8 @@ export interface ArcadeCabinetUIDeps {
   seats?: 1 | 2;
   /** Leave the cabinet (the strip's LEAVE button). */
   requestRelease: () => void;
+  /** May change the cabinet's settings on its ⚙️ card (canEditRoom). */
+  isOwner?: () => boolean;
   /** The shared-game session (stubbed in tests). */
   link?: ArcadeLink;
 }
@@ -231,6 +261,10 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const seat = deps.seat ?? 0;
   const seats = deps.seats ?? 1;
 
+  /** The menu, as the room's owner set this cabinet (its ⚙️ card). */
+  const offered = () => offeredGames(readArcadeSettings(deps.itemId)?.game);
+  let menuGames = offered();
+  let menu = menuFor(menuGames);
   let view: ArcadeView = { screen: 'menu', cursor: 0, status: null };
   /** The menu row last selected, so leaving a game lands back on it. */
   let menuCursor = 0;
@@ -262,6 +296,10 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   let stripText: HTMLSpanElement | null = null;
   /** Visually hidden live region: the screen's content, read aloud. */
   let spoken: HTMLSpanElement | null = null;
+  /** The cabinet's ⚙️ card, open over the focus view. */
+  let card: ArcadeCard | null = null;
+  let focusHost: HTMLElement | null = null;
+  let gear: HTMLButtonElement | null = null;
 
   const present = () => deps.visual?.present();
 
@@ -271,7 +309,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     dirty = true;
     if (stripText) stripText.textContent = stripFor(next);
     if (spoken) {
-      const words = describeView(next);
+      const words = describeView(next, menu);
       if (spoken.textContent !== words) spoken.textContent = words;
     }
     // The UI's own screens and your own cartridge are painted here; a shared
@@ -283,7 +321,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
 
   const paint = () => {
     if (!painter) return;
-    if (view.screen === 'menu') painter.drawMenu(menuRows(), view.cursor, view.status, blinkOn);
+    if (view.screen === 'menu') painter.drawMenu(menuRows(menu), view.cursor, view.status, blinkOn);
     else if (view.screen === 'credits') painter.drawCredits(view.page);
     else if (view.screen === 'loading') painter.drawCard(view.title, 'LOADING…');
     else return; // playing: the frames paint themselves
@@ -356,7 +394,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
 
   /** A press while the menu/credits are up; `gesture` = from a key event. */
   const menuPress = (button: NesButton, gesture: boolean) => {
-    const { view: next, action } = menuInput(view, button);
+    const { view: next, action } = menuInput(view, button, menu);
     if (next !== view) setView(next);
     if (action.kind === 'start') startShared(action.game);
     else if (action.kind === 'pickFile') {
@@ -384,6 +422,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     if (e.ctrlKey || e.metaKey || e.altKey) return; // the browser's shortcuts (Shift is Select)
     const target = e.target as HTMLElement | null;
     if (isFormFieldTarget(target)) return;
+    if (target && card?.el.contains(target)) return; // the ⚙️ card's own keys
     // A focused button (LEAVE, reached by keyboard or a screen reader) keeps Enter.
     if (target?.tagName === 'BUTTON' && keyToButton(e.code) === 'START') return;
     if (e.code === 'Backspace') {
@@ -448,6 +487,34 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     }
   };
 
+  /** The owner changed which games the cabinet offers: the menu follows,
+   *  keeping the cursor on the same row where it can. */
+  const refreshMenu = () => {
+    const games = offered();
+    if (games.length === menuGames.length && games.every((g, i) => g === menuGames[i])) return;
+    const next = menuFor(games);
+    const cursor = view.screen === 'menu' ? sameRow(menu, next, view.cursor) : 0;
+    menuCursor = sameRow(menu, next, menuCursor);
+    menuGames = games;
+    menu = next;
+    if (view.screen === 'menu') setView({ ...view, cursor });
+  };
+
+  /** ⚙️ on the strip: the cabinet's card over the focus view, or away again. */
+  const toggleCard = () => {
+    if (card) return card.close();
+    if (!focusHost) return;
+    card = openArcadeCard(focusHost, {
+      itemId: deps.itemId,
+      seats,
+      isOwner: deps.isOwner ?? (() => false),
+      onClose: () => {
+        card = null;
+        gear?.focus?.({ preventScroll: true });
+      },
+    }, 'absolute');
+  };
+
   /** Follow the shared game on the cabinet: one starting, changing hands,
    *  ending, or someone else's already running when this page stepped up. */
   const followShared = () => {
@@ -473,6 +540,8 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   return {
     mount(host: HTMLElement): void {
       mounted = true;
+      focusHost = host;
+      refreshMenu();
       speaker = new ArcadeSpeaker();
       machine = null;
       keysDown.clear();
@@ -511,6 +580,17 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
         background:transparent; color:#FFC860; border:1px solid rgba(255,200,96,0.5);
         border-radius:6px; padding:4px 10px; font:inherit; cursor:pointer;`;
       strip.addEventListener('click', keepClick);
+      gear = document.createElement('button');
+      gear.textContent = '⚙️';
+      gear.title = 'The cabinet card: its game, who is playing, the controls';
+      gear.setAttribute('aria-label', 'Cabinet card');
+      gear.style.cssText = `
+        background:transparent; color:#F0C060; border:1px solid rgba(212,168,75,0.5);
+        border-radius:6px; padding:3px 8px; font:inherit; cursor:pointer;`;
+      gear.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleCard();
+      });
       leave.addEventListener('click', (e) => {
         e.stopPropagation();
         deps.requestRelease();
@@ -521,8 +601,8 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       spoken.style.cssText = `
         position:absolute; width:1px; height:1px; overflow:hidden;
         clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap;`;
-      spoken.textContent = describeView(view);
-      strip.append(stripText, leave, spoken);
+      spoken.textContent = describeView(view, menu);
+      strip.append(stripText, gear, leave, spoken);
       host.append(capture, strip);
 
       window.addEventListener('keydown', onKeyDown, CAPTURE);
@@ -547,14 +627,18 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       link = null;
       speaker?.close();
       speaker = null;
+      card?.close();
       capture?.remove();
       strip?.remove();
       capture = strip = stripText = spoken = null;
+      gear = null;
+      focusHost = null;
       if (fileInput) fileInput.onchange = null;
     },
 
     update(dt: number): void {
       if (!mounted) return;
+      refreshMenu();
       pollPads(dt);
       followShared();
       link?.setButtons(padByte([...keysDown.values(), ...padHeld[0]]));
