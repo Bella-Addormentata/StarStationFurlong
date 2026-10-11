@@ -594,7 +594,8 @@ export async function verifySettledRound(
   // The party set must be the one this page saw frozen before the reveals.
   const seen = seenFor(tableId, s);
   if (seen && (seen.house !== s.houseCommit || !sameCommits(seen.commits, frozen)
-    || (seen.wagers && !sameCommits(seen.wagers, s.wagers ?? {})))) return { kind: 'failed' };
+    || (seen.wagers && !sameCommits(seen.wagers, s.wagers ?? {}))
+    || (seen.sigs && !sameCommits(seen.sigs, s.sigs ?? {})))) return { kind: 'failed' };
   const bettors = t.parties.slice(1);
   if (t.commits[0] !== (s.houseCommit ?? '')
     || bettors.length !== Object.keys(frozen).length

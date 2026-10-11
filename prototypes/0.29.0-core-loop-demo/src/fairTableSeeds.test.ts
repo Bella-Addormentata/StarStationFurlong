@@ -598,6 +598,27 @@ describe('a Fair roulette round', () => {
       .toMatchObject({ kind: 'verified', mine: 'left-out' });
   });
 
+  it("a settled round whose published signatures were rewritten fails on a page that saw the close", async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect((await verifySettledRound('roulette', t, s, { pocket: s.result! })).kind).toBe('verified');
+    const stripped: RouletteTableState = { ...s, sigs: {} };
+    expect((await verifySettledRound('roulette', t, stripped, { pocket: s.result! })).kind).toBe('failed');
+  });
+
+  it('a void stamp outside a settled, payout-free round fails the state guard', async () => {
+    const { isRouletteTableState } = await import('./games/roulette');
+    const base = { kind: 'roulette', round: 1, result: null, resultAt: 0 };
+    expect(isRouletteTableState({ ...base, phase: 'settled', payouts: {}, voided: true })).toBe(true);
+    expect(isRouletteTableState({ ...base, phase: 'betting', payouts: null, voided: true })).toBe(false);
+    expect(isRouletteTableState({ ...base, phase: 'settled', payouts: { [AMY]: 20 }, voided: true })).toBe(false);
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);
