@@ -153,12 +153,23 @@ stand still, as on macOS and Linux, so the same viewer would read the
 hour as one tick and never know it slept. So the
 anchor is worth nothing after a gap: the room tick marks the page awake,
 a gap in the marks longer than 2.5 s BY EITHER CLOCK (a closed lid, a
-frozen tab, a throttled background page — `TV_SUSPEND_GAP_MS`; the wall
-clock finds the gap the monotonic clock stood still through, at the cost
-that a forward wall-clock step wider than that between two ticks reads
-as a sleep too — stale for one wake window, bridged by the step — while
-a backward step is no gap) marks every sample from
-before it STALE, and a stale reading is shown but never acted on — no
+frozen tab, a throttled background page — `TV_SUSPEND_GAP_MS`) marks
+every sample from before it STALE. A gap the monotonic clock itself saw
+is SURE — the event loop did not run — and a gap the wall clock alone
+found is AMBIGUOUS: a sleep the monotonic clock stood still through, or
+a wall-clock step while the page ran, and nothing in the page tells the
+two apart (in either, the only clock that moved is the one that steps;
+timers, players and marks all show one tick's worth). So an ambiguous
+gap is a sleep for everything that WAITS — the samples before it stale,
+leases lapsed by the wall clock's measure, a holder past the lapse
+letting the remote go — and a step for everything that MOVES: its wall
+delta is never added to playback, no holder seeks its player or beats
+the room forward on the wall clock's word alone, and the bridge below
+is for sure gaps only. The cost, said once: a holder whose monotonic
+clock stood still through a sleep rejoins where it slept, not where the
+room ran on to, once it picks the remote up again — where before it
+renewed its claim over a takeover it slept through. A backward step is
+no gap at all. A stale reading is shown but never acted on — no
 seek, no nudge — until a fresh sample lands after the wake window (a
 sample the network held through the sleep and delivers on waking is
 stamped from before the gap, as a lease is, and is stale with the rest;
@@ -178,10 +189,11 @@ then seeked once, to where the room
 is, never to where the sleep says. A HOLDER that slept rejoins the room
 where the room is and never drags it back to where it slept: its own
 anchor is stale like any other, and `readPlayback` bridges the gap on
-the WALL clock — the one use of wall time in the extrapolation, for the
-gap alone, since the monotonic clock may or may not have run through a
-sleep and the wall clock did, the error an NTP step the sleep may have
-hidden and never the sleep — so the headless beat carries the pre-sleep
+the WALL clock — the one use of wall time in the extrapolation, for a
+SURE gap alone (one the monotonic clock itself saw; an ambiguous one,
+above, is bridged by nothing), since the monotonic clock may or may not
+have run through a sleep and the wall clock did, the error an NTP step
+the sleep may have hidden and never the sleep — so the headless beat carries the pre-sleep
 position plus the time really elapsed, a holder with the theatre open
 seeks its own player there once (the OS stopped it with the machine) and
 beats from there, no beat going out before that seek lands, and that
