@@ -244,7 +244,7 @@
           var snap = null;
           var loadTries = 0;
           var LOAD_RETRY = 8;
-          var LOAD_TRIES = 64;
+          var LOAD_TRIES = 240;
           var applying = false;
           var lastStatus = 0;
           // What the replay holds down on this emulator now: a save state
@@ -292,7 +292,8 @@
               // sometimes drops the load outright (measured on fceumm: no
               // sign of it 120 iterations on), and asking again lands it —
               // so it asks again every LOAD_RETRY iterations until the
-              // state matches, and gives up after LOAD_TRIES. The frames
+              // state matches (17 to 57 iterations in the runs), and gives
+              // up after LOAD_TRIES, about four seconds. The frames
               // run while it waits ran on the old state, which the load
               // throws away.
               loadTries += 1;
