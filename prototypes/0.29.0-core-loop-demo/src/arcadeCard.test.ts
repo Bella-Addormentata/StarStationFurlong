@@ -98,6 +98,20 @@ describe('what the card says', () => {
     });
   });
 
+  it('a game from a newer version is still a game: named as such, with its players, and the owner can end it', () => {
+    writeArcade(ITEM, { ...newMatch({ game: 'from-a-newer-build', host: 'ada-id', hostPage: 'page-a', hostSeat: 0, now: 1 }) });
+    const model = arcadeCardModel(ITEM, 2, true, ME);
+    expect(model.now).toEqual({
+      game: null,
+      players: [{ player: 1, who: 'ADA' }, { player: 2, who: 'OPEN · STEP UP TO THE RIGHT STAND' }],
+    });
+    expect(model.canReset).toBe(true);
+    const html = arcadeCardHtml(model);
+    expect(html).toContain('A GAME FROM A NEWER VERSION');
+    expect(html).not.toContain('NOTHING · STEP UP');
+    expect(html).toMatch(/data-act="reset" +style/); // enabled
+  });
+
   it("escapes a player's chosen name", () => {
     name('ada-id', '<img src=x onerror=alert(1)>');
     start(0);
@@ -216,6 +230,17 @@ describe('the dialog', () => {
       expect(el.innerHTML).toBe(before);
       writeArcade(ITEM, null);
     }
+  });
+
+  it('keeps every key, Tab included, so Tab walks its buttons instead of opening the phone', () => {
+    const card = openArcadeCard(fake() as unknown as HTMLElement, { itemId: ITEM, seats: 1, isOwner: () => true }, 'fixed');
+    for (const key of ['Tab', 'Enter', 'ArrowDown']) {
+      const e = { key, stopPropagation: vi.fn(), preventDefault: vi.fn() };
+      for (const fn of (card.el as unknown as Fake).handlers.get('keydown') ?? []) fn(e);
+      expect(e.stopPropagation).toHaveBeenCalled();
+      expect(e.preventDefault).not.toHaveBeenCalled(); // the browser moves focus
+    }
+    card.close();
   });
 
   it('closes when the page moves to another room', () => {

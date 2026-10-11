@@ -28,8 +28,9 @@ export interface ArcadeCardModel {
   owner: boolean;
   /** "YOU RUN THIS CABINET", or what everyone else reads. */
   role: string;
-  /** The game the room is playing on it, and who holds each player. */
-  now: { game: ArcadeGame; players: Array<{ player: 1 | 2; who: string }> } | null;
+  /** The game the room is playing on it (null: one from a newer version,
+   *  which this build doesn't have), and who holds each player. */
+  now: { game: ArcadeGame | null; players: Array<{ player: 1 | 2; who: string }> } | null;
   /** The one game the owner set, or null: the whole menu. */
   pinned: ArcadeGame | null;
   /** The bundled games the cabinet's menu offers. */
@@ -64,7 +65,7 @@ export function arcadeCardModel(itemId: string, seats: 1 | 2, owner: boolean, me
     title: seats === 2 ? '⚙️ 2-PLAYER ARCADE CABINET' : '⚙️ ARCADE CABINET',
     owner,
     role: owner ? 'YOU RUN THIS CABINET' : 'THE OWNER SETS THIS CABINET · ANYONE CAN LOOK',
-    now: m && game ? { game, players: matchPlayers(m, seats, me) } : null,
+    now: m ? { game: game ?? null, players: matchPlayers(m, seats, me) } : null,
     pinned,
     offered: pinned ? [pinned] : ARCADE_GAMES,
     canReset: owner && m !== null,
@@ -121,8 +122,11 @@ export function arcadeCardHtml(model: ArcadeCardModel, notice: string | null = n
   rows.push(`<div style="display:flex;flex-direction:column;gap:4px;border-top:1px solid rgba(212,168,75,0.18);padding-top:8px;">
     ${label('NOW PLAYING')}
     ${now
-    ? `<span style="font-size:11px;font-weight:800;color:${GOLD_BRIGHT};">${esc(now.game.title)}</span>
-       <span style="font-size:9px;color:${GOLD};">${credit(now.game)}</span>
+    ? `${now.game
+      ? `<span style="font-size:11px;font-weight:800;color:${GOLD_BRIGHT};">${esc(now.game.title)}</span>
+       <span style="font-size:9px;color:${GOLD};">${credit(now.game)}</span>`
+      : `<span style="font-size:11px;font-weight:800;color:${GOLD_BRIGHT};">A GAME FROM A NEWER VERSION</span>
+       <span style="font-size:9px;color:${GOLD};">UPDATE TO WATCH OR PLAY IT</span>`}
        ${now.players.map((p) => `<span style="font-size:10px;color:${GOLD};">PLAYER ${p.player} · ${esc(p.who)}</span>`).join('')}`
     : `<span style="font-size:10px;color:${GOLD};">NOTHING · STEP UP AND PRESS ENTER TO PLAY</span>`}
     </div>`);
@@ -216,13 +220,13 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
     render();
   });
   el.addEventListener('keydown', (e) => {
+    // Keys stay with the card: Tab moves between its buttons (the room's
+    // Tab would open the phone instead), and Esc closes the card, not the
+    // cabinet or the room view behind it.
+    e.stopPropagation();
     if (e.key === 'Escape') {
-      // Esc closes the card, not the cabinet or the room view behind it.
       e.preventDefault();
-      e.stopPropagation();
       close();
-    } else if (e.key !== 'Tab') {
-      e.stopPropagation();
     }
   });
   // Keep presses on the card from walking the player or releasing a focus.
