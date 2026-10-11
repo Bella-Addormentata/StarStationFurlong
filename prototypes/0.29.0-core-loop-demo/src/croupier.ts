@@ -39,6 +39,7 @@ import {
   writeCroupierBeat,
   writeTableState,
 } from './casinoDoc';
+import { getPlayerId } from './identity';
 import { pocketColor, resolveRound } from './games/roulette';
 import type { RouletteTableState } from './games/roulette';
 import { settleParties } from './games/diceFairness';
@@ -110,6 +111,9 @@ export function rollAndSettle(tableId: string, round: number, autoShowMs?: numbe
     .finally(() => settling.delete(tableId));
 }
 
+/** This page, as a manual SPIN's settlement lease holder (see `operator`). */
+export const ROULETTE_PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).slice(2, 10)}`;
+
 async function settleRoulette(tableId: string, round: number, autoShowMs?: number): Promise<void> {
   const epoch = casinoDocEpoch();
   const closing = readTableState(tableId);
@@ -133,6 +137,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // same room doc (a removed or recreated table, or a rival settle, is not).
   const before = readTableState(tableId);
   if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return;
+  // 🎡 A manual round settles only on the page holding its lease: two house
+  // members pressing SPIN must not both publish and pay.
+  if (before.operator !== undefined && before.operator !== ROULETTE_PAGE_ID) return;
   // ⚖️ Only the wagers frozen at "no more bets" settle (the reveals made the
   // pocket computable; a rewritten list is void), and a bettor who committed
   // but never revealed forfeits this round's bets.
@@ -161,8 +168,10 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
 
 /** "No more bets": close the window and freeze the round's commitments.
  *  `deadlineMs` set ⇒ the robot's beat before the spin. */
-export function closeBetting(tableId: string, s: RouletteTableState, deadlineMs?: number): void {
-  const next: RouletteTableState = { ...s, phase: 'closing', ...freezeCommits(tableId, 'roulette', s) };
+export function closeBetting(tableId: string, s: RouletteTableState, deadlineMs?: number, operator?: string): void {
+  const next: RouletteTableState = {
+    ...s, phase: 'closing', ...freezeCommits(tableId, 'roulette', s), ...(operator ? { operator } : {}),
+  };
   if (deadlineMs != null) next.phaseDeadline = Date.now() + deadlineMs;
   else delete next.phaseDeadline;
   writeTableState(tableId, next);

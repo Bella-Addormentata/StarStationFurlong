@@ -26,7 +26,7 @@ import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
 import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
-import { tickFairSeeds } from "./fairTableSeeds";
+import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
   canRunCroupier,
@@ -5800,6 +5800,7 @@ export class World {
       const me = getPlayerId();
       for (const t of tables) tickFairSeeds(t.id, t.kind === "craps-table" ? "craps" : "roulette", me);
     }
+    forgetMissingTables(new Set(tables.map((t) => t.id)));
 
     // 🎰 Slot machines: ONE session operates every machine in the room (one
     // lease, slotCroupier.ts), so a player's balance has a single slot

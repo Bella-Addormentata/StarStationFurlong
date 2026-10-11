@@ -231,6 +231,18 @@ export function frozenFields(
   };
 }
 
+/** Forget the snapshots of every table no longer in the room (`live` is the
+ *  room's current table ids): a table removed and recreated under the same id
+ *  starts over at round 1, and a stale snapshot would fail its rounds. Every
+ *  client calls this each frame (world.ts), not just the page that removed it. */
+export function forgetMissingTables(live: ReadonlySet<string>): void {
+  if (frozenSeen.size === 0) return;
+  const prefix = `${casinoDocEpoch()}:`;
+  for (const tk of [...frozenSeen.keys()]) {
+    if (!tk.startsWith(prefix) || !live.has(tk.slice(prefix.length))) frozenSeen.delete(tk);
+  }
+}
+
 function noteFrozen(tableId: string, s: TableState & { wagers?: Record<string, string> }, overwrite: boolean): void {
   const k = String(s.round);
   const tk = `${casinoDocEpoch()}:${tableId}`;

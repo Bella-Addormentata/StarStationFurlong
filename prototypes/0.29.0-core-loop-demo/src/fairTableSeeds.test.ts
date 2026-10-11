@@ -15,10 +15,12 @@ const {
   readTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyBets, writeMyCrapsBets,
   writeMySeedRecord, writeTableState,
 } = await import('./casinoDoc');
-const { BET_WINDOW_MS, CLOSING_MS, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier } = await import('./croupier');
+const {
+  BET_WINDOW_MS, CLOSING_MS, rollAndSettle, ROULETTE_PAGE_ID, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier,
+} = await import('./croupier');
 const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, pressManualRoll, tickAutoStickman } = await import('./crapsCroupier');
 const {
-  commitSeedSync, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
+  commitSeedSync, forgetMissingTables, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
   wagerFingerprint,
 } = await import('./fairTableSeeds');
 const { pocketFromMaterial } = await import('./games/fairDice');
@@ -297,6 +299,39 @@ describe('a Fair roulette round', () => {
       result: mixed!.pocket!, fairness: mixed!.transcript,
     };
     expect((await verifySettledRound('roulette', t, forged, { pocket: forged.result! })).kind).toBe('failed');
+  });
+
+  it("a round under another page's SPIN lease isn't settled here", async () => {
+    const t = freshTable();
+    const closing = rouletteToClosing(t);
+    writeTableState(t, { ...closing, operator: 'player-Other:abc123' });
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    rollAndSettle(t, closing.round);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('closing');
+    writeTableState(t, { ...readTableState(t)!, operator: ROULETTE_PAGE_ID });
+    rollAndSettle(t, closing.round);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('settled');
+  });
+
+  it('a table removed from the room forgets its snapshot, so a recreated one verifies afresh', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette'); // snapshot for round 1
+    forgetMissingTables(new Set()); // the table left the room
+    // Recreated under the same id: a different round 1, never witnessed here.
+    const { settleParties } = await import('./games/diceFairness');
+    const seed = 'cd'.repeat(32);
+    const house = commitSeedSync(seed, { room: '', table: t, round: 1, party: 'house', house: '' });
+    const mixed = await settleParties('roulette', [{ id: 'house', commit: house, seed }], t, 1);
+    const fresh: RouletteTableState = {
+      kind: 'roulette', phase: 'settled', round: 1, result: mixed!.pocket!, resultAt: 0, payouts: {},
+      houseCommit: house, commits: {}, fairness: mixed!.transcript,
+    };
+    expect(await verifySettledRound('roulette', t, fresh, { pocket: fresh.result! }))
+      .toMatchObject({ kind: 'verified', watchedClose: false });
   });
 
   it('a bettor id too long for the closing state is left out instead of wedging the table', () => {

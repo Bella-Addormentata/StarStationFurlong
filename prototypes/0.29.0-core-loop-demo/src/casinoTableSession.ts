@@ -34,13 +34,13 @@ import {
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
-  writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat,
+  writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
 } from './casinoDoc';
 import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
-import { closeBetting, isCroupierLive, openBetting, rollAndSettle } from './croupier';
+import { closeBetting, isCroupierLive, openBetting, rollAndSettle, ROULETTE_PAGE_ID } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -73,6 +73,12 @@ export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { te
     ? { text: '✔ FAIR TABLE · EVERY BETTOR ADDS A SEED · CHECK EACH RESULT ON ⚙', color: '#7CF5B0', fair: true }
     : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F5C26B', fair: false };
 }
+
+/** 🎡 A rival house member's SPIN lease is honoured this long before this
+ *  page may take the round over (the reveal wait plus a margin). */
+const SPIN_TAKEOVER_MS = 15_000;
+/** How long a fresh lease write gets to converge before its page settles. */
+const LEASE_SETTLE_MS = 600;
 
 /** Friendly tables this page has already warned about (once per table). */
 const friendlyWarned = new Set<string>();
@@ -455,6 +461,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let seatTimer: number | null = null;
   /** The manual SPIN's settle poll: one per focused table. */
   let spinPoll: number | null = null;
+  /** When this page first saw another house member's lease on a round. */
+  let spinSeen: { key: string; at: number } | null = null;
   const stopSpinPoll = (): void => {
     if (spinPoll !== null) window.clearInterval(spinPoll);
     spinPoll = null;
@@ -1101,7 +1109,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     // forfeited party's seed record can change "a revealed seed was left out".
     const records = Object.keys(s.commits ?? {}).sort().map((pid) => readSeedRecord(itemId, pid));
     const inFlight = JSON.stringify([
-      forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null, s.unseeded ?? null, records,
+      forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null, s.unseeded ?? null, s.wagers ?? null,
+      records,
     ]);
     const v = verdicts.get(inFlight);
     if (v) return v;
@@ -1262,19 +1271,33 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return;
     }
     if (s.phase === 'settled') return;
-    if (s.phase === 'betting') closeBetting(itemId, s);
     if (spinPoll !== null) return; // already settling this round
+    if (s.phase === 'betting') closeBetting(itemId, s, undefined, ROULETTE_PAGE_ID);
+    else if (s.operator !== undefined && s.operator !== ROULETTE_PAGE_ID) {
+      // Another house member's SPIN holds this round. Take it over only once
+      // they've had time to settle it (they may have left mid-round).
+      const k = `${casinoDocEpoch()}:${s.round}:${s.operator}`;
+      if (spinSeen?.key !== k) spinSeen = { key: k, at: Date.now() };
+      if (Date.now() - spinSeen.at < SPIN_TAKEOVER_MS) {
+        say('THE WHEEL IS SPINNING — ANOTHER HOUSE MEMBER IS RUNNING THIS ROUND');
+        return;
+      }
+      writeTableState(itemId, { ...s, operator: ROULETTE_PAGE_ID });
+    }
     const r = s.round;
+    // Let a rival's lease write converge before this page may publish.
+    const settleFrom = Date.now() + LEASE_SETTLE_MS;
     const epoch = casinoDocEpoch();
     const until = Date.now() + REVEAL_GRACE_MS + 6_000;
     spinPoll = window.setInterval(() => {
       const now = rouletteState();
       // Another room's table can share this id and round: stop on a rebind.
-      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || Date.now() > until) {
+      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || Date.now() > until
+        || (now.operator !== undefined && now.operator !== ROULETTE_PAGE_ID)) {
         stopSpinPoll();
         return;
       }
-      rollAndSettle(itemId, r);
+      if (Date.now() >= settleFrom) rollAndSettle(itemId, r);
     }, 150);
   };
 

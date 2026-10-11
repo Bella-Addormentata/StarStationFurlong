@@ -70,6 +70,9 @@ export interface RouletteTableState {
   commits?: Record<string, string>;
   unseeded?: string[];
   wagers?: Record<string, string>;
+  /** 🎡 A manual SPIN's settlement lease: the page (player id + page nonce)
+   *  that closed or took over this round. Only it publishes and pays. */
+  operator?: string;
 }
 
 export function initialRouletteState(): RouletteTableState {
@@ -107,6 +110,7 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
+    && (s.operator === undefined || (typeof s.operator === 'string' && s.operator.length <= 192))
     && isSeedRoundFields(s);
 }
 
