@@ -23,11 +23,14 @@
  * the phase; everyone else renders `deadline − localNow` as a display-only
  * countdown (the offers.ts expiresAt precedent, single-writer for seconds-scale).
  *
- * FAIRNESS is dev-phase trust (the operator's client rolls the pocket), exactly
- * like the manual croupier — the G5 commit-reveal upgrade slots in unchanged.
+ * ⚖️ FAIRNESS: by default the pocket comes from the house's seed mixed with
+ * every bettor's (fairTableSeeds.ts) — committed at open, frozen at "no more
+ * bets", revealed at the settle — so the operator can't pick the number. A
+ * table the owner sets to plain RNG still spins from the operator's client.
  */
 
 import {
+  casinoDocEpoch,
   clearTableKeys,
   creditChips,
   readAllBets,
@@ -38,6 +41,12 @@ import {
 } from './casinoDoc';
 import { pocketColor, resolveRound } from './games/roulette';
 import type { RouletteTableState } from './games/roulette';
+import { settleParties } from './games/diceFairness';
+import type { FairnessTranscript } from './games/craps';
+// ⚖️ Fair by default: the house + bettors' seed exchange (fairTableSeeds.ts).
+import {
+  freezeCommits, gatherRound, isFairTable, newHouseCommit, settledRound,
+} from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet table never spins nothing). */
@@ -68,7 +77,7 @@ export function canRunCroupier(): boolean {
   return solePredicate();
 }
 
-// ── Random pocket (operator-side; dev-phase trust — G5 adds commit-reveal) ────
+// ── Random pocket (operator-side; an RNG table, or nobody revealed) ──────────
 
 /** Uniform pocket 0–36 via rejection sampling (no modulo bias). */
 function spinPocket(): number {
@@ -81,16 +90,51 @@ function spinPocket(): number {
 
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
-/** Roll, resolve, publish the settled record, and credit winners. Called by the
- *  operator's timer (with `autoShowMs` so it auto-opens the next round) AND by
- *  the manual SPIN button (no `autoShowMs` — the house clicks NEW ROUND). */
-export function rollAndSettle(
-  tableId: string,
-  round: number,
-  autoShowMs?: number,
-): number {
-  const result = spinPocket();
-  const payouts = resolveRound(readAllBets(tableId, round), result);
+/** Tables mid-settle — the Fair settle hashes (async) and may wait on reveals,
+ *  while the operator's tick calls every frame. */
+const settling = new Set<string>();
+
+/**
+ * Spin, resolve, publish the settled record, and credit winners. Called by the
+ * operator's timer (with `autoShowMs` so it auto-opens the next round) AND by
+ * the manual SPIN (no `autoShowMs` — the house clicks NEW ROUND). FIRE-AND-
+ * FORGET: on a Fair table it settles once the frozen bettors have revealed
+ * (or REVEAL_GRACE_MS ran out); until then a call does nothing and the caller
+ * simply calls again. Only a 'closing' table at `round` settles.
+ */
+export function rollAndSettle(tableId: string, round: number, autoShowMs?: number): void {
+  if (settling.has(tableId)) return;
+  settling.add(tableId);
+  settleRoulette(tableId, round, autoShowMs)
+    .catch((err) => console.error('[roulette] settle failed:', err))
+    .finally(() => settling.delete(tableId));
+}
+
+async function settleRoulette(tableId: string, round: number, autoShowMs?: number): Promise<void> {
+  const epoch = casinoDocEpoch();
+  const closing = readTableState(tableId);
+  if (closing?.phase !== 'closing' || closing.round !== round) return;
+  let result: number;
+  let fairness: FairnessTranscript | undefined;
+  let forfeited: string[] = [];
+  if (isFairTable(tableId)) {
+    const gathered = gatherRound(tableId, closing);
+    if (!gathered) return; // reveals still due
+    forfeited = gathered.forfeited;
+    const mixed = await settleParties('roulette', gathered.parties, tableId, round);
+    result = mixed?.pocket ?? spinPocket();
+    fairness = mixed?.transcript;
+  } else {
+    result = spinPocket();
+  }
+  // The hashing yielded: settle only the very round this call was for, in the
+  // same room doc (a removed or recreated table, or a rival settle, is not).
+  const before = readTableState(tableId);
+  if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return;
+  // ⚖️ A bettor who committed but never revealed forfeits this round's bets.
+  const bets = readAllBets(tableId, round);
+  for (const pid of forfeited) delete bets[pid];
+  const payouts = resolveRound(bets, result);
   const now = Date.now();
   writeTableState(tableId, {
     kind: 'roulette',
@@ -99,10 +143,22 @@ export function rollAndSettle(
     result,
     resultAt: now,
     payouts,
+    ...(fairness ? { fairness } : {}),
+    ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+    ...(before.commits !== undefined ? { commits: before.commits } : {}),
     ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
   });
+  settledRound(tableId, before);
   for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
-  return result;
+}
+
+/** "No more bets": close the window and freeze the round's commitments.
+ *  `deadlineMs` set ⇒ the robot's beat before the spin. */
+export function closeBetting(tableId: string, s: RouletteTableState, deadlineMs?: number): void {
+  const next: RouletteTableState = { ...s, phase: 'closing', ...freezeCommits(tableId, 'roulette', s) };
+  if (deadlineMs != null) next.phaseDeadline = Date.now() + deadlineMs;
+  else delete next.phaseDeadline;
+  writeTableState(tableId, next);
 }
 
 /** Open a fresh betting round (idle — no timer until a first bet arms it). */
@@ -114,6 +170,7 @@ export function openBetting(tableId: string, round: number): void {
     result: null,
     resultAt: 0,
     payouts: null,
+    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit() } : {}),
   });
 }
 
@@ -137,11 +194,7 @@ export function tickAutoCroupier(tableId: string): void {
         writeTableState(tableId, { ...s, phaseDeadline: now + BET_WINDOW_MS });
       }
     } else if (now >= s.phaseDeadline) {
-      writeTableState(tableId, {
-        ...s,
-        phase: 'closing',
-        phaseDeadline: now + CLOSING_MS,
-      });
+      closeBetting(tableId, s, CLOSING_MS);
     }
   } else if (s.phase === 'closing') {
     if (now >= (s.phaseDeadline ?? now)) rollAndSettle(tableId, s.round, SHOW_MS);

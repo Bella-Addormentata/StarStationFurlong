@@ -21,9 +21,10 @@
  * the settle, disjoint from the players' betting window (documented v1; the G4
  * Registry chips + a claim lane close it for real).
  *
- * NO SHARED CLOCK, FAIRNESS = dev-phase trust — same as croupier.ts: the
- * operator's Date.now() drives the deadlines and its client throws the dice; the
- * G5 commit-reveal upgrade slots in around resolveCrapsRound untouched.
+ * NO SHARED CLOCK — same as croupier.ts: the operator's Date.now() drives the
+ * deadlines. ⚖️ FAIRNESS: by default the dice come from the house's seed mixed
+ * with every bettor's (fairTableSeeds.ts) — committed at open, frozen at "no
+ * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
 import { canRunCroupier } from './croupier';
@@ -46,6 +47,9 @@ import type { CrapsTableState, SeatedPlayer } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
 import { selectCrapsBackend } from './crapsBackend';
+// ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
+// at "no more bets" (fairTableSeeds.ts).
+import { freezeCommits, isFairTable, newHouseCommit } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet come-out table never throws to an empty felt). */
@@ -101,6 +105,7 @@ export function rollAndSettleCraps(
       ...s,
       phase: 'closing',
       phaseDeadline: Date.now() + CRAPS_CLOSING_MS,
+      ...freezeCommits(tableId, 'craps', s),
     });
   }
   selectCrapsBackend(tableId)
@@ -133,6 +138,7 @@ export function openCrapsBetting(
     payouts: null,
     ...(shooter !== undefined ? { shooter } : {}),
     ...(lastShooter !== undefined ? { lastShooter } : {}),
+    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit() } : {}),
   });
 }
 
@@ -224,6 +230,13 @@ export function stickmanThrows(tableId: string, s: CrapsTableState, autoShowMs?:
   // The operator ticks every frame while the async settle is in flight: one
   // throw per roll, or every client's dice would restart their tumble.
   if (settling.has(tableId)) return;
+  // ⚖️ A Fair settle can wait a beat on the bettors' reveals, and the tick
+  // comes back every frame meanwhile: the stickman throws once per roll.
+  const prev = readDiceThrow(tableId);
+  if (prev?.round === s.round && prev.by === 'stickman') {
+    rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
+    return;
+  }
   writeDiceThrow(tableId, {
     round: s.round,
     by: 'stickman',
@@ -263,6 +276,7 @@ export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Dat
     ...s,
     phase: 'closing',
     phaseDeadline: now + (shooter ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS),
+    ...freezeCommits(tableId, 'craps', s),
   };
   if (shooter) next.shooter = shooter;
   else delete next.shooter;

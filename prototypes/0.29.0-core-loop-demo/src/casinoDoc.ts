@@ -269,8 +269,9 @@ export function clearTableKeys(tableId: string): void {
     map.delete(`cfg:fairness:${tableId}`);
     map.delete(`throw:${tableId}`);
     const seatPrefix = `seat:${tableId}:`;
+    const seedPrefix = `fseed:${tableId}:`;
     for (const key of [...map.keys()]) {
-      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix)) map.delete(key);
+      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix) || key.startsWith(seedPrefix)) map.delete(key);
     }
   });
 }
@@ -521,6 +522,55 @@ export function writeCrapsFairnessPref(tableId: string, mode: FairnessMode): voi
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`cfg:fairness:${tableId}`, mode);
+  });
+}
+
+// ── ⚖️ Fair-table seed records (craps + roulette multiparty) ──────────────────
+// Each bettor's own `fseed:<tableId>:<pid>` (only that player's client writes
+// it): its commitment for one round, bound to the round number AND the house
+// commit so it can never be replayed into another round, plus the revealed
+// seed once "no more bets" froze the commit set. See fairTableSeeds.ts.
+
+export interface TableSeedRecord {
+  round: number;
+  /** The table's houseCommit this commitment answers. */
+  house: string;
+  commit: string;
+  /** The revealed seed — absent until the commit set is frozen. */
+  seed?: string;
+}
+
+function isTableSeedRecord(v: unknown): v is TableSeedRecord {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<TableSeedRecord>;
+  const hex = (x: unknown) => typeof x === 'string' && x.length > 0 && x.length <= 128;
+  return Number.isInteger(r.round) && (r.round as number) >= 1
+    && hex(r.house) && hex(r.commit)
+    && (r.seed === undefined || hex(r.seed));
+}
+
+export function readSeedRecord(tableId: string, playerId: string): TableSeedRecord | null {
+  const v = ensureMap().get(`fseed:${tableId}:${playerId}`);
+  return isTableSeedRecord(v) ? v : null;
+}
+
+/** Every bettor's seed record on a table, by player id. */
+export function readAllSeedRecords(tableId: string): Record<string, TableSeedRecord> {
+  const prefix = `fseed:${tableId}:`;
+  const out: Record<string, TableSeedRecord> = {};
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix) || !isTableSeedRecord(value)) continue;
+    const pid = key.slice(prefix.length);
+    if (pid.length === 0 || pid.length > 128) continue;
+    out[pid] = value;
+  }
+  return out;
+}
+
+export function writeMySeedRecord(tableId: string, playerId: string, rec: TableSeedRecord): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`fseed:${tableId}:${playerId}`, rec);
   });
 }
 

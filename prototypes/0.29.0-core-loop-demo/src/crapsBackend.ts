@@ -40,7 +40,10 @@ import type { CrapsBackendKind } from './casinoDoc';
 import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 // 🎲🔀 The dice-fairness mode drives HOW the roll is produced (rng / commit-reveal
 // / multiparty / block-beacon) — switchable per table; see games/diceFairness.ts.
-import { getCrapsFairnessMode, produceRoll } from './games/diceFairness';
+import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
+import type { FairnessTranscript } from './games/craps';
+// ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
+import { gatherRound, settledRound } from './fairTableSeeds';
 
 export type { CrapsBackendKind };
 
@@ -57,13 +60,15 @@ export interface CrapsBackend {
    * `autoShowMs` set ⇒ auto-open the next window on a timer; absent ⇒ the manual
    * house clicks NEXT ROLL. ASYNC — the fairness modes hash (SubtleCrypto); the
    * dispatcher (crapsCroupier.rollAndSettleCraps) guards against re-entry.
+   * Resolves null when nothing settled yet — a Fair table still waiting on its
+   * bettors' reveals (the operator's tick simply calls again).
    */
   rollAndSettle(
     tableId: string,
     round: number,
     pointBefore: number | null,
     autoShowMs?: number,
-  ): Promise<[number, number]>;
+  ): Promise<[number, number] | null>;
 }
 
 // ── Local backend — the selected fairness mode + room-doc chips ───────────────
@@ -81,12 +86,29 @@ class LocalCrapsBackend implements CrapsBackend {
     round: number,
     pointBefore: number | null,
     autoShowMs?: number,
-  ): Promise<[number, number]> {
+  ): Promise<[number, number] | null> {
     // HOW the dice are produced is the table's fairness mode (rng / commit-reveal
     // / multiparty / block-beacon), per-table override or the global default.
     const mode = readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
     const epoch = casinoDocEpoch();
-    const { dice, transcript } = await produceRoll(mode, tableId, round);
+    let dice: [number, number];
+    let transcript: FairnessTranscript | undefined;
+    let forfeited: string[] = [];
+    const closing = readCrapsTableState(tableId);
+    if (mode === 'multiparty' && closing?.phase === 'closing' && closing.round === round) {
+      // ⚖️ The live Fair roll: the house seed + every frozen bettor's reveal.
+      const gathered = gatherRound(tableId, closing);
+      if (!gathered) return null; // reveals still due
+      forfeited = gathered.forfeited;
+      const mixed = await settleParties('craps', gathered.parties, tableId, round);
+      // Nobody revealed anything (no house seed on this device, no bettors):
+      // an unproven roll, shown as such on the table card.
+      ({ dice, transcript } = mixed?.dice
+        ? { dice: mixed.dice, transcript: mixed.transcript }
+        : await produceRoll('rng', tableId, round));
+    } else {
+      ({ dice, transcript } = await produceRoll(mode, tableId, round));
+    }
     // The hashing yielded — the table may have been REMOVED meanwhile
     // (closeCrapsTable refunded every felt and wiped the table keys, #87
     // review). Writing now would resurrect the dead table's state and pay
@@ -100,12 +122,17 @@ class LocalCrapsBackend implements CrapsBackend {
     if (casinoDocEpoch() !== epoch || before.round !== round || before.phase !== 'closing') return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
+    // ⚖️ A bettor who committed but never revealed forfeits every bet on the
+    // felt this roll — withholding a seed to dodge a result must cost them.
+    const allBets = readAllCrapsBets(tableId);
+    for (const pid of forfeited) delete allBets[pid];
     const { payouts, remaining } = resolveCrapsRound(
-      readAllCrapsBets(tableId),
+      allBets,
       d1,
       d2,
       pointBefore,
     );
+    for (const pid of forfeited) remaining[pid] = [];
     const now = Date.now();
     writeCrapsTableState(tableId, {
       kind: 'craps',
@@ -122,8 +149,13 @@ class LocalCrapsBackend implements CrapsBackend {
       ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
       ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
       ...(transcript ? { fairness: transcript } : {}),
+      // ⚖️ The round's commitments stay on the settled record so anyone can
+      // check the transcript against them.
+      ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+      ...(before.commits !== undefined ? { commits: before.commits } : {}),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
+    settledRound(tableId, before);
     for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
     // Prune the felt: rewrite each player's list to only the bets that survived
     // (standing pass/place). Empty ⇒ their felt clears.
@@ -160,7 +192,7 @@ class ChiaCrapsBackend implements CrapsBackend {
     _round: number,
     _pointBefore: number | null,
     _autoShowMs?: number,
-  ): Promise<[number, number]> {
+  ): Promise<[number, number] | null> {
     // Eventual flow (brainstorming/craps-chia-backend-plan.md §3–§4):
     //   1. Reveal the house seed committed at roll-open; combine with the target
     //      block hash beacon → the shared dice (identical for every channel).

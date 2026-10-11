@@ -105,6 +105,9 @@ export interface CrapsTableState {
   /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
    *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
   lastShooter?: string;
+  /** ⚖️ This round's seed commitments (see SeedRoundFields). */
+  houseCommit?: string;
+  commits?: Record<string, string>;
 }
 
 /** Which fairness scheme produced a table's dice (see diceFairness.ts). All four
@@ -125,6 +128,12 @@ export interface FairnessTranscript {
   /** block-beacon: the block hash the dice mixed in. */
   beacon?: string;
   simulated?: boolean;
+  /** ⚖️ A LIVE multiparty roll (Fair by default): who each commit belongs to,
+   *  index-aligned with `commits` and `seeds` — 'house' first, then each
+   *  bettor's player id. A party that committed but never revealed has an
+   *  empty seed: their bets were forfeited and the result came from the rest.
+   *  Absent on the older dev-simulated transcripts. */
+  parties?: string[];
 }
 
 const FAIRNESS_MODES: readonly string[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
@@ -151,7 +160,36 @@ export function isFairnessTranscript(value: unknown): value is FairnessTranscrip
     && (f.commits === undefined || isBoundedStringArray(f.commits))
     && (f.seeds === undefined || isBoundedStringArray(f.seeds))
     && (f.beacon === undefined || (typeof f.beacon === 'string' && f.beacon.length <= FAIRNESS_MAX_STRING))
-    && (f.simulated === undefined || typeof f.simulated === 'boolean');
+    && (f.simulated === undefined || typeof f.simulated === 'boolean')
+    && (f.parties === undefined || (
+        isBoundedStringArray(f.parties)
+        && f.commits?.length === f.parties.length
+        && f.seeds?.length === f.parties.length
+    ));
+}
+
+/** The party name a live multiparty transcript gives the house's seed. */
+export const HOUSE_PARTY = 'house';
+
+/** ⚖️ The per-round seed commitments on a Fair table's state (craps and
+ *  roulette share them). `houseCommit` is written when the betting window
+ *  opens; `commits` is the bettors' commitments FROZEN at "no more bets" —
+ *  only these parties are asked to reveal, and only their seeds count. */
+export interface SeedRoundFields {
+  houseCommit?: string;
+  commits?: Record<string, string>;
+}
+
+/** Shape guard for the peer-written seed fields (bounded like transcripts). */
+export function isSeedRoundFields(s: SeedRoundFields): boolean {
+  if (s.houseCommit !== undefined
+    && (typeof s.houseCommit !== 'string' || s.houseCommit.length > FAIRNESS_MAX_STRING)) return false;
+  if (s.commits === undefined) return true;
+  if (typeof s.commits !== 'object' || s.commits === null || Array.isArray(s.commits)) return false;
+  const entries = Object.entries(s.commits);
+  return entries.length < FAIRNESS_MAX_PARTIES
+    && entries.every(([pid, c]) => pid.length > 0 && pid.length <= 128
+      && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
 }
 
 export function initialCrapsState(): CrapsTableState {
@@ -220,7 +258,8 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && isPlayerIdField(s.shooter)
     && isPlayerIdField(s.lastShooter)
-    && isPlayerIdField(s.operator);
+    && isPlayerIdField(s.operator)
+    && isSeedRoundFields(s);
 }
 
 /** The point AFTER a roll of `sum`, given the point in force before it:
