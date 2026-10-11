@@ -38,6 +38,7 @@ import type {
   ArcadeScreenHandle,
   AlligatorsVisualHandle,
 } from './devices';
+import type { CasinoTableVisualHandle } from './casinoTable3d';
 
 /**
  * The per-item drive collections World owns, seen as the sinks the handle
@@ -75,6 +76,9 @@ export interface FurnitureHandleSinks {
   /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — handed
    *  on with the item's pose to alligatorsSession.ts, as air hockey's are. */
   alligatorsVisuals: Map<string, AlligatorsVisualHandle>;
+  /** 🎲🎡 #226: craps / roulette table pieces (felt, chips, dice, wheel),
+   *  keyed by item id — driven every frame by casinoTableSession.ts. */
+  casinoTableVisuals: Map<string, CasinoTableVisualHandle>;
 }
 
 /**
@@ -110,4 +114,5 @@ export function registerFurnitureHandles(
   if (d.tvScreen) sinks.tvScreens.set(itemId, d.tvScreen as TvScreenHandle);
   if (d.arcadeScreen) sinks.arcadeScreens.set(itemId, d.arcadeScreen as ArcadeScreenHandle);
   if (d.alligators) sinks.alligatorsVisuals.set(itemId, d.alligators as AlligatorsVisualHandle);
+  if (d.casinoTable) sinks.casinoTableVisuals.set(itemId, d.casinoTable as CasinoTableVisualHandle);
 }
