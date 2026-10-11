@@ -365,7 +365,8 @@ pub struct FaucetReply {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<FaucetStatus>,
-    /// The id of the coin a claim or gift spent, once the mempool accepted it.
+    /// The id of the coin a claim or gift spent (with `unanswered` set: the coin
+    /// its bundle spends, if the gateway took it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spent_coin: Option<String>,
     /// On a claim or give that went out: the snapshot BARRIER, taken under
@@ -377,11 +378,27 @@ pub struct FaucetReply {
     /// review, round 13).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_snapshot: Option<u64>,
+    /// On a claim or give whose push the gateway did not ANSWER (a timeout
+    /// above all): why. The spend may be in the mempool all the same, so its
+    /// inputs stay parked and the browser keeps its TAKING…/GIVING… until
+    /// reconciliation settles the spend, exactly as after an accepted push;
+    /// `ok` stays true. Only an explicit rejection, which proves nothing was
+    /// spent, comes back as `ok: false` (#245 review, round 14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unanswered: Option<String>,
 }
 
 impl FaucetReply {
     fn fail(op: &str, error: impl Into<String>) -> Self {
-        Self { op: op.to_string(), ok: false, error: Some(error.into()), status: None, spent_coin: None, after_snapshot: None }
+        Self {
+            op: op.to_string(),
+            ok: false,
+            error: Some(error.into()),
+            status: None,
+            spent_coin: None,
+            after_snapshot: None,
+            unanswered: None,
+        }
     }
     /// A request the node will not serve at all (wrong source), op unknown.
     pub fn refused(error: impl Into<String>) -> Self {
@@ -420,6 +437,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
             status: Some(s),
             spent_coin: None,
             after_snapshot: None,
+            unanswered: None,
         }),
         "claim" => claim(ctx, &client, &params).await,
         "give" => give(ctx, &client, &params, req.amount).await,
@@ -437,7 +455,9 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
             // above the barrier that shows the spend settled (or the gift
             // landed). The barrier goes out even when the read right after it
             // fails, so a later poll can settle a spend the chain dropped; the
-            // polls bring the status.
+            // polls bring the status. A push the gateway did not answer went out
+            // as well (`unanswered` set, round 14): its spend may be live, so the
+            // browser keeps the action pending the same way.
             if reply.ok && matches!(reply.op.as_str(), "claim" | "give") {
                 let _turn = STATUS_TURN.lock().await;
                 reply.after_snapshot = Some(STATUS_SNAPSHOTS.load(std::sync::atomic::Ordering::SeqCst));
@@ -646,13 +666,20 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
     // rejection — then the gift is not landing either (incoming_pending reads
     // the parking).
     crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id());
-    crate::chia_publish::push_parked(client, bundle, [target.coin.coin_id()]).await?;
-    println!(
-        "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
-        params.gift,
-        hex::encode(target.coin.coin_id()),
-        params.address()
-    );
+    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, [target.coin.coin_id()]).await)?;
+    match &unanswered {
+        None => println!(
+            "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
+            params.gift,
+            hex::encode(target.coin.coin_id()),
+            params.address()
+        ),
+        Some(why) => eprintln!(
+            "⛓️🥣 faucet: claim of coin {} at {} pushed but unanswered ({why}); the coin stays parked until the chain or the mempool settles it",
+            hex::encode(target.coin.coin_id()),
+            params.address()
+        ),
+    }
     Ok(FaucetReply {
         op: "claim".into(),
         ok: true,
@@ -660,6 +687,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
         status: None,
         spent_coin: Some(hex::encode(target.coin.coin_id())),
         after_snapshot: None,
+        unanswered,
     })
 }
 
@@ -723,12 +751,19 @@ async fn give(
     }
     let bundle = crate::chia_publish::sign_standard_spends(sk, ctx_spend.take())?;
     // Coins parked before the push leaves (round 9): see push_parked.
-    crate::chia_publish::push_parked(client, bundle, coins.iter().map(|c| c.coin_id())).await?;
-    println!(
-        "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",
-        params.address(),
-        coins.len()
-    );
+    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, coins.iter().map(|c| c.coin_id())).await)?;
+    match &unanswered {
+        None => println!(
+            "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",
+            params.address(),
+            coins.len()
+        ),
+        Some(why) => eprintln!(
+            "⛓️🥣 faucet: gift of {amount} mojo(s) into {} pushed but unanswered ({why}); its {} coin(s) stay parked until the chain or the mempool settles it",
+            params.address(),
+            coins.len()
+        ),
+    }
     Ok(FaucetReply {
         op: "give".into(),
         ok: true,
@@ -736,6 +771,7 @@ async fn give(
         status: None,
         spent_coin: Some(hex::encode(coins[0].coin_id())),
         after_snapshot: None,
+        unanswered,
     })
 }
 
@@ -747,6 +783,21 @@ async fn give(
     _amount: u64,
 ) -> Result<FaucetReply> {
     Err(anyhow!("this node was built without publishing; it cannot give"))
+}
+
+/// What a push leaves for the reply (#245 review, round 14): `Ok(None)` when the
+/// gateway accepted it; `Ok(Some(why))` when it did not ANSWER — the spend may
+/// be live and its inputs stay parked, so the request is answered as SENT with
+/// `unanswered` set, never as a refusal that would let the player spend again
+/// from other coins; `Err` only for a rejection, which proves nothing was spent.
+#[cfg(feature = "chia-publish")]
+fn pushed(outcome: Result<(), crate::chia_publish::PushError>) -> Result<Option<String>> {
+    use crate::chia_publish::PushError;
+    match outcome {
+        Ok(()) => Ok(None),
+        Err(PushError::Unanswered(e)) => Ok(Some(format!("{e:#}"))),
+        Err(rejected @ PushError::Rejected(_)) => Err(rejected.into()),
+    }
 }
 
 // ── bech32m (BIP-350), enough to print a Chia address ───────────────────────
@@ -1036,6 +1087,41 @@ mod tests {
         assert_eq!((chosen.len(), change), (2, 1));
         assert!(pick_give_coins(vec![coin(1, 400), coin(2, 500)], 1000).is_none());
         assert!(pick_give_coins(vec![], 1).is_none());
+    }
+
+    #[test]
+    fn an_unanswered_push_goes_out_as_sent_with_the_reason_never_as_a_refusal() {
+        let sent = FaucetReply {
+            op: "give".into(),
+            ok: true,
+            error: None,
+            status: None,
+            spent_coin: Some("ab".repeat(32)),
+            after_snapshot: Some(7),
+            unanswered: Some("operation timed out".into()),
+        };
+        let json = serde_json::to_string(&sent).unwrap();
+        assert!(json.contains("\"ok\":true"), "{json}");
+        assert!(json.contains("\"unanswered\":\"operation timed out\""), "{json}");
+        assert!(json.contains("\"afterSnapshot\":7"), "{json}");
+        // An accepted push sends no such field; a refusal is `ok: false` and never carries one.
+        let accepted = serde_json::to_string(&FaucetReply { unanswered: None, ..sent.clone() }).unwrap();
+        assert!(!accepted.contains("unanswered"), "{accepted}");
+        let refused = serde_json::to_string(&FaucetReply::fail("give", "push_tx rejected: DOUBLE_SPEND")).unwrap();
+        assert!(refused.contains("\"ok\":false") && !refused.contains("unanswered"), "{refused}");
+    }
+
+    #[cfg(feature = "chia-publish")]
+    #[test]
+    fn only_a_rejection_refuses_the_request() {
+        use crate::chia_publish::PushError;
+        assert_eq!(pushed(Ok(())).unwrap(), None);
+        // Unanswered: the spend may be live; the request is answered as SENT with the reason.
+        let unanswered = pushed(Err(PushError::Unanswered(anyhow!("operation timed out")))).unwrap();
+        assert_eq!(unanswered.as_deref(), Some("operation timed out"));
+        // Rejected: nothing was spent; the request is refused with the gateway's reason.
+        let refused = pushed(Err(PushError::Rejected("DOUBLE_SPEND".into()))).unwrap_err();
+        assert!(refused.to_string().contains("DOUBLE_SPEND"), "{refused}");
     }
 
     #[test]

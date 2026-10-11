@@ -247,6 +247,7 @@ import {
   dishLine,
   failFaucetRequest,
   faucetPending,
+  faucetPendingUnanswered,
   formatMojos,
   jarLevel,
   latestFaucetError,
@@ -254,6 +255,7 @@ import {
   markFaucetPending,
   subscribeFaucet,
   type FaucetOp,
+  type FaucetRequestTicket,
 } from './faucetDish';
 
 /** The helm's FUEL gauge: its figure, fill and colour. */
@@ -4636,8 +4638,9 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
 export interface FaucetDishUIDeps {
   /** The room whose dish this is (its faucet address derives from the room key). */
   roomId: () => string;
-  /** Send a status / take / give request to the local node (NetworkProvider). */
-  request: (op: FaucetOp, amount?: number) => Promise<void>;
+  /** Send a status / take / give request to the local node (NetworkProvider):
+   *  the ticket's `seq` is what the node echoes on the reply. */
+  request: (op: FaucetOp, amount?: number) => FaucetRequestTicket;
 }
 
 /** Give buttons, in mojos. The lobby gift is one mojo, so 1,000 mojos is a
@@ -4668,7 +4671,8 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
   /** Ask the node for a status; a request that cannot leave is shown as such
    *  (the screen otherwise reads "READING THE CHAIN…" with no node at all). */
   const poll = (roomId: string): void => {
-    deps.request('status').catch((e: unknown) => failFaucetRequest(roomId, 'status', e));
+    const { seq, sent } = deps.request('status');
+    sent.catch((e: unknown) => failFaucetRequest(roomId, 'status', seq, e));
   };
 
   const render = (): void => {
@@ -4698,10 +4702,16 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     const confirming = wallet !== null && spendable !== null && spendable < wallet ? wallet - spendable : 0n;
     const canTake = !!st?.canClaim && pending === null;
     const canGive = (mojos: number): boolean => !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
+    // A push the gateway never answered: the node keeps the spend's coins
+    // parked and the action pending until the chain or the mempool settles it,
+    // and the screen says so instead of reading a refusal (#245 review, round 14).
+    const unanswered = faucetPendingUnanswered(roomId);
+    const unansweredLine = (what: string): string =>
+      `the gateway did not answer the push (${escapeHtml(unanswered ?? '')}); ${what} may still land with the next block, and the dish keeps this until the chain or the mempool settles it`;
     const pendingLine = pending === 'claim'
-      ? 'TAKING… the mojo lands when the next block confirms it (about a minute)'
+      ? `TAKING… ${unanswered !== null ? unansweredLine('the mojo') : 'the mojo lands when the next block confirms it (about a minute)'}`
       : pending === 'give'
-        ? 'GIVING… your gift lands when the next block confirms it (about a minute)'
+        ? `GIVING… ${unanswered !== null ? unansweredLine('your gift') : 'your gift lands when the next block confirms it (about a minute)'}`
         : '';
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
@@ -4751,10 +4761,15 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     // and the pending state goes with it: otherwise TAKING…/GIVING… would show
     // for the whole timeout after a disconnect (#245 review, round 3).
     const send = (op: FaucetOp, amount?: number): void => {
-      markFaucetPending(roomId, op);
-      deps.request(op, amount).then(
+      // The request's seq is allotted before anything is written, and the
+      // action is marked pending under it here, before any reply can arrive:
+      // only the reply echoing it (or the failure of this very request) sets
+      // its floor, settles or refuses it (#245 review, round 14).
+      const { seq, sent } = deps.request(op, amount);
+      markFaucetPending(roomId, op, seq);
+      sent.then(
         () => window.setTimeout(() => poll(roomId), 2_000),
-        (e: unknown) => failFaucetRequest(roomId, op, e),
+        (e: unknown) => failFaucetRequest(roomId, op, seq, e),
       );
     };
     panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => send('claim'));

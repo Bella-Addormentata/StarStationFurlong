@@ -173,7 +173,7 @@ import {
 } from "./devices";
 import { boardGate } from "./departuresDoc";
 // ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
-import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp } from "./faucetDish";
+import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import {
   closeCoinPusher,
@@ -482,7 +482,7 @@ export class World {
   private faucetDishes: Map<string, FaucetDishHandle> = new Map();
   /** ⛓️🥣 main.ts installs the node request path (NetworkProvider.requestFaucet)
    *  so the dish screen can ask for status / take / give. */
-  public onFaucetRequest: ((op: FaucetOp, amount?: number) => Promise<void>) | null = null;
+  public onFaucetRequest: ((op: FaucetOp, amount?: number) => FaucetRequestTicket) | null = null;
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
   /** 🪙 Coin-pusher cabinets (issue #135) — animated pusher bar + rebuilt chip
    *  piles from shared state each frame. Same driven-every-frame idiom as the
@@ -6230,7 +6230,7 @@ export class World {
       const ui = createFaucetDishUI({
         roomId: () => World.activeRoomId(),
         request: (op, amount) =>
-          request ? request(op, amount) : Promise.reject(new Error("no node request path installed")),
+          request ? request(op, amount) : { seq: 0, sent: Promise.reject(new Error("no node request path installed")) },
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

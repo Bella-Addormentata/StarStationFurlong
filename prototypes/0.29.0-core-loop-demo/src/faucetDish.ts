@@ -74,9 +74,25 @@ export interface FaucetReply {
    *  status numbered above it was captured after the push. Sent even when the
    *  status read right after the push failed. */
   afterSnapshot?: number;
+  /** On a claim or give whose push the gateway did not ANSWER: why. The spend
+   *  may be in the mempool all the same, so the action stays pending, exactly
+   *  as after an accepted push, until the node's statuses settle it; only an
+   *  explicit rejection comes back as `ok: false`. */
+  unanswered?: string;
 }
 
 export type FaucetOp = 'status' | 'claim' | 'give';
+
+/** A request on its way to the node (NetworkProvider.requestFaucet). `seq` is
+ *  the request's number on the wire, which the node echoes on the reply; it is
+ *  allotted before the frame leaves, so a pending TAKE/GIVE is keyed on it
+ *  before any reply can arrive. `sent` resolves once the request is on the
+ *  wire and rejects when it never left (no node connection, a stream that
+ *  failed before the write). */
+export interface FaucetRequestTicket {
+  seq: number;
+  sent: Promise<void>;
+}
 
 /** Testnet11 / mainnet block cadence: 32 blocks per 10 minutes. */
 export const SECONDS_PER_BLOCK = 18.75;
@@ -150,6 +166,7 @@ export function parseFaucetReply(payloadB64: string): FaucetReply | null {
   if (typeof r.error === 'string') reply.error = r.error;
   if (typeof r.spentCoin === 'string') reply.spentCoin = r.spentCoin;
   if (isNum(r.afterSnapshot) && r.afterSnapshot >= 0) reply.afterSnapshot = Math.floor(r.afterSnapshot);
+  if (typeof r.unanswered === 'string') reply.unanswered = r.unanswered;
   if (r.status !== undefined) {
     const status = asFaucetStatus(r.status);
     if (!status) return null;
@@ -204,12 +221,19 @@ export function dishLine(status: FaucetStatus | null): string {
 // ── Per-room store: the last status the node sent, and in-flight spends ──────
 
 /** A TAKE or GIVE from the click until the node settles it (see setFaucetReply).
- *  `floor` is the first snapshot number that counts as captured AFTER the push
- *  (from the barrier the node sends with the reply): a status numbered below it
- *  predates the spend and says nothing about it. Null until the reply arrives. */
+ *  `seq` is the request's number on the wire: the node echoes it on the reply,
+ *  and only the reply carrying it is this action's own. `floor` is the first
+ *  snapshot number that counts as captured AFTER the push (from the barrier
+ *  the node sends with the reply): a status numbered below it predates the
+ *  spend and says nothing about it. Null until the reply arrives. `unanswered`
+ *  is the node's word when the gateway never answered the push: the spend may
+ *  be live all the same, and the action stays pending until a status settles
+ *  it, as after an accepted push. */
 interface Pending {
   op: FaucetOp;
+  seq: number;
   floor: number | null;
+  unanswered: string | null;
 }
 
 const latest = new Map<string, FaucetStatus>();
@@ -240,9 +264,16 @@ export function faucetPending(roomId: string): FaucetOp | null {
   return pending.get(roomId)?.op ?? null;
 }
 
-export function markFaucetPending(roomId: string, op: FaucetOp): void {
-  pending.set(roomId, { op, floor: null });
+export function markFaucetPending(roomId: string, op: FaucetOp, seq: number): void {
+  pending.set(roomId, { op, seq, floor: null, unanswered: null });
   notify();
+}
+
+/** The node's word when the gateway did not answer the pending action's push
+ *  (null otherwise): the spend may be live all the same, its inputs stay
+ *  parked, and the action stays pending until a status settles it. */
+export function faucetPendingUnanswered(roomId: string): string | null {
+  return pending.get(roomId)?.unanswered ?? null;
 }
 
 /** File a reply from the node for `roomId`. A status replaces the last one; an
@@ -267,27 +298,49 @@ export function markFaucetPending(roomId: string, op: FaucetOp): void {
  *  newer. The node numbers snapshots as it captures them, one at a time; a
  *  status numbered below the newest filed is an older look and is dropped (it
  *  could put a pre-claim balance back and re-enable TAKE). An older node sends
- *  no number (0), which orders nothing. */
-export function setFaucetReply(roomId: string, reply: FaucetReply): void {
+ *  no number (0), which orders nothing.
+ *
+ *  A take/give reply is tied to its request by `seq`, the number the request
+ *  carried on the wire and the node echoes back: only the reply with the
+ *  pending action's own seq (or the failure of that very request) sets its
+ *  floor or refuses it. An earlier action's reply answered late — after a poll
+ *  showed that action landed and cleared it, and a new one began — carries an
+ *  older seq: its status is filed like any other (the snapshot ordering sorts
+ *  it), but it says nothing about the action pending now, whose floor it would
+ *  otherwise set from a snapshot already on file and clear it at once; a late
+ *  refusal of it is not this action's refusal either (#245 review, round 14). */
+export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
+  const p = pending.get(roomId);
+  const own: Pending | null =
+    p !== undefined && p.op === reply.op && (reply.op === 'claim' || reply.op === 'give') && seq !== undefined && seq === p.seq
+      ? p
+      : null;
   if (!reply.ok) {
+    if (reply.op === 'claim' || reply.op === 'give') {
+      // A refusal of some other request — an earlier action's, answered late —
+      // neither clears the pending action nor shows as its error.
+      if (!own) return;
+      pending.delete(roomId);
+    }
     lastError.set(roomId, reply.error ?? 'the node refused');
-    if (reply.op === 'claim' || reply.op === 'give') pending.delete(roomId);
     notify();
     return;
   }
   lastError.delete(roomId);
-  const p = pending.get(roomId);
-  // The take/give reply: the spend went out. Its floor is recorded BEFORE the
-  // snapshot ordering below is consulted: a reply answered after a newer poll
-  // carries an older snapshot and must not be filed over it, but the floor it
-  // brings still stands, or the action could never clear (#245 review, round
-  // 12). The node sends the barrier even when its status read after the push
-  // failed (round 13); an older node sends only the status; one that sends
+  // This action's own reply: the spend went out. Its floor is recorded BEFORE
+  // the snapshot ordering below is consulted: a reply answered after a newer
+  // poll carries an older snapshot and must not be filed over it, but the floor
+  // it brings still stands, or the action could never clear (#245 review,
+  // round 12). The node sends the barrier even when its status read after the
+  // push failed (round 13); an older node sends only the status; one that sends
   // neither leaves the floor unset, and only a landing clears the action then.
-  if (p && p.op === reply.op && (reply.op === 'claim' || reply.op === 'give')) {
-    p.floor = reply.afterSnapshot !== undefined
+  // A push the gateway did not answer is a spend that may be live: the action
+  // stays pending the same way, and the screen says why (round 14).
+  if (own) {
+    own.floor = reply.afterSnapshot !== undefined
       ? reply.afterSnapshot + 1
       : reply.status && reply.status.snapshot > 0 ? reply.status.snapshot : null;
+    own.unanswered = reply.unanswered ?? null;
   }
   const prev = latest.get(roomId);
   let filed = false;
@@ -319,11 +372,11 @@ export function setFaucetReply(roomId: string, reply: FaucetReply): void {
 }
 
 /** A request never reached the node (no connection, a failed stream): no spend
- *  was made, so a pending TAKE/GIVE is dropped at once instead of showing until
- *  the timeout, and the screen says why. */
-export function failFaucetRequest(roomId: string, op: FaucetOp, reason: unknown): void {
+ *  was made, so the pending TAKE/GIVE it was for (`seq`) is dropped at once,
+ *  and the screen says why. */
+export function failFaucetRequest(roomId: string, op: FaucetOp, seq: number, reason: unknown): void {
   const why = reason instanceof Error ? reason.message : String(reason ?? 'unknown error');
-  setFaucetReply(roomId, { op, ok: false, error: `the request did not reach your node (${why})` });
+  setFaucetReply(roomId, { op, ok: false, error: `the request did not reach your node (${why})` }, seq);
 }
 
 export function subscribeFaucet(cb: () => void): () => void {

@@ -317,17 +317,20 @@ impl WalletLease {
 
 /// Push `bundle`, which consumes `inputs`, with the inputs PARKED FIRST (#245
 /// review, round 9). The three outcomes of a push, and what each leaves:
-///   - accepted: the inputs stay parked until the chain or the mempool settles
-///     the spend ([`WalletLease::reconcile`]);
-///   - rejected by the gateway (an explicit `success: false`): it holds nothing
-///     of the spend, so the inputs are handed back at once;
-///   - a transport error (a timeout above all): INDETERMINATE — the request may
-///     have reached the gateway and the spend may be in the mempool while the
-///     chain still lists the inputs unspent — so the inputs stay parked and
-///     reconciliation settles them (dropped: free again after the grace;
-///     landed: gone with the confirmation).
+///   - accepted (`Ok`): the inputs stay parked until the chain or the mempool
+///     settles the spend ([`WalletLease::reconcile`]);
+///   - rejected by the gateway (an explicit `success: false`,
+///     [`PushError::Rejected`]): it holds nothing of the spend, so the inputs
+///     are handed back at once;
+///   - a transport error (a timeout above all, [`PushError::Unanswered`]):
+///     INDETERMINATE — the request may have reached the gateway and the spend
+///     may be in the mempool while the chain still lists the inputs unspent —
+///     so the inputs stay parked and reconciliation settles them (dropped: free
+///     again after the grace; landed: gone with the confirmation).
 /// Parking only on success, as the writers first did, left the third case
-/// free for the next writer to select and double-spend.
+/// free for the next writer to select and double-spend. The two errors are
+/// told apart so a caller answering a user can say which happened: only a
+/// rejection proves that nothing was spent (#245 review, round 14).
 ///
 /// Callers hold the lease gate. For the dish's TAKE the input is the FAUCET
 /// coin, not ours: parking it keeps a second TAKE off it the same way.
@@ -335,22 +338,47 @@ pub async fn push_parked(
     client: &CoinsetClient,
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = Bytes32>,
-) -> Result<()> {
+) -> Result<(), PushError> {
     let parking = WALLET_LEASE.park(inputs);
     let resp = match client.push_tx(bundle).await {
         Ok(resp) => resp,
-        Err(e) => {
-            return Err(anyhow!(
-                "coinset push_tx failed: {e} (the coins it spends stay parked until the chain or the mempool settles them)"
-            ))
-        }
+        Err(e) => return Err(PushError::Unanswered(anyhow::Error::new(e))),
     };
     if !resp.success {
         WALLET_LEASE.unpark(&parking);
-        return Err(anyhow!("push_tx rejected: {:?}", resp.error));
+        return Err(PushError::Rejected(resp.error.unwrap_or_else(|| "no reason given".to_string())));
     }
     Ok(())
 }
+
+/// How a push through [`push_parked`] failed, and what it left behind.
+#[derive(Debug)]
+pub enum PushError {
+    /// The gateway answered `success: false` (its reason inside): it holds
+    /// nothing of the spend, and the inputs were handed back. Nothing was
+    /// spent, so the action can be refused outright and tried again.
+    Rejected(String),
+    /// The gateway did not answer (a timeout, a dropped connection): the bundle
+    /// may be in the mempool all the same, so the inputs stay parked until
+    /// reconciliation settles the spend. NOT a refusal: a caller that reported
+    /// it as one would let its user spend again, from other coins, while the
+    /// first spend is still live.
+    Unanswered(anyhow::Error),
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(reason) => write!(f, "push_tx rejected: {reason}"),
+            Self::Unanswered(e) => write!(
+                f,
+                "coinset push_tx unanswered: {e:#} (the coins it spends stay parked until the chain or the mempool settles them)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PushError {}
 
 /// How many spends one reconciliation asks the mempool about (one HTTPS call
 /// each); the rest wait for the next pass. Spends in flight are one per writer
@@ -774,6 +802,25 @@ mod tests {
         let _second = lease.park_at([a], t0 + Duration::from_secs(1));
         lease.unpark(&first); // stale: the first spend's rejection, arriving late
         assert!(lease.is_pending(&a));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_push_is_not_a_rejection_and_keeps_its_inputs_parked() {
+        // Nothing listens here, so the push gets no answer from any gateway: the
+        // outcome is INDETERMINATE (a timeout reads the same), not a refusal.
+        let client = CoinsetClient::new("http://127.0.0.1:9".to_string());
+        let coin = Bytes32::new([42u8; 32]);
+        let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
+        let outcome = tokio::time::timeout(Duration::from_secs(20), push_parked(&client, bundle, [coin]))
+            .await
+            .expect("a refused connection answers at once");
+        assert!(matches!(outcome, Err(PushError::Unanswered(_))), "{outcome:?}");
+        // The coin stays parked for reconciliation to settle, and the error says
+        // so: it is what a caller passes on when it cannot tell its user that
+        // nothing happened (#245 review, round 14).
+        assert!(WALLET_LEASE.is_pending(&coin));
+        let text = outcome.unwrap_err().to_string();
+        assert!(text.contains("unanswered") && text.contains("stay parked"), "{text}");
     }
 
     #[test]

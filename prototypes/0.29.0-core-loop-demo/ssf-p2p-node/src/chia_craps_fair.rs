@@ -106,7 +106,8 @@ async fn push_fair_record(
 ) -> Result<()> {
     let hint = fair_hint(table, round);
     let bundle = build_publish_bundle(chia_sk, coin, hint, Bytes::new(payload.to_vec()))?;
-    push_parked(client, bundle, [coin.coin_id()]).await
+    push_parked(client, bundle, [coin.coin_id()]).await?;
+    Ok(())
 }
 
 /// Poll until `spent` is no longer in the unspent set, then return the largest

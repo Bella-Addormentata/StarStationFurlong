@@ -24,7 +24,7 @@ import type {
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
 import { buildRoomCapPayload, nextCapSeq, readChiaMode } from './roomCap.ts';
-import type { FaucetOp } from '../faucetDish.ts';
+import type { FaucetOp, FaucetRequestTicket } from '../faucetDish.ts';
 
 export interface NetworkDebugInfo {
   mode: TransportMode;
@@ -63,8 +63,8 @@ export class NetworkProvider implements NetworkProviderPort {
    *  envelope must not pass for the node's answer). */
   #faucetReplyHandler: ((env: any) => void) | null = null;
   /** Monotonic `seq` on faucet requests; the node echoes it on the reply, so
-   *  the dish can drop a status answered out of order (each poll is its own
-   *  stream, and streams complete in any order). */
+   *  the dish can tell the reply to its pending TAKE/GIVE from any other (each
+   *  request is its own stream, and streams complete in any order). */
   #faucetSeq = 0;
   #isActive = false;
 
@@ -312,17 +312,25 @@ export class NetworkProvider implements NetworkProviderPort {
    *  and nowhere else. The node derives the faucet address from the room key
    *  it already holds from `cap`, so nothing secret travels here.
    *
-   *  Resolves once the request is on the wire; REJECTS when it never left
-   *  (no node connection, or the stream failed before the frame was written),
-   *  so the caller can drop its pending TAKE/GIVE at once. A failure AFTER the
-   *  write is indeterminate and resolves (see below).
+   *  Returns the request's `seq` at once, with `sent`: a promise that resolves
+   *  once the request is on the wire and REJECTS when it never left (no node
+   *  connection, or the stream failed before the frame was written), so the
+   *  caller can drop its pending TAKE/GIVE at once. The seq is allotted here,
+   *  before anything is written, so the dish keys the pending action on it
+   *  before any reply can arrive. A failure AFTER the write is indeterminate
+   *  and resolves (see below).
    *
    *  The reply is accepted only while the transport this request went out on
    *  is still the live one: a stream of a session since left can outlive
    *  disconnect() (its read is still pending), and a reconnect that lands the
    *  same room before it ends must not take that session's stale status or
    *  error as its own. */
-  async requestFaucet(op: FaucetOp, amount?: number): Promise<void> {
+  requestFaucet(op: FaucetOp, amount?: number): FaucetRequestTicket {
+    const seq = ++this.#faucetSeq;
+    return { seq, sent: this.#sendFaucetRequest(op, amount, seq) };
+  }
+
+  async #sendFaucetRequest(op: FaucetOp, amount: number | undefined, seq: number): Promise<void> {
     const boot = this.#boot;
     const wt = this.#wt;
     if (!wt || this.#mode === 'offline' || !boot) {
@@ -333,7 +341,7 @@ export class NetworkProvider implements NetworkProviderPort {
       if (op === 'give') body.amount = Math.max(0, Math.floor(amount ?? 0));
       const payloadBytes = new TextEncoder().encode(JSON.stringify(body));
       const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
-      const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq: ++this.#faucetSeq, author: '', payload: payloadB64 };
+      const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq, author: '', payload: payloadB64 };
       const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
       const packet = new Uint8Array(4 + jsonBytes.length);
       new DataView(packet.buffer).setUint32(0, jsonBytes.length, true);

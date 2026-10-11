@@ -404,7 +404,8 @@ describe('NetworkProvider — the faucet request stream', () => {
 
   it('sends one framed request then FIN, and the reply on that stream reaches onFaucetReply only', async () => {
     const { wt, provider, replies, envelopes } = await connected();
-    await provider.requestFaucet('give', 1234.9);
+    const ticket = provider.requestFaucet('give', 1234.9);
+    await ticket.sent;
 
     expect(wt.opened).toHaveLength(1);
     const stream = wt.opened[0];
@@ -414,6 +415,10 @@ describe('NetworkProvider — the faucet request stream', () => {
     expect(sent[0].room).toBe(BOOT.roomId);
     expect(JSON.parse(atob(sent[0].payload as string))).toEqual({ op: 'give', amount: 1234 });
     expect(sent[0].seq).toBe(1);
+    // …and the caller holds that seq from the call itself, before the frame can
+    // leave: the dish keys its pending TAKE/GIVE on it, and only the reply
+    // echoing it settles that action.
+    expect(ticket.seq).toBe(1);
     // The writable is closed after that one frame: the node's read loop ends at
     // our FIN and it can finish its side after replying, so the stream ends
     // instead of living (and holding a node task) until disconnect.
@@ -427,7 +432,9 @@ describe('NetworkProvider — the faucet request stream', () => {
     expect(envelopes).toHaveLength(0);
     // Every request carries the next seq (its id on the wire, echoed by the
     // node; snapshot ORDER comes from the node's own numbering, see faucetDish).
-    await provider.requestFaucet('status');
+    const next = provider.requestFaucet('status');
+    await next.sent;
+    expect(next.seq).toBe(2);
     expect(unframe(wt.opened[1].written)[0].seq).toBe(2);
     await provider.disconnect();
   });
@@ -445,7 +452,7 @@ describe('NetworkProvider — the faucet request stream', () => {
     });
 
     await provider.connect(BOOT);
-    await provider.requestFaucet('status'); // its drain is now awaiting the node's reply
+    await provider.requestFaucet('status').sent; // its drain is now awaiting the node's reply
     const stale = left.opened[0];
     await provider.disconnect(); // leave: the read on `stale` is still pending
     await provider.connect(BOOT); // and the same room is joined again, on `live`
@@ -460,7 +467,7 @@ describe('NetworkProvider — the faucet request stream', () => {
     expect(replies).toHaveLength(0);
 
     // The live session's own request stream still delivers.
-    await provider.requestFaucet('status');
+    await provider.requestFaucet('status').sent;
     const fresh = live.opened[0];
     const reply = faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1fresh' } });
     fresh.reply(reply);
@@ -503,7 +510,7 @@ describe('NetworkProvider — the faucet request stream', () => {
     };
     // The frame went out, so the node may be acting on it: this must RESOLVE
     // (a rejection would drop the pending GIVE and invite a second one)…
-    await expect(provider.requestFaucet('give', 1000)).resolves.toBeUndefined();
+    await expect(provider.requestFaucet('give', 1000).sent).resolves.toBeUndefined();
     const stream = wt.opened[0];
     expect(unframe(stream.written)).toHaveLength(1);
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('did not close cleanly'), expect.anything());
@@ -518,13 +525,13 @@ describe('NetworkProvider — the faucet request stream', () => {
 
   it('rejects a request it cannot send instead of resolving as if it had', async () => {
     const provider = new NetworkProvider();
-    await expect(provider.requestFaucet('status')).rejects.toThrow('no connection to your node');
+    await expect(provider.requestFaucet('status').sent).rejects.toThrow('no connection to your node');
     const wt = new FakeTransport();
     wt.acceptHandshake();
     queueTransports(wt);
     await provider.connect(BOOT);
     await provider.disconnect();
-    await expect(provider.requestFaucet('claim')).rejects.toThrow('no connection to your node');
+    await expect(provider.requestFaucet('claim').sent).rejects.toThrow('no connection to your node');
     expect(wt.opened).toHaveLength(0);
   });
 });
