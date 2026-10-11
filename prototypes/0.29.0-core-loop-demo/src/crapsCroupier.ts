@@ -270,10 +270,16 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
   // seen the seated players' heartbeats move and can slide them the dice.
   sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
-  if (s?.phase !== 'closing' || s.operator !== PAGE_ID) return;
+  // A takeover marker counts only for the turn it took, in this room doc;
+  // losing the turn (or it ending) drops it.
+  const mark = tookOverAt.get(tableId);
+  const took = mark && s && mark.epoch === casinoDocEpoch() && mark.round === s.round ? mark.at : undefined;
+  if (s?.phase !== 'closing' || s.operator !== PAGE_ID) {
+    tookOverAt.delete(tableId);
+    return;
+  }
   // Just took the turn over: let the operator stamp converge first, so a
   // rival takeover's write wins or loses before either page settles.
-  const took = tookOverAt.get(tableId);
   if (took !== undefined && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
   tickCrapsClosing(tableId, s, undefined, took !== undefined ? Infinity : now);
   tookOverAt.delete(tableId);
@@ -283,8 +289,8 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
  *  (its operator page is gone) and another editor's ROLL may take it over. */
 export const MANUAL_TAKEOVER_MS = 10_000;
 const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
-/** Tables this page took over, by this page's own clock. */
-const tookOverAt = new Map<string, number>();
+/** Turns this page took over: when (this page's own clock), and which. */
+const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>();
 
 /**
  * The house's ROLL on a manual table. Returns a notice for the press, or
@@ -303,6 +309,7 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
   const s = readCrapsTableState(tableId);
   if (!s) return null;
   if (s.phase === 'betting') {
+    tookOverAt.delete(tableId);
     closeCrapsBetting(tableId, s, now, true);
     return null;
   }
@@ -316,7 +323,7 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
     return 'THE DICE ARE OUT — ANOTHER HOUSE MEMBER IS RUNNING THIS ROLL';
   }
   writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
-  tookOverAt.set(tableId, now);
+  tookOverAt.set(tableId, { at: now, round: s.round, epoch: casinoDocEpoch() });
   return null;
 }
 

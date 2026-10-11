@@ -40,6 +40,8 @@ describe('the craps table chips', () => {
     });
     expect(handle).not.toBeNull();
     const h = handle as unknown as CasinoTableVisualHandle;
+    const meshesBefore: THREE.Object3D[] = [];
+    group.traverse((o) => { if ((o as THREE.InstancedMesh).isInstancedMesh) meshesBefore.push(o); });
     // 50 stacks of twenty $1 chips: 1000 chips of one denomination.
     const stacks = Array.from({ length: 50 }, (_, i) => ({
       x: -1.2 + (i % 10) * 0.25, z: -0.3 + Math.floor(i / 10) * 0.15,
@@ -48,6 +50,10 @@ describe('the craps table chips', () => {
     h.setFeltChips(stacks);
     h.update(0);
     expect(chipsDrawn(group)).toBeGreaterThanOrEqual(1000);
+    // The pools grew in place: the very meshes World registered at placement.
+    const meshesAfter: THREE.Object3D[] = [];
+    group.traverse((o) => { if ((o as THREE.InstancedMesh).isInstancedMesh) meshesAfter.push(o); });
+    expect(meshesAfter).toEqual(meshesBefore);
     // And it settles back once the felt clears.
     h.setFeltChips([]);
     h.update(0);

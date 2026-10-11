@@ -372,9 +372,8 @@ class ChipPools {
   private readonly dim = new THREE.Color(0.62, 0.62, 0.62);
   private readonly lit = new THREE.Color(1, 1, 1);
   private readonly up = new THREE.Vector3(0, 1, 0);
-  private readonly tmpColor = new THREE.Color();
 
-  constructor(private readonly ctx: PiecesCtx) {
+  constructor(ctx: PiecesCtx) {
     const geo = new THREE.CylinderGeometry(CHIP_RADIUS, CHIP_RADIUS, CHIP_H, 24);
     for (const d of POOL_DENOMS) {
       const side = solidCanvas(chipSideCanvas(d));
@@ -397,30 +396,22 @@ class ChipPools {
     return mesh;
   }
 
-  /** Double a full pool in place: copy what's laid out so far into a mesh
-   *  twice the size and swap it into the old one's spot. */
+  /** Double a full pool in place. The mesh object itself stays put — World
+   *  registered it at placement for its zoom hide/show pass and its teardown
+   *  — and only its instance buffers are swapped for ones twice the size,
+   *  carrying over what's laid out so far. dispose() first frees the old GPU
+   *  buffers; the renderer uploads the new ones on its next frame. */
   private grow(d: number): THREE.InstancedMesh {
-    const old = this.meshes.get(d)!;
-    const mesh = this.makeMesh(old.geometry, old.material as THREE.Material[], old.instanceMatrix.count * 2);
-    const n = this.used.get(d) ?? 0;
-    for (let i = 0; i < n; i++) {
-      old.getMatrixAt(i, this.m4);
-      mesh.setMatrixAt(i, this.m4);
-      if (old.instanceColor) {
-        old.getColorAt(i, this.tmpColor);
-        mesh.setColorAt(i, this.tmpColor);
-      }
-    }
-    mesh.visible = old.visible;
-    const parent = old.parent;
-    if (parent) {
-      parent.add(mesh);
-      parent.remove(old);
-    } else {
-      this.ctx.attach(mesh);
-    }
-    old.dispose(); // the instance buffers only; geometry + materials carry over
-    this.meshes.set(d, mesh);
+    const mesh = this.meshes.get(d)!;
+    const cap = mesh.instanceMatrix.count * 2;
+    const matrix = new THREE.InstancedBufferAttribute(new Float32Array(cap * 16), 16);
+    matrix.setUsage(THREE.DynamicDrawUsage);
+    matrix.array.set(mesh.instanceMatrix.array);
+    const color = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
+    if (mesh.instanceColor) color.array.set(mesh.instanceColor.array);
+    mesh.dispose(); // the old instance buffers only; geometry + materials carry over
+    mesh.instanceMatrix = matrix;
+    mesh.instanceColor = color;
     return mesh;
   }
 
