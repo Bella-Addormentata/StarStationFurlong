@@ -15,6 +15,7 @@ import { PAD_BIT, packArcadeTick, unpackArcadeTick } from './arcadeNet';
 
 type SessionModule = typeof import('./arcadeSession');
 type GamesModule = typeof import('./games/gamesDoc');
+type CasinoModule = typeof import('./casinoDoc');
 type YModule = typeof import('yjs');
 
 const ITEM = 'arcade-1';
@@ -34,6 +35,7 @@ interface Page {
   lane: string;
   mod: SessionModule;
   games: GamesModule;
+  casino: CasinoModule;
   Y: YModule;
   doc: InstanceType<YModule['Doc']>;
   /** Painted frames: the frame number each shows → its hash. */
@@ -67,7 +69,7 @@ async function openPage(name: string, viewer: { x: number; z: number } | null = 
   casino.bindCasinoDoc(doc);
   games.bindGamesDoc(doc);
   const page: Page = {
-    name, lane: `lane-${name}`, mod, games, Y, doc,
+    name, lane: `lane-${name}`, mod, games, casino, Y, doc,
     hashes: new Map(), cards: [], attract: 0, outbox: [], sent: [], viewer, closed: false,
   };
   doc.on('update', (update: Uint8Array, origin: unknown) => {
@@ -157,7 +159,20 @@ function compare(a: Page, b: Page, from = 0): { common: number; differ: number[]
 const ticksOf = (page: Page, type: 'frames' | 'guest' | 'sync') =>
   page.sent.filter((b) => unpackArcadeTick(b)?.type === type);
 
+/** The page goes to a room (main.ts publishes its id, then binds its doc). */
+function moveRoom(page: Page, id: string): void {
+  setRoom(id);
+  page.doc = new page.Y.Doc();
+  page.casino.bindCasinoDoc(page.doc);
+  page.games.bindGamesDoc(page.doc);
+}
+
+const setRoom = (id: string | undefined) => {
+  (globalThis as { __ssfRoomId?: string }).__ssfRoomId = id;
+};
+
 afterEach(() => {
+  setRoom(undefined);
   pages = [];
   lose = () => false;
   rewrite = (_f, _t, b) => b;
@@ -403,4 +418,51 @@ describe('watching from across the room', () => {
     await run(1000);
     expect(far.hashes.size - before).toBeGreaterThan(25);
   }, 60_000);
+});
+
+describe('rooms and builds', () => {
+  it("a page that goes to another room leaves its cabinet link behind", async () => {
+    const [a] = await room(['a', null]);
+    setRoom('room-a');
+    const l = a.mod.linkArcade(ITEM, 0, 2); // the menu is up (the UI's own screen)
+    l.host(THWAITE); // the ROM is still on its way…
+    moveRoom(a, 'room-b'); // …when the page moves to another room
+    const attract = a.attract;
+    await run(200);
+    expect(a.games.readArcade(ITEM)).toBeNull(); // nothing written into room B
+    expect(l.shared()).toBeNull();
+    l.host(THWAITE);
+    l.join();
+    l.stop();
+    await run(200);
+    expect(a.games.readArcade(ITEM)).toBeNull();
+    // Room B's cabinet with the same id is the room's, not held by the link.
+    expect(a.attract).toBeGreaterThan(attract);
+  }, 30_000);
+
+  it('a page that rejoins the same room picks its cabinet up again', async () => {
+    const [a] = await room(['a', null]);
+    setRoom('room-a');
+    const l = link(a, 0, 1);
+    moveRoom(a, 'room-a');
+    l.host(THWAITE);
+    await run(100);
+    expect(a.games.readArcade(ITEM)?.hostPage).toBe(a.mod.arcadePage());
+    expect(l.shared()).toMatchObject({ role: 'host', phase: 'playing' });
+  }, 30_000);
+
+  it("a game this build doesn't have clears the last game off the cabinet", async () => {
+    const [a, c] = await room(['a', null], ['c', null]);
+    await startGame(a, 0, 1);
+    await run(500);
+    expect(c.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
+    const m = c.games.readArcade(ITEM)!;
+    const attract = c.attract;
+    c.games.writeArcade(ITEM, {
+      ...m, id: (m.id % 65535) + 1, game: 'from-a-newer-build', host: 'someone', hostPage: 'their-page',
+    });
+    await run(100);
+    expect(c.mod.arcadeCopyInfo(ITEM)).toBeNull();
+    expect(c.attract).toBeGreaterThan(attract);
+  }, 30_000);
 });

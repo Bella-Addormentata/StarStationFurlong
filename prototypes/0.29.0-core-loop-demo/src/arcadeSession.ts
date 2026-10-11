@@ -220,15 +220,26 @@ function freshSession(handle: ArcadeCabinetVisualHandle, pos: { x: number; z: nu
 }
 
 /** The cabinet's session in the room's current doc (a room change starts it
- *  afresh: nothing carries over to another room's cabinet with the same id). */
+ *  afresh: nothing carries over to another room's cabinet with the same id,
+ *  not even the page at it, whose link re-attaches only in the same room). */
 function sessionFor(itemId: string): CabinetSession | null {
   const s = sessions.get(itemId);
   if (!s || s.docEpoch === casinoDocEpoch()) return s ?? null;
   s.copy?.machine?.stop();
+  s.copy = null;
   const fresh = freshSession(s.handle, s.pos);
-  fresh.link = s.link;
   sessions.set(itemId, fresh);
   return fresh;
+}
+
+/** The session still belongs to the bound room doc (an async step that
+ *  finishes after a room change must not touch the new room). */
+const inBoundRoom = (s: CabinetSession): boolean => s.docEpoch === casinoDocEpoch();
+
+/** The room this page is in (main.ts publishes it), or null before one. */
+function roomId(): string | null {
+  const id = (globalThis as { __ssfRoomId?: unknown }).__ssfRoomId;
+  return typeof id === 'string' ? id : null;
 }
 
 /** Drop a removed cabinet's runtime (world.ts removeFurnitureVisuals). A
@@ -266,7 +277,7 @@ function newCopy(s: CabinetSession, itemId: string, matchId: number, game: Arcad
   };
   romFor(game).then(
     (rom) => {
-      if (s.copy !== copy) return;
+      if (s.copy !== copy || !inBoundRoom(s)) return;
       const machine = new ArcadeMachine({
         sampleRate: s.link?.sampleRate ?? 48000,
         onAudioSample: (l, r) => s.link?.audio?.(l, r),
@@ -320,7 +331,16 @@ function reconcile(itemId: string, s: CabinetSession, m: ArcadeMatch | null): vo
     return;
   }
   const game = gameById(m.game);
-  if (!game) return; // a game this build doesn't have: nothing to follow
+  if (!game) {
+    // A game this build doesn't have (a newer client started it): nothing
+    // to follow, and the last match's copy must not stand in for it.
+    if (copy) {
+      copy.machine?.stop();
+      s.copy = null;
+      s.shown = null;
+    }
+    return;
+  }
   newCopy(s, itemId, m.id, game, 'follow');
 }
 
@@ -414,7 +434,7 @@ export function arcadeFrame(dt: number, viewer: { x: number; z: number } | null)
     if (copy) copy.ranNow = 0;
     try {
       if (copy?.role === 'host') hostFrame(itemId, s, copy, step, now);
-      else if (copy && m) followFrame(itemId, s, copy, m, step, now);
+      else if (copy && m && copy.matchId === m.id) followFrame(itemId, s, copy, m, step, now);
     } catch {
       // The emulator threw mid-frame (a bad save state, a jsnes bug): drop
       // this copy; a follower starts over, a host ends its game.
@@ -489,7 +509,7 @@ async function writeSnapshot(itemId: string, s: CabinetSession, copy: Copy): Pro
   copy.snapshotBusy = true;
   try {
     const data = await encodeSnapshot(state, boot);
-    if (s.copy === copy && readArcade(itemId)?.id === copy.matchId) {
+    if (s.copy === copy && inBoundRoom(s) && readArcade(itemId)?.id === copy.matchId) {
       writeArcadeSnapshot(itemId, { kind: 'arcade-snapshot', id: copy.matchId, next, data });
     }
   } catch {
@@ -692,7 +712,16 @@ export interface ArcadeLink {
  */
 export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLink {
   const link: LinkState = { buttons: 0, localP2: 0, audio: null, sampleRate: 48000, uiScreen: true, error: null };
+  /** The room and doc the page stepped up in. Focus can outlive a room
+   *  change: in another room this link reads and writes nothing; the same
+   *  room rejoined (a new doc) picks the cabinet up again. */
+  const room = roomId();
+  let epoch = casinoDocEpoch();
   const session = () => {
+    if (casinoDocEpoch() !== epoch) {
+      if (roomId() !== room) return null;
+      epoch = casinoDocEpoch();
+    }
     const s = sessionFor(itemId);
     if (s && s.link !== link) s.link = link;
     return s;
@@ -747,12 +776,13 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
 
     stop(): void {
       const s = session();
-      const copy = s?.copy;
+      if (!s) return;
+      const copy = s.copy;
       const m = readArcade(itemId);
       if (copy?.role === 'host') {
         copy.machine?.stop();
-        s!.copy = null;
-        s!.shown = null;
+        s.copy = null;
+        s.shown = null;
         if (m && m.hostPage === PAGE) writeArcade(itemId, null);
         return;
       }
@@ -760,6 +790,7 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
     },
 
     join(): void {
+      if (!session()) return;
       const m = readArcade(itemId);
       if (!m || seats !== 2 || seat === m.hostSeat) return;
       const next = withGuest(m, getPlayerId(), PAGE);
