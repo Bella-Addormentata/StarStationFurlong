@@ -472,6 +472,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   }
   /** round → verdict of the fairness check, so the card never re-hashes. */
   const verdicts = new Map<number, boolean>();
+  /** `epoch:round` checks in flight, so re-renders don't start them again. */
+  const verifying = new Set<string>();
   /** The room doc this focus began in: rounds and bets from another room's
    *  table with the same id must not count as this window's. */
   let mountEpoch = casinoDocEpoch();
@@ -607,13 +609,26 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       }
     }
     const chips = [...hand];
+    // The felt draws at most MAX_STACK_CHIPS of yours per box and
+    // MAX_BETS_DRAWN_PER_PLAYER chips in all: say so at the table rather than
+    // take a chip nobody would see.
+    const mine = myBets();
+    const key0 = spotKey(rg.bet);
+    if (mine.filter((b) => spotKey(b) === key0).length + chips.length > MAX_STACK_CHIPS) {
+      say(`THAT BOX IS FULL — ${MAX_STACK_CHIPS} CHIPS A BOX`);
+      return;
+    }
+    if (mine.length + chips.length > MAX_BETS_DRAWN_PER_PLAYER) {
+      say(`YOU HAVE ${MAX_BETS_DRAWN_PER_PLAYER} CHIPS DOWN — THE TABLE LIMIT`);
+      return;
+    }
     if (!spendChips(me, sumOf(chips))) {
       say('NOT ENOUGH CHIPS — VISIT THE CASHIER');
       refreshRail();
       return;
     }
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
-    writeBets([...myBets(), ...placed]);
+    writeBets([...mine, ...placed]);
     const key = spotKey(rg.bet);
     added.set(key, [...(added.get(key) ?? []), ...chips]);
     // The hand stays loaded: the next box you click takes the same chips.
@@ -1021,16 +1036,19 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         const fx = s.fairness;
         const txt = `🔒 LAST ROLL · ${fx.mode.toUpperCase()}${fx.simulated ? ' (dev-simulated)' : ''} · ${v === undefined ? 'verifying…' : v ? '✓ verified' : '✗ FAILED'}`;
         rows.push(`<div style="font-size:9px;color:${v === false ? '#FF8A80' : '#7CF5B0'};">${txt}</div>`);
-        if (v === undefined) {
-          const forRound = s.round;
-          const forEpoch = casinoDocEpoch();
+        const forRound = s.round;
+        const forEpoch = casinoDocEpoch();
+        const inFlight = `${forEpoch}:${forRound}`;
+        if (v === undefined && !verifying.has(inFlight)) {
+          verifying.add(inFlight);
           verifyTranscript(fx, itemId, forRound, s.dice).then((ok) => {
+            verifying.delete(inFlight);
             // A check started in another room's doc says nothing about this one.
             if (forEpoch !== casinoDocEpoch()) return;
             if (verdicts.size > 32) verdicts.clear();
             verdicts.set(forRound, ok);
             renderCard();
-          });
+          }, () => verifying.delete(inFlight));
         }
       }
     }
