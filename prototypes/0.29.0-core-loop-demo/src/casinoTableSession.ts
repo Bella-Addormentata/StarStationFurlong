@@ -1080,7 +1080,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         return { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
       }
       if (s.phase === 'settled' && s.voided) {
-        return { line: '⚠ ROLL VOID — THE HOUSE SEED WAS LOST · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
+        return { line: '⚠ ROLL VOID — IT COULD NOT BE SETTLED FAIRLY · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
       }
       if (s.phase === 'settled' && s.dice && s.result !== null) {
         const won = (s.payouts?.[me] ?? 0) > 0;
@@ -1099,7 +1099,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (animating()) return { line: '🎡 NO MORE BETS — THE BALL IS ROLLING…', color: PINK };
     if (s?.phase === 'closing') return { line: '✋ NO MORE BETS', color: PINK };
     if (s?.phase === 'settled' && s.voided) {
-      return { line: '⚠ SPIN VOID — THE HOUSE SEED WAS LOST · STAKES RETURNED', color: GOLD_BRIGHT };
+      return { line: '⚠ SPIN VOID — IT COULD NOT BE SETTLED FAIRLY · STAKES RETURNED', color: GOLD_BRIGHT };
     }
     if (s?.phase === 'settled' && s.result !== null) {
       const won = (s.payouts?.[me] ?? 0) > 0;
@@ -1163,7 +1163,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         || Object.keys(s.payouts ?? {}).length > 0;
       if (played) return { text: `✗ ${what} · CHECK FAILED (A PLAYED ROUND MARKED VOID)`, color: '#FF8A80' };
       return {
-        text: `⚠ ${what} VOIDED · THE HOUSE SEED WAS UNAVAILABLE · ${game === 'craps' ? 'EVERY BET STANDS' : 'STAKES RETURNED'}`,
+        text: `⚠ ${what} VOIDED · A SEED WAS MISSING OR UNSIGNED · ${game === 'craps' ? 'EVERY BET STANDS' : 'STAKES RETURNED'}`,
         color: '#F5C26B',
       };
     }
