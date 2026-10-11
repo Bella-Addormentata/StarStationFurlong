@@ -529,6 +529,32 @@ describe('a Fair roulette round', () => {
     expect(readTableState(t)?.commits?.[AMY]).toBeUndefined();
   });
 
+  it('erasing the house commit before a bettor reveals still lets the bettor reveal', () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    forgetMissingTables(new Set()); // a page that hasn't snapshotted this close
+    writeTableState(t, { ...readTableState(t)!, houseCommit: undefined });
+    playersLook(t, 'roulette');
+    expect(readSeedRecord(t, AMY)?.seed).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('the stored seeds stay capped when rounds are abandoned before they settle', async () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, v); },
+      removeItem: (k: string) => { store.delete(k); },
+    });
+    try {
+      const { newHouseCommit } = await import('./fairTableSeeds');
+      for (let i = 0; i < 300; i++) newHouseCommit(`abandoned-${i}`, 1);
+      expect([...store.keys()].filter((k) => k.startsWith('ssf-fair-seed:')).length).toBe(256);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.stubGlobal('window', { location: { search: '' } });
+    }
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);

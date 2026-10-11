@@ -113,13 +113,30 @@ function evictOldest(m: Map<string, unknown> | Set<string>, max: number): void {
 }
 
 const SEED_STORE_PREFIX = 'ssf-fair-seed:';
+/** The stored commitments, oldest first: a round abandoned mid-way (left the
+ *  room, table removed) never settles, so the store is capped by this index. */
+const SEED_INDEX_KEY = 'ssf-fair-seed-index';
+const MAX_STORED_SEEDS = 256;
 const memSeeds = new Map<string, string>();
+
+function readSeedIndex(): string[] {
+  try {
+    const v: unknown = JSON.parse(localStorage.getItem(SEED_INDEX_KEY) ?? '[]');
+    return Array.isArray(v) ? v.filter((c): c is string => typeof c === 'string') : [];
+  } catch {
+    return [];
+  }
+}
 
 function keepSeed(commit: string, seed: string): void {
   memSeeds.set(commit, seed);
   evictOldest(memSeeds, 256);
   try {
+    const index = readSeedIndex().filter((c) => c !== commit);
+    index.push(commit);
+    while (index.length > MAX_STORED_SEEDS) localStorage.removeItem(SEED_STORE_PREFIX + index.shift()!);
     localStorage.setItem(SEED_STORE_PREFIX + commit, seed);
+    localStorage.setItem(SEED_INDEX_KEY, JSON.stringify(index));
   } catch {
     // No storage (private window, tests): the in-memory copy still reveals.
   }
@@ -148,6 +165,7 @@ function forgetSeed(commit: string, ctx: TableSeedContext): void {
   memSeeds.delete(commit);
   try {
     localStorage.removeItem(SEED_STORE_PREFIX + commit);
+    localStorage.setItem(SEED_INDEX_KEY, JSON.stringify(readSeedIndex().filter((c) => c !== commit)));
   } catch {
     // Nothing stored.
   }
@@ -345,15 +363,27 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
   lastTick.delete(tickKey);
   lastTick.set(tickKey, now);
   evictOldest(lastTick, 256);
-  const s = readState(tableId, game);
+  const live = readState(tableId, game);
   // A removed table forgets its snapshots: one recreated under the same id
   // starts again at round 1 with a new house commit.
-  if (!s) frozenSeen.delete(`${casinoDocEpoch()}:${tableId}`);
-  if (!s?.houseCommit) return;
+  if (!live) frozenSeen.delete(`${casinoDocEpoch()}:${tableId}`);
+  if (!live) return;
+  const rec = readSeedRecord(tableId, me);
+  // Past the close, the house commit comes from what this page froze, or
+  // from my own commitment for this round: erasing the live field mustn't
+  // stop my reveal (the operator settles by its frozen copy and would
+  // forfeit me).
+  let house = live.houseCommit;
+  if (live.phase !== 'betting') {
+    const mineRec = rec && rec.round === live.round
+      && authored.has(authoredKey(tableId, { ...live, houseCommit: rec.house }, rec.commit)) ? rec.house : undefined;
+    house = frozenFields(tableId, live).houseCommit ?? house ?? mineRec;
+  }
+  if (!house) return;
+  const s: TableState = { ...live, houseCommit: house, ...(live.phase === 'closing' ? frozenFields(tableId, live) : {}) };
   if (s.phase === 'closing') {
     noteFrozen(tableId, s, false);
   }
-  const rec = readSeedRecord(tableId, me);
   if (s.phase === 'betting') {
     // A record under my id that I didn't write is replaced with my own.
     // "Mine" is per round: a commitment of mine copied in from an earlier
@@ -371,7 +401,7 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
     authoredRounds.add(roundKey(tableId, s.round, s.houseCommit));
     evictOldest(authored, 512);
     evictOldest(authoredRounds, 512);
-    writeMySeedRecord(tableId, me, { round: s.round, house: s.houseCommit, commit, sig });
+    writeMySeedRecord(tableId, me, { round: s.round, house, commit, sig });
   } else if (s.phase === 'closing') {
     const frozen = s.commits?.[me];
     if (!frozen || !rec || rec.commit !== frozen || rec.round !== s.round || rec.seed) return;
@@ -391,7 +421,7 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
     }
     if (rec && rec.round === s.round) forgetSeed(rec.commit, { room: casinoRoomId(), table: tableId, round: rec.round, party: me, house: rec.house });
     if (myFrozen) forgetSeed(myFrozen, bettorCtx(tableId, s, me));
-    forgetSeed(s.houseCommit, houseCtx(tableId, s.round));
+    forgetSeed(house, houseCtx(tableId, s.round));
   }
 }
 

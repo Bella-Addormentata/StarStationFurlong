@@ -1079,6 +1079,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         if (s.shooter && s.shooter !== me) return { line: `✋ NO MORE BETS — ${readPlayerDisplayName(s.shooter).toUpperCase()} IS SHOOTING${remain()}`, color: PINK };
         return { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
       }
+      if (s.phase === 'settled' && s.voided) {
+        return { line: '⚠ ROLL VOID — THE HOUSE SEED WAS LOST · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
+      }
       if (s.phase === 'settled' && s.dice && s.result !== null) {
         const won = (s.payouts?.[me] ?? 0) > 0;
         const call = s.sevenOut ? ' — SEVEN OUT' : s.point !== null && s.point === s.result ? '' : '';
@@ -1095,6 +1098,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const s = rouletteState();
     if (animating()) return { line: '🎡 NO MORE BETS — THE BALL IS ROLLING…', color: PINK };
     if (s?.phase === 'closing') return { line: '✋ NO MORE BETS', color: PINK };
+    if (s?.phase === 'settled' && s.voided) {
+      return { line: '⚠ SPIN VOID — THE HOUSE SEED WAS LOST · STAKES RETURNED', color: GOLD_BRIGHT };
+    }
     if (s?.phase === 'settled' && s.result !== null) {
       const won = (s.payouts?.[me] ?? 0) > 0;
       return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''}`, color: won ? WIN : GOLD_BRIGHT };
