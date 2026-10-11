@@ -4,8 +4,10 @@
 //! The "volunteer wallet" is a set of coins at ONE puzzle hash per room, locked
 //! by `puzzles/faucet.clsp`. Nobody holds a key for it: the puzzle alone decides
 //! how coins leave — exactly one GIFT per coin per GAP blocks, to whoever submits
-//! the spend, the rest back to the same puzzle hash, at most MAX_FEE burnt as
-//! fee. Chialisp cannot act on its own and cannot read other coins, so the chain
+//! the spend, the rest back to the same puzzle hash, and (for the lobby) no fee
+//! at all: the claimer picks the fee and the claimer is anyone, so a fee cap
+//! would be a per-window burn allowance. Chialisp cannot act on its own and
+//! cannot read other coins, so the chain
 //! neither pushes gifts nor checks that a claimer's wallet is empty: the
 //! passer-by's node submits the claim (this module), and "only when my wallet is
 //! empty" is this node's courtesy rule, not a chain rule.
@@ -14,9 +16,10 @@
 //! at it, which of them are ready, and the status the browser draws the dish
 //! from. Publish side (`chia-publish` with the wallet loaded, i.e.
 //! `SSF_CHIA_LANE=1`): the CLAIM spend — keyless, puzzle reveal + solution and an
-//! EMPTY aggregated signature, the faucet coin paying any fee — and the GIVE
-//! spend, our standard-puzzle coin paying into the faucet address. Testnet11
-//! only until P8 (every gift and donation links addresses on a public chain).
+//! EMPTY aggregated signature, the faucet coin the spend's only input — and the
+//! GIVE spend, our standard-puzzle coins paying into the faucet address under
+//! the wallet spend lease (`chia_publish::WALLET_LEASE`). Testnet11 only until
+//! P8 (every gift and donation links addresses on a public chain).
 #![cfg(feature = "chia-read")]
 
 use std::collections::HashMap;
@@ -46,11 +49,13 @@ pub const FAUCET_MOD_HASH: TreeHash = TreeHash::new([
 
 /// v1 lobby parameters (design note §4): a one-mojo join token — enough to
 /// publish presence forever at fee 0 — once per coin every 32 blocks (~10 min),
-/// with a claim allowed to burn at most 0.00005 XCH as fee when the mempool is
-/// full. Changing any of these changes every room's faucet address.
+/// and NO fee on a claim: the puzzle is keyless, so whatever fee it allowed, a
+/// griefer could burn from every ready coin every window (#245 review). A
+/// claim therefore waits for an uncongested mempool, which on testnet11 is the
+/// normal state. Changing any of these changes every room's faucet address.
 pub const GIFT_MOJOS: u64 = 1;
 pub const GAP_BLOCKS: u32 = 32;
-pub const MAX_FEE_MOJOS: u64 = 50_000_000;
+pub const MAX_FEE_MOJOS: u64 = 0;
 
 /// Domain-separated derivation of the per-room tag curried into the puzzle. It
 /// is one-way: a private room's address reveals nothing about its key.
@@ -116,6 +121,7 @@ pub fn mod_program(a: &mut Allocator) -> Result<NodePtr> {
 }
 
 /// A claim's solution: `(my_puzzle_hash my_amount recipient_ph fee)`.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build only shows the dish
 pub fn claim_solution(
     a: &mut Allocator,
     my_puzzle_hash: Bytes32,
@@ -159,7 +165,9 @@ pub struct FaucetStatus {
     pub gift: u64,
     pub gap: u32,
     pub peak: u32,
-    /// Mojos in claimable coins (dust below GIFT is not counted: it can never leave).
+    /// Mojos in claimable coins (dust below GIFT is not counted: it can never
+    /// leave). A decimal STRING on the wire — see [`mojo_string`].
+    #[serde(with = "mojo_string")]
     pub total_mojos: u64,
     /// Claimable coins = gift slots per GAP.
     pub coins: u32,
@@ -171,14 +179,51 @@ pub struct FaucetStatus {
     pub can_claim: bool,
     /// This node can pay into the jar: wallet loaded and funded.
     pub can_give: bool,
-    /// Our wallet's unspent mojos, when a wallet is loaded.
+    /// Our wallet's unspent mojos, when a wallet is loaded (decimal string).
+    #[serde(with = "opt_mojo_string")]
     pub wallet_mojos: Option<u64>,
+    /// The coin listing hit [`MAX_FAUCET_PAGES`]: `coins`, `ready` and
+    /// `total_mojos` cover the pages read, the jar holds more.
+    pub partial: bool,
     /// Why claim/give are off, in the dish's words.
     pub note: String,
 }
 
+/// Mojo totals travel as DECIMAL STRINGS: a JSON number is a double in the
+/// browser, exact only below 2^53 (about 9,007 XCH), and the screen promises
+/// exact totals (#245 review). The browser parses them as `bigint`.
+mod mojo_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+mod opt_mojo_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => s.collect_str(n),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|text| text.parse().map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
 /// Pure half of `status`: fold the coins at the address into the dish's view.
-pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin]) -> FaucetStatus {
+/// `partial` says the listing was cut short (see [`unspent_at`]).
+pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial: bool) -> FaucetStatus {
     let claimable: Vec<&FaucetCoin> = coins.iter().filter(|c| c.claimable(params)).collect();
     let ready = claimable.iter().filter(|c| c.ready(params, peak)).count() as u32;
     let next_ready_in_blocks = claimable
@@ -199,26 +244,57 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin]) -> Fauc
         can_claim: false,
         can_give: false,
         wallet_mojos: None,
+        partial,
         note: String::new(),
     }
 }
 
-/// The unspent coins at `puzzle_hash` (first page; a faucet holds a handful).
-pub async fn unspent_at(client: &CoinsetClient, puzzle_hash: Bytes32) -> Result<Vec<FaucetCoin>> {
-    let resp = client
-        .get_coin_records_by_puzzle_hash(puzzle_hash, None, None, Some(false), None)
-        .await
-        .map_err(|e| anyhow!("coinset get_coin_records_by_puzzle_hash failed: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("coin lookup unsuccessful: {:?}", resp.error));
-    }
-    Ok(resp
-        .coin_records
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| !r.spent)
-        .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index })
-        .collect())
+/// Gateway pages followed per listing (one HTTPS call each). A faucet address is
+/// permissionless, so a flood of tiny outputs could stretch the listing past one
+/// page; the pages are followed up to this bound (as `chia_resolve::read_hint`
+/// does) and past it the status says so (`partial`) instead of silently
+/// missing coins (#245 review).
+pub const MAX_FAUCET_PAGES: usize = 8;
+
+/// The unspent coins at an address, and whether the listing was cut short.
+pub struct Unspent {
+    pub coins: Vec<FaucetCoin>,
+    pub partial: bool,
+}
+
+/// The unspent coins at `puzzle_hash`, following the gateway's cursor.
+pub async fn unspent_at(client: &CoinsetClient, puzzle_hash: Bytes32) -> Result<Unspent> {
+    let mut coins = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
+    let partial = loop {
+        let resp = client
+            .get_coin_records_by_puzzle_hash(puzzle_hash, None, None, Some(false), cursor.take())
+            .await
+            .map_err(|e| anyhow!("coinset get_coin_records_by_puzzle_hash failed: {e}"))?;
+        if !resp.success {
+            return Err(anyhow!("coin lookup unsuccessful: {:?}", resp.error));
+        }
+        pages += 1;
+        coins.extend(
+            resp.coin_records
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| !r.spent)
+                .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index }),
+        );
+        let truncated = resp.truncated.unwrap_or(false);
+        match resp.next_cursor {
+            Some(next) if truncated => {
+                if pages >= MAX_FAUCET_PAGES {
+                    break true;
+                }
+                cursor = Some(next);
+            }
+            _ => break truncated,
+        }
+    };
+    Ok(Unspent { coins, partial })
 }
 
 // ── The browser lane: `faucet` envelopes ────────────────────────────────────
@@ -301,8 +377,8 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
     let peak = crate::chia_resolve::peak_height(client)
         .await
         .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
-    let coins = unspent_at(client, params.puzzle_hash()).await?;
-    let mut st = summarize(params, peak, &coins);
+    let listing = unspent_at(client, params.puzzle_hash()).await?;
+    let mut st = summarize(params, peak, &listing.coins, listing.partial);
     #[cfg(feature = "chia-publish")]
     {
         match &ctx.wallet {
@@ -333,10 +409,35 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
     Ok(st)
 }
 
+/// Our wallet's unspent coins, minus those a spend is already pending for.
 #[cfg(feature = "chia-publish")]
 async fn wallet_unspent(client: &CoinsetClient, sk: &chia_bls::SecretKey) -> Result<Vec<Coin>> {
     let ph = crate::chia_publish::our_puzzle_hash(sk);
-    Ok(unspent_at(client, ph).await?.into_iter().map(|c| c.coin).collect())
+    Ok(unspent_at(client, ph)
+        .await?
+        .coins
+        .into_iter()
+        .map(|c| c.coin)
+        .filter(|c| !crate::chia_publish::WALLET_LEASE.is_pending(&c.coin_id()))
+        .collect())
+}
+
+/// Which of our coins pay a gift of `amount`: largest first until they cover it,
+/// so a wallet split over several small coins can still give what the screen
+/// enabled from its total (#245 review). `None` when the wallet cannot cover it;
+/// otherwise the coins and the change.
+pub fn pick_give_coins(mut coins: Vec<Coin>, amount: u64) -> Option<(Vec<Coin>, u64)> {
+    coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
+    let mut chosen = Vec::new();
+    let mut sum: u64 = 0;
+    for coin in coins {
+        sum = sum.saturating_add(coin.amount);
+        chosen.push(coin);
+        if sum >= amount {
+            return Some((chosen, sum - amount));
+        }
+    }
+    None
 }
 
 /// CLAIM: spend the readiest faucet coin, GIFT to our own address, keyless.
@@ -357,10 +458,11 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
         .await
         .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
     let faucet_ph = params.puzzle_hash();
-    let coins = unspent_at(client, faucet_ph).await?;
+    let coins = unspent_at(client, faucet_ph).await?.coins;
     let Some(target) = coins
         .iter()
         .filter(|c| c.ready(params, peak))
+        .filter(|c| !crate::chia_publish::WALLET_LEASE.is_pending(&c.coin.coin_id()))
         .max_by_key(|c| (c.coin.amount, std::cmp::Reverse(c.confirmed_height)))
     else {
         return Err(anyhow!("no mojo in the dish right now; it refills on the block clock"));
@@ -381,6 +483,8 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
     // Keyless: no AGG_SIG condition anywhere, so the aggregate is the identity.
     let bundle = SpendBundle::new(vec![coin_spend], chia_bls::Signature::default());
     push(client, bundle).await?;
+    // Not our coin, but a second TAKE before this one confirms must not pick it.
+    crate::chia_publish::WALLET_LEASE.mark_spent([target.coin.coin_id()]);
     println!(
         "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
         params.gift,
@@ -401,7 +505,8 @@ async fn claim(_ctx: &FaucetContext<'_>, _client: &CoinsetClient, _params: &Fauc
     Err(anyhow!("this node was built without publishing; it cannot take a mojo"))
 }
 
-/// GIVE: pay `amount` mojos from our largest coin into the faucet address.
+/// GIVE: pay `amount` mojos from our wallet into the faucet address, from as
+/// many of our coins (largest first) as it takes, under the wallet spend lease.
 #[cfg(feature = "chia-publish")]
 async fn give(
     ctx: &FaucetContext<'_>,
@@ -420,41 +525,49 @@ async fn give(
     if amount < params.gift {
         return Err(anyhow!("a gift below {} mojo(s) could never leave the jar", params.gift));
     }
-    let mut mine = wallet_unspent(client, sk).await?;
-    mine.sort_by_key(|c| std::cmp::Reverse(c.amount));
-    let Some(coin) = mine.into_iter().next() else {
+    // Select, build and push under the lease: the heartbeat (or a second GIVE)
+    // must not pick the same coins before this spend confirms.
+    let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
+    let mine = wallet_unspent(client, sk).await?;
+    if mine.is_empty() {
         return Err(anyhow!("your wallet is empty; fund it first (the dish takes, it does not lend)"));
-    };
-    if coin.amount < amount {
-        return Err(anyhow!(
-            "your largest coin holds {} mojos; give at most that in one go",
-            coin.amount
-        ));
     }
+    let total: u64 = mine.iter().map(|c| c.amount).sum();
+    let Some((coins, change)) = pick_give_coins(mine, amount) else {
+        return Err(anyhow!("your wallet holds {total} mojos; give at most that in one go"));
+    };
     let our_ph = crate::chia_publish::our_puzzle_hash(sk);
     let faucet_ph = params.puzzle_hash();
-    let change = coin.amount - amount; // fee 0, like every lane spend
     let mut ctx_spend = SpendContext::new();
-    let mut conditions = Conditions::new().create_coin(faucet_ph, amount, Memos::None);
-    if change > 0 {
-        conditions = conditions.create_coin(our_ph, change, Memos::None);
+    let layer = StandardLayer::new(sk.public_key().derive_synthetic());
+    for (i, coin) in coins.iter().enumerate() {
+        // The first coin carries the outputs (gift + change, fee 0 like every
+        // lane spend); the others are consumed into it.
+        let mut conditions = Conditions::new();
+        if i == 0 {
+            conditions = conditions.create_coin(faucet_ph, amount, Memos::None);
+            if change > 0 {
+                conditions = conditions.create_coin(our_ph, change, Memos::None);
+            }
+        }
+        layer
+            .spend(&mut ctx_spend, *coin, conditions)
+            .map_err(|e| anyhow!("standard-layer spend: {e:?}"))?;
     }
-    StandardLayer::new(sk.public_key().derive_synthetic())
-        .spend(&mut ctx_spend, coin, conditions)
-        .map_err(|e| anyhow!("standard-layer spend: {e:?}"))?;
     let bundle = crate::chia_publish::sign_standard_spends(sk, ctx_spend.take())?;
     push(client, bundle).await?;
+    crate::chia_publish::WALLET_LEASE.mark_spent(coins.iter().map(|c| c.coin_id()));
     println!(
-        "⛓️🥣 faucet: gave {amount} mojo(s) into {} (coin {})",
+        "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",
         params.address(),
-        hex::encode(coin.coin_id())
+        coins.len()
     );
     Ok(FaucetReply {
         op: "give".into(),
         ok: true,
         error: None,
         status: None,
-        spent_coin: Some(hex::encode(coin.coin_id())),
+        spent_coin: Some(hex::encode(coins[0].coin_id())),
     })
 }
 
@@ -557,8 +670,14 @@ mod tests {
     use clvm_traits::FromClvm;
     use clvm_utils::tree_hash;
 
+    /// The lobby's v1 parameters on a fixed room tag.
     fn test_params() -> FaucetParams {
-        FaucetParams { room_tag: Bytes32::new([7u8; 32]), gift: 1, gap: 32, max_fee: 50_000_000 }
+        FaucetParams { room_tag: Bytes32::new([7u8; 32]), gift: GIFT_MOJOS, gap: GAP_BLOCKS, max_fee: MAX_FEE_MOJOS }
+    }
+
+    /// A private-room dish that allows a fee, to exercise the fee arithmetic.
+    fn fee_params() -> FaucetParams {
+        FaucetParams { max_fee: 50_000_000, ..test_params() }
     }
 
     /// Run the curried puzzle on a solution and return its conditions.
@@ -604,9 +723,14 @@ mod tests {
         let params = test_params();
         assert_eq!(
             hex::encode(params.puzzle_hash()),
+            "ffd3a25bdaf219476e17d08cac6f3e223d685e9d0527e253d0da4d79d44c7249"
+        );
+        assert_eq!(params.address(), "txch1llf6yk767gv5wmsh6zx2cme7yg7ksh5aq5n7y57smfxhn4zvwfyscfgx6a");
+        // The fee cap is curried too: a dish that allows one is another address.
+        assert_eq!(
+            hex::encode(fee_params().puzzle_hash()),
             "d7beae5412414d3ba9acd402455efefb92f939011185b73796927b99b9cdc49b"
         );
-        assert_eq!(params.address(), "txch167l2u4qjg9xnh2dv6spy2hh7lwf0jwgpzxzmwdukjfaenwwdcjds6rwx2x");
         // The reveal we would put in a spend hashes to the same puzzle hash.
         let mut a = Allocator::new();
         let reveal = params.puzzle_reveal(&mut a).unwrap();
@@ -643,9 +767,11 @@ mod tests {
                 format!("create_coin {} 1", hex::encode(recipient)),
             ]
         );
-        // A fee comes out of the remainder, never out of the gift.
-        let conds = run(&params, clvm_list!(ph, 1000u64, recipient, 7u64)).unwrap();
-        assert_eq!(conds[0], format!("create_coin {} 992", hex::encode(ph)));
+        // Where a dish allows a fee, it comes out of the remainder, never the gift.
+        let fee = fee_params();
+        let fph = fee.puzzle_hash();
+        let conds = run(&fee, clvm_list!(fph, 1000u64, recipient, 7u64)).unwrap();
+        assert_eq!(conds[0], format!("create_coin {} 992", hex::encode(fph)));
         assert_eq!(conds[4], format!("create_coin {} 1", hex::encode(recipient)));
         // The last mojo leaves no remainder coin behind.
         let conds = run(&params, clvm_list!(ph, 1u64, recipient, 0u64)).unwrap();
@@ -658,7 +784,15 @@ mod tests {
         let params = test_params();
         let ph = params.puzzle_hash();
         let recipient = Bytes32::new([9u8; 32]);
-        assert!(run(&params, clvm_list!(ph, 1000u64, recipient, 50_000_001u64)).is_err(), "fee over cap");
+        // The lobby allows NO fee: a keyless claimer could otherwise burn the cap
+        // from every ready coin every window (#245 review).
+        assert!(run(&params, clvm_list!(ph, 1000u64, recipient, 1u64)).is_err(), "lobby: any fee at all");
+        assert!(run(&params, clvm_list!(ph, 1000u64, recipient, 0u64)).is_ok());
+        let fee = fee_params();
+        let fph = fee.puzzle_hash();
+        assert!(run(&fee, clvm_list!(fph, 1000u64, recipient, 50_000_001u64)).is_err(), "fee over cap");
+        assert!(run(&fee, clvm_list!(fph, 60_000_000u64, recipient, 50_000_000u64)).is_ok(), "fee at cap");
+        assert!(run(&fee, clvm_list!(fph, 1000u64, recipient, 50_000_000u64)).is_err(), "fee larger than the coin");
         assert!(run(&params, clvm_list!(ph, 1000u64, recipient, -1i64)).is_err(), "negative fee");
         assert!(run(&params, clvm_list!(ph, 0u64, recipient, 0u64)).is_err(), "nothing to give");
         let short = chia_protocol::Bytes::new(vec![9u8; 31]);
@@ -680,19 +814,54 @@ mod tests {
             confirmed_height: confirmed,
         };
         let coins = vec![coin(1000, 100), coin(5, 130), coin(0, 50)];
-        let st = summarize(&params, 140, &coins);
+        let st = summarize(&params, 140, &coins, false);
         assert_eq!((st.coins, st.ready, st.total_mojos), (2, 1, 1005));
         assert_eq!(st.next_ready_in_blocks, Some(22));
         assert_eq!(st.address, params.address());
-        assert!(!st.can_claim && !st.can_give && st.wallet_mojos.is_none());
+        assert!(!st.can_claim && !st.can_give && st.wallet_mojos.is_none() && !st.partial);
         // Everyone ready: no "next".
-        let st = summarize(&params, 200, &coins);
-        assert_eq!((st.ready, st.next_ready_in_blocks), (2, None));
+        let st = summarize(&params, 200, &coins, true);
+        assert_eq!((st.ready, st.next_ready_in_blocks, st.partial), (2, None, true));
         // Empty jar.
-        let st = summarize(&params, 200, &[]);
+        let st = summarize(&params, 200, &[], false);
         assert_eq!((st.coins, st.ready, st.total_mojos), (0, 0, 0));
         let json = serde_json::to_string(&st).unwrap();
         assert!(json.contains("\"nextReadyInBlocks\":null") && json.contains("\"canClaim\":false"));
+        assert!(json.contains("\"partial\":false"));
+    }
+
+    #[test]
+    fn mojo_totals_travel_as_decimal_strings() {
+        // Exact past 2^53 — a JSON number would round in the browser.
+        let mut st = summarize(&test_params(), 1, &[], false);
+        st.total_mojos = u64::MAX;
+        st.wallet_mojos = Some(9_007_199_254_740_993);
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(json.contains("\"totalMojos\":\"18446744073709551615\""), "{json}");
+        assert!(json.contains("\"walletMojos\":\"9007199254740993\""), "{json}");
+        let back: FaucetStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, st);
+        st.wallet_mojos = None;
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(json.contains("\"walletMojos\":null"), "{json}");
+        assert_eq!(serde_json::from_str::<FaucetStatus>(&json).unwrap(), st);
+    }
+
+    #[test]
+    fn give_takes_the_fewest_largest_coins_that_cover_the_gift() {
+        let ph = Bytes32::new([5u8; 32]);
+        let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), ph, amount);
+        // Two 600-mojo coins cover a 1,000-mojo gift together (the screen enables
+        // the button from the 1,200 total), with 200 change.
+        let (chosen, change) = pick_give_coins(vec![coin(1, 600), coin(2, 600)], 1000).unwrap();
+        assert_eq!((chosen.len(), change), (2, 200));
+        // Largest first, and no more coins than needed.
+        let (chosen, change) = pick_give_coins(vec![coin(1, 10), coin(2, 5000), coin(3, 700)], 1000).unwrap();
+        assert_eq!((chosen.len(), chosen[0].amount, change), (1, 5000, 4000));
+        // An exact cover leaves no change; an uncoverable gift is refused.
+        assert_eq!(pick_give_coins(vec![coin(1, 400), coin(2, 600)], 1000).unwrap().1, 0);
+        assert!(pick_give_coins(vec![coin(1, 400), coin(2, 500)], 1000).is_none());
+        assert!(pick_give_coins(vec![], 1).is_none());
     }
 
     #[test]

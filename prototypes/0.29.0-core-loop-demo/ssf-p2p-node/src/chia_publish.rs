@@ -47,7 +47,69 @@ pub fn our_puzzle_hash(chia_sk: &SecretKey) -> Bytes32 {
     StandardArgs::curry_tree_hash(synthetic_pk).into()
 }
 
-/// Find our largest UNSPENT coin — the one to spend-to-self. `None` if unfunded.
+/// How long a coin we pushed a spend for stays off-limits to the next spend.
+/// Testnet11 confirms in about a block (18.75 s); three minutes covers a slow
+/// block without parking a coin for long should the mempool drop the spend.
+pub const PENDING_SPEND_TTL: Duration = Duration::from_secs(180);
+
+/// 🔒 Wallet spend lease (#245 review). Every spend from OUR wallet — the
+/// presence heartbeat, the startup hooks, the faucet dish's GIVE — selects its
+/// coins, builds and pushes while holding `gate`, and records the coin ids it
+/// consumed in `pending` for [`PENDING_SPEND_TTL`]. Until a pushed spend
+/// confirms, the chain still lists its coins as unspent, so a second spend
+/// started in that window would pick the same coin and die in the mempool as a
+/// double-spend; with the lease it skips them. (The heartbeat's one-publish-per-
+/// tick rule serialized its own publishes; this covers every writer.)
+pub struct WalletLease {
+    gate: tokio::sync::Mutex<()>,
+    pending: std::sync::Mutex<HashMap<Bytes32, Instant>>,
+}
+
+/// The process-wide lease: one wallet per node, so one lease.
+pub static WALLET_LEASE: std::sync::LazyLock<WalletLease> = std::sync::LazyLock::new(WalletLease::new);
+
+impl WalletLease {
+    pub fn new() -> Self {
+        Self { gate: tokio::sync::Mutex::new(()), pending: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    /// Hold the guard across select → build → push.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+
+    /// Record the coins a just-pushed spend consumed.
+    pub fn mark_spent(&self, coin_ids: impl IntoIterator<Item = Bytes32>) {
+        self.mark_spent_at(coin_ids, Instant::now());
+    }
+
+    pub fn mark_spent_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) {
+        let mut pending = self.pending.lock().unwrap();
+        for id in coin_ids {
+            pending.insert(id, now);
+        }
+    }
+
+    /// A coin some spend was pushed for inside the TTL: skip it when selecting.
+    pub fn is_pending(&self, coin_id: &Bytes32) -> bool {
+        self.is_pending_at(coin_id, Instant::now())
+    }
+
+    pub fn is_pending_at(&self, coin_id: &Bytes32, now: Instant) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|_, at| now.duration_since(*at) < PENDING_SPEND_TTL);
+        pending.contains_key(coin_id)
+    }
+}
+
+impl Default for WalletLease {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Find our largest UNSPENT coin — the one to spend-to-self — skipping coins a
+/// spend is already pending for (see [`WalletLease`]). `None` if unfunded.
 pub async fn find_spendable_coin(
     client: &CoinsetClient,
     puzzle_hash: Bytes32,
@@ -65,6 +127,7 @@ pub async fn find_spendable_coin(
         .into_iter()
         .filter(|r| !r.spent)
         .map(|r| r.coin)
+        .filter(|c| !WALLET_LEASE.is_pending(&c.coin_id()))
         .collect();
     // Largest first — the recreated coin keeps the most value for future republishes.
     coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
@@ -301,7 +364,9 @@ pub async fn publish_presence(
     let hint = Bytes32::new(chia_lane::derive_hint(room_key, chia_lane::epoch_now(now)));
     let ciphertext = Bytes::new(sealed);
 
-    // 2. Find our fundable coin (pays for the spend).
+    // 2. Find our fundable coin (pays for the spend) — under the wallet lease,
+    //    so no other writer picks the same coin before this spend confirms.
+    let _lease = WALLET_LEASE.lock().await;
     let client = CoinsetClient::testnet11();
     let our_ph = our_puzzle_hash(chia_sk);
     let coin = find_spendable_coin(&client, our_ph)
@@ -317,6 +382,7 @@ pub async fn publish_presence(
     if !resp.success {
         return Err(anyhow!("push_tx rejected: {:?}", resp.error));
     }
+    WALLET_LEASE.mark_spent([coin.coin_id()]);
     Ok(hint)
 }
 
@@ -326,6 +392,20 @@ mod tests {
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
         ChiaRoomCap { room_key: [key; 32], chia_mode, public_room, seq: 0 }
+    }
+
+    #[test]
+    fn wallet_lease_parks_spent_coins_for_the_ttl() {
+        let lease = WalletLease::new();
+        let a = Bytes32::new([1u8; 32]);
+        let b = Bytes32::new([2u8; 32]);
+        let t0 = Instant::now();
+        assert!(!lease.is_pending_at(&a, t0));
+        lease.mark_spent_at([a], t0);
+        assert!(lease.is_pending_at(&a, t0 + Duration::from_secs(1)));
+        assert!(!lease.is_pending_at(&b, t0 + Duration::from_secs(1)));
+        // Confirmed long ago (or dropped by the mempool): the coin is fair game again.
+        assert!(!lease.is_pending_at(&a, t0 + PENDING_SPEND_TTL));
     }
 
     #[test]

@@ -260,7 +260,9 @@ export class NetworkProvider implements NetworkProviderPort {
       const stream = await this.#wt.createBidirectionalStream();
       const writer = stream.writable.getWriter();
       await writer.write(packet);
-      writer.releaseLock();
+      // close() sends FIN: the node's reader sees EOF and ends its stream task.
+      // Only releasing the lock left every cap stream open until disconnect.
+      await writer.close();
     } catch (e) {
       console.warn('Failed to send room cap to node:', e);
     }
@@ -317,7 +319,10 @@ export class NetworkProvider implements NetworkProviderPort {
       const stream = await this.#wt.createBidirectionalStream();
       const writer = stream.writable.getWriter();
       await writer.write(packet);
-      writer.releaseLock();
+      // One request per stream: close() sends FIN, so after its reply the node
+      // finishes its side too and this stream ends instead of living (and
+      // holding a node task) until disconnect — one leak per status poll.
+      await writer.close();
       // The reply comes back on THIS stream: drain it like a node-opened one.
       void this.#drainNodeStream(stream);
     } catch (e) {

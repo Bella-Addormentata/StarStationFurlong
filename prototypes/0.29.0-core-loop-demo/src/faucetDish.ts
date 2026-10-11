@@ -22,8 +22,9 @@ export interface FaucetStatus {
   gap: number;
   /** Chain peak the status was read at. */
   peak: number;
-  /** Mojos in claimable coins. */
-  totalMojos: number;
+  /** Mojos in claimable coins. A bigint: the node sends mojo totals as decimal
+   *  strings because a JSON number is exact only below 2^53 (~9,007 XCH). */
+  totalMojos: bigint;
   /** Claimable coins = gift slots per GAP. */
   coins: number;
   /** Coins past their GAP right now: mojos sitting in the dish. */
@@ -34,7 +35,10 @@ export interface FaucetStatus {
   canClaim: boolean;
   canGive: boolean;
   /** Our wallet's unspent mojos when the node has a wallet loaded. */
-  walletMojos: number | null;
+  walletMojos: bigint | null;
+  /** The node's coin listing was cut short (a flood of outputs): coins, ready
+   *  and totalMojos cover the pages it read; the jar holds more. */
+  partial: boolean;
   /** Why take/give are off, in the node's words. */
   note: string;
 }
@@ -59,32 +63,44 @@ export const PENDING_TIMEOUT_MS = 120_000;
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
+/** A mojo total off the wire: a decimal string (the node's form), or a safe
+ *  non-negative integer number (older nodes). Anything else is refused. */
+export function asMojos(v: unknown): bigint | null {
+  if (typeof v === 'bigint') return v >= 0n ? v : null;
+  if (typeof v === 'string') return /^\d{1,30}$/.test(v) ? BigInt(v) : null;
+  if (isNum(v) && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
+  return null;
+}
+
 /** Shape-guard a parsed status object from the node (a hostile or stale node
  *  must not crash the dish). Returns null when any required field is off. */
 export function asFaucetStatus(raw: unknown): FaucetStatus | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.address !== 'string' || typeof r.puzzleHash !== 'string') return null;
-  for (const k of ['gift', 'gap', 'peak', 'totalMojos', 'coins', 'ready'] as const) {
+  for (const k of ['gift', 'gap', 'peak', 'coins', 'ready'] as const) {
     if (!isNum(r[k]) || (r[k] as number) < 0) return null;
   }
+  const total = asMojos(r.totalMojos);
+  if (total === null) return null;
   const next = r.nextReadyInBlocks;
   if (!(next === null || next === undefined || isNum(next))) return null;
-  const wallet = r.walletMojos;
-  if (!(wallet === null || wallet === undefined || isNum(wallet))) return null;
+  const wallet = r.walletMojos === null || r.walletMojos === undefined ? null : asMojos(r.walletMojos);
+  if (r.walletMojos !== null && r.walletMojos !== undefined && wallet === null) return null;
   return {
     address: r.address,
     puzzleHash: r.puzzleHash,
     gift: r.gift as number,
     gap: r.gap as number,
     peak: r.peak as number,
-    totalMojos: r.totalMojos as number,
+    totalMojos: total,
     coins: r.coins as number,
     ready: r.ready as number,
     nextReadyInBlocks: isNum(next) ? next : null,
     canClaim: r.canClaim === true,
     canGive: r.canGive === true,
-    walletMojos: isNum(wallet) ? wallet : null,
+    walletMojos: wallet,
+    partial: r.partial === true,
     note: typeof r.note === 'string' ? r.note : '',
   };
 }
@@ -123,14 +139,18 @@ export function blocksToMinutes(blocks: number): number {
   return Math.max(1, Math.round((blocks * SECONDS_PER_BLOCK) / 60));
 }
 
-/** Mojos for the focused screen: thousands grouped; TXCH alongside from 1e9. */
-export function formatMojos(mojos: number): string {
-  const n = Math.max(0, Math.floor(mojos));
-  const grouped = n.toLocaleString('en-US');
-  const unit = n === 1 ? 'mojo' : 'mojos';
-  if (n >= 1_000_000_000) {
-    const txch = n / 1e12;
-    const shown = txch >= 1 ? txch.toFixed(3) : txch.toFixed(6).replace(/0+$/, '').replace(/\.$/, '.0');
+const MOJOS_PER_TXCH = 1_000_000_000_000n;
+
+/** Mojos for the focused screen: thousands grouped; TXCH alongside from 1e9.
+ *  Exact at any size (digit strings, no floating point). */
+export function formatMojos(mojos: bigint | number): string {
+  const n = typeof mojos === 'bigint' ? (mojos < 0n ? 0n : mojos) : BigInt(Math.max(0, Math.floor(mojos)));
+  const grouped = n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const unit = n === 1n ? 'mojo' : 'mojos';
+  if (n >= 1_000_000_000n) {
+    const whole = n / MOJOS_PER_TXCH;
+    const frac = (n % MOJOS_PER_TXCH).toString().padStart(12, '0');
+    const shown = whole >= 1n ? `${whole}.${frac.slice(0, 3)}` : `0.${frac.slice(0, 6).replace(/0+$/, '') || '0'}`;
     return `${grouped} ${unit} (${shown} TXCH)`;
   }
   return `${grouped} ${unit}`;
@@ -207,7 +227,7 @@ export function setFaucetReply(roomId: string, reply: FaucetReply): void {
     const p = pending.get(roomId);
     if (p && prev) {
       const landed =
-        (p.op === 'claim' && (reply.status.walletMojos ?? 0) > 0) ||
+        (p.op === 'claim' && (reply.status.walletMojos ?? 0n) > 0n) ||
         (p.op === 'give' && reply.status.walletMojos !== null && prev.walletMojos !== null
           && reply.status.walletMojos < prev.walletMojos);
       if (landed) pending.delete(roomId);

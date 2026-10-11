@@ -5,8 +5,11 @@
 ;   * hands exactly GIFT mojos to the address the spender names,
 ;   * returns everything else to this same puzzle hash, so the coin stays a
 ;     faucet (or returns nothing when the gift empties it — no dust is left),
-;   * burns at most MAX_FEE mojos as the transaction fee (the faucet pays the
-;     fee, so a claimer with zero coins can claim alone),
+;   * burns at most MAX_FEE mojos as the transaction fee — and the claimer, who
+;     is anyone, picks the fee, so a nonzero cap is a per-window burn allowance
+;     for a griefer. The lobby curries MAX_FEE = 0: a claim pays no fee at all
+;     (it waits for an uncongested mempool), and a claimer with zero coins
+;     still claims alone because the faucet coin is the spend's only input,
 ;   * and is valid only GAP blocks after the coin was created
 ;     (ASSERT_HEIGHT_RELATIVE): one gift per coin per GAP — the rate limit the
 ;     chain enforces with nobody online.
@@ -16,7 +19,8 @@
 ;             it makes each room's faucet its own address.
 ;   GIFT      mojos per claim.
 ;   GAP       blocks between claims of one coin.
-;   MAX_FEE   mojos a claim may burn as fee.
+;   MAX_FEE   mojos a claim may burn as fee (0 for the lobby; a private room's
+;             dish may curry a small cap at its own risk, see above).
 ; Solution (the claimer's):
 ;   my_puzzle_hash  this coin's puzzle hash (asserted, so it can be recreated)
 ;   my_amount       this coin's amount (asserted)

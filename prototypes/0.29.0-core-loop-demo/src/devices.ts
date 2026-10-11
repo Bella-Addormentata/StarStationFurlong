@@ -4685,7 +4685,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       </div>`;
     const wallet = st?.walletMojos ?? null;
     const canTake = !!st?.canClaim && pending === null;
-    const canGive = (mojos: number): boolean => !!st?.canGive && wallet !== null && wallet >= mojos && pending === null;
+    const canGive = (mojos: number): boolean => !!st?.canGive && wallet !== null && wallet >= BigInt(mojos) && pending === null;
     const pendingLine = pending === 'claim'
       ? 'TAKING… the mojo lands when the next block confirms it (about a minute)'
       : pending === 'give'
@@ -4705,7 +4705,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
           <div style="height:100%; width:${Math.round(level * 100)}%; background:${CH_GOLD};"></div>
         </div>
         ${st ? row('IN THE JAR', formatMojos(st.totalMojos)) : ''}
-        ${st ? row('GIFT SLOTS (COINS)', String(st.coins)) : ''}
+        ${st ? row('GIFT SLOTS (COINS)', st.partial ? `${st.coins}+ (listing cut short; the jar holds more)` : String(st.coins)) : ''}
         ${st ? row('EACH GIFT', `${formatMojos(st.gift)} · one per coin every ${st.gap} blocks`) : ''}
         ${st ? row('CHAIN HEIGHT', String(st.peak)) : row('CHAIN', 'reading…')}
       </div>
@@ -4713,7 +4713,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE DISH</div>
         <div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>
         <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
-          ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless; the jar pays the fee.'}
+          ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
           ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}.` : ''}
         </div>
       </div>

@@ -1695,6 +1695,10 @@ async fn handle_wt_connection_inner(
                                 };
                                 let mut s = send.lock().await;
                                 let _ = write_faucet_reply(&mut *s, &envelope.room, &reply).await;
+                                // One request per stream: FIN our side after the reply so the
+                                // browser's reader ends cleanly; its own FIN ends this loop at the
+                                // next read (it closes its writer after the single frame).
+                                let _ = s.finish().await;
                             }
                             continue;
                         }
