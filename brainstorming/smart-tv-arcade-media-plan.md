@@ -612,18 +612,28 @@ hints. A signed `roster`, `px` or `mesh-join` payload carries
 each as a graft candidate WITH those hints, and the mesh loop's GRAFT
 dials the candidate with them as given (`dial_peer_with_retry`), so an
 admitted member's claim about another member's address — or about its
-own — aims a handshake wherever it likes, automatically. And the empty
+own — aims a handshake wherever it likes, automatically. And the node's
+BOOTSTRAP dial is a third: the browser copies the room's boot record —
+the primary member's and the whole roster's relay URLs and direct
+addresses, room-written — into every envelope it sends its node
+(`src/network/YjsSync.ts`, `iroh_relay_urls`, `iroh_direct_addrs`,
+`iroh_member_hints`), and the node's WT reader dials each hinted member
+with them as given, before it checks the envelope at all (its M4 dials);
+the envelope's signature, where it is checked, is the local page's own
+and vouches for no address. And the empty
 hints close the RELAYED hint and not the reflection: with empty hints
 iroh resolves the id through the Mainline DHT, where the id's OWNER
 publishes its own signed address record (the node's `DhtAddressLookup`,
 `AddrFilter::unfiltered`), so a member that signs a room envelope under
 an id it owns, having published a victim's address under that id, still
 has every node that hears the envelope send its QUIC handshake there —
-automatically, on the envelope alone, before any consent. Both dials are
-therefore a PREREQUISITE of this section, not a given: an AUTOMATIC dial
-carries no peer-supplied hint at all — a candidate learned from a
-roster, px or mesh-join is dialled by id, the payload's addresses
-discarded (a member's self-reported address is a claim like any other:
+automatically, on the envelope alone, before any consent. All three dials
+are therefore a PREREQUISITE of this section, not a given: an AUTOMATIC
+dial carries no peer-supplied hint at all — a candidate learned from a
+roster, px or mesh-join, or a member the browser's bootstrap envelope
+hints, is dialled by id, the payload's addresses discarded, the
+envelope's two hint fields reduced to ids and those ids admitted and
+budgeted before any dial (a member's self-reported address is a claim like any other:
 the signature proves it is theirs, not that they answer there), a hinted
 dial kept for what the viewer asked for, under the budget below — and
 the mesh-upgrade dial of a gossip-learned id goes to a route observed on
@@ -693,11 +703,21 @@ plane (a sibling of the `media-sub` kind) — an announce that is evidence
 only on the announcer's own authenticated connection, accepted from the
 link whose iroh handshake proved its node id, never relayed as someone
 else's word, and dialled, again, by that id. The hints in the room's
-member records are the bootstrap roster's and nothing more (`YjsSync`
-carries them outside the signed envelope, `src/network/YjsSync.ts`); the
-blob lane dials from none of them, and the mesh's graft dial, which today
-still dials a roster, px or mesh-join candidate from the hints it came
-with, is the prerequisite above. A library seeder's signed entry (§7)
+member records are the bootstrap roster's: `YjsSync` copies the primary
+member's and the whole roster's `irohRelayUrls` and `irohDirectAddrs`
+from the room's boot record — room-written — into every envelope it
+sends its node, outside the signed part (`src/network/YjsSync.ts`), and
+the node bootstrap-dials each hinted member with those addresses as
+given, before it checks the envelope at all (`ssf-p2p-node/src/main.rs`,
+the WT reader's M4 dials) — a signature there proving only that the
+local page sent it, never that the addresses are the members' own, so a
+member who writes a victim's address into the roster has every member's
+node send it a handshake. The blob lane dials from none of them; that
+bootstrap dial, with the mesh's graft dial, which today still dials a
+roster, px or mesh-join candidate from the hints it came with, are the
+prerequisite above — the envelope's two hint fields reduced to ids,
+admitted and budgeted before any dial, their addresses discarded, as the
+gossip candidates' are. A library seeder's signed entry (§7)
 names its node id, dialled the same way. So the fall-back to a seeder
 nobody is connected to is a dial by id through discovery — never to an
 address a stranger supplied — and holding is proven by serving bytes the
@@ -1947,10 +1967,25 @@ within 1 280 × 720, transferred no faster than the lane's rate with ONE
 in flight — a bitmap arriving early, or behind one not yet drawn, is
 closed unused — and nothing queued anywhere: a message is handled or
 dropped as it arrives. What remains is the structured clone the browser
-performs BEFORE any handler runs, so one oversized message costs the
-page its clone once — the memory and the stalled event loop of that one
-message — after which the frame is gone: the residual availability cost,
-stated as one. #208 carries the shape, the budget and both teardowns for
+performs BEFORE any handler runs — and performs for EVERY message the
+frame posts before the page's event loop turns again: a frame that
+posts without yielding queues as many clones as it likes, each
+serialized and queued before the page can read the first, count it or
+tear the frame down, so the budget and the teardowns bound what the
+page HANDLES and nothing of what it is made to hold. The residual,
+stated as it is: same-tab availability is NOT protected against an
+exploited frame — the cabinet's tab, the player's own, can be stalled
+or crashed by a core exploit, and the one who chose the game is the one
+who pays. What holds it down: the frame in a process of its own where
+the browser isolates sandboxed frames (the serialized bytes then live
+in the frame's process until delivery, and a runaway sender exhausts
+its own process first), and the teardown at the first message handled,
+after which nothing more is delivered. A design that would bound it — a
+pre-allocated `SharedArrayBuffer` ring the frame writes into under
+credits, no clone at all, which needs the whole page cross-origin
+isolated (COOP and COEP, every subresource CORS- or CORP-clean) — is the
+follow-up if that residual proves to matter; the picture lane's
+transferred bitmaps sit under the same residual. #208 carries the shape, the budget and both teardowns for
 the status messages (`arcadeEmulator.ts`: `frameMessage`, `MessageBudget`,
 `malformed` and `flood`; `arcadeStage.ts` the backoff); the picture and
 save-state caps come with the lanes that carry them. The frame still runs under a
