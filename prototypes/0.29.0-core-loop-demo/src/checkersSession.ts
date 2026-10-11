@@ -161,7 +161,8 @@ export function createCheckersTableLayer(deps: CheckersTableDeps): CheckersTable
       };">${statusLine(s, myId)}</div>
       <div style="font-size:9px; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:4px;">
         ${s ? `RED — ${seatName(s, 'red')} · BLACK — ${seatName(s, 'black')} · ` : ''}⚙ ON THE TABLE FOR OPTIONS · ESC TO STEP BACK
-      </div>`;
+      </div>
+      <div style="margin-top:6px;">${button('options', settingsOpen ? '✕ CLOSE OPTIONS' : '⚙ OPTIONS', true, 'Table options (same as the ⚙ on the table)')}</div>`;
 
     card.style.display = settingsOpen ? 'flex' : 'none';
     if (!settingsOpen || !s) return;
@@ -190,6 +191,13 @@ export function createCheckersTableLayer(deps: CheckersTableDeps): CheckersTable
   const act = (what: string): void => {
     const s = state();
     if (what === 'close') settingsOpen = false;
+    else if (what === 'options') {
+      // Keyboard route to the ⚙ token: open the card and move focus into it.
+      settingsOpen = !settingsOpen;
+      render();
+      if (settingsOpen) card?.querySelector<HTMLButtonElement>('button:not([disabled])')?.focus();
+      return;
+    }
     else if (what === 'bot' || what === 'forfeit') {
       // Both hand the game back to the board, so the card gets out of the way.
       const next = !s ? null : what === 'bot' ? startBot(s, myId) : forfeit(s, myId);
@@ -283,7 +291,11 @@ export function createCheckersTableLayer(deps: CheckersTableDeps): CheckersTable
       strip = document.createElement('div');
       strip.id = 'checkers3d-status';
       strip.style.cssText = `${shell} top:16px; padding:10px 18px; text-align:center; max-width:calc(100vw - 32px);`;
-      strip.addEventListener('click', (e) => e.stopPropagation());
+      strip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const b = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-act]');
+        if (b && !b.disabled) act(b.dataset.act ?? '');
+      });
       card = document.createElement('div');
       card.id = 'checkers3d-options';
       card.style.cssText = `${shell} bottom:24px; width:min(360px, calc(100vw - 32px)); padding:14px; flex-direction:column; gap:12px; display:none;`;
