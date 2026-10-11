@@ -54,9 +54,15 @@ pub const CURSOR_OVERLAP_BLOCKS: u32 = 32;
 /// Signed `issued_at` further ahead than this is refused (publisher clock skew
 /// bound; a day, matching the daily epoch rotation).
 pub const MAX_FUTURE_SKEW_SECS: u64 = 86_400;
-/// Coin ids remembered per cursor before the set is cleared (the height
-/// window then does the de-duplication alone for one poll).
-const SEEN_CAP: usize = 512;
+/// Flood bound on the per-hint set of examined coin ids. The set is NEVER
+/// cleared mid-cycle (clearing made the reader revisit the newest coins and
+/// starve everything past the first few hundred, since `last_height` cannot
+/// move while coins stay unexamined); it empties only when a listing ends fully
+/// examined and the height advances. At this many coins under ONE hint-epoch
+/// the hint is a flood by a key holder: the reader stops examining it for the
+/// cycle and says so, rather than forgetting what it has read. 16k ids are
+/// 512 KB; a real room writes tens of records a day.
+const SEEN_CAP: usize = 16_384;
 
 /// A verified record plus where it sat on chain.
 #[derive(Clone, Debug, PartialEq)]
@@ -73,7 +79,8 @@ pub struct HintCursor {
     /// Highest confirmed height fully examined (0 = never read: full scan).
     pub last_height: u32,
     /// Coin ids already examined (decoded or rejected) — skipped on re-reads
-    /// inside the overlap window. Bounded by `SEEN_CAP`.
+    /// inside the overlap window. Emptied when a listing cycle completes;
+    /// bounded by `SEEN_CAP` as a flood stop, never cleared mid-cycle.
     pub seen: HashSet<[u8; 32]>,
     /// A listing the last poll could not finish inside `MAX_PAGES_PER_POLL`:
     /// the next poll continues it from the gateway's cursor instead of starting
@@ -140,11 +147,20 @@ impl HintCursor {
         }
     }
 
-    fn mark_seen(&mut self, coin_id: [u8; 32]) {
+    /// Remember an examined coin. Refuses (returns false) once the flood bound
+    /// is reached; it never clears the set, see [`SEEN_CAP`].
+    fn mark_seen(&mut self, coin_id: [u8; 32]) -> bool {
         if self.seen.len() >= SEEN_CAP {
-            self.seen.clear();
+            return false;
         }
         self.seen.insert(coin_id);
+        true
+    }
+
+    /// The flood bound is reached: nothing more is examined under this hint
+    /// until its listing cycle ends.
+    pub fn seen_full(&self) -> bool {
+        self.seen.len() >= SEEN_CAP
     }
 }
 
@@ -235,6 +251,16 @@ pub async fn read_hint(
             capped = true;
             break;
         }
+        if cursor.seen_full() {
+            // A flood under this hint: more distinct coins than any honest room
+            // writes in an epoch. Stop here, keep what was read, say so once.
+            eprintln!(
+                "⛓️ ChiaHub resolve: hint {} holds more than {SEEN_CAP} coins this epoch — flooded; not examining further this cycle",
+                hex::encode(&hint.to_bytes()[..8])
+            );
+            capped = true;
+            break;
+        }
         fetched += 1;
         // The memos live in the PARENT's spend (the create_coin that made this coin).
         let parent_spend =
@@ -265,7 +291,11 @@ pub async fn read_hint(
     }
     if listed {
         if examined_all && max_height > cursor.last_height {
+            // Cycle complete: everything listed from `start` is examined. The
+            // height moves up and the next cycle lists only coins above it
+            // (minus the overlap), so the examined-ids set can start afresh.
             cursor.last_height = max_height;
+            cursor.seen.clear();
         }
     } else if let Some(next) = page {
         // Page budget spent before the listing ended: park the cursor so the
@@ -449,10 +479,18 @@ mod tests {
         assert_eq!(c.start_height(), Some(0), "overlap saturates at genesis");
         c.last_height = 5_000;
         assert_eq!(c.start_height(), Some(5_000 - CURSOR_OVERLAP_BLOCKS));
-        for i in 0..(SEEN_CAP as u32 + 3) {
-            c.mark_seen([(i % 251) as u8, (i / 251) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let id = |i: u32| {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            b
+        };
+        for i in 0..(SEEN_CAP as u32) {
+            assert!(c.mark_seen(id(i)), "under the bound every id is remembered");
         }
-        assert!(c.seen.len() <= SEEN_CAP, "seen set is bounded, got {}", c.seen.len());
+        assert!(c.seen_full());
+        assert!(!c.mark_seen(id(u32::MAX)), "at the bound nothing more is remembered…");
+        assert_eq!(c.seen.len(), SEEN_CAP, "…and nothing already remembered is forgotten");
+        assert!(c.seen.contains(&id(0)), "the oldest examined coin is still known: no clearing");
     }
 
     #[test]

@@ -717,15 +717,37 @@ fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
 }
 
 /// v6 companion to [`ipv4_is_public`] (Slice 5b): rejects loopback/unspecified/
-/// multicast, link-local (fe80::/10) and ULA (fc00::/7); keeps global unicast.
+/// multicast, link-local (fe80::/10), ULA (fc00::/7) and documentation
+/// (2001:db8::/32); keeps global unicast. An IPv4 wearing IPv6 clothing is
+/// judged as THAT IPv4 — mapped `::ffff:a.b.c.d`, the deprecated compatible
+/// `::a.b.c.d`, 6to4 `2002:AABB:CCDD::` and NAT64 `64:ff9b::a.b.c.d` — so
+/// `[::ffff:192.168.1.1]` cannot smuggle a LAN address past the v4 checks and
+/// make every watcher probe somebody's network (#238 review). Teredo
+/// (2001:0::/32) is a relay tunnel, never a direct path: rejected.
 #[cfg(feature = "chia-read")]
 fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
-    !(ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (first & 0xffc0) == 0xfe80   // fe80::/10 link-local
-        || (first & 0xfe00) == 0xfc00)  // fc00::/7 unique-local
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    // Mapped and compatible forms both unwrap here (after the loopback and
+    // unspecified checks above, so `::1` and `::` never reach the v4 judge).
+    if let Some(v4) = ip.to_ipv4() {
+        return ipv4_is_public(v4);
+    }
+    let seg = ip.segments();
+    let v4_of = |hi: u16, lo: u16| std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if seg[0] == 0x2002 {
+        return ipv4_is_public(v4_of(seg[1], seg[2])); // 6to4
+    }
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+        return ipv4_is_public(v4_of(seg[6], seg[7])); // NAT64 well-known prefix
+    }
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        return false; // Teredo
+    }
+    !((seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local
+        || (seg[0] & 0xfe00) == 0xfc00  // fc00::/7 unique-local
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 documentation
 }
 
 /// Slice 5b addr-trust filter: a chia-resolved record's addrs are SELF-declared,
@@ -780,6 +802,34 @@ mod chia_addr_filter_tests {
         for bad in ["192.168", "127.0.0.1", "100.64", "169.254", "fe80", "fc00", "203.0.113"] {
             assert!(!kept.iter().any(|s| s.contains(bad)), "{bad} should be filtered out");
         }
+    }
+
+    #[test]
+    fn public_filter_judges_ipv4_hidden_in_ipv6_as_that_ipv4() {
+        // A record could carry a LAN address in IPv6 clothing to make every
+        // watcher probe somebody's network; each embedding is unwrapped and
+        // judged as the IPv4 it carries (#238 review).
+        let addrs: Vec<String> = [
+            "[::ffff:192.168.1.1]:44442",   // mapped private -> drop
+            "[::ffff:127.0.0.1]:1",         // mapped loopback -> drop
+            "[::ffff:100.64.0.9]:1",        // mapped CGNAT -> drop
+            "[::192.168.1.1]:1",            // compatible (deprecated) private -> drop
+            "[2002:c0a8:0101::1]:1",        // 6to4 of 192.168.1.1 -> drop
+            "[64:ff9b::c0a8:101]:1",        // NAT64 of 192.168.1.1 -> drop
+            "[2001:0:1234::1]:1",           // Teredo relay -> drop
+            "[2001:db8::1]:1",              // documentation -> drop
+            "[::1]:1",                      // loopback -> drop
+            "[::]:1",                       // unspecified -> drop
+            "[::ffff:8.8.8.8]:1",           // mapped PUBLIC -> keep
+            "[2002:0808:0808::1]:1",        // 6to4 of 8.8.8.8 -> keep
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let kept: Vec<String> = chia_public_dial_addrs(&addrs).iter().map(|s| s.to_string()).collect();
+        assert_eq!(kept.len(), 2, "only the two public embeddings survive, got {kept:?}");
+        assert!(kept.iter().any(|s| s.contains("8.8.8.8")), "mapped public v4 kept: {kept:?}");
+        assert!(kept.iter().any(|s| s.contains("2002:808:808")), "6to4 of a public v4 kept: {kept:?}");
     }
 
     #[test]
