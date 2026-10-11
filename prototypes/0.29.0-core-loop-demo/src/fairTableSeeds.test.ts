@@ -410,6 +410,27 @@ describe('a Fair roulette round', () => {
     expect(readChips(BOB)).toBe(before + 10);
   });
 
+  it('the plaque stays Fair when the house commit is erased after the close', () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    writeTableState(t, { ...readTableState(t)!, houseCommit: undefined });
+    expect(roundIsFair(t, 'roulette')).toBe(true);
+  });
+
+  it('joining another room right away still lets this room take a seed tick', () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    tickFairSeeds(t, 'roulette', AMY); // throttles this table for Amy, in the old room
+    bindCasinoDoc(new Y.Doc());
+    buyInChips(AMY, 100);
+    tickAutoCroupier(t);
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    tickAutoCroupier(t);
+    tickFairSeeds(t, 'roulette', AMY); // same instant, new room
+    expect(readSeedRecord(t, AMY)?.house).toBe(readTableState(t)?.houseCommit);
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);

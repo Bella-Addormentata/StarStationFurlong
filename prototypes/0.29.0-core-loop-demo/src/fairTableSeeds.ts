@@ -74,7 +74,9 @@ type TableState = CrapsTableState | RouletteTableState;
  *  owner's setting only before any round exists. */
 export function roundIsFair(tableId: string, game: TableGame): boolean {
   const s = readState(tableId, game);
-  return s ? !!s.houseCommit : isFairTable(tableId);
+  // A house commit this page froze keeps the round Fair even if the live
+  // field is erased after the close.
+  return s ? !!(s.houseCommit || frozenFields(tableId, s).houseCommit) : isFairTable(tableId);
 }
 
 /** Is this table settled by the live multiparty scheme (Fair)? The owner's
@@ -287,7 +289,7 @@ function sameCommits(a: Record<string, string>, b: Record<string, string>): bool
  * writes only on a real change, looks at most every 200 ms per table.
  */
 export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now(), force = false): void {
-  const tickKey = `${tableId}:${me}`;
+  const tickKey = `${casinoDocEpoch()}:${tableId}:${me}`;
   if (!force && now - (lastTick.get(tickKey) ?? 0) < 200) return;
   lastTick.delete(tickKey);
   lastTick.set(tickKey, now);
