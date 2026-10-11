@@ -65,10 +65,12 @@ describe('the craps felt', () => {
 
   it('prints every bet on both ends, and the propositions once in the middle', () => {
     const count = (key: string) => CRAPS_LAYOUT.regions.filter((r) => spotKey(r.bet) === key).length;
-    for (const k of ['pass:', 'dontpass:', 'come:', 'dontcome:', 'field:', 'big6:', 'big8:']) {
+    for (const k of ['pass:', 'dontpass:', 'come:', 'dontcome:', 'field:', 'big6:', 'big8:', 'passodds:', 'dontpassodds:']) {
       expect(count(k), k).toBe(2);
     }
-    for (const n of CRAPS_NUMBERS) expect(count(`place:${n}`)).toBe(2);
+    for (const n of CRAPS_NUMBERS) {
+      for (const t of ['place', 'comeodds', 'dontcomeodds']) expect(count(`${t}:${n}`)).toBe(2);
+    }
     for (const k of ['anyseven:', 'anycraps:', 'hard:4', 'hard:6', 'hard:8', 'hard:10', 'two:', 'three:', 'yo:', 'twelve:']) {
       expect(count(k), k).toBe(1);
     }
@@ -77,7 +79,38 @@ describe('the craps felt', () => {
   it('wraps the pass line around the end of the table', () => {
     expect(hitRegion(CRAPS_LAYOUT, { x: 1.33, z: 0.3 })?.id).toBe('pass@+');
     expect(hitRegion(CRAPS_LAYOUT, { x: -1.33, z: 0.3 })?.id).toBe('pass@-');
-    expect(hitRegion(CRAPS_LAYOUT, { x: 0.8, z: -0.4 })?.id).toBe('pass@+');
+    expect(hitRegion(CRAPS_LAYOUT, { x: 0.8, z: -0.36 })?.id).toBe('pass@+');
+    // The corner behind the end strip is still the line.
+    expect(hitRegion(CRAPS_LAYOUT, { x: 1.33, z: -0.4 })?.id).toBe('pass@+');
+  });
+
+  it('prints the odds behind the line, the lay odds by the don\'t pass, and odds bands in every number box', () => {
+    for (const side of [-1, 1] as const) {
+      const tag = side > 0 ? '+' : '-';
+      // Behind the pass line = between it and the −z player rail.
+      expect(hitRegion(CRAPS_LAYOUT, { x: 0.8 * side, z: -0.4 })?.id).toBe(`passodds@${tag}`);
+      const pass = CRAPS_LAYOUT.regions.find((r) => r.id === `pass@${tag}`)!;
+      const odds = CRAPS_LAYOUT.regions.find((r) => r.id === `passodds@${tag}`)!;
+      expect(odds.rects[0].z1).toBeLessThanOrEqual(pass.rects[0].z0 + 1e-9);
+      // The pass line's caption stays on its long strip.
+      expect(inRect(pass.rects[0], regionCenter(pass))).toBe(true);
+      expect(CRAPS_LAYOUT.regions.some((r) => r.id === `dontpassodds@${tag}`)).toBe(true);
+      for (const n of CRAPS_NUMBERS) {
+        const box = crapsNumberBox(n, side);
+        const at = (z: number) => hitRegion(CRAPS_LAYOUT, { x: (box.x0 + box.x1) / 2, z })?.id;
+        expect(at(box.z0 + 0.02)).toBe(`comeodds:${n}@${tag}`);
+        expect(at((box.z0 + box.z1) / 2)).toBe(`place:${n}@${tag}`);
+        expect(at(box.z1 - 0.02)).toBe(`dontcomeodds:${n}@${tag}`);
+        // Odds chips stack beside the come / don't come chips they back.
+        for (const t of ['come', 'dontcome'] as const) {
+          const flat = crapsChipRect({ type: t, pick: n }, side)!;
+          const o = crapsChipRect({ type: t === 'come' ? 'comeodds' : 'dontcomeodds', pick: n }, side)!;
+          expect(overlaps(flat, o)).toBe(false);
+          expect(o.x0 >= box.x0 && o.x1 <= box.x1 + 1e-9 && o.z0 >= box.z0 - 1e-9 && o.z1 <= box.z1 + 1e-9).toBe(true);
+        }
+      }
+    }
+    expect(crapsChipRect({ type: 'passodds' }, 1)).toEqual(CRAPS_LAYOUT.regions.find((x) => x.id === 'passodds@+')!.chipRect);
   });
 
   it('reads 4 to 10 left to right on both ends', () => {

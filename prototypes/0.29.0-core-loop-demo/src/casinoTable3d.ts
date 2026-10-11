@@ -24,7 +24,7 @@
 import * as THREE from 'three';
 import { CHIP_STYLE } from './chipDisplay';
 import {
-  CHIP_RADIUS, CRAPS_DICE_SPOT, crapsPuckSpot, CRAPS_LAYOUT, ROULETTE_LAYOUT, ROULETTE_WHEEL,
+  captionRect, CHIP_RADIUS, CRAPS_DICE_SPOT, crapsPuckSpot, CRAPS_LAYOUT, ROULETTE_LAYOUT, ROULETTE_WHEEL,
 } from './games/casinoLayout';
 import type {
   CrapsSpot, FeltLayout, FeltPoint, FeltRect, FeltRegion, RouletteSpot,
@@ -199,7 +199,7 @@ function paintRegion<B>(
   rg: FeltRegion<B>, lit: boolean, focused = false,
 ): void {
   const k = FELT_PX_PER_M;
-  for (const r of rg.rects) {
+  for (const r of rg.frame ? [rg.frame] : rg.rects) {
     const q = rectToPx(f, W, H, r);
     if (rg.fill) {
       c.fillStyle = rg.fill;
@@ -209,9 +209,19 @@ function paintRegion<B>(
       c.fillStyle = 'rgba(255, 214, 102, 0.32)';
       c.fillRect(q.x, q.y, q.w, q.h);
     }
-    c.lineWidth = lit ? 6 : 3;
-    c.strokeStyle = lit ? '#FFD666' : LINE;
-    c.strokeRect(q.x + 1.5, q.y + 1.5, q.w - 3, q.h - 3);
+    if (rg.faint && !lit) {
+      // An odds band: a dashed hairline inside the box it belongs to.
+      c.save();
+      c.setLineDash([6, 6]);
+      c.lineWidth = 1.5;
+      c.strokeStyle = 'rgba(244, 236, 214, 0.45)';
+      c.strokeRect(q.x + 5, q.y + 5, q.w - 10, q.h - 10);
+      c.restore();
+    } else {
+      c.lineWidth = lit ? 6 : 3;
+      c.strokeStyle = lit ? '#FFD666' : LINE;
+      c.strokeRect(q.x + 1.5, q.y + 1.5, q.w - 3, q.h - 3);
+    }
     if (focused) {
       // Keyboard play's selected box: a bright dashed ring inside the line.
       c.save();
@@ -222,9 +232,9 @@ function paintRegion<B>(
       c.restore();
     }
   }
-  // Caption at the centre of the region's first (largest) rect.
-  const main = rg.rects.reduce((a, b) =>
-    (b.x1 - b.x0) * (b.z1 - b.z0) > (a.x1 - a.x0) * (a.z1 - a.z0) ? b : a);
+  // Caption at the centre of the region's caption rect (its largest, unless
+  // the layout names one).
+  const main = captionRect(rg);
   const [cx, cy] = feltToPx(f, W, H, (main.x0 + main.x1) / 2, (main.z0 + main.z1) / 2);
   c.save();
   c.translate(cx, cy);
@@ -251,7 +261,7 @@ function paintRegion<B>(
   const lift = rg.sub ? subSize * 0.55 : 0;
   if (rg.label) {
     c.font = `900 ${size}px "Trebuchet MS", "Segoe UI", sans-serif`;
-    c.fillStyle = rg.ink ?? INK;
+    c.fillStyle = rg.ink ?? (rg.faint ? 'rgba(244, 236, 214, 0.6)' : INK);
     c.fillText(rg.label, 0, -lift);
   }
   if (rg.sub) {

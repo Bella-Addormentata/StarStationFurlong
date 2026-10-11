@@ -50,10 +50,12 @@ import type { DeviceUI } from './devices';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import {
   assignSlots, chipSlots, crapsChipRect, crapsSideFor, CRAPS_LAYOUT, hitRegion,
-  hitSettings, nearestInDirection, regionCenter, ROULETTE_LAYOUT, spotKey,
+  hitSettings, LAY_PAYS, nearestInDirection, ODDS_PAYS, regionCenter, ROULETTE_LAYOUT, spotKey,
 } from './games/casinoLayout';
 import type { FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
-import { canPlaceBet, crapsBetLabel, pointWasOn } from './games/craps';
+import {
+  canPlaceBet, crapsBetLabel, isOddsType, MAX_LAY_MULTIPLE, MAX_ODDS_MULTIPLE, oddsFlat, oddsRoom, pointWasOn,
+} from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/diceFairness';
 import { isFairTable, MAX_TABLE_BETTORS, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound } from './fairTableSeeds';
@@ -633,7 +635,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (game === 'craps') {
       const s = crapsState();
       const type = rg.bet.type as CrapsBet['type'];
-      if (!canPlaceBet(type, s?.point ?? null)) {
+      if (isOddsType(type)) {
+        // 🎲 Odds ride on a flat bet, up to the table's multiple of it.
+        const o = oddsRoom(readMyCrapsBets(itemId, me), type, rg.bet.pick, s?.point ?? null);
+        if (o.reason) {
+          say(o.reason);
+          return;
+        }
+        if (sumOf(hand) > o.room) {
+          say(`ODDS MAX — ${o.room} MORE FITS HERE`);
+          return;
+        }
+      } else if (!canPlaceBet(type, s?.point ?? null)) {
         say(type === 'come' || type === 'dontcome'
           ? 'THE COME BOX OPENS ONCE A POINT IS ON'
           : 'THE LINE IS CLOSED WHILE A POINT IS ON');
@@ -689,7 +702,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const takeBack = (rg: FeltRegion<Spot>): boolean => {
     syncWindow();
     const key = spotKey(rg.bet);
-    const mine = added.get(key) ?? [];
+    // Odds are the one bet you may take down any time the betting is open,
+    // not only this window's chips (the flat bet under them stays).
+    const mine = game === 'craps' && isOddsType(rg.bet.type)
+      ? myBets().filter((b) => spotKey(b) === key).map((b) => b.amount)
+      : added.get(key) ?? [];
     if (mine.length === 0) return false;
     if (!bettingOpen()) {
       say('NO MORE BETS — THOSE CHIPS STAY');
@@ -775,6 +792,21 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (h && s?.phase === 'settled' && s.dice) h.diceLand(s.dice);
   };
 
+  /** A click on an odds band with no bet there to back is meant for the box
+   *  around it, as it was before the odds bands: the number box's place bet,
+   *  or (come-out) the line. Keyboard play keeps the band, and hears why. */
+  const pointerTarget = (rg: FeltRegion<Spot>): FeltRegion<Spot> => {
+    if (game !== 'craps' || !isOddsType(rg.bet.type)) return rg;
+    const point = crapsState()?.point ?? null;
+    const t = rg.bet.type;
+    if (oddsFlat(readMyCrapsBets(itemId, me), t, rg.bet.pick) > 0 && !(point === null && (t === 'passodds' || t === 'dontpassodds'))) return rg;
+    const tag = rg.side > 0 ? '+' : '-';
+    const to = t === 'comeodds' || t === 'dontcomeodds'
+      ? `place:${rg.bet.pick}@${tag}`
+      : point === null ? `${t === 'passodds' ? 'pass' : 'dontpass'}@${tag}` : null;
+    return (to && layout.regions.find((r) => r.id === to)) || rg;
+  };
+
   const onMove = (e: PointerEvent): void => {
     if (!h || !aim(e)) return;
     dropStaleHold();
@@ -851,8 +883,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const stackAtPt = h.onMyStack(ray, hit.p);
     const stackRg = stackAtPt ? hitRegion(layout, stackAtPt) : null;
     if (stackRg && takeBack(stackRg)) return;
-    const rg = hitRegion(layout, hit.p);
-    if (!rg) return;
+    const hitRg = hitRegion(layout, hit.p);
+    if (!hitRg) return;
+    const rg = pointerTarget(hitRg);
     if (hand.length > 0) placeHand(rg);
     else say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
   };
@@ -888,7 +921,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const KEY_HELP = `${game === 'craps' ? 'Craps' : 'Roulette'} table. Arrow keys choose a box on the felt. `
     + '1 to 6 pick up a 1, 5, 25, 100, 500 or 1000 chip. Enter or Space bets your hand on the box. '
-    + 'Delete takes back the chips you put there this round. 0 puts your hand back. '
+    + 'Delete takes back the chips you put there this round, or your odds there. 0 puts your hand back. '
     + `${game === 'craps' ? 'R throws the dice when they are yours. ' : ''}`
     + 'I reads the table. S opens the table card. Escape steps away.';
 
@@ -899,7 +932,24 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const describeRegion = (rg: FeltRegion<Spot>): string => {
     const key = spotKey(rg.bet);
     const mine = myBets().filter((b) => spotKey(b) === key).reduce((a, b) => a + b.amount, 0);
-    return `${labelOf(rg.bet)}${rg.sub ? `, pays ${rg.sub}` : ''}. ${mine > 0 ? `Your chips here: ${mine}.` : 'None of your chips here.'} ${handLine()}`;
+    const pays = game === 'craps' && isOddsType(rg.bet.type) ? `, ${oddsLine(rg.bet)}` : rg.sub ? `, pays ${rg.sub}` : '';
+    return `${labelOf(rg.bet)}${pays}. ${mine > 0 ? `Your chips here: ${mine}.` : 'None of your chips here.'} ${handLine()}`;
+  };
+
+  /** An odds box read aloud: what it pays on the number it backs, and how
+   *  much more of your flat bet's odds it can take right now. */
+  const oddsLine = (b: Spot): string => {
+    const t = b.type as CrapsBet['type'];
+    const lay = t === 'dontpassodds' || t === 'dontcomeodds';
+    const point = crapsState()?.point ?? null;
+    const n = t === 'passodds' || t === 'dontpassodds' ? point : b.pick ?? null;
+    const pays = n === null
+      ? `pays ${lay ? 'lay odds: 1 to 2 on 4 and 10, 2 to 3 on 5 and 9, 5 to 6 on 6 and 8' : 'true odds: 2 to 1 on 4 and 10, 3 to 2 on 5 and 9, 6 to 5 on 6 and 8'}`
+      : `pays ${(lay ? LAY_PAYS : ODDS_PAYS)[n]?.toLowerCase() ?? ''} on the ${n}`;
+    const o = oddsRoom(readMyCrapsBets(itemId, me), t, b.pick, point);
+    const room = o.reason ? o.reason.toLowerCase() : `you can add up to ${o.room}`;
+    const off = t === 'comeodds' && point === null ? ', off on the come-out' : '';
+    return `${pays}${off}; ${room}`;
   };
 
   const selectRegion = (i: number): void => {
@@ -1080,6 +1130,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
        <div>PLACE 4 · 10 — 9:5 &nbsp; 5 · 9 — 7:5 &nbsp; 6 · 8 — 7:6 (off on the come-out)</div>
        <div>FIELD — 1:1, 2 and 12 pay 2:1 &nbsp; BIG 6 / BIG 8 — 1:1</div>
        <div>HARD 6 · 8 — 9:1 &nbsp; HARD 4 · 10 — 7:1 (off on the come-out)</div>
+       <div>ODDS behind PASS / COME — true odds, no house edge: 4 · 10 — 2:1 &nbsp; 5 · 9 — 3:2 &nbsp; 6 · 8 — 6:5; up to ${MAX_ODDS_MULTIPLE[4]}× · ${MAX_ODDS_MULTIPLE[5]}× · ${MAX_ODDS_MULTIPLE[6]}× the flat bet</div>
+       <div>LAY ODDS behind DON'T PASS / DON'T COME — 4 · 10 — 1:2 &nbsp; 5 · 9 — 2:3 &nbsp; 6 · 8 — 5:6; up to ${MAX_LAY_MULTIPLE}× the flat bet</div>
+       <div>Come odds are off on the come-out (returned if the come bet is decided then); lay odds always work. Odds come down any time bets are open.</div>
        <div>ANY 7 — 4:1 &nbsp; ANY CRAPS — 7:1 &nbsp; 2 · 12 — 30:1 &nbsp; 3 · 11 — 15:1</div>
        <div>The dice go clockwise to players with a line bet; a shooter keeps them until a seven-out.</div>`
     : `<div>SINGLE-ZERO WHEEL — straight up 35:1</div>
