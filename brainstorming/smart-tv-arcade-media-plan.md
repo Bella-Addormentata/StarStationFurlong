@@ -424,7 +424,11 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   6to4 (`2002::/16`, the IPv4 in bits 16–47) and Teredo (`2001:0::/32`,
   the server's IPv4 in bits 32–63 and the client's in the last 32,
   inverted — both judged by what they carry, since either reads as global
-  unicast on paper and `2002:7f00:1::` is loopback in fact); and
+  unicast on paper and `2002:7f00:1::` is loopback in fact); ISATAP
+  (RFC 5214) under ANY prefix — an interface identifier of `0:5efe` or
+  `200:5efe` in bits 64–95 with the IPv4 in the last 32, so a globally
+  scoped outer address names a private or loopback host on a site with
+  ISATAP routing — judged by that IPv4 the same way; and
   any address under a NAT64 prefix: the well-known `64:ff9b::/96` and
   `64:ff9b:1::/48`, and the network's own, learned the RFC 7050 way by
   resolving `ipv4only.arpa` and reading the prefix off the AAAA answer
@@ -439,7 +443,8 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   outright, which costs nothing where IPv4 reaches the same host. The
   classifier is a pure function with that table of cases as its tests —
   loopback, private, link-local and the metadata address under every one
-  of those encodings, mapped, compatible, 6to4, Teredo and NAT64 alike —
+  of those encodings, mapped, compatible, 6to4, Teredo, ISATAP in both
+  of its interface-identifier forms, and NAT64 alike —
   and
   the node PINS the socket to
   a vetted address: it connects to the IP with the original name kept as
@@ -931,7 +936,9 @@ rotates to a new epoch before every admission (the admitted can open
 nothing from before it: a key handed out mid-epoch would open the ciphertext
 a joiner, or a hub that later joins as a member, had already logged — which
 is the guarantee below that a forwarding node reconstructs no audio), on
-every departure (the departed can open nothing after it) and on a timer. A
+every departure (the departed can open nothing after it — under a
+departure storm, the one exception stated with the churn budgets below,
+nothing past two seconds) and on a timer. A
 join and a leave each cost one rotation — a sealed key per subscriber on
 the reliable lane — which at room scale is nothing, until one member makes
 a habit of it; so the transitions are defined once, enforceably, and the
@@ -943,7 +950,10 @@ DEPARTURE is a member whose last lease has been gone for the grace window
 left) or who said leave; it rotates AT ONCE — the sender emits under the
 new epoch from its next frame — and from that rotation the departed can
 open nothing: there is no resuming an epoch, and a return is an ADMISSION
-like any other. A lease is renewed against the SENDER'S clock, never a
+like any other — with ONE exception, stated below with the churn budgets
+and nowhere else: a source under a departure STORM batches its rotations,
+and a member departed under one may open up to two seconds of frames
+before the batched rotation shuts it out. A lease is renewed against the SENDER'S clock, never a
 clock of its own, or a hub between them could stockpile a live
 subscriber's renewals — each valid on its signature and its rising
 sequence alone — and release one a lease period after the subscriber had
@@ -1038,9 +1048,11 @@ honest hub with many spokes never needs and a lying one cannot stay
 inside; a hub that keeps relaying a parked origin's churn is parked the
 same way, an honest hub having parked the spoke first; and
 source-wide, past thirty rotations a minute the sender batches further
-departures into one rotation every two seconds and reports the storm,
-which hands a departed member at most two seconds of frames it could still
-open — stated as the cost — rather than the sender's whole budget. A
+departures into one rotation every two seconds and reports the storm —
+the ONE exception to the rotation at once that the departure rule above
+promises, and stated there too: under a storm a departed member can still
+open at most two seconds of frames, the cost, rather than the sender's
+whole budget going to rotations. A
 subscriber cap per source (sixty-four identities; the hubs' aggregation
 keeps the forwarding tree beneath it) bounds what any rotation costs: one
 sealed key per subscriber, a few milliseconds of X25519 and a few
@@ -1237,7 +1249,11 @@ the receiver hands its `EncodedAudioChunk` `samples × 1000 / 48`
 microseconds back; a packet's TOC byte is never read for it, since the
 TOC gives the duration of ONE frame while a code-3 packet carries
 several), then the chunks in order, chunk k's
-timestamp the header's plus the durations before it; the table under the
+timestamp the header's plus the durations before it, each converted from
+the table's 48 kHz samples to the timestamp's microseconds first
+(`samples × 1000 / 48`: a 960 in the table adds 20 000 µs, never 960, or
+batched chunks and the audio's meeting with video would land fifty times
+too close); the table under the
 AEAD and the signature with the rest, bit 1 of the flags byte saying a
 batch is inside, and a batch whose lengths do not add up to the payload,
 or whose durations are not among those six or sum past 60 ms, dropped as malformed and
@@ -1865,7 +1881,26 @@ when the spectator lane comes, comes out the same way — `ImageBitmap`s
 (or `VideoFrame`s) the frame makes from its own canvas and transfers at
 the lane's rate — never a reach into the frame's canvas, which an opaque
 origin forbids by design and an earlier draft of this paragraph relied
-on. The frame still runs under a content-security policy on EVERY lane,
+on. And since the frame is attacker-controlled after a core exploit, the
+source check says only WHO is posting; what crosses is bounded as input
+from an attacker: one versioned shape per message kind (`arcade-*`,
+known keys only, a string field at most 256 characters, anything else
+dropped on receipt), a message budget of twenty a second per frame, past
+which the page tears the frame down (`flood`) and re-mounts it only on
+the player's RETRY, and not before a doubling backoff from 5 s (five
+minutes at most, forgiven by a clean start); a save state at
+most 16 MB by `byteLength`; a picture at most the core's native size
+within 1 280 × 720, transferred no faster than the lane's rate with ONE
+in flight — a bitmap arriving early, or behind one not yet drawn, is
+closed unused — and nothing queued anywhere: a message is handled or
+dropped as it arrives. What remains is the structured clone the browser
+performs BEFORE any handler runs, so one oversized message costs the
+page its clone once — the memory and the stalled event loop of that one
+message — after which the frame is gone: the residual availability cost,
+stated as one. #208 carries the shape, the budget and the teardown for
+the status messages (`arcadeEmulator.ts`); the picture and save-state
+caps come with the lanes that carry them. The frame still runs under a
+content-security policy on EVERY lane,
 set by the frame itself on receipt of the page's config and before its
 loader is fetched: its own origin, `blob:`, `data:`, the viewer's own node
 and — on the CDN lane alone, in a build with the lanes on —
