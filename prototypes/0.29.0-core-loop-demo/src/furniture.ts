@@ -57,6 +57,9 @@ import { WHEEL_ORDER, pocketColor } from "./games/roulette";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey, readCoinPusherState } from "./casinoDoc";
+import { airHockeyTheme, hexCss } from "./airHockeyTheme";
+import type { AirHockeyThemeSpec } from "./airHockeyTheme";
+import { readAirHockeyTheme } from "./airHockeyThemeDoc";
 // 🎉 Party props read their own per-instance state (candles, lids, the music)
 // straight from the room doc, the same way the slot machine reads the casino
 // map — the doc is the phase, a local click is never the phase.
@@ -3380,22 +3383,54 @@ const airHockeyStands: StandTemplate[] = [
 // dual-face scoreboard OFF the long side (never occluding the iso camera's
 // view of the playfield), and the three animated pieces the
 // AirHockeyVisualHandle drives: two mallets and the puck.
-const AH_CYAN = 0x35c8e8;   // side 'a' (-z end + mallet)
-const AH_ORANGE = 0xe8933a; // side 'b' (+z end + mallet)
+// 🎨 #184: the per-side colours (and every other colour on the table) now
+// come from the item's theme — see airHockeyTheme.ts. The originals live on
+// as the `midnight` preset's playerA / playerB.
 /** Mallet hover height above the surface while RAISED (mouse released). */
 const AH_RAISE = 0.1;
 
 const buildAirHockeyTable = (ctx: BuildCtx): void => {
   const { m, place, attach } = ctx;
   const railTop = AH_SURFACE_Y + 0.06;
+  // 🎨 #184: this table's colour skin, by item id. An unrecoloured table
+  // resolves to `arctic`, the light default the issue asked for, so every
+  // existing room picks it up with no migration.
+  //
+  // MUTABLE, because handle.setTheme repaints the table in place rather than
+  // rebuilding it (see the note on setTheme in devices.ts): the two canvas
+  // painters below close over this binding and are re-run on a recolour.
+  let theme = airHockeyTheme(readAirHockeyTheme(ctx.itemId));
+
+  // Every standard material whose colour comes from the skin, paired with the
+  // spec field it reads. Registering them here is what lets setTheme repaint
+  // the table without knowing where any of them ended up in the group.
+  const themed: Array<{
+    mat: THREE.MeshStandardMaterial;
+    key: keyof AirHockeyThemeSpec;
+    /** Also drives `emissive` (the goal lamps, whose intensity update() animates). */
+    emissive?: boolean;
+  }> = [];
+  /** ctx.m, but the material is registered for repainting. */
+  const tm = (
+    key: keyof AirHockeyThemeSpec,
+    rough?: number,
+    metal?: number,
+    emissive = false,
+  ): THREE.MeshStandardMaterial => {
+    const mat = emissive
+      ? m(theme[key], rough, metal, theme[key], 0)
+      : m(theme[key], rough, metal);
+    themed.push(emissive ? { mat, key, emissive } : { mat, key });
+    return mat;
+  };
 
   // Cabinet body (top face AT the playing surface) + legs + end colour bands.
-  place(new THREE.BoxGeometry(1.7, 0.22, 2.7), m(0x24303e, 0.5, 0.2), 0, AH_SURFACE_Y - 0.11, 0);
+  place(new THREE.BoxGeometry(1.7, 0.22, 2.7), tm('cabinet', 0.5, 0.2), 0, AH_SURFACE_Y - 0.11, 0);
   for (const [lx, lz] of [[-0.65, -1.15], [0.65, -1.15], [-0.65, 1.15], [0.65, 1.15]]) {
-    place(new THREE.BoxGeometry(0.12, 0.58, 0.12), m(0x1a2430, 0.55, 0.3), lx, 0.29, lz);
+    place(new THREE.BoxGeometry(0.12, 0.58, 0.12), tm('legs', 0.55, 0.3), lx, 0.29, lz);
   }
-  place(new THREE.BoxGeometry(1.6, 0.12, 0.05), m(AH_CYAN, 0.4, 0.25), 0, 0.72, -1.36);
-  place(new THREE.BoxGeometry(1.6, 0.12, 0.05), m(AH_ORANGE, 0.4, 0.25), 0, 0.72, 1.36);
+  place(new THREE.BoxGeometry(1.6, 0.12, 0.05), tm('playerA', 0.4, 0.25), 0, 0.72, -1.36);
+  place(new THREE.BoxGeometry(1.6, 0.12, 0.05), tm('playerB', 0.4, 0.25), 0, 0.72, 1.36);
 
   // Playfield — CanvasTexture (NearestFilter, wall-screen idiom). The art is
   // mirror-SYMMETRIC on purpose: no orientation to get wrong; sides are keyed
@@ -3404,36 +3439,75 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   feltCv.width = 512;
   feltCv.height = 848; // ≈ the playfield's 1.52 : 2.52 aspect
   const c2d = feltCv.getContext("2d")!;
-  c2d.fillStyle = "#0d1622";
-  c2d.fillRect(0, 0, 512, 848);
-  c2d.fillStyle = "#16283a"; // air-hole grid
-  for (let gy = 24; gy < 848; gy += 32) {
-    for (let gx = 24; gx < 512; gx += 32) c2d.fillRect(gx - 2, gy - 2, 4, 4);
-  }
-  c2d.strokeStyle = "#3a6a8a";
-  c2d.lineWidth = 6;
-  c2d.strokeRect(8, 8, 496, 832);          // boundary
-  c2d.beginPath();                          // centre line + circle
-  c2d.moveTo(8, 424);
-  c2d.lineTo(504, 424);
-  c2d.stroke();
-  c2d.beginPath();
-  c2d.arc(256, 424, 64, 0, Math.PI * 2);
-  c2d.stroke();
   const mouthPx = (AH_GOAL_HALF_W / AH_HALF_W) * 256; // goal creases + lines
-  for (const [cy, sweep] of [[8, 1], [840, -1]] as const) {
-    c2d.beginPath();
-    c2d.arc(256, cy, 120, 0, Math.PI, sweep < 0);
-    c2d.stroke();
-    c2d.strokeStyle = "#d8e8f8";
-    c2d.lineWidth = 8;
-    c2d.beginPath();
-    c2d.moveTo(256 - mouthPx, cy);
-    c2d.lineTo(256 + mouthPx, cy);
-    c2d.stroke();
-    c2d.strokeStyle = "#3a6a8a";
+  // 🥅 The goal line is drawn INSET into the playfield instead of on top of
+  // the boundary stroke it used to overpaint. Not a cosmetic preference: the
+  // mouth has to be light enough to clear a near-black puck and dark enough to
+  // clear a near-white felt, and every preset's feltLines luminance falls
+  // inside that window, so NO colour of any hue clears 3 : 1 against puck,
+  // felt and markings at once (airHockeyTheme.ts carries the arithmetic).
+  // Painted colinear the two strokes meet at 1.00-1.67 : 1 — on midnight
+  // under protanopia they are the same luminance to within half a percent —
+  // so they were left to be told apart by hue alone, which three
+  // skin/observer pairs do not survive: ΔE 4.6 on sandstone under
+  // protanopia and 11.2 under deuteranopia (its markings are a brown,
+  // against this red), and 10.5 on mint under protanopia. All three sit
+  // under the ΔE 15 the palette is held to everywhere else. Arctic and
+  // midnight clear it (27.9 and 31.6 protan), but the geometry has to
+  // survive the worst skin, not the average one. Split by a strip of felt,
+  // each mark is read against the felt instead, where the worst of the 24
+  // preset × observer combinations is 3.03 : 1 — above the floor for
+  // everyone, everywhere.
+  //
+  // The cost, stated: this paints the mouth 7.7 cm INBOARD of the plane that
+  // actually scores — 1.40 puck radii, not one. The inset below is 18 px, but
+  // it is measured from the BOUNDARY STROKE, and that stroke is itself 8 px in
+  // from the texture edge, so the paint stands 26 px off the edge. The edge is
+  // what scores: a goal needs the puck's centre at ±(AH_HALF_L + AH_PUCK_R),
+  // i.e. the puck fully across z = ±AH_HALF_L, which is exactly where this
+  // texture stops. The texture is decoration — goals are judged from the
+  // constants in games/airHockey.ts, never from these pixels — so nothing is
+  // mis-scored, but a player sighting down the paint is sighting ~1.4 puck
+  // radii short of the line. Worth it to keep the mark legible at all; not
+  // worth hiding, and not worth understating — which the earlier wording did,
+  // by quoting the 18 px from the right arithmetic and the wrong baseline.
+  // airHockeyFelt.test.ts now measures this off the real draw calls, so the
+  // paragraph cannot drift away from the paint a second time.
+  const goalLineInset = 18; // px from the boundary stroke; 26 px from the plane
+  /** Paint the playfield in the CURRENT skin. Re-run by setTheme. */
+  const drawFelt = (): void => {
+    c2d.fillStyle = hexCss(theme.feltBase);
+    c2d.fillRect(0, 0, 512, 848);
+    c2d.fillStyle = hexCss(theme.feltHoles); // air-hole grid
+    for (let gy = 24; gy < 848; gy += 32) {
+      for (let gx = 24; gx < 512; gx += 32) c2d.fillRect(gx - 2, gy - 2, 4, 4);
+    }
+    c2d.strokeStyle = hexCss(theme.feltLines);
     c2d.lineWidth = 6;
-  }
+    c2d.strokeRect(8, 8, 496, 832);          // boundary
+    c2d.beginPath();                          // centre line + circle
+    c2d.moveTo(8, 424);
+    c2d.lineTo(504, 424);
+    c2d.stroke();
+    c2d.beginPath();
+    c2d.arc(256, 424, 64, 0, Math.PI * 2);
+    c2d.stroke();
+    for (const [cy, sweep] of [[8, 1], [840, -1]] as const) {
+      c2d.beginPath();
+      c2d.arc(256, cy, 120, 0, Math.PI, sweep < 0);
+      c2d.stroke();
+      c2d.strokeStyle = hexCss(theme.feltMouth);
+      c2d.lineWidth = 8;
+      c2d.beginPath();
+      const goalY = cy + sweep * goalLineInset; // sweep already points inboard
+      c2d.moveTo(256 - mouthPx, goalY);
+      c2d.lineTo(256 + mouthPx, goalY);
+      c2d.stroke();
+      c2d.strokeStyle = hexCss(theme.feltLines);
+      c2d.lineWidth = 6;
+    }
+  };
+  drawFelt();
   const feltTex = new THREE.CanvasTexture(feltCv);
   feltTex.minFilter = THREE.NearestFilter;
   feltTex.magFilter = THREE.NearestFilter;
@@ -3448,7 +3522,7 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   }), 0, AH_SURFACE_Y + 0.002, 0);
 
   // Rails: full-length sides; END rails in two segments leaving the goal gap.
-  const railMat = () => m(0xb8c4d0, 0.35, 0.55);
+  const railMat = () => tm('rail', 0.35, 0.55);
   const sideX = AH_HALF_W + 0.045;
   place(new THREE.BoxGeometry(0.09, 0.06, 2.7), railMat(), -sideX, railTop - 0.03, 0);
   place(new THREE.BoxGeometry(0.09, 0.06, 2.7), railMat(), sideX, railTop - 0.03, 0);
@@ -3459,12 +3533,12 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     place(new THREE.BoxGeometry(endSegW, 0.06, 0.09), railMat(), -endSegX, railTop - 0.03, ez);
     place(new THREE.BoxGeometry(endSegW, 0.06, 0.09), railMat(), endSegX, railTop - 0.03, ez);
     // Dark catch slot under the gap so the mouth reads as an opening.
-    place(new THREE.BoxGeometry(AH_GOAL_HALF_W * 2, 0.05, 0.09), m(0x0a0e14, 0.7, 0.05), 0, AH_SURFACE_Y - 0.005, ez);
+    place(new THREE.BoxGeometry(AH_GOAL_HALF_W * 2, 0.05, 0.09), tm('catchSlot', 0.7, 0.05), 0, AH_SURFACE_Y - 0.005, ez);
   }
 
   // Goal lamps — one over each mouth; flashGoal() strobes the breached end.
-  const lampMatA = m(0xe84a5a, 0.4, 0.1, 0xe84a5a, 0);
-  const lampMatB = m(0xe84a5a, 0.4, 0.1, 0xe84a5a, 0);
+  const lampMatA = tm('goalLamp', 0.4, 0.1, /* emissive */ true);
+  const lampMatB = tm('goalLamp', 0.4, 0.1, /* emissive */ true);
   place(new THREE.BoxGeometry(0.16, 0.05, 0.06), lampMatA, 0, railTop + 0.02, -endZ);
   place(new THREE.BoxGeometry(0.16, 0.05, 0.06), lampMatB, 0, railTop + 0.02, endZ);
 
@@ -3477,31 +3551,34 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   const SCORE_X = 0.98 - SCORE_W / 2; // outer edge 2 cm inside the footprint
   const SCORE_Y = 1.58;
   const poleH = SCORE_Y - SCORE_H / 2; // up to the panel's lower edge
-  place(new THREE.CylinderGeometry(0.03, 0.04, poleH, 10), m(0x2a3644, 0.5, 0.4), 0.94, poleH / 2, 0);
+  place(new THREE.CylinderGeometry(0.03, 0.04, poleH, 10), tm('scorePole', 0.5, 0.4), 0.94, poleH / 2, 0);
   const scoreCv = document.createElement("canvas");
   scoreCv.width = 512;
   scoreCv.height = 256;
   const s2d = scoreCv.getContext("2d")!;
+  /** Last score painted, replayed when the skin changes under it. */
+  let lastScore: [number, number, string] = [0, 0, 'walk up to play'];
   const drawScore = (a: number, b: number, statusLine: string): void => {
-    s2d.fillStyle = "#0a1018";
+    lastScore = [a, b, statusLine];
+    s2d.fillStyle = hexCss(theme.scoreBg);
     s2d.fillRect(0, 0, 512, 256);
-    s2d.strokeStyle = "#2a4a66";
+    s2d.strokeStyle = hexCss(theme.scoreBorder);
     s2d.lineWidth = 8;
     s2d.strokeRect(6, 6, 500, 244);
     s2d.textAlign = "center";
-    s2d.fillStyle = "#7a92aa";
+    s2d.fillStyle = hexCss(theme.scoreTitle);
     s2d.font = "bold 34px monospace";
     s2d.fillText("AIR HOCKEY", 256, 52);
     // Scores are colour-keyed to the mallets/end bands — readable from both
     // faces without any left/right side convention to misread.
     s2d.font = "bold 108px monospace";
-    s2d.fillStyle = "#35c8e8";
+    s2d.fillStyle = hexCss(theme.playerA);
     s2d.fillText(String(a), 140, 158);
-    s2d.fillStyle = "#526a82";
+    s2d.fillStyle = hexCss(theme.scoreColon);
     s2d.fillText(":", 256, 152);
-    s2d.fillStyle = "#e8933a";
+    s2d.fillStyle = hexCss(theme.playerB);
     s2d.fillText(String(b), 372, 158);
-    s2d.fillStyle = "#d8e8f8";
+    s2d.fillStyle = hexCss(theme.scoreStatus);
     s2d.font = "bold 30px monospace";
     s2d.fillText(statusLine.slice(0, 26).toUpperCase(), 256, 222);
   };
@@ -3524,20 +3601,20 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   // so they ride the morph fade like every other mesh in the group.
   const puck = place(
     new THREE.CylinderGeometry(AH_PUCK_R, AH_PUCK_R, 0.024, 20),
-    m(0x141a22, 0.35, 0.15),
+    tm('puck', 0.35, 0.15),
     0, AH_SURFACE_Y + 0.014, 0,
   );
   puck.visible = false;
-  const mkMallet = (color: number): THREE.Group => {
+  const mkMallet = (key: 'playerA' | 'playerB'): THREE.Group => {
     const g = new THREE.Group();
     const base = new THREE.Mesh(
       new THREE.CylinderGeometry(AH_MALLET_R, AH_MALLET_R * 1.06, 0.04, 20),
-      m(color, 0.35, 0.15),
+      tm(key, 0.35, 0.15),
     );
     base.position.y = 0.02;
     const knob = new THREE.Mesh(
       new THREE.CylinderGeometry(0.036, 0.05, 0.06, 14),
-      m(color, 0.3, 0.2),
+      tm(key, 0.3, 0.2),
     );
     knob.position.y = 0.07;
     g.add(base, knob);
@@ -3545,7 +3622,7 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     attach(g);
     return g;
   };
-  const mallets = { a: mkMallet(AH_CYAN), b: mkMallet(AH_ORANGE) };
+  const mallets = { a: mkMallet('playerA'), b: mkMallet('playerB') };
 
   // ── Handle state: net-driven positions snap; the hover height eases. ──
   const hover = {
@@ -3576,6 +3653,28 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     },
     flashGoal(side): void {
       flash[side] = 1;
+    },
+    setTheme(next): void {
+      // airHockeyTheme() hands back the SAME spec object for a given id, so
+      // identity is a sound "nothing changed" test — and the doc notify that
+      // fires on every bind/join then costs nothing.
+      if (next === theme) return;
+      theme = next;
+      // Standard materials: colour (and the lamps' emissive, whose INTENSITY
+      // update() owns — only the hue is the skin's business). `opacity` is
+      // untouched, so a table recoloured mid-fade keeps fading.
+      for (const entry of themed) {
+        entry.mat.color.setHex(theme[entry.key]);
+        if (entry.emissive) entry.mat.emissive.setHex(theme[entry.key]);
+      }
+      // Canvases: repaint and re-upload. The scoreboard replays the last
+      // score rather than resetting to 0:0 — a recolour must not look like
+      // a restart. scoreKey is cleared so drawScore's dedupe can't skip it.
+      drawFelt();
+      feltTex.needsUpdate = true;
+      const [a, b, statusLine] = lastScore;
+      scoreKey = '';
+      this.setScore(a, b, statusLine);
     },
     update(dt: number): void {
       const d = Math.max(0, dt);

@@ -140,6 +140,7 @@ import {
 } from './doorsDoc';
 import { isDockChain } from './adapter';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
+import type { AirHockeyThemeSpec } from './airHockeyTheme';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
 // ⚓ #163: the helm's docking computer draws the ship atlas in room metres.
@@ -478,6 +479,16 @@ export interface AirHockeyVisualHandle {
   flashGoal(side: 'a' | 'b'): void;
   /** Per-frame animation (goal flash, mallet hover ease). World drives this. */
   update(dt: number): void;
+  /**
+   * 🎨 #184: repaint the table in a new colour skin, IN PLACE.
+   *
+   * Deliberately not a rebuild: removeFurnitureVisuals() closes the runtime
+   * session and clears the table's doc state for this kind, so rebuilding to
+   * recolour would end a match in progress and reset the score. Repainting
+   * touches only `color` / `emissive` and the two canvases, so the fade-in
+   * opacity, the registered handle and the live game all survive it.
+   */
+  setTheme(theme: AirHockeyThemeSpec): void;
 }
 
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
