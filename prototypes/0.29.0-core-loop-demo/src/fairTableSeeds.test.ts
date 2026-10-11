@@ -73,12 +73,12 @@ describe('commitments and the wheel', () => {
     expect(commitSeedSync(seed, ctx)).toBe(await commitTableSeed(seed, ctx));
   });
 
-  it('binds a commitment to its table, round, party and house commit', () => {
+  it('binds a commitment to its room, table, round, party and house commit', () => {
     const seed = 'ab'.repeat(32);
     const ctx = { table: 't', round: 3, party: AMY, house: 'c'.repeat(64) };
     const c = commitSeedSync(seed, ctx);
     for (const other of [
-      { ...ctx, table: 'u' }, { ...ctx, round: 4 }, { ...ctx, party: BOB }, { ...ctx, house: 'd'.repeat(64) },
+      { ...ctx, room: 'another-room' }, { ...ctx, table: 'u' }, { ...ctx, round: 4 }, { ...ctx, party: BOB }, { ...ctx, house: 'd'.repeat(64) },
     ]) expect(commitSeedSync(seed, other)).not.toBe(c);
   });
 
@@ -382,6 +382,30 @@ describe('a Fair roulette round', () => {
     expect(s.phase).toBe('settled');
     const v = await verifySettledRound('roulette', t, s, { pocket: s.result! });
     expect(v).toMatchObject({ kind: 'verified', unseeded: [BOB], bettorSeeds: 0 });
+    // Clearing the published list doesn't hide him: the frozen wagers say so.
+    const hidden: RouletteTableState = { ...s, unseeded: [] };
+    expect(await verifySettledRound('roulette', t, hidden, { pocket: s.result! }))
+      .toMatchObject({ kind: 'verified', unseeded: [BOB] });
+  });
+
+  it("a record copied in from the same table and round in another room isn't revealed", () => {
+    bindCasinoDoc(new Y.Doc(), 'room-A');
+    buyInChips(AMY, 100);
+    buyInChips(BOB, 100);
+    const t = 'shared-table-id';
+    const closingA = rouletteToClosing(t);
+    const amyOnA = closingA.commits![AMY];
+    // Room B: same table id, same round, the attacker copies Amy's record.
+    bindCasinoDoc(new Y.Doc(), 'room-B');
+    tickAutoCroupier(t);
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 5 }]);
+    const openB = readTableState(t)!;
+    // …and room A's house commit, so everything but the room matches.
+    const house = closingA.houseCommit!;
+    writeMySeedRecord(t, AMY, { round: 1, house, commit: amyOnA });
+    writeTableState(t, { ...openB, houseCommit: house, phase: 'closing', commits: { [AMY]: amyOnA } });
+    playersLook(t, 'roulette', [AMY]);
+    expect(readSeedRecord(t, AMY)?.seed).toBeUndefined();
   });
 
   it("the plaque follows the round's locked-in mode, not a mid-round switch", () => {

@@ -156,9 +156,10 @@ export async function verifyTranscript(
   table: string,
   round: number,
   dice: [number, number],
+  room = '',
 ): Promise<boolean> {
   if (t.mode === 'rng') return false;
-  if (t.parties) return verifyParties(t, 'craps', table, round, { dice });
+  if (t.parties) return verifyParties(t, 'craps', table, round, { dice }, room);
   if (t.mode === 'block-beacon') {
     const seed = t.seeds?.[0];
     const commit = t.commits?.[0];
@@ -206,12 +207,15 @@ export function combinePocketSeeds(seeds: string[], table: string, round: number
   return pocketFromMaterial(`ssf-roulette-combine-v1|${ordered.join('|')}|${table}|${round}`);
 }
 
-/** Who a table-seed commitment belongs to, and where: the table, the round,
+/** Who a table-seed commitment belongs to, and where: the room, the table, the round,
  *  the party ('house' or a player id) and — for a bettor — the house commit
  *  it answers ('' for the house's own). Hashed into the commitment, so a seed
  *  revealed in one round can never be replayed as fresh entropy in another,
  *  by another party, or against another house commit. */
 export interface TableSeedContext {
+  /** The room's stable id (furniture ids are only room-local, so a table id
+   *  and round can recur in another room). '' offline. */
+  room?: string;
   table: string;
   round: number;
   party: string;
@@ -220,7 +224,7 @@ export interface TableSeedContext {
 
 /** The exact message a table-seed commitment hashes. */
 export function tableCommitMessage(seed: string, ctx: TableSeedContext): string {
-  return `ssf-table-commit-v2|${ctx.table}|${ctx.round}|${ctx.party}|${ctx.house}|${seed}`;
+  return `ssf-table-commit-v3|${ctx.room ?? ''}|${ctx.table}|${ctx.round}|${ctx.party}|${ctx.house}|${seed}`;
 }
 
 /** A table seed's commitment (async SubtleCrypto; fairTableSeeds has the
@@ -262,6 +266,7 @@ export async function verifyParties(
   table: string,
   round: number,
   outcome: { dice?: [number, number]; pocket?: number },
+  room = '',
 ): Promise<boolean> {
   const { parties, commits, seeds } = t;
   if (t.mode !== 'multiparty' || !parties || !commits || !seeds) return false;
@@ -270,7 +275,7 @@ export async function verifyParties(
   const revealed: string[] = [];
   for (let i = 0; i < parties.length; i++) {
     if (seeds[i] === '') continue;
-    const ctx = { table, round, party: parties[i], house: i === 0 ? '' : commits[0] };
+    const ctx = { room, table, round, party: parties[i], house: i === 0 ? '' : commits[0] };
     if ((await commitTableSeed(seeds[i], ctx)) !== commits[i]) return false;
     revealed.push(seeds[i]);
   }

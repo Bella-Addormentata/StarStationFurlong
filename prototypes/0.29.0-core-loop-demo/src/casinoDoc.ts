@@ -110,8 +110,13 @@ function docAlive(): boolean {
     && (boundDoc as { isDestroyed?: boolean }).isDestroyed !== true;
 }
 
-export function bindCasinoDoc(doc: Y.Doc): void {
+/** The bound room's stable id ('' for the page-local practice doc): the
+ *  fair tables bind their seed commitments to it. */
+let boundRoomId = '';
+
+export function bindCasinoDoc(doc: Y.Doc, roomId = ''): void {
   bindingEpoch += 1;
+  boundRoomId = roomId;
   boundDoc = doc;
   casinoMap = doc.getMap('casino');
   // 🪙 Index the coin pushers' requests now, outside any operator poll, and
@@ -124,6 +129,10 @@ export function bindCasinoDoc(doc: Y.Doc): void {
 
 export function casinoDocEpoch(): number {
   return bindingEpoch;
+}
+
+export function casinoRoomId(): string {
+  return boundRoomId;
 }
 
 /** Bound map, lazily falling back to a page-local doc (offline practice). */

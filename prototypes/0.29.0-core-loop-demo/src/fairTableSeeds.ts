@@ -38,6 +38,7 @@ import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import {
   casinoDocEpoch,
+  casinoRoomId,
   readAllBets,
   readAllCrapsBets,
   readCrapsFairnessPref,
@@ -148,11 +149,11 @@ export function newHouseCommit(tableId: string, round: number): string {
 }
 
 function houseCtx(table: string, round: number): TableSeedContext {
-  return { table, round, party: HOUSE_PARTY, house: '' };
+  return { room: casinoRoomId(), table, round, party: HOUSE_PARTY, house: '' };
 }
 
 function bettorCtx(table: string, s: TableState, pid: string): TableSeedContext {
-  return { table, round: s.round, party: pid, house: s.houseCommit ?? '' };
+  return { room: casinoRoomId(), table, round: s.round, party: pid, house: s.houseCommit ?? '' };
 }
 
 // ── Who has a stake ──────────────────────────────────────────────────────────
@@ -293,7 +294,7 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
       evictOldest(authored, 512);
       evictOldest(authoredRounds, 512);
     }
-    if (rec && rec.round === s.round) forgetSeed(rec.commit, { table: tableId, round: rec.round, party: me, house: rec.house });
+    if (rec && rec.round === s.round) forgetSeed(rec.commit, { room: casinoRoomId(), table: tableId, round: rec.round, party: me, house: rec.house });
     if (myFrozen) forgetSeed(myFrozen, bettorCtx(tableId, s, me));
     forgetSeed(s.houseCommit, houseCtx(tableId, s.round));
   }
@@ -457,7 +458,7 @@ export async function verifySettledRound(
     || bettors.some((pid, i) => frozen[pid] !== t.commits![i + 1])) {
     return { kind: 'failed' };
   }
-  if (!(await verifyParties(t, game, tableId, s.round, outcome))) return { kind: 'failed' };
+  if (!(await verifyParties(t, game, tableId, s.round, outcome, casinoRoomId()))) return { kind: 'failed' };
   const forfeited = bettors.filter((_, i) => t.seeds![i + 1] === '');
   const droppedReveal = forfeited.some((pid) => {
     const r = readSeedRecord(tableId, pid);
@@ -468,12 +469,19 @@ export async function verifySettledRound(
     const i = bettors.indexOf(me);
     mine = !authored.has(frozen[me]) ? 'replaced' : i >= 0 && t.seeds[i + 1] !== '' ? 'in' : 'left-out';
   }
+  // Who had chips down but added no seed: the frozen wager keys minus the
+  // frozen commit keys — not the peer-writable `unseeded` list, which an
+  // operator could clear to hide a house-only result.
+  const fz = frozenFields(tableId, s);
+  const unseeded = fz.wagers
+    ? Object.keys(fz.wagers).filter((pid) => !(pid in (fz.commits ?? {}))).sort()
+    : s.unseeded ?? [];
   return {
     kind: 'verified',
     forfeited,
     houseMissing: t.seeds[0] === '',
     droppedReveal,
-    unseeded: s.unseeded ?? [],
+    unseeded,
     bettorSeeds: bettors.length - forfeited.length,
     mine,
     watchedClose: !!seen,
