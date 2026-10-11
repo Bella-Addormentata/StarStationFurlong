@@ -324,6 +324,8 @@ describe('the dialog', () => {
     showArcadeCard({ itemId: 'arcade-2', seats: 1, isOwner: () => false });
     const [first, second] = body.children;
     expect(first.removed).toBe(true); // the second cabinet's card replaced it
+    // Above a device focused meanwhile (its host is 4500), as the gear card is.
+    expect(second.style.cssText).toContain('z-index:4600');
     closeArcadeCardFor(ITEM);
     expect(second.removed).toBe(false); // not that cabinet's card
     closeArcadeCardFor();

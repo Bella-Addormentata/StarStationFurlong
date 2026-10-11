@@ -194,7 +194,12 @@ export function openArcadeCard(host: HTMLElement, deps: ArcadeCardDeps, placemen
     position:${placement}; top:${placement === 'fixed' ? 128 : 76}px; right:24px; width:340px; max-width:calc(100vw - 32px); max-height:80vh; overflow-y:auto;
     background:rgba(4,8,22,0.94); border:1px solid rgba(212,168,75,0.3); border-radius:10px;
     box-shadow:0 10px 48px rgba(0,0,0,0.85); padding:14px; display:flex; flex-direction:column; gap:10px;
-    font-family:'SF Mono','Monaco','Consolas',monospace; color:${GOLD}; pointer-events:auto; box-sizing:border-box; z-index:40;`;
+    font-family:'SF Mono','Monaco','Consolas',monospace; color:${GOLD}; pointer-events:auto; box-sizing:border-box;
+    z-index:${placement === 'fixed' ? 4600 : 40};`;
+  // Over the room view it is page-level, like the gear card (settingsGear.ts):
+  // above the focused-device host (4500), so a device focused while it is
+  // open can't hide it (and its Esc never closes a card nobody sees), and
+  // below the SpacePhone (5000).
 
   let shown = '';
   const render = (): void => {
