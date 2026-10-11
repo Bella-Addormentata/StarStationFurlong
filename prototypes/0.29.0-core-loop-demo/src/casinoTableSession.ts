@@ -550,7 +550,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     refreshRail();
   };
 
-  /** Pick my chips put down this window back off a box (refund → hand). */
+  /** Pick my chips put down this window back off a box (refunded; into the
+   *  hand when it is empty). */
   const takeBack = (rg: FeltRegion<Spot>): boolean => {
     syncWindow();
     const key = spotKey(rg.bet);
@@ -577,7 +578,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     writeBets(keep);
     creditChips(me, sumOf(back));
     added.delete(key);
-    hand = [...hand, ...back].slice(0, HAND_MAX);
+    // An empty hand picks them up; a loaded hand is already the stake you're
+    // betting with, so they just go back to the rail.
+    if (hand.length === 0) hand = back.slice(0, HAND_MAX);
     refreshRail();
     return true;
   };
@@ -693,8 +696,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return;
     }
     if (!rg) return;
+    // Your own chips from this round come back first; anywhere else, the
+    // hand bets.
+    if (takeBack(rg)) return;
     if (hand.length > 0) placeHand(rg);
-    else if (!takeBack(rg)) say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
+    else say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
   };
 
   const onUp = (e: PointerEvent): void => {

@@ -165,10 +165,16 @@ export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[]
  *  player clockwise with a line bet; otherwise nobody (the stickman throws). */
 export function shooterForClose(tableId: string, s: CrapsTableState, now = Date.now()): string | undefined {
   const seated = seatedPlayers(tableId, now);
-  if (s.shooter !== undefined && seated.some((p) => p.pid === s.shooter)) return s.shooter;
-  if (s.point !== null) return undefined; // the shooter left mid-hand: the stickman finishes it
+  const stillHere = s.shooter !== undefined && seated.some((p) => p.pid === s.shooter);
+  if (s.point !== null) {
+    // Mid-hand the shooter keeps the dice; if they left, the stickman finishes.
+    return stillHere ? s.shooter : undefined;
+  }
+  // A come-out needs a line bet from whoever rolls — the shooter included.
   const bets = readAllCrapsBets(tableId);
-  return pickShooter(seated, (pid) => hasLineBet(bets[pid] ?? []), s.shooter ?? s.lastShooter) ?? undefined;
+  const eligible = (pid: string) => hasLineBet(bets[pid] ?? []);
+  if (stillHere && eligible(s.shooter!)) return s.shooter;
+  return pickShooter(seated, eligible, s.shooter ?? s.lastShooter) ?? undefined;
 }
 
 /** The stickman throws for the table (no shooter, or the shooter ran out of

@@ -27,6 +27,7 @@
  */
 
 import {
+  casinoDocEpoch,
   creditChips,
   readAllCrapsBets,
   readCrapsBackendPref,
@@ -84,6 +85,7 @@ class LocalCrapsBackend implements CrapsBackend {
     // HOW the dice are produced is the table's fairness mode (rng / commit-reveal
     // / multiparty / block-beacon), per-table override or the global default.
     const mode = readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
+    const epoch = casinoDocEpoch();
     const { dice, transcript } = await produceRoll(mode, tableId, round);
     // The hashing yielded — the table may have been REMOVED meanwhile
     // (closeCrapsTable refunded every felt and wiped the table keys, #87
@@ -91,6 +93,9 @@ class LocalCrapsBackend implements CrapsBackend {
     // out bets that were already refunded — abort instead.
     const before = readCrapsTableState(tableId);
     if (before == null) return dice;
+    // 🎲 #226: or the room doc rebound / the table was recreated under the
+    // same id: only settle the very roll this call was started for.
+    if (casinoDocEpoch() !== epoch || before.round !== round || before.phase === 'settled') return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     const { payouts, remaining } = resolveCrapsRound(
