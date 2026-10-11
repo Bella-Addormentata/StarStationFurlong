@@ -50,7 +50,7 @@ import { CRAPS_PAGE_ID, selectCrapsBackend } from './crapsBackend';
 import { getCrapsFairnessMode } from './games/diceFairness';
 // ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
 // at "no more bets" (fairTableSeeds.ts).
-import { freezeCommits, frozenFields, houseSeedHeld, isFairTable, newHouseCommit } from './fairTableSeeds';
+import { freezeCommits, frozenFields, isFairTable, newHouseCommit, roundSettleable } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet come-out table never throws to an empty felt). */
@@ -234,7 +234,7 @@ export function stickmanThrows(tableId: string, s: CrapsTableState, autoShowMs?:
   if (settling.has(tableId)) return;
   // ⚖️ A Fair round whose house seed this page doesn't hold (a takeover) is
   // void: settle it with no throw, so no client animates dice for it.
-  if ((s.houseCommit || frozenFields(tableId, s).houseCommit) && !houseSeedHeld(tableId, s)) {
+  if ((s.houseCommit || frozenFields(tableId, s).houseCommit) && !roundSettleable(tableId, s)) {
     rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
     return;
   }
@@ -294,7 +294,7 @@ export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Dat
   // ⚖️ A Fair window this page can't reveal the house seed for is void: settle
   // it now, before any shooter or the stickman throws dice for it.
   // (A robot-run table gets its usual show beat, so it opens the next window.)
-  if (next.houseCommit && !houseSeedHeld(tableId, next)) {
+  if (next.houseCommit && !roundSettleable(tableId, next)) {
     rollAndSettleCraps(tableId, next.round, next.point, manual ? undefined : CRAPS_SHOW_MS);
   }
 }

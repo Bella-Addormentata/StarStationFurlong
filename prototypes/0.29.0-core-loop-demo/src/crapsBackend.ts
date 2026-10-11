@@ -43,7 +43,7 @@ import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
-import { frozenFields, frozenWagers, gatherRound, houseSeedHeld, settledRound } from './fairTableSeeds';
+import { frozenFields, frozenWagers, gatherRound, roundSettleable, settledRound } from './fairTableSeeds';
 import { getPlayerId } from './identity';
 
 /** This page, as a manual table's operator: player id plus a per-load nonce,
@@ -109,7 +109,7 @@ class LocalCrapsBackend implements CrapsBackend {
     // owner switched the table to since; the switch takes effect next window.
     if (closing?.houseCommit && closing.phase === 'closing' && closing.round === round) {
       // ⚖️ The live Fair roll: the house seed + every frozen bettor's reveal.
-      if (!houseSeedHeld(tableId, closing)) {
+      if (!roundSettleable(tableId, closing)) {
         // ⚖️ No house seed to reveal (this page lost it): having seen every
         // bettor's reveal, the house could pick between outcomes by settling
         // without its seed. The roll is void: no dice, every bet stands.

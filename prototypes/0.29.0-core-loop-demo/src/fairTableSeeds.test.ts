@@ -619,6 +619,20 @@ describe('a Fair roulette round', () => {
     expect(isRouletteTableState({ ...base, phase: 'settled', payouts: { [AMY]: 20 }, voided: true })).toBe(false);
   });
 
+  it("a reloaded operator voids a round whose closing commits were rewritten without signatures", async () => {
+    const t = freshTable();
+    const closing = rouletteToClosing(t);
+    forgetMissingTables(new Set()); // reloaded: no snapshot of its own close
+    const forgedCommit = commitSeedSync('ab'.repeat(32), { room: '', table: t, round: 1, party: AMY, house: closing.houseCommit! });
+    writeTableState(t, { ...closing, commits: { ...closing.commits, [AMY]: forgedCommit } });
+    const before = readChips(AMY);
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    expect(readTableState(t)).toMatchObject({ phase: 'settled', voided: true, result: null });
+    expect(readChips(AMY)).toBe(before + 10);
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);
@@ -975,6 +989,23 @@ describe('a Fair craps roll', () => {
     rollAndSettleCraps(t, closing.round, closing.point);
     await flush();
     expect(readCrapsTableState(t)?.phase).toBe('closing');
+  });
+
+  it("a reloaded stickman voids a roll whose closing commits were rewritten without signatures", async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    const closing = readCrapsTableState(t)!;
+    forgetMissingTables(new Set());
+    writeCrapsTableState(t, { ...closing, commits: { [AMY]: 'c'.repeat(64) } });
+    stickmanThrows(t, readCrapsTableState(t)!);
+    await flush();
+    expect(readDiceThrow(t)).toBeNull();
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'settled', voided: true, dice: null });
   });
 
   it('settles only frozen bettors whose wager lists still match', () => {

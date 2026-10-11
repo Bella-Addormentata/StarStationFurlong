@@ -343,6 +343,22 @@ export function houseSeedHeld(tableId: string, s: TableState): boolean {
   return !!house && !!seedFor(house, houseCtx(tableId, s.round));
 }
 
+/** Whether every frozen bettor's commitment carries its own signature (the
+ *  frozen `sigs`, under the player's pinned key). A page that didn't freeze
+ *  the round itself (a reload) reads the peer-written closing fields, so a
+ *  forged party could slip in there: such a round is void, never settled. */
+export function frozenPartiesSigned(tableId: string, s: TableState): boolean {
+  const fz = frozenFields(tableId, s);
+  const ctxState: TableState = fz.houseCommit ? { ...s, houseCommit: fz.houseCommit } : s;
+  return Object.entries(fz.commits ?? {}).every(([pid, commit]) => signedBy(tableId, ctxState, pid, commit, fz.sigs?.[pid]));
+}
+
+/** Can this page settle the Fair round? It must hold the house seed, and every
+ *  frozen party must be signed — otherwise the round is void. */
+export function roundSettleable(tableId: string, s: TableState): boolean {
+  return houseSeedHeld(tableId, s) && frozenPartiesSigned(tableId, s);
+}
+
 function roundKey(tableId: string, round: number, house: string | undefined): string {
   return `${casinoDocEpoch()}:${tableId}:${round}:${house ?? ''}`;
 }

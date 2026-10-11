@@ -45,9 +45,7 @@ import type { RouletteTableState } from './games/roulette';
 import { settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the house + bettors' seed exchange (fairTableSeeds.ts).
-import {
-  freezeCommits, frozenFields, frozenWagers, gatherRound, isFairTable, newHouseCommit, settledRound,
-} from './fairTableSeeds';
+import { freezeCommits, frozenFields, frozenPartiesSigned, frozenWagers, gatherRound, isFairTable, newHouseCommit, settledRound } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet table never spins nothing). */
@@ -128,7 +126,12 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   let voided = false;
   // A round opened Fair (it carries a house commit) settles Fair, whatever the
   // owner switched the table to since; the switch takes effect next round.
-  if (closing.houseCommit) {
+  if (closing.houseCommit && !frozenPartiesSigned(tableId, closing)) {
+    // ⚖️ A frozen party without its own signature (this page didn't freeze
+    // the round, and the closing fields were rewritten): never mixed or paid.
+    voided = true;
+    result = null;
+  } else if (closing.houseCommit) {
     const gathered = gatherRound(tableId, closing);
     if (!gathered) return; // reveals still due
     forfeited = gathered.forfeited;
