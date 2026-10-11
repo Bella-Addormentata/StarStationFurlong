@@ -1775,9 +1775,11 @@ const ARCADE_SCREEN_Y = 1.3;
 const ARCADE_TEX_W = 320;
 const ARCADE_TEX_H = 240;
 /** The double-wide cabinet: a 1.6 m body in a 2×1 footprint, two 4:3
- *  screens side by side drawn from one 8:3 canvas, four players' panels. */
+ *  screens side by side drawn from one 8:3 canvas, four players' panels.
+ *  Its depth is the single cabinet's: the screens tilt back into the upper
+ *  body's face, so a deeper body would bury their top edge. */
 const ARCADE_WIDE_W = 1.6;
-const ARCADE_WIDE_D = 0.8;
+const ARCADE_WIDE_D = ARCADE_D;
 const ARCADE_WIDE_SEATS = 4;
 
 /** The furniture kinds that are arcade cabinets (main.ts and world.ts tick
@@ -10739,7 +10741,7 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
       place(new THREE.CylinderGeometry(0.02, 0.02, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), cx + bx, 1.0, 0.31);
     }
     place(new THREE.BoxGeometry(0.08, 0.1, 0.02), m(0x3d4a5e, 0.5, 0.5), cx, 0.5, d / 2 - 0.005);
-    place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 - 0.006);
+    place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 + 0.003);
   }
   // Marquee across the top.
   place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
