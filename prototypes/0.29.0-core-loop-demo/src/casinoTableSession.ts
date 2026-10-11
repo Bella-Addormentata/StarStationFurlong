@@ -71,7 +71,7 @@ import { getPlayerId } from './identity';
 export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { text: string; color: string; fair: boolean } {
   return roundIsFair(tableId, game)
     ? { text: '✔ FAIR TABLE · EVERY BETTOR ADDS A SEED · CHECK EACH RESULT ON ⚙', color: '#7CF5B0', fair: true }
-    : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F5C26B', fair: false };
+    : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F28B87', fair: false };
 }
 
 /** 🎡 A rival house member's SPIN lease is honoured this long before this

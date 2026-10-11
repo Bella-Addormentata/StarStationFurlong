@@ -84,7 +84,7 @@ export interface CasinoTableVisualHandle {
   setHighlight(ids: ReadonlySet<string>): void;
   /** Glow the ⚙️ button (pointer over it). */
   setSettingsHot(hot: boolean): void;
-  /** ⚖️ The plaque beside the ⚙️: a green FAIR or an amber FRIENDLY table. */
+  /** ⚖️ The plaque beside the ⚙️: a green-circled F (FAIR) or a red-circled F (FRIENDLY). */
   setFairBadge(fair: boolean): void;
   // 🎲 craps
   /** Move both pucks: OFF in the don't come bar, ON on the point. */
@@ -869,14 +869,28 @@ function plaqueCanvas(fair: boolean): HTMLCanvasElement {
   const c = cv.getContext('2d')!;
   c.fillStyle = '#14181F';
   c.fillRect(0, 0, cv.width, cv.height);
-  c.lineWidth = 8;
-  c.strokeStyle = fair ? '#3FBF7F' : '#D9A441';
-  c.strokeRect(4, 4, cv.width - 8, cv.height - 8);
-  c.fillStyle = fair ? '#7CF5B0' : '#F5C26B';
-  c.font = '900 50px "Trebuchet MS", sans-serif';
+  const ring = fair ? '#3FBF7F' : '#D9534F';
+  c.lineWidth = 6;
+  c.strokeStyle = ring;
+  c.strokeRect(3, 3, cv.width - 6, cv.height - 6);
+  // The "F" medallion: a green circle on a Fair table, a red one on a
+  // Friendly one. Both words start with F, so the word beside it says which
+  // (and doesn't lean on red vs green alone).
+  const r = 38;
+  const cx = 14 + r;
+  const cy = cv.height / 2;
+  c.beginPath();
+  c.arc(cx, cy, r, 0, Math.PI * 2);
+  c.fillStyle = ring;
+  c.fill();
+  c.fillStyle = '#FFFFFF';
+  c.font = '900 54px "Trebuchet MS", sans-serif';
   c.textAlign = 'center';
   c.textBaseline = 'middle';
-  c.fillText(fair ? '✔ FAIR' : 'FRIENDLY', cv.width / 2, cv.height / 2 + 3);
+  c.fillText('F', cx, cy + 3);
+  c.fillStyle = fair ? '#7CF5B0' : '#F28B87';
+  c.font = `900 ${fair ? 52 : 42}px "Trebuchet MS", sans-serif`;
+  c.fillText(fair ? 'FAIR' : 'FRIENDLY', (cx + r + cv.width) / 2, cy + 3);
   return cv;
 }
 
