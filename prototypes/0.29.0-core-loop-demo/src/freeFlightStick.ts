@@ -31,6 +31,7 @@
  */
 
 import type { StickInput } from './freeFlight';
+import { isFormFieldTarget } from './typingFocus';
 
 const BINDINGS: Array<[string[], string]> = [
   [['KeyW', 'ArrowUp'], 'thrust+'],
@@ -54,11 +55,6 @@ const held = new Set<string>();
  *  another (the phone over the theatre). */
 let standingAside = 0;
 
-function isTyping(target: EventTarget | null): boolean {
-  const el = target as HTMLElement | null;
-  return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true);
-}
-
 /** Whether the key was pressed with focus inside a panel marked
  *  `data-stick-aside` (the phone's TV remote): the key is the panel's. */
 function insideStandingAsidePanel(target: EventTarget | null): boolean {
@@ -73,7 +69,7 @@ export function isFlightKey(code: string): boolean {
 }
 
 function onKeyDown(e: KeyboardEvent): void {
-  if (!taken || standingAside > 0 || isTyping(e.target) || insideStandingAsidePanel(e.target)) return;
+  if (!taken || standingAside > 0 || isFormFieldTarget(e.target as HTMLElement | null) || insideStandingAsidePanel(e.target)) return;
   const action = ACTION_OF.get(e.code);
   if (!action) return;
   held.add(e.code);

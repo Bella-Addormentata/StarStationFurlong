@@ -39,6 +39,7 @@ import type {
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
   AirHockeyVisualHandle,
+  AlligatorsVisualHandle,
   PropAnimHandle,
 } from "./devices";
 // 🪙 Coin pusher visual driver: the cabinet draws the engine's cross-section —
@@ -52,9 +53,27 @@ import {
 import {
   AH_SURFACE_Y, AH_HALF_W, AH_HALF_L, AH_GOAL_HALF_W, AH_PUCK_R, AH_MALLET_R,
 } from "./games/airHockey";
+// 🐊 #185: the alligators table is sized by the engine's geometry the same
+// way — pivots, mouths, the rim and the ball all come from one source.
+import {
+  IA_BALL_R, IA_BASE_R, IA_HEAD_LEN, IA_MAX_BALLS, IA_MOUTH_R, IA_SEATS,
+  IA_SEAT_COLORS, IA_SURFACE_Y, IA_TABLE_R, birdAngle, pivotOf, seatAngle,
+} from "./games/alligators";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
+import { pieceColor, isKing } from "./games/checkers";
+import type { CheckersColor } from "./games/checkers";
+import {
+  BOARD_TEX_PX,
+  BOARD_PAD_PX,
+  BOARD_SQ_PX,
+  BOARD_SQ_M,
+  BOARD_SIZE_M,
+  cellCenterLocal,
+  cellFromUV,
+} from "./games/checkersTable";
+import type { BoardMarks } from "./games/checkersTable";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey, readCoinPusherState } from "./casinoDoc";
@@ -160,6 +179,7 @@ export type FurnitureKind =
   | "slot-machine"
   | "coin-pusher"
   | "air-hockey-table"
+  | "alligators-table"
   // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
   | "cake-table"
   | "gift-box"
@@ -2400,20 +2420,36 @@ const GT_SQ_LIGHT = "#EAD9B0";
 const GT_SQ_DARK = "#7A4A28";
 const GT_FRAME = "#4A2F1B";
 const GT_RED = "#C43C3C";
-const GT_RED_RIM = "#8E2626";
 const GT_BLACK = "#23252E";
-const GT_BLACK_RIM = "#0E0F14";
 const GT_CROWN = "#F0C060";
+const GT_TURN_BLACK = "#9AA3B2"; // black's turn strip — dark-on-dark would vanish
+/** Checker piece size (m): radius a little under half a square, and height. */
+const GT_PIECE_R = BOARD_SQ_M * 0.38;
+const GT_PIECE_H = 0.013;
+/** Board-face surface height in the top group's frame (slab half-height). */
+const GT_FACE_Y = 0.037;
+/** Where the ⚙ token sits on the top (beside the board, toward +x). */
+const GT_GEAR_X = 0.6;
+const GT_GEAR_R = 0.055;
 
-/** Board-face painter shared by the builder (in-world texture). Kept board-
- *  code-compatible with games/checkers.ts (1/2 red man/king, 3/4 black). */
+/** Board-face painter (in-world texture). Since #227 the pieces are 3D
+ *  meshes, so the face carries only what belongs ON the wood: the squares,
+ *  the frame, a glowing strip on the frame at the end whose turn it is (so
+ *  spectators read the turn from across the room), and the LOCAL player's
+ *  move marks. Geometry comes from games/checkersTable.ts — the same numbers
+ *  place the pieces and pick the clicked cell. */
 function drawCheckerboard(
   c2d: CanvasRenderingContext2D,
-  board: number[] | null,
+  turn: CheckersColor | null,
+  marks: BoardMarks | null,
 ): void {
-  const S = 512,
-    PAD = 32,
-    SQ = (S - PAD * 2) / 8; // 56 px squares
+  const S = BOARD_TEX_PX,
+    PAD = BOARD_PAD_PX,
+    SQ = BOARD_SQ_PX;
+  const at = (idx: number) => ({
+    x: PAD + (idx % 8) * SQ,
+    y: PAD + Math.floor(idx / 8) * SQ,
+  });
   c2d.imageSmoothingEnabled = false;
   c2d.fillStyle = GT_FRAME;
   c2d.fillRect(0, 0, S, S);
@@ -2423,29 +2459,75 @@ function drawCheckerboard(
       c2d.fillRect(PAD + c * SQ, PAD + r * SQ, SQ, SQ);
     }
   }
-  if (!board) return;
-  for (let idx = 0; idx < 64; idx++) {
-    const v = board[idx];
-    if (v === 0) continue;
-    const red = v === 1 || v === 2;
-    const king = v === 2 || v === 4;
-    const cx = PAD + (idx % 8) * SQ + SQ / 2;
-    const cy = PAD + Math.floor(idx / 8) * SQ + SQ / 2;
-    c2d.beginPath();
-    c2d.arc(cx, cy, SQ * 0.36, 0, Math.PI * 2);
-    c2d.fillStyle = red ? GT_RED : GT_BLACK;
-    c2d.fill();
-    c2d.lineWidth = 4;
-    c2d.strokeStyle = red ? GT_RED_RIM : GT_BLACK_RIM;
-    c2d.stroke();
-    if (king) {
-      c2d.fillStyle = GT_CROWN;
-      c2d.font = "bold 26px monospace";
-      c2d.textAlign = "center";
-      c2d.textBaseline = "middle";
-      c2d.fillText("K", cx, cy + 1);
-    }
+  // Turn strip: red plays from the canvas bottom (rows 5–7), black the top.
+  if (turn) {
+    c2d.fillStyle = turn === "red" ? GT_RED : GT_TURN_BLACK;
+    const y = turn === "red" ? S - PAD + 8 : 8;
+    c2d.fillRect(PAD, y, S - PAD * 2, PAD - 16);
   }
+  if (!marks) return;
+  // Movable pieces: a gold ring that shows past the disc's edge.
+  c2d.lineWidth = 4;
+  c2d.strokeStyle = "rgba(240, 192, 96, 0.8)";
+  for (const idx of marks.movable) {
+    const { x, y } = at(idx);
+    c2d.beginPath();
+    c2d.arc(x + SQ / 2, y + SQ / 2, SQ * 0.45, 0, Math.PI * 2);
+    c2d.stroke();
+  }
+  if (marks.selected !== null) {
+    const { x, y } = at(marks.selected);
+    c2d.lineWidth = 6;
+    c2d.strokeStyle = GT_CROWN;
+    c2d.strokeRect(x + 3, y + 3, SQ - 6, SQ - 6);
+  }
+  c2d.fillStyle = GT_CROWN;
+  for (const idx of marks.targets) {
+    const { x, y } = at(idx);
+    c2d.beginPath();
+    c2d.arc(x + SQ / 2, y + SQ / 2, SQ * 0.16, 0, Math.PI * 2);
+    c2d.fill();
+  }
+  if (marks.hover !== null) {
+    const { x, y } = at(marks.hover);
+    c2d.lineWidth = 3;
+    c2d.strokeStyle = "#FFFFFF";
+    c2d.strokeRect(x + 1.5, y + 1.5, SQ - 3, SQ - 3);
+  }
+}
+
+/** The ⚙ settings token (#227, after #226's settings button): a brass disc
+ *  with a procedurally drawn gear, so it reads the same on every platform
+ *  (no emoji font in a CanvasTexture). */
+function drawSettingsToken(c2d: CanvasRenderingContext2D): void {
+  const S = 128,
+    C = S / 2;
+  c2d.clearRect(0, 0, S, S);
+  c2d.beginPath();
+  c2d.arc(C, C, C - 2, 0, Math.PI * 2);
+  c2d.fillStyle = "#2A1A0E";
+  c2d.fill();
+  c2d.lineWidth = 6;
+  c2d.strokeStyle = GT_CROWN;
+  c2d.stroke();
+  const teeth = 8,
+    outer = 40,
+    inner = 31;
+  c2d.beginPath();
+  for (let i = 0; i < teeth * 2; i++) {
+    const a0 = (i / (teeth * 2)) * Math.PI * 2;
+    const a1 = ((i + 1) / (teeth * 2)) * Math.PI * 2;
+    const rad = i % 2 === 0 ? outer : inner;
+    c2d.lineTo(C + Math.cos(a0) * rad, C + Math.sin(a0) * rad);
+    c2d.lineTo(C + Math.cos(a1) * rad, C + Math.sin(a1) * rad);
+  }
+  c2d.closePath();
+  c2d.fillStyle = GT_CROWN;
+  c2d.fill();
+  c2d.beginPath();
+  c2d.arc(C, C, 13, 0, Math.PI * 2);
+  c2d.fillStyle = "#2A1A0E";
+  c2d.fill();
 }
 
 /** One-shot card-felt face: green baize, darker border, two card outlines +
@@ -2565,15 +2647,15 @@ const buildGameTable = (ctx: BuildCtx) => {
 
   // FACE A — checkerboard CanvasTexture (NearestFilter, wall-screen idiom).
   const boardCv = document.createElement("canvas");
-  boardCv.width = 512;
-  boardCv.height = 512;
+  boardCv.width = BOARD_TEX_PX;
+  boardCv.height = BOARD_TEX_PX;
   const boardC2d = boardCv.getContext("2d")!;
   const boardTex = new THREE.CanvasTexture(boardCv);
   boardTex.minFilter = THREE.NearestFilter;
   boardTex.magFilter = THREE.NearestFilter;
   boardTex.generateMipmaps = false;
   boardTex.colorSpace = THREE.SRGBColorSpace;
-  drawCheckerboard(boardC2d, null); // bare board until a game exists
+  drawCheckerboard(boardC2d, null, null); // bare board until a game exists
   const boardMat = new THREE.MeshBasicMaterial({
     map: boardTex,
     transparent: true,
@@ -2582,10 +2664,86 @@ const buildGameTable = (ctx: BuildCtx) => {
   // rotateX(-π/2) faces +y; the extra rotateY(π) points texture-up AWAY from
   // the device front (-z), so board row 0 (black home) reads at the far side
   // for the focused viewer — matching the DOM board's fixed orientation.
-  const boardGeo = new THREE.PlaneGeometry(0.74, 0.74);
+  // games/checkersTable.ts cellCenterLocal / cellFromUV mirror this exact
+  // lay-down — change one, change the other (checkersTable.test.ts pins it).
+  const boardGeo = new THREE.PlaneGeometry(BOARD_SIZE_M, BOARD_SIZE_M);
   boardGeo.rotateX(-Math.PI / 2);
   boardGeo.rotateY(Math.PI);
-  addTop(boardGeo, boardMat, 0, 0.037, 0);
+  const boardMesh = addTop(boardGeo, boardMat, 0, GT_FACE_Y, 0);
+
+  // 🎲 #227: the pieces are REAL 3D checkers on face A, seen by everyone in
+  // the room. Instanced (one draw per layer, capacity 64 — a malformed peer
+  // board can't overflow it): a base disc per piece, a second stacked disc
+  // for kings (the real-set crowning), and a gold band on the king's top.
+  // Children of the top group, so they ride the morph fade-in (ctx.m) and
+  // hide while the table flips / shows the card felt.
+  const pieces = new THREE.Group();
+  top.add(pieces);
+  const discGeo = new THREE.CylinderGeometry(GT_PIECE_R, GT_PIECE_R, GT_PIECE_H, 28);
+  const bandGeo = new THREE.TorusGeometry(GT_PIECE_R * 0.62, 0.0035, 6, 28);
+  bandGeo.rotateX(Math.PI / 2);
+  const layer = (geo: THREE.BufferGeometry, mat: THREE.Material) => {
+    const mesh = new THREE.InstancedMesh(geo, mat, 64);
+    mesh.count = 0;
+    mesh.frustumCulled = false; // instances span the board, not the origin
+    pieces.add(mesh);
+    return mesh;
+  };
+  const redMat = m(new THREE.Color(GT_RED).getHex(), 0.45, 0.05);
+  const blackMat = m(new THREE.Color(GT_BLACK).getHex(), 0.4, 0.1);
+  const goldMat = m(new THREE.Color(GT_CROWN).getHex(), 0.3, 0.7);
+  const redBase = layer(discGeo, redMat);
+  const blackBase = layer(discGeo, blackMat);
+  const redKing = layer(discGeo, redMat);
+  const blackKing = layer(discGeo, blackMat);
+  const crowns = layer(bandGeo, goldMat);
+  const placeAt = new THREE.Matrix4();
+  const layers = [redBase, blackBase, redKing, blackKing, crowns];
+  /** Cell of each instance, per layer — a ray that hits a raised checker
+   *  picks ITS cell (pickCell), not the board square behind it. */
+  const instanceCells: number[][] = layers.map(() => []);
+  const layPieces = (board: number[] | null): void => {
+    const n = [0, 0, 0, 0, 0];
+    const put = (li: number, idx: number, y: number) => {
+      const { x, z } = cellCenterLocal(idx);
+      placeAt.makeTranslation(x, y, z);
+      instanceCells[li][n[li]] = idx;
+      layers[li].setMatrixAt(n[li]++, placeAt);
+    };
+    for (let idx = 0; board && idx < 64; idx++) {
+      const v = board[idx];
+      const color = pieceColor(v);
+      if (!color) continue;
+      const red = color === "red";
+      put(red ? 0 : 1, idx, GT_FACE_Y + GT_PIECE_H / 2);
+      if (isKing(v)) {
+        put(red ? 2 : 3, idx, GT_FACE_Y + GT_PIECE_H * 1.5 + 0.001);
+        put(4, idx, GT_FACE_Y + GT_PIECE_H * 2 + 0.0015);
+      }
+    }
+    layers.forEach((mesh, i) => {
+      mesh.count = n[i];
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere(); // raycasts cull on it; instances moved
+    });
+  };
+
+  // ⚙ settings token beside the board (#227) — where players open the
+  // table's options and anyone can read who plays which side.
+  const gearCv = document.createElement("canvas");
+  gearCv.width = 128;
+  gearCv.height = 128;
+  drawSettingsToken(gearCv.getContext("2d")!);
+  const gearTex = new THREE.CanvasTexture(gearCv);
+  gearTex.colorSpace = THREE.SRGBColorSpace;
+  const gearMat = new THREE.MeshBasicMaterial({
+    map: gearTex,
+    transparent: true,
+    opacity: 0,
+  });
+  const gearGeo = new THREE.CircleGeometry(GT_GEAR_R, 32);
+  gearGeo.rotateX(-Math.PI / 2);
+  const gear = addTop(gearGeo, gearMat, GT_GEAR_X, GT_FACE_Y + 0.002, 0);
 
   // FACE B — card felt, facing -y until a flip brings it up.
   const feltCv = document.createElement("canvas");
@@ -2618,6 +2776,19 @@ const buildGameTable = (ctx: BuildCtx) => {
   let toAngle = 0;
   let cardsUp = false;
   let pendingComplete: (() => void) | null = null;
+  // The face's inputs, kept so either one can change without the other.
+  let board: number[] | null = null;
+  let turn: CheckersColor | null = null;
+  let marks: BoardMarks | null = null;
+  const repaint = (): void => {
+    drawCheckerboard(boardC2d, turn, marks);
+    boardTex.needsUpdate = true;
+  };
+  /** First hit on one of the face's meshes, only while it is face up. */
+  const hitFace = (ray: THREE.Raycaster, mesh: THREE.Object3D) => {
+    if (cardsUp || flipT < 1) return null;
+    return ray.intersectObject(mesh, false)[0] ?? null;
+  };
 
   const handle: GameTableTopHandle = {
     flip(onComplete?: () => void): boolean {
@@ -2626,6 +2797,7 @@ const buildGameTable = (ctx: BuildCtx) => {
       toAngle = fromAngle + Math.PI;
       flipT = 0;
       pendingComplete = onComplete ?? null;
+      pieces.visible = false; // the checkers don't swing round with the top
       return true;
     },
     isFlipping(): boolean {
@@ -2634,9 +2806,31 @@ const buildGameTable = (ctx: BuildCtx) => {
     isCardsUp(): boolean {
       return cardsUp;
     },
-    setBoard(board: number[] | null): void {
-      drawCheckerboard(boardC2d, board);
-      boardTex.needsUpdate = true;
+    setBoard(next: number[] | null, nextTurn: CheckersColor | null = null): void {
+      board = next;
+      turn = nextTurn;
+      layPieces(board);
+      repaint();
+    },
+    setMarks(next: BoardMarks | null): void {
+      marks = next;
+      repaint();
+    },
+    pickCell(ray: THREE.Raycaster): number | null {
+      if (cardsUp || flipT < 1) return null;
+      // Checkers first: from the oblique focus camera, a ray over a king's
+      // top lands ~5 cm further on when continued down to the board.
+      const piece = ray.intersectObjects(layers, false)[0];
+      if (piece?.instanceId !== undefined) {
+        const li = layers.findIndex((mesh) => mesh === piece.object);
+        const cell = instanceCells[li]?.[piece.instanceId];
+        if (cell !== undefined) return cell;
+      }
+      const uv = hitFace(ray, boardMesh)?.uv;
+      return uv ? cellFromUV(uv.x, uv.y) : null;
+    },
+    pickSettings(ray: THREE.Raycaster): boolean {
+      return hitFace(ray, gear) !== null;
     },
     update(deltaTime: number): void {
       if (flipT >= 1) return;
@@ -2650,6 +2844,7 @@ const buildGameTable = (ctx: BuildCtx) => {
         top.rotation.x = toAngle;
         top.position.y = GT_TOP_Y;
         cardsUp = !cardsUp;
+        pieces.visible = !cardsUp;
         if (pendingComplete) {
           const cb = pendingComplete;
           pendingComplete = null; // exactly once
@@ -2875,6 +3070,90 @@ const BRIDGE_PLANK_HALF = 0.04; // plank half-thickness → deck TOP offset
 /** ♨️ Tub water disc height (buildHotTub water mesh) — splash spawn point. */
 export const HOT_TUB_WATER_Y = 0.565;
 
+/**
+ * ♨️ Hot-tub radii (local metres) — ONE table, read by both tub builders AND
+ * by the seat templates.
+ *
+ * The seats are derived FROM the basin rather than hand-placed beside it:
+ * #187 asked for four usable places with room between the occupants, and
+ * "how far out can a fox sit" is a question about the water disc, not about
+ * the art. Sharing the table is also what stops the two tub kinds drifting
+ * apart again — the classic deck tub carried a byte-identical copy of the
+ * broken seat list, so #187's defect existed twice.
+ *
+ * #187 widened the BASIN and deliberately left `pedestal` alone. The
+ * pedestal is load-bearing in the layout sense: it stands on the lazy-pool
+ * island (island cylinder r 1.65), it is what a walker's body meets at the
+ * classic tub's 3×3 obstacle edge, and the footbridge's island end tucks
+ * under it. Growing it would drag the island disc, the river's hole in
+ * lazyRiverShape(), the swim-exclusion ellipse in getPoolIsland(),
+ * BRIDGE_Z_ISLAND and the deck standoff along with it, for a change the
+ * player reads at the rim anyway. The water grew INSIDE the pedestal
+ * instead: the rim wall thinned from 0.42 m to 0.28 m, and the basin went
+ * from ⌀2.56 m to ⌀2.84 m.
+ */
+export const HOT_TUB_R = {
+  /** Tiled base step, on the deck or on the pool island. UNCHANGED by #187. */
+  pedestal: 1.7,
+  /** Tiled drum wall; 0.08 inside the pedestal, which reads as its lip. */
+  drum: 1.62,
+  /** White cap-ring centre line. */
+  cap: 1.51,
+  /** Cap tube radius ⇒ the rim spans 1.41 → 1.61, flush with the drum. */
+  capTube: 0.1,
+  /**
+   * Cyan LED line, a flat torus of tube 0.04 at y 0.5 — inside the drum's
+   * 0.12 → 0.58 band, so the drum wall is what decides whether it is seen.
+   * It sits 0.05 short of that wall, the clearance it has always had (it
+   * was 1.46 + 0.04 against a 1.55 drum). It is deliberately NOT pinned to
+   * the cap's outer edge any more: #187 brings the cap out flush with the
+   * drum, and following it there would thread this ring THROUGH the wall.
+   */
+  glow: 1.53,
+  /** Dark disc just under the waterline — the basin falling away. */
+  shadow: 1.44,
+  /** The water surface. Every seat position is measured from this. */
+  water: 1.42,
+  /** Foam ring hugging the rim. */
+  foam: 1.3,
+  /** Ring the six jet swirls churn on. */
+  jets: 1.14,
+} as const;
+
+/**
+ * The surface bubbles were hand-scattered against the pre-#187 water disc
+ * (r 1.28), so their POSITIONS ride the same factor the basin grew by and
+ * keep that composition. Their radii do not: a bubble is a bubble.
+ */
+const HOT_TUB_BUBBLE_SPREAD = HOT_TUB_R.water / 1.28;
+
+/**
+ * 🌉 The hot tub standing on the lazy pool's island — the one tub the
+ * footbridge reaches — or null when the room has none.
+ *
+ * Keyed on what the bridge actually belongs to, not on an item id. The
+ * Classic Lido's deck tub was seeded with the island tub's id
+ * ("pool-hot-tub"), so every bridge rule that matched on that id handed a
+ * corner tub on open deck an arched walk over a bridge that is not there, a
+ * phantom bridge click strip, and a swim-exclusion island in its pool's
+ * corner. The bridge is drawn by buildLazyPool, so: a lazy pool, and a
+ * "hot-tub" standing on its island (the pool's own centre). Rooms seeded
+ * before the deck tub got its own id still carry the old one; keying on kind
+ * and place is what fixes those without a doc migration.
+ */
+export function islandHotTub(items: readonly FurnitureItem[]): FurnitureItem | null {
+  const pool = items.find((item) => item.kind === "lazy-pool");
+  if (!pool) return null;
+  return (
+    items.find(
+      (item) =>
+        item.kind === "hot-tub" &&
+        Math.abs(item.pos.x - pool.pos.x) < 1e-6 &&
+        Math.abs(item.pos.z - pool.pos.z) < 1e-6,
+    ) ?? null
+  );
+}
+
 /** Deck-TOP height of the footbridge at local z ∈ [island, shore]. */
 function bridgeTopAt(lz: number): number {
   const t = (lz - BRIDGE_Z_ISLAND) / (BRIDGE_Z_SHORE - BRIDGE_Z_ISLAND);
@@ -2893,7 +3172,7 @@ export function bridgeDeckY(
   x: number,
   z: number,
 ): number | null {
-  const tub = items.find((item) => item.id === "pool-hot-tub");
+  const tub = islandHotTub(items);
   if (!tub) return null;
   const lx = x - tub.pos.x;
   const lz = z - tub.pos.z;
@@ -2914,7 +3193,7 @@ export function isBridgeClick(
   x: number,
   z: number,
 ): boolean {
-  const tub = items.find((item) => item.id === "pool-hot-tub");
+  const tub = islandHotTub(items);
   if (!tub) return false;
   const lx = x - tub.pos.x;
   const lz = z - tub.pos.z;
@@ -2923,6 +3202,26 @@ export function isBridgeClick(
     lz >= BRIDGE_Z_ISLAND - 0.2 &&
     lz <= BRIDGE_Z_SHORE + 0.2
   );
+}
+
+/**
+ * 🌉 World point where the footbridge meets the tub island, or null when the
+ * room has no hot tub.
+ *
+ * findSeatAt routes a click on the bridge DECK into the tub, and has to pick
+ * which of the four spots. "Greatest sit.z" answered that while the seats
+ * were an east/west/north/south cross; #187's quadrant layout puts two seats
+ * on the south side, so the rule needs the thing it always meant — the spot
+ * nearest where the walk ends. Deriving it here keeps the bridge's geometry
+ * (and its unrotated-tub assumption, shared with bridgeDeckY/isBridgeClick)
+ * in the one module that owns it.
+ */
+export function hotTubBridgeLanding(
+  items: FurnitureItem[],
+): { x: number; z: number } | null {
+  const tub = islandHotTub(items);
+  if (!tub) return null;
+  return { x: tub.pos.x + BRIDGE_X, z: tub.pos.z + BRIDGE_Z_ISLAND };
 }
 const bunkBedSeats: SeatTemplate[] = [
   // 🛏️ The bed splits down the middle of its LONG axis: the FOOT half — the end
@@ -3108,37 +3407,86 @@ const poolSeats: SeatTemplate[] = [
   },
 ];
 
-// ── 🛁 Hot-tub seats — soak together (hot-tub, 4 spots) ──────────────────────
-// sitY 0.28: chest above the waterline of the raised drum, legs hidden inside.
-// Fronts are just outside the 3×3 obstacle (blocked ones fall back to the
-// nearest walkable cell via computeFront); sit positions are inside the tub.
+// ── 🛁 Hot-tub seats — four soakers, one per QUADRANT (#187) ────────────────
+/**
+ * The four spots have always existed; only two of them could ever be reached.
+ * The old boxes were an east half and a west half — each the FULL 3×3 depth —
+ * followed by a south half and a north half, and findSeatAt returns the first
+ * box that contains the point. The two halves listed first therefore covered
+ * the entire footprint: seat 2 was reachable only through the footbridge
+ * branch and seat 3 was unreachable by any click. The bunk bed hit this exact
+ * wall and was fixed this exact way (see bunkBedSeats) — boxes that PARTITION
+ * the footprint, one per seat.
+ *
+ * So: quadrants, with the occupants on the diagonals at the quadrant centres.
+ * Each box contains exactly its own seat, the four tile the 3×3 with no gap
+ * (a click anywhere on the tub lands in one of them) and no overlap beyond
+ * the shared edges, where the earlier-listed box wins deterministically.
+ *
+ * SPACING — the other half of #187. The occupants sit on a ring of radius
+ * HOT_TUB_SIT_R; neighbours are a quarter-turn apart, so their roots are
+ * HOT_TUB_SIT_R·√2 apart and the gap between two bodies is that less twice
+ * PLAYER_R (0.38 each, player.ts). At the old ring radius of 0.62 the gap was
+ * 0.12 m — shoulder to shoulder. At 0.82 it is 0.40 m, and a body's outer
+ * edge (1.20) still clears the rim's inner face (cap − capTube = 1.41) by
+ * 0.21 m. That pair of numbers is what sized the basin: a 1.28 m water disc
+ * cannot hold four foxes with room to spare, a 1.42 m one can.
+ *
+ * faceAngle points INWARD — the occupant's back is to the rim — on the π/4
+ * detents the avatar rig already snaps to.
+ *
+ * FRONTS stay on the AXES, one per side, rather than on the seat diagonals.
+ * A front has to be a walkable cell just outside the 3×3 obstacle, and the
+ * diagonal of that box at this radius is still inside the box's own x/z span;
+ * spreading the four approaches over the four sides also stops arrivals
+ * queueing on one.
+ *
+ * The lazy pool's island tub does not read them: buildSeatList replaces the
+ * front of all four with the footbridge's shore end (islandHotTub). Every
+ * other tub — the Classic Lido's corner tub on open deck — walks up to the
+ * quadrant it was asked for.
+ *
+ * sitY 0.28: chest above the waterline of the raised drum, legs hidden inside.
+ */
+/** Radius of the ring the four occupants sit on — see the spacing note above. */
+const HOT_TUB_SIT_R = 0.82;
+/** That ring resolved onto each axis: a seat sits at (±HOT_TUB_SIT_XZ, ±…). */
+const HOT_TUB_SIT_XZ = HOT_TUB_SIT_R / Math.SQRT2;
+/** Dry-land approach distance — just outside the 3×3 obstacle's half-extent. */
+const HOT_TUB_FRONT_R = 1.85;
+
 const hotTubSeats: SeatTemplate[] = [
+  // NE quadrant, approached from the NORTH deck.
   {
-    clickBox: { x0: 0.0, z0: -1.5, x1: 1.5, z1: 1.5 },
-    front: { x: 1.85, z: 0.0 },
-    sit: { x: 0.62, z: 0.0 },
-    faceAngle: -Math.PI / 2,
+    clickBox: { x0: 0.0, z0: -1.5, x1: 1.5, z1: 0.0 },
+    front: { x: 0.0, z: -HOT_TUB_FRONT_R },
+    sit: { x: HOT_TUB_SIT_XZ, z: -HOT_TUB_SIT_XZ },
+    faceAngle: -Math.PI / 4,
     sitY: 0.28,
   },
+  // SE quadrant, approached from the EAST deck.
   {
-    clickBox: { x0: -1.5, z0: -1.5, x1: 0.0, z1: 1.5 },
-    front: { x: -1.85, z: 0.0 },
-    sit: { x: -0.62, z: 0.0 },
-    faceAngle: Math.PI / 2,
+    clickBox: { x0: 0.0, z0: 0.0, x1: 1.5, z1: 1.5 },
+    front: { x: HOT_TUB_FRONT_R, z: 0.0 },
+    sit: { x: HOT_TUB_SIT_XZ, z: HOT_TUB_SIT_XZ },
+    faceAngle: (-3 * Math.PI) / 4,
     sitY: 0.28,
   },
+  // SW quadrant, approached from the SOUTH deck — and the spot the lazy
+  // pool's footbridge lands next to (hotTubBridgeLanding sits at x -0.2).
   {
-    clickBox: { x0: -1.5, z0: 0.0, x1: 1.5, z1: 1.5 },
-    front: { x: 0.0, z: 1.85 },
-    sit: { x: 0.0, z: 0.62 },
-    faceAngle: Math.PI,
+    clickBox: { x0: -1.5, z0: 0.0, x1: 0.0, z1: 1.5 },
+    front: { x: 0.0, z: HOT_TUB_FRONT_R },
+    sit: { x: -HOT_TUB_SIT_XZ, z: HOT_TUB_SIT_XZ },
+    faceAngle: (3 * Math.PI) / 4,
     sitY: 0.28,
   },
+  // NW quadrant, approached from the WEST deck.
   {
-    clickBox: { x0: -1.5, z0: -1.5, x1: 1.5, z1: 0.0 },
-    front: { x: 0.0, z: -1.85 },
-    sit: { x: 0.0, z: -0.62 },
-    faceAngle: 0,
+    clickBox: { x0: -1.5, z0: -1.5, x1: 0.0, z1: 0.0 },
+    front: { x: -HOT_TUB_FRONT_R, z: 0.0 },
+    sit: { x: -HOT_TUB_SIT_XZ, z: -HOT_TUB_SIT_XZ },
+    faceAngle: Math.PI / 4,
     sitY: 0.28,
   },
 ];
@@ -3188,20 +3536,11 @@ const classicPoolSeats: SeatTemplate[] = [
     faceAngle: -Math.PI / 4, sitY: POOL_SWIM_Y, swim: true },
 ];
 
-const classicHotTubSeats: SeatTemplate[] = [
-  { clickBox: { x0: 0.0, z0: -1.5, x1: 1.5, z1: 1.5 },
-    front: { x: 1.85, z: 0.0 }, sit: { x: 0.62, z: 0.0 },
-    faceAngle: -Math.PI / 2, sitY: 0.28 },
-  { clickBox: { x0: -1.5, z0: -1.5, x1: 0.0, z1: 1.5 },
-    front: { x: -1.85, z: 0.0 }, sit: { x: -0.62, z: 0.0 },
-    faceAngle: Math.PI / 2, sitY: 0.28 },
-  { clickBox: { x0: -1.5, z0: 0.0, x1: 1.5, z1: 1.5 },
-    front: { x: 0.0, z: 1.85 }, sit: { x: 0.0, z: 0.62 },
-    faceAngle: Math.PI, sitY: 0.28 },
-  { clickBox: { x0: -1.5, z0: -1.5, x1: 1.5, z1: 0.0 },
-    front: { x: 0.0, z: -1.85 }, sit: { x: 0.0, z: -0.62 },
-    faceAngle: 0, sitY: 0.28 },
-];
+// 🛁 The classic pool's deck tub used to carry a byte-identical copy of the
+// hot-tub seat list, which is why #187's "only two of the four spots can be
+// clicked" was one bug in two places. There is one list now — hotTubSeats,
+// above — and the registry points both tub kinds at it. The two tubs are the
+// same object with different paint; only their builders differ.
 
 // 🎰 Roulette table (2×1 footprint): 6 standing positions ringing it. The -x
 // SHORT END is the WHEEL HEAD — reserved for the owner / their croupier robot.
@@ -3472,6 +3811,375 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     },
   };
   felt.userData.airHockey = handle; // collected by World.registerFurnitureGroup
+};
+
+// 🐊 Insatiable alligators (#185): eight stands ringing the round table, one
+// behind each head's pivot. The craps/roulette stand model — the walk-up
+// picker takes the nearest free one, and the template INDEX is the seat.
+// Each stand sits on the seat's outward ray where it clears the 3×3
+// footprint by 0.4 m on its far axis (the air-hockey clearance rule), so the
+// diagonal seats stand out at the footprint's corners.
+const alligatorsStands: StandTemplate[] = Array.from({ length: IA_SEATS }, (_, i) => {
+  const a = seatAngle(i);
+  const dx = Math.cos(a);
+  const dz = Math.sin(a);
+  const k = 1.9 / Math.max(Math.abs(dx), Math.abs(dz));
+  return {
+    stand: { x: Math.round(dx * k * 1000) / 1000, z: Math.round(dz * k * 1000) / 1000 },
+    faceAngle: Math.atan2(-dx, -dz), // toward the table centre
+  };
+});
+
+// ── 🐊 Insatiable-alligators table builder (#185) ────────────────────────────
+// A round 2.2 m table on a pedestal inside the 3×3 footprint, its playfield
+// sized exactly by the engine constants. The felt turns on a separate group
+// (the every-10-seconds spin); the rim, the eight heads on their base
+// housings, the eight counter displays with a bird on each, and the balls are
+// fixed to the table. Everything animated is driven through the
+// AlligatorsVisualHandle — heads fold up from under the table only when their
+// seat is claimed.
+/** How far a head's snout tilts up while its mouth is open (rad). */
+const IA_JAW_TILT = 0.55;
+/** A stowed head's fold (rad): pitched down past vertical, under the rim. */
+const IA_STOW_PITCH = 1.75;
+/** Head hinge height above the surface. */
+const IA_HINGE_Y = 0.07;
+/** Ball colours — pastel eggs. */
+const IA_EGG_COLORS = [0xf4efe2, 0xf2c6d8, 0xc6e2f2, 0xf2e6a8, 0xcdeec0, 0xe0cdf2];
+
+const buildAlligatorsTable = (ctx: BuildCtx): void => {
+  const { m, place, attach } = ctx;
+  const S = IA_SURFACE_Y;
+
+  // Pedestal, foot and the round cabinet (top face AT the playing surface).
+  place(new THREE.CylinderGeometry(0.72, 0.78, 0.06, 40), m(0x17261d, 0.6, 0.2), 0, 0.03, 0);
+  place(new THREE.CylinderGeometry(0.32, 0.46, S - 0.26, 28), m(0x1d3326, 0.55, 0.25), 0, 0.06 + (S - 0.26) / 2, 0);
+  const cabinet = place(
+    new THREE.CylinderGeometry(1.12, 1.0, 0.22, 56),
+    m(0x24452f, 0.5, 0.2),
+    0, S - 0.11, 0,
+  );
+  // Rim: a raised ring round the playfield.
+  const rimGeo = new THREE.TorusGeometry(IA_TABLE_R + 0.05, 0.05, 10, 72);
+  rimGeo.rotateX(Math.PI / 2);
+  place(rimGeo, m(0xb8a46a, 0.35, 0.55), 0, S + 0.02, 0);
+
+  // The spinning top — CanvasTexture (NearestFilter, the wall-screen idiom):
+  // a lily-pond swirl whose spokes and pads make the spin readable.
+  const feltCv = document.createElement("canvas");
+  feltCv.width = 512;
+  feltCv.height = 512;
+  const c2d = feltCv.getContext("2d")!;
+  c2d.fillStyle = "#123a3a";
+  c2d.fillRect(0, 0, 512, 512);
+  for (let ring = 5; ring >= 1; ring--) {
+    c2d.fillStyle = ring % 2 === 0 ? "#174848" : "#1b5450";
+    c2d.beginPath();
+    c2d.arc(256, 256, ring * 50, 0, Math.PI * 2);
+    c2d.fill();
+  }
+  c2d.strokeStyle = "#2f7a62";
+  c2d.lineWidth = 5;
+  for (let spoke = 0; spoke < 16; spoke++) {
+    const a = (spoke / 16) * Math.PI * 2;
+    c2d.beginPath();
+    c2d.moveTo(256 + Math.cos(a) * 40, 256 + Math.sin(a) * 40);
+    c2d.quadraticCurveTo(
+      256 + Math.cos(a + 0.5) * 150, 256 + Math.sin(a + 0.5) * 150,
+      256 + Math.cos(a + 0.8) * 250, 256 + Math.sin(a + 0.8) * 250,
+    );
+    c2d.stroke();
+  }
+  c2d.fillStyle = "#3f9a5a"; // lily pads
+  for (let pad = 0; pad < 6; pad++) {
+    const a = (pad / 6) * Math.PI * 2 + 0.3;
+    c2d.beginPath();
+    c2d.arc(256 + Math.cos(a) * 165, 256 + Math.sin(a) * 165, 18, 0.4, Math.PI * 2);
+    c2d.lineTo(256 + Math.cos(a) * 165, 256 + Math.sin(a) * 165);
+    c2d.fill();
+  }
+  c2d.fillStyle = "#e8d070"; // centre boss
+  c2d.beginPath();
+  c2d.arc(256, 256, 22, 0, Math.PI * 2);
+  c2d.fill();
+  const feltTex = new THREE.CanvasTexture(feltCv);
+  feltTex.minFilter = THREE.NearestFilter;
+  feltTex.magFilter = THREE.NearestFilter;
+  feltTex.generateMipmaps = false;
+  feltTex.colorSpace = THREE.SRGBColorSpace;
+  const feltGeo = new THREE.CircleGeometry(IA_TABLE_R, 72);
+  feltGeo.rotateX(-Math.PI / 2);
+  const top = new THREE.Group();
+  top.position.y = S + 0.002;
+  top.add(new THREE.Mesh(feltGeo, new THREE.MeshBasicMaterial({
+    map: feltTex,
+    transparent: true,
+    opacity: 0, // morph fade-in contract — World tweens it up
+  })));
+  attach(top);
+
+  // ── Heads: base housing (a solid bumper in the engine), and the head
+  // itself: hinge (inward) → fold (stow pitch) → swing → lunge → skull
+  // (jaw tilt about its back). Upper jaw only, as the issue asks. ──
+  interface HeadRig {
+    fold: THREE.Group;
+    swing: THREE.Group;
+    lunge: THREE.Group;
+    skull: THREE.Group;
+    foldNow: number;
+    foldTarget: number;
+  }
+  const heads: HeadRig[] = [];
+  const toothGeo = new THREE.ConeGeometry(0.013, 0.04, 4);
+  toothGeo.rotateX(Math.PI); // points down
+  for (let seat = 0; seat < IA_SEATS; seat++) {
+    const p = pivotOf(seat);
+    const a = seatAngle(seat);
+    const inward = Math.atan2(-Math.cos(a), -Math.sin(a));
+    const collar = IA_SEAT_COLORS[seat];
+
+    // A low mossy mound the head rises out of, ringed at its foot in the
+    // seat's colour.
+    const moundGeo = new THREE.SphereGeometry(IA_BASE_R, 28, 10, 0, Math.PI * 2, 0, Math.PI / 2);
+    moundGeo.scale(1, 0.32, 1);
+    place(moundGeo, m(0x2c5a3a, 0.7, 0.05), p.x, S, p.z);
+    const collarGeo = new THREE.TorusGeometry(IA_BASE_R, 0.016, 6, 32);
+    collarGeo.rotateX(Math.PI / 2);
+    place(collarGeo, m(collar, 0.4, 0.2, collar, 0.35), p.x, S + 0.012, p.z);
+
+    const hinge = new THREE.Group();
+    hinge.position.set(p.x, S + IA_HINGE_Y, p.z);
+    hinge.rotation.y = inward;
+    const fold = new THREE.Group();
+    fold.rotation.x = IA_STOW_PITCH;
+    fold.visible = false;
+    const swing = new THREE.Group();
+    const lunge = new THREE.Group();
+    const skull = new THREE.Group();
+    hinge.add(fold);
+    fold.add(swing);
+    swing.add(lunge);
+    lunge.add(skull);
+
+    const green = m(0x3f8f3a, 0.55, 0.1);
+    const dark = m(0x2e6b2b, 0.6, 0.1);
+    const belly = m(0xc9d98a, 0.6, 0.05);
+    const tooth = m(0xf6f2e4, 0.3, 0.05);
+    const mesh = (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number, parent: THREE.Object3D): THREE.Mesh => {
+      const o = new THREE.Mesh(geo, mat);
+      o.position.set(x, y, z);
+      parent.add(o);
+      return o;
+    };
+    // Little hands at the base (they stay put while the head lunges).
+    for (const sx of [-1, 1]) {
+      mesh(new THREE.BoxGeometry(0.06, 0.035, 0.09), green, sx * 0.13, -0.035, 0.07, swing);
+      for (const cx of [-0.018, 0, 0.018]) {
+        mesh(new THREE.BoxGeometry(0.01, 0.012, 0.025), tooth, sx * 0.13 + cx, -0.045, 0.125, swing);
+      }
+    }
+    // Neck collar in the seat's colour.
+    const neckRing = new THREE.TorusGeometry(0.1, 0.018, 6, 20);
+    mesh(neckRing, m(collar, 0.4, 0.2, collar, 0.3), 0, 0.01, 0.03, swing);
+    // Skull: the back of the head with the eyes, then the long snout and its
+    // wide rounded tip — the mouth footprint (IA_MOUTH_R) sits under the tip.
+    mesh(new THREE.BoxGeometry(0.21, 0.12, 0.2), green, 0, 0.02, 0.09, skull);
+    const snoutLen = IA_HEAD_LEN - 0.16;
+    mesh(new THREE.BoxGeometry(0.17, 0.065, snoutLen), green, 0, -0.005, 0.16 + snoutLen / 2, skull);
+    mesh(new THREE.BoxGeometry(0.15, 0.012, snoutLen), belly, 0, -0.04, 0.16 + snoutLen / 2, skull);
+    const tip = mesh(new THREE.CylinderGeometry(IA_MOUTH_R - 0.01, IA_MOUTH_R - 0.005, 0.065, 20), green, 0, -0.005, IA_HEAD_LEN, skull);
+    tip.scale.set(1, 1, 0.85);
+    for (let t = 0; t < 11; t++) {
+      // Teeth round the front half of the tip and along both jaw edges.
+      const ang = -Math.PI / 2 + (t / 10) * Math.PI;
+      mesh(toothGeo, tooth, Math.sin(ang) * (IA_MOUTH_R - 0.02), -0.05, IA_HEAD_LEN + Math.cos(ang) * (IA_MOUTH_R - 0.03) * 0.85, skull);
+    }
+    for (const sx of [-1, 1]) {
+      for (let t = 0; t < 4; t++) {
+        mesh(toothGeo, tooth, sx * 0.075, -0.05, 0.19 + t * 0.045, skull);
+      }
+      // Eyes on top of the head, nostrils on the tip, bumps along the snout.
+      const eye = mesh(new THREE.SphereGeometry(0.038, 12, 8), m(0xf0d040, 0.3, 0.05), sx * 0.065, 0.085, 0.07, skull);
+      mesh(new THREE.SphereGeometry(0.018, 8, 6), m(0x101010, 0.3, 0.05), 0, 0.012, 0.024, eye);
+      mesh(new THREE.SphereGeometry(0.014, 8, 6), dark, sx * 0.035, 0.032, IA_HEAD_LEN + 0.05, skull);
+      mesh(new THREE.BoxGeometry(0.03, 0.02, 0.03), dark, sx * 0.04, 0.032, 0.22, skull);
+    }
+    attach(hinge);
+    heads.push({ fold, swing, lunge, skull, foldNow: IA_STOW_PITCH, foldTarget: IA_STOW_PITCH });
+  }
+
+  // ── Counter displays (one per seat, beside it) with a bird on each ──
+  const DISPLAY_R = 1.2;
+  const DISPLAY_W = 0.26;
+  const DISPLAY_H = 0.17;
+  const DISPLAY_Y = S + 0.13;
+  interface DisplayRig {
+    cv: HTMLCanvasElement;
+    tex: THREE.CanvasTexture;
+    key: string;
+    count: number;
+    lit: boolean;
+    flashing: boolean;
+  }
+  const displays: DisplayRig[] = [];
+  interface BirdRig {
+    body: THREE.Group;
+    squat: number;
+  }
+  const birds: BirdRig[] = [];
+  for (let j = 0; j < IA_SEATS; j++) {
+    const a = birdAngle(j);
+    const dx = Math.cos(a);
+    const dz = Math.sin(a);
+    const out = Math.atan2(dx, dz); // plane +z → outward
+    // Bracket from the cabinet edge out to the display, then the casing.
+    place(new THREE.BoxGeometry(0.06, 0.05, 0.16), m(0x2a3644, 0.5, 0.4), dx * 1.1, S + 0.0, dz * 1.1, out);
+    place(new THREE.BoxGeometry(0.05, 0.1, 0.05), m(0x2a3644, 0.5, 0.4), dx * DISPLAY_R, S + 0.02, dz * DISPLAY_R, out);
+    place(new THREE.BoxGeometry(DISPLAY_W + 0.03, DISPLAY_H + 0.03, 0.06), m(0x141c24, 0.5, 0.4), dx * DISPLAY_R, DISPLAY_Y, dz * DISPLAY_R, out);
+    const cv = document.createElement("canvas");
+    cv.width = 128;
+    cv.height = 84;
+    const tex = new THREE.CanvasTexture(cv);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    // One texture on both faces (the air-hockey scoreboard note: the back
+    // plane's half turn already reads the right way round).
+    for (const face of [0, Math.PI]) {
+      const ox = dx * (DISPLAY_R + (face === 0 ? 0.031 : -0.031));
+      const oz = dz * (DISPLAY_R + (face === 0 ? 0.031 : -0.031));
+      place(new THREE.PlaneGeometry(DISPLAY_W, DISPLAY_H), new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 }), ox, DISPLAY_Y, oz, out + face);
+    }
+    displays.push({ cv, tex, key: "", count: 0, lit: false, flashing: false });
+
+    // The bird, facing in over the table, sitting on the display.
+    const bird = new THREE.Group();
+    bird.position.set(dx * DISPLAY_R, DISPLAY_Y + DISPLAY_H / 2 + 0.015, dz * DISPLAY_R);
+    bird.rotation.y = out + Math.PI;
+    const body = new THREE.Group();
+    bird.add(body);
+    const plume = m(0xf2a0b8, 0.6, 0.05);
+    const bodyMesh = new THREE.Mesh(new THREE.SphereGeometry(0.055, 14, 10), plume);
+    bodyMesh.scale.set(1, 0.85, 1.25);
+    bodyMesh.position.y = 0.047;
+    body.add(bodyMesh);
+    const headMesh = new THREE.Mesh(new THREE.SphereGeometry(0.034, 12, 8), plume);
+    headMesh.position.set(0, 0.105, 0.05);
+    body.add(headMesh);
+    const beak = new THREE.Mesh(new THREE.ConeGeometry(0.012, 0.04, 6), m(0xf0a030, 0.4, 0.05));
+    beak.rotation.x = Math.PI / 2;
+    beak.position.set(0, 0.1, 0.095);
+    body.add(beak);
+    for (const sx of [-1, 1]) {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.008, 6, 4), m(0x101010, 0.3, 0.05));
+      eye.position.set(sx * 0.022, 0.115, 0.075);
+      body.add(eye);
+      const wing = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.04, 0.08), m(0xe888a8, 0.6, 0.05));
+      wing.position.set(sx * 0.056, 0.05, -0.005);
+      body.add(wing);
+    }
+    attach(bird);
+    birds.push({ body, squat: 0 });
+  }
+
+  const drawDisplay = (seat: number, flashOn: boolean): void => {
+    const d = displays[seat];
+    const g = d.cv.getContext("2d")!;
+    const color = `#${IA_SEAT_COLORS[seat].toString(16).padStart(6, "0")}`;
+    const inverse = d.flashing && flashOn;
+    g.fillStyle = inverse ? color : "#070b10";
+    g.fillRect(0, 0, 128, 84);
+    g.strokeStyle = d.lit ? color : "#1c2630";
+    g.lineWidth = 4;
+    g.strokeRect(3, 3, 122, 78);
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.font = "bold 54px monospace";
+    g.fillStyle = !d.lit ? "#1c2630" : inverse ? "#070b10" : color;
+    g.fillText(d.lit ? String(d.count) : "--", 64, 46);
+    d.tex.needsUpdate = true;
+  };
+  for (let seat = 0; seat < IA_SEATS; seat++) drawDisplay(seat, false);
+
+  // ── Balls — hidden until a session shows them; shared egg materials. ──
+  const ballGeo = new THREE.SphereGeometry(IA_BALL_R, 14, 10);
+  const eggMats = IA_EGG_COLORS.map((c) => m(c, 0.35, 0.05));
+  const balls: THREE.Mesh[] = [];
+  for (let k = 0; k < IA_MAX_BALLS; k++) {
+    const ball = new THREE.Mesh(ballGeo, eggMats[k % eggMats.length]);
+    ball.position.y = S + IA_BALL_R;
+    ball.visible = false;
+    attach(ball);
+    balls.push(ball);
+  }
+
+  let flashClock = 0;
+  const handle: AlligatorsVisualHandle = {
+    setHead(seat, raised, swing, ext, jawOpen): void {
+      const h = heads[seat];
+      if (!h) return;
+      h.foldTarget = raised ? 0 : IA_STOW_PITCH;
+      // swing is + toward the seated player's screen-right; inside the hinge
+      // (whose +z points in) that is a turn toward local −x: rotation −swing.
+      h.swing.rotation.y = -swing;
+      h.lunge.position.z = ext;
+      h.skull.rotation.x = -IA_JAW_TILT * Math.max(0, Math.min(1, jawOpen));
+    },
+    setBall(index, x, z, visible): void {
+      const b = balls[index];
+      if (!b) return;
+      b.visible = visible;
+      b.position.x = x;
+      b.position.z = z;
+    },
+    setSpin(angle): void {
+      // The engine turns +x toward +z; three's +rotation.y turns +x toward −z.
+      top.rotation.y = -angle;
+    },
+    setDisplay(seat, count, lit, flashing): void {
+      const d = displays[seat];
+      if (!d) return;
+      const key = `${count}|${lit}|${flashing}`;
+      if (key === d.key) return; // dedupe — callers repeat every frame
+      d.key = key;
+      d.count = count;
+      d.lit = lit;
+      d.flashing = flashing;
+      drawDisplay(seat, false);
+    },
+    layEgg(bird): void {
+      const b = birds[bird];
+      if (b) b.squat = 1;
+    },
+    update(dt: number): void {
+      const t = Math.max(0, dt);
+      for (const h of heads) {
+        h.foldNow += (h.foldTarget - h.foldNow) * Math.min(1, t * 6);
+        if (Math.abs(h.foldTarget - h.foldNow) < 0.002) h.foldNow = h.foldTarget;
+        h.fold.rotation.x = h.foldNow;
+        // Fully stowed heads are hidden under the table.
+        h.fold.visible = h.foldNow < IA_STOW_PITCH - 0.01;
+      }
+      for (const b of birds) {
+        // Squat, then pop up as the egg comes out.
+        b.squat = Math.max(0, b.squat - t * 2.6);
+        const phase = 1 - b.squat;
+        const s = b.squat > 0 ? 1 - 0.35 * Math.sin(Math.PI * phase) : 1;
+        b.body.scale.set(1 + (1 - s) * 0.5, s, 1 + (1 - s) * 0.5);
+      }
+      // Winners' displays strobe four times a second.
+      const before = Math.floor(flashClock * 4) % 2;
+      flashClock += t;
+      const now = Math.floor(flashClock * 4) % 2;
+      if (now !== before) {
+        displays.forEach((d, seat) => {
+          if (d.flashing) drawDisplay(seat, now === 1);
+        });
+      }
+    },
+  };
+  cabinet.userData.alligators = handle; // collected by World.registerFurnitureGroup
 };
 
 export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
@@ -3891,6 +4599,24 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: AH_SURFACE_Y, z: 0 },
     },
   },
+  // 🐊 Insatiable alligators (#185): a round table in a 3×3 footprint, eight
+  // seats round it. The device template holds SEAT 0's values (local −z);
+  // World's requestDeviceFocus turns the front/eye round the table centre to
+  // the seat the player walked to.
+  "alligators-table": {
+    kind: "alligators-table",
+    build: buildAlligatorsTable,
+    footprint: { w: 3, d: 3 },
+    functions: ["alligatorsTable"],
+    stands: alligatorsStands,
+    device: {
+      kind: "alligators",
+      front: { x: 0, z: -1.9 },
+      faceAngle: 0,
+      eye: { x: 0, y: 2.3, z: -1.75 },
+      anchor: { x: 0, y: IA_SURFACE_Y, z: 0 },
+    },
+  },
   // ── 🚀 Ship fittings (#30 SH1) — capability = the `functions` TAG, not the
   // kind (spaceship-conversion-plan.md invariant: future part variants tag
   // the same capability; the helm/exterior count by tag). ──
@@ -3948,7 +4674,7 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     kind: "classic-hot-tub",
     build: buildClassicHotTub,
     footprint: { w: 3, d: 3 },
-    seats: classicHotTubSeats,
+    seats: hotTubSeats,
   },
   // ── 🎰 Casino fixtures (#69 G1/G2) — device fronts face -z (helm idiom). ──
   "cashier-atm": {
@@ -5504,22 +6230,22 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
   // Stepped pedestal + drum — clad in the SAME pale-blue tile as the dive
   // tower (poolTileMat blue variant; repeat ≈ circumference × height).
   place(
-    new THREE.CylinderGeometry(1.7, 1.7, 0.14, 36),
-    poolTileMat(10.7, 0.3, true),
+    new THREE.CylinderGeometry(HOT_TUB_R.pedestal, HOT_TUB_R.pedestal, 0.14, 36),
+    poolTileMat(2 * Math.PI * HOT_TUB_R.pedestal, 0.3, true),
     0,
     0.07,
     0,
   );
   place(
-    new THREE.CylinderGeometry(1.55, 1.55, 0.46, 36, 1, true),
-    poolTileMat(9.7, 0.46, true),
+    new THREE.CylinderGeometry(HOT_TUB_R.drum, HOT_TUB_R.drum, 0.46, 36, 1, true),
+    poolTileMat(2 * Math.PI * HOT_TUB_R.drum, 0.46, true),
     0,
     0.35,
     0,
   );
   // White cap ring.
   const capRing = place(
-    new THREE.TorusGeometry(1.36, 0.1, 8, 36),
+    new THREE.TorusGeometry(HOT_TUB_R.cap, HOT_TUB_R.capTube, 8, 36),
     m(TRIM, 0.7, 0.08),
     0,
     0.62,
@@ -5529,7 +6255,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
 
   // Dark shadow disc just under the waterline — the basin falling away.
   const shadow = place(
-    new THREE.CylinderGeometry(1.3, 1.3, 0.012, 36),
+    new THREE.CylinderGeometry(HOT_TUB_R.shadow, HOT_TUB_R.shadow, 0.012, 36),
     flat(0x0f4a60),
     0,
     0.552,
@@ -5541,7 +6267,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
   // light rim, the same colour stops as the main pool's water. Continuous
   // like real water, no ring banding.
   const water = place(
-    new THREE.CylinderGeometry(1.28, 1.28, 0.014, 36),
+    new THREE.CylinderGeometry(HOT_TUB_R.water, HOT_TUB_R.water, 0.014, 36),
     radialWaterMat(["#082E44", "#0E5872", "#2D8EA5"]),
     0,
     0.565,
@@ -5578,9 +6304,9 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
     const bub = place(
       new THREE.SphereGeometry(br, 8, 6),
       m(0xf6fdff, 0.85, 0.0),
-      bx,
+      bx * HOT_TUB_BUBBLE_SPREAD,
       0.59,
-      bz,
+      bz * HOT_TUB_BUBBLE_SPREAD,
     );
     bub.scale.y = 0.4;
     (bub.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.55;
@@ -5590,9 +6316,9 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
     const swirl = place(
       new THREE.SphereGeometry(0.12, 8, 6),
       m(0xeffcff, 0.85, 0.0),
-      Math.cos(a) * 1.02,
+      Math.cos(a) * HOT_TUB_R.jets,
       0.585,
-      Math.sin(a) * 1.02,
+      Math.sin(a) * HOT_TUB_R.jets,
     );
     swirl.scale.set(1.2, 0.28, 0.6);
     swirl.rotation.y = -a;
@@ -5601,7 +6327,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
 
   // Foam ring hugging the rim + cyan LED line beneath the cap.
   const foam = place(
-    new THREE.TorusGeometry(1.16, 0.04, 6, 36),
+    new THREE.TorusGeometry(HOT_TUB_R.foam, 0.04, 6, 36),
     flat(0xeffcff),
     0,
     0.575,
@@ -5610,7 +6336,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
   foam.rotation.x = Math.PI / 2;
   (foam.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.85;
   const rim = place(
-    new THREE.TorusGeometry(1.46, 0.04, 6, 36),
+    new THREE.TorusGeometry(HOT_TUB_R.glow, 0.04, 6, 36),
     flat(GLOW),
     0,
     0.5,
@@ -10902,13 +11628,13 @@ function buildClassicPool({ m, flat, place, addLight }: BuildCtx) {
 function buildClassicHotTub({ m, flat, place, addLight }: BuildCtx) {
   const TRIM = 0xfafdfe,
     GLOW = 0x69ceff;
-  place(new THREE.CylinderGeometry(1.7, 1.7, 0.14, 36), poolTileMat(10.7, 0.3, true), 0, 0.07, 0);
-  place(new THREE.CylinderGeometry(1.55, 1.55, 0.46, 36), poolTileMat(9.7, 0.46, true), 0, 0.35, 0);
-  const capRing = place(new THREE.TorusGeometry(1.36, 0.1, 8, 36), m(TRIM, 0.7, 0.08), 0, 0.62, 0);
+  place(new THREE.CylinderGeometry(HOT_TUB_R.pedestal, HOT_TUB_R.pedestal, 0.14, 36), poolTileMat(2 * Math.PI * HOT_TUB_R.pedestal, 0.3, true), 0, 0.07, 0);
+  place(new THREE.CylinderGeometry(HOT_TUB_R.drum, HOT_TUB_R.drum, 0.46, 36), poolTileMat(2 * Math.PI * HOT_TUB_R.drum, 0.46, true), 0, 0.35, 0);
+  const capRing = place(new THREE.TorusGeometry(HOT_TUB_R.cap, HOT_TUB_R.capTube, 8, 36), m(TRIM, 0.7, 0.08), 0, 0.62, 0);
   capRing.rotation.x = Math.PI / 2;
-  const shadow = place(new THREE.CylinderGeometry(1.3, 1.3, 0.012, 36), flat(0x0f4a60), 0, 0.552, 0);
+  const shadow = place(new THREE.CylinderGeometry(HOT_TUB_R.shadow, HOT_TUB_R.shadow, 0.012, 36), flat(0x0f4a60), 0, 0.552, 0);
   (shadow.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.92;
-  const water = place(new THREE.CylinderGeometry(1.28, 1.28, 0.014, 36), radialWaterMat(["#1F6E88", "#3FA9BC", "#7CD8DF"]), 0, 0.565, 0);
+  const water = place(new THREE.CylinderGeometry(HOT_TUB_R.water, HOT_TUB_R.water, 0.014, 36), radialWaterMat(["#1F6E88", "#3FA9BC", "#7CD8DF"]), 0, 0.565, 0);
   (water.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.94;
   const boil = place(new THREE.SphereGeometry(0.22, 12, 8), m(0xf2fbfd, 0.9, 0.0), 0, 0.585, 0);
   boil.scale.y = 0.32;
@@ -10919,21 +11645,21 @@ function buildClassicHotTub({ m, flat, place, addLight }: BuildCtx) {
     [0.1, 0.28, 0.035], [-0.31, -0.65, 0.04], [0.85, 0.25, 0.04], [-0.8, -0.5, 0.035],
   ];
   for (const [bx, bz, br] of bubbles) {
-    const bub = place(new THREE.SphereGeometry(br, 8, 6), m(0xf6fdff, 0.85, 0.0), bx, 0.59, bz);
+    const bub = place(new THREE.SphereGeometry(br, 8, 6), m(0xf6fdff, 0.85, 0.0), bx * HOT_TUB_BUBBLE_SPREAD, 0.59, bz * HOT_TUB_BUBBLE_SPREAD);
     bub.scale.y = 0.4;
     (bub.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.8;
   }
   for (let i = 0; i < 6; i++) {
     const a = (i / 6) * Math.PI * 2 + 0.3;
-    const swirl = place(new THREE.SphereGeometry(0.12, 8, 6), m(0xeffcff, 0.85, 0.0), Math.cos(a) * 1.02, 0.585, Math.sin(a) * 1.02);
+    const swirl = place(new THREE.SphereGeometry(0.12, 8, 6), m(0xeffcff, 0.85, 0.0), Math.cos(a) * HOT_TUB_R.jets, 0.585, Math.sin(a) * HOT_TUB_R.jets);
     swirl.scale.set(1.2, 0.28, 0.6);
     swirl.rotation.y = -a;
     (swirl.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.75;
   }
-  const foam = place(new THREE.TorusGeometry(1.16, 0.04, 6, 36), flat(0xeffcff), 0, 0.575, 0);
+  const foam = place(new THREE.TorusGeometry(HOT_TUB_R.foam, 0.04, 6, 36), flat(0xeffcff), 0, 0.575, 0);
   foam.rotation.x = Math.PI / 2;
   (foam.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.85;
-  const rim = place(new THREE.TorusGeometry(1.46, 0.04, 6, 36), flat(GLOW), 0, 0.5, 0);
+  const rim = place(new THREE.TorusGeometry(HOT_TUB_R.glow, 0.04, 6, 36), flat(GLOW), 0, 0.5, 0);
   rim.rotation.x = Math.PI / 2;
   (rim.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.92;
   for (const [sx, sy, sz, sc] of [[-0.22, 0.87, -0.1, 0.11], [0.18, 0.93, 0.15, 0.1], [0.06, 0.83, -0.22, 0.09]] as [number, number, number, number][]) {
@@ -11491,14 +12217,17 @@ export function poolHoleRect(
   return null;
 }
 
-/** Central hot-tub island excluded from the lazy-river swim channel. */
+/** Central hot-tub island excluded from the lazy-river swim channel. Only the
+ *  lazy pool has one: keyed on its island tub (islandHotTub), not on the
+ *  "pool-hot-tub" id the Classic Lido's corner tub also carried, which carved
+ *  a phantom island out of that pool's north-west corner. */
 export function getPoolIsland(items: FurnitureItem[]): {
   x: number;
   z: number;
   rx: number;
   rz: number;
 } | null {
-  const hotTub = items.find((item) => item.id === "pool-hot-tub");
+  const hotTub = islandHotTub(items);
   if (!hotTub) return null;
   return { x: hotTub.pos.x, z: hotTub.pos.z, rx: 1.72, rz: 1.48 };
 }
@@ -11707,6 +12436,7 @@ export function buildSeatList(
   isWalkable: (x: number, z: number) => boolean,
 ): Seat[] {
   const seats: Seat[] = [];
+  const bridgeTub = islandHotTub(items);
   for (const item of items) {
     const templates = FURNITURE_DEFS[item.kind].seats;
     if (!templates) continue;
@@ -11715,16 +12445,18 @@ export function buildSeatList(
       const fr = rotXZ(t.front.x, t.front.z, item.rot);
       const c0 = rotXZ(t.clickBox.x0, t.clickBox.z0, item.rot);
       const c1 = rotXZ(t.clickBox.x1, t.clickBox.z1, item.rot);
-      // The central hot tub is reachable only over its south footbridge. All
-      // four seats share the same dry-land approach; the scripted `path` then
-      // WALKS the arched bridge (shore → crest, y following the deck) and the
-      // SIT_DOWN hop covers the last stretch over the rim (player.ts).
+      // The lazy pool's island tub is reachable only over its south
+      // footbridge. All four seats share the same dry-land approach; the
+      // scripted `path` then WALKS the arched bridge (shore → crest, y
+      // following the deck) and the SIT_DOWN hop covers the last stretch over
+      // the rim (player.ts). Any other tub stands on dry deck and keeps its
+      // own per-quadrant fronts.
       const preferred =
-        item.id === "pool-hot-tub"
+        item === bridgeTub
           ? { x: item.pos.x + BRIDGE_X, z: item.pos.z + 3.75 }
           : { x: item.pos.x + fr.x, z: item.pos.z + fr.z };
       const path =
-        item.id === "pool-hot-tub"
+        item === bridgeTub
           ? [3.26, 2.96, 2.66, 2.42, 2.22, 2.05].map((lz) => ({
               x: item.pos.x + BRIDGE_X,
               y: bridgeTopAt(lz),

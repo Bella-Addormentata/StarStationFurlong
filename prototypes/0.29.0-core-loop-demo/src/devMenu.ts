@@ -55,7 +55,7 @@ import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
 import { addFurniture, writeFurnitureItem } from './furnitureDoc';
 // #45 board mirror: spawned game tables paint the doc's current game at once.
-import { readGame } from './games/gamesDoc';
+import { paintCheckersTable } from './checkersSession';
 import {
   ROOM_TEMPLATES, applyRoomTemplate, addRoomTemplateItems, exportCurrentRoomAsTemplate,
   findTemplate,
@@ -76,6 +76,8 @@ import type { FurnitureHandleSinks } from './furnitureHandles';
 // 🏒 #115: a DEV-spawned air-hockey table must register with the session layer
 // (the doc-echo reconcile no-ops on this local add, so World never sees it).
 import { registerAirHockeyVisual } from './airHockeySession';
+// 🐊 #185: the same for a DEV-spawned insatiable-alligators table.
+import { registerAlligatorsVisual } from './alligatorsSession';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -93,6 +95,7 @@ import {
 import { showHint } from './hud';
 import type { World } from './world';
 import type { Player } from './player';
+import { isFormFieldTarget } from './typingFocus';
 
 // ── Palette: dashed AMBER — deliberately unlike any shipped UI ───────────────
 const DEV_AMBER = '#FFB300';
@@ -113,6 +116,7 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
   'departures-board': '🚏 DEPARTURES BOARD',
   'air-hockey-table': '🏒 AIR HOCKEY TABLE',
+  'alligators-table': '🐊 INSATIABLE ALLIGATORS',
   'smiley-bouquet': '😊 SMILEY BOUQUET',
   'rose-bouquet': '🌹 ROSE BOUQUET',
   'purple-bouquet': '💜 PURPLE BOUQUET',
@@ -430,10 +434,12 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       // Read back the FILED handle, not obj.userData — see the note at the
       // World call site on why this side must not keep its own key list.
       const spawnedTop = sinks.gameTableTops.get(item.id);
-      if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+      if (spawnedTop) paintCheckersTable(spawnedTop, item.id);
       // 🏒 #115 — mirrors World.registerFurnitureGroup's hand-off.
       const hockey = sinks.airHockeyVisuals.get(item.id);
       if (hockey) registerAirHockeyVisual(item.id, hockey, { x: item.pos.x, z: item.pos.z, rot: item.rot });
+      const gators = sinks.alligatorsVisuals.get(item.id);
+      if (gators) registerAlligatorsVisual(item.id, gators, { x: item.pos.x, z: item.pos.z, rot: item.rot });
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;
@@ -834,10 +840,11 @@ function sectionHtml(title: string, note: string | null, rows: string[]): string
 function buildPanel(): HTMLDivElement {
   const el = document.createElement('div');
   el.id = 'dev-menu-panel';
+  // Opens BELOW the top-left DEV button (#223).
   el.style.cssText = `
     position: fixed;
     left: 24px;
-    bottom: 64px;
+    top: 64px;
     width: 300px;
     max-height: min(66vh, 620px);
     display: none;
@@ -1263,10 +1270,11 @@ export function initDevMenu(getWorldRef: GetWorld): void {
 
   const btn = document.getElementById('dev-menu-btn');
   if (btn) {
+    // #223: top-left corner (the view cross holds the top-right).
     btn.style.cssText = `
       position: fixed;
       left: 24px;
-      bottom: 24px;
+      top: 24px;
       z-index: ${DEV_Z};
       background: ${DEV_BG};
       color: ${DEV_AMBER};
@@ -1294,8 +1302,7 @@ export function initDevMenu(getWorldRef: GetWorld): void {
   });
 
   window.addEventListener('keydown', (e) => {
-    const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+    if (isFormFieldTarget(e.target as HTMLElement | null)) {
       return; // typing ` or Esc in an input never drives the dev menu
     }
     if (e.code === 'Backquote') {
