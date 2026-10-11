@@ -1289,6 +1289,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         return;
       }
       writeTableState(itemId, { ...s, operator: ROULETTE_PAGE_ID });
+    } else if (s.operator === undefined) {
+      // An unleased closing round (the robot closed it, then went away):
+      // claim it, so only this page publishes and pays.
+      writeTableState(itemId, { ...s, operator: ROULETTE_PAGE_ID });
     }
     const r = s.round;
     // Let a rival's lease write converge before this page may publish.
