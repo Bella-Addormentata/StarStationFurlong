@@ -87,6 +87,32 @@ describe('parseInesHeader', () => {
     expect(parseInesHeader(ines(2, 1).subarray(0, 20000))).toEqual({ ok: false, reason: 'ROM IS TRUNCATED' });
     expect(parseInesHeader(new Uint8Array(MAX_ROM_BYTES + 1))).toEqual({ ok: false, reason: 'FILE TOO LARGE' });
   });
+
+  it('reads NES 2.0 sizes, so a header cannot declare more than the file holds', () => {
+    const nes2 = (bytes: Uint8Array, byte8: number, byte9: number) => {
+      bytes[7] = (bytes[7] & 0xf0) | 0x08;
+      bytes[8] = byte8;
+      bytes[9] = byte9;
+      return bytes;
+    };
+    // Plain NES 2.0: the high nibble of byte 8 extends the mapper number.
+    expect(parseInesHeader(nes2(ines(2, 1, 0x42), 0x01, 0x00))).toEqual({
+      ok: true,
+      mapper: 0x142,
+      prgBanks: 2,
+      chrBanks: 1,
+    });
+    // Byte 9 adds 256 PRG banks (4 MiB) the 2-bank file doesn't hold.
+    expect(parseInesHeader(nes2(ines(2, 1), 0, 0x01))).toEqual({ ok: false, reason: 'ROM IS TRUNCATED' });
+    // Exponent mode: byte 4 = 0x80 declares 2^32 bytes (4 GiB) of PRG, though
+    // the file is padded to the 128 banks byte 4 alone would mean.
+    const huge = nes2(ines(0x80, 1), 0, 0x0f);
+    expect(parseInesHeader(huge)).toEqual({ ok: false, reason: 'ROM IS TRUNCATED' });
+    // Exponent mode that fits: 2^15 × 1 = 32 KiB of PRG, the same as 2 banks.
+    const exact = nes2(ines(2, 1), 0, 0x0f);
+    exact[4] = 15 << 2;
+    expect(parseInesHeader(exact)).toEqual({ ok: true, mapper: 0, prgBanks: 2, chrBanks: 1 });
+  });
 });
 
 describe('ArcadeMachine', () => {

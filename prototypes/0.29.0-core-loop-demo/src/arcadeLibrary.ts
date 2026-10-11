@@ -111,11 +111,21 @@ export type InesHeader =
   | { ok: true; mapper: number; prgBanks: number; chrBanks: number }
   | { ok: false; reason: string };
 
+/** One ROM size field in bytes. NES 2.0 adds a high nibble to the bank
+ *  count, and a high nibble of 0xF switches to 2^E × (2M+1) bytes, which can
+ *  declare gigabytes in one byte. */
+function romFieldBytes(lsb: number, msb: number, bankBytes: number): number {
+  if (msb === 0x0f) return 2 ** (lsb >> 2) * ((lsb & 0x03) * 2 + 1);
+  return ((msb << 8) | lsb) * bankBytes;
+}
+
 /**
  * Read an iNES / NES 2.0 header. Only the checks that keep junk out of the
- * emulator: the magic, a non-empty PRG, and a file long enough for the banks
- * it declares. Whether jsnes supports the mapper is jsnes's call (loadROM
- * throws), so the cabinet asks it rather than keeping a copy of its list.
+ * emulator: the magic, a non-empty PRG, and a file long enough for the ROM
+ * it declares. jsnes allocates what the header declares, so a file that
+ * declares more than it holds never reaches it. Whether jsnes supports the
+ * mapper is jsnes's call (loadROM throws), so the cabinet asks it rather than
+ * keeping a copy of its list.
  */
 export function parseInesHeader(bytes: Uint8Array): InesHeader {
   if (bytes.length < 16) return { ok: false, reason: 'FILE TOO SMALL' };
@@ -123,12 +133,13 @@ export function parseInesHeader(bytes: Uint8Array): InesHeader {
   if (bytes[0] !== 0x4e || bytes[1] !== 0x45 || bytes[2] !== 0x53 || bytes[3] !== 0x1a) {
     return { ok: false, reason: 'NOT AN NES ROM' };
   }
-  const prgBanks = bytes[4];
-  const chrBanks = bytes[5];
-  if (prgBanks === 0) return { ok: false, reason: 'NO PROGRAM DATA' };
+  // NES 2.0 when byte 7 bits 3..2 are 0b10, the same test jsnes makes.
+  const nes2 = (bytes[7] & 0x0c) === 0x08;
+  const prgBytes = romFieldBytes(bytes[4], nes2 ? bytes[9] & 0x0f : 0, 16384);
+  const chrBytes = romFieldBytes(bytes[5], nes2 ? bytes[9] >> 4 : 0, 8192);
+  if (prgBytes === 0) return { ok: false, reason: 'NO PROGRAM DATA' };
   const trainer = bytes[6] & 0x04 ? 512 : 0;
-  const need = 16 + trainer + prgBanks * 16384 + chrBanks * 8192;
-  if (bytes.length < need) return { ok: false, reason: 'ROM IS TRUNCATED' };
-  const mapper = (bytes[6] >> 4) | (bytes[7] & 0xf0);
-  return { ok: true, mapper, prgBanks, chrBanks };
+  if (bytes.length < 16 + trainer + prgBytes + chrBytes) return { ok: false, reason: 'ROM IS TRUNCATED' };
+  const mapper = (bytes[6] >> 4) | (bytes[7] & 0xf0) | (nes2 ? (bytes[8] & 0x0f) << 8 : 0);
+  return { ok: true, mapper, prgBanks: Math.ceil(prgBytes / 16384), chrBanks: Math.ceil(chrBytes / 8192) };
 }

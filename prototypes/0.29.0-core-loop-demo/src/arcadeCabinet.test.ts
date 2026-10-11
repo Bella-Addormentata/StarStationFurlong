@@ -171,12 +171,15 @@ function fakeElement(tag: string): FakeElement {
 function key(
   type: 'keydown' | 'keyup',
   code: string,
-  extra: { key?: string; repeat?: boolean; target?: { tagName: string } } = {},
+  extra: { key?: string; repeat?: boolean; target?: { tagName: string }; mod?: 'ctrlKey' | 'metaKey' | 'altKey' } = {},
 ): Event {
   const event = new Event(type, { cancelable: true });
   Object.defineProperty(event, 'code', { value: code });
   Object.defineProperty(event, 'key', { value: extra.key ?? code });
   Object.defineProperty(event, 'repeat', { value: extra.repeat ?? false });
+  for (const mod of ['ctrlKey', 'metaKey', 'altKey'] as const) {
+    Object.defineProperty(event, mod, { value: extra.mod === mod });
+  }
   if (extra.target) Object.defineProperty(event, 'target', { value: extra.target });
   return event;
 }
@@ -295,6 +298,26 @@ describe('the focus UI', () => {
       win.dispatchEvent(event);
       expect(event.defaultPrevented).toBe(false);
     }
+    ui.unmount();
+  });
+
+  it('leaves Ctrl, Cmd and Alt shortcuts to the browser, and keeps Shift as Select', () => {
+    const { ui, painter, host } = setup();
+    ui.mount(host as unknown as HTMLElement);
+    for (const [code, mod] of [
+      ['KeyS', 'ctrlKey'],
+      ['KeyW', 'metaKey'],
+      ['ArrowLeft', 'altKey'],
+    ] as const) {
+      const event = key('keydown', code, { mod });
+      win.dispatchEvent(event);
+      expect(event.defaultPrevented, `${mod}+${code}`).toBe(false);
+    }
+    ui.update(1 / 60);
+    expect(painter.drawMenu.mock.lastCall?.[1]).toBe(0); // the cursor never moved
+    const select = key('keydown', 'ShiftLeft', { key: 'Shift' });
+    win.dispatchEvent(select);
+    expect(select.defaultPrevented).toBe(true);
     ui.unmount();
   });
 

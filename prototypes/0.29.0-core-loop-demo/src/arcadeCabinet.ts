@@ -317,6 +317,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
 
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Escape' || e.key === 'Tab') return; // the focus controller's / the phone's
+    if (e.ctrlKey || e.metaKey || e.altKey) return; // the browser's shortcuts (Shift is Select)
     const target = e.target as HTMLElement | null;
     if (isFormFieldTarget(target)) return;
     // A focused button (LEAVE, reached by keyboard or a screen reader) keeps Enter.
