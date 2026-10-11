@@ -203,18 +203,25 @@ The first heartbeat the viewer can act on is at most
 the wake window is stamped from before the gap, so the first fresh one is
 the holder's next — and a viewer whose player stopped with the machine is
 then seeked once, to where the room
-is, never to where the sleep says. A HOLDER that slept rejoins the room
-where the room is and never drags it back to where it slept: its own
-anchor is stale like any other, and `readPlayback` bridges the gap on
-the WALL clock — the one use of wall time in the extrapolation, for a
-SURE gap alone (one the monotonic clock itself saw; an ambiguous one,
-above, is bridged by nothing), since the monotonic clock may or may not
-have run through a sleep and the wall clock did, the error an NTP step
-the sleep may have hidden and never the sleep — so the headless beat carries the pre-sleep
-position plus the time really elapsed, a holder with the theatre open
-seeks its own player there once (the OS stopped it with the machine) and
-beats from there, no beat going out before that seek lands, and that
-beat is the fresh sample that un-stales everyone, the holder included.
+is, never to where the sleep says. A HOLDER that slept through a SURE
+gap rejoins the room where the room is and never drags it back to where
+it slept: its own anchor is stale like any other, and `readPlayback`
+bridges the gap on the WALL clock — the one use of wall time in the
+extrapolation, for a sure gap alone, since the monotonic clock may or
+may not have run through a sleep and the wall clock did, the error an
+NTP step the sleep may have hidden and never the sleep — so the headless
+beat carries the pre-sleep position plus the time really elapsed, a
+holder with the theatre open seeks its own player there once (the OS
+stopped it with the machine) and beats from there, no beat going out
+before that seek lands, and that beat is the fresh sample that
+un-stales everyone, the holder included. After an AMBIGUOUS gap the rule
+is the other one, and there is only one: the gap is bridged by nothing,
+so the holder rejoins where it SLEPT — its first beat after the gap,
+which goes out only once it holds the remote again (a hold past the
+lapse was let go), is its last beat's position plus the monotonic time
+since, from its player where one runs, with no wall delta in it, and
+the room follows that beat, back by the sleep if the gap was one. One
+expected result, and the tests pin it (tvDoc, tvSession).
 `lead` is half the round trip the viewer's `NetworkProvider` measures to the
 node it is connected to, capped at 1 s, and zero for the holder (its own
 writes land locally). That term corrects exactly one hop — the last one,
@@ -944,11 +951,21 @@ then none; the shared reliable readers,
 which carry `ysync` as well — a whole Yjs baseline is one frame — keep
 their own kinds and get a GLOBAL ceiling of their own, the largest frame
 any kind may carry (the document bound below plus the envelope), enforced
-on the prefix the same way,
-since today `ssf-p2p-node/src/main.rs` allocates the declared length of a
-reliable frame as it stands (around lines 1499 and 2223), a fix the node
-owes with or without media — and never the 4 KiB class, which would
-reset a room's sync before its kind was read. That ceiling rests on a
+on the prefix the same way — and under the same read DEADLINE from the
+frame's acceptance, since a ceiling on bytes bounds no frame that never
+finishes: the length prefix within a second of the stream's acceptance
+or the previous frame's end, the body within the ceiling over the link's
+floor rate (the largest frame at 1 Mbit/s is twelve seconds; the
+deadline fifteen), the stream reset and the link charged past it; the
+body read into a buffer that grows with what arrives and is never
+allocated at the declared length; and one unfinished frame per shared
+stream, two per link, so a frame declared and never sent holds a
+bounded buffer for fifteen seconds and then nothing — since today
+`ssf-p2p-node/src/main.rs` allocates the declared length of a reliable
+frame as it stands and reads it with `read_exact` and no deadline
+(around lines 1493–1501 and 2217–2225), a fix the node owes with or
+without media — and never the 4 KiB class, which would reset a room's
+sync before its kind was read. That ceiling rests on a
 DOCUMENT bound the sender enforces, never on a number borrowed from
 elsewhere: today nothing bounds a room document — the room cache merely
 skips persisting a snapshot past 1 000 000 bytes (`roomCache.ts`), while
@@ -967,7 +984,30 @@ that bound base64-expanded plus the envelope's fields — 1 400 000 bytes —
 and a frame past it is a protocol violation, never a large room. A
 chunked baseline (SyncStep2 in bounded pieces) was the alternative, not
 taken: it bounds the frame and never the document, and the document is
-what every reader must hold. A control-message budget
+what every reader must hold. And the bound holds at the RECEIVER too, in
+both replicas, since a local-write check binds only honest pages:
+`YjsSync` applies every inbound update as it arrives
+(`src/network/YjsSync.ts`) and the node's replica does the same
+(`main.rs`, `apply_update`), so a peer could grow both without limit in
+frames under the ceiling. Each replica keeps a running measure of the
+document — the last exact measure (`encodeStateAsUpdate` after garbage
+collection, taken at load and again after every sixty-four applied
+updates or 256 KB of them) plus the lengths of the updates applied
+since, an upper bound on growth, since an update adds at most its own
+length — and refuses an inbound update that would carry the measure
+past the bound: dropped unapplied and charged to the link like a
+malformed frame (an update that depended on it waits in Yjs's pending
+set, bounded by the same accounting and cleared with the room), the
+room read-only, ROOM FULL, until compacted. Compaction is a new DOCUMENT
+EPOCH: the owner signs `room-compact { epoch, at, root }` — a fresh Yjs
+document built from the current state, its epoch carried in every
+`ysync` envelope beside the room id — and a replica that has seen the
+compaction rejects any update stamped with an older epoch, so an old
+peer's history never merges back in: it resyncs from the new baseline
+under the new epoch, its unsent writes lost (what the owner's
+compaction warns of), and the node relays no envelope whose epoch is
+older than the room's. The bound is on what a replica HOLDS, and the
+epoch is what makes a compaction stick. A control-message budget
 per link in messages and bytes a second (the renewals its admitted
 subscribers owe plus a fifth, with a floor for a fresh link; that count
 times the ceiling) drops a message past it unverified and counted; and
@@ -987,7 +1027,7 @@ senders use codecs whose keyframes are self-describing (VP8, VP9, AV1,
 H.264 in Annex-B form), so a keyframe and its configuration are all a
 late joiner needs. A leg's counter is the SENDER's for
 the whole epoch, never the encoder's: it lives outside the encoder and
-survives every pause, restart and reconfiguration (§9 and spike #21 restart
+survives every pause, restart and reconfiguration (§9 and spike `#21` restart
 encoders for the first subscriber), so a restarted encoder goes on from the
 counter it left. Epochs and counters live together in the sender's page
 state, and the epoch only rises within an instance; a counter about to wrap
@@ -1104,7 +1144,7 @@ meanwhile; per ORIGIN NODE — the node a subscriber's page is connected
 to, which signs every lease it forwards with its own iroh key
 ({subscriber identity, origin node id, lease epoch, sequence, the beat
 nonce the renewal answers}, end to end to the sender under the hub's
-relay; the control plane of #21), so the
+relay; the control plane of `#21`), so the
 origin is never the hub's word: a lease without a valid origin signature
 is charged to the hub link alone, a departure counts against an origin
 only when the origin signed it (its page gone, reported by the node that
@@ -1121,7 +1161,7 @@ flooder, never a minting member — stated as that. What holds against one
 is counted where a key is not the principal: per LINK, at the node that
 holds it — a link is a connection that node admitted, and its connection
 admission (a cap on the links it holds, a rate on new ones: the control
-plane's to enforce, #21) bounds how many minted links arrive and how fast
+plane's to enforce, `#21`) bounds how many minted links arrive and how fast
 — and per SOURCE, below: the sixty-four cap, the batched rotations, the
 storm report. Such a member can fill a source and make it rotate at the
 batched rate, stated as the cost; it cannot take the source down, make a
