@@ -44,38 +44,35 @@ export function chipsFor(balance: number): number[] {
 }
 
 /**
- * 🎲 #226: the chips in a player's table RAIL — the same total as chipsFor,
- * but made playable: a pure greedy split hands someone with 100 a single
- * black chip they cannot bet a 5 from. Each denomination keeps a working
- * float of the next one down (five whites, five reds, four greens, five
- * blacks) whenever the balance is big enough to spare it, the way a dealer
- * colours a buy-in down. Largest first. The big chips are counted, not
- * looped one by one, and at most `maxBig` of them are returned (the rail
- * only draws a few dozen), so Σ result === balance for every non-negative
- * integer up to roughly maxBig × 1000 and the allocation stays bounded
- * beyond it.
+ * 🎲 #226: the chips in a player's table RAIL, as counts per denomination —
+ * the same total as chipsFor, but made playable: a pure greedy split hands
+ * someone with 100 a single black chip they cannot bet a 5 from. Each
+ * denomination keeps a working float of the next one down (five whites, five
+ * reds, four greens, five blacks) whenever the balance is big enough to spare
+ * it, the way a dealer colours a buy-in down. Counted, never one entry per
+ * chip, so Σ denom × count === balance for every non-negative safe integer
+ * and the result is at most one entry per denomination. Largest first.
  */
-export function railChips(balance: number, maxBig = 400): number[] {
+export function railChipCounts(balance: number): Array<{ denom: number; count: number }> {
   let left = Math.max(0, Math.floor(balance));
   // [denomination, its next one up, how many of it to keep as a float]
   const floats: Array<[number, number, number]> = [[1, 5, 5], [5, 25, 5], [25, 100, 4], [100, 500, 5]];
-  const small = new Map<number, number>();
+  const counts = new Map<number, number>();
   for (const [d, up, keep] of floats) {
     let n = (left % up) / d; // what can't make up a whole chip of the next size
     if (left - n * d >= keep * d + up) n += keep;
-    small.set(d, n);
+    counts.set(d, n);
     left -= n * d;
   }
-  const big: number[] = [];
   for (const d of CHIP_DENOMS) {
-    const n = Math.min(Math.floor(left / d), maxBig - big.length);
-    for (let i = 0; i < n; i++) big.push(d);
-    left -= Math.floor(left / d) * d;
+    const n = Math.floor(left / d);
+    counts.set(d, (counts.get(d) ?? 0) + n);
+    left -= n * d;
   }
-  for (const d of [100, 25, 5, 1]) {
-    for (let i = 0; i < (small.get(d) ?? 0); i++) big.push(d);
-  }
-  return big.sort((a, b) => b - a);
+  return [...counts.entries()]
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[0] - a[0])
+    .map(([denom, count]) => ({ denom, count }));
 }
 
 /** Group a flat chip list by denomination, largest first. */

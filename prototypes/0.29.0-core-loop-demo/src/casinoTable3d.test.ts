@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { railStacks, type CasinoTableVisualHandle } from './casinoTable3d';
-import { railChips } from './chipDisplay';
+import { railChipCounts } from './chipDisplay';
 import { buildItemGroup } from './furniture';
 
 /** A canvas whose 2-D context draws nothing: the felt paints through one. */
@@ -61,7 +61,7 @@ describe('the craps table chips', () => {
   });
 
   it('keeps small chips on a crowded rail', () => {
-    const rail = railStacks({ x: 0, z: -0.48, axis: 'x', len: 0.62 }, railChips(123456));
+    const rail = railStacks({ x: 0, z: -0.48, axis: 'x', len: 0.62 }, railChipCounts(123456));
     const denoms = new Set(rail.map((s) => s.denom));
     for (const d of [1, 5, 25, 100]) expect(denoms.has(d), `$${d}`).toBe(true);
     // Still largest first along the rail.

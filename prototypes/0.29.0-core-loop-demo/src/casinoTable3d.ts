@@ -1063,15 +1063,15 @@ export const RAIL_PITCH = CHIP_RADIUS * 2 + 0.006;
 
 /** Lay a rail's chips out: stacks of up to 10 by denomination, along the rail
  *  (as many stacks as the rail's length holds — the rest stay off the table). */
-export function railStacks(spec: RailSpec, chips: readonly number[]): RailStack[] {
-  const counts = new Map<number, number>();
-  for (const c of chips) counts.set(c, (counts.get(c) ?? 0) + 1);
-  const raw: Array<{ denom: number; count: number }> = [];
-  for (const [denom, n] of [...counts.entries()].sort((a, b) => b[0] - a[0])) {
-    for (let left = n; left > 0; left -= 10) raw.push({ denom, count: Math.min(10, left) });
-  }
+export function railStacks(spec: RailSpec, counts: ReadonlyArray<{ denom: number; count: number }>): RailStack[] {
   const pitch = RAIL_PITCH;
   const fit = Math.max(1, Math.floor(spec.len / pitch));
+  // Stacks of ten; never more of one denomination than the rail could show.
+  const raw: Array<{ denom: number; count: number }> = [];
+  for (const { denom, count } of [...counts].sort((a, b) => b.denom - a.denom)) {
+    let left = count;
+    for (let k = 0; left > 0 && k < fit; k++, left -= 10) raw.push({ denom, count: Math.min(10, left) });
+  }
   // Too many stacks for the rail: keep one of every denomination first
   // (smallest first, so a rich player still has small chips to bet), then
   // as many of the rest as fit, largest first.

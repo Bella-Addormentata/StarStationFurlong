@@ -39,7 +39,7 @@ import {
 import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
-import { CHIP_DENOMS, railChips } from './chipDisplay';
+import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
@@ -558,7 +558,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       hand = [];
       say('NOT ENOUGH CHIPS FOR THAT STAKE AGAIN — PICK UP FROM YOUR RAIL');
     }
-    if (!pickup) railView = rail ? railStacks(rail, railChips(balance - sumOf(hand))) : [];
+    if (!pickup) railView = rail ? railStacks(rail, railChipCounts(balance - sumOf(hand))) : [];
     h.setRailStacks(railView);
     h.setHand(cursor, hand);
   };
@@ -1015,7 +1015,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const rows: string[] = [];
     rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;">
       <span style="font-size:12px;font-weight:900;letter-spacing:1px;color:${GOLD_BRIGHT};">⚙️ ${game === 'craps' ? 'CRAPS' : 'ROULETTE'} TABLE</span>
-      <button data-act="close" style="background:none;border:none;color:${GOLD};font-size:16px;cursor:pointer;">✕</button></div>`);
+      <button data-act="close" aria-label="Close the table card" style="background:none;border:none;color:${GOLD};font-size:16px;cursor:pointer;">✕</button></div>`);
     rows.push(`<div style="font-size:9px;color:${DIM};letter-spacing:1px;">${house ? 'YOU RUN THIS TABLE' : 'THE OWNER SETS THIS TABLE · ANYONE CAN LOOK'}</div>`);
     rows.push(`<div style="font-size:10px;line-height:1.7;color:${GOLD};border-top:1px solid rgba(212,168,75,0.18);padding-top:8px;">${rulesHtml()}</div>`);
     if (game === 'craps') {
