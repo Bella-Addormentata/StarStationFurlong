@@ -270,6 +270,7 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
   // seen the seated players' heartbeats move and can slide them the dice.
   sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
+  noteClosing(tableId, s, now);
   // A takeover marker counts only for the turn it took, in this room doc;
   // losing the turn (or it ending) drops it.
   const mark = tookOverAt.get(tableId);
@@ -285,9 +286,29 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
   tookOverAt.delete(tableId);
 }
 
-/** How long after the dice's deadline a manual turn counts as abandoned
- *  (its operator page is gone) and another editor's ROLL may take it over. */
-export const MANUAL_TAKEOVER_MS = 10_000;
+/** How long this page must have watched one manual turn stay closing, under
+ *  one operator, before it counts as abandoned (that page is gone) and this
+ *  page's ROLL may take it over: the shooter's whole window plus a margin.
+ *  Measured on this page's own clock only — phaseDeadline was written by the
+ *  operator's clock, which isn't comparable with ours. */
+export const MANUAL_TAKEOVER_MS = CRAPS_SHOOTER_MS + 10_000;
+
+/** When this page first saw each table's current closing turn (its epoch,
+ *  round and operator), by this page's clock. tickManualCraps notes it every
+ *  frame on every editor's page, so the watch starts as the turn does. */
+const closingSeen = new Map<string, { epoch: number; round: number; operator: string | undefined; at: number }>();
+
+function noteClosing(tableId: string, s: CrapsTableState | null, now: number): number {
+  if (s?.phase !== 'closing') {
+    closingSeen.delete(tableId);
+    return now;
+  }
+  const epoch = casinoDocEpoch();
+  const seen = closingSeen.get(tableId);
+  if (seen && seen.epoch === epoch && seen.round === s.round && seen.operator === s.operator) return seen.at;
+  closingSeen.set(tableId, { epoch, round: s.round, operator: s.operator, at: now });
+  return now;
+}
 const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
 /** Turns this page took over: when (this page's own clock), and which. */
 const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>();
@@ -299,8 +320,8 @@ const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>
  *  • Betting: closes, slides the dice out, and stamps this page as operator.
  *  • Closing, this page operates: settles the throw that landed, else the
  *    stickman throws now.
- *  • Closing, another page operates: refused until MANUAL_TAKEOVER_MS past
- *    the dice's deadline (that page is gone); then this page stamps itself
+ *  • Closing, another page operates: refused until this page has watched
+ *    the turn sit for MANUAL_TAKEOVER_MS (that page is gone); then this page stamps itself
  *    operator and finishes the turn from tickManualCraps once the stamp has
  *    converged — never two settles from two shareholders' presses.
  */
@@ -319,7 +340,7 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
     tookOverAt.delete(tableId);
     return null;
   }
-  if (now < (s.phaseDeadline ?? now) + MANUAL_TAKEOVER_MS) {
+  if (now - noteClosing(tableId, s, now) < MANUAL_TAKEOVER_MS) {
     return 'THE DICE ARE OUT — ANOTHER HOUSE MEMBER IS RUNNING THIS ROLL';
   }
   writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });

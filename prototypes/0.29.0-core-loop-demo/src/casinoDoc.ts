@@ -432,7 +432,12 @@ export function readSeats(tableId: string): Record<string, TableSeat> {
   const out: Record<string, TableSeat> = {};
   for (const [key, value] of ensureMap().entries()) {
     if (!key.startsWith(prefix) || !isTableSeat(value)) continue;
-    out[key.slice(prefix.length)] = value;
+    const pid = key.slice(prefix.length);
+    // The key is peer-written too: a seat whose player id the table state
+    // can't hold (isCrapsTableState's 1–128 chars) could never be the
+    // shooter, so it isn't a seat.
+    if (pid.length === 0 || pid.length > 128) continue;
+    out[pid] = value;
   }
   return out;
 }

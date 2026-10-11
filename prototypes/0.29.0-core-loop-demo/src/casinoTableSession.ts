@@ -673,7 +673,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         takeFromStack(i);
       }
     }
-    h.setHand(cursor, hand);
+    // Only a held hand follows the cursor; an empty one is already cleared,
+    // and setHand would rebuild every chip instance on each move.
+    if (hand.length > 0) h.setHand(cursor, hand);
   };
 
   const onDown = (e: PointerEvent): void => {
