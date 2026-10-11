@@ -218,6 +218,32 @@ describe('faucet dish: per-room store', () => {
     clearFaucetRoom(room);
   });
 
+  it('takes the floor from a give reply answered after a newer poll, without filing the older snapshot', () => {
+    const room = 'home-store-5';
+    clearFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 10 }) });
+    markFaucetPending(room, 'give');
+    // The 20 s poll captured after the push (12) answers before the give reply (11).
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 12 }) });
+    expect(faucetPending(room)).toBe('give');
+    setFaucetReply(room, { op: 'give', ok: true, spentCoin: 'ab'.repeat(32), status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 11 }) });
+    // The newer snapshot stays on file, the spend still settles: pending.
+    expect(latestFaucetStatus(room)?.snapshot).toBe(12);
+    expect(faucetPending(room)).toBe('give');
+    // The next poll shows it settled: cleared — the floor was recorded.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 13 }) });
+    expect(faucetPending(room)).toBeNull();
+    // And a late reply arriving when the newer poll ALREADY shows the spend
+    // settled clears it on the spot.
+    markFaucetPending(room, 'claim');
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, landing: false, snapshot: 15 }) });
+    expect(faucetPending(room)).toBe('claim'); // no floor yet: not trusted
+    setFaucetReply(room, { op: 'claim', ok: true, status: status({ walletMojos: 0n, landing: true, snapshot: 14 }) });
+    expect(latestFaucetStatus(room)?.snapshot).toBe(15);
+    expect(faucetPending(room)).toBeNull();
+    clearFaucetRoom(room);
+  });
+
   it('keeps the newest snapshot by the node\'s numbering, whatever order the replies arrive in', () => {
     const room = 'home-store-4';
     clearFaucetRoom(room);

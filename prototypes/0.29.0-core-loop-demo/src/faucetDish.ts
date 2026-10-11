@@ -270,30 +270,40 @@ export function setFaucetReply(roomId: string, reply: FaucetReply): void {
     notify();
     return;
   }
-  if (reply.status && reply.status.snapshot > 0) {
-    const newest = latestSnapshot.get(roomId) ?? 0;
-    if (reply.status.snapshot < newest) return; // an older snapshot answered late
-    latestSnapshot.set(roomId, reply.status.snapshot);
-  }
   lastError.delete(roomId);
   const p = pending.get(roomId);
+  // The take/give reply: the spend went out. Its floor is recorded BEFORE the
+  // snapshot ordering below is consulted: a reply answered after a newer poll
+  // carries an older snapshot and must not be filed over it, but the floor it
+  // brings still stands, or the action could never clear (#245 review, round 12).
   if (p && p.op === reply.op && (reply.op === 'claim' || reply.op === 'give')) {
-    // The spend went out: statuses from the one captured after it count. An
-    // older node (or a failed read) sends none; then only a landing clears it.
     p.floor = reply.status && reply.status.snapshot > 0 ? reply.status.snapshot : null;
   }
   if (reply.status) {
     const st = reply.status;
+    // An older snapshot answered late is not filed over a newer one (an older
+    // node numbers nothing and always files).
+    const newest = latestSnapshot.get(roomId) ?? 0;
+    const stale = st.snapshot > 0 && st.snapshot < newest;
     const prev = latest.get(roomId);
-    latest.set(roomId, st);
+    if (!stale) {
+      if (st.snapshot > 0) latestSnapshot.set(roomId, st.snapshot);
+      latest.set(roomId, st);
+    }
     if (p) {
-      const landed =
-        (p.op === 'claim' && (st.walletMojos ?? 0n) > 0n) ||
-        (p.op === 'give' && prev !== undefined && st.walletMojos !== null && prev.walletMojos !== null
-          && st.walletMojos < prev.walletMojos);
-      const settling = p.op === 'claim' ? st.landing : st.spending;
-      const afterPush = p.floor !== null && st.snapshot >= p.floor;
-      if (landed || (afterPush && !settling)) pending.delete(roomId);
+      // Judge the pending action on the newest view there is: the status just
+      // filed, or, for a late reply, the newer one already on file — which now
+      // counts as after the push, the floor being set.
+      const view = stale ? prev : st;
+      if (view) {
+        const landed =
+          (p.op === 'claim' && (view.walletMojos ?? 0n) > 0n) ||
+          (!stale && p.op === 'give' && prev !== undefined && view.walletMojos !== null && prev.walletMojos !== null
+            && view.walletMojos < prev.walletMojos);
+        const settling = p.op === 'claim' ? view.landing : view.spending;
+        const afterPush = p.floor !== null && view.snapshot >= p.floor;
+        if (landed || (afterPush && !settling)) pending.delete(roomId);
+      }
     }
   }
   notify();
