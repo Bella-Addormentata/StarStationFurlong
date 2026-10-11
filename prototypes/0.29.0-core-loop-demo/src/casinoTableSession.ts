@@ -30,7 +30,7 @@
 
 import * as THREE from 'three';
 import {
-  clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips,
+  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeats, readTableState,
   spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
@@ -131,6 +131,10 @@ function diceSpotFor(stand: FeltPoint, felt: FeltRect): FeltPoint {
 // ── Per-table runtime (every client) ─────────────────────────────────────────
 
 interface TableRuntime {
+  /** The room doc this runtime was built in (casinoDocEpoch): another room
+   *  can hold a table with the same id at the same round, so its state never
+   *  carries over a rebind. */
+  epoch: number;
   /** First frame done — history seen before that is never animated. */
   primed: boolean;
   /** Seed of the last dice throw this client started animating. */
@@ -148,8 +152,8 @@ let unsubscribeDoc: (() => void) | null = null;
 
 function runtime(tableId: string): TableRuntime {
   let rt = runtimes.get(tableId);
-  if (!rt) {
-    rt = { primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, dirty: true };
+  if (!rt || rt.epoch !== casinoDocEpoch()) {
+    rt = { epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, dirty: true };
     runtimes.set(tableId, rt);
   }
   return rt;
@@ -406,6 +410,20 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let windowRound = -1;
   /** round → verdict of the fairness check, so the card never re-hashes. */
   const verdicts = new Map<number, boolean>();
+  /** The room doc this focus began in: rounds and bets from another room's
+   *  table with the same id must not count as this window's. */
+  let mountEpoch = casinoDocEpoch();
+  const syncEpoch = (): void => {
+    if (mountEpoch === casinoDocEpoch()) return;
+    mountEpoch = casinoDocEpoch();
+    windowRound = -1;
+    added = new Map();
+    verdicts.clear();
+    hand = [];
+    pickup = null;
+    held = null;
+    localHold.delete(itemId);
+  };
 
   // ── Reads ─────────────────────────────────────────────────────────────────
 
@@ -441,6 +459,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   };
 
   const syncWindow = (): void => {
+    syncEpoch();
     const r = round();
     if (r !== windowRound) {
       windowRound = r;
@@ -731,6 +750,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const showFlash = flash && performance.now() < flashUntil;
     fl.textContent = showFlash ? flash : '';
     fl.style.display = showFlash ? 'block' : 'none';
+    // Screen readers hear each notice once (the status line ticks every
+    // second, so it stays out of the live region).
+    const live = bar.querySelector<HTMLDivElement>('[data-live]')!;
+    const said = showFlash ? flash : '';
+    if (live.textContent !== said) live.textContent = said;
   };
 
   // ── ⚙️ settings card ──────────────────────────────────────────────────────
@@ -898,6 +922,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       bar.innerHTML = `
         <div data-status style="font-size:12px;font-weight:900;letter-spacing:1px;"></div>
         <div data-flash style="display:none;font-size:10px;font-weight:800;color:#FF8A80;letter-spacing:1px;margin-top:3px;"></div>
+        <div data-live role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;"></div>
         <div style="font-size:9px;color:rgba(212,168,75,0.55);letter-spacing:1px;margin-top:4px;">
           DRAG ACROSS YOUR RAIL TO PICK UP CHIPS · CLICK THE FELT TO BET · RIGHT-CLICK TO PUT THEM BACK · ⚙️ TABLE · ESC TO STEP BACK</div>`;
       host.appendChild(bar);
@@ -935,6 +960,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       capture = null;
     },
     update(): void {
+      syncEpoch();
       // Holding over one stack keeps picking chips off it, a little faster each time.
       if (pickup && performance.now() >= pickup.nextAt) {
         takeFromStack(pickup.stack);

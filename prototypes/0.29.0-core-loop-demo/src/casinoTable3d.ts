@@ -311,7 +311,8 @@ function rouletteDecor(c: CanvasRenderingContext2D, px: (x: number, z: number) =
 // ── Chips ────────────────────────────────────────────────────────────────────
 
 const POOL_DENOMS = [1, 5, 25, 100, 500, 1000] as const;
-/** Per denomination: felt + rail + hand together. */
+/** Starting chips per denomination (felt + rail + hand together); a pool
+ *  that fills doubles, so every chip on the table always renders. */
 const CHIP_POOL = 360;
 
 function chipFaceCanvas(denom: number): HTMLCanvasElement {
@@ -366,23 +367,56 @@ class ChipPools {
   private readonly dim = new THREE.Color(0.62, 0.62, 0.62);
   private readonly lit = new THREE.Color(1, 1, 1);
   private readonly up = new THREE.Vector3(0, 1, 0);
+  private readonly tmpColor = new THREE.Color();
 
-  constructor(ctx: PiecesCtx) {
+  constructor(private readonly ctx: PiecesCtx) {
     const geo = new THREE.CylinderGeometry(CHIP_RADIUS, CHIP_RADIUS, CHIP_H, 24);
     for (const d of POOL_DENOMS) {
       const side = solidCanvas(chipSideCanvas(d));
       const face = solidCanvas(chipFaceCanvas(d));
       // Lit materials would be nicer but the chips must read in the casino's
       // dim light from across the table: unlit faces, like the felt.
-      const mesh = new THREE.InstancedMesh(geo, [side, face, face], CHIP_POOL);
-      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      mesh.count = 0;
-      mesh.frustumCulled = false;
-      // setColorAt allocates instanceColor; prime it so dim/lit always works.
-      mesh.setColorAt(0, this.lit);
+      const mesh = this.makeMesh(geo, [side, face, face], CHIP_POOL);
       ctx.attach(mesh);
       this.meshes.set(d, mesh);
     }
+  }
+
+  private makeMesh(geo: THREE.BufferGeometry, mats: THREE.Material[], capacity: number): THREE.InstancedMesh {
+    const mesh = new THREE.InstancedMesh(geo, mats, capacity);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    // setColorAt allocates instanceColor; prime it so dim/lit always works.
+    mesh.setColorAt(0, this.lit);
+    return mesh;
+  }
+
+  /** Double a full pool in place: copy what's laid out so far into a mesh
+   *  twice the size and swap it into the old one's spot. */
+  private grow(d: number): THREE.InstancedMesh {
+    const old = this.meshes.get(d)!;
+    const mesh = this.makeMesh(old.geometry, old.material as THREE.Material[], old.instanceMatrix.count * 2);
+    const n = this.used.get(d) ?? 0;
+    for (let i = 0; i < n; i++) {
+      old.getMatrixAt(i, this.m4);
+      mesh.setMatrixAt(i, this.m4);
+      if (old.instanceColor) {
+        old.getColorAt(i, this.tmpColor);
+        mesh.setColorAt(i, this.tmpColor);
+      }
+    }
+    mesh.visible = old.visible;
+    const parent = old.parent;
+    if (parent) {
+      parent.add(mesh);
+      parent.remove(old);
+    } else {
+      this.ctx.attach(mesh);
+    }
+    old.dispose(); // the instance buffers only; geometry + materials carry over
+    this.meshes.set(d, mesh);
+    return mesh;
   }
 
   begin(): void {
@@ -392,9 +426,9 @@ class ChipPools {
   /** Add one chip lying flat at (x, y, z) — y is the chip's bottom face. */
   add(denom: number, x: number, y: number, z: number, spin: number, dim: boolean): void {
     const d = (POOL_DENOMS as readonly number[]).includes(denom) ? denom : 1;
-    const mesh = this.meshes.get(d)!;
     const i = this.used.get(d) ?? 0;
-    if (i >= CHIP_POOL) return;
+    let mesh = this.meshes.get(d)!;
+    if (i >= mesh.instanceMatrix.count) mesh = this.grow(d);
     this.q.setFromAxisAngle(this.up, spin);
     this.pos.set(x, y + CHIP_H / 2, z);
     this.m4.compose(this.pos, this.q, this.one);
