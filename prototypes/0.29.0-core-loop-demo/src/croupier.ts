@@ -118,18 +118,27 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   const epoch = casinoDocEpoch();
   const closing = readTableState(tableId);
   if (closing?.phase !== 'closing' || closing.round !== round) return;
-  let result: number;
+  let result: number | null;
   let fairness: FairnessTranscript | undefined;
   let forfeited: string[] = [];
+  let voided = false;
   // A round opened Fair (it carries a house commit) settles Fair, whatever the
   // owner switched the table to since; the switch takes effect next round.
   if (closing.houseCommit) {
     const gathered = gatherRound(tableId, closing);
     if (!gathered) return; // reveals still due
     forfeited = gathered.forfeited;
-    const mixed = await settleParties('roulette', gathered.parties, tableId, round);
-    result = mixed?.pocket ?? spinPocket();
-    fairness = mixed?.transcript;
+    if (!gathered.parties[0].seed) {
+      // ⚖️ No house seed to reveal (this page lost it): the house has seen
+      // every bettor's reveal, so settling without its seed would let it pick
+      // between outcomes. The round is void and every stake goes back.
+      voided = true;
+      result = null;
+    } else {
+      const mixed = await settleParties('roulette', gathered.parties, tableId, round);
+      result = mixed!.pocket!;
+      fairness = mixed!.transcript;
+    }
   } else {
     result = spinPocket();
   }
@@ -143,9 +152,17 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // ⚖️ Only the wagers frozen at "no more bets" settle (the reveals made the
   // pocket computable; a rewritten list is void), and a bettor who committed
   // but never revealed forfeits this round's bets.
-  const { bets } = frozenWagers(tableId, before, readAllBets(tableId, round));
+  const live = readAllBets(tableId, round);
+  const { bets, omitted } = frozenWagers(tableId, before, live);
   for (const pid of forfeited) delete bets[pid];
-  const payouts = resolveRound(bets, result);
+  // A void round returns every stake on it; otherwise a bet that missed the
+  // freeze (it arrived just after "no more bets") goes back to its bettor.
+  const refunds: Record<string, number> = {};
+  for (const pid of voided ? Object.keys(live) : omitted) {
+    const sum = live[pid].reduce((n, b) => n + b.amount, 0);
+    if (sum > 0) refunds[pid] = sum;
+  }
+  const payouts = result === null ? {} : resolveRound(bets, result);
   const now = Date.now();
   writeTableState(tableId, {
     kind: 'roulette',
@@ -154,6 +171,7 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     result,
     resultAt: now,
     payouts,
+    ...(voided ? { voided: true } : {}),
     ...(fairness ? { fairness } : {}),
     ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
     // The commits and wagers as this page froze them, not as the shared
@@ -164,6 +182,7 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   });
   settledRound(tableId, before);
   for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
+  for (const [pid, amount] of Object.entries(refunds)) creditChips(pid, amount);
 }
 
 /** "No more bets": close the window and freeze the round's commitments.

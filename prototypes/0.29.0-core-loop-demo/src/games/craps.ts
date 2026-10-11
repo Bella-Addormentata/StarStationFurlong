@@ -87,6 +87,9 @@ export interface CrapsTableState {
    *  legacy/betting states ⇒ treated as false. The shooter-hand NETTING boundary
    *  (see the Chia backend plan) and the "new shooter" narration read it. */
   sevenOut?: boolean;
+  /** ⚖️ A Fair roll voided because the house seed couldn't be revealed: no
+   *  dice, every bet stands (roulette: every stake returned). */
+  voided?: boolean;
   /** 🎲🔒 How this roll's dice were produced + its verifiable transcript (absent
    *  for 'rng'). Settled rolls only; lets any client re-derive and check the dice. */
   fairness?: FairnessTranscript;
@@ -270,6 +273,7 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
         )
     ))
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
+    && (s.voided === undefined || typeof s.voided === 'boolean')
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))

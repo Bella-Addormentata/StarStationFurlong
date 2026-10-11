@@ -1096,9 +1096,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const rs = game === 'roulette' ? rouletteState() : null;
     const s = cs ?? rs;
     if (s?.phase !== 'settled') return null;
+    const what = game === 'craps' ? 'LAST ROLL' : 'LAST SPIN';
+    if (s.voided) {
+      return {
+        text: `⚠ ${what} VOIDED · THE HOUSE SEED WAS UNAVAILABLE · ${game === 'craps' ? 'EVERY BET STANDS' : 'STAKES RETURNED'}`,
+        color: '#F5C26B',
+      };
+    }
     const outcome = cs ? (cs.dice ? { dice: cs.dice } : null) : (rs?.result != null ? { pocket: rs.result } : null);
     if (!outcome) return null;
-    const what = game === 'craps' ? 'LAST ROLL' : 'LAST SPIN';
     const fx = s.fairness;
     if (!fx) {
       return s.houseCommit ? { text: `⚠ ${what} · UNPROVEN (NO SEEDS WERE REVEALED)`, color: '#F5C26B' } : null;

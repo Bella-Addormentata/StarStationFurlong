@@ -372,18 +372,22 @@ export function frozenWagers<T>(
   tableId: string,
   s: TableState & { wagers?: Record<string, string> },
   bets: Record<string, T[]>,
-): { bets: Record<string, T[]>; voided: string[] } {
+): { bets: Record<string, T[]>; voided: string[]; omitted: string[] } {
   const { wagers } = frozenFields(tableId, s);
-  if (!wagers) return { bets, voided: [] };
+  if (!wagers) return { bets, voided: [], omitted: [] };
   const out: Record<string, T[]> = {};
   const voided: string[] = [];
+  const omitted: string[] = [];
   for (const [pid, list] of Object.entries(bets)) {
     const want = wagers[pid];
-    if (want === undefined) continue; // not in the round: untouched
+    if (want === undefined) { // missed the freeze: the caller returns it (roulette) or lets it ride (craps)
+      omitted.push(pid);
+      continue;
+    }
     if (wagerFingerprint(list) === want) out[pid] = list;
     else voided.push(pid);
   }
-  return { bets: out, voided: voided.sort() };
+  return { bets: out, voided: voided.sort(), omitted: omitted.sort() };
 }
 
 /** When this page first tried to settle each round (its own clock). */
@@ -486,6 +490,10 @@ export async function verifySettledRound(
     || bettors.some((pid, i) => frozen[pid] !== t.commits![i + 1])) {
     return { kind: 'failed' };
   }
+  // Settling without the house seed lets the house pick between outcomes
+  // after seeing every reveal: the operator voids such a round instead, so a
+  // published one fails.
+  if (t.seeds[0] === '') return { kind: 'failed' };
   if (!(await verifyParties(t, game, tableId, s.round, outcome, casinoRoomId()))) return { kind: 'failed' };
   const forfeited = bettors.filter((_, i) => t.seeds![i + 1] === '');
   const droppedReveal = forfeited.some((pid) => {

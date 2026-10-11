@@ -103,6 +103,25 @@ class LocalCrapsBackend implements CrapsBackend {
       const gathered = gatherRound(tableId, closing);
       if (!gathered) return null; // reveals still due
       forfeited = gathered.forfeited;
+      if (!gathered.parties[0].seed) {
+        // ⚖️ No house seed to reveal (this page lost it): having seen every
+        // bettor's reveal, the house could pick between outcomes by settling
+        // without its seed. The roll is void: no dice, every bet stands.
+        const before = readCrapsTableState(tableId);
+        if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return null;
+        const now = Date.now();
+        writeCrapsTableState(tableId, {
+          kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
+          resultAt: now, payouts: {}, voided: true,
+          ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
+          ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
+          ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+          ...frozenFields(tableId, before),
+          ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+        });
+        settledRound(tableId, before);
+        return null;
+      }
       const mixed = await settleParties('craps', gathered.parties, tableId, round);
       // Nobody revealed anything (no house seed on this device, no bettors):
       // an unproven roll, shown as such on the table card.

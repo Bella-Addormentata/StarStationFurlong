@@ -11,7 +11,7 @@ import * as Y from 'yjs';
 vi.stubGlobal('window', { location: { search: '' } });
 
 const {
-  bindCasinoDoc, buyInChips, readAllCrapsBets, readCrapsTableState, readDiceThrow, readSeedRecord,
+  bindCasinoDoc, buyInChips, readAllCrapsBets, readChips, readCrapsTableState, readDiceThrow, readSeedRecord,
   readTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyBets, writeMyCrapsBets,
   writeMySeedRecord, writeTableState,
 } = await import('./casinoDoc');
@@ -334,6 +334,58 @@ describe('a Fair roulette round', () => {
       .toMatchObject({ kind: 'verified', watchedClose: false });
   });
 
+  it('a round whose house seed is gone is void, and every stake goes back', async () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    // The operator page no longer holds this house commit's seed (lost on reload).
+    writeTableState(t, { ...readTableState(t)!, houseCommit: 'f'.repeat(64) });
+    writeMyBets(t, AMY, 1, [{ type: 'red', amount: 10 }]);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette', [AMY]);
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    playersLook(t, 'roulette', [AMY]);
+    const before = readChips(AMY);
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s).toMatchObject({ phase: 'settled', result: null, voided: true, payouts: {} });
+    expect(readChips(AMY)).toBe(before + 10);
+  });
+
+  it('a bet that missed the freeze is returned, not lost', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    writeMyBets(t, 'player-Late', 1, [{ type: 'red', amount: 7 }]); // lands just after the close
+    playersLook(t, 'roulette');
+    const before = readChips('player-Late');
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('settled');
+    expect(readChips('player-Late')).toBe(before + 7);
+  });
+
+  it('a published round without the house seed fails the check', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    const { settleParties } = await import('./games/diceFairness');
+    const f = s.fairness!;
+    const mixed = await settleParties('roulette', [
+      { id: 'house', commit: f.commits![0], seed: null },
+      { id: AMY, commit: f.commits![1], seed: f.seeds![1] },
+      { id: BOB, commit: f.commits![2], seed: f.seeds![2] },
+    ], t, 1);
+    const forged: RouletteTableState = { ...s, result: mixed!.pocket!, fairness: mixed!.transcript };
+    expect((await verifySettledRound('roulette', t, forged, { pocket: forged.result! })).kind).toBe('failed');
+  });
+
   it('a bettor id too long for the closing state is left out instead of wedging the table', () => {
     const t = freshTable();
     tickAutoCroupier(t);
@@ -592,8 +644,26 @@ describe('a Fair craps roll', () => {
     const a = [{ type: 'pass', amount: 10 }];
     const wagers = { [AMY]: wagerFingerprint(a), [BOB]: wagerFingerprint([{ type: 'field', amount: 5 }]) };
     const out = frozenWagers('t', { kind: 'roulette', round: 1, houseCommit: 'h', wagers } as never, { [AMY]: a, [BOB]: [{ type: 'anyseven', amount: 50 }], 'player-Late': a });
-    expect(out).toEqual({ bets: { [AMY]: a }, voided: [BOB] });
-    expect(frozenWagers('t', { kind: 'roulette', round: 1 } as never, { [BOB]: a })).toEqual({ bets: { [BOB]: a }, voided: [] });
+    expect(out).toEqual({ bets: { [AMY]: a }, voided: [BOB], omitted: ['player-Late'] });
+    expect(frozenWagers('t', { kind: 'roulette', round: 1 } as never, { [BOB]: a })).toEqual({ bets: { [BOB]: a }, voided: [], omitted: [] });
+  });
+
+  it('a roll whose house seed is gone is void: no dice, every bet stands', async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeCrapsTableState(t, { ...readCrapsTableState(t)!, houseCommit: 'f'.repeat(64) });
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_CLOSING_MS);
+    tickAutoStickman(t);
+    await flush();
+    const s = readCrapsTableState(t)!;
+    expect(s).toMatchObject({ phase: 'settled', dice: null, voided: true, point: null });
+    expect(readAllCrapsBets(t)[AMY]).toEqual([{ type: 'pass', amount: 10 }]);
   });
 
   it('an RNG table skips the exchange and carries no transcript', async () => {

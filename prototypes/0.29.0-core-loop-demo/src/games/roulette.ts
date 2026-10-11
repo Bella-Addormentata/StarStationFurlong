@@ -73,6 +73,9 @@ export interface RouletteTableState {
   /** 🎡 A manual SPIN's settlement lease: the page (player id + page nonce)
    *  that closed or took over this round. Only it publishes and pays. */
   operator?: string;
+  /** ⚖️ Voided: the house seed couldn't be revealed, so no pocket and every
+   *  stake was returned. */
+  voided?: boolean;
 }
 
 export function initialRouletteState(): RouletteTableState {
@@ -111,6 +114,7 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.operator === undefined || (typeof s.operator === 'string' && s.operator.length <= 192))
+    && (s.voided === undefined || typeof s.voided === 'boolean')
     && isSeedRoundFields(s);
 }
 
