@@ -22,7 +22,7 @@
  * rebakeWalkableGrid → rebuildSeats).
  */
 
-import { FURNITURE, buildSeatList, isBridgeClick } from './furniture';
+import { FURNITURE, buildSeatList, hotTubBridgeLanding, isBridgeClick, islandHotTub } from './furniture';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 
 export interface Seat {
@@ -68,7 +68,7 @@ rebuildSeats();
  *  and the pool item precedes the hot tub in FURNITURE order, so a single
  *  first-hit pass would route every tub/bridge click into a wade-in swim.
  *  1. solid seats (chairs, loungers, bunks, the hot tub, the dive board)
- *  2. 🌉 the footbridge deck → the tub's southmost seat (facing the bridge)
+ *  2. 🌉 the footbridge deck → the tub spot the bridge actually arrives at
  *  3. open-water swim seats
  */
 export function findSeatAt(x: number, z: number): Seat | null {
@@ -80,12 +80,27 @@ export function findSeatAt(x: number, z: number): Seat | null {
     if (!seat.swim && inBox(seat)) return seat;
   }
   if (isBridgeClick(FURNITURE, x, z)) {
-    let best: Seat | null = null;
-    for (const seat of SEATS) {
-      if (!seat.id.startsWith('pool-hot-tub:')) continue;
-      if (!best || seat.sit.z > best.sit.z) best = seat;
+    // Which of the tub's four spots? The one nearest where the bridge walk
+    // ends. This used to be "greatest sit.z", which picked the single south
+    // seat of the old east/west/north/south cross; #187's quadrant layout
+    // puts TWO seats on the south side, so the rule is now the thing it
+    // always meant — and it stays right whatever the seat list becomes.
+    const landing = hotTubBridgeLanding(FURNITURE);
+    const tub = islandHotTub(FURNITURE);
+    if (landing && tub) {
+      let best: Seat | null = null;
+      let bestDist = Infinity;
+      for (const seat of SEATS) {
+        if (!seat.id.startsWith(`${tub.id}:`)) continue;
+        const d =
+          (seat.sit.x - landing.x) ** 2 + (seat.sit.z - landing.z) ** 2;
+        if (d < bestDist) {
+          bestDist = d;
+          best = seat;
+        }
+      }
+      if (best) return best;
     }
-    if (best) return best;
   }
   for (const seat of SEATS) {
     if (seat.swim && inBox(seat)) return seat;

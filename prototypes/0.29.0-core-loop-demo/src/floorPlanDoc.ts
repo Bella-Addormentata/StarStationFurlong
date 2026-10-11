@@ -23,6 +23,14 @@
 
 import * as Y from 'yjs';
 import type { DoorId } from './doors';
+import {
+  CUPOLA_WALLS,
+  cupolaPlans,
+  cupolaCornerClearance,
+  clampOutOfCupolaCorners,
+  type CupolaPlan,
+  type CupolaWall,
+} from './cupola';
 
 export const DOOR_LATTICE = 0.5;
 /** |lateral| bound keeping opening+posts inside the 11.8 run for BOTH door
@@ -294,6 +302,107 @@ export function roomHalfExtents(): { halfX: number; halfZ: number } {
 function recomputeRoomHalf(): void {
   const { cols, rows } = readRoomDims();
   roomHalf = { halfX: cols * TILE_SIZE / 2, halfZ: rows * TILE_SIZE / 2 };
+  roomCupolaPlan = OCTAGON_HULL ? cupolaPlans(roomHalf, readCupolaWalls()) : [];
+}
+
+// ── 🔭 Cupola end wall (cupola.ts) ───────────────────────────────────────────
+// `floorPlan.cupola → { wall, walls? }`: which END walls are observation
+// cupolas. Absent / malformed ⇒ none (every existing room, unchanged). A resize
+// that turns an end into a side wall clears that end (writeRoomDims); a peer's
+// invalid wall likewise renders plain.
+
+/** The cupola is part of the octagon hull; the legacy flat-box room
+ *  (`?octagon=0`) draws none, so it must not walk or place round one either.
+ *  Same flag world.ts reads (no window under the unit tests ⇒ on). */
+const OCTAGON_HULL =
+  typeof window === 'undefined' || new URLSearchParams(window.location.search).get('octagon') !== '0';
+
+/** Cached resolved cupolas for the current room size. */
+let roomCupolaPlan: CupolaPlan[] = [];
+
+/** The stored cupola walls, shape-guarded (peer data), or an empty list. */
+export function readCupolaWalls(): CupolaWall[] {
+  if (!docAlive()) return [];
+  const raw = planMap!.get('cupola') as { wall?: unknown; walls?: unknown } | undefined;
+  if (!raw || typeof raw !== 'object') return [];
+  const isWall = (w: unknown): w is CupolaWall => typeof w === 'string' && CUPOLA_WALLS.includes(w as CupolaWall);
+  // Both ends: exactly the two ends of one axis, with `wall` naming the first
+  // (cupolaRecord). Anything else falls back to `wall` alone, which is what
+  // an older build draws, so the two never disagree about a peer's record.
+  const walls = raw.walls;
+  if (
+    Array.isArray(walls) && walls.length === 2 && isWall(walls[0]) && isWall(walls[1]) &&
+    walls[0] !== walls[1] && walls[0][0] === walls[1][0] && (raw.wall === undefined || raw.wall === walls[0])
+  ) {
+    return [walls[0], walls[1]];
+  }
+  return isWall(raw.wall) ? [raw.wall] : [];
+}
+
+/** 🔭 The stored cupola walls that are end walls at the room's current size:
+ *  the ones the hull draws (a dormant one, left by a racing resize, is not). */
+export function endCupolaWalls(): CupolaWall[] {
+  return readCupolaWalls().filter((wall) => cupolaPlans(roomHalf, wall).length > 0);
+}
+
+/** Legacy single-wall reader; new code should use readCupolaWalls. */
+export function readCupolaWall(): CupolaWall | null {
+  return readCupolaWalls()[0] ?? null;
+}
+
+/** Owner UI: set the room's cupola ends. The editor gates end walls and
+ *  conflicts before writing. */
+export function writeCupolaWalls(walls: readonly CupolaWall[]): void {
+  if (!docAlive()) return;
+  const valid = [...new Set(walls)].filter((wall) => CUPOLA_WALLS.includes(wall));
+  boundDoc!.transact(() => {
+    if (valid.length === 0) planMap!.delete('cupola');
+    else planMap!.set('cupola', cupolaRecord(valid));
+  });
+}
+
+/** The stored shape: `{ wall }` for one end; both ends also keep `wall` (the
+ *  first) beside `walls`, so an older build still draws one of them. */
+function cupolaRecord(walls: readonly CupolaWall[]): { wall: CupolaWall; walls?: CupolaWall[] } {
+  return walls.length === 1 ? { wall: walls[0] } : { wall: walls[0], walls: [...walls] };
+}
+
+/** Legacy single-wall writer; new code should use writeCupolaWalls. */
+export function writeCupolaWall(wall: CupolaWall | null): void {
+  writeCupolaWalls(wall === null ? [] : [wall]);
+}
+
+/** The current room's cupolas resolved against its size. Cached — cheap enough
+ *  for the per-cell walkable bake and the per-frame move clamps. */
+export function roomCupolas(): CupolaPlan[] {
+  return roomCupolaPlan;
+}
+
+/** Legacy single-cupola reader; new code should use roomCupolas. */
+export function roomCupola(): CupolaPlan | null {
+  return roomCupolaPlan[0] ?? null;
+}
+
+/** True when a plan point is walkable floor as far as the room's SHAPE goes:
+ *  inside the walkable box and clear of any cupola's cut corners, with the
+ *  same WALL_CLEARANCE. (Furniture is the obstacle map's business.) */
+export function insideRoomWalk(x: number, z: number): boolean {
+  const { boundX, boundZ } = roomWalkBounds();
+  if (Math.abs(x) > boundX || Math.abs(z) > boundZ) return false;
+  return roomCupolaPlan.every((plan) => cupolaCornerClearance(plan, x, z) >= WALL_CLEARANCE);
+}
+
+/** Clamp a plan point onto the walkable floor: the walkable box, then out of
+ *  a cupola's cut corners (sliding along the glass). */
+export function clampToRoomWalk(x: number, z: number): { x: number; z: number } {
+  const { boundX, boundZ } = roomWalkBounds();
+  const cx = Math.max(-boundX, Math.min(boundX, x));
+  const cz = Math.max(-boundZ, Math.min(boundZ, z));
+  let point = { x: cx, z: cz };
+  for (let pass = 0; pass < roomCupolaPlan.length; pass++) {
+    for (const plan of roomCupolaPlan) point = clampOutOfCupolaCorners(plan, point.x, point.z, WALL_CLEARANCE);
+  }
+  return point;
 }
 
 /**
@@ -370,6 +479,23 @@ export function writeRoomDims(cols: number, rows: number): void {
   const r = sanitizeTileCount(rows);
   if (c === null || r === null) return;
   boundDoc!.transact(() => {
+    // 🔭 A resize that makes the cupola wall a SIDE wall ends the cupola —
+    // kept dormant, it could come back over doors or windows placed on that
+    // wall meanwhile, none of which validateCupolaWall ever saw. One already
+    // dormant before this resize (a peer set it while another resized) is
+    // just as stale, so it goes too.
+    const currentCupolas = readCupolaWalls();
+    const nextHalf = { halfX: c * TILE_SIZE / 2, halfZ: r * TILE_SIZE / 2 };
+    const nextCupolas = currentCupolas.filter((wall) =>
+      cupolaPlans(roomHalfExtents(), wall).length > 0 && cupolaPlans(nextHalf, wall).length > 0,
+    );
+    if (nextCupolas.length !== currentCupolas.length) {
+      if (nextCupolas.length) {
+        planMap!.set('cupola', cupolaRecord(nextCupolas));
+      } else {
+        planMap!.delete('cupola');
+      }
+    }
     planMap!.set('dims', { cols: c, rows: r });
     const nonDefault = c !== DEFAULT_DIMS.cols || r !== DEFAULT_DIMS.rows;
     if (nonDefault) {

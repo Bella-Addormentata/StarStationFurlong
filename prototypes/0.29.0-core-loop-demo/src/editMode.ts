@@ -75,7 +75,12 @@ import {
 } from './pathfinding';
 import {
   roomHalfExtents, roomPlaceBounds, doorLateralLimitForWall, clearDoorSlide,
+  roomCupolas, readCupolaWalls, writeCupolaWalls,
 } from './floorPlanDoc';
+import {
+  cupolaPlan, cupolaEndWalls, cupolaWallSelections, cupolaWallsLabel, cupolaSideWallRun, cupolaCornerClearance,
+  boxClearOfCupolaCorners, boxInCupolaTaper, cupolaStripRun, type CupolaPlan, type CupolaWall,
+} from './cupola';
 import { SEATS, rebuildSeats } from './seats';
 import { rebuildStands } from './stands';
 import { DEVICES, rebuildDevices } from './devices';
@@ -112,7 +117,15 @@ import { showHint } from './hud';
 import { isDeviceFocusActive } from './deviceFocus';
 import { writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { addToRoomInventory, activeRoomId } from './roomInventory';
+// 🚀 The robot captain's dock stays while its ship's route runs (design §2a).
+import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
+// 🚏 …and so do a helm, engine and fuel tank, the same ones in every game.
+import { readShipRoute, routeRulesFlightNow } from './shipRoute';
+import { isRouteRunning } from './pilotRoute';
+import { clearRobotConfig, readRobotConfig } from './robotDoc';
+import { keptRoutePartTaken, routePortTaken, tanksLockedByRoute, ROUTE_PORT_REFUSAL, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
+import { isFormFieldTarget } from './typingFocus';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
 
@@ -135,6 +148,24 @@ export function setRoomEditPermission(predicate: () => RoomEditPermission): void
 /** May the local player edit this room? (Consumed by the wall-computer UI.) */
 export function canEditRoom(): RoomEditPermission {
   return ownerPredicate();
+}
+
+/**
+ * 🔒 The narrower gate of main.ts's authority split: does the local player
+ * hold this room's DEED (the raw owner, never a venture's shareholders)?
+ * What can't be undone takes it: 🔧 #192, a module taken off the station.
+ * main.ts registers the raw deed check (currentRoomDeedIsMine), as it does
+ * for the sole-croupier election. Default: permissive (offline = your room).
+ */
+let deedPredicate: () => boolean = () => true;
+
+export function setRoomDeedCheck(predicate: () => boolean): void {
+  deedPredicate = predicate;
+}
+
+/** Does the local player hold this room's deed? */
+export function holdsRoomDeed(): boolean {
+  return deedPredicate();
 }
 
 /**
@@ -286,6 +317,14 @@ export function validatePlacement(
     if (pos.x < -bX || pos.x > bX || pos.z < -bZ || pos.z > bZ) {
       return { ok: false, reason: 'out of bounds' };
     }
+  }
+  // 1a. 🔭 …and out of a cupola's cut corners, with the same 1 m of wall
+  //     clearance the placement box keeps.
+  //     A wall panel may not hang anywhere past where the taper starts (on
+  //     the glass, or on side wall the taper removed).
+  const cupolas = roomCupolas();
+  if (cupolas.some((cupola) => !cupolaClearsItem(cupola, item.kind, pos, rot, box, featureBoxes))) {
+    return { ok: false, reason: 'in the cupola glass' };
   }
 
   // 1b. 🖥️ Wall-mounted panel rules (doorways, windows, other furniture).
@@ -676,9 +715,19 @@ export function validateDoorPlacement(
   lateral: number,
   excludeId?: string,
 ): DoorPlacementVerdict {
-  // 1. On the wall, clear of the corners.
+  // 0. 🔭 A cupola wall is all glass — no doors on it.
+  const cupolas = roomCupolas();
+  if (cupolas.some((cupola) => cupola.wall === wall)) {
+    return { ok: false, reason: 'the cupola wall takes no doors' };
+  }
+
+  // 1. On the wall, clear of the corners…
   if (Math.abs(lateral) > doorLateralLimitForWall(wall) + 1e-6) {
     return { ok: false, reason: 'too close to a corner' };
+  }
+  // 1b. 🔭 …and, on a side wall, clear of where a cupola starts tapering.
+  if (cupolas.some((cupola) => !doorClearOfCupola(cupola, wall, lateral))) {
+    return { ok: false, reason: 'too close to the cupola' };
   }
 
   // 2. No furniture in the opening…
@@ -763,6 +812,121 @@ export function validateDoorPlacement(
   }
 
   return { ok: true };
+}
+
+// ── 🔭 Cupola end wall (cupola.ts) ──────────────────────────────────────────
+
+/** Furniture keeps this far inside a cupola's cut corners — the same 1 m the
+ *  placement box keeps from the walls (floorPlanDoc.roomPlaceBounds). */
+const CUPOLA_PLACE_CLEARANCE = 1.0;
+
+/** Window end inset — octagonHull.WINDOW_INSET / windowLayout.WALL_INSET. */
+const WINDOW_END_INSET = 0.05;
+
+/** Doorway (opening + posts) kept this far short of where a side wall ends at
+ *  the cupola — the same margin the door keeps from a window. */
+const CUPOLA_DOOR_MARGIN = 0.4;
+
+/** True when a piece stays out of the cupola. Wall panels must hang short
+ *  of the taper. A footprint (`box`) keeps the placement box's 1 m inside
+ *  the cut corners; a generated feature's blocked area (`featureBoxes`: sea,
+ *  river, pool — they meet the walls by design) only has to stay out of the
+ *  cut-off corners; a piece with neither is tested at its origin. */
+function cupolaClearsItem(
+  plan: CupolaPlan,
+  kind: FurnitureItem['kind'],
+  pos: { x: number; z: number },
+  rot: Rot,
+  box: Box | null,
+  featureBoxes: readonly Box[] = [],
+): boolean {
+  if (isWallMounted(kind)) {
+    const mount = wallMountBox(kind, pos, rot);
+    return !mount || !boxInCupolaTaper(plan, mount);
+  }
+  if (box) return boxClearOfCupolaCorners(plan, box, CUPOLA_PLACE_CLEARANCE);
+  if (featureBoxes.length) return featureBoxes.every((b) => boxClearOfCupolaCorners(plan, b, 0));
+  return cupolaCornerClearance(plan, pos.x, pos.z) >= CUPOLA_PLACE_CLEARANCE;
+}
+
+/** cupolaClearsItem for a piece already in the room. */
+function cupolaClearsItemRecord(plan: CupolaPlan, item: FurnitureItem): boolean {
+  const box = itemAabb(item);
+  const gen = FURNITURE_DEFS[item.kind].obstacleBoxes;
+  const featureBoxes = !box && gen ? gen(item, FURNITURE) : [];
+  return cupolaClearsItem(plan, item.kind, item.pos, item.rot, box, featureBoxes);
+}
+
+/** True when a door on `wall` at `lateral` leaves the cupola alone: always on
+ *  the far end cap, and on a side wall only while its doorway stops short of
+ *  the taper. (The cupola wall itself is refused before this.) */
+function doorClearOfCupola(plan: CupolaPlan, wall: DoorWall, lateral: number): boolean {
+  const narrowAxis = plan.profile.narrowAxis;
+  const sideWall = narrowAxis === 'x' ? wall === 'x-' || wall === 'x+' : wall === 'y-' || wall === 'y+';
+  if (!sideWall) return true;
+  const run = cupolaSideWallRun(plan);
+  const half = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH + CUPOLA_DOOR_MARGIN;
+  return lateral - half >= run.lo - 1e-6 && lateral + half <= run.hi + 1e-6;
+}
+
+export type CupolaVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * May the room's `wall` become a cupola? Pure; the 🔭 CUPOLA button's gate.
+ *  1. it must be an END wall (where the module's octagon shows);
+ *  2. no door on it — the owner removes it first (a docked door can't be);
+ *  3. no side-wall door reaching into the taper;
+ *  4. no furniture standing in the corners the cupola cuts off, and no wall
+ *     panel hung past where it starts tapering;
+ *  5. no hull window reaching into the taper.
+ */
+export function validateCupolaWall(wall: CupolaWall): CupolaVerdict {
+  const { halfX, halfZ } = roomHalfExtents();
+  const plan = cupolaPlan({ halfX, halfZ }, wall);
+  if (!plan) return { ok: false, reason: `the ${wall} wall is a side wall — only an end wall can be a cupola` };
+  const openings = currentDoorOpenings();
+  if (openings.some((o) => o.wall === wall)) {
+    return { ok: false, reason: `remove the door on the ${wall} wall first` };
+  }
+  const intruder = openings.find((o) => !doorClearOfCupola(plan, o.wall, o.lateral));
+  if (intruder) {
+    return { ok: false, reason: `move ${doorDisplayName(intruder.id)} away from the ${wall} end first` };
+  }
+  for (const item of FURNITURE) {
+    if (!cupolaClearsItemRecord(plan, item)) {
+      return { ok: false, reason: `move ${item.id} away from the ${wall} end first` };
+    }
+  }
+  // 5. …nor a hull window reaching into the taper (the strips end there).
+  const [lo, hi] = cupolaStripRun(plan, plan.profile.longHalf);
+  for (const rec of readAllWindowLayout().values()) {
+    // The same 0.05 m end inset the hull and the editor keep (clampOpening,
+    // clampWindowAlong), so a window that passes renders where it is stored.
+    if (rec.along - rec.w / 2 < lo + WINDOW_END_INSET - 1e-6 || rec.along + rec.w / 2 > hi - WINDOW_END_INSET + 1e-6) {
+      return { ok: false, reason: `move the window near the ${wall} end first` };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * ⚖️ A cupola and a door, window or piece of furniture that conflicts with it,
+ * written at the same moment by two players, can both land: each was checked
+ * against a doc that did not yet hold the other. Every game reaches the same
+ * verdict from the merged docs, so an editor's game clears the cupola (an
+ * idempotent write) and the other change stands. A stored wall that is no
+ * longer an end wall is cleared the same way. Run after any change to the
+ * floor plan, doors, windows or furniture, and once on join; returns true
+ * when it cleared.
+ */
+export function settleCupolaConflicts(): boolean {
+  const walls = readCupolaWalls();
+  if (!walls.length) return false;
+  const valid = walls.filter((wall) => cupolaPlan(roomHalfExtents(), wall) && validateCupolaWall(wall).ok);
+  if (valid.length === walls.length) return false;
+  if (!canEditRoom().ok) return false;
+  writeCupolaWalls(valid);
+  return true;
 }
 
 // ── Window placement validity (#80 S4 — the window editor's add/tint gate) ─────
@@ -1062,7 +1226,7 @@ class RoomEditController {
   constructor() {
     // Esc precedence — same e.target guards as the phone (#31) and
     // device-focus (#33 D0.3) handlers, deferring to both owners:
-    //  (1) a focused INPUT/TEXTAREA owns Esc (room-name editor, chat) —
+    //  (1) a focused form field owns Esc (room-name editor, chat) —
     //      guard on e.target, not document.activeElement (#31's lesson).
     //  (2) phone open → #31's handler owns Esc.
     //  (3) device focus live → deviceFocus's handler owns Esc (can't overlap
@@ -1070,8 +1234,7 @@ class RoomEditController {
     //  (4) otherwise Esc exits an active edit mode.
     window.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape' || !this.active) return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+      if (isFormFieldTarget(e.target as HTMLElement | null)) {
         return;
       }
       if (document.getElementById('spacephone-container')?.classList.contains('active')) {
@@ -1148,8 +1311,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || !this.addWindowMode) return;
       if (e.key !== '[' && e.key !== ']') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       this.cycleWindowSurface(e.key === ']' ? 1 : -1);
     });
@@ -1171,8 +1333,7 @@ class RoomEditController {
       else if (e.key === 'ArrowDown') dh = -WINDOW_RESIZE_STEP;
       else if (e.key === 'f' || e.key === 'F') auto = true;
       else return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       if (armed) {
         if (auto) this.resetGhostAuto();
@@ -1188,8 +1349,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || !this.carrying) return;
       if (e.key !== 'r' && e.key !== 'R') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       this.rotateCarry();
     });
 
@@ -1201,8 +1361,7 @@ class RoomEditController {
     window.addEventListener('keydown', (e) => {
       if (!this.active || this.carrying || this.doorDrag || !this.selectedId) return;
       if (e.key !== 'x' && e.key !== 'X' && e.key !== 'Delete') return;
-      const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (isFormFieldTarget(e.target as HTMLElement | null)) return;
       e.preventDefault();
       this.removeSelected();
     });
@@ -2201,6 +2360,41 @@ class RoomEditController {
       showHint("CAN'T REMOVE — the room terminal is the way back into edit mode.", 2600);
       return;
     }
+    // 🚀 The robot captain's charging dock (itself, or mounted under the item)
+    // can't go while the ship's route runs: the route names it, and its robot
+    // walks the helm and the berth door. Stop the route at the helm first.
+    const captainDock = readRouteCaptainDockId();
+    if (captainDock && (itemId === captainDock || mountDescendantsOf(itemId).some((c) => c.id === captainDock))) {
+      showHint(`CAN'T REMOVE — ${CAPTAIN_LOCK_REFUSAL}.`, 2800);
+      return;
+    }
+    let routeRuns = false;
+    try {
+      routeRuns = isRouteRunning(readShipRoute());
+    } catch {
+      routeRuns = false;
+    }
+    // Every game keeps the same one of each (routeKeptParts), so two people
+    // removing parts at once never take the last.
+    const going = new Set([itemId, ...mountDescendantsOf(itemId).map((c) => c.id)]);
+    const kept = keptRoutePartTaken(itemId, FURNITURE, going, routeRuns);
+    if (kept) {
+      showHint(kept.others
+        ? `CAN'T REMOVE — the ship's route is running and keeps this ${kept.name} aboard. Remove another ${kept.name}, or stop the route at the helm first.`
+        : `CAN'T REMOVE — the ship's route is running and this is its last ${kept.name}. Stop the route at the helm first.`, 3200);
+      return;
+    }
+    // ⛽ …and while the timetable flies the ship, no tank comes off at all.
+    let timetableRules = false;
+    try {
+      timetableRules = routeRulesFlightNow();
+    } catch {
+      timetableRules = false;
+    }
+    if (tanksLockedByRoute(FURNITURE, FURNITURE.filter((i) => !going.has(i.id)), timetableRules)) {
+      showHint(`CAN'T REMOVE — ${TANKS_LOCK_REFUSAL}.`, 3200);
+      return;
+    }
     if (import.meta.env.DEV && isDeviceFocusActive()) {
       console.error('[editMode] removeSelected during device focus — the edit-mode/device-focus mutual exclusion is broken');
     }
@@ -2217,6 +2411,12 @@ class RoomEditController {
     // tank out also removes everything mounted outboard of it — each layer
     // goes to the room inventory like the item itself, no floating orphans.
     const cascade = mountDescendantsOf(itemId);
+    // 🔧 A robot taking a module apart leaves the job's crew with its dock,
+    // released while the dock is still in the layout (the crew counts placed
+    // docks only), so the job keeps the work done so far.
+    for (const d of [item, ...cascade]) {
+      if (d.kind === 'charging-dock' && readRobotConfig(d.id)?.routine === 'disassemble') clearRobotConfig(d.id);
+    }
     for (const child of cascade) {
       if (this.hoveredId === child.id) this.setHovered(null);
       const childMeshes = this.itemMeshes.get(child.id) ?? [];
@@ -2288,6 +2488,18 @@ class RoomEditController {
   private removeSelectedDoor(doorId: string): void {
     const world = this.world;
     if (!world) return;
+    // 🚏 The running route's ship port: the keeper docks through it at every
+    // stop, and in flight it is unpaired, so the check below would let it go.
+    let route: ReturnType<typeof readShipRoute> = null;
+    try {
+      route = readShipRoute();
+    } catch {
+      route = null;
+    }
+    if (routePortTaken(doorId, route)) {
+      showHint(`CAN'T REMOVE — ${ROUTE_PORT_REFUSAL}.`, 3200);
+      return;
+    }
     if (world.dockingSystem?.isDoorPaired(doorId)) {
       showHint('Unpair this door first (open its keypad), then remove it.', 2800);
       return;
@@ -3643,10 +3855,104 @@ class RoomEditController {
     }
     this.wallpaperBtnEl.style.display = 'block';
     this.syncWallpaperButton();
+    this.showCupolaButton(); // 🔭 shares the 🖼 row (and its show/hide)
   }
 
   private hideWallpaperButton(): void {
     if (this.wallpaperBtnEl) this.wallpaperBtnEl.style.display = 'none';
+    this.hideCupolaButton();
+  }
+
+  // ── 🔭 CUPOLA button — make an end wall an observation cupola (cupola.ts) ──
+
+  private cupolaBtnEl: HTMLButtonElement | null = null;
+
+  /** The 🔭 CUPOLA button, beside 🖼 WALLPAPER. Each click steps the room's
+   *  cupola through OFF → first end wall → second end wall → OFF, skipping a
+   *  wall validateCupolaWall refuses (and saying why). Applies live. */
+  private showCupolaButton(): void {
+    if (!this.cupolaBtnEl) {
+      const btn = document.createElement('button');
+      btn.id = 'room-edit-cupola-btn';
+      btn.type = 'button';
+      btn.title = 'Make an end wall an eight-sided glass cupola (no doors on it)';
+      btn.style.cssText = `
+        position: fixed;
+        top: 128px;
+        left: calc(50% + 92px);
+        padding: 6px 14px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(155, 212, 232, 0.7);
+        border-radius: 8px;
+        color: #9bd4e8;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4700;
+        cursor: pointer;
+      `;
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        this.cycleCupola();
+      });
+      document.body.appendChild(btn);
+      this.cupolaBtnEl = btn;
+    }
+    this.cupolaBtnEl.style.display = 'block';
+    this.syncCupolaButton();
+  }
+
+  private hideCupolaButton(): void {
+    if (this.cupolaBtnEl) this.cupolaBtnEl.style.display = 'none';
+  }
+
+  /** 🔭 A floorPlan change (a peer set or cleared the cupola, or a resize)
+   *  relabels the open 🔭 button. */
+  public onFloorPlanChanged(): void {
+    this.syncCupolaButton();
+  }
+
+  /** Label the button with the room's current cupola wall (or OFF). */
+  private syncCupolaButton(): void {
+    if (!this.cupolaBtnEl) return;
+    const { halfX, halfZ } = roomHalfExtents();
+    const active = new Set(roomCupolas().map((plan) => plan.wall));
+    const walls = cupolaEndWalls(halfX, halfZ).filter((wall) => active.has(wall));
+    this.cupolaBtnEl.textContent = walls.length ? `🔭 CUPOLA ${cupolaWallsLabel(walls)}` : '🔭 CUPOLA OFF';
+  }
+
+  /** Step to the next cupola setting that validates (OFF always does). */
+  private cycleCupola(): void {
+    const { halfX, halfZ } = roomHalfExtents();
+    const ends = cupolaEndWalls(halfX, halfZ);
+    const order = cupolaWallSelections(ends);
+    const current = roomCupolas().map((plan) => plan.wall);
+    const key = (walls: CupolaWall[]) => [...walls].sort().join('/');
+    const start = order.findIndex((walls) => key(walls) === key(current));
+    const refused: string[] = [];
+    for (let step = 1; step <= order.length; step++) {
+      const next = order[(start + step + order.length) % order.length];
+      if (!next.length) {
+        if (readCupolaWalls().length) writeCupolaWalls([]);
+        showHint(refused.length ? `No cupola — ${refused.join('; ')}.` : 'Cupola removed — a plain end wall again.', 3600);
+        break;
+      }
+      const verdicts = next.map(validateCupolaWall);
+      const refusal = verdicts.find((verdict) => !verdict.ok);
+      if (refusal && !refusal.ok) {
+        refused.push(refusal.reason);
+        continue;
+      }
+      writeCupolaWalls(next);
+      showHint(next.length === 1
+        ? `The ${next[0]} wall is a cupola now — no doors can go on it.`
+        : `Both end walls (${cupolaWallsLabel(next)}) are cupolas now — no doors can go on them.`, 3000);
+      break;
+    }
+    this.syncCupolaButton();
   }
 
   /** Reflect the armed/idle wallpaper state onto the 🖼 WALLPAPER button. */

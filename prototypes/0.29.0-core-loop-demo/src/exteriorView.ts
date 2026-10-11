@@ -20,11 +20,7 @@
  */
 
 import * as THREE from "three";
-import {
-  readExterior,
-  nextFreeExteriorSlot,
-  writeExteriorSlot,
-} from "./exteriorDoc";
+import { readExterior, writeExteriorSlot } from "./exteriorDoc";
 import { doorDisplayName } from "./doorLayoutDoc";
 import type { DoorWall } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
@@ -32,6 +28,7 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
+import { refreshFarPass, setFarPassActive, setFarPassOrbit } from "./farOrbitView";
 import type { AtlasDoor } from "./stationAtlas";
 import {
   buildConnectorChain,
@@ -41,7 +38,7 @@ import {
 import type { VestibuleDoorId } from "./adapter";
 import { buildOctagonShell } from "./octagonHull";
 import { collectWindowOpenings } from "./windowLayout";
-import { roomHalfExtents } from "./floorPlanDoc";
+import { roomHalfExtents, roomCupolas } from "./floorPlanDoc";
 
 /** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
  *  (the new cross-section) instead of the flat box. Now the DEFAULT — disable
@@ -91,6 +88,9 @@ const worldRef = (): WorldRef =>
   (window as unknown as { world?: WorldRef }).world ?? {};
 
 let active = false;
+/** 🪐 Zoomed out past the station to the planet view (issue 218): the far
+ *  pass draws the planet and every station, ours at their scale. */
+let orbitView = false;
 let group: THREE.Group | null = null;
 let toolbar: HTMLDivElement | null = null;
 let editor: HTMLDivElement | null = null;
@@ -172,7 +172,8 @@ function buildGroup(): THREE.Group {
     // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
     // exterior barrel (neighbour shells below stay windowless — other modules'
     // windows aren't loaded here, by design).
-    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings()).group);
+    // 🔭 …and any cupola end walls show as framed glass.
+    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings(), roomCupolas().map((cupola) => cupola.wall)).group);
   } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.
@@ -337,6 +338,8 @@ function buildGroup(): THREE.Group {
           buildOctagonShell(
             { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
             { opacity: 0.82 },
+            {},
+            pose.cupola ?? null, // 🔭 its cupola end walls, when gossiped
           ).group,
         );
       } else {
@@ -437,30 +440,9 @@ function buildGroup(): THREE.Group {
     }
   }
 
-  // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell.
-  const planet = new THREE.Mesh(
-    new THREE.SphereGeometry(42, 48, 32),
-    new THREE.MeshStandardMaterial({
-      color: 0x2a5a8f,
-      roughness: 0.9,
-      metalness: 0.05,
-      emissive: 0x0c2038,
-      emissiveIntensity: 0.5,
-    }),
-  );
-  planet.position.set(6, -62, 26);
-  g.add(planet);
-  const atmo = new THREE.Mesh(
-    new THREE.SphereGeometry(43.6, 48, 32),
-    new THREE.MeshBasicMaterial({
-      color: 0x7fb8ff,
-      transparent: true,
-      opacity: 0.1,
-      side: THREE.BackSide,
-    }),
-  );
-  atmo.position.copy(planet.position);
-  g.add(atmo);
+  // 🌍 The planet is no longer hung below the station here: it sits off the
+  // station's −X, level with the floor (orbits.ts's planet frame), drawn by
+  // the far pass (farOrbitView.ts) with the other stations and ships.
 
   return g;
 }
@@ -500,20 +482,17 @@ function ensureToolbar(): HTMLDivElement {
 
 function renderToolbar(): void {
   const t = ensureToolbar();
-  const owner = ownerCheck();
-  const free = nextFreeExteriorSlot();
   // Owner request: the "🛰️ EXTERIOR VIEW · click a bellows joint…" bubble is
-  // GONE. The bar only appears when it holds something real — the owner's
-  // solar button, or a transient click-to-connect message (showToolbarHint).
-  t.innerHTML = `
-    <span id="exterior-toolbar-hint"></span>
-    ${owner ? `<button type="button" id="exterior-add-solar" ${free === null ? "disabled" : ""}>☀️ ADD SOLAR PANEL${free === null ? " (FULL)" : ""}</button>` : ""}
-  `;
-  t.querySelector("#exterior-add-solar")?.addEventListener("click", () => {
-    const slot = nextFreeExteriorSlot();
-    if (slot !== null) writeExteriorSlot(slot, { kind: "solar" });
-  });
-  t.style.display = owner ? "flex" : "none";
+  // GONE, and so (#223, for now) is the owner's ☀️ ADD SOLAR PANEL button —
+  // it needs a home somewhere else. Adding a panel is still
+  // exteriorDoc.nextFreeExteriorSlot + writeExteriorSlot(slot, { kind:
+  // "solar" }), and an owner still removes one by clicking it. The bar is left
+  // holding only the transient click-to-connect message (showToolbarHint), so
+  // it shows while that message does.
+  if (!document.getElementById("exterior-toolbar-hint")) {
+    t.innerHTML = `<span id="exterior-toolbar-hint"></span>`;
+  }
+  if (toolbarHintTimer === null || orbitView) t.style.display = "none";
 }
 
 /** Transient toolbar message (click-to-connect feedback) — shows the bar for
@@ -529,7 +508,7 @@ function showToolbarHint(msg: string): void {
   toolbarHintTimer = window.setTimeout(() => {
     toolbarHintTimer = null;
     hint.textContent = "";
-    if (!ownerCheck()) t.style.display = "none";
+    t.style.display = "none";
   }, 5000);
 }
 
@@ -605,6 +584,8 @@ function onClickCapture(e: MouseEvent): void {
   if (t && (gameCanvas ? t !== gameCanvas : t.tagName !== "CANVAS")) return;
   // The exterior view owns canvas clicks — never walk-to-point from space.
   e.stopPropagation();
+  // 🪐 The planet view draws no isometric station to click.
+  if (orbitView) return;
   const camera = gr().camera;
   if (!camera) return;
   const ndc = new THREE.Vector2(
@@ -750,6 +731,7 @@ export function refreshExteriorView(): void {
   }
   group = buildGroup();
   scene?.add(group);
+  refreshFarPass();
   renderToolbar();
   applyExteriorZoom(); // the known station may have grown — reframe
 }
@@ -770,6 +752,9 @@ export function tickExterior(_dt: number): void {
 export function setExteriorActive(on: boolean): void {
   if (on === active) return;
   active = on;
+  setFarPassActive(on);
+  // Every trip outside starts at the station view.
+  orbitView = false;
   // 🧹 First descent from space ⇒ the player is IN the room: reveals the
   // room-only HUD (the SpacePhone tip's body.in-room gate). Sticky by
   // design — later trips to space re-hide via body.exterior-active.
@@ -814,4 +799,21 @@ export function setExteriorActive(on: boolean): void {
 
 export function isExteriorActive(): boolean {
   return active;
+}
+
+/** 🪐 zoom.ts's step between the station view and the planet view (issue
+ *  218), both at level 3. Off whenever the exterior view is. */
+export function setExteriorOrbitView(on: boolean): void {
+  const next = on && active;
+  if (next === orbitView) return;
+  orbitView = next;
+  setFarPassOrbit(next);
+  // The isometric station's own controls belong to the station view.
+  closeEditor();
+  if (enterBubble) enterBubble.style.display = next ? "none" : "";
+  if (toolbar) renderToolbar();
+}
+
+export function isExteriorOrbitView(): boolean {
+  return orbitView;
 }
