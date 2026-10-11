@@ -43,7 +43,7 @@ import { CHIP_DENOMS, railChips } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
-  openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
+  markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
 } from './crapsCroupier';
 import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
@@ -1153,6 +1153,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const beatSeat = (): void => {
     if (deps.stand === null || !stand) return;
     writeMySeat(itemId, me, { stand: deps.stand, angle: Math.atan2(stand.z, stand.x), at: Date.now() });
+    if (game === 'craps') markLocalSeat(itemId, me, true);
   };
 
   // ── DeviceUI ──────────────────────────────────────────────────────────────
@@ -1215,6 +1216,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (seatTimer !== null) window.clearInterval(seatTimer);
       seatTimer = null;
       clearMySeat(itemId, me);
+      markLocalSeat(itemId, me, false);
       localHold.delete(itemId);
       held = null;
       pickup = null;

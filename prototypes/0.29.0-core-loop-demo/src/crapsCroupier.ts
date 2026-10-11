@@ -145,6 +145,21 @@ export function openCrapsBetting(
 const seatSeen = new Map<string, { at: number; seenAt: number; moved: boolean }>();
 let seatSeenEpoch = -1;
 
+/** `table:player` seats THIS page is writing right now (its own focused
+ *  table): live by construction, so they count without waiting to see a
+ *  second heartbeat. */
+const localSeats = new Set<string>();
+
+/** The focused table UI marks its own seat while it heartbeats it. */
+export function markLocalSeat(tableId: string, playerId: string, on: boolean): void {
+  if (on) localSeats.add(`${tableId}:${playerId}`);
+  else localSeats.delete(`${tableId}:${playerId}`);
+}
+
+/** How long a newly seen seat may wait for its second heartbeat before a
+ *  manual ROLL stops waiting for it (a little over one beat). */
+const SEAT_CONFIRM_MS = 7_000;
+
 /** Players standing at the table right now, judged on the operator's own clock:
  *  a seat counts once this client has watched its heartbeat move, and while it
  *  keeps moving. A seat left behind by a crashed page never moves, so it never
@@ -165,11 +180,25 @@ export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[]
     // place in the ring comes from the table's layout, not the stored angle.
     const t = FURNITURE_DEFS['craps-table'].stands?.[seat.stand];
     if (!t || t.role) continue;
-    if (seen.moved && now - seen.seenAt < SEAT_STALE_MS) {
+    if (localSeats.has(key) || (seen.moved && now - seen.seenAt < SEAT_STALE_MS)) {
       out.push({ pid, angle: Math.atan2(t.stand.z, t.stand.x) });
     }
   }
   return out;
+}
+
+/** Seats with a line bet that this client has only just seen and can't yet
+ *  call live or stale (no second heartbeat yet, and not long enough to give
+ *  up on one): a manual ROLL waits for them rather than skip a real shooter. */
+function seatsUnconfirmed(tableId: string, now: number): boolean {
+  const bets = readAllCrapsBets(tableId);
+  for (const pid of Object.keys(readSeats(tableId))) {
+    const key = `${tableId}:${pid}`;
+    const seen = seatSeen.get(key);
+    if (!seen || seen.moved || localSeats.has(key)) continue;
+    if (now - seen.seenAt < SEAT_CONFIRM_MS && hasLineBet(bets[pid] ?? [])) return true;
+  }
+  return false;
 }
 
 /** Who throws when betting closes on `s`: the hand's shooter while they are
@@ -330,6 +359,8 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
   const s = readCrapsTableState(tableId);
   if (!s) return null;
   if (s.phase === 'betting') {
+    seatedPlayers(tableId, now);
+    if (seatsUnconfirmed(tableId, now)) return 'CHECKING WHO IS AT THE TABLE — PRESS AGAIN IN A MOMENT';
     tookOverAt.delete(tableId);
     closeCrapsBetting(tableId, s, now, true);
     return null;
