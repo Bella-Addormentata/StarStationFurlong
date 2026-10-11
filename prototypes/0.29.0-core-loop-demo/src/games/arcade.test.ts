@@ -57,3 +57,29 @@ describe('arcade match', () => {
     expect(yieldsMatchId(late, { cabinet: 'a', match: early.match })).toBe(false);
   });
 });
+
+describe("the room's matches, as the doc holds them", () => {
+  it('are read once per change to the games map, and follow every change, local or from a peer', async () => {
+    const Y = await import('yjs');
+    const { bindGamesDoc, readArcadeMatches, writeArcade } = await import('./gamesDoc');
+    const doc = new Y.Doc();
+    bindGamesDoc(doc);
+    const m = newMatch({ game: 'thwaite', host: 'h', hostPage: 'p', hostSeat: 0, now: 1 });
+    writeArcade('arcade-1', m);
+    const first = readArcadeMatches();
+    expect([...first.keys()]).toEqual(['arcade-1']);
+    expect(readArcadeMatches()).toBe(first); // no change: the same answer, not a new scan
+
+    // A peer's write lands as a doc update.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    peer.getMap('games').set('arcade-2', { ...m, id: (m.id % 65535) + 1 });
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer));
+    expect([...readArcadeMatches().keys()].sort()).toEqual(['arcade-1', 'arcade-2']);
+
+    writeArcade('arcade-1', null);
+    expect([...readArcadeMatches().keys()]).toEqual(['arcade-2']);
+    bindGamesDoc(new Y.Doc()); // another room
+    expect(readArcadeMatches().size).toBe(0);
+  });
+});

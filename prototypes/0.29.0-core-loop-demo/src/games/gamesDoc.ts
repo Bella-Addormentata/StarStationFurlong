@@ -48,6 +48,9 @@ export type TableGame =
 let boundDoc: Y.Doc | null = null;
 let gamesMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
+/** readArcadeMatches' answer until the games map next changes: a host
+ *  checks it every frame, and the map holds every table's game. */
+let arcadeMatches: ReadonlyMap<string, ArcadeMatch> | null = null;
 
 function notify(): void {
   // Copy: a listener may unsubscribe (or mount a new UI) mid-notify.
@@ -77,7 +80,11 @@ function docAlive(): boolean {
 export function bindGamesDoc(doc: Y.Doc): void {
   boundDoc = doc;
   gamesMap = doc.getMap('games');
-  gamesMap.observe(() => notify());
+  arcadeMatches = null;
+  gamesMap.observe(() => {
+    arcadeMatches = null;
+    notify();
+  });
   notify(); // repaint subscribers from the fresh doc (mirror of rebuildChatLog)
 }
 
@@ -144,11 +151,14 @@ export function readArcade(cabinetId: string): ArcadeMatch | null {
 }
 
 /** 🕹️ Every cabinet's shared game in the room, by cabinet id. */
-export function readArcadeMatches(): Map<string, ArcadeMatch> {
+export function readArcadeMatches(): ReadonlyMap<string, ArcadeMatch> {
+  const map = ensureMap();
+  if (arcadeMatches) return arcadeMatches;
   const out = new Map<string, ArcadeMatch>();
-  ensureMap().forEach((value, key) => {
+  map.forEach((value, key) => {
     if (isArcadeMatch(value)) out.set(key, value);
   });
+  arcadeMatches = out;
   return out;
 }
 

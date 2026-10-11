@@ -62,6 +62,10 @@ const STALL_SYNC_MS = 1000;
 const HOST_SILENT_MS = 4000;
 /** …and this long: the match is over as far as a watcher's cabinet shows. */
 const HOST_GONE_MS = 12000;
+/** Frame 0 comes round again every 65536 frames (the u16 clock, ~18
+ *  minutes at 60 a second). Only a match younger than this, by its start
+ *  time, can be at its first frame; the margin covers clocks that differ. */
+const FIRST_FRAME_WITHIN_MS = 10 * 60 * 1000;
 /** The guest silent this long: player 2's pad lets go… */
 const GUEST_SILENT_MS = 2000;
 /** …and this long: the guest closed the tab or lost the link, so the host
@@ -564,8 +568,10 @@ function followFrame(itemId: string, s: CabinetSession, copy: Copy, m: ArcadeMat
   if (hostSilentFor(s, copy, now) > HOST_SILENT_MS) return; // nothing to run until the host is back
 
   if (!copy.started && !copy.needSync) {
-    // Heard the match from its first frame: run it from power-on.
-    if (copy.log.has(0) && copy.log.latest !== null && frameDiff(copy.log.latest, 0) < 4096) copy.started = true;
+    // Heard the match from its first frame: run it from power-on. (A frame
+    // 0 in an older match is the clock wrapping: that needs a save state.)
+    const young = now - m.startedAt < FIRST_FRAME_WITHIN_MS;
+    if (young && copy.log.has(0) && copy.log.latest !== null && frameDiff(copy.log.latest, 0) < 4096) copy.started = true;
     else if (copy.log.latest !== null) copy.needSync = true;
   }
   if (copy.needSync) {
