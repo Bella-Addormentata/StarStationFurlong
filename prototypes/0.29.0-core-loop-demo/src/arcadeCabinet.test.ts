@@ -382,10 +382,21 @@ describe('the focus UI', () => {
     expect(link.join).toHaveBeenCalledTimes(1); // watching now: it doesn't grab the pad back
     expect(strip.textContent).toBe('WATCHING · ENTER PLAYS PLAYER 2 · ESC LEAVE');
 
+    win.dispatchEvent(key('keyup', 'KeyX'));
     win.dispatchEvent(key('keydown', 'Enter'));
     expect(link.join).toHaveBeenCalledTimes(2);
     ui.update(1 / 60);
     expect(strip.textContent).toMatch(/^PLAYER 2 · /);
+    // The Enter that took the stand is not Start in the game (it would
+    // pause it for everyone) until it lets go; the next one is.
+    expect(link.setButtons).toHaveBeenLastCalledWith(0);
+    win.dispatchEvent(key('keydown', 'KeyX'));
+    ui.update(1 / 60);
+    expect(link.setButtons).toHaveBeenLastCalledWith(0b1);
+    win.dispatchEvent(key('keyup', 'Enter'));
+    win.dispatchEvent(key('keydown', 'Enter'));
+    ui.update(1 / 60);
+    expect(link.setButtons).toHaveBeenLastCalledWith(0b1001); // A and Start
     ui.unmount();
     expect(link.release).toHaveBeenCalled();
   });
@@ -650,6 +661,41 @@ describe('gamepads at the cabinet', () => {
     expect(byte()).toBe(0b1);
     pad.release(1);
     expect(byte()).toBe(0);
+    ui.unmount();
+  });
+
+  it("a gamepad's Start that takes the free stand waits to be let go, too", () => {
+    const pad = fakePad();
+    vi.stubGlobal('navigator', { getGamepads: () => [pad.pad] });
+    let shared: SharedView = { role: 'watcher', title: 'THWAITE', phase: 'playing', joinAs: 2, player: null };
+    const link: ArcadeLink = {
+      shared: () => shared,
+      takeError: () => null,
+      host: vi.fn(),
+      stop: vi.fn(),
+      join: vi.fn(() => void (shared = { ...shared, role: 'guest', joinAs: null, player: 2 })),
+      setButtons: vi.fn(),
+      setLocalPad2: vi.fn(),
+      setAudio: vi.fn(),
+      setUiScreen: vi.fn(),
+      release: vi.fn(),
+    };
+    const visual: ArcadeCabinetVisualHandle = { painter: recordingPainter(), present: vi.fn(), showAttract: vi.fn() };
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual, seat: 1, seats: 2, requestRelease: vi.fn(), link });
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    ui.update(1 / 60); // stepping up took the stand; hand it back to watch
+    shared = { ...shared, role: 'watcher', joinAs: 2, player: null };
+    ui.update(1 / 60);
+    pad.press(9); // Start
+    ui.update(1 / 60);
+    expect(link.join).toHaveBeenCalled();
+    ui.update(1 / 60);
+    expect(link.setButtons).toHaveBeenLastCalledWith(0);
+    pad.release(9);
+    ui.update(1 / 60);
+    pad.press(9);
+    ui.update(1 / 60);
+    expect(link.setButtons).toHaveBeenLastCalledWith(0b1000); // Start, now in the game
     ui.unmount();
   });
 
