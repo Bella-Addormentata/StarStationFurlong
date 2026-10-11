@@ -244,6 +244,35 @@ describe('faucet dish: per-room store', () => {
     clearFaucetRoom(room);
   });
 
+  it('settles a dropped spend from the node\'s barrier when the status read after the push failed', () => {
+    const room = 'home-store-6';
+    clearFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 30 }) });
+    markFaucetPending(room, 'give');
+    // The give went out, but the node's status read right after it failed: the
+    // reply carries the barrier (30: every snapshot above it is after the push)
+    // and no status.
+    setFaucetReply(room, { op: 'give', ok: true, spentCoin: 'ab'.repeat(32), afterSnapshot: 30 });
+    expect(faucetPending(room)).toBe('give');
+    // The next polls: settling, settling, then dropped (balance back in full,
+    // nothing parked). Cleared — without the barrier it never would be.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 31 }) });
+    expect(faucetPending(room)).toBe('give');
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 32 }) });
+    expect(faucetPending(room)).toBeNull();
+    // A poll already on file above the barrier settles it the moment the
+    // status-less reply arrives.
+    markFaucetPending(room, 'give');
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 34 }) });
+    expect(faucetPending(room)).toBe('give');
+    setFaucetReply(room, { op: 'give', ok: true, afterSnapshot: 33 });
+    expect(faucetPending(room)).toBeNull();
+    // The barrier is parsed off the wire; the status alone still sets the floor for an older node.
+    expect(parseFaucetReply(b64({ op: 'give', ok: true, afterSnapshot: 12 }))?.afterSnapshot).toBe(12);
+    expect(parseFaucetReply(b64({ op: 'give', ok: true, afterSnapshot: 'later' }))?.afterSnapshot).toBeUndefined();
+    clearFaucetRoom(room);
+  });
+
   it('keeps the newest snapshot by the node\'s numbering, whatever order the replies arrive in', () => {
     const room = 'home-store-4';
     clearFaucetRoom(room);

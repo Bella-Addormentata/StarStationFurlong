@@ -368,11 +368,20 @@ pub struct FaucetReply {
     /// The id of the coin a claim or gift spent, once the mempool accepted it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spent_coin: Option<String>,
+    /// On a claim or give that went out: the snapshot BARRIER, taken under
+    /// `STATUS_TURN` once the spend was pushed, so every status numbered above
+    /// it was captured after the push. Sent whether or not the status read
+    /// right after it succeeds: the browser's TAKING…/GIVING… clears from a
+    /// snapshot above the barrier that shows the spend settled, and a dropped
+    /// spend must be able to clear even when that one read failed (#245
+    /// review, round 13).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_snapshot: Option<u64>,
 }
 
 impl FaucetReply {
     fn fail(op: &str, error: impl Into<String>) -> Self {
-        Self { op: op.to_string(), ok: false, error: Some(error.into()), status: None, spent_coin: None }
+        Self { op: op.to_string(), ok: false, error: Some(error.into()), status: None, spent_coin: None, after_snapshot: None }
     }
     /// A request the node will not serve at all (wrong source), op unknown.
     pub fn refused(error: impl Into<String>) -> Self {
@@ -410,6 +419,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
             error: None,
             status: Some(s),
             spent_coin: None,
+            after_snapshot: None,
         }),
         "claim" => claim(ctx, &client, &params).await,
         "give" => give(ctx, &client, &params, req.amount).await,
@@ -417,16 +427,21 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
     };
     match result {
         Ok(mut reply) => {
-            // A TAKE or GIVE that went out carries the first look AFTER its push
-            // (#245 review, round 11): captured under STATUS_TURN once the writer
-            // has let the wallet lease go, so it is numbered above every snapshot
-            // captured before the push, and the browser can tell a poll that
-            // predates the spend from one that reflects it. Its TAKING…/GIVING…
-            // then clears only from a snapshot numbered from this one on that
-            // shows the spend settled (or the gift landed). A status read that
-            // fails here leaves the reply without one; the polls follow.
-            if reply.ok && reply.status.is_none() && matches!(reply.op.as_str(), "claim" | "give") {
-                match status(ctx, &client, &params).await {
+            // A TAKE or GIVE that went out carries the snapshot BARRIER and the
+            // first look after its push (#245 review, rounds 11 and 13). Both are
+            // taken under STATUS_TURN once the writer has let the wallet lease go:
+            // every snapshot still in progress completes first, so any status
+            // numbered above the barrier was captured after the push, and the
+            // browser can tell a poll that predates the spend from one that
+            // reflects it. Its TAKING…/GIVING… then clears only from a snapshot
+            // above the barrier that shows the spend settled (or the gift
+            // landed). The barrier goes out even when the read right after it
+            // fails, so a later poll can settle a spend the chain dropped; the
+            // polls bring the status.
+            if reply.ok && matches!(reply.op.as_str(), "claim" | "give") {
+                let _turn = STATUS_TURN.lock().await;
+                reply.after_snapshot = Some(STATUS_SNAPSHOTS.load(std::sync::atomic::Ordering::SeqCst));
+                match status_under_turn(ctx, &client, &params).await {
                     Ok(st) => reply.status = Some(st),
                     Err(e) => eprintln!("⛓️🥣 faucet: {} went out but the status read after it failed: {e:#}", reply.op),
                 }
@@ -442,6 +457,11 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
     // before the wallet lease below, never after it: the writers take the lease
     // alone, so the two never wait on each other in a cycle.
     let _turn = STATUS_TURN.lock().await;
+    status_under_turn(ctx, client, params).await
+}
+
+/// The snapshot itself; the caller holds `STATUS_TURN`.
+async fn status_under_turn(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetParams) -> Result<FaucetStatus> {
     let peak = crate::chia_resolve::peak_height(client)
         .await
         .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
@@ -639,6 +659,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
         error: None,
         status: None,
         spent_coin: Some(hex::encode(target.coin.coin_id())),
+        after_snapshot: None,
     })
 }
 
@@ -714,6 +735,7 @@ async fn give(
         error: None,
         status: None,
         spent_coin: Some(hex::encode(coins[0].coin_id())),
+        after_snapshot: None,
     })
 }
 

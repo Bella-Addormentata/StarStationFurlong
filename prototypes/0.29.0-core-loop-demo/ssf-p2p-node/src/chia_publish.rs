@@ -106,6 +106,9 @@ pub struct WalletLease {
     incoming: std::sync::Mutex<Option<Bytes32>>,
     /// Spend numbers handed out so far (see [`Parking`]).
     spends: std::sync::atomic::AtomicU64,
+    /// The last spend a reconciliation asked the mempool about: the next pass
+    /// starts its probe window after it (see [`mempool_probes`]).
+    probe_cursor: std::sync::atomic::AtomicU64,
 }
 
 /// A parked coin: when, and by which spend (see [`Parking`]).
@@ -142,6 +145,7 @@ impl WalletLease {
             pending: std::sync::Mutex::new(HashMap::new()),
             incoming: std::sync::Mutex::new(None),
             spends: std::sync::atomic::AtomicU64::new(0),
+            probe_cursor: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -285,7 +289,12 @@ impl WalletLease {
         // (see `mempool_probes`): a bundle sits in the mempool with all of its
         // inputs or with none, so any one of them answers for the spend.
         let mut in_mempool: HashMap<u64, Option<bool>> = HashMap::new();
-        for (spend, coin) in mempool_probes(&due, &spent_on_chain) {
+        let after = self.probe_cursor.load(std::sync::atomic::Ordering::Relaxed);
+        let probes = mempool_probes(&due, &spent_on_chain, after);
+        if let Some((last, _)) = probes.last() {
+            self.probe_cursor.store(*last, std::sync::atomic::Ordering::Relaxed);
+        }
+        for (spend, coin) in probes {
             let seen = match client.get_mempool_items_by_coin_name(coin).await {
                 Ok(resp) if resp.success => Some(resp.mempool_items.is_some_and(|items| !items.is_empty())),
                 Ok(resp) => {
@@ -344,9 +353,9 @@ pub async fn push_parked(
 }
 
 /// How many spends one reconciliation asks the mempool about (one HTTPS call
-/// each); the rest stay parked until the next pass. Spends in flight are one
-/// per writer action, so the bound is rarely reached, and it keeps a pass
-/// under the lease short whatever is parked (#245 review, round 11).
+/// each); the rest wait for the next pass. Spends in flight are one per writer
+/// action, so the bound is rarely reached, and it keeps a pass under the lease
+/// short whatever is parked (#245 review, round 11).
 pub const MAX_MEMPOOL_PROBES: usize = 8;
 
 /// Which due spends need the mempool's word, and the coin to ask with: a spend
@@ -354,10 +363,27 @@ pub const MAX_MEMPOOL_PROBES: usize = 8;
 /// is settled without the mempool (confirmed, or dead to another spend of that
 /// coin); one with an input the listing left out is settled by whether the
 /// listing was complete. One probe per spend, at most [`MAX_MEMPOOL_PROBES`].
-pub fn mempool_probes(due: &[DueSpend], spent_on_chain: &HashMap<Bytes32, bool>) -> Vec<(u64, Bytes32)> {
-    due.iter()
+///
+/// The window ROTATES (#245 review, round 13): it opens at the first eligible
+/// spend numbered above `after` — the last spend the previous pass asked about
+/// — and wraps around to the oldest, so when more spends wait in the mempool
+/// than one pass covers, every later spend is still reached on a later pass
+/// and none is starved of the verdict that would release its coins.
+pub fn mempool_probes(
+    due: &[DueSpend],
+    spent_on_chain: &HashMap<Bytes32, bool>,
+    after: u64,
+) -> Vec<(u64, Bytes32)> {
+    let eligible: Vec<(u64, Bytes32)> = due
+        .iter()
         .filter(|d| d.coins.iter().all(|c| spent_on_chain.get(c) == Some(&false)))
         .filter_map(|d| d.coins.first().map(|c| (d.spend, *c)))
+        .collect();
+    let start = eligible.iter().position(|(spend, _)| *spend > after).unwrap_or(0);
+    eligible[start..]
+        .iter()
+        .chain(eligible[..start].iter())
+        .copied()
         .take(MAX_MEMPOOL_PROBES)
         .collect()
 }
@@ -775,7 +801,7 @@ mod tests {
         .collect();
         // One probe per spend whose inputs are all unspent, with its first coin;
         // the three-input spend is ONE question, not three.
-        let probes = mempool_probes(&due, &spent_on_chain);
+        let probes = mempool_probes(&due, &spent_on_chain, 0);
         assert_eq!(probes, vec![(2, id(2)), (3, id(3)), (4, id(4)), (6, id(6))]);
         let in_mempool: HashMap<u64, Option<bool>> =
             [(2, Some(false)), (3, Some(true)), (4, None), (6, Some(false))].into_iter().collect();
@@ -787,10 +813,21 @@ mod tests {
         let mut released = settle(&due, &spent_on_chain, &in_mempool, false);
         released.sort();
         assert_eq!(released, vec![1, 2, 6]);
-        // The probes are bounded per pass; the spends past the bound wait.
-        let many: Vec<DueSpend> = (20..40u64).map(|n| spend(n, &[id(n as u8)])).collect();
-        let all_unspent: HashMap<Bytes32, bool> = (20..40u8).map(|n| (id(n), false)).collect();
-        assert_eq!(mempool_probes(&many, &all_unspent).len(), MAX_MEMPOOL_PROBES);
+        // The probes are bounded per pass, and the window rotates: a pass opens
+        // after the last spend the previous one asked about and wraps around, so
+        // with more spends waiting than one pass covers, none is starved.
+        let many: Vec<DueSpend> = (20..30u64).map(|n| spend(n, &[id(n as u8)])).collect();
+        let all_unspent: HashMap<Bytes32, bool> = (20..30u8).map(|n| (id(n), false)).collect();
+        let ids = |probes: Vec<(u64, Bytes32)>| probes.into_iter().map(|(n, _)| n).collect::<Vec<u64>>();
+        let first = ids(mempool_probes(&many, &all_unspent, 0));
+        assert_eq!(first, (20..28).collect::<Vec<u64>>());
+        let second = ids(mempool_probes(&many, &all_unspent, 27));
+        assert_eq!(second, vec![28, 29, 20, 21, 22, 23, 24, 25]);
+        assert_eq!(ids(mempool_probes(&many, &all_unspent, 29))[0], 20, "past the last: wraps to the oldest");
+        // A spend that needs no probe is skipped by the rotation as well.
+        let mut one_spent = all_unspent.clone();
+        one_spent.insert(id(28), true);
+        assert_eq!(ids(mempool_probes(&many, &one_spent, 27)), vec![29, 20, 21, 22, 23, 24, 25, 26]);
     }
 
     #[test]

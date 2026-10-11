@@ -70,6 +70,10 @@ export interface FaucetReply {
   status?: FaucetStatus;
   /** The coin a claim or gift spent, once the mempool accepted it. */
   spentCoin?: string;
+  /** On a claim or give that went out: the node's snapshot barrier. Every
+   *  status numbered above it was captured after the push. Sent even when the
+   *  status read right after the push failed. */
+  afterSnapshot?: number;
 }
 
 export type FaucetOp = 'status' | 'claim' | 'give';
@@ -145,6 +149,7 @@ export function parseFaucetReply(payloadB64: string): FaucetReply | null {
   const reply: FaucetReply = { op: r.op, ok: r.ok };
   if (typeof r.error === 'string') reply.error = r.error;
   if (typeof r.spentCoin === 'string') reply.spentCoin = r.spentCoin;
+  if (isNum(r.afterSnapshot) && r.afterSnapshot >= 0) reply.afterSnapshot = Math.floor(r.afterSnapshot);
   if (r.status !== undefined) {
     const status = asFaucetStatus(r.status);
     if (!status) return null;
@@ -199,9 +204,9 @@ export function dishLine(status: FaucetStatus | null): string {
 // ── Per-room store: the last status the node sent, and in-flight spends ──────
 
 /** A TAKE or GIVE from the click until the node settles it (see setFaucetReply).
- *  `floor` is the snapshot number of the first status captured AFTER the push
- *  (the node sends it with the reply): a status numbered below it predates the
- *  spend and says nothing about it. Null until the reply arrives. */
+ *  `floor` is the first snapshot number that counts as captured AFTER the push
+ *  (from the barrier the node sends with the reply): a status numbered below it
+ *  predates the spend and says nothing about it. Null until the reply arrives. */
 interface Pending {
   op: FaucetOp;
   floor: number | null;
@@ -275,36 +280,40 @@ export function setFaucetReply(roomId: string, reply: FaucetReply): void {
   // The take/give reply: the spend went out. Its floor is recorded BEFORE the
   // snapshot ordering below is consulted: a reply answered after a newer poll
   // carries an older snapshot and must not be filed over it, but the floor it
-  // brings still stands, or the action could never clear (#245 review, round 12).
+  // brings still stands, or the action could never clear (#245 review, round
+  // 12). The node sends the barrier even when its status read after the push
+  // failed (round 13); an older node sends only the status; one that sends
+  // neither leaves the floor unset, and only a landing clears the action then.
   if (p && p.op === reply.op && (reply.op === 'claim' || reply.op === 'give')) {
-    p.floor = reply.status && reply.status.snapshot > 0 ? reply.status.snapshot : null;
+    p.floor = reply.afterSnapshot !== undefined
+      ? reply.afterSnapshot + 1
+      : reply.status && reply.status.snapshot > 0 ? reply.status.snapshot : null;
   }
+  const prev = latest.get(roomId);
+  let filed = false;
   if (reply.status) {
     const st = reply.status;
     // An older snapshot answered late is not filed over a newer one (an older
     // node numbers nothing and always files).
     const newest = latestSnapshot.get(roomId) ?? 0;
-    const stale = st.snapshot > 0 && st.snapshot < newest;
-    const prev = latest.get(roomId);
-    if (!stale) {
+    if (!(st.snapshot > 0 && st.snapshot < newest)) {
       if (st.snapshot > 0) latestSnapshot.set(roomId, st.snapshot);
       latest.set(roomId, st);
+      filed = true;
     }
-    if (p) {
-      // Judge the pending action on the newest view there is: the status just
-      // filed, or, for a late reply, the newer one already on file — which now
-      // counts as after the push, the floor being set.
-      const view = stale ? prev : st;
-      if (view) {
-        const landed =
-          (p.op === 'claim' && (view.walletMojos ?? 0n) > 0n) ||
-          (!stale && p.op === 'give' && prev !== undefined && view.walletMojos !== null && prev.walletMojos !== null
-            && view.walletMojos < prev.walletMojos);
-        const settling = p.op === 'claim' ? view.landing : view.spending;
-        const afterPush = p.floor !== null && view.snapshot >= p.floor;
-        if (landed || (afterPush && !settling)) pending.delete(roomId);
-      }
-    }
+  }
+  // Judge the pending action on the newest view there is: the status just
+  // filed, or the newer one already on file (a late reply, or a reply without
+  // a status), which counts as after the push once the floor is set.
+  const view = latest.get(roomId);
+  if (p && view) {
+    const landed =
+      (p.op === 'claim' && (view.walletMojos ?? 0n) > 0n) ||
+      (p.op === 'give' && filed && prev !== undefined && view.walletMojos !== null && prev.walletMojos !== null
+        && view.walletMojos < prev.walletMojos);
+    const settling = p.op === 'claim' ? view.landing : view.spending;
+    const afterPush = p.floor !== null && view.snapshot >= p.floor;
+    if (landed || (afterPush && !settling)) pending.delete(roomId);
   }
   notify();
 }
