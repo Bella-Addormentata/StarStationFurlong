@@ -61,6 +61,9 @@ export const REVEAL_GRACE_MS = 4_000;
 /** At most this many bettors per round (the transcript bound is 16 with the
  *  house). More than that and the extras simply aren't parties that roll. */
 const MAX_BETTOR_PARTIES = 15;
+/** Most distinct bettors a Fair round can carry (15 seeded + 16 unseeded, the
+ *  transcript's bounds): the table refuses a new bettor past it. */
+export const MAX_TABLE_BETTORS = 2 * MAX_BETTOR_PARTIES + 1;
 
 type TableState = CrapsTableState | RouletteTableState;
 
@@ -197,8 +200,11 @@ interface FrozenSnapshot {
 const frozenSeen = new Map<string, Map<string, FrozenSnapshot>>();
 const SNAPSHOTS_PER_TABLE = 4;
 
+// Keyed by round alone, NOT the house commit: that field is peer-writable
+// too, and a rewritten one must hit the snapshot (and fail the house
+// comparison) rather than miss it and read as merely unwitnessed.
 function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
-  return frozenSeen.get(`${casinoDocEpoch()}:${tableId}`)?.get(roundKey(tableId, s.round, s.houseCommit));
+  return frozenSeen.get(`${casinoDocEpoch()}:${tableId}`)?.get(String(s.round));
 }
 
 function snapshot(s: TableState & { wagers?: Record<string, string> }): FrozenSnapshot {
@@ -215,14 +221,18 @@ function snapshot(s: TableState & { wagers?: Record<string, string> }): FrozenSn
 export function frozenFields(
   tableId: string,
   s: TableState & { wagers?: Record<string, string> },
-): { commits?: Record<string, string>; wagers?: Record<string, string> } {
+): { houseCommit?: string; commits?: Record<string, string>; wagers?: Record<string, string> } {
   const seen = seenFor(tableId, s);
   if (!seen) return { ...(s.commits ? { commits: s.commits } : {}), ...(s.wagers ? { wagers: s.wagers } : {}) };
-  return { commits: seen.commits, ...(seen.wagers ? { wagers: seen.wagers } : {}) };
+  return {
+    ...(seen.house ? { houseCommit: seen.house } : {}),
+    commits: seen.commits,
+    ...(seen.wagers ? { wagers: seen.wagers } : {}),
+  };
 }
 
 function noteFrozen(tableId: string, s: TableState & { wagers?: Record<string, string> }, overwrite: boolean): void {
-  const k = roundKey(tableId, s.round, s.houseCommit);
+  const k = String(s.round);
   const tk = `${casinoDocEpoch()}:${tableId}`;
   let rounds = frozenSeen.get(tk);
   if (rounds?.has(k) && !overwrite) return;
@@ -258,6 +268,9 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
   lastTick.set(tickKey, now);
   evictOldest(lastTick, 256);
   const s = readState(tableId, game);
+  // A removed table forgets its snapshots: one recreated under the same id
+  // starts again at round 1 with a new house commit.
+  if (!s) frozenSeen.delete(`${casinoDocEpoch()}:${tableId}`);
   if (!s?.houseCommit) return;
   if (s.phase === 'closing') {
     noteFrozen(tableId, s, false);
@@ -376,7 +389,10 @@ export interface GatheredRound {
  * missing ones are forfeited. A reveal that doesn't open its commitment
  * counts as missing.
  */
-export function gatherRound(tableId: string, s: TableState, now = Date.now()): GatheredRound | null {
+export function gatherRound(tableId: string, live: TableState, now = Date.now()): GatheredRound | null {
+  // The house commit and commit set as this page froze them (see frozenFields).
+  const fz = frozenFields(tableId, live);
+  const s: TableState = { ...live, ...(fz.houseCommit ? { houseCommit: fz.houseCommit } : {}) };
   const key = roundKey(tableId, s.round, s.houseCommit);
   if (!settleDueAt.has(key)) {
     settleDueAt.set(key, now);
@@ -390,7 +406,7 @@ export function gatherRound(tableId: string, s: TableState, now = Date.now()): G
     seed: houseCommit ? seedFor(houseCommit, houseCtx(tableId, s.round)) : null,
   }];
   const forfeited: string[] = [];
-  for (const [pid, commit] of Object.entries(frozenFields(tableId, s).commits ?? {})) {
+  for (const [pid, commit] of Object.entries(fz.commits ?? {})) {
     const r = readSeedRecord(tableId, pid);
     const seed = r && r.round === s.round && r.commit === commit && r.seed
       && commitSeedSync(r.seed, bettorCtx(tableId, s, pid)) === commit ? r.seed : null;

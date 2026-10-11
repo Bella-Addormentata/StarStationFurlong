@@ -56,7 +56,7 @@ import type { FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casino
 import { canPlaceBet, crapsBetLabel, pointWasOn } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/diceFairness';
-import { isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound } from './fairTableSeeds';
+import { isFairTable, MAX_TABLE_BETTORS, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound } from './fairTableSeeds';
 import { readPlayerDisplayName } from './games/gamesDoc';
 import { betLabel, payoutFor, pocketColor } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
@@ -645,6 +645,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (mine.length + chips.length > MAX_BETS_DRAWN_PER_PLAYER) {
       say(`YOU HAVE ${MAX_BETS_DRAWN_PER_PLAYER} CHIPS DOWN — THE TABLE LIMIT`);
       return;
+    }
+    // ⚖️ A Fair round's transcript carries at most MAX_TABLE_BETTORS bettors:
+    // a newcomer past that would be left out of the settle, so they wait.
+    if (mine.length === 0 && roundIsFair(itemId, game)) {
+      const all = game === 'craps' ? readAllCrapsBets(itemId) : readAllBets(itemId, round());
+      if (Object.keys(all).filter((pid) => pid !== me).length >= MAX_TABLE_BETTORS) {
+        say('THE TABLE IS FULL — WAIT FOR A PLACE');
+        return;
+      }
     }
     if (!spendChips(me, sumOf(chips))) {
       say('NOT ENOUGH CHIPS — VISIT THE CASHIER');

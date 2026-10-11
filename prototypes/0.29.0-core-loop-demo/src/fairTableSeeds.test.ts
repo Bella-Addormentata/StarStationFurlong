@@ -279,6 +279,26 @@ describe('a Fair roulette round', () => {
     expect(s.wagers?.[BOB]).not.toBe(wagerFingerprint(winAll)); // the frozen copy is what's published
   });
 
+  it("a rewritten house commit can't dodge the frozen snapshot", async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette'); // snapshots the frozen set under this round
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    // A self-consistent rewrite: a fresh house seed alone decides the pocket.
+    const { settleParties } = await import('./games/diceFairness');
+    const seed = 'ab'.repeat(32);
+    const house = commitSeedSync(seed, { room: '', table: t, round: 1, party: 'house', house: '' });
+    const mixed = await settleParties('roulette', [{ id: 'house', commit: house, seed }], t, 1);
+    const forged: RouletteTableState = {
+      ...s, houseCommit: house, commits: {}, unseeded: undefined, wagers: undefined,
+      result: mixed!.pocket!, fairness: mixed!.transcript,
+    };
+    expect((await verifySettledRound('roulette', t, forged, { pocket: forged.result! })).kind).toBe('failed');
+  });
+
   it('a bettor id too long for the closing state is left out instead of wedging the table', () => {
     const t = freshTable();
     tickAutoCroupier(t);
