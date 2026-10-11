@@ -194,6 +194,8 @@ import {
 // 🪙 Whether the room's coin pushers are operated, and ready for a drop,
 // judged without comparing clocks across devices (pusherCroupier.ts CLOCKS).
 import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
+import { gearSection } from './gearCardParts';
+import type { GearCardSpec } from './settingsGear';
 import {
   DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_REQUEST_TTL_MS,
   commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
@@ -5675,6 +5677,39 @@ const PUSHER_REFUSAL_TEXT: Record<PusherRefusalReason, string> = {
   'balance-full': 'YOUR RACK CAN\'T HOLD ANY MORE — CASH SOME CHIPS OUT FIRST',
   jammed: 'THE MACHINE JAMMED — NOTHING WAS TAKEN',
 };
+
+/** ⚙ The machine card (settingsGear.ts): the rules and what's inside for
+ *  anyone. Nothing on the pusher is adjustable yet; the owner empties it
+ *  from the machine's own panel. */
+export function coinPusherGearCard(itemId: string, isHouse: () => boolean): GearCardSpec {
+  return {
+    itemId,
+    title: 'COIN PUSHER',
+    noun: 'MACHINE',
+    isHouse,
+    body(house) {
+      const state = readCoinPusherState(itemId);
+      const operator = coinPusherOperatorState();
+      const rows = [
+        gearSection([
+          `EACH DROP COSTS ${PUSHER_ANTE} CHIP · PICK ONE OF ${HOLE_COUNT} HOLES AND TIME IT AGAINST THE PUSHER`,
+          'CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS',
+          'THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE',
+          `THE MACHINE HOLDS UP TO ${MACHINE_MAX_CHIPS} CHIPS`,
+        ]),
+        gearSection([
+          state ? `${chipsInMachine(state)} CHIPS INSIDE` : 'NOT SET UP YET',
+          operator === 'ready' ? 'MACHINE ONLINE' : operator === 'starting' ? 'MACHINE STARTING' : 'MACHINE OFFLINE — ITS OWNER RUNS IT',
+        ]),
+      ];
+      if (house) {
+        rows.push(gearSection(['TO EMPTY IT, STEP UP TO THE MACHINE AND OPEN THE DOOR FROM ITS PANEL']));
+      }
+      return rows.join('');
+    },
+    subscribe: subscribeCasino,
+  };
+}
 
 /**
  * The coin-pusher panel: a live pusher gauge (the same clock the cabinet
