@@ -55,6 +55,8 @@ let lose: (from: Page, to: Page, bytes: Uint8Array) => boolean = () => false;
 /** A tick on its way from → to, rewritten (default: as sent). */
 let rewrite: (from: Page, to: Page, bytes: Uint8Array) => Uint8Array = (_f, _t, b) => b;
 let pages: Page[] = [];
+/** Doc updates held back while the room's docs are out of touch (split()). */
+let held: Array<{ from: Page; update: Uint8Array }> | null = null;
 
 /** A new page in the room: fresh modules (its own page id and player id),
  *  its doc caught up with the room's. */
@@ -74,6 +76,7 @@ async function openPage(name: string, viewer: { x: number; z: number } | null = 
   };
   doc.on('update', (update: Uint8Array, origin: unknown) => {
     if (origin === 'room' || page.closed) return;
+    if (held) return void held.push({ from: page, update });
     for (const other of pages) if (other !== page && !other.closed) other.Y.applyUpdate(other.doc, update, 'room');
   });
   mod.setArcadeRomFetcher(async (url) => romBytes.get(url)!);
@@ -100,6 +103,16 @@ async function openPage(name: string, viewer: { x: number; z: number } | null = 
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Docs stop hearing each other (ticks still flow) until heal(). */
+const split = () => void (held = []);
+function heal(): void {
+  const updates = held ?? [];
+  held = null;
+  for (const { from, update } of updates) {
+    for (const other of pages) if (other !== from && !other.closed) other.Y.applyUpdate(other.doc, update, 'room');
+  }
+}
 
 /** Run every open page for `ms` of game time at 60 updates a second.
  *  `each` runs before every update (set pads, join…). */
@@ -189,6 +202,7 @@ const setRoom = (id: string | undefined) => {
 afterEach(() => {
   setRoom(undefined);
   pages = [];
+  held = null;
   lose = () => false;
   rewrite = (_f, _t, b) => b;
   vi.useRealTimers();
@@ -415,6 +429,36 @@ describe('when the host goes', () => {
   }, 60_000);
 });
 
+describe('a new host after one who left', () => {
+  it("never reuses the last game's id, so a watcher still on that one follows the new game", async () => {
+    const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
+    // Every id pick lands on the same number unless it is taken.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    await startGame(a, 0, 2);
+    random.mockRestore();
+    const old = c.games.readArcade(ITEM)!.id;
+    await run(500);
+    expect(c.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
+    a.closed = true;
+    await run(13_000); // the cabinet is free again; a's record is still there
+    expect(c.games.readArcade(ITEM)?.id).toBe(old);
+
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const l = link(b, 1, 2);
+    l.host(THWAITE);
+    await run(100);
+    vi.restoreAllMocks();
+    expect(c.games.readArcade(ITEM)!.id).not.toBe(old);
+    const from = b.mod.arcadeCopyInfo(ITEM)!.next;
+    const p1 = padScript(9);
+    await run(3000, () => l.setButtons(p1()));
+    // The watcher dropped the old copy and shows b's game from its start.
+    const { common, differ } = compare(b, c, from);
+    expect(common).toBeGreaterThan(60);
+    expect(differ).toEqual([]);
+  }, 60_000);
+});
+
 describe('watching from across the room', () => {
   it('repaints less the farther away the watcher stands; the network is the same', async () => {
     const [a, near, far] = await room(['a', null], ['near', { x: 2, z: 0 }], ['far', { x: 20, z: 0 }]);
@@ -494,6 +538,37 @@ describe('rooms and builds', () => {
     // The watcher followed it to the new id, and shows the same game.
     expect(c.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
     const { common, differ } = compare(a, c);
+    expect(common).toBeGreaterThan(60);
+    expect(differ).toEqual([]);
+  }, 60_000);
+
+  it('two pages that claim one cabinet at once under the same id: one hosts, the other follows', async () => {
+    const [a, b] = await room(['a', null], ['b', null]);
+    split(); // neither page sees the other's claim yet
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const la = link(a, 0, 2);
+    const lb = link(b, 1, 2);
+    la.host(THWAITE);
+    lb.host(THWAITE);
+    await run(100);
+    random.mockRestore();
+    expect(la.shared()?.role).toBe('host');
+    expect(lb.shared()?.role).toBe('host');
+    expect(a.games.readArcade(ITEM)!.id).toBe(b.games.readArcade(ITEM)!.id);
+
+    heal(); // the docs merge: one record stands
+    const m = a.games.readArcade(ITEM)!;
+    expect(b.games.readArcade(ITEM)).toEqual(m);
+    const aWon = m.hostPage === a.mod.arcadePage();
+    const [winner, loser] = aWon ? [a, b] : [b, a];
+    const [won, lost] = aWon ? [la, lb] : [lb, la];
+    const sentBefore = ticksOf(loser, 'frames').length;
+    await run(3000);
+    expect(won.shared()?.role).toBe('host');
+    expect(lost.shared()?.role).toBe('watcher');
+    expect(ticksOf(loser, 'frames').length).toBe(sentBefore); // it stopped hosting
+    expect(loser.mod.arcadeCopyInfo(ITEM)?.started).toBe(true);
+    const { common, differ } = compare(winner, loser, 60);
     expect(common).toBeGreaterThan(60);
     expect(differ).toEqual([]);
   }, 60_000);

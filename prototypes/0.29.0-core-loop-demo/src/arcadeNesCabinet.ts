@@ -245,6 +245,10 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   const keysDown = new Map<string, NesButton>();
   /** Per gamepad index, the NES buttons held last poll (edge detection). */
   const padHeld: Array<Set<NesButton>> = [new Set(), new Set()];
+  /** Player 1's buttons whose press worked the cabinet (the menu, or Start
+   *  taking the free stand): the game doesn't get them until they let go,
+   *  so taking player 2 doesn't also pause the game. */
+  const usedByCabinet = new Set<NesButton>();
 
   let capture: HTMLDivElement | null = null;
   let strip: HTMLDivElement | null = null;
@@ -315,8 +319,12 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
 
   const buttonDown = (player: NesPlayer, button: NesButton) => {
     if (view.screen === 'menu' || view.screen === 'credits') {
-      if (player === 1) menuPress(button);
+      if (player === 1) {
+        usedByCabinet.add(button);
+        menuPress(button);
+      }
     } else if (view.joinAs && player === 1 && button === 'START') {
+      usedByCabinet.add(button);
       autoJoin = true;
       link?.join();
     }
@@ -351,10 +359,13 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
    *  the shared game reads the pad byte, which keeps a button any other key
    *  or pad still holds. */
   const onKeyUp = (e: KeyboardEvent) => {
+    const button = keysDown.get(e.code);
     keysDown.delete(e.code);
+    if (button && ![...keysDown.values()].includes(button) && !padHeld[0].has(button)) usedByCabinet.delete(button);
   };
   const onBlur = () => {
     keysDown.clear();
+    usedByCabinet.clear();
   };
 
   const pollPads = (dt: number) => {
@@ -412,6 +423,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       mounted = true;
       speaker = new ArcadeSpeaker();
       keysDown.clear();
+      usedByCabinet.clear();
       padHeld[0] = new Set();
       padHeld[1] = new Set();
       link = deps.link ?? linkArcade(deps.itemId, seat, seats);
@@ -508,7 +520,9 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       }
       pollPads(dt);
       followShared();
-      link?.setButtons(padByte([...keysDown.values(), ...padHeld[0]]));
+      const held = [...keysDown.values(), ...padHeld[0]];
+      for (const b of usedByCabinet) if (!held.includes(b)) usedByCabinet.delete(b); // let go
+      link?.setButtons(padByte(held.filter((b) => !usedByCabinet.has(b))));
       link?.setLocalPad2(padByte(padHeld[1]));
       if (view.screen === 'shared') {
         speaker?.flush();

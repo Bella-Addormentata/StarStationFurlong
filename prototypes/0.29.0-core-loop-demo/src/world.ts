@@ -165,6 +165,7 @@ import {
   operateActiveSlotMachine,
   clearPendingSlotPlays,
   createCoinPusherUI,
+  coinPusherGearCard,
   createRobotDockUI,
   createCloneVatUI,
   createDeparturesBoardUI,
@@ -215,6 +216,7 @@ import {
   closeAirHockeyTable,
   createAirHockeyUI,
   registerAirHockeyVisual,
+  airHockeyGearCard,
 } from "./airHockeySession";
 // 🐊 #185: the insatiable-alligators live layer — the same hand-off as air
 // hockey's: built handles + frame time in, everything else in the session.
@@ -223,7 +225,9 @@ import {
   closeAlligatorsTable,
   createAlligatorsUI,
   registerAlligatorsVisual,
+  alligatorsGearCard,
 } from "./alligatorsSession";
+import { closeGearCard, toggleGearCard } from "./settingsGear";
 import { IA_SEATS } from "./games/alligators";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
@@ -3251,6 +3255,7 @@ export class World {
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
     this.arcadeCabinetVisuals.delete(itemId);
+    closeGearCard(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.tvScreens.delete(itemId);
@@ -6083,7 +6088,7 @@ export class World {
 
   public handleSlotMachineControl(
     deviceId: string,
-    control: SlotMachineCabinetControl | "service",
+    control: SlotMachineCabinetControl | "service" | "settings",
     value?: number,
   ): boolean {
     const device = findDevice(deviceId);
@@ -6095,9 +6100,11 @@ export class World {
       onDenominationChange: (amount: number) => visual?.setDenomination(amount),
       onMessage: (message: string) => visual?.showMessage(message),
     };
-    if (control === "service") {
+    // ⚙️ (kick panel) opens the machine's card for anyone, read-only unless
+    // they can edit the room; the marquee's service key stays owner-only.
+    if (control === "service" || control === "settings") {
       const permission = canEditRoom();
-      if (!permission.ok) {
+      if (control === "service" && !permission.ok) {
         visual?.showMessage("OWNER ONLY");
         showHint(permission.reason);
         return true;
@@ -6125,6 +6132,19 @@ export class World {
     const operated = operateActiveSlotMachine(deviceId, control, value);
     if (operated && control === "pull") visual?.pullLever();
     return operated;
+  }
+
+  /** ⚙ A settings gear was clicked (settingsGear.ts): open or close that
+   *  item's card. False when the item has no gear card. */
+  public openSettingsCard(itemId: string): boolean {
+    const kind = FURNITURE.find((item) => item.id === itemId)?.kind;
+    const spec = kind === "air-hockey-table" ? airHockeyGearCard(itemId)
+      : kind === "alligators-table" ? alligatorsGearCard(itemId)
+      : kind === "coin-pusher" ? coinPusherGearCard(itemId, () => canEditRoom().ok)
+      : null;
+    if (!spec) return false;
+    toggleGearCard(spec);
+    return true;
   }
 
   private updateSeatedSlotSession(): void {

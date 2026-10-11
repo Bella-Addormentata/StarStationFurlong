@@ -222,11 +222,14 @@ export class PadLog {
 
   /** File a FRAMES tick's runs. The earlier run is placed only when the
    *  current one's start is exact (run0 not capped at 255) and isn't the
-   *  match's first frame, which has nothing before it. */
+   *  match's first frame, which has nothing before it. A run starting at
+   *  frame 0 is the first frame unless the log already heard of the frames
+   *  just before it: then the clock wrapped, and the earlier run counts. */
   addTick(t: { frame: number; cur: number; run0: number; prev: number; run1: number }): void {
     const curFrom = frameAdd(t.frame, -t.run0);
     this.fill(curFrom, t.frame, t.cur);
-    if (t.run0 < 255 && curFrom !== 0) {
+    const wrapped = this.latest !== null && frameDiff(curFrom, this.latest) > 0;
+    if (t.run0 < 255 && (curFrom !== 0 || wrapped)) {
       const prevTo = frameAdd(curFrom, -1);
       const prevFrom = frameAdd(prevTo, -t.run1);
       this.fill(prevFrom, prevTo, t.prev);
@@ -341,6 +344,18 @@ function undoDelta(d: unknown, r: unknown): unknown {
   return d;
 }
 
+/** A save state as JSON: typed arrays as arrays, holes as null, a Tile as
+ *  its toJSON. */
+const asJson = (state: unknown): unknown => JSON.parse(JSON.stringify(state));
+
+/** Power-on states as JSON, per state (a ROM's is reused for every save). */
+const bootJson = new WeakMap<object, unknown>();
+function bootAsJson(boot: MachineState): unknown {
+  let json = bootJson.get(boot);
+  if (json === undefined) bootJson.set(boot, (json = asJson(boot)));
+  return json;
+}
+
 /** The most JSON a save state may inflate to (a whole jsnes state is about
  *  a megabyte; its difference from power-on is less). */
 export const MAX_SNAPSHOT_JSON_BYTES = 8 * 1024 * 1024;
@@ -380,8 +395,45 @@ async function pipe(
  * games, against roughly a megabyte of plain jsnes JSON.
  */
 export async function encodeSnapshot(state: MachineState, boot: MachineState): Promise<Uint8Array> {
-  const json = new TextEncoder().encode(JSON.stringify(delta(state, boot)));
+  // As JSON first, the way jsnes saves it (a cached tile as its pixels, not
+  // every field of the Tile), so what is sent is what decodeSnapshot checks.
+  const json = new TextEncoder().encode(JSON.stringify(delta(asJson(state), bootAsJson(boot))));
   return pipe(json, new CompressionStream('deflate'));
+}
+
+const isNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const numbers = (v: unknown, length: number): boolean =>
+  Array.isArray(v) && v.length === length && v.every(isNumber);
+
+/** A cached background tile as jsnes saves it (Tile.toJSON). */
+const isTile = (v: unknown): boolean =>
+  !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 2
+  && numbers((v as { pix?: unknown }).pix, 64) && numbers((v as { opaque?: unknown }).opaque, 8);
+
+/**
+ * Does `s` have the power-on state's shape (`ref`, as JSON)? The same keys,
+ * arrays of the same length, and leaves of the same type, numbers finite. A
+ * running game only fills in what the power-on state leaves null: a few PPU
+ * registers (a number or a flag) and the scanline's tile cache (a tile).
+ * Anything else would reach jsnes' fromJSON and break the copy, or worse,
+ * throw in the middle of a frame.
+ */
+function sameShape(s: unknown, ref: unknown, inArray = false): boolean {
+  if (ref === null) {
+    return s === null || (inArray ? isTile(s) : isNumber(s) || typeof s === 'boolean');
+  }
+  if (typeof ref === 'number') return isNumber(s);
+  if (Array.isArray(ref)) {
+    return Array.isArray(s) && s.length === ref.length && ref.every((r, i) => sameShape(s[i], r, true));
+  }
+  if (typeof ref === 'object') {
+    if (!s || typeof s !== 'object' || Array.isArray(s)) return false;
+    const keys = Object.keys(ref);
+    return Object.keys(s).length === keys.length
+      && keys.every((k) => Object.prototype.hasOwnProperty.call(s, k)
+        && sameShape((s as Record<string, unknown>)[k], (ref as Record<string, unknown>)[k]));
+  }
+  return typeof s === typeof ref;
 }
 
 /** Undo encodeSnapshot against the same ROM's power-on state. Throws on
@@ -389,12 +441,8 @@ export async function encodeSnapshot(state: MachineState, boot: MachineState): P
 export async function decodeSnapshot(data: Uint8Array, boot: MachineState): Promise<MachineState> {
   if (data.byteLength > MAX_SNAPSHOT_BYTES) throw new Error('save state too large');
   const json = await pipe(data, new DecompressionStream('deflate'), MAX_SNAPSHOT_JSON_BYTES);
-  const state = undoDelta(JSON.parse(new TextDecoder().decode(json)), boot);
-  if (!state || typeof state !== 'object') throw new Error('not a save state');
-  for (const part of ['cpu', 'mmap', 'ppu', 'papu']) {
-    if (!(state as Record<string, unknown>)[part] || typeof (state as Record<string, unknown>)[part] !== 'object') {
-      throw new Error('not a save state');
-    }
-  }
+  const ref = bootAsJson(boot);
+  const state = undoDelta(JSON.parse(new TextDecoder().decode(json)), ref);
+  if (!sameShape(state, ref)) throw new Error('not a save state');
   return state as MachineState;
 }

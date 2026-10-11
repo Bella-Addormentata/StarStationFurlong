@@ -2696,6 +2696,48 @@ function drawSettingsToken(c2d: CanvasRenderingContext2D): void {
   c2d.fill();
 }
 
+/** Gold of a settings gear's disc (the casino trim gold). */
+const GEAR_DISC_GOLD = 0xd4a84b;
+
+/** ⚙ A settings gear button (#241): the brass token on a gold disc. Lies
+ *  flat (face up) unless `ry` is given, in which case it stands upright
+ *  facing the item-local direction (sin ry, 0, cos ry), so π faces −z. The
+ *  caller tags the returned meshes with the click route. */
+function addSettingsGear(
+  place: BuildCtx["place"],
+  m: BuildCtx["m"],
+  x: number,
+  y: number,
+  z: number,
+  r: number,
+  ry?: number,
+): THREE.Mesh[] {
+  const cv = document.createElement("canvas");
+  cv.width = 128;
+  cv.height = 128;
+  drawSettingsToken(cv.getContext("2d")!);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const faceMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
+  faceMat.userData.baseOpacity = 1;
+  // A gold rim round the token (a torus, not a cylinder: the coin pusher's
+  // tests count cylinders as its chips).
+  const rimGeo = new THREE.TorusGeometry(r, r * 0.14, 8, 32); // faces +z
+  const faceGeo = new THREE.CircleGeometry(r, 32);            // faces +z
+  if (ry === undefined) {
+    rimGeo.rotateX(-Math.PI / 2);
+    faceGeo.rotateX(-Math.PI / 2);
+    return [
+      place(rimGeo, m(GEAR_DISC_GOLD, 0.35, 0.6), x, y, z),
+      place(faceGeo, faceMat, x, y + 0.002, z),
+    ];
+  }
+  return [
+    place(rimGeo, m(GEAR_DISC_GOLD, 0.35, 0.6), x, y, z, ry),
+    place(faceGeo, faceMat, x + Math.sin(ry) * 0.002, y, z + Math.cos(ry) * 0.002, ry),
+  ];
+}
+
 /** One-shot card-felt face: green baize, darker border, two card outlines +
  *  centre pips. Motif is 180°-rotation-symmetric on purpose — the face is
  *  only ever seen after a flip, so no text that could read upside down. */
@@ -3907,6 +3949,15 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     place(new THREE.BoxGeometry(AH_GOAL_HALF_W * 2, 0.05, 0.09), m(0x0a0e14, 0.7, 0.05), 0, AH_SURFACE_Y - 0.005, ez);
   }
 
+  // ⚙ Settings gears (settingsGear.ts): one on each end rail, at that
+  // player's right hand, opening the table card (rules, who holds each end,
+  // the owner's RESET).
+  for (const [gx, gz] of [[-endSegX, -endZ], [endSegX, endZ]] as const) {
+    for (const gear of addSettingsGear(place, m, gx, railTop + 0.006, gz, 0.04)) {
+      gear.userData.settingsGear = ctx.itemId;
+    }
+  }
+
   // Goal lamps — one over each mouth; flashGoal() strobes the breached end.
   const lampMatA = m(0xe84a5a, 0.4, 0.1, 0xe84a5a, 0);
   const lampMatB = m(0xe84a5a, 0.4, 0.1, 0xe84a5a, 0);
@@ -4088,6 +4139,15 @@ const buildAlligatorsTable = (ctx: BuildCtx): void => {
   const rimGeo = new THREE.TorusGeometry(IA_TABLE_R + 0.05, 0.05, 10, 72);
   rimGeo.rotateX(Math.PI / 2);
   place(rimGeo, m(0xb8a46a, 0.35, 0.55), 0, S + 0.02, 0);
+  // ⚙ Settings gears (settingsGear.ts) on the cabinet's skirt, one a little
+  // to each seat's left, opening the table card (rules, the seats, the
+  // owner's RESET).
+  for (let seat = 0; seat < IA_SEATS; seat++) {
+    const g = seatAngle(seat) - 0.22;
+    for (const gear of addSettingsGear(place, m, Math.cos(g) * 1.075, S - 0.11, Math.sin(g) * 1.075, 0.06, Math.atan2(Math.cos(g), Math.sin(g)))) {
+      gear.userData.settingsGear = ctx.itemId;
+    }
+  }
 
   // The spinning top — CanvasTexture (NearestFilter, the wall-screen idiom):
   // a lily-pond swirl whose spokes and pads make the spin readable.
@@ -7816,6 +7876,18 @@ function buildSlotMachine({
   // Tray interior (slightly recessed dark)
   place(new THREE.BoxGeometry(0.40, 0.03, 0.10), m(0x14181e, 0.85, 0.1), 0, 0.64, -0.135);
 
+  // ── ⚙️ Settings buttons on the kick panel near the floor ─────────────────
+  // A dark kick panel fills the gap between the front legs, and two gold-rimmed
+  // ⚙️ buttons sit on it. Anyone can press one to read the machine's card
+  // (paytable, RTP, fairness); for the owner the same card is editable.
+  place(new THREE.BoxGeometry(0.40, 0.26, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.20, -0.07);
+  for (const gx of [-0.10, 0.10]) {
+    for (const gear of addSettingsGear(place, m, gx, 0.20, -0.086, 0.05, Math.PI)) {
+      gear.userData.slotControl = "settings";
+      gear.userData.slotMachineId = itemId;
+    }
+  }
+
   // ── Pull lever (right side, +x) ───────────────────────────────────────────
   // A horizontal axle projects perpendicular to the cabinet's right side.
   // Shaft and grip share one centerline at its outer end; the whole axle group
@@ -7960,6 +8032,14 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   for (const [lx, lz] of [[-0.32, -0.24], [0.32, -0.24], [-0.32, 0.44], [0.32, 0.44]] as const) {
     place(new THREE.BoxGeometry(0.09, 0.42, 0.09), m(CHROME, 0.4, 0.6), lx, 0.31, lz);
     place(new THREE.BoxGeometry(0.11, 0.03, 0.11), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
+  }
+  // ⚙ Settings gears (settingsGear.ts) on a kick panel between the front
+  // legs, as on the slot machine: the machine card (rules, what's inside).
+  place(new THREE.BoxGeometry(0.55, 0.36, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.31, -0.22);
+  for (const gx of [-0.13, 0.13]) {
+    for (const gear of addSettingsGear(place, m, gx, 0.31, -0.237, 0.06, Math.PI)) {
+      gear.userData.settingsGear = itemId;
+    }
   }
   // Machine body — an open-fronted shell (back, floor, low skirts), so the
   // playfield shows through the glass. (A solid body box here would hide the
