@@ -108,6 +108,7 @@ export interface CrapsTableState {
   /** ⚖️ This round's seed commitments (see SeedRoundFields). */
   houseCommit?: string;
   commits?: Record<string, string>;
+  unseeded?: string[];
 }
 
 /** Which fairness scheme produced a table's dice (see diceFairness.ts). All four
@@ -178,12 +179,17 @@ export const HOUSE_PARTY = 'house';
 export interface SeedRoundFields {
   houseCommit?: string;
   commits?: Record<string, string>;
+  /** Players with chips down at "no more bets" who added no seed (their
+   *  client never committed in time, or the party cap was full). They are
+   *  protected only by the other parties' seeds — shown on the table card. */
+  unseeded?: string[];
 }
 
 /** Shape guard for the peer-written seed fields (bounded like transcripts). */
 export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.houseCommit !== undefined
     && (typeof s.houseCommit !== 'string' || s.houseCommit.length > FAIRNESS_MAX_STRING)) return false;
+  if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
   if (s.commits === undefined) return true;
   if (typeof s.commits !== 'object' || s.commits === null || Array.isArray(s.commits)) return false;
   const entries = Object.entries(s.commits);

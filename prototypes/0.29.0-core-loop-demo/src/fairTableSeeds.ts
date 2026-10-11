@@ -66,6 +66,14 @@ type TableState = CrapsTableState | RouletteTableState;
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
 
+/** Is the round on this table right now Fair? The mode locks in when the
+ *  window opens (a house commit), so this reads the round itself, and the
+ *  owner's setting only before any round exists. */
+export function roundIsFair(tableId: string, game: TableGame): boolean {
+  const s = readState(tableId, game);
+  return s ? !!s.houseCommit : isFairTable(tableId);
+}
+
 /** Is this table settled by the live multiparty scheme (Fair)? The owner's
  *  fairness setting, else the global default (multiparty). Roulette knows only
  *  Fair and plain RNG; craps' other two modes are still dev-simulated, so they
@@ -156,9 +164,9 @@ const lastTick = new Map<string, number>();
  * "no more bets" froze a commit set that includes us. Cheap and idempotent:
  * writes only on a real change, looks at most every 200 ms per table.
  */
-export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now()): void {
+export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now(), force = false): void {
   const tickKey = `${tableId}:${me}`;
-  if (now - (lastTick.get(tickKey) ?? 0) < 200) return;
+  if (!force && now - (lastTick.get(tickKey) ?? 0) < 200) return;
   if (lastTick.size > 256) lastTick.clear();
   lastTick.set(tickKey, now);
   const s = readState(tableId, game);
@@ -188,7 +196,11 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
 
 /** "No more bets": the commitments that roll — staked players whose record
  *  answers this round's house commit. Spread into the closing write. */
-export function freezeCommits(tableId: string, game: TableGame, s: TableState): { commits?: Record<string, string> } {
+export function freezeCommits(
+  tableId: string,
+  game: TableGame,
+  s: TableState,
+): { commits?: Record<string, string>; unseeded?: string[] } {
   if (!s.houseCommit) return {};
   const staked = stakedPlayers(tableId, game, s.round);
   const commits: Record<string, string> = {};
@@ -198,7 +210,11 @@ export function freezeCommits(tableId: string, game: TableGame, s: TableState): 
     if (Object.keys(commits).length >= MAX_BETTOR_PARTIES) break;
     if (staked.has(pid) && r.round === s.round && r.house === s.houseCommit) commits[pid] = r.commit;
   }
-  return { commits };
+  // Staked but no seed (offline with standing bets, too quick a close, or
+  // past the cap — a table's stands keep it far below 15): on the record, so
+  // the card can say who the result didn't take a seed from.
+  const unseeded = [...staked].filter((pid) => !(pid in commits)).sort().slice(0, MAX_BETTOR_PARTIES + 1);
+  return unseeded.length > 0 ? { commits, unseeded } : { commits };
 }
 
 /** When this page first tried to settle each round (its own clock). */
@@ -252,7 +268,16 @@ export function settledRound(tableId: string, s: TableState): void {
 // ── Anyone's check ────────────────────────────────────────────────────────────
 
 export type RoundVerdict =
-  | { kind: 'verified'; forfeited: string[]; houseMissing: boolean; droppedReveal: boolean }
+  | {
+    kind: 'verified';
+    forfeited: string[];
+    houseMissing: boolean;
+    droppedReveal: boolean;
+    /** Staked players who added no seed at all (see SeedRoundFields). */
+    unseeded: string[];
+    /** Bettors whose revealed seed went into the mix. */
+    bettorSeeds: number;
+  }
   | { kind: 'failed' }
   | { kind: 'unproven' };
 
@@ -284,5 +309,12 @@ export async function verifySettledRound(
     const r = readSeedRecord(tableId, pid);
     return !!r?.seed && r.round === s.round && commitSeedSync(r.seed, bettorCtx(tableId, s, pid)) === frozen[pid];
   });
-  return { kind: 'verified', forfeited, houseMissing: t.seeds[0] === '', droppedReveal };
+  return {
+    kind: 'verified',
+    forfeited,
+    houseMissing: t.seeds[0] === '',
+    droppedReveal,
+    unseeded: s.unseeded ?? [],
+    bettorSeeds: bettors.length - forfeited.length,
+  };
 }

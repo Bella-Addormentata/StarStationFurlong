@@ -18,7 +18,7 @@ const {
 const { BET_WINDOW_MS, CLOSING_MS, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier } = await import('./croupier');
 const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, tickAutoStickman } = await import('./crapsCroupier');
 const {
-  commitSeedSync, isFairTable, REVEAL_GRACE_MS, tickFairSeeds, verifySettledRound,
+  commitSeedSync, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
 } = await import('./fairTableSeeds');
 const { pocketFromMaterial } = await import('./games/fairDice');
 const { commitTableSeed } = await import('./games/diceFairness');
@@ -131,7 +131,9 @@ describe('a Fair roulette round', () => {
     expect(s.fairness?.parties).toEqual(['house', AMY, BOB]);
     expect(s.fairness?.seeds?.every((x) => x.length === 64)).toBe(true);
     const v = await verifySettledRound('roulette', t, s, { pocket: s.result! });
-    expect(v).toEqual({ kind: 'verified', forfeited: [], houseMissing: false, droppedReveal: false });
+    expect(v).toEqual({
+      kind: 'verified', forfeited: [], houseMissing: false, droppedReveal: false, unseeded: [], bettorSeeds: 2,
+    });
     // A different pocket fails the check.
     const wrong = await verifySettledRound('roulette', t, s, { pocket: (s.result! + 1) % 37 });
     expect(wrong.kind).toBe('failed');
@@ -243,6 +245,34 @@ describe('a Fair roulette round', () => {
     later(SHOW_MS);
     tickAutoCroupier(t); // the next round opens as RNG
     expect(readTableState(t)?.houseCommit).toBeUndefined();
+  });
+
+  it('records a staked player who added no seed, and says the house seed was all there was', async () => {
+    const t = freshTable();
+    tickAutoCroupier(t);
+    writeMyBets(t, BOB, 1, [{ type: 'black', amount: 10 }]);
+    tickAutoCroupier(t);
+    // Bob's client never looks (offline, or the house closed at once).
+    later(BET_WINDOW_MS);
+    tickAutoCroupier(t);
+    expect(readTableState(t)?.unseeded).toEqual([BOB]);
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    const v = await verifySettledRound('roulette', t, s, { pocket: s.result! });
+    expect(v).toMatchObject({ kind: 'verified', unseeded: [BOB], bettorSeeds: 0 });
+  });
+
+  it("the plaque follows the round's locked-in mode, not a mid-round switch", () => {
+    const t = freshTable();
+    expect(roundIsFair(t, 'roulette')).toBe(true); // no round yet: the setting
+    writeCrapsFairnessPref(t, 'rng');
+    tickAutoCroupier(t); // opens an RNG round
+    expect(roundIsFair(t, 'roulette')).toBe(false);
+    writeCrapsFairnessPref(t, 'multiparty');
+    expect(roundIsFair(t, 'roulette')).toBe(false); // still this RNG round
   });
 
   it('a bettor who joins after "no more bets" is not a party', () => {

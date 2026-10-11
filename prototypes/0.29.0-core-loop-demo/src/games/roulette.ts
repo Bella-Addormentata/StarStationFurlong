@@ -68,6 +68,7 @@ export interface RouletteTableState {
   /** ⚖️ This round's seed commitments (see SeedRoundFields in craps.ts). */
   houseCommit?: string;
   commits?: Record<string, string>;
+  unseeded?: string[];
 }
 
 export function initialRouletteState(): RouletteTableState {

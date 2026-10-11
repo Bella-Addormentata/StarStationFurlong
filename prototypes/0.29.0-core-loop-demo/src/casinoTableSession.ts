@@ -56,7 +56,7 @@ import type { FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casino
 import { canPlaceBet, crapsBetLabel, pointWasOn } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/diceFairness';
-import { isFairTable, REVEAL_GRACE_MS, verifySettledRound } from './fairTableSeeds';
+import { isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound } from './fairTableSeeds';
 import { readPlayerDisplayName } from './games/gamesDoc';
 import { betLabel, payoutFor, pocketColor } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
@@ -64,10 +64,10 @@ import { getPlayerId } from './identity';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/** ⚖️ The plaque line for a table: Fair (nobody can steer the result) or
- *  Friendly (you are trusting the owner's client). */
-export function fairnessBadge(tableId: string): { text: string; color: string; fair: boolean } {
-  return isFairTable(tableId)
+/** ⚖️ The plaque line for the round on a table: Fair (nobody can steer the
+ *  result) or Friendly (you are trusting the owner's client). */
+export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { text: string; color: string; fair: boolean } {
+  return roundIsFair(tableId, game)
     ? { text: '✔ FAIR TABLE · NOBODY CAN STEER THE RESULT', color: '#7CF5B0', fair: true }
     : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F5C26B', fair: false };
 }
@@ -291,7 +291,7 @@ const NO_HIGHLIGHT: ReadonlySet<string> = new Set();
 function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readCrapsTableState(id);
   const t = readDiceThrow(id);
-  h.setFairBadge(isFairTable(id));
+  h.setFairBadge(roundIsFair(id, 'craps'));
   if (!rt.primed) {
     // Walking in mid-game (or a room rebind): clear whatever the pieces still
     // show, then show where things stand, animating nothing old.
@@ -348,7 +348,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
 
 function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readTableState(id);
-  h.setFairBadge(isFairTable(id));
+  h.setFairBadge(roundIsFair(id, 'roulette'));
   if (!rt.primed) {
     rt.primed = true;
     h.reset();
@@ -646,7 +646,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
     writeBets([...mine, ...placed]);
     const warnKey = `${casinoDocEpoch()}:${itemId}`;
-    if (!isFairTable(itemId) && !friendlyWarned.has(warnKey)) {
+    // Commit this bet's seed now, not on the next tick: a quick close must
+    // still find it.
+    tickFairSeeds(itemId, game, me, Date.now(), true);
+    if (!roundIsFair(itemId, game) && !friendlyWarned.has(warnKey)) {
       friendlyWarned.add(warnKey);
       say("🤝 FRIENDLY TABLE — THE OWNER COULD STEER RESULTS · BET WITH PEOPLE YOU TRUST");
     }
@@ -1027,7 +1030,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const renderBar = (): void => {
     if (!bar) return;
     const st = status();
-    const badge = fairnessBadge(itemId);
+    const badge = fairnessBadge(itemId, game);
     const fairLine = bar.querySelector<HTMLDivElement>('[data-fair]')!;
     if (fairLine.textContent !== badge.text) fairLine.textContent = badge.text;
     fairLine.style.color = badge.color;
@@ -1090,11 +1093,17 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           const mixed = fx.seeds!.filter((x) => x !== '').length;
           const parts = [`🔒 ${what} · ✓ VERIFIED · ${mixed} SEED${mixed === 1 ? '' : 'S'} MIXED`];
           if (n > 0) parts.push(`${n} WITHHELD (BETS FORFEITED)`);
+          const u = r.unseeded.length;
+          if (u > 0) parts.push(`⚠ ${u} BETTOR${u === 1 ? '' : 'S'} ADDED NO SEED`);
+          // With chips down but no bettor seed in the mix, the house alone
+          // made this result: checkable, but not something it couldn't steer.
+          const houseOnly = r.bettorSeeds === 0 && (u > 0 || n > 0);
+          if (houseOnly) parts.push('⚠ HOUSE SEED ONLY');
           if (r.houseMissing) parts.push('⚠ HOUSE SEED MISSING');
           if (r.droppedReveal) parts.push('✗ A REVEALED SEED WAS LEFT OUT');
           return {
             text: parts.join(' · '),
-            color: r.droppedReveal ? '#FF8A80' : r.houseMissing ? '#F5C26B' : '#7CF5B0',
+            color: r.droppedReveal ? '#FF8A80' : r.houseMissing || houseOnly || u > 0 ? '#F5C26B' : '#7CF5B0',
           };
         })
         : verifyTranscript(fx, itemId, forRound, cs?.dice ?? [0, 0]).then((ok) => ({
@@ -1125,7 +1134,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     rows.push(`<div style="font-size:9px;color:${DIM};letter-spacing:1px;">${house ? 'YOU RUN THIS TABLE' : 'THE OWNER SETS THIS TABLE · ANYONE CAN LOOK'}</div>`);
     rows.push(`<div style="font-size:10px;line-height:1.7;color:${GOLD};border-top:1px solid rgba(212,168,75,0.18);padding-top:8px;">${rulesHtml()}</div>`);
     // ⚖️ Fair / Friendly, how the result is made, and the last result's check.
-    const badge = fairnessBadge(itemId);
+    const badge = fairnessBadge(itemId, game);
     rows.push(`<div style="font-size:10px;font-weight:900;letter-spacing:1px;color:${badge.color};">${badge.text}</div>`);
     const mode = readCrapsFairnessPref(itemId) ?? getCrapsFairnessMode();
     const info = game === 'craps' || mode === 'multiparty' ? FAIRNESS_MODES[mode] : FAIRNESS_MODES.rng;
@@ -1133,6 +1142,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       <span style="font-size:9px;color:${DIM};letter-spacing:1.2px;">${game === 'craps' ? 'DICE' : 'WHEEL'} FAIRNESS</span>
       ${house ? btn('fairness', info.label.toUpperCase(), true) : `<span style="font-size:10px;color:${GOLD_BRIGHT};">${info.label.toUpperCase()}</span>`}</div>`);
     rows.push(`<div style="font-size:9px;color:${DIM};">${info.blurb}${game === 'craps' && (mode === 'commit-reveal' || mode === 'block-beacon') ? ' (dev-simulated, so not Fair yet)' : ''}</div>`);
+    if (isFairTable(itemId) !== badge.fair) {
+      rows.push(`<div style="font-size:9px;color:${DIM};">THE NEW SETTING STARTS WITH THE NEXT ${game === 'craps' ? 'ROLL' : 'ROUND'}</div>`);
+    }
     if (game === 'craps') {
       const backend = crapsBackend(readCrapsBackendPref(itemId));
       const pref = readCrapsBackendPref(itemId);

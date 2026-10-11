@@ -148,6 +148,7 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     ...(fairness ? { fairness } : {}),
     ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
     ...(before.commits !== undefined ? { commits: before.commits } : {}),
+    ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
     ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
   });
   settledRound(tableId, before);

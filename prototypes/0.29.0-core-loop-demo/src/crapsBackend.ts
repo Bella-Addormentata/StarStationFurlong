@@ -157,6 +157,7 @@ class LocalCrapsBackend implements CrapsBackend {
       // check the transcript against them.
       ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
       ...(before.commits !== undefined ? { commits: before.commits } : {}),
+      ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
     settledRound(tableId, before);
