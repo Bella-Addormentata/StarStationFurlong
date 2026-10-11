@@ -575,6 +575,11 @@ const networkProvider = new NetworkProvider();
  *  nobody should be handed its address either — that falls out of `some` over
  *  an empty list, which is exactly the fail-closed answer. With no doc bound
  *  yet the defaults read PUBLIC, which for N8 is the safe answer too. */
+/** The room whose door-policy AND door-layout docs are the ones currently
+ *  bound, or null between a leave and the next join's binds (see the N8 probe
+ *  below: until this names a room, that room's passage is unknown → PUBLIC). */
+let doorDocsBoundFor: string | null = null;
+
 function roomPassageIsPublic(): boolean {
   const ids = [...readAllDoorLayout().keys()];
   const doors = doorSetIsAuthoritative() ? ids : ["north", "south", "east", "west"];
@@ -585,13 +590,22 @@ function roomPassageIsPublic(): boolean {
 // bundled welcome room, or a room anyone may walk into — and never publishes
 // an address under such a room's key (anyone can derive its hint). Until the
 // probe answers the node assumes public, so a wrong answer can only withhold
-// a publish. Re-stamped on every door-policy change AND every door-layout
-// change (a door fitted with no policy record of its own takes the default,
-// which is public, so a new door alone can open the room), and on every room
-// bind, which notifies both; so a room flipping public/private reaches the
-// node live whichever record flipped it.
+// a publish. The door docs the probe reads are globally bound and re-bound per
+// join, and the first cap of a join goes out at connect, BEFORE the new room's
+// docs are bound: so the probe only reads them once `doorDocsBoundFor` names
+// this exact room (set right before the last of the two binds), and says
+// PUBLIC until then — never the previous room's doors for the new room.
+// Re-stamped on every door-policy change AND every door-layout change (a door
+// fitted with no policy record of its own takes the default, which is public,
+// so a new door alone can open the room), and on every room bind, which
+// notifies both; so a room flipping public/private reaches the node live
+// whichever record flipped it. Each cap carries a sequence number, so one that
+// left earlier but lands later cannot overwrite the current posture.
 networkProvider.setPublicRoomProbe((roomId) =>
-  roomIsPublicSpace(roomId === DEFAULT_STATION.welcomeRoomId, roomPassageIsPublic()),
+  roomIsPublicSpace(
+    roomId === DEFAULT_STATION.welcomeRoomId,
+    doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
+  ),
 );
 subscribeDoorPolicy(() => {
   void networkProvider.refreshRoomCap();
@@ -1781,6 +1795,9 @@ async function joinRoomAtEpoch(
   receivedTicks = 0;
   remoteLastSeen.clear();
   world.clearRemotePlayers();
+  // ⛓️ N8: the door docs about to be bound are not this room's yet — the cap
+  // sent at connect must say PUBLIC until both are (see the probe's comment).
+  doorDocsBoundFor = null;
   // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
   // world.ts activeRoomId). Published BEFORE the connect await (the id is
   // known synchronously) so a trunk opened during the connect window keys
@@ -2128,6 +2145,10 @@ async function joinRoomAtEpoch(
   // separate from the pairing map + floor-plan position. Binding re-notifies →
   // world.reconcileDoorLayout runs immediately (a joiner sees the host's door
   // set); an unseeded room keeps the local cardinal defaults.
+  // ⛓️ N8: the door-POLICY doc is bound above; with this bind both of the docs
+  // the public-room probe reads are this room's, so name it first — the bind's
+  // own notify then re-stamps the room cap with the real passage reading.
+  doorDocsBoundFor = boot.roomId;
   bindDoorLayoutDoc(sync.doc);
   // 🪟 #80: window layout syncs the same way (rebinds per join at the T0 seam).
   bindWindowLayoutDoc(sync.doc);
@@ -3190,6 +3211,9 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // doors doc binds before the layout/floor-plan docs, and a harvest in that
   // window reads the new room's doors at the OLD room's walls.
   setAtlasHarvestArmed(false);
+  // ⛓️ N8: likewise, the public-room probe must not read this room's doors for
+  // whatever room is joined next.
+  doorDocsBoundFor = null;
   // We are now roomless (issue #60 review): clear the active-pass room so a
   // swap that leaves but never re-joins (stranded) can't wedge a pass showing
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the

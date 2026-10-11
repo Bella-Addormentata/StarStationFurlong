@@ -62,9 +62,19 @@ pub struct ChiaRoomCap {
     /// free and harmless either way. Set by the browser OR forced to
     /// `Some(true)` by the bundled-key check below.
     pub public_room: Option<bool>,
+    /// The browser's per-session cap sequence number (0 from a browser that
+    /// predates it). Every cap rides its own stream and streams may land out
+    /// of order, so [`ingest_room_cap`] drops a cap older than the one it
+    /// holds: a stale PRIVATE can never overwrite a fresh PUBLIC.
+    pub seq: u64,
 }
 
 impl ChiaRoomCap {
+    /// Same key and flags — what "changed" means for logging; `seq` is not posture.
+    pub fn same_posture(&self, other: &ChiaRoomCap) -> bool {
+        self.room_key == other.room_key && self.chia_mode == other.chia_mode && self.public_room == other.public_room
+    }
+
     /// May the publisher write a presence record under this room's key?
     /// Armed AND KNOWN private — the N8 guard in one place. An absent flag is
     /// not "private": an older browser cannot vouch for the room's posture.
@@ -96,6 +106,9 @@ struct RoomCapPayload {
     /// Absent in caps from browsers that predate N8 — see [`ChiaRoomCap::public_room`].
     #[serde(rename = "publicRoom", default)]
     public_room: Option<bool>,
+    /// Absent (0) from browsers that predate the sequence number.
+    #[serde(default)]
+    seq: u64,
 }
 
 /// Decode a 32-byte room key from whatever base64 flavor the browser emits
@@ -134,12 +147,13 @@ pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
     let parsed: RoomCapPayload = serde_json::from_slice(payload).ok()?;
     let room_key = decode_room_key(&parsed.room_key_b64)?;
     let public_room = if is_bundled_room_key(&room_key) { Some(true) } else { parsed.public_room };
-    Some(ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room })
+    Some(ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room, seq: parsed.seq })
 }
 
 /// Ingest a `cap` payload the local browser sent for `room`: store the room key
 /// and flags, log the room's current lookup hint when something changed (a
-/// re-sent cap on reconnect is quiet).
+/// re-sent cap on reconnect is quiet). A cap with a LOWER sequence number than
+/// the one held is a straggler from an earlier send and is dropped.
 pub fn ingest_room_cap(rooms: &Mutex<HashMap<String, ChiaRoomCap>>, room: &str, payload: &[u8]) {
     let cap = match parse_room_cap(payload) {
         Some(c) => c,
@@ -156,7 +170,17 @@ pub fn ingest_room_cap(rooms: &Mutex<HashMap<String, ChiaRoomCap>>, room: &str, 
     let changed = {
         let mut map = rooms.lock().unwrap();
         match map.get(room) {
-            Some(prev) if *prev == cap => false,
+            Some(prev) if prev.seq > cap.seq => {
+                eprintln!(
+                    "⛓️ ChiaHub lane: dropping a stale room cap for {room} (seq {} < held {})",
+                    cap.seq, prev.seq
+                );
+                return;
+            }
+            Some(prev) if prev.same_posture(&cap) => {
+                map.insert(room.to_string(), cap.clone()); // keep the newest seq
+                false
+            }
             _ => {
                 map.insert(room.to_string(), cap.clone());
                 true
@@ -263,5 +287,25 @@ mod tests {
         assert!(rooms.lock().unwrap()["r1"].chia_mode);
         ingest_room_cap(&rooms, "r1", b"garbage");
         assert!(rooms.lock().unwrap()["r1"].chia_mode, "malformed cap leaves the stored one alone");
+    }
+
+    #[test]
+    fn ingest_drops_a_cap_older_than_the_one_held() {
+        let rooms = Mutex::new(HashMap::new());
+        let key = [11u8; 32];
+        // The browser sent PRIVATE (seq 100) then PUBLIC (seq 101); they ride
+        // separate streams and the node sees PUBLIC first.
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":101"));
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":false,\"seq\":100"));
+        let held = rooms.lock().unwrap()["r1"].clone();
+        assert_eq!(held.public_room, Some(true), "the straggling PRIVATE must not overwrite PUBLIC");
+        assert_eq!(held.seq, 101);
+        // Equal seq (a browser without sequence numbers always sends 0) is accepted.
+        ingest_room_cap(&rooms, "r2", &payload(key, ",\"chiaMode\":false"));
+        ingest_room_cap(&rooms, "r2", &payload(key, ",\"chiaMode\":true"));
+        assert!(rooms.lock().unwrap()["r2"].chia_mode, "seq 0 after seq 0 still applies");
+        // A newer cap with the same posture is kept so its seq becomes the floor.
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":105"));
+        assert_eq!(rooms.lock().unwrap()["r1"].seq, 105);
     }
 }

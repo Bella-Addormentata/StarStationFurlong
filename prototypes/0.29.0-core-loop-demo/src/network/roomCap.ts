@@ -17,10 +17,26 @@ export interface RoomCapPayload {
   roomKeyB64: string;
   chiaMode: boolean;
   publicRoom: boolean;
+  /** Monotonic within a browser session (the ms clock, bumped past the last
+   *  one sent). Every cap rides its own stream and streams may land out of
+   *  order, so the node keeps the highest `seq` it has seen per room and drops
+   *  anything older; a stale PRIVATE can then never overwrite a fresh PUBLIC. */
+  seq: number;
 }
 
-export function buildRoomCapPayload(roomKeyB64: string, chiaMode: boolean, publicRoom: boolean): RoomCapPayload {
-  return { roomKeyB64, chiaMode: !!chiaMode, publicRoom: !!publicRoom };
+export function buildRoomCapPayload(
+  roomKeyB64: string,
+  chiaMode: boolean,
+  publicRoom: boolean,
+  seq: number,
+): RoomCapPayload {
+  return { roomKeyB64, chiaMode: !!chiaMode, publicRoom: !!publicRoom, seq: Math.max(0, Math.floor(seq)) || 0 };
+}
+
+/** The next cap's `seq`: the clock, but never at or below the last one sent,
+ *  so two caps in the same millisecond still order. */
+export function nextCapSeq(last: number, nowMs: number = Date.now()): number {
+  return Math.max(nowMs, last + 1);
 }
 
 /** N8's two reasons a room is public space, in one predicate. `bundled` is

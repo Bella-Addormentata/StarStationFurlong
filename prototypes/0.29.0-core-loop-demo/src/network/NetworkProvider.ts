@@ -23,7 +23,7 @@ import type {
   TransportMode,
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
-import { buildRoomCapPayload, readChiaMode } from './roomCap.ts';
+import { buildRoomCapPayload, nextCapSeq, readChiaMode } from './roomCap.ts';
 
 export interface NetworkDebugInfo {
   mode: TransportMode;
@@ -70,6 +70,8 @@ export class NetworkProvider implements NetworkProviderPort {
   #boot: RoomBootstrap | null = null;
   /** N8 probe: is this room public space? Installed by main.ts. */
   #publicRoomProbe: ((roomId: string) => boolean) | null = null;
+  /** Last cap `seq` sent (see roomCap.ts): caps ride separate streams. */
+  #capSeq = 0;
 
   async connect(boot: RoomBootstrap): Promise<void> {
     if (this.#isActive) {
@@ -235,7 +237,8 @@ export class NetworkProvider implements NetworkProviderPort {
     if (!this.#wt || this.#mode === 'offline') return;
     try {
       const publicRoom = this.#publicRoomProbe ? this.#publicRoomProbe(roomId) : true;
-      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom);
+      this.#capSeq = nextCapSeq(this.#capSeq);
+      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq);
       const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
       // Small payload (<128 B) — a single btoa is safe. Node decodes with
       // BASE64_STANDARD, which btoa produces.
