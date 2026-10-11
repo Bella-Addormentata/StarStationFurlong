@@ -16,7 +16,7 @@ const {
   writeMySeedRecord, writeTableState,
 } = await import('./casinoDoc');
 const { BET_WINDOW_MS, CLOSING_MS, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier } = await import('./croupier');
-const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, tickAutoStickman } = await import('./crapsCroupier');
+const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, pressManualRoll, tickAutoStickman } = await import('./crapsCroupier');
 const {
   commitSeedSync, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
 } = await import('./fairTableSeeds');
@@ -380,6 +380,19 @@ describe('a Fair craps roll', () => {
     const s = readCrapsTableState(t)!;
     expect(s.phase).toBe('settled');
     expect(s.fairness?.parties).toEqual(['house', AMY]);
+  });
+
+  it("the house's first ROLL on a fresh Fair table with bets down only opens the window", () => {
+    const t = freshTable();
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    expect(pressManualRoll(t)).toMatch(/PRESS AGAIN/);
+    expect(readCrapsTableState(t)?.phase).toBe('betting');
+    playersLook(t, 'craps', [AMY]);
+    expect(pressManualRoll(t)).toBeNull();
+    const s = readCrapsTableState(t)!;
+    expect(s.phase).toBe('closing');
+    expect(Object.keys(s.commits ?? {})).toEqual([AMY]);
+    expect(s.unseeded ?? []).toEqual([]);
   });
 
   it('an RNG table skips the exchange and carries no transcript', async () => {

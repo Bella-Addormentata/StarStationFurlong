@@ -372,7 +372,16 @@ const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>
  *    converged — never two settles from two shareholders' presses.
  */
 export function pressManualRoll(tableId: string, now = Date.now()): string | null {
-  if (!readCrapsTableState(tableId)) openCrapsBetting(tableId, 1, null);
+  if (!readCrapsTableState(tableId)) {
+    openCrapsBetting(tableId, 1, null);
+    // ⚖️ A Fair window with bets already down only opens on this press: the
+    // bettors need to see the house commit and add their seeds before "no
+    // more bets", or the house seed alone would decide the roll.
+    const opened = readCrapsTableState(tableId);
+    if (opened?.houseCommit && Object.keys(readAllCrapsBets(tableId)).length > 0) {
+      return 'BETS OPEN — PRESS AGAIN TO ROLL';
+    }
+  }
   const s = readCrapsTableState(tableId);
   if (!s) return null;
   if (s.phase === 'betting') {
