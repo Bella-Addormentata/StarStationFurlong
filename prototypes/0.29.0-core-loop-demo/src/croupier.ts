@@ -45,7 +45,7 @@ import { settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the house + bettors' seed exchange (fairTableSeeds.ts).
 import {
-  freezeCommits, frozenWagers, gatherRound, isFairTable, newHouseCommit, settledRound,
+  freezeCommits, frozenFields, frozenWagers, gatherRound, isFairTable, newHouseCommit, settledRound,
 } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
@@ -136,7 +136,7 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // ⚖️ Only the wagers frozen at "no more bets" settle (the reveals made the
   // pocket computable; a rewritten list is void), and a bettor who committed
   // but never revealed forfeits this round's bets.
-  const { bets } = frozenWagers(before, readAllBets(tableId, round));
+  const { bets } = frozenWagers(tableId, before, readAllBets(tableId, round));
   for (const pid of forfeited) delete bets[pid];
   const payouts = resolveRound(bets, result);
   const now = Date.now();
@@ -149,7 +149,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     payouts,
     ...(fairness ? { fairness } : {}),
     ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
-    ...(before.commits !== undefined ? { commits: before.commits } : {}),
+    // The commits and wagers as this page froze them, not as the shared
+    // state reads now (anyone can rewrite it after the reveals).
+    ...frozenFields(tableId, before),
     ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
     ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
   });

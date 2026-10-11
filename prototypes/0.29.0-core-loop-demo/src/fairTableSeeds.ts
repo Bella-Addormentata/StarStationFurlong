@@ -178,7 +178,39 @@ const authoredRounds = new Set<string>();
  *  closing — before any reveal, so before anyone could know the result. The
  *  check compares the settled record against it: an operator who rewrites the
  *  party set after the reveals (to drop or add a seed) is caught here. */
-const frozenSeen = new Map<string, { house: string; commits: Record<string, string> }>();
+interface FrozenSnapshot {
+  house: string;
+  commits: Record<string, string>;
+  wagers?: Record<string, string>;
+}
+const frozenSeen = new Map<string, FrozenSnapshot>();
+
+function snapshot(s: TableState & { wagers?: Record<string, string> }): FrozenSnapshot {
+  return {
+    house: s.houseCommit ?? '',
+    commits: { ...(s.commits ?? {}) },
+    ...(s.wagers ? { wagers: { ...s.wagers } } : {}),
+  };
+}
+
+/** The round's frozen commit set and wagers as THIS page first saw them (the
+ *  operator: as it froze them) — anyone can rewrite the shared state after the
+ *  reveals, so the settle and the check go by this copy when there is one. */
+export function frozenFields(
+  tableId: string,
+  s: TableState & { wagers?: Record<string, string> },
+): { commits?: Record<string, string>; wagers?: Record<string, string> } {
+  const seen = frozenSeen.get(roundKey(tableId, s.round, s.houseCommit));
+  if (!seen) return { ...(s.commits ? { commits: s.commits } : {}), ...(s.wagers ? { wagers: s.wagers } : {}) };
+  return { commits: seen.commits, ...(seen.wagers ? { wagers: seen.wagers } : {}) };
+}
+
+function noteFrozen(tableId: string, s: TableState & { wagers?: Record<string, string> }, overwrite: boolean): void {
+  const k = roundKey(tableId, s.round, s.houseCommit);
+  if (!overwrite && frozenSeen.has(k)) return;
+  if (frozenSeen.size > 64) frozenSeen.clear();
+  frozenSeen.set(k, snapshot(s));
+}
 
 function roundKey(tableId: string, round: number, house: string | undefined): string {
   return `${casinoDocEpoch()}:${tableId}:${round}:${house ?? ''}`;
@@ -202,11 +234,7 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
   const s = readState(tableId, game);
   if (!s?.houseCommit) return;
   if (s.phase === 'closing') {
-    const k = roundKey(tableId, s.round, s.houseCommit);
-    if (!frozenSeen.has(k)) {
-      if (frozenSeen.size > 64) frozenSeen.clear();
-      frozenSeen.set(k, { house: s.houseCommit, commits: { ...(s.commits ?? {}) } });
-    }
+    noteFrozen(tableId, s, false);
   }
   const rec = readSeedRecord(tableId, me);
   if (s.phase === 'betting') {
@@ -273,6 +301,8 @@ export function freezeCommits(
   for (const pid of [...Object.keys(commits), ...unseeded]) {
     wagers[pid] = wagerFingerprint(game === 'craps' ? readMyCrapsBets(tableId, pid) : readMyBets(tableId, pid, s.round));
   }
+  // The operator's own copy of what it froze: its settle goes by this.
+  noteFrozen(tableId, { ...s, commits, wagers }, true);
   return unseeded.length > 0 ? { commits, unseeded, wagers } : { commits, wagers };
 }
 
@@ -286,14 +316,16 @@ export function wagerFingerprint(bets: readonly unknown[]): string {
  *  "no more bets" is `voided` (its bets are not paid — the settle clears them).
  *  A round without frozen wagers (RNG) settles the bets as they stand. */
 export function frozenWagers<T>(
-  s: { wagers?: Record<string, string> },
+  tableId: string,
+  s: TableState & { wagers?: Record<string, string> },
   bets: Record<string, T[]>,
 ): { bets: Record<string, T[]>; voided: string[] } {
-  if (!s.wagers) return { bets, voided: [] };
+  const { wagers } = frozenFields(tableId, s);
+  if (!wagers) return { bets, voided: [] };
   const out: Record<string, T[]> = {};
   const voided: string[] = [];
   for (const [pid, list] of Object.entries(bets)) {
-    const want = s.wagers[pid];
+    const want = wagers[pid];
     if (want === undefined) continue; // not in the round: untouched
     if (wagerFingerprint(list) === want) out[pid] = list;
     else voided.push(pid);
@@ -330,7 +362,7 @@ export function gatherRound(tableId: string, s: TableState, now = Date.now()): G
     seed: houseCommit ? seedFor(houseCommit, houseCtx(tableId, s.round)) : null,
   }];
   const forfeited: string[] = [];
-  for (const [pid, commit] of Object.entries(s.commits ?? {})) {
+  for (const [pid, commit] of Object.entries(frozenFields(tableId, s).commits ?? {})) {
     const r = readSeedRecord(tableId, pid);
     const seed = r && r.round === s.round && r.commit === commit && r.seed
       && commitSeedSync(r.seed, bettorCtx(tableId, s, pid)) === commit ? r.seed : null;
@@ -390,7 +422,8 @@ export async function verifySettledRound(
   const frozen = s.commits ?? {};
   // The party set must be the one this page saw frozen before the reveals.
   const seen = frozenSeen.get(roundKey(tableId, s.round, s.houseCommit));
-  if (seen && (seen.house !== s.houseCommit || !sameCommits(seen.commits, frozen))) return { kind: 'failed' };
+  if (seen && (seen.house !== s.houseCommit || !sameCommits(seen.commits, frozen)
+    || (seen.wagers && !sameCommits(seen.wagers, s.wagers ?? {})))) return { kind: 'failed' };
   const bettors = t.parties.slice(1);
   if (t.commits[0] !== (s.houseCommit ?? '')
     || bettors.length !== Object.keys(frozen).length

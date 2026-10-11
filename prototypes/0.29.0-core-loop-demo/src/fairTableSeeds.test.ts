@@ -260,6 +260,25 @@ describe('a Fair roulette round', () => {
     expect(s.payouts?.[BOB]).toBeUndefined();
   });
 
+  it("rewriting the closing state's wager hash too doesn't get a rewritten bet paid", async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    const winAll = [
+      { type: 'red' as const, amount: 10 }, { type: 'black' as const, amount: 10 }, { type: 'straight' as const, pick: 0, amount: 10 },
+    ];
+    writeMyBets(t, BOB, 1, winAll);
+    const closing = readTableState(t)!;
+    writeTableState(t, { ...closing, wagers: { ...closing.wagers, [BOB]: wagerFingerprint(winAll) } });
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(s.wagers?.[BOB]).not.toBe(wagerFingerprint(winAll)); // the frozen copy is what's published
+  });
+
   it('a bettor id too long for the closing state is left out instead of wedging the table', () => {
     const t = freshTable();
     tickAutoCroupier(t);
@@ -473,9 +492,9 @@ describe('a Fair craps roll', () => {
   it('settles only frozen bettors whose wager lists still match', () => {
     const a = [{ type: 'pass', amount: 10 }];
     const wagers = { [AMY]: wagerFingerprint(a), [BOB]: wagerFingerprint([{ type: 'field', amount: 5 }]) };
-    const out = frozenWagers({ wagers }, { [AMY]: a, [BOB]: [{ type: 'anyseven', amount: 50 }], 'player-Late': a });
+    const out = frozenWagers('t', { kind: 'roulette', round: 1, houseCommit: 'h', wagers } as never, { [AMY]: a, [BOB]: [{ type: 'anyseven', amount: 50 }], 'player-Late': a });
     expect(out).toEqual({ bets: { [AMY]: a }, voided: [BOB] });
-    expect(frozenWagers({}, { [BOB]: a })).toEqual({ bets: { [BOB]: a }, voided: [] });
+    expect(frozenWagers('t', { kind: 'roulette', round: 1 } as never, { [BOB]: a })).toEqual({ bets: { [BOB]: a }, voided: [] });
   });
 
   it('an RNG table skips the exchange and carries no transcript', async () => {

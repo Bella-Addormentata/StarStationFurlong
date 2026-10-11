@@ -43,7 +43,7 @@ import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
-import { frozenWagers, gatherRound, settledRound } from './fairTableSeeds';
+import { frozenFields, frozenWagers, gatherRound, settledRound } from './fairTableSeeds';
 
 export type { CrapsBackendKind };
 
@@ -131,7 +131,7 @@ class LocalCrapsBackend implements CrapsBackend {
     // felt this roll — withholding a seed to dodge a result must cost them.
     // Only wagers frozen at "no more bets" settle: the reveals made the dice
     // computable, so a list rewritten since is void and cleared like a forfeit.
-    const { bets: allBets, voided } = frozenWagers(before, readAllCrapsBets(tableId));
+    const { bets: allBets, voided } = frozenWagers(tableId, before, readAllCrapsBets(tableId));
     forfeited = [...forfeited, ...voided];
     for (const pid of forfeited) delete allBets[pid];
     const { payouts, remaining } = resolveCrapsRound(
@@ -160,7 +160,9 @@ class LocalCrapsBackend implements CrapsBackend {
       // ⚖️ The round's commitments stay on the settled record so anyone can
       // check the transcript against them.
       ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
-      ...(before.commits !== undefined ? { commits: before.commits } : {}),
+      // The commits and wagers as this page froze them, not as the shared
+      // state reads now (anyone can rewrite it after the reveals).
+      ...frozenFields(tableId, before),
       ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
