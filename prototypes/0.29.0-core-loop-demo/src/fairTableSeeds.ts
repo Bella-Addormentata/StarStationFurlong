@@ -543,8 +543,10 @@ export function gatherRound(tableId: string, live: TableState, now = Date.now())
 
 /** The round settled: the house seed is public now. */
 export function settledRound(tableId: string, s: TableState): void {
-  settleDueAt.delete(roundKey(tableId, s.round, s.houseCommit));
-  if (s.houseCommit) forgetSeed(s.houseCommit, houseCtx(tableId, s.round));
+  // By the house commit this page froze: the live one may have been erased.
+  const house = frozenFields(tableId, s).houseCommit ?? s.houseCommit;
+  settleDueAt.delete(roundKey(tableId, s.round, house));
+  if (house) forgetSeed(house, houseCtx(tableId, s.round));
 }
 
 // ── Anyone's check ────────────────────────────────────────────────────────────

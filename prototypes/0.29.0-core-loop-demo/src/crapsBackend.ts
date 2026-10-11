@@ -44,6 +44,11 @@ import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFa
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
 import { frozenFields, frozenWagers, gatherRound, houseSeedHeld, settledRound } from './fairTableSeeds';
+import { getPlayerId } from './identity';
+
+/** This page, as a manual table's operator: player id plus a per-load nonce,
+ *  so two tabs of one player are still two operators. */
+export const CRAPS_PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).slice(2, 10)}`;
 
 export type { CrapsBackendKind };
 
@@ -110,6 +115,7 @@ class LocalCrapsBackend implements CrapsBackend {
         // without its seed. The roll is void: no dice, every bet stands.
         const before = readCrapsTableState(tableId);
         if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return null;
+        if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return null;
         const now = Date.now();
         writeCrapsTableState(tableId, {
           kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
@@ -153,6 +159,9 @@ class LocalCrapsBackend implements CrapsBackend {
     // caller closes the table first, so a table back in 'betting' at the same
     // round is a recreated one, not this roll's.
     if (casinoDocEpoch() !== epoch || before.round !== round || before.phase !== 'closing') return dice;
+    // 🎲 A manual roll settles only on the page still holding its lease: the
+    // hashing can outlive it (a suspended tab another member took over from).
+    if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     // ⚖️ A bettor who committed but never revealed forfeits every bet on the

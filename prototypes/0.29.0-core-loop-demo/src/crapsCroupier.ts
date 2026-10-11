@@ -28,7 +28,6 @@
  */
 
 import { canRunCroupier } from './croupier';
-import { getPlayerId } from './identity';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
@@ -47,7 +46,7 @@ import { hasLineBet, pickShooter } from './games/craps';
 import type { CrapsTableState, SeatedPlayer } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
-import { selectCrapsBackend } from './crapsBackend';
+import { CRAPS_PAGE_ID, selectCrapsBackend } from './crapsBackend';
 import { getCrapsFairnessMode } from './games/diceFairness';
 // ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
 // at "no more bets" (fairTableSeeds.ts).
@@ -313,9 +312,8 @@ export function tickCrapsClosing(tableId: string, s: CrapsTableState, autoShowMs
   if (now >= (s.phaseDeadline ?? now)) stickmanThrows(tableId, s, autoShowMs);
 }
 
-/** This page, as a manual table's operator: player id plus a per-load nonce,
- *  so two tabs of one player are still two operators. */
-const PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).slice(2, 10)}`;
+/** This page, as a manual table's operator (crapsBackend.CRAPS_PAGE_ID). */
+const PAGE_ID = CRAPS_PAGE_ID;
 
 /** A manual craps table (no robot stickman): the page whose ROLL slid the
  *  dice out runs only that shooter's turn — watching the seats, settling the

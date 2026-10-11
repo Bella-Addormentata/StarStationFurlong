@@ -18,7 +18,7 @@ const {
 const {
   BET_WINDOW_MS, CLOSING_MS, rollAndSettle, ROULETTE_PAGE_ID, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier,
 } = await import('./croupier');
-const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, CRAPS_SHOW_MS, pressManualRoll, stickmanThrows, tickAutoStickman } = await import('./crapsCroupier');
+const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, CRAPS_SHOW_MS, pressManualRoll, rollAndSettleCraps, stickmanThrows, tickAutoStickman } = await import('./crapsCroupier');
 const {
   commitSeedSync, forgetMissingTables, keyFor, seedSigBytes, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
   wagerFingerprint,
@@ -911,6 +911,22 @@ describe('a Fair craps roll', () => {
     await flush();
     expect(readDiceThrow(t)).toBeNull();
     expect(readCrapsTableState(t)).toMatchObject({ phase: 'settled', voided: true, dice: null });
+  });
+
+  it("a craps roll under another page's lease isn't settled here", async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    const closing = readCrapsTableState(t)!;
+    writeCrapsTableState(t, { ...closing, operator: 'player-Other:abc123' });
+    rollAndSettleCraps(t, closing.round, closing.point);
+    await flush();
+    expect(readCrapsTableState(t)?.phase).toBe('closing');
   });
 
   it('settles only frozen bettors whose wager lists still match', () => {
