@@ -271,7 +271,53 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
   sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
   if (s?.phase !== 'closing' || s.operator !== PAGE_ID) return;
-  tickCrapsClosing(tableId, s, undefined, now);
+  // Just took the turn over: let the operator stamp converge first, so a
+  // rival takeover's write wins or loses before either page settles.
+  const took = tookOverAt.get(tableId);
+  if (took !== undefined && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
+  tickCrapsClosing(tableId, s, undefined, took !== undefined ? Infinity : now);
+  tookOverAt.delete(tableId);
+}
+
+/** How long after the dice's deadline a manual turn counts as abandoned
+ *  (its operator page is gone) and another editor's ROLL may take it over. */
+export const MANUAL_TAKEOVER_MS = 10_000;
+const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
+/** Tables this page took over, by this page's own clock. */
+const tookOverAt = new Map<string, number>();
+
+/**
+ * The house's ROLL on a manual table. Returns a notice for the press, or
+ * null when it acted.
+ *  • No state yet: opens round 1 (as tickAutoStickman does), then closes it.
+ *  • Betting: closes, slides the dice out, and stamps this page as operator.
+ *  • Closing, this page operates: settles the throw that landed, else the
+ *    stickman throws now.
+ *  • Closing, another page operates: refused until MANUAL_TAKEOVER_MS past
+ *    the dice's deadline (that page is gone); then this page stamps itself
+ *    operator and finishes the turn from tickManualCraps once the stamp has
+ *    converged — never two settles from two shareholders' presses.
+ */
+export function pressManualRoll(tableId: string, now = Date.now()): string | null {
+  if (!readCrapsTableState(tableId)) openCrapsBetting(tableId, 1, null);
+  const s = readCrapsTableState(tableId);
+  if (!s) return null;
+  if (s.phase === 'betting') {
+    closeCrapsBetting(tableId, s, now, true);
+    return null;
+  }
+  if (s.phase !== 'closing') return null;
+  if (s.operator === PAGE_ID) {
+    tickCrapsClosing(tableId, s, undefined, Infinity);
+    tookOverAt.delete(tableId);
+    return null;
+  }
+  if (now < (s.phaseDeadline ?? now) + MANUAL_TAKEOVER_MS) {
+    return 'THE DICE ARE OUT — ANOTHER HOUSE MEMBER IS RUNNING THIS ROLL';
+  }
+  writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
+  tookOverAt.set(tableId, now);
+  return null;
 }
 
 /**

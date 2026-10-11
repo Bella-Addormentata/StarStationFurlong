@@ -43,7 +43,7 @@ import { CHIP_DENOMS, railChips } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
-  closeCrapsBetting, openCrapsBetting, STICKMAN_DICE_SPOT, tickCrapsClosing,
+  openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
 } from './crapsCroupier';
 import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
@@ -713,15 +713,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       capture?.setPointerCapture(e.pointerId);
       return;
     }
-    const rg = hitRegion(layout, hit.p);
     if (hitSettings(layout, hit.p)) {
       toggleCard();
       return;
     }
+    // A click on your own stack takes this round's chips back from the box
+    // that stack stands in (a tall stack can hide felt several boxes away);
+    // anywhere else in a box, the hand bets.
+    const stackAtPt = h.onMyStack(ray, hit.p);
+    const stackRg = stackAtPt ? hitRegion(layout, stackAtPt) : null;
+    if (stackRg && takeBack(stackRg)) return;
+    const rg = hitRegion(layout, hit.p);
     if (!rg) return;
-    // A click on your own stack takes this round's chips back; anywhere
-    // else in the box, the hand bets.
-    if (h.onMyStack(ray, hit.p) && takeBack(rg)) return;
     if (hand.length > 0) placeHand(rg);
     else say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
   };
@@ -888,14 +891,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     } else if (act === 'roll') {
       // Manual ROLL takes the same close as the robot: the dice go to a
       // seated shooter with a line bet first; a second press (or nobody to
-      // shoot) has the stickman throw.
-      // A table no robot has opened yet starts at round 1 here. A press
-      // while the dice are out settles the shooter's throw if it landed,
-      // else the stickman throws; either way this client finishes it.
-      if (!crapsState()) openCrapsBetting(itemId, 1, null);
-      const s = crapsState();
-      if (s?.phase === 'betting') closeCrapsBetting(itemId, s, Date.now(), true);
-      else if (s?.phase === 'closing') tickCrapsClosing(itemId, s, undefined, Infinity);
+      // shoot) has the stickman throw. See pressManualRoll for who may.
+      const notice = pressManualRoll(itemId);
+      if (notice) say(notice);
     } else if (act === 'spin') {
       if (phase() === 'betting' || phase() === 'closing') rollAndSettle(itemId, round());
     } else if (act === 'next') {

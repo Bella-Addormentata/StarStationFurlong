@@ -105,7 +105,7 @@ export interface CasinoTableVisualHandle {
   wheelRest(result: number | null): void;
   wheelSpinning(): boolean;
   /** Is `p` on one of the local player's own stacks on the felt? */
-  onMyStack(ray: THREE.Raycaster, p: FeltPoint): boolean;
+  onMyStack(ray: THREE.Raycaster, p: FeltPoint): FeltPoint | null;
   /** Back to an empty table: no chips, nothing lit, puck off, any throw or
    *  spin dropped — for a room rebind, so nothing carries over. */
   reset(): void;
@@ -1166,15 +1166,16 @@ class TableHandle implements CasinoTableVisualHandle {
     for (const p of this.pucks) p.set(point);
   }
 
-  /** Whether the click is on one of the viewer's own (undimmed) stacks: the
-   *  felt point under it, or the ray passing through a tall stack's column. */
-  onMyStack(ray: THREE.Raycaster, p: FeltPoint): boolean {
+  /** The viewer's own (undimmed) stack the click is on, as its felt spot:
+   *  the felt point under it, or the ray passing through a tall stack's
+   *  column. null when the click is on none of them. */
+  onMyStack(ray: THREE.Raycaster, p: FeltPoint): FeltPoint | null {
     const r = CHIP_RADIUS * 1.6;
     const g = this.group();
     if (g) g.updateMatrixWorld();
     const a = new THREE.Vector3();
     const b = new THREE.Vector3();
-    return this.feltStacks.some((s) => {
+    const hit = this.feltStacks.find((s) => {
       if (s.dim) return false;
       if (Math.hypot(s.x - p.x, s.z - p.z) <= r) return true;
       if (!g) return false;
@@ -1184,6 +1185,7 @@ class TableHandle implements CasinoTableVisualHandle {
       g.localToWorld(b);
       return ray.ray.distanceSqToSegment(a, b) <= CHIP_RADIUS * CHIP_RADIUS;
     });
+    return hit ? { x: hit.x, z: hit.z } : null;
   }
 
   reset(): void {
