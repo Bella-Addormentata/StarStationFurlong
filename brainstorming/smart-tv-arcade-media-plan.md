@@ -148,16 +148,28 @@ alone and never for the elapsed time of a page that stayed awake. The
 monotonic clock is no promise of its own
 across a sleep, though: High Resolution Time lets `performance.now()` run
 on through OS sleep, and on Windows it does, so a viewer waking after an
-hour would read its last sample an hour ahead and seek there. So the
+hour would read its last sample an hour ahead and seek there — or lets it
+stand still, as on macOS and Linux, so the same viewer would read the
+hour as one tick and never know it slept. So the
 anchor is worth nothing after a gap: the room tick marks the page awake,
-a gap in the marks longer than 2.5 s (a closed lid, a frozen tab, a
-throttled background page — `TV_SUSPEND_GAP_MS`) marks every sample from
+a gap in the marks longer than 2.5 s BY EITHER CLOCK (a closed lid, a
+frozen tab, a throttled background page — `TV_SUSPEND_GAP_MS`; the wall
+clock finds the gap the monotonic clock stood still through, at the cost
+that a forward wall-clock step wider than that between two ticks reads
+as a sleep too — stale for one wake window, bridged by the step — while
+a backward step is no gap) marks every sample from
 before it STALE, and a stale reading is shown but never acted on — no
 seek, no nudge — until a fresh sample lands after the wake window (a
 sample the network held through the sleep and delivers on waking is
 stamped from before the gap, as a lease is, and is stale with the rest;
 what the page wrote itself is received as it is written, whatever the
-marks say — a holder waking and beating is never stale to itself).
+marks say — a holder waking and beating is never stale to itself). A
+lease's LAPSE is measured the same way — the time really elapsed since
+this page saw the renewal, every gap since counted by the wall clock,
+a gap the first tick back has not marked yet included — so a holder
+that slept past the lapse reads its own hold as lapsed on waking
+whichever way its monotonic clock behaved, and picks the remote up again
+like anyone rather than renewing over a takeover it slept through.
 The first heartbeat the viewer can act on is at most
 `TV_WAKE_WINDOW_MS + TV_HEARTBEAT_MS` away — 4 s: a beat delivered inside
 the wake window is stamped from before the gap, so the first fresh one is
@@ -252,7 +264,19 @@ refused outright, no button offered (`tvConsent.ts` in #207), a screening
 of the host as written and nothing more. That is
 consent, not validation: a host the viewer accepted can redirect the request,
 or resolve, into the viewer's own network, and a browser `<video>` can see
-neither — the ask says so, and the node's media proxy (§3.4, TODO) is where
+neither — the ask says so. A consented URL is PROBED before the element is
+mounted (`probeRedirect`, #207): a CORS HEAD with `redirect: 'manual'`, no
+body read, eight seconds at most, counted against the set's mount budget
+and aborted when the programme moves on. An opaque-redirect answer refuses
+the mount; a direct answer — the host sends CORS headers: a 200, a 405 to
+the HEAD, a 404 — allows it; no answer at all (a host without CORS headers,
+one that is down, the deadline) allows nothing and is not kept, so a RETRY
+asks again. It FAILS CLOSED, which narrows the lane to CORS-clean hosts,
+and it checks one answer at one moment: the `<video>`'s own GET may be
+answered differently, and a name that RESOLVES into the viewer's network
+is not seen at all (a `no-cors` probe would learn nothing — the fetch
+standard makes `no-cors` with any redirect mode but `follow` a network
+error outright). The node's media proxy (§3.4, TODO) is where
 destinations are checked after DNS and on every redirect; until it lands, a
 direct URL is the viewer's own trust decision, per origin, per session. And
 an origin that needs no asking is still mounted under a BUDGET, since
@@ -309,7 +333,7 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
 | ▶️ YouTube | each viewer, from YouTube | iframe, IFrame API | full | Convenience, single vendor | allowed, labelled, greyed out when unreachable; `youtube-nocookie.com`; no other feature may require it; on the desktop shells gated on §3.5's error-153 check — until it passes, the tile may fail from `tauri://localhost`, which v1's theatre reports as a lane failure with RETRY (browsers are unaffected) |
 | 🏛️ archive.org | each viewer (direct `<video>`, or via the node proxy for a texture) | `<video>` / `VideoTexture`, or their embed | full (a chosen file) / start-time (their embed) | Convenience host, sovereign backup exists | later, not v1: the item's `licenseurl` shown and a marked-PD shelf (v1's resolver accepts any identifier and reads only the file list and the title); every fetch offered to the station library |
 | 📺 PeerTube | the instance named; a station can run its own | iframe, embed API (`play`/`pause`/`seek`) | full | Convenience, or player-run | behind `VITE_SSF_CONVENIENCE_LANES=1` in every case (§12): an instance is a server whoever runs it, and the default build plays serverless sources only; with the flag on, add it as the player-run answer to "YouTube-shaped" content |
-| 🔗 URL | the host named | `<video>` | full for finite, seekable media (a host with range support); start-only for a live stream or a host without usable ranges — the element's `seekable` decides, and the controller never seeks what cannot be sought | Convenience | whoever pastes it is responsible for it; each viewer's browser fetches it only after PLAY FROM <host> (§3.2), never from a host that names a private network as written — a screening of the literal host, the destination after DNS and redirects being the proxy's to check (§3.4) — and only within the mount budget (§3.2) |
+| 🔗 URL | the host named | `<video>` | full for finite, seekable media (a host with range support); start-only for a live stream or a host without usable ranges — the element's `seekable` decides, and the controller never seeks what cannot be sought | Convenience | whoever pastes it is responsible for it; each viewer's browser fetches it only after PLAY FROM <host> (§3.2), never from a host that names a private network as written — a screening of the literal host — and, for a consented host, only once a CORS HEAD probe that follows no redirect has answered directly (§3.2: it fails closed, so CORS-clean hosts only; the destination after DNS, and the GET's own answer, stay the proxy's to check, §3.4) — and only within the mount budget (§3.2) |
 | 📁 File (host's own) | host node → blob lane → viewers' nodes | `VideoTexture` from the local node | full | Pure P2P | private rooms, delete-on-leave cache |
 | 🧲 Magnet / `.torrent` | the host node from the public swarm, then the blob lane (§6) | `VideoTexture` from the local node | full | Public swarm for the fetch, pure P2P for the room | paste only, no search, no tracker list, seeding notice |
 | 🎤 Karaoke MP3+G | the singer's client (§5) | CD+G on the `CanvasTexture` + audio through Web Audio | full | Pure P2P | the host's own files; stream, don't copy |
