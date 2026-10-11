@@ -708,6 +708,11 @@ let pendingBootstrapOverride: RoomBootstrap | null = null;
  *  last-room resume or the default station (review of #156). */
 let urlSeedImport: Promise<void> | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
+/** 🥣 The room whose faucet replies are accepted right now: set at join, before
+ *  the connect, and cleared synchronously at the top of a leave, so a reply
+ *  still in flight when the room is left (a status poll answered during the
+ *  leave's flush) cannot repopulate the state clearFaucetRoom just dropped. */
+let faucetRepliesFor: string | null = null;
 /** 🆕 #79 P4: guards a single home-fallback if resuming the last room fails. */
 let resumeRetried = false;
 /** 🛰️ "Is this a first run" — snapshotted before anything can lazily mint the
@@ -1805,6 +1810,7 @@ async function joinRoomAtEpoch(
   // the right room; sequential re-joins overwrite correctly. The bootstrap
   // roomId, NOT the editable display name.
   (window as any).__ssfRoomId = boot.roomId;
+  faucetRepliesFor = boot.roomId;
   updateHUDNode("ONLINE", "#00e676");
   // Connect with a cert-refresh retry on the LOCAL loopback dial: the node's WT
   // cert regenerates every launch, so a stale hash fails the handshake — on
@@ -3231,7 +3237,10 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   clearChatBubbles();
   // 🥣 The faucet dish's last status, error and pending TAKE/GIVE belong to
   // this room's node session: forget them, so a revisit reads the chain
-  // afresh instead of showing stale balances or a stale TAKING… line.
+  // afresh instead of showing stale balances or a stale TAKING… line. The
+  // reply gate closes first (synchronously, before any await below), so a
+  // reply still in flight cannot put the state back once it is cleared.
+  faucetRepliesFor = null;
   {
     const leavingRoomId = activeBootstrap?.roomId ?? networkProvider.getBootRecord()?.roomId;
     if (leavingRoomId) clearFaucetRoom(leavingRoomId);
@@ -9906,6 +9915,9 @@ async function init() {
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
   networkProvider.onFaucetReply((env: { payload?: string; room?: string }) => {
     if (typeof env.payload !== "string" || typeof env.room !== "string") return;
+    // Only the room joined right now: a reply for a room already left (or
+    // never joined) is dropped, not filed.
+    if (env.room !== faucetRepliesFor) return;
     const reply = parseFaucetReply(env.payload);
     if (reply) setFaucetReply(env.room, reply);
   });
