@@ -201,6 +201,66 @@ export type EmulatorEvent =
   | { type: 'exit' }
   | { type: 'error'; why: string };
 
+/** What the frame may say, and how much. The frame is attacker-controlled
+ *  after a core exploit, so a message from it is input from an attacker:
+ *  matching the event's source says only WHO is posting. So one shape per
+ *  kind — known keys, a short string — and a budget of messages a second,
+ *  past which the frame comes down (`flood`): the page is not the frame's
+ *  to keep busy. What no handler can refuse is the structured clone the
+ *  browser performs BEFORE the handler runs: one oversized message costs
+ *  the page its clone once, and then the frame is gone (plan §9). */
+export const FRAME_MESSAGE_BUDGET = 20;
+export const FRAME_MESSAGE_WINDOW_MS = 1_000;
+export const FRAME_STRING_MAX = 256;
+
+export type FrameMessage =
+  | { type: 'arcade-frame-ready' }
+  | { type: 'arcade-ready' }
+  | { type: 'arcade-started' }
+  | { type: 'arcade-exit' }
+  | { type: 'arcade-error'; why: string };
+
+const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
+  'arcade-frame-ready': ['type'],
+  'arcade-ready': ['type'],
+  'arcade-started': ['type'],
+  'arcade-exit': ['type'],
+  'arcade-error': ['type', 'why'],
+};
+
+/** The frame's message as one of the shapes above, or null — an unknown
+ *  kind, a key the kind does not have, a `why` that is not a string or is
+ *  longer than FRAME_STRING_MAX: dropped unread. */
+export function frameMessage(data: unknown): FrameMessage | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const d = data as Record<string, unknown>;
+  const type = d.type;
+  if (typeof type !== 'string' || !Object.prototype.hasOwnProperty.call(FRAME_MESSAGE_KEYS, type)) return null;
+  const kind = type as FrameMessage['type'];
+  const keys = FRAME_MESSAGE_KEYS[kind];
+  for (const k of Object.keys(d)) if (!keys.includes(k)) return null;
+  if (kind === 'arcade-error') {
+    const why = d.why;
+    if (typeof why !== 'string' || why.length > FRAME_STRING_MAX) return null;
+    return { type: kind, why };
+  }
+  return { type: kind };
+}
+
+/** Messages a second from one frame, counted on every message it posts,
+ *  shape or no shape: a flood of garbage is a flood. */
+export class MessageBudget {
+  private readonly stamps: number[] = [];
+  constructor(private readonly limit = FRAME_MESSAGE_BUDGET, private readonly windowMs = FRAME_MESSAGE_WINDOW_MS) {}
+  /** True while the message fits the budget; false on the one that breaks it. */
+  take(now: number): boolean {
+    while (this.stamps.length && now - this.stamps[0]! >= this.windowMs) this.stamps.shift();
+    if (this.stamps.length >= this.limit) return false;
+    this.stamps.push(now);
+    return true;
+  }
+}
+
 export interface EmulatorHandle {
   /** The wall in the stage: this page's own document around the frame. */
   readonly wall: HTMLIFrameElement;
@@ -273,11 +333,23 @@ export function mountEmulatorFrame(
   // but to its own URL — and the config carries the game's bytes, which
   // were the frame's to have, and nothing of this page's.
   const target = '*';
+  // The frame's messages are input from an attacker (the header on
+  // FRAME_MESSAGE_BUDGET): counted before they are read, read into one
+  // shape or dropped, each state reported once.
+  const budget = new MessageBudget();
+  let flooded = false;
+  let readySeen = false;
+  let startedSeen = false;
   const onMessage = (e: MessageEvent) => {
-    if (!alive || !frame || e.source !== frame.contentWindow) return;
-    const d = e.data as { type?: unknown; why?: unknown } | null;
-    if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
-    switch (d.type) {
+    if (!alive || flooded || !frame || e.source !== frame.contentWindow) return;
+    if (!budget.take(performance.now())) {
+      flooded = true;
+      onEvent({ type: 'error', why: 'flood' });
+      return;
+    }
+    const m = frameMessage(e.data);
+    if (!m) return;
+    switch (m.type) {
       case 'arcade-frame-ready':
         if (configured) return;
         configured = true;
@@ -296,10 +368,10 @@ export function mountEmulatorFrame(
           timeoutMs: EMULATOR_LOAD_TIMEOUT_MS,
         }, target);
         break;
-      case 'arcade-ready': onEvent({ type: 'ready' }); break;
-      case 'arcade-started': onEvent({ type: 'started' }); break;
+      case 'arcade-ready': if (!readySeen) { readySeen = true; onEvent({ type: 'ready' }); } break;
+      case 'arcade-started': if (!startedSeen) { startedSeen = true; onEvent({ type: 'started' }); } break;
       case 'arcade-exit': onEvent({ type: 'exit' }); break;
-      case 'arcade-error': onEvent({ type: 'error', why: typeof d.why === 'string' ? d.why : 'unknown' }); break;
+      case 'arcade-error': onEvent({ type: 'error', why: m.why }); break;
       default: break;
     }
   };
@@ -418,6 +490,7 @@ export function emulatorErrorText(why: string, data: EmulatorData): { title: str
   if (why === 'frame') return { title: 'THE ARCADE FRAME DID NOT LOAD', hint: 'public/arcade/frame.html is missing from this build.' };
   if (why === 'barred') return { title: 'THE EMULATOR FRAME TRIED TO LEAVE THE CABINET', hint: 'The frame asked for another page. The cabinet\'s policy refused it before any request went out, and the frame was torn down. RETRY reloads it.' };
   if (why === 'navigated') return { title: 'THE EMULATOR FRAME LEFT THE CABINET', hint: 'The frame loaded a second document — its own page again, the only one the cabinet\'s policy allows — so it was torn down. RETRY reloads it.' };
+  if (why === 'flood') return { title: 'THE EMULATOR FRAME WOULD NOT STOP TALKING', hint: `The frame posted more than ${FRAME_MESSAGE_BUDGET} messages in a second, which no game needs, so it was torn down. RETRY reloads it.` };
   if (why === 'game') return { title: 'THE GAME DID NOT LOAD', hint: 'The link may be blocked by CORS, the file may not be for this core, or the romset name may not match.' };
   return { title: 'THE CABINET FAULTED', hint: why };
 }

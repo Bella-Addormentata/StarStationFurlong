@@ -7,8 +7,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameOrigins,
-  emulatorIsolated, emulatorWallPolicy, localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom,
-  romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
+  emulatorIsolated, emulatorWallPolicy, frameMessage, localRomExposureAllowed, localRomFor, MessageBudget, probeEmulatorData,
+  rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX, FRAME_MESSAGE_BUDGET,
+  FRAME_MESSAGE_WINDOW_MS, FRAME_STRING_MAX,
 } from './arcadeEmulator';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -26,6 +27,42 @@ const answering = (r: Response | Error, calls: string[] = []): typeof fetch =>
     if (r instanceof Error) throw r;
     return r;
   }) as unknown as typeof fetch;
+
+describe('what the frame may say, and how much — its messages are input from an attacker', () => {
+  it('reads one shape per kind — known keys, a short string — and drops the rest unread', () => {
+    expect(frameMessage({ type: 'arcade-frame-ready' })).toEqual({ type: 'arcade-frame-ready' });
+    expect(frameMessage({ type: 'arcade-started' })).toEqual({ type: 'arcade-started' });
+    expect(frameMessage({ type: 'arcade-error', why: 'loader' })).toEqual({ type: 'arcade-error', why: 'loader' });
+    expect(frameMessage({ type: 'arcade-error', why: 'x'.repeat(FRAME_STRING_MAX) })).not.toBeNull();
+    expect(frameMessage({ type: 'arcade-error', why: 'x'.repeat(FRAME_STRING_MAX + 1) })).toBeNull(); // a string past the cap
+    expect(frameMessage({ type: 'arcade-error' })).toBeNull(); // a `why` that is not a string
+    expect(frameMessage({ type: 'arcade-error', why: { huge: true } })).toBeNull();
+    expect(frameMessage({ type: 'arcade-ready', why: 'x' })).toBeNull(); // a key the kind does not have
+    expect(frameMessage({ type: 'arcade-ready', state: new ArrayBuffer(8) })).toBeNull();
+    expect(frameMessage({ type: 'arcade-config' })).toBeNull(); // the page's own kind, never the frame's
+    expect(frameMessage({ type: 'constructor' })).toBeNull(); // a prototype's key is no kind
+    expect(frameMessage({ type: 'toString' })).toBeNull();
+    expect(frameMessage({ type: 42 })).toBeNull();
+    expect(frameMessage(['arcade-ready'])).toBeNull();
+    expect(frameMessage('arcade-ready')).toBeNull();
+    expect(frameMessage(null)).toBeNull();
+  });
+
+  it('budgets the frame\'s messages a second, shape or no shape, and the one that breaks it is the last', () => {
+    const b = new MessageBudget();
+    for (let i = 0; i < FRAME_MESSAGE_BUDGET; i++) expect(b.take(1_000 + i)).toBe(true);
+    expect(b.take(1_000 + FRAME_MESSAGE_BUDGET)).toBe(false); // the twenty-first inside the second
+    expect(b.take(1_000 + FRAME_MESSAGE_WINDOW_MS)).toBe(true); // the window has moved on: the first is a second old
+    expect(b.take(1_000 + FRAME_MESSAGE_WINDOW_MS)).toBe(false); // one slot freed, one taken
+    const slow = new MessageBudget(2, 100);
+    expect(slow.take(0)).toBe(true);
+    expect(slow.take(50)).toBe(true);
+    expect(slow.take(99)).toBe(false);
+    expect(slow.take(100)).toBe(true);
+    expect(emulatorErrorText('flood', 'station').title).toContain('WOULD NOT STOP');
+    expect(emulatorErrorText('flood', 'station').hint).toContain(String(FRAME_MESSAGE_BUDGET));
+  });
+});
 
 describe('where the emulator files come from', () => {
   it('the station path sits under the base, the CDN is itself; each has its lane', () => {
