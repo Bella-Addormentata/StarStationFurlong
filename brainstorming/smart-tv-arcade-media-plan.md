@@ -924,14 +924,33 @@ the sender cannot exceed: the media cap below plus a few for control),
 so an authenticated peer that opens every stream it is allowed and
 sends nothing, or a byte at a time, holds those slots for a second and
 then none; the shared reliable readers,
-which carry `ysync` as well — a whole Yjs baseline is one frame, and a
-room snapshot may run to 1 000 000 bytes — keep their own kinds and get a
-GLOBAL ceiling of their own, the largest frame any kind may carry (that
-snapshot bound plus the envelope), enforced on the prefix the same way,
+which carry `ysync` as well — a whole Yjs baseline is one frame — keep
+their own kinds and get a GLOBAL ceiling of their own, the largest frame
+any kind may carry (the document bound below plus the envelope), enforced
+on the prefix the same way,
 since today `ssf-p2p-node/src/main.rs` allocates the declared length of a
 reliable frame as it stands (around lines 1499 and 2223), a fix the node
 owes with or without media — and never the 4 KiB class, which would
-reset a room's sync before its kind was read. A control-message budget
+reset a room's sync before its kind was read. That ceiling rests on a
+DOCUMENT bound the sender enforces, never on a number borrowed from
+elsewhere: today nothing bounds a room document — the room cache merely
+skips persisting a snapshot past 1 000 000 bytes (`roomCache.ts`), while
+`YjsSync` frames and accepts a baseline of any `u32` length — so a ceiling
+drawn from the cache's cutoff would reset the sync of every live room that
+had outgrown it. So the page bounds the document itself: its encoded
+state (`Y.encodeStateAsUpdate`, after Yjs's garbage collection of deleted
+content) is held under 1 000 000 bytes by refusing the local transaction
+that would carry it past — the room says ROOM FULL, and the owner
+compacts it, a fresh document from the current state with its history
+dropped, to write again — the same number the cache persists up to, so
+persistence and sync agree; a room found past the bound at load (one from
+before the rule) is synced read-only until compacted; and `YjsSync`
+refuses to emit a frame past the bound, so the reliable frame ceiling is
+that bound base64-expanded plus the envelope's fields — 1 400 000 bytes —
+and a frame past it is a protocol violation, never a large room. A
+chunked baseline (SyncStep2 in bounded pieces) was the alternative, not
+taken: it bounds the frame and never the document, and the document is
+what every reader must hold. A control-message budget
 per link in messages and bytes a second (the renewals its admitted
 subscribers owe plus a fifth, with a floor for a fresh link; that count
 times the ceiling) drops a message past it unverified and counted; and
