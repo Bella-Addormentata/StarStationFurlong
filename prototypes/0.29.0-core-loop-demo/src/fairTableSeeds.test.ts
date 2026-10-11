@@ -555,6 +555,22 @@ describe('a Fair roulette round', () => {
     }
   });
 
+  it("a bettor whose committed seed the close left out entirely is told LEFT OUT", async () => {
+    const t = freshTable();
+    const closing = rouletteToClosing(t);
+    // The operator drops Amy from the party set at the close.
+    const { [AMY]: _dropped, ...rest } = closing.commits!;
+    writeTableState(t, { ...closing, commits: rest });
+    forgetMissingTables(new Set());
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(await verifySettledRound('roulette', t, s, { pocket: s.result! }, AMY))
+      .toMatchObject({ kind: 'verified', mine: 'left-out' });
+  });
+
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);

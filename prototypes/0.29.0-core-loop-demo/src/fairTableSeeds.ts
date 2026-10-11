@@ -611,9 +611,11 @@ export async function verifySettledRound(
     return !!r?.seed && r.round === s.round && commitSeedSync(r.seed, bettorCtx(tableId, s, pid)) === frozen[pid];
   });
   let mine: 'in' | 'left-out' | 'replaced' | undefined;
-  if (me && me in frozen && authoredRounds.has(roundKey(tableId, s.round, s.houseCommit))) {
+  if (me && authoredRounds.has(roundKey(tableId, s.round, s.houseCommit))) {
     const i = bettors.indexOf(me);
-    mine = !authored.has(authoredKey(tableId, s, frozen[me])) ? 'replaced' : i >= 0 && t.seeds[i + 1] !== '' ? 'in' : 'left-out';
+    // A seed I committed that the close left out of the party set entirely
+    // is as much LEFT OUT as one forfeited after it.
+    mine = !(me in frozen) ? 'left-out' : !authored.has(authoredKey(tableId, s, frozen[me])) ? 'replaced' : i >= 0 && t.seeds[i + 1] !== '' ? 'in' : 'left-out';
   }
   // Who had chips down but added no seed: the frozen wager keys minus the
   // frozen commit keys — not the peer-writable `unseeded` list, which an
