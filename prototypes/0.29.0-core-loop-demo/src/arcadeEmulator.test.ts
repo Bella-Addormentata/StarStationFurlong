@@ -61,6 +61,10 @@ describe('what the frame may say, and how much — its messages are input from a
     expect(slow.take(100)).toBe(true);
     expect(emulatorErrorText('flood', 'station').title).toContain('WOULD NOT STOP');
     expect(emulatorErrorText('flood', 'station').hint).toContain(String(FRAME_MESSAGE_BUDGET));
+    // A message of no known shape brings the frame down at the first word
+    // (mountEmulatorFrame): its own notice, and RETRY waits out the same backoff.
+    expect(emulatorErrorText('malformed', 'station').title).toContain('OUT OF TURN');
+    expect(emulatorErrorText('malformed', 'station').hint).toContain('RETRY');
   });
 });
 

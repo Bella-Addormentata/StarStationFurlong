@@ -204,11 +204,15 @@ export type EmulatorEvent =
 /** What the frame may say, and how much. The frame is attacker-controlled
  *  after a core exploit, so a message from it is input from an attacker:
  *  matching the event's source says only WHO is posting. So one shape per
- *  kind — known keys, a short string — and a budget of messages a second,
- *  past which the frame comes down (`flood`): the page is not the frame's
- *  to keep busy. What no handler can refuse is the structured clone the
- *  browser performs BEFORE the handler runs: one oversized message costs
- *  the page its clone once, and then the frame is gone (plan §9). */
+ *  kind — known keys, a short string — and a message of any other shape
+ *  brings the frame down at the first word (`malformed`): no game sends
+ *  one, a frame that does is exploited or broken, and dropping it would
+ *  pay the clone below for every such message up to the budget; and a
+ *  budget of messages a second, past which the frame comes down
+ *  (`flood`): the page is not the frame's to keep busy. What no handler
+ *  can refuse is the structured clone the browser performs BEFORE the
+ *  handler runs: one oversized message costs the page its clone once, and
+ *  then the frame is gone (plan §9). */
 export const FRAME_MESSAGE_BUDGET = 20;
 export const FRAME_MESSAGE_WINDOW_MS = 1_000;
 export const FRAME_STRING_MAX = 256;
@@ -230,7 +234,8 @@ const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
 
 /** The frame's message as one of the shapes above, or null — an unknown
  *  kind, a key the kind does not have, a `why` that is not a string or is
- *  longer than FRAME_STRING_MAX: dropped unread. */
+ *  longer than FRAME_STRING_MAX, no object at all: read no further, and
+ *  the frame is torn down for it (mountEmulatorFrame, `malformed`). */
 export function frameMessage(data: unknown): FrameMessage | null {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
   const d = data as Record<string, unknown>;
@@ -335,20 +340,24 @@ export function mountEmulatorFrame(
   const target = '*';
   // The frame's messages are input from an attacker (the header on
   // FRAME_MESSAGE_BUDGET): counted before they are read, read into one
-  // shape or dropped, each state reported once.
+  // shape or the frame torn down, each state reported once.
   const budget = new MessageBudget();
-  let flooded = false;
+  let silenced = false;
   let readySeen = false;
   let startedSeen = false;
   const onMessage = (e: MessageEvent) => {
-    if (!alive || flooded || !frame || e.source !== frame.contentWindow) return;
+    if (!alive || silenced || !frame || e.source !== frame.contentWindow) return;
     if (!budget.take(performance.now())) {
-      flooded = true;
+      silenced = true;
       onEvent({ type: 'error', why: 'flood' });
       return;
     }
     const m = frameMessage(e.data);
-    if (!m) return;
+    if (!m) {
+      silenced = true;
+      onEvent({ type: 'error', why: 'malformed' });
+      return;
+    }
     switch (m.type) {
       case 'arcade-frame-ready':
         if (configured) return;
@@ -491,6 +500,7 @@ export function emulatorErrorText(why: string, data: EmulatorData): { title: str
   if (why === 'barred') return { title: 'THE EMULATOR FRAME TRIED TO LEAVE THE CABINET', hint: 'The frame asked for another page. The cabinet\'s policy refused it before any request went out, and the frame was torn down. RETRY reloads it.' };
   if (why === 'navigated') return { title: 'THE EMULATOR FRAME LEFT THE CABINET', hint: 'The frame loaded a second document — its own page again, the only one the cabinet\'s policy allows — so it was torn down. RETRY reloads it.' };
   if (why === 'flood') return { title: 'THE EMULATOR FRAME WOULD NOT STOP TALKING', hint: `The frame posted more than ${FRAME_MESSAGE_BUDGET} messages in a second, which no game needs, so it was torn down. RETRY reloads it.` };
+  if (why === 'malformed') return { title: 'THE EMULATOR FRAME SPOKE OUT OF TURN', hint: 'The frame posted a message the cabinet does not know, or one larger than any it takes, which no game needs, so it was torn down. RETRY reloads it.' };
   if (why === 'game') return { title: 'THE GAME DID NOT LOAD', hint: 'The link may be blocked by CORS, the file may not be for this core, or the romset name may not match.' };
   return { title: 'THE CABINET FAULTED', hint: why };
 }

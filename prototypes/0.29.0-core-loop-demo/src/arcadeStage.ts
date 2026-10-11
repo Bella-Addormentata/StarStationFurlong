@@ -65,9 +65,10 @@ interface Stage {
   mounted: string;
   phase: Phase;
   counted: boolean;
-  /** A frame torn down for flooding the page (arcadeEmulator's budget) is
-   *  not remounted before this moment, on RETRY or otherwise, and the wait
-   *  doubles each time until a game starts cleanly. */
+  /** A frame torn down for its messages (arcadeEmulator's budget or its
+   *  shapes: `flood`, `malformed`) is not remounted before this moment, on
+   *  RETRY or otherwise, and the wait doubles each time until a game
+   *  starts cleanly. */
   floodUntil: number;
   floodBackoffMs: number;
   timer: number;
@@ -212,7 +213,7 @@ function showNotice(t: Stage, title: string, hint: string, retry = false): void 
     ${retry ? '<button type="button" data-arcade-retry="1">RETRY</button>' : ''}`;
   t.notice.hidden = false;
   t.notice.querySelector<HTMLButtonElement>('[data-arcade-retry]')?.addEventListener('click', () => {
-    // A frame that flooded the page waits out its backoff before any
+    // A frame torn down for its messages waits out its backoff before any
     // remount: the player's press is the only way back in, and not yet.
     const wait = t.floodUntil - Date.now();
     if (wait > 0) {
@@ -224,7 +225,8 @@ function showNotice(t: Stage, title: string, hint: string, retry = false): void 
   });
 }
 
-/** The first wait after a flood; doubled on each flood until a clean start. */
+/** The first wait after a flood or a malformed message; doubled on each
+ *  until a clean start. */
 export const FLOOD_BACKOFF_MS = 5_000;
 export const FLOOD_BACKOFF_MAX_MS = 5 * 60_000;
 
@@ -434,7 +436,7 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
       t.frame?.focus();
     } else if (ev.type === 'exit') closeArcadeStage();
     else if (ev.type === 'error') {
-      if (ev.why === 'flood') {
+      if (ev.why === 'flood' || ev.why === 'malformed') {
         t.floodUntil = Date.now() + t.floodBackoffMs;
         t.floodBackoffMs = Math.min(t.floodBackoffMs * 2, FLOOD_BACKOFF_MAX_MS);
       }
