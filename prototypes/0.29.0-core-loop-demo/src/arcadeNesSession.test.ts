@@ -11,7 +11,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { ARCADE_GAMES, type ArcadeGame } from './arcadeLibrary';
-import { PAD_BIT, packArcadeTick, unpackArcadeTick } from './arcadeNet';
+import { PAD_BIT, PadLog, frameAdd, packArcadeTick, unpackArcadeTick, type ArcadeTick } from './arcadeNet';
+
+type FramesTick = Extract<ArcadeTick, { type: 'frames' }>;
 
 type SessionModule = typeof import('./arcadeNesSession');
 type GamesModule = typeof import('./games/gamesDoc');
@@ -286,6 +288,47 @@ describe('a shared game, played by two and watched by a third', () => {
     guest.join();
     await run(50);
     expect(guest.shared()).toMatchObject({ role: 'guest' });
+  }, 30_000);
+
+  it("player 2's quick tap on taking the stand again lands, though its first tick was lost", async () => {
+    const [a, b] = await room(['a', null], ['b', null]);
+    const host = await startGame(a, 0, 2);
+    host.setButtons(0);
+    const guest = link(b, 1, 2);
+    guest.join();
+    // B held, then let go: the last two pads of b's first turn.
+    await run(400, (i) => guest.setButtons(i < 12 ? PAD_BIT.B : 0));
+
+    // Every tick of b's that shows A down is lost on the way to the host.
+    lose = (sender, to, bytes) => {
+      const t = unpackArcadeTick(bytes);
+      return sender === b && to === a && t?.type === 'guest' && (t.cur & PAD_BIT.A) !== 0;
+    };
+    /** b takes the stand again and, `wait` updates later, taps A for two
+     *  frames: player 2's pad on each frame the host ran since, as its
+     *  ticks told the room. */
+    const retakeAndTap = async (wait: number): Promise<number[]> => {
+      guest.stop();
+      await run(50);
+      guest.join();
+      const from = a.mod.arcadeCopyInfo(ITEM)!.next;
+      await run(500, (i) => guest.setButtons(i >= wait && i < wait + 2 ? PAD_BIT.A : 0));
+      const log = new PadLog();
+      for (const t of ticksOf(a, 'frames')) log.addTick(unpackArcadeTick(t) as FramesTick);
+      const p2: number[] = [];
+      for (let f = from; log.has(f); f = frameAdd(f, 1)) p2.push(log.get(f) >> 8);
+      return p2;
+    };
+    // A moment at the stand first: its ticks meanwhile replay nothing from
+    // b's last turn (B)…
+    const later = await retakeAndTap(15);
+    // …and the tap at once: the first tick the host hears is the release.
+    const atOnce = await retakeAndTap(0);
+    for (const p2 of [later, atOnce]) {
+      expect(p2.length).toBeGreaterThan(25);
+      expect(p2).toContain(PAD_BIT.A);
+      expect(p2.filter((pad) => pad !== 0 && pad !== PAD_BIT.A)).toEqual([]);
+    }
   }, 30_000);
 
   it('a stale guest page cannot drive player 2', async () => {

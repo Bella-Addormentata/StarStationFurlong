@@ -284,12 +284,15 @@ export class PadLog {
  * Player 2's pad on the host, from the guest's ticks. Each distinct pad the
  * guest reports is held for at least one frame, so a quick tap still lands;
  * a tick that shows two changes since the last one also replays the pad
- * between them (`prev`).
+ * between them (`prev`). A guest counts its changes from none, with nothing
+ * held, each time it takes the seat, so this holds for its first tick too.
  */
 export class GuestPad {
   private queue: number[] = [];
   private applied = 0;
-  private seenChanges: number | null = null;
+  /** The guest's change count as of its last tick: 0 for a guest not heard
+   *  yet, null when unknown (it went quiet, so changes went unheard). */
+  private seenChanges: number | null = 0;
   private lastSeq: number | null = null;
 
   onTick(t: { cur: number; prev: number; changes: number; seq: number }): void {
@@ -314,8 +317,19 @@ export class GuestPad {
     return this.applied;
   }
 
-  /** The guest went quiet: let go of everything. */
+  /** A new guest (or the same one on a fresh match id): nothing held, and
+   *  its changes counted from none. */
   reset(): void {
+    this.queue = [];
+    this.applied = 0;
+    this.seenChanges = 0;
+    this.lastSeq = null;
+  }
+
+  /** The guest went quiet: let go of everything. Its next tick's pad counts
+   *  as it is, since the changes in between were never heard. */
+  lapse(): void {
+    if (this.lastSeq === null) return; // nothing heard since: still exact
     this.queue = [];
     this.applied = 0;
     this.seenChanges = null;

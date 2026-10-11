@@ -227,6 +227,40 @@ describe("the guest's pad on the host", () => {
     pad.reset();
     expect(pad.next()).toBe(0);
   });
+
+  it("replays a new guest's tap whose first tick was lost: its changes count from none", () => {
+    const pad = new GuestPad();
+    // A pressed (change 1), released (change 2): the guest's first tick lost.
+    pad.onTick({ cur: 0, prev: PAD_BIT.A, changes: 2, seq: 2 });
+    expect([pad.next(), pad.next()]).toEqual([PAD_BIT.A, 0]);
+    // The next guest (or the same one, back on the seat) counts from none
+    // again, its sequence wherever its own is.
+    pad.onTick({ cur: PAD_BIT.B, prev: 0, changes: 3, seq: 3 });
+    pad.reset();
+    expect(pad.next()).toBe(0);
+    pad.onTick({ cur: PAD_BIT.LEFT, prev: PAD_BIT.UP, changes: 2, seq: 1 });
+    expect([pad.next(), pad.next(), pad.next()]).toEqual([PAD_BIT.UP, PAD_BIT.LEFT, PAD_BIT.LEFT]);
+    // Standing there with nothing pressed changes nothing.
+    pad.reset();
+    pad.onTick({ cur: 0, prev: 0, changes: 0, seq: 40 });
+    expect(pad.next()).toBe(0);
+  });
+
+  it('after a silence, lets go, and takes the next pad as it is', () => {
+    const pad = new GuestPad();
+    pad.onTick({ cur: PAD_BIT.RIGHT, prev: 0, changes: 1, seq: 1 });
+    expect(pad.next()).toBe(PAD_BIT.RIGHT);
+    pad.lapse();
+    expect(pad.next()).toBe(0);
+    // What it changed meanwhile went unheard: no replay of `prev`.
+    pad.onTick({ cur: PAD_BIT.UP, prev: PAD_BIT.A, changes: 9, seq: 30 });
+    expect([pad.next(), pad.next()]).toEqual([PAD_BIT.UP, PAD_BIT.UP]);
+    // A guest not heard from yet still counts from none, however long it took.
+    const fresh = new GuestPad();
+    fresh.lapse();
+    fresh.onTick({ cur: 0, prev: PAD_BIT.B, changes: 2, seq: 7 });
+    expect([fresh.next(), fresh.next()]).toEqual([PAD_BIT.B, 0]);
+  });
 });
 
 describe('every copy runs the same game', () => {

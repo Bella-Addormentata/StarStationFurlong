@@ -180,6 +180,8 @@ interface Copy {
   hostChecks: Map<number, number>;
   myChecks: Map<number, number>;
   // Guest's outgoing pad
+  /** The seat token the counts below are for: a new seat starts them over. */
+  guestFor: number;
   guestCur: number;
   guestPrev: number;
   guestChanges: number;
@@ -276,7 +278,7 @@ function newCopy(
     log: new PadLog(), hostLane: null, lastFramesAt: 0, stalledSince: null, needSync: false,
     syncFrom: null, lastSyncAskAt: 0, restoring: false, triedSnapshot: null,
     hostChecks: new Map(), myChecks: new Map(),
-    guestCur: 0, guestPrev: 0, guestChanges: 0, guestSeq: 0, guestBeat: 0,
+    guestFor: 0, guestCur: 0, guestPrev: 0, guestChanges: 0, guestSeq: 0, guestBeat: 0,
   };
   s.copy = copy;
   s.shown = null;
@@ -507,9 +509,10 @@ export function arcadeFrame(dt: number, viewer: { x: number; z: number } | null)
   }
 }
 
-/** Host: keep the guest pad with whoever holds the seat now. A new holder's
- *  sequence starts over, so it starts from a clean pad, and gets a grace
- *  period for its first tick. */
+/** Host: keep the guest pad with whoever holds the seat now. A new holder
+ *  counts its changes from none (sendGuestPad) and numbers its ticks its own
+ *  way, so it starts from a clean pad, and gets a grace period for its first
+ *  tick. */
 function seatGuest(copy: Copy, m: ArcadeMatch, now: number): void {
   if (m.guestToken === copy.guestToken) return;
   copy.guestToken = m.guestToken;
@@ -538,7 +541,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     writeArcade(itemId, m);
     seatGuest(copy, m, now);
   }
-  if (now - copy.lastGuestAt > GUEST_SILENT_MS) copy.guestPad.reset();
+  if (now - copy.lastGuestAt > GUEST_SILENT_MS) copy.guestPad.lapse();
   const id = m.id;
   const sendFrames = (): void => {
     const runs = copy.runs.tick();
@@ -682,6 +685,15 @@ function tryRestore(itemId: string, copy: Copy): void {
 }
 
 function sendGuestPad(s: CabinetSession, copy: Copy, m: ArcadeMatch): void {
+  if (copy.guestFor !== m.guestToken) {
+    // Taken the seat (again): the host counts this seat's changes from none,
+    // with nothing held, so a tap whose first tick is lost still replays.
+    // The sequence runs on, so the host never mistakes a tick for an old one.
+    copy.guestFor = m.guestToken;
+    copy.guestCur = 0;
+    copy.guestPrev = 0;
+    copy.guestChanges = 0;
+  }
   const pad = s.link?.buttons ?? 0;
   let due = ++copy.guestBeat >= GUEST_HEARTBEAT;
   if (pad !== copy.guestCur) {
