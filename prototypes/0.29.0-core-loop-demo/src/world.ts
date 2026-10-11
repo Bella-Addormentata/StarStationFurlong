@@ -195,6 +195,8 @@ import type {
   DeviceTarget,
 } from "./devices";
 import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
+import { seatOf, standIndexFor } from "./games/checkersTable";
+import { createCheckersTableLayer, paintCheckersTable } from "./checkersSession";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -1671,9 +1673,7 @@ export class World {
     // the previous listener first, so rebuilds never stack duplicates.
     this.unsubscribeGameBoards?.();
     const repaintBoards = () => {
-      for (const [id, top] of this.gameTableTops) {
-        top.setBoard(readGame(id)?.board ?? null);
-      }
+      for (const [id, top] of this.gameTableTops) paintCheckersTable(top, id);
     };
     this.unsubscribeGameBoards = subscribeGames(repaintBoards);
     repaintBoards();
@@ -1713,7 +1713,7 @@ export class World {
         // degrades correctly — if the helper ever stops filing this kind,
         // the paint no-ops rather than driving a handle nothing tracks.
         const spawnedTop = sinks.gameTableTops.get(item.id);
-        if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+        if (spawnedTop) paintCheckersTable(spawnedTop, item.id);
         // 🏒 #115: hand the filed air-hockey handle to the session layer,
         // which drives it every frame (airHockeyFrame) and converts its LOCAL
         // coords to the world-space tick wire — read back from the sink for
@@ -5221,22 +5221,6 @@ export class World {
     };
   }
 
-  /**
-   * 🎰 #76: retarget a table's device focus to a free STANDING slot so the
-   * avatar walks up to an OPEN position (auto-bumping past taken ones) facing
-   * the table, then the game/betting UI opens — instead of everyone stacking on
-   * the single fixed device front. The reserved wheel-head is never auto-picked
-   * (it's the owner's croupier robot's spot); falls back to the device's own
-   * front when every open slot is occupied. Occupancy is inferred from remote
-   * avatar positions (Phase 1 — a synced claim map lands in a later slice).
-   */
-  private standTarget(device: DeviceTarget): DeviceTarget {
-    const stand = this.pickFreeStand(device.id);
-    return stand
-      ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
-      : device;
-  }
-
   /** Nearest open, REACHABLE (non-wheel-head) stand slot for the item, or null.
    *  "Taken" = a remote avatar within 0.7 m of the slot front. A slot must also
    *  be A*-reachable from the player — otherwise picking it would strand the
@@ -5248,6 +5232,26 @@ export class World {
     const slots = standsForItem(itemId).filter((s) => !s.role);
     if (slots.length === 0) return null;
     const others = this.getRemoteAvatarSnapshots();
+    const me = this.player.getPosition();
+    const reachable = this.standReachability();
+    const free = slots.filter(
+      (s) =>
+        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
+        reachable(s),
+    );
+    if (free.length === 0) return null;
+    free.sort(
+      (a, b) =>
+        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
+        Math.hypot(b.front.x - me.x, b.front.z - me.z),
+    );
+    return free[0];
+  }
+
+  /** "Can the player walk to this stand?" — A* from the player's cell (snapped
+   *  to solid ground first), or already standing at it. Shared by
+   *  pickFreeStand and the 🎲 #227 own-end pick at a checkers table. */
+  private standReachability(): (s: StandSlot) => boolean {
     const me = this.player.getPosition();
     let mr = worldToRow(me.z);
     let mc = worldToCol(me.x);
@@ -5268,21 +5272,9 @@ export class World {
         }
       }
     }
-    const reachable = (s: StandSlot) =>
+    return (s: StandSlot) =>
       Math.hypot(s.front.x - me.x, s.front.z - me.z) < 0.6 ||
       findPath(mr, mc, worldToRow(s.front.z), worldToCol(s.front.x)).length > 0;
-    const free = slots.filter(
-      (s) =>
-        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
-        reachable(s),
-    );
-    if (free.length === 0) return null;
-    free.sort(
-      (a, b) =>
-        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
-        Math.hypot(b.front.x - me.x, b.front.z - me.z),
-    );
-    return free[0];
   }
 
   /**
@@ -6080,15 +6072,53 @@ export class World {
     }
 
     if (device.kind === "gameTable") {
-      // #45 v1: flippable surface + doc-synced checkers. The flip is a UI
+      // #45 v1: flippable surface + doc-synced games. The flip is a UI
       // affordance (button), not focus choreography — no prepare hook; the
       // top handle simply rides along so FLIP can drive the tween.
+      // 🎰 #76: walk to an open STANDING position at the table, then the UI
+      // opens. 🎲 #227: a seated checkers player goes to their OWN end and
+      // looks from it (stand s0 = red at −z, s1 = black at +z) when it is
+      // open and can be walked to (pickFreeStand's rules); otherwise, and for
+      // everyone else, the nearest open end — the camera follows that end.
+      const game = readGame(deviceId);
+      const mine = game ? seatOf(game, getPlayerId()) : null;
+      const ownEnd = mine
+        ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${standIndexFor(mine)}`)
+        : undefined;
+      const ownEndFree =
+        !!ownEnd &&
+        !this.getRemoteAvatarSnapshots().some(
+          (a) => Math.hypot(a.x - ownEnd.front.x, a.z - ownEnd.front.z) < 0.7,
+        ) &&
+        this.standReachability()(ownEnd);
+      const stand = (ownEndFree ? ownEnd : null) ?? this.pickFreeStand(deviceId);
+      const farEnd = stand ? stand.id.endsWith(":s1") : false;
+      const top = this.gameTableTops.get(deviceId) ?? null;
       const ui = createGameTableUI({
         itemId: deviceId,
-        top: this.gameTableTops.get(deviceId) ?? null,
+        top,
+        // 🎲 #227: checkers is played on the 3D table itself. Taking a side
+        // from the other end walks the player round to their own end.
+        checkers: createCheckersTableLayer({
+          itemId: deviceId,
+          top,
+          end: farEnd ? 1 : 0,
+          onSeatTaken: () => deviceFocus.releaseThen(() => this.requestDeviceFocus(deviceId)),
+        }),
       });
-      // 🎰 #76: walk to an open STANDING position at the table, then the UI opens.
-      deviceFocus.beginFocus(this.player, this.standTarget(device), ui);
+      // The def bakes the −z eye; the +z end's is its point reflection
+      // through the board centre (air hockey's mirrored-end rule).
+      const eye = farEnd
+        ? new THREE.Vector3(
+            2 * device.anchor.x - device.eye.x,
+            device.eye.y,
+            2 * device.anchor.z - device.eye.z,
+          )
+        : device.eye;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : device;
+      deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 
@@ -6320,7 +6350,7 @@ export class World {
       // s0 is the cyan/a end (local −z), s1 the orange/b end (local +z) — the
       // template INDEX is the side, read from the `${itemId}:s${n}` slot id.
       // Every slot taken (or unreachable) falls back to the a end, matching
-      // standTarget's fallback-to-device-front behavior.
+      // the other tables' fall back to the device front.
       const stand = this.pickFreeStand(deviceId);
       const standIdx = stand
         ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
