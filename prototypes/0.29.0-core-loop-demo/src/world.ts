@@ -3181,6 +3181,11 @@ export class World {
     }
   }
 
+  /** ⛓️🥣 A faucet dish stands in this room (main.ts polls its status then). */
+  public hasFaucetDish(): boolean {
+    return this.faucetDishes.size > 0;
+  }
+
   /**
    * Despawn ONE furniture item's visuals and deregister every per-item
    * handle — the exact inverse of the per-item registration that both
@@ -3202,11 +3207,6 @@ export class World {
    * driving freed handles: the 1 Hz screen redraw, the per-frame lid ease
    * and the holo-ring spin all iterate those collections.
    */
-  /** ⛓️🥣 A faucet dish stands in this room (main.ts polls its status then). */
-  public hasFaucetDish(): boolean {
-    return this.faucetDishes.size > 0;
-  }
-
   public removeFurnitureVisuals(itemId: string): boolean {
     const group = this.furnitureGroups.get(itemId);
     if (!group) return false;

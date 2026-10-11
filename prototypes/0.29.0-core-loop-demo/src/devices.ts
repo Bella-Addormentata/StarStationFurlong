@@ -492,14 +492,8 @@ export interface AlligatorsVisualHandle {
   update(dt: number): void;
 }
 
-// ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
+// ── ⛓️🥣 Faucet dish handle (shared with the furniture builder) ──────────────
 
-/**
- * Handle onto a storage trunk's animated lid. The builder (furniture.ts)
- * stows it in the lid slab's userData.trunkLid; World collects it, drives
- * update(dt) every frame (door-slide idiom), and wires openLid/closeLid into
- * the focus choreography via DeviceTarget.prepare/onRelease.
- */
 /**
  * ⛓️🥣 The faucet dish fixture's live state. World pushes it at ~1 Hz from the
  * last status the node sent for the room (faucetDish.ts): the jar's fill
@@ -510,6 +504,14 @@ export interface FaucetDishHandle {
   setState(level: number, ready: number, pending: boolean): void;
 }
 
+// ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
+
+/**
+ * Handle onto a storage trunk's animated lid. The builder (furniture.ts)
+ * stows it in the lid slab's userData.trunkLid; World collects it, drives
+ * update(dt) every frame (door-slide idiom), and wires openLid/closeLid into
+ * the focus choreography via DeviceTarget.prepare/onRelease.
+ */
 export interface TrunkLidHandle {
   /** Swing the lid open (~100° back). onComplete fires exactly once on arrival. */
   openLid(onComplete?: () => void): void;
@@ -4726,7 +4728,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <div style="height:8px; border:1px solid rgba(212,168,75,0.35); border-radius:4px; overflow:hidden; margin-bottom:6px;">
           <div style="height:100%; width:${Math.round(level * 100)}%; background:${CH_GOLD};"></div>
         </div>
-        ${st ? row('IN THE JAR', formatMojos(st.totalMojos)) : ''}
+        ${st ? row('IN THE JAR', st.partial ? `${formatMojos(st.totalMojos)}+ (listing cut short; the jar holds more)` : formatMojos(st.totalMojos)) : ''}
         ${st ? row('GIFT SLOTS (COINS)', st.partial ? `${st.coins}+ (listing cut short; the jar holds more)` : String(st.coins)) : ''}
         ${st ? row('EACH GIFT', `${formatMojos(st.gift)} · one per coin every ${st.gap} blocks`) : ''}
         ${st ? row('CHAIN HEIGHT', String(st.peak)) : row('CHAIN', 'reading…')}

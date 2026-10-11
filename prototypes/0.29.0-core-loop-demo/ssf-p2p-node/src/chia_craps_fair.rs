@@ -33,6 +33,7 @@ use chia_protocol::{Bytes, Bytes32, Coin};
 use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
 use sha2::{Digest, Sha256};
 
+use crate::chia_faucet::{unspent_at, MAX_FAUCET_PAGES};
 use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, push_parked, WALLET_LEASE};
 use crate::chia_resolve::{extract_ciphertext, fetch_coin_spend};
 
@@ -115,29 +116,25 @@ async fn push_fair_record(
 /// simply returning the first coin that differs from it) is safe when the wallet
 /// has multiple coins: a larger coin could be returned before `spent`'s spend
 /// confirms, violating the commit→reveal ordering assumption. ~200 s bound.
+///
+/// The listing is PAGED like every other wallet listing (#245 review, round 15):
+/// `spent` was selected across up to [`MAX_FAUCET_PAGES`] gateway pages, so the
+/// first page alone could simply not hold it while it still sits unspent on a
+/// later one, and the reveal would go out before the commit confirmed. A
+/// listing cut short that does not show `spent` proves nothing either way
+/// ([`confirmed_gone`]): the wait goes on.
 async fn wait_for_next_coin(
     client: &CoinsetClient,
     our_ph: Bytes32,
     spent: &Coin,
 ) -> Result<Coin> {
+    let mut cut_short = false;
     for attempt in 0..40u32 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let resp = client
-            .get_coin_records_by_puzzle_hash(our_ph, None, None, Some(false), None)
-            .await
-            .map_err(|e| anyhow!("coinset get_coin_records_by_puzzle_hash failed: {e}"))?;
-        if !resp.success {
-            return Err(anyhow!("coin lookup unsuccessful: {:?}", resp.error));
-        }
-        let unspent: Vec<Coin> = resp
-            .coin_records
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| !r.spent)
-            .map(|r| r.coin)
-            .collect();
-        // Only proceed once `spent` is confirmed gone from the unspent set.
-        if !unspent.iter().any(|c| c == spent) {
+        let listing = unspent_at(client, our_ph).await?;
+        cut_short = listing.partial;
+        let unspent: Vec<Coin> = listing.coins.into_iter().map(|c| c.coin).collect();
+        if confirmed_gone(!listing.partial, &unspent, spent) {
             if let Some(next) = unspent.into_iter().max_by_key(|c| c.amount) {
                 return Ok(next);
             }
@@ -146,9 +143,22 @@ async fn wait_for_next_coin(
             println!("   …waiting for block confirmation ({}s)", (attempt + 1) * 5);
         }
     }
+    if cut_short {
+        return Err(anyhow!(
+            "timed out (~200 s): the wallet listing is cut short at {MAX_FAUCET_PAGES} pages, so whether the spend confirmed cannot be read"
+        ));
+    }
     Err(anyhow!(
         "timed out (~200 s) waiting for the spend to confirm — testnet slow or unfunded"
     ))
+}
+
+/// Whether a wallet listing proves `spent` gone from the unspent set: absent
+/// from a COMPLETE listing. Absent from one cut short, it may sit on a page the
+/// listing never reached, so that is unknown, not confirmed (#245 review,
+/// round 15).
+fn confirmed_gone(listing_complete: bool, unspent: &[Coin], spent: &Coin) -> bool {
+    listing_complete && !unspent.iter().any(|c| c == spent)
 }
 
 /// Resolve every PUBLIC fairness record published under (table, round): the raw
@@ -319,6 +329,22 @@ mod tests {
             counts[(a + b) as usize] += 1;
         }
         assert!(counts[7] > counts[2] && counts[7] > counts[12]);
+    }
+
+    #[test]
+    fn a_coin_missing_from_a_listing_cut_short_is_not_confirmed_gone() {
+        let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), Bytes32::new([0u8; 32]), amount);
+        let spent = coin(1, 500);
+        let others = vec![coin(2, 700), coin(3, 100)];
+        // Still listed: not gone, whatever the listing's completeness.
+        assert!(!confirmed_gone(true, &[spent.clone(), others[0].clone()], &spent));
+        assert!(!confirmed_gone(false, &[spent.clone()], &spent));
+        // Absent from a COMPLETE listing: confirmed gone.
+        assert!(confirmed_gone(true, &others, &spent));
+        // Absent from a listing cut short: it may sit on a page never reached —
+        // unknown, and the reveal must wait (#245 review, round 15).
+        assert!(!confirmed_gone(false, &others, &spent));
+        assert!(!confirmed_gone(false, &[], &spent));
     }
 
     #[test]
