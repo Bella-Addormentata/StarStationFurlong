@@ -52,12 +52,6 @@ pub fn our_puzzle_hash(chia_sk: &SecretKey) -> Bytes32 {
 /// not asked about. Testnet11 confirms in about a block (18.75 s).
 pub const RECONCILE_GRACE: Duration = Duration::from_secs(20);
 
-/// The one place wall time decides anything: a parked coin the gateway could
-/// NOT settle (its lookups failing, or a gateway without the mempool endpoint)
-/// is released after this long rather than parking the wallet for good. A spend
-/// still unconfirmed after an hour has left the mempool.
-pub const PENDING_FALLBACK_TTL: Duration = Duration::from_secs(3600);
-
 /// Pages of `get_coin_records_by_names` a reconciliation follows (one HTTPS
 /// call each). Parked coins number a handful; a listing still cut short after
 /// this many pages is treated as INCOMPLETE and settles nothing it left out.
@@ -153,15 +147,14 @@ impl WalletLease {
 
     /// A coin some pushed spend consumed, as far as the chain and the mempool
     /// have told us (see [`WalletLease::reconcile`]): skip it when selecting.
+    /// Only a verdict clears it, never the clock (#245 review, round 10): a
+    /// zero-fee spend can wait in the mempool for hours, so an eviction on
+    /// elapsed time would free a coin whose spend is still live — the very
+    /// double-spend, or second gift, the lease exists to prevent. A gateway
+    /// that cannot be asked keeps the coin parked, fail closed; a gateway that
+    /// is down can take no spend either, so nothing is lost meanwhile.
     pub fn is_pending(&self, coin_id: &Bytes32) -> bool {
-        self.is_pending_at(coin_id, Instant::now())
-    }
-
-    pub fn is_pending_at(&self, coin_id: &Bytes32, now: Instant) -> bool {
-        let mut pending = self.pending.lock().unwrap();
-        // The fallback only: an entry the gateway never settled (see above).
-        pending.retain(|_, at| now.duration_since(*at) < PENDING_FALLBACK_TTL);
-        pending.contains_key(coin_id)
+        self.pending.lock().unwrap().contains_key(coin_id)
     }
 
     /// Record the faucet coin a claim just spent: the gift INTO our wallet is
@@ -173,13 +166,9 @@ impl WalletLease {
     /// A gift to our wallet is still landing: the wallet is not empty even
     /// though the chain does not list the coin yet.
     pub fn incoming_pending(&self) -> bool {
-        self.incoming_pending_at(Instant::now())
-    }
-
-    pub fn incoming_pending_at(&self, now: Instant) -> bool {
         let coin = *self.incoming.lock().unwrap();
         match coin {
-            Some(id) if self.is_pending_at(&id, now) => true,
+            Some(id) if self.is_pending(&id) => true,
             Some(_) => {
                 *self.incoming.lock().unwrap() = None;
                 false
@@ -218,8 +207,9 @@ impl WalletLease {
 
     /// Settle the parked coins against the chain and the mempool: ask the
     /// gateway about every coin past the grace, then release what [`settle`]
-    /// says. Lookups that fail leave their coins parked (the fallback TTL
-    /// bounds that); nothing here is decided by the clock. Callers hold the
+    /// says. Lookups that fail leave their coins parked, FAIL CLOSED: a coin
+    /// stays parked until the gateway gives an authoritative answer, however
+    /// long that takes; nothing here is decided by the clock. Callers hold the
     /// lease gate (every writer does; the dish's status read takes it for
     /// this), and `release` is compare-and-release besides, so a verdict can
     /// never remove a marker parked after it was formed.
@@ -650,21 +640,18 @@ mod tests {
         let a = Bytes32::new([1u8; 32]);
         let b = Bytes32::new([2u8; 32]);
         let t0 = Instant::now();
-        assert!(!lease.is_pending_at(&a, t0));
+        assert!(!lease.is_pending(&a));
         lease.mark_spent_at([a], t0);
-        assert!(lease.is_pending_at(&a, t0 + Duration::from_secs(1)));
-        assert!(!lease.is_pending_at(&b, t0 + Duration::from_secs(1)));
-        // No timer releases it: three minutes, thirty, fifty-nine, still parked…
-        assert!(lease.is_pending_at(&a, t0 + Duration::from_secs(180)));
-        assert!(lease.is_pending_at(&a, t0 + PENDING_FALLBACK_TTL - Duration::from_secs(1)));
-        // …only the chain/mempool verdict does (release), or the hour-long
-        // fallback for a coin the gateway never settled.
+        assert!(lease.is_pending(&a));
+        assert!(!lease.is_pending(&b));
+        // No timer releases it, however long the spend waits in the mempool:
+        // only the chain/mempool verdict does (release).
         assert!(lease.due_at(t0 + Duration::from_secs(5)).is_empty(), "inside the grace: not asked yet");
         assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![(a, t0)]);
         lease.release(&[(a, t0)]);
-        assert!(!lease.is_pending_at(&a, t0 + Duration::from_secs(1)));
+        assert!(!lease.is_pending(&a));
         lease.mark_spent_at([b], t0);
-        assert!(!lease.is_pending_at(&b, t0 + PENDING_FALLBACK_TTL));
+        assert!(lease.is_pending(&b), "no eviction on elapsed time: parked until a verdict");
     }
 
     #[test]
@@ -680,10 +667,10 @@ mod tests {
         lease.mark_spent_at([a], t1);
         // The stale verdict lands: the fresh marker stays.
         lease.release(&verdict);
-        assert!(lease.is_pending_at(&a, t1 + Duration::from_secs(1)));
+        assert!(lease.is_pending(&a));
         // The verdict formed for the new parking does release it.
         lease.release(&lease.due_at(t1 + RECONCILE_GRACE));
-        assert!(!lease.is_pending_at(&a, t1 + Duration::from_secs(1)));
+        assert!(!lease.is_pending(&a));
     }
 
     #[test]
@@ -694,20 +681,20 @@ mod tests {
         let t0 = Instant::now();
         // Parked the moment the writer commits to the spend, before any push.
         let parking = lease.park_at([a, b], t0);
-        assert!(lease.is_pending_at(&a, t0) && lease.is_pending_at(&b, t0));
+        assert!(lease.is_pending(&a) && lease.is_pending(&b));
         // A transport error leaves the parking alone (push_parked calls nothing):
         // both coins stay parked and come due for reconciliation after the grace.
         assert_eq!(lease.due_at(t0 + RECONCILE_GRACE).len(), 2);
         // An explicit rejection hands exactly this parking back.
         lease.unpark(&parking);
-        assert!(!lease.is_pending_at(&a, t0) && !lease.is_pending_at(&b, t0));
+        assert!(!lease.is_pending(&a) && !lease.is_pending(&b));
         // …but never a NEWER parking of the same coin: a later writer's spend of
         // a coin the gateway rejected the first time keeps its marker.
         let first = lease.park_at([a], t0);
         lease.unpark(&first);
         let _second = lease.park_at([a], t0 + Duration::from_secs(1));
         lease.unpark(&first); // stale: the first spend's rejection, arriving late
-        assert!(lease.is_pending_at(&a, t0 + Duration::from_secs(2)));
+        assert!(lease.is_pending(&a));
     }
 
     #[test]
@@ -737,16 +724,15 @@ mod tests {
         let lease = WalletLease::new();
         let faucet_coin = Bytes32::new([9u8; 32]);
         let t0 = Instant::now();
-        assert!(!lease.incoming_pending_at(t0));
+        assert!(!lease.incoming_pending());
         lease.mark_spent_at([faucet_coin], t0);
         lease.mark_incoming(faucet_coin);
-        // A second TAKE a moment, or an hour less a second, later sees it landing…
-        assert!(lease.incoming_pending_at(t0 + Duration::from_secs(1)));
-        assert!(lease.incoming_pending_at(t0 + PENDING_FALLBACK_TTL - Duration::from_secs(1)));
+        // A second TAKE sees it landing, however long the claim waits…
+        assert!(lease.incoming_pending());
         // …until the chain or the mempool settles the claim (confirmed: the gift
         // is in the wallet; dropped: the wallet is still empty and may ask again).
         lease.release(&[(faucet_coin, t0)]);
-        assert!(!lease.incoming_pending_at(t0 + Duration::from_secs(2)));
+        assert!(!lease.incoming_pending());
     }
 
     #[test]
