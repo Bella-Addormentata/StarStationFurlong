@@ -5398,7 +5398,7 @@ export function createSlotMachineUI(
     if (fingerprint === renderedPaytable && house === renderedPaytableForHouse) return;
     renderedPaytable = fingerprint;
     renderedPaytableForHouse = house;
-    rows.replaceChildren(...paytable.slice(0, 10).map((entry, index) => {
+    rows.replaceChildren(...paytable.map((entry, index) => {
       const row = document.createElement('div');
       row.style.cssText =
         'display:flex;align-items:center;justify-content:space-between;gap:4px;min-height:20px;';
