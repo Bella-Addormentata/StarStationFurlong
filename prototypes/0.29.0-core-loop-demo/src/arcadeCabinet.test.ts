@@ -19,6 +19,7 @@ import {
   type ArcadeView,
 } from './arcadeCabinet';
 import { ARCADE_GAMES } from './arcadeLibrary';
+import { ArcadeMachine } from './arcadeMachine';
 import { BLACK_LIFT, CREDIT_PAGES, writeFrameRgba, type ArcadeScreenPainter } from './arcadeScreen';
 import type { ArcadeCabinetVisualHandle } from './devices';
 import { FURNITURE_DEFS, buildItemGroup } from './furniture';
@@ -411,6 +412,7 @@ describe('gamepads at the cabinet', () => {
     return {
       pad: pad as unknown as Gamepad,
       press: (...indices: number[]) => indices.forEach((i) => (buttons[i].pressed = true)),
+      release: (...indices: number[]) => indices.forEach((i) => (buttons[i].pressed = false)),
       releaseAll: () => {
         buttons.forEach((b) => (b.pressed = false));
         pad.axes = [0, 0];
@@ -465,6 +467,35 @@ describe('gamepads at the cabinet', () => {
     expect(painter.drawMenu.mock.calls.length).toBe(menuDraws);
     for (let i = 0; i < 35; i++) ui.update(1 / 60);
     expect(painter.drawMenu.mock.calls.length).toBeGreaterThan(menuDraws);
+    ui.unmount();
+  });
+
+  it('a button lets go only when the last key or pad holding it does', async () => {
+    const { ui, pads } = setupWithPads(1);
+    win.dispatchEvent(key('keydown', 'Enter'));
+    await flush();
+    ui.update(1 / 60);
+    const release = vi.spyOn(ArcadeMachine.prototype, 'release');
+    const releasedA = () => release.mock.calls.filter(([player, button]) => player === 1 && button === 'A').length;
+
+    // X and K are both A: letting go of one keeps A held.
+    win.dispatchEvent(key('keydown', 'KeyX'));
+    win.dispatchEvent(key('keydown', 'KeyK'));
+    win.dispatchEvent(key('keyup', 'KeyX'));
+    expect(releasedA()).toBe(0);
+    // The pad's A holds it too.
+    pads[0].press(1);
+    ui.update(1 / 60);
+    win.dispatchEvent(key('keyup', 'KeyK'));
+    expect(releasedA()).toBe(0);
+    // Ctrl+X was the browser's: its key-up lets go of nothing.
+    win.dispatchEvent(key('keydown', 'KeyX', { mod: 'ctrlKey' }));
+    win.dispatchEvent(key('keyup', 'KeyX'));
+    expect(releasedA()).toBe(0);
+    // The last one lets go.
+    pads[0].release(1);
+    ui.update(1 / 60);
+    expect(releasedA()).toBe(1);
     ui.unmount();
   });
 
