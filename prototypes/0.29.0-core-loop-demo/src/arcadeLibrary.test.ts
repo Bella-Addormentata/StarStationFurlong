@@ -27,7 +27,9 @@ describe('arcade library', () => {
 
   it.each(ARCADE_GAMES.map((g) => [g.id, g] as const))('%s ships its ROM, license and source', (_id, game) => {
     expect(existsSync(publicFile(game.romUrl)), game.romUrl).toBe(true);
-    if (game.licenseUrl.startsWith('/')) expect(existsSync(publicFile(game.licenseUrl)), game.licenseUrl).toBe(true);
+    // The license text travels with the app too, so the credits hold offline.
+    expect(game.licenseUrl).toMatch(/^\/arcade\/licenses\//);
+    expect(existsSync(publicFile(game.licenseUrl)), game.licenseUrl).toBe(true);
     // Copyleft: the corresponding source travels with the binary.
     if (game.license.startsWith('GPL')) {
       expect(game.bundledSource, 'a GPL game must bundle its source').toBeTruthy();

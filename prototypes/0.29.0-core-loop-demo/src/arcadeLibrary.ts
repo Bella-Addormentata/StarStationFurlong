@@ -76,7 +76,7 @@ export const ARCADE_GAMES: readonly ArcadeGame[] = [
     romUrl: '/arcade/roms/nesert-golfing.nes',
     sourceUrl: 'https://github.com/bbbradsmith/NESertGolfing',
     sourceCommit: '1947a966403a9b0d05641a316df7d7bb209429e6',
-    licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
+    licenseUrl: '/arcade/licenses/CC-BY-4.0.txt',
     blurb: 'One endless desert course. One stroke at a time.',
     controls: 'SEE HELP ON THE TITLE SCREEN',
   },

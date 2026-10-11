@@ -28,7 +28,8 @@ npm.
   [`source/`](source/) (a `git archive` of the commit above), so the source
   travels with every copy of the app.
 - **zlib** (robotfindskitten): [`licenses/zlib-robotfindskitten.txt`](licenses/zlib-robotfindskitten.txt).
-- **CC BY 4.0** (NESert Golfing): <https://creativecommons.org/licenses/by/4.0/>.
+- **CC BY 4.0** (NESert Golfing): [`licenses/CC-BY-4.0.txt`](licenses/CC-BY-4.0.txt)
+  (also at <https://creativecommons.org/licenses/by/4.0/>).
   NESert Golfing by Brad Smith (<https://rainwarrior.itch.io/nesert-golfing>),
   built without changes from the source linked above.
 
