@@ -32,7 +32,7 @@ import * as THREE from 'three';
 import {
   casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
-  readDiceThrow, readMyBets, readMyCrapsBets, readSeats, readTableState,
+  readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
   writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat,
 } from './casinoDoc';
@@ -43,7 +43,8 @@ import { CHIP_DENOMS, railChips } from './chipDisplay';
 import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
-  openCrapsBetting, STICKMAN_DICE_SPOT, stickmanThrows,
+  closeCrapsBetting, openCrapsBetting, sampleSeats, STICKMAN_DICE_SPOT, stickmanThrows,
+  tickCrapsClosing,
 } from './crapsCroupier';
 import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
@@ -297,7 +298,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
   if (!animating) {
     h.setPuck(s.point);
     if (s.phase !== 'settled' && !localHold.has(id)) {
-      const shooterSeat = s.shooter !== undefined ? readSeats(id)[s.shooter] : undefined;
+      const shooterSeat = s.shooter !== undefined ? readSeat(id, s.shooter) : null;
       const stand = shooterSeat ? standLocal(kind, shooterSeat.stand) : null;
       h.diceRestAt(stand ? diceSpotFor(stand, CRAPS_LAYOUT.felt) : STICKMAN_DICE_SPOT);
     }
@@ -875,8 +876,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     } else if (act === 'backend') {
       writeCrapsBackendPref(itemId, readCrapsBackendPref(itemId) === 'chia' ? 'local' : 'chia');
     } else if (act === 'roll') {
+      // Manual ROLL takes the same close as the robot: the dice go to a
+      // seated shooter with a line bet first; a second press (or nobody to
+      // shoot) has the stickman throw.
       const s = crapsState();
-      if (s && (s.phase === 'betting' || s.phase === 'closing')) stickmanThrows(itemId, s);
+      if (s?.phase === 'betting') closeCrapsBetting(itemId, s);
+      else if (s?.phase === 'closing') stickmanThrows(itemId, s);
     } else if (act === 'spin') {
       if (phase() === 'betting' || phase() === 'closing') rollAndSettle(itemId, round());
     } else if (act === 'next') {
@@ -989,6 +994,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     },
     update(): void {
       syncEpoch();
+      // A manual table (no robot): the house's page runs the shooter's turn —
+      // watching seats, settling the shooter's throw, timing them out.
+      if (game === 'craps' && deps.isHouse() && !isCroupierLive(itemId)) {
+        sampleSeats(itemId);
+        const s = crapsState();
+        if (s?.phase === 'closing') tickCrapsClosing(itemId, s);
+      }
       // Holding over one stack keeps picking chips off it, a little faster each time.
       if (pickup && performance.now() >= pickup.nextAt) {
         takeFromStack(pickup.stack);

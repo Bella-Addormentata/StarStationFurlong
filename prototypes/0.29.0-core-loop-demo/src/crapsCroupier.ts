@@ -27,6 +27,7 @@
  */
 
 import { canRunCroupier } from './croupier';
+import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
   clearTableKeys,
@@ -159,7 +160,13 @@ export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[]
     if (!prev) seatSeen.set(key, { at: seat.at, seenAt: now, moved: false });
     else if (prev.at !== seat.at) seatSeen.set(key, { at: seat.at, seenAt: now, moved: true });
     const seen = seatSeen.get(key)!;
-    if (seen.moved && now - seen.seenAt < SEAT_STALE_MS) out.push({ pid, angle: seat.angle });
+    // The seat is peer-written: only a real player stand counts, and its
+    // place in the ring comes from the table's layout, not the stored angle.
+    const t = FURNITURE_DEFS['craps-table'].stands?.[seat.stand];
+    if (!t || t.role) continue;
+    if (seen.moved && now - seen.seenAt < SEAT_STALE_MS) {
+      out.push({ pid, angle: Math.atan2(t.stand.z, t.stand.x) });
+    }
   }
   return out;
 }
@@ -205,6 +212,46 @@ function hasLiveBets(tableId: string): boolean {
   return Object.keys(readAllCrapsBets(tableId)).length > 0;
 }
 
+/** When the operator last sampled each table's seats. */
+const seatSampledAt = new Map<string, number>();
+
+/** Watch the seats' heartbeats all window long (once a second: each look
+ *  scans the room doc), so the shooter pick at the close judges them on what
+ *  this client actually saw move. */
+export function sampleSeats(tableId: string, now = Date.now()): void {
+  if (now - (seatSampledAt.get(tableId) ?? 0) < 1000) return;
+  seatSampledAt.set(tableId, now);
+  seatedPlayers(tableId, now);
+}
+
+/** "No more bets": the stickman pushes the dice to the shooter, who then has
+ *  CRAPS_SHOOTER_MS to fling them (#226); with no shooter the stickman throws
+ *  after the usual beat. The robot's tick and the house's manual ROLL share it. */
+export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Date.now()): void {
+  const shooter = shooterForClose(tableId, s, now);
+  const next: CrapsTableState = {
+    ...s,
+    phase: 'closing',
+    phaseDeadline: now + (shooter ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS),
+  };
+  if (shooter) next.shooter = shooter;
+  else delete next.shooter;
+  writeCrapsTableState(tableId, next);
+}
+
+/** While the dice are with the shooter: settle their throw when it lands in
+ *  the doc, or have the stickman throw at the deadline. */
+export function tickCrapsClosing(tableId: string, s: CrapsTableState, autoShowMs?: number, now = Date.now()): void {
+  if (s.shooter !== undefined) {
+    const t = readDiceThrow(tableId);
+    if (t && t.round === s.round && t.by === s.shooter) {
+      rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
+      return;
+    }
+  }
+  if (now >= (s.phaseDeadline ?? now)) stickmanThrows(tableId, s, autoShowMs);
+}
+
 /**
  * One operator tick for one craps table. Idempotent per frame — only writes on a
  * real transition. The window ARMS when there are live bets (so an empty come-out
@@ -214,9 +261,7 @@ function hasLiveBets(tableId: string): boolean {
  */
 export function tickAutoStickman(tableId: string): void {
   const now = Date.now();
-  // Watch the seats' heartbeats all window long, so the shooter pick at the
-  // close judges them on what this client actually saw move.
-  seatedPlayers(tableId, now);
+  sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
   if (!s) {
     openCrapsBetting(tableId, 1, null);
@@ -228,30 +273,10 @@ export function tickAutoStickman(tableId: string): void {
         writeCrapsTableState(tableId, { ...s, phaseDeadline: now + CRAPS_BET_WINDOW_MS });
       }
     } else if (now >= s.phaseDeadline) {
-      // "No more bets": the stickman pushes the dice to the shooter, who then
-      // has CRAPS_SHOOTER_MS to fling them (#226); with no shooter the stickman
-      // throws after the usual beat.
-      const shooter = shooterForClose(tableId, s, now);
-      const next: CrapsTableState = {
-        ...s,
-        phase: 'closing',
-        phaseDeadline: now + (shooter ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS),
-      };
-      if (shooter) next.shooter = shooter;
-      else delete next.shooter;
-      writeCrapsTableState(tableId, next);
+      closeCrapsBetting(tableId, s, now);
     }
   } else if (s.phase === 'closing') {
-    if (s.shooter !== undefined) {
-      const t = readDiceThrow(tableId);
-      if (t && t.round === s.round && t.by === s.shooter) {
-        rollAndSettleCraps(tableId, s.round, s.point, CRAPS_SHOW_MS);
-      } else if (now >= (s.phaseDeadline ?? now)) {
-        stickmanThrows(tableId, s, CRAPS_SHOW_MS);
-      }
-    } else if (now >= (s.phaseDeadline ?? now)) {
-      stickmanThrows(tableId, s, CRAPS_SHOW_MS);
-    }
+    tickCrapsClosing(tableId, s, CRAPS_SHOW_MS, now);
   } else if (s.phase === 'settled') {
     if (s.phaseDeadline != null && now >= s.phaseDeadline) {
       openCrapsBetting(tableId, s.round + 1, s.point, s);

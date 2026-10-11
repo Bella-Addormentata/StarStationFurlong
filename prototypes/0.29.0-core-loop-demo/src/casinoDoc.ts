@@ -419,6 +419,12 @@ export function clearMySeat(tableId: string, playerId: string): void {
   });
 }
 
+/** One player's seat on one table (a keyed read — no scan). */
+export function readSeat(tableId: string, playerId: string): TableSeat | null {
+  const v = ensureMap().get(`seat:${tableId}:${playerId}`);
+  return isTableSeat(v) ? v : null;
+}
+
 /** Every seat record on one table, playerId → seat (freshness is the
  *  reader's call — the operator's, or the renderer's "anyone here?"). */
 export function readSeats(tableId: string): Record<string, TableSeat> {
