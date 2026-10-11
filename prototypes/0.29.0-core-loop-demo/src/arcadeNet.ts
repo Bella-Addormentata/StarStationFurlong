@@ -164,6 +164,8 @@ export class PadRuns {
   private prev = 0;
   /** The previous run's curRun at its last frame, or -1 before one. */
   private prevRun = -1;
+  /** Runs started since the last tick(). */
+  private changes = 0;
 
   /** Frame `frame` (u16) ran with `pads`. Frames arrive in order, one apart. */
   record(frame: number, pads: number): void {
@@ -175,15 +177,27 @@ export class PadRuns {
       this.prevRun = this.curRun;
       this.cur = pads;
       this.curRun = 0;
+      this.changes++;
     } else {
       this.curRun = Math.min(255, this.curRun + 1);
     }
     this.last = frame;
   }
 
-  /** The FRAMES fields for the latest frame, or null before any. */
+  /** Would a frame with `pads` push a run no tick has carried out of the
+   *  next one? A tick carries two runs, so it holds every frame since the
+   *  last only while at most one run started in between: send before a
+   *  second (a burst of changes inside one update, or between the
+   *  every-other-update ticks). */
+  needsTickBefore(pads: number): boolean {
+    return this.last >= 0 && pads !== this.cur && this.changes > 0;
+  }
+
+  /** The FRAMES fields for the latest frame, to send now, or null before
+   *  any frame. */
   tick(): { frame: number; cur: number; run0: number; prev: number; run1: number } | null {
     if (this.last < 0) return null;
+    this.changes = 0;
     const run0 = this.curRun;
     const hasPrev = this.prevRun >= 0 && run0 < 255;
     return {
