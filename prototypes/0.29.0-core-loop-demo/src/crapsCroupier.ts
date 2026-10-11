@@ -266,9 +266,11 @@ const PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).slice(2, 10)}`;
  *  so shareholders in a venture room never race the settle. If that page
  *  goes away, any editor's next ROLL press finishes the turn. */
 export function tickManualCraps(tableId: string, now = Date.now()): void {
+  // Every editor samples (throttled), so whoever presses ROLL has already
+  // seen the seated players' heartbeats move and can slide them the dice.
+  sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
   if (s?.phase !== 'closing' || s.operator !== PAGE_ID) return;
-  sampleSeats(tableId, now);
   tickCrapsClosing(tableId, s, undefined, now);
 }
 

@@ -47,6 +47,8 @@ describe('craps bet shapes', () => {
     expect(isCrapsTableState({ ...initialCrapsState(), shooter: '' })).toBe(false);
     expect(isCrapsTableState({ ...initialCrapsState(), shooter: 7 })).toBe(false);
     expect(isCrapsTableState({ ...initialCrapsState(), lastShooter: 'x'.repeat(200) })).toBe(false);
+    expect(isCrapsTableState({ ...initialCrapsState(), operator: 'p1:abc' })).toBe(true);
+    expect(isCrapsTableState({ ...initialCrapsState(), operator: 42 })).toBe(false);
   });
 });
 

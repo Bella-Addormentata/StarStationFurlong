@@ -219,7 +219,8 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && isPlayerIdField(s.shooter)
-    && isPlayerIdField(s.lastShooter);
+    && isPlayerIdField(s.lastShooter)
+    && isPlayerIdField(s.operator);
 }
 
 /** The point AFTER a roll of `sum`, given the point in force before it:
