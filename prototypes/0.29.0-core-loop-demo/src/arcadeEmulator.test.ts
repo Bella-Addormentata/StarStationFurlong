@@ -7,8 +7,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameOrigins,
-  emulatorIsolated, emulatorWallPolicy, localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom,
-  romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
+  emulatorIsolated, emulatorWallPolicy, localRomExposureAllowed, localRomFor, probeEmulatorData, readReplayStatus,
+  rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
 } from './arcadeEmulator';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -135,5 +135,16 @@ describe('where the emulator files come from', () => {
     expect(localRomExposureAllowed(game, EMULATOR_CDN_DATA, origin)).toBe(true);
     expect(localRomExposureAllowed({ ...game, size: 1 }, EMULATOR_CDN_DATA, origin)).toBe(false); // another file: its own ask
     expect(localRomExposureAllowed(game, 'https://mirror.example/data/', origin)).toBe(false); // another engine origin: its own ask
+  });
+});
+
+describe('a spectator frame\'s replay status is read field by field', () => {
+  it('keeps what is well-formed and drops the rest', () => {
+    expect(readReplayStatus({ phase: 'running', frame: 600, through: 611 })).toEqual({ phase: 'running', frame: 600, through: 611 });
+    expect(readReplayStatus({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, frame: 213 }))
+      .toEqual({ phase: 'stalled', loaded: 213, hash: 'd5d7dc6e:13752', matches: true, frame: 213 });
+    expect(readReplayStatus({ phase: 'running', frame: 1.5, hash: '<b>', matches: 'yes' })).toEqual({ phase: 'running' });
+    expect(readReplayStatus({ phase: 'dancing' })).toBeNull();
+    expect(readReplayStatus(null)).toBeNull();
   });
 });

@@ -43,6 +43,16 @@
                     { type: 'arcade-started' }   the game runs
                     { type: 'arcade-exit' }      Escape pressed here
                     { type: 'arcade-error', why } 'loader' | 'timeout' | 'game'
+    Replay (spectators, src/arcadeReplay.ts), when the config's `replay`
+    is 'source' (player one) or 'follower' (a spectator):
+      source → page  { type: 'arcade-replay-inputs', from, through, inputs: [[frame, player, index, value]] }
+                     { type: 'arcade-replay-hash', frame, hash }
+                     { type: 'arcade-replay-snapshot', frame, state, held: [[player, index, value]], hash }
+      page → source  { type: 'arcade-replay-want-snapshot' }
+                     { type: 'arcade-replay-press', player, index, value }
+      page → follower  the source's inputs and snapshot messages, relayed
+      follower → page  { type: 'arcade-replay-hash', frame, hash }
+                       { type: 'arcade-replay-status', phase, frame, through, loaded?, hash?, matches? }
     EmulatorJS itself (GPL-3.0) is NOT in this repository: pathToData names
     this station's /emulatorjs/data/ (scripts/fetch-emulatorjs.mjs) or
     cdn.emulatorjs.org, the owner's call per cabinet — the CDN only in a
@@ -135,6 +145,180 @@
         if (extra) for (var k in extra) msg[k] = extra[k];
         pageWin.postMessage(msg, '*');
       }
+      // ── 👀 Replay: spectators watch by replaying player one's inputs ──────
+      // (src/arcadeReplay.ts has the contract and the page's checks.) Player
+      // one's frame (role 'source') records every input it applies with the
+      // emulator's frame counter at that moment, posts them in batches with
+      // `through` (every input at or before it is sent), hashes its state
+      // every hashEvery frames and hands out a save state on request. A
+      // spectator's frame (role 'follower') loads that save state, then runs
+      // a frame only once every input before it is in hand, applying each
+      // at the frame it was stamped with — so the two run the same program
+      // on the same inputs and should hash alike.
+      //
+      // The hooks are Emscripten's main-loop callbacks, which the runtime
+      // reads ONCE as it starts: so they go into the options EmulatorJS
+      // hands the core's factory (window.EJS_Runtime, which the core's
+      // script defines and EmulatorJS calls), not onto the Module after.
+      // A pre-hook returning false skips that iteration whole: the core does
+      // not run and the frame counter does not move. One iteration runs one
+      // frame; a save state loaded between iterations lands in the next one,
+      // which then runs no frame of its own (both measured on fceumm).
+      var hooks = { pre: null, post: null };
+      function hookMainLoop() {
+        var factory = null;
+        Object.defineProperty(window, 'EJS_Runtime', {
+          configurable: true,
+          get: function () {
+            if (!factory) return undefined;
+            return function (opts) {
+              opts.preMainLoop = function () { return hooks.pre ? hooks.pre() : undefined; };
+              opts.postMainLoop = function () { if (hooks.post) hooks.post(); };
+              return factory(opts);
+            };
+          },
+          set: function (v) { factory = v; },
+        });
+      }
+      // FNV-1a 32 over the state bytes, `hex:length` (replayStateHash).
+      function stateHash(b) {
+        var h = 0x811c9dc5;
+        for (var i = 0; i < b.length; i++) { h ^= b[i]; h = Math.imul(h, 0x01000193) >>> 0; }
+        return h.toString(16) + ':' + b.length;
+      }
+      var replay = null;
+      function startReplay(role, c) {
+        var gm = window.EJS_emulator && window.EJS_emulator.gameManager;
+        if (!gm || !gm.functions || typeof gm.functions.simulateInput !== 'function') {
+          post('arcade-replay-status', { phase: 'unsupported' });
+          return;
+        }
+        var hashEvery = c.replayHashEvery > 0 ? c.replayHashEvery | 0 : 60;
+        var lead = c.replayLead >= 0 ? c.replayLead | 0 : 12;
+        var batchFrames = c.replayBatchFrames > 0 ? c.replayBatchFrames | 0 : 6;
+        var apply = gm.functions.simulateInput;
+        // EmulatorJS's own hotkeys (indices 24–29: save, load, fast-forward,
+        // rewind, slow motion) bend time or swap the state under the replay:
+        // dropped on both sides while a replay runs.
+        var gmSimulate = gm.simulateInput.bind(gm);
+        gm.simulateInput = function (p, i, v) { if (i <= 23) gmSimulate(p, i, v); };
+        if (role === 'source') {
+          var held = {};
+          var pending = [];
+          var lastBatch = gm.getFrameNum();
+          // Batches tile the frames: each starts where the last one ended.
+          var nextFrom = lastBatch;
+          var wantSnapshot = false;
+          // Every input route (keyboard, gamepad, touch) ends here: record
+          // it with the frame it lands before.
+          gm.functions.simulateInput = function (p, i, v) {
+            pending.push([gm.getFrameNum(), p, i, v]);
+            held[p + ':' + i] = [p, i, v];
+            return apply(p, i, v);
+          };
+          hooks.post = function () {
+            var f = gm.getFrameNum();
+            if (wantSnapshot) {
+              wantSnapshot = false;
+              var st = gm.getState();
+              var heldRows = [];
+              for (var k in held) if (held[k][2] !== 0) heldRows.push(held[k]);
+              pageWin.postMessage({ type: 'arcade-replay-snapshot', frame: f, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
+            }
+            if (f % hashEvery === 0) post('arcade-replay-hash', { frame: f, hash: stateHash(gm.getState()) });
+            // An input stamped f arrives after this hook (between
+            // iterations), so everything up to f - 1 is final now.
+            if (f - lastBatch >= batchFrames) {
+              post('arcade-replay-inputs', { from: nextFrom, through: f - 1, inputs: pending });
+              pending = [];
+              lastBatch = f;
+              nextFrom = f;
+            }
+          };
+          replay = { role: role, want: function () { wantSnapshot = true; }, press: function (p, i, v) { gm.simulateInput(p, i, v); } };
+        } else {
+          var queue = {};
+          var through = -1;
+          var offset = 0;
+          var phase = 'waiting';
+          var snap = null;
+          var applying = false;
+          var lastStatus = 0;
+          // Nothing local drives a spectator's emulator: only the replay.
+          gm.functions.simulateInput = function (p, i, v) { if (applying) return apply(p, i, v); };
+          function feed(p, i, v) { applying = true; try { apply(p, i, v); } finally { applying = false; } }
+          function status(extra) {
+            var m = { phase: phase, frame: gm.getFrameNum() + offset, through: through };
+            if (extra) for (var k in extra) m[k] = extra[k];
+            post('arcade-replay-status', m);
+          }
+          hooks.pre = function () {
+            if (phase === 'waiting') return false;
+            if (phase === 'loading') return undefined;
+            var s = gm.getFrameNum() + offset;
+            // Frame s + 1 runs next: every input stamped s must be in hand.
+            if (through < s) {
+              if (phase !== 'stalled') { phase = 'stalled'; status(); }
+              return false;
+            }
+            // Out of a stall, wait for `lead` frames of input before going
+            // on, so one late batch is one pause and not a stutter.
+            if (phase === 'stalled' && through < s + lead) return false;
+            if (phase !== 'running') { phase = 'running'; status(); }
+            var rows = queue[s];
+            if (rows) {
+              for (var r = 0; r < rows.length; r++) feed(rows[r][0], rows[r][1], rows[r][2]);
+              delete queue[s];
+            }
+            return undefined;
+          };
+          hooks.post = function () {
+            if (phase === 'loading') {
+              // The iteration that landed the save state: no frame of its
+              // own ran, so the state now is the source's at snap.frame.
+              offset = snap.frame - gm.getFrameNum();
+              var h = stateHash(gm.getState());
+              for (var k = 0; k < snap.held.length; k++) feed(snap.held[k][0], snap.held[k][1], snap.held[k][2]);
+              for (var q in queue) if (+q < snap.frame) delete queue[q];
+              phase = 'stalled';
+              status({ loaded: snap.frame, hash: h, matches: h === snap.hash });
+              return;
+            }
+            var s = gm.getFrameNum() + offset;
+            if (s % hashEvery === 0) post('arcade-replay-hash', { frame: s, hash: stateHash(gm.getState()) });
+            var now = Date.now();
+            if (now - lastStatus > 1000) { lastStatus = now; status(); }
+          };
+          replay = {
+            role: role,
+            inputs: function (d) {
+              if (typeof d.through !== 'number' || !Array.isArray(d.inputs)) return;
+              for (var n = 0; n < d.inputs.length; n++) {
+                var row = d.inputs[n];
+                (queue[row[0]] || (queue[row[0]] = [])).push([row[1], row[2], row[3]]);
+              }
+              if (d.through > through) through = d.through;
+            },
+            snapshot: function (d) {
+              if (!(d.state instanceof Uint8Array) || !Array.isArray(d.held) || typeof d.frame !== 'number') return;
+              snap = d;
+              gm.loadState(d.state);
+              phase = 'loading';
+            },
+          };
+        }
+      }
+      window.addEventListener('message', function (e) {
+        if (e.source !== pageWin || !e.data || !replay) return;
+        var d = e.data;
+        if (replay.role === 'source') {
+          if (d.type === 'arcade-replay-want-snapshot') replay.want();
+          else if (d.type === 'arcade-replay-press' && typeof d.player === 'number') replay.press(d.player, d.index, d.value);
+        } else {
+          if (d.type === 'arcade-replay-inputs') replay.inputs(d);
+          else if (d.type === 'arcade-replay-snapshot') replay.snapshot(d);
+        }
+      });
       var started = false;
       window.addEventListener('message', function (e) {
         if (e.source !== pageWin || !e.data || e.data.type !== 'arcade-config' || started) return;
@@ -185,7 +369,12 @@
           });
         }
         window.EJS_ready = function () { post('arcade-ready'); };
-        window.EJS_onGameStart = function () { post('arcade-started'); };
+        var replayRole = c.replay === 'source' || c.replay === 'follower' ? c.replay : null;
+        if (replayRole) hookMainLoop();
+        window.EJS_onGameStart = function () {
+          if (replayRole) startReplay(replayRole, c);
+          post('arcade-started');
+        };
         var s = document.createElement('script');
         s.src = c.pathToData + 'loader.js';
         s.onerror = function () { post('arcade-error', { why: 'loader' }); };

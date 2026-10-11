@@ -66,6 +66,8 @@
  */
 
 import { gameId, ARCADE_CORES } from './arcadeDoc';
+import { readFrameBatch, readFrameHash, readFrameSnapshot } from './arcadeReplay';
+import type { ReplayBatch, ReplayHash, ReplaySnapshot } from './arcadeReplay';
 import type { ArcadeCore, ArcadeGame, EmulatorData } from './arcadeDoc';
 import { convenienceLanesEnabled } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
@@ -150,6 +152,33 @@ export interface EmulatorConfig {
    *  the viewer's own node (tvConsent's own media origins); the engine's
    *  own origin is added for the CDN lane (emulatorFrameOrigins). */
   allowOrigins: readonly string[];
+  /** Spectating by input replay (arcadeReplay.ts): player one's frame is
+   *  the 'source', a spectator's the 'follower'. Absent: no replay hooks. */
+  replay?: EmulatorReplayConfig;
+}
+
+export interface EmulatorReplayConfig {
+  role: 'source' | 'follower';
+  /** Hash the state every this many frames (default 60). */
+  hashEvery?: number;
+  /** A follower out of a stall waits for this many frames of input (12). */
+  lead?: number;
+  /** The source posts a batch every this many frames (6). */
+  batchFrames?: number;
+}
+
+/** A follower's report of where it stands. */
+export interface ReplayStatus {
+  phase: 'waiting' | 'loading' | 'stalled' | 'running' | 'unsupported';
+  /** The source frame the follower's state is at. */
+  frame?: number;
+  /** The latest `through` it holds. */
+  through?: number;
+  /** Set once, as a save state lands: its frame, the hash after loading,
+   *  and whether that matched the hash the source sent with it. */
+  loaded?: number;
+  hash?: string;
+  matches?: boolean;
 }
 
 /** Whether engine files at `pathToData` come from another origin than the
@@ -199,7 +228,11 @@ export type EmulatorEvent =
   | { type: 'ready' }
   | { type: 'started' }
   | { type: 'exit' }
-  | { type: 'error'; why: string };
+  | { type: 'error'; why: string }
+  | { type: 'replay-inputs'; batch: ReplayBatch }
+  | { type: 'replay-hash'; hash: ReplayHash }
+  | { type: 'replay-snapshot'; snapshot: ReplaySnapshot }
+  | { type: 'replay-status'; status: ReplayStatus };
 
 export interface EmulatorHandle {
   /** The wall in the stage: this page's own document around the frame. */
@@ -207,6 +240,10 @@ export interface EmulatorHandle {
   /** The emulator's frame inside the wall, once the wall is up. */
   emulator(): HTMLIFrameElement | null;
   focus(): void;
+  /** Post a replay message to the frame (arcadeReplay.ts: the source's
+   *  batches and snapshot to a follower, a snapshot request or a press to a
+   *  source). Nothing before the frame has said hello. */
+  send(message: Record<string, unknown>, transfer?: Transferable[]): void;
   destroy(): void;
 }
 
@@ -240,6 +277,23 @@ export function emulatorWallPolicy(frameUrl: string, href = typeof location === 
   const source = `${u.protocol}//${u.host}${u.pathname}`;
   if (!/^[a-z][a-z0-9+.-]*:\/\/[^\s,;'"]+$/i.test(source)) return null;
   return `default-src 'none'; frame-src ${source}`;
+}
+
+const REPLAY_PHASES: ReadonlySet<string> = new Set(['waiting', 'loading', 'stalled', 'running', 'unsupported']);
+
+/** A follower's status as the frame posts it, checked field by field. */
+export function readReplayStatus(data: unknown): ReplayStatus | null {
+  if (!data || typeof data !== 'object') return null;
+  const d = data as Record<string, unknown>;
+  if (typeof d.phase !== 'string' || !REPLAY_PHASES.has(d.phase)) return null;
+  const out: ReplayStatus = { phase: d.phase as ReplayStatus['phase'] };
+  const int = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= -1 && v <= 0xffff_ffff;
+  if (int(d.frame)) out.frame = d.frame as number;
+  if (int(d.through)) out.through = d.through as number;
+  if (int(d.loaded)) out.loaded = d.loaded as number;
+  if (typeof d.hash === 'string' && /^[0-9a-f]{1,8}:\d{1,9}$/.test(d.hash)) out.hash = d.hash;
+  if (typeof d.matches === 'boolean') out.matches = d.matches;
+  return out;
 }
 
 /** The parent side of the frame protocol: the frame says hello, the parent
@@ -294,12 +348,43 @@ export function mountEmulatorFrame(
           volume: config.volume,
           isolated: config.isolated,
           timeoutMs: EMULATOR_LOAD_TIMEOUT_MS,
+          replay: config.replay?.role,
+          replayHashEvery: config.replay?.hashEvery,
+          replayLead: config.replay?.lead,
+          replayBatchFrames: config.replay?.batchFrames,
         }, target);
         break;
       case 'arcade-ready': onEvent({ type: 'ready' }); break;
       case 'arcade-started': onEvent({ type: 'started' }); break;
       case 'arcade-exit': onEvent({ type: 'exit' }); break;
       case 'arcade-error': onEvent({ type: 'error', why: typeof d.why === 'string' ? d.why : 'unknown' }); break;
+      // Replay messages only from a frame configured for one, and only in
+      // the shape arcadeReplay.ts reads: the frame is a third party's
+      // engine on a ROM, and a batch is what the page would forward.
+      case 'arcade-replay-inputs': {
+        if (config.replay?.role !== 'source') break;
+        const batch = readFrameBatch(d);
+        if (batch) onEvent({ type: 'replay-inputs', batch });
+        break;
+      }
+      case 'arcade-replay-hash': {
+        if (!config.replay) break;
+        const hash = readFrameHash(d);
+        if (hash) onEvent({ type: 'replay-hash', hash });
+        break;
+      }
+      case 'arcade-replay-snapshot': {
+        if (config.replay?.role !== 'source') break;
+        const snapshot = readFrameSnapshot(d);
+        if (snapshot) onEvent({ type: 'replay-snapshot', snapshot });
+        break;
+      }
+      case 'arcade-replay-status': {
+        if (!config.replay) break;
+        const status = readReplayStatus(d);
+        if (status) onEvent({ type: 'replay-status', status });
+        break;
+      }
       default: break;
     }
   };
@@ -391,6 +476,10 @@ export function mountEmulatorFrame(
         frame?.focus();
         frame?.contentWindow?.focus();
       } catch { /* detached */ }
+    },
+    send(message, transfer = []) {
+      if (!alive || !configured) return;
+      frame?.contentWindow?.postMessage(message, target, transfer);
     },
     destroy() {
       alive = false;
