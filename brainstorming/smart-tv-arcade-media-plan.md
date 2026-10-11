@@ -46,6 +46,23 @@ idea of decentralisation:
   signed ticket — the station's own nodes, py-ipv8's names only as the dev
   mode the rules allow — and with none configured the lookup is OFF, never
   defaulted to the public names; a public torrent swarm is the same shape.
+  The node's public-address ECHO is the other default in that class: with
+  `SSF_EXTERNAL_ADDRS` unset the node behaves as `auto` and asks
+  `api.ipify.org` or `checkip.amazonaws.com` for its public IPv4 over
+  plain HTTP, every five minutes (`main.rs`, `DEFAULT_IP_ECHO_HOSTS`;
+  `SSF_IP_ECHO` names other hosts, `SSF_EXTERNAL_ADDRS=off` silences it) —
+  the R1 posture flip, an owner decision for the demo phase ("as easy as
+  possible"), and the only outbound DNS and HTTP a fresh node makes on its
+  own. So compiling the Mainline lookup out leaves that traffic, and the
+  prerequisite covers it too: a STRICT build compiles the echo path out
+  (no echo host exists in it; the external address comes from explicit
+  `SSF_EXTERNAL_ADDRS` entries, from the relay the operator configured,
+  or from what an authenticated peer observed of this node's address on
+  its own connection, iroh's path reports), and a non-strict sovereign
+  configuration keeps the owner's R1 default while naming the echo hosts
+  it uses in `SSF_IP_ECHO` — the operator's own echo on the station, or
+  none — so that a node never resolves a third party's name unless its
+  operator wrote that name down.
 - **P‑3**: never default public relays. **v007 F2/F5**: status must reach the
   player, and every feature says which rung it is using.
 - **The ChiaHub floor** (rung 6): the chain as the discovery that keeps working
@@ -257,7 +274,7 @@ sources the countdown doubles as the prefetch window.
 | You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
 | You fall asleep holding it | The holder renews every 3 s; after 8 s of silence anyone may take it |
 | You open a second tab | The remote stays with the tab that picked it up (`page`); the other is a viewer that may take it over — one person, one place — and closing it drops nothing |
-| The TV has buttons on its body | Anyone standing at the TV can press POWER and VOLUME without the remote — each its own key (§3.1), so no body press writes the programme record the holder rewrites every three seconds, and an INPUT button, if one comes, gets a key of its own the same way, never a second writer of `tv:<id>` — and whoever turns the set ON has the remote placed in their hand (#186's rule) when it is on the set or lapsed; a live holder keeps it, since a body button moves nothing out of a hand and the owner's spare is not the switch's to use: the holder turns the set on themselves, or hands the remote over. That last clause is a REFINEMENT of #186's wording and is recorded as one (the options table, §10): the issue says whoever turns the set on holds the remote and says nothing of a remote already in a live hand, so v1 applies the issue's rule whenever the remote is not in one — the common case, the set being off — and keeps a live holder's possession across a body press; the owner may overrule it, in which case ON hands the remote over on every OFF→ON transition, a one-line change in `tvDoc.ts` (#207) |
+| The TV has buttons on its body | Anyone standing at the TV can press POWER and VOLUME without the remote — each its own key (§3.1), so no body press writes the programme record the holder rewrites every three seconds, and an INPUT button, if one comes, gets a key of its own the same way, never a second writer of `tv:<id>` — and whoever turns the set ON has the remote placed in their hand (#186's rule, as written) on every OFF→ON — a remote on the set, lapsed, or in a live hand alike: the previous holder sees the switch take it, and takes it back by pressing ON themselves or asking. The alternative — a live holder keeps the remote across a body press, since a body button moves nothing out of a hand, and the switch hands over only a remote on the set or lapsed — is recorded as an OPEN OPTION for the owner (the options table, §10), a one-line change in `tvDoc.ts` (#207), and not v1's behaviour |
 | The owner has the spare | The room owner may take the remote from anyone, always |
 
 The holder gate is client-side and best effort — the dev-phase posture of
@@ -2117,7 +2134,7 @@ it.
 | EmulatorJS netplay | Not depended on | WebRTC + its own signaling/TURN, marked unstable |
 | Spectators run the emulator themselves | Possible later | CPU per spectator and a save-state transfer; the video lane is cheaper at retro resolutions |
 | Sender-side distance gating | Rejected | The node is content-blind and tick positions are untrusted; viewer-pull matches the mesh's IWANT philosophy |
-| POWER ON takes the remote from a live holder | Refined, pending the owner's word | #186 says whoever turns the set on holds the remote and says nothing of a remote already in a live hand; v1 applies the issue's rule whenever the remote is on the set or lapsed and keeps a live holder's possession across a body press (§3.2), a refinement recorded here rather than claimed as the issue's — overruled, ON hands over on every OFF→ON, a one-line change in `tvDoc.ts` (#207) |
+| POWER ON takes the remote from a live holder | #186 as written in v1; the alternative open | #186 says whoever turns the set on holds the remote, and v1 does exactly that on every OFF→ON, a live holder's remote included — the previous holder sees the switch take it and presses or asks to take it back (§3.2). The alternative, a live holder keeping the remote across a body press (a body button moves nothing out of a hand; the switch hands over only a remote on the set or lapsed), is an OPEN OPTION for the owner, a one-line change in `tvDoc.ts` (#207), and not v1's behaviour until chosen |
 
 ## 11. Final recommendations and sequence
 
