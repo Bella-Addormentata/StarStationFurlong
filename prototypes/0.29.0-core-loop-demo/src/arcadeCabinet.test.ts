@@ -163,28 +163,61 @@ describe('the double-wide cabinet as built', () => {
     expect(meshes).toBeGreaterThan(30); // four stations of stick, ball, two buttons and a coin slot
   });
 
-  it('shows one wide card on two screens side by side, and files one handle', () => {
+  it('shows one picture on both screens, and files each handle once', () => {
     const group = buildWide();
-    const planes: THREE.Mesh[] = [];
-    group.traverse((obj) => {
-      if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) planes.push(obj);
-    });
-    expect(planes).toHaveLength(2);
-    const [left, right] = planes.map((p) => new THREE.Box3().setFromObject(p).getCenter(new THREE.Vector3())).sort((a, b) => a.x - b.x);
-    expect(left!.x).toBeLessThan(0);
-    expect(right!.x).toBeGreaterThan(0);
-    // The halves of one canvas: the left plane shows the left half.
-    const maps = planes.map((p) => (p.material as THREE.MeshBasicMaterial).map as THREE.CanvasTexture);
-    expect(maps[0]!.image).toBe(maps[1]!.image);
-    expect(maps.map((t) => t.repeat.x)).toEqual([0.5, 0.5]);
-    expect(maps.map((t) => t.offset.x).sort()).toEqual([0, 0.5]);
     const s = sinks();
-    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, WIDE, obj); });
+    let left: THREE.Mesh | null = null;
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      registerFurnitureHandles(s, WIDE, obj);
+      if (obj.userData.arcadeCabinet) left = obj;
+    });
     expect(s.arcadeScreens.size).toBe(1);
     expect(s.arcadeScreens.has(WIDE)).toBe(true);
+    expect(s.arcadeCabinetVisuals.has(WIDE)).toBe(true); // the built-in emulator paints it too
+    expect(left).not.toBeNull();
+    expect(left!.userData.arcadeScreen).toBe(s.arcadeScreens.get(WIDE));
+    // Two screens, one material: whatever the left one shows, so does the right.
+    const screens: THREE.Mesh[] = [];
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.material === left!.material) screens.push(obj); });
+    expect(screens).toHaveLength(2);
+    const xs = screens.map((p) => new THREE.Box3().setFromObject(p).getCenter(new THREE.Vector3()).x).sort((a, b) => a - b);
+    expect(xs[0]).toBeLessThan(0);
+    expect(xs[1]).toBeGreaterThan(0);
+    expect((left!.material as THREE.MeshBasicMaterial).map).toBeInstanceOf(THREE.CanvasTexture);
     const def = FURNITURE_DEFS['arcade-cabinet-wide'];
     expect(def.device?.kind).toBe('arcade');
     expect(def.device?.front.z).toBeGreaterThan(d(def));
+  });
+
+  it("has the single cabinet's ⚙️ low on its front, and a lit marquee across the top", () => {
+    const group = buildWide();
+    const gears: THREE.Mesh[] = [];
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.arcadeControl) gears.push(obj); });
+    expect(gears.length).toBe(2); // the rim and the emoji's face
+    for (const gear of gears) {
+      expect(gear.userData).toMatchObject({ arcadeControl: 'settings', arcadeCabinetId: WIDE });
+      const box = new THREE.Box3().setFromObject(gear);
+      expect(box.getCenter(new THREE.Vector3()).y).toBeCloseTo(ARCADE_GEAR_Y, 5);
+      expect(box.max.z).toBeGreaterThan(FURNITURE_DEFS['arcade-cabinet-wide'].footprint!.d / 2 - 0.15); // on the front face
+    }
+    // Three textures, each a material map the removal reaches: the screens'
+    // one, the marquee's and the ⚙️'s.
+    const maps = new Map<THREE.Texture, THREE.Mesh>();
+    let screen: THREE.Mesh | null = null;
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      const map = (obj.material as THREE.MeshBasicMaterial).map;
+      if (map) maps.set(map, obj);
+      if (obj.userData.arcadeCabinet) screen = obj;
+    });
+    expect(maps.size).toBe(3);
+    const gearMap = (gears.find((g) => (g.material as THREE.MeshBasicMaterial).map)!.material as THREE.MeshBasicMaterial).map!;
+    const screenMap = (screen!.material as THREE.MeshBasicMaterial).map!;
+    const marquee = [...maps].find(([map]) => map !== gearMap && map !== screenMap)![1];
+    const box = new THREE.Box3().setFromObject(marquee);
+    expect(box.min.y).toBeGreaterThan(new THREE.Box3().setFromObject(screen!).max.y); // above the screens
+    expect(box.max.x - box.min.x).toBeGreaterThan(1.4); // across both of them
   });
 
   it('counts every size as an arcade cabinet', () => {

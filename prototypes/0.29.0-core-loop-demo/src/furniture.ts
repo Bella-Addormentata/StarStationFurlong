@@ -1784,7 +1784,7 @@ const ARCADE_SCREEN_Y = 1.3;
 const ARCADE_TEX_W = 320;
 const ARCADE_TEX_H = 240;
 /** The double-wide cabinet: a 1.6 m body in a 2×1 footprint, two 4:3
- *  screens side by side drawn from one 8:3 canvas, four players' panels.
+ *  screens side by side showing one picture, four players' panels.
  *  Its depth is the single cabinet's: the screens tilt back into the upper
  *  body's face, so a deeper body would bury their top edge. */
 const ARCADE_WIDE_W = 1.6;
@@ -10779,8 +10779,8 @@ function buildTvStand(ctx: BuildCtx) {
  * (FURLONG ARCADE, the game, a blinking INSERT COIN, the tally and how many
  * play), "P1 · <name>" while someone plays, or the empty card — with
  * scanlines over it (the #194 pass in its cheapest form). Returns the
- * glow's intensity for the view. Shared by the cabinet and the double-wide
- * one, whose 8:3 canvas spans its two screens as one picture.
+ * glow's intensity for the view. Every cabinet's screen paints it
+ * (arcadeScreenSurface).
  */
 function paintArcadeScreen(c2d: CanvasRenderingContext2D, w: number, h: number, view: ArcadeScreenView, players: string): number {
   const text = (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
@@ -10901,10 +10901,10 @@ function arcadeScreenSurface(players: string, setGlow: (i: number) => void, onVi
  * 🕹 The marquee (#193): the game's name, lit from behind in a box above the
  * screen, like the cabinets of old. Repainted only when the name changes.
  */
-function arcadeMarquee(planeW: number, planeH: number): { texture: THREE.CanvasTexture; show: (title: string) => void } {
+function arcadeMarquee(planeW: number, planeH: number, canvasW = 512): { texture: THREE.CanvasTexture; show: (title: string) => void } {
   const canvas = document.createElement("canvas");
-  canvas.width = 512;
-  canvas.height = Math.round((512 * planeH) / planeW);
+  canvas.width = canvasW;
+  canvas.height = Math.round((canvasW * planeH) / planeW);
   const g = canvas.getContext("2d")!;
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
@@ -11044,18 +11044,18 @@ function buildArcadeCabinet(ctx: BuildCtx) {
 
 /**
  * 🕹🕹 The double-wide cabinet (#193): the deluxe four-player cabinet of the
- * early nineties — two monitors side by side making one wide picture, and a
- * control deck long enough for four players shoulder to shoulder, each with
- * a stick, two buttons and a coin slot in their player colour. A 1.6 m body
- * in a 2×1 footprint, screens to local +z. The two screens are one 8:3
- * canvas (the attract card spans the pair, as a dual-screen game's picture
- * does), each plane showing its half. Stows one ArcadeScreenHandle
- * (userData.arcadeScreen, on the left plane) for registerFurnitureHandles.
+ * early nineties — two monitors side by side, and a control deck long
+ * enough for four players shoulder to shoulder, each with a stick, two
+ * buttons and a coin slot in their player colour. A 1.6 m body in a 2×1
+ * footprint, screens to local +z, with the single cabinet's lit marquee
+ * (across the top) and ⚙️ (low on the front). Both monitors show the one
+ * screen both emulators share (arcadeScreenSurface): the built-in game, or
+ * the card. Stows its handles on the left screen (userData.arcadeScreen,
+ * userData.arcadeCabinet) for registerFurnitureHandles.
  */
 function buildWideArcadeCabinet(ctx: BuildCtx) {
   const { m, place, addLight } = ctx;
   const BODY = 0x141a2e;
-  const TRIM = 0xd4a84b;
   const PANEL = 0x1a1f2a;
   const SIDE = 0x00e5ff;
   /** P1 to P4, left to right: the colours four-player cabinets used. */
@@ -11086,34 +11086,17 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
     place(new THREE.BoxGeometry(0.08, 0.1, 0.02), m(0x3d4a5e, 0.5, 0.5), cx, 0.5, d / 2 - 0.005);
     place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 + 0.003);
   }
-  // Marquee across the top.
+  // ⚙️ in the middle, below the coin doors, just above the plinth: anyone's
+  // way to the settings.
+  placeArcadeSettingsGear(ctx, 0, (d - 0.03) / 2);
+  // Marquee: the game's name, lit in a box across the top.
   place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
-  place(new THREE.PlaneGeometry(w - 0.08, 0.1), m(TRIM, 0.5, 0.1, TRIM, 0.6), 0, 1.74, 0.111);
+  const marquee = arcadeMarquee(w - 0.06, 0.13, 1024);
+  const marqueeMat = new THREE.MeshBasicMaterial({ map: marquee.texture, transparent: true, opacity: 0, toneMapped: false });
+  marqueeMat.userData.baseOpacity = 1;
+  place(new THREE.PlaneGeometry(w - 0.06, 0.13), marqueeMat, 0, 1.74, 0.111);
+  addLight(new THREE.PointLight(0xffc070, 0, 2.2), 0, 1.74, 0.35, 0.3);
 
-  // Two screens, one canvas: each plane shows its half of the 8:3 card.
-  const cv = document.createElement("canvas");
-  cv.width = ARCADE_TEX_W * 2;
-  cv.height = ARCADE_TEX_H;
-  const c2d = cv.getContext("2d")!;
-  const halves: THREE.CanvasTexture[] = [];
-  let handleMesh: THREE.Object3D | null = null;
-  for (const half of [0, 1]) {
-    const x = (half === 0 ? -1 : 1) * 0.34;
-    const bezel = place(new THREE.BoxGeometry(0.66, 0.5, 0.03), m(PANEL, 0.5, 0.3), x, ARCADE_SCREEN_Y, 0.15);
-    bezel.rotation.x = -0.14;
-    const tex = new THREE.CanvasTexture(cv);
-    tex.minFilter = THREE.LinearFilter;
-    tex.magFilter = THREE.LinearFilter;
-    tex.generateMipmaps = false;
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.repeat.set(0.5, 1);
-    tex.offset.set(half * 0.5, 0);
-    halves.push(tex);
-    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
-    const plane = place(new THREE.PlaneGeometry(0.6, 0.45), mat, x, ARCADE_SCREEN_Y + 0.002, 0.168);
-    plane.rotation.x = -0.14;
-    if (half === 0) handleMesh = plane;
-  }
   // The pair's glow on the deck and the floor: driven with the view.
   const glow = new THREE.PointLight(0x7fd8ff, 0, 4);
   addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
@@ -11121,22 +11104,22 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
     glow.userData.targetIntensity = i;
     glow.intensity = i;
   };
-  const draw = (view: ArcadeScreenView): void => {
-    setGlow(paintArcadeScreen(c2d, cv.width, cv.height, view, `${ARCADE_WIDE_SEATS} PLAYERS`));
-    for (const t of halves) t.needsUpdate = true;
-  };
-
-  let last = "";
-  const handle: ArcadeScreenHandle = {
-    draw: (view) => {
-      const key = JSON.stringify(view);
-      if (key === last) return;
-      last = key;
-      draw(view);
-    },
-  };
-  draw({ mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER LOADS A GAME", lane: "", blink: false, plays: 0 });
-  handleMesh!.userData.arcadeScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
+  // Two monitors, one picture: the same screen on both, so every station
+  // sees the game.
+  const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title));
+  const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
+  screenMat.userData.baseOpacity = 1;
+  for (const sx of [-1, 1]) {
+    const bezel = place(new THREE.BoxGeometry(0.66, 0.5, 0.03), m(PANEL, 0.5, 0.3), sx * 0.34, ARCADE_SCREEN_Y, 0.15);
+    bezel.rotation.x = -0.14;
+    const plane = place(new THREE.PlaneGeometry(0.6, 0.45), screenMat, sx * 0.34, ARCADE_SCREEN_Y + 0.002, 0.168);
+    plane.rotation.x = -0.14;
+    if (sx < 0) {
+      // Both handles once, on the left screen (registerFurnitureHandles).
+      plane.userData.arcadeScreen = surface.screen;
+      plane.userData.arcadeCabinet = surface.visual;
+    }
+  }
 }
 
 /**
