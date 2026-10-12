@@ -472,10 +472,13 @@ export class LockstepController {
     if (this.unsupported) return { ...base, phase: 'unsupported' };
     if (this.tooBig) return { ...base, phase: 'toobig' };
     if (!this.started || !this.nonce) return { ...base, phase: 'starting' };
-    if (this.joining && this.joining.epoch.nonce === this.nonce) return { ...base, phase: 'joining' };
-    if (this.framePhase === 'free' && this.frameNonce === this.nonce) return { ...base, phase: 'alone' };
+    // Left out of the game now running: a load that never landed, of the
+    // game before, is not joining any more.
     const e = this.epoch();
-    if (e && e.nonce !== this.nonce && !e.seats.includes(this.d.seat)) return { ...base, phase: 'out' };
+    const out = !!e && e.nonce !== this.nonce && !e.seats.includes(this.d.seat);
+    if (this.joining && this.joining.epoch.nonce === this.nonce && !out) return { ...base, phase: 'joining' };
+    if (this.framePhase === 'free' && this.frameNonce === this.nonce) return { ...base, phase: 'alone' };
+    if (out) return { ...base, phase: 'out' };
     if (this.d.now() - this.lastProgressAt > 1_000) {
       const waitingOn = this.members.filter((n) => n !== this.d.seat && (this.fwd.get(n) ?? -1) < this.frameAt);
       return { ...base, waitingOn, phase: 'holding' };

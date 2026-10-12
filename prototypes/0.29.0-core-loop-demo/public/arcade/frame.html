@@ -366,7 +366,8 @@
             post('arcade-replay-status', m);
           }
           // A new epoch from `from`: nothing of the last one carries over —
-          // its buttons, the batches heard, this seat's own unsent presses.
+          // its buttons, the batches heard, this seat's own unsent presses
+          // (what the player holds now goes in again: reconcile, below).
           function enter(tag, seatList, from) {
             nonce = tag;
             active = seatList.slice();
@@ -410,6 +411,7 @@
               enter(b.nonce, [seat], at());
               phase = 'free';
               ownGame = true;
+              reconcile();
               status();
               return;
             }
@@ -421,6 +423,7 @@
             phase = 'lockstep';
             ownGame = false;
             pageWin.postMessage({ type: 'arcade-replay-snapshot', nonce: nonce, frame: start, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
+            reconcile();
             status();
           }
           // The frame each button last changed at. A press and a release
@@ -429,15 +432,13 @@
           // instead, or the core would never see the tap. A stick needs no
           // such care: where it ends up is what counts.
           var lastAt = {};
-          // The local player's buttons: player one's controls, played as
-          // this seat. Alone ('free') they play at once; in step they are
-          // stamped ahead; held or loading, they go nowhere.
-          gm.functions.simulateInput = function (p, i, v) {
-            v = v | 0; // a stick's fraction, as the core takes it (as the source's)
-            if (applying) return apply(p, i, v);
-            if (p !== 0) return;
-            if (phase === 'free') return feed(seat, i, v);
-            if (phase !== 'lockstep' && phase !== 'stalled') return;
+          // What the player holds now, by input, whatever the phase. An
+          // epoch starts from what its leading seat had played, which can
+          // miss this seat's latest: a change stamped ahead and not yet
+          // played (a release as a player sits down, say), or one made
+          // while it loaded.
+          var mine = {};
+          function stamp(i, v) {
             var f = at() + delay;
             if (i < 16) {
               if (lastAt[i] !== undefined && f <= lastAt[i]) f = lastAt[i] + 1;
@@ -446,7 +447,35 @@
             var row = [f, seat, i, v];
             pending.push(row);
             enqueue(seat, row);
+          }
+          // The local player's buttons: player one's controls, played as
+          // this seat. Alone ('free') they play at once; in step they are
+          // stamped ahead; held or loading, they wait for the next epoch.
+          gm.functions.simulateInput = function (p, i, v) {
+            v = v | 0; // a stick's fraction, as the core takes it (as the source's)
+            if (applying) return apply(p, i, v);
+            if (p !== 0) return;
+            if (v !== 0) mine[i] = v;
+            else delete mine[i];
+            if (phase === 'free') return feed(seat, i, v);
+            if (phase !== 'lockstep' && phase !== 'stalled') return;
+            stamp(i, v);
           };
+          // Into an epoch: whatever of this seat's its start holds other
+          // than the player does now is played again, as a change made now
+          // (at once alone, stamped ahead in step) — or a button let go
+          // just before would stay down, with no key left to let go of.
+          function reconcile() {
+            var want = {};
+            for (var dk in down) if (down[dk][0] === seat) want[down[dk][1]] = 0;
+            for (var mk in mine) want[mk] = mine[mk];
+            for (var k in want) {
+              var has = down[seat + ':' + k];
+              if ((has ? has[2] : 0) === want[k]) continue;
+              if (phase === 'free') feed(seat, +k, want[k]);
+              else stamp(+k, want[k]);
+            }
+          }
           // A load has landed when the state is the one the epoch began
           // from: this seat is at the epoch's start, holding what it held.
           function land(h) {
@@ -463,6 +492,7 @@
             lastAt = {};
             phase = 'stalled';
             settling = true;
+            reconcile();
             status({ loaded: snap.frame, hash: h, matches: true, tries: loadTries });
           }
           hooks.pre = function () {

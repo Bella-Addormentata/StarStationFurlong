@@ -187,13 +187,16 @@ log('cabinet placed; game on it:', JSON.stringify(put));
 
 // In as a player comes in: past the start screen, then the ENTER ROOM
 // bubble over the dome (devices focus only from the room view, zoom 2),
-// and out of the clone vat.
+// and out of the clone vat. The room's first spawn plays on a frame at the
+// room view: a clone the vat let go of on its own while the page stayed
+// outside is beamed back in then, which would cancel a walk-up begun
+// before it. So the wait is for that spawn too, not only for no vat.
 async function enter(p) {
   const fresh = p.page.locator('button', { hasText: 'NEW PLAYER' });
   if (await fresh.isVisible().catch(() => false)) await fresh.click();
   await p.page.locator('#exterior-enter-bubble').click({ timeout: 60_000 });
   await p.page.waitForFunction(() => window.multiScaleZoom?.getLevel?.() === 2, null, { timeout: 60_000 });
-  await p.page.waitForFunction(() => !window.world.player.isVatSpawning(), null, { timeout: 90_000 });
+  await p.page.waitForFunction(() => !window.world.pendingVatSpawn && !window.world.player.isVatSpawning(), null, { timeout: 90_000 });
 }
 await Promise.all(players.map(enter));
 log('every player is in the room view');

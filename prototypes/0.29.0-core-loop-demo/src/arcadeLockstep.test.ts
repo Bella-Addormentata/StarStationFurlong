@@ -655,6 +655,7 @@ describe('players at the double-wide cabinet, page against page', () => {
     b.frame.brokenLoads = true; // its loads never land
     await room.run(JOIN_MS + 4_000, bot(a, 1));
     expect(view(a)).toMatchObject({ phase: 'alone', players: [0] });
+    expect(view(b).phase).toBe('out'); // and its stage says so, not that it is joining
     const at = a.frame.at();
     await room.run(2_000, bot(a, 1));
     expect(a.frame.at()).toBeGreaterThan(at + 100);
@@ -675,11 +676,13 @@ describe('players at the double-wide cabinet, page against page', () => {
     await room.run(JOIN_MS + 4_000, allOf(bot(a, 1), bot(b, 2)));
     expect(view(a)).toMatchObject({ phase: 'playing', players: [0, 1] });
     expect(readEpoch(a.map.get(lockstepEpochKey(CAB)), 4)?.out.map(([n]) => n)).toEqual([2]);
+    expect(view(c).phase).toBe('out');
     // The seat that leads goes while c is still out: b leads now, and
     // plays on without holding for c again.
     room.remove(a);
     await room.run(3_000, bot(b, 2));
     expect(view(b)).toMatchObject({ phase: 'alone', players: [1] });
+    expect(view(c).phase).toBe('out');
     const at = b.frame.at();
     await room.run(2_000, bot(b, 2));
     expect(b.frame.at()).toBeGreaterThan(at + 60);
