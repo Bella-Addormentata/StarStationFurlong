@@ -459,8 +459,13 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   `/api/media-cap` endpoint whose allowlist is the EXACT origins named in
   `SSF_ALLOWED_ORIGINS`, never a loopback wildcard. Where no such channel
   exists — a node whose data dir the shell cannot read, a page on an origin
-  the list does not name — the proxy is simply unavailable and the
-  theatre's consent-only direct URL is what plays. The proxy's own
+  the list does not name — the proxy is unavailable and so is the lane:
+  the tile says PROXY UNAVAILABLE and nothing fetches, never a fall back
+  to the direct URL, which the proxy retires (the critical-path item's
+  done-when in the TODO: the browser's direct fetches of those URLs are
+  gone). Until the proxy exists, v1's consent-only direct URL is the lane
+  as shipped, behind the flag; once it exists, there is no direct path.
+  The proxy's own
   `Origin` check is that same exact list, a filter behind the token. The
   token is carried in the URL
   because a `<video>` cannot set a header, with the element in CORS mode
@@ -1961,14 +1966,20 @@ presses a button and nothing more); the signed binding below is the
 prerequisite of anything with stakes. The owner's own game — any console
 or arcade board EmulatorJS runs, from a file on the owner's disk (sent
 through the room to each player who presses play, `arcadeRomShare.ts`,
-until the blob lane carries it, §4) or a link — runs in ONE page's
-EmulatorJS, P1's stage, and is model B: the rest of this section is
-about it. (Since then the #250 replay spike — dev server only,
-`arcadeReplaySpike.ts` — replayed P1's inputs into a watcher's
-EmulatorJS and matched every hash, so model A may reach the owner's
-game too; wiring it is the arcade thread's follow-up, and the video
-lane stays for what replay cannot carry: a watcher without the file, a
-core that diverges, a game whose inputs are not its whole state.)
+until the blob lane carries it, §4) or a link — runs in EmulatorJS on
+the seated pages: at the double-wide cabinet in LOCKSTEP on every seated
+page, up to four, each on its own computer (#242, `arcadeStage.ts` and
+`arcadeLockstep.ts`: model A for the owner's game, the seats' inputs
+exchanged through the room and the state checked by hash), and at the
+single and two-player cabinets in ONE page, P1's stage. Model B, the
+rest of this section, is for what that lockstep does not cover: the
+cabinets where the owner's game runs in one page, and spectators of
+any cabinet — where the #250 replay spike (dev server only,
+`arcadeReplaySpike.ts`) replayed P1's inputs into a watcher's
+EmulatorJS and matched every hash, so model A may serve spectators too,
+the wiring the arcade thread's follow-up — with the video lane kept for
+what replay cannot carry: a watcher without the file, a core that
+diverges, a game whose inputs are not its whole state.
 
 **Player one is the source.** P1 holds the cabinet's P1 panel (claimed in the
 doc the way an air-hockey end is, with the page-seat rule); their emulator
@@ -2276,8 +2287,9 @@ P1 focus and controls, the
 CSS CRT pass on the stage) → the media lane with subscriptions (shared with
 the TV's screen share and karaoke), which brings the picture — bridged out
 of the frame as above — and the texture
-CRT pass to the prop → P2 over video → lockstep only for the games that need
-it.
+CRT pass to the prop → P2 over video for the cabinets whose owner's game
+runs in one page (the double-wide cabinet's seats already play in lockstep,
+#242) → lockstep elsewhere only for the games that need it.
 
 ## 10. Options considered
 
@@ -2297,7 +2309,7 @@ it.
 | Tor for torrent traffic | Rejected | No UDP; the Tor project asks people not to torrent through it |
 | I2P (`emissary`) | Watch; opt-in later | Experimental; passes the no-single-vendor rule that IPv8 fails |
 | WebTorrent in the browser | Rejected | Browsers cannot join classic swarms |
-| Lockstep netplay first for the arcade | Shipped for the built-in NES games (#248); for the owner's EmulatorJS game the #250 replay spike matched every hash, the wiring the arcade thread's, with P2-over-video kept for what replay cannot carry | One engine (jsnes) and a fixed library made determinism free, so the built-in games run on every page from pad bytes on the tick lane (§9); any libretro core would be a multi-week determinism spike, and the video lane is built for spectators anyway |
+| Lockstep netplay first for the arcade | Shipped for the built-in NES games (#248) and for the owner's EmulatorJS game at the double-wide cabinet (#242: up to four seated pages in step); the #250 replay spike matched every hash for a watcher too, the wiring the arcade thread's; P2-over-video kept for the one-page cabinets and for what replay cannot carry | One engine (jsnes) and a fixed library made determinism free, so the built-in games run on every page from pad bytes on the tick lane (§9); any libretro core would be a multi-week determinism spike, and the video lane is built for spectators anyway |
 | EmulatorJS netplay | Not depended on | WebRTC + its own signaling/TURN, marked unstable |
 | Spectators run the emulator themselves | Possible later | CPU per spectator and a save-state transfer; the video lane is cheaper at retro resolutions |
 | Sender-side distance gating | Rejected | The node is content-blind and tick positions are untrusted; viewer-pull matches the mesh's IWANT philosophy |
@@ -2329,8 +2341,11 @@ it.
 5. **Audio lane** (WebCodecs Opus over the node): #189, then karaoke tier 2 and
    the #190 calls; media subscriptions by distance on the node.
 6. **Video lane:** screen share, arcade spectators, then P2 over video.
-7. **Arcade P1** can proceed in parallel with 1–2 (it needs only the proxy for
-   archive ROMs; local files work without it) — in #208 (merged 2026‑10‑12,
+7. **Arcade P1** can proceed in parallel with 1–2 (it needs no lane: a
+   built-in game, or the owner's file sent through the room, or a link on
+   the station; the proxy comes later for an owner's link on another
+   server, with the lanes on — #248 left no archive source on the
+   cabinet) — in #208 (merged 2026‑10‑12,
    after #207; the ⚙️ gear in #243 and the one-game rework in #248 follow it)
    under the same ruling: the CDN opt-in and links on other servers behind
    the flag, the station lane's frame under a content-security policy (§9).
