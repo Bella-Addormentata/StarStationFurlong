@@ -187,7 +187,7 @@ describe('games', () => {
     for (const core of fetched) expect(script, core).toContain(`'@emulatorjs/core-${core}@${version}': 'sha512-`);
   });
 
-  it('pins the commit every fetched core, the engine, RetroArch and the build scripts were built from', () => {
+  it('pins the commit every fetched core, the engine, RetroArch, the build scripts and the RAR unpacker were built from', () => {
     // scripts/emulatorjs-sources.json, which NOTICE.txt names and a release
     // packs (scripts/pack-emulatorjs-source.mjs).
     const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
@@ -197,12 +197,19 @@ describe('games', () => {
       frontend: { repo: string; commit: string };
       build: { repo: string; commit: string };
       cores: Record<string, { repo: string; commit: string }>;
+      helpers: Record<string, { repo: string; commit: string }>;
     };
     const script = read('../scripts/fetch-emulatorjs.mjs');
     expect(sources.version).toBe(script.match(/process\.env\.EJS_VERSION \?\? '([0-9.]+)'/)?.[1]);
     expect(Object.keys(sources.cores).sort()).toEqual([...new Set(ARCADE_CORES.map((c) => c.libretro))].sort());
     for (const s of [sources.engine, sources.frontend, sources.build, ...Object.values(sources.cores)]) {
       expect(s.repo).toMatch(/^https:\/\/github\.com\/EmulatorJS\/[A-Za-z0-9._-]+$/);
+      expect(s.commit, s.repo).toMatch(/^[0-9a-f]{40}$/);
+    }
+    // The engine's prebuilt unpacking helpers whose source is known: the RAR one.
+    expect(Object.keys(sources.helpers)).toEqual(['libunrar']);
+    for (const s of Object.values(sources.helpers)) {
+      expect(s.repo).toMatch(/^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/);
       expect(s.commit, s.repo).toMatch(/^[0-9a-f]{40}$/);
     }
   });

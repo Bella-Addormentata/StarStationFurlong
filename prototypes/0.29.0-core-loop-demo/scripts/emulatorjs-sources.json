@@ -1,5 +1,5 @@
 {
-  "about": "The exact source of the EmulatorJS a release ships: what each part was built from, by full commit hash. scripts/pack-emulatorjs-source.mjs says how each was found and packs them; scripts/fetch-emulatorjs.mjs names them in NOTICE.txt.",
+  "about": "The exact source of the EmulatorJS a release ships: what each part was built from, by full commit hash. scripts/pack-emulatorjs-source.mjs says how each was found and packs them; scripts/fetch-emulatorjs.mjs names them in NOTICE.txt. helpers: the source of EmulatorJS's prebuilt unpacking helpers (data/compression/) where it is known, which is libunrar's alone.",
   "version": "4.2.1",
   "engine": { "repo": "https://github.com/EmulatorJS/EmulatorJS", "commit": "13362ef0786990e93462f06505de772031cfc4c2" },
   "frontend": { "repo": "https://github.com/EmulatorJS/RetroArch", "commit": "40b2c7c833d5331bfd614f1d47d524a16dcb1b8e" },
@@ -16,5 +16,8 @@
     "pcsx_rearmed": { "repo": "https://github.com/EmulatorJS/pcsx_rearmed", "commit": "2b859b303daa012f1658bae7f1530967cff6d961" },
     "stella2014": { "repo": "https://github.com/EmulatorJS/stella2014-libretro", "commit": "1f578c36382bb5a86a0fe245973fa557f369738b" },
     "mednafen_pce": { "repo": "https://github.com/EmulatorJS/beetle-pce-libretro", "commit": "e1ac90d5a97ad328c51b8b01e68da8af5faa1579" }
+  },
+  "helpers": {
+    "libunrar": { "repo": "https://github.com/tnikolai2/libunrar-js", "commit": "294e362691041b70bef818628e7dfb012b2474aa" }
   }
 }

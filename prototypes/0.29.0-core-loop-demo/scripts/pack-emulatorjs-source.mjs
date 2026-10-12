@@ -26,6 +26,15 @@
  *     archive carries.
  *   - the engine: the commit of its v<version> tag, whose data/ is the npm
  *     package's, file for file.
+ *   - the engine's unpacking helpers (data/compression/), files EmulatorJS
+ *     has carried prebuilt since 2021, where their source is known (under
+ *     `helpers`). libunrar.js and libunrar.wasm are tnikolai2/libunrar-js's
+ *     build of RARLAB's UnRAR 5.9.2 (EmulatorJS's data/compression/README.md,
+ *     added after 4.2.1, names it): its libunrar.wasm is EmulatorJS's byte
+ *     for byte, and its libunrar.js is EmulatorJS's but for a six-line
+ *     header. Nothing says what extract7z.js and extractzip.js were built
+ *     from, so theirs is the one source the archive cannot carry, and its
+ *     README.txt says so.
  * Each tree is fetched by that hash, checked to be that commit, and packed
  * without git's own files. A core's submodules are packed when its web
  * build compiles them, and emulatorjs-sources.json lists those under the
@@ -67,12 +76,17 @@ for (const core of cores) {
   if (!/^[a-z0-9_]+$/.test(core)) throw new Error(`'${core}' is not a core's name`);
   if (!Object.hasOwn(sources.cores, core)) throw new Error(`core ${core} has no source pinned in emulatorjs-sources.json`);
 }
+const helpers = Object.entries(sources.helpers ?? {});
+for (const [helper] of helpers) {
+  if (!/^[a-z0-9_]+$/.test(helper)) throw new Error(`emulatorjs-sources.json: '${helper}' is not a helper's name`);
+}
 /** Every tree the archive carries: where it goes and what it is. */
 const trees = [
   { dir: 'EmulatorJS', what: `the engine, EmulatorJS ${sources.version}`, ...sources.engine },
   { dir: 'RetroArch', what: "RetroArch, EmulatorJS's fork, which every core is linked with", ...sources.frontend },
   { dir: 'build', what: "EmulatorJS's build scripts (build.sh, cores.json), which built the cores", ...sources.build },
   ...cores.map((core) => ({ dir: `cores/${core}`, what: `the ${core} core`, ...sources.cores[core] })),
+  ...helpers.map(([helper, s]) => ({ dir: `helpers/${helper}`, what: `the source of the engine's ${helper} (EmulatorJS/data/compression/${helper}.*)`, ...s })),
 ];
 
 const work = mkdtempSync(join(tmpdir(), 'ejs-source-'));
@@ -137,6 +151,11 @@ try {
     'when its web build compiles them; the others are named below with their commits.',
     'build/build.sh is how EmulatorJS built the cores: it clones RetroArch and each',
     'core, builds the core, and links it with RetroArch.',
+    'Two files have no source here: EmulatorJS/data/compression/extract7z.js and',
+    'extractzip.js, the 7z and zip unpackers, which EmulatorJS has only ever',
+    'published built, since 2021, with nothing to say what they were built from.',
+    "The RAR unpacker beside them is helpers/libunrar/'s build (UnRAR 5.9.2's",
+    "source is in it, as RARLAB's tarball).",
     '',
     ...listed.map((l) => `${l}\n`),
   ].join('\n'));

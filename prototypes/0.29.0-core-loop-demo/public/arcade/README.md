@@ -69,6 +69,7 @@ commit it was built from.
 | snes9x | SNES | Snes9x, **non-commercial** | [`licenses/Snes9x.txt`](licenses/Snes9x.txt) |
 | fbneo | Arcade (FBNeo) | FBNeo, **non-commercial**, and no asking for donations for a project that uses it | [`licenses/FBNeo.txt`](licenses/FBNeo.txt) |
 | mame2003_plus | Arcade (MAME 2003-Plus) | MAME 0.78, **non-commercial** | [`licenses/MAME-2003-Plus.txt`](licenses/MAME-2003-Plus.txt) |
+| libunrar (EmulatorJS's RAR unpacker), RARLAB's UnRAR 5.9.2 | RAR files | UnRAR's own (free to use and pass on; not for making a RAR archiver) | [`licenses/UnRAR.txt`](licenses/UnRAR.txt) |
 
 The four non-commercial cores are in release builds because Star Station
 Furlong is non-commercial (the owner, 2026-10-12). FBNeo's license also forbids
@@ -92,6 +93,16 @@ were; each core's own version string names its commit, and
 (`scripts/pack-emulatorjs-source.mjs` says how each was found, and packs the
 archive). `NOTICE.txt` names each commit, and the archive's `README.txt` lists
 them with the submodules left out, which the cores' web builds don't compile.
+
+EmulatorJS's unpacking helpers under `data/compression/` open 7z, zip and RAR
+files, each in a worker of its own; every core arrives as a 7z archive. They are
+prebuilt files EmulatorJS has carried since 2021. The RAR one (`libunrar.js`,
+`libunrar.wasm`) is [libunrar-js](https://github.com/tnikolai2/libunrar-js),
+RARLAB's UnRAR 5.9.2 built for the web: its `libunrar.wasm` is EmulatorJS's byte
+for byte, so the archive carries its source too, UnRAR's included. Nothing says
+what `extract7z.js` and `extractzip.js` were built from, EmulatorJS included, so
+theirs is the one source the archive can't carry; it holds them as EmulatorJS
+ships them.
 
 ## Adding a game
 
