@@ -410,15 +410,16 @@ pub struct HubState {
     /// [`DIAL_PINHOLE_GRACE`]: the NAT mapping our Initials opened outlives
     /// the dial task, so an inbound connection from one of them inside the
     /// grace is not unsolicited and proves nothing about reachability.
-    /// Written by `dial_peer_with_retry`, read and pruned by `dialed_lately`.
+    /// Written and pruned by `release_dial`, read and pruned by `dialed_lately`.
     #[cfg(feature = "chia-read")]
     pub recent_dials: Mutex<HashMap<PublicKey, std::time::Instant>>,
     /// #231 P6a: serializes contact-card sends with room-posture changes. The
-    /// maintenance loop holds it from reading a room's posture through the
-    /// sends of that batch (each bounded by `CARD_SEND_TIMEOUT`); the local
-    /// browser's cap lane takes it before a cap is accepted. A cap turning a
-    /// room public therefore lands between batches, never inside one, and no
-    /// card authorized by a posture since replaced can leave.
+    /// maintenance loop holds it from reading a room's posture through ONE
+    /// send (bounded by `CARD_SEND_TIMEOUT`), card by card; the local browser's
+    /// cap lane takes it before a cap is accepted. A cap turning a room public
+    /// therefore waits for one send at most, lands between two, and the next
+    /// send's check sees it, so no card authorized by a posture since replaced
+    /// can leave.
     #[cfg(feature = "chia-read")]
     pub card_gate: tokio::sync::Mutex<()>,
     /// #231 P6a: the chain peak the watcher (or the publisher) read last, with
@@ -788,7 +789,8 @@ const AUTO_ADDR_RECHECK_SECS: u64 = 300;
 /// where a home-router port-forward cannot produce inbound reachability, and
 /// the other special-purpose ranges that never route on the internet: this
 /// network (0.0.0.0/8), IETF protocol assignments (192.0.0.0/24), benchmarking
-/// (198.18.0.0/15), multicast (224.0.0.0/4) and reserved (240.0.0.0/4). Since
+/// (198.18.0.0/15), multicast (224.0.0.0/4), reserved (240.0.0.0/4) and the
+/// deprecated 6to4 relay anycast block (192.88.99.0/24, RFC 7526). Since
 /// #231 P6a the same judge decides what a presence record may carry, so a
 /// non-global address is never written to the chain either.
 fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
@@ -796,6 +798,7 @@ fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
     let cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64; // 100.64.0.0/10
     let this_network = o[0] == 0; // 0.0.0.0/8
     let ietf_assignments = o[0] == 192 && o[1] == 0 && o[2] == 0; // 192.0.0.0/24
+    let six_to_four_relay = o[0] == 192 && o[1] == 88 && o[2] == 99; // 192.88.99.0/24
     let benchmarking = o[0] == 198 && (o[1] & 0xfe) == 18; // 198.18.0.0/15
     let reserved = o[0] >= 240; // 240.0.0.0/4 (broadcast included)
     !(ip.is_private()
@@ -808,6 +811,7 @@ fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
         || cgnat
         || this_network
         || ietf_assignments
+        || six_to_four_relay
         || benchmarking
         || reserved)
 }
@@ -815,8 +819,9 @@ fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
 /// v6 companion to [`ipv4_is_public`] (Slice 5b): rejects loopback/unspecified/
 /// multicast, link-local (fe80::/10), the deprecated site-local (fec0::/10),
 /// ULA (fc00::/7), documentation (2001:db8::/32 and 3fff::/20), benchmarking
-/// (2001:2::/48), ORCHIDv2 (2001:20::/28) and the discard-only 100::/64; keeps
-/// global unicast. An IPv4 wearing IPv6 clothing is
+/// (2001:2::/48), ORCHIDv2 (2001:20::/28), the discard-only 100::/64, the
+/// local-use translation prefix 64:ff9b:1::/48 (RFC 8215) and the SRv6 SID
+/// space 5f00::/16 (RFC 9602); keeps global unicast. An IPv4 wearing IPv6 clothing is
 /// judged as THAT IPv4 — mapped `::ffff:a.b.c.d`, the deprecated compatible
 /// `::a.b.c.d`, 6to4 `2002:AABB:CCDD::` and NAT64 `64:ff9b::a.b.c.d` — so
 /// `[::ffff:192.168.1.1]` cannot smuggle a LAN address past the v4 checks and
@@ -850,7 +855,9 @@ fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
         || (seg[0] == 0x3fff && (seg[1] >> 12) == 0) // 3fff::/20 documentation
         || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0) // 2001:2::/48 benchmarking
         || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
-        || (seg[0] == 0x0100 && seg[1..4] == [0, 0, 0])) // 100::/64 discard-only
+        || (seg[0] == 0x0100 && seg[1..4] == [0, 0, 0]) // 100::/64 discard-only
+        || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001) // 64:ff9b:1::/48 local-use translation
+        || seg[0] == 0x5f00) // 5f00::/16 SRv6 SIDs
 }
 
 /// Slice 5b addr-trust filter: a chia-resolved record's addrs are SELF-declared,
@@ -911,6 +918,9 @@ mod chia_addr_filter_tests {
             "[2001:2::1]:1",                         // benchmarking v6 -> drop
             "[2001:20::1]:1",                        // ORCHIDv2 -> drop
             "[3fff::1]:1",                           // documentation v6 (3fff::/20) -> drop
+            "192.88.99.1:1",                         // deprecated 6to4 relay anycast -> drop
+            "[64:ff9b:1::1]:1",                      // local-use IPv4/IPv6 translation -> drop
+            "[5f00::1]:1",                           // SRv6 SID space -> drop
             "8.8.8.8:44442",                         // public v4 -> KEEP
             "[2600:1700:68a0:8ca0::29]:58828",       // public v6 -> KEEP
         ]
@@ -924,7 +934,7 @@ mod chia_addr_filter_tests {
         assert_eq!(kept[1], "8.8.8.8:44442");
         for bad in [
             "192.168", "127.0.0.1", "100.64", "169.254", "fe80", "fc00", "203.0.113", "198.18", "240.0", "0.1.2.3",
-            "224.0", "192.0.0", "fec0", "100::", "2001:2:", "2001:20:", "3fff",
+            "224.0", "192.0.0", "fec0", "100::", "2001:2:", "2001:20:", "3fff", "192.88.99", "64:ff9b:1:", "5f00",
         ] {
             assert!(!kept.iter().any(|s| s.contains(bad)), "{bad} should be filtered out");
         }
@@ -2254,6 +2264,12 @@ fn dialed_lately(hub: &HubState, peer: &PublicKey, now: std::time::Instant) -> b
 /// hold up the browser's room caps.
 #[cfg(feature = "chia-read")]
 const CARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one maintenance tick may spend on contact-card sends across all
+/// its rooms; the rest wait for the next tick, so the loop's other duties
+/// (heartbeats, prunes, grafts) run on time whatever the peers do.
+#[cfg(feature = "chia-read")]
+const CARD_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Release a dial's single-flight claim once its task ended, however it ended,
 /// remembering the dial for the pinhole grace FIRST: every path that claims a
@@ -3806,6 +3822,8 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
         }
 
         // Off-lock: heartbeats (datagram), IHAVE adverts (control), graft dials.
+        #[cfg(feature = "chia-read")]
+        let cards_started = std::time::Instant::now();
         for w in work {
             for conn in &w.heartbeat_conns {
                 let _ = conn.send_datagram(HEARTBEAT_MAGIC.to_vec().into());
@@ -3815,30 +3833,40 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
             // holds, is marked as having it.
             #[cfg(feature = "chia-read")]
             if !w.cards.is_empty() {
-                // Posture and sends under one gate: a cap turning this room
-                // public waits for the sends in flight (each bounded by
-                // `CARD_SEND_TIMEOUT`) and the next check sees it, so no card
-                // authorized by a posture since replaced can leave.
-                let _gate = hub.card_gate.lock().await;
                 let card = chia_contact::make_card(&hub.secret_key, &hub.contact_key, chia_resolve::unix_now());
                 if let Ok(payload) = serde_json::to_vec(&card) {
                     let mut delivered: Vec<(PublicKey, usize)> = Vec::new();
                     for (peer, conn) in &w.cards {
-                        // The room's posture was read before the lock was dropped;
-                        // a cap that made the room public since then stops the
-                        // rest of the batch — no card leaves for a public room.
-                        let still_sharing =
-                            hub.chia_rooms.lock().unwrap().get(&w.room).is_some_and(|cap| cap.may_share_card());
-                        if !still_sharing {
-                            println!("📇 room {} is no longer private — the remaining contact cards are not sent", w.room);
+                        // The tick's card budget: `remote_peers` is not capped (only
+                        // the mesh neighbors are) and a stalled send costs a whole
+                        // `CARD_SEND_TIMEOUT`, so a room full of stalled connections
+                        // must not keep every other room's heartbeats and prunes
+                        // waiting. Unsent peers stay unmarked and get the card next tick.
+                        if cards_started.elapsed() >= CARD_BATCH_BUDGET {
+                            println!("📇 room {}: this tick's card budget is spent — the remaining contact cards go next tick", w.room);
                             break;
                         }
-                        let sent = tokio::time::timeout(
-                            CARD_SEND_TIMEOUT,
-                            send_control(&hub, conn, &w.room, "contact", 0, payload.clone()),
-                        )
-                        .await
-                        .unwrap_or(false);
+                        // Posture and ONE send under the gate: a cap turning this
+                        // room public waits at most for the send in flight (bounded
+                        // by `CARD_SEND_TIMEOUT`), lands between two sends, and the
+                        // next check sees it — so no card authorized by a posture
+                        // since replaced can leave, and the browser's caps never
+                        // wait for a whole batch.
+                        let sent = {
+                            let _gate = hub.card_gate.lock().await;
+                            let still_sharing =
+                                hub.chia_rooms.lock().unwrap().get(&w.room).is_some_and(|cap| cap.may_share_card());
+                            if !still_sharing {
+                                println!("📇 room {} is no longer private — the remaining contact cards are not sent", w.room);
+                                break;
+                            }
+                            tokio::time::timeout(
+                                CARD_SEND_TIMEOUT,
+                                send_control(&hub, conn, &w.room, "contact", 0, payload.clone()),
+                            )
+                            .await
+                            .unwrap_or(false)
+                        };
                         if sent {
                             delivered.push((*peer, conn.stable_id()));
                         } else {

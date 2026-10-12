@@ -65,11 +65,15 @@ pub const TARGET_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// through the whole book, the longest-waiting first.
 pub const MAX_CK_READS_PER_TICK: usize = 8;
 
-/// The block beat: when does a room read its hints?
+/// The block beat: when does a room (or a contact key, or our own key) read
+/// its hints? Entries are keyed by [`room_sched_key`], [`ck_sched_key`] and
+/// [`SELF_SCHED_KEY`], three disjoint shapes: a room id is a free string, so a
+/// room that happened to be named like another entry could otherwise take its
+/// beat and keep that read from ever falling due.
 #[derive(Debug, Default)]
 pub struct BeatSchedule {
     beat_blocks: u32,
-    /// Peak height at the last read, per room.
+    /// Peak height at the last read, per schedule key.
     last_read: HashMap<String, u32>,
 }
 
@@ -88,23 +92,23 @@ impl BeatSchedule {
         Self::new(blocks)
     }
 
-    /// A read is due the first time a room is seen and whenever the peak has
-    /// crossed into a new beat since the room's last read. A connected room's
+    /// A read is due the first time a key is seen and whenever the peak has
+    /// crossed into a new beat since the key's last read. A connected room's
     /// beats are `CONNECTED_BEAT_MULTIPLIER` times longer. Records the read.
-    pub fn due(&mut self, room: &str, peak_height: u32, connected: bool) -> bool {
+    pub fn due(&mut self, key: &str, peak_height: u32, connected: bool) -> bool {
         let stride = self.beat_blocks * if connected { CONNECTED_BEAT_MULTIPLIER } else { 1 };
-        let due = match self.last_read.get(room) {
+        let due = match self.last_read.get(key) {
             None => true,
             Some(&last) => peak_height > last && peak_height / stride != last / stride,
         };
         if due {
-            self.last_read.insert(room.to_string(), peak_height);
+            self.last_read.insert(key.to_string(), peak_height);
         }
         due
     }
 
-    pub fn forget(&mut self, room: &str) {
-        self.last_read.remove(room);
+    pub fn forget(&mut self, key: &str) {
+        self.last_read.remove(key);
     }
 
     /// Peak height at the last read of `key`, if it was ever read.
@@ -289,7 +293,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             .collect();
         for room in &gone {
             cache.remove(room);
-            sched.forget(room);
+            sched.forget(&room_sched_key(room));
         }
         // Keep only the cursors of hints still in play: this tick's three scan
         // epochs of each readable room. A hint that rotated out of
@@ -317,9 +321,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         for (node_id, ck, _) in &peers {
             by_ck.entry(*ck).or_default().push(node_id.clone());
         }
-        sched.forget_where(|key| {
-            key.strip_prefix("ck:").is_some_and(|k| k != "self" && !by_ck.keys().any(|ck| ck_sched_key(ck) == key))
-        });
+        let live_ck_keys: HashSet<String> = by_ck.keys().map(ck_sched_key).collect();
+        sched.forget_where(|key| key.starts_with(CK_SCHED_PREFIX) && !live_ck_keys.contains(key));
         // Nothing to read for, unless the publisher may have written OUR record:
         // then the own-key read below must run every beat, since it is what
         // confirms the write (a fresh node has no rooms or cards yet, and an
@@ -349,7 +352,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             let rc = cache.entry(room.clone()).or_default();
 
             // Beat-aligned chain read (skipped when the peak is unknown).
-            if peak > 0 && sched.due(&room, peak, !connected.is_empty()) {
+            if peak > 0 && sched.due(&room_sched_key(&room), peak, !connected.is_empty()) {
                 let mut found = Vec::new();
                 for e in chia_resolve::scan_epochs(now_unix) {
                     let hint = chia_lane::derive_hint(&room_key, e);
@@ -413,7 +416,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         // records (further below) run without one, as the room records' do.
         if peak > 0 {
             let own_ck = hub.contact_key;
-            if sched.due("ck:self", peak, false) {
+            if sched.due(SELF_SCHED_KEY, peak, false) {
                 match chia_resolve::read_ck(&client, &own_ck, peak, now_unix, &mut self_cursors).await {
                     Ok(found) => {
                         if let Some(newest) = found
@@ -618,8 +621,6 @@ fn spawn_hold(
     });
 }
 
-/// The beat-schedule key of a contact key (a hint prefix: the key itself never
-/// appears in a log line).
 /// The order contact keys are offered a read in this tick: never-read keys
 /// first, then by the peak height of their last read (longest waiting first),
 /// ties broken by the key bytes so the order is stable.
@@ -636,7 +637,17 @@ fn ck_read_order(by_ck: &HashMap<[u8; 32], Vec<String>>, sched: &BeatSchedule) -
 /// prefix (a member who knows another's key can mint one) never share an entry
 /// and shadow each other's reads.
 fn ck_sched_key(ck: &[u8; 32]) -> String {
-    format!("ck:{}", hex::encode(ck))
+    format!("{CK_SCHED_PREFIX}{}", hex::encode(ck))
+}
+const CK_SCHED_PREFIX: &str = "ck:";
+
+/// The beat entry of the read of our own contact key.
+const SELF_SCHED_KEY: &str = "self";
+
+/// The beat entry of a room record read. Room ids are free strings, so the
+/// prefix keeps a room named `self` or `ck:…` from taking another entry's beat.
+fn room_sched_key(room: &str) -> String {
+    format!("room:{room}")
 }
 
 /// The rooms `node_id` is connected in right now.
@@ -727,6 +738,28 @@ mod tests {
         let s = BeatSchedule::new(0);
         assert_eq!(s.beat_blocks, 1, "zero is clamped, never a division by zero");
         assert_eq!(BeatSchedule::new(DEFAULT_BEAT_BLOCKS).beat_blocks, 32);
+    }
+
+    #[test]
+    fn schedule_keys_of_rooms_own_key_and_contact_keys_never_collide() {
+        // Room ids are free strings: a room named like another entry must not
+        // take its beat, or that read would never fall due again.
+        let ck = [7u8; 32];
+        let ck_key = ck_sched_key(&ck);
+        for name in ["self", "ck:self", ck_key.as_str(), "room:x"] {
+            assert_ne!(room_sched_key(name), SELF_SCHED_KEY);
+            assert_ne!(room_sched_key(name), ck_key);
+        }
+        assert_ne!(SELF_SCHED_KEY, ck_key);
+        let mut s = BeatSchedule::new(32);
+        assert!(s.due(&room_sched_key("self"), 1_000, false));
+        assert!(s.due(&room_sched_key(&ck_key), 1_000, false));
+        assert!(s.due(SELF_SCHED_KEY, 1_000, false), "the own-key read is still due after those rooms read");
+        assert!(s.due(&ck_key, 1_000, false), "and so is the contact key's");
+        // Forgetting a room leaves the contact key's entry and our own alone.
+        s.forget(&room_sched_key(&ck_key));
+        assert!(!s.due(&ck_key, 1_000, false));
+        assert!(!s.due(SELF_SCHED_KEY, 1_000, false));
     }
 
     #[test]
