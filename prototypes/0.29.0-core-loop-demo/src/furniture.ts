@@ -44,6 +44,7 @@ import type {
   AirHockeyVisualHandle,
   AlligatorsVisualHandle,
   PropAnimHandle,
+  FaucetDishHandle,
 } from "./devices";
 // 🪙 Coin pusher visual driver: the cabinet draws the engine's cross-section —
 // the pusher bar from the sweep clock, the piles from the shared state.
@@ -167,6 +168,7 @@ export type FurnitureKind =
   | "engine-block"
   | "helm-console"
   | "cashier-atm"
+  | "faucet-dish"
   | "roulette-table"
   | "craps-table"
   | "casino-booth"
@@ -4975,6 +4977,22 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 1.3, z: 0 },
     },
   },
+  // 🥣 Faucet dish (#231 onboarding): the Chia faucet coin as furniture. Same
+  // device-front idiom as the cashier; the focused screen is the only place
+  // exact mojo totals show (owner rule), the prop shows a fill level.
+  "faucet-dish": {
+    kind: "faucet-dish",
+    build: buildFaucetDish,
+    footprint: { w: 1, d: 1 },
+    functions: ["faucetDish"],
+    device: {
+      kind: "faucetDish",
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.4, z: -0.95 },
+      anchor: { x: 0, y: 1.0, z: 0 },
+    },
+  },
   "roulette-table": {
     kind: "roulette-table",
     build: buildRouletteTable,
@@ -6833,6 +6851,151 @@ function buildCashierAtm({ m, flat, place }: BuildCtx) {
   sign.rotation.y = Math.PI; // face -z
   // Status pip.
   place(new THREE.SphereGeometry(0.03, 8, 6), flat(0x00e676), 0.3, 0.72, -0.28);
+}
+
+// ── 🥣 Faucet dish (#231 onboarding) — a self-filling dog dish for mojos. ────
+// A pedestal carries a glass jar (the faucet's balance as a FILL LEVEL only:
+// the owner rule keeps exact totals on the focused screen, as at the cashier),
+// a donation slot in the lid, and a spout over a floor dish on the -z front
+// where ONE gold mojo appears while a faucet coin is claimable. World drives
+// it ~1 Hz through the FaucetDishHandle stowed on userData.faucetDish
+// (collected by registerFurnitureHandles) from the node's chain reads.
+function drawFaucetSign(c2d: CanvasRenderingContext2D): void {
+  const W = 256,
+    H = 128;
+  c2d.fillStyle = "#0A0E1A";
+  c2d.fillRect(0, 0, W, H);
+  c2d.strokeStyle = "#D4A84B";
+  c2d.lineWidth = 4;
+  c2d.strokeRect(6, 6, W - 12, H - 12);
+  c2d.fillStyle = "#F0C060";
+  c2d.font = "bold 34px monospace";
+  c2d.textAlign = "center";
+  c2d.textBaseline = "middle";
+  c2d.fillText("FAUCET", W / 2, 42);
+  c2d.font = "bold 20px monospace";
+  c2d.fillStyle = "#7FD6A6";
+  c2d.fillText("· 1 MOJO · FREE ·", W / 2, 88);
+}
+
+function buildFaucetDish({ m, flat, place }: BuildCtx) {
+  const JAR_BOTTOM = 0.86;
+  const JAR_H = 0.46;
+  const steel = m(0x37474f, 0.55, 0.45);
+  const gold = m(0xd4a84b, 0.45, 0.5);
+  // Plinth + column + shelf (station-steel family, like the cashier kiosk).
+  place(new THREE.BoxGeometry(0.6, 0.1, 0.5), m(0x2a3444, 0.7, 0.35), 0, 0.05, 0.1);
+  place(
+    new THREE.CylinderGeometry(0.16, 0.18, 0.7, 20),
+    m(0x1c262e, 0.6, 0.4),
+    0,
+    0.45,
+    0.1,
+  );
+  place(new THREE.BoxGeometry(0.56, 0.06, 0.56), steel, 0, 0.83, 0.1);
+  const collar = place(new THREE.TorusGeometry(0.21, 0.015, 8, 32), gold, 0, JAR_BOTTOM, 0.1);
+  collar.rotation.x = Math.PI / 2;
+  // The jar: barely-there glass, both sides, no depth write — baseOpacity,
+  // never raw opacity (the skylight rule, so the morph keeps it translucent).
+  const glass = m(0x9bd4e8, 0.05, 0.0, 0x0a1a2a, 0.06);
+  glass.side = THREE.DoubleSide;
+  glass.depthWrite = false;
+  glass.userData.baseOpacity = 0.14;
+  place(
+    new THREE.CylinderGeometry(0.2, 0.2, JAR_H + 0.04, 24, 1, true),
+    glass,
+    0,
+    JAR_BOTTOM + JAR_H / 2 + 0.02,
+    0.1,
+  );
+  // The mojos inside: a gold column whose height is the jar's fill level.
+  const liquid = place(
+    new THREE.CylinderGeometry(0.17, 0.17, JAR_H, 20),
+    m(0xf0c060, 0.35, 0.6, 0xd4a84b, 0.35),
+    0,
+    JAR_BOTTOM + JAR_H / 2,
+    0.1,
+  );
+  // Lid with the donation slot (a dark line you drop a coin through).
+  place(
+    new THREE.CylinderGeometry(0.22, 0.22, 0.05, 24),
+    m(0x1c262e, 0.6, 0.4),
+    0,
+    JAR_BOTTOM + JAR_H + 0.065,
+    0.1,
+  );
+  place(new THREE.BoxGeometry(0.16, 0.03, 0.04), steel, 0, JAR_BOTTOM + JAR_H + 0.1, 0.1);
+  place(
+    new THREE.BoxGeometry(0.12, 0.012, 0.012),
+    flat(0x000000),
+    0,
+    JAR_BOTTOM + JAR_H + 0.116,
+    0.1,
+  );
+  // Spout: out of the column toward -z, then down over the dish.
+  place(new THREE.BoxGeometry(0.06, 0.06, 0.26), steel, 0, 0.62, -0.17);
+  place(new THREE.BoxGeometry(0.06, 0.3, 0.06), steel, 0, 0.5, -0.3);
+  // Plaque on the column front (faces -z, the device-front convention).
+  const signCv = document.createElement("canvas");
+  signCv.width = 256;
+  signCv.height = 128;
+  drawFaucetSign(signCv.getContext("2d")!);
+  const signTex = new THREE.CanvasTexture(signCv);
+  signTex.minFilter = THREE.NearestFilter;
+  signTex.magFilter = THREE.NearestFilter;
+  signTex.generateMipmaps = false;
+  signTex.colorSpace = THREE.SRGBColorSpace;
+  const sign = place(
+    new THREE.PlaneGeometry(0.3, 0.15),
+    new THREE.MeshBasicMaterial({
+      map: signTex,
+      transparent: true,
+      opacity: 0,
+    }),
+    0,
+    0.74,
+    -0.09,
+  );
+  sign.rotation.y = Math.PI; // face -z
+  // The dish: a shallow ceramic bowl under the spout, gold rim.
+  place(new THREE.CylinderGeometry(0.2, 0.16, 0.05, 24), m(0xe8e4d8, 0.6, 0.05), 0, 0.025, -0.3);
+  const rim = place(new THREE.TorusGeometry(0.19, 0.02, 8, 32), gold, 0, 0.05, -0.3);
+  rim.rotation.x = Math.PI / 2;
+  // The mojo: one gold disc in the dish, shown only while a coin is claimable.
+  const mojo = place(
+    new THREE.CylinderGeometry(0.07, 0.07, 0.015, 20),
+    m(0xf0c060, 0.3, 0.7, 0xffd54f, 0.6),
+    0,
+    0.058,
+    -0.3,
+  );
+  // Status pips on the drop pipe: green = idle, amber = a take/give in flight.
+  const pipIdle = place(new THREE.SphereGeometry(0.02, 8, 6), flat(0x00e676), 0, 0.4, -0.34);
+  const pipBusy = place(new THREE.SphereGeometry(0.02, 8, 6), flat(0xffd54f), 0, 0.4, -0.34);
+  // Shown/hidden by scale (not .visible) so the morph machinery, which walks
+  // every mesh's material, never fights a flag it did not set.
+  const show = (mesh: THREE.Mesh, on: boolean) => mesh.scale.setScalar(on ? 1 : 0.001);
+  let last = { level: -1, ready: -1, pending: false };
+  const handle: FaucetDishHandle = {
+    setState: (level, ready, pending) => {
+      const lv = Math.min(1, Math.max(0, level));
+      if (lv !== last.level) {
+        const h = Math.max(0.02, lv);
+        liquid.scale.y = h;
+        liquid.position.y = JAR_BOTTOM + (JAR_H * h) / 2;
+      }
+      if (ready > 0 !== last.ready > 0) show(mojo, ready > 0);
+      if (pending !== last.pending) {
+        show(pipIdle, !pending);
+        show(pipBusy, pending);
+      }
+      last = { level: lv, ready, pending };
+    },
+  };
+  show(mojo, false);
+  show(pipBusy, false);
+  handle.setState(0, 0, false);
+  liquid.userData.faucetDish = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 }
 
 function buildRouletteTable(ctx: BuildCtx) {

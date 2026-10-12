@@ -1,0 +1,58 @@
+; ⛓️🥣 SSF faucet coin — the keyless "volunteer wallet" behind the faucet dish
+; (issue #231, onboarding phase beside P8; design: ssf-p2p/faucet-dish-design.md).
+;
+; Anyone may spend a faucet coin, but the ONLY spend this puzzle accepts:
+;   * hands exactly GIFT mojos to the address the spender names,
+;   * returns everything else to this same puzzle hash, so the coin stays a
+;     faucet (or returns nothing when the gift empties it — no dust is left),
+;   * burns at most MAX_FEE mojos as the transaction fee — and the claimer, who
+;     is anyone, picks the fee, so a nonzero cap is a per-window burn allowance
+;     for a griefer. The lobby curries MAX_FEE = 0: a claim pays no fee at all
+;     (it waits for an uncongested mempool), and a claimer with zero coins
+;     still claims alone because the faucet coin is the spend's only input,
+;   * and is valid only GAP blocks after the coin was created
+;     (ASSERT_HEIGHT_RELATIVE): one gift per coin per GAP — the rate limit the
+;     chain enforces with nobody online.
+;
+; Curried (fixed at creation, part of the puzzle hash / address):
+;   ROOM_TAG  32 bytes, blake3-derived from the room key; unused by the logic,
+;             it makes each room's faucet its own address.
+;   GIFT      mojos per claim.
+;   GAP       blocks between claims of one coin.
+;   MAX_FEE   mojos a claim may burn as fee (0 for the lobby; a private room's
+;             dish may curry a small cap at its own risk, see above).
+; Solution (the claimer's):
+;   my_puzzle_hash  this coin's puzzle hash (asserted, so it can be recreated)
+;   my_amount       this coin's amount (asserted)
+;   recipient_ph    32-byte puzzle hash receiving GIFT
+;   fee             mojos left unspent as the fee, 0 ≤ fee ≤ MAX_FEE
+;
+; Compiled with clvm_tools `run` (clvm_tools_rs 0.4.0); the hex and its tree
+; hash are pinned in src/chia_faucet.rs and checked by its tests.
+(mod (ROOM_TAG GIFT GAP MAX_FEE my_puzzle_hash my_amount recipient_ph fee)
+
+  (defconstant CREATE_COIN 51)
+  (defconstant ASSERT_MY_PUZZLEHASH 72)
+  (defconstant ASSERT_MY_AMOUNT 73)
+  (defconstant ASSERT_HEIGHT_RELATIVE 82)
+
+  (defun-inline remainder () (- my_amount (+ GIFT fee)))
+
+  (defun-inline base-conditions ()
+    (list
+      (list ASSERT_MY_PUZZLEHASH my_puzzle_hash)
+      (list ASSERT_MY_AMOUNT my_amount)
+      (list ASSERT_HEIGHT_RELATIVE GAP)
+      (list CREATE_COIN recipient_ph GIFT)))
+
+  (if (all
+        (not (> fee MAX_FEE))
+        (not (> 0 fee))
+        (not (> (+ GIFT fee) my_amount))
+        (= (strlen recipient_ph) 32)
+        ; the coin that stays behind must itself be claimable (≥ GIFT) or gone
+        (any (= (remainder) 0) (not (> GIFT (remainder)))))
+      (if (> (remainder) 0)
+          (c (list CREATE_COIN my_puzzle_hash (remainder)) (base-conditions))
+          (base-conditions))
+      (x "faucet: bad solution")))

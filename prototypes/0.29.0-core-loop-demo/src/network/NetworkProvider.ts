@@ -24,6 +24,7 @@ import type {
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
 import { buildRoomCapPayload, nextCapSeq, readChiaMode } from './roomCap.ts';
+import type { FaucetOp, FaucetRequestTicket } from '../faucetDish.ts';
 
 export interface NetworkDebugInfo {
   mode: TransportMode;
@@ -57,6 +58,14 @@ export class NetworkProvider implements NetworkProviderPort {
   #datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #tickHandler: ((buf: Uint8Array) => void) | null = null;
   #envelopeHandler: ((env: any) => void) | null = null;
+  /** Replies to our own `faucet` requests: delivered ONLY from the stream the
+   *  request went out on, never from a node-opened stream (a peer's forwarded
+   *  envelope must not pass for the node's answer). */
+  #faucetReplyHandler: ((env: any) => void) | null = null;
+  /** Monotonic `seq` on faucet requests; the node echoes it on the reply, so
+   *  the dish can tell the reply to its pending TAKE/GIVE from any other (each
+   *  request is its own stream, and streams complete in any order). */
+  #faucetSeq = 0;
   #isActive = false;
 
   #pingSent = 0;
@@ -259,7 +268,9 @@ export class NetworkProvider implements NetworkProviderPort {
       const stream = await this.#wt.createBidirectionalStream();
       const writer = stream.writable.getWriter();
       await writer.write(packet);
-      writer.releaseLock();
+      // close() sends FIN: the node's reader sees EOF and ends its stream task.
+      // Only releasing the lock left every cap stream open until disconnect.
+      await writer.close();
     } catch (e) {
       console.warn('Failed to send room cap to node:', e);
     }
@@ -293,24 +304,104 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
+  /** ⛓️🥣 Ask the LOCAL node about this room's faucet dish — `status` (what is
+   *  in the jar and the dish), `claim` (take the ready mojo to our wallet) or
+   *  `give` (pay `amount` mojos from our wallet into the jar). One fresh
+   *  bidirectional stream per request, the `cap` framing; the node answers on
+   *  that stream with a `faucet` envelope, which arrives through onFaucetReply
+   *  and nowhere else. The node derives the faucet address from the room key
+   *  it already holds from `cap`, so nothing secret travels here.
+   *
+   *  Returns the request's `seq` at once, with `sent`: a promise that resolves
+   *  once the request is on the wire and REJECTS when it never left (no node
+   *  connection, or the stream failed before the frame was written), so the
+   *  caller can drop its pending TAKE/GIVE at once. The seq is allotted here,
+   *  before anything is written, so the dish keys the pending action on it
+   *  before any reply can arrive. A failure AFTER the write is indeterminate
+   *  and resolves (see below).
+   *
+   *  The reply is accepted only while the transport this request went out on
+   *  is still the live one: a stream of a session since left can outlive
+   *  disconnect() (its read is still pending), and a reconnect that lands the
+   *  same room before it ends must not take that session's stale status or
+   *  error as its own. */
+  requestFaucet(op: FaucetOp, amount?: number): FaucetRequestTicket {
+    const seq = ++this.#faucetSeq;
+    return { seq, sent: this.#sendFaucetRequest(op, amount, seq) };
+  }
+
+  async #sendFaucetRequest(op: FaucetOp, amount: number | undefined, seq: number): Promise<void> {
+    const boot = this.#boot;
+    const wt = this.#wt;
+    if (!wt || this.#mode === 'offline' || !boot) {
+      throw new Error('no connection to your node');
+    }
+    try {
+      const body: { op: FaucetOp; amount?: number } = { op };
+      if (op === 'give') body.amount = Math.max(0, Math.floor(amount ?? 0));
+      const payloadBytes = new TextEncoder().encode(JSON.stringify(body));
+      const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
+      const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq, author: '', payload: payloadB64 };
+      const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
+      const packet = new Uint8Array(4 + jsonBytes.length);
+      new DataView(packet.buffer).setUint32(0, jsonBytes.length, true);
+      packet.set(jsonBytes, 4);
+      const stream = await wt.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(packet);
+      // One request per stream: close() sends FIN, so after its reply the node
+      // finishes its side too and this stream ends instead of living (and
+      // holding a node task) until disconnect — one leak per status poll.
+      // The frame is on the wire once write() resolves, so a close() that fails
+      // (a reset while the FIN is in flight) is a failure of the stream's
+      // cleanup, not of the request: the node may well have read the frame and
+      // be acting on it. It is logged, the reply is still awaited, and the
+      // request is NOT reported as never sent — that would drop a pending
+      // TAKE/GIVE and invite a second one.
+      try {
+        await writer.close();
+      } catch (e) {
+        console.warn('Faucet request stream did not close cleanly (the node may still answer):', e);
+      }
+      // The reply comes back on THIS stream, and only a reply is accepted from
+      // it: the generic envelope path never sees it, and nothing that arrives
+      // on a node-opened stream can pass for it. Bound to `wt`: the drain
+      // stops delivering the moment that transport is no longer the live one.
+      void this.#drainNodeStream(stream, wt, (env) => {
+        if (env?.kind === 'faucet') this.#faucetReplyHandler?.(env);
+      });
+    } catch (e) {
+      console.warn('Failed to send faucet request to node:', e);
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+  }
+
   /** Register a handler for envelopes arriving on node-initiated streams
    *  (remote peers' ysync updates, bridge dial-status, future chat lanes). */
   onEnvelope(handler: (env: any) => void): void {
     this.#envelopeHandler = handler;
   }
 
+  /** Register the handler for the node's replies to requestFaucet. */
+  onFaucetReply(handler: (env: any) => void): void {
+    this.#faucetReplyHandler = handler;
+  }
+
   /** Accept and drain every bidirectional stream the NODE opens toward us.
    *  Each stream carries u32-LE length-framed JSON SsfEnvelopes (same wire
    *  format as browser→node streams). */
   async #listenIncomingStreams(): Promise<void> {
-    if (!this.#wt) return;
+    // THIS session's transport: every stream it hands us is drained for as long
+    // as it stays the live one, and not a read longer.
+    const wt = this.#wt;
+    if (!wt) return;
     try {
-      const reader = this.#wt.incomingBidirectionalStreams.getReader();
-      while (this.#isActive) {
+      const reader = wt.incomingBidirectionalStreams.getReader();
+      while (this.#isActive && this.#wt === wt) {
         const { value: stream, done } = await reader.read();
         if (done) break;
         this.#openChannels++;
-        void this.#drainNodeStream(stream);
+        void this.#drainNodeStream(stream, wt);
       }
     } catch (e) {
       if (this.#isActive) {
@@ -319,13 +410,27 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
-  async #drainNodeStream(stream: { readable: ReadableStream<Uint8Array> }): Promise<void> {
+  /** Read length-framed envelopes off `stream` until it ends. Node-opened
+   *  streams deliver to the generic handler; a request stream we opened passes
+   *  its own `deliver`, so its replies never mix with forwarded traffic.
+   *
+   *  `owner` is the transport the stream belongs to. A read already pending
+   *  when disconnect() runs resolves later — possibly after a reconnect has
+   *  made the provider active again on a NEW transport — and what it read then
+   *  belongs to the session that was left, not to the live one: nothing is
+   *  delivered, and the drain ends, once `owner` is no longer `this.#wt`. */
+  async #drainNodeStream(
+    stream: { readable: ReadableStream<Uint8Array> },
+    owner: unknown,
+    deliver: (env: any) => void = (env) => this.#envelopeHandler?.(env),
+  ): Promise<void> {
     const reader = stream.readable.getReader();
     let buffer = new Uint8Array(0);
+    const live = (): boolean => this.#isActive && this.#wt === owner;
     try {
-      while (this.#isActive) {
+      while (live()) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done || !live()) break;
         const merged = new Uint8Array(buffer.length + value.length);
         merged.set(buffer, 0);
         merged.set(value, buffer.length);
@@ -339,7 +444,7 @@ export class NetworkProvider implements NetworkProviderPort {
           buffer = buffer.subarray(4 + len);
           try {
             const envelope = JSON.parse(new TextDecoder().decode(payloadBytes));
-            this.#envelopeHandler?.(envelope);
+            deliver(envelope);
           } catch (e) {
             console.warn('Failed to parse node-initiated envelope:', e);
           }

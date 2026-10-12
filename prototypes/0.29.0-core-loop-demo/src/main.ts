@@ -14,6 +14,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
+import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
 import { roomIsPublicSpace } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
@@ -1810,6 +1811,10 @@ async function joinRoomAtEpoch(
   // the right room; sequential re-joins overwrite correctly. The bootstrap
   // roomId, NOT the editable display name.
   (window as any).__ssfRoomId = boot.roomId;
+  // 🥣 The faucet dish's store listens to this room's node from here on
+  // (before the connect await, so the first poll's reply is filed); the leave
+  // closes it again before anything else (faucetDish.ts, openFaucetRoom).
+  openFaucetRoom(boot.roomId);
   updateHUDNode("ONLINE", "#00e676");
   // Connect with a cert-refresh retry on the LOCAL loopback dial: the node's WT
   // cert regenerates every launch, so a stale hash fails the handshake — on
@@ -1976,6 +1981,13 @@ async function joinRoomAtEpoch(
         yjsSync?.ingestEnvelope(env);
         return;
       }
+      // 🥣 Faucet lane (#231 onboarding): the node answers the dish's
+      // status / take / give requests on the stream they came in on, and that
+      // reply reaches faucetDish.ts through onFaucetReply below. A `faucet`
+      // envelope on a node-opened stream is NOT the node's answer (the node
+      // drops peer-sent ones, but an older node forwards them), so it is
+      // ignored here: nothing a room peer sends may set the dish's address.
+      if (env.kind === "faucet") return;
       if (env.kind === "bridge" && typeof env.payload === "string") {
         try {
           const status = JSON.parse(atob(env.payload)) as {
@@ -3250,6 +3262,17 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   setActivePassRoom(null);
   // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
   clearChatBubbles();
+  // 🥣 The faucet dish's last status, error and pending TAKE/GIVE belong to
+  // this room's node session: forget them, so a revisit reads the chain
+  // afresh instead of showing stale balances or a stale TAKING… line. The
+  // store's gate closes first (synchronously, before any await below), so a
+  // reply still in flight, or a request failing to leave during the flush,
+  // cannot put the state back once it is cleared (faucetDish.ts).
+  closeFaucetRoom();
+  {
+    const leavingRoomId = activeBootstrap?.roomId ?? networkProvider.getBootRecord()?.roomId;
+    if (leavingRoomId) clearFaucetRoom(leavingRoomId);
+  }
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
   settleReqUnsub?.();
   settleReqUnsub = null;
@@ -10059,6 +10082,31 @@ async function init() {
   // Create world
   world = new worldModule.World(scene);
   (window as any).world = world;
+
+  // 🥣 Faucet dish (#231 onboarding): the fixture's take / give / status
+  // requests go to the LOCAL node over the faucet lane, one stream each, and
+  // the node's reply comes back ON THAT STREAM, through onFaucetReply below
+  // and nowhere else: a `faucet` envelope on a node-opened stream is
+  // forwarded traffic a room peer could have sent, and the generic onEnvelope
+  // path (joinRoomAtEpoch) ignores it, so nothing a peer sends can pass for
+  // the node's answer. The reply lands in faucetDish.ts, which World reads
+  // ~1 Hz for the jar level and the mojo in the dish. A slow poll keeps the
+  // prop honest for players who never focus the screen (18.75 s blocks).
+  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
+  networkProvider.onFaucetReply((env: { payload?: string; room?: string; seq?: number }) => {
+    if (typeof env.payload !== "string" || typeof env.room !== "string") return;
+    // Only the room open right now is filed: the store drops a reply for a
+    // room already left (or never joined) at its gate (openFaucetRoom), the
+    // same gate a failed request's report passes.
+    const reply = parseFaucetReply(env.payload);
+    // A status carries the node's snapshot number, so an older look answered
+    // late cannot overwrite a newer one; the echoed `seq` ties a take/give
+    // reply to the request it answers (see setFaucetReply).
+    if (reply) setFaucetReply(env.room, reply, typeof env.seq === "number" ? env.seq : undefined);
+  });
+  window.setInterval(() => {
+    if (world.hasFaucetDish()) networkProvider.requestFaucet("status").sent.catch(() => {});
+  }, 60_000);
 
   // 🖱️ Right-click context menu (MOVE / DELETE on furniture) needs the world
   // OUTSIDE an edit session — same registration idiom as the owner gate below.

@@ -162,6 +162,7 @@ import {
   createGameTableUI,
   createHelmUI,
   createCashierUI,
+  createFaucetDishUI,
   createSlotMachineUI,
   operateActiveSlotMachine,
   clearPendingSlotPlays,
@@ -174,6 +175,8 @@ import {
   readLiveRoomStatus,
 } from "./devices";
 import { boardGate } from "./departuresDoc";
+// ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
+import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import {
   closeCoinPusher,
@@ -190,6 +193,7 @@ import type {
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
+  FaucetDishHandle,
   SlotMachineVisualHandle,
   PropAnimHandle,
   SlotMachineCabinetControl,
@@ -500,6 +504,12 @@ export class World {
   /** 🧬 Clone-vat tanks, keyed by item id (driven every frame like the lids). */
   private cloneVats: Map<string, CloneVatHandle> = new Map();
   private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
+  /** ⛓️🥣 Faucet dish fixtures, keyed by item id — pushed the room's last
+   *  faucet status at ~1 Hz (jar level, mojos in the dish, pending spend). */
+  private faucetDishes: Map<string, FaucetDishHandle> = new Map();
+  /** ⛓️🥣 main.ts installs the node request path (NetworkProvider.requestFaucet)
+   *  so the dish screen can ask for status / take / give. */
+  public onFaucetRequest: ((op: FaucetOp, amount?: number) => FaucetRequestTicket) | null = null;
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
   /** 🪙 Coin-pusher cabinets (issue #135) — animated pusher bar + rebuilt chip
    *  piles from shared state each frame. Same driven-every-frame idiom as the
@@ -1827,6 +1837,7 @@ export class World {
       arcadeScreens: this.arcadeScreens,
       alligatorsVisuals: this.alligatorsVisuals,
       casinoTableVisuals: this.casinoTableVisuals,
+      faucetDishes: this.faucetDishes,
     };
   }
 
@@ -3218,6 +3229,11 @@ export class World {
     }
   }
 
+  /** ⛓️🥣 A faucet dish stands in this room (main.ts polls its status then). */
+  public hasFaucetDish(): boolean {
+    return this.faucetDishes.size > 0;
+  }
+
   /**
    * Despawn ONE furniture item's visuals and deregister every per-item
    * handle — the exact inverse of the per-item registration that both
@@ -3280,6 +3296,7 @@ export class World {
     forgetCabinet(itemId);
     this.alligatorsVisuals.delete(itemId);
     this.casinoTableVisuals.delete(itemId);
+    this.faucetDishes.delete(itemId);
     forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
@@ -4114,17 +4131,29 @@ export class World {
 
     // 1 Hz idle status on wall-computer screens (M1 — the permanent home of
     // PR #36's dev-hook wiring; same live values, same cadence).
-    if (this.wallScreens.size > 0) {
+    if (this.wallScreens.size > 0 || this.faucetDishes.size > 0) {
       this.screenStatusTimer += deltaTime;
       if (this.screenStatusTimer >= 1.0) {
         this.screenStatusTimer = 0;
-        const status = readLiveRoomStatus();
-        for (const [itemId, screen] of this.wallScreens) {
-          // 🚏📋 A departures board adds its own rows (its gate setting is
-          // its own); the plain terminal's status carries none.
-          screen.updateStatus(
-            screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
-          );
+        if (this.wallScreens.size > 0) {
+          const status = readLiveRoomStatus();
+          for (const [itemId, screen] of this.wallScreens) {
+            // 🚏📋 A departures board adds its own rows (its gate setting is
+            // its own); the plain terminal's status carries none.
+            screen.updateStatus(
+              screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
+            );
+          }
+        }
+        // ⛓️🥣 Faucet dishes: the jar level and the mojo in the dish follow the
+        // room's last faucet status (the node reads the chain; main.ts polls).
+        if (this.faucetDishes.size > 0) {
+          const roomId = World.activeRoomId();
+          const faucet = latestFaucetStatus(roomId);
+          const pending = faucetPending(roomId) !== null;
+          for (const dish of this.faucetDishes.values()) {
+            dish.setState(jarLevel(faucet), faucet?.ready ?? 0, pending);
+          }
         }
       }
     }
@@ -6374,6 +6403,20 @@ export class World {
         isMySpawn,
         isEffectiveSpawn: () => this.findSpawnVat()?.item.id === deviceId,
         setMySpawn: (on) => setPreferredSpawnVat(roomId, on ? deviceId : null),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "faucetDish") {
+      // ⛓️🥣 The faucet dish: status / take / give go to the local node through
+      // the request path main.ts installed; without a node the screen still
+      // opens and says the chain is unreachable.
+      const request = this.onFaucetRequest;
+      const ui = createFaucetDishUI({
+        roomId: () => World.activeRoomId(),
+        request: (op, amount) =>
+          request ? request(op, amount) : { seq: 0, sent: Promise.reject(new Error("no node request path installed")) },
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
