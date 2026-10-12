@@ -198,7 +198,7 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       if (ev.nonce !== epoch.nonce || seat !== epoch.anchor) break;
       const s = ev.snapshot;
       if (!stats.lockstepAt) stats.lockstepAt = performance.now();
-      if (!stats.lockFrame) stats.lockFrame = s.frame;
+      if (stats.epochs.length === 0) stats.lockFrame = s.frame; // the first epoch's, which may be frame 0
       stats.snapshotBytes = s.state.byteLength;
       stats.epochs.push({ nonce: epoch.nonce, anchor: seat, frame: s.frame });
       // Every seat's batches start at this frame.

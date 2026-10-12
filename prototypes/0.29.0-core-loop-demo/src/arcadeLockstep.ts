@@ -21,11 +21,15 @@
  *                             the size and hash of the state it began from
  *   lsc:<itemId>:<tag>:<i>  → that state, deflated, in pieces
  * The doc reaches every page in the room (sibling tabs on one node, and the
- * nodes the room meshes with), signed, and in order per writer. A lane
- * carries a WINDOW of buttons rather than the newest few, because a key
- * holds only its latest value and a page may hear two writes as one: a
- * page hands its frame only what it has not, and the window starts no
- * earlier than the oldest frame a seat in the epoch has yet to run.
+ * nodes the room meshes with), signed, but not always in order: the node
+ * relays each update on a stream of its own, so a key can read missing for
+ * a moment (LockstepDeps.seatPage). A lane and an epoch name their game by
+ * a short tag of the stage's mount key (lockstepGameTag): the key holds a
+ * link of up to 2 KB, and a lane is written every 40 ms. A lane carries a
+ * WINDOW of buttons rather than the newest few, because a key holds only
+ * its latest value and a page may hear two writes as one: a page hands its
+ * frame only what it has not, and the window starts no earlier than the
+ * oldest frame a seat in the epoch has yet to run.
  *
  * AN EPOCH is a game in step: a save state, the seats that start from it,
  * and a tag every message of it carries. One seat begins it (its frame
@@ -106,6 +110,14 @@ export const lockstepLaneKey = (itemId: string, seat: number): string => `ls:${i
 export const lockstepChunkPrefix = (itemId: string): string => `lsc:${itemId}:`;
 export const lockstepChunkKey = (itemId: string, nonce: string, i: number): string => `lsc:${itemId}:${nonce}:${i}`;
 
+/** What a lane and an epoch call the game every seat must run: a tag of the
+ *  stage's mount key (the game and the emulator files), short whatever the
+ *  key's length (a link of up to ARCADE_MAX_URL, 2 KB). */
+export function lockstepGameTag(key: string): string {
+  return replayStateHash(new TextEncoder().encode(key));
+}
+const GAME_TAG_MAX = 64;
+
 // ── Records, as a peer may have written them ─────────────────────────────────
 
 /** Where a seat stands: booted with no game yet, playing alone, loading an
@@ -146,7 +158,7 @@ export function readLane(raw: unknown, seat: number): Lane | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
   const page = shortString(r.page, 32);
-  const game = shortString(r.game, 512);
+  const game = shortString(r.game, GAME_TAG_MAX);
   if (r.v !== 1 || !page || game === null || !isEpochTag(r.nonce)) return null;
   if (typeof r.phase !== 'string' || !LANE_PHASES.has(r.phase)) return null;
   if (!isInt(r.ran, 0, 0xffff_ffff) || !isInt(r.hashFrame, -1, 0xffff_ffff) || !isInt(r.beat, 0, Number.MAX_SAFE_INTEGER)) return null;
@@ -191,7 +203,7 @@ export interface Epoch {
 export function readEpoch(raw: unknown, seats: number): Epoch | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
-  const game = shortString(r.game, 512);
+  const game = shortString(r.game, GAME_TAG_MAX);
   const page = shortString(r.page, 32);
   if (r.v !== 1 || !isEpochTag(r.nonce) || r.nonce === '' || game === null || !page) return null;
   if (!Array.isArray(r.seats) || r.seats.length < 1 || r.seats.length > seats) return null;
@@ -223,6 +235,26 @@ export function readEpoch(raw: unknown, seats: number): Epoch | null {
   };
 }
 
+/** An epoch's pieces as one buffer, or null when they are not what its
+ *  record says: pieces of at most STATE_CHUNK_BYTES, as the seat that began
+ *  it cut them, adding up to `size`. Checked before anything is allocated,
+ *  since a peer may write anything under a piece's key. */
+export function joinStatePieces(pieces: readonly Uint8Array[], size: number): Uint8Array | null {
+  let total = 0;
+  for (const p of pieces) {
+    if (p.length > STATE_CHUNK_BYTES) return null;
+    total += p.length;
+  }
+  if (total !== size) return null;
+  const packed = new Uint8Array(size);
+  let at = 0;
+  for (const p of pieces) {
+    packed.set(p, at);
+    at += p.length;
+  }
+  return packed;
+}
+
 // ── The page's side ──────────────────────────────────────────────────────────
 
 /** The room doc as the controller uses it (arcadeDoc's raw keys). */
@@ -242,7 +274,7 @@ export interface LockstepDeps {
   seat: number;
   seats: number;
   /** What every seat must be running to play together: the game and the
-   *  emulator files (arcadeStage's mount key). */
+   *  emulator files (arcadeStage's mount key; the doc gets its tag). */
   game: string;
   page: string;
   store: LockstepStore;
@@ -307,6 +339,8 @@ interface Joining {
 export class LockstepController {
   private readonly d: LockstepDeps;
   private readonly delay: number;
+  /** The game, as the lanes and the epoch name it (lockstepGameTag). */
+  private readonly game: string;
   private disposed = false;
   /** The frame's emulator is up; its core cannot play in step; its state is
    *  too big to share. */
@@ -358,6 +392,7 @@ export class LockstepController {
   constructor(deps: LockstepDeps) {
     this.d = deps;
     this.delay = deps.delay ?? LOCKSTEP_DELAY;
+    this.game = lockstepGameTag(deps.game);
   }
 
   /** The frame's events (the stage hands over every one). */
@@ -551,7 +586,7 @@ export class LockstepController {
     const raw = this.d.store.get(lockstepEpochKey(this.d.itemId));
     if (raw !== undefined && raw !== this.epochCache.raw) this.epochCache = { raw, epoch: readEpoch(raw, this.d.seats) };
     const e = this.epochCache.epoch;
-    return e && e.game === this.d.game ? e : null;
+    return e && e.game === this.game ? e : null;
   }
 
   /** Seat n's lane as the doc has it (read again only once it changes).
@@ -585,7 +620,7 @@ export class LockstepController {
     for (let n = 0; n < this.d.seats; n++) {
       const lane = this.lane(n);
       if (n === this.d.seat) {
-        if (lane && lane.page === this.d.page && lane.game === this.d.game && this.started && !this.unsupported) out.set(n, lane);
+        if (lane && lane.page === this.d.page && lane.game === this.game && this.started && !this.unsupported) out.set(n, lane);
         continue;
       }
       if (!lane) {
@@ -597,7 +632,7 @@ export class LockstepController {
         s = { beat: lane.beat, page: lane.page, at: now };
         this.seen.set(n, s);
       }
-      if (now - s.at >= LANE_LAPSE_MS || lane.game !== this.d.game || this.seatPage(n) !== lane.page) continue;
+      if (now - s.at >= LANE_LAPSE_MS || lane.game !== this.game || this.seatPage(n) !== lane.page) continue;
       out.set(n, lane);
     }
     return out;
@@ -753,7 +788,7 @@ export class LockstepController {
     const prefix = lockstepChunkPrefix(itemId);
     const stale = store.keys(prefix, 4096).filter((k) => !k.startsWith(`${prefix}${e.nonce}:`));
     const record = {
-      v: 1, nonce: e.nonce, game: this.d.game, anchor: this.d.seat, seats: e.seats, frame: e.frame, hash: e.hash,
+      v: 1, nonce: e.nonce, game: this.game, anchor: this.d.seat, seats: e.seats, frame: e.frame, hash: e.hash,
       held: e.held, raw: e.raw, size: pieces.reduce((n, p) => n + p.length, 0), chunks: pieces.length, page: this.d.page,
     };
     // The frame is in it already: its state for others to load is what
@@ -781,14 +816,9 @@ export class LockstepController {
       }
       pieces.push(p);
     }
-    const packed = new Uint8Array(pieces.reduce((n, p) => n + p.length, 0));
-    let at = 0;
-    for (const p of pieces) {
-      packed.set(p, at);
-      at += p.length;
-    }
+    const packed = joinStatePieces(pieces, e.size);
     let state: Uint8Array | null = null;
-    if (packed.length === e.size) {
+    if (packed) {
       try {
         state = await (this.d.unpack ?? inflate)(packed, e.raw);
       } catch {
@@ -883,7 +913,7 @@ export class LockstepController {
       inputs = this.rows;
     }
     return {
-      page: this.d.page, game: this.d.game, nonce: this.nonce, phase: this.lanePhase(), ran: this.ran,
+      page: this.d.page, game: this.game, nonce: this.nonce, phase: this.lanePhase(), ran: this.ran,
       from, through: this.through, inputs, hash: this.lastHash.hash, hashFrame: this.lastHash.frame, bad: this.bad, beat: this.beat,
     };
   }

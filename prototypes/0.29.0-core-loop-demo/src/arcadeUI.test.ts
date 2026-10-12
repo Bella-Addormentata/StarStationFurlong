@@ -8,7 +8,7 @@ import * as Y from 'yjs';
 import { setConvenienceLanesForTest } from './sovereignty';
 import {
   bindArcadeDoc, insertCoin, putOnCabinet, takeOffCabinet, setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate,
-  setArcadeIdentity, setArcadePageId, setEmulatorData,
+  setArcadeIdentity, setArcadePageId, setEmulatorData, standUp,
 } from './arcadeDoc';
 import type { ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES } from './arcadeLibrary';
@@ -240,5 +240,26 @@ describe('the double-wide cabinet\'s four players (#242)', () => {
     setArcadeEjectPredicate(() => true);
     expect(resetArcadeCabinet(CAB, true, 4)).toBe('The players stood up · the cabinet is free.');
     expect(renderArcadePanel(CAB, wide('settings', false))).toContain('Nobody · step up and INSERT COIN to play.');
+  });
+
+  it('frees every stand or none: an editor without the deed resets only while the seats held are all theirs', () => {
+    ownerPuts(LJ65);
+    sits('BBBBbobpub', 'Bob', 'tab-b', 0);
+    expect(insertCoin(CAB, 2).ok).toBe(true); // this page (an editor, say a venture's shareholder) sits too
+    expect(renderArcadePanel(CAB, wide('settings', true, 2))).toContain('data-arcade-reset="1" disabled');
+    expect(resetArcadeCabinet(CAB, true, 4)).toBe('Bob is at the controls.'); // a panel painted before Bob sat
+    let html = renderArcadePanel(CAB, wide('settings', true, 2));
+    expect(html).toContain('PLAYER 1 · BOB');
+    expect(html).toContain('PLAYER 3 · YOU'); // nobody stood up
+    // Bob goes: the only seat held is this page's, and RESET frees it.
+    setArcadeIdentity(() => ({ pub: 'BBBBbobpub', name: 'Bob' }));
+    setArcadePageId('tab-b');
+    expect(standUp(CAB, 0).ok).toBe(true);
+    setArcadeIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    setArcadePageId('tab-a');
+    html = renderArcadePanel(CAB, wide('settings', true, 2));
+    expect(html).toContain('data-arcade-reset="1"');
+    expect(html).not.toContain('data-arcade-reset="1" disabled');
+    expect(resetArcadeCabinet(CAB, true, 4)).toBe('The players stood up · the cabinet is free.');
   });
 });

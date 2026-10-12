@@ -12,8 +12,8 @@ import * as Y from 'yjs';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import type { EmulatorEvent } from './arcadeEmulator';
 import {
-  lockstepChunkKey, lockstepEpochKey, lockstepLaneKey, readEpoch, readLane, LockstepController,
-  EXCLUDE_MS, JOIN_MS, LANE_LAPSE_MS, LOCKSTEP_DELAY,
+  joinStatePieces, lockstepChunkKey, lockstepEpochKey, lockstepGameTag, lockstepLaneKey, readEpoch, readLane, LockstepController,
+  EXCLUDE_MS, JOIN_MS, LANE_LAPSE_MS, LOCKSTEP_DELAY, STATE_CHUNK_BYTES,
 } from './arcadeLockstep';
 import type { LockstepView } from './arcadeLockstep';
 import { packInputBatch, replayStateHash } from './arcadeReplay';
@@ -284,6 +284,8 @@ interface Page {
 class Room {
   now = 1_000_000;
   latencyMs = 30;
+  /** The stage's mount key every page plays. */
+  game = GAME;
   pages: Page[] = [];
   /** Which page's write the doc keeps when two write one key at once goes
    *  by the docs' client ids: set here, so a run is the same every time
@@ -324,7 +326,7 @@ class Room {
     };
     page.frame = new FakeFrame(seat, (ev) => page.toPage.push(ev), () => this.now);
     page.ctl = new LockstepController({
-      itemId: CAB, seat, seats: 4, game: GAME, page: id,
+      itemId: CAB, seat, seats: 4, game: this.game, page: id,
       store: {
         get: (k) => map.get(k),
         set: (entries) => doc.transact(() => { for (const [k, v] of entries) if (v === undefined) map.delete(k); else map.set(k, v); }),
@@ -474,7 +476,7 @@ describe('records as a peer may have written them', () => {
     for (const bad of [
       { ...lane, v: 2 }, { ...lane, page: '' }, { ...lane, nonce: 'E3' }, { ...lane, phase: 'dancing' },
       { ...lane, ran: -1 }, { ...lane, hash: '<b>' }, { ...lane, rows: [1, 2] }, { ...lane, rows: new Uint8Array(3) },
-      { ...lane, beat: 1.5 }, null, 'lane', [lane],
+      { ...lane, beat: 1.5 }, { ...lane, game: 'x'.repeat(65) }, null, 'lane', [lane],
     ]) expect(readLane(bad, 2)).toBeNull();
   });
 
@@ -491,6 +493,26 @@ describe('records as a peer may have written them', () => {
       { ...e, nonce: '' }, { ...alone, chunks: 1 }, { ...e, seats: [0, 1, 2, 3, 0] },
     ]) expect(readEpoch(bad, 4)).toBeNull();
     expect(readEpoch({ ...e, seats: [0, 1, 3] }, 2)).toBeNull(); // past a two-seat cabinet's seats
+  });
+
+  it('a state\'s pieces join only as cut, and only to the size the epoch names', () => {
+    const full = new Uint8Array(STATE_CHUNK_BYTES).fill(1);
+    const tail = new Uint8Array([2, 3]);
+    const joined = joinStatePieces([full, tail], STATE_CHUNK_BYTES + 2);
+    expect(joined?.length).toBe(STATE_CHUNK_BYTES + 2);
+    expect(Array.from(joined!.slice(-3))).toEqual([1, 2, 3]);
+    expect(joinStatePieces([full, tail], STATE_CHUNK_BYTES + 3)).toBeNull(); // short of its size
+    expect(joinStatePieces([tail, full], 2)).toBeNull(); // past it
+    // A piece longer than any the beginning seat cuts, whatever the record says.
+    expect(joinStatePieces([new Uint8Array(STATE_CHUNK_BYTES + 1)], STATE_CHUNK_BYTES + 1)).toBeNull();
+  });
+
+  it('a game is named by a short tag, whatever the length of the link it plays', () => {
+    const long = `nes:https://example.org/${'x'.repeat(2_000)}.nes@station`;
+    expect(lockstepGameTag(long).length).toBeLessThanOrEqual(64);
+    // Every page tags the key it builds itself, alike.
+    expect(lockstepGameTag(['nes:https://example.org/', 'x'.repeat(2_000), '.nes@station'].join(''))).toBe(lockstepGameTag(long));
+    expect(lockstepGameTag(long)).not.toBe(lockstepGameTag(GAME));
   });
 });
 
@@ -513,6 +535,19 @@ describe('players at the double-wide cabinet, page against page', () => {
     expect(c.compared).toBeGreaterThan(15);
     expect(Math.abs(a.frame.at() - b.frame.at())).toBeLessThanOrEqual(LOCKSTEP_DELAY + 1);
     expect(b.fresh).toBe(0);
+  });
+
+  it('a game whose link is long plays in step all the same', async () => {
+    const room = new Room();
+    room.game = `nes:https://example.org/${'x'.repeat(2_000)}.nes@station`; // a link up to ARCADE_MAX_URL
+    const a = room.add('pa', 0);
+    await room.run(1_000);
+    const b = room.add('pb', 1);
+    await room.run(4_000, allOf(bot(a, 1), bot(b, 2)));
+    expect(view(a)).toMatchObject({ phase: 'playing', players: [0, 1] });
+    expect(view(b)).toMatchObject({ phase: 'playing', players: [0, 1] });
+    expect(readLane(a.map.get(lockstepLaneKey(CAB, 1)), 1)?.game).toBe(lockstepGameTag(room.game));
+    expect(room.compare().mismatched).toBe(0);
   });
 
   it('a third and a fourth sit down: each is a new epoch the others load, and all four play on in step', async () => {

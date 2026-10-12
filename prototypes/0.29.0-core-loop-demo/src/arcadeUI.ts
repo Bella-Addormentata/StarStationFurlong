@@ -244,14 +244,19 @@ export function matchPlayers(m: ArcadeMatch, seats: 1 | 2, me: string): Array<{ 
 }
 
 /** What RESET would end on the cabinet now: a built-in game's match (for
- *  everyone watching or playing), player one's seat at the owner's own game
- *  (when this page may free it: the deed holder's EJECT), or nothing. */
+ *  everyone watching or playing), the players' seats at the owner's own
+ *  game (when this page may free them all: its own, or any with the deed
+ *  holder's EJECT), or nothing. */
 function resettable(itemId: string, seats = 1): 'match' | 'seat' | null {
   const game = readCabinet(itemId).game;
   if (game?.bundled) return readArcade(itemId) ? 'match' : null;
   if (seats === 4) {
-    const anyone = seatHolders(itemId, 4).some((r) => r !== null);
-    return anyone && (mySeat(itemId, 4) !== null || mayEjectP1()) ? 'seat' : null;
+    // It frees every stand or none: without EJECT (the deed holder's), only
+    // while every seat held is this page's own.
+    const holders = seatHolders(itemId, 4);
+    const mine = mySeat(itemId, 4);
+    const anyone = holders.some((r) => r !== null);
+    return anyone && (mayEjectP1() || holders.every((r, n) => r === null || n === mine)) ? 'seat' : null;
   }
   const seat = readSeat(itemId);
   const held = seat.holder !== '' && !seatLapsed(itemId);
@@ -313,7 +318,9 @@ export function resetArcadeCabinet(itemId: string, owner: boolean, seats = 1): s
     const r = standUp(itemId);
     return r.ok ? 'Player one stood up · the cabinet is free.' : r.error;
   }
-  return 'Nothing is running here.';
+  // Pressed from a panel painted before another player sat down.
+  const other = seats === 4 ? seatHolders(itemId, 4).find((r, n) => r !== null && n !== mySeat(itemId, 4)) : undefined;
+  return other ? `${other.name || 'Someone'} is at the controls.` : 'Nothing is running here.';
 }
 
 /** The double-wide cabinet's PLAYERS (#242): who is at each of the four
