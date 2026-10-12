@@ -1,10 +1,16 @@
 /**
- * 🕹 arcadeStage — P1's stage (#193): the emulator frame in a 4:3 panel with
- * the CRT pass over it, opened by INSERT COIN from the cabinet's panel (the
- * device focus is released first, the TV theatre's posture) and closed by
- * Escape, the ✕, STAND UP, losing the seat, or the cabinet leaving the
- * room. Closing on P1's own account stands P1 up; closing because the seat
- * went to someone else never touches their seat.
+ * 🕹 arcadeStage — a seated player's stage (#193): the emulator frame in a
+ * 4:3 panel with the CRT pass over it, opened by INSERT COIN from the
+ * cabinet's panel (the device focus is released first, the TV theatre's
+ * posture) and closed by Escape, the ✕, STAND UP, losing the seat, or the
+ * cabinet leaving the room. Closing on the player's own account stands them
+ * up; closing because the seat went to someone else never touches it.
+ *
+ * At the double-wide cabinet (#242) each of up to four players has a stage
+ * on their own computer, every one running the game in step with the others
+ * (arcadeLockstep.ts, through the room): the frame is a lockstep 'peer' for
+ * the page's seat, and the stage hands its events to the controller that
+ * carries this seat's buttons out and the other seats' in.
  *
  * WHILE THE STAGE IS OPEN THE WORLD GETS NO KEYS. The world's InputManager
  * listens on the window with no target check, so W/A/S/D typed into the
@@ -35,8 +41,13 @@
  * a RETRY on any fault.
  */
 
-import { coreLabel, countPlay, gameId, gameLane, iAmP1, readCabinet, readSeat, standUp } from './arcadeDoc';
+import {
+  arcadePageId, arcadeRawDelete, arcadeRawGet, arcadeRawKeys, arcadeRawSetMany, coreLabel, countPlay, gameId, gameLane,
+  mySeat, readCabinet, readSeat, seatKey, seatStatus, standUp, subscribeArcadeKey,
+} from './arcadeDoc';
 import type { ArcadeGame, EmulatorData } from './arcadeDoc';
+import { lockstepEpochKey, lockstepLaneKey, LockstepController, LOCKSTEP_BATCH_FRAMES, LOCKSTEP_DELAY } from './arcadeLockstep';
+import type { LockstepView } from './arcadeLockstep';
 import {
   allowLocalRomExposure, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated,
   localRomExposureAllowed, localRomFor, mountEmulatorFrame, probeEmulatorData, rememberLocalRom,
@@ -56,6 +67,14 @@ type Phase = 'checking' | 'loading' | 'starting' | 'in play' | 'waiting' | 'faul
 interface Stage {
   root: HTMLDivElement;
   itemId: string;
+  /** The cabinet's seats (1, or the double-wide's 4, played in step) and the
+   *  one this page took: the stage is this seat's while the page holds it. */
+  seats: number;
+  seat: number;
+  /** The game in step (seats > 1): its controller, clock and doc listeners. */
+  lock: LockstepController | null;
+  lockTimer: number;
+  lockSubs: Array<() => void>;
   head: HTMLDivElement;
   screen: HTMLDivElement;
   notice: HTMLDivElement;
@@ -98,7 +117,9 @@ export function isArcadeStageOpen(itemId?: string): boolean {
   return stage !== null && (itemId === undefined || stage.itemId === itemId);
 }
 
-export function openArcadeStage(itemId: string): void {
+/** Open the stage for the seat this page holds at the cabinet (of its
+ *  `seats`: 1, or 4 at the double-wide cabinet, whose players play in step). */
+export function openArcadeStage(itemId: string, seats = 1): void {
   if (stage && stage.itemId !== itemId) closeArcadeStage();
   if (stage) return;
   const root = document.createElement('div');
@@ -157,6 +178,11 @@ export function openArcadeStage(itemId: string): void {
   stage = {
     root,
     itemId,
+    seats,
+    seat: mySeat(itemId, seats) ?? 0,
+    lock: null,
+    lockTimer: 0,
+    lockSubs: [],
     head: root.querySelector<HTMLDivElement>('.arcade-stage-head')!,
     screen: root.querySelector<HTMLDivElement>('.arcade-stage-screen')!,
     notice: root.querySelector<HTMLDivElement>('.arcade-stage-notice')!,
@@ -190,13 +216,13 @@ function stageFocusable(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), iframe')];
 }
 
-/** Close the stage; stand up only if this page still holds P1 (the owner
- *  closing a stage whose seat went to someone else must not kick them). */
+/** Close the stage; stand up only if this page still holds its seat (the
+ *  owner closing a stage whose seat went to someone else must not kick them). */
 export function closeArcadeStage(): void {
   if (!stage) return;
   const t = stage;
   teardown(t);
-  if (iAmP1(t.itemId)) standUp(t.itemId);
+  if (seatStatus(t.itemId, t.seat) === 'mine') standUp(t.itemId, t.seat);
 }
 
 function teardown(t: Stage): void {
@@ -211,10 +237,74 @@ function teardown(t: Stage): void {
 }
 
 function unmountFrame(t: Stage): void {
+  stopLockstep(t);
   t.frame?.destroy();
   t.frame = null;
   t.mounted = '';
   t.phase = 'idle';
+}
+
+/** The game in step: this seat's lane goes from the room (and an epoch it
+ *  began that nobody else plays). */
+function stopLockstep(t: Stage): void {
+  t.lock?.dispose();
+  t.lock = null;
+  window.clearInterval(t.lockTimer);
+  for (const off of t.lockSubs) off();
+  t.lockSubs = [];
+}
+
+/** How often the controller looks again without a word from the frame or
+ *  the doc (its beats, its holds, a write it put off), and how many of its
+ *  looks between two repaints of the status line. */
+const LOCKSTEP_TICK_MS = 50;
+const LOCKSTEP_REPAINT_TICKS = 5;
+
+function startLockstep(t: Stage, frame: EmulatorHandle, key: string): void {
+  const itemId = t.itemId;
+  const lock = new LockstepController({
+    itemId,
+    seat: t.seat,
+    seats: t.seats,
+    game: key,
+    page: arcadePageId(),
+    store: { get: arcadeRawGet, set: arcadeRawSetMany, delete: arcadeRawDelete, keys: arcadeRawKeys },
+    send: (m, transfer) => frame.send(m, transfer),
+    seatPage: (n) => {
+      // A record that reads missing: one a later update emptied for now,
+      // the controller's to judge (LockstepDeps.seatPage).
+      if (arcadeRawGet(seatKey(itemId, n)) === undefined) return undefined;
+      const rec = readSeat(itemId, n);
+      return rec.holder && seatStatus(itemId, n) !== 'free' ? rec.page : null;
+    },
+    visible: () => document.visibilityState === 'visible',
+    now: () => Date.now(),
+    // A game begun here from scratch, not one joined or begun again.
+    onFreshGame: () => countPlay(itemId),
+  });
+  t.lock = lock;
+  let ticks = 0;
+  t.lockTimer = window.setInterval(() => {
+    lock.tick();
+    if (++ticks % LOCKSTEP_REPAINT_TICKS === 0 && stage === t) renderStageChrome(t);
+  }, LOCKSTEP_TICK_MS);
+  const keys = [lockstepEpochKey(itemId), ...Array.from({ length: t.seats }, (_, n) => lockstepLaneKey(itemId, n))];
+  t.lockSubs = keys.map((k) => subscribeArcadeKey(k, () => lock.onDoc()));
+}
+
+/** Where this seat's game in step stands, in a few words. */
+export function inStepText(seat: number, v: LockstepView): string {
+  const names = (seats: number[]) => seats.filter((n) => n !== seat).map((n) => `P${n + 1}`).join(' ');
+  switch (v.phase) {
+    case 'starting': return 'STARTING';
+    case 'alone': return 'PLAYING ALONE · PLAYERS WHO SIT DOWN JOIN THIS GAME';
+    case 'joining': return 'JOINING THE GAME';
+    case 'playing': return `IN STEP WITH ${names(v.players)}`;
+    case 'holding': return `HOLDING FOR ${names(v.waitingOn) || 'THE OTHERS'}`;
+    case 'out': return 'LEFT OUT FOR A MOMENT · THIS COMPUTER COULD NOT KEEP UP';
+    case 'unsupported': return 'THIS CORE CANNOT PLAY IN STEP';
+    case 'toobig': return 'PLAYING ALONE · THIS GAME\'S STATE IS TOO BIG TO SHARE';
+  }
 }
 
 function showNotice(t: Stage, title: string, hint: string, retry = false): void {
@@ -256,7 +346,7 @@ function fail(t: Stage, key: string, text: { title: string; hint: string }): voi
 function stageTick(): void {
   const t = stage;
   if (!t) return;
-  if (!iAmP1(t.itemId)) {
+  if (mySeat(t.itemId, t.seats) !== t.seat) {
     // Kicked by the owner, lapsed from another page's view and taken, or
     // stood up elsewhere: the stage goes down now — it swallows the world's
     // keys while it is up — and nobody's seat is touched.
@@ -277,9 +367,9 @@ function stageTick(): void {
   }
   if (game.bundled) {
     // The owner put a built-in game on: it plays on the cabinet's screen,
-    // not here. The stage stands P1 up and goes; the cabinet takes over.
+    // not here. The stage stands the player up and goes; the cabinet takes over.
     teardown(t);
-    standUp(t.itemId);
+    standUp(t.itemId, t.seat);
     showHint(`🕹 ${game.name} is on the cabinet now: walk up and press play.`);
     return;
   }
@@ -467,7 +557,9 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
   }
   hideNotice(t);
   t.phase = 'loading';
-  t.frame = mountEmulatorFrame(t.screen, {
+  // The double-wide cabinet's seats play in step, each on its own computer.
+  const inStep = t.seats > 1;
+  const frame = mountEmulatorFrame(t.screen, {
     core: game.core,
     game: bytes,
     gameName: game.name,
@@ -476,8 +568,10 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
     isolated: emulatorIsolated(path),
     // The station lane's policy: this origin and the viewer's own node.
     allowOrigins: ownMediaOrigins(),
+    ...(inStep ? { replay: { role: 'peer' as const, seat: t.seat, seats: t.seats, delay: LOCKSTEP_DELAY, batchFrames: LOCKSTEP_BATCH_FRAMES } } : {}),
   }, (ev) => {
     if (stage !== t || t.mounted !== key) return;
+    t.lock?.onFrameEvent(ev);
     if (ev.type === 'frame-ready') t.phase = 'loading';
     else if (ev.type === 'ready') {
       t.phase = 'starting';
@@ -485,7 +579,9 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
     } else if (ev.type === 'started') {
       t.phase = 'in play';
       t.floodBackoffMs = FLOOD_BACKOFF_MS; // a clean start forgives the floods before it
-      if (!t.counted) {
+      // In step, the controller counts a game begun here from scratch, not
+      // one this seat joined.
+      if (!t.counted && !inStep) {
         t.counted = true;
         countPlay(t.itemId);
       }
@@ -500,6 +596,8 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
     }
     if (stage === t) renderStageChrome(t);
   });
+  t.frame = frame;
+  if (inStep) startLockstep(t, frame, key);
   // The CRT overlay must stay above the frame.
   const crt = t.screen.querySelector('.arcade-crt');
   if (crt) t.screen.appendChild(crt);
@@ -508,7 +606,7 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
 
 function renderStageChrome(t: Stage): void {
   const rec = readCabinet(t.itemId);
-  const seat = readSeat(t.itemId);
+  const seat = readSeat(t.itemId, t.seat);
   const game = rec.game;
   const lane = game ? gameLane(game) : '';
   const head = `<span class="arcade-stage-title">🕹 ${game ? `${escapeHtml(game.name)} · ${escapeHtml(coreLabel(game.core))}` : 'ARCADE CABINET'}</span>
@@ -520,8 +618,17 @@ function renderStageChrome(t: Stage): void {
     t.head.querySelector<HTMLButtonElement>('[data-arcade-close]')?.addEventListener('click', () => closeArcadeStage());
   }
   // Plain text, set with textContent: the raw name, never an escaped one.
-  const who = seat.holder ? `P1 · ${seat.name || 'a clone'}` : 'NOBODY AT THE CONTROLS';
-  const status = `${who} · ${t.phase.toUpperCase()} · EMULATOR FILES: ${emulatorDataLane(rec.data)}`;
+  const who = seat.holder ? `P${t.seat + 1} · ${seat.name || 'a clone'}` : 'NOBODY AT THE CONTROLS';
+  const lock = t.lock?.view() ?? null;
+  const view = lock && (t.phase === 'in play' || lock.phase === 'unsupported') ? lock : null;
+  const doing = view ? inStepText(t.seat, view) : t.phase.toUpperCase();
+  if (view?.phase === 'unsupported' && t.notice.hidden && game) {
+    // The frame holds the game: a core that cannot save and load its state
+    // cannot be played in step (arcadeLockstep), so it is said here.
+    showNotice(t, 'THIS GAME CANNOT BE PLAYED IN STEP',
+      `${escapeHtml(coreLabel(game.core))} cannot save and load its state, which players on separate computers need to play one game together. It plays on a one-player cabinet.`);
+  }
+  const status = `${who} · ${doing} · EMULATOR FILES: ${emulatorDataLane(rec.data)}`;
   if (status !== t.lastStatus) {
     t.status.textContent = status;
     t.lastStatus = status;

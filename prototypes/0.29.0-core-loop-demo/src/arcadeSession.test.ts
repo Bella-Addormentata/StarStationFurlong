@@ -65,3 +65,16 @@ describe('the P1 page keeps its seat', () => {
     forgetCabinet('arcade-cabinet-9'); // never sat: nothing to do
   });
 });
+
+describe('a seat at the double-wide cabinet is kept and given back the same way', () => {
+  it('renews player three\'s seat, and leaving stands up from it', () => {
+    insertCoin(CAB, 2);
+    tickArcadeRoom([CAB], now);
+    now += ARCADE_SEAT_RENEW_MS;
+    tickArcadeRoom([CAB], now);
+    expect(readSeat(CAB, 2).leaseAt).toBe(now);
+    expect(readSeat(CAB).holder).toBe(''); // player one's seat is nobody's
+    leaveArcadeRoom([CAB]);
+    expect(readSeat(CAB, 2).holder).toBe('');
+  });
+});

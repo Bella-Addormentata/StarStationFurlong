@@ -394,8 +394,9 @@ function bootAsJson(boot: MachineState): unknown {
 export const MAX_SNAPSHOT_JSON_BYTES = 8 * 1024 * 1024;
 
 /** Run bytes through a (de)compression stream, read chunk by chunk, giving
- *  up the moment the output passes `maxOut` (a deflate bomb in the doc). */
-async function pipe(
+ *  up the moment the output passes `maxOut` (a deflate bomb in the doc).
+ *  (arcadeLockstep.ts carries its save states the same way.) */
+export async function pipe(
   bytes: Uint8Array,
   stream: CompressionStream | DecompressionStream,
   maxOut = Infinity,
