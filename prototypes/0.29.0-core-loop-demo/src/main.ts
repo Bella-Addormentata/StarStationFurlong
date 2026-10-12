@@ -14,6 +14,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
+import { roomIsPublicSpace } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
   packTick,
@@ -582,6 +583,54 @@ const mouse = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+
+/** 🔑 May a stranger walk into the CURRENT room? Decides whether its seed rides
+ *  in the shared atlas (stationAtlas) and, since #231 N8, whether the node may
+ *  publish an address under its key. An UN-MIGRATED room presents the four
+ *  cardinal defaults everywhere else, so treat it the same here rather than
+ *  making "never opened the door editor" mean "unreachable". A room that has
+ *  DECLARED an empty door set is a different thing: nobody can walk in, so
+ *  nobody should be handed its address either — that falls out of `some` over
+ *  an empty list, which is exactly the fail-closed answer. With no doc bound
+ *  yet the defaults read PUBLIC, which for N8 is the safe answer too. */
+/** The room whose door-policy AND door-layout docs are the ones currently
+ *  bound, or null between a leave and the next join's binds (see the N8 probe
+ *  below: until this names a room, that room's passage is unknown → PUBLIC). */
+let doorDocsBoundFor: string | null = null;
+
+function roomPassageIsPublic(): boolean {
+  const ids = [...readAllDoorLayout().keys()];
+  const doors = doorSetIsAuthoritative() ? ids : ["north", "south", "east", "west"];
+  return doors.some((d) => readDoorPolicy(d).passage === "public");
+}
+
+// ⛓️ N8 (#231): the node learns from us whether a room is PUBLIC SPACE — the
+// bundled welcome room, or a room anyone may walk into — and never publishes
+// an address under such a room's key (anyone can derive its hint). Until the
+// probe answers the node assumes public, so a wrong answer can only withhold
+// a publish. The door docs the probe reads are globally bound and re-bound per
+// join, and the first cap of a join goes out at connect, BEFORE the new room's
+// docs are bound: so the probe only reads them once `doorDocsBoundFor` names
+// this exact room (set right before the last of the two binds), and says
+// PUBLIC until then — never the previous room's doors for the new room.
+// Re-stamped on every door-policy change AND every door-layout change (a door
+// fitted with no policy record of its own takes the default, which is public,
+// so a new door alone can open the room), and on every room bind, which
+// notifies both; so a room flipping public/private reaches the node live
+// whichever record flipped it. Each cap carries a sequence number, so one that
+// left earlier but lands later cannot overwrite the current posture.
+networkProvider.setPublicRoomProbe((roomId) =>
+  roomIsPublicSpace(
+    roomId === DEFAULT_STATION.welcomeRoomId,
+    doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
+  ),
+);
+subscribeDoorPolicy(() => {
+  void networkProvider.refreshRoomCap();
+});
+subscribeDoorLayout(() => {
+  void networkProvider.refreshRoomCap();
+});
 // 🏒 #115: give the air-hockey session its outbound datagram seam. The
 // provider is a boot-time singleton and sendTick self-gates on connection
 // state (clean no-op offline), so one wiring here covers every room join.
@@ -1752,6 +1801,9 @@ async function joinRoomAtEpoch(
   receivedTicks = 0;
   remoteLastSeen.clear();
   world.clearRemotePlayers();
+  // ⛓️ N8: the door docs about to be bound are not this room's yet — the cap
+  // sent at connect must say PUBLIC until both are (see the probe's comment).
+  doorDocsBoundFor = null;
   // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
   // world.ts activeRoomId). Published BEFORE the connect await (the id is
   // known synchronously) so a trunk opened during the connect window keys
@@ -2029,19 +2081,7 @@ async function joinRoomAtEpoch(
     // the default `public` for a cardinal the room does not even have — so the
     // predicate was ALWAYS TRUE and no room could be unlisted. Iterate the
     // doors the room actually has, and fail CLOSED when it has none public.
-    isPassagePublic: () => {
-      const ids = [...readAllDoorLayout().keys()];
-      // An UN-MIGRATED room presents the four cardinal defaults everywhere
-      // else, so treat it the same here rather than making "never opened the
-      // door editor" mean "unreachable". A room that has DECLARED an empty
-      // door set is a different thing: nobody can walk in, so nobody should be
-      // handed its address either — that falls out of `some` over an empty
-      // list, which is exactly the fail-closed answer.
-      const doors = doorSetIsAuthoritative()
-        ? ids
-        : ["north", "south", "east", "west"];
-      return doors.some((d) => readDoorPolicy(d).passage === "public");
-    },
+    isPassagePublic: roomPassageIsPublic,
   });
 
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
@@ -2119,6 +2159,10 @@ async function joinRoomAtEpoch(
   // separate from the pairing map + floor-plan position. Binding re-notifies →
   // world.reconcileDoorLayout runs immediately (a joiner sees the host's door
   // set); an unseeded room keeps the local cardinal defaults.
+  // ⛓️ N8: the door-POLICY doc is bound above; with this bind both of the docs
+  // the public-room probe reads are this room's, so name it first — the bind's
+  // own notify then re-stamps the room cap with the real passage reading.
+  doorDocsBoundFor = boot.roomId;
   bindDoorLayoutDoc(sync.doc);
   // 🪟 #80: window layout syncs the same way (rebinds per join at the T0 seam).
   bindWindowLayoutDoc(sync.doc);
@@ -3196,6 +3240,9 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // doors doc binds before the layout/floor-plan docs, and a harvest in that
   // window reads the new room's doors at the OLD room's walls.
   setAtlasHarvestArmed(false);
+  // ⛓️ N8: likewise, the public-room probe must not read this room's doors for
+  // whatever room is joined next.
+  doorDocsBoundFor = null;
   // We are now roomless (issue #60 review): clear the active-pass room so a
   // swap that leaves but never re-joins (stranded) can't wedge a pass showing
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the
@@ -8798,7 +8845,7 @@ function setupNetworkDetailsPanel() {
       void networkProvider.resendRoomCap(on);
       if (feedback) {
         feedback.textContent = on
-          ? "Advanced Chia mesh mode ON for this room (experimental — needs a chia-lane node + funded testnet wallet; otherwise a harmless no-op)."
+          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once SSF_CHIA_LANE=1 and its testnet wallet is funded; chain reads are on for every node, and public rooms never publish)."
           : "Advanced Chia mesh mode OFF for this room.";
         setTimeout(() => {
           if (feedback) feedback.textContent = "";

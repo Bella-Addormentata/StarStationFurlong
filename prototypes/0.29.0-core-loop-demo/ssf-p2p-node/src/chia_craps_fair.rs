@@ -23,7 +23,7 @@
 //! it, but the publish→resolve loop must run against the funded dev wallet on the
 //! chia-lane build (see brainstorming/craps-chia-backend-plan.md §12.5). The
 //! `SSF_CHIA_CRAPS_FAIR_TEST=1` hook in main.rs runs the end-to-end self-test.
-#![cfg(feature = "chia-lane")]
+#![cfg(feature = "chia-publish")]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

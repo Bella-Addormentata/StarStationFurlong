@@ -9,10 +9,13 @@
 //!
 //! The principal returns to the wallet (spend-to-self, amount − fee), so only the
 //! fee leaves. Every SDK call is the source-verified 0.34 API (audit surfaces B/C/D).
-//! Behind the `chia-lane` feature; runtime-gated by SSF_CHIA_LANE=1 at the caller.
-#![cfg(feature = "chia-lane")]
+//! Behind the `chia-publish` feature; runtime-gated by SSF_CHIA_LANE=1 at the caller.
+//!
+//! N8 (#231): a room that is public space (bundled seed or PUBLIC passage) is
+//! never published under, armed or not — see [`publishable_rooms`].
+#![cfg(feature = "chia-publish")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -27,6 +30,7 @@ use chia_sdk_types::{Conditions, TESTNET11_CONSTANTS};
 use clvmr::Allocator;
 
 use crate::chia_lane::{self, ChiaPresenceRecord};
+use crate::chia_rooms::ChiaRoomCap;
 
 /// Fee (mojos) for a publish. 0 confirms when the mempool is quiet (the usual
 /// testnet state); the spend-to-self recreates the coin at `amount − fee`, so at
@@ -139,11 +143,42 @@ const HEARTBEAT_TICK_SECS: u64 = 60;
 
 /// Last publish attempt per room (loop-local; rebuilt on node restart, which just
 /// causes one early republish — harmless, spend-to-self is idempotent in effect).
-struct PublishMark {
-    room_key: [u8; 32],
-    addrs_sig: String,
-    at: Instant,
-    ok: bool,
+pub struct PublishMark {
+    pub room_key: [u8; 32],
+    pub addrs_sig: String,
+    pub at: Instant,
+    pub ok: bool,
+}
+
+/// N8 in one place: of the rooms the browser handed us, which may publish right
+/// now (armed AND known private) and which are armed but refused — their key is
+/// public space (bundled seed or PUBLIC passage), or the browser predates N8 and
+/// never said which, and silence fails closed.
+pub fn publishable_rooms(caps: &[(String, ChiaRoomCap)]) -> (Vec<(String, [u8; 32])>, Vec<String>) {
+    let mut armed = Vec::new();
+    let mut refused = Vec::new();
+    for (room, cap) in caps {
+        if cap.may_publish() {
+            armed.push((room.clone(), cap.room_key));
+        } else if cap.chia_mode {
+            refused.push(room.clone());
+        }
+    }
+    (armed, refused)
+}
+
+/// Is a publish due? Always for a room never published; otherwise on a room-key
+/// change, an address change, or once the OK / retry cadence has elapsed.
+pub fn publish_due(mark: Option<&PublishMark>, room_key: &[u8; 32], addrs_sig: &str, now: Instant) -> bool {
+    match mark {
+        None => true,
+        Some(m) => {
+            m.room_key != *room_key
+                || m.addrs_sig != addrs_sig
+                || now.saturating_duration_since(m.at)
+                    >= Duration::from_secs(if m.ok { HEARTBEAT_OK_SECS } else { HEARTBEAT_RETRY_SECS })
+        }
+    }
 }
 
 /// Slice 6: the REAL-room publisher — what makes the lane operate beyond the
@@ -166,6 +201,8 @@ pub async fn heartbeat_loop(
     chia_sk: SecretKey,
 ) {
     let mut marks: HashMap<String, PublishMark> = HashMap::new();
+    // N8: public-space rooms that are armed, already told about once.
+    let mut refused_logged: HashSet<String> = HashSet::new();
     loop {
         tokio::time::sleep(Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
         // Live addresses (F3 rule: hints are live data, not a boot-time snapshot).
@@ -179,30 +216,26 @@ pub async fn heartbeat_loop(
             continue; // nothing routable to advertise yet
         }
         let addrs_sig = addrs.join(",");
-        let armed: Vec<(String, [u8; 32])> = hub
+        let caps: Vec<(String, ChiaRoomCap)> = hub
             .chia_rooms
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, cap)| cap.chia_mode)
-            .map(|(room, cap)| (room.clone(), cap.room_key))
+            .map(|(room, cap)| (room.clone(), cap.clone()))
             .collect();
+        let (armed, refused) = publishable_rooms(&caps);
+        refused_logged.retain(|room| refused.contains(room));
+        for room in &refused {
+            if refused_logged.insert(room.clone()) {
+                println!(
+                    "⛓️ ChiaHub heartbeat: room {room} is armed but N8 refuses it — its key is public space (bundled seed or PUBLIC passage), or the browser predates N8 and never said; no address is published under its key until the browser says private"
+                );
+            }
+        }
         // Forget rooms no longer armed (toggle flipped off / cap replaced).
         marks.retain(|room, _| armed.iter().any(|(r, _)| r == room));
         for (room, room_key) in armed {
-            let due = match marks.get(&room) {
-                None => true,
-                Some(m) => {
-                    m.room_key != room_key
-                        || m.addrs_sig != addrs_sig
-                        || m.at.elapsed()
-                            >= Duration::from_secs(if m.ok {
-                                HEARTBEAT_OK_SECS
-                            } else {
-                                HEARTBEAT_RETRY_SECS
-                            })
-                }
-            };
+            let due = publish_due(marks.get(&room), &room_key, &addrs_sig, Instant::now());
             if !due {
                 continue;
             }
@@ -279,4 +312,47 @@ pub async fn publish_presence(
         return Err(anyhow!("push_tx rejected: {:?}", resp.error));
     }
     Ok(hint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
+        ChiaRoomCap { room_key: [key; 32], chia_mode, public_room, seq: 0 }
+    }
+
+    #[test]
+    fn n8_only_armed_known_private_rooms_publish() {
+        let caps = vec![
+            ("private-armed".to_string(), cap(1, true, Some(false))),
+            ("private-off".to_string(), cap(2, false, Some(false))),
+            ("public-armed".to_string(), cap(3, true, Some(true))),
+            ("public-off".to_string(), cap(4, false, Some(true))),
+            ("unknown-armed".to_string(), cap(5, true, None)),
+            ("unknown-off".to_string(), cap(6, false, None)),
+        ];
+        let (armed, refused) = publishable_rooms(&caps);
+        assert_eq!(armed, vec![("private-armed".to_string(), [1u8; 32])]);
+        assert_eq!(
+            refused,
+            vec!["public-armed".to_string(), "unknown-armed".to_string()],
+            "armed rooms that are public, or whose posture an old browser never sent, are named so the operator learns why nothing publishes"
+        );
+    }
+
+    #[test]
+    fn publish_due_on_first_change_and_cadence() {
+        let key = [7u8; 32];
+        let t0 = Instant::now();
+        assert!(publish_due(None, &key, "a", t0), "never published -> due");
+        let ok = PublishMark { room_key: key, addrs_sig: "a".into(), at: t0, ok: true };
+        assert!(!publish_due(Some(&ok), &key, "a", t0 + Duration::from_secs(60)), "fresh OK publish is not due");
+        assert!(publish_due(Some(&ok), &key, "a,b", t0 + Duration::from_secs(1)), "address change republishes at once");
+        assert!(publish_due(Some(&ok), &[8u8; 32], "a", t0 + Duration::from_secs(1)), "room key change republishes at once");
+        assert!(publish_due(Some(&ok), &key, "a", t0 + Duration::from_secs(HEARTBEAT_OK_SECS)), "heartbeat cadence");
+        let failed = PublishMark { ok: false, ..PublishMark { room_key: key, addrs_sig: "a".into(), at: t0, ok: false } };
+        assert!(!publish_due(Some(&failed), &key, "a", t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS - 1)));
+        assert!(publish_due(Some(&failed), &key, "a", t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS)), "retry cadence after a failure");
+    }
 }
