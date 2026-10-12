@@ -79,6 +79,16 @@ const lag = last?.lagFrames ?? [];
 const sorted = [...lag].sort((a, b) => a - b);
 const pct = (p) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] : null);
 const seconds = (Date.now() - started) / 1000;
+/** Exit 0 only on a clean run, with fresh comparisons all the way through:
+ *  a run whose frames froze after a match would otherwise end with that
+ *  match and nothing against it. */
+function finish() {
+  const d = last?.drift;
+  const gapLimitMs = Math.max(15_000, (10 * (last?.hashEvery ?? 60) * 1000) / 60);
+  const kept = (last?.longestGapMs ?? Infinity) <= gapLimitMs;
+  if (d?.compared && !kept) console.log(`[replay-spike] comparing stopped for ${last?.longestGapMs} ms (limit ${gapLimitMs} ms)`);
+  process.exit(d && d.compared > 0 && d.mismatched === 0 && kept && !last?.errors?.length ? 0 : 1);
+}
 if (lockstep) {
   // Seconds of lockstep, for the per-second rates: from the moment seat 0
   // began it (the page's own clock), and frames counted from that frame.
@@ -107,10 +117,10 @@ if (lockstep) {
       wireBytesPerSecond: Math.round(p.wireBytes / lockSeconds),
       messagesPerSecond: Number((p.messages / lockSeconds).toFixed(1)),
     })),
+    longestGapMs: last?.longestGapMs,
     errors: last?.errors,
   }, null, 2));
-  const dd = last?.drift;
-  process.exit(dd && dd.compared > 0 && dd.mismatched === 0 && !last?.errors?.length ? 0 : 1);
+  finish();
 }
 console.log(JSON.stringify({
   minutes,
@@ -130,10 +140,4 @@ console.log(JSON.stringify({
   lagFrames: { p50: pct(50), p95: pct(95), max: sorted.at(-1) ?? null, samples: sorted.length },
   errors: last?.errors,
 }, null, 2));
-const d = last?.drift;
-// Fresh comparisons all the way through: a run whose frames froze after a
-// match would otherwise end with that match and nothing against it.
-const gapLimitMs = Math.max(15_000, (10 * (last?.hashEvery ?? 60) * 1000) / 60);
-const kept = (last?.longestGapMs ?? Infinity) <= gapLimitMs;
-if (d?.compared && !kept) console.log(`[replay-spike] comparing stopped for ${last?.longestGapMs} ms (limit ${gapLimitMs} ms)`);
-process.exit(d && d.compared > 0 && d.mismatched === 0 && kept && !last?.errors?.length ? 0 : 1);
+finish();

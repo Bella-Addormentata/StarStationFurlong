@@ -84,8 +84,14 @@ const stats = {
   snapshotBytes: 0,
   loads: [] as Array<{ seat: number; frame: number; matches: boolean | undefined; tries: number | undefined }>,
   perSeat: Array.from({ length: seats }, (): SeatStats => ({ started: false, status: null, batches: 0, inputs: 0, wireBytes: 0, messages: 0, presses: 0 })),
+  /** The longest stretch, in ms, between one comparison and the next:
+   *  seats that froze partway stop comparing, which no mismatch would show
+   *  (stats() counts the stretch since the last one too). */
+  longestGapMs: 0,
   errors: [] as string[],
 };
+/** When the ledger last compared a frame across every seat (0: not yet). */
+let comparedAt = 0;
 
 const frames: Array<EmulatorHandle | null> = Array.from({ length: seats }, () => null);
 /** One reassembler per link (from → to): batches back in frame order,
@@ -157,9 +163,14 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       for (let to = 1; to < seats; to++) sendBegun(to);
       break;
     }
-    case 'replay-hash':
-      ledger.record(seat, ev.hash.frame, ev.hash.hash);
+    case 'replay-hash': {
+      if (ledger.record(seat, ev.hash.frame, ev.hash.hash) !== null) {
+        const now = performance.now();
+        if (comparedAt) stats.longestGapMs = Math.max(stats.longestGapMs, now - comparedAt);
+        comparedAt = now;
+      }
       break;
+    }
     case 'replay-status': {
       const st = ev.status;
       if (st.phase === 'unsupported') stats.errors.push(`seat ${seat}: cannot replay (no save states)`);
@@ -237,7 +248,13 @@ window.addEventListener('error', (e) => stats.errors.push(`page: ${e.message}`))
 window.addEventListener('unhandledrejection', (e) => stats.errors.push(`page: ${String(e.reason)}`));
 
 (window as unknown as { __lockstepSpike: unknown }).__lockstepSpike = {
-  stats: () => ({ ...stats, lockSeconds: stats.lockstepAt ? (performance.now() - stats.lockstepAt) / 1000 : 0, drift: ledger.read() }),
+  stats: () => ({
+    ...stats,
+    hashEvery,
+    longestGapMs: Math.round(Math.max(stats.longestGapMs, comparedAt ? performance.now() - comparedAt : 0)),
+    lockSeconds: stats.lockstepAt ? (performance.now() - stats.lockstepAt) / 1000 : 0,
+    drift: ledger.read(),
+  }),
 };
 
 void (async () => {
