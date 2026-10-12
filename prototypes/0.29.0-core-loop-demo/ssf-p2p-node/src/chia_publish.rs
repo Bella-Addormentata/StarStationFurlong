@@ -1064,6 +1064,9 @@ pub async fn heartbeat_loop(
     // Without the watcher nothing ever reads our record back, so the gateway's
     // acceptance is the only confirmation there is.
     let watcher_confirms = crate::chia_watch::watch_enabled();
+    // Tell the watcher to read our own key every beat for as long as we may
+    // write it, rooms and peers or not: that read is what confirms a write.
+    hub.presence_publishing.store(findable_enabled(), std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = &node_mark {
         println!(
             "⛓️ ChiaHub presence: last written in era {} (write {}, hint {}, {})",

@@ -299,7 +299,12 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         sched.forget_where(|key| {
             key.strip_prefix("ck:").is_some_and(|k| k != "self" && !by_ck.keys().any(|ck| ck_sched_key(ck) == key))
         });
-        if readable.is_empty() && peers.is_empty() {
+        // Nothing to read for, unless the publisher may have written OUR record:
+        // then the own-key read below must run every beat, since it is what
+        // confirms the write (a fresh node has no rooms or cards yet, and an
+        // unconfirmed write is retried every confirmation timeout).
+        let self_publishing = hub.presence_publishing.load(std::sync::atomic::Ordering::Relaxed);
+        if readable.is_empty() && peers.is_empty() && !self_publishing {
             continue;
         }
 

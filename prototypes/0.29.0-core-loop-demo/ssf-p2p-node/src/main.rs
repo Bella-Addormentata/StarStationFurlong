@@ -410,6 +410,13 @@ pub struct HubState {
     /// write is pending and retried after a timeout.
     #[cfg(feature = "chia-read")]
     pub presence_confirmed_era: std::sync::atomic::AtomicU64,
+    /// #231 P6a: the presence publisher is running and findable (raised by the
+    /// heartbeat loop at start). While it is, the watcher reads our own
+    /// contact key every beat even with no room or peer to read for, since
+    /// that read is what confirms a write: without it a landed record would be
+    /// re-written at every confirmation timeout until the era's budget is spent.
+    #[cfg(feature = "chia-read")]
+    pub presence_publishing: std::sync::atomic::AtomicBool,
     /// ⛓️🥣 The wallet key `SSF_CHIA_LANE=1` loaded at startup (publish build),
     /// so the faucet dish can TAKE (claim to our address) and GIVE (pay from our
     /// coin) on the local browser's request. `None` while publishing is off.
@@ -1409,6 +1416,8 @@ async fn main() -> Result<()> {
         chia_peak: std::sync::atomic::AtomicU32::new(0),
         #[cfg(feature = "chia-read")]
         presence_confirmed_era: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(feature = "chia-read")]
+        presence_publishing: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
     });

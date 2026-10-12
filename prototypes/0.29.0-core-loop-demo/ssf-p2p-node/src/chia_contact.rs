@@ -77,13 +77,30 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.flush()
 }
 
+/// Reset an EXISTING secret file to 0600 without rewriting it (Unix; a no-op
+/// elsewhere). The contact key is written once and then only read, so a copy
+/// left broader than 0600 would otherwise stay readable for the life of the
+/// node — `write_private` never gets a chance to tighten it.
+pub fn tighten_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Load the contact key, or mint one. A file of the wrong size is replaced
 /// (and said so): a half-written key would otherwise make every card we hand
-/// out point at a hint we never publish under.
+/// out point at a hint we never publish under. A loaded key's file is
+/// tightened to 0600 on the way, like every file this module writes.
 pub fn load_or_create_contact_key(path: &Path) -> Result<[u8; 32]> {
     if path.exists() {
         let bytes = std::fs::read(path)?;
         if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            tighten_private(path)?;
             return Ok(arr);
         }
         eprintln!("⛓️ contact key: {} is not 32 bytes — minting a new one", path.display());
@@ -367,6 +384,16 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            // A valid key file left broader (copied in, or an older run) is
+            // tightened when it is LOADED, since it is never rewritten.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let loaded = load_or_create_contact_key(&path).unwrap();
+            assert_eq!(loaded, a, "the broader file still holds the same key");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "loading an existing, broader key file tightens it to 0600"
+            );
         }
         std::fs::write(&path, b"short").unwrap();
         #[cfg(unix)]
