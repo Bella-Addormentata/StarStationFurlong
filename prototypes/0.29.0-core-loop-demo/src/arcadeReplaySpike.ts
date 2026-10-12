@@ -90,9 +90,15 @@ const stats = {
    *  handful of identical hashes would prove nothing. */
   distinctHashes: 0,
   dropped: null as { frame: number; index: number; value: number } | null,
+  /** The longest stretch, in ms, between one comparison and the next:
+   *  frames that froze partway stop comparing, which no mismatch would
+   *  show (stats() counts the stretch since the last one too). */
+  longestGapMs: 0,
   errors: [] as string[],
 };
 const seenHashes = new Set<string>();
+/** When the ledger last compared a pair of hashes (0: not yet). */
+let comparedAt = 0;
 /** Inputs delivered so far, for `drop`. */
 let delivered = 0;
 /** When player one's frame last said where it was: a batch posts as the
@@ -192,6 +198,11 @@ function onFollower(ev: EmulatorEvent): void {
       break;
     case 'replay-hash': {
       const ok = ledger.followerHash(ev.hash.frame, ev.hash.hash);
+      if (ok !== null) {
+        const now = performance.now();
+        if (comparedAt) stats.longestGapMs = Math.max(stats.longestGapMs, now - comparedAt);
+        comparedAt = now;
+      }
       if (ok === false && resync) source?.send({ type: 'arcade-replay-want-snapshot' });
       break;
     }
@@ -281,7 +292,13 @@ window.addEventListener('error', (e) => stats.errors.push(`page: ${e.message}`))
 window.addEventListener('unhandledrejection', (e) => stats.errors.push(`page: ${String(e.reason)}`));
 
 (window as unknown as { __replaySpike: unknown }).__replaySpike = {
-  stats: () => ({ ...stats, drift: ledger.read(), lagFrames: stats.lagFrames.slice(-600) }),
+  stats: () => ({
+    ...stats,
+    hashEvery,
+    longestGapMs: Math.round(Math.max(stats.longestGapMs, comparedAt ? performance.now() - comparedAt : 0)),
+    drift: ledger.read(),
+    lagFrames: stats.lagFrames.slice(-600),
+  }),
 };
 
 void (async () => {
