@@ -32,8 +32,11 @@ import type {
   CloneVatHandle,
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
+  ArcadeCabinetVisualHandle,
   PropAnimHandle,
   AirHockeyVisualHandle,
+  TvScreenHandle,
+  ArcadeScreenHandle,
   AlligatorsVisualHandle,
 } from './devices';
 import type { CasinoTableVisualHandle } from './casinoTable3d';
@@ -61,12 +64,19 @@ export interface FurnitureHandleSinks {
   slotMachineVisuals: Map<string, SlotMachineVisualHandle>;
   /** 🪙 Coin-pusher cabinet visuals (pusher sweep, chips, hole lamps), keyed by item id. */
   coinPusherVisuals: Map<string, CoinPusherVisualHandle>;
+  /** 🕹️ Arcade-cabinet screens, keyed by item id — handed to the cabinet's
+   *  focus UI (arcadeNesCabinet.ts), which paints the menu and the game. */
+  arcadeCabinetVisuals: Map<string, ArcadeCabinetVisualHandle>;
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
   propAnims: Map<string, PropAnimHandle>;
   /** 🏒 Air-hockey table visuals (mallets/puck/scoreboard), keyed by item id.
    *  Both registration paths read the filed handle back and hand it, with the
    *  item's pose, to the session layer (airHockeySession.ts), which drives it. */
   airHockeyVisuals: Map<string, AirHockeyVisualHandle>;
+  /** 📺 Smart-TV screens, keyed by item id (#186 — redrawn at ~2 Hz from the room record). */
+  tvScreens: Map<string, TvScreenHandle>;
+  /** 🕹 Arcade cabinet screens, keyed by item id (#193 — the attract card, "P1 · name"). */
+  arcadeScreens: Map<string, ArcadeScreenHandle>;
   /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — handed
    *  on with the item's pose to alligatorsSession.ts, as air hockey's are. */
   alligatorsVisuals: Map<string, AlligatorsVisualHandle>;
@@ -103,8 +113,13 @@ export function registerFurnitureHandles(
   if (d.coinPusherVisual) {
     sinks.coinPusherVisuals.set(itemId, d.coinPusherVisual as CoinPusherVisualHandle);
   }
+  if (d.arcadeCabinet) {
+    sinks.arcadeCabinetVisuals.set(itemId, d.arcadeCabinet as ArcadeCabinetVisualHandle);
+  }
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
   if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);
+  if (d.tvScreen) sinks.tvScreens.set(itemId, d.tvScreen as TvScreenHandle);
+  if (d.arcadeScreen) sinks.arcadeScreens.set(itemId, d.arcadeScreen as ArcadeScreenHandle);
   if (d.alligators) sinks.alligatorsVisuals.set(itemId, d.alligators as AlligatorsVisualHandle);
   if (d.casinoTable) sinks.casinoTableVisuals.set(itemId, d.casinoTable as CasinoTableVisualHandle);
 }

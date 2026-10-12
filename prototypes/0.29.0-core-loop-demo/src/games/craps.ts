@@ -46,13 +46,18 @@ export type CrapsBetType =
   | 'two'       // one-roll: snake eyes, pays 30:1
   | 'three'     // one-roll: ace-deuce, pays 15:1
   | 'yo'        // one-roll: eleven, pays 15:1
-  | 'twelve';   // one-roll: boxcars, pays 30:1
+  | 'twelve'    // one-roll: boxcars, pays 30:1
+  | 'passodds'      // odds behind the pass line — true odds on the point
+  | 'dontpassodds'  // lay odds behind the don't pass — true odds against the point
+  | 'comeodds'      // odds on a travelled come bet (pick = its number)
+  | 'dontcomeodds'; // lay odds on a travelled don't come bet (pick = its number)
 
 export interface CrapsBet {
   type: CrapsBetType;
   /** place: the number (4,5,6,8,9,10); hard: 4/6/8/10; come / dontcome: the
-   *  number the bet TRAVELLED to (absent while it still sits in the come box).
-   *  Absent for every other bet. */
+   *  number the bet TRAVELLED to (absent while it still sits in the come box);
+   *  comeodds / dontcomeodds: the come point they back (required). Absent for
+   *  every other bet — passodds / dontpassodds always back the table's point. */
   pick?: number;
   /** Chips staked (already deducted from the bettor's balance). */
   amount: number;
@@ -87,6 +92,9 @@ export interface CrapsTableState {
    *  legacy/betting states ⇒ treated as false. The shooter-hand NETTING boundary
    *  (see the Chia backend plan) and the "new shooter" narration read it. */
   sevenOut?: boolean;
+  /** ⚖️ A Fair roll voided because the house seed couldn't be revealed: no
+   *  dice, every bet stands (roulette: every stake returned). */
+  voided?: boolean;
   /** 🎲🔒 How this roll's dice were produced + its verifiable transcript (absent
    *  for 'rng'). Settled rolls only; lets any client re-derive and check the dice. */
   fairness?: FairnessTranscript;
@@ -105,6 +113,15 @@ export interface CrapsTableState {
   /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
    *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
   lastShooter?: string;
+  /** ⚖️ This round's seed commitments (see SeedRoundFields). */
+  houseCommit?: string;
+  commits?: Record<string, string>;
+  unseeded?: string[];
+  wagers?: Record<string, string>;
+  sigs?: Record<string, string>;
+  /** ⚖️ The fairness mode locked in when this window opened; the settle uses
+   *  it, so an owner's switch mid-window applies from the next one. */
+  fairMode?: FairnessMode;
 }
 
 /** Which fairness scheme produced a table's dice (see diceFairness.ts). All four
@@ -125,6 +142,12 @@ export interface FairnessTranscript {
   /** block-beacon: the block hash the dice mixed in. */
   beacon?: string;
   simulated?: boolean;
+  /** ⚖️ A LIVE multiparty roll (Fair by default): who each commit belongs to,
+   *  index-aligned with `commits` and `seeds` — 'house' first, then each
+   *  bettor's player id. A party that committed but never revealed has an
+   *  empty seed: their bets were forfeited and the result came from the rest.
+   *  Absent on the older dev-simulated transcripts. */
+  parties?: string[];
 }
 
 const FAIRNESS_MODES: readonly string[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
@@ -151,7 +174,52 @@ export function isFairnessTranscript(value: unknown): value is FairnessTranscrip
     && (f.commits === undefined || isBoundedStringArray(f.commits))
     && (f.seeds === undefined || isBoundedStringArray(f.seeds))
     && (f.beacon === undefined || (typeof f.beacon === 'string' && f.beacon.length <= FAIRNESS_MAX_STRING))
-    && (f.simulated === undefined || typeof f.simulated === 'boolean');
+    && (f.simulated === undefined || typeof f.simulated === 'boolean')
+    && (f.parties === undefined || (
+        isBoundedStringArray(f.parties)
+        && f.commits?.length === f.parties.length
+        && f.seeds?.length === f.parties.length
+    ));
+}
+
+/** The party name a live multiparty transcript gives the house's seed. */
+export const HOUSE_PARTY = 'house';
+
+/** ⚖️ The per-round seed commitments on a Fair table's state (craps and
+ *  roulette share them). `houseCommit` is written when the betting window
+ *  opens; `commits` is the bettors' commitments FROZEN at "no more bets" —
+ *  only these parties are asked to reveal, and only their seeds count. */
+export interface SeedRoundFields {
+  houseCommit?: string;
+  commits?: Record<string, string>;
+  /** Players with chips down at "no more bets" who added no seed (their
+   *  client never committed in time, or the party cap was full). They are
+   *  protected only by the other parties' seeds — shown on the table card. */
+  unseeded?: string[];
+  /** Each frozen bettor's wager list, hashed at "no more bets": the settle
+   *  pays only lists that still match. */
+  wagers?: Record<string, string>;
+  /** Each frozen bettor's signature over its commitment (its identity key,
+   *  players[pid].keyB64): nobody else can put a seed in under its name. */
+  sigs?: Record<string, string>;
+}
+
+function isPidMap(v: unknown, max: number): boolean {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const entries = Object.entries(v);
+  return entries.length <= max
+    && entries.every(([pid, c]) => pid.length > 0 && pid.length <= 128
+      && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
+}
+
+/** Shape guard for the peer-written seed fields (bounded like transcripts). */
+export function isSeedRoundFields(s: SeedRoundFields): boolean {
+  if (s.houseCommit !== undefined
+    && (typeof s.houseCommit !== 'string' || s.houseCommit.length > FAIRNESS_MAX_STRING)) return false;
+  if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
+  if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
+  if (s.sigs !== undefined && !isPidMap(s.sigs, FAIRNESS_MAX_PARTIES - 1)) return false;
+  return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 
 export function initialCrapsState(): CrapsTableState {
@@ -164,6 +232,7 @@ export function initialCrapsState(): CrapsTableState {
 const BET_TYPES: readonly string[] = [
   'pass', 'dontpass', 'come', 'dontcome', 'field', 'place', 'big6', 'big8',
   'hard', 'anyseven', 'anycraps', 'two', 'three', 'yo', 'twelve',
+  'passodds', 'dontpassodds', 'comeodds', 'dontcomeodds',
 ];
 
 /** Shape guard — bets cross the room-doc trust boundary (peer writes). */
@@ -177,6 +246,9 @@ export function isCrapsBet(value: unknown): value is CrapsBet {
   }
   if (b.type === 'hard') {
     return Number.isInteger(b.pick) && HARD_NUMBERS.has(b.pick as number);
+  }
+  if (b.type === 'comeodds' || b.type === 'dontcomeodds') {
+    return Number.isInteger(b.pick) && POINT_NUMBERS.has(b.pick as number);
   }
   if (b.type === 'come' || b.type === 'dontcome') {
     return b.pick === undefined
@@ -215,12 +287,18 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
         )
     ))
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
+    // A void is the canonical no-outcome shape: no dice, no transcript.
+    && (s.voided === undefined || (typeof s.voided === 'boolean'
+      && (!s.voided || (s.phase === 'settled' && s.dice === null && s.result === null && s.fairness === undefined
+        && s.payouts !== null && Object.keys(s.payouts).length === 0))))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && isPlayerIdField(s.shooter)
     && isPlayerIdField(s.lastShooter)
-    && isPlayerIdField(s.operator);
+    && isPlayerIdField(s.operator)
+    && isSeedRoundFields(s)
+    && (s.fairMode === undefined || FAIRNESS_MODES.includes(s.fairMode));
 }
 
 /** The point AFTER a roll of `sum`, given the point in force before it:
@@ -249,6 +327,9 @@ export function shooterHandOver(pointBefore: number | null, sum: number): boolea
 export function canPlaceBet(type: CrapsBetType, point: number | null): boolean {
   if (type === 'pass' || type === 'dontpass') return point === null;
   if (type === 'come' || type === 'dontcome') return point !== null;
+  // Line odds back the point, so there must be one. Come / don't come odds
+  // can go up whenever their come bet stands (oddsRoom checks that).
+  if (type === 'passodds' || type === 'dontpassodds') return point !== null;
   return true;
 }
 
@@ -279,6 +360,153 @@ const HARD_ODDS: Record<number, number> = { 4: 7, 6: 9, 8: 9, 10: 7 };
 
 /** A bet that stays up after it wins: only the winnings come back. */
 const paidAndStays = (credited: number): BetResolution => ({ credited, keep: true, outcome: 'win' });
+
+// ── Odds ─────────────────────────────────────────────────────────────────────
+// The one bet on the felt with no house edge. Once a line or come bet has a
+// number, its owner may back it with ODDS (pass / come: paid at the true odds
+// of that number before a 7) or LAY odds against it (don't pass / don't come:
+// the inverse). Odds ride with their flat bet and are decided on the same
+// roll; the flat bet is what earns the right to take them, so the stake is
+// capped at a multiple of it (the house's 3-4-5x table).
+//
+// Standard working rules:
+//  - Pass / don't pass odds exist only while a point is on (they back IT).
+//  - Come odds are OFF on the come-out roll: if the come bet is decided on a
+//    come-out roll (its number, or a 7), the flat bet wins / loses as usual
+//    and its odds come back untouched.
+//  - Don't come lay odds are always working.
+
+/** The four odds bet types. */
+export const ODDS_TYPES: ReadonlySet<CrapsBetType> = new Set<CrapsBetType>([
+  'passodds', 'dontpassodds', 'comeodds', 'dontcomeodds',
+]);
+
+export function isOddsType(type: string): type is 'passodds' | 'dontpassodds' | 'comeodds' | 'dontcomeodds' {
+  return ODDS_TYPES.has(type as CrapsBetType);
+}
+
+/** TRUE odds by number, winnings:stake — ways to roll a 7 (six) against ways
+ *  to roll the number: 4/10 three → 2:1, 5/9 four → 3:2, 6/8 five → 6:5. */
+const TRUE_ODDS: Record<number, [number, number]> = {
+  4: [2, 1], 5: [3, 2], 6: [6, 5], 8: [6, 5], 9: [3, 2], 10: [2, 1],
+};
+
+/** Winnings:stake an odds bet of `type` pays on number `n` — true odds for
+ *  pass / come, the inverse (1:2, 2:3, 5:6) for the lay side. */
+export function oddsPayout(type: CrapsBetType, n: number): [number, number] {
+  const [num, den] = TRUE_ODDS[n] ?? [1, 1];
+  return type === 'dontpassodds' || type === 'dontcomeodds' ? [den, num] : [num, den];
+}
+
+/** 3-4-5x odds: how many times the flat bet the odds may be, by number. */
+export const MAX_ODDS_MULTIPLE: Readonly<Record<number, number>> = { 4: 3, 5: 4, 6: 5, 8: 5, 9: 4, 10: 3 };
+
+/** Lay odds may be up to 6x the flat bet on every number — the lay that
+ *  WINS 3x / 4x / 5x the flat, mirroring the right side's cap. */
+export const MAX_LAY_MULTIPLE = 6;
+
+/** Most chips odds of `type` on number `n` may hold behind `flat` chips. */
+export function maxOddsStake(type: CrapsBetType, n: number, flat: number): number {
+  if (!POINT_NUMBERS.has(n) || flat <= 0) return 0;
+  const lay = type === 'dontpassodds' || type === 'dontcomeodds';
+  return flat * (lay ? MAX_LAY_MULTIPLE : MAX_ODDS_MULTIPLE[n]);
+}
+
+/** The flat bet type an odds type rides on. */
+function oddsBaseType(type: CrapsBetType): CrapsBetType {
+  return type === 'passodds' ? 'pass' : type === 'dontpassodds' ? 'dontpass'
+    : type === 'comeodds' ? 'come' : 'dontcome';
+}
+
+/** The chips of flat bet that odds of `type` (on come point `pick`) ride on,
+ *  in one player's list: the pass / don't pass line, or the come / don't come
+ *  bets that travelled to `pick`. */
+export function oddsFlat(bets: readonly CrapsBet[], type: CrapsBetType, pick?: number): number {
+  const base = oddsBaseType(type);
+  const line = type === 'passodds' || type === 'dontpassodds';
+  let flat = 0;
+  for (const b of bets) {
+    if (b.type !== base) continue;
+    if (line || (b.pick !== undefined && b.pick === pick)) flat += b.amount;
+  }
+  return flat;
+}
+
+/** The number odds back: the table's point for line odds, the bet's own pick
+ *  for come odds. null ⇒ nothing to back. */
+function oddsNumber(type: CrapsBetType, pick: number | undefined, point: number | null): number | null {
+  const n = type === 'passodds' || type === 'dontpassodds' ? point : pick ?? null;
+  return n !== null && POINT_NUMBERS.has(n) ? n : null;
+}
+
+/**
+ * How many more chips a player may put on odds of `type` (on come point
+ * `pick`) right now, or why none: the felt's check before a chip lands. The
+ * settle enforces the same cap (resolveCrapsRound), so a list written around
+ * this is paid only up to it.
+ */
+export function oddsRoom(
+  bets: readonly CrapsBet[],
+  type: CrapsBetType,
+  pick: number | undefined,
+  point: number | null,
+): { room: number; reason: string | null } {
+  if ((type === 'passodds' || type === 'dontpassodds') && point === null) {
+    return { room: 0, reason: 'ODDS GO UP ONCE A POINT IS ON' };
+  }
+  const n = oddsNumber(type, pick, point);
+  const flat = n === null ? 0 : oddsFlat(bets, type, pick);
+  if (n === null || flat <= 0) {
+    const what = type === 'passodds' ? 'PASS LINE BET' : type === 'dontpassodds' ? "DON'T PASS BET"
+      : type === 'comeodds' ? `COME BET ON ${pick}` : `DON'T COME BET ON ${pick}`;
+    return { room: 0, reason: `NO ${what} TO BACK` };
+  }
+  const have = bets.filter((b) => b.type === type && b.pick === pick)
+    .reduce((a, b) => a + b.amount, 0);
+  const room = Math.max(0, maxOddsStake(type, n, flat) - have);
+  return room > 0 ? { room, reason: null } : { room: 0, reason: 'THE ODDS ARE AT THE TABLE MAXIMUM' };
+}
+
+/**
+ * Settle a whole STACK of odds (every chip one player has on one odds spot),
+ * given the flat bet it rides on. Paying the stack at once keeps the
+ * fractional true-odds payouts from losing a chip per record to rounding.
+ * Chips over the cap (or with no flat bet / no point behind them) are not in
+ * action: they come back whenever the stack is decided, or at once when
+ * nothing backs them at all.
+ */
+export function resolveOddsStack(
+  type: CrapsBetType,
+  pick: number | undefined,
+  stake: number,
+  flat: number,
+  d1: number,
+  d2: number,
+  pointBefore: number | null,
+): BetResolution {
+  const sum = d1 + d2;
+  const n = oddsNumber(type, pick, pointBefore);
+  if (n === null) return push(stake);                  // nothing to back
+  const working = Math.min(stake, maxOddsStake(type, n, flat));
+  if (working <= 0) return push(stake);                // no flat bet behind it
+  const spare = stake - working;
+  // Come odds are off on the come-out: the come bet is decided on its own and
+  // the odds come back.
+  if (type === 'comeodds' && pointBefore === null) {
+    return sum === n || sum === 7 ? push(stake) : stay;
+  }
+  const [num, den] = oddsPayout(type, n);
+  const win = (): BetResolution => won(working + Math.floor((working * num) / den) + spare);
+  const lose = (): BetResolution => ({ credited: spare, keep: false, outcome: 'lose' });
+  if (type === 'passodds' || type === 'comeodds') {
+    if (sum === n) return win();
+    if (sum === 7) return lose();
+    return stay;
+  }
+  if (sum === 7) return win();
+  if (sum === n) return lose();
+  return stay;
+}
 
 /** Resolve ONE bet against a roll, given the point in force BEFORE the roll. */
 export function resolveCrapsBet(
@@ -373,10 +601,19 @@ export function resolveCrapsBet(
       return sum === 7 ? won(a * 5) : lost;                // 4:1
     case 'anycraps':
       return (sum === 2 || sum === 3 || sum === 12) ? won(a * 8) : lost; // 7:1
+    case 'passodds':
+    case 'dontpassodds':
+    case 'comeodds':
+    case 'dontcomeodds':
+      // On its own, an odds bet is taken as fully backed; resolveCrapsRound
+      // checks the flat bet and the cap, and pays the whole stack at once.
+      return resolveOddsStack(bet.type, bet.pick, a, Number.MAX_SAFE_INTEGER, d1, d2, pointBefore);
     default:
       return lost;
   }
 }
+
+const spotOf = (b: CrapsBet): string => `${b.type}:${b.pick ?? ''}`;
 
 /** Per-player resolution of a whole roll: total credited + the pruned bet list
  *  each player carries to the next roll. Players with a positive credit appear
@@ -402,7 +639,23 @@ export function resolveCrapsRound(
       }
     }
     const placePaidPick = new Set<number>();
+    // Odds settle by the stack, against the flat bet as it stood BEFORE this
+    // roll (a come bet decided this roll still backs its odds this roll).
+    const oddsStacks = new Map<string, BetResolution>();
     for (const bet of bets) {
+      if (!isOddsType(bet.type)) continue;
+      const k = spotOf(bet);
+      if (oddsStacks.has(k)) continue;
+      const stake = bets.filter((b) => spotOf(b) === k).reduce((x, b) => x + b.amount, 0);
+      const r = resolveOddsStack(bet.type, bet.pick, stake, oddsFlat(bets, bet.type, bet.pick), d1, d2, pointBefore);
+      oddsStacks.set(k, r);
+      total += r.credited;
+    }
+    for (const bet of bets) {
+      if (isOddsType(bet.type)) {
+        if (oddsStacks.get(spotOf(bet))?.keep) kept.push(bet);
+        continue;
+      }
       const r = resolveCrapsBet(bet, d1, d2, pointBefore);
       if (r.keep) kept.push(r.moved ?? bet);
       if (bet.type === 'place' && bet.pick != null && r.outcome === 'win') {
@@ -440,6 +693,10 @@ export function crapsBetLabel(bet: CrapsBet): string {
     case 'three': return 'THREE';
     case 'yo': return 'YO 11';
     case 'twelve': return 'TWELVE';
+    case 'passodds': return 'PASS LINE ODDS';
+    case 'dontpassodds': return "DON'T PASS LAY ODDS";
+    case 'comeodds': return `COME ODDS ${bet.pick}`;
+    case 'dontcomeodds': return `DON'T COME LAY ODDS ${bet.pick}`;
     default: return '?';
   }
 }

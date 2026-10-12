@@ -61,8 +61,11 @@ function buildCabinet(): { group: THREE.Group; handle: CoinPusherVisualHandle } 
     cloneVats: new Map(),
     slotMachineVisuals: new Map(),
     coinPusherVisuals: new Map(),
+    arcadeCabinetVisuals: new Map(),
     propAnims: new Map(),
     airHockeyVisuals: new Map(),
+    tvScreens: new Map(),
+    arcadeScreens: new Map(),
     alligatorsVisuals: new Map(),
     casinoTableVisuals: new Map(),
   };

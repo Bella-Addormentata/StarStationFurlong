@@ -85,3 +85,6 @@ node_modules
 .claude/
 .vscode/
 images/
+
+# 🕹 EmulatorJS data files (#193) — fetched by prototypes/*/scripts/fetch-emulatorjs.mjs, never vendored
+prototypes/*/public/emulatorjs/

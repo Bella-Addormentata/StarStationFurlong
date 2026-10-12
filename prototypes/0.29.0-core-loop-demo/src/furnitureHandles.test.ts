@@ -25,8 +25,11 @@ function freshSinks(): FurnitureHandleSinks {
     cloneVats: new Map(),
     slotMachineVisuals: new Map(),
     coinPusherVisuals: new Map(),
+    arcadeCabinetVisuals: new Map(),
     propAnims: new Map(),
     airHockeyVisuals: new Map(),
+    tvScreens: new Map(),
+    arcadeScreens: new Map(),
     alligatorsVisuals: new Map(),
     casinoTableVisuals: new Map(),
   };
@@ -56,6 +59,7 @@ describe('registerFurnitureHandles — filing', () => {
     const vat = handle('vat');
     const slot = handle('slot');
     const pusher = handle('pusher');
+    const arcade = handle('arcade');
     const pulse = handle('pulse');
     const hockey = handle('hockey');
     const gators = handle('gators');
@@ -69,6 +73,7 @@ describe('registerFurnitureHandles — filing', () => {
     registerFurnitureHandles(sinks, ITEM, carrier({ cloneVat: vat }));
     registerFurnitureHandles(sinks, ITEM, carrier({ slotMachineVisual: slot }));
     registerFurnitureHandles(sinks, ITEM, carrier({ coinPusherVisual: pusher }));
+    registerFurnitureHandles(sinks, ITEM, carrier({ arcadeCabinet: arcade }));
     registerFurnitureHandles(sinks, ITEM, carrier({ propAnim: pulse }));
     registerFurnitureHandles(sinks, ITEM, carrier({ airHockey: hockey }));
     registerFurnitureHandles(sinks, ITEM, carrier({ alligators: gators }));
@@ -83,6 +88,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.cloneVats.get(ITEM)).toBe(vat);
     expect(sinks.slotMachineVisuals.get(ITEM)).toBe(slot);
     expect(sinks.coinPusherVisuals.get(ITEM)).toBe(pusher);
+    expect(sinks.arcadeCabinetVisuals.get(ITEM)).toBe(arcade);
     expect(sinks.propAnims.get(ITEM)).toBe(pulse);
     expect(sinks.airHockeyVisuals.get(ITEM)).toBe(hockey);
     expect(sinks.alligatorsVisuals.get(ITEM)).toBe(gators);
@@ -96,11 +102,12 @@ describe('registerFurnitureHandles — filing', () => {
       sinks.cloneVats.size,
       sinks.slotMachineVisuals.size,
       sinks.coinPusherVisuals.size,
+      sinks.arcadeCabinetVisuals.size,
       sinks.propAnims.size,
       sinks.airHockeyVisuals.size,
       sinks.alligatorsVisuals.size,
       sinks.casinoTableVisuals.size,
-    ]).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+    ]).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
   });
 
   it('files every kind one carrier mesh carries', () => {
@@ -148,7 +155,7 @@ describe('registerFurnitureHandles — filing', () => {
       ITEM,
       carrier({
         wallScreen: null, trunkLid: undefined, gameTableTop: false, cloneVat: 0, slotMachineVisual: '',
-        coinPusherVisual: null, airHockey: null, alligators: null, casinoTable: null,
+        coinPusherVisual: null, airHockey: null, tvScreen: undefined, arcadeScreen: null, alligators: null, casinoTable: null,
       }),
     );
     // A string "speed" is not a spinner tag — same typeof check both paths used.
@@ -196,7 +203,7 @@ describe('registerFurnitureHandles — one list', () => {
    * key without a leading dot, e.g. "tagged userData.holoSpin", doesn't match.)
    */
   const HANDLE_READ =
-    /\.userData\.(wallScreen|holoSpin|trunkLid|gameTableTop|cloneVat|slotMachineVisual|coinPusherVisual|airHockey|alligators|casinoTable)\b/;
+    /\.userData\.(wallScreen|holoSpin|trunkLid|gameTableTop|cloneVat|slotMachineVisual|coinPusherVisual|airHockey|tvScreen|arcadeScreen|arcadeCabinet|alligators|casinoTable)\b/;
 
   it('both registration paths call the helper and keep no private copy of the list (#117)', () => {
     for (const [name, text] of [['world.ts', world], ['devMenu.ts', devMenu]] as const) {

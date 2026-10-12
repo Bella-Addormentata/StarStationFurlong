@@ -28,9 +28,10 @@ export class InputManager {
     });
 
     // Leaving the window entirely (alt-tab, a native dialog, the OS taking
-    // focus) delivers no keyup, so anything held sticks down and the avatar
-    // is still walking when the player comes back. Same stuck-key class as
-    // the chat case above, so it is closed in the same place.
+    // focus, focus moving into the arcade cabinet's emulator frame) delivers
+    // no keyup, so anything held sticks down and the avatar is still walking
+    // when the player comes back. Same stuck-key class as the chat case
+    // above, so it is closed in the same place.
     window.addEventListener('blur', () => this.keys.clear());
 
     console.log('✅ Input manager initialized');
