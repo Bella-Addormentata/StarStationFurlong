@@ -56,6 +56,14 @@ env:
   #      with `tag` + `target` — see workflow_dispatch above).
   RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
 
+  # 🕹 THE ARCADE CORES A RELEASE CARRIES, as comma-separated libretro names
+  # (scripts/fetch-emulatorjs.mjs in RELEASE_FRONTEND); empty means all of them.
+  # The installers' fetch and the emulator's source archive both read this, so
+  # a core left out is left out of both. A build that is sold, or that asks for
+  # donations, has to leave out fbneo, mame2003_plus, snes9x and genesis_plus_gx
+  # (public/arcade/README.md).
+  EJS_CORES: ''
+
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────
   # tauri-action cannot reliably find draft releases by tag (drafts are not
@@ -352,12 +360,12 @@ jobs:
         run: |
           cd "$RELEASE_FRONTEND"
           npm ci
-          # 🕹 The arcade cabinet's own EmulatorJS (#193): the engine and its
-          # eleven cores, from the npm registry at the version the fetch
-          # script pins, refused unless each package's sha512 is pinned
-          # there too. Four of the cores forbid commercial use (FBNeo,
-          # MAME 2003-Plus, Snes9x, Genesis Plus GX; public/arcade/README.md).
-          # A frontend without the script skips this.
+          # 🕹 The arcade cabinet's own EmulatorJS (#193): the engine and the
+          # cores EJS_CORES (above) names, all eleven by default, from the npm
+          # registry at the version the fetch script pins, refused unless each
+          # package's sha512 is pinned there too. Four of the cores forbid
+          # commercial use (FBNeo, MAME 2003-Plus, Snes9x, Genesis Plus GX;
+          # public/arcade/README.md). A frontend without the script skips this.
           EJS_REQUIRE_PIN=1 npm run --if-present fetch:emulatorjs
           npm run build
 
@@ -489,15 +497,17 @@ jobs:
             }
 
   # ── Stage 2c: the emulator's source, attached to the same draft ──────────
-  # Release builds carry EmulatorJS and eleven libretro cores (step 4 above).
-  # Most of them are GPL and mgba is MPL, which ask whoever ships them to
-  # offer their exact source too, and the plainest way is from the same
-  # place: this packs the commits each part was built from
+  # Release builds carry EmulatorJS and the libretro cores EJS_CORES (above)
+  # names, all eleven by default (step 4 above). Most of them are GPL and
+  # mgba is MPL, which ask whoever ships them to offer their exact source too,
+  # and the plainest way is from the same place: this packs the commits the
+  # engine and those same cores were built from
   # (scripts/emulatorjs-sources.json) into emulatorjs-<version>-source.tar.xz,
-  # about 123 MB, and attaches it beside the installers. finalize-release
-  # waits for it, so no release goes out without it. A frontend that fetches
-  # no EmulatorJS has nothing to pack; one that fetches it but has no way to
-  # pack its source fails here.
+  # about 123 MB with all eleven, and attaches it beside the installers. Once
+  # the pack has run, the upload fails without exactly one archive, and
+  # finalize-release waits for this job, so no release goes out without it. A
+  # frontend that fetches no EmulatorJS has nothing to pack; one that fetches
+  # it but has no way to pack its source fails here.
   publish-emulator-source:
     needs: create-release
     permissions:
@@ -515,13 +525,15 @@ jobs:
           node-version: 20
 
       - name: 📦 Pack the emulator's source (${{ env.RELEASE_FRONTEND }})
+        id: pack
         shell: bash
         run: |
           cd "$RELEASE_FRONTEND"
           scripts=" $(node -p "Object.keys(require('./package.json').scripts ?? {}).join(' ')") "
           case "$scripts" in
             *" pack:emulatorjs-source "*)
-              EJS_SOURCE_OUT="$RUNNER_TEMP/emulatorjs-source" npm run pack:emulatorjs-source ;;
+              EJS_SOURCE_OUT="$RUNNER_TEMP/emulatorjs-source" npm run pack:emulatorjs-source
+              echo "packed=true" >> "$GITHUB_OUTPUT" ;;
             *" fetch:emulatorjs "*)
               echo "::error::$RELEASE_FRONTEND ships EmulatorJS (fetch:emulatorjs) but has no pack:emulatorjs-source to pack its source."
               exit 1 ;;
@@ -530,6 +542,7 @@ jobs:
           esac
 
       - name: ⬆️ Upload the source archive to the shared draft release
+        if: steps.pack.outputs.packed == 'true'
         uses: actions/github-script@v8
         with:
           script: |
@@ -539,6 +552,12 @@ jobs:
             const release_id = Number('${{ needs.create-release.outputs.release_id }}');
             const dir = path.join(process.env.RUNNER_TEMP, 'emulatorjs-source');
             const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('-source.tar.xz')) : [];
+            // The release owes exactly one archive, and finalize-release's asset
+            // floor would be met without it.
+            if (files.length !== 1) {
+              core.setFailed(`Refusing to go on: the pack should have left one *-source.tar.xz in ${dir}, and there are ${files.length}. Draft left intact.`);
+              return;
+            }
             // A re-run of this job finds its earlier upload on the draft: replace it.
             const earlier = await github.paginate(github.rest.repos.listReleaseAssets, { owner, repo, release_id, per_page: 100 });
             for (const name of files) {

@@ -4,8 +4,9 @@
  * archive, emulatorjs-<version>-source.tar.xz, which release.yml attaches
  * to the release beside the installers that carry the emulator.
  *
- * Release builds carry EmulatorJS and eleven libretro cores
- * (scripts/fetch-emulatorjs.mjs). The engine and most cores are GPL and
+ * Release builds carry EmulatorJS and the libretro cores EJS_CORES names, all
+ * eleven by default (scripts/fetch-emulatorjs.mjs), and this packs the source
+ * of those same cores. The engine and most cores are GPL and
  * mgba is MPL-2.0: whoever ships them must also offer the exact source they
  * were built from, and the plainest way is from the same place. EmulatorJS
  * publishes the cores built but does not say what each was built from, so
@@ -37,6 +38,7 @@
  *
  *   npm run pack:emulatorjs-source                  (into ./emulatorjs-source/)
  *   EJS_SOURCE_OUT=<dir> npm run pack:emulatorjs-source
+ *   EJS_CORES=fceumm,mgba npm run pack:emulatorjs-source   (a subset, as fetched)
  *
  * Needs git, GNU tar and xz. It reads github.com and nothing else.
  */
@@ -55,15 +57,22 @@ const log = (s) => console.log(`[pack-emulatorjs-source] ${s}`);
 const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
 const run = (cmd, args) => execFileSync(cmd, args, { env, stdio: ['ignore', 'pipe', 'inherit'] }).toString('utf8').trim();
 
-/** Every tree the archive carries: where it goes and what it is. */
-for (const core of Object.keys(sources.cores)) {
-  if (!/^[a-z0-9_]+$/.test(core)) throw new Error(`emulatorjs-sources.json: '${core}' is not a core's name`);
+// The cores the build carries, chosen as fetch-emulatorjs.mjs chooses them:
+// EJS_CORES when it is set (release.yml sets it once, for both), else every
+// pinned core, which are the fetch's own defaults (arcadeDoc.test.ts). A core
+// the build leaves out, its source leaves out too.
+const cores = [...new Set((process.env.EJS_CORES ? process.env.EJS_CORES.split(',') : Object.keys(sources.cores))
+  .map((c) => c.trim()).filter(Boolean))];
+for (const core of cores) {
+  if (!/^[a-z0-9_]+$/.test(core)) throw new Error(`'${core}' is not a core's name`);
+  if (!Object.hasOwn(sources.cores, core)) throw new Error(`core ${core} has no source pinned in emulatorjs-sources.json`);
 }
+/** Every tree the archive carries: where it goes and what it is. */
 const trees = [
   { dir: 'EmulatorJS', what: `the engine, EmulatorJS ${sources.version}`, ...sources.engine },
   { dir: 'RetroArch', what: "RetroArch, EmulatorJS's fork, which every core is linked with", ...sources.frontend },
   { dir: 'build', what: "EmulatorJS's build scripts (build.sh, cores.json), which built the cores", ...sources.build },
-  ...Object.entries(sources.cores).map(([core, s]) => ({ dir: `cores/${core}`, what: `the ${core} core`, ...s })),
+  ...cores.map((core) => ({ dir: `cores/${core}`, what: `the ${core} core`, ...sources.cores[core] })),
 ];
 
 const work = mkdtempSync(join(tmpdir(), 'ejs-source-'));

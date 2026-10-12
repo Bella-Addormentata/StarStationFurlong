@@ -74,7 +74,8 @@ The four non-commercial cores are in release builds because Star Station
 Furlong is non-commercial (the owner, 2026-10-12). FBNeo's license also forbids
 asking for donations to support work on any project that uses it, and this one
 asks for none. A build that is sold, or that asks for donations, would have to
-leave those cores out (`EJS_CORES` names the cores to fetch).
+leave those cores out: `EJS_CORES` in `.github/workflows/release.yml` names the
+cores a release carries, and its source archive then carries only theirs.
 
 EmulatorJS's own scripts travel with it unminified. The cores are compiled
 builds, too big to carry their source inside the app the way the built-in

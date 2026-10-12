@@ -51,9 +51,10 @@
  * MAME 2003-Plus, Snes9x and Genesis Plus GX forbid commercial use.
  * NOTICE.txt, written beside the engine, names what was fetched and the
  * commit each part was built from (emulatorjs-sources.json). Release builds
- * ship every default core (release.yml), and each release carries all of
- * that source too, as emulatorjs-<version>-source.tar.xz beside the
- * installers (pack-emulatorjs-source.mjs packs it).
+ * ship the cores release.yml's EJS_CORES names (every default core unless it
+ * names fewer), and each release carries their source too, as
+ * emulatorjs-<version>-source.tar.xz beside the installers
+ * (pack-emulatorjs-source.mjs packs it, for the same EJS_CORES).
  */
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
