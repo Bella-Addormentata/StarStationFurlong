@@ -109,6 +109,16 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// empty would let a writer reselect those inputs, or a second TAKE draw
 /// another mojo while the first claim is still live. Restored spends are
 /// reconciled like any other, after a fresh grace.
+///
+/// The file is AUTHORITATIVE, so the lease fails closed around it (#245
+/// review, round 19): a lease file that exists but cannot be read SEALS the
+/// lease (no spend leaves until the file is fixed or removed and the node
+/// restarted, since the spends it described may still be live), and a
+/// parking that cannot be written is taken back and its spend is not sent,
+/// since a restart would forget it. The file is only ever over-parked, never
+/// under: a release that fails to save is logged and the next change saves
+/// it, and a restored coin the chain has long settled is released by the
+/// first reconciliation.
 pub struct WalletLease {
     gate: tokio::sync::Mutex<()>,
     pending: std::sync::Mutex<HashMap<Bytes32, Parked>>,
@@ -123,6 +133,10 @@ pub struct WalletLease {
     /// tests). Held across a snapshot and its write, so the file always holds
     /// the latest parking.
     store: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Why no spend may leave: the previous run's lease file exists but could
+    /// not be read (see [`WalletLease::restore`]). Nothing parks, and nothing
+    /// is written over the file.
+    sealed: std::sync::Mutex<Option<String>>,
 }
 
 /// A parked coin: when, and by which spend (see [`Parking`]).
@@ -202,6 +216,7 @@ impl WalletLease {
             spends: std::sync::atomic::AtomicU64::new(0),
             probe_cursor: std::sync::atomic::AtomicU64::new(0),
             store: std::sync::Mutex::new(None),
+            sealed: std::sync::Mutex::new(None),
         }
     }
 
@@ -212,12 +227,16 @@ impl WalletLease {
 
     /// Park the coins a spend is ABOUT to consume, before its push leaves (see
     /// [`push_parked`]). The returned [`Parking`] hands exactly this parking
-    /// back on an explicit rejection; a transport error keeps it.
-    pub fn park(&self, coin_ids: impl IntoIterator<Item = Bytes32>) -> Parking {
+    /// back on an explicit rejection; a transport error keeps it. `Err` means
+    /// NOTHING is parked and the spend must not leave: the lease is sealed, or
+    /// the parking could not be saved and a restart would forget the spend
+    /// (#245 review, round 19).
+    pub fn park(&self, coin_ids: impl IntoIterator<Item = Bytes32>) -> Result<Parking, LeaseError> {
         self.park_at(coin_ids, Instant::now())
     }
 
-    pub fn park_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) -> Parking {
+    pub fn park_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) -> Result<Parking, LeaseError> {
+        self.ensure_open()?;
         let spend = self.spends.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let coins: Vec<Bytes32> = coin_ids.into_iter().collect();
         {
@@ -226,8 +245,25 @@ impl WalletLease {
                 pending.insert(*id, Parked { at: now, spend });
             }
         }
-        self.persist();
-        Parking { spend, coins }
+        if let Err(e) = self.persist() {
+            // Not saved, so not sent: take the parking back whole (by its spend
+            // number, as a rejection would) and let the caller refuse the
+            // spend. The number is used up, so no later spend shares it.
+            self.pending.lock().unwrap().retain(|_, parked| parked.spend != spend);
+            return Err(LeaseError::Unsaved(e));
+        }
+        Ok(Parking { spend, coins })
+    }
+
+    /// `Err` while the lease is sealed (see [`WalletLease::restore`]). Every
+    /// writer checks this right after taking the gate, so it refuses before it
+    /// reads the chain and names the reason at once; [`WalletLease::park`]
+    /// checks it again, so nothing leaves regardless.
+    pub fn ensure_open(&self) -> Result<(), LeaseError> {
+        match self.sealed.lock().unwrap().as_ref() {
+            Some(why) => Err(LeaseError::Sealed(why.clone())),
+            None => Ok(()),
+        }
     }
 
     /// The gateway REJECTED the spend outright, so it holds nothing of it and
@@ -248,11 +284,18 @@ impl WalletLease {
         self.pending.lock().unwrap().contains_key(coin_id)
     }
 
-    /// Record the faucet coin a claim just spent: the gift INTO our wallet is
-    /// landing for as long as that coin stays parked.
-    pub fn mark_incoming(&self, faucet_coin: Bytes32) {
-        *self.incoming.lock().unwrap() = Some(faucet_coin);
-        self.persist();
+    /// Record the faucet coin a claim is ABOUT to spend: the gift INTO our
+    /// wallet is landing for as long as that coin stays parked. `Err` means the
+    /// marker is not set (the lease is sealed, or the marker could not be
+    /// saved) and the claim must not leave, like a parking that failed.
+    pub fn mark_incoming(&self, faucet_coin: Bytes32) -> Result<(), LeaseError> {
+        self.ensure_open()?;
+        let previous = self.incoming.lock().unwrap().replace(faucet_coin);
+        if let Err(e) = self.persist() {
+            *self.incoming.lock().unwrap() = previous;
+            return Err(LeaseError::Unsaved(e));
+        }
+        Ok(())
     }
 
     /// A spend from OUR wallet is still settling: a coin is parked other than
@@ -274,7 +317,7 @@ impl WalletLease {
             Some(id) if self.is_pending(&id) => true,
             Some(_) => {
                 *self.incoming.lock().unwrap() = None;
-                self.persist();
+                self.persist_or_log("the gift settled");
                 false
             }
             None => false,
@@ -302,10 +345,12 @@ impl WalletLease {
 
     /// Forget the coins the given spends parked. A coin parked AGAIN by a later
     /// spend in the meantime (a new spend of a coin the chain had let go) carries
-    /// that spend's number and stays, whatever a stale verdict says.
+    /// that spend's number and stays, whatever a stale verdict says. A release
+    /// the file cannot take is logged: it then over-parks a settled coin until
+    /// the next change saves, or a restart reconciles it away; never under.
     pub fn release(&self, spends: &[u64]) {
         self.pending.lock().unwrap().retain(|_, parked| !spends.contains(&parked.spend));
-        self.persist();
+        self.persist_or_log("a release");
     }
 
     /// Take the parking the previous run left in `path`, and keep writing the
@@ -317,70 +362,93 @@ impl WalletLease {
     /// mempool then settle them exactly as they would have without the
     /// restart. The spend counter continues above the restored numbers, so a
     /// new spend never shares one with a restored verdict (compare-and-release
-    /// stays sound). A missing file is a first run; an unreadable one is logged
-    /// and the lease starts empty, as every run did before the file existed.
+    /// stays sound).
+    ///
+    /// A missing file is a first run. A file that EXISTS but cannot be read or
+    /// parsed SEALS the lease (round 19): the spends it described may still be
+    /// live in the mempool, so a lease that started empty would let a writer
+    /// reselect their inputs, or a second TAKE draw another mojo. Nothing
+    /// parks until the operator fixes or removes the file and restarts the
+    /// node, and nothing is written over it meanwhile (it is left for
+    /// recovery); the log at startup says so.
     pub fn restore(&self, path: &std::path::Path) {
-        match std::fs::read(path) {
+        let read = match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<LeaseFile>(&bytes) {
-                Ok(file) => {
-                    let parked = self.load(&file, Instant::now());
-                    if parked > 0 {
-                        println!(
-                            "⛓️ wallet lease: {parked} coin(s) still parked from the last run (spends up to #{}); the chain and the mempool settle them",
-                            file.spends
-                        );
-                    }
-                }
-                Err(e) => eprintln!(
-                    "⛓️ wallet lease: {} is unreadable ({e}); starting with nothing parked",
-                    path.display()
-                ),
+                Ok(file) => self
+                    .load(&file, Instant::now())
+                    .map(|parked| (file.spends, parked))
+                    .map_err(|e| format!("{} holds a {e}", path.display())),
+                Err(e) => Err(format!("{} is unreadable ({e})", path.display())),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("⛓️ wallet lease: cannot read {}: {e}; starting with nothing parked", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, 0)),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        };
+        match read {
+            Ok((_, 0)) => {}
+            Ok((spends, parked)) => println!(
+                "⛓️ wallet lease: {parked} coin(s) still parked from the last run (spends up to #{spends}); the chain and the mempool settle them"
+            ),
+            Err(why) => {
+                eprintln!(
+                    "⛓️ wallet lease: {why}. SEALED: no spend leaves this node until the file is fixed or removed and the node restarted, since the spends it recorded may still be live"
+                );
+                *self.sealed.lock().unwrap() = Some(why);
+                return;
+            }
         }
         *self.store.lock().unwrap() = Some(path.to_path_buf());
     }
 
     /// Merge a stored parking into the lease (see [`WalletLease::restore`]):
-    /// how many coins it parked.
-    fn load(&self, file: &LeaseFile, now: Instant) -> usize {
-        let mut parked = 0;
+    /// how many coins it parked. Parsed WHOLE before anything is taken, so a
+    /// malformed entry leaves the lease untouched and seals it: the spend it
+    /// belonged to is unknown, not forgotten.
+    fn load(&self, file: &LeaseFile, now: Instant) -> Result<usize, String> {
+        let mut parked = Vec::with_capacity(file.parked.len());
+        for entry in &file.parked {
+            let id = parse_coin_id(&entry.coin).ok_or_else(|| format!("malformed parked coin id {:?}", entry.coin))?;
+            parked.push((id, entry.spend));
+        }
+        let incoming = match file.incoming.as_deref() {
+            Some(hex_id) => Some(parse_coin_id(hex_id).ok_or_else(|| format!("malformed incoming coin id {hex_id:?}"))?),
+            None => None,
+        };
         {
             let mut pending = self.pending.lock().unwrap();
-            for entry in &file.parked {
-                let Some(id) = parse_coin_id(&entry.coin) else {
-                    eprintln!("⛓️ wallet lease: skipping a malformed parked coin id {:?}", entry.coin);
-                    continue;
-                };
-                pending.entry(id).or_insert(Parked { at: now, spend: entry.spend });
-                parked += 1;
+            for (id, spend) in &parked {
+                pending.entry(*id).or_insert(Parked { at: now, spend: *spend });
             }
         }
         self.spends.fetch_max(file.spends, std::sync::atomic::Ordering::Relaxed);
-        if let Some(incoming) = file.incoming.as_deref().and_then(parse_coin_id) {
+        if let Some(incoming) = incoming {
             *self.incoming.lock().unwrap() = Some(incoming);
         }
-        parked
+        Ok(parked.len())
     }
 
     /// Write the parking to the store, if [`WalletLease::restore`] named one:
     /// after every change, synchronously, through a temporary file and a
-    /// rename, so the file on disk is always a whole snapshot. A failed write
-    /// is logged; the parking stays in memory as before.
-    fn persist(&self) {
+    /// rename, so the file on disk is always a whole snapshot. In memory only
+    /// (no store named, as in tests) there is nothing to do. The changes that
+    /// ADD parking treat a failed write as fatal to their spend (see
+    /// [`WalletLease::park`]); the ones that remove it log it
+    /// ([`WalletLease::persist_or_log`]).
+    fn persist(&self) -> std::io::Result<()> {
         let store = self.store.lock().unwrap();
-        let Some(path) = store.as_ref() else { return };
-        let file = self.snapshot();
-        let bytes = match serde_json::to_vec_pretty(&file) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("⛓️ wallet lease: could not encode the parking: {e}");
-                return;
-            }
-        };
-        if let Err(e) = write_replacing(path, &bytes) {
-            eprintln!("⛓️ wallet lease: could not write {}: {e}", path.display());
+        let Some(path) = store.as_ref() else { return Ok(()) };
+        let bytes = serde_json::to_vec_pretty(&self.snapshot()).map_err(std::io::Error::other)?;
+        write_replacing(path, &bytes)
+    }
+
+    /// Save after a change that only REMOVES parking: a failed write leaves the
+    /// file over-parked (a coin the chain has settled), which the next change
+    /// rewrites and a restart reconciles away. Never under-parked, so it is
+    /// safe to log and carry on.
+    fn persist_or_log(&self, change: &str) {
+        if let Err(e) = self.persist() {
+            eprintln!(
+                "⛓️ wallet lease: could not save the parking after {change}: {e}; the file keeps the previous parking until the next change saves"
+            );
         }
     }
 
@@ -497,13 +565,26 @@ pub async fn push_parked(
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = Bytes32>,
 ) -> Result<(), PushError> {
-    let parking = WALLET_LEASE.park(inputs);
+    push_parked_with(&WALLET_LEASE, client, bundle, inputs).await
+}
+
+/// [`push_parked`] against a given lease (the process-wide one in production;
+/// tests bring their own). The parking comes FIRST and must be saved: a lease
+/// that cannot park (sealed, or its file unwritable) means the spend never
+/// leaves, since a restart would forget it (#245 review, round 19).
+pub async fn push_parked_with(
+    lease: &WalletLease,
+    client: &CoinsetClient,
+    bundle: SpendBundle,
+    inputs: impl IntoIterator<Item = Bytes32>,
+) -> Result<(), PushError> {
+    let parking = lease.park(inputs).map_err(PushError::NotSent)?;
     let resp = match client.push_tx(bundle).await {
         Ok(resp) => resp,
         Err(e) => return Err(PushError::Unanswered(anyhow::Error::new(e))),
     };
     if !resp.success {
-        WALLET_LEASE.unpark(&parking);
+        lease.unpark(&parking);
         return Err(PushError::Rejected(resp.error.unwrap_or_else(|| "no reason given".to_string())));
     }
     Ok(())
@@ -522,6 +603,10 @@ pub enum PushError {
     /// it as one would let its user spend again, from other coins, while the
     /// first spend is still live.
     Unanswered(anyhow::Error),
+    /// The spend never left: the lease would not park its inputs (see
+    /// [`LeaseError`]), so nothing is parked and nothing was pushed. Like a
+    /// rejection, the action can be refused outright (#245 review, round 19).
+    NotSent(LeaseError),
 }
 
 impl std::fmt::Display for PushError {
@@ -532,11 +617,40 @@ impl std::fmt::Display for PushError {
                 f,
                 "coinset push_tx unanswered: {e:#} (the coins it spends stay parked until the chain or the mempool settles them)"
             ),
+            Self::NotSent(e) => write!(f, "spend not sent: {e}"),
         }
     }
 }
 
 impl std::error::Error for PushError {}
+
+/// Why the lease would not take a parking (see [`WalletLease::park`]): either
+/// way nothing is parked and the spend must not leave.
+#[derive(Debug)]
+pub enum LeaseError {
+    /// The previous run's lease file exists but could not be read, so what it
+    /// parked is unknown (see [`WalletLease::restore`]). Only the operator
+    /// clears this: the file is the one record of spends that may still be
+    /// live.
+    Sealed(String),
+    /// The parking could not be written to the lease file, so a restart would
+    /// forget the spend. Nothing was parked; the spend is not sent.
+    Unsaved(std::io::Error),
+}
+
+impl std::fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sealed(why) => write!(
+                f,
+                "the wallet lease is sealed ({why}); fix or remove wallet_lease.json and restart the node before it spends again"
+            ),
+            Self::Unsaved(e) => write!(f, "the wallet lease could not be saved ({e}), so the spend was not sent"),
+        }
+    }
+}
+
+impl std::error::Error for LeaseError {}
 
 /// How many spends one reconciliation asks the mempool about (one HTTPS call
 /// each); the rest wait for the next pass. Spends in flight are one per writer
@@ -872,6 +986,9 @@ pub async fn publish_presence(
     // 2. Find our fundable coin (pays for the spend) — under the wallet lease,
     //    so no other writer picks the same coin before this spend confirms.
     let _lease = WALLET_LEASE.lock().await;
+    // A sealed lease refuses before any gateway read (push_parked would refuse
+    // regardless; this spares the reads and names the reason at once).
+    WALLET_LEASE.ensure_open()?;
     let client = CoinsetClient::testnet11();
     WALLET_LEASE.reconcile(&client).await;
     let our_ph = our_puzzle_hash(chia_sk);
@@ -901,7 +1018,7 @@ mod tests {
         let b = Bytes32::new([2u8; 32]);
         let t0 = Instant::now();
         assert!(!lease.is_pending(&a));
-        let parking = lease.park_at([a], t0);
+        let parking = lease.park_at([a], t0).unwrap();
         assert!(lease.is_pending(&a));
         assert!(!lease.is_pending(&b));
         // No timer releases it, however long the spend waits in the mempool:
@@ -910,7 +1027,7 @@ mod tests {
         assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![DueSpend { spend: parking.spend, coins: vec![a] }]);
         lease.release(&[parking.spend]);
         assert!(!lease.is_pending(&a));
-        lease.park_at([b], t0);
+        lease.park_at([b], t0).unwrap();
         assert!(lease.is_pending(&b), "no eviction on elapsed time: parked until a verdict");
     }
 
@@ -919,13 +1036,13 @@ mod tests {
         let lease = WalletLease::new();
         let a = Bytes32::new([1u8; 32]);
         let t0 = Instant::now();
-        let first = lease.park_at([a], t0);
+        let first = lease.park_at([a], t0).unwrap();
         // A verdict formed for the first parking…
         let verdict: Vec<u64> = lease.due_at(t0 + RECONCILE_GRACE).iter().map(|d| d.spend).collect();
         assert_eq!(verdict, vec![first.spend]);
         // …while a writer saw the coin released and spent it again.
         lease.release(&[first.spend]);
-        let second = lease.park_at([a], t0 + Duration::from_secs(30));
+        let second = lease.park_at([a], t0 + Duration::from_secs(30)).unwrap();
         // The stale verdict lands: the fresh marker stays.
         lease.release(&verdict);
         assert!(lease.is_pending(&a));
@@ -943,7 +1060,7 @@ mod tests {
         let b = Bytes32::new([8u8; 32]);
         let t0 = Instant::now();
         // Parked the moment the writer commits to the spend, before any push.
-        let parking = lease.park_at([a, b], t0);
+        let parking = lease.park_at([a, b], t0).unwrap();
         assert!(lease.is_pending(&a) && lease.is_pending(&b));
         // A transport error leaves the parking alone (push_parked calls nothing):
         // both coins stay parked and come due for reconciliation after the grace,
@@ -955,9 +1072,9 @@ mod tests {
         assert!(!lease.is_pending(&a) && !lease.is_pending(&b));
         // …but never a NEWER parking of the same coin: a later writer's spend of
         // a coin the gateway rejected the first time keeps its marker.
-        let first = lease.park_at([a], t0);
+        let first = lease.park_at([a], t0).unwrap();
         lease.unpark(&first);
-        let _second = lease.park_at([a], t0 + Duration::from_secs(1));
+        let _second = lease.park_at([a], t0 + Duration::from_secs(1)).unwrap();
         lease.unpark(&first); // stale: the first spend's rejection, arriving late
         assert!(lease.is_pending(&a));
     }
@@ -1041,8 +1158,8 @@ mod tests {
         let faucet_coin = Bytes32::new([9u8; 32]);
         let t0 = Instant::now();
         assert!(!lease.incoming_pending());
-        let claim = lease.park_at([faucet_coin], t0);
-        lease.mark_incoming(faucet_coin);
+        let claim = lease.park_at([faucet_coin], t0).unwrap();
+        lease.mark_incoming(faucet_coin).unwrap();
         // A second TAKE sees it landing, however long the claim waits…
         assert!(lease.incoming_pending());
         // …until the chain or the mempool settles the claim (confirmed: the gift
@@ -1062,13 +1179,13 @@ mod tests {
         // First run: nothing on disk yet; a give and a claim park their coins.
         let first = WalletLease::new();
         first.restore(&path);
-        assert!(!path.exists());
+        assert!(!path.exists() && first.ensure_open().is_ok());
         let on_disk = || std::fs::read_to_string(&path).unwrap();
-        let give = first.park([ours]);
+        let give = first.park([ours]).unwrap();
         assert!(on_disk().contains(&hex::encode(ours)));
         // Every later change replaces the file, not only the first write.
-        first.park([faucet_coin]);
-        first.mark_incoming(faucet_coin);
+        first.park([faucet_coin]).unwrap();
+        first.mark_incoming(faucet_coin).unwrap();
         let disk = on_disk();
         assert!(disk.contains(&hex::encode(faucet_coin)) && disk.contains("\"incoming\""), "{disk}");
         // Second run (a restart): the lease starts empty and takes the parking back…
@@ -1084,7 +1201,7 @@ mod tests {
         let due: Vec<u64> = second.due_at(Instant::now() + RECONCILE_GRACE).iter().map(|d| d.spend).collect();
         assert_eq!(due, vec![give.spend, give.spend + 1]);
         // …and new spends are numbered above them, so no verdict is confused.
-        let later = second.park([Bytes32::new([7u8; 32])]);
+        let later = second.park([Bytes32::new([7u8; 32])]).unwrap();
         assert!(later.spend > give.spend + 1);
         // A verdict releases a restored spend and the file follows: a third run
         // no longer sees it, while the claim still landing is still there.
@@ -1093,11 +1210,54 @@ mod tests {
         let third = WalletLease::new();
         third.restore(&path);
         assert!(!third.is_pending(&ours) && third.is_pending(&faucet_coin) && third.incoming_pending());
-        // A file that cannot be read starts the lease empty, and never panics.
-        std::fs::write(&path, b"not json").unwrap();
-        let fourth = WalletLease::new();
-        fourth.restore(&path);
-        assert!(!fourth.is_pending(&faucet_coin) && !fourth.incoming_pending());
+        // A file that exists but cannot be read SEALS the lease (round 19): the
+        // spends it held may be live, so nothing parks and no spend leaves, and
+        // the file is left as it is for the operator, never written over.
+        let broken: [&[u8]; 2] = [b"not json", br#"{"v":1,"spends":3,"parked":[{"coin":"zz","spend":3}]}"#];
+        for bytes in broken {
+            std::fs::write(&path, bytes).unwrap();
+            let sealed = WalletLease::new();
+            sealed.restore(&path);
+            assert!(matches!(sealed.ensure_open(), Err(LeaseError::Sealed(_))), "{}", String::from_utf8_lossy(bytes));
+            assert!(!sealed.is_pending(&faucet_coin) && !sealed.incoming_pending());
+            assert!(matches!(sealed.park([ours]), Err(LeaseError::Sealed(_))));
+            assert!(matches!(sealed.mark_incoming(faucet_coin), Err(LeaseError::Sealed(_))));
+            assert!(!sealed.is_pending(&ours) && !sealed.incoming_pending());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "the broken file is left for recovery");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_parking_that_cannot_be_saved_is_taken_back_and_its_spend_never_leaves() {
+        // The store sits in a directory that does not exist, so every write fails.
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("wallet_lease.json");
+        let lease = WalletLease::new();
+        lease.restore(&path); // a missing file is a first run: the store is named, nothing is sealed
+        assert!(lease.ensure_open().is_ok());
+        let ours = Bytes32::new([8u8; 32]);
+        let faucet_coin = Bytes32::new([9u8; 32]);
+        assert!(matches!(lease.park([ours]), Err(LeaseError::Unsaved(_))));
+        assert!(!lease.is_pending(&ours), "a parking that was not saved is not kept either");
+        assert!(matches!(lease.mark_incoming(faucet_coin), Err(LeaseError::Unsaved(_))));
+        assert!(!lease.incoming_pending());
+        // Through push_parked the spend is NOT SENT: no gateway is asked (none
+        // listens here; had one been asked, the outcome would read unanswered).
+        let client = CoinsetClient::new("http://127.0.0.1:9".to_string());
+        let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
+        let outcome = push_parked_with(&lease, &client, bundle, [ours]).await;
+        assert!(matches!(outcome, Err(PushError::NotSent(LeaseError::Unsaved(_)))), "{outcome:?}");
+        assert!(!lease.is_pending(&ours));
+        let text = outcome.unwrap_err().to_string();
+        assert!(text.contains("not sent") && text.contains("could not be saved"), "{text}");
+        // Once the directory exists the next parking saves, and goes through.
+        std::fs::create_dir_all(&dir).unwrap();
+        let parking = lease.park([ours]).unwrap();
+        assert!(lease.is_pending(&ours) && std::fs::read_to_string(&path).unwrap().contains(&hex::encode(ours)));
+        lease.unpark(&parking);
+        assert!(!lease.is_pending(&ours));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1109,12 +1269,12 @@ mod tests {
         let t0 = Instant::now();
         assert!(!lease.outgoing_pending());
         // A claim parks the dish's coin, not ours: landing, not spending.
-        let claim = lease.park_at([faucet_coin], t0);
-        lease.mark_incoming(faucet_coin);
+        let claim = lease.park_at([faucet_coin], t0).unwrap();
+        lease.mark_incoming(faucet_coin).unwrap();
         assert!(lease.incoming_pending() && !lease.outgoing_pending());
         // A give parks a coin of ours: spending, whatever a wallet listing shows
         // (one cut short may never reach the parked coin).
-        let give = lease.park_at([ours], t0);
+        let give = lease.park_at([ours], t0).unwrap();
         assert!(lease.outgoing_pending());
         lease.release(&[claim.spend]);
         assert!(lease.outgoing_pending() && !lease.incoming_pending());

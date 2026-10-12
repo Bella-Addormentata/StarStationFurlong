@@ -1219,7 +1219,10 @@ async fn main() -> Result<()> {
                 // round 17): a zero-fee spend can still sit in the mempool after
                 // a restart, and the restored parking keeps its inputs, and a
                 // mojo still landing, from being taken again. Beside the seed,
-                // same CWD-relative convention; before any writer runs.
+                // same CWD-relative convention; before any writer runs. A file
+                // that exists but cannot be read SEALS the lease (round 19):
+                // the node then takes no spend until the operator fixes or
+                // removes it and restarts; the startup log says so.
                 chia_publish::WALLET_LEASE.restore(std::path::Path::new("wallet_lease.json"));
                 chia_heartbeat_sk = Some(chia_sk.clone());
                 // SLICE 4 test hook (SSF_CHIA_PUBLISH_TEST=1): once at startup, spend

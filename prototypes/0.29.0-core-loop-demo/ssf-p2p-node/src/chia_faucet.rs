@@ -626,6 +626,9 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
     // round 3). The lease is held across the gateway reads, as the heartbeat
     // holds it across its own.
     let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
+    // A sealed lease (its file from the last run unreadable) refuses here,
+    // before any gateway read, with the reason (#245 review, round 19).
+    crate::chia_publish::WALLET_LEASE.ensure_open()?;
     crate::chia_publish::WALLET_LEASE.reconcile(client).await;
     if crate::chia_publish::WALLET_LEASE.incoming_pending() {
         return Err(anyhow!(
@@ -677,8 +680,9 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
     // reading empty with no gift landing would let a second TAKE through.
     // push_parked parks the coin first and hands it back only on an outright
     // rejection — then the gift is not landing either (incoming_pending reads
-    // the parking).
-    crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id());
+    // the parking). A mark that cannot be SAVED stops the claim here, before
+    // anything leaves: a restart would otherwise forget it (round 19).
+    crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id())?;
     let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, [target.coin.coin_id()]).await)?;
     match &unanswered {
         None => println!(
@@ -732,6 +736,7 @@ async fn give(
     // Select, build and push under the lease: the heartbeat (or a second GIVE)
     // must not pick the same coins before this spend confirms.
     let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
+    crate::chia_publish::WALLET_LEASE.ensure_open()?;
     crate::chia_publish::WALLET_LEASE.reconcile(client).await;
     let wallet = wallet_view(client, sk).await?;
     if wallet.owned.is_empty() {
@@ -802,7 +807,8 @@ async fn give(
 /// gateway accepted it; `Ok(Some(why))` when it did not ANSWER — the spend may
 /// be live and its inputs stay parked, so the request is answered as SENT with
 /// `unanswered` set, never as a refusal that would let the player spend again
-/// from other coins; `Err` only for a rejection, which proves nothing was spent.
+/// from other coins; `Err` only for a rejection, which proves nothing was spent,
+/// or for a spend the lease would not let leave (round 19), which never did.
 #[cfg(feature = "chia-publish")]
 fn pushed(outcome: Result<(), crate::chia_publish::PushError>) -> Result<Option<String>> {
     use crate::chia_publish::PushError;
@@ -810,6 +816,9 @@ fn pushed(outcome: Result<(), crate::chia_publish::PushError>) -> Result<Option<
         Ok(()) => Ok(None),
         Err(PushError::Unanswered(e)) => Ok(Some(format!("{e:#}"))),
         Err(rejected @ PushError::Rejected(_)) => Err(rejected.into()),
+        // Not sent: the lease would not park (sealed, or its file unwritable),
+        // so nothing left and nothing is parked; refused like a rejection.
+        Err(not_sent @ PushError::NotSent(_)) => Err(not_sent.into()),
     }
 }
 
@@ -1135,6 +1144,11 @@ mod tests {
         // Rejected: nothing was spent; the request is refused with the gateway's reason.
         let refused = pushed(Err(PushError::Rejected("DOUBLE_SPEND".into()))).unwrap_err();
         assert!(refused.to_string().contains("DOUBLE_SPEND"), "{refused}");
+        // Not sent: the lease could not save the parking, so nothing left; the
+        // request is refused with that reason, never answered as sent.
+        let unsaved = crate::chia_publish::LeaseError::Unsaved(std::io::Error::other("disk full"));
+        let refused = pushed(Err(PushError::NotSent(unsaved))).unwrap_err().to_string();
+        assert!(refused.contains("not sent") && refused.contains("disk full"), "{refused}");
     }
 
     #[test]

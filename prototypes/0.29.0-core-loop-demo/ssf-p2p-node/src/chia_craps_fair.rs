@@ -227,6 +227,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
     }))?;
     let coin_a = {
         let _lease = WALLET_LEASE.lock().await;
+        WALLET_LEASE.ensure_open()?;
         WALLET_LEASE.reconcile(&client).await;
         let coin = find_spendable_coin(&client, our_ph)
             .await?
@@ -245,6 +246,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
     }))?;
     let coin_b = {
         let _lease = WALLET_LEASE.lock().await;
+        WALLET_LEASE.ensure_open()?;
         WALLET_LEASE.reconcile(&client).await;
         let coin = find_spendable_coin(&client, our_ph)
             .await?
