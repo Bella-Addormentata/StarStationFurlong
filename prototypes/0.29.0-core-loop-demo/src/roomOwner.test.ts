@@ -197,6 +197,16 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
     expect(main).not.toMatch(/setTvHostPredicate\(\(\) => isLocalPlayerRoomOwner/);
   });
 
+  it('the arcade cabinet ejects P1 on the deed predicate and curates on the edit gate', () => {
+    // EJECT (and sitting down over a held seat) unseats someone; the shelf
+    // does not. Two seams, pinned apart: the eject one must never be the
+    // shareholder-extended gate, which a peer-written venture record passes.
+    expect(main).toContain('setArcadeEjectPredicate(() => currentRoomDeedIsMine())');
+    expect(main).toContain('setArcadeHostPredicate(() => canEditRoom().ok)');
+    expect(main).not.toMatch(/setArcadeEjectPredicate\(\(\) => canEditRoom/);
+    expect(main).not.toMatch(/setArcadeEjectPredicate\(\(\) => isLocalPlayerRoomOwner/);
+  });
+
   it('the documented authority split still covers every shareholder surface', () => {
     // WHY a bare count: main.ts's isLocalPlayerRoomOwner docblock lists the
     // six surfaces shareholders reach, and that list is hand-maintained.

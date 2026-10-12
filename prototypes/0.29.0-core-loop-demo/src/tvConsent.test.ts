@@ -6,8 +6,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   acceptMediaOrigin, allowMount, consentRefusal, forgetMediaConsent, isPrivateHost, mayMountNow, mediaConsent, mediaOrigin,
-  needsRedirectProbe, probeRedirect, redirectVerdict, setNodeMediaOrigin, setOwnMediaOrigins, trustedNodeMediaOrigin,
-  TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS,
+  needsRedirectProbe, ownMediaOrigins, probeRedirect, redirectVerdict, setNodeMediaOrigin, setOwnMediaOrigins,
+  trustedNodeMediaOrigin, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS, urlConsent, urlRefusal,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
@@ -42,6 +42,56 @@ describe('serverless only — the build default (sovereignty.ts)', () => {
     expect(mediaConsent(url('http://192.168.1.20/x'))).toBe('refuse');
     expect(consentRefusal(url('http://192.168.1.20/x'))).toBe('private');
     expect(consentRefusal(url('not a url'))).toBe('bad');
+  });
+
+  it('answers the cabinet the same way: a game on another server is not fetched here', () => {
+    expect(urlConsent('http://localhost:4173/roms/pacman.zip')).toBe('ok');
+    expect(urlConsent('http://127.0.0.1:8080/blob/abc')).toBe('ok');
+    expect(urlConsent('https://archive.org/download/x/y.nes')).toBe('refuse');
+    expect(urlRefusal('https://archive.org/download/x/y.nes')).toBe('server-off');
+    expect(urlConsent('https://roms.example.org/pacman.zip')).toBe('refuse');
+    acceptMediaOrigin('https://roms.example.org');
+    expect(urlConsent('https://roms.example.org/pacman.zip')).toBe('refuse');
+    expect(urlRefusal('https://roms.example.org/pacman.zip')).toBe('server-off');
+    expect(urlRefusal('http://nas/pacman.zip')).toBe('private');
+    expect(urlRefusal('not a url')).toBe('bad');
+  });
+});
+
+describe('urlConsent — the one answer for any URL the room hands this browser (the cabinet asks it too)', () => {
+  it('own origins and the product lanes without asking; a public host asks once; a private host never', () => {
+    expect(urlConsent('http://localhost:4173/roms/pacman.zip')).toBe('ok');
+    expect(urlConsent('http://127.0.0.1:8080/blob/abc')).toBe('ok'); // the identified node
+    expect(urlConsent('http://127.0.0.1:8081/blob/abc')).toBe('refuse'); // a loopback port that is not the node's
+    expect(urlConsent('https://archive.org/download/x/y.nes')).toBe('ok');
+    expect(urlConsent('https://roms.example.org/pacman.zip')).toBe('ask');
+    acceptMediaOrigin('https://roms.example.org');
+    expect(urlConsent('https://roms.example.org/pacman.zip')).toBe('ok');
+    expect(urlConsent('http://192.168.1.20/pacman.zip')).toBe('refuse');
+    expect(urlConsent('http://nas/pacman.zip')).toBe('refuse');
+    expect(urlConsent('not a url')).toBe('refuse');
+    expect(mediaConsent(url('https://roms.example.org/film.mp4'))).toBe(urlConsent('https://roms.example.org/film.mp4'));
+  });
+
+  it('says why a refuse is a refuse, and only for a refuse', () => {
+    expect(urlRefusal('http://192.168.1.20/pacman.zip')).toBe('private');
+    expect(urlRefusal('http://127.0.0.1:8081/blob/abc')).toBe('private');
+    expect(urlRefusal('not a url')).toBe('bad');
+    expect(urlRefusal('https://roms.example.org/pacman.zip')).toBe('bad'); // lanes on: not a refuse at all
+  });
+
+  it('hands back the own origins it was given, normalized', () => {
+    setOwnMediaOrigins(['http://localhost:4173/some/path', 'http://127.0.0.1:8080', 'not an origin']);
+    expect(ownMediaOrigins().sort()).toEqual(['http://127.0.0.1:8080', 'http://localhost:4173']);
+  });
+
+  it('counts the probed node among them while its trust is live, and not after', () => {
+    setOwnMediaOrigins(['http://localhost:4173']);
+    setNodeMediaOrigin('http://127.0.0.1:8081', 1_000, 5_000);
+    expect(ownMediaOrigins(1_000, 5_000).sort()).toEqual(['http://127.0.0.1:8081', 'http://localhost:4173']);
+    expect(ownMediaOrigins(1_000 + TV_NODE_TRUST_MS, 5_000)).toEqual(['http://localhost:4173']);
+    expect(urlRefusal('http://127.0.0.1:8081/rom.zip', 1_000 + TV_NODE_TRUST_MS, 5_000)).toBe('node-stale');
+    setNodeMediaOrigin(null, 1_000);
   });
 });
 

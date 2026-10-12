@@ -28,6 +28,7 @@ function freshSinks(): FurnitureHandleSinks {
     propAnims: new Map(),
     airHockeyVisuals: new Map(),
     tvScreens: new Map(),
+    arcadeScreens: new Map(),
     alligatorsVisuals: new Map(),
     casinoTableVisuals: new Map(),
   };
@@ -149,7 +150,7 @@ describe('registerFurnitureHandles — filing', () => {
       ITEM,
       carrier({
         wallScreen: null, trunkLid: undefined, gameTableTop: false, cloneVat: 0, slotMachineVisual: '',
-        coinPusherVisual: null, airHockey: null, tvScreen: undefined, alligators: null, casinoTable: null,
+        coinPusherVisual: null, airHockey: null, tvScreen: undefined, arcadeScreen: null, alligators: null, casinoTable: null,
       }),
     );
     // A string "speed" is not a spinner tag — same typeof check both paths used.
@@ -197,7 +198,7 @@ describe('registerFurnitureHandles — one list', () => {
    * key without a leading dot, e.g. "tagged userData.holoSpin", doesn't match.)
    */
   const HANDLE_READ =
-    /\.userData\.(wallScreen|holoSpin|trunkLid|gameTableTop|cloneVat|slotMachineVisual|coinPusherVisual|airHockey|tvScreen|alligators|casinoTable)\b/;
+    /\.userData\.(wallScreen|holoSpin|trunkLid|gameTableTop|cloneVat|slotMachineVisual|coinPusherVisual|airHockey|tvScreen|arcadeScreen|alligators|casinoTable)\b/;
 
   it('both registration paths call the helper and keep no private copy of the list (#117)', () => {
     for (const [name, text] of [['world.ts', world], ['devMenu.ts', devMenu]] as const) {

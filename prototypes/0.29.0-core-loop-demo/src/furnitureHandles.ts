@@ -35,6 +35,7 @@ import type {
   PropAnimHandle,
   AirHockeyVisualHandle,
   TvScreenHandle,
+  ArcadeScreenHandle,
   AlligatorsVisualHandle,
 } from './devices';
 import type { CasinoTableVisualHandle } from './casinoTable3d';
@@ -70,6 +71,8 @@ export interface FurnitureHandleSinks {
   airHockeyVisuals: Map<string, AirHockeyVisualHandle>;
   /** 📺 Smart-TV screens, keyed by item id (#186 — redrawn at ~2 Hz from the room record). */
   tvScreens: Map<string, TvScreenHandle>;
+  /** 🕹 Arcade cabinet screens, keyed by item id (#193 — the attract card, "P1 · name"). */
+  arcadeScreens: Map<string, ArcadeScreenHandle>;
   /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — handed
    *  on with the item's pose to alligatorsSession.ts, as air hockey's are. */
   alligatorsVisuals: Map<string, AlligatorsVisualHandle>;
@@ -109,6 +112,7 @@ export function registerFurnitureHandles(
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
   if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);
   if (d.tvScreen) sinks.tvScreens.set(itemId, d.tvScreen as TvScreenHandle);
+  if (d.arcadeScreen) sinks.arcadeScreens.set(itemId, d.arcadeScreen as ArcadeScreenHandle);
   if (d.alligators) sinks.alligatorsVisuals.set(itemId, d.alligators as AlligatorsVisualHandle);
   if (d.casinoTable) sinks.casinoTableVisuals.set(itemId, d.casinoTable as CasinoTableVisualHandle);
 }

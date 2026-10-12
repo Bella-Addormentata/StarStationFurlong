@@ -185,6 +185,7 @@ import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
   TvScreenHandle,
+  ArcadeScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
@@ -239,6 +240,12 @@ import { createSmartTvUI } from "./tvUI";
 import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
 import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
+// 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
+// attract card the prop draws.
+import { createArcadeCabinetUI } from "./arcadeUI";
+import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
+import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
+import { arcadeScreenView } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -496,6 +503,9 @@ export class World {
   private tvScreens: Map<string, TvScreenHandle> = new Map();
   /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the chip). */
   private tvTimer = 0;
+  /** 🕹 Arcade cabinet screens (#193), keyed by item id — redrawn at ~2 Hz
+   *  from the room record (arcadeDoc.arcadeScreenView), on the TV's timer. */
+  private arcadeScreens: Map<string, ArcadeScreenHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -1799,6 +1809,7 @@ export class World {
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
       tvScreens: this.tvScreens,
+      arcadeScreens: this.arcadeScreens,
       alligatorsVisuals: this.alligatorsVisuals,
       casinoTableVisuals: this.casinoTableVisuals,
     };
@@ -3229,6 +3240,7 @@ export class World {
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.tvScreens.delete(itemId);
+    this.arcadeScreens.delete(itemId);
     // 📺 #186: a removed set takes its theatre and this client's hold on its
     // remote with it — nothing keeps playing, or heartbeating, to a record
     // whose set is gone (no-ops for every other kind).
@@ -3242,6 +3254,10 @@ export class World {
     if (tvDriveArmed()) {
       updateTvChip(FURNITURE.filter((i) => isTvKind(i.kind) && i.id !== itemId).map((i) => i.id));
     }
+    // 🕹 #193: likewise a removed cabinet takes its stage (which swallows
+    // the world's keys while it is up) and this page's seat with it.
+    if (isArcadeStageOpen(itemId)) closeArcadeStage();
+    forgetCabinet(itemId);
     this.alligatorsVisuals.delete(itemId);
     this.casinoTableVisuals.delete(itemId);
     forgetCasinoTable(itemId);
@@ -4104,6 +4120,12 @@ export class World {
         for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
         tickTvRoom(tvIds);
         updateTvChip(tvIds);
+        // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
+        // P1 page renews its seat — with an empty list too, and under the
+        // same flag: a seat is not renewed into a room being left either.
+        const arcadeIds = FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+        for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
+        tickArcadeRoom(arcadeIds);
       }
     }
 
@@ -6477,6 +6499,21 @@ export class World {
               (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
             }
           }),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // 🕹 #193: the cabinet's panel — the owner's shelf and game, INSERT COIN
+    // for P1 — and the stage the coin opens (the emulator in a frame of our
+    // own), after the focus is released, as the TV hands off to its theatre.
+    if (device.kind === "arcade") {
+      const ui = createArcadeCabinetUI({
+        itemId: deviceId,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        canEdit: () => canEditRoom().ok,
+        openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId)),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
