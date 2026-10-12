@@ -43,13 +43,21 @@ pub const PEERS_FILE: &str = "peers.json";
 pub const PRUNE_FAILED_WINDOWS: u32 = 3;
 pub const PRUNE_AFTER_SECS: u64 = 7 * 24 * 3600;
 
+/// A card dated further ahead than this is refused: `issued_at` is chosen by
+/// the remote signer and decides newest-wins ordering and retention, so an
+/// absurd future date would outrank every later rotation and never age out.
+pub const MAX_CARD_FUTURE_SKEW_SECS: u64 = 2 * 3600;
+
 const CTX_KX_CARD: &str = "ssf-chia-kx-card-v1";
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // only the publisher derives era keys
 const CTX_KX_ERA: &str = "ssf-chia-kx-era-v1";
 const CARD_SIGN_PREFIX: &str = "ssf-contact-card:v1\n";
 
 /// Write a secret file readable by its owner only (0600 on Unix; elsewhere the
-/// platform's default, as `iroh_node_id.key` already does).
+/// platform's default, as `iroh_node_id.key` already does). The mode is set
+/// on creation AND reset on an existing file: `OpenOptions::mode` applies only
+/// to files it creates, and a file left broader by an earlier tool or run
+/// must not keep its old permissions once it holds a key.
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -60,6 +68,11 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     f.write_all(bytes)?;
     f.flush()
 }
@@ -146,8 +159,13 @@ pub fn make_card(iroh_sk: &iroh::SecretKey, ck: &[u8; 32], issued_at: u64) -> Co
     ContactCard { node_id, ck: ck_s, kx_pk: kx_s, issued_at, sig: hex::encode(sig.to_bytes()) }
 }
 
-/// Verify a card: well-formed fields and a valid signature by its own node id.
-pub fn verify_card(card: &ContactCard) -> Result<VerifiedCard> {
+/// Verify a card: well-formed fields, a valid signature by its own node id,
+/// and an `issued_at` no further than [`MAX_CARD_FUTURE_SKEW_SECS`] ahead of
+/// `now` (the receiver's clock).
+pub fn verify_card(card: &ContactCard, now: u64) -> Result<VerifiedCard> {
+    if card.issued_at > now.saturating_add(MAX_CARD_FUTURE_SKEW_SECS) {
+        return Err(anyhow!("card issued_at is more than {MAX_CARD_FUTURE_SKEW_SECS}s in the future"));
+    }
     let node_id: iroh::PublicKey =
         card.node_id.parse().map_err(|e| anyhow!("card node_id is not an iroh key: {e:?}"))?;
     let ck: [u8; 32] = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &card.ck)?
@@ -351,8 +369,22 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         std::fs::write(&path, b"short").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let c = load_or_create_contact_key(&path).unwrap();
         assert_ne!(c, a, "a damaged file is replaced by a fresh key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "rewriting an existing, broader file tightens it to 0600"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -377,21 +409,28 @@ mod tests {
     fn contact_card_signs_and_verifies_and_rejects_tampering() {
         let sk = iroh::SecretKey::generate();
         let ck = [3u8; 32];
-        let card = make_card(&sk, &ck, 1_791_700_000);
-        let v = verify_card(&card).unwrap();
+        let now = 1_791_700_000u64;
+        let card = make_card(&sk, &ck, now);
+        let v = verify_card(&card, now).unwrap();
         assert_eq!(v.node_id, sk.public());
         assert_eq!(v.ck, ck);
         assert_eq!(v.kx_pk, kx_public(&kx_card_secret(&sk)));
         assert_eq!(v.issued_at, 1_791_700_000);
         let mut other_ck = card.clone();
         other_ck.ck = ck_b64(&[4u8; 32]);
-        assert!(verify_card(&other_ck).is_err(), "a swapped contact key fails the signature");
+        assert!(verify_card(&other_ck, now).is_err(), "a swapped contact key fails the signature");
         let mut other_node = card.clone();
         other_node.node_id = iroh::SecretKey::generate().public().to_string();
-        assert!(verify_card(&other_node).is_err(), "a card re-attributed to another node fails");
+        assert!(verify_card(&other_node, now).is_err(), "a card re-attributed to another node fails");
         let mut later = card.clone();
         later.issued_at += 1;
-        assert!(verify_card(&later).is_err());
+        assert!(verify_card(&later, now).is_err());
+        // A validly signed card from the far future is refused: its date would
+        // outrank every later rotation and never age out of the book.
+        let far = make_card(&sk, &ck, now + MAX_CARD_FUTURE_SKEW_SECS + 1);
+        assert!(verify_card(&far, now).is_err(), "two hours ahead is too far");
+        assert!(verify_card(&make_card(&sk, &ck, now + MAX_CARD_FUTURE_SKEW_SECS), now).is_ok(), "the bound itself passes");
+        assert!(verify_card(&make_card(&sk, &ck, u64::MAX), now).is_err(), "u64::MAX never gets in");
         let json = serde_json::to_vec(&card).unwrap();
         assert!(String::from_utf8_lossy(&json).contains("\"nodeId\""), "camelCase on the wire");
         let back: ContactCard = serde_json::from_slice(&json).unwrap();
@@ -404,15 +443,15 @@ mod tests {
         let node = sk.public().to_string();
         let now = 1_791_700_000u64;
         let mut book = PeerBook::default();
-        let v1 = verify_card(&make_card(&sk, &[1u8; 32], now - 100)).unwrap();
+        let v1 = verify_card(&make_card(&sk, &[1u8; 32], now - 100), now).unwrap();
         assert!(book.record_card(&v1, "room-a"));
         assert!(!book.record_card(&v1, "room-a"), "the same card again changes nothing");
         assert!(book.record_card(&v1, "room-b"), "a new room is a change");
         assert_eq!(book.ck_of(&node), Some([1u8; 32]));
-        let older = verify_card(&make_card(&sk, &[2u8; 32], now - 150)).unwrap();
+        let older = verify_card(&make_card(&sk, &[2u8; 32], now - 150), now).unwrap();
         assert!(!book.record_card(&older, "room-a"), "an older card never replaces the held one");
         assert_eq!(book.ck_of(&node), Some([1u8; 32]));
-        let newer = verify_card(&make_card(&sk, &[2u8; 32], now)).unwrap();
+        let newer = verify_card(&make_card(&sk, &[2u8; 32], now), now).unwrap();
         assert!(book.record_card(&newer, "room-a"));
         assert_eq!(book.ck_of(&node), Some([2u8; 32]));
         assert_eq!(book.with_ck().len(), 1);
@@ -445,7 +484,7 @@ mod tests {
         assert_eq!(PeerBook::load(&path), PeerBook::default(), "no file: empty book");
         let sk = iroh::SecretKey::generate();
         let mut book = PeerBook::default();
-        book.record_card(&verify_card(&make_card(&sk, &[7u8; 32], 5)).unwrap(), "r");
+        book.record_card(&verify_card(&make_card(&sk, &[7u8; 32], 5), 5).unwrap(), "r");
         book.save(&path).unwrap();
         assert_eq!(PeerBook::load(&path), book);
         std::fs::write(&path, b"{not json").unwrap();

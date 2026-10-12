@@ -404,6 +404,12 @@ pub struct HubState {
     /// era clock for the inbound marks and the presence publisher.
     #[cfg(feature = "chia-read")]
     pub chia_peak: std::sync::atomic::AtomicU32,
+    /// #231 P6a: `era + 1` of the newest presence record of OUR OWN the
+    /// watcher read back from the chain (0 = none yet). The publisher marks
+    /// its write confirmed when this names the write's era; until then the
+    /// write is pending and retried after a timeout.
+    #[cfg(feature = "chia-read")]
+    pub presence_confirmed_era: std::sync::atomic::AtomicU64,
     /// ⛓️🥣 The wallet key `SSF_CHIA_LANE=1` loaded at startup (publish build),
     /// so the faucet dish can TAKE (claim to our address) and GIVE (pay from our
     /// coin) on the local browser's request. `None` while publishing is off.
@@ -1401,6 +1407,8 @@ async fn main() -> Result<()> {
         inbound_verified: Mutex::new(chia_contact::InboundVerified::default()),
         #[cfg(feature = "chia-read")]
         chia_peak: std::sync::atomic::AtomicU32::new(0),
+        #[cfg(feature = "chia-read")]
+        presence_confirmed_era: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
     });
@@ -1436,6 +1444,21 @@ async fn main() -> Result<()> {
             if ok > 0 {
                 println!("💾 Restored {ok} persisted room doc(s) — serving from boot (rooms survive node restarts)");
             }
+        }
+    }
+
+    // #231 P6a: a restored cap is kept only for a room whose doc restored too.
+    // A cap written before the room's first 15 s snapshot, or left behind by a
+    // corrupt or deleted doc, would otherwise have the watcher polling and the
+    // publisher spending for a room this node does not serve.
+    #[cfg(feature = "chia-read")]
+    {
+        let rooms = hub.rooms.lock().unwrap();
+        let mut caps = hub.chia_rooms.lock().unwrap();
+        let orphans: Vec<String> = caps.keys().filter(|room| !rooms.contains_key(*room)).cloned().collect();
+        for room in &orphans {
+            caps.remove(room);
+            eprintln!("💾 cap persist: room {room} has a cap but no restored doc — cap not restored (the browser re-sends it)");
         }
     }
 
@@ -2263,11 +2286,14 @@ async fn dial_peer_inner(
         // #231 P6a, FIRST: the target's PER-NODE presence, when its contact card
         // is in the address book (we met it in a private room before). Found by
         // the node's own key and the chain's era, whatever room this dial is
-        // for. A hold started here settles the dial either way: the room-keyed
-        // v1 record below would only repeat the same addresses.
+        // for. A hold that lands settles the dial; one that fails falls through
+        // to the room-keyed v1 record below, which is tried only when it names
+        // addresses the contact-key hold did not (v1 republishes on every
+        // address change at once, the v2 record is debounced and capped).
+        let mut held_by_ck: Option<Vec<SocketAddr>> = None;
         let target_ck = hub.peers.lock().unwrap().ck_of(&target_str);
         if let Some(ck) = target_ck {
-            match chia_resolve::resolve_presence_by_ck(&ck).await {
+            match chia_resolve::resolve_presence_by_ck(&ck, &target_str).await {
                 Ok(Some(rec)) => {
                     let addrs = chia_public_dial_addrs(&rec.addrs);
                     if addrs.is_empty() {
@@ -2284,20 +2310,27 @@ async fn dial_peer_inner(
                             room_id.clone(),
                             target_pub_key,
                             target_str.clone(),
-                            addrs,
+                            addrs.clone(),
                             dial_tier,
                             send.clone(),
                         )
                         .await;
-                        let now = chia_resolve::unix_now();
-                        let mut book = hub.peers.lock().unwrap();
-                        if ok {
-                            book.note_ok(&target_str, now);
-                        } else {
-                            book.note_fail(&target_str, now);
+                        {
+                            let now = chia_resolve::unix_now();
+                            let mut book = hub.peers.lock().unwrap();
+                            if ok {
+                                book.note_ok(&target_str, now);
+                            } else {
+                                book.note_fail(&target_str, now);
+                            }
+                            let _ = book.save(std::path::Path::new(chia_contact::PEERS_FILE));
                         }
-                        let _ = book.save(std::path::Path::new(chia_contact::PEERS_FILE));
-                        return;
+                        if ok {
+                            return;
+                        }
+                        let mut sorted = addrs;
+                        sorted.sort();
+                        held_by_ck = Some(sorted);
                     }
                 }
                 Ok(None) => println!("⛓️ ChiaHub rung-6: no presence record under {target_str}'s contact key this era or last"),
@@ -2310,8 +2343,15 @@ async fn dial_peer_inner(
                 match chia_resolve::resolve_target(&cap.room_key, &target_str).await {
                     Ok(Some(rec)) => {
                         let addrs = chia_public_dial_addrs(&rec.addrs);
+                        let same_as_held = held_by_ck.as_ref().is_some_and(|held| {
+                            let mut sorted = addrs.clone();
+                            sorted.sort();
+                            &sorted == held
+                        });
                         if addrs.is_empty() {
                             println!("⛓️ ChiaHub rung-6: resolved {target_str} but no public addr survived the trust filter");
+                        } else if same_as_held {
+                            println!("⛓️ ChiaHub rung-6: the room record names the same addresses the contact-key hold just tried — not holding again");
                         } else {
                             println!(
                                 "⛓️ ChiaHub rung-6: resolved {target_str} on-chain — {} public addr(s), holding the dial for {}s",
@@ -3227,17 +3267,20 @@ fn node_signed_control(hub: &SharedHub, room: &str, kind: &str, seq: u32, payloa
 
 /// Send raw framed bytes ([len:u32 LE][bytes]) on a fresh bi-stream, with the
 /// finish() the host→joiner fix requires (a dropped stream RESETs and the frame
-/// is silently lost).
-async fn send_framed(conn: &iroh::endpoint::Connection, bytes: &[u8]) {
-    if let Ok((mut send_stream, _recv)) = conn.open_bi().await {
-        let l = (bytes.len() as u32).to_le_bytes();
-        let _ = send_stream.write_all(&l).await;
-        let _ = send_stream.write_all(bytes).await;
-        let _ = send_stream.finish();
+/// is silently lost). Returns whether the whole frame was written and finished;
+/// callers that must retry a lost frame (#231 P6a's contact card) look at it,
+/// the fire-and-forget senders ignore it as before.
+async fn send_framed(conn: &iroh::endpoint::Connection, bytes: &[u8]) -> bool {
+    let Ok((mut send_stream, _recv)) = conn.open_bi().await else { return false };
+    let l = (bytes.len() as u32).to_le_bytes();
+    if send_stream.write_all(&l).await.is_err() || send_stream.write_all(bytes).await.is_err() {
+        return false;
     }
+    send_stream.finish().is_ok()
 }
 
-/// Build + node-sign a control envelope and send it on `conn`.
+/// Build + node-sign a control envelope and send it on `conn`. True when the
+/// frame went out whole.
 async fn send_control(
     hub: &SharedHub,
     conn: &iroh::endpoint::Connection,
@@ -3245,10 +3288,11 @@ async fn send_control(
     kind: &str,
     seq: u32,
     payload: Vec<u8>,
-) {
+) -> bool {
     let env = node_signed_control(hub, room, kind, seq, payload);
-    if let Ok(bytes) = serde_json::to_vec(&env) {
-        send_framed(conn, &bytes).await;
+    match serde_json::to_vec(&env) {
+        Ok(bytes) => send_framed(conn, &bytes).await,
+        Err(_) => false,
     }
 }
 
@@ -3301,7 +3345,7 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
             if env.author.as_slice() != remote_id.as_bytes() {
                 eprintln!("🔒 CONTACT-DROP: card envelope not authored by the connection peer {remote_id}");
             } else if let Ok(card) = serde_json::from_slice::<chia_contact::ContactCard>(&env.payload) {
-                match chia_contact::verify_card(&card) {
+                match chia_contact::verify_card(&card, chia_resolve::unix_now()) {
                     Ok(verified) if verified.node_id == remote_id => {
                         let changed = {
                             let mut book = hub.peers.lock().unwrap();
@@ -3428,7 +3472,7 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
         graft: Vec<(PublicKey, PeerHints, u8)>,
         /// #231 P6a: connected peers that have not had our contact card yet.
         #[cfg(feature = "chia-read")]
-        cards: Vec<iroh::endpoint::Connection>,
+        cards: Vec<(PublicKey, iroh::endpoint::Connection)>,
     }
 
     loop {
@@ -3519,17 +3563,15 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                 }
 
                 // #231 P6a: our card goes to every connected peer of a private room
-                // once per connection; marked sent here, under the lock, so a slow
-                // tick never sends it twice.
+                // that has not had it yet; the entry is marked only once the send
+                // succeeded (below), so a frame lost to a stream error is retried
+                // next tick. This loop is the only sender, one tick at a time.
                 #[cfg(feature = "chia-read")]
-                let cards: Vec<iroh::endpoint::Connection> = if sharing.contains(room_id) {
+                let cards: Vec<(PublicKey, iroh::endpoint::Connection)> = if sharing.contains(room_id) {
                     room.remote_peers
-                        .values_mut()
-                        .filter(|m| !m.card_sent)
-                        .map(|m| {
-                            m.card_sent = true;
-                            m.conn.clone()
-                        })
+                        .iter()
+                        .filter(|(_, m)| !m.card_sent)
+                        .map(|(k, m)| (*k, m.conn.clone()))
                         .collect()
                 } else {
                     Vec::new()
@@ -3572,14 +3614,30 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                 let _ = conn.send_datagram(HEARTBEAT_MAGIC.to_vec().into());
             }
             // #231 P6a: the contact card, node-signed like every control frame.
+            // Only a peer whose frame went out whole is marked as having it.
             #[cfg(feature = "chia-read")]
             if !w.cards.is_empty() {
                 let card = chia_contact::make_card(&hub.secret_key, &hub.contact_key, chia_resolve::unix_now());
                 if let Ok(payload) = serde_json::to_vec(&card) {
-                    for conn in &w.cards {
-                        send_control(&hub, conn, &w.room, "contact", 0, payload.clone()).await;
+                    let mut delivered: Vec<PublicKey> = Vec::new();
+                    for (peer, conn) in &w.cards {
+                        if send_control(&hub, conn, &w.room, "contact", 0, payload.clone()).await {
+                            delivered.push(*peer);
+                        } else {
+                            eprintln!("📇 contact card to {peer} in room {} did not go out — retrying next tick", w.room);
+                        }
                     }
-                    println!("📇 contact card sent to {} peer(s) in room {}", w.cards.len(), w.room);
+                    if !delivered.is_empty() {
+                        let mut rooms = hub.rooms.lock().unwrap();
+                        if let Some(room) = rooms.get_mut(&w.room) {
+                            for peer in &delivered {
+                                if let Some(m) = room.remote_peers.get_mut(peer) {
+                                    m.card_sent = true;
+                                }
+                            }
+                        }
+                        println!("📇 contact card sent to {} peer(s) in room {}", delivered.len(), w.room);
+                    }
                 }
             }
             // M5.4 lazy-pull adverts are OPT-IN (SSF_MESH_LAZYPULL=1). The deduped

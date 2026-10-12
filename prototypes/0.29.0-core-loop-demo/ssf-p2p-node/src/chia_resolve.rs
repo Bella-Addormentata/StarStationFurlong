@@ -363,7 +363,10 @@ pub fn scan_eras(peak: u32) -> Vec<u64> {
 
 /// One incremental read of a contact key's presence: both scan eras' hints,
 /// cursors kept by the caller per hint (so the watcher pays only for new coins
-/// beat after beat).
+/// beat after beat). A hint whose read fails has its cursor put back exactly
+/// as it was, so nothing it examined counts as seen and the next beat re-reads
+/// it; what the other hint found is returned all the same. Only when every
+/// hint failed is the error returned.
 pub async fn read_ck(
     client: &CoinsetClient,
     ck: &[u8; 32],
@@ -372,13 +375,34 @@ pub async fn read_ck(
     cursors: &mut std::collections::HashMap<[u8; 32], HintCursor>,
 ) -> Result<Vec<FoundRecord>> {
     let mut found = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut any_ok = false;
     for era in scan_eras(peak) {
         let hint = chia_lane::derive_ck_hint(ck, era);
         let cursor = cursors.entry(hint).or_default();
+        let before = cursor.clone();
         let opener = |ct: &[u8], height: u32| decode_v2_presence(ck, ct, era, height, now);
-        found.extend(read_hint_with(client, Bytes32::new(hint), cursor, &opener).await?);
+        match read_hint_with(client, Bytes32::new(hint), cursor, &opener).await {
+            Ok(records) => {
+                any_ok = true;
+                found.extend(records);
+            }
+            Err(e) => {
+                *cursor = before; // transactional: a failed read examined nothing
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
     }
-    Ok(found)
+    match first_error {
+        Some(e) if !any_ok => Err(e),
+        Some(e) => {
+            eprintln!("⛓️ ChiaHub resolve: one of a contact key's era hints failed and will be re-read next beat: {e:#}");
+            Ok(found)
+        }
+        None => Ok(found),
+    }
 }
 
 /// The hints a v2 reader of `ck` has in play at `peak` (for cursor pruning).
@@ -386,11 +410,15 @@ pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
     scan_eras(peak).into_iter().map(|era| chia_lane::derive_ck_hint(ck, era)).collect()
 }
 
-/// ONE-SHOT: the freshest presence record a node published under its contact
-/// key `ck` — the introduction lookup at dial exhaustion (rung 6) once the
-/// target's card is known. Reads the chain peak first (the era is the chain's
-/// clock), then both scan eras, round after round within the one-shot budget.
-pub async fn resolve_presence_by_ck(ck: &[u8; 32]) -> Result<Option<ChiaPresenceRecord>> {
+/// ONE-SHOT: the freshest presence record `node_id` published under its
+/// contact key `ck` — the introduction lookup at dial exhaustion (rung 6) once
+/// the target's card is known. Reads the chain peak first (the era is the
+/// chain's clock), then both scan eras, round after round within the one-shot
+/// budget. Records under the hint signed by any OTHER node are discarded
+/// before ranking: a contact key is shared with every member of the rooms
+/// that received the card, so it locates the hint but never vouches for the
+/// signer; only the node's own signature does.
+pub async fn resolve_presence_by_ck(ck: &[u8; 32], node_id: &str) -> Result<Option<ChiaPresenceRecord>> {
     let now = unix_now();
     let client = CoinsetClient::testnet11();
     let peak = peak_height(&client).await.ok_or_else(|| anyhow!("chain peak unavailable"))?;
@@ -405,6 +433,7 @@ pub async fn resolve_presence_by_ck(ck: &[u8; 32]) -> Result<Option<ChiaPresence
             eprintln!("⛓️ ChiaHub resolve: a contact key's hints still had more after {round} rounds — budget spent, result may be partial");
         }
     }
+    all.retain(|f| f.record.node_id == node_id);
     Ok(rank_and_dedupe(all).into_iter().next().map(|f| f.record))
 }
 

@@ -291,8 +291,13 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         // #231 P6a: the peers whose contact cards we hold (node id, ck, rooms met in).
         let peers = hub.peers.lock().unwrap().with_ck();
         node_cache.retain(|node, _| peers.iter().any(|(n, _, _)| n == node));
+        // Distinct contact keys and the node ids that claim each (see below).
+        let mut by_ck: HashMap<[u8; 32], Vec<String>> = HashMap::new();
+        for (node_id, ck, _) in &peers {
+            by_ck.entry(*ck).or_default().push(node_id.clone());
+        }
         sched.forget_where(|key| {
-            key.strip_prefix("ck:").is_some_and(|node| node != "self" && !peers.iter().any(|(n, _, _)| n == node))
+            key.strip_prefix("ck:").is_some_and(|k| k != "self" && !by_ck.keys().any(|ck| ck_sched_key(ck) == key))
         });
         if readable.is_empty() && peers.is_empty() {
             continue;
@@ -369,69 +374,83 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         }
 
         // ── #231 P6a: per-node presence — the peers whose contact cards we hold ──
-        // Each peer's hints are read on the same beat as a room's (four times
-        // less often while the peer is connected anywhere), the freshest record
-        // cached, and holds planned into the readable rooms it was met in and is
-        // not connected to. Our own record goes first: seeing it confirm clears
-        // every cooldown, since the peers see us at their next beat.
+        // One read per DISTINCT contact key per beat (four times less often while
+        // any node claiming it is connected somewhere), records routed to the
+        // peer whose node id SIGNED them: a card never proves a key belongs to
+        // one node alone (a member who learned another member's key can claim
+        // it in its own card), so the key only locates the hint and the
+        // signature decides whose record it is; two claimants of one key both
+        // get their own records, neither can shadow the other. Our own record
+        // goes first: seeing it confirm tells the publisher the write landed
+        // and clears every cooldown, since the peers see us at their next beat.
         if peak > 0 {
             let own_ck = hub.contact_key;
             if sched.due("ck:self", peak, false) {
                 match chia_resolve::read_ck(&client, &own_ck, peak, now_unix, &mut ck_cursors).await {
                     Ok(found) => {
-                        let newest = found
-                            .iter()
-                            .filter(|f| f.record.node_id == self_id)
-                            .map(|f| f.confirmed_height)
-                            .max()
-                            .unwrap_or(0);
-                        if newest > own_ck_height {
-                            own_ck_height = newest;
-                            shared.cooldowns.lock().unwrap().clear();
-                            println!("⛓️ ChiaHub watcher: own presence confirmed at height {newest} — cooldowns cleared");
+                        if let Some(newest) =
+                            found.iter().filter(|f| f.record.node_id == self_id).max_by_key(|f| f.confirmed_height)
+                        {
+                            hub.presence_confirmed_era.store(
+                                chia_lane::era_of(newest.confirmed_height) + 1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            if newest.confirmed_height > own_ck_height {
+                                own_ck_height = newest.confirmed_height;
+                                shared.cooldowns.lock().unwrap().clear();
+                                println!(
+                                    "⛓️ ChiaHub watcher: own presence confirmed at height {} (era {}) — cooldowns cleared",
+                                    newest.confirmed_height,
+                                    chia_lane::era_of(newest.confirmed_height)
+                                );
+                            }
                         }
                     }
                     Err(err) => eprintln!("⛓️ ChiaHub watcher: read of our own presence failed: {err:#}"),
                 }
             }
             let mut live_ck_hints: HashSet<[u8; 32]> = chia_resolve::live_ck_hints(&own_ck, peak).into_iter().collect();
-            for (node_id, ck, met_in) in &peers {
+            for (ck, nodes) in &by_ck {
                 live_ck_hints.extend(chia_resolve::live_ck_hints(ck, peak));
-                let connected_in = rooms_connected_to(&hub, node_id);
-                if sched.due(&format!("ck:{node_id}"), peak, !connected_in.is_empty()) {
-                    match chia_resolve::read_ck(&client, ck, peak, now_unix, &mut ck_cursors).await {
-                        Ok(found) => {
-                            for f in chia_resolve::rank_and_dedupe(found) {
-                                // A card's ck names its node; a record under that
-                                // hint signed by anyone else is noise.
-                                if &f.record.node_id != node_id {
-                                    continue;
-                                }
-                                let newer = node_cache
-                                    .get(node_id)
-                                    .map(|p| (f.record.issued_at, f.confirmed_height) > (p.record.issued_at, p.confirmed_height))
-                                    .unwrap_or(true);
-                                if newer {
-                                    println!(
-                                        "⛓️ ChiaHub watcher: presence of {} read — era record at height {}, {} public addr(s)",
-                                        &node_id[..node_id.len().min(16)],
-                                        f.confirmed_height,
-                                        crate::chia_public_dial_addrs(&f.record.addrs).len()
-                                    );
-                                    node_cache.insert(node_id.clone(), f);
-                                }
+                let connected_any = nodes.iter().any(|n| !rooms_connected_to(&hub, n).is_empty());
+                if !sched.due(&ck_sched_key(ck), peak, connected_any) {
+                    continue;
+                }
+                match chia_resolve::read_ck(&client, ck, peak, now_unix, &mut ck_cursors).await {
+                    Ok(found) => {
+                        for f in chia_resolve::rank_and_dedupe(found) {
+                            // Routed by signer; a record signed by nobody who
+                            // claims this key is noise under the hint.
+                            let Some(node_id) = nodes.iter().find(|n| **n == f.record.node_id) else { continue };
+                            let newer = node_cache
+                                .get(node_id)
+                                .map(|p| (f.record.issued_at, f.confirmed_height) > (p.record.issued_at, p.confirmed_height))
+                                .unwrap_or(true);
+                            if newer {
+                                println!(
+                                    "⛓️ ChiaHub watcher: presence of {} read — era record at height {}, {} public addr(s)",
+                                    &node_id[..node_id.len().min(16)],
+                                    f.confirmed_height,
+                                    crate::chia_public_dial_addrs(&f.record.addrs).len()
+                                );
+                                node_cache.insert(node_id.clone(), f);
                             }
                         }
-                        Err(err) => eprintln!(
-                            "⛓️ ChiaHub watcher: read of {}'s presence failed: {err:#}",
-                            &node_id[..node_id.len().min(16)]
-                        ),
                     }
+                    Err(err) => eprintln!(
+                        "⛓️ ChiaHub watcher: read of a contact key's presence failed ({} claimant(s)): {err:#}",
+                        nodes.len()
+                    ),
                 }
+            }
+            // Holds: each peer's freshest record, in the readable rooms it was
+            // met in and is not connected to.
+            for (node_id, _ck, met_in) in &peers {
                 let Some(found) = node_cache.get(node_id) else { continue };
                 if found.record.expires_at != 0 && found.record.expires_at < now_unix {
                     continue;
                 }
+                let connected_in = rooms_connected_to(&hub, node_id);
                 let record = vec![found.record.clone()];
                 for room in met_in {
                     // Only a room this node still holds (served or relayed) and
@@ -546,6 +565,12 @@ fn spawn_hold(
                 .insert((room_h, cand.node_id), Instant::now() + TARGET_COOLDOWN);
         }
     });
+}
+
+/// The beat-schedule key of a contact key (a hint prefix: the key itself never
+/// appears in a log line).
+fn ck_sched_key(ck: &[u8; 32]) -> String {
+    format!("ck:{}", hex::encode(&ck[..8]))
 }
 
 /// The rooms `node_id` is connected in right now.
