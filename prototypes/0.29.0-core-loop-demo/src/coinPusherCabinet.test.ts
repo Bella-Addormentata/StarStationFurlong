@@ -63,6 +63,7 @@ function buildCabinet(): { group: THREE.Group; handle: CoinPusherVisualHandle } 
     coinPusherVisuals: new Map(),
     propAnims: new Map(),
     airHockeyVisuals: new Map(),
+    tvScreens: new Map(),
     alligatorsVisuals: new Map(),
     casinoTableVisuals: new Map(),
   };

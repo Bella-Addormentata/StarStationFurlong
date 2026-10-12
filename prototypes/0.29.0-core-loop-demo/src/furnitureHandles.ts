@@ -34,6 +34,7 @@ import type {
   CoinPusherVisualHandle,
   PropAnimHandle,
   AirHockeyVisualHandle,
+  TvScreenHandle,
   AlligatorsVisualHandle,
 } from './devices';
 import type { CasinoTableVisualHandle } from './casinoTable3d';
@@ -67,6 +68,8 @@ export interface FurnitureHandleSinks {
    *  Both registration paths read the filed handle back and hand it, with the
    *  item's pose, to the session layer (airHockeySession.ts), which drives it. */
   airHockeyVisuals: Map<string, AirHockeyVisualHandle>;
+  /** 📺 Smart-TV screens, keyed by item id (#186 — redrawn at ~2 Hz from the room record). */
+  tvScreens: Map<string, TvScreenHandle>;
   /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — handed
    *  on with the item's pose to alligatorsSession.ts, as air hockey's are. */
   alligatorsVisuals: Map<string, AlligatorsVisualHandle>;
@@ -105,6 +108,7 @@ export function registerFurnitureHandles(
   }
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
   if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);
+  if (d.tvScreen) sinks.tvScreens.set(itemId, d.tvScreen as TvScreenHandle);
   if (d.alligators) sinks.alligatorsVisuals.set(itemId, d.alligators as AlligatorsVisualHandle);
   if (d.casinoTable) sinks.casinoTableVisuals.set(itemId, d.casinoTable as CasinoTableVisualHandle);
 }

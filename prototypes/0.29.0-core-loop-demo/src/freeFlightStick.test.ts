@@ -2,7 +2,7 @@
  * 🕹️ freeFlightStick — the flight keys and a gamepad or joystick (issue 203).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, takeStickKeys } from './freeFlightStick';
+import { isFlightKey, readStick, releaseStickKeys, stickKeysTaken, stickPadName, suspendStickKeys, takeStickKeys } from './freeFlightStick';
 
 type Listener = (e: unknown) => void;
 const listeners = new Map<string, Set<Listener>>();
@@ -69,6 +69,47 @@ describe('the flight keys', () => {
     expect(readStick()).toMatchObject({ thrust: 1, yaw: 1 });
     for (const fn of listeners.get('blur') ?? []) fn({});
     expect(readStick()).toMatchObject({ thrust: 0, yaw: 0 });
+  });
+
+  it('stand aside while an overlay that takes the keyboard is up — keys held then let go — and are the stick\'s again once every overlay has released', () => {
+    takeStickKeys();
+    key('keydown', 'KeyW');
+    expect(readStick().thrust).toBe(1);
+    const theatre = suspendStickKeys(); // the TV theatre opens over the helm
+    expect(readStick().thrust).toBe(0); // the W held as it opened is let go
+    expect(key('keydown', 'KeyW')).toBe(false); // the theatre's own listener sees it: nothing flies the ship
+    expect(readStick().thrust).toBe(0);
+    const phone = suspendStickKeys(); // the phone, above the theatre
+    theatre(); // the theatre closes first…
+    expect(key('keydown', 'KeyA')).toBe(false); // …the phone is still up
+    theatre(); // a second release of the same overlay counts for nothing
+    phone();
+    expect(key('keydown', 'KeyA')).toBe(true);
+    expect(readStick().yaw).toBe(-1);
+    // An overlay up before the stick is taken stands it aside the same.
+    releaseStickKeys();
+    const stage = suspendStickKeys();
+    takeStickKeys();
+    expect(key('keydown', 'KeyW')).toBe(false);
+    stage();
+    expect(key('keydown', 'KeyW')).toBe(true);
+  });
+
+  it('let a key typed into a panel marked data-stick-aside through (the phone\'s TV remote), and keep every other key', () => {
+    takeStickKeys();
+    const remote = { tagName: 'BUTTON', closest: (sel: string) => (sel === '[data-stick-aside]' ? {} : null) };
+    expect(key('keydown', 'ArrowDown', remote)).toBe(false); // the remote's own ↓, not thrust
+    expect(key('keydown', 'Space', remote)).toBe(false); // presses the remote's button, not the brake
+    expect(readStick()).toEqual({ thrust: 0, yaw: 0, strafe: 0, brake: false });
+    const world = { tagName: 'CANVAS', closest: () => null };
+    expect(key('keydown', 'KeyW', world)).toBe(true); // focus back on the world with the phone still up: the pilot flies
+    expect(readStick().thrust).toBe(1);
+    expect(key('keydown', 'KeyW', { tagName: 'DIV' })).toBe(true); // a target with no closest() is the world's too
+  });
+
+  it('names the flight keys a standing-aside panel must hold back from input.ts', () => {
+    for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'KeyX', 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) expect(isFlightKey(code)).toBe(true);
+    for (const code of ['Tab', 'Escape', 'Enter', 'KeyF', 'KeyK']) expect(isFlightKey(code)).toBe(false);
   });
 });
 
