@@ -231,6 +231,11 @@ function render(): void {
   document.getElementById('stats')!.textContent = lines.filter(Boolean).join('\n');
 }
 
+// The harness's own failures count against the run, as on the replay
+// spike's page (the frames' windows are their own).
+window.addEventListener('error', (e) => stats.errors.push(`page: ${e.message}`));
+window.addEventListener('unhandledrejection', (e) => stats.errors.push(`page: ${String(e.reason)}`));
+
 (window as unknown as { __lockstepSpike: unknown }).__lockstepSpike = {
   stats: () => ({ ...stats, lockSeconds: stats.lockstepAt ? (performance.now() - stats.lockstepAt) / 1000 : 0, drift: ledger.read() }),
 };
