@@ -84,14 +84,16 @@ const stats = {
   snapshotBytes: 0,
   loads: [] as Array<{ seat: number; frame: number; matches: boolean | undefined; tries: number | undefined }>,
   perSeat: Array.from({ length: seats }, (): SeatStats => ({ started: false, status: null, batches: 0, inputs: 0, wireBytes: 0, messages: 0, presses: 0 })),
-  /** The longest stretch, in ms, between one comparison and the next:
-   *  seats that froze partway stop comparing, which no mismatch would show
-   *  (stats() counts the stretch since the last one too). */
+  /** The longest stretch, in ms, without a new comparison, from the moment
+   *  every seat has started: seats that froze partway, or a lockstep that
+   *  never got going, stop comparing, which no mismatch would show
+   *  (stats() counts the stretch still running too). */
   longestGapMs: 0,
   errors: [] as string[],
 };
-/** When the ledger last compared a frame across every seat (0: not yet). */
-let comparedAt = 0;
+/** When the current stretch without a comparison began: the moment every
+ *  seat had started, then each comparison (0: not every seat has). */
+let gapFrom = 0;
 
 const frames: Array<EmulatorHandle | null> = Array.from({ length: seats }, () => null);
 /** One reassembler per link (from → to): batches back in frame order,
@@ -133,7 +135,10 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       if (seat === 0) stats.startedAt = performance.now();
       if (botOn) startBot(seat);
       // Every seat in: seat 0 saves its state, and lockstep begins there.
-      if (stats.perSeat.every((s) => s.started)) frames[0]?.send({ type: 'arcade-replay-begin' });
+      if (stats.perSeat.every((s) => s.started)) {
+        if (!gapFrom) gapFrom = performance.now();
+        frames[0]?.send({ type: 'arcade-replay-begin' });
+      }
       break;
     case 'replay-inputs': {
       const bytes = packInputBatch(ev.batch);
@@ -166,8 +171,8 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
     case 'replay-hash': {
       if (ledger.record(seat, ev.hash.frame, ev.hash.hash) !== null) {
         const now = performance.now();
-        if (comparedAt) stats.longestGapMs = Math.max(stats.longestGapMs, now - comparedAt);
-        comparedAt = now;
+        stats.longestGapMs = Math.max(stats.longestGapMs, now - (gapFrom || now));
+        gapFrom = now;
       }
       break;
     }
@@ -251,7 +256,7 @@ window.addEventListener('unhandledrejection', (e) => stats.errors.push(`page: ${
   stats: () => ({
     ...stats,
     hashEvery,
-    longestGapMs: Math.round(Math.max(stats.longestGapMs, comparedAt ? performance.now() - comparedAt : 0)),
+    longestGapMs: Math.round(Math.max(stats.longestGapMs, gapFrom ? performance.now() - gapFrom : 0)),
     lockSeconds: stats.lockstepAt ? (performance.now() - stats.lockstepAt) / 1000 : 0,
     drift: ledger.read(),
   }),
