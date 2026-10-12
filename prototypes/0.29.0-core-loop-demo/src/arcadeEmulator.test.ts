@@ -250,11 +250,24 @@ describe('a replay frame says only what its role posts, in its shape', () => {
     expect(peerOwnSeat(frameMessage(hash, 'peer')!, { role: 'peer', seat: 3, seats: 4 })).toBe(true);
   });
 
-  it('a lockstep peer gets the larger budget: a batch can go out every frame its player presses', () => {
-    expect(FRAME_MESSAGE_BUDGET_LOCKSTEP).toBeGreaterThanOrEqual(60);
+  it('a lockstep peer gets the larger budget: a batch every frame its player presses, beside its hash and status', () => {
     const b = new MessageBudget(FRAME_MESSAGE_BUDGET_LOCKSTEP);
-    for (let i = 0; i < FRAME_MESSAGE_BUDGET_LOCKSTEP; i++) expect(b.take(i * 16)).toBe(true);
-    expect(b.take(FRAME_MESSAGE_BUDGET_LOCKSTEP * 16)).toBe(false); // the sixty-first inside the second
+    // A player pressing all the time for five seconds: a batch every
+    // frame, and a hash and a status each second, with the start's few
+    // messages (frame ready, ready, started, a status) in the first.
+    for (let i = 0; i < 4; i++) expect(b.take(i)).toBe(true);
+    for (let f = 0; f < 300; f++) {
+      const t = 10 + f * (1000 / 60);
+      expect(b.take(t)).toBe(true);
+      if (f % 60 === 30) {
+        expect(b.take(t + 1)).toBe(true); // the hash
+        expect(b.take(t + 2)).toBe(true); // the status
+      }
+    }
+    // A frame posting past the budget inside one second still comes down.
+    const flood = new MessageBudget(FRAME_MESSAGE_BUDGET_LOCKSTEP);
+    for (let i = 0; i < FRAME_MESSAGE_BUDGET_LOCKSTEP; i++) expect(flood.take(i)).toBe(true);
+    expect(flood.take(FRAME_MESSAGE_BUDGET_LOCKSTEP)).toBe(false);
     expect(b.take(FRAME_MESSAGE_WINDOW_MS + 16)).toBe(true);
   });
 });

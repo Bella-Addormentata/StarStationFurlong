@@ -19,7 +19,11 @@
  * Query parameters (all optional): seats (4), delay (frames; 8), latency
  * and jitter (ms, one way per link; 0), batchFrames (3), hashEvery (60),
  * bot (0 turns the random presses off), seed, core (nes), rom
- * (/emulatorjs/roms/lj65.nes).
+ * (/emulatorjs/roms/lj65.nes). Seats, delay, batchFrames and hashEvery
+ * are whole numbers, clamped to seats 1–4, delay 1–600, batchFrames
+ * 1–600 and hashEvery 10–3600 (a hash every frame or two, beside a batch
+ * every frame, would pass a seat's message budget): the seats run with,
+ * and the stats report, the same settings.
  *
  * window.__lockstepSpike.stats() returns the numbers
  * (scripts/arcade-replay-spike.mjs --page lockstep-spike.html prints them).
@@ -36,12 +40,16 @@ const num = (k: string, d: number) => {
   const v = Number(q.get(k));
   return q.has(k) && Number.isFinite(v) ? v : d;
 };
-const seats = Math.max(1, Math.min(4, num('seats', 4)));
-const delay = num('delay', 8);
+/** A whole number within [min, max]. The frame would truncate a fraction
+ *  and put its own default in for anything below 1, so the page settles
+ *  them first rather than report settings no seat ran with. */
+const int = (k: string, d: number, min: number, max: number) => Math.min(max, Math.max(min, Math.trunc(num(k, d))));
+const seats = int('seats', 4, 1, 4);
+const delay = int('delay', 8, 1, 600);
 const latencyMs = num('latency', 0);
 const jitterMs = num('jitter', 0);
-const batchFrames = num('batchFrames', 3);
-const hashEvery = num('hashEvery', 60);
+const batchFrames = int('batchFrames', 3, 1, 600);
+const hashEvery = int('hashEvery', 60, 10, 3600);
 const botOn = q.get('bot') !== '0';
 const core = (q.get('core') ?? 'nes') as ArcadeCore;
 const romUrl = q.get('rom') ?? '/emulatorjs/roms/lj65.nes';

@@ -346,6 +346,12 @@
             nextFrom = through + 1;
             lastBatch = at();
           }
+          // The frame each button last changed at. A press and a release
+          // that would land on one frame (both made while this seat held a
+          // frame for the others, say) go to one frame after another
+          // instead, or the core would never see the tap. A stick needs no
+          // such care: where it ends up is what counts.
+          var lastAt = {};
           // The local player's buttons: player one's controls, played as
           // this seat. Before lockstep, seat 0 plays at once (the game is
           // its alone); a joining seat's buttons go nowhere until it is in.
@@ -358,7 +364,12 @@
               return feed(seat, i, v);
             }
             if (phase !== 'lockstep' && phase !== 'stalled') return;
-            var row = [at() + delay, seat, i, v];
+            var f = at() + delay;
+            if (i < 16) {
+              if (lastAt[i] !== undefined && f <= lastAt[i]) f = lastAt[i] + 1;
+              lastAt[i] = f;
+            }
+            var row = [f, seat, i, v];
             pending.push(row);
             enqueue(seat, row);
           };

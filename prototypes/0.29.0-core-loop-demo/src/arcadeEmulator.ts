@@ -267,8 +267,9 @@ export type EmulatorEvent =
  *  then the frame is gone (plan §9). */
 export const FRAME_MESSAGE_BUDGET = 20;
 /** A lockstep peer's budget: a batch as often as every frame while its
- *  player presses, beside its hashes and status. */
-export const FRAME_MESSAGE_BUDGET_LOCKSTEP = 60;
+ *  player presses (60 a second), and room beside them for its hash and
+ *  status each second and the messages of its start and its load. */
+export const FRAME_MESSAGE_BUDGET_LOCKSTEP = 80;
 export const FRAME_MESSAGE_WINDOW_MS = 1_000;
 export const FRAME_STRING_MAX = 256;
 
