@@ -59,6 +59,8 @@ Run from the repository root; every hit must have a row above. The commands take
 ```sh
 # the tree the release ships, read from the workflow so a prototype switch moves the audit with it (expect prototypes/0.29.0-core-loop-demo today)
 APP=$(sed -n 's/^ *RELEASE_FRONTEND: *//p' .github/workflows/release.yml | head -1); echo "$APP"
+# a dependency's source as the node's lockfile pins it: the registry cache can hold other versions beside the one that was built, so no version glob
+crate() { v=$(awk -v n="$1" '$0=="name = \""n"\""{getline; gsub(/"/,"",$3); print $3; exit}' "$APP/ssf-p2p-node/Cargo.lock"); echo ~/.cargo/registry/src/*/"$1-$v"; }
 # every URL, hostname, IPv4 or IPv6 literal in the node: a URL, any name.tld inside a string literal (whatever the TLD), a dotted quad, a bracketed IPv6 address,
 # a four-octet array ([0, 0, 0, 0]) or a quoted bare IPv6 address ("::1").
 # Expect: the two echo hosts of §2 (until that row moves to §7); tauri.localhost; file names (json.tmp, the test-vector paths);
@@ -72,13 +74,13 @@ grep -rn -E 'TcpStream::connect|UdpSocket::(bind|connect)|lookup_host|to_socket_
 # the gateway call sites (must be empty once §2's first row has moved to §7)
 grep -rn 'CoinsetClient::' $APP/ssf-p2p-node/src
 # the gateway host itself lives in the pinned crate, not in the node: expect https://testnet11.api.coinset.org (the crate leaves Cargo.toml with that row)
-grep -n -A1 'pub fn testnet11' ~/.cargo/registry/src/*/chia-sdk-coinset-0.34.*/src/coinset_client.rs
+grep -n -A1 'pub fn testnet11' "$(crate chia-sdk-coinset)/src/coinset_client.rs"
 # the build script's hosts and the environment overrides that redirect them (the build-time row of §3)
 grep -n -E 'https?://|process\.env\.EJS_' $APP/scripts/fetch-emulatorjs.mjs
 # the release workflow's downloads: expect the actions by major tag (checkout, setup-node, rust-toolchain@stable, rust-cache, tauri-action, github-script), apt-get (curl and wget there are packages it installs, not downloads), npm ci and cargo build, and no URL; a new `uses:`, `curl`, `wget` or URL needs the build-time row
 grep -n -E '^\s*uses:|https?://|apt-get|npm (ci|install)|cargo (build|install)|curl |wget ' .github/workflows/release.yml
 # where the lockfiles download from: expect registry.npmjs.org alone and the crates.io index alone, and no git or path dependency or [patch] section in the manifests (any of those names a new host or a vendored copy)
-grep -h -o -E '"resolved": "[a-z]+://[^/"]+' $APP/package-lock.json | sort | uniq -c; grep -h -o -E '^source = "[^"#]+' $APP/ssf-p2p-node/Cargo.lock $APP/src-tauri/Cargo.lock | sort | uniq -c; grep -n -E 'git = |^\[patch' $APP/ssf-p2p-node/Cargo.toml $APP/src-tauri/Cargo.toml
+grep -h -o -E '"resolved": "[a-z]+://[^/"]+' $APP/package-lock.json | sort | uniq -c; grep -h -o -E '^source = "[^"#]+' $APP/ssf-p2p-node/Cargo.lock $APP/src-tauri/Cargo.lock | sort | uniq -c; grep -n -E 'git = |path = |^\[patch' $APP/ssf-p2p-node/Cargo.toml $APP/src-tauri/Cargo.toml
 # every literal external URL in the browser
 grep -rn -o -E 'https?://[A-Za-z0-9./_-]+' $APP/src --include='*.ts' | grep -v '[.]test[.]ts'
 # the stylesheets and the inline styles: a url() or @import fetches with no TypeScript sink (expect nothing: no stylesheet names an outside resource today)
@@ -95,15 +97,15 @@ grep -rn -o -i -E 'https?://[^" )]+|"[^"]*\b[a-z0-9-]+\.[a-z]{2,}\b[^"]*"|\b[0-9
 # ...and the shell's outbound sinks, the node's pattern again (expect three local hits with no destination: a UDP bind probe, the WebTransport server, the HTTP API's TCP listener)
 grep -rn -E 'TcpStream::connect|TcpListener::bind|UdpSocket::(bind|connect)|lookup_host|to_socket_addrs|\.connect\(|Endpoint::(server|client)|CoinsetClient::|reqwest::|hyper::' --include='*.rs' $APP/src-tauri/src
 # the Mainline DHT bootstrap list lives in the n0-mainline crate, not in the node (main.rs passes no override): expect the four hosts of §3's first row
-grep -n -A5 'DEFAULT_BOOTSTRAP_NODES' ~/.cargo/registry/src/*/n0-mainline-*/src/actor/config.rs
+grep -n -A5 'DEFAULT_BOOTSTRAP_NODES' "$(crate n0-mainline)/src/actor/config.rs"
 # ...and the bootstrap nodes are seeded into a lookup again whenever the candidate set is smaller than that list
-grep -n -B2 -A3 'candidates.len() < self.bootstrap.len()' ~/.cargo/registry/src/*/n0-mainline-*/src/core.rs
+grep -n -B2 -A3 'candidates.len() < self.bootstrap.len()' "$(crate n0-mainline)/src/core.rs"
 # the bundled default-station pass: where a first run dials. Expect one member hint, the owner's SSF-WELCOME host (its iroh id and direct addresses), no irohRelayUrls, a loopback wtUrl; a new host or a relay URL here needs the §5 row updated
 grep -o "seed=[A-Za-z0-9_%=-]\{20,\}" $APP/src/defaultStation.ts | cut -c6- | python3 -c 'import sys,base64,json,urllib.parse; s=urllib.parse.unquote(sys.stdin.read().strip()); d=json.loads(base64.urlsafe_b64decode(s+"="*(-len(s)%4))); d.pop("roomKeyB64",None); print(json.dumps(d,indent=1))'
 # what iroh does when the node configures nothing (expect RelayMode::Disabled, no address lookup)
-grep -n -B1 -A3 'pub fn empty()' ~/.cargo/registry/src/*/iroh-1.*/src/endpoint.rs
+grep -n -B1 -A3 'pub fn empty()' "$(crate iroh)/src/endpoint.rs"
 # iroh's DNS resolver is built from the system's configuration, with Google's resolvers only as the fallback when that cannot be read (expect the warn! line and GOOGLE: the §5 row); the node names no resolver of its own (expect no hits)
-grep -n -A8 'fn build_resolver' ~/.cargo/registry/src/*/iroh-dns-1.*/src/dns.rs; grep -rn -E 'dns_resolver|with_nameserver' --include='*.rs' $APP/ssf-p2p-node/src
+grep -n -A8 'fn build_resolver' "$(crate iroh-dns)/src/dns.rs"; grep -rn -E 'dns_resolver|with_nameserver' --include='*.rs' $APP/ssf-p2p-node/src
 ```
 
 On main `97c10988` the TypeScript line finds twenty hits and the HTML line three, every one accounted for: the page's own origin (the Mars texture under `/assets/` in `world.ts`, the photo standees in `furniture.ts`, the party tracks in `partyAudio.ts`, the built-in ROMs under `/arcade/roms/` in `arcadeNesSession.ts`, the emulator frame and the emulator-files probe in `arcadeEmulator.ts`, the probe fetching `loader.js` from the page's own origin only since a cross-origin data path returns `unknown` unfetched, the replay spike's ROM in `arcadeReplaySpike.ts`, whose page `replay-spike.html` is a dev-server page and not a build input); the viewer's own node, or the remote node a pass names when the browser has none (the bridge row of §4): `/api/fingerprint` and the WebTransport session in `main.ts` and `network/NetworkProvider.ts`; room-record URLs behind `urlConsent` (the TV's video source in `tvTheatre.ts`, the game link in `arcadeStage.ts`, and the TV's redirect probe in `tvConsent.ts`, a CORS HEAD to a host the viewer already consented to); and the convenience lanes (the YouTube API script and the archive.org embed in `tvTheatre.ts`, the archive.org metadata lookup in `tvUI.ts`), none reached before the consent gate let the source through; and the four navigation sinks: the arcade's GitHub source link in `arcadeUI.ts` (the GitHub row of §3), a download link to a file the page itself made (a blob URL, `main.ts`), and two reloads of the page's own origin (`devMenu.ts`, `main.ts`). Of the three HTML hits, `index.html` loads only `/src/index-inline.css` and `/src/main.ts`, and the arcade frame loads the EmulatorJS loader from the data path it is handed: the station's own `/emulatorjs/` by default, `cdn.emulatorjs.org` only on the CDN lane of §4. The Rust sink line finds sixteen hits, one of them a comment: the echo's TCP connect to port 80 (§2); the six gateway clients (§2) and two more in tests that point at a loopback port nothing listens on; the iroh endpoint builder and its two dials, the bridge dial from a pass's member hints and the chain-triggered hold dial, whose targets are room peers (§5, the welcome host among them), found through the DHT (§3) and carried by a relay only with `SSF_RELAYS` set (§4); and two local UDP binds and the WebTransport server, which have no destination.
