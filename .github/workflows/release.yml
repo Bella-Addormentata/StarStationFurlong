@@ -505,14 +505,18 @@ jobs:
   # (scripts/emulatorjs-sources.json) into emulatorjs-<version>-source.tar.xz,
   # about 123 MB with all eleven, and attaches it beside the installers. Once
   # the pack has run, the upload fails without exactly one archive, and
-  # finalize-release waits for this job, so no release goes out without it. A
-  # frontend that fetches no EmulatorJS has nothing to pack; one that fetches
-  # it but has no way to pack its source fails here.
+  # finalize-release waits for this job, then finds the archive on the draft by
+  # name, so no release goes out without it. A frontend that fetches no
+  # EmulatorJS has nothing to pack; one that fetches it but has no way to pack
+  # its source fails here.
   publish-emulator-source:
     needs: create-release
     permissions:
       contents: write
     runs-on: ubuntu-22.04
+    # 'true' when this release owes a source archive (finalize-release reads it).
+    outputs:
+      packed: ${{ steps.pack.outputs.packed }}
     steps:
       - name: 📥 Checkout repository (the release commit)
         uses: actions/checkout@v5
@@ -552,8 +556,8 @@ jobs:
             const release_id = Number('${{ needs.create-release.outputs.release_id }}');
             const dir = path.join(process.env.RUNNER_TEMP, 'emulatorjs-source');
             const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('-source.tar.xz')) : [];
-            // The release owes exactly one archive, and finalize-release's asset
-            // floor would be met without it.
+            // The release owes exactly one archive (finalize-release looks for it
+            // again before publishing).
             if (files.length !== 1) {
               core.setFailed(`Refusing to go on: the pack should have left one *-source.tar.xz in ${dir}, and there are ${files.length}. Draft left intact.`);
               return;
@@ -606,10 +610,20 @@ jobs:
               repo: context.repo.repo,
               release_id,
             });
+            // The emulator's source (Stage 2c) is an asset apart: a release whose
+            // frontend packed it owes exactly one, found by name, and it never
+            // counts toward the installers' floor below.
+            const owed = '${{ needs.publish-emulator-source.outputs.packed }}' === 'true' ? 1 : 0;
+            const sources = rel.assets.filter((a) => a.name.endsWith('-source.tar.xz')).length;
+            if (sources !== owed) {
+              core.setFailed(`Refusing to publish: the draft has ${sources} *-source.tar.xz, and this release owes ${owed}. Draft left intact.`);
+              return;
+            }
             // Sanity floor: 3 platform installer sets + standalone node exe.
             // Guards against publishing (immutably!) a half-populated release.
-            if (rel.assets.length < 6) {
-              core.setFailed(`Refusing to publish: only ${rel.assets.length} assets attached (expected >= 6). Draft left intact.`);
+            const installers = rel.assets.length - sources;
+            if (installers < 6) {
+              core.setFailed(`Refusing to publish: only ${installers} installer and node assets attached (expected >= 6). Draft left intact.`);
               return;
             }
             await github.rest.repos.updateRelease({
