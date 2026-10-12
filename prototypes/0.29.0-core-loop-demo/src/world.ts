@@ -6121,13 +6121,18 @@ export class World {
   /** 🕹🕹🕹🕹 The double-wide cabinet's stand for this page (#242): its own
    *  seat's, else the lowest seat nobody holds — by the seats' leases, not by
    *  who stands near (four stands a step apart). None free, or none it can
-   *  walk to: null, the device front. */
+   *  walk to: null, the device front. Its own seat's stand counts only while
+   *  it can walk there (furniture set down since it sat can fence one off),
+   *  and the panel at the front still shows its seat. */
   private pickArcadeSeatStand(deviceId: string): StandSlot | null {
     const stands = standsForItem(deviceId);
     const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
-    const mine = mySeat(deviceId, 4);
-    if (mine !== null) return at(mine);
     const reachable = this.standReachability();
+    const mine = mySeat(deviceId, 4);
+    if (mine !== null) {
+      const own = at(mine);
+      return own && reachable(own) ? own : null;
+    }
     for (let n = 0; n < 4; n++) {
       const s = at(n);
       if (s && seatStatus(deviceId, n) === "free" && reachable(s)) return s;
