@@ -798,7 +798,10 @@ one's is its declaration, reserved; received bytes past the ceiling abort
 the transfer, and a completed blob whose size differs from the
 declaration is rejected either way.
 Nobody in a room can spend another viewer's bandwidth or disk unasked. The same lane later carries room assets, ROMs and the
-station library (§7).
+station library (§7) — the cabinet owner's game file first: #248 passes it
+through the room document until this lane exists (`arcadeRomShare.ts`,
+§9), which is why the document bound in the media-control part below
+waits on this lane.
 
 **Step 2 — the live lane.** `new VideoFrame(canvasOrVideo, {timestamp})` →
 WebCodecs `VideoEncoder` / `AudioEncoder` (Opus), each chunk's bytes
@@ -984,7 +987,22 @@ that bound base64-expanded plus the envelope's fields — 1 400 000 bytes —
 and a frame past it is a protocol violation, never a large room. A
 chunked baseline (SyncStep2 in bounded pieces) was the alternative, not
 taken: it bounds the frame and never the document, and the document is
-what every reader must hold. And the bound holds at the RECEIVER too, in
+what every reader must hold. **Enforced only once the cabinet's file has
+left the document.** Since #248 the owner's own game file is sent to a
+player who presses play THROUGH THE ROOM DOCUMENT (`arcadeRomShare.ts`:
+up to 8 MiB in 64 KiB chunks under `romc:` keys, eight a tick at the 2 Hz
+arcade beat, deleted once nobody asks, so a delivered file leaves the
+document and its cache — the one file path between pages while the
+`asset` envelope kind stays reserved, §4), so a live document passes
+1 000 000 bytes, honestly and transiently, for as long as a transfer
+runs, and a baseline taken during one carries the whole file. A bound
+enforced today would refuse the sender's chunks as ROOM FULL, the
+receiver's measure below would drop them, and the frame ceiling would
+reset a late joiner's sync. So the ROM share moves to the blob lane first
+(§4, the lane the cabinet's file was always to ride; §9), or to another
+transport outside the document, and until it has, no replica enforces
+the bound, the cache goes on skipping the snapshots it cannot hold, and
+the ceiling is not drawn. And the bound holds at the RECEIVER too, in
 both replicas, since a local-write check binds only honest pages:
 `YjsSync` applies every inbound update as it arrives
 (`src/network/YjsSync.ts`) and the node's replica does the same
@@ -1887,6 +1905,32 @@ media lane. B: one machine runs it, streams video, receives inputs
 (Parsec/cloud gaming); needs the live lane and adds a round trip of input lag.
 Screen sharing is not required for multiplayer; it is how spectators watch.
 
+**Two kinds of game on one cabinet, one model each (#248, merged
+2026‑10‑12).** A cabinet holds ONE game, the owner's pick in ⚙️ SETTINGS
+(the shelf #208 shipped is gone): a BUILT-IN game, or the owner's OWN.
+The built-in games are model A, shipped: four NES homebrew titles the app
+ships under licences that allow redistribution (`arcadeLibrary.ts`;
+THWAITE on a cabinet nobody has set), run by jsnes ON the cabinet's own
+screen for the whole room — the host's page (whoever pressed start) runs
+the reference copy and sends both pads' bytes on the tick lane each frame
+(a kind‑1 subtype no mallet tick can pose as, `arcadeNet.ts`), every
+other page runs the same frames with the same bytes a few frames behind
+and paints them on its cabinet (every frame up close, every third across
+the room, every sixth from afar), and a late or lost copy takes a save
+state through the doc (deflated JSON of the difference from power-on,
+10–20 KB, at most one a second); player 2 is whoever steps up to the
+two-player cabinet's second stand, their pad on the same lane. One
+engine and a fixed library made determinism free there, so none of the
+lanes below is needed for it, and it runs on today's unauthenticated
+tick lane under the dev-phase posture (a forged pad at a free game
+presses a button and nothing more); the signed binding below is the
+prerequisite of anything with stakes. The owner's own game — any console
+or arcade board EmulatorJS runs, from a file on the owner's disk (sent
+through the room to each player who presses play, `arcadeRomShare.ts`,
+until the blob lane carries it, §4) or a link — runs in ONE page's
+EmulatorJS, P1's stage, and is model B: the rest of this section is
+about it.
+
 **Player one is the source.** P1 holds the cabinet's P1 panel (claimed in the
 doc the way an air-hockey end is, with the page-seat rule); their emulator
 canvas is the picture. Spectators subscribe by distance (§4): live within
@@ -1999,18 +2043,30 @@ where lag matters.
 **Sources.** The archive.org embed (`archive.org/embed/<id>`) is single-player
 only (cross-origin, no input injection, no CRT). The ROM file loaded into an
 emulator in our page is the path that can do netplay, save states and #194.
-ROM-set versions must match the core; the owner's shelf is curated by test.
+ROM-set versions must match the core. The built-in games are validated
+by test: `arcadeLibrary.test.ts` checks every entry's files exist and
+boots its ROM through the emulator, each entry pinned to an upstream
+commit with the corresponding source bundled for the copyleft titles
+(public/arcade/README.md is the credits page and says how to add one;
+commercial and non-commercial ROMs never go in). The owner's own game is
+one file or link with the core of the owner's choosing, validated by the
+engine at load — the iNES header check keeps junk out of jsnes, and
+EmulatorJS answers for its own cores — and its SHA-256 in the cabinet
+record is what a player's received copy is checked against.
 The archive is a convenience source; the owner's own file is the sovereign
 one; the station library (§7) is the sovereign backup for ROMs exactly as for
 films, and its BLAKE3 hash is the first half of the netplay determinism check
 — the bytes. Lockstep also binds the exact core build, the emulator settings
 and the initial state, or two identical ROMs still diverge.
 
-**Engine.** EmulatorJS (libretro cores in WASM) for single-player, the menu,
+**Engine.** Two: jsnes (Apache-2.0, `arcadeMachine.ts`) for the built-in
+NES games, stepped one frame at a time with both pads set from bytes, which
+is what makes the shared game above possible; and EmulatorJS (libretro
+cores in WASM) for the owner's own game — single-player, the menu,
 save states, gamepads and touch; its own netplay is WebRTC-based with its own
 signaling and STUN/TURN and is marked unstable, so it is not depended on.
-Lockstep needs a libretro core driven per frame (a thin harness, the P2
-spike). Licences to review before bundling: EmulatorJS GPL-3.0, FBNeo
+Lockstep for an EmulatorJS game needs a libretro core driven per frame (a
+thin harness, the P2 spike). Licences to review before bundling: EmulatorJS GPL-3.0, FBNeo
 non-commercial clause, MAME a GPL-2.0/BSD-3 mix. The emulator data files are
 **not** vendored into the repository (size); they are fetched into
 `public/emulatorjs/` by a script (`npm run fetch:emulatorjs`), and the CDN is
@@ -2183,7 +2239,7 @@ it.
 | Tor for torrent traffic | Rejected | No UDP; the Tor project asks people not to torrent through it |
 | I2P (`emissary`) | Watch; opt-in later | Experimental; passes the no-single-vendor rule that IPv8 fails |
 | WebTorrent in the browser | Rejected | Browsers cannot join classic swarms |
-| Lockstep netplay first for the arcade | Deferred behind P2-over-video | Multi-week determinism spike; the video lane is built for spectators anyway |
+| Lockstep netplay first for the arcade | Shipped for the built-in NES games (#248); deferred behind P2-over-video for the owner's EmulatorJS game | One engine (jsnes) and a fixed library made determinism free, so the built-in games run on every page from pad bytes on the tick lane (§9); any libretro core would be a multi-week determinism spike, and the video lane is built for spectators anyway |
 | EmulatorJS netplay | Not depended on | WebRTC + its own signaling/TURN, marked unstable |
 | Spectators run the emulator themselves | Possible later | CPU per spectator and a save-state transfer; the video lane is cheaper at retro resolutions |
 | Sender-side distance gating | Rejected | The node is content-blind and tick positions are untrusted; viewer-pull matches the mesh's IWANT philosophy |
@@ -2196,7 +2252,10 @@ it.
    IFrame API with full sync, archive.org files and direct URLs via `<video>`
    with full sync for finite, seekable media (the archive embed, a live
    stream or a host without usable ranges play start-time only, §3.3), the
-   countdown, the start screen with lane badges, the theatre panel.
+   countdown, the source tiles with their lane badges on the phone's remote
+   app and the panel at the set (the prop shows what is on, the countdown and
+   the holder; the start screen navigated on the prop is a later slice,
+   §3.3), the theatre panel.
    **In #207 (merged 2026‑10‑12), serverless-only under the 2026‑10‑04 ruling (§3.3):** the
    YouTube and archive tiles and PLAY FROM <host> are in the tree behind
    `VITE_SSF_CONVENIENCE_LANES=1`; a default build plays a file on the
@@ -2230,7 +2289,11 @@ it.
   comes, behind the same flag.
 - Whether a station runs a library-station node, and who.
 - Whether the IPv8 stage-A spike is wanted at all after the library lands.
-- The arcade shelf's default contents (homebrew/freeware first). ~~Whether
-  the CDN opt-in for emulator files is acceptable for non-sovereign builds.~~
-  **Decided 2026‑10‑04:** not offered by default; behind
-  `VITE_SSF_CONVENIENCE_LANES=1` with the rest (§9).
+- ~~The arcade shelf's default contents (homebrew/freeware first).~~
+  **Decided by #248 (2026‑10‑12):** no shelf — one game per cabinet, the
+  owner's pick in ⚙️ SETTINGS, from four built-in NES homebrew titles
+  (THWAITE on a cabinet nobody has set) or the owner's own file or link
+  (§9).
+- ~~Whether the CDN opt-in for emulator files is acceptable for
+  non-sovereign builds.~~ **Decided 2026‑10‑04:** not offered by default;
+  behind `VITE_SSF_CONVENIENCE_LANES=1` with the rest (§9).
