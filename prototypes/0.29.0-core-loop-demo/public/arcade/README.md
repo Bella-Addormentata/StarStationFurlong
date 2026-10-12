@@ -82,6 +82,12 @@ the three together, and a release then offers, fetches and packs the source of
 only the rest. `EJS_CORES` alone would leave the cores' files out but still
 offer their systems, which then wouldn't start.
 
+Each of those four is compiled into one file with EmulatorJS's GPL-3.0
+RetroArch, and the GPL allows no further restrictions on such a file, so
+strictly they can't be passed on under both licenses at once. EmulatorJS
+publishes them that way all the same, and the owner chose to ship them as it
+does (2026-10-12).
+
 EmulatorJS's own scripts travel with it unminified. The cores are compiled
 builds, too big to carry their source inside the app the way the built-in
 games do, so every release carries it beside the installers:
