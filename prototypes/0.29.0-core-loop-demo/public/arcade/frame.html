@@ -163,6 +163,27 @@
         // by postMessage, the page offering the file — a follow-up; a
         // station-side store comes with the blob lane.
         window.EJS_disableDatabases = true;
+        window.EJS_disableLocalStorage = true;
+        // EmulatorJS 4.2.1 reads window.localStorage BEFORE it looks at its
+        // own switch above, and in an opaque origin that read throws: the
+        // engine died at startup under this frame's sandbox. A storage of
+        // this frame's own, in memory and gone with it, answers instead.
+        try {
+          void window.localStorage;
+        } catch (err) {
+          var mem = {};
+          Object.defineProperty(window, 'localStorage', {
+            configurable: true,
+            value: {
+              getItem: function (k) { return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; },
+              setItem: function (k, v) { mem[k] = String(v); },
+              removeItem: function (k) { delete mem[k]; },
+              clear: function () { mem = {}; },
+              key: function (i) { var ks = Object.keys(mem); return i < ks.length ? ks[i] : null; },
+              get length() { return Object.keys(mem).length; },
+            },
+          });
+        }
         window.EJS_ready = function () { post('arcade-ready'); };
         window.EJS_onGameStart = function () { post('arcade-started'); };
         var s = document.createElement('script');
