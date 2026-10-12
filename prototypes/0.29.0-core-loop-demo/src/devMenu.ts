@@ -78,6 +78,7 @@ import type { FurnitureHandleSinks } from './furnitureHandles';
 import { registerAirHockeyVisual } from './airHockeySession';
 // 🐊 #185: the same for a DEV-spawned insatiable-alligators table.
 import { registerAlligatorsVisual } from './alligatorsSession';
+import { registerArcadeVisual } from './arcadeNesSession';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -127,6 +128,7 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'smart-tv': '📺 SMART TV (WALL)',
   'tv-stand': '📺 TV ON A STAND',
   'arcade-cabinet': '🕹 ARCADE CABINET',
+  'arcade-cabinet-2p': '🕹 ARCADE CABINET · 2 PLAYER',
   'cake-table': '🎂 CAKE TABLE',
   'gift-box': '🎁 GIFT BOX',
   'birthday-banner': '🎊 BIRTHDAY BANNER',
@@ -441,6 +443,8 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       if (hockey) registerAirHockeyVisual(item.id, hockey, { x: item.pos.x, z: item.pos.z, rot: item.rot });
       const gators = sinks.alligatorsVisuals.get(item.id);
       if (gators) registerAlligatorsVisual(item.id, gators, { x: item.pos.x, z: item.pos.z, rot: item.rot });
+      const arcade = sinks.arcadeCabinetVisuals.get(item.id);
+      if (arcade) registerArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;

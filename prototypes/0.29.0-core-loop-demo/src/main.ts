@@ -39,6 +39,9 @@ import {
   routeAlligatorsTick,
   setAlligatorsSender,
 } from "./alligatorsSession";
+// 🕹️ Shared arcade games: their pad bytes ride lane kind 1 as a subtype.
+import { routeArcadeTick, setArcadeSender } from "./arcadeNesSession";
+import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -251,7 +254,7 @@ import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArm
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
 import { leaveArcadeRoom } from "./arcadeSession";
 import { closeArcadeStage } from "./arcadeStage";
-import { FURNITURE } from "./furniture";
+import { ARCADE_CABINET_KINDS, FURNITURE } from "./furniture";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -584,6 +587,7 @@ const networkProvider = new NetworkProvider();
 // state (clean no-op offline), so one wiring here covers every room join.
 setAirHockeySender((buf) => networkProvider.sendTick(buf));
 setAlligatorsSender((buf) => networkProvider.sendTick(buf));
+setArcadeSender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -2003,7 +2007,7 @@ async function joinRoomAtEpoch(
   // remote. Same T0 seam — a joiner walks in on a movie already running and
   // anchors its clock to the sample it finds.
   bindTvDoc(sync.doc);
-  // 🕹 Bind the shared arcade map (#193): each cabinet's shelf and game, and
+  // 🕹 Bind the shared arcade map (#193): each cabinet's game, and
   // who is at its controls. Same T0 seam.
   bindArcadeDoc(sync.doc);
 
@@ -3088,6 +3092,17 @@ async function joinRoomAtEpoch(
         tick = unpackTick(buf);
       } else {
         return; // unknown datagram framing — ignore
+      }
+      // 🕹️ Arcade ticks ride the kind-1 lane with flags bit 5 set and a NaN
+      // where a mallet keeps its x (arcadeNet.ts): route them on the raw
+      // bytes, before anything reads that x as a position.
+      const raw = buf.byteLength === ADDRESSED_TICK_BYTES ? buf.subarray(buf.byteLength - TICK_BYTES) : buf;
+      if (isArcadeTickFlags(tick.flags)) {
+        seenPeers.add(peerId);
+        receivedTicks++;
+        remoteLastSeen.set(peerId, performance.now());
+        routeArcadeTick(peerId, raw);
+        return;
       }
       // 🏒 #115: flags bits 6–7 select the tick lane. Mallet/puck ticks are
       // game traffic for the air-hockey session, NOT avatar movement —
@@ -4259,7 +4274,7 @@ function resolveOwnerLabel(owner: string): string {
  *      handing theirs on — setTvHostPredicate; the panels paint from it)
  *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
  *      (#193 — setArcadeEjectPredicate; the panel paints from it). The
- *      cabinet's CURATION (shelf, game, emulator files) stays with the
+ *      cabinet's CURATION (its game, emulator files) stays with the
  *      shareholder-extended gate above (setArcadeHostPredicate).
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
@@ -6056,7 +6071,7 @@ function tvTheatreDeps(itemId: string) {
 }
 // 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
 function roomArcadeIds(): string[] {
-  return FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+  return FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
 }
 
 /** WATCH from the phone or the HUD chip: only for a set still in THIS room,
@@ -10028,7 +10043,7 @@ async function init() {
       : `page-${Math.random().toString(36).slice(2, 12)}`,
   );
   // 🕹 #193: two authorities for the cabinet (#142's split, in the
-  // isLocalPlayerRoomOwner docblock). Curation — the shelf, the game, the
+  // isLocalPlayerRoomOwner docblock). Curation — the game, the
   // emulator files — is the edit gate's, shareholder-extended. Unseating
   // P1 (EJECT, sitting down over a held seat) is the DEED holder's alone:
   // a peer-written venture record can satisfy the edit gate, and nobody is
