@@ -6,7 +6,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameOrigins,
+  allowLocalRomExposure, arcadeFrameUrl, asksForSnapshot, isEpochTag, SNAPSHOT_ASKS_MAX, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameOrigins,
   emulatorIsolated, emulatorWallPolicy, frameMessage, localRomExposureAllowed, localRomFor, MessageBudget, probeEmulatorData,
   peerOwnSeat, readReplayStatus, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
   FRAME_MESSAGE_BUDGET, FRAME_MESSAGE_BUDGET_LOCKSTEP, FRAME_MESSAGE_WINDOW_MS, FRAME_STRING_MAX,
@@ -269,5 +269,49 @@ describe('a replay frame says only what its role posts, in its shape', () => {
     for (let i = 0; i < FRAME_MESSAGE_BUDGET_LOCKSTEP; i++) expect(flood.take(i)).toBe(true);
     expect(flood.take(FRAME_MESSAGE_BUDGET_LOCKSTEP)).toBe(false);
     expect(b.take(FRAME_MESSAGE_WINDOW_MS + 16)).toBe(true);
+  });
+});
+
+describe('a lockstep peer\'s epoch, as the page reads it from the frame', () => {
+  const hash = { type: 'arcade-replay-hash', frame: 60, hash: 'd5d7dc6e:13752' };
+  const batch = { type: 'arcade-replay-inputs', from: 994, through: 1_000, inputs: [[994, 2, 8, 1]] };
+
+  it('an epoch tag is a few lowercase letters and digits, or none yet', () => {
+    for (const ok of ['', 'e0', 'k3x9', 'a'.repeat(16)]) expect(isEpochTag(ok)).toBe(true);
+    for (const bad of ['E0', 'e-1', 'a'.repeat(17), ' e0', 7, null, undefined, {}]) expect(isEpochTag(bad)).toBe(false);
+  });
+
+  it('a peer\'s batches, hashes, save states and status carry their epoch\'s tag; no other role posts one', () => {
+    expect(frameMessage({ ...hash, nonce: 'e3' }, 'peer')).toEqual({ type: 'arcade-replay-hash', hash: { frame: 60, hash: 'd5d7dc6e:13752' }, nonce: 'e3' });
+    expect(frameMessage({ ...batch, nonce: 'e3' }, 'peer')).toMatchObject({ type: 'arcade-replay-inputs', nonce: 'e3' });
+    const snap = frameMessage({ type: 'arcade-replay-snapshot', nonce: 'e3', frame: 9, state: new Uint8Array([1, 2, 3]), held: [], hash: 'a:3' }, 'peer');
+    expect(snap).toMatchObject({ type: 'arcade-replay-snapshot', nonce: 'e3' });
+    expect(frameMessage({ type: 'arcade-replay-status', phase: 'lockstep', nonce: 'e3', frame: 61 }, 'peer'))
+      .toEqual({ type: 'arcade-replay-status', status: { phase: 'lockstep', nonce: 'e3', frame: 61 } });
+    // Untagged, as before its first epoch: read as it is.
+    expect(frameMessage(hash, 'peer')).toEqual({ type: 'arcade-replay-hash', hash: { frame: 60, hash: 'd5d7dc6e:13752' } });
+    // A tag out of shape, or from a role that has no epochs: out of turn.
+    expect(frameMessage({ ...hash, nonce: 'E3' }, 'peer')).toBeNull();
+    expect(frameMessage({ ...hash, nonce: 'x'.repeat(17) }, 'peer')).toBeNull();
+    expect(frameMessage({ ...hash, nonce: 3 }, 'peer')).toBeNull();
+    expect(frameMessage({ ...hash, nonce: 'e3' }, 'source')).toBeNull();
+    expect(frameMessage({ ...hash, nonce: 'e3' }, 'follower')).toBeNull();
+    expect(readReplayStatus({ phase: 'lockstep', nonce: '<b>' })).toBeNull();
+  });
+
+  it('asks a frame for a save state only where one is owed: a source on request, a peer beginning with others', () => {
+    const peer = { role: 'peer', seat: 1, seats: 4 } as const;
+    expect(asksForSnapshot({ type: 'arcade-replay-want-snapshot' }, { role: 'source' })).toBe(true);
+    expect(asksForSnapshot({ type: 'arcade-replay-want-snapshot' }, { role: 'follower' })).toBe(false);
+    expect(asksForSnapshot({ type: 'arcade-replay-want-snapshot' }, peer)).toBe(false);
+    // Any seat may begin an epoch; alone it just plays, and posts no state.
+    expect(asksForSnapshot({ type: 'arcade-replay-begin', nonce: 'e1', seats: [0, 1, 3] }, peer)).toBe(true);
+    expect(asksForSnapshot({ type: 'arcade-replay-begin', nonce: 'e1', seats: [1] }, peer)).toBe(false);
+    expect(asksForSnapshot({ type: 'arcade-replay-begin', nonce: 'e1', seats: [0, 1] }, { role: 'source' })).toBe(false);
+    expect(asksForSnapshot({ type: 'arcade-replay-begin', nonce: 'e1' }, peer)).toBe(false);
+    // The page relaying another seat's state or buttons asks nothing back.
+    expect(asksForSnapshot({ type: 'arcade-replay-snapshot', nonce: 'e1', seats: [0, 1] }, peer)).toBe(false);
+    expect(asksForSnapshot({ type: 'arcade-replay-inputs', nonce: 'e1', seat: 0 }, peer)).toBe(false);
+    expect(SNAPSHOT_ASKS_MAX).toBeGreaterThanOrEqual(2);
   });
 });

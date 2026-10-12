@@ -6,10 +6,13 @@
  * SEAT of the same game (role 'peer', public/arcade/frame.html): every seat
  * runs the game, plays its own player's buttons a fixed `delay` frames late,
  * and runs a frame only once every other seat's buttons for it are in hand.
- * Seat 0 starts the game; once every seat has started, it saves its state
- * and the others load it, and lockstep begins at that frame. This page
- * stands in for the mesh between them: each batch is packed to the wire
- * format and unpacked again, per link, optionally late and jittered.
+ * Every seat starts held; once every seat has started, seat 0 begins an
+ * EPOCH — saves its state, which the others load — and lockstep begins at
+ * that frame. With `reepoch`, every that many seconds the next seat in turn
+ * begins a new epoch from where the game stands, the others loading it
+ * again (what the room does when a player comes or goes). This page stands
+ * in for the mesh between them: each batch is packed to the wire format and
+ * unpacked again, per link, optionally late and jittered.
  *
  * What it measures: whether every seat's state hashes agree frame for frame
  * (the LockstepLedger), how often a seat had to hold a frame for another's
@@ -18,8 +21,8 @@
  *
  * Query parameters (all optional): seats (4), delay (frames; 8), latency
  * and jitter (ms, one way per link; 0), batchFrames (3), hashEvery (60),
- * bot (0 turns the random presses off), seed, core (nes), rom
- * (/emulatorjs/roms/lj65.nes). Seats, delay, batchFrames and hashEvery
+ * reepoch (seconds between epochs; 0, never), bot (0 turns the random
+ * presses off), seed, core (nes), rom (/emulatorjs/roms/lj65.nes). Seats, delay, batchFrames and hashEvery
  * are whole numbers, clamped to seats 1–4, delay 1–600, batchFrames
  * 1–600 and hashEvery 10–3600 (a hash every frame or two, beside a batch
  * every frame, would pass a seat's message budget): the seats run with,
@@ -50,6 +53,7 @@ const latencyMs = num('latency', 0);
 const jitterMs = num('jitter', 0);
 const batchFrames = int('batchFrames', 3, 1, 600);
 const hashEvery = int('hashEvery', 60, 10, 3600);
+const reepochSeconds = Math.max(0, num('reepoch', 0));
 const botOn = q.get('bot') !== '0';
 const core = (q.get('core') ?? 'nes') as ArcadeCore;
 const romUrl = q.get('rom') ?? '/emulatorjs/roms/lj65.nes';
@@ -79,11 +83,17 @@ interface SeatStats {
 }
 
 const ledger = new LockstepLedger(seats);
+/** Hashes are compared per epoch: a seat that ran past where the next
+ *  epoch began runs those frames again from its state. */
+const EPOCH_FRAMES = 1e9;
 const stats = {
   startedAt: 0,
   lockstepAt: 0,
   /** The frame lockstep began at (seat 0's save state). */
   lockFrame: 0,
+  /** Epochs begun, and the seats that began them. */
+  epochs: [] as Array<{ nonce: string; anchor: number; frame: number }>,
+  reepochSeconds,
   seats,
   delay,
   latencyMs,
@@ -104,22 +114,37 @@ const stats = {
 let gapFrom = 0;
 
 const frames: Array<EmulatorHandle | null> = Array.from({ length: seats }, () => null);
-/** One reassembler per link (from → to): batches back in frame order,
- *  from the frame lockstep begins at (seat 0's save state). */
-const links = Array.from({ length: seats }, () => Array.from({ length: seats }, () => new ReplayReassembler()));
+const allSeats = Array.from({ length: seats }, (_, k) => k);
+/** One reassembler per link (from → to) for the epoch running: batches
+ *  back in frame order, from the frame it began at. */
+const freshLinks = () => Array.from({ length: seats }, () => Array.from({ length: seats }, () => new ReplayReassembler()));
+let links = freshLinks();
+
+/** The epoch running: its tag, its number, and the seat that began it. */
+let epoch = { nonce: '', index: 0, anchor: 0 };
 
 function forward(from: number, to: number, batches: ReplayBatch[]): void {
-  for (const b of batches) frames[to]?.send({ type: 'arcade-replay-inputs', seat: from, from: b.from, through: b.through, inputs: batchRows(b) });
+  const nonce = epoch.nonce;
+  for (const b of batches) frames[to]?.send({ type: 'arcade-replay-inputs', nonce, seat: from, from: b.from, through: b.through, inputs: batchRows(b) });
 }
 
-/** Seat 0's save state, where lockstep began. Every seat waits for every
- *  other, so a seat whose load never landed can still start from it. */
+/** The save state the epoch began from. Every seat waits for every other,
+ *  so a seat whose load never landed can still start from it. */
 let begun: ReplaySnapshot | null = null;
 function sendBegun(to: number): void {
   const s = begun;
   if (!s) return;
   const state = s.state.slice();
-  deliver(() => frames[to]?.send({ type: 'arcade-replay-snapshot', frame: s.frame, state, held: s.held, hash: s.hash }, [state.buffer]));
+  const nonce = epoch.nonce;
+  deliver(() => frames[to]?.send({ type: 'arcade-replay-snapshot', nonce, seats: allSeats, frame: s.frame, state, held: s.held, hash: s.hash }, [state.buffer]));
+}
+
+/** Begin an epoch at `anchor`: its frame saves its state where it stands. */
+function beginEpoch(anchor: number): void {
+  epoch = { nonce: `e${epoch.index + 1}`, index: epoch.index + 1, anchor };
+  links = freshLinks();
+  begun = null;
+  frames[anchor]?.send({ type: 'arcade-replay-begin', nonce: epoch.nonce, seats: allSeats });
 }
 
 function deliver(fn: () => void): void {
@@ -142,42 +167,53 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       me.started = true;
       if (seat === 0) stats.startedAt = performance.now();
       if (botOn) startBot(seat);
-      // Every seat in: seat 0 saves its state, and lockstep begins there.
+      // Every seat in: seat 0 begins the first epoch, and lockstep begins there.
       if (stats.perSeat.every((s) => s.started)) {
         if (!gapFrom) gapFrom = performance.now();
-        frames[0]?.send({ type: 'arcade-replay-begin' });
+        beginEpoch(0);
+        if (reepochSeconds > 0) {
+          window.setInterval(() => beginEpoch((epoch.anchor + 1) % seats), reepochSeconds * 1000);
+        }
       }
       break;
     case 'replay-inputs': {
+      // A batch of an epoch since replaced is nobody's now.
+      if (ev.nonce !== epoch.nonce) break;
       const bytes = packInputBatch(ev.batch);
       me.batches += 1;
       me.inputs += ev.batch.inputs.length;
       me.wireBytes += bytes.byteLength;
       for (let to = 0; to < seats; to++) {
         if (to === seat) continue;
+        const nonce = epoch.nonce;
         deliver(() => {
           const batch = unpackInputBatch(bytes);
-          if (!batch) return;
+          if (!batch || nonce !== epoch.nonce) return;
           forward(seat, to, links[seat]![to]!.push(batch));
         });
       }
       break;
     }
     case 'replay-snapshot': {
+      if (ev.nonce !== epoch.nonce || seat !== epoch.anchor) break;
       const s = ev.snapshot;
-      stats.lockstepAt = performance.now();
-      stats.lockFrame = s.frame;
+      if (!stats.lockstepAt) stats.lockstepAt = performance.now();
+      if (!stats.lockFrame) stats.lockFrame = s.frame;
       stats.snapshotBytes = s.state.byteLength;
+      stats.epochs.push({ nonce: epoch.nonce, anchor: seat, frame: s.frame });
       // Every seat's batches start at this frame.
       for (let from = 0; from < seats; from++) {
         for (let to = 0; to < seats; to++) if (to !== from) forward(from, to, links[from]![to]!.start(s.frame));
       }
       begun = s;
-      for (let to = 1; to < seats; to++) sendBegun(to);
+      for (let to = 0; to < seats; to++) if (to !== seat) sendBegun(to);
       break;
     }
     case 'replay-hash': {
-      if (ledger.record(seat, ev.hash.frame, ev.hash.hash) !== null) {
+      // Compared within an epoch (EPOCH_FRAMES): a seat that ran past where
+      // the next one began runs those frames again, on other buttons.
+      if (ev.nonce !== epoch.nonce) break;
+      if (ledger.record(seat, epoch.index * EPOCH_FRAMES + ev.hash.frame, ev.hash.hash) !== null) {
         const now = performance.now();
         stats.longestGapMs = Math.max(stats.longestGapMs, now - (gapFrom || now));
         gapFrom = now;
@@ -189,7 +225,7 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       if (st.phase === 'unsupported') stats.errors.push(`seat ${seat}: cannot replay (no save states)`);
       if (st.loaded !== undefined) stats.loads.push({ seat, frame: st.loaded, matches: st.matches, tries: st.tries });
       // A load that never landed: the seat holds; hand it the save state again.
-      if (st.loaded !== undefined && st.matches === false) sendBegun(seat);
+      if (st.loaded !== undefined && st.matches === false && st.nonce === epoch.nonce) sendBegun(seat);
       me.status = st;
       break;
     }
@@ -229,7 +265,7 @@ function startBot(seat: number): void {
 async function mountSeat(seat: number, game: Blob): Promise<void> {
   const pane = document.createElement('div');
   pane.className = 'pane';
-  pane.innerHTML = `<p>SEAT ${seat + 1}${seat === 0 ? ' (starts the game)' : ''}</p><div class="screen"></div>`;
+  pane.innerHTML = `<p>SEAT ${seat + 1}${seat === 0 ? ' (begins the first epoch)' : ''}</p><div class="screen"></div>`;
   document.getElementById('seats')!.append(pane);
   frames[seat] = mountEmulatorFrame(pane.querySelector('.screen') as HTMLElement, {
     core,
@@ -247,7 +283,7 @@ function render(): void {
   const d = ledger.read();
   const elapsed = stats.startedAt ? (performance.now() - stats.startedAt) / 1000 : 0;
   const lines = [
-    `elapsed ${elapsed.toFixed(0)} s · ${seats} seats · delay ${delay} frames · latency ${latencyMs} ± ${jitterMs} ms`,
+    `elapsed ${elapsed.toFixed(0)} s · ${seats} seats · delay ${delay} frames · latency ${latencyMs} ± ${jitterMs} ms · epoch ${epoch.index} (seat ${epoch.anchor + 1})`,
     `hashes compared ${d.compared} · matched ${d.matched} · mismatched ${d.mismatched}${d.firstMismatch !== null ? ` (first at frame ${d.firstMismatch})` : ''}`,
     ...stats.perSeat.map((p, i) => `seat ${i + 1}: ${p.status?.phase ?? '—'} @ ${p.status?.frame ?? '—'} · stalls ${p.status?.stalls ?? 0} · frames held ${p.status?.waits ?? 0} · ${p.inputs} inputs in ${p.batches} batches`),
     stats.errors.length ? `errors: ${stats.errors.join('; ')}` : '',

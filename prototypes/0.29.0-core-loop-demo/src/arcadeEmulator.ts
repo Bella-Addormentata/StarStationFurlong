@@ -169,7 +169,8 @@ export interface EmulatorReplayConfig {
   /** The source posts a batch every this many frames (6); a peer posts one
    *  at least this often, and at once with any buttons in it. */
   batchFrames?: number;
-  /** A peer's seat, 0–3 (seat 0 starts the game), and how many seats. */
+  /** A peer's seat, 0–3, and how many seats the cabinet has. Whichever
+   *  seat the page names begins an epoch (arcadeLockstep.ts). */
   seat?: number;
   seats?: number;
   /** A peer's input delay: its player's buttons land this many frames
@@ -181,6 +182,8 @@ export interface EmulatorReplayConfig {
 /** A follower's report of where it stands. */
 export interface ReplayStatus {
   phase: 'waiting' | 'loading' | 'stalled' | 'running' | 'free' | 'lockstep' | 'unsupported';
+  /** A lockstep peer's epoch (arcadeLockstep.ts), '' before its first. */
+  nonce?: string;
   /** The source frame the follower's state is at. */
   frame?: number;
   /** The latest `through` it holds. */
@@ -248,9 +251,10 @@ export type EmulatorEvent =
   | { type: 'started' }
   | { type: 'exit' }
   | { type: 'error'; why: string }
-  | { type: 'replay-inputs'; batch: ReplayBatch }
-  | { type: 'replay-hash'; hash: ReplayHash }
-  | { type: 'replay-snapshot'; snapshot: ReplaySnapshot }
+  /** `nonce`: a lockstep peer's epoch (arcadeLockstep.ts); a source posts none. */
+  | { type: 'replay-inputs'; batch: ReplayBatch; nonce?: string }
+  | { type: 'replay-hash'; hash: ReplayHash; nonce?: string }
+  | { type: 'replay-snapshot'; snapshot: ReplaySnapshot; nonce?: string }
   | { type: 'replay-status'; status: ReplayStatus };
 
 /** What the frame may say, and how much. The frame is attacker-controlled
@@ -271,6 +275,8 @@ export const FRAME_MESSAGE_BUDGET = 20;
  *  status each second and the messages of its start and its load. */
 export const FRAME_MESSAGE_BUDGET_LOCKSTEP = 80;
 export const FRAME_MESSAGE_WINDOW_MS = 1_000;
+/** Save states the page may have asked a frame for and not yet had. */
+export const SNAPSHOT_ASKS_MAX = 4;
 export const FRAME_STRING_MAX = 256;
 
 export type FrameMessage =
@@ -279,9 +285,9 @@ export type FrameMessage =
   | { type: 'arcade-started' }
   | { type: 'arcade-exit' }
   | { type: 'arcade-error'; why: string }
-  | { type: 'arcade-replay-inputs'; batch: ReplayBatch }
-  | { type: 'arcade-replay-hash'; hash: ReplayHash }
-  | { type: 'arcade-replay-snapshot'; snapshot: ReplaySnapshot }
+  | { type: 'arcade-replay-inputs'; batch: ReplayBatch; nonce?: string }
+  | { type: 'arcade-replay-hash'; hash: ReplayHash; nonce?: string }
+  | { type: 'arcade-replay-snapshot'; snapshot: ReplaySnapshot; nonce?: string }
   | { type: 'arcade-replay-status'; status: ReplayStatus };
 
 const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
@@ -290,17 +296,17 @@ const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
   'arcade-started': ['type'],
   'arcade-exit': ['type'],
   'arcade-error': ['type', 'why'],
-  'arcade-replay-inputs': ['type', 'from', 'through', 'inputs'],
-  'arcade-replay-hash': ['type', 'frame', 'hash'],
-  'arcade-replay-snapshot': ['type', 'frame', 'state', 'held', 'hash'],
-  'arcade-replay-status': ['type', 'phase', 'frame', 'through', 'loaded', 'hash', 'matches', 'tries', 'stalls', 'waits', 'iters'],
+  'arcade-replay-inputs': ['type', 'nonce', 'from', 'through', 'inputs'],
+  'arcade-replay-hash': ['type', 'nonce', 'frame', 'hash'],
+  'arcade-replay-snapshot': ['type', 'nonce', 'frame', 'state', 'held', 'hash'],
+  'arcade-replay-status': ['type', 'nonce', 'phase', 'frame', 'through', 'loaded', 'hash', 'matches', 'tries', 'stalls', 'waits', 'iters'],
 };
 
 /** The replay kinds a frame may post, by the role its config gave it
  *  (arcadeReplay.ts): player one's frame its batches, hashes and save
  *  states; a spectator's its hashes and where it stands; a lockstep peer's
- *  all of them (seat 0's save state starts the game for the others); any
- *  that it cannot replay at all. A frame given no role posts none: from it, or
+ *  all of them (the save state of the seat that begins an epoch starts it
+ *  for the others); any that it cannot replay at all. A frame given no role posts none: from it, or
  *  from the other role, a replay kind is a message no game sends. */
 const REPLAY_KINDS: Record<EmulatorReplayConfig['role'], ReadonlySet<string>> = {
   source: new Set(['arcade-replay-inputs', 'arcade-replay-hash', 'arcade-replay-snapshot', 'arcade-replay-status']),
@@ -323,6 +329,10 @@ export function frameMessage(data: unknown, replay?: EmulatorReplayConfig['role'
   const keys = FRAME_MESSAGE_KEYS[kind];
   for (const k of Object.keys(d)) if (!keys.includes(k)) return null;
   if (kind.startsWith('arcade-replay-') && !(replay && REPLAY_KINDS[replay].has(kind))) return null;
+  // A lockstep peer's epoch tag: only a peer posts one, and only a short
+  // one (the page's own, echoed: arcadeLockstep.ts).
+  if (d.nonce !== undefined && (replay !== 'peer' || !isEpochTag(d.nonce))) return null;
+  const tagged = d.nonce !== undefined ? { nonce: d.nonce as string } : {};
   switch (kind) {
     case 'arcade-error': {
       const why = d.why;
@@ -331,15 +341,15 @@ export function frameMessage(data: unknown, replay?: EmulatorReplayConfig['role'
     }
     case 'arcade-replay-inputs': {
       const batch = readFrameBatch(d);
-      return batch ? { type: kind, batch } : null;
+      return batch ? { type: kind, batch, ...tagged } : null;
     }
     case 'arcade-replay-hash': {
       const hash = readFrameHash(d);
-      return hash ? { type: kind, hash } : null;
+      return hash ? { type: kind, hash, ...tagged } : null;
     }
     case 'arcade-replay-snapshot': {
       const snapshot = readFrameSnapshot(d);
-      return snapshot ? { type: kind, snapshot } : null;
+      return snapshot ? { type: kind, snapshot, ...tagged } : null;
     }
     case 'arcade-replay-status': {
       const status = readReplayStatus(d);
@@ -348,6 +358,22 @@ export function frameMessage(data: unknown, replay?: EmulatorReplayConfig['role'
     default:
       return { type: kind };
   }
+}
+
+/** An epoch's tag as the page writes it (arcadeLockstep.ts): a few lower-
+ *  case letters and digits. The empty tag is a peer's before its first. */
+export function isEpochTag(v: unknown): v is string {
+  return typeof v === 'string' && /^[0-9a-z]{0,16}$/.test(v);
+}
+
+/** Whether a message from the page asks its frame for a save state: a
+ *  source's on request, and a peer's when the page has it begin an epoch
+ *  with other seats in it (alone, it just plays). A save state is the one
+ *  large message a frame may post, and only in answer to one of these. */
+export function asksForSnapshot(message: Record<string, unknown>, replay?: EmulatorReplayConfig): boolean {
+  if (message.type === 'arcade-replay-want-snapshot') return replay?.role === 'source';
+  if (message.type === 'arcade-replay-begin') return replay?.role === 'peer' && Array.isArray(message.seats) && message.seats.length > 1;
+  return false;
 }
 
 /** Messages a second from one frame, counted on every message it posts,
@@ -427,6 +453,10 @@ export function readReplayStatus(data: unknown): ReplayStatus | null {
   const d = data as Record<string, unknown>;
   if (typeof d.phase !== 'string' || !REPLAY_PHASES.has(d.phase)) return null;
   const out: ReplayStatus = { phase: d.phase as ReplayStatus['phase'] };
+  if (d.nonce !== undefined) {
+    if (!isEpochTag(d.nonce)) return null;
+    out.nonce = d.nonce;
+  }
   const int = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= -1 && v <= 0xffff_ffff;
   for (const k of ['frame', 'through', 'loaded'] as const) {
     if (d[k] === undefined) continue;
@@ -491,7 +521,9 @@ export function mountEmulatorFrame(
   let silenced = false;
   let readySeen = false;
   let startedSeen = false;
-  let snapshotWanted = false;
+  /** Save states the page has asked for and not yet had (a few at most:
+   *  asks the frame folds into one leave one or two over, never more). */
+  let snapshotsWanted = 0;
   const onMessage = (e: MessageEvent) => {
     if (!alive || silenced || !frame || e.source !== frame.contentWindow) return;
     if (!budget.take(performance.now())) {
@@ -501,14 +533,14 @@ export function mountEmulatorFrame(
     }
     const m = frameMessage(e.data, config.replay?.role);
     // A save state is the one large message a frame may post, so only in
-    // answer to the page's request (send, `arcade-replay-want-snapshot`):
-    // one it was not asked for is out of turn.
-    if (!m || (m.type === 'arcade-replay-snapshot' && !snapshotWanted) || !peerOwnSeat(m, config.replay)) {
+    // answer to the page's ask (send, asksForSnapshot): one it was not
+    // asked for is out of turn.
+    if (!m || (m.type === 'arcade-replay-snapshot' && snapshotsWanted === 0) || !peerOwnSeat(m, config.replay)) {
       silenced = true;
       onEvent({ type: 'error', why: 'malformed' });
       return;
     }
-    if (m.type === 'arcade-replay-snapshot') snapshotWanted = false;
+    if (m.type === 'arcade-replay-snapshot') snapshotsWanted -= 1;
     switch (m.type) {
       case 'arcade-frame-ready':
         if (configured) return;
@@ -539,9 +571,9 @@ export function mountEmulatorFrame(
       case 'arcade-started': if (!startedSeen) { startedSeen = true; onEvent({ type: 'started' }); } break;
       case 'arcade-exit': onEvent({ type: 'exit' }); break;
       case 'arcade-error': onEvent({ type: 'error', why: m.why }); break;
-      case 'arcade-replay-inputs': onEvent({ type: 'replay-inputs', batch: m.batch }); break;
-      case 'arcade-replay-hash': onEvent({ type: 'replay-hash', hash: m.hash }); break;
-      case 'arcade-replay-snapshot': onEvent({ type: 'replay-snapshot', snapshot: m.snapshot }); break;
+      case 'arcade-replay-inputs': onEvent({ type: 'replay-inputs', batch: m.batch, ...(m.nonce !== undefined ? { nonce: m.nonce } : {}) }); break;
+      case 'arcade-replay-hash': onEvent({ type: 'replay-hash', hash: m.hash, ...(m.nonce !== undefined ? { nonce: m.nonce } : {}) }); break;
+      case 'arcade-replay-snapshot': onEvent({ type: 'replay-snapshot', snapshot: m.snapshot, ...(m.nonce !== undefined ? { nonce: m.nonce } : {}) }); break;
       case 'arcade-replay-status': onEvent({ type: 'replay-status', status: m.status }); break;
       default: break;
     }
@@ -637,8 +669,7 @@ export function mountEmulatorFrame(
     },
     send(message, transfer = []) {
       if (!alive || !configured) return;
-      if (message.type === 'arcade-replay-want-snapshot' && config.replay?.role === 'source') snapshotWanted = true;
-      if (message.type === 'arcade-replay-begin' && config.replay?.role === 'peer' && config.replay.seat === 0) snapshotWanted = true;
+      if (asksForSnapshot(message, config.replay)) snapshotsWanted = Math.min(SNAPSHOT_ASKS_MAX, snapshotsWanted + 1);
       frame?.contentWindow?.postMessage(message, target, transfer);
     },
     destroy() {

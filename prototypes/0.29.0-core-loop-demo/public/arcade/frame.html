@@ -53,6 +53,17 @@
       page → follower  the source's inputs and snapshot messages, relayed
       follower → page  { type: 'arcade-replay-hash', frame, hash }
                        { type: 'arcade-replay-status', phase, frame, through, loaded?, hash?, matches? }
+    Lockstep (the four-player cabinet, src/arcadeLockstep.ts), when the
+    config's `replay` is 'peer': one seat (replaySeat) of up to four
+    (replaySeats), its own buttons played replayDelay frames late. Every
+    message of an epoch carries its tag (`nonce`):
+      page → peer  { type: 'arcade-replay-begin', nonce, seats }   begin one here
+                   { type: 'arcade-replay-snapshot', nonce, seats, frame, state, held, hash }   join one
+                   { type: 'arcade-replay-inputs', nonce, seat, from, through, inputs }   another seat's
+      peer → page  { type: 'arcade-replay-inputs', nonce, from, through, inputs }   its own seat's
+                   { type: 'arcade-replay-snapshot', nonce, frame, state, held, hash }   on a begin with others
+                   { type: 'arcade-replay-hash', nonce, frame, hash }
+                   { type: 'arcade-replay-status', nonce, phase, frame, through, stalls, waits, iters, loaded?, hash?, matches?, tries? }
     EmulatorJS itself (GPL-3.0) is NOT in this repository: pathToData names
     this station's /emulatorjs/data/ (scripts/fetch-emulatorjs.mjs) or
     cdn.emulatorjs.org, the owner's call per cabinet — the CDN only in a
@@ -162,8 +173,10 @@
       // script defines and EmulatorJS calls), not onto the Module after.
       // A pre-hook returning false skips that iteration whole: the core does
       // not run and the frame counter does not move. One iteration runs one
-      // frame; a save state loaded between iterations lands in the next one,
-      // which then runs no frame of its own (both measured on fceumm).
+      // frame; a save state loaded between iterations is in place by the
+      // next one's pre-hook, and that iteration may run no frame of its own
+      // though the counter moves on — always, on an emulator held since it
+      // started; sometimes, on a running one (all measured on fceumm).
       var hooks = { pre: null, post: null };
       function hookMainLoop() {
         var factory = null;
@@ -277,10 +290,19 @@
           // frames ahead — the frame counter now plus delay — and posted in
           // batches like a source's. A frame runs only once every OTHER
           // seat's batches cover it, so every peer applies the same buttons
-          // at the same frames, in seat order, and hashes alike. Seat 0
-          // starts the game alone ('free'), and on the page's word
-          // (`arcade-replay-begin`) saves its state and enters lockstep at
-          // that frame; the other seats load that save state and join there.
+          // at the same frames, in seat order, and hashes alike.
+          //
+          // A game in step is an EPOCH: a save state, the seats that start
+          // from it, and a tag (`nonce`) every message of it carries. Every
+          // seat starts held ('waiting'). The page names one seat to begin
+          // (`arcade-replay-begin` with the epoch's tag and seats): alone,
+          // it plays at once ('free'); with others, it saves its state,
+          // posts it, and holds at that frame for their buttons. The others
+          // load that state (`arcade-replay-snapshot`) and join there. A
+          // seat that comes or goes, or a hash that disagrees, is a new
+          // epoch from whichever seat the page names — from any phase, so
+          // a game in step re-begins where it stands and the seats load it
+          // again. Nothing of an older epoch counts in a newer one.
           var seat = c.replaySeat | 0;
           var seats = c.replaySeats | 0;
           var delay = c.replayDelay >= 1 ? c.replayDelay | 0 : 8;
@@ -288,13 +310,17 @@
             post('arcade-replay-status', { phase: 'unsupported' });
             return;
           }
-          var queue = {};
-          var thru = [];
-          for (var n = 0; n < seats; n++) thru.push(-1);
-          var phase = seat === 0 ? 'free' : 'waiting';
-          ownGame = seat === 0;
-          var offset = 0;
+          var phase = 'waiting';
+          ownGame = false;
+          // The epoch: its tag, its seats (ascending), the frame it starts at.
+          var nonce = '';
+          var active = [];
           var start = 0;
+          // Buttons by frame, then by seat; and how far each other seat's
+          // batches reach.
+          var queue = {};
+          var thru = {};
+          var offset = 0;
           var snap = null;
           var loadTries = 0;
           var LOAD_RETRY = 8;
@@ -304,8 +330,11 @@
           var pending = [];
           var nextFrom = 0;
           var lastBatch = 0;
-          var wantBegin = false;
-          var held = {};
+          var wantBegin = null;
+          // Whether a load has landed and no frame is yet seen run on it.
+          var settling = false;
+          // What feed has applied and holds down now, every seat's, with its
+          // value: an epoch's save state carries it, as a save state cannot.
           var down = {};
           // How the lockstep went: times it had to wait, and the iterations
           // it waited (a frame skipped is a stutter on screen).
@@ -313,22 +342,43 @@
           var waits = 0;
           var iters = 0;
           function feed(p, i, v) {
-            if (v !== 0) down[p + ':' + i] = [p, i];
+            if (v !== 0) down[p + ':' + i] = [p, i, v];
             else delete down[p + ':' + i];
             applying = true;
             try { apply(p, i, v); } finally { applying = false; }
           }
           function at() { return gm.getFrameNum() + offset; }
+          function inEpoch(k) { return active.indexOf(k) >= 0; }
           function enqueue(k, row) {
             var f = row[0];
             if (f < start) return;
-            var bySeat = queue[f] || (queue[f] = []);
+            var bySeat = queue[f] || (queue[f] = {});
             (bySeat[k] || (bySeat[k] = [])).push([row[1], row[2], row[3]]);
           }
-          function status() {
+          function status(extra) {
             var others = Infinity;
-            for (var k = 0; k < seats; k++) if (k !== seat && thru[k] < others) others = thru[k];
-            post('arcade-replay-status', { phase: phase, frame: at(), through: others === Infinity ? -1 : others, stalls: stalls, waits: waits, iters: iters });
+            for (var n = 0; n < active.length; n++) {
+              var k = active[n];
+              if (k !== seat && thru[k] < others) others = thru[k];
+            }
+            var m = { nonce: nonce, phase: phase, frame: at(), through: others === Infinity ? -1 : others, stalls: stalls, waits: waits, iters: iters };
+            if (extra) for (var x in extra) m[x] = extra[x];
+            post('arcade-replay-status', m);
+          }
+          // A new epoch from `from`: nothing of the last one carries over —
+          // its buttons, the batches heard, this seat's own unsent presses.
+          function enter(tag, seatList, from) {
+            nonce = tag;
+            active = seatList.slice();
+            start = from;
+            queue = {};
+            thru = {};
+            for (var n = 0; n < active.length; n++) thru[active[n]] = from - 1;
+            pending = [];
+            nextFrom = from;
+            lastBatch = from;
+            lastAt = {};
+            settling = false;
           }
           // Everything stamped at or before now + delay - 1 is final: a
           // button pressed from here on lands at now + delay or later. A
@@ -341,10 +391,37 @@
             var out = [];
             var keep = [];
             for (var r = 0; r < pending.length; r++) (pending[r][0] <= through ? out : keep).push(pending[r]);
-            post('arcade-replay-inputs', { from: nextFrom, through: through, inputs: out });
+            post('arcade-replay-inputs', { nonce: nonce, from: nextFrom, through: through, inputs: out });
             pending = keep;
             nextFrom = through + 1;
             lastBatch = at();
+          }
+          // The page's word to begin an epoch here, between two frames (the
+          // pre-hook runs in every phase but a load's, so a held seat can
+          // begin too): alone, the game is this seat's to play at once;
+          // with others, the state now is every seat's start.
+          function begin() {
+            var b = wantBegin;
+            wantBegin = null;
+            // A seat the epoch leaves out lets go of what it held: nobody
+            // will send its release.
+            for (var dk in down) if (b.seats.indexOf(down[dk][0]) < 0) feed(down[dk][0], down[dk][1], 0);
+            if (b.seats.length < 2) {
+              enter(b.nonce, [seat], at());
+              phase = 'free';
+              ownGame = true;
+              status();
+              return;
+            }
+            var st = stateNow();
+            if (!st) return;
+            var heldRows = [];
+            for (var hk in down) heldRows.push(down[hk]);
+            enter(b.nonce, b.seats, at());
+            phase = 'lockstep';
+            ownGame = false;
+            pageWin.postMessage({ type: 'arcade-replay-snapshot', nonce: nonce, frame: start, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
+            status();
           }
           // The frame each button last changed at. A press and a release
           // that would land on one frame (both made while this seat held a
@@ -353,16 +430,13 @@
           // such care: where it ends up is what counts.
           var lastAt = {};
           // The local player's buttons: player one's controls, played as
-          // this seat. Before lockstep, seat 0 plays at once (the game is
-          // its alone); a joining seat's buttons go nowhere until it is in.
+          // this seat. Alone ('free') they play at once; in step they are
+          // stamped ahead; held or loading, they go nowhere.
           gm.functions.simulateInput = function (p, i, v) {
             v = v | 0; // a stick's fraction, as the core takes it (as the source's)
             if (applying) return apply(p, i, v);
             if (p !== 0) return;
-            if (phase === 'free') {
-              held[seat + ':' + i] = [seat, i, v];
-              return feed(seat, i, v);
-            }
+            if (phase === 'free') return feed(seat, i, v);
             if (phase !== 'lockstep' && phase !== 'stalled') return;
             var f = at() + delay;
             if (i < 16) {
@@ -373,25 +447,59 @@
             pending.push(row);
             enqueue(seat, row);
           };
+          // A load has landed when the state is the one the epoch began
+          // from: this seat is at the epoch's start, holding what it held.
+          function land(h) {
+            offset = snap.frame - gm.getFrameNum();
+            // Let go of what the epoch does not hold, then hold what it
+            // does: this seat's own buttons from a game alone included.
+            for (var d in down) if (!snap.held.some(function (r) { return r[0] + ':' + r[1] === d; })) feed(down[d][0], down[d][1], 0);
+            for (var q = 0; q < snap.held.length; q++) feed(snap.held[q][0], snap.held[q][1], snap.held[q][2]);
+            // The epoch began when its state came (snapshot, below), so the
+            // batches heard while it loaded are its own and stay.
+            nextFrom = start;
+            lastBatch = start;
+            pending = [];
+            lastAt = {};
+            phase = 'stalled';
+            settling = true;
+            status({ loaded: snap.frame, hash: h, matches: true, tries: loadTries });
+          }
           hooks.pre = function () {
-            if (phase === 'free' || phase === 'loading') return undefined;
+            // A load in a running emulator is in place by the next pre-hook,
+            // and the iteration would run a frame on top of it before the
+            // post-hook could tell (measured on fceumm): so it is looked for
+            // here first, and a load found here starts the epoch before any
+            // frame runs. The post-hook looks too, for one that lands later.
+            if (phase === 'loading') {
+              var cur = stateNow();
+              if (!cur) return false;
+              var h = stateHash(cur);
+              if (h !== snap.hash) return undefined;
+              land(h);
+            }
+            if (wantBegin) begin();
+            if (phase === 'free') return undefined;
             if (phase === 'waiting') return false;
             iters += 1;
             var s = at();
             // Frame s + 1 runs next: every other seat's buttons through s
             // must be in hand. This seat's own are, by construction.
-            for (var k = 0; k < seats; k++) {
+            for (var n = 0; n < active.length; n++) {
+              var k = active[n];
               if (k === seat || thru[k] >= s) continue;
               if (phase !== 'stalled') { phase = 'stalled'; stalls += 1; }
               waits += 1;
               flush();
+              var now = Date.now();
+              if (now - lastStatus > 1000) { lastStatus = now; status(); }
               return false;
             }
             phase = 'lockstep';
             var bySeat = queue[s];
             if (bySeat) {
-              for (var k2 = 0; k2 < seats; k2++) {
-                var rows = bySeat[k2];
+              for (var m = 0; m < active.length; m++) {
+                var rows = bySeat[active[m]];
                 if (rows) for (var r = 0; r < rows.length; r++) feed(rows[r][0], rows[r][1], rows[r][2]);
               }
               delete queue[s];
@@ -399,79 +507,97 @@
             return undefined;
           };
           hooks.post = function () {
-            if (phase === 'free') {
-              if (!wantBegin) return;
-              // Lockstep begins here: the state now is every seat's start.
-              wantBegin = false;
-              var st = stateNow();
-              if (!st) return;
-              var heldRows = [];
-              for (var hk in held) if (held[hk][2] !== 0) heldRows.push(held[hk]);
-              start = gm.getFrameNum();
-              nextFrom = start;
-              lastBatch = start;
-              phase = 'lockstep';
-              ownGame = false;
-              pageWin.postMessage({ type: 'arcade-replay-snapshot', frame: start, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
-              status();
-              return;
-            }
             if (phase === 'loading') {
-              // As a spectator's load (above): landed when the state is seat
-              // 0's, asked again every LOAD_RETRY iterations meanwhile, and
-              // after LOAD_TRIES it holds and says the load failed.
+              // As a spectator's load (below): asked again every LOAD_RETRY
+              // iterations until it lands, and after LOAD_TRIES it holds and
+              // says the load failed (the page may hand it the state again).
               loadTries += 1;
               var cur = stateNow();
               if (!cur) return;
               var h = stateHash(cur);
-              if (h !== snap.hash) {
-                if (loadTries < LOAD_TRIES) {
-                  if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
-                  return;
-                }
-                phase = 'waiting';
-                post('arcade-replay-status', { phase: phase, frame: at(), through: -1, loaded: snap.frame, hash: h, matches: false, tries: loadTries });
+              if (h === snap.hash) { land(h); return; }
+              if (loadTries < LOAD_TRIES) {
+                if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
                 return;
               }
-              offset = snap.frame - gm.getFrameNum();
-              start = snap.frame;
-              nextFrom = start;
-              lastBatch = start;
-              for (var d in down) if (!snap.held.some(function (r) { return r[0] + ':' + r[1] === d; })) feed(down[d][0], down[d][1], 0);
-              for (var q = 0; q < snap.held.length; q++) feed(snap.held[q][0], snap.held[q][1], snap.held[q][2]);
-              for (var qf in queue) if (+qf < start) delete queue[qf];
-              phase = 'stalled';
-              post('arcade-replay-status', { phase: phase, frame: at(), through: -1, loaded: snap.frame, hash: h, matches: true, tries: loadTries });
+              phase = 'waiting';
+              status({ loaded: snap.frame, hash: h, matches: false, tries: loadTries });
               return;
+            }
+            var now = Date.now();
+            if (phase === 'free') {
+              if (now - lastStatus > 1000) { lastStatus = now; status(); }
+              return;
+            }
+            if (phase !== 'lockstep' && phase !== 'stalled') return;
+            // The iteration after a load sometimes runs no frame though the
+            // frame counter moves on (always, on an emulator held since it
+            // started): the state is still the epoch's start, and so is
+            // this seat — the start's buttons, fed already, stay held.
+            if (settling) {
+              var still = stateNow();
+              if (!still) return;
+              if (stateHash(still) === snap.hash) offset = start - gm.getFrameNum();
+              else settling = false;
             }
             var s = at();
             if (pending.length || s - lastBatch >= batchFrames) flush();
             if (s % hashEvery === 0) {
               var hashed = stateNow();
               if (!hashed) return;
-              post('arcade-replay-hash', { frame: s, hash: stateHash(hashed) });
+              post('arcade-replay-hash', { nonce: nonce, frame: s, hash: stateHash(hashed) });
             }
-            var now = Date.now();
             if (now - lastStatus > 1000) { lastStatus = now; status(); }
           };
+          // The page's messages carry plain data it checked: a tag, seats
+          // within the cabinet's, frames, rows. A seat list must hold this
+          // seat — an epoch it is not in is not its to begin or join.
+          function seatList(v) {
+            if (!Array.isArray(v) || v.length < 1 || v.length > seats) return null;
+            var out = [];
+            for (var n = 0; n < v.length; n++) {
+              var k = v[n];
+              if (typeof k !== 'number' || (k | 0) !== k || k < 0 || k >= seats || out.indexOf(k) >= 0) return null;
+              out.push(k);
+            }
+            if (out.indexOf(seat) < 0) return null;
+            return out.sort(function (a, b) { return a - b; });
+          }
+          function isTag(v) { return typeof v === 'string' && /^[0-9a-z]{1,16}$/.test(v); }
           replay = {
             role: role,
-            begin: function () { if (seat === 0 && phase === 'free') wantBegin = true; },
+            begin: function (d) {
+              var list = seatList(d.seats);
+              if (!isTag(d.nonce) || !list) return;
+              wantBegin = { nonce: d.nonce, seats: list };
+            },
             press: function (p, i, v) { gm.simulateInput(p, i, v); },
             inputs: function (d) {
               var k = d.seat;
-              if (typeof k !== 'number' || k === seat || !(k >= 0 && k < seats) || typeof d.through !== 'number' || !Array.isArray(d.inputs)) return;
+              if (d.nonce !== nonce || typeof k !== 'number' || k === seat || !inEpoch(k)) return;
+              if (typeof d.from !== 'number' || typeof d.through !== 'number' || !Array.isArray(d.inputs)) return;
+              // Batches must tile: one that starts past what this seat holds
+              // leaves a gap, and waits for one that covers it. What it holds
+              // already is not queued twice.
+              if (d.from > thru[k] + 1) return;
               for (var n = 0; n < d.inputs.length; n++) {
                 var row = d.inputs[n];
-                if (Array.isArray(row) && row[1] === k) enqueue(k, row);
+                if (Array.isArray(row) && row[1] === k && row[0] > thru[k] && row[0] <= d.through) enqueue(k, row);
               }
               if (d.through > thru[k]) thru[k] = d.through;
             },
             snapshot: function (d) {
-              if (seat === 0 || phase !== 'waiting') return;
-              if (!(d.state instanceof Uint8Array) || !Array.isArray(d.held) || typeof d.frame !== 'number') return;
-              snap = d;
+              var list = seatList(d.seats);
+              if (!isTag(d.nonce) || !list) return;
+              if (!(d.state instanceof Uint8Array) || !Array.isArray(d.held) || typeof d.frame !== 'number' || typeof d.hash !== 'string') return;
+              // The epoch this seat is in already, or loading: a second copy
+              // changes nothing — unless the last load failed (held again).
+              if (d.nonce === nonce && phase !== 'waiting') return;
+              wantBegin = null;
+              snap = { frame: d.frame, state: d.state, held: d.held, hash: d.hash };
               loadTries = 0;
+              enter(d.nonce, list, d.frame);
+              ownGame = false;
               gm.loadState(d.state);
               phase = 'loading';
             },
@@ -598,7 +724,7 @@
         } else if (replay.role === 'peer') {
           if (d.type === 'arcade-replay-inputs') replay.inputs(d);
           else if (d.type === 'arcade-replay-snapshot') replay.snapshot(d);
-          else if (d.type === 'arcade-replay-begin') replay.begin();
+          else if (d.type === 'arcade-replay-begin') replay.begin(d);
           else if (d.type === 'arcade-replay-press' && typeof d.player === 'number') replay.press(d.player, d.index, d.value);
         } else {
           if (d.type === 'arcade-replay-inputs') replay.inputs(d);
