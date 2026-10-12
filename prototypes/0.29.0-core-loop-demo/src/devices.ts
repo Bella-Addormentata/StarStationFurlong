@@ -246,6 +246,20 @@ import { readStore as readPlanetStore, subscribePlanetSummary } from './planetSu
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, groupChips } from './chipDisplay';
+import {
+  dishLine,
+  failFaucetRequest,
+  faucetPending,
+  faucetPendingUnanswered,
+  formatMojos,
+  jarLevel,
+  latestFaucetError,
+  latestFaucetStatus,
+  markFaucetPending,
+  subscribeFaucet,
+  type FaucetOp,
+  type FaucetRequestTicket,
+} from './faucetDish';
 
 /** The helm's FUEL gauge: its figure, fill and colour. */
 function fuelGauge(fuel: number, capacity: number): { text: string; pct: number; color: string } {
@@ -275,7 +289,7 @@ function stationFliesFree(stationId: string, now: number): boolean {
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv' | 'arcade';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv' | 'arcade' | 'faucetDish';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -507,6 +521,18 @@ export interface AlligatorsVisualHandle {
   layEgg(bird: number): void;
   /** Per-frame animation (fold ease, bird squats, display flash). */
   update(dt: number): void;
+}
+
+// ── ⛓️🥣 Faucet dish handle (shared with the furniture builder) ──────────────
+
+/**
+ * ⛓️🥣 The faucet dish fixture's live state. World pushes it at ~1 Hz from the
+ * last status the node sent for the room (faucetDish.ts): the jar's fill
+ * LEVEL (0..1, by gift slots — never a total in-room), how many mojos sit in
+ * the dish, and whether a take or give is in flight (the mojo pulses).
+ */
+export interface FaucetDishHandle {
+  setState(level: number, ready: number, pending: boolean): void;
 }
 
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
@@ -4653,6 +4679,202 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
     },
     update(): void { /* observer-driven; nothing per-frame */ },
   };
+}
+
+// ── ⛓️🥣 The FAUCET DISH — the room's faucet coin, made physical ─────────────
+
+export interface FaucetDishUIDeps {
+  /** The room whose dish this is (its faucet address derives from the room key). */
+  roomId: () => string;
+  /** Send a status / take / give request to the local node (NetworkProvider):
+   *  the ticket's `seq` is what the node echoes on the reply. */
+  request: (op: FaucetOp, amount?: number) => FaucetRequestTicket;
+}
+
+/** Give buttons, in mojos. The lobby gift is one mojo, so 1,000 mojos is a
+ *  thousand gifts; the largest button, 0.001 TXCH (a billion mojos), is still
+ *  small change on testnet11. */
+export const FAUCET_GIVE_AMOUNTS: ReadonlyArray<{ mojos: number; label: string }> = [
+  { mojos: 1_000, label: '+1,000 MOJOS' },
+  { mojos: 1_000_000, label: '+1,000,000' },
+  { mojos: 1_000_000_000, label: '+0.001 TXCH' },
+];
+
+/** While the screen is open, re-read the chain this often (reads are free). */
+const FAUCET_SCREEN_POLL_MS = 20_000;
+
+/**
+ * The faucet dish's focused UI: the JAR (exact mojos, coins, the address to
+ * pay into from any wallet), the DISH (is a mojo ready, when the next one is),
+ * TAKE A MOJO (a keyless claim the node submits, only while our wallet is
+ * empty) and GIVE (a fee-0 spend from our wallet into the jar). Everything
+ * shown comes from the node's last `faucet` reply; nothing here touches keys.
+ */
+export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let pollTimer: number | null = null;
+  let copied = false;
+
+  /** Ask the node for a status; a request that cannot leave is shown as such
+   *  (the screen otherwise reads "READING THE CHAIN…" with no node at all).
+   *  A failure resolving after the room was left files nothing: the store's
+   *  gate drops it, as it drops a late reply (faucetDish.ts, openFaucetRoom;
+   *  #245 review, round 20). */
+  const poll = (roomId: string): void => {
+    const { seq, sent } = deps.request('status');
+    sent.catch((e: unknown) => failFaucetRequest(roomId, 'status', seq, e));
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const roomId = deps.roomId();
+    const st = latestFaucetStatus(roomId);
+    const err = latestFaucetError(roomId);
+    const pending = faucetPending(roomId);
+    const level = jarLevel(st);
+    const btn = (id: string, label: string, disabled = false): string => `
+      <button id="${id}" ${disabled ? 'disabled' : ''} style="
+        flex:1; padding: 8px 6px;
+        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
+        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
+        border-radius: 6px; color: ${disabled ? CH_DIM : CH_GOLD_BRIGHT};
+        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1px;
+        cursor: ${disabled ? 'not-allowed' : 'pointer'};
+      ">${label}</button>`;
+    const row = (k: string, v: string): string => `
+      <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0; gap:10px;">
+        <span style="color:${CH_DIM};">${k}</span><span style="color:${CH_GOLD}; text-align:right;">${v}</span>
+      </div>`;
+    const wallet = st?.walletMojos ?? null;
+    // GIVE spends what the node can spend NOW (owned minus coins still confirming
+    // an earlier spend); the balance line shows what the wallet owns.
+    const spendable = st?.walletSpendableMojos ?? wallet;
+    const confirming = wallet !== null && spendable !== null && spendable < wallet ? wallet - spendable : 0n;
+    const canTake = !!st?.canClaim && pending === null;
+    const canGive = (mojos: number): boolean => !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
+    // A push the gateway never answered: the node keeps the spend's coins
+    // parked and the action pending until the chain or the mempool settles it,
+    // and the screen says so instead of reading a refusal (#245 review, round 14).
+    const unanswered = faucetPendingUnanswered(roomId);
+    const unansweredLine = (what: string): string =>
+      `the gateway did not answer the push (${escapeHtml(unanswered ?? '')}); ${what} may still land with the next block, and the dish keeps this until the chain or the mempool settles it`;
+    const pendingLine = pending === 'claim'
+      ? `TAKING… ${unanswered !== null ? unansweredLine('the mojo') : 'the mojo lands when the next block confirms it (about a minute)'}`
+      : pending === 'give'
+        ? `GIVING… ${unanswered !== null ? unansweredLine('your gift') : 'your gift lands when the next block confirms it (about a minute)'}`
+        : '';
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🥣 FAUCET DISH</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:11px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">${dishLine(st)}</div>
+      ${pendingLine ? `<div style="font-size:9.5px; color:${CH_PINK};">${pendingLine}</div>` : ''}
+      ${err ? `<div style="font-size:9.5px; color:#FF8A80;">⚠ ${escapeHtml(err)}</div>` : ''}
+      <div style="border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:10px 12px; background:rgba(10,16,24,0.6);">
+        <div style="font-size:10px; color:${CH_PINK}; letter-spacing:2px; margin-bottom:6px;">THE JAR</div>
+        <div style="height:8px; border:1px solid rgba(212,168,75,0.35); border-radius:4px; overflow:hidden; margin-bottom:6px;">
+          <div style="height:100%; width:${Math.round(level * 100)}%; background:${CH_GOLD};"></div>
+        </div>
+        ${st ? row('IN THE JAR', st.partial ? `${formatMojos(st.totalMojos)}+ (listing cut short; the jar holds more)` : formatMojos(st.totalMojos)) : ''}
+        ${st ? row('GIFT SLOTS (COINS)', st.partial ? `${st.coins}+ (listing cut short; the jar holds more)` : String(st.coins)) : ''}
+        ${st ? row('EACH GIFT', `${formatMojos(st.gift)} · one per coin every ${st.gap} blocks`) : ''}
+        ${st ? row('CHAIN HEIGHT', String(st.peak)) : row('CHAIN', 'reading…')}
+      </div>
+      <div>
+        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE DISH</div>
+        <div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>
+        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
+          ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
+          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}${st?.walletPartial ? '+ (listing cut short; it holds more)' : ''}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming a spend)` : ''}.` : ''}
+        </div>
+      </div>
+      <div>
+        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE SLOT — GIVE</div>
+        <div style="display:flex; gap:8px;">
+          ${FAUCET_GIVE_AMOUNTS.map((g, i) => btn(`faucet-give-${i}`, g.label, !canGive(g.mojos))).join('')}
+        </div>
+        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
+          Or pay into the jar from any Chia wallet (testnet11):
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
+          <code id="faucet-address" style="flex:1; font-size:8.5px; color:${CH_GOLD}; word-break:break-all; user-select:all;">${st ? escapeHtml(st.address) : '…'}</code>
+          ${btn('faucet-copy', copied ? 'COPIED' : 'COPY', !st)}
+        </div>
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF FAUCET DISH v1 · a keyless Chia coin per room · one gift per coin per ${st?.gap ?? 32} blocks · testnet11
+      </div>
+    `;
+    // A TAKE or GIVE is pending from the click until a status shows it landed
+    // (or the node refuses). A request that never reaches the node rejects,
+    // and the pending state goes with it: otherwise TAKING…/GIVING… would show
+    // for the whole timeout after a disconnect (#245 review, round 3).
+    const send = (op: FaucetOp, amount?: number): void => {
+      // The request's seq is allotted before anything is written, and the
+      // action is marked pending under it here, before any reply can arrive:
+      // only the reply echoing it (or the failure of this very request) sets
+      // its floor, settles or refuses it (#245 review, round 14).
+      const { seq, sent } = deps.request(op, amount);
+      markFaucetPending(roomId, op, seq);
+      // The failure of a request that never left drops the pending action (no
+      // spend was made); one resolving after the room was left is dropped by
+      // the store's gate instead, so nothing here can revive a departed
+      // room's state (round 20).
+      sent.then(
+        () => window.setTimeout(() => poll(roomId), 2_000),
+        (e: unknown) => failFaucetRequest(roomId, op, seq, e),
+      );
+    };
+    panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => send('claim'));
+    FAUCET_GIVE_AMOUNTS.forEach((g, i) => {
+      panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => send('give', g.mojos));
+    });
+    panel.querySelector<HTMLButtonElement>('#faucet-copy')?.addEventListener('click', () => {
+      if (!st) return;
+      void navigator.clipboard?.writeText(st.address).then(() => {
+        copied = true;
+        render();
+        window.setTimeout(() => { copied = false; render(); }, 1_500);
+      });
+    });
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-faucet-dish-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 380px; max-height: 90vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${CH_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      unsubscribe = subscribeFaucet(() => render());
+      render();
+      poll(deps.roomId());
+      pollTimer = window.setInterval(() => poll(deps.roomId()), FAUCET_SCREEN_POLL_MS);
+    },
+    unmount(): void {
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+      pollTimer = null;
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+    },
+    update(): void { /* observer-driven; nothing per-frame */ },
+  };
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 // ── 🤖 #77C s3: ROBOT DOCK — program the dock's robot (routine console) ───────

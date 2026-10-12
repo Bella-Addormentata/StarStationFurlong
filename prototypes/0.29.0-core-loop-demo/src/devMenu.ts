@@ -130,6 +130,7 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'arcade-cabinet': '🕹 ARCADE CABINET',
   'arcade-cabinet-2p': '🕹 ARCADE CABINET · 2 PLAYER',
   'arcade-cabinet-wide': '🕹🕹 DOUBLE-WIDE ARCADE (4 PLAYERS)',
+  'faucet-dish': '🥣 FAUCET DISH (chia)',
   'cake-table': '🎂 CAKE TABLE',
   'gift-box': '🎁 GIFT BOX',
   'birthday-banner': '🎊 BIRTHDAY BANNER',

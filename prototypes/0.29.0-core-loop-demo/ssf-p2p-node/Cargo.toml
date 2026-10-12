@@ -28,9 +28,16 @@ rand = "0.8"
 # Pure-Rust AEAD — no linker-surface risk. Chain IO deps land in C1 after B-7.
 chacha20poly1305 = "0.10"
 
-# Chia chain IO (C1) — OPTIONAL, behind the `chia-lane` feature so the default
-# release binary never pulls the heavy BLS12-381 + clvm stack. Build/develop the
-# lane with `cargo build --features chia-lane`; ship without it until it's ready.
+# Chia chain IO — split in two since #231 D3 (2026-10-11):
+#   `chia-read`    (in `default`) — hint lookups, parent-spend fetch, record decode:
+#                  the presence reader and the P1 watcher. Reads cost no mojos and
+#                  need no wallet, seed or account, so every node ships them.
+#   `chia-publish` (opt-in at build time; runtime toggle SSF_CHIA_LANE=1) — the
+#                  BLS wallet seed, spend-to-self publish and the craps fairness
+#                  hook. Release builds carry it so one binary ships (D3: the
+#                  separate `ssf-p2p-node-chia.exe` asset retires); dev builds
+#                  may leave it out to skip the BLS12-381 + driver stack.
+#   `chia-lane`    = alias for `chia-publish`, kept so older scripts still work.
 #
 # We depend on the specific chia-sdk SUB-CRATES, NOT the umbrella `chia-wallet-sdk`.
 # The umbrella pulls chia-sdk-test (peer simulator), chia-sdk-daemon, chia-sdk-client,
@@ -46,8 +53,8 @@ chacha20poly1305 = "0.10"
 # feature with the flag that suppresses those unused cdylib exports:
 #   RUSTFLAGS="-C link-arg=-Wl,--exclude-all-symbols" cargo build --features chia-lane
 # The node is a bin (exports nothing) and nothing links iroh-relay's cdylib, so
-# the flag is safe. The DEFAULT (no-chia) release build does NOT need it and is
-# left untouched.
+# the flag is safe. Since `chia-read` joined `default` (D3) the flag may be
+# needed for ANY Windows-GNU build; MSVC (what CI and releases use) never is.
 chia-bls = { version = "0.36", optional = true, features = ["serde"] }
 chia-protocol = { version = "0.36", optional = true, features = ["serde"] }
 chia-puzzle-types = { version = "0.36", optional = true }
@@ -64,15 +71,26 @@ clvmr = { version = "0.16", optional = true }
 # Slice 5 (resolve): ToClvm/FromClvm traits to run the parent spend and decode the
 # create_coin memos back out (already transitive; direct dep makes them nameable).
 clvm-traits = { version = "0.36", optional = true }
+clvm-utils = { version = "0.36", optional = true }
 # Craps fairness (plan §12 / T1): SHA-256 for the commit-reveal + beacon dice
 # derivation, byte-for-byte identical to the browser's src/games/fairDice.ts.
 sha2 = { version = "0.10", optional = true }
 
 [features]
-# Off by default. Turns on the Chia introduction-lane chain IO (wallet address,
-# spend-to-self publish, lookup-by-hint resolve). Runtime still gated by SSF_CHIA_LANE=1.
-chia-lane = [
-    "dep:chia-bls", "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-utils",
-    "dep:chia-sdk-driver", "dep:chia-sdk-types", "dep:chia-sdk-signer", "dep:chia-sdk-coinset",
-    "dep:clvmr", "dep:clvm-traits", "dep:sha2",
+default = ["chia-read"]
+# Chain READS (#231 D3: on by default). Lookup-by-hint, parent-spend fetch and
+# record decode for the presence reader + P1 watcher. No wallet, no seed, no spends.
+chia-read = [
+    "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-types",
+    "dep:chia-sdk-coinset", "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
 ]
+# Chain WRITES: the BLS wallet seed + `txch1…` address, spend-to-self publish,
+# the craps fairness hook and the treasury codec tests. Runtime-gated by
+# SSF_CHIA_LANE=1 (the publish toggle; D4/P3 give it a UI later).
+chia-publish = [
+    "chia-read",
+    "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
+    "dep:sha2",
+]
+# Back-compat alias: `--features chia-lane` keeps meaning "the whole lane".
+chia-lane = ["chia-publish"]

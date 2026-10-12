@@ -22,6 +22,7 @@ export type EnvelopeKind =
   | 'roomlog'    // append-only social-log ops (Phase 2+; stub in Phase 1)
   | 'asset'      // content-addressed blob requests/chunks
   | 'cap'        // capability handshake (ClientHello / NodeAck)
+  | 'faucet'     // ⛓️🥣 faucet dish: status / take / give request → node reply (loopback only)
   | 'ping'       // comms-weather probe — Chrome has no WT getStats() (v006 §3.8)
   | 'pong';
 

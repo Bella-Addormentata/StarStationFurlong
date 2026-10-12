@@ -11,7 +11,7 @@
 // encoded bytes. Arrays with SET semantics are sorted by canonical encoded
 // bytes inside the hash helpers, exactly like the TypeScript side.
 //
-// Gated under `chia-lane` (CI compiles + tests it there). PR D's treasury
+// Gated under `chia-publish` (CI compiles + tests it there). PR D's treasury
 // module consumes these functions with typed structs; until then the helpers
 // accept serde_json values so the golden-vector tests exercise the identical
 // code path the fixtures were generated through.
