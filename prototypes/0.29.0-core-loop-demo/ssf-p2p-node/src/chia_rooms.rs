@@ -165,7 +165,19 @@ pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
 /// and flags, log the room's current lookup hint when something changed (a
 /// re-sent cap on reconnect is quiet). A cap with a LOWER sequence number than
 /// the one held is a straggler from an earlier send and is dropped.
-pub fn ingest_room_cap(rooms: &Mutex<HashMap<String, ChiaRoomCap>>, room: &str, payload: &[u8]) -> Option<ChiaRoomCap> {
+///
+/// `then` runs on an accepted cap WHILE the room map is still locked. The
+/// persist hook goes there so the files land in acceptance order: the browser's
+/// caps arrive one per stream, two streams can carry seq N and N+1 for one room
+/// at once, and a write made after the lock is released could put the stale cap
+/// on disk last — restored at the next start (with seq 0) as a private, armed
+/// room the browser had already declared public.
+pub fn ingest_room_cap(
+    rooms: &Mutex<HashMap<String, ChiaRoomCap>>,
+    room: &str,
+    payload: &[u8],
+    then: impl FnOnce(&str, &ChiaRoomCap),
+) -> Option<ChiaRoomCap> {
     let cap = match parse_room_cap(payload) {
         Some(c) => c,
         None => {
@@ -180,7 +192,7 @@ pub fn ingest_room_cap(rooms: &Mutex<HashMap<String, ChiaRoomCap>>, room: &str, 
     let hint = crate::chia_lane::derive_hint(&cap.room_key, crate::chia_lane::epoch_now(now));
     let changed = {
         let mut map = rooms.lock().unwrap();
-        match map.get(room) {
+        let changed = match map.get(room) {
             Some(prev) if prev.seq > cap.seq => {
                 eprintln!(
                     "⛓️ ChiaHub lane: dropping a stale room cap for {room} (seq {} < held {})",
@@ -196,7 +208,9 @@ pub fn ingest_room_cap(rooms: &Mutex<HashMap<String, ChiaRoomCap>>, room: &str, 
                 map.insert(room.to_string(), cap.clone());
                 true
             }
-        }
+        };
+        then(room, &cap); // still under the lock — see the doc comment
+        changed
     };
     if changed {
         let posture = if cap.public_room == Some(true) {
@@ -388,11 +402,11 @@ mod tests {
     fn ingest_stores_and_updates_on_change_only() {
         let rooms = Mutex::new(HashMap::new());
         let key = [8u8; 32];
-        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":false"));
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":false"), |_, _| {});
         assert!(!rooms.lock().unwrap()["r1"].chia_mode);
-        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true"));
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true"), |_, _| {});
         assert!(rooms.lock().unwrap()["r1"].chia_mode);
-        ingest_room_cap(&rooms, "r1", b"garbage");
+        ingest_room_cap(&rooms, "r1", b"garbage", |_, _| {});
         assert!(rooms.lock().unwrap()["r1"].chia_mode, "malformed cap leaves the stored one alone");
     }
 
@@ -414,18 +428,40 @@ mod tests {
         let key = [11u8; 32];
         // The browser sent PRIVATE (seq 100) then PUBLIC (seq 101); they ride
         // separate streams and the node sees PUBLIC first.
-        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":101"));
-        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":false,\"seq\":100"));
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":101"), |_, _| {});
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":false,\"seq\":100"), |_, _| {});
         let held = rooms.lock().unwrap()["r1"].clone();
         assert_eq!(held.public_room, Some(true), "the straggling PRIVATE must not overwrite PUBLIC");
         assert_eq!(held.seq, 101);
         // Equal seq (a browser without sequence numbers always sends 0) is accepted.
-        ingest_room_cap(&rooms, "r2", &payload(key, ",\"chiaMode\":false"));
-        ingest_room_cap(&rooms, "r2", &payload(key, ",\"chiaMode\":true"));
+        ingest_room_cap(&rooms, "r2", &payload(key, ",\"chiaMode\":false"), |_, _| {});
+        ingest_room_cap(&rooms, "r2", &payload(key, ",\"chiaMode\":true"), |_, _| {});
         assert!(rooms.lock().unwrap()["r2"].chia_mode, "seq 0 after seq 0 still applies");
         // A newer cap with the same posture is kept so its seq becomes the floor.
-        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":105"));
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":105"), |_, _| {});
         assert_eq!(rooms.lock().unwrap()["r1"].seq, 105);
+    }
+
+    #[test]
+    fn persist_hook_runs_under_the_lock_for_accepted_caps_only() {
+        let rooms: Mutex<HashMap<String, ChiaRoomCap>> = Mutex::new(HashMap::new());
+        let key = [5u8; 32];
+        let seen: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
+        let hook = |_: &str, c: &ChiaRoomCap| {
+            // The map is still locked while the hook runs, so a cap can never be
+            // persisted after a newer one replaced it.
+            let locked = rooms.try_lock().is_err();
+            seen.lock().unwrap().push((c.seq, locked));
+        };
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":false,\"seq\":7"), hook);
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":6"), hook);
+        ingest_room_cap(&rooms, "r1", &payload(key, ",\"chiaMode\":true,\"publicRoom\":true,\"seq\":8"), hook);
+        ingest_room_cap(&rooms, "r1", b"garbage", hook);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(7, true), (8, true)],
+            "stale and malformed caps never reach the hook; accepted ones run with the map locked"
+        );
     }
 
     #[test]

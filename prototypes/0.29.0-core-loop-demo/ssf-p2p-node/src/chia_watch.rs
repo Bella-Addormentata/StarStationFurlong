@@ -57,6 +57,11 @@ pub const HOLD_WINDOW: Duration = Duration::from_secs(180);
 pub const MAX_HOLDS_PER_ROOM: usize = 4;
 /// A target whose hold failed is left alone this long (per room).
 pub const TARGET_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// Distinct contact keys read per watcher tick, at most (two hint scans each).
+/// The address book has no cap — a private-room member can leave one card per
+/// node identity it cycles through — so the gateway load per tick is bounded
+/// here and the keys take turns, the longest-waiting first.
+pub const MAX_CK_READS_PER_TICK: usize = 8;
 
 /// The block beat: when does a room read its hints?
 #[derive(Debug, Default)]
@@ -98,6 +103,11 @@ impl BeatSchedule {
 
     pub fn forget(&mut self, room: &str) {
         self.last_read.remove(room);
+    }
+
+    /// Peak height at the last read of `key`, if it was ever read.
+    pub fn last_read_of(&self, key: &str) -> Option<u32> {
+        self.last_read.get(key).copied()
     }
 
     /// Drop every schedule entry `gone` says is gone (P6a: peers that left the
@@ -415,13 +425,24 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 }
             }
             let mut live_ck_hints: HashSet<[u8; 32]> = chia_resolve::live_ck_hints(&own_ck, peak).into_iter().collect();
-            for (ck, nodes) in &by_ck {
+            for ck in by_ck.keys() {
                 live_ck_hints.extend(chia_resolve::live_ck_hints(ck, peak));
+            }
+            // Bounded and fair: at most MAX_CK_READS_PER_TICK keys per tick, the
+            // longest-waiting first. A key passed over keeps its turn (its beat
+            // is not recorded) and comes before the others next tick.
+            let mut reads = 0usize;
+            for ck in ck_read_order(&by_ck, &sched) {
+                if reads >= MAX_CK_READS_PER_TICK {
+                    break;
+                }
+                let nodes = &by_ck[&ck];
                 let connected_any = nodes.iter().any(|n| !rooms_connected_to(&hub, n).is_empty());
-                if !sched.due(&ck_sched_key(ck), peak, connected_any) {
+                if !sched.due(&ck_sched_key(&ck), peak, connected_any) {
                     continue;
                 }
-                match chia_resolve::read_ck(&client, ck, peak, now_unix, &mut ck_cursors).await {
+                reads += 1;
+                match chia_resolve::read_ck(&client, &ck, peak, now_unix, &mut ck_cursors).await {
                     Ok(found) => {
                         for f in chia_resolve::rank_and_dedupe(found) {
                             // Routed by signer; a record signed by nobody who
@@ -574,6 +595,18 @@ fn spawn_hold(
 
 /// The beat-schedule key of a contact key (a hint prefix: the key itself never
 /// appears in a log line).
+/// The order contact keys are offered a read in this tick: never-read keys
+/// first, then by the peak height of their last read (longest waiting first),
+/// ties broken by the key bytes so the order is stable.
+fn ck_read_order(by_ck: &HashMap<[u8; 32], Vec<String>>, sched: &BeatSchedule) -> Vec<[u8; 32]> {
+    let mut keys: Vec<[u8; 32]> = by_ck.keys().copied().collect();
+    keys.sort_by_key(|ck| {
+        let last = sched.last_read_of(&ck_sched_key(ck));
+        (last.is_some(), last.unwrap_or(0), *ck)
+    });
+    keys
+}
+
 fn ck_sched_key(ck: &[u8; 32]) -> String {
     format!("ck:{}", hex::encode(&ck[..8]))
 }
@@ -645,6 +678,17 @@ mod tests {
         let mut other = BeatSchedule::new(32);
         assert!(other.due("x", 1_024, false));
         assert!(other.due("x", 1_056, false), "the same gap reads when unconnected");
+    }
+
+    #[test]
+    fn contact_keys_take_turns_never_read_first_then_longest_waiting() {
+        let mut sched = BeatSchedule::new(32);
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let by_ck: HashMap<[u8; 32], Vec<String>> = [a, b, c].into_iter().map(|k| (k, vec![format!("n{}", k[0])])).collect();
+        assert!(sched.due(&ck_sched_key(&a), 1000, false));
+        assert!(sched.due(&ck_sched_key(&b), 500, false));
+        assert_eq!(ck_read_order(&by_ck, &sched), vec![c, b, a], "never read first, then the longest waiting");
+        assert!(MAX_CK_READS_PER_TICK >= 1);
     }
 
     #[test]

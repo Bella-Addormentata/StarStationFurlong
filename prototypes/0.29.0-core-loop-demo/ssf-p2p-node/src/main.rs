@@ -1768,14 +1768,16 @@ async fn handle_wt_connection_inner(
                                 // publish its addresses under it — or out-sequence the
                                 // local browser's caps for a room.
                                 if chia_rooms::cap_source_is_local(&remote_addr_inner) {
-                                    if let Some(cap) = chia_rooms::ingest_room_cap(
+                                    // #231 P6a: the cap outlives the process, beside the room
+                                    // doc — written while the room map is still locked, so two
+                                    // caps on two streams land on disk in acceptance order and
+                                    // a restart never restores the stale one.
+                                    chia_rooms::ingest_room_cap(
                                         &hub_clone.chia_rooms,
                                         &envelope.room,
                                         &envelope.payload,
-                                    ) {
-                                        // #231 P6a: the cap outlives the process, beside the room doc.
-                                        chia_rooms::persist_room_cap(&envelope.room, &cap);
-                                    }
+                                        chia_rooms::persist_room_cap,
+                                    );
                                 } else {
                                     eprintln!(
                                         "⛓️ ChiaHub lane: ignoring a room cap from a non-loopback browser session ({remote_addr_inner}) — caps are the LOCAL browser's alone"

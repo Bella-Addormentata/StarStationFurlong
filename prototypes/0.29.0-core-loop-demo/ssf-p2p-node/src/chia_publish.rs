@@ -933,6 +933,12 @@ pub struct NodePublishMark {
     /// the write is pending and is retried after [`PRESENCE_CONFIRM_TIMEOUT_SECS`].
     #[serde(default)]
     pub confirmed: bool,
+    /// The node id (signer) the record was written as. With `hint` this binds
+    /// the mark to the identity that produced it: a mark left by a replaced
+    /// `contact.key` or `iroh_node_id.key` satisfies nothing, since readers
+    /// look under the new hint and reject the old signer.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 impl NodePublishMark {
@@ -959,15 +965,31 @@ pub fn era_guard(peak: u32) -> bool {
     peak % ERA_BLOCKS >= ERA_BLOCKS - ERA_GUARD_BLOCKS
 }
 
-/// Is a presence write due? Always for a new era (or none ever). Within an era:
-/// when the last write is still unconfirmed after [`PRESENCE_CONFIRM_TIMEOUT_SECS`]
-/// (the spend may have been dropped), or when the signed address set changed
-/// and the debounce has passed; either way only while the era's write budget
-/// is not spent.
-pub fn node_publish_due(mark: Option<&NodePublishMark>, era: u64, addrs_sig: &str, now: u64) -> bool {
+/// Was `mark` written as the identity we are now: under this `hint` (contact
+/// key + era) and signed by this `node_id`? A same-era mark from another
+/// identity is as good as none — readers look under the new hint and reject
+/// the old signer — so a replaced key publishes again at once.
+pub fn mark_is_ours(mark: &NodePublishMark, hint: &str, node_id: &str) -> bool {
+    mark.hint == hint && mark.node_id.as_deref() == Some(node_id)
+}
+
+/// Is a presence write due? Always for a new era (or none ever), and for a mark
+/// another identity left ([`mark_is_ours`]). Within an era: when the last write
+/// is still unconfirmed after [`PRESENCE_CONFIRM_TIMEOUT_SECS`] (the spend may
+/// have been dropped), or when the signed address set changed and the debounce
+/// has passed; either way only while the era's write budget is not spent.
+pub fn node_publish_due(
+    mark: Option<&NodePublishMark>,
+    era: u64,
+    addrs_sig: &str,
+    now: u64,
+    hint: &str,
+    node_id: &str,
+) -> bool {
     match mark {
         None => true,
         Some(m) if m.era != era => true,
+        Some(m) if !mark_is_ours(m, hint, node_id) => true,
         Some(m) if m.writes >= 1 + MAX_NODE_WRITES_PER_ERA => false,
         Some(m) if !m.confirmed => now.saturating_sub(m.last_at) >= PRESENCE_CONFIRM_TIMEOUT_SECS
             || (m.addrs_sig != addrs_sig && now.saturating_sub(m.last_at) >= ADDR_CHANGE_DEBOUNCE_SECS),
@@ -1058,6 +1080,7 @@ pub async fn heartbeat_loop(
     // failure; the guard flag logs the end-of-era pause once.
     let mark_path = std::path::Path::new(NODE_MARK_FILE);
     let mut node_mark: Option<NodePublishMark> = NodePublishMark::load(mark_path);
+    let self_id = iroh_sk.public().to_string();
     let mut node_attempt: Option<Instant> = None;
     let mut era_guard_logged = false;
     let peak_client = CoinsetClient::testnet11();
@@ -1106,6 +1129,7 @@ pub async fn heartbeat_loop(
                 era_guard_logged = false;
                 let era = chia_lane::era_of(peak);
                 let now_unix = crate::chia_resolve::unix_now();
+                let hint_now = hex::encode(chia_lane::derive_ck_hint(&hub.contact_key, era));
                 // The watcher saw our record for the mark's era on chain: the
                 // write is confirmed, nothing more to retry.
                 if let Some(m) = node_mark.as_mut() {
@@ -1124,12 +1148,12 @@ pub async fn heartbeat_loop(
                 let retry_ok = node_attempt
                     .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
                     .unwrap_or(true);
-                if node_publish_due(node_mark.as_ref(), era, &sig, now_unix) && retry_ok {
+                if node_publish_due(node_mark.as_ref(), era, &sig, now_unix, &hint_now, &self_id) && retry_ok {
                     node_attempt = Some(Instant::now());
                     match publish_node_presence(&iroh_sk, &chia_sk, &hub.contact_key, era, &entries, now_unix).await {
                         Ok(hint) => {
                             let writes = match &node_mark {
-                                Some(m) if m.era == era => m.writes + 1,
+                                Some(m) if m.era == era && mark_is_ours(m, &hint_now, &self_id) => m.writes + 1,
                                 _ => 1,
                             };
                             let mark = NodePublishMark {
@@ -1139,6 +1163,7 @@ pub async fn heartbeat_loop(
                                 last_at: now_unix,
                                 hint: hex::encode(hint.to_bytes()),
                                 confirmed: !watcher_confirms,
+                                node_id: Some(self_id.clone()),
                             };
                             if let Err(e) = mark.save(mark_path) {
                                 eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
@@ -1273,32 +1298,38 @@ mod tests {
     #[test]
     fn node_presence_is_written_once_per_era_then_only_on_debounced_changes() {
         let now = 1_791_700_000u64;
-        assert!(node_publish_due(None, 5, "a", now), "never written: due");
+        assert!(node_publish_due(None, 5, "a", now, "h", "n"), "never written: due");
         let mark = NodePublishMark {
             era: 5,
             writes: 1,
             addrs_sig: "a".into(),
             last_at: now,
-            hint: String::new(),
+            hint: "h".into(),
             confirmed: true,
+            node_id: Some("n".into()),
         };
-        assert!(!node_publish_due(Some(&mark), 5, "a", now + 3600), "same era, same addresses: idle writes nothing");
-        assert!(node_publish_due(Some(&mark), 6, "a", now + 1), "a new era: due at once");
-        assert!(!node_publish_due(Some(&mark), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS - 1), "changed, but inside the debounce");
-        assert!(node_publish_due(Some(&mark), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS), "changed, debounce passed");
+        assert!(!node_publish_due(Some(&mark), 5, "a", now + 3600, "h", "n"), "same era, same addresses: idle writes nothing");
+        // A mark another identity left (a replaced contact or node key) satisfies
+        // nothing: its record sits under another hint, or carries a signer readers reject.
+        assert!(node_publish_due(Some(&mark), 5, "a", now + 1, "other-hint", "n"), "another contact key: due at once");
+        assert!(node_publish_due(Some(&mark), 5, "a", now + 1, "h", "other-node"), "another node key: due at once");
+        assert!(node_publish_due(Some(&mark), 6, "a", now + 1, "h", "n"), "a new era: due at once");
+        assert!(!node_publish_due(Some(&mark), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS - 1, "h", "n"), "changed, but inside the debounce");
+        assert!(node_publish_due(Some(&mark), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS, "h", "n"), "changed, debounce passed");
         let spent = NodePublishMark { writes: 1 + MAX_NODE_WRITES_PER_ERA, ..mark.clone() };
-        assert!(!node_publish_due(Some(&spent), 5, "b", now + 3600), "the era's change budget is spent");
-        assert!(node_publish_due(Some(&spent), 6, "b", now + 3600), "…until the next era");
+        assert!(!node_publish_due(Some(&spent), 5, "b", now + 3600, "h", "n"), "the era's change budget is spent");
+        assert!(node_publish_due(Some(&spent), 6, "b", now + 3600, "h", "n"), "…until the next era");
         // A write the chain never showed back is retried after the timeout —
         // and not before, so a spend still waiting in the mempool is left alone.
         let pending = NodePublishMark { confirmed: false, ..mark.clone() };
-        assert!(!node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS - 1), "pending, inside the window");
-        assert!(node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS), "pending too long: retry");
-        assert!(node_publish_due(Some(&pending), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS), "pending, but the addresses changed: the change rule still applies");
+        assert!(!node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS - 1, "h", "n"), "pending, inside the window");
+        assert!(node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "pending too long: retry");
+        assert!(node_publish_due(Some(&pending), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS, "h", "n"), "pending, but the addresses changed: the change rule still applies");
         let pending_spent = NodePublishMark { confirmed: false, writes: 1 + MAX_NODE_WRITES_PER_ERA, ..mark.clone() };
-        assert!(!node_publish_due(Some(&pending_spent), 5, "a", now + 2 * PRESENCE_CONFIRM_TIMEOUT_SECS), "retries spend the same era budget");
+        assert!(!node_publish_due(Some(&pending_spent), 5, "a", now + 2 * PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "retries spend the same era budget");
         let legacy: NodePublishMark = serde_json::from_str(r#"{"era":5,"writes":1,"addrs_sig":"a","last_at":1,"hint":""}"#).unwrap();
         assert!(!legacy.confirmed, "a mark file without the field reads as unconfirmed");
+        assert!(!mark_is_ours(&legacy, "", "n"), "a mark without a node id is nobody's");
     }
 
     #[test]
