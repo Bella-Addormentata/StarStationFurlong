@@ -74,8 +74,12 @@ The four non-commercial cores are in release builds because Star Station
 Furlong is non-commercial (the owner, 2026-10-12). FBNeo's license also forbids
 asking for donations to support work on any project that uses it, and this one
 asks for none. A build that is sold, or that asks for donations, would have to
-leave those cores out: `EJS_CORES` in `.github/workflows/release.yml` names the
-cores a release carries, and its source archive then carries only theirs.
+leave those cores out, and the systems they run with them: take those systems
+out of `ARCADE_CORES` (`src/arcadeDoc.ts`) and the cores out of the fetch
+script's `DEFAULT_CORES` and `scripts/emulatorjs-sources.json`. The tests hold
+the three together, and a release then offers, fetches and packs the source of
+only the rest. `EJS_CORES` alone would leave the cores' files out but still
+offer their systems, which then wouldn't start.
 
 EmulatorJS's own scripts travel with it unminified. The cores are compiled
 builds, too big to carry their source inside the app the way the built-in

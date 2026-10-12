@@ -56,12 +56,12 @@ env:
   #      with `tag` + `target` — see workflow_dispatch above).
   RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
 
-  # 🕹 THE ARCADE CORES A RELEASE CARRIES, as comma-separated libretro names
-  # (scripts/fetch-emulatorjs.mjs in RELEASE_FRONTEND); empty means all of them.
-  # The installers' fetch and the emulator's source archive both read this, so
-  # a core left out is left out of both. A build that is sold, or that asks for
-  # donations, has to leave out fbneo, mame2003_plus, snes9x and genesis_plus_gx
-  # (public/arcade/README.md).
+  # 🕹 THE ARCADE CORES A RELEASE FETCHES, as comma-separated libretro names
+  # (scripts/fetch-emulatorjs.mjs in RELEASE_FRONTEND). Leave it empty, which
+  # means all of them: the cabinet offers a system for each, and one whose core
+  # is left out still shows and won't start. The installers' fetch and the source
+  # archive both read this, so they always agree. To take cores out of a build,
+  # take their systems out of the cabinet with them (public/arcade/README.md).
   EJS_CORES: ''
 
 jobs:
