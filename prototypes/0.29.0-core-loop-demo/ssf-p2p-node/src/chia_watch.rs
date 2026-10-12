@@ -394,7 +394,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
 
         // ── #231 P6a: per-node presence — the peers whose contact cards we hold ──
         // One read per DISTINCT contact key per beat (four times less often while
-        // any node claiming it is connected somewhere), records routed to the
+        // every node claiming it is connected somewhere), records routed to the
         // peer whose node id SIGNED them: a card never proves a key belongs to
         // one node alone (a member who learned another member's key can claim
         // it in its own card), so the key only locates the hint and the
@@ -442,8 +442,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     break;
                 }
                 let nodes = &by_ck[&ck];
-                let connected_any = nodes.iter().any(|n| !rooms_connected_to(&hub, n).is_empty());
-                if !sched.due(&ck_sched_key(&ck), peak, connected_any) {
+                // The slower cadence only when EVERY claimant is connected
+                // somewhere: a member who reuses another's key in its own card
+                // and stays connected must not slow that node's reads.
+                let connected_all = nodes.iter().all(|n| !rooms_connected_to(&hub, n).is_empty());
+                if !sched.due(&ck_sched_key(&ck), peak, connected_all) {
                     continue;
                 }
                 reads += 1;

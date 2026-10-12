@@ -867,6 +867,9 @@ pub fn publishable_rooms(caps: &[(String, ChiaRoomCap)]) -> (Vec<(String, [u8; 3
     let mut armed = Vec::new();
     let mut refused = Vec::new();
     for (room, cap) in caps {
+        if cap.restored {
+            continue; // read-only until the browser sends a live cap (posture may be stale)
+        }
         if cap.may_publish() {
             armed.push((room.clone(), cap.room_key));
         } else if cap.chia_mode {
@@ -1319,7 +1322,7 @@ mod tests {
     use super::*;
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
-        ChiaRoomCap { room_key: [key; 32], chia_mode, public_room, seq: 0 }
+        ChiaRoomCap { room_key: [key; 32], chia_mode, public_room, seq: 0, restored: false }
     }
 
     #[test]

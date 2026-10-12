@@ -67,6 +67,12 @@ pub struct ChiaRoomCap {
     /// of order, so [`ingest_room_cap`] drops a cap older than the one it
     /// holds: a stale PRIVATE can never overwrite a fresh PUBLIC.
     pub seq: u64,
+    /// Loaded from `rooms/<id>.cap` at startup rather than sent by a browser in
+    /// THIS process. Its posture is the last one known before the node went
+    /// down and the room may have gone public since, so a restored cap only
+    /// authorizes reads (free and harmless); publishing under the room key and
+    /// handing out the contact card wait for a live cap.
+    pub restored: bool,
 }
 
 impl ChiaRoomCap {
@@ -76,10 +82,11 @@ impl ChiaRoomCap {
     }
 
     /// May the publisher write a presence record under this room's key?
-    /// Armed AND KNOWN private — the N8 guard in one place. An absent flag is
-    /// not "private": an older browser cannot vouch for the room's posture.
+    /// Armed AND KNOWN private, by a cap from this process — the N8 guard in
+    /// one place. An absent flag is not "private": an older browser cannot
+    /// vouch for the room's posture; neither can a cap restored from disk.
     pub fn may_publish(&self) -> bool {
-        self.chia_mode && self.public_room == Some(false)
+        self.chia_mode && self.public_room == Some(false) && !self.restored
     }
 
     /// Should the reader (rung-6 resolve, P1 watcher) read this room's hint?
@@ -158,7 +165,7 @@ pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
     let parsed: RoomCapPayload = serde_json::from_slice(payload).ok()?;
     let room_key = decode_room_key(&parsed.room_key_b64)?;
     let public_room = if is_bundled_room_key(&room_key) { Some(true) } else { parsed.public_room };
-    Some(ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room, seq: parsed.seq })
+    Some(ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room, seq: parsed.seq, restored: false })
 }
 
 /// Ingest a `cap` payload the local browser sent for `room`: store the room key
@@ -236,8 +243,10 @@ pub fn ingest_room_cap(
 /// the arming toggle: a card lets the other side find US once we publish, and
 /// theirs lets us find them, whether or not either publishes yet.
 impl ChiaRoomCap {
+    /// Known private by a cap from THIS process (a restored cap's posture may
+    /// be stale), and never the bundled welcome key.
     pub fn may_share_card(&self) -> bool {
-        self.public_room == Some(false) && !is_bundled_room_key(&self.room_key)
+        self.public_room == Some(false) && !self.restored && !is_bundled_room_key(&self.room_key)
     }
 }
 
@@ -269,25 +278,29 @@ fn cap_path(room_id: &str) -> std::path::PathBuf {
     std::path::Path::new("rooms").join(format!("{}{CAP_FILE_SUFFIX}", hex::encode(room_id.as_bytes())))
 }
 
-/// Write one room's cap. Best-effort: failures log and drop.
+/// Write one room's cap. Fails closed: when the new cap cannot be written, the
+/// file holding the OLD cap is removed, so a restart never restores a posture
+/// the browser has since replaced (a room gone public coming back as private).
 pub fn persist_room_cap(room_id: &str, cap: &ChiaRoomCap) {
     use base64::Engine;
-    if let Err(e) = std::fs::create_dir_all("rooms") {
-        eprintln!("💾 cap persist: cannot create rooms/: {e}");
-        return;
-    }
+    let path = cap_path(room_id);
     let body = PersistedCap {
         room_key_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cap.room_key),
         chia_mode: cap.chia_mode,
         public_room: cap.public_room,
     };
-    match serde_json::to_vec(&body) {
-        Ok(bytes) => {
-            if let Err(e) = crate::chia_contact::write_private(&cap_path(room_id), &bytes) {
-                eprintln!("💾 cap persist: write failed for {room_id}: {e}");
-            }
+    let written = std::fs::create_dir_all("rooms")
+        .map_err(|e| format!("cannot create rooms/: {e}"))
+        .and_then(|_| serde_json::to_vec(&body).map_err(|e| format!("encode failed: {e}")))
+        .and_then(|bytes| crate::chia_contact::write_private(&path, &bytes).map_err(|e| format!("write failed: {e}")));
+    if let Err(why) = written {
+        match std::fs::remove_file(&path) {
+            Ok(()) => eprintln!("💾 cap persist: {why} for {room_id} — the previous cap file was removed so no stale posture is restored"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => eprintln!("💾 cap persist: {why} for {room_id}"),
+            Err(e) => eprintln!(
+                "💾 cap persist: {why} for {room_id}, and the previous cap file could not be removed ({e}) — it is read-only when restored"
+            ),
         }
-        Err(e) => eprintln!("💾 cap persist: encode failed for {room_id}: {e}"),
     }
 }
 
@@ -325,7 +338,7 @@ pub fn load_persisted_caps() -> Vec<(String, ChiaRoomCap)> {
             continue;
         };
         let public_room = if is_bundled_room_key(&room_key) { Some(true) } else { parsed.public_room };
-        out.push((room_id, ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room, seq: 0 }));
+        out.push((room_id, ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room, seq: 0, restored: true }));
     }
     out
 }
@@ -471,8 +484,13 @@ mod tests {
 
     #[test]
     fn cards_are_shared_only_in_rooms_known_private() {
-        let private = ChiaRoomCap { room_key: [9u8; 32], chia_mode: false, public_room: Some(false), seq: 0 };
+        let private = ChiaRoomCap { room_key: [9u8; 32], chia_mode: false, public_room: Some(false), seq: 0, restored: false };
         assert!(private.may_share_card(), "a private room shares, armed or not");
+        let restored = ChiaRoomCap { chia_mode: true, restored: true, ..private.clone() };
+        assert!(!restored.may_share_card(), "a cap restored from disk may have gone public meanwhile: no card");
+        assert!(!restored.may_publish(), "nor does it arm the room publisher");
+        assert!(restored.may_read(), "reading under it is free and harmless");
+        assert!(ChiaRoomCap { chia_mode: true, ..private.clone() }.may_publish(), "a live armed private cap publishes");
         let public = ChiaRoomCap { public_room: Some(true), ..private.clone() };
         assert!(!public.may_share_card());
         let unknown = ChiaRoomCap { public_room: None, ..private.clone() };

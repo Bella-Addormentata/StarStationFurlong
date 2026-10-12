@@ -1407,7 +1407,7 @@ async fn main() -> Result<()> {
         let book = chia_contact::PeerBook::load(std::path::Path::new(chia_contact::PEERS_FILE));
         let caps: HashMap<String, chia_rooms::ChiaRoomCap> = chia_rooms::load_persisted_caps().into_iter().collect();
         println!(
-            "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) restored · cards {}",
+            "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) restored for reading (publishing and cards wait for a live cap) · cards {}",
             book.peers.len(),
             caps.len(),
             if !durable {
