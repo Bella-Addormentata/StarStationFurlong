@@ -450,9 +450,9 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   the address classifier and the socket pinning in a crate both the node
   and the embedded listener compile in, with one table of test cases — or
   the proxy does not exist in that listener: an embedded listener without
-  the module answers `/api/media` with 404 and the theatre's consent-only
-  direct URL is what plays, so the two HTTP implementations never diverge
-  in what they let through. `tauri://localhost` on macOS and Linux, and
+  the module answers `/api/media` with 404 and the lane is unavailable
+  there, never the direct URL, so the two HTTP implementations never
+  diverge in what they let through. `tauri://localhost` on macOS and Linux, and
   `http://tauri.localhost` on Windows (§2), is every Tauri app's origin on
   that platform and names nothing on its own, so possession of the token
   is the authority and the origin list only a filter. A browser page, in development, gets it from a dedicated
