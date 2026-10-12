@@ -1015,8 +1015,15 @@ since, an upper bound on growth, since an update adds at most its own
 length — and refuses an inbound update that would carry the measure
 past the bound: dropped unapplied and charged to the link like a
 malformed frame (an update that depended on it waits in Yjs's pending
-set, bounded by the same accounting and cleared with the room), the
-room read-only, ROOM FULL, until compacted. Compaction is a new DOCUMENT
+set — which `encodeStateAsUpdate` does not encode, so the re-measure
+would drop it from the account: the pending set has a HARD BUDGET of
+its own in both replicas, 256 KB of retained pending update and
+delete-set bytes per document, never reset by the re-measure and never
+counted against the document, past which the whole pending set is
+dropped and the link that filled it charged — an honest dependency is
+re-sent with the next sync step, a flood is not — and cleared with the
+room; the node's replica keeps the same account over its pending
+structs), the room read-only, ROOM FULL, until compacted. Compaction is a new DOCUMENT
 EPOCH: the owner signs `room-compact { epoch, at, root }` — a fresh Yjs
 document built from the current state, its epoch carried in every
 `ysync` envelope beside the room id — accepted only under an
