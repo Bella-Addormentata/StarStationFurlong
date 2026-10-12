@@ -150,6 +150,9 @@ export function readFrameSnapshot(data: unknown): ReplaySnapshot | null {
   const d = data as { frame?: unknown; state?: unknown; held?: unknown; hash?: unknown };
   if (!isInt(d.frame, 0, REPLAY_MAX_FRAME)) return null;
   if (!(d.state instanceof Uint8Array) || d.state.byteLength === 0 || d.state.byteLength > REPLAY_MAX_STATE_BYTES) return null;
+  // Only a view that is its whole buffer: handing a state on moves its
+  // buffer, so a small view over a big one would carry the big one past the cap.
+  if (d.state.byteOffset !== 0 || d.state.byteLength !== d.state.buffer.byteLength) return null;
   if (typeof d.hash !== 'string' || !HASH.test(d.hash)) return null;
   if (!Array.isArray(d.held) || d.held.length > (REPLAY_MAX_PLAYER + 1) * (REPLAY_MAX_INDEX + 1)) return null;
   const held: Array<[number, number, number]> = [];

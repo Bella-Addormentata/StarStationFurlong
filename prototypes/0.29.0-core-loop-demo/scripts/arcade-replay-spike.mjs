@@ -13,10 +13,12 @@
  *        [--query "rom=/emulatorjs/roms/lj65.nes&latency=40&jitter=30"] [--chromium /path/to/chrome]
  *        [--screenshot out.png]
  *
- * Exits non-zero when any compared hash differed, nothing was compared, or
- * the harness or either frame reported an error (a frame torn down, or the
- * harness stopped, partway through stops comparing, which no mismatch would
- * show). The negative control, `--query drop=N`, is expected to.
+ * Exits non-zero when any compared hash differed, nothing was compared,
+ * comparing stopped for longer than ten hash periods (or 15 s) at any point
+ * after it began, or the harness or either frame reported an error: a frame
+ * torn down or frozen, or the harness stopped, partway through stops
+ * comparing, which no mismatch would show. The negative control,
+ * `--query drop=N`, is expected to.
  */
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -80,8 +82,14 @@ console.log(JSON.stringify({
   distinctHashes: last?.distinctHashes,
   dropped: last?.dropped,
   stalls: last?.stalls,
+  longestGapMs: last?.longestGapMs,
   lagFrames: { p50: pct(50), p95: pct(95), max: sorted.at(-1) ?? null, samples: sorted.length },
   errors: last?.errors,
 }, null, 2));
 const d = last?.drift;
-process.exit(d && d.compared > 0 && d.mismatched === 0 && !last?.errors?.length ? 0 : 1);
+// Fresh comparisons all the way through: a run whose frames froze after a
+// match would otherwise end with that match and nothing against it.
+const gapLimitMs = Math.max(15_000, (10 * (last?.hashEvery ?? 60) * 1000) / 60);
+const kept = (last?.longestGapMs ?? Infinity) <= gapLimitMs;
+if (d?.compared && !kept) console.log(`[replay-spike] comparing stopped for ${last?.longestGapMs} ms (limit ${gapLimitMs} ms)`);
+process.exit(d && d.compared > 0 && d.mismatched === 0 && kept && !last?.errors?.length ? 0 : 1);

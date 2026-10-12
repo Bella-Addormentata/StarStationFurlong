@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   batchRows, DriftLedger, packInputBatch, readFrameBatch, readFrameHash, readFrameSnapshot, replayStateHash,
-  unpackInputBatch, ReplayReassembler, REPLAY_MAX_BATCH_INPUTS, REPLAY_MAX_FRAME, REPLAY_WIRE_VERSION,
+  unpackInputBatch, ReplayReassembler, REPLAY_MAX_BATCH_INPUTS, REPLAY_MAX_FRAME, REPLAY_MAX_STATE_BYTES, REPLAY_WIRE_VERSION,
 } from './arcadeReplay';
 import type { ReplayBatch } from './arcadeReplay';
 
@@ -86,6 +86,14 @@ describe('what the emulator frame posts is checked before anything uses it', () 
     expect(readFrameSnapshot({ ...ok, state: new Uint8Array(0) })).toBeNull();
     expect(readFrameSnapshot({ ...ok, state: [1, 2, 3] })).toBeNull();
     expect(readFrameSnapshot({ ...ok, held: [[0, 99, 1]] })).toBeNull();
+  });
+
+  it('a snapshot is its whole buffer: a small view over a big one is refused', () => {
+    const big = new Uint8Array(new ArrayBuffer(REPLAY_MAX_STATE_BYTES + 1), 0, 3);
+    big.set([1, 2, 3]);
+    const at = new Uint8Array(new ArrayBuffer(4), 1, 3);
+    at.set([1, 2, 3]);
+    for (const state of [big, at]) expect(readFrameSnapshot({ frame: 9, state, held: [], hash: replayStateHash(state) })).toBeNull();
   });
 
   it('hashes the way frame.html does', () => {
