@@ -53,7 +53,7 @@ const started = Date.now();
 const until = started + minutes * 60_000;
 let last;
 while (Date.now() < until) {
-  await page.waitForTimeout(30_000);
+  await page.waitForTimeout(Math.min(30_000, until - Date.now()));
   last = await read();
   const d = last?.drift;
   if (lockstep) {

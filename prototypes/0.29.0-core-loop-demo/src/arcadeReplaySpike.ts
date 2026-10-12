@@ -200,6 +200,8 @@ function onFollower(ev: EmulatorEvent): void {
       if (st.phase === 'unsupported') stats.errors.push('follower: cannot replay (no save states)');
       if (st.phase === 'stalled' && stats.follower?.phase === 'running') stats.stalls += 1;
       if (st.loaded !== undefined) stats.loads.push({ frame: st.loaded, matches: st.matches, tries: st.tries, atMs: Math.round(performance.now() - stats.startedAt) });
+      // A save state that never landed: the spectator holds; hand it a fresh one.
+      if (st.loaded !== undefined && st.matches === false) source?.send({ type: 'arcade-replay-want-snapshot' });
       if (st.phase === 'running' && st.frame !== undefined) stats.lagFrames.push(sourceFrameNow() - st.frame);
       stats.follower = st;
       break;
