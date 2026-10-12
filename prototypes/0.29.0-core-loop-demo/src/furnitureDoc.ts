@@ -127,6 +127,14 @@ export function readAllFurniture(): Map<string, FurnitureRecord> {
   return out;
 }
 
+/** 🔧 The checked record placed under `id` in `doc`'s layout, or null. It
+ *  reads the doc it is given, not the bound one: a reader bound to the same
+ *  room doc (robotDoc's crews) sees the layout of that same moment. */
+export function placedFurnitureIn(doc: Y.Doc, id: string): FurnitureRecord | null {
+  const value = doc.getMap('furniture').get(id);
+  return isFurnitureRecord(value) ? value : null;
+}
+
 /** Number of entries currently in the map (0 ⇒ unseeded — keep local defaults). */
 export function furnitureDocSize(): number {
   return docAlive() ? furnitureMap!.size : 0;

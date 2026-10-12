@@ -1,0 +1,1084 @@
+/**
+ * 🛰️ The helm's STATION KEEPING face (owner request, 2026-09-27) — what a
+ * helm console shows in a module bolted into a station, or in a station's
+ * own welcome room standing alone (stationKeeping.steersStation). A ship's
+ * helm flies the ship; this one flies the station, with a small TRIM STICK
+ * for fine orbital maintenance:
+ *
+ *   ▲ RAISE / ▼ LOWER — one burn moves the orbit TRIM_STEP_KM,
+ *   ◀ BACK / AHEAD ▶  — one burn slides the station PHASE_STEP_DEG along it.
+ *
+ * Flick the stick (drag the knob past its ring and let go), press a button,
+ * or use the arrow keys (the stick takes the keyboard focus as the face
+ * opens). Each is ONE discrete burn (stationKeeping.planTrim); everything
+ * else on the dashboard is derived from the room's burns and the clock. Tab
+ * is the SpacePhone's (main.ts), so F opens FUEL & DOCKING and K comes back.
+ *
+ * Every helm opens through here (world.ts): one in a module that steers no
+ * station opens on the ship face, which offers station keeping within half
+ * a second of the module coming to steer one (a gangway paired, or the room
+ * saved as a station, while the helm is open).
+ *
+ * The STATION KEEPING BOX draws the station against its slot: the crosshair
+ * is where the slot's orbit puts it, across is along the orbit (behind /
+ * ahead) and up is altitude. A lower orbit is a faster one, so the marker
+ * slides; the ghost ring shows where it will be in ten minutes.
+ *
+ * Thrusters and propellant are the ship parts the module already carries:
+ * ENGINE BLOCKs fire the burns and FUEL TANKs feed them (the shipDoc fuel
+ * gauge). The FUEL & DOCKING tab is the ship helm face itself (devices.ts
+ * createHelmUI), whose REFUEL and DOCKING COMPUTER serve a station module as
+ * well — nothing the helm did before is lost.
+ *
+ * MOVE TO ANOTHER PLANET (stationMove.ts) sits under the stick: for each other
+ * planet, the next launch window, the flight time and the propellant both
+ * burns take; MOVE schedules the whole transfer in one write. While a move is
+ * scheduled or under way the stick holds still.
+ *
+ * 🎚️ ORBIT ALTITUDE (issue 191) sits between the two: an autopilot-style ALT
+ * window of amber LED digits in km. Each digit is a thumbwheel: scroll the
+ * mouse wheel over it (or click its ▲ ▼, or focus the window and use the
+ * arrow keys) to dial the target altitude; SYNC sets it back to the altitude
+ * flown. ENGAGE flies the station there at once on a two-burn transfer
+ * (stationMove.planStationAltitude), clear of every other orbit around the
+ * planet; the stick and MOVE hold until it arrives.
+ */
+
+import type { DeviceUI } from './devices';
+import { subscribeDoors } from './doorsDoc';
+import { FURNITURE, FURNITURE_DEFS } from './furniture';
+import { subscribeFurniture } from './furnitureDoc';
+import { MIN_ALTITUDE_KM, MIN_ORBIT_SEPARATION_KM, maxAltitudeKm, realMsFor } from './orbits';
+import type { CircularOrbit } from './orbits';
+import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFlightRecord, readFuelLevel, subscribeShip } from './shipDoc';
+import { subscribePlanetSummary } from './planetSummary';
+import type { StationRecord } from './stations';
+import {
+  MAX_TRIM_KM,
+  PHASE_STEP_DEG,
+  TRIM_DIRECTIONS,
+  TRIM_FUEL,
+  TRIM_STEP_KM,
+  describeDrift,
+  describeOffset,
+  describeRefusal,
+  describeTrimStatus,
+  helmTrim,
+  isBurnLogFull,
+  planTrim,
+  readBurnFiring,
+  readHelmFiring,
+  readOrbitTrim,
+  readSharedTrim,
+  slotDriftPerHour,
+  slotOffsetAt,
+  slotOrbit,
+  subscribeStationKeeping,
+  trimmedOrbit,
+  writeTrimBurn,
+} from './stationKeeping';
+import type { FiredBurn, OrbitTrim, TrimContext, TrimDirection, TrimRefusal } from './stationKeeping';
+import { atlasComponent, readAtlas } from './stationAtlas';
+import {
+  describeAltitudeRefusal,
+  describeMove,
+  describeMoveRefusal,
+  formatAltitude,
+  formatLongSpan,
+  formatTransferSpan,
+  isMoveActive,
+  otherPlanets,
+  planStationAltitude,
+  planStationMove,
+  quoteMove,
+  readMoveFuelDrawn,
+  stationAltitudeKm,
+  stationPointWithMoveAt,
+  subscribeStationMove,
+  wholeAltitude,
+  writeStationMove,
+} from './stationMove';
+import type { MoveContext } from './stationMove';
+import { isOrbitChange, listStations, planetById } from './stations';
+
+const DEG = Math.PI / 180;
+
+// ── Commander seam (main.ts funnels the room-owner predicate in) ─────────────
+
+let commanderCheck: (() => boolean) | null = null;
+
+/** Who may fly the station from this helm: the same room-owner predicate the
+ *  ship helm uses (main.ts isHelmCommander). Unset ⇒ nobody — the stick
+ *  fails closed. */
+export function setStationHelmCommanderCheck(cb: (() => boolean) | null): void {
+  commanderCheck = cb;
+}
+
+function isCommander(): boolean {
+  return commanderCheck?.() === true;
+}
+
+/** Is the SpacePhone open over the helm (main.ts marks its container
+ *  active)? It opens without taking the focus, so keys pressed at it still
+ *  reach the helm. */
+function phoneOpen(): boolean {
+  return document.getElementById('spacephone-container')?.classList.contains('active') === true;
+}
+
+/** Does `el` take keys of its own (a text field the player is typing in, or
+ *  a select): none of them is a helm command. */
+function takesKeys(el: Element | null): boolean {
+  const tag = el?.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el as HTMLElement | null)?.isContentEditable === true;
+}
+
+function countFunction(tag: string): number {
+  return FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes(tag)).length;
+}
+
+// ── Shared look (the ship helm's palette) ────────────────────────────────────
+
+const GOLD = '#d4a84b';
+const GOLD_DIM = 'rgba(212,168,75,0.75)';
+const AMBER = '#FFB300';
+const GREEN = '#00E676';
+const WARN = '#FFB74D';
+
+/** The refusals that disable the whole stick (as opposed to one direction). */
+const STICK_REFUSALS: readonly TrimRefusal[] = ['not-bolted', 'no-station', 'not-commander', 'no-thrusters', 'no-fuel', 'log-full'];
+
+/** "1m 32s" / "3h 54m" — a real-time span. */
+function formatSpan(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── The station keeping box (canvas) ─────────────────────────────────────────
+
+/** Canvas pixels per CSS pixel (the box is drawn at 2× for sharp text). */
+const CANVAS_SCALE = 2;
+/** The box spans this far along the orbit either side of the slot. */
+const BOX_PHASE_DEG = 5;
+/** The ghost ring: where the drift puts the station this far ahead. */
+const GHOST_MINUTES = 10;
+
+const PUSH: Record<TrimDirection, { x: number; y: number }> = {
+  raise: { x: 0, y: -1 },
+  lower: { x: 0, y: 1 },
+  ahead: { x: 1, y: 0 },
+  back: { x: -1, y: 0 },
+};
+
+function drawKeepingBox(
+  canvas: HTMLCanvasElement,
+  view: { base: CircularOrbit; trim: OrbitTrim | null; planet: string } | null,
+  now: number,
+  firing: FiredBurn | null,
+): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const W = canvas.width;
+  const H = canvas.height;
+  const s = CANVAS_SCALE;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#030A10';
+  ctx.fillRect(0, 0, W, H);
+
+  const cx = W / 2;
+  const cy = H / 2 - 4 * s;
+  const halfW = W / 2 - 16 * s;
+  const halfH = H / 2 - 22 * s;
+  const xOf = (deg: number) => cx + (deg / BOX_PHASE_DEG) * halfW;
+  const yOf = (km: number) => cy - (km / MAX_TRIM_KM) * halfH;
+
+  // Grid: a line per degree along the orbit, per 5 km of altitude.
+  ctx.lineWidth = 1 * s;
+  ctx.strokeStyle = 'rgba(30,136,168,0.18)';
+  ctx.beginPath();
+  for (let d = -BOX_PHASE_DEG; d <= BOX_PHASE_DEG; d++) {
+    ctx.moveTo(xOf(d), yOf(MAX_TRIM_KM));
+    ctx.lineTo(xOf(d), yOf(-MAX_TRIM_KM));
+  }
+  for (let km = -MAX_TRIM_KM; km <= MAX_TRIM_KM; km += 5) {
+    ctx.moveTo(xOf(-BOX_PHASE_DEG), yOf(km));
+    ctx.lineTo(xOf(BOX_PHASE_DEG), yOf(km));
+  }
+  ctx.stroke();
+  // The slot: the crosshair every burn is measured from.
+  ctx.strokeStyle = 'rgba(0,229,255,0.55)';
+  ctx.beginPath();
+  ctx.moveTo(xOf(-BOX_PHASE_DEG), cy);
+  ctx.lineTo(xOf(BOX_PHASE_DEG), cy);
+  ctx.moveTo(cx, yOf(MAX_TRIM_KM));
+  ctx.lineTo(cx, yOf(-MAX_TRIM_KM));
+  ctx.stroke();
+
+  ctx.font = `${8 * s}px monospace`;
+  ctx.fillStyle = 'rgba(212,168,75,0.6)';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'center';
+  ctx.fillText(`HIGHER +${MAX_TRIM_KM} km`, cx, 3 * s);
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(`▼ ${view?.planet ?? 'PLANET'} · LOWER`, cx, H - 3 * s);
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillText('◀', 3 * s, cy);
+  ctx.textAlign = 'right';
+  ctx.fillText('▶', W - 3 * s, cy);
+  ctx.fillStyle = 'rgba(0,229,255,0.7)';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText('SLOT', cx + 3 * s, cy + 2 * s);
+
+  if (!view) return;
+  const offsetDeg = slotOffsetAt(view.base, view.trim, now) / DEG;
+  const dR = view.trim?.dRadiusKm ?? 0;
+  const clampX = (deg: number) => Math.max(xOf(-BOX_PHASE_DEG), Math.min(xOf(BOX_PHASE_DEG), xOf(deg)));
+  const px = clampX(offsetDeg);
+  const py = yOf(dR);
+
+  // Where the drift carries the station in the next ten minutes.
+  const driftDeg = (slotDriftPerHour(view.base, view.trim) / DEG) * (GHOST_MINUTES / 60);
+  if (Math.abs(driftDeg) > 0.01) {
+    const gx = clampX(offsetDeg + driftDeg);
+    ctx.strokeStyle = 'rgba(255,179,0,0.55)';
+    ctx.setLineDash([3 * s, 3 * s]);
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    ctx.lineTo(gx, py);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(gx, py, 4 * s, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // A burn's exhaust, opposite the push.
+  if (firing) {
+    const push = PUSH[firing.dir];
+    const flicker = 0.7 + 0.3 * Math.sin(now / 45);
+    ctx.fillStyle = `rgba(255,138,64,${0.75 * flicker})`;
+    ctx.beginPath();
+    ctx.moveTo(px - push.x * 7 * s - push.y * 4 * s, py - push.y * 7 * s + push.x * 4 * s);
+    ctx.lineTo(px - push.x * (18 + 6 * flicker) * s, py - push.y * (18 + 6 * flicker) * s);
+    ctx.lineTo(px - push.x * 7 * s + push.y * 4 * s, py - push.y * 7 * s - push.x * 4 * s);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // The station: a hull with two panel wings.
+  ctx.fillStyle = AMBER;
+  ctx.fillRect(px - 4 * s, py - 4 * s, 8 * s, 8 * s);
+  ctx.fillStyle = 'rgba(100,181,246,0.9)';
+  ctx.fillRect(px - 13 * s, py - 2 * s, 7 * s, 4 * s);
+  ctx.fillRect(px + 6 * s, py - 2 * s, 7 * s, 4 * s);
+
+  // Off the box: say how far, at the edge it went out of.
+  if (Math.abs(offsetDeg) > BOX_PHASE_DEG) {
+    ctx.fillStyle = WARN;
+    ctx.textBaseline = 'bottom';
+    ctx.textAlign = offsetDeg > 0 ? 'right' : 'left';
+    ctx.fillText(`${Math.abs(offsetDeg).toFixed(1)}° ${offsetDeg > 0 ? 'AHEAD ▶' : '◀ BEHIND'}`, offsetDeg > 0 ? W - 14 * s : 14 * s, py - 7 * s);
+  }
+}
+
+// ── The face ─────────────────────────────────────────────────────────────────
+
+export interface StationHelmDeps {
+  /** Does the module still steer a station — read at every refresh and
+   *  every burn, since a peer can take the gangway down while this is open
+   *  (stationKeeping.steersStation over the live door records), and on the
+   *  ship face every TEXT_REFRESH_S, to offer station keeping once it does. */
+  bolted: () => boolean;
+  /** The station this module belongs to (stations.currentStation). */
+  station: () => StationRecord | null;
+  /** The ship helm face: where a helm that steers no station opens, and
+   *  what the FUEL & DOCKING tab mounts. */
+  shipFace: () => DeviceUI;
+}
+
+/** How far the knob travels in its well (CSS px), and how far a flick must
+ *  go to fire. */
+const KNOB_TRAVEL = 24;
+const FLICK_AT = 0.55;
+/** A refusal the stick just met stays on the status line this long. */
+const FLASH_MS = 2_500;
+/** Text rows refresh at this rate while mounted (the drift moves slowly). */
+const TEXT_REFRESH_S = 0.5;
+
+const ARROW_KEYS: Record<string, TrimDirection> = {
+  ArrowUp: 'raise',
+  ArrowDown: 'lower',
+  ArrowRight: 'ahead',
+  ArrowLeft: 'back',
+};
+
+/** Which way a flick of (dx, dy) screen px points — the longer axis wins. */
+function flickDirection(dx: number, dy: number): TrimDirection | null {
+  if (Math.hypot(dx, dy) < KNOB_TRAVEL * FLICK_AT) return null;
+  if (Math.abs(dx) > Math.abs(dy)) return dx > 0 ? 'ahead' : 'back';
+  return dy < 0 ? 'raise' : 'lower';
+}
+
+// ── 🎚️ The ALT window ────────────────────────────────────────────────────────
+
+/** Digits in the ALT window: up to 999,999 km, past the top orbit anywhere. */
+export const ALT_DIGITS = 6;
+const ALT_MAX = 10 ** ALT_DIGITS - 1;
+
+/** The target altitude after turning digit `place` (0 = units) by `steps`:
+ *  a thumbwheel carries into the digits above, and the window holds 0 to
+ *  999,999 km. */
+export function turnAltitudeDigit(target: number, place: number, steps: number): number {
+  const p = Math.max(0, Math.min(ALT_DIGITS - 1, Math.floor(place)));
+  const next = Math.round(target) + Math.sign(steps) * Math.min(Math.abs(Math.trunc(steps)), 9) * 10 ** p;
+  return Math.max(0, Math.min(ALT_MAX, next));
+}
+
+/** The ALT window's digits, most significant first, and how many of them are
+ *  leading zeros (drawn unlit). */
+export function altitudeDigits(target: number): { digits: number[]; leading: number } {
+  const v = Math.max(0, Math.min(ALT_MAX, Math.round(target)));
+  const digits = String(v).padStart(ALT_DIGITS, '0').split('').map(Number);
+  let leading = 0;
+  while (leading < ALT_DIGITS - 1 && digits[leading] === 0) leading++;
+  return { digits, leading };
+}
+
+/** Wheel travel (CSS px) that turns an ALT digit one step: one notch. */
+const WHEEL_NOTCH_PX = 100;
+
+const LED = '#FFB300';
+const LED_GLOW = '0 0 6px rgba(255,179,0,0.85), 0 0 14px rgba(255,120,0,0.35)';
+
+export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
+  /** Does this helm steer the station now? Not while a one-module station
+   *  flies by itself (🅿️ Fly and park): it keeps no orbit to trim or move
+   *  from until it PARKs, the only move it books meanwhile (others read a
+   *  move booked since as its PARK). */
+  const steering = (): boolean => deps.bolted() && readFlightRecord().status !== 'free-flight';
+  let host: HTMLElement | null = null;
+  let panel: HTMLDivElement | null = null;
+  let face: 'keep' | 'ship' = 'keep';
+  let ship: DeviceUI | null = null;
+  let back: HTMLButtonElement | null = null;
+  let sinceBack = 0;
+  const unsubs: Array<() => void> = [];
+
+  // What the dashboard last read (refresh), and what the box draws each frame.
+  let view: { station: StationRecord; base: CircularOrbit; trim: OrbitTrim | null; planet: string } | null = null;
+  let flash: { text: string; until: number } | null = null;
+  let moveFlash: { text: string; until: number } | null = null;
+  /** 🎚️ The ALT window: the altitude dialled (whole km), whether the hand has
+   *  turned it since it last followed the altitude flown, the digit the
+   *  arrow keys turn (0 = units), and a refusal ENGAGE just met. */
+  let altTarget: number | null = null;
+  let altEdited = false;
+  let altPlace = 2;
+  let altFlash: { text: string; until: number } | null = null;
+  let sinceText = 0;
+  let drag: { id: number; cx: number; cy: number; dx: number; dy: number } | null = null;
+
+  const q = <T extends HTMLElement>(sel: string): T | null => panel?.querySelector<T>(sel) ?? null;
+  const setText = (sel: string, html: string) => {
+    const el = q(sel);
+    if (el && el.innerHTML !== html) el.innerHTML = html;
+  };
+  const check = (ok: boolean) => ok ? `<span style="color:${GREEN};">✔</span>` : '<span style="color:#FF8A80;">✗</span>';
+
+  /** Everything a burn decision reads, fresh. */
+  const readContext = (): TrimContext & { station: StationRecord | null; tanks: number; capacity: number } => {
+    const tanks = countFunction('fuelTank');
+    const capacity = tanks * TANK_CAPACITY;
+    const now = Date.now();
+    const station = deps.station();
+    return {
+      bolted: steering(),
+      station,
+      trim: readOrbitTrim(station),
+      commander: isCommander(),
+      engines: countFunction('engine'),
+      fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
+      now,
+      firing: readBurnFiring(now, station),
+      logFull: isBurnLogFull(),
+      shared: readSharedTrim(station),
+      tanks,
+      capacity,
+    };
+  };
+
+  /** Everything a move decision reads, fresh, on top of the burn's. */
+  const readMoveContext = (c: ReturnType<typeof readContext>): MoveContext => ({
+    bolted: c.bolted,
+    station: c.station,
+    stations: listStations(),
+    commander: c.commander,
+    engines: c.engines,
+    fuel: c.fuel,
+    drawn: readMoveFuelDrawn(),
+    deficit: fuelDrawDeficit('stationMove'),
+    // 0 (refused, no quote) until this install's atlas holds the station.
+    modules: c.station ? atlasComponent(readAtlas(), c.station.welcomeRoomId).size : 0,
+    now: c.now,
+  });
+
+  /** The MOVE TO ANOTHER PLANET block: the move under way, or a quote per
+   *  planet with its MOVE button. */
+  const refreshMove = (c: ReturnType<typeof readContext>): void => {
+    const mc = readMoveContext(c);
+    const station = mc.station;
+    const move = station?.move;
+    let rows = '';
+    let note = '';
+    if (!station) {
+      note = describeMoveRefusal('no-station', null, mc.fuel);
+    } else if (move && isMoveActive(move, mc.now)) {
+      note = describeMove(move, mc.now);
+    } else if (mc.modules < 1) {
+      note = describeMoveRefusal('unknown-layout', null, mc.fuel);
+    } else {
+      for (const planetId of otherPlanets(station)) {
+        const quote = quoteMove(station, mc.stations, planetId, mc.modules, mc.now);
+        const name = esc(planetById(planetId).name);
+        if (!quote) {
+          rows += `<div style="padding:5px 0; font-size:10px; color:${GOLD_DIM};">${name} · no free orbit</div>`;
+          continue;
+        }
+        const plan = planStationMove(mc, planetId);
+        const ready = plan.ok;
+        rows += `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid rgba(212,168,75,0.10); font-size:10px; line-height:1.45;">
+            <span><b style="color:#F0C060;">${name}</b> · slot ${quote.toSlot}<br>
+              <span style="color:${GOLD_DIM};">window in ${formatLongSpan(quote.plan.waitMs)} · ${formatLongSpan(quote.plan.transferMs)} flight · ${quote.plan.deltaVKmS.toFixed(2)} km/s</span><br>
+              ${check(mc.fuel >= quote.fuel)} ${quote.fuel} fuel <span style="color:${GOLD_DIM};">(${mc.modules} module${mc.modules === 1 ? '' : 's'})</span></span>
+            <button type="button" data-sk-move="${esc(planetId)}" title="${esc(ready ? `Leave for ${planetById(planetId).name} at the next launch window` : describeMoveRefusal(plan.refusal, plan.quote, mc.fuel))}" style="padding:5px 10px; border-radius:6px; border:1px solid rgba(255,179,0,0.45); background:rgba(255,179,0,0.10); color:${AMBER}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:0.5px; opacity:${ready ? '1' : '0.45'}; cursor:pointer;">MOVE</button>
+          </div>`;
+      }
+    }
+    setText('#sk-move', rows);
+    const msg = q<HTMLElement>('#sk-move-msg');
+    if (msg) {
+      const text = moveFlash && mc.now < moveFlash.until ? moveFlash.text : note;
+      if (msg.textContent !== text) msg.textContent = text;
+      msg.style.display = text ? 'block' : 'none';
+      msg.style.color = moveFlash && mc.now < moveFlash.until ? WARN : GOLD;
+    }
+  };
+
+  /** Schedule the move to `planetId` — the block's only write. */
+  const startMove = (planetId: string): void => {
+    const c = readContext();
+    const plan = planStationMove(readMoveContext(c), planetId);
+    if (!plan.ok) {
+      moveFlash = { text: describeMoveRefusal(plan.refusal, plan.quote, c.fuel), until: c.now + FLASH_MS * 2 };
+    } else {
+      moveFlash = null;
+      writeStationMove(plan.move);
+    }
+    refresh();
+  };
+
+  /** 🎚️ The ALT window: the digits, the band, and the quote or the change
+   *  under way. Until the hand turns a wheel the window shows the altitude
+   *  flown. */
+  const refreshAltitude = (c: ReturnType<typeof readContext>): void => {
+    const mc = readMoveContext(c);
+    const station = mc.station;
+    const move = station?.move;
+    const active = !!move && isMoveActive(move, mc.now);
+    const flown = station ? wholeAltitude(stationAltitudeKm(station)) : null;
+    if (!altEdited || altTarget === null) altTarget = flown ?? 0;
+    if (active) altEdited = false;
+    // While an altitude change flies, the window holds where it is going.
+    if (active && move?.mode === 'orbit' && move.orbit) {
+      altTarget = wholeAltitude(move.orbit.toRadiusKm - planetById(move.toPlanetId).radiusKm);
+    }
+    const target = altTarget;
+    const { digits, leading } = altitudeDigits(target);
+    let cells = '';
+    digits.forEach((d, i) => {
+      const place = ALT_DIGITS - 1 - i;
+      const lit = i >= leading;
+      const sel = place === altPlace;
+      const roll = (n: number) => (n + 10) % 10;
+      cells += `
+        <div data-alt-place="${place}" title="Scroll to turn the ${place === 0 ? 'units' : `${(10 ** place).toLocaleString('en-US')}s`} wheel" style="display:flex; flex-direction:column; align-items:center; width:26px; cursor:ns-resize; user-select:none;">
+          <button type="button" tabindex="-1" data-alt-step="${place}:1" aria-label="Up ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:3px 3px 0 0; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▲</button>
+          <div style="position:relative; width:24px; height:46px; overflow:hidden; background:linear-gradient(#000 0%, #1a0d00 22%, #120800 50%, #1a0d00 78%, #000 100%); border:1px solid ${sel ? 'rgba(255,179,0,0.85)' : 'rgba(255,179,0,0.25)'}; border-radius:3px; box-shadow:inset 0 0 6px rgba(0,0,0,0.95);">
+            <div style="position:absolute; left:0; right:0; top:-3px; text-align:center; font-size:11px; color:rgba(255,179,0,0.18);">${roll(d + 1)}</div>
+            <div style="position:absolute; left:0; right:0; top:10px; text-align:center; font-size:22px; font-weight:800; color:rgba(255,179,0,0.07);">8</div>
+            <div style="position:absolute; left:0; right:0; top:10px; text-align:center; font-size:22px; font-weight:800; color:${lit ? LED : 'rgba(255,179,0,0.22)'}; text-shadow:${lit ? LED_GLOW : 'none'};">${d}</div>
+            <div style="position:absolute; left:0; right:0; bottom:-3px; text-align:center; font-size:11px; color:rgba(255,179,0,0.18);">${roll(d - 1)}</div>
+          </div>
+          <button type="button" tabindex="-1" data-alt-step="${place}:-1" aria-label="Down ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:0 0 3px 3px; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▼</button>
+        </div>`;
+      // A thin gap marks the thousands, as the window's "1,250" would.
+      if (place === 3) cells += '<div style="width:4px;"></div>';
+    });
+    setText('#sk-alt-digits', cells);
+    const spin = q<HTMLElement>('#sk-alt-digits');
+    const spoken = `${formatAltitude(target)}, turning the ${(10 ** altPlace).toLocaleString('en-US')}s digit`;
+    if (spin && spin.getAttribute('aria-valuetext') !== spoken) {
+      spin.setAttribute('aria-valuenow', String(target));
+      spin.setAttribute('aria-valuetext', spoken);
+    }
+
+    const planet = station ? planetById(station.planetId) : null;
+    setText('#sk-alt-band', planet
+      ? `${formatAltitude(MIN_ALTITUDE_KM)} – ${formatAltitude(maxAltitudeKm(planet.id))} · ${MIN_ORBIT_SEPARATION_KM} km clear of other orbits · flying ${formatAltitude(flown ?? 0)}`
+      : '');
+
+    let note = '';
+    let tone = GOLD;
+    let ready = false;
+    if (!station) {
+      note = esc(describeAltitudeRefusal('no-station', null, mc.fuel));
+      tone = WARN;
+    } else if (active && move) {
+      note = esc(describeMove(move, mc.now));
+      tone = GREEN;
+    } else if (target === flown) {
+      note = 'Scroll a digit to dial a new altitude, then ENGAGE.';
+    } else {
+      const plan = planStationAltitude(mc, target);
+      ready = plan.ok;
+      const quote = plan.quote;
+      const route = quote
+        ? `→ ${formatAltitude(target)} · ${formatTransferSpan(quote.plan.arriveAt - quote.plan.departAt)} transfer · ${quote.plan.deltaVKmS.toFixed(2)} km/s · ${check(mc.fuel >= quote.fuel)} ${quote.fuel} fuel`
+        : '';
+      if (plan.ok) note = route;
+      else {
+        const why = describeAltitudeRefusal(plan.refusal, plan.quote, mc.fuel, station, plan.near ?? null);
+        note = route ? `${route}<br>${esc(why)}` : esc(why);
+        tone = WARN;
+      }
+    }
+    const flashing = altFlash && mc.now < altFlash.until;
+    setText('#sk-alt-msg', flashing ? esc(altFlash!.text) : note);
+    const msg = q<HTMLElement>('#sk-alt-msg');
+    if (msg) msg.style.color = flashing ? WARN : tone;
+    const engage = q<HTMLButtonElement>('#sk-alt-engage');
+    if (engage) {
+      engage.style.opacity = ready ? '1' : '0.45';
+      engage.style.boxShadow = ready ? '0 0 10px rgba(0,230,118,0.45)' : 'none';
+    }
+  };
+
+  /** Turn one ALT wheel. */
+  const turnAltitude = (place: number, steps: number): void => {
+    if (altTarget === null || steps === 0) return;
+    altTarget = turnAltitudeDigit(altTarget, place, steps);
+    altPlace = Math.max(0, Math.min(ALT_DIGITS - 1, place));
+    altEdited = true;
+    altFlash = null;
+    refresh();
+  };
+
+  /** ENGAGE: fly the station to the altitude dialled — the window's only
+   *  write. */
+  const engageAltitude = (): void => {
+    const c = readContext();
+    const target = altTarget;
+    if (target === null) return;
+    const station = c.station;
+    if (station && target === wholeAltitude(stationAltitudeKm(station))) {
+      altFlash = { text: describeAltitudeRefusal('same-altitude', null, c.fuel), until: c.now + FLASH_MS * 2 };
+    } else {
+      const plan = planStationAltitude(readMoveContext(c), target);
+      if (!plan.ok) {
+        altFlash = {
+          text: describeAltitudeRefusal(plan.refusal, plan.quote, c.fuel, station, plan.near ?? null),
+          until: c.now + FLASH_MS * 2,
+        };
+      } else if (writeStationMove(plan.move)) {
+        altFlash = null;
+        altEdited = false;
+      } else {
+        altFlash = { text: 'The burn did not go through. Try ENGAGE again.', until: c.now + FLASH_MS * 2 };
+      }
+    }
+    refresh();
+  };
+
+  /** The room's burn firing now, on the orbit the dashboard shows. */
+  const firingNow = (now: number): FiredBurn | null =>
+    // Or the shared trim's last one, while the helm goes on from that trim.
+    (view ? readHelmFiring(now, view.station) : null);
+
+  const refresh = (): void => {
+    if (!panel) return;
+    sinceText = 0;
+    const c = readContext();
+    const station = c.station;
+    const trim = helmTrim(station, c.trim, c.shared);
+    const base = station ? slotOrbit(station) : null;
+    view = station && base ? { station, base, trim, planet: base.planet.name } : null;
+
+    // 🎚️ An altitude change under way: the station is on its transfer.
+    const changing = station?.move && isOrbitChange(station.move) && isMoveActive(station.move, c.now) ? station.move : null;
+    if (view && base) {
+      const orbit = trimmedOrbit(base, trim);
+      const dR = trim?.dRadiusKm ?? 0;
+      setText('#sk-station', esc(view.station.name));
+      setText('#sk-orbit', `${esc(view.planet)} · slot ${view.station.orbitSlot}`);
+      if (changing?.orbit) {
+        const live = stationPointWithMoveAt(view.station, c.now).radiusKm - base.planet.radiusKm;
+        const to = changing.orbit.toRadiusKm - base.planet.radiusKm;
+        setText('#sk-alt', `${live.toFixed(1)} km <span style="color:${GOLD_DIM};">· ${to > live ? 'climbing' : 'descending'} to ${esc(formatAltitude(to))}</span>`);
+      } else setText('#sk-alt', `${orbit.altitudeKm.toFixed(1)} km <span style="color:${GOLD_DIM};">· ${view.station.orbit ? 'set' : 'slot'} ${base.altitudeKm.toFixed(1)} km${
+        Math.abs(dR) > 1e-9 ? ` (${dR > 0 ? '+' : '−'}${Math.abs(dR).toFixed(1)})` : ''}</span>`);
+      setText('#sk-speed', `${orbit.speedKmS.toFixed(3)} km/s <span style="color:${GOLD_DIM};">· ${formatSpan(realMsFor(orbit.periodS))} per orbit</span>`);
+      setText('#sk-pos', describeOffset(slotOffsetAt(base, trim, c.now)));
+      setText('#sk-drift', describeDrift(slotDriftPerHour(base, trim)));
+    } else {
+      for (const sel of ['#sk-station', '#sk-orbit', '#sk-alt', '#sk-speed', '#sk-pos', '#sk-drift']) {
+        setText(sel, '<span style="color:rgba(212,168,75,0.45);">—</span>');
+      }
+    }
+    setText('#sk-thrusters', c.engines >= 1
+      ? `${check(true)} ${c.engines} engine block${c.engines === 1 ? '' : 's'}`
+      : `${check(false)} none`);
+    setText('#sk-fuel', c.capacity > 0
+      ? `${check(c.fuel >= TRIM_FUEL)} ${c.fuel} / ${c.capacity} <span style="color:${GOLD_DIM};">· ${TRIM_FUEL} per burn</span>`
+      : `${check(false)} no fuel tank`);
+
+    // A refusal that holds for every direction (no station, not the owner,
+    // no thrusters, no fuel) greys the whole stick and is said on the status
+    // line. One that holds for a single push (a burn still firing, the trim
+    // band's edge) leaves the control live: pressing it says why instead.
+    const plan = planTrim(c, 'raise');
+    const stickRefusal = !plan.ok && STICK_REFUSALS.includes(plan.refusal) ? plan.refusal : null;
+    for (const dir of TRIM_DIRECTIONS) {
+      const b = q<HTMLButtonElement>(`[data-sk-dir="${dir}"]`);
+      if (!b) continue;
+      b.disabled = stickRefusal !== null;
+      b.style.opacity = stickRefusal ? '0.4' : '1';
+      b.style.cursor = stickRefusal ? 'not-allowed' : 'pointer';
+    }
+    const well = q<HTMLElement>('#sk-well');
+    if (well) well.style.opacity = stickRefusal ? '0.45' : '1';
+
+    const msg = q<HTMLElement>('#sk-msg');
+    if (msg) {
+      let text: string;
+      let tone: string;
+      if (stickRefusal) {
+        text = describeRefusal(stickRefusal, c.tanks);
+        tone = WARN;
+      } else if (flash && c.now < flash.until) {
+        text = flash.text;
+        tone = WARN;
+      } else if (changing) {
+        text = describeMove(changing, c.now);
+        tone = AMBER;
+      } else if (view) {
+        text = describeTrimStatus(view.base, trim, c.now, firingNow(c.now));
+        tone = text.startsWith('ON STATION') ? GREEN : text.startsWith('BURNING') ? AMBER : GOLD;
+      } else {
+        text = describeRefusal('no-station', c.tanks);
+        tone = WARN;
+      }
+      if (msg.textContent !== text) msg.textContent = text;
+      msg.style.color = tone;
+    }
+    refreshAltitude(c);
+    refreshMove(c);
+  };
+
+  /** One burn — the stick's only write. */
+  const fire = (dir: TrimDirection): void => {
+    const c = readContext();
+    if (isMoveActive(c.station?.move, c.now)) {
+      flash = {
+        text: isOrbitChange(c.station?.move)
+          ? 'The station is changing altitude: the stick holds until it arrives.'
+          : 'The station is moving to another planet: the stick holds until it arrives.',
+        until: c.now + FLASH_MS,
+      };
+      refresh();
+      return;
+    }
+    const plan = planTrim(c, dir);
+    if (!plan.ok) {
+      flash = { text: describeRefusal(plan.refusal, c.tanks, helmTrim(c.station, c.trim, c.shared)?.dRadiusKm ?? 0), until: c.now + FLASH_MS };
+      refresh();
+      return;
+    }
+    flash = writeTrimBurn(plan.burn) ? null : { text: 'The burn did not go through. Try the stick again.', until: c.now + FLASH_MS };
+    refresh();
+  };
+
+  /** The knob: where the hand holds it, else leaning the way a burn pushes. */
+  const placeKnob = (now: number): void => {
+    const knob = q<HTMLElement>('#sk-knob');
+    if (!knob) return;
+    if (drag) {
+      knob.style.transform = `translate(${drag.dx}px, ${drag.dy}px)`;
+      return;
+    }
+    const firing = firingNow(now);
+    const push = firing ? PUSH[firing.dir] : { x: 0, y: 0 };
+    const t = `translate(${push.x * KNOB_TRAVEL * 0.7}px, ${push.y * KNOB_TRAVEL * 0.7}px)`;
+    if (knob.style.transform !== t) knob.style.transform = t;
+  };
+
+  const btn = (dir: TrimDirection, label: string, title: string) =>
+    `<button type="button" data-sk-dir="${dir}" title="${esc(title)}" style="width:100%; padding:5px 2px; border-radius:6px; border:1px solid rgba(255,179,0,0.45); background:rgba(255,179,0,0.10); color:${AMBER}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:0.5px; white-space:pre-line; line-height:1.25;">${label}</button>`;
+  const row = (label: string, id: string) => `
+    <div style="display:flex; justify-content:space-between; gap:10px; padding:4px 0; border-bottom:1px solid rgba(212,168,75,0.10); font-size:11px;">
+      <span style="color:${GOLD_DIM};">${label}</span><span id="${id}" style="text-align:right;"></span>
+    </div>`;
+  const tabStyle = (on: boolean) => `flex:1; padding:6px; border-radius:6px; border:1px solid ${on ? AMBER : 'rgba(212,168,75,0.25)'}; background:${on ? 'rgba(255,179,0,0.14)' : 'transparent'}; color:${on ? AMBER : GOLD_DIM}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:1px; cursor:pointer;`;
+
+  const mountKeep = (h: HTMLElement): void => {
+    panel = document.createElement('div');
+    panel.id = 'device-station-helm-pane';
+    panel.style.cssText = `
+      position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+      width: 400px; max-height: 88vh; overflow-y: auto;
+      background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+      border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+      padding: 18px; display: flex; flex-direction: column;
+      color: ${GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+      box-sizing: border-box; pointer-events: auto;
+    `;
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🛰️ STATION HELM</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="display:flex; gap:6px; margin:8px 0 4px;">
+        <button type="button" data-sk-tab="keep" aria-pressed="true" aria-keyshortcuts="K" style="${tabStyle(true)}">STATION KEEPING [K]</button>
+        <button type="button" data-sk-tab="ship" aria-pressed="false" aria-keyshortcuts="F" style="${tabStyle(false)}">FUEL &amp; DOCKING [F]</button>
+      </div>
+      ${row('STATION', 'sk-station')}
+      ${row('ORBIT', 'sk-orbit')}
+      ${row('ALTITUDE', 'sk-alt')}
+      ${row('SPEED', 'sk-speed')}
+      ${row('POSITION', 'sk-pos')}
+      ${row('DRIFT', 'sk-drift')}
+      ${row('THRUSTERS', 'sk-thrusters')}
+      ${row('PROPELLANT', 'sk-fuel')}
+      <div style="display:flex; gap:10px; align-items:center; justify-content:space-between; margin-top:10px;">
+        <canvas id="sk-box" width="368" height="320" style="width:184px; height:160px; display:block; border-radius:6px; border:1px solid rgba(0,229,255,0.18);" aria-label="Station keeping box: the station against its orbit slot"></canvas>
+        <div style="display:grid; grid-template-columns:44px 74px 44px; grid-template-rows:auto 74px auto; gap:4px; align-items:center; justify-items:stretch;">
+          <span></span>${btn('raise', '▲ RAISE', `Raise the orbit ${TRIM_STEP_KM} km (one burn)`)}<span></span>
+          ${btn('back', '◀\nBACK', `Slide ${PHASE_STEP_DEG}° back along the orbit (one burn)`)}
+          <div id="sk-well" tabindex="0" role="group" aria-label="Trim stick. Flick it, or use the arrow keys: up raises, down lowers, right slides ahead, left slides back." style="position:relative; width:74px; height:74px; border-radius:50%; background:radial-gradient(circle, #0b1620 55%, #05090f); border:1px solid rgba(255,179,0,0.45); box-shadow: inset 0 0 12px rgba(0,0,0,0.9); touch-action:none; cursor:grab; outline-offset:2px;">
+            <div style="position:absolute; left:50%; top:8px; bottom:8px; width:1px; background:rgba(255,179,0,0.18);"></div>
+            <div style="position:absolute; top:50%; left:8px; right:8px; height:1px; background:rgba(255,179,0,0.18);"></div>
+            <div id="sk-knob" style="position:absolute; left:50%; top:50%; width:26px; height:26px; margin:-13px 0 0 -13px; border-radius:50%; background:radial-gradient(circle at 35% 35%, #FFE082, ${AMBER} 55%, #7a4f00); box-shadow:0 2px 6px rgba(0,0,0,0.8); transition:transform 0.18s ease-out; pointer-events:none;"></div>
+          </div>
+          ${btn('ahead', '▶\nAHEAD', `Slide ${PHASE_STEP_DEG}° ahead along the orbit (one burn)`)}
+          <span></span>${btn('lower', '▼ LOWER', `Lower the orbit ${TRIM_STEP_KM} km (one burn)`)}<span></span>
+        </div>
+      </div>
+      <div id="sk-msg" role="status" style="margin-top:10px; padding:9px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.55;"></div>
+      <div style="margin-top:12px; font-size:10px; font-weight:800; color:#F0C060; letter-spacing:1px;">🎚️ ORBIT ALTITUDE</div>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:6px; padding:8px 10px; border-radius:8px; background:linear-gradient(#1b1f26, #0d1015); border:1px solid rgba(212,168,75,0.28); box-shadow:inset 0 1px 0 rgba(255,255,255,0.06), 0 2px 8px rgba(0,0,0,0.6);">
+        <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
+          <span style="font-size:10px; font-weight:800; color:#e8e2d0; letter-spacing:2px;">ALT</span>
+          <span style="font-size:8px; color:${GOLD_DIM};">KM</span>
+        </div>
+        <div id="sk-alt-digits" tabindex="0" role="spinbutton" aria-valuemin="0" aria-valuemax="${ALT_MAX}" aria-label="Target orbit altitude in km. Scroll a digit to turn it, or use the arrow keys: up and down turn the selected digit, left and right pick the digit." style="display:flex; gap:3px; padding:3px 5px; border-radius:5px; background:#050302; border:1px solid rgba(0,0,0,0.9); outline-offset:2px;"></div>
+        <div style="display:flex; flex-direction:column; gap:5px; margin-left:auto;">
+          <button type="button" id="sk-alt-engage" title="Fly the station to the altitude dialled (two burns)" style="padding:6px 10px; border-radius:6px; border:1px solid rgba(0,230,118,0.6); background:rgba(0,230,118,0.10); color:${GREEN}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:1px; cursor:pointer;">ENGAGE</button>
+          <button type="button" id="sk-alt-sync" title="Set the window back to the altitude flown" style="padding:4px 10px; border-radius:6px; border:1px solid rgba(255,179,0,0.45); background:rgba(255,179,0,0.08); color:${AMBER}; font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">SYNC</button>
+        </div>
+      </div>
+      <div id="sk-alt-band" style="margin-top:5px; font-size:9px; color:${GOLD_DIM}; line-height:1.5;"></div>
+      <div id="sk-alt-msg" role="status" style="margin-top:4px; font-size:10px; line-height:1.55;"></div>
+      <div style="margin-top:12px; font-size:10px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚚 MOVE TO ANOTHER PLANET</div>
+      <div id="sk-move"></div>
+      <div id="sk-move-msg" role="status" style="margin-top:6px; font-size:10px; line-height:1.55;"></div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px; line-height:1.5;">
+        SSF STATION KEEPING v0 · circular orbit · a lower orbit runs faster · one flick = one burn = ${TRIM_FUEL} fuel
+      </div>
+    `;
+
+    // Clicks stay in the panel: the window-level canvas handler releases the
+    // focus on any click that reaches it.
+    panel.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const target = e.target as HTMLElement;
+      const dirBtn = target.closest<HTMLButtonElement>('[data-sk-dir]');
+      if (dirBtn && !dirBtn.disabled) {
+        fire(dirBtn.dataset.skDir as TrimDirection);
+        return;
+      }
+      const step = target.closest<HTMLElement>('[data-alt-step]');
+      if (step?.dataset.altStep) {
+        const [place, dir] = step.dataset.altStep.split(':').map(Number);
+        turnAltitude(place, dir);
+        return;
+      }
+      if (target.closest('#sk-alt-engage')) {
+        engageAltitude();
+        return;
+      }
+      if (target.closest('#sk-alt-sync')) {
+        altEdited = false;
+        altFlash = null;
+        refresh();
+        return;
+      }
+      const wheelCell = target.closest<HTMLElement>('[data-alt-place]');
+      if (wheelCell?.dataset.altPlace) {
+        altPlace = Number(wheelCell.dataset.altPlace);
+        q<HTMLElement>('#sk-alt-digits')?.focus();
+        refresh();
+        return;
+      }
+      const moveBtn = target.closest<HTMLButtonElement>('[data-sk-move]');
+      if (moveBtn?.dataset.skMove) {
+        startMove(moveBtn.dataset.skMove);
+        return;
+      }
+      const tab = target.closest<HTMLElement>('[data-sk-tab]');
+      if (tab?.dataset.skTab === 'ship') showShip();
+    });
+
+    // 🎚️ The ALT wheels: the mouse wheel turns the digit under the pointer.
+    // Not passive, so the panel does not scroll and the game camera does not
+    // zoom while a wheel turns.
+    const altWindow = panel.querySelector<HTMLElement>('#sk-alt-digits')!;
+    let wheelRest = 0;
+    let wheelPlace = -1;
+    altWindow.addEventListener('wheel', (e) => {
+      const cell = (e.target as HTMLElement).closest<HTMLElement>('[data-alt-place]');
+      if (!cell?.dataset.altPlace) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // A part-turn on one wheel never carries over to the next one.
+      const place = Number(cell.dataset.altPlace);
+      if (place !== wheelPlace) {
+        wheelPlace = place;
+        wheelRest = 0;
+      }
+      // A notched wheel sends about 100 px (or 3 lines) per notch; a
+      // touchpad sends many small deltas, gathered here into notches.
+      wheelRest += e.deltaMode === 0 ? e.deltaY : e.deltaMode === 1 ? e.deltaY * (WHEEL_NOTCH_PX / 3) : e.deltaY * WHEEL_NOTCH_PX;
+      const notches = Math.trunc(wheelRest / WHEEL_NOTCH_PX);
+      if (notches === 0) return;
+      wheelRest -= notches * WHEEL_NOTCH_PX;
+      turnAltitude(place, -notches);
+    }, { passive: false });
+    altWindow.addEventListener('keydown', (e) => {
+      // The window's own keys only: the digit buttons inside it are for the
+      // pointer (out of the tab order, as each refresh redraws them), and a
+      // key on one never engages.
+      if (e.target !== altWindow) return;
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        turnAltitude(altPlace, e.key === 'ArrowUp' ? 1 : -1);
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        altPlace = Math.max(0, Math.min(ALT_DIGITS - 1, altPlace + (e.key === 'ArrowLeft' ? 1 : -1)));
+        refresh();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        engageAltitude();
+      }
+    });
+
+    const well = panel.querySelector<HTMLElement>('#sk-well')!;
+    well.addEventListener('keydown', (e) => {
+      const dir = ARROW_KEYS[e.key];
+      if (!dir) return;
+      // No key pressed at the SpacePhone fires a burn.
+      if (phoneOpen()) return;
+      e.preventDefault();
+      // One press, one burn: a held key's auto-repeat is not a new press
+      // (it would fire again the moment the last burn ends).
+      if (e.repeat) return;
+      fire(dir);
+    });
+    well.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // That also keeps the press from focusing the stick: focus it here, so
+      // the arrow keys steer it next.
+      well.focus({ preventScroll: true });
+      const r = well.getBoundingClientRect();
+      drag = { id: e.pointerId, cx: r.left + r.width / 2, cy: r.top + r.height / 2, dx: 0, dy: 0 };
+      well.setPointerCapture?.(e.pointerId);
+      well.style.cursor = 'grabbing';
+      const knob = q<HTMLElement>('#sk-knob');
+      if (knob) knob.style.transition = 'none';
+    });
+    well.addEventListener('pointermove', (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      let dx = e.clientX - drag.cx;
+      let dy = e.clientY - drag.cy;
+      const len = Math.hypot(dx, dy);
+      if (len > KNOB_TRAVEL) {
+        dx = (dx / len) * KNOB_TRAVEL;
+        dy = (dy / len) * KNOB_TRAVEL;
+      }
+      drag.dx = dx;
+      drag.dy = dy;
+      placeKnob(Date.now());
+    });
+    const letGo = (e: PointerEvent, flick: boolean) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const dir = flick ? flickDirection(drag.dx, drag.dy) : null;
+      drag = null;
+      well.style.cursor = 'grab';
+      const knob = q<HTMLElement>('#sk-knob');
+      if (knob) knob.style.transition = 'transform 0.18s ease-out';
+      if (dir) fire(dir);
+      placeKnob(Date.now());
+    };
+    well.addEventListener('pointerup', (e) => letGo(e, true));
+    well.addEventListener('pointercancel', (e) => letGo(e, false));
+
+    h.appendChild(panel);
+    unsubs.push(subscribeStationKeeping(refresh));
+    unsubs.push(subscribeStationMove(refresh));
+    unsubs.push(subscribeShip(refresh));
+    unsubs.push(subscribeFurniture(refresh));
+    unsubs.push(subscribeDoors(refresh));
+    // 🪐 A peer's trim of this station, or a newly learned neighbour.
+    unsubs.push(subscribePlanetSummary(refresh));
+    refresh();
+    placeKnob(Date.now());
+    // Somewhere for the arrow keys to land: Tab cannot bring the focus here
+    // (main.ts binds it to the SpacePhone), so the stick takes it as this face
+    // opens, on the way back from FUEL & DOCKING too, unless the player is
+    // typing (the SpacePhone's chat). preventScroll: the panel sits over the
+    // canvas.
+    if (!takesKeys(document.activeElement)) well.focus({ preventScroll: true });
+  };
+
+  const unmountKeep = (): void => {
+    for (const off of unsubs.splice(0)) off();
+    drag = null;
+    panel?.remove();
+    panel = null;
+  };
+
+  /** On the ship face, the way back to station keeping: offered while the
+   *  module steers a station, so a helm opened as a ship's offers it once a
+   *  gangway is paired or the room is saved as a station. Never switches
+   *  faces itself: the pilot may be at the ship face's REFUEL or DOCK. */
+  const placeBack = (): void => {
+    sinceBack = 0;
+    if (!host || face !== 'ship') return;
+    const steers = steering();
+    if (steers && !back) {
+      back = document.createElement('button');
+      back.type = 'button';
+      back.textContent = '◂ STATION KEEPING [K]';
+      back.setAttribute('aria-keyshortcuts', 'K');
+      back.style.cssText = `position:absolute; top:14px; left:50%; transform:translateX(-50%); pointer-events:auto; padding:7px 14px; border-radius:8px; border:1px solid ${AMBER}; background:rgba(4,8,22,0.94); color:${AMBER}; font-family:'SF Mono','Monaco','Consolas',monospace; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer; box-shadow:0 6px 24px rgba(0,0,0,0.8);`;
+      back.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showKeep();
+      });
+      host.appendChild(back);
+    } else if (!steers && back) {
+      back.remove();
+      back = null;
+    }
+  };
+
+  const mountShip = (h: HTMLElement): void => {
+    face = 'ship';
+    ship = deps.shipFace();
+    ship.mount(h);
+    placeBack();
+  };
+
+  const showShip = (): void => {
+    if (!host || face === 'ship') return;
+    unmountKeep();
+    mountShip(host);
+  };
+
+  const showKeep = (): void => {
+    if (!host || face === 'keep') return;
+    ship?.unmount();
+    ship = null;
+    back?.remove();
+    back = null;
+    face = 'keep';
+    mountKeep(host);
+  };
+
+  /** The faces' keys, since Tab is the SpacePhone's and the stick keeps the
+   *  arrows: F opens FUEL & DOCKING, and K comes back to station keeping
+   *  while the ship face offers it. Never while typing, at the SpacePhone, or
+   *  with a modifier held (the browser's own shortcuts). */
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (takesKeys(e.target as Element | null) || phoneOpen()) return;
+    const key = e.key.toLowerCase();
+    if (key === 'f' && face === 'keep') {
+      e.preventDefault();
+      showShip();
+    } else if (key === 'k' && face === 'ship' && back) {
+      e.preventDefault();
+      showKeep();
+    }
+  };
+
+  return {
+    mount(h: HTMLElement): void {
+      host = h;
+      window.addEventListener('keydown', onKey);
+      if (steering()) {
+        face = 'keep';
+        mountKeep(h);
+      } else {
+        mountShip(h);
+      }
+    },
+    unmount(): void {
+      window.removeEventListener('keydown', onKey);
+      if (face === 'ship') {
+        ship?.unmount();
+        ship = null;
+        back?.remove();
+        back = null;
+      } else {
+        unmountKeep();
+      }
+      face = 'keep';
+      host = null;
+      view = null;
+      flash = null;
+      moveFlash = null;
+      altTarget = null;
+      altEdited = false;
+      altFlash = null;
+    },
+    update(dt: number): void {
+      if (face === 'ship') {
+        ship?.update(dt);
+        if ((sinceBack += dt) >= TEXT_REFRESH_S) placeBack();
+        return;
+      }
+      if (!panel) return;
+      sinceText += dt;
+      // No longer steering the station (a gangway taken down, or 🅿️ the
+      // station flying by itself): the ship face, as a fresh mount opens.
+      if (sinceText >= TEXT_REFRESH_S && !steering()) { showShip(); return; }
+      if (sinceText >= TEXT_REFRESH_S || (flash && Date.now() >= flash.until)) {
+        if (flash && Date.now() >= flash.until) flash = null;
+        if (moveFlash && Date.now() >= moveFlash.until) moveFlash = null;
+        if (altFlash && Date.now() >= altFlash.until) altFlash = null;
+        refresh();
+      }
+      const now = Date.now();
+      placeKnob(now);
+      const canvas = q<HTMLCanvasElement>('#sk-box');
+      if (canvas) drawKeepingBox(canvas, view, now, firingNow(now));
+    },
+  };
+}

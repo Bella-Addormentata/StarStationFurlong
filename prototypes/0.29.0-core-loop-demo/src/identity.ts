@@ -16,6 +16,7 @@
 const ID_STORAGE_KEY = 'ssf-player-id';
 const NAME_STORAGE_KEY = 'ssf-player-name';
 const DEFAULT_ROOM_STORAGE_KEY = 'ssf-default-room-id';
+const STATION_OWNER_STORAGE_KEY = 'ssf-station-owner-id';
 
 /** Same cap as the room-name editor — keeps phone rows from overflowing. */
 export const PLAYER_NAME_MAX_LENGTH = 24;
@@ -26,6 +27,7 @@ export const PLAYER_NAME_MAX_LENGTH = 24;
 let cachedPlayerId: string | null = null;
 let cachedPlayerName: string | null = null;
 let cachedDefaultRoomId: string | null = null;
+let cachedStationOwnerId: string | null = null;
 
 /**
  * Mint a UUID for the player id. crypto.randomUUID is unavailable outside
@@ -95,6 +97,26 @@ function mintDefaultRoomId(): string {
   try { crypto.getRandomValues(bytes); }
   catch { for (let i = 0; i < 6; i++) bytes[i] = Math.floor(Math.random() * 256); }
   return 'home-' + Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * 🪐 Per-install id this install's own station records go out under in the
+ * planet summary (planetSummary.ts `ownerInstall`). Station ids are each
+ * install's own, so two installs can save one place under one id; this tells
+ * their records apart. Its own UUID, not the player id: summaries travel to
+ * rooms the player never visits, and nothing there should name the player.
+ * Minted once + cached, mirroring getPlayerId.
+ */
+export function getStationOwnerId(): string {
+  if (cachedStationOwnerId) return cachedStationOwnerId;
+  try {
+    const existing = localStorage.getItem(STATION_OWNER_STORAGE_KEY);
+    if (existing) { cachedStationOwnerId = existing; return existing; }
+  } catch { /* privacy mode — mint a session-scoped id below */ }
+  const minted = mintPlayerUuid();
+  cachedStationOwnerId = minted;
+  try { localStorage.setItem(STATION_OWNER_STORAGE_KEY, minted); } catch { /* session-scoped */ }
+  return minted;
 }
 
 /** Default display name: Clone-XXXX from the last 4 hex chars of the id. */

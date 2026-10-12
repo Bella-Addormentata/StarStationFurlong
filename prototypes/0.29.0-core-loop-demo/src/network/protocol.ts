@@ -173,7 +173,8 @@ export interface ChatMessage {
 //                 bit4: swimming — pool seat, 'swim' pose [🏊],
 //                 bit5: diving — mid dive arc, yaw = arc heading [🏊‍♂️],
 //                 bits6–7: tick LANE KIND [#115] — 0 movement (all pre-#115
-//                 traffic), 1 air-hockey mallet, 2 air-hockey puck; bits 0–5
+//                 traffic), 1 air-hockey mallet, 2 air-hockey puck,
+//                 3 insatiable-alligators head/ball [#185]; bits 0–5
 //                 are kind-scoped for kinds ≠ 0. See tickKind() below.)
 //   [1..5)   f32  x
 //   [5..9)   f32  z
@@ -239,6 +240,11 @@ export const TICK_KIND_MOVEMENT = 0;
 export const TICK_KIND_AH_MALLET = 1;
 /** Kind 2: air-hockey puck (bits0–4 speed, bit5 active; yaw = heading). */
 export const TICK_KIND_AH_PUCK = 2;
+/** Kind 3: insatiable alligators (#185) — the LAST free kind, so it carries
+ *  both of that game's entities: bit5 0 = a head (bit0 jaw down, bits2–4
+ *  seat), 1 = a ball (bits0–4 speed, yaw = heading, seq = index ‖ counter).
+ *  See games/alligators.ts. A further game needs a subtype here, not a kind. */
+export const TICK_KIND_ALLIGATORS = 3;
 
 /** Lane kind of a received tick (0–3). */
 export function tickKind(flags: number): number {

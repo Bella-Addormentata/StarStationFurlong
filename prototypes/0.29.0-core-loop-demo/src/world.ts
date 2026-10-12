@@ -6,7 +6,7 @@
 
 import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
-import { readDoorPolicy } from "./doorPolicy";
+import { readDockGates, readDoorPolicy } from "./doorPolicy";
 import { setLocalPresence } from "./localPresence";
 import {
   physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
@@ -22,9 +22,11 @@ import {
 } from "./poolWaiter";
 import type { WorkoutPose } from "./voxelCharacter";
 import { InputManager } from "./input";
-import { findSeatAt, rebuildSeats, SEATS } from "./seats";
+import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
+import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
+import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
   canRunCroupier,
@@ -40,11 +42,30 @@ import {
   closeCrapsTable,
   crapsBeatLine,
   tickAutoStickman,
+  tickManualCraps,
 } from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
-import { readRobotConfig, subscribeRobot } from "./robotDoc";
+import {
+  finishDisassemblyJob, raiseDisassemblyLabor, readDisassemblyJobs, readDisassemblyJobsIfComplete, readRobotConfig, subscribeRobot,
+} from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
+import {
+  disassemblyCandidates,
+  doorsJoinedTo,
+  jobAnnouncement,
+  jobDueAt,
+  jobFraction,
+  laborHoursFor,
+  removalBlocker,
+  type CandidateInput,
+  type DisassemblyCandidate,
+  type DisassemblyJob,
+  type JobAnnouncement,
+} from "./disassembly";
+// 🚀 The robot captain (robot pilot routes §2a): where a Ship pilot robot
+// stands and what it announces, from the ship's shared timetable.
+import { pilotLine, pilotPost, pilotSpeechAfter, readPilotView, type PilotSpeech } from "./shipPilot";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
@@ -62,8 +83,18 @@ import {
   bridgeDeckY,
   floorCutOutlines,
   isFloorCutKind,
+  rotXZ,
+  type Rot,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
+// 🎲🎡 #226: craps + roulette play on the 3D table — the frame driver, the
+// focused-table controls, and the pieces' handle type.
+import {
+  casinoTablesFrame,
+  createCasinoTableUI,
+  forgetCasinoTable,
+} from "./casinoTableSession";
+import type { CasinoTableVisualHandle } from "./casinoTable3d";
 import { northDoorUnlocked } from "./stationParts";
 import { rebuildObstacles } from "./obstacles";
 import {
@@ -80,17 +111,29 @@ import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
+  readAllDoorsIfComplete,
   writeDoorPairing,
+  readPhysicalDoors,
   deleteDoorPairing,
   reapOrphanPairings,
+  transactDoorWrites,
+  writeDoorTombstone,
   type DoorRecord,
 } from "./doorsDoc";
-import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { roomHalfExtents, roomWalkBounds, roomCupolas, readCupolaWalls } from "./floorPlanDoc";
+import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
-import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
+import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled, sharedRoomsNaming } from "./stationAtlas";
+// 🛰️ A helm bolted into a station flies the STATION (station keeping).
+import { steersStation } from "./stationKeeping";
+import { createStationHelmUI } from "./stationHelm";
+import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
-import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
+import {
+  chooseArrivalDoor, doorBeingCrossed,
+  type ArrivalDoor, type CrossingDoor,
+} from "./doorMatch";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -118,16 +161,18 @@ import {
   createGameTableUI,
   createHelmUI,
   createCashierUI,
-  createRouletteUI,
-  createCrapsUI,
   createSlotMachineUI,
   operateActiveSlotMachine,
   clearPendingSlotPlays,
   createCoinPusherUI,
+  coinPusherGearCard,
   createRobotDockUI,
   createCloneVatUI,
+  createDeparturesBoardUI,
+  readDepartureScreen,
   readLiveRoomStatus,
 } from "./devices";
+import { boardGate } from "./departuresDoc";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import {
   closeCoinPusher,
@@ -139,6 +184,8 @@ import { registerFurnitureHandles } from "./furnitureHandles";
 import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
+  TvScreenHandle,
+  ArcadeScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
@@ -147,10 +194,15 @@ import type {
   SlotMachineCabinetControl,
   CoinPusherVisualHandle,
   AirHockeyVisualHandle,
+  AlligatorsVisualHandle,
   DeviceUI,
   DeviceTarget,
 } from "./devices";
-import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
+import { subscribeGames, readTable, clearTable } from "./games/gamesDoc";
+import { seatOf, standIndexFor } from "./games/checkersTable";
+import { chessSeatOf, chessStandIndexFor } from "./games/chessTable";
+import { createCheckersTableLayer } from "./checkersSession";
+import { createChessTableLayer, paintGameTable } from "./chessSession";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -158,9 +210,21 @@ import {
   closeAirHockeyTable,
   createAirHockeyUI,
   registerAirHockeyVisual,
+  airHockeyGearCard,
 } from "./airHockeySession";
+// 🐊 #185: the insatiable-alligators live layer — the same hand-off as air
+// hockey's: built handles + frame time in, everything else in the session.
+import {
+  alligatorsFrame,
+  closeAlligatorsTable,
+  createAlligatorsUI,
+  registerAlligatorsVisual,
+  alligatorsGearCard,
+} from "./alligatorsSession";
+import { closeGearCard, toggleGearCard } from "./settingsGear";
+import { IA_SEATS } from "./games/alligators";
 import { deviceFocus } from "./deviceFocus";
-import { roomEdit, canEditRoom } from "./editMode";
+import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
 import { showHint } from "./hud";
 // 🎉 Party props: the focused panels and the doc the moment lives in.
 import {
@@ -168,8 +232,20 @@ import {
   type PartyDeviceDeps,
 } from "./partyUI";
 import { getIdentityPub } from "./keypair";
-import { getPlayerName } from "./identity";
+import { getPlayerId, getPlayerName } from "./identity";
 import { listContacts, getContact } from "./contacts";
+// 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
+// screen view the prop draws.
+import { createSmartTvUI } from "./tvUI";
+import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
+import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
+import { tvScreenView } from "./tvDoc";
+// 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
+// attract card the prop draws.
+import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
+import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
+import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
+import { arcadeScreenView } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -226,6 +302,12 @@ interface RemoteAvatar {
   diveAge: number | null;
   /** 🏊‍♂️ replica y at arc start — the receiver replays its own parabola. */
   diveStartY: number;
+  /** 🪑 The seat this peer is in or sliding onto (seatOccupancy), or null. */
+  seatId: string | null;
+  /** 🪑 When this client first saw that claim (performance.now ms). */
+  seatSince: number;
+  /** 🪑 The peer's latest movement-tick counter — breaks a seat clash. */
+  seq: number;
 }
 
 /** 🛑📐 #80: render each room as an OCTAGON barrel (walls + 45° roof + basement)
@@ -289,6 +371,14 @@ export class World {
   private robotQuietUntil = 0;
   /** Edge detector for the player-entered-the-room moment (see above). */
   private hadActivePlayer = false;
+  /** 🚀 The robot captain's lines said, per charging-dock robot (local,
+   *  like the robot: each rider's copy speaks for itself), and the
+   *  countdown (s) to the next reading of the timetable. */
+  private pilotSpeech = new Map<string, PilotSpeech>();
+  private pilotTimer = 0;
+  /** 🔧 The job, and the last tenth of it, each Disassemble robot
+   *  announced (local, like the captain's lines). */
+  private disassemblySaid = new Map<string, JobAnnouncement>();
   /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
@@ -313,6 +403,8 @@ export class World {
   /** 🚪 #159: what the live hull's door apertures were cut from (see
    *  hullDoorSignature) — lets a refresh skip an identical rebuild. */
   private octagonHullDoorSig = "";
+  /** 🔭 cupolaSignature() when reconcileCupola last re-cut the room. */
+  private cupolaSig = "";
   /** 🚪 #159: the apertures may be stale — the docking system said a frame
    *  moved or vanished, or a door began to open or finished closing
    *  (onDoorApertureChange). Settled once per frame in update(), so a join
@@ -350,6 +442,17 @@ export class World {
    * completed, never failed, never disposed).
    */
   public isTransitBusy: (() => boolean) | null = null;
+  /**
+   * 🗺️ #192: the holotable's BEAM INTO, wired by main.ts like
+   * onAdapterTransit. `roomPassFor` names the pass this install holds for a
+   * room (none: no beam); `onBeamInto` enters a room by its pass, the ACCESS
+   * beam, so the table reaches no room the ACCESS app couldn't. It runs at
+   * the click, with `afterStepBack` to beam once the table has let you go.
+   */
+  public roomPassFor: ((roomId: string) => string | undefined) | null = null;
+  public onBeamInto:
+    | ((seed: string, afterStepBack: (go: () => void) => void) => void)
+    | null = null;
   /**
    * Persistent gangway vestibules, one per PAIRED door (#51). Spawned the
    * frame a door's pairing completes, resting lightly translucent and
@@ -395,6 +498,14 @@ export class World {
    *  slot-machine visuals; the userData key on the upper platform mesh carries
    *  the handle so the traversal below picks it up. */
   private coinPusherVisuals: Map<string, CoinPusherVisualHandle> = new Map();
+  /** 📺 Smart-TV screens (#186), keyed by item id — redrawn at ~2 Hz from
+   *  the room record (tvDoc.tvScreenView); the handle dedupes identical views. */
+  private tvScreens: Map<string, TvScreenHandle> = new Map();
+  /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the chip). */
+  private tvTimer = 0;
+  /** 🕹 Arcade cabinet screens (#193), keyed by item id — redrawn at ~2 Hz
+   *  from the room record (arcadeDoc.arcadeScreenView), on the TV's timer. */
+  private arcadeScreens: Map<string, ArcadeScreenHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -419,6 +530,12 @@ export class World {
   /** 🏒 Air-hockey table visuals, keyed by item id — filed here, then handed
    *  to the session layer, which drives them (airHockeyFrame). */
   private airHockeyVisuals: Map<string, AirHockeyVisualHandle> = new Map();
+  /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — filed
+   *  here, then handed to the session layer, which drives them. */
+  private alligatorsVisuals: Map<string, AlligatorsVisualHandle> = new Map();
+  /** 🎲🎡 #226: craps / roulette table pieces, keyed by item id — driven every
+   *  frame by casinoTablesFrame. */
+  private casinoTableVisuals: Map<string, CasinoTableVisualHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -505,6 +622,10 @@ export class World {
     this.player.onSeatSettled = (seat) => {
       if (seat.firstPerson) this.onFirstPersonSeat?.(seat.faceAngle);
     };
+    // 🪑 One person per seat: the walk re-checks on arrival, because someone
+    // can sit down while we are on the way.
+    this.player.seatGate = (seat) => this.freeSeatForLocal(seat);
+    this.player.onSeatRefused = (seat) => showHint(World.seatTakenHint(seat));
 
     // Furniture layout sync (issue #60 E4): reconcile the local room to the
     // shared `furniture` map whenever it changes. Subscribed ONCE here (not per
@@ -843,6 +964,7 @@ export class World {
           side: THREE.BackSide,
         }),
       );
+      glow.name = "ambientPlanetGlow";
       glow.position.copy(ambient.position);
       this.platformGroup.add(glow);
     }
@@ -1092,6 +1214,7 @@ export class World {
       collectWindowOpenings(),
       this.collectWallpaper(),
       doorOpenings,
+      readCupolaWalls(),
     );
     this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
@@ -1182,6 +1305,8 @@ export class World {
       const shell = buildOctagonShell(
         { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
         { opacity: 0.85 },
+        {},
+        pose.cupola ?? null, // 🔭 its cupola end walls, when gossiped
       );
       this.disableFog(shell.group); // stay crisp at station distances
       mod.add(shell.group);
@@ -1433,6 +1558,32 @@ export class World {
     this.addOctagonHull();
   }
 
+  /** 🔭 What the cupola rendering depends on: the stored walls and the room
+   *  size it is resolved against. */
+  private cupolaSignature(): string {
+    return JSON.stringify([roomHalfExtents(), readCupolaWalls()]);
+  }
+
+  /**
+   * 🔭 Follow the floorPlan `cupola` setting: a change (the owner set or
+   * cleared it, here or on another client) re-cuts the hull, the floor's
+   * corners and the walkable grid. Called on every floorPlan change, so it
+   * bails when the cupola signature is unchanged.
+   */
+  public reconcileCupola(): void {
+    const sig = this.cupolaSignature();
+    if (sig === this.cupolaSig) return;
+    this.cupolaSig = sig;
+    rebakeWalkableGrid();
+    this.player.onWalkShapeChanged(); // out of a glass corner; replan the walk
+    if (this.platformFloor) {
+      const old = this.platformFloor.geometry;
+      this.platformFloor.geometry = this.makeFloorGeometry();
+      old.dispose();
+    }
+    if (OCTAGON_HULL && this.octagonHull) this.addOctagonHull();
+  }
+
   /**
    * 🖼️ #80 S6: rebuild the octagon hull when the shared wall-covering set
    * changes (paint / clear) — mirrors reconcileWindowLayout. The rebuild
@@ -1454,14 +1605,21 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     const w = 2 * halfX,
       d = 2 * halfZ;
-    if (this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
+    // 🔭 cupola end walls cut their floor corners at 45°.
+    const cupolas = OCTAGON_HULL ? roomCupolas() : [];
+    if (!cupolas.length && this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
       return new THREE.PlaneGeometry(w, d);
     }
     const shape = new THREE.Shape();
-    shape.moveTo(-halfX, -halfZ);
-    shape.lineTo(halfX, -halfZ);
-    shape.lineTo(halfX, halfZ);
-    shape.lineTo(-halfX, halfZ);
+    if (cupolas.length) {
+      const outline = cupolaFloorOutline(cupolas);
+      outline.forEach((p, i) => (i === 0 ? shape.moveTo(p.x, -p.z) : shape.lineTo(p.x, -p.z)));
+    } else {
+      shape.moveTo(-halfX, -halfZ);
+      shape.lineTo(halfX, -halfZ);
+      shape.lineTo(halfX, halfZ);
+      shape.lineTo(-halfX, halfZ);
+    }
     shape.closePath();
     for (const h of this.floorHoles) {
       const path = new THREE.Path();
@@ -1544,9 +1702,7 @@ export class World {
     // the previous listener first, so rebuilds never stack duplicates.
     this.unsubscribeGameBoards?.();
     const repaintBoards = () => {
-      for (const [id, top] of this.gameTableTops) {
-        top.setBoard(readGame(id)?.board ?? null);
-      }
+      for (const [id, top] of this.gameTableTops) paintGameTable(top, id);
     };
     this.unsubscribeGameBoards = subscribeGames(repaintBoards);
     repaintBoards();
@@ -1586,7 +1742,7 @@ export class World {
         // degrades correctly — if the helper ever stops filing this kind,
         // the paint no-ops rather than driving a handle nothing tracks.
         const spawnedTop = sinks.gameTableTops.get(item.id);
-        if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+        if (spawnedTop) paintGameTable(spawnedTop, item.id);
         // 🏒 #115: hand the filed air-hockey handle to the session layer,
         // which drives it every frame (airHockeyFrame) and converts its LOCAL
         // coords to the world-space tick wire — read back from the sink for
@@ -1594,6 +1750,15 @@ export class World {
         const hockey = sinks.airHockeyVisuals.get(item.id);
         if (hockey) {
           registerAirHockeyVisual(item.id, hockey, {
+            x: item.pos.x,
+            z: item.pos.z,
+            rot: item.rot,
+          });
+        }
+        // 🐊 #185: the same hand-off for an alligators table.
+        const gators = sinks.alligatorsVisuals.get(item.id);
+        if (gators) {
+          registerAlligatorsVisual(item.id, gators, {
             x: item.pos.x,
             z: item.pos.z,
             rot: item.rot,
@@ -1643,6 +1808,10 @@ export class World {
       coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
+      tvScreens: this.tvScreens,
+      arcadeScreens: this.arcadeScreens,
+      alligatorsVisuals: this.alligatorsVisuals,
+      casinoTableVisuals: this.casinoTableVisuals,
     };
   }
 
@@ -3067,8 +3236,31 @@ export class World {
     // before any chip is drawn, so the traversal below can't reach them all.
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
+    closeGearCard(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
+    this.tvScreens.delete(itemId);
+    this.arcadeScreens.delete(itemId);
+    // 📺 #186: a removed set takes its theatre and this client's hold on its
+    // remote with it — nothing keeps playing, or heartbeating, to a record
+    // whose set is gone (no-ops for every other kind).
+    if (isTvTheatreOpen(itemId)) closeTvTheatre();
+    forgetTv(itemId);
+    // And its WATCH chip, now, not at the next half-second tick: a chip
+    // left clickable in that gap would reopen the removed set's theatre,
+    // which later ticks would never close. Runs pre-splice, so the removed
+    // id is excluded by hand; under the same drive flag as the tick, so a
+    // teardown cannot put a departed room's chip back up.
+    if (tvDriveArmed()) {
+      updateTvChip(FURNITURE.filter((i) => isTvKind(i.kind) && i.id !== itemId).map((i) => i.id));
+    }
+    // 🕹 #193: likewise a removed cabinet takes its stage (which swallows
+    // the world's keys while it is up) and this page's seat with it.
+    if (isArcadeStageOpen(itemId)) closeArcadeStage();
+    forgetCabinet(itemId);
+    this.alligatorsVisuals.delete(itemId);
+    this.casinoTableVisuals.delete(itemId);
+    forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3093,6 +3285,10 @@ export class World {
       // only fires on true removals; the delete is idempotent, safe for every
       // observing client to run.
       closeAirHockeyTable(itemId);
+      clearTable(itemId);
+    } else if (removedKind === "alligators-table") {
+      // 🐊 #185: the same as air hockey — runtime session out, doc state wiped.
+      closeAlligatorsTable(itemId);
       clearTable(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
@@ -3752,6 +3948,8 @@ export class World {
     if (this.isPlayerActive()) {
       this.player.update(deltaTime, inputManager);
     }
+    // 🪑 Stamp the moment a local seat claim begins (a seat clash compares it).
+    this.syncLocalSeat();
 
     // Animate networked peer replicas (issue #21 — fox avatars, not spheres)
     this.updateRemoteAvatars(deltaTime);
@@ -3829,6 +4027,12 @@ export class World {
     // writes, 30/20 Hz tick sends, remote smoothing, scoreboard/goal lamps.
     // The session module owns the registry; this is its only clock.
     airHockeyFrame(deltaTime);
+    // 🐊 #185: and every alligators table — operator ball sim, bites → doc
+    // writes, head/ball tick sends, remote smoothing, heads/birds/displays.
+    alligatorsFrame(deltaTime);
+    // 🎲🎡 #226: lay every craps / roulette table's synced state onto its 3D
+    // pieces (chips, dice, pucks, wheel) — for every client, focused or not.
+    casinoTablesFrame(deltaTime, this.casinoTableVisuals);
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -3846,6 +4050,14 @@ export class World {
       this.robotQuietUntil = performance.now() + 1000;
     }
     this.hadActivePlayer = !!activePlayer;
+    // 🚀 Ship pilot robots: re-read the ship's timetable twice a second
+    // (where the captain stands, what it says) — never per frame.
+    this.pilotTimer -= deltaTime;
+    if (this.pilotTimer <= 0) {
+      this.pilotTimer = World.PILOT_TICK_SECS;
+      this.updateShipPilots();
+      this.updateDisassembly();
+    }
     for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
 
     this.updateCoachFollow(deltaTime, activePlayer, zoomLevel === 1);
@@ -3878,9 +4090,42 @@ export class World {
       if (this.screenStatusTimer >= 1.0) {
         this.screenStatusTimer = 0;
         const status = readLiveRoomStatus();
-        for (const screen of this.wallScreens.values()) {
-          screen.updateStatus(status);
+        for (const [itemId, screen] of this.wallScreens) {
+          // 🚏📋 A departures board adds its own rows (its gate setting is
+          // its own); the plain terminal's status carries none.
+          screen.updateStatus(
+            screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
+          );
         }
+      }
+    }
+
+    // 📺 #186: the TVs at 2 Hz — each screen draws the view the room record
+    // implies (the handle skips unchanged views), a holder renews its remote
+    // and keeps the room's clock alive, and the HUD chip says what is on.
+    // Driven here, not by timers of their own, so a removed set stops dead.
+    this.tvTimer += deltaTime;
+    if (this.tvTimer >= 0.5) {
+      this.tvTimer = 0;
+      // Nothing while a room is being left (tvSession's drive flag, cleared
+      // synchronously by leaveRoomNow and armed again once the next room's
+      // docs and layout are bound): this loop keeps running through the
+      // leave's awaited flush, with the old furniture and the old TV doc
+      // still here — a tick then would put the departed room's WATCH chip
+      // back up, with its theatre a click away. Otherwise unconditionally:
+      // with the last set gone, an empty list is what takes a stale chip
+      // down and clears the session's bookkeeping.
+      if (tvDriveArmed()) {
+        const tvIds = FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
+        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+        tickTvRoom(tvIds);
+        updateTvChip(tvIds);
+        // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
+        // P1 page renews its seat — with an empty list too, and under the
+        // same flag: a seat is not renewed into a room being left either.
+        const arcadeIds = FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+        for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
+        tickArcadeRoom(arcadeIds);
       }
     }
 
@@ -3916,6 +4161,71 @@ export class World {
   }
 
   public remotePlayers: Map<string, RemoteAvatar> = new Map();
+
+  // ── 🪑 One person per seat (seatOccupancy.ts) ──────────────────────────────
+  /** The seat the local player is in or sliding onto, as last seen. */
+  private localSeatId: string | null = null;
+  /** When that claim began (performance.now ms). */
+  private localSeatSince = 0;
+  /** The local movement-tick counter as last sent (main.ts). */
+  private localTickSeq = 0;
+
+  /** main.ts reports each movement tick it sends — the local half of the
+   *  counter comparison that breaks a seat clash. */
+  public noteSentTickSeq(seq: number): void {
+    this.localTickSeq = seq & 0xffff;
+  }
+
+  /** Re-read the local player's seat, stamping when a new claim began. */
+  private syncLocalSeat(): string | null {
+    const id = this.player.getSeatedSeatId();
+    if (id !== this.localSeatId) {
+      this.localSeatId = id;
+      this.localSeatSince = performance.now();
+    }
+    return id;
+  }
+
+  /** What to say when every spot of the kind asked for is taken. */
+  private static seatTakenHint(seat: Seat): string {
+    return seat.lie
+      ? "Someone is already in that bunk."
+      : "Someone is already sitting there.";
+  }
+
+  /** Seats other players are in or sliding onto. */
+  private seatsTakenByOthers(): Set<string> {
+    const taken = new Set<string>();
+    for (const avatar of this.remotePlayers.values()) {
+      if (avatar.seatId) taken.add(avatar.seatId);
+    }
+    return taken;
+  }
+
+  /** The seat to send the local player to for `seat` — see freeSeatFor. */
+  private freeSeatForLocal(seat: Seat): Seat | null {
+    return freeSeatFor(SEATS, seat, this.seatsTakenByOthers());
+  }
+
+  /**
+   * 🪑 A peer has just been placed in the seat the local player is in: both
+   * sat down within one network delay of each other (the click and the last
+   * step before sitting refuse a taken seat, so nothing slower gets here).
+   * keepsSeat gives the two games the same answer from opposite sides; the
+   * one it does not keep stands up.
+   */
+  private settleSeatClash(avatar: RemoteAvatar): void {
+    if (!avatar.seatId || avatar.seatId !== this.syncLocalSeat()) return;
+    const keep = keepsSeat({
+      mineSince: this.localSeatSince,
+      theirsSince: avatar.seatSince,
+      mySeq: this.localTickSeq,
+      theirSeq: avatar.seq,
+    });
+    if (keep) return;
+    this.player.evictFromSeat();
+    showHint("Someone sat down there at the same moment.");
+  }
 
   /** Stable [0,1) hash of a peer id (FNV-1a) — drives the per-peer fur tint. */
   private static peerHue01(id: string): number {
@@ -3965,6 +4275,7 @@ export class World {
     elevated: boolean = false,
     swimming: boolean = false,
     diving: boolean = false,
+    seq: number = 0,
   ) {
     // 🏊/🛏️ The tick carries no y — derive the seat height locally: SEATS is
     // built from the SAME synced furniture doc on every client, so the seat
@@ -4009,6 +4320,16 @@ export class World {
             seated && priorAvatar
             ? priorAvatar.elevY
             : 0;
+    // 🪑 The seat this peer holds, settled on it or still sliding in. A seated
+    // peer the lookup misses keeps the claim it had, for the same reason the
+    // height above is held: this end's SEATS can lag the sender's. A wade
+    // into the pool is "seated" for its slide too, but it is open water and
+    // no seat (swimming, bit4, is up for that whole slide).
+    const seatId = seated && !swimming
+      ? (seatClaimedBy(SEATS, { x, z, facing, elevated })?.id ??
+        priorAvatar?.seatId ??
+        null)
+      : null;
     const avatar = priorAvatar;
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
@@ -4037,7 +4358,11 @@ export class World {
         diving,
         diveAge: diving ? 0 : null,
         diveStartY: 0,
+        seatId,
+        seatSince: performance.now(),
+        seq,
       });
+      this.settleSeatClash(this.remotePlayers.get(id)!);
       return;
     }
     // 🏊‍♂️ bit5 rising edge: start the local arc replay from wherever the
@@ -4065,6 +4390,12 @@ export class World {
     avatar.elevY = elevY;
     avatar.swimming = swimming;
     avatar.diving = diving;
+    if (seatId !== avatar.seatId) {
+      avatar.seatId = seatId;
+      avatar.seatSince = performance.now();
+    }
+    avatar.seq = seq;
+    this.settleSeatClash(avatar);
   }
 
   /**
@@ -4250,9 +4581,13 @@ export class World {
       }
       // Clicks landing on a chair/sofa footprint become sit requests:
       // walk to the seat front, turn back-to-the-chair, and sit down.
+      // 🪑 One person per seat: a taken seat sends the click to a free spot
+      // on the same piece, and a full piece says so instead of walking over.
       const seat = findSeatAt(x, z);
       if (seat) {
-        this.player.navigateToSeat(seat);
+        const free = this.freeSeatForLocal(seat);
+        if (free) this.player.navigateToSeat(free);
+        else showHint(World.seatTakenHint(seat));
       } else {
         this.player.navigateTo(x, z);
       }
@@ -4506,20 +4841,39 @@ export class World {
     }
     const p = this.player.getPosition();
     const now = performance.now();
-    let inAnyAperture = false;
+
+    // 🚪 #182: ONE door is being crossed, resolved before the loop.
+    //
+    // The aperture frame comes from the door's PHYSICAL wall, not its logical
+    // id (#91: the ids agree for the cardinals under both layouts, but every
+    // free `d:` door read as east/west, so one on the north or south wall
+    // could never trip the threshold) — and from that wall's SIDE as well as
+    // its axis (#182: without the sign each door also answered for its mirror
+    // on the opposite wall, which is both the wrong-room arrival and dorkmo's
+    // phantom doors). The test itself is pure and lives in doorMatch, beside
+    // the arrival chooser, pinned by doorMatch.test.ts.
+    //
+    // Rebuilt per frame because a door can be added, removed or slid along its
+    // wall at any time by the room's editor; DOORS is a handful of entries and
+    // this runs only while first-person with a live avatar.
+    const crossingDoors: CrossingDoor[] = DOORS.map((d) => ({
+      id: d.id,
+      wall: this.wallOfDoor(d.id),
+      front: d.front, // read-only here — no need to clone
+    }));
+    const crossing = doorBeingCrossed(
+      crossingDoors,
+      { x: p.x, z: p.z },
+      // Derived from the movement CLAMP, not from the wall: the trip point has
+      // to be the last centimetres of travel, or ordinary walking along the
+      // wall crosses it.
+      roomWalkBounds(),
+      // 🚪 #91: the crossable band is the door's actual opening, derived rather
+      // than the old 0.95 literal that was sized for the retired small door.
+      DOOR_OPENING_WIDTH,
+    );
+
     for (const door of DOORS) {
-      // Aperture frame: lateral offset along the wall vs distance INTO it.
-      // 🚪 #91: the aperture frame comes from the door's PHYSICAL wall, not its
-      // logical id. The ids happen to agree for the cardinals under both
-      // layouts, but every free `d:` door read as east/west — so one on the
-      // north or south wall could never trip the threshold and was impossible
-      // to walk through in first person.
-      const doorWall = this.wallOfDoor(door.id);
-      const northSouth = doorWall === "y-" || doorWall === "y+";
-      const lateral = Math.abs(
-        northSouth ? p.x - door.front.x : p.z - door.front.z,
-      );
-      const wallCoord = Math.abs(northSouth ? p.z : p.x);
       const approachDist = Math.hypot(p.x - door.front.x, p.z - door.front.z);
 
       const state = ds.getDockingState(door.id);
@@ -4546,23 +4900,8 @@ export class World {
 
       // Threshold: pressed into the open doorway (the manual-movement clamp
       // stops the body at the wall, so "as far in as possible" IS the cross).
-      // Derived from the CLAMP, not from the wall: the trip point has to be the
-      // last few centimetres of travel, or ordinary walking along the wall
-      // crosses it. (It was `half - 0.85` against a `half - 0.8` clamp — a 5 cm
-      // sliver you could only enter by pressing in. When the walkable box was
-      // widened to `half - WALL_CLEARANCE` that literal silently became a 35 cm
-      // strip of normal floor, so strolling past a paired door in first person
-      // fired an unrequested transit.)
-      const { boundX, boundZ } = roomWalkBounds();
-      const apThresh = (northSouth ? boundZ : boundX) - 0.05;
-      // 🚪 #91: the crossable band is the door's actual opening (half-width),
-      // derived rather than the old 0.95 literal that was sized for the
-      // retired small door — with the 2 m opening it left the edges of the
-      // doorway un-crossable.
-      const inAperture = lateral < DOOR_OPENING_WIDTH / 2 && wallCoord > apThresh;
-      if (inAperture) inAnyAperture = true;
       if (
-        inAperture &&
+        crossing?.id === door.id &&
         paired &&
         passable &&
         this.fpTransitArmed &&
@@ -4577,7 +4916,9 @@ export class World {
         this.onAdapterTransit?.(state!.connectedRoomAddress, door.id);
       }
     }
-    if (!inAnyAperture) this.fpTransitArmed = true;
+    // Step clear of EVERY doorway to re-arm — including a disabled or unpaired
+    // one, which is why doorBeingCrossed is told about those doors too.
+    if (!crossing) this.fpTransitArmed = true;
   }
 
   private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
@@ -4960,22 +5301,6 @@ export class World {
     };
   }
 
-  /**
-   * 🎰 #76: retarget a table's device focus to a free STANDING slot so the
-   * avatar walks up to an OPEN position (auto-bumping past taken ones) facing
-   * the table, then the game/betting UI opens — instead of everyone stacking on
-   * the single fixed device front. The reserved wheel-head is never auto-picked
-   * (it's the owner's croupier robot's spot); falls back to the device's own
-   * front when every open slot is occupied. Occupancy is inferred from remote
-   * avatar positions (Phase 1 — a synced claim map lands in a later slice).
-   */
-  private standTarget(device: DeviceTarget): DeviceTarget {
-    const stand = this.pickFreeStand(device.id);
-    return stand
-      ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
-      : device;
-  }
-
   /** Nearest open, REACHABLE (non-wheel-head) stand slot for the item, or null.
    *  "Taken" = a remote avatar within 0.7 m of the slot front. A slot must also
    *  be A*-reachable from the player — otherwise picking it would strand the
@@ -4987,6 +5312,26 @@ export class World {
     const slots = standsForItem(itemId).filter((s) => !s.role);
     if (slots.length === 0) return null;
     const others = this.getRemoteAvatarSnapshots();
+    const me = this.player.getPosition();
+    const reachable = this.standReachability();
+    const free = slots.filter(
+      (s) =>
+        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
+        reachable(s),
+    );
+    if (free.length === 0) return null;
+    free.sort(
+      (a, b) =>
+        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
+        Math.hypot(b.front.x - me.x, b.front.z - me.z),
+    );
+    return free[0];
+  }
+
+  /** "Can the player walk to this stand?" — A* from the player's cell (snapped
+   *  to solid ground first), or already standing at it. Shared by
+   *  pickFreeStand and the 🎲 #227 own-end pick at a checkers table. */
+  private standReachability(): (s: StandSlot) => boolean {
     const me = this.player.getPosition();
     let mr = worldToRow(me.z);
     let mc = worldToCol(me.x);
@@ -5007,21 +5352,9 @@ export class World {
         }
       }
     }
-    const reachable = (s: StandSlot) =>
+    return (s: StandSlot) =>
       Math.hypot(s.front.x - me.x, s.front.z - me.z) < 0.6 ||
       findPath(mr, mc, worldToRow(s.front.z), worldToCol(s.front.x)).length > 0;
-    const free = slots.filter(
-      (s) =>
-        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
-        reachable(s),
-    );
-    if (free.length === 0) return null;
-    free.sort(
-      (a, b) =>
-        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
-        Math.hypot(b.front.x - me.x, b.front.z - me.z),
-    );
-    return free[0];
   }
 
   /**
@@ -5073,6 +5406,8 @@ export class World {
     if (this.robotsPatrol !== waiterPatrol) {
       for (const bot of this.robots.values()) bot.dispose();
       this.robots.clear();
+      this.pilotSpeech.clear(); // 🚀 fresh robots, fresh announcements
+      this.disassemblySaid.clear();
       this.robotsPatrol = waiterPatrol;
       // 🔇 Fresh room: hold every robot line for the first second (owner
       // request — no greeting barked mid-load/entry; the class opens its
@@ -5137,6 +5472,261 @@ export class World {
     spawnFixedBubble(anchorId, text, x, z, ROBOT_BUBBLE_Y);
     speakRobotLine(text, x, z);
     return true;
+  }
+
+  /** 🚀 How often (s) the Ship pilot robots re-read the timetable. */
+  private static readonly PILOT_TICK_SECS = 0.5;
+  /** 🚀 How far inside the berth door the captain stands to announce. */
+  private static readonly PILOT_DOOR_STANDOFF = 1.8;
+  /** 🚀 How far to the side of the helm's stand the captain stands. */
+  private static readonly PILOT_HELM_SIDESTEP = 0.8;
+
+  /**
+   * 🚀 The robot captain (robot pilot routes, design §2a; shipPilot.ts).
+   * Every 'pilot' robot is pointed at its post: the running route's captain
+   * (route.robotDockId) goes to the helm or the berth door as the ship's
+   * timetable says (shipPilot.pilotPost); any other pilot robot waits on its
+   * dock. The captain's announcements (shipPilot.pilotLine) go through
+   * robotSay like every robot line, and are marked said only once
+   * delivered. A parked captain stays on its dock and says nothing (the
+   * ferry keeps its timetable). Local to this game, never synced.
+   */
+  private updateShipPilots(): void {
+    let any = false;
+    for (const key of this.robots.keys()) {
+      if (readRobotConfig(key)?.routine === "pilot") {
+        any = true;
+        break;
+      }
+    }
+    if (!any) {
+      this.pilotSpeech.clear();
+      return;
+    }
+    const now = Date.now();
+    // The route's end is still read (and said from the berth door) for a
+    // while once STOP or the fuel has finished the route.
+    let view: ReturnType<typeof readPilotView> = null;
+    try {
+      view = readPilotView(now);
+    } catch (err) {
+      console.warn("[pilot] timetable read failed:", err);
+    }
+    for (const [key, bot] of this.robots) {
+      const cfg = readRobotConfig(key);
+      if (cfg?.routine !== "pilot") {
+        bot.setPilotPost(null);
+        this.pilotSpeech.delete(key);
+        continue;
+      }
+      const captain = view && view.route.robotDockId === key ? view : null;
+      // A parked pilot's post is its dock (PoolWaiter.update also parks it
+      // before the pilot branch), so none is handed over.
+      const post = cfg.parked === true ? null : pilotPost(captain?.f ?? null, now);
+      const door = captain ? this.pilotDoorPost(captain.route.shipPort) : null;
+      bot.setPilotPost(
+        post === "helm" ? (this.pilotHelmPost() ?? door) : post === "door" ? door : null,
+      );
+      if (!captain || cfg.parked === true) continue;
+      const mem = this.pilotSpeech.get(key) ?? null;
+      const line = pilotLine(captain, mem);
+      if (!line) continue;
+      const p = bot.getPosition();
+      if (this.robotSay(`robotsay:${key}`, line.text, p.x, p.z)) {
+        this.pilotSpeech.set(key, pilotSpeechAfter(captain, mem, line));
+      }
+    }
+  }
+
+  /** 🚀 The captain's helm post: beside the first helm console's device
+   *  stand (a step to its side, so a player can still walk up and use the
+   *  helm), facing the console. */
+  private pilotHelmPost(): { x: number; z: number; faceAngle: number } | null {
+    const helm = FURNITURE.find((i) => FURNITURE_DEFS[i.kind]?.functions?.includes("helm"));
+    const d = helm ? findDevice(helm.id) : null;
+    if (!d) return null;
+    const side = World.PILOT_HELM_SIDESTEP;
+    const want = {
+      x: d.front.x + Math.cos(d.faceAngle) * side,
+      z: d.front.z - Math.sin(d.faceAngle) * side,
+    };
+    const cell = nearestWalkableCell(want.x, want.z, 2) ?? d.front;
+    return { x: cell.x, z: cell.z, faceAngle: d.faceAngle };
+  }
+
+  /** 🚀 The captain's berth-door post: just inside the route's dock-port
+   *  door (toward the room's middle, on walkable floor), facing the door. */
+  private pilotDoorPost(doorId: string): { x: number; z: number; faceAngle: number } | null {
+    const g = this.dockingSystem?.getDoorGroups().get(doorId);
+    if (!g) return null;
+    const dx = g.position.x;
+    const dz = g.position.z;
+    const len = Math.hypot(dx, dz);
+    const k = len > 0.01 ? Math.max(0, len - World.PILOT_DOOR_STANDOFF) / len : 0;
+    const want = { x: dx * k, z: dz * k };
+    const cell = nearestWalkableCell(want.x, want.z, 3) ?? want;
+    return { x: cell.x, z: cell.z, faceAngle: Math.atan2(dx - cell.x, dz - cell.z) };
+  }
+
+  /** 🔧 How far apart robots on the same job stand at its door. */
+  private static readonly WORK_SPACING = 0.9;
+
+  /** 🔧 What every disassembly check reads, as of now (disassembly.ts). */
+  private disassemblyInput(): CandidateInput {
+    // The room's doors read whole, or a capped read flagged as partial: a
+    // door to the module it left out would stay unsealed (removalBlocker
+    // holds the job).
+    const whole = readAllDoorsIfComplete();
+    return {
+      atlas: readAtlas(),
+      hereRoomId: World.activeRoomId(),
+      doors: whole ?? readAllDoors(),
+      ...(whole ? {} : { doorsPartial: true }),
+      ...(readDisassemblyJobsIfComplete() ? {} : { jobsPartial: true }),
+      playerId: getPlayerId(),
+      identityPub: getIdentityPub(),
+      welcomeRoomId: currentStation()?.welcomeRoomId ?? null,
+      // What this room's visitors published of the rooms naming a module,
+      // past the ones the atlas keeps.
+      namedBy: (roomId) => sharedRoomsNaming(roomId),
+    };
+  }
+
+  /** 🔧 The modules this room's robots could take apart (the dock console). */
+  public disassemblyCandidates(): DisassemblyCandidate[] {
+    return disassemblyCandidates(this.disassemblyInput());
+  }
+
+  /**
+   * 🔧 The Disassemble robots (#192, disassembly.ts). A job whose labor has
+   * run out ends here, on the deed holder's client while they are in the
+   * room (their two tabs would write the same thing): the room's doors to
+   * the module are sealed as UNDOCK seals them, the job is marked done, and
+   * the module leaves the atlas for every map. A blocker found then (the
+   * module was joined to another meanwhile) holds it at 100% until it
+   * clears. Each robot on an open job works at that job's door, side by
+   * side with its crew, saying how far along it is, until the labor is done;
+   * then, and for any other Disassemble robot, it waits on its dock. The
+   * job's door is the one it was opened at while that still joins the
+   * module, else another door of this room that does (the first was
+   * undocked since); while none does, its robots wait on their docks, and
+   * the job ends detached when its labor is due. Run twice a second.
+   */
+  private updateDisassembly(): void {
+    const now = Date.now();
+    let jobs = readDisassemblyJobs();
+    if (jobs.length === 0) {
+      for (const [key, bot] of this.robots) {
+        if (readRobotConfig(key)?.routine === "disassemble") bot.setWorkPost(null);
+      }
+      this.disassemblySaid.clear();
+      return;
+    }
+    // Only the deed holder's client, standing in the room, ends a job: a
+    // module off the station can't be put back, so it is the deed's, not
+    // every venture shareholder's (main.ts's authority split), and the deed
+    // holder is who sets robots to a module. Their copy of the doors and the
+    // atlas is the room as it is. (The job record is peer-written, like all
+    // of the room doc: this decides what this client does, roomOwner.ts.)
+    if (this.hadActivePlayer && holdsRoomDeed()) {
+      let ended = false;
+      for (const job of jobs) {
+        const due = jobDueAt(job);
+        if (due !== null && due <= now) ended = this.finishDisassembly(job, due) || ended;
+      }
+      if (ended) jobs = readDisassemblyJobs();
+    }
+    let doorsNow: Pick<CandidateInput, "doors" | "hereRoomId"> | null = null;
+    const workDoors = new Map<string, string | null>();
+    const workDoor = (job: DisassemblyJob): string | null => {
+      if (!workDoors.has(job.roomId)) {
+        doorsNow ??= { doors: readAllDoors(), hereRoomId: World.activeRoomId() };
+        const joined = doorsJoinedTo(doorsNow, job.roomId);
+        workDoors.set(job.roomId, (joined.find((d) => d.doorId === job.doorId) ?? joined[0])?.doorId ?? null);
+      }
+      return workDoors.get(job.roomId) ?? null;
+    };
+    for (const [key, bot] of this.robots) {
+      const cfg = readRobotConfig(key);
+      if (cfg?.routine !== "disassemble") {
+        bot.setWorkPost(null);
+        this.disassemblySaid.delete(key);
+        continue;
+      }
+      const job = cfg.target ? jobs.find((j) => j.roomId === cfg.target) : undefined;
+      const slot = job ? job.crew.indexOf(key) : -1;
+      if (!job || job.finishedAt !== undefined || slot < 0) {
+        bot.setWorkPost(null);
+        this.disassemblySaid.delete(key);
+        continue;
+      }
+      // In the crew: it works at the job's door while labor is left, then
+      // waits on its dock until the module comes off (a blocker, or the
+      // deed holder away), having said it is done.
+      const fraction = jobFraction(job, now);
+      const door = fraction < 1 ? workDoor(job) : null;
+      bot.setWorkPost(door ? this.workPost(door, slot) : null);
+      // A line on starting on the job and at each tenth of it, once
+      // delivered (a robot set to another module starts over there).
+      const line = jobAnnouncement(job, fraction, this.disassemblySaid.get(key));
+      if (!line) continue;
+      const p = bot.getPosition();
+      if (this.robotSay(`robotsay:${key}`, line.text, p.x, p.z)) this.disassemblySaid.set(key, line.said);
+    }
+  }
+
+  /** 🔧 End a job whose labor ran out at `due`. True when the job changed. */
+  private finishDisassembly(job: DisassemblyJob, due: number): boolean {
+    const input = this.disassemblyInput();
+    // Nothing is decided on a capped read of the doors, not even that none
+    // joins the module now, nor of the robot records: the job holds until
+    // they read whole.
+    if (input.doorsPartial || input.jobsPartial) return false;
+    const joined = doorsJoinedTo(input, job.roomId);
+    if (joined.length === 0) {
+      // Disconnected some other way first: nothing here to take off. (Or it
+      // already came off, and a write that crossed the end reopened the job.)
+      finishDisassemblyJob(job.roomId, due, isDismantled(job.roomId) ? "removed" : "detached");
+      return true;
+    }
+    // The labor is worked out here, from the module's size, not taken from
+    // the record: a job costed below it (the module grew, or the record was
+    // written short) is raised to it and carries on.
+    const labor = laborHoursFor(input.atlas[job.roomId]?.dims);
+    if (job.laborHours < labor) {
+      raiseDisassemblyLabor(job.roomId, labor);
+      return true;
+    }
+    if (removalBlocker(input, job.roomId)) return false;
+    // One transaction of the room doc: the doors sealed, the job done and the
+    // module's tombstone in the shared atlas land together (dismantleInAtlas
+    // publishes it there, and writes our own atlas in the same step), so no
+    // reload or visitor ever finds the job ended and the module still mapped.
+    transactDoorWrites(() => {
+      for (const d of joined) writeDoorTombstone(d.doorId, d.address);
+      finishDisassemblyJob(job.roomId, due, "removed");
+      dismantleInAtlas(job.roomId, due);
+    });
+    const speaker = job.crew.map((k) => this.robots.get(k)).find((b) => b);
+    if (speaker) {
+      const p = speaker.getPosition();
+      this.robotSay(`robotsay:${job.crew[0]}`, `✅ ${job.name} is off the station.`, p.x, p.z);
+    }
+    return true;
+  }
+
+  /** 🔧 Where the `slot`th robot of a job stands: inside the job's door like
+   *  the captain's berth post, then side by side along the wall. */
+  private workPost(doorId: string, slot: number): { x: number; z: number; faceAngle: number } | null {
+    const base = this.pilotDoorPost(doorId);
+    if (!base || slot <= 0) return base;
+    const step = Math.ceil(slot / 2) * (slot % 2 === 1 ? 1 : -1) * World.WORK_SPACING;
+    const want = {
+      x: base.x + Math.cos(base.faceAngle) * step,
+      z: base.z - Math.sin(base.faceAngle) * step,
+    };
+    const cell = nearestWalkableCell(want.x, want.z, 2) ?? base;
+    return { x: cell.x, z: cell.z, faceAngle: base.faceAngle };
   }
 
   /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (an
@@ -5277,6 +5867,19 @@ export class World {
         else tickAutoCroupier(t.id);
       }
     }
+    // 🎲 #226: a manual craps table (no robot running it): the page whose
+    // manual ROLL slid the dice out carries that shooter's turn, focused or
+    // not (tickManualCraps returns at once on every other editor's page).
+    else if (crapsTables.length && canEditRoom().ok) {
+      for (const t of crapsTables) if (!isCroupierLive(t.id)) tickManualCraps(t.id);
+    }
+    // ⚖️ Fair tables: every client with chips down commits its seed while the
+    // window is open and reveals it at "no more bets" (fairTableSeeds.ts).
+    if (tables.length) {
+      const me = getPlayerId();
+      for (const t of tables) tickFairSeeds(t.id, t.kind === "craps-table" ? "craps" : "roulette", me);
+    }
+    forgetMissingTables(new Set(tables.map((t) => t.id)));
 
     // 🎰 Slot machines: ONE session operates every machine in the room (one
     // lease, slotCroupier.ts), so a player's balance has a single slot
@@ -5323,6 +5926,8 @@ export class World {
       routineOf(k) !== "custom" &&
       routineOf(k) !== "coach" && // a coach runs its class, never a table
       routineOf(k) !== "dance" && // 🎉 a dancer is on the floor, never at a table
+      routineOf(k) !== "pilot" && // 🚀 a ship pilot keeps to the helm and the berth door
+      routineOf(k) !== "disassemble" && // 🔧 a robot taking a module apart stays on the job
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,
@@ -5404,9 +6009,42 @@ export class World {
    * build the kind-appropriate focused UI, and hand both to the
    * DeviceFocusController, which wires its hooks into navigateToDevice.
    */
+  /**
+   * 🕹 The arcade cabinet's panel in one of its views (#193): PLAY at the
+   * controls, SETTINGS from the ⚙️. Each view swaps to the other in place.
+   */
+  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView): DeviceUI {
+    return createArcadeCabinetUI({
+      itemId: deviceId,
+      myPub: () => getIdentityPub(),
+      myName: () => getPlayerName(),
+      canEdit: () => canEditRoom().ok,
+      openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId)),
+      view,
+      openSettings: () => { deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, "settings")); },
+      openPlay: () => { deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, "play")); },
+    });
+  }
+
+  /**
+   * 🕹 The ⚙️ low on a cabinet's front (#193, the slot machine's kick-panel
+   * gears in #241): anyone who clicks it is walked to the cabinet and shown
+   * its SETTINGS view — read-only unless they can edit the room, the gate
+   * arcadeDoc's writes check again. Already at that cabinet, the panel just
+   * swaps to it.
+   */
+  public handleArcadeControl(deviceId: string, control: "settings"): boolean {
+    const device = findDevice(deviceId);
+    if (!device || device.kind !== "arcade" || control !== "settings" || !this.isPlayerActive()) return false;
+    const ui = this.arcadeCabinetUI(deviceId, "settings");
+    if (deviceFocus.getActiveDeviceId() === deviceId && deviceFocus.replaceFocusedUI(ui)) return true;
+    deviceFocus.beginFocus(this.player, device, ui);
+    return true;
+  }
+
   public handleSlotMachineControl(
     deviceId: string,
-    control: SlotMachineCabinetControl | "service",
+    control: SlotMachineCabinetControl | "service" | "settings",
     value?: number,
   ): boolean {
     const device = findDevice(deviceId);
@@ -5418,9 +6056,11 @@ export class World {
       onDenominationChange: (amount: number) => visual?.setDenomination(amount),
       onMessage: (message: string) => visual?.showMessage(message),
     };
-    if (control === "service") {
+    // ⚙️ (kick panel) opens the machine's card for anyone, read-only unless
+    // they can edit the room; the marquee's service key stays owner-only.
+    if (control === "service" || control === "settings") {
       const permission = canEditRoom();
-      if (!permission.ok) {
+      if (control === "service" && !permission.ok) {
         visual?.showMessage("OWNER ONLY");
         showHint(permission.reason);
         return true;
@@ -5448,6 +6088,19 @@ export class World {
     const operated = operateActiveSlotMachine(deviceId, control, value);
     if (operated && control === "pull") visual?.pullLever();
     return operated;
+  }
+
+  /** ⚙ A settings gear was clicked (settingsGear.ts): open or close that
+   *  item's card. False when the item has no gear card. */
+  public openSettingsCard(itemId: string): boolean {
+    const kind = FURNITURE.find((item) => item.id === itemId)?.kind;
+    const spec = kind === "air-hockey-table" ? airHockeyGearCard(itemId)
+      : kind === "alligators-table" ? alligatorsGearCard(itemId)
+      : kind === "coin-pusher" ? coinPusherGearCard(itemId, () => canEditRoom().ok)
+      : null;
+    if (!spec) return false;
+    toggleGearCard(spec);
+    return true;
   }
 
   private updateSeatedSlotSession(): void {
@@ -5506,6 +6159,26 @@ export class World {
       // M4: the solar map, diegetic — mounted inside the focus overlay.
       const ui = createMapTableUI({
         requestRelease: () => deviceFocus.release(),
+        // 🗺️ #192: the station atlas edits through the room's own door panels.
+        currentDoors: () =>
+          [...(this.dockingSystem?.getDoorGroups().keys() ?? [])].map((id) => ({
+            id,
+            label: doorDisplayName(id),
+          })),
+        openDoorPanel: (doorId) =>
+          deviceFocus.releaseThen(() => this.dockingSystem?.handlePanelRaycast(doorId)),
+        // ✏️ Another module of the station: the ACCESS beam takes you in,
+        // where its own door panels do the editing.
+        canBeamTo: (roomId) => !!this.onBeamInto && !!this.roomPassFor?.(roomId),
+        beamTo: (roomId) => {
+          const seed = this.roomPassFor?.(roomId);
+          const beam = this.onBeamInto;
+          if (!seed || !beam) return;
+          beam(seed, (go) => deviceFocus.releaseThen(go));
+        },
+        playerId: () => getPlayerId(),
+        identityPub: () => getIdentityPub(),
+        disassemblyCandidates: () => this.disassemblyCandidates(),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
@@ -5534,15 +6207,74 @@ export class World {
     }
 
     if (device.kind === "gameTable") {
-      // #45 v1: flippable surface + doc-synced checkers. The flip is a UI
+      // #45 v1: flippable surface + doc-synced games. The flip is a UI
       // affordance (button), not focus choreography — no prepare hook; the
       // top handle simply rides along so FLIP can drive the tween.
+      // 🎰 #76: walk to an open STANDING position at the table, then the UI
+      // opens. 🎲 #227: a seated checkers or ♟ chess player goes to their
+      // OWN end and looks from it (stand s0 = red / white at −z, s1 = black
+      // at +z) when it is open and can be walked to (pickFreeStand's rules);
+      // otherwise, and for everyone else, the nearest open end — the camera
+      // follows that end.
+      const game = readTable(deviceId);
+      const myId = getPlayerId();
+      const mySeat =
+        game?.kind === "checkers"
+          ? (() => {
+              const c = seatOf(game.state, myId);
+              return c ? standIndexFor(c) : null;
+            })()
+          : game?.kind === "chess"
+            ? (() => {
+                const c = chessSeatOf(game.state, myId);
+                return c ? chessStandIndexFor(c) : null;
+              })()
+            : null;
+      const ownEnd =
+        mySeat !== null
+          ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${mySeat}`)
+          : undefined;
+      const ownEndFree =
+        !!ownEnd &&
+        !this.getRemoteAvatarSnapshots().some(
+          (a) => Math.hypot(a.x - ownEnd.front.x, a.z - ownEnd.front.z) < 0.7,
+        ) &&
+        this.standReachability()(ownEnd);
+      const stand = (ownEndFree ? ownEnd : null) ?? this.pickFreeStand(deviceId);
+      const farEnd = stand ? stand.id.endsWith(":s1") : false;
+      const top = this.gameTableTops.get(deviceId) ?? null;
       const ui = createGameTableUI({
         itemId: deviceId,
-        top: this.gameTableTops.get(deviceId) ?? null,
+        top,
+        // 🎲 #227: checkers is played on the 3D table itself. Taking a side
+        // from the other end walks the player round to their own end.
+        checkers: createCheckersTableLayer({
+          itemId: deviceId,
+          top,
+          end: farEnd ? 1 : 0,
+          onSeatTaken: () => deviceFocus.releaseThen(() => this.requestDeviceFocus(deviceId)),
+        }),
+        // ♟ Chess plays on the table the same way (white's end is −z).
+        chess: createChessTableLayer({
+          itemId: deviceId,
+          top,
+          end: farEnd ? 1 : 0,
+          onSeatTaken: () => deviceFocus.releaseThen(() => this.requestDeviceFocus(deviceId)),
+        }),
       });
-      // 🎰 #76: walk to an open STANDING position at the table, then the UI opens.
-      deviceFocus.beginFocus(this.player, this.standTarget(device), ui);
+      // The def bakes the −z eye; the +z end's is its point reflection
+      // through the board centre (air hockey's mirrored-end rule).
+      const eye = farEnd
+        ? new THREE.Vector3(
+            2 * device.anchor.x - device.eye.x,
+            device.eye.y,
+            2 * device.anchor.z - device.eye.z,
+          )
+        : device.eye;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : device;
+      deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 
@@ -5552,21 +6284,30 @@ export class World {
       // COMPUTER — the very DOCK / UNDOCK the door panel runs, so the two
       // surfaces can never disagree about a port.
       const ds = this.dockingSystem;
-      deviceFocus.beginFocus(
-        this.player,
-        device,
+      const shipFace = () =>
         createHelmUI(
           ds
             ? {
                 ports: () => ds.listDockPorts(),
                 connected: () => ds.connectedModules(),
                 subscribe: (cb) => ds.onDockChange(cb),
-                undock: (doorId) => void ds.undockPort(doorId),
-                dock: (doorId) => void ds.redockPort(doorId),
+                undock: (doorId) => ds.undockPort(doorId),
+                // 🚏 A5: the DOCK's answer (docked, or why not) reaches the helm.
+                dock: (doorId) => ds.redockPortAnswer(doorId),
+                releaseAllowed: (doorId, now) => ds.farReleaseAllowed(doorId, now),
               }
             : undefined,
-        ),
-      );
+        );
+      // 🛰️ A module bolted into a station by a gangway, or a station's own
+      // welcome room standing alone, steers the STATION: its helm opens the
+      // station keeping face (small trim stick) and keeps the ship face one
+      // tab away for fuel and the docking computer. Every helm opens through
+      // the station helm, so one opened on the ship face offers station
+      // keeping once its module comes to steer a station. The room's own
+      // doors count, each read past the doors' read cap, as DEPART reads them.
+      const bolted = () => steersStation(currentRoomId(), readPhysicalDoors());
+      const ui = createStationHelmUI({ bolted, station: () => currentStation(), shipFace });
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 
@@ -5585,23 +6326,69 @@ export class World {
       return;
     }
 
-    if (device.kind === "cashier" || device.kind === "roulette" || device.kind === "craps") {
-      // 🎰 #69 G1/G2/G3: the HOUSE side (cashier book, croupier spin, stickman
-      // throw) rides the same owner-equivalent seam as room editing —
-      // canEditRoom funnels main.ts's isLocalPlayerRoomOwner, so a venture-owned
-      // room makes every shareholder the house (the #68 V1 rule, applied to the
-      // casino).
-      const isHouse = () => canEditRoom().ok;
-      const ui =
-        device.kind === "cashier"
-          ? createCashierUI({ isHouse })
-          : device.kind === "craps"
-          ? createCrapsUI({ itemId: deviceId, isHouse })
-          : createRouletteUI({ itemId: deviceId, isHouse });
-      // 🎰 #76: the game tables gather players at their open standing slots (the
-      // cashier is not a table — it keeps its single front).
-      const target =
-        device.kind === "cashier" ? device : this.standTarget(device);
+    if (device.kind === "cashier") {
+      // 🎰 #69 G1: the HOUSE side (the cage book) rides the same owner-
+      // equivalent seam as room editing — canEditRoom funnels main.ts's
+      // isLocalPlayerRoomOwner, so a venture-owned room makes every
+      // shareholder the house (the #68 V1 rule, applied to the casino).
+      deviceFocus.beginFocus(this.player, device, createCashierUI({ isHouse: () => canEditRoom().ok }));
+      return;
+    }
+
+    if (device.kind === "roulette" || device.kind === "craps") {
+      // 🎲🎡 #226: no popup — the player plays on the 3D table from an open
+      // standing slot (#76). The camera stands behind THAT slot looking over
+      // the felt, so the rail in front of them (their chips) sits at the
+      // bottom of the view; the house side (settings, manual roll/spin) rides
+      // canEditRoom like every casino device.
+      const stand = this.pickFreeStand(deviceId);
+      const item = FURNITURE.find((i) => i.id === deviceId);
+      // With no open, reachable stand the avatar keeps the device's own front,
+      // but the player still needs a rail of chips and a camera: play from the
+      // (non-operator) stand nearest where they are.
+      let standIdx = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
+        : null;
+      if (standIdx === null && item) {
+        const me = this.player.getPosition();
+        const inv = ((4 - item.rot) % 4) as Rot;
+        const p = rotXZ(me.x - item.pos.x, me.z - item.pos.z, inv);
+        let best = Infinity;
+        (FURNITURE_DEFS[item.kind].stands ?? []).forEach((t, i) => {
+          const d = Math.hypot(t.stand.x - p.x, t.stand.z - p.z);
+          if (!t.role && d < best) {
+            best = d;
+            standIdx = i;
+          }
+        });
+      }
+      const tmpl =
+        item && standIdx !== null
+          ? FURNITURE_DEFS[item.kind].stands?.[standIdx]
+          : undefined;
+      let target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        : device;
+      if (item && tmpl) {
+        const local = (x: number, y: number, z: number) => {
+          const r = rotXZ(x, z, item.rot);
+          return new THREE.Vector3(item.pos.x + r.x, y, item.pos.z + r.z);
+        };
+        const sx = tmpl.stand.x;
+        const sz = tmpl.stand.z;
+        target = {
+          ...target,
+          eye: local(sx * 0.85, 1.9, sz * 0.85),
+          anchor: local(sx * 0.35, 0.8, sz * 0.15),
+        };
+      }
+      const ui = createCasinoTableUI({
+        itemId: deviceId,
+        game: device.kind,
+        isHouse: () => canEditRoom().ok,
+        stand: tmpl ? standIdx : null,
+        visual: this.casinoTableVisuals.get(deviceId) ?? null,
+      });
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
@@ -5687,8 +6474,74 @@ export class World {
       const ui = createRobotDockUI({
         itemId: deviceId,
         canEdit: () => canEditRoom().ok,
+        holdsDeed: () => holdsRoomDeed(),
+        disassemblyCandidates: () => this.disassemblyCandidates(),
       });
       deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "departuresBoard") {
+      // 🚏📋 The board's console: what it shows (all gates, or one gate's
+      // ferries) and its rows now. Owner-gated like the robot console.
+      const screen = this.wallScreens.get(deviceId) ?? null;
+      const roomGates = () => Object.values(readDockGates());
+      const ui = createDeparturesBoardUI({
+        itemId: deviceId,
+        canEdit: () => canEditRoom().ok,
+        gateChoices: () => [
+          ...roomGates(),
+          ...(currentStation()?.berths ?? []).flatMap((b) => (b.gate !== undefined ? [b.gate] : [])),
+        ],
+        defaultGate: () => boardGate(null, roomGates()),
+        // Dim the in-world screen while focused, as the terminal does (D0.4).
+        onEngagedChange: (engaged) => screen?.setEngaged(engaged),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // 📺 #186: the set's body buttons, WATCH, and the remote. The programme
+    // itself is chosen on the remote (the phone's TV app), as on a real set.
+    if (device.kind === "smartTv") {
+      const label = tvLabel(FURNITURE.find((i) => i.id === deviceId)?.kind);
+      const ui = createSmartTvUI({
+        itemId: deviceId,
+        label,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        roomPlayers: () => tvRoomPlayers(getIdentityPub()),
+        // The deps main.ts installed (setTvTheatreDeps): the same label and
+        // round-trip lead as the chip's and the phone's WATCH.
+        // Opened in the continuation, which runs after the focus eases out:
+        // a room leave may have begun meanwhile (leaveRoomNow closes the
+        // theatre, then awaits the flush while World keeps updating), so the
+        // drive and the set are checked again THERE, as the phone's and the
+        // chip's WATCH check them — else this reopened a theatre no room
+        // tick would close.
+        openTheatre: () =>
+          deviceFocus.releaseThen(() => {
+            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) openTvTheatre(deviceId);
+          }),
+        // The same guard in the remote's continuation: a phone reopened on a
+        // set that left with its room, after the drive was disarmed, would
+        // show a remote nothing ticks for.
+        openRemote: () =>
+          deviceFocus.releaseThen(() => {
+            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) {
+              (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
+            }
+          }),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // 🕹 #193: the cabinet's panel — the owner's shelf and game, INSERT COIN
+    // for P1 — and the stage the coin opens (the emulator in a frame of our
+    // own), after the focus is released, as the TV hands off to its theatre.
+    if (device.kind === "arcade") {
+      deviceFocus.beginFocus(this.player, device, this.arcadeCabinetUI(deviceId, "play"));
       return;
     }
 
@@ -5697,7 +6550,7 @@ export class World {
       // s0 is the cyan/a end (local −z), s1 the orange/b end (local +z) — the
       // template INDEX is the side, read from the `${itemId}:s${n}` slot id.
       // Every slot taken (or unreachable) falls back to the a end, matching
-      // standTarget's fallback-to-device-front behavior.
+      // the other tables' fall back to the device front.
       const stand = this.pickFreeStand(deviceId);
       const standIdx = stand
         ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
@@ -5718,6 +6571,34 @@ export class World {
         ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
         : { ...device, eye };
       const ui = createAirHockeyUI({ itemId: deviceId, side });
+      deviceFocus.beginFocus(this.player, target, ui);
+      return;
+    }
+
+    if (device.kind === "alligators") {
+      // 🐊 #185: walk to the nearest FREE seat round the table (the
+      // craps/roulette stand picker) and play first-person from it. The
+      // stand template INDEX is the seat, read from the `${itemId}:s${n}`
+      // slot id; every stand taken falls back to seat 0.
+      const stand = this.pickFreeStand(deviceId);
+      const seat = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) % IA_SEATS
+        : 0;
+      // The def bakes seat 0's eye; seat n's is that eye turned n·45° round
+      // the table centre (anchor). Rotations commute, so turning the WORLD
+      // offset is the same as turning the local one before the item's rot.
+      const turn = (seat * 2 * Math.PI) / IA_SEATS;
+      const ox = device.eye.x - device.anchor.x;
+      const oz = device.eye.z - device.anchor.z;
+      const eye = new THREE.Vector3(
+        device.anchor.x + ox * Math.cos(turn) - oz * Math.sin(turn),
+        device.eye.y,
+        device.anchor.z + ox * Math.sin(turn) + oz * Math.cos(turn),
+      );
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : { ...device, eye };
+      const ui = createAlligatorsUI({ itemId: deviceId, seat });
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }

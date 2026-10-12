@@ -4735,7 +4735,7 @@ dependencies = [
 
 [[package]]
 name = "ssf-p2p-node"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "anyhow",
  "base64",

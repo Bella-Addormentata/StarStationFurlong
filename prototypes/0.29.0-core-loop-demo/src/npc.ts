@@ -4,7 +4,7 @@
  */
 import * as THREE from 'three';
 import { InputManager } from './input';
-import { roomWalkBounds } from './floorPlanDoc';
+import { roomWalkBounds, clampToRoomWalk } from './floorPlanDoc';
 
 const W = 160, H = 240;
 
@@ -164,7 +164,8 @@ export class NPC {
       const r1 = resolveObstacles(candX, pos.z);
       const candZ = Math.max(-boundZ, Math.min(boundZ, pos.z + nz * this.SPEED * dt));
       const r2 = resolveObstacles(r1.x, candZ);
-      pos.x = r2.x; pos.z = r2.z;
+      const onFloor = clampToRoomWalk(r2.x, r2.z); // 🔭 clear of a cupola's cut corners
+      pos.x = onFloor.x; pos.z = onFloor.z;
       pos.y = 1.0 + Math.abs(Math.sin(this.elapsed * 6.5)) * (this.view === 'side' ? 0.058 : 0.038);
       this.redraw(Math.floor(this.elapsed * 7) % 4, false);
 

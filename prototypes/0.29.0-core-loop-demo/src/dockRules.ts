@@ -143,12 +143,14 @@ export function stampAfter(after: number | undefined, now = Date.now()): number 
   return Math.min(after + 1, Number.MAX_SAFE_INTEGER);
 }
 
-/** What an UNDOCK remembers of the berth it releases. */
-export function berthMemoryFrom(record: DoorPairing, undockedAt: number): DockBerthMemory {
+/** What an UNDOCK remembers of the berth it releases, and where the
+ *  station across it was then (`at`), when known. */
+export function berthMemoryFrom(record: DoorPairing, undockedAt: number, at?: string): DockBerthMemory {
   const memory: DockBerthMemory = { undockedAt };
   if (record.farDoor) memory.farDoor = record.farDoor;
   if (record.farWall) memory.farWall = record.farWall;
   if (record.farLateral !== undefined) memory.farLateral = record.farLateral;
+  if (at) memory.at = at;
   return memory;
 }
 
@@ -199,6 +201,14 @@ export function holdsOurRedock(
  */
 export function farWriteMayStand(far: FarDockResult): boolean {
   return far.ok ? far.detail === 'written' : far.reason === 'unreachable' && far.unconfirmed === true;
+}
+
+/** ⚓🚦 Did the far gate admit this DOCK? When the far room said so, and when
+ *  it wrote its half but the answer was lost (farWriteMayStand): it writes
+ *  only past its gate, and that half may stand, so this side matches it
+ *  rather than fall back on what this client's atlas holds of the gate. */
+export function farGateAdmitted(far: FarDockResult | null): boolean {
+  return far !== null && (far.ok || farWriteMayStand(far));
 }
 
 // ── The transit mirror ───────────────────────────────────────────────────────
@@ -291,12 +301,14 @@ function namesAnotherNearDoor(record: DoorPairing, nearDoorId: string): boolean 
  *  after this undock (a late write from a quick undock→dock must never undo
  *  the newer dock). `onlyDockedAt` narrows it to exactly one dock: the
  *  take-back of a far DOCK this client wrote, which must never undo anyone
- *  else's. */
+ *  else's. `at` is where the near end's station was as it let go, when
+ *  known (DockBerthMemory.at). */
 export function farUndockPatch(
   farRecord: DoorRecord | undefined,
   near: NearEnd,
   undockedAt: number,
   onlyDockedAt?: number,
+  at?: string,
 ): FarUndock {
   if (!farRecord) return { action: 'skip', reason: 'absent' };
   if (!farRecord.paired) return { action: 'skip', reason: 'already' };
@@ -325,6 +337,7 @@ export function farUndockPatch(
       farWall: near.wall,
       farLateral: near.lateral,
       undockedAt,
+      ...(at ? { at } : {}),
     }),
   };
 }
@@ -345,7 +358,7 @@ export type FarDock =
   | { action: 'write'; record: DoorPairing }
   | {
       action: 'refuse';
-      reason: 'gone' | 'occupied' | 'closed' | 'superseded';
+      reason: 'gone' | 'occupied' | 'closed' | 'superseded' | 'not-allowed' | 'no-gate';
       /** With `superseded`: the stamp of the dock of this port the berth holds. */
       stamp?: number;
     };
@@ -356,7 +369,25 @@ export const FAR_DOCK_REFUSAL: Record<Extract<FarDock, { action: 'refuse' }>['re
   occupied: 'That berth is occupied by another module now.',
   closed: 'That berth was closed — its dock port was removed.',
   superseded: 'A newer DOCK of this port already holds that berth.',
+  'no-gate': 'That station has used every gate number — no new dock port can be fitted there.',
+  'not-allowed': 'That gate does not admit this ship — the station has closed it, reserved it for another ship, or opened it only to captains granted at its door.',
 };
+
+/** ⚓🚦 Who the far gate admits (doorPolicy gateAccessIn): absent = open. */
+export interface FarGateAccess {
+  access: 'open' | 'pass' | 'reserved' | 'closed';
+  reservedFor?: string;
+  /** The docking captain holds the owner's grant at that door. */
+  granted?: boolean;
+}
+
+/** Does the gate admit the ship whose room is `shipRoomId`? */
+export function gateAdmits(gate: FarGateAccess | undefined, shipRoomId: string, granted = gate?.granted === true): boolean {
+  if (!gate || gate.access === 'open') return true;
+  if (gate.access === 'closed') return false;
+  if (gate.access === 'reserved') return !!gate.reservedFor && gate.reservedFor === shipRoomId;
+  return granted;
+}
 
 /**
  * DOCK's far end: the berth must still exist and be free.
@@ -385,8 +416,13 @@ export function farDockPatch(
   near: NearEnd,
   dockedAt: number,
   replacesUndockedAt?: number,
+  gate?: FarGateAccess,
 ): FarDock {
   if (!far.exists) return { action: 'refuse', reason: 'gone' };
+  // ⚓🚦 The station decides who docks here. A dock this ship already holds
+  // stands (re-affirming it is not a new arrival).
+  const heldByUs = !!farRecord?.paired && roomIdFromSeed(farRecord.connectedRoomAddress) === near.roomId;
+  if (!heldByUs && !gateAdmits(gate, near.roomId)) return { action: 'refuse', reason: 'not-allowed' };
   if (farRecord?.paired) {
     if (
       roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId ||
@@ -420,4 +456,89 @@ export function farDockPatch(
       dockedAt,
     }),
   };
+}
+
+// ── 🚏 What a DOCK answered (robot pilot routes, build notes A5) ─────────────
+
+/**
+ * Why a DOCK (docking.ts redockPortAnswer) did not dock. The far berth's own
+ * refusals keep their FarDockResult names; the rest are this side's:
+ *   busy         a dock or undock is already running on this port
+ *   no-port      the door wears no port, or it remembers no berth to dock to
+ *   in-flight    the module is flying (the flight gate)
+ *   no-rights    the local player may not dock here (construction rights,
+ *                and not the route keeper's carve-out)
+ *   overlap      the module would land on another one
+ *   no-writer    KEEPER MODE: no far-room writer is wired, so the station
+ *                cannot be asked (a plain DOCK docks this side alone)
+ *   changed      this port changed while the berth was asked
+ *   refused      a bare `false` from an older docking API (no reason given)
+ *   moving       this station or the berth's is moving between planets
+ *                (stationMove.dockLockedByMove, PR 174)
+ * `occupied` is also this side's own answer when the local atlas shows the
+ * berth taken (a plain DOCK only; keeper mode asks the station instead).
+ */
+export type DockRefusal =
+  | 'busy'
+  | 'no-port'
+  | 'in-flight'
+  | 'no-rights'
+  | 'overlap'
+  | 'no-writer'
+  | 'changed'
+  | 'refused'
+  | 'moving'
+  | 'unreachable'
+  | 'no-address'
+  | 'no-far-door'
+  | 'occupied'
+  | 'closed'
+  | 'gone'
+  | 'not-allowed'
+  | 'superseded'
+  /** ⚓🚦 The far door wears no port and every gate number of its station
+   *  is taken (PR 177), so none could be fitted. */
+  | 'no-gate';
+
+/** A DOCK's answer: docked (with the dock's own stamp), or why not. */
+export type DockAnswer =
+  | {
+      ok: true;
+      /** The dock's stamp (its DoorPairing.dockedAt): this DOCK's own, or the
+       *  one it joined. Absent from an older docking API. */
+      dockedAt?: number;
+      /** It joined a dock of this very port already at the berth. */
+      joined?: boolean;
+      /** Docked on this side alone (the station was not told). Never in
+       *  keeper mode. */
+      oneSided?: boolean;
+    }
+  | {
+      ok: false;
+      reason: DockRefusal;
+      /** With `not-allowed`: the gate setting that refused, when known. */
+      gateAccess?: 'pass' | 'reserved' | 'closed';
+    };
+
+/** Options for a DOCK or UNDOCK run by a route's keeper (routeKeeper.ts). */
+export interface DockOpOptions {
+  /**
+   * KEEPER MODE (A5): skip the local atlas's "taken" check (a stale atlas can
+   * say taken long after the berth frees) and count only the station's
+   * answer, so an unreachable station (or one that cannot be asked) leaves
+   * the port undocked instead of docking one side alone. Also lets the
+   * route's own port through the rider carve-out (docking.ts
+   * onRouteDockRight) at the timetable's moments.
+   */
+  keeper?: boolean;
+}
+
+/** Read whatever a docking API answered as a DockAnswer: no answer counts as
+ *  docked (PR 172's contract), a bare boolean as docked or `refused`. */
+export function dockAnswerOf(v: unknown): DockAnswer {
+  if (v === undefined || v === true) return { ok: true };
+  if (v === false || v === null || typeof v !== 'object') return { ok: false, reason: 'refused' };
+  const a = v as { ok?: unknown; reason?: unknown };
+  if (a.ok === true) return v as DockAnswer;
+  return typeof a.reason === 'string' ? (v as DockAnswer) : { ok: false, reason: 'refused' };
 }

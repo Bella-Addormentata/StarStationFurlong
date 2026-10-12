@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Furlong Arcade</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    🕹 The arcade cabinet's emulator frame (#193): a page of our own that
+    hosts EmulatorJS, so the cabinet can tear the whole thing down by
+    removing the frame, and so keys typed here never reach the world's input.
+
+    THIS FRAME IS AN OPAQUE ORIGIN, ON EVERY LANE: the parent mounts it
+    sandboxed without allow-same-origin (src/arcadeEmulator.ts), because
+    engine code and ROM data are external inputs, and a same-origin frame
+    would share the app's DOM, its storage and the desktop shells' IPC
+    bridge — none of which the policy below bounds: it governs what this
+    page may LOAD. So this document's origin reads "null" (self.origin;
+    location.origin is the URL's, which is why the policy below names it);
+    every message goes to the PAGE with the '*' target (there is no name
+    to match, and the page matches what it hears to this frame's window)
+    — the page being the parent of this frame's parent: the frame sits
+    inside a WALL, a document of the page's own with no script in it,
+    whose one policy governs where this frame may navigate (below);
+    there is no storage (EmulatorJS's databases are off) and no download
+    (the sandbox allows scripts and pointer lock, nothing else: a form, a
+    popup or a download is a request to any URL no policy governs), so a
+    save state will leave by postMessage, the page offering the file — a
+    follow-up; and the game arrives as BYTES the parent fetched itself, as
+    the page, and plays from a blob: URL of this document — never as a URL
+    this frame would fetch with no origin to its name. The one request
+    nothing in this frame forbids — its own navigation elsewhere — is the
+    WALL's to refuse: the parent mounts this frame inside a same-origin
+    document of its own whose frame-src names this URL and nothing else
+    (src/arcadeEmulator.ts, emulatorWallPolicy), checked by the browser
+    before any request goes out; a reload of this URL, the one navigation
+    allowed, is torn down by the parent at the second load.
+
+    Protocol with the page (src/arcadeEmulator.ts mountEmulatorFrame):
+      frame → page  { type: 'arcade-frame-ready' }
+      page → frame  { type: 'arcade-config', core, game (a Blob), gameName,
+                      pathToData, allow (origins), volume, isolated, timeoutMs }
+      frame → page  { type: 'arcade-ready' }     the emulator is loaded
+                    { type: 'arcade-started' }   the game runs
+                    { type: 'arcade-exit' }      Escape pressed here
+                    { type: 'arcade-error', why } 'loader' | 'timeout' | 'game'
+    EmulatorJS itself (GPL-3.0) is NOT in this repository: pathToData names
+    this station's /emulatorjs/data/ (scripts/fetch-emulatorjs.mjs) or
+    cdn.emulatorjs.org, the owner's call per cabinet — the CDN only in a
+    build with the convenience lanes on (src/sovereignty.ts; the default is
+    serverless sources only); `isolated` in the config says the engine is
+    another origin's code, which is what the player's consent to hand it
+    their own file is about.
+
+    This page is opened at ONE path with nothing in a query, on every lane
+    (frame-src, which the wall enforces, ignores a query — a policy chosen
+    by one could be swapped by a self-navigation to the same path), and it
+    sets its content-security policy itself, on receipt of the page's
+    config and before the loader is fetched: the engine, its cores and the
+    game come from this page's own origin, blob: and data:, plus the origins
+    the config names (`allow`: the engine's origin where it is another —
+    the CDN lane — and the viewer's own node; http(s) origins the page
+    already reduced, emulatorFrameOrigins, and this page checks again) —
+    and nothing else: no update check, no netplay server, no other third
+    party. Every directive names this page's origin outright, beside
+    'self', since 'self' is whatever the browser makes of an opaque origin.
+    Scripts keep 'unsafe-eval' and 'wasm-unsafe-eval' for the cores. A
+    document that arrives here by a self-navigation runs this script alone,
+    receives no config (the page configures a frame once), sets no policy
+    and loads nothing, and is torn down at the second load. An opaque
+    origin's fetches carry `Origin: null`, so the station serves
+    /emulatorjs/ with Access-Control-Allow-Origin (vite.config.ts for dev
+    and preview; a deployment the same) — the engine and its cores, public
+    files, and nothing else needs it: the game never crosses as a URL. A
+    policy in a meta element governs every fetch after its insertion; the
+    cabinet's smoke checks that a fetch to another server is refused under
+    it, that the origin here reads null, and that the parent is out of
+    reach.
+    EmulatorJS itself has not run under this policy in this repository (its
+    files are never here): the spike that fetches them is where a directive
+    it needs would show, as a console refusal naming it.
+  -->
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #game { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <script>
+    (function () {
+      // The policy, set on receipt of the page's config and before the
+      // loader is fetched — on every lane. Every directive names this page's
+      // own origin outright, beside 'self' (this document's origin is
+      // opaque, and 'self' is whatever the browser makes of that), and the
+      // origins the config names: the engine's where it is another (the
+      // CDN lane) and the viewer's own node, checked again here. Nothing
+      // comes from this page's URL (the header).
+      var isOrigin = function (o) { return typeof o === 'string' && /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/.test(o); };
+      function setPolicy(allowed) {
+        var origins = (Array.isArray(allowed) ? allowed : []).filter(isOrigin);
+        try {
+          var here = new URL(location.href).origin;
+          if (isOrigin(here) && origins.indexOf(here) < 0) origins.push(here);
+        } catch (err) { /* no origin of our own to name */ }
+        var allow = origins.join(' ');
+        var reach = "'self' blob: data:" + (allow ? ' ' + allow : '');
+        var meta = document.createElement('meta');
+        meta.httpEquiv = 'Content-Security-Policy';
+        meta.content = [
+          'default-src ' + reach,
+          'script-src ' + reach + " 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'",
+          'style-src ' + reach + " 'unsafe-inline'",
+          'img-src ' + reach,
+          'media-src ' + reach,
+          'connect-src ' + reach,
+          'font-src ' + reach,
+          'worker-src ' + reach,
+          'child-src ' + reach,
+          "frame-src 'none'",
+          "object-src 'none'",
+          "base-uri 'none'",
+          "form-action 'none'",
+        ].join('; ');
+        document.head.appendChild(meta);
+      }
+      // The page that mounted this frame is beyond the WALL (the header):
+      // window.parent is the wall, a document of the page's own with no
+      // script in it, and the page is the wall's parent — the same window
+      // when there is no wall. An opaque origin has no name a target could
+      // match: '*' it is. The page matches what it hears to this frame's
+      // window, and nothing posted from here is the page's to leak.
+      var pageWin = window.parent.parent;
+      function post(type, extra) {
+        var msg = { type: type };
+        if (extra) for (var k in extra) msg[k] = extra[k];
+        pageWin.postMessage(msg, '*');
+      }
+      var started = false;
+      window.addEventListener('message', function (e) {
+        if (e.source !== pageWin || !e.data || e.data.type !== 'arcade-config' || started) return;
+        started = true;
+        var c = e.data;
+        // The policy first: before the game's blob: URL, before the loader.
+        setPolicy(c.allow);
+        // The game: the bytes the parent fetched, or the player's own file,
+        // as a blob: URL of this document — gone with the frame.
+        var gameUrl;
+        try { gameUrl = URL.createObjectURL(c.game); } catch (err) { post('arcade-error', { why: 'game' }); return; }
+        window.EJS_player = '#game';
+        window.EJS_core = c.core;
+        window.EJS_gameUrl = gameUrl;
+        window.EJS_gameName = c.gameName;
+        window.EJS_pathtodata = c.pathToData;
+        window.EJS_startOnLoaded = true;
+        window.EJS_backgroundColor = '#000000';
+        window.EJS_color = '#d4a84b';
+        window.EJS_volume = typeof c.volume === 'number' ? c.volume : 0.7;
+        // Its netplay is WebRTC with its own signalling and TURN, marked
+        // unstable upstream: not depended on (plan §9). Hide the button.
+        window.EJS_Buttons = { netplay: false };
+        // An opaque origin has no storage of its own, and the sandbox
+        // refuses downloads (EmulatorJS's export): a save state will leave
+        // by postMessage, the page offering the file — a follow-up; a
+        // station-side store comes with the blob lane.
+        window.EJS_disableDatabases = true;
+        window.EJS_ready = function () { post('arcade-ready'); };
+        window.EJS_onGameStart = function () { post('arcade-started'); };
+        var s = document.createElement('script');
+        s.src = c.pathToData + 'loader.js';
+        s.onerror = function () { post('arcade-error', { why: 'loader' }); };
+        document.body.appendChild(s);
+        // A loader that never calls back (no engine behind it, a dead CDN,
+        // a game the core refuses) is a failure too.
+        var budget = typeof c.timeoutMs === 'number' ? c.timeoutMs : 45000;
+        var startedAt = Date.now();
+        var watch = setInterval(function () {
+          if (window.EJS_emulator && window.EJS_emulator.started) { clearInterval(watch); return; }
+          if (Date.now() - startedAt > budget) {
+            clearInterval(watch);
+            post('arcade-error', { why: window.EJS_emulator ? 'game' : 'timeout' });
+          }
+        }, 1000);
+      });
+      // Escape leaves the cabinet (the parent stands P1 up and closes the
+      // stage). Captured before the emulator sees it.
+      window.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); post('arcade-exit'); }
+      }, true);
+      post('arcade-frame-ready');
+    })();
+  </script>
+</body>
+</html>

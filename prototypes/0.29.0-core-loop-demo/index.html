@@ -162,8 +162,8 @@
       </div>
     </div>
     
-    <!-- (M4/M-dep of #33: the HUD +/- zoom buttons are gone — keyboard +/-
-         survives in zoom.ts, clamped at level 2 unless ?devzoom=1.) -->
+    <!-- (#223: the +/- zoom buttons live in cameraRig.ts's top-right view
+         cross, beside the rotate arrows; same steps as the +/- keys.) -->
 
     <!-- Phone Tip indicator box -->
     <div id="phone-tip-indicator">📲 Press TAB or Click here to activate SpacePhone!</div>
@@ -234,6 +234,12 @@
             <button type="button" class="phone-app-tile" data-phone-app="settings" aria-label="Open Settings app">
               <span class="phone-app-tile-icon">⚙️</span>
               <span class="phone-app-tile-label">SETTINGS</span>
+            </button>
+            <!-- 📺 The TV remote (#186): the phone IS the remote for the set
+                 whose remote you hold — sources, play/schedule, hand over. -->
+            <button type="button" class="phone-app-tile" data-phone-app="tv" aria-label="Open the TV remote">
+              <span class="phone-app-tile-icon">📺</span>
+              <span class="phone-app-tile-label">TV</span>
             </button>
           </div>
 
@@ -397,6 +403,10 @@
 
         <!-- ⚙️→📊 Stats view (receives #debug-hud) -->
         <div id="phone-app-settings-stats" class="phone-app-view"></div>
+
+        <!-- 📺 TV remote (#186) — rendered by tvUI.ts renderTvPhoneApp on open
+             and on every tv-map change while the view is active. -->
+        <div id="phone-app-tv" class="phone-app-view"></div>
       </div>
     </div>
     

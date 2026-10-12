@@ -31,7 +31,7 @@ import {
   seaCorner, roomDoorPoints, itemOccupancyBox, itemAabb,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture, deleteFurnitureItems, peerIdTag } from "./furnitureDoc";
-import { writeRobotConfig, type RobotRoutine } from "./robotDoc";
+import { clearRobotConfig, readRobotConfig, writeRobotConfig, type RobotRoutine } from "./robotDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
 import { doorSetIsAuthoritative } from "./doorLayoutDoc";
 import { PLAYER_R } from "./player";
@@ -554,7 +554,9 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
         movable: false,
         footprintOverride: { x0: -5.4, z0: -3, x1: 3.5, z1: 3 },
       },
-      { id: "pool-hot-tub", kind: "classic-hot-tub", pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
+      // ♨️ Its own id: "pool-hot-tub" is the lazy pool's island tub, and while
+      // this corner tub shared it, it inherited that tub's footbridge.
+      { id: "lido-hot-tub", kind: "classic-hot-tub", pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
       { id: "otree-sw", kind: "cherry-tree", pos: { x: -4.5, z: 4.5 }, rot: 0, movable: true },
       { id: "otree-se", kind: "cherry-tree", pos: { x: 4.5, z: 4.5 }, rot: 0, movable: true },
       { id: "opot-1", kind: "blossom-pot", pos: { x: 2.55, z: 4.75 }, rot: 0, movable: true },
@@ -819,10 +821,23 @@ function configureTemplateDocks(t: RoomTemplate, items: readonly FurnitureItem[]
   });
 }
 
+/** 🔧 A layout about to replace the room's drops every charging dock it
+ *  doesn't keep: a robot of one taking a module apart leaves the job first,
+ *  while its dock is still placed, so the work it did is kept (editMode's
+ *  REMOVE does the same for one dock). A dock is kept only by a dock of the
+ *  same id: an id the layout gives a piece of another kind drops it too. */
+function releaseDroppedDocks(next: readonly FurnitureItem[]): void {
+  const kept = new Set(next.filter((i) => i.kind === "charging-dock").map((i) => i.id));
+  for (const [id, rec] of readAllFurniture()) {
+    if (rec.kind === "charging-dock" && !kept.has(id) && readRobotConfig(id)?.routine === "disassemble") clearRobotConfig(id);
+  }
+}
+
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
   const items = templateItemsFor(t);
+  releaseDroppedDocks(items);
   replaceAllFurniture(items);
   configureTemplateDocks(t, items, items.map((i) => i.id));
   // 🌌 …and the room IS this now: stamping the theme makes the change
@@ -946,6 +961,7 @@ export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
   const items = templateItemsFor(t);
+  releaseDroppedDocks(items);
   replaceAllFurniture(items);
   configureTemplateDocks(t, items, items.map((i) => i.id));
   return true;
