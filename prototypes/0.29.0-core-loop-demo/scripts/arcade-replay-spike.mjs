@@ -13,12 +13,13 @@
  *        [--query "rom=/emulatorjs/roms/lj65.nes&latency=40&jitter=30"] [--chromium /path/to/chrome]
  *        [--screenshot out.png]
  *
- * Exits non-zero when any compared hash differed, nothing was compared,
- * comparing stopped for longer than ten hash periods (or 15 s) at any point
- * after it began, or the harness or either frame reported an error: a frame
- * torn down or frozen, or the harness stopped, partway through stops
- * comparing, which no mismatch would show. The negative control,
- * `--query drop=N`, is expected to.
+ * Exits non-zero when any compared hash differed, nothing was compared, no
+ * new comparison came for longer than ten hash periods (or 15 s) at any
+ * point from the spectator's start on, or the harness or either frame
+ * reported an error: a frame torn down or frozen, a spectator that never
+ * got going, or the harness stopped, partway through stops comparing, which
+ * no mismatch would show. The negative control, `--query drop=N`, is
+ * expected to.
  */
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
