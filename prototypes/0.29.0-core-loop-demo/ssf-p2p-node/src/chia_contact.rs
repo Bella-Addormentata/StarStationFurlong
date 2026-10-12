@@ -55,8 +55,9 @@ const CARD_SIGN_PREFIX: &str = "ssf-contact-card:v1\n";
 
 /// Write a secret file readable by its owner only (0600 on Unix; elsewhere the
 /// platform's default, as `iroh_node_id.key` already does), atomically: the
-/// bytes go to a fresh 0600 temporary beside the destination, are synced, and
-/// the temporary is renamed over the destination. A crash or short write thus
+/// bytes go to a fresh 0600 temporary beside the destination, are synced, the
+/// temporary is renamed over the destination and the directory is synced too
+/// (on Unix), so the new name survives a power loss. A crash or short write thus
 /// leaves the previous file intact — a half-written `contact.key` would
 /// otherwise be read as damaged at the next start and silently replaced, making
 /// every card handed out stale — and a destination left broader by an earlier
@@ -86,7 +87,14 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // The rename is directory metadata: until the directory is synced, a
+        // power loss can still lose the new name (a freshly minted
+        // `contact.key` would then rotate the identity at the next start).
+        // Windows has no directory handle to sync; NTFS journals the rename.
+        #[cfg(unix)]
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);

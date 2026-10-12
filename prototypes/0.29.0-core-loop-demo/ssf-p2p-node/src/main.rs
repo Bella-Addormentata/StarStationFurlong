@@ -784,23 +784,39 @@ const DEFAULT_IP_ECHO_HOSTS: &[&str] = &["api.ipify.org", "checkip.amazonaws.com
 const AUTO_ADDR_RECHECK_SECS: u64 = 300;
 
 /// True when the address is usable as an internet-facing dial hint — rejects
-/// private/loopback/link-local/documentation ranges and CGNAT (100.64.0.0/10),
-/// where a home-router port-forward cannot produce inbound reachability.
+/// private/loopback/link-local/documentation ranges, CGNAT (100.64.0.0/10),
+/// where a home-router port-forward cannot produce inbound reachability, and
+/// the other special-purpose ranges that never route on the internet: this
+/// network (0.0.0.0/8), IETF protocol assignments (192.0.0.0/24), benchmarking
+/// (198.18.0.0/15), multicast (224.0.0.0/4) and reserved (240.0.0.0/4). Since
+/// #231 P6a the same judge decides what a presence record may carry, so a
+/// non-global address is never written to the chain either.
 fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     let cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64; // 100.64.0.0/10
+    let this_network = o[0] == 0; // 0.0.0.0/8
+    let ietf_assignments = o[0] == 192 && o[1] == 0 && o[2] == 0; // 192.0.0.0/24
+    let benchmarking = o[0] == 198 && (o[1] & 0xfe) == 18; // 198.18.0.0/15
+    let reserved = o[0] >= 240; // 240.0.0.0/4 (broadcast included)
     !(ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.is_documentation()
-        || cgnat)
+        || ip.is_multicast()
+        || cgnat
+        || this_network
+        || ietf_assignments
+        || benchmarking
+        || reserved)
 }
 
 /// v6 companion to [`ipv4_is_public`] (Slice 5b): rejects loopback/unspecified/
-/// multicast, link-local (fe80::/10), ULA (fc00::/7) and documentation
-/// (2001:db8::/32); keeps global unicast. An IPv4 wearing IPv6 clothing is
+/// multicast, link-local (fe80::/10), the deprecated site-local (fec0::/10),
+/// ULA (fc00::/7), documentation (2001:db8::/32 and 3fff::/20), benchmarking
+/// (2001:2::/48), ORCHIDv2 (2001:20::/28) and the discard-only 100::/64; keeps
+/// global unicast. An IPv4 wearing IPv6 clothing is
 /// judged as THAT IPv4 — mapped `::ffff:a.b.c.d`, the deprecated compatible
 /// `::a.b.c.d`, 6to4 `2002:AABB:CCDD::` and NAT64 `64:ff9b::a.b.c.d` — so
 /// `[::ffff:192.168.1.1]` cannot smuggle a LAN address past the v4 checks and
@@ -828,8 +844,13 @@ fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
         return false; // Teredo
     }
     !((seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local
+        || (seg[0] & 0xffc0) == 0xfec0  // fec0::/10 site-local (deprecated, never global)
         || (seg[0] & 0xfe00) == 0xfc00  // fc00::/7 unique-local
-        || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 documentation
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
+        || (seg[0] == 0x3fff && (seg[1] >> 12) == 0) // 3fff::/20 documentation
+        || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0) // 2001:2::/48 benchmarking
+        || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
+        || (seg[0] == 0x0100 && seg[1..4] == [0, 0, 0])) // 100::/64 discard-only
 }
 
 /// Slice 5b addr-trust filter: a chia-resolved record's addrs are SELF-declared,
@@ -880,6 +901,16 @@ mod chia_addr_filter_tests {
             "[fe80::1]:1",                           // link-local v6 -> drop
             "[fc00::1]:1",                           // ULA v6 -> drop
             "203.0.113.9:44442",                     // TEST-NET-3 documentation -> drop
+            "198.18.0.1:1",                          // benchmarking 198.18/15 -> drop
+            "240.0.0.1:1",                           // reserved 240/4 -> drop
+            "0.1.2.3:1",                             // this network 0/8 -> drop
+            "224.0.0.1:1",                           // multicast -> drop
+            "192.0.0.9:1",                           // IETF protocol assignments 192.0.0/24 -> drop
+            "[fec0::1]:1",                           // site-local v6 (deprecated) -> drop
+            "[100::1]:1",                            // discard-only v6 -> drop
+            "[2001:2::1]:1",                         // benchmarking v6 -> drop
+            "[2001:20::1]:1",                        // ORCHIDv2 -> drop
+            "[3fff::1]:1",                           // documentation v6 (3fff::/20) -> drop
             "8.8.8.8:44442",                         // public v4 -> KEEP
             "[2600:1700:68a0:8ca0::29]:58828",       // public v6 -> KEEP
         ]
@@ -891,7 +922,10 @@ mod chia_addr_filter_tests {
         assert_eq!(kept.len(), 2, "only the two public addrs survive, got {kept:?}");
         assert!(kept[0].contains("2600:1700"), "IPv6 is dialed first (P1), got {kept:?}");
         assert_eq!(kept[1], "8.8.8.8:44442");
-        for bad in ["192.168", "127.0.0.1", "100.64", "169.254", "fe80", "fc00", "203.0.113"] {
+        for bad in [
+            "192.168", "127.0.0.1", "100.64", "169.254", "fe80", "fc00", "203.0.113", "198.18", "240.0", "0.1.2.3",
+            "224.0", "192.0.0", "fec0", "100::", "2001:2:", "2001:20:", "3fff",
+        ] {
             assert!(!kept.iter().any(|s| s.contains(bad)), "{bad} should be filtered out");
         }
     }
@@ -1404,8 +1438,8 @@ async fn main() -> Result<()> {
 
     // #231 P6a: the contact identity and the address book, loaded (or minted)
     // beside the iroh key, and the room caps persisted by earlier runs so the
-    // watcher reads and the publisher writes for served rooms before any
-    // browser returns.
+    // watcher READS for served rooms before any browser returns (a restored cap
+    // authorizes reads only; publishing and cards wait for a live cap).
     #[cfg(feature = "chia-read")]
     let (contact_key, contact_key_durable, peer_book, restored_caps) = {
         let (ck, durable) = match chia_contact::load_or_create_contact_key(std::path::Path::new(chia_contact::CONTACT_KEY_FILE)) {
@@ -2472,7 +2506,7 @@ async fn dial_peer_inner(
                                 chia_watch::HOLD_WINDOW.as_secs()
                             );
                             // hold_dial reports its own outcome to the browser.
-                            hold_dial(
+                            let ok = hold_dial(
                                 hub.clone(),
                                 iroh_ep.clone(),
                                 room_id.clone(),
@@ -2483,6 +2517,16 @@ async fn dial_peer_inner(
                                 send.clone(),
                             )
                             .await;
+                            // The dial as a whole reached the peer: the failure the
+                            // contact-key leg noted above was a stale v2 address, not
+                            // an unreachable peer, and must not count toward pruning.
+                            if ok && held_by_ck.is_some() {
+                                let mut book = hub.peers.lock().unwrap();
+                                if book.peers.contains_key(&target_str) {
+                                    book.note_ok(&target_str, chia_resolve::unix_now());
+                                    let _ = book.save(std::path::Path::new(chia_contact::PEERS_FILE));
+                                }
+                            }
                             return;
                         }
                     }

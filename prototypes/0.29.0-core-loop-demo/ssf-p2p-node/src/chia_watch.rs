@@ -59,9 +59,10 @@ pub const MAX_HOLDS_PER_ROOM: usize = 4;
 /// A target whose hold failed is left alone this long (per room).
 pub const TARGET_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Distinct contact keys read per watcher tick, at most (two hint scans each).
-/// The address book has no cap — a private-room member can leave one card per
-/// node identity it cycles through — so the gateway load per tick is bounded
-/// here and the keys take turns, the longest-waiting first.
+/// The address book holds up to `MAX_PEERS` (512) peers — a private-room member
+/// can leave one card per node identity it cycles through — so the gateway load
+/// per tick is bounded here, well below the book's cap, and the keys take turns
+/// through the whole book, the longest-waiting first.
 pub const MAX_CK_READS_PER_TICK: usize = 8;
 
 /// The block beat: when does a room read its hints?

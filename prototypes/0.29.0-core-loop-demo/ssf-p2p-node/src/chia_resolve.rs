@@ -593,7 +593,11 @@ impl ChainPeak {
     /// The height, when known and read within [`PEAK_MAX_AGE_SECS`] of `now`;
     /// `None` is "ask the chain" (or, for a mark, "judge by elapsed time").
     pub fn fresh(&self, now: u64) -> Option<u32> {
-        (self.height != 0 && now.saturating_sub(self.seen_at) <= PEAK_MAX_AGE_SECS).then_some(self.height)
+        // A read dated after `now` means the wall clock was set back since: how
+        // old the height really is cannot be told, so it is stale (the chain is
+        // asked again), not fresh until the clock catches up.
+        let age = now.checked_sub(self.seen_at)?;
+        (self.height != 0 && age <= PEAK_MAX_AGE_SECS).then_some(self.height)
     }
 }
 
@@ -641,7 +645,7 @@ mod tests {
         assert_eq!(ChainPeak::new(100, now).fresh(now), Some(100), "just read");
         assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS).fresh(now), Some(100), "at the bound: still the clock");
         assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS - 1).fresh(now), None, "older: ask the chain");
-        assert_eq!(ChainPeak::new(100, now + 5).fresh(now), Some(100), "a clock set back never ages a peak");
+        assert_eq!(ChainPeak::new(100, now + 5).fresh(now), None, "a read dated in the future (clock set back) is stale, not fresh forever");
     }
 
     #[test]
