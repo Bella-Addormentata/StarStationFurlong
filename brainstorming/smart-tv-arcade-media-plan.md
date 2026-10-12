@@ -797,7 +797,11 @@ start, so the ceiling never cuts short a transfer it began; an approved
 one's is its declaration, reserved; received bytes past the ceiling abort
 the transfer, and a completed blob whose size differs from the
 declaration is rejected either way.
-Nobody in a room can spend another viewer's bandwidth or disk unasked. The same lane later carries room assets, ROMs and the
+Nobody in a room can spend another viewer's bandwidth or disk beyond the
+allowance that viewer set for automatic fetches — the cap, the budget and
+the count above, spent only on sources that fit them, and a peer-written
+record can empty that allowance and no more — and nothing past it without
+asking, one FETCH per transfer. The same lane later carries room assets, ROMs and the
 station library (§7) — the cabinet owner's game file first: #248 passes it
 through the room document until this lane exists (`arcadeRomShare.ts`,
 §9), which is why the document bound in the media-control part below
