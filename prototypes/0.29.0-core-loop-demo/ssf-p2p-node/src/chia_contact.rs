@@ -54,27 +54,44 @@ const CTX_KX_ERA: &str = "ssf-chia-kx-era-v1";
 const CARD_SIGN_PREFIX: &str = "ssf-contact-card:v1\n";
 
 /// Write a secret file readable by its owner only (0600 on Unix; elsewhere the
-/// platform's default, as `iroh_node_id.key` already does). The mode is set
-/// on creation AND reset on an existing file: `OpenOptions::mode` applies only
-/// to files it creates, and a file left broader by an earlier tool or run
-/// must not keep its old permissions once it holds a key.
+/// platform's default, as `iroh_node_id.key` already does), atomically: the
+/// bytes go to a fresh 0600 temporary beside the destination, are synced, and
+/// the temporary is renamed over the destination. A crash or short write thus
+/// leaves the previous file intact — a half-written `contact.key` would
+/// otherwise be read as damaged at the next start and silently replaced, making
+/// every card handed out stale — and a destination left broader by an earlier
+/// tool or run is replaced by the fresh 0600 file.
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => Path::new(".").to_path_buf(),
+    };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+    let tmp = dir.join(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let written = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    f.write_all(bytes)?;
-    f.flush()
+    written
 }
 
 /// Reset an EXISTING secret file to 0600 without rewriting it (Unix; a no-op
@@ -419,6 +436,29 @@ mod tests {
                 0o600,
                 "rewriting an existing, broader file tightens it to 0600"
             );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_private_replaces_the_file_whole_and_leaves_no_temporary() {
+        let dir = std::env::temp_dir().join(format!("ssf-wp-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        write_private(&path, b"first").unwrap();
+        write_private(&path, b"second, longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "state.json")
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary survives a write: {leftovers:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

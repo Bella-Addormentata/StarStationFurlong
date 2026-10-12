@@ -391,6 +391,12 @@ pub struct HubState {
     /// presence is filed under; handed to private-room members as a signed card.
     #[cfg(feature = "chia-read")]
     pub contact_key: [u8; 32],
+    /// #231 P6a: `contact.key` could be loaded or written. When it could not,
+    /// the key above is for this run only and nothing advertises it: no card
+    /// is shared and no per-node presence is published, since both would go
+    /// stale at the next start and contradict the node's one-key identity.
+    #[cfg(feature = "chia-read")]
+    pub contact_key_durable: bool,
     /// #231 P6a: the address book (`peers.json`): the contact and card keys of
     /// the peers that handed us their card, and the rooms we met them in.
     #[cfg(feature = "chia-read")]
@@ -1371,17 +1377,21 @@ async fn main() -> Result<()> {
     // watcher reads and the publisher writes for served rooms before any
     // browser returns.
     #[cfg(feature = "chia-read")]
-    let (contact_key, peer_book, restored_caps) = {
-        let ck = match chia_contact::load_or_create_contact_key(std::path::Path::new(chia_contact::CONTACT_KEY_FILE)) {
-            Ok(ck) => ck,
+    let (contact_key, contact_key_durable, peer_book, restored_caps) = {
+        let (ck, durable) = match chia_contact::load_or_create_contact_key(std::path::Path::new(chia_contact::CONTACT_KEY_FILE)) {
+            Ok(ck) => (ck, true),
             Err(e) => {
                 // A key that cannot be stored would change every start and make
                 // every card we hand out stale; say so and run with a key for
-                // this process only.
-                eprintln!("⛓️ ChiaHub contact: cannot load or create {}: {e} — using a key for this run only", chia_contact::CONTACT_KEY_FILE);
+                // this process only — one that is neither shared nor published
+                // under (the watcher still reads).
+                eprintln!(
+                    "⛓️ ChiaHub contact: cannot load or create {}: {e} — no card is shared and no presence is published this run",
+                    chia_contact::CONTACT_KEY_FILE
+                );
                 let mut ck = [0u8; 32];
                 rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ck);
-                ck
+                (ck, false)
             }
         };
         let book = chia_contact::PeerBook::load(std::path::Path::new(chia_contact::PEERS_FILE));
@@ -1390,9 +1400,15 @@ async fn main() -> Result<()> {
             "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) restored · cards {}",
             book.peers.len(),
             caps.len(),
-            if chia_contact::share_card_enabled() { "shared in private rooms" } else { "not shared (SSF_CHIA_SHARE_CARD=0)" }
+            if !durable {
+                "not shared (no durable contact key)"
+            } else if chia_contact::share_card_enabled() {
+                "shared in private rooms"
+            } else {
+                "not shared (SSF_CHIA_SHARE_CARD=0)"
+            }
         );
-        (ck, book, caps)
+        (ck, durable, book, caps)
     };
 
     let hub = Arc::new(HubState {
@@ -1409,6 +1425,8 @@ async fn main() -> Result<()> {
         chia_rooms: Mutex::new(restored_caps),
         #[cfg(feature = "chia-read")]
         contact_key,
+        #[cfg(feature = "chia-read")]
+        contact_key_durable,
         #[cfg(feature = "chia-read")]
         peers: Mutex::new(peer_book),
         #[cfg(feature = "chia-read")]
@@ -3497,7 +3515,7 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
         // KNOWN private (never a bundled or PUBLIC room, N8). Snapshotted before
         // the rooms lock so the two locks are never nested.
         #[cfg(feature = "chia-read")]
-        let sharing: std::collections::HashSet<String> = if chia_contact::share_card_enabled() {
+        let sharing: std::collections::HashSet<String> = if chia_contact::share_card_enabled() && hub.contact_key_durable {
             hub.chia_rooms
                 .lock()
                 .unwrap()

@@ -252,7 +252,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // #231 P6a: per-node presence state — cursors per contact-key hint, the
     // freshest record per peer, and the height our own record was last seen at.
     let mut ck_cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
-    let mut node_cache: HashMap<String, FoundRecord> = HashMap::new();
+    // Per peer: the contact key the record was read under, and the record.
+    let mut node_cache: HashMap<String, ([u8; 32], FoundRecord)> = HashMap::new();
     let mut own_ck_height: u32 = 0;
     println!(
         "⛓️ ChiaHub watcher on: reads every {} blocks per room (×{} while connected), hold {}s × {}s, {} holds/room",
@@ -300,7 +301,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         cursors.retain(|k, _| live_hints.contains(k));
         // #231 P6a: the peers whose contact cards we hold (node id, ck, rooms met in).
         let peers = hub.peers.lock().unwrap().with_ck();
-        node_cache.retain(|node, _| peers.iter().any(|(n, _, _)| n == node));
+        // A record stays cached only while its peer is in the book under the
+        // SAME contact key: a newer card that rotates the key evicts the old
+        // key's record, so holds follow the key the peer now publishes under.
+        node_cache.retain(|node, (ck, _)| peers.iter().any(|(n, k, _)| n == node && k == ck));
         // Distinct contact keys and the node ids that claim each (see below).
         let mut by_ck: HashMap<[u8; 32], Vec<String>> = HashMap::new();
         for (node_id, ck, _) in &peers {
@@ -451,7 +455,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             let Some(node_id) = nodes.iter().find(|n| **n == f.record.node_id) else { continue };
                             let newer = node_cache
                                 .get(node_id)
-                                .map(|p| (f.record.issued_at, f.confirmed_height) > (p.record.issued_at, p.confirmed_height))
+                                .map(|(_, p)| (f.record.issued_at, f.confirmed_height) > (p.record.issued_at, p.confirmed_height))
                                 .unwrap_or(true);
                             if newer {
                                 println!(
@@ -460,7 +464,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                     f.confirmed_height,
                                     crate::chia_public_dial_addrs(&f.record.addrs).len()
                                 );
-                                node_cache.insert(node_id.clone(), f);
+                                node_cache.insert(node_id.clone(), (ck, f));
                             }
                         }
                     }
@@ -473,7 +477,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // Holds: each peer's freshest record, in the readable rooms it was
             // met in and is not connected to.
             for (node_id, _ck, met_in) in &peers {
-                let Some(found) = node_cache.get(node_id) else { continue };
+                let Some((_, found)) = node_cache.get(node_id) else { continue };
                 if found.record.expires_at != 0 && found.record.expires_at < now_unix {
                     continue;
                 }

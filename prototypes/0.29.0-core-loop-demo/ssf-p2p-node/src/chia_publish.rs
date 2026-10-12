@@ -1098,9 +1098,16 @@ pub async fn heartbeat_loop(
     // Without the watcher nothing ever reads our record back, so the gateway's
     // acceptance is the only confirmation there is.
     let watcher_confirms = crate::chia_watch::watch_enabled();
+    // Findable: told so (D4 default) AND holding a durable contact key — a key
+    // for this run only is never published under, since the record would
+    // outlive it and contradict the node's one-key identity.
+    let findable = findable_enabled() && hub.contact_key_durable;
+    if findable_enabled() && !hub.contact_key_durable {
+        println!("⛓️ ChiaHub presence: no durable contact key — per-node presence is not published this run");
+    }
     // Tell the watcher to read our own key every beat for as long as we may
     // write it, rooms and peers or not: that read is what confirms a write.
-    hub.presence_publishing.store(findable_enabled(), std::sync::atomic::Ordering::Relaxed);
+    hub.presence_publishing.store(findable, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = &node_mark {
         println!(
             "⛓️ ChiaHub presence: last written in era {} (write {}, hint {}, {})",
@@ -1124,7 +1131,7 @@ pub async fn heartbeat_loop(
         }
 
         // ── #231 P6a: the node's OWN presence first (priority over room publishes) ──
-        if findable_enabled() {
+        if findable {
             // The era is the chain's clock: the watcher's last peak when it has
             // one (it reads every tick), else one gateway call of our own.
             let mut peak = hub.chia_peak.load(std::sync::atomic::Ordering::Relaxed);
