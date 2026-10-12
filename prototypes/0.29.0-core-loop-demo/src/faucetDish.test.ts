@@ -197,7 +197,7 @@ describe('faucet dish: per-room store', () => {
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 12 }) });
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 90 }) });
     expect(faucetPending(room)).toBe('give');
-    // Landed: fewer mojos, nothing settling.
+    // Settled: nothing parked any more (landed here: the balance is lower).
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 91 }) });
     expect(faucetPending(room)).toBeNull();
     // Dropped: the balance is back in full and nothing is settling — over too.
@@ -206,11 +206,18 @@ describe('faucet dish: per-room store', () => {
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 93 }) });
     expect(faucetPending(room)).toBeNull();
     // Before the reply arrives, a poll showing nothing in flight is not trusted
-    // (it may predate the push); only the reply or a landing clears it.
+    // (it may predate the push), and neither is a lower balance: the wallet is
+    // the node's, shared by every room and tab, so the drop can be another
+    // action's gift while this spend is still parked (#245 review, round 18).
     markFaucetPending(room, 'give', 3);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 94 }) });
     expect(faucetPending(room)).toBe('give');
-    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 3_000n, walletSpendableMojos: 3_000n, snapshot: 95 }) });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 3_000n, walletSpendableMojos: 3_000n, spending: true, snapshot: 95 }) });
+    expect(faucetPending(room)).toBe('give');
+    // Only the node's verdict past this action's barrier clears it.
+    setFaucetReply(room, { op: 'give', ok: true, afterSnapshot: 95 }, 3);
+    expect(faucetPending(room)).toBe('give');
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 2_000n, walletSpendableMojos: 2_000n, snapshot: 96 }) });
     expect(faucetPending(room)).toBeNull();
     // Refused: dropped at once, and the screen keeps the reason.
     markFaucetPending(room, 'give', 4);
@@ -279,15 +286,17 @@ describe('faucet dish: per-room store', () => {
     const room = 'home-store-7';
     clearFaucetRoom(room);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 40 }) });
-    // GIVE #1 (request seq 1): a poll shows it landed before its own reply arrives.
+    // GIVE #1 (request seq 1): its reply sets the floor, the next poll shows it settled.
     markFaucetPending(room, 'give', 1);
+    setFaucetReply(room, { op: 'give', ok: true, afterSnapshot: 40 }, 1);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 4_000n, walletSpendableMojos: 4_000n, snapshot: 42 }) });
     expect(faucetPending(room)).toBeNull();
     // GIVE #2 (seq 2) begins; the newest poll on file shows nothing settling.
     markFaucetPending(room, 'give', 2);
-    // GIVE #1's reply arrives late. Matched by op alone, its floor (41) would meet
-    // the snapshot already on file (42, nothing settling) and clear GIVE #2 at
-    // once, before its spend even left. Matched by seq, it is not GIVE #2's.
+    // A reply of GIVE #1 arrives again (a stream read late, or twice). Matched
+    // by op alone, its floor (41) would meet the snapshot already on file (42,
+    // nothing settling) and clear GIVE #2 at once, before its spend even left.
+    // Matched by seq, it is not GIVE #2's.
     setFaucetReply(room, { op: 'give', ok: true, afterSnapshot: 40, status: status({ walletMojos: 5_000n, walletSpendableMojos: 0n, spending: true, snapshot: 41 }) }, 1);
     expect(faucetPending(room)).toBe('give');
     expect(latestFaucetStatus(room)?.snapshot).toBe(42);

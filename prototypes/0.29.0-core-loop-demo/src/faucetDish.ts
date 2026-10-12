@@ -283,13 +283,17 @@ export function faucetPendingUnanswered(roomId: string): string | null {
  *  take/give reply carries the first status captured after the push; from that
  *  snapshot number on, a status that no longer shows the spend settling
  *  (`spending` for a give, `landing` for a take) means the chain or the mempool
- *  settled it — landed or dropped — and the action is over either way; a status
- *  that shows the spend LANDED (take: our wallet holds a coin; give: fewer
- *  wallet mojos) clears it whatever its number. A status numbered below the
- *  reply's predates the push and is not read as "nothing in flight". Until the
- *  reply arrives only a landing clears it; a reply lost with its stream keeps
- *  the action pending until the spend lands or the room is left, rather than
- *  risk a second gift.
+ *  settled it — landed or dropped — and the action is over either way. A TAKE
+ *  also clears from any status that shows our wallet holding a coin: TAKE is
+ *  over then whatever happened, since the dish is for empty wallets. A GIVE
+ *  clears from the node's verdict alone, never from a lower balance: the
+ *  wallet is the node's, shared by every room and tab, and another action's
+ *  gift confirming would read as this one's while its own spend is still
+ *  parked — and GIVE would come back while that spend is live (#245 review,
+ *  round 18). A status numbered below the reply's predates the push and is
+ *  not read as "nothing in flight". Until the reply arrives nothing but a
+ *  TAKE's landing clears an action; a reply lost with its stream keeps the
+ *  action pending until the room is left, rather than risk a second gift.
  *
  *  Statuses are ordered by the node's snapshot number, not by request: the
  *  20 s and 60 s polls and the post-action read each run on their own stream,
@@ -342,8 +346,6 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
       : reply.status && reply.status.snapshot > 0 ? reply.status.snapshot : null;
     own.unanswered = reply.unanswered ?? null;
   }
-  const prev = latest.get(roomId);
-  let filed = false;
   if (reply.status) {
     const st = reply.status;
     // An older snapshot answered late is not filed over a newer one (an older
@@ -352,7 +354,6 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
     if (!(st.snapshot > 0 && st.snapshot < newest)) {
       if (st.snapshot > 0) latestSnapshot.set(roomId, st.snapshot);
       latest.set(roomId, st);
-      filed = true;
     }
   }
   // Judge the pending action on the newest view there is: the status just
@@ -360,10 +361,10 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
   // a status), which counts as after the push once the floor is set.
   const view = latest.get(roomId);
   if (p && view) {
-    const landed =
-      (p.op === 'claim' && (view.walletMojos ?? 0n) > 0n) ||
-      (p.op === 'give' && filed && prev !== undefined && view.walletMojos !== null && prev.walletMojos !== null
-        && view.walletMojos < prev.walletMojos);
+    // A funded wallet ends a TAKE whatever happened; a GIVE has no such sign
+    // of its own (a lower balance can be another room's or tab's gift) and
+    // waits for the node's verdict past the barrier.
+    const landed = p.op === 'claim' && (view.walletMojos ?? 0n) > 0n;
     const settling = p.op === 'claim' ? view.landing : view.spending;
     const afterPush = p.floor !== null && view.snapshot >= p.floor;
     if (landed || (afterPush && !settling)) pending.delete(roomId);

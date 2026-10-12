@@ -108,7 +108,7 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// still lists its inputs unspent and the wallet empty; a lease that started
 /// empty would let a writer reselect those inputs, or a second TAKE draw
 /// another mojo while the first claim is still live. Restored spends are
-/// reconciled at once, like any other.
+/// reconciled like any other, after a fresh grace.
 pub struct WalletLease {
     gate: tokio::sync::Mutex<()>,
     pending: std::sync::Mutex<HashMap<Bytes32, Parked>>,
@@ -164,6 +164,25 @@ struct LeaseFile {
 struct ParkedCoin {
     coin: String,
     spend: u64,
+}
+
+/// Write `bytes` to `path` as a whole: into a temporary file beside it, then a
+/// rename over the destination, which `std::fs::rename` replaces on every
+/// platform (on Windows through `MOVEFILE_REPLACE_EXISTING`). Windows can still
+/// refuse that rename while another process holds the destination open (a
+/// sharing violation); then the file is rewritten in place rather than left
+/// stale: a stale parking would silently forget live spends, a torn one is
+/// unreadable and the startup log says so (#245 review, round 18).
+fn write_replacing(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, bytes).map_err(|_| rename_err)
+        }
+    }
 }
 
 fn parse_coin_id(hex_id: &str) -> Option<Bytes32> {
@@ -290,9 +309,11 @@ impl WalletLease {
     }
 
     /// Take the parking the previous run left in `path`, and keep writing the
-    /// parking there from now on (#245 review, round 17). Restored spends are
-    /// due for reconciliation at once: the grace is for a spend the mempool
-    /// has not heard of yet, and these left long ago; the chain and the
+    /// parking there from now on (#245 review, round 17). Restored spends get
+    /// a FRESH grace before reconciliation asks about them (round 18): a
+    /// restart can fall inside the first grace, before the gateway's mempool
+    /// index has the spend, and a probe then would read its inputs unspent
+    /// and absent and free them while the spend is live. The chain and the
     /// mempool then settle them exactly as they would have without the
     /// restart. The spend counter continues above the restored numbers, so a
     /// new spend never shares one with a restored verdict (compare-and-release
@@ -324,7 +345,6 @@ impl WalletLease {
     /// Merge a stored parking into the lease (see [`WalletLease::restore`]):
     /// how many coins it parked.
     fn load(&self, file: &LeaseFile, now: Instant) -> usize {
-        let due_now = now.checked_sub(RECONCILE_GRACE).unwrap_or(now);
         let mut parked = 0;
         {
             let mut pending = self.pending.lock().unwrap();
@@ -333,7 +353,7 @@ impl WalletLease {
                     eprintln!("⛓️ wallet lease: skipping a malformed parked coin id {:?}", entry.coin);
                     continue;
                 };
-                pending.entry(id).or_insert(Parked { at: due_now, spend: entry.spend });
+                pending.entry(id).or_insert(Parked { at: now, spend: entry.spend });
                 parked += 1;
             }
         }
@@ -352,12 +372,14 @@ impl WalletLease {
         let store = self.store.lock().unwrap();
         let Some(path) = store.as_ref() else { return };
         let file = self.snapshot();
-        let tmp = path.with_extension("json.tmp");
-        let written = serde_json::to_vec_pretty(&file)
-            .map_err(|e| anyhow!("{e}"))
-            .and_then(|bytes| std::fs::write(&tmp, bytes).map_err(|e| anyhow!("{e}")))
-            .and_then(|()| std::fs::rename(&tmp, path).map_err(|e| anyhow!("{e}")));
-        if let Err(e) = written {
+        let bytes = match serde_json::to_vec_pretty(&file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("⛓️ wallet lease: could not encode the parking: {e}");
+                return;
+            }
+        };
+        if let Err(e) = write_replacing(path, &bytes) {
             eprintln!("⛓️ wallet lease: could not write {}: {e}", path.display());
         }
     }
@@ -1041,18 +1063,25 @@ mod tests {
         let first = WalletLease::new();
         first.restore(&path);
         assert!(!path.exists());
+        let on_disk = || std::fs::read_to_string(&path).unwrap();
         let give = first.park([ours]);
+        assert!(on_disk().contains(&hex::encode(ours)));
+        // Every later change replaces the file, not only the first write.
         first.park([faucet_coin]);
         first.mark_incoming(faucet_coin);
-        assert!(path.exists());
+        let disk = on_disk();
+        assert!(disk.contains(&hex::encode(faucet_coin)) && disk.contains("\"incoming\""), "{disk}");
         // Second run (a restart): the lease starts empty and takes the parking back…
         let second = WalletLease::new();
         assert!(!second.is_pending(&ours));
         second.restore(&path);
         assert!(second.is_pending(&ours) && second.is_pending(&faucet_coin));
         assert!(second.outgoing_pending() && second.incoming_pending());
-        // …due for reconciliation at once, under their old spend numbers…
-        let due: Vec<u64> = second.due_at(Instant::now()).iter().map(|d| d.spend).collect();
+        // …due for reconciliation after a FRESH grace (a restart can fall inside
+        // the first one, before the gateway's mempool has the spend), under
+        // their old spend numbers…
+        assert!(second.due_at(Instant::now()).is_empty());
+        let due: Vec<u64> = second.due_at(Instant::now() + RECONCILE_GRACE).iter().map(|d| d.spend).collect();
         assert_eq!(due, vec![give.spend, give.spend + 1]);
         // …and new spends are numbered above them, so no verdict is confused.
         let later = second.park([Bytes32::new([7u8; 32])]);
@@ -1060,6 +1089,7 @@ mod tests {
         // A verdict releases a restored spend and the file follows: a third run
         // no longer sees it, while the claim still landing is still there.
         second.release(&[give.spend]);
+        assert!(!on_disk().contains(&hex::encode(ours)));
         let third = WalletLease::new();
         third.restore(&path);
         assert!(!third.is_pending(&ours) && third.is_pending(&faucet_coin) && third.incoming_pending());
