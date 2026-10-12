@@ -90,15 +90,17 @@ const stats = {
    *  handful of identical hashes would prove nothing. */
   distinctHashes: 0,
   dropped: null as { frame: number; index: number; value: number } | null,
-  /** The longest stretch, in ms, between one comparison and the next:
-   *  frames that froze partway stop comparing, which no mismatch would
-   *  show (stats() counts the stretch since the last one too). */
+  /** The longest stretch, in ms, without a new comparison, from the
+   *  spectator's start on: frames that froze partway, or a spectator that
+   *  never got going, stop comparing, which no mismatch would show
+   *  (stats() counts the stretch still running too). */
   longestGapMs: 0,
   errors: [] as string[],
 };
 const seenHashes = new Set<string>();
-/** When the ledger last compared a pair of hashes (0: not yet). */
-let comparedAt = 0;
+/** When the current stretch without a comparison began: the spectator's
+ *  start, then each comparison (0: the spectator has not started). */
+let gapFrom = 0;
 /** Inputs delivered so far, for `drop`. */
 let delivered = 0;
 /** When player one's frame last said where it was: a batch posts as the
@@ -194,14 +196,15 @@ function onFollower(ev: EmulatorEvent): void {
   switch (ev.type) {
     case 'started':
       stats.followerStarted = true;
+      if (!gapFrom) gapFrom = performance.now();
       source?.send({ type: 'arcade-replay-want-snapshot' });
       break;
     case 'replay-hash': {
       const ok = ledger.followerHash(ev.hash.frame, ev.hash.hash);
       if (ok !== null) {
         const now = performance.now();
-        if (comparedAt) stats.longestGapMs = Math.max(stats.longestGapMs, now - comparedAt);
-        comparedAt = now;
+        stats.longestGapMs = Math.max(stats.longestGapMs, now - (gapFrom || now));
+        gapFrom = now;
       }
       if (ok === false && resync) source?.send({ type: 'arcade-replay-want-snapshot' });
       break;
@@ -295,7 +298,7 @@ window.addEventListener('unhandledrejection', (e) => stats.errors.push(`page: ${
   stats: () => ({
     ...stats,
     hashEvery,
-    longestGapMs: Math.round(Math.max(stats.longestGapMs, comparedAt ? performance.now() - comparedAt : 0)),
+    longestGapMs: Math.round(Math.max(stats.longestGapMs, gapFrom ? performance.now() - gapFrom : 0)),
     drift: ledger.read(),
     lagFrames: stats.lagFrames.slice(-600),
   }),

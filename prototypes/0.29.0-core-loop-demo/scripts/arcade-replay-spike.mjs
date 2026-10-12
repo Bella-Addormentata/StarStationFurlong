@@ -16,12 +16,13 @@
  * --page lockstep-spike.html runs the four-seat lockstep spike instead
  * (src/arcadeLockstepSpike.ts; its query takes seats, delay, batchFrames).
  *
- * Exits non-zero when any compared hash differed, nothing was compared,
- * comparing stopped for longer than ten hash periods (or 15 s) at any point
- * after it began, or the harness or any frame reported an error: a frame
- * torn down or frozen, or the harness stopped, partway through stops
- * comparing, which no mismatch would show. The negative control,
- * `--query drop=N`, is expected to.
+ * Exits non-zero when any compared hash differed, nothing was compared, no
+ * new comparison came for longer than ten hash periods (or 15 s) at any
+ * point from the spectator's start on (in lockstep, from every seat's), or
+ * the harness or any frame reported an error: a frame torn down or frozen,
+ * a spectator or seat that never got going, or the harness stopped, partway
+ * through stops comparing, which no mismatch would show. The negative
+ * control, `--query drop=N`, is expected to.
  */
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
