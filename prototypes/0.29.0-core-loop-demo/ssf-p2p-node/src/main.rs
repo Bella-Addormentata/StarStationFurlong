@@ -404,12 +404,13 @@ pub struct HubState {
     /// era clock for the inbound marks and the presence publisher.
     #[cfg(feature = "chia-read")]
     pub chia_peak: std::sync::atomic::AtomicU32,
-    /// #231 P6a: `era + 1` of the newest presence record of OUR OWN the
-    /// watcher read back from the chain (0 = none yet). The publisher marks
-    /// its write confirmed when this names the write's era; until then the
-    /// write is pending and retried after a timeout.
+    /// #231 P6a: the signed `issued_at` of the newest presence record of OUR
+    /// OWN the watcher read back from the chain (0 = none yet). The publisher
+    /// marks its write confirmed when this is the write's own issued_at (its
+    /// mark's `last_at`); until then the write is pending and retried after a
+    /// timeout. An older record re-read inside the cursor overlap confirms nothing.
     #[cfg(feature = "chia-read")]
-    pub presence_confirmed_era: std::sync::atomic::AtomicU64,
+    pub presence_confirmed_at: std::sync::atomic::AtomicU64,
     /// #231 P6a: the presence publisher is running and findable (raised by the
     /// heartbeat loop at start). While it is, the watcher reads our own
     /// contact key every beat even with no room or peer to read for, since
@@ -1415,7 +1416,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-read")]
         chia_peak: std::sync::atomic::AtomicU32::new(0),
         #[cfg(feature = "chia-read")]
-        presence_confirmed_era: std::sync::atomic::AtomicU64::new(0),
+        presence_confirmed_at: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "chia-read")]
         presence_publishing: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "chia-publish")]
@@ -3361,10 +3362,13 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
                         let changed = {
                             let mut book = hub.peers.lock().unwrap();
                             let changed = book.record_card(&verified, room_id);
-                            if changed {
-                                if let Err(e) = book.save(std::path::Path::new(chia_contact::PEERS_FILE)) {
-                                    eprintln!("⛓️ ChiaHub contact: could not save {}: {e}", chia_contact::PEERS_FILE);
-                                }
+                            // The card came over a live connection from this very
+                            // peer: contact in itself, so the hold failures counted
+                            // against it are forgiven — they would otherwise prune a
+                            // peer we are talking to, a week after its card.
+                            book.note_ok(&remote_id.to_string(), chia_resolve::unix_now());
+                            if let Err(e) = book.save(std::path::Path::new(chia_contact::PEERS_FILE)) {
+                                eprintln!("⛓️ ChiaHub contact: could not save {}: {e}", chia_contact::PEERS_FILE);
                             }
                             changed
                         };

@@ -388,7 +388,13 @@ pub async fn read_ck(
                 found.extend(records);
             }
             Err(e) => {
-                *cursor = before; // transactional: a failed read examined nothing
+                // Transactional: a failed read examined nothing. The hint still
+                // has everything to read, so it is marked as backlog: the
+                // one-shot resolver then spends a retry round on it instead of
+                // taking the other hint's clean finish for "all read"; the
+                // watcher re-reads it next beat either way.
+                *cursor = before;
+                cursor.backlog = true;
                 if first_error.is_none() {
                     first_error = Some(e);
                 }

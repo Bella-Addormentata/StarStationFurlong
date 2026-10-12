@@ -403,13 +403,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             if sched.due("ck:self", peak, false) {
                 match chia_resolve::read_ck(&client, &own_ck, peak, now_unix, &mut ck_cursors).await {
                     Ok(found) => {
-                        if let Some(newest) =
-                            found.iter().filter(|f| f.record.node_id == self_id).max_by_key(|f| f.confirmed_height)
+                        if let Some(newest) = found
+                            .iter()
+                            .filter(|f| f.record.node_id == self_id)
+                            .max_by_key(|f| (f.record.issued_at, f.confirmed_height))
                         {
-                            hub.presence_confirmed_era.store(
-                                chia_lane::era_of(newest.confirmed_height) + 1,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            // The exact write, not just its era: the publisher
+                            // matches this against the push time in its mark.
+                            hub.presence_confirmed_at.store(newest.record.issued_at, std::sync::atomic::Ordering::Relaxed);
                             if newest.confirmed_height > own_ck_height {
                                 own_ck_height = newest.confirmed_height;
                                 shared.cooldowns.lock().unwrap().clear();

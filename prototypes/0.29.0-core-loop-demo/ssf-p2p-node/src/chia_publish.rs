@@ -946,6 +946,7 @@ impl NodePublishMark {
     /// at worst: spend-to-self is idempotent in effect).
     pub fn load(path: &std::path::Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
+        let _ = crate::chia_contact::tighten_private(path); // 0600 like every node file
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -971,6 +972,16 @@ pub fn era_guard(peak: u32) -> bool {
 /// the old signer — so a replaced key publishes again at once.
 pub fn mark_is_ours(mark: &NodePublishMark, hint: &str, node_id: &str) -> bool {
     mark.hint == hint && mark.node_id.as_deref() == Some(node_id)
+}
+
+/// Does the watcher's latest sighting of our own record (`seen_issued_at`: the
+/// signed `issued_at` of the newest record of ours read back, 0 = none yet)
+/// confirm this mark? Only the EXACT write counts: the mark's `last_at` is the
+/// `issued_at` it was published with, so an older record of the same era,
+/// re-read inside the cursor overlap, never confirms a newer write that may
+/// still be pending or dropped.
+pub fn mark_confirmed_by(mark: &NodePublishMark, seen_issued_at: u64) -> bool {
+    !mark.confirmed && seen_issued_at != 0 && seen_issued_at == mark.last_at
 }
 
 /// Is a presence write due? Always for a new era (or none ever), and for a mark
@@ -1130,11 +1141,13 @@ pub async fn heartbeat_loop(
                 let era = chia_lane::era_of(peak);
                 let now_unix = crate::chia_resolve::unix_now();
                 let hint_now = hex::encode(chia_lane::derive_ck_hint(&hub.contact_key, era));
-                // The watcher saw our record for the mark's era on chain: the
-                // write is confirmed, nothing more to retry.
+                // The watcher read THIS write back from the chain (the record's
+                // signed issued_at is the mark's push time): confirmed, nothing
+                // more to retry. An older record of ours re-read inside the
+                // cursor overlap names another issued_at and confirms nothing.
                 if let Some(m) = node_mark.as_mut() {
-                    let seen_era = hub.presence_confirmed_era.load(std::sync::atomic::Ordering::Relaxed);
-                    if !m.confirmed && seen_era == m.era + 1 {
+                    let seen_at = hub.presence_confirmed_at.load(std::sync::atomic::Ordering::Relaxed);
+                    if mark_confirmed_by(m, seen_at) {
                         m.confirmed = true;
                         if let Err(e) = m.save(mark_path) {
                             eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
@@ -1327,6 +1340,12 @@ mod tests {
         assert!(node_publish_due(Some(&pending), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS, "h", "n"), "pending, but the addresses changed: the change rule still applies");
         let pending_spent = NodePublishMark { confirmed: false, writes: 1 + MAX_NODE_WRITES_PER_ERA, ..mark.clone() };
         assert!(!node_publish_due(Some(&pending_spent), 5, "a", now + 2 * PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "retries spend the same era budget");
+        // Confirmation names the exact write: the record carrying the mark's own
+        // issued_at, not any record of ours from the same era.
+        assert!(mark_confirmed_by(&pending, now), "the record published at the mark's time confirms it");
+        assert!(!mark_confirmed_by(&pending, now - 1), "an older record of ours (same era) confirms nothing");
+        assert!(!mark_confirmed_by(&pending, 0), "nothing read back yet");
+        assert!(!mark_confirmed_by(&mark, now), "a confirmed mark needs nothing");
         let legacy: NodePublishMark = serde_json::from_str(r#"{"era":5,"writes":1,"addrs_sig":"a","last_at":1,"hint":""}"#).unwrap();
         assert!(!legacy.confirmed, "a mark file without the field reads as unconfirmed");
         assert!(!mark_is_ours(&legacy, "", "n"), "a mark without a node id is nobody's");

@@ -315,6 +315,11 @@ pub fn load_persisted_caps() -> Vec<(String, ChiaRoomCap)> {
             eprintln!("💾 cap persist: unreadable {name}");
             continue;
         };
+        // The cap holds the room key: a file left broader than 0600 is
+        // tightened on load, like `contact.key` and `peers.json`.
+        if let Err(e) = crate::chia_contact::tighten_private(&entry.path()) {
+            eprintln!("💾 cap persist: could not tighten {name}: {e}");
+        }
         let Some(room_key) = decode_room_key(&parsed.room_key_b64) else {
             eprintln!("💾 cap persist: bad room key in {name}");
             continue;

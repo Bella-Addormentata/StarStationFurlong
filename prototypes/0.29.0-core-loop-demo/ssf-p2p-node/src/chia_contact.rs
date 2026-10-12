@@ -238,13 +238,21 @@ impl PeerBook {
     /// logged and starts empty (fail open: it only slows re-introduction).
     pub fn load(path: &Path) -> PeerBook {
         match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(book) => book,
-                Err(e) => {
-                    eprintln!("⛓️ peers: {} is unreadable ({e}) — starting with an empty address book", path.display());
-                    PeerBook::default()
+            Ok(bytes) => {
+                // The book holds other nodes' contact keys: a file left broader
+                // than 0600 is tightened on load, like `contact.key`, since a
+                // quiet node may not save it again for a long time.
+                if let Err(e) = tighten_private(path) {
+                    eprintln!("⛓️ peers: could not tighten {}: {e}", path.display());
                 }
-            },
+                match serde_json::from_slice(&bytes) {
+                    Ok(book) => book,
+                    Err(e) => {
+                        eprintln!("⛓️ peers: {} is unreadable ({e}) — starting with an empty address book", path.display());
+                        PeerBook::default()
+                    }
+                }
+            }
             Err(_) => PeerBook::default(),
         }
     }
@@ -410,6 +418,30 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600,
                 "rewriting an existing, broader file tightens it to 0600"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_book_file_is_tightened_on_load() {
+        let dir = std::env::temp_dir().join(format!("ssf-pb-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PEERS_FILE);
+        std::fs::write(&path, serde_json::to_vec(&PeerBook::default()).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert_eq!(PeerBook::load(&path), PeerBook::default());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "loading an existing, broader address book tightens it to 0600"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
