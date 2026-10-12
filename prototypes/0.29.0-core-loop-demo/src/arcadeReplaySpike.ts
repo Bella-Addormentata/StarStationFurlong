@@ -64,7 +64,11 @@ function rng(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const random = rng(num('seed', 193));
+const seed = num('seed', 193);
+/** The bot and the network draw from separate streams: a re-sync or a
+ *  jittered delivery would otherwise shift the bot's buttons and timings. */
+const random = rng(seed);
+const netRandom = rng(seed ^ 0x5eed);
 
 const ledger = new DriftLedger();
 /** The spectator's side of the lane, made as it joins: like a real late
@@ -113,7 +117,7 @@ let follower: EmulatorHandle | null = null;
 
 /** The network between them: after latency ± jitter, in order of arrival. */
 function deliver(fn: () => void): void {
-  const delay = Math.max(0, latencyMs + (random() * 2 - 1) * jitterMs);
+  const delay = Math.max(0, latencyMs + (netRandom() * 2 - 1) * jitterMs);
   if (delay === 0) fn();
   else window.setTimeout(fn, delay);
 }
