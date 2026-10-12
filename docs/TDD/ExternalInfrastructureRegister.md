@@ -59,7 +59,7 @@ Run from the repository root; every hit must have a row above.
 # Expect: the two echo hosts of §2 (until that row moves to §7); tauri.localhost; file names (json.tmp, the test-vector paths);
 # and the addresses the address-filter tests use as fixtures: loopback, private, link-local, shared-space (100.64/10), the RFC 5737
 # documentation ranges, and 8.8.8.8 standing in for "a public v4" (never dialed). Anything else needs a row above
-grep -n -o -E 'https?://[^" )]+|"[^"]*\b[a-z0-9-]+\.[a-z]{2,}\b[^"]*"|\b[0-9]{1,3}(\.[0-9]{1,3}){3}\b' prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src/*.rs
+grep -rn -o -i -E 'https?://[^" )]+|"[^"]*\b[a-z0-9-]+\.[a-z]{2,}\b[^"]*"|\b[0-9]{1,3}(\.[0-9]{1,3}){3}\b' --include='*.rs' prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src
 # the gateway call sites (must be empty once §2's first row has moved to §7)
 grep -rn 'CoinsetClient::' prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src
 # the gateway host itself lives in the pinned crate, not in the node: expect https://testnet11.api.coinset.org (the crate leaves Cargo.toml with that row)
@@ -73,7 +73,7 @@ grep -rn 'typeof fetch' prototypes/0.29.0-core-loop-demo/src --include='*.ts' | 
 grep -rn -E '(^|[^A-Za-z])(fetch|fetchImpl|fetchFn)\(|new WebSocket\(|new EventSource\(|new WebTransport\(|\.src\s*=|href=|\.href\s*=|window\.open\(' prototypes/0.29.0-core-loop-demo/src --include='*.ts' | grep -v '[.]test[.]ts' | grep -v -E 'startPrefetch|stopPrefetch'
 grep -n -E 'https?://|fetch\(|\.src\s*=|<script[^>]*src=|href=|window\.open\(' prototypes/0.29.0-core-loop-demo/index.html prototypes/0.29.0-core-loop-demo/public/arcade/frame.html
 # the desktop shell: no updater endpoint, no remote URLs (expect the Vite dev URL localhost:5173 in the config; loopback 127.0.0.1 and the scheme prefixes the origin check strips in the sources)
-grep -n -i 'updater\|endpoints\|https\?://' prototypes/0.29.0-core-loop-demo/src-tauri/tauri.conf.json prototypes/0.29.0-core-loop-demo/src-tauri/src/*.rs
+grep -n -i 'updater\|endpoints\|https\?://' prototypes/0.29.0-core-loop-demo/src-tauri/tauri.conf.json; grep -rn -i 'updater\|endpoints\|https\?://' --include='*.rs' prototypes/0.29.0-core-loop-demo/src-tauri/src
 # the Mainline DHT bootstrap list lives in the n0-mainline crate, not in the node (main.rs passes no override): expect the four hosts of §3's first row
 grep -n -A5 'DEFAULT_BOOTSTRAP_NODES' ~/.cargo/registry/src/*/n0-mainline-*/src/actor/config.rs
 # ...and the bootstrap nodes are seeded into a lookup again whenever the candidate set is smaller than that list
