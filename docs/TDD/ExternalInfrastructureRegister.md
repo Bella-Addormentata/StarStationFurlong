@@ -49,6 +49,7 @@ Paths below are relative to the repository root; line numbers are those of main 
 | Port mapper (UPnP / NAT‑PMP / PCP, iroh's `portmapper` feature) | The player's own router | On | none | 2026‑10‑12 |
 | The node's HTTP API and WebTransport (`wtUrl`) | Loopback: the browser and its own node, when it has one (a browser with no node dials the `wtUrl` of the pass it imported: the bridge row of §4). The diagnostics Self-Test also dials the player's own node, at the LAN or public address they typed ([main.ts](../../prototypes/0.29.0-core-loop-demo/src/main.ts#L8603)) | On | — | 2026‑10‑12 |
 | Room sync (Yjs over the mesh), ticks, the hub relay | Room peers: the other players' own nodes, on the LAN or across the Internet, reached directly; no server is on the path unless the operator turns the §4 relay lane on, when iroh may carry this same traffic through a configured or peer-named relay (that row) | On | — | 2026‑10‑12 |
+| The default station: a genuine first run with a local node docks at the bundled welcome room instead of an empty home ([defaultStation.ts](../../prototypes/0.29.0-core-loop-demo/src/defaultStation.ts#L52), [main.ts](../../prototypes/0.29.0-core-loop-demo/src/main.ts#L1180)) | One named peer: the node that hosts SSF-WELCOME, the owner's. The pass bundled in the build carries that node's iroh id and its direct addresses as they were when the pass was issued (2026‑09‑15: one public IPv4 on two ports, two public IPv6, one LAN address; the §6 command prints them), no relay URL, and a loopback `wtUrl`; the local node dials those addresses and asks the DHT and the LAN for the id as for any room peer, once, as a join, never a claim. Only a first run dials it (`?seed=`, a resume target and the ordinary home boot take precedence), and when the host cannot be reached the boot falls back to the player's own home module, so the welcome host is a convenience on the first run's path, not a dependency | On while `WELCOME_ROOM_LINK` is non-empty | Build time: ship an empty `WELCOME_ROOM_LINK` (first runs then boot home) | 2026‑10‑12 |
 
 ## 6. How to re-verify
 
@@ -78,6 +79,8 @@ grep -n -i 'updater\|endpoints\|https\?://' prototypes/0.29.0-core-loop-demo/src
 grep -n -A5 'DEFAULT_BOOTSTRAP_NODES' ~/.cargo/registry/src/*/n0-mainline-*/src/actor/config.rs
 # ...and the bootstrap nodes are seeded into a lookup again whenever the candidate set is smaller than that list
 grep -n -B2 -A3 'candidates.len() < self.bootstrap.len()' ~/.cargo/registry/src/*/n0-mainline-*/src/core.rs
+# the bundled default-station pass: where a first run dials. Expect one member hint, the owner's SSF-WELCOME host (its iroh id and direct addresses), no irohRelayUrls, a loopback wtUrl; a new host or a relay URL here needs the §5 row updated
+grep -o "seed=[A-Za-z0-9_%=-]\{20,\}" prototypes/0.29.0-core-loop-demo/src/defaultStation.ts | cut -c6- | python3 -c 'import sys,base64,json,urllib.parse; s=urllib.parse.unquote(sys.stdin.read().strip()); d=json.loads(base64.urlsafe_b64decode(s+"="*(-len(s)%4))); d.pop("roomKeyB64",None); print(json.dumps(d,indent=1))'
 # what iroh does when the node configures nothing (expect RelayMode::Disabled, no address lookup)
 grep -n -B1 -A3 'pub fn empty()' ~/.cargo/registry/src/*/iroh-1.*/src/endpoint.rs
 ```
