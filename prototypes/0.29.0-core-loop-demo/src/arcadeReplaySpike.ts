@@ -32,6 +32,7 @@ import { emulatorDataPath, mountEmulatorFrame } from './arcadeEmulator';
 import type { EmulatorEvent, EmulatorHandle, ReplayStatus } from './arcadeEmulator';
 import type { ArcadeCore } from './arcadeDoc';
 import { batchRows, DriftLedger, packInputBatch, ReplayReassembler, unpackInputBatch } from './arcadeReplay';
+import type { ReplayBatch } from './arcadeReplay';
 
 const q = new URLSearchParams(location.search);
 const num = (k: string, d: number) => {
@@ -48,6 +49,9 @@ const hashEvery = num('hashEvery', 60);
 const lead = num('lead', 12);
 const resync = q.get('resync') === '1';
 const dropAt = num('drop', 0);
+/** Player one's frame posts a batch every this many frames. */
+const BATCH_FRAMES = 6;
+const FRAME_MS = 1000 / 60;
 
 /** mulberry32: the bot's presses repeat for a seed. */
 function rng(seed: number): () => number {
@@ -63,8 +67,10 @@ function rng(seed: number): () => number {
 const random = rng(num('seed', 193));
 
 const ledger = new DriftLedger();
-/** The spectator's side of the lane: batches back in frame order. */
-const reassembler = new ReplayReassembler();
+/** The spectator's side of the lane, made as it joins: like a real late
+ *  joiner it hears the stream from then on, and puts it back in frame
+ *  order from its save state's frame. */
+let reassembler: ReplayReassembler | null = null;
 const stats = {
   startedAt: 0,
   sourceStarted: false,
@@ -89,6 +95,9 @@ const stats = {
 const seenHashes = new Set<string>();
 /** Inputs delivered so far, for `drop`. */
 let delivered = 0;
+/** When player one's frame last said where it was: a batch posts as the
+ *  frame after its `through` ends. */
+let sourceFrameAt = 0;
 
 const el = (id: string) => document.getElementById(id) as HTMLElement;
 let source: EmulatorHandle | null = null;
@@ -99,6 +108,17 @@ function deliver(fn: () => void): void {
   const delay = Math.max(0, latencyMs + (random() * 2 - 1) * jitterMs);
   if (delay === 0) fn();
   else window.setTimeout(fn, delay);
+}
+
+/** Player one's frame now: the last batch's, plus the frames it has run
+ *  since (fewer than a batch's worth, or the next batch would have come). */
+function sourceFrameNow(): number {
+  const since = Math.floor((performance.now() - sourceFrameAt) / FRAME_MS);
+  return stats.sourceFrame + Math.max(0, Math.min(BATCH_FRAMES - 1, since));
+}
+
+function forward(batches: ReplayBatch[]): void {
+  for (const b of batches) follower?.send({ type: 'arcade-replay-inputs', from: b.from, through: b.through, inputs: batchRows(b) });
 }
 
 async function fetchRom(): Promise<Blob> {
@@ -121,6 +141,7 @@ function onSource(ev: EmulatorEvent): void {
       stats.inputs += ev.batch.inputs.length;
       stats.wireBytes += bytes.byteLength;
       stats.sourceFrame = ev.batch.through + 1;
+      sourceFrameAt = performance.now();
       deliver(() => {
         const batch = unpackInputBatch(bytes);
         if (!batch) return;
@@ -130,12 +151,13 @@ function onSource(ev: EmulatorEvent): void {
           delivered += 1;
         }
         delivered += batch.inputs.length;
-        for (const b of reassembler.push(batch)) {
-          follower?.send({ type: 'arcade-replay-inputs', from: b.from, through: b.through, inputs: batchRows(b) });
-        }
+        if (reassembler) forward(reassembler.push(batch));
       });
       break;
     }
+    case 'replay-status':
+      if (ev.status.phase === 'unsupported') stats.errors.push('source: cannot replay (no save states)');
+      break;
     case 'replay-hash':
       ledger.sourceHash(ev.hash.frame, ev.hash.hash);
       if (seenHashes.size < 100_000) seenHashes.add(ev.hash.hash);
@@ -145,9 +167,12 @@ function onSource(ev: EmulatorEvent): void {
       const s = ev.snapshot;
       stats.snapshots += 1;
       stats.snapshotBytes += s.state.byteLength;
-      // Late joiner: the save state goes first, then every batch after it
-      // (the follower drops inputs stamped before the state's frame).
-      deliver(() => follower?.send({ type: 'arcade-replay-snapshot', frame: s.frame, state: s.state, held: s.held, hash: s.hash }, [s.state.buffer]));
+      // Late joiner: the save state goes first, then every batch from its
+      // frame on, in order (the ones heard since the join waited for it).
+      deliver(() => {
+        follower?.send({ type: 'arcade-replay-snapshot', frame: s.frame, state: s.state, held: s.held, hash: s.hash }, [s.state.buffer]);
+        if (reassembler) forward(reassembler.start(s.frame));
+      });
       break;
     }
     case 'error':
@@ -172,9 +197,10 @@ function onFollower(ev: EmulatorEvent): void {
     }
     case 'replay-status': {
       const st = ev.status;
+      if (st.phase === 'unsupported') stats.errors.push('follower: cannot replay (no save states)');
       if (st.phase === 'stalled' && stats.follower?.phase === 'running') stats.stalls += 1;
       if (st.loaded !== undefined) stats.loads.push({ frame: st.loaded, matches: st.matches, tries: st.tries, atMs: Math.round(performance.now() - stats.startedAt) });
-      if (st.phase === 'running' && st.frame !== undefined) stats.lagFrames.push(stats.sourceFrame - st.frame);
+      if (st.phase === 'running' && st.frame !== undefined) stats.lagFrames.push(sourceFrameNow() - st.frame);
       stats.follower = st;
       break;
     }
@@ -221,11 +247,12 @@ async function config(role: 'source' | 'follower') {
     volume: 0,
     isolated: false,
     allowOrigins: [],
-    replay: { role, hashEvery, lead },
+    replay: { role, hashEvery, lead, batchFrames: BATCH_FRAMES },
   };
 }
 
 async function mountFollower(): Promise<void> {
+  reassembler = new ReplayReassembler();
   follower = mountEmulatorFrame(el('follower'), await config('follower'), onFollower);
 }
 
