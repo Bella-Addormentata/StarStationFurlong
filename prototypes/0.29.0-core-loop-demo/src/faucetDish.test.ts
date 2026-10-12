@@ -113,6 +113,14 @@ describe('faucet dish: node replies', () => {
     expect(asFaucetStatus({ ...wire(), ready: 'two' })).toBeNull();
     expect(asFaucetStatus({ ...wire(), walletMojos: 'lots' })).toBeNull();
     expect(asFaucetStatus({ ...wire(), totalMojos: '-5' })).toBeNull();
+    // Counts are whole and non-negative: a fraction or a negative block count
+    // would render as "1.5 MOJOS" or "REFILLS IN -3 BLOCKS" (round 22).
+    expect(asFaucetStatus(wire({ ready: 1.5 }))).toBeNull();
+    expect(asFaucetStatus(wire({ nextReadyInBlocks: -3 }))).toBeNull();
+    expect(asFaucetStatus(wire({ nextReadyInBlocks: 2.5 }))).toBeNull();
+    expect(asFaucetStatus(wire({ peak: 2 ** 53 }))).toBeNull();
+    expect(asFaucetStatus({ ...wire(), snapshot: 1.5 })?.snapshot).toBe(0);
+    expect(asFaucetStatus(wire({ snapshot: 12 }))?.snapshot).toBe(12);
   });
 
   it('keeps an error reply and a spent coin', () => {

@@ -99,6 +99,10 @@ export const SECONDS_PER_BLOCK = 18.75;
 /** Coins (gift slots) at which the jar reads FULL. One lobby drip is one coin. */
 export const FULL_JAR_COINS = 8;
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+/** A count off the wire (coins, blocks, the snapshot number): a safe
+ *  non-negative integer. A fraction or a negative would render as "1.5 MOJOS"
+ *  or "REFILLS IN -3 BLOCKS" (#245 review, round 22). */
+const isCount = (v: unknown): v is number => isNum(v) && Number.isSafeInteger(v) && v >= 0;
 
 /** A mojo total off the wire: a decimal string (the node's form; it sums coins
  *  in u128, so up to 39 digits, since several u64 coins can pass u64 together),
@@ -117,12 +121,12 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
   const r = raw as Record<string, unknown>;
   if (typeof r.address !== 'string' || typeof r.puzzleHash !== 'string') return null;
   for (const k of ['gift', 'gap', 'peak', 'coins', 'ready'] as const) {
-    if (!isNum(r[k]) || (r[k] as number) < 0) return null;
+    if (!isCount(r[k])) return null;
   }
   const total = asMojos(r.totalMojos);
   if (total === null) return null;
   const next = r.nextReadyInBlocks;
-  if (!(next === null || next === undefined || isNum(next))) return null;
+  if (!(next === null || next === undefined || isCount(next))) return null;
   const optMojos = (v: unknown): bigint | null | undefined => (v === null || v === undefined ? null : (asMojos(v) ?? undefined));
   const wallet = optMojos(r.walletMojos);
   if (wallet === undefined) return null;
@@ -137,7 +141,7 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
     totalMojos: total,
     coins: r.coins as number,
     ready: r.ready as number,
-    nextReadyInBlocks: isNum(next) ? next : null,
+    nextReadyInBlocks: isCount(next) ? next : null,
     canClaim: r.canClaim === true,
     canGive: r.canGive === true,
     walletMojos: wallet,
@@ -147,7 +151,7 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
     note: typeof r.note === 'string' ? r.note : '',
     spending: r.spending === true,
     landing: r.landing === true,
-    snapshot: isNum(r.snapshot) && r.snapshot > 0 ? Math.floor(r.snapshot) : 0,
+    snapshot: isCount(r.snapshot) ? r.snapshot : 0,
   };
 }
 
