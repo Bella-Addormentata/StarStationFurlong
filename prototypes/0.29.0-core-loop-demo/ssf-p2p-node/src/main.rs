@@ -823,6 +823,17 @@ fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
 #[cfg(feature = "chia-read")]
 pub(crate) fn chia_public_dial_addrs(addrs: &[String]) -> Vec<SocketAddr> {
     const CAP: usize = 8;
+    let mut kept = chia_public_addrs(addrs);
+    kept.truncate(CAP);
+    kept
+}
+
+/// Every public, internet-routable address among `addrs`, v6 first (stable:
+/// publisher order within each family), with no cap: the presence publisher
+/// canonicalizes and de-duplicates the whole set before it applies the
+/// record's own cap, so a duplicate never costs a slot.
+#[cfg(feature = "chia-read")]
+pub(crate) fn chia_public_addrs(addrs: &[String]) -> Vec<SocketAddr> {
     let mut kept: Vec<SocketAddr> = addrs
         .iter()
         .filter_map(|s| s.parse::<SocketAddr>().ok())
@@ -831,8 +842,7 @@ pub(crate) fn chia_public_dial_addrs(addrs: &[String]) -> Vec<SocketAddr> {
             std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
         })
         .collect();
-    kept.sort_by_key(|sa| sa.is_ipv4()); // stable: v6 first, then v4, publisher order within each
-    kept.truncate(CAP);
+    kept.sort_by_key(|sa| sa.is_ipv4());
     kept
 }
 
@@ -3654,6 +3664,15 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                 if let Ok(payload) = serde_json::to_vec(&card) {
                     let mut delivered: Vec<PublicKey> = Vec::new();
                     for (peer, conn) in &w.cards {
+                        // The room's posture was read before the lock was dropped;
+                        // a cap that made the room public since then stops the
+                        // rest of the batch — no card leaves for a public room.
+                        let still_sharing =
+                            hub.chia_rooms.lock().unwrap().get(&w.room).is_some_and(|cap| cap.may_share_card());
+                        if !still_sharing {
+                            println!("📇 room {} is no longer private — the remaining contact cards are not sent", w.room);
+                            break;
+                        }
                         if send_control(&hub, conn, &w.room, "contact", 0, payload.clone()).await {
                             delivered.push(*peer);
                         } else {

@@ -1013,7 +1013,10 @@ pub fn node_publish_due(
 /// so a LAN or CGNAT address never leaves the machine), in canonical order,
 /// at most eight, each with the measured flags of its family.
 pub fn public_addr_entries(live_addrs: &[String], inbound: &InboundVerified, peak: u32, now: u64) -> Vec<AddrEntry> {
-    let mut entries: Vec<AddrEntry> = crate::chia_public_dial_addrs(live_addrs)
+    // Every public address first, canonical order and duplicates removed, and
+    // only then the record's cap: a duplicate or the endpoint's listing order
+    // never costs a slot or shifts the signature.
+    let mut entries: Vec<AddrEntry> = crate::chia_public_addrs(live_addrs)
         .into_iter()
         .map(|addr| AddrEntry { addr, flags: inbound.flags_for(addr.is_ipv6(), peak, now) })
         .collect();
@@ -1126,9 +1129,10 @@ pub async fn heartbeat_loop(
             .filter(|sock| !sock.ip().is_unspecified())
             .map(|sock| sock.to_string())
             .collect();
-        if addrs.is_empty() {
-            continue; // nothing routable to advertise yet
-        }
+        // No early exit on an empty address list here: the per-node record may
+        // carry ZERO addresses (the codec allows it), and a node that lost its
+        // last address must say so, or its peers keep dialing the old ones until
+        // the record expires. The room publisher below still skips an empty set.
 
         // ── #231 P6a: the node's OWN presence first (priority over room publishes) ──
         if findable {
@@ -1205,6 +1209,9 @@ pub async fn heartbeat_loop(
             }
         }
 
+        if addrs.is_empty() {
+            continue; // nothing routable to advertise under a room key yet
+        }
         let addrs_sig = addrs.join(",");
         let caps: Vec<(String, ChiaRoomCap)> = hub
             .chia_rooms
@@ -1394,6 +1401,14 @@ mod tests {
         assert_ne!(addrs_signature(&later), sig_a, "a flag going stale in the next era is an address change");
         let many: Vec<String> = (0..12).map(|i| format!("1.1.1.{i}:1")).collect();
         assert_eq!(public_addr_entries(&many, &inbound, peak, now).len(), chia_lane::MAX_V2_ADDRS);
+        // Duplicates never cost a slot: nine distinct addresses listed behind
+        // eight copies of the first still fill all eight slots, all distinct.
+        let mut padded: Vec<String> = vec!["1.1.1.0:1".to_string(); 8];
+        padded.extend((0..9).map(|i| format!("1.1.1.{i}:1")));
+        let filled = public_addr_entries(&padded, &inbound, peak, now);
+        assert_eq!(filled.len(), chia_lane::MAX_V2_ADDRS);
+        let distinct: std::collections::HashSet<_> = filled.iter().map(|e| e.addr).collect();
+        assert_eq!(distinct.len(), chia_lane::MAX_V2_ADDRS, "canonicalized before the cap");
         assert_eq!(public_addr_entries(&["10.0.0.1:1".to_string()], &inbound, peak, now), vec![]);
     }
 

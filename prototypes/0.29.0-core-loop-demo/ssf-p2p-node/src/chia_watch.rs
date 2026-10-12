@@ -111,7 +111,7 @@ impl BeatSchedule {
     }
 
     /// Drop every schedule entry `gone` says is gone (P6a: peers that left the
-    /// address book, keyed `ck:<node id>`).
+    /// address book, keyed `ck:<contact key hex>`).
     pub fn forget_where(&mut self, gone: impl Fn(&str) -> bool) {
         self.last_read.retain(|key, _| !gone(key));
     }
@@ -612,8 +612,11 @@ fn ck_read_order(by_ck: &HashMap<[u8; 32], Vec<String>>, sched: &BeatSchedule) -
     keys
 }
 
+/// The beat entry of a contact key: the WHOLE key, so two keys that share a
+/// prefix (a member who knows another's key can mint one) never share an entry
+/// and shadow each other's reads.
 fn ck_sched_key(ck: &[u8; 32]) -> String {
-    format!("ck:{}", hex::encode(&ck[..8]))
+    format!("ck:{}", hex::encode(ck))
 }
 
 /// The rooms `node_id` is connected in right now.
@@ -694,6 +697,9 @@ mod tests {
         assert!(sched.due(&ck_sched_key(&b), 500, false));
         assert_eq!(ck_read_order(&by_ck, &sched), vec![c, b, a], "never read first, then the longest waiting");
         assert!(MAX_CK_READS_PER_TICK >= 1);
+        let mut twin = a;
+        twin[31] ^= 1;
+        assert_ne!(ck_sched_key(&a), ck_sched_key(&twin), "a key sharing a's first bytes has its own beat entry");
     }
 
     #[test]

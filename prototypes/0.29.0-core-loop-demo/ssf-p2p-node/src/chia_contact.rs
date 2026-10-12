@@ -218,6 +218,13 @@ pub fn share_card_enabled() -> bool {
     std::env::var("SSF_CHIA_SHARE_CARD").ok().as_deref() != Some("0")
 }
 
+/// Peers the address book holds at most. A private-room member can hand us one
+/// card per node identity it mints, and a key under which nothing is ever
+/// published fails no hold, so pruning alone never forgets it; past this many,
+/// the peer least recently in contact (a hold success, a card over a live
+/// connection, or failing both its card's own date) makes room for a newcomer.
+pub const MAX_PEERS: usize = 512;
+
 /// One peer in the address book.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerEntry {
@@ -282,7 +289,20 @@ impl PeerBook {
     /// Record a verified card met in `room`. Returns true when the book changed
     /// (a new peer, a newer card, or a new room for a known peer).
     pub fn record_card(&mut self, card: &VerifiedCard, room: &str) -> bool {
-        let entry = self.peers.entry(card.node_id.to_string()).or_default();
+        let node = card.node_id.to_string();
+        if !self.peers.contains_key(&node) && self.peers.len() >= MAX_PEERS {
+            // Full: the peer least recently in contact goes (ties by node id,
+            // so the choice is the same on every node).
+            let evict = self
+                .peers
+                .iter()
+                .min_by_key(|(id, e)| (e.last_ok.max(e.card_issued_at), (*id).clone()))
+                .map(|(id, _)| id.clone());
+            if let Some(id) = evict {
+                self.peers.remove(&id);
+            }
+        }
+        let entry = self.peers.entry(node).or_default();
         let mut changed = entry.rooms.insert(room.to_string());
         if card.issued_at >= entry.card_issued_at {
             let ck = ck_b64(&card.ck);
@@ -573,6 +593,30 @@ mod tests {
         book.note_fail(&node, now + 30);
         book.note_fail(&node, now + 40);
         assert_eq!(book.prune(now + 50 + PRUNE_AFTER_SECS), 1, "last_ok a week ago, three failures since: gone");
+    }
+
+    #[test]
+    fn peer_book_is_bounded_and_forgets_the_least_recent_contact_first() {
+        let now = 1_791_700_000u64;
+        let mut book = PeerBook::default();
+        let mut first = String::new();
+        for i in 0..MAX_PEERS {
+            let sk = iroh::SecretKey::generate();
+            let card = verify_card(&make_card(&sk, &[7u8; 32], now - 10_000 + i as u64), now).unwrap();
+            assert!(book.record_card(&card, "r"));
+            if i == 0 {
+                first = sk.public().to_string();
+            }
+        }
+        assert_eq!(book.peers.len(), MAX_PEERS);
+        // A hold success is contact: the oldest card is no longer the least recent.
+        book.note_ok(&first, now);
+        let sk = iroh::SecretKey::generate();
+        let newcomer = verify_card(&make_card(&sk, &[8u8; 32], now), now).unwrap();
+        assert!(book.record_card(&newcomer, "r"));
+        assert_eq!(book.peers.len(), MAX_PEERS, "the book stays at its cap");
+        assert!(book.peers.contains_key(&first), "the peer heard from most recently is kept");
+        assert!(book.peers.contains_key(&sk.public().to_string()), "the newcomer is in");
     }
 
     #[test]
