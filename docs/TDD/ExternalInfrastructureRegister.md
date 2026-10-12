@@ -43,20 +43,23 @@ Paths below are relative to the repository root; line numbers are those of main 
 
 ## 5. Local or peer, not central
 
-| Mechanism | Talks to | Default | Off switch |
-|---|---|---|---|
-| mDNS address lookup (`iroh-mdns-address-lookup` 0.4) | The LAN | On ([main.rs](../../prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src/main.rs#L1170)) | `SSF_NO_MDNS=1` |
-| Port mapper (UPnP / NAT‑PMP / PCP, iroh's `portmapper` feature) | The player's own router | On | none |
-| The node's HTTP API and WebTransport (`wtUrl`) | Loopback: the browser and its own node, when it has one (a browser with no node dials the `wtUrl` of the pass it imported: the bridge row of §4). The diagnostics Self-Test also dials the player's own node, at the LAN or public address they typed ([main.ts](../../prototypes/0.29.0-core-loop-demo/src/main.ts#L8603)) | On | — |
-| Room sync (Yjs over the mesh), ticks, the hub relay | Room peers: the other players' own nodes, on the LAN or across the Internet, reached directly; no server is on the path unless the operator turns the §4 relay lane on, when iroh may carry this same traffic through a configured or peer-named relay (that row) | On | — |
+| Mechanism | Talks to | Default | Off switch | Checked |
+|---|---|---|---|---|
+| mDNS address lookup (`iroh-mdns-address-lookup` 0.4) | The LAN | On ([main.rs](../../prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src/main.rs#L1170)) | `SSF_NO_MDNS=1` | 2026‑10‑12 |
+| Port mapper (UPnP / NAT‑PMP / PCP, iroh's `portmapper` feature) | The player's own router | On | none | 2026‑10‑12 |
+| The node's HTTP API and WebTransport (`wtUrl`) | Loopback: the browser and its own node, when it has one (a browser with no node dials the `wtUrl` of the pass it imported: the bridge row of §4). The diagnostics Self-Test also dials the player's own node, at the LAN or public address they typed ([main.ts](../../prototypes/0.29.0-core-loop-demo/src/main.ts#L8603)) | On | — | 2026‑10‑12 |
+| Room sync (Yjs over the mesh), ticks, the hub relay | Room peers: the other players' own nodes, on the LAN or across the Internet, reached directly; no server is on the path unless the operator turns the §4 relay lane on, when iroh may carry this same traffic through a configured or peer-named relay (that row) | On | — | 2026‑10‑12 |
 
 ## 6. How to re-verify
 
 Run from the repository root; every hit must have a row above.
 
 ```sh
-# every URL or hostname in the node
-grep -n -o -E 'https?://[^" )]+|[a-z0-9-]+[.](org|com|net|io|link|computer)' prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src/*.rs
+# every URL, hostname or IPv4 literal in the node: a URL, any name.tld inside a string literal (whatever the TLD), or a dotted quad.
+# Expect: the two echo hosts of §2 (until that row moves to §7); tauri.localhost; file names (json.tmp, the test-vector paths);
+# and the addresses the address-filter tests use as fixtures: loopback, private, link-local, shared-space (100.64/10), the RFC 5737
+# documentation ranges, and 8.8.8.8 standing in for "a public v4" (never dialed). Anything else needs a row above
+grep -n -o -E 'https?://[^" )]+|"[^"]*\b[a-z0-9-]+\.[a-z]{2,}\b[^"]*"|\b[0-9]{1,3}(\.[0-9]{1,3}){3}\b' prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src/*.rs
 # the gateway call sites (must be empty once §2's first row has moved to §7)
 grep -rn 'CoinsetClient::' prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src
 # the gateway host itself lives in the pinned crate, not in the node: expect https://testnet11.api.coinset.org (the crate leaves Cargo.toml with that row)
