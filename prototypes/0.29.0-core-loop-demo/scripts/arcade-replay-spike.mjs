@@ -17,7 +17,7 @@
  * (src/arcadeLockstepSpike.ts; its query takes seats, delay, batchFrames).
  *
  * Exits non-zero when any compared hash differed, nothing was compared, or
- * either frame reported an error (one torn down partway through stops
+ * any frame reported an error (one torn down partway through stops
  * comparing, which no mismatch would show). The negative control,
  * `--query drop=N`, is expected to.
  */
@@ -108,7 +108,7 @@ if (lockstep) {
     errors: last?.errors,
   }, null, 2));
   const dd = last?.drift;
-  process.exit(dd && dd.compared > 0 && dd.mismatched === 0 ? 0 : 1);
+  process.exit(dd && dd.compared > 0 && dd.mismatched === 0 && !last?.errors?.length ? 0 : 1);
 }
 console.log(JSON.stringify({
   minutes,

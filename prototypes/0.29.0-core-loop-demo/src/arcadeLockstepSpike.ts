@@ -29,6 +29,7 @@ import { emulatorDataPath, mountEmulatorFrame } from './arcadeEmulator';
 import type { EmulatorEvent, EmulatorHandle, ReplayStatus } from './arcadeEmulator';
 import type { ArcadeCore } from './arcadeDoc';
 import { batchRows, LockstepLedger, packInputBatch, ReplayReassembler, unpackInputBatch } from './arcadeReplay';
+import type { ReplayBatch } from './arcadeReplay';
 
 const q = new URLSearchParams(location.search);
 const num = (k: string, d: number) => {
@@ -87,8 +88,13 @@ const stats = {
 };
 
 const frames: Array<EmulatorHandle | null> = Array.from({ length: seats }, () => null);
-/** One reassembler per link (from → to): batches back in frame order. */
+/** One reassembler per link (from → to): batches back in frame order,
+ *  from the frame lockstep begins at (seat 0's save state). */
 const links = Array.from({ length: seats }, () => Array.from({ length: seats }, () => new ReplayReassembler()));
+
+function forward(from: number, to: number, batches: ReplayBatch[]): void {
+  for (const b of batches) frames[to]?.send({ type: 'arcade-replay-inputs', seat: from, from: b.from, through: b.through, inputs: batchRows(b) });
+}
 
 function deliver(fn: () => void): void {
   const ms = Math.max(0, latencyMs + (netRandom() * 2 - 1) * jitterMs);
@@ -123,9 +129,7 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
         deliver(() => {
           const batch = unpackInputBatch(bytes);
           if (!batch) return;
-          for (const b of links[seat]![to]!.push(batch)) {
-            frames[to]?.send({ type: 'arcade-replay-inputs', seat, from: b.from, through: b.through, inputs: batchRows(b) });
-          }
+          forward(seat, to, links[seat]![to]!.push(batch));
         });
       }
       break;
@@ -135,6 +139,10 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       stats.lockstepAt = performance.now();
       stats.lockFrame = s.frame;
       stats.snapshotBytes = s.state.byteLength;
+      // Every seat's batches start at this frame.
+      for (let from = 0; from < seats; from++) {
+        for (let to = 0; to < seats; to++) if (to !== from) forward(from, to, links[from]![to]!.start(s.frame));
+      }
       for (let to = 1; to < seats; to++) {
         const state = s.state.slice();
         deliver(() => frames[to]?.send({ type: 'arcade-replay-snapshot', frame: s.frame, state, held: s.held, hash: s.hash }, [state.buffer]));
@@ -146,6 +154,7 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       break;
     case 'replay-status': {
       const st = ev.status;
+      if (st.phase === 'unsupported') stats.errors.push(`seat ${seat}: cannot replay (no save states)`);
       if (st.loaded !== undefined) stats.loads.push({ seat, frame: st.loaded, matches: st.matches, tries: st.tries });
       me.status = st;
       break;

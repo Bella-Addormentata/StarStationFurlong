@@ -201,15 +201,19 @@
         var lead = c.replayLead >= 0 ? c.replayLead | 0 : 12;
         var batchFrames = c.replayBatchFrames > 0 ? c.replayBatchFrames | 0 : 6;
         var apply = gm.functions.simulateInput;
+        // Whether the game in this frame is its own (player one's, or seat
+        // 0's before lockstep) rather than one following another's.
+        var ownGame = role === 'source';
         // The state as bytes, or null. EmulatorJS's getState hands back the
         // core's error message, a string, when a save fails: then the
-        // replay stops and says so (`unsupported`). Player one's game goes
-        // on without it; a spectator's holds where it is.
+        // replay stops and says so (`unsupported`). A game of its own goes
+        // on without it; one that follows (a spectator, a seat in lockstep)
+        // holds where it is.
         function stateNow() {
           var st = gm.getState();
           if (st instanceof Uint8Array && st.length > 0) return st;
           if (role === 'source') gm.functions.simulateInput = apply;
-          hooks.pre = role === 'source' ? null : function () { return false; };
+          hooks.pre = ownGame ? null : function () { return false; };
           hooks.post = null;
           replay = null;
           post('arcade-replay-status', { phase: 'unsupported' });
@@ -285,6 +289,7 @@
           var thru = [];
           for (var n = 0; n < seats; n++) thru.push(-1);
           var phase = seat === 0 ? 'free' : 'waiting';
+          ownGame = seat === 0;
           var offset = 0;
           var start = 0;
           var snap = null;
@@ -342,6 +347,7 @@
           // this seat. Before lockstep, seat 0 plays at once (the game is
           // its alone); a joining seat's buttons go nowhere until it is in.
           gm.functions.simulateInput = function (p, i, v) {
+            v = v | 0; // a stick's fraction, as the core takes it (as the source's)
             if (applying) return apply(p, i, v);
             if (p !== 0) return;
             if (phase === 'free') {
@@ -383,13 +389,15 @@
               if (!wantBegin) return;
               // Lockstep begins here: the state now is every seat's start.
               wantBegin = false;
-              var st = gm.getState();
+              var st = stateNow();
+              if (!st) return;
               var heldRows = [];
               for (var hk in held) if (held[hk][2] !== 0) heldRows.push(held[hk]);
               start = gm.getFrameNum();
               nextFrom = start;
               lastBatch = start;
               phase = 'lockstep';
+              ownGame = false;
               pageWin.postMessage({ type: 'arcade-replay-snapshot', frame: start, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
               status();
               return;
@@ -398,7 +406,9 @@
               // As a spectator's load (above): landed when the state is seat
               // 0's, asked again every LOAD_RETRY iterations meanwhile.
               loadTries += 1;
-              var h = stateHash(gm.getState());
+              var cur = stateNow();
+              if (!cur) return;
+              var h = stateHash(cur);
               if (h !== snap.hash && loadTries < LOAD_TRIES) {
                 if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
                 return;
@@ -416,7 +426,11 @@
             }
             var s = at();
             if (pending.length || s - lastBatch >= batchFrames) flush();
-            if (s % hashEvery === 0) post('arcade-replay-hash', { frame: s, hash: stateHash(gm.getState()) });
+            if (s % hashEvery === 0) {
+              var hashed = stateNow();
+              if (!hashed) return;
+              post('arcade-replay-hash', { frame: s, hash: stateHash(hashed) });
+            }
             var now = Date.now();
             if (now - lastStatus > 1000) { lastStatus = now; status(); }
           };
