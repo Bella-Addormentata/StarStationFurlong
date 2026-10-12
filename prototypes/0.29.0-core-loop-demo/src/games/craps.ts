@@ -92,6 +92,9 @@ export interface CrapsTableState {
    *  legacy/betting states ⇒ treated as false. The shooter-hand NETTING boundary
    *  (see the Chia backend plan) and the "new shooter" narration read it. */
   sevenOut?: boolean;
+  /** ⚖️ A Fair roll voided because the house seed couldn't be revealed: no
+   *  dice, every bet stands (roulette: every stake returned). */
+  voided?: boolean;
   /** 🎲🔒 How this roll's dice were produced + its verifiable transcript (absent
    *  for 'rng'). Settled rolls only; lets any client re-derive and check the dice. */
   fairness?: FairnessTranscript;
@@ -110,6 +113,15 @@ export interface CrapsTableState {
   /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
    *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
   lastShooter?: string;
+  /** ⚖️ This round's seed commitments (see SeedRoundFields). */
+  houseCommit?: string;
+  commits?: Record<string, string>;
+  unseeded?: string[];
+  wagers?: Record<string, string>;
+  sigs?: Record<string, string>;
+  /** ⚖️ The fairness mode locked in when this window opened; the settle uses
+   *  it, so an owner's switch mid-window applies from the next one. */
+  fairMode?: FairnessMode;
 }
 
 /** Which fairness scheme produced a table's dice (see diceFairness.ts). All four
@@ -130,6 +142,12 @@ export interface FairnessTranscript {
   /** block-beacon: the block hash the dice mixed in. */
   beacon?: string;
   simulated?: boolean;
+  /** ⚖️ A LIVE multiparty roll (Fair by default): who each commit belongs to,
+   *  index-aligned with `commits` and `seeds` — 'house' first, then each
+   *  bettor's player id. A party that committed but never revealed has an
+   *  empty seed: their bets were forfeited and the result came from the rest.
+   *  Absent on the older dev-simulated transcripts. */
+  parties?: string[];
 }
 
 const FAIRNESS_MODES: readonly string[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
@@ -156,7 +174,52 @@ export function isFairnessTranscript(value: unknown): value is FairnessTranscrip
     && (f.commits === undefined || isBoundedStringArray(f.commits))
     && (f.seeds === undefined || isBoundedStringArray(f.seeds))
     && (f.beacon === undefined || (typeof f.beacon === 'string' && f.beacon.length <= FAIRNESS_MAX_STRING))
-    && (f.simulated === undefined || typeof f.simulated === 'boolean');
+    && (f.simulated === undefined || typeof f.simulated === 'boolean')
+    && (f.parties === undefined || (
+        isBoundedStringArray(f.parties)
+        && f.commits?.length === f.parties.length
+        && f.seeds?.length === f.parties.length
+    ));
+}
+
+/** The party name a live multiparty transcript gives the house's seed. */
+export const HOUSE_PARTY = 'house';
+
+/** ⚖️ The per-round seed commitments on a Fair table's state (craps and
+ *  roulette share them). `houseCommit` is written when the betting window
+ *  opens; `commits` is the bettors' commitments FROZEN at "no more bets" —
+ *  only these parties are asked to reveal, and only their seeds count. */
+export interface SeedRoundFields {
+  houseCommit?: string;
+  commits?: Record<string, string>;
+  /** Players with chips down at "no more bets" who added no seed (their
+   *  client never committed in time, or the party cap was full). They are
+   *  protected only by the other parties' seeds — shown on the table card. */
+  unseeded?: string[];
+  /** Each frozen bettor's wager list, hashed at "no more bets": the settle
+   *  pays only lists that still match. */
+  wagers?: Record<string, string>;
+  /** Each frozen bettor's signature over its commitment (its identity key,
+   *  players[pid].keyB64): nobody else can put a seed in under its name. */
+  sigs?: Record<string, string>;
+}
+
+function isPidMap(v: unknown, max: number): boolean {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const entries = Object.entries(v);
+  return entries.length <= max
+    && entries.every(([pid, c]) => pid.length > 0 && pid.length <= 128
+      && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
+}
+
+/** Shape guard for the peer-written seed fields (bounded like transcripts). */
+export function isSeedRoundFields(s: SeedRoundFields): boolean {
+  if (s.houseCommit !== undefined
+    && (typeof s.houseCommit !== 'string' || s.houseCommit.length > FAIRNESS_MAX_STRING)) return false;
+  if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
+  if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
+  if (s.sigs !== undefined && !isPidMap(s.sigs, FAIRNESS_MAX_PARTIES - 1)) return false;
+  return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 
 export function initialCrapsState(): CrapsTableState {
@@ -224,12 +287,18 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
         )
     ))
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
+    // A void is the canonical no-outcome shape: no dice, no transcript.
+    && (s.voided === undefined || (typeof s.voided === 'boolean'
+      && (!s.voided || (s.phase === 'settled' && s.dice === null && s.result === null && s.fairness === undefined
+        && s.payouts !== null && Object.keys(s.payouts).length === 0))))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && isPlayerIdField(s.shooter)
     && isPlayerIdField(s.lastShooter)
-    && isPlayerIdField(s.operator);
+    && isPlayerIdField(s.operator)
+    && isSeedRoundFields(s)
+    && (s.fairMode === undefined || FAIRNESS_MODES.includes(s.fairMode));
 }
 
 /** The point AFTER a roll of `sum`, given the point in force before it:

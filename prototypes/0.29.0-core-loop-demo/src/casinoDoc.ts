@@ -110,9 +110,15 @@ function docAlive(): boolean {
     && (boundDoc as { isDestroyed?: boolean }).isDestroyed !== true;
 }
 
-export function bindCasinoDoc(doc: Y.Doc): void {
+/** The bound room's stable id ('' for the page-local practice doc): the
+ *  fair tables bind their seed commitments to it. */
+let boundRoomId = '';
+
+export function bindCasinoDoc(doc: Y.Doc, roomId = ''): void {
   bindingEpoch += 1;
+  boundRoomId = roomId;
   boundDoc = doc;
+  pinPlayerKeys(doc);
   casinoMap = doc.getMap('casino');
   // 🪙 Index the coin pushers' requests now, outside any operator poll, and
   // observe ahead of notify() so listeners never see a stale index.
@@ -124,6 +130,10 @@ export function bindCasinoDoc(doc: Y.Doc): void {
 
 export function casinoDocEpoch(): number {
   return bindingEpoch;
+}
+
+export function casinoRoomId(): string {
+  return boundRoomId;
 }
 
 /** Bound map, lazily falling back to a page-local doc (offline practice). */
@@ -269,8 +279,9 @@ export function clearTableKeys(tableId: string): void {
     map.delete(`cfg:fairness:${tableId}`);
     map.delete(`throw:${tableId}`);
     const seatPrefix = `seat:${tableId}:`;
+    const seedPrefix = `fseed:${tableId}:`;
     for (const key of [...map.keys()]) {
-      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix)) map.delete(key);
+      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix) || key.startsWith(seedPrefix)) map.delete(key);
     }
   });
 }
@@ -521,6 +532,83 @@ export function writeCrapsFairnessPref(tableId: string, mode: FairnessMode): voi
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`cfg:fairness:${tableId}`, mode);
+  });
+}
+
+// ── ⚖️ Fair-table seed records (craps + roulette multiparty) ──────────────────
+// Each bettor's own `fseed:<tableId>:<pid>` (only that player's client writes
+// it): its commitment for one round, bound to the round number AND the house
+// commit so it can never be replayed into another round, plus the revealed
+// seed once "no more bets" froze the commit set. See fairTableSeeds.ts.
+
+export interface TableSeedRecord {
+  round: number;
+  /** The table's houseCommit this commitment answers. */
+  house: string;
+  commit: string;
+  /** The revealed seed — absent until the commit set is frozen. */
+  seed?: string;
+  /** The bettor's identity-key signature over the commitment (base64url,
+   *  fairTableSeeds.seedSigBytes): a record without a valid one is no party. */
+  sig?: string;
+}
+
+function isTableSeedRecord(v: unknown): v is TableSeedRecord {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<TableSeedRecord>;
+  const hex = (x: unknown) => typeof x === 'string' && x.length > 0 && x.length <= 128;
+  return Number.isInteger(r.round) && (r.round as number) >= 1
+    && hex(r.house) && hex(r.commit)
+    && (r.seed === undefined || hex(r.seed))
+    && (r.sig === undefined || hex(r.sig));
+}
+
+export function readSeedRecord(tableId: string, playerId: string): TableSeedRecord | null {
+  const v = ensureMap().get(`fseed:${tableId}:${playerId}`);
+  return isTableSeedRecord(v) ? v : null;
+}
+
+// ⚖️ Each player's identity key as THIS page first saw it in the bound room
+// (trust on first use): pinned the moment the players map shows it — at bind,
+// then as entries sync or arrive — so a later rewrite of players[pid].keyB64
+// can't hand a player's seat to another key. Pins last as long as the doc
+// binding and are never evicted; past the cap, new players simply go unpinned
+// (and so can't add a signed seed) rather than unseat anyone.
+const MAX_PINNED_KEYS = 4096;
+let pinnedKeys = new Map<string, string>();
+
+function entryKey(v: unknown): string | undefined {
+  const k = (v as { keyB64?: unknown } | undefined)?.keyB64;
+  return typeof k === 'string' && k.length > 0 && k.length <= 128 ? k : undefined;
+}
+
+function pinPlayerKeys(doc: Y.Doc): void {
+  const pins = new Map<string, string>();
+  pinnedKeys = pins;
+  const players = doc.getMap('players');
+  const pin = (pid: string, v: unknown): void => {
+    if (pins.has(pid) || pins.size >= MAX_PINNED_KEYS || pid.length === 0 || pid.length > 128) return;
+    const k = entryKey(v);
+    if (k) pins.set(pid, k);
+  };
+  players.forEach((v, pid) => pin(pid, v));
+  players.observe((e) => {
+    for (const pid of e.keysChanged) pin(pid, players.get(pid));
+  });
+}
+
+/** A player's identity key as this page first saw it in the room's players
+ *  map (the same base64url string keypair.getIdentityPub writes), or
+ *  undefined while none has shown up. */
+export function readPlayerKey(playerId: string): string | undefined {
+  if (!docAlive() || !boundDoc) return undefined;
+  return pinnedKeys.get(playerId);
+}
+
+export function writeMySeedRecord(tableId: string, playerId: string, rec: TableSeedRecord): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`fseed:${tableId}:${playerId}`, rec);
   });
 }
 

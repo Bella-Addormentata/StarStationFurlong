@@ -200,12 +200,13 @@ export type PlacementVerdict = { ok: true } | { ok: false; reason: string };
 
 /**
  * May `item` be placed at (pos, rot)? Checks, in order (plan §E3):
- *  1. bounds — within the shared PLACEMENT box (roomPlaceBounds: 1 m inside
- *     each wall, ±5 in the default room, deliberately TIGHTER than the
- *     walkable box). The footprint AABB is tested when the kind has one;
- *     extent-less kinds are tested at their origin point instead; wall mounts
- *     are exempt, because their origin sits on the wall plane and check 1b
- *     owns their rules
+ *  1. bounds — a footprint AABB must stay inside the walls (it may stand
+ *     flush against one); extent-less kinds are tested at their origin point
+ *     against the PLACEMENT box instead (roomPlaceBounds: 1 m inside each
+ *     wall, ±5 in the default room); wall mounts are exempt, because their
+ *     origin sits on the wall plane and check 1b owns their rules
+ *  1c. 🧱 a footprint stays out of every doorway's opening band and off every
+ *     hung wall panel (wallFixturesVerdict)
  *  1b. 🖥️ wall-mounted panels (the room terminal): the panel must clear the
  *     doorways and windows on its wall and must not be hung inside another
  *     item — see wallMountVerdict
@@ -300,17 +301,25 @@ export function validatePlacement(
     return gen ? gen(other, FURNITURE) : [];
   };
 
-  // Placement box: 1 m inside each wall (floorPlanDoc.roomPlaceBounds —
-  // deliberately tighter than the WALKABLE box; that function explains why).
-  // 🧱 #66 R1 — default 2×2 room ⇒ {6,6} ⇒ ±5, the legacy literal.
-  const { boundX: bX, boundZ: bZ } = roomPlaceBounds();
-
   // 1. Bounds — the footprint, or (decorative / wall-mounted) the origin point.
+  //    🧱 A footprint may run right up to the wall: its AABB is its real
+  //    extent, so the wall line itself is the limit, and the squares along
+  //    the walls are floor like any other. (This used to be the 1 m placement
+  //    box below, which left the whole outer ring of squares unplaceable for
+  //    every piece that has a footprint.) What that 1 m band used to protect
+  //    implicitly — doorways and hung wall panels — is checked explicitly at
+  //    1c.
+  //    Extent-less kinds keep the placement box (floorPlanDoc.roomPlaceBounds,
+  //    1 m inside each wall): they are tested at their ORIGIN with no AABB to
+  //    catch their real size; that function explains why.
   //    A wall-mounted panel's origin sits ON the wall plane, outside the
   //    walkable box by construction, so it is exempt: snapInteriorWall already
   //    clamps it to the wall and wallMountVerdict below owns its rules.
+  const { boundX: bX, boundZ: bZ } = roomPlaceBounds();
   if (box) {
-    if (box.x0 < -bX || box.x1 > bX || box.z0 < -bZ || box.z1 > bZ) {
+    const { halfX, halfZ } = roomHalfExtents();
+    const EPS = 1e-6;
+    if (box.x0 < -halfX - EPS || box.x1 > halfX + EPS || box.z0 < -halfZ - EPS || box.z1 > halfZ + EPS) {
       return { ok: false, reason: 'out of bounds' };
     }
   } else if (!isWallMounted(item.kind)) {
@@ -318,8 +327,8 @@ export function validatePlacement(
       return { ok: false, reason: 'out of bounds' };
     }
   }
-  // 1a. 🔭 …and out of a cupola's cut corners, with the same 1 m of wall
-  //     clearance the placement box keeps.
+  // 1a. 🔭 …and out of a cupola's cut corners, with the same clearance as
+  //     from the walls (none for a footprint, 1 m for an extent-less origin).
   //     A wall panel may not hang anywhere past where the taper starts (on
   //     the glass, or on side wall the taper removed).
   const cupolas = roomCupolas();
@@ -330,6 +339,14 @@ export function validatePlacement(
   // 1b. 🖥️ Wall-mounted panel rules (doorways, windows, other furniture).
   const wallVerdict = wallMountVerdict(item, pos, rot);
   if (!wallVerdict.ok) return wallVerdict;
+
+  // 1c. 🧱 A footprint against a wall must leave its doorways and hung panels
+  //     alone — the mirror of validateDoorPlacement check 2 and
+  //     wallMountVerdict rule 1, which only guard the DOOR and PANEL paths.
+  if (box) {
+    const wallVerdict = wallFixturesVerdict(item, box);
+    if (!wallVerdict.ok) return wallVerdict;
+  }
 
   for (const b of blocking) {
     // 2. Overlap with every other item's CURRENT blocked area.
@@ -622,6 +639,34 @@ function wallMountVerdict(
   return { ok: true };
 }
 
+/**
+ * 🧱 May a footprint stand where it is, as far as the fixtures ON the walls
+ * go? Its box must stay out of every doorway's opening band (doorOpeningAabb)
+ * and must not stand inside a hung DEVICE panel (wallMountBox) — the mirror of
+ * wallMountVerdict rule 3, which refuses to hang a device over furniture.
+ * A DECORATIVE mount (the climbing rose) is skipped, as wallMountVerdict skips
+ * rule 3 for it: it hangs above and behind what stands on the floor, so either
+ * may come first. Needed since footprints may reach the wall (validatePlacement
+ * check 1); before that the 1 m placement box kept every footprint out of both.
+ */
+function wallFixturesVerdict(item: FurnitureItem, box: Box): PlacementVerdict {
+  for (const door of currentDoorOpenings()) {
+    const ob = doorOpeningAabb(door.wall, door.lateral);
+    if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
+      return { ok: false, reason: `in the way of ${doorDisplayName(door.id)}` };
+    }
+  }
+  for (const other of FURNITURE) {
+    if (other.id === item.id || !isWallMounted(other.kind) || !FURNITURE_DEFS[other.kind].device) continue;
+    const panel = wallMountBox(other.kind, other.pos, other.rot);
+    if (!panel) continue;
+    if (box.x0 < panel.x1 && box.x1 > panel.x0 && box.z0 < panel.z1 && box.z1 > panel.z0) {
+      return { ok: false, reason: `in front of ${other.id} on the wall` };
+    }
+  }
+  return { ok: true };
+}
+
 // ── Door placement validity (#28 S6b — the door editor's add/tint gate) ───────
 
 /** Mint a fresh free-door id suffix — crypto.randomUUID with the identity.ts
@@ -816,8 +861,10 @@ export function validateDoorPlacement(
 
 // ── 🔭 Cupola end wall (cupola.ts) ──────────────────────────────────────────
 
-/** Furniture keeps this far inside a cupola's cut corners — the same 1 m the
- *  placement box keeps from the walls (floorPlanDoc.roomPlaceBounds). */
+/** An EXTENT-LESS piece's origin keeps this far inside a cupola's cut
+ *  corners — the same 1 m the placement box keeps it from the walls
+ *  (floorPlanDoc.roomPlaceBounds). A footprint may stand flush against the
+ *  glass, as it may against a wall (validatePlacement check 1). */
 const CUPOLA_PLACE_CLEARANCE = 1.0;
 
 /** Window end inset — octagonHull.WINDOW_INSET / windowLayout.WALL_INSET. */
@@ -828,8 +875,8 @@ const WINDOW_END_INSET = 0.05;
 const CUPOLA_DOOR_MARGIN = 0.4;
 
 /** True when a piece stays out of the cupola. Wall panels must hang short
- *  of the taper. A footprint (`box`) keeps the placement box's 1 m inside
- *  the cut corners; a generated feature's blocked area (`featureBoxes`: sea,
+ *  of the taper. A footprint (`box`) may touch the cut line (flush against
+ *  the glass, as against a wall) but not cross it; a generated feature's blocked area (`featureBoxes`: sea,
  *  river, pool — they meet the walls by design) only has to stay out of the
  *  cut-off corners; a piece with neither is tested at its origin. */
 function cupolaClearsItem(
@@ -844,7 +891,7 @@ function cupolaClearsItem(
     const mount = wallMountBox(kind, pos, rot);
     return !mount || !boxInCupolaTaper(plan, mount);
   }
-  if (box) return boxClearOfCupolaCorners(plan, box, CUPOLA_PLACE_CLEARANCE);
+  if (box) return boxClearOfCupolaCorners(plan, box, -1e-6);
   if (featureBoxes.length) return featureBoxes.every((b) => boxClearOfCupolaCorners(plan, b, 0));
   return cupolaCornerClearance(plan, pos.x, pos.z) >= CUPOLA_PLACE_CLEARANCE;
 }

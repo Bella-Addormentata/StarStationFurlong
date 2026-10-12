@@ -26,6 +26,7 @@ import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
 import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
+import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
   canRunCroupier,
@@ -5903,6 +5904,13 @@ export class World {
     else if (crapsTables.length && canEditRoom().ok) {
       for (const t of crapsTables) if (!isCroupierLive(t.id)) tickManualCraps(t.id);
     }
+    // ⚖️ Fair tables: every client with chips down commits its seed while the
+    // window is open and reveals it at "no more bets" (fairTableSeeds.ts).
+    if (tables.length) {
+      const me = getPlayerId();
+      for (const t of tables) tickFairSeeds(t.id, t.kind === "craps-table" ? "craps" : "roulette", me);
+    }
+    forgetMissingTables(new Set(tables.map((t) => t.id)));
 
     // 🎰 Slot machines: ONE session operates every machine in the room (one
     // lease, slotCroupier.ts), so a player's balance has a single slot

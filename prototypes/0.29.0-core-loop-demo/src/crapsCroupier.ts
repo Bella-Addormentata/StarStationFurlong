@@ -21,19 +21,20 @@
  * the settle, disjoint from the players' betting window (documented v1; the G4
  * Registry chips + a claim lane close it for real).
  *
- * NO SHARED CLOCK, FAIRNESS = dev-phase trust — same as croupier.ts: the
- * operator's Date.now() drives the deadlines and its client throws the dice; the
- * G5 commit-reveal upgrade slots in around resolveCrapsRound untouched.
+ * NO SHARED CLOCK — same as croupier.ts: the operator's Date.now() drives the
+ * deadlines. ⚖️ FAIRNESS: by default the dice come from the house's seed mixed
+ * with every bettor's (fairTableSeeds.ts) — committed at open, frozen at "no
+ * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
 import { canRunCroupier } from './croupier';
-import { getPlayerId } from './identity';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
   clearTableKeys,
   creditChips,
   readAllCrapsBets,
+  readCrapsFairnessPref,
   readCrapsTableState,
   readDiceThrow,
   readSeats,
@@ -45,7 +46,11 @@ import { hasLineBet, pickShooter } from './games/craps';
 import type { CrapsTableState, SeatedPlayer } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
-import { selectCrapsBackend } from './crapsBackend';
+import { CRAPS_PAGE_ID, selectCrapsBackend } from './crapsBackend';
+import { getCrapsFairnessMode } from './games/diceFairness';
+// ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
+// at "no more bets" (fairTableSeeds.ts).
+import { freezeCommits, frozenFields, isFairTable, newHouseCommit, roundSettleable } from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet come-out table never throws to an empty felt). */
@@ -101,6 +106,7 @@ export function rollAndSettleCraps(
       ...s,
       phase: 'closing',
       phaseDeadline: Date.now() + CRAPS_CLOSING_MS,
+      ...freezeCommits(tableId, 'craps', s),
     });
   }
   selectCrapsBackend(tableId)
@@ -133,6 +139,8 @@ export function openCrapsBetting(
     payouts: null,
     ...(shooter !== undefined ? { shooter } : {}),
     ...(lastShooter !== undefined ? { lastShooter } : {}),
+    fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
+    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
   });
 }
 
@@ -224,6 +232,19 @@ export function stickmanThrows(tableId: string, s: CrapsTableState, autoShowMs?:
   // The operator ticks every frame while the async settle is in flight: one
   // throw per roll, or every client's dice would restart their tumble.
   if (settling.has(tableId)) return;
+  // ⚖️ A Fair round whose house seed this page doesn't hold (a takeover) is
+  // void: settle it with no throw, so no client animates dice for it.
+  if ((s.houseCommit || frozenFields(tableId, s).houseCommit) && !roundSettleable(tableId, s)) {
+    rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
+    return;
+  }
+  // ⚖️ A Fair settle can wait a beat on the bettors' reveals, and the tick
+  // comes back every frame meanwhile: the stickman throws once per roll.
+  const prev = readDiceThrow(tableId);
+  if (prev?.round === s.round && prev.by === 'stickman') {
+    rollAndSettleCraps(tableId, s.round, s.point, autoShowMs);
+    return;
+  }
   writeDiceThrow(tableId, {
     round: s.round,
     by: 'stickman',
@@ -263,12 +284,19 @@ export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Dat
     ...s,
     phase: 'closing',
     phaseDeadline: now + (shooter ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS),
+    ...freezeCommits(tableId, 'craps', s),
   };
   if (shooter) next.shooter = shooter;
   else delete next.shooter;
   if (manual) next.operator = PAGE_ID;
   else delete next.operator;
   writeCrapsTableState(tableId, next);
+  // ⚖️ A Fair window this page can't reveal the house seed for is void: settle
+  // it now, before any shooter or the stickman throws dice for it.
+  // (A robot-run table gets its usual show beat, so it opens the next window.)
+  if (next.houseCommit && !roundSettleable(tableId, next)) {
+    rollAndSettleCraps(tableId, next.round, next.point, manual ? undefined : CRAPS_SHOW_MS);
+  }
 }
 
 /** While the dice are with the shooter: settle their throw when it lands in
@@ -284,9 +312,8 @@ export function tickCrapsClosing(tableId: string, s: CrapsTableState, autoShowMs
   if (now >= (s.phaseDeadline ?? now)) stickmanThrows(tableId, s, autoShowMs);
 }
 
-/** This page, as a manual table's operator: player id plus a per-load nonce,
- *  so two tabs of one player are still two operators. */
-const PAGE_ID = `${getPlayerId()}:${Math.random().toString(36).slice(2, 10)}`;
+/** This page, as a manual table's operator (crapsBackend.CRAPS_PAGE_ID). */
+const PAGE_ID = CRAPS_PAGE_ID;
 
 /** A manual craps table (no robot stickman): the page whose ROLL slid the
  *  dice out runs only that shooter's turn — watching the seats, settling the
@@ -355,7 +382,16 @@ const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>
  *    converged — never two settles from two shareholders' presses.
  */
 export function pressManualRoll(tableId: string, now = Date.now()): string | null {
-  if (!readCrapsTableState(tableId)) openCrapsBetting(tableId, 1, null);
+  if (!readCrapsTableState(tableId)) {
+    openCrapsBetting(tableId, 1, null);
+    // ⚖️ A Fair window with bets already down only opens on this press: the
+    // bettors need to see the house commit and add their seeds before "no
+    // more bets", or the house seed alone would decide the roll.
+    const opened = readCrapsTableState(tableId);
+    if (opened?.houseCommit && Object.keys(readAllCrapsBets(tableId)).length > 0) {
+      return 'BETS OPEN — PRESS AGAIN TO ROLL';
+    }
+  }
   const s = readCrapsTableState(tableId);
   if (!s) return null;
   if (s.phase === 'betting') {
