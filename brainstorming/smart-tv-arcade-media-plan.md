@@ -1636,15 +1636,27 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   wrong for a listing: a seeder listed at the stepped reading would stay
   listed for as long as the step, a day never passing on a clock that
   does not move. So listings age on the AGE clock, which only rises and
-  never stands still: the later of the wall clock and the reading last
-  persisted plus the monotonic time elapsed since, persisted with every
-  mark written and on shutdown, and resumed from the persisted reading
-  at start — the time the node was down counting only as far as the wall
-  clock has moved past that reading, never on a clock that may have been
-  stepped meanwhile — so a listing accepted while the clock stood
-  stepped forward is delisted a day of real time later; and the age
-  clock, never below the floor (both take the wall clock's maximum, and
-  only one of them runs on), is never the one a mark is measured on, or
+  never stands still while the node runs: the later of the wall clock and
+  the reading last persisted plus the monotonic time elapsed since,
+  persisted with every mark written, on shutdown and at least once a
+  minute besides (a crash loses the time since the last reading and no
+  more), and resumed at start from the later of the wall clock and the
+  persisted reading — the time the node was down counting only as far as
+  the wall clock has moved past that reading, never on a clock that may
+  have been stepped meanwhile. When the wall clock at start stands BEHIND
+  the persisted reading (stepped back while the node was down, or a crash
+  after a step forward that the reading had followed), the time down is
+  unknowable, and the node FAILS CLOSED: every listing is dropped — a
+  seeder earns its place again at its next hourly renewal, said on the
+  library pane — while the marks, which live on the floor, are kept;
+  since a reading resumed below where the clock had run would hold a dead
+  seeder listed past its day, and a restart repeated would hold it for as
+  long as the restarts went on. So a restart costs a listing at most the
+  minute since the last persisted reading, never the uptime, and a
+  listing accepted while the clock stood stepped forward is delisted a
+  day of real time later; and the age clock, never below the floor (both
+  take the wall clock's maximum, and only one of them runs on), is never
+  the one a mark is measured on, or
   marks would fall before the announcements they guard were refused by
   age. (The cost of a clock stepped a long way forward and back is that
   honest seeds read as too old until true time catches the floor up, and
