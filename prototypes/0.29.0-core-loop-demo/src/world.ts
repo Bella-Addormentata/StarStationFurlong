@@ -242,7 +242,7 @@ import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } 
 import { tvScreenView } from "./tvDoc";
 // 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
 // attract card the prop draws.
-import { createArcadeCabinetUI } from "./arcadeUI";
+import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
 import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
 import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
 import { arcadeScreenView } from "./arcadeDoc";
@@ -6009,6 +6009,39 @@ export class World {
    * build the kind-appropriate focused UI, and hand both to the
    * DeviceFocusController, which wires its hooks into navigateToDevice.
    */
+  /**
+   * 🕹 The arcade cabinet's panel in one of its views (#193): PLAY at the
+   * controls, SETTINGS from the ⚙️. Each view swaps to the other in place.
+   */
+  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView): DeviceUI {
+    return createArcadeCabinetUI({
+      itemId: deviceId,
+      myPub: () => getIdentityPub(),
+      myName: () => getPlayerName(),
+      canEdit: () => canEditRoom().ok,
+      openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId)),
+      view,
+      openSettings: () => { deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, "settings")); },
+      openPlay: () => { deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, "play")); },
+    });
+  }
+
+  /**
+   * 🕹 The ⚙️ low on a cabinet's front (#193, the slot machine's kick-panel
+   * gears in #241): anyone who clicks it is walked to the cabinet and shown
+   * its SETTINGS view — read-only unless they can edit the room, the gate
+   * arcadeDoc's writes check again. Already at that cabinet, the panel just
+   * swaps to it.
+   */
+  public handleArcadeControl(deviceId: string, control: "settings"): boolean {
+    const device = findDevice(deviceId);
+    if (!device || device.kind !== "arcade" || control !== "settings" || !this.isPlayerActive()) return false;
+    const ui = this.arcadeCabinetUI(deviceId, "settings");
+    if (deviceFocus.getActiveDeviceId() === deviceId && deviceFocus.replaceFocusedUI(ui)) return true;
+    deviceFocus.beginFocus(this.player, device, ui);
+    return true;
+  }
+
   public handleSlotMachineControl(
     deviceId: string,
     control: SlotMachineCabinetControl | "service" | "settings",
@@ -6508,14 +6541,7 @@ export class World {
     // for P1 — and the stage the coin opens (the emulator in a frame of our
     // own), after the focus is released, as the TV hands off to its theatre.
     if (device.kind === "arcade") {
-      const ui = createArcadeCabinetUI({
-        itemId: deviceId,
-        myPub: () => getIdentityPub(),
-        myName: () => getPlayerName(),
-        canEdit: () => canEditRoom().ok,
-        openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId)),
-      });
-      deviceFocus.beginFocus(this.player, device, ui);
+      deviceFocus.beginFocus(this.player, device, this.arcadeCabinetUI(deviceId, "play"));
       return;
     }
 

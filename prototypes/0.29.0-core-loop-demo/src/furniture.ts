@@ -10596,6 +10596,40 @@ function buildTvStand(ctx: BuildCtx) {
  * brings it here later (plan §9). Stows the ArcadeScreenHandle on the
  * screen mesh (userData.arcadeScreen) for registerFurnitureHandles.
  */
+/**
+ * ⚙️ The cabinet's settings button, low on its front by the floor — out of
+ * the player's view at the controls (the slot machine's kick-panel gears,
+ * #241). Anyone who clicks it reads the cabinet's settings; the owner
+ * changes them there (arcadeUI's SETTINGS view, World.handleArcadeControl).
+ * A gold rim and the emoji on a dark disc, facing local +z at `z`.
+ */
+export const ARCADE_GEAR_Y = 0.2;
+function placeArcadeSettingsGear({ itemId, m, place }: BuildCtx, x: number, z: number): void {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 128;
+  const g = canvas.getContext("2d")!;
+  g.fillStyle = "#20262F";
+  g.beginPath();
+  g.arc(64, 64, 62, 0, Math.PI * 2);
+  g.fill();
+  g.font = '84px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+  g.textAlign = "center";
+  g.textBaseline = "middle";
+  g.fillText("⚙️", 64, 70);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const face = new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0 });
+  face.userData.baseOpacity = 1;
+  const rimGeometry = new THREE.CylinderGeometry(0.05, 0.05, 0.012, 24);
+  rimGeometry.rotateX(Math.PI / 2);
+  const rim = place(rimGeometry, m(0xd4a84b, 0.35, 0.6), x, ARCADE_GEAR_Y, z + 0.006);
+  const disc = place(new THREE.PlaneGeometry(0.086, 0.086), face, x, ARCADE_GEAR_Y, z + 0.0125);
+  for (const gear of [rim, disc]) {
+    gear.userData.arcadeControl = "settings";
+    gear.userData.arcadeCabinetId = itemId;
+  }
+}
+
 function buildArcadeCabinet(ctx: BuildCtx) {
   const { m, place, addLight } = ctx;
   const BODY = 0x141a2e; // deep navy cabinet
@@ -10626,6 +10660,8 @@ function buildArcadeCabinet(ctx: BuildCtx) {
   // Coin door with its slot.
   place(new THREE.BoxGeometry(0.22, 0.16, 0.02), m(0x3d4a5e, 0.5, 0.5), 0, 0.5, d / 2 - 0.005);
   place(new THREE.BoxGeometry(0.05, 0.012, 0.016), m(0x05070c, 0.8, 0.1), 0, 0.52, d / 2 + 0.003);
+  // ⚙️ below the coin door, just above the plinth: anyone's way to the settings.
+  placeArcadeSettingsGear(ctx, 0, (d - 0.03) / 2);
   // Marquee: a lit header above the screen.
   place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
   place(new THREE.PlaneGeometry(w - 0.08, 0.1), m(TRIM, 0.5, 0.1, TRIM, 0.6), 0, 1.74, 0.111);
