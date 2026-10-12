@@ -25,8 +25,9 @@
 //! hints (this era and the last) read on the beat, and its freshest record is
 //! planned into holds in the private rooms it was met in. Our own record is
 //! read too, so seeing it confirm restarts the dance exactly as a room record
-//! did. The watcher also publishes the chain peak it saw (`hub.chia_peak`),
-//! the era clock for the inbound marks and the presence publisher.
+//! did. The watcher also publishes the chain peak it saw (`hub.chia_peak`, with
+//! the time of the read in `hub.chia_peak_at`), the era clock for the inbound
+//! marks and the presence publisher.
 //!
 //! Pure pieces ([`BeatSchedule`], [`plan_holds`]) are unit-tested; the loop
 //! itself is thin glue over them, the reader and `main::hold_dial`.
@@ -327,6 +328,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             Some(h) => {
                 peak_failure_logged = false;
                 hub.chia_peak.store(h, std::sync::atomic::Ordering::Relaxed);
+                hub.chia_peak_at.store(chia_resolve::unix_now(), std::sync::atomic::Ordering::Relaxed);
                 h
             }
             None => {

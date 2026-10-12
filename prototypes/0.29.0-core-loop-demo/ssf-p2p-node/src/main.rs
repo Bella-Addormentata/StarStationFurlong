@@ -406,10 +406,24 @@ pub struct HubState {
     /// record's reachability flags. Written by `run_iroh_listener` only.
     #[cfg(feature = "chia-read")]
     pub inbound_verified: Mutex<chia_contact::InboundVerified>,
+    /// #231 P6a: peers whose dial ended lately, and when, kept for
+    /// [`DIAL_PINHOLE_GRACE`]: the NAT mapping our Initials opened outlives
+    /// the dial task, so an inbound connection from one of them inside the
+    /// grace is not unsolicited and proves nothing about reachability.
+    /// Written by `dial_peer_with_retry`, read and pruned by `dialed_lately`.
+    #[cfg(feature = "chia-read")]
+    pub recent_dials: Mutex<HashMap<PublicKey, std::time::Instant>>,
     /// #231 P6a: the chain peak the watcher saw last (0 = unknown yet): the
     /// era clock for the inbound marks and the presence publisher.
     #[cfg(feature = "chia-read")]
     pub chia_peak: std::sync::atomic::AtomicU32,
+    /// #231 P6a: when (unix seconds) `chia_peak` was last read from the chain
+    /// (0 = never). The publisher trusts the cached peak only while it is
+    /// younger than its freshness bound and otherwise asks the chain itself
+    /// before an era-sensitive write: a stalled watcher scan must not let a
+    /// record be signed for an era that has already ended.
+    #[cfg(feature = "chia-read")]
+    pub chia_peak_at: std::sync::atomic::AtomicU64,
     /// #231 P6a: the signed `issued_at` of the newest presence record of OUR
     /// OWN the watcher read back from the chain (0 = none yet). The publisher
     /// marks its write confirmed when this is the write's own issued_at (its
@@ -1442,7 +1456,11 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-read")]
         inbound_verified: Mutex::new(chia_contact::InboundVerified::default()),
         #[cfg(feature = "chia-read")]
+        recent_dials: Mutex::new(HashMap::new()),
+        #[cfg(feature = "chia-read")]
         chia_peak: std::sync::atomic::AtomicU32::new(0),
+        #[cfg(feature = "chia-read")]
+        chia_peak_at: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "chia-read")]
         presence_confirmed_at: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "chia-read")]
@@ -2126,12 +2144,15 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
 
 /// #231 P6a: an accepted connection whose Initial came DIRECTLY (no relay) from
 /// a PUBLIC address, with that address validated, from a peer we were not
-/// dialing at the time, is proof that this node is reachable inbound on that
-/// address family — the only thing a presence record's flag may claim. A
-/// connection that arrived through a relay, from a LAN peer, or while our own
-/// hold-dial Initials had already opened the pinhole proves nothing and sets
-/// nothing. The mark carries the chain peak the watcher knows (0 when it has
-/// none yet), so the publisher can tell "this era" from "last era".
+/// dialing — nor had dialed within [`DIAL_PINHOLE_GRACE`] — is proof that this
+/// node is reachable inbound on that address family — the only thing a
+/// presence record's flag may claim. A connection that arrived through a relay,
+/// from a LAN peer, or after our own dial Initials opened the pinhole (a dial
+/// still running, or one that ended inside the grace: the NAT mapping it made
+/// outlives the task, and the peer's own hole-punch Initials come through it)
+/// proves nothing and sets nothing. The mark carries the chain peak the watcher
+/// knows (0 when it has none yet), so the publisher can tell "this era" from
+/// "last era".
 #[cfg(feature = "chia-read")]
 fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::endpoint::IncomingAddr, bool)) {
     let (addr, validated) = path;
@@ -2143,7 +2164,7 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
         std::net::IpAddr::V4(v4) => ipv4_is_public(v4),
         std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
     };
-    if !public || hub.dialing.lock().unwrap().contains(&remote_id) {
+    if !public || dialed_lately(hub, &remote_id, std::time::Instant::now()) {
         return;
     }
     let height = hub.chia_peak.load(std::sync::atomic::Ordering::Relaxed);
@@ -2156,6 +2177,28 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
             sa.ip()
         );
     }
+}
+
+/// How long after a dial task ends an inbound connection from its target still
+/// counts as one we enabled: the UDP mapping our Initials opened in a NAT lives
+/// on after the task (two minutes is the mapping lifetime RFC 4787 asks of a
+/// NAT), and the peer's own Initials arrive through it. Only an inbound
+/// connection from a peer we have not dialed in this long is unsolicited. A
+/// reachable node that dialed the peer first is not misjudged, only measured
+/// by a later peer instead.
+#[cfg(feature = "chia-read")]
+const DIAL_PINHOLE_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Did we dial `peer` lately: a dial in flight (`hub.dialing`), or one that
+/// ended within [`DIAL_PINHOLE_GRACE`] (`hub.recent_dials`, pruned here)?
+#[cfg(feature = "chia-read")]
+fn dialed_lately(hub: &HubState, peer: &PublicKey, now: std::time::Instant) -> bool {
+    if hub.dialing.lock().unwrap().contains(peer) {
+        return true;
+    }
+    let mut recent = hub.recent_dials.lock().unwrap();
+    recent.retain(|_, ended| now.duration_since(*ended) < DIAL_PINHOLE_GRACE);
+    recent.contains_key(peer)
 }
 
 // Issue #60 symptom 2: bounded, backing-off dial that runs OFF the browser's
@@ -2192,6 +2235,10 @@ async fn dial_peer_with_retry(
     )
     .await;
     hub.dialing.lock().unwrap().remove(&target_pub_key);
+    // #231 P6a: the pinhole our Initials opened outlives the task — an inbound
+    // connection from this peer inside the grace is not unsolicited.
+    #[cfg(feature = "chia-read")]
+    hub.recent_dials.lock().unwrap().insert(target_pub_key, std::time::Instant::now());
 }
 
 /// Report a dial's status to the browser: to the specific `send` stream when the
@@ -3657,12 +3704,13 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                 let _ = conn.send_datagram(HEARTBEAT_MAGIC.to_vec().into());
             }
             // #231 P6a: the contact card, node-signed like every control frame.
-            // Only a peer whose frame went out whole is marked as having it.
+            // Only a peer whose frame went out whole, on the connection it still
+            // holds, is marked as having it.
             #[cfg(feature = "chia-read")]
             if !w.cards.is_empty() {
                 let card = chia_contact::make_card(&hub.secret_key, &hub.contact_key, chia_resolve::unix_now());
                 if let Ok(payload) = serde_json::to_vec(&card) {
-                    let mut delivered: Vec<PublicKey> = Vec::new();
+                    let mut delivered: Vec<(PublicKey, usize)> = Vec::new();
                     for (peer, conn) in &w.cards {
                         // The room's posture was read before the lock was dropped;
                         // a cap that made the room public since then stops the
@@ -3674,7 +3722,7 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                             break;
                         }
                         if send_control(&hub, conn, &w.room, "contact", 0, payload.clone()).await {
-                            delivered.push(*peer);
+                            delivered.push((*peer, conn.stable_id()));
                         } else {
                             eprintln!("📇 contact card to {peer} in room {} did not go out — retrying next tick", w.room);
                         }
@@ -3682,8 +3730,14 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                     if !delivered.is_empty() {
                         let mut rooms = hub.rooms.lock().unwrap();
                         if let Some(room) = rooms.get_mut(&w.room) {
-                            for peer in &delivered {
-                                if let Some(m) = room.remote_peers.get_mut(peer) {
+                            for (peer, sent_on) in &delivered {
+                                // The card went out on THAT connection. A peer that
+                                // reconnected meanwhile holds a new entry (a new
+                                // connection) that never saw it: left unmarked, it
+                                // gets the card next tick.
+                                if let Some(m) =
+                                    room.remote_peers.get_mut(peer).filter(|m| m.conn.stable_id() == *sent_on)
+                                {
                                     m.card_sent = true;
                                 }
                             }

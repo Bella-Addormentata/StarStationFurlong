@@ -372,7 +372,9 @@ pub struct InboundSeen {
 /// The measured half of the reachability flags: nothing here is set by
 /// configuration, only by `run_iroh_listener` accepting a connection whose
 /// Initial arrived DIRECTLY (not via a relay) from a public address we were
-/// not dialing at the time, with the sender's address validated.
+/// not dialing, nor had dialed within the pinhole grace (`DIAL_PINHOLE_GRACE`
+/// in main.rs: the NAT mapping a dial opens outlives its task), with the
+/// sender's address validated.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboundVerified {
     pub v4: Option<InboundSeen>,
