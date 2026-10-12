@@ -568,6 +568,35 @@ pub(crate) fn extract_ciphertext(coin_spend: &CoinSpend, hint: Bytes32) -> Resul
     Ok(None)
 }
 
+/// How old a cached chain peak may be before it is as good as none. The watcher
+/// reads the peak once per tick, but a long or stalled scan — or the gateway
+/// down — can leave it blocks, or an era, behind: a publisher signing by it
+/// would write for an era that has ended, and an inbound mark stamped with it
+/// would name one. Kept well inside the publisher's eight end-of-era guard
+/// blocks (about 150 s of blocks), so a stale peak never walks a write past
+/// the guard either.
+pub const PEAK_MAX_AGE_SECS: u64 = 90;
+
+/// The chain peak as last read, and when (unix seconds), as ONE value: a reader
+/// never pairs an old height with a newer time. `Default` is "none yet".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainPeak {
+    pub height: u32,
+    pub seen_at: u64,
+}
+
+impl ChainPeak {
+    pub fn new(height: u32, seen_at: u64) -> Self {
+        Self { height, seen_at }
+    }
+
+    /// The height, when known and read within [`PEAK_MAX_AGE_SECS`] of `now`;
+    /// `None` is "ask the chain" (or, for a mark, "judge by elapsed time").
+    pub fn fresh(&self, now: u64) -> Option<u32> {
+        (self.height != 0 && now.saturating_sub(self.seen_at) <= PEAK_MAX_AGE_SECS).then_some(self.height)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,6 +632,16 @@ mod tests {
             confirmed_height: height,
             hint: Bytes32::new([1u8; 32]),
         }
+    }
+
+    #[test]
+    fn a_cached_peak_is_the_era_clock_only_while_fresh() {
+        let now = 1_700_000_000u64;
+        assert_eq!(ChainPeak::default().fresh(now), None, "no peak read yet");
+        assert_eq!(ChainPeak::new(100, now).fresh(now), Some(100), "just read");
+        assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS).fresh(now), Some(100), "at the bound: still the clock");
+        assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS - 1).fresh(now), None, "older: ask the chain");
+        assert_eq!(ChainPeak::new(100, now + 5).fresh(now), Some(100), "a clock set back never ages a peak");
     }
 
     #[test]

@@ -224,6 +224,11 @@ pub fn share_card_enabled() -> bool {
 /// the peer least recently in contact (a hold success, a card over a live
 /// connection, or failing both its card's own date) makes room for a newcomer.
 pub const MAX_PEERS: usize = 512;
+/// Rooms remembered per peer. A connection names its own room, so one peer
+/// could otherwise grow its entry (and `peers.json`) without bound by
+/// reconnecting under ever new room ids; past the cap a new room is not
+/// recorded, and holds for the peer stay bound to the rooms already known.
+pub const MAX_ROOMS_PER_PEER: usize = 32;
 
 /// One peer in the address book.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -237,7 +242,8 @@ pub struct PeerEntry {
     /// `issued_at` of the card held; an older card never replaces a newer one.
     #[serde(default)]
     pub card_issued_at: u64,
-    /// Rooms this peer was met in (where a hold for it may be bound).
+    /// Rooms this peer was met in (where a hold for it may be bound), at most
+    /// [`MAX_ROOMS_PER_PEER`].
     #[serde(default)]
     pub rooms: BTreeSet<String>,
     /// Unix seconds of the last successful link to this peer, and of the last
@@ -303,7 +309,8 @@ impl PeerBook {
             }
         }
         let entry = self.peers.entry(node).or_default();
-        let mut changed = entry.rooms.insert(room.to_string());
+        let room_known = entry.rooms.contains(room);
+        let mut changed = !room_known && entry.rooms.len() < MAX_ROOMS_PER_PEER && entry.rooms.insert(room.to_string());
         if card.issued_at >= entry.card_issued_at {
             let ck = ck_b64(&card.ck);
             let kx = hex::encode(card.kx_pk);
@@ -619,6 +626,24 @@ mod tests {
         assert_eq!(book.peers.len(), MAX_PEERS, "the book stays at its cap");
         assert!(book.peers.contains_key(&first), "the peer heard from most recently is kept");
         assert!(book.peers.contains_key(&sk.public().to_string()), "the newcomer is in");
+    }
+
+    #[test]
+    fn rooms_per_peer_are_bounded() {
+        let now = 1_791_700_000u64;
+        let mut book = PeerBook::default();
+        let sk = iroh::SecretKey::generate();
+        let card = verify_card(&make_card(&sk, &[7u8; 32], now), now).unwrap();
+        for i in 0..MAX_ROOMS_PER_PEER {
+            assert!(book.record_card(&card, &format!("room-{i}")), "a new room is recorded");
+        }
+        let node = sk.public().to_string();
+        assert_eq!(book.peers[&node].rooms.len(), MAX_ROOMS_PER_PEER);
+        assert!(!book.record_card(&card, "room-overflow"), "past the cap a new room changes nothing");
+        assert!(!book.record_card(&card, "room-0"), "a room already known changes nothing either");
+        let rooms = &book.peers[&node].rooms;
+        assert_eq!(rooms.len(), MAX_ROOMS_PER_PEER, "the set stays at its cap");
+        assert!(rooms.contains("room-0") && !rooms.contains("room-overflow"));
     }
 
     #[test]

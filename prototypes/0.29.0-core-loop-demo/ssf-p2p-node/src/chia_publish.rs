@@ -920,14 +920,6 @@ pub const ERA_GUARD_BLOCKS: u32 = 8;
 /// [`publish_node_presence`] spends no OTHER coin beside a pending one either:
 /// while any spend of ours is still settling, the retry waits.
 pub const PRESENCE_CONFIRM_TIMEOUT_SECS: u64 = 30 * 60;
-/// How old the watcher's cached chain peak may be before the publisher asks the
-/// chain itself ahead of an era-sensitive write. The watcher reads the peak
-/// once per tick, but a long or stalled scan can leave it blocks — or an era —
-/// behind, and a record signed for an ended era is refused by every reader. A
-/// peak older than this is as good as none. Kept well inside the
-/// [`ERA_GUARD_BLOCKS`] window (about 150 s of blocks), so a stale peak cannot
-/// walk a write past the end-of-era guard.
-pub const PEAK_MAX_AGE_SECS: u64 = 90;
 
 /// What the node last wrote for its own presence.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -977,12 +969,6 @@ pub fn findable_enabled() -> bool {
 /// Inside the era's last [`ERA_GUARD_BLOCKS`]: wait for the new era.
 pub fn era_guard(peak: u32) -> bool {
     peak % ERA_BLOCKS >= ERA_BLOCKS - ERA_GUARD_BLOCKS
-}
-
-/// Is a cached peak usable as the era clock: known, and read within
-/// [`PEAK_MAX_AGE_SECS`] of `now`?
-pub fn peak_is_fresh(peak: u32, seen_at: u64, now: u64) -> bool {
-    peak != 0 && now.saturating_sub(seen_at) <= PEAK_MAX_AGE_SECS
 }
 
 /// Was `mark` written as the identity we are now: under this `hint` (contact
@@ -1168,15 +1154,14 @@ pub async fn heartbeat_loop(
             // fresh (it reads every tick, but a long or stalled scan can leave
             // it blocks — or an era — behind), else one gateway call of our
             // own, shared back so the inbound marks and the next tick have it.
-            // No peak, no write this tick.
+            // Height and read time travel as one snapshot (`ChainPeak`), so a
+            // stale height is never judged by a newer time. No peak, no write.
             let now_unix = crate::chia_resolve::unix_now();
-            let mut peak = hub.chia_peak.load(std::sync::atomic::Ordering::Relaxed);
-            let peak_at = hub.chia_peak_at.load(std::sync::atomic::Ordering::Relaxed);
-            if !peak_is_fresh(peak, peak_at, now_unix) {
+            let mut peak = hub.chia_peak.lock().unwrap().fresh(now_unix).unwrap_or(0);
+            if peak == 0 {
                 peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
                 if peak > 0 {
-                    hub.chia_peak.store(peak, std::sync::atomic::Ordering::Relaxed);
-                    hub.chia_peak_at.store(now_unix, std::sync::atomic::Ordering::Relaxed);
+                    *hub.chia_peak.lock().unwrap() = crate::chia_resolve::ChainPeak::new(peak, now_unix);
                 }
             }
             if peak > 0 && era_guard(peak) {
@@ -1412,16 +1397,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_peak_is_the_era_clock_only_while_fresh() {
-        let now = 1_700_000_000u64;
-        assert!(!peak_is_fresh(0, now, now), "no peak read yet");
-        assert!(peak_is_fresh(100, now, now), "just read");
-        assert!(peak_is_fresh(100, now - PEAK_MAX_AGE_SECS, now), "at the bound: still the clock");
-        assert!(!peak_is_fresh(100, now - PEAK_MAX_AGE_SECS - 1, now), "older: ask the chain");
-        assert!(peak_is_fresh(100, now + 5, now), "a clock set back never ages a peak");
-        // A peak this stale still leaves the end-of-era guard blocks to spare.
+    fn a_stale_peak_stays_inside_the_era_guard() {
+        // The publisher trusts a cached peak this old at most; that many seconds
+        // of blocks still leave end-of-era guard blocks to spare.
         let secs_per_block = ERA_SECS / u64::from(ERA_BLOCKS);
-        assert!(PEAK_MAX_AGE_SECS < u64::from(ERA_GUARD_BLOCKS) * secs_per_block, "a stale peak stays inside the guard");
+        assert!(
+            crate::chia_resolve::PEAK_MAX_AGE_SECS < u64::from(ERA_GUARD_BLOCKS) * secs_per_block,
+            "a stale peak stays inside the guard"
+        );
     }
 
     #[test]

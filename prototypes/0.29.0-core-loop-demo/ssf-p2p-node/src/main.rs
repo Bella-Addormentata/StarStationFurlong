@@ -413,17 +413,23 @@ pub struct HubState {
     /// Written by `dial_peer_with_retry`, read and pruned by `dialed_lately`.
     #[cfg(feature = "chia-read")]
     pub recent_dials: Mutex<HashMap<PublicKey, std::time::Instant>>,
-    /// #231 P6a: the chain peak the watcher saw last (0 = unknown yet): the
-    /// era clock for the inbound marks and the presence publisher.
+    /// #231 P6a: serializes contact-card sends with room-posture changes. The
+    /// maintenance loop holds it from reading a room's posture through the
+    /// sends of that batch (each bounded by `CARD_SEND_TIMEOUT`); the local
+    /// browser's cap lane takes it before a cap is accepted. A cap turning a
+    /// room public therefore lands between batches, never inside one, and no
+    /// card authorized by a posture since replaced can leave.
     #[cfg(feature = "chia-read")]
-    pub chia_peak: std::sync::atomic::AtomicU32,
-    /// #231 P6a: when (unix seconds) `chia_peak` was last read from the chain
-    /// (0 = never). The publisher trusts the cached peak only while it is
-    /// younger than its freshness bound and otherwise asks the chain itself
-    /// before an era-sensitive write: a stalled watcher scan must not let a
-    /// record be signed for an era that has already ended.
+    pub card_gate: tokio::sync::Mutex<()>,
+    /// #231 P6a: the chain peak the watcher (or the publisher) read last, with
+    /// the time of the read, as one snapshot: the era clock for the inbound
+    /// marks and the presence publisher. Both trust it only while it is younger
+    /// than `chia_resolve::PEAK_MAX_AGE_SECS`; the publisher otherwise asks the
+    /// chain itself before an era-sensitive write, and a mark falls back to
+    /// elapsed time, so a stalled watcher never dates anything into an era
+    /// that has ended.
     #[cfg(feature = "chia-read")]
-    pub chia_peak_at: std::sync::atomic::AtomicU64,
+    pub chia_peak: Mutex<chia_resolve::ChainPeak>,
     /// #231 P6a: the signed `issued_at` of the newest presence record of OUR
     /// OWN the watcher read back from the chain (0 = none yet). The publisher
     /// marks its write confirmed when this is the write's own issued_at (its
@@ -1458,9 +1464,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-read")]
         recent_dials: Mutex::new(HashMap::new()),
         #[cfg(feature = "chia-read")]
-        chia_peak: std::sync::atomic::AtomicU32::new(0),
+        card_gate: tokio::sync::Mutex::new(()),
         #[cfg(feature = "chia-read")]
-        chia_peak_at: std::sync::atomic::AtomicU64::new(0),
+        chia_peak: Mutex::new(chia_resolve::ChainPeak::default()),
         #[cfg(feature = "chia-read")]
         presence_confirmed_at: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "chia-read")]
@@ -1819,6 +1825,10 @@ async fn handle_wt_connection_inner(
                                     // doc — written while the room map is still locked, so two
                                     // caps on two streams land on disk in acceptance order and
                                     // a restart never restores the stale one.
+                                    // Under the card gate: a card batch that read this
+                                    // room's posture finishes its sends before the new
+                                    // cap lands (see `HubState::card_gate`).
+                                    let _gate = hub_clone.card_gate.lock().await;
                                     chia_rooms::ingest_room_cap(
                                         &hub_clone.chia_rooms,
                                         &envelope.room,
@@ -2151,8 +2161,8 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
 /// still running, or one that ended inside the grace: the NAT mapping it made
 /// outlives the task, and the peer's own hole-punch Initials come through it)
 /// proves nothing and sets nothing. The mark carries the chain peak the watcher
-/// knows (0 when it has none yet), so the publisher can tell "this era" from
-/// "last era".
+/// knows (0 when it has none, or none fresh enough to trust), so the publisher
+/// can tell "this era" from "last era".
 #[cfg(feature = "chia-read")]
 fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::endpoint::IncomingAddr, bool)) {
     let (addr, validated) = path;
@@ -2167,8 +2177,11 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
     if !public || dialed_lately(hub, &remote_id, std::time::Instant::now()) {
         return;
     }
-    let height = hub.chia_peak.load(std::sync::atomic::Ordering::Relaxed);
     let now = chia_resolve::unix_now();
+    // A peak the watcher read too long ago (it or the gateway down, maybe across
+    // an era boundary) would date this mark into an era that has ended; an
+    // unknown height makes the ledger judge by elapsed time instead.
+    let height = hub.chia_peak.lock().unwrap().fresh(now).unwrap_or(0);
     let first_this_era = hub.inbound_verified.lock().unwrap().note(sa.is_ipv6(), height, now);
     if first_this_era {
         println!(
@@ -2199,6 +2212,23 @@ fn dialed_lately(hub: &HubState, peer: &PublicKey, now: std::time::Instant) -> b
     let mut recent = hub.recent_dials.lock().unwrap();
     recent.retain(|_, ended| now.duration_since(*ended) < DIAL_PINHOLE_GRACE);
     recent.contains_key(peer)
+}
+
+/// A contact-card send that has not finished in this long counts as not sent
+/// (retried next tick) and lets go of the card gate, so a stalled peer cannot
+/// hold up the browser's room caps.
+#[cfg(feature = "chia-read")]
+const CARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Release a dial's single-flight claim once its task ended, however it ended,
+/// remembering the dial for the pinhole grace FIRST: every path that claims a
+/// dial (the browser's, the mesh's, the watcher's holds) releases it here, so
+/// no inbound connection our own Initials enabled can pass as unsolicited, not
+/// even in the instant between the two steps.
+pub(crate) fn release_dial(hub: &HubState, peer: PublicKey) {
+    #[cfg(feature = "chia-read")]
+    hub.recent_dials.lock().unwrap().insert(peer, std::time::Instant::now());
+    hub.dialing.lock().unwrap().remove(&peer);
 }
 
 // Issue #60 symptom 2: bounded, backing-off dial that runs OFF the browser's
@@ -2234,11 +2264,7 @@ async fn dial_peer_with_retry(
         send,
     )
     .await;
-    hub.dialing.lock().unwrap().remove(&target_pub_key);
-    // #231 P6a: the pinhole our Initials opened outlives the task — an inbound
-    // connection from this peer inside the grace is not unsolicited.
-    #[cfg(feature = "chia-read")]
-    hub.recent_dials.lock().unwrap().insert(target_pub_key, std::time::Instant::now());
+    release_dial(&hub, target_pub_key);
 }
 
 /// Report a dial's status to the browser: to the specific `send` stream when the
@@ -3708,6 +3734,11 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
             // holds, is marked as having it.
             #[cfg(feature = "chia-read")]
             if !w.cards.is_empty() {
+                // Posture and sends under one gate: a cap turning this room
+                // public waits for the sends in flight (each bounded by
+                // `CARD_SEND_TIMEOUT`) and the next check sees it, so no card
+                // authorized by a posture since replaced can leave.
+                let _gate = hub.card_gate.lock().await;
                 let card = chia_contact::make_card(&hub.secret_key, &hub.contact_key, chia_resolve::unix_now());
                 if let Ok(payload) = serde_json::to_vec(&card) {
                     let mut delivered: Vec<(PublicKey, usize)> = Vec::new();
@@ -3721,7 +3752,13 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                             println!("📇 room {} is no longer private — the remaining contact cards are not sent", w.room);
                             break;
                         }
-                        if send_control(&hub, conn, &w.room, "contact", 0, payload.clone()).await {
+                        let sent = tokio::time::timeout(
+                            CARD_SEND_TIMEOUT,
+                            send_control(&hub, conn, &w.room, "contact", 0, payload.clone()),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        if sent {
                             delivered.push((*peer, conn.stable_id()));
                         } else {
                             eprintln!("📇 contact card to {peer} in room {} did not go out — retrying next tick", w.room);

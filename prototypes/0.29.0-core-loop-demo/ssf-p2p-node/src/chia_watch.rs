@@ -25,9 +25,9 @@
 //! hints (this era and the last) read on the beat, and its freshest record is
 //! planned into holds in the private rooms it was met in. Our own record is
 //! read too, so seeing it confirm restarts the dance exactly as a room record
-//! did. The watcher also publishes the chain peak it saw (`hub.chia_peak`, with
-//! the time of the read in `hub.chia_peak_at`), the era clock for the inbound
-//! marks and the presence publisher.
+//! did. The watcher also publishes the chain peak it saw (`hub.chia_peak`:
+//! height and read time as one snapshot), the era clock for the inbound marks
+//! and the presence publisher.
 //!
 //! Pure pieces ([`BeatSchedule`], [`plan_holds`]) are unit-tested; the loop
 //! itself is thin glue over them, the reader and `main::hold_dial`.
@@ -327,8 +327,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         let peak = match chia_resolve::peak_height(&client).await {
             Some(h) => {
                 peak_failure_logged = false;
-                hub.chia_peak.store(h, std::sync::atomic::Ordering::Relaxed);
-                hub.chia_peak_at.store(chia_resolve::unix_now(), std::sync::atomic::Ordering::Relaxed);
+                *hub.chia_peak.lock().unwrap() = chia_resolve::ChainPeak::new(h, chia_resolve::unix_now());
                 h
             }
             None => {
@@ -577,7 +576,8 @@ fn spawn_hold(
             None,
         )
         .await;
-        hub_h.dialing.lock().unwrap().remove(&target_pub);
+        // Released the way every dial is: the claim goes, the pinhole grace stays.
+        crate::release_dial(&hub_h, target_pub);
         if let Some(n) = shared_h.active.lock().unwrap().get_mut(&room_h) {
             *n = n.saturating_sub(1);
         }
