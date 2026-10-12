@@ -36,7 +36,7 @@
 import {
   IA_BALL_MAX_SPEED, IA_BALL_R, IA_BALL_SEQ_MASK, IA_BITE_DONE_S, IA_BITE_HOLD_S,
   IA_BITE_LAND_S, IA_LAY_START_MS, IA_LIVE, IA_MAX_BALLS, IA_MIN_PLAYERS,
-  IA_SEATS, IA_SEAT_COLORS, IA_SEAT_NAMES, IA_SPIN_EVERY_MS, IA_SPIN_MS,
+  IA_BALLS_PER_PLAYER, IA_SEATS, IA_SEAT_COLORS, IA_SEAT_NAMES, IA_SPIN_EVERY_MS, IA_SPIN_MS,
   IA_TABLE_R, ballFromTick, ballToTick, ballsUnderMouth, biteJawOpen,
   biteLungeExt, birdOf, claimSeat, claimedSeats, clampPose, eggSpawn,
   headFromTick, headToTick, initialAlligatorsState, isBallTick, isPractice,
@@ -61,6 +61,9 @@ import type { Rot } from './furniture';
 import type { AlligatorsVisualHandle, DeviceUI } from './devices';
 import { activeRoomId } from './roomInventory';
 import { canEditRoom } from './editMode';
+import { gearButton, gearSection } from './gearCardParts';
+import { closeGearCard, pickSettingsGearAt, toggleGearCard } from './settingsGear';
+import type { GearCardSpec } from './settingsGear';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -803,6 +806,45 @@ export function alligatorsStatusLine(s: AlligatorsState | null, roundMs: number)
  * into the head (#185's control scheme). ALL shared state lives in the doc —
  * the panel re-renders from observers, never from local truth.
  */
+/** ⚙ The table card (settingsGear.ts): the rules and the seats for anyone;
+ *  RESET TABLE for whoever may edit the room. */
+export function alligatorsGearCard(itemId: string): GearCardSpec {
+  return {
+    itemId,
+    title: 'INSATIABLE ALLIGATORS',
+    noun: 'TABLE',
+    isHouse: () => canEditRoom().ok,
+    body(house) {
+      const s = readAlligators(itemId);
+      const eaten = s ? scores(s) : [];
+      const seats = s ? claimedSeats(s) : [];
+      const rows = [
+        gearSection([
+          `2 TO ${IA_SEATS} PLAYERS · ${IA_BALLS_PER_PLAYER} BALLS EACH · THE MOST BALLS EATEN WINS`,
+          `THE TABLE SPINS EVERY ${IA_SPIN_EVERY_MS / 1000} S AND DRAGS THE BALLS ROUND`,
+          'ONE PLAYER CAN PRACTICE ALONE AND EAT THEM ALL',
+        ]),
+        gearSection(seats.length === 0
+          ? ['NO ONE IS SEATED']
+          : seats.map((seat) => `<span style="color:${seatColor(seat)};">${seatName(seat)}</span> · ${
+            escapeHtml(readPlayerDisplayName(s!.players[seat]!)).toUpperCase()} · ${eaten[seat] ?? 0} EATEN`)),
+        gearSection([
+          'CLICK THE TABLE TO TAKE YOUR HEAD · MOVE THE MOUSE TO SWING · CLICK TO BITE · PUSH FORWARD AS YOU CLICK TO LUNGE · ESC LETS GO',
+        ]),
+      ];
+      if (house) {
+        rows.push(`<div style="display:flex;justify-content:flex-end;">${gearButton('reset', 'RESET TABLE', s !== null)}</div>`);
+      }
+      return rows.join('');
+    },
+    onAct(act, house) {
+      if (act !== 'reset' || !house || readAlligators(itemId) === null) return;
+      writeGame(itemId, initialAlligatorsState());
+    },
+    subscribe: subscribeGames,
+  };
+}
+
 export function createAlligatorsUI(deps: AlligatorsUIDeps): DeviceUI {
   const myId = getPlayerId();
   const seat = deps.seat;
@@ -973,6 +1015,10 @@ export function createAlligatorsUI(deps: AlligatorsUIDeps): DeviceUI {
 
   const onCaptureClick = (e: MouseEvent): void => {
     e.stopPropagation(); // never a click-away release
+    if (!locked() && pickSettingsGearAt(e) === deps.itemId) {
+      toggleGearCard(alligatorsGearCard(deps.itemId));
+      return;
+    }
     if (locked() || !canDrive() || !captureLayer) return;
     const p = captureLayer.requestPointerLock() as unknown as Promise<void> | undefined;
     if (p && typeof p.catch === 'function') p.catch(() => { /* throttled — retry by clicking */ });
@@ -1215,6 +1261,7 @@ export function createAlligatorsUI(deps: AlligatorsUIDeps): DeviceUI {
     },
 
     unmount(): void {
+      closeGearCard(deps.itemId);
       document.removeEventListener('pointerlockchange', onLockChange);
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mousedown', onMouseDown);

@@ -24,7 +24,7 @@
 import * as THREE from 'three';
 import { CHIP_STYLE } from './chipDisplay';
 import {
-  CHIP_RADIUS, CRAPS_DICE_SPOT, crapsPuckSpot, CRAPS_LAYOUT, ROULETTE_LAYOUT, ROULETTE_WHEEL,
+  captionRect, CHIP_RADIUS, CRAPS_DICE_SPOT, crapsPuckSpot, CRAPS_LAYOUT, ROULETTE_LAYOUT, ROULETTE_WHEEL,
 } from './games/casinoLayout';
 import type {
   CrapsSpot, FeltLayout, FeltPoint, FeltRect, FeltRegion, RouletteSpot,
@@ -84,6 +84,8 @@ export interface CasinoTableVisualHandle {
   setHighlight(ids: ReadonlySet<string>): void;
   /** Glow the ⚙️ button (pointer over it). */
   setSettingsHot(hot: boolean): void;
+  /** ⚖️ The plaque beside the ⚙️: a green-circled F (FAIR) or a red-circled F (FRIENDLY). */
+  setFairBadge(fair: boolean): void;
   // 🎲 craps
   /** Move both pucks: OFF in the don't come bar, ON on the point. */
   setPuck(point: number | null): void;
@@ -197,7 +199,7 @@ function paintRegion<B>(
   rg: FeltRegion<B>, lit: boolean, focused = false,
 ): void {
   const k = FELT_PX_PER_M;
-  for (const r of rg.rects) {
+  for (const r of rg.frame ? [rg.frame] : rg.rects) {
     const q = rectToPx(f, W, H, r);
     if (rg.fill) {
       c.fillStyle = rg.fill;
@@ -207,9 +209,19 @@ function paintRegion<B>(
       c.fillStyle = 'rgba(255, 214, 102, 0.32)';
       c.fillRect(q.x, q.y, q.w, q.h);
     }
-    c.lineWidth = lit ? 6 : 3;
-    c.strokeStyle = lit ? '#FFD666' : LINE;
-    c.strokeRect(q.x + 1.5, q.y + 1.5, q.w - 3, q.h - 3);
+    if (rg.faint && !lit) {
+      // An odds band: a dashed hairline inside the box it belongs to.
+      c.save();
+      c.setLineDash([6, 6]);
+      c.lineWidth = 1.5;
+      c.strokeStyle = 'rgba(244, 236, 214, 0.45)';
+      c.strokeRect(q.x + 5, q.y + 5, q.w - 10, q.h - 10);
+      c.restore();
+    } else {
+      c.lineWidth = lit ? 6 : 3;
+      c.strokeStyle = lit ? '#FFD666' : LINE;
+      c.strokeRect(q.x + 1.5, q.y + 1.5, q.w - 3, q.h - 3);
+    }
     if (focused) {
       // Keyboard play's selected box: a bright dashed ring inside the line.
       c.save();
@@ -220,9 +232,9 @@ function paintRegion<B>(
       c.restore();
     }
   }
-  // Caption at the centre of the region's first (largest) rect.
-  const main = rg.rects.reduce((a, b) =>
-    (b.x1 - b.x0) * (b.z1 - b.z0) > (a.x1 - a.x0) * (a.z1 - a.z0) ? b : a);
+  // Caption at the centre of the region's caption rect (its largest, unless
+  // the layout names one).
+  const main = captionRect(rg);
   const [cx, cy] = feltToPx(f, W, H, (main.x0 + main.x1) / 2, (main.z0 + main.z1) / 2);
   c.save();
   c.translate(cx, cy);
@@ -249,7 +261,7 @@ function paintRegion<B>(
   const lift = rg.sub ? subSize * 0.55 : 0;
   if (rg.label) {
     c.font = `900 ${size}px "Trebuchet MS", "Segoe UI", sans-serif`;
-    c.fillStyle = rg.ink ?? INK;
+    c.fillStyle = rg.ink ?? (rg.faint ? 'rgba(244, 236, 214, 0.6)' : INK);
     c.fillText(rg.label, 0, -lift);
   }
   if (rg.sub) {
@@ -855,6 +867,81 @@ function buildSettingsButton(ctx: PiecesCtx, b: { x: number; z: number; r: numbe
   };
 }
 
+// ── ⚖️ Fair / Friendly plaque ────────────────────────────────────────────────
+
+const PLAQUE_W = 0.12;
+const PLAQUE_H = 0.032;
+
+function plaqueCanvas(fair: boolean): HTMLCanvasElement {
+  const cv = document.createElement('canvas');
+  cv.width = 384;
+  cv.height = 102;
+  const c = cv.getContext('2d')!;
+  c.fillStyle = '#14181F';
+  c.fillRect(0, 0, cv.width, cv.height);
+  const ring = fair ? '#3FBF7F' : '#D9534F';
+  c.lineWidth = 6;
+  c.strokeStyle = ring;
+  c.strokeRect(3, 3, cv.width - 6, cv.height - 6);
+  // The "F" medallion: a green circle on a Fair table, a red one on a
+  // Friendly one. Both words start with F, so the word beside it says which
+  // (and doesn't lean on red vs green alone).
+  const r = 38;
+  const cx = 14 + r;
+  const cy = cv.height / 2;
+  c.beginPath();
+  c.arc(cx, cy, r, 0, Math.PI * 2);
+  c.fillStyle = ring;
+  c.fill();
+  c.fillStyle = '#FFFFFF';
+  c.font = '900 54px "Trebuchet MS", sans-serif';
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  c.fillText('F', cx, cy + 3);
+  c.fillStyle = fair ? '#7CF5B0' : '#F28B87';
+  c.font = `900 ${fair ? 52 : 42}px "Trebuchet MS", sans-serif`;
+  c.fillText(fair ? 'FAIR' : 'FRIENDLY', (cx + r + cv.width) / 2, cy + 3);
+  return cv;
+}
+
+/** Where the plaque lies beside a ⚙️ at `b`: on its reader's right (craps,
+ *  where the dice rest on its left), or just in front of it toward the −z rail
+ *  (roulette, whose gear sits between the wheel and the layout). Clear felt
+ *  either way — casinoTable3d.test.ts checks it against every betting box. */
+export function fairPlaqueCentre(b: { x: number; z: number; r: number }, at: 'right' | 'front'): FeltPoint {
+  return at === 'right'
+    ? { x: b.x - (b.r + 0.012 + PLAQUE_W / 2), z: b.z }
+    : { x: b.x, z: b.z - (b.r + 0.012 + PLAQUE_H / 2) };
+}
+export const FAIR_PLAQUE_SIZE = { w: PLAQUE_W, h: PLAQUE_H };
+
+/** A small brass-edged plaque lying on the felt by the ⚙️, reading the same
+ *  way as the gear (for the players on the −z rail). */
+function buildFairPlaque(ctx: PiecesCtx, b: { x: number; z: number; r: number }, at: 'right' | 'front'): { set(fair: boolean): void } {
+  const fairMat = solidCanvas(plaqueCanvas(true));
+  const friendlyMat = solidCanvas(plaqueCanvas(false));
+  const geo = new THREE.PlaneGeometry(PLAQUE_W, PLAQUE_H);
+  geo.rotateX(-Math.PI / 2);
+  // Rotated like the gear, so its reader's right is the table's −x.
+  geo.rotateY(Math.PI);
+  const c = fairPlaqueCentre(b, at);
+  const mesh = ctx.place(geo, fairMat, c.x, FELT_Y + 0.002, c.z);
+  let shown = true;
+  // World's teardown frees the material on the mesh; free the spare too.
+  mesh.userData.disposePlaqueSpare = () => {
+    const spare = mesh.material === fairMat ? friendlyMat : fairMat;
+    spare.map?.dispose();
+    spare.dispose();
+  };
+  return {
+    set(fair) {
+      if (fair === shown) return;
+      shown = fair;
+      mesh.material = fair ? fairMat : friendlyMat;
+    },
+  };
+}
+
 // ── Roulette wheel ───────────────────────────────────────────────────────────
 
 const POCKETS = WHEEL_ORDER.length;
@@ -1023,9 +1110,10 @@ interface Common {
   pools: ChipPools;
   railHit: THREE.Mesh;
   settings: { mesh: THREE.Mesh; setHot(hot: boolean): void };
+  plaque: { set(fair: boolean): void };
 }
 
-function buildCommon<B>(ctx: PiecesCtx, layout: FeltLayout<B>, halfX: number, halfZ: number, decor: Parameters<typeof makeFeltCanvas>[1]): Common {
+function buildCommon<B>(ctx: PiecesCtx, layout: FeltLayout<B>, halfX: number, halfZ: number, decor: Parameters<typeof makeFeltCanvas>[1], plaqueAt: 'right' | 'front'): Common {
   const felt = makeFeltCanvas(layout, decor);
   const f = layout.felt;
   const geo = new THREE.PlaneGeometry(f.x1 - f.x0, f.z1 - f.z0);
@@ -1055,7 +1143,8 @@ function buildCommon<B>(ctx: PiecesCtx, layout: FeltLayout<B>, halfX: number, ha
   railGroup.add(railHit);
   ctx.attach(railGroup);
   const settings = buildSettingsButton(ctx, layout.settings);
-  return { feltMesh, felt, pools, railHit, settings };
+  const plaque = buildFairPlaque(ctx, layout.settings, plaqueAt);
+  return { feltMesh, felt, pools, railHit, settings, plaque };
 }
 
 /** Pitch between rail stacks (a chip and a sliver of rail). */
@@ -1190,6 +1279,10 @@ class TableHandle implements CasinoTableVisualHandle {
     this.c.settings.setHot(hot);
   }
 
+  setFairBadge(fair: boolean): void {
+    this.c.plaque.set(fair);
+  }
+
   setPuck(point: number | null): void {
     for (const p of this.pucks) p.set(point);
   }
@@ -1288,7 +1381,7 @@ class TableHandle implements CasinoTableVisualHandle {
 /** The craps table's moving parts. Returns the handle (also stowed on the
  *  felt mesh's userData.casinoTable for World to file). */
 export function buildCrapsPieces(ctx: PiecesCtx, halfX: number, halfZ: number): CasinoTableVisualHandle {
-  const c = buildCommon(ctx, CRAPS_LAYOUT as FeltLayout<CrapsSpot>, halfX, halfZ, crapsDecor);
+  const c = buildCommon(ctx, CRAPS_LAYOUT as FeltLayout<CrapsSpot>, halfX, halfZ, crapsDecor, 'right');
   const dice = new DicePair(CRAPS_LAYOUT.felt);
   ctx.attach(dice.group);
   const pucks = [new Puck(ctx, -1), new Puck(ctx, 1)];
@@ -1301,7 +1394,7 @@ export function buildCrapsPieces(ctx: PiecesCtx, halfX: number, halfZ: number): 
 
 /** The roulette table's moving parts (see buildCrapsPieces). */
 export function buildRoulettePieces(ctx: PiecesCtx, halfX: number, halfZ: number): CasinoTableVisualHandle {
-  const c = buildCommon(ctx, ROULETTE_LAYOUT as FeltLayout<RouletteSpot>, halfX, halfZ, rouletteDecor);
+  const c = buildCommon(ctx, ROULETTE_LAYOUT as FeltLayout<RouletteSpot>, halfX, halfZ, rouletteDecor, 'front');
   const wheel = new RouletteWheel(ctx);
   const handle = new TableHandle('roulette', halfX, halfZ, c, null, [], wheel);
   c.feltMesh.userData.casinoTable = handle;

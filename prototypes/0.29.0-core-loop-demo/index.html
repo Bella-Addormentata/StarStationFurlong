@@ -235,6 +235,12 @@
               <span class="phone-app-tile-icon">⚙️</span>
               <span class="phone-app-tile-label">SETTINGS</span>
             </button>
+            <!-- 📺 The TV remote (#186): the phone IS the remote for the set
+                 whose remote you hold — sources, play/schedule, hand over. -->
+            <button type="button" class="phone-app-tile" data-phone-app="tv" aria-label="Open the TV remote">
+              <span class="phone-app-tile-icon">📺</span>
+              <span class="phone-app-tile-label">TV</span>
+            </button>
           </div>
 
           <!-- 🛰️ Room roster (issue #20 S2) — rendered from the Yjs players map.
@@ -397,6 +403,10 @@
 
         <!-- ⚙️→📊 Stats view (receives #debug-hud) -->
         <div id="phone-app-settings-stats" class="phone-app-view"></div>
+
+        <!-- 📺 TV remote (#186) — rendered by tvUI.ts renderTvPhoneApp on open
+             and on every tv-map change while the view is active. -->
+        <div id="phone-app-tv" class="phone-app-view"></div>
       </div>
     </div>
     

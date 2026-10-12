@@ -194,6 +194,8 @@ import {
 // 🪙 Whether the room's coin pushers are operated, and ready for a drop,
 // judged without comparing clocks across devices (pusherCroupier.ts CLOCKS).
 import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
+import { gearSection } from './gearCardParts';
+import type { GearCardSpec } from './settingsGear';
 import {
   DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_REQUEST_TTL_MS,
   commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
@@ -207,6 +209,7 @@ import {
   PUSHER_REQUEST_TTL_MS,
 } from './games/coinPusher';
 import type { CoinPusherState, PusherHole, PusherRefusalReason } from './games/coinPusher';
+import type { ArcadeScreenPainter } from './arcadeScreen';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier } from './croupier';
@@ -286,7 +289,7 @@ function stationFliesFree(stationId: string, now: number): boolean {
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'faucetDish';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv' | 'arcade' | 'faucetDish';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -463,6 +466,34 @@ export interface AirHockeyVisualHandle {
   update(dt: number): void;
 }
 
+// ── 📺 Smart-TV screen handle (#186 — shared with the furniture builder) ─────
+
+/**
+ * Handle onto a smart TV's in-world CanvasTexture screen. The builder
+ * (furniture.ts) stows it in the screen mesh's userData.tvScreen; World
+ * collects it and, at ~2 Hz, hands it the view tvDoc derives from the room
+ * record (tvScreenView) — the handle redraws only when the view changed.
+ * The picture itself is not here (plan §3.4): the screen shows the home
+ * screen, the countdown and the now-playing card; the theatre plays video.
+ */
+export interface TvScreenHandle {
+  draw(view: import('./tvDoc').TvScreenView): void;
+}
+
+// ── 🕹 Arcade cabinet screen handle (#193 — shared with the furniture builder) ─
+
+/**
+ * Handle onto an arcade cabinet's in-world CanvasTexture screen: the attract
+ * card (INSERT COIN, the game's name, the tally) and "P1 · <name>" while
+ * someone is at the controls. Stowed in the screen mesh's userData.arcadeScreen
+ * by the builder; World collects it and hands it arcadeDoc.arcadeScreenView
+ * at ~2 Hz. The game's own picture plays in P1's stage panel (plan §9); the
+ * spectator lane brings it to this texture later.
+ */
+export interface ArcadeScreenHandle {
+  draw(view: import('./arcadeDoc').ArcadeScreenView): void;
+}
+
 // ── 🐊 Insatiable-alligators table handle (#185 — shared with the builder) ──
 
 /**
@@ -583,6 +614,21 @@ export interface CoinPusherVisualHandle {
    *  traversal of the cabinet can't reach them all. World calls this once,
    *  as it removes the cabinet. */
   dispose(): void;
+}
+
+/**
+ * 🕹️ The arcade cabinet's screen. The builder (furniture.ts) makes the
+ * 512×480 canvas, its CanvasTexture and the painter, paints the attract card,
+ * and stows this in the screen mesh's userData.arcadeCabinet. The focused
+ * cabinet UI (arcadeNesCabinet.ts) paints the menu and the running game through
+ * `painter`, then calls present() to push the canvas to the texture.
+ */
+export interface ArcadeCabinetVisualHandle {
+  readonly painter: ArcadeScreenPainter;
+  /** Mark the screen texture for upload after a paint. */
+  present(): void;
+  /** Back to the idle attract card (the player stepped away). */
+  showAttract(): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
@@ -5618,7 +5664,7 @@ export function createSlotMachineUI(
     if (fingerprint === renderedPaytable && house === renderedPaytableForHouse) return;
     renderedPaytable = fingerprint;
     renderedPaytableForHouse = house;
-    rows.replaceChildren(...paytable.slice(0, 10).map((entry, index) => {
+    rows.replaceChildren(...paytable.map((entry, index) => {
       const row = document.createElement('div');
       row.style.cssText =
         'display:flex;align-items:center;justify-content:space-between;gap:4px;min-height:20px;';
@@ -5719,6 +5765,9 @@ export function createSlotMachineUI(
       `THEORETICAL RTP ${paytableRtp.toFixed(2)}%`;
     panel.querySelector<HTMLElement>('#sl-service-status')!.textContent = flash;
     const house = deps.isHouse();
+    panel.querySelector<HTMLElement>('#sl-role')!.textContent = house
+      ? 'YOU RUN THIS MACHINE'
+      : 'THE OWNER SETS THIS MACHINE · ANYONE CAN LOOK';
     renderPaytable(paytable, house);
     const owner = panel.querySelector<HTMLElement>('#sl-owner');
     if (owner) owner.style.display = house ? 'flex' : 'none';
@@ -5801,7 +5850,9 @@ export function createSlotMachineUI(
         pointer-events:auto; box-shadow:0 12px 64px rgba(0,0,0,0.9);
       `;
       panel.innerHTML = `
-        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🎰 SLOT MACHINE SERVICE</div>
+        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">⚙️ SLOT MACHINE</div>
+        <div id="sl-role" style="font-size:9px;color:${GT_DIM};letter-spacing:1px;"></div>
+        <div style="font-size:9px;color:#7CF5B0;">🔒 FAIR · YOUR SEED AND THE HOUSE SEED DECIDE EVERY SPIN</div>
         <div id="sl-service-status" style="min-height:14px;text-align:center;font-size:9px;font-weight:800;color:${GT_GOLD_BRIGHT};"></div>
         <div id="sl-rtp" style="font-size:9px;color:${GT_DIM};"></div>
         <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:9px;color:#E8ECF2;"></div>
@@ -5892,6 +5943,39 @@ const PUSHER_REFUSAL_TEXT: Record<PusherRefusalReason, string> = {
   'balance-full': 'YOUR RACK CAN\'T HOLD ANY MORE — CASH SOME CHIPS OUT FIRST',
   jammed: 'THE MACHINE JAMMED — NOTHING WAS TAKEN',
 };
+
+/** ⚙ The machine card (settingsGear.ts): the rules and what's inside for
+ *  anyone. Nothing on the pusher is adjustable yet; the owner empties it
+ *  from the machine's own panel. */
+export function coinPusherGearCard(itemId: string, isHouse: () => boolean): GearCardSpec {
+  return {
+    itemId,
+    title: 'COIN PUSHER',
+    noun: 'MACHINE',
+    isHouse,
+    body(house) {
+      const state = readCoinPusherState(itemId);
+      const operator = coinPusherOperatorState();
+      const rows = [
+        gearSection([
+          `EACH DROP COSTS ${PUSHER_ANTE} CHIP · PICK ONE OF ${HOLE_COUNT} HOLES AND TIME IT AGAINST THE PUSHER`,
+          'CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS',
+          'THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE',
+          `THE MACHINE HOLDS UP TO ${MACHINE_MAX_CHIPS} CHIPS`,
+        ]),
+        gearSection([
+          state ? `${chipsInMachine(state)} CHIPS INSIDE` : 'NOT SET UP YET',
+          operator === 'ready' ? 'MACHINE ONLINE' : operator === 'starting' ? 'MACHINE STARTING' : 'MACHINE OFFLINE — ITS OWNER RUNS IT',
+        ]),
+      ];
+      if (house) {
+        rows.push(gearSection(['TO EMPTY IT, STEP UP TO THE MACHINE AND OPEN THE DOOR FROM ITS PANEL']));
+      }
+      return rows.join('');
+    },
+    subscribe: subscribeCasino,
+  };
+}
 
 /**
  * The coin-pusher panel: a live pusher gauge (the same clock the cabinet

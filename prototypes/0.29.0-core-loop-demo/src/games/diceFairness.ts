@@ -9,9 +9,9 @@
  *                     combine(both). Instant, off-chain, diegetic (the shooter
  *                     really makes the roll). Fair UNLESS house + shooter collude.
  *   • multiparty    — every bettor contributes a committed seed. Collusion-
- *                     resistant (≥1 honest suffices), but liveness-fragile (a
- *                     non-revealer stalls; the last revealer can grief) — needs
- *                     timeouts/bonds when wired for real.
+ *                     resistant (≥1 honest suffices). ⚖️ The DEFAULT, and LIVE:
+ *                     the house + bettors' real seeds (fairTableSeeds.ts); a
+ *                     non-revealer is timed out and forfeits their bets.
  *   • block-beacon  — house commit + a Chia block hash (games/fairDice.ts). No
  *                     collusion vector, but ~1 block slow (see the plan §latency).
  *
@@ -27,9 +27,11 @@ import {
   commitToSeed,
   deriveDice,
   diceFromMaterial,
+  pocketFromMaterial,
   randomSeedHex,
   verifyRoll,
 } from './fairDice';
+import { HOUSE_PARTY } from './craps';
 import type { FairnessMode, FairnessTranscript } from './craps';
 
 export type { FairnessMode, FairnessTranscript };
@@ -65,11 +67,11 @@ export const FAIRNESS_MODES: Record<FairnessMode, FairnessModeInfo> = {
   },
   multiparty: {
     mode: 'multiparty',
-    label: 'Multiparty commit-reveal',
+    label: 'Fair · everyone adds a seed',
     instant: true,
     needsSecondParty: true,
     needsChain: false,
-    blurb: 'every bettor adds entropy — collusion-resistant, but liveness-fragile',
+    blurb: 'the house and every bettor commit a secret seed; the result mixes them all, so nobody can steer it alone',
   },
   'block-beacon': {
     mode: 'block-beacon',
@@ -154,8 +156,10 @@ export async function verifyTranscript(
   table: string,
   round: number,
   dice: [number, number],
+  room = '',
 ): Promise<boolean> {
   if (t.mode === 'rng') return false;
+  if (t.parties) return verifyParties(t, 'craps', table, round, { dice }, room);
   if (t.mode === 'block-beacon') {
     const seed = t.seeds?.[0];
     const commit = t.commits?.[0];
@@ -178,11 +182,118 @@ export async function verifyTranscript(
   return d1 === dice[0] && d2 === dice[1];
 }
 
+// ── ⚖️ LIVE multiparty: the Fair-by-default craps + roulette settle ─────────
+//
+// The house commits a seed when a betting window opens; each bettor's client
+// commits its own seed alongside its chips; "no more bets" freezes the commit
+// set; everyone reveals; the result mixes every revealed seed. A party that
+// committed but never revealed keeps an EMPTY seed in the transcript (their
+// bets are forfeited by the settle, so withholding costs them their stake) and
+// the result comes from the rest. The live wiring is fairTableSeeds.ts.
+
+export type TableGame = 'craps' | 'roulette';
+
+/** One party's contribution to a round: its commit, and its seed once
+ *  revealed (null = never revealed). */
+export interface RoundParty {
+  id: string;
+  commit: string;
+  seed: string | null;
+}
+
+/** Order-independent roulette counterpart of `combineSeeds`. */
+export function combinePocketSeeds(seeds: string[], table: string, round: number): Promise<number> {
+  const ordered = [...seeds].sort();
+  return pocketFromMaterial(`ssf-roulette-combine-v1|${ordered.join('|')}|${table}|${round}`);
+}
+
+/** Who a table-seed commitment belongs to, and where: the room, the table, the round,
+ *  the party ('house' or a player id) and — for a bettor — the house commit
+ *  it answers ('' for the house's own). Hashed into the commitment, so a seed
+ *  revealed in one round can never be replayed as fresh entropy in another,
+ *  by another party, or against another house commit. */
+export interface TableSeedContext {
+  /** The room's stable id (furniture ids are only room-local, so a table id
+   *  and round can recur in another room). '' offline. */
+  room?: string;
+  table: string;
+  round: number;
+  party: string;
+  house: string;
+}
+
+/** The exact message a table-seed commitment hashes. */
+export function tableCommitMessage(seed: string, ctx: TableSeedContext): string {
+  return `ssf-table-commit-v3|${ctx.room ?? ''}|${ctx.table}|${ctx.round}|${ctx.party}|${ctx.house}|${seed}`;
+}
+
+/** A table seed's commitment (async SubtleCrypto; fairTableSeeds has the
+ *  sync twin for the live exchange). */
+export async function commitTableSeed(seed: string, ctx: TableSeedContext): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(tableCommitMessage(seed, ctx)));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Mix the revealed seeds of `parties` into the round's outcome and its public
+ *  transcript. null when NOBODY revealed (no verifiable material at all — the
+ *  caller falls back to an unproven roll). */
+export async function settleParties(
+  game: TableGame,
+  parties: RoundParty[],
+  table: string,
+  round: number,
+): Promise<{ dice?: [number, number]; pocket?: number; transcript: FairnessTranscript } | null> {
+  const seeds = parties.flatMap((p) => (p.seed ? [p.seed] : []));
+  if (seeds.length === 0) return null;
+  const transcript: FairnessTranscript = {
+    mode: 'multiparty',
+    parties: parties.map((p) => p.id),
+    commits: parties.map((p) => p.commit),
+    seeds: parties.map((p) => p.seed ?? ''),
+  };
+  return game === 'craps'
+    ? { dice: await combineSeeds(seeds, table, round), transcript }
+    : { pocket: await combinePocketSeeds(seeds, table, round), transcript };
+}
+
+/** Check a live multiparty transcript: every revealed seed opens its commit,
+ *  and the outcome is the mix of exactly those seeds. Says nothing about
+ *  WHICH commits belonged in the round — the caller compares the parties
+ *  against the table's frozen commit set (fairTableSeeds.verifySettledRound). */
+export async function verifyParties(
+  t: FairnessTranscript,
+  game: TableGame,
+  table: string,
+  round: number,
+  outcome: { dice?: [number, number]; pocket?: number },
+  room = '',
+): Promise<boolean> {
+  const { parties, commits, seeds } = t;
+  if (t.mode !== 'multiparty' || !parties || !commits || !seeds) return false;
+  if (parties.length !== commits.length || parties.length !== seeds.length) return false;
+  if (parties[0] !== HOUSE_PARTY || new Set(parties).size !== parties.length) return false;
+  const revealed: string[] = [];
+  for (let i = 0; i < parties.length; i++) {
+    if (seeds[i] === '') continue;
+    const ctx = { room, table, round, party: parties[i], house: i === 0 ? '' : commits[0] };
+    if ((await commitTableSeed(seeds[i], ctx)) !== commits[i]) return false;
+    revealed.push(seeds[i]);
+  }
+  if (revealed.length === 0) return false;
+  if (game === 'craps') {
+    if (!outcome.dice) return false;
+    const [d1, d2] = await combineSeeds(revealed, table, round);
+    return d1 === outcome.dice[0] && d2 === outcome.dice[1];
+  }
+  return outcome.pocket === await combinePocketSeeds(revealed, table, round);
+}
+
 // ── The switchable mode variable (dev phase: all modes coexist) ───────────────
 
 /** Global default fairness mode — flip it here, via `setCrapsFairnessMode`, or
- *  per-table (casinoDoc pref). 'rng' preserves today's instant, unproven roll. */
-let currentMode: FairnessMode = 'rng';
+ *  per-table (casinoDoc pref). ⚖️ 'multiparty' = Fair by default: the house and
+ *  the bettors' real seeds settle every craps roll and roulette spin. */
+let currentMode: FairnessMode = 'multiparty';
 
 export function getCrapsFairnessMode(): FairnessMode {
   return currentMode;

@@ -30,17 +30,17 @@
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips,
+  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
-  writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat,
+  writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
 } from './casinoDoc';
 import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
-import { isCroupierLive, openBetting, rollAndSettle } from './croupier';
+import { closeBetting, isCroupierLive, openBetting, rollAndSettle, ROULETTE_PAGE_ID } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -50,18 +50,40 @@ import type { DeviceUI } from './devices';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import {
   assignSlots, chipSlots, crapsChipRect, crapsSideFor, CRAPS_LAYOUT, hitRegion,
-  hitSettings, nearestInDirection, regionCenter, ROULETTE_LAYOUT, spotKey,
+  hitSettings, LAY_PAYS, nearestInDirection, ODDS_PAYS, regionCenter, ROULETTE_LAYOUT, spotKey,
 } from './games/casinoLayout';
 import type { FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
-import { canPlaceBet, crapsBetLabel, pointWasOn } from './games/craps';
+import {
+  canPlaceBet, crapsBetLabel, isOddsType, MAX_LAY_MULTIPLE, MAX_ODDS_MULTIPLE, oddsFlat, oddsRoom, pointWasOn,
+} from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/diceFairness';
+import { isFairTable, MAX_TABLE_BETTORS, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound } from './fairTableSeeds';
 import { readPlayerDisplayName } from './games/gamesDoc';
 import { betLabel, payoutFor, pocketColor } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
+
+/** ⚖️ The plaque line for the round on a table: Fair (the round runs the
+ *  seed exchange) or Friendly (you are trusting the owner's client). It names
+ *  the mode, not the outcome: whether a given result really took bettors'
+ *  seeds is the ⚙ card's verdict line, which warns on house-seed-only. */
+export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { text: string; color: string; fair: boolean } {
+  return roundIsFair(tableId, game)
+    ? { text: '✔ FAIR TABLE · EVERY BETTOR ADDS A SEED · CHECK EACH RESULT ON ⚙', color: '#7CF5B0', fair: true }
+    : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F28B87', fair: false };
+}
+
+/** 🎡 A rival house member's SPIN lease is honoured this long before this
+ *  page may take the round over (the reveal wait plus a margin). */
+const SPIN_TAKEOVER_MS = 15_000;
+/** How long a fresh lease write gets to converge before its page settles. */
+const LEASE_SETTLE_MS = 600;
+
+/** Friendly tables this page has already warned about (once per table). */
+const friendlyWarned = new Set<string>();
 
 /** How often a focused player refreshes their seat (the operator's liveness). */
 const SEAT_BEAT_MS = 5_000;
@@ -279,6 +301,7 @@ const NO_HIGHLIGHT: ReadonlySet<string> = new Set();
 function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readCrapsTableState(id);
   const t = readDiceThrow(id);
+  h.setFairBadge(roundIsFair(id, 'craps'));
   if (!rt.primed) {
     // Walking in mid-game (or a room rebind): clear whatever the pieces still
     // show, then show where things stand, animating nothing old.
@@ -335,6 +358,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
 
 function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readTableState(id);
+  h.setFairBadge(roundIsFair(id, 'roulette'));
   if (!rt.primed) {
     rt.primed = true;
     h.reset();
@@ -437,6 +461,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let card: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
   let seatTimer: number | null = null;
+  /** The manual SPIN's settle poll: one per focused table. */
+  let spinPoll: number | null = null;
+  /** When this page first saw another house member's lease on a round. */
+  let spinSeen: { key: string; at: number } | null = null;
+  const stopSpinPoll = (): void => {
+    if (spinPoll !== null) window.clearInterval(spinPoll);
+    spinPoll = null;
+  };
 
   /** Chips in hand (denominations). Spent only when they land on the felt. */
   let hand: number[] = [];
@@ -470,8 +502,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       windowRound = saved.round;
     }
   }
-  /** round → verdict of the fairness check, so the card never re-hashes. */
-  const verdicts = new Map<number, boolean>();
+  /** Fingerprint of a settled result (epoch, round, outcome, transcript and
+   *  commitments) → its check's verdict line: the card re-hashes only when
+   *  something it checked changes, never shows a stale verdict if it does. */
+  const verdicts = new Map<string, { text: string; color: string }>();
   /** `epoch:round` checks in flight, so re-renders don't start them again. */
   const verifying = new Set<string>();
   /** The room doc this focus began in: rounds and bets from another room's
@@ -601,7 +635,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (game === 'craps') {
       const s = crapsState();
       const type = rg.bet.type as CrapsBet['type'];
-      if (!canPlaceBet(type, s?.point ?? null)) {
+      if (isOddsType(type)) {
+        // 🎲 Odds ride on a flat bet, up to the table's multiple of it.
+        const o = oddsRoom(readMyCrapsBets(itemId, me), type, rg.bet.pick, s?.point ?? null);
+        if (o.reason) {
+          say(o.reason);
+          return;
+        }
+        if (sumOf(hand) > o.room) {
+          say(`ODDS MAX — ${o.room} MORE FITS HERE`);
+          return;
+        }
+      } else if (!canPlaceBet(type, s?.point ?? null)) {
         say(type === 'come' || type === 'dontcome'
           ? 'THE COME BOX OPENS ONCE A POINT IS ON'
           : 'THE LINE IS CLOSED WHILE A POINT IS ON');
@@ -622,6 +667,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say(`YOU HAVE ${MAX_BETS_DRAWN_PER_PLAYER} CHIPS DOWN — THE TABLE LIMIT`);
       return;
     }
+    // ⚖️ A Fair round's transcript carries at most MAX_TABLE_BETTORS bettors:
+    // a newcomer past that would be left out of the settle, so they wait.
+    if (mine.length === 0 && roundIsFair(itemId, game)) {
+      const all = game === 'craps' ? readAllCrapsBets(itemId) : readAllBets(itemId, round());
+      if (Object.keys(all).filter((pid) => pid !== me).length >= MAX_TABLE_BETTORS) {
+        say('THE TABLE IS FULL — WAIT FOR A PLACE');
+        return;
+      }
+    }
     if (!spendChips(me, sumOf(chips))) {
       say('NOT ENOUGH CHIPS — VISIT THE CASHIER');
       refreshRail();
@@ -629,6 +683,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
     writeBets([...mine, ...placed]);
+    const warnKey = `${casinoDocEpoch()}:${itemId}`;
+    // Commit this bet's seed now, not on the next tick: a quick close must
+    // still find it.
+    tickFairSeeds(itemId, game, me, Date.now(), true);
+    if (!roundIsFair(itemId, game) && !friendlyWarned.has(warnKey)) {
+      friendlyWarned.add(warnKey);
+      say("🤝 FRIENDLY TABLE — THE OWNER COULD STEER RESULTS · BET WITH PEOPLE YOU TRUST");
+    }
     const key = spotKey(rg.bet);
     added.set(key, [...(added.get(key) ?? []), ...chips]);
     // The hand stays loaded: the next box you click takes the same chips.
@@ -640,7 +702,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const takeBack = (rg: FeltRegion<Spot>): boolean => {
     syncWindow();
     const key = spotKey(rg.bet);
-    const mine = added.get(key) ?? [];
+    // Odds are the one bet you may take down any time the betting is open,
+    // not only this window's chips (the flat bet under them stays).
+    const mine = game === 'craps' && isOddsType(rg.bet.type)
+      ? myBets().filter((b) => spotKey(b) === key).map((b) => b.amount)
+      : added.get(key) ?? [];
     if (mine.length === 0) return false;
     if (!bettingOpen()) {
       say('NO MORE BETS — THOSE CHIPS STAY');
@@ -726,6 +792,21 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (h && s?.phase === 'settled' && s.dice) h.diceLand(s.dice);
   };
 
+  /** A click on an odds band with no bet there to back is meant for the box
+   *  around it, as it was before the odds bands: the number box's place bet,
+   *  or (come-out) the line. Keyboard play keeps the band, and hears why. */
+  const pointerTarget = (rg: FeltRegion<Spot>): FeltRegion<Spot> => {
+    if (game !== 'craps' || !isOddsType(rg.bet.type)) return rg;
+    const point = crapsState()?.point ?? null;
+    const t = rg.bet.type;
+    if (oddsFlat(readMyCrapsBets(itemId, me), t, rg.bet.pick) > 0 && !(point === null && (t === 'passodds' || t === 'dontpassodds'))) return rg;
+    const tag = rg.side > 0 ? '+' : '-';
+    const to = t === 'comeodds' || t === 'dontcomeodds'
+      ? `place:${rg.bet.pick}@${tag}`
+      : point === null ? `${t === 'passodds' ? 'pass' : 'dontpass'}@${tag}` : null;
+    return (to && layout.regions.find((r) => r.id === to)) || rg;
+  };
+
   const onMove = (e: PointerEvent): void => {
     if (!h || !aim(e)) return;
     dropStaleHold();
@@ -802,8 +883,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const stackAtPt = h.onMyStack(ray, hit.p);
     const stackRg = stackAtPt ? hitRegion(layout, stackAtPt) : null;
     if (stackRg && takeBack(stackRg)) return;
-    const rg = hitRegion(layout, hit.p);
-    if (!rg) return;
+    const hitRg = hitRegion(layout, hit.p);
+    if (!hitRg) return;
+    const rg = pointerTarget(hitRg);
     if (hand.length > 0) placeHand(rg);
     else say(`${labelOf(rg.bet)} — PICK UP CHIPS FROM YOUR RAIL FIRST`);
   };
@@ -839,7 +921,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const KEY_HELP = `${game === 'craps' ? 'Craps' : 'Roulette'} table. Arrow keys choose a box on the felt. `
     + '1 to 6 pick up a 1, 5, 25, 100, 500 or 1000 chip. Enter or Space bets your hand on the box. '
-    + 'Delete takes back the chips you put there this round. 0 puts your hand back. '
+    + 'Delete takes back the chips you put there this round, or your odds there. 0 puts your hand back. '
     + `${game === 'craps' ? 'R throws the dice when they are yours. ' : ''}`
     + 'I reads the table. S opens the table card. Escape steps away.';
 
@@ -850,7 +932,24 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const describeRegion = (rg: FeltRegion<Spot>): string => {
     const key = spotKey(rg.bet);
     const mine = myBets().filter((b) => spotKey(b) === key).reduce((a, b) => a + b.amount, 0);
-    return `${labelOf(rg.bet)}${rg.sub ? `, pays ${rg.sub}` : ''}. ${mine > 0 ? `Your chips here: ${mine}.` : 'None of your chips here.'} ${handLine()}`;
+    const pays = game === 'craps' && isOddsType(rg.bet.type) ? `, ${oddsLine(rg.bet)}` : rg.sub ? `, pays ${rg.sub}` : '';
+    return `${labelOf(rg.bet)}${pays}. ${mine > 0 ? `Your chips here: ${mine}.` : 'None of your chips here.'} ${handLine()}`;
+  };
+
+  /** An odds box read aloud: what it pays on the number it backs, and how
+   *  much more of your flat bet's odds it can take right now. */
+  const oddsLine = (b: Spot): string => {
+    const t = b.type as CrapsBet['type'];
+    const lay = t === 'dontpassodds' || t === 'dontcomeodds';
+    const point = crapsState()?.point ?? null;
+    const n = t === 'passodds' || t === 'dontpassodds' ? point : b.pick ?? null;
+    const pays = n === null
+      ? `pays ${lay ? 'lay odds: 1 to 2 on 4 and 10, 2 to 3 on 5 and 9, 5 to 6 on 6 and 8' : 'true odds: 2 to 1 on 4 and 10, 3 to 2 on 5 and 9, 6 to 5 on 6 and 8'}`
+      : `pays ${(lay ? LAY_PAYS : ODDS_PAYS)[n]?.toLowerCase() ?? ''} on the ${n}`;
+    const o = oddsRoom(readMyCrapsBets(itemId, me), t, b.pick, point);
+    const room = o.reason ? o.reason.toLowerCase() : `you can add up to ${o.room}`;
+    const off = t === 'comeodds' && point === null ? ', off on the come-out' : '';
+    return `${pays}${off}; ${room}`;
   };
 
   const selectRegion = (i: number): void => {
@@ -980,6 +1079,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         if (s.shooter && s.shooter !== me) return { line: `✋ NO MORE BETS — ${readPlayerDisplayName(s.shooter).toUpperCase()} IS SHOOTING${remain()}`, color: PINK };
         return { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
       }
+      if (s.phase === 'settled' && s.voided) {
+        return { line: '⚠ ROLL VOID — IT COULD NOT BE SETTLED FAIRLY · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
+      }
       if (s.phase === 'settled' && s.dice && s.result !== null) {
         const won = (s.payouts?.[me] ?? 0) > 0;
         const call = s.sevenOut ? ' — SEVEN OUT' : s.point !== null && s.point === s.result ? '' : '';
@@ -996,6 +1098,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const s = rouletteState();
     if (animating()) return { line: '🎡 NO MORE BETS — THE BALL IS ROLLING…', color: PINK };
     if (s?.phase === 'closing') return { line: '✋ NO MORE BETS', color: PINK };
+    if (s?.phase === 'settled' && s.voided) {
+      return { line: '⚠ SPIN VOID — IT COULD NOT BE SETTLED FAIRLY · STAKES RETURNED', color: GOLD_BRIGHT };
+    }
     if (s?.phase === 'settled' && s.result !== null) {
       const won = (s.payouts?.[me] ?? 0) > 0;
       return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''}`, color: won ? WIN : GOLD_BRIGHT };
@@ -1006,6 +1111,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const renderBar = (): void => {
     if (!bar) return;
     const st = status();
+    const badge = fairnessBadge(itemId, game);
+    const fairLine = bar.querySelector<HTMLDivElement>('[data-fair]')!;
+    if (fairLine.textContent !== badge.text) fairLine.textContent = badge.text;
+    fairLine.style.color = badge.color;
     const line = bar.querySelector<HTMLDivElement>('[data-status]')!;
     line.textContent = st.line;
     line.style.color = st.color;
@@ -1027,6 +1136,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
        <div>PLACE 4 · 10 — 9:5 &nbsp; 5 · 9 — 7:5 &nbsp; 6 · 8 — 7:6 (off on the come-out)</div>
        <div>FIELD — 1:1, 2 and 12 pay 2:1 &nbsp; BIG 6 / BIG 8 — 1:1</div>
        <div>HARD 6 · 8 — 9:1 &nbsp; HARD 4 · 10 — 7:1 (off on the come-out)</div>
+       <div>ODDS behind PASS / COME — true odds, no house edge: 4 · 10 — 2:1 &nbsp; 5 · 9 — 3:2 &nbsp; 6 · 8 — 6:5; up to ${MAX_ODDS_MULTIPLE[4]}× · ${MAX_ODDS_MULTIPLE[5]}× · ${MAX_ODDS_MULTIPLE[6]}× the flat bet</div>
+       <div>LAY ODDS behind DON'T PASS / DON'T COME — 4 · 10 — 1:2 &nbsp; 5 · 9 — 2:3 &nbsp; 6 · 8 — 5:6; up to ${MAX_LAY_MULTIPLE}× the flat bet</div>
+       <div>Come odds are off on the come-out (returned if the come bet is decided then); lay odds always work. Odds come down any time bets are open.</div>
        <div>ANY 7 — 4:1 &nbsp; ANY CRAPS — 7:1 &nbsp; 2 · 12 — 30:1 &nbsp; 3 · 11 — 15:1</div>
        <div>The dice go clockwise to players with a line bet; a shooter keeps them until a seven-out.</div>`
     : `<div>SINGLE-ZERO WHEEL — straight up 35:1</div>
@@ -1035,6 +1147,91 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const btn = (id: string, label: string, enabled: boolean): string =>
     `<button data-act="${id}" ${enabled ? '' : 'disabled'} style="padding:6px 10px;background:rgba(212,168,75,${enabled ? 0.12 : 0.04});border:1px solid rgba(212,168,75,${enabled ? 0.5 : 0.18});border-radius:6px;color:${enabled ? GOLD_BRIGHT : DIM};font:inherit;font-size:10px;font-weight:800;letter-spacing:1.2px;cursor:${enabled ? 'pointer' : 'not-allowed'};">${label}</button>`;
+
+  /** The card's line for the last settled result's fairness check (async the
+   *  first time; cached per checked content). null when there is nothing to check. */
+  const lastResultCheck = (): { text: string; color: string } | null => {
+    const cs = game === 'craps' ? crapsState() : null;
+    const rs = game === 'roulette' ? rouletteState() : null;
+    const s = cs ?? rs;
+    if (s?.phase !== 'settled') return null;
+    const what = game === 'craps' ? 'LAST ROLL' : 'LAST SPIN';
+    if (s.voided) {
+      // A void is only the canonical no-outcome shape: no result, no payouts,
+      // no transcript. `voided` stamped on a played round is a failed check.
+      const played = s.result !== null || (cs?.dice ?? null) !== null || !!s.fairness
+        || Object.keys(s.payouts ?? {}).length > 0;
+      if (played) return { text: `✗ ${what} · CHECK FAILED (A PLAYED ROUND MARKED VOID)`, color: '#FF8A80' };
+      return {
+        text: `⚠ ${what} VOIDED · A SEED WAS MISSING OR UNSIGNED · ${game === 'craps' ? 'EVERY BET STANDS' : 'STAKES RETURNED'}`,
+        color: '#F5C26B',
+      };
+    }
+    const outcome = cs ? (cs.dice ? { dice: cs.dice } : null) : (rs?.result != null ? { pocket: rs.result } : null);
+    if (!outcome) return null;
+    const fx = s.fairness;
+    if (!fx) {
+      return s.houseCommit ? { text: `⚠ ${what} · UNPROVEN (NO SEEDS WERE REVEALED)`, color: '#F5C26B' } : null;
+    }
+    const forRound = s.round;
+    const forEpoch = casinoDocEpoch();
+    // Everything the verdict reads goes in the key: a late reveal landing in a
+    // forfeited party's seed record can change "a revealed seed was left out".
+    const records = Object.keys(s.commits ?? {}).sort().map((pid) => readSeedRecord(itemId, pid));
+    const inFlight = JSON.stringify([
+      forEpoch, forRound, outcome, fx, s.houseCommit ?? null, s.commits ?? null, s.unseeded ?? null, s.wagers ?? null, s.sigs ?? null,
+      records,
+    ]);
+    const v = verdicts.get(inFlight);
+    if (v) return v;
+    if (!verifying.has(inFlight)) {
+      verifying.add(inFlight);
+      const check: Promise<{ text: string; color: string }> = fx.parties
+        ? verifySettledRound(game, itemId, s, outcome, me).then((r) => {
+          if (r.kind === 'failed') return { text: `✗ ${what} · CHECK FAILED`, color: '#FF8A80' };
+          if (r.kind === 'unproven') return { text: `⚠ ${what} · UNPROVEN`, color: '#F5C26B' };
+          const n = r.forfeited.length;
+          const mixed = fx.seeds!.filter((x) => x !== '').length;
+          const parts = [`🔒 ${what} · ✓ VERIFIED · ${mixed} SEED${mixed === 1 ? '' : 'S'} MIXED`];
+          if (n > 0) parts.push(`${n} WITHHELD (BETS FORFEITED)`);
+          const u = r.unseeded.length;
+          if (u > 0) parts.push(`⚠ ${u} BETTOR${u === 1 ? '' : 'S'} ADDED NO SEED`);
+          // With chips down but no bettor seed in the mix, the house alone
+          // made this result: checkable, but not something it couldn't steer.
+          const houseOnly = r.bettorSeeds === 0 && (u > 0 || n > 0);
+          if (houseOnly) parts.push('⚠ HOUSE SEED ONLY');
+          if (r.houseMissing) parts.push('⚠ HOUSE SEED MISSING');
+          if (r.droppedReveal) parts.push('✗ A REVEALED SEED WAS LEFT OUT');
+          // Your own part is the check that matters most to you: with your
+          // seed in, nobody could have steered the result against you.
+          // A page that only saw the round after it settled can't tell
+          // whether the operator dropped a party from both the frozen set
+          // and the transcript: checkable maths, unwitnessed party set.
+          if (!r.watchedClose) parts.push('⚠ PARTY SET NOT WITNESSED (OPENED AFTER BETS CLOSED)');
+          if (r.mine === 'in') parts.push('✓ YOUR SEED IS IN');
+          if (r.mine === 'left-out') parts.push('✗ YOUR SEED WAS LEFT OUT');
+          if (r.mine === 'replaced') parts.push('✗ YOUR SEED WAS SWAPPED FOR ONE YOU DID NOT MAKE');
+          const bad = r.droppedReveal || r.mine === 'left-out' || r.mine === 'replaced';
+          return {
+            text: parts.join(' · '),
+            color: bad ? '#FF8A80' : r.houseMissing || houseOnly || u > 0 || !r.watchedClose ? '#F5C26B' : '#7CF5B0',
+          };
+        })
+        : verifyTranscript(fx, itemId, forRound, cs?.dice ?? [0, 0]).then((ok) => ({
+          text: `🔒 ${what} · ${fx.mode.toUpperCase()}${fx.simulated ? ' (dev-simulated)' : ''} · ${ok ? '✓ verified' : '✗ FAILED'}`,
+          color: ok ? '#7CF5B0' : '#FF8A80',
+        }));
+      check.then((line) => {
+        verifying.delete(inFlight);
+        // A check started in another room's doc says nothing about this one.
+        if (forEpoch !== casinoDocEpoch()) return;
+        if (verdicts.size > 32) verdicts.clear();
+        verdicts.set(inFlight, line);
+        renderCard();
+      }, () => verifying.delete(inFlight));
+    }
+    return { text: `🔒 ${what} · verifying…`, color: '#7CF5B0' };
+  };
 
   const renderCard = (): void => {
     if (!card) return;
@@ -1047,40 +1244,27 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       <button data-act="close" aria-label="Close the table card" style="background:none;border:none;color:${GOLD};font-size:16px;cursor:pointer;">✕</button></div>`);
     rows.push(`<div style="font-size:9px;color:${DIM};letter-spacing:1px;">${house ? 'YOU RUN THIS TABLE' : 'THE OWNER SETS THIS TABLE · ANYONE CAN LOOK'}</div>`);
     rows.push(`<div style="font-size:10px;line-height:1.7;color:${GOLD};border-top:1px solid rgba(212,168,75,0.18);padding-top:8px;">${rulesHtml()}</div>`);
+    // ⚖️ Fair / Friendly, how the result is made, and the last result's check.
+    const badge = fairnessBadge(itemId, game);
+    rows.push(`<div style="font-size:10px;font-weight:900;letter-spacing:1px;color:${badge.color};">${badge.text}</div>`);
+    const mode = readCrapsFairnessPref(itemId) ?? getCrapsFairnessMode();
+    const info = game === 'craps' || mode === 'multiparty' ? FAIRNESS_MODES[mode] : FAIRNESS_MODES.rng;
+    rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+      <span style="font-size:9px;color:${DIM};letter-spacing:1.2px;">${game === 'craps' ? 'DICE' : 'WHEEL'} FAIRNESS</span>
+      ${house ? btn('fairness', info.label.toUpperCase(), true) : `<span style="font-size:10px;color:${GOLD_BRIGHT};">${info.label.toUpperCase()}</span>`}</div>`);
+    rows.push(`<div style="font-size:9px;color:${DIM};">${info.blurb}${game === 'craps' && (mode === 'commit-reveal' || mode === 'block-beacon') ? ' (dev-simulated, so not Fair yet)' : ''}</div>`);
+    if (isFairTable(itemId) !== badge.fair) {
+      rows.push(`<div style="font-size:9px;color:${DIM};">THE NEW SETTING STARTS WITH THE NEXT ${game === 'craps' ? 'ROLL' : 'ROUND'}</div>`);
+    }
     if (game === 'craps') {
-      const mode = readCrapsFairnessPref(itemId) ?? getCrapsFairnessMode();
-      const info = FAIRNESS_MODES[mode];
       const backend = crapsBackend(readCrapsBackendPref(itemId));
-      rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
-        <span style="font-size:9px;color:${DIM};letter-spacing:1.2px;">DICE FAIRNESS</span>
-        ${house ? btn('fairness', info.label.toUpperCase(), true) : `<span style="font-size:10px;color:${GOLD_BRIGHT};">${info.label.toUpperCase()}</span>`}</div>`);
-      rows.push(`<div style="font-size:9px;color:${DIM};">${info.blurb}</div>`);
       const pref = readCrapsBackendPref(itemId);
       rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
         <span style="font-size:9px;color:${DIM};letter-spacing:1.2px;">SETTLEMENT</span>
         ${house ? btn('backend', `${backend.label.toUpperCase()}${pref === 'chia' && !backend.isAvailable() ? ' · FALLS BACK TO LOCAL' : ''}`, true) : `<span style="font-size:10px;color:${GOLD_BRIGHT};">${backend.label.toUpperCase()}</span>`}</div>`);
-      const s = crapsState();
-      if (s?.phase === 'settled' && s.fairness && s.dice) {
-        const v = verdicts.get(s.round);
-        const fx = s.fairness;
-        const txt = `🔒 LAST ROLL · ${fx.mode.toUpperCase()}${fx.simulated ? ' (dev-simulated)' : ''} · ${v === undefined ? 'verifying…' : v ? '✓ verified' : '✗ FAILED'}`;
-        rows.push(`<div style="font-size:9px;color:${v === false ? '#FF8A80' : '#7CF5B0'};">${txt}</div>`);
-        const forRound = s.round;
-        const forEpoch = casinoDocEpoch();
-        const inFlight = `${forEpoch}:${forRound}`;
-        if (v === undefined && !verifying.has(inFlight)) {
-          verifying.add(inFlight);
-          verifyTranscript(fx, itemId, forRound, s.dice).then((ok) => {
-            verifying.delete(inFlight);
-            // A check started in another room's doc says nothing about this one.
-            if (forEpoch !== casinoDocEpoch()) return;
-            if (verdicts.size > 32) verdicts.clear();
-            verdicts.set(forRound, ok);
-            renderCard();
-          }, () => verifying.delete(inFlight));
-        }
-      }
     }
+    const lastLine = lastResultCheck();
+    if (lastLine) rows.push(`<div style="font-size:9px;color:${lastLine.color};">${lastLine.text}</div>`);
     if (live) {
       rows.push(`<div style="font-size:9.5px;color:${GOLD};">🤖 THE ROBOT ${game === 'craps' ? 'STICKMAN' : 'CROUPIER'} RUNS THIS TABLE ON A TIMER</div>`);
     } else if (house) {
@@ -1116,9 +1300,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     if (!house) return;
     if (act === 'fairness') {
-      const order: FairnessMode[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
+      // Roulette is Fair or plain RNG; craps also has its two dev modes. The
+      // change applies from the next window the house opens.
+      const order: FairnessMode[] = game === 'craps'
+        ? ['multiparty', 'rng', 'commit-reveal', 'block-beacon']
+        : ['multiparty', 'rng'];
       const cur = readCrapsFairnessPref(itemId) ?? getCrapsFairnessMode();
-      writeCrapsFairnessPref(itemId, order[(order.indexOf(cur) + 1) % order.length]);
+      const at = order.indexOf(cur);
+      writeCrapsFairnessPref(itemId, order[(at < 0 ? 0 : at + 1) % order.length]);
     } else if (act === 'backend') {
       writeCrapsBackendPref(itemId, readCrapsBackendPref(itemId) === 'chia' ? 'local' : 'chia');
     } else if (act === 'roll') {
@@ -1128,7 +1317,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       const notice = pressManualRoll(itemId);
       if (notice) say(notice);
     } else if (act === 'spin') {
-      if (phase() === 'betting' || phase() === 'closing') rollAndSettle(itemId, round());
+      spinByHand();
     } else if (act === 'next') {
       if (phase() !== 'settled') return;
       if (game === 'craps') {
@@ -1139,6 +1328,51 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       }
     }
     renderCard();
+  };
+
+  /** The house's manual SPIN: close the window (freezing the round's seed
+   *  commitments), then settle as soon as the bettors have revealed. */
+  const spinByHand = (): void => {
+    const s = rouletteState();
+    // A manual table nobody has run yet: this press opens round 1, so its
+    // house commitment is out before a later press freezes the bets.
+    if (!s) {
+      openBetting(itemId, 1);
+      return;
+    }
+    if (s.phase === 'settled') return;
+    if (spinPoll !== null) return; // already settling this round
+    if (s.phase === 'betting') closeBetting(itemId, s, undefined, ROULETTE_PAGE_ID);
+    else if (s.operator !== undefined && s.operator !== ROULETTE_PAGE_ID) {
+      // Another house member's SPIN holds this round. Take it over only once
+      // they've had time to settle it (they may have left mid-round).
+      const k = `${casinoDocEpoch()}:${s.round}:${s.operator}`;
+      if (spinSeen?.key !== k) spinSeen = { key: k, at: Date.now() };
+      if (Date.now() - spinSeen.at < SPIN_TAKEOVER_MS) {
+        say('THE WHEEL IS SPINNING — ANOTHER HOUSE MEMBER IS RUNNING THIS ROUND');
+        return;
+      }
+      writeTableState(itemId, { ...s, operator: ROULETTE_PAGE_ID });
+    } else if (s.operator === undefined) {
+      // An unleased closing round (the robot closed it, then went away):
+      // claim it, so only this page publishes and pays.
+      writeTableState(itemId, { ...s, operator: ROULETTE_PAGE_ID });
+    }
+    const r = s.round;
+    // Let a rival's lease write converge before this page may publish.
+    const settleFrom = Date.now() + LEASE_SETTLE_MS;
+    const epoch = casinoDocEpoch();
+    const until = Date.now() + REVEAL_GRACE_MS + 6_000;
+    spinPoll = window.setInterval(() => {
+      const now = rouletteState();
+      // Another room's table can share this id and round: stop on a rebind.
+      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || Date.now() > until
+        || (now.operator !== undefined && now.operator !== ROULETTE_PAGE_ID)) {
+        stopSpinPoll();
+        return;
+      }
+      if (Date.now() >= settleFrom) rollAndSettle(itemId, r);
+    }, 150);
   };
 
   const toggleCard = (): void => {
@@ -1223,6 +1457,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         padding:8px 14px; text-align:center; pointer-events:none;
         font-family:'SF Mono','Monaco','Consolas',monospace; box-sizing:border-box;`;
       bar.innerHTML = `
+        <div data-fair style="font-size:9px;font-weight:800;letter-spacing:1.2px;margin-bottom:3px;"></div>
         <div data-status style="font-size:12px;font-weight:900;letter-spacing:1px;"></div>
         <div data-flash style="display:none;font-size:10px;font-weight:800;color:#FF8A80;letter-spacing:1px;margin-top:3px;"></div>
         <div data-live role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;"></div>
@@ -1247,6 +1482,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       unsubscribe = null;
       if (seatTimer !== null) window.clearInterval(seatTimer);
       seatTimer = null;
+      stopSpinPoll();
       clearMySeat(itemId, me);
       markLocalSeat(itemId, me, false);
       localHold.delete(itemId);

@@ -78,6 +78,7 @@ import type { FurnitureHandleSinks } from './furnitureHandles';
 import { registerAirHockeyVisual } from './airHockeySession';
 // 🐊 #185: the same for a DEV-spawned insatiable-alligators table.
 import { registerAlligatorsVisual } from './alligatorsSession';
+import { registerArcadeVisual } from './arcadeNesSession';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -124,6 +125,10 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
   'coin-pusher': '🪙 COIN PUSHER',
+  'smart-tv': '📺 SMART TV (WALL)',
+  'tv-stand': '📺 TV ON A STAND',
+  'arcade-cabinet': '🕹 ARCADE CABINET',
+  'arcade-cabinet-2p': '🕹 ARCADE CABINET · 2 PLAYER',
   'faucet-dish': '🥣 FAUCET DISH (chia)',
   'cake-table': '🎂 CAKE TABLE',
   'gift-box': '🎁 GIFT BOX',
@@ -439,6 +444,8 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       if (hockey) registerAirHockeyVisual(item.id, hockey, { x: item.pos.x, z: item.pos.z, rot: item.rot });
       const gators = sinks.alligatorsVisuals.get(item.id);
       if (gators) registerAlligatorsVisual(item.id, gators, { x: item.pos.x, z: item.pos.z, rot: item.rot });
+      const arcade = sinks.arcadeCabinetVisuals.get(item.id);
+      if (arcade) registerArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;
@@ -527,7 +534,7 @@ function spawnFurniture(kind: FurnitureKind): void {
   const spot: { x: number; z: number; rot?: Rot; mountParent?: string } | null =
     FURNITURE_DEFS[kind].mount === 'exterior-wall'
       ? findFreeExteriorSpot(kind, item, world.getPlayer().getPosition())
-      : findSpawnSpot(world, item);
+      : findSpawnSpot(world, item); // 📺 interior wall kinds (the TV) hang on the wall it finds
   if (!spot) {
     showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (room is full).`);
     return;

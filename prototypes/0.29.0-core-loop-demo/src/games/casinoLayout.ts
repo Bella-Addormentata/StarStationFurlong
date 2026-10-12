@@ -62,6 +62,14 @@ export interface FeltRegion<B> {
   diamond?: string;
   /** Where chips for this bet stack. */
   chipRect: FeltRect;
+  /** Which of `rects` carries the caption and the keyboard anchor (default:
+   *  the largest). */
+  caption?: number;
+  /** Paint this outline instead of `rects` (a number box drawn whole while
+   *  its odds bands take the clicks at its top and bottom). */
+  frame?: FeltRect;
+  /** A band inside another box (odds): a dashed hairline, not a printed box. */
+  faint?: boolean;
   /** Which end of the craps table (−1 / +1); 0 for the centre and roulette. */
   side: -1 | 0 | 1;
 }
@@ -108,11 +116,18 @@ export function hitRegion<B>(layout: FeltLayout<B>, p: FeltPoint): FeltRegion<B>
   return null;
 }
 
-/** A region's anchor: the centre of its largest rect (where its caption is
+/** The rect a region's caption is printed in: `caption` when set, else its
+ *  largest. */
+export function captionRect<B>(rg: FeltRegion<B>): FeltRect {
+  if (rg.caption !== undefined && rg.rects[rg.caption]) return rg.rects[rg.caption];
+  return rg.rects.reduce((a, b) =>
+    (b.x1 - b.x0) * (b.z1 - b.z0) > (a.x1 - a.x0) * (a.z1 - a.z0) ? b : a);
+}
+
+/** A region's anchor: the centre of its caption rect (where its caption is
  *  printed, and where keyboard play points at it). */
 export function regionCenter<B>(rg: FeltRegion<B>): FeltPoint {
-  const main = rg.rects.reduce((a, b) =>
-    (b.x1 - b.x0) * (b.z1 - b.z0) > (a.x1 - a.x0) * (a.z1 - a.z0) ? b : a);
+  const main = captionRect(rg);
   return { x: (main.x0 + main.x1) / 2, z: (main.z0 + main.z1) / 2 };
 }
 
@@ -160,6 +175,7 @@ export const CRAPS_FELT: FeltRect = rect(-1.37, -0.42, 1.37, 0.42);
 const CR = {
   inner: 0.36,      // |x| where each end starts (the centre box is inside)
   passIn: -0.335,   // top edge of the pass line's long strip
+  oddsIn: -0.382,   // top edge of the pass-odds band behind the line
   dpIn: -0.255,     // top edge of the don't pass bar
   fieldIn: -0.1,    // top edge of the field
   comeIn: 0.14,     // top edge of the come box (number boxes above)
@@ -186,6 +202,30 @@ export function crapsNumberBox(n: number, side: -1 | 1): FeltRect {
   return rect(x0, CR.comeIn, x0 + NUM_W, CRAPS_FELT.z1);
 }
 
+/** Depth of a number box's bottom (come) and top (don't come) bands. */
+const NUM_BAND = 0.09;
+/** Width of the odds column at the inner edge of each band. */
+const ODDS_COL = 0.045;
+
+/** A number box's bands: travelled come bets and their odds at the bottom,
+ *  place bets in the middle, travelled don't come bets, their lay odds (and
+ *  the puck) at the top. */
+function numberBands(n: number, side: -1 | 1) {
+  const box = crapsNumberBox(n, side);
+  const bottom = rect(box.x0, box.z0, box.x1, box.z0 + NUM_BAND);
+  const top = rect(box.x0, box.z1 - NUM_BAND, box.x1, box.z1);
+  return {
+    box,
+    bottom,
+    top,
+    middle: rect(box.x0, bottom.z1, box.x1, top.z0),
+    come: rect(box.x0, box.z0, box.x1 - ODDS_COL, bottom.z1),
+    comeOdds: rect(box.x1 - ODDS_COL, box.z0, box.x1, bottom.z1),
+    dontCome: rect(box.x0, top.z0, box.x1 - ODDS_COL, box.z1),
+    dontComeOdds: rect(box.x1 - ODDS_COL, top.z0, box.x1, box.z1),
+  };
+}
+
 /** The DON'T COME bar on one end (beside the number boxes, toward the middle). */
 function dontComeBar(side: -1 | 1): FeltRect {
   return side > 0 ? rect(CR.inner, CR.comeIn, CR.numIn, CRAPS_FELT.z1)
@@ -193,6 +233,9 @@ function dontComeBar(side: -1 | 1): FeltRect {
 }
 
 const PLACE_PAYS: Record<number, string> = { 4: '9 TO 5', 5: '7 TO 5', 6: '7 TO 6', 8: '7 TO 6', 9: '7 TO 5', 10: '9 TO 5' };
+/** True odds (come odds) and their inverse (don't come lay odds), as printed. */
+export const ODDS_PAYS: Record<number, string> = { 4: '2 TO 1', 5: '3 TO 2', 6: '6 TO 5', 8: '6 TO 5', 9: '3 TO 2', 10: '2 TO 1' };
+export const LAY_PAYS: Record<number, string> = { 4: '1 TO 2', 5: '2 TO 3', 6: '5 TO 6', 8: '5 TO 6', 9: '2 TO 3', 10: '1 TO 2' };
 const NUMBER_WORD: Record<number, string> = { 4: '4', 5: '5', 6: 'SIX', 8: '8', 9: 'NINE', 10: '10' };
 
 function crapsEnd(side: -1 | 1): FeltRegion<CrapsSpot>[] {
@@ -200,17 +243,33 @@ function crapsEnd(side: -1 | 1): FeltRegion<CrapsSpot>[] {
   const tag = s > 0 ? '+' : '-';
   const X = (v: number) => v * s; // mirror an |x| onto this end
   const out: FeltRegion<CrapsSpot>[] = [];
-  const passLong = rect(X(CR.inner), CRAPS_FELT.z0, X(CRAPS_FELT.x1), CR.passIn);
+  // The pass line's long strip, with the odds band behind it (toward the
+  // player rail) — where a dealer sets odds, behind the flat bet.
+  const passLong = rect(X(CR.inner), CR.oddsIn, X(CR.endIn), CR.passIn);
+  const passCorner = rect(X(CR.endIn), CRAPS_FELT.z0, X(CRAPS_FELT.x1), CR.passIn);
   const passEnd = rect(X(CR.endIn), CR.passIn, X(CRAPS_FELT.x1), CRAPS_FELT.z1);
   out.push({
-    id: `pass@${tag}`, bet: { type: 'pass' }, rects: [passLong, passEnd],
-    label: 'PASS LINE', fill: null, textSize: 0.05, side: s,
-    chipRect: rect(X(CR.inner + 0.04), CRAPS_FELT.z0, X(CR.endIn), CR.passIn),
+    id: `pass@${tag}`, bet: { type: 'pass' }, rects: [passLong, passCorner, passEnd], caption: 0,
+    label: 'PASS LINE', fill: null, textSize: 0.038, side: s,
+    chipRect: rect(X(CR.inner + 0.04), CR.oddsIn, X(CR.endIn), CR.passIn),
   });
-  const dp = rect(X(CR.inner), CR.passIn, X(CR.bigIn), CR.dpIn);
+  const passOdds = rect(X(CR.inner), CRAPS_FELT.z0, X(CR.endIn), CR.oddsIn);
+  out.push({
+    id: `passodds@${tag}`, bet: { type: 'passodds' }, rects: [passOdds],
+    label: 'ODDS BEHIND THE LINE · TRUE ODDS', fill: null, textSize: 0.02, faint: true, side: s,
+    chipRect: rect(X(CR.inner + 0.04), CRAPS_FELT.z0, X(CR.endIn), CR.oddsIn),
+  });
+  // The don't pass bar, its lay odds at the outer end by big 6 / 8.
+  const dpSplit = CR.bigIn - 0.17;
+  const dp = rect(X(CR.inner), CR.passIn, X(dpSplit), CR.dpIn);
   out.push({
     id: `dontpass@${tag}`, bet: { type: 'dontpass' }, rects: [dp],
-    label: "DON'T PASS BAR ⚀⚀", fill: null, textSize: 0.038, side: s, chipRect: dp,
+    label: "DON'T PASS BAR ⚀⚀", fill: null, textSize: 0.034, side: s, chipRect: dp,
+  });
+  const dpOdds = rect(X(dpSplit), CR.passIn, X(CR.bigIn), CR.dpIn);
+  out.push({
+    id: `dontpassodds@${tag}`, bet: { type: 'dontpassodds' }, rects: [dpOdds],
+    label: 'LAY ODDS', fill: null, textSize: 0.024, faint: true, side: s, chipRect: dpOdds,
   });
   const field = rect(X(CR.inner), CR.dpIn, X(CR.bigIn), CR.fieldIn);
   out.push({
@@ -241,14 +300,23 @@ function crapsEnd(side: -1 | 1): FeltRegion<CrapsSpot>[] {
     textRot: Math.PI / 2, side: s, chipRect: dc,
   });
   for (const n of CRAPS_NUMBERS) {
-    const box = crapsNumberBox(n, s);
+    const b = numberBands(n, s);
+    // Place chips sit in the middle band of the box; the top band holds the
+    // puck and travelled don't-come bets with their lay odds, the bottom band
+    // travelled come bets with their odds. A click in a band backs that bet.
     out.push({
-      id: `place:${n}@${tag}`, bet: { type: 'place', pick: n }, rects: [box],
+      id: `place:${n}@${tag}`, bet: { type: 'place', pick: n }, rects: [b.middle], frame: b.box,
       label: NUMBER_WORD[n], sub: PLACE_PAYS[n], fill: null,
       textSize: n === 6 || n === 9 ? 0.04 : 0.07, side: s,
-      // Place chips sit in the middle band of the box; the top band holds the
-      // puck and travelled don't-come bets, the bottom band travelled come bets.
-      chipRect: rect(box.x0, box.z0 + 0.09, box.x1, box.z1 - 0.09),
+      chipRect: b.middle,
+    });
+    out.push({
+      id: `comeodds:${n}@${tag}`, bet: { type: 'comeodds', pick: n }, rects: [b.bottom],
+      label: 'ODDS', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.comeOdds,
+    });
+    out.push({
+      id: `dontcomeodds:${n}@${tag}`, bet: { type: 'dontcomeodds', pick: n }, rects: [b.top],
+      label: 'LAY', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.dontComeOdds,
     });
   }
   return out;
@@ -320,10 +388,8 @@ export function crapsSideFor(x: number): -1 | 1 {
  *  don't-come bets move into their number's box (bottom / top band). */
 export function crapsChipRect(bet: CrapsSpot, side: -1 | 1): FeltRect | null {
   if ((bet.type === 'come' || bet.type === 'dontcome') && bet.pick !== undefined) {
-    const box = crapsNumberBox(bet.pick, side);
-    return bet.type === 'come'
-      ? rect(box.x0, box.z0, box.x1, box.z0 + 0.09)
-      : rect(box.x0, box.z1 - 0.09, box.x1 - 0.045, box.z1);
+    const b = numberBands(bet.pick, side);
+    return bet.type === 'come' ? b.come : b.dontCome;
   }
   const key = spotKey(bet);
   const onEnd = CRAPS_LAYOUT.regions.find((r) => spotKey(r.bet) === key && (r.side === side || r.side === 0));
