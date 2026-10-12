@@ -51,19 +51,20 @@ inside a sandboxed frame. It isn't in this repository:
 its cores as npm packages at one pinned version, and release builds carry the
 engine and all eleven cores. Each core's archive holds its own license
 (`license.txt`); the texts are here too, and
-`emulatorjs/data/NOTICE.txt` names each package fetched, its sha512 and its
-source repository.
+`emulatorjs/data/NOTICE.txt` names each package fetched, its sha512 and the
+commit it was built from.
 
 | Part | Systems | License | Text |
 |---|---|---|---|
 | EmulatorJS (the engine) | all | GPL-3.0 | [`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt); its own `LICENSE` lands beside the engine |
+| RetroArch (EmulatorJS's fork), linked into every core's file | all | GPL-3.0 | [`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt) |
 | fceumm | NES | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
 | gambatte | Game Boy, Game Boy Color | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
 | mupen64plus_next | Nintendo 64 | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
 | pcsx_rearmed | PlayStation | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
 | mednafen_pce | PC Engine | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
 | mgba | Game Boy Advance | MPL-2.0 | [`licenses/MPL-2.0-mgba.txt`](licenses/MPL-2.0-mgba.txt) |
-| stella2014 | Atari 2600 | none shipped: its archive holds no license text; see [its repository](https://github.com/EmulatorJS/stella2014-libretro) | — |
+| stella2014 | Atari 2600 | GPL-2.0 (its archive holds no license text; its source has Stella's, `stella/license.txt`) | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
 | genesis_plus_gx | Mega Drive, Master System | Genesis Plus GX, **non-commercial** | [`licenses/Genesis-Plus-GX.txt`](licenses/Genesis-Plus-GX.txt) |
 | snes9x | SNES | Snes9x, **non-commercial** | [`licenses/Snes9x.txt`](licenses/Snes9x.txt) |
 | fbneo | Arcade (FBNeo) | FBNeo, **non-commercial**, and no asking for donations for a project that uses it | [`licenses/FBNeo.txt`](licenses/FBNeo.txt) |
@@ -76,9 +77,16 @@ asks for none. A build that is sold, or that asks for donations, would have to
 leave those cores out (`EJS_CORES` names the cores to fetch).
 
 EmulatorJS's own scripts travel with it unminified. The cores are compiled
-builds: each package names its source repository but not the commit it was
-built from, so their source does not travel with the app the way the built-in
-games' does.
+builds, too big to carry their source inside the app the way the built-in
+games do, so every release carries it beside the installers:
+`emulatorjs-4.2.1-source.tar.xz` (about 123 MB) holds the engine, the eleven
+cores, the RetroArch they are linked with and the scripts that built them, each
+at the commit it was built from. EmulatorJS doesn't say which commits those
+were; each core's own version string names its commit, and
+`scripts/emulatorjs-sources.json` pins them all by full hash
+(`scripts/pack-emulatorjs-source.mjs` says how each was found, and packs the
+archive). `NOTICE.txt` names each commit, and the archive's `README.txt` lists
+them with the submodules left out, which the cores' web builds don't compile.
 
 ## Adding a game
 

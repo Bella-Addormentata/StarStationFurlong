@@ -18,7 +18,9 @@
  * Every tarball is checked against the sha512 the registry publishes for
  * it, and against the one pinned in PINNED below where there is one (what
  * a release ships). release.yml sets EJS_REQUIRE_PIN=1, which refuses any
- * package without a pin, so a release carries exactly those bytes.
+ * package without a pin, or without the commit it was built from in
+ * emulatorjs-sources.json, so a release carries exactly those bytes and
+ * can name their source.
  *
  * Everything lands in a staging directory first — under public/emulatorjs/
  * itself, so the final move is a rename on one filesystem and not a copy
@@ -47,11 +49,14 @@
  * each core carries its own inside its archive (license.txt; stella2014's
  * carries none), and public/arcade/licenses/ has them as text. FBNeo,
  * MAME 2003-Plus, Snes9x and Genesis Plus GX forbid commercial use.
- * NOTICE.txt, written beside the engine, names what was fetched and where
- * its source lives. Release builds ship every default core (release.yml).
+ * NOTICE.txt, written beside the engine, names what was fetched and the
+ * commit each part was built from (emulatorjs-sources.json). Release builds
+ * ship every default core (release.yml), and each release carries all of
+ * that source too, as emulatorjs-<version>-source.tar.xz beside the
+ * installers (pack-emulatorjs-source.mjs packs it).
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
@@ -91,6 +96,9 @@ const PINNED = {
 };
 const cores = (process.env.EJS_CORES ? process.env.EJS_CORES.split(',') : DEFAULT_CORES)
   .map((c) => c.trim()).filter(Boolean);
+/** The commit each part of a pinned version was built from. */
+const sources = JSON.parse(readFileSync(join(here, 'emulatorjs-sources.json'), 'utf8'));
+const sourced = sources.version === version;
 const log = (s) => console.log(`[fetch-emulatorjs] ${s}`);
 /** A failure is thrown, not exited on: the cleanup below must run first
  *  (process.exit would skip the `finally`, leaving staging behind). */
@@ -178,6 +186,12 @@ const staging = mkdtempSync(join(root, '.staging-'));
  *  tree could not be put back after a failed swap (it is at dest.prev). */
 let installed = '';
 try {
+  if (process.env.EJS_REQUIRE_PIN === '1') {
+    if (!sourced) fail(`no source is pinned for EmulatorJS ${version} (EJS_REQUIRE_PIN=1): emulatorjs-sources.json is for ${sources.version}`);
+    for (const core of cores) {
+      if (!sources.cores[core]) fail(`core ${core} has no source pinned (EJS_REQUIRE_PIN=1): add the commit it was built from to emulatorjs-sources.json`);
+    }
+  }
   log(`engine: @emulatorjs/emulatorjs@${version} from ${registry} …`);
   const engine = await fetchPackage('@emulatorjs/emulatorjs');
   let engineFiles = 0;
@@ -217,7 +231,7 @@ try {
       put(join(coresDir, file), bytes);
       if (file.endsWith('.data')) total += bytes.length;
     }
-    fetched.push(pkg);
+    fetched.push({ ...pkg, core });
     log(`  ${core}: ${pkg.spec}`);
   }
   // Check the staging tree before anything is swapped in.
@@ -228,6 +242,12 @@ try {
     }
   }
   if (!existsSync(join(staging, 'loader.js'))) fail('loader.js missing from the staging tree');
+  /** Where a core's source is: the commit it was built from, else its repository. */
+  const sourceOf = (p) => {
+    const s = sourced ? sources.cores[p.core] : null;
+    if (s) return `, built from ${s.repo} at ${s.commit}`;
+    return p.repository ? `, source ${p.repository.replace(/^git\+/, '').replace(/\.git$/, '')}` : '';
+  };
   writeFileSync(join(staging, 'NOTICE.txt'), [
     'EmulatorJS for the arcade cabinet, as scripts/fetch-emulatorjs.mjs fetched it',
     `from ${registry}. Each package's sha512 is the one the registry publishes.`,
@@ -235,17 +255,30 @@ try {
     `Engine: ${engine.spec} (${engine.integrity})`,
     '  EmulatorJS, GPL-3.0: the licence text is LICENSE, beside this file. Its',
     '  scripts are here unminified, under src/; its repository is',
-    `  https://github.com/EmulatorJS/EmulatorJS (tag v${version}). emulator.min.js and`,
-    '  emulator.min.css are those scripts and emulator.css, joined as its',
-    '  minify/index.js joins them but not minified. The helpers under compression/',
-    '  are compiled builds EmulatorJS ships (7z, zip and RAR extractors).',
+    `  https://github.com/EmulatorJS/EmulatorJS (tag v${version}${sourced ? `, commit ${sources.engine.commit}` : ''}).`,
+    '  emulator.min.js and emulator.min.css are those scripts and emulator.css,',
+    '  joined as its minify/index.js joins them but not minified. The helpers under',
+    '  compression/ are compiled builds EmulatorJS ships (7z, zip and RAR extractors).',
     '',
     'Cores: each <core>-*.data is an archive holding a RetroArch build of a',
     '  libretro core, its source repository (core.json) and its licence',
     "  (license.txt; stella2014's archive has none). EmulatorJS builds them with",
     '  https://github.com/EmulatorJS/build.',
-    ...fetched.map((p) => `  ${p.spec} (${p.integrity})${p.repository ? `, source ${p.repository.replace(/^git\+/, '').replace(/\.git$/, '')}` : ''}`),
+    ...fetched.map((p) => `  ${p.spec} (${p.integrity})${sourceOf(p)}`),
     '',
+    ...(sourced ? [
+      'Source: each core above is linked with RetroArch, built from',
+      `  ${sources.frontend.repo} at ${sources.frontend.commit},`,
+      `  by EmulatorJS's build scripts, ${sources.build.repo} at`,
+      `  ${sources.build.commit}. A Star Station Furlong release carries`,
+      `  all of that source as emulatorjs-${version}-source.tar.xz beside its installers`,
+      '  (scripts/pack-emulatorjs-source.mjs packs it; its README.txt lists every commit).',
+      '',
+    ] : [
+      `Source: no commits are pinned for EmulatorJS ${version} (scripts/emulatorjs-sources.json`,
+      `  is for ${sources.version}); each repository above has its source.`,
+      '',
+    ]),
   ].join('\n'));
   // The swap: the old install moves aside, the new one moves in (a rename
   // on the same filesystem), the old one goes. A failure of the second

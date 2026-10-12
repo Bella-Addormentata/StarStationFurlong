@@ -488,17 +488,91 @@ jobs:
               core.info(`Uploaded ${a.name} (${data.length} bytes)`);
             }
 
+  # ── Stage 2c: the emulator's source, attached to the same draft ──────────
+  # Release builds carry EmulatorJS and eleven libretro cores (step 4 above).
+  # Most of them are GPL and mgba is MPL, which ask whoever ships them to
+  # offer their exact source too, and the plainest way is from the same
+  # place: this packs the commits each part was built from
+  # (scripts/emulatorjs-sources.json) into emulatorjs-<version>-source.tar.xz,
+  # about 123 MB, and attaches it beside the installers. finalize-release
+  # waits for it, so no release goes out without it. A frontend that fetches
+  # no EmulatorJS has nothing to pack; one that fetches it but has no way to
+  # pack its source fails here.
+  publish-emulator-source:
+    needs: create-release
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 📥 Checkout repository (the release commit)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.create-release.outputs.sha }}
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: 📦 Pack the emulator's source (${{ env.RELEASE_FRONTEND }})
+        shell: bash
+        run: |
+          cd "$RELEASE_FRONTEND"
+          scripts=" $(node -p "Object.keys(require('./package.json').scripts ?? {}).join(' ')") "
+          case "$scripts" in
+            *" pack:emulatorjs-source "*)
+              EJS_SOURCE_OUT="$RUNNER_TEMP/emulatorjs-source" npm run pack:emulatorjs-source ;;
+            *" fetch:emulatorjs "*)
+              echo "::error::$RELEASE_FRONTEND ships EmulatorJS (fetch:emulatorjs) but has no pack:emulatorjs-source to pack its source."
+              exit 1 ;;
+            *)
+              echo "$RELEASE_FRONTEND ships no EmulatorJS: no source to pack." ;;
+          esac
+
+      - name: ⬆️ Upload the source archive to the shared draft release
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const release_id = Number('${{ needs.create-release.outputs.release_id }}');
+            const dir = path.join(process.env.RUNNER_TEMP, 'emulatorjs-source');
+            const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('-source.tar.xz')) : [];
+            // A re-run of this job finds its earlier upload on the draft: replace it.
+            const earlier = await github.paginate(github.rest.repos.listReleaseAssets, { owner, repo, release_id, per_page: 100 });
+            for (const name of files) {
+              for (const a of earlier.filter((a) => a.name === name)) {
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: a.id });
+                core.info(`Removed an earlier ${name}`);
+              }
+              const data = fs.readFileSync(path.join(dir, name));
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id,
+                name,
+                data,
+                headers: {
+                  'content-type': 'application/x-xz',
+                  'content-length': data.length,
+                },
+              });
+              core.info(`Uploaded ${name} (${data.length} bytes)`);
+            }
+
   # ── Stage 3: publish the draft ONLY when every artifact is attached ──────
   # This repository has IMMUTABLE releases: publishing freezes the asset list
   # permanently, so publishing mid-run bricks the version (v0.20.0 was lost
   # exactly this way — published while builds were still uploading, leaving an
   # empty, undeletable release). Never publish the draft manually; this job
-  # flips it once all installer jobs and the node asset are in. If anything
-  # fails upstream, the draft stays a draft and the tag can be re-run safely —
-  # re-run the failed run, or dispatch the workflow with the same `tag` (an
-  # existing tag is reused, never moved; the stale draft is swept above).
+  # flips it once all installer jobs, the node asset and the emulator's source
+  # are in. If anything fails upstream, the draft stays a draft and the tag
+  # can be re-run safely — re-run the failed run, or dispatch the workflow
+  # with the same `tag` (an existing tag is reused, never moved; the stale
+  # draft is swept above).
   finalize-release:
-    needs: [create-release, publish-tauri-binaries, publish-p2p-node]
+    needs: [create-release, publish-tauri-binaries, publish-p2p-node, publish-emulator-source]
     permissions:
       contents: write
     runs-on: ubuntu-22.04
