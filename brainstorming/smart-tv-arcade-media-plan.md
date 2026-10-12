@@ -80,7 +80,7 @@ the sources that fail have to say so on the screen.
 | Shared switch state | Whole-value LWW records per item, shape-checked reads, per-key subscribe, owner-predicate seam | `partyDoc.ts` (`speaker:<itemId>`, `setPartyHostPredicate`) |
 | Single-writer clocks | The operator stamps absolute deadlines; others render `deadline − localNow`; heartbeat 3 s, stale at 9 s — wall clocks compared across devices, so a precedent for the schedule's absolute `startAt` (§3.1 accepts that skew) and NOT for liveness, which §3.1 takes from the pusher row below | `croupier.ts` (`isCroupierLive`) |
 | A renewable lease, liveness judged by the renewals a page saw | Operator lease: renew every 3 s, lapse after 8 s. Its CLAIM policy is the pusher's own — owner-only, and a 60 s split window before another device takes over — and is NOT what the TV reuses: the remote's claim policy is distinct (§3.2): anyone takes a free or lapsed remote, at once, no owner gate | `pusherCroupier.ts` |
-| Per-frame unreliable lane | 13-byte datagrams, relayed content-blind to every room member; 2-bit lane kind, one kind (3) still free | `network/protocol.ts`; `ssf-p2p-node/src/main.rs` accepts only `datagram.len() == 13` from the browser |
+| Per-frame unreliable lane | 13-byte datagrams, relayed content-blind to every room member; 2-bit lane kind, ALL FOUR TAKEN — kind 3 by Insatiable Alligators (#185), and the arcade's own ticks a subtype of kind 1 behind a flag bit and a NaN `x` — so a further game needs a subtype, never a kind, and anything longer than 13 bytes needs the extended datagram of §9, told apart by length alone | `network/protocol.ts` (`TICK_KIND_ALLIGATORS`), `arcadeNet.ts`; `ssf-p2p-node/src/main.rs` accepts only `datagram.len() == 13` from the browser |
 | Reliable lane | JSON envelopes with base64 payloads (`ysync`); `'asset'` kind declared, unimplemented; no `iroh-blobs` in the node | `network/YjsSync.ts`, `protocol.ts` |
 | Fan-out | The hub relays ticks and control frames to the room (M5), with heartbeat pruning and a signed control plane (`graft`/`prune`/`px`/`ihave`/`iwant`) | `main.rs` |
 | Screens | Live `CanvasTexture` planes (wall computer at ~1 Hz, the air-hockey scoreboard). No iframe, CSS3D, `VideoTexture`, WebCodecs, WebRTC or `getUserMedia` anywhere | `furniture.ts`, `devices.ts` |
@@ -1993,11 +1993,13 @@ the domain out — where the
 tenure nonce is minted fresh by P1 as it grants the seat and carried in the
 seat record, so a renewed seat or another cabinet is another key even for
 the same two identities on the same lane in the same room epoch — and each
-kind-3 input carries a strictly increasing sequence number and a
-keyed-BLAKE3 MAC under that key over the whole canonical frame: sub-kind,
+P2 input (an extended datagram, below) carries a strictly increasing sequence number and a
+keyed-BLAKE3 MAC under that key over the whole canonical frame: the ext byte,
 sequence and payload, nothing an input says left outside it. The frame is
-fixed to the byte: `[kind 3 | sub-kind: 1 B][len: 1 B, counting the
-tag][seq: 4 B unsigned little-endian][input: 13 B]` (the sequence in the
+fixed to the byte: `[ext: 1 B][len: 1 B, counting the
+tag][seq: 4 B unsigned little-endian][input: 13 B]` (the ext byte the
+extension's own — bits 7–6 set to `0b11` as a marker, bits 0–5 the
+sub-kind — and the sequence in the
 tick codec's byte order, `protocol.ts`); the MAC is `blake3::keyed_hash` under the
 32-byte session key over exactly those nineteen bytes, truncated to its
 first 16 bytes and appended — a 128-bit tag (BLAKE3's output is a PRF, so
@@ -2016,14 +2018,31 @@ bytes become thirty-five; at 60 Hz that is 17 kbps, nothing). Thirty-five bytes 
 lane as it is: browser ingress takes exactly 13-byte datagrams, and the
 mesh relays only the 13-, 14- and 22-byte frames with a 13-byte tick inside
 (`ssf-p2p-node/src/main.rs`, the datagram arms) — everything else is
-dropped on the floor. So the extended datagram is a prerequisite in its own
-right, landed as one change across the four places that read a tick, in
+dropped on the floor. And the lane has no kind to spare: all four 2-bit
+kinds are taken (kind 3 by Insatiable Alligators, `TICK_KIND_ALLIGATORS`
+in `protocol.ts`; the arcade's own ticks are a subtype of kind 1 behind a
+flag bit and a NaN `x`, `arcadeNet.ts`). So the extended datagram is a
+prerequisite in its own right — a VARIABLE-LENGTH format told apart from
+every legacy tick by its LENGTH and by nothing else, reusing no kind —
+landed as one change across the four places that read a tick, in
 two shapes as today's tick already has: the browser sends its node a bare
-`[kind 3 | sub-kind][len][payload ≤ 64 B]` and nothing else, and the node —
+`[ext: 1 B][len: 1 B][payload]` with the payload 12 to 64 bytes and
+nothing else — 14 to 66 bytes, never a legacy tick's 13 — and the node —
 as it does for the 13-byte tick — mints the lane id from the connection and
-the TTL itself and wraps the mesh frame `[TTL][8B origin lane id][kind 3 |
-sub-kind][len][payload]`, so a browser never chooses routing or authorship
-metadata, and ingress rejects a frame that carries any. Negotiated per link
+the TTL itself and wraps the mesh frame `[TTL][8B origin lane id][ext][len][payload]`
+— 23 to 75 bytes, never the 13, 14 or 22 of a legacy frame — so a browser
+never chooses routing or authorship metadata, and ingress rejects a frame
+that carries any. A receiver checks `len` against the bytes actually
+present and against the 12-to-64 range before anything else, a frame
+that fails either dropped and charged like a malformed one; the ext byte
+is the extension's own — bits 0–5 the sub-kind, bits 7–6 set to `0b11`
+as a marker — and no 13-byte parser ever reads it, since the length
+decides first on every hop and a legacy peer, which drops unknown
+lengths today, never reads a kind out of it. The twelve-byte floor costs
+the P2 input nothing (its payload is 33 bytes) and is what keeps the two
+formats apart on one link: a capability says a peer understands the
+extension and nothing about which format a given datagram is, so the
+lengths must. Negotiated per link
 by a capability on the M5 control plane; ingress accepts it only from a
 browser that announced it, the relay forwards it only to links that did —
 and under packet and byte budgets enforced BEFORE the dedup hash and the
@@ -2054,7 +2073,7 @@ dropped before P1 ever saw its MAC fail; loop suppression keys on the
 bytes, and the sequence is enforced by P1 alone, after the MAC verifies.
 Local delivery hands it to the page as its own message, and a legacy peer
 is never sent one and goes on dropping unknown lengths as it does today. And then the S3 mapping from that proven key to the player
-holding the seat. P1 accepts kind-3 inputs only
+holding the seat. P1 accepts extended-datagram inputs only
 from a lane whose proven key is the P2 seat's identity, and only inputs
 that key's session authenticates. Lockstep stays the upgrade for games
 where lag matters.
