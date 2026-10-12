@@ -13,6 +13,7 @@ import {
   jarLevel,
   latestFaucetStatus,
   markFaucetPending,
+  openFaucetRoom,
   parseFaucetReply,
   setFaucetReply,
   type FaucetStatus,
@@ -157,6 +158,7 @@ describe('faucet dish: per-room store', () => {
   it('keeps a pending take until the node reports the gift landed or the claim settled, never on the clock', () => {
     const room = 'home-store-1';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     expect(latestFaucetStatus(room)).toBeNull();
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true, snapshot: 4 }) });
     expect(latestFaucetStatus(room)?.canClaim).toBe(true);
@@ -188,6 +190,7 @@ describe('faucet dish: per-room store', () => {
   it('keeps a pending give while the node says the spend is settling, clears it when settled or refused', () => {
     const room = 'home-store-2';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 10 }) });
     markFaucetPending(room, 'give', 1);
     // The give reply: coins parked, the spend settling.
@@ -230,6 +233,7 @@ describe('faucet dish: per-room store', () => {
   it('takes the floor from a give reply answered after a newer poll, without filing the older snapshot', () => {
     const room = 'home-store-5';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 10 }) });
     markFaucetPending(room, 'give', 1);
     // The 20 s poll captured after the push (12) answers before the give reply (11).
@@ -256,6 +260,7 @@ describe('faucet dish: per-room store', () => {
   it('settles a dropped spend from the node\'s barrier when the status read after the push failed', () => {
     const room = 'home-store-6';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 30 }) });
     markFaucetPending(room, 'give', 1);
     // The give went out, but the node's status read right after it failed: the
@@ -285,6 +290,7 @@ describe('faucet dish: per-room store', () => {
   it('ties a take/give reply to its own request: an earlier action\'s late reply or refusal leaves the one pending now alone', () => {
     const room = 'home-store-7';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 40 }) });
     // GIVE #1 (request seq 1): its reply sets the floor, the next poll shows it settled.
     markFaucetPending(room, 'give', 1);
@@ -324,6 +330,7 @@ describe('faucet dish: per-room store', () => {
   it('keeps a give pending when the gateway did not answer the push, says so, and lets the node settle it', () => {
     const room = 'home-store-8';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 5_000n, walletSpendableMojos: 5_000n, snapshot: 50 }) });
     markFaucetPending(room, 'give', 1);
     expect(faucetPendingUnanswered(room)).toBeNull();
@@ -348,6 +355,7 @@ describe('faucet dish: per-room store', () => {
   it('keeps the newest snapshot by the node\'s numbering, whatever order the replies arrive in', () => {
     const room = 'home-store-4';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true, snapshot: 7 }) });
     // The node captured the post-claim read as snapshot 9 and an older poll as
     // 8 — the poll was SENT first but served second, or simply answered late.
@@ -366,6 +374,7 @@ describe('faucet dish: per-room store', () => {
   it('drops a pending take at once when the request never reached the node, and says why', () => {
     const room = 'home-store-3';
     clearFaucetRoom(room);
+    openFaucetRoom(room);
     markFaucetPending(room, 'claim', 1);
     expect(faucetPending(room)).toBe('claim');
     failFaucetRequest(room, 'claim', 1, new Error('no connection to your node'));
@@ -375,5 +384,62 @@ describe('faucet dish: per-room store', () => {
     setFaucetReply(room, { op: 'status', ok: true, status: status() });
     expect(latestFaucetError(room)).toBeNull();
     clearFaucetRoom(room);
+  });
+
+  it('reads a refusal the node issued before parsing the request (op "?") as the action\'s own when it carries its seq', () => {
+    const room = 'home-store-9';
+    clearFaucetRoom(room);
+    openFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true, snapshot: 60 }) });
+    markFaucetPending(room, 'claim', 7);
+    // The node refuses a request before reading its op (not its local browser,
+    // or not JSON) under op "?". A status poll's refusal (another seq) shows on
+    // the screen — the whole dish is refused then — but is not this action's.
+    setFaucetReply(room, { op: '?', ok: false, error: "faucet requests are the LOCAL browser's alone" }, 6);
+    expect(faucetPending(room)).toBe('claim');
+    expect(latestFaucetError(room)).toBe("faucet requests are the LOCAL browser's alone");
+    // THIS request's refusal, by its seq: the TAKE is over and the buttons return.
+    setFaucetReply(room, { op: '?', ok: false, error: "faucet requests are the LOCAL browser's alone" }, 7);
+    expect(faucetPending(room)).toBeNull();
+    // Under the action's own op the seq decides the same way.
+    markFaucetPending(room, 'give', 8);
+    setFaucetReply(room, { op: '?', ok: false, error: 'bad request' });
+    expect(faucetPending(room)).toBe('give');
+    setFaucetReply(room, { op: 'give', ok: false, error: 'your wallet is empty' }, 8);
+    expect(faucetPending(room)).toBeNull();
+    clearFaucetRoom(room);
+  });
+
+  it('files replies, request failures and pending actions only for the open room, so a room left mid-flight gets nothing back', () => {
+    const room = 'home-store-10';
+    clearFaucetRoom(room);
+    openFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, canClaim: true, snapshot: 70 }) });
+    markFaucetPending(room, 'claim', 1);
+    expect(latestFaucetStatus(room)?.snapshot).toBe(70);
+    // The room is left: its state goes and the gate closes, synchronously.
+    clearFaucetRoom(room);
+    expect(latestFaucetStatus(room)).toBeNull();
+    // A poll answered during the leave's flush, the failure of a request that
+    // could not leave, and a click landing late all resolve afterwards: none
+    // puts anything back for the departed room.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ walletMojos: 0n, snapshot: 71 }) });
+    failFaucetRequest(room, 'claim', 1, new Error('stream closed'));
+    markFaucetPending(room, 'give', 2);
+    expect(latestFaucetStatus(room)).toBeNull();
+    expect(latestFaucetError(room)).toBeNull();
+    expect(faucetPending(room)).toBeNull();
+    // The next room opened is the only one filed; the departed room's replies
+    // still go nowhere.
+    const next = 'home-store-11';
+    clearFaucetRoom(next);
+    openFaucetRoom(next);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ snapshot: 72 }) });
+    setFaucetReply(next, { op: 'status', ok: true, status: status({ snapshot: 1 }) });
+    failFaucetRequest(room, 'status', 3, new Error('no connection'));
+    expect(latestFaucetStatus(room)).toBeNull();
+    expect(latestFaucetError(room)).toBeNull();
+    expect(latestFaucetStatus(next)?.snapshot).toBe(1);
+    clearFaucetRoom(next);
   });
 });

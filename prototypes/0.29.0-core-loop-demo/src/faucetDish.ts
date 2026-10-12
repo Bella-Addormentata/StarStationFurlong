@@ -242,9 +242,32 @@ const pending = new Map<string, Pending>();
 /** The node's snapshot number of the newest status filed per room (see setFaucetReply). */
 const latestSnapshot = new Map<string, number>();
 const listeners = new Set<() => void>();
+/** The room whose node session this store listens to right now (see openFaucetRoom). */
+let openRoom: string | null = null;
 
 function notify(): void {
   for (const cb of listeners) cb();
+}
+
+/** Open `roomId` to its node's replies. main.ts opens the room at join, before
+ *  the connect (the id is known synchronously, so the first poll's reply is
+ *  filed), and closes it at the top of a leave, before any await. Only the
+ *  open room's replies, the failures of its requests and its pending actions
+ *  are filed: a reply still in flight when the room is left (a poll answered
+ *  during the leave's flush), or a request that fails to leave after it (a
+ *  stream that could not be opened, rejecting during the leave), would
+ *  otherwise put state back for a room already left — a stale balance, a stale
+ *  TAKING… line, an error for the departed room. The gate lives here, in the
+ *  one store every reply and failure goes through, so no caller can pass it
+ *  by (#245 review, rounds 14 and 20). */
+export function openFaucetRoom(roomId: string): void {
+  openRoom = roomId;
+}
+
+/** Close the gate, whatever room is open: nothing is filed until the next
+ *  openFaucetRoom. Synchronous, so it takes effect before a leave's flush. */
+export function closeFaucetRoom(): void {
+  openRoom = null;
 }
 
 export function latestFaucetStatus(roomId: string): FaucetStatus | null {
@@ -265,6 +288,7 @@ export function faucetPending(roomId: string): FaucetOp | null {
 }
 
 export function markFaucetPending(roomId: string, op: FaucetOp, seq: number): void {
+  if (roomId !== openRoom) return;
   pending.set(roomId, { op, seq, floor: null, unanswered: null });
   notify();
 }
@@ -312,19 +336,30 @@ export function faucetPendingUnanswered(roomId: string): string | null {
  *  older seq: its status is filed like any other (the snapshot ordering sorts
  *  it), but it says nothing about the action pending now, whose floor it would
  *  otherwise set from a snapshot already on file and clear it at once; a late
- *  refusal of it is not this action's refusal either (#245 review, round 14). */
+ *  refusal of it is not this action's refusal either (#245 review, round 14).
+ *  A refusal the node issued before it could read the op — `op: "?"`, for a
+ *  request it could not parse or one from a session that is not its local
+ *  browser — carries the request's seq like any reply, so with the pending
+ *  action's seq it is that action's refusal and clears it (round 20); with
+ *  another seq (a status poll's) it is shown, since the whole dish is refused
+ *  then, but the action stands.
+ *
+ *  Only the open room's replies are filed (see openFaucetRoom); any other
+ *  room's are dropped here, whatever the caller. */
 export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
+  if (roomId !== openRoom) return;
   const p = pending.get(roomId);
+  // This action's own reply: the one echoing its seq, under its op or under
+  // '?' (refused before the op was read).
   const own: Pending | null =
-    p !== undefined && p.op === reply.op && (reply.op === 'claim' || reply.op === 'give') && seq !== undefined && seq === p.seq
-      ? p
-      : null;
+    p !== undefined && seq !== undefined && seq === p.seq && (reply.op === p.op || reply.op === '?') ? p : null;
   if (!reply.ok) {
-    if (reply.op === 'claim' || reply.op === 'give') {
-      // A refusal of some other request — an earlier action's, answered late —
-      // neither clears the pending action nor shows as its error.
-      if (!own) return;
+    if (own) {
       pending.delete(roomId);
+    } else if (reply.op === 'claim' || reply.op === 'give') {
+      // A refusal of some other action — an earlier one's, answered late —
+      // neither clears the pending action nor shows as its error.
+      return;
     }
     lastError.set(roomId, reply.error ?? 'the node refused');
     notify();
@@ -374,7 +409,8 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
 
 /** A request never reached the node (no connection, a failed stream): no spend
  *  was made, so the pending TAKE/GIVE it was for (`seq`) is dropped at once,
- *  and the screen says why. */
+ *  and the screen says why. Gated like a reply: a request whose failure
+ *  resolves after its room was left files nothing (see openFaucetRoom). */
 export function failFaucetRequest(roomId: string, op: FaucetOp, seq: number, reason: unknown): void {
   const why = reason instanceof Error ? reason.message : String(reason ?? 'unknown error');
   setFaucetReply(roomId, { op, ok: false, error: `the request did not reach your node (${why})` }, seq);
@@ -387,8 +423,10 @@ export function subscribeFaucet(cb: () => void): () => void {
   };
 }
 
-/** Forget a room's dish state (leaving the room / tests). */
+/** Forget a room's dish state, and close it to replies if it is the open room
+ *  (leaving the room / tests). */
 export function clearFaucetRoom(roomId: string): void {
+  if (openRoom === roomId) openRoom = null;
   latest.delete(roomId);
   lastError.delete(roomId);
   pending.delete(roomId);

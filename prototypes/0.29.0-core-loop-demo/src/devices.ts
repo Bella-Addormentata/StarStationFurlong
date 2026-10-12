@@ -4671,7 +4671,10 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
   let copied = false;
 
   /** Ask the node for a status; a request that cannot leave is shown as such
-   *  (the screen otherwise reads "READING THE CHAIN…" with no node at all). */
+   *  (the screen otherwise reads "READING THE CHAIN…" with no node at all).
+   *  A failure resolving after the room was left files nothing: the store's
+   *  gate drops it, as it drops a late reply (faucetDish.ts, openFaucetRoom;
+   *  #245 review, round 20). */
   const poll = (roomId: string): void => {
     const { seq, sent } = deps.request('status');
     sent.catch((e: unknown) => failFaucetRequest(roomId, 'status', seq, e));
@@ -4769,6 +4772,10 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       // its floor, settles or refuses it (#245 review, round 14).
       const { seq, sent } = deps.request(op, amount);
       markFaucetPending(roomId, op, seq);
+      // The failure of a request that never left drops the pending action (no
+      // spend was made); one resolving after the room was left is dropped by
+      // the store's gate instead, so nothing here can revive a departed
+      // room's state (round 20).
       sent.then(
         () => window.setTimeout(() => poll(roomId), 2_000),
         (e: unknown) => failFaucetRequest(roomId, op, seq, e),

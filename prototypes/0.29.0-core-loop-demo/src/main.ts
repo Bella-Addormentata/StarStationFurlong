@@ -13,7 +13,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
-import { clearFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
+import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
 import { roomIsPublicSpace } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
@@ -708,11 +708,6 @@ let pendingBootstrapOverride: RoomBootstrap | null = null;
  *  last-room resume or the default station (review of #156). */
 let urlSeedImport: Promise<void> | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
-/** 🥣 The room whose faucet replies are accepted right now: set at join, before
- *  the connect, and cleared synchronously at the top of a leave, so a reply
- *  still in flight when the room is left (a status poll answered during the
- *  leave's flush) cannot repopulate the state clearFaucetRoom just dropped. */
-let faucetRepliesFor: string | null = null;
 /** 🆕 #79 P4: guards a single home-fallback if resuming the last room fails. */
 let resumeRetried = false;
 /** 🛰️ "Is this a first run" — snapshotted before anything can lazily mint the
@@ -1810,7 +1805,10 @@ async function joinRoomAtEpoch(
   // the right room; sequential re-joins overwrite correctly. The bootstrap
   // roomId, NOT the editable display name.
   (window as any).__ssfRoomId = boot.roomId;
-  faucetRepliesFor = boot.roomId;
+  // 🥣 The faucet dish's store listens to this room's node from here on
+  // (before the connect await, so the first poll's reply is filed); the leave
+  // closes it again before anything else (faucetDish.ts, openFaucetRoom).
+  openFaucetRoom(boot.roomId);
   updateHUDNode("ONLINE", "#00e676");
   // Connect with a cert-refresh retry on the LOCAL loopback dial: the node's WT
   // cert regenerates every launch, so a stale hash fails the handshake — on
@@ -3238,9 +3236,10 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // 🥣 The faucet dish's last status, error and pending TAKE/GIVE belong to
   // this room's node session: forget them, so a revisit reads the chain
   // afresh instead of showing stale balances or a stale TAKING… line. The
-  // reply gate closes first (synchronously, before any await below), so a
-  // reply still in flight cannot put the state back once it is cleared.
-  faucetRepliesFor = null;
+  // store's gate closes first (synchronously, before any await below), so a
+  // reply still in flight, or a request failing to leave during the flush,
+  // cannot put the state back once it is cleared (faucetDish.ts).
+  closeFaucetRoom();
   {
     const leavingRoomId = activeBootstrap?.roomId ?? networkProvider.getBootRecord()?.roomId;
     if (leavingRoomId) clearFaucetRoom(leavingRoomId);
@@ -9915,9 +9914,9 @@ async function init() {
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
   networkProvider.onFaucetReply((env: { payload?: string; room?: string; seq?: number }) => {
     if (typeof env.payload !== "string" || typeof env.room !== "string") return;
-    // Only the room joined right now: a reply for a room already left (or
-    // never joined) is dropped, not filed.
-    if (env.room !== faucetRepliesFor) return;
+    // Only the room open right now is filed: the store drops a reply for a
+    // room already left (or never joined) at its gate (openFaucetRoom), the
+    // same gate a failed request's report passes.
     const reply = parseFaucetReply(env.payload);
     // A status carries the node's snapshot number, so an older look answered
     // late cannot overwrite a newer one; the echoed `seq` ties a take/give
