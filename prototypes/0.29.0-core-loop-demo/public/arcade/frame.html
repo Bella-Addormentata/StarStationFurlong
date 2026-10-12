@@ -318,16 +318,22 @@
               // sometimes drops the load outright (measured on fceumm: no
               // sign of it 120 iterations on), and asking again lands it —
               // so it asks again every LOAD_RETRY iterations until the
-              // state matches (17 to 57 iterations in the runs), and gives
-              // up after LOAD_TRIES, about four seconds. The frames
+              // state matches (17 to 57 iterations in the runs). The frames
               // run while it waits ran on the old state, which the load
-              // throws away.
+              // throws away. After LOAD_TRIES, about four seconds, it gives
+              // up: it holds where it is and says the load failed
+              // (`matches: false`), for the page to hand it a fresh one.
               loadTries += 1;
               var cur = stateNow();
               if (!cur) return;
               var h = stateHash(cur);
-              if (h !== snap.hash && loadTries < LOAD_TRIES) {
-                if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+              if (h !== snap.hash) {
+                if (loadTries < LOAD_TRIES) {
+                  if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+                  return;
+                }
+                phase = 'waiting';
+                status({ loaded: snap.frame, hash: h, matches: false, tries: loadTries });
                 return;
               }
               offset = snap.frame - gm.getFrameNum();
@@ -337,7 +343,7 @@
               for (var k = 0; k < snap.held.length; k++) feed(snap.held[k][0], snap.held[k][1], snap.held[k][2]);
               for (var q in queue) if (+q < snap.frame) delete queue[q];
               phase = 'stalled';
-              status({ loaded: snap.frame, hash: h, matches: h === snap.hash, tries: loadTries });
+              status({ loaded: snap.frame, hash: h, matches: true, tries: loadTries });
               return;
             }
             var s = gm.getFrameNum() + offset;
