@@ -20,6 +20,10 @@ mod chia_lane;
 // reader and the P1 beat/hold watcher.
 #[cfg(feature = "chia-read")]
 mod chia_rooms;
+// #231 P6a: the node's contact key, contact cards, the address book and the
+// inbound-verified ledger — what finds a NODE on chain without a room key.
+#[cfg(feature = "chia-read")]
+mod chia_contact;
 #[cfg(feature = "chia-read")]
 mod chia_resolve;
 #[cfg(feature = "chia-read")]
@@ -272,11 +276,23 @@ pub struct MemberEntry {
     pub tier: u8,
     pub in_mesh: bool,
     pub hints: PeerHints,
+    /// #231 P6a: our contact card went out on this connection (once per
+    /// connection and room; the maintenance loop sends it in private rooms).
+    #[cfg(feature = "chia-read")]
+    pub card_sent: bool,
 }
 
 impl MemberEntry {
     fn new(conn: iroh::endpoint::Connection, tier: u8, in_mesh: bool, hints: PeerHints) -> Self {
-        Self { conn, last_seen: std::time::Instant::now(), tier, in_mesh, hints }
+        Self {
+            conn,
+            last_seen: std::time::Instant::now(),
+            tier,
+            in_mesh,
+            hints,
+            #[cfg(feature = "chia-read")]
+            card_sent: false,
+        }
     }
 }
 
@@ -371,6 +387,23 @@ pub struct HubState {
     /// so it is in the default build.
     #[cfg(feature = "chia-read")]
     pub chia_rooms: Mutex<HashMap<String, chia_rooms::ChiaRoomCap>>,
+    /// #231 P6a: this node's CONTACT KEY (`contact.key`) — what its per-node
+    /// presence is filed under; handed to private-room members as a signed card.
+    #[cfg(feature = "chia-read")]
+    pub contact_key: [u8; 32],
+    /// #231 P6a: the address book (`peers.json`): the contact and card keys of
+    /// the peers that handed us their card, and the rooms we met them in.
+    #[cfg(feature = "chia-read")]
+    pub peers: Mutex<chia_contact::PeerBook>,
+    /// #231 P6a: when this node last ACCEPTED an unsolicited direct inbound
+    /// connection, per address family — the measured half of the presence
+    /// record's reachability flags. Written by `run_iroh_listener` only.
+    #[cfg(feature = "chia-read")]
+    pub inbound_verified: Mutex<chia_contact::InboundVerified>,
+    /// #231 P6a: the chain peak the watcher saw last (0 = unknown yet): the
+    /// era clock for the inbound marks and the presence publisher.
+    #[cfg(feature = "chia-read")]
+    pub chia_peak: std::sync::atomic::AtomicU32,
     /// ⛓️🥣 The wallet key `SSF_CHIA_LANE=1` loaded at startup (publish build),
     /// so the faucet dish can TAKE (claim to our address) and GIVE (pay from our
     /// coin) on the local browser's request. `None` while publishing is off.
@@ -1319,6 +1352,35 @@ async fn main() -> Result<()> {
     let wt_endpoint = WtEndpoint::server(wt_config)
         .map_err(|e| anyhow!("Failed to bind wtransport server: {:?}", e))?;
 
+    // #231 P6a: the contact identity and the address book, loaded (or minted)
+    // beside the iroh key, and the room caps persisted by earlier runs so the
+    // watcher reads and the publisher writes for served rooms before any
+    // browser returns.
+    #[cfg(feature = "chia-read")]
+    let (contact_key, peer_book, restored_caps) = {
+        let ck = match chia_contact::load_or_create_contact_key(std::path::Path::new(chia_contact::CONTACT_KEY_FILE)) {
+            Ok(ck) => ck,
+            Err(e) => {
+                // A key that cannot be stored would change every start and make
+                // every card we hand out stale; say so and run with a key for
+                // this process only.
+                eprintln!("⛓️ ChiaHub contact: cannot load or create {}: {e} — using a key for this run only", chia_contact::CONTACT_KEY_FILE);
+                let mut ck = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ck);
+                ck
+            }
+        };
+        let book = chia_contact::PeerBook::load(std::path::Path::new(chia_contact::PEERS_FILE));
+        let caps: HashMap<String, chia_rooms::ChiaRoomCap> = chia_rooms::load_persisted_caps().into_iter().collect();
+        println!(
+            "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) restored · cards {}",
+            book.peers.len(),
+            caps.len(),
+            if chia_contact::share_card_enabled() { "shared in private rooms" } else { "not shared (SSF_CHIA_SHARE_CARD=0)" }
+        );
+        (ck, book, caps)
+    };
+
     let hub = Arc::new(HubState {
         rooms: Mutex::new(HashMap::new()),
         fingerprint: Mutex::new(fingerprint),
@@ -1330,7 +1392,15 @@ async fn main() -> Result<()> {
         dialing: Mutex::new(std::collections::HashSet::new()),
         reach: reach.clone(),
         #[cfg(feature = "chia-read")]
-        chia_rooms: Mutex::new(HashMap::new()),
+        chia_rooms: Mutex::new(restored_caps),
+        #[cfg(feature = "chia-read")]
+        contact_key,
+        #[cfg(feature = "chia-read")]
+        peers: Mutex::new(peer_book),
+        #[cfg(feature = "chia-read")]
+        inbound_verified: Mutex::new(chia_contact::InboundVerified::default()),
+        #[cfg(feature = "chia-read")]
+        chia_peak: std::sync::atomic::AtomicU32::new(0),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
     });
@@ -1666,11 +1736,14 @@ async fn handle_wt_connection_inner(
                                 // publish its addresses under it — or out-sequence the
                                 // local browser's caps for a room.
                                 if chia_rooms::cap_source_is_local(&remote_addr_inner) {
-                                    chia_rooms::ingest_room_cap(
+                                    if let Some(cap) = chia_rooms::ingest_room_cap(
                                         &hub_clone.chia_rooms,
                                         &envelope.room,
                                         &envelope.payload,
-                                    );
+                                    ) {
+                                        // #231 P6a: the cap outlives the process, beside the room doc.
+                                        chia_rooms::persist_room_cap(&envelope.room, &cap);
+                                    }
                                 } else {
                                     eprintln!(
                                         "⛓️ ChiaHub lane: ignoring a room cap from a non-loopback browser session ({remote_addr_inner}) — caps are the LOCAL browser's alone"
@@ -1949,6 +2022,13 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
             None => continue,
         };
 
+        // #231 P6a: how this Initial arrived — straight from an IP, or via a
+        // relay — and whether its source address was validated, read before
+        // the accept consumes the Incoming. The measured "inbound verified"
+        // flag below needs exactly these two facts.
+        #[cfg(feature = "chia-read")]
+        let inbound_path = (incoming_conn.remote_addr(), incoming_conn.remote_addr_validated());
+
         // Same per-client tolerance as run_wt_listener: a peer failing its
         // handshake must not tear down the swarm listener for everyone else.
         let accepting = match incoming_conn.accept() {
@@ -1967,6 +2047,8 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         };
         let remote_id = connection.remote_id();
         println!("🚀 Inbound P2P Swarm handshake from peer: {}", remote_id);
+        #[cfg(feature = "chia-read")]
+        note_inbound_verified(&hub, remote_id, &inbound_path);
 
         let hub_clone = hub.clone();
         let iroh_clone = endpoint.clone();
@@ -1976,6 +2058,40 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
                 eprintln!("⚠️ Swarm connection error with peer ({}): {:?}", remote_id, e);
             }
         });
+    }
+}
+
+/// #231 P6a: an accepted connection whose Initial came DIRECTLY (no relay) from
+/// a PUBLIC address, with that address validated, from a peer we were not
+/// dialing at the time, is proof that this node is reachable inbound on that
+/// address family — the only thing a presence record's flag may claim. A
+/// connection that arrived through a relay, from a LAN peer, or while our own
+/// hold-dial Initials had already opened the pinhole proves nothing and sets
+/// nothing. The mark carries the chain peak the watcher knows (0 when it has
+/// none yet), so the publisher can tell "this era" from "last era".
+#[cfg(feature = "chia-read")]
+fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::endpoint::IncomingAddr, bool)) {
+    let (addr, validated) = path;
+    let iroh::endpoint::IncomingAddr::Ip(sa) = addr else { return };
+    if !validated {
+        return;
+    }
+    let public = match sa.ip() {
+        std::net::IpAddr::V4(v4) => ipv4_is_public(v4),
+        std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
+    };
+    if !public || hub.dialing.lock().unwrap().contains(&remote_id) {
+        return;
+    }
+    let height = hub.chia_peak.load(std::sync::atomic::Ordering::Relaxed);
+    let now = chia_resolve::unix_now();
+    let first_this_era = hub.inbound_verified.lock().unwrap().note(sa.is_ipv6(), height, now);
+    if first_this_era {
+        println!(
+            "📡 inbound verified: an unsolicited direct {} connection from {} reached us — this era's presence record will say so",
+            if sa.is_ipv6() { "IPv6" } else { "IPv4" },
+            sa.ip()
+        );
     }
 }
 
@@ -2144,6 +2260,50 @@ async fn dial_peer_inner(
     // after the fast ladder gave up — the chain is an address book, never a pipe.
     #[cfg(feature = "chia-read")]
     {
+        // #231 P6a, FIRST: the target's PER-NODE presence, when its contact card
+        // is in the address book (we met it in a private room before). Found by
+        // the node's own key and the chain's era, whatever room this dial is
+        // for. A hold started here settles the dial either way: the room-keyed
+        // v1 record below would only repeat the same addresses.
+        let target_ck = hub.peers.lock().unwrap().ck_of(&target_str);
+        if let Some(ck) = target_ck {
+            match chia_resolve::resolve_presence_by_ck(&ck).await {
+                Ok(Some(rec)) => {
+                    let addrs = chia_public_dial_addrs(&rec.addrs);
+                    if addrs.is_empty() {
+                        println!("⛓️ ChiaHub rung-6: {target_str} found by contact key, but its presence record carries no public addr");
+                    } else {
+                        println!(
+                            "⛓️ ChiaHub rung-6: {target_str} found by contact key — {} public addr(s), holding the dial for {}s",
+                            addrs.len(),
+                            chia_watch::HOLD_WINDOW.as_secs()
+                        );
+                        let ok = hold_dial(
+                            hub.clone(),
+                            iroh_ep.clone(),
+                            room_id.clone(),
+                            target_pub_key,
+                            target_str.clone(),
+                            addrs,
+                            dial_tier,
+                            send.clone(),
+                        )
+                        .await;
+                        let now = chia_resolve::unix_now();
+                        let mut book = hub.peers.lock().unwrap();
+                        if ok {
+                            book.note_ok(&target_str, now);
+                        } else {
+                            book.note_fail(&target_str, now);
+                        }
+                        let _ = book.save(std::path::Path::new(chia_contact::PEERS_FILE));
+                        return;
+                    }
+                }
+                Ok(None) => println!("⛓️ ChiaHub rung-6: no presence record under {target_str}'s contact key this era or last"),
+                Err(e) => eprintln!("⛓️ ChiaHub rung-6 contact-key resolve error: {e:#}"),
+            }
+        }
         let chia_cap = hub.chia_rooms.lock().unwrap().get(&room_id).cloned();
         if let Some(cap) = chia_cap {
             if cap.may_read() {
@@ -2981,7 +3141,7 @@ struct IdsPayload {
 /// flooded, never merged) BEFORE the ysync relay. Kept as a single predicate so
 /// the reader loop's branch and any future sender agree on the set.
 fn is_control_kind(kind: &str) -> bool {
-    matches!(kind, "roster" | "mesh-join" | "graft" | "prune" | "px" | "ihave" | "iwant")
+    matches!(kind, "roster" | "mesh-join" | "graft" | "prune" | "px" | "ihave" | "iwant" | "contact")
 }
 
 /// Kinds this node speaks only with its own browser tabs (`cap` and `faucet`
@@ -3131,6 +3291,42 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
                 }
             }
         }
+        // #231 P6a: a peer's CONTACT CARD — its own, signed by its own key. The
+        // envelope author must be the connection peer (as for graft/prune:
+        // nobody hands out somebody else's card) and the card must name that
+        // same peer. Filed in the address book under this room; never relayed,
+        // never forwarded to the tabs (control kinds stop here).
+        #[cfg(feature = "chia-read")]
+        "contact" => {
+            if env.author.as_slice() != remote_id.as_bytes() {
+                eprintln!("🔒 CONTACT-DROP: card envelope not authored by the connection peer {remote_id}");
+            } else if let Ok(card) = serde_json::from_slice::<chia_contact::ContactCard>(&env.payload) {
+                match chia_contact::verify_card(&card) {
+                    Ok(verified) if verified.node_id == remote_id => {
+                        let changed = {
+                            let mut book = hub.peers.lock().unwrap();
+                            let changed = book.record_card(&verified, room_id);
+                            if changed {
+                                if let Err(e) = book.save(std::path::Path::new(chia_contact::PEERS_FILE)) {
+                                    eprintln!("⛓️ ChiaHub contact: could not save {}: {e}", chia_contact::PEERS_FILE);
+                                }
+                            }
+                            changed
+                        };
+                        if changed {
+                            println!(
+                                "📇 contact card from {} filed for room {room_id} — its presence is now findable by key",
+                                remote_id.to_string().chars().take(16).collect::<String>()
+                            );
+                        }
+                    }
+                    Ok(_) => eprintln!("🔒 CONTACT-DROP: card from {remote_id} names another node"),
+                    Err(e) => eprintln!("🔒 CONTACT-DROP from {remote_id}: {e}"),
+                }
+            } else {
+                eprintln!("🔒 CONTACT-DROP: malformed card from {remote_id}");
+            }
+        }
         // M5.3 link-state: graft/prune are about THIS direct link, so require the
         // signer to be the connection peer (a relay can't toggle someone else's
         // membership). Local in_mesh is authoritative for who WE eager-forward to.
@@ -3230,11 +3426,29 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
         neighbors: Vec<iroh::endpoint::Connection>,
         ihave_ids: Vec<MsgId>,
         graft: Vec<(PublicKey, PeerHints, u8)>,
+        /// #231 P6a: connected peers that have not had our contact card yet.
+        #[cfg(feature = "chia-read")]
+        cards: Vec<iroh::endpoint::Connection>,
     }
 
     loop {
         ticker.tick().await;
         let mut work: Vec<RoomWork> = Vec::new();
+        // #231 P6a: the rooms whose connected peers get our contact card — those
+        // KNOWN private (never a bundled or PUBLIC room, N8). Snapshotted before
+        // the rooms lock so the two locks are never nested.
+        #[cfg(feature = "chia-read")]
+        let sharing: std::collections::HashSet<String> = if chia_contact::share_card_enabled() {
+            hub.chia_rooms
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, cap)| cap.may_share_card())
+                .map(|(room, _)| room.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         {
             let now = std::time::Instant::now();
             let mut rooms = hub.rooms.lock().unwrap();
@@ -3304,6 +3518,22 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                     }
                 }
 
+                // #231 P6a: our card goes to every connected peer of a private room
+                // once per connection; marked sent here, under the lock, so a slow
+                // tick never sends it twice.
+                #[cfg(feature = "chia-read")]
+                let cards: Vec<iroh::endpoint::Connection> = if sharing.contains(room_id) {
+                    room.remote_peers
+                        .values_mut()
+                        .filter(|m| !m.card_sent)
+                        .map(|m| {
+                            m.card_sent = true;
+                            m.conn.clone()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let heartbeat_conns: Vec<iroh::endpoint::Connection> =
                     room.remote_peers.values().map(|m| m.conn.clone()).collect();
                 let neighbors: Vec<iroh::endpoint::Connection> =
@@ -3324,7 +3554,15 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                         room.candidates.len(),
                     );
                 }
-                work.push(RoomWork { room: room_id.clone(), heartbeat_conns, neighbors, ihave_ids, graft });
+                work.push(RoomWork {
+                    room: room_id.clone(),
+                    heartbeat_conns,
+                    neighbors,
+                    ihave_ids,
+                    graft,
+                    #[cfg(feature = "chia-read")]
+                    cards,
+                });
             }
         }
 
@@ -3332,6 +3570,17 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
         for w in work {
             for conn in &w.heartbeat_conns {
                 let _ = conn.send_datagram(HEARTBEAT_MAGIC.to_vec().into());
+            }
+            // #231 P6a: the contact card, node-signed like every control frame.
+            #[cfg(feature = "chia-read")]
+            if !w.cards.is_empty() {
+                let card = chia_contact::make_card(&hub.secret_key, &hub.contact_key, chia_resolve::unix_now());
+                if let Ok(payload) = serde_json::to_vec(&card) {
+                    for conn in &w.cards {
+                        send_control(&hub, conn, &w.room, "contact", 0, payload.clone()).await;
+                    }
+                    println!("📇 contact card sent to {} peer(s) in room {}", w.cards.len(), w.room);
+                }
             }
             // M5.4 lazy-pull adverts are OPT-IN (SSF_MESH_LAZYPULL=1). The deduped
             // TTL flood already converges state correctly on its own (the plan's

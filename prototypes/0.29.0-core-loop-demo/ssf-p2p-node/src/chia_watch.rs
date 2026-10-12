@@ -20,6 +20,14 @@
 //! N5′ (#231 first follow-up): cached addresses are re-dialed first; the chain
 //! is read only on the beat. `SSF_CHIA_WATCH=0` turns the watcher off.
 //!
+//! #231 P6a: the same beat and hold now serve the PER-NODE presence records
+//! (record v2): every peer whose contact card sits in `peers.json` has its own
+//! hints (this era and the last) read on the beat, and its freshest record is
+//! planned into holds in the private rooms it was met in. Our own record is
+//! read too, so seeing it confirm restarts the dance exactly as a room record
+//! did. The watcher also publishes the chain peak it saw (`hub.chia_peak`),
+//! the era clock for the inbound marks and the presence publisher.
+//!
 //! Pure pieces ([`BeatSchedule`], [`plan_holds`]) are unit-tested; the loop
 //! itself is thin glue over them, the reader and `main::hold_dial`.
 #![cfg(feature = "chia-read")]
@@ -90,6 +98,12 @@ impl BeatSchedule {
 
     pub fn forget(&mut self, room: &str) {
         self.last_read.remove(room);
+    }
+
+    /// Drop every schedule entry `gone` says is gone (P6a: peers that left the
+    /// address book, keyed `ck:<node id>`).
+    pub fn forget_where(&mut self, gone: impl Fn(&str) -> bool) {
+        self.last_read.retain(|key, _| !gone(key));
     }
 }
 
@@ -225,6 +239,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     let mut cache: HashMap<String, RoomCache> = HashMap::new();
     let shared = Arc::new(WatchShared::default());
     let mut peak_failure_logged = false;
+    // #231 P6a: per-node presence state — cursors per contact-key hint, the
+    // freshest record per peer, and the height our own record was last seen at.
+    let mut ck_cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
+    let mut node_cache: HashMap<String, FoundRecord> = HashMap::new();
+    let mut own_ck_height: u32 = 0;
     println!(
         "⛓️ ChiaHub watcher on: reads every {} blocks per room (×{} while connected), hold {}s × {}s, {} holds/room",
         sched.beat_blocks,
@@ -269,7 +288,13 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             })
             .collect();
         cursors.retain(|k, _| live_hints.contains(k));
-        if readable.is_empty() {
+        // #231 P6a: the peers whose contact cards we hold (node id, ck, rooms met in).
+        let peers = hub.peers.lock().unwrap().with_ck();
+        node_cache.retain(|node, _| peers.iter().any(|(n, _, _)| n == node));
+        sched.forget_where(|key| {
+            key.strip_prefix("ck:").is_some_and(|node| node != "self" && !peers.iter().any(|(n, _, _)| n == node))
+        });
+        if readable.is_empty() && peers.is_empty() {
             continue;
         }
 
@@ -277,6 +302,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         let peak = match chia_resolve::peak_height(&client).await {
             Some(h) => {
                 peak_failure_logged = false;
+                hub.chia_peak.store(h, std::sync::atomic::Ordering::Relaxed);
                 h
             }
             None => {
@@ -287,7 +313,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 0
             }
         };
-        for (room, room_key) in readable {
+        for (room, room_key) in readable.iter().cloned() {
             let (connected, dialing) = snapshot_peers(&hub, &room);
             let rc = cache.entry(room.clone()).or_default();
 
@@ -338,49 +364,200 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 now: Instant::now(),
             };
             for cand in plan_holds(&records, &ctx, &crate::chia_public_dial_addrs) {
-                let Ok(target_pub) = cand.node_id.parse::<iroh::PublicKey>() else { continue };
-                // Claim the dial single-flight here (not inside the task) so the
-                // same target cannot be planned twice before its task starts.
-                if !hub.dialing.lock().unwrap().insert(target_pub) {
+                spawn_hold(&hub, &iroh_ep, &shared, &room, cand, "room record");
+            }
+        }
+
+        // ── #231 P6a: per-node presence — the peers whose contact cards we hold ──
+        // Each peer's hints are read on the same beat as a room's (four times
+        // less often while the peer is connected anywhere), the freshest record
+        // cached, and holds planned into the readable rooms it was met in and is
+        // not connected to. Our own record goes first: seeing it confirm clears
+        // every cooldown, since the peers see us at their next beat.
+        if peak > 0 {
+            let own_ck = hub.contact_key;
+            if sched.due("ck:self", peak, false) {
+                match chia_resolve::read_ck(&client, &own_ck, peak, now_unix, &mut ck_cursors).await {
+                    Ok(found) => {
+                        let newest = found
+                            .iter()
+                            .filter(|f| f.record.node_id == self_id)
+                            .map(|f| f.confirmed_height)
+                            .max()
+                            .unwrap_or(0);
+                        if newest > own_ck_height {
+                            own_ck_height = newest;
+                            shared.cooldowns.lock().unwrap().clear();
+                            println!("⛓️ ChiaHub watcher: own presence confirmed at height {newest} — cooldowns cleared");
+                        }
+                    }
+                    Err(err) => eprintln!("⛓️ ChiaHub watcher: read of our own presence failed: {err:#}"),
+                }
+            }
+            let mut live_ck_hints: HashSet<[u8; 32]> = chia_resolve::live_ck_hints(&own_ck, peak).into_iter().collect();
+            for (node_id, ck, met_in) in &peers {
+                live_ck_hints.extend(chia_resolve::live_ck_hints(ck, peak));
+                let connected_in = rooms_connected_to(&hub, node_id);
+                if sched.due(&format!("ck:{node_id}"), peak, !connected_in.is_empty()) {
+                    match chia_resolve::read_ck(&client, ck, peak, now_unix, &mut ck_cursors).await {
+                        Ok(found) => {
+                            for f in chia_resolve::rank_and_dedupe(found) {
+                                // A card's ck names its node; a record under that
+                                // hint signed by anyone else is noise.
+                                if &f.record.node_id != node_id {
+                                    continue;
+                                }
+                                let newer = node_cache
+                                    .get(node_id)
+                                    .map(|p| (f.record.issued_at, f.confirmed_height) > (p.record.issued_at, p.confirmed_height))
+                                    .unwrap_or(true);
+                                if newer {
+                                    println!(
+                                        "⛓️ ChiaHub watcher: presence of {} read — era record at height {}, {} public addr(s)",
+                                        &node_id[..node_id.len().min(16)],
+                                        f.confirmed_height,
+                                        crate::chia_public_dial_addrs(&f.record.addrs).len()
+                                    );
+                                    node_cache.insert(node_id.clone(), f);
+                                }
+                            }
+                        }
+                        Err(err) => eprintln!(
+                            "⛓️ ChiaHub watcher: read of {}'s presence failed: {err:#}",
+                            &node_id[..node_id.len().min(16)]
+                        ),
+                    }
+                }
+                let Some(found) = node_cache.get(node_id) else { continue };
+                if found.record.expires_at != 0 && found.record.expires_at < now_unix {
                     continue;
                 }
-                *shared.active.lock().unwrap().entry(room.clone()).or_insert(0) += 1;
-                println!(
-                    "⛓️ ChiaHub watcher: holding for {} in room {room} at {} public addr(s)",
-                    &cand.node_id[..cand.node_id.len().min(16)],
-                    cand.addrs.len()
-                );
-                let hub_h = hub.clone();
-                let ep_h = iroh_ep.clone();
-                let shared_h = shared.clone();
-                let room_h = room.clone();
-                tokio::spawn(async move {
-                    let ok = crate::hold_dial(
-                        hub_h.clone(),
-                        ep_h,
-                        room_h.clone(),
-                        target_pub,
-                        cand.node_id.clone(),
-                        cand.addrs,
-                        crate::TIER_INTRODUCED,
-                        None,
-                    )
-                    .await;
-                    hub_h.dialing.lock().unwrap().remove(&target_pub);
-                    if let Some(n) = shared_h.active.lock().unwrap().get_mut(&room_h) {
-                        *n = n.saturating_sub(1);
+                let record = vec![found.record.clone()];
+                for room in met_in {
+                    // Only a room this node still holds (served or relayed) and
+                    // may read: a hold is bound to a room, and one bound to a
+                    // room that is gone would end at once as "linked".
+                    let held = hub.rooms.lock().unwrap().contains_key(room);
+                    if !held || !readable.iter().any(|(r, _)| r == room) || connected_in.contains(room) {
+                        continue;
                     }
-                    if !ok {
-                        shared_h
-                            .cooldowns
-                            .lock()
-                            .unwrap()
-                            .insert((room_h, cand.node_id), Instant::now() + TARGET_COOLDOWN);
+                    let (connected, dialing) = snapshot_peers(&hub, room);
+                    let cooldown_until: HashMap<String, Instant> = shared
+                        .cooldowns
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|((r, _), _)| r == room)
+                        .map(|((_, node), until)| (node.clone(), *until))
+                        .collect();
+                    let active_holds = shared.active.lock().unwrap().get(room).copied().unwrap_or(0);
+                    let ctx = PlanContext {
+                        self_id: &self_id,
+                        connected: &connected,
+                        dialing: &dialing,
+                        cooldown_until: &cooldown_until,
+                        active_holds,
+                        now_unix,
+                        now: Instant::now(),
+                    };
+                    for cand in plan_holds(&record, &ctx, &crate::chia_public_dial_addrs) {
+                        spawn_hold(&hub, &iroh_ep, &shared, room, cand, "contact key");
                     }
-                });
+                }
+            }
+            ck_cursors.retain(|hint, _| live_ck_hints.contains(hint));
+            // Forget peers that failed three windows in a row with no success
+            // for a week (their card is stale; a new one arrives if we meet).
+            let pruned = {
+                let mut book = hub.peers.lock().unwrap();
+                let n = book.prune(now_unix);
+                if n > 0 {
+                    let _ = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE));
+                }
+                n
+            };
+            if pruned > 0 {
+                println!("⛓️ ChiaHub watcher: forgot {pruned} unreachable peer(s) from the address book");
             }
         }
     }
+}
+
+/// Start one hold for `cand` in `room`: claims the dial single-flight here (not
+/// inside the task) so the same target cannot be planned twice before its task
+/// starts, counts it against the room's hold slots, and on failure puts the
+/// target in cooldown. The outcome is also noted in the address book when the
+/// target is a peer whose card we hold (`source` names what found it, for the log).
+fn spawn_hold(
+    hub: &crate::SharedHub,
+    iroh_ep: &iroh::Endpoint,
+    shared: &Arc<WatchShared>,
+    room: &str,
+    cand: HoldCandidate,
+    source: &str,
+) {
+    let Ok(target_pub) = cand.node_id.parse::<iroh::PublicKey>() else { return };
+    if !hub.dialing.lock().unwrap().insert(target_pub) {
+        return;
+    }
+    *shared.active.lock().unwrap().entry(room.to_string()).or_insert(0) += 1;
+    println!(
+        "⛓️ ChiaHub watcher: holding for {} in room {room} at {} public addr(s) ({source})",
+        &cand.node_id[..cand.node_id.len().min(16)],
+        cand.addrs.len()
+    );
+    let hub_h = hub.clone();
+    let ep_h = iroh_ep.clone();
+    let shared_h = shared.clone();
+    let room_h = room.to_string();
+    tokio::spawn(async move {
+        let ok = crate::hold_dial(
+            hub_h.clone(),
+            ep_h,
+            room_h.clone(),
+            target_pub,
+            cand.node_id.clone(),
+            cand.addrs,
+            crate::TIER_INTRODUCED,
+            None,
+        )
+        .await;
+        hub_h.dialing.lock().unwrap().remove(&target_pub);
+        if let Some(n) = shared_h.active.lock().unwrap().get_mut(&room_h) {
+            *n = n.saturating_sub(1);
+        }
+        {
+            let now = chia_resolve::unix_now();
+            let mut book = hub_h.peers.lock().unwrap();
+            if book.peers.contains_key(&cand.node_id) {
+                if ok {
+                    book.note_ok(&cand.node_id, now);
+                } else {
+                    book.note_fail(&cand.node_id, now);
+                }
+                let _ = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE));
+            }
+        }
+        if !ok {
+            shared_h
+                .cooldowns
+                .lock()
+                .unwrap()
+                .insert((room_h, cand.node_id), Instant::now() + TARGET_COOLDOWN);
+        }
+    });
+}
+
+/// The rooms `node_id` is connected in right now.
+fn rooms_connected_to(hub: &crate::SharedHub, node_id: &str) -> HashSet<String> {
+    let Ok(key) = node_id.parse::<iroh::PublicKey>() else { return HashSet::new() };
+    hub.rooms
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, r)| r.remote_peers.contains_key(&key))
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Node ids connected in `room`, and node ids with a dial in flight (global).
@@ -402,6 +579,8 @@ mod tests {
 
     fn rec(node: &str, issued_at: u64, expires_at: u64, addrs: &[&str]) -> ChiaPresenceRecord {
         ChiaPresenceRecord {
+            kx_pk: None,
+            addr_flags: vec![],
             v: 1,
             node_id: node.to_string(),
             addrs: addrs.iter().map(|s| s.to_string()).collect(),
