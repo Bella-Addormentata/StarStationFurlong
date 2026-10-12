@@ -1,86 +1,185 @@
 /**
  * 🕹 arcadeUI's two views (#193): PLAY at the cabinet, and SETTINGS from the
- * ⚙️ on its front — what the owner set, readable by anyone, with the
+ * ⚙️ on its front — the cabinet's one game, readable by anyone, with the
  * owner's controls only for the owner (arcadeDoc gates the writes again).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { setConvenienceLanesForTest } from './sovereignty';
 import {
-  addToShelf, bindArcadeDoc, putOnCabinet, setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate,
+  bindArcadeDoc, insertCoin, putOnCabinet, takeOffCabinet, setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate,
   setArcadeIdentity, setArcadePageId, setEmulatorData,
 } from './arcadeDoc';
 import type { ArcadeGame } from './arcadeDoc';
-import { renderArcadePanel, type ArcadeDeviceDeps } from './arcadeUI';
+import { ARCADE_GAMES } from './arcadeLibrary';
+import { matchPlayers, renderArcadePanel, resetArcadeCabinet, type ArcadeDeviceDeps } from './arcadeUI';
+import { newMatch, type ArcadeMatch } from './games/arcade';
+import { bindGamesDoc, readArcade, writeArcade } from './games/gamesDoc';
 
 const CAB = 'arcade-cabinet-1';
 const LJ65: ArcadeGame = { name: 'lj65.nes', core: 'nes', url: '', size: 40_976 };
-const THWAITE: ArcadeGame = { name: 'thwaite.nes', core: 'nes', url: '', size: 40_976 };
 
 let owner = false;
 const deps = (view: ArcadeDeviceDeps['view'], canEdit: boolean): ArcadeDeviceDeps => ({
   itemId: CAB, myPub: () => 'AAAAalicepub', myName: () => 'Alice', canEdit: () => canEdit, openStage: () => undefined, view,
 });
+/** The owner puts a game on; then the visitor looks. */
+const ownerPuts = (game: ArcadeGame) => {
+  owner = true;
+  expect(putOnCabinet(CAB, game).ok).toBe(true);
+  owner = false;
+};
+
+const OWNER_CONTROLS = ['data-arcade-builtin', 'data-arcade-put', 'data-arcade-takeoff', 'data-arcade-data', 'data-arcade-file', 'data-arcade-url'];
 
 beforeEach(() => {
-  owner = true;
+  owner = false;
   setArcadeClock(() => 1_000_000);
   setArcadeHostPredicate(() => owner);
   setArcadeEjectPredicate(() => false);
   setArcadePageId('tab-a');
   setArcadeIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
   bindArcadeDoc(new Y.Doc());
+  const games = new Y.Doc();
+  games.getMap('players').set('bob-id', { name: 'Bob <b>' });
+  bindGamesDoc(games);
   setConvenienceLanesForTest(true);
-  // The owner sets the cabinet up; then the visitor looks.
-  expect(putOnCabinet(CAB, LJ65).ok).toBe(true);
-  expect(addToShelf(CAB, THWAITE).ok).toBe(true);
+  owner = true;
   expect(setEmulatorData(CAB, 'cdn').ok).toBe(true);
   owner = false;
 });
 afterEach(() => { setConvenienceLanesForTest(null); });
 
 describe('the SETTINGS view (the ⚙️)', () => {
-  it('shows a visitor everything the owner set, with nothing to change it', () => {
+  it('shows a visitor the one game and its credits, with nothing to change it', () => {
     const html = renderArcadePanel(CAB, deps('settings', false));
     expect(html).toContain('⚙️ ARCADE CABINET');
     expect(html).toContain('THE OWNER SETS THIS CABINET · ANYONE CAN LOOK');
-    expect(html).toContain('lj65.nes'); // on the cabinet
-    expect(html).toContain('thwaite.nes'); // on the shelf
-    expect(html).toContain('EMULATOR FILES');
+    expect(html).toContain('ON THE CABINET · ONE GAME');
+    expect(html).toContain('THWAITE'); // the default: the first built-in game
+    expect(html).toContain('NES · BUILT-IN');
+    expect(html).toContain(ARCADE_GAMES[0].author);
+    expect(html).toContain(ARCADE_GAMES[0].sourceUrl);
+    expect(html).toContain('EMULATORJS FILES');
     expect(html).toContain('cdn.emulatorjs.org'); // where the files come from, as text
-    for (const control of ['data-arcade-put', 'data-arcade-shelve', 'data-arcade-takeoff', 'data-arcade-unshelve', 'data-arcade-pick', 'data-arcade-data', 'data-arcade-file', 'data-arcade-url']) {
-      expect(html).not.toContain(control);
-    }
+    for (const control of OWNER_CONTROLS) expect(html).not.toContain(control);
+    expect(html).not.toContain('FREE GAMES');
     expect(html).toContain('data-arcade-play'); // back to the cabinet
   });
 
-  it('gives the owner the controls, in the same card', () => {
+  it('gives the owner both kinds of game to pick from, in the same card', () => {
     const html = renderArcadePanel(CAB, deps('settings', true));
     expect(html).toContain('YOU RUN THIS CABINET');
-    for (const control of ['data-arcade-put', 'data-arcade-shelve', 'data-arcade-takeoff', 'data-arcade-unshelve', 'data-arcade-pick', 'data-arcade-data="station"', 'data-arcade-data="cdn"', 'data-arcade-file', 'data-arcade-url']) {
+    expect(html).toContain('FREE GAMES · BUILT-IN EMULATOR');
+    expect(html).toContain('YOUR OWN GAME · EMULATORJS');
+    for (const control of [...OWNER_CONTROLS, 'data-arcade-data="station"', 'data-arcade-data="cdn"']) {
       expect(html).toContain(control);
     }
+    // Every free game, the one on the cabinet marked and not offered again.
+    for (const lib of ARCADE_GAMES) expect(html).toContain(`data-arcade-builtin="${lib.id}"`);
+    expect(html).toMatch(/data-arcade-builtin="thwaite" disabled[\s\S]*✓ ON/);
+    expect(html).not.toContain('SHELF');
+  });
+
+  it('shows the owner\'s own game as their file, for EmulatorJS', () => {
+    ownerPuts(LJ65);
+    const html = renderArcadePanel(CAB, deps('settings', false));
+    expect(html).toContain('lj65.nes');
+    expect(html).not.toContain('NES · BUILT-IN');
+    expect(html).toContain('EmulatorJS window');
+  });
+
+  it('says who sends the owner\'s file to the players', () => {
+    ownerPuts({ ...LJ65, sha256: 'cd'.repeat(32) });
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Sent to each player who presses play');
+    // The owner's page lost the file (a reload): it says how to send it again.
+    expect(renderArcadePanel(CAB, deps('settings', true))).toContain('pick it again below');
+    ownerPuts(LJ65); // no hash: from a build before sending
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Not sent to players');
+    ownerPuts({ ...LJ65, size: 9 * 1024 * 1024, sha256: 'cd'.repeat(32) });
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Not sent to players (over 8 MB)');
   });
 
   it('escapes a peer\'s game name', () => {
-    owner = true;
-    expect(putOnCabinet(CAB, { ...LJ65, name: '<img src=x onerror=alert(1)>.nes' }).ok).toBe(true);
-    owner = false;
+    ownerPuts({ ...LJ65, name: '<img src=x onerror=alert(1)>.nes' });
     const html = renderArcadePanel(CAB, deps('settings', false));
     expect(html).not.toContain('<img');
   });
 });
 
-describe('the PLAY view (at the cabinet)', () => {
-  it('keeps the coin and the shelf, and moves the owner\'s settings behind ⚙️', () => {
+describe('NOW PLAYING and the owner\'s RESET (#246\'s card)', () => {
+  const match = (over: Partial<ArcadeMatch> = {}): ArcadeMatch => ({
+    ...newMatch({ game: 'thwaite', host: 'bob-id', hostPage: 'tab-b', hostSeat: 0, now: 1 }), ...over,
+  });
+
+  it('names who holds each player of a built-in game, and what the other stand is', () => {
+    expect(matchPlayers(match(), 2, 'me')).toEqual([
+      { player: 1, who: 'BOB <B>' },
+      { player: 2, who: 'OPEN · STEP UP TO THE RIGHT STAND' },
+    ]);
+    expect(matchPlayers(match({ hostSeat: 1 }), 2, 'bob-id')).toEqual([
+      { player: 1, who: 'OPEN · STEP UP TO THE LEFT STAND' },
+      { player: 2, who: 'YOU' },
+    ]);
+    expect(matchPlayers(match(), 1, 'me')[1].who).toBe("A SECOND GAMEPAD ON PLAYER 1'S COMPUTER");
+
+    writeArcade(CAB, match());
+    const html = renderArcadePanel(CAB, { ...deps('settings', false), seats: 2 });
+    expect(html).toContain('NOW PLAYING');
+    expect(html).toContain('PLAYER 1 · BOB &lt;B&gt;'); // a peer's name, escaped
+    expect(html).toContain('PLAYER 2 · OPEN · STEP UP TO THE RIGHT STAND');
+    expect(html).not.toContain('data-arcade-reset'); // a visitor reads it
+  });
+
+  it('lets the owner end a built-in game for everyone, and nobody else', () => {
+    writeArcade(CAB, match());
+    const html = renderArcadePanel(CAB, deps('settings', true));
+    expect(html).toContain('data-arcade-reset="1"');
+    expect(html).not.toContain('data-arcade-reset="1" disabled');
+    expect(resetArcadeCabinet(CAB, false)).toBeNull();
+    expect(readArcade(CAB)).not.toBeNull();
+    expect(resetArcadeCabinet(CAB, true)).toBe('The game ended · the cabinet is free.');
+    expect(readArcade(CAB)).toBeNull();
+    const after = renderArcadePanel(CAB, deps('settings', true));
+    expect(after).toContain('Nobody · step up and press Enter to play.');
+    expect(after).toContain('data-arcade-reset="1" disabled');
+  });
+
+  it('frees player one\'s seat at the owner\'s own game, when this page may eject', () => {
+    ownerPuts(LJ65);
+    setArcadeIdentity(() => ({ pub: 'BBBBbobpub', name: 'Bob' }));
+    setArcadePageId('tab-b');
+    expect(insertCoin(CAB).ok).toBe(true);
+    setArcadeIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    setArcadePageId('tab-a');
+    const html = renderArcadePanel(CAB, deps('settings', true));
+    expect(html).toContain('PLAYER 1 · BOB');
+    expect(html).toContain('data-arcade-reset="1" disabled'); // no EJECT here (not the deed holder)
+    setArcadeEjectPredicate(() => true);
+    expect(resetArcadeCabinet(CAB, true)).toBe('Player one stood up · the cabinet is free.');
+    expect(renderArcadePanel(CAB, deps('settings', false))).toContain('Nobody · step up and INSERT COIN to play.');
+  });
+});
+
+describe('the PLAY view (the owner\'s own game, at the cabinet)', () => {
+  it('keeps the coin, and moves the owner\'s settings behind ⚙️', () => {
+    ownerPuts(LJ65);
     for (const canEdit of [false, true]) {
       const html = renderArcadePanel(CAB, deps(undefined, canEdit));
       expect(html).toContain('🕹 ARCADE CABINET');
       expect(html).toContain('data-arcade-coin');
       expect(html).toContain('data-arcade-settings');
-      expect(html).not.toContain('LOAD A GAME');
-      expect(html).not.toContain('data-arcade-data');
-      expect(html).not.toContain('data-arcade-unshelve');
+      for (const control of OWNER_CONTROLS) expect(html).not.toContain(control);
+      expect(html).not.toContain('SHELF');
     }
+  });
+
+  it('says where the game is picked when the owner took it off, with no coin to take', () => {
+    owner = true;
+    expect(takeOffCabinet(CAB).ok).toBe(true);
+    owner = false;
+    const html = renderArcadePanel(CAB, deps(undefined, false));
+    expect(html).toContain('the owner picks a game in ⚙️ SETTINGS');
+    expect(html).not.toContain('data-arcade-coin');
   });
 });

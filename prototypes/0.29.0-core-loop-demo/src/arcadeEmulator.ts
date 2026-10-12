@@ -66,6 +66,8 @@
  */
 
 import { gameId, ARCADE_CORES } from './arcadeDoc';
+import { readFrameBatch, readFrameHash, readFrameSnapshot } from './arcadeReplay';
+import type { ReplayBatch, ReplayHash, ReplaySnapshot } from './arcadeReplay';
 import type { ArcadeCore, ArcadeGame, EmulatorData } from './arcadeDoc';
 import { convenienceLanesEnabled } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
@@ -150,6 +152,35 @@ export interface EmulatorConfig {
    *  the viewer's own node (tvConsent's own media origins); the engine's
    *  own origin is added for the CDN lane (emulatorFrameOrigins). */
   allowOrigins: readonly string[];
+  /** Spectating by input replay (arcadeReplay.ts): player one's frame is
+   *  the 'source', a spectator's the 'follower'. Absent: no replay hooks. */
+  replay?: EmulatorReplayConfig;
+}
+
+export interface EmulatorReplayConfig {
+  role: 'source' | 'follower';
+  /** Hash the state every this many frames (default 60). */
+  hashEvery?: number;
+  /** A follower out of a stall waits for this many frames of input (12). */
+  lead?: number;
+  /** The source posts a batch every this many frames (6). */
+  batchFrames?: number;
+}
+
+/** A follower's report of where it stands. */
+export interface ReplayStatus {
+  phase: 'waiting' | 'loading' | 'stalled' | 'running' | 'unsupported';
+  /** The source frame the follower's state is at. */
+  frame?: number;
+  /** The latest `through` it holds. */
+  through?: number;
+  /** Set once, as a save state lands: its frame, the hash after loading,
+   *  whether that matched the hash the source sent with it, and how many
+   *  iterations the load took to land. */
+  loaded?: number;
+  hash?: string;
+  matches?: boolean;
+  tries?: number;
 }
 
 /** Whether engine files at `pathToData` come from another origin than the
@@ -199,7 +230,11 @@ export type EmulatorEvent =
   | { type: 'ready' }
   | { type: 'started' }
   | { type: 'exit' }
-  | { type: 'error'; why: string };
+  | { type: 'error'; why: string }
+  | { type: 'replay-inputs'; batch: ReplayBatch }
+  | { type: 'replay-hash'; hash: ReplayHash }
+  | { type: 'replay-snapshot'; snapshot: ReplaySnapshot }
+  | { type: 'replay-status'; status: ReplayStatus };
 
 /** What the frame may say, and how much. The frame is attacker-controlled
  *  after a core exploit, so a message from it is input from an attacker:
@@ -222,7 +257,11 @@ export type FrameMessage =
   | { type: 'arcade-ready' }
   | { type: 'arcade-started' }
   | { type: 'arcade-exit' }
-  | { type: 'arcade-error'; why: string };
+  | { type: 'arcade-error'; why: string }
+  | { type: 'arcade-replay-inputs'; batch: ReplayBatch }
+  | { type: 'arcade-replay-hash'; hash: ReplayHash }
+  | { type: 'arcade-replay-snapshot'; snapshot: ReplaySnapshot }
+  | { type: 'arcade-replay-status'; status: ReplayStatus };
 
 const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
   'arcade-frame-ready': ['type'],
@@ -230,13 +269,29 @@ const FRAME_MESSAGE_KEYS: Record<FrameMessage['type'], readonly string[]> = {
   'arcade-started': ['type'],
   'arcade-exit': ['type'],
   'arcade-error': ['type', 'why'],
+  'arcade-replay-inputs': ['type', 'from', 'through', 'inputs'],
+  'arcade-replay-hash': ['type', 'frame', 'hash'],
+  'arcade-replay-snapshot': ['type', 'frame', 'state', 'held', 'hash'],
+  'arcade-replay-status': ['type', 'phase', 'frame', 'through', 'loaded', 'hash', 'matches', 'tries'],
+};
+
+/** The replay kinds a frame may post, by the role its config gave it
+ *  (arcadeReplay.ts): player one's frame its batches, hashes and save
+ *  states; a spectator's its hashes and where it stands; either that it
+ *  cannot replay at all. A frame given no role posts none: from it, or
+ *  from the other role, a replay kind is a message no game sends. */
+const REPLAY_KINDS: Record<EmulatorReplayConfig['role'], ReadonlySet<string>> = {
+  source: new Set(['arcade-replay-inputs', 'arcade-replay-hash', 'arcade-replay-snapshot', 'arcade-replay-status']),
+  follower: new Set(['arcade-replay-hash', 'arcade-replay-status']),
 };
 
 /** The frame's message as one of the shapes above, or null — an unknown
  *  kind, a key the kind does not have, a `why` that is not a string or is
- *  longer than FRAME_STRING_MAX, no object at all: read no further, and
- *  the frame is torn down for it (mountEmulatorFrame, `malformed`). */
-export function frameMessage(data: unknown): FrameMessage | null {
+ *  longer than FRAME_STRING_MAX, a replay kind its role does not post or
+ *  whose payload arcadeReplay.ts will not read, no object at all: read no
+ *  further, and the frame is torn down for it (mountEmulatorFrame,
+ *  `malformed`). */
+export function frameMessage(data: unknown, replay?: EmulatorReplayConfig['role']): FrameMessage | null {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
   const d = data as Record<string, unknown>;
   const type = d.type;
@@ -244,12 +299,32 @@ export function frameMessage(data: unknown): FrameMessage | null {
   const kind = type as FrameMessage['type'];
   const keys = FRAME_MESSAGE_KEYS[kind];
   for (const k of Object.keys(d)) if (!keys.includes(k)) return null;
-  if (kind === 'arcade-error') {
-    const why = d.why;
-    if (typeof why !== 'string' || why.length > FRAME_STRING_MAX) return null;
-    return { type: kind, why };
+  if (kind.startsWith('arcade-replay-') && !(replay && REPLAY_KINDS[replay].has(kind))) return null;
+  switch (kind) {
+    case 'arcade-error': {
+      const why = d.why;
+      if (typeof why !== 'string' || why.length > FRAME_STRING_MAX) return null;
+      return { type: kind, why };
+    }
+    case 'arcade-replay-inputs': {
+      const batch = readFrameBatch(d);
+      return batch ? { type: kind, batch } : null;
+    }
+    case 'arcade-replay-hash': {
+      const hash = readFrameHash(d);
+      return hash ? { type: kind, hash } : null;
+    }
+    case 'arcade-replay-snapshot': {
+      const snapshot = readFrameSnapshot(d);
+      return snapshot ? { type: kind, snapshot } : null;
+    }
+    case 'arcade-replay-status': {
+      const status = readReplayStatus(d);
+      return status ? { type: kind, status } : null;
+    }
+    default:
+      return { type: kind };
   }
-  return { type: kind };
 }
 
 /** Messages a second from one frame, counted on every message it posts,
@@ -272,6 +347,10 @@ export interface EmulatorHandle {
   /** The emulator's frame inside the wall, once the wall is up. */
   emulator(): HTMLIFrameElement | null;
   focus(): void;
+  /** Post a replay message to the frame (arcadeReplay.ts: the source's
+   *  batches and snapshot to a follower, a snapshot request or a press to a
+   *  source). Nothing before the frame has said hello. */
+  send(message: Record<string, unknown>, transfer?: Transferable[]): void;
   destroy(): void;
 }
 
@@ -305,6 +384,37 @@ export function emulatorWallPolicy(frameUrl: string, href = typeof location === 
   const source = `${u.protocol}//${u.host}${u.pathname}`;
   if (!/^[a-z][a-z0-9+.-]*:\/\/[^\s,;'"]+$/i.test(source)) return null;
   return `default-src 'none'; frame-src ${source}`;
+}
+
+const REPLAY_PHASES: ReadonlySet<string> = new Set(['waiting', 'loading', 'stalled', 'running', 'unsupported']);
+
+/** A follower's status as the frame posts it: every field it carries in
+ *  its shape, or none of it (a field out of shape is a malformed message,
+ *  frameMessage). */
+export function readReplayStatus(data: unknown): ReplayStatus | null {
+  if (!data || typeof data !== 'object') return null;
+  const d = data as Record<string, unknown>;
+  if (typeof d.phase !== 'string' || !REPLAY_PHASES.has(d.phase)) return null;
+  const out: ReplayStatus = { phase: d.phase as ReplayStatus['phase'] };
+  const int = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= -1 && v <= 0xffff_ffff;
+  for (const k of ['frame', 'through', 'loaded'] as const) {
+    if (d[k] === undefined) continue;
+    if (!int(d[k])) return null;
+    out[k] = d[k] as number;
+  }
+  if (d.hash !== undefined) {
+    if (typeof d.hash !== 'string' || !/^[0-9a-f]{1,8}:\d{1,9}$/.test(d.hash)) return null;
+    out.hash = d.hash;
+  }
+  if (d.matches !== undefined) {
+    if (typeof d.matches !== 'boolean') return null;
+    out.matches = d.matches;
+  }
+  if (d.tries !== undefined) {
+    if (typeof d.tries !== 'number' || !Number.isInteger(d.tries) || d.tries < 0 || d.tries > 1000) return null;
+    out.tries = d.tries;
+  }
+  return out;
 }
 
 /** The parent side of the frame protocol: the frame says hello, the parent
@@ -345,6 +455,7 @@ export function mountEmulatorFrame(
   let silenced = false;
   let readySeen = false;
   let startedSeen = false;
+  let snapshotWanted = false;
   const onMessage = (e: MessageEvent) => {
     if (!alive || silenced || !frame || e.source !== frame.contentWindow) return;
     if (!budget.take(performance.now())) {
@@ -352,12 +463,16 @@ export function mountEmulatorFrame(
       onEvent({ type: 'error', why: 'flood' });
       return;
     }
-    const m = frameMessage(e.data);
-    if (!m) {
+    const m = frameMessage(e.data, config.replay?.role);
+    // A save state is the one large message a frame may post, so only in
+    // answer to the page's request (send, `arcade-replay-want-snapshot`):
+    // one it was not asked for is out of turn.
+    if (!m || (m.type === 'arcade-replay-snapshot' && !snapshotWanted)) {
       silenced = true;
       onEvent({ type: 'error', why: 'malformed' });
       return;
     }
+    if (m.type === 'arcade-replay-snapshot') snapshotWanted = false;
     switch (m.type) {
       case 'arcade-frame-ready':
         if (configured) return;
@@ -375,12 +490,20 @@ export function mountEmulatorFrame(
           volume: config.volume,
           isolated: config.isolated,
           timeoutMs: EMULATOR_LOAD_TIMEOUT_MS,
+          replay: config.replay?.role,
+          replayHashEvery: config.replay?.hashEvery,
+          replayLead: config.replay?.lead,
+          replayBatchFrames: config.replay?.batchFrames,
         }, target);
         break;
       case 'arcade-ready': if (!readySeen) { readySeen = true; onEvent({ type: 'ready' }); } break;
       case 'arcade-started': if (!startedSeen) { startedSeen = true; onEvent({ type: 'started' }); } break;
       case 'arcade-exit': onEvent({ type: 'exit' }); break;
       case 'arcade-error': onEvent({ type: 'error', why: m.why }); break;
+      case 'arcade-replay-inputs': onEvent({ type: 'replay-inputs', batch: m.batch }); break;
+      case 'arcade-replay-hash': onEvent({ type: 'replay-hash', hash: m.hash }); break;
+      case 'arcade-replay-snapshot': onEvent({ type: 'replay-snapshot', snapshot: m.snapshot }); break;
+      case 'arcade-replay-status': onEvent({ type: 'replay-status', status: m.status }); break;
       default: break;
     }
   };
@@ -472,6 +595,11 @@ export function mountEmulatorFrame(
         frame?.focus();
         frame?.contentWindow?.focus();
       } catch { /* detached */ }
+    },
+    send(message, transfer = []) {
+      if (!alive || !configured) return;
+      if (message.type === 'arcade-replay-want-snapshot' && config.replay?.role === 'source') snapshotWanted = true;
+      frame?.contentWindow?.postMessage(message, target, transfer);
     },
     destroy() {
       alive = false;

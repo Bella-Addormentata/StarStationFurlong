@@ -5,14 +5,14 @@ name: "✅ PR Checks"
 #   1. Frontend `tsc --noEmit` — the repo's long-standing "tsc clean" bar.
 #   2. Frontend `npm test` (vitest) — treasury contract unit tests + the shared
 #      TS<->Rust golden vectors under test-vectors/treasury/.
-#   3. `cargo check` on the sovereign node with DEFAULT features — what a local
-#      `cargo check` compiles.
-#   4. `cargo check`/`cargo test` with `--features chia-lane` — the feature-gated
-#      chia modules (chia_publish / chia_resolve / chia_craps_fair /
-#      treasury_codec) are INVISIBLE to a default check, so a PR could break them
-#      without anyone noticing until the tag-time release build (#87's near-miss:
-#      a review fix to the gated module shipped without ever having been
-#      compiled).
+#   3. `cargo check` + `cargo test` on the sovereign node with DEFAULT features —
+#      what a local `cargo check` compiles. Since #231 D3 the default build carries
+#      the chain READ side (`chia-read`: chia_rooms / chia_resolve / chia_watch).
+#   4. `cargo check`/`cargo test` with `--features chia-publish` — the publish-only
+#      modules (chia_wallet / chia_publish / chia_craps_fair / treasury_codec) are
+#      INVISIBLE to a default check, so a PR could break them without anyone
+#      noticing until the tag-time release build (#87's near-miss: a review fix to
+#      the gated module shipped without ever having been compiled).
 
 on:
   pull_request:
@@ -46,14 +46,14 @@ jobs:
         working-directory: ${{ env.RELEASE_FRONTEND }}
 
       # Treasury PR B golden vectors: the same fixtures are asserted by
-      # `cargo test --features chia-lane` (treasury_codec.rs), so a drift in
+      # `cargo test --features chia-publish` (treasury_codec.rs), so a drift in
       # either runtime's canonical encoding fails one lane or the other.
       - name: 🧪 npm test (vitest)
         run: npm test
         working-directory: ${{ env.RELEASE_FRONTEND }}
 
   node-check:
-    name: 🦀 Node cargo check + test (default & chia-lane)
+    name: 🦀 Node cargo check + test (default & chia-publish)
     runs-on: ubuntu-22.04
     steps:
       - name: 📥 Checkout repository
@@ -71,11 +71,14 @@ jobs:
           # crate"), so scope it to the pinned runner.
           key: ubuntu-22.04
 
-      - name: 🔎 cargo check (default features)
+      - name: 🔎 cargo check (default features = chia-read)
         run: cargo check --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
-      - name: 🔎 cargo check --features chia-lane
-        run: cargo check --features chia-lane --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+      - name: 🧪 cargo test (default features = chia-read)
+        run: cargo test --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
-      - name: 🧪 cargo test --features chia-lane
-        run: cargo test --features chia-lane --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+      - name: 🔎 cargo check --features chia-publish
+        run: cargo check --features chia-publish --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      - name: 🧪 cargo test --features chia-publish
+        run: cargo test --features chia-publish --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml

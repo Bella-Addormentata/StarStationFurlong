@@ -3,6 +3,8 @@
  * is a reciprocal graph, the empty configuration ships nothing, and the
  * validator and the exporter drop what they should.
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import bundledAtlasJson from './defaultStation.atlas.json';
 import {
@@ -47,6 +49,15 @@ describe.skipIf(!DEFAULT_STATION.welcomeRoomId)('the shipped default station', (
     expect(typeof parsed.roomKeyB64).toBe('string');
     expect(parsed.memberHints?.[0]?.irohNodeId).toMatch(/^[0-9a-f]{64}$/);
     expect(parsed.memberHints[0].irohDirectAddrs.length).toBeGreaterThan(0);
+  });
+
+  it('is listed by the node as a bundled key, so no address is ever published under it (#231 N8)', () => {
+    const seed = new URL(DEFAULT_STATION.welcomeRoomLink).searchParams.get('seed')!;
+    const { roomKeyB64 } = JSON.parse(atob(seed)) as { roomKeyB64: string };
+    const rs = readFileSync(fileURLToPath(new URL('../ssf-p2p-node/src/chia_rooms.rs', import.meta.url)), 'utf8');
+    const list = rs.match(/BUNDLED_ROOM_KEYS_B64: &\[&str\] = &\[([^\]]*)\]/);
+    expect(list, 'chia_rooms.rs declares BUNDLED_ROOM_KEYS_B64').not.toBeNull();
+    expect(list![1]).toContain(`"${roomKeyB64}"`);
   });
 
   it('ships a file the validator accepts whole', () => {

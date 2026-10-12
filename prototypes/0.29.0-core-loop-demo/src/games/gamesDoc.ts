@@ -31,6 +31,8 @@ import type { AirHockeyState } from './airHockey';
 import { isAlligatorsState } from './alligators';
 import type { AlligatorsState } from './alligators';
 import type { RoomOwnerKey } from '../treasuryView';
+import { isArcadeMatch, isArcadeSnapshot, snapshotKey } from './arcade';
+import type { ArcadeMatch, ArcadeSnapshot } from './arcade';
 
 /** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`,
  *  air hockey `kind: 'airhockey'` (#115) and insatiable alligators
@@ -46,6 +48,9 @@ export type TableGame =
 let boundDoc: Y.Doc | null = null;
 let gamesMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
+/** readArcadeMatches' answer until the games map next changes: a host
+ *  checks it every frame, and the map holds every table's game. */
+let arcadeMatches: ReadonlyMap<string, ArcadeMatch> | null = null;
 
 function notify(): void {
   // Copy: a listener may unsubscribe (or mount a new UI) mid-notify.
@@ -75,7 +80,11 @@ function docAlive(): boolean {
 export function bindGamesDoc(doc: Y.Doc): void {
   boundDoc = doc;
   gamesMap = doc.getMap('games');
-  gamesMap.observe(() => notify());
+  arcadeMatches = null;
+  gamesMap.observe(() => {
+    arcadeMatches = null;
+    notify();
+  });
   notify(); // repaint subscribers from the fresh doc (mirror of rebuildChatLog)
 }
 
@@ -132,6 +141,51 @@ export function writeGame(
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(tableId, state);
+  });
+}
+
+/** 🕹️ The shared game on an arcade cabinet, or null (none, or malformed). */
+export function readArcade(cabinetId: string): ArcadeMatch | null {
+  const value = ensureMap().get(cabinetId);
+  return isArcadeMatch(value) ? value : null;
+}
+
+/** 🕹️ Every cabinet's shared game in the room, by cabinet id. */
+export function readArcadeMatches(): ReadonlyMap<string, ArcadeMatch> {
+  const map = ensureMap();
+  if (arcadeMatches) return arcadeMatches;
+  const out = new Map<string, ArcadeMatch>();
+  map.forEach((value, key) => {
+    if (isArcadeMatch(value)) out.set(key, value);
+  });
+  arcadeMatches = out;
+  return out;
+}
+
+/** 🕹️ Start, change or (null) end a cabinet's shared game. Ending also
+ *  drops its save state, which is no use to anyone after the match. */
+export function writeArcade(cabinetId: string, match: ArcadeMatch | null): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    if (match) {
+      map.set(cabinetId, match);
+    } else {
+      map.delete(cabinetId);
+      map.delete(snapshotKey(cabinetId));
+    }
+  });
+}
+
+/** 🕹️ The cabinet's latest save state for late copies, or null. */
+export function readArcadeSnapshot(cabinetId: string): ArcadeSnapshot | null {
+  const value = ensureMap().get(snapshotKey(cabinetId));
+  return isArcadeSnapshot(value) ? value : null;
+}
+
+export function writeArcadeSnapshot(cabinetId: string, snapshot: ArcadeSnapshot): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(snapshotKey(cabinetId), snapshot);
   });
 }
 
