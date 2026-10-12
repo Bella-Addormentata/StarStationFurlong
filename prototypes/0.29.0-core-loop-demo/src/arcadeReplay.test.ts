@@ -100,14 +100,14 @@ describe('the reassembler puts batches back in frame order', () => {
   });
 
   it('passes batches that arrive in order straight through', () => {
-    const r = new ReplayReassembler();
+    const r = new ReplayReassembler(10);
     expect(r.push(b(10, 15))).toEqual([b(10, 15)]);
     expect(r.push(b(16, 21))).toEqual([b(16, 21)]);
     expect(r.covered()).toBe(22);
   });
 
   it('holds a batch past a gap until the gap fills, then releases both in order', () => {
-    const r = new ReplayReassembler();
+    const r = new ReplayReassembler(10);
     r.push(b(10, 15));
     expect(r.push(b(22, 27, [24]))).toEqual([]);
     expect(r.waiting()).toBe(1);
@@ -117,19 +117,52 @@ describe('the reassembler puts batches back in frame order', () => {
   });
 
   it('drops what is already covered, and keeps only the new part of a straddler', () => {
-    const r = new ReplayReassembler();
+    const r = new ReplayReassembler(10);
     r.push(b(10, 15));
     expect(r.push(b(10, 15))).toEqual([]);
     expect(r.push(b(12, 20, [13, 18]))).toEqual([b(16, 20, [18])]);
   });
 
   it('holds a bounded number of batches', () => {
-    const r = new ReplayReassembler(2);
+    const r = new ReplayReassembler(0, 2);
     r.push(b(0, 0));
     r.push(b(5, 5));
     r.push(b(7, 7));
     r.push(b(9, 9));
     expect(r.waiting()).toBe(2);
+  });
+
+  it("starts at a late joiner's save state, even when its first two batches came the wrong way round", () => {
+    const r = new ReplayReassembler();
+    // Taking the first batch heard as the start would have dropped the
+    // earlier one, and the input at 14 with it.
+    expect(r.push(b(16, 21, [18]))).toEqual([]);
+    expect(r.push(b(10, 15, [11, 14]))).toEqual([]);
+    expect(r.covered()).toBeNull();
+    // The save state is of frame 12: every input from 12 on, in order.
+    expect(r.start(12)).toEqual([b(12, 15, [14]), b(16, 21, [18])]);
+    expect(r.covered()).toBe(22);
+    expect(r.waiting()).toBe(0);
+  });
+
+  it('drops what came before the save state, and waits through a gap after it', () => {
+    const r = new ReplayReassembler();
+    r.push(b(4, 9, [5]));
+    r.push(b(22, 27, [24]));
+    expect(r.start(16)).toEqual([]);
+    expect(r.waiting()).toBe(1);
+    expect(r.push(b(10, 15, [12]))).toEqual([]);
+    expect(r.push(b(16, 21))).toEqual([b(16, 21), b(22, 27, [24])]);
+    expect(r.covered()).toBe(28);
+  });
+
+  it('takes the start once: a later save state (a re-sync) lands on a stream already in order', () => {
+    const r = new ReplayReassembler();
+    r.push(b(10, 15));
+    expect(r.start(10)).toEqual([b(10, 15)]);
+    expect(r.start(40)).toEqual([]);
+    expect(r.covered()).toBe(16);
+    expect(r.push(b(16, 21))).toEqual([b(16, 21)]);
   });
 });
 

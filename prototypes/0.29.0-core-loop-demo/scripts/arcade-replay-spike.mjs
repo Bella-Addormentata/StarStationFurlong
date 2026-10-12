@@ -13,8 +13,10 @@
  *        [--query "rom=/emulatorjs/roms/lj65.nes&latency=40&jitter=30"] [--chromium /path/to/chrome]
  *        [--screenshot out.png]
  *
- * Exits non-zero when any compared hash differed or nothing was compared
- * (the negative control, `--query drop=N`, is expected to).
+ * Exits non-zero when any compared hash differed, nothing was compared, or
+ * either frame reported an error (one torn down partway through stops
+ * comparing, which no mismatch would show). The negative control,
+ * `--query drop=N`, is expected to.
  */
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -82,4 +84,4 @@ console.log(JSON.stringify({
   errors: last?.errors,
 }, null, 2));
 const d = last?.drift;
-process.exit(d && d.compared > 0 && d.mismatched === 0 ? 0 : 1);
+process.exit(d && d.compared > 0 && d.mismatched === 0 && !last?.errors?.length ? 0 : 1);

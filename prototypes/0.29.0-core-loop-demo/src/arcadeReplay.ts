@@ -230,27 +230,54 @@ export function unpackInputBatch(bytes: Uint8Array): ReplayBatch | null {
  * as the word on every frame before it would run past inputs still on the
  * way. Batches go out only once every frame before them is covered.
  *
- * The first batch heard sets the start: a spectator joins mid-stream, and
- * what it missed before that is what the save state is for.
+ * Where the order starts is the save state's frame, not the first batch
+ * heard: a spectator joins mid-stream, and the first two batches it hears
+ * can be the wrong way round too. So batches wait until the save state
+ * says where it starts (`start`), or the constructor already knows.
  */
 export class ReplayReassembler {
-  private next: number | null = null;
+  private next: number | null;
   private readonly held = new Map<number, ReplayBatch>();
 
-  constructor(private readonly maxHeld = 600) {}
+  /** `start`: the first frame whose inputs are wanted, when known up front
+   *  (null: wait for `start()`). */
+  constructor(start: number | null = null, private readonly maxHeld = 600) {
+    this.next = start;
+  }
+
+  /** The save state the spectator starts from is of `frame`: from here on
+   *  it needs every input stamped `frame` or later, in order. Returns the
+   *  held batches now in order (possibly none). Only the first call counts:
+   *  a later save state (a re-sync) lands on a stream already in order. */
+  start(frame: number): ReplayBatch[] {
+    if (this.next !== null) return [];
+    this.next = frame;
+    let first: ReplayBatch | undefined;
+    for (const b of this.held.values()) {
+      if (b.through < frame) this.held.delete(b.from);
+      else if (b.from <= frame) first = b;
+    }
+    if (!first) return [];
+    this.held.delete(first.from);
+    return this.take(first);
+  }
 
   /** Take a batch; get back the batches now in order (possibly none). */
   push(batch: ReplayBatch): ReplayBatch[] {
-    if (this.next === null) this.next = batch.from;
-    if (batch.through < this.next) return []; // already covered
-    if (batch.from > this.next) {
+    if (this.next !== null && batch.through < this.next) return []; // already covered
+    if (this.next === null || batch.from > this.next) {
       if (this.held.size < this.maxHeld) this.held.set(batch.from, batch);
       return [];
     }
-    const out: ReplayBatch[] = [];
-    // A batch straddling `next` (only after a restart) keeps what is new.
-    const fresh = batch.from < this.next ? { ...batch, from: this.next, inputs: batch.inputs.filter((i) => i.frame >= this.next!) } : batch;
-    out.push(fresh);
+    return this.take(batch);
+  }
+
+  /** `batch` covers `next`: out it goes, then every held batch it lets
+   *  through. One straddling `next` (the save state's frame, or after a
+   *  restart) keeps only what is new. */
+  private take(batch: ReplayBatch): ReplayBatch[] {
+    const next = this.next!;
+    const out = [batch.from < next ? { ...batch, from: next, inputs: batch.inputs.filter((i) => i.frame >= next) } : batch];
     this.next = batch.through + 1;
     for (let b = this.held.get(this.next); b; b = this.held.get(this.next)) {
       this.held.delete(this.next);
@@ -260,7 +287,7 @@ export class ReplayReassembler {
     return out;
   }
 
-  /** The first frame not yet covered, or null before any batch. */
+  /** The first frame not yet covered, or null before the start is known. */
   covered(): number | null {
     return this.next;
   }

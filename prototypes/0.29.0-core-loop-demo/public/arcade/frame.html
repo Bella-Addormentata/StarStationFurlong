@@ -189,7 +189,11 @@
       var replay = null;
       function startReplay(role, c) {
         var gm = window.EJS_emulator && window.EJS_emulator.gameManager;
-        if (!gm || !gm.functions || typeof gm.functions.simulateInput !== 'function') {
+        // The replay stands on save states (a late joiner starts from one,
+        // and the hashes are of one): a core that cannot make them cannot
+        // be replayed. EmulatorJS asks the core the same way before it
+        // offers its own save, load and netplay buttons.
+        if (!gm || !gm.functions || typeof gm.functions.simulateInput !== 'function' || typeof gm.supportsStates !== 'function' || !gm.supportsStates()) {
           post('arcade-replay-status', { phase: 'unsupported' });
           return;
         }
@@ -197,6 +201,20 @@
         var lead = c.replayLead >= 0 ? c.replayLead | 0 : 12;
         var batchFrames = c.replayBatchFrames > 0 ? c.replayBatchFrames | 0 : 6;
         var apply = gm.functions.simulateInput;
+        // The state as bytes, or null. EmulatorJS's getState hands back the
+        // core's error message, a string, when a save fails: then the
+        // replay stops and says so (`unsupported`). Player one's game goes
+        // on without it; a spectator's holds where it is.
+        function stateNow() {
+          var st = gm.getState();
+          if (st instanceof Uint8Array && st.length > 0) return st;
+          if (role === 'source') gm.functions.simulateInput = apply;
+          hooks.pre = role === 'source' ? null : function () { return false; };
+          hooks.post = null;
+          replay = null;
+          post('arcade-replay-status', { phase: 'unsupported' });
+          return null;
+        }
         // EmulatorJS's own hotkeys (indices 24–29: save, load, fast-forward,
         // rewind, slow motion) bend time or swap the state under the replay:
         // dropped on both sides while a replay runs.
@@ -210,8 +228,11 @@
           var nextFrom = lastBatch;
           var wantSnapshot = false;
           // Every input route (keyboard, gamepad, touch) ends here: record
-          // it with the frame it lands before.
+          // it with the frame it lands before. A stick comes as 0x7fff times
+          // its axis, a fraction, and the core takes an int (the call into
+          // wasm truncates it): the int is what is recorded and applied.
           gm.functions.simulateInput = function (p, i, v) {
+            v = v | 0;
             pending.push([gm.getFrameNum(), p, i, v]);
             held[p + ':' + i] = [p, i, v];
             return apply(p, i, v);
@@ -220,12 +241,17 @@
             var f = gm.getFrameNum();
             if (wantSnapshot) {
               wantSnapshot = false;
-              var st = gm.getState();
+              var st = stateNow();
+              if (!st) return;
               var heldRows = [];
               for (var k in held) if (held[k][2] !== 0) heldRows.push(held[k]);
               pageWin.postMessage({ type: 'arcade-replay-snapshot', frame: f, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
             }
-            if (f % hashEvery === 0) post('arcade-replay-hash', { frame: f, hash: stateHash(gm.getState()) });
+            if (f % hashEvery === 0) {
+              var hashed = stateNow();
+              if (!hashed) return;
+              post('arcade-replay-hash', { frame: f, hash: stateHash(hashed) });
+            }
             // An input stamped f arrives after this hook (between
             // iterations), so everything up to f - 1 is final now.
             if (f - lastBatch >= batchFrames) {
@@ -297,7 +323,9 @@
               // run while it waits ran on the old state, which the load
               // throws away.
               loadTries += 1;
-              var h = stateHash(gm.getState());
+              var cur = stateNow();
+              if (!cur) return;
+              var h = stateHash(cur);
               if (h !== snap.hash && loadTries < LOAD_TRIES) {
                 if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
                 return;
@@ -313,7 +341,11 @@
               return;
             }
             var s = gm.getFrameNum() + offset;
-            if (s % hashEvery === 0) post('arcade-replay-hash', { frame: s, hash: stateHash(gm.getState()) });
+            if (s % hashEvery === 0) {
+              var hashed = stateNow();
+              if (!hashed) return;
+              post('arcade-replay-hash', { frame: s, hash: stateHash(hashed) });
+            }
             var now = Date.now();
             if (now - lastStatus > 1000) { lastStatus = now; status(); }
           };
