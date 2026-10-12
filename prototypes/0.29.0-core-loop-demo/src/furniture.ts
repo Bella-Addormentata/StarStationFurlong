@@ -3872,6 +3872,15 @@ const arcadeCabinet2PStands: StandTemplate[] = [
   { stand: { x: -0.5, z: -1.0 }, faceAngle: 0 },
 ];
 
+// 🕹🕹🕹🕹 The double-wide cabinet (#242): a stand a pace back from each of
+// its four panels, s0 player 1 (red, left as you face the screens, local
+// -x) to s3 player 4 — the template index is the seat (arcadeDoc's
+// seat:<id>:<n>), the cabinet faced from +z.
+const arcadeCabinetWideStands: StandTemplate[] = Array.from({ length: ARCADE_WIDE_SEATS }, (_, p) => ({
+  stand: { x: (p - (ARCADE_WIDE_SEATS - 1) / 2) * (ARCADE_WIDE_W / ARCADE_WIDE_SEATS), z: 1.05 },
+  faceAngle: Math.PI,
+}));
+
 // ── 🏒 Air-hockey table builder (#115) ───────────────────────────────────────
 // A 1.7×2.7 m cabinet inside the 2×3 footprint, playfield sized exactly by the
 // engine constants, rails with real goal gaps, colour-keyed ends (side 'a'
@@ -5182,12 +5191,14 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     },
   },
   // 🕹🕹 The double-wide cabinet (#193): 2×1, two screens and four panels,
-  // the players a pace back along its front.
+  // the players a pace back along its front, a stand at each panel: the
+  // owner's own game seats four, each on their own computer (#242).
   "arcade-cabinet-wide": {
     kind: "arcade-cabinet-wide",
     build: buildWideArcadeCabinet,
     footprint: { w: 2, d: 1 },
     functions: ["arcade"],
+    stands: arcadeCabinetWideStands,
     device: {
       kind: "arcade",
       front: { x: 0, z: 1.05 },

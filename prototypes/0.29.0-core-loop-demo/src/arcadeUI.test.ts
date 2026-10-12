@@ -183,3 +183,62 @@ describe('the PLAY view (the owner\'s own game, at the cabinet)', () => {
     expect(html).not.toContain('data-arcade-coin');
   });
 });
+
+describe('the double-wide cabinet\'s four players (#242)', () => {
+  const wide = (view: ArcadeDeviceDeps['view'], canEdit: boolean, seat?: number): ArcadeDeviceDeps => ({ ...deps(view, canEdit), seats: 4, seat });
+  /** Another player's page takes a seat. */
+  const sits = (pub: string, name: string, page: string, seat: number) => {
+    setArcadeIdentity(() => ({ pub, name }));
+    setArcadePageId(page);
+    expect(insertCoin(CAB, seat).ok).toBe(true);
+    setArcadeIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    setArcadePageId('tab-a');
+  };
+
+  it('lists the four seats, a coin at each free one, the big one at the stand stepped up to', () => {
+    ownerPuts(LJ65);
+    sits('BBBBbobpub', 'Bob <b>', 'tab-b', 0);
+    const html = renderArcadePanel(CAB, wide(undefined, false, 2));
+    expect(html).toContain('PLAYERS · UP TO FOUR, EACH ON THEIR OWN COMPUTER');
+    expect(html).toMatch(/P1<\/span>\s*<span[^>]*>BOB &lt;B&gt;<\/span>/); // a peer's name, escaped
+    for (const n of [1, 2, 3]) expect(html).toContain(`data-arcade-coin="${n}"`);
+    expect(html).not.toContain('data-arcade-coin="0"');
+    expect(html).toContain('INSERT COIN · PLAY AS P3');
+    expect(html).not.toContain('data-arcade-eject'); // not the deed holder
+    expect(html).not.toContain('PLAYER ONE');
+    setArcadeEjectPredicate(() => true);
+    expect(renderArcadePanel(CAB, wide(undefined, false))).toContain('data-arcade-eject="0"');
+  });
+
+  it('gives a seated player the way back to the controls and STAND UP, and no second seat', () => {
+    ownerPuts(LJ65);
+    expect(insertCoin(CAB, 1).ok).toBe(true);
+    const html = renderArcadePanel(CAB, wide(undefined, false, 1));
+    expect(html).toMatch(/P2<\/span>\s*<span[^>]*>YOU<\/span>/);
+    expect(html).toContain('data-arcade-standup="1"');
+    expect(html).toContain('BACK TO THE CONTROLS');
+    expect(html).not.toContain('data-arcade-coin');
+  });
+
+  it('says so when every seat is taken', () => {
+    ownerPuts(LJ65);
+    for (const n of [0, 1, 2, 3]) sits(`P${n}pub`, `Player ${n}`, `tab-${n}`, n);
+    const html = renderArcadePanel(CAB, wide(undefined, false));
+    expect(html).toContain('All four seats are taken.');
+    expect(html).not.toContain('data-arcade-coin');
+  });
+
+  it('names every player in NOW PLAYING, and the deed holder\'s RESET stands them all up', () => {
+    ownerPuts(LJ65);
+    sits('BBBBbobpub', 'Bob', 'tab-b', 0);
+    sits('CCCCcarolpub', 'Carol', 'tab-c', 3);
+    const html = renderArcadePanel(CAB, wide('settings', true));
+    expect(html).toContain('PLAYER 1 · BOB');
+    expect(html).toContain('PLAYER 4 · CAROL');
+    expect(html).toContain('for up to four players, each on their own computer');
+    expect(html).toContain('data-arcade-reset="1" disabled'); // seated nowhere, and no EJECT
+    setArcadeEjectPredicate(() => true);
+    expect(resetArcadeCabinet(CAB, true, 4)).toBe('The players stood up · the cabinet is free.');
+    expect(renderArcadePanel(CAB, wide('settings', false))).toContain('Nobody · step up and INSERT COIN to play.');
+  });
+});
