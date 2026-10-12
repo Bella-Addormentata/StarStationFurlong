@@ -552,7 +552,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
 /// inside the task) so the same target cannot be planned twice before its task
 /// starts, counts it against the room's hold slots, and on failure puts the
 /// target in cooldown. The outcome is also noted in the address book when the
-/// target is a peer whose card we hold (`source` names what found it, for the log).
+/// target is a peer whose card we hold, read off the room (a hold cut short by
+/// the room's removal notes nothing; `source` names what found it, for the log).
 fn spawn_hold(
     hub: &crate::SharedHub,
     iroh_ep: &iroh::Endpoint,
@@ -592,11 +593,14 @@ fn spawn_hold(
         if let Some(n) = shared_h.active.lock().unwrap().get_mut(&room_h) {
             *n = n.saturating_sub(1);
         }
-        {
+        // The outcome is read off the room, not off `ok`: a hold that ended
+        // because the room went away made no contact and met no failure.
+        let linked = crate::linked_in_room(&hub_h, &room_h, &target_pub);
+        if linked || !ok {
             let now = chia_resolve::unix_now();
             let mut book = hub_h.peers.lock().unwrap();
             if book.peers.contains_key(&cand.node_id) {
-                if ok {
+                if linked {
                     book.note_ok(&cand.node_id, now);
                 } else {
                     book.note_fail(&cand.node_id, now);

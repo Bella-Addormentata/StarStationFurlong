@@ -238,8 +238,10 @@ pub fn ingest_room_cap(
 }
 
 /// May this node hand its contact card to the peers it is connected to in
-/// `room`? Only a room KNOWN to be private (N8: never a bundled or PUBLIC
-/// room, never one whose posture the browser has not stated). Independent of
+/// `room`, and file the cards they hand it? Only a room KNOWN to be private
+/// (N8: never a bundled or PUBLIC room, never one whose posture the browser
+/// has not stated). One answer gates both directions, so a visitor of a public
+/// room can neither learn our key nor fill our address book. Independent of
 /// the arming toggle: a card lets the other side find US once we publish, and
 /// theirs lets us find them, whether or not either publishes yet.
 impl ChiaRoomCap {
@@ -485,7 +487,7 @@ mod tests {
     #[test]
     fn cards_are_shared_only_in_rooms_known_private() {
         let private = ChiaRoomCap { room_key: [9u8; 32], chia_mode: false, public_room: Some(false), seq: 0, restored: false };
-        assert!(private.may_share_card(), "a private room shares, armed or not");
+        assert!(private.may_share_card(), "a private room shares (and files the peers' cards), armed or not");
         let restored = ChiaRoomCap { chia_mode: true, restored: true, ..private.clone() };
         assert!(!restored.may_share_card(), "a cap restored from disk may have gone public meanwhile: no card");
         assert!(!restored.may_publish(), "nor does it arm the room publisher");

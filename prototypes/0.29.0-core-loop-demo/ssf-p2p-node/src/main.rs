@@ -2237,7 +2237,8 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
 const DIAL_PINHOLE_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Did we dial `peer` lately: a dial in flight (`hub.dialing`), or one that
-/// ended within [`DIAL_PINHOLE_GRACE`] (`hub.recent_dials`, pruned here)?
+/// ended within [`DIAL_PINHOLE_GRACE`] (`hub.recent_dials`, pruned here and
+/// in [`release_dial`])?
 #[cfg(feature = "chia-read")]
 fn dialed_lately(hub: &HubState, peer: &PublicKey, now: std::time::Instant) -> bool {
     if hub.dialing.lock().unwrap().contains(peer) {
@@ -2258,11 +2259,28 @@ const CARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// remembering the dial for the pinhole grace FIRST: every path that claims a
 /// dial (the browser's, the mesh's, the watcher's holds) releases it here, so
 /// no inbound connection our own Initials enabled can pass as unsolicited, not
-/// even in the instant between the two steps.
+/// even in the instant between the two steps. Entries whose grace has run out
+/// are dropped on every release, so the map holds the dials of the last two
+/// minutes at most, however many unreachable peers a node tries in a row.
 pub(crate) fn release_dial(hub: &HubState, peer: PublicKey) {
     #[cfg(feature = "chia-read")]
-    hub.recent_dials.lock().unwrap().insert(peer, std::time::Instant::now());
+    {
+        let now = std::time::Instant::now();
+        let mut recent = hub.recent_dials.lock().unwrap();
+        recent.retain(|_, ended| now.duration_since(*ended) < DIAL_PINHOLE_GRACE);
+        recent.insert(peer, now);
+    }
     hub.dialing.lock().unwrap().remove(&peer);
+}
+
+/// Is `peer` connected in `room_id` right now? Hold outcomes are recorded from
+/// this, never from [`hold_dial`]'s return value alone: that is also `true` when
+/// the room went away or another path linked first. A hold that ended with the
+/// peer linked is contact, whichever path made the link; one that ended with no
+/// link and no exhausted window (the room is gone) counts as nothing.
+#[cfg(feature = "chia-read")]
+pub(crate) fn linked_in_room(hub: &HubState, room_id: &str, peer: &PublicKey) -> bool {
+    hub.rooms.lock().unwrap().get(room_id).is_some_and(|room| room.remote_peers.contains_key(peer))
 }
 
 // Issue #60 symptom 2: bounded, backing-off dial that runs OFF the browser's
@@ -2462,10 +2480,13 @@ async fn dial_peer_inner(
                             send.clone(),
                         )
                         .await;
-                        {
+                        // Recorded from the link itself: `ok` is also true when the
+                        // room went away mid-hold, which is neither contact nor failure.
+                        let linked = linked_in_room(&hub, &room_id, &target_pub_key);
+                        if linked || !ok {
                             let now = chia_resolve::unix_now();
                             let mut book = hub.peers.lock().unwrap();
-                            if ok {
+                            if linked {
                                 book.note_ok(&target_str, now);
                             } else {
                                 book.note_fail(&target_str, now);
@@ -2506,7 +2527,7 @@ async fn dial_peer_inner(
                                 chia_watch::HOLD_WINDOW.as_secs()
                             );
                             // hold_dial reports its own outcome to the browser.
-                            let ok = hold_dial(
+                            hold_dial(
                                 hub.clone(),
                                 iroh_ep.clone(),
                                 room_id.clone(),
@@ -2517,10 +2538,12 @@ async fn dial_peer_inner(
                                 send.clone(),
                             )
                             .await;
-                            // The dial as a whole reached the peer: the failure the
-                            // contact-key leg noted above was a stale v2 address, not
-                            // an unreachable peer, and must not count toward pruning.
-                            if ok && held_by_ck.is_some() {
+                            // The dial as a whole reached the peer (judged on the room,
+                            // since a vanished room also ends the hold with `true`): the
+                            // failure the contact-key leg noted above was a stale v2
+                            // address, not an unreachable peer, and must not count
+                            // toward pruning.
+                            if held_by_ck.is_some() && linked_in_room(&hub, &room_id, &target_pub_key) {
                                 let mut book = hub.peers.lock().unwrap();
                                 if book.peers.contains_key(&target_str) {
                                     book.note_ok(&target_str, chia_resolve::unix_now());
@@ -2556,7 +2579,9 @@ async fn dial_peer_inner(
 /// introducer. `addrs` arrive public-only from [`chia_public_dial_addrs`]; the
 /// first attempt tries the IPv6 ones alone (see below), later attempts all of
 /// them. The CALLER owns the `hub.dialing` single-flight claim. Reports
-/// dialing/connected/failed to the browser; returns true on link.
+/// dialing/connected/failed to the browser; returns true on link, and also when
+/// the hold became moot (another path linked first, or the room is gone), so
+/// callers judge contact by [`linked_in_room`], not by the return value.
 #[cfg(feature = "chia-read")]
 pub(crate) async fn hold_dial(
     hub: SharedHub,
@@ -3499,8 +3524,20 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
         // never forwarded to the tabs (control kinds stop here).
         #[cfg(feature = "chia-read")]
         "contact" => {
+            // Filed only where WE would hand out ours (`may_share_card`): a room
+            // this process holds a live private cap for — never a public, bundled
+            // or posture-unknown room, not one restored from disk before the
+            // browser is back, and not a room we hold no cap for at all (the first
+            // envelope on a connection picks the room, so a peer can name any).
+            // Without that, any visitor of a public room could file self-signed
+            // identities until MAX_PEERS evicted the contacts that matter. Judged
+            // before the signature, so a flood costs no verification; a card
+            // dropped here comes again with the peer's next connection.
+            let admitted = hub.chia_rooms.lock().unwrap().get(room_id).is_some_and(|cap| cap.may_share_card());
             if env.author.as_slice() != remote_id.as_bytes() {
                 eprintln!("🔒 CONTACT-DROP: card envelope not authored by the connection peer {remote_id}");
+            } else if !admitted {
+                eprintln!("🔒 CONTACT-DROP: card from {remote_id} in room {room_id}, which has no live private cap here");
             } else if let Ok(card) = serde_json::from_slice::<chia_contact::ContactCard>(&env.payload) {
                 match chia_contact::verify_card(&card, chia_resolve::unix_now()) {
                     Ok(verified) if verified.node_id == remote_id => {
