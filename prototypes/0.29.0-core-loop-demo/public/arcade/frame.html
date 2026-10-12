@@ -404,13 +404,19 @@
             }
             if (phase === 'loading') {
               // As a spectator's load (above): landed when the state is seat
-              // 0's, asked again every LOAD_RETRY iterations meanwhile.
+              // 0's, asked again every LOAD_RETRY iterations meanwhile, and
+              // after LOAD_TRIES it holds and says the load failed.
               loadTries += 1;
               var cur = stateNow();
               if (!cur) return;
               var h = stateHash(cur);
-              if (h !== snap.hash && loadTries < LOAD_TRIES) {
-                if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+              if (h !== snap.hash) {
+                if (loadTries < LOAD_TRIES) {
+                  if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+                  return;
+                }
+                phase = 'waiting';
+                post('arcade-replay-status', { phase: phase, frame: at(), through: -1, loaded: snap.frame, hash: h, matches: false, tries: loadTries });
                 return;
               }
               offset = snap.frame - gm.getFrameNum();
@@ -421,7 +427,7 @@
               for (var q = 0; q < snap.held.length; q++) feed(snap.held[q][0], snap.held[q][1], snap.held[q][2]);
               for (var qf in queue) if (+qf < start) delete queue[qf];
               phase = 'stalled';
-              post('arcade-replay-status', { phase: phase, frame: at(), through: -1, loaded: snap.frame, hash: h, matches: h === snap.hash, tries: loadTries });
+              post('arcade-replay-status', { phase: phase, frame: at(), through: -1, loaded: snap.frame, hash: h, matches: true, tries: loadTries });
               return;
             }
             var s = at();

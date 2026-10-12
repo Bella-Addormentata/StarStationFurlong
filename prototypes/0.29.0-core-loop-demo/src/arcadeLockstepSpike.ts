@@ -29,7 +29,7 @@ import { emulatorDataPath, mountEmulatorFrame } from './arcadeEmulator';
 import type { EmulatorEvent, EmulatorHandle, ReplayStatus } from './arcadeEmulator';
 import type { ArcadeCore } from './arcadeDoc';
 import { batchRows, LockstepLedger, packInputBatch, ReplayReassembler, unpackInputBatch } from './arcadeReplay';
-import type { ReplayBatch } from './arcadeReplay';
+import type { ReplayBatch, ReplaySnapshot } from './arcadeReplay';
 
 const q = new URLSearchParams(location.search);
 const num = (k: string, d: number) => {
@@ -96,6 +96,16 @@ function forward(from: number, to: number, batches: ReplayBatch[]): void {
   for (const b of batches) frames[to]?.send({ type: 'arcade-replay-inputs', seat: from, from: b.from, through: b.through, inputs: batchRows(b) });
 }
 
+/** Seat 0's save state, where lockstep began. Every seat waits for every
+ *  other, so a seat whose load never landed can still start from it. */
+let begun: ReplaySnapshot | null = null;
+function sendBegun(to: number): void {
+  const s = begun;
+  if (!s) return;
+  const state = s.state.slice();
+  deliver(() => frames[to]?.send({ type: 'arcade-replay-snapshot', frame: s.frame, state, held: s.held, hash: s.hash }, [state.buffer]));
+}
+
 function deliver(fn: () => void): void {
   const ms = Math.max(0, latencyMs + (netRandom() * 2 - 1) * jitterMs);
   if (ms === 0) fn();
@@ -143,10 +153,8 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       for (let from = 0; from < seats; from++) {
         for (let to = 0; to < seats; to++) if (to !== from) forward(from, to, links[from]![to]!.start(s.frame));
       }
-      for (let to = 1; to < seats; to++) {
-        const state = s.state.slice();
-        deliver(() => frames[to]?.send({ type: 'arcade-replay-snapshot', frame: s.frame, state, held: s.held, hash: s.hash }, [state.buffer]));
-      }
+      begun = s;
+      for (let to = 1; to < seats; to++) sendBegun(to);
       break;
     }
     case 'replay-hash':
@@ -156,6 +164,8 @@ function onSeat(seat: number, ev: EmulatorEvent): void {
       const st = ev.status;
       if (st.phase === 'unsupported') stats.errors.push(`seat ${seat}: cannot replay (no save states)`);
       if (st.loaded !== undefined) stats.loads.push({ seat, frame: st.loaded, matches: st.matches, tries: st.tries });
+      // A load that never landed: the seat holds; hand it the save state again.
+      if (st.loaded !== undefined && st.matches === false) sendBegun(seat);
       me.status = st;
       break;
     }
