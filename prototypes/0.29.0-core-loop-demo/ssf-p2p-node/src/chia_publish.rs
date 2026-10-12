@@ -195,6 +195,17 @@ impl WalletLease {
         *self.incoming.lock().unwrap() = Some(faucet_coin);
     }
 
+    /// A spend from OUR wallet is still settling: a coin is parked other than
+    /// the faucet coin a claim spent (the dish's coin, not ours; that one is
+    /// [`WalletLease::incoming_pending`]). Read from the lease, never inferred
+    /// from a wallet listing: a flood of outputs can cut the listing short of
+    /// the parked coin, and a GIVE would then read as settled while its spend
+    /// is still live in the mempool (#245 review, round 16).
+    pub fn outgoing_pending(&self) -> bool {
+        let incoming = *self.incoming.lock().unwrap();
+        self.pending.lock().unwrap().keys().any(|id| Some(*id) != incoming)
+    }
+
     /// A gift to our wallet is still landing: the wallet is not empty even
     /// though the chain does not list the coin yet.
     pub fn incoming_pending(&self) -> bool {
@@ -891,6 +902,27 @@ mod tests {
         // is in the wallet; dropped: the wallet is still empty and may ask again).
         lease.release(&[claim.spend]);
         assert!(!lease.incoming_pending());
+    }
+
+    #[test]
+    fn our_own_spends_read_as_spending_from_the_lease_not_from_a_listing() {
+        let lease = WalletLease::new();
+        let ours = Bytes32::new([3u8; 32]);
+        let faucet_coin = Bytes32::new([4u8; 32]);
+        let t0 = Instant::now();
+        assert!(!lease.outgoing_pending());
+        // A claim parks the dish's coin, not ours: landing, not spending.
+        let claim = lease.park_at([faucet_coin], t0);
+        lease.mark_incoming(faucet_coin);
+        assert!(lease.incoming_pending() && !lease.outgoing_pending());
+        // A give parks a coin of ours: spending, whatever a wallet listing shows
+        // (one cut short may never reach the parked coin).
+        let give = lease.park_at([ours], t0);
+        assert!(lease.outgoing_pending());
+        lease.release(&[claim.spend]);
+        assert!(lease.outgoing_pending() && !lease.incoming_pending());
+        lease.release(&[give.spend]);
+        assert!(!lease.outgoing_pending());
     }
 
     #[test]

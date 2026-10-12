@@ -204,11 +204,13 @@ pub struct FaucetStatus {
     pub partial: bool,
     /// Why claim/give are off, in the dish's words.
     pub note: String,
-    /// A spend FROM our wallet is still settling: some of the coins the chain
-    /// lists as ours are parked by a push the chain and the mempool have not
-    /// settled yet (see `chia_publish::WalletLease`). The browser keeps its
+    /// A spend FROM our wallet is still settling: the lease has a coin of ours
+    /// parked by a push the chain and the mempool have not settled yet (see
+    /// `chia_publish::WalletLease::outgoing_pending`). The browser keeps its
     /// GIVING… pending while this holds and clears it from a later snapshot
     /// that no longer says so, never on elapsed time (#245 review, round 11).
+    /// Read from the lease, not inferred from the wallet listing, which a
+    /// flood of outputs can cut short of the parked coin (round 16).
     pub spending: bool,
     /// A gift from the dish is still landing in our wallet (the faucet coin the
     /// claim spent is parked): same for the browser's TAKING….
@@ -508,8 +510,13 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &CoinsetClient, para
                 // from the dish that is still landing counts the same way (the
                 // chain lists it only once the block confirms).
                 let landing = crate::chia_publish::WALLET_LEASE.incoming_pending();
-                st.can_claim = wallet.owned.is_empty() && !landing && st.ready > 0;
-                st.spending = wallet.spendable.len() < wallet.owned.len();
+                // A listing cut short lists coins, so it is never empty; should
+                // one ever be, it proves nothing about the wallet: TAKE stays
+                // off (fail closed, #245 review, round 16).
+                st.can_claim = wallet.owned.is_empty() && !wallet.partial && !landing && st.ready > 0;
+                // From the lease, not the listing: a parked coin the cut-short
+                // listing never reached is still a spend in flight (round 16).
+                st.spending = crate::chia_publish::WALLET_LEASE.outgoing_pending();
                 st.landing = landing;
                 st.note = if wallet.owned.is_empty() && landing {
                     "your mojo from the dish is on its way (about a minute); the wallet shows it when the block lands".into()
@@ -519,7 +526,7 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &CoinsetClient, para
                     "no mojo in the dish yet; it refills on the block clock".into()
                 } else if wallet.partial {
                     "your wallet holds more coins than the dish lists (cut short); giving uses the ones it read".into()
-                } else if wallet.spendable_mojos() < wallet.owned_mojos() {
+                } else if st.spending {
                     "a spend from your wallet is still confirming (about a minute); giving waits for it".into()
                 } else {
                     String::new()
@@ -626,8 +633,14 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
         ));
     }
     // Owned, not spendable: a coin parked by a spend in flight is still ours.
-    if !wallet_view(client, sk).await?.owned.is_empty() {
+    let wallet = wallet_view(client, sk).await?;
+    if !wallet.owned.is_empty() {
         return Err(anyhow!("your wallet already holds a coin; the dish is for players with an empty wallet"));
+    }
+    // A listing cut short proves nothing about emptiness (it lists coins, so
+    // this cannot happen; should it, fail closed — #245 review, round 16).
+    if wallet.partial {
+        return Err(anyhow!("your wallet listing was cut short, so the dish cannot tell that it is empty"));
     }
     let peak = crate::chia_resolve::peak_height(client)
         .await
