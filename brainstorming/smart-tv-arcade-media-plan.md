@@ -8,7 +8,9 @@ Issues: [#186 smart TV](https://github.com/Bella-Addormentata/StarStationFurlong
 
 Status: design of record for the TV, the cabinet and everything that moves media
 between players, consolidated from the research notes on #186 and #193
-(2026‑10‑03). Grounded in `prototypes/0.29.0-core-loop-demo` as of v0.38.0 and
+(2026‑10‑03). Grounded in `prototypes/0.29.0-core-loop-demo` as of main on
+2026‑10‑12 — v0.39.0 in `version.ts`, with the Unreleased work of #207, #208,
+#242, #248 and #250 merged — and
 in the sovereignty rules of [STUDY-Architecture v002 §3](AI%20BRAINSTORMING/STUDY-Architecture%20v002.md),
 the [Cabal DNS-free plan §3–§4](REVIEWS/REVIEW-20260707-Cabal-DNS-Free-Discovery-Plan.md)
 and [v007](AI%20BRAINSTORMING/STUDY-Architecture%20v007.md). Every option that
@@ -982,7 +984,11 @@ has with or without media, and the reader hardening — the ceiling, the
 buffer grown as bytes arrive, the deadline from acceptance, the
 unfinished-frame cap — is its own CRITICAL-PATH item in the TODO and a
 prerequisite of every lane that rides the reliable stream, never
-something that waits for the audio spike — and never the 4 KiB class,
+something that waits for the audio spike; the browser's `YjsSync` reader
+(`#readIncoming`) comes under the same ceiling and the same deadline,
+since it too reads until the declared length has arrived, keeping the
+bytes so far, with no deadline — the stream cancelled and the link
+re-dialled past it — and never the 4 KiB class,
 which would reset a room's sync before its kind was read. That ceiling
 rests on a
 DOCUMENT bound the sender enforces, never on a number borrowed from
