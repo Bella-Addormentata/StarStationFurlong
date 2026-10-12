@@ -291,9 +291,25 @@ class Room {
   constructor(private readonly order: 1 | -1 = 1) {}
   /** Who holds each seat (arcadeDoc's leases, as every page sees them). */
   leases = new Map<number, string>();
+  /** Or the leases are records in the doc, each renewed by its holder's
+   *  page every ARCADE_SEAT_RENEW_MS, as arcadeDoc's are. */
+  leasesInDoc = false;
+  /** Up to this much more on the way for each update, at random: the node
+   *  relays each on a stream of its own, so one can overtake another. */
+  jitterMs = 0;
+  /** Keys a page's doc lost to an update that overtook an earlier one (a
+   *  write that replaces a key, there before an earlier write of the same
+   *  page, empties the key until the earlier one is in). */
+  gaps = 0;
   private wire: Array<{ at: number; from: Page; update: Uint8Array }> = [];
   private nextTick = 0;
+  private nextRenew = 0;
   private added = 0;
+  private seed = 7;
+  private rand(): number {
+    this.seed = (Math.imul(this.seed, 1103515245) + 12345) >>> 0;
+    return this.seed / 2 ** 32;
+  }
 
   add(id: string, seat: number): Page {
     const doc = new Y.Doc();
@@ -316,7 +332,11 @@ class Room {
         keys: (prefix, max) => [...map.keys()].filter((k) => k.startsWith(prefix)).slice(0, max),
       },
       send: (m) => page.toFrame.push(m),
-      seatPage: (n) => this.leases.get(n) ?? null,
+      seatPage: (n) => {
+        if (!this.leasesInDoc) return this.leases.get(n) ?? null;
+        const rec = map.get(`seat:${n}`) as { page: string } | undefined;
+        return rec === undefined ? undefined : rec.page || null;
+      },
       visible: () => page.visible,
       now: () => this.now,
       newTag: () => `${id}${++tags}`,
@@ -327,10 +347,16 @@ class Room {
       unpack: async (b, raw) => new Uint8Array(inflateRawSync(b, { maxOutputLength: Math.max(1, raw) })),
     });
     doc.on('update', (update: Uint8Array, origin: unknown) => {
-      if (origin !== 'remote') this.wire.push({ at: this.now + this.latencyMs, from: page, update });
+      if (origin !== 'remote') this.wire.push({ at: this.now + this.latencyMs + this.rand() * this.jitterMs, from: page, update });
     });
-    map.observe(() => page.ctl.onDoc());
+    map.observe((ev) => {
+      if (ev.transaction.origin === 'remote') {
+        for (const [k, c] of ev.changes.keys) if (c.action === 'delete' && !k.startsWith('lsc:')) this.gaps += 1;
+      }
+      page.ctl.onDoc();
+    });
     this.leases.set(seat, id);
+    if (this.leasesInDoc) map.set(`seat:${seat}`, { page: id, at: this.now });
     this.pages.push(page);
     // The emulator comes up: frame.html says 'started' once its replay
     // role is set (held, waiting).
@@ -342,11 +368,12 @@ class Room {
   remove(page: Page): void {
     page.ctl.dispose();
     this.leases.delete(page.seat);
+    if (this.leasesInDoc) page.map.set(`seat:${page.seat}`, { page: '', at: this.now });
     this.pages = this.pages.filter((p) => p !== page);
   }
 
   private deliver(): void {
-    const due = this.wire.filter((w) => w.at <= this.now);
+    const due = this.wire.filter((w) => w.at <= this.now).sort((x, y) => x.at - y.at);
     this.wire = this.wire.filter((w) => w.at > this.now);
     for (const w of due) for (const p of this.pages) if (p !== w.from) Y.applyUpdate(p.doc, w.update, 'remote');
   }
@@ -380,6 +407,10 @@ class Room {
           p.ctl.tick();
           this.pump(p);
         }
+      }
+      if (this.leasesInDoc && this.now >= this.nextRenew) {
+        this.nextRenew = this.now + 3_000;
+        for (const p of this.pages) p.map.set(`seat:${p.seat}`, { page: p.id, at: this.now });
       }
       each?.(this.now);
       // A state deflated or inflated (settled at once) is handled now.
@@ -511,6 +542,32 @@ describe('players at the double-wide cabinet, page against page', () => {
     const c = room.compare();
     expect(c.mismatched).toBe(0);
     expect(c.compared).toBeGreaterThan(20);
+  });
+
+  it('updates that overtake earlier ones neither drop a player nor begin the game again', async () => {
+    // Each update up to 150 ms on the way, so one often overtakes an
+    // earlier one of the same page; with the leases records in the doc,
+    // renewed between the lanes' writes, a lane, a lease or the epoch now
+    // and then reads missing for a moment (room.gaps): that is taken as
+    // unchanged, not as a player gone.
+    const room = new Room();
+    room.jitterMs = 120;
+    room.leasesInDoc = true;
+    const pages = [room.add('pa', 0), room.add('pb', 1), room.add('pc', 2), room.add('pd', 3)];
+    const bots = () => allOf(...pages.map((p, n) => bot(p, n + 21)));
+    await room.run(10_000, bots());
+    const nonce = pages[0]!.frame.nonce;
+    for (const p of pages) expect(view(p)).toMatchObject({ phase: 'playing', players: [0, 1, 2, 3] });
+    const begins = pages.map((p) => p.begins);
+    const gaps = room.gaps;
+    await room.run(30_000, bots());
+    expect(room.gaps - gaps).toBeGreaterThan(10);
+    expect(pages.map((p) => p.begins)).toEqual(begins);
+    for (const p of pages) {
+      expect(p.frame.nonce).toBe(nonce);
+      expect(view(p)).toMatchObject({ phase: 'playing', players: [0, 1, 2, 3] });
+    }
+    expect(room.compare().mismatched).toBe(0);
   });
 
   for (const order of [1, -1] as const) {

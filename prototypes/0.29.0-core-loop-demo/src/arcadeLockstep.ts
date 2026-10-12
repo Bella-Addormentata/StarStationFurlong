@@ -248,8 +248,15 @@ export interface LockstepDeps {
   store: LockstepStore;
   /** To this page's frame (EmulatorHandle.send). */
   send(message: Record<string, unknown>, transfer?: Transferable[]): void;
-  /** The page holding seat n now (its lease, not lapsed), or null. */
-  seatPage(n: number): string | null;
+  /** The page holding seat n now (its lease, not lapsed), or null; or
+   *  undefined while its record reads missing. The room's updates can reach
+   *  a page out of order (the node relays each on a stream of its own), and
+   *  an update that replaces a key, there before an earlier update of the
+   *  same writer, empties that key until the earlier one is in: the doc
+   *  takes the replacing update's deletes at once and holds its writes. So
+   *  the controller takes a record that reads missing as unchanged, and the
+   *  lanes and the epoch the same way. */
+  seatPage(n: number): string | null | undefined;
   /** Whether this page is on screen. */
   visible(): boolean;
   now(): number;
@@ -329,6 +336,9 @@ export class LockstepController {
   /** When this page saw each lane last change, by its own clock. */
   private seen = new Map<number, { beat: number; page: string; at: number }>();
   private laneCache = new Map<number, { raw: unknown; lane: Lane | null }>();
+  private epochCache: { raw: unknown; epoch: Epoch | null } = { raw: undefined, epoch: null };
+  /** The page last known to hold each seat (LockstepDeps.seatPage). */
+  private pages = new Map<number, string | null>();
   private epochSeen = new Map<string, number>();
   private excluded = new Map<number, number>();
   private strikes = new Map<number, number>();
@@ -393,14 +403,17 @@ export class LockstepController {
     if (this.disposed) return;
     this.disposed = true;
     const { store, itemId, seat } = this.d;
-    const gone: string[] = [lockstepLaneKey(itemId, seat)];
+    // This page's own only: the seat may be another page's by now, its lane
+    // written, and a newer epoch's pieces may be in before its record.
+    const gone: string[] = [];
+    if (readLane(store.get(lockstepLaneKey(itemId, seat)), seat)?.page === this.d.page) gone.push(lockstepLaneKey(itemId, seat));
     const e = readEpoch(store.get(lockstepEpochKey(itemId)), this.d.seats);
     if (e && e.anchor === seat && e.page === this.d.page) {
       const now = this.d.now();
       const others = [...this.readLanes(now).keys()].filter((n) => n !== seat && e.seats.includes(n));
-      if (others.length === 0) gone.push(lockstepEpochKey(itemId), ...store.keys(lockstepChunkPrefix(itemId), 4096));
+      if (others.length === 0) gone.push(lockstepEpochKey(itemId), ...store.keys(`${lockstepChunkPrefix(itemId)}${e.nonce}:`, 4096));
     }
-    store.delete(gone);
+    if (gone.length > 0) store.delete(gone);
   }
 
   view(): LockstepView {
@@ -531,19 +544,36 @@ export class LockstepController {
     }
   }
 
+  /** The epoch as the doc has it. One that reads missing is taken as
+   *  unchanged (LockstepDeps.seatPage says why): one that is gone for good
+   *  is replaced by the next seat to begin. */
   private epoch(): Epoch | null {
-    const e = readEpoch(this.d.store.get(lockstepEpochKey(this.d.itemId)), this.d.seats);
+    const raw = this.d.store.get(lockstepEpochKey(this.d.itemId));
+    if (raw !== undefined && raw !== this.epochCache.raw) this.epochCache = { raw, epoch: readEpoch(raw, this.d.seats) };
+    const e = this.epochCache.epoch;
     return e && e.game === this.d.game ? e : null;
   }
 
-  /** Seat n's lane as the doc has it (read again only once it changes). */
+  /** Seat n's lane as the doc has it (read again only once it changes).
+   *  Another seat's that reads missing is taken as unchanged: one that is
+   *  gone for good stops beating, and lapses (its seat's lease has gone by
+   *  then, as a rule). */
   private lane(n: number): Lane | null {
     const raw = this.d.store.get(lockstepLaneKey(this.d.itemId, n));
     const hit = this.laneCache.get(n);
-    if (hit && hit.raw === raw) return hit.lane;
+    if (hit && (hit.raw === raw || (raw === undefined && n !== this.d.seat))) return hit.lane;
     const lane = readLane(raw, n);
     this.laneCache.set(n, { raw, lane });
     return lane;
+  }
+
+  /** The page holding seat n, the last one known while its record reads
+   *  missing. */
+  private seatPage(n: number): string | null {
+    const page = this.d.seatPage(n);
+    if (page === undefined) return this.pages.get(n) ?? null;
+    this.pages.set(n, page);
+    return page;
   }
 
   /** The lanes of the seats in now, as this page sees them. This page's
@@ -567,7 +597,7 @@ export class LockstepController {
         s = { beat: lane.beat, page: lane.page, at: now };
         this.seen.set(n, s);
       }
-      if (now - s.at >= LANE_LAPSE_MS || lane.game !== this.d.game || this.d.seatPage(n) !== lane.page) continue;
+      if (now - s.at >= LANE_LAPSE_MS || lane.game !== this.d.game || this.seatPage(n) !== lane.page) continue;
       out.set(n, lane);
     }
     return out;
@@ -797,7 +827,7 @@ export class LockstepController {
     for (const n of this.members) {
       if (n === this.d.seat) continue;
       const lane = this.lane(n);
-      if (!lane || lane.nonce !== this.nonce || this.d.seatPage(n) !== lane.page) continue;
+      if (!lane || lane.nonce !== this.nonce || this.seatPage(n) !== lane.page) continue;
       const have = this.fwd.get(n) ?? this.start - 1;
       if (lane.through <= have || lane.from > have + 1) continue;
       const inputs = lane.inputs.filter((i) => i.frame > have).map((i) => [i.frame, i.player, i.index, i.value]);

@@ -43,7 +43,7 @@
 
 import {
   arcadePageId, arcadeRawDelete, arcadeRawGet, arcadeRawKeys, arcadeRawSetMany, coreLabel, countPlay, gameId, gameLane,
-  mySeat, readCabinet, readSeat, seatStatus, standUp, subscribeArcadeKey,
+  mySeat, readCabinet, readSeat, seatKey, seatStatus, standUp, subscribeArcadeKey,
 } from './arcadeDoc';
 import type { ArcadeGame, EmulatorData } from './arcadeDoc';
 import { lockstepEpochKey, lockstepLaneKey, LockstepController, LOCKSTEP_BATCH_FRAMES, LOCKSTEP_DELAY } from './arcadeLockstep';
@@ -271,6 +271,9 @@ function startLockstep(t: Stage, frame: EmulatorHandle, key: string): void {
     store: { get: arcadeRawGet, set: arcadeRawSetMany, delete: arcadeRawDelete, keys: arcadeRawKeys },
     send: (m, transfer) => frame.send(m, transfer),
     seatPage: (n) => {
+      // A record that reads missing: one a later update emptied for now,
+      // the controller's to judge (LockstepDeps.seatPage).
+      if (arcadeRawGet(seatKey(itemId, n)) === undefined) return undefined;
       const rec = readSeat(itemId, n);
       return rec.holder && seatStatus(itemId, n) !== 'free' ? rec.page : null;
     },
