@@ -1215,6 +1215,12 @@ async fn main() -> Result<()> {
         match chia_wallet::load_or_mint_bls_key(seed_path) {
             Ok(chia_sk) => {
                 chia_wallet::log_receive_address(&chia_sk);
+                // The wallet lease's parking outlives the process (#245 review,
+                // round 17): a zero-fee spend can still sit in the mempool after
+                // a restart, and the restored parking keeps its inputs, and a
+                // mojo still landing, from being taken again. Beside the seed,
+                // same CWD-relative convention; before any writer runs.
+                chia_publish::WALLET_LEASE.restore(std::path::Path::new("wallet_lease.json"));
                 chia_heartbeat_sk = Some(chia_sk.clone());
                 // SLICE 4 test hook (SSF_CHIA_PUBLISH_TEST=1): once at startup, spend
                 // a coin to publish a presence record under a FIXED test room key, so
