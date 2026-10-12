@@ -204,11 +204,15 @@
         // The state as bytes, or null. EmulatorJS's getState hands back the
         // core's error message, a string, when a save fails: then the
         // replay stops and says so (`unsupported`). Player one's game goes
-        // on without it; a spectator's holds where it is.
+        // on as if no replay had started, its hotkeys back too; a
+        // spectator's holds where it is.
         function stateNow() {
           var st = gm.getState();
           if (st instanceof Uint8Array && st.length > 0) return st;
-          if (role === 'source') gm.functions.simulateInput = apply;
+          if (role === 'source') {
+            gm.functions.simulateInput = apply;
+            gm.simulateInput = gmSimulate;
+          }
           hooks.pre = role === 'source' ? null : function () { return false; };
           hooks.post = null;
           replay = null;

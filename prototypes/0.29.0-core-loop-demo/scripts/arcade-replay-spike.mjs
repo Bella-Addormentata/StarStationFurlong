@@ -14,9 +14,9 @@
  *        [--screenshot out.png]
  *
  * Exits non-zero when any compared hash differed, nothing was compared, or
- * either frame reported an error (one torn down partway through stops
- * comparing, which no mismatch would show). The negative control,
- * `--query drop=N`, is expected to.
+ * the harness or either frame reported an error (a frame torn down, or the
+ * harness stopped, partway through stops comparing, which no mismatch would
+ * show). The negative control, `--query drop=N`, is expected to.
  */
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {

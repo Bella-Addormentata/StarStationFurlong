@@ -273,6 +273,13 @@ function render(): void {
   ].filter(Boolean).join('\n');
 }
 
+// The harness's own failures count against the run: one that stopped it
+// partway would otherwise leave a clean ledger behind. (The frames' are
+// their own windows' and reach it only as messages; EmulatorJS's update
+// check fails in them every run, under the frame's policy.)
+window.addEventListener('error', (e) => stats.errors.push(`page: ${e.message}`));
+window.addEventListener('unhandledrejection', (e) => stats.errors.push(`page: ${String(e.reason)}`));
+
 (window as unknown as { __replaySpike: unknown }).__replaySpike = {
   stats: () => ({ ...stats, drift: ledger.read(), lagFrames: stats.lagFrames.slice(-600) }),
 };
