@@ -69,8 +69,8 @@ import { pilotLine, pilotPost, pilotSpeechAfter, readPilotView, type PilotSpeech
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
-  FURNITURE,
   ARCADE_CABINET_KINDS,
+  FURNITURE,
   FURNITURE_DEFS,
   DEFAULT_FOOTPRINT_OVERRIDES,
   buildItemGroup,
@@ -257,7 +257,7 @@ import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
 import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
 import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
 import { tickRomShare } from "./arcadeRomShare";
-import { arcadeScreenView, builtInEntry, countBuiltInPlay, readCabinet } from "./arcadeDoc";
+import { arcadeScreenView, builtInEntry, countBuiltInPlay, mySeat, readCabinet, seatStatus } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -6074,11 +6074,13 @@ export class World {
    * controls and depends on the cabinet's one game, the owner's pick: a
    * built-in game plays on the cabinet's own screen (arcadeNesCabinet.ts —
    * `seat` is the stand stepped up to, of `seats`), the owner's own game in
-   * the panel whose INSERT COIN opens EmulatorJS's stage. SETTINGS, from
-   * the ⚙️, is the panel's for both. Each swaps to the other in place, and
-   * PLAY is rebuilt when the owner changes the game.
+   * the panel whose INSERT COIN opens EmulatorJS's stage — for player one,
+   * or at the double-wide cabinet for up to four players in step (#242),
+   * `seat` the stand stepped up to. SETTINGS, from the ⚙️, is the panel's
+   * for both. Each swaps to the other in place, and PLAY is rebuilt when
+   * the owner changes the game.
    */
-  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView, seat: 0 | 1 = 0, seats: 1 | 2 = 1): DeviceUI {
+  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView, seat = 0, seats: 1 | 2 = 1): DeviceUI {
     const swap = (next: ArcadePanelView) => () => {
       deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, next, seat, seats));
     };
@@ -6090,7 +6092,7 @@ export class World {
         onGameChanged: swap("play"),
         openSettings: swap("settings"),
         onPlay: () => countBuiltInPlay(deviceId),
-        seat,
+        seat: seat === 1 ? 1 : 0,
         seats,
         requestRelease: () => deviceFocus.release(),
       });
@@ -6100,12 +6102,42 @@ export class World {
       myPub: () => getIdentityPub(),
       myName: () => getPlayerName(),
       canEdit: () => canEditRoom().ok,
-      openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId)),
+      openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId, this.arcadeSeats(deviceId) === 4 ? 4 : 1)),
       view,
       openSettings: swap("settings"),
       openPlay: swap("play"),
-      seats: standsForItem(deviceId).length > 0 ? 2 : 1,
+      seats: this.arcadeSeats(deviceId),
+      seat,
     });
+  }
+
+  /** 🕹 A cabinet's stands: the two-player cabinet's two, the double-wide
+   *  cabinet's four (#242), or none (1: the device front). */
+  private arcadeSeats(deviceId: string): 1 | 2 | 4 {
+    const kind = FURNITURE.find((i) => i.id === deviceId)?.kind;
+    return kind === "arcade-cabinet-wide" ? 4 : kind === "arcade-cabinet-2p" ? 2 : 1;
+  }
+
+  /** 🕹🕹🕹🕹 The double-wide cabinet's stand for this page (#242): its own
+   *  seat's, else the lowest seat nobody holds — by the seats' leases, not by
+   *  who stands near (four stands a step apart). None free, or none it can
+   *  walk to: null, the device front. Its own seat's stand counts only while
+   *  it can walk there (furniture set down since it sat can fence one off),
+   *  and the panel at the front still shows its seat. */
+  private pickArcadeSeatStand(deviceId: string): StandSlot | null {
+    const stands = standsForItem(deviceId);
+    const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
+    const reachable = this.standReachability();
+    const mine = mySeat(deviceId, 4);
+    if (mine !== null) {
+      const own = at(mine);
+      return own && reachable(own) ? own : null;
+    }
+    for (let n = 0; n < 4; n++) {
+      const s = at(n);
+      if (s && seatStatus(deviceId, n) === "free" && reachable(s)) return s;
+    }
+    return null;
   }
 
   /**
@@ -6641,15 +6673,20 @@ export class World {
     // TV hands off to its theatre.
     if (device.kind === "arcade") {
       // The two-player cabinet has a stand per player (s0 = player 1):
-      // walk to the free one, and its index is the seat. The one-player
-      // cabinet has no stands, just the device front.
-      const twoPlayer = standsForItem(deviceId).length > 0;
-      const stand = twoPlayer ? this.pickFreeStand(deviceId) : null;
-      const seat = stand && stand.id.endsWith(":s1") ? 1 : 0;
+      // walk to the free one, and its index is the seat. The double-wide
+      // cabinet's four stands are its owner's own game's players (#242):
+      // this page's seat's, or the lowest free one. Its built-in games, and
+      // the one-player cabinet, play from the device front.
+      const seats = this.arcadeSeats(deviceId);
+      const builtIn = builtInEntry(readCabinet(deviceId).game) !== null;
+      const stand = seats === 2 ? this.pickFreeStand(deviceId)
+        : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId)
+          : null;
+      const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : 0;
       const target: DeviceTarget = stand
         ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
         : device;
-      deviceFocus.beginFocus(this.player, target, this.arcadeCabinetUI(deviceId, "play", seat, twoPlayer ? 2 : 1));
+      deviceFocus.beginFocus(this.player, target, this.arcadeCabinetUI(deviceId, "play", seat, seats === 2 ? 2 : 1));
       return;
     }
 

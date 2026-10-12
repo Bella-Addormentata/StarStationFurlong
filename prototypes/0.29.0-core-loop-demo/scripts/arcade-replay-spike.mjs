@@ -11,15 +11,18 @@
  *
  *   node scripts/arcade-replay-spike.mjs [--url http://localhost:5173] [--minutes 10]
  *        [--query "rom=/emulatorjs/roms/lj65.nes&latency=40&jitter=30"] [--chromium /path/to/chrome]
- *        [--screenshot out.png]
+ *        [--screenshot out.png] [--page lockstep-spike.html]
+ *
+ * --page lockstep-spike.html runs the four-seat lockstep spike instead
+ * (src/arcadeLockstepSpike.ts; its query takes seats, delay, batchFrames).
  *
  * Exits non-zero when any compared hash differed, nothing was compared, no
  * new comparison came for longer than ten hash periods (or 15 s) at any
- * point from the spectator's start on, or the harness or either frame
- * reported an error: a frame torn down or frozen, a spectator that never
- * got going, or the harness stopped, partway through stops comparing, which
- * no mismatch would show. The negative control, `--query drop=N`, is
- * expected to.
+ * point from the spectator's start on (in lockstep, from every seat's), or
+ * the harness or any frame reported an error: a frame torn down or frozen,
+ * a spectator or seat that never got going, or the harness stopped, partway
+ * through stops comparing, which no mismatch would show. The negative
+ * control, `--query drop=N`, is expected to.
  */
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -30,6 +33,8 @@ const base = arg('url', 'http://localhost:5173').replace(/\/+$/, '');
 const minutes = Number(arg('minutes', '10'));
 const query = arg('query', '');
 const executablePath = arg('chromium', process.env.CHROMIUM_PATH);
+const pageName = arg('page', 'replay-spike.html');
+const lockstep = pageName.startsWith('lockstep');
 
 let chromium;
 try {
@@ -45,8 +50,8 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage({ viewport: { width: 1100, height: 700 } });
 page.on('pageerror', (e) => console.log(`[page error] ${e.message}`));
-await page.goto(`${base}/replay-spike.html${query ? `?${query}` : ''}`);
-const read = () => page.evaluate(() => window.__replaySpike?.stats());
+await page.goto(`${base}/${pageName}${query ? `?${query}` : ''}`);
+const read = () => page.evaluate(() => (window.__replaySpike ?? window.__lockstepSpike)?.stats());
 const started = Date.now();
 const until = started + minutes * 60_000;
 let last;
@@ -54,6 +59,12 @@ while (Date.now() < until) {
   await page.waitForTimeout(Math.min(30_000, until - Date.now()));
   last = await read();
   const d = last?.drift;
+  if (lockstep) {
+    const seats = (last?.perSeat ?? []).map((p, i) => `${i + 1}:${p.status?.phase ?? '-'}@${p.status?.frame ?? '-'} held ${p.status?.waits ?? 0}`).join(' ');
+    console.log(`[${((Date.now() - started) / 60_000).toFixed(1)} min] compared ${d?.compared} matched ${d?.matched} mismatched ${d?.mismatched} · ${seats}` +
+      (last?.errors?.length ? ` · errors ${last.errors.join('; ')}` : ''));
+    continue;
+  }
   console.log(
     `[${((Date.now() - started) / 60_000).toFixed(1)} min] source frame ${last?.sourceFrame} · follower ${last?.follower?.phase} @ ${last?.follower?.frame}` +
       ` · compared ${d?.compared} matched ${d?.matched} mismatched ${d?.mismatched}` +
@@ -69,6 +80,49 @@ const lag = last?.lagFrames ?? [];
 const sorted = [...lag].sort((a, b) => a - b);
 const pct = (p) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] : null);
 const seconds = (Date.now() - started) / 1000;
+/** Exit 0 only on a clean run, with fresh comparisons all the way through:
+ *  a run whose frames froze after a match would otherwise end with that
+ *  match and nothing against it. */
+function finish() {
+  const d = last?.drift;
+  const gapLimitMs = Math.max(15_000, (10 * (last?.hashEvery ?? 60) * 1000) / 60);
+  const kept = (last?.longestGapMs ?? Infinity) <= gapLimitMs;
+  if (d?.compared && !kept) console.log(`[replay-spike] comparing stopped for ${last?.longestGapMs} ms (limit ${gapLimitMs} ms)`);
+  process.exit(d && d.compared > 0 && d.mismatched === 0 && kept && !last?.errors?.length ? 0 : 1);
+}
+if (lockstep) {
+  // Seconds of lockstep, for the per-second rates: from the moment seat 0
+  // began it (the page's own clock), and frames counted from that frame.
+  const lockSeconds = Math.max(1, last?.lockSeconds ?? seconds);
+  const lockFrame = last?.lockFrame ?? 0;
+  console.log(JSON.stringify({
+    minutes,
+    query,
+    seats: last?.seats,
+    delay: last?.delay,
+    drift: last?.drift,
+    loads: last?.loads,
+    snapshotBytes: last?.snapshotBytes,
+    perSeat: (last?.perSeat ?? []).map((p) => ({
+      phase: p.status?.phase,
+      frame: p.status?.frame,
+      stalls: p.status?.stalls,
+      framesHeld: p.status?.waits,
+      iterations: p.status?.iters,
+      // The share of main-loop iterations spent holding for another seat.
+      heldShare: p.status?.iters ? Number(((p.status.waits ?? 0) / p.status.iters).toFixed(3)) : null,
+      // Game frames run per second of lockstep: 60 is full speed on NES.
+      framesPerSecond: Number((((p.status?.frame ?? lockFrame) - lockFrame) / lockSeconds).toFixed(1)),
+      iterationsPerSecond: Number(((p.status?.iters ?? 0) / lockSeconds).toFixed(1)),
+      inputs: p.inputs,
+      wireBytesPerSecond: Math.round(p.wireBytes / lockSeconds),
+      messagesPerSecond: Number((p.messages / lockSeconds).toFixed(1)),
+    })),
+    longestGapMs: last?.longestGapMs,
+    errors: last?.errors,
+  }, null, 2));
+  finish();
+}
 console.log(JSON.stringify({
   minutes,
   query,
@@ -87,10 +141,4 @@ console.log(JSON.stringify({
   lagFrames: { p50: pct(50), p95: pct(95), max: sorted.at(-1) ?? null, samples: sorted.length },
   errors: last?.errors,
 }, null, 2));
-const d = last?.drift;
-// Fresh comparisons all the way through: a run whose frames froze after a
-// match would otherwise end with that match and nothing against it.
-const gapLimitMs = Math.max(15_000, (10 * (last?.hashEvery ?? 60) * 1000) / 60);
-const kept = (last?.longestGapMs ?? Infinity) <= gapLimitMs;
-if (d?.compared && !kept) console.log(`[replay-spike] comparing stopped for ${last?.longestGapMs} ms (limit ${gapLimitMs} ms)`);
-process.exit(d && d.compared > 0 && d.mismatched === 0 && kept && !last?.errors?.length ? 0 : 1);
+finish();

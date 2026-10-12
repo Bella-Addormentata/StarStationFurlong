@@ -230,7 +230,10 @@ export type FurnitureKind =
   | "smart-tv"
   | "tv-stand"
   // 🕹 The arcade cabinet (#193): P1 at the controls, the attract card on a canvas.
-  | "arcade-cabinet";
+  | "arcade-cabinet"
+  // 🕹🕹 The double-wide cabinet (#193): two screens as one wide picture,
+  // four control panels — the deluxe four-player cabinet.
+  | "arcade-cabinet-wide";
 
 export interface FurnitureItem {
   id: string;
@@ -1782,10 +1785,17 @@ const ARCADE_SCREEN_Y = 1.3;
 /** Screen texture: 4:3, the cabinet's own ratio. */
 const ARCADE_TEX_W = 320;
 const ARCADE_TEX_H = 240;
+/** The double-wide cabinet: a 1.6 m body in a 2×1 footprint, two 4:3
+ *  screens side by side showing one picture, four players' panels.
+ *  Its depth is the single cabinet's: the screens tilt back into the upper
+ *  body's face, so a deeper body would bury their top edge. */
+const ARCADE_WIDE_W = 1.6;
+const ARCADE_WIDE_D = ARCADE_D;
+const ARCADE_WIDE_SEATS = 4;
 
 /** The furniture kinds that are arcade cabinets (main.ts and world.ts tick
  *  them, arcadeDoc keys them by item id alike). */
-export const ARCADE_CABINET_KINDS: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>(["arcade-cabinet", "arcade-cabinet-2p"]);
+export const ARCADE_CABINET_KINDS: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>(["arcade-cabinet", "arcade-cabinet-2p", "arcade-cabinet-wide"]);
 
 const buildWallComputer = (ctx: BuildCtx) => {
   const { m, place } = ctx;
@@ -3862,6 +3872,15 @@ const arcadeCabinet2PStands: StandTemplate[] = [
   { stand: { x: -0.5, z: -1.0 }, faceAngle: 0 },
 ];
 
+// 🕹🕹🕹🕹 The double-wide cabinet (#242): a stand a pace back from each of
+// its four panels, s0 player 1 (red, left as you face the screens, local
+// -x) to s3 player 4 — the template index is the seat (arcadeDoc's
+// seat:<id>:<n>), the cabinet faced from +z.
+const arcadeCabinetWideStands: StandTemplate[] = Array.from({ length: ARCADE_WIDE_SEATS }, (_, p) => ({
+  stand: { x: (p - (ARCADE_WIDE_SEATS - 1) / 2) * (ARCADE_WIDE_W / ARCADE_WIDE_SEATS), z: 1.05 },
+  faceAngle: Math.PI,
+}));
+
 // ── 🏒 Air-hockey table builder (#115) ───────────────────────────────────────
 // A 1.7×2.7 m cabinet inside the 2×3 footprint, playfield sized exactly by the
 // engine constants, rails with real goal gaps, colour-keyed ends (side 'a'
@@ -5169,6 +5188,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.54, z: -1.12 },
       anchor: { x: 0, y: 1.41, z: -0.09 },
+    },
+  },
+  // 🕹🕹 The double-wide cabinet (#193): 2×1, two screens and four panels,
+  // the players a pace back along its front, a stand at each panel: the
+  // owner's own game seats four, each on their own computer (#242).
+  "arcade-cabinet-wide": {
+    kind: "arcade-cabinet-wide",
+    build: buildWideArcadeCabinet,
+    footprint: { w: 2, d: 1 },
+    functions: ["arcade"],
+    stands: arcadeCabinetWideStands,
+    device: {
+      kind: "arcade",
+      front: { x: 0, z: 1.05 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.5, z: 1.25 },
+      anchor: { x: 0, y: ARCADE_SCREEN_Y, z: 0.2 },
     },
   },
 };
@@ -10917,8 +10953,8 @@ function buildTvStand(ctx: BuildCtx) {
  * (FURLONG ARCADE, the game, a blinking INSERT COIN, the tally and how many
  * play), "P1 · <name>" while someone plays, or the empty card — with
  * scanlines over it (the #194 pass in its cheapest form). Returns the
- * glow's intensity for the view. Shared by the cabinet and the double-wide
- * one, whose 8:3 canvas spans its two screens as one picture.
+ * glow's intensity for the view. Every cabinet's screen paints it
+ * (arcadeScreenSurface).
  */
 function paintArcadeScreen(c2d: CanvasRenderingContext2D, w: number, h: number, view: ArcadeScreenView, players: string): number {
   const text = (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
@@ -11039,10 +11075,10 @@ function arcadeScreenSurface(players: string, setGlow: (i: number) => void, onVi
  * 🕹 The marquee (#193): the game's name, lit from behind in a box above the
  * screen, like the cabinets of old. Repainted only when the name changes.
  */
-function arcadeMarquee(planeW: number, planeH: number): { texture: THREE.CanvasTexture; show: (title: string) => void } {
+function arcadeMarquee(planeW: number, planeH: number, canvasW = 512): { texture: THREE.CanvasTexture; show: (title: string) => void } {
   const canvas = document.createElement("canvas");
-  canvas.width = 512;
-  canvas.height = Math.round((512 * planeH) / planeW);
+  canvas.width = canvasW;
+  canvas.height = Math.round((canvasW * planeH) / planeW);
   const g = canvas.getContext("2d")!;
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
@@ -11178,6 +11214,86 @@ function buildArcadeCabinet(ctx: BuildCtx) {
   // the room record's card, and the built-in emulator's painter.
   screen.userData.arcadeScreen = surface.screen;
   screen.userData.arcadeCabinet = surface.visual;
+}
+
+/**
+ * 🕹🕹 The double-wide cabinet (#193): the deluxe four-player cabinet of the
+ * early nineties — two monitors side by side, and a control deck long
+ * enough for four players shoulder to shoulder, each with a stick, two
+ * buttons and a coin slot in their player colour. A 1.6 m body in a 2×1
+ * footprint, screens to local +z, with the single cabinet's lit marquee
+ * (across the top) and ⚙️ (low on the front). Both monitors show the one
+ * screen both emulators share (arcadeScreenSurface): the built-in game, or
+ * the card. Stows its handles on the left screen (userData.arcadeScreen,
+ * userData.arcadeCabinet) for registerFurnitureHandles.
+ */
+function buildWideArcadeCabinet(ctx: BuildCtx) {
+  const { m, place, addLight } = ctx;
+  const BODY = 0x141a2e;
+  const PANEL = 0x1a1f2a;
+  const SIDE = 0x00e5ff;
+  /** P1 to P4, left to right: the colours four-player cabinets used. */
+  const PLAYER = [0xff3b3b, 0x3b8bff, 0x2fe6a0, 0xffd23b];
+  const w = ARCADE_WIDE_W;
+  const d = ARCADE_WIDE_D;
+
+  // Plinth, lower body, upper body, cap.
+  place(new THREE.BoxGeometry(w, 0.12, d), m(0x0a0d16, 0.7, 0.2), 0, 0.06, 0);
+  place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
+  place(new THREE.BoxGeometry(w, 0.7, d - 0.25), m(BODY, 0.6, 0.15), 0, 1.25, -0.11);
+  place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
+  for (const sx of [-1, 1]) {
+    place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 - 0.006), 1.0, 0.05);
+  }
+  // The control deck: four stations, a stick and two buttons each, and a
+  // coin slot each below, lit in the player's colour.
+  const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
+  deck.rotation.x = -0.22;
+  for (let p = 0; p < ARCADE_WIDE_SEATS; p++) {
+    const cx = (p - (ARCADE_WIDE_SEATS - 1) / 2) * (w / ARCADE_WIDE_SEATS);
+    const color = PLAYER[p]!;
+    place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), cx - 0.08, 1.04, 0.3);
+    place(new THREE.SphereGeometry(0.028, 10, 8), m(color, 0.4, 0.1), cx - 0.08, 1.09, 0.3);
+    for (const bx of [0.04, 0.11]) {
+      place(new THREE.CylinderGeometry(0.02, 0.02, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), cx + bx, 1.0, 0.31);
+    }
+    place(new THREE.BoxGeometry(0.08, 0.1, 0.02), m(0x3d4a5e, 0.5, 0.5), cx, 0.5, d / 2 - 0.005);
+    place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 + 0.003);
+  }
+  // ⚙️ in the middle, below the coin doors, just above the plinth: anyone's
+  // way to the settings.
+  placeArcadeSettingsGear(ctx, 0, (d - 0.03) / 2);
+  // Marquee: the game's name, lit in a box across the top.
+  place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
+  const marquee = arcadeMarquee(w - 0.06, 0.13, 1024);
+  const marqueeMat = new THREE.MeshBasicMaterial({ map: marquee.texture, transparent: true, opacity: 0, toneMapped: false });
+  marqueeMat.userData.baseOpacity = 1;
+  place(new THREE.PlaneGeometry(w - 0.06, 0.13), marqueeMat, 0, 1.74, 0.111);
+  addLight(new THREE.PointLight(0xffc070, 0, 2.2), 0, 1.74, 0.35, 0.3);
+
+  // The pair's glow on the deck and the floor: driven with the view.
+  const glow = new THREE.PointLight(0x7fd8ff, 0, 4);
+  addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
+  const setGlow = (i: number) => {
+    glow.userData.targetIntensity = i;
+    glow.intensity = i;
+  };
+  // Two monitors, one picture: the same screen on both, so every station
+  // sees the game.
+  const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title));
+  const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
+  screenMat.userData.baseOpacity = 1;
+  for (const sx of [-1, 1]) {
+    const bezel = place(new THREE.BoxGeometry(0.66, 0.5, 0.03), m(PANEL, 0.5, 0.3), sx * 0.34, ARCADE_SCREEN_Y, 0.15);
+    bezel.rotation.x = -0.14;
+    const plane = place(new THREE.PlaneGeometry(0.6, 0.45), screenMat, sx * 0.34, ARCADE_SCREEN_Y + 0.002, 0.168);
+    plane.rotation.x = -0.14;
+    if (sx < 0) {
+      // Both handles once, on the left screen (registerFurnitureHandles).
+      plane.userData.arcadeScreen = surface.screen;
+      plane.userData.arcadeCabinet = surface.visual;
+    }
+  }
 }
 
 /**

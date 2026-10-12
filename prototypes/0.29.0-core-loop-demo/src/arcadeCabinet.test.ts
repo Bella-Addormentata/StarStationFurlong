@@ -26,7 +26,7 @@ function fakeCanvas() {
 
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
-const { buildItemGroup, ARCADE_GEAR_Y, FURNITURE_DEFS } = await import('./furniture');
+const { buildItemGroup, ARCADE_CABINET_KINDS, ARCADE_GEAR_Y, FURNITURE_DEFS } = await import('./furniture');
 
 const ID = 'arcade-cabinet-1';
 
@@ -135,6 +135,93 @@ describe('the arcade cabinet as built', () => {
     const afterPlay = fills;
     handle.draw(view('empty', false, 'FURLONG ARCADE'));
     expect(fills).toBeGreaterThan(afterPlay);
+  });
+});
+
+describe('the double-wide cabinet as built', () => {
+  const WIDE = 'arcade-cabinet-wide-1';
+  const buildWide = (): THREE.Group => {
+    const group = buildItemGroup({ id: WIDE, kind: 'arcade-cabinet-wide', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    group.updateMatrixWorld(true);
+    return group;
+  };
+
+  it('keeps every mesh inside its 2×1 footprint', () => {
+    const { w, d: depth } = FURNITURE_DEFS['arcade-cabinet-wide'].footprint!;
+    expect([w, depth]).toEqual([2, 1]);
+    let meshes = 0;
+    buildWide().traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      meshes++;
+      const box = new THREE.Box3().setFromObject(obj);
+      expect(box.min.x).toBeGreaterThanOrEqual(-w / 2 - 1e-9);
+      expect(box.max.x).toBeLessThanOrEqual(w / 2 + 1e-9);
+      expect(box.min.z).toBeGreaterThanOrEqual(-depth / 2 - 1e-9);
+      expect(box.max.z).toBeLessThanOrEqual(depth / 2 + 1e-9);
+      expect(box.min.y).toBeGreaterThanOrEqual(-1e-9);
+    });
+    expect(meshes).toBeGreaterThan(30); // four stations of stick, ball, two buttons and a coin slot
+  });
+
+  it('shows one picture on both screens, and files each handle once', () => {
+    const group = buildWide();
+    const s = sinks();
+    let left: THREE.Mesh | null = null;
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      registerFurnitureHandles(s, WIDE, obj);
+      if (obj.userData.arcadeCabinet) left = obj;
+    });
+    expect(s.arcadeScreens.size).toBe(1);
+    expect(s.arcadeScreens.has(WIDE)).toBe(true);
+    expect(s.arcadeCabinetVisuals.has(WIDE)).toBe(true); // the built-in emulator paints it too
+    expect(left).not.toBeNull();
+    expect(left!.userData.arcadeScreen).toBe(s.arcadeScreens.get(WIDE));
+    // Two screens, one material: whatever the left one shows, so does the right.
+    const screens: THREE.Mesh[] = [];
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.material === left!.material) screens.push(obj); });
+    expect(screens).toHaveLength(2);
+    const xs = screens.map((p) => new THREE.Box3().setFromObject(p).getCenter(new THREE.Vector3()).x).sort((a, b) => a - b);
+    expect(xs[0]).toBeLessThan(0);
+    expect(xs[1]).toBeGreaterThan(0);
+    expect((left!.material as THREE.MeshBasicMaterial).map).toBeInstanceOf(THREE.CanvasTexture);
+    const def = FURNITURE_DEFS['arcade-cabinet-wide'];
+    expect(def.device?.kind).toBe('arcade');
+    expect(def.device?.front.z).toBeGreaterThan(d(def));
+  });
+
+  it("has the single cabinet's ⚙️ low on its front, and a lit marquee across the top", () => {
+    const group = buildWide();
+    const gears: THREE.Mesh[] = [];
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.arcadeControl) gears.push(obj); });
+    expect(gears.length).toBe(2); // the rim and the emoji's face
+    for (const gear of gears) {
+      expect(gear.userData).toMatchObject({ arcadeControl: 'settings', arcadeCabinetId: WIDE });
+      const box = new THREE.Box3().setFromObject(gear);
+      expect(box.getCenter(new THREE.Vector3()).y).toBeCloseTo(ARCADE_GEAR_Y, 5);
+      expect(box.max.z).toBeGreaterThan(FURNITURE_DEFS['arcade-cabinet-wide'].footprint!.d / 2 - 0.15); // on the front face
+    }
+    // Three textures, each a material map the removal reaches: the screens'
+    // one, the marquee's and the ⚙️'s.
+    const maps = new Map<THREE.Texture, THREE.Mesh>();
+    let screen: THREE.Mesh | null = null;
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      const map = (obj.material as THREE.MeshBasicMaterial).map;
+      if (map) maps.set(map, obj);
+      if (obj.userData.arcadeCabinet) screen = obj;
+    });
+    expect(maps.size).toBe(3);
+    const gearMap = (gears.find((g) => (g.material as THREE.MeshBasicMaterial).map)!.material as THREE.MeshBasicMaterial).map!;
+    const screenMap = (screen!.material as THREE.MeshBasicMaterial).map!;
+    const marquee = [...maps].find(([map]) => map !== gearMap && map !== screenMap)![1];
+    const box = new THREE.Box3().setFromObject(marquee);
+    expect(box.min.y).toBeGreaterThan(new THREE.Box3().setFromObject(screen!).max.y); // above the screens
+    expect(box.max.x - box.min.x).toBeGreaterThan(1.4); // across both of them
+  });
+
+  it('counts every size as an arcade cabinet', () => {
+    expect([...ARCADE_CABINET_KINDS].sort()).toEqual(['arcade-cabinet', 'arcade-cabinet-2p', 'arcade-cabinet-wide']);
   });
 });
 

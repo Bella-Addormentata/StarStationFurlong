@@ -1,13 +1,17 @@
 /**
  * 🕹 arcadeDoc — the arcade cabinet's shared records (#193).
  *
- * Three keys per cabinet in the room doc's `arcade` map, plain JSON, whole-
- * value transacted writes, LWW per key (the tvDoc / partyDoc discipline):
- *   arcade:<itemId> → the curation   the ONE game on the cabinet and the
- *                                    emulator-files choice (the owner's)
- *   seat:<itemId>   → SeatRecord     who is at the controls — PLAYER ONE — as
- *                                    a lease (the TV remote's shape)
- *   plays:<itemId>  → PlaysRecord    the attract card's tally, P1's write
+ * Three kinds of key per cabinet in the room doc's `arcade` map, plain JSON,
+ * whole-value transacted writes, LWW per key (the tvDoc / partyDoc
+ * discipline):
+ *   arcade:<itemId>     → the curation   the ONE game on the cabinet and the
+ *                                        emulator-files choice (the owner's)
+ *   seat:<itemId>       → SeatRecord     who is at the controls — PLAYER ONE —
+ *                                        as a lease (the TV remote's shape)
+ *   seat:<itemId>:<n>   → SeatRecord     players two to four (n = 1–3), on the
+ *                                        double-wide cabinet: a lease each
+ *   plays:<itemId>      → PlaysRecord    the attract card's tally, a player's
+ *                                        write
  * One key per writer: a seat renewal never collides with a change of game, and
  * a play counted the moment the owner changes the game never reverts the
  * change (nor the change the count) — whole-value LWW keeps one of two writes
@@ -16,13 +20,16 @@
  *
  * PLAYER ONE IS THE SOURCE (plan §9, brainstorming/smart-tv-arcade-media-
  * plan.md): one player holds the cabinet's P1 panel; their emulator, running
- * in THEIR page, is the picture. This slice (P1, single player) carries no
- * spectator video yet: the in-world screen shows the attract card and
- * "P1 · <name>"; the media lane (TODO.md spike #21) adds the live picture.
+ * in THEIR page, is the picture. This slice carries no spectator video yet:
+ * the in-world screen shows the attract card and "P1 · <name>"; the media
+ * lane (TODO.md spike #21) adds the live picture. On the DOUBLE-WIDE cabinet
+ * every seated player runs the game in their own page, in step with the
+ * others (arcadeLockstep.ts): four seats, a lease each, one game.
  *
- * THE SEAT IS A LEASE, BOUND TO A PAGE: whoever inserts the coin holds P1
- * from the page that did it — the same identity in a second tab is not at
- * the controls, because the emulator runs in exactly one page. The holder's
+ * THE SEAT IS A LEASE, BOUND TO A PAGE: whoever inserts the coin holds the
+ * seat from the page that did it — the same identity in a second tab is not
+ * at the controls, because the emulator runs in exactly one page, and a page
+ * holds one seat of a cabinet at a time. The holder's
  * page renews every ARCADE_SEAT_RENEW_MS; the seat lapses
  * ARCADE_SEAT_LAPSE_MS after the last renewal THIS page saw (never by the
  * holder's clock — the pusherCroupier.ts CLOCKS rule). Standing up, leaving
@@ -67,7 +74,7 @@ import { ownMediaOrigins } from './tvConsent';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/** How often the P1 page renews its seat. */
+/** How often a seated page renews its seat. */
 export const ARCADE_SEAT_RENEW_MS = 3_000;
 /** A seat not renewed for this long (as THIS page saw it) is free again. */
 export const ARCADE_SEAT_LAPSE_MS = 8_000;
@@ -76,6 +83,8 @@ export const ARCADE_MAX_URL = 2048;
 export const ARCADE_MAX_PLAYER = 32;
 /** The attract card's INSERT COIN blink period. */
 export const ARCADE_BLINK_MS = 800;
+/** The most players a cabinet seats: the double-wide cabinet's four. */
+export const ARCADE_SEATS_MAX = 4;
 
 // ── Cores and games ──────────────────────────────────────────────────────────
 
@@ -226,8 +235,9 @@ export function arcadePageId(): string {
   return pageId;
 }
 
-/** Seats as THIS page saw them: the record's holder/page/leaseAt and OUR
- *  clock when that triple first appeared (the pusherCroupier `seeLease` idea). */
+/** Seats as THIS page saw them, by seat key: the record's holder/page/
+ *  leaseAt and OUR clock when that triple first appeared (the
+ *  pusherCroupier `seeLease` idea). */
 interface SeenSeat {
   holder: string;
   page: string;
@@ -266,7 +276,7 @@ function noteSeats(keys: Iterable<string>): void {
   const now = clock();
   for (const key of keys) {
     if (!key.startsWith('seat:')) continue;
-    seeSeat(key.slice(5), readSeat(key.slice(5)), now);
+    seeSeat(key, readSeatAt(key), now);
   }
 }
 
@@ -318,13 +328,28 @@ function write(key: string, value: unknown): void {
 }
 
 /** Raw access for arcadeRomShare's own keys (`rom…:`), which carry the
- *  owner's game file to the players who press play: their shapes are that
- *  module's to check. Each write is its own transaction (one update each). */
+ *  owner's game file to the players who press play, and arcadeLockstep's
+ *  (`ls…:`), which carry the double-wide cabinet's players' buttons: their
+ *  shapes are those modules' to check. Each write is its own transaction
+ *  (one update each). */
 export function arcadeRawGet(key: string): unknown {
   return ensureMap().get(key);
 }
 export function arcadeRawSet(key: string, value: unknown): void {
   write(key, value);
+}
+/** Several keys in one transaction (one update): a record and the pieces
+ *  it names land together (arcadeLockstep). A value of undefined deletes
+ *  its key. */
+export function arcadeRawSetMany(entries: ReadonlyArray<readonly [string, unknown]>): void {
+  if (entries.length === 0) return;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    for (const [k, v] of entries) {
+      if (v === undefined) map.delete(k);
+      else map.set(k, v);
+    }
+  });
 }
 export function arcadeRawDelete(keys: readonly string[]): void {
   const map = ensureMap();
@@ -348,8 +373,14 @@ export function arcadeRawKeys(prefix: string, max = 4096): string[] {
 export function cabinetKey(itemId: string): string {
   return `arcade:${itemId}`;
 }
-export function seatKey(itemId: string): string {
-  return `seat:${itemId}`;
+/** A seat's key: player one's is the cabinet's own (as before there were
+ *  more), players two to four's carry their number. */
+export function seatKey(itemId: string, seat = 0): string {
+  return seat === 0 ? `seat:${itemId}` : `seat:${itemId}:${seat}`;
+}
+/** A seat number a caller may name: 0 (P1) to ARCADE_SEATS_MAX - 1. */
+export function isSeatIndex(v: unknown): v is number {
+  return Number.isInteger(v) && (v as number) >= 0 && (v as number) < ARCADE_SEATS_MAX;
 }
 export function playsKey(itemId: string): string {
   return `plays:${itemId}`;
@@ -374,9 +405,9 @@ let ejectPredicate: () => boolean = () => false;
 export function setArcadeEjectPredicate(predicate: () => boolean): void {
   ejectPredicate = predicate;
 }
-/** Whether this client may take P1 off the controls. The panel paints EJECT
- *  from here — the predicate the write itself checks — so no button is
- *  offered that standUp then refuses. */
+/** Whether this client may take a player off the controls. The panel
+ *  paints EJECT from here — the predicate the write itself checks — so no
+ *  button is offered that standUp then refuses. */
 export function mayEjectP1(): boolean {
   return ejectPredicate();
 }
@@ -454,8 +485,12 @@ export function readCabinet(itemId: string): CabinetRecord {
   return { ...readCuration(itemId), plays: readPlays(itemId) };
 }
 
-export function readSeat(itemId: string): SeatRecord {
-  const raw = ensureMap().get(seatKey(itemId)) as Partial<SeatRecord> | undefined;
+export function readSeat(itemId: string, seat = 0): SeatRecord {
+  return readSeatAt(seatKey(itemId, seat));
+}
+
+function readSeatAt(key: string): SeatRecord {
+  const raw = ensureMap().get(key) as Partial<SeatRecord> | undefined;
   if (!raw || typeof raw !== 'object') return { ...SEAT_FREE };
   const holder = str(raw.holder, 128);
   return {
@@ -467,83 +502,114 @@ export function readSeat(itemId: string): SeatRecord {
   };
 }
 
-// ── Player one: the seat ─────────────────────────────────────────────────────
+// ── The seats: player one, and two to four on the double-wide cabinet ──────
 
 export type SeatStatus = 'free' | 'mine' | 'held';
 export type ArcadeAction = { ok: true } | { ok: false; error: string };
 
-function seeSeat(itemId: string, rec: SeatRecord, now: number): SeenSeat {
-  const seen = seenSeats.get(itemId);
+function seeSeat(key: string, rec: SeatRecord, now: number): SeenSeat {
+  const seen = seenSeats.get(key);
   if (seen && seen.holder === rec.holder && seen.page === rec.page && seen.leaseAt === rec.leaseAt) return seen;
   const fresh = { holder: rec.holder, page: rec.page, leaseAt: rec.leaseAt, at: now };
-  seenSeats.set(itemId, fresh);
+  seenSeats.set(key, fresh);
   return fresh;
 }
 
 /** Whether a held seat has gone quiet long enough to count as left —
  *  judged by the renewals THIS page saw, never by the holder's clock. */
-export function seatLapsed(itemId: string, now = clock()): boolean {
-  const rec = readSeat(itemId);
+export function seatLapsed(itemId: string, seat = 0, now = clock()): boolean {
+  const key = seatKey(itemId, seat);
+  const rec = readSeatAt(key);
   if (!rec.holder) return true;
-  const seen = seeSeat(itemId, rec, now);
-  return now - seen.at >= ARCADE_SEAT_LAPSE_MS;
+  return now - seeSeat(key, rec, now).at >= ARCADE_SEAT_LAPSE_MS;
 }
 
 /** 'mine' only from the page that inserted the coin. */
-export function seatStatus(itemId: string, now = clock()): SeatStatus {
-  const rec = readSeat(itemId);
+export function seatStatus(itemId: string, seat = 0, now = clock()): SeatStatus {
+  const rec = readSeat(itemId, seat);
   if (!rec.holder) return 'free';
   if (rec.holder === identityProvider().pub && rec.page === pageId) return 'mine';
-  return seatLapsed(itemId, now) ? 'free' : 'held';
+  return seatLapsed(itemId, seat, now) ? 'free' : 'held';
 }
 
 export function iAmP1(itemId: string): boolean {
-  return seatStatus(itemId) === 'mine';
+  return seatStatus(itemId, 0) === 'mine';
 }
 
-/** May this page take the controls now: free, lapsed, already mine — or
- *  held, and I hold the room's deed (sitting down over someone unseats
- *  them: the eject predicate, never the edit gate). */
-export function maySit(itemId: string, now = clock()): boolean {
-  return seatStatus(itemId, now) !== 'held' || ejectPredicate();
+/** The seat this page holds at the cabinet (of its first `seats`), or null. */
+export function mySeat(itemId: string, seats = ARCADE_SEATS_MAX): number | null {
+  for (let n = 0; n < Math.min(seats, ARCADE_SEATS_MAX); n++) if (seatStatus(itemId, n) === 'mine') return n;
+  return null;
 }
 
-/** INSERT COIN: take P1 from this page. */
-export function insertCoin(itemId: string, now = clock()): ArcadeAction {
+/** Who holds each of the cabinet's first `seats` now (a lapsed lease is
+ *  nobody's): the panel's and the screen's list of players. */
+export function seatHolders(itemId: string, seats = ARCADE_SEATS_MAX, now = clock()): Array<SeatRecord | null> {
+  const out: Array<SeatRecord | null> = [];
+  for (let n = 0; n < Math.min(seats, ARCADE_SEATS_MAX); n++) {
+    const rec = readSeat(itemId, n);
+    out.push(rec.holder && seatStatus(itemId, n, now) !== 'free' ? rec : null);
+  }
+  return out;
+}
+
+/** May this page take the seat now: free, lapsed, already mine — or held,
+ *  and I hold the room's deed (sitting down over someone unseats them: the
+ *  eject predicate, never the edit gate). */
+export function maySit(itemId: string, seat = 0, now = clock()): boolean {
+  if (!isSeatIndex(seat)) return false;
+  return seatStatus(itemId, seat, now) !== 'held' || ejectPredicate();
+}
+
+/** INSERT COIN: take the seat from this page — P1 unless another is named.
+ *  A page holds one seat of a cabinet: taking another gives up the first,
+ *  in the same write. */
+export function insertCoin(itemId: string, seat = 0, now = clock()): ArcadeAction {
   const { pub, name } = identityProvider();
   if (!pub) return { ok: false, error: 'No identity on this device yet.' };
-  const rec = readSeat(itemId);
-  if (!maySit(itemId, now)) {
+  if (!isSeatIndex(seat)) return { ok: false, error: 'The cabinet has no such seat.' };
+  const rec = readSeat(itemId, seat);
+  if (!maySit(itemId, seat, now)) {
     return { ok: false, error: `${rec.name || 'Someone'} is at the controls.` };
   }
-  write(seatKey(itemId), {
-    holder: pub, name: name.slice(0, ARCADE_MAX_PLAYER), page: pageId, leaseAt: now, by: pub,
-  } satisfies SeatRecord);
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    for (let n = 0; n < ARCADE_SEATS_MAX; n++) {
+      if (n !== seat && seatStatus(itemId, n, now) === 'mine') {
+        map.set(seatKey(itemId, n), { holder: '', name: '', page: '', leaseAt: now, by: pub } satisfies SeatRecord);
+      }
+    }
+    map.set(seatKey(itemId, seat), {
+      holder: pub, name: name.slice(0, ARCADE_MAX_PLAYER), page: pageId, leaseAt: now, by: pub,
+    } satisfies SeatRecord);
+  });
   return { ok: true };
 }
 
-/** Renew my seat (the P1 page's tick calls this every ARCADE_SEAT_RENEW_MS). */
-export function renewSeat(itemId: string, now = clock()): void {
+/** Renew my seat (a seated page's tick calls this every ARCADE_SEAT_RENEW_MS). */
+export function renewSeat(itemId: string, seat = 0, now = clock()): void {
   const { pub, name } = identityProvider();
-  if (!pub) return;
-  const rec = readSeat(itemId);
+  if (!pub || !isSeatIndex(seat)) return;
+  const rec = readSeat(itemId, seat);
   if (rec.holder !== pub || rec.page !== pageId) return;
-  write(seatKey(itemId), {
+  write(seatKey(itemId, seat), {
     holder: pub, name: name.slice(0, ARCADE_MAX_PLAYER), page: pageId, leaseAt: now, by: pub,
   } satisfies SeatRecord);
 }
 
-/** Stand up. The holder's page may; so may the room's deed holder (EJECT —
- *  the one authority that unseats people, #142). */
-export function standUp(itemId: string, now = clock()): ArcadeAction {
+/** Stand up from a seat (P1 unless another is named). The holder's page
+ *  may; so may the room's deed holder (EJECT — the one authority that
+ *  unseats people, #142). */
+export function standUp(itemId: string, seat = 0, now = clock()): ArcadeAction {
   const { pub } = identityProvider();
-  const rec = readSeat(itemId);
+  if (!isSeatIndex(seat)) return { ok: true };
+  const rec = readSeat(itemId, seat);
   if (!rec.holder) return { ok: true };
   const mine = rec.holder === pub && rec.page === pageId;
   if (!mine && !ejectPredicate()) {
     return { ok: false, error: `${rec.name || 'Someone'} is at the controls.` };
   }
-  write(seatKey(itemId), { holder: '', name: '', page: '', leaseAt: now, by: pub } satisfies SeatRecord);
+  write(seatKey(itemId, seat), { holder: '', name: '', page: '', leaseAt: now, by: pub } satisfies SeatRecord);
   return { ok: true };
 }
 
@@ -586,11 +652,11 @@ export function setEmulatorData(itemId: string, data: EmulatorData): ArcadeActio
   return { ok: true };
 }
 
-/** A game started under P1: one more on the tally — its own key, so a
- *  play counted as the owner changes the game reverts neither the change
- *  nor the count. */
+/** A game started by a seated player: one more on the tally — its own
+ *  key, so a play counted as the owner changes the game reverts neither the
+ *  change nor the count. */
 export function countPlay(itemId: string): void {
-  if (!iAmP1(itemId)) return;
+  if (mySeat(itemId) === null) return;
   write(playsKey(itemId), { plays: bump(readPlays(itemId)) } satisfies PlaysRecord);
 }
 
@@ -667,7 +733,8 @@ export interface ArcadeScreenView {
   mode: 'empty' | 'attract' | 'inplay';
   /** Big line: the game's name, or the cabinet's own name. */
   title: string;
-  /** Under it: INSERT COIN, "P1 · <name>", or what the owner must do. */
+  /** Under it: INSERT COIN, "P1 · <name>" (or, with more than one
+   *  player, how many and at which seats), or what the owner must do. */
   line: string;
   lane: ArcadeLane | '';
   /** The attract card's INSERT COIN blink phase. */
@@ -679,18 +746,21 @@ export interface ArcadeScreenView {
  *  client's prop agrees and the drawing code has nothing to decide. */
 export function arcadeScreenView(itemId: string, now = clock()): ArcadeScreenView {
   const rec = readCabinet(itemId);
-  const seat = readSeat(itemId);
   if (!rec.game) {
     return { mode: 'empty', title: 'FURLONG ARCADE', line: 'THE OWNER PICKS A GAME', lane: '', blink: false, plays: rec.plays };
   }
   // A built-in game's picture is the shared game itself (arcadeNesSession
-  // paints over this card while one runs); P1's seat is EmulatorJS's.
-  const inPlay = !rec.game.bundled && seat.holder !== '' && !seatLapsed(itemId, now);
-  if (inPlay) {
-    return {
-      mode: 'inplay', title: gameTitle(rec.game), line: `P1 · ${seat.name || 'a clone'}`,
-      lane: gameLane(rec.game), blink: false, plays: rec.plays,
-    };
+  // paints over this card while one runs); the seats are EmulatorJS's.
+  const seated = rec.game.bundled ? [] : seatHolders(itemId, ARCADE_SEATS_MAX, now)
+    .map((r, n) => (r && !seatLapsed(itemId, n, now) ? { n, name: r.name } : null))
+    .filter((p): p is { n: number; name: string } => p !== null);
+  if (seated.length > 0) {
+    // One player is named; more are counted, with their seats (names do
+    // not fit the card four at a time — the panel lists them).
+    const line = seated.length === 1
+      ? `P${seated[0]!.n + 1} · ${seated[0]!.name || 'a clone'}`
+      : `${seated.length} PLAYERS · ${seated.map((p) => `P${p.n + 1}`).join(' ')}`;
+    return { mode: 'inplay', title: gameTitle(rec.game), line, lane: gameLane(rec.game), blink: false, plays: rec.plays };
   }
   const blink = Math.floor(now / ARCADE_BLINK_MS) % 2 === 0;
   return {

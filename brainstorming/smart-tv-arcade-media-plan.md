@@ -1952,7 +1952,12 @@ or arcade board EmulatorJS runs, from a file on the owner's disk (sent
 through the room to each player who presses play, `arcadeRomShare.ts`,
 until the blob lane carries it, §4) or a link — runs in ONE page's
 EmulatorJS, P1's stage, and is model B: the rest of this section is
-about it.
+about it. (Since then the #250 replay spike — dev server only,
+`arcadeReplaySpike.ts` — replayed P1's inputs into a watcher's
+EmulatorJS and matched every hash, so model A may reach the owner's
+game too; wiring it is the arcade thread's follow-up, and the video
+lane stays for what replay cannot carry: a watcher without the file, a
+core that diverges, a game whose inputs are not its whole state.)
 
 **Player one is the source.** P1 holds the cabinet's P1 panel (claimed in the
 doc the way an air-hockey end is, with the page-seat rule); their emulator
@@ -2281,7 +2286,7 @@ it.
 | Tor for torrent traffic | Rejected | No UDP; the Tor project asks people not to torrent through it |
 | I2P (`emissary`) | Watch; opt-in later | Experimental; passes the no-single-vendor rule that IPv8 fails |
 | WebTorrent in the browser | Rejected | Browsers cannot join classic swarms |
-| Lockstep netplay first for the arcade | Shipped for the built-in NES games (#248); deferred behind P2-over-video for the owner's EmulatorJS game | One engine (jsnes) and a fixed library made determinism free, so the built-in games run on every page from pad bytes on the tick lane (§9); any libretro core would be a multi-week determinism spike, and the video lane is built for spectators anyway |
+| Lockstep netplay first for the arcade | Shipped for the built-in NES games (#248); for the owner's EmulatorJS game the #250 replay spike matched every hash, the wiring the arcade thread's, with P2-over-video kept for what replay cannot carry | One engine (jsnes) and a fixed library made determinism free, so the built-in games run on every page from pad bytes on the tick lane (§9); any libretro core would be a multi-week determinism spike, and the video lane is built for spectators anyway |
 | EmulatorJS netplay | Not depended on | WebRTC + its own signaling/TURN, marked unstable |
 | Spectators run the emulator themselves | Possible later | CPU per spectator and a save-state transfer; the video lane is cheaper at retro resolutions |
 | Sender-side distance gating | Rejected | The node is content-blind and tick positions are untrusted; viewer-pull matches the mesh's IWANT philosophy |

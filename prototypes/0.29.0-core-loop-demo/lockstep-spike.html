@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arcade lockstep spike</title>
+  <!-- 🕹🕹🕹🕹 #193: up to four seats, each running the game and holding every
+       frame for every seat's buttons (src/arcadeLockstepSpike.ts). Dev server only. -->
+  <style>
+    body { margin: 0; padding: 16px; background: #0b0d12; color: #d4a84b; font: 13px/1.5 ui-monospace, monospace; }
+    .grid { display: grid; grid-template-columns: repeat(2, 320px); gap: 12px; }
+    .pane p { margin: 0 0 4px; }
+    .pane .screen { width: 320px; height: 240px; background: #000; }
+    .pane .arcade-frame { width: 100%; height: 100%; border: 0; display: block; }
+    #stats { white-space: pre-wrap; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="grid" id="seats"></div>
+  <div id="stats">loading…</div>
+  <script type="module" src="/src/arcadeLockstepSpike.ts"></script>
+</body>
+</html>
