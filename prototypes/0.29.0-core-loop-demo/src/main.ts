@@ -3,6 +3,7 @@
  * Main entry point — orthographic camera + hybrid WASD / point-and-click nav.
  */
 
+import { pickSettingsGear } from "./gearCardParts";
 import * as THREE from "three";
 import "./style.css";
 import { updateDebugHUD, showHint } from "./hud";
@@ -38,6 +39,9 @@ import {
   routeAlligatorsTick,
   setAlligatorsSender,
 } from "./alligatorsSession";
+// 🕹️ Shared arcade games: their pad bytes ride lane kind 1 as a subtype.
+import { routeArcadeTick, setArcadeSender } from "./arcadeNesSession";
+import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -250,7 +254,7 @@ import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArm
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
 import { leaveArcadeRoom } from "./arcadeSession";
 import { closeArcadeStage } from "./arcadeStage";
-import { FURNITURE } from "./furniture";
+import { ARCADE_CABINET_KINDS, FURNITURE } from "./furniture";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -583,6 +587,7 @@ const networkProvider = new NetworkProvider();
 // state (clean no-op offline), so one wiring here covers every room join.
 setAirHockeySender((buf) => networkProvider.sendTick(buf));
 setAlligatorsSender((buf) => networkProvider.sendTick(buf));
+setArcadeSender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -1983,7 +1988,7 @@ async function joinRoomAtEpoch(
 
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
   // table state. Rebinds per join like games/furniture (T0 seam).
-  bindCasinoDoc(sync.doc);
+  bindCasinoDoc(sync.doc, boot.roomId);
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);
@@ -2002,7 +2007,7 @@ async function joinRoomAtEpoch(
   // remote. Same T0 seam — a joiner walks in on a movie already running and
   // anchors its clock to the sample it finds.
   bindTvDoc(sync.doc);
-  // 🕹 Bind the shared arcade map (#193): each cabinet's shelf and game, and
+  // 🕹 Bind the shared arcade map (#193): each cabinet's game, and
   // who is at its controls. Same T0 seam.
   bindArcadeDoc(sync.doc);
 
@@ -3087,6 +3092,17 @@ async function joinRoomAtEpoch(
         tick = unpackTick(buf);
       } else {
         return; // unknown datagram framing — ignore
+      }
+      // 🕹️ Arcade ticks ride the kind-1 lane with flags bit 5 set and a NaN
+      // where a mallet keeps its x (arcadeNet.ts): route them on the raw
+      // bytes, before anything reads that x as a position.
+      const raw = buf.byteLength === ADDRESSED_TICK_BYTES ? buf.subarray(buf.byteLength - TICK_BYTES) : buf;
+      if (isArcadeTickFlags(tick.flags)) {
+        seenPeers.add(peerId);
+        receivedTicks++;
+        remoteLastSeen.set(peerId, performance.now());
+        routeArcadeTick(peerId, raw);
+        return;
       }
       // 🏒 #115: flags bits 6–7 select the tick lane. Mallet/puck ticks are
       // game traffic for the air-hockey session, NOT avatar movement —
@@ -4258,7 +4274,7 @@ function resolveOwnerLabel(owner: string): string {
  *      handing theirs on — setTvHostPredicate; the panels paint from it)
  *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
  *      (#193 — setArcadeEjectPredicate; the panel paints from it). The
- *      cabinet's CURATION (shelf, game, emulator files) stays with the
+ *      cabinet's CURATION (its game, emulator files) stays with the
  *      shareholder-extended gate above (setArcadeHostPredicate).
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
@@ -6055,7 +6071,7 @@ function tvTheatreDeps(itemId: string) {
 }
 // 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
 function roomArcadeIds(): string[] {
-  return FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+  return FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
 }
 
 /** WATCH from the phone or the HUD chip: only for a set still in THIS room,
@@ -10027,7 +10043,7 @@ async function init() {
       : `page-${Math.random().toString(36).slice(2, 12)}`,
   );
   // 🕹 #193: two authorities for the cabinet (#142's split, in the
-  // isLocalPlayerRoomOwner docblock). Curation — the shelf, the game, the
+  // isLocalPlayerRoomOwner docblock). Curation — the game, the
   // emulator files — is the edit gate's, shareholder-extended. Unseating
   // P1 (EJECT, sitting down over a held seat) is the DEED holder's alone:
   // a peer-written venture record can satisfy the edit gate, and nobody is
@@ -10407,7 +10423,7 @@ function setupClickToEnter() {
 
 function findSlotMachineControl(scene: THREE.Scene): {
   deviceId: string;
-  control: "denomination" | "pull" | "service";
+  control: "denomination" | "pull" | "service" | "settings";
   value?: number;
 } | null {
   const controls: THREE.Object3D[] = [];
@@ -10419,7 +10435,7 @@ function findSlotMachineControl(scene: THREE.Scene): {
   const hit = raycaster.intersectObjects(controls, false)[0];
   if (!hit) return null;
   const control = hit.object.userData.slotControl;
-  if (control !== "denomination" && control !== "pull" && control !== "service") return null;
+  if (control !== "denomination" && control !== "pull" && control !== "service" && control !== "settings") return null;
   return {
     deviceId: hit.object.userData.slotMachineId as string,
     control,
@@ -10427,6 +10443,17 @@ function findSlotMachineControl(scene: THREE.Scene): {
       ? { value: hit.object.userData.slotValue as number }
       : {}),
   };
+}
+
+/** 🕹 The ⚙️ low on an arcade cabinet's front (#193): the cabinet it opens. */
+function findArcadeControl(scene: THREE.Scene): { deviceId: string; control: "settings" } | null {
+  const controls: THREE.Object3D[] = [];
+  scene.traverse((child) => {
+    if (child.userData?.arcadeControl && child.userData.arcadeCabinetId) controls.push(child);
+  });
+  const hit = raycaster.intersectObjects(controls, false)[0];
+  if (!hit || hit.object.userData.arcadeControl !== "settings") return null;
+  return { deviceId: hit.object.userData.arcadeCabinetId as string, control: "settings" };
 }
 
 function onCanvasClick(event: MouseEvent): void {
@@ -10451,6 +10478,8 @@ function onCanvasClick(event: MouseEvent): void {
     mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
     mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
     raycaster.setFromCamera(mouse, deviceFocus.getCamera() ?? focusRenderer.camera);
+    const gearItem = pickSettingsGear(focusRenderer.scene, raycaster);
+    if (gearItem && world.openSettingsCard(gearItem)) return;
     const slotControl = findSlotMachineControl(focusRenderer.scene);
     if (slotControl
       && world.handleSlotMachineControl(
@@ -10458,6 +10487,8 @@ function onCanvasClick(event: MouseEvent): void {
         slotControl.control,
         slotControl.value,
       )) return;
+    const arcadeControl = findArcadeControl(focusRenderer.scene);
+    if (arcadeControl && world.handleArcadeControl(arcadeControl.deviceId, arcadeControl.control)) return;
   }
   if (isDeviceFocusActive()) {
     deviceFocus.release();
@@ -10483,6 +10514,9 @@ function onCanvasClick(event: MouseEvent): void {
 
   raycaster.setFromCamera(mouse, camera);
 
+  const gearItem = pickSettingsGear(scene, raycaster);
+  if (gearItem && world.openSettingsCard(gearItem)) return;
+
   const slotControl = findSlotMachineControl(scene);
   if (slotControl
     && world.handleSlotMachineControl(
@@ -10490,6 +10524,8 @@ function onCanvasClick(event: MouseEvent): void {
       slotControl.control,
       slotControl.value,
     )) return;
+  const arcadeControl = findArcadeControl(scene);
+  if (arcadeControl && world.handleArcadeControl(arcadeControl.deviceId, arcadeControl.control)) return;
 
   // ── Intercept Golden Keypad Clicks for our Docking System
   if (world.dockingSystem) {

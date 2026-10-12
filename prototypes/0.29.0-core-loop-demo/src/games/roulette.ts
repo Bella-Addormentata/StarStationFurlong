@@ -13,6 +13,9 @@
  * returns 0 — the chips are already gone.
  */
 
+import { isFairnessTranscript, isSeedRoundFields } from './craps';
+import type { FairnessTranscript } from './craps';
+
 /** Numbers that pay RED (standard wheel). Everything 1–36 not here is black. */
 export const RED_NUMBERS = new Set([
   1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36,
@@ -59,6 +62,21 @@ export interface RouletteTableState {
    *  countdown is display-only). Absent ⇒ a manual/idle table with no timer,
    *  so legacy and un-driven tables validate and behave exactly as before. */
   phaseDeadline?: number;
+  /** ⚖️ The settled spin's verifiable transcript (absent on an unproven
+   *  'rng' table) — the same shape craps uses. */
+  fairness?: FairnessTranscript;
+  /** ⚖️ This round's seed commitments (see SeedRoundFields in craps.ts). */
+  houseCommit?: string;
+  commits?: Record<string, string>;
+  unseeded?: string[];
+  wagers?: Record<string, string>;
+  sigs?: Record<string, string>;
+  /** 🎡 A manual SPIN's settlement lease: the page (player id + page nonce)
+   *  that closed or took over this round. Only it publishes and pays. */
+  operator?: string;
+  /** ⚖️ Voided: the house seed couldn't be revealed, so no pocket and every
+   *  stake was returned. */
+  voided?: boolean;
 }
 
 export function initialRouletteState(): RouletteTableState {
@@ -94,7 +112,14 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
     && typeof s.resultAt === 'number'
     && (s.payouts === null || typeof s.payouts === 'object')
     && (s.phaseDeadline === undefined
-        || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
+        || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
+    && (s.fairness === undefined || isFairnessTranscript(s.fairness))
+    && (s.operator === undefined || (typeof s.operator === 'string' && s.operator.length <= 192))
+    // A void is the canonical no-outcome shape: no pocket, no transcript.
+    && (s.voided === undefined || (typeof s.voided === 'boolean'
+      && (!s.voided || (s.phase === 'settled' && s.result === null && s.fairness === undefined
+        && s.payouts !== null && Object.keys(s.payouts).length === 0))))
+    && isSeedRoundFields(s);
 }
 
 /** Layout column of a number (0/1/2 = bottom/middle/top row of the classic

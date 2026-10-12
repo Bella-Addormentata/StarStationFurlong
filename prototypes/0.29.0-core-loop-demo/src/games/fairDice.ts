@@ -107,6 +107,19 @@ export async function diceFromMaterial(base: string): Promise<[number, number]> 
 }
 
 /**
+ * One unbiased roulette pocket (0–36) DETERMINISTICALLY from a domain string —
+ * the wheel's counterpart of `diceFromMaterial`. A byte ≥ 222 (= 6·37) is
+ * discarded so every pocket keeps exactly 6 of the 222 kept byte values.
+ */
+export async function pocketFromMaterial(base: string): Promise<number> {
+  for (let block = 0; ; block++) {
+    for (const b of await sha256Bytes(`${base}|${block}`)) {
+      if (b < 222) return b % 37;
+    }
+  }
+}
+
+/**
  * Verify a settled roll from its PUBLIC transcript — anyone (a player, an
  * auditor) can run this: the revealed seed must match the commit the house
  * published before bets, and the dice must be the deterministic derivation. A

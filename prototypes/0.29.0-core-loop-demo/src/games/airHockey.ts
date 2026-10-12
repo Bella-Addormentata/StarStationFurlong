@@ -202,6 +202,25 @@ export function takeSeat(
   return withSeat(s, side, seat);
 }
 
+/**
+ * RESET TABLE / NEW MATCH gate (checkers canResetTable precedent): anyone
+ * when no match is live (an empty table, or one that has ended); otherwise
+ * only a player holding an end, or whoever may edit the room. `mayEditRoom`
+ * is the shared ownership gate (editMode.canEditRoom), not the raw room
+ * owner, so a legacy room stays read-only and venture shareholders count
+ * (#141). Lets the room's editors free an end a crashed player left.
+ */
+export function canResetAirHockey(
+  s: AirHockeyState | null,
+  myId: string,
+  mayEditRoom: boolean,
+): boolean {
+  if (!s) return false;
+  if (s.status === 'ended') return true;
+  if (s.players.a === null && s.players.b === null) return true;
+  return s.players.a === myId || s.players.b === myId || mayEditRoom;
+}
+
 /** Release a side pre-game (walk-away/un-claim); ready resets with it. */
 export function releaseSide(
   s: AirHockeyState,

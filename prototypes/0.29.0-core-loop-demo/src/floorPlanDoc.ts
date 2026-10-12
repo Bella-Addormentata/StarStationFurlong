@@ -442,17 +442,17 @@ export function roomWalkBounds(): { boundX: number; boundZ: number } {
 }
 
 /**
- * The FURNITURE PLACEMENT box — deliberately 1 m inside each wall, i.e. a half
- * metre tighter than the walkable box, and unchanged by the walkable widening.
+ * The PLACEMENT box for EXTENT-LESS furniture origins — deliberately 1 m inside
+ * each wall, i.e. a half metre tighter than the walkable box.
  *
- * Keeping these two separate matters. Opening the outer ring to WALKING is the
- * point of the change; opening it to PLACEMENT would buy nothing and break
- * things:
- *  - it buys nothing for real furniture, because every FURNITURE_DEFS footprint
- *    declares integer tile extents and snapItemPos snaps them to an integer
- *    lattice, so every candidate AABB has integer edges — the largest edge
- *    inside ±5.5 is still ±5.0, exactly this bound;
- *  - it actively breaks the EXTENT-LESS kinds (footprint: null — rugs, cherry
+ * 🧱 Pieces WITH a footprint no longer use it: their AABB is their real extent,
+ * so editMode.validatePlacement lets it reach the wall line itself, and the
+ * squares along the walls take furniture like any other (with this box they
+ * were all refused). That check also keeps footprints out of doorway bands and
+ * off hung wall panels, which this 1 m band used to do implicitly.
+ *
+ * Widening THIS box (to the walkable box or the wall) would break things:
+ *  - it breaks the EXTENT-LESS kinds (footprint: null — rugs, cherry
  *    trees, wall decor), which are bounds-checked at their ORIGIN POINT with no
  *    AABB to catch their real size. Wall-hung photo decor documents its
  *    dependence on this exact number (see PhotoDecorSpec.zOff in furniture.ts:
