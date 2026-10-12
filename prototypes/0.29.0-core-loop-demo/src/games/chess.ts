@@ -9,8 +9,9 @@
  *
  * RULES (full standard chess, with two documented v1 scope choices):
  *  - All piece moves, castling (rights tracked; no castling out of / through /
- *    into check), en passant, pawn promotion (AUTO-QUEEN in v1 — an
- *    under-promotion picker is UI noise the game doesn't need yet).
+ *    into check), en passant, pawn promotion (queen unless the move names
+ *    another piece in `promoteTo` — the 3D table's ⚙ card offers the choice,
+ *    #227 follow-up; the stored state is unchanged, only the board code).
  *  - CHECK is annotated for the UI; moving into check is illegal (legalMoves
  *    filters king safety).
  *  - END: checkmate → winner; stalemate → draw. NO 50-move rule / threefold
@@ -43,12 +44,21 @@ export interface ChessState {
   last: { from: number; to: number } | null;
 }
 
+/** What a promoting pawn becomes. */
+export type ChessPromotion = 'queen' | 'rook' | 'bishop' | 'knight';
+
 export interface ChessMove {
   from: number;
   to: number;
   /** Marks the special mechanics applyMove must perform. */
   special?: 'castle-k' | 'castle-q' | 'en-passant' | 'promote';
+  /** For a 'promote' move: the piece the pawn becomes (default queen). */
+  promoteTo?: ChessPromotion;
 }
+
+const PROMOTION_CODE: Record<ChessPromotion, number> = {
+  queen: W_QUEEN, rook: W_ROOK, bishop: W_BISHOP, knight: W_KNIGHT,
+};
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
@@ -233,7 +243,8 @@ function performOnBoard(s: ChessState, move: ChessMove): number[] {
   board[move.from] = 0;
   board[move.to] = v;
   if (move.special === 'promote') {
-    board[move.to] = v > 0 ? W_QUEEN : B_QUEEN; // v1: auto-queen (documented)
+    const code = PROMOTION_CODE[move.promoteTo ?? 'queen'] ?? W_QUEEN;
+    board[move.to] = v > 0 ? code : -code;
   } else if (move.special === 'en-passant') {
     const dir = v > 0 ? 1 : -1; // captured pawn sits BEHIND the target square
     board[move.to + dir * 8] = 0;

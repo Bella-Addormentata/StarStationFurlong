@@ -16,6 +16,9 @@
  *   cashed:<playerId>         → number   lifetime chips returned to the cage
  *   table:<tableId>           → RouletteTableState (croupier-written)
  *   bets:<tableId>:<playerId> → { round, bets: RouletteBet[] } (owner-written)
+ *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
+ *   throw:<tableId>           → DiceThrow (the shooter's fling, or the
+ *                                        stickman's when it throws for them)
  *
  * Every player-scoped key is written by exactly one writer in normal play, so
  * per-key LWW is safe. The one shared writer pair is bal:<pid> (owner spends,
@@ -107,9 +110,15 @@ function docAlive(): boolean {
     && (boundDoc as { isDestroyed?: boolean }).isDestroyed !== true;
 }
 
-export function bindCasinoDoc(doc: Y.Doc): void {
+/** The bound room's stable id ('' for the page-local practice doc): the
+ *  fair tables bind their seed commitments to it. */
+let boundRoomId = '';
+
+export function bindCasinoDoc(doc: Y.Doc, roomId = ''): void {
   bindingEpoch += 1;
+  boundRoomId = roomId;
   boundDoc = doc;
+  pinPlayerKeys(doc);
   casinoMap = doc.getMap('casino');
   // 🪙 Index the coin pushers' requests now, outside any operator poll, and
   // observe ahead of notify() so listeners never see a stale index.
@@ -121,6 +130,10 @@ export function bindCasinoDoc(doc: Y.Doc): void {
 
 export function casinoDocEpoch(): number {
   return bindingEpoch;
+}
+
+export function casinoRoomId(): string {
+  return boundRoomId;
 }
 
 /** Bound map, lazily falling back to a page-local doc (offline practice). */
@@ -264,8 +277,11 @@ export function clearTableKeys(tableId: string): void {
     // never writes them).
     map.delete(`cfg:backend:${tableId}`);
     map.delete(`cfg:fairness:${tableId}`);
+    map.delete(`throw:${tableId}`);
+    const seatPrefix = `seat:${tableId}:`;
+    const seedPrefix = `fseed:${tableId}:`;
     for (const key of [...map.keys()]) {
-      if (key.startsWith(betPrefix)) map.delete(key);
+      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix) || key.startsWith(seedPrefix)) map.delete(key);
     }
   });
 }
@@ -374,6 +390,108 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
   return out;
 }
 
+// ── 🎲🎡 #226: who stands where, and the shooter's throw ─────────────────────
+// A player at a table writes `seat:<tableId>:<pid>` while they are focused
+// there: which stand they took (so their chips sit in front of them on every
+// client) and the stand's angle round the table (the clockwise order the dice
+// travel in). `at` is refreshed every few seconds — the operator treats a seat
+// whose `at` stops changing as gone, on ITS OWN clock (see crapsCroupier), so
+// a crashed page cannot hold the dice forever.
+
+export interface TableSeat {
+  /** Index into the table's stand list. */
+  stand: number;
+  /** atan2(z, x) of the stand in the table's local frame. */
+  angle: number;
+  /** The writer's clock at the last refresh (only ever compared to itself). */
+  at: number;
+}
+
+function isTableSeat(v: unknown): v is TableSeat {
+  if (typeof v !== 'object' || v === null) return false;
+  const s = v as Partial<TableSeat>;
+  return Number.isInteger(s.stand) && (s.stand as number) >= 0 && (s.stand as number) < 32
+    && typeof s.angle === 'number' && Number.isFinite(s.angle)
+    && typeof s.at === 'number' && Number.isFinite(s.at);
+}
+
+export function writeMySeat(tableId: string, playerId: string, seat: TableSeat): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`seat:${tableId}:${playerId}`, seat);
+  });
+}
+
+export function clearMySeat(tableId: string, playerId: string): void {
+  const map = ensureMap();
+  if (!map.has(`seat:${tableId}:${playerId}`)) return;
+  boundDoc!.transact(() => {
+    map.delete(`seat:${tableId}:${playerId}`);
+  });
+}
+
+/** One player's seat on one table (a keyed read — no scan). */
+export function readSeat(tableId: string, playerId: string): TableSeat | null {
+  const v = ensureMap().get(`seat:${tableId}:${playerId}`);
+  return isTableSeat(v) ? v : null;
+}
+
+/** Every seat record on one table, playerId → seat (freshness is the
+ *  reader's call — the operator's, or the renderer's "anyone here?"). */
+export function readSeats(tableId: string): Record<string, TableSeat> {
+  const prefix = `seat:${tableId}:`;
+  const out: Record<string, TableSeat> = {};
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix) || !isTableSeat(value)) continue;
+    const pid = key.slice(prefix.length);
+    // The key is peer-written too: a seat whose player id the table state
+    // can't hold (isCrapsTableState's 1–128 chars) could never be the
+    // shooter, so it isn't a seat.
+    if (pid.length === 0 || pid.length > 128) continue;
+    out[pid] = value;
+  }
+  return out;
+}
+
+/** 🎲 One throw of the dice: who threw on which roll, from where and how hard
+ *  (table-local felt coords, a unit direction, power 0..1) and the tumble
+ *  seed. COSMETIC — the dice faces come from the table's fairness mode at the
+ *  settle; this only lets every client animate the same fling. */
+export interface DiceThrow {
+  round: number;
+  /** The shooter's player id, or 'stickman'. */
+  by: string;
+  sx: number;
+  sz: number;
+  dx: number;
+  dz: number;
+  power: number;
+  seed: number;
+}
+
+function isDiceThrow(v: unknown): v is DiceThrow {
+  if (typeof v !== 'object' || v === null) return false;
+  const t = v as Partial<DiceThrow>;
+  const fin = (n: unknown) => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) < 100;
+  return Number.isInteger(t.round) && (t.round as number) >= 1
+    && typeof t.by === 'string' && t.by.length > 0 && t.by.length <= 128
+    && fin(t.sx) && fin(t.sz) && fin(t.dx) && fin(t.dz)
+    && typeof t.power === 'number' && t.power >= 0 && t.power <= 1
+    && Number.isInteger(t.seed);
+}
+
+export function readDiceThrow(tableId: string): DiceThrow | null {
+  const v = ensureMap().get(`throw:${tableId}`);
+  return isDiceThrow(v) ? v : null;
+}
+
+export function writeDiceThrow(tableId: string, t: DiceThrow): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`throw:${tableId}`, t);
+  });
+}
+
 // ── 🎲🔗 Craps settlement backend preference (#69 G5 seam) ────────────────────
 // Which backend settles a craps table — 'local' (crypto RNG + these room-doc
 // chips, the default) or 'chia' (per-player↔house state channels + a shared
@@ -414,6 +532,83 @@ export function writeCrapsFairnessPref(tableId: string, mode: FairnessMode): voi
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`cfg:fairness:${tableId}`, mode);
+  });
+}
+
+// ── ⚖️ Fair-table seed records (craps + roulette multiparty) ──────────────────
+// Each bettor's own `fseed:<tableId>:<pid>` (only that player's client writes
+// it): its commitment for one round, bound to the round number AND the house
+// commit so it can never be replayed into another round, plus the revealed
+// seed once "no more bets" froze the commit set. See fairTableSeeds.ts.
+
+export interface TableSeedRecord {
+  round: number;
+  /** The table's houseCommit this commitment answers. */
+  house: string;
+  commit: string;
+  /** The revealed seed — absent until the commit set is frozen. */
+  seed?: string;
+  /** The bettor's identity-key signature over the commitment (base64url,
+   *  fairTableSeeds.seedSigBytes): a record without a valid one is no party. */
+  sig?: string;
+}
+
+function isTableSeedRecord(v: unknown): v is TableSeedRecord {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<TableSeedRecord>;
+  const hex = (x: unknown) => typeof x === 'string' && x.length > 0 && x.length <= 128;
+  return Number.isInteger(r.round) && (r.round as number) >= 1
+    && hex(r.house) && hex(r.commit)
+    && (r.seed === undefined || hex(r.seed))
+    && (r.sig === undefined || hex(r.sig));
+}
+
+export function readSeedRecord(tableId: string, playerId: string): TableSeedRecord | null {
+  const v = ensureMap().get(`fseed:${tableId}:${playerId}`);
+  return isTableSeedRecord(v) ? v : null;
+}
+
+// ⚖️ Each player's identity key as THIS page first saw it in the bound room
+// (trust on first use): pinned the moment the players map shows it — at bind,
+// then as entries sync or arrive — so a later rewrite of players[pid].keyB64
+// can't hand a player's seat to another key. Pins last as long as the doc
+// binding and are never evicted; past the cap, new players simply go unpinned
+// (and so can't add a signed seed) rather than unseat anyone.
+const MAX_PINNED_KEYS = 4096;
+let pinnedKeys = new Map<string, string>();
+
+function entryKey(v: unknown): string | undefined {
+  const k = (v as { keyB64?: unknown } | undefined)?.keyB64;
+  return typeof k === 'string' && k.length > 0 && k.length <= 128 ? k : undefined;
+}
+
+function pinPlayerKeys(doc: Y.Doc): void {
+  const pins = new Map<string, string>();
+  pinnedKeys = pins;
+  const players = doc.getMap('players');
+  const pin = (pid: string, v: unknown): void => {
+    if (pins.has(pid) || pins.size >= MAX_PINNED_KEYS || pid.length === 0 || pid.length > 128) return;
+    const k = entryKey(v);
+    if (k) pins.set(pid, k);
+  };
+  players.forEach((v, pid) => pin(pid, v));
+  players.observe((e) => {
+    for (const pid of e.keysChanged) pin(pid, players.get(pid));
+  });
+}
+
+/** A player's identity key as this page first saw it in the room's players
+ *  map (the same base64url string keypair.getIdentityPub writes), or
+ *  undefined while none has shown up. */
+export function readPlayerKey(playerId: string): string | undefined {
+  if (!docAlive() || !boundDoc) return undefined;
+  return pinnedKeys.get(playerId);
+}
+
+export function writeMySeedRecord(tableId: string, playerId: string, rec: TableSeedRecord): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`fseed:${tableId}:${playerId}`, rec);
   });
 }
 

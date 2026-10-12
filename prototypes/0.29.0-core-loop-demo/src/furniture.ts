@@ -25,6 +25,7 @@
  */
 
 import * as THREE from "three";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { Seat } from "./seats";
 import type {
   DepartureScreen,
@@ -39,6 +40,7 @@ import type {
   CloneVatHandle,
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
+  ArcadeCabinetVisualHandle,
   AirHockeyVisualHandle,
   AlligatorsVisualHandle,
   PropAnimHandle,
@@ -49,6 +51,8 @@ import {
   CHIP_R, HOLE_XS, PLAT_LOW_BACK, PLAT_LOW_FRONT, PLAT_UP_FRONT,
   currentPusherPhase, pusherFaceX, unseenDropHoles,
 } from "./games/coinPusher";
+// 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
+import { createArcadeScreenPainter } from "./arcadeScreen";
 // 🏒 #115: the table sculpt is sized by the SAME playfield constants the pure
 // engine simulates — one source of truth for rails, goals, puck and mallets.
 import {
@@ -60,9 +64,9 @@ import {
   IA_BALL_R, IA_BASE_R, IA_HEAD_LEN, IA_MAX_BALLS, IA_MOUTH_R, IA_SEATS,
   IA_SEAT_COLORS, IA_SURFACE_Y, IA_TABLE_R, birdAngle, pivotOf, seatAngle,
 } from "./games/alligators";
-// 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
-// order/colors from the pure engine — one source of truth with the focused UI.
-import { WHEEL_ORDER, pocketColor } from "./games/roulette";
+// 🎲🎡 #226: the craps and roulette tables' live 3D pieces (felt, chips,
+// dice, pucks, wheel) — built here, driven by casinoTableSession.ts.
+import { buildCrapsPieces, buildRoulettePieces } from "./casinoTable3d";
 import { pieceColor, isKing } from "./games/checkers";
 import type { CheckersColor } from "./games/checkers";
 import {
@@ -75,6 +79,9 @@ import {
   cellFromUV,
 } from "./games/checkersTable";
 import type { BoardMarks } from "./games/checkersTable";
+import type { ChessColor } from "./games/chess";
+import { CHESS_PIECE_TYPES, chessPieceOf } from "./games/chessTable";
+import type { ChessPieceType } from "./games/chessTable";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey, readCoinPusherState } from "./casinoDoc";
@@ -180,6 +187,8 @@ export type FurnitureKind =
   | "clone-vat"
   | "slot-machine"
   | "coin-pusher"
+  | "arcade-cabinet"
+  | "arcade-cabinet-2p"
   | "air-hockey-table"
   | "alligators-table"
   // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
@@ -1784,7 +1793,7 @@ const ARCADE_WIDE_SEATS = 4;
 
 /** The furniture kinds that are arcade cabinets (main.ts and world.ts tick
  *  them, arcadeDoc keys them by item id alike). */
-export const ARCADE_CABINET_KINDS: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>(["arcade-cabinet", "arcade-cabinet-wide"]);
+export const ARCADE_CABINET_KINDS: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>(["arcade-cabinet", "arcade-cabinet-2p", "arcade-cabinet-wide"]);
 
 const buildWallComputer = (ctx: BuildCtx) => {
   const { m, place } = ctx;
@@ -2451,6 +2460,10 @@ const GT_RED = "#C43C3C";
 const GT_BLACK = "#23252E";
 const GT_CROWN = "#F0C060";
 const GT_TURN_BLACK = "#9AA3B2"; // black's turn strip — dark-on-dark would vanish
+/** ♟ Chess set colors: ivory and ebony (ebony a touch lifted off the dark
+ *  squares so it never vanishes into them). */
+const GT_CHESS_WHITE = "#ECE3CC";
+const GT_CHESS_BLACK = "#2A2C35";
 /** Checker piece size (m): radius a little under half a square, and height. */
 const GT_PIECE_R = BOARD_SQ_M * 0.38;
 const GT_PIECE_H = 0.013;
@@ -2466,10 +2479,24 @@ const GT_GEAR_R = 0.055;
  *  spectators read the turn from across the room), and the LOCAL player's
  *  move marks. Geometry comes from games/checkersTable.ts — the same numbers
  *  place the pieces and pick the clicked cell. */
+/** The glowing strip on the frame at the end whose turn it is: `near` is
+ *  the canvas bottom (the device-front, −z end: red / white). */
+interface TurnStrip {
+  near: boolean;
+  color: string;
+}
+/** Shared (everyone-sees) chess echo on the wood: the last move's two
+ *  squares and a checked king's square. */
+interface BoardEcho {
+  last: { from: number; to: number } | null;
+  check: number | null;
+}
+
 function drawCheckerboard(
   c2d: CanvasRenderingContext2D,
-  turn: CheckersColor | null,
+  strip: TurnStrip | null,
   marks: BoardMarks | null,
+  echo: BoardEcho | null = null,
 ): void {
   const S = BOARD_TEX_PX,
     PAD = BOARD_PAD_PX,
@@ -2487,12 +2514,23 @@ function drawCheckerboard(
       c2d.fillRect(PAD + c * SQ, PAD + r * SQ, SQ, SQ);
     }
   }
-  // Turn strip: red plays from the canvas bottom (rows 5–7), black the top.
-  if (turn) {
-    c2d.fillStyle = turn === "red" ? GT_RED : GT_TURN_BLACK;
-    const y = turn === "red" ? S - PAD + 8 : 8;
+  // Turn strip: red / white play from the canvas bottom, black the top.
+  if (strip) {
+    c2d.fillStyle = strip.color;
+    const y = strip.near ? S - PAD + 8 : 8;
     c2d.fillRect(PAD, y, S - PAD * 2, PAD - 16);
   }
+  const tint = (idx: number, color: string) => {
+    if (!Number.isInteger(idx) || idx < 0 || idx > 63) return;
+    const { x, y } = at(idx);
+    c2d.fillStyle = color;
+    c2d.fillRect(x, y, SQ, SQ);
+  };
+  if (echo?.last) {
+    tint(echo.last.from, "rgba(240, 192, 96, 0.32)");
+    tint(echo.last.to, "rgba(240, 192, 96, 0.32)");
+  }
+  if (echo && echo.check !== null) tint(echo.check, "rgba(255, 23, 68, 0.45)");
   if (!marks) return;
   // Movable pieces: a gold ring that shows past the disc's edge.
   c2d.lineWidth = 4;
@@ -2521,6 +2559,116 @@ function drawCheckerboard(
     c2d.lineWidth = 3;
     c2d.strokeStyle = "#FFFFFF";
     c2d.strokeRect(x + 1.5, y + 1.5, SQ - 3, SQ - 3);
+  }
+}
+
+/**
+ * ♟ Low-poly chess pieces from three.js primitives: a lathed body per piece
+ * (shared base + collar, distinct crown) with boxes for the rook's
+ * battlements, the knight's head and the king's cross. Origin at the
+ * piece's foot, knight facing +z (white's forward; black's are turned).
+ * Sized to the board square (BOARD_SQ_M ≈ 8 cm).
+ */
+function buildChessPieceGeometry(type: ChessPieceType): THREE.BufferGeometry {
+  const R = BOARD_SQ_M * 0.33; // base radius
+  const lathe = (pts: [number, number][]) =>
+    new THREE.LatheGeometry(
+      pts.map(([r, y]) => new THREE.Vector2(r, y)),
+      18,
+    );
+  /** Base disc + collar every piece stands on. */
+  const base: [number, number][] = [
+    [0, 0],
+    [R, 0],
+    [R, 0.006],
+    [R * 0.82, 0.009],
+    [R * 0.82, 0.011],
+    [R * 0.62, 0.014],
+  ];
+  /** A ball of radius `rr` centred `cy` up, as lathe points. */
+  const ball = (cy: number, rr: number): [number, number][] => {
+    const out: [number, number][] = [];
+    for (let i = 1; i <= 8; i++) {
+      const a = -Math.PI / 2 + (Math.PI * i) / 8;
+      out.push([Math.max(0, rr * Math.cos(a)), cy + rr * Math.sin(a)]);
+    }
+    return out;
+  };
+  const box = (w: number, h: number, d: number, x: number, y: number, z: number, rx = 0) => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    if (rx) g.rotateX(rx);
+    g.translate(x, y, z);
+    return g;
+  };
+  const merge = (parts: THREE.BufferGeometry[]) => {
+    // Boxes are indexed like lathes, so the parts merge as-is.
+    const g = parts.length > 1 ? (mergeGeometries(parts, false) ?? parts[0]) : parts[0];
+    g.computeBoundingSphere();
+    return g;
+  };
+  switch (type) {
+    case "pawn":
+      return merge([
+        lathe([...base, [R * 0.4, 0.022], [R * 0.62, 0.025], [R * 0.3, 0.027], ...ball(0.035, R * 0.42)]),
+      ]);
+    case "rook": {
+      const top = 0.046;
+      const parts: THREE.BufferGeometry[] = [
+        lathe([...base, [R * 0.56, 0.034], [R * 0.78, 0.037], [R * 0.78, top], [0, top]]),
+      ];
+      for (let i = 0; i < 4; i++) {
+        const a = (i * Math.PI) / 2 + Math.PI / 4;
+        parts.push(box(R * 0.42, 0.008, R * 0.42, Math.cos(a) * R * 0.52, top + 0.004, Math.sin(a) * R * 0.52));
+      }
+      return merge(parts);
+    }
+    case "knight":
+      return merge([
+        lathe([...base, [R * 0.6, 0.02], [R * 0.7, 0.022], [0, 0.022]]),
+        box(R * 0.62, 0.032, R * 0.8, 0, 0.034, -R * 0.12, 0.28), // neck
+        box(R * 0.56, R * 0.5, R * 1.25, 0, 0.049, R * 0.22), // head + muzzle
+        box(R * 0.2, 0.008, R * 0.2, 0, 0.058, -R * 0.12), // ears
+      ]);
+    case "bishop":
+      return merge([
+        lathe([
+          ...base,
+          [R * 0.36, 0.03],
+          [R * 0.6, 0.032],
+          [R * 0.3, 0.034],
+          [R * 0.5, 0.042],
+          [R * 0.46, 0.05],
+          [R * 0.2, 0.056],
+          ...ball(0.059, R * 0.16),
+        ]),
+      ]);
+    case "queen":
+      return merge([
+        lathe([
+          ...base,
+          [R * 0.36, 0.038],
+          [R * 0.64, 0.04],
+          [R * 0.34, 0.043],
+          [R * 0.46, 0.054],
+          [R * 0.66, 0.06],
+          [R * 0.3, 0.061],
+          ...ball(0.066, R * 0.2),
+        ]),
+      ]);
+    case "king":
+      return merge([
+        lathe([
+          ...base,
+          [R * 0.38, 0.042],
+          [R * 0.66, 0.044],
+          [R * 0.36, 0.047],
+          [R * 0.5, 0.058],
+          [R * 0.6, 0.064],
+          [0, 0.064],
+        ]),
+        box(R * 0.16, 0.018, R * 0.16, 0, 0.073, 0), // cross upright
+        box(R * 0.5, R * 0.16, R * 0.16, 0, 0.075, 0), // cross bar
+      ]);
   }
 }
 
@@ -2556,6 +2704,48 @@ function drawSettingsToken(c2d: CanvasRenderingContext2D): void {
   c2d.arc(C, C, 13, 0, Math.PI * 2);
   c2d.fillStyle = "#2A1A0E";
   c2d.fill();
+}
+
+/** Gold of a settings gear's disc (the casino trim gold). */
+const GEAR_DISC_GOLD = 0xd4a84b;
+
+/** ⚙ A settings gear button (#241): the brass token on a gold disc. Lies
+ *  flat (face up) unless `ry` is given, in which case it stands upright
+ *  facing the item-local direction (sin ry, 0, cos ry), so π faces −z. The
+ *  caller tags the returned meshes with the click route. */
+function addSettingsGear(
+  place: BuildCtx["place"],
+  m: BuildCtx["m"],
+  x: number,
+  y: number,
+  z: number,
+  r: number,
+  ry?: number,
+): THREE.Mesh[] {
+  const cv = document.createElement("canvas");
+  cv.width = 128;
+  cv.height = 128;
+  drawSettingsToken(cv.getContext("2d")!);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const faceMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
+  faceMat.userData.baseOpacity = 1;
+  // A gold rim round the token (a torus, not a cylinder: the coin pusher's
+  // tests count cylinders as its chips).
+  const rimGeo = new THREE.TorusGeometry(r, r * 0.14, 8, 32); // faces +z
+  const faceGeo = new THREE.CircleGeometry(r, 32);            // faces +z
+  if (ry === undefined) {
+    rimGeo.rotateX(-Math.PI / 2);
+    faceGeo.rotateX(-Math.PI / 2);
+    return [
+      place(rimGeo, m(GEAR_DISC_GOLD, 0.35, 0.6), x, y, z),
+      place(faceGeo, faceMat, x, y + 0.002, z),
+    ];
+  }
+  return [
+    place(rimGeo, m(GEAR_DISC_GOLD, 0.35, 0.6), x, y, z, ry),
+    place(faceGeo, faceMat, x + Math.sin(ry) * 0.002, y, z + Math.cos(ry) * 0.002, ry),
+  ];
 }
 
 /** One-shot card-felt face: green baize, darker border, two card outlines +
@@ -2756,6 +2946,47 @@ const buildGameTable = (ctx: BuildCtx) => {
     });
   };
 
+  // ♟ The chess set, laid out the same way: one instanced layer per piece
+  // shape × color (12 draws, capacity 64 each — a malformed peer board
+  // still can't overflow), children of the same pieces group so they fade,
+  // flip-hide and pick exactly like the checkers.
+  const chessMats: Record<ChessColor, THREE.Material> = {
+    white: m(new THREE.Color(GT_CHESS_WHITE).getHex(), 0.42, 0.05),
+    black: m(new THREE.Color(GT_CHESS_BLACK).getHex(), 0.38, 0.12),
+  };
+  const chessGeos = CHESS_PIECE_TYPES.map((t) => buildChessPieceGeometry(t));
+  const chessLayerList = [
+    ...chessGeos.map((g) => layer(g, chessMats.white)),
+    ...chessGeos.map((g) => layer(g, chessMats.black)),
+  ];
+  const chessCells: number[][] = chessLayerList.map(() => []);
+  const turnBlack = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+  const noTurn = new THREE.Quaternion();
+  const one = new THREE.Vector3(1, 1, 1);
+  const placePos = new THREE.Vector3();
+  const layChess = (board: number[] | null): void => {
+    const n = chessLayerList.map(() => 0);
+    for (let idx = 0; board && idx < 64; idx++) {
+      const piece = chessPieceOf(board[idx]);
+      if (!piece) continue;
+      const li = (piece.color === "white" ? 0 : 6) + CHESS_PIECE_TYPES.indexOf(piece.type);
+      const { x, z } = cellCenterLocal(idx);
+      placePos.set(x, GT_FACE_Y, z);
+      // Black's pieces face −z (toward white): only the knight shows it.
+      placeAt.compose(placePos, piece.color === "black" ? turnBlack : noTurn, one);
+      chessCells[li][n[li]] = idx;
+      chessLayerList[li].setMatrixAt(n[li]++, placeAt);
+    }
+    chessLayerList.forEach((mesh, i) => {
+      mesh.count = n[i];
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    });
+  };
+  /** Every pickable piece layer, with its per-instance cells. */
+  const pickLayers = [...layers, ...chessLayerList];
+  const pickCells = [...instanceCells, ...chessCells];
+
   // ⚙ settings token beside the board (#227) — where players open the
   // table's options and anyone can read who plays which side.
   const gearCv = document.createElement("canvas");
@@ -2805,11 +3036,11 @@ const buildGameTable = (ctx: BuildCtx) => {
   let cardsUp = false;
   let pendingComplete: (() => void) | null = null;
   // The face's inputs, kept so either one can change without the other.
-  let board: number[] | null = null;
-  let turn: CheckersColor | null = null;
+  let strip: TurnStrip | null = null;
   let marks: BoardMarks | null = null;
+  let echo: BoardEcho | null = null;
   const repaint = (): void => {
-    drawCheckerboard(boardC2d, turn, marks);
+    drawCheckerboard(boardC2d, strip, marks, echo);
     boardTex.needsUpdate = true;
   };
   /** First hit on one of the face's meshes, only while it is face up. */
@@ -2825,7 +3056,7 @@ const buildGameTable = (ctx: BuildCtx) => {
       toAngle = fromAngle + Math.PI;
       flipT = 0;
       pendingComplete = onComplete ?? null;
-      pieces.visible = false; // the checkers don't swing round with the top
+      pieces.visible = false; // the pieces don't swing round with the top
       return true;
     },
     isFlipping(): boolean {
@@ -2835,9 +3066,19 @@ const buildGameTable = (ctx: BuildCtx) => {
       return cardsUp;
     },
     setBoard(next: number[] | null, nextTurn: CheckersColor | null = null): void {
-      board = next;
-      turn = nextTurn;
-      layPieces(board);
+      layPieces(next);
+      layChess(null);
+      strip = nextTurn ? { near: nextTurn === "red", color: nextTurn === "red" ? GT_RED : GT_TURN_BLACK } : null;
+      echo = null;
+      repaint();
+    },
+    setChess(next, nextTurn = null, nextEcho = null): void {
+      layChess(next);
+      layPieces(null);
+      strip = nextTurn
+        ? { near: nextTurn === "white", color: nextTurn === "white" ? GT_CHESS_WHITE : GT_TURN_BLACK }
+        : null;
+      echo = nextEcho;
       repaint();
     },
     setMarks(next: BoardMarks | null): void {
@@ -2846,12 +3087,13 @@ const buildGameTable = (ctx: BuildCtx) => {
     },
     pickCell(ray: THREE.Raycaster): number | null {
       if (cardsUp || flipT < 1) return null;
-      // Checkers first: from the oblique focus camera, a ray over a king's
-      // top lands ~5 cm further on when continued down to the board.
-      const piece = ray.intersectObjects(layers, false)[0];
+      // Pieces first: from the oblique focus camera, a ray over a king's
+      // top lands several cm further on when continued down to the board
+      // (a chess king stands ~8 cm tall, so this matters even more).
+      const piece = ray.intersectObjects(pickLayers, false)[0];
       if (piece?.instanceId !== undefined) {
-        const li = layers.findIndex((mesh) => mesh === piece.object);
-        const cell = instanceCells[li]?.[piece.instanceId];
+        const li = pickLayers.findIndex((mesh) => mesh === piece.object);
+        const cell = pickCells[li]?.[piece.instanceId];
         if (cell !== undefined) return cell;
       }
       const uv = hitFace(ray, boardMesh)?.uv;
@@ -3621,6 +3863,13 @@ const airHockeyStands: StandTemplate[] = [
   { stand: { x: 0.0, z: 1.9 }, faceAngle: Math.PI },
 ];
 
+// 🕹️ Two-player arcade cabinet: stand s0 is player 1 (left as you face the
+// screen, local +x), s1 player 2 — the template index is the seat.
+const arcadeCabinet2PStands: StandTemplate[] = [
+  { stand: { x: 0.5, z: -1.0 }, faceAngle: 0 },
+  { stand: { x: -0.5, z: -1.0 }, faceAngle: 0 },
+];
+
 // ── 🏒 Air-hockey table builder (#115) ───────────────────────────────────────
 // A 1.7×2.7 m cabinet inside the 2×3 footprint, playfield sized exactly by the
 // engine constants, rails with real goal gaps, colour-keyed ends (side 'a'
@@ -3708,6 +3957,15 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     place(new THREE.BoxGeometry(endSegW, 0.06, 0.09), railMat(), endSegX, railTop - 0.03, ez);
     // Dark catch slot under the gap so the mouth reads as an opening.
     place(new THREE.BoxGeometry(AH_GOAL_HALF_W * 2, 0.05, 0.09), m(0x0a0e14, 0.7, 0.05), 0, AH_SURFACE_Y - 0.005, ez);
+  }
+
+  // ⚙ Settings gears (settingsGear.ts): one on each end rail, at that
+  // player's right hand, opening the table card (rules, who holds each end,
+  // the owner's RESET).
+  for (const [gx, gz] of [[-endSegX, -endZ], [endSegX, endZ]] as const) {
+    for (const gear of addSettingsGear(place, m, gx, railTop + 0.006, gz, 0.04)) {
+      gear.userData.settingsGear = ctx.itemId;
+    }
   }
 
   // Goal lamps — one over each mouth; flashGoal() strobes the breached end.
@@ -3891,6 +4149,15 @@ const buildAlligatorsTable = (ctx: BuildCtx): void => {
   const rimGeo = new THREE.TorusGeometry(IA_TABLE_R + 0.05, 0.05, 10, 72);
   rimGeo.rotateX(Math.PI / 2);
   place(rimGeo, m(0xb8a46a, 0.35, 0.55), 0, S + 0.02, 0);
+  // ⚙ Settings gears (settingsGear.ts) on the cabinet's skirt, one a little
+  // to each seat's left, opening the table card (rules, the seats, the
+  // owner's RESET).
+  for (let seat = 0; seat < IA_SEATS; seat++) {
+    const g = seatAngle(seat) - 0.22;
+    for (const gear of addSettingsGear(place, m, Math.cos(g) * 1.075, S - 0.11, Math.sin(g) * 1.075, 0.06, Math.atan2(Math.cos(g), Math.sin(g)))) {
+      gear.userData.settingsGear = ctx.itemId;
+    }
+  }
 
   // The spinning top — CanvasTexture (NearestFilter, the wall-screen idiom):
   // a lily-pond swirl whose spokes and pads make the spin readable.
@@ -4875,6 +5142,25 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: Math.PI,
       eye: { x: 0, y: 1.45, z: 0.95 },
       anchor: { x: 0, y: ARCADE_SCREEN_Y, z: 0.2 },
+    },
+  },
+  // 🕹️ Two-player arcade cabinet — 2×1, one wide screen and two control
+  // panels. Its two STANDS are the players: player 1 on the left as you face
+  // the screen (local +x), player 2 on the right. Whoever starts a game plays
+  // from their stand; whoever steps up to the other one joins as the other
+  // player (arcadeNesSession.ts). Both share the centred focus eye.
+  "arcade-cabinet-2p": {
+    kind: "arcade-cabinet-2p",
+    build: buildArcadeCabinet2P,
+    footprint: { w: 2, d: 1 },
+    functions: ["arcade"],
+    stands: arcadeCabinet2PStands,
+    device: {
+      kind: "arcade",
+      front: { x: 0.5, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.54, z: -1.12 },
+      anchor: { x: 0, y: 1.41, z: -0.09 },
     },
   },
   // 🕹🕹 The double-wide cabinet (#193): 2×1, two screens and four panels,
@@ -6428,8 +6714,8 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
 // ── 🎰 Casino fixtures (#69 G1/G2) — cashier ATM + roulette table ────────────
 // Canvas-textured faces follow the game-table idiom: MeshBasicMaterial with
 // transparent + opacity 0 so the morph fade-in machinery raises them with
-// everything else. Focused UIs live in devices.ts (createCashierUI /
-// createRouletteUI); these builders are the in-world halves.
+// everything else. The cashier UI lives in devices.ts (createCashierUI); the tables play in 3D
+// (casinoTable3d.ts + casinoTableSession.ts, #226).
 
 /** Cashier sign face: 'CASHIER · CHIPS' gold on dark with a chip pip. */
 function drawCashierSign(c2d: CanvasRenderingContext2D): void {
@@ -6466,46 +6752,6 @@ function drawCashierScreen(c2d: CanvasRenderingContext2D): void {
   c2d.fillStyle = "#F0C060";
   c2d.font = "16px monospace";
   c2d.fillText("WALK UP TO BEGIN", W / 2, 146);
-}
-
-/** Roulette felt: green baize, gold trim, betting-grid motif on the +x half
- *  (the wheel occupies -x). Painted once — the LIVE board is the focused UI. */
-function drawRouletteFelt(c2d: CanvasRenderingContext2D): void {
-  const W = 512,
-    H = 256;
-  c2d.fillStyle = "#14532D";
-  c2d.fillRect(0, 0, W, H);
-  c2d.fillStyle = "#1B6B3A";
-  c2d.fillRect(8, 8, W - 16, H - 16);
-  c2d.strokeStyle = "rgba(240, 224, 180, 0.8)";
-  c2d.lineWidth = 3;
-  // Grid motif: 12×3 cells on the right half + a zero wedge.
-  const gx = 280,
-    gy = 40,
-    cw = 16,
-    ch = 56;
-  for (let col = 0; col <= 12; col++) {
-    c2d.beginPath();
-    c2d.moveTo(gx + col * cw, gy);
-    c2d.lineTo(gx + col * cw, gy + 3 * ch);
-    c2d.stroke();
-  }
-  for (let row = 0; row <= 3; row++) {
-    c2d.beginPath();
-    c2d.moveTo(gx, gy + row * ch);
-    c2d.lineTo(gx + 12 * cw, gy + row * ch);
-    c2d.stroke();
-  }
-  c2d.beginPath(); // zero wedge left of the grid
-  c2d.moveTo(gx, gy);
-  c2d.lineTo(gx - 28, gy + 1.5 * ch);
-  c2d.lineTo(gx, gy + 3 * ch);
-  c2d.closePath();
-  c2d.stroke();
-  // Outside-bet boxes under the grid.
-  for (let b = 0; b < 6; b++) {
-    c2d.strokeRect(gx + b * 32, gy + 3 * ch + 10, 32, 24);
-  }
 }
 
 function buildCashierAtm({ m, flat, place }: BuildCtx) {
@@ -6661,155 +6907,19 @@ function buildRouletteTable(ctx: BuildCtx) {
     [0.08, 0.96, -0.94, 0],
     [0.08, 0.96, 0.94, 0],
   ] as [number, number, number, number][]) {
+    // #226: a low padded rim (top 0.855) so a player's view over it still
+    // reaches the near pass line / even-money boxes; the chip rail rides it.
     place(
-      new THREE.BoxGeometry(w, 0.09, d),
+      new THREE.BoxGeometry(w, 0.05, d),
       m(0x3a2417, 0.6, 0.1),
       lx,
-      0.845,
+      0.83,
       lz,
     );
   }
-  // Felt (canvas) across the top.
-  const feltCv = document.createElement("canvas");
-  feltCv.width = 512;
-  feltCv.height = 256;
-  drawRouletteFelt(feltCv.getContext("2d")!);
-  const feltTex = new THREE.CanvasTexture(feltCv);
-  feltTex.minFilter = THREE.NearestFilter;
-  feltTex.magFilter = THREE.NearestFilter;
-  feltTex.generateMipmaps = false;
-  feltTex.colorSpace = THREE.SRGBColorSpace;
-  const feltGeo = new THREE.PlaneGeometry(1.84, 0.84);
-  feltGeo.rotateX(-Math.PI / 2);
-  place(
-    feltGeo,
-    new THREE.MeshBasicMaterial({
-      map: feltTex,
-      transparent: true,
-      opacity: 0,
-    }),
-    0,
-    0.812,
-    0,
-  );
-  // Wheel at the -x end: bowl + pocket disc (canvas) + gold hub and rim.
-  place(
-    new THREE.CylinderGeometry(0.34, 0.36, 0.06, 28),
-    m(0x2a1a10, 0.5, 0.3),
-    -0.58,
-    0.845,
-    0,
-  );
-  const wheelCv = document.createElement("canvas");
-  wheelCv.width = 256;
-  wheelCv.height = 256;
-  const wc = wheelCv.getContext("2d")!;
-  const CX = 128,
-    CY = 128;
-  wc.fillStyle = "#2A1A10";
-  wc.fillRect(0, 0, 256, 256);
-  for (let i = 0; i < WHEEL_ORDER.length; i++) {
-    const a0 = (i / WHEEL_ORDER.length) * Math.PI * 2;
-    const a1 = ((i + 1) / WHEEL_ORDER.length) * Math.PI * 2;
-    const col = pocketColor(WHEEL_ORDER[i]);
-    wc.beginPath();
-    wc.moveTo(CX, CY);
-    wc.arc(CX, CY, 120, a0, a1);
-    wc.closePath();
-    wc.fillStyle =
-      col === "green" ? "#1B6B3A" : col === "red" ? "#C43C3C" : "#23252E";
-    wc.fill();
-  }
-  wc.beginPath();
-  wc.arc(CX, CY, 52, 0, Math.PI * 2);
-  wc.fillStyle = "#4A2F1B";
-  wc.fill();
-  wc.beginPath();
-  wc.arc(CX, CY, 120, 0, Math.PI * 2);
-  wc.lineWidth = 5;
-  wc.strokeStyle = "#D4A84B";
-  wc.stroke();
-  const wheelTex = new THREE.CanvasTexture(wheelCv);
-  wheelTex.minFilter = THREE.NearestFilter;
-  wheelTex.magFilter = THREE.NearestFilter;
-  wheelTex.generateMipmaps = false;
-  wheelTex.colorSpace = THREE.SRGBColorSpace;
-  const wheelGeo = new THREE.CircleGeometry(0.31, 48);
-  wheelGeo.rotateX(-Math.PI / 2);
-  place(
-    wheelGeo,
-    new THREE.MeshBasicMaterial({
-      map: wheelTex,
-      transparent: true,
-      opacity: 0,
-    }),
-    -0.58,
-    0.877,
-    0,
-  );
-  const hub = place(
-    new THREE.ConeGeometry(0.06, 0.09, 12),
-    m(0xd4a84b, 0.4, 0.6),
-    -0.58,
-    0.92,
-    0,
-  );
-  hub.rotation.y = 0.3;
-  const rim = place(
-    new THREE.TorusGeometry(0.335, 0.018, 8, 32),
-    m(0xd4a84b, 0.45, 0.5),
-    -0.58,
-    0.877,
-    0,
-  );
-  rim.rotation.x = Math.PI / 2;
-  // Chip stacks near the +x end (deco).
-  const chipColors = [0xc43c3c, 0x3e92b8, 0xf0c060];
-  chipColors.forEach((col, i) => {
-    place(
-      new THREE.CylinderGeometry(0.045, 0.045, 0.06, 12),
-      m(col, 0.5, 0.25),
-      0.52 + (i % 2) * 0.12,
-      0.845,
-      -0.18 + i * 0.14,
-    );
-  });
-}
-
-/** Craps felt (canvas 768×256, a 3:1 table): green baize with the classic
- *  layout schematic — PASS LINE / DON'T PASS along the rails, the number boxes
- *  and FIELD across the centre. Painted once; the LIVE board is the focused UI. */
-function drawCrapsFelt(c2d: CanvasRenderingContext2D): void {
-  const W = 768, H = 256;
-  c2d.fillStyle = "#14532D";
-  c2d.fillRect(0, 0, W, H);
-  c2d.fillStyle = "#1B6B3A";
-  c2d.fillRect(10, 10, W - 20, H - 20);
-  c2d.strokeStyle = "rgba(240, 224, 180, 0.85)";
-  c2d.lineWidth = 3;
-  c2d.strokeRect(10, 10, W - 20, H - 20);
-  c2d.fillStyle = "#F0E6C8";
-  c2d.textAlign = "center";
-  c2d.textBaseline = "middle";
-  // The point-number boxes across the top (4 5 6 8 9 10 — the felt's spine).
-  const nums = [4, 5, 6, 8, 9, 10];
-  const bw = 108, bx0 = 44, by = 34, bh = 74;
-  nums.forEach((n, i) => {
-    const bx = bx0 + i * bw;
-    c2d.strokeRect(bx, by, bw - 8, bh);
-    c2d.font = "bold 40px monospace";
-    c2d.fillText(String(n), bx + (bw - 8) / 2, by + bh / 2);
-  });
-  // FIELD strip.
-  c2d.strokeRect(44, 128, W - 88, 44);
-  c2d.font = "bold 24px monospace";
-  c2d.fillText("FIELD  ·  2  3  4  9  10  11  12", W / 2, 150);
-  // PASS / DON'T PASS rails along the bottom.
-  c2d.strokeRect(44, 186, (W - 96) / 2, 44);
-  c2d.strokeRect(52 + (W - 96) / 2, 186, (W - 96) / 2, 44);
-  c2d.font = "bold 26px monospace";
-  c2d.fillText("PASS  LINE", 44 + (W - 96) / 4, 208);
-  c2d.fillText("DON'T  PASS", 52 + (W - 96) * 0.75, 208);
+  // 🎡 #226: the live felt, the wheel + ball and the chips are 3D pieces now
+  // (casinoTable3d.ts) — the table plays on the table, no popup.
+  buildRoulettePieces(ctx, 0.94, 0.44);
 }
 
 /** 🎲 Craps table (#69 G3): a long green baize table — 50% longer than the
@@ -6848,62 +6958,27 @@ function buildCrapsTable(ctx: BuildCtx) {
     [0.08, HALF_Z * 2, -HALF_X, 0],
     [0.08, HALF_Z * 2, HALF_X, 0],
   ] as [number, number, number, number][]) {
-    place(new THREE.BoxGeometry(w, 0.09, d), m(0x3a2417, 0.6, 0.1), lx, 0.845, lz);
+    // #226: low rim, as the roulette table's (top 0.855).
+    place(new THREE.BoxGeometry(w, 0.05, d), m(0x3a2417, 0.6, 0.1), lx, 0.83, lz);
   }
-  // Felt (canvas) across the top.
-  const feltCv = document.createElement("canvas");
-  feltCv.width = 768;
-  feltCv.height = 256;
-  drawCrapsFelt(feltCv.getContext("2d")!);
-  const feltTex = new THREE.CanvasTexture(feltCv);
-  feltTex.minFilter = THREE.NearestFilter;
-  feltTex.magFilter = THREE.NearestFilter;
-  feltTex.generateMipmaps = false;
-  feltTex.colorSpace = THREE.SRGBColorSpace;
-  const feltGeo = new THREE.PlaneGeometry(HALF_X * 2 - 0.12, HALF_Z * 2 - 0.12);
-  feltGeo.rotateX(-Math.PI / 2);
-  place(
-    feltGeo,
-    new THREE.MeshBasicMaterial({ map: feltTex, transparent: true, opacity: 0 }),
-    0, 0.812, 0,
-  );
-  // Chip rails along both long sides (raised troughs).
-  for (const rz of [-HALF_Z + 0.06, HALF_Z - 0.06]) {
-    place(new THREE.BoxGeometry(HALF_X * 2 - 0.3, 0.03, 0.07), m(0x3a2417, 0.6, 0.1), 0, 0.86, rz);
-  }
-  // Deco chip stacks in the rails.
-  const chipColors = [0xc43c3c, 0x3e92b8, 0xf0c060, 0x2e7d46];
-  chipColors.forEach((col, i) => {
-    place(
-      new THREE.CylinderGeometry(0.045, 0.045, 0.06, 12),
-      m(col, 0.5, 0.25),
-      -1.0 + i * 0.12,
-      0.9,
-      HALF_Z - 0.06,
-    );
-  });
+  // 🎲 #226: the real layout felt, the oversized dice, the ON/OFF pucks and
+  // every chip are live 3D pieces (casinoTable3d.ts); the padded rail is the
+  // chip rail each player picks up from.
+  buildCrapsPieces(ctx, HALF_X, HALF_Z);
   // 🎲 The STICKMAN's dice stick — a slim curved stick resting on the +z rail at
   // the middle (the reserved operator's tool). A shaft + a small hook at the end.
   const stick = place(
     new THREE.CylinderGeometry(0.014, 0.014, 0.9, 8),
     m(0x8a5a2a, 0.5, 0.2),
-    0.0, 0.905, HALF_Z - 0.02,
+    0.0, 0.87, HALF_Z - 0.02,
   );
   stick.rotation.z = Math.PI / 2; // lie flat along x
   const hook = place(
     new THREE.TorusGeometry(0.05, 0.012, 6, 12, Math.PI),
     m(0x8a5a2a, 0.5, 0.2),
-    0.45, 0.905, HALF_Z - 0.02,
+    0.45, 0.87, HALF_Z - 0.02,
   );
   hook.rotation.x = Math.PI / 2;
-  // Two dice resting at the stickman's spot (deco).
-  for (const dx of [-0.05, 0.05]) {
-    place(
-      new THREE.BoxGeometry(0.05, 0.05, 0.05),
-      m(0xf4efe2, 0.4, 0.1),
-      dx, 0.87, HALF_Z - 0.14,
-    );
-  }
 }
 
 // ── 🛏️ Bunk bed (owner request) — two stacked sleep berths ───────────────────
@@ -7826,6 +7901,18 @@ function buildSlotMachine({
   // Tray interior (slightly recessed dark)
   place(new THREE.BoxGeometry(0.40, 0.03, 0.10), m(0x14181e, 0.85, 0.1), 0, 0.64, -0.135);
 
+  // ── ⚙️ Settings buttons on the kick panel near the floor ─────────────────
+  // A dark kick panel fills the gap between the front legs, and two gold-rimmed
+  // ⚙️ buttons sit on it. Anyone can press one to read the machine's card
+  // (paytable, RTP, fairness); for the owner the same card is editable.
+  place(new THREE.BoxGeometry(0.40, 0.26, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.20, -0.07);
+  for (const gx of [-0.10, 0.10]) {
+    for (const gear of addSettingsGear(place, m, gx, 0.20, -0.086, 0.05, Math.PI)) {
+      gear.userData.slotControl = "settings";
+      gear.userData.slotMachineId = itemId;
+    }
+  }
+
   // ── Pull lever (right side, +x) ───────────────────────────────────────────
   // A horizontal axle projects perpendicular to the cabinet's right side.
   // Shaft and grip share one centerline at its outer end; the whole axle group
@@ -7970,6 +8057,14 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   for (const [lx, lz] of [[-0.32, -0.24], [0.32, -0.24], [-0.32, 0.44], [0.32, 0.44]] as const) {
     place(new THREE.BoxGeometry(0.09, 0.42, 0.09), m(CHROME, 0.4, 0.6), lx, 0.31, lz);
     place(new THREE.BoxGeometry(0.11, 0.03, 0.11), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
+  }
+  // ⚙ Settings gears (settingsGear.ts) on a kick panel between the front
+  // legs, as on the slot machine: the machine card (rules, what's inside).
+  place(new THREE.BoxGeometry(0.55, 0.36, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.31, -0.22);
+  for (const gx of [-0.13, 0.13]) {
+    for (const gear of addSettingsGear(place, m, gx, 0.31, -0.237, 0.06, Math.PI)) {
+      gear.userData.settingsGear = itemId;
+    }
   }
   // Machine body — an open-fronted shell (back, floor, low skirts), so the
   // playfield shows through the glass. (A solid body box here would hide the
@@ -8188,6 +8283,124 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   // The upper platform mesh carries the handle so world.ts collects it the
   // same way it collects SlotMachineVisualHandle.
   upperPlatform.userData.coinPusherVisual = handle;
+}
+
+// ── 🕹️ Arcade cabinet ────────────────────────────────────────────────────────
+// A classic upright: lower body with a coin door, a control panel with a
+// stick and two buttons, the monitor housing with a tilted CRT, and a lit
+// marquee on top. The screen is a live CanvasTexture painted by
+// arcadeScreen.ts — the attract card while idle, the menu while someone is at
+// it, and a game, which everyone in the room sees (arcadeSession.ts).
+//
+// Coordinate scheme (metres, item origin at rot 0): the player stands at
+// (0, −1.0) facing +z; the cabinet fills z ∈ [−0.36, +0.43]. The two-player
+// cabinet is the same upright, wider, with a bigger screen and a stick and
+// buttons for each player.
+function buildArcadeCabinet2P(ctx: BuildCtx) {
+  buildUprightCabinet(ctx, { width: 1.40, housingH: 0.96, screenW: 0.82, players: [0.34, -0.34], marquee: "SSF ARCADE · 2 PLAYER" });
+}
+
+interface UprightSpec {
+  /** Body width (x). */
+  width: number;
+  /** Monitor housing height; the screen sits at its centre. */
+  housingH: number;
+  /** Screen width; its height keeps the NES's 256:240. */
+  screenW: number;
+  /** Control-panel centre x for each player, player 1 first. */
+  players: number[];
+  marquee: string;
+}
+
+function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
+  const { m, place, addLight } = ctx;
+  const BODY = 0x232a3a; // deep gunmetal (the coin pusher's family, darker)
+  const TRIM = 0x14181e; // black trim / kick plate
+  const MAGENTA = 0xff3fa4;
+  const CYAN = 0x2ee6ff;
+  const GOLD = 0xd4a84b;
+  const W = spec.width;
+  const housingY = 0.95 + spec.housingH / 2;
+  const marqueeY = 0.95 + spec.housingH + 0.10;
+  const screenY = housingY - 0.02;
+  const screenH = spec.screenW * (240 / 256);
+
+  // ── Body: lower cabinet, monitor housing, marquee box, top cap ────────────
+  place(new THREE.BoxGeometry(W, 0.90, 0.62), m(BODY, 0.6, 0.35), 0, 0.45, 0.12);
+  place(new THREE.BoxGeometry(W, 0.06, 0.02), m(TRIM, 0.9, 0.1), 0, 0.03, -0.195);
+  place(new THREE.BoxGeometry(W, spec.housingH, 0.50), m(BODY, 0.6, 0.35), 0, housingY, 0.18);
+  place(new THREE.BoxGeometry(W + 0.02, 0.20, 0.30), m(BODY, 0.6, 0.35), 0, marqueeY, 0.09);
+  place(new THREE.BoxGeometry(W + 0.04, 0.03, 0.54), m(TRIM, 0.8, 0.2), 0, marqueeY + 0.115, 0.16);
+  // Neon edge strips down both front corners (the cabinet's side art).
+  for (const sx of [-(W / 2 + 0.005), W / 2 + 0.005]) {
+    place(new THREE.BoxGeometry(0.012, spec.housingH, 0.012), m(MAGENTA, 0.4, 0.1, MAGENTA, 0.9), sx, housingY, -0.075);
+    place(new THREE.BoxGeometry(0.012, 0.86, 0.012), m(CYAN, 0.4, 0.1, CYAN, 0.7), sx, 0.47, -0.195);
+  }
+
+  // ── Coin doors (one per player): two lit slots and a return flap ──────────
+  for (const px of spec.players) {
+    place(new THREE.BoxGeometry(0.30, 0.30, 0.012), m(TRIM, 0.7, 0.4), px, 0.42, -0.200);
+    for (const sx of [-0.07, 0.07]) {
+      place(new THREE.BoxGeometry(0.05, 0.07, 0.012), m(0xff3030, 0.5, 0.1, 0xff3030, 0.8), px + sx, 0.49, -0.208);
+      place(new THREE.BoxGeometry(0.008, 0.04, 0.014), m(TRIM, 0.9, 0.1), px + sx, 0.49, -0.212);
+    }
+    place(new THREE.BoxGeometry(0.16, 0.05, 0.014), m(GOLD, 0.4, 0.6), px, 0.33, -0.208);
+  }
+
+  // ── Control panel: angled deck; a stick and two buttons per player ────────
+  const deck = place(new THREE.BoxGeometry(W + 0.04, 0.06, 0.30), m(BODY, 0.55, 0.4), 0, 0.93, -0.21);
+  deck.rotation.x = 0.18; // front edge dips toward the player
+  place(new THREE.BoxGeometry(W + 0.04, 0.012, 0.28), m(0x1a1f2b, 0.8, 0.1), 0, 0.963, -0.21).rotation.x = 0.18;
+  spec.players.forEach((px, i) => {
+    const ball = i === 0 ? 0xe02030 : 0x20c060;
+    const buttons = i === 0 ? ([0xe02030, 0x2050e0] as const) : ([0x20c060, 0xe0c020] as const);
+    place(new THREE.CylinderGeometry(0.035, 0.035, 0.012, 16), m(TRIM, 0.8, 0.2), px - 0.14, 0.972, -0.23);
+    place(new THREE.CylinderGeometry(0.008, 0.008, 0.08, 8), m(0xc0c8d0, 0.3, 0.8), px - 0.14, 1.01, -0.23);
+    place(new THREE.SphereGeometry(0.026, 14, 10), m(ball, 0.35, 0.1), px - 0.14, 1.06, -0.23);
+    buttons.forEach((color, b) => {
+      place(new THREE.CylinderGeometry(0.026, 0.026, 0.02, 16), m(color, 0.35, 0.1, color, 0.35), px + 0.06 + b * 0.10, 0.978, -0.23);
+    });
+  });
+
+  // ── Monitor: black bezel and the tilted CRT screen ────────────────────────
+  // Tilted back by SCREEN_TILT about x so its face meets the focus eye, which
+  // sits ~11 cm above the screen's centre. Tilted back, its top edge leans
+  // toward the housing: the screen stands out far enough that the top edge
+  // stays just in front of the housing's face (z −0.07), or the housing
+  // would hide the top of the picture.
+  const SCREEN_TILT = 0.12;
+  const HOUSING_FACE_Z = 0.18 - 0.25;
+  const screenZ = HOUSING_FACE_Z - 0.005 - (screenH / 2) * Math.sin(SCREEN_TILT);
+  const bezel = place(new THREE.BoxGeometry(spec.screenW + 0.10, screenH + 0.11, 0.02), m(0x07090c, 0.9, 0.05), 0, screenY, screenZ + 0.013);
+  bezel.rotation.x = SCREEN_TILT;
+
+  // The marquee's lit name and the screen both emulators paint
+  // (arcadeMarquee, arcadeScreenSurface: the single cabinet's).
+  const marquee = arcadeMarquee(W - 0.02, 0.155);
+  const screenGlow = new THREE.PointLight(0x9fe8ff, 0, 1.6);
+  addLight(screenGlow, 0, screenY, -0.40, 0.22);
+  const surface = arcadeScreenSurface(spec.players.length === 2 ? "2 PLAYERS" : "1 PLAYER", (i) => {
+    screenGlow.userData.targetIntensity = 0.22 * i;
+    screenGlow.intensity = 0.22 * i;
+  }, (view) => marquee.show(view.title));
+  const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
+  screenMat.userData.baseOpacity = 1;
+  // NES aspect 256:240; the plane faces −z (ry = π), then tilts back.
+  const screen = place(new THREE.PlaneGeometry(spec.screenW, screenH), screenMat, 0, screenY, screenZ, Math.PI);
+  screen.rotation.x = SCREEN_TILT;
+
+  // ── Marquee ───────────────────────────────────────────────────────────────
+  const marqueeMat = new THREE.MeshBasicMaterial({ map: marquee.texture, transparent: true, opacity: 0, toneMapped: false });
+  marqueeMat.userData.baseOpacity = 1;
+  place(new THREE.PlaneGeometry(W - 0.02, 0.155), marqueeMat, 0, marqueeY, -0.062, Math.PI);
+  addLight(new THREE.PointLight(0xffc070, 0, 1.4), 0, marqueeY, -0.30, 0.18);
+
+  // ⚙️ on the kick plate's level, between the coin doors: the settings.
+  placeArcadeSettingsGear(ctx, 0, -0.19, -1);
+
+  // Both handles on the screen mesh (registerFurnitureHandles files them).
+  screen.userData.arcadeScreen = surface.screen;
+  screen.userData.arcadeCabinet = surface.visual;
 }
 
 
@@ -10561,81 +10774,6 @@ function buildTvStand(ctx: BuildCtx) {
  * brings it here later (plan §9). Stows the ArcadeScreenHandle on the
  * screen mesh (userData.arcadeScreen) for registerFurnitureHandles.
  */
-function buildArcadeCabinet(ctx: BuildCtx) {
-  const { m, place, addLight } = ctx;
-  const BODY = 0x141a2e; // deep navy cabinet
-  const TRIM = 0xd4a84b; // gold edges
-  const PANEL = 0x1a1f2a; // near-black deck and bezel
-  const SIDE = 0x00e5ff; // cyan side art
-  const w = ARCADE_W;
-  const d = ARCADE_D;
-
-  // Plinth, lower body, upper body, cap.
-  place(new THREE.BoxGeometry(w, 0.12, d), m(0x0a0d16, 0.7, 0.2), 0, 0.06, 0);
-  place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
-  place(new THREE.BoxGeometry(w, 0.7, d - 0.25), m(BODY, 0.6, 0.15), 0, 1.25, -0.11);
-  place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
-  // Side art: a lit cyan stripe on each flank.
-  for (const sx of [-1, 1]) {
-    place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 + 0.004), 1.0, 0.05);
-  }
-  // The control deck, angled toward the player: joystick left, buttons right.
-  const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
-  deck.rotation.x = -0.22;
-  place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), -0.17, 1.04, 0.3);
-  place(new THREE.SphereGeometry(0.028, 10, 8), m(0xff3b3b, 0.4, 0.1), -0.17, 1.09, 0.3);
-  const buttons: ReadonlyArray<readonly [number, number]> = [[0.02, TRIM], [0.12, SIDE], [0.22, 0x2fe6a0]];
-  for (const [bx, color] of buttons) {
-    place(new THREE.CylinderGeometry(0.022, 0.022, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), bx, 1.0, 0.31);
-  }
-  // Coin door with its slot.
-  place(new THREE.BoxGeometry(0.22, 0.16, 0.02), m(0x3d4a5e, 0.5, 0.5), 0, 0.5, d / 2 - 0.005);
-  place(new THREE.BoxGeometry(0.05, 0.012, 0.016), m(0x05070c, 0.8, 0.1), 0, 0.52, d / 2 + 0.003);
-  // Marquee: a lit header above the screen.
-  place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
-  place(new THREE.PlaneGeometry(w - 0.08, 0.1), m(TRIM, 0.5, 0.1, TRIM, 0.6), 0, 1.74, 0.111);
-  // The screen: a bezel and the canvas plane, both tilted back a touch.
-  const bezel = place(new THREE.BoxGeometry(0.64, 0.5, 0.03), m(PANEL, 0.5, 0.3), 0, ARCADE_SCREEN_Y, 0.15);
-  bezel.rotation.x = -0.14;
-
-  const cv = document.createElement("canvas");
-  cv.width = ARCADE_TEX_W;
-  cv.height = ARCADE_TEX_H;
-  const c2d = cv.getContext("2d")!;
-  const screenTex = new THREE.CanvasTexture(cv);
-  screenTex.minFilter = THREE.LinearFilter;
-  screenTex.magFilter = THREE.LinearFilter;
-  screenTex.generateMipmaps = false;
-  screenTex.colorSpace = THREE.SRGBColorSpace;
-  const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 });
-  const screen = place(new THREE.PlaneGeometry(0.56, 0.42), screenMat, 0, ARCADE_SCREEN_Y + 0.002, 0.168);
-  screen.rotation.x = -0.14;
-  // The screen's glow on the deck and the floor: driven with the view.
-  const glow = new THREE.PointLight(0x7fd8ff, 0, 3);
-  addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
-
-  const setGlow = (i: number) => {
-    glow.userData.targetIntensity = i;
-    glow.intensity = i;
-  };
-  const draw = (view: ArcadeScreenView): void => {
-    setGlow(paintArcadeScreen(c2d, ARCADE_TEX_W, ARCADE_TEX_H, view, "1 PLAYER"));
-    screenTex.needsUpdate = true;
-  };
-
-  let last = "";
-  const handle: ArcadeScreenHandle = {
-    draw: (view) => {
-      const key = JSON.stringify(view);
-      if (key === last) return;
-      last = key;
-      draw(view);
-    },
-  };
-  draw({ mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER LOADS A GAME", lane: "", blink: false, plays: 0 });
-  screen.userData.arcadeScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
-}
-
 /**
  * The cabinet's screen card, on a canvas `w` × `h`: the attract card
  * (FURLONG ARCADE, the game, a blinking INSERT COIN, the tally and how many
@@ -10697,6 +10835,211 @@ function paintArcadeScreen(c2d: CanvasRenderingContext2D, w: number, h: number, 
   c2d.fillStyle = "rgba(0,0,0,0.18)";
   for (let y = 0; y < h; y += 3) c2d.fillRect(0, y, w, 1);
   return glow;
+}
+
+/**
+ * 🕹 The screen both emulators share (#193). One 512×480 canvas under one
+ * texture: arcadeScreen.ts's painter draws the built-in NES emulator's
+ * frames and menus into it; while no built-in game holds it, the attract
+ * card from the room record (arcadeDoc.arcadeScreenView, the ArcadeScreenHandle
+ * World draws at 2 Hz) is painted into the same canvas at its 320×240 layout,
+ * scaled. The NES side takes the screen with present() and hands it back
+ * with showAttract(), which repaints the latest card.
+ */
+function arcadeScreenSurface(players: string, setGlow: (i: number) => void, onView?: (view: ArcadeScreenView) => void): {
+  texture: THREE.CanvasTexture;
+  screen: ArcadeScreenHandle;
+  visual: ArcadeCabinetVisualHandle;
+} {
+  const canvas = document.createElement("canvas");
+  const painter = createArcadeScreenPainter(canvas);
+  const c2d = canvas.getContext("2d")!;
+  const texture = new THREE.CanvasTexture(canvas);
+  // Linear filtering over the 2× pixel grid is the CRT's soft bleed.
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  let nesHolds = false;
+  let latest: ArcadeScreenView = { mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER PICKS A GAME", lane: "", blink: false, plays: 0 };
+  let latestKey = "";
+  const paintCard = () => {
+    c2d.save();
+    c2d.setTransform(canvas.width / ARCADE_TEX_W, 0, 0, canvas.height / ARCADE_TEX_H, 0, 0);
+    setGlow(paintArcadeScreen(c2d, ARCADE_TEX_W, ARCADE_TEX_H, latest, players));
+    c2d.restore();
+    texture.needsUpdate = true;
+  };
+  const screen: ArcadeScreenHandle = {
+    draw: (view) => {
+      const key = JSON.stringify(view);
+      if (key === latestKey) return;
+      latestKey = key;
+      latest = view;
+      onView?.(view);
+      if (!nesHolds) paintCard();
+    },
+  };
+  const visual: ArcadeCabinetVisualHandle = {
+    painter,
+    present(): void {
+      nesHolds = true;
+      setGlow(1.0);
+      texture.needsUpdate = true;
+    },
+    showAttract(): void {
+      nesHolds = false;
+      paintCard();
+    },
+  };
+  paintCard();
+  onView?.(latest);
+  return { texture, screen, visual };
+}
+
+/**
+ * 🕹 The marquee (#193): the game's name, lit from behind in a box above the
+ * screen, like the cabinets of old. Repainted only when the name changes.
+ */
+function arcadeMarquee(planeW: number, planeH: number): { texture: THREE.CanvasTexture; show: (title: string) => void } {
+  const canvas = document.createElement("canvas");
+  canvas.width = 512;
+  canvas.height = Math.round((512 * planeH) / planeW);
+  const g = canvas.getContext("2d")!;
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  let shown: string | null = null;
+  const show = (title: string) => {
+    if (title === shown) return;
+    shown = title;
+    const W = canvas.width;
+    const H = canvas.height;
+    // Backlit glass: warm at the centre, darker at the ends.
+    const glass = g.createLinearGradient(0, 0, W, 0);
+    glass.addColorStop(0, "#3a1606");
+    glass.addColorStop(0.5, "#ffb84a");
+    glass.addColorStop(1, "#3a1606");
+    g.fillStyle = glass;
+    g.fillRect(0, 0, W, H);
+    g.fillStyle = "rgba(255,240,200,0.25)";
+    g.fillRect(0, H * 0.08, W, H * 0.12);
+    g.strokeStyle = "#d4a84b";
+    g.lineWidth = 6;
+    g.strokeRect(3, 3, W - 6, H - 6);
+    const name = title.length > 22 ? `${title.slice(0, 21)}…` : title;
+    let size = 64;
+    g.font = `900 ${size}px 'SF Mono','Consolas',monospace`;
+    while (size > 24 && g.measureText(name).width > W - 40) {
+      size -= 4;
+      g.font = `900 ${size}px 'SF Mono','Consolas',monospace`;
+    }
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.lineWidth = 5;
+    g.strokeStyle = "#1a0a14";
+    g.strokeText(name, W / 2, H / 2 + 3, W - 30);
+    g.fillStyle = "#fff6e0";
+    g.fillText(name, W / 2, H / 2 + 3, W - 30);
+    texture.needsUpdate = true;
+  };
+  return { texture, show };
+}
+
+/**
+ * ⚙️ The cabinet's settings button, low on its front by the floor — out of
+ * the player's view at the controls (the slot machine's kick-panel gears,
+ * #241). Anyone who clicks it reads the cabinet's settings; the owner
+ * changes them there (arcadeUI's SETTINGS view, World.handleArcadeControl).
+ * A gold rim and the emoji on a dark disc on the face at `z`, facing local
+ * +z (`face` 1, the single cabinet) or −z (−1, the two-player upright).
+ */
+export const ARCADE_GEAR_Y = 0.2;
+function placeArcadeSettingsGear({ itemId, m, place }: BuildCtx, x: number, z: number, face: 1 | -1 = 1): void {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 128;
+  const g = canvas.getContext("2d")!;
+  g.fillStyle = "#20262F";
+  g.beginPath();
+  g.arc(64, 64, 62, 0, Math.PI * 2);
+  g.fill();
+  g.font = '84px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+  g.textAlign = "center";
+  g.textBaseline = "middle";
+  g.fillText("⚙️", 64, 70);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const faceMat = new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0 });
+  faceMat.userData.baseOpacity = 1;
+  const rimGeometry = new THREE.CylinderGeometry(0.05, 0.05, 0.012, 24);
+  rimGeometry.rotateX(Math.PI / 2);
+  const rim = place(rimGeometry, m(0xd4a84b, 0.35, 0.6), x, ARCADE_GEAR_Y, z + face * 0.006);
+  const disc = place(new THREE.PlaneGeometry(0.086, 0.086), faceMat, x, ARCADE_GEAR_Y, z + face * 0.0125, face === 1 ? 0 : Math.PI);
+  for (const gear of [rim, disc]) {
+    gear.userData.arcadeControl = "settings";
+    gear.userData.arcadeCabinetId = itemId;
+  }
+}
+
+function buildArcadeCabinet(ctx: BuildCtx) {
+  const { m, place, addLight } = ctx;
+  const BODY = 0x141a2e; // deep navy cabinet
+  const TRIM = 0xd4a84b; // gold edges
+  const PANEL = 0x1a1f2a; // near-black deck and bezel
+  const SIDE = 0x00e5ff; // cyan side art
+  const w = ARCADE_W;
+  const d = ARCADE_D;
+
+  // Plinth, lower body, upper body, cap.
+  place(new THREE.BoxGeometry(w, 0.12, d), m(0x0a0d16, 0.7, 0.2), 0, 0.06, 0);
+  place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
+  place(new THREE.BoxGeometry(w, 0.7, d - 0.25), m(BODY, 0.6, 0.15), 0, 1.25, -0.11);
+  place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
+  // Side art: a lit cyan stripe on each flank.
+  for (const sx of [-1, 1]) {
+    place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 + 0.004), 1.0, 0.05);
+  }
+  // The control deck, angled toward the player: joystick left, buttons right.
+  const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
+  deck.rotation.x = -0.22;
+  place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), -0.17, 1.04, 0.3);
+  place(new THREE.SphereGeometry(0.028, 10, 8), m(0xff3b3b, 0.4, 0.1), -0.17, 1.09, 0.3);
+  const buttons: ReadonlyArray<readonly [number, number]> = [[0.02, TRIM], [0.12, SIDE], [0.22, 0x2fe6a0]];
+  for (const [bx, color] of buttons) {
+    place(new THREE.CylinderGeometry(0.022, 0.022, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), bx, 1.0, 0.31);
+  }
+  // Coin door with its slot.
+  place(new THREE.BoxGeometry(0.22, 0.16, 0.02), m(0x3d4a5e, 0.5, 0.5), 0, 0.5, d / 2 - 0.005);
+  place(new THREE.BoxGeometry(0.05, 0.012, 0.016), m(0x05070c, 0.8, 0.1), 0, 0.52, d / 2 + 0.003);
+  // ⚙️ below the coin door, just above the plinth: anyone's way to the settings.
+  placeArcadeSettingsGear(ctx, 0, (d - 0.03) / 2);
+  // Marquee: the game's name, lit in a box above the screen.
+  place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
+  const marquee = arcadeMarquee(w - 0.06, 0.13);
+  const marqueeMat = new THREE.MeshBasicMaterial({ map: marquee.texture, transparent: true, opacity: 0, toneMapped: false });
+  marqueeMat.userData.baseOpacity = 1;
+  place(new THREE.PlaneGeometry(w - 0.06, 0.13), marqueeMat, 0, 1.74, 0.111);
+  addLight(new THREE.PointLight(0xffc070, 0, 1.4), 0, 1.74, 0.35, 0.25);
+  // The screen: a bezel and the canvas plane, both tilted back a touch.
+  const bezel = place(new THREE.BoxGeometry(0.64, 0.5, 0.03), m(PANEL, 0.5, 0.3), 0, ARCADE_SCREEN_Y, 0.15);
+  bezel.rotation.x = -0.14;
+
+  // The screen both emulators paint (arcadeScreenSurface): a 4:3 plane,
+  // tilted back a touch, the NES picture stretched as a CRT shows it.
+  const glow = new THREE.PointLight(0x7fd8ff, 0, 3);
+  addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
+  const setGlow = (i: number) => {
+    glow.userData.targetIntensity = i;
+    glow.intensity = i;
+  };
+  const surface = arcadeScreenSurface("1 PLAYER", setGlow, (view) => marquee.show(view.title));
+  const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
+  screenMat.userData.baseOpacity = 1;
+  const screen = place(new THREE.PlaneGeometry(0.56, 0.42), screenMat, 0, ARCADE_SCREEN_Y + 0.002, 0.168);
+  screen.rotation.x = -0.14;
+  // Both handles on the screen mesh (registerFurnitureHandles files them):
+  // the room record's card, and the built-in emulator's painter.
+  screen.userData.arcadeScreen = surface.screen;
+  screen.userData.arcadeCabinet = surface.visual;
 }
 
 /**
