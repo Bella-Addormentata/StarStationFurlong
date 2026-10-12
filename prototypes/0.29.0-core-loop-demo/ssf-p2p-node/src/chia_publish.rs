@@ -400,13 +400,32 @@ impl WalletLease {
     }
 
     /// Merge a stored parking into the lease (see [`WalletLease::restore`]):
-    /// how many coins it parked. Parsed WHOLE before anything is taken, so a
-    /// malformed entry leaves the lease untouched and seals it: the spend it
-    /// belonged to is unknown, not forgotten.
+    /// how many coins it parked. Checked WHOLE before anything is taken, so a
+    /// file that fails any check leaves the lease untouched and seals it: what
+    /// it recorded is unknown, not forgotten. The checks (#245 review, round
+    /// 21): the version this node writes; every coin id well formed and listed
+    /// once; every spend number in `1..=spends`, so the counter the lease
+    /// continues from really is above every restored number — a file whose
+    /// counter had fallen behind its entries would hand a new spend a restored
+    /// number, and one verdict would then release both (compare-and-release
+    /// relies on the numbers being distinct).
     fn load(&self, file: &LeaseFile, now: Instant) -> Result<usize, String> {
+        if file.v != 1 {
+            return Err(format!("version {} this node does not read (it writes version 1)", file.v));
+        }
         let mut parked = Vec::with_capacity(file.parked.len());
+        let mut seen = HashSet::with_capacity(file.parked.len());
         for entry in &file.parked {
             let id = parse_coin_id(&entry.coin).ok_or_else(|| format!("malformed parked coin id {:?}", entry.coin))?;
+            if entry.spend == 0 || entry.spend > file.spends {
+                return Err(format!(
+                    "parked coin {:?} numbered #{} outside its spend counter #{} (spends run 1..=counter)",
+                    entry.coin, entry.spend, file.spends
+                ));
+            }
+            if !seen.insert(id) {
+                return Err(format!("parked coin {:?} listed twice", entry.coin));
+            }
             parked.push((id, entry.spend));
         }
         let incoming = match file.incoming.as_deref() {
@@ -1213,8 +1232,20 @@ mod tests {
         // A file that exists but cannot be read SEALS the lease (round 19): the
         // spends it held may be live, so nothing parks and no spend leaves, and
         // the file is left as it is for the operator, never written over.
-        let broken: [&[u8]; 2] = [b"not json", br#"{"v":1,"spends":3,"parked":[{"coin":"zz","spend":3}]}"#];
-        for bytes in broken {
+        let one = hex::encode([1u8; 32]);
+        let broken: Vec<String> = vec![
+            "not json".to_string(),
+            r#"{"v":1,"spends":3,"parked":[{"coin":"zz","spend":3}]}"#.to_string(),
+            // Checked whole (round 21): a version this node does not write, a
+            // spend numbered beyond the counter (a new spend would share it), a
+            // zero spend number, a coin listed twice.
+            r#"{"v":2,"spends":1,"parked":[]}"#.to_string(),
+            format!(r#"{{"v":1,"spends":0,"parked":[{{"coin":"{one}","spend":1}}]}}"#),
+            format!(r#"{{"v":1,"spends":2,"parked":[{{"coin":"{one}","spend":0}}]}}"#),
+            format!(r#"{{"v":1,"spends":2,"parked":[{{"coin":"{one}","spend":1}},{{"coin":"{one}","spend":2}}]}}"#),
+        ];
+        for text in &broken {
+            let bytes = text.as_bytes();
             std::fs::write(&path, bytes).unwrap();
             let sealed = WalletLease::new();
             sealed.restore(&path);

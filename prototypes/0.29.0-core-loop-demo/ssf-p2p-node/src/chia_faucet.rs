@@ -499,38 +499,23 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &CoinsetClient, para
                 // land on a coin a writer parked again in the meantime, and the
                 // wallet snapshot must match the markers it is read against.
                 let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
+                // A sealed lease takes no spend: the buttons go off and the note
+                // says why, whatever the balance (round 21; see wallet_part).
+                let sealed = crate::chia_publish::WALLET_LEASE.ensure_open().err();
                 crate::chia_publish::WALLET_LEASE.reconcile(client).await;
                 let wallet = wallet_view(client, sk).await?;
                 st.wallet_mojos = Some(wallet.owned_mojos());
                 st.wallet_spendable_mojos = Some(wallet.spendable_mojos());
                 st.wallet_partial = wallet.partial;
-                st.can_give = wallet.spendable_mojos() >= u128::from(params.gift);
-                // The courtesy check reads what we OWN: a coin parked by a spend
-                // in flight is still ours, so the wallet is not empty. A gift
-                // from the dish that is still landing counts the same way (the
-                // chain lists it only once the block confirms).
                 let landing = crate::chia_publish::WALLET_LEASE.incoming_pending();
-                // A listing cut short lists coins, so it is never empty; should
-                // one ever be, it proves nothing about the wallet: TAKE stays
-                // off (fail closed, #245 review, round 16).
-                st.can_claim = wallet.owned.is_empty() && !wallet.partial && !landing && st.ready > 0;
                 // From the lease, not the listing: a parked coin the cut-short
                 // listing never reached is still a spend in flight (round 16).
                 st.spending = crate::chia_publish::WALLET_LEASE.outgoing_pending();
                 st.landing = landing;
-                st.note = if wallet.owned.is_empty() && landing {
-                    "your mojo from the dish is on its way (about a minute); the wallet shows it when the block lands".into()
-                } else if !wallet.owned.is_empty() && st.ready > 0 {
-                    "the dish is for players with an empty wallet; yours already holds a coin".into()
-                } else if wallet.owned.is_empty() && st.ready == 0 {
-                    "no mojo in the dish yet; it refills on the block clock".into()
-                } else if wallet.partial {
-                    "your wallet holds more coins than the dish lists (cut short); giving uses the ones it read".into()
-                } else if st.spending {
-                    "a spend from your wallet is still confirming (about a minute); giving waits for it".into()
-                } else {
-                    String::new()
-                };
+                let part = wallet_part(&wallet, landing, st.spending, sealed.as_ref(), params.gift, st.ready > 0);
+                st.can_give = part.can_give;
+                st.can_claim = part.can_claim;
+                st.note = part.note;
             }
             None => {
                 st.note = "this node has no wallet loaded (start it with SSF_CHIA_LANE=1 to take or give)".into();
@@ -585,10 +570,30 @@ async fn wallet_view(client: &CoinsetClient, sk: &chia_bls::SecretKey) -> Result
     Ok(WalletView { owned, spendable, partial: listing.partial })
 }
 
+/// One gift is paid from at most this many of our coins (#245 review, round
+/// 21): a wallet dusted into many small outputs would otherwise have one click
+/// build and sign hundreds of standard spends under the wallet lease, for a
+/// bundle the mempool may refuse over its cost only after all that work. At a
+/// generous 12 million cost per standard input, 64 inputs stay under a tenth
+/// of a block's 11 billion.
+#[cfg(feature = "chia-publish")]
+pub const MAX_GIVE_INPUTS: usize = 64;
+
+/// What one gift can draw on: the [`MAX_GIVE_INPUTS`] largest coins together
+/// (the whole balance, for a wallet with no more coins than that).
+#[cfg(feature = "chia-publish")]
+pub fn give_reach(coins: &[Coin]) -> u128 {
+    let mut amounts: Vec<u64> = coins.iter().map(|c| c.amount).collect();
+    amounts.sort_unstable_by(|a, b| b.cmp(a));
+    amounts.iter().take(MAX_GIVE_INPUTS).map(|a| u128::from(*a)).sum()
+}
+
 /// Which of our coins pay a gift of `amount`: largest first until they cover it,
 /// so a wallet split over several small coins can still give what the screen
-/// enabled from its total (#245 review). `None` when the wallet cannot cover it;
-/// otherwise the coins and the change.
+/// enabled from its total (#245 review), but never more than
+/// [`MAX_GIVE_INPUTS`] of them. `None` when those cannot cover it; otherwise
+/// the coins and the change.
+#[cfg(feature = "chia-publish")]
 pub fn pick_give_coins(mut coins: Vec<Coin>, amount: u64) -> Option<(Vec<Coin>, u64)> {
     coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
     let mut chosen = Vec::new();
@@ -603,8 +608,72 @@ pub fn pick_give_coins(mut coins: Vec<Coin>, amount: u64) -> Option<(Vec<Coin>, 
         if sum >= amount {
             return Some((chosen, (sum - amount) as u64));
         }
+        if chosen.len() == MAX_GIVE_INPUTS {
+            break;
+        }
     }
     None
+}
+
+/// The wallet's word on the dish for THIS node: TAKE and GIVE, and the note
+/// explaining whichever is off (see [`status_under_turn`]). Pure, so it is
+/// checked without a chain. A SEALED lease (see
+/// [`crate::chia_publish::WalletLease::restore`]) takes no spend, so neither
+/// button is offered whatever the balance and the note says why: a status poll
+/// clears an earlier refusal from the screen, and would otherwise re-enable
+/// buttons every click of which fails (#245 review, round 21).
+#[cfg(feature = "chia-publish")]
+#[derive(Debug)]
+struct WalletPart {
+    can_give: bool,
+    can_claim: bool,
+    note: String,
+}
+
+#[cfg(feature = "chia-publish")]
+fn wallet_part(
+    wallet: &WalletView,
+    landing: bool,
+    spending: bool,
+    sealed: Option<&crate::chia_publish::LeaseError>,
+    gift: u64,
+    dish_ready: bool,
+) -> WalletPart {
+    let open = sealed.is_none();
+    let spendable = wallet.spendable_mojos();
+    let reach = give_reach(&wallet.spendable);
+    // The courtesy check reads what we OWN: a coin parked by a spend in flight
+    // is still ours, so the wallet is not empty. A gift from the dish that is
+    // still landing counts the same way (the chain lists it only once the
+    // block confirms). A listing cut short lists coins, so it is never empty;
+    // should one ever be, it proves nothing about the wallet: TAKE stays off
+    // (fail closed, #245 review, round 16).
+    let can_claim = open && wallet.owned.is_empty() && !wallet.partial && !landing && dish_ready;
+    // GIVE draws on at most MAX_GIVE_INPUTS coins: what those reach, not the
+    // whole balance, is what a gift can be.
+    let can_give = open && reach >= u128::from(gift);
+    let note = if let Some(why) = sealed {
+        format!("this node takes no spend right now: {why}")
+    } else if wallet.owned.is_empty() && landing {
+        "your mojo from the dish is on its way (about a minute); the wallet shows it when the block lands".into()
+    } else if reach < spendable {
+        // A giver's wallet (it holds coins), so the giving hint outranks the
+        // note that the dish is for empty wallets.
+        format!(
+            "your wallet is split into many small coins: one gift is paid from at most {MAX_GIVE_INPUTS} of them ({reach} mojos); consolidate it to give more at once"
+        )
+    } else if !wallet.owned.is_empty() && dish_ready {
+        "the dish is for players with an empty wallet; yours already holds a coin".into()
+    } else if wallet.owned.is_empty() && !dish_ready {
+        "no mojo in the dish yet; it refills on the block clock".into()
+    } else if wallet.partial {
+        "your wallet holds more coins than the dish lists (cut short); giving uses the ones it read".into()
+    } else if spending {
+        "a spend from your wallet is still confirming (about a minute); giving waits for it".into()
+    } else {
+        String::new()
+    };
+    WalletPart { can_give, can_claim, note }
 }
 
 /// CLAIM: spend the readiest faucet coin, GIFT to our own address, keyless.
@@ -746,8 +815,16 @@ async fn give(
         return Err(anyhow!("a spend from your wallet is still confirming (about a minute); give again after it lands"));
     }
     let total = wallet.spendable_mojos();
+    let reach = give_reach(&wallet.spendable);
     let Some((coins, change)) = pick_give_coins(wallet.spendable, amount) else {
-        return Err(anyhow!("your wallet can spend {total} mojos right now; give at most that in one go"));
+        return Err(if u128::from(amount) <= total {
+            // Covered by the balance, not by MAX_GIVE_INPUTS coins of it (round 21).
+            anyhow!(
+                "your wallet is split into many small coins: one gift is paid from at most {MAX_GIVE_INPUTS} of them ({reach} mojos); give at most that in one go, or consolidate the wallet first"
+            )
+        } else {
+            anyhow!("your wallet can spend {total} mojos right now; give at most that in one go")
+        });
     };
     let our_ph = crate::chia_publish::our_puzzle_hash(sk);
     let faucet_ph = params.puzzle_hash();
@@ -1090,6 +1167,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<FaucetStatus>(&json).unwrap(), st);
     }
 
+    #[cfg(feature = "chia-publish")]
     #[test]
     fn give_takes_the_fewest_largest_coins_that_cover_the_gift() {
         let ph = Bytes32::new([5u8; 32]);
@@ -1109,6 +1187,42 @@ mod tests {
         assert_eq!((chosen.len(), change), (2, 1));
         assert!(pick_give_coins(vec![coin(1, 400), coin(2, 500)], 1000).is_none());
         assert!(pick_give_coins(vec![], 1).is_none());
+        // One gift is paid from at most MAX_GIVE_INPUTS coins (round 21): a
+        // wallet dusted into 100 one-mojo coins reaches 64, covers 64, not 65.
+        let dust: Vec<Coin> = (0..100u8).map(|n| coin(n, 1)).collect();
+        assert_eq!(give_reach(&dust), MAX_GIVE_INPUTS as u128);
+        let (chosen, change) = pick_give_coins(dust.clone(), MAX_GIVE_INPUTS as u64).unwrap();
+        assert_eq!((chosen.len(), change), (MAX_GIVE_INPUTS, 0));
+        assert!(pick_give_coins(dust, MAX_GIVE_INPUTS as u64 + 1).is_none());
+    }
+
+    #[cfg(feature = "chia-publish")]
+    #[test]
+    fn a_sealed_lease_offers_neither_take_nor_give_and_says_why() {
+        use crate::chia_publish::LeaseError;
+        let ph = Bytes32::new([5u8; 32]);
+        let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), ph, amount);
+        let funded = WalletView { owned: vec![coin(1, 5_000)], spendable: vec![coin(1, 5_000)], partial: false };
+        let empty = WalletView { owned: vec![], spendable: vec![], partial: false };
+        // Open: a funded wallet gives, an empty one takes.
+        let part = wallet_part(&funded, false, false, None, 1, true);
+        assert!(part.can_give && !part.can_claim, "{part:?}");
+        let part = wallet_part(&empty, false, false, None, 1, true);
+        assert!(part.can_claim && !part.can_give && part.note.is_empty(), "{part:?}");
+        // Sealed: neither, whatever the balance, and the note carries the reason,
+        // so a poll clearing an earlier refusal does not re-enable the buttons.
+        let sealed = LeaseError::Sealed("wallet_lease.json is unreadable".into());
+        let part = wallet_part(&funded, false, false, Some(&sealed), 1, true);
+        assert!(!part.can_give && !part.can_claim, "{part:?}");
+        assert!(part.note.contains("takes no spend") && part.note.contains("wallet_lease.json is unreadable"), "{}", part.note);
+        let part = wallet_part(&empty, false, false, Some(&sealed), 1, true);
+        assert!(!part.can_claim && part.note.contains("sealed"), "{part:?}");
+        // A wallet dusted into more coins than one gift may spend: GIVE stays on
+        // for what the largest coins reach, and the note says to consolidate.
+        let dust: Vec<Coin> = (0..100u8).map(|n| coin(n, 1)).collect();
+        let dusted = WalletView { owned: dust.clone(), spendable: dust, partial: false };
+        let part = wallet_part(&dusted, false, false, None, 1, true);
+        assert!(part.can_give && part.note.contains("many small coins") && part.note.contains("(64 mojos)"), "{part:?}");
     }
 
     #[test]
