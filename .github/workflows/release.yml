@@ -352,6 +352,13 @@ jobs:
         run: |
           cd "$RELEASE_FRONTEND"
           npm ci
+          # 🕹 The arcade cabinet's own EmulatorJS (#193): the engine and its
+          # eleven cores, from the npm registry at the version the fetch
+          # script pins, refused unless each package's sha512 is pinned
+          # there too. Four of the cores forbid commercial use (FBNeo,
+          # MAME 2003-Plus, Snes9x, Genesis Plus GX; public/arcade/README.md).
+          # A frontend without the script skips this.
+          EJS_REQUIRE_PIN=1 npm run --if-present fetch:emulatorjs
           npm run build
 
       # 4b. Build the sovereign P2P node for THIS platform and stage it where

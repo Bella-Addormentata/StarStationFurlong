@@ -43,6 +43,43 @@ settings: one of the games above on the built-in emulator (it plays on the
 cabinet's screen and the room watches), or the owner's own game in EmulatorJS.
 Players don't pick games; they walk up and press play.
 
+## EmulatorJS, for the owner's own game
+
+The owner's own game runs in [EmulatorJS](https://github.com/EmulatorJS/EmulatorJS)
+inside a sandboxed frame. It isn't in this repository:
+`npm run fetch:emulatorjs` puts it under `public/emulatorjs/`, the engine and
+its cores as npm packages at one pinned version, and release builds carry the
+engine and all eleven cores. Each core's archive holds its own license
+(`license.txt`); the texts are here too, and
+`emulatorjs/data/NOTICE.txt` names each package fetched, its sha512 and its
+source repository.
+
+| Part | Systems | License | Text |
+|---|---|---|---|
+| EmulatorJS (the engine) | all | GPL-3.0 | [`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt); its own `LICENSE` lands beside the engine |
+| fceumm | NES | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| gambatte | Game Boy, Game Boy Color | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| mupen64plus_next | Nintendo 64 | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| pcsx_rearmed | PlayStation | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| mednafen_pce | PC Engine | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| mgba | Game Boy Advance | MPL-2.0 | [`licenses/MPL-2.0-mgba.txt`](licenses/MPL-2.0-mgba.txt) |
+| stella2014 | Atari 2600 | none shipped: its archive holds no license text; see [its repository](https://github.com/EmulatorJS/stella2014-libretro) | — |
+| genesis_plus_gx | Mega Drive, Master System | Genesis Plus GX, **non-commercial** | [`licenses/Genesis-Plus-GX.txt`](licenses/Genesis-Plus-GX.txt) |
+| snes9x | SNES | Snes9x, **non-commercial** | [`licenses/Snes9x.txt`](licenses/Snes9x.txt) |
+| fbneo | Arcade (FBNeo) | FBNeo, **non-commercial**, and no asking for donations for a project that uses it | [`licenses/FBNeo.txt`](licenses/FBNeo.txt) |
+| mame2003_plus | Arcade (MAME 2003-Plus) | MAME 0.78, **non-commercial** | [`licenses/MAME-2003-Plus.txt`](licenses/MAME-2003-Plus.txt) |
+
+The four non-commercial cores are in release builds because Star Station
+Furlong is non-commercial (the owner, 2026-10-12). FBNeo's license also forbids
+asking for donations to support work on any project that uses it, and this one
+asks for none. A build that is sold, or that asks for donations, would have to
+leave those cores out (`EJS_CORES` names the cores to fetch).
+
+EmulatorJS's own scripts travel with it unminified. The cores are compiled
+builds: each package names its source repository but not the commit it was
+built from, so their source does not travel with the app the way the built-in
+games' does.
+
 ## Adding a game
 
 Only add a ROM whose author has released it under a license that allows
