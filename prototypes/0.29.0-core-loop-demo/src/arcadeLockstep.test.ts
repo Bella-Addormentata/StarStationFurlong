@@ -483,14 +483,17 @@ describe('records as a peer may have written them', () => {
   it('an epoch names its seats, its leading seat among them, and a state in pieces that add up', () => {
     const e = { v: 1, nonce: 'pa4', game: GAME, anchor: 1, seats: [0, 1, 3], frame: 900, hash: 'abc:13752', held: [[1, 8, 1]], raw: 13_752, size: 4_000, chunks: 1, page: 'pb' };
     expect(readEpoch(e, 4)).toEqual({
-      nonce: 'pa4', game: GAME, anchor: 1, seats: [0, 1, 3], frame: 900, hash: 'abc:13752', held: [[1, 8, 1]], raw: 13_752, size: 4_000, chunks: 1, page: 'pb',
+      nonce: 'pa4', game: GAME, anchor: 1, seats: [0, 1, 3], frame: 900, hash: 'abc:13752', held: [[1, 8, 1]], raw: 13_752, size: 4_000, chunks: 1, page: 'pb', out: [],
     });
+    expect(readEpoch({ ...e, out: [[2, 15_000]] }, 4)?.out).toEqual([[2, 15_000]]); // left out, for 15 s more
     const alone = { ...e, seats: [1], hash: '', held: [], raw: 0, size: 0, chunks: 0 };
     expect(readEpoch(alone, 4)?.seats).toEqual([1]);
     for (const bad of [
       { ...e, seats: [1, 0, 3] }, { ...e, seats: [0, 0, 1] }, { ...e, seats: [0, 1, 4] }, { ...e, anchor: 2 },
       { ...e, chunks: 0 }, { ...e, size: 70_000 }, { ...e, hash: 'abc:99' }, { ...e, held: [[4, 8, 1]] },
       { ...e, nonce: '' }, { ...alone, chunks: 1 }, { ...e, seats: [0, 1, 2, 3, 0] },
+      { ...e, out: [[1, 5]] }, { ...e, out: [[2, 0]] }, { ...e, out: [[2, EXCLUDE_MS + 1]] }, { ...e, out: [[4, 5]] },
+      { ...e, out: [[2, 5], [2, 6]] }, { ...e, out: [2, 5] }, { ...e, out: 'none' },
     ]) expect(readEpoch(bad, 4)).toBeNull();
     expect(readEpoch({ ...e, seats: [0, 1, 3] }, 2)).toBeNull(); // past a two-seat cabinet's seats
   });
@@ -660,6 +663,30 @@ describe('players at the double-wide cabinet, page against page', () => {
     await room.run(EXCLUDE_MS + 6_000, bot(a, 1));
     expect(view(a)).toMatchObject({ phase: 'playing', players: [0, 1] });
     expect(view(b)).toMatchObject({ phase: 'playing', players: [0, 1] });
+  });
+
+  it('a seat left out stays out when the seat that leads stands up', async () => {
+    const room = new Room();
+    const a = room.add('pa', 0);
+    await room.run(2_000);
+    const b = room.add('pb', 1);
+    const c = room.add('pc', 2);
+    c.frame.brokenLoads = true; // its loads never land
+    await room.run(JOIN_MS + 4_000, allOf(bot(a, 1), bot(b, 2)));
+    expect(view(a)).toMatchObject({ phase: 'playing', players: [0, 1] });
+    expect(readEpoch(a.map.get(lockstepEpochKey(CAB)), 4)?.out.map(([n]) => n)).toEqual([2]);
+    // The seat that leads goes while c is still out: b leads now, and
+    // plays on without holding for c again.
+    room.remove(a);
+    await room.run(3_000, bot(b, 2));
+    expect(view(b)).toMatchObject({ phase: 'alone', players: [1] });
+    const at = b.frame.at();
+    await room.run(2_000, bot(b, 2));
+    expect(b.frame.at()).toBeGreaterThan(at + 60);
+    // Once its time out is up and it loads again, c is let back in.
+    c.frame.brokenLoads = false;
+    await room.run(EXCLUDE_MS + 6_000, bot(b, 2));
+    expect(view(b)).toMatchObject({ phase: 'playing', players: [1, 2] });
   });
 
   it('two seats that begin at once end in one game', async () => {

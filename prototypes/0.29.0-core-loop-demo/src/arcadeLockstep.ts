@@ -51,7 +51,10 @@
  * LANE_BEAT_MS), it runs the same game, and its page is on screen: a tab
  * in the background runs no frames, so it steps out until it is back. A
  * seat that cannot keep up (its join never lands, or the game keeps
- * holding for it) is left out for EXCLUDE_MS by the seat that leads.
+ * holding for it) is left out for EXCLUDE_MS by the seat that leads. Every
+ * epoch names the seats left out and for how much longer, so the pages
+ * that see it leave them out too, and a seat that leads next keeps them
+ * out; a seat never leaves itself out (alone, it plays).
  *
  * ENFORCEMENT POSTURE: a peer running edited code can send its own seat's
  * buttons and a state of its own making, as any player can press buttons.
@@ -196,6 +199,9 @@ export interface Epoch {
   size: number;
   chunks: number;
   page: string;
+  /** The seats left out when it began ([seat, ms]): out for that much
+   *  longer from then. None of its seats. */
+  out: Array<[number, number]>;
 }
 
 /** The cabinet's epoch, or null for anything out of shape (`seats`: the
@@ -229,9 +235,18 @@ export function readEpoch(raw: unknown, seats: number): Epoch | null {
     if (!isReplayInput({ frame: 0, player: row[0], index: row[1], value: row[2] }) || row[0] >= seats) return null;
     held.push([row[0], row[1], row[2]]);
   }
+  const out: Array<[number, number]> = [];
+  if (r.out !== undefined) {
+    if (!Array.isArray(r.out) || r.out.length > seats) return null;
+    for (const row of r.out) {
+      if (!Array.isArray(row) || row.length !== 2 || !isInt(row[0], 0, seats - 1) || !isInt(row[1], 1, EXCLUDE_MS)) return null;
+      if (list.includes(row[0]) || out.some(([n]) => n === row[0])) return null;
+      out.push([row[0], row[1]]);
+    }
+  }
   return {
     nonce: r.nonce, game, anchor: r.anchor, seats: list, frame: r.frame, hash: r.hash as string, held,
-    raw: r.raw, size: r.size, chunks: r.chunks, page,
+    raw: r.raw, size: r.size, chunks: r.chunks, page, out,
   };
 }
 
@@ -667,6 +682,9 @@ export class LockstepController {
     if (e && !this.epochSeen.has(e.nonce)) {
       this.epochSeen.set(e.nonce, now);
       if (this.epochSeen.size > 16) this.epochSeen.delete(this.epochSeen.keys().next().value!);
+      // Who it leaves out is out here too, and a seat it takes is back in.
+      for (const n of e.seats) this.excluded.delete(n);
+      for (const [n, ms] of e.out) if (n !== this.d.seat) this.excluded.set(n, Math.max(this.excluded.get(n) ?? 0, now + ms));
     }
     const lanes = this.readLanes(now);
     this.forward();
@@ -779,17 +797,23 @@ export class LockstepController {
     for (const n of seats) if (n !== this.d.seat) this.fwd.set(n, start - 1);
   }
 
-  /** The epoch's record, written with or after its pieces (the doc is in
-   *  order per writer, so a page that hears the record has every piece; a
-   *  piece is an update of its own), the pieces of every earlier epoch of
+  /** The epoch's record, written with or after its pieces (a piece is an
+   *  update of its own; a page that hears the record before every piece is
+   *  in tries again on its next look), the pieces of every earlier epoch of
    *  the cabinet deleted in the same write. */
   private publish(e: { nonce: string; seats: number[]; frame: number; hash: string; held: Array<[number, number, number]>; raw: number }, pieces: Uint8Array[]): void {
     const { store, itemId } = this.d;
     const prefix = lockstepChunkPrefix(itemId);
     const stale = store.keys(prefix, 4096).filter((k) => !k.startsWith(`${prefix}${e.nonce}:`));
+    const now = this.d.now();
+    const out: Array<[number, number]> = [];
+    for (const [n, until] of this.excluded) {
+      if (until > now && !e.seats.includes(n)) out.push([n, Math.min(EXCLUDE_MS, Math.ceil(until - now))]);
+    }
     const record = {
       v: 1, nonce: e.nonce, game: this.game, anchor: this.d.seat, seats: e.seats, frame: e.frame, hash: e.hash,
       held: e.held, raw: e.raw, size: pieces.reduce((n, p) => n + p.length, 0), chunks: pieces.length, page: this.d.page,
+      out: out.sort((a, b) => a[0] - b[0]),
     };
     // The frame is in it already: its state for others to load is what
     // began it. This seat's lane says so in the same write as the record,
@@ -797,7 +821,7 @@ export class LockstepController {
     // to begin in between).
     this.frameNonce = e.nonce;
     this.framePhase = e.seats.length === 1 ? 'free' : 'lockstep';
-    const lane: readonly [string, unknown] = [lockstepLaneKey(itemId, this.d.seat), this.laneRecord(this.d.now())];
+    const lane: readonly [string, unknown] = [lockstepLaneKey(itemId, this.d.seat), this.laneRecord(now)];
     const entries: Array<readonly [string, unknown]> = pieces.map((p, i) => [lockstepChunkKey(itemId, e.nonce, i), p] as const);
     for (const entry of entries.slice(0, -1)) store.set([entry]);
     store.set([...stale.map((k) => [k, undefined] as const), ...entries.slice(-1), [lockstepEpochKey(itemId), record], lane]);

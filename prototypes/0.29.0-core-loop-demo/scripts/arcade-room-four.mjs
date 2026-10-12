@@ -296,7 +296,11 @@ function laneLatency(docs, from) {
 }
 const last = new Map();
 const epochs = new Set();
-let totals = { compared: 0, mismatched: 0 };
+// Every frame of every game two pages hashed, and those whose hashes
+// differed, kept from report to report: a page keeps only its latest
+// 4,000 hashes, so a long run's early ones age out of its window.
+const compared = new Set();
+const mismatched = new Set();
 async function report(label) {
   const now = Date.now();
   const rows = await Promise.all(players.map((p) => p.page.evaluate(() => ({
@@ -316,15 +320,12 @@ async function report(label) {
       at.set(k, e);
     }
   });
-  let compared = 0;
-  let mismatched = 0;
-  for (const e of at.values()) {
+  for (const [k, e] of at) {
     if (e.pages.size < 2) continue;
-    compared += 1;
-    if (e.hashes.size > 1) mismatched += 1;
+    compared.add(k);
+    if (e.hashes.size > 1) mismatched.add(k);
   }
-  totals = { compared, mismatched };
-  log(`── ${label} · hashes compared ${compared} · mismatched ${mismatched} · games in step so far ${epochs.size}`);
+  log(`── ${label} · hashes compared ${compared.size} · mismatched ${mismatched.size} · games in step so far ${epochs.size}`);
   log(`   ${laneLatency(rows.map((r) => r.doc), laneFrom)}`);
   laneFrom = now;
   rows.forEach((r, i) => {
@@ -360,7 +361,7 @@ log('sitting down to playing:', JSON.stringify(joined));
 pressing = false;
 await Promise.allSettled(bots);
 await browser.close();
-if (totals.compared === 0) failures.push('no hashes compared');
-if (totals.mismatched > 0) failures.push(`${totals.mismatched} hashes differed`);
+if (compared.size === 0) failures.push('no hashes compared');
+if (mismatched.size > 0) failures.push(`${mismatched.size} hashes differed`);
 log(failures.length ? `failed: ${failures.join('; ')}` : 'passed');
 process.exit(failures.length ? 1 : 0);
