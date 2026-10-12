@@ -2197,7 +2197,7 @@ it.
    with full sync for finite, seekable media (the archive embed, a live
    stream or a host without usable ranges play start-time only, §3.3), the
    countdown, the start screen with lane badges, the theatre panel.
-   **In #207 (open), serverless-only under the 2026‑10‑04 ruling (§3.3):** the
+   **In #207 (merged 2026‑10‑12), serverless-only under the 2026‑10‑04 ruling (§3.3):** the
    YouTube and archive tiles and PLAY FROM <host> are in the tree behind
    `VITE_SSF_CONVENIENCE_LANES=1`; a default build plays a file on the
    viewer's own origin or node. Spike
@@ -2213,10 +2213,10 @@ it.
    the #190 calls; media subscriptions by distance on the node.
 6. **Video lane:** screen share, arcade spectators, then P2 over video.
 7. **Arcade P1** can proceed in parallel with 1–2 (it needs only the proxy for
-   archive ROMs; local files work without it) — in #208 (open, stacked on
-   #207) under the same ruling: the CDN opt-in and links on other servers
-   behind the flag,
-   the station lane's frame under a content-security policy (§9).
+   archive ROMs; local files work without it) — in #208 (merged 2026‑10‑12,
+   after #207; the ⚙️ gear in #243 and the one-game rework in #248 follow it)
+   under the same ruling: the CDN opt-in and links on other servers behind
+   the flag, the station lane's frame under a content-security policy (§9).
 8. **Not now:** IPv8/Tribler (stage-A spike only on request), per-viewer swarm
    fetch by default, any built-in content search.
 
