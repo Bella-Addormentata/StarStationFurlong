@@ -1,7 +1,7 @@
 /**
  * 🕹 arcadeDoc — the cabinet's records against a real Y.Doc: the owner's
- * one game (built in, or their own), the P1 seat as a page-bound lease (insert coin, renew,
- * lapse, stand up, the owner's kick), the shape-checked reads that survive
+ * one game (built in, or their own), the seats as page-bound leases (insert coin, renew,
+ * lapse, stand up, the owner's kick; P1, and the double-wide cabinet's four), the shape-checked reads that survive
  * a peer's garbage, the parsing, and the attract card's view.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -14,6 +14,7 @@ import {
   playsKey, readCabinet, readPlays, readSeat, renewSeat, sanitizeGame, seatKey, seatLapsed, seatStatus,
   setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
   standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_COUNTER_MAX, ARCADE_DEFAULT_GAME, ARCADE_SEAT_LAPSE_MS,
+  isSeatIndex, mySeat, seatHolders, ARCADE_SEATS_MAX,
 } from './arcadeDoc';
 import type { ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES } from './arcadeLibrary';
@@ -300,6 +301,94 @@ describe('player one', () => {
     expect(maySit(CAB)).toBe(true);
     expect(insertCoin(CAB)).toEqual({ ok: true });
     expect(readSeat(CAB).holder).toBe(BOB);
+  });
+});
+
+describe('the double-wide cabinet\'s four seats', () => {
+  it('each seat is a lease of its own, in a key of its own; player one keeps the cabinet\'s key', () => {
+    expect(seatKey(CAB)).toBe(`seat:${CAB}`);
+    expect(seatKey(CAB, 0)).toBe(`seat:${CAB}`);
+    expect(seatKey(CAB, 3)).toBe(`seat:${CAB}:3`);
+    expect(insertCoin(CAB, 2)).toEqual({ ok: true });
+    expect(readSeat(CAB, 2)).toEqual({ holder: ALICE, name: 'Alice', page: 'tab-a', leaseAt: now, by: ALICE });
+    expect(readSeat(CAB).holder).toBe('');
+    expect(mySeat(CAB)).toBe(2);
+    expect(iAmP1(CAB)).toBe(false);
+    iAm(BOB, 'Bob');
+    setArcadePageId('tab-b');
+    expect(seatStatus(CAB, 2)).toBe('held');
+    expect(insertCoin(CAB, 2)).toEqual({ ok: false, error: 'Alice is at the controls.' });
+    expect(insertCoin(CAB, 0)).toEqual({ ok: true });
+    expect(mySeat(CAB)).toBe(0);
+    expect(seatHolders(CAB).map((r) => r?.name ?? null)).toEqual(['Bob', null, 'Alice', null]);
+    expect(seatHolders(CAB, 1).map((r) => r?.name ?? null)).toEqual(['Bob']);
+  });
+
+  it('a page holds one seat of a cabinet: taking another gives up the first, in the same write', () => {
+    insertCoin(CAB, 1);
+    let updates = 0;
+    doc.on('update', () => { updates++; });
+    expect(insertCoin(CAB, 3)).toEqual({ ok: true });
+    expect(updates).toBe(1);
+    expect(readSeat(CAB, 1).holder).toBe('');
+    expect(mySeat(CAB)).toBe(3);
+    // A seat at another cabinet is another matter.
+    insertCoin('arcade-cabinet-2', 1);
+    expect(mySeat(CAB)).toBe(3);
+    expect(mySeat('arcade-cabinet-2')).toBe(1);
+  });
+
+  it('no seat past the fourth, and none that is not a whole number', () => {
+    expect(insertCoin(CAB, ARCADE_SEATS_MAX)).toEqual({ ok: false, error: 'The cabinet has no such seat.' });
+    expect(insertCoin(CAB, -1).ok).toBe(false);
+    expect(insertCoin(CAB, 1.5).ok).toBe(false);
+    expect(maySit(CAB, ARCADE_SEATS_MAX)).toBe(false);
+    expect(isSeatIndex(3)).toBe(true);
+    expect(isSeatIndex(ARCADE_SEATS_MAX)).toBe(false);
+    expect(isSeatIndex('1')).toBe(false);
+    expect(mySeat(CAB)).toBeNull();
+  });
+
+  it('every seat lapses and renews on its own, and the deed holder may unseat any of them', () => {
+    insertCoin(CAB, 3);
+    iAm(BOB, 'Bob');
+    setArcadePageId('tab-b');
+    insertCoin(CAB, 1);
+    tick(ARCADE_SEAT_LAPSE_MS - 1);
+    renewSeat(CAB, 1);
+    tick(1);
+    expect(seatStatus(CAB, 3)).toBe('free'); // Alice's went quiet, as Bob's page saw it
+    expect(seatStatus(CAB, 1)).toBe('mine');
+    expect(standUp(CAB, 3)).toEqual({ ok: false, error: 'Alice is at the controls.' });
+    deed = true;
+    expect(standUp(CAB, 3)).toEqual({ ok: true });
+    expect(readSeat(CAB, 3).holder).toBe('');
+    deed = false;
+    expect(standUp(CAB, 1)).toEqual({ ok: true });
+    expect(mySeat(CAB)).toBeNull();
+  });
+
+  it('the screen names one player and counts more, with their seats', () => {
+    owner = true;
+    putOnCabinet(CAB, TETRIS);
+    insertCoin(CAB, 1);
+    expect(arcadeScreenView(CAB)).toMatchObject({ mode: 'inplay', line: 'P2 · Alice' });
+    iAm(BOB, 'Bob');
+    setArcadePageId('tab-b');
+    insertCoin(CAB, 3);
+    expect(arcadeScreenView(CAB)).toMatchObject({ mode: 'inplay', line: '2 PLAYERS · P2 P4' });
+    tick(ARCADE_SEAT_LAPSE_MS);
+    renewSeat(CAB, 3);
+    expect(arcadeScreenView(CAB)).toMatchObject({ mode: 'inplay', line: 'P4 · Bob' }); // Alice's lapsed
+  });
+
+  it('a play counts under any seat; a seat a peer wrote garbage into reads as free', () => {
+    insertCoin(CAB, 2);
+    countPlay(CAB);
+    expect(readPlays(CAB)).toBe(1);
+    doc.getMap('arcade').set(seatKey(CAB, 1), 'nonsense');
+    expect(readSeat(CAB, 1)).toEqual({ holder: '', name: '', page: '', leaseAt: 0, by: '' });
+    expect(seatStatus(CAB, 1)).toBe('free');
   });
 });
 

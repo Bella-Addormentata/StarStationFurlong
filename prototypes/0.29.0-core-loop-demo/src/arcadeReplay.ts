@@ -129,6 +129,11 @@ export interface ReplayHash {
   hash: string;
 }
 
+/** A state hash's text as the frame writes it (`hex:length`). */
+export function isReplayStateHash(v: unknown): v is string {
+  return typeof v === 'string' && HASH.test(v);
+}
+
 export function readFrameHash(data: unknown): ReplayHash | null {
   if (!data || typeof data !== 'object') return null;
   const d = data as { frame?: unknown; hash?: unknown };
