@@ -970,9 +970,16 @@ stream, two per link, so a frame declared and never sent holds a
 bounded buffer for fifteen seconds and then nothing — since today
 `ssf-p2p-node/src/main.rs` allocates the declared length of a reliable
 frame as it stands and reads it with `read_exact` and no deadline
-(around lines 1493–1501 and 2217–2225), a fix the node owes with or
-without media — and never the 4 KiB class, which would reset a room's
-sync before its kind was read. That ceiling rests on a
+(lines 1614–1619, the ysync reader, and 2488–2493), so an admitted peer
+can make a node allocate 4 GiB for one frame by declaring it, or hold a
+reader task for ever by never finishing one: that is a hole the node
+has with or without media, and the reader hardening — the ceiling, the
+buffer grown as bytes arrive, the deadline from acceptance, the
+unfinished-frame cap — is its own CRITICAL-PATH item in the TODO and a
+prerequisite of every lane that rides the reliable stream, never
+something that waits for the audio spike — and never the 4 KiB class,
+which would reset a room's sync before its kind was read. That ceiling
+rests on a
 DOCUMENT bound the sender enforces, never on a number borrowed from
 elsewhere: today nothing bounds a room document — the room cache merely
 skips persisting a snapshot past 1 000 000 bytes (`roomCache.ts`), while
@@ -1013,17 +1020,21 @@ both replicas, since a local-write check binds only honest pages:
 (`main.rs`, `apply_update`), so a peer could grow both without limit in
 frames under the ceiling. Each replica keeps a running measure of the
 document — the last exact measure (`encodeStateAsUpdate` after garbage
-collection, taken at load and again after every sixty-four applied
-updates or 256 KB of them) plus the lengths of the updates applied
-since, an upper bound on growth, since an update adds at most its own
-length — and refuses an inbound update that would carry the measure
+collection, taken at load, again after every sixty-four applied
+updates or 256 KB of them, and after any update that released pending
+structs) plus the lengths of the updates applied since AND the bytes
+the pending set retains, since an update adds at most its own length
+and a dependency's arrival integrates at most what was waiting on it —
+so the measure bounds the document whatever a small update releases,
+and the frame ceiling drawn from the bound holds — and refuses an
+inbound update that would carry the measure
 past the bound: dropped unapplied and charged to the link like a
 malformed frame (an update that depended on it waits in Yjs's pending
-set — which `encodeStateAsUpdate` does not encode, so the re-measure
-would drop it from the account: the pending set has a HARD BUDGET of
+set — which `encodeStateAsUpdate` does not encode, so a re-measure
+alone would drop it from the account: the pending set has a HARD BUDGET of
 its own in both replicas, 256 KB of retained pending update and
-delete-set bytes per document, never reset by the re-measure and never
-counted against the document, past which the whole pending set is
+delete-set bytes per document, never reset by the re-measure and
+counted in the running measure as if applied, past which the whole pending set is
 dropped and the link that filled it charged — an honest dependency is
 re-sent with the next sync step, a flood is not — and cleared with the
 room; the node's replica keeps the same account over its pending
