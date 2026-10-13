@@ -194,6 +194,15 @@ describe('the double-wide cabinet as built', () => {
     expect(boxes[1]!.min.x).toBeGreaterThan(0);
     // Butted together: only a hairline seam, behind one pane, no bezel between.
     expect(boxes[1]!.min.x - boxes[0]!.max.x).toBeLessThan(0.02);
+    // The left tube holds the picture's left half, the right tube its right.
+    const span = (tube: THREE.Mesh) => {
+      const shader = { uniforms: {} as Record<string, THREE.IUniform>, vertexShader: '', fragmentShader: '' };
+      (tube.material as THREE.Material).onBeforeCompile(shader as unknown as THREE.WebGLProgramParametersWithUniforms, {} as THREE.WebGLRenderer);
+      return shader.uniforms.uCrtSpan!.value as THREE.Vector2;
+    };
+    const [l, r] = [...screens].sort((a, b) => a.position.x - b.position.x);
+    expect(span(l!)).toEqual(new THREE.Vector2(0, 0.5));
+    expect(span(r!)).toEqual(new THREE.Vector2(0.5, 0.5));
     expect(panes).toHaveLength(1);
     const pane = new THREE.Box3().setFromObject(panes[0]!);
     expect(pane.min.x).toBeLessThan(boxes[0]!.min.x);

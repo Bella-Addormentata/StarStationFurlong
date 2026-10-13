@@ -74,6 +74,31 @@ describe('the CRT screen material', () => {
     expect(shader.uniforms.uCrtLines.value).toEqual(new THREE.Vector2(...ARCADE_CRT_LOOK.lines));
   });
 
+  it('splits one picture across a row of tubes: each its own half, the margin round the outside', () => {
+    const compiled = (index: number) => {
+      const shader = {
+        uniforms: {} as Record<string, THREE.IUniform>,
+        vertexShader: '',
+        fragmentShader: '#include <common>\nvoid main() {\n#include <map_fragment>\n}',
+      };
+      crtScreenMaterial(new THREE.Texture(), ARCADE_CRT_LOOK, { index, count: 2 })
+        .onBeforeCompile(shader as unknown as THREE.WebGLProgramParametersWithUniforms, {} as THREE.WebGLRenderer);
+      return shader;
+    };
+    const [left, right] = [compiled(0), compiled(1)];
+    expect(left.fragmentShader).toContain('uCrtSpan.x + vMapUv.x * uCrtSpan.y');
+    expect(left.uniforms.uCrtSpan.value).toEqual(new THREE.Vector2(0, 0.5));
+    expect(right.uniforms.uCrtSpan.value).toEqual(new THREE.Vector2(0.5, 0.5));
+    // The side margin is the pair's: half each tube's own.
+    const inset = 1 - (1 - ARCADE_CRT_LOOK.inset[0]) / 2;
+    expect(left.uniforms.uCrtInset.value.x).toBeCloseTo(inset, 9);
+    expect(left.uniforms.uCrtInset.value.y).toBe(ARCADE_CRT_LOOK.inset[1]);
+    // A lone tube shows the whole picture.
+    const lone = { uniforms: {} as Record<string, THREE.IUniform>, vertexShader: '', fragmentShader: '' };
+    crtScreenMaterial(new THREE.Texture()).onBeforeCompile(lone as unknown as THREE.WebGLProgramParametersWithUniforms, {} as THREE.WebGLRenderer);
+    expect(lone.uniforms.uCrtSpan.value).toEqual(new THREE.Vector2(0, 1));
+  });
+
   it('keeps the cartoon look: colour pushed, blacks lifted only a few percent', () => {
     expect(ARCADE_CRT_LOOK.saturation).toBeGreaterThan(1);
     for (const c of ARCADE_CRT_LOOK.rest) expect(c).toBeLessThan(0.01); // linear; ≲ 5% on screen
