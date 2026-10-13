@@ -179,7 +179,7 @@ Rollout gate to mainnet: C1–C3 green on testnet11 **and** the §7 privacy chec
 
 ## 9. Open [VERIFY] items (all owned by C0/B-7 unless noted)
 
-> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** B-7 gates browser chain code only, so none of these items gates the node lane. The SDK-capability items C0 filed under B-7 were closed by v0.30.0's testnet11 proof, except singleton drivers, the subscription surface and skew, which moved to S-0/S-1 and C2 (TODO #12).
+> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** B-7 gates browser chain code only, so B-7 itself no longer gates the node lane; the items below keep their gates under new names. The SDK-capability items C0 filed under B-7 were closed by v0.30.0's testnet11 proof (memo-attach, hint lookup, spend-to-self, dust/fee, faucet), except: singleton drivers and the subscription surface, whose confirmation moves to S-0/S-1 and §17.4 gate 1 of the sovereign plan, so C4's presence singleton and the mainnet gate still wait on it; and peak-height skew, which stays with C2 (TODO #12). Nothing here is cleared by the narrow reading alone.
 
 1. Exact chia-wallet-sdk APIs for memo attachment + hint queries (names, light-wallet vs full-node RPC coverage).
 2. Mempool subscription surface: what a *light* wallet can see pre-confirmation vs what requires a local full node.
