@@ -11,18 +11,22 @@ import type { TvScreenView } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
 
 let fills = 0;
+/** Every setTransform call, by the canvas it was made on. */
+const transforms = new Map<object, number[][]>();
 function fakeCanvas() {
-  const ctx = new Proxy({} as Record<PropertyKey, unknown>, {
+  const canvas = { width: 0, height: 0, getContext: () => ctx };
+  const ctx: Record<PropertyKey, unknown> = new Proxy({} as Record<PropertyKey, unknown>, {
     get: (target, key) => {
       if (key in target) return target[key];
       if (key === 'fillRect') return () => { fills++; };
+      if (key === 'setTransform') return (...m: number[]) => { transforms.set(canvas, [...(transforms.get(canvas) ?? []), m]); };
       if (key === 'measureText') return () => ({ width: 40 });
       if (key === 'createLinearGradient') return () => ({ addColorStop: () => undefined });
       return () => undefined;
     },
     set: (target, key, value) => { target[key] = value; return true; },
   });
-  return { width: 0, height: 0, getContext: () => ctx };
+  return canvas;
 }
 
 vi.stubGlobal('document', { createElement: fakeCanvas });
@@ -90,6 +94,18 @@ describe('the smart TV as built', () => {
       const centre = new THREE.Box3().setFromObject(plane!).getCenter(new THREE.Vector3());
       expect(centre.z).toBeGreaterThan(0);
       expect(FURNITURE_DEFS[kind].device?.kind).toBe('smartTv');
+    }
+  });
+
+  it('draws each screen on a whole-number multiple of the 384×216 layout, scaled back to layout units', () => {
+    // 3 m wall set → 3×, 1.8 m stand set → 2×. Without the transform the
+    // layout would land in the canvas's top-left corner only.
+    for (const [kind, scale] of [['smart-tv', 3], ['tv-stand', 2]] as const) {
+      const canvas = (screenPlane(build(kind))!.material as THREE.MeshBasicMaterial).map!.image as { width: number; height: number };
+      expect([canvas.width, canvas.height]).toEqual([384 * scale, 216 * scale]);
+      const calls = transforms.get(canvas) ?? [];
+      expect(calls.length).toBeGreaterThan(0); // the first draw, as built
+      for (const m of calls) expect(m).toEqual([scale, 0, 0, scale, 0, 0]);
     }
   });
 
