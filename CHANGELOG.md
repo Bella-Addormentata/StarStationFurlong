@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+## v0.40.0 — 2026-10-13
+
 - **📜 The plan documents agree with the decisions on record ([#259](https://github.com/Bella-Addormentata/StarStationFurlong/pull/259), [#231](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) S-0 step 0).** Six downstream plans and the sovereign plan carry dated one-line errata: B-7 gates browser chain code only (D2), so node-side chain work waits on S-0's chain-access seam and, for anything that moves money, on S-2, PR E and PR F; the coinset gateway client goes away outright with no dev/test fallback, once all nine gateway call sites run on the peer implementation; and the ChiaHub review records what has landed (#238, #245, #254), that presence is keyed by a per-node contact key, and that its §4 punch-intent protocol was superseded by the beat watcher and hold. Documentation only.
 - **📺 The wall smart TV is three squares wide, so it reads from across the room ([#257](https://github.com/Bella-Addormentata/StarStationFurlong/pull/257), [#186](https://github.com/Bella-Addormentata/StarStationFurlong/issues/186)).** The wall TV grows from 1.3 m to 3 m wide (about 136"), hung at the same height, so its screen can be read from a chair or sofa on the far side of a room instead of only from right in front of it. The TV on a stand grows from 1.3 m to 1.8 m, as wide as its two-square cabinet, so stands already placed don't move. Both screens draw at two or three times the old resolution so their text stays sharp at the new size, and walking up to either TV now frames the whole set. A wall TV now needs a 3.1 m stretch of wall clear of doorways, windows and other wall pieces.
 
