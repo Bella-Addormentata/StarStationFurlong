@@ -1,0 +1,23 @@
+{
+  "about": "The exact source of the EmulatorJS a release ships: what each part was built from, by full commit hash. scripts/pack-emulatorjs-source.mjs says how each was found and packs them; scripts/fetch-emulatorjs.mjs names them in NOTICE.txt. helpers: the source of EmulatorJS's prebuilt unpacking helpers (data/compression/) where it is known, which is libunrar's alone.",
+  "version": "4.2.1",
+  "engine": { "repo": "https://github.com/EmulatorJS/EmulatorJS", "commit": "13362ef0786990e93462f06505de772031cfc4c2" },
+  "frontend": { "repo": "https://github.com/EmulatorJS/RetroArch", "commit": "40b2c7c833d5331bfd614f1d47d524a16dcb1b8e" },
+  "build": { "repo": "https://github.com/EmulatorJS/build", "commit": "f1ad2e9e29682008e349446b14a70c45a30472a3" },
+  "cores": {
+    "fceumm": { "repo": "https://github.com/EmulatorJS/libretro-fceumm", "commit": "71013a15ec4e09ca7ea41bedc2623e42aecb3a0e" },
+    "snes9x": { "repo": "https://github.com/EmulatorJS/snes9x", "commit": "6ca2343e5f3b0acbea49ca958251e3a0af58a81d" },
+    "gambatte": { "repo": "https://github.com/EmulatorJS/gambatte-libretro", "commit": "c556291badb469016b53e0149ad3783fa135df76" },
+    "mgba": { "repo": "https://github.com/EmulatorJS/mgba", "commit": "80daaf0c6e5dd2f1beb724719b84bd45d778be97" },
+    "genesis_plus_gx": { "repo": "https://github.com/EmulatorJS/Genesis-Plus-GX", "commit": "764283e9d779232d41825e497de3d466b1200169" },
+    "mupen64plus_next": { "repo": "https://github.com/EmulatorJS/mupen64plus-libretro-nx", "commit": "501e60d28583b2a73118534e3b493908e5026954" },
+    "fbneo": { "repo": "https://github.com/EmulatorJS/FBNeo", "commit": "e66b0ca6c630f34f6a50f5a2ee890a5994da19a2" },
+    "mame2003_plus": { "repo": "https://github.com/EmulatorJS/mame2003-plus-libretro", "commit": "d18678998f8ee921635522bd64a094338556ca98" },
+    "pcsx_rearmed": { "repo": "https://github.com/EmulatorJS/pcsx_rearmed", "commit": "2b859b303daa012f1658bae7f1530967cff6d961" },
+    "stella2014": { "repo": "https://github.com/EmulatorJS/stella2014-libretro", "commit": "1f578c36382bb5a86a0fe245973fa557f369738b" },
+    "mednafen_pce": { "repo": "https://github.com/EmulatorJS/beetle-pce-libretro", "commit": "e1ac90d5a97ad328c51b8b01e68da8af5faa1579" }
+  },
+  "helpers": {
+    "libunrar": { "repo": "https://github.com/tnikolai2/libunrar-js", "commit": "294e362691041b70bef818628e7dfb012b2474aa" }
+  }
+}

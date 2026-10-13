@@ -92,23 +92,34 @@ export type ArcadeCore =
   | 'nes' | 'snes' | 'gb' | 'gbc' | 'gba' | 'segaMD' | 'segaMS' | 'n64'
   | 'arcade' | 'mame2003' | 'psx' | 'atari2600' | 'pce';
 
-/** The cores this cabinet offers (EmulatorJS core ids) and the file
- *  extensions that pick them. Arcade ROMs are zips named after their romset,
- *  so .zip defaults to 'arcade' (FBNeo); the owner may switch to MAME 2003. */
-export const ARCADE_CORES: ReadonlyArray<{ core: ArcadeCore; label: string; exts: readonly string[] }> = [
-  { core: 'nes', label: 'NES', exts: ['nes', 'fds', 'unf', 'unif'] },
-  { core: 'snes', label: 'SNES', exts: ['sfc', 'smc', 'fig', 'swc'] },
-  { core: 'gb', label: 'GAME BOY', exts: ['gb'] },
-  { core: 'gbc', label: 'GAME BOY COLOR', exts: ['gbc'] },
-  { core: 'gba', label: 'GAME BOY ADVANCE', exts: ['gba'] },
-  { core: 'segaMD', label: 'MEGA DRIVE', exts: ['md', 'gen', 'smd'] },
-  { core: 'segaMS', label: 'MASTER SYSTEM', exts: ['sms'] },
-  { core: 'n64', label: 'N64', exts: ['n64', 'z64', 'v64'] },
-  { core: 'arcade', label: 'ARCADE (FBNEO)', exts: ['zip'] },
-  { core: 'mame2003', label: 'ARCADE (MAME 2003)', exts: [] },
-  { core: 'psx', label: 'PLAYSTATION', exts: ['cue', 'chd', 'pbp', 'iso'] },
-  { core: 'atari2600', label: 'ATARI 2600', exts: ['a26'] },
-  { core: 'pce', label: 'PC ENGINE', exts: ['pce'] },
+/** The cores this cabinet offers and the file extensions that pick them.
+ *  Arcade ROMs are zips named after their romset, so .zip defaults to
+ *  'arcade' (FBNeo); the owner may switch to MAME 2003-Plus. `ejs` is what
+ *  EmulatorJS is told (EJS_core) and `libretro` the core that then runs.
+ *  EmulatorJS takes a system's name, and runs that system's first core, or
+ *  a core's name, and runs that core. Where the cabinet's own id would run
+ *  a core no station fetches, it is told another: 'gbc' names nothing
+ *  there, 'mame2003' is plain MAME 2003, and its first pick for the Master
+ *  System is smsplus (for the N64 on an iPhone, parallel_n64).
+ *  scripts/fetch-emulatorjs.mjs fetches exactly these cores
+ *  (arcadeDoc.test.ts holds the two together, and the names to EmulatorJS
+ *  4.2.1's own table). */
+export const ARCADE_CORES: ReadonlyArray<{
+  core: ArcadeCore; label: string; exts: readonly string[]; ejs: string; libretro: string;
+}> = [
+  { core: 'nes', label: 'NES', exts: ['nes', 'fds', 'unf', 'unif'], ejs: 'nes', libretro: 'fceumm' },
+  { core: 'snes', label: 'SNES', exts: ['sfc', 'smc', 'fig', 'swc'], ejs: 'snes', libretro: 'snes9x' },
+  { core: 'gb', label: 'GAME BOY', exts: ['gb'], ejs: 'gb', libretro: 'gambatte' },
+  { core: 'gbc', label: 'GAME BOY COLOR', exts: ['gbc'], ejs: 'gb', libretro: 'gambatte' },
+  { core: 'gba', label: 'GAME BOY ADVANCE', exts: ['gba'], ejs: 'gba', libretro: 'mgba' },
+  { core: 'segaMD', label: 'MEGA DRIVE', exts: ['md', 'gen', 'smd'], ejs: 'segaMD', libretro: 'genesis_plus_gx' },
+  { core: 'segaMS', label: 'MASTER SYSTEM', exts: ['sms'], ejs: 'genesis_plus_gx', libretro: 'genesis_plus_gx' },
+  { core: 'n64', label: 'N64', exts: ['n64', 'z64', 'v64'], ejs: 'mupen64plus_next', libretro: 'mupen64plus_next' },
+  { core: 'arcade', label: 'ARCADE (FBNEO)', exts: ['zip'], ejs: 'arcade', libretro: 'fbneo' },
+  { core: 'mame2003', label: 'ARCADE (MAME 2003-PLUS)', exts: [], ejs: 'mame', libretro: 'mame2003_plus' },
+  { core: 'psx', label: 'PLAYSTATION', exts: ['cue', 'chd', 'pbp', 'iso'], ejs: 'psx', libretro: 'pcsx_rearmed' },
+  { core: 'atari2600', label: 'ATARI 2600', exts: ['a26'], ejs: 'atari2600', libretro: 'stella2014' },
+  { core: 'pce', label: 'PC ENGINE', exts: ['pce'], ejs: 'pce', libretro: 'mednafen_pce' },
 ];
 const CORE_IDS: ReadonlySet<string> = new Set(ARCADE_CORES.map((c) => c.core));
 
@@ -118,6 +129,12 @@ export function isArcadeCore(v: unknown): v is ArcadeCore {
 
 export function coreLabel(core: ArcadeCore): string {
   return ARCADE_CORES.find((c) => c.core === core)?.label ?? core.toUpperCase();
+}
+
+/** What EmulatorJS is told for a core (EJS_core; ARCADE_CORES). Every
+ *  ArcadeCore has its row; anything else goes as itself. */
+export function ejsCore(core: ArcadeCore): string {
+  return ARCADE_CORES.find((c) => c.core === core)?.ejs ?? core;
 }
 
 /** The core a file name implies, or null (the owner then picks one). */

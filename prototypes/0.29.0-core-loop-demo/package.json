@@ -10,7 +10,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "fetch:emulatorjs": "node scripts/fetch-emulatorjs.mjs"
+    "fetch:emulatorjs": "node scripts/fetch-emulatorjs.mjs",
+    "pack:emulatorjs-source": "node scripts/pack-emulatorjs-source.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

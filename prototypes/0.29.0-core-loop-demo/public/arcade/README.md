@@ -43,6 +43,73 @@ settings: one of the games above on the built-in emulator (it plays on the
 cabinet's screen and the room watches), or the owner's own game in EmulatorJS.
 Players don't pick games; they walk up and press play.
 
+## EmulatorJS, for the owner's own game
+
+The owner's own game runs in [EmulatorJS](https://github.com/EmulatorJS/EmulatorJS)
+inside a sandboxed frame. It isn't in this repository:
+`npm run fetch:emulatorjs` puts it under `public/emulatorjs/`, the engine and
+its cores as npm packages at one pinned version, and release builds carry the
+engine and all eleven cores. Each core's archive holds its own license
+(`license.txt`); the texts are here too, and
+`emulatorjs/data/NOTICE.txt` names each package fetched, its sha512 and the
+commit it was built from.
+
+| Part | Systems | License | Text |
+|---|---|---|---|
+| EmulatorJS (the engine) | all | GPL-3.0 | [`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt); its own `LICENSE` lands beside the engine |
+| RetroArch (EmulatorJS's fork), linked into every core's file | all | GPL-3.0 | [`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt) |
+| fceumm | NES | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| gambatte | Game Boy, Game Boy Color | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| mupen64plus_next | Nintendo 64 | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| pcsx_rearmed | PlayStation | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| mednafen_pce | PC Engine | GPL-2.0 | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| mgba | Game Boy Advance | MPL-2.0 | [`licenses/MPL-2.0-mgba.txt`](licenses/MPL-2.0-mgba.txt) |
+| stella2014 | Atari 2600 | GPL-2.0 (its archive holds no license text; its source has Stella's, `stella/license.txt`) | [`licenses/GPL-2.0.txt`](licenses/GPL-2.0.txt) |
+| genesis_plus_gx | Mega Drive, Master System | Genesis Plus GX, **non-commercial** | [`licenses/Genesis-Plus-GX.txt`](licenses/Genesis-Plus-GX.txt) |
+| snes9x | SNES | Snes9x, **non-commercial** | [`licenses/Snes9x.txt`](licenses/Snes9x.txt) |
+| fbneo | Arcade (FBNeo) | FBNeo, **non-commercial**, and no asking for donations for a project that uses it | [`licenses/FBNeo.txt`](licenses/FBNeo.txt) |
+| mame2003_plus | Arcade (MAME 2003-Plus) | MAME 0.78, **non-commercial** | [`licenses/MAME-2003-Plus.txt`](licenses/MAME-2003-Plus.txt) |
+| libunrar (EmulatorJS's RAR unpacker), RARLAB's UnRAR 5.9.2 | RAR files | UnRAR's own (free to use and pass on; not for making a RAR archiver) | [`licenses/UnRAR.txt`](licenses/UnRAR.txt) |
+
+The four non-commercial cores are in release builds because Star Station
+Furlong is non-commercial (the owner, 2026-10-12). FBNeo's license also forbids
+asking for donations to support work on any project that uses it, and this one
+asks for none. A build that is sold, or that asks for donations, would have to
+leave those cores out, and the systems they run with them: take those systems
+out of `ARCADE_CORES` (`src/arcadeDoc.ts`) and the cores out of the fetch
+script's `DEFAULT_CORES` and `scripts/emulatorjs-sources.json`. The tests hold
+the three together, and a release then offers, fetches and packs the source of
+only the rest. `EJS_CORES` alone would leave the cores' files out but still
+offer their systems, which then wouldn't start.
+
+Each of those four is compiled into one file with EmulatorJS's GPL-3.0
+RetroArch, and the GPL allows no further restrictions on such a file, so
+strictly they can't be passed on under both licenses at once. EmulatorJS
+publishes them that way all the same, and the owner chose to ship them as it
+does (2026-10-12).
+
+EmulatorJS's own scripts travel with it unminified. The cores are compiled
+builds, too big to carry their source inside the app the way the built-in
+games do, so every release carries it beside the installers:
+`emulatorjs-4.2.1-source.tar.xz` (about 123 MB) holds the engine, the eleven
+cores, the RetroArch they are linked with and the scripts that built them, each
+at the commit it was built from. EmulatorJS doesn't say which commits those
+were; each core's own version string names its commit, and
+`scripts/emulatorjs-sources.json` pins them all by full hash
+(`scripts/pack-emulatorjs-source.mjs` says how each was found, and packs the
+archive). `NOTICE.txt` names each commit, and the archive's `README.txt` lists
+them with the submodules left out, which the cores' web builds don't compile.
+
+EmulatorJS's unpacking helpers under `data/compression/` open 7z, zip and RAR
+files, each in a worker of its own; every core arrives as a 7z archive. They are
+prebuilt files EmulatorJS has carried since 2021. The RAR one (`libunrar.js`,
+`libunrar.wasm`) is [libunrar-js](https://github.com/tnikolai2/libunrar-js),
+RARLAB's UnRAR 5.9.2 built for the web: its `libunrar.wasm` is EmulatorJS's byte
+for byte, so the archive carries its source too, UnRAR's included. Nothing says
+what `extract7z.js` and `extractzip.js` were built from, EmulatorJS included, so
+theirs is the one source the archive can't carry; it holds them as EmulatorJS
+ships them.
+
 ## Adding a game
 
 Only add a ROM whose author has released it under a license that allows
