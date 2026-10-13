@@ -54,6 +54,8 @@ import {
 } from "./games/coinPusher";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
 import { createArcadeScreenPainter } from "./arcadeScreen";
+// 📺 The cabinets' curved CRT tube and its screen shader (#194).
+import { crtFaceGeometry, crtScreenMaterial, crtTick } from "./arcadeCrt";
 // 🏒 #115: the table sculpt is sized by the SAME playfield constants the pure
 // engine simulates — one source of truth for rails, goals, puck and mallets.
 import {
@@ -1782,16 +1784,25 @@ const ARCADE_W = 0.7;
 const ARCADE_D = 0.75;
 /** The screen's centre height (the focus anchor). */
 const ARCADE_SCREEN_Y = 1.3;
+/** The single and double-wide cabinets' tube (#194): a 4:3 face, picture
+ *  margin included, tilted back toward the eye, in the upper body's face. */
+const ARCADE_TUBE_W = 0.6;
+const ARCADE_TUBE_H = 0.45;
+const ARCADE_TUBE_TILT = 0.14;
+/** The upper body's face, where the monitor bay's bezel sits. */
+const ARCADE_UPPER_FACE_Z = 0.14;
 /** Screen texture: 4:3, the cabinet's own ratio. */
 const ARCADE_TEX_W = 320;
 const ARCADE_TEX_H = 240;
 /** The double-wide cabinet: a 1.6 m body in a 2×1 footprint, two 4:3
- *  screens side by side showing one picture, four players' panels.
+ *  tubes butted together showing one picture, four players' panels.
  *  Its depth is the single cabinet's: the screens tilt back into the upper
  *  body's face, so a deeper body would bury their top edge. */
 const ARCADE_WIDE_W = 1.6;
 const ARCADE_WIDE_D = ARCADE_D;
 const ARCADE_WIDE_SEATS = 4;
+/** The double-wide's two tubes stand this far apart: one screen, a seam. */
+const ARCADE_WIDE_TUBE_GAP = 0.008;
 
 /** The furniture kinds that are arcade cabinets (main.ts and world.ts tick
  *  them, arcadeDoc keys them by item id alike). */
@@ -8498,11 +8509,20 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
   const marqueeY = 0.95 + spec.housingH + 0.10;
   const screenY = housingY - 0.02;
   const screenH = spec.screenW * (240 / 256);
+  // The tube: the picture plus its margin of unlit glass (arcadeCrt), tilted
+  // back by SCREEN_TILT so its face meets the focus eye, ~11 cm above the
+  // screen's centre.
+  const tubeW = spec.screenW + 0.04;
+  const tubeH = screenH + 0.04;
+  const SCREEN_TILT = 0.12;
+  const HOUSING_FACE_Z = 0.18 - 0.25;
+  const bayDepth = arcadeBayDepth(tubeH, SCREEN_TILT);
 
-  // ── Body: lower cabinet, monitor housing, marquee box, top cap ────────────
+  // ── Body: lower cabinet, monitor housing (stopping short of its face,
+  // where the monitor bay goes), marquee box, top cap ──────────────────────
   place(new THREE.BoxGeometry(W, 0.90, 0.62), m(BODY, 0.6, 0.35), 0, 0.45, 0.12);
   place(new THREE.BoxGeometry(W, 0.06, 0.02), m(TRIM, 0.9, 0.1), 0, 0.03, -0.195);
-  place(new THREE.BoxGeometry(W, spec.housingH, 0.50), m(BODY, 0.6, 0.35), 0, housingY, 0.18);
+  place(new THREE.BoxGeometry(W, spec.housingH, 0.50 - bayDepth), m(BODY, 0.6, 0.35), 0, housingY, 0.18 + bayDepth / 2);
   place(new THREE.BoxGeometry(W + 0.02, 0.20, 0.30), m(BODY, 0.6, 0.35), 0, marqueeY, 0.09);
   place(new THREE.BoxGeometry(W + 0.04, 0.03, 0.54), m(TRIM, 0.8, 0.2), 0, marqueeY + 0.115, 0.16);
   // Neon edge strips down both front corners (the cabinet's side art).
@@ -8536,18 +8556,6 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
     });
   });
 
-  // ── Monitor: black bezel and the tilted CRT screen ────────────────────────
-  // Tilted back by SCREEN_TILT about x so its face meets the focus eye, which
-  // sits ~11 cm above the screen's centre. Tilted back, its top edge leans
-  // toward the housing: the screen stands out far enough that the top edge
-  // stays just in front of the housing's face (z −0.07), or the housing
-  // would hide the top of the picture.
-  const SCREEN_TILT = 0.12;
-  const HOUSING_FACE_Z = 0.18 - 0.25;
-  const screenZ = HOUSING_FACE_Z - 0.005 - (screenH / 2) * Math.sin(SCREEN_TILT);
-  const bezel = place(new THREE.BoxGeometry(spec.screenW + 0.10, screenH + 0.11, 0.02), m(0x07090c, 0.9, 0.05), 0, screenY, screenZ + 0.013);
-  bezel.rotation.x = SCREEN_TILT;
-
   // The marquee's lit name and the screen both emulators paint
   // (arcadeMarquee, arcadeScreenSurface: the single cabinet's).
   const marquee = arcadeMarquee(W - 0.02, 0.155);
@@ -8557,11 +8565,13 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
     screenGlow.userData.targetIntensity = 0.22 * i;
     screenGlow.intensity = 0.22 * i;
   }, (view) => marquee.show(view.title));
-  const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
-  screenMat.userData.baseOpacity = 1;
-  // NES aspect 256:240; the plane faces −z (ry = π), then tilts back.
-  const screen = place(new THREE.PlaneGeometry(spec.screenW, screenH), screenMat, 0, screenY, screenZ, Math.PI);
-  screen.rotation.x = SCREEN_TILT;
+
+  // ── Monitor: the tube behind smoked glass in the housing's face ──────────
+  const [screen] = placeArcadeMonitorBay(ctx, {
+    y: housingY, z: HOUSING_FACE_Z, face: -1, w: W, h: spec.housingH,
+    tubes: [0], tubeY: screenY - housingY, tubeW, tubeH, tilt: SCREEN_TILT,
+    body: BODY, bezel: 0x07090c, material: crtScreenMaterial(surface.texture),
+  });
 
   // ── Marquee ───────────────────────────────────────────────────────────────
   const marqueeMat = new THREE.MeshBasicMaterial({ map: marquee.texture, transparent: true, opacity: 0, toneMapped: false });
@@ -10939,21 +10949,11 @@ function buildTvStand(ctx: BuildCtx) {
 }
 
 /**
- * 🕹 Arcade cabinet (#193): a 1×1 floor item, screen to local +z and the
- * player at the controls a pace back. The screen is a CanvasTexture that
- * draws arcadeDoc's view — the attract card (FURLONG ARCADE, the game, a
- * blinking INSERT COIN, the tally) or "P1 · <name>" while someone plays —
- * with scanlines over it (the #194 pass in its cheapest form). The game's
- * own picture runs in P1's stage (arcadeStage.ts); the spectator lane
- * brings it here later (plan §9). Stows the ArcadeScreenHandle on the
- * screen mesh (userData.arcadeScreen) for registerFurnitureHandles.
- */
-/**
  * The cabinet's screen card, on a canvas `w` × `h`: the attract card
  * (FURLONG ARCADE, the game, a blinking INSERT COIN, the tally and how many
- * play), "P1 · <name>" while someone plays, or the empty card — with
- * scanlines over it (the #194 pass in its cheapest form). Returns the
- * glow's intensity for the view. Every cabinet's screen paints it
+ * play), "P1 · <name>" while someone plays, or the empty card. The tube's
+ * material draws the CRT over it (arcadeCrt.ts, #194). Returns the glow's
+ * intensity for the view. Every cabinet's screen paints it
  * (arcadeScreenSurface).
  */
 function paintArcadeScreen(c2d: CanvasRenderingContext2D, w: number, h: number, view: ArcadeScreenView, players: string): number {
@@ -11005,9 +11005,6 @@ function paintArcadeScreen(c2d: CanvasRenderingContext2D, w: number, h: number, 
     text(`PLAYS ${view.plays}`, w - 16, h - 20, "bold 11px monospace", "#8fa3b8", "right");
     glow = 1.0;
   }
-  // Scanlines: the #194 CRT pass in its cheapest form.
-  c2d.fillStyle = "rgba(0,0,0,0.18)";
-  for (let y = 0; y < h; y += 3) c2d.fillRect(0, y, w, 1);
   return glow;
 }
 
@@ -11029,7 +11026,7 @@ function arcadeScreenSurface(players: string, setGlow: (i: number) => void, onVi
   const painter = createArcadeScreenPainter(canvas);
   const c2d = canvas.getContext("2d")!;
   const texture = new THREE.CanvasTexture(canvas);
-  // Linear filtering over the 2× pixel grid is the CRT's soft bleed.
+  // Linear filtering over the 2× pixel grid: the tube's bleed starts here.
   texture.minFilter = THREE.LinearFilter;
   texture.magFilter = THREE.LinearFilter;
   texture.generateMipmaps = false;
@@ -11154,6 +11151,133 @@ function placeArcadeSettingsGear({ itemId, m, place }: BuildCtx, x: number, z: n
   }
 }
 
+/**
+ * 📺 The monitor bay (#194): how a real cabinet shows its CRT. An opaque
+ * bezel covers the cabinet's face but for a window per tube (or one window
+ * for them all, `joined`); a pane of smoked glass fills each window, a
+ * little larger than the tubes; the tubes sit a few inches behind the glass,
+ * tilted back toward the player's eye, in a cavity lined black so nothing
+ * but the picture reads in there. Each tube is crtFaceGeometry (curved,
+ * rounded corners) wearing crtScreenMaterial (`material`: one for every
+ * tube, or one per tube).
+ *
+ * Built in the bay's own frame — the face's plane at z = 0, the room in
+ * front (+z) and the cavity behind (−z) — then turned to `face`. The caller
+ * trims its body box to stop `depth` behind the face, or it would fill the
+ * cavity. Returns the tube meshes in `tubes` order.
+ */
+interface ArcadeMonitorBay {
+  /** The face's centre height and its plane's z (the body's old front). */
+  y: number;
+  z: number;
+  /** Which way the face looks: local +z (1) or −z (−1). */
+  face: 1 | -1;
+  /** The face the bezel covers, around the windows. */
+  w: number;
+  h: number;
+  /** Each tube's centre x (in the bay's frame), and their shared height
+   *  offset from the face's centre. */
+  tubes: number[];
+  tubeY: number;
+  /** The tube face, picture margin included. */
+  tubeW: number;
+  tubeH: number;
+  /** One window and one pane for all the tubes, with no bezel between them. */
+  joined?: boolean;
+  /** Tilt back toward the eye (radians). */
+  tilt: number;
+  /** Body and bezel colours. */
+  body: number;
+  bezel: number;
+  material: THREE.MeshBasicMaterial | THREE.MeshBasicMaterial[];
+}
+/** The glass's margin around the tube, each side. */
+const BAY_GLASS_MARGIN = 0.015;
+/** Glass to the tube face's nearest point: a few inches. */
+const BAY_TUBE_SETBACK = 0.075;
+/** The tube face's bulge, as a share of its height. */
+const BAY_TUBE_BULGE = 0.04;
+/** The bezel plate's thickness, standing proud of the face. */
+const BAY_BEZEL_T = 0.012;
+/** How far behind the face the tube's centre sits: the setback, plus what
+ *  the tilt brings the bottom edge forward, plus the bulge. */
+function arcadeTubeZ(tubeH: number, tilt: number): number {
+  return -(BAY_TUBE_SETBACK + (tubeH / 2) * Math.sin(tilt) + BAY_TUBE_BULGE * tubeH);
+}
+/** How deep the cavity runs behind the face for a bay with tubes this tall:
+ *  past the tube's top edge, which the tilt takes back as far again. */
+function arcadeBayDepth(tubeH: number, tilt: number): number {
+  return -arcadeTubeZ(tubeH, tilt) + (tubeH / 2) * Math.sin(tilt) + 0.02;
+}
+function placeArcadeMonitorBay({ m, attach }: BuildCtx, spec: ArcadeMonitorBay): THREE.Mesh[] {
+  const bay = new THREE.Group();
+  bay.position.set(0, spec.y, spec.z);
+  if (spec.face === -1) bay.rotation.y = Math.PI;
+  attach(bay);
+  const add = (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number): THREE.Mesh => {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    bay.add(mesh);
+    return mesh;
+  };
+  const depth = arcadeBayDepth(spec.tubeH, spec.tilt);
+  const gh = spec.tubeH + 2 * BAY_GLASS_MARGIN;
+  const xs = [...spec.tubes].sort((a, b) => a - b);
+  // The windows, left to right: one around each tube, or one around them all.
+  const windows = (spec.joined ? [[xs[0]!, xs[xs.length - 1]!]] : xs.map((x) => [x, x]))
+    .map(([a, b]) => ({ x: (a! + b!) / 2, w: b! - a! + spec.tubeW + 2 * BAY_GLASS_MARGIN }));
+
+  // The bezel: the face cut into strips around the windows — a body-coloured
+  // block the cavity's depth (the cabinet's flank carries on along it) under
+  // a bezel-coloured plate.
+  const bodyMat = m(spec.body, 0.6, 0.15);
+  const bezelMat = m(spec.bezel, 0.55, 0.3);
+  const strip = (x0: number, x1: number, y0: number, y1: number) => {
+    if (x1 - x0 < 1e-6 || y1 - y0 < 1e-6) return;
+    const cx = (x0 + x1) / 2;
+    const cy = (y0 + y1) / 2;
+    add(new THREE.BoxGeometry(x1 - x0, y1 - y0, depth), bodyMat, cx, cy, -depth / 2);
+    add(new THREE.BoxGeometry(x1 - x0, y1 - y0, BAY_BEZEL_T), bezelMat, cx, cy, BAY_BEZEL_T / 2);
+  };
+  const top = spec.tubeY + gh / 2;
+  const bottom = spec.tubeY - gh / 2;
+  strip(-spec.w / 2, spec.w / 2, top, spec.h / 2);
+  strip(-spec.w / 2, spec.w / 2, -spec.h / 2, bottom);
+  let left = -spec.w / 2;
+  for (const win of windows) {
+    strip(left, win.x - win.w / 2, bottom, top);
+    left = win.x + win.w / 2;
+  }
+  strip(left, spec.w / 2, bottom, top);
+
+  // The cavity: lined matte black, so only the picture shows in there.
+  const liner = m(0x030405, 0.95, 0.0);
+  // Smoked glass: a grey tint, mostly clear; the tube is bright enough to
+  // punch through. Unlit, so the cabinet's own screen glow (a light just in
+  // front of it) does not bloom on the pane; never writes depth, so it
+  // cannot hide the tube.
+  const glass = new THREE.MeshBasicMaterial({ color: 0x0c0f12, transparent: true, opacity: 0, depthWrite: false });
+  glass.userData.baseOpacity = 0.35;
+  for (const { x, w: gw } of windows) {
+    add(new THREE.PlaneGeometry(gw, gh), liner, x, spec.tubeY, -depth + 0.001);
+    for (const sx of [-1, 1]) {
+      const side = add(new THREE.PlaneGeometry(depth, gh), liner, x + sx * (gw / 2 - 0.001), spec.tubeY, -depth / 2);
+      side.rotation.y = -sx * Math.PI / 2;
+      const lid = add(new THREE.PlaneGeometry(gw, depth), liner, x, spec.tubeY + sx * (gh / 2 - 0.001), -depth / 2);
+      lid.rotation.x = sx * Math.PI / 2;
+    }
+    // Glass in the bezel's slot, its edges hidden in the plate.
+    add(new THREE.PlaneGeometry(gw + 0.01, gh + 0.01), glass, x, spec.tubeY, BAY_BEZEL_T / 2);
+  }
+  return spec.tubes.map((x, i) => {
+    const material = Array.isArray(spec.material) ? spec.material[i]! : spec.material;
+    const tube = add(crtFaceGeometry(spec.tubeW, spec.tubeH, BAY_TUBE_BULGE * spec.tubeH), material, x, spec.tubeY, arcadeTubeZ(spec.tubeH, spec.tilt));
+    tube.rotation.x = -spec.tilt;
+    tube.onBeforeRender = () => crtTick(performance.now() / 1000);
+    return tube;
+  });
+}
+
 function buildArcadeCabinet(ctx: BuildCtx) {
   const { m, place, addLight } = ctx;
   const BODY = 0x141a2e; // deep navy cabinet
@@ -11162,11 +11286,13 @@ function buildArcadeCabinet(ctx: BuildCtx) {
   const SIDE = 0x00e5ff; // cyan side art
   const w = ARCADE_W;
   const d = ARCADE_D;
+  const bayDepth = arcadeBayDepth(ARCADE_TUBE_H, ARCADE_TUBE_TILT);
 
-  // Plinth, lower body, upper body, cap.
+  // Plinth, lower body, upper body (stopping short of its face, where the
+  // monitor bay goes), cap.
   place(new THREE.BoxGeometry(w, 0.12, d), m(0x0a0d16, 0.7, 0.2), 0, 0.06, 0);
   place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
-  place(new THREE.BoxGeometry(w, 0.7, d - 0.25), m(BODY, 0.6, 0.15), 0, 1.25, -0.11);
+  place(new THREE.BoxGeometry(w, 0.7, d - 0.25 - bayDepth), m(BODY, 0.6, 0.15), 0, 1.25, -0.11 - bayDepth / 2);
   place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
   // Side art: a lit cyan stripe on each flank.
   for (const sx of [-1, 1]) {
@@ -11193,12 +11319,9 @@ function buildArcadeCabinet(ctx: BuildCtx) {
   marqueeMat.userData.baseOpacity = 1;
   place(new THREE.PlaneGeometry(w - 0.06, 0.13), marqueeMat, 0, 1.74, 0.111);
   addLight(new THREE.PointLight(0xffc070, 0, 1.4), 0, 1.74, 0.35, 0.25);
-  // The screen: a bezel and the canvas plane, both tilted back a touch.
-  const bezel = place(new THREE.BoxGeometry(0.64, 0.5, 0.03), m(PANEL, 0.5, 0.3), 0, ARCADE_SCREEN_Y, 0.15);
-  bezel.rotation.x = -0.14;
-
-  // The screen both emulators paint (arcadeScreenSurface): a 4:3 plane,
-  // tilted back a touch, the NES picture stretched as a CRT shows it.
+  // The screen both emulators paint (arcadeScreenSurface), on a 4:3 tube
+  // behind smoked glass in the upper body's face (placeArcadeMonitorBay),
+  // the NES picture stretched as a CRT shows it.
   const glow = new THREE.PointLight(0x7fd8ff, 0, 3);
   addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
   const setGlow = (i: number) => {
@@ -11206,10 +11329,11 @@ function buildArcadeCabinet(ctx: BuildCtx) {
     glow.intensity = i;
   };
   const surface = arcadeScreenSurface("1 PLAYER", setGlow, (view) => marquee.show(view.title));
-  const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
-  screenMat.userData.baseOpacity = 1;
-  const screen = place(new THREE.PlaneGeometry(0.56, 0.42), screenMat, 0, ARCADE_SCREEN_Y + 0.002, 0.168);
-  screen.rotation.x = -0.14;
+  const [screen] = placeArcadeMonitorBay(ctx, {
+    y: 1.25, z: ARCADE_UPPER_FACE_Z, face: 1, w, h: 0.7,
+    tubes: [0], tubeY: ARCADE_SCREEN_Y - 1.25, tubeW: ARCADE_TUBE_W, tubeH: ARCADE_TUBE_H, tilt: ARCADE_TUBE_TILT,
+    body: BODY, bezel: PANEL, material: crtScreenMaterial(surface.texture),
+  });
   // Both handles on the screen mesh (registerFurnitureHandles files them):
   // the room record's card, and the built-in emulator's painter.
   screen.userData.arcadeScreen = surface.screen;
@@ -11218,13 +11342,13 @@ function buildArcadeCabinet(ctx: BuildCtx) {
 
 /**
  * 🕹🕹 The double-wide cabinet (#193): the deluxe four-player cabinet of the
- * early nineties — two monitors side by side, and a control deck long
+ * early nineties — two monitors butted together as one screen, and a control deck long
  * enough for four players shoulder to shoulder, each with a stick, two
  * buttons and a coin slot in their player colour. A 1.6 m body in a 2×1
  * footprint, screens to local +z, with the single cabinet's lit marquee
- * (across the top) and ⚙️ (low on the front). Both monitors show the one
- * screen both emulators share (arcadeScreenSurface): the built-in game, or
- * the card. Stows its handles on the left screen (userData.arcadeScreen,
+ * (across the top) and ⚙️ (low on the front). The monitors split the one
+ * screen both emulators share (arcadeScreenSurface), half each: the
+ * built-in game, or the card. Stows its handles on the left screen (userData.arcadeScreen,
  * userData.arcadeCabinet) for registerFurnitureHandles.
  */
 function buildWideArcadeCabinet(ctx: BuildCtx) {
@@ -11236,11 +11360,12 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
   const PLAYER = [0xff3b3b, 0x3b8bff, 0x2fe6a0, 0xffd23b];
   const w = ARCADE_WIDE_W;
   const d = ARCADE_WIDE_D;
+  const bayDepth = arcadeBayDepth(ARCADE_TUBE_H, ARCADE_TUBE_TILT);
 
-  // Plinth, lower body, upper body, cap.
+  // Plinth, lower body, upper body (short of its face: the monitor bay), cap.
   place(new THREE.BoxGeometry(w, 0.12, d), m(0x0a0d16, 0.7, 0.2), 0, 0.06, 0);
   place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
-  place(new THREE.BoxGeometry(w, 0.7, d - 0.25), m(BODY, 0.6, 0.15), 0, 1.25, -0.11);
+  place(new THREE.BoxGeometry(w, 0.7, d - 0.25 - bayDepth), m(BODY, 0.6, 0.15), 0, 1.25, -0.11 - bayDepth / 2);
   place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
   for (const sx of [-1, 1]) {
     place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 - 0.006), 1.0, 0.05);
@@ -11278,22 +11403,21 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
     glow.userData.targetIntensity = i;
     glow.intensity = i;
   };
-  // Two monitors, one picture: the same screen on both, so every station
-  // sees the game.
+  // Two monitors acting as one screen: butted together behind one pane with
+  // no bezel between them, the left half of the picture on the left tube and
+  // the right half on the right.
   const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title));
-  const screenMat = new THREE.MeshBasicMaterial({ map: surface.texture, transparent: true, opacity: 0, toneMapped: false });
-  screenMat.userData.baseOpacity = 1;
-  for (const sx of [-1, 1]) {
-    const bezel = place(new THREE.BoxGeometry(0.66, 0.5, 0.03), m(PANEL, 0.5, 0.3), sx * 0.34, ARCADE_SCREEN_Y, 0.15);
-    bezel.rotation.x = -0.14;
-    const plane = place(new THREE.PlaneGeometry(0.6, 0.45), screenMat, sx * 0.34, ARCADE_SCREEN_Y + 0.002, 0.168);
-    plane.rotation.x = -0.14;
-    if (sx < 0) {
-      // Both handles once, on the left screen (registerFurnitureHandles).
-      plane.userData.arcadeScreen = surface.screen;
-      plane.userData.arcadeCabinet = surface.visual;
-    }
-  }
+  const tubeX = ARCADE_TUBE_W / 2 + ARCADE_WIDE_TUBE_GAP / 2;
+  const [left] = placeArcadeMonitorBay(ctx, {
+    y: 1.25, z: ARCADE_UPPER_FACE_Z, face: 1, w, h: 0.7,
+    tubes: [-tubeX, tubeX], joined: true,
+    tubeY: ARCADE_SCREEN_Y - 1.25, tubeW: ARCADE_TUBE_W, tubeH: ARCADE_TUBE_H, tilt: ARCADE_TUBE_TILT,
+    body: BODY, bezel: PANEL,
+    material: [0, 1].map((index) => crtScreenMaterial(surface.texture, undefined, { index, count: 2 })),
+  });
+  // Both handles once, on the left screen (registerFurnitureHandles).
+  left!.userData.arcadeScreen = surface.screen;
+  left!.userData.arcadeCabinet = surface.visual;
 }
 
 /**
