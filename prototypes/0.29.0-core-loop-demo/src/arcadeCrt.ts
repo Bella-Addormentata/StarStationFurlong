@@ -108,6 +108,7 @@ const crtTime = { value: 0 };
 const CRT_UNIFORMS = /* glsl */ `
 uniform float uCrtTime;
 uniform vec2 uCrtInset;
+uniform vec2 uCrtSpan;
 uniform vec2 uCrtLines;
 uniform float uCrtWarp;
 uniform float uCrtScan;
@@ -119,8 +120,10 @@ uniform vec3 uCrtRest;
 /** Replaces MeshBasicMaterial's map lookup: the picture through the tube. */
 const CRT_MAP_FRAGMENT = /* glsl */ `
 #ifdef USE_MAP
-  // Picture space: ±0.5 across the picture, which sits inside the face.
-  vec2 crtC = (vMapUv - 0.5) / uCrtInset;
+  // Picture space: ±0.5 across the picture, which sits inside the face —
+  // or across a row of faces, this one holding the slice uCrtSpan names
+  // (its start and width, 0..1 across the row).
+  vec2 crtC = (vec2(uCrtSpan.x + vMapUv.x * uCrtSpan.y, vMapUv.y) - 0.5) / uCrtInset;
   crtC *= 1.0 + uCrtWarp * dot(crtC, crtC);
   vec2 crtUv = crtC + 0.5;
   // The lit picture's rounded corners, with a soft edge.
@@ -167,17 +170,27 @@ const CRT_MAP_FRAGMENT = /* glsl */ `
 /**
  * The tube's screen material: a MeshBasicMaterial on `texture` (so it fades
  * in with the room, opacity 0 → userData.baseOpacity, like every furniture
- * material) with the CRT pass patched into its map lookup. One material can
- * serve several faces (the double-wide cabinet's two). Call crtTick from the
- * face's onBeforeRender (placeCrtFace does) so the flicker runs.
+ * material) with the CRT pass patched into its map lookup. Call crtTick from
+ * the face's onBeforeRender (furniture.ts placeArcadeMonitorBay does) so the
+ * flicker runs.
+ *
+ * `span` lets a row of tubes act as one screen: tube `index` of `count`
+ * shows its slice of the picture, and the picture's margin of unlit glass
+ * runs round the row's outside edges only.
  */
-export function crtScreenMaterial(texture: THREE.Texture, look: CrtLook = ARCADE_CRT_LOOK): THREE.MeshBasicMaterial {
+export function crtScreenMaterial(
+  texture: THREE.Texture,
+  look: CrtLook = ARCADE_CRT_LOOK,
+  span: { index: number; count: number } = { index: 0, count: 1 },
+): THREE.MeshBasicMaterial {
   const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0, toneMapped: false });
   material.userData.baseOpacity = 1;
   material.userData.crtLook = look;
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uCrtTime = crtTime;
-    shader.uniforms.uCrtInset = { value: new THREE.Vector2(...look.inset) };
+    // Across a row the side margins are the row's, not each tube's.
+    shader.uniforms.uCrtInset = { value: new THREE.Vector2(1 - (1 - look.inset[0]) / span.count, look.inset[1]) };
+    shader.uniforms.uCrtSpan = { value: new THREE.Vector2(span.index / span.count, 1 / span.count) };
     shader.uniforms.uCrtLines = { value: new THREE.Vector2(...look.lines) };
     shader.uniforms.uCrtWarp = { value: look.warp };
     shader.uniforms.uCrtScan = { value: look.scan };

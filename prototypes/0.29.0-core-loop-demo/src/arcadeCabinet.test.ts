@@ -163,7 +163,7 @@ describe('the double-wide cabinet as built', () => {
     expect(meshes).toBeGreaterThan(30); // four stations of stick, ball, two buttons and a coin slot
   });
 
-  it('shows one picture on both screens, and files each handle once', () => {
+  it('shows one picture across both tubes, acting as one screen, and files each handle once', () => {
     const group = buildWide();
     const s = sinks();
     let left: THREE.Mesh | null = null;
@@ -177,13 +177,27 @@ describe('the double-wide cabinet as built', () => {
     expect(s.arcadeCabinetVisuals.has(WIDE)).toBe(true); // the built-in emulator paints it too
     expect(left).not.toBeNull();
     expect(left!.userData.arcadeScreen).toBe(s.arcadeScreens.get(WIDE));
-    // Two screens, one material: whatever the left one shows, so does the right.
+    // Two tubes on the one picture, each with its own half of it.
     const screens: THREE.Mesh[] = [];
-    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.material === left!.material) screens.push(obj); });
+    const panes: THREE.Mesh[] = [];
+    const map = (left!.material as THREE.MeshBasicMaterial).map;
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      const mat = obj.material as THREE.MeshBasicMaterial;
+      if (mat.map === map) screens.push(obj);
+      else if (mat.transparent && (mat.userData.baseOpacity as number) < 1) panes.push(obj);
+    });
     expect(screens).toHaveLength(2);
-    const xs = screens.map((p) => new THREE.Box3().setFromObject(p).getCenter(new THREE.Vector3()).x).sort((a, b) => a - b);
-    expect(xs[0]).toBeLessThan(0);
-    expect(xs[1]).toBeGreaterThan(0);
+    expect(screens[0]!.material).not.toBe(screens[1]!.material);
+    const boxes = screens.map((p) => new THREE.Box3().setFromObject(p)).sort((a, b) => a.min.x - b.min.x);
+    expect(boxes[0]!.max.x).toBeLessThan(0);
+    expect(boxes[1]!.min.x).toBeGreaterThan(0);
+    // Butted together: only a hairline seam, behind one pane, no bezel between.
+    expect(boxes[1]!.min.x - boxes[0]!.max.x).toBeLessThan(0.02);
+    expect(panes).toHaveLength(1);
+    const pane = new THREE.Box3().setFromObject(panes[0]!);
+    expect(pane.min.x).toBeLessThan(boxes[0]!.min.x);
+    expect(pane.max.x).toBeGreaterThan(boxes[1]!.max.x);
     expect((left!.material as THREE.MeshBasicMaterial).map).toBeInstanceOf(THREE.CanvasTexture);
     const def = FURNITURE_DEFS['arcade-cabinet-wide'];
     expect(def.device?.kind).toBe('arcade');

@@ -1795,12 +1795,14 @@ const ARCADE_UPPER_FACE_Z = 0.14;
 const ARCADE_TEX_W = 320;
 const ARCADE_TEX_H = 240;
 /** The double-wide cabinet: a 1.6 m body in a 2×1 footprint, two 4:3
- *  screens side by side showing one picture, four players' panels.
+ *  tubes butted together showing one picture, four players' panels.
  *  Its depth is the single cabinet's: the screens tilt back into the upper
  *  body's face, so a deeper body would bury their top edge. */
 const ARCADE_WIDE_W = 1.6;
 const ARCADE_WIDE_D = ARCADE_D;
 const ARCADE_WIDE_SEATS = 4;
+/** The double-wide's two tubes stand this far apart: one screen, a seam. */
+const ARCADE_WIDE_TUBE_GAP = 0.008;
 
 /** The furniture kinds that are arcade cabinets (main.ts and world.ts tick
  *  them, arcadeDoc keys them by item id alike). */
@@ -11151,12 +11153,13 @@ function placeArcadeSettingsGear({ itemId, m, place }: BuildCtx, x: number, z: n
 
 /**
  * 📺 The monitor bay (#194): how a real cabinet shows its CRT. An opaque
- * bezel covers the cabinet's face but for a window per tube; a pane of
- * smoked glass fills each window, a little larger than the tube; the tube
- * itself sits a few inches behind the glass, tilted back toward the player's
- * eye, in a cavity lined black so nothing but the picture reads in there.
- * The tube is crtFaceGeometry (curved, rounded corners) wearing
- * crtScreenMaterial (`material`, shared when a cabinet has two tubes).
+ * bezel covers the cabinet's face but for a window per tube (or one window
+ * for them all, `joined`); a pane of smoked glass fills each window, a
+ * little larger than the tubes; the tubes sit a few inches behind the glass,
+ * tilted back toward the player's eye, in a cavity lined black so nothing
+ * but the picture reads in there. Each tube is crtFaceGeometry (curved,
+ * rounded corners) wearing crtScreenMaterial (`material`: one for every
+ * tube, or one per tube).
  *
  * Built in the bay's own frame — the face's plane at z = 0, the room in
  * front (+z) and the cavity behind (−z) — then turned to `face`. The caller
@@ -11179,12 +11182,14 @@ interface ArcadeMonitorBay {
   /** The tube face, picture margin included. */
   tubeW: number;
   tubeH: number;
+  /** One window and one pane for all the tubes, with no bezel between them. */
+  joined?: boolean;
   /** Tilt back toward the eye (radians). */
   tilt: number;
   /** Body and bezel colours. */
   body: number;
   bezel: number;
-  material: THREE.MeshBasicMaterial;
+  material: THREE.MeshBasicMaterial | THREE.MeshBasicMaterial[];
 }
 /** The glass's margin around the tube, each side. */
 const BAY_GLASS_MARGIN = 0.015;
@@ -11216,9 +11221,11 @@ function placeArcadeMonitorBay({ m, attach }: BuildCtx, spec: ArcadeMonitorBay):
     return mesh;
   };
   const depth = arcadeBayDepth(spec.tubeH, spec.tilt);
-  const gw = spec.tubeW + 2 * BAY_GLASS_MARGIN;
   const gh = spec.tubeH + 2 * BAY_GLASS_MARGIN;
   const xs = [...spec.tubes].sort((a, b) => a - b);
+  // The windows, left to right: one around each tube, or one around them all.
+  const windows = (spec.joined ? [[xs[0]!, xs[xs.length - 1]!]] : xs.map((x) => [x, x]))
+    .map(([a, b]) => ({ x: (a! + b!) / 2, w: b! - a! + spec.tubeW + 2 * BAY_GLASS_MARGIN }));
 
   // The bezel: the face cut into strips around the windows — a body-coloured
   // block the cavity's depth (the cabinet's flank carries on along it) under
@@ -11237,9 +11244,9 @@ function placeArcadeMonitorBay({ m, attach }: BuildCtx, spec: ArcadeMonitorBay):
   strip(-spec.w / 2, spec.w / 2, top, spec.h / 2);
   strip(-spec.w / 2, spec.w / 2, -spec.h / 2, bottom);
   let left = -spec.w / 2;
-  for (const x of xs) {
-    strip(left, x - gw / 2, bottom, top);
-    left = x + gw / 2;
+  for (const win of windows) {
+    strip(left, win.x - win.w / 2, bottom, top);
+    left = win.x + win.w / 2;
   }
   strip(left, spec.w / 2, bottom, top);
 
@@ -11251,7 +11258,7 @@ function placeArcadeMonitorBay({ m, attach }: BuildCtx, spec: ArcadeMonitorBay):
   // cannot hide the tube.
   const glass = new THREE.MeshBasicMaterial({ color: 0x0c0f12, transparent: true, opacity: 0, depthWrite: false });
   glass.userData.baseOpacity = 0.35;
-  return spec.tubes.map((x) => {
+  for (const { x, w: gw } of windows) {
     add(new THREE.PlaneGeometry(gw, gh), liner, x, spec.tubeY, -depth + 0.001);
     for (const sx of [-1, 1]) {
       const side = add(new THREE.PlaneGeometry(depth, gh), liner, x + sx * (gw / 2 - 0.001), spec.tubeY, -depth / 2);
@@ -11261,7 +11268,10 @@ function placeArcadeMonitorBay({ m, attach }: BuildCtx, spec: ArcadeMonitorBay):
     }
     // Glass in the bezel's slot, its edges hidden in the plate.
     add(new THREE.PlaneGeometry(gw + 0.01, gh + 0.01), glass, x, spec.tubeY, BAY_BEZEL_T / 2);
-    const tube = add(crtFaceGeometry(spec.tubeW, spec.tubeH, BAY_TUBE_BULGE * spec.tubeH), spec.material, x, spec.tubeY, arcadeTubeZ(spec.tubeH, spec.tilt));
+  }
+  return spec.tubes.map((x, i) => {
+    const material = Array.isArray(spec.material) ? spec.material[i]! : spec.material;
+    const tube = add(crtFaceGeometry(spec.tubeW, spec.tubeH, BAY_TUBE_BULGE * spec.tubeH), material, x, spec.tubeY, arcadeTubeZ(spec.tubeH, spec.tilt));
     tube.rotation.x = -spec.tilt;
     tube.onBeforeRender = () => crtTick(performance.now() / 1000);
     return tube;
@@ -11332,13 +11342,13 @@ function buildArcadeCabinet(ctx: BuildCtx) {
 
 /**
  * 🕹🕹 The double-wide cabinet (#193): the deluxe four-player cabinet of the
- * early nineties — two monitors side by side, and a control deck long
+ * early nineties — two monitors butted together as one screen, and a control deck long
  * enough for four players shoulder to shoulder, each with a stick, two
  * buttons and a coin slot in their player colour. A 1.6 m body in a 2×1
  * footprint, screens to local +z, with the single cabinet's lit marquee
- * (across the top) and ⚙️ (low on the front). Both monitors show the one
- * screen both emulators share (arcadeScreenSurface): the built-in game, or
- * the card. Stows its handles on the left screen (userData.arcadeScreen,
+ * (across the top) and ⚙️ (low on the front). The monitors split the one
+ * screen both emulators share (arcadeScreenSurface), half each: the
+ * built-in game, or the card. Stows its handles on the left screen (userData.arcadeScreen,
  * userData.arcadeCabinet) for registerFurnitureHandles.
  */
 function buildWideArcadeCabinet(ctx: BuildCtx) {
@@ -11393,13 +11403,17 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
     glow.userData.targetIntensity = i;
     glow.intensity = i;
   };
-  // Two monitors, one picture: the same screen on both, so every station
-  // sees the game.
+  // Two monitors acting as one screen: butted together behind one pane with
+  // no bezel between them, the left half of the picture on the left tube and
+  // the right half on the right.
   const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title));
+  const tubeX = ARCADE_TUBE_W / 2 + ARCADE_WIDE_TUBE_GAP / 2;
   const [left] = placeArcadeMonitorBay(ctx, {
     y: 1.25, z: ARCADE_UPPER_FACE_Z, face: 1, w, h: 0.7,
-    tubes: [-0.38, 0.38], tubeY: ARCADE_SCREEN_Y - 1.25, tubeW: ARCADE_TUBE_W, tubeH: ARCADE_TUBE_H, tilt: ARCADE_TUBE_TILT,
-    body: BODY, bezel: PANEL, material: crtScreenMaterial(surface.texture),
+    tubes: [-tubeX, tubeX], joined: true,
+    tubeY: ARCADE_SCREEN_Y - 1.25, tubeW: ARCADE_TUBE_W, tubeH: ARCADE_TUBE_H, tilt: ARCADE_TUBE_TILT,
+    body: BODY, bezel: PANEL,
+    material: [0, 1].map((index) => crtScreenMaterial(surface.texture, undefined, { index, count: 2 })),
   });
   // Both handles once, on the left screen (registerFurnitureHandles).
   left!.userData.arcadeScreen = surface.screen;
