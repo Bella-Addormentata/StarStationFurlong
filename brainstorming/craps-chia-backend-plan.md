@@ -296,6 +296,8 @@ dependency, because reading a block hash is not a spend.
 
 ## 8. Dependencies & gates (unchanged from repo posture)
 
+> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** B-7 gates browser chain code only; the node-side chips and channels wait on the chain-access seam (S-0, [sovereign plan §6 / §14](sovereign-treasury-serverless-plan.md)) and its crate audit, not on B-7.
+
 - **B-7 wallet spike** — key custody, XCH balance, spend signing. Hard gate for any
   channel/settlement work (same gate as [[games-plan]] Phase 5 and
   [[REVIEW-20260710-ChiaHub]] C0). The fairness-only G5b does **not** need it.
@@ -396,6 +398,8 @@ the part of craps that fits testnet11 **now** — the fairness layer, not the ch
    the dice match `seed ‖ beacon`. Publicly auditable on testnet11.
 
 ### 12.3 Why this dodges the B-7 gate
+
+> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** the gate this section dodges no longer applies to the node side at all (B-7 gates browser chain code only); fairness records and chips alike wait on S-0's chain-access seam. The shipped primitive reused here has since moved to per-node records ([#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254)).
 
 It is the **same spend-to-self** the presence lane already runs — no CAT
 mint/melt, no channel coins, no arbitrary-recipient spends. The general wallet SDK

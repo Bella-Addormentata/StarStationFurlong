@@ -1,6 +1,9 @@
 # REVIEW — ChiaHub: The Chia Blockchain as a Sovereign Rendezvous & Punch-Coordination Lane
 
 **Date:** 2026-07-10 · **Author:** Claude Fable 5 (GitHub Copilot) · **Status:** Implementation plan — gated on spike B-7 (chia-wallet-sdk audit); nothing here is run-verified yet
+
+> **Status (2026-10-13):** the B-7 gate is lifted — [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) (2026-10-11) narrows B-7 to browser chain code, so nothing on the node side waits on it ([sovereign plan §14](../sovereign-treasury-serverless-plan.md)). Landed on the node since this review: chain reads on by default with the beat watcher and the symmetric hold (N8 + P1 + D3, [#238](https://github.com/Bella-Addormentata/StarStationFurlong/pull/238)), the faucet dish ([#245](https://github.com/Bella-Addormentata/StarStationFurlong/pull/245)) and P6a per-node presence ([#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254)) — presence is keyed by a per-node **contact key** (`hint = derive_key("ssf-chia-ck-hint-v1", ck ‖ era)`, `era = height / 32 256`, one 320-byte record per node per era), not by the room key as §3.2 describes; room-keyed v1 records stay one more release for the upgrade overlap. The plan of record is [#231](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) (phases P0–P10, decisions D1–D7); chain access moves from the HTTPS gateway to the peer protocol under S-0 ([sovereign plan §6 / §14](../sovereign-treasury-serverless-plan.md)), the gateway removed outright (Dorkmo, 2026-10-12).
+
 **Companions:** [STUDY-Architecture v007 §4](../AI%20BRAINSTORMING/STUDY-Architecture%20v007.md) (ladder position) · [Cabal discovery plan §4.5](REVIEW-20260707-Cabal-DNS-Free-Discovery-Plan.md) (the other lanes) · [v006 §10.2](../AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) (Chia as coarse clock — this doc weaponizes that idea)
 
 > **The question this answers:** can the Chia blockchain perform the beacon's tasks? Could it be done slowly over multiple blocks? With a standard or custom wallet?
@@ -63,6 +66,8 @@
 - The signature binds the record to the iroh node key — spam to the hint costs an attacker fees and costs readers one signature check.
 
 ### 3.2 Encryption & hint derivation — "the room is the key" extends to the chain
+
+> **Superseded for presence (P6a, [#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254), 2026-10-13):** presence records are keyed by a per-node contact key and filed by chain height (`era = height / 32 256`; hint and seal derived from the contact key), not by the room key and the wall-clock day below; the room key still seals the v1 records kept one release for the upgrade overlap. The derivations below are the v1 scheme.
 
 Everything on chain is ciphertext addressed by an unlinkable tag:
 
@@ -171,6 +176,8 @@ Rollout gate to mainnet: C1–C3 green on testnet11 **and** the §7 privacy chec
 ---
 
 ## 9. Open [VERIFY] items (all owned by C0/B-7 unless noted)
+
+> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** B-7 gates browser chain code only, so none of these items gates the node lane. The SDK-capability items C0 filed under B-7 were closed by v0.30.0's testnet11 proof, except singleton drivers, the subscription surface and skew, which moved to S-0/S-1 and C2 (TODO #12).
 
 1. Exact chia-wallet-sdk APIs for memo attachment + hint queries (names, light-wallet vs full-node RPC coverage).
 2. Mempool subscription surface: what a *light* wallet can see pre-confirmation vs what requires a local full node.

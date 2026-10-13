@@ -51,7 +51,7 @@ Three evidence classes, strongest first. Nothing may cite a weaker class as if i
 ### 2.3 Designed, not yet built **[PLAN]**
 - Hub relay + membership gossip + hub-coordinated punch (§5).
 - Beacon toggle (embedded `iroh-relay` server, IP-literal + `ca_tls_config` self-signed — APIs verified on docs, never exercised: B-6 re-run scope).
-- ChiaHub lane (full spec in the [review](../REVIEWS/REVIEW-20260710-ChiaHub.md); gated behind spike B-7).
+- ChiaHub lane (full spec in the [review](../REVIEWS/REVIEW-20260710-ChiaHub.md); gated behind spike B-7). *Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)): B-7 gates browser chain code only; the lane landed on the node without it ([#238](https://github.com/Bella-Addormentata/StarStationFurlong/pull/238), [#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254)).*
 - S2 room challenge; WT cert staged rotation (C1 second half); `wt_listener` retirement; installer bundling of the node (`externalBin`).
 
 ---
@@ -77,7 +77,7 @@ One table now tracks both ladders from the Cabal plan (§4.1.2, §4.5) plus the 
 | 3 | Manual port-forward (`SSF_IROH_PORT` + `SSF_EXTERNAL_ADDRS`) | **[FACT/compile]** shipped v0.17.0 | Nobody — this *is* the manual rung, now at least possible |
 | 4 | Hub relay + membership gossip + hub-coordinated punch | **[PLAN]** §5 | Every member except one per room |
 | 5 | Beacon toggle (embedded `iroh-relay`) | **[PLAN]** B-6 re-run scope | Everyone, every room, while one volunteer runs it |
-| 6 | **ChiaHub** — chain rendezvous + block-clock punch scheduling | **[PLAN]** [full spec](../REVIEWS/REVIEW-20260710-ChiaHub.md), gated on B-7 | The *discovery* half of everything above, permanently, with no live infrastructure at all |
+| 6 | **ChiaHub** — chain rendezvous + block-clock punch scheduling | **[PLAN]** [full spec](../REVIEWS/REVIEW-20260710-ChiaHub.md), gated on B-7 (erratum 2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231): B-7 gates browser chain code only; landed as [#238](https://github.com/Bella-Addormentata/StarStationFurlong/pull/238) and [#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254)) | The *discovery* half of everything above, permanently, with no live infrastructure at all |
 
 Lane 6 is the new insight of this study: the chain the game already requires (L3 settlement, coarse clock) can also be its **introduction service** — slow (~5 s mempool-watched, ~1 min confirmed), permanent, and unkillable. It can never carry traffic; symmetric-NAT-both-sides pairs still need rung 5.
 
@@ -121,7 +121,7 @@ Meta-lesson (also from the CORS false-negative episode): **landed-in-source ≠ 
 3. **B-6 re-run** *(gate b)*: stand up one player-run `iroh-relay` (IP-literal, self-signed via `ca_tls_config`), relay-assisted punch drill across two networks, kill-switch matrix (DNS off / relay off / DHT off), refuse-publics proof. **Accept:** the errata-#2 checklist, plus a recorded toolchain note.
 4. **Hub-coordinated punch** (§5 step 3). **Accept:** B↔C direct link forms through A's coordination with A's relay path then going quiet.
 5. **Beacon toggle**: `--beacon` profile embedding the `iroh-relay` server; greys out when unreachable (§4.1.3). **Accept:** a fresh third-party joins a room whose only reachable party is the beacon.
-6. **ChiaHub spike** (post-B-7; [phased C1–C4 in the review](../REVIEWS/REVIEW-20260710-ChiaHub.md)). **Accept:** C1 on testnet11 — publish + resolve a presence record via hinted memo round-trip.
+6. **ChiaHub spike** (post-B-7; [phased C1–C4 in the review](../REVIEWS/REVIEW-20260710-ChiaHub.md)). **Accept:** C1 on testnet11 — publish + resolve a presence record via hinted memo round-trip. *Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)): not post-B-7 — B-7 gates browser chain code only; C1's round trip was proven on testnet11 (v0.30.0) and the lane landed as [#238](https://github.com/Bella-Addormentata/StarStationFurlong/pull/238) (room records) and [#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254) (per-node records).*
 7. **Node-in-installer** (`externalBin` + per-platform CI node builds) → **retire `wt_listener.rs`**.
 8. **S2 key-gated room challenge** (plan §4.6) and **C1-cert staged rotation** (`reload_config`) — the two oldest open security findings.
 9. **v007 graduation pass**: when gates (b) and (c) close, strike this banner, promote [PLAN]→[FACT] sections with evidence citations, and hand v006+v007 to the reviewer panel together.
