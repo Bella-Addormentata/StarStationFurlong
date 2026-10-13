@@ -225,6 +225,44 @@ describe('the double-wide cabinet as built', () => {
   });
 });
 
+describe('the monitor bay (#194)', () => {
+  /** Every cabinet: the tube, the smoked glass in front of it, the bezel. */
+  const kinds = [['arcade-cabinet', 1], ['arcade-cabinet-2p', -1], ['arcade-cabinet-wide', 1]] as const;
+  for (const [kind, face] of kinds) {
+    it(`${kind}: a curved tube a few inches behind smoked glass, in a dark bay`, () => {
+      const group = buildItemGroup({ id: kind, kind, pos: { x: 0, z: 0 }, rot: 0, movable: true });
+      group.updateMatrixWorld(true);
+      let tube: THREE.Mesh | null = null;
+      const glass: THREE.Mesh[] = [];
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh)) return;
+        if (obj.userData.arcadeCabinet) tube = obj;
+        const mat = obj.material as THREE.Material;
+        if (mat.transparent && (mat.userData.baseOpacity as number | undefined) !== undefined
+          && (mat.userData.baseOpacity as number) < 1) glass.push(obj);
+      });
+      expect(tube).not.toBeNull();
+      const tubeMesh = tube as unknown as THREE.Mesh;
+      // A curved face, not a flat plane.
+      tubeMesh.geometry.computeBoundingBox();
+      expect(tubeMesh.geometry.boundingBox!.max.z).toBeGreaterThan(0.005);
+      // The glass: see-through but tinted, and never hiding what is behind it.
+      expect(glass.length).toBeGreaterThan(0);
+      const pane = glass[0]!.material as THREE.MeshBasicMaterial;
+      expect(pane.userData.baseOpacity).toBeGreaterThan(0.1);
+      expect(pane.userData.baseOpacity).toBeLessThan(0.6);
+      expect(pane.depthWrite).toBe(false);
+      // In front of the tube by a few inches, along the way the cabinet faces.
+      const tubeZ = new THREE.Box3().setFromObject(tubeMesh).getCenter(new THREE.Vector3()).z;
+      for (const g of glass) {
+        const glassZ = new THREE.Box3().setFromObject(g).getCenter(new THREE.Vector3()).z;
+        expect((glassZ - tubeZ) * face).toBeGreaterThan(0.05);
+        expect((glassZ - tubeZ) * face).toBeLessThan(0.12);
+      }
+    });
+  }
+});
+
 /** The footprint's half depth: the stand point must be outside the cabinet. */
 function d(def: { footprint: { d: number } | null }): number {
   return (def.footprint?.d ?? 0) / 2;
