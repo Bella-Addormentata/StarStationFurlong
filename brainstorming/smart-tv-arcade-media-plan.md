@@ -9,8 +9,8 @@ Issues: [#186 smart TV](https://github.com/Bella-Addormentata/StarStationFurlong
 Status: design of record for the TV, the cabinet and everything that moves media
 between players, consolidated from the research notes on #186 and #193
 (2026‑10‑03). Grounded in `prototypes/0.29.0-core-loop-demo` as of main on
-2026‑10‑13 (`330c692`) — v0.39.0 in `version.ts`, with the Unreleased work
-of #207, #208, #242, #248, #250, #255 and #256 merged — and
+2026‑10‑13 (`a2b6f68`, the v0.40.0 release) — v0.40.0 in `version.ts`,
+with #207, #208, #242, #248, #250, #255, #256 and #257 shipped in it — and
 in the sovereignty rules of [STUDY-Architecture v002 §3](AI%20BRAINSTORMING/STUDY-Architecture%20v002.md),
 the [Cabal DNS-free plan §3–§4](REVIEWS/REVIEW-20260707-Cabal-DNS-Free-Discovery-Plan.md)
 and [v007](AI%20BRAINSTORMING/STUDY-Architecture%20v007.md). Every option that
@@ -67,9 +67,11 @@ idea of decentralisation:
   operator wrote that name down. Which is not yet true of the CHAIN lane
   either, and compiling out Mainline and the echo does not make it so:
   every chain read and push goes to one third-party gateway by default —
-  `CoinsetClient::testnet11()`, `testnet11.api.coinset.org`, at six call
-  sites (the presence reader, the beat watcher, the publisher, the faucet
-  dish and the craps fairness records; the TODO's critical-path item
+  `CoinsetClient::testnet11()`, `testnet11.api.coinset.org`, at every call
+  site (the presence reader, the beat watcher, the publisher, the faucet
+  dish and the craps fairness records — six in the TODO item's inventory
+  as of `5414b662`, nine by the count in #259's errata; the TODO's
+  critical-path item
   *Remove the coinset.org dependency from the chain lane*, Dorkmo
   2026‑10‑12) — and since #238 chain reads are on in every node with no
   wallet, seed or switch (`SSF_CHIA_WATCH=0` turns the watcher off), so a
