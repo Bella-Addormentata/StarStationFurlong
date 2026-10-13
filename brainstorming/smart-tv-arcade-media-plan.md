@@ -64,7 +64,22 @@ idea of decentralisation:
   configuration keeps the owner's R1 default while naming the echo hosts
   it uses in `SSF_IP_ECHO` — the operator's own echo on the station, or
   none — so that a node never resolves a third party's name unless its
-  operator wrote that name down.
+  operator wrote that name down. Which is not yet true of the CHAIN lane
+  either, and compiling out Mainline and the echo does not make it so:
+  every chain read and push goes to one third-party gateway by default —
+  `CoinsetClient::testnet11()`, `testnet11.api.coinset.org`, at six call
+  sites (the presence reader, the beat watcher, the publisher, the faucet
+  dish and the craps fairness records; the TODO's critical-path item
+  *Remove the coinset.org dependency from the chain lane*, Dorkmo
+  2026‑10‑12) — and since #238 chain reads are on in every node with no
+  wallet, seed or switch (`SSF_CHIA_WATCH=0` turns the watcher off), so a
+  strict build still resolves that gateway's name on every block beat
+  until that item lands. The strict-build definition therefore includes
+  it: in a strict build the chain lane talks to the operator's own Chia
+  peers or to none (that item's seam — `chia-sdk-client` and
+  `SSF_CHIA_PEERS`), and with none configured the lane is OFF, never
+  defaulted to the gateway; until the removal lands, the gateway is the
+  one remaining default third-party name, stated here as such.
 - **P‑3**: never default public relays. **v007 F2/F5**: status must reach the
   player, and every feature says which rung it is using.
 - **The ChiaHub floor** (rung 6): the chain as the discovery that keeps working
@@ -1049,7 +1064,20 @@ set, media key, epochs and counters — `source = BLAKE3("ssf-media-src:v1\n"
 this protocol's and no other's, and the two variable-length strings
 length-framed, so Rust and TypeScript hash the same bytes and no pair of
 room and kind can collide with another (both are newline-free tokens, but
-a length is cheaper to get right than a rule) — declared in the sender's
+a length is cheaper to get right than a rule) — and the strings are
+BOUNDED where they enter, since a 16-bit length frames nothing longer than
+65 535 bytes and today `decodeBootstrapSeed` (`src/main.ts`) takes any
+non-empty `roomId` while the node's envelope reader (`SsfEnvelope`,
+`room: String`) checks no length either: a room id is at most 64 bytes of
+UTF-8 (the station mints `module-` and six hex digits, 13 bytes), a kind
+at most 16, a cabinet id at most 64, a member's node id 64, a relay URL
+128 with at most four per hint, a direct address 48 with at most eight per
+hint — one table of maxima in `signBytes.ts` and `main.rs` with a test
+each, enforced at bootstrap ingress (a pass or `?seed=` link naming a
+longer room is INVALID PASS), in the page's envelope builder, and in both
+readers, where a field past its bound is a protocol violation whatever
+the frame's length, dropped and charged to the link; §9's P2 session info
+frames its room and cabinet id under the same bounds — declared in the sender's
 signed source announcement on the control plane, which binds the id to
 the sender key, the room, the kind and the nonce; a frame's signature is
 verified against the key that announcement names, resolved once per
@@ -1171,8 +1199,13 @@ document from the current state with its history dropped, to write again
 persistence and sync agree; a room found past the bound at load (one from
 before the rule) is synced read-only until compacted; and `YjsSync`
 refuses to emit a frame past the bound, so the reliable frame ceiling is
-that bound base64-expanded plus the envelope's fields — 1 400 000 bytes —
-and a frame past it is a protocol violation, never a large room. A
+that bound base64-expanded plus the envelope's fields at their maxima —
+1 333 336 bytes of base64 for the bound; `room` 64, `kind` 16, `author`
+44 and `sig` 88 in base64, `v` and `seq`; the hint fields at
+`ROOM_HINT_CAP` = 32 members of at most 64 + 4 × 128 + 8 × 48 bytes each
+with their JSON, under 40 000 in all (the identifier bounds above, which
+is what makes the sum a number) — so 1 400 000 bytes holds with room to
+spare, and a frame past it is a protocol violation, never a large room. A
 chunked baseline (SyncStep2 in bounded pieces) was the alternative, not
 taken: it bounds the frame and never the document, and the document is
 what every reader must hold. **Enforced only once the cabinet's file has
