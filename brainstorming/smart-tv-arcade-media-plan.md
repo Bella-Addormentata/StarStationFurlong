@@ -639,7 +639,10 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   the actual video in a **theatre panel** (DOM) that anyone in the room opens
   from the TV, the phone, or a HUD chip while seated. A `<video>` in a DOM
   panel needs no CORS, so archive.org files and direct URLs get full sync
-  without any node change. The CSS3D in-world plane is spike S1 (§11).
+  without any node change — for finite, seekable media, §3.3's rule: a
+  live stream or a host without usable ranges plays start-only, the
+  element's `seekable` deciding, and the controller never seeks what
+  cannot be sought. The CSS3D in-world plane is spike S1 (§11).
 
 ### 3.5 Tauri checks before the in-world iframe
 
@@ -672,11 +675,17 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   from 2.44; WebRTC reportedly absent in many builds. Treat Linux as "embeds
   and mp4" until verified.
 
-### 3.6 Content classes (unchanged from the first note on #186)
+### 3.6 Content classes (from the first note on #186; class 3 restated to match §4)
 
 1. Public-domain and Creative Commons films: any room.
 2. Free embeddable web video via the platform's own player: any room.
-3. The host's own DRM-free files: small private rooms, stream rather than copy.
+3. The host's own DRM-free files: small private rooms, carried by the blob
+   lane as a TRANSFER and not a stream (§4): each viewer's node fetches the
+   file, verifies it by hash and holds it in a cache bounded by quota,
+   playback starting before the transfer ends, the copy deleted on leave
+   and never kept past the room's cache quota — never a copy the viewer
+   keeps as a file of their own; the live WebCodecs lane (§4, step 2) is
+   the stream path, for what is not a file: screen share, karaoke, calls.
 4. Never: paid platform content (DRM captures black), re-broadcast captures of
    YouTube, ripped discs, Tribler/torrent search as a built-in catalogue.
 
