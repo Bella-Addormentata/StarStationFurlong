@@ -26,10 +26,10 @@
  * planet) is the natural next step once ship travel needs it.
  */
 
-import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
+import { MAX_GOSSIP_SKEW_MS, atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
-import { MIN_ALTITUDE_KM, maxAltitudeKm } from './orbits';
+import { MIN_ALTITUDE_KM, isUsableOrbit, maxAltitudeKm, orbitForSlot } from './orbits';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { DoorRecord } from './doorsDoc';
 
@@ -226,6 +226,67 @@ function capBerths(sorted: readonly StationBerthRecord[]): StationBerthRecord[] 
   });
   for (let i = 0; i < sorted.length && kept < MAX_BERTHS; i++) if (!keep[i]) { keep[i] = true; kept++; }
   return sorted.filter((_, i) => keep[i]);
+}
+
+/** ⚓🚦 Room tombstones (rooms that list no gate any more) a summary carries
+ *  beside its listed rooms' stamps: their own budget, as large as the list's,
+ *  so every room a full list held can carry its removal. */
+export const MAX_ROOM_TOMBSTONES = MAX_BERTHS;
+/** The most room stamps one summary carries. */
+export const MAX_ROOM_STAMPS = MAX_BERTHS + MAX_ROOM_TOMBSTONES;
+
+const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+/** A peer's stamp: finite, not negative, and no further ahead of `now` than
+ *  a gossip stamp may sit (stationAtlas). */
+const isPeerStamp = (v: unknown, now: number): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= now + MAX_GOSSIP_SKEW_MS;
+const isSummaryId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LENGTH;
+
+/** What isSummaryHead vouches for in a planet summary. */
+export type SummaryHead = Record<string, unknown> & {
+  welcomeRoomId: string; name: string; planetId: string; orbitSlot: number; updatedAt: number;
+};
+
+/** ⚓🚦 Is `v` a planet summary (planetSummary's StationSummary) as every
+ *  reader takes one across the peer trust boundary (cleanStationSummary, and
+ *  a far room's dock lock, stationMove.ts): a plain object naming its
+ *  station's welcome room, name, planet and slot, and any owner, with a good
+ *  stamp? A summary without all of them is junk entire; each of its other
+ *  fields is taken or left out on its own (summaryGates its gate list). */
+export function isSummaryHead(v: unknown, now: number = Date.now()): v is SummaryHead {
+  return isPlainRecord(v) && isSummaryId(v.welcomeRoomId)
+    && typeof v.name === 'string' && v.name.length > 0 && v.name.length <= MAX_NAME_LENGTH
+    && isSummaryId(v.planetId)
+    && Number.isInteger(v.orbitSlot) && (v.orbitSlot as number) >= 0 && (v.orbitSlot as number) < MAX_ORBIT_SLOTS
+    && (v.ownerId === undefined || isSummaryId(v.ownerId))
+    && isPeerStamp(v.updatedAt, now);
+}
+
+/** ⚓🚦 A planet summary's gate list (StationSummary.berths) as every reader
+ *  takes it (isSummaryHead's readers): the list cleaned, with its
+ *  `berthsAt` (a good stamp), or null when there is none to keep. An empty
+ *  list is news too (the station's last gate was removed); a list whose
+ *  every entry was malformed is not. Its room stamps (`berthRoomsAt`) are
+ *  counted only so far: a map larger than any list carries is junk, and so
+ *  is the gate list it came with, since without its stamps each room would
+ *  pass for as fresh as the whole list. */
+export function summaryGates(
+  v: Record<string, unknown>,
+  now: number = Date.now(),
+): { berths: StationBerthRecord[]; berthsAt: number } | null {
+  if (!Array.isArray(v.berths)) return null;
+  const berths = cleanBerths(v.berths);
+  if (berths.length === 0 && v.berths.length > 0) return null;
+  const at = v.berthsAt;
+  if (!isPeerStamp(at, now)) return null;
+  const rooms = v.berthRoomsAt;
+  if (rooms !== undefined) {
+    if (!isPlainRecord(rooms)) return null;
+    let count = 0;
+    for (const _k in rooms) if (++count > MAX_ROOM_STAMPS) return null;
+  }
+  return { berths, berthsAt: at };
 }
 
 /**
@@ -1273,8 +1334,9 @@ export function setRoomStationResolver(resolver: ((roomId: string) => string | n
 }
 
 /** The station a room belongs to: the one the room-station resolver names,
- *  else the one whose welcome room shares the room's atlas component, or null
- *  when neither knows the room. */
+ *  else the one whose welcome room shares the room's atlas component, else
+ *  the one station listing a gate in it (gateStationForRoom), or null when
+ *  none of them knows the room. */
 export function stationForRoom(
   roomId: string,
   atlas: Record<string, AtlasEntry> = readAtlas(),
@@ -1294,7 +1356,24 @@ export function stationForRoom(
     const placed = id ? stations.find((s) => s.id === id) : undefined;
     if (placed) return placed;
   }
-  return atlasStationForRoom(roomId, atlas, stations);
+  return atlasStationForRoom(roomId, atlas, stations) ?? gateStationForRoom(roomId, stations);
+}
+
+/** ⚓🚦 A room the atlas cannot place (a station's module this game has not
+ *  walked through), by the gates the stations list (StationRecord.berths:
+ *  their atlas's own, and those learned from records and summaries in rooms
+ *  this atlas knows nothing of): the one station listing a gate there. None
+ *  when no station does, or when more than one does (a stale list, and which
+ *  is right is not known here). */
+function gateStationForRoom(roomId: string, stations: StationRecord[]): StationRecord | null {
+  if (!roomId) return null;
+  let found: StationRecord | null = null;
+  for (const st of stations) {
+    if (!st.berths?.some((b) => b.roomId === roomId)) continue;
+    if (found && found.id !== st.id) return null;
+    found = st;
+  }
+  return found;
 }
 
 /** What the atlas alone says: the station whose welcome room shares the
@@ -1317,10 +1396,11 @@ function atlasStationForRoom(
  * main.ts installs as the room-station resolver for the room the player is in.
  * Only a lone module moves: no structural (non-berth) pairing, live or in the
  * atlas, and no station of its own beyond the one derived from it. It is at
- * the station on the far side of one of its docks, when that side is a real
- * station — a saved or built-in record, or structure of more than one room —
- * so two lone modules docked together stay where they are, and a station
- * never moves to the ship visiting it. null: the atlas places the room.
+ * the station on the far side of one of its docks (by the atlas, or by the
+ * gates a station lists in a room the atlas has not mapped), when that side
+ * is a real station — a saved or built-in record, or structure of more than
+ * one room — so two lone modules docked together stay where they are, and a
+ * station never moves to the ship visiting it. null: the atlas places the room.
  */
 export function dockedStationFor(
   roomId: string,
@@ -1345,7 +1425,7 @@ export function dockedStationFor(
     partners.push(partner);
   }
   for (const partner of partners) {
-    const there = atlasStationForRoom(partner, atlas, stations);
+    const there = atlasStationForRoom(partner, atlas, stations) ?? gateStationForRoom(partner, stations);
     if (!there || there.id === own?.id) continue;
     if (!there.derived || atlasComponent(atlas, there.welcomeRoomId).size > 1) return there.id;
   }
@@ -1404,31 +1484,73 @@ export function isStationRoom(
 
 /** The planet a room's station orbits — the default planet when unknown. */
 /** Where a ship that missed a departed station waits: open orbit at the
- *  planet and slot that station left (`adrift:<planetId>:<slot>`). A place,
- *  never a station, so it follows no station anywhere; hops leave from it to
- *  the stations around that planet like from any orbit. */
+ *  planet and slot that station left (`adrift:<planetId>:<slot>`), and 🎚️ at
+ *  the altitude it flew there when that was its own, not the slot's
+ *  (`adrift:<planetId>:<slot>@<radiusKm>,<phase0>`, the station's base
+ *  orbit, untrimmed). A place, never a station, so it follows no station
+ *  anywhere; hops leave from it to the stations around that planet like
+ *  from any orbit. */
 export const ADRIFT_PREFIX = 'adrift:';
 
-export function adriftAt(planetId: string, orbitSlot: number): string {
-  return `${ADRIFT_PREFIX}${planetId}:${orbitSlot}`;
+/** An open-orbit place: a planet's slot, on the station's own orbit there
+ *  when it flew one. */
+export interface AdriftPlace {
+  planetId: string;
+  orbitSlot: number;
+  orbit?: StationOrbit;
 }
 
-/** The planet and slot an adrift location names, or null for anything else. */
-export function adriftPlace(id: string): { planetId: string; orbitSlot: number } | null {
+export function adriftAt(planetId: string, orbitSlot: number, orbit?: StationOrbit | null): string {
+  const slotPart = `${ADRIFT_PREFIX}${planetId}:${orbitSlot}`;
+  // The slot's own orbit is the slot: one place, one id.
+  if (!orbit || !isUsableOrbit(planetById(planetId), orbit) || isSlotOrbit(planetId, orbitSlot, orbit)) return slotPart;
+  const id = `${slotPart}@${orbit.radiusKm},${orbit.phase0}`;
+  // An id longer than a flight record holds keeps the slot alone.
+  return id.length <= MAX_ADRIFT_ID_LEN ? id : slotPart;
+}
+
+/** = shipDoc's location-id bound. */
+const MAX_ADRIFT_ID_LEN = 128;
+
+/** The planet, slot and own orbit an adrift location names, or null for
+ *  anything else (an orbit its planet's stations can't fly too). */
+export function adriftPlace(id: string): AdriftPlace | null {
   if (typeof id !== 'string' || !id.startsWith(ADRIFT_PREFIX)) return null;
-  const rest = id.slice(ADRIFT_PREFIX.length);
+  const body = id.slice(ADRIFT_PREFIX.length);
+  const at = body.indexOf('@');
+  const rest = at < 0 ? body : body.slice(0, at);
   const cut = rest.lastIndexOf(':');
   const planetId = rest.slice(0, cut);
   const orbitSlot = Number(rest.slice(cut + 1));
   if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) return null;
   // The planet as every other reader names it (an unknown one reads as the
   // default planet, as in listStations), so destinations around it match.
-  return { planetId: planetById(planetId).id, orbitSlot };
+  const planet = planetById(planetId);
+  if (at < 0) return { planetId: planet.id, orbitSlot };
+  const parts = body.slice(at + 1).split(',');
+  if (parts.length !== 2 || parts.some((p) => p.trim() === '')) return null;
+  const orbit = { radiusKm: Number(parts[0]), phase0: Number(parts[1]) };
+  if (!isUsableOrbit(planet, orbit)) return null;
+  return isSlotOrbit(planet.id, orbitSlot, orbit) ? { planetId: planet.id, orbitSlot } : { planetId: planet.id, orbitSlot, orbit };
+}
+
+/** 🎚️ Is `orbit` the slot's own (the same circle)? */
+function isSlotOrbit(planetId: string, orbitSlot: number, orbit: StationOrbit): boolean {
+  return onPlaceOrbit(orbit, orbitForSlot(planetId, orbitSlot));
+}
+
+/** 🎚️ Does a station flying `flies` (its base orbit, StationRecord.orbit)
+ *  fly the open-orbit place's own orbit `at`: both its slot's, or the same
+ *  circle? */
+export function onPlaceOrbit(flies: StationOrbit | undefined, at: StationOrbit | undefined): boolean {
+  if (!flies || !at) return !flies && !at;
+  return Math.abs(flies.radiusKm - at.radiusKm) < 1e-6
+    && Math.abs(Math.atan2(Math.sin(flies.phase0 - at.phase0), Math.cos(flies.phase0 - at.phase0))) < 1e-9;
 }
 
 /** Where the room resolver puts a room when that is open orbit (a ship
  *  adrift: its flight record's location), or null — a station, or unknown. */
-export function roomAdriftPlace(roomId: string): { planetId: string; orbitSlot: number } | null {
+export function roomAdriftPlace(roomId: string): AdriftPlace | null {
   if (!roomId || !roomStationResolver || resolvingRoom) return null;
   resolvingRoom = true;
   try {
@@ -1463,7 +1585,8 @@ export function currentRoomId(): string {
   return currentRoomGetter();
 }
 
-/** The station the player is in now, or null before the atlas knows the room. */
+/** The station the player is in now, or null before the atlas (or any
+ *  station's gates) places the room. */
 export function currentStation(): StationRecord | null {
   return stationForRoom(currentRoomGetter());
 }

@@ -124,6 +124,77 @@ describe('applyFarDockRequest — DOCK', () => {
     expect(Y.encodeStateVector(full)).toEqual(before);
   });
 
+  it("⚓🚦 fits a new far port unnumbered while a flood hides some of the far room's ports", () => {
+    const doc = new Y.Doc();
+    const layout = doc.getMap('doorLayout');
+    const policies = doc.getMap('doorPolicy');
+    for (let i = 0; i < 1100; i++) {
+      const id = `d:junk${String(i).padStart(4, '0')}`;
+      layout.set(id, { nope: true });
+      policies.set(id, { passage: 'public', construction: 'owner' });
+    }
+    // A real port holding gate 1, past both scans: any number could be its.
+    layout.set('d:hidden', { id: 'd:hidden', wall: 'y-', lateral: 0, placed: true });
+    policies.set('d:hidden', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    layout.set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    expect(dockAt(doc).wrote).toBe(true);
+    const bay = doc.getMap('doorPolicy').toJSON()['d:bay'] as { adapter?: boolean; gate?: number };
+    expect(bay.adapter).toBe(true);
+    expect(bay.gate).toBeUndefined();
+  });
+
+  it('⚓🚦 refuses a new far port in a station whose seen gates take every number, though a flood hides others', () => {
+    const doc = new Y.Doc();
+    const layout = doc.getMap('doorLayout');
+    const policies = doc.getMap('doorPolicy');
+    for (let g = 1; g <= 99; g++) {
+      const id = `d:${String(g).padStart(8, '0')}`;
+      layout.set(id, { id, wall: 'y+', lateral: 0, placed: true });
+      policies.set(id, { passage: 'public', construction: 'owner', adapter: true, gate: g });
+    }
+    for (let i = 0; i < 1100; i++) {
+      const id = `d:junk${String(i).padStart(4, '0')}`;
+      layout.set(id, { nope: true });
+      policies.set(id, { passage: 'public', construction: 'owner' });
+    }
+    layout.set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc)).toEqual({ result: { ok: false, reason: 'no-gate' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+  });
+
+  it('⚓🚦 fits a new far port unnumbered in a room with a port not numbered yet, whose gates no other room can see', () => {
+    const doc = new Y.Doc();
+    // A port fitted before gates: the room's harvest says its gates are not
+    // known, so a number given here would be hidden from the rest of the
+    // station, where another new port could take it too.
+    doc.getMap('doorLayout').set('d:old', { id: 'd:old', wall: 'y-', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('d:old', { passage: 'public', construction: 'owner', adapter: true });
+    doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    expect(dockAt(doc).wrote).toBe(true);
+    const bay = doc.getMap('doorPolicy').toJSON()['d:bay'] as { adapter?: boolean; gate?: number };
+    expect(bay.adapter).toBe(true);
+    expect(bay.gate).toBeUndefined();
+  });
+
+  it("⚓🚦 numbers a new far port in a room whose ports all have numbers, though another room's gates are not known", () => {
+    const doc = new Y.Doc();
+    doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    // The hub's gates are not known (a port there has no number yet), so it
+    // holds none: the new port is numbered, not left waiting on the hub.
+    doc.getMap('atlas').set(STATION, {
+      roomId: STATION, name: 'Dock', updatedAt: 5,
+      doors: { 'd:hall': { targetRoomId: 'hub-room', farDoor: 'd:in', transient: false } },
+    });
+    doc.getMap('atlas').set('hub-room', {
+      roomId: 'hub-room', name: 'Hub', updatedAt: 5,
+      doors: { 'd:in': { targetRoomId: STATION, farDoor: 'd:hall', transient: false } },
+      gatesUnknown: true,
+    });
+    expect(dockAt(doc).wrote).toBe(true);
+    expect(doc.getMap('doorPolicy').toJSON()['d:bay']).toMatchObject({ adapter: true, gate: 1 });
+  });
+
   it("⚓🚦 numbers a new far port past gates the far doc's shared atlas knows, even unvisited rooms", () => {
     const doc = new Y.Doc();
     doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });

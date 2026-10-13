@@ -4,7 +4,7 @@
 // near-side writes as docking.ts's UNDOCK / DOCK.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { listStations, planetById, setStationMoveResolver, setStationRoomSource } from './stations';
+import { listStations, planetById, registerStation, setStationMoveResolver, setStationRoomSource } from './stations';
 import {
   MOVE_SCAN_MAX, bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, readStationMove, rejectionOf, writeStationMove,
   type StationMove,
@@ -1039,6 +1039,61 @@ describe('where a ship with no live dock is', () => {
     expect(detachBerth('east', now + 13_000)).toBe(false);
     expect(restingPlace(readRestPlace()!, now + 14_000)).toMatchObject({ at: there, releasedAt: now + 12_000, recorded: true });
     expect(shipPlaceId(readFlightRecord(), now + 14_000)).toBe('furlong-station');
+  });
+
+  it('lets a ship go where its station is now, at a module of it this game has not mapped', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const g = globalThis as { localStorage?: unknown };
+    const before = g.localStorage;
+    const store = new Map<string, string>();
+    g.localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, v); },
+      removeItem: (k: string) => { store.delete(k); },
+    };
+    try {
+      const now = Date.now();
+      // No atlas here: the yard's annex is known only by the gate the
+      // station lists in it.
+      expect(registerStation({
+        id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-sovereign', orbitSlot: 9, welcomeRoomId: 'yard-lobby',
+        berths: [{ roomId: 'yard-annex', doorId: 'd:gate-2', gate: 2 }],
+      })).toBe(true);
+      const yard = listStations().find((st) => st.id === 'aris-yard')!;
+      const seed = 'ssf://room#room=yard-annex';
+      writeFlightRecord({ status: 'docked', locationId: 'aris-yard' });
+      writeDoorPairing('east', seed, buildDoorPairing(seed, {
+        segments: dockChain(), farDoor: 'south', farWall: 'y+', transient: true, dockedAt: now - 30_000,
+      }));
+      expect(keepRestPlace('ship-room', now)).toBe(true);
+      expect(readRestPlace()).toEqual({ at: placeOfStation('aris-yard'), since: now, docks: ['east'] });
+      // The yard flies to Aris, and the dock holds the ship all the way.
+      expect(writeStationMove({
+        stationId: 'aris-yard', welcomeRoomId: 'yard-lobby', fromPlanetId: yard.planetId, fromSlot: yard.orbitSlot,
+        toPlanetId: 'planet-aris', toSlot: 0, departAt: now + 1000, arriveAt: now + 10_000,
+        mode: 'thrusters', bookedAt: now + 500, fuel: 1, fuelDrawn: 0,
+      })).toBe(true);
+      expect(berthHeldByMove('ship-room', 'east', now + 5000)).toBe(true);
+      expect(keepRestPlace('ship-room', now + 5000)).toBe(false);
+      // There, its rest follows the yard, and let go it stays at Aris, not
+      // where the yard was before it left.
+      const atAris = listStations(undefined, undefined, now + 11_000).find((st) => st.id === 'aris-yard')!;
+      const there = adriftAt('planet-aris', atAris.orbitSlot);
+      expect(berthHeldByMove('ship-room', 'east', now + 11_000)).toBe(false);
+      expect(keepRestPlace('ship-room', now + 11_000)).toBe(true);
+      expect(readRestPlace()).toEqual({ at: there, since: now + 11_000, docks: ['east'] });
+      expect(releasePlaceOf('yard-annex', now + 11_000)).toBe(there);
+      expect(detachBerth('east', now + 12_000)).toBe(true);
+      expect(readDoor('east')).toMatchObject({ paired: false, dock: { undockedAt: now + 12_000, at: there } });
+      expect(restingPlace(readRestPlace()!, now + 14_000)).toMatchObject({ at: there, releasedAt: now + 12_000, recorded: true });
+    } finally {
+      if (before === undefined) delete g.localStorage;
+      else g.localStorage = before;
+    }
   });
 
   it('casts off every transient berth at DEPART, unless a station move holds one or the moves cannot all be read', () => {

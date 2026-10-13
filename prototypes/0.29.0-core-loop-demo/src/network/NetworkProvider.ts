@@ -23,6 +23,8 @@ import type {
   TransportMode,
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
+import { buildRoomCapPayload, nextCapSeq, readChiaMode } from './roomCap.ts';
+import type { FaucetOp, FaucetRequestTicket } from '../faucetDish.ts';
 
 export interface NetworkDebugInfo {
   mode: TransportMode;
@@ -56,6 +58,14 @@ export class NetworkProvider implements NetworkProviderPort {
   #datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #tickHandler: ((buf: Uint8Array) => void) | null = null;
   #envelopeHandler: ((env: any) => void) | null = null;
+  /** Replies to our own `faucet` requests: delivered ONLY from the stream the
+   *  request went out on, never from a node-opened stream (a peer's forwarded
+   *  envelope must not pass for the node's answer). */
+  #faucetReplyHandler: ((env: any) => void) | null = null;
+  /** Monotonic `seq` on faucet requests; the node echoes it on the reply, so
+   *  the dish can tell the reply to its pending TAKE/GIVE from any other (each
+   *  request is its own stream, and streams complete in any order). */
+  #faucetSeq = 0;
   #isActive = false;
 
   #pingSent = 0;
@@ -67,6 +77,10 @@ export class NetworkProvider implements NetworkProviderPort {
   #openChannels = 0;
   #connectedAt = 0;
   #boot: RoomBootstrap | null = null;
+  /** N8 probe: is this room public space? Installed by main.ts. */
+  #publicRoomProbe: ((roomId: string) => boolean) | null = null;
+  /** Last cap `seq` sent (see roomCap.ts): caps ride separate streams. */
+  #capSeq = 0;
 
   async connect(boot: RoomBootstrap): Promise<void> {
     if (this.#isActive) {
@@ -134,16 +148,15 @@ export class NetworkProvider implements NetworkProviderPort {
       // 3. Start RTT Ping/Pong probe loop (Task 3.4 / v006 §3.8 Chrome fallback)
       this.#startPingProbe(wt);
 
-      // 4. ChiaHub Slice 3: hand our LOCAL node this room's key + per-room
-      // chia-mode flag over a one-shot `cap` stream, so it can derive the room's
-      // chia lookup hint and (later) publish/resolve presence. Loopback only; the
-      // node drops it entirely unless it was built with the chia-lane feature AND
-      // SSF_CHIA_LANE=1. The chia-mode flag is the "advanced chia mesh mode"
-      // toggle — sourced from localStorage until the management-computer UI sets it.
+      // 4. ChiaHub Slice 3: hand our LOCAL node this room's key + flags over a
+      // one-shot `cap` stream, so it can derive the room's chia lookup hint,
+      // read presence for it (on by default, #231 D3) and publish presence when
+      // armed. Loopback only. The chia-mode flag is the "advanced chia mesh
+      // mode" toggle — sourced from localStorage until the management-computer
+      // UI sets it; the public-room flag (N8) comes from the probe main.ts
+      // installs and is re-sent whenever the door policy changes.
       if (boot.roomKeyB64) {
-        let chiaMode = false;
-        try { chiaMode = localStorage.getItem(`ssf-chia-mode-${boot.roomId}`) === '1'; } catch { /* privacy mode */ }
-        void this.sendRoomCap(boot.roomId, boot.roomKeyB64, chiaMode);
+        void this.sendRoomCap(boot.roomId, boot.roomKeyB64, readChiaMode(boot.roomId));
       }
 
     } catch (err: any) {
@@ -225,13 +238,25 @@ export class NetworkProvider implements NetworkProviderPort {
    *  LOCAL node over a one-shot `cap` stream. The node needs the room key to
    *  derive the room's chia lookup hint and seal presence records; it holds the
    *  room's plaintext doc already, so this is loopback-only and exposes nothing
-   *  new. Fire-and-forget: the node silently drops it unless it was built with
-   *  the chia-lane feature and SSF_CHIA_LANE=1. Same `[u32-LE len][JSON]` framing
-   *  the node reads on every browser->node stream. */
+   *  new. Fire-and-forget. The payload also carries N8's `publicRoom` flag from
+   *  the installed probe; a provider with no probe (every background provider)
+   *  sends no cap at all — see the guard below. Same `[u32-LE len][JSON]`
+   *  framing the node reads on every browser->node stream. */
   async sendRoomCap(roomId: string, roomKeyB64: string, chiaMode: boolean): Promise<void> {
     if (!this.#wt || this.#mode === 'offline') return;
+    // N8: only a provider that can vouch for the room's posture speaks. The
+    // background providers (passes, far-door and departure writes, direct
+    // messages, room sessions) have no probe; a cap from one of them would
+    // overwrite the primary session's reading for that room with a blanket
+    // PUBLIC — fail-closed, but it would switch reads off for a room the
+    // player is standing in. The node holds no cap for a room nobody vouched
+    // for, which is the same fail-closed outcome without the override.
+    if (!this.#publicRoomProbe) return;
     try {
-      const payloadBytes = new TextEncoder().encode(JSON.stringify({ roomKeyB64, chiaMode }));
+      const publicRoom = this.#publicRoomProbe(roomId);
+      this.#capSeq = nextCapSeq(this.#capSeq);
+      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq);
+      const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
       // Small payload (<128 B) — a single btoa is safe. Node decodes with
       // BASE64_STANDARD, which btoa produces.
       const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
@@ -243,7 +268,9 @@ export class NetworkProvider implements NetworkProviderPort {
       const stream = await this.#wt.createBidirectionalStream();
       const writer = stream.writable.getWriter();
       await writer.write(packet);
-      writer.releaseLock();
+      // close() sends FIN: the node's reader sees EOF and ends its stream task.
+      // Only releasing the lock left every cap stream open until disconnect.
+      await writer.close();
     } catch (e) {
       console.warn('Failed to send room cap to node:', e);
     }
@@ -259,24 +286,122 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
+  /** N8: who decides whether a room is public space (bundled seed or PUBLIC
+   *  passage). main.ts installs it on the primary provider at boot, before any
+   *  join; a provider without one never sends a cap, so a node never publishes
+   *  under a key the browser has not vouched for. */
+  setPublicRoomProbe(probe: (roomId: string) => boolean): void {
+    this.#publicRoomProbe = probe;
+  }
+
+  /** Re-send the current room's cap with its CURRENT flags — called when the
+   *  door policy changes, so a room flipping between public and private passage
+   *  reaches the node without a reconnect. */
+  async refreshRoomCap(): Promise<void> {
+    const boot = this.#boot;
+    if (boot?.roomKeyB64) {
+      await this.sendRoomCap(boot.roomId, boot.roomKeyB64, readChiaMode(boot.roomId));
+    }
+  }
+
+  /** ⛓️🥣 Ask the LOCAL node about this room's faucet dish — `status` (what is
+   *  in the jar and the dish), `claim` (take the ready mojo to our wallet) or
+   *  `give` (pay `amount` mojos from our wallet into the jar). One fresh
+   *  bidirectional stream per request, the `cap` framing; the node answers on
+   *  that stream with a `faucet` envelope, which arrives through onFaucetReply
+   *  and nowhere else. The node derives the faucet address from the room key
+   *  it already holds from `cap`, so nothing secret travels here.
+   *
+   *  Returns the request's `seq` at once, with `sent`: a promise that resolves
+   *  once the request is on the wire and REJECTS when it never left (no node
+   *  connection, or the stream failed before the frame was written), so the
+   *  caller can drop its pending TAKE/GIVE at once. The seq is allotted here,
+   *  before anything is written, so the dish keys the pending action on it
+   *  before any reply can arrive. A failure AFTER the write is indeterminate
+   *  and resolves (see below).
+   *
+   *  The reply is accepted only while the transport this request went out on
+   *  is still the live one: a stream of a session since left can outlive
+   *  disconnect() (its read is still pending), and a reconnect that lands the
+   *  same room before it ends must not take that session's stale status or
+   *  error as its own. */
+  requestFaucet(op: FaucetOp, amount?: number): FaucetRequestTicket {
+    const seq = ++this.#faucetSeq;
+    return { seq, sent: this.#sendFaucetRequest(op, amount, seq) };
+  }
+
+  async #sendFaucetRequest(op: FaucetOp, amount: number | undefined, seq: number): Promise<void> {
+    const boot = this.#boot;
+    const wt = this.#wt;
+    if (!wt || this.#mode === 'offline' || !boot) {
+      throw new Error('no connection to your node');
+    }
+    try {
+      const body: { op: FaucetOp; amount?: number } = { op };
+      if (op === 'give') body.amount = Math.max(0, Math.floor(amount ?? 0));
+      const payloadBytes = new TextEncoder().encode(JSON.stringify(body));
+      const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
+      const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq, author: '', payload: payloadB64 };
+      const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
+      const packet = new Uint8Array(4 + jsonBytes.length);
+      new DataView(packet.buffer).setUint32(0, jsonBytes.length, true);
+      packet.set(jsonBytes, 4);
+      const stream = await wt.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(packet);
+      // One request per stream: close() sends FIN, so after its reply the node
+      // finishes its side too and this stream ends instead of living (and
+      // holding a node task) until disconnect — one leak per status poll.
+      // The frame is on the wire once write() resolves, so a close() that fails
+      // (a reset while the FIN is in flight) is a failure of the stream's
+      // cleanup, not of the request: the node may well have read the frame and
+      // be acting on it. It is logged, the reply is still awaited, and the
+      // request is NOT reported as never sent — that would drop a pending
+      // TAKE/GIVE and invite a second one.
+      try {
+        await writer.close();
+      } catch (e) {
+        console.warn('Faucet request stream did not close cleanly (the node may still answer):', e);
+      }
+      // The reply comes back on THIS stream, and only a reply is accepted from
+      // it: the generic envelope path never sees it, and nothing that arrives
+      // on a node-opened stream can pass for it. Bound to `wt`: the drain
+      // stops delivering the moment that transport is no longer the live one.
+      void this.#drainNodeStream(stream, wt, (env) => {
+        if (env?.kind === 'faucet') this.#faucetReplyHandler?.(env);
+      });
+    } catch (e) {
+      console.warn('Failed to send faucet request to node:', e);
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+  }
+
   /** Register a handler for envelopes arriving on node-initiated streams
    *  (remote peers' ysync updates, bridge dial-status, future chat lanes). */
   onEnvelope(handler: (env: any) => void): void {
     this.#envelopeHandler = handler;
   }
 
+  /** Register the handler for the node's replies to requestFaucet. */
+  onFaucetReply(handler: (env: any) => void): void {
+    this.#faucetReplyHandler = handler;
+  }
+
   /** Accept and drain every bidirectional stream the NODE opens toward us.
    *  Each stream carries u32-LE length-framed JSON SsfEnvelopes (same wire
    *  format as browser→node streams). */
   async #listenIncomingStreams(): Promise<void> {
-    if (!this.#wt) return;
+    // THIS session's transport: every stream it hands us is drained for as long
+    // as it stays the live one, and not a read longer.
+    const wt = this.#wt;
+    if (!wt) return;
     try {
-      const reader = this.#wt.incomingBidirectionalStreams.getReader();
-      while (this.#isActive) {
+      const reader = wt.incomingBidirectionalStreams.getReader();
+      while (this.#isActive && this.#wt === wt) {
         const { value: stream, done } = await reader.read();
         if (done) break;
         this.#openChannels++;
-        void this.#drainNodeStream(stream);
+        void this.#drainNodeStream(stream, wt);
       }
     } catch (e) {
       if (this.#isActive) {
@@ -285,13 +410,27 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
-  async #drainNodeStream(stream: { readable: ReadableStream<Uint8Array> }): Promise<void> {
+  /** Read length-framed envelopes off `stream` until it ends. Node-opened
+   *  streams deliver to the generic handler; a request stream we opened passes
+   *  its own `deliver`, so its replies never mix with forwarded traffic.
+   *
+   *  `owner` is the transport the stream belongs to. A read already pending
+   *  when disconnect() runs resolves later — possibly after a reconnect has
+   *  made the provider active again on a NEW transport — and what it read then
+   *  belongs to the session that was left, not to the live one: nothing is
+   *  delivered, and the drain ends, once `owner` is no longer `this.#wt`. */
+  async #drainNodeStream(
+    stream: { readable: ReadableStream<Uint8Array> },
+    owner: unknown,
+    deliver: (env: any) => void = (env) => this.#envelopeHandler?.(env),
+  ): Promise<void> {
     const reader = stream.readable.getReader();
     let buffer = new Uint8Array(0);
+    const live = (): boolean => this.#isActive && this.#wt === owner;
     try {
-      while (this.#isActive) {
+      while (live()) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done || !live()) break;
         const merged = new Uint8Array(buffer.length + value.length);
         merged.set(buffer, 0);
         merged.set(value, buffer.length);
@@ -305,7 +444,7 @@ export class NetworkProvider implements NetworkProviderPort {
           buffer = buffer.subarray(4 + len);
           try {
             const envelope = JSON.parse(new TextDecoder().decode(payloadBytes));
-            this.#envelopeHandler?.(envelope);
+            deliver(envelope);
           } catch (e) {
             console.warn('Failed to parse node-initiated envelope:', e);
           }

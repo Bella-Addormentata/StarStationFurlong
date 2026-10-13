@@ -7,13 +7,14 @@ import type { FreePose } from './freeFlight';
 import { planStationPark } from './freeStation';
 import { ORBIT_EPOCH_MS, baseOrbit, orbitForSlot, angleAt } from './orbits';
 import { isStationMove } from './stationMove';
-import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, MIN_ORBIT_SEPARATION_KM, orbitAfterMove } from './stations';
+import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, MIN_ORBIT_SEPARATION_KM, altitudeMoveKey, lostAltitudeClaims, orbitAfterMove } from './stations';
+import type { StationRecord } from './stations';
 
 const T = ORBIT_EPOCH_MS + 5 * 3_600_000;
 const station = DEFAULT_STATION_RECORD;
 
-function stillAt(radiusKm: number, angle = 1.2): FreePose {
-  return { planetId: DEFAULT_PLANET_ID, at: T, radiusKm, angle, vAlong: 0, vRadial: 0, heading: 0, parked: true };
+function stillAt(radiusKm: number, angle = 1.2, at = T): FreePose {
+  return { planetId: DEFAULT_PLANET_ID, at, radiusKm, angle, vAlong: 0, vRadial: 0, heading: 0, parked: true };
 }
 
 describe('🅿️ parking a station', () => {
@@ -43,5 +44,22 @@ describe('🅿️ parking a station', () => {
     const low = planStationPark(station, stillAt(6371 + 150), [station], 0, 0);
     expect(low.ok).toBe(false);
     if (!low.ok) expect(low.reason).toMatch(/Too low/);
+  });
+
+  it('parks exactly the separation below an orbit claimed earlier: the unflown leg leaves from below, and both claims stand', () => {
+    const other: StationRecord = { ...station, id: 'other-station', name: 'OTHER', welcomeRoomId: 'home-other', orbitSlot: 1 };
+    const first = planStationPark(other, stillAt(mid, 2.5, T - 3_600_000), [station, other], 0, 0);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const otherNow: StationRecord = { ...other, move: first.move, orbit: orbitAfterMove(first.move, T) };
+    const target = mid - MIN_ORBIT_SEPARATION_KM;
+    const res = planStationPark(station, stillAt(target), [station, otherNow], 0, 0);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.move.orbit!.fromRadiusKm).toBeLessThan(target);
+    expect(isStationMove(res.move)).toBe(true);
+    const lost = lostAltitudeClaims([first.move, res.move]);
+    expect(lost.has(altitudeMoveKey(res.move))).toBe(false);
+    expect(lost.has(altitudeMoveKey(first.move))).toBe(false);
   });
 });

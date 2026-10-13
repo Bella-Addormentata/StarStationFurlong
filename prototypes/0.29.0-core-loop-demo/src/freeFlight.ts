@@ -371,11 +371,15 @@ export function applyZones(pose: FreePose, all: readonly FreeStation[]): { pose:
     // Parked: kept where it is (it is still, so no zone would slow it, and a
     // station merely passing must not pick it up), until another station
     // sweeps into its docking zone: then that one takes it.
-    if (!other || other.distanceKm > DOCK_ZONE_KM || other.station.room === p.near?.room) return { pose, changed: false };
+    if (!other || other.distanceKm > DOCK_ZONE_KM || other.station.room === p.near?.room
+      || (p.near && other.distanceKm >= Math.hypot(p.near.along, p.near.radial))) return { pose, changed: false };
     const { parked: _off, ...flying } = p;
     p = flying;
     changed = true;
   }
+  // The station the take-up below gives the ship to: the nearest, unless a
+  // handover names another (the held one may still be the nearest).
+  let takeUp = nearest;
   if (p.near) {
     // Past the zone's edge (with a margin), or its station is gone: back on
     // the ship's own orbit. So too when another station comes much nearer
@@ -384,7 +388,10 @@ export function applyZones(pose: FreePose, all: readonly FreeStation[]): { pose:
     // and hull count (orbits are only MIN_ORBIT_SEPARATION apart).
     const held = stations.find((s) => s.room === p.near!.room);
     const heldKm = Math.hypot(p.near.along, p.near.radial);
-    const handOver = !!other && (other.distanceKm <= DOCK_ZONE_KM || other.distanceKm < heldKm * FRAME_HANDOVER);
+    // Only ever to a station nearer than the held one, so two stations both
+    // within the docking zone never trade the ship back and forth.
+    const handOver = !!other && other.distanceKm < heldKm
+      && (other.distanceKm <= DOCK_ZONE_KM || other.distanceKm < heldKm * FRAME_HANDOVER);
     if (!held || heldKm > APPROACH_ZONE_KM * LEAVE_MARGIN || handOver) {
       const { near: _gone, ...open } = p;
       // Its speed along, from the station's frame to its own orbit's: the
@@ -394,13 +401,14 @@ export function applyZones(pose: FreePose, all: readonly FreeStation[]): { pose:
         : p.vAlong;
       p = { ...open, vAlong };
       changed = true;
+      if (handOver) takeUp = other;
     }
   }
-  if (!p.near && nearest && nearest.distanceKm <= APPROACH_ZONE_KM) {
+  if (!p.near && takeUp && takeUp.distanceKm <= APPROACH_ZONE_KM) {
     // The ship's offset from the station, in the station's frame, and its
     // speed against the station's (a slow ship a station passes is passed,
     // not picked up).
-    const st = nearest.station;
+    const st = takeUp.station;
     const here = st.pointAt(p.at);
     const off = offsetFrom(here, { radiusKm: p.radiusKm, angle: p.angle });
     const ownRate = circularRate(p.planetId, p.radiusKm) + p.vAlong / p.radiusKm;

@@ -23,7 +23,7 @@
 //! it, but the publish→resolve loop must run against the funded dev wallet on the
 //! chia-lane build (see brainstorming/craps-chia-backend-plan.md §12.5). The
 //! `SSF_CHIA_CRAPS_FAIR_TEST=1` hook in main.rs runs the end-to-end self-test.
-#![cfg(feature = "chia-lane")]
+#![cfg(feature = "chia-publish")]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +33,8 @@ use chia_protocol::{Bytes, Bytes32, Coin};
 use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
 use sha2::{Digest, Sha256};
 
-use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash};
+use crate::chia_faucet::{unspent_at, MAX_FAUCET_PAGES};
+use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, push_parked, WALLET_LEASE};
 use crate::chia_resolve::{extract_ciphertext, fetch_coin_spend};
 
 /// Domain for the PUBLIC craps-fairness lookup hint. Unlike presence (keyed on a
@@ -92,7 +93,10 @@ pub fn derive_dice(seed_hex: &str, beacon_hex: &str, table: &str, round: u64) ->
 }
 
 /// Spend a specific `coin` back to self carrying `[fair_hint, payload]` memos —
-/// the plaintext fairness record. Reuses the presence lane's `build_publish_bundle`.
+/// the plaintext fairness record. Reuses the presence lane's `build_publish_bundle`
+/// and pushes with the coin parked first (`push_parked`: a push that times out
+/// may still have landed, so the coin stays parked until the chain or the
+/// mempool settles it; an outright rejection frees it).
 async fn push_fair_record(
     client: &CoinsetClient,
     chia_sk: &SecretKey,
@@ -103,13 +107,7 @@ async fn push_fair_record(
 ) -> Result<()> {
     let hint = fair_hint(table, round);
     let bundle = build_publish_bundle(chia_sk, coin, hint, Bytes::new(payload.to_vec()))?;
-    let resp = client
-        .push_tx(bundle)
-        .await
-        .map_err(|e| anyhow!("coinset push_tx failed: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("push_tx rejected: {:?}", resp.error));
-    }
+    push_parked(client, bundle, [coin.coin_id()]).await?;
     Ok(())
 }
 
@@ -118,29 +116,25 @@ async fn push_fair_record(
 /// simply returning the first coin that differs from it) is safe when the wallet
 /// has multiple coins: a larger coin could be returned before `spent`'s spend
 /// confirms, violating the commit→reveal ordering assumption. ~200 s bound.
+///
+/// The listing is PAGED like every other wallet listing (#245 review, round 15):
+/// `spent` was selected across up to [`MAX_FAUCET_PAGES`] gateway pages, so the
+/// first page alone could simply not hold it while it still sits unspent on a
+/// later one, and the reveal would go out before the commit confirmed. A
+/// listing cut short that does not show `spent` proves nothing either way
+/// ([`confirmed_gone`]): the wait goes on.
 async fn wait_for_next_coin(
     client: &CoinsetClient,
     our_ph: Bytes32,
     spent: &Coin,
 ) -> Result<Coin> {
+    let mut cut_short = false;
     for attempt in 0..40u32 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let resp = client
-            .get_coin_records_by_puzzle_hash(our_ph, None, None, Some(false), None)
-            .await
-            .map_err(|e| anyhow!("coinset get_coin_records_by_puzzle_hash failed: {e}"))?;
-        if !resp.success {
-            return Err(anyhow!("coin lookup unsuccessful: {:?}", resp.error));
-        }
-        let unspent: Vec<Coin> = resp
-            .coin_records
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| !r.spent)
-            .map(|r| r.coin)
-            .collect();
-        // Only proceed once `spent` is confirmed gone from the unspent set.
-        if !unspent.iter().any(|c| c == spent) {
+        let listing = unspent_at(client, our_ph).await?;
+        cut_short = listing.partial;
+        let unspent: Vec<Coin> = listing.coins.into_iter().map(|c| c.coin).collect();
+        if confirmed_gone(!listing.partial, &unspent, spent) {
             if let Some(next) = unspent.into_iter().max_by_key(|c| c.amount) {
                 return Ok(next);
             }
@@ -149,9 +143,22 @@ async fn wait_for_next_coin(
             println!("   …waiting for block confirmation ({}s)", (attempt + 1) * 5);
         }
     }
+    if cut_short {
+        return Err(anyhow!(
+            "timed out (~200 s): the wallet listing is cut short at {MAX_FAUCET_PAGES} pages, so whether the spend confirmed cannot be read"
+        ));
+    }
     Err(anyhow!(
         "timed out (~200 s) waiting for the spend to confirm — testnet slow or unfunded"
     ))
+}
+
+/// Whether a wallet listing proves `spent` gone from the unspent set: absent
+/// from a COMPLETE listing. Absent from one cut short, it may sit on a page the
+/// listing never reached, so that is unknown, not confirmed (#245 review,
+/// round 15).
+fn confirmed_gone(listing_complete: bool, unspent: &[Coin], spent: &Coin) -> bool {
+    listing_complete && !unspent.iter().any(|c| c == spent)
 }
 
 /// Resolve every PUBLIC fairness record published under (table, round): the raw
@@ -212,22 +219,41 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
     println!("🎲⛓️ craps-fair selftest — table={table} round={round}");
     println!("   commit = {commit}");
 
-    // 1. COMMIT.
-    let coin_a = find_spendable_coin(&client, our_ph)
-        .await?
-        .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; fund it at a testnet11 faucet"))?;
+    // 1. COMMIT. Select + push under the wallet lease (chia_publish::WALLET_LEASE):
+    //    the heartbeat or the faucet dish must not pick the same coin before this
+    //    spend confirms. The confirmation wait below runs with the lease released.
     let commit_payload = serde_json::to_vec(&serde_json::json!({
         "t": table, "r": round, "k": "commit", "commit": commit,
     }))?;
-    push_fair_record(&client, chia_sk, coin_a.clone(), table, round, &commit_payload).await?;
+    let coin_a = {
+        let _lease = WALLET_LEASE.lock().await;
+        WALLET_LEASE.ensure_open()?;
+        WALLET_LEASE.reconcile(&client).await;
+        let coin = find_spendable_coin(&client, our_ph)
+            .await?
+            .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; fund it at a testnet11 faucet"))?;
+        push_fair_record(&client, chia_sk, coin.clone(), table, round, &commit_payload).await?;
+        coin
+    };
     println!("   ✅ commit published; waiting for confirmation…");
-    let coin_b = wait_for_next_coin(&client, our_ph, &coin_a).await?;
+    wait_for_next_coin(&client, our_ph, &coin_a).await?;
 
     // 2. REVEAL (after the "betting window" — here, once the commit confirmed).
+    //    Selected afresh under the lease: `wait_for_next_coin`'s pick could have
+    //    been taken by another writer in the meantime.
     let reveal_payload = serde_json::to_vec(&serde_json::json!({
         "t": table, "r": round, "k": "reveal", "seed": seed_hex, "beacon": beacon_hex,
     }))?;
-    push_fair_record(&client, chia_sk, coin_b.clone(), table, round, &reveal_payload).await?;
+    let coin_b = {
+        let _lease = WALLET_LEASE.lock().await;
+        WALLET_LEASE.ensure_open()?;
+        WALLET_LEASE.reconcile(&client).await;
+        let coin = find_spendable_coin(&client, our_ph)
+            .await?
+            .ok_or_else(|| anyhow!("no spendable coin for the reveal (the commit's change not confirmed yet?)"))?;
+        push_fair_record(&client, chia_sk, coin.clone(), table, round, &reveal_payload).await?;
+        coin
+    };
     println!("   ✅ reveal published; waiting for confirmation…");
     wait_for_next_coin(&client, our_ph, &coin_b).await?;
 
@@ -305,6 +331,22 @@ mod tests {
             counts[(a + b) as usize] += 1;
         }
         assert!(counts[7] > counts[2] && counts[7] > counts[12]);
+    }
+
+    #[test]
+    fn a_coin_missing_from_a_listing_cut_short_is_not_confirmed_gone() {
+        let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), Bytes32::new([0u8; 32]), amount);
+        let spent = coin(1, 500);
+        let others = vec![coin(2, 700), coin(3, 100)];
+        // Still listed: not gone, whatever the listing's completeness.
+        assert!(!confirmed_gone(true, &[spent.clone(), others[0].clone()], &spent));
+        assert!(!confirmed_gone(false, &[spent.clone()], &spent));
+        // Absent from a COMPLETE listing: confirmed gone.
+        assert!(confirmed_gone(true, &others, &spent));
+        // Absent from a listing cut short: it may sit on a page never reached —
+        // unknown, and the reveal must wait (#245 review, round 15).
+        assert!(!confirmed_gone(false, &others, &spent));
+        assert!(!confirmed_gone(false, &[], &spent));
     }
 
     #[test]

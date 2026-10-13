@@ -38,7 +38,7 @@
 import {
   AH_GOAL_PAUSE_MS, AH_GOALS_TO_WIN, AH_HALF_L, AH_HALF_W, AH_PUCK_R,
   AH_SERVE_DELAY_MS, AH_STUCK_SPEED, AH_STUCK_TIMEOUT_MS,
-  claimSide, clampMallet, initialAirHockeyState, isVersus, otherSide, releaseSide,
+  canResetAirHockey, claimSide, clampMallet, initialAirHockeyState, isVersus, otherSide, releaseSide,
   malletFromTick, malletToTick, puckFromTick, puckToTick, seatOf,
   servePosition, setReady, setUnready, startIfReady, startPractice, stepPuck,
   takeSeat, withForfeit, withGoal,
@@ -47,10 +47,11 @@ import type {
   AirHockeySide, AirHockeyState, MalletInput, PuckSim,
 } from './games/airHockey';
 import {
-  readAirHockey, readPlayerDisplayName, readRoomOwner, subscribeGames,
+  readAirHockey, readPlayerDisplayName, subscribeGames,
   writeGame,
 } from './games/gamesDoc';
 import { casinoDocEpoch } from './casinoDoc';
+import { canEditRoom } from './editMode';
 // #116 review fix: HTML escaper for peer-authored strings that reach
 // innerHTML (the seat-row display-name interpolation, previously an XSS).
 import { escapeHtml } from './htmlEscape';
@@ -63,6 +64,9 @@ import { FURNITURE, rotXZ } from './furniture';
 import type { Rot } from './furniture';
 import type { AirHockeyVisualHandle, DeviceUI } from './devices';
 import { activeRoomId } from './roomInventory';
+import { gearButton, gearSection } from './gearCardParts';
+import { closeGearCard, pickSettingsGearAt, toggleGearCard } from './settingsGear';
+import type { GearCardSpec } from './settingsGear';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -823,6 +827,51 @@ export function airHockeySeatRowHtml(
  * deviceFocus after the walk-up + camera ease; ALL shared state lives in the
  * doc — the panel re-renders from observers, never from local truth.
  */
+/** ⚙ The table card (settingsGear.ts): the rules and who holds each end for
+ *  anyone; RESET TABLE for whoever may edit the room. */
+export function airHockeyGearCard(itemId: string): GearCardSpec {
+  const holder = (pid: string | null): string =>
+    pid === null ? 'OPEN' : escapeHtml(readPlayerDisplayName(pid)).toUpperCase();
+  return {
+    itemId,
+    title: 'AIR HOCKEY TABLE',
+    noun: 'TABLE',
+    isHouse: () => canEditRoom().ok,
+    body(house) {
+      const s = readAirHockey(itemId);
+      const rows = [
+        gearSection([
+          `FIRST TO ${AH_GOALS_TO_WIN} GOALS WINS`,
+          'TAKE AN END AND READY UP · THE MATCH STARTS WHEN BOTH ENDS ARE READY',
+          'PRACTICE ALONE AGAINST BOTH GOALS UNTIL SOMEONE JOINS',
+          `LEAVE MID-MATCH FOR ${FORFEIT_MS / 1000} S AND YOU FORFEIT`,
+        ]),
+        gearSection([
+          `<span style="color:${AH_UI_CYAN};">CYAN END</span> · ${holder(s?.players.a ?? null)}`,
+          `<span style="color:${AH_UI_ORANGE};">ORANGE END</span> · ${holder(s?.players.b ?? null)}`,
+          s?.status === 'playing' || s?.status === 'ended' ? `SCORE ${s.score.a}–${s.score.b}` : 'NO MATCH ON',
+        ]),
+        gearSection([
+          'CLICK THE TABLE TO GRAB YOUR MALLET · HOLD THE MOUSE TO PUT IT DOWN · RELEASE TO LIFT · ESC LETS GO',
+        ]),
+      ];
+      if (house) {
+        rows.push(`<div style="display:flex;justify-content:flex-end;">${
+          gearButton('reset', 'RESET TABLE', canResetAirHockey(s, getPlayerId(), true))
+        }</div>`);
+      }
+      return rows.join('');
+    },
+    onAct(act, house) {
+      if (act !== 'reset' || !house) return;
+      if (canResetAirHockey(readAirHockey(itemId), getPlayerId(), house)) {
+        writeGame(itemId, initialAirHockeyState());
+      }
+    },
+    subscribe: subscribeGames,
+  };
+}
+
 export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   const myId = getPlayerId();
   const side = deps.side;
@@ -950,13 +999,10 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     if (ns) writeGame(deps.itemId, ns);
   };
 
-  /** RESET/NEW MATCH gate (checkers canReset precedent): anyone once ended;
-   *  participants or the room owner otherwise (recovers crash-leaked claims). */
-  const canReset = (s: AirHockeyState | null): boolean => {
-    if (!s) return false;
-    if (s.status === 'ended') return true;
-    return s.players.a === myId || s.players.b === myId || readRoomOwner() === myId;
-  };
+  /** RESET/NEW MATCH gate — the pure rule is canResetAirHockey; the owner
+   *  half goes through the shared edit gate (recovers crash-leaked claims). */
+  const canReset = (s: AirHockeyState | null): boolean =>
+    canResetAirHockey(s, myId, canEditRoom().ok);
 
   const doReset = (): void => {
     const s = state();
@@ -1010,6 +1056,10 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   const onCaptureClick = (e: MouseEvent): void => {
     e.stopPropagation(); // never a click-away release
+    if (!locked() && pickSettingsGearAt(e) === deps.itemId) {
+      toggleGearCard(airHockeyGearCard(deps.itemId));
+      return;
+    }
     if (locked() || !canDrive() || !captureLayer) return;
     // Chrome throttles re-locks right after an Esc — swallow the rejection,
     // the prompt simply stays up for the retry.
@@ -1282,6 +1332,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     },
 
     unmount(): void {
+      closeGearCard(deps.itemId);
       document.removeEventListener('pointerlockchange', onLockChange);
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mousedown', onMouseDown);

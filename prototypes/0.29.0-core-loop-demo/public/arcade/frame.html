@@ -1,0 +1,854 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Furlong Arcade</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    🕹 The arcade cabinet's emulator frame (#193): a page of our own that
+    hosts EmulatorJS, so the cabinet can tear the whole thing down by
+    removing the frame, and so keys typed here never reach the world's input.
+
+    THIS FRAME IS AN OPAQUE ORIGIN, ON EVERY LANE: the parent mounts it
+    sandboxed without allow-same-origin (src/arcadeEmulator.ts), because
+    engine code and ROM data are external inputs, and a same-origin frame
+    would share the app's DOM, its storage and the desktop shells' IPC
+    bridge — none of which the policy below bounds: it governs what this
+    page may LOAD. So this document's origin reads "null" (self.origin;
+    location.origin is the URL's, which is why the policy below names it);
+    every message goes to the PAGE with the '*' target (there is no name
+    to match, and the page matches what it hears to this frame's window)
+    — the page being the parent of this frame's parent: the frame sits
+    inside a WALL, a document of the page's own with no script in it,
+    whose one policy governs where this frame may navigate (below);
+    there is no storage (EmulatorJS's databases are off) and no download
+    (the sandbox allows scripts and pointer lock, nothing else: a form, a
+    popup or a download is a request to any URL no policy governs), so a
+    save state will leave by postMessage, the page offering the file — a
+    follow-up; and the game arrives as BYTES the parent fetched itself, as
+    the page, and plays from a blob: URL of this document — never as a URL
+    this frame would fetch with no origin to its name. The one request
+    nothing in this frame forbids — its own navigation elsewhere — is the
+    WALL's to refuse: the parent mounts this frame inside a same-origin
+    document of its own whose frame-src names this URL and nothing else
+    (src/arcadeEmulator.ts, emulatorWallPolicy), checked by the browser
+    before any request goes out; a reload of this URL, the one navigation
+    allowed, is torn down by the parent at the second load.
+
+    Protocol with the page (src/arcadeEmulator.ts mountEmulatorFrame):
+      frame → page  { type: 'arcade-frame-ready' }
+      page → frame  { type: 'arcade-config', core, game (a Blob), gameName,
+                      pathToData, allow (origins), volume, isolated, timeoutMs }
+      frame → page  { type: 'arcade-ready' }     the emulator is loaded
+                    { type: 'arcade-started' }   the game runs
+                    { type: 'arcade-exit' }      Escape pressed here
+                    { type: 'arcade-error', why } 'loader' | 'timeout' | 'game'
+    Replay (spectators, src/arcadeReplay.ts), when the config's `replay`
+    is 'source' (player one) or 'follower' (a spectator):
+      source → page  { type: 'arcade-replay-inputs', from, through, inputs: [[frame, player, index, value]] }
+                     { type: 'arcade-replay-hash', frame, hash }
+                     { type: 'arcade-replay-snapshot', frame, state, held: [[player, index, value]], hash }
+      page → source  { type: 'arcade-replay-want-snapshot' }
+                     { type: 'arcade-replay-press', player, index, value }
+      page → follower  the source's inputs and snapshot messages, relayed
+      follower → page  { type: 'arcade-replay-hash', frame, hash }
+                       { type: 'arcade-replay-status', phase, frame, through, loaded?, hash?, matches? }
+    Lockstep (the four-player cabinet, src/arcadeLockstep.ts), when the
+    config's `replay` is 'peer': one seat (replaySeat) of up to four
+    (replaySeats), its own buttons played replayDelay frames late. Every
+    message of an epoch carries its tag (`nonce`):
+      page → peer  { type: 'arcade-replay-begin', nonce, seats }   begin one here
+                   { type: 'arcade-replay-snapshot', nonce, seats, frame, state, held, hash }   join one
+                   { type: 'arcade-replay-inputs', nonce, seat, from, through, inputs }   another seat's
+      peer → page  { type: 'arcade-replay-inputs', nonce, from, through, inputs }   its own seat's
+                   { type: 'arcade-replay-snapshot', nonce, frame, state, held, hash }   on a begin with others
+                   { type: 'arcade-replay-hash', nonce, frame, hash }
+                   { type: 'arcade-replay-status', nonce, phase, frame, through, stalls, waits, iters, loaded?, hash?, matches?, tries? }
+    EmulatorJS itself (GPL-3.0) is NOT in this repository: pathToData names
+    this station's /emulatorjs/data/ (scripts/fetch-emulatorjs.mjs) or
+    cdn.emulatorjs.org, the owner's call per cabinet — the CDN only in a
+    build with the convenience lanes on (src/sovereignty.ts; the default is
+    serverless sources only); `isolated` in the config says the engine is
+    another origin's code, which is what the player's consent to hand it
+    their own file is about.
+
+    This page is opened at ONE path with nothing in a query, on every lane
+    (frame-src, which the wall enforces, ignores a query — a policy chosen
+    by one could be swapped by a self-navigation to the same path), and it
+    sets its content-security policy itself, on receipt of the page's
+    config and before the loader is fetched: the engine, its cores and the
+    game come from this page's own origin, blob: and data:, plus the origins
+    the config names (`allow`: the engine's origin where it is another —
+    the CDN lane — and the viewer's own node; http(s) origins the page
+    already reduced, emulatorFrameOrigins, and this page checks again) —
+    and nothing else: no update check, no netplay server, no other third
+    party. Every directive names this page's origin outright, beside
+    'self', since 'self' is whatever the browser makes of an opaque origin.
+    Scripts keep 'unsafe-eval' and 'wasm-unsafe-eval' for the cores. A
+    document that arrives here by a self-navigation runs this script alone,
+    receives no config (the page configures a frame once), sets no policy
+    and loads nothing, and is torn down at the second load. An opaque
+    origin's fetches carry `Origin: null`, so the station serves
+    /emulatorjs/ with Access-Control-Allow-Origin (vite.config.ts for dev
+    and preview; a deployment the same) — the engine and its cores, public
+    files, and nothing else needs it: the game never crosses as a URL. A
+    policy in a meta element governs every fetch after its insertion; the
+    cabinet's smoke checks that a fetch to another server is refused under
+    it, that the origin here reads null, and that the parent is out of
+    reach.
+    EmulatorJS itself has not run under this policy in this repository (its
+    files are never here): the spike that fetches them is where a directive
+    it needs would show, as a console refusal naming it.
+  -->
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #game { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <script>
+    (function () {
+      // The policy, set on receipt of the page's config and before the
+      // loader is fetched — on every lane. Every directive names this page's
+      // own origin outright, beside 'self' (this document's origin is
+      // opaque, and 'self' is whatever the browser makes of that), and the
+      // origins the config names: the engine's where it is another (the
+      // CDN lane) and the viewer's own node, checked again here. Nothing
+      // comes from this page's URL (the header).
+      var isOrigin = function (o) { return typeof o === 'string' && /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/.test(o); };
+      function setPolicy(allowed) {
+        var origins = (Array.isArray(allowed) ? allowed : []).filter(isOrigin);
+        try {
+          // Ours is http(s) in a browser and in the desktop app on Windows
+          // (http://tauri.localhost), and tauri://localhost in the desktop
+          // app on Linux and macOS, which only this frame may name.
+          var here = new URL(location.href).origin;
+          if ((isOrigin(here) || here === 'tauri://localhost') && origins.indexOf(here) < 0) origins.push(here);
+        } catch (err) { /* no origin of our own to name */ }
+        var allow = origins.join(' ');
+        var reach = "'self' blob: data:" + (allow ? ' ' + allow : '');
+        var meta = document.createElement('meta');
+        meta.httpEquiv = 'Content-Security-Policy';
+        meta.content = [
+          'default-src ' + reach,
+          'script-src ' + reach + " 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'",
+          'style-src ' + reach + " 'unsafe-inline'",
+          'img-src ' + reach,
+          'media-src ' + reach,
+          'connect-src ' + reach,
+          'font-src ' + reach,
+          'worker-src ' + reach,
+          'child-src ' + reach,
+          "frame-src 'none'",
+          "object-src 'none'",
+          "base-uri 'none'",
+          "form-action 'none'",
+        ].join('; ');
+        document.head.appendChild(meta);
+      }
+      // The page that mounted this frame is beyond the WALL (the header):
+      // window.parent is the wall, a document of the page's own with no
+      // script in it, and the page is the wall's parent — the same window
+      // when there is no wall. An opaque origin has no name a target could
+      // match: '*' it is. The page matches what it hears to this frame's
+      // window, and nothing posted from here is the page's to leak.
+      var pageWin = window.parent.parent;
+      function post(type, extra) {
+        var msg = { type: type };
+        if (extra) for (var k in extra) msg[k] = extra[k];
+        pageWin.postMessage(msg, '*');
+      }
+      // ── 👀 Replay: spectators watch by replaying player one's inputs ──────
+      // (src/arcadeReplay.ts has the contract and the page's checks.) Player
+      // one's frame (role 'source') records every input it applies with the
+      // emulator's frame counter at that moment, posts them in batches with
+      // `through` (every input at or before it is sent), hashes its state
+      // every hashEvery frames and hands out a save state on request. A
+      // spectator's frame (role 'follower') loads that save state, then runs
+      // a frame only once every input before it is in hand, applying each
+      // at the frame it was stamped with — so the two run the same program
+      // on the same inputs and should hash alike.
+      //
+      // The hooks are Emscripten's main-loop callbacks, which the runtime
+      // reads ONCE as it starts: so they go into the options EmulatorJS
+      // hands the core's factory (window.EJS_Runtime, which the core's
+      // script defines and EmulatorJS calls), not onto the Module after.
+      // A pre-hook returning false skips that iteration whole: the core does
+      // not run and the frame counter does not move. One iteration runs one
+      // frame; a save state loaded between iterations is in place by the
+      // next one's pre-hook, and that iteration may run no frame of its own
+      // though the counter moves on — always, on an emulator held since it
+      // started; sometimes, on a running one (all measured on fceumm).
+      var hooks = { pre: null, post: null };
+      function hookMainLoop() {
+        var factory = null;
+        Object.defineProperty(window, 'EJS_Runtime', {
+          configurable: true,
+          get: function () {
+            if (!factory) return undefined;
+            return function (opts) {
+              opts.preMainLoop = function () { return hooks.pre ? hooks.pre() : undefined; };
+              opts.postMainLoop = function () { if (hooks.post) hooks.post(); };
+              return factory(opts);
+            };
+          },
+          set: function (v) { factory = v; },
+        });
+      }
+      // FNV-1a 32 over the state bytes, `hex:length` (replayStateHash).
+      function stateHash(b) {
+        var h = 0x811c9dc5;
+        for (var i = 0; i < b.length; i++) { h ^= b[i]; h = Math.imul(h, 0x01000193) >>> 0; }
+        return h.toString(16) + ':' + b.length;
+      }
+      var replay = null;
+      function startReplay(role, c) {
+        var gm = window.EJS_emulator && window.EJS_emulator.gameManager;
+        // The replay stands on save states (a late joiner starts from one,
+        // and the hashes are of one): a core that cannot make them cannot
+        // be replayed. EmulatorJS asks the core the same way before it
+        // offers its own save, load and netplay buttons.
+        if (!gm || !gm.functions || typeof gm.functions.simulateInput !== 'function' || typeof gm.supportsStates !== 'function' || !gm.supportsStates()) {
+          post('arcade-replay-status', { phase: 'unsupported' });
+          return;
+        }
+        var hashEvery = c.replayHashEvery > 0 ? c.replayHashEvery | 0 : 60;
+        var lead = c.replayLead >= 0 ? c.replayLead | 0 : 12;
+        var batchFrames = c.replayBatchFrames > 0 ? c.replayBatchFrames | 0 : 6;
+        var apply = gm.functions.simulateInput;
+        // Whether the game in this frame is its own (player one's, or seat
+        // 0's before lockstep) rather than one following another's.
+        var ownGame = role === 'source';
+        // The state as bytes, or null. EmulatorJS's getState hands back the
+        // core's error message, a string, when a save fails: then the
+        // replay stops and says so (`unsupported`). A game of its own goes
+        // on as if no replay had started, its hotkeys back too; one that
+        // follows (a spectator, a seat in lockstep) holds where it is.
+        function stateNow() {
+          var st = gm.getState();
+          if (st instanceof Uint8Array && st.length > 0) return st;
+          if (ownGame) {
+            gm.functions.simulateInput = apply;
+            gm.simulateInput = gmSimulate;
+          }
+          hooks.pre = ownGame ? null : function () { return false; };
+          hooks.post = null;
+          replay = null;
+          post('arcade-replay-status', { phase: 'unsupported' });
+          return null;
+        }
+        // EmulatorJS's own hotkeys (indices 24–29: save, load, fast-forward,
+        // rewind, slow motion) bend time or swap the state under the replay:
+        // dropped on both sides while a replay runs.
+        var gmSimulate = gm.simulateInput.bind(gm);
+        gm.simulateInput = function (p, i, v) { if (i <= 23) gmSimulate(p, i, v); };
+        if (role === 'source') {
+          var held = {};
+          var pending = [];
+          var lastBatch = gm.getFrameNum();
+          // Batches tile the frames: each starts where the last one ended.
+          var nextFrom = lastBatch;
+          var wantSnapshot = false;
+          // Every input route (keyboard, gamepad, touch) ends here: record
+          // it with the frame it lands before. A stick comes as 0x7fff times
+          // its axis, a fraction, and the core takes an int (the call into
+          // wasm truncates it): the int is what is recorded and applied.
+          gm.functions.simulateInput = function (p, i, v) {
+            v = v | 0;
+            pending.push([gm.getFrameNum(), p, i, v]);
+            held[p + ':' + i] = [p, i, v];
+            return apply(p, i, v);
+          };
+          hooks.post = function () {
+            var f = gm.getFrameNum();
+            if (wantSnapshot) {
+              wantSnapshot = false;
+              var st = stateNow();
+              if (!st) return;
+              var heldRows = [];
+              for (var k in held) if (held[k][2] !== 0) heldRows.push(held[k]);
+              pageWin.postMessage({ type: 'arcade-replay-snapshot', frame: f, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
+            }
+            if (f % hashEvery === 0) {
+              var hashed = stateNow();
+              if (!hashed) return;
+              post('arcade-replay-hash', { frame: f, hash: stateHash(hashed) });
+            }
+            // An input stamped f arrives after this hook (between
+            // iterations), so everything up to f - 1 is final now.
+            if (f - lastBatch >= batchFrames) {
+              post('arcade-replay-inputs', { from: nextFrom, through: f - 1, inputs: pending });
+              pending = [];
+              lastBatch = f;
+              nextFrom = f;
+            }
+          };
+          replay = { role: role, want: function () { wantSnapshot = true; }, press: function (p, i, v) { gm.simulateInput(p, i, v); } };
+        } else if (role === 'peer') {
+          // ── 🕹🕹🕹🕹 Lockstep: every seated player runs the game ────────────
+          // A peer's frame (role 'peer') is one seat of up to four. Its own
+          // player's buttons (player one's controls, whoever plays) are
+          // played AS its seat, never at once: each is stamped `delay`
+          // frames ahead — the frame counter now plus delay — and posted in
+          // batches like a source's. A frame runs only once every OTHER
+          // seat's batches cover it, so every peer applies the same buttons
+          // at the same frames, in seat order, and hashes alike.
+          //
+          // A game in step is an EPOCH: a save state, the seats that start
+          // from it, and a tag (`nonce`) every message of it carries. Every
+          // seat starts held ('waiting'). The page names one seat to begin
+          // (`arcade-replay-begin` with the epoch's tag and seats): alone,
+          // it plays at once ('free'); with others, it saves its state,
+          // posts it, and holds at that frame for their buttons. The others
+          // load that state (`arcade-replay-snapshot`) and join there. A
+          // seat that comes or goes, or a hash that disagrees, is a new
+          // epoch from whichever seat the page names — from any phase, so
+          // a game in step re-begins where it stands and the seats load it
+          // again. Nothing of an older epoch counts in a newer one.
+          var seat = c.replaySeat | 0;
+          var seats = c.replaySeats | 0;
+          var delay = c.replayDelay >= 1 ? c.replayDelay | 0 : 8;
+          if (!(seats >= 1 && seats <= 4 && seat >= 0 && seat < seats)) {
+            post('arcade-replay-status', { phase: 'unsupported' });
+            return;
+          }
+          var phase = 'waiting';
+          ownGame = false;
+          // The epoch: its tag, its seats (ascending), the frame it starts at.
+          var nonce = '';
+          var active = [];
+          var start = 0;
+          // Buttons by frame, then by seat; and how far each other seat's
+          // batches reach.
+          var queue = {};
+          var thru = {};
+          var offset = 0;
+          var snap = null;
+          var loadTries = 0;
+          var LOAD_RETRY = 8;
+          var LOAD_TRIES = 240;
+          var applying = false;
+          var lastStatus = 0;
+          var pending = [];
+          var nextFrom = 0;
+          var lastBatch = 0;
+          var wantBegin = null;
+          // Whether a load has landed and no frame is yet seen run on it.
+          var settling = false;
+          // What feed has applied and holds down now, every seat's, with its
+          // value: an epoch's save state carries it, as a save state cannot.
+          var down = {};
+          // How the lockstep went: times it had to wait, and the iterations
+          // it waited (a frame skipped is a stutter on screen).
+          var stalls = 0;
+          var waits = 0;
+          var iters = 0;
+          function feed(p, i, v) {
+            if (v !== 0) down[p + ':' + i] = [p, i, v];
+            else delete down[p + ':' + i];
+            applying = true;
+            try { apply(p, i, v); } finally { applying = false; }
+          }
+          function at() { return gm.getFrameNum() + offset; }
+          function inEpoch(k) { return active.indexOf(k) >= 0; }
+          function enqueue(k, row) {
+            var f = row[0];
+            if (f < start) return;
+            var bySeat = queue[f] || (queue[f] = {});
+            (bySeat[k] || (bySeat[k] = [])).push([row[1], row[2], row[3]]);
+          }
+          function status(extra) {
+            var others = Infinity;
+            for (var n = 0; n < active.length; n++) {
+              var k = active[n];
+              if (k !== seat && thru[k] < others) others = thru[k];
+            }
+            var m = { nonce: nonce, phase: phase, frame: at(), through: others === Infinity ? -1 : others, stalls: stalls, waits: waits, iters: iters };
+            if (extra) for (var x in extra) m[x] = extra[x];
+            post('arcade-replay-status', m);
+          }
+          // A new epoch from `from`: nothing of the last one carries over —
+          // its buttons, the batches heard, this seat's own unsent presses
+          // (what the player holds now goes in again: reconcile, below).
+          function enter(tag, seatList, from) {
+            nonce = tag;
+            active = seatList.slice();
+            start = from;
+            queue = {};
+            thru = {};
+            for (var n = 0; n < active.length; n++) thru[active[n]] = from - 1;
+            pending = [];
+            nextFrom = from;
+            lastBatch = from;
+            lastAt = {};
+            settling = false;
+          }
+          // Everything stamped at or before now + delay - 1 is final: a
+          // button pressed from here on lands at now + delay or later. A
+          // batch goes out with any buttons in it, every batchFrames frames
+          // without, and whenever this peer stalls — the others may be
+          // waiting on exactly that.
+          function flush() {
+            var through = at() + delay - 1;
+            if (through < nextFrom) return;
+            var out = [];
+            var keep = [];
+            for (var r = 0; r < pending.length; r++) (pending[r][0] <= through ? out : keep).push(pending[r]);
+            post('arcade-replay-inputs', { nonce: nonce, from: nextFrom, through: through, inputs: out });
+            pending = keep;
+            nextFrom = through + 1;
+            lastBatch = at();
+          }
+          // The page's word to begin an epoch here, between two frames (the
+          // pre-hook runs in every phase but a load's, so a held seat can
+          // begin too): alone, the game is this seat's to play at once;
+          // with others, the state now is every seat's start.
+          function begin() {
+            var b = wantBegin;
+            wantBegin = null;
+            // A seat the epoch leaves out lets go of what it held: nobody
+            // will send its release.
+            for (var dk in down) if (b.seats.indexOf(down[dk][0]) < 0) feed(down[dk][0], down[dk][1], 0);
+            if (b.seats.length < 2) {
+              enter(b.nonce, [seat], at());
+              phase = 'free';
+              ownGame = true;
+              reconcile();
+              status();
+              return;
+            }
+            var st = stateNow();
+            if (!st) return;
+            var heldRows = [];
+            for (var hk in down) heldRows.push(down[hk]);
+            enter(b.nonce, b.seats, at());
+            phase = 'lockstep';
+            ownGame = false;
+            pageWin.postMessage({ type: 'arcade-replay-snapshot', nonce: nonce, frame: start, state: st, held: heldRows, hash: stateHash(st) }, '*', [st.buffer]);
+            reconcile();
+            status();
+          }
+          // The frame each button last changed at. A press and a release
+          // that would land on one frame (both made while this seat held a
+          // frame for the others, say) go to one frame after another
+          // instead, or the core would never see the tap. A stick needs no
+          // such care: where it ends up is what counts.
+          var lastAt = {};
+          // What the player holds now, by input, whatever the phase. An
+          // epoch starts from what its leading seat had played, which can
+          // miss this seat's latest: a change stamped ahead and not yet
+          // played (a release as a player sits down, say), or one made
+          // while it loaded.
+          var mine = {};
+          function stamp(i, v) {
+            var f = at() + delay;
+            if (i < 16) {
+              if (lastAt[i] !== undefined && f <= lastAt[i]) f = lastAt[i] + 1;
+              lastAt[i] = f;
+            }
+            var row = [f, seat, i, v];
+            pending.push(row);
+            enqueue(seat, row);
+          }
+          // The local player's buttons: player one's controls, played as
+          // this seat. Alone ('free') they play at once; in step they are
+          // stamped ahead; held or loading, they wait for the next epoch.
+          gm.functions.simulateInput = function (p, i, v) {
+            v = v | 0; // a stick's fraction, as the core takes it (as the source's)
+            if (applying) return apply(p, i, v);
+            if (p !== 0) return;
+            if (v !== 0) mine[i] = v;
+            else delete mine[i];
+            if (phase === 'free') return feed(seat, i, v);
+            if (phase !== 'lockstep' && phase !== 'stalled') return;
+            stamp(i, v);
+          };
+          // Into an epoch: whatever of this seat's its start holds other
+          // than the player does now is played again, as a change made now
+          // (at once alone, stamped ahead in step) — or a button let go
+          // just before would stay down, with no key left to let go of.
+          function reconcile() {
+            var want = {};
+            for (var dk in down) if (down[dk][0] === seat) want[down[dk][1]] = 0;
+            for (var mk in mine) want[mk] = mine[mk];
+            for (var k in want) {
+              var has = down[seat + ':' + k];
+              if ((has ? has[2] : 0) === want[k]) continue;
+              if (phase === 'free') feed(seat, +k, want[k]);
+              else stamp(+k, want[k]);
+            }
+          }
+          // A load has landed when the state is the one the epoch began
+          // from: this seat is at the epoch's start, holding what it held.
+          function land(h) {
+            offset = snap.frame - gm.getFrameNum();
+            // Let go of what the epoch does not hold, then hold what it
+            // does: this seat's own buttons from a game alone included.
+            for (var d in down) if (!snap.held.some(function (r) { return r[0] + ':' + r[1] === d; })) feed(down[d][0], down[d][1], 0);
+            for (var q = 0; q < snap.held.length; q++) feed(snap.held[q][0], snap.held[q][1], snap.held[q][2]);
+            // The epoch began when its state came (snapshot, below), so the
+            // batches heard while it loaded are its own and stay.
+            nextFrom = start;
+            lastBatch = start;
+            pending = [];
+            lastAt = {};
+            phase = 'stalled';
+            settling = true;
+            reconcile();
+            status({ loaded: snap.frame, hash: h, matches: true, tries: loadTries });
+          }
+          hooks.pre = function () {
+            // A load in a running emulator is in place by the next pre-hook,
+            // and the iteration would run a frame on top of it before the
+            // post-hook could tell (measured on fceumm): so it is looked for
+            // here first, and a load found here starts the epoch before any
+            // frame runs. The post-hook looks too, for one that lands later.
+            if (phase === 'loading') {
+              var cur = stateNow();
+              if (!cur) return false;
+              var h = stateHash(cur);
+              if (h !== snap.hash) return undefined;
+              land(h);
+            }
+            if (wantBegin) begin();
+            if (phase === 'free') return undefined;
+            if (phase === 'waiting') return false;
+            iters += 1;
+            var s = at();
+            // Frame s + 1 runs next: every other seat's buttons through s
+            // must be in hand. This seat's own are, by construction.
+            for (var n = 0; n < active.length; n++) {
+              var k = active[n];
+              if (k === seat || thru[k] >= s) continue;
+              if (phase !== 'stalled') { phase = 'stalled'; stalls += 1; }
+              waits += 1;
+              flush();
+              var now = Date.now();
+              if (now - lastStatus > 1000) { lastStatus = now; status(); }
+              return false;
+            }
+            phase = 'lockstep';
+            var bySeat = queue[s];
+            if (bySeat) {
+              for (var m = 0; m < active.length; m++) {
+                var rows = bySeat[active[m]];
+                if (rows) for (var r = 0; r < rows.length; r++) feed(rows[r][0], rows[r][1], rows[r][2]);
+              }
+              delete queue[s];
+            }
+            return undefined;
+          };
+          hooks.post = function () {
+            if (phase === 'loading') {
+              // As a spectator's load (below): asked again every LOAD_RETRY
+              // iterations until it lands, and after LOAD_TRIES it holds and
+              // says the load failed (the page may hand it the state again).
+              loadTries += 1;
+              var cur = stateNow();
+              if (!cur) return;
+              var h = stateHash(cur);
+              if (h === snap.hash) { land(h); return; }
+              if (loadTries < LOAD_TRIES) {
+                if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+                return;
+              }
+              phase = 'waiting';
+              status({ loaded: snap.frame, hash: h, matches: false, tries: loadTries });
+              return;
+            }
+            var now = Date.now();
+            if (phase === 'free') {
+              if (now - lastStatus > 1000) { lastStatus = now; status(); }
+              return;
+            }
+            if (phase !== 'lockstep' && phase !== 'stalled') return;
+            // The iteration after a load sometimes runs no frame though the
+            // frame counter moves on (always, on an emulator held since it
+            // started): the state is still the epoch's start, and so is
+            // this seat — the start's buttons, fed already, stay held.
+            if (settling) {
+              var still = stateNow();
+              if (!still) return;
+              if (stateHash(still) === snap.hash) offset = start - gm.getFrameNum();
+              else settling = false;
+            }
+            var s = at();
+            if (pending.length || s - lastBatch >= batchFrames) flush();
+            if (s % hashEvery === 0) {
+              var hashed = stateNow();
+              if (!hashed) return;
+              post('arcade-replay-hash', { nonce: nonce, frame: s, hash: stateHash(hashed) });
+            }
+            if (now - lastStatus > 1000) { lastStatus = now; status(); }
+          };
+          // The page's messages carry plain data it checked: a tag, seats
+          // within the cabinet's, frames, rows. A seat list must hold this
+          // seat — an epoch it is not in is not its to begin or join.
+          function seatList(v) {
+            if (!Array.isArray(v) || v.length < 1 || v.length > seats) return null;
+            var out = [];
+            for (var n = 0; n < v.length; n++) {
+              var k = v[n];
+              if (typeof k !== 'number' || (k | 0) !== k || k < 0 || k >= seats || out.indexOf(k) >= 0) return null;
+              out.push(k);
+            }
+            if (out.indexOf(seat) < 0) return null;
+            return out.sort(function (a, b) { return a - b; });
+          }
+          function isTag(v) { return typeof v === 'string' && /^[0-9a-z]{1,16}$/.test(v); }
+          replay = {
+            role: role,
+            begin: function (d) {
+              var list = seatList(d.seats);
+              if (!isTag(d.nonce) || !list) return;
+              wantBegin = { nonce: d.nonce, seats: list };
+            },
+            press: function (p, i, v) { gm.simulateInput(p, i, v); },
+            inputs: function (d) {
+              var k = d.seat;
+              if (d.nonce !== nonce || typeof k !== 'number' || k === seat || !inEpoch(k)) return;
+              if (typeof d.from !== 'number' || typeof d.through !== 'number' || !Array.isArray(d.inputs)) return;
+              // Batches must tile: one that starts past what this seat holds
+              // leaves a gap, and waits for one that covers it. What it holds
+              // already is not queued twice.
+              if (d.from > thru[k] + 1) return;
+              for (var n = 0; n < d.inputs.length; n++) {
+                var row = d.inputs[n];
+                if (Array.isArray(row) && row[1] === k && row[0] > thru[k] && row[0] <= d.through) enqueue(k, row);
+              }
+              if (d.through > thru[k]) thru[k] = d.through;
+            },
+            snapshot: function (d) {
+              var list = seatList(d.seats);
+              if (!isTag(d.nonce) || !list) return;
+              if (!(d.state instanceof Uint8Array) || !Array.isArray(d.held) || typeof d.frame !== 'number' || typeof d.hash !== 'string') return;
+              // The epoch this seat is in already, or loading: a second copy
+              // changes nothing — unless the last load failed (held again).
+              if (d.nonce === nonce && phase !== 'waiting') return;
+              wantBegin = null;
+              snap = { frame: d.frame, state: d.state, held: d.held, hash: d.hash };
+              loadTries = 0;
+              enter(d.nonce, list, d.frame);
+              ownGame = false;
+              gm.loadState(d.state);
+              phase = 'loading';
+            },
+          };
+        } else {
+          var queue = {};
+          var through = -1;
+          var offset = 0;
+          var phase = 'waiting';
+          var snap = null;
+          var loadTries = 0;
+          var LOAD_RETRY = 8;
+          var LOAD_TRIES = 240;
+          var applying = false;
+          var lastStatus = 0;
+          // What the replay holds down on this emulator now: a save state
+          // carries none of it, so a load has to set it to player one's.
+          var down = {};
+          // Nothing local drives a spectator's emulator: only the replay.
+          gm.functions.simulateInput = function (p, i, v) { if (applying) return apply(p, i, v); };
+          function feed(p, i, v) {
+            if (v !== 0) down[p + ':' + i] = [p, i];
+            else delete down[p + ':' + i];
+            applying = true;
+            try { apply(p, i, v); } finally { applying = false; }
+          }
+          function status(extra) {
+            var m = { phase: phase, frame: gm.getFrameNum() + offset, through: through };
+            if (extra) for (var k in extra) m[k] = extra[k];
+            post('arcade-replay-status', m);
+          }
+          hooks.pre = function () {
+            if (phase === 'waiting') return false;
+            if (phase === 'loading') return undefined;
+            var s = gm.getFrameNum() + offset;
+            // Frame s + 1 runs next: every input stamped s must be in hand.
+            if (through < s) {
+              if (phase !== 'stalled') { phase = 'stalled'; status(); }
+              return false;
+            }
+            // Out of a stall, wait for `lead` frames of input before going
+            // on, so one late batch is one pause and not a stutter.
+            if (phase === 'stalled' && through < s + lead) return false;
+            if (phase !== 'running') { phase = 'running'; status(); }
+            var rows = queue[s];
+            if (rows) {
+              for (var r = 0; r < rows.length; r++) feed(rows[r][0], rows[r][1], rows[r][2]);
+              delete queue[s];
+            }
+            return undefined;
+          };
+          hooks.post = function () {
+            if (phase === 'loading') {
+              // A save state lands between a frame and this hook, and the
+              // iteration that lands it runs no frame after it: so it has
+              // landed when the state IS player one's. On a fresh spectator
+              // that is the first iteration. On a running one EmulatorJS
+              // sometimes drops the load outright (measured on fceumm: no
+              // sign of it 120 iterations on), and asking again lands it —
+              // so it asks again every LOAD_RETRY iterations until the
+              // state matches (17 to 57 iterations in the runs). The frames
+              // run while it waits ran on the old state, which the load
+              // throws away. After LOAD_TRIES, about four seconds, it gives
+              // up: it holds where it is and says the load failed
+              // (`matches: false`), for the page to hand it a fresh one.
+              loadTries += 1;
+              var cur = stateNow();
+              if (!cur) return;
+              var h = stateHash(cur);
+              if (h !== snap.hash) {
+                if (loadTries < LOAD_TRIES) {
+                  if (loadTries % LOAD_RETRY === 0) gm.loadState(snap.state);
+                  return;
+                }
+                phase = 'waiting';
+                status({ loaded: snap.frame, hash: h, matches: false, tries: loadTries });
+                return;
+              }
+              offset = snap.frame - gm.getFrameNum();
+              // Let go of what player one does not hold, then hold what it
+              // does: after a drift, the old state's buttons are stale too.
+              for (var d in down) if (!snap.held.some(function (r) { return r[0] + ':' + r[1] === d; })) feed(down[d][0], down[d][1], 0);
+              for (var k = 0; k < snap.held.length; k++) feed(snap.held[k][0], snap.held[k][1], snap.held[k][2]);
+              for (var q in queue) if (+q < snap.frame) delete queue[q];
+              phase = 'stalled';
+              status({ loaded: snap.frame, hash: h, matches: true, tries: loadTries });
+              return;
+            }
+            var s = gm.getFrameNum() + offset;
+            if (s % hashEvery === 0) {
+              var hashed = stateNow();
+              if (!hashed) return;
+              post('arcade-replay-hash', { frame: s, hash: stateHash(hashed) });
+            }
+            var now = Date.now();
+            if (now - lastStatus > 1000) { lastStatus = now; status(); }
+          };
+          replay = {
+            role: role,
+            inputs: function (d) {
+              if (typeof d.through !== 'number' || !Array.isArray(d.inputs)) return;
+              for (var n = 0; n < d.inputs.length; n++) {
+                var row = d.inputs[n];
+                (queue[row[0]] || (queue[row[0]] = [])).push([row[1], row[2], row[3]]);
+              }
+              if (d.through > through) through = d.through;
+            },
+            snapshot: function (d) {
+              if (!(d.state instanceof Uint8Array) || !Array.isArray(d.held) || typeof d.frame !== 'number') return;
+              snap = d;
+              loadTries = 0;
+              gm.loadState(d.state);
+              phase = 'loading';
+            },
+          };
+        }
+      }
+      window.addEventListener('message', function (e) {
+        if (e.source !== pageWin || !e.data || !replay) return;
+        var d = e.data;
+        if (replay.role === 'source') {
+          if (d.type === 'arcade-replay-want-snapshot') replay.want();
+          else if (d.type === 'arcade-replay-press' && typeof d.player === 'number') replay.press(d.player, d.index, d.value);
+        } else if (replay.role === 'peer') {
+          if (d.type === 'arcade-replay-inputs') replay.inputs(d);
+          else if (d.type === 'arcade-replay-snapshot') replay.snapshot(d);
+          else if (d.type === 'arcade-replay-begin') replay.begin(d);
+          else if (d.type === 'arcade-replay-press' && typeof d.player === 'number') replay.press(d.player, d.index, d.value);
+        } else {
+          if (d.type === 'arcade-replay-inputs') replay.inputs(d);
+          else if (d.type === 'arcade-replay-snapshot') replay.snapshot(d);
+        }
+      });
+      var started = false;
+      window.addEventListener('message', function (e) {
+        if (e.source !== pageWin || !e.data || e.data.type !== 'arcade-config' || started) return;
+        started = true;
+        var c = e.data;
+        // The policy first: before the game's blob: URL, before the loader.
+        setPolicy(c.allow);
+        // The game: the bytes the parent fetched, or the player's own file,
+        // as a blob: URL of this document — gone with the frame.
+        var gameUrl;
+        try { gameUrl = URL.createObjectURL(c.game); } catch (err) { post('arcade-error', { why: 'game' }); return; }
+        window.EJS_player = '#game';
+        window.EJS_core = c.core;
+        window.EJS_gameUrl = gameUrl;
+        window.EJS_gameName = c.gameName;
+        window.EJS_pathtodata = c.pathToData;
+        window.EJS_startOnLoaded = true;
+        window.EJS_backgroundColor = '#000000';
+        window.EJS_color = '#d4a84b';
+        window.EJS_volume = typeof c.volume === 'number' ? c.volume : 0.7;
+        // Its netplay is WebRTC with its own signalling and TURN, marked
+        // unstable upstream: not depended on (plan §9). Hide the button.
+        window.EJS_Buttons = { netplay: false };
+        // An opaque origin has no storage of its own, and the sandbox
+        // refuses downloads (EmulatorJS's export): a save state will leave
+        // by postMessage, the page offering the file — a follow-up; a
+        // station-side store comes with the blob lane.
+        window.EJS_disableDatabases = true;
+        window.EJS_disableLocalStorage = true;
+        // EmulatorJS 4.2.1 reads window.localStorage BEFORE it looks at its
+        // own switch above, and in an opaque origin that read throws: the
+        // engine died at startup under this frame's sandbox. A storage of
+        // this frame's own, in memory and gone with it, answers instead.
+        try {
+          void window.localStorage;
+        } catch (err) {
+          var mem = {};
+          Object.defineProperty(window, 'localStorage', {
+            configurable: true,
+            value: {
+              getItem: function (k) { return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; },
+              setItem: function (k, v) { mem[k] = String(v); },
+              removeItem: function (k) { delete mem[k]; },
+              clear: function () { mem = {}; },
+              key: function (i) { var ks = Object.keys(mem); return i < ks.length ? ks[i] : null; },
+              get length() { return Object.keys(mem).length; },
+            },
+          });
+        }
+        window.EJS_ready = function () { post('arcade-ready'); };
+        var replayRole = c.replay === 'source' || c.replay === 'follower' || c.replay === 'peer' ? c.replay : null;
+        if (replayRole) hookMainLoop();
+        // EmulatorJS focuses its player when the game starts, and focus in
+        // this frame is the keyboard leaving the world: a spectator's frame,
+        // which takes no input, mounts while its avatar is walking past and
+        // must not take the keys with it (the spike caught it doing so).
+        // A lockstep peer's page decides which frame has the keys, too.
+        if (replayRole === 'follower' || replayRole === 'peer') window.EJS_noAutoFocus = true;
+        window.EJS_onGameStart = function () {
+          if (replayRole) startReplay(replayRole, c);
+          post('arcade-started');
+        };
+        var s = document.createElement('script');
+        s.src = c.pathToData + 'loader.js';
+        s.onerror = function () { post('arcade-error', { why: 'loader' }); };
+        document.body.appendChild(s);
+        // A loader that never calls back (no engine behind it, a dead CDN,
+        // a game the core refuses) is a failure too.
+        var budget = typeof c.timeoutMs === 'number' ? c.timeoutMs : 45000;
+        var startedAt = Date.now();
+        var watch = setInterval(function () {
+          if (window.EJS_emulator && window.EJS_emulator.started) { clearInterval(watch); return; }
+          if (Date.now() - startedAt > budget) {
+            clearInterval(watch);
+            post('arcade-error', { why: window.EJS_emulator ? 'game' : 'timeout' });
+          }
+        }, 1000);
+      });
+      // Escape leaves the cabinet (the parent stands P1 up and closes the
+      // stage). Captured before the emulator sees it.
+      window.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); post('arcade-exit'); }
+      }, true);
+      post('arcade-frame-ready');
+    })();
+  </script>
+</body>
+</html>

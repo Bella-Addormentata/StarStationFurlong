@@ -74,8 +74,8 @@ import {
 import type { GateAccess } from './doorPolicy';
 import { ROOM_SESSION_OPEN_MS } from './roomSession';
 import { GUARD_BAND_MS, legWindowAfter, pauseCheckpoint, skipCheckpoint, startCheckpoint } from './pilotRoute';
-import { CAST_OFF_LATE_MS, KEEPER_RETRY_MS, keeperStep, type KeeperStep } from './routeKeeper';
-import { TANK_CAPACITY } from './shipDoc';
+import { CAST_OFF_LATE_MS, KEEPER_RETRY_MS, keeperStep, type KeeperPassDeps, type KeeperStep } from './routeKeeper';
+import { CAST_OFF_HOLD_MS, TANK_CAPACITY } from './shipDoc';
 import { readRememberedMoves, type StationMove } from './stationMove';
 import {
   MIN_WAIT_SECS,
@@ -468,6 +468,24 @@ describe("the ferry's own view, and what the gate does with its keeper's step", 
     own.getMap('ship').set('route', routeToWire({ ...R, stops: [stop(0, 0), stop(1, 1, { berth: { roomId: HERE, farDoor: 'x+', anyGate: false } })] }));
     expect(moveAt(own, { 'x+': 'Cargo Bay' }))
       .toMatchObject({ kind: 'none', why: 'overlap', gate: { doorId: 'x+' }, module: 'Cargo Bay' });
+  });
+
+  // 🚚🎚️ Riders' keepers skip a stop whose station has left the orbit the
+  // route copied of it (another planet, or another altitude since:
+  // routeKeeper.stopStationMoved), and the station's keeper docks nothing
+  // there either.
+  it('docks nowhere at a stop whose station has left the orbit the route copied of it', () => {
+    const t = ARRIVE + GATE_DOCK_DEFER_MS;
+    const look = ferryLook({ doc: ferryDoc(), capacity: BIG, now: t, sameStation, memory: null })!;
+    const step = keeperStep(look.view);
+    const moveIf = (moved?: boolean) => gateMove({
+      step, look, gates: gates(memoryOf(T0 - HOUR)), roomId: HERE, shipRoomId: FERRY, near, now: t,
+      ...(moved !== undefined ? { moved } : {}),
+    });
+    expect(step).toEqual({ kind: 'dock' });
+    expect(moveIf()).toMatchObject({ kind: 'dock', gate: { doorId: 'x+' } });
+    expect(moveIf(false)).toMatchObject({ kind: 'dock', gate: { doorId: 'x+' } });
+    expect(moveIf(true)).toEqual({ kind: 'none', why: 'moved' });
   });
 
   it('docks nowhere while one of its gates holds a claim on the ferry (a DOCK under way)', () => {
@@ -1045,6 +1063,127 @@ describe('docking from the station side', () => {
     expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
   });
 
+  // Copilot (PR 204, after merge): a DEPART begun at the ferry's helm while
+  // the dock is under way has the ferry's docks until it ends (its shared
+  // cast-off hold), as the keeper's look stands aside for one: the claim is
+  // taken back before the ferry's side is asked, or a dock that landed
+  // meanwhile is withdrawn at both ends, so the ferry never flies off from a
+  // gate still holding it.
+  describe("a DEPART begun at the ferry's helm meanwhile", () => {
+    const depart = (ferry: Y.Doc, at = D0 - SEC) => { ferry.getMap('ship').set('castOff', { by: 'depart-1', at }); };
+    const released = () =>
+      buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 });
+
+    it('takes the claim back, asking nothing of the ferry, when it begins while the claim settles', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      const r = await dock(station, ferry, { wait: async () => { depart(ferry); } });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(leftStop0());
+    });
+
+    it('withdraws the dock at both ends when it begins while the dock settles', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let n = 0;
+      const r = await dock(station, ferry, { wait: async () => { if (++n === 2) depart(ferry); } });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(released());
+    });
+
+    it("withdraws the dock at both ends when it begins while the ferry's side goes unacknowledged", async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      const r = await stationDock({
+        session: { doc: ferry, confirm: async () => { depart(ferry); return false; } },
+        gate: gateEndOn(station),
+        shipRoomId: FERRY,
+        shipPort: PORT,
+        berthing: BERTHING,
+        now: () => D0,
+        wait: instant,
+      });
+      expect(r).toEqual({ ok: false, reason: 'unconfirmed' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(released());
+    });
+
+    it("takes the claim back, leaving a crossing DOCK's stamp to its maker", async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let n = 0;
+      const r = await dock(station, ferry, {
+        wait: async () => {
+          if (++n !== 2) return;
+          ferry.getMap('doors').set(PORT, portDockedAt(D0 - 5));
+          depart(ferry);
+        },
+      });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0 - 5));
+    });
+
+    it('docks as before under a hold that has lapsed (its helm went away mid-way)', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      depart(ferry, D0 - CAST_OFF_HOLD_MS);
+      expect(await dock(station, ferry)).toEqual({ ok: true, dockedAt: D0 });
+      expect(readDoorFrom(station, 'x+')).toEqual(dockOf(D0));
+      expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0));
+    });
+
+    // Copilot (PR 212): one that began and ended meanwhile took its hold
+    // with it, but not the stay it left (a hand DEPART pauses the route).
+    const dockInStay = (station: Y.Doc, ferry: Y.Doc, o: {
+      confirm?: () => Promise<boolean>; wait?: () => Promise<void>; inStay: () => boolean;
+    }) => stationDock({
+      session: { doc: ferry, confirm: o.confirm ?? (async () => true) },
+      gate: gateEndOn(station),
+      shipRoomId: FERRY,
+      shipPort: PORT,
+      berthing: BERTHING,
+      now: () => D0,
+      wait: o.wait ?? instant,
+      inStay: o.inStay,
+    });
+
+    it('takes the claim back, asking nothing of the ferry, when the ferry left its stay while the claim settles', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let staying = true;
+      const r = await dockInStay(station, ferry, { wait: async () => { staying = false; }, inStay: () => staying });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(leftStop0());
+    });
+
+    it("withdraws the dock at both ends when one began and ended while the ferry's side went unacknowledged", async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let staying = true;
+      const r = await dockInStay(station, ferry, {
+        confirm: async () => {
+          depart(ferry);
+          ferry.getMap('ship').delete('castOff');
+          staying = false;
+          return false;
+        },
+        inStay: () => staying,
+      });
+      expect(r).toEqual({ ok: false, reason: 'unconfirmed' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(released());
+      // A stay that cannot be read counts as left.
+      const again = stationWith(memoryOf(T0 - HOUR));
+      const r2 = await dockInStay(again, ferryDoc(), { inStay: () => { throw new Error('flooded'); } });
+      expect(r2).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(again, 'x+')).toEqual(memoryOf(D0 + 1));
+    });
+  });
+
   // 🚚 As a ship's DOCK rechecks where its berth's station orbits once the
   // far room's moves are learned (docking.ts redockPort, shipArrival.
   // berthStillThere): a station found gone to another planet since the dock
@@ -1565,6 +1704,31 @@ describe('the gate keeper over a stand-in session', () => {
       .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: t + SEC }));
   });
 
+  // 🚚🎚️ A dock at a stop whose station has left the orbit the route copied
+  // of it would carry the ferry across without a transfer: riders' keepers
+  // skip that stop (routeKeeper.runKeeperPass), and the station's keeper,
+  // reading the station from this game's directory as they do, docks nothing.
+  it('docks no ferry at a stop whose station has moved or changed altitude since its route was saved', async () => {
+    const listedAs = (where: { planetId?: string; orbit?: { radiusKm: number; phase0: number } }) =>
+      () => where as KeeperPassDeps['station'];
+    for (const where of [{ planetId: 'planet-aris' }, { planetId: SOV, orbit: { radiusKm: 7_400, phase0: 0.5 } }]) {
+      const { h, deps } = harness();
+      const keeper = createGateKeeper({ ...deps, station: listedAs(where) });
+      await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+      await tickAt(keeper, h, D0);
+      await tickAt(keeper, h, D0 + KEEPER_RETRY_MS);
+      expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+      expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
+    }
+    // Still where the route copied it: docked as before.
+    const { h, deps } = harness();
+    const keeper = createGateKeeper({ ...deps, station: listedAs({ planetId: SOV }) });
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+    await tickAt(keeper, h, D0);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(D0));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+  });
+
   it("casts off neither end while the ferry's room holds a move this game never heard of, and learns it", () =>
     withStorage(async () => {
       const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
@@ -1628,6 +1792,43 @@ describe('the gate keeper over a stand-in session', () => {
     expect(readDoorFrom(h.ferry, PORT))
       .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }));
     expect(h.notes).toEqual([]);
+  });
+
+  // Copilot (PR 212): a DEPART at the ferry's helm can begin and end while
+  // the dock waits, and its hold goes with it; a hand DEPART leaves the
+  // route paused (helmRoute.pauseRouteFromHelm), and the dock gives way.
+  it("takes the claim back, or withdraws the dock at both ends, when a DEPART at the ferry's helm began and ended meanwhile", async () => {
+    for (const during of [1, 2]) {
+      const { h, deps } = harness();
+      let n = 0;
+      h.wait = async () => {
+        if (++n !== during) return;
+        const pause = pauseCheckpoint(R, 1, { at: D0 })!;
+        h.ferry.getMap('ship').set(checkpointKey(R.startedAt, pause.legSeq, pause.kind), checkpointToWire(pause));
+      };
+      const keeper = createGateKeeper(deps);
+      await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+      await tickAt(keeper, h, ARRIVE + SEC);
+      await tickAt(keeper, h, D0);
+      expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(h.ferry, PORT)).toEqual(during === 1
+        ? leftStop0()
+        : buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }));
+      expect(h.notes).toEqual([]);
+    }
+  });
+
+  // …as does one whose stay ended while it waited (a tab in the background
+  // can wait a minute): the ferry's route has it in flight by then.
+  it('takes the claim back when the departure comes while the claim settles', async () => {
+    const { h, deps } = harness();
+    h.wait = async () => { h.now = DEPART + SEC; };
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+    await tickAt(keeper, h, ARRIVE + SEC);
+    await tickAt(keeper, h, D0);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(DEPART + SEC));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
   });
 
   /** A dock the ferry's port holds alone at gate x+ (its far write never

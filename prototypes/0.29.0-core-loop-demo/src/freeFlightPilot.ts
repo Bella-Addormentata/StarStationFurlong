@@ -22,7 +22,7 @@ import {
   undockPose,
 } from './freeFlight';
 import type { FreePose, FreeStation, StickInput } from './freeFlight';
-import { orbitForSlot, angleAt, stationPointAt } from './orbits';
+import { angleAt, baseOrbit, stationPointAt } from './orbits';
 import { readStore } from './planetSummary';
 import { readFlightRecord, readFuelLevel, readStoredFuelLevel, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { localStationId, portableStationId } from './stationDirectory';
@@ -114,7 +114,8 @@ export function settleFreeDock(): void {
 
 /**
  * Fly on from AUTO-DOCK's mark when the dock did not happen: the ship reads
- * `docked` at the marked station with no port docked, and no answer is still
+ * `docked` at the marked station (or in open orbit, where an arrival whose
+ * station moved settles it) with no port docked, and no answer is still
  * due here (`answered`: this game's has just come; else the game that asked
  * left the room, and the pairings have had FREE_DOCK_SETTLE_MS to arrive).
  * A docked port, or a record that moved on, clears the mark. Returns whether
@@ -134,9 +135,13 @@ export function recoverFreeDock(
   const rec = readFlightRecord();
   if (rec.status === 'redocking') return false;
   if (rec.status !== 'docked' || ports.some((p) => p.state.kind === 'docked')) { clear(); return false; }
-  // Another install names the station its own way: not ours to judge (this
-  // game's own answer settled somewhere else, say open orbit, is).
-  if (rec.locationId !== localStationId(raw.stationId)) { if (answered) { dockPending = null; clear(); } return false; }
+  // Settled in open orbit (adriftPlace) instead: the station left, moved or
+  // took off while the ship came in (shipArrival.completeArrival), so the
+  // dock never happened and the ship flies on from its mark. Any other
+  // place is another install's name for the station: not ours to judge
+  // (this game's own answer settled somewhere else is).
+  const settledAdrift = adriftPlace(rec.locationId) !== null;
+  if (!settledAdrift && rec.locationId !== localStationId(raw.stationId)) { if (answered) { dockPending = null; clear(); } return false; }
   if (answered) {
     dockPending = null;
   } else {
@@ -230,9 +235,11 @@ function timedStation(s: StationRecord, planet: string): FreeStation | null {
 let flyingCache: { room: string; at: number; status: string; since: Map<string, number> } | null = null;
 
 /** This game's memory of the rooms it has heard flying free (room → the
- *  newest such summary's time), kept past the planet summaries' expiry and
+ *  newest such summary's time: its pose's own time when that is earlier), kept past the planet summaries' expiry and
  *  cap: a station's docks stay closed here until it is heard otherwise. */
-const FLYING_KEY = 'ssf.freeFlight.flyingRooms.v1';
+// v2: times by the flying room's pose clock. v1 kept summary stamps, which
+// a fast clock could set hours ahead of the PARK that ends them: dropped.
+const FLYING_KEY = 'ssf.freeFlight.flyingRooms.v2';
 const MAX_FLYING_ROOMS = 64;
 /** How long a room heard flying free is remembered once nothing more is
  *  heard of it. The summaries are peer-written (the dev-phase trust of the
@@ -288,7 +295,13 @@ function flyingSince(now: number): Map<string, number> {
     for (const s of Object.values(readStore(now).ships)) {
       const known = since.get(s.roomId);
       if (!s.retired && s.status === 'free-flight') {
-        if (known === undefined || s.updatedAt > known) { since.set(s.roomId, s.updatedAt); dirty = true; }
+        // Heard flying as of its pose's own time when it carries one: the
+        // flying room's clock, the one its PARK move is booked by
+        // (stationFlyingFree), where the summary's stamp may run hours ahead.
+        const heard = s.free ? Math.min(s.updatedAt, s.free.at) : s.updatedAt;
+        // The summary on hand is the latest word on the room: it replaces a
+        // later time remembered from a clock that ran ahead.
+        if (known !== heard) { since.set(s.roomId, heard); dirty = true; }
       } else if (known !== undefined && s.updatedAt > known) {
         since.delete(s.roomId);
         dirty = true;
@@ -299,9 +312,12 @@ function flyingSince(now: number): Map<string, number> {
   }
   // This room's own record is first-hand.
   if (room && status === 'free-flight') {
-    // Kept fresh (hourly) while it flies, so it never lapses first-hand.
+    // Kept fresh (hourly) while it flies, so it never lapses first-hand: as
+    // of its pose's time, by the clock that books its PARK, never later
+    // than this game's.
     const known = since.get(room);
-    if (known === undefined || now - known > 3600_000) { since.set(room, now); dirty = true; }
+    const at = Math.min(now, readFreePose()?.at ?? now);
+    if (known === undefined || at < known || at - known > 3600_000) { since.set(room, at); dirty = true; }
   } else if (room && since.delete(room)) {
     dirty = true;
   }
@@ -344,7 +360,8 @@ export function undockPoseFrom(locationId: string, now = Date.now()): FreePose |
   const adrift = adriftPlace(locationId);
   if (!adrift) return null;
   const planetId = planetById(adrift.planetId).id;
-  const orbit = orbitForSlot(planetId, adrift.orbitSlot);
+  // 🎚️ On the place's own orbit, when it names one.
+  const orbit = baseOrbit({ planetId, orbitSlot: adrift.orbitSlot, ...(adrift.orbit ? { orbit: adrift.orbit } : {}) });
   return undockPose(planetId, now, { radiusKm: orbit.radiusKm, angle: angleAt(orbit, now) });
 }
 

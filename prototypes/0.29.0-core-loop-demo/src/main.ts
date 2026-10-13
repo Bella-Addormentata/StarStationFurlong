@@ -3,6 +3,7 @@
  * Main entry point — orthographic camera + hybrid WASD / point-and-click nav.
  */
 
+import { pickSettingsGear } from "./gearCardParts";
 import * as THREE from "three";
 import "./style.css";
 import { updateDebugHUD, showHint } from "./hud";
@@ -10,8 +11,11 @@ import { renderWithFarPass } from "./farOrbitView";
 import type { World } from "./world";
 import type { DoorId } from "./doors";
 import type { InputManager } from "./input";
+import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
+import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
+import { roomIsPublicSpace } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
   packTick,
@@ -19,6 +23,7 @@ import {
   unpackAddressedTick,
   tickKind,
   TICK_KIND_MOVEMENT,
+  TICK_KIND_ALLIGATORS,
   ADDRESSED_TICK_BYTES,
   TICK_BYTES,
   type MovementTick,
@@ -31,6 +36,14 @@ import {
   routeAirHockeyTick,
   setAirHockeySender,
 } from "./airHockeySession";
+// 🐊 #185: insatiable-alligators heads and balls ride lane kind 3.
+import {
+  routeAlligatorsTick,
+  setAlligatorsSender,
+} from "./alligatorsSession";
+// 🕹️ Shared arcade games: their pad bytes ride lane kind 1 as a subtype.
+import { routeArcadeTick, setArcadeSender } from "./arcadeNesSession";
+import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -230,6 +243,20 @@ import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
+// 📺 #186: the smart TV — its records, the phone remote, the theatre, the
+// room-level duties (lease renewals, the hand-back on leave).
+import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv, tvNow, tvWallNow } from "./tvDoc";
+import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
+import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
+import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
+import { parseNodeFingerprint } from "./nodeFingerprint";
+import type { LocalFingerprint } from "./nodeFingerprint";
+import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
+// 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
+import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
+import { leaveArcadeRoom } from "./arcadeSession";
+import { closeArcadeStage } from "./arcadeStage";
+import { ARCADE_CABINET_KINDS, FURNITURE } from "./furniture";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -267,6 +294,8 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
+// 🗺️✏️ #192: the holotable's BEAM INTO takes the pass this install holds.
+import { beamAfterStepBack, beamPassFor } from "./stationPlan";
 // ⚓ A station's public berth takes its door's pose from the atlas, and 🚀 a
 // ship under way keeps its flight's place whatever it wears.
 import { followsFlightRecord, setBerthPoseLookup } from "./stationDirectory";
@@ -303,13 +332,15 @@ import {
   readAutoFerryGates,
   readDockGates,
   readDockGatesIfComplete,
+  readGatesInUse,
+  mayNumberNewPort,
   readUnnumberedPorts,
   readDoorPolicy,
   writeDoorPolicy,
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
-  bindFloorPlan, subscribeFloorPlan, readRoomDims,
+  bindFloorPlan, subscribeFloorPlan, readRoomDims, endCupolaWalls,
 } from "./floorPlanDoc";
 import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
@@ -554,10 +585,60 @@ const mouse = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+
+/** 🔑 May a stranger walk into the CURRENT room? Decides whether its seed rides
+ *  in the shared atlas (stationAtlas) and, since #231 N8, whether the node may
+ *  publish an address under its key. An UN-MIGRATED room presents the four
+ *  cardinal defaults everywhere else, so treat it the same here rather than
+ *  making "never opened the door editor" mean "unreachable". A room that has
+ *  DECLARED an empty door set is a different thing: nobody can walk in, so
+ *  nobody should be handed its address either — that falls out of `some` over
+ *  an empty list, which is exactly the fail-closed answer. With no doc bound
+ *  yet the defaults read PUBLIC, which for N8 is the safe answer too. */
+/** The room whose door-policy AND door-layout docs are the ones currently
+ *  bound, or null between a leave and the next join's binds (see the N8 probe
+ *  below: until this names a room, that room's passage is unknown → PUBLIC). */
+let doorDocsBoundFor: string | null = null;
+
+function roomPassageIsPublic(): boolean {
+  const ids = [...readAllDoorLayout().keys()];
+  const doors = doorSetIsAuthoritative() ? ids : ["north", "south", "east", "west"];
+  return doors.some((d) => readDoorPolicy(d).passage === "public");
+}
+
+// ⛓️ N8 (#231): the node learns from us whether a room is PUBLIC SPACE — the
+// bundled welcome room, or a room anyone may walk into — and never publishes
+// an address under such a room's key (anyone can derive its hint). Until the
+// probe answers the node assumes public, so a wrong answer can only withhold
+// a publish. The door docs the probe reads are globally bound and re-bound per
+// join, and the first cap of a join goes out at connect, BEFORE the new room's
+// docs are bound: so the probe only reads them once `doorDocsBoundFor` names
+// this exact room (set right before the last of the two binds), and says
+// PUBLIC until then — never the previous room's doors for the new room.
+// Re-stamped on every door-policy change AND every door-layout change (a door
+// fitted with no policy record of its own takes the default, which is public,
+// so a new door alone can open the room), and on every room bind, which
+// notifies both; so a room flipping public/private reaches the node live
+// whichever record flipped it. Each cap carries a sequence number, so one that
+// left earlier but lands later cannot overwrite the current posture.
+networkProvider.setPublicRoomProbe((roomId) =>
+  roomIsPublicSpace(
+    roomId === DEFAULT_STATION.welcomeRoomId,
+    doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
+  ),
+);
+subscribeDoorPolicy(() => {
+  void networkProvider.refreshRoomCap();
+});
+subscribeDoorLayout(() => {
+  void networkProvider.refreshRoomCap();
+});
 // 🏒 #115: give the air-hockey session its outbound datagram seam. The
 // provider is a boot-time singleton and sendTick self-gates on connection
 // state (clean no-op offline), so one wiring here covers every room join.
 setAirHockeySender((buf) => networkProvider.sendTick(buf));
+setAlligatorsSender((buf) => networkProvider.sendTick(buf));
+setArcadeSender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -744,21 +825,8 @@ let roomPassesInited = false;
 // connection exists — this is how the first node of a sovereign network
 // comes online: there is no server, only peers. Every player's node seeds
 // for the network by default; only their connection can prevent it.
-interface LocalFingerprint {
-  hex: string;
-  base64: string;
-  port: number;
-  iroh_node_id?: string;
-  iroh_relay_urls?: string[];
-  iroh_direct_addrs?: string[];
-  /** R1: live reachability classification from the node —
-   *  'port-mapped' | 'advertised' | 'cgnat' | 'local-only'.
-   *  Optional: the Tauri fallback listener's fingerprint omits it. */
-  reachability?: string;
-  /** R1: the iroh UDP port ACTUALLY bound (post random-port fallback) —
-   *  the port a router forward must target. */
-  iroh_port?: number;
-}
+// The node's /api/fingerprint answer and its contract live in
+// nodeFingerprint.ts (testable; main.ts runs the whole client on import).
 let localFingerprint: LocalFingerprint | null = null;
 const BOOTSTRAP_ADDRESS_STORAGE_KEY = "ssf-bootstrap-address";
 const LEGACY_BOOTSTRAP_ADDRESS_KEY = "ssf-host-address";
@@ -1735,12 +1803,19 @@ async function joinRoomAtEpoch(
   receivedTicks = 0;
   remoteLastSeen.clear();
   world.clearRemotePlayers();
+  // ⛓️ N8: the door docs about to be bound are not this room's yet — the cap
+  // sent at connect must say PUBLIC until both are (see the probe's comment).
+  doorDocsBoundFor = null;
   // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
   // world.ts activeRoomId). Published BEFORE the connect await (the id is
   // known synchronously) so a trunk opened during the connect window keys
   // the right room; sequential re-joins overwrite correctly. The bootstrap
   // roomId, NOT the editable display name.
   (window as any).__ssfRoomId = boot.roomId;
+  // 🥣 The faucet dish's store listens to this room's node from here on
+  // (before the connect await, so the first poll's reply is filed); the leave
+  // closes it again before anything else (faucetDish.ts, openFaucetRoom).
+  openFaucetRoom(boot.roomId);
   updateHUDNode("ONLINE", "#00e676");
   // Connect with a cert-refresh retry on the LOCAL loopback dial: the node's WT
   // cert regenerates every launch, so a stale hash fails the handshake — on
@@ -1907,6 +1982,13 @@ async function joinRoomAtEpoch(
         yjsSync?.ingestEnvelope(env);
         return;
       }
+      // 🥣 Faucet lane (#231 onboarding): the node answers the dish's
+      // status / take / give requests on the stream they came in on, and that
+      // reply reaches faucetDish.ts through onFaucetReply below. A `faucet`
+      // envelope on a node-opened stream is NOT the node's answer (the node
+      // drops peer-sent ones, but an older node forwards them), so it is
+      // ignored here: nothing a room peer sends may set the dish's address.
+      if (env.kind === "faucet") return;
       if (env.kind === "bridge" && typeof env.payload === "string") {
         try {
           const status = JSON.parse(atob(env.payload)) as {
@@ -1971,7 +2053,7 @@ async function joinRoomAtEpoch(
 
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
   // table state. Rebinds per join like games/furniture (T0 seam).
-  bindCasinoDoc(sync.doc);
+  bindCasinoDoc(sync.doc, boot.roomId);
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);
@@ -1985,6 +2067,14 @@ async function joinRoomAtEpoch(
   // candles / gift's lid / speaker's switch. Same T0 seam — a joiner must walk
   // into a party that has already happened and see the candles already out.
   bindPartyDoc(sync.doc);
+
+  // 📺 Bind the shared tv map (#186): what each set shows and who holds its
+  // remote. Same T0 seam — a joiner walks in on a movie already running and
+  // anchors its clock to the sample it finds.
+  bindTvDoc(sync.doc);
+  // 🕹 Bind the shared arcade map (#193): each cabinet's game, and
+  // who is at its controls. Same T0 seam.
+  bindArcadeDoc(sync.doc);
 
   // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
   // with the local visitation atlas, so a first-time visitor renders the
@@ -2004,19 +2094,7 @@ async function joinRoomAtEpoch(
     // the default `public` for a cardinal the room does not even have — so the
     // predicate was ALWAYS TRUE and no room could be unlisted. Iterate the
     // doors the room actually has, and fail CLOSED when it has none public.
-    isPassagePublic: () => {
-      const ids = [...readAllDoorLayout().keys()];
-      // An UN-MIGRATED room presents the four cardinal defaults everywhere
-      // else, so treat it the same here rather than making "never opened the
-      // door editor" mean "unreachable". A room that has DECLARED an empty
-      // door set is a different thing: nobody can walk in, so nobody should be
-      // handed its address either — that falls out of `some` over an empty
-      // list, which is exactly the fail-closed answer.
-      const doors = doorSetIsAuthoritative()
-        ? ids
-        : ["north", "south", "east", "west"];
-      return doors.some((d) => readDoorPolicy(d).passage === "public");
-    },
+    isPassagePublic: roomPassageIsPublic,
   });
 
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
@@ -2094,6 +2172,10 @@ async function joinRoomAtEpoch(
   // separate from the pairing map + floor-plan position. Binding re-notifies →
   // world.reconcileDoorLayout runs immediately (a joiner sees the host's door
   // set); an unseeded room keeps the local cardinal defaults.
+  // ⛓️ N8: the door-POLICY doc is bound above; with this bind both of the docs
+  // the public-room probe reads are this room's, so name it first — the bind's
+  // own notify then re-stamps the room cap with the real passage reading.
+  doorDocsBoundFor = boot.roomId;
   bindDoorLayoutDoc(sync.doc);
   // 🪟 #80: window layout syncs the same way (rebinds per join at the T0 seam).
   bindWindowLayoutDoc(sync.doc);
@@ -2109,6 +2191,10 @@ async function joinRoomAtEpoch(
   // the same room.
   setAtlasHarvestArmed(true);
   harvestStationAtlas();
+  // 📺 #186: the TVs are driven again — every doc the drive reads (tv,
+  // furniture) is bound above; leaveRoomNow disarmed it synchronously so no
+  // tick during the leave's flush touched the departed room.
+  armTvDrive(true);
   // 🛑🛰️ #157: the first-person shells are laid out AROUND THE CURRENT ROOM, so
   // they are re-posed the moment that room changes — not only when a door or
   // shared-atlas event happens to follow. On the first join of a launch neither
@@ -2273,6 +2359,15 @@ async function joinRoomAtEpoch(
     // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
       queueCupolaSettle();
+      // 🔭 A resize or a cupola set / cleared changes what the atlas maps
+      // draw of this module (issue 219): harvest it then, not on every door
+      // slide the floor plan also carries.
+      const shape = JSON.stringify([readRoomDims(), endCupolaWalls()]);
+      if (shape !== atlasShapeHarvested) {
+        atlasShapeHarvested = shape;
+        harvestStationAtlas();
+        world?.refreshFpNeighbourShells();
+      }
       world?.reconcileDoorPlacements();
       world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
       roomEdit.onFloorPlanChanged(); // …and an open edit session's 🔭 label
@@ -2665,7 +2760,8 @@ async function joinRoomAtEpoch(
         const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
         // ⚓🚦 …numbered like every port (the new room's own gate list; the
         // atlas groups it with its station once harvested).
-        const gate = freeGateNumberHere(boot.roomId, readDockGates());
+        const inUse = readGatesInUse();
+        const gate = mayNumberNewPort(inUse) ? freeGateNumberHere(boot.roomId, inUse.gates) : null;
         writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
@@ -3057,6 +3153,17 @@ async function joinRoomAtEpoch(
       } else {
         return; // unknown datagram framing — ignore
       }
+      // 🕹️ Arcade ticks ride the kind-1 lane with flags bit 5 set and a NaN
+      // where a mallet keeps its x (arcadeNet.ts): route them on the raw
+      // bytes, before anything reads that x as a position.
+      const raw = buf.byteLength === ADDRESSED_TICK_BYTES ? buf.subarray(buf.byteLength - TICK_BYTES) : buf;
+      if (isArcadeTickFlags(tick.flags)) {
+        seenPeers.add(peerId);
+        receivedTicks++;
+        remoteLastSeen.set(peerId, performance.now());
+        routeArcadeTick(peerId, raw);
+        return;
+      }
       // 🏒 #115: flags bits 6–7 select the tick lane. Mallet/puck ticks are
       // game traffic for the air-hockey session, NOT avatar movement —
       // dispatched BEFORE the avatar bookkeeping so a game tick can never
@@ -3066,7 +3173,9 @@ async function joinRoomAtEpoch(
         seenPeers.add(peerId);
         receivedTicks++;
         remoteLastSeen.set(peerId, performance.now());
-        routeAirHockeyTick(peerId, tick);
+        // 🐊 #185: kind 3 is the alligators lane; 1–2 stay air hockey's.
+        if (tickKind(tick.flags) === TICK_KIND_ALLIGATORS) routeAlligatorsTick(peerId, tick);
+        else routeAirHockeyTick(peerId, tick);
         return;
       }
       seenPeers.add(peerId);
@@ -3083,6 +3192,7 @@ async function joinRoomAtEpoch(
         (tick.flags & 8) === 8,
         (tick.flags & 16) === 16,
         (tick.flags & 32) === 32,
+        tick.seq,
       );
     } catch (e) {
       console.warn("Error unpacking incoming remote peer datagram tick:", e);
@@ -3146,6 +3256,9 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // doors doc binds before the layout/floor-plan docs, and a harvest in that
   // window reads the new room's doors at the OLD room's walls.
   setAtlasHarvestArmed(false);
+  // ⛓️ N8: likewise, the public-room probe must not read this room's doors for
+  // whatever room is joined next.
+  doorDocsBoundFor = null;
   // We are now roomless (issue #60 review): clear the active-pass room so a
   // swap that leaves but never re-joins (stranded) can't wedge a pass showing
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the
@@ -3153,9 +3266,38 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   setActivePassRoom(null);
   // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
   clearChatBubbles();
+  // 🥣 The faucet dish's last status, error and pending TAKE/GIVE belong to
+  // this room's node session: forget them, so a revisit reads the chain
+  // afresh instead of showing stale balances or a stale TAKING… line. The
+  // store's gate closes first (synchronously, before any await below), so a
+  // reply still in flight, or a request failing to leave during the flush,
+  // cannot put the state back once it is cleared (faucetDish.ts).
+  closeFaucetRoom();
+  {
+    const leavingRoomId = activeBootstrap?.roomId ?? networkProvider.getBootRecord()?.roomId;
+    if (leavingRoomId) clearFaucetRoom(leavingRoomId);
+  }
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
   settleReqUnsub?.();
   settleReqUnsub = null;
+  // 📺 #186: the theatre, its chip and every remote I hold belong to THIS
+  // room. Tear them down now, synchronously and on every path (sync or
+  // not): nothing may keep a player, an interval or a clock registration
+  // pointed at the old set, or write under its item id to the next room's
+  // map once the doc rebinds. The put-downs go out with the flush below.
+  closeTvTheatre();
+  updateTvChip([]);
+  leaveTvRoom(roomTvIds());
+  // 🕹 #193: the same for the cabinet — the stage (its frame, its seat
+  // renewals) is this room's; a P1 who leaves stands up before the doc goes.
+  closeArcadeStage();
+  leaveArcadeRoom(roomArcadeIds());
+  // What this viewer agreed to fetch was agreed for THIS room: the origins
+  // accepted with PLAY FROM, the probe's verdicts and the sets' mount
+  // budgets go with it, so a peer in the next room cannot reuse an origin
+  // approved here without asking, and a reused set id inherits no spent
+  // budget. The node's trust is the probe's, not the room's, and stays.
+  forgetMediaConsent();
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -3520,6 +3662,19 @@ async function performRoomSwap(
   }
 }
 
+/** 🗺️🎫 #192: the pass this install holds for `roomId`, for the holotable's
+ *  BEAM INTO: an ACCESS pass, or a module it minted. Never the atlas's seed
+ *  for a room, which may be a neighbour's door record (the stub a harvest
+ *  makes for each door): entering by that would pass by the door's own
+ *  passage policy and lock. One naming another room is no pass to this one
+ *  (beamPassFor). */
+function heldPassFor(roomId: string): string | undefined {
+  return beamPassFor(roomId, [
+    passSeed(roomId),
+    moduleLedger().find((e) => e.roomId === roomId)?.seed,
+  ]);
+}
+
 /**
  * An address OTHER rooms can reach `roomId` by — what a mirror record, or a
  * far room's end of a dock, must point back at. The walker's own rooms are
@@ -3854,11 +4009,16 @@ async function transitTo(
     // re-fit the port below.
     // ⚓🚦 A dock that fits a new port here needs a free gate number; with
     // every number taken, the dock is not completed (as the far DOCK refuses).
+    // While this room's gates are not known (a flood hides some of its ports
+    // from the gate read, or a port has no number yet), the port is fitted
+    // unnumbered (mayNumberNewPort).
     const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
-    const newGate = needsPort ? freeGateNumberHere(activeBootstrap?.roomId ?? "", readDockGates()) : null;
+    const inUse = needsPort ? readGatesInUse() : null;
+    const freeGate = inUse ? freeGateNumberHere(activeBootstrap?.roomId ?? "", inUse.gates) : null;
+    const newGate = inUse && mayNumberNewPort(inUse) ? freeGate : null;
     if (
       depRoomId &&
-      !(needsPort && newGate === null) &&
+      !(needsPort && freeGate === null) &&
       mirrorMayWrite(existing, depRoomId, depDock, {
         portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
       }) &&
@@ -3896,12 +4056,13 @@ async function transitTo(
         // ⚓ A dock has a half on BOTH doors: the arrival door wears the
         // mating half the connection brought (staged on the far side, or the
         // visiting ship's own), so it can UNDOCK and DOCK from this side too.
-        if (needsPort && newGate !== null) {
-          // ⚓🚦 …numbered, like every new port of the station.
+        if (needsPort) {
+          // ⚓🚦 …numbered, like every new port of the station (unnumbered
+          // while this room's gates are not known, above).
           writeDoorPolicy(arrivalDoorId, {
             ...readDoorPolicy(arrivalDoorId),
             adapter: true,
-            gate: newGate,
+            ...(newGate !== null ? { gate: newGate } : {}),
           });
         }
       });
@@ -3953,6 +4114,21 @@ function wireAdapterTransit(): void {
   // in-flight swap falls through to the normal peek round-trip instead of
   // spawning a vestibule whose transit would silently early-return.
   world.isTransitBusy = () => transitInProgress;
+  // 🗺️✏️ #192: the holotable's BEAM INTO another module of the station is
+  // the ACCESS beam, with a pass this install holds; its word goes on a hint,
+  // as the ACCESS app's feedback line is out of sight at the table. It is a
+  // manual choice like ACCESS's ENTER/JUMP, made at the click: a pasted pass
+  // still warming is dropped then, before the table's step-back, where its
+  // READY could otherwise carry you off first (beamAfterStepBack).
+  world.roomPassFor = (roomId) => heldPassFor(roomId);
+  world.onBeamInto = (seed, afterStepBack) =>
+    beamAfterStepBack(seed, {
+      cancelPending: () => {
+        autoEnterRoomId = null;
+      },
+      afterStepBack,
+      enter: (s) => void enterRoomFromPass(s, (msg) => showHint(msg, 4000)),
+    });
   const provisionModuleSeed = async (
     templateId = "empty",
     parentDoorId?: string,
@@ -4168,6 +4344,12 @@ function resolveOwnerLabel(owner: string): string {
  *    · the room ACCESS MODE        · co-host accept/deny/revoke
  *    · 🔧 #192 taking a module apart (a Disassemble job's pick and its end:
  *      a module off the station can't be put back) — setRoomDeedCheck
+ *    · the TV's spare remote (#186: taking the remote from its holder, or
+ *      handing theirs on — setTvHostPredicate; the panels paint from it)
+ *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
+ *      (#193 — setArcadeEjectPredicate; the panel paints from it). The
+ *      cabinet's CURATION (its game, emulator files) stays with the
+ *      shareholder-extended gate above (setArcadeHostPredicate).
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
  *  own venture map entry, which is peer-written, shape-checked only, and tied
@@ -4344,6 +4526,8 @@ export function setAtlasHarvestArmed(on: boolean): void {
  *  room's state landed): until then the planet summary does not take the
  *  atlas's copy of them, which may be an earlier visit's, as news. */
 let gatesReadIn: string | null = null;
+/** 🔭 The size and cupola walls the floor-plan listener last harvested. */
+let atlasShapeHarvested = "";
 
 function harvestStationAtlas(): void {
   if (!atlasHarvestArmed) return;
@@ -4401,10 +4585,15 @@ function harvestStationAtlas(): void {
           : {}),
       }];
     });
-  // ⚓🚦 A port fitted before gates existed has no number: the owner numbers
-  // it here, once. Until then (anyone else here) the room's gates are not
-  // known, and the harvest says so (null): an older list, even one of none,
-  // would hide that port as a legacy berth.
+  // ⚓🚦 A port fitted before gates existed, or while the room's gates were
+  // not known (mayNumberNewPort), has no number: the owner numbers it here,
+  // once. Until then (anyone else here) the room's gates are not known, and
+  // the harvest says so (null): an older list, even one of none, would hide
+  // that port as a legacy berth.
+  // The station's other rooms whose gates are not known are read as holding
+  // no numbers (they hold none, apart from ports a flood hides), not waited
+  // for: two rooms that each have a port with no number, as rooms with ports
+  // fitted before gates do, would wait on each other for good.
   const unnumbered = readUnnumberedPorts();
   if (unnumbered.length > 0 && isLocalHelmCommander() && yjsSync) {
     // One transaction: the policy observer (which harvests again) runs only
@@ -4412,7 +4601,10 @@ function harvestStationAtlas(): void {
     yjsSync.doc.transact(() => {
       for (const doorId of unnumbered) {
         if (readDoorPolicy(doorId).gate !== undefined) continue;
-        const gate = freeGateNumberHere(roomId, readDockGates());
+        // Only from a gate read that sees every port: past a flood, a number
+        // might be a hidden port's.
+        const inUse = readGatesInUse();
+        const gate = inUse.complete ? freeGateNumberHere(roomId, inUse.gates) : null;
         if (gate === null) break;
         writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
       }
@@ -4438,7 +4630,7 @@ function harvestStationAtlas(): void {
   const ownerName = typeof ownerEntry?.name === "string" && ownerEntry.name ? ownerEntry.name : undefined;
   const ownerKey = typeof ownerEntry?.keyB64 === "string" && ownerEntry.keyB64 ? ownerEntry.keyB64 : undefined;
   harvestIntoAtlas({
-    roomId, name, seed, dims: readRoomDims(), doors,
+    roomId, name, seed, dims: readRoomDims(), cupola: endCupolaWalls(), doors,
     ...(gates ?? { gates: null }),
     // null: this synced room has no verifiable owner (clears a stale one),
     // and neither has one whose id the atlas can't carry (cleanAtlasOwner
@@ -5938,6 +6130,36 @@ function syncVentureLedgerFromCurrentRoom(): void {
  *  not the right to hand the module away). 🔒 #141: legacy 'Local-Clone' rooms
  *  no longer count as mine — they counted as EVERYONE's — matching
  *  `categorizeRoom`, which now files them as 'visited'. */
+// 📺 #186: the room's TVs, as the phone remote and the leave hand-back see them.
+function roomTvIds(): string[] {
+  return FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
+}
+function tvLabelFor(itemId: string): string {
+  return tvLabel(FURNITURE.find((i) => i.id === itemId)?.kind);
+}
+/** Installed on the theatre (setTvTheatreDeps) so every WATCH — the set's
+ *  panel in world.ts, the phone, the HUD chip — opens it with the same label
+ *  and the same round-trip lead. */
+function tvTheatreDeps(itemId: string) {
+  return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
+}
+// 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
+function roomArcadeIds(): string[] {
+  return FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
+}
+
+/** WATCH from the phone or the HUD chip: only for a set still in THIS room,
+ *  with the TV drive armed. A WATCH button can outlive its set by up to a
+ *  second (the phone repaints on a timer; the chip on the room tick), and
+ *  the callback stays reachable through a room leave's awaited flush after
+ *  the teardown closed the theatre — opening then would make a theatre no
+ *  room tick ever closes. */
+function openTvTheatreIfPresent(itemId: string): boolean {
+  if (!tvDriveArmed() || !roomTvIds().includes(itemId)) return false;
+  openTvTheatre(itemId);
+  return true;
+}
+
 function currentRoomDeedIsMine(): boolean {
   // The decision lives in roomOwner.ts so it can be unit-tested; this wrapper
   // supplies the live getters, exactly as isLocalPlayerRoomOwner does.
@@ -7374,7 +7596,8 @@ function setupSpacePhoneOverlay() {
     | "treasury"
     | "settings"
     | "setnet"
-    | "setstats";
+    | "setstats"
+    | "tv";
   const phoneViewMeta: Record<
     PhoneViewId,
     { elId: string; title: string; subtitle: string }
@@ -7428,6 +7651,11 @@ function setupSpacePhoneOverlay() {
       elId: "phone-app-settings-stats",
       title: "📊 STATS",
       subtitle: "Settings · Live Readout",
+    },
+    tv: {
+      elId: "phone-app-tv",
+      title: "📺 TV REMOTE",
+      subtitle: "The set whose remote you hold",
     },
   };
   /** Sub-views return to their parent on BACK instead of jumping home. */
@@ -7559,6 +7787,28 @@ function setupSpacePhoneOverlay() {
     }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
+    // 📺 #186: the remote. Repaints itself on tv-map changes while active.
+    if (id === "tv") {
+      const view = document.getElementById("phone-app-tv");
+      if (view) {
+        renderTvPhoneApp(view, {
+          tvs: () => roomTvIds().map((tvId) => ({ id: tvId, label: tvLabelFor(tvId) })),
+          myPub: () => getIdentityPub(),
+          myName: () => getPlayerName(),
+          roomPlayers: () => tvRoomPlayers(getIdentityPub()),
+          openTheatre: (tvId) => {
+            if (!tvDriveArmed() || !roomTvIds().includes(tvId)) return; // the set is gone, or the room is: nothing to watch
+            container?.classList.remove("active");
+            openTvTheatre(tvId);
+          },
+          resolveArchive: resolveArchiveFile,
+        });
+        // Land focus in the view (the treasury's rule): Tab is the phone's
+        // toggle, not a tab stop, so the remote's controls are reached by
+        // ↑/↓ from here, and a keyboard-only player can paste and PLAY.
+        focusTvApp(view);
+      }
+    }
   };
 
   // App tiles on the home screen route into their views. Delegated from the
@@ -7611,6 +7861,23 @@ function setupSpacePhoneOverlay() {
     container?.classList.add("active");
     showPhoneView("treasury");
   };
+  // 📺 #186: the set's panel and a hand-over open the phone straight on the
+  // remote — same posture as __ssfOpenTreasury.
+  (
+    window as unknown as { __ssfOpenTvRemote?: () => void }
+  ).__ssfOpenTvRemote = () => {
+    // Who gets focus back when the phone closes (releasePhoneOpener): the
+    // theatre when it is up (a hand-over pops the phone open above it; the
+    // dialog root is the stable target, and it refocuses its own control),
+    // else whatever outside the phone had focus — the set's panel. A
+    // control inside the phone is no opener: it is about to be hidden.
+    const active = document.activeElement as HTMLElement | null;
+    const theatreRoot = document.getElementById("tv-theatre");
+    phoneOpener = theatreRoot ?? (active && !phoneShell.contains(active) ? active : null);
+    closeMiniChat();
+    container?.classList.add("active");
+    showPhoneView("tv");
+  };
   phoneShell.addEventListener("click", (e) => routeFrom(e.target));
   phoneShell.addEventListener("keydown", (e) => {
     const ev = e as KeyboardEvent;
@@ -7640,11 +7907,7 @@ function setupSpacePhoneOverlay() {
     }
     if (!container || !container.classList.contains("active")) return;
     const target = e.target as HTMLElement | null;
-    if (
-      target &&
-      target !== chatInput &&
-      (target.tagName === "INPUT" || target.tagName === "TEXTAREA")
-    ) {
+    if (target && target !== chatInput && isFormFieldTarget(target)) {
       return; // e.g. room-name editor owns Escape for cancel
     }
     if (currentPhoneView !== "home") {
@@ -7689,9 +7952,70 @@ function setupSpacePhoneOverlay() {
     });
   }
 
+  // 📱 Open/close the phone: Tab, or a click on its bezel.
+  const togglePhone = (): void => {
+    if (tipIndicator) {
+      removeTipIndicator();
+    }
+
+    // 💬 QUICK CHAT: from the mini bar, EXPAND to the full phone on the CHAT
+    // app (scrollable history) instead of the home-screen toggle.
+    if (miniChatOpen) {
+      closeMiniChat();
+      if (container && !container.classList.contains("active")) {
+        container.classList.add("active");
+        showPhoneView("chat");
+        logToPhoneSystem("Entering SpacePhone net...");
+      }
+      return;
+    }
+
+    if (container) {
+      // Don't OPEN the SpacePhone while editing the room: an open phone
+      // latches the #spacephone-container.active guard that swallows the
+      // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
+      // (zoom.ts), stranding the player in edit mode with no working exit.
+      // An already-open phone may still CLOSE.
+      if (
+        roomEdit.isEditModeActive() &&
+        !container.classList.contains("active")
+      )
+        return;
+      container.classList.toggle("active");
+      if (container.classList.contains("active")) {
+        // Always land on the home screen (see view-router policy note above)
+        showPhoneView("home");
+        logToPhoneSystem("Entering SpacePhone net...");
+      } else {
+        chatInput?.blur();
+        // Any control left focused inside the phone lets go too: the phone
+        // is only moved offscreen, so a focused control in it keeps taking
+        // keys nobody can see — the TV remote's paste box swallowing WASD,
+        // its PLAY still answering Enter — whether or not an opener exists
+        // to hand focus back to.
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        // Hand focus back to whatever opened the phone from outside it. The
+        // phone is only moved offscreen, never display:none, so a control
+        // left focused inside it keeps answering the arrow keys against
+        // hidden rows — a keyboard player who opened TREASURY from the room
+        // terminal could not get back to the terminal at all.
+        releasePhoneOpener();
+      }
+    }
+  };
+
   if (container) {
+    const bezel = document.getElementById("phone-bezel");
     container.addEventListener("click", (e) => {
       e.stopPropagation();
+      // 📱 #223: the bezel is the phone's handle, and a click on it does what
+      // Tab does. A put-away phone shows nothing BUT its bezel, so any click
+      // on it counts; open or peeking, only the bezel itself does, so the
+      // screen and the quick-chat field below it keep their own clicks.
+      const putAway =
+        !container.classList.contains("active") && !miniChatOpen;
+      if (putAway || bezel?.contains(e.target as Node)) togglePhone();
     });
   }
 
@@ -7701,8 +8025,7 @@ function setupSpacePhoneOverlay() {
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" || miniChatOpen) return;
     if (container?.classList.contains("active")) return;
-    const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (isFormFieldTarget(e.target as HTMLElement | null)) return;
     const welcome = document.getElementById("welcome");
     if (welcome && getComputedStyle(welcome).display !== "none") return;
     if (roomEdit.isEditModeActive() || isDeviceFocusActive()) return;
@@ -7716,49 +8039,7 @@ function setupSpacePhoneOverlay() {
       // Suppress the browser's focus-cycling so Tab acts as a pure toggle,
       // and let it close the phone even while the chat input has focus.
       e.preventDefault();
-
-      if (tipIndicator) {
-        removeTipIndicator();
-      }
-
-      // 💬 QUICK CHAT: Tab from the mini bar EXPANDS to the full phone on the
-      // CHAT app (scrollable history) instead of the home-screen toggle.
-      if (miniChatOpen) {
-        closeMiniChat();
-        if (container && !container.classList.contains("active")) {
-          container.classList.add("active");
-          showPhoneView("chat");
-          logToPhoneSystem("Entering SpacePhone net...");
-        }
-        return;
-      }
-
-      if (container) {
-        // Don't let Tab OPEN the SpacePhone while editing the room: an open
-        // phone latches the #spacephone-container.active guard that swallows the
-        // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
-        // (zoom.ts), stranding the player in edit mode with no working exit.
-        // Tab may still CLOSE an already-open phone.
-        if (
-          roomEdit.isEditModeActive() &&
-          !container.classList.contains("active")
-        )
-          return;
-        container.classList.toggle("active");
-        if (container.classList.contains("active")) {
-          // Always land on the home screen (see view-router policy note above)
-          showPhoneView("home");
-          logToPhoneSystem("Entering SpacePhone net...");
-        } else {
-          chatInput?.blur();
-          // Hand focus back to whatever opened the phone from outside it. The
-          // phone is only moved offscreen, never display:none, so a control
-          // left focused inside it keeps answering the arrow keys against
-          // hidden rows — a keyboard player who opened TREASURY from the room
-          // terminal could not get back to the terminal at all.
-          releasePhoneOpener();
-        }
-      }
+      togglePhone();
     }
   });
 
@@ -8069,32 +8350,75 @@ async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
  *  change minutes after node startup (echo loop, portmapper mapping), so the
  *  panel re-polls this on an interval — a one-shot startup snapshot would
  *  pin the row (and freshly-minted invite hints) to a stale state. */
+/** How long one fingerprint probe may take, its body included: a service on
+ *  the port that accepts the request and never finishes answering would
+ *  otherwise hold the probe for good — no fall-through to the next port,
+ *  and no later round to withdraw the trust an earlier fingerprint earned. */
+const FINGERPRINT_PROBE_MS = 3_000;
+/** The newest probe: an older one still in flight when a newer one has
+ *  decided must not restore the trust the newer one withdrew. */
+let fingerprintProbeGen = 0;
+
 async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
-  let fingerprint: LocalFingerprint = { hex: "", base64: "", port: 4443 };
-  try {
-    const res = await fetch("http://127.0.0.1:8080/api/fingerprint");
-    fingerprint = await res.json();
-  } catch {
-    const res = await fetch("http://127.0.0.1:8081/api/fingerprint").catch(
-      () => null,
-    );
-    if (res) {
-      fingerprint = await res.json();
+  const gen = ++fingerprintProbeGen;
+  let fingerprint: LocalFingerprint | null = null;
+  let nodeOrigin = "";
+  // The node's HTTP origin as this page finds it: 8080, or 8081 when 8080
+  // was taken. A port is the node's only when it answers 200 with a
+  // fingerprint that meets the node's contract (nodeFingerprint.ts: 32
+  // bytes of hex, the same bytes in base64, a port); anything else on it —
+  // no answer, not JSON, `{}`, `{ hex: true }`, or an answer that never
+  // completes within the deadline — is a stranger, tried past to the next
+  // port rather than ending the probe. Nothing here throws.
+  for (const origin of ["http://127.0.0.1:8080", "http://127.0.0.1:8081"]) {
+    const ctl = new AbortController();
+    const deadline = window.setTimeout(() => ctl.abort(), FINGERPRINT_PROBE_MS);
+    try {
+      // No redirect: the trust that follows goes to the origin probed, so the
+      // answer must be that origin's own. A stranger on 8080 redirecting to
+      // the node on 8081 would otherwise have 8080 trusted on the node's
+      // fingerprint; with redirects refused the fetch throws and the next
+      // port is tried.
+      const res = await fetch(`${origin}/api/fingerprint`, { signal: ctl.signal, redirect: "error" });
+      if (!res.ok) continue;
+      // The body read runs under the same signal: a port that answers the
+      // headers and then trickles is cut off at the deadline too.
+      const parsed = parseNodeFingerprint(await res.json());
+      if (parsed) {
+        fingerprint = parsed;
+        nodeOrigin = origin;
+        break;
+      }
+    } catch {
+      // unreachable, timed out, or not JSON: the next port
+    } finally {
+      window.clearTimeout(deadline);
     }
   }
-  if (!fingerprint.hex) {
+  // A newer probe decided meanwhile (the panel's interval, a startup retry):
+  // its verdict stands, and this older one changes nothing — least of all
+  // the trust the newer one withdrew.
+  if (gen !== fingerprintProbeGen) return localFingerprint;
+  // Media from the node's origin plays in the theatre without asking
+  // (tvConsent.ts) — ONLY while the node answers as ours, with a fingerprint
+  // that meets its contract, not merely on a loopback port. The trust is
+  // decided afresh on every probe, so a round the node does not answer
+  // withdraws it: once the node is gone, whatever next binds its port is a
+  // stranger, until a fingerprint says otherwise. And it has a lifetime of
+  // its own (TV_NODE_TRUST_MS, one probe interval and a margin): a probe
+  // that never runs — a throttled tab, a stalled interval — withdraws it
+  // by lapse, so a stranger on the node's port between probes is not
+  // trusted for longer than that. (A service impersonating the node
+  // deliberately is beyond what this page can tell from here.)
+  setOwnMediaOrigins([window.location.origin]);
+  setNodeMediaOrigin(fingerprint ? nodeOrigin : null, tvNow(), tvWallNow());
+  if (!fingerprint) {
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
     renderReachabilityRow(localFingerprint);
     return localFingerprint;
   }
-  fingerprint.iroh_relay_urls = normalizeStringArray(
-    fingerprint.iroh_relay_urls,
-  );
-  fingerprint.iroh_direct_addrs = normalizeStringArray(
-    fingerprint.iroh_direct_addrs,
-  );
   localFingerprint = fingerprint;
   renderReachabilityRow(fingerprint);
   return fingerprint;
@@ -8548,7 +8872,7 @@ function setupNetworkDetailsPanel() {
       void networkProvider.resendRoomCap(on);
       if (feedback) {
         feedback.textContent = on
-          ? "Advanced Chia mesh mode ON for this room (experimental — needs a chia-lane node + funded testnet wallet; otherwise a harmless no-op)."
+          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once SSF_CHIA_LANE=1 and its testnet wallet is funded; chain reads are on for every node, and public rooms never publish)."
           : "Advanced Chia mesh mode OFF for this room.";
         setTimeout(() => {
           if (feedback) feedback.textContent = "";
@@ -8697,6 +9021,9 @@ function setupNetworkDetailsPanel() {
   // R1: keep the REACHABILITY row (and the cached fingerprint feeding invite
   // hints) live. Portmapper mappings and the echo advert appear/heal minutes
   // after node startup, and the node classifies per request — poll gently.
+  // This interval is also what renews the node origin's media trust
+  // (tvConsent TV_NODE_TRUST_MS is sized to it, with a margin): lengthen one
+  // and the other must follow.
   void refreshLocalFingerprint();
   window.setInterval(() => {
     void refreshLocalFingerprint();
@@ -9280,12 +9607,14 @@ let autoEnterRoomId: string | null = null;
 
 /** Enter a room from its pass — the ACCESS beam, now fast because a READY
  *  room is already warm on the node (no minutes-long re-dial). Also the DEV
- *  "jump now" path (immediate, before READY). */
-async function enterRoomFromPass(seed: string): Promise<void> {
-  const setAccessFeedback = (msg: string) => {
+ *  "jump now" path (immediate, before READY). `say` takes its progress and
+ *  failures: the ACCESS app's feedback line unless given (the holotable's
+ *  BEAM INTO puts them on a hint, #192). */
+async function enterRoomFromPass(seed: string, say?: (msg: string) => void): Promise<void> {
+  const setAccessFeedback = say ?? ((msg: string) => {
     const el = document.getElementById("access-feedback");
     if (el) el.textContent = msg;
-  };
+  });
   if (world.getPlayer().isInAdapterTransit()) {
     setAccessFeedback(
       "Docking transit in progress — enter once you are through.",
@@ -9713,12 +10042,13 @@ function updateHUDP2P(status: string, color: string) {
   }
 }
 
-// M-dep of #33: the fullscreen solar-map overlay is retired — the 'm' hotkey,
-// the #solarmap-toggle-btn and the +/- HUD zoom buttons are gone. The solar
-// map now lives INSIDE the world: click the holographic map table (M4) and
-// the same SolarSystemMap mounts into the device-focus panel (devices.ts
-// createMapTableUI). Keyboard +/- zoom survives in zoom.ts, clamped at
-// level 2 unless ?devzoom=1.
+// M-dep of #33: the fullscreen solar-map overlay is retired — the 'm' hotkey
+// and the #solarmap-toggle-btn are gone. The solar map now lives INSIDE the
+// world: click the holographic map table (M4) and the same SolarSystemMap
+// mounts into the device-focus panel (devices.ts createMapTableUI). The +/-
+// zoom keys live in zoom.ts; since #223 the HUD has +/- buttons again too, in
+// cameraRig's top-right view cross. Past the planet view both need
+// ?devzoom=1.
 function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
@@ -9757,6 +10087,31 @@ async function init() {
   world = new worldModule.World(scene);
   (window as any).world = world;
 
+  // 🥣 Faucet dish (#231 onboarding): the fixture's take / give / status
+  // requests go to the LOCAL node over the faucet lane, one stream each, and
+  // the node's reply comes back ON THAT STREAM, through onFaucetReply below
+  // and nowhere else: a `faucet` envelope on a node-opened stream is
+  // forwarded traffic a room peer could have sent, and the generic onEnvelope
+  // path (joinRoomAtEpoch) ignores it, so nothing a peer sends can pass for
+  // the node's answer. The reply lands in faucetDish.ts, which World reads
+  // ~1 Hz for the jar level and the mojo in the dish. A slow poll keeps the
+  // prop honest for players who never focus the screen (18.75 s blocks).
+  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
+  networkProvider.onFaucetReply((env: { payload?: string; room?: string; seq?: number }) => {
+    if (typeof env.payload !== "string" || typeof env.room !== "string") return;
+    // Only the room open right now is filed: the store drops a reply for a
+    // room already left (or never joined) at its gate (openFaucetRoom), the
+    // same gate a failed request's report passes.
+    const reply = parseFaucetReply(env.payload);
+    // A status carries the node's snapshot number, so an older look answered
+    // late cannot overwrite a newer one; the echoed `seq` ties a take/give
+    // reply to the request it answers (see setFaucetReply).
+    if (reply) setFaucetReply(env.room, reply, typeof env.seq === "number" ? env.seq : undefined);
+  });
+  window.setInterval(() => {
+    if (world.hasFaucetDish()) networkProvider.requestFaucet("status").sent.catch(() => {});
+  }, 60_000);
+
   // 🖱️ Right-click context menu (MOVE / DELETE on furniture) needs the world
   // OUTSIDE an edit session — same registration idiom as the owner gate below.
   setEditWorldProvider(() => world);
@@ -9770,6 +10125,71 @@ async function init() {
   // host) ask the same owner seam edit mode does.
   setPartyHostPredicate(() => canEditRoom().ok);
   setPartyIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  // 📺 #186: the TV's seams — the spare remote, the identity, the room roster
+  // for HAND TO…, and the chip that opens the theatre from anywhere in the
+  // room. 🔒 The spare remote is the DEED holder's (#142's split, in the
+  // isLocalPlayerRoomOwner docblock): taking the remote from a holder, or
+  // handing theirs on, unseats them, and the shareholder-extended edit gate
+  // can be satisfied by a peer-written venture record. The panels paint
+  // TAKE BACK from the same predicate (tvDoc.holdsSpareRemote).
+  setTvHostPredicate(() => currentRoomDeedIsMine());
+  setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  // The remote is held by a PAGE, not a key: two tabs share the identity
+  // (the seed is in localStorage) and must not both renew, beat and release.
+  setTvPageId(
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `page-${Math.random().toString(36).slice(2, 12)}`,
+  );
+  // 🕹 #193: two authorities for the cabinet (#142's split, in the
+  // isLocalPlayerRoomOwner docblock). Curation — the game, the
+  // emulator files — is the edit gate's, shareholder-extended. Unseating
+  // P1 (EJECT, sitting down over a held seat) is the DEED holder's alone:
+  // a peer-written venture record can satisfy the edit gate, and nobody is
+  // taken off the controls on the strength of one. The seat is held under
+  // my identity from this page.
+  setArcadeHostPredicate(() => canEditRoom().ok);
+  setArcadeEjectPredicate(() => currentRoomDeedIsMine());
+  setArcadeIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  setTvRoomPlayersProvider(() => {
+    const out: Array<{ pub: string; name: string }> = [];
+    const map = yjsSync?.doc.getMap("players");
+    if (!map) return out;
+    for (const [, raw] of map.entries()) {
+      const p = raw as Partial<PlayerEntry> | undefined;
+      if (p && typeof p.keyB64 === "string" && p.keyB64) {
+        out.push({ pub: p.keyB64, name: typeof p.name === "string" ? p.name.slice(0, PLAYER_NAME_MAX_LENGTH) : "" });
+      }
+    }
+    return out;
+  });
+  setTvTheatreDeps(tvTheatreDeps);
+  setTvChipOpener((itemId) => { openTvTheatreIfPresent(itemId); });
+  // The theatre fetches a peer-written URL only with this viewer's consent
+  // (tvConsent.ts). The page's own origin is this viewer's own machine; the
+  // node's origin joins it once the node has identified itself through the
+  // fingerprint probe (refreshLocalFingerprint) — a loopback port is never
+  // trusted for merely answering, since 8080 may be someone else's service
+  // the day the node fell back to 8081.
+  setOwnMediaOrigins([window.location.origin]);
+  // A remote handed to me pops the phone open on it (plan §3.2: the
+  // receiver's phone opens on the remote; no accept step). A pick-up of my
+  // own is not announced — `by` names the giver.
+  let tvHeldBefore = new Set<string>();
+  subscribeTv(() => {
+    const me = getIdentityPub();
+    const held = new Set(roomTvIds().filter((id) => iHoldRemote(id)));
+    for (const id of held) {
+      if (tvHeldBefore.has(id)) continue;
+      const rec = readRemote(id);
+      if (rec.by && rec.by !== me) {
+        selectTvRemote(id); // the phone shows the remote just received, not an earlier one
+        showHint("📺 Someone handed you the TV remote.");
+        (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
+      }
+    }
+    tvHeldBefore = held;
+  });
   setRoomEditPermission(() => {
     // Leaving: the old room's doc is still bound and its writes still go out,
     // but it isn't this client's room any more (roomLeavesUnderWay).
@@ -9877,7 +10297,7 @@ async function init() {
   setupNetworkDetailsPanel();
   setupZoomView();
 
-  // Camera rig: 45° view-rotation arrows (bottom-left HUD, next to DEV).
+  // Camera rig: the top-right view cross — 45° rotation arrows + zoom (#223).
   // Injected probes keep cameraRig.ts import-cycle-free: it must not import
   // zoom.ts (which imports it for rotated level snaps) nor deviceFocus.ts.
   initCameraRig({
@@ -9885,6 +10305,13 @@ async function init() {
     isCameraBusy: () => isDeviceFocusActive(),
     // 🎬 The rig adds the slow station drift while the space view is up.
     isExteriorDrifting: () => isExteriorActive(),
+    // ➕➖ #223: the HUD cross's zoom buttons, the same steps as +/-.
+    zoom: {
+      stepIn: () => multiScaleZoom?.stepIn(),
+      stepOut: () => multiScaleZoom?.stepOut(),
+      canZoomIn: () => multiScaleZoom?.canZoomIn() ?? false,
+      canZoomOut: () => multiScaleZoom?.canZoomOut() ?? false,
+    },
   });
 
   // DEV1: temporary Development menu (owner request, demo phase — will be
@@ -10095,7 +10522,7 @@ function setupClickToEnter() {
 
 function findSlotMachineControl(scene: THREE.Scene): {
   deviceId: string;
-  control: "denomination" | "pull" | "service";
+  control: "denomination" | "pull" | "service" | "settings";
   value?: number;
 } | null {
   const controls: THREE.Object3D[] = [];
@@ -10107,7 +10534,7 @@ function findSlotMachineControl(scene: THREE.Scene): {
   const hit = raycaster.intersectObjects(controls, false)[0];
   if (!hit) return null;
   const control = hit.object.userData.slotControl;
-  if (control !== "denomination" && control !== "pull" && control !== "service") return null;
+  if (control !== "denomination" && control !== "pull" && control !== "service" && control !== "settings") return null;
   return {
     deviceId: hit.object.userData.slotMachineId as string,
     control,
@@ -10115,6 +10542,17 @@ function findSlotMachineControl(scene: THREE.Scene): {
       ? { value: hit.object.userData.slotValue as number }
       : {}),
   };
+}
+
+/** 🕹 The ⚙️ low on an arcade cabinet's front (#193): the cabinet it opens. */
+function findArcadeControl(scene: THREE.Scene): { deviceId: string; control: "settings" } | null {
+  const controls: THREE.Object3D[] = [];
+  scene.traverse((child) => {
+    if (child.userData?.arcadeControl && child.userData.arcadeCabinetId) controls.push(child);
+  });
+  const hit = raycaster.intersectObjects(controls, false)[0];
+  if (!hit || hit.object.userData.arcadeControl !== "settings") return null;
+  return { deviceId: hit.object.userData.arcadeCabinetId as string, control: "settings" };
 }
 
 function onCanvasClick(event: MouseEvent): void {
@@ -10139,6 +10577,8 @@ function onCanvasClick(event: MouseEvent): void {
     mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
     mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
     raycaster.setFromCamera(mouse, deviceFocus.getCamera() ?? focusRenderer.camera);
+    const gearItem = pickSettingsGear(focusRenderer.scene, raycaster);
+    if (gearItem && world.openSettingsCard(gearItem)) return;
     const slotControl = findSlotMachineControl(focusRenderer.scene);
     if (slotControl
       && world.handleSlotMachineControl(
@@ -10146,6 +10586,8 @@ function onCanvasClick(event: MouseEvent): void {
         slotControl.control,
         slotControl.value,
       )) return;
+    const arcadeControl = findArcadeControl(focusRenderer.scene);
+    if (arcadeControl && world.handleArcadeControl(arcadeControl.deviceId, arcadeControl.control)) return;
   }
   if (isDeviceFocusActive()) {
     deviceFocus.release();
@@ -10171,6 +10613,9 @@ function onCanvasClick(event: MouseEvent): void {
 
   raycaster.setFromCamera(mouse, camera);
 
+  const gearItem = pickSettingsGear(scene, raycaster);
+  if (gearItem && world.openSettingsCard(gearItem)) return;
+
   const slotControl = findSlotMachineControl(scene);
   if (slotControl
     && world.handleSlotMachineControl(
@@ -10178,6 +10623,8 @@ function onCanvasClick(event: MouseEvent): void {
       slotControl.control,
       slotControl.value,
     )) return;
+  const arcadeControl = findArcadeControl(scene);
+  if (arcadeControl && world.handleArcadeControl(arcadeControl.deviceId, arcadeControl.control)) return;
 
   // ── Intercept Golden Keypad Clicks for our Docking System
   if (world.dockingSystem) {
@@ -10568,6 +11015,8 @@ function animate() {
 
       const packed = packTick(tickData);
       networkProvider.sendTick(packed);
+      // 🪑 The counter a peer will see — breaks a seat clash (seatOccupancy).
+      world.noteSentTickSeq(tickData.seq);
       lastTickSent = currentTime;
     }
   } else {

@@ -81,4 +81,14 @@ describe('the holotable\'s "you are here" for a ship', () => {
     expect(writeFlightRecord({ status: 'in-flight', locationId: 'alpha', destinationId: 'beta', departedAt: T0, etaAt: T0 + 60_000 })).toBe(true);
     expect(holotableStation()?.id).toBe('home');
   });
+
+  it('is no station while flown by hand, a ship or a one-module station flying by itself', () => {
+    expect(writeFlightRecord({ status: 'docked', locationId: 'beta' })).toBe(true);
+    expect(writeFlightRecord({ status: 'free-flight', locationId: 'beta' })).toBe(true);
+    expect(holotableStation()).toBeNull();
+    registerStation({ id: 'home', name: 'HOME', planetId: DEFAULT_PLANET_ID, orbitSlot: 3, welcomeRoomId: 'room-ship' });
+    setStationRoomCheck(() => 'welcome-room');
+    lose('engine-block');
+    expect(holotableStation()).toBeNull();
+  });
 });

@@ -12,9 +12,14 @@
  * Editing reuses the door panels rather than copying them: in the room you
  * stand in, each door has an OPEN DOOR PANEL button, which steps back from
  * the table and opens that door's own panel (provision a new module, fit or
- * remove a vestibule, undock). 🔧 Taking a module apart is a robot job set
- * at a charging dock (disassembly.ts): the plan shows each job's progress,
- * and a module joined to your room says what it would take.
+ * remove a vestibule, undock). Another module of the station you stand in
+ * has a BEAM INTO button when this install holds a pass to it: the ACCESS
+ * beam takes you in, where its own door panels do the editing (editAccess),
+ * so the table reaches no room the ACCESS app couldn't. A module whose door
+ * back no walk-through has paired yet waits for that first walk. 🔧 Taking
+ * a module apart is a robot job set at a charging dock (disassembly.ts): the
+ * plan shows each job's progress, and a module joined to your room says what
+ * it would take.
  *
  * All text from the atlas and the summaries is peer-written: it reaches the
  * page through textContent only.
@@ -24,11 +29,13 @@ import type { StationRecord } from './stations';
 import type { AtlasEntry } from './stationAtlas';
 import type { ShipSummary } from './planetSummary';
 import type { PlanModule, StationPlan, VisitingShip } from './stationPlan';
-import { moduleCorners, planModuleAt, stationPlan, visitingShips } from './stationPlan';
+import { editAccess, moduleCupolaGlass, moduleOutline, planModuleAt, stationPlan, visitingShips } from './stationPlan';
+import { cupolaWallsLabel } from './cupola';
 import { TILE_SIZE } from './floorPlanDoc';
 import { legacyOwnerMarker } from './roomOwner';
 import type { DisassemblyCandidate, DisassemblyJob } from './disassembly';
 import { jobFraction, jobStatusText, ownerIsMe } from './disassembly';
+import { statusFromWire } from './departuresBoard';
 
 export interface StationPlanDeps {
   atlas: () => Record<string, AtlasEntry>;
@@ -50,6 +57,11 @@ export interface StationPlanDeps {
   doors: () => Array<{ id: string; label: string }>;
   /** Step back from the table and open a door's own panel. */
   openDoorPanel: (doorId: string) => void;
+  /** ✏️ Does this install hold a pass to that room (the ACCESS beam's)? */
+  canBeamTo?: (roomId: string) => boolean;
+  /** ✏️ Step back from the table and beam into that room, where its own
+   *  door panels do the editing. */
+  beamTo?: (roomId: string) => void;
   /** Leave the plan for the solar plot. */
   onBack: () => void;
   /** 🔧 The room you stand in: its disassembly jobs, and the modules joined
@@ -62,6 +74,11 @@ const GOLD_BRIGHT = '#F0C060';
 const DIM = 'rgba(212,168,75,0.5)';
 const CYAN = '#00d4ff';
 const SHIP = '#7fd7a8';
+/** 🔭 Cupola glass on the plan. */
+const CUPOLA_GLASS = '#9fe8ff';
+const CUPOLA_GLASS_FILL = 'rgba(159,232,255,0.22)';
+/** A full-width action button in the side panel. */
+const ACTION_CSS = `margin-top:5px; width:100%; text-align:left; border-radius:6px; border:1px solid rgba(212,168,75,0.35); background:rgba(212,168,75,0.08); color:${GOLD}; padding:6px 8px; cursor:pointer; font-size:10px; font-family:inherit;`;
 
 /** Short form of an owner id with no known name. */
 function shortId(id: string): string {
@@ -266,7 +283,8 @@ export class StationPlanView {
     const active = document.activeElement;
     const keep = active instanceof HTMLElement && this.root?.contains(active)
       ? (active.dataset.roomId !== undefined ? `[data-room-id="${CSS.escape(active.dataset.roomId)}"]`
-        : active.dataset.doorId !== undefined ? `[data-door-id="${CSS.escape(active.dataset.doorId)}"]` : null)
+        : active.dataset.doorId !== undefined ? `[data-door-id="${CSS.escape(active.dataset.doorId)}"]`
+          : active.dataset.beamRoomId !== undefined ? `[data-beam-room-id="${CSS.escape(active.dataset.beamRoomId)}"]` : null)
       : null;
     this.drawCanvas();
     this.renderCard();
@@ -342,7 +360,8 @@ export class StationPlanView {
     // other berth is stale.
     const listed = new Set(this.visiting.filter((s) => s.state === 'docked' && s.onPlan).map((s) => s.roomId));
     for (const m of [...plan.modules, ...plan.ships]) {
-      const corners = moduleCorners(m).map((c) => toPx(c.x, c.z));
+      // 🔭 The footprint, its corners cut at a cupola end (issue 219).
+      const corners = moduleOutline(m).map((c) => toPx(c.x, c.z));
       const isShip = m.kind === 'ship';
       // A berth the ship itself says it left is drawn faint.
       const stale = isShip && !listed.has(m.roomId);
@@ -387,6 +406,23 @@ export class StationPlanView {
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // 🔭 Each cupola end: its glass taper tinted, the tip window bright.
+      for (const glass of moduleCupolaGlass(m)) {
+        const taper = glass.taper.map((p) => toPx(p.x, p.z));
+        ctx.beginPath();
+        taper.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+        ctx.closePath();
+        ctx.fillStyle = CUPOLA_GLASS_FILL;
+        ctx.fill();
+        const [a, b] = glass.tip.map((p) => toPx(p.x, p.z));
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = CUPOLA_GLASS;
+        ctx.stroke();
+      }
+
       const c = toPx(m.x, m.z);
       // 🔧 Being taken apart: hatched, with how far the robots have got.
       const job = isShip ? undefined : this.jobs.get(m.roomId);
@@ -427,6 +463,14 @@ export class StationPlanView {
     }
   }
 
+  /** 🔭 Which end walls are cupolas, as the room editor's button names them. */
+  private cupolaText(m: PlanModule): string {
+    if (m.cupola === undefined) return 'Not known yet (someone must stand in it once).';
+    if (m.cupola.length === 0) return 'None';
+    if (m.cupola.length === 2) return `🔭 Both ends (${cupolaWallsLabel(m.cupola)})`;
+    return `🔭 The ${m.cupola[0]} end`;
+  }
+
   private ownerText(m: PlanModule): string {
     if (m.owner === undefined) return 'Owner not known yet (someone must stand in it once).';
     // null, or the pre-S2 marker: no verifiable owner (roomOwner.ts).
@@ -459,6 +503,8 @@ export class StationPlanView {
       row(this.ownerText(m), CYAN),
       heading('Size'),
       row(m.dims ? `${m.dims.cols} × ${m.dims.rows} tiles` : 'Not known yet (drawn at the default 2 × 2)'),
+      heading('Cupola'),
+      row(this.cupolaText(m), m.cupola?.length ? CUPOLA_GLASS : undefined),
     );
     if (isShip) {
       if (m.dockedAt) {
@@ -490,15 +536,27 @@ export class StationPlanView {
       }
     }
 
-    // ✏️ Editing: the door panels of the room you stand in.
+    // ✏️ Editing: the door panels of the room you stand in; another module
+    // of the station, by the ACCESS beam with a pass this install holds.
     card.append(heading('Build and edit'));
-    if (!m.here) {
-      card.append(row(m.kind === 'module' && this.plan.modules.some((x) => x.here)
-        ? 'Walk to this module to work on its doors.'
-        : 'Edit a module from a holotable inside the station.', DIM));
+    const access = editAccess(this.plan, m.roomId, (id) => this.deps.canBeamTo?.(id) ?? false);
+    if (access === 'here') {
+      this.renderDoorButtons(card, m);
       return;
     }
-    this.renderDoorButtons(card, m);
+    if (access === 'beam') {
+      card.append(row('Beam into this module to work on its doors from inside, as the ACCESS beam enters a room you hold a pass to.', DIM));
+      const btn = el('button', ACTION_CSS, `✨ BEAM INTO ${m.name}`);
+      btn.dataset.beamRoomId = m.roomId;
+      btn.addEventListener('click', () => this.deps.beamTo?.(m.roomId));
+      card.append(btn);
+      return;
+    }
+    card.append(row(access === 'walk-first'
+      ? "Walk to this module through the station's doors first: its door back is paired on the first walk-through, which a beam skips."
+      : access === 'walk'
+        ? 'Walk to this module to work on its doors: this install holds no pass to beam into it.'
+        : 'Edit a module from a holotable inside the station.', DIM));
   }
 
   /** 🔧 A module being taken apart says how far along; one joined to your
@@ -525,7 +583,7 @@ export class StationPlanView {
     const doors = this.deps.doors();
     if (doors.length === 0) card.append(row('No doors in this room.', DIM));
     for (const d of doors) {
-      const btn = el('button', `margin-top:5px; width:100%; text-align:left; border-radius:6px; border:1px solid rgba(212,168,75,0.35); background:rgba(212,168,75,0.08); color:${GOLD}; padding:6px 8px; cursor:pointer; font-size:10px; font-family:inherit;`);
+      const btn = el('button', ACTION_CSS);
       const link = m.links.find((l) => l.doorId === d.id);
       btn.textContent = `🚪 ${d.label}${link ? ` → ${this.nameOf(link.toRoomId)}` : ' (free)'} · OPEN DOOR PANEL`;
       btn.dataset.doorId = d.id;
@@ -575,8 +633,9 @@ export class StationPlanView {
           // Past its arrival time (late, or arrived and still docking): when it was due.
           ? `arriving${s.at !== undefined ? (s.at >= now ? ` ${when(s.at, now)}` : `, due ${when(s.at, now)}`) : ''}`
           : `leaving${s.at !== undefined ? ` (${when(s.at, now)})` : ''}`;
+      // 🚏 A ferry's status in the departures board's words, not its wire id.
       const item = el('div', `font-size:11px; line-height:1.5; color:${s.state === 'docked' ? SHIP : GOLD}; cursor:${drawn.has(s.roomId) ? 'pointer' : 'default'};`,
-        `🚀 ${s.name} · ${where}${s.routeStatus ? ` · ${s.routeStatus.toUpperCase()}` : ''}`);
+        `🚀 ${s.name} · ${where}${s.routeStatus ? ` · ${statusFromWire(s.routeStatus)}` : ''}`);
       if (drawn.has(s.roomId)) {
         item.addEventListener('click', () => {
           this.selected = s.roomId;

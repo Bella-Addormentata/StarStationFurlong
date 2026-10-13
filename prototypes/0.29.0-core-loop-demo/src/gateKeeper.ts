@@ -28,7 +28,9 @@
  *                         station (as a DOCK checks): the stop's own gate
  *                         first, another only when the stop allows a gate
  *                         change. GATE_DOCK_DEFER_MS after the arrival, so a
- *                         rider's keeper goes first.
+ *                         rider's keeper goes first. Nothing at a stop whose
+ *                         station has left the orbit the route copied of it
+ *                         (routeKeeper.stopStationMoved): riders skip it.
  *   cast off              UNDOCKS the ferry from this room's gate,
  *                         GATE_CAST_OFF_DEFER_MS after the departure (inside
  *                         the keeper's CAST_OFF_LATE_MS, so the leg stands).
@@ -56,7 +58,9 @@
  * while its claim settles, or a station move, a tow or this room's flight
  * that starts meanwhile, or this station found gone from where it orbited as
  * the dock began (by the moves the ferry's room holds, learned as a far write
- * learns them); once the ferry's side has docked too, such a gate has the
+ * learns them), or a DEPART begun at the ferry's helm meanwhile (its shared
+ * cast-off hold, or once that has ended, the route it paused or the stay it
+ * left); once the ferry's side has docked too, such a gate has the
  * dock withdrawn at both ends. The gate is read again before the
  * dock counts, or before it takes a crossing DOCK's stamp: another game may
  * have written over the claim while the ferry's side was asked, and then the
@@ -67,7 +71,8 @@
  * Nothing is written to the gate once the keeper has reset (the player left,
  * even if they came straight back). While a DEPART casts the ferry off under
  * the shared hold (shipDoc.ts readCastOffHold), the keeper takes no step of
- * its own: that DEPART has the docks until it ends.
+ * its own, and a dock of its own under way gives way as above: that DEPART
+ * has the docks until it ends.
  *
  * The gate's record needs the ferry's address and its port's pose (the far
  * wall and lateral): both come from a record in this room that names the
@@ -192,14 +197,17 @@ import {
 import {
   KEEPER_RETRY_MAX_MS,
   KEEPER_RETRY_MS,
+  directoryStationFor,
   keeperMemoryAt,
   keeperStep,
   newestTimedStay,
   standingHold,
   stayHasDock,
   stayResumed,
+  stopStationMoved,
   type KeeperDocks,
   type KeeperMemory,
+  type KeeperPassDeps,
   type KeeperPort,
   type KeeperStep,
   type KeeperView,
@@ -645,7 +653,7 @@ export function ferryLook(o: {
 // ── What the gate keeper does with a step ────────────────────────────────────
 
 export type GateMove =
-  | { kind: 'none'; why: 'idle' | 'defer' | 'not-here' | 'claimed' | 'no-gate' | 'not-ours' | 'renew' }
+  | { kind: 'none'; why: 'idle' | 'defer' | 'not-here' | 'moved' | 'claimed' | 'no-gate' | 'not-ours' | 'renew' }
   /** Every gate the ferry may dock at would put it on top of another module
    *  here: the first of them, and the module. */
   | { kind: 'none'; why: 'overlap'; gate: GateView; module: string }
@@ -677,6 +685,9 @@ export function gateMove(o: {
   /** The module the ferry would overlap docked at this gate (as a DOCK
    *  checks), or null. Default: none. */
   overlap?: (gate: GateView) => string | null;
+  /** 🚚🎚️ Has the current stop's station left the orbit the route copied of
+   *  it (routeKeeper.stopStationMoved)? Default: no. */
+  moved?: boolean;
   now: number;
 }): GateMove {
   const { step, look, now } = o;
@@ -701,6 +712,11 @@ export function gateMove(o: {
     case 'dock': {
       const stop = look.view.route.stops[f.stopIndex];
       if (!stop || stop.berth.roomId !== o.roomId) return none('not-here');
+      // 🚚🎚️ The station has left the orbit the route copied of it: the
+      // timetable brought the ferry to where it was, out of every gate's
+      // reach, and riders' keepers skip the stop (routeKeeper.runKeeperPass).
+      // A dock here would carry the ferry across without a transfer.
+      if (o.moved === true) return none('moved');
       // A gate's claim on the ferry its port does not hold is a DOCK under
       // way (a rider's, or this keeper's own unacknowledged one): it lands,
       // or the gate lets it go (gateFixes). Never a second dock beside it.
@@ -920,8 +936,10 @@ export type StationDockResult =
          *  or its dock settled (AUTO-DOCK switched off, it no longer admits
          *  the ferry, a station move, a tow or this room's flight locks it,
          *  its station was found gone from where it orbited as the dock
-         *  began, or the keeper reset): the claim is taken back, or a dock
-         *  both ends held is withdrawn at both, where it may be. */
+         *  began, a DEPART began at the ferry's helm or the ferry left the
+         *  stay the dock was for, or the keeper reset):
+         *  the claim is taken back, or a dock both ends held is withdrawn at
+         *  both, where it may be. */
         | 'disabled';
       /** A withdrawn dock's release was written to the ferry's room but
        *  never acknowledged: its port may still hold the gate, which has let
@@ -937,11 +955,13 @@ export type StationDockResult =
  * joined; a claim on the ferry the gate already holds is left to land. A dock
  * counts only while both ends hold its stamp, and nothing is written over a
  * gate record another game wrote meanwhile. A gate no longer live (GateEnd),
- * or whose station is found gone from where it orbited as the dock began,
- * once the dock has landed has it withdrawn at both ends. The request
- * carries no requester key: nobody aboard docks it, so a ferry port open only
- * to granted captains refuses it, whoever stands in the station. Never
- * throws.
+ * or whose station is found gone from where it orbited as the dock began, or
+ * a ferry whose helm began a DEPART meanwhile (its shared cast-off hold), or
+ * that is no longer in the stay the dock is for (`inStay`), has
+ * the claim taken back, or the dock withdrawn at both ends once it has
+ * landed. The request carries no requester key: nobody aboard docks it, so a
+ * ferry port open only to granted captains refuses it, whoever stands in the
+ * station. Never throws.
  */
 export async function stationDock(o: {
   session: FerryDocSession;
@@ -951,25 +971,50 @@ export async function stationDock(o: {
   berthing: FerryBerthing;
   now: () => number;
   wait: (ms: number) => Promise<void>;
+  /** Is the ferry still in the stay this dock is for, by the route in its
+   *  own doc? A DEPART can begin and end while the dock waits, and its hold
+   *  goes with it, but not what it wrote: a hand DEPART pauses the route
+   *  (helmRoute.pauseRouteFromHelm). Default: yes. */
+  inStay?: () => boolean;
 }): Promise<StationDockResult> {
   const { session, gate, shipRoomId, shipPort, berthing } = o;
   const doc = session.doc;
   // 🚚 Where this station orbits as the dock begins (none for a lone module).
   const berthAt = gate.place?.();
+  /** Has a DEPART at the ferry's helm taken the shared cast-off hold
+   *  (shipDoc.ts) since the keeper looked (act)? That DEPART has the
+   *  ferry's docks until it ends: a dock landed meanwhile would see the
+   *  ferry fly off from a gate still holding it. A hold that cannot be read
+   *  counts as one. */
+  const departing = (): boolean => {
+    try {
+      return castOffHoldIn(doc.getMap(SHIP_MAP), o.now()) !== null;
+    } catch {
+      return true;
+    }
+  };
   /** Is the gate still one this keeper docks at, its station still where it
-   *  orbited as the dock began? The moves the ferry's room holds are learned
-   *  first, as a far write learns its room's (farDoorWrite.writeAndSettle):
-   *  a station found gone since (left for another planet, on a list here
-   *  that had not heard) is out of the ferry's reach, and a dock to it would
-   *  carry the ferry across without a transfer (as docking.ts redockPort
-   *  rechecks shipArrival.berthStillThere). */
+   *  orbited as the dock began, no DEPART under way at the ferry's helm, and
+   *  the ferry still in the stay the dock is for (a DEPART that ended)?
+   *  The moves the ferry's room holds are learned first, as a far write
+   *  learns its room's (farDoorWrite.writeAndSettle): a station found gone
+   *  since (left for another planet, on a list here that had not heard) is
+   *  out of the ferry's reach, and a dock to it would carry the ferry across
+   *  without a transfer (as docking.ts redockPort rechecks
+   *  shipArrival.berthStillThere). Checked after every wait. */
   const stillLive = (): boolean => {
     try {
       rememberMovesIn(doc);
     } catch (err) {
       console.warn('[gate] reading the moves in the ferry room failed:', err);
     }
-    return gate.live() && gate.place?.() === berthAt;
+    let staying = false;
+    try {
+      staying = o.inStay?.() ?? true;
+    } catch (err) {
+      console.warn("[gate] reading the ferry's stay failed:", err);
+    }
+    return gate.live() && gate.place?.() === berthAt && !departing() && staying;
   };
   const held = (rec: DoorRecord | undefined): rec is DoorPairing => holdsFerry(rec, shipRoomId, shipPort);
   const pairingAt = (dockedAt: number): DoorPairing =>
@@ -1256,6 +1301,11 @@ export interface GateKeeperDeps {
   /** A fresh "is this room part of the stop's station?" per read
    *  (routeKeeper.sameStationReader). Default: the stop's berth room only. */
   sameStation?: () => (stop: RouteStop, roomId: string) => boolean;
+  /** 🚚🎚️ The stop's station in this game's directory, as riders' keepers
+   *  read it (RouteKeeperDeps.station): one that has left the orbit the
+   *  route copied of it is docked nowhere (routeKeeper.stopStationMoved).
+   *  Default: routeKeeper.directoryStationFor. */
+  station?: (stop: RouteStop) => KeeperPassDeps['station'];
   /** Is this ship towing a station? Default: no. */
   towing?: (shipRoomId: string, now: number) => boolean;
   /** Publish a ferry snapshot to this room's departures map. */
@@ -1769,11 +1819,16 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const step = keeperStep(look.view);
     // Where the ferry's port would put its module at each gate.
     const overlap = (g: GateView): string | null => (berthing ? overlapAt(w, g.doorId, berthing) : null);
-    const move = gateMove({ step, look, gates, settling: retired, roomId, shipRoomId: w.ship, near, overlap, now });
+    // 🚚🎚️ Is the current stop's station still where the route copied it,
+    // by this game's directory (as riders' keepers judge it)?
+    const stop = route.stops[look.view.flight.stopIndex];
+    const moved = !!stop && step.kind === 'dock'
+      && safe(() => stopStationMoved(stop, (deps.station ?? directoryStationFor)(stop)), false);
+    const move = gateMove({ step, look, gates, settling: retired, roomId, shipRoomId: w.ship, near, overlap, moved, now });
     const dockLocked = (): boolean => safe(() => deps.dockLocked?.([roomId, w.ship], now) === true, false);
     switch (move.kind) {
       case 'none':
-        if (move.why === 'no-gate' || move.why === 'overlap') {
+        if (move.why === 'no-gate' || move.why === 'overlap' || move.why === 'moved') {
           mem.nextPassAt = now + KEEPER_RETRY_MS;
           mem.verdict = 'none';
         }
@@ -1850,6 +1905,15 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         const gen = generation;
         const legSeq = look.view.flight.legSeq;
         const run = route.startedAt;
+        const stopIndex = look.view.flight.stopIndex;
+        // The stay the ferry's route still rules, as this look found it: a
+        // hand DEPART that began and ended meanwhile paused the route.
+        const inStay = (): boolean => {
+          const again = ferryLook({ doc: session.doc, capacity, now: clock(), sameStation, memory: null });
+          const f = again?.view.flight;
+          return !!f && again!.view.route.startedAt === run && f.legSeq === legSeq && f.stopIndex === stopIndex
+            && f.status === 'docked';
+        };
         void stationDock({
           session,
           gate: gateEnd(w, move.gate.doorId, roomId),
@@ -1858,6 +1922,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
           berthing,
           now: clock,
           wait,
+          inStay,
         }).then((r) => {
           if (gen !== generation) return;
           w.busy = false;

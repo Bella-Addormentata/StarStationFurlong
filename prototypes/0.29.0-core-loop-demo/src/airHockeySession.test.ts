@@ -10,8 +10,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 
 // The module publishes a debug handle on `window` when it loads (and
-// furniture.ts reads the page's query string).
-vi.stubGlobal('window', { location: { search: '' } });
+// furniture.ts reads the page's query string; editMode listens for keys).
+vi.stubGlobal('window', { location: { search: '' }, addEventListener: () => {}, removeEventListener: () => {} });
 
 const { bindCasinoDoc } = await import('./casinoDoc');
 const { bindGamesDoc, readAirHockey, writeGame } = await import('./games/gamesDoc');

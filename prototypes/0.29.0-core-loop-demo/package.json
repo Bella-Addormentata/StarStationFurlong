@@ -1,6 +1,6 @@
 {
   "name": "starstation-furlong-core-demo",
-  "version": "0.38.0",
+  "version": "0.39.0",
   "type": "module",
   "description": "StarStation Furlong - Phase 1 Core Loop Demo",
   "author": "StarStation Team",
@@ -9,7 +9,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "fetch:emulatorjs": "node scripts/fetch-emulatorjs.mjs",
+    "pack:emulatorjs-source": "node scripts/pack-emulatorjs-source.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
@@ -21,6 +23,7 @@
   "dependencies": {
     "@noble/ed25519": "^2.1.0",
     "@noble/hashes": "^1.5.0",
+    "jsnes": "^2.1.0",
     "msgpackr": "^1.12.1",
     "three": "^0.167.1",
     "y-indexeddb": "^9.0.12",

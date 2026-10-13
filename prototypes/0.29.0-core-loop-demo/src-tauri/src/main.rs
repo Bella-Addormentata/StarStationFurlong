@@ -201,6 +201,33 @@ fn main() {
     tauri::Builder::default()
         .manage(hub_for_commands)
         .invoke_handler(tauri::generate_handler![get_fingerprint, rotate_fingerprint])
+        .setup(|app| {
+            // 🕹 The window is built here, not by tauri.conf.json ("create":
+            // false), for the arcade cabinet's emulator frame. That frame is an
+            // opaque origin (src/arcadeEmulator.ts), so its fetches of the
+            // engine's cores carry `Origin: null`, which the app protocol's own
+            // Access-Control-Allow-Origin (this window's origin) refuses. The
+            // files under /emulatorjs/ are public and answer any origin, as the
+            // dev server's do (vite.config.ts); nothing else changes.
+            let config = app
+                .config()
+                .app
+                .windows
+                .first()
+                .cloned()
+                .ok_or("tauri.conf.json names no window")?;
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+                .on_web_resource_request(|request, response| {
+                    if request.uri().path().starts_with("/emulatorjs/") {
+                        response.headers_mut().insert(
+                            tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                            tauri::http::HeaderValue::from_static("*"),
+                        );
+                    }
+                })
+                .build()?;
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(move |_app, event| {

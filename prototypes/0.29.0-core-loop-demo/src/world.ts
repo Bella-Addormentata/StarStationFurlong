@@ -22,9 +22,11 @@ import {
 } from "./poolWaiter";
 import type { WorkoutPose } from "./voxelCharacter";
 import { InputManager } from "./input";
-import { findSeatAt, rebuildSeats, SEATS } from "./seats";
+import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
+import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
+import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
   canRunCroupier,
@@ -40,6 +42,7 @@ import {
   closeCrapsTable,
   crapsBeatLine,
   tickAutoStickman,
+  tickManualCraps,
 } from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
@@ -66,6 +69,7 @@ import { pilotLine, pilotPost, pilotSpeechAfter, readPilotView, type PilotSpeech
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
+  ARCADE_CABINET_KINDS,
   FURNITURE,
   FURNITURE_DEFS,
   DEFAULT_FOOTPRINT_OVERRIDES,
@@ -80,8 +84,18 @@ import {
   bridgeDeckY,
   floorCutOutlines,
   isFloorCutKind,
+  rotXZ,
+  type Rot,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
+// 🎲🎡 #226: craps + roulette play on the 3D table — the frame driver, the
+// focused-table controls, and the pieces' handle type.
+import {
+  casinoTablesFrame,
+  createCasinoTableUI,
+  forgetCasinoTable,
+} from "./casinoTableSession";
+import type { CasinoTableVisualHandle } from "./casinoTable3d";
 import { northDoorUnlocked } from "./stationParts";
 import { rebuildObstacles } from "./obstacles";
 import {
@@ -107,7 +121,7 @@ import {
   writeDoorTombstone,
   type DoorRecord,
 } from "./doorsDoc";
-import { roomHalfExtents, roomWalkBounds, roomCupola, readCupolaWall } from "./floorPlanDoc";
+import { roomHalfExtents, roomWalkBounds, roomCupolas, readCupolaWalls } from "./floorPlanDoc";
 import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled, sharedRoomsNaming } from "./stationAtlas";
@@ -117,7 +131,10 @@ import { createStationHelmUI } from "./stationHelm";
 import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
-import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
+import {
+  chooseArrivalDoor, doorBeingCrossed,
+  type ArrivalDoor, type CrossingDoor,
+} from "./doorMatch";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -145,12 +162,12 @@ import {
   createGameTableUI,
   createHelmUI,
   createCashierUI,
-  createRouletteUI,
-  createCrapsUI,
+  createFaucetDishUI,
   createSlotMachineUI,
   operateActiveSlotMachine,
   clearPendingSlotPlays,
   createCoinPusherUI,
+  coinPusherGearCard,
   createRobotDockUI,
   createCloneVatUI,
   createDeparturesBoardUI,
@@ -158,6 +175,8 @@ import {
   readLiveRoomStatus,
 } from "./devices";
 import { boardGate } from "./departuresDoc";
+// ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
+import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import {
   closeCoinPusher,
@@ -169,18 +188,32 @@ import { registerFurnitureHandles } from "./furnitureHandles";
 import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
+  TvScreenHandle,
+  ArcadeScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
+  FaucetDishHandle,
   SlotMachineVisualHandle,
   PropAnimHandle,
   SlotMachineCabinetControl,
   CoinPusherVisualHandle,
+  ArcadeCabinetVisualHandle,
   AirHockeyVisualHandle,
+  AlligatorsVisualHandle,
   DeviceUI,
   DeviceTarget,
 } from "./devices";
-import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
+import { subscribeGames, readTable, clearTable } from "./games/gamesDoc";
+import { seatOf, standIndexFor } from "./games/checkersTable";
+import { chessSeatOf, chessStandIndexFor } from "./games/chessTable";
+import { createCheckersTableLayer } from "./checkersSession";
+import { createChessTableLayer, paintGameTable } from "./chessSession";
+import { createArcadeCabinetUI as createNesCabinetUI } from "./arcadeNesCabinet";
+// 🕹️ Shared arcade games: every cabinet's game runs on every page in the
+// room from the host's button presses (arcadeNesSession.ts).
+import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeNesSession";
+import { writeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -188,7 +221,19 @@ import {
   closeAirHockeyTable,
   createAirHockeyUI,
   registerAirHockeyVisual,
+  airHockeyGearCard,
 } from "./airHockeySession";
+// 🐊 #185: the insatiable-alligators live layer — the same hand-off as air
+// hockey's: built handles + frame time in, everything else in the session.
+import {
+  alligatorsFrame,
+  closeAlligatorsTable,
+  createAlligatorsUI,
+  registerAlligatorsVisual,
+  alligatorsGearCard,
+} from "./alligatorsSession";
+import { closeGearCard, toggleGearCard } from "./settingsGear";
+import { IA_SEATS } from "./games/alligators";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
 import { showHint } from "./hud";
@@ -200,6 +245,19 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerId, getPlayerName } from "./identity";
 import { listContacts, getContact } from "./contacts";
+// 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
+// screen view the prop draws.
+import { createSmartTvUI } from "./tvUI";
+import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
+import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
+import { tvScreenView } from "./tvDoc";
+// 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
+// attract card the prop draws.
+import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
+import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
+import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
+import { tickRomShare } from "./arcadeRomShare";
+import { arcadeScreenView, builtInEntry, countBuiltInPlay, mySeat, readCabinet, seatStatus } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -261,6 +319,12 @@ interface RemoteAvatar {
   diveAge: number | null;
   /** 🏊‍♂️ replica y at arc start — the receiver replays its own parabola. */
   diveStartY: number;
+  /** 🪑 The seat this peer is in or sliding onto (seatOccupancy), or null. */
+  seatId: string | null;
+  /** 🪑 When this client first saw that claim (performance.now ms). */
+  seatSince: number;
+  /** 🪑 The peer's latest movement-tick counter — breaks a seat clash. */
+  seq: number;
 }
 
 /** 🛑📐 #80: render each room as an OCTAGON barrel (walls + 45° roof + basement)
@@ -396,6 +460,17 @@ export class World {
    */
   public isTransitBusy: (() => boolean) | null = null;
   /**
+   * 🗺️ #192: the holotable's BEAM INTO, wired by main.ts like
+   * onAdapterTransit. `roomPassFor` names the pass this install holds for a
+   * room (none: no beam); `onBeamInto` enters a room by its pass, the ACCESS
+   * beam, so the table reaches no room the ACCESS app couldn't. It runs at
+   * the click, with `afterStepBack` to beam once the table has let you go.
+   */
+  public roomPassFor: ((roomId: string) => string | undefined) | null = null;
+  public onBeamInto:
+    | ((seed: string, afterStepBack: (go: () => void) => void) => void)
+    | null = null;
+  /**
    * Persistent gangway vestibules, one per PAIRED door (#51). Spawned the
    * frame a door's pairing completes, resting lightly translucent and
    * solidifying as the player approaches; disposed on unpair / morph restart.
@@ -434,12 +509,28 @@ export class World {
   /** 🧬 Clone-vat tanks, keyed by item id (driven every frame like the lids). */
   private cloneVats: Map<string, CloneVatHandle> = new Map();
   private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
+  /** ⛓️🥣 Faucet dish fixtures, keyed by item id — pushed the room's last
+   *  faucet status at ~1 Hz (jar level, mojos in the dish, pending spend). */
+  private faucetDishes: Map<string, FaucetDishHandle> = new Map();
+  /** ⛓️🥣 main.ts installs the node request path (NetworkProvider.requestFaucet)
+   *  so the dish screen can ask for status / take / give. */
+  public onFaucetRequest: ((op: FaucetOp, amount?: number) => FaucetRequestTicket) | null = null;
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
   /** 🪙 Coin-pusher cabinets (issue #135) — animated pusher bar + rebuilt chip
    *  piles from shared state each frame. Same driven-every-frame idiom as the
    *  slot-machine visuals; the userData key on the upper platform mesh carries
    *  the handle so the traversal below picks it up. */
   private coinPusherVisuals: Map<string, CoinPusherVisualHandle> = new Map();
+  /** 📺 Smart-TV screens (#186), keyed by item id — redrawn at ~2 Hz from
+   *  the room record (tvDoc.tvScreenView); the handle dedupes identical views. */
+  private tvScreens: Map<string, TvScreenHandle> = new Map();
+  /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the chip). */
+  private tvTimer = 0;
+  /** 🕹 Arcade cabinet screens (#193), keyed by item id — redrawn at ~2 Hz
+   *  from the room record (arcadeDoc.arcadeScreenView), on the TV's timer. */
+  private arcadeScreens: Map<string, ArcadeScreenHandle> = new Map();
+  /** 🕹️ Arcade-cabinet screens — painted only by a focused cabinet's UI. */
+  private arcadeCabinetVisuals: Map<string, ArcadeCabinetVisualHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -464,6 +555,12 @@ export class World {
   /** 🏒 Air-hockey table visuals, keyed by item id — filed here, then handed
    *  to the session layer, which drives them (airHockeyFrame). */
   private airHockeyVisuals: Map<string, AirHockeyVisualHandle> = new Map();
+  /** 🐊 Insatiable-alligators table visuals (#185), keyed by item id — filed
+   *  here, then handed to the session layer, which drives them. */
+  private alligatorsVisuals: Map<string, AlligatorsVisualHandle> = new Map();
+  /** 🎲🎡 #226: craps / roulette table pieces, keyed by item id — driven every
+   *  frame by casinoTablesFrame. */
+  private casinoTableVisuals: Map<string, CasinoTableVisualHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -550,6 +647,10 @@ export class World {
     this.player.onSeatSettled = (seat) => {
       if (seat.firstPerson) this.onFirstPersonSeat?.(seat.faceAngle);
     };
+    // 🪑 One person per seat: the walk re-checks on arrival, because someone
+    // can sit down while we are on the way.
+    this.player.seatGate = (seat) => this.freeSeatForLocal(seat);
+    this.player.onSeatRefused = (seat) => showHint(World.seatTakenHint(seat));
 
     // Furniture layout sync (issue #60 E4): reconcile the local room to the
     // shared `furniture` map whenever it changes. Subscribed ONCE here (not per
@@ -1140,7 +1241,7 @@ export class World {
       collectWindowOpenings(),
       this.collectWallpaper(),
       doorOpenings,
-      readCupolaWall(),
+      readCupolaWalls(),
     );
     this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
@@ -1231,6 +1332,8 @@ export class World {
       const shell = buildOctagonShell(
         { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
         { opacity: 0.85 },
+        {},
+        pose.cupola ?? null, // 🔭 its cupola end walls, when gossiped
       );
       this.disableFog(shell.group); // stay crisp at station distances
       mod.add(shell.group);
@@ -1482,10 +1585,10 @@ export class World {
     this.addOctagonHull();
   }
 
-  /** 🔭 What the cupola rendering depends on: the stored wall and the room
+  /** 🔭 What the cupola rendering depends on: the stored walls and the room
    *  size it is resolved against. */
   private cupolaSignature(): string {
-    return JSON.stringify([roomHalfExtents(), readCupolaWall()]);
+    return JSON.stringify([roomHalfExtents(), readCupolaWalls()]);
   }
 
   /**
@@ -1550,14 +1653,14 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     const w = 2 * halfX,
       d = 2 * halfZ;
-    // 🔭 a cupola end wall cuts the floor's two corners at that end at 45°.
-    const cupola = OCTAGON_HULL ? roomCupola() : null;
-    if (!cupola && this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
+    // 🔭 cupola end walls cut their floor corners at 45°.
+    const cupolas = OCTAGON_HULL ? roomCupolas() : [];
+    if (!cupolas.length && this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
       return new THREE.PlaneGeometry(w, d);
     }
     const shape = new THREE.Shape();
-    if (cupola) {
-      const outline = cupolaFloorOutline(cupola);
+    if (cupolas.length) {
+      const outline = cupolaFloorOutline(cupolas);
       outline.forEach((p, i) => (i === 0 ? shape.moveTo(p.x, -p.z) : shape.lineTo(p.x, -p.z)));
     } else {
       shape.moveTo(-halfX, -halfZ);
@@ -1647,9 +1750,7 @@ export class World {
     // the previous listener first, so rebuilds never stack duplicates.
     this.unsubscribeGameBoards?.();
     const repaintBoards = () => {
-      for (const [id, top] of this.gameTableTops) {
-        top.setBoard(readGame(id)?.board ?? null);
-      }
+      for (const [id, top] of this.gameTableTops) paintGameTable(top, id);
     };
     this.unsubscribeGameBoards = subscribeGames(repaintBoards);
     repaintBoards();
@@ -1689,7 +1790,7 @@ export class World {
         // degrades correctly — if the helper ever stops filing this kind,
         // the paint no-ops rather than driving a handle nothing tracks.
         const spawnedTop = sinks.gameTableTops.get(item.id);
-        if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+        if (spawnedTop) paintGameTable(spawnedTop, item.id);
         // 🏒 #115: hand the filed air-hockey handle to the session layer,
         // which drives it every frame (airHockeyFrame) and converts its LOCAL
         // coords to the world-space tick wire — read back from the sink for
@@ -1702,6 +1803,19 @@ export class World {
             rot: item.rot,
           });
         }
+        // 🐊 #185: the same hand-off for an alligators table.
+        const gators = sinks.alligatorsVisuals.get(item.id);
+        if (gators) {
+          registerAlligatorsVisual(item.id, gators, {
+            x: item.pos.x,
+            z: item.pos.z,
+            rot: item.rot,
+          });
+        }
+        // 🕹️ And an arcade cabinet's screen, which the session paints with
+        // the room's shared game (its position sets the watcher repaint rate).
+        const arcade = sinks.arcadeCabinetVisuals.get(item.id);
+        if (arcade) registerArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -1744,8 +1858,14 @@ export class World {
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
       coinPusherVisuals: this.coinPusherVisuals,
+      arcadeCabinetVisuals: this.arcadeCabinetVisuals,
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
+      tvScreens: this.tvScreens,
+      arcadeScreens: this.arcadeScreens,
+      alligatorsVisuals: this.alligatorsVisuals,
+      casinoTableVisuals: this.casinoTableVisuals,
+      faucetDishes: this.faucetDishes,
     };
   }
 
@@ -3070,6 +3190,10 @@ export class World {
           group.position.set(rec.x, 0, rec.z);
           group.rotation.y = furnitureVisualYaw(existing);
         }
+        // 🕹️ A moved cabinet keeps its screen; its new spot sets how often
+        // watchers repaint it.
+        const arcade = this.arcadeCabinetVisuals.get(id);
+        if (arcade) registerArcadeVisual(id, arcade, { x: rec.x, z: rec.z });
         changedIds.add(id);
       }
     }
@@ -3133,6 +3257,11 @@ export class World {
     }
   }
 
+  /** ⛓️🥣 A faucet dish stands in this room (main.ts polls its status then). */
+  public hasFaucetDish(): boolean {
+    return this.faucetDishes.size > 0;
+  }
+
   /**
    * Despawn ONE furniture item's visuals and deregister every per-item
    * handle — the exact inverse of the per-item registration that both
@@ -3170,8 +3299,33 @@ export class World {
     // before any chip is drawn, so the traversal below can't reach them all.
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
+    this.arcadeCabinetVisuals.delete(itemId);
+    closeGearCard(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
+    this.tvScreens.delete(itemId);
+    this.arcadeScreens.delete(itemId);
+    // 📺 #186: a removed set takes its theatre and this client's hold on its
+    // remote with it — nothing keeps playing, or heartbeating, to a record
+    // whose set is gone (no-ops for every other kind).
+    if (isTvTheatreOpen(itemId)) closeTvTheatre();
+    forgetTv(itemId);
+    // And its WATCH chip, now, not at the next half-second tick: a chip
+    // left clickable in that gap would reopen the removed set's theatre,
+    // which later ticks would never close. Runs pre-splice, so the removed
+    // id is excluded by hand; under the same drive flag as the tick, so a
+    // teardown cannot put a departed room's chip back up.
+    if (tvDriveArmed()) {
+      updateTvChip(FURNITURE.filter((i) => isTvKind(i.kind) && i.id !== itemId).map((i) => i.id));
+    }
+    // 🕹 #193: likewise a removed cabinet takes its stage (which swallows
+    // the world's keys while it is up) and this page's seat with it.
+    if (isArcadeStageOpen(itemId)) closeArcadeStage();
+    forgetCabinet(itemId);
+    this.alligatorsVisuals.delete(itemId);
+    this.casinoTableVisuals.delete(itemId);
+    this.faucetDishes.delete(itemId);
+    forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3197,6 +3351,14 @@ export class World {
       // observing client to run.
       closeAirHockeyTable(itemId);
       clearTable(itemId);
+    } else if (removedKind === "alligators-table") {
+      // 🐊 #185: the same as air hockey — runtime session out, doc state wiped.
+      closeAlligatorsTable(itemId);
+      clearTable(itemId);
+    } else if (removedKind && ARCADE_CABINET_KINDS.has(removedKind)) {
+      // 🕹️ A removed cabinet's shared game ends with it, for everyone.
+      closeArcadeCabinet(itemId);
+      writeArcade(itemId, null);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -3855,6 +4017,8 @@ export class World {
     if (this.isPlayerActive()) {
       this.player.update(deltaTime, inputManager);
     }
+    // 🪑 Stamp the moment a local seat claim begins (a seat clash compares it).
+    this.syncLocalSeat();
 
     // Animate networked peer replicas (issue #21 — fox avatars, not spheres)
     this.updateRemoteAvatars(deltaTime);
@@ -3932,6 +4096,12 @@ export class World {
     // writes, 30/20 Hz tick sends, remote smoothing, scoreboard/goal lamps.
     // The session module owns the registry; this is its only clock.
     airHockeyFrame(deltaTime);
+    // 🐊 #185: and every alligators table — operator ball sim, bites → doc
+    // writes, head/ball tick sends, remote smoothing, heads/birds/displays.
+    alligatorsFrame(deltaTime);
+    // 🎲🎡 #226: lay every craps / roulette table's synced state onto its 3D
+    // pieces (chips, dice, pucks, wheel) — for every client, focused or not.
+    casinoTablesFrame(deltaTime, this.casinoTableVisuals);
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -3973,6 +4143,11 @@ export class World {
 
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
+    // 🕹️ Every arcade cabinet's shared game: the host's copy runs and sends
+    // its pads, the others follow and repaint by distance. After the focused
+    // UI, so a host's game runs on this update's buttons, not the last one's.
+    const me = this.player.getPosition();
+    arcadeFrame(deltaTime, { x: me.x, z: me.z });
 
     // Drive room-edit mode (E2 of #25): force-exit when the view leaves the
     // plain isometric room (zoom ≠ 2 / solar map) + selection-label tracking.
@@ -3984,18 +4159,61 @@ export class World {
 
     // 1 Hz idle status on wall-computer screens (M1 — the permanent home of
     // PR #36's dev-hook wiring; same live values, same cadence).
-    if (this.wallScreens.size > 0) {
+    if (this.wallScreens.size > 0 || this.faucetDishes.size > 0) {
       this.screenStatusTimer += deltaTime;
       if (this.screenStatusTimer >= 1.0) {
         this.screenStatusTimer = 0;
-        const status = readLiveRoomStatus();
-        for (const [itemId, screen] of this.wallScreens) {
-          // 🚏📋 A departures board adds its own rows (its gate setting is
-          // its own); the plain terminal's status carries none.
-          screen.updateStatus(
-            screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
-          );
+        if (this.wallScreens.size > 0) {
+          const status = readLiveRoomStatus();
+          for (const [itemId, screen] of this.wallScreens) {
+            // 🚏📋 A departures board adds its own rows (its gate setting is
+            // its own); the plain terminal's status carries none.
+            screen.updateStatus(
+              screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
+            );
+          }
         }
+        // ⛓️🥣 Faucet dishes: the jar level and the mojo in the dish follow the
+        // room's last faucet status (the node reads the chain; main.ts polls).
+        if (this.faucetDishes.size > 0) {
+          const roomId = World.activeRoomId();
+          const faucet = latestFaucetStatus(roomId);
+          const pending = faucetPending(roomId) !== null;
+          for (const dish of this.faucetDishes.values()) {
+            dish.setState(jarLevel(faucet), faucet?.ready ?? 0, pending);
+          }
+        }
+      }
+    }
+
+    // 📺 #186: the TVs at 2 Hz — each screen draws the view the room record
+    // implies (the handle skips unchanged views), a holder renews its remote
+    // and keeps the room's clock alive, and the HUD chip says what is on.
+    // Driven here, not by timers of their own, so a removed set stops dead.
+    this.tvTimer += deltaTime;
+    if (this.tvTimer >= 0.5) {
+      this.tvTimer = 0;
+      // Nothing while a room is being left (tvSession's drive flag, cleared
+      // synchronously by leaveRoomNow and armed again once the next room's
+      // docs and layout are bound): this loop keeps running through the
+      // leave's awaited flush, with the old furniture and the old TV doc
+      // still here — a tick then would put the departed room's WATCH chip
+      // back up, with its theatre a click away. Otherwise unconditionally:
+      // with the last set gone, an empty list is what takes a stale chip
+      // down and clears the session's bookkeeping.
+      if (tvDriveArmed()) {
+        const tvIds = FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
+        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+        tickTvRoom(tvIds);
+        updateTvChip(tvIds);
+        // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
+        // P1 page renews its seat — with an empty list too, and under the
+        // same flag: a seat is not renewed into a room being left either.
+        const arcadeIds = FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
+        for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
+        tickArcadeRoom(arcadeIds);
+        // …and the owner's game file, sent to whoever pressed play.
+        tickRomShare();
       }
     }
 
@@ -4031,6 +4249,71 @@ export class World {
   }
 
   public remotePlayers: Map<string, RemoteAvatar> = new Map();
+
+  // ── 🪑 One person per seat (seatOccupancy.ts) ──────────────────────────────
+  /** The seat the local player is in or sliding onto, as last seen. */
+  private localSeatId: string | null = null;
+  /** When that claim began (performance.now ms). */
+  private localSeatSince = 0;
+  /** The local movement-tick counter as last sent (main.ts). */
+  private localTickSeq = 0;
+
+  /** main.ts reports each movement tick it sends — the local half of the
+   *  counter comparison that breaks a seat clash. */
+  public noteSentTickSeq(seq: number): void {
+    this.localTickSeq = seq & 0xffff;
+  }
+
+  /** Re-read the local player's seat, stamping when a new claim began. */
+  private syncLocalSeat(): string | null {
+    const id = this.player.getSeatedSeatId();
+    if (id !== this.localSeatId) {
+      this.localSeatId = id;
+      this.localSeatSince = performance.now();
+    }
+    return id;
+  }
+
+  /** What to say when every spot of the kind asked for is taken. */
+  private static seatTakenHint(seat: Seat): string {
+    return seat.lie
+      ? "Someone is already in that bunk."
+      : "Someone is already sitting there.";
+  }
+
+  /** Seats other players are in or sliding onto. */
+  private seatsTakenByOthers(): Set<string> {
+    const taken = new Set<string>();
+    for (const avatar of this.remotePlayers.values()) {
+      if (avatar.seatId) taken.add(avatar.seatId);
+    }
+    return taken;
+  }
+
+  /** The seat to send the local player to for `seat` — see freeSeatFor. */
+  private freeSeatForLocal(seat: Seat): Seat | null {
+    return freeSeatFor(SEATS, seat, this.seatsTakenByOthers());
+  }
+
+  /**
+   * 🪑 A peer has just been placed in the seat the local player is in: both
+   * sat down within one network delay of each other (the click and the last
+   * step before sitting refuse a taken seat, so nothing slower gets here).
+   * keepsSeat gives the two games the same answer from opposite sides; the
+   * one it does not keep stands up.
+   */
+  private settleSeatClash(avatar: RemoteAvatar): void {
+    if (!avatar.seatId || avatar.seatId !== this.syncLocalSeat()) return;
+    const keep = keepsSeat({
+      mineSince: this.localSeatSince,
+      theirsSince: avatar.seatSince,
+      mySeq: this.localTickSeq,
+      theirSeq: avatar.seq,
+    });
+    if (keep) return;
+    this.player.evictFromSeat();
+    showHint("Someone sat down there at the same moment.");
+  }
 
   /** Stable [0,1) hash of a peer id (FNV-1a) — drives the per-peer fur tint. */
   private static peerHue01(id: string): number {
@@ -4080,6 +4363,7 @@ export class World {
     elevated: boolean = false,
     swimming: boolean = false,
     diving: boolean = false,
+    seq: number = 0,
   ) {
     // 🏊/🛏️ The tick carries no y — derive the seat height locally: SEATS is
     // built from the SAME synced furniture doc on every client, so the seat
@@ -4124,6 +4408,16 @@ export class World {
             seated && priorAvatar
             ? priorAvatar.elevY
             : 0;
+    // 🪑 The seat this peer holds, settled on it or still sliding in. A seated
+    // peer the lookup misses keeps the claim it had, for the same reason the
+    // height above is held: this end's SEATS can lag the sender's. A wade
+    // into the pool is "seated" for its slide too, but it is open water and
+    // no seat (swimming, bit4, is up for that whole slide).
+    const seatId = seated && !swimming
+      ? (seatClaimedBy(SEATS, { x, z, facing, elevated })?.id ??
+        priorAvatar?.seatId ??
+        null)
+      : null;
     const avatar = priorAvatar;
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
@@ -4152,7 +4446,11 @@ export class World {
         diving,
         diveAge: diving ? 0 : null,
         diveStartY: 0,
+        seatId,
+        seatSince: performance.now(),
+        seq,
       });
+      this.settleSeatClash(this.remotePlayers.get(id)!);
       return;
     }
     // 🏊‍♂️ bit5 rising edge: start the local arc replay from wherever the
@@ -4180,6 +4478,12 @@ export class World {
     avatar.elevY = elevY;
     avatar.swimming = swimming;
     avatar.diving = diving;
+    if (seatId !== avatar.seatId) {
+      avatar.seatId = seatId;
+      avatar.seatSince = performance.now();
+    }
+    avatar.seq = seq;
+    this.settleSeatClash(avatar);
   }
 
   /**
@@ -4365,9 +4669,13 @@ export class World {
       }
       // Clicks landing on a chair/sofa footprint become sit requests:
       // walk to the seat front, turn back-to-the-chair, and sit down.
+      // 🪑 One person per seat: a taken seat sends the click to a free spot
+      // on the same piece, and a full piece says so instead of walking over.
       const seat = findSeatAt(x, z);
       if (seat) {
-        this.player.navigateToSeat(seat);
+        const free = this.freeSeatForLocal(seat);
+        if (free) this.player.navigateToSeat(free);
+        else showHint(World.seatTakenHint(seat));
       } else {
         this.player.navigateTo(x, z);
       }
@@ -4621,20 +4929,39 @@ export class World {
     }
     const p = this.player.getPosition();
     const now = performance.now();
-    let inAnyAperture = false;
+
+    // 🚪 #182: ONE door is being crossed, resolved before the loop.
+    //
+    // The aperture frame comes from the door's PHYSICAL wall, not its logical
+    // id (#91: the ids agree for the cardinals under both layouts, but every
+    // free `d:` door read as east/west, so one on the north or south wall
+    // could never trip the threshold) — and from that wall's SIDE as well as
+    // its axis (#182: without the sign each door also answered for its mirror
+    // on the opposite wall, which is both the wrong-room arrival and dorkmo's
+    // phantom doors). The test itself is pure and lives in doorMatch, beside
+    // the arrival chooser, pinned by doorMatch.test.ts.
+    //
+    // Rebuilt per frame because a door can be added, removed or slid along its
+    // wall at any time by the room's editor; DOORS is a handful of entries and
+    // this runs only while first-person with a live avatar.
+    const crossingDoors: CrossingDoor[] = DOORS.map((d) => ({
+      id: d.id,
+      wall: this.wallOfDoor(d.id),
+      front: d.front, // read-only here — no need to clone
+    }));
+    const crossing = doorBeingCrossed(
+      crossingDoors,
+      { x: p.x, z: p.z },
+      // Derived from the movement CLAMP, not from the wall: the trip point has
+      // to be the last centimetres of travel, or ordinary walking along the
+      // wall crosses it.
+      roomWalkBounds(),
+      // 🚪 #91: the crossable band is the door's actual opening, derived rather
+      // than the old 0.95 literal that was sized for the retired small door.
+      DOOR_OPENING_WIDTH,
+    );
+
     for (const door of DOORS) {
-      // Aperture frame: lateral offset along the wall vs distance INTO it.
-      // 🚪 #91: the aperture frame comes from the door's PHYSICAL wall, not its
-      // logical id. The ids happen to agree for the cardinals under both
-      // layouts, but every free `d:` door read as east/west — so one on the
-      // north or south wall could never trip the threshold and was impossible
-      // to walk through in first person.
-      const doorWall = this.wallOfDoor(door.id);
-      const northSouth = doorWall === "y-" || doorWall === "y+";
-      const lateral = Math.abs(
-        northSouth ? p.x - door.front.x : p.z - door.front.z,
-      );
-      const wallCoord = Math.abs(northSouth ? p.z : p.x);
       const approachDist = Math.hypot(p.x - door.front.x, p.z - door.front.z);
 
       const state = ds.getDockingState(door.id);
@@ -4661,23 +4988,8 @@ export class World {
 
       // Threshold: pressed into the open doorway (the manual-movement clamp
       // stops the body at the wall, so "as far in as possible" IS the cross).
-      // Derived from the CLAMP, not from the wall: the trip point has to be the
-      // last few centimetres of travel, or ordinary walking along the wall
-      // crosses it. (It was `half - 0.85` against a `half - 0.8` clamp — a 5 cm
-      // sliver you could only enter by pressing in. When the walkable box was
-      // widened to `half - WALL_CLEARANCE` that literal silently became a 35 cm
-      // strip of normal floor, so strolling past a paired door in first person
-      // fired an unrequested transit.)
-      const { boundX, boundZ } = roomWalkBounds();
-      const apThresh = (northSouth ? boundZ : boundX) - 0.05;
-      // 🚪 #91: the crossable band is the door's actual opening (half-width),
-      // derived rather than the old 0.95 literal that was sized for the
-      // retired small door — with the 2 m opening it left the edges of the
-      // doorway un-crossable.
-      const inAperture = lateral < DOOR_OPENING_WIDTH / 2 && wallCoord > apThresh;
-      if (inAperture) inAnyAperture = true;
       if (
-        inAperture &&
+        crossing?.id === door.id &&
         paired &&
         passable &&
         this.fpTransitArmed &&
@@ -4692,7 +5004,9 @@ export class World {
         this.onAdapterTransit?.(state!.connectedRoomAddress, door.id);
       }
     }
-    if (!inAnyAperture) this.fpTransitArmed = true;
+    // Step clear of EVERY doorway to re-arm — including a disabled or unpaired
+    // one, which is why doorBeingCrossed is told about those doors too.
+    if (!crossing) this.fpTransitArmed = true;
   }
 
   private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
@@ -5075,22 +5389,6 @@ export class World {
     };
   }
 
-  /**
-   * 🎰 #76: retarget a table's device focus to a free STANDING slot so the
-   * avatar walks up to an OPEN position (auto-bumping past taken ones) facing
-   * the table, then the game/betting UI opens — instead of everyone stacking on
-   * the single fixed device front. The reserved wheel-head is never auto-picked
-   * (it's the owner's croupier robot's spot); falls back to the device's own
-   * front when every open slot is occupied. Occupancy is inferred from remote
-   * avatar positions (Phase 1 — a synced claim map lands in a later slice).
-   */
-  private standTarget(device: DeviceTarget): DeviceTarget {
-    const stand = this.pickFreeStand(device.id);
-    return stand
-      ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
-      : device;
-  }
-
   /** Nearest open, REACHABLE (non-wheel-head) stand slot for the item, or null.
    *  "Taken" = a remote avatar within 0.7 m of the slot front. A slot must also
    *  be A*-reachable from the player — otherwise picking it would strand the
@@ -5102,6 +5400,26 @@ export class World {
     const slots = standsForItem(itemId).filter((s) => !s.role);
     if (slots.length === 0) return null;
     const others = this.getRemoteAvatarSnapshots();
+    const me = this.player.getPosition();
+    const reachable = this.standReachability();
+    const free = slots.filter(
+      (s) =>
+        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
+        reachable(s),
+    );
+    if (free.length === 0) return null;
+    free.sort(
+      (a, b) =>
+        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
+        Math.hypot(b.front.x - me.x, b.front.z - me.z),
+    );
+    return free[0];
+  }
+
+  /** "Can the player walk to this stand?" — A* from the player's cell (snapped
+   *  to solid ground first), or already standing at it. Shared by
+   *  pickFreeStand and the 🎲 #227 own-end pick at a checkers table. */
+  private standReachability(): (s: StandSlot) => boolean {
     const me = this.player.getPosition();
     let mr = worldToRow(me.z);
     let mc = worldToCol(me.x);
@@ -5122,21 +5440,9 @@ export class World {
         }
       }
     }
-    const reachable = (s: StandSlot) =>
+    return (s: StandSlot) =>
       Math.hypot(s.front.x - me.x, s.front.z - me.z) < 0.6 ||
       findPath(mr, mc, worldToRow(s.front.z), worldToCol(s.front.x)).length > 0;
-    const free = slots.filter(
-      (s) =>
-        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
-        reachable(s),
-    );
-    if (free.length === 0) return null;
-    free.sort(
-      (a, b) =>
-        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
-        Math.hypot(b.front.x - me.x, b.front.z - me.z),
-    );
-    return free[0];
   }
 
   /**
@@ -5649,6 +5955,19 @@ export class World {
         else tickAutoCroupier(t.id);
       }
     }
+    // 🎲 #226: a manual craps table (no robot running it): the page whose
+    // manual ROLL slid the dice out carries that shooter's turn, focused or
+    // not (tickManualCraps returns at once on every other editor's page).
+    else if (crapsTables.length && canEditRoom().ok) {
+      for (const t of crapsTables) if (!isCroupierLive(t.id)) tickManualCraps(t.id);
+    }
+    // ⚖️ Fair tables: every client with chips down commits its seed while the
+    // window is open and reveals it at "no more bets" (fairTableSeeds.ts).
+    if (tables.length) {
+      const me = getPlayerId();
+      for (const t of tables) tickFairSeeds(t.id, t.kind === "craps-table" ? "craps" : "roulette", me);
+    }
+    forgetMissingTables(new Set(tables.map((t) => t.id)));
 
     // 🎰 Slot machines: ONE session operates every machine in the room (one
     // lease, slotCroupier.ts), so a player's balance has a single slot
@@ -5778,9 +6097,96 @@ export class World {
    * build the kind-appropriate focused UI, and hand both to the
    * DeviceFocusController, which wires its hooks into navigateToDevice.
    */
+  /**
+   * 🕹 The arcade cabinet's UI in one of its views (#193). PLAY is at the
+   * controls and depends on the cabinet's one game, the owner's pick: a
+   * built-in game plays on the cabinet's own screen (arcadeNesCabinet.ts —
+   * `seat` is the stand stepped up to, of `seats`), the owner's own game in
+   * the panel whose INSERT COIN opens EmulatorJS's stage — for player one,
+   * or at the double-wide cabinet for up to four players in step (#242),
+   * `seat` the stand stepped up to. SETTINGS, from the ⚙️, is the panel's
+   * for both. Each swaps to the other in place, and PLAY is rebuilt when
+   * the owner changes the game.
+   */
+  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView, seat = 0, seats: 1 | 2 = 1): DeviceUI {
+    const swap = (next: ArcadePanelView) => () => {
+      deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, next, seat, seats));
+    };
+    if (view === "play" && builtInEntry(readCabinet(deviceId).game)) {
+      return createNesCabinetUI({
+        itemId: deviceId,
+        visual: this.arcadeCabinetVisuals.get(deviceId),
+        game: () => builtInEntry(readCabinet(deviceId).game),
+        onGameChanged: swap("play"),
+        openSettings: swap("settings"),
+        onPlay: () => countBuiltInPlay(deviceId),
+        seat: seat === 1 ? 1 : 0,
+        seats,
+        requestRelease: () => deviceFocus.release(),
+      });
+    }
+    return createArcadeCabinetUI({
+      itemId: deviceId,
+      myPub: () => getIdentityPub(),
+      myName: () => getPlayerName(),
+      canEdit: () => canEditRoom().ok,
+      openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId, this.arcadeSeats(deviceId) === 4 ? 4 : 1)),
+      view,
+      openSettings: swap("settings"),
+      openPlay: swap("play"),
+      seats: this.arcadeSeats(deviceId),
+      seat,
+    });
+  }
+
+  /** 🕹 A cabinet's stands: the two-player cabinet's two, the double-wide
+   *  cabinet's four (#242), or none (1: the device front). */
+  private arcadeSeats(deviceId: string): 1 | 2 | 4 {
+    const kind = FURNITURE.find((i) => i.id === deviceId)?.kind;
+    return kind === "arcade-cabinet-wide" ? 4 : kind === "arcade-cabinet-2p" ? 2 : 1;
+  }
+
+  /** 🕹🕹🕹🕹 The double-wide cabinet's stand for this page (#242): its own
+   *  seat's, else the lowest seat nobody holds — by the seats' leases, not by
+   *  who stands near (four stands a step apart). None free, or none it can
+   *  walk to: null, the device front. Its own seat's stand counts only while
+   *  it can walk there (furniture set down since it sat can fence one off),
+   *  and the panel at the front still shows its seat. */
+  private pickArcadeSeatStand(deviceId: string): StandSlot | null {
+    const stands = standsForItem(deviceId);
+    const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
+    const reachable = this.standReachability();
+    const mine = mySeat(deviceId, 4);
+    if (mine !== null) {
+      const own = at(mine);
+      return own && reachable(own) ? own : null;
+    }
+    for (let n = 0; n < 4; n++) {
+      const s = at(n);
+      if (s && seatStatus(deviceId, n) === "free" && reachable(s)) return s;
+    }
+    return null;
+  }
+
+  /**
+   * 🕹 The ⚙️ low on a cabinet's front (#193, the slot machine's kick-panel
+   * gears in #241): anyone who clicks it is walked to the cabinet and shown
+   * its SETTINGS view — read-only unless they can edit the room, the gate
+   * arcadeDoc's writes check again. Already at that cabinet, the panel just
+   * swaps to it.
+   */
+  public handleArcadeControl(deviceId: string, control: "settings"): boolean {
+    const device = findDevice(deviceId);
+    if (!device || device.kind !== "arcade" || control !== "settings" || !this.isPlayerActive()) return false;
+    const ui = this.arcadeCabinetUI(deviceId, "settings");
+    if (deviceFocus.getActiveDeviceId() === deviceId && deviceFocus.replaceFocusedUI(ui)) return true;
+    deviceFocus.beginFocus(this.player, device, ui);
+    return true;
+  }
+
   public handleSlotMachineControl(
     deviceId: string,
-    control: SlotMachineCabinetControl | "service",
+    control: SlotMachineCabinetControl | "service" | "settings",
     value?: number,
   ): boolean {
     const device = findDevice(deviceId);
@@ -5792,9 +6198,11 @@ export class World {
       onDenominationChange: (amount: number) => visual?.setDenomination(amount),
       onMessage: (message: string) => visual?.showMessage(message),
     };
-    if (control === "service") {
+    // ⚙️ (kick panel) opens the machine's card for anyone, read-only unless
+    // they can edit the room; the marquee's service key stays owner-only.
+    if (control === "service" || control === "settings") {
       const permission = canEditRoom();
-      if (!permission.ok) {
+      if (control === "service" && !permission.ok) {
         visual?.showMessage("OWNER ONLY");
         showHint(permission.reason);
         return true;
@@ -5822,6 +6230,19 @@ export class World {
     const operated = operateActiveSlotMachine(deviceId, control, value);
     if (operated && control === "pull") visual?.pullLever();
     return operated;
+  }
+
+  /** ⚙ A settings gear was clicked (settingsGear.ts): open or close that
+   *  item's card. False when the item has no gear card. */
+  public openSettingsCard(itemId: string): boolean {
+    const kind = FURNITURE.find((item) => item.id === itemId)?.kind;
+    const spec = kind === "air-hockey-table" ? airHockeyGearCard(itemId)
+      : kind === "alligators-table" ? alligatorsGearCard(itemId)
+      : kind === "coin-pusher" ? coinPusherGearCard(itemId, () => canEditRoom().ok)
+      : null;
+    if (!spec) return false;
+    toggleGearCard(spec);
+    return true;
   }
 
   private updateSeatedSlotSession(): void {
@@ -5888,6 +6309,15 @@ export class World {
           })),
         openDoorPanel: (doorId) =>
           deviceFocus.releaseThen(() => this.dockingSystem?.handlePanelRaycast(doorId)),
+        // ✏️ Another module of the station: the ACCESS beam takes you in,
+        // where its own door panels do the editing.
+        canBeamTo: (roomId) => !!this.onBeamInto && !!this.roomPassFor?.(roomId),
+        beamTo: (roomId) => {
+          const seed = this.roomPassFor?.(roomId);
+          const beam = this.onBeamInto;
+          if (!seed || !beam) return;
+          beam(seed, (go) => deviceFocus.releaseThen(go));
+        },
         playerId: () => getPlayerId(),
         identityPub: () => getIdentityPub(),
         disassemblyCandidates: () => this.disassemblyCandidates(),
@@ -5919,15 +6349,74 @@ export class World {
     }
 
     if (device.kind === "gameTable") {
-      // #45 v1: flippable surface + doc-synced checkers. The flip is a UI
+      // #45 v1: flippable surface + doc-synced games. The flip is a UI
       // affordance (button), not focus choreography — no prepare hook; the
       // top handle simply rides along so FLIP can drive the tween.
+      // 🎰 #76: walk to an open STANDING position at the table, then the UI
+      // opens. 🎲 #227: a seated checkers or ♟ chess player goes to their
+      // OWN end and looks from it (stand s0 = red / white at −z, s1 = black
+      // at +z) when it is open and can be walked to (pickFreeStand's rules);
+      // otherwise, and for everyone else, the nearest open end — the camera
+      // follows that end.
+      const game = readTable(deviceId);
+      const myId = getPlayerId();
+      const mySeat =
+        game?.kind === "checkers"
+          ? (() => {
+              const c = seatOf(game.state, myId);
+              return c ? standIndexFor(c) : null;
+            })()
+          : game?.kind === "chess"
+            ? (() => {
+                const c = chessSeatOf(game.state, myId);
+                return c ? chessStandIndexFor(c) : null;
+              })()
+            : null;
+      const ownEnd =
+        mySeat !== null
+          ? standsForItem(deviceId).find((slot) => slot.id === `${deviceId}:s${mySeat}`)
+          : undefined;
+      const ownEndFree =
+        !!ownEnd &&
+        !this.getRemoteAvatarSnapshots().some(
+          (a) => Math.hypot(a.x - ownEnd.front.x, a.z - ownEnd.front.z) < 0.7,
+        ) &&
+        this.standReachability()(ownEnd);
+      const stand = (ownEndFree ? ownEnd : null) ?? this.pickFreeStand(deviceId);
+      const farEnd = stand ? stand.id.endsWith(":s1") : false;
+      const top = this.gameTableTops.get(deviceId) ?? null;
       const ui = createGameTableUI({
         itemId: deviceId,
-        top: this.gameTableTops.get(deviceId) ?? null,
+        top,
+        // 🎲 #227: checkers is played on the 3D table itself. Taking a side
+        // from the other end walks the player round to their own end.
+        checkers: createCheckersTableLayer({
+          itemId: deviceId,
+          top,
+          end: farEnd ? 1 : 0,
+          onSeatTaken: () => deviceFocus.releaseThen(() => this.requestDeviceFocus(deviceId)),
+        }),
+        // ♟ Chess plays on the table the same way (white's end is −z).
+        chess: createChessTableLayer({
+          itemId: deviceId,
+          top,
+          end: farEnd ? 1 : 0,
+          onSeatTaken: () => deviceFocus.releaseThen(() => this.requestDeviceFocus(deviceId)),
+        }),
       });
-      // 🎰 #76: walk to an open STANDING position at the table, then the UI opens.
-      deviceFocus.beginFocus(this.player, this.standTarget(device), ui);
+      // The def bakes the −z eye; the +z end's is its point reflection
+      // through the board centre (air hockey's mirrored-end rule).
+      const eye = farEnd
+        ? new THREE.Vector3(
+            2 * device.anchor.x - device.eye.x,
+            device.eye.y,
+            2 * device.anchor.z - device.eye.z,
+          )
+        : device.eye;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : device;
+      deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 
@@ -5979,23 +6468,83 @@ export class World {
       return;
     }
 
-    if (device.kind === "cashier" || device.kind === "roulette" || device.kind === "craps") {
-      // 🎰 #69 G1/G2/G3: the HOUSE side (cashier book, croupier spin, stickman
-      // throw) rides the same owner-equivalent seam as room editing —
-      // canEditRoom funnels main.ts's isLocalPlayerRoomOwner, so a venture-owned
-      // room makes every shareholder the house (the #68 V1 rule, applied to the
-      // casino).
-      const isHouse = () => canEditRoom().ok;
-      const ui =
-        device.kind === "cashier"
-          ? createCashierUI({ isHouse })
-          : device.kind === "craps"
-          ? createCrapsUI({ itemId: deviceId, isHouse })
-          : createRouletteUI({ itemId: deviceId, isHouse });
-      // 🎰 #76: the game tables gather players at their open standing slots (the
-      // cashier is not a table — it keeps its single front).
-      const target =
-        device.kind === "cashier" ? device : this.standTarget(device);
+    if (device.kind === "faucetDish") {
+      // ⛓️🥣 The faucet dish: status / take / give go to the local node through
+      // the request path main.ts installed; without a node the screen still
+      // opens and says the chain is unreachable.
+      const request = this.onFaucetRequest;
+      const ui = createFaucetDishUI({
+        roomId: () => World.activeRoomId(),
+        request: (op, amount) =>
+          request ? request(op, amount) : { seq: 0, sent: Promise.reject(new Error("no node request path installed")) },
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "cashier") {
+      // 🎰 #69 G1: the HOUSE side (the cage book) rides the same owner-
+      // equivalent seam as room editing — canEditRoom funnels main.ts's
+      // isLocalPlayerRoomOwner, so a venture-owned room makes every
+      // shareholder the house (the #68 V1 rule, applied to the casino).
+      deviceFocus.beginFocus(this.player, device, createCashierUI({ isHouse: () => canEditRoom().ok }));
+      return;
+    }
+
+    if (device.kind === "roulette" || device.kind === "craps") {
+      // 🎲🎡 #226: no popup — the player plays on the 3D table from an open
+      // standing slot (#76). The camera stands behind THAT slot looking over
+      // the felt, so the rail in front of them (their chips) sits at the
+      // bottom of the view; the house side (settings, manual roll/spin) rides
+      // canEditRoom like every casino device.
+      const stand = this.pickFreeStand(deviceId);
+      const item = FURNITURE.find((i) => i.id === deviceId);
+      // With no open, reachable stand the avatar keeps the device's own front,
+      // but the player still needs a rail of chips and a camera: play from the
+      // (non-operator) stand nearest where they are.
+      let standIdx = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
+        : null;
+      if (standIdx === null && item) {
+        const me = this.player.getPosition();
+        const inv = ((4 - item.rot) % 4) as Rot;
+        const p = rotXZ(me.x - item.pos.x, me.z - item.pos.z, inv);
+        let best = Infinity;
+        (FURNITURE_DEFS[item.kind].stands ?? []).forEach((t, i) => {
+          const d = Math.hypot(t.stand.x - p.x, t.stand.z - p.z);
+          if (!t.role && d < best) {
+            best = d;
+            standIdx = i;
+          }
+        });
+      }
+      const tmpl =
+        item && standIdx !== null
+          ? FURNITURE_DEFS[item.kind].stands?.[standIdx]
+          : undefined;
+      let target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        : device;
+      if (item && tmpl) {
+        const local = (x: number, y: number, z: number) => {
+          const r = rotXZ(x, z, item.rot);
+          return new THREE.Vector3(item.pos.x + r.x, y, item.pos.z + r.z);
+        };
+        const sx = tmpl.stand.x;
+        const sz = tmpl.stand.z;
+        target = {
+          ...target,
+          eye: local(sx * 0.85, 1.9, sz * 0.85),
+          anchor: local(sx * 0.35, 0.8, sz * 0.15),
+        };
+      }
+      const ui = createCasinoTableUI({
+        itemId: deviceId,
+        game: device.kind,
+        isHouse: () => canEditRoom().ok,
+        stand: tmpl ? standIdx : null,
+        visual: this.casinoTableVisuals.get(deviceId) ?? null,
+      });
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
@@ -6108,12 +6657,73 @@ export class World {
       return;
     }
 
+    // 📺 #186: the set's body buttons, WATCH, and the remote. The programme
+    // itself is chosen on the remote (the phone's TV app), as on a real set.
+    if (device.kind === "smartTv") {
+      const label = tvLabel(FURNITURE.find((i) => i.id === deviceId)?.kind);
+      const ui = createSmartTvUI({
+        itemId: deviceId,
+        label,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        roomPlayers: () => tvRoomPlayers(getIdentityPub()),
+        // The deps main.ts installed (setTvTheatreDeps): the same label and
+        // round-trip lead as the chip's and the phone's WATCH.
+        // Opened in the continuation, which runs after the focus eases out:
+        // a room leave may have begun meanwhile (leaveRoomNow closes the
+        // theatre, then awaits the flush while World keeps updating), so the
+        // drive and the set are checked again THERE, as the phone's and the
+        // chip's WATCH check them — else this reopened a theatre no room
+        // tick would close.
+        openTheatre: () =>
+          deviceFocus.releaseThen(() => {
+            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) openTvTheatre(deviceId);
+          }),
+        // The same guard in the remote's continuation: a phone reopened on a
+        // set that left with its room, after the drive was disarmed, would
+        // show a remote nothing ticks for.
+        openRemote: () =>
+          deviceFocus.releaseThen(() => {
+            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) {
+              (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
+            }
+          }),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // 🕹 #193: the cabinet and its one game. A built-in game plays on the
+    // cabinet's own screen (the UI only adds a key strip and keeps stray
+    // clicks from releasing the focus mid-game); the owner's own game opens
+    // the panel — INSERT COIN for P1 — and the stage the coin opens (the
+    // emulator in a frame of our own), after the focus is released, as the
+    // TV hands off to its theatre.
+    if (device.kind === "arcade") {
+      // The two-player cabinet has a stand per player (s0 = player 1):
+      // walk to the free one, and its index is the seat. The double-wide
+      // cabinet's four stands are its owner's own game's players (#242):
+      // this page's seat's, or the lowest free one. Its built-in games, and
+      // the one-player cabinet, play from the device front.
+      const seats = this.arcadeSeats(deviceId);
+      const builtIn = builtInEntry(readCabinet(deviceId).game) !== null;
+      const stand = seats === 2 ? this.pickFreeStand(deviceId)
+        : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId)
+          : null;
+      const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : 0;
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        : device;
+      deviceFocus.beginFocus(this.player, target, this.arcadeCabinetUI(deviceId, "play", seat, seats === 2 ? 2 : 1));
+      return;
+    }
+
     if (device.kind === "airHockey") {
       // 🏒 #115: walk to a FREE end and play first-person from it. Stand slot
       // s0 is the cyan/a end (local −z), s1 the orange/b end (local +z) — the
       // template INDEX is the side, read from the `${itemId}:s${n}` slot id.
       // Every slot taken (or unreachable) falls back to the a end, matching
-      // standTarget's fallback-to-device-front behavior.
+      // the other tables' fall back to the device front.
       const stand = this.pickFreeStand(deviceId);
       const standIdx = stand
         ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
@@ -6134,6 +6744,34 @@ export class World {
         ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
         : { ...device, eye };
       const ui = createAirHockeyUI({ itemId: deviceId, side });
+      deviceFocus.beginFocus(this.player, target, ui);
+      return;
+    }
+
+    if (device.kind === "alligators") {
+      // 🐊 #185: walk to the nearest FREE seat round the table (the
+      // craps/roulette stand picker) and play first-person from it. The
+      // stand template INDEX is the seat, read from the `${itemId}:s${n}`
+      // slot id; every stand taken falls back to seat 0.
+      const stand = this.pickFreeStand(deviceId);
+      const seat = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) % IA_SEATS
+        : 0;
+      // The def bakes seat 0's eye; seat n's is that eye turned n·45° round
+      // the table centre (anchor). Rotations commute, so turning the WORLD
+      // offset is the same as turning the local one before the item's rot.
+      const turn = (seat * 2 * Math.PI) / IA_SEATS;
+      const ox = device.eye.x - device.anchor.x;
+      const oz = device.eye.z - device.anchor.z;
+      const eye = new THREE.Vector3(
+        device.anchor.x + ox * Math.cos(turn) - oz * Math.sin(turn),
+        device.eye.y,
+        device.anchor.z + ox * Math.sin(turn) + oz * Math.cos(turn),
+      );
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : { ...device, eye };
+      const ui = createAlligatorsUI({ itemId: deviceId, seat });
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }

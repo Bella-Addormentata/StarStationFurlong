@@ -166,28 +166,17 @@ import {
 import type { ItemDef } from './items';
 import { loadSavedOutfitId } from './outfits';
 import type { RoomEditPermission } from './editMode';
-import {
-  initialState, legalMoves, applyMove, chooseBotMove, pieceColor, otherColor,
-  RED_KING, BLACK_KING,
-} from './games/checkers';
-import type { CheckersState, CheckersColor } from './games/checkers';
-import {
-  initialChessState, legalChessMoves, applyChessMove, chooseChessBotMove,
-  chessPieceColor, otherChessColor, inCheck,
-  W_PAWN, W_KNIGHT, W_BISHOP, W_ROOK, W_QUEEN, W_KING,
-  B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
-} from './games/chess';
-import type { ChessState, ChessColor } from './games/chess';
-import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
+import { initialState } from './games/checkers';
+import type { CheckersColor } from './games/checkers';
+import type { BoardMarks } from './games/checkersTable';
+import { initialChessState } from './games/chess';
+import type { ChessColor } from './games/chess';
+import { writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
-  readChips, buyInChips, cashOutChips, spendChips, creditChips,
-  readCageLedger, readTableState,
-  readMyBets, writeMyBets, readAllBets, subscribeCasino,
-  readCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
-  readCrapsBackendPref, writeCrapsBackendPref,
-  readCrapsFairnessPref, writeCrapsFairnessPref,
+  readChips, buyInChips, cashOutChips,
+  readCageLedger, subscribeCasino,
   casinoDocEpoch,
   clearSlotPlayRequest,
   readSlotMachineState, readSlotOddsConfig, readSlotReveal,
@@ -206,23 +195,8 @@ import {
 // 🪙 Whether the room's coin pushers are operated, and ready for a drop,
 // judged without comparing clocks across devices (pusherCroupier.ts CLOCKS).
 import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
-// 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
-// the house-only toggle in the craps panel flips the per-table preference.
-import { crapsBackend } from './crapsBackend';
-// 🎲🔀 The dice-fairness modes (rng / commit-reveal / multiparty / block-beacon) —
-// a house-only cycle button flips the per-table mode; settled rolls show a
-// verifiable "provably fair" badge.
-import {
-  FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript,
-} from './games/diceFairness';
-import type { FairnessMode } from './games/craps';
-import {
-  WHEEL_ORDER, pocketColor,
-} from './games/roulette';
-import type { RouletteBet, RouletteTableState } from './games/roulette';
-// 🎲 #69 G3: the craps engine (pure payout math) + its table state.
-import { canPlaceBet } from './games/craps';
-import type { CrapsBet, CrapsTableState } from './games/craps';
+import { gearSection } from './gearCardParts';
+import type { GearCardSpec } from './settingsGear';
 import {
   DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_REQUEST_TTL_MS,
   commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
@@ -236,16 +210,14 @@ import {
   PUSHER_REQUEST_TTL_MS,
 } from './games/coinPusher';
 import type { CoinPusherState, PusherHole, PusherRefusalReason } from './games/coinPusher';
+import type { ArcadeScreenPainter } from './arcadeScreen';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
-import { canRunCroupier, rollAndSettle, openBetting, isCroupierLive } from './croupier';
+import { canRunCroupier } from './croupier';
 import {
   isManualSlotMachineRunning,
   setManualSlotMachineRunning,
 } from './slotCroupier';
-// 🎲🤖 #69 G3: the auto-stickman's shared settle/open helpers (manual ROLL /
-// NEXT ROLL delegate to the same implementation).
-import { rollAndSettleCraps, openCrapsBetting } from './crapsCroupier';
 // 🤖 #77C s3: per-dock robot routine config (the programming console).
 import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
@@ -274,7 +246,21 @@ import { readBoardSetting, subscribeDepartures, writeBoardSetting } from './depa
 import { readStore as readPlanetStore, subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
-import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
+import { chipsFor, drawChips, groupChips } from './chipDisplay';
+import {
+  dishLine,
+  failFaucetRequest,
+  faucetPending,
+  faucetPendingUnanswered,
+  formatMojos,
+  jarLevel,
+  latestFaucetError,
+  latestFaucetStatus,
+  markFaucetPending,
+  subscribeFaucet,
+  type FaucetOp,
+  type FaucetRequestTicket,
+} from './faucetDish';
 
 /** The helm's FUEL gauge: its figure, fill and colour. */
 function fuelGauge(fuel: number, capacity: number): { text: string; pct: number; color: string } {
@@ -304,7 +290,7 @@ function stationFliesFree(stationId: string, now: number): boolean {
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv' | 'arcade' | 'faucetDish';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -491,6 +477,75 @@ export interface AirHockeyVisualHandle {
   setTheme(theme: AirHockeyThemeSpec): void;
 }
 
+// ── 📺 Smart-TV screen handle (#186 — shared with the furniture builder) ─────
+
+/**
+ * Handle onto a smart TV's in-world CanvasTexture screen. The builder
+ * (furniture.ts) stows it in the screen mesh's userData.tvScreen; World
+ * collects it and, at ~2 Hz, hands it the view tvDoc derives from the room
+ * record (tvScreenView) — the handle redraws only when the view changed.
+ * The picture itself is not here (plan §3.4): the screen shows the home
+ * screen, the countdown and the now-playing card; the theatre plays video.
+ */
+export interface TvScreenHandle {
+  draw(view: import('./tvDoc').TvScreenView): void;
+}
+
+// ── 🕹 Arcade cabinet screen handle (#193 — shared with the furniture builder) ─
+
+/**
+ * Handle onto an arcade cabinet's in-world CanvasTexture screen: the attract
+ * card (INSERT COIN, the game's name, the tally) and "P1 · <name>" while
+ * someone is at the controls. Stowed in the screen mesh's userData.arcadeScreen
+ * by the builder; World collects it and hands it arcadeDoc.arcadeScreenView
+ * at ~2 Hz. The game's own picture plays in P1's stage panel (plan §9); the
+ * spectator lane brings it to this texture later.
+ */
+export interface ArcadeScreenHandle {
+  draw(view: import('./arcadeDoc').ArcadeScreenView): void;
+}
+
+// ── 🐊 Insatiable-alligators table handle (#185 — shared with the builder) ──
+
+/**
+ * Handle onto an insatiable-alligators table's animated pieces: eight heads
+ * on the rim, the balls, the spinning table top, the eight birds and their
+ * counter displays. The builder (furniture.ts) stows it in the felt mesh's
+ * userData.alligators; World collects it and hands it to alligatorsSession,
+ * which drives every piece for EVERYONE (the diegetic-display rule — the
+ * air-hockey handle's contract). All coordinates are LOCAL table space.
+ */
+export interface AlligatorsVisualHandle {
+  /** Place seat `seat`'s head. `raised` false folds it away under the table
+   *  (issue #185: heads fold up only when a player joins); `swing` (rad) and
+   *  `ext` (lunge, m) follow games/alligators.ts headDir/mouthOf; `jawOpen`
+   *  is 1 open … 0 shut on the table. */
+  setHead(seat: number, raised: boolean, swing: number, ext: number, jawOpen: number): void;
+  /** Place ball `index` (hidden when not visible: unlaid, eaten, no round). */
+  setBall(index: number, x: number, z: number, visible: boolean): void;
+  /** Turn the table top (rad) — the every-10-seconds spin. */
+  setSpin(angle: number): void;
+  /** Redraw seat `seat`'s counter (deduped): `lit` while the seat is played,
+   *  `flashing` for a round's winner. */
+  setDisplay(seat: number, count: number, lit: boolean, flashing: boolean): void;
+  /** Bird `bird` lays an egg — a squat-and-pop animation, decayed in update. */
+  layEgg(bird: number): void;
+  /** Per-frame animation (fold ease, bird squats, display flash). */
+  update(dt: number): void;
+}
+
+// ── ⛓️🥣 Faucet dish handle (shared with the furniture builder) ──────────────
+
+/**
+ * ⛓️🥣 The faucet dish fixture's live state. World pushes it at ~1 Hz from the
+ * last status the node sent for the room (faucetDish.ts): the jar's fill
+ * LEVEL (0..1, by gift slots — never a total in-room), how many mojos sit in
+ * the dish, and whether a take or give is in flight (the mojo pulses).
+ */
+export interface FaucetDishHandle {
+  setState(level: number, ready: number, pending: boolean): void;
+}
+
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
 
 /**
@@ -572,6 +627,21 @@ export interface CoinPusherVisualHandle {
   dispose(): void;
 }
 
+/**
+ * 🕹️ The arcade cabinet's screen. The builder (furniture.ts) makes the
+ * 512×480 canvas, its CanvasTexture and the painter, paints the attract card,
+ * and stows this in the screen mesh's userData.arcadeCabinet. The focused
+ * cabinet UI (arcadeNesCabinet.ts) paints the menu and the running game through
+ * `painter`, then calls present() to push the canvas to the texture.
+ */
+export interface ArcadeCabinetVisualHandle {
+  readonly painter: ArcadeScreenPainter;
+  /** Mark the screen texture for upload after a paint. */
+  present(): void;
+  /** Back to the idle attract card (the player stepped away). */
+  showAttract(): void;
+}
+
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
 
 /**
@@ -592,11 +662,32 @@ export interface GameTableTopHandle {
   /** True when the card-felt face is up (checkerboard face down). */
   isCardsUp(): boolean;
   /**
-   * Repaint the in-world checkerboard texture from a 64-cell board array
-   * (games/checkers.ts codes), or null for the bare board. Lets spectators
-   * see the live game without focusing (wall-screen hybrid idiom, §D0.4).
+   * Lay the 3D checkers out from a 64-cell board array (games/checkers.ts
+   * codes) — clearing any chess set — or null for a bare board, and light
+   * the frame strip at the end whose `turn` it is (null: no game running).
+   * Everyone in the room sees this — spectators follow the live game
+   * without focusing (#227).
    */
-  setBoard(board: number[] | null): void;
+  setBoard(board: number[] | null, turn?: CheckersColor | null): void;
+  /**
+   * ♟ Lay the 3D chess set out from a 64-cell board array (games/chess.ts
+   * codes) — clearing any checkers — light the frame strip at the end whose
+   * `turn` it is, and echo the last move and a checked king on the wood.
+   * Everyone in the room sees this. null board: a bare board.
+   */
+  setChess(
+    board: number[] | null,
+    turn?: ChessColor | null,
+    echo?: { last: { from: number; to: number } | null; check: number | null } | null,
+  ): void;
+  /** The LOCAL player's move marks (selection, destinations, movable
+   *  pieces, hover) painted on the board face; null clears them. */
+  setMarks(marks: BoardMarks | null): void;
+  /** Cell under a ray (focus camera + pointer), or null off the squares,
+   *  while the board face is up and at rest. */
+  pickCell(ray: THREE.Raycaster): number | null;
+  /** True when a ray hits the ⚙ settings token beside the board. */
+  pickSettings(ray: THREE.Raycaster): boolean;
   /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
   update(deltaTime: number): void;
 }
@@ -1192,6 +1283,11 @@ export interface MapTableDeps {
   currentDoors?: () => Array<{ id: string; label: string }>;
   /** 🗺️ Step back from the table and open a door's own panel. */
   openDoorPanel?: (doorId: string) => void;
+  /** ✏️ #192: does this install hold a pass to that module (the atlas's
+   *  BEAM INTO for another module of the station)? */
+  canBeamTo?: (roomId: string) => boolean;
+  /** ✏️ Step back from the table and beam into that module. */
+  beamTo?: (roomId: string) => void;
   /** 🗺️ The local player's id, so a module's owner can read "You". */
   playerId?: () => string;
   /** 🗺️ The local identity key: "You" still, back on a fresh player id. */
@@ -1297,6 +1393,8 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
           dismantled: () => dismantledRoomIds(),
           doors: () => stationPlanDeps.currentDoors?.() ?? [],
           openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
+          canBeamTo: (roomId) => stationPlanDeps.canBeamTo?.(roomId) ?? false,
+          beamTo: (roomId) => stationPlanDeps.beamTo?.(roomId),
           onBack: () => stationPlanView?.hide(),
           disassembly: () => ({
             jobs: readDisassemblyJobs(),
@@ -1544,7 +1642,7 @@ export function createStorageTrunkUI(deps: StorageTrunkUIDeps): DeviceUI {
   };
 }
 
-// ── #45 v1 game-table focused UI — flippable surface + doc-synced checkers ───
+// ── #45 v1 game-table focused UI — flippable surface + game picker ───────────
 
 export interface GameTableUIDeps {
   /** Furniture item id — the key into the room doc's `games` map. */
@@ -1554,406 +1652,114 @@ export interface GameTableUIDeps {
    * handle was never collected — the FLIP affordance disables itself).
    */
   top: GameTableTopHandle | null;
+  /**
+   * 🎲 #227: the fully-3D checkers layer (checkersSession.ts, built by
+   * World). While the table holds checkers with its board face up, this
+   * UI hides its panel and mounts the layer instead — play happens on the
+   * 3D table. Null: checkers has no surface here (headless tests).
+   */
+  checkers: BoardGameTableLayer | null;
+  /** ♟ The fully-3D chess layer (chessSession.ts, built by World) — the
+   *  same hand-off for a chess game. Null: no chess surface here. */
+  chess: BoardGameTableLayer | null;
 }
+
+/** The slice of a 3D board-game layer (checkersSession.ts /
+ *  chessSession.ts) this UI drives — declared here so devices.ts never
+ *  imports the session modules (editMode would cycle). */
+export interface BoardGameTableLayer {
+  /** Attach the capture layer + HUD. `refresh` asks this UI to re-pick
+   *  its face (after a flip or a reset leaves the game). */
+  mount(host: HTMLElement, refresh: () => void): void;
+  unmount(): void;
+  /** Bot pump (runs only while mounted — the documented v1 sleep rule). */
+  update(dt: number): void;
+  /** That game's half of the table's RESET gate. */
+  canReset(): boolean;
+}
+/** The checkers layer's name before chess joined it on the table. */
+export type CheckersTableLayer = BoardGameTableLayer;
 
 const GT_GOLD = '#d4a84b';
 const GT_GOLD_BRIGHT = '#F0C060';
 const GT_DIM = '#4A5560';
 
-/** DOM-board palette (mirrors the in-world texture painter in furniture.ts). */
-const DOM_SQ_LIGHT = '#EAD9B0';
-const DOM_SQ_DARK = '#7A4A28';
-const DOM_RED = '#C43C3C';
-const DOM_BLACK = '#23252E';
-
 /**
  * The game table's focused DOM UI (#45 v1): FLIP affordance for the two-face
- * top, and the checkers game on face A — seat claiming (first two claimants,
- * keyed by S2 player id), click-to-move with mandatory-capture highlighting,
- * VS BOT single-player, forfeit/reset, live spectator view. ALL game state
- * lives in the room doc's `games` map (games/gamesDoc.ts): every transition
- * is read → pure-engine compute → transacted write, and every repaint is
- * observer-driven — a second tab (or a rejoin) converges from the doc alone.
+ * top and the GAME PICKER. ALL game state lives in the room doc's `games`
+ * map (games/gamesDoc.ts): every transition is read → pure-engine compute →
+ * transacted write, and every repaint is observer-driven — a second tab (or
+ * a rejoin) converges from the doc alone.
+ *
+ * 🎲 #227 / ♟: neither board game lives in this panel any more. When the
+ * table holds checkers or chess with its board face up, the panel steps
+ * aside and that game's 3D layer (deps.checkers / deps.chess) takes over —
+ * pieces on the table, clicks on the table, a ⚙ token for options.
  *
  * Honest-scope notes baked into the panel: the card face has no games yet
  * (war/poker/solitaire arrive per brainstorming/games-plan.md), and the
- * trivial bot only "thinks" while the RED claimant has the table focused.
+ * trivial bots only "think" while their human player has the table focused.
  */
 export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
-  let boardCanvas: HTMLCanvasElement | null = null;
   let unsubscribe: (() => void) | null = null;
-  /** Selected own-piece cell, or null. Local-only — never written to the doc. */
-  let selected: number | null = null;
-  let botTimer = 0;
-  const myId = getPlayerId();
+  let host: HTMLElement | null = null;
+  /** The 3D layer that owns the view right now (panel hidden), or null. */
+  let mounted: BoardGameTableLayer | null = null;
 
-  const BOARD_CSS = 320;  // CSS px (square)
-  const BOARD_RES = 640;  // backing-store px (2x for crisp squares)
-
-  const mySeat = (s: CheckersState): CheckersColor | null =>
-    s.players.red === myId ? 'red' : s.players.black === myId ? 'black' : null;
-
-  /** May I interact with the board right now (seat + turn + not the bot's)? */
-  const myTurn = (s: CheckersState): boolean => {
-    const seat = mySeat(s);
-    return s.status === 'playing' && seat !== null && s.turn === seat
-      && !(s.bot && s.turn === 'black');
-  };
-
-  const seatLabel = (s: CheckersState, color: CheckersColor): string => {
-    if (color === 'black' && s.bot) return 'BOT';
-    const id = s.players[color];
-    if (!id) return 'OPEN';
-    const name = readPlayerDisplayName(id).toUpperCase();
-    return id === myId ? `${name} (YOU)` : name;
-  };
-
-  const statusText = (s: CheckersState): string => {
-    if (s.status === 'waiting') return 'WAITING FOR PLAYERS — SIT DOWN TO CLAIM A COLOR';
-    if (s.status === 'red-won') return '● RED WINS';
-    if (s.status === 'black-won') return '● BLACK WINS';
-    const who = s.turn.toUpperCase();
-    const yours = myTurn(s) ? ' — YOUR MOVE' : '';
-    const chain = s.chain !== null ? ' · MULTI-JUMP: SAME PIECE CONTINUES' : '';
-    return `${who} TO MOVE${yours}${chain}`;
-  };
-
-  // ── Doc transitions (read → pure engine → transacted write) ────────────────
-
-  const claimSeat = (color: CheckersColor): void => {
-    const s = readGame(deps.itemId) ?? initialState();
-    if (s.status !== 'waiting') return;            // claims only pre-game (v1)
-    if (s.players[color] !== null) return;         // taken (doc LWW settles races)
-    if (s.players[otherColor(color)] === myId) return; // one seat per player (v1)
-    if (s.bot && color === 'black') return;        // bot holds black
-    const players = { ...s.players, [color]: myId };
-    const status = players.red && players.black ? 'playing' as const : s.status;
-    writeGame(deps.itemId, { ...s, players, status });
-  };
-
-  const startBotGame = (): void => {
-    const s = readGame(deps.itemId) ?? initialState();
-    if (s.status !== 'waiting' || s.players.black !== null) return;
-    if (s.players.red !== null && s.players.red !== myId) return; // not alone
-    writeGame(deps.itemId, {
-      ...s,
-      players: { ...s.players, red: myId },
-      bot: true,
-      status: 'playing',
-    });
-  };
-
-  const forfeit = (): void => {
-    const s = readGame(deps.itemId);
-    if (!s || s.status !== 'playing') return;
-    const seat = mySeat(s);
-    if (!seat) return;
-    writeGame(deps.itemId, {
-      ...s,
-      status: seat === 'red' ? 'black-won' : 'red-won',
-      chain: null,
-    });
-  };
-
-  /** RESET gate: participants or the room owner mid-game; ANYONE once the
-   *  game is finished (otherwise departed winners would pin the seats).
-   *  Bot games are always resettable (review F5): the bot holds no real seat,
-   *  so if the red claimant leaves mid-game no seat-holder remains — without
-   *  this an owner-absent room's table is pinned at BLACK (BOT) forever. */
-  const canReset = (s: CheckersState | null): boolean => {
-    if (!s) return false;
-    if (s.status === 'red-won' || s.status === 'black-won') return true;
-    if (s.bot) return true;
-    return mySeat(s) !== null || readRoomOwner() === myId;
-  };
-
-  // (The old per-game reset became clearToPicker — RESET now clears the whole
-  // table back to the game menu for BOTH kinds. The LWW caveat still applies:
-  // an in-flight opponent move-write may win over the clear; RESET again
-  // recovers. canReset above remains the checkers half of canClearTable.)
-
-  // ── Board rendering + click-to-move ────────────────────────────────────────
-
-  const drawBoard = (s: CheckersState | null): void => {
-    if (!boardCanvas) return;
-    const ctx = boardCanvas.getContext('2d');
-    if (!ctx) return;
-    const state = s ?? initialState();
-    const SQ = BOARD_RES / 8;
-    ctx.imageSmoothingEnabled = false;
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        ctx.fillStyle = (r + c) % 2 === 1 ? DOM_SQ_DARK : DOM_SQ_LIGHT;
-        ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
-      }
-    }
-    const moves = s && myTurn(s) ? legalMoves(s) : [];
-    // Selected piece: gold frame; its legal destinations: gold dots.
-    if (selected !== null) {
-      ctx.lineWidth = 6;
-      ctx.strokeStyle = GT_GOLD_BRIGHT;
-      ctx.strokeRect((selected % 8) * SQ + 3, Math.floor(selected / 8) * SQ + 3, SQ - 6, SQ - 6);
-      for (const m of moves) {
-        if (m.from !== selected) continue;
-        ctx.beginPath();
-        ctx.arc((m.to % 8) * SQ + SQ / 2, Math.floor(m.to / 8) * SQ + SQ / 2, SQ * 0.14, 0, Math.PI * 2);
-        ctx.fillStyle = GT_GOLD_BRIGHT;
-        ctx.fill();
-      }
-    }
-    for (let idx = 0; idx < 64; idx++) {
-      const v = state.board[idx];
-      if (v === 0) continue;
-      const red = pieceColor(v) === 'red';
-      const cx = (idx % 8) * SQ + SQ / 2;
-      const cy = Math.floor(idx / 8) * SQ + SQ / 2;
-      ctx.beginPath();
-      ctx.arc(cx, cy, SQ * 0.36, 0, Math.PI * 2);
-      ctx.fillStyle = red ? DOM_RED : DOM_BLACK;
-      ctx.fill();
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = red ? '#8E2626' : '#0E0F14';
-      ctx.stroke();
-      // Movable pieces get a soft halo on your turn (mandatory captures make
-      // "why can't I move THIS piece?" a real question — show the answer).
-      if (moves.some((m) => m.from === idx)) {
-        ctx.beginPath();
-        ctx.arc(cx, cy, SQ * 0.44, 0, Math.PI * 2);
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(240, 192, 96, 0.65)';
-        ctx.stroke();
-      }
-      if (v === RED_KING || v === BLACK_KING) {
-        ctx.fillStyle = GT_GOLD_BRIGHT;
-        ctx.font = 'bold 30px monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('K', cx, cy + 2);
-      }
-    }
-  };
-
-  const onBoardClick = (e: MouseEvent): void => {
-    if (!boardCanvas) return;
-    const s = readGame(deps.itemId);
-    if (!s || !myTurn(s)) return; // spectators/off-turn: view only
-    const rect = boardCanvas.getBoundingClientRect();
-    const c = Math.floor(((e.clientX - rect.left) / rect.width) * 8);
-    const r = Math.floor(((e.clientY - rect.top) / rect.height) * 8);
-    if (r < 0 || r > 7 || c < 0 || c > 7) return;
-    const idx = r * 8 + c;
-    const moves = legalMoves(s);
-    if (selected !== null) {
-      const move = moves.find((m) => m.from === selected && m.to === idx);
-      if (move) {
-        const next = applyMove(s, move);
-        // Multi-jump: keep the chained piece selected so the continuation
-        // reads as one gesture; otherwise clear.
-        selected = next.chain;
-        writeGame(deps.itemId, next); // observer repaints
-        return;
-      }
-    }
-    // (Re)select one of my movable pieces; anything else clears.
-    selected = pieceColor(s.board[idx]) === s.turn && moves.some((m) => m.from === idx)
-      ? idx : null;
-    drawBoard(s); // selection is local — no doc write, repaint directly
-  };
-
-  // ── ♟ Chess (#45 — the board face's second game; checkers' sibling) ────────
-
-  let chessSelected: number | null = null;
-  let chessBotTimer = 0;
-
-  const myChessSeat = (s: ChessState): ChessColor | null =>
-    s.players.white === myId ? 'white' : s.players.black === myId ? 'black' : null;
-
-  const myChessTurn = (s: ChessState): boolean => {
-    const seat = myChessSeat(s);
-    return s.status === 'playing' && seat !== null && s.turn === seat
-      && !(s.bot && s.turn === 'black');
-  };
-
-  const chessSeatLabel = (s: ChessState, color: ChessColor): string => {
-    if (color === 'black' && s.bot) return 'BOT';
-    const id = s.players[color];
-    if (!id) return 'OPEN';
-    const name = readPlayerDisplayName(id).toUpperCase();
-    return id === myId ? `${name} (YOU)` : name;
-  };
-
-  const chessStatusText = (s: ChessState): string => {
-    if (s.status === 'waiting') return 'WAITING FOR PLAYERS — SIT DOWN TO CLAIM A COLOR';
-    if (s.status === 'white-won') return '♔ WHITE WINS — CHECKMATE';
-    if (s.status === 'black-won') return '♚ BLACK WINS — CHECKMATE';
-    if (s.status === 'draw') return '½–½ DRAW — STALEMATE';
-    const who = s.turn.toUpperCase();
-    const yours = myChessTurn(s) ? ' — YOUR MOVE' : '';
-    const check = inCheck(s.board, s.turn) ? ' · CHECK!' : '';
-    return `${who} TO MOVE${yours}${check}`;
-  };
-
-  const claimChessSeat = (color: ChessColor): void => {
-    const t = readTable(deps.itemId);
-    if (!t || t.kind !== 'chess') return;
-    const s = t.state;
-    if (s.status !== 'waiting') return;
-    if (s.players[color] !== null) return;
-    if (s.players[otherChessColor(color)] === myId) return;
-    if (s.bot && color === 'black') return;
-    const players = { ...s.players, [color]: myId };
-    const status = players.white && players.black ? 'playing' as const : s.status;
-    writeGame(deps.itemId, { ...s, players, status });
-  };
-
-  const startChessBotGame = (): void => {
-    const t = readTable(deps.itemId);
-    if (!t || t.kind !== 'chess') return;
-    const s = t.state;
-    if (s.status !== 'waiting' || s.players.black !== null) return;
-    if (s.players.white !== null && s.players.white !== myId) return;
-    writeGame(deps.itemId, { ...s, players: { ...s.players, white: myId }, bot: true, status: 'playing' });
-  };
-
-  const chessForfeit = (): void => {
-    const t = readTable(deps.itemId);
-    if (!t || t.kind !== 'chess' || t.state.status !== 'playing') return;
-    const seat = myChessSeat(t.state);
-    if (!seat) return;
-    writeGame(deps.itemId, { ...t.state, status: seat === 'white' ? 'black-won' : 'white-won' });
-  };
-
-  /** RESET gate for EITHER game kind (mirror of canReset's reasoning). */
+  /** RESET gate for whatever lives on the table. */
   const canClearTable = (): boolean => {
     const t = readTable(deps.itemId);
     if (!t) return false;
-    if (t.kind === 'checkers') return canReset(t.state);
+    if (t.kind === 'checkers') return deps.checkers?.canReset() ?? false;
+    if (t.kind === 'chess') return deps.chess?.canReset() ?? false;
     // 🏒 An air-hockey state under a GAME TABLE's key is foreign — the
     // air-hockey UI writes only under its own table's item id, so this can
     // only be a malformed/hostile peer write. No participants are derivable
     // for a game this table can't host: let ANYONE clear it (unwedge rule).
-    if (t.kind === 'airhockey') return true;
-    const s = t.state;
-    if (s.status !== 'waiting' && s.status !== 'playing') return true;
-    if (s.bot) return true;
-    if (s.status === 'waiting') return true; // nobody committed yet
-    return myChessSeat(s) !== null || readRoomOwner() === myId;
+    // 🐊 Insatiable alligators (#185) is foreign here the same way.
+    return true;
   };
 
-  /** Clear the table back to the GAME PICKER (both kinds — lets players
-   *  switch games; the whole-value LWW caveat from reset() applies). */
+  /** Clear the table back to the GAME PICKER (lets players switch games;
+   *  the whole-value LWW caveat applies — RESET again recovers). */
   const clearToPicker = (): void => {
     if (!canClearTable()) return;
-    selected = null;
-    chessSelected = null;
     clearTable(deps.itemId);
-  };
-
-  const CHESS_GLYPHS: Record<number, string> = {
-    [W_KING]: '♔', [W_QUEEN]: '♕', [W_ROOK]: '♖', [W_BISHOP]: '♗', [W_KNIGHT]: '♘', [W_PAWN]: '♙',
-    [B_KING]: '♚', [B_QUEEN]: '♛', [B_ROOK]: '♜', [B_BISHOP]: '♝', [B_KNIGHT]: '♞', [B_PAWN]: '♟',
-  };
-
-  const drawChessBoard = (s: ChessState): void => {
-    if (!boardCanvas) return;
-    const ctx = boardCanvas.getContext('2d');
-    if (!ctx) return;
-    const SQ = BOARD_RES / 8;
-    ctx.imageSmoothingEnabled = true;
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        ctx.fillStyle = (r + c) % 2 === 1 ? '#8A6A48' : '#EAD9B0';
-        ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
-      }
-    }
-    // Last-move echo (both squares) — reads the opponent's reply at a glance.
-    if (s.last) {
-      ctx.fillStyle = 'rgba(240, 192, 96, 0.28)';
-      for (const sq of [s.last.from, s.last.to]) {
-        ctx.fillRect((sq % 8) * SQ, Math.floor(sq / 8) * SQ, SQ, SQ);
-      }
-    }
-    const moves = myChessTurn(s) ? legalChessMoves(s) : [];
-    if (chessSelected !== null) {
-      ctx.lineWidth = 6;
-      ctx.strokeStyle = GT_GOLD_BRIGHT;
-      ctx.strokeRect((chessSelected % 8) * SQ + 3, Math.floor(chessSelected / 8) * SQ + 3, SQ - 6, SQ - 6);
-      for (const m of moves) {
-        if (m.from !== chessSelected) continue;
-        ctx.beginPath();
-        ctx.arc((m.to % 8) * SQ + SQ / 2, Math.floor(m.to / 8) * SQ + SQ / 2, SQ * 0.13, 0, Math.PI * 2);
-        ctx.fillStyle = GT_GOLD_BRIGHT;
-        ctx.fill();
-      }
-    }
-    // Check flare under the threatened king.
-    if (s.status === 'playing' && inCheck(s.board, s.turn)) {
-      const k = s.board.indexOf(s.turn === 'white' ? W_KING : B_KING);
-      if (k >= 0) {
-        ctx.fillStyle = 'rgba(255, 23, 68, 0.35)';
-        ctx.fillRect((k % 8) * SQ, Math.floor(k / 8) * SQ, SQ, SQ);
-      }
-    }
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font = `${Math.floor(SQ * 0.78)}px serif`;
-    for (let idx = 0; idx < 64; idx++) {
-      const v = s.board[idx];
-      if (v === 0) continue;
-      const cx = (idx % 8) * SQ + SQ / 2;
-      const cy = Math.floor(idx / 8) * SQ + SQ / 2 + 4;
-      // Halo for movable pieces on your turn (mirrors checkers affordance).
-      if (moves.some((m) => m.from === idx)) {
-        ctx.beginPath();
-        ctx.arc(cx, cy - 4, SQ * 0.42, 0, Math.PI * 2);
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(240, 192, 96, 0.6)';
-        ctx.stroke();
-      }
-      // Outline both colors for contrast on both square shades.
-      ctx.fillStyle = v > 0 ? '#FFFFFF' : '#16181F';
-      ctx.strokeStyle = v > 0 ? '#3A3A3A' : '#C9CDD6';
-      ctx.lineWidth = 2;
-      ctx.strokeText(CHESS_GLYPHS[v], cx, cy);
-      ctx.fillText(CHESS_GLYPHS[v], cx, cy);
-    }
-  };
-
-  const onChessBoardClick = (e: MouseEvent): void => {
-    if (!boardCanvas) return;
-    const t = readTable(deps.itemId);
-    if (!t || t.kind !== 'chess' || !myChessTurn(t.state)) return;
-    const s = t.state;
-    const rect = boardCanvas.getBoundingClientRect();
-    const c = Math.floor(((e.clientX - rect.left) / rect.width) * 8);
-    const r = Math.floor(((e.clientY - rect.top) / rect.height) * 8);
-    if (r < 0 || r > 7 || c < 0 || c > 7) return;
-    const idx = r * 8 + c;
-    const moves = legalChessMoves(s);
-    if (chessSelected !== null) {
-      const move = moves.find((m) => m.from === chessSelected && m.to === idx);
-      if (move) {
-        chessSelected = null;
-        writeGame(deps.itemId, applyChessMove(s, move)); // observer repaints
-        return;
-      }
-    }
-    chessSelected = chessPieceColor(s.board[idx]) === s.turn && moves.some((m) => m.from === idx)
-      ? idx : null;
-    drawChessBoard(s);
   };
 
   // ── Panel rendering (trunk-UI idiom: re-render + re-attach on change) ──────
 
+  /**
+   * 🎲 #227 / ♟: hand the view to the 3D layer of the board game on the
+   * table while its board face is up and at rest, and take it back
+   * otherwise. Returns true while a layer has it — the panel then stays
+   * hidden and unrendered.
+   */
+  const syncBoardLayer = (): boolean => {
+    // No top → nothing to pick on; keep the panel (its RESET stays reachable).
+    const kind = readTable(deps.itemId)?.kind;
+    const faceUp = !!deps.top && !!host
+      && !(deps.top?.isCardsUp() ?? false) && !(deps.top?.isFlipping() ?? false);
+    const want = !faceUp ? null
+      : kind === 'checkers' ? deps.checkers
+      : kind === 'chess' ? deps.chess
+      : null;
+    if (mounted && mounted !== want) {
+      mounted.unmount();
+      mounted = null;
+    }
+    if (want && !mounted && host) {
+      want.mount(host, () => render());
+      mounted = want;
+    }
+    if (panel) panel.style.display = mounted ? 'none' : 'flex';
+    return mounted !== null;
+  };
+
   const render = (): void => {
     if (!panel) return;
-    const s = readGame(deps.itemId);
-    // Prune a stale selection (an opponent/bot move landed, or a reset).
-    if (selected !== null
-      && (!s || !myTurn(s) || !legalMoves(s).some((m) => m.from === selected))) {
-      selected = s?.chain ?? null;
-    }
+    if (syncBoardLayer()) return;
     const cardsUp = deps.top?.isCardsUp() ?? false;
     const flipping = deps.top?.isFlipping() ?? false;
     const surface = flipping ? 'FLIPPING…' : cardsUp ? 'CARD FELT' : 'CHECKERBOARD';
@@ -1973,52 +1779,9 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         opacity: ${disabled ? '0.5' : '1'};
       ">${label}</button>`;
 
-    const seatCell = (color: CheckersColor): string => {
-      const state = s ?? initialState();
-      const label = seatLabel(state, color);
-      const claimable = state.status === 'waiting'
-        && state.players[color] === null
-        && !(state.bot && color === 'black')
-        && state.players[otherColor(color)] !== myId;
-      const dot = color === 'red' ? DOM_RED : '#9AA3B2';
-      return `
-        <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:7px 10px;">
-          <span style="width:10px; height:10px; border-radius:50%; background:${dot}; flex:none;"></span>
-          <span style="flex:1; font-size:10px; letter-spacing:1px; color:${GT_GOLD};">${color.toUpperCase()} — ${label}</span>
-          ${claimable ? btn(`gt-sit-${color}`, 'SIT', false, `Claim ${color}`) : ''}
-        </div>`;
-    };
-
     const table = readTable(deps.itemId);
 
-    // Chess: prune a stale selection (opponent/bot moved, or the table reset).
-    if (chessSelected !== null
-      && (table?.kind !== 'chess' || !myChessTurn(table.state)
-        || !legalChessMoves(table.state).some((m) => m.from === chessSelected))) {
-      chessSelected = null;
-    }
-
-    const boardCursor = (interactive: boolean): string => interactive ? 'pointer' : 'default';
-    const canvasHtml = (interactive: boolean): string => `
-      <canvas id="gt-board" width="${BOARD_RES}" height="${BOARD_RES}"
-        style="width:${BOARD_CSS}px; height:${BOARD_CSS}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${boardCursor(interactive)};"></canvas>`;
-
-    const chessSeatCell = (state: ChessState, color: ChessColor): string => {
-      const label = chessSeatLabel(state, color);
-      const claimable = state.status === 'waiting'
-        && state.players[color] === null
-        && !(state.bot && color === 'black')
-        && state.players[otherChessColor(color)] !== myId;
-      const dot = color === 'white' ? '#EAEAEA' : '#23252E';
-      return `
-        <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:7px 10px;">
-          <span style="width:10px; height:10px; border-radius:50%; background:${dot}; border:1px solid #666; flex:none;"></span>
-          <span style="flex:1; font-size:10px; letter-spacing:1px; color:${GT_GOLD};">${color.toUpperCase()} — ${label}</span>
-          ${claimable ? btn(`gt-chess-sit-${color}`, 'SIT', false, `Claim ${color}`) : ''}
-        </div>`;
-    };
-
-    // ── The board face: game picker / checkers / chess ──
+    // ── The board face: game picker / a board game / foreign state ──
     let boardFace: string;
     if (table === null) {
       boardFace = `
@@ -2028,51 +1791,23 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             ${btn('gt-pick-chess', '♟ CHESS', false, 'Full rules — castling, en passant, checkmate')}
             ${btn('gt-pick-checkers', '⛀ CHECKERS', false, 'American rules, forced captures')}
           </div>
-          <div style="font-size:9px; color:rgba(212,168,75,0.5);">Anyone at the table picks; the first two to SIT play. RESET brings this menu back.</div>
+          <div style="font-size:9px; color:rgba(212,168,75,0.5);">Anyone at the table picks; click a piece on the table to take its side. RESET brings this menu back.</div>
         </div>`;
-    } else if (table.kind === 'chess') {
-      const cs = table.state;
-      const showChessBot = cs.status === 'waiting' && cs.players.black === null
-        && (cs.players.white === null || cs.players.white === myId);
-      const showChessForfeit = cs.status === 'playing' && myChessSeat(cs) !== null;
+    } else if (table.kind === 'chess' || table.kind === 'checkers') {
+      // 🎲 #227 / ♟: both board games are played on the 3D table — this face
+      // only shows for the instant the top is mid-flip (the layer steps
+      // aside then), or where no layer was supplied.
       boardFace = `
-        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
-          cs.status === 'playing' ? GT_GOLD_BRIGHT : cs.status === 'waiting' ? GT_DIM : '#00E676'
-        };">${chessStatusText(cs)}</div>
-        <div style="display:flex; gap:8px;">
-          ${chessSeatCell(cs, 'white')}
-          ${chessSeatCell(cs, 'black')}
-        </div>
-        ${showChessBot ? `<div>${btn('gt-chess-bot', '⚙ VS BOT — PLAY ALONE', false, 'Single-player against a trivial AI')}</div>` : ''}
-        ${canvasHtml(myChessTurn(cs))}
+        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${GT_GOLD_BRIGHT};">${
+          table.kind === 'chess' ? '♟ CHESS' : '⛀ CHECKERS'
+        } IS PLAYED ON THE TABLE</div>
         <div style="display:flex; gap:8px; justify-content:flex-end;">
-          ${showChessForfeit ? btn('gt-chess-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
           ${btn('gt-reset', 'RESET', !canClearTable(),
-            canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
-        </div>`;
-    } else if (table.kind === 'checkers') {
-      const state = table.state;
-      const showBot = state.status === 'waiting' && state.players.black === null
-        && (state.players.red === null || state.players.red === myId);
-      const showForfeit = state.status === 'playing' && mySeat(state) !== null;
-      boardFace = `
-        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
-          state.status === 'playing' ? GT_GOLD_BRIGHT : state.status === 'waiting' ? GT_DIM : '#00E676'
-        };">${statusText(state)}</div>
-        <div style="display:flex; gap:8px;">
-          ${seatCell('red')}
-          ${seatCell('black')}
-        </div>
-        ${showBot ? `<div>${btn('gt-bot', '⚙ VS BOT — PLAY ALONE', false, 'Start a single-player game against a trivial AI')}</div>` : ''}
-        ${canvasHtml(myTurn(state))}
-        <div style="display:flex; gap:8px; justify-content:flex-end;">
-          ${showForfeit ? btn('gt-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
-          ${btn('gt-reset', 'RESET', !canClearTable(),
-            canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
+            canClearTable() ? 'Clear the table (back to the game menu)' : 'Players at the table or anyone who can edit this room can reset a live game')}
         </div>`;
     } else {
-      // 🏒 Foreign state: an air-hockey record under this GAME TABLE's key.
-      // The air-hockey UI writes only under its own table's item id, so this
+      // 🏒 Foreign state: an air-hockey (or 🐊 alligators) record under this
+      // GAME TABLE's key. Those UIs write only under their own table's id, so this
       // can only come from a malformed or hostile peer write. Render a
       // recovery strip instead of wedging — RESET (enabled for anyone via
       // canClearTable's airhockey arm) clears it back to the game picker.
@@ -2080,7 +1815,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:#FF6E40;">UNRECOGNISED TABLE STATE</div>
         <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.6;">
           This table's synced entry holds a game this surface can't host
-          (air hockey). RESET clears it back to the game menu.
+          (${table.kind === 'airhockey' ? 'air hockey' : 'insatiable alligators'}). RESET clears it back to the game menu.
         </div>
         <div style="display:flex; gap:8px; justify-content:flex-end;">
           ${btn('gt-reset', 'RESET', !canClearTable(), 'Clear the table (back to the game menu)')}
@@ -2107,14 +1842,12 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         </div>
       </div>` : boardFace}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF GAME TABLE · chess (full rules, auto-queen) + checkers (American rules) · state synced via room doc · flip is per-player (only you see the other face)
+        SSF GAME TABLE · chess (full rules) and checkers (American rules) play on the 3D table · state synced via room doc · flip is per-player (only you see the other face)
       </div>
     `;
 
     panel.querySelector<HTMLButtonElement>('#gt-flip')?.addEventListener('click', () => {
       if (!deps.top || deps.top.isFlipping()) return;
-      selected = null;
-      chessSelected = null;
       deps.top.flip(() => render()); // completion swaps the panel face
       render();                      // immediate: show FLIPPING…
     });
@@ -2125,32 +1858,13 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#gt-pick-checkers')?.addEventListener('click', () => {
       if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialState());
     });
-    // Checkers controls.
-    panel.querySelector<HTMLButtonElement>('#gt-sit-red')?.addEventListener('click', () => claimSeat('red'));
-    panel.querySelector<HTMLButtonElement>('#gt-sit-black')?.addEventListener('click', () => claimSeat('black'));
-    panel.querySelector<HTMLButtonElement>('#gt-bot')?.addEventListener('click', () => startBotGame());
-    panel.querySelector<HTMLButtonElement>('#gt-forfeit')?.addEventListener('click', () => forfeit());
-    // Chess controls.
-    panel.querySelector<HTMLButtonElement>('#gt-chess-sit-white')?.addEventListener('click', () => claimChessSeat('white'));
-    panel.querySelector<HTMLButtonElement>('#gt-chess-sit-black')?.addEventListener('click', () => claimChessSeat('black'));
-    panel.querySelector<HTMLButtonElement>('#gt-chess-bot')?.addEventListener('click', () => startChessBotGame());
-    panel.querySelector<HTMLButtonElement>('#gt-chess-forfeit')?.addEventListener('click', () => chessForfeit());
-    // Shared RESET → back to the picker (both kinds).
+    // Shared RESET → back to the picker (every kind).
     panel.querySelector<HTMLButtonElement>('#gt-reset')?.addEventListener('click', () => clearToPicker());
-    boardCanvas = panel.querySelector<HTMLCanvasElement>('#gt-board');
-    if (table?.kind === 'chess') {
-      boardCanvas?.addEventListener('click', onChessBoardClick);
-      drawChessBoard(table.state);
-    } else {
-      boardCanvas?.addEventListener('click', onBoardClick);
-      // Checkers state feeds the board; picker (null) and the foreign
-      // air-hockey face draw the empty felt (no #gt-board in that face).
-      drawBoard(table?.kind === 'checkers' ? table.state : null);
-    }
   };
 
   return {
-    mount(host: HTMLElement): void {
+    mount(into: HTMLElement): void {
+      host = into;
       panel = document.createElement('div');
       panel.id = 'device-gametable-pane';
       // Gold-on-dark monospace shell (room-terminal idiom), nudged above
@@ -2179,9 +1893,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       // Input capture (plan §D0.3): clicks inside the device UI never reach
       // the canvas handler — clicks that DO reach it release the focus.
       panel.addEventListener('click', (e) => e.stopPropagation());
-      host.appendChild(panel);
-      selected = null;
-      botTimer = 0;
+      into.appendChild(panel);
       // Observer-driven repaint: doc changes (peer moves, claims, resets,
       // rebinds after a rejoin) re-render the whole panel from the doc.
       unsubscribe = subscribeGames(() => render());
@@ -2191,40 +1903,17 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      mounted?.unmount();
+      mounted = null;
       panel?.remove();
       panel = null;
-      boardCanvas = null;
+      host = null;
     },
 
     update(dt: number): void {
-      // Single-player bot pumps: the human claimant's client plays the bot
-      // side with a small think-delay. Runs only while this UI is mounted —
-      // the trivial bots sleep when the table is not focused (documented v1).
-      const t = readTable(deps.itemId);
-      if (t?.kind === 'checkers') {
-        const s = t.state;
-        if (s.bot && s.status === 'playing' && s.turn === 'black' && s.players.red === myId) {
-          botTimer += dt;
-          if (botTimer >= 0.7) {
-            botTimer = 0;
-            const move = chooseBotMove(s);
-            if (move) writeGame(deps.itemId, applyMove(s, move));
-          }
-        } else botTimer = 0;
-      } else if (t?.kind === 'chess') {
-        const s = t.state;
-        if (s.bot && s.status === 'playing' && s.turn === 'black' && s.players.white === myId) {
-          chessBotTimer += dt;
-          if (chessBotTimer >= 0.8) {
-            chessBotTimer = 0;
-            const move = chooseChessBotMove(s);
-            if (move) writeGame(deps.itemId, applyChessMove(s, move));
-          }
-        } else chessBotTimer = 0;
-      } else {
-        botTimer = 0;
-        chessBotTimer = 0;
-      }
+      // Single-player bot pumps live in the 3D layers (#227 / ♟): the human
+      // claimant's client plays the bot side while the table is focused.
+      mounted?.update(dt);
     },
   };
 }
@@ -2263,10 +1952,14 @@ const HELM_TICK_MS = 250;
  *  (docks are not station structure), so a ship reads its live dock partner
  *  first, then where its last flight left it; in flight it is at none, even
  *  should a fitting come off mid-trip (the room still follows its flight:
- *  followsFlightRecord, as main.ts places it). Exported for tests. */
+ *  followsFlightRecord, as main.ts places it), nor while flown by hand.
+ *  Exported for tests. */
 export function holotableStation(): StationRecord | null {
   // 🚏 A running route's timetable, when it rules the flight (A4).
   const flight = readResolvedFlight();
+  // 🕹️ Flown by hand (issue 203), a ship or a one-module station flying by
+  // itself is at no station: not even its own, which has left its orbit.
+  if (flight.status === 'free-flight') return null;
   if (!followsFlightRecord(flight.status, flightCapable(isShipReady()))) return currentStation();
   if (flight.status !== 'docked') return null;
   const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
@@ -4336,6 +4029,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     if (isBoltedIntoStation(readPhysicalDoors().values())) return 'This is the station\'s welcome room, joined to its other modules: only a station standing alone flies.';
     if (shipDocking?.ports().some((p) => p.state.kind === 'docked')) return 'Ships are docked here: a station flies alone, once they cast off.';
     if (isMoveActive(station.move, now)) return 'A move or altitude change is scheduled or under way.';
+    // A move this room's log is too long to read whole may be the one under
+    // way (stationMove.roomMovesKnown), as the station planners refuse.
+    if (!roomMovesKnown()) return 'This station holds more move records than the helm can read: it flies once they are cleared.';
     return '';
   }
 
@@ -4538,6 +4234,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       return;
     }
     const station = ownStationOf();
+    if (station && !roomMovesKnown()) {
+      flashFree('Cannot park yet: this station holds more move records than the helm can read. It parks once they are cleared.');
+      if (panel) render();
+      return;
+    }
     if (station) {
       // 🅿️ A station parks for good: its new orbit is kept as an altitude
       // change's arrival orbit (freeStation.ts), and the flight ends.
@@ -4989,6 +4690,202 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
     },
     update(): void { /* observer-driven; nothing per-frame */ },
   };
+}
+
+// ── ⛓️🥣 The FAUCET DISH — the room's faucet coin, made physical ─────────────
+
+export interface FaucetDishUIDeps {
+  /** The room whose dish this is (its faucet address derives from the room key). */
+  roomId: () => string;
+  /** Send a status / take / give request to the local node (NetworkProvider):
+   *  the ticket's `seq` is what the node echoes on the reply. */
+  request: (op: FaucetOp, amount?: number) => FaucetRequestTicket;
+}
+
+/** Give buttons, in mojos. The lobby gift is one mojo, so 1,000 mojos is a
+ *  thousand gifts; the largest button, 0.001 TXCH (a billion mojos), is still
+ *  small change on testnet11. */
+export const FAUCET_GIVE_AMOUNTS: ReadonlyArray<{ mojos: number; label: string }> = [
+  { mojos: 1_000, label: '+1,000 MOJOS' },
+  { mojos: 1_000_000, label: '+1,000,000' },
+  { mojos: 1_000_000_000, label: '+0.001 TXCH' },
+];
+
+/** While the screen is open, re-read the chain this often (reads are free). */
+const FAUCET_SCREEN_POLL_MS = 20_000;
+
+/**
+ * The faucet dish's focused UI: the JAR (exact mojos, coins, the address to
+ * pay into from any wallet), the DISH (is a mojo ready, when the next one is),
+ * TAKE A MOJO (a keyless claim the node submits, only while our wallet is
+ * empty) and GIVE (a fee-0 spend from our wallet into the jar). Everything
+ * shown comes from the node's last `faucet` reply; nothing here touches keys.
+ */
+export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let pollTimer: number | null = null;
+  let copied = false;
+
+  /** Ask the node for a status; a request that cannot leave is shown as such
+   *  (the screen otherwise reads "READING THE CHAIN…" with no node at all).
+   *  A failure resolving after the room was left files nothing: the store's
+   *  gate drops it, as it drops a late reply (faucetDish.ts, openFaucetRoom;
+   *  #245 review, round 20). */
+  const poll = (roomId: string): void => {
+    const { seq, sent } = deps.request('status');
+    sent.catch((e: unknown) => failFaucetRequest(roomId, 'status', seq, e));
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const roomId = deps.roomId();
+    const st = latestFaucetStatus(roomId);
+    const err = latestFaucetError(roomId);
+    const pending = faucetPending(roomId);
+    const level = jarLevel(st);
+    const btn = (id: string, label: string, disabled = false): string => `
+      <button id="${id}" ${disabled ? 'disabled' : ''} style="
+        flex:1; padding: 8px 6px;
+        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
+        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
+        border-radius: 6px; color: ${disabled ? CH_DIM : CH_GOLD_BRIGHT};
+        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1px;
+        cursor: ${disabled ? 'not-allowed' : 'pointer'};
+      ">${label}</button>`;
+    const row = (k: string, v: string): string => `
+      <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0; gap:10px;">
+        <span style="color:${CH_DIM};">${k}</span><span style="color:${CH_GOLD}; text-align:right;">${v}</span>
+      </div>`;
+    const wallet = st?.walletMojos ?? null;
+    // GIVE spends what the node can spend NOW (owned minus coins still confirming
+    // an earlier spend); the balance line shows what the wallet owns.
+    const spendable = st?.walletSpendableMojos ?? wallet;
+    const confirming = wallet !== null && spendable !== null && spendable < wallet ? wallet - spendable : 0n;
+    const canTake = !!st?.canClaim && pending === null;
+    const canGive = (mojos: number): boolean => !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
+    // A push the gateway never answered: the node keeps the spend's coins
+    // parked and the action pending until the chain or the mempool settles it,
+    // and the screen says so instead of reading a refusal (#245 review, round 14).
+    const unanswered = faucetPendingUnanswered(roomId);
+    const unansweredLine = (what: string): string =>
+      `the gateway did not answer the push (${escapeHtml(unanswered ?? '')}); ${what} may still land with the next block, and the dish keeps this until the chain or the mempool settles it`;
+    const pendingLine = pending === 'claim'
+      ? `TAKING… ${unanswered !== null ? unansweredLine('the mojo') : 'the mojo lands when the next block confirms it (about a minute)'}`
+      : pending === 'give'
+        ? `GIVING… ${unanswered !== null ? unansweredLine('your gift') : 'your gift lands when the next block confirms it (about a minute)'}`
+        : '';
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🥣 FAUCET DISH</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:11px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">${dishLine(st)}</div>
+      ${pendingLine ? `<div style="font-size:9.5px; color:${CH_PINK};">${pendingLine}</div>` : ''}
+      ${err ? `<div style="font-size:9.5px; color:#FF8A80;">⚠ ${escapeHtml(err)}</div>` : ''}
+      <div style="border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:10px 12px; background:rgba(10,16,24,0.6);">
+        <div style="font-size:10px; color:${CH_PINK}; letter-spacing:2px; margin-bottom:6px;">THE JAR</div>
+        <div style="height:8px; border:1px solid rgba(212,168,75,0.35); border-radius:4px; overflow:hidden; margin-bottom:6px;">
+          <div style="height:100%; width:${Math.round(level * 100)}%; background:${CH_GOLD};"></div>
+        </div>
+        ${st ? row('IN THE JAR', st.partial ? `${formatMojos(st.totalMojos)}+ (listing cut short; the jar holds more)` : formatMojos(st.totalMojos)) : ''}
+        ${st ? row('GIFT SLOTS (COINS)', st.partial ? `${st.coins}+ (listing cut short; the jar holds more)` : String(st.coins)) : ''}
+        ${st ? row('EACH GIFT', `${formatMojos(st.gift)} · one per coin every ${st.gap} blocks`) : ''}
+        ${st ? row('CHAIN HEIGHT', String(st.peak)) : row('CHAIN', 'reading…')}
+      </div>
+      <div>
+        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE DISH</div>
+        <div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>
+        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
+          ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
+          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}${st?.walletPartial ? '+ (listing cut short; it holds more)' : ''}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming a spend)` : ''}.` : ''}
+        </div>
+      </div>
+      <div>
+        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE SLOT — GIVE</div>
+        <div style="display:flex; gap:8px;">
+          ${FAUCET_GIVE_AMOUNTS.map((g, i) => btn(`faucet-give-${i}`, g.label, !canGive(g.mojos))).join('')}
+        </div>
+        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
+          Or pay into the jar from any Chia wallet (testnet11):
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
+          <code id="faucet-address" style="flex:1; font-size:8.5px; color:${CH_GOLD}; word-break:break-all; user-select:all;">${st ? escapeHtml(st.address) : '…'}</code>
+          ${btn('faucet-copy', copied ? 'COPIED' : 'COPY', !st)}
+        </div>
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF FAUCET DISH v1 · a keyless Chia coin per room · one gift per coin per ${st?.gap ?? 32} blocks · testnet11
+      </div>
+    `;
+    // A TAKE or GIVE is pending from the click until a status shows it landed
+    // (or the node refuses). A request that never reaches the node rejects,
+    // and the pending state goes with it: otherwise TAKING…/GIVING… would show
+    // for the whole timeout after a disconnect (#245 review, round 3).
+    const send = (op: FaucetOp, amount?: number): void => {
+      // The request's seq is allotted before anything is written, and the
+      // action is marked pending under it here, before any reply can arrive:
+      // only the reply echoing it (or the failure of this very request) sets
+      // its floor, settles or refuses it (#245 review, round 14).
+      const { seq, sent } = deps.request(op, amount);
+      markFaucetPending(roomId, op, seq);
+      // The failure of a request that never left drops the pending action (no
+      // spend was made); one resolving after the room was left is dropped by
+      // the store's gate instead, so nothing here can revive a departed
+      // room's state (round 20).
+      sent.then(
+        () => window.setTimeout(() => poll(roomId), 2_000),
+        (e: unknown) => failFaucetRequest(roomId, op, seq, e),
+      );
+    };
+    panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => send('claim'));
+    FAUCET_GIVE_AMOUNTS.forEach((g, i) => {
+      panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => send('give', g.mojos));
+    });
+    panel.querySelector<HTMLButtonElement>('#faucet-copy')?.addEventListener('click', () => {
+      if (!st) return;
+      void navigator.clipboard?.writeText(st.address).then(() => {
+        copied = true;
+        render();
+        window.setTimeout(() => { copied = false; render(); }, 1_500);
+      });
+    });
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-faucet-dish-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 380px; max-height: 90vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${CH_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      unsubscribe = subscribeFaucet(() => render());
+      render();
+      poll(deps.roomId());
+      pollTimer = window.setInterval(() => poll(deps.roomId()), FAUCET_SCREEN_POLL_MS);
+    },
+    unmount(): void {
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+      pollTimer = null;
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+    },
+    update(): void { /* observer-driven; nothing per-frame */ },
+  };
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 // ── 🤖 #77C s3: ROBOT DOCK — program the dock's robot (routine console) ───────
@@ -5552,496 +5449,6 @@ export function createDeparturesBoardUI(deps: DeparturesBoardUIDeps): DeviceUI {
   };
 }
 
-// ── 🎡 #69 G2: ROULETTE — house-banked, croupier spins, chips on the felt ────
-
-export interface RouletteUIDeps {
-  /** Furniture item id — keys the table + bet records in the casino map. */
-  itemId: string;
-  /** Owner-equivalent predicate: the croupier side (house/venture). */
-  isHouse: () => boolean;
-}
-
-/** Seconds the wheel animates after a settle lands. */
-const RL_SPIN_SECS = 4.0;
-const RL_GREEN = '#1B6B3A';
-const RL_RED = '#C43C3C';
-const RL_BLACK = '#23252E';
-
-/** Betting-board hit region (CSS px inside the board canvas). */
-interface BoardRegion {
-  x: number; y: number; w: number; h: number;
-  label: string;
-  fill: string | null;
-  bet: { type: RouletteBet['type']; pick?: number };
-}
-
-const RL_BOARD_W = 344;
-const RL_BOARD_H = 440;
-
-/** Single source for drawing AND hit-testing the classic layout. */
-function rouletteBoardRegions(): BoardRegion[] {
-  const regions: BoardRegion[] = [];
-  const GX = 116, GY = 40, CW = 72, CH = 30; // number grid
-  regions.push({ x: GX, y: 4, w: CW * 3, h: 32, label: '0', fill: RL_GREEN, bet: { type: 'straight', pick: 0 } });
-  for (let n = 1; n <= 36; n++) {
-    const r = Math.floor((n - 1) / 3), c = (n - 1) % 3;
-    regions.push({
-      x: GX + c * CW, y: GY + r * CH, w: CW, h: CH,
-      label: String(n),
-      fill: pocketColor(n) === 'red' ? RL_RED : RL_BLACK,
-      bet: { type: 'straight', pick: n },
-    });
-  }
-  // Dozens beside the grid.
-  for (let d = 0; d < 3; d++) {
-    regions.push({
-      x: 60, y: GY + d * CH * 4, w: 52, h: CH * 4,
-      label: ['1st', '2nd', '3rd'][d] + ' 12', fill: null, bet: { type: 'dozen', pick: d },
-    });
-  }
-  // Even-money outermost.
-  const even: Array<[string, RouletteBet['type']]> = [
-    ['1–18', 'low'], ['EVEN', 'even'], ['RED', 'red'],
-    ['BLACK', 'black'], ['ODD', 'odd'], ['19–36', 'high'],
-  ];
-  even.forEach(([label, type], i) => {
-    regions.push({
-      x: 4, y: GY + i * CH * 2, w: 52, h: CH * 2,
-      label, fill: type === 'red' ? RL_RED : type === 'black' ? RL_BLACK : null,
-      bet: { type },
-    });
-  });
-  // Column bets under the grid.
-  for (let c = 0; c < 3; c++) {
-    regions.push({
-      x: GX + c * CW, y: GY + 12 * CH + 4, w: CW, h: 30,
-      label: '2:1', fill: null, bet: { type: 'column', pick: c },
-    });
-  }
-  return regions;
-}
-
-/**
- * The roulette table's focused UI (#69 G2): a live wheel, the classic betting
- * board (straight numbers + dozens/columns + even-money), chip denominations,
- * and the croupier controls. House-banked: stakes leave your chips when they
- * hit the felt; the croupier (owner-equivalent client — a venture-owned house
- * pays every shareholder's croupier duty the same way) spins, and the settle
- * write carries result + payouts for every client to converge on. Fairness is
- * dev-phase trust (the croupier's client rolls) — commit-reveal is the G5
- * upgrade, and the panel says so honestly.
- */
-export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
-  let panel: HTMLDivElement | null = null;
-  let wheelCanvas: HTMLCanvasElement | null = null;
-  let boardCanvas: HTMLCanvasElement | null = null;
-  let unsubscribe: (() => void) | null = null;
-  let denom = 5;
-  /** Round whose spin animation was already started (never replay history). */
-  let animRound = 0;
-  /** Animation progress 0..1, or null when idle. */
-  let animT: number | null = null;
-  /** One-shot notice line (e.g. "not enough chips"), cleared on next render. */
-  let flash = '';
-  const myId = getPlayerId();
-  const regions = rouletteBoardRegions();
-
-  const state = (): RouletteTableState | null => readTableState(deps.itemId);
-  const round = (): number => state()?.round ?? 1;
-  const phase = (): 'betting' | 'closing' | 'settled' => state()?.phase ?? 'betting';
-  const myBets = (): RouletteBet[] => readMyBets(deps.itemId, myId, round());
-  /** Betting is CLOSED once the phase leaves 'betting' OR the auto-croupier's
-   *  window deadline has passed (a chip must not land after "no more bets"). */
-  const bettingOpen = (): boolean => {
-    const s = state();
-    if ((s?.phase ?? 'betting') !== 'betting') return false;
-    return s?.phaseDeadline == null || Date.now() < s.phaseDeadline;
-  };
-
-  // ── Bet placement (stakes move at placement time — see module doc) ─────────
-
-  const placeBet = (bet: { type: RouletteBet['type']; pick?: number }): void => {
-    if (!bettingOpen() || animT !== null) return;
-    if (!spendChips(myId, denom)) {
-      flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
-      render();
-      return;
-    }
-    writeMyBets(deps.itemId, myId, round(), [...myBets(), { ...bet, amount: denom }]);
-  };
-
-  const undoBet = (): void => {
-    if (!bettingOpen()) return; // symmetric with placeBet — no take-back past the deadline
-    const bets = myBets();
-    const last = bets[bets.length - 1];
-    if (!last) return;
-    creditChips(myId, last.amount);
-    writeMyBets(deps.itemId, myId, round(), bets.slice(0, -1));
-  };
-
-  const clearBets = (): void => {
-    if (!bettingOpen()) return;
-    const total = myBets().reduce((sum, b) => sum + b.amount, 0);
-    if (total > 0) creditChips(myId, total);
-    writeMyBets(deps.itemId, myId, round(), []);
-  };
-
-  // ── Croupier: the settle write is the round's single source of truth ───────
-  // Manual house controls (venture / legacy rooms with no live robot croupier).
-  // They delegate to the SAME settle/open implementation the auto-croupier runs,
-  // with no phaseDeadline — the house clicks NEW ROUND rather than a timer.
-
-  const spin = (): void => {
-    // Manual settle from betting OR a stranded 'closing' (rescues a table the
-    // auto-croupier left mid-spin when its operator dropped off — the button is
-    // only shown once the heartbeat goes stale, so there is no double-settle).
-    if (!deps.isHouse() || (phase() !== 'betting' && phase() !== 'closing')) return;
-    rollAndSettle(deps.itemId, round());
-  };
-
-  const newRound = (): void => {
-    if (!deps.isHouse() || phase() !== 'settled') return;
-    openBetting(deps.itemId, round() + 1);
-  };
-
-  // ── Wheel drawing ──────────────────────────────────────────────────────────
-
-  const WHEEL_CSS = 200, WHEEL_RES = 400;
-
-  const drawWheel = (rotation: number): void => {
-    if (!wheelCanvas) return;
-    const ctx = wheelCanvas.getContext('2d');
-    if (!ctx) return;
-    const S = WHEEL_RES, C = S / 2, R = S / 2 - 14;
-    ctx.clearRect(0, 0, S, S);
-    const seg = (Math.PI * 2) / WHEEL_ORDER.length;
-    for (let i = 0; i < WHEEL_ORDER.length; i++) {
-      // Pocket i is CENTERED at rotation + i·seg, measured from the top.
-      const a0 = -Math.PI / 2 + rotation + i * seg - seg / 2;
-      const col = pocketColor(WHEEL_ORDER[i]);
-      ctx.beginPath();
-      ctx.moveTo(C, C);
-      ctx.arc(C, C, R, a0, a0 + seg);
-      ctx.closePath();
-      ctx.fillStyle = col === 'green' ? RL_GREEN : col === 'red' ? RL_RED : RL_BLACK;
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(212,168,75,0.5)';
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      // Number label near the rim, upright along the pocket's spoke.
-      const mid = a0 + seg / 2;
-      ctx.save();
-      ctx.translate(C + Math.cos(mid) * (R - 22), C + Math.sin(mid) * (R - 22));
-      ctx.rotate(mid + Math.PI / 2);
-      ctx.fillStyle = '#F5EFDF';
-      ctx.font = 'bold 15px monospace';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(String(WHEEL_ORDER[i]), 0, 0);
-      ctx.restore();
-    }
-    // Hub + rim + top pointer.
-    ctx.beginPath(); ctx.arc(C, C, 52, 0, Math.PI * 2);
-    ctx.fillStyle = '#4A2F1B'; ctx.fill();
-    ctx.lineWidth = 4; ctx.strokeStyle = '#D4A84B'; ctx.stroke();
-    ctx.beginPath(); ctx.arc(C, C, R + 6, 0, Math.PI * 2);
-    ctx.lineWidth = 6; ctx.strokeStyle = '#D4A84B'; ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(C - 12, 2); ctx.lineTo(C + 12, 2); ctx.lineTo(C, 26);
-    ctx.closePath();
-    ctx.fillStyle = '#F0C060'; ctx.fill();
-  };
-
-  /** Wheel rotation that parks `result`'s pocket under the top pointer. */
-  const restingRotation = (result: number): number => {
-    const idx = Math.max(0, WHEEL_ORDER.indexOf(result));
-    return -idx * ((Math.PI * 2) / WHEEL_ORDER.length);
-  };
-
-  const drawWheelForNow = (): void => {
-    const s = state();
-    if (animT !== null && s?.result !== null && s !== null) {
-      const ease = 1 - Math.pow(1 - animT, 3); // cubic ease-out
-      drawWheel(ease * (Math.PI * 2 * 5 + restingRotation(s.result!)));
-    } else {
-      drawWheel(s?.phase === 'settled' && s.result !== null ? restingRotation(s.result) : 0);
-    }
-  };
-
-  // ── Board drawing + clicks ─────────────────────────────────────────────────
-
-  const drawBoard = (): void => {
-    if (!boardCanvas) return;
-    const ctx = boardCanvas.getContext('2d');
-    if (!ctx) return;
-    ctx.setTransform(2, 0, 0, 2, 0, 0); // backing 2x, draw in CSS units
-    ctx.clearRect(0, 0, RL_BOARD_W, RL_BOARD_H);
-    ctx.fillStyle = '#14532D';
-    ctx.fillRect(0, 0, RL_BOARD_W, RL_BOARD_H);
-    // 🪙 Physical chips as placed: every bet record is ONE chip of its
-    // denomination — the felt shows the actual chips (mine bright, other
-    // players' dimmed), never a numeric total. Count them.
-    const keyOf = (b: { type: string; pick?: number }) => `${b.type}:${b.pick ?? ''}`;
-    const mineChips = new Map<string, number[]>();
-    for (const b of myBets()) {
-      const k = keyOf(b);
-      mineChips.set(k, [...(mineChips.get(k) ?? []), b.amount]);
-    }
-    const otherChips = new Map<string, number[]>();
-    for (const [pid, list] of Object.entries(readAllBets(deps.itemId, round()))) {
-      if (pid === myId) continue;
-      for (const b of list) {
-        const k = keyOf(b);
-        otherChips.set(k, [...(otherChips.get(k) ?? []), b.amount]);
-      }
-    }
-    const winning = state()?.phase === 'settled' && animT === null ? state()!.result : null;
-    for (const rg of regions) {
-      ctx.fillStyle = rg.fill ?? '#1B6B3A';
-      ctx.fillRect(rg.x, rg.y, rg.w, rg.h);
-      // Winning straight cell flares gold once the wheel has landed.
-      if (winning !== null && rg.bet.type === 'straight' && rg.bet.pick === winning) {
-        ctx.lineWidth = 4;
-        ctx.strokeStyle = '#F0C060';
-        ctx.strokeRect(rg.x + 2, rg.y + 2, rg.w - 4, rg.h - 4);
-      } else {
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(240, 224, 180, 0.75)';
-        ctx.strokeRect(rg.x, rg.y, rg.w, rg.h);
-      }
-      ctx.fillStyle = '#F5EFDF';
-      ctx.font = `bold ${rg.bet.type === 'straight' && rg.bet.pick !== 0 ? 13 : 11}px monospace`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(rg.label, rg.x + rg.w / 2, rg.y + rg.h / 2);
-      // The region's physical chips: others left (dim), mine right (bright).
-      const theirs = otherChips.get(keyOf(rg.bet));
-      if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
-      const placed = mineChips.get(keyOf(rg.bet));
-      if (placed) {
-        const cols = Math.ceil(placed.length / 8);
-        drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
-      }
-    }
-  };
-
-  const onBoardClick = (e: MouseEvent): void => {
-    if (!boardCanvas) return;
-    const rect = boardCanvas.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * RL_BOARD_W;
-    const y = ((e.clientY - rect.top) / rect.height) * RL_BOARD_H;
-    const hit = regions.find((rg) => x >= rg.x && x < rg.x + rg.w && y >= rg.y && y < rg.y + rg.h);
-    if (hit) placeBet(hit.bet);
-  };
-
-  // ── Panel ──────────────────────────────────────────────────────────────────
-
-  /** The status line + colour for the current instant. Recomputed each frame by
-   *  update(dt) so the auto-croupier's betting countdown ticks live (the doc
-   *  only changes at phase edges). */
-  const computeStatus = (): { line: string; color: string } => {
-    const s = state();
-    const p = phase();
-    const staked = myBets().reduce((sum, b) => sum + b.amount, 0);
-    // 'No more bets' the instant betting is closed — either the synced 'closing'
-    // phase OR the local deadline already passed (before the operator's write).
-    if (animT !== null || p === 'closing'
-        || (p === 'betting' && s?.phaseDeadline != null && Date.now() >= s.phaseDeadline)) {
-      return { line: 'NO MORE BETS — THE WHEEL SPINS…', color: CH_PINK };
-    }
-    if (p === 'settled' && s?.result != null) {
-      // 🪙 Physical-chips rule: the win shows as CHIPS (the YOUR WIN tray),
-      // never as a number — the pocket label is the wheel's, not money.
-      const won = s.payouts?.[myId] ?? 0;
-      const col = pocketColor(s.result).toUpperCase();
-      const line = `● ${s.result} ${col}` + (staked > 0 || won > 0
-        ? (won > 0 ? ' — YOU WIN' : ' — NO WIN THIS TIME')
-        : '');
-      return { line, color: won > 0 ? '#00E676' : GT_GOLD_BRIGHT };
-    }
-    const chips = readChips(myId);
-    const remain = s?.phaseDeadline != null
-      ? Math.max(0, Math.ceil((s.phaseDeadline - Date.now()) / 1000))
-      : null;
-    const line = `ROUND ${round()} — PLACE YOUR BETS`
-      + (remain != null ? ` · ${remain}s` : '')
-      + (chips <= 0 && staked === 0 ? ' · VISIT THE CASHIER FOR CHIPS' : '');
-    return { line, color: GT_GOLD_BRIGHT };
-  };
-
-  /** Cheap per-frame refresh of just the status text (no full re-render). */
-  const syncStatusEl = (): void => {
-    const el = panel?.querySelector<HTMLDivElement>('#rl-status');
-    if (!el) return;
-    const { line, color } = computeStatus();
-    el.textContent = line;
-    el.style.color = color;
-  };
-
-  const render = (): void => {
-    if (!panel) return;
-    const s = state();
-    const p = phase();
-    const chips = readChips(myId);
-    const bets = myBets();
-    const house = deps.isHouse();
-    const spinning = animT !== null;
-    // 🤖 #77B: a live robot croupier drives the timer + hides the manual house
-    // controls; without one (venture / legacy rooms), the house buttons stand.
-    const autoRun = isCroupierLive(deps.itemId);
-    const { line: statusLine, color: statusColor } = computeStatus();
-
-    const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
-      <button id="${id}" ${disabled ? 'disabled' : ''} title="${title}" style="
-        padding: 6px 10px;
-        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
-        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
-        border-radius: 6px; color: ${disabled ? GT_DIM : GT_GOLD_BRIGHT};
-        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1.5px;
-        cursor: ${disabled ? 'not-allowed' : 'pointer'}; opacity: ${disabled ? '0.5' : '1'};
-      ">${label}</button>`;
-
-    const denomBtn = (n: number): string => `
-      <button data-denom="${n}" style="
-        width: 44px; height: 30px; border-radius: 15px;
-        background: ${denom === n ? 'rgba(240,192,96,0.28)' : 'rgba(212,168,75,0.07)'};
-        border: 2px solid ${denom === n ? '#F0C060' : 'rgba(212,168,75,0.35)'};
-        color: ${denom === n ? '#F0C060' : CH_GOLD};
-        font-family: inherit; font-size: 10px; font-weight: 800; cursor: pointer;
-      ">${n}</button>`;
-
-
-    panel.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
-        <span style="font-size:12px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1px;">🎡 ROULETTE</span>
-        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
-      </div>
-      <div id="rl-status" style="font-size:11px; font-weight:800; letter-spacing:1px; color:${statusColor};">${statusLine}</div>
-      ${flash ? `<div style="font-size:10px; font-weight:800; color:#FF8A80; letter-spacing:1px;">${flash}</div>` : ''}
-      <div style="display:flex; gap:14px; align-items:center;">
-        <canvas id="rl-wheel" width="${WHEEL_RES}" height="${WHEEL_RES}"
-          style="width:${WHEEL_CSS}px; height:${WHEEL_CSS}px; flex:none;"></canvas>
-        <div style="display:flex; flex-direction:column; gap:6px; min-width:0; flex:1;">
-          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">YOUR CHIPS — COUNT THEM</div>
-          <canvas id="rl-rack" width="380" height="132" style="width:190px; height:66px;"></canvas>
-          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">ON THE FELT</div>
-          <canvas id="rl-felt-rack" width="380" height="88" style="width:190px; height:44px;"></canvas>
-          ${p === 'settled' && !spinning && (s?.payouts?.[myId] ?? 0) > 0 ? `
-          <div style="font-size:10px; color:#00E676; letter-spacing:1.5px;">YOUR WIN</div>
-          <canvas id="rl-won" width="380" height="88" style="width:190px; height:44px;"></canvas>` : ''}
-        </div>
-      </div>
-      <div style="display:flex; align-items:center; gap:8px;">
-        <span style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">CHIP:</span>
-        ${[1, 5, 25, 100].map(denomBtn).join('')}
-        <span style="flex:1;"></span>
-        ${btn('rl-undo', 'UNDO', !bettingOpen() || spinning || bets.length === 0, 'Take back the last chip')}
-        ${btn('rl-clear', 'CLEAR', !bettingOpen() || spinning || bets.length === 0, 'Take back all your chips')}
-      </div>
-      <canvas id="rl-board" width="${RL_BOARD_W * 2}" height="${RL_BOARD_H * 2}"
-        style="width:${RL_BOARD_W}px; height:${RL_BOARD_H}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${bettingOpen() && !spinning ? 'pointer' : 'default'};"></canvas>
-      <div style="display:flex; gap:8px; justify-content:flex-end; align-items:center;">
-        ${autoRun
-          ? `<span style="font-size:9.5px; color:${CH_GOLD};">🤖 THE ROBO-CROUPIER RUNS THIS TABLE</span>`
-          : house
-          ? (p === 'settled'
-            ? btn('rl-new-round', 'NEW ROUND', spinning, 'Open the felt for the next round')
-            : btn('rl-spin', '🎡 SPIN', spinning, 'Close betting and spin the wheel'))
-          : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !spinning ? 'WAITING FOR THE CROUPIER TO OPEN THE NEXT ROUND' : 'THE HOUSE SPINS WHEN BETS ARE DOWN'}</span>`}
-      </div>
-      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
-        SINGLE-ZERO WHEEL · straight pays 35:1 · dozens &amp; columns 2:1 · red/black odd/even 1–18/19–36 1:1
-        · house-banked, the croupier's spin settles the round · fair-spin upgrade coming
-        · chips are physical at the table — count them; the CASHIER's screen shows the number
-      </div>
-    `;
-    panel.querySelectorAll<HTMLButtonElement>('[data-denom]').forEach((b) => {
-      b.addEventListener('click', () => { denom = Number(b.dataset.denom); render(); });
-    });
-    panel.querySelector<HTMLButtonElement>('#rl-undo')?.addEventListener('click', () => undoBet());
-    panel.querySelector<HTMLButtonElement>('#rl-clear')?.addEventListener('click', () => clearBets());
-    panel.querySelector<HTMLButtonElement>('#rl-spin')?.addEventListener('click', () => { spin(); });
-    panel.querySelector<HTMLButtonElement>('#rl-new-round')?.addEventListener('click', () => newRound());
-    wheelCanvas = panel.querySelector<HTMLCanvasElement>('#rl-wheel');
-    boardCanvas = panel.querySelector<HTMLCanvasElement>('#rl-board');
-    boardCanvas?.addEventListener('click', onBoardClick);
-    flash = '';
-    drawWheelForNow();
-    drawBoard();
-    // 🪙 The physical trays (2x backing): rack = full balance decomposed;
-    // felt tray = the exact chips placed this round; win tray = the payout.
-    const paintTray = (id: string, tray: number[], cssW: number, cssH: number, emptyText?: string) => {
-      const cv = panel!.querySelector<HTMLCanvasElement>(`#${id}`);
-      const c2 = cv?.getContext('2d');
-      if (!cv || !c2) return;
-      c2.setTransform(2, 0, 0, 2, 0, 0);
-      c2.clearRect(0, 0, cssW, cssH);
-      drawChips(c2, tray, 0, 0, cssW, cssH, { emptyText });
-    };
-    paintTray('rl-rack', chipsFor(chips), 190, 66, 'NO CHIPS — VISIT THE CASHIER');
-    paintTray('rl-felt-rack', bets.map((b) => b.amount), 190, 44, 'NOTHING STAKED');
-    if (p === 'settled' && !spinning) {
-      paintTray('rl-won', chipsFor(s?.payouts?.[myId] ?? 0), 190, 44);
-    }
-  };
-
-  return {
-    mount(host: HTMLElement): void {
-      panel = document.createElement('div');
-      panel.id = 'device-roulette-pane';
-      panel.style.cssText = `
-        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
-        width: 430px; max-height: 94vh; overflow-y: auto;
-        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
-        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
-        padding: 18px; display: flex; flex-direction: column; gap: 12px;
-        color: ${GT_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-        box-sizing: border-box; pointer-events: auto;
-      `;
-      panel.addEventListener('click', (e) => e.stopPropagation());
-      host.appendChild(panel);
-      // Never replay a spin that landed before we walked up.
-      const s = state();
-      animRound = s?.phase === 'settled' ? s.round : 0;
-      animT = null;
-      unsubscribe = subscribeCasino(() => {
-        // A fresh settle write starts the wheel; everything else just repaints.
-        const cur = state();
-        if (cur?.phase === 'settled' && cur.round > animRound) {
-          animRound = cur.round;
-          animT = 0;
-        }
-        render();
-      });
-      render();
-    },
-    unmount(): void {
-      unsubscribe?.();
-      unsubscribe = null;
-      panel?.remove();
-      panel = null;
-      wheelCanvas = null;
-      boardCanvas = null;
-    },
-    update(dt: number): void {
-      // 🤖 #77B: tick the auto-croupier's betting/closing countdown live — the
-      // doc only changes at phase edges, so the seconds are refreshed here.
-      const s = state();
-      if (animT === null && s?.phaseDeadline != null && s.phase !== 'settled') {
-        syncStatusEl();
-      }
-      if (animT === null) return;
-      animT = Math.min(1, animT + Math.max(0, dt) / RL_SPIN_SECS);
-      if (animT >= 1) {
-        animT = null;
-        render(); // reveal the result banner + winning cell + settled balances
-      } else {
-        drawWheelForNow();
-      }
-    },
-  };
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
 // 🎰 Slot machine (#109)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -6268,7 +5675,7 @@ export function createSlotMachineUI(
     if (fingerprint === renderedPaytable && house === renderedPaytableForHouse) return;
     renderedPaytable = fingerprint;
     renderedPaytableForHouse = house;
-    rows.replaceChildren(...paytable.slice(0, 10).map((entry, index) => {
+    rows.replaceChildren(...paytable.map((entry, index) => {
       const row = document.createElement('div');
       row.style.cssText =
         'display:flex;align-items:center;justify-content:space-between;gap:4px;min-height:20px;';
@@ -6369,6 +5776,9 @@ export function createSlotMachineUI(
       `THEORETICAL RTP ${paytableRtp.toFixed(2)}%`;
     panel.querySelector<HTMLElement>('#sl-service-status')!.textContent = flash;
     const house = deps.isHouse();
+    panel.querySelector<HTMLElement>('#sl-role')!.textContent = house
+      ? 'YOU RUN THIS MACHINE'
+      : 'THE OWNER SETS THIS MACHINE · ANYONE CAN LOOK';
     renderPaytable(paytable, house);
     const owner = panel.querySelector<HTMLElement>('#sl-owner');
     if (owner) owner.style.display = house ? 'flex' : 'none';
@@ -6451,7 +5861,9 @@ export function createSlotMachineUI(
         pointer-events:auto; box-shadow:0 12px 64px rgba(0,0,0,0.9);
       `;
       panel.innerHTML = `
-        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🎰 SLOT MACHINE SERVICE</div>
+        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">⚙️ SLOT MACHINE</div>
+        <div id="sl-role" style="font-size:9px;color:${GT_DIM};letter-spacing:1px;"></div>
+        <div style="font-size:9px;color:#7CF5B0;">🔒 FAIR · YOUR SEED AND THE HOUSE SEED DECIDE EVERY SPIN</div>
         <div id="sl-service-status" style="min-height:14px;text-align:center;font-size:9px;font-weight:800;color:${GT_GOLD_BRIGHT};"></div>
         <div id="sl-rtp" style="font-size:9px;color:${GT_DIM};"></div>
         <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:9px;color:#E8ECF2;"></div>
@@ -6517,596 +5929,6 @@ export function createSlotMachineUI(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 🎲 Craps table (#69 G3)
-// ══════════════════════════════════════════════════════════════════════════════
-
-export interface CrapsUIDeps {
-  /** Furniture item id — keys the table + bet records in the casino map. */
-  itemId: string;
-  /** Owner-equivalent predicate: the stickman side (house/venture). */
-  isHouse: () => boolean;
-}
-
-/** Seconds the dice tumble after a settle lands. */
-const CR_ROLL_SECS = 1.6;
-const CR_BOARD_W = 360;
-const CR_BOARD_H = 186;
-const CR_GREEN = '#1B6B3A';
-const CR_RED = '#7A1E1E';
-
-interface CrapsRegion {
-  x: number; y: number; w: number; h: number;
-  label: string;
-  fill: string | null;
-  bet: { type: CrapsBet['type']; pick?: number };
-}
-
-/** Single source for drawing AND hit-testing the craps felt (CSS px). */
-function crapsBoardRegions(): CrapsRegion[] {
-  const r: CrapsRegion[] = [];
-  r.push({ x: 6, y: 6, w: 232, h: 34, label: 'PASS LINE · 1:1', fill: null, bet: { type: 'pass' } });
-  r.push({ x: 242, y: 6, w: 112, h: 34, label: "DON'T PASS", fill: CR_RED, bet: { type: 'dontpass' } });
-  r.push({ x: 6, y: 44, w: 348, h: 44, label: 'FIELD · 2 3 4 9 10 11 12 · 2 & 12 DOUBLE', fill: null, bet: { type: 'field' } });
-  [4, 5, 6, 8, 9, 10].forEach((n, i) => {
-    r.push({
-      x: 6 + i * 58, y: 92, w: 54, h: 46,
-      label: String(n),
-      fill: CR_GREEN,
-      bet: { type: 'place', pick: n },
-    });
-  });
-  r.push({ x: 6, y: 144, w: 170, h: 34, label: 'ANY 7 · 4:1', fill: null, bet: { type: 'anyseven' } });
-  r.push({ x: 184, y: 144, w: 170, h: 34, label: 'ANY CRAPS · 7:1', fill: null, bet: { type: 'anycraps' } });
-  return r;
-}
-
-/** Pip offsets (unit square −1..1) for a die face 1–6. */
-const DIE_PIPS: Record<number, Array<[number, number]>> = {
-  1: [[0, 0]],
-  2: [[-0.5, -0.5], [0.5, 0.5]],
-  3: [[-0.5, -0.5], [0, 0], [0.5, 0.5]],
-  4: [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]],
-  5: [[-0.5, -0.5], [0.5, -0.5], [0, 0], [-0.5, 0.5], [0.5, 0.5]],
-  6: [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0], [0.5, 0], [-0.5, 0.5], [0.5, 0.5]],
-};
-
-/** Draw one white die with black pips, centred at (cx,cy), side `s`. */
-function drawDie(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number, value: number, tilt = 0): void {
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(tilt);
-  const r = s * 0.18;
-  ctx.fillStyle = '#F4EFE2';
-  ctx.strokeStyle = '#C9BE9E';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(-s / 2 + r, -s / 2);
-  ctx.arcTo(s / 2, -s / 2, s / 2, s / 2, r);
-  ctx.arcTo(s / 2, s / 2, -s / 2, s / 2, r);
-  ctx.arcTo(-s / 2, s / 2, -s / 2, -s / 2, r);
-  ctx.arcTo(-s / 2, -s / 2, s / 2, -s / 2, r);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-  ctx.fillStyle = '#23252E';
-  const pipR = s * 0.09;
-  for (const [px, py] of DIE_PIPS[value] ?? []) {
-    ctx.beginPath();
-    ctx.arc(px * s * 0.56, py * s * 0.56, pipR, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.restore();
-}
-
-/**
- * The craps table's focused UI (#69 G3): the two dice, the classic felt (pass /
- * don't pass / field / place 4-5-6-8-9-10 / any 7 / any craps), the ON/OFF point
- * puck, chip denominations, and the stickman controls. House-banked, exactly
- * like roulette: stakes leave your chips when they hit the felt; the stickman
- * (owner-equivalent client, or their robot) throws, and the settle write carries
- * the dice + payouts + the pruned felt for every client to converge on. Craps
- * carries state across rolls — a pass line rides its point, a place bet stays
- * working — so a bet you placed on a PRIOR window is locked (only what you put
- * down THIS window is yours to take back). Fairness is dev-phase trust; the
- * commit-reveal upgrade is G5 and the panel says so.
- */
-export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
-  let panel: HTMLDivElement | null = null;
-  let diceCanvas: HTMLCanvasElement | null = null;
-  let boardCanvas: HTMLCanvasElement | null = null;
-  let unsubscribe: (() => void) | null = null;
-  let denom = 5;
-  /** Round whose dice tumble was already started (never replay history). */
-  let animRound = 0;
-  /** Animation progress 0..1, or null when idle. */
-  let animT: number | null = null;
-  /** One-shot notice line, cleared on next render. */
-  let flash = '';
-  /** Bets I placed in the CURRENT betting window — the only ones UNDO/CLEAR may
-   *  take back (standing pass/place bets from prior rolls are contract-locked). */
-  let addedThisWindow: CrapsBet[] = [];
-  let windowRound = 0;
-  /** round → transcript verdict, so re-renders stamp the badge from cache
-   *  instead of re-hashing the whole transcript every time (#87 review). */
-  const verifiedVerdicts = new Map<number, boolean>();
-  const myId = getPlayerId();
-  const regions = crapsBoardRegions();
-
-  const state = (): CrapsTableState | null => readCrapsTableState(deps.itemId);
-  const phase = (): 'betting' | 'closing' | 'settled' => state()?.phase ?? 'betting';
-  const point = (): number | null => state()?.point ?? null;
-  const round = (): number => state()?.round ?? 1;
-  const myBets = (): CrapsBet[] => readMyCrapsBets(deps.itemId, myId);
-  const bettingOpen = (): boolean => {
-    const s = state();
-    if ((s?.phase ?? 'betting') !== 'betting') return false;
-    return s?.phaseDeadline == null || Date.now() < s.phaseDeadline;
-  };
-
-  /** Reset the "mine this window" tracker whenever the betting window turns over
-   *  (a new round after a settle) so contract bets from the last roll lock. */
-  const syncWindow = (): void => {
-    const r = round();
-    if (r !== windowRound) {
-      windowRound = r;
-      addedThisWindow = [];
-    }
-  };
-
-  // ── Bet placement (stakes move at placement time — see module doc) ─────────
-
-  const placeBet = (bet: { type: CrapsBet['type']; pick?: number }): void => {
-    if (!bettingOpen() || animT !== null) return;
-    if (!canPlaceBet(bet.type, point())) {
-      flash = 'THE LINE IS CLOSED — A POINT IS ON';
-      render();
-      return;
-    }
-    if (!spendChips(myId, denom)) {
-      flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
-      render();
-      return;
-    }
-    const full: CrapsBet = { ...bet, amount: denom };
-    writeMyCrapsBets(deps.itemId, myId, [...myBets(), full]);
-    addedThisWindow.push(full);
-  };
-
-  const undoBet = (): void => {
-    if (!bettingOpen() || addedThisWindow.length === 0) return;
-    const bets = myBets();
-    const last = bets[bets.length - 1];
-    if (!last) return;
-    creditChips(myId, last.amount);
-    writeMyCrapsBets(deps.itemId, myId, bets.slice(0, -1));
-    addedThisWindow.pop();
-  };
-
-  const clearBets = (): void => {
-    if (!bettingOpen() || addedThisWindow.length === 0) return;
-    const n = addedThisWindow.length;
-    const refund = addedThisWindow.reduce((sum, b) => sum + b.amount, 0);
-    if (refund > 0) creditChips(myId, refund);
-    const bets = myBets();
-    writeMyCrapsBets(deps.itemId, myId, bets.slice(0, Math.max(0, bets.length - n)));
-    addedThisWindow = [];
-  };
-
-  // ── Stickman: the settle write is the roll's single source of truth ────────
-  // Manual house controls (venture / legacy rooms with no live robot stickman)
-  // delegate to the SAME settle/open the auto-stickman runs, with no deadline.
-
-  const roll = (): void => {
-    if (!deps.isHouse() || (phase() !== 'betting' && phase() !== 'closing')) return;
-    rollAndSettleCraps(deps.itemId, round(), point());
-  };
-
-  const nextRoll = (): void => {
-    if (!deps.isHouse() || phase() !== 'settled') return;
-    openCrapsBetting(deps.itemId, round() + 1, point());
-  };
-
-  // ── Dice + puck drawing ────────────────────────────────────────────────────
-
-  const DICE_W = 168, DICE_H = 84;
-
-  const drawDiceForNow = (): void => {
-    if (!diceCanvas) return;
-    const ctx = diceCanvas.getContext('2d');
-    if (!ctx) return;
-    ctx.setTransform(2, 0, 0, 2, 0, 0); // 2x backing, draw in CSS units
-    ctx.clearRect(0, 0, DICE_W, DICE_H);
-    const s = state();
-    const tumbling = animT !== null;
-    let d1 = 1, d2 = 1;
-    if (tumbling) {
-      d1 = 1 + Math.floor(Math.random() * 6);
-      d2 = 1 + Math.floor(Math.random() * 6);
-    } else if (s?.phase === 'settled' && s.dice) {
-      [d1, d2] = s.dice;
-    } else {
-      // Idle / come-out with no roll yet — show a neutral pair of aces.
-      d1 = d2 = 1;
-    }
-    const tilt = tumbling ? (Math.random() - 0.5) * 0.6 : 0;
-    drawDie(ctx, 38, 42, 52, d1, tilt);
-    drawDie(ctx, 100, 42, 52, d2, tumbling ? (Math.random() - 0.5) * 0.6 : 0);
-    // ON/OFF point puck at the right.
-    const pt = s?.point ?? null;
-    const px = 148, py = 42, pr = 17;
-    ctx.beginPath();
-    ctx.arc(px, py, pr, 0, Math.PI * 2);
-    ctx.fillStyle = pt != null ? '#F4EFE2' : '#12161F';
-    ctx.fill();
-    ctx.lineWidth = 2.5;
-    ctx.strokeStyle = pt != null ? '#00E676' : '#4A5560';
-    ctx.stroke();
-    ctx.fillStyle = pt != null ? '#12321E' : '#8894A2';
-    ctx.font = 'bold 9px monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(pt != null ? 'ON' : 'OFF', px, pt != null ? py - 4 : py);
-    if (pt != null) {
-      ctx.font = 'bold 13px monospace';
-      ctx.fillText(String(pt), px, py + 6);
-    }
-  };
-
-  // ── Board drawing + clicks ─────────────────────────────────────────────────
-
-  const drawBoard = (): void => {
-    if (!boardCanvas) return;
-    const ctx = boardCanvas.getContext('2d');
-    if (!ctx) return;
-    ctx.setTransform(2, 0, 0, 2, 0, 0);
-    ctx.clearRect(0, 0, CR_BOARD_W, CR_BOARD_H);
-    ctx.fillStyle = '#14532D';
-    ctx.fillRect(0, 0, CR_BOARD_W, CR_BOARD_H);
-    const keyOf = (b: { type: string; pick?: number }) => `${b.type}:${b.pick ?? ''}`;
-    const mineChips = new Map<string, number[]>();
-    for (const b of myBets()) {
-      const k = keyOf(b);
-      mineChips.set(k, [...(mineChips.get(k) ?? []), b.amount]);
-    }
-    const otherChips = new Map<string, number[]>();
-    for (const [pid, list] of Object.entries(readAllCrapsBets(deps.itemId))) {
-      if (pid === myId) continue;
-      for (const b of list) {
-        const k = keyOf(b);
-        otherChips.set(k, [...(otherChips.get(k) ?? []), b.amount]);
-      }
-    }
-    // The rolled number flares once the dice have landed (informative even to a
-    // spectator): the matching place box + the field when it hit.
-    const settled = state()?.phase === 'settled' && animT === null;
-    const rolled = settled ? state()!.result : null;
-    const fieldSet = new Set([2, 3, 4, 9, 10, 11, 12]);
-    for (const rg of regions) {
-      ctx.fillStyle = rg.fill ?? '#1B6B3A';
-      ctx.fillRect(rg.x, rg.y, rg.w, rg.h);
-      const flare = rolled != null && (
-        (rg.bet.type === 'place' && rg.bet.pick === rolled) ||
-        (rg.bet.type === 'field' && fieldSet.has(rolled)) ||
-        (rg.bet.type === 'anyseven' && rolled === 7) ||
-        (rg.bet.type === 'anycraps' && (rolled === 2 || rolled === 3 || rolled === 12))
-      );
-      if (flare) {
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = '#F0C060';
-        ctx.strokeRect(rg.x + 1.5, rg.y + 1.5, rg.w - 3, rg.h - 3);
-      } else {
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(240, 224, 180, 0.75)';
-        ctx.strokeRect(rg.x, rg.y, rg.w, rg.h);
-      }
-      ctx.fillStyle = '#F5EFDF';
-      ctx.font = `bold ${rg.bet.type === 'place' ? 17 : 10}px monospace`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      const cy = rg.bet.type === 'place' ? rg.y + 16 : rg.y + rg.h / 2;
-      ctx.fillText(rg.label, rg.x + rg.w / 2, cy);
-      if (rg.bet.type === 'place') {
-        ctx.font = '7px monospace';
-        ctx.fillStyle = 'rgba(240,224,180,0.7)';
-        ctx.fillText(
-          rg.bet.pick === 6 || rg.bet.pick === 8 ? '7:6' : rg.bet.pick === 5 || rg.bet.pick === 9 ? '7:5' : '9:5',
-          rg.x + rg.w / 2, rg.y + 32,
-        );
-      }
-      const theirs = otherChips.get(keyOf(rg.bet));
-      if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
-      const placed = mineChips.get(keyOf(rg.bet));
-      if (placed) {
-        const cols = Math.ceil(placed.length / 8);
-        drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
-      }
-    }
-  };
-
-  const onBoardClick = (e: MouseEvent): void => {
-    if (!boardCanvas) return;
-    const rect = boardCanvas.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * CR_BOARD_W;
-    const y = ((e.clientY - rect.top) / rect.height) * CR_BOARD_H;
-    const hit = regions.find((rg) => x >= rg.x && x < rg.x + rg.w && y >= rg.y && y < rg.y + rg.h);
-    if (hit) placeBet(hit.bet);
-  };
-
-  // ── Status line ────────────────────────────────────────────────────────────
-
-  const computeStatus = (): { line: string; color: string } => {
-    const s = state();
-    const p = phase();
-    const staked = myBets().reduce((sum, b) => sum + b.amount, 0);
-    if (animT !== null || p === 'closing'
-        || (p === 'betting' && s?.phaseDeadline != null && Date.now() >= s.phaseDeadline)) {
-      return { line: 'NO MORE BETS — THE DICE ARE OUT…', color: CH_PINK };
-    }
-    if (p === 'settled' && s?.dice != null && s.result != null) {
-      const won = s.payouts?.[myId] ?? 0;
-      // s.sevenOut = a point-phase 7 (hand over); a come-out 7 is a natural (win),
-      // not a seven-out, though both leave the post-roll point null.
-      const line = `● ${s.dice[0]}+${s.dice[1]} = ${s.result}`
-        + (s.sevenOut ? ' — SEVEN OUT' : '')
-        + (staked > 0 || won > 0 ? (won > 0 ? ' — YOU WIN' : '') : '');
-      return { line, color: won > 0 ? '#00E676' : GT_GOLD_BRIGHT };
-    }
-    const chips = readChips(myId);
-    const remain = s?.phaseDeadline != null
-      ? Math.max(0, Math.ceil((s.phaseDeadline - Date.now()) / 1000))
-      : null;
-    const pt = point();
-    const head = pt == null ? 'COME OUT — PLACE YOUR BETS' : `POINT IS ${pt} — PLACE YOUR BETS`;
-    const line = head
-      + (remain != null ? ` · ${remain}s` : '')
-      + (chips <= 0 && staked === 0 ? ' · VISIT THE CASHIER FOR CHIPS' : '');
-    return { line, color: GT_GOLD_BRIGHT };
-  };
-
-  const syncStatusEl = (): void => {
-    const el = panel?.querySelector<HTMLDivElement>('#cr-status');
-    if (!el) return;
-    const { line, color } = computeStatus();
-    el.textContent = line;
-    el.style.color = color;
-  };
-
-  const render = (): void => {
-    if (!panel) return;
-    syncWindow();
-    const s = state();
-    const p = phase();
-    const chips = readChips(myId);
-    const bets = myBets();
-    const house = deps.isHouse();
-    const rolling = animT !== null;
-    const autoRun = isCroupierLive(deps.itemId);
-    // 🎲🔗 #69 G5 seam: the house-only settlement toggle (local / optional Chia).
-    const backendPref = readCrapsBackendPref(deps.itemId);
-    const backendObj = crapsBackend(backendPref);
-    const backendReady = backendObj.isAvailable();
-    // 🎲🔀 The house-only fairness-mode toggle (rng / commit-reveal / multiparty /
-    // block-beacon), per-table override or the global default.
-    const fairnessMode = readCrapsFairnessPref(deps.itemId) ?? getCrapsFairnessMode();
-    const fairInfo = FAIRNESS_MODES[fairnessMode];
-    const { line: statusLine, color: statusColor } = computeStatus();
-
-    const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
-      <button id="${id}" ${disabled ? 'disabled' : ''} title="${title}" style="
-        padding: 6px 10px;
-        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
-        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
-        border-radius: 6px; color: ${disabled ? GT_DIM : GT_GOLD_BRIGHT};
-        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1.5px;
-        cursor: ${disabled ? 'not-allowed' : 'pointer'}; opacity: ${disabled ? '0.5' : '1'};
-      ">${label}</button>`;
-
-    const denomBtn = (n: number): string => `
-      <button data-denom="${n}" style="
-        width: 44px; height: 30px; border-radius: 15px;
-        background: ${denom === n ? 'rgba(240,192,96,0.28)' : 'rgba(212,168,75,0.07)'};
-        border: 2px solid ${denom === n ? '#F0C060' : 'rgba(212,168,75,0.35)'};
-        color: ${denom === n ? '#F0C060' : CH_GOLD};
-        font-family: inherit; font-size: 10px; font-weight: 800; cursor: pointer;
-      ">${n}</button>`;
-
-    panel.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
-        <span style="font-size:12px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1px;">🎲 CRAPS</span>
-        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
-      </div>
-      <div id="cr-status" style="font-size:11px; font-weight:800; letter-spacing:1px; color:${statusColor};">${statusLine}</div>
-      ${flash ? `<div style="font-size:10px; font-weight:800; color:#FF8A80; letter-spacing:1px;">${flash}</div>` : ''}
-      <div style="display:flex; gap:14px; align-items:flex-start;">
-        <div style="display:flex; flex-direction:column; gap:6px; flex:none;">
-          <canvas id="cr-dice" width="${DICE_W * 2}" height="${DICE_H * 2}"
-            style="width:${DICE_W}px; height:${DICE_H}px; background:rgba(0,0,0,0.25); border-radius:8px;"></canvas>
-        </div>
-        <div style="display:flex; flex-direction:column; gap:6px; min-width:0; flex:1;">
-          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">YOUR CHIPS — COUNT THEM</div>
-          <canvas id="cr-rack" width="380" height="132" style="width:190px; height:66px;"></canvas>
-          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">ON THE FELT</div>
-          <canvas id="cr-felt-rack" width="380" height="88" style="width:190px; height:44px;"></canvas>
-          ${p === 'settled' && !rolling && (s?.payouts?.[myId] ?? 0) > 0 ? `
-          <div style="font-size:10px; color:#00E676; letter-spacing:1.5px;">YOUR WIN</div>
-          <canvas id="cr-won" width="380" height="88" style="width:190px; height:44px;"></canvas>` : ''}
-        </div>
-      </div>
-      <div style="display:flex; align-items:center; gap:8px;">
-        <span style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">CHIP:</span>
-        ${[1, 5, 25, 100].map(denomBtn).join('')}
-        <span style="flex:1;"></span>
-        ${btn('cr-undo', 'UNDO', !bettingOpen() || rolling || addedThisWindow.length === 0, 'Take back the last chip you placed this window')}
-        ${btn('cr-clear', 'CLEAR', !bettingOpen() || rolling || addedThisWindow.length === 0, 'Take back every chip you placed this window')}
-      </div>
-      <canvas id="cr-board" width="${CR_BOARD_W * 2}" height="${CR_BOARD_H * 2}"
-        style="width:${CR_BOARD_W}px; height:${CR_BOARD_H}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${bettingOpen() && !rolling ? 'pointer' : 'default'};"></canvas>
-      <div style="display:flex; gap:8px; justify-content:flex-end; align-items:center;">
-        ${autoRun
-          ? `<span style="font-size:9.5px; color:${CH_GOLD};">🤖 THE ROBO-STICKMAN RUNS THIS TABLE</span>`
-          : house
-          ? (p === 'settled'
-            ? btn('cr-next', 'NEXT ROLL', rolling, 'Open the felt for the next roll')
-            : btn('cr-roll', '🎲 ROLL', rolling, 'Close betting and throw the dice'))
-          : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !rolling ? 'WAITING FOR THE STICKMAN TO OPEN THE NEXT ROLL' : 'THE HOUSE THROWS WHEN BETS ARE DOWN'}</span>`}
-      </div>
-      ${house ? `
-      <div style="display:flex; gap:8px; justify-content:space-between; align-items:center;">
-        <span style="font-size:9px; color:${GT_DIM}; letter-spacing:1.5px;">SETTLEMENT · HOUSE</span>
-        <button id="cr-backend" title="How this table settles: LOCAL play chips, or the optional Chia gaming backend (per-player↔house state channels sharing one fair dice). Off by default; the in-world game is identical either way. Selecting Chia before it is wired keeps playing on LOCAL." style="
-          padding:4px 9px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,${backendPref === 'chia' ? '0.55' : '0.4'});
-          border-radius:6px; color:${backendPref === 'chia' && !backendReady ? '#FFC107' : GT_GOLD_BRIGHT};
-          font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">
-          ${backendObj.label.toUpperCase()}${backendPref === 'chia' && !backendReady ? ' · FALLS BACK TO LOCAL' : ''}
-        </button>
-      </div>
-      <div style="display:flex; gap:8px; justify-content:space-between; align-items:center;">
-        <span style="font-size:9px; color:${GT_DIM}; letter-spacing:1.5px;">FAIRNESS · HOUSE</span>
-        <button id="cr-fairness" title="${fairInfo.blurb}${fairInfo.needsSecondParty || fairInfo.needsChain ? ' — DEV: entropy/beacon simulated locally until the network/chain half is wired' : ''}" style="
-          padding:4px 9px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,${fairnessMode === 'rng' ? '0.4' : '0.55'});
-          border-radius:6px; color:${fairnessMode === 'rng' ? GT_GOLD_BRIGHT : '#7CF5B0'};
-          font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">
-          ${fairInfo.label.toUpperCase()}${fairInfo.instant ? '' : ' · ~1 BLOCK'}
-        </button>
-      </div>` : ''}
-      ${p === 'settled' && !rolling && s?.fairness ? `
-      <div id="cr-fair-badge" style="font-size:9px; color:#7CF5B0; letter-spacing:1px;">
-        🔒 provably fair · ${(s.fairness.mode as string).toUpperCase()}${s.fairness.simulated ? ' (dev-simulated)' : ''} · verifying…
-      </div>` : ''}
-      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
-        BANK CRAPS · pass/don't-pass 1:1 (come-out only) · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6
-        · any 7 4:1 · any craps 7:1 · place bets ride until a 7, the pass line rides its point
-        · house-banked, the stickman's throw settles the roll · fair-dice upgrade coming
-        · chips are physical at the table — count them; the CASHIER's screen shows the number
-      </div>
-    `;
-    panel.querySelectorAll<HTMLButtonElement>('[data-denom]').forEach((b) => {
-      b.addEventListener('click', () => { denom = Number(b.dataset.denom); render(); });
-    });
-    panel.querySelector<HTMLButtonElement>('#cr-undo')?.addEventListener('click', () => undoBet());
-    panel.querySelector<HTMLButtonElement>('#cr-clear')?.addEventListener('click', () => clearBets());
-    panel.querySelector<HTMLButtonElement>('#cr-roll')?.addEventListener('click', () => { roll(); });
-    panel.querySelector<HTMLButtonElement>('#cr-next')?.addEventListener('click', () => nextRoll());
-    panel.querySelector<HTMLButtonElement>('#cr-fairness')?.addEventListener('click', () => {
-      if (!deps.isHouse()) return;
-      const order: FairnessMode[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
-      const next = order[(order.indexOf(fairnessMode) + 1) % order.length];
-      writeCrapsFairnessPref(deps.itemId, next);
-      render();
-    });
-    // 🔒 Verify a settled roll's transcript and stamp the badge (async — anyone
-    // can re-derive the dice from the public transcript). The verdict is cached
-    // per round, and the stamp re-queries the LIVE badge and re-checks the
-    // round (#87 review): render() replaces panel.innerHTML, so a node captured
-    // before the await would be detached — and a slow promise from round N must
-    // never stamp round N+1's badge.
-    if (p === 'settled' && !rolling && s?.fairness && s.dice) {
-      const dice = s.dice;
-      const fx = s.fairness;
-      const forRound = s.round;
-      const stamp = (ok: boolean): void => {
-        if (!panel || round() !== forRound) return;
-        const badge = panel.querySelector<HTMLDivElement>('#cr-fair-badge');
-        if (!badge) return;
-        badge.textContent = `🔒 provably fair · ${(fx.mode as string).toUpperCase()}`
-          + (fx.simulated ? ' (dev-simulated)' : '')
-          + (ok ? ' · ✓ verified' : ' · ✗ FAILED');
-        badge.style.color = ok ? '#7CF5B0' : '#FF8A80';
-      };
-      const cached = verifiedVerdicts.get(forRound);
-      if (cached !== undefined) {
-        stamp(cached);
-      } else {
-        verifyTranscript(fx, deps.itemId, forRound, dice).then((ok) => {
-          if (verifiedVerdicts.size > 32) verifiedVerdicts.clear(); // old rounds never re-render
-          verifiedVerdicts.set(forRound, ok);
-          stamp(ok);
-        });
-      }
-    }
-    panel.querySelector<HTMLButtonElement>('#cr-backend')?.addEventListener('click', () => {
-      if (!deps.isHouse()) return;
-      writeCrapsBackendPref(deps.itemId, backendPref === 'chia' ? 'local' : 'chia');
-      render();
-    });
-    diceCanvas = panel.querySelector<HTMLCanvasElement>('#cr-dice');
-    boardCanvas = panel.querySelector<HTMLCanvasElement>('#cr-board');
-    boardCanvas?.addEventListener('click', onBoardClick);
-    flash = '';
-    drawDiceForNow();
-    drawBoard();
-    const paintTray = (id: string, tray: number[], cssW: number, cssH: number, emptyText?: string) => {
-      const cv = panel!.querySelector<HTMLCanvasElement>(`#${id}`);
-      const c2 = cv?.getContext('2d');
-      if (!cv || !c2) return;
-      c2.setTransform(2, 0, 0, 2, 0, 0);
-      c2.clearRect(0, 0, cssW, cssH);
-      drawChips(c2, tray, 0, 0, cssW, cssH, { emptyText });
-    };
-    paintTray('cr-rack', chipsFor(chips), 190, 66, 'NO CHIPS — VISIT THE CASHIER');
-    paintTray('cr-felt-rack', bets.map((b) => b.amount), 190, 44, 'NOTHING ON THE FELT');
-    if (p === 'settled' && !rolling) {
-      paintTray('cr-won', chipsFor(s?.payouts?.[myId] ?? 0), 190, 44);
-    }
-  };
-
-  return {
-    mount(host: HTMLElement): void {
-      panel = document.createElement('div');
-      panel.id = 'device-craps-pane';
-      panel.style.cssText = `
-        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
-        width: 430px; max-height: 94vh; overflow-y: auto;
-        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
-        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
-        padding: 18px; display: flex; flex-direction: column; gap: 12px;
-        color: ${GT_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-        box-sizing: border-box; pointer-events: auto;
-      `;
-      panel.addEventListener('click', (e) => e.stopPropagation());
-      host.appendChild(panel);
-      // Never replay a throw that landed before we walked up.
-      const s = state();
-      animRound = s?.phase === 'settled' ? s.round : 0;
-      windowRound = s?.round ?? 0;
-      animT = null;
-      unsubscribe = subscribeCasino(() => {
-        // A fresh settle write starts the dice tumble; everything else repaints.
-        const cur = state();
-        if (cur?.phase === 'settled' && cur.round > animRound) {
-          animRound = cur.round;
-          animT = 0;
-        }
-        render();
-      });
-      render();
-    },
-    unmount(): void {
-      unsubscribe?.();
-      unsubscribe = null;
-      panel?.remove();
-      panel = null;
-      diceCanvas = null;
-      boardCanvas = null;
-    },
-    update(dt: number): void {
-      const s = state();
-      if (animT === null && s?.phaseDeadline != null && s.phase !== 'settled') {
-        syncStatusEl();
-      }
-      if (animT === null) return;
-      animT = Math.min(1, animT + Math.max(0, dt) / CR_ROLL_SECS);
-      if (animT >= 1) {
-        animT = null;
-        render(); // reveal the dice + payouts + settled balances
-      } else {
-        drawDiceForNow(); // tumble
-      }
-    },
-  };
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
 // 🪙 Coin pusher (#135)
 // ══════════════════════════════════════════════════════════════════════════════
 // The player's panel. The machine is run by its operator (pusherCroupier.ts);
@@ -7132,6 +5954,39 @@ const PUSHER_REFUSAL_TEXT: Record<PusherRefusalReason, string> = {
   'balance-full': 'YOUR RACK CAN\'T HOLD ANY MORE — CASH SOME CHIPS OUT FIRST',
   jammed: 'THE MACHINE JAMMED — NOTHING WAS TAKEN',
 };
+
+/** ⚙ The machine card (settingsGear.ts): the rules and what's inside for
+ *  anyone. Nothing on the pusher is adjustable yet; the owner empties it
+ *  from the machine's own panel. */
+export function coinPusherGearCard(itemId: string, isHouse: () => boolean): GearCardSpec {
+  return {
+    itemId,
+    title: 'COIN PUSHER',
+    noun: 'MACHINE',
+    isHouse,
+    body(house) {
+      const state = readCoinPusherState(itemId);
+      const operator = coinPusherOperatorState();
+      const rows = [
+        gearSection([
+          `EACH DROP COSTS ${PUSHER_ANTE} CHIP · PICK ONE OF ${HOLE_COUNT} HOLES AND TIME IT AGAINST THE PUSHER`,
+          'CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS',
+          'THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE',
+          `THE MACHINE HOLDS UP TO ${MACHINE_MAX_CHIPS} CHIPS`,
+        ]),
+        gearSection([
+          state ? `${chipsInMachine(state)} CHIPS INSIDE` : 'NOT SET UP YET',
+          operator === 'ready' ? 'MACHINE ONLINE' : operator === 'starting' ? 'MACHINE STARTING' : 'MACHINE OFFLINE — ITS OWNER RUNS IT',
+        ]),
+      ];
+      if (house) {
+        rows.push(gearSection(['TO EMPTY IT, STEP UP TO THE MACHINE AND OPEN THE DOOR FROM ITS PANEL']));
+      }
+      return rows.join('');
+    },
+    subscribe: subscribeCasino,
+  };
+}
 
 /**
  * The coin-pusher panel: a live pusher gauge (the same clock the cabinet

@@ -10,8 +10,9 @@
  * An orbit move must be the Hohmann transfer its two orbits make
  * (stationMove.orbitChangeFits), so PARK writes the one that ARRIVES where
  * the station stopped, at the moment it stopped: it leaves from an orbit
- * PARK_FROM_OFFSET_KM higher, half a transfer earlier, phased so its
- * arrival point is the park point. That leg is in the past and is never
+ * PARK_FROM_OFFSET_KM higher (or lower, when another orbit sits within the
+ * separation just above), half a transfer earlier, phased so its arrival
+ * point is the park point. That leg is in the past and is never
  * flown or drawn; what counts is the orbit it arrives in.
  */
 
@@ -49,13 +50,18 @@ export function planStationPark(
   const altitude = r - planet.radiusKm;
   if (altitude < MIN_ALTITUDE_KM) return { ok: false, reason: `Too low to park: ${formatAltitude(MIN_ALTITUDE_KM)} is the lowest orbit clear of the atmosphere.` };
   if (altitude > maxAltitudeKm(planet.id)) return { ok: false, reason: `Too high to park: ${formatAltitude(maxAltitudeKm(planet.id))} is the highest orbit around ${planet.name}.` };
-  const near = altitudeConflict(r, orbitsToKeepClear(station, stations, pose.at));
-  if (near) {
-    const whose = near.name ? `${near.name}'s orbit` : 'another slot\'s orbit';
-    return { ok: false, reason: `Too close to ${whose} at ${formatAltitude(near.radiusKm - planet.radiusKm)} to park: keep ${MIN_ORBIT_SEPARATION_KM} km clear.` };
-  }
-  // The unflown leg: from just above, half a transfer before the stop.
-  const r1 = r + PARK_FROM_OFFSET_KM;
+  const clear = orbitsToKeepClear(station, stations, pose.at);
+  const tooClose = (o: NonNullable<ReturnType<typeof altitudeConflict>>): StationParkResult => {
+    const whose = o.name ? `${o.name}'s orbit` : 'another slot\'s orbit';
+    return { ok: false, reason: `Too close to ${whose} at ${formatAltitude(o.radiusKm - planet.radiusKm)} to park: keep ${MIN_ORBIT_SEPARATION_KM} km clear.` };
+  };
+  const near = altitudeConflict(r, clear);
+  if (near) return tooClose(near);
+  // The unflown leg: from just above (or just below), half a transfer before
+  // the stop. Its orbit is weighed as a claim too (stations.lostAltitudeClaims,
+  // which the destination stands on), so it must keep the same separation.
+  const r1 = [r + PARK_FROM_OFFSET_KM, r - PARK_FROM_OFFSET_KM].find((c) => !altitudeConflict(c, clear));
+  if (r1 === undefined) return tooClose(altitudeConflict(r + PARK_FROM_OFFSET_KM, clear)!);
   const transferS = Math.PI * Math.sqrt(((r1 + r) / 2) ** 3 / planet.mu);
   const departAt = pose.at - Math.round(realMsFor(transferS));
   const n1 = Math.sqrt(planet.mu / r1 ** 3);

@@ -554,7 +554,9 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
         movable: false,
         footprintOverride: { x0: -5.4, z0: -3, x1: 3.5, z1: 3 },
       },
-      { id: "pool-hot-tub", kind: "classic-hot-tub", pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
+      // ♨️ Its own id: "pool-hot-tub" is the lazy pool's island tub, and while
+      // this corner tub shared it, it inherited that tub's footbridge.
+      { id: "lido-hot-tub", kind: "classic-hot-tub", pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
       { id: "otree-sw", kind: "cherry-tree", pos: { x: -4.5, z: 4.5 }, rot: 0, movable: true },
       { id: "otree-se", kind: "cherry-tree", pos: { x: 4.5, z: 4.5 }, rot: 0, movable: true },
       { id: "opot-1", kind: "blossom-pot", pos: { x: 2.55, z: 4.75 }, rot: 0, movable: true },
