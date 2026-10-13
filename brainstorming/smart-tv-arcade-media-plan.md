@@ -1,0 +1,2675 @@
+# Smart TV, Arcade Cabinet and the Media Lane — options and recommendations
+
+Issues: [#186 smart TV](https://github.com/Bella-Addormentata/StarStationFurlong/issues/186) ·
+[#193 arcade cabinet](https://github.com/Bella-Addormentata/StarStationFurlong/issues/193) ·
+[#194 CRT vibe](https://github.com/Bella-Addormentata/StarStationFurlong/issues/194) ·
+[#189 voice toggle](https://github.com/Bella-Addormentata/StarStationFurlong/issues/189) ·
+[#190 voice calls](https://github.com/Bella-Addormentata/StarStationFurlong/issues/190)
+
+Status: design of record for the TV, the cabinet and everything that moves media
+between players, consolidated from the research notes on #186 and #193
+(2026‑10‑03). Grounded in `prototypes/0.29.0-core-loop-demo` as of main on
+2026‑10‑13 (`a2b6f68`, the v0.40.0 release) — v0.40.0 in `version.ts`,
+with #207, #208, #242, #248, #250, #255, #256 and #257 shipped in it — and
+in the sovereignty rules of [STUDY-Architecture v002 §3](AI%20BRAINSTORMING/STUDY-Architecture%20v002.md),
+the [Cabal DNS-free plan §3–§4](REVIEWS/REVIEW-20260707-Cabal-DNS-Free-Discovery-Plan.md)
+and [v007](AI%20BRAINSTORMING/STUDY-Architecture%20v007.md). Every option that
+was weighed is listed in §10, including the rejected ones, so the next reader
+does not re-open them by accident.
+
+---
+
+## 1. The yardstick
+
+Every choice below was scored against the project's own rules, not a generic
+idea of decentralisation:
+
+- **The Sovereignty Test** (v002 §3): *"If every third party we don't control
+  vanished overnight — GitHub, Cloudflare, public STUN, public Nostr relays,
+  public torrent trackers, every commercial cloud — would StarStationFurlong
+  still boot, find peers, and play?"* A critical-path component must be a
+  player-run node, our own code, or the Chia consensus; anything else is
+  rejected or demoted to an optional fallback. v002's table already rules
+  *Public WebTorrent tracker → Rejected → Chia infohash registry + our seeders*.
+- **The DNS-free rules** (Cabal plan §3.1): no external DNS for a join, no
+  public relay by default, no public bootstrap defaults unless explicitly
+  enabled as dev mode, discovery inputs only from signed local config or
+  signed tickets.
+- **The lane classes** (Cabal plan §4.5): *pure P2P*, *community-owned*, and
+  *decentralised third party — optional, off in strict sovereign builds, never
+  a dependency*. The Mainline DHT is already in that last class for address
+  lookup — in class, not yet in posture: the node builds its
+  `DhtAddressLookup` with the crate's default bootstrap whenever
+  `SSF_NO_DHT` is unset (`ssf-p2p-node/src/main.rs`; `n0-mainline` 0.5.0's
+  `DEFAULT_BOOTSTRAP_NODES`, four public DNS names, `router.bittorrent.com`
+  among them), which the DNS-free rules above forbid as a default. That is
+  an UNMET PREREQUISITE of every DHT use in this plan (§4's address lookup,
+  §7's seeds): the bootstrap list comes from signed local config or a
+  signed ticket — the station's own nodes, py-ipv8's names only as the dev
+  mode the rules allow — and with none configured the lookup is OFF, never
+  defaulted to the public names; a public torrent swarm is the same shape.
+  The node's public-address ECHO is the other default in that class: with
+  `SSF_EXTERNAL_ADDRS` unset the node behaves as `auto` and asks
+  `api.ipify.org` or `checkip.amazonaws.com` for its public IPv4 over
+  plain HTTP, every five minutes (`main.rs`, `DEFAULT_IP_ECHO_HOSTS`;
+  `SSF_IP_ECHO` names other hosts, `SSF_EXTERNAL_ADDRS=off` silences it) —
+  the R1 posture flip, an owner decision for the demo phase ("as easy as
+  possible"), and the only outbound DNS and HTTP a fresh node makes on its
+  own. So compiling the Mainline lookup out leaves that traffic, and the
+  prerequisite covers it too: a STRICT build compiles the echo path out
+  (no echo host exists in it; the external address comes from explicit
+  `SSF_EXTERNAL_ADDRS` entries, from the relay the operator configured,
+  or from what an authenticated peer observed of this node's address on
+  its own connection, iroh's path reports), and a non-strict sovereign
+  configuration keeps the owner's R1 default while naming the echo hosts
+  it uses in `SSF_IP_ECHO` — the operator's own echo on the station, or
+  none — so that a node never resolves a third party's name unless its
+  operator wrote that name down. Which is not yet true of the CHAIN lane
+  either, and compiling out Mainline and the echo does not make it so:
+  every chain read and push goes to one third-party gateway by default —
+  `CoinsetClient::testnet11()`, `testnet11.api.coinset.org`, at every call
+  site (the presence reader, the beat watcher, the publisher, the faucet
+  dish and the craps fairness records — six in the TODO item's inventory
+  as of `5414b662`, nine by the count in #259's errata; the TODO's
+  critical-path item
+  *Remove the coinset.org dependency from the chain lane*, Dorkmo
+  2026‑10‑12) — and since #238 chain reads are on in every node with no
+  wallet, seed or switch (`SSF_CHIA_WATCH=0` turns the watcher off), so a
+  strict build still resolves that gateway's name on every block beat
+  until that item lands. The strict-build definition therefore includes
+  it: in a strict build the chain lane talks to the operator's own Chia
+  peers or to none (that item's seam — `chia-sdk-client` and
+  `SSF_CHIA_PEERS`), and with none configured the lane is OFF, never
+  defaulted to the gateway; until the removal lands, the gateway is the
+  one remaining default third-party name, stated here as such.
+- **P‑3**: never default public relays. **v007 F2/F5**: status must reach the
+  player, and every feature says which rung it is using.
+- **The ChiaHub floor** (rung 6): the chain as the discovery that keeps working
+  when every DHT bootstrap and DNS server refuses us.
+
+Applied to a TV the test reads: *with YouTube, archive.org, every tracker and
+every DHT bootstrap node gone, can a room still watch something together, and
+can a station keep what it has?* At least one source has to answer yes, and
+the sources that fail have to say so on the screen.
+
+## 2. What the stack already gives us (checked in source)
+
+| Need | What exists | Where |
+|---|---|---|
+| Shared switch state | Whole-value LWW records per item, shape-checked reads, per-key subscribe, owner-predicate seam | `partyDoc.ts` (`speaker:<itemId>`, `setPartyHostPredicate`) |
+| Single-writer clocks | The operator stamps absolute deadlines; others render `deadline − localNow`; heartbeat 3 s, stale at 9 s — wall clocks compared across devices, so a precedent for the schedule's absolute `startAt` (§3.1 accepts that skew) and NOT for liveness, which §3.1 takes from the pusher row below | `croupier.ts` (`isCroupierLive`) |
+| A renewable lease, liveness judged by the renewals a page saw | Operator lease: renew every 3 s, lapse after 8 s. Its CLAIM policy is the pusher's own — owner-only, and a 60 s split window before another device takes over — and is NOT what the TV reuses: the remote's claim policy is distinct (§3.2): anyone takes a free or lapsed remote, at once, no owner gate | `pusherCroupier.ts` |
+| Per-frame unreliable lane | 13-byte datagrams, relayed content-blind to every room member; 2-bit lane kind, ALL FOUR TAKEN — kind 3 by Insatiable Alligators (#185), and the arcade's own ticks a subtype of kind 1 behind a flag bit and a NaN `x` — so a further game needs a subtype, never a kind, and anything longer than 13 bytes needs the extended datagram of §9, told apart by length alone | `network/protocol.ts` (`TICK_KIND_ALLIGATORS`), `arcadeNet.ts`; `ssf-p2p-node/src/main.rs` accepts only `datagram.len() == 13` from the browser |
+| Reliable lane | JSON envelopes with base64 payloads (`ysync`); `'asset'` kind declared, unimplemented; no `iroh-blobs` in the node | `network/YjsSync.ts`, `protocol.ts` |
+| Fan-out | The hub relays ticks and control frames to the room (M5), with heartbeat pruning and a signed control plane (`graft`/`prune`/`px`/`ihave`/`iwant`) | `main.rs` |
+| Screens | Live `CanvasTexture` planes (wall computer at ~1 Hz, the air-hockey scoreboard). No iframe, CSS3D, `VideoTexture`, WebCodecs, WebRTC or `getUserMedia` anywhere | `furniture.ts`, `devices.ts` |
+| Mounting and focus | `FurnitureDef.wallMount`, the `device` focus template, seats with the seated pose bit | `furniture.ts`, `deviceFocus.ts` |
+| The phone | `phoneViewMeta` registry + `showPhoneView` router; a new app is one entry and one view element | `main.ts` |
+| Transit measurement | `ping`/`pong` datagrams, `stats().rttMs` | `NetworkProvider.ts` |
+| Tauri | `csp: null`; the UI is served from `tauri://localhost` on macOS/Linux and `http://tauri.localhost` on Windows | `src-tauri/tauri.conf.json` |
+
+## 3. The Smart TV
+
+### 3.1 The record and the sync rule
+
+```ts
+// room doc, map 'tv', key tv:<itemId> — whole-value transacted writes, shape-checked reads
+{
+  source: { kind: 'youtube', videoId }            // IFrame API: full sync
+        | { kind: 'archive', identifier, file: '' | name }  // '' is their embed, the no-file case (start-time sync;
+                         // tvDoc isStartOnly); a name is that mp4 of the item (full sync) — one shape, read unambiguously
+        | { kind: 'url', url }                    // any mp4 / webm a <video> can play
+        | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id — the id
+                         // ALONE, never dial hints: a viewer's node resolves the id to a route itself
+                         // (what it observed on an earlier authenticated connection, iroh discovery),
+                         // since an address a peer wrote, signed or not, is a reflection surface (§4)
+        | null,
+  state: 'home' | 'scheduled' | 'playing' | 'paused',  // the PROGRAMME only: 'home' is on with nothing on. Power is
+                         // not here — it is its own key (below), so the set has one source of truth
+                         // for being off; a reader derives the 'off' it shows from `power.on`,
+                         // and a programme value of 'off' (legacy or garbage) is read as 'home'
+  startAt: number,       // UTC ms — the countdown only
+  positionMs: number,    // where the holder's player was…
+  seq: number,           // …stamped with a per-write counter: a NEW seq is a new sample, which a
+                         // reader anchors to its OWN receipt time; never a wall clock
+  started: number,       // the seq of the write that started the programme: a replay is a new start
+  jump: number,          // bumped by every transport write, never by a heartbeat; the holder follows it once
+  history: Array<{ source, title, playedAt }>,    // cap 20
+  // later, not v1 — ui: { screen, cursor, text }: the start screen everyone watches the holder
+  // navigate on the prop. v1 (#207) picks sources on the phone's remote app or the panel at
+  // the set, and the prop's texture shows what is on (the status, the countdown, the holder).
+}
+// key remote:<itemId> — its own record so a lease renewal never collides with a playback write
+{ holder: pub | '', name, leaseAt, by, page }
+// page: the holder's PAGE-LOAD id, never the key — two tabs of one browser share the key (the
+// seed lives in localStorage) and must not both renew, beat the clock and release on leave; a
+// hand-over writes page '' and the first of the receiver's pages to tick claims it
+// key volume:<itemId> — the set's volume (a body button anyone may press), its own key so a
+// viewer turning the sound down never carries a stale programme over the holder's seek:
+// whole-value LWW keeps one writer per key, so each thing that changes on its own has one
+{ volume: 0..100 }
+// key power:<itemId> — the switch, a body button anyone may press; its own key for the same
+// reason (a press must never race the holder's heartbeat in the programme's slot). Off keeps
+// the programme and writes the presser's own reading of where the room was (`parkMs`: a
+// programme playing, or a schedule past its T0, which plays by the clock whoever holds — null
+// when nothing was running, a pause or a countdown still ahead, and 0 is a reading — a
+// position, never a time: the clocks rule below; and null too from a page whose reading is
+// STALE, bridged across its own sleep — ahead of the room by the whole sleep when the sample
+// was a beat the network delivered in the moment after waking, stamped from before the gap
+// like the rest — unless that sample is the page's own last beat, the holder's clock bridged
+// across its own sleep, which every awake viewer ran on to: a reading a page may not act on
+// is none it may publish for the room, and a switch with no reading anchors nothing, the
+// holder parking at the record's last heartbeat, behind the room by a beat at most while the
+// holder is awake and never ahead); on carries it, so
+// every page anchors the resumed programme there on receipt of the ON write (a sample of its
+// own, replaced by the holder's next heartbeat) and the holder's tick parks the programme
+// there as it sees the switch — with no holder present the programme resumes from where it
+// was switched off and runs, best effort, until someone picks the remote up and beats, never
+// from a stale heartbeat with the time switched off counted as playback; `seq` voids a
+// lookup in flight
+{ on: boolean, seq, parkMs }
+```
+
+**Sync rule.** While playing, the holder's client writes `{positionMs, seq}`
+every 3 s. Every other client records `receivedAt = performance.now()` when
+a new `seq` lands and computes `expected = positionMs + (now − receivedAt) +
+lead` with the same monotonic `now`. In steady-state playback the
+monotonic clock, never the wall clock: `Date.now()` steps on an NTP
+correction, on a wake from sleep or on a manual change, and a step would
+read as elapsed playback and seek every viewer at once; the wall clock
+serves the UTC schedule (`startAt`) and, in the sync maths, exactly one
+thing — a DETECTED sleep gap, below, which the wall clock ran through
+and the monotonic clock may not have, bridged on wall time for the gap
+alone and never for the elapsed time of a page that stayed awake. The
+monotonic clock is no promise of its own
+across a sleep, though: High Resolution Time lets `performance.now()` run
+on through OS sleep, and on Windows it does, so a viewer waking after an
+hour would read its last sample an hour ahead and seek there — or lets it
+stand still, as on macOS and Linux, so the same viewer would read the
+hour as one tick and never know it slept. So the
+anchor is worth nothing after a gap: the room tick marks the page awake,
+a gap in the marks longer than 2.5 s BY EITHER CLOCK (a closed lid, a
+frozen tab, a throttled background page — `TV_SUSPEND_GAP_MS`) marks
+every sample from before it STALE. A gap the monotonic clock itself saw
+is SURE — the event loop did not run — and a gap the wall clock alone
+found is AMBIGUOUS: a sleep the monotonic clock stood still through, or
+a wall-clock step while the page ran, and nothing in the page tells the
+two apart (in either, the only clock that moved is the one that steps;
+timers, players and marks all show one tick's worth). So an ambiguous
+gap is a sleep for everything that WAITS — the samples before it stale,
+leases lapsed by the wall clock's measure, a holder past the lapse
+letting the remote go — and a step for everything that MOVES: its wall
+delta is never added to playback, no holder seeks its player or beats
+the room forward on the wall clock's word alone, and the bridge below
+is for sure gaps only. The cost, said once: a holder whose monotonic
+clock stood still through a sleep rejoins where it slept, not where the
+room ran on to, once it picks the remote up again — where before it
+renewed its claim over a takeover it slept through. A backward step is
+no gap at all. A stale reading is shown but never acted on — no
+seek, no nudge — until a fresh sample lands after the wake window (a
+sample the network held through the sleep and delivers on waking is
+stamped from before the gap, as a lease is, and is stale with the rest;
+what the page wrote itself is received as it is written, whatever the
+marks say — a holder waking and beating is never stale to itself). A
+lease's LAPSE is measured the same way — the time really elapsed since
+this page saw the renewal, every gap since counted by the wall clock,
+a gap the first tick back has not marked yet included — so a holder
+that slept past the lapse reads its own hold as lapsed on waking
+whichever way its monotonic clock behaved, and picks the remote up again
+like anyone rather than renewing over a takeover it slept through.
+The first heartbeat the viewer can act on is at most
+`TV_WAKE_WINDOW_MS + TV_HEARTBEAT_MS` away — 4 s: a beat delivered inside
+the wake window is stamped from before the gap, so the first fresh one is
+the holder's next — and a viewer whose player stopped with the machine is
+then seeked once, to where the room
+is, never to where the sleep says. A HOLDER that slept through a SURE
+gap rejoins the room where the room is and never drags it back to where
+it slept: its own anchor is stale like any other, and `readPlayback`
+bridges the gap on the WALL clock — the one use of wall time in the
+extrapolation, for a sure gap alone, since the monotonic clock may or
+may not have run through a sleep and the wall clock did, the error an
+NTP step the sleep may have hidden and never the sleep — so the headless
+beat carries the pre-sleep position plus the time really elapsed, a
+holder with the theatre open seeks its own player there once (the OS
+stopped it with the machine) and beats from there, no beat going out
+before that seek lands, and that beat is the fresh sample that
+un-stales everyone, the holder included. After an AMBIGUOUS gap the rule
+is the other one, and there is only one: the gap is bridged by nothing,
+so the holder rejoins where it SLEPT — its first beat after the gap,
+which goes out only once it holds the remote again (a hold past the
+lapse was let go), is its last beat's position plus the monotonic time
+since, from its player where one runs, with no wall delta in it, and
+the room follows that beat, back by the sleep if the gap was one. One
+expected result, and the tests pin it (tvDoc, tvSession).
+`lead` is half the round trip the viewer's `NetworkProvider` measures to the
+node it is connected to, capped at 1 s, and zero for the holder (its own
+writes land locally). That term corrects exactly one hop — the last one,
+from the viewer's own node to its page, which on a desktop build is
+loopback and worth nothing — and no other: the sample's path runs from the
+holder's page through its node and the mesh to the viewer's node before
+that hop, and anchoring at receipt keeps every millisecond of that
+delivery delay in the viewer's position. The honest guarantee is therefore
+the weaker one: each viewer sits BEHIND the holder by its own delivery
+delay, a standing offset that no heartbeat corrects (the next sample
+arrives with the same delay) and that never grows (a heartbeat replaces,
+it does not accumulate, so a one-off spike lasts one heartbeat); two
+viewers differ by the difference of their delays, typically tens of
+milliseconds over a hop or two and inside the seek band; and none of it is
+clock skew: no device
+compares its clock with another's (the `pusherCroupier.ts` rule —
+`leaseLapsesAt` counts a lease term from when THIS page first saw the
+record, never `Date.now()` against a stamp another device wrote — and the
+air-hockey staleness clocks, local receipt time against the local clock;
+NOT `croupier.ts`, whose `isCroupierLive` takes `Date.now() − beat` across
+devices and is the precedent this rule exists to avoid). An end-to-end
+probe — a viewer's mark echoed by the holder through the record and timed
+on the viewer's own clock — is what would measure the whole path and take
+the offset out; it is a later item, and until it lands the term stays the
+one hop it is. Drift correction: `<video>` elements
+nudge `playbackRate` ±3 % under 1 s of drift and seek beyond 1.5 s; the
+YouTube player only seeks (its rate steps are coarse), with a 1.5 s dead band
+so we never fight its own buffering. Pause is a record write. A late joiner
+reads once, computes, seeks.
+
+**Scheduled start.** `state: 'scheduled'` renders the countdown from
+`startAt − localNow` (display only). At T0 only the HOLDER's clock decides.
+The shared record is still `scheduled`: the holder's own read treats the due
+schedule as running (locally, and nowhere else), and its first heartbeat
+performs the shared transition to `playing`; every viewer starts on receipt
+of that write and anchors to it, so skew between viewers never splits the
+room. What anchoring cannot do is make the holder's clock right: the START
+is the holder's wall clock against `startAt`, and a holder five minutes
+fast starts the room five minutes early for everyone (five minutes slow,
+late) — skew moves the start, never the sync after it. v1 states that and
+accepts it: the holder who scheduled the film sees the same countdown as
+everyone else, and a clock within a minute is the norm; a station time
+source (the node's peers, or NTP through the node) is a later item, not
+v1's. A viewer whose countdown has
+reached 0 shows STARTING… until the write lands (within a heartbeat). Only
+when nobody holds the remote does a viewer free-run from `startAt`, best
+effort, until someone picks the remote up and beats. For `blob` and torrent
+sources the countdown doubles as the prefetch window.
+
+### 3.2 The remote: possession, not a role
+
+| Real life | In the room |
+|---|---|
+| The remote sits by the TV | `remote:<tvId> → { holder: '' }` (the schema above; never `null`) |
+| You pick it up | Walk to the TV and press PICK UP REMOTE, or click the remote in the holder's hand |
+| You hand it to someone | HAND TO… lists the room's players (v1: everyone the players map has seen — there is no liveness until S3 presence, so a remote handed to someone who has left lapses back to the set in 8 s; arm's reach comes with the rig work); the receiver's phone opens on the remote; no accept step |
+| You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
+| You fall asleep holding it | The holder renews every 3 s; after 8 s of silence anyone may take it |
+| You open a second tab | The remote stays with the tab that picked it up (`page`); the other is a viewer that may take it over — one person, one place — and closing it drops nothing |
+| The TV has buttons on its body | Anyone standing at the TV can press POWER and VOLUME without the remote — each its own key (§3.1), so no body press writes the programme record the holder rewrites every three seconds, and an INPUT button, if one comes, gets a key of its own the same way, never a second writer of `tv:<id>` — and whoever turns the set ON has the remote placed in their hand (#186's rule, as written) on every OFF→ON — a remote on the set, lapsed, or in a live hand alike: the previous holder sees the switch take it, and takes it back by pressing ON themselves or asking. The alternative — a live holder keeps the remote across a body press, since a body button moves nothing out of a hand, and the switch hands over only a remote on the set or lapsed — is recorded as an OPEN OPTION for the owner (the options table, §10), a one-line change in `tvDoc.ts` (#207), and not v1's behaviour |
+| The owner has the spare | The room owner may take the remote from anyone, always |
+
+The holder gate is client-side and best effort — the dev-phase posture of
+`doorPolicy.ts`, not an authority boundary. The `tv` map is peer-writable:
+a modified client can write any shape-valid `tv:<id>` or `remote:<id>` (a
+different programme, position, history or lease). Every read is
+shape-checked, and nothing is FETCHED on a peer's say-so: a shape-valid
+http(s) source would otherwise make every open theatre's browser request it
+(a `<video>` preloads the moment it is mounted), so the theatre mounts a
+source only when its origin is one of the product's own lanes
+(`youtube-nocookie.com`, `archive.org`), the page's own origin or its node's,
+or one this viewer accepted in this session by pressing PLAY FROM <host>; a
+host that NAMES a loopback, link-local or private network as written — a
+literal address, an intranet name — and is not the viewer's own node is
+refused outright, no button offered (`tvConsent.ts` in #207), a screening
+of the host as written and nothing more. That is
+consent, not validation: a host the viewer accepted can redirect the request,
+or resolve, into the viewer's own network, and a browser `<video>` can see
+neither — the ask says so. A consented URL is PROBED before the element is
+mounted (`probeRedirect`, #207): a CORS HEAD with `redirect: 'manual'`, no
+body read, eight seconds at most, counted against the set's mount budget
+and aborted when the programme moves on. An opaque-redirect answer refuses
+the mount; a direct answer — the host sends CORS headers: a 200, a 405 to
+the HEAD, a 404 — allows it; no answer at all (a host without CORS headers,
+one that is down, the deadline) allows nothing and is not kept, so a RETRY
+asks again. It FAILS CLOSED, which narrows the lane to CORS-clean hosts,
+and it checks one answer at one moment: the `<video>`'s own GET may be
+answered differently, and a name that RESOLVES into the viewer's network
+is not seen at all (a `no-cors` probe would learn nothing — the fetch
+standard makes `no-cors` with any redirect mode but `follow` a network
+error outright). The node's media proxy (§3.4, TODO) is where
+destinations are checked after DNS and on every redirect; until it lands, a
+direct URL is the viewer's own trust decision, per origin, per session. And
+an origin that needs no asking is still mounted under a BUDGET, since
+consent per origin bounds nothing cumulative: a modified client could
+rotate shape-valid sources on the viewer's own node or a product lane and
+have every open theatre fetch each in turn without end, and no cap on one
+request bounds that. So automatic mounts are counted per set and per
+session — a source change within the budget (six in a minute: a holder
+flipping through films, never a script) mounts on its own, and past it the
+theatre mounts nothing more by itself: the record's source is shown as what
+is on, with PLAY, and the press is the consent that mounts it and opens the
+next window (`tvConsent.ts` `mayMountNow`, `TV_MOUNT_BUDGET`; a `<video>`'s bytes are what the
+viewer watches once mounted and no more than its metadata before); where
+the lane measures bytes (the blob lane's `autoFetchBudget`, §4) the byte
+budget stands beside the count. So the
+worst a modified client can do is change what is on, a bounded number of
+times a minute without asking — never make a browser fetch what its owner
+did not agree to, and never without bound. When an authority boundary is needed
+it is the signed-op acceptance rule of the RoomLog (Phase 2), not more checks
+in the client. The holder shows as a 📺 badge on the name tag first; the
+remote prop in the hand is rig work shared with #190.
+
+### 3.3 The start screen and the sources
+
+The TV boots to its own home screen, drawn on the screen texture. In v1 (#207)
+that texture shows what is on — the status, the countdown, who holds the
+remote — and the sources are picked on the phone's remote app or the panel at
+the set; everyone watching the holder navigate the start screen on the prop
+(a cursor in the record, the `ui` field) is a later slice. The phone's remote
+app is the buttons; the TV is the display. Every tile wears its
+lane badge (**SOVEREIGN** / **PLAYER-RUN** / **PUBLIC SWARM** / **CONVENIENCE**);
+a build without `VITE_SSF_CONVENIENCE_LANES=1` — the default, and every
+strict build — does not show the convenience tiles at all (the ruling
+below), a build with the flag on shows them labelled and greys them out
+when unreachable, and a strict build shows the torrent tile as
+library-only, since §6 compiles the torrent client out there.
+
+**Ruling (2026‑10‑04): serverless sources only, by default.** The owner's
+call after the torrent-only assessment: a default build offers no
+convenience lane at all — the YouTube and archive.org tiles are not shown,
+a pasted URL plays only from the viewer's own origin or their node (any
+other server is refused with the reason; PLAY FROM <host> does not exist
+there), and the cabinet's CDN opt-in (§9) is not offered — while the
+convenience code stays in the tree behind one build flag,
+`VITE_SSF_CONVENIENCE_LANES=1` (`src/sovereignty.ts`, read literally at
+build time the way the treasury's network pin is), for the day it is wanted
+again. The file, karaoke, screen and torrent tiles are the sovereign lanes
+and land on their own schedule (§11). The table below describes every lane
+as designed; the Convenience rows, PeerTube among them, exist only in a
+build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
+
+| Tile | Who fetches the bytes | Reaches the screen as | Sync | Class | Posture |
+|---|---|---|---|---|---|
+| ▶️ YouTube | each viewer, from YouTube | iframe, IFrame API | full | Convenience, single vendor | allowed, labelled, greyed out when unreachable; `youtube-nocookie.com`; no other feature may require it; on the desktop shells gated on §3.5's error-153 check — until it passes, the tile may fail from `tauri://localhost`, which v1's theatre reports as a lane failure with RETRY (browsers are unaffected) |
+| 🏛️ archive.org | each viewer (direct `<video>`, or via the node proxy for a texture) | `<video>` / `VideoTexture`, or their embed | full (a chosen file) / start-time (their embed) | Convenience host, sovereign backup exists | later, not v1: the item's `licenseurl` shown and a marked-PD shelf (v1's resolver accepts any identifier and reads only the file list and the title); every fetch offered to the station library |
+| 📺 PeerTube | the instance named; a station can run its own | iframe, embed API (`play`/`pause`/`seek`) | full | Convenience, or player-run | behind `VITE_SSF_CONVENIENCE_LANES=1` in every case (§12): an instance is a server whoever runs it, and the default build plays serverless sources only; with the flag on, add it as the player-run answer to "YouTube-shaped" content |
+| 🔗 URL | the host named | `<video>` | full for finite, seekable media (a host with range support); start-only for a live stream or a host without usable ranges — the element's `seekable` decides, and the controller never seeks what cannot be sought | Convenience | whoever pastes it is responsible for it; each viewer's browser fetches it only after PLAY FROM <host> (§3.2), never from a host that names a private network as written — a screening of the literal host — and, for a consented host, only once a CORS HEAD probe that follows no redirect has answered directly (§3.2: it fails closed, so CORS-clean hosts only; the destination after DNS, and the GET's own answer, stay the proxy's to check, §3.4) — and only within the mount budget (§3.2) |
+| 📁 File (host's own) | host node → blob lane → viewers' nodes | `VideoTexture` from the local node | full | Pure P2P | private rooms, delete-on-leave cache |
+| 🧲 Magnet / `.torrent` | the host node from the public swarm, then the blob lane (§6) | `VideoTexture` from the local node | full | Public swarm for the fetch, pure P2P for the room | paste only, no search, no tracker list, seeding notice |
+| 🎤 Karaoke MP3+G | the singer's client (§5) | CD+G on the `CanvasTexture` + audio through Web Audio | full | Pure P2P | the host's own files; stream, don't copy |
+| 🖥️ Screen share | the host, live (§4) | `VideoFrameTexture` | live | Pure P2P | the #189 lane |
+
+### 3.4 Rendering paths
+
+- **Path A — an iframe on a CSS3D plane** (YouTube, archive embed, PeerTube).
+  The three.js `css3d_youtube` pattern: a `CSS3DRenderer` layer behind the
+  WebGL canvas, the canvas clearing transparent, a `NoBlending` "hole" mesh on
+  the screen plane so avatars occlude it. Works with the orthographic camera.
+  Costs: `renderer.ts` sets an opaque `scene.background` that must move to the
+  CSS layer; no lighting or CRT shader on the iframe; its audio cannot enter
+  the Web Audio graph; the iframe swallows pointer events. And the canvas
+  itself is opaque today: `renderer.ts` builds its `WebGLRenderer` without
+  `alpha: true` (line 74), so moving the background alone would leave the
+  drawing buffer opaque and the hole hidden — the spike recreates the
+  renderer with alpha enabled and clears with alpha 0, and only then moves
+  `scene.background` into the CSS layer.
+- **Path B — a `<video>` into a `VideoTexture`** (node-proxied mp4, local file,
+  blob, torrent). Lit, occluded, shader-able (the #194 CRT pass only works
+  here: the picture tube #256 gave the cabinets, `arcadeCrt.ts`, is a material
+  on the screen mesh, which a `VideoTexture` can wear and an iframe cannot),
+  audio through the `partyAudio.ts` graph with distance falloff. Needs
+  CORS-clean bytes: a `/api/media?url=…&cap=…` range pipe on the node. The
+  pipe is a **request gate, not a response header**: the listener's existing
+  origin allowlist (`wt_listener.rs`, `origin_allowed`) only decides whether
+  `Access-Control-Allow-Origin` is emitted and serves the GET regardless —
+  right for a fingerprint, wrong for a fetcher, because a `<video src>` or a
+  no-CORS request from any page that can reach loopback would still make the
+  node download whatever the URL names, bandwidth and CPU spent on a response
+  the page can never read. So the proxy requires a **node-scoped capability
+  token**: minted by the node at launch (random, per launch, never
+  persisted) and delivered over a channel only the app's own page can read
+  — NOT `/api/fingerprint`, whose allowlist (`origin_allowed` in
+  `ssf-p2p-node/src/main.rs`) admits any loopback origin on any port, so
+  that a dev server or another app's local UI could read a token served
+  there; that loopback-wide rule stays for the fingerprint, and for
+  development builds, and gates nothing of the proxy's. In the desktop shell
+  the node is another PROCESS — spawned by the shell, or already running
+  (`src-tauri/src/main.rs`, `acquire_p2p_node`), the shell holding only an
+  HTTP placeholder for it — so the hand-off crosses that boundary where the
+  OS already authenticates, and the boundary is the OS USER, stated so that
+  nobody reads more into the token than it holds: it keeps PAGES out
+  (another origin that can reach loopback — a dev server, another app's
+  local UI, a page in the user's browser — the boundary a browser enforces
+  and the one the proxy's gate is for), and it keeps out every OTHER USER's
+  process on a shared machine; it does not and cannot keep out another
+  process running as the same user, which can read the node's identity key
+  in the same data dir, its room caches and the shell's memory, and needs
+  no proxy to fetch a URL — no file mode, environment variable or pairing
+  secret moves that line (a spawned node's environment is readable from
+  `/proc/<pid>/environ` by its own user), so the design claims nothing
+  against it. Within that boundary the hand-off is a PAIRING, in both
+  modes, and never port occupancy: the node writes the token at launch to
+  a file in its per-user data dir readable by that user alone (a spawned
+  node also takes a pairing secret from the shell's environment and writes
+  the file under it), and the shell's Rust side reads the file and, before
+  it hands the token to anything, PROVES the listener holds it — a fresh
+  32-byte random challenge to `POST /api/media-cap/prove` on the node's
+  HTTP origin as the shell discovered it, answered with
+  `HMAC-SHA256(key = token, msg = "ssf-media-cap-v1" ‖ challenge)` and
+  checked against the token the file gave, the token itself crossing HTTP
+  in neither direction — and only then hands it to its own webview over
+  `invoke`, never over HTTP. Today `acquire_p2p_node` takes whatever has
+  UDP 4443 bound for the node and points the page at `127.0.0.1:8080`
+  regardless, and a port is not a user's: on a shared machine the first
+  process to bind it wins, whoever runs it. So a listener that cannot
+  answer the proof — another user's process on the port, a stale file
+  from a launch that crashed, a legacy node without the module — is
+  UNPAIRED: the shell hands its webview no token, the tile says PROXY
+  UNAVAILABLE and nothing fetches, and the rest of the shell carries on
+  as it does today (the pairing gates the proxy and the `/blob` route and
+  nothing else; this plan widens nothing else). The proof runs once per
+  launch and again whenever the node's HTTP origin is re-discovered (8080
+  taken, 8081 found) or a request comes back 401 — a cap the listener
+  does not know, so the listener changed — and a node that exits or fails
+  a re-proof revokes the page's token: the shell tells its webview, the
+  lane goes unavailable, and no further request carries the cap. What
+  remains is the cap travelling in a query string to whatever answers
+  that port at request time: a process that takes the port between the
+  proof and a request learns the cap from the first request — a same-user
+  process, outside the boundary above, or another user's after the node
+  has exited, which the revocation covers but for the requests in flight;
+  the cap is bound to the origin it was proven on (scheme, host, port) and
+  sent to no other, and the listener binds loopback alone. "Readable by
+  that user alone" is a creation property, never a tightening after the fact, and it
+  is defined per platform: on Unix, mode 0600 at creation
+  (`OpenOptions::mode(0o600)` with `create_new`); on Windows, where a mode
+  means nothing, a security descriptor set at creation whose DACL is
+  protected — it inherits nothing from the directory — and grants the
+  owning user's SID alone. The directory it lives in is owner-only the same
+  way — mode 0700 on Unix, a protected DACL granting the owning SID alone
+  on Windows — created so and verified so by writer and reader alike
+  before any token is written or read, since ownership alone says nothing
+  about who else may rename into, replace or delete from a directory. The
+  file is written under a temporary name in the same directory and renamed
+  into place with the platform's atomic replacement — `rename(2)` on Unix;
+  on Windows `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, or
+  `SetFileInformationByHandle` with `FileRenameInfoEx` and the
+  replace-if-exists and POSIX-semantics flags, which is what Rust's
+  `std::fs::rename` wraps there, verified on the target toolchain by the
+  spike and failing closed (no token, no proxy) where it cannot replace an
+  existing file — so no reader sees a half-written token and the previous
+  launch's file is replaced by the rename, never left behind, and it is
+  removed on a clean exit. The reader opens the final path without
+  following links (`O_NOFOLLOW`; on Windows `FILE_FLAG_OPEN_REPARSE_POINT`
+  with any reparse point refused) and checks the open handle, not the
+  path: a regular file, owned by the user, with the mode or DACL above,
+  and on Unix the inode the directory entry names, so a swapped, linked or
+  stale file is refused; a shell that finds the file or its directory
+  wider than owner-only refuses it and reports, and the proxy is
+  unavailable. In the EMBEDDED
+  mode — no sidecar found, the shell starting its own `wt_listener` and HTTP
+  API in-process (`src-tauri/src/main.rs`, `NodeMode::Unavailable`) — there
+  is no boundary to cross: the shell mints the token itself and hands it to
+  its webview over `invoke`, with no file. Whichever listener answers, the
+  gate is ONE module — the token check, the `Origin` / fetch-metadata rule,
+  the address classifier and the socket pinning in a crate both the node
+  and the embedded listener compile in, with one table of test cases — or
+  the proxy does not exist in that listener: an embedded listener without
+  the module answers `/api/media` with 404 and the lane is unavailable
+  there, never the direct URL, so the two HTTP implementations never
+  diverge in what they let through. `tauri://localhost` on macOS and Linux, and
+  `http://tauri.localhost` on Windows (§2), is every Tauri app's origin on
+  that platform and names nothing on its own, so possession of the token
+  is the authority and the origin list only a filter. A browser page, in development, gets it from a dedicated
+  `/api/media-cap` endpoint whose allowlist is the EXACT origins named in
+  `SSF_ALLOWED_ORIGINS`, never a loopback wildcard. Where no such channel
+  exists — a node whose data dir the shell cannot read, an external node
+  that fails the pairing proof, a page on an origin the list does not
+  name — the proxy is unavailable and so is the lane:
+  the tile says PROXY UNAVAILABLE and nothing fetches, never a fall back
+  to the direct URL, which the proxy retires (the critical-path item's
+  done-when in the TODO: the browser's direct fetches of those URLs are
+  gone). Until the proxy exists, v1's consent-only direct URL is the lane
+  as shipped, behind the flag; once it exists, there is no direct path.
+  The proxy's own
+  `Origin` check is that same exact list, a filter behind the token. The
+  token is carried in the URL
+  because a `<video>` cannot set a header, with the element in CORS mode
+  (`crossOrigin = 'anonymous'`):
+  that is what makes a cross-origin `<video>` send `Origin` at all — a plain
+  cross-origin `<video src>` sends none — and what a `VideoTexture` needs
+  anyway, since a non-CORS video taints the canvas it is drawn to. A
+  SAME-origin GET sends no `Origin` even in CORS mode, and that is the very
+  deployment §3.5 proposes (the UI served from the node's own HTTP origin),
+  so the gate reads `Origin` where there is one and fetch metadata where
+  there is not: a request with no `Origin` is admitted only with
+  `Sec-Fetch-Site: same-origin` — the header every current browser sets and
+  no page can forge — and refused otherwise. A missing or wrong token, a
+  disallowed `Origin`, or no `Origin` without that same-origin metadata, is
+  a 403 **before any DNS lookup or outbound connection**; `/blob` follows
+  the same rule (§4). Only then the
+  URL itself — its scheme `http:` or `https:` and nothing else, and an
+  EMPTY userinfo, no username or password in it — checked on the initial
+  URL and again on every redirect target, the `Location` resolved against
+  the current URL first and then judged whole, before any lookup or
+  connection for it: a `file:`, `ftp:`, `data:`, `blob:` or `javascript:`
+  target, or a URL with credentials in it, ends the fetch (the gate makes
+  this check itself and trusts no earlier one of the record's, since a
+  redirect is the host's and not the record's; and an HTTP client that
+  turned userinfo into an `Authorization` header would break the
+  built-from-nothing rule below, so no URL with userinfo reaches the
+  client at all); then the
+  host allowlist, which is a GRANT TABLE on the node and nothing static —
+  not archive.org's entry either: an ORIGIN (scheme, host and port, the
+  key `acceptMediaOrigin` in `tvConsent.ts` already keeps the viewer's
+  consent under, for the session) enters it only when the viewer's own
+  page, after PLAY FROM <host> (§3.3, behind the flag), posts it through
+  the same gate as any proxy request — `POST /api/media-grant`, under the
+  cap and the `Origin` or fetch-metadata rule — and under a PAGE SESSION
+  of its own, since the cap is the node's, one per launch and shared by
+  every tab on the app's origin, so a grant keyed by origin alone would
+  let a second tab play from a host the first consented to, and the node
+  could not tell when the consenting page had gone: at start each page
+  asks the node for a session (`POST /api/media-session`, under the cap
+  and the gate) and receives an unguessable 32-byte `sid`, held in that
+  page's memory only — never in storage a sibling tab could read — and
+  LEASED: the page beats it every 30 s (`POST /api/media-session/beat`),
+  a session 90 s without a beat lapses, and the page ends it on
+  `pagehide` with a beacon (`/api/media-session/end`), so a closed tab's
+  consents die within a minute and a half at most; a grant is keyed by
+  (`sid`, origin), every `/api/media` and `/blob` request carries `sid`
+  beside `cap` (both in the URL, since a `<video>` sets no header — the
+  cap's residual, bound to the proven origin), and an `/api/media` request
+  whose `sid` holds no live grant for the UPSTREAM URL's origin is a 403
+  before any lookup — `/blob` needs no grant: its origin is the node's own
+  and it fetches no upstream (§4: it serves what the store holds or is
+  fetching and starts nothing), so the cap, a live `sid` and the `Origin`
+  or fetch-metadata rule admit it, the hash being the name — so a consent is one page's, as `acceptMediaOrigin`'s set is one page's
+  today, and a sibling tab, another room in it or a reload of the same
+  tab starts with none; a grant leaves the table when its session ends
+  or lapses, when the viewer forgets consents (the page ends its session
+  and opens a new one), or after twelve hours at most, whichever comes
+  first; at most thirty-two live origins per session and sixty-four live
+  sessions per node, a further one refused with the reason. The record's `url` grants
+  nothing: a URL on an origin without a live grant is a 403 before any
+  lookup, the record only prompting the OFFER of consent, as v1's tile
+  does, and a node that restarts has an empty table, so a page answered
+  403 NO SESSION or NO GRANT opens a session anew, re-grants from its own
+  consents and retries. A
+  REDIRECT to another origin is followed only if that origin holds a
+  live grant of its own; otherwise the fetch ends with the reason and the
+  host (REDIRECTED TO <host>), the tile offers PLAY FROM <that host>, and
+  a consent there grants it and retries — a same-origin redirect needs
+  nothing new. That is the per-origin consent v1 approximates from the
+  browser with the CORS HEAD probe, which the proxy retires with the
+  direct path — and, because a loopback service that fetches URLs is an
+  SSRF surface, the node resolves the name ITSELF and validates every
+  address the answer holds: an IPv6 address that carries an IPv4 inside is
+  normalized to that IPv4 first — IPv4-mapped and IPv4-compatible forms;
+  6to4 (`2002::/16`, the IPv4 in bits 16–47) and Teredo (`2001:0::/32`,
+  the server's IPv4 in bits 32–63 and the client's in the last 32,
+  inverted — both judged by what they carry, since either reads as global
+  unicast on paper and `2002:7f00:1::` is loopback in fact); ISATAP
+  (RFC 5214) under ANY prefix — an interface identifier of `0:5efe` or
+  `200:5efe` in bits 64–95 with the IPv4 in the last 32, so a globally
+  scoped outer address names a private or loopback host on a site with
+  ISATAP routing — judged by that IPv4 the same way; and
+  any address under a NAT64 prefix: the well-known `64:ff9b::/96` and
+  `64:ff9b:1::/48`, and the network's own, learned the RFC 7050 way by
+  resolving `ipv4only.arpa` and reading the prefix off the AAAA answer
+  (`64:ff9b::a9fe:a9fe` is global unicast on paper and the metadata address
+  in fact) — and then anything that is not a global unicast address is
+  refused — loopback, private, link-local, the metadata address,
+  unspecified, carrier-grade NAT, multicast, broadcast, documentation and
+  reserved ranges, IPv6 unique-local and link-local alike (a denylist of a
+  few classes is a list of what was remembered; the rule is an allowlist of
+  global unicast and nothing else). Where the NAT64 discovery cannot run, or
+  its answer is not one the node trusts, IPv6 destinations are refused
+  outright, which costs nothing where IPv4 reaches the same host. The
+  classifier is a pure function with that table of cases as its tests —
+  loopback, private, link-local and the metadata address under every one
+  of those encodings, mapped, compatible, 6to4, Teredo, ISATAP in both
+  of its interface-identifier forms, and NAT64 alike —
+  and
+  the node PINS the socket to
+  a vetted address: it connects to the IP with the original name kept as
+  `Host` and SNI, and the HTTP client never resolves the name again on
+  connect — a rebinding resolver would answer the check with a public
+  address and the connect with a private one, so "validated after DNS"
+  alone checks one answer and connects on another. On EVERY redirect and
+  every retry the whole gate runs again from the top: the scheme and
+  userinfo check, then the grant table on the new target's origin (a
+  grant of its own under the request's `sid`, above) before any
+  lookup, then the resolve, validate
+  and pin
+  (redirects capped) — an allowed host can redirect anywhere, and a redirect
+  that is not re-admitted is the end of the fetch. A size ceiling, a timeout
+  on both ends of the pipe (an upstream that stalls, a reader that stops
+  reading) and a cap on concurrent fetches. The REQUEST upstream is built
+  from nothing, never copied from the browser's: in the same-origin
+  deployment the browser's request carries the app's own cookies and
+  whatever `Authorization` it holds, so the proxy sends an allowlist of its
+  own making — GET or HEAD, `Host`, `Range` (with `If-Range`,
+  `If-None-Match` and `If-Modified-Since` as validators), a fixed
+  `User-Agent`, `Accept: */*` and `Accept-Encoding: identity` — and nothing
+  else: no `Cookie`, `Authorization`, `Origin`, `Referer` or fetch-metadata
+  header reaches a media host. Identity encoding is forced, and an upstream
+  answer that carries `Content-Encoding` anyway is refused, since an encoded
+  body breaks the byte offsets `Content-Length` and `Content-Range`
+  promise. And the RESPONSE is bytes, never
+  the upstream's headers: the proxy forwards an allowlist of them only —
+  `Content-Type` (checked against an allowlist: `video/*`, `audio/*`,
+  `application/octet-stream`, and `application/zip` with
+  `application/x-zip-compressed` for the cabinet's ROM sets, §9 — a text,
+  HTML, script or image type ends the fetch, since nothing the proxy
+  serves is ever a document), `Content-Length`, `Content-Range`,
+  `Accept-Ranges`, `ETag`,
+  `Last-Modified` — and drops everything else, `Set-Cookie`,
+  `Clear-Site-Data`, `Content-Security-Policy`,
+  `Strict-Transport-Security`, `Location` (a redirect is followed under the
+  gate above, never handed to the browser), `Link`, `Refresh`,
+  `WWW-Authenticate` and every `Access-Control-*`, `Cross-Origin-*` and
+  `Cache-Control` among them, minting its own CORS, `Cache-Control:
+  private, no-store` and `X-Content-Type-Options: nosniff`; in the
+  same-origin deployment §3.5 proposes, a forwarded cookie or
+  `Clear-Site-Data` would act on the app's own origin, and a media host
+  could set the app's cookies or wipe its storage. It answers only a
+  subresource fetch (`Sec-Fetch-Dest` of `video`, `audio` or `empty`, with
+  `Content-Security-Policy: sandbox` on the response besides), never a
+  navigation, so nothing an allowed host serves is ever rendered as a
+  document of the app's origin. A hostname allowlist alone closes nothing,
+  a response header gates nothing, and a check the connect does not reuse
+  protects nothing.
+- **v1 ships neither on the in-world plane.** The first slice draws the status,
+  menu, countdown and now-playing card on the in-world `CanvasTexture` and plays
+  the actual video in a **theatre panel** (DOM) that anyone in the room opens
+  from the TV, the phone, or a HUD chip while seated. A `<video>` in a DOM
+  panel needs no CORS, so archive.org files and direct URLs get full sync
+  without any node change — for finite, seekable media, §3.3's rule: a
+  live stream or a host without usable ranges plays start-only, the
+  element's `seekable` deciding, and the controller never seeks what
+  cannot be sought. The CSS3D in-world plane is spike S1 (§11).
+
+### 3.5 Tauri checks before the in-world iframe
+
+- YouTube **error 153** is a referrer problem: on macOS and Linux Tauri serves
+  the UI from `tauri://localhost`, which sends no `Referer`. It gates TV v1 on
+  those shells, not only the in-world iframe: v1's theatre is itself an IFrame
+  API embed from the same origin. Until the three-shell check passes, v1's
+  defined state on a shell that fails is the lane-failure notice with RETRY
+  and nothing else depending on it (browsers are unaffected). No
+  `referrerpolicy` is a remedy: a document loaded from `tauri://` has no
+  HTTP(S) referrer to send whatever the policy says — Tauri's own tracker
+  confirms that even `unsafe-url` produces none for the custom protocol — so
+  the spike does not spend itself there. `youtube-nocookie.com` stays, for
+  privacy. The remedy to measure is serving the UI from an http(s) loopback
+  origin — the node's HTTP origin as the frontend discovered it (8080, or
+  8081 when 8080 is taken; never a fixed port) — which also makes the proxy
+  same-origin but moves the app's storage origin, so it is a measured
+  decision — and moves Tauri's IPC boundary with it: `invoke` is what hands
+  the webview the media token, the shell's commands are registered in
+  `src-tauri/src/main.rs` (`invoke_handler`), and a page on an http(s)
+  origin reaches them only through Tauri's remote-domain IPC access, which
+  is off by default and must not be opened wide. S1 verifies that the
+  loopback origin — chosen at run time, so the capability must name the
+  node's actual origin, never a wildcard — can reach exactly the commands
+  it needs (the media-token command, the fingerprint one) and no other, and
+  that no other origin reaches any; if Tauri cannot scope it that narrowly,
+  the token travels another way (the shell injects it into the page at
+  load) and the IPC stays closed.
+- The Linux webview (WebKitGTK) is the weakest: codecs via GStreamer; WebCodecs
+  from 2.44; WebRTC reportedly absent in many builds. Treat Linux as "embeds
+  and mp4" until verified.
+
+### 3.6 Content classes (from the first note on #186; class 3 restated to match §4)
+
+1. Public-domain and Creative Commons films: any room.
+2. Free embeddable web video via the platform's own player: any room.
+3. The host's own DRM-free files: small private rooms, carried by the blob
+   lane as a TRANSFER and not a stream (§4): each viewer's node fetches the
+   file, verifies it by hash and holds it in a cache bounded by quota,
+   playback starting before the transfer ends, the copy deleted on leave
+   and never kept past the room's cache quota — never a copy the viewer
+   keeps as a file of their own; the live WebCodecs lane (§4, step 2) is
+   the stream path, for what is not a file: screen share, karaoke, calls.
+4. Never: paid platform content (DRM captures black), re-broadcast captures of
+   YouTube, ripped discs, Tribler/torrent search as a built-in catalogue.
+
+## 4. The media lane: two steps, then subscriptions
+
+**Step 1 — the blob lane (bytes, not a stream).** Add `iroh-blobs` to the
+node (v006 §12.1 already pins it; the `'asset'` envelope kind is reserved for
+it). The host's node imports a file as a BLAKE3 blob; viewers' nodes fetch it
+(verified, resumable, in order, so playback can start early) and serve it to
+their own webview at `/blob/<hash>?cap=…` with range support, behind the
+same request gate as `/api/media` (§3.4): the per-launch capability token,
+the page's live session (`sid`) and an allowed `Origin` — or
+`Sec-Fetch-Site: same-origin` in its place, the proxy's rule — checked
+before any read of the store, the element in CORS mode so that a
+cross-origin one sends an `Origin`; and no ORIGIN GRANT, which is
+`/api/media`'s for an upstream — this route has none, its origin is the
+node's own, and the hash is the name. Every `/blob`
+response carries `Cache-Control: private, no-store` (the proxy's responses
+the same): a webview's HTTP cache keeps the ranges it was served, and
+without the header delete-on-leave and eviction would remove the store's
+copy while a second, unquotaed one lived on in the cache — the node's store
+is the only copy, under the quotas. The route
+serves only what the store already holds or is fetching and never starts a
+fetch itself — CORS only governs who may read a response, a `<video src>`
+needs none to make the request, and a hash is no secret once a room record
+carries it, so the hash alone authorizes nothing and without the gate any
+page that can reach loopback could drive reads against the viewer's node.
+A hash alone starts nothing: a fetch
+needs a provider, as an `iroh-blobs` `BlobTicket` carries one beside the
+hash and format. The ticket's `NodeAddr` bundles a relay URL and direct
+addresses with the node id for convenience; here the id is ALL that
+travels — no dial hints, signed or not. A signature binds a claim to its
+signer and proves nothing about who answers at an address: a member could
+sign {its own id, a victim's address} and have every automatic viewer send
+a QUIC handshake there, which is exactly why the node's inline
+mesh-upgrade dial takes a gossip-learned peer by id with EMPTY hints
+(`ssf-p2p-node/src/main.rs`, the TIER_INTRODUCED dial: "the signature
+covers the payload + author, NOT the iroh_node_id / direct_addrs") — and
+why that is not yet the rule: the node's OTHER automatic dial keeps the
+hints. A signed `roster`, `px` or `mesh-join` payload carries
+`relay_urls` and `direct_addrs` per member, `dispatch_control` records
+each as a graft candidate WITH those hints, and the mesh loop's GRAFT
+dials the candidate with them as given (`dial_peer_with_retry`), so an
+admitted member's claim about another member's address — or about its
+own — aims a handshake wherever it likes, automatically. And the node's
+BOOTSTRAP dial is a third: the browser copies the room's boot record —
+the primary member's and the whole roster's relay URLs and direct
+addresses, room-written — into every envelope it sends its node
+(`src/network/YjsSync.ts`, `iroh_relay_urls`, `iroh_direct_addrs`,
+`iroh_member_hints`), and the node's WT reader dials each hinted member
+with them as given, before it checks the envelope at all (its M4 dials);
+and an imported INVITE is a fourth, the one source that exists before any
+room state: a pasted pass, or a `?seed=` link opened on load —
+`decodeBootstrapSeed` (`src/main.ts`) takes the invite's `memberHints`
+and their addresses as given, the import is registered at once and the
+page enters the lobby with no press, the boot record carries them, and
+the page's first envelope hands them to the node, which dials them as
+above; a pass's `sigB64`, where one is present and checked, binds the
+invite to its issuer and proves nothing about who answers at an address,
+so a link in a chat has the node of whoever opens it send handshakes
+wherever the link says;
+the envelope's signature, where it is checked, is the local page's own
+and vouches for no address. And the empty
+hints close the RELAYED hint and not the reflection: with empty hints
+iroh resolves the id through the Mainline DHT, where the id's OWNER
+publishes its own signed address record (the node's `DhtAddressLookup`,
+`AddrFilter::unfiltered`), so a member that signs a room envelope under
+an id it owns, having published a victim's address under that id, still
+has every node that hears the envelope send its QUIC handshake there —
+automatically, on the envelope alone, before any consent. All three dials
+are therefore a PREREQUISITE of this section, not a given: an AUTOMATIC
+dial carries no peer-supplied hint at all — a candidate learned from a
+roster, px or mesh-join, or a member the browser's bootstrap envelope
+hints, is dialled by id, the payload's addresses discarded, the
+envelope's two hint fields reduced to ids and those ids admitted and
+budgeted before any dial (a member's self-reported address is a claim like any other:
+the signature proves it is theirs, not that they answer there) — and
+"admitted and budgeted" is arithmetic the reader does in constant work
+per hint, under the room lock, before any lookup and before any
+`tokio::spawn`, since today the WT reader spawns one `dial_peer_with_retry`
+ladder per distinct hinted id as the envelope arrives, bounded by nothing
+but the single-flight set (`hub.dialing`: one ladder per id at a time, any
+number of ids), and does so before the signature check, which on that lane
+is the local page's own and gates nothing: **(i)** an envelope's roster
+hints — the room's, or an imported invite's, (v) below — are admitted up to `ROOM_HINT_CAP` = 32 ids, the primary counted,
+the rest dropped with the envelope kept and the drop logged once a minute
+per room; **(ii)** an admitted id that is not connected, not already
+dialling and not under backoff joins the room's pending dial queue, a FIFO
+of `DIAL_QUEUE_CAP` = 64 de-duplicated by id, a full queue dropping the
+newest; **(iii)** ladders start from the queue alone, into
+`DIALS_IN_FLIGHT_ROOM` = 4 slots per room and `DIALS_IN_FLIGHT_NODE` = 16
+per node (a ladder holds its slot from spawn to its last attempt), at
+most one new ladder a second per room with a burst of four, so a stream
+of envelopes each naming fresh ids spawns no faster whatever it carries;
+**(iv)** per id, a ladder that fails backs off 60 s before the queue may
+hold that id again, and after four failed ladders in a session the id is
+dialled automatically no more (a join the player asks for resets it);
+**(v)** the hints an imported invite carries start no dial on import or on
+page load: the page registers the invite and shows the JOIN card — the
+room, the host's id, the number of members it names — and dials only on
+the press, one join the player asked for, under the same caps and the
+per-address bytes budget below, the invite's addresses used for that join
+alone and dropped once the room's signed envelopes name the roster (a
+pass's signature, where present and checked, binds it to its issuer and
+vouches for no address), so a crafted link costs its opener nothing until
+they press, and then at most what their own join may send;
+and the graft dial of a gossip candidate (`CANDIDATE_CAP` = 256 already
+bounds the map it is drawn from) starts through the same queue and
+slots, so the two paths share one bound, the per-address bytes budget
+below riding under all of it; a hinted dial kept for what the viewer
+asked for, under the budget below — and
+the mesh-upgrade dial of a gossip-learned id goes to a route observed on
+an authenticated connection where one exists (the hub's, or the
+connection the envelope arrived on when its peer is the origin), and
+otherwise through discovery under exactly the per-id, per-address and
+global dial budget below — bytes counted at the socket, backoff, the
+pending queue and in-flight slots above. That dial is the ONE automatic
+handshake this
+design lets discovery place, and it is a decision, not an oversight: a
+member who joins a room consents to its mesh — the dial reaches the ids
+the room's own signed envelopes name, and spends nothing a fetch would
+spend, no bandwidth on content and no disk — and what the budget bounds
+is the reflection, a victim's address receiving at most the budget's few
+datagrams a minute from each member and never a handshake storm; a rate
+limit makes nothing consensual, which is why the FETCH lane's rule below
+is the stricter one and stands apart: a fetch places no automatic
+handshake through discovery at all. Until the node dials so, neither
+rule holds for the mesh, and the fetcher's gate alone is not the whole
+fix. So
+the `blob` source (§3.1) and a library
+op (§7) carry the hash with the importing node's iroh id, and a viewer's
+node resolves that id to a route in two classes, kept apart. A route it
+observed ITSELF on an authenticated connection with that id — the importer
+is a connected member when the record first appears, a `have` announcer is
+connected by definition, and iroh keeps what it saw — is the only route an
+AUTOMATIC fetch (one the viewer did not ask for: the cap and budget below)
+ever dials. In a hub-and-spoke room that route is usually the HUB, not the
+importer: a spoke's node holds one authenticated connection, to its hub,
+the record reaches it through that hub, and a `have` counts only on its
+announcer's own connection, never relayed — so an automatic fetch at a
+spoke has exactly one admissible route, its hub, and runs only once the
+hub holds the blob: the hub prefetches what its spokes will play as an
+explicit step of its own, under its own cap and budget (below), and
+announces `have` on each spoke's connection once it holds the whole blob.
+A spoke whose hub does not hold it gets a FETCH button, and that consent
+is what admits a discovery route. A hub vouching for the importer's
+address — a route handoff — was considered and refused: the hub's word
+about another node's address is exactly the claim the id-only rule exists
+to reject. A route from discovery is a peer-authored hint like any other:
+on the sovereign Mainline DHT a node publishes its OWN signed address record
+(`ssf-p2p-node/src/main.rs`, the `DhtAddressLookup`), so a holder could
+publish a victim's address under its own id as surely as it could write one
+into a room record, and mDNS and a relay are no better — so such a route is
+dialled only for a fetch the viewer asked for (the FETCH button, the
+library's explicit resolution of a seeder nobody is connected to), under a
+per-id, a per-address and a global rate limit with exponential backoff and
+no retry storm — and the bound is on BYTES SENT, never on attempts
+counted: a QUIC connect is not one datagram, since loss recovery
+retransmits the Initial on every probe timeout until the handshake gives
+up, so the node budgets what actually leaves its socket per destination
+address — a handshake lifetime of three seconds (the dial abandoned at
+that deadline, not at the transport's own idle timeout), at most four
+handshake datagrams of 1 200 bytes within it (the Initial and its
+probe-timeout retransmissions, counted at the socket, the dial cut at the
+fourth), and at most two attempts a minute per address. The most a
+victim's address can be made to receive is eight datagrams, under 10 KB,
+a minute from each viewer who chose to fetch, whatever the handshake's
+timers do — the standing cost of any id-to-address lookup on a public
+DHT, iroh's included — which is bounded here and never claimed closed. A viewer's node never sends an
+automatic handshake FOR A FETCH to an address anyone merely wrote down,
+in a room record or a DHT record alike; the one automatic handshake
+discovery ever places is the mesh-upgrade dial of a room member's id
+(above), under the same budget, and a fetch adds none to it. A provider reachable by neither class is not
+reachable, and the record says who else to ask: every node that
+completes the blob announces `have` for the hash on the room's control
+plane (a sibling of the `media-sub` kind) — an announce that is evidence
+only on the announcer's own authenticated connection, accepted from the
+link whose iroh handshake proved its node id, never relayed as someone
+else's word, and dialled, again, by that id. The hints in the room's
+member records are the bootstrap roster's: `YjsSync` copies the primary
+member's and the whole roster's `irohRelayUrls` and `irohDirectAddrs`
+from the room's boot record — room-written — into every envelope it
+sends its node, outside the signed part (`src/network/YjsSync.ts`), and
+the node bootstrap-dials each hinted member with those addresses as
+given, before it checks the envelope at all (`ssf-p2p-node/src/main.rs`,
+the WT reader's M4 dials) — a signature there proving only that the
+local page sent it, never that the addresses are the members' own, so a
+member who writes a victim's address into the roster has every member's
+node send it a handshake. The blob lane dials from none of them; that
+bootstrap dial, with the mesh's graft dial, which today still dials a
+roster, px or mesh-join candidate from the hints it came with, are the
+prerequisite above — the envelope's two hint fields reduced to ids,
+admitted and budgeted before any dial (the roster cap, the pending queue
+and the in-flight slots above, enforced in the reader before any lookup
+or spawn), their addresses discarded, as the gossip candidates' are. A library seeder's signed entry (§7)
+names its node id, dialled the same way. So the fall-back to a seeder
+nobody is connected to is a dial by id through discovery — never to an
+address a stranger supplied — and holding is proven by serving bytes the
+hash verifies, never by a claim. A viewer resolves a
+hash to the nodes that hold it: the ticket's provider while it is still
+here, else any announcing holder — a hub among them only when it chose to
+hold the blob, since `iroh-blobs` moves bytes from provider to requester
+directly and relaying for a spoke puts nothing in the hub's store: a hub
+prefetches what its spokes play as an explicit step under its own cap and
+budget, and announces `have` only once it holds the whole blob — else the
+station library's seeders (§7). A provider that
+leaves mid-transfer, stalls (no progress for 10 s, or under a floor rate
+for 30 s), fails a request or serves bytes the hash rejects is replaced by
+the next holder from the next range on — a `have` is any peer's claim, so a
+holder that lied or stalled is remembered and not tried again this session
+— and the hash verifies every byte, so any honest holder is as good as the
+host, and the host leaving does not end the film for those still fetching.
+No re-encode, every platform; the countdown spreads the host's upload
+before T0. Honest caveat: a transfer, not
+a stream — delete-on-leave cache and private rooms keep it in the shape of
+sending a friend a file. And the record is peer-writable, so a fetch is never
+automatic beyond a cap AND a budget: the source carries its declared size; a
+viewer's node fetches on its own only when the declared size fits a
+per-transfer `autoFetchCap` the viewer sets AND what is left of a cumulative
+`autoFetchBudget` — the bytes fetched without asking, per room and per
+session (a FETCH button otherwise: a declaration larger than the remainder
+would download partially and abort, spending the remainder for nothing),
+with one automatic transfer in flight per room, a byte rate ceiling, and —
+since a byte budget bounds no number of requests — an automatic-transfer
+count per room and per session, a minimum charge per transfer against the
+byte budget (a thousand empty blobs still cost what verifying and indexing
+them costs), and a cache-entry count limit per room and global, under
+per-room and global cache quotas, with cancellation and delete-on-leave. The budget exists because a
+cap alone bounds one transfer: a peer rotating through fresh under-cap
+hashes would spend a viewer's bandwidth without end while cache eviction
+kept the disk quota honest; a spent budget makes every further fetch an
+explicit FETCH, and eviction never refills it. And the declared size, being
+peer-written, is only a hint, so every transfer runs under a hard byte
+ceiling of its own. Three numbers, kept apart: the cap and the budget say
+what fetches *without asking*; a fetch the viewer approved runs to the
+`approvedLimit` the FETCH button showed them — the declaration itself,
+and the button is offered only when the declaration FITS the quota they
+have left, that whole amount reserved against the quota at the press and
+released if the transfer fails — never to the cap, which would abort the
+very transfer they agreed to, and never to a limit below the declaration,
+which would be a transfer that cannot succeed (bytes past the limit abort
+it, and a blob ending under it fails the size check below); a declaration
+larger than the remaining quota gets no FETCH button but the reason, NOT
+ENOUGH QUOTA with the two sizes, and nothing starts. An automatic fetch's
+ceiling is its declaration,
+already fitted under the cap and the remainder by the rule that let it
+start, so the ceiling never cuts short a transfer it began; an approved
+one's is its declaration, reserved; received bytes past the ceiling abort
+the transfer, and a completed blob whose size differs from the
+declaration is rejected either way.
+Nobody in a room can spend another viewer's bandwidth or disk beyond the
+allowance that viewer set for automatic fetches — the cap, the budget and
+the count above, spent only on sources that fit them, and a peer-written
+record can empty that allowance and no more — and nothing past it without
+asking, one FETCH per transfer. The same lane later carries room assets, ROMs and the
+station library (§7) — the cabinet owner's game file first: #248 passes it
+through the room document until this lane exists (`arcadeRomShare.ts`,
+§9), which is why the document bound in the media-control part below
+waits on this lane.
+
+**Step 2 — the live lane.** `new VideoFrame(canvasOrVideo, {timestamp})` →
+WebCodecs `VideoEncoder` / `AudioEncoder` (Opus), each chunk's bytes
+carrying its timestamp, its type and its decoder-configuration generation
+in the authenticated header below (`copyTo()` gives the bytes alone) →
+**end-to-end encryption in
+the sender's page** → WebTransport unidirectional streams, one per video
+frame, each carrying one signed frame and verified whole; 20 ms Opus frames
+(or a batch of three) as datagrams, one signed frame or batch per datagram
+→ node → iroh fan-out as
+a `media` lane the node and every hub forward without being able to read →
+viewers' `VideoDecoder` → three.js `VideoFrameTexture` — added upstream in
+r173 (January 2025, `src/textures/VideoFrameTexture.js`), after the r167
+the prototype pins (`three` 0.167.1), so the
+video lane carries a three.js upgrade with a regression pass of the
+renderer (the hole-punch spike touches the same file), or, until it lands,
+an equivalent uploader on r167: each decoded `VideoFrame` drawn into an
+`OffscreenCanvas` behind a `CanvasTexture`, one copy a frame, enough at
+arcade resolution — and viewers'
+`AudioDecoder` (Opus), both decoders configured from the signed
+`media-config` message (below) → a 60–120 ms jitter buffer ordered by the
+chunks' timestamps → the Web Audio graph,
+spatialised at the source's position. A keyframe every ~2 s plus
+keyframe-on-request — a request being a signed control message from an
+AUTHENTICATED subscriber of that source (one from a link the source is
+not admitted to is dropped at ingress and charged to the link, under the
+control budget like any control message), and COALESCED per source: the
+sender answers every request pending with ONE keyframe at the encoder's
+next opportunity, never sooner than a minimum forced-keyframe interval
+of one second after the last keyframe it emitted, periodic or forced,
+and a hub forwards at most one request per source per interval upstream,
+the rest folded into it — so sixty-four subscribers asking in a loop
+cost the sender one keyframe a second and each hub one message, and the
+tier's rate ceiling stands over a forced keyframe as over every frame
+(the encoder keeps it inside the frame budget at that frame's quality),
+so a request can move a keyframe earlier and never push the source past
+its tier.
+
+**Encrypted end to end, not hop by hop.** WebTransport and iroh encrypt each
+hop, and a forwarding hub terminates one hop and opens the next, so "opaque"
+framing alone would let a hub read every Opus frame and video chunk it
+relays. v006 §9's rule for forwarded voice stands: forwarders see only
+ciphertext (the WebRTC path met it with Encoded Transform; here the sender
+does the same by hand on WebCodecs output — the SFrame shape, RFC 9605).
+Each frame is sealed with ONE suite, pinned rather than negotiated —
+AES‑256‑GCM through WebCrypto, the one AEAD every browser's `crypto.subtle`
+has and hardware-backed; a version byte in the header names the suite, v1
+is this, and a receiver that lacks a version drops the frame and reports —
+under a per-LEG key: a source has an audio leg and a video leg, and each
+leg's key and nonce salt are derived by HKDF‑SHA‑256 from the 32-byte
+per-source media key with the key epoch (4 bytes, big-endian) as the salt
+and `"ssf-media-v1" ‖ leg (1 byte) ‖ "key"` or `‖ "salt"` as the info, 32
+and 12 bytes out; the 96-bit nonce is the leg's 12-byte salt XOR the
+64-bit frame counter, big-endian in the low 8 bytes (the SFrame
+construction), and each leg counts its own frames, so two legs never
+share a nonce space under one key — one key with two independent encoder
+counters would reuse a nonce, which breaks the AEAD outright. The
+associated data is the header exactly as it goes on the wire, fixed to
+the byte: version (1) ‖ source (32) ‖
+leg (1) ‖ key epoch (4, big-endian) ‖ counter (8, big-endian) ‖ timestamp
+(8, big-endian `i64`: the chunk's WebCodecs `timestamp`, a signed 64-bit
+microsecond count, on the source's one capture clock, which both legs
+share — a sender starts that clock at zero or above and a receiver drops
+a negative value as malformed, so the sign bit is never set on the wire
+and Rust and TypeScript read the field alike; and since a signed source
+controls every non-negative value, the jitter buffer is bounded by
+ARRIVAL and never by the source's clock: its playout position is
+anchored to arrival time and slewed on its own occupancy as any jitter
+buffer's is, a frame whose timestamp lies more than the jitter window
+plus 500 ms ahead of that position is dropped as out of horizon rather
+than held until its time comes, one behind it by more than the window is
+dropped as late, and the buffer holds at most twice the window's frames
+at the tier's rate (eight at least) and twice the window's bytes at the
+tier's ceiling per source, the frame farthest ahead dropped first past
+either cap — so a far-future timestamp, inside every wire budget,
+neither stalls playback nor grows the buffer) ‖ config (2, big-endian:
+the generation of the decoder configuration the frame decodes under) ‖
+flags (1: bit 0 the keyframe, bit 1 a batch) — 57 bytes — and the
+signature below covers that header and the ciphertext with its tag. The
+counter is for the nonce, the replay window and loss, never for time:
+`copyTo()` hands the page encoded bytes only, and a chunk's timestamp, its
+type and the decoder's configuration travel beside them or a receiver
+cannot rebuild an `EncodedAudioChunk` or `EncodedVideoChunk` at all — so
+the timestamp is here, authenticated with the rest: the jitter buffer
+orders by it, a pause is a gap in it rather than a slip, a screen share's
+irregular frames keep their own times, and audio meets video by
+subtraction on the shared clock (a batch carries its first chunk's
+timestamp in the header and each chunk's duration in its table, below —
+never inferred from a packet's TOC byte, which gives the duration of ONE
+frame while a code-3 packet carries several — so chunk k starts at the
+header's timestamp plus the durations before it, and so a batch holds
+only CONTIGUOUS chunks of one generation: the sender flushes it before a
+chunk whose timestamp is not the last chunk's plus its duration — a
+pause, a dropped capture — and before a reconfiguration, so a gap is
+never closed into adjacency and no chunk is labelled with another
+generation's configuration); the keyframe bit is the
+chunk's type; and the configuration
+goes on the reliable lane, below, named by its generation. The source is an INSTANCE, never
+the sender's key: one identity may publish voice, a screen share and an
+arcade feed at once, and each is its own source with its own subscriber
+set, media key, epochs and counters — `source = BLAKE3("ssf-media-src:v1\n"
+‖ sender key (32) ‖ u16-BE length ‖ room (UTF-8) ‖ u16-BE length ‖ kind
+(UTF-8) ‖ a 16-byte instance nonce)`: a versioned domain tag first, as
+`signBytes.ts` puts one before every envelope it signs, so the digest is
+this protocol's and no other's, and the two variable-length strings
+length-framed, so Rust and TypeScript hash the same bytes and no pair of
+room and kind can collide with another (both are newline-free tokens, but
+a length is cheaper to get right than a rule) — and the strings are
+BOUNDED where they enter, since a 16-bit length frames nothing longer than
+65 535 bytes and today `decodeBootstrapSeed` (`src/main.ts`) takes any
+non-empty `roomId` while the node's envelope reader (`SsfEnvelope`,
+`room: String`) checks no length either: a room id is at most 64 bytes of
+UTF-8 (the station mints `module-` and six hex digits, 13 bytes), a kind
+at most 16, a cabinet id at most 64, a member's node id 64, a relay URL
+128 with at most four per hint, a direct address 48 with at most eight per
+hint — one table of maxima in `signBytes.ts` and `main.rs` with a test
+each, enforced at bootstrap ingress (a pass or `?seed=` link naming a
+longer room is INVALID PASS), in the page's envelope builder, and in both
+readers, where a field past its bound is a protocol violation whatever
+the frame's length, dropped and charged to the link; §9's P2 session info
+frames its room and cabinet id under the same bounds — declared in the sender's
+signed source announcement on the control plane, which binds the id to
+the sender key, the room, the kind and the nonce; a frame's signature is
+verified against the key that announcement names, resolved once per
+source and never read from the header. The DECODER CONFIGURATION travels
+the same way, not in the frame: a signed `media-config` message per
+(source, leg, generation) on the reliable lane — for video the codec
+string, the coded width and height and, where the codec wants one, the
+`description` bytes; for audio `opus`, the sample rate, the channel count
+and the Opus head beyond two channels — signed by the sender's identity
+key like the announcement, forwarded verbatim by every hub, naming the
+counter of the first frame it governs; the generation rises on every
+reconfiguration (a resolution change, a codec change) — for video always
+at a keyframe, so the decoder is reset on a frame it can start from; for
+audio at the first chunk after the new configuration, Opus having no
+keyframes (there is no chunk type to wait for), the receiver resetting
+its decoder there and muting the 80 ms of pre-roll RFC 7845 names before
+its output is clean — and it never wraps: a sender whose next reconfiguration would pass 65 535
+announces a new source instance first (a fresh nonce, id and key — as a
+counter about to wrap takes a new epoch, and §9's input sequence takes a
+new seat), so a generation names one configuration for the life of the
+instance and never aliases an older signed `media-config`; a
+receiver holding frames of a generation it has no configuration for waits
+the jitter window for the message and then drops them; a `media-config`
+that fails its signature is dropped and counted against the link like a
+frame — and the reliable lane that carries it is bounded BEFORE any
+signature is checked, as the datagram lane is below. Media control
+travels on a stream of its own, opened with a one-byte preface naming
+the class, so its ceiling — 4 KiB per message — is known from the first
+byte and enforced on the length prefix before a byte of the body is
+allocated (the node reads into a fixed buffer and resets the stream,
+counting it, when the prefix says more) — and a ceiling on bytes bounds
+no stream that sends none: a read DEADLINE runs from the stream's
+ACCEPTANCE, not its first byte — a second for the preface and the length
+prefix, the budget's share for the whole message — a stream past it
+reset and counted against the link like a frame, and the streams a link
+may hold open unclassified or unfinished are capped per link (the
+session's unidirectional-stream limit, which the receiver dictates and
+the sender cannot exceed: the media cap below plus a few for control),
+so an authenticated peer that opens every stream it is allowed and
+sends nothing, or a byte at a time, holds those slots for a second and
+then none; the shared reliable readers,
+which carry `ysync` as well — a whole Yjs baseline is one frame — keep
+their own kinds and get a GLOBAL ceiling of their own, the largest frame
+any kind may carry (the document bound below plus the envelope), enforced
+on the prefix the same way — and under the same read DEADLINE from the
+frame's acceptance, since a ceiling on bytes bounds no frame that never
+finishes: the length prefix within a second of the stream's acceptance
+or the previous frame's end, the body within the ceiling over the link's
+floor rate (the largest frame at 1 Mbit/s is twelve seconds; the
+deadline fifteen), the stream reset and the link charged past it; the
+body read into a buffer that grows with what arrives and is never
+allocated at the declared length — and grows GEOMETRICALLY (capacity
+doubled when full, or the chunks kept in a list and joined once when
+the declared length has arrived), never a fresh allocation and a copy
+of every byte held per chunk, so reassembly is amortized linear and the
+bytes copied for a frame are at most twice its length whatever the
+fragment size: a frame under the ceiling cut into one-byte fragments by
+a peer is the CPU half of the same attack, inside both the size and the
+time limit; and one unfinished frame per shared
+stream, two per link, so a frame declared and never sent holds a
+bounded buffer for fifteen seconds and then nothing — since today
+`ssf-p2p-node/src/main.rs` allocates the declared length of a reliable
+frame as it stands and reads it with `read_exact` and no deadline
+(lines 1813–1818, the ysync reader, and 2886–2891, as of main `330c692`), so an admitted peer
+can make a node allocate 4 GiB for one frame by declaring it, or hold a
+reader task for ever by never finishing one: that is a hole the node
+has with or without media, and the reader hardening — the ceiling, the
+buffer grown as bytes arrive, the deadline from acceptance, the
+unfinished-frame cap — is its own CRITICAL-PATH item in the TODO and a
+prerequisite of every lane that rides the reliable stream, never
+something that waits for the audio spike; the browser's `YjsSync` reader
+(`#readIncoming`) comes under the same ceiling and the same deadline,
+since it too reads until the declared length has arrived, keeping the
+bytes so far, with no deadline — the stream cancelled and the link
+re-dialled past it — and under the same amortized-linear reassembly,
+since today it allocates `buffer.length + value.length` and recopies
+every byte it holds on every read (`src/network/YjsSync.ts`, lines
+478–481 as of main `330c692`), so a 1.4 MB frame delivered in tiny
+fragments costs quadratic copying on the main thread while staying
+inside both limits — the chunks kept in a list and joined once at the
+declared length, or a buffer of geometric capacity, the prefix parsed
+from the first four bytes without a join, and a regression test that
+delivers a frame at the ceiling in one-byte fragments and bounds the
+bytes copied to twice its length, beside the half-frame test — and
+never the 4 KiB class,
+which would reset a room's sync before its kind was read. That ceiling
+rests on a
+DOCUMENT bound the sender enforces, never on a number borrowed from
+elsewhere: today nothing bounds a room document — the room cache merely
+skips persisting a snapshot past 1 000 000 bytes (`roomCache.ts`), while
+`YjsSync` frames and accepts a baseline of any `u32` length — so a ceiling
+drawn from the cache's cutoff would reset the sync of every live room that
+had outgrown it. So the page bounds the document itself: its encoded
+state (`Y.encodeStateAsUpdate`, after Yjs's garbage collection of deleted
+content) is held under 1 000 000 bytes by ADMITTING each local write
+before the live document sees it — a Yjs transaction mutates the live
+document synchronously and has no rollback, so a measure taken after one
+refuses nothing: the oversized state is already there, and undoing it
+writes more history — and the admission is therefore a STAGING step:
+every local room-document write goes through one helper (`roomWrite(fn)`,
+the only local writer; today some forty files under `src/` call
+`transact` on a document directly, tests among them, and a test scans for
+a `transact` or a Y-type mutation outside the helper, the way
+`editMode.test.ts` scans for a room-document write outside the owner
+gate), which runs `fn` in a transaction on a SHADOW document kept in
+lockstep with the live one — a client id of its own, synced to nobody,
+fed every update the live document applies, remote or local, as it is
+applied — captures the update the shadow transaction emits, measures the
+shadow (the running measure below: the last exact measure plus this
+update's bytes as the upper bound, the exact re-measure where that rule
+asks for one), and only if the result stays under the bound applies that
+same update to the live document (`Y.applyUpdate`, under the helper's
+origin), so the live document never holds a state past the bound for any
+reader, persister or frame to see; past it the shadow is rebuilt from the
+live document's state and nothing reaches the live document — the room
+says ROOM FULL with the write's size, and the owner compacts it, a fresh
+document from the current state with its history dropped, to write again
+— the same number the cache persists up to, so
+persistence and sync agree; a room found past the bound at load (one from
+before the rule) is synced read-only until compacted; and `YjsSync`
+refuses to emit a frame past the bound, so the reliable frame ceiling is
+that bound base64-expanded plus the envelope's fields at their maxima —
+1 333 336 bytes of base64 for the bound; `room` 64, `kind` 16, `author`
+44 and `sig` 88 in base64, `v` and `seq`; the hint fields at
+`ROOM_HINT_CAP` = 32 members of at most 64 + 4 × 128 + 8 × 48 bytes each
+with their JSON, under 40 000 in all (the identifier bounds above, which
+is what makes the sum a number) — so 1 400 000 bytes holds with room to
+spare, and a frame past it is a protocol violation, never a large room. A
+chunked baseline (SyncStep2 in bounded pieces) was the alternative, not
+taken: it bounds the frame and never the document, and the document is
+what every reader must hold. **Enforced only once the cabinet's file has
+left the document.** Since #248 the owner's own game file is sent to a
+player who presses play THROUGH THE ROOM DOCUMENT (`arcadeRomShare.ts`:
+up to 8 MiB in 64 KiB chunks under `romc:` keys, eight a tick at the 2 Hz
+arcade beat, deleted once nobody asks, so a delivered file leaves the
+document and its cache — the one file path between pages while the
+`asset` envelope kind stays reserved, §4), so a live document passes
+1 000 000 bytes, honestly and transiently, for as long as a transfer
+runs, and a baseline taken during one carries the whole file. A bound
+enforced today would refuse the sender's chunks as ROOM FULL, the
+receiver's measure below would drop them, and the frame ceiling would
+reset a late joiner's sync. So the ROM share moves to the blob lane first
+(§4, the lane the cabinet's file was always to ride; §9), or to another
+transport outside the document, and until it has, no replica enforces
+the bound, the cache goes on skipping the snapshots it cannot hold, and
+the readers' ceiling is PROVISIONAL: the hardening above lands now — the
+deadlines, the geometric buffers, the unfinished-frame caps, the field
+maxima — under a prefix ceiling of 16 MiB (16 777 216 bytes), what a
+baseline carrying the cabinet's whole 8 MiB file base64-expanded can
+reach, with room, so no valid cabinet transfer or late-join baseline is
+refused; the 1 400 000-byte ceiling comes with the bound, in the same
+change as spike `#18`'s migration, which is that ceiling's explicit
+predecessor. And the bound holds at the RECEIVER too, in
+both replicas, since a local-write check binds only honest pages:
+`YjsSync` applies every inbound update as it arrives
+(`src/network/YjsSync.ts`) and the node's replica does the same
+(`main.rs`, `apply_update`), so a peer could grow both without limit in
+frames under the ceiling. Each replica keeps a running measure of the
+document — the last exact measure (`encodeStateAsUpdate` after garbage
+collection, taken at load, again after every sixty-four applied
+updates or 256 KB of them, and after any update that released pending
+structs) plus the lengths of the updates applied since AND the bytes
+the pending set retains, since an update adds at most its own length
+and a dependency's arrival integrates at most what was waiting on it —
+so the measure bounds the document whatever a small update releases,
+and the frame ceiling drawn from the bound holds — and refuses an
+inbound update that would carry the measure
+past the bound: dropped unapplied and charged to the link like a
+malformed frame (an update that depended on it waits in Yjs's pending
+set — which `encodeStateAsUpdate` does not encode, so a re-measure
+alone would drop it from the account: the pending set has a HARD BUDGET of
+its own in both replicas, 256 KB of retained pending update and
+delete-set bytes per document, never reset by the re-measure and
+counted in the running measure as if applied, past which the whole pending set is
+dropped and the link that filled it charged — an honest dependency is
+re-sent with the next sync step, a flood is not — and cleared with the
+room; the node's replica keeps the same account over its pending
+structs), the room read-only, ROOM FULL, until compacted. Compaction is a new DOCUMENT
+EPOCH: the owner signs `room-compact { epoch, at, root }` — a fresh Yjs
+document built from the current state, its epoch carried in every
+`ysync` envelope beside the room id — accepted only under an
+AUTHORIZATION ROOT a replica can verify without the room's say-so,
+since the epoch switch discards every older update: the room's
+pass-anchored owner key (`ownerPubB64` in a `RoomBootstrap` v3 pass,
+verified under its `sigB64` — the off-chain ownership root item in the
+TODO, its step 1), or a key the chain-verified authority head names
+where the room has one (§7); never the key the peer-writable
+`roomInfo.owner → players[…]` chain resolves to, which any member can
+point at themselves and which therefore authorizes nothing. A room with
+no verifiable owner — every legacy room until that pass lands — cannot
+be compacted: past the bound it stays read-only until it has one, and a
+`room-compact` from any other signer is dropped and charged to the link
+like a forged op. That ownership root is a PREREQUISITE of the bound's
+compaction, as it is of the library's removals. A replica that has seen
+the compaction rejects any update stamped with an older epoch, so an old
+peer's history never merges back in: it resyncs from the new baseline
+under the new epoch, its unsent writes lost (what the owner's
+compaction warns of), and the node relays no envelope whose epoch is
+older than the room's. The bound is on what a replica HOLDS, and the
+epoch is what makes a compaction stick. A control-message budget
+per link in messages and bytes a second (the renewals its admitted
+subscribers owe plus a fifth, with a floor for a fresh link; that count
+times the ceiling) drops a message past it unverified and counted; and
+the configuration's fields are checked after
+the signature and before any decoder sees them — the codec string against
+an allowlist (`opus`; `vp8`, `vp09.*`, `av01.*` and `avc1.*` for video,
+nothing else, and never longer than 64 bytes), the coded width and height
+each between 16 and 4 096 and their product within the tier's pixel
+ceiling (1 280 × 720 for the desktop tier; the arcade tier is a native
+retro screen and takes no more), the `description` at most 1 KiB and
+present only where the codec takes one (an `avcC` or `av1C` record;
+Annex-B H.264, VP8 and VP9 carry none), the sample rate 48 000 and the
+channel count 1 to 8 with the Opus head present exactly when it is above
+2 — so a configuration outside these never reaches `configure()`, and a
+pathological one costs the receiver a dropped message, not a decoder; and
+senders use codecs whose keyframes are self-describing (VP8, VP9, AV1,
+H.264 in Annex-B form), so a keyframe and its configuration are all a
+late joiner needs. A leg's counter is the SENDER's for
+the whole epoch, never the encoder's: it lives outside the encoder and
+survives every pause, restart and reconfiguration (§9 and spike `#21` restart
+encoders for the first subscriber), so a restarted encoder goes on from the
+counter it left. Epochs and counters live together in the sender's page
+state, and the epoch only rises within an instance; a counter about to wrap
+takes a new epoch — a fresh media key, sealed again, as any rotation —
+before the next frame. A sender that has LOST that state (a page reload, a
+crash) has lost the instance: it cannot know which epochs or counters the
+old source used, so it never continues it under any epoch — it announces a
+NEW source instance (a fresh 16-byte instance nonce, hence a new source id
+and a new media key, every subscriber subscribing afresh), and the old
+source ends as a departure does. A nonce is never reused under one key,
+because no key outlives the state that counts under it. The frame counter is the nonce, and
+the routing header — source id, leg, key epoch, counter, keyframe flag — is
+the associated data and is under the sender's signature below, so a hub can
+relabel nothing: a frame moved to another leg or another counter neither
+opens nor verifies. The header is all the node needs to route (the
+subscriber set), to serve the glimpse tier (the keyframe flag) and to drop,
+and it gets nothing else. The sender mints the source key and seals it to
+each subscriber on the reliable lane when the subscription is accepted —
+one construction, pinned, so Rust and TypeScript derive the same bytes and
+a key message can be substituted for no other: HPKE as RFC 9180 defines
+it, base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and
+ChaCha20-Poly1305, a single-shot `Seal` of the 32-byte media key to the
+subscriber's static X25519 key, derived from their Ed25519 identity by
+the libsodium conversion (`crypto_sign_ed25519_pk_to_curve25519`; on the
+page `@noble/curves`'s `edwardsToMontgomeryPub` for the recipient's public
+key on the sender's side and `edwardsToMontgomeryPriv` for the recipient's
+own private key when it opens — the library has no `edwardsToMontgomery`),
+the KEM's own
+all-zero check refusing a low-order point, with `info = "ssf-media-key:v1\n"
+‖ source id (32) ‖ epoch (4, big-endian) ‖ recipient identity key (32)` and
+the same bytes as the AEAD's associated data, so a sealed key opens only
+for the recipient, source and epoch it names; on the wire `media-key {
+source, epoch, recipient, enc (32, the encapsulated key), ct (48) }`,
+signed by the sender's identity key under the domain tag
+`ssf-media-key:v1` as every envelope `signBytes.ts` signs is, so a hub can
+neither forge one nor move one between recipients or epochs, a message
+whose signature or opening fails dropped and charged to the link; the
+HPKE runtime is the PAGE's alone — `@hpke/core` with `@hpke/dhkem-x25519`
+(hpke-js ships the X25519 KEM as a package of its own; `@hpke/core` alone
+constructs no DHKEM(X25519) suite), or
+the RFC's four steps over `@noble/curves`, `@noble/hashes` and
+`@noble/ciphers` — since the media key is minted and sealed in the
+sender's page and a recipient's identity secret never leaves its browser
+(`keypair.ts`): a node carries the sealed message as it carries the
+ciphertext, and could neither seal nor open one without key material it
+is not meant to have; the Rust `hpke` crate appears only in a test-vector
+harness, never as a runtime dependency of the node, and the page's
+implementation and that harness are held to one fixture of test vectors
+(RFC 9180's for the suite, ours for the envelope) — and
+rotates to a new epoch before every admission (the admitted can open
+nothing from before it: a key handed out mid-epoch would open the ciphertext
+a joiner, or a hub that later joins as a member, had already logged — which
+is the guarantee below that a forwarding node reconstructs no audio), on
+every departure (the departed can open nothing after it — under a
+departure storm, the one exception stated with the churn budgets below,
+nothing past two seconds) and on a timer. A
+join and a leave each cost one rotation — a sealed key per subscriber on
+the reliable lane — which at room scale is nothing, until one member makes
+a habit of it; so the transitions are defined once, enforceably, and the
+two guarantees never meet. Membership is per IDENTITY, not per link: a
+second tab, or a re-dialled link, of a member who holds the epoch's key is
+the same member — no transition, the key resent to the new link. A
+DEPARTURE is a member whose last lease has been gone for the grace window
+(5 s: a lapsed lease renewed inside it was a flap, and the member never
+left) or who said leave; it rotates AT ONCE — the sender emits under the
+new epoch from its next frame — and from that rotation the departed can
+open nothing: there is no resuming an epoch, and a return is an ADMISSION
+like any other — with ONE exception, stated below with the churn budgets
+and nowhere else: a source under a departure STORM batches its rotations,
+and a member departed under one may open up to two seconds of frames
+before the batched rotation shuts it out. A lease is renewed against the SENDER'S clock, never a
+clock of its own, or a hub between them could stockpile a live
+subscriber's renewals — each valid on its signature and its rising
+sequence alone — and release one a lease period after the subscriber had
+gone, the sender seeing no lapse and rotating never, the departed
+decrypting on: so the sender emits a signed BEAT every 2 s on the
+reliable lane (`media-beat { source, epoch, beat, nonce }`, the beat
+number rising, the nonce 16 fresh random bytes, under
+`ssf-media-beat:v1`, forwarded by hubs as a `media-config` is), a
+renewal is the subscriber's signature over the LATEST beat's nonce
+besides the rest of its tuple (and the origin node's countersignature
+over the same, below), and the sender accepts a renewal only for its
+current beat or the one before it — a renewal in flight across a beat
+boundary is honest, an older one a lapse in progress — and at most ONCE
+per subscriber and beat, a second under the same beat dropped as the
+replay it is. A stockpile is then worth at most the two beats a hub
+already holds, each usable once, so a departed subscriber's lease lapses
+within one beat interval past the grace — 9 s at the outside against 5
+— and never later; a hub that withholds the beats lapses every spoke
+behind it and is charged for the lapses as below; and the beat runs
+through a paused source as through a playing one, since it is a message
+of its own and never inferred from the frames. Admissions are the side
+that is batched: a joiner is
+pending until the next admission boundary (at most 2 s away), when one
+rotation admits every pending joiner — with the key BEFORE the frames,
+never after. The sender seals the new epoch's key to every subscriber, old
+and new, on the reliable lane; switches its emission to the new epoch once
+the current subscribers have acknowledged the key, or 500 ms later for any
+that have not (they drop what they cannot open and catch the next
+keyframe); and the sender's node starts routing frames to a joiner only
+once that joiner's node has reported the key installed. A receiver holds
+no frame it has no key for: a frame of an unknown epoch is dropped, and an
+old-epoch frame that arrives reordered after the switch is opened with the
+old key, which is kept for the jitter window (120 ms) and then discarded —
+so a live voice stream is never a buffer stale, and the frames from before
+a joiner's admission, which it was never meant to open, it never sees. So
+a departure is never delayed, and admissions cost one rotation per interval
+however many join.
+What bounds a member who leaves and returns on purpose is counted at three
+scopes, since an identity is free to mint: per identity, past three
+departures in a minute it is parked — its next admission waits out a
+backoff that doubles each time, and its leaves and returns trigger nothing
+meanwhile; per ORIGIN NODE — the node a subscriber's page is connected
+to, which signs every lease it forwards with its own iroh key
+({subscriber identity, origin node id, lease epoch, sequence, the beat
+nonce the renewal answers}, end to end to the sender under the hub's
+relay; the control plane of `#21`), so the
+origin is never the hub's word: a lease without a valid origin signature
+is charged to the hub link alone, a departure counts against an origin
+only when the origin signed it (its page gone, reported by the node that
+saw it go), and a LAPSE — renewals that stopped arriving — is charged to
+the link that carried them, the hub's, since a hub that withheld an
+honest origin's renewals would otherwise park the honest origin; a
+principal a shared hub connection is not — but NOT one a fresh key cannot
+change: a node's id is a key the node mints for itself, and mints again
+wherever it finds no `iroh_node_id.key` (`ssf-p2p-node/src/main.rs`,
+`load_or_create_secret_key`: a new working directory is a new node), so a
+holder of the room key mints origins as cheaply as identities, and the
+per-identity and per-origin budgets catch honest churn and the careless
+flooder, never a minting member — stated as that. What holds against one
+is counted where a key is not the principal: per LINK, at the node that
+holds it — a link is a connection that node admitted, and its connection
+admission (a cap on the links it holds, a rate on new ones: the control
+plane's to enforce, `#21`) bounds how many minted links arrive and how fast
+— and per SOURCE, below: the sixty-four cap, the batched rotations, the
+storm report. Such a member can fill a source and make it rotate at the
+batched rate, stated as the cost; it cannot take the source down, make a
+rotation cost more than the cap, or open a frame it was not sealed to. A
+principal a fresh key cannot change — the one these budgets and the slot
+sharing below bind to by right — is a MEMBERSHIP CREDENTIAL the room's
+authority issues: the owner or co-host keys of the room's verified
+authority head signing a member's identity key with an expiry
+([chia-authority-architecture.md](chia-authority-architecture.md), once its
+§3 verification is executable), presented with each lease and checked by
+every node that admits; named here as what those rules move to the day
+it exists, identity and origin being the heuristics they bind to until
+then:
+past six departures a minute
+across every identity behind one origin, that origin is parked — its
+identities evicted in ONE rotation, their re-admissions waiting out the
+doubling backoff together — so a client minting identities interrupts a
+source six times before it must mint an origin too, and the honest spokes
+behind the same hub are not touched. The quota is enforced in layers, each parking only
+the offender: a hub applies it to each spoke's link at the hub before
+relaying anything (a spoke's departures count against that spoke, never
+the hub), the sender applies it to the origin a lease names, and the
+sender keeps a budget on the hub LINK itself regardless of the origins
+behind it — a hub minting origins beside identities, each a fresh key
+that signs its own leases, would keep every one under six: past one
+departure a minute per admitted subscriber behind the link, plus six, the
+link is parked and everything behind it evicted in one rotation, room an
+honest hub with many spokes never needs and a lying one cannot stay
+inside; a hub that keeps relaying a parked origin's churn is parked the
+same way, an honest hub having parked the spoke first; and
+source-wide, past thirty rotations a minute the sender batches further
+departures into one rotation every two seconds and reports the storm —
+the ONE exception to the rotation at once that the departure rule above
+promises, and stated there too: under a storm a departed member can still
+open at most two seconds of frames, the cost, rather than the sender's
+whole budget going to rotations. A
+subscriber cap per source (sixty-four identities; the hubs' aggregation
+keeps the forwarding tree beneath it) bounds what any rotation costs: one
+sealed key per subscriber, a few milliseconds of X25519 and a few
+kilobytes at the cap — and the cap is SHARED OUT among MEMBERS, never
+first-come, once a member is a principal a fresh key cannot mint (the
+membership credential above), since the churn budgets count departures,
+and a holder of the room key who admitted sixty-four minted identities
+and kept their leases alive would fill the source without one departure,
+every honest listener after it refused for good. The sharing is
+incremental and stays inside the cap (a fixed share per member cannot:
+sixty-four slots hold no floor of eight for a ninth): at every node that
+admits — the sender for the links it holds, a hub for its spokes' within
+the slots the sender granted it — a member's FIRST identity takes a
+reserved slot: a free one when there is one, else the newest admission of
+the member holding the most, which is evicted (told the source is full
+for it, free to ask again as a joiner) — one eviction per arriving
+member, never more, and none when every member holds one alone, since
+then the source is full and the newcomer waits for a departure; a
+member's further identities (its tabs) take free slots in the order asked
+and are never made room for; a freed slot goes first to a member waiting
+for its first, the longest wait first, then to the identities asking in
+order. So one member may hold many slots only while nobody else asks,
+gives one back to each newcomer that finds the source full, and never
+keeps a newcomer out: sixty-four members each hold their one. The
+eviction is keyed to the credential and to nothing a member can mint — on
+a link or an identity it would be the attack it answers, a member minting
+links to displace an honest hub's spokes one per link — so UNTIL the
+credential exists the eviction is off: slots are first-come under the
+cap, a freed slot goes to the longest-waiting joiner, a room-key holder
+can fill a source (the cost stated above), and the enforceable bounds are
+the per-link and per-source ones, the heuristics of eight identities per
+origin and three departures a minute per identity still catching the
+careless. Replay protection is a sliding window per leg and
+epoch, the SRTP shape: a leg's counter only ever goes up within an epoch, a
+new epoch starts a new window, and a new instance is a new source with
+windows of its own (a reloaded sender is a new instance, above, never an old
+source resumed); a receiver keeps, per leg, the highest counter it has
+accepted and a bitmap
+of the last 128 below it, takes a frame above the highest (and
+slides the window up), takes a frame inside the window that the bitmap has
+not seen, and drops a duplicate or a counter older than the window — so
+frames that arrive out of order across streams are played once, and a
+replayed one never. Origin, not only membership: a shared key proves that a
+frame came from someone holding it, and every subscriber holds it — so any
+subscriber could forge frames as the source, and with a high counter push
+genuine frames out of the window. The sender therefore signs every frame:
+an Ed25519 signature by the sender's identity key — the key the room
+already knows the source by — over a versioned domain tag,
+`"ssf-media-frame:v1\n"`, then the frame's header and ciphertext: the tag
+first, as `signBytes.ts` puts one before every envelope it signs, so the
+signature is this message class's and nothing else the same key signs
+(an announcement, a lease, a beat, a `media-config`, each under a tag of
+its own: `ssf-media-announce:v1`, `ssf-media-lease:v1`,
+`ssf-media-beat:v1`, `ssf-media-config:v1`) can
+be replayed as a frame, nor a frame as one of them — verified before
+anything is decoded or played. Nothing plays
+unauthenticated, a lost datagram costs only itself, and a forged frame
+fails verification and is dropped and counted (reported when it keeps
+coming) — never a reason to drop the source, since any member could inject,
+and dropping would hand each of them a way to silence any speaker. The
+replay window advances on verified frames only. Authentication bounds
+nothing by itself, so the lane has budgets enforced on the node BEFORE any
+signature is checked, on the authenticated ingress link FIRST — the
+WebTransport session or iroh connection a frame arrived on — in one
+aggregate bucket per link whatever source ids its frames carry, since a
+source id is what a flooder forges and a bucket per id would multiply the
+allowance: the link's packet-rate and byte-rate ceilings are the sum of
+the tiers of the sources it is admitted for (the publisher's registered
+sources on a browser link, the subscribed sources on a mesh link) plus a
+fifth, and a frame past them is dropped unverified. Inside that
+aggregate, per-source tier buckets, nested: a frame-size ceiling per leg
+from the source's announced tier (an audio frame's ceiling is its tier's
+payload bound — the tier's bitrate over 20 ms with twofold VBR headroom:
+160 bytes for the 32 kbps voice tier, 640 for the 128 kbps music tier —
+plus the 137-byte overhead, so 297 and 777 bytes; each chunk of a batch is
+held to the same bound, and the sender packs a batch to a ceiling the whole
+PATH carries, never to the size its own session negotiated
+(`maxDatagramSize` speaks for the browser's hop alone, and a hub forwards
+ciphertext as it is, unable to re-batch what it cannot open, so a batch
+that fitted the first hop would be dropped at a smaller one): 1 100 bytes
+of datagram payload, the protocol's fixed ceiling, under the 1 200-byte
+UDP payload every QUIC path must carry (RFC 9000 §14.1) less the packet's
+own headers and the node's envelope at any hop — three voice frames (630
+bytes with the overhead) always, a music frame (777) alone; a video frame
+one WebTransport unidirectional
+stream of its own, per the wire path above, read only up to the tier's
+frame-size ceiling and verified whole before it is forwarded — never
+fragmented into datagrams, which would need fragment ids, loss handling
+and reassembly before any hub could check the signature — and, since a
+stream is state the receiver holds until it ends, a cap on the streams a
+link may hold open UNFINISHED (per link, set as the session's own
+unidirectional-stream limit, which the receiver dictates and the sender
+cannot exceed; and per source inside it, a few frames' worth: the frames
+a keyframe at the ceiling spans on the wire at the tier's rate, half a
+second's, plus the tier's frame rate times the jitter window) and a
+deadline from a stream's ACCEPTANCE — never its first byte, since a
+stream that sends nothing holds its slot as surely as one that trickles
+— to its end, derived from what an
+honest frame can take, not from one frame interval — a keyframe is many
+intervals long on the wire: the video frame-size ceiling is half a second
+of the tier's rate (187 kB on the 3 Mbps desktop tier, 50 kB on the
+0.8 Mbps arcade tier, the most a keyframe at that rate is), and a 100 kB
+keyframe takes some 270 ms at 3 Mbps against a 33 ms interval at 30 fps,
+so a deadline of one interval would reset honest keyframes — the ceiling
+over the tier's rate (half a second: what an honest sender at its tier
+needs for the largest frame it may send), plus the link's measured round
+trip capped at one second as slack, and never more than two seconds
+whatever the tier, since a sender trickling a stream a byte at a time
+would otherwise hold its state for as long as the ceiling allows — a
+stream past either is reset, its bytes discarded and the reset counted against
+the link's failed-verification budget below, since a publisher holding a
+thousand streams open with a byte each would spend the receiver's memory
+and stream state under every rate ceiling here; and a stream whose bytes
+pass the ceiling is reset at that byte, the frame never assembled), and
+packet-rate and byte-rate ceilings per source with
+a short burst allowance, per tier and counted on the WIRE — the tier's
+codec rate plus the per-frame overhead (the 57-byte header, the 16-byte
+tag and the 64-byte signature: 137 bytes a frame, 55 kbps at 50 frames a
+second, more than voice itself, which is why three Opus frames may ride
+one header, tag and signature, framed by a count, length and duration table inside
+the plaintext) plus a fifth: about 105 kbps for the 32
+kbps voice tier and about 220 kbps for the 128 kbps music tier signed
+frame by frame, a third of the overhead when batched, and 50 frames a
+second plus the batch allowance either way — the sender's frame being
+20 ms (`frameDuration` 20 000), the one size every budget here assumes,
+a source whose chunks come faster throttled to that budget, the stated
+cost of any other size; video the same way from its
+tier's rate —
+admission per link by what the link is to the source: a browser link is
+admitted for the sources it REGISTERED as their publisher (the source
+announcement bound to that link on the control plane) and for nothing
+else, a mesh link for the sources this node subscribed to upstream through
+it and for nothing else, and a frame for any other source is dropped at
+ingress (a publisher's own link subscribes to nothing — its subscribers
+are downstream — so one rule for both would drop every frame at the
+originating node);
+a cap on the sources one link may carry, and a failed-verification budget
+per link — past a handful of failures a second the LINK is muted for a
+doubling backoff and the event reported, while the source stays up on
+every other path. What that budget counts is what a LINK can be blamed
+for: a frame whose signature fails, a frame past the ceilings, a stream
+reset — everything decided before decryption, which a hub decides the
+same way, since a hub verifies before it forwards (the signature is
+public-key), so a forged frame dies at its first hop and its sender's link
+pays; an honest hub forwards no forgery, so a signature failure arriving
+over a hub link is that hub's own doing and the member re-homes rather
+than keep a link that lies. What a hub CANNOT check it is never blamed
+for: it holds no media key, so a frame whose signature is valid but whose
+AEAD tag fails, or whose plaintext is malformed (a batch table that does
+not add up, a duration that is none of the six Opus frame durations),
+passes every honest hub and fails only at a subscriber
+— and only the source could have signed it. Such a failure is charged to
+the SOURCE, by its key: past a handful a second the subscriber mutes that
+source alone, for a doubling backoff, and reports it, while every other
+source on the same link plays on; the link's budget is untouched, or a
+publisher signing garbage would have every subscriber mute the honest
+hub between them and take unrelated sources down with it. A frame of a
+generation the subscriber holds no configuration for is NONE of these:
+the reliable `media-config` and the datagrams it governs travel different
+lanes and arrive in either order, so such a frame waits the jitter window
+and is then dropped (§4 above), charged to nobody — a source penalty is
+for what only the source's own output explains, a tag that fails or a
+plaintext that is malformed, never for a configuration that has not
+arrived yet, or an ordinary reconfiguration would mute a valid source
+at its own threshold. A member or
+hub that floods invalid or oversized frames spends its own link's budget,
+costs verification only up to it, and takes no honest source down; a
+source that signs what cannot be opened silences itself and nobody else;
+a valid source past its tier is throttled to the tier on every link, the
+ceilings being the tier's, not an estimate's. The cost is 137 bytes a
+frame — the 64-byte signature, the 57-byte header and the 16-byte tag:
+about 55 kbps on a 20 ms Opus stream, more than voice itself and still a
+tenth of an arcade-resolution stream — and some eighty verifications a
+second per source, a few milliseconds of CPU; a sender may sign a batch of
+up to three chunks AND at most 60 ms of audio in all (three 20 ms frames;
+a shorter frame buys no larger batch and a longer one no 180 ms batch)
+under one header, tag and signature for a third of the overhead at 40 ms
+more latency — framed inside the plaintext
+so the receiver can cut it back into the encoder's chunks, each with its
+own timestamp and duration: a one-byte count, then per chunk a two-byte
+big-endian length and a two-byte big-endian duration in 48 kHz samples
+(one of the six durations a WebCodecs Opus encoder's `frameDuration` may
+take — 120, 240, 480, 960, 1 920 or 2 880 samples, 2.5 to 60 ms: the
+registration validates the setting against RFC 6716 §2.1.4's frame
+sizes, and a 120 ms Opus packet is several frames, never one chunk of
+the encoder's, so the receiver takes exactly those six and refuses a
+duration between or beyond them — a check of the chunk's SHAPE, beside
+the 20 ms frame the sender uses and the budgets above assume; the sender
+writes `round(duration × 48 / 1000)` from the chunk's WebCodecs
+`duration`, which is MICROSECONDS — 20 000 for a 20 ms frame, so 960 goes
+in the table, never 20 000 — and, when the chunk reports none, from the
+`opus.frameDuration` it configured the encoder with, the same conversion;
+the receiver hands its `EncodedAudioChunk` `samples × 1000 / 48`
+microseconds back; a packet's TOC byte is never read for it, since the
+TOC gives the duration of ONE frame while a code-3 packet carries
+several), then the chunks in order, chunk k's
+timestamp the header's plus the durations before it, each converted from
+the table's 48 kHz samples to the timestamp's microseconds first
+(`samples × 1000 / 48`: a 960 in the table adds 20 000 µs, never 960, or
+batched chunks and the audio's meeting with video would land fifty times
+too close); the table under the
+AEAD and the signature with the rest, bit 1 of the flags byte saying a
+batch is inside, and a batch whose lengths do not add up to the payload,
+or whose durations are not among those six or sum past 60 ms, dropped as malformed and
+charged to the source, as every failure behind a valid signature is
+(above); never
+a bare concatenation,
+which Opus chunks of varying size could not be split again, and never a
+repacketised multi-frame Opus packet, which would mean rewriting the TOC
+in the page — while video frames, kilobytes
+each, are signed one by one. Hash chains and
+signed manifests were considered and rejected: both either make playback
+speculative — a frame heard before its proof cannot be unheard, and a
+subscriber with the group key could inject audible frames until the proof
+was due — or add their interval to the latency. A subscription is signed by the subscriber's identity
+with proof of possession (the P2 lane binding's shape, §9) and
+countersigned by the origin node that forwards it, so no entry is forged
+in another's name and no origin in another node's, and a forged entry would receive only ciphertext
+it cannot open. What a hub still sees is the traffic's shape — who sends to
+whom, how often, how much — as with v006's SFU-lite. The lane supersedes
+the WebRTC mesh (#10) only once this layer is in and a forwarding node that
+logs every frame is shown to reconstruct no audio.
+Audio needs a step video does not: `AudioEncoder` takes `AudioData`, never
+a `MediaStream` or a Web Audio node. A microphone track goes through an
+audio `MediaStreamTrackProcessor` where the browser has one (Chromium),
+else through an `AudioWorklet` tapping the track's
+`MediaStreamAudioSourceNode` and posting its PCM frames over the worklet's
+`MessagePort` (transferred buffers, 20 ms at a time) to the page or a
+dedicated worker, where `AudioData` is built and `AudioEncoder` runs —
+`AudioData` is not exposed in `AudioWorkletGlobalScope`, so a worklet
+supplies PCM and builds nothing — the universal path, since the worklet is
+everywhere the lane runs, and the one the karaoke mix takes regardless,
+tapped off the mix bus; both are feature-detected with the worklet as the
+fallback for the PCM step only — a worklet supplies PCM and encodes
+nothing — and a browser without
+`AudioEncoder`, or whose `AudioEncoder` cannot do Opus, sends no audio and
+says so, whatever worklets it has (Safari 16.4–18.x; on WebKitGTK the API
+is there from 2.44 and the codec is a GStreamer plugin, below).
+A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
+three CAPABILITIES the lane rests on are feature-detected separately, and a
+sender advertises only the ones it has (they are not legs — the lane has
+two, audio and video, keyed as above): `WebTransport` (Safari 26.4 is the floor per
+`docs/TDD/BrowserSupportMatrix.md`), `VideoEncoder` (Chromium; Firefox
+desktop 130+ and NOT Firefox Android, per the matrix, so an Android Firefox
+advertises no media leg; Safari 16.4+; WebKitGTK 2.44+) and `AudioEncoder`
+(absent on Safari 16.4–18.x; present on WebKitGTK from 2.44, where WebCodecs
+sits on GStreamer and a codec is whatever plugin the system has — Opus from
+`opusenc` in gst-plugins-base — so the page asks
+`AudioEncoder.isConfigSupported({ codec: 'opus', … })` rather than reading
+a version, and advertises the audio leg only on a yes). Only true screen capture (`getDisplayMedia`)
+is Chromium-first. Budget per
+viewer: ~24–32 kbps voice, ~96–128 kbps music, ~0.3–0.8 Mbps for a
+native-resolution arcade screen, ~1.5–3 Mbps for a 720p desktop — codec
+rates; the wire adds the per-frame overhead, and §4's ceilings count the
+wire. **Build
+audio first**: it is a tenth of the work, it is #189, and it unlocks karaoke.
+
+**Subscriptions by distance.** The viewer decides, not the sender: every client
+knows the source's position (furniture doc) and its own, subscribes within
+`R_live`, unsubscribes beyond `R_live + 1.5 m` (hysteresis). The node keeps a
+per-source subscriber set (a `media-sub` control kind beside `graft`/`prune`)
+and forwards frames only to subscribed links. An entry is a lease scoped to
+the link that made it — renewed by that link, removed from every set when
+the link disconnects or stops renewing, so a dead tab never pins a sender on
+and frames are never sent into a dead link; a hub subscribes upstream for
+its spokes — ONE forwarding subscription per hub on the data plane, kept
+only while a live spoke of its own still wants the source — and relays each
+spoke's signed membership lease — each renewal answering the sender's
+latest beat, countersigned by the spoke's own node as its origin — and
+its departure, to the sender
+separately on the control plane: the aggregate says where frames go, the
+per-spoke leases say who may open them, because the sender above seals the
+key to each subscriber on admission and rotates on each departure, and a
+join or a leave behind an already-subscribed hub would otherwise reach it
+neither — the joiner waiting on a key that never comes, the leaver keeping
+one it should have lost. The hub forwards what it receives as the
+ciphertext it is — the media key reaches each spoke sealed from the sender,
+never from the hub (above). With no subscriber the sender's own node drops
+frames at the source AND tells its browser so, and the browser stops capturing and encoding
+until the first subscriber returns (restarting on a keyframe) — a node-side
+drop alone would leave the dominant CPU and battery cost in place. Tiers:
+live (near, full stream + audio), glimpse (keyframes only, no second
+encode), far (the attract still; nothing captured, nothing encoded). The
+TV's live sources
+use the same mechanism with a larger radius; voice uses an earshot radius.
+
+## 5. Karaoke
+
+- **Tier 1 (TV v1 only):** a karaoke or lyric video on the TV, synced; everyone
+  sings alone. A toy. In the default build that is a file on the viewer's own
+  origin or node (the library's, once §7 exists); YouTube karaoke videos only
+  with the convenience lanes on (§12, the 2026‑10‑04 ruling).
+- **Tier 2 (audio lane):** a microphone prop; whoever holds it is the live
+  source. Either everyone plays the backing track locally and listeners delay
+  it by the measured transit (the voice-chat shape), or the singer's client
+  mixes mic + track in Web Audio and streams the mix (~128 kbps; perfect sync
+  by construction; the track must be a decodable file). Recommend the mix for
+  the karaoke machine. `echoCancellation: true` plus a "headphones recommended"
+  line; verify Chromium's canceller removes the local backing track.
+- **MP3+G** (`.mp3` + `.cdg`, 300×216, 16 colours, ~300 packets/s, usually
+  zipped): render with the `cdgraphics` library keyed to the audio element's
+  `currentTime` onto the screen's `CanvasTexture` (so lyrics get the CRT pass).
+  Distribution: share the zip over the blob lane for home-made/CC/PD tracks;
+  stream the mixed audio plus the `.cdg` packets as a tiny side stream for a
+  purchased library, so nothing but a stream leaves the singer's machine.
+- **Lyrics and scoring** need no media: LRC/UltraStar timed lyrics from the
+  shared clock; pitch detection (YIN in an `AudioWorklet`) against an UltraStar
+  note track where one exists. CD+G carries no pitch data.
+
+## 6. Torrents without the central parts
+
+| Central piece | Without it |
+|---|---|
+| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build — and when it is on, every tracker announce and every web-seed request (next rows) goes through §3.4's destination gate, the one crate the media proxy uses: the node resolves each tracker and web-seed name itself, admits global unicast only (loopback, private, link-local and the cloud metadata ranges refused; an explicit allowlist for a tracker the operator runs on the station's own LAN), pins the socket to the address it checked, and re-runs the whole gate on every redirect of a web seed. `librqbit` inherits none of that on its own, so the node filters the metadata's `tr=` and `url-list` entries before the client sees them, hands it pinned addresses where its API allows, runs its HTTP under a redirect policy that re-checks each hop, and where the client cannot be made to check every hop the setting stays off and says why. And the same classifier stands on every PEER dial, setting or no setting: the endpoints a tracker response, the DHT or PEX hand back are as untrusted as the metadata, so every outgoing BitTorrent connection and every uTP or DHT packet goes to a global-unicast address or nowhere — loopback, private, link-local and the metadata ranges refused, a LAN peer reachable only through the operator's explicit allowlist — the check sitting in the client's connector, which the node forks if `librqbit` offers no hook there, rather than shipping without it. LSD (BEP 14) is the ONE exception to global unicast, and it is off until that allowlist exists: its announcements go to multicast groups (`239.192.152.143:6771` and `[ff15::efc0:988f]:6771`), so with an allowlist set the node admits exactly those two destinations on that port, sent only out of the interface(s) that carry an allowlisted subnet, with a hop limit of 1, and takes an announcement only from a source address inside the allowlist (any other is dropped unread), dialling the peers it names only through the same unicast allowlist; with no allowlist there is no LSD socket at all. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
+| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node — one that ANSWERS queries only under a no-amplification rule, since a KRPC query's source address is anyone's to forge and a node that answered freely would reflect onto whoever it named: EVERY reply carries no more bytes than the query it answers, whoever sent it — the node and value lists trimmed to fit, as BEP 5 allows, and a reply that cannot fit (a `get_peers` answer whose token alone outweighs a tiny query) withheld — because an address's past answers authenticate nothing about a later query under its name, so there is no proven-reachable exception to replay: a spoofed query reflects at most its own size and buys the attacker nothing over sending the bytes itself (a reflector at one to one hides a source and multiplies nothing, the standing cost of any UDP service); and every address is besides under a response budget counted at the socket (a reply a second and 2 KB a second per address, 64 KB a second across all, the rest dropped unanswered), a bound on the node's own outgoing bytes and never the amplification argument, which the size rule carries alone — the limiter's own state bounded too, since a source address is anyone's to forge and a fresh one per packet would grow a per-address map without limit under the global ceiling: the global budget is checked FIRST, before any per-address entry exists, a query it refuses dropped with nothing written; the table is of fixed capacity (4 096 addresses, a few hundred KB) and its entries expire with the second they count (an entry idle for two seconds is gone), and at capacity with none expired a query from an unknown address is dropped unanswered and no entry written — never a live entry evicted into a fresh allowance — so a flood of forged sources fills a table it cannot grow and the node goes on answering the addresses it already knows; `librqbit` enqueues `get_peers` and `find_node` replies directly and its limiter wraps only the queries it makes, so until the node's fork carries the rule the DHT runs client-only, lookups made and no query answered, at the cost of the bootstrap role alone: a client-only node answers nobody and so bootstraps nobody, and a spoke bootstraps meanwhile from a configured node that answers (a station's full node once the fork lands, the dev-mode list before it) — a room's hub becomes its spokes' bootstrap only once it answers, under the rule — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no BEP‑5 infohash DHT client, no PEX, no LSD, no tracker or web-seed code to reach a swarm with — the only isolation that holds for the swarm, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. What this feature neither adds nor removes is the node's OWN address lookup over Mainline — `DhtAddressLookup` in `ssf-p2p-node/src/main.rs`, on by default today and off with `SSF_NO_DHT=1` — and, until its bootstrap list comes from signed local config or a ticket, bootstrapped from the crate's four public DNS names, §1's unmet prerequisite, the lookup to be off with none configured — which publishes and resolves node ids, never infohashes: node discovery's lane-5 question (§1) — and a STRICT build answers it the way §1 does: the lookup is not compiled in there — `DhtAddressLookup` sits behind a cargo feature (`mainline-lookup`, on by default) that a strict build leaves out, as it leaves the `torrent` feature out — so there is no switch for an operator to flip and the promise is the build's, not a default's: discovery falls back to signed local config, tickets and connected peers, and "strict" promises no public DHT traffic of any kind, torrent or address. `SSF_NO_DHT=1` stays the runtime switch of a NON-strict build. A build that merely leaves the `torrent` feature out while keeping the address lookup is TORRENT-FREE, the narrower promise, and is called that — never strict, whatever its switches say. |
+| Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build, under the trackers row's destination gate when on (a web-seed URL comes from the same untrusted metadata, and a crafted one would otherwise point the node at loopback, the LAN or a metadata service); never on a strict one. rqbit's web-seed support is unverified. |
+| Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
+
+Rules: `librqbit` inside `ssf-p2p-node` as an optional cargo feature
+(`torrent`, gated like `chia-lane`), never a second process, and not
+compiled into a strict build at all (the DHT row above). The **host's node
+is the room's one swarm participant**; the file reaches the room over the blob
+lane; viewers join the swarm only by opt-in. And the client starts from a
+LOCAL command only, never from the room record: the TV record is
+peer-writable, so a node that reacted to a `torrent` source in it would let
+any member put this node's IP in a public swarm and spend its disk and
+bandwidth. A page starts a torrent on its own node through the node's
+local channel under §3.4's capability token — the paste on the holder's
+page is that command for the holder's node, JOIN SWARM on a viewer's page
+is it for theirs — a node reading a magnet in shared state fetches nothing
+and joins nothing, and the record carries the hash and the host node's
+progress for the screen: it reports a transfer a node already approved
+locally and starts none. The torrent side keeps its own limits beside
+§4's blob-lane caps, viewer-set with defaults: a size cap per torrent and
+a disk quota for torrent data, download and upload rate ceilings, a
+seeding budget — *seed while the TV plays, stop after* by default, else up
+to a ratio or a number of hours — and a count of concurrent torrents.
+Paste only, no search, no
+catalogue. A `fetching` state with the host node's progress on the screen; the
+🕒 schedule is how a torrent is meant to be used. One-line notice that
+BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews will not play
+`mkv`. A station that passes its library around as torrents runs its own
+`aquatic` tracker and marks them private (BEP 27).
+
+## 7. The station library: the sovereign backup
+
+- **Bytes:** the blob lane, content-addressed, replicated by possession, served
+  to a webview by the local node.
+- **Index:** a signed `library-add { hash, title, bytes, licence, source,
+  addedBy, provider }` op in the RoomLog, per station or venture —
+  `provider` the adding owner's node id, the first node to ask — plus a
+  signed `library-seed { hash, node, seq, at }` announcement from every
+  node that holds the item and will serve it (a library-station volunteer,
+  an owner's node) — `at` the seeder's wall-clock stamp, under the
+  signature with the rest — renewed hourly under a sequence per (node,
+  hash) that only rises — one per item, never one per node across items,
+  or a renewal for one hash arriving after a higher one for another would
+  read as a replay — a sequence the seeder keeps DURABLY, since a reader
+  that holds a mark refuses every value at or below it for a day and a
+  seeder that kept its key but reset its counter would be unlistable for
+  that day: the next `seq` is the greater of the wall clock in whole
+  seconds and the last value persisted plus one, written beside the node
+  key (the directory `iroh_node_id.key` lives in) BEFORE the announcement
+  goes out and reserved in blocks of 64, so a crash between the
+  reservation and the send costs a gap and never a reuse, and resumed
+  from the reservation at start — so across a restart the sequence
+  continues, and a seeder whose counter is gone (the file lost, the
+  directory copied without it) recovers on the clock, which stands above
+  anything it emitted unless the clock has been set back: the one case
+  that leaves it unlistable, for as long as its clock stands behind its
+  last emission and at most the day a mark lives, bounded by the step and
+  said on the library pane, a seeder that would rather not wait minting a
+  new node id, a (node, hash) no mark names — and judged expiring by the
+  READER, on two clocks of
+  its own (below), one lifetime each: a seed is LISTED — its node
+  counted among the item's holders — for a day, on the AGE clock, from
+  its reading when this node last received a renewal with a higher `seq`
+  for that (node, hash), never from a stamp of the seeder's, which no
+  reader could bound and a skewed or lying seeder could set a decade out;
+  and its MARK, the replay guard, is kept, on the FLOOR, for a day past
+  the later of that same receipt and the newest `at` it accepted, so the
+  mark always outlives the listing (a guard that fell before its seed
+  could be re-admitted would be no guard; the floor never runs ahead of
+  the age clock, below; and within a first-come slot's TENURE, further
+  below, at whose end listing and mark go together) — a renewal with an
+  older or equal `seq` for that (node, hash) is a replay and ignored, the high-water mark kept per
+  (node, hash) and persisted — under BOUNDS that hold against minting,
+  since a node id is free to mint (§4), a map that grew with every id a
+  member minted would never shrink, and a bound per id would bound
+  nothing: every seed announcement carries the seeder's wall-clock `at`,
+  and a reader accepts it only inside a WINDOW on a clock of its own that
+  ONLY RISES — the FLOOR: the highest wall-clock reading the reader has
+  persisted, raised as the clock advances and never lowered, so a clock
+  stepped forward by mistake and corrected back expires nothing twice —
+  refused when more than a day older than the floor, and refused when
+  more than five minutes ahead of the clock, since an announcement dated
+  the far future would never grow too old — a coarse bound, in days, on
+  how long a signed announcement stays replayable, never a comparison that
+  moves playback; a mark lives for the whole window — until the floor
+  stands a day past the later of its receipt and the newest `at` it
+  accepted, as above, when every announcement it could refuse is refused
+  by age under every later correction — and is never dropped sooner, so a
+  replay fails on the mark or on its age and on nothing else. The floor
+  may STAND STILL — corrected back after a step forward, it waits for
+  true time to catch it up — which is right for the replay bound and
+  wrong for a listing: a seeder listed at the stepped reading would stay
+  listed for as long as the step, a day never passing on a clock that
+  does not move. So listings age on the AGE clock, which only rises and
+  never stands still while the node runs: the later of the wall clock and
+  the reading last persisted plus the monotonic time elapsed since,
+  persisted with every mark written, on shutdown and at least once a
+  minute besides (a crash loses the time since the last reading and no
+  more), and resumed at start from the later of the wall clock and the
+  persisted reading — the time the node was down counting only as far as
+  the wall clock has moved past that reading, never on a clock that may
+  have been stepped meanwhile. When the wall clock at start stands BEHIND
+  the persisted reading (stepped back while the node was down, or a crash
+  after a step forward that the reading had followed), the time down is
+  unknowable, and the node FAILS CLOSED: every listing is dropped — a
+  seeder earns its place again at its next hourly renewal, said on the
+  library pane — while the marks, which live on the floor, are kept;
+  since a reading resumed below where the clock had run would hold a dead
+  seeder listed past its day, and a restart repeated would hold it for as
+  long as the restarts went on. So a restart costs a listing at most the
+  minute since the last persisted reading, never the uptime, and a
+  listing accepted while the clock stood stepped forward is delisted a
+  day of real time later; and the age clock, never below the floor (both
+  take the wall clock's maximum, and only one of them runs on), is never
+  the one a mark is measured on, or
+  marks would fall before the announcements they guard were refused by
+  age. (The cost of a clock stepped a long way forward and back is that
+  honest seeds read as too old until true time catches the floor up, and
+  the few marks accepted meanwhile — only announcements dated near the
+  stepped reading earn one then — stand until it does, said on the
+  library pane as the clock standing behind the floor — bounded by the
+  step, and the smaller cost beside a withdrawal undone.) What the mark
+  guards is
+  an honest seeder's withdrawal (the `library-unseed` below), which an old
+  seed replayed after it would undo — a seeder that lies about `at` or
+  signs anew guards nothing by replaying, since it can announce afresh at
+  will under the same caps; and the marks are capped PER READER, in all,
+  whatever ids they name, in TWO pools with one maximum each: the
+  first-come pool — at most sixty-four seeders per item (a sixty-fifth
+  announcement is ignored until one expires; the item has holders enough)
+  and at most 4 096 marks in all — and the principal pool, which only a
+  seed under a principal enters (a library-station's under its operator
+  key, an owner's node under the owner's) — at most eight seeders per
+  item, the station's owners and its operator being fewer, and at most
+  4 096 marks in all — so a reader holds at most 8 192 marks and an item
+  lists at most seventy-two seeders, whatever the ids; in either pool
+  expired marks are dropped first, and at capacity with none expired the
+  newcomer is refused — ignored, no mark written — rather than a live mark
+  evicted into a replay. A first-come slot has a TENURE apart from the
+  mark's retention: a day on the age clock from the reader's FIRST
+  admission of that (node, hash), jittered by up to four hours per slot,
+  which no renewal extends — a renewal keeps the seeder listed inside its
+  tenure and moves nothing else — and at tenure's end the slot is released
+  and its mark dropped with it, a renewal arriving after that a NEW
+  admission under the caps, first-come again (the replay guard a released
+  mark gave covered an honest seeder's withdrawal for the tenure; an old
+  seed replayed after it lists for a day a seeder that is gone, which §4's
+  route rule already pays for by skipping a holder that fails). Without
+  that tenure a flood of minted ids, renewing every mark it held each
+  hour, would hold the pool for as long as it ran, since a renewal moved
+  both the listing and the mark forward. With it, what such a flood does
+  is still a PERSISTENT cost, stated plainly rather than bounded to a
+  day: ids are free, so a peer willing to announce 4 096 seeds a day and
+  renew them hourly takes most of the first-come pool for as long as it
+  keeps paying — released slots go first-come at release instants it
+  cannot predict, so honest newcomers take a share of them in proportion
+  to their announcements and no more, and a flood larger than everyone
+  else combined holds most of the pool. What that costs the reader is
+  bounded (4 096 marks and their renewals, verified under the per-link
+  rate limits), and what it takes from the station is a STRANGER's chance
+  to be listed in a first-come slot while the flood runs: it neither
+  displaces nor shuts out the station's own seeders, whose principal pool
+  it cannot enter, and a stranger with a principal (#231's membership
+  credential, once it exists) lists there. The first-come pool is best
+  effort by construction, and the design says so.
+  Admission is by principal where one exists and first-come under the
+  caps for the rest — and a signed `library-unseed` from the same node (a
+  higher `seq` for that hash) or the item's `library-remove` withdraws it
+  early. A late joiner counts its day
+  from its own receipt and is wrong by at most that day about a seeder
+  that has gone, and §4's route rule skips a holder that fails or stalls
+  for the rest of the session either way. A seeder is its node id, dialled by id
+  under §4's route rule (a connected announcer's observed route for an
+  automatic fetch; discovery only for a fetch the viewer asked for), so a
+  hash resolves, in order, to the connected `have` announcers, the
+  unexpired seeders, and the adder's own node — never to a bare hash with
+  nobody to ask. v002's "Chia infohash registry + our seeders" with the
+  registry in the signed log and a ChiaHub-shaped record for a station's
+  library root as the floor.
+  **Prerequisite:** the SsfLog-backed RoomLog adapter. Today `RoomLog.append`
+  and `subscribe` are contract stubs on the Phase 2 horizon; the adapter is
+  an explicit gate that lands before the library, not beside it.
+- **Resolution order on the TV:** library (a connected member who announces
+  it, else an unexpired seeder, else the adder's node) → archive /
+  PeerTube / URL via the proxy → the item's torrent over the DHT; an
+  `identifier → hash` map keeps a second viewing off archive.org.
+- **Policy:** PD/CC-marked items by default, the owner's own files behind the
+  private-room rule, never YouTube.
+- **Who seeds outward:** nobody by default. A **library-station** role (the
+  beacon-toggle shape) fetches from the public swarm and the archive, seeds
+  into the public DHT, and serves the station. That volunteer alone exposes
+  an IP to public swarms; everyone else is hidden by construction.
+- **Who may fill it:** a signature says who enqueued an item, not that the
+  content is theirs to share or fit to seed. Two writer sets, stated apart.
+  `library-add` is accepted only from the station's owners — room owners by
+  a key the accepting node can trust: an owner key pinned in the station's
+  own config, or the `owner_ed25519_pubkey` / `cohost_ed25519_pubkeys` of
+  the room's verified authority head
+  ([chia-authority-architecture.md](chia-authority-architecture.md), whose
+  §3 verification is itself an open TODO item), and never the peer-writable
+  `roomInfo.owner → players[owner].keyB64` chain that `gamesDoc.ts` reads
+  today, which any peer can rewrite and nothing pins, so a writer set taken
+  from it would be no writer set at all — the library-station operator
+  approves each item before any fetch
+  (or allowlists signers) but does not add; the fetch verifies hash and size
+  against the op; storage and egress run under quotas. `library-remove` (a
+  denylist honoured by every node) is accepted from the station's owners AND
+  from the library-station operator, an additional remove-only authority
+  (the volunteer must be able to drop what it will not host) — whose key is
+  bound the way the owners' are, never self-asserted: pinned in the
+  station's own config, or named by the room's verified authority head (an
+  operator key the deed holder signs into it). The beacon-style opt-in says
+  a node volunteers to fetch and seed; it says nothing about whose removals
+  the rest of the station should honour, and a node that can resolve no
+  operator key honours no operator removals. A removal
+  signed by anyone else is rejected before the denylist is applied, since a
+  signature identifies a writer without authorizing one, and an open remove
+  would let any room peer blank the whole library. Nobody can make the
+  volunteer fetch and seed arbitrary or oversized content, or drop what it
+  holds, by writing an op.
+- **Under which authority:** owners' keys rotate and a deed transfers, so
+  every `library-add`, `library-remove` and operator-key op names the
+  authority head it was signed under — the head's sequence number and
+  hash — and chains to the writer's own previous op by hash (the writer's
+  first op names none), so each writer's ops form one contiguous chain
+  that a gap breaks: a node holding an op whose predecessor it lacks
+  fetches the predecessor before it accepts anything after it — and a
+  chain that forks (two ops from one key naming the same predecessor: two
+  devices on one key, or an equivocating writer) is resolved the same way
+  everywhere, at once, not at the next head: the branch whose first op has
+  the lower hash stands, the other is refused whole and the fork reported,
+  and a node that accepted the losing branch first switches on sight and
+  re-validates; a writer's client never signs over a tip it has not read
+  (it fetches the key's tip first), so two honest devices on one key fork
+  only in a race — and what the race loses is the losing BRANCH, whole:
+  not the racing op alone but every descendant either device appended to
+  it before the fork was seen, which a partition can make arbitrarily
+  long, since each side keeps writing over its own tip until it sees the
+  other's. The rule bounds who wins, never how much is lost, so a client
+  expects to recover: on switching it re-signs its discarded ops, in
+  order, over the winning tip (they are its own, their content still
+  wanted, and a re-signed op is a new op at a new sequence, never the old
+  one replayed), and a node reports a fork with the count it discarded;
+  an anchored head's committed tip is the finality that closes the
+  question later. A node
+  validates an op against THAT head's writer set, never the current one.
+  Heads form one chain of their own: each is signed by the authority that
+  makes it (the deed holder for a key-set change; for a transfer, the new
+  holder, citing the chain spend that made it so), numbers in sequence,
+  names its predecessor by hash, and COMMITS the history it inherits — the
+  terminal accepted op of every earlier writer, as ONE hash: the root of a
+  SPARSE MERKLE MAP of fixed depth, canonical to the byte so every node
+  derives the same root and the same proofs — a writer's leaf sits at the
+  path `BLAKE3("ssf-library-writer:v1\n" ‖ writer key)`, 256 bits read from
+  the top: bit d of the path, for the edge leaving depth d (the root is
+  depth 0, the leaf depth 256), is bit 7 − (d mod 8) of byte ⌊d / 8⌋ —
+  the first byte's most significant bit first — 0 going left and 1
+  right; its value `BLAKE3("ssf-library-leaf:v1\n" ‖ writer key (32) ‖
+  tip hash (32))`; an internal node is `BLAKE3("ssf-library-node:v1\n" ‖
+  left ‖ right)`; an empty subtree is a fixed constant per depth, 32 zero
+  bytes at the leaf and the node hash of two empties above it, so a map of
+  ten writers is ten leaves and a few hundred real hashes, never 2²⁵⁶; a
+  proof is the leaf's 256 siblings with the empty ones elided behind a
+  32-byte bitmap, a few hundred bytes for the writers a deed has had — on
+  the wire, and in the hash of a head, ONE encoding and no other: the
+  bitmap first, bit d (numbered as the path's bits are, byte ⌊d / 8⌋, bit
+  7 − (d mod 8)) set exactly when the sibling of the path's node at depth
+  d + 1 is not its depth's empty constant, then those siblings and no
+  others, 32 bytes each, root to leaf in rising d — so a proof is
+  32 + 32 × popcount(bitmap) bytes, a verifier that finds any other
+  length, or a listed sibling equal to its depth's empty constant, refuses
+  it unread, and two implementations that derive different bytes have
+  derived different proofs, never one proof twice — verified from the leaf
+  up: h starts as the leaf's value, and for d from 255 down to 0, h
+  becomes node(h, sibling) where path bit d is 0 and node(sibling, h)
+  where it is 1, the sibling the listed one or the empty constant for
+  depth d + 1 as the bitmap says, and the h left at d = 0 must equal the
+  root; and before any of this is consensus, one fixture of vectors held
+  by the Rust node's and the page's test suites alike — the empty map's
+  root, a one-writer map and a map of three writers whose keys and tips
+  are written out, each with its root and every leaf's proof as bytes, and
+  the chain of heads that builds the three-writer map from the empty one
+  (a first leaf, two more, then one tip moved: four update witnesses,
+  below, each as bytes with the root before and the root after) —
+  that both must reproduce, so a Rust and a TypeScript implementation
+  that disagree fail a test and never a head — so
+  an insertion moves no other leaf and the tree is updated, 256 hashes a
+  write, never rebuilt; a PROOF, though, answers to one root — any other
+  leaf's change alters a sibling on this path — so a proof is versioned by
+  the head whose root it answers to and recomputed from the pairs, which
+  every node holds, against the head an op is validated under, a few
+  hundred bytes and 256 hashes each time, never carried over from an
+  earlier head; a head stays a few hundred
+  bytes however many holders and co-hosts the deed has had — its root, the
+  one (writer, tip) pair it commits, the writer's PRIOR tip under the root
+  before it (a presence byte: 0 for a writer with no leaf yet, 1 and the
+  32-byte tip otherwise) and an UPDATE WITNESS, never the map: the leaf's
+  sibling path in the proof encoding above — one path, since the writer
+  key fixes it and the head moves no other leaf — verified TWICE, with the
+  prior leaf (the leaf hash of the prior tip, or the empty leaf constant
+  where there was none) against the root the head before it left, and
+  with the new leaf against this head's own root, both walks from the
+  leaf up as above, a head that fails either refused; so the witness
+  proves the state it replaces as well as the new one — a membership
+  proof of the new pair against the root before it could never verify,
+  that root holding the old tip or an empty leaf where the new one goes —
+  and a node that holds the map checks the prior tip against its own
+  leaf besides. A head thus commits exactly ONE leaf's change and nothing
+  hidden: an authority with several writers' tips to commit (a transfer
+  that closes the old owner's chain and opens the new one's, two co-hosts
+  caught up at once) signs one head per writer, each witnessed against
+  the root the head before it left, in one chain, the first head of all
+  against the empty map's root — a single pair and witness could never
+  let a node derive the other leaves a root had moved; a tip is
+  looked up by one proof, and replaying the chain costs a logarithm per op
+  and never the square of the writers; the pairs themselves are state
+  every node holds, rebuilt by replaying the chain from its first head
+  (each head's witness checked against the root before it and against the
+  head's own root, the leaf then set to the new tip, so the map a node
+  rebuilds answers to the root it ends at, and a late node reconstructs it
+  from the heads alone, carrying no list in any of them), and a writer
+  whose tip an earlier head already committed is
+  carried forward unchanged — so an op under a superseded head is accepted only if it lies
+  on the chain that ends at the committed tip. A newly signed op with an old
+  sequence is off that chain, and so is a second op at a sequence the
+  chain already holds, whoever signs them and whenever a node syncs; a
+  sequence number alone would commit nothing, since a former owner could
+  mint a backdated op below it, or two at one number, and a late node
+  could not tell them from the history the successor accepted. A chain of
+  signatures detects a fork and chooses none: the authority itself could
+  sign two heads on one predecessor committing different tips, and two
+  readers could accept two histories. So a head counts only once it is
+  ANCHORED — its hash carried in a spend of the deed's own singleton on
+  chain, the channel the authority architecture already gives the deed,
+  whose lineage is linear by construction: one chain of coins, one chain
+  of heads — and an unanchored head authorizes nothing yet; ops under it
+  wait. Until the anchor lands (the §3 verification the authority
+  architecture still owes), the deterministic rule is the lowest hash: of
+  two heads on one predecessor from one authority, every node takes the
+  one whose hash sorts first, switches to it on sight and re-validates
+  what it accepted under the other, and an authority seen to equivocate is
+  reported — convergent, and a stopgap, never finality.
+  Historical validation is then the same rule on every node: walk the
+  head chain, accept each writer's ops along its hash chain up to the tip
+  the next head committed, and refuse the rest everywhere at once; the
+  new holder chooses the tips and so may drop ops still in flight at the
+  transfer, which is the new holder's prerogative over the new holder's
+  library. A pinned owner key in a station's config is head zero of a
+  chain of one.
+
+## 8. Tribler / IPv8, evaluated seriously
+
+IPv8 is a UDP overlay of communities keyed by public key, bootstrapped by
+introduction. py-ipv8's shipped `configuration.py` loads `DiscoveryCommunity`,
+`HiddenTunnelCommunity` and `DHTDiscoveryCommunity` by default; bootstrap is
+13 raw IP:port entries at TU Delft plus seven DNS names,
+`dispersy1–4.tribler.org` and `dispersy1–3.st.tudelft.nl` (ports 6421–6424
+by number); tunnel
+defaults are `max_circuits: 1`, `max_joined_circuits: 100` (every default node
+relays strangers' circuits), `max_time: 600`, `max_time_inactive: 20`,
+`max_traffic: 250 MiB`. No Rust implementation exists: `ipv8-rust-tunnels` is
+the data plane under Python and `kotlin-ipv8` implements Discovery and
+TrustChain only.
+
+| Stage | Build | Yields | Estimate |
+|---|---|---|---|
+| A | wire format, keys, the Discovery walk, bootstrap, persisted peers | on the overlay | 3–4 weeks |
+| B | TunnelCommunity client: circuits, DATA cells, rotation, SOCKS5 UDP-associate for rqbit, exit selection | anonymous fetch of a public magnet | 6–10 weeks |
+| C | HiddenTunnelCommunity + DHT discovery | hidden swarms | 4–8 weeks |
+| D | relay side, TrustChain accounting, their test vectors | good citizenship | 4+ weeks |
+| ∞ | track py-ipv8 3.x / Tribler 8.x releases | staying on the overlay | ongoing |
+
+**Verdict:** buildable in four to six engineer-months, but it fails the
+project's own tests: the protocol is one lab's with one reference
+implementation (the single-vendor shape v002 rejects for relays), a default
+node relays strangers' traffic (or free-rides if it does not), the circuit
+limits make it a download-ahead source rather than a streaming one, and the
+anonymity is, by Tribler's own statement, not mature. The one property worth
+having — players' IPs never in public swarms — comes cheaper from host-only
+fetch, the library-station volunteer, and later an opt-in embedded I2P router
+(`emissary`, Rust, experimental, several independent implementations, no
+exits). **Recommendation:** do not port IPv8 now; if the owners still want it
+after the library, run a two-week opt-in FEASIBILITY SPIKE — a subset of
+stage A, not stage A: the wire format, keys and one Discovery walk against
+the shipped bootstrap list, with no persistence or relay polish — measured on
+what discovery alone can show: bootstrap success and latency, introductions
+received, peers walked per minute, how many advertise the tunnel community.
+Those are its exit criteria; stage A proper stays the 3–4 weeks in the table,
+and nothing past it is committed on the spike. Exit-peer count and three-hop
+throughput need stage B's circuits: they gate B→C, not A→B.
+
+## 9. The arcade cabinet
+
+**Models.** A: every player runs the same deterministic emulator and the room
+exchanges inputs (RetroArch netplay); bytes per frame, fits the tick lane, no
+media lane. B: one machine runs it, streams video, receives inputs
+(Parsec/cloud gaming); needs the live lane and adds a round trip of input lag.
+Screen sharing is not required for multiplayer; it is how spectators watch.
+
+**Two kinds of game on one cabinet, one model each (#248, merged
+2026‑10‑12).** A cabinet holds ONE game, the owner's pick in ⚙️ SETTINGS
+(the shelf #208 shipped is gone): a BUILT-IN game, or the owner's OWN.
+The built-in games are model A, shipped: four NES homebrew titles the app
+ships under licences that allow redistribution (`arcadeLibrary.ts`;
+THWAITE on a cabinet nobody has set), run by jsnes ON the cabinet's own
+screen for the whole room — the host's page (whoever pressed start) runs
+the reference copy and sends both pads' bytes on the tick lane each frame
+(a kind‑1 subtype no mallet tick can pose as, `arcadeNet.ts`), every
+other page runs the same frames with the same bytes a few frames behind
+and paints them on its cabinet (every frame up close, every third across
+the room, every sixth from afar), and a late or lost copy takes a save
+state through the doc (deflated JSON of the difference from power-on,
+10–20 KB, at most one a second); player 2 is whoever steps up to the
+two-player cabinet's second stand, their pad on the same lane. One
+engine and a fixed library made determinism free there, so none of the
+lanes below is needed for it, and it runs on today's unauthenticated
+tick lane under the dev-phase posture (a forged pad at a free game
+presses a button and nothing more); the signed binding below is the
+prerequisite of anything with stakes. The owner's own game — any console
+or arcade board EmulatorJS runs, from a file on the owner's disk (sent
+through the room to each player who presses play, `arcadeRomShare.ts`,
+until the blob lane carries it, §4) or a link — runs in EmulatorJS on
+the seated pages: at the double-wide cabinet in LOCKSTEP on every seated
+page, up to four, each on its own computer (#242, `arcadeStage.ts` and
+`arcadeLockstep.ts`: model A for the owner's game, the seats' inputs
+exchanged through the room and the state checked by hash), and at the
+single and two-player cabinets in ONE page, P1's stage. Model B, the
+rest of this section, is for what that lockstep does not cover: the
+cabinets where the owner's game runs in one page, and spectators of
+any cabinet — where the #250 replay spike (dev server only,
+`arcadeReplaySpike.ts`) replayed P1's inputs into a watcher's
+EmulatorJS and matched every hash, so model A may serve spectators too,
+the wiring the arcade thread's follow-up — with the video lane kept for
+what replay cannot carry: a watcher without the file, a core that
+diverges, a game whose inputs are not its whole state.
+
+**Player one is the source.** P1 holds the cabinet's P1 panel (claimed in the
+doc the way an air-hockey end is, with the page-seat rule); their emulator
+canvas is the picture. Spectators subscribe by distance (§4): live within
+~5 m at the game's native resolution (~0.3–0.8 Mbps), keyframe glimpses to
+~10 m, the attract still beyond. With the lane in place the cheapest player
+two is **also over the video** (inputs on the tick lane's extended kind,
+P1's emulator applies them): any core, no determinism work, ~50 ms input lag
+on a LAN and ~120 ms at a 40 ms round trip between the players; the game dies
+when P1 leaves. **Prerequisite, in two parts:** first the node's SIGNED
+lane-to-key binding — M5.5's per-epoch Ed25519 binding of `origin_lane_id`
+to a trusted pubkey, carried on the reliable lane and verified before relay;
+today the id is minted unauthenticated and relayed verbatim (the M5.5-STUB
+note in `ssf-p2p-node/src/main.rs`), so an admitted neighbour can forge any
+lane, and a lookup alone would let it drive P2. The binding must carry the
+PLAYER's proof of possession, not the node's word alone: a node signature
+authenticates the node, and an admitted node gone bad could attest its own
+lane as the P2 occupant's key and sail through the lookup. So the page
+identity signs a fresh binding over {room, origin node key, epoch, lane id};
+the originating node verifies it on the connection that owns the lane and
+relays that proof with its own attestation; P1 verifies both against the
+seat before any lane is mapped to a player. And every input after that is
+authenticated end to end too: the binding proves the lane was the player's
+once, and a node gone bad could emit ticks under it afterwards that P1
+could not tell from the player's. So the two pages derive a session key —
+X25519 between their identity-derived keys (the libsodium Ed25519→X25519
+conversion each side already has; a shared secret that comes out all
+zeros, a low-order point's, is refused and the seat not taken), then
+HKDF-SHA-256 over that secret: the salt the seat's 16-byte tenure nonce,
+the info `"ssf-p2-session:v1\n" ‖ u16-BE length ‖ room (UTF-8) ‖ u16-BE
+length ‖ cabinet id (UTF-8) ‖ tenure nonce (16) ‖ epoch (4, big-endian) ‖
+lane id (8) ‖ P1's Ed25519 pub (32) ‖ P2's Ed25519 pub (32)`, P1 then P2
+by role, never by sort, and 32 bytes out — the key bound to {room, cabinet
+id, the seat's tenure nonce, epoch, lane id, both pubs} under a versioned
+tag, as `signBytes.ts` binds an envelope to its room, kind and sequence —
+but by an encoding of this protocol's OWN: every variable-length field
+framed by an explicit length, where the envelope signer separates its
+newline-free fields by newlines and length-frames nothing, so an
+implementer takes the framing from here and never from there; two
+correct implementations derive one key and an ad-hoc one cannot leave
+the domain out — where the
+tenure nonce is minted fresh by P1 as it grants the seat and carried in the
+seat record, so a renewed seat or another cabinet is another key even for
+the same two identities on the same lane in the same room epoch — and each
+P2 input (an extended datagram, below) carries a strictly increasing sequence number and a
+keyed-BLAKE3 MAC under that key over the whole canonical frame: the ext byte,
+sequence and payload, nothing an input says left outside it. The frame is
+fixed to the byte: `[ext: 1 B][len: 1 B, counting the
+tag][seq: 4 B unsigned little-endian][input: 13 B]` (the ext byte the
+extension's own — bits 7–6 set to `0b11` as a marker, bits 0–5 the
+sub-kind — and the sequence in the
+tick codec's byte order, `protocol.ts`); the MAC is `blake3::keyed_hash` under the
+32-byte session key over exactly those nineteen bytes, truncated to its
+first 16 bytes and appended — a 128-bit tag (BLAKE3's output is a PRF, so
+a prefix is a MAC of its own length's strength; 2⁻¹²⁸ per forged frame is
+the claim, and the full 32 bytes would buy nothing a 60 Hz lane could use)
+— and P1 takes the tag as the payload's last 16 bytes. The node's wrapper
+(the TTL, the origin lane id) stays outside the MAC: the TTL changes per
+hop, and the lane id is already bound into the key. The sequence starts at
+zero under each session key and never wraps: 2³² frames is two years at
+60 Hz, and a sender at the ceiling stops and takes a new seat (a new tenure
+nonce, a new key, a new zero). P1 drops any
+input whose MAC fails or whose sequence does not advance, and an input
+captured in one session verifies in no other — a high sequence replayed
+from an earlier tenure cannot push a new session's inputs out (thirteen
+bytes become thirty-five; at 60 Hz that is 17 kbps, nothing). Thirty-five bytes do not fit the tick
+lane as it is: browser ingress takes exactly 13-byte datagrams, and the
+mesh relays only the 13-, 14- and 22-byte frames with a 13-byte tick inside
+(`ssf-p2p-node/src/main.rs`, the datagram arms) — everything else is
+dropped on the floor. And the lane has no kind to spare: all four 2-bit
+kinds are taken (kind 3 by Insatiable Alligators, `TICK_KIND_ALLIGATORS`
+in `protocol.ts`; the arcade's own ticks are a subtype of kind 1 behind a
+flag bit and a NaN `x`, `arcadeNet.ts`). So the extended datagram is a
+prerequisite in its own right — a VARIABLE-LENGTH format told apart from
+every legacy tick by its LENGTH and by nothing else, reusing no kind —
+landed as one change across the four places that read a tick, in
+two shapes as today's tick already has: the browser sends its node a bare
+`[ext: 1 B][len: 1 B][payload]` with the payload 12 to 64 bytes and
+nothing else — 14 to 66 bytes, never a legacy tick's 13 — and the node —
+as it does for the 13-byte tick — mints the lane id from the connection and
+the TTL itself and wraps the mesh frame `[TTL][8B origin lane id][ext][len][payload]`
+— 23 to 75 bytes, never the 13, 14 or 22 of a legacy frame — so a browser
+never chooses routing or authorship metadata, and ingress rejects a frame
+that carries any. A receiver checks `len` against the bytes actually
+present and against the 12-to-64 range before anything else, a frame
+that fails either dropped and charged like a malformed one; the ext byte
+is the extension's own — bits 0–5 the sub-kind, bits 7–6 set to `0b11`
+as a marker — and no 13-byte parser ever reads it, since the length
+decides first on every hop and a legacy peer, which drops unknown
+lengths today, never reads a kind out of it. The twelve-byte floor costs
+the P2 input nothing (its payload is 33 bytes) and is what keeps the two
+formats apart on one link: a capability says a peer understands the
+extension and nothing about which format a given datagram is, so the
+lengths must. Negotiated per link
+by a capability on the M5 control plane; ingress accepts it only from a
+browser that announced it, the relay forwards it only to links that did —
+and under packet and byte budgets enforced BEFORE the dedup hash and the
+relay, since the capability and the 64-byte ceiling bound a frame's size
+and nothing about its count, and nothing below P1 authenticates an input:
+the 60 Hz the P2 protocol runs at is the budget, enforced and not
+assumed — per origin lane ON EACH LINK sixty extended datagrams and 3 KB
+a second with a second's burst (a frame arriving by two links counts
+once on each, so a mesh's duplicates never spend a lane's allowance),
+and per link one aggregate bucket whatever lane ids its frames name (a
+lane id is what a flooder forges), its ceiling the sum of the lanes the
+link is admitted to carry — a browser link exactly one, its own, a mesh
+link the P2 seats of the rooms it serves, sixteen lanes at most — a
+datagram past either dropped unhashed and counted against the link's
+failed-verification budget, so a flood costs its own link a mute and no
+hub a relay; the `SeenCache` behind the dedup already holds 4 096 keys
+and no more (`ssf-p2p-node/src/main.rs`), so what a flood of unique
+frames would spend is the hash per frame, every negotiated link's
+bandwidth and the honest keys it evicts from that cache, which is why
+the budgets sit before the hash — and dedups it as it dedups the tick
+today — on `blake3(origin lane id ‖
+the whole extended datagram)`, payload included (`tick_seen_key` in
+`ssf-p2p-node/src/main.rs`, the M5.2 rule the build plan states as "never
+on (origin, seq) alone") — because a dedup keyed on the sequence would let
+a forwarding hub race a doctored copy under a genuine sequence into every
+cache on the way, and the honest copy arriving by another path would be
+dropped before P1 ever saw its MAC fail; loop suppression keys on the
+bytes, and the sequence is enforced by P1 alone, after the MAC verifies.
+Local delivery hands it to the page as its own message, and a legacy peer
+is never sent one and goes on dropping unknown lengths as it does today. And then the S3 mapping from that proven key to the player
+holding the seat. P1 accepts extended-datagram inputs only
+from a lane whose proven key is the P2 seat's identity, and only inputs
+that key's session authenticates. Lockstep stays the upgrade for games
+where lag matters.
+
+**Sources.** The archive.org embed (`archive.org/embed/<id>`) is single-player
+only (cross-origin, no input injection, no CRT). The ROM file loaded into an
+emulator in our page is the path that can do netplay, save states and #194.
+ROM-set versions must match the core. The built-in games are validated
+by test: `arcadeLibrary.test.ts` checks every entry's files exist and
+boots its ROM through the emulator, each entry pinned to an upstream
+commit with the corresponding source bundled for the copyleft titles
+(public/arcade/README.md is the credits page and says how to add one;
+commercial and non-commercial ROMs never go in). The owner's own game is
+one file or link with the core of the owner's choosing, validated by the
+engine at load — the iNES header check keeps junk out of jsnes, and
+EmulatorJS answers for its own cores — and its SHA-256 in the cabinet
+record is what a player's received copy is checked against.
+The archive is a convenience source; the owner's own file is the sovereign
+one; the station library (§7) is the sovereign backup for ROMs exactly as for
+films, and its BLAKE3 hash is the first half of the netplay determinism check
+— the bytes. Lockstep also binds the exact core build, the emulator settings
+and the initial state, or two identical ROMs still diverge.
+
+**Engine.** Two: jsnes (Apache-2.0, `arcadeMachine.ts`) for the built-in
+NES games, stepped one frame at a time with both pads set from bytes, which
+is what makes the shared game above possible; and EmulatorJS (libretro
+cores in WASM) for the owner's own game — single-player, the menu,
+save states, gamepads and touch; its own netplay is WebRTC-based with its own
+signaling and STUN/TURN and is marked unstable, so it is not depended on.
+Lockstep for an EmulatorJS game needs a libretro core driven per frame (a
+thin harness, the P2 spike). The emulator data files are **not** vendored
+into the repository (size); they are fetched into `public/emulatorjs/` by a
+script (`npm run fetch:emulatorjs`) — since #255 (merged 2026‑10‑13) from
+the npm registry the app already installs from, the engine and each core at
+one pinned version, every tarball checked against the registry's sha512 and
+the script's own pin, never from the CDN — and release builds carry them:
+EmulatorJS 4.2.1 and the eleven cores behind the cabinet's thirteen systems
+(about 46 MB a build), with their licence texts in `public/arcade/licenses/`,
+and every release attaches the source each part was built from
+(`emulatorjs-4.2.1-source.tar.xz`, 123 MB: each tree at the commit the
+core's own version string names, pinned in `scripts/emulatorjs-sources.json`),
+all but EmulatorJS's prebuilt 7z and zip unpackers, whose source nobody has
+published (a cabinet follow-up on `main`). The licence call is made:
+EmulatorJS and its RetroArch are GPL-3.0, six cores GPL-2.0 and mgba
+MPL-2.0, and FBNeo, MAME 2003-Plus, Snes9x and Genesis Plus GX forbid
+commercial use — they ship because Star Station Furlong is non-commercial
+and asks for no donations (Dorkmo, 2026‑10‑12; `public/arcade/README.md`
+says what a sold build would have to leave out). The CDN remains an opt-in
+labelled CONVENIENCE that exists only in a build with the convenience lanes
+on (`VITE_SSF_CONVENIENCE_LANES=1`: the 2026‑10‑04 ruling, §3.3 — a record
+that says CDN reads as the station's files in a default build, and a link
+on another server is refused at PUT ON with the reason).
+The emulator never runs in the page's own origin, whichever lane its files
+come from: engine code and ROM data are external inputs (a core is a
+third party's build, a ROM is whatever a file or a server held, and a
+core bug a ROM exploits is script in the frame), and a same-origin frame
+— sandboxed with `allow-same-origin`, or not at all — shares the page's
+DOM, its storage and, in the desktop shells, the IPC bridge; a
+content-security policy bounds what a frame may LOAD, never what its
+scripts may reach, so it is no isolation boundary. The frame is an opaque
+origin on every lane (`sandbox` without `allow-same-origin`: scripts and
+pointer lock allowed, nothing else — no forms, popups or downloads, each
+of them a request to any URL that no policy directive governs, a popup or
+a download script-initiated at that), and everything
+crosses its boundary explicitly: keys reach it by focus (a focused frame
+receives them, and the stage's capture listener keeps them from the
+world); its status and its policy report come out by `postMessage`, the
+page checking the event's source against the frame it mounted and the
+frame posting to `'*'`, since its origin reads null; and the picture,
+when the spectator lane comes, comes out the same way — `ImageBitmap`s
+(or `VideoFrame`s) the frame makes from its own canvas and transfers at
+the lane's rate — never a reach into the frame's canvas, which an opaque
+origin forbids by design and an earlier draft of this paragraph relied
+on. And since the frame is attacker-controlled after a core exploit, the
+source check says only WHO is posting; what crosses is bounded as input
+from an attacker: one versioned shape per message kind (`arcade-*`,
+known keys only, a string field at most 256 characters — and a message
+of any other shape tears the frame down at the first word (`malformed`):
+no game sends one, a frame that does is exploited or broken, and dropping
+it would pay the clone below for every such message up to the budget), a
+message budget of twenty a second per frame, counted shape or no shape,
+past which the page tears the frame down (`flood`); either torn-down
+frame is re-mounted only on
+the player's RETRY, and not before a doubling backoff from 5 s (five
+minutes at most, forgiven by a clean start); a save state at
+most 16 MB by `byteLength`; a picture at most the core's native size
+within 1 280 × 720, transferred no faster than the lane's rate with ONE
+in flight — a bitmap arriving early, or behind one not yet drawn, is
+closed unused — and nothing queued anywhere: a message is handled or
+dropped as it arrives. What remains is the structured clone the browser
+performs BEFORE any handler runs — and performs for EVERY message the
+frame posts before the page's event loop turns again: a frame that
+posts without yielding queues as many clones as it likes, each
+serialized and queued before the page can read the first, count it or
+tear the frame down, so the budget and the teardowns bound what the
+page HANDLES and nothing of what it is made to hold. The residual,
+stated as it is: same-tab availability is NOT protected against an
+exploited frame — the cabinet's tab, the player's own, can be stalled
+or crashed by a core exploit, and the one who chose the game is the one
+who pays. What holds it down: the frame in a process of its own where
+the browser isolates sandboxed frames (the serialized bytes then live
+in the frame's process until delivery, and a runaway sender exhausts
+its own process first), and the teardown at the first message handled,
+after which nothing more is delivered. A design that would bound it — a
+pre-allocated `SharedArrayBuffer` ring the frame writes into under
+credits, no clone at all, which needs the whole page cross-origin
+isolated (COOP and COEP, every subresource CORS- or CORP-clean) — is the
+follow-up if that residual proves to matter; the picture lane's
+transferred bitmaps sit under the same residual. #208 carries the shape, the budget and both teardowns for
+the status messages (`arcadeEmulator.ts`: `frameMessage`, `MessageBudget`,
+`malformed` and `flood`; `arcadeStage.ts` the backoff); the picture and
+save-state caps come with the lanes that carry them. The frame still runs under a
+content-security policy on EVERY lane,
+set by the frame itself on receipt of the page's config and before its
+loader is fetched: its own origin, `blob:`, `data:`, the viewer's own node
+and — on the CDN lane alone, in a build with the lanes on —
+`cdn.emulatorjs.org`, the engine's origin, and nothing else: no update
+check, no netplay signalling, no other third party; `'unsafe-eval'` and
+`'wasm-unsafe-eval'` for the cores. The origins travel in the config
+message (`emulatorFrameOrigins`), never in the frame's URL, which is one
+immutable path with no query: `frame-src` ignores a query, so a policy
+chosen by one could be swapped by a self-navigation to the same path. An
+opaque origin's fetches carry `Origin: null`, so the station's
+engine files answer them with `Access-Control-Allow-Origin` (the engine
+and its cores: public files, readable by any page that can reach the
+station anyway, and nothing else of the station's); the ROM never crosses
+as a URL — the page fetches it itself, AS the page (same-origin, or from
+its node under the node's gate, which admits the page's origin and need
+admit no frame without one), under the consent the cabinet already asked,
+and hands the frame the bytes as a `Blob` it plays from a `blob:` URL of
+its own; a save state crosses the same way — EmulatorJS's own export is a
+download, which the sandbox refuses, so the state goes to the page by
+`postMessage` and the page offers the file (a P1 follow-up), an opaque
+origin having no storage of its own and a station-side store being the
+blob lane's; the desktop shell's protocol handler answers the engine's
+fetches the same way since #255 (merged 2026‑10‑13): the window is built in
+`setup` (`"create": false` in `tauri.conf.json`) so that every response
+under `/emulatorjs/` carries `Access-Control-Allow-Origin: *` — the frame's
+fetches arrive with `Origin: null`, which the app protocol's own header,
+the window's origin, refused — and `frame.html`'s policy names
+`tauri://localhost`, the app's origin on Linux and macOS; tried in the
+Linux build (WebKitGTK under tauri-driver, each fix needed when taken out
+alone) and with Windows' headers imitated in Chromium, macOS and Windows
+themselves untried until the next release builds there; the IPC bridge
+must be absent from the frame (`__TAURI_INTERNALS__` undefined inside it,
+else the shell's isolation pattern), which stays the fetch spike's to
+verify, as is where a policy directive EmulatorJS needs would show, as a
+console refusal naming it (its files are never in the repository). What no policy
+of the frame's own and no sandbox flag forbids is the frame navigating
+ITSELF: a document may always leave for another URL — and once it has
+left, the policy it left under governs nothing of what arrives, which
+runs its scripts and sends its requests before the page hears of it, or
+holds its `load` off for good; a teardown at the frame's second load is
+therefore a belt and never the barrier. The barrier is the EMBEDDER's
+`frame-src`, which the browser checks on every navigation of the frames a
+document embeds, whoever starts it, before the request is dispatched: so
+the page mounts the frame inside a WALL — a same-origin `srcdoc` document
+of its own whose one policy is `default-src 'none'; frame-src <the
+frame's path, exactly>` (`arcadeEmulator.ts`, `emulatorWallPolicy`;
+nothing else loads in the wall, and the frame, an opaque origin, is
+nobody to it) — one immutable path with nothing in a query, since
+`frame-src` ignores a query and a mode chosen by one would be a mode the
+frame's code could choose, and a path that never REDIRECTS, for any
+query or path variant, on every deployment: a content-security policy
+drops a source expression's path once a request has redirected, so an
+allowed navigation to the frame's path that a server answered with a
+redirect would land anywhere on the origin — the station serves the path
+as a static file that answers 200 or 404 and never a 3xx, the cabinet's
+smoke fetches a query variant and checks that nothing redirected, and a
+deployment that cannot promise it puts the frame on an origin of its own,
+where an origin-wide allowance is then safe — and a frame that tries to leave sends
+nothing: the wall hears the violation (`securitypolicyviolation`,
+`frame-src`) and the page tears the frame down with the reason. The one
+navigation the policy allows, to the frame's own path, is the frame
+reloading itself: the document that arrives runs the page's script alone,
+receives no config (the page configures a frame once), sets no policy and
+loads nothing, and is caught by the second `load` and torn down the same
+way (Chromium also puts a blank
+page of its own into a frame whose navigation it refused, whose load
+reaches the page before the report of the refusal: the page waits a
+moment for the report before it calls a second load a reload). The
+cabinet's smoke verifies in Chromium that an escape attempt reaches no
+network route and comes down as a refusal, that the reload comes down,
+and that the keyboard reaches the frame through the wall; the fetch
+spike confirms the enforcement on each shell's engine. The boundary the frame's own policy gives is on
+loads, connections and workers, which is where an emulator's traffic is.
+
+**Display and controls.** The emulator draws to a canvas. In P1 the picture
+lives in P1's stage panel (DOM) with a CSS scanline-and-vignette pass, and the
+cabinet's `CanvasTexture` shows the attract card and "P1 · name" — the TV's
+posture (§3.4), for the TV's reason: nothing else in the room can see P1's
+canvas yet. Since #256 (merged 2026‑10‑13) that texture is on a picture
+tube: every cabinet's screen is a curved, round-cornered CRT face about
+7.5 cm behind smoked glass in an opaque bezel, and the tube's own material
+(`arcadeCrt.ts`, one fragment pass through `onBeforeCompile`, no
+post-processing) draws the scanlines, bleed, glow, flicker and vignette over
+whatever the canvas holds — the attract card, a built-in NES game — so the
+canvas painters bake none of their own; the double-wide's two tubes sit
+behind one pane and act as one 8:3 screen, half the picture each. The
+owner's game on that tube comes with the spectator lane, which is what
+puts the picture in front of other players in the first place. Focus is the device-focus first-person framing;
+keyboard first (RetroPad defaults, WASD suppressed while at the controls),
+Gamepad API, mouse under pointer lock as a trackball, the virtual gamepad on
+Android.
+
+**Phasing.** P1 cabinet + single player (attract mode, owner-set game or menu,
+EmulatorJS in an opaque-origin frame under the policy above on every lane,
+P1 focus and controls, the
+CSS CRT pass on the stage) → the media lane with subscriptions (shared with
+the TV's screen share and karaoke), which brings the picture — bridged out
+of the frame as above — onto the prop's
+tube (#256) → P2 over video for the cabinets whose owner's game
+runs in one page (the double-wide cabinet's seats already play in lockstep,
+#242) → lockstep elsewhere only for the games that need it.
+
+## 10. Options considered
+
+| Option | Verdict | Why |
+|---|---|---|
+| Holder runs a browser and screen-shares it (the issue's first idea) | Rejected for public web video; kept for things that cannot be embedded (step 2) | Embed + sync costs no re-encode or uplink, gives each viewer their own quality, and DRM content captures black |
+| Owner-only remote | Rejected | Owner ruling: anyone holding the remote controls the TV; the lease gives possession semantics |
+| UTC-only sync | Rejected | Consumer clocks are minutes off; anchor on local receipt of the holder's heartbeat instead |
+| CSS3D iframe on the in-world plane in v1 | Deferred to spike S1 | Needs the renderer's opaque background moved to CSS and the Tauri referer check; the theatre panel delivers the sync first |
+| iroh-blobs for the host's files | Adopted (step 1) | No re-encode, every platform, reuses the reserved `'asset'` lane |
+| WebCodecs live lane | Adopted (step 2), audio first | Needed for voice, karaoke, screen share, arcade spectators |
+| Bundle headless Tribler | Rejected | Python runtime, GPL, second update train, and the room still cannot see the stream |
+| "Bring your own Tribler" REST hook | Allowed, desktop-only, out of scope for v1 | Days of work; hides nothing for the room |
+| Native IPv8 in Rust | Not now (stage-A spike only on request) | §8 |
+| librqbit torrent feature | Adopted with §6 rules | Single binary, DHT/PEX, streaming endpoint |
+| Per-viewer swarm fetch | Opt-in only | Exposes every viewer's IP; host-only fetch + blob lane hides N−1 |
+| Tor for torrent traffic | Rejected | No UDP; the Tor project asks people not to torrent through it |
+| I2P (`emissary`) | Watch; opt-in later | Experimental; passes the no-single-vendor rule that IPv8 fails |
+| WebTorrent in the browser | Rejected | Browsers cannot join classic swarms |
+| Lockstep netplay first for the arcade | Shipped for the built-in NES games (#248) and for the owner's EmulatorJS game at the double-wide cabinet (#242: up to four seated pages in step); the #250 replay spike matched every hash for a watcher too, the wiring the arcade thread's; P2-over-video kept for the one-page cabinets and for what replay cannot carry | One engine (jsnes) and a fixed library made determinism free, so the built-in games run on every page from pad bytes on the tick lane (§9); any libretro core would be a multi-week determinism spike, and the video lane is built for spectators anyway |
+| EmulatorJS netplay | Not depended on | WebRTC + its own signaling/TURN, marked unstable |
+| Spectators run the emulator themselves | Possible later | CPU per spectator and a save-state transfer; the video lane is cheaper at retro resolutions |
+| Sender-side distance gating | Rejected | The node is content-blind and tick positions are untrusted; viewer-pull matches the mesh's IWANT philosophy |
+| POWER ON takes the remote from a live holder | #186 as written in v1; the alternative open | #186 says whoever turns the set on holds the remote, and v1 does exactly that on every OFF→ON, a live holder's remote included — the previous holder sees the switch take it and presses or asks to take it back (§3.2). The alternative, a live holder keeping the remote across a body press (a body button moves nothing out of a hand; the switch hands over only a remote on the set or lapsed), is an OPEN OPTION for the owner, a one-line change in `tvDoc.ts` (#207), and not v1's behaviour until chosen |
+
+## 11. Final recommendations and sequence
+
+1. **TV v1, no node changes** (this PR line): TV furniture (wall mount + stand),
+   the `tv`/`remote` records, the lease remote on the phone, YouTube via the
+   IFrame API with full sync, archive.org files and direct URLs via `<video>`
+   with full sync for finite, seekable media (the archive embed, a live
+   stream or a host without usable ranges play start-time only, §3.3), the
+   countdown, the source tiles with their lane badges on the phone's remote
+   app and the panel at the set (the prop shows what is on, the countdown and
+   the holder; the start screen navigated on the prop is a later slice,
+   §3.3), the theatre panel.
+   **In #207 (merged 2026‑10‑12), serverless-only under the 2026‑10‑04 ruling (§3.3):** the
+   YouTube and archive tiles and PLAY FROM <host> are in the tree behind
+   `VITE_SSF_CONVENIENCE_LANES=1`; a default build plays a file on the
+   viewer's own origin or node. Spike
+   **S1** beside it: the CSS3D hole-punch with the ortho camera
+   plus the error-153 check on the three desktop shells.
+2. **Node media proxy** (`/api/media`, range + CORS, an origin table the
+   viewer's consent fills): textures
+   from archive.org files, spatial audio, the #194 CRT pass (the cabinets'
+   tube of #256, `arcadeCrt.ts`, is the material to reuse on the TV's
+   screen); the cabinet's ROM fetch uses the same route.
+3. **Blob lane** (`iroh-blobs`): the host's files, prefetched during the
+   countdown; the room side of torrents; the station library.
+4. **`torrent` feature** (`librqbit`) under §6's rules; PeerTube tile.
+5. **Audio lane** (WebCodecs Opus over the node): #189, then karaoke tier 2 and
+   the #190 calls; media subscriptions by distance on the node.
+6. **Video lane:** screen share, arcade spectators, then P2 over video.
+7. **Arcade P1** can proceed in parallel with 1–2 (it needs no lane: a
+   built-in game, or the owner's file sent through the room, or a link on
+   the station; the proxy comes later for an owner's link on another
+   server, with the lanes on — #248 left no archive source on the
+   cabinet) — in #208 (merged 2026‑10‑12,
+   after #207; the ⚙️ gear in #243 and the one-game rework in #248 follow it)
+   under the same ruling: the CDN opt-in and links on other servers behind
+   the flag, the station lane's frame under a content-security policy (§9).
+8. **Not now:** IPv8/Tribler (stage-A spike only on request), per-viewer swarm
+   fetch by default, any built-in content search.
+
+## 12. Open decisions for the owner
+
+- ~~v1 sources: YouTube + archive.org + direct URL (recommended), PeerTube next.~~
+  **Decided 2026‑10‑04:** serverless sources only by default — a URL on the
+  viewer's own origin or node now, the file, torrent, karaoke and screen
+  tiles as they land; YouTube, archive.org and PLAY FROM <host> kept in the
+  tree behind `VITE_SSF_CONVENIENCE_LANES=1` (§3.3). PeerTube, when it
+  comes, behind the same flag.
+- Whether a station runs a library-station node, and who.
+- Whether the IPv8 stage-A spike is wanted at all after the library lands.
+- ~~The arcade shelf's default contents (homebrew/freeware first).~~
+  **Decided by #248 (2026‑10‑12):** no shelf — one game per cabinet, the
+  owner's pick in ⚙️ SETTINGS, from four built-in NES homebrew titles
+  (THWAITE on a cabinet nobody has set) or the owner's own file or link
+  (§9).
+- ~~Whether the CDN opt-in for emulator files is acceptable for
+  non-sovereign builds.~~ **Decided 2026‑10‑04:** not offered by default;
+  behind `VITE_SSF_CONVENIENCE_LANES=1` with the rest (§9).
+- ~~Whether release builds may bundle EmulatorJS and its cores, four of them
+  non-commercial.~~ **Decided 2026‑10‑12 (#255, merged 2026‑10‑13):** they
+  ship — every release carries the engine, all eleven cores and their
+  source; the four non-commercial cores because the station is
+  non-commercial and asks for no donations, and the two prebuilt unpackers
+  as EmulatorJS ships them (§9).
