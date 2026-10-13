@@ -526,6 +526,17 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   disallowed `Origin`, or no `Origin` without that same-origin metadata, is
   a 403 **before any DNS lookup or outbound connection**; `/blob` follows
   the same rule (§4). Only then the
+  URL itself — its scheme `http:` or `https:` and nothing else, and an
+  EMPTY userinfo, no username or password in it — checked on the initial
+  URL and again on every redirect target, the `Location` resolved against
+  the current URL first and then judged whole, before any lookup or
+  connection for it: a `file:`, `ftp:`, `data:`, `blob:` or `javascript:`
+  target, or a URL with credentials in it, ends the fetch (the gate makes
+  this check itself and trusts no earlier one of the record's, since a
+  redirect is the host's and not the record's; and an HTTP client that
+  turned userinfo into an `Authorization` header would break the
+  built-from-nothing rule below, so no URL with userinfo reaches the
+  client at all); then the
   host allowlist — and, because a loopback service that fetches URLs is an
   SSRF surface, the node resolves the name ITSELF and validates every
   address the answer holds: an IPv6 address that carries an IPv4 inside is
@@ -561,8 +572,9 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   connect — a rebinding resolver would answer the check with a public
   address and the connect with a private one, so "validated after DNS"
   alone checks one answer and connects on another. On EVERY redirect and
-  every retry the whole gate runs again from the top: the host allowlist on
-  the new target before any lookup, then the resolve, validate and pin
+  every retry the whole gate runs again from the top: the scheme and
+  userinfo check, then the host allowlist on the new target before any
+  lookup, then the resolve, validate and pin
   (redirects capped) — an allowed host can redirect anywhere, and a redirect
   that is not re-admitted is the end of the fetch. A size ceiling, a timeout
   on both ends of the pipe (an upstream that stalls, a reader that stops
@@ -1066,10 +1078,30 @@ skips persisting a snapshot past 1 000 000 bytes (`roomCache.ts`), while
 drawn from the cache's cutoff would reset the sync of every live room that
 had outgrown it. So the page bounds the document itself: its encoded
 state (`Y.encodeStateAsUpdate`, after Yjs's garbage collection of deleted
-content) is held under 1 000 000 bytes by refusing the local transaction
-that would carry it past — the room says ROOM FULL, and the owner
-compacts it, a fresh document from the current state with its history
-dropped, to write again — the same number the cache persists up to, so
+content) is held under 1 000 000 bytes by ADMITTING each local write
+before the live document sees it — a Yjs transaction mutates the live
+document synchronously and has no rollback, so a measure taken after one
+refuses nothing: the oversized state is already there, and undoing it
+writes more history — and the admission is therefore a STAGING step:
+every local room-document write goes through one helper (`roomWrite(fn)`,
+the only local writer; today some forty files under `src/` call
+`transact` on a document directly, tests among them, and a test scans for
+a `transact` or a Y-type mutation outside the helper, the way
+`editMode.test.ts` scans for a room-document write outside the owner
+gate), which runs `fn` in a transaction on a SHADOW document kept in
+lockstep with the live one — a client id of its own, synced to nobody,
+fed every update the live document applies, remote or local, as it is
+applied — captures the update the shadow transaction emits, measures the
+shadow (the running measure below: the last exact measure plus this
+update's bytes as the upper bound, the exact re-measure where that rule
+asks for one), and only if the result stays under the bound applies that
+same update to the live document (`Y.applyUpdate`, under the helper's
+origin), so the live document never holds a state past the bound for any
+reader, persister or frame to see; past it the shadow is rebuilt from the
+live document's state and nothing reaches the live document — the room
+says ROOM FULL with the write's size, and the owner compacts it, a fresh
+document from the current state with its history dropped, to write again
+— the same number the cache persists up to, so
 persistence and sync agree; a room found past the bound at load (one from
 before the rule) is synced read-only until compacted; and `YjsSync`
 refuses to emit a frame past the bound, so the reliable frame ceiling is
@@ -1713,8 +1745,9 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   the later of that same receipt and the newest `at` it accepted, so the
   mark always outlives the listing (a guard that fell before its seed
   could be re-admitted would be no guard; the floor never runs ahead of
-  the age clock, below) — a renewal with an older or equal `seq` for that
-  (node, hash) is a replay and ignored, the high-water mark kept per
+  the age clock, below; and within a first-come slot's TENURE, further
+  below, at whose end listing and mark go together) — a renewal with an
+  older or equal `seq` for that (node, hash) is a replay and ignored, the high-water mark kept per
   (node, hash) and persisted — under BOUNDS that hold against minting,
   since a node id is free to mint (§4), a map that grew with every id a
   member minted would never shrink, and a bound per id would bound
@@ -1781,9 +1814,33 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   lists at most seventy-two seeders, whatever the ids; in either pool
   expired marks are dropped first, and at capacity with none expired the
   newcomer is refused — ignored, no mark written — rather than a live mark
-  evicted into a replay; so a flood of minted ids fills the first-come
-  pool for a day and never more, and neither displaces nor shuts out the
-  station's own seeders, whose pool it cannot enter.
+  evicted into a replay. A first-come slot has a TENURE apart from the
+  mark's retention: a day on the age clock from the reader's FIRST
+  admission of that (node, hash), jittered by up to four hours per slot,
+  which no renewal extends — a renewal keeps the seeder listed inside its
+  tenure and moves nothing else — and at tenure's end the slot is released
+  and its mark dropped with it, a renewal arriving after that a NEW
+  admission under the caps, first-come again (the replay guard a released
+  mark gave covered an honest seeder's withdrawal for the tenure; an old
+  seed replayed after it lists for a day a seeder that is gone, which §4's
+  route rule already pays for by skipping a holder that fails). Without
+  that tenure a flood of minted ids, renewing every mark it held each
+  hour, would hold the pool for as long as it ran, since a renewal moved
+  both the listing and the mark forward. With it, what such a flood does
+  is still a PERSISTENT cost, stated plainly rather than bounded to a
+  day: ids are free, so a peer willing to announce 4 096 seeds a day and
+  renew them hourly takes most of the first-come pool for as long as it
+  keeps paying — released slots go first-come at release instants it
+  cannot predict, so honest newcomers take a share of them in proportion
+  to their announcements and no more, and a flood larger than everyone
+  else combined holds most of the pool. What that costs the reader is
+  bounded (4 096 marks and their renewals, verified under the per-link
+  rate limits), and what it takes from the station is a STRANGER's chance
+  to be listed in a first-come slot while the flood runs: it neither
+  displaces nor shuts out the station's own seeders, whose principal pool
+  it cannot enter, and a stranger with a principal (#231's membership
+  credential, once it exists) lists there. The first-come pool is best
+  effort by construction, and the design says so.
   Admission is by principal where one exists and first-come under the
   caps for the rest — and a signed `library-unseed` from the same node (a
   higher `seq` for that hash) or the item's `library-remove` withdraws it
