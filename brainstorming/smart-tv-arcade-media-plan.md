@@ -9,8 +9,8 @@ Issues: [#186 smart TV](https://github.com/Bella-Addormentata/StarStationFurlong
 Status: design of record for the TV, the cabinet and everything that moves media
 between players, consolidated from the research notes on #186 and #193
 (2026‑10‑03). Grounded in `prototypes/0.29.0-core-loop-demo` as of main on
-2026‑10‑12 — v0.39.0 in `version.ts`, with the Unreleased work of #207, #208,
-#242, #248 and #250 merged — and
+2026‑10‑13 (`330c692`) — v0.39.0 in `version.ts`, with the Unreleased work
+of #207, #208, #242, #248, #250, #255 and #256 merged — and
 in the sovereignty rules of [STUDY-Architecture v002 §3](AI%20BRAINSTORMING/STUDY-Architecture%20v002.md),
 the [Cabal DNS-free plan §3–§4](REVIEWS/REVIEW-20260707-Cabal-DNS-Free-Discovery-Plan.md)
 and [v007](AI%20BRAINSTORMING/STUDY-Architecture%20v007.md). Every option that
@@ -393,7 +393,9 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   `scene.background` into the CSS layer.
 - **Path B — a `<video>` into a `VideoTexture`** (node-proxied mp4, local file,
   blob, torrent). Lit, occluded, shader-able (the #194 CRT pass only works
-  here), audio through the `partyAudio.ts` graph with distance falloff. Needs
+  here: the picture tube #256 gave the cabinets, `arcadeCrt.ts`, is a material
+  on the screen mesh, which a `VideoTexture` can wear and an iframe cannot),
+  audio through the `partyAudio.ts` graph with distance falloff. Needs
   CORS-clean bytes: a `/api/media?url=…&cap=…` range pipe on the node. The
   pipe is a **request gate, not a response header**: the listener's existing
   origin allowlist (`wt_listener.rs`, `origin_allowed`) only decides whether
@@ -977,7 +979,7 @@ stream, two per link, so a frame declared and never sent holds a
 bounded buffer for fifteen seconds and then nothing — since today
 `ssf-p2p-node/src/main.rs` allocates the declared length of a reliable
 frame as it stands and reads it with `read_exact` and no deadline
-(lines 1614–1619, the ysync reader, and 2488–2493), so an admitted peer
+(lines 1813–1818, the ysync reader, and 2886–2891, as of main `330c692`), so an admitted peer
 can make a node allocate 4 GiB for one frame by declaring it, or hold a
 reader task for ever by never finishing one: that is a hole the node
 has with or without media, and the reader hardening — the ceiling, the
@@ -2141,14 +2143,28 @@ cores in WASM) for the owner's own game — single-player, the menu,
 save states, gamepads and touch; its own netplay is WebRTC-based with its own
 signaling and STUN/TURN and is marked unstable, so it is not depended on.
 Lockstep for an EmulatorJS game needs a libretro core driven per frame (a
-thin harness, the P2 spike). Licences to review before bundling: EmulatorJS GPL-3.0, FBNeo
-non-commercial clause, MAME a GPL-2.0/BSD-3 mix. The emulator data files are
-**not** vendored into the repository (size); they are fetched into
-`public/emulatorjs/` by a script (`npm run fetch:emulatorjs`), and the CDN is
-an opt-in labelled CONVENIENCE that exists only in a build with the
-convenience lanes on (`VITE_SSF_CONVENIENCE_LANES=1`: the 2026‑10‑04 ruling,
-§3.3 — a record that says CDN reads as the station's files in a default
-build, and a link on another server is refused at PUT ON with the reason).
+thin harness, the P2 spike). The emulator data files are **not** vendored
+into the repository (size); they are fetched into `public/emulatorjs/` by a
+script (`npm run fetch:emulatorjs`) — since #255 (merged 2026‑10‑13) from
+the npm registry the app already installs from, the engine and each core at
+one pinned version, every tarball checked against the registry's sha512 and
+the script's own pin, never from the CDN — and release builds carry them:
+EmulatorJS 4.2.1 and the eleven cores behind the cabinet's thirteen systems
+(about 46 MB a build), with their licence texts in `public/arcade/licenses/`,
+and every release attaches the source each part was built from
+(`emulatorjs-4.2.1-source.tar.xz`, 123 MB: each tree at the commit the
+core's own version string names, pinned in `scripts/emulatorjs-sources.json`),
+all but EmulatorJS's prebuilt 7z and zip unpackers, whose source nobody has
+published (a cabinet follow-up on `main`). The licence call is made:
+EmulatorJS and its RetroArch are GPL-3.0, six cores GPL-2.0 and mgba
+MPL-2.0, and FBNeo, MAME 2003-Plus, Snes9x and Genesis Plus GX forbid
+commercial use — they ship because Star Station Furlong is non-commercial
+and asks for no donations (Dorkmo, 2026‑10‑12; `public/arcade/README.md`
+says what a sold build would have to leave out). The CDN remains an opt-in
+labelled CONVENIENCE that exists only in a build with the convenience lanes
+on (`VITE_SSF_CONVENIENCE_LANES=1`: the 2026‑10‑04 ruling, §3.3 — a record
+that says CDN reads as the station's files in a default build, and a link
+on another server is refused at PUT ON with the reason).
 The emulator never runs in the page's own origin, whichever lane its files
 come from: engine code and ROM data are external inputs (a core is a
 third party's build, a ROM is whatever a file or a server held, and a
@@ -2231,12 +2247,20 @@ its own; a save state crosses the same way — EmulatorJS's own export is a
 download, which the sandbox refuses, so the state goes to the page by
 `postMessage` and the page offers the file (a P1 follow-up), an opaque
 origin having no storage of its own and a station-side store being the
-blob lane's; the desktop shells' protocol handlers must answer the
-engine's fetches the same way, and the IPC bridge must be absent from the
-frame (`__TAURI_INTERNALS__` undefined inside it, else the shell's
-isolation pattern) — both verified by the fetch spike, which is also
-where a policy directive EmulatorJS needs would show, as a console
-refusal naming it (its files are never in the repository). What no policy
+blob lane's; the desktop shell's protocol handler answers the engine's
+fetches the same way since #255 (merged 2026‑10‑13): the window is built in
+`setup` (`"create": false` in `tauri.conf.json`) so that every response
+under `/emulatorjs/` carries `Access-Control-Allow-Origin: *` — the frame's
+fetches arrive with `Origin: null`, which the app protocol's own header,
+the window's origin, refused — and `frame.html`'s policy names
+`tauri://localhost`, the app's origin on Linux and macOS; tried in the
+Linux build (WebKitGTK under tauri-driver, each fix needed when taken out
+alone) and with Windows' headers imitated in Chromium, macOS and Windows
+themselves untried until the next release builds there; the IPC bridge
+must be absent from the frame (`__TAURI_INTERNALS__` undefined inside it,
+else the shell's isolation pattern), which stays the fetch spike's to
+verify, as is where a policy directive EmulatorJS needs would show, as a
+console refusal naming it (its files are never in the repository). What no policy
 of the frame's own and no sandbox flag forbids is the frame navigating
 ITSELF: a document may always leave for another URL — and once it has
 left, the policy it left under governs nothing of what arrives, which
@@ -2280,9 +2304,16 @@ loads, connections and workers, which is where an emulator's traffic is.
 lives in P1's stage panel (DOM) with a CSS scanline-and-vignette pass, and the
 cabinet's `CanvasTexture` shows the attract card and "P1 · name" — the TV's
 posture (§3.4), for the TV's reason: nothing else in the room can see P1's
-canvas yet. The canvas on the prop's texture, with the #194 shader pass, comes
-with the spectator lane, which is what puts the picture in front of other
-players in the first place. Focus is the device-focus first-person framing;
+canvas yet. Since #256 (merged 2026‑10‑13) that texture is on a picture
+tube: every cabinet's screen is a curved, round-cornered CRT face about
+7.5 cm behind smoked glass in an opaque bezel, and the tube's own material
+(`arcadeCrt.ts`, one fragment pass through `onBeforeCompile`, no
+post-processing) draws the scanlines, bleed, glow, flicker and vignette over
+whatever the canvas holds — the attract card, a built-in NES game — so the
+canvas painters bake none of their own; the double-wide's two tubes sit
+behind one pane and act as one 8:3 screen, half the picture each. The
+owner's game on that tube comes with the spectator lane, which is what
+puts the picture in front of other players in the first place. Focus is the device-focus first-person framing;
 keyboard first (RetroPad defaults, WASD suppressed while at the controls),
 Gamepad API, mouse under pointer lock as a trackball, the virtual gamepad on
 Android.
@@ -2292,8 +2323,8 @@ EmulatorJS in an opaque-origin frame under the policy above on every lane,
 P1 focus and controls, the
 CSS CRT pass on the stage) → the media lane with subscriptions (shared with
 the TV's screen share and karaoke), which brings the picture — bridged out
-of the frame as above — and the texture
-CRT pass to the prop → P2 over video for the cabinets whose owner's game
+of the frame as above — onto the prop's
+tube (#256) → P2 over video for the cabinets whose owner's game
 runs in one page (the double-wide cabinet's seats already play in lockstep,
 #242) → lockstep elsewhere only for the games that need it.
 
@@ -2339,8 +2370,9 @@ runs in one page (the double-wide cabinet's seats already play in lockstep,
    **S1** beside it: the CSS3D hole-punch with the ortho camera
    plus the error-153 check on the three desktop shells.
 2. **Node media proxy** (`/api/media`, range + CORS, host allowlist): textures
-   from archive.org files, spatial audio, the #194 CRT pass; the cabinet's ROM
-   fetch uses the same route.
+   from archive.org files, spatial audio, the #194 CRT pass (the cabinets'
+   tube of #256, `arcadeCrt.ts`, is the material to reuse on the TV's
+   screen); the cabinet's ROM fetch uses the same route.
 3. **Blob lane** (`iroh-blobs`): the host's files, prefetched during the
    countdown; the room side of torrents; the station library.
 4. **`torrent` feature** (`librqbit`) under §6's rules; PeerTube tile.
@@ -2376,3 +2408,9 @@ runs in one page (the double-wide cabinet's seats already play in lockstep,
 - ~~Whether the CDN opt-in for emulator files is acceptable for
   non-sovereign builds.~~ **Decided 2026‑10‑04:** not offered by default;
   behind `VITE_SSF_CONVENIENCE_LANES=1` with the rest (§9).
+- ~~Whether release builds may bundle EmulatorJS and its cores, four of them
+  non-commercial.~~ **Decided 2026‑10‑12 (#255, merged 2026‑10‑13):** they
+  ship — every release carries the engine, all eleven cores and their
+  source; the four non-commercial cores because the station is
+  non-commercial and asks for no donations, and the two prebuilt unpackers
+  as EmulatorJS ships them (§9).
