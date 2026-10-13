@@ -252,12 +252,14 @@ describe('the monitor bay (#194)', () => {
       expect(pane.userData.baseOpacity).toBeGreaterThan(0.1);
       expect(pane.userData.baseOpacity).toBeLessThan(0.6);
       expect(pane.depthWrite).toBe(false);
-      // In front of the tube by a few inches, along the way the cabinet faces.
-      const tubeZ = new THREE.Box3().setFromObject(tubeMesh).getCenter(new THREE.Vector3()).z;
+      // In front of the tube's nearest point (its tilted-forward, bulged
+      // bottom edge) by a few inches, along the way the cabinet faces.
+      const tubeBox = new THREE.Box3().setFromObject(tubeMesh);
+      const nearest = face === 1 ? tubeBox.max.z : tubeBox.min.z;
       for (const g of glass) {
         const glassZ = new THREE.Box3().setFromObject(g).getCenter(new THREE.Vector3()).z;
-        expect((glassZ - tubeZ) * face).toBeGreaterThan(0.05);
-        expect((glassZ - tubeZ) * face).toBeLessThan(0.12);
+        expect((glassZ - nearest) * face).toBeGreaterThan(0.05);
+        expect((glassZ - nearest) * face).toBeLessThan(0.12);
       }
     });
   }

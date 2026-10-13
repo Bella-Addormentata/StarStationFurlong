@@ -160,7 +160,7 @@ const CRT_MAP_FRAGMENT = /* glsl */ `
   crtCol = uCrtRest + crtCol * (1.0 - uCrtRest);
   diffuseColor.rgb *= mix(uCrtRest * 0.5, crtCol, crtLit);
   // A soft sheen on the curved glass, high and to the left.
-  diffuseColor.rgb += vec3(0.03) * smoothstep(0.45, 0.0, length((vMapUv - vec2(0.28, 0.8)) * vec2(1.0, 1.6)));
+  diffuseColor.rgb += vec3(0.03) * (1.0 - smoothstep(0.0, 0.45, length((vMapUv - vec2(0.28, 0.8)) * vec2(1.0, 1.6))));
 #endif
 `;
 

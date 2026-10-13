@@ -11188,13 +11188,21 @@ interface ArcadeMonitorBay {
 }
 /** The glass's margin around the tube, each side. */
 const BAY_GLASS_MARGIN = 0.015;
-/** Glass to tube face: a few inches. */
+/** Glass to the tube face's nearest point: a few inches. */
 const BAY_TUBE_SETBACK = 0.075;
+/** The tube face's bulge, as a share of its height. */
+const BAY_TUBE_BULGE = 0.04;
 /** The bezel plate's thickness, standing proud of the face. */
 const BAY_BEZEL_T = 0.012;
-/** How deep the cavity runs behind the face for a bay with tubes this tall. */
+/** How far behind the face the tube's centre sits: the setback, plus what
+ *  the tilt brings the bottom edge forward, plus the bulge. */
+function arcadeTubeZ(tubeH: number, tilt: number): number {
+  return -(BAY_TUBE_SETBACK + (tubeH / 2) * Math.sin(tilt) + BAY_TUBE_BULGE * tubeH);
+}
+/** How deep the cavity runs behind the face for a bay with tubes this tall:
+ *  past the tube's top edge, which the tilt takes back as far again. */
 function arcadeBayDepth(tubeH: number, tilt: number): number {
-  return BAY_TUBE_SETBACK + (tubeH / 2) * Math.sin(tilt) + 0.04;
+  return -arcadeTubeZ(tubeH, tilt) + (tubeH / 2) * Math.sin(tilt) + 0.02;
 }
 function placeArcadeMonitorBay({ m, attach }: BuildCtx, spec: ArcadeMonitorBay): THREE.Mesh[] {
   const bay = new THREE.Group();
@@ -11253,7 +11261,7 @@ function placeArcadeMonitorBay({ m, attach }: BuildCtx, spec: ArcadeMonitorBay):
     }
     // Glass in the bezel's slot, its edges hidden in the plate.
     add(new THREE.PlaneGeometry(gw + 0.01, gh + 0.01), glass, x, spec.tubeY, BAY_BEZEL_T / 2);
-    const tube = add(crtFaceGeometry(spec.tubeW, spec.tubeH, 0.04 * spec.tubeH), spec.material, x, spec.tubeY, -BAY_TUBE_SETBACK);
+    const tube = add(crtFaceGeometry(spec.tubeW, spec.tubeH, BAY_TUBE_BULGE * spec.tubeH), spec.material, x, spec.tubeY, arcadeTubeZ(spec.tubeH, spec.tilt));
     tube.rotation.x = -spec.tilt;
     tube.onBeforeRender = () => crtTick(performance.now() / 1000);
     return tube;
