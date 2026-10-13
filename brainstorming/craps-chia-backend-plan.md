@@ -31,7 +31,7 @@ changing gameplay? Research + options + the seam to build now. -->
   current logic as the `local` implementation, a `chia` stub, and a per-table
   toggle) — default `local`, so nothing changes today. Implement the `chia` stub
   later, gated on the same two spikes [[games-plan]] Phase 5 already names: the
-  **B-7 wallet spike** and a **chia-gaming integration spike**.
+  **B-7 wallet spike** and a **chia-gaming integration spike** *(erratum 2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231): B-7 gates browser chain code only; the wagering gates are S-0, then S-2, PR E and PR F, see §8)*.
 
 ## 0. Decisions (owner, 2026-07-23)
 
@@ -287,7 +287,7 @@ the same game regardless of what settles it underneath.
 |---|---|---|
 | **G5a — build now** | The backend seam: `CrapsBackend` interface, `LocalCrapsBackend` (today's logic), `ChiaCrapsBackend` stub, per-table toggle. Default local; **zero gameplay change** | No |
 | **G5b** | Shared-dice **commit-reveal + block beacon** (§3b) under a *still-local* settlement. A large trust win (provably fair dice) that needs only **read-only** chain access — no channels, no wallet | No (read-only chain) |
-| **G6a** | One player↔house **channel** proof on testnet11: fund, bet, settle, close; the payout **referee puzzle** = a `resolveCrapsBet` port, differential-tested vs the TS engine | Yes (B-7) |
+| **G6a** | One player↔house **channel** proof on testnet11: fund, bet, settle, close; the payout **referee puzzle** = a `resolveCrapsBet` port, differential-tested vs the TS engine | Yes (B-7; erratum 2026-10-11: S-0, then S-2, PR E and PR F, see §8) |
 | **G6b** | **N channels sharing one beacon-anchored dice**; buy-in/cash-out = channel open/close; chips as **CATs** | Yes |
 
 G5b is the sweet spot to chase first after the seam: it delivers *provable
@@ -427,7 +427,7 @@ behind.
   session** — it needs an on-machine testnet run to confirm, exactly like the
   2026-07-16 presence verification. Nothing here is run-verified yet.
 - **Scope.** Fairness records prove the *transcript*, not settlement. **Chips stay
-  room-doc integers**; on-chain CATs + channels remain B-7-gated (§8).
+  room-doc integers**; on-chain CATs + channels remain B-7-gated (§8; erratum 2026-10-11: gated on S-0, then S-2, PR E and PR F, see §8's erratum).
 - **Residual.** A house that also farms testnet netspace could still grind/withhold
   the beacon block (option (c) hardening) — unchanged from §0.
 

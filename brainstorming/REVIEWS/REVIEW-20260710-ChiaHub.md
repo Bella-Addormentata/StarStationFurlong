@@ -40,7 +40,7 @@
 - ❌ No DataLayer (its data plane needs HTTP mirrors — servers by another name).
 - ❌ No on-chain plaintext, ever (§7).
 
-**Standard or custom wallet?** Standard *primitives*, custom *software*: the node drives these spends itself via the **chia-wallet-sdk** (Rust; already pinned in v006 §12.1 and already scheduled for audit as spike **B-7**). A human with the stock GUI wallet couldn't operate this lane by hand — but nothing about it requires anything the standard wallet protocol doesn't already do. Light-wallet mode works against any farmer's full node; running your own full node upgrades you to the fast path (§4.2).
+**Standard or custom wallet?** Standard *primitives*, custom *software*: the node drives these spends itself via the **chia-wallet-sdk** (Rust; already pinned in v006 §12.1 and already scheduled for audit as spike **B-7**; erratum 2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231): B-7 is the browser WASM audit, and the node-side crates are covered by S-0's chain-access crate audit, sovereign plan §11 / §14). A human with the stock GUI wallet couldn't operate this lane by hand — but nothing about it requires anything the standard wallet protocol doesn't already do. Light-wallet mode works against any farmer's full node; running your own full node upgrades you to the fast path (§4.2).
 
 ---
 
@@ -167,7 +167,7 @@ Cost: slightly more complex spend construction; same wallet-grade primitives.
 
 | Phase | Deliverable | Acceptance criterion |
 |---|---|---|
-| **C0** *(= spike B-7, already on the critical path)* | chia-wallet-sdk audit confirms: memo-attach on spend construction, lookup-by-hint query surface, spend-to-self flow, singleton drivers, WASM/browser posture | API table with exact names/versions; **[VERIFY] items in §9 closed** |
+| **C0** *(= spike B-7, already on the critical path; erratum 2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231): C0 is not B-7, see §9)* | chia-wallet-sdk audit confirms: memo-attach on spend construction, lookup-by-hint query surface, spend-to-self flow, singleton drivers, WASM/browser posture | API table with exact names/versions; **[VERIFY] items in §9 closed** |
 | **C1** | Presence records on **testnet11**: publish + resolve behind `SSF_CHIA_LANE=1`, wired as a hint source into the existing dial path | Two nodes on different networks, **no other discovery lane enabled**, resolve each other's live records and complete a dial where physics allow |
 | **C2** | Block-clock punch (§4.1) + skew/pinhole measurement | Firewalled-IPv6 pair (the current playtest topology!) establishes a direct link with **chain-only coordination**; measured skew + success table by NAT type recorded |
 | **C3** | Mempool watcher fast path (local full node) | Signaling latency ≤ 10 s end-to-end, measured |
