@@ -414,12 +414,51 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   the node is another PROCESS — spawned by the shell, or already running
   (`src-tauri/src/main.rs`, `acquire_p2p_node`), the shell holding only an
   HTTP placeholder for it — so the hand-off crosses that boundary where the
-  OS already authenticates: the node writes the token at launch to a file in
-  its per-user data dir readable by that user alone (a spawned node also
-  takes a pairing secret from the shell's environment and writes the file
-  under it), the shell's Rust side reads the file and hands the token to
-  its own webview over `invoke` — never over HTTP. "Readable by that user
-  alone" is a creation property, never a tightening after the fact, and it
+  OS already authenticates, and the boundary is the OS USER, stated so that
+  nobody reads more into the token than it holds: it keeps PAGES out
+  (another origin that can reach loopback — a dev server, another app's
+  local UI, a page in the user's browser — the boundary a browser enforces
+  and the one the proxy's gate is for), and it keeps out every OTHER USER's
+  process on a shared machine; it does not and cannot keep out another
+  process running as the same user, which can read the node's identity key
+  in the same data dir, its room caches and the shell's memory, and needs
+  no proxy to fetch a URL — no file mode, environment variable or pairing
+  secret moves that line (a spawned node's environment is readable from
+  `/proc/<pid>/environ` by its own user), so the design claims nothing
+  against it. Within that boundary the hand-off is a PAIRING, in both
+  modes, and never port occupancy: the node writes the token at launch to
+  a file in its per-user data dir readable by that user alone (a spawned
+  node also takes a pairing secret from the shell's environment and writes
+  the file under it), and the shell's Rust side reads the file and, before
+  it hands the token to anything, PROVES the listener holds it — a fresh
+  32-byte random challenge to `POST /api/media-cap/prove` on the node's
+  HTTP origin as the shell discovered it, answered with
+  `HMAC-SHA256(key = token, msg = "ssf-media-cap-v1" ‖ challenge)` and
+  checked against the token the file gave, the token itself crossing HTTP
+  in neither direction — and only then hands it to its own webview over
+  `invoke`, never over HTTP. Today `acquire_p2p_node` takes whatever has
+  UDP 4443 bound for the node and points the page at `127.0.0.1:8080`
+  regardless, and a port is not a user's: on a shared machine the first
+  process to bind it wins, whoever runs it. So a listener that cannot
+  answer the proof — another user's process on the port, a stale file
+  from a launch that crashed, a legacy node without the module — is
+  UNPAIRED: the shell hands its webview no token, the tile says PROXY
+  UNAVAILABLE and nothing fetches, and the rest of the shell carries on
+  as it does today (the pairing gates the proxy and the `/blob` route and
+  nothing else; this plan widens nothing else). The proof runs once per
+  launch and again whenever the node's HTTP origin is re-discovered (8080
+  taken, 8081 found) or a request comes back 401 — a cap the listener
+  does not know, so the listener changed — and a node that exits or fails
+  a re-proof revokes the page's token: the shell tells its webview, the
+  lane goes unavailable, and no further request carries the cap. What
+  remains is the cap travelling in a query string to whatever answers
+  that port at request time: a process that takes the port between the
+  proof and a request learns the cap from the first request — a same-user
+  process, outside the boundary above, or another user's after the node
+  has exited, which the revocation covers but for the requests in flight;
+  the cap is bound to the origin it was proven on (scheme, host, port) and
+  sent to no other, and the listener binds loopback alone. "Readable by
+  that user alone" is a creation property, never a tightening after the fact, and it
   is defined per platform: on Unix, mode 0600 at creation
   (`OpenOptions::mode(0o600)` with `create_new`); on Windows, where a mode
   means nothing, a security descriptor set at creation whose DACL is
@@ -462,8 +501,9 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   is the authority and the origin list only a filter. A browser page, in development, gets it from a dedicated
   `/api/media-cap` endpoint whose allowlist is the EXACT origins named in
   `SSF_ALLOWED_ORIGINS`, never a loopback wildcard. Where no such channel
-  exists — a node whose data dir the shell cannot read, a page on an origin
-  the list does not name — the proxy is unavailable and so is the lane:
+  exists — a node whose data dir the shell cannot read, an external node
+  that fails the pairing proof, a page on an origin the list does not
+  name — the proxy is unavailable and so is the lane:
   the tile says PROXY UNAVAILABLE and nothing fetches, never a fall back
   to the direct URL, which the proxy retires (the critical-path item's
   done-when in the TODO: the browser's direct fetches of those URLs are
@@ -667,14 +707,39 @@ roster, px or mesh-join, or a member the browser's bootstrap envelope
 hints, is dialled by id, the payload's addresses discarded, the
 envelope's two hint fields reduced to ids and those ids admitted and
 budgeted before any dial (a member's self-reported address is a claim like any other:
-the signature proves it is theirs, not that they answer there), a hinted
-dial kept for what the viewer asked for, under the budget below — and
+the signature proves it is theirs, not that they answer there) — and
+"admitted and budgeted" is arithmetic the reader does in constant work
+per hint, under the room lock, before any lookup and before any
+`tokio::spawn`, since today the WT reader spawns one `dial_peer_with_retry`
+ladder per distinct hinted id as the envelope arrives, bounded by nothing
+but the single-flight set (`hub.dialing`: one ladder per id at a time, any
+number of ids), and does so before the signature check, which on that lane
+is the local page's own and gates nothing: **(i)** an envelope's roster
+hints are admitted up to `ROOM_HINT_CAP` = 32 ids, the primary counted,
+the rest dropped with the envelope kept and the drop logged once a minute
+per room; **(ii)** an admitted id that is not connected, not already
+dialling and not under backoff joins the room's pending dial queue, a FIFO
+of `DIAL_QUEUE_CAP` = 64 de-duplicated by id, a full queue dropping the
+newest; **(iii)** ladders start from the queue alone, into
+`DIALS_IN_FLIGHT_ROOM` = 4 slots per room and `DIALS_IN_FLIGHT_NODE` = 16
+per node (a ladder holds its slot from spawn to its last attempt), at
+most one new ladder a second per room with a burst of four, so a stream
+of envelopes each naming fresh ids spawns no faster whatever it carries;
+**(iv)** per id, a ladder that fails backs off 60 s before the queue may
+hold that id again, and after four failed ladders in a session the id is
+dialled automatically no more (a join the player asks for resets it);
+and the graft dial of a gossip candidate (`CANDIDATE_CAP` = 256 already
+bounds the map it is drawn from) starts through the same queue and
+slots, so the two paths share one bound, the per-address bytes budget
+below riding under all of it; a hinted dial kept for what the viewer
+asked for, under the budget below — and
 the mesh-upgrade dial of a gossip-learned id goes to a route observed on
 an authenticated connection where one exists (the hub's, or the
 connection the envelope arrived on when its peer is the origin), and
 otherwise through discovery under exactly the per-id, per-address and
-global dial budget below — bytes counted at the socket, backoff, a cap on
-automatic dials in flight. That dial is the ONE automatic handshake this
+global dial budget below — bytes counted at the socket, backoff, the
+pending queue and in-flight slots above. That dial is the ONE automatic
+handshake this
 design lets discovery place, and it is a decision, not an oversight: a
 member who joins a room consents to its mesh — the dial reaches the ids
 the room's own signed envelopes name, and spends nothing a fetch would
@@ -749,8 +814,9 @@ node send it a handshake. The blob lane dials from none of them; that
 bootstrap dial, with the mesh's graft dial, which today still dials a
 roster, px or mesh-join candidate from the hints it came with, are the
 prerequisite above — the envelope's two hint fields reduced to ids,
-admitted and budgeted before any dial, their addresses discarded, as the
-gossip candidates' are. A library seeder's signed entry (§7)
+admitted and budgeted before any dial (the roster cap, the pending queue
+and the in-flight slots above, enforced in the reader before any lookup
+or spawn), their addresses discarded, as the gossip candidates' are. A library seeder's signed entry (§7)
 names its node id, dialled the same way. So the fall-back to a seeder
 nobody is connected to is a dial by id through discovery — never to an
 address a stranger supplied — and holding is proven by serving bytes the
