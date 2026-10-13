@@ -296,7 +296,7 @@ dependency, because reading a block hash is not a spend.
 
 ## 8. Dependencies & gates (unchanged from repo posture)
 
-> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** B-7 gates browser chain code only; the node-side chips and channels wait on the chain-access seam (S-0, [sovereign plan §6 / §14](sovereign-treasury-serverless-plan.md)) and its crate audit, not on B-7.
+> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** B-7 gates browser chain code only; none of this plan waits on B-7. Node-side chips and channels wait on the chain-access seam and its crate audit (S-0, [sovereign plan §6 / §14](sovereign-treasury-serverless-plan.md)) for chain access, and then on S-2, PR E and PR F for the CAT, channel and custody wallet capability, which §14 moves there; S-0 alone clears nothing that moves money.
 
 - **B-7 wallet spike** — key custody, XCH balance, spend signing. Hard gate for any
   channel/settlement work (same gate as [[games-plan]] Phase 5 and
@@ -399,7 +399,7 @@ the part of craps that fits testnet11 **now** — the fairness layer, not the ch
 
 ### 12.3 Why this dodges the B-7 gate
 
-> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** the gate this section dodges no longer applies to the node side at all (B-7 gates browser chain code only); fairness records and chips alike wait on S-0's chain-access seam. The shipped primitive reused here has since moved to per-node records ([#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254)).
+> **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** the gate this section dodges no longer applies to the node side at all (B-7 gates browser chain code only); fairness records wait on S-0's chain-access seam; chips and channels wait on S-0 and then on S-2, PR E and PR F for the CAT, channel and custody wallet capability ([sovereign plan §14](sovereign-treasury-serverless-plan.md)). The shipped primitive reused here has since moved to per-node records ([#254](https://github.com/Bella-Addormentata/StarStationFurlong/pull/254)).
 
 It is the **same spend-to-self** the presence lane already runs — no CAT
 mint/melt, no channel coins, no arbitrary-recipient spends. The general wallet SDK
