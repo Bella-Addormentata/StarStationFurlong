@@ -574,9 +574,12 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   consents die within a minute and a half at most; a grant is keyed by
   (`sid`, origin), every `/api/media` and `/blob` request carries `sid`
   beside `cap` (both in the URL, since a `<video>` sets no header — the
-  cap's residual, bound to the proven origin), and a request whose `sid`
-  holds no live grant for the URL's origin is a 403 before any lookup —
-  so a consent is one page's, as `acceptMediaOrigin`'s set is one page's
+  cap's residual, bound to the proven origin), and an `/api/media` request
+  whose `sid` holds no live grant for the UPSTREAM URL's origin is a 403
+  before any lookup — `/blob` needs no grant: its origin is the node's own
+  and it fetches no upstream (§4: it serves what the store holds or is
+  fetching and starts nothing), so the cap, a live `sid` and the `Origin`
+  or fetch-metadata rule admit it, the hash being the name — so a consent is one page's, as `acceptMediaOrigin`'s set is one page's
   today, and a sibling tab, another room in it or a reload of the same
   tab starts with none; a grant leaves the table when its session ends
   or lapses, when the viewer forgets consents (the page ends its session
@@ -734,10 +737,13 @@ node (v006 §12.1 already pins it; the `'asset'` envelope kind is reserved for
 it). The host's node imports a file as a BLAKE3 blob; viewers' nodes fetch it
 (verified, resumable, in order, so playback can start early) and serve it to
 their own webview at `/blob/<hash>?cap=…` with range support, behind the
-same request gate as `/api/media` (§3.4): the per-launch capability token
-and an allowed `Origin` — or `Sec-Fetch-Site: same-origin` in its place,
-the proxy's rule — checked before any read of the store, the element in
-CORS mode so that a cross-origin one sends an `Origin`. Every `/blob`
+same request gate as `/api/media` (§3.4): the per-launch capability token,
+the page's live session (`sid`) and an allowed `Origin` — or
+`Sec-Fetch-Site: same-origin` in its place, the proxy's rule — checked
+before any read of the store, the element in CORS mode so that a
+cross-origin one sends an `Origin`; and no ORIGIN GRANT, which is
+`/api/media`'s for an upstream — this route has none, its origin is the
+node's own, and the hash is the name. Every `/blob`
 response carries `Cache-Control: private, no-store` (the proxy's responses
 the same): a webview's HTTP cache keeps the ranges it was served, and
 without the header delete-on-leave and eviction would remove the store's
@@ -1246,7 +1252,14 @@ reset a late joiner's sync. So the ROM share moves to the blob lane first
 (§4, the lane the cabinet's file was always to ride; §9), or to another
 transport outside the document, and until it has, no replica enforces
 the bound, the cache goes on skipping the snapshots it cannot hold, and
-the ceiling is not drawn. And the bound holds at the RECEIVER too, in
+the readers' ceiling is PROVISIONAL: the hardening above lands now — the
+deadlines, the geometric buffers, the unfinished-frame caps, the field
+maxima — under a prefix ceiling of 16 MiB (16 777 216 bytes), what a
+baseline carrying the cabinet's whole 8 MiB file base64-expanded can
+reach, with room, so no valid cabinet transfer or late-join baseline is
+refused; the 1 400 000-byte ceiling comes with the bound, in the same
+change as spike `#18`'s migration, which is that ceiling's explicit
+predecessor. And the bound holds at the RECEIVER too, in
 both replicas, since a local-write check binds only honest pages:
 `YjsSync` applies every inbound update as it arrives
 (`src/network/YjsSync.ts`) and the node's replica does the same
