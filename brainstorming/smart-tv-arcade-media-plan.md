@@ -734,6 +734,16 @@ addresses, room-written — into every envelope it sends its node
 (`src/network/YjsSync.ts`, `iroh_relay_urls`, `iroh_direct_addrs`,
 `iroh_member_hints`), and the node's WT reader dials each hinted member
 with them as given, before it checks the envelope at all (its M4 dials);
+and an imported INVITE is a fourth, the one source that exists before any
+room state: a pasted pass, or a `?seed=` link opened on load —
+`decodeBootstrapSeed` (`src/main.ts`) takes the invite's `memberHints`
+and their addresses as given, the import is registered at once and the
+page enters the lobby with no press, the boot record carries them, and
+the page's first envelope hands them to the node, which dials them as
+above; a pass's `sigB64`, where one is present and checked, binds the
+invite to its issuer and proves nothing about who answers at an address,
+so a link in a chat has the node of whoever opens it send handshakes
+wherever the link says;
 the envelope's signature, where it is checked, is the local page's own
 and vouches for no address. And the empty
 hints close the RELAYED hint and not the reflection: with empty hints
@@ -757,7 +767,7 @@ ladder per distinct hinted id as the envelope arrives, bounded by nothing
 but the single-flight set (`hub.dialing`: one ladder per id at a time, any
 number of ids), and does so before the signature check, which on that lane
 is the local page's own and gates nothing: **(i)** an envelope's roster
-hints are admitted up to `ROOM_HINT_CAP` = 32 ids, the primary counted,
+hints — the room's, or an imported invite's, (v) below — are admitted up to `ROOM_HINT_CAP` = 32 ids, the primary counted,
 the rest dropped with the envelope kept and the drop logged once a minute
 per room; **(ii)** an admitted id that is not connected, not already
 dialling and not under backoff joins the room's pending dial queue, a FIFO
@@ -770,6 +780,15 @@ of envelopes each naming fresh ids spawns no faster whatever it carries;
 **(iv)** per id, a ladder that fails backs off 60 s before the queue may
 hold that id again, and after four failed ladders in a session the id is
 dialled automatically no more (a join the player asks for resets it);
+**(v)** the hints an imported invite carries start no dial on import or on
+page load: the page registers the invite and shows the JOIN card — the
+room, the host's id, the number of members it names — and dials only on
+the press, one join the player asked for, under the same caps and the
+per-address bytes budget below, the invite's addresses used for that join
+alone and dropped once the room's signed envelopes name the roster (a
+pass's signature, where present and checked, binds it to its issuer and
+vouches for no address), so a crafted link costs its opener nothing until
+they press, and then at most what their own join may send;
 and the graft dial of a gossip candidate (`CANDIDATE_CAP` = 256 already
 bounds the map it is drawn from) starts through the same queue and
 slots, so the two paths share one bound, the per-address bytes budget
