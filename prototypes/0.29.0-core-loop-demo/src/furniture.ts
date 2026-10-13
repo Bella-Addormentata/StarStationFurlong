@@ -1766,20 +1766,32 @@ const WC_Y = 1.6; // mount height (panel centre)
 // 📺 Smart TV dimensions (#186) — declared beside the terminal's because the
 // registry table below reads them (consts are not hoisted); the builders
 // themselves sit after the party props.
-/** Set width / height (the panel, bezel included): a 1.3 m set (≈58"),
- *  16:9 plus a bezel — big enough to read across a room, narrow enough to
- *  hang between a doorway and a corner in the default 2×2 module. */
-const TV_W = 1.3;
-const TV_H = 0.8;
+/** The wall set (the panel, bezel included): 3 m wide — three grid squares,
+ *  ≈136" — so it reads from a chair across the room, not only from a pace
+ *  in front of it. 16:9 picture inside a 5 cm bezel. */
+const TV_BEZEL = 0.05;
+const TV_W = 3.0;
+const TV_H = tvPanelHeight(TV_W);
 const TV_D = 0.07;
-/** Wall mount: panel centre height — eye level, like the terminal. */
+/** Wall mount: panel centre height. A seated eye is ~1.15 m and a standing
+ *  one ~1.6 m; the 1.7 m-tall panel spans y 0.69–2.42 round this. */
 const TV_WALL_Y = 1.55;
+/** The stand's set: as wide as its 2-square cabinet holds (≈80"). */
+const TV_STAND_W = 1.8;
+const TV_STAND_H = tvPanelHeight(TV_STAND_W);
 /** The stand's cabinet, and the panel's centre standing on it. */
 const TV_STAND_CAB_H = 0.5;
-const TV_STAND_SCREEN_Y = TV_STAND_CAB_H + 0.06 + TV_H / 2;
-/** Screen texture: 16:9, pixel-text sharp at the prop's size. */
+const TV_STAND_SCREEN_Y = TV_STAND_CAB_H + 0.06 + TV_STAND_H / 2;
+/** Screen texture LAYOUT size: 16:9, the units every screen is drawn in.
+ *  Each set's canvas is this times a whole scale (attachTvSet), so the
+ *  bigger panels keep text sharp without a second layout. */
 const TV_TEX_W = 384;
 const TV_TEX_H = 216;
+
+/** A panel `w` wide: a 16:9 picture plus the bezel all round. */
+function tvPanelHeight(w: number): number {
+  return ((w - 2 * TV_BEZEL) * 9) / 16 + 2 * TV_BEZEL;
+}
 
 // 🕹 Arcade cabinet dimensions (#193) — beside the TV's for the same reason.
 /** Cabinet body: 0.7 m wide, 0.75 m deep, inside a 1×1 footprint. */
@@ -5246,7 +5258,10 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       kind: "smartTv",
       front: { x: 0, z: 1.0 },
       faceAngle: Math.PI,
-      eye: { x: 0, y: 1.5, z: 1.1 },
+      // Far enough back that the 50° focus camera frames the whole 3 m set
+      // (the avatar is hidden once the camera arrives, so standing behind
+      // the stand-point is fine).
+      eye: { x: 0, y: 1.5, z: 2.6 },
       anchor: { x: 0, y: TV_WALL_Y, z: 0.05 },
     },
   },
@@ -5261,7 +5276,7 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       kind: "smartTv",
       front: { x: 0, z: 1.5 },
       faceAngle: Math.PI,
-      eye: { x: 0, y: 1.3, z: 1.4 },
+      eye: { x: 0, y: 1.3, z: 1.8 },
       anchor: { x: 0, y: TV_STAND_SCREEN_Y, z: 0.1 },
     },
   },
@@ -10884,24 +10899,28 @@ const TV_HOME_TILES: ReadonlyArray<{ label: string; kind: string; live: boolean 
 ];
 
 /**
- * The set itself, centred on (0, cy, zFront) with the screen facing +z.
- * Stows the TvScreenHandle on the screen mesh (userData.tvScreen) so both
- * registration paths file it (furnitureHandles.ts).
+ * The set itself, `w` × `h`, centred on (0, cy) with its back at zBack and
+ * the screen facing +z. Stows the TvScreenHandle on the screen mesh
+ * (userData.tvScreen) so both registration paths file it
+ * (furnitureHandles.ts).
  */
-function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
+function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: number): void {
   const { m, place, addLight } = ctx;
   const HOUSING = 0x1a1f2a; // near-black bezel
   const TRIM = 0x3d4a5e;
   const ACCENT = 0xd4a84b;
 
-  place(new THREE.BoxGeometry(TV_W, TV_H, TV_D - 0.02), m(HOUSING, 0.55, 0.35), 0, cy, zBack + TV_D / 2 - 0.01);
+  place(new THREE.BoxGeometry(w, h, TV_D - 0.02), m(HOUSING, 0.55, 0.35), 0, cy, zBack + TV_D / 2 - 0.01);
   // A thin gold trim along the bottom edge — the "soundbar".
-  place(new THREE.BoxGeometry(TV_W * 0.92, 0.03, 0.03), m(ACCENT, 0.4, 0.5), 0, cy - TV_H / 2 + 0.03, zBack + TV_D - 0.005);
-  place(new THREE.BoxGeometry(TV_W - 0.06, TV_H - 0.06, 0.012), m(TRIM, 0.5, 0.3), 0, cy, zBack + TV_D - 0.012);
+  place(new THREE.BoxGeometry(w * 0.92, 0.03, 0.03), m(ACCENT, 0.4, 0.5), 0, cy - h / 2 + 0.03, zBack + TV_D - 0.005);
+  place(new THREE.BoxGeometry(w - 0.06, h - 0.06, 0.012), m(TRIM, 0.5, 0.3), 0, cy, zBack + TV_D - 0.012);
 
+  // The canvas is the layout size times a whole scale (≈300 px per metre of
+  // set), and every draw below works in layout units under that transform.
+  const texScale = Math.max(1, Math.round(w));
   const cv = document.createElement("canvas");
-  cv.width = TV_TEX_W;
-  cv.height = TV_TEX_H;
+  cv.width = TV_TEX_W * texScale;
+  cv.height = TV_TEX_H * texScale;
   const c2d = cv.getContext("2d")!;
   const screenTex = new THREE.CanvasTexture(cv);
   screenTex.minFilter = THREE.LinearFilter;
@@ -10909,14 +10928,14 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
   screenTex.generateMipmaps = false;
   screenTex.colorSpace = THREE.SRGBColorSpace;
   const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 });
-  const screen = place(new THREE.PlaneGeometry(TV_W - 0.1, TV_H - 0.1), screenMat, 0, cy, zBack + TV_D + 0.002);
+  const screen = place(new THREE.PlaneGeometry(w - 2 * TV_BEZEL, h - 2 * TV_BEZEL), screenMat, 0, cy, zBack + TV_D + 0.002);
   // The set's glow on the wall and floor while it is on: driven with the view.
   // Registered with World at target 0, so the room's morph pass (which
   // fades every furniture light toward its registered target) zeroes it on
   // each frame while the room is appearing; the handle re-applies the
   // view's level on every tick (below), so a set already on HOME or PAUSED
   // when a player joins is lit again the moment the morph is over.
-  const glow = new THREE.PointLight(0x9fd8ff, 0, 5);
+  const glow = new THREE.PointLight(0x9fd8ff, 0, 2 + w * 2);
   addLight(glow, 0, cy, zBack + 0.6, 0);
   let glowLevel = 0;
 
@@ -10940,6 +10959,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
     text(lane, TV_TEX_W - 12 - w / 2, 22, "bold 10px monospace", c2d.strokeStyle, "center");
   };
   const draw = (view: TvScreenView): void => {
+    c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
     if (view.state === "off") {
       fill("#05070c");
@@ -11026,7 +11046,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number): void {
 function buildSmartTv(ctx: BuildCtx) {
   // Wall frame (snapInteriorWall): origin on the flush-mount plane, +z into
   // the room — everything sits in z ≥ 0.
-  attachTvSet(ctx, TV_WALL_Y, 0);
+  attachTvSet(ctx, TV_WALL_Y, 0, TV_W, TV_H);
 }
 
 function buildTvStand(ctx: BuildCtx) {
@@ -11044,7 +11064,7 @@ function buildTvStand(ctx: BuildCtx) {
   }
   // A small foot under the panel.
   place(new THREE.BoxGeometry(0.5, 0.06, 0.2), m(LEG, 0.55, 0.4), 0, TV_STAND_CAB_H + 0.03, 0.05);
-  attachTvSet(ctx, TV_STAND_SCREEN_Y, 0.02);
+  attachTvSet(ctx, TV_STAND_SCREEN_Y, 0.02, TV_STAND_W, TV_STAND_H);
 }
 
 /**
