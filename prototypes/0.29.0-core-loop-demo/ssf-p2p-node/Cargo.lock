@@ -4752,6 +4752,7 @@ dependencies = [
  "clvm-traits 0.36.1",
  "clvm-utils",
  "clvmr",
+ "curve25519-dalek",
  "hex",
  "iroh",
  "iroh-mainline-address-lookup",

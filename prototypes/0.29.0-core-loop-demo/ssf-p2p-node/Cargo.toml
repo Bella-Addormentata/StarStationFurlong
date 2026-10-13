@@ -75,6 +75,11 @@ clvm-utils = { version = "0.36", optional = true }
 # Craps fairness (plan §12 / T1): SHA-256 for the commit-reveal + beacon dice
 # derivation, byte-for-byte identical to the browser's src/games/fairDice.ts.
 sha2 = { version = "0.10", optional = true }
+# #231 P6a: the per-node presence record carries an X25519 key (`kx_pk`) that
+# P6b's knocks are sealed to. Only the base-point multiplication is needed here;
+# pinned to the exact version iroh-base already locks, so no second copy of the
+# curve lands in the binary (Windows-GNU export-ordinal budget, see above).
+curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false, optional = true }
 
 [features]
 default = ["chia-read"]
@@ -83,6 +88,7 @@ default = ["chia-read"]
 chia-read = [
     "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-types",
     "dep:chia-sdk-coinset", "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
+    "dep:curve25519-dalek",
 ]
 # Chain WRITES: the BLS wallet seed + `txch1…` address, spend-to-self publish,
 # the craps fairness hook and the treasury codec tests. Runtime-gated by

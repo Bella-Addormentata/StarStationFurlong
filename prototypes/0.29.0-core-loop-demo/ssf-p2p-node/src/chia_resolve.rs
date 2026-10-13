@@ -1,7 +1,9 @@
 //! The GENERIC HINT READER — the read side of the ChiaHub lane (#231 P1, on by
 //! default since D3). Everything a node learns from the chain comes through
-//! here: today the room-keyed presence records, later the per-node presence,
-//! inbox and beacon kinds of P6, which only change the hint and the opener.
+//! here: the room-keyed v1 presence records and, since P6a, the per-NODE v2
+//! presence records filed under a contact key's era hints ([`read_ck`],
+//! [`resolve_presence_by_ck`]). The inbox and beacon kinds of P6b will only
+//! change the hint and the opener again ([`read_hint_with`]).
 //!
 //! Flow (source-verified chia-sdk 0.34 API):
 //!   hint -> get_coin_records_by_hint (spent coins INCLUDED — every publish
@@ -43,6 +45,11 @@ use clvm_traits::{FromClvm, ToClvm};
 use clvmr::{Allocator, NodePtr};
 
 use crate::chia_lane::{self, ChiaPresenceRecord};
+
+/// Record v2 (P6a) refuses a signed `issued_at` more than two hours ahead of
+/// the reader's clock (the third follow-up on #231); the era, not the clock,
+/// is v2's rotation, so the skew bound can be tight.
+pub const MAX_FUTURE_SKEW_V2_SECS: u64 = 2 * 3600;
 
 /// Parent-spend fetches per hint per poll. Bounds the cost of a flooded hint.
 pub const MAX_PARENT_FETCHES_PER_POLL: usize = 50;
@@ -214,6 +221,19 @@ pub async fn read_hint(
     now: u64,
     cursor: &mut HintCursor,
 ) -> Result<Vec<FoundRecord>> {
+    read_hint_with(client, hint, cursor, &|ciphertext, _height| decode_blob(room_key, ciphertext, now)).await
+}
+
+/// [`read_hint`] with the OPENER as a parameter: the listing, paging, parent
+/// fetching, cursor and flood rules are the same for every record kind; only
+/// how a ciphertext becomes a record differs. The opener gets the ciphertext
+/// and the height of the block that confirmed the coin (v2's era rule).
+pub async fn read_hint_with(
+    client: &CoinsetClient,
+    hint: Bytes32,
+    cursor: &mut HintCursor,
+    opener: &(dyn Fn(&[u8], u32) -> Option<ChiaPresenceRecord> + Sync),
+) -> Result<Vec<FoundRecord>> {
     let Resume { start, mut page, mut max_height, mut examined_all } = cursor.resume();
     let mut coins = Vec::new();
     // `listed` = the gateway reported the listing's last page this poll.
@@ -276,7 +296,7 @@ pub async fn read_hint(
             Some(ct) => ct,
             None => continue,
         };
-        if let Some(record) = decode_blob(room_key, &ciphertext, now) {
+        if let Some(record) = opener(&ciphertext, rec.confirmed_block_index) {
             out.push(FoundRecord {
                 record,
                 coin_id: Bytes32::new(coin_id),
@@ -303,6 +323,124 @@ pub async fn read_hint(
         cursor.pending = Some(PendingPage { start_height: start, next_cursor: next, max_height, examined_all });
     }
     Ok(out)
+}
+
+// ── #231 P6a: per-node presence (record v2) ─────────────────────────────────
+
+/// Open + verify + check one v2 presence ciphertext read under `ck`'s hint for
+/// `era`. `None` when it is not for us, tampered, filed under the wrong era,
+/// CONFIRMED OUTSIDE ITS ERA (the pre-fill/replay rule: a record is valid only
+/// if the block that confirmed it lies in the era it is signed for), expired,
+/// or signed more than [`MAX_FUTURE_SKEW_V2_SECS`] ahead of our clock.
+pub fn decode_v2_presence(
+    ck: &[u8; 32],
+    ciphertext: &[u8],
+    era: u64,
+    confirmed_height: u32,
+    now: u64,
+) -> Option<ChiaPresenceRecord> {
+    if chia_lane::era_of(confirmed_height) != era {
+        return None;
+    }
+    let plain = chia_lane::open_v2(ck, chia_lane::KIND_PRESENCE, era, ciphertext).ok()?;
+    let record = chia_lane::decode_presence_v2(&plain, era).ok()?;
+    if record.expires_at < now {
+        return None;
+    }
+    if record.issued_at > now.saturating_add(MAX_FUTURE_SKEW_V2_SECS) {
+        return None;
+    }
+    Some(record.to_record())
+}
+
+/// The eras a v2 reader scans at chain peak `peak`: the current one and the
+/// one before (a record written late in an era stays findable through the
+/// next). Genesis has no previous era.
+pub fn scan_eras(peak: u32) -> Vec<u64> {
+    let e = chia_lane::era_of(peak);
+    if e == 0 { vec![0] } else { vec![e, e - 1] }
+}
+
+/// One incremental read of a contact key's presence: both scan eras' hints,
+/// cursors kept by the caller per hint (so the watcher pays only for new coins
+/// beat after beat). A hint whose read fails has its cursor put back exactly
+/// as it was, so nothing it examined counts as seen and the next beat re-reads
+/// it; what the other hint found is returned all the same. Only when every
+/// hint failed is the error returned.
+pub async fn read_ck(
+    client: &CoinsetClient,
+    ck: &[u8; 32],
+    peak: u32,
+    now: u64,
+    cursors: &mut std::collections::HashMap<[u8; 32], HintCursor>,
+) -> Result<Vec<FoundRecord>> {
+    let mut found = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut any_ok = false;
+    for era in scan_eras(peak) {
+        let hint = chia_lane::derive_ck_hint(ck, era);
+        let cursor = cursors.entry(hint).or_default();
+        let before = cursor.clone();
+        let opener = |ct: &[u8], height: u32| decode_v2_presence(ck, ct, era, height, now);
+        match read_hint_with(client, Bytes32::new(hint), cursor, &opener).await {
+            Ok(records) => {
+                any_ok = true;
+                found.extend(records);
+            }
+            Err(e) => {
+                // Transactional: a failed read examined nothing. The hint still
+                // has everything to read, so it is marked as backlog: the
+                // one-shot resolver then spends a retry round on it instead of
+                // taking the other hint's clean finish for "all read"; the
+                // watcher re-reads it next beat either way.
+                *cursor = before;
+                cursor.backlog = true;
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(e) if !any_ok => Err(e),
+        Some(e) => {
+            eprintln!("⛓️ ChiaHub resolve: one of a contact key's era hints failed and will be re-read next beat: {e:#}");
+            Ok(found)
+        }
+        None => Ok(found),
+    }
+}
+
+/// The hints a v2 reader of `ck` has in play at `peak` (for cursor pruning).
+pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
+    scan_eras(peak).into_iter().map(|era| chia_lane::derive_ck_hint(ck, era)).collect()
+}
+
+/// ONE-SHOT: the freshest presence record `node_id` published under its
+/// contact key `ck` — the introduction lookup at dial exhaustion (rung 6) once
+/// the target's card is known. Reads the chain peak first (the era is the
+/// chain's clock), then both scan eras, round after round within the one-shot
+/// budget. Records under the hint signed by any OTHER node are discarded
+/// before ranking: a contact key is shared with every member of the rooms
+/// that received the card, so it locates the hint but never vouches for the
+/// signer; only the node's own signature does.
+pub async fn resolve_presence_by_ck(ck: &[u8; 32], node_id: &str) -> Result<Option<ChiaPresenceRecord>> {
+    let now = unix_now();
+    let client = CoinsetClient::testnet11();
+    let peak = peak_height(&client).await.ok_or_else(|| anyhow!("chain peak unavailable"))?;
+    let mut all = Vec::new();
+    let mut cursors = std::collections::HashMap::new();
+    for round in 1..=ONE_SHOT_MAX_ROUNDS {
+        all.extend(read_ck(&client, ck, peak, now, &mut cursors).await?);
+        if !cursors.values().any(|c| c.has_more()) {
+            break;
+        }
+        if round == ONE_SHOT_MAX_ROUNDS {
+            eprintln!("⛓️ ChiaHub resolve: a contact key's hints still had more after {round} rounds — budget spent, result may be partial");
+        }
+    }
+    all.retain(|f| f.record.node_id == node_id);
+    Ok(rank_and_dedupe(all).into_iter().next().map(|f| f.record))
 }
 
 /// How many `read_hint` rounds a ONE-SHOT lookup ([`resolve_all`]) spends per
@@ -430,12 +568,47 @@ pub(crate) fn extract_ciphertext(coin_spend: &CoinSpend, hint: Bytes32) -> Resul
     Ok(None)
 }
 
+/// How old a cached chain peak may be before it is as good as none. The watcher
+/// reads the peak once per tick, but a long or stalled scan — or the gateway
+/// down — can leave it blocks, or an era, behind: a publisher signing by it
+/// would write for an era that has ended, and an inbound mark stamped with it
+/// would name one. Kept well inside the publisher's eight end-of-era guard
+/// blocks (about 150 s of blocks), so a stale peak never walks a write past
+/// the guard either.
+pub const PEAK_MAX_AGE_SECS: u64 = 90;
+
+/// The chain peak as last read, and when (unix seconds), as ONE value: a reader
+/// never pairs an old height with a newer time. `Default` is "none yet".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainPeak {
+    pub height: u32,
+    pub seen_at: u64,
+}
+
+impl ChainPeak {
+    pub fn new(height: u32, seen_at: u64) -> Self {
+        Self { height, seen_at }
+    }
+
+    /// The height, when known and read within [`PEAK_MAX_AGE_SECS`] of `now`;
+    /// `None` is "ask the chain" (or, for a mark, "judge by elapsed time").
+    pub fn fresh(&self, now: u64) -> Option<u32> {
+        // A read dated after `now` means the wall clock was set back since: how
+        // old the height really is cannot be told, so it is stale (the chain is
+        // asked again), not fresh until the clock catches up.
+        let age = now.checked_sub(self.seen_at)?;
+        (self.height != 0 && age <= PEAK_MAX_AGE_SECS).then_some(self.height)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sealed_record(room_key: &[u8; 32], sk: &iroh::SecretKey, issued_at: u64, expires_at: u64) -> Vec<u8> {
         let record = ChiaPresenceRecord {
+            kx_pk: None,
+            addr_flags: vec![],
             v: 1,
             node_id: sk.public().to_string(),
             addrs: vec!["[2001:db8::1]:4445".into(), "198.51.100.7:4444".into()],
@@ -450,6 +623,8 @@ mod tests {
     fn found(node: &str, issued_at: u64, height: u32) -> FoundRecord {
         FoundRecord {
             record: ChiaPresenceRecord {
+            kx_pk: None,
+            addr_flags: vec![],
                 v: 1,
                 node_id: node.to_string(),
                 addrs: vec![],
@@ -461,6 +636,16 @@ mod tests {
             confirmed_height: height,
             hint: Bytes32::new([1u8; 32]),
         }
+    }
+
+    #[test]
+    fn a_cached_peak_is_the_era_clock_only_while_fresh() {
+        let now = 1_700_000_000u64;
+        assert_eq!(ChainPeak::default().fresh(now), None, "no peak read yet");
+        assert_eq!(ChainPeak::new(100, now).fresh(now), Some(100), "just read");
+        assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS).fresh(now), Some(100), "at the bound: still the clock");
+        assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS - 1).fresh(now), None, "older: ask the chain");
+        assert_eq!(ChainPeak::new(100, now + 5).fresh(now), None, "a read dated in the future (clock set back) is stale, not fresh forever");
     }
 
     #[test]
@@ -560,5 +745,51 @@ mod tests {
         assert_eq!(ranked[0].confirmed_height, 100);
         assert_eq!(ranked[1].record.node_id, "bob");
         assert_eq!(ranked[1].confirmed_height, 500, "equal times: the later-confirmed copy wins");
+    }
+
+    #[test]
+    fn v2_opener_enforces_the_era_rule_and_the_tight_skew() {
+        use crate::chia_lane::{encode_presence_v2, seal_v2, AddrEntry, PresenceV2, ERA_BLOCKS, KIND_PRESENCE};
+        let sk = iroh::SecretKey::generate();
+        let ck = [8u8; 32];
+        let now = 1_791_700_000u64;
+        let era = 12u64;
+        let rec = PresenceV2 {
+            era,
+            node_id: sk.public(),
+            kx_pk: [1u8; 32],
+            issued_at: now - 60,
+            expires_at: now + 3600,
+            addrs: vec![AddrEntry { addr: "198.51.100.7:4444".parse().unwrap(), flags: 1 }],
+        };
+        let sealed = seal_v2(&ck, KIND_PRESENCE, era, &encode_presence_v2(&rec, &sk).unwrap()).unwrap();
+        let inside = 12 * ERA_BLOCKS + 10;
+        let got = decode_v2_presence(&ck, &sealed, era, inside, now).expect("confirmed inside its era");
+        assert_eq!(got.v, 2);
+        assert_eq!(got.node_id, sk.public().to_string());
+        assert_eq!(got.addrs, vec!["198.51.100.7:4444".to_string()]);
+        assert_eq!(got.addr_flags, vec![1]);
+        assert!(decode_v2_presence(&ck, &sealed, era, 13 * ERA_BLOCKS, now).is_none(), "confirmed in the next era: a pre-fill or a late replay, refused");
+        assert!(decode_v2_presence(&ck, &sealed, era, 12 * ERA_BLOCKS - 1, now).is_none(), "confirmed before its era: refused");
+        assert!(decode_v2_presence(&ck, &sealed, era + 1, 13 * ERA_BLOCKS, now).is_none(), "read under the next era's hint: the seal refuses");
+        assert!(decode_v2_presence(&[9u8; 32], &sealed, era, inside, now).is_none(), "another contact key");
+        assert!(decode_v2_presence(&ck, &sealed, era, inside, now + 3601).is_none(), "expired");
+        let future = PresenceV2 { issued_at: now + MAX_FUTURE_SKEW_V2_SECS + 1, expires_at: now + 10 * 3600, ..rec.clone() };
+        let sealed = seal_v2(&ck, KIND_PRESENCE, era, &encode_presence_v2(&future, &sk).unwrap()).unwrap();
+        assert!(decode_v2_presence(&ck, &sealed, era, inside, now).is_none(), "two hours ahead is too far");
+    }
+
+    #[test]
+    fn v2_readers_scan_this_era_and_the_last() {
+        use crate::chia_lane::ERA_BLOCKS;
+        assert_eq!(scan_eras(0), vec![0]);
+        assert_eq!(scan_eras(ERA_BLOCKS - 1), vec![0]);
+        assert_eq!(scan_eras(ERA_BLOCKS), vec![1, 0]);
+        assert_eq!(scan_eras(5 * ERA_BLOCKS + 7), vec![5, 4]);
+        let ck = [3u8; 32];
+        let hints = live_ck_hints(&ck, 5 * ERA_BLOCKS);
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0], chia_lane::derive_ck_hint(&ck, 5));
+        assert_eq!(hints[1], chia_lane::derive_ck_hint(&ck, 4));
     }
 }

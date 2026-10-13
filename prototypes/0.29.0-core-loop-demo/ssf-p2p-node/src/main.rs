@@ -20,6 +20,10 @@ mod chia_lane;
 // reader and the P1 beat/hold watcher.
 #[cfg(feature = "chia-read")]
 mod chia_rooms;
+// #231 P6a: the node's contact key, contact cards, the address book and the
+// inbound-verified ledger — what finds a NODE on chain without a room key.
+#[cfg(feature = "chia-read")]
+mod chia_contact;
 #[cfg(feature = "chia-read")]
 mod chia_resolve;
 #[cfg(feature = "chia-read")]
@@ -272,11 +276,23 @@ pub struct MemberEntry {
     pub tier: u8,
     pub in_mesh: bool,
     pub hints: PeerHints,
+    /// #231 P6a: our contact card went out on this connection (once per
+    /// connection and room; the maintenance loop sends it in private rooms).
+    #[cfg(feature = "chia-read")]
+    pub card_sent: bool,
 }
 
 impl MemberEntry {
     fn new(conn: iroh::endpoint::Connection, tier: u8, in_mesh: bool, hints: PeerHints) -> Self {
-        Self { conn, last_seen: std::time::Instant::now(), tier, in_mesh, hints }
+        Self {
+            conn,
+            last_seen: std::time::Instant::now(),
+            tier,
+            in_mesh,
+            hints,
+            #[cfg(feature = "chia-read")]
+            card_sent: false,
+        }
     }
 }
 
@@ -371,6 +387,64 @@ pub struct HubState {
     /// so it is in the default build.
     #[cfg(feature = "chia-read")]
     pub chia_rooms: Mutex<HashMap<String, chia_rooms::ChiaRoomCap>>,
+    /// #231 P6a: this node's CONTACT KEY (`contact.key`) — what its per-node
+    /// presence is filed under; handed to private-room members as a signed card.
+    #[cfg(feature = "chia-read")]
+    pub contact_key: [u8; 32],
+    /// #231 P6a: `contact.key` could be loaded or written. When it could not,
+    /// the key above is for this run only and nothing advertises it: no card
+    /// is shared and no per-node presence is published, since both would go
+    /// stale at the next start and contradict the node's one-key identity.
+    #[cfg(feature = "chia-read")]
+    pub contact_key_durable: bool,
+    /// #231 P6a: the address book (`peers.json`): the contact and card keys of
+    /// the peers that handed us their card, and the rooms we met them in.
+    #[cfg(feature = "chia-read")]
+    pub peers: Mutex<chia_contact::PeerBook>,
+    /// #231 P6a: when this node last ACCEPTED an unsolicited direct inbound
+    /// connection, per address family — the measured half of the presence
+    /// record's reachability flags. Written by `run_iroh_listener` only.
+    #[cfg(feature = "chia-read")]
+    pub inbound_verified: Mutex<chia_contact::InboundVerified>,
+    /// #231 P6a: peers whose dial ended lately, and when, kept for
+    /// [`DIAL_PINHOLE_GRACE`]: the NAT mapping our Initials opened outlives
+    /// the dial task, so an inbound connection from one of them inside the
+    /// grace is not unsolicited and proves nothing about reachability.
+    /// Written and pruned by `release_dial`, read and pruned by `dialed_lately`.
+    #[cfg(feature = "chia-read")]
+    pub recent_dials: Mutex<HashMap<PublicKey, std::time::Instant>>,
+    /// #231 P6a: serializes contact-card sends with room-posture changes. The
+    /// maintenance loop holds it from reading a room's posture through ONE
+    /// send (bounded by `CARD_SEND_TIMEOUT`), card by card; the local browser's
+    /// cap lane takes it before a cap is accepted. A cap turning a room public
+    /// therefore waits for one send at most, lands between two, and the next
+    /// send's check sees it, so no card authorized by a posture since replaced
+    /// can leave.
+    #[cfg(feature = "chia-read")]
+    pub card_gate: tokio::sync::Mutex<()>,
+    /// #231 P6a: the chain peak the watcher (or the publisher) read last, with
+    /// the time of the read, as one snapshot: the era clock for the inbound
+    /// marks and the presence publisher. Both trust it only while it is younger
+    /// than `chia_resolve::PEAK_MAX_AGE_SECS`; the publisher otherwise asks the
+    /// chain itself before an era-sensitive write, and a mark falls back to
+    /// elapsed time, so a stalled watcher never dates anything into an era
+    /// that has ended.
+    #[cfg(feature = "chia-read")]
+    pub chia_peak: Mutex<chia_resolve::ChainPeak>,
+    /// #231 P6a: the signed `issued_at` of the newest presence record of OUR
+    /// OWN the watcher read back from the chain (0 = none yet). The publisher
+    /// marks its write confirmed when this is the write's own issued_at (its
+    /// mark's `last_at`); until then the write is pending and retried after a
+    /// timeout. An older record re-read inside the cursor overlap confirms nothing.
+    #[cfg(feature = "chia-read")]
+    pub presence_confirmed_at: std::sync::atomic::AtomicU64,
+    /// #231 P6a: the presence publisher is running and findable (raised by the
+    /// heartbeat loop at start). While it is, the watcher reads our own
+    /// contact key every beat even with no room or peer to read for, since
+    /// that read is what confirms a write: without it a landed record would be
+    /// re-written at every confirmation timeout until the era's budget is spent.
+    #[cfg(feature = "chia-read")]
+    pub presence_publishing: std::sync::atomic::AtomicBool,
     /// ⛓️🥣 The wallet key `SSF_CHIA_LANE=1` loaded at startup (publish build),
     /// so the faucet dish can TAKE (claim to our address) and GIVE (pay from our
     /// coin) on the local browser's request. `None` while publishing is off.
@@ -711,23 +785,43 @@ const DEFAULT_IP_ECHO_HOSTS: &[&str] = &["api.ipify.org", "checkip.amazonaws.com
 const AUTO_ADDR_RECHECK_SECS: u64 = 300;
 
 /// True when the address is usable as an internet-facing dial hint — rejects
-/// private/loopback/link-local/documentation ranges and CGNAT (100.64.0.0/10),
-/// where a home-router port-forward cannot produce inbound reachability.
+/// private/loopback/link-local/documentation ranges, CGNAT (100.64.0.0/10),
+/// where a home-router port-forward cannot produce inbound reachability, and
+/// the other special-purpose ranges that never route on the internet: this
+/// network (0.0.0.0/8), IETF protocol assignments (192.0.0.0/24), benchmarking
+/// (198.18.0.0/15), multicast (224.0.0.0/4), reserved (240.0.0.0/4) and the
+/// deprecated 6to4 relay anycast block (192.88.99.0/24, RFC 7526). Since
+/// #231 P6a the same judge decides what a presence record may carry, so a
+/// non-global address is never written to the chain either.
 fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     let cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64; // 100.64.0.0/10
+    let this_network = o[0] == 0; // 0.0.0.0/8
+    let ietf_assignments = o[0] == 192 && o[1] == 0 && o[2] == 0; // 192.0.0.0/24
+    let six_to_four_relay = o[0] == 192 && o[1] == 88 && o[2] == 99; // 192.88.99.0/24
+    let benchmarking = o[0] == 198 && (o[1] & 0xfe) == 18; // 198.18.0.0/15
+    let reserved = o[0] >= 240; // 240.0.0.0/4 (broadcast included)
     !(ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.is_documentation()
-        || cgnat)
+        || ip.is_multicast()
+        || cgnat
+        || this_network
+        || ietf_assignments
+        || six_to_four_relay
+        || benchmarking
+        || reserved)
 }
 
 /// v6 companion to [`ipv4_is_public`] (Slice 5b): rejects loopback/unspecified/
-/// multicast, link-local (fe80::/10), ULA (fc00::/7) and documentation
-/// (2001:db8::/32); keeps global unicast. An IPv4 wearing IPv6 clothing is
+/// multicast, link-local (fe80::/10), the deprecated site-local (fec0::/10),
+/// ULA (fc00::/7), documentation (2001:db8::/32 and 3fff::/20), benchmarking
+/// (2001:2::/48), ORCHIDv2 (2001:20::/28), the discard-only 100::/64, the
+/// local-use translation prefix 64:ff9b:1::/48 (RFC 8215) and the SRv6 SID
+/// space 5f00::/16 (RFC 9602); keeps global unicast. An IPv4 wearing IPv6 clothing is
 /// judged as THAT IPv4 — mapped `::ffff:a.b.c.d`, the deprecated compatible
 /// `::a.b.c.d`, 6to4 `2002:AABB:CCDD::` and NAT64 `64:ff9b::a.b.c.d` — so
 /// `[::ffff:192.168.1.1]` cannot smuggle a LAN address past the v4 checks and
@@ -755,8 +849,15 @@ fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
         return false; // Teredo
     }
     !((seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local
+        || (seg[0] & 0xffc0) == 0xfec0  // fec0::/10 site-local (deprecated, never global)
         || (seg[0] & 0xfe00) == 0xfc00  // fc00::/7 unique-local
-        || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 documentation
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
+        || (seg[0] == 0x3fff && (seg[1] >> 12) == 0) // 3fff::/20 documentation
+        || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0) // 2001:2::/48 benchmarking
+        || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
+        || (seg[0] == 0x0100 && seg[1..4] == [0, 0, 0]) // 100::/64 discard-only
+        || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001) // 64:ff9b:1::/48 local-use translation
+        || seg[0] == 0x5f00) // 5f00::/16 SRv6 SIDs
 }
 
 /// Slice 5b addr-trust filter: a chia-resolved record's addrs are SELF-declared,
@@ -770,6 +871,17 @@ fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
 #[cfg(feature = "chia-read")]
 pub(crate) fn chia_public_dial_addrs(addrs: &[String]) -> Vec<SocketAddr> {
     const CAP: usize = 8;
+    let mut kept = chia_public_addrs(addrs);
+    kept.truncate(CAP);
+    kept
+}
+
+/// Every public, internet-routable address among `addrs`, v6 first (stable:
+/// publisher order within each family), with no cap: the presence publisher
+/// canonicalizes and de-duplicates the whole set before it applies the
+/// record's own cap, so a duplicate never costs a slot.
+#[cfg(feature = "chia-read")]
+pub(crate) fn chia_public_addrs(addrs: &[String]) -> Vec<SocketAddr> {
     let mut kept: Vec<SocketAddr> = addrs
         .iter()
         .filter_map(|s| s.parse::<SocketAddr>().ok())
@@ -778,8 +890,7 @@ pub(crate) fn chia_public_dial_addrs(addrs: &[String]) -> Vec<SocketAddr> {
             std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
         })
         .collect();
-    kept.sort_by_key(|sa| sa.is_ipv4()); // stable: v6 first, then v4, publisher order within each
-    kept.truncate(CAP);
+    kept.sort_by_key(|sa| sa.is_ipv4());
     kept
 }
 
@@ -797,6 +908,19 @@ mod chia_addr_filter_tests {
             "[fe80::1]:1",                           // link-local v6 -> drop
             "[fc00::1]:1",                           // ULA v6 -> drop
             "203.0.113.9:44442",                     // TEST-NET-3 documentation -> drop
+            "198.18.0.1:1",                          // benchmarking 198.18/15 -> drop
+            "240.0.0.1:1",                           // reserved 240/4 -> drop
+            "0.1.2.3:1",                             // this network 0/8 -> drop
+            "224.0.0.1:1",                           // multicast -> drop
+            "192.0.0.9:1",                           // IETF protocol assignments 192.0.0/24 -> drop
+            "[fec0::1]:1",                           // site-local v6 (deprecated) -> drop
+            "[100::1]:1",                            // discard-only v6 -> drop
+            "[2001:2::1]:1",                         // benchmarking v6 -> drop
+            "[2001:20::1]:1",                        // ORCHIDv2 -> drop
+            "[3fff::1]:1",                           // documentation v6 (3fff::/20) -> drop
+            "192.88.99.1:1",                         // deprecated 6to4 relay anycast -> drop
+            "[64:ff9b:1::1]:1",                      // local-use IPv4/IPv6 translation -> drop
+            "[5f00::1]:1",                           // SRv6 SID space -> drop
             "8.8.8.8:44442",                         // public v4 -> KEEP
             "[2600:1700:68a0:8ca0::29]:58828",       // public v6 -> KEEP
         ]
@@ -808,7 +932,10 @@ mod chia_addr_filter_tests {
         assert_eq!(kept.len(), 2, "only the two public addrs survive, got {kept:?}");
         assert!(kept[0].contains("2600:1700"), "IPv6 is dialed first (P1), got {kept:?}");
         assert_eq!(kept[1], "8.8.8.8:44442");
-        for bad in ["192.168", "127.0.0.1", "100.64", "169.254", "fe80", "fc00", "203.0.113"] {
+        for bad in [
+            "192.168", "127.0.0.1", "100.64", "169.254", "fe80", "fc00", "203.0.113", "198.18", "240.0", "0.1.2.3",
+            "224.0", "192.0.0", "fec0", "100::", "2001:2:", "2001:20:", "3fff", "192.88.99", "64:ff9b:1:", "5f00",
+        ] {
             assert!(!kept.iter().any(|s| s.contains(bad)), "{bad} should be filtered out");
         }
     }
@@ -1319,6 +1446,45 @@ async fn main() -> Result<()> {
     let wt_endpoint = WtEndpoint::server(wt_config)
         .map_err(|e| anyhow!("Failed to bind wtransport server: {:?}", e))?;
 
+    // #231 P6a: the contact identity and the address book, loaded (or minted)
+    // beside the iroh key, and the room caps persisted by earlier runs so the
+    // watcher READS for served rooms before any browser returns (a restored cap
+    // authorizes reads only; publishing and cards wait for a live cap).
+    #[cfg(feature = "chia-read")]
+    let (contact_key, contact_key_durable, peer_book, restored_caps) = {
+        let (ck, durable) = match chia_contact::load_or_create_contact_key(std::path::Path::new(chia_contact::CONTACT_KEY_FILE)) {
+            Ok(ck) => (ck, true),
+            Err(e) => {
+                // A key that cannot be stored would change every start and make
+                // every card we hand out stale; say so and run with a key for
+                // this process only — one that is neither shared nor published
+                // under (the watcher still reads).
+                eprintln!(
+                    "⛓️ ChiaHub contact: cannot load or create {}: {e} — no card is shared and no presence is published this run",
+                    chia_contact::CONTACT_KEY_FILE
+                );
+                let mut ck = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ck);
+                (ck, false)
+            }
+        };
+        let book = chia_contact::PeerBook::load(std::path::Path::new(chia_contact::PEERS_FILE));
+        let caps: HashMap<String, chia_rooms::ChiaRoomCap> = chia_rooms::load_persisted_caps().into_iter().collect();
+        println!(
+            "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) restored for reading (publishing and cards wait for a live cap) · cards {}",
+            book.peers.len(),
+            caps.len(),
+            if !durable {
+                "not shared (no durable contact key)"
+            } else if chia_contact::share_card_enabled() {
+                "shared in private rooms"
+            } else {
+                "not shared (SSF_CHIA_SHARE_CARD=0)"
+            }
+        );
+        (ck, durable, book, caps)
+    };
+
     let hub = Arc::new(HubState {
         rooms: Mutex::new(HashMap::new()),
         fingerprint: Mutex::new(fingerprint),
@@ -1330,7 +1496,25 @@ async fn main() -> Result<()> {
         dialing: Mutex::new(std::collections::HashSet::new()),
         reach: reach.clone(),
         #[cfg(feature = "chia-read")]
-        chia_rooms: Mutex::new(HashMap::new()),
+        chia_rooms: Mutex::new(restored_caps),
+        #[cfg(feature = "chia-read")]
+        contact_key,
+        #[cfg(feature = "chia-read")]
+        contact_key_durable,
+        #[cfg(feature = "chia-read")]
+        peers: Mutex::new(peer_book),
+        #[cfg(feature = "chia-read")]
+        inbound_verified: Mutex::new(chia_contact::InboundVerified::default()),
+        #[cfg(feature = "chia-read")]
+        recent_dials: Mutex::new(HashMap::new()),
+        #[cfg(feature = "chia-read")]
+        card_gate: tokio::sync::Mutex::new(()),
+        #[cfg(feature = "chia-read")]
+        chia_peak: Mutex::new(chia_resolve::ChainPeak::default()),
+        #[cfg(feature = "chia-read")]
+        presence_confirmed_at: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(feature = "chia-read")]
+        presence_publishing: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
     });
@@ -1366,6 +1550,21 @@ async fn main() -> Result<()> {
             if ok > 0 {
                 println!("💾 Restored {ok} persisted room doc(s) — serving from boot (rooms survive node restarts)");
             }
+        }
+    }
+
+    // #231 P6a: a restored cap is kept only for a room whose doc restored too.
+    // A cap written before the room's first 15 s snapshot, or left behind by a
+    // corrupt or deleted doc, would otherwise have the watcher polling and the
+    // publisher spending for a room this node does not serve.
+    #[cfg(feature = "chia-read")]
+    {
+        let rooms = hub.rooms.lock().unwrap();
+        let mut caps = hub.chia_rooms.lock().unwrap();
+        let orphans: Vec<String> = caps.keys().filter(|room| !rooms.contains_key(*room)).cloned().collect();
+        for room in &orphans {
+            caps.remove(room);
+            eprintln!("💾 cap persist: room {room} has a cap but no restored doc — cap not restored (the browser re-sends it)");
         }
     }
 
@@ -1666,10 +1865,19 @@ async fn handle_wt_connection_inner(
                                 // publish its addresses under it — or out-sequence the
                                 // local browser's caps for a room.
                                 if chia_rooms::cap_source_is_local(&remote_addr_inner) {
+                                    // #231 P6a: the cap outlives the process, beside the room
+                                    // doc — written while the room map is still locked, so two
+                                    // caps on two streams land on disk in acceptance order and
+                                    // a restart never restores the stale one.
+                                    // Under the card gate: a card batch that read this
+                                    // room's posture finishes its sends before the new
+                                    // cap lands (see `HubState::card_gate`).
+                                    let _gate = hub_clone.card_gate.lock().await;
                                     chia_rooms::ingest_room_cap(
                                         &hub_clone.chia_rooms,
                                         &envelope.room,
                                         &envelope.payload,
+                                        chia_rooms::persist_room_cap,
                                     );
                                 } else {
                                     eprintln!(
@@ -1949,6 +2157,13 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
             None => continue,
         };
 
+        // #231 P6a: how this Initial arrived — straight from an IP, or via a
+        // relay — and whether its source address was validated, read before
+        // the accept consumes the Incoming. The measured "inbound verified"
+        // flag below needs exactly these two facts.
+        #[cfg(feature = "chia-read")]
+        let inbound_path = (incoming_conn.remote_addr(), incoming_conn.remote_addr_validated());
+
         // Same per-client tolerance as run_wt_listener: a peer failing its
         // handshake must not tear down the swarm listener for everyone else.
         let accepting = match incoming_conn.accept() {
@@ -1967,6 +2182,8 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         };
         let remote_id = connection.remote_id();
         println!("🚀 Inbound P2P Swarm handshake from peer: {}", remote_id);
+        #[cfg(feature = "chia-read")]
+        note_inbound_verified(&hub, remote_id, &inbound_path);
 
         let hub_clone = hub.clone();
         let iroh_clone = endpoint.clone();
@@ -1977,6 +2194,109 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
             }
         });
     }
+}
+
+/// #231 P6a: an accepted connection whose Initial came DIRECTLY (no relay) from
+/// a PUBLIC address, with that address validated, from a peer we were not
+/// dialing — nor had dialed within [`DIAL_PINHOLE_GRACE`] — is proof that this
+/// node is reachable inbound on that address family — the only thing a
+/// presence record's flag may claim. A connection that arrived through a relay,
+/// from a LAN peer, or after our own dial Initials opened the pinhole (a dial
+/// still running, or one that ended inside the grace: the NAT mapping it made
+/// outlives the task, and the peer's own hole-punch Initials come through it)
+/// proves nothing and sets nothing. The mark carries the chain peak the watcher
+/// knows (0 when it has none, or none fresh enough to trust), so the publisher
+/// can tell "this era" from "last era".
+#[cfg(feature = "chia-read")]
+fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::endpoint::IncomingAddr, bool)) {
+    let (addr, validated) = path;
+    let iroh::endpoint::IncomingAddr::Ip(sa) = addr else { return };
+    if !validated {
+        return;
+    }
+    let public = match sa.ip() {
+        std::net::IpAddr::V4(v4) => ipv4_is_public(v4),
+        std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
+    };
+    if !public || dialed_lately(hub, &remote_id, std::time::Instant::now()) {
+        return;
+    }
+    let now = chia_resolve::unix_now();
+    // A peak the watcher read too long ago (it or the gateway down, maybe across
+    // an era boundary) would date this mark into an era that has ended; an
+    // unknown height makes the ledger judge by elapsed time instead.
+    let height = hub.chia_peak.lock().unwrap().fresh(now).unwrap_or(0);
+    let first_this_era = hub.inbound_verified.lock().unwrap().note(sa.is_ipv6(), height, now);
+    if first_this_era {
+        println!(
+            "📡 inbound verified: an unsolicited direct {} connection from {} reached us — this era's presence record will say so",
+            if sa.is_ipv6() { "IPv6" } else { "IPv4" },
+            sa.ip()
+        );
+    }
+}
+
+/// How long after a dial task ends an inbound connection from its target still
+/// counts as one we enabled: the UDP mapping our Initials opened in a NAT lives
+/// on after the task (two minutes is the mapping lifetime RFC 4787 asks of a
+/// NAT), and the peer's own Initials arrive through it. Only an inbound
+/// connection from a peer we have not dialed in this long is unsolicited. A
+/// reachable node that dialed the peer first is not misjudged, only measured
+/// by a later peer instead.
+#[cfg(feature = "chia-read")]
+const DIAL_PINHOLE_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Did we dial `peer` lately: a dial in flight (`hub.dialing`), or one that
+/// ended within [`DIAL_PINHOLE_GRACE`] (`hub.recent_dials`, pruned here and
+/// in [`release_dial`])?
+#[cfg(feature = "chia-read")]
+fn dialed_lately(hub: &HubState, peer: &PublicKey, now: std::time::Instant) -> bool {
+    if hub.dialing.lock().unwrap().contains(peer) {
+        return true;
+    }
+    let mut recent = hub.recent_dials.lock().unwrap();
+    recent.retain(|_, ended| now.duration_since(*ended) < DIAL_PINHOLE_GRACE);
+    recent.contains_key(peer)
+}
+
+/// A contact-card send that has not finished in this long counts as not sent
+/// (retried next tick) and lets go of the card gate, so a stalled peer cannot
+/// hold up the browser's room caps.
+#[cfg(feature = "chia-read")]
+const CARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one maintenance tick may spend on contact-card sends across all
+/// its rooms; the rest wait for the next tick, so the loop's other duties
+/// (heartbeats, prunes, grafts) run on time whatever the peers do.
+#[cfg(feature = "chia-read")]
+const CARD_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Release a dial's single-flight claim once its task ended, however it ended,
+/// remembering the dial for the pinhole grace FIRST: every path that claims a
+/// dial (the browser's, the mesh's, the watcher's holds) releases it here, so
+/// no inbound connection our own Initials enabled can pass as unsolicited, not
+/// even in the instant between the two steps. Entries whose grace has run out
+/// are dropped on every release, so the map holds the dials of the last two
+/// minutes at most, however many unreachable peers a node tries in a row.
+pub(crate) fn release_dial(hub: &HubState, peer: PublicKey) {
+    #[cfg(feature = "chia-read")]
+    {
+        let now = std::time::Instant::now();
+        let mut recent = hub.recent_dials.lock().unwrap();
+        recent.retain(|_, ended| now.duration_since(*ended) < DIAL_PINHOLE_GRACE);
+        recent.insert(peer, now);
+    }
+    hub.dialing.lock().unwrap().remove(&peer);
+}
+
+/// Is `peer` connected in `room_id` right now? Hold outcomes are recorded from
+/// this, never from [`hold_dial`]'s return value alone: that is also `true` when
+/// the room went away or another path linked first. A hold that ended with the
+/// peer linked is contact, whichever path made the link; one that ended with no
+/// link and no exhausted window (the room is gone) counts as nothing.
+#[cfg(feature = "chia-read")]
+pub(crate) fn linked_in_room(hub: &HubState, room_id: &str, peer: &PublicKey) -> bool {
+    hub.rooms.lock().unwrap().get(room_id).is_some_and(|room| room.remote_peers.contains_key(peer))
 }
 
 // Issue #60 symptom 2: bounded, backing-off dial that runs OFF the browser's
@@ -2012,7 +2332,7 @@ async fn dial_peer_with_retry(
         send,
     )
     .await;
-    hub.dialing.lock().unwrap().remove(&target_pub_key);
+    release_dial(&hub, target_pub_key);
 }
 
 /// Report a dial's status to the browser: to the specific `send` stream when the
@@ -2144,14 +2464,78 @@ async fn dial_peer_inner(
     // after the fast ladder gave up — the chain is an address book, never a pipe.
     #[cfg(feature = "chia-read")]
     {
+        // #231 P6a, FIRST: the target's PER-NODE presence, when its contact card
+        // is in the address book (we met it in a private room before). Found by
+        // the node's own key and the chain's era, whatever room this dial is
+        // for. A hold that lands settles the dial; one that fails falls through
+        // to the room-keyed v1 record below, which is tried only when it names
+        // addresses the contact-key hold did not (v1 republishes on every
+        // address change at once, the v2 record is debounced and capped).
+        let mut held_by_ck: Option<Vec<SocketAddr>> = None;
+        let target_ck = hub.peers.lock().unwrap().ck_of(&target_str);
+        if let Some(ck) = target_ck {
+            match chia_resolve::resolve_presence_by_ck(&ck, &target_str).await {
+                Ok(Some(rec)) => {
+                    let addrs = chia_public_dial_addrs(&rec.addrs);
+                    if addrs.is_empty() {
+                        println!("⛓️ ChiaHub rung-6: {target_str} found by contact key, but its presence record carries no public addr");
+                    } else {
+                        println!(
+                            "⛓️ ChiaHub rung-6: {target_str} found by contact key — {} public addr(s), holding the dial for {}s",
+                            addrs.len(),
+                            chia_watch::HOLD_WINDOW.as_secs()
+                        );
+                        let ok = hold_dial(
+                            hub.clone(),
+                            iroh_ep.clone(),
+                            room_id.clone(),
+                            target_pub_key,
+                            target_str.clone(),
+                            addrs.clone(),
+                            dial_tier,
+                            send.clone(),
+                        )
+                        .await;
+                        // Recorded from the link itself: `ok` is also true when the
+                        // room went away mid-hold, which is neither contact nor failure.
+                        let linked = linked_in_room(&hub, &room_id, &target_pub_key);
+                        if linked || !ok {
+                            let now = chia_resolve::unix_now();
+                            let mut book = hub.peers.lock().unwrap();
+                            if linked {
+                                book.note_ok(&target_str, now);
+                            } else {
+                                book.note_fail(&target_str, now);
+                            }
+                            let _ = book.save(std::path::Path::new(chia_contact::PEERS_FILE));
+                        }
+                        if ok {
+                            return;
+                        }
+                        let mut sorted = addrs;
+                        sorted.sort();
+                        held_by_ck = Some(sorted);
+                    }
+                }
+                Ok(None) => println!("⛓️ ChiaHub rung-6: no presence record under {target_str}'s contact key this era or last"),
+                Err(e) => eprintln!("⛓️ ChiaHub rung-6 contact-key resolve error: {e:#}"),
+            }
+        }
         let chia_cap = hub.chia_rooms.lock().unwrap().get(&room_id).cloned();
         if let Some(cap) = chia_cap {
             if cap.may_read() {
                 match chia_resolve::resolve_target(&cap.room_key, &target_str).await {
                     Ok(Some(rec)) => {
                         let addrs = chia_public_dial_addrs(&rec.addrs);
+                        let same_as_held = held_by_ck.as_ref().is_some_and(|held| {
+                            let mut sorted = addrs.clone();
+                            sorted.sort();
+                            &sorted == held
+                        });
                         if addrs.is_empty() {
                             println!("⛓️ ChiaHub rung-6: resolved {target_str} but no public addr survived the trust filter");
+                        } else if same_as_held {
+                            println!("⛓️ ChiaHub rung-6: the room record names the same addresses the contact-key hold just tried — not holding again");
                         } else {
                             println!(
                                 "⛓️ ChiaHub rung-6: resolved {target_str} on-chain — {} public addr(s), holding the dial for {}s",
@@ -2170,6 +2554,18 @@ async fn dial_peer_inner(
                                 send.clone(),
                             )
                             .await;
+                            // The dial as a whole reached the peer (judged on the room,
+                            // since a vanished room also ends the hold with `true`): the
+                            // failure the contact-key leg noted above was a stale v2
+                            // address, not an unreachable peer, and must not count
+                            // toward pruning.
+                            if held_by_ck.is_some() && linked_in_room(&hub, &room_id, &target_pub_key) {
+                                let mut book = hub.peers.lock().unwrap();
+                                if book.peers.contains_key(&target_str) {
+                                    book.note_ok(&target_str, chia_resolve::unix_now());
+                                    let _ = book.save(std::path::Path::new(chia_contact::PEERS_FILE));
+                                }
+                            }
                             return;
                         }
                     }
@@ -2199,7 +2595,9 @@ async fn dial_peer_inner(
 /// introducer. `addrs` arrive public-only from [`chia_public_dial_addrs`]; the
 /// first attempt tries the IPv6 ones alone (see below), later attempts all of
 /// them. The CALLER owns the `hub.dialing` single-flight claim. Reports
-/// dialing/connected/failed to the browser; returns true on link.
+/// dialing/connected/failed to the browser; returns true on link, and also when
+/// the hold became moot (another path linked first, or the room is gone), so
+/// callers judge contact by [`linked_in_room`], not by the return value.
 #[cfg(feature = "chia-read")]
 pub(crate) async fn hold_dial(
     hub: SharedHub,
@@ -2981,7 +3379,7 @@ struct IdsPayload {
 /// flooded, never merged) BEFORE the ysync relay. Kept as a single predicate so
 /// the reader loop's branch and any future sender agree on the set.
 fn is_control_kind(kind: &str) -> bool {
-    matches!(kind, "roster" | "mesh-join" | "graft" | "prune" | "px" | "ihave" | "iwant")
+    matches!(kind, "roster" | "mesh-join" | "graft" | "prune" | "px" | "ihave" | "iwant" | "contact")
 }
 
 /// Kinds this node speaks only with its own browser tabs (`cap` and `faucet`
@@ -3067,17 +3465,20 @@ fn node_signed_control(hub: &SharedHub, room: &str, kind: &str, seq: u32, payloa
 
 /// Send raw framed bytes ([len:u32 LE][bytes]) on a fresh bi-stream, with the
 /// finish() the host→joiner fix requires (a dropped stream RESETs and the frame
-/// is silently lost).
-async fn send_framed(conn: &iroh::endpoint::Connection, bytes: &[u8]) {
-    if let Ok((mut send_stream, _recv)) = conn.open_bi().await {
-        let l = (bytes.len() as u32).to_le_bytes();
-        let _ = send_stream.write_all(&l).await;
-        let _ = send_stream.write_all(bytes).await;
-        let _ = send_stream.finish();
+/// is silently lost). Returns whether the whole frame was written and finished;
+/// callers that must retry a lost frame (#231 P6a's contact card) look at it,
+/// the fire-and-forget senders ignore it as before.
+async fn send_framed(conn: &iroh::endpoint::Connection, bytes: &[u8]) -> bool {
+    let Ok((mut send_stream, _recv)) = conn.open_bi().await else { return false };
+    let l = (bytes.len() as u32).to_le_bytes();
+    if send_stream.write_all(&l).await.is_err() || send_stream.write_all(bytes).await.is_err() {
+        return false;
     }
+    send_stream.finish().is_ok()
 }
 
-/// Build + node-sign a control envelope and send it on `conn`.
+/// Build + node-sign a control envelope and send it on `conn`. True when the
+/// frame went out whole.
 async fn send_control(
     hub: &SharedHub,
     conn: &iroh::endpoint::Connection,
@@ -3085,10 +3486,11 @@ async fn send_control(
     kind: &str,
     seq: u32,
     payload: Vec<u8>,
-) {
+) -> bool {
     let env = node_signed_control(hub, room, kind, seq, payload);
-    if let Ok(bytes) = serde_json::to_vec(&env) {
-        send_framed(conn, &bytes).await;
+    match serde_json::to_vec(&env) {
+        Ok(bytes) => send_framed(conn, &bytes).await,
+        Err(_) => false,
     }
 }
 
@@ -3129,6 +3531,57 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
                         }
                     }
                 }
+            }
+        }
+        // #231 P6a: a peer's CONTACT CARD — its own, signed by its own key. The
+        // envelope author must be the connection peer (as for graft/prune:
+        // nobody hands out somebody else's card) and the card must name that
+        // same peer. Filed in the address book under this room; never relayed,
+        // never forwarded to the tabs (control kinds stop here).
+        #[cfg(feature = "chia-read")]
+        "contact" => {
+            // Filed only where WE would hand out ours (`may_share_card`): a room
+            // this process holds a live private cap for — never a public, bundled
+            // or posture-unknown room, not one restored from disk before the
+            // browser is back, and not a room we hold no cap for at all (the first
+            // envelope on a connection picks the room, so a peer can name any).
+            // Without that, any visitor of a public room could file self-signed
+            // identities until MAX_PEERS evicted the contacts that matter. Judged
+            // before the signature, so a flood costs no verification; a card
+            // dropped here comes again with the peer's next connection.
+            let admitted = hub.chia_rooms.lock().unwrap().get(room_id).is_some_and(|cap| cap.may_share_card());
+            if env.author.as_slice() != remote_id.as_bytes() {
+                eprintln!("🔒 CONTACT-DROP: card envelope not authored by the connection peer {remote_id}");
+            } else if !admitted {
+                eprintln!("🔒 CONTACT-DROP: card from {remote_id} in room {room_id}, which has no live private cap here");
+            } else if let Ok(card) = serde_json::from_slice::<chia_contact::ContactCard>(&env.payload) {
+                match chia_contact::verify_card(&card, chia_resolve::unix_now()) {
+                    Ok(verified) if verified.node_id == remote_id => {
+                        let changed = {
+                            let mut book = hub.peers.lock().unwrap();
+                            let changed = book.record_card(&verified, room_id);
+                            // The card came over a live connection from this very
+                            // peer: contact in itself, so the hold failures counted
+                            // against it are forgiven — they would otherwise prune a
+                            // peer we are talking to, a week after its card.
+                            book.note_ok(&remote_id.to_string(), chia_resolve::unix_now());
+                            if let Err(e) = book.save(std::path::Path::new(chia_contact::PEERS_FILE)) {
+                                eprintln!("⛓️ ChiaHub contact: could not save {}: {e}", chia_contact::PEERS_FILE);
+                            }
+                            changed
+                        };
+                        if changed {
+                            println!(
+                                "📇 contact card from {} filed for room {room_id} — its presence is now findable by key",
+                                remote_id.to_string().chars().take(16).collect::<String>()
+                            );
+                        }
+                    }
+                    Ok(_) => eprintln!("🔒 CONTACT-DROP: card from {remote_id} names another node"),
+                    Err(e) => eprintln!("🔒 CONTACT-DROP from {remote_id}: {e}"),
+                }
+            } else {
+                eprintln!("🔒 CONTACT-DROP: malformed card from {remote_id}");
             }
         }
         // M5.3 link-state: graft/prune are about THIS direct link, so require the
@@ -3230,11 +3683,29 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
         neighbors: Vec<iroh::endpoint::Connection>,
         ihave_ids: Vec<MsgId>,
         graft: Vec<(PublicKey, PeerHints, u8)>,
+        /// #231 P6a: connected peers that have not had our contact card yet.
+        #[cfg(feature = "chia-read")]
+        cards: Vec<(PublicKey, iroh::endpoint::Connection)>,
     }
 
     loop {
         ticker.tick().await;
         let mut work: Vec<RoomWork> = Vec::new();
+        // #231 P6a: the rooms whose connected peers get our contact card — those
+        // KNOWN private (never a bundled or PUBLIC room, N8). Snapshotted before
+        // the rooms lock so the two locks are never nested.
+        #[cfg(feature = "chia-read")]
+        let sharing: std::collections::HashSet<String> = if chia_contact::share_card_enabled() && hub.contact_key_durable {
+            hub.chia_rooms
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, cap)| cap.may_share_card())
+                .map(|(room, _)| room.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         {
             let now = std::time::Instant::now();
             let mut rooms = hub.rooms.lock().unwrap();
@@ -3304,6 +3775,20 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                     }
                 }
 
+                // #231 P6a: our card goes to every connected peer of a private room
+                // that has not had it yet; the entry is marked only once the send
+                // succeeded (below), so a frame lost to a stream error is retried
+                // next tick. This loop is the only sender, one tick at a time.
+                #[cfg(feature = "chia-read")]
+                let cards: Vec<(PublicKey, iroh::endpoint::Connection)> = if sharing.contains(room_id) {
+                    room.remote_peers
+                        .iter()
+                        .filter(|(_, m)| !m.card_sent)
+                        .map(|(k, m)| (*k, m.conn.clone()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let heartbeat_conns: Vec<iroh::endpoint::Connection> =
                     room.remote_peers.values().map(|m| m.conn.clone()).collect();
                 let neighbors: Vec<iroh::endpoint::Connection> =
@@ -3324,14 +3809,88 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
                         room.candidates.len(),
                     );
                 }
-                work.push(RoomWork { room: room_id.clone(), heartbeat_conns, neighbors, ihave_ids, graft });
+                work.push(RoomWork {
+                    room: room_id.clone(),
+                    heartbeat_conns,
+                    neighbors,
+                    ihave_ids,
+                    graft,
+                    #[cfg(feature = "chia-read")]
+                    cards,
+                });
             }
         }
 
         // Off-lock: heartbeats (datagram), IHAVE adverts (control), graft dials.
+        #[cfg(feature = "chia-read")]
+        let cards_started = std::time::Instant::now();
         for w in work {
             for conn in &w.heartbeat_conns {
                 let _ = conn.send_datagram(HEARTBEAT_MAGIC.to_vec().into());
+            }
+            // #231 P6a: the contact card, node-signed like every control frame.
+            // Only a peer whose frame went out whole, on the connection it still
+            // holds, is marked as having it.
+            #[cfg(feature = "chia-read")]
+            if !w.cards.is_empty() {
+                let card = chia_contact::make_card(&hub.secret_key, &hub.contact_key, chia_resolve::unix_now());
+                if let Ok(payload) = serde_json::to_vec(&card) {
+                    let mut delivered: Vec<(PublicKey, usize)> = Vec::new();
+                    for (peer, conn) in &w.cards {
+                        // The tick's card budget: `remote_peers` is not capped (only
+                        // the mesh neighbors are) and a stalled send costs a whole
+                        // `CARD_SEND_TIMEOUT`, so a room full of stalled connections
+                        // must not keep every other room's heartbeats and prunes
+                        // waiting. Unsent peers stay unmarked and get the card next tick.
+                        if cards_started.elapsed() >= CARD_BATCH_BUDGET {
+                            println!("📇 room {}: this tick's card budget is spent — the remaining contact cards go next tick", w.room);
+                            break;
+                        }
+                        // Posture and ONE send under the gate: a cap turning this
+                        // room public waits at most for the send in flight (bounded
+                        // by `CARD_SEND_TIMEOUT`), lands between two sends, and the
+                        // next check sees it — so no card authorized by a posture
+                        // since replaced can leave, and the browser's caps never
+                        // wait for a whole batch.
+                        let sent = {
+                            let _gate = hub.card_gate.lock().await;
+                            let still_sharing =
+                                hub.chia_rooms.lock().unwrap().get(&w.room).is_some_and(|cap| cap.may_share_card());
+                            if !still_sharing {
+                                println!("📇 room {} is no longer private — the remaining contact cards are not sent", w.room);
+                                break;
+                            }
+                            tokio::time::timeout(
+                                CARD_SEND_TIMEOUT,
+                                send_control(&hub, conn, &w.room, "contact", 0, payload.clone()),
+                            )
+                            .await
+                            .unwrap_or(false)
+                        };
+                        if sent {
+                            delivered.push((*peer, conn.stable_id()));
+                        } else {
+                            eprintln!("📇 contact card to {peer} in room {} did not go out — retrying next tick", w.room);
+                        }
+                    }
+                    if !delivered.is_empty() {
+                        let mut rooms = hub.rooms.lock().unwrap();
+                        if let Some(room) = rooms.get_mut(&w.room) {
+                            for (peer, sent_on) in &delivered {
+                                // The card went out on THAT connection. A peer that
+                                // reconnected meanwhile holds a new entry (a new
+                                // connection) that never saw it: left unmarked, it
+                                // gets the card next tick.
+                                if let Some(m) =
+                                    room.remote_peers.get_mut(peer).filter(|m| m.conn.stable_id() == *sent_on)
+                                {
+                                    m.card_sent = true;
+                                }
+                            }
+                        }
+                        println!("📇 contact card sent to {} peer(s) in room {}", delivered.len(), w.room);
+                    }
+                }
             }
             // M5.4 lazy-pull adverts are OPT-IN (SSF_MESH_LAZYPULL=1). The deduped
             // TTL flood already converges state correctly on its own (the plan's

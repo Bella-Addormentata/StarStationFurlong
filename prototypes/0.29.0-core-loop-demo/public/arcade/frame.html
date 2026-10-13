@@ -120,8 +120,11 @@
       function setPolicy(allowed) {
         var origins = (Array.isArray(allowed) ? allowed : []).filter(isOrigin);
         try {
+          // Ours is http(s) in a browser and in the desktop app on Windows
+          // (http://tauri.localhost), and tauri://localhost in the desktop
+          // app on Linux and macOS, which only this frame may name.
           var here = new URL(location.href).origin;
-          if (isOrigin(here) && origins.indexOf(here) < 0) origins.push(here);
+          if ((isOrigin(here) || here === 'tauri://localhost') && origins.indexOf(here) < 0) origins.push(here);
         } catch (err) { /* no origin of our own to name */ }
         var allow = origins.join(' ');
         var reach = "'self' blob: data:" + (allow ? ' ' + allow : '');

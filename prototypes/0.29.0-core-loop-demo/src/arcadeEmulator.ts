@@ -65,7 +65,7 @@
  * DOM-free except mountEmulatorFrame; the path and probe maths are tested.
  */
 
-import { gameId, ARCADE_CORES } from './arcadeDoc';
+import { ejsCore, gameId, ARCADE_CORES } from './arcadeDoc';
 import { readFrameBatch, readFrameHash, readFrameSnapshot } from './arcadeReplay';
 import type { ReplayBatch, ReplayHash, ReplaySnapshot } from './arcadeReplay';
 import type { ArcadeCore, ArcadeGame, EmulatorData } from './arcadeDoc';
@@ -548,7 +548,8 @@ export function mountEmulatorFrame(
         onEvent({ type: 'frame-ready' });
         frame.contentWindow?.postMessage({
           type: 'arcade-config',
-          core: config.core,
+          // EmulatorJS's own name for it (arcadeDoc's ARCADE_CORES).
+          core: ejsCore(config.core),
           game: config.game,
           gameName: config.gameName,
           pathToData: config.pathToData,

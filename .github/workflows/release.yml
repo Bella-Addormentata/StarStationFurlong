@@ -56,6 +56,14 @@ env:
   #      with `tag` + `target` — see workflow_dispatch above).
   RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
 
+  # 🕹 THE ARCADE CORES A RELEASE FETCHES, as comma-separated libretro names
+  # (scripts/fetch-emulatorjs.mjs in RELEASE_FRONTEND). Leave it empty, which
+  # means all of them: the cabinet offers a system for each, and one whose core
+  # is left out still shows and won't start. The installers' fetch and the source
+  # archive both read this, so they always agree. To take cores out of a build,
+  # take their systems out of the cabinet with them (public/arcade/README.md).
+  EJS_CORES: ''
+
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────
   # tauri-action cannot reliably find draft releases by tag (drafts are not
@@ -352,6 +360,13 @@ jobs:
         run: |
           cd "$RELEASE_FRONTEND"
           npm ci
+          # 🕹 The arcade cabinet's own EmulatorJS (#193): the engine and the
+          # cores EJS_CORES (above) names, all eleven by default, from the npm
+          # registry at the version the fetch script pins, refused unless each
+          # package's sha512 is pinned there too. Four of the cores forbid
+          # commercial use (FBNeo, MAME 2003-Plus, Snes9x, Genesis Plus GX;
+          # public/arcade/README.md). A frontend without the script skips this.
+          EJS_REQUIRE_PIN=1 npm run --if-present fetch:emulatorjs
           npm run build
 
       # 4b. Build the sovereign P2P node for THIS platform and stage it where
@@ -481,17 +496,106 @@ jobs:
               core.info(`Uploaded ${a.name} (${data.length} bytes)`);
             }
 
+  # ── Stage 2c: the emulator's source, attached to the same draft ──────────
+  # Release builds carry EmulatorJS and the libretro cores EJS_CORES (above)
+  # names, all eleven by default (step 4 above). Most of them are GPL and
+  # mgba is MPL, which ask whoever ships them to offer their exact source too,
+  # and the plainest way is from the same place: this packs the commits the
+  # engine and those same cores were built from
+  # (scripts/emulatorjs-sources.json) into emulatorjs-<version>-source.tar.xz,
+  # about 123 MB with all eleven, and attaches it beside the installers. Once
+  # the pack has run, the upload fails without exactly one archive, and
+  # finalize-release waits for this job, then finds the archive on the draft by
+  # name, so no release goes out without it. A frontend that fetches no
+  # EmulatorJS has nothing to pack; one that fetches it but has no way to pack
+  # its source fails here.
+  publish-emulator-source:
+    needs: create-release
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    # 'true' when this release owes a source archive (finalize-release reads it).
+    outputs:
+      packed: ${{ steps.pack.outputs.packed }}
+    steps:
+      - name: 📥 Checkout repository (the release commit)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.create-release.outputs.sha }}
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: 📦 Pack the emulator's source (${{ env.RELEASE_FRONTEND }})
+        id: pack
+        shell: bash
+        run: |
+          cd "$RELEASE_FRONTEND"
+          scripts=" $(node -p "Object.keys(require('./package.json').scripts ?? {}).join(' ')") "
+          case "$scripts" in
+            *" pack:emulatorjs-source "*)
+              EJS_SOURCE_OUT="$RUNNER_TEMP/emulatorjs-source" npm run pack:emulatorjs-source
+              echo "packed=true" >> "$GITHUB_OUTPUT" ;;
+            *" fetch:emulatorjs "*)
+              echo "::error::$RELEASE_FRONTEND ships EmulatorJS (fetch:emulatorjs) but has no pack:emulatorjs-source to pack its source."
+              exit 1 ;;
+            *)
+              echo "$RELEASE_FRONTEND ships no EmulatorJS: no source to pack." ;;
+          esac
+
+      - name: ⬆️ Upload the source archive to the shared draft release
+        if: steps.pack.outputs.packed == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const release_id = Number('${{ needs.create-release.outputs.release_id }}');
+            const dir = path.join(process.env.RUNNER_TEMP, 'emulatorjs-source');
+            const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('-source.tar.xz')) : [];
+            // The release owes exactly one archive (finalize-release looks for it
+            // again before publishing).
+            if (files.length !== 1) {
+              core.setFailed(`Refusing to go on: the pack should have left one *-source.tar.xz in ${dir}, and there are ${files.length}. Draft left intact.`);
+              return;
+            }
+            // A re-run of this job finds its earlier upload on the draft: replace it.
+            const earlier = await github.paginate(github.rest.repos.listReleaseAssets, { owner, repo, release_id, per_page: 100 });
+            for (const name of files) {
+              for (const a of earlier.filter((a) => a.name === name)) {
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: a.id });
+                core.info(`Removed an earlier ${name}`);
+              }
+              const data = fs.readFileSync(path.join(dir, name));
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id,
+                name,
+                data,
+                headers: {
+                  'content-type': 'application/x-xz',
+                  'content-length': data.length,
+                },
+              });
+              core.info(`Uploaded ${name} (${data.length} bytes)`);
+            }
+
   # ── Stage 3: publish the draft ONLY when every artifact is attached ──────
   # This repository has IMMUTABLE releases: publishing freezes the asset list
   # permanently, so publishing mid-run bricks the version (v0.20.0 was lost
   # exactly this way — published while builds were still uploading, leaving an
   # empty, undeletable release). Never publish the draft manually; this job
-  # flips it once all installer jobs and the node asset are in. If anything
-  # fails upstream, the draft stays a draft and the tag can be re-run safely —
-  # re-run the failed run, or dispatch the workflow with the same `tag` (an
-  # existing tag is reused, never moved; the stale draft is swept above).
+  # flips it once all installer jobs, the node asset and the emulator's source
+  # are in. If anything fails upstream, the draft stays a draft and the tag
+  # can be re-run safely — re-run the failed run, or dispatch the workflow
+  # with the same `tag` (an existing tag is reused, never moved; the stale
+  # draft is swept above).
   finalize-release:
-    needs: [create-release, publish-tauri-binaries, publish-p2p-node]
+    needs: [create-release, publish-tauri-binaries, publish-p2p-node, publish-emulator-source]
     permissions:
       contents: write
     runs-on: ubuntu-22.04
@@ -506,10 +610,20 @@ jobs:
               repo: context.repo.repo,
               release_id,
             });
+            // The emulator's source (Stage 2c) is an asset apart: a release whose
+            // frontend packed it owes exactly one, found by name, and it never
+            // counts toward the installers' floor below.
+            const owed = '${{ needs.publish-emulator-source.outputs.packed }}' === 'true' ? 1 : 0;
+            const sources = rel.assets.filter((a) => a.name.endsWith('-source.tar.xz')).length;
+            if (sources !== owed) {
+              core.setFailed(`Refusing to publish: the draft has ${sources} *-source.tar.xz, and this release owes ${owed}. Draft left intact.`);
+              return;
+            }
             // Sanity floor: 3 platform installer sets + standalone node exe.
             // Guards against publishing (immutably!) a half-populated release.
-            if (rel.assets.length < 6) {
-              core.setFailed(`Refusing to publish: only ${rel.assets.length} assets attached (expected >= 6). Draft left intact.`);
+            const installers = rel.assets.length - sources;
+            if (installers < 6) {
+              core.setFailed(`Refusing to publish: only ${installers} installer and node assets attached (expected >= 6). Draft left intact.`);
               return;
             }
             await github.rest.repos.updateRelease({

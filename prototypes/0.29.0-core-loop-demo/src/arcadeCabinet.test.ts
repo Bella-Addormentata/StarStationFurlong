@@ -163,7 +163,7 @@ describe('the double-wide cabinet as built', () => {
     expect(meshes).toBeGreaterThan(30); // four stations of stick, ball, two buttons and a coin slot
   });
 
-  it('shows one picture on both screens, and files each handle once', () => {
+  it('shows one picture across both tubes, acting as one screen, and files each handle once', () => {
     const group = buildWide();
     const s = sinks();
     let left: THREE.Mesh | null = null;
@@ -177,13 +177,36 @@ describe('the double-wide cabinet as built', () => {
     expect(s.arcadeCabinetVisuals.has(WIDE)).toBe(true); // the built-in emulator paints it too
     expect(left).not.toBeNull();
     expect(left!.userData.arcadeScreen).toBe(s.arcadeScreens.get(WIDE));
-    // Two screens, one material: whatever the left one shows, so does the right.
+    // Two tubes on the one picture, each with its own half of it.
     const screens: THREE.Mesh[] = [];
-    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.material === left!.material) screens.push(obj); });
+    const panes: THREE.Mesh[] = [];
+    const map = (left!.material as THREE.MeshBasicMaterial).map;
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      const mat = obj.material as THREE.MeshBasicMaterial;
+      if (mat.map === map) screens.push(obj);
+      else if (mat.transparent && (mat.userData.baseOpacity as number) < 1) panes.push(obj);
+    });
     expect(screens).toHaveLength(2);
-    const xs = screens.map((p) => new THREE.Box3().setFromObject(p).getCenter(new THREE.Vector3()).x).sort((a, b) => a - b);
-    expect(xs[0]).toBeLessThan(0);
-    expect(xs[1]).toBeGreaterThan(0);
+    expect(screens[0]!.material).not.toBe(screens[1]!.material);
+    const boxes = screens.map((p) => new THREE.Box3().setFromObject(p)).sort((a, b) => a.min.x - b.min.x);
+    expect(boxes[0]!.max.x).toBeLessThan(0);
+    expect(boxes[1]!.min.x).toBeGreaterThan(0);
+    // Butted together: only a hairline seam, behind one pane, no bezel between.
+    expect(boxes[1]!.min.x - boxes[0]!.max.x).toBeLessThan(0.02);
+    // The left tube holds the picture's left half, the right tube its right.
+    const span = (tube: THREE.Mesh) => {
+      const shader = { uniforms: {} as Record<string, THREE.IUniform>, vertexShader: '', fragmentShader: '' };
+      (tube.material as THREE.Material).onBeforeCompile(shader as unknown as THREE.WebGLProgramParametersWithUniforms, {} as THREE.WebGLRenderer);
+      return shader.uniforms.uCrtSpan!.value as THREE.Vector2;
+    };
+    const [l, r] = [...screens].sort((a, b) => a.position.x - b.position.x);
+    expect(span(l!)).toEqual(new THREE.Vector2(0, 0.5));
+    expect(span(r!)).toEqual(new THREE.Vector2(0.5, 0.5));
+    expect(panes).toHaveLength(1);
+    const pane = new THREE.Box3().setFromObject(panes[0]!);
+    expect(pane.min.x).toBeLessThan(boxes[0]!.min.x);
+    expect(pane.max.x).toBeGreaterThan(boxes[1]!.max.x);
     expect((left!.material as THREE.MeshBasicMaterial).map).toBeInstanceOf(THREE.CanvasTexture);
     const def = FURNITURE_DEFS['arcade-cabinet-wide'];
     expect(def.device?.kind).toBe('arcade');
@@ -223,6 +246,46 @@ describe('the double-wide cabinet as built', () => {
   it('counts every size as an arcade cabinet', () => {
     expect([...ARCADE_CABINET_KINDS].sort()).toEqual(['arcade-cabinet', 'arcade-cabinet-2p', 'arcade-cabinet-wide']);
   });
+});
+
+describe('the monitor bay (#194)', () => {
+  /** Every cabinet: the tube, the smoked glass in front of it, the bezel. */
+  const kinds = [['arcade-cabinet', 1], ['arcade-cabinet-2p', -1], ['arcade-cabinet-wide', 1]] as const;
+  for (const [kind, face] of kinds) {
+    it(`${kind}: a curved tube a few inches behind smoked glass, in a dark bay`, () => {
+      const group = buildItemGroup({ id: kind, kind, pos: { x: 0, z: 0 }, rot: 0, movable: true });
+      group.updateMatrixWorld(true);
+      let tube: THREE.Mesh | null = null;
+      const glass: THREE.Mesh[] = [];
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh)) return;
+        if (obj.userData.arcadeCabinet) tube = obj;
+        const mat = obj.material as THREE.Material;
+        if (mat.transparent && (mat.userData.baseOpacity as number | undefined) !== undefined
+          && (mat.userData.baseOpacity as number) < 1) glass.push(obj);
+      });
+      expect(tube).not.toBeNull();
+      const tubeMesh = tube as unknown as THREE.Mesh;
+      // A curved face, not a flat plane.
+      tubeMesh.geometry.computeBoundingBox();
+      expect(tubeMesh.geometry.boundingBox!.max.z).toBeGreaterThan(0.005);
+      // The glass: see-through but tinted, and never hiding what is behind it.
+      expect(glass.length).toBeGreaterThan(0);
+      const pane = glass[0]!.material as THREE.MeshBasicMaterial;
+      expect(pane.userData.baseOpacity).toBeGreaterThan(0.1);
+      expect(pane.userData.baseOpacity).toBeLessThan(0.6);
+      expect(pane.depthWrite).toBe(false);
+      // In front of the tube's nearest point (its tilted-forward, bulged
+      // bottom edge) by a few inches, along the way the cabinet faces.
+      const tubeBox = new THREE.Box3().setFromObject(tubeMesh);
+      const nearest = face === 1 ? tubeBox.max.z : tubeBox.min.z;
+      for (const g of glass) {
+        const glassZ = new THREE.Box3().setFromObject(g).getCenter(new THREE.Vector3()).z;
+        expect((glassZ - nearest) * face).toBeGreaterThan(0.05);
+        expect((glassZ - nearest) * face).toBeLessThan(0.12);
+      }
+    });
+  }
 });
 
 /** The footprint's half depth: the stand point must be outside the cabinet. */

@@ -5,6 +5,8 @@
  * a peer's garbage, the parsing, and the attract card's view.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
 import { setConvenienceLanesForTest } from './sovereignty';
 import { setOwnMediaOrigins } from './tvConsent';
@@ -14,7 +16,7 @@ import {
   playsKey, readCabinet, readPlays, readSeat, renewSeat, sanitizeGame, seatKey, seatLapsed, seatStatus,
   setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
   standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_COUNTER_MAX, ARCADE_DEFAULT_GAME, ARCADE_SEAT_LAPSE_MS,
-  isSeatIndex, mySeat, seatHolders, ARCADE_SEATS_MAX,
+  isSeatIndex, mySeat, seatHolders, ARCADE_SEATS_MAX, ARCADE_CORES, ejsCore,
 } from './arcadeDoc';
 import type { ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES } from './arcadeLibrary';
@@ -138,6 +140,78 @@ describe('games', () => {
     expect(coreForName('film.mp3')).toBeNull();
     expect(coreForName('noext')).toBeNull();
     expect(coreLabel('segaMD')).toBe('MEGA DRIVE');
+  });
+
+  it('tells EmulatorJS a name that runs the core the fetch script fetches, as the right system', () => {
+    // EmulatorJS 4.2.1's table (emulator.js getCores), in its order, and its
+    // reading of EJS_core (getCore): a system's name runs the system's first
+    // core; a core's name runs that core, as the first system listing it.
+    const table: ReadonlyArray<readonly [string, readonly string[]]> = [
+      ['atari5200', ['a5200']], ['vb', ['beetle_vb']], ['nds', ['melonds', 'desmume', 'desmume2015']],
+      ['arcade', ['fbneo', 'fbalpha2012_cps1', 'fbalpha2012_cps2']], ['nes', ['fceumm', 'nestopia']],
+      ['gb', ['gambatte']], ['coleco', ['gearcoleco']], ['segaMS', ['smsplus', 'genesis_plus_gx', 'picodrive']],
+      ['segaMD', ['genesis_plus_gx', 'picodrive']], ['segaGG', ['genesis_plus_gx']],
+      ['segaCD', ['genesis_plus_gx', 'picodrive']], ['sega32x', ['picodrive']],
+      ['sega', ['genesis_plus_gx', 'picodrive']], ['lynx', ['handy']], ['mame', ['mame2003_plus', 'mame2003']],
+      ['ngp', ['mednafen_ngp']], ['pce', ['mednafen_pce']], ['pcfx', ['mednafen_pcfx']],
+      ['psx', ['pcsx_rearmed', 'mednafen_psx_hw']], ['ws', ['mednafen_wswan']], ['gba', ['mgba']],
+      ['n64', ['mupen64plus_next', 'parallel_n64']], ['3do', ['opera']], ['psp', ['ppsspp']],
+      ['atari7800', ['prosystem']], ['snes', ['snes9x']], ['atari2600', ['stella2014']],
+      ['jaguar', ['virtualjaguar']], ['segaSaturn', ['yabause']], ['amiga', ['puae']], ['c64', ['vice_x64sc']],
+      ['c128', ['vice_x128']], ['pet', ['vice_xpet']], ['plus4', ['vice_xplus4']], ['vic20', ['vice_xvic']],
+    ];
+    const runs = (ejs: string) => ({
+      system: table.find(([, cores]) => cores.includes(ejs))?.[0] ?? ejs,
+      core: table.find(([name]) => name === ejs)?.[1][0] ?? ejs,
+    });
+    // The system each plays as (its controls, and how it takes a zip).
+    const plays: Record<string, string> = {
+      nes: 'nes', snes: 'snes', gb: 'gb', gbc: 'gb', gba: 'gba', segaMD: 'segaMD', segaMS: 'segaMS', n64: 'n64',
+      arcade: 'arcade', mame2003: 'mame', psx: 'psx', atari2600: 'atari2600', pce: 'pce',
+    };
+    for (const c of ARCADE_CORES) {
+      expect(ejsCore(c.core)).toBe(c.ejs);
+      expect(runs(c.ejs), c.core).toEqual({ system: plays[c.core], core: c.libretro });
+    }
+    // What EmulatorJS would have done with the cabinet's own names.
+    expect(runs('gbc').core).toBe('gbc'); // no such core
+    expect(runs('segaMS').core).toBe('smsplus'); // not fetched
+    expect(runs('mame2003').core).toBe('mame2003'); // not fetched
+    // scripts/fetch-emulatorjs.mjs fetches exactly these, each pinned.
+    const script = readFileSync(fileURLToPath(new URL('../scripts/fetch-emulatorjs.mjs', import.meta.url)), 'utf8');
+    const list = script.match(/const DEFAULT_CORES = \[([^\]]*)\]/)?.[1] ?? '';
+    const fetched = [...list.matchAll(/'([a-z0-9_]+)'/g)].map((m) => m[1]);
+    expect([...fetched].sort()).toEqual([...new Set(ARCADE_CORES.map((c) => c.libretro))].sort());
+    const version = script.match(/process\.env\.EJS_VERSION \?\? '([0-9.]+)'/)?.[1];
+    expect(version).toBeTruthy();
+    for (const core of fetched) expect(script, core).toContain(`'@emulatorjs/core-${core}@${version}': 'sha512-`);
+  });
+
+  it('pins the commit every fetched core, the engine, RetroArch, the build scripts and the RAR unpacker were built from', () => {
+    // scripts/emulatorjs-sources.json, which NOTICE.txt names and a release
+    // packs (scripts/pack-emulatorjs-source.mjs).
+    const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+    const sources = JSON.parse(read('../scripts/emulatorjs-sources.json')) as {
+      version: string;
+      engine: { repo: string; commit: string };
+      frontend: { repo: string; commit: string };
+      build: { repo: string; commit: string };
+      cores: Record<string, { repo: string; commit: string }>;
+      helpers: Record<string, { repo: string; commit: string }>;
+    };
+    const script = read('../scripts/fetch-emulatorjs.mjs');
+    expect(sources.version).toBe(script.match(/process\.env\.EJS_VERSION \?\? '([0-9.]+)'/)?.[1]);
+    expect(Object.keys(sources.cores).sort()).toEqual([...new Set(ARCADE_CORES.map((c) => c.libretro))].sort());
+    for (const s of [sources.engine, sources.frontend, sources.build, ...Object.values(sources.cores)]) {
+      expect(s.repo).toMatch(/^https:\/\/github\.com\/EmulatorJS\/[A-Za-z0-9._-]+$/);
+      expect(s.commit, s.repo).toMatch(/^[0-9a-f]{40}$/);
+    }
+    // The engine's prebuilt unpacking helpers whose source is known: the RAR one.
+    expect(Object.keys(sources.helpers)).toEqual(['libunrar']);
+    for (const s of Object.values(sources.helpers)) {
+      expect(s.repo).toMatch(/^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/);
+      expect(s.commit, s.repo).toMatch(/^[0-9a-f]{40}$/);
+    }
   });
 
   it('parseRomUrl takes an http(s) link, names it by the file, and refuses the rest', () => {

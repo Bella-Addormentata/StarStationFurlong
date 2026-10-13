@@ -4,10 +4,10 @@
  * pages and the idle attract card.
  *
  * The canvas is 512×480, exactly twice the NES's 256×240, so each NES pixel is
- * a 2×2 block and every second row can carry a scanline. On top of that sits a
- * small CRT look, kept to this one screen (the room-wide CRT vibe is issue
- * #194): dark scanlines, blacks lifted off pure black, a soft vignette, and
- * the texture's linear filtering for a little bleed between pixels.
+ * a 2×2 block. The canvas stays clean apart from blacks lifted off pure
+ * black: the CRT look (scanlines, bleed, glow, vignette, flicker) is the
+ * tube's own material, drawn over this picture in the cabinet (arcadeCrt.ts,
+ * #194).
  *
  * Frame conversion (writeFrameRgba) is pure and tested; the rest is
  * Canvas2D drawing.
@@ -22,8 +22,6 @@ export const SCREEN_H = NES_H * 2;
 
 /** Black sits this far above 0, like a CRT's glowing phosphor floor. */
 export const BLACK_LIFT = 10;
-/** Opacity of the dark line drawn over every second screen row. */
-const SCANLINE_ALPHA = 0.28;
 
 const PHOSPHOR = '#7CFFB0';
 const PHOSPHOR_DIM = '#3C9F6A';
@@ -54,7 +52,7 @@ export interface ArcadeMenuRow {
 }
 
 export interface ArcadeScreenPainter {
-  /** Paint one emulator frame with the CRT overlay. */
+  /** Paint one emulator frame. */
   drawFrame(frame: ArrayLike<number>): void;
   /** The game menu: rows, the selected one, an optional status line. */
   drawMenu(rows: ArcadeMenuRow[], selected: number, status: string | null, blink: boolean): void;
@@ -87,30 +85,6 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
     return nes;
   };
 
-  // Scanlines + vignette, rendered once and laid over every paint.
-  let overlay: HTMLCanvasElement | null = null;
-  const crtOverlay = (): HTMLCanvasElement => {
-    if (overlay) return overlay;
-    overlay = document.createElement('canvas');
-    overlay.width = SCREEN_W;
-    overlay.height = SCREEN_H;
-    const ox = overlay.getContext('2d')!;
-    ox.fillStyle = `rgba(0,0,0,${SCANLINE_ALPHA})`;
-    for (let y = 1; y < SCREEN_H; y += 2) ox.fillRect(0, y, SCREEN_W, 1);
-    const vignette = ox.createRadialGradient?.(
-      SCREEN_W / 2, SCREEN_H / 2, SCREEN_H * 0.35,
-      SCREEN_W / 2, SCREEN_H / 2, SCREEN_H * 0.78,
-    );
-    if (vignette) {
-      vignette.addColorStop(0, 'rgba(0,0,0,0)');
-      vignette.addColorStop(1, 'rgba(0,0,0,0.45)');
-      ox.fillStyle = vignette;
-      ox.fillRect(0, 0, SCREEN_W, SCREEN_H);
-    }
-    return overlay;
-  };
-  const finish = () => ctx.drawImage(crtOverlay(), 0, 0);
-
   const clear = () => {
     ctx.fillStyle = BG;
     ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
@@ -135,7 +109,6 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
       s.ctx.putImageData(s.image, 0, 0);
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(s.canvas, 0, 0, SCREEN_W, SCREEN_H);
-      finish();
     },
 
     drawMenu(rows, selected, status, blink) {
@@ -159,7 +132,6 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
         dy += 24;
       }
       if (status) text(status, SCREEN_W / 2, SCREEN_H - 24, 18, AMBER, 'center');
-      finish();
     },
 
     drawCredits(page) {
@@ -186,14 +158,12 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
         text('FULL LIST: arcade/README.md', SCREEN_W / 2, 338, 16, PHOSPHOR_DIM, 'center');
       }
       text(`◀ ${page + 1}/${CREDIT_PAGES} ▶   ENTER BACK`, SCREEN_W / 2, SCREEN_H - 24, 16, AMBER, 'center');
-      finish();
     },
 
     drawCard(title, line) {
       clear();
       text(title, SCREEN_W / 2, SCREEN_H / 2 - 10, 28, PHOSPHOR, 'center');
       text(line, SCREEN_W / 2, SCREEN_H / 2 + 30, 18, PHOSPHOR_DIM, 'center');
-      finish();
     },
 
     drawAttract() {
@@ -202,7 +172,6 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
       text('ARCADE', SCREEN_W / 2, 240, 52, PHOSPHOR, 'center');
       text(`${ARCADE_GAMES.length} GAMES INSIDE`, SCREEN_W / 2, 310, 20, PHOSPHOR_DIM, 'center');
       text('STEP UP TO PLAY', SCREEN_W / 2, 370, 22, PHOSPHOR, 'center');
-      finish();
     },
   };
 }
