@@ -28,8 +28,10 @@ use chia_sdk_driver::{SpendContext, StandardLayer};
 use chia_sdk_signer::{AggSigConstants, RequiredSignature};
 use chia_sdk_types::{Conditions, TESTNET11_CONSTANTS};
 use clvmr::Allocator;
+use serde::{Deserialize, Serialize};
 
-use crate::chia_lane::{self, ChiaPresenceRecord};
+use crate::chia_contact::InboundVerified;
+use crate::chia_lane::{self, AddrEntry, ChiaPresenceRecord, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_PRESENCE};
 use crate::chia_rooms::ChiaRoomCap;
 
 /// Fee (mojos) for a publish. 0 confirms when the mempool is quiet (the usual
@@ -865,6 +867,9 @@ pub fn publishable_rooms(caps: &[(String, ChiaRoomCap)]) -> (Vec<(String, [u8; 3
     let mut armed = Vec::new();
     let mut refused = Vec::new();
     for (room, cap) in caps {
+        if cap.restored {
+            continue; // read-only until the browser sends a live cap (posture may be stale)
+        }
         if cap.may_publish() {
             armed.push((room.clone(), cap.room_key));
         } else if cap.chia_mode {
@@ -886,6 +891,194 @@ pub fn publish_due(mark: Option<&PublishMark>, room_key: &[u8; 32], addrs_sig: &
                     >= Duration::from_secs(if m.ok { HEARTBEAT_OK_SECS } else { HEARTBEAT_RETRY_SECS })
         }
     }
+}
+
+// ── #231 P6a: the PER-NODE presence publisher ────────────────────────────────
+// One record per node per era, under the node's contact key, with the chain as
+// the clock: written once when a new era begins (or the node comes online in
+// it) and again when the PUBLIC address set or a reachability flag changes —
+// debounced, at most MAX_NODE_WRITES_PER_ERA times an era. Idle writes nothing.
+// The mark of what was written persists in `publish_marks.json` and is set only
+// after the push succeeded, so a restart never doubles a write; a failed push
+// (an unfunded wallet, the gateway down) retries on the heartbeat's retry
+// cadence. Presence has PRIORITY over the room-keyed v1 publishes in the same
+// tick (one spend per tick, see the heartbeat's doc comment).
+
+pub const NODE_MARK_FILE: &str = "publish_marks.json";
+/// Address-change republishes an era may carry (the once-per-era write excluded).
+pub const MAX_NODE_WRITES_PER_ERA: u32 = 8;
+/// An address change republishes no sooner than this after the last write.
+pub const ADDR_CHANGE_DEBOUNCE_SECS: u64 = 10 * 60;
+/// No publish in the last blocks of an era: a spend pushed there could confirm
+/// in the next era and be filed under a hint it is not valid for.
+pub const ERA_GUARD_BLOCKS: u32 = 8;
+/// A write the watcher has not seen confirmed on chain after this long is
+/// tried again: the gateway's acceptance puts a spend in the mempool, and a
+/// zero-fee spend can still be dropped from it. The wallet lease keeps a
+/// retry from touching a coin whose spend is still pending, so an early retry
+/// fails harmlessly as "unfunded" rather than double-spending — and
+/// [`publish_node_presence`] spends no OTHER coin beside a pending one either:
+/// while any spend of ours is still settling, the retry waits.
+pub const PRESENCE_CONFIRM_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// What the node last wrote for its own presence.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodePublishMark {
+    pub era: u64,
+    /// Writes in `era` so far (1 = the era's first).
+    pub writes: u32,
+    /// [`addrs_signature`] of the published address set.
+    pub addrs_sig: String,
+    /// Unix seconds of the last successful push.
+    pub last_at: u64,
+    /// The hint written under, hex (what the operator can look up).
+    pub hint: String,
+    /// The watcher read this write back from the chain (or no watcher runs,
+    /// in which case the gateway's acceptance is all there is). Until then
+    /// the write is pending and is retried after [`PRESENCE_CONFIRM_TIMEOUT_SECS`].
+    #[serde(default)]
+    pub confirmed: bool,
+    /// The node id (signer) the record was written as. With `hint` this binds
+    /// the mark to the identity that produced it: a mark left by a replaced
+    /// `contact.key` or `iroh_node_id.key` satisfies nothing, since readers
+    /// look under the new hint and reject the old signer.
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+impl NodePublishMark {
+    /// A missing or unreadable file is "never published" (one early republish
+    /// at worst: spend-to-self is idempotent in effect).
+    pub fn load(path: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        let _ = crate::chia_contact::tighten_private(path); // 0600 like every node file
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        crate::chia_contact::write_private(path, &bytes)
+    }
+}
+
+/// D4 shape: a publishing node is findable unless told otherwise.
+pub fn findable_enabled() -> bool {
+    std::env::var("SSF_CHIA_FINDABLE").ok().as_deref() != Some("0")
+}
+
+/// Inside the era's last [`ERA_GUARD_BLOCKS`]: wait for the new era.
+pub fn era_guard(peak: u32) -> bool {
+    peak % ERA_BLOCKS >= ERA_BLOCKS - ERA_GUARD_BLOCKS
+}
+
+/// Was `mark` written as the identity we are now: under this `hint` (contact
+/// key + era) and signed by this `node_id`? A same-era mark from another
+/// identity is as good as none — readers look under the new hint and reject
+/// the old signer — so a replaced key publishes again at once.
+pub fn mark_is_ours(mark: &NodePublishMark, hint: &str, node_id: &str) -> bool {
+    mark.hint == hint && mark.node_id.as_deref() == Some(node_id)
+}
+
+/// Does the watcher's latest sighting of our own record (`seen_issued_at`: the
+/// signed `issued_at` of the newest record of ours read back, 0 = none yet)
+/// confirm this mark? Only the EXACT write counts: the mark's `last_at` is the
+/// `issued_at` it was published with, so an older record of the same era,
+/// re-read inside the cursor overlap, never confirms a newer write that may
+/// still be pending or dropped.
+pub fn mark_confirmed_by(mark: &NodePublishMark, seen_issued_at: u64) -> bool {
+    !mark.confirmed && seen_issued_at != 0 && seen_issued_at == mark.last_at
+}
+
+/// Is a presence write due? Always for a new era (or none ever), and for a mark
+/// another identity left ([`mark_is_ours`]). Within an era: when the last write
+/// is still unconfirmed after [`PRESENCE_CONFIRM_TIMEOUT_SECS`] (the spend may
+/// have been dropped), or when the signed address set changed and the debounce
+/// has passed; either way only while the era's write budget is not spent.
+pub fn node_publish_due(
+    mark: Option<&NodePublishMark>,
+    era: u64,
+    addrs_sig: &str,
+    now: u64,
+    hint: &str,
+    node_id: &str,
+) -> bool {
+    match mark {
+        None => true,
+        Some(m) if m.era != era => true,
+        Some(m) if !mark_is_ours(m, hint, node_id) => true,
+        Some(m) if m.writes >= 1 + MAX_NODE_WRITES_PER_ERA => false,
+        Some(m) if !m.confirmed => now.saturating_sub(m.last_at) >= PRESENCE_CONFIRM_TIMEOUT_SECS
+            || (m.addrs_sig != addrs_sig && now.saturating_sub(m.last_at) >= ADDR_CHANGE_DEBOUNCE_SECS),
+        Some(m) => m.addrs_sig != addrs_sig && now.saturating_sub(m.last_at) >= ADDR_CHANGE_DEBOUNCE_SECS,
+    }
+}
+
+/// The address set a presence record carries: the node's live addresses
+/// filtered to PUBLIC, internet-routable ones (the same judge the dialer uses,
+/// so a LAN or CGNAT address never leaves the machine), in canonical order,
+/// at most eight, each with the measured flags of its family.
+pub fn public_addr_entries(live_addrs: &[String], inbound: &InboundVerified, peak: u32, now: u64) -> Vec<AddrEntry> {
+    // Every public address first, canonical order and duplicates removed, and
+    // only then the record's cap: a duplicate or the endpoint's listing order
+    // never costs a slot or shifts the signature.
+    let mut entries: Vec<AddrEntry> = crate::chia_public_addrs(live_addrs)
+        .into_iter()
+        .map(|addr| AddrEntry { addr, flags: inbound.flags_for(addr.is_ipv6(), peak, now) })
+        .collect();
+    chia_lane::sort_addr_entries(&mut entries);
+    entries.truncate(chia_lane::MAX_V2_ADDRS);
+    entries
+}
+
+/// The "did anything change" fingerprint of an address set: addresses AND flags.
+pub fn addrs_signature(entries: &[AddrEntry]) -> String {
+    entries.iter().map(|e| format!("{}/{}", e.addr, e.flags)).collect::<Vec<_>>().join(",")
+}
+
+/// Publish this node's presence for `era` under its contact key: encode + sign
+/// (iroh key), seal (ck), then the same lease / coin / spend-to-self / push
+/// path as the room-keyed publish. Returns the hint written under.
+pub async fn publish_node_presence(
+    iroh_sk: &iroh::SecretKey,
+    chia_sk: &SecretKey,
+    ck: &[u8; 32],
+    era: u64,
+    entries: &[AddrEntry],
+    now: u64,
+) -> Result<Bytes32> {
+    let record = PresenceV2 {
+        era,
+        node_id: iroh_sk.public(),
+        kx_pk: crate::chia_contact::kx_public(&crate::chia_contact::kx_era_secret(iroh_sk, era)),
+        issued_at: now,
+        expires_at: now + 2 * ERA_SECS,
+        addrs: entries.to_vec(),
+    };
+    let plain = chia_lane::encode_presence_v2(&record, iroh_sk)?;
+    let sealed = chia_lane::seal_v2(ck, KIND_PRESENCE, era, &plain)?;
+    let hint = Bytes32::new(chia_lane::derive_ck_hint(ck, era));
+    let ciphertext = Bytes::new(sealed);
+
+    let _lease = WALLET_LEASE.lock().await;
+    WALLET_LEASE.ensure_open()?;
+    let client = CoinsetClient::testnet11();
+    WALLET_LEASE.reconcile(&client).await;
+    // A spend of ours still settling (the previous presence write, or a room
+    // publish) keeps its coin parked — and a wallet holding more coins would
+    // spend ANOTHER one beside it: two records landing for one era, the era's
+    // write budget paid twice. The confirmation timeout is a retry for a spend
+    // the mempool DROPPED, so a pending one waits for reconciliation's verdict
+    // (the heartbeat tries again on its retry cadence).
+    if WALLET_LEASE.outgoing_pending() {
+        return Err(anyhow!("a spend from this wallet is still settling — the presence write waits for its verdict"));
+    }
+    let our_ph = our_puzzle_hash(chia_sk);
+    let coin = find_spendable_coin(&client, our_ph)
+        .await?
+        .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
+    let bundle = build_publish_bundle(chia_sk, coin, hint, ciphertext)?;
+    push_parked(&client, bundle, [coin.coin_id()]).await?;
+    Ok(hint)
 }
 
 /// Slice 6: the REAL-room publisher — what makes the lane operate beyond the
@@ -910,6 +1103,37 @@ pub async fn heartbeat_loop(
     let mut marks: HashMap<String, PublishMark> = HashMap::new();
     // N8: public-space rooms that are armed, already told about once.
     let mut refused_logged: HashSet<String> = HashSet::new();
+    // #231 P6a: the per-node presence state. The mark is what was WRITTEN (on
+    // disk, set on push success); the attempt instant paces retries after a
+    // failure; the guard flag logs the end-of-era pause once.
+    let mark_path = std::path::Path::new(NODE_MARK_FILE);
+    let mut node_mark: Option<NodePublishMark> = NodePublishMark::load(mark_path);
+    let self_id = iroh_sk.public().to_string();
+    let mut node_attempt: Option<Instant> = None;
+    let mut era_guard_logged = false;
+    let peak_client = CoinsetClient::testnet11();
+    // Without the watcher nothing ever reads our record back, so the gateway's
+    // acceptance is the only confirmation there is.
+    let watcher_confirms = crate::chia_watch::watch_enabled();
+    // Findable: told so (D4 default) AND holding a durable contact key — a key
+    // for this run only is never published under, since the record would
+    // outlive it and contradict the node's one-key identity.
+    let findable = findable_enabled() && hub.contact_key_durable;
+    if findable_enabled() && !hub.contact_key_durable {
+        println!("⛓️ ChiaHub presence: no durable contact key — per-node presence is not published this run");
+    }
+    // Tell the watcher to read our own key every beat for as long as we may
+    // write it, rooms and peers or not: that read is what confirms a write.
+    hub.presence_publishing.store(findable, std::sync::atomic::Ordering::Relaxed);
+    if let Some(m) = &node_mark {
+        println!(
+            "⛓️ ChiaHub presence: last written in era {} (write {}, hint {}, {})",
+            m.era,
+            m.writes,
+            &m.hint[..m.hint.len().min(16)],
+            if m.confirmed { "confirmed" } else { "awaiting confirmation" }
+        );
+    }
     loop {
         tokio::time::sleep(Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
         // Live addresses (F3 rule: hints are live data, not a boot-time snapshot).
@@ -919,8 +1143,95 @@ pub async fn heartbeat_loop(
             .filter(|sock| !sock.ip().is_unspecified())
             .map(|sock| sock.to_string())
             .collect();
+        // No early exit on an empty address list here: the per-node record may
+        // carry ZERO addresses (the codec allows it), and a node that lost its
+        // last address must say so, or its peers keep dialing the old ones until
+        // the record expires. The room publisher below still skips an empty set.
+
+        // ── #231 P6a: the node's OWN presence first (priority over room publishes) ──
+        if findable {
+            // The era is the chain's clock: the watcher's last peak while it is
+            // fresh (it reads every tick, but a long or stalled scan can leave
+            // it blocks — or an era — behind), else one gateway call of our
+            // own, shared back so the inbound marks and the next tick have it.
+            // Height and read time travel as one snapshot (`ChainPeak`), so a
+            // stale height is never judged by a newer time. No peak, no write.
+            let now_unix = crate::chia_resolve::unix_now();
+            let mut peak = hub.chia_peak.lock().unwrap().fresh(now_unix).unwrap_or(0);
+            if peak == 0 {
+                peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
+                if peak > 0 {
+                    *hub.chia_peak.lock().unwrap() = crate::chia_resolve::ChainPeak::new(peak, now_unix);
+                }
+            }
+            if peak > 0 && era_guard(peak) {
+                if !era_guard_logged {
+                    println!("⛓️ ChiaHub presence: the era ends within {ERA_GUARD_BLOCKS} blocks — holding this write for the new era");
+                    era_guard_logged = true;
+                }
+            } else if peak > 0 {
+                era_guard_logged = false;
+                let era = chia_lane::era_of(peak);
+                let hint_now = hex::encode(chia_lane::derive_ck_hint(&hub.contact_key, era));
+                // The watcher read THIS write back from the chain (the record's
+                // signed issued_at is the mark's push time): confirmed, nothing
+                // more to retry. An older record of ours re-read inside the
+                // cursor overlap names another issued_at and confirms nothing.
+                if let Some(m) = node_mark.as_mut() {
+                    let seen_at = hub.presence_confirmed_at.load(std::sync::atomic::Ordering::Relaxed);
+                    if mark_confirmed_by(m, seen_at) {
+                        m.confirmed = true;
+                        if let Err(e) = m.save(mark_path) {
+                            eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
+                        }
+                        println!("⛓️ ChiaHub presence: the era {} write is confirmed on chain", m.era);
+                    }
+                }
+                let inbound = hub.inbound_verified.lock().unwrap().clone();
+                let entries = public_addr_entries(&addrs, &inbound, peak, now_unix);
+                let sig = addrs_signature(&entries);
+                let retry_ok = node_attempt
+                    .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
+                    .unwrap_or(true);
+                if node_publish_due(node_mark.as_ref(), era, &sig, now_unix, &hint_now, &self_id) && retry_ok {
+                    node_attempt = Some(Instant::now());
+                    match publish_node_presence(&iroh_sk, &chia_sk, &hub.contact_key, era, &entries, now_unix).await {
+                        Ok(hint) => {
+                            let writes = match &node_mark {
+                                Some(m) if m.era == era && mark_is_ours(m, &hint_now, &self_id) => m.writes + 1,
+                                _ => 1,
+                            };
+                            let mark = NodePublishMark {
+                                era,
+                                writes,
+                                addrs_sig: sig,
+                                last_at: now_unix,
+                                hint: hex::encode(hint.to_bytes()),
+                                confirmed: !watcher_confirms,
+                                node_id: Some(self_id.clone()),
+                            };
+                            if let Err(e) = mark.save(mark_path) {
+                                eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
+                            }
+                            println!(
+                                "⛓️ ChiaHub presence: published for era {era} (write {writes}) · {} public addr(s) · hint {}",
+                                entries.len(),
+                                &mark.hint[..16]
+                            );
+                            node_mark = Some(mark);
+                        }
+                        Err(e) => eprintln!(
+                            "⛓️ ChiaHub presence: publish for era {era} failed: {e:#} (retry in {} min)",
+                            HEARTBEAT_RETRY_SECS / 60
+                        ),
+                    }
+                    continue; // one spend per tick — see the doc comment
+                }
+            }
+        }
+
         if addrs.is_empty() {
-            continue; // nothing routable to advertise yet
+            continue; // nothing routable to advertise under a room key yet
         }
         let addrs_sig = addrs.join(",");
         let caps: Vec<(String, ChiaRoomCap)> = hub
@@ -990,6 +1301,8 @@ pub async fn publish_presence(
     // 1. Build + sign (iroh key) + seal (room key) the presence record — all the
     //    shipped, unit-tested chia_lane crypto.
     let record = ChiaPresenceRecord {
+            kx_pk: None,
+            addr_flags: vec![],
         v: 1,
         node_id: iroh_sk.public().to_string(),
         addrs: live_addrs.to_vec(),
@@ -1027,7 +1340,108 @@ mod tests {
     use super::*;
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
-        ChiaRoomCap { room_key: [key; 32], chia_mode, public_room, seq: 0 }
+        ChiaRoomCap { room_key: [key; 32], chia_mode, public_room, seq: 0, restored: false }
+    }
+
+    #[test]
+    fn node_presence_is_written_once_per_era_then_only_on_debounced_changes() {
+        let now = 1_791_700_000u64;
+        assert!(node_publish_due(None, 5, "a", now, "h", "n"), "never written: due");
+        let mark = NodePublishMark {
+            era: 5,
+            writes: 1,
+            addrs_sig: "a".into(),
+            last_at: now,
+            hint: "h".into(),
+            confirmed: true,
+            node_id: Some("n".into()),
+        };
+        assert!(!node_publish_due(Some(&mark), 5, "a", now + 3600, "h", "n"), "same era, same addresses: idle writes nothing");
+        // A mark another identity left (a replaced contact or node key) satisfies
+        // nothing: its record sits under another hint, or carries a signer readers reject.
+        assert!(node_publish_due(Some(&mark), 5, "a", now + 1, "other-hint", "n"), "another contact key: due at once");
+        assert!(node_publish_due(Some(&mark), 5, "a", now + 1, "h", "other-node"), "another node key: due at once");
+        assert!(node_publish_due(Some(&mark), 6, "a", now + 1, "h", "n"), "a new era: due at once");
+        assert!(!node_publish_due(Some(&mark), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS - 1, "h", "n"), "changed, but inside the debounce");
+        assert!(node_publish_due(Some(&mark), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS, "h", "n"), "changed, debounce passed");
+        let spent = NodePublishMark { writes: 1 + MAX_NODE_WRITES_PER_ERA, ..mark.clone() };
+        assert!(!node_publish_due(Some(&spent), 5, "b", now + 3600, "h", "n"), "the era's change budget is spent");
+        assert!(node_publish_due(Some(&spent), 6, "b", now + 3600, "h", "n"), "…until the next era");
+        // A write the chain never showed back is retried after the timeout —
+        // and not before, so a spend still waiting in the mempool is left alone.
+        let pending = NodePublishMark { confirmed: false, ..mark.clone() };
+        assert!(!node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS - 1, "h", "n"), "pending, inside the window");
+        assert!(node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "pending too long: retry");
+        assert!(node_publish_due(Some(&pending), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS, "h", "n"), "pending, but the addresses changed: the change rule still applies");
+        let pending_spent = NodePublishMark { confirmed: false, writes: 1 + MAX_NODE_WRITES_PER_ERA, ..mark.clone() };
+        assert!(!node_publish_due(Some(&pending_spent), 5, "a", now + 2 * PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "retries spend the same era budget");
+        // Confirmation names the exact write: the record carrying the mark's own
+        // issued_at, not any record of ours from the same era.
+        assert!(mark_confirmed_by(&pending, now), "the record published at the mark's time confirms it");
+        assert!(!mark_confirmed_by(&pending, now - 1), "an older record of ours (same era) confirms nothing");
+        assert!(!mark_confirmed_by(&pending, 0), "nothing read back yet");
+        assert!(!mark_confirmed_by(&mark, now), "a confirmed mark needs nothing");
+        let legacy: NodePublishMark = serde_json::from_str(r#"{"era":5,"writes":1,"addrs_sig":"a","last_at":1,"hint":""}"#).unwrap();
+        assert!(!legacy.confirmed, "a mark file without the field reads as unconfirmed");
+        assert!(!mark_is_ours(&legacy, "", "n"), "a mark without a node id is nobody's");
+    }
+
+    #[test]
+    fn era_guard_holds_the_last_blocks_of_an_era() {
+        assert!(!era_guard(0));
+        assert!(!era_guard(ERA_BLOCKS - ERA_GUARD_BLOCKS - 1));
+        assert!(era_guard(ERA_BLOCKS - ERA_GUARD_BLOCKS));
+        assert!(era_guard(ERA_BLOCKS - 1));
+        assert!(!era_guard(ERA_BLOCKS));
+        assert!(era_guard(3 * ERA_BLOCKS - 1));
+    }
+
+    #[test]
+    fn a_stale_peak_stays_inside_the_era_guard() {
+        // The publisher trusts a cached peak this old at most; that many seconds
+        // of blocks still leave end-of-era guard blocks to spare.
+        let secs_per_block = ERA_SECS / u64::from(ERA_BLOCKS);
+        assert!(
+            crate::chia_resolve::PEAK_MAX_AGE_SECS < u64::from(ERA_GUARD_BLOCKS) * secs_per_block,
+            "a stale peak stays inside the guard"
+        );
+    }
+
+    #[test]
+    fn public_addr_entries_keep_public_sorted_flagged_and_capped() {
+        let now = 1_791_700_000u64;
+        let peak = 10 * ERA_BLOCKS + 5;
+        let mut inbound = InboundVerified::default();
+        inbound.note(false, peak, now);
+        // Real global unicast addresses: the public-address judge drops the
+        // documentation ranges (TEST-NET, 2001:db8::/32) along with LAN ones.
+        let live: Vec<String> = vec![
+            "192.168.1.5:4444".into(),
+            "8.8.8.8:4444".into(),
+            "[fe80::1]:4444".into(),
+            "[2001:4860:4860::8888]:4445".into(),
+            "8.8.8.8:4444".into(),
+            "203.0.113.9:4444".into(),
+        ];
+        let entries = public_addr_entries(&live, &inbound, peak, now);
+        assert_eq!(entries.len(), 2, "LAN, link-local, TEST-NET and the duplicate are gone");
+        assert!(entries[0].addr.is_ipv6(), "IPv6 first");
+        assert_eq!(entries[0].flags, 0, "IPv6 never accepted an unsolicited inbound");
+        assert_eq!(entries[1].flags, chia_lane::FLAG_INBOUND_VERIFIED, "IPv4 did, this era");
+        let sig_a = addrs_signature(&entries);
+        let later = public_addr_entries(&live, &inbound, 11 * ERA_BLOCKS, now);
+        assert_ne!(addrs_signature(&later), sig_a, "a flag going stale in the next era is an address change");
+        let many: Vec<String> = (0..12).map(|i| format!("1.1.1.{i}:1")).collect();
+        assert_eq!(public_addr_entries(&many, &inbound, peak, now).len(), chia_lane::MAX_V2_ADDRS);
+        // Duplicates never cost a slot: nine distinct addresses listed behind
+        // eight copies of the first still fill all eight slots, all distinct.
+        let mut padded: Vec<String> = vec!["1.1.1.0:1".to_string(); 8];
+        padded.extend((0..9).map(|i| format!("1.1.1.{i}:1")));
+        let filled = public_addr_entries(&padded, &inbound, peak, now);
+        assert_eq!(filled.len(), chia_lane::MAX_V2_ADDRS);
+        let distinct: std::collections::HashSet<_> = filled.iter().map(|e| e.addr).collect();
+        assert_eq!(distinct.len(), chia_lane::MAX_V2_ADDRS, "canonicalized before the cap");
+        assert_eq!(public_addr_entries(&["10.0.0.1:1".to_string()], &inbound, peak, now), vec![]);
     }
 
     #[test]
