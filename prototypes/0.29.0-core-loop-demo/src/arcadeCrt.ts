@@ -40,8 +40,13 @@ export function crtFaceGeometry(w: number, h: number, bulge: number, cols = 32, 
   const uvs: number[] = [];
   for (let j = 0; j <= rows; j++) {
     for (let i = 0; i <= cols; i++) {
-      let u = (i / cols) * 2 - 1;
-      let v = (j / rows) * 2 - 1;
+      // The bulge follows the square grid, so the outline's corners (the
+      // square's) sit at z = 0 and its edge midpoints at half.
+      const gu = (i / cols) * 2 - 1;
+      const gv = (j / rows) * 2 - 1;
+      const z = bulge * (1 - (gu * gu + gv * gv) / 2);
+      let u = gu;
+      let v = gv;
       const s = Math.max(Math.abs(u), Math.abs(v));
       if (s > 0) {
         // Push the square ring through this point onto the squircle's.
@@ -51,7 +56,7 @@ export function crtFaceGeometry(w: number, h: number, bulge: number, cols = 32, 
       }
       const x = (u * w) / 2;
       const y = (v * h) / 2;
-      positions.push(x, y, bulge * (1 - (u * u + v * v) / 2));
+      positions.push(x, y, z);
       uvs.push(x / w + 0.5, y / h + 0.5);
     }
   }

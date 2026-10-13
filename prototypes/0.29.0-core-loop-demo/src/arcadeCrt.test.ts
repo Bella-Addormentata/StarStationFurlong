@@ -19,7 +19,8 @@ describe('the CRT face', () => {
     geo.computeBoundingBox();
     const box = geo.boundingBox!;
     expect(box.max.z).toBeCloseTo(bulge, 6);
-    expect(box.min.z).toBeGreaterThanOrEqual(-1e-9);
+    expect(box.min.z).toBeCloseTo(0, 9); // the corners
+    for (const i of [0, pos.count - 1]) expect(pos.getZ(i)).toBeCloseTo(0, 9);
     expect(box.max.x - box.min.x).toBeCloseTo(w, 6);
     expect(box.max.y - box.min.y).toBeCloseTo(h, 6);
     // Normals lean outward toward the edges, as on a curved glass face.
