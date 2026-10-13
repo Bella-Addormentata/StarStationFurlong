@@ -537,7 +537,27 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   turned userinfo into an `Authorization` header would break the
   built-from-nothing rule below, so no URL with userinfo reaches the
   client at all); then the
-  host allowlist — and, because a loopback service that fetches URLs is an
+  host allowlist, which is a GRANT TABLE on the node and nothing static —
+  not archive.org's entry either: an ORIGIN (scheme, host and port, the
+  key `acceptMediaOrigin` in `tvConsent.ts` already keeps the viewer's
+  consent under, for the session) enters it only when the viewer's own
+  page, after PLAY FROM <host> (§3.3, behind the flag), posts it through
+  the same gate as any proxy request — `POST /api/media-grant`, under the
+  cap and the `Origin` or fetch-metadata rule — and leaves it when the
+  page's session ends, when the viewer forgets consents, or after twelve
+  hours at most, whichever comes first; at most thirty-two live origins,
+  a thirty-third refused with the reason. The record's `url` grants
+  nothing: a URL on an origin without a live grant is a 403 before any
+  lookup, the record only prompting the OFFER of consent, as v1's tile
+  does, and a node that restarts has an empty table, so a page answered
+  403 NO GRANT re-grants from its session consents and retries. A
+  REDIRECT to another origin is followed only if that origin holds a
+  live grant of its own; otherwise the fetch ends with the reason and the
+  host (REDIRECTED TO <host>), the tile offers PLAY FROM <that host>, and
+  a consent there grants it and retries — a same-origin redirect needs
+  nothing new. That is the per-origin consent v1 approximates from the
+  browser with the CORS HEAD probe, which the proxy retires with the
+  direct path — and, because a loopback service that fetches URLs is an
   SSRF surface, the node resolves the name ITSELF and validates every
   address the answer holds: an IPv6 address that carries an IPv4 inside is
   normalized to that IPv4 first — IPv4-mapped and IPv4-compatible forms;
@@ -573,8 +593,9 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   address and the connect with a private one, so "validated after DNS"
   alone checks one answer and connects on another. On EVERY redirect and
   every retry the whole gate runs again from the top: the scheme and
-  userinfo check, then the host allowlist on the new target before any
-  lookup, then the resolve, validate and pin
+  userinfo check, then the grant table on the new target's origin (a
+  grant of its own, above) before any lookup, then the resolve, validate
+  and pin
   (redirects capped) — an allowed host can redirect anywhere, and a redirect
   that is not re-admitted is the end of the fetch. A size ceiling, a timeout
   on both ends of the pipe (an upstream that stalls, a reader that stops
@@ -1052,7 +1073,14 @@ or the previous frame's end, the body within the ceiling over the link's
 floor rate (the largest frame at 1 Mbit/s is twelve seconds; the
 deadline fifteen), the stream reset and the link charged past it; the
 body read into a buffer that grows with what arrives and is never
-allocated at the declared length; and one unfinished frame per shared
+allocated at the declared length — and grows GEOMETRICALLY (capacity
+doubled when full, or the chunks kept in a list and joined once when
+the declared length has arrived), never a fresh allocation and a copy
+of every byte held per chunk, so reassembly is amortized linear and the
+bytes copied for a frame are at most twice its length whatever the
+fragment size: a frame under the ceiling cut into one-byte fragments by
+a peer is the CPU half of the same attack, inside both the size and the
+time limit; and one unfinished frame per shared
 stream, two per link, so a frame declared and never sent holds a
 bounded buffer for fifteen seconds and then nothing — since today
 `ssf-p2p-node/src/main.rs` allocates the declared length of a reliable
@@ -1068,7 +1096,17 @@ something that waits for the audio spike; the browser's `YjsSync` reader
 (`#readIncoming`) comes under the same ceiling and the same deadline,
 since it too reads until the declared length has arrived, keeping the
 bytes so far, with no deadline — the stream cancelled and the link
-re-dialled past it — and never the 4 KiB class,
+re-dialled past it — and under the same amortized-linear reassembly,
+since today it allocates `buffer.length + value.length` and recopies
+every byte it holds on every read (`src/network/YjsSync.ts`, lines
+478–481 as of main `330c692`), so a 1.4 MB frame delivered in tiny
+fragments costs quadratic copying on the main thread while staying
+inside both limits — the chunks kept in a list and joined once at the
+declared length, or a buffer of geometric capacity, the prefix parsed
+from the first four bytes without a join, and a regression test that
+delivers a frame at the ceiling in one-byte fragments and bounds the
+bytes copied to twice its length, beside the half-frame test — and
+never the 4 KiB class,
 which would reset a room's sync before its kind was read. That ceiling
 rests on a
 DOCUMENT bound the sender enforces, never on a number borrowed from
@@ -2492,7 +2530,8 @@ runs in one page (the double-wide cabinet's seats already play in lockstep,
    viewer's own origin or node. Spike
    **S1** beside it: the CSS3D hole-punch with the ortho camera
    plus the error-153 check on the three desktop shells.
-2. **Node media proxy** (`/api/media`, range + CORS, host allowlist): textures
+2. **Node media proxy** (`/api/media`, range + CORS, an origin table the
+   viewer's consent fills): textures
    from archive.org files, spatial audio, the #194 CRT pass (the cabinets'
    tube of #256, `arcadeCrt.ts`, is the material to reuse on the TV's
    screen); the cabinet's ROM fetch uses the same route.
