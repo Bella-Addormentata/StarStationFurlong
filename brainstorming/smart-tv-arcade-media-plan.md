@@ -560,14 +560,34 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   consent under, for the session) enters it only when the viewer's own
   page, after PLAY FROM <host> (§3.3, behind the flag), posts it through
   the same gate as any proxy request — `POST /api/media-grant`, under the
-  cap and the `Origin` or fetch-metadata rule — and leaves it when the
-  page's session ends, when the viewer forgets consents, or after twelve
-  hours at most, whichever comes first; at most thirty-two live origins,
-  a thirty-third refused with the reason. The record's `url` grants
+  cap and the `Origin` or fetch-metadata rule — and under a PAGE SESSION
+  of its own, since the cap is the node's, one per launch and shared by
+  every tab on the app's origin, so a grant keyed by origin alone would
+  let a second tab play from a host the first consented to, and the node
+  could not tell when the consenting page had gone: at start each page
+  asks the node for a session (`POST /api/media-session`, under the cap
+  and the gate) and receives an unguessable 32-byte `sid`, held in that
+  page's memory only — never in storage a sibling tab could read — and
+  LEASED: the page beats it every 30 s (`POST /api/media-session/beat`),
+  a session 90 s without a beat lapses, and the page ends it on
+  `pagehide` with a beacon (`/api/media-session/end`), so a closed tab's
+  consents die within a minute and a half at most; a grant is keyed by
+  (`sid`, origin), every `/api/media` and `/blob` request carries `sid`
+  beside `cap` (both in the URL, since a `<video>` sets no header — the
+  cap's residual, bound to the proven origin), and a request whose `sid`
+  holds no live grant for the URL's origin is a 403 before any lookup —
+  so a consent is one page's, as `acceptMediaOrigin`'s set is one page's
+  today, and a sibling tab, another room in it or a reload of the same
+  tab starts with none; a grant leaves the table when its session ends
+  or lapses, when the viewer forgets consents (the page ends its session
+  and opens a new one), or after twelve hours at most, whichever comes
+  first; at most thirty-two live origins per session and sixty-four live
+  sessions per node, a further one refused with the reason. The record's `url` grants
   nothing: a URL on an origin without a live grant is a 403 before any
   lookup, the record only prompting the OFFER of consent, as v1's tile
   does, and a node that restarts has an empty table, so a page answered
-  403 NO GRANT re-grants from its session consents and retries. A
+  403 NO SESSION or NO GRANT opens a session anew, re-grants from its own
+  consents and retries. A
   REDIRECT to another origin is followed only if that origin holds a
   live grant of its own; otherwise the fetch ends with the reason and the
   host (REDIRECTED TO <host>), the tile offers PLAY FROM <that host>, and
@@ -611,7 +631,8 @@ build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
   alone checks one answer and connects on another. On EVERY redirect and
   every retry the whole gate runs again from the top: the scheme and
   userinfo check, then the grant table on the new target's origin (a
-  grant of its own, above) before any lookup, then the resolve, validate
+  grant of its own under the request's `sid`, above) before any
+  lookup, then the resolve, validate
   and pin
   (redirects capped) — an allowed host can redirect anywhere, and a redirect
   that is not re-admitted is the end of the fetch. A size ceiling, a timeout
