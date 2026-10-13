@@ -60,7 +60,7 @@ enforcement backstop. Chain is touched only at open/close/dispute.
 
 Integration posture for SSF:
 - **Gate**: wagering waits on the B-7 wallet spike (key custody, XCH balance,
-  spend signing) — no wallet, no channel coin, no wagers. Hard dependency.
+  spend signing) — no wallet, no channel coin, no wagers. Hard dependency. *(Erratum 2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231): B-7 gates browser chain code only; see Sequencing.)*
 - **Shape**: chia-gaming games are chialisp validators + handlers registered in
   its `clsp/games/` tree; our checkers/chess engines do NOT port for free.
   Poker comes with the framework (their two variants) — start wagering there.
@@ -74,4 +74,4 @@ Integration posture for SSF:
 ## Sequencing
 
 P2 chess and P3 cards are independent of each other (both reuse v1 plumbing);
-P4 practice poker builds on P3; P5 gates on B-7 wallet + a chia-gaming spike.
+P4 practice poker builds on P3; P5 gates on B-7 wallet + a chia-gaming spike. **Erratum (2026-10-11, [#231 D2](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231)):** B-7 gates browser chain code only; P5's node-side wagering waits on the chain-access seam (S-0, [sovereign plan §6 / §14](sovereign-treasury-serverless-plan.md)) for chain access, then on S-2, PR E and PR F for the CAT, channel and custody wallet capability (§14 moves those there), and on the chia-gaming spike; none of it waits on B-7.
