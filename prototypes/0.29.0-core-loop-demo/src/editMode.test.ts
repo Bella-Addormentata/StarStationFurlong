@@ -115,7 +115,7 @@ const WRITERS = [
   // anyway — requiring the gate here costs nothing and asserts the obvious.
   'addToRoomInventory',
   'clearDoorSlide', // floorPlanDoc — planMap.delete inside a transact
-  'writeCupolaWall', // floorPlanDoc — planMap.set/delete inside a transact
+  'writeCupolaWalls', // floorPlanDoc — planMap.set/delete inside a transact
   'clearRobotConfig', // robotDoc — setConfigIn inside a transact on the room doc
   // Not imported: reached through `this.world`, whose type arrives as
   // `import type { World }` and whose VALUE arrives as enter()'s argument.
@@ -3261,8 +3261,8 @@ opened no unit on it, so everything it does is credited to this one's gate`);
       './airHockeyThemeDoc': ['readAirHockeyTheme', 'writeAirHockeyTheme'],
       './furnitureDoc': ['deleteFurnitureItem', 'writeFurnitureItem'],
       './roomInventory': ['activeRoomId', 'addToRoomInventory'],
-      './floorPlanDoc': ['clearDoorSlide', 'doorLateralLimitForWall', 'readCupolaWall',
-        'roomCupola', 'roomHalfExtents', 'roomPlaceBounds', 'writeCupolaWall'],
+      './floorPlanDoc': ['clearDoorSlide', 'doorLateralLimitForWall', 'readCupolaWalls',
+        'roomCupolas', 'roomHalfExtents', 'roomPlaceBounds', 'writeCupolaWalls'],
       './robotDoc': ['clearRobotConfig', 'readRobotConfig'],
       // shipRoute transacts in ten places, but neither name editMode takes
       // is one of them: readShipRoute resolves a cached snapshot, and
@@ -3612,7 +3612,7 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     expect(gate, 'the 🔭 button writes the floor plan with no owner check')
       .toBeGreaterThanOrEqual(0);
     expect(gate, 'the owner check must come before the first write, not after')
-      .toBeLessThan(body.search(/\bwriteCupolaWall\s*\(/));
+      .toBeLessThan(body.search(/\bwriteCupolaWalls\s*\(/));
   });
 
   it('gates the conflict settler, the one room-doc write outside the class', () => {
@@ -3627,7 +3627,7 @@ opened no unit on it, so everything it does is credited to this one's gate`);
     // `functions` carries the same three views as `members`, so the gate is
     // read string-blanked and the write is not — see `gateBodyOf`.
     const gate = f!.gateBody.search(boundedCall('canEditRoom()'));
-    const write = f!.body.search(/\bwriteCupolaWall\s*\(/);
+    const write = f!.body.search(/\bwriteCupolaWalls\s*\(/);
     expect(write, 'settleCupolaConflicts no longer writes — is this test still earning its place?')
       .toBeGreaterThanOrEqual(0);
     expect(gate, 'settleCupolaConflicts writes the floor plan with no owner check')

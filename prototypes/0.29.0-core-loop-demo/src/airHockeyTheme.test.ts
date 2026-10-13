@@ -377,13 +377,15 @@ function colourFingerprint(group: THREE.Group): string[] {
   return out.sort();
 }
 
-/** Every CanvasTexture on the table, with its upload version. A repaint that
- *  forgets `needsUpdate` never reaches the screen, which looks exactly like a
- *  repaint that never happened. */
+/** Every themed CanvasTexture on the table (felt and scoreboard), with its
+ *  upload version. A repaint that forgets `needsUpdate` never reaches the
+ *  screen, which looks exactly like a repaint that never happened. The ⚙
+ *  settings gears are skipped: their brass token is the same on every piece
+ *  of furniture, so no theme repaints it. */
 function textureVersions(group: THREE.Group): number[] {
   const out: number[] = [];
   group.traverse((obj) => {
-    if (!(obj instanceof THREE.Mesh)) return;
+    if (!(obj instanceof THREE.Mesh) || obj.userData.settingsGear) return;
     const map = (obj.material as THREE.Material & { map?: THREE.Texture }).map;
     if (map) out.push(map.version);
   });
