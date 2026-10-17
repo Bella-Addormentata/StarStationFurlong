@@ -132,6 +132,7 @@ import {
   roomCupolas,
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
+import type { CupolaWall } from "./cupola";
 import {
   readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumberHere, stationGates, steppedGateNumberHere,
 } from "./stationAtlas";
@@ -2994,6 +2995,8 @@ export class DoorDockingPortSystem {
     halfX: number;
     halfZ: number;
     dock: boolean;
+    /** 🔭 Its cupola end walls, when the atlas knows them (issue 219). */
+    cupola?: CupolaWall[];
   }> {
     const out: ReturnType<DoorDockingPortSystem["connectedModules"]> = [];
     for (const [doorId, st] of this.doorState) {
@@ -3001,7 +3004,8 @@ export class DoorDockingPortSystem {
       if (!this.doorObjects.has(doorId)) continue; // this room's doors only
       const roomId = roomIdFromSeed(st.connectedRoomAddress);
       const farWall = this.farWallFor(st);
-      const dims = roomId ? readAtlas()[roomId]?.dims : undefined;
+      const entry = roomId ? readAtlas()[roomId] : undefined;
+      const dims = entry?.dims;
       const pose = projectionPoseForDoor(
         doorId,
         st.segments,
@@ -3016,6 +3020,7 @@ export class DoorDockingPortSystem {
         ...pose,
         ...moduleHalves(dims),
         dock: isDockChain(st.segments),
+        ...(entry?.cupola ? { cupola: entry.cupola } : {}),
       });
     }
     return out;
