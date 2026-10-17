@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- **🚪🔥 The rooms behind public doors stay loaded, so walking through is quick ([#PRNUM](https://github.com/Bella-Addormentata/StarStationFurlong/pull/PRNUM)).** While you stand in a module, the game keeps a background session open to each room behind a paired door anyone may walk out of, up to four of them. When you walk through, the next room starts from that copy instead of being loaded from nothing behind the fade, so the screen only blinks. The room you just left stays loaded too, so walking back is quick as well. Doors set to owner-only, IN ONLY doors and keyed rooms keep the old crossing. Showing the next room for real and crossing with no fade at all is the follow-up, [#262](https://github.com/Bella-Addormentata/StarStationFurlong/issues/262).
+
 ## v0.40.0 — 2026-10-13
 
 - **📜 The plan documents agree with the decisions on record ([#259](https://github.com/Bella-Addormentata/StarStationFurlong/pull/259), [#231](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) S-0 step 0).** Six downstream plans and the sovereign plan carry dated one-line errata: B-7 gates browser chain code only (D2), so node-side chain work waits on S-0's chain-access seam and, for anything that moves money, on S-2, PR E and PR F; the coinset gateway client goes away outright with no dev/test fallback, once all nine gateway call sites run on the peer implementation; and the ChiaHub review records what has landed (#238, #245, #254), that presence is keyed by a per-node contact key, and that its §4 punch-intent protocol was superseded by the beat watcher and hold. Documentation only.

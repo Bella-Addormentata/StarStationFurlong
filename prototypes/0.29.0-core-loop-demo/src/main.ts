@@ -200,6 +200,7 @@ import { createRouteKeeper, routeRoomReady, sameStationReader } from "./routeKee
 // ferry's room.
 import { createGateKeeper } from "./gateKeeper";
 import { openRoomSession, type RoomSessionDeps } from "./roomSession";
+import { createNeighbourWarmer, type WarmNeighbour } from "./neighbourWarm";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -629,6 +630,7 @@ networkProvider.setPublicRoomProbe((roomId) =>
 );
 subscribeDoorPolicy(() => {
   void networkProvider.refreshRoomCap();
+  refreshWarmNeighbours(); // 🚪🔥 a door made public or private
 });
 subscribeDoorLayout(() => {
   void networkProvider.refreshRoomCap();
@@ -1517,6 +1519,43 @@ let roomSessionDeps: RoomSessionDeps | null = null;
 let localSeedForRoom: ((roomId: string) => string | undefined) | null = null;
 
 /**
+ * 🚪🔥 The rooms next door, kept loaded (neighbourWarm.ts): a background
+ * session to each room behind a PUBLIC paired door of the room we stand in,
+ * so walking through starts the next room from its synced replica instead of
+ * waiting behind the fade for it to arrive.
+ */
+const neighbourWarmer = createNeighbourWarmer({
+  open: (address) => (roomSessionDeps ? openRoomSession(roomSessionDeps, address) : Promise.resolve(null)),
+});
+
+/** The current room's public neighbours: every paired door a guest may walk
+ *  OUT of (passage public, not IN ONLY), with the pass the door holds. */
+function publicNeighbours(): WarmNeighbour[] {
+  const out: WarmNeighbour[] = [];
+  for (const [doorId, record] of readAllDoors()) {
+    if (!record.paired || !record.connectedRoomAddress) continue;
+    const policy = readDoorPolicy(doorId);
+    if (policy.passage !== "public" || policy.oneWay === "in") continue;
+    const roomId = decodeBootstrapInput(record.connectedRoomAddress)?.roomId;
+    if (roomId) out.push({ roomId, address: record.connectedRoomAddress });
+  }
+  return out;
+}
+
+let warmRefreshTimer = 0;
+/** Re-aim the warmer at the current room's neighbours, once the room's own
+ *  door docs are bound and its state has arrived (never from a stale or
+ *  half-bound replica). Debounced: a join notifies doors and policy at once. */
+function refreshWarmNeighbours(): void {
+  window.clearTimeout(warmRefreshTimer);
+  warmRefreshTimer = window.setTimeout(() => {
+    const roomId = activeBootstrap?.roomId ?? null;
+    if (!roomId || doorDocsBoundFor !== roomId || !roomStateArrivedNow()) return;
+    neighbourWarmer.setNeighbours(publicNeighbours(), roomId);
+  }, 300);
+}
+
+/**
  * 🚏🤖 The station's gate keeper (gateKeeper.ts, robot pilot routes open
  * choice 8): once a second, in EVERY game standing in a room with a gate
  * set to AUTO-DOCK FERRIES, it docks a route ferry that calls here with
@@ -1933,6 +1972,12 @@ async function joinRoomAtEpoch(
     if (yjsSync === sync) yjsSync = null;
     return;
   }
+  // 🚪🔥 A warm neighbour's replica, applied the same silent way (before
+  // start()): the room is already known when the channel comes up, so the
+  // arrival gate opens at once and the host ships only what changed since.
+  if (neighbourWarmer.seedDoc(sync.doc, boot.roomId)) {
+    console.log(`🚪🔥 joined ${boot.roomId} from its warm replica`);
+  }
   await sync.start();
   if (epoch !== sessionEpoch) {
     // Superseded while the sync spun up. A concurrent leaveRoom may already
@@ -2212,6 +2257,8 @@ async function joinRoomAtEpoch(
   void awaitInitialRoomState(SYNC_GATE_MS).then(() => {
     if (epoch !== sessionEpoch || yjsSync !== sync) return;
     harvestStationAtlas();
+    // 🚪🔥 This room's neighbours, warmed for the next crossing.
+    refreshWarmNeighbours();
     // 🔧 A Disassemble robot whose dock left the layout before we came: only
     // once the room's state is here is its absence known. After a gate
     // timeout that is whenever the state lands, still this visit.
@@ -2387,6 +2434,7 @@ async function joinRoomAtEpoch(
     // 🗺️ #62 P5: door changes update the atlas + the whole-station render.
     subscribeDoors(() => {
       harvestStationAtlas();
+      refreshWarmNeighbours(); // 🚪🔥 a door paired, unpaired or re-aimed
       refreshExteriorView();
       // 🛑🛰️ #80 S5: the local room's own edges just changed the atlas → re-pose
       // the station-through-the-window shells (they depend only on the atlas).
