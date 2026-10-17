@@ -33,6 +33,9 @@ mod chia_contact;
 mod chia_resolve;
 #[cfg(feature = "chia-read")]
 mod chia_watch;
+/// #231 P6b: the knock book (knocks sent and read, the rendezvous schedule).
+#[cfg(feature = "chia-read")]
+mod chia_knock;
 // The faucet dish's coin (#231 onboarding phase): per-room address, status,
 // and — in a publish build — the keyless claim and the give spend.
 #[cfg(feature = "chia-read")]
@@ -450,6 +453,17 @@ pub struct HubState {
     /// re-written at every confirmation timeout until the era's budget is spent.
     #[cfg(feature = "chia-read")]
     pub presence_publishing: std::sync::atomic::AtomicBool,
+    /// #231 P6b: knocks the dial ladder asked for, waiting for the publisher
+    /// (one spend per tick): queued when the hold toward a contact failed,
+    /// drained by the heartbeat loop. RAM only — a knock not yet sent is
+    /// re-decided by the next dial anyway.
+    #[cfg(feature = "chia-read")]
+    pub knock_queue: Mutex<std::collections::VecDeque<chia_knock::KnockRequest>>,
+    /// #231 P6b: the knock book (`knocks.json`): knocks we sent (one per host
+    /// per era) and knocks read from our inbox, each with the confirmation
+    /// height both sides dial by.
+    #[cfg(feature = "chia-read")]
+    pub knocks: Mutex<chia_knock::KnockBook>,
     /// ⛓️🥣 The wallet key `SSF_CHIA_LANE=1` loaded at startup (publish build),
     /// so the faucet dish can TAKE (claim to our address) and GIVE (pay from our
     /// coin) on the local browser's request. `None` while publishing is off.
@@ -1520,6 +1534,10 @@ async fn main() -> Result<()> {
         presence_confirmed_at: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "chia-read")]
         presence_publishing: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "chia-read")]
+        knock_queue: Mutex::new(std::collections::VecDeque::new()),
+        #[cfg(feature = "chia-read")]
+        knocks: Mutex::new(chia_knock::KnockBook::load(std::path::Path::new(chia_knock::KNOCKS_FILE))),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
     });
@@ -1878,12 +1896,29 @@ async fn handle_wt_connection_inner(
                                     // room's posture finishes its sends before the new
                                     // cap lands (see `HubState::card_gate`).
                                     let _gate = hub_clone.card_gate.lock().await;
-                                    chia_rooms::ingest_room_cap(
+                                    let accepted = chia_rooms::ingest_room_cap(
                                         &hub_clone.chia_rooms,
                                         &envelope.room,
                                         &envelope.payload,
                                         chia_rooms::persist_room_cap,
                                     );
+                                    // #231 P6b: the cards the room's pass carries for its
+                                    // members, filed like a card handed over a live
+                                    // connection — only where we would hand out ours
+                                    // (`may_share_card`), so a public or bundled room's
+                                    // hints never fill the address book.
+                                    if accepted.as_ref().is_some_and(|cap| cap.may_share_card()) {
+                                        let filed = chia_rooms::file_member_cards(
+                                            &hub_clone.peers,
+                                            &iroh_clone.id(),
+                                            &envelope.room,
+                                            &envelope.payload,
+                                            chia_resolve::unix_now(),
+                                        );
+                                        if filed > 0 {
+                                            println!("📇 {filed} member card(s) from room {}'s pass filed — their presence is now findable by key", envelope.room);
+                                        }
+                                    }
                                 } else {
                                     eprintln!(
                                         "⛓️ ChiaHub lane: ignoring a room cap from a non-loopback browser session ({remote_addr_inner}) — caps are the LOCAL browser's alone"

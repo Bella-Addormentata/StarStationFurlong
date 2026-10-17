@@ -1329,7 +1329,7 @@ mod tests {
     use super::*;
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
-        ChiaRoomCap { room_key: [key; 32], chia_mode, public_room, seq: 0, restored: false }
+        ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false }
     }
 
     #[test]

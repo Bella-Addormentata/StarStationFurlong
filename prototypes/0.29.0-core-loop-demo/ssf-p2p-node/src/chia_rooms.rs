@@ -53,6 +53,11 @@ pub struct ChiaRoomCap {
     /// The per-room "publish my presence here" toggle (the arming switch; P3/D4
     /// give it its default). Publishing only — reads never consult it.
     pub chia_mode: bool,
+    /// #231 P6b: the per-room "share my card in this room" toggle (default
+    /// on). Off, this node hands no card to the room's members, files none of
+    /// theirs, and reads no inbox for the room — a room one would rather not
+    /// be findable from. Publishing and reads are not its business.
+    pub share_card: bool,
     /// N8 posture. `Some(true)`: bundled-seed or PUBLIC-passage room — never
     /// published under, never read under. `Some(false)`: the browser resolved
     /// the door policy and the room is private. `None`: the browser never said
@@ -78,7 +83,10 @@ pub struct ChiaRoomCap {
 impl ChiaRoomCap {
     /// Same key and flags — what "changed" means for logging; `seq` is not posture.
     pub fn same_posture(&self, other: &ChiaRoomCap) -> bool {
-        self.room_key == other.room_key && self.chia_mode == other.chia_mode && self.public_room == other.public_room
+        self.room_key == other.room_key
+            && self.chia_mode == other.chia_mode
+            && self.public_room == other.public_room
+            && self.share_card == other.share_card
     }
 
     /// May the publisher write a presence record under this room's key?
@@ -116,6 +124,18 @@ struct RoomCapPayload {
     /// Absent (0) from browsers that predate the sequence number.
     #[serde(default)]
     seq: u64,
+    /// #231 P6b: absent (on) from browsers that predate the toggle.
+    #[serde(rename = "shareCard", default = "default_true")]
+    share_card: bool,
+    /// #231 P6b: the node-signed contact cards the room's pass carries for its
+    /// members, so the node can find them by key before it ever meets them.
+    /// Verified and filed by [`file_member_cards`], never trusted as sent.
+    #[serde(rename = "memberCards", default)]
+    member_cards: Vec<crate::chia_contact::ContactCard>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// May a `cap` from a browser session at `source` be trusted? Only loopback:
@@ -165,7 +185,52 @@ pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
     let parsed: RoomCapPayload = serde_json::from_slice(payload).ok()?;
     let room_key = decode_room_key(&parsed.room_key_b64)?;
     let public_room = if is_bundled_room_key(&room_key) { Some(true) } else { parsed.public_room };
-    Some(ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room, seq: parsed.seq, restored: false })
+    Some(ChiaRoomCap {
+        room_key,
+        chia_mode: parsed.chia_mode,
+        share_card: parsed.share_card,
+        public_room,
+        seq: parsed.seq,
+        restored: false,
+    })
+}
+
+/// #231 P6b: file the member cards a `cap` payload carries into the address
+/// book under `room` — each verified (signature, skew), our own skipped — and
+/// save the book when it changed. Returns how many were new or newer. The
+/// CALLER has checked the accepted cap's [`ChiaRoomCap::may_share_card`]: a
+/// public, bundled or posture-unknown room's hints never fill the book, for
+/// the reason the `contact` frame gives.
+pub fn file_member_cards(
+    peers: &Mutex<crate::chia_contact::PeerBook>,
+    self_id: &iroh::PublicKey,
+    room: &str,
+    payload: &[u8],
+    now: u64,
+) -> usize {
+    let Ok(parsed) = serde_json::from_slice::<RoomCapPayload>(payload) else { return 0 };
+    if parsed.member_cards.is_empty() {
+        return 0;
+    }
+    let mut filed = 0usize;
+    let mut book = peers.lock().unwrap();
+    for card in &parsed.member_cards {
+        match crate::chia_contact::verify_card(card, now) {
+            Ok(verified) if &verified.node_id == self_id => {}
+            Ok(verified) => {
+                if book.record_card(&verified, room) {
+                    filed += 1;
+                }
+            }
+            Err(e) => eprintln!("⛓️ ChiaHub lane: a member card in room {room}'s cap did not verify: {e}"),
+        }
+    }
+    if filed > 0 {
+        if let Err(e) = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE)) {
+            eprintln!("⛓️ ChiaHub contact: could not save {}: {e}", crate::chia_contact::PEERS_FILE);
+        }
+    }
+    filed
 }
 
 /// Ingest a `cap` payload the local browser sent for `room`: store the room key
@@ -230,7 +295,8 @@ pub fn ingest_room_cap(
             "reads on, publishing off"
         };
         println!(
-            "⛓️ ChiaHub lane: room {room} key received · {posture} · epoch hint {}",
+            "⛓️ ChiaHub lane: room {room} key received · {posture}{} · epoch hint {}",
+            if cap.share_card { "" } else { " · card sharing off for this room" },
             hex::encode(&hint[..8]),
         );
     }
@@ -246,9 +312,10 @@ pub fn ingest_room_cap(
 /// theirs lets us find them, whether or not either publishes yet.
 impl ChiaRoomCap {
     /// Known private by a cap from THIS process (a restored cap's posture may
-    /// be stale), and never the bundled welcome key.
+    /// be stale), never the bundled welcome key, and the room's own toggle on
+    /// (#231 P6b).
     pub fn may_share_card(&self) -> bool {
-        self.public_room == Some(false) && !self.restored && !is_bundled_room_key(&self.room_key)
+        self.share_card && self.public_room == Some(false) && !self.restored && !is_bundled_room_key(&self.room_key)
     }
 }
 
@@ -274,6 +341,9 @@ struct PersistedCap {
     chia_mode: bool,
     #[serde(rename = "publicRoom")]
     public_room: Option<bool>,
+    /// Absent (on) in files written before #231 P6b.
+    #[serde(rename = "shareCard", default = "default_true")]
+    share_card: bool,
 }
 
 fn cap_path(room_id: &str) -> std::path::PathBuf {
@@ -290,6 +360,7 @@ pub fn persist_room_cap(room_id: &str, cap: &ChiaRoomCap) {
         room_key_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cap.room_key),
         chia_mode: cap.chia_mode,
         public_room: cap.public_room,
+        share_card: cap.share_card,
     };
     let written = std::fs::create_dir_all("rooms")
         .map_err(|e| format!("cannot create rooms/: {e}"))
@@ -340,7 +411,17 @@ pub fn load_persisted_caps() -> Vec<(String, ChiaRoomCap)> {
             continue;
         };
         let public_room = if is_bundled_room_key(&room_key) { Some(true) } else { parsed.public_room };
-        out.push((room_id, ChiaRoomCap { room_key, chia_mode: parsed.chia_mode, public_room, seq: 0, restored: true }));
+        out.push((
+            room_id,
+            ChiaRoomCap {
+                room_key,
+                chia_mode: parsed.chia_mode,
+                share_card: parsed.share_card,
+                public_room,
+                seq: 0,
+                restored: true,
+            },
+        ));
     }
     out
 }
@@ -486,8 +567,18 @@ mod tests {
 
     #[test]
     fn cards_are_shared_only_in_rooms_known_private() {
-        let private = ChiaRoomCap { room_key: [9u8; 32], chia_mode: false, public_room: Some(false), seq: 0, restored: false };
+        let private = ChiaRoomCap {
+            room_key: [9u8; 32],
+            chia_mode: false,
+            share_card: true,
+            public_room: Some(false),
+            seq: 0,
+            restored: false,
+        };
         assert!(private.may_share_card(), "a private room shares (and files the peers' cards), armed or not");
+        let muted = ChiaRoomCap { share_card: false, ..private.clone() };
+        assert!(!muted.may_share_card(), "P6b: the room's own toggle turns cards off");
+        assert!(muted.may_read() && !muted.posture_unknown(), "and nothing else");
         let restored = ChiaRoomCap { chia_mode: true, restored: true, ..private.clone() };
         assert!(!restored.may_share_card(), "a cap restored from disk may have gone public meanwhile: no card");
         assert!(!restored.may_publish(), "nor does it arm the room publisher");
@@ -500,5 +591,51 @@ mod tests {
         let bundled_key = decode_room_key(BUNDLED_ROOM_KEYS_B64[0]).unwrap();
         let bundled = ChiaRoomCap { room_key: bundled_key, public_room: Some(false), ..private.clone() };
         assert!(!bundled.may_share_card(), "the bundled welcome key never gets a card, whatever a browser says");
+    }
+
+    #[test]
+    fn p6b_share_card_toggle_rides_the_cap_and_its_file() {
+        let key = [4u8; 32];
+        let on = parse_room_cap(&payload(key, ",\"publicRoom\":false")).unwrap();
+        assert!(on.share_card, "absent means on (older browsers)");
+        let off = parse_room_cap(&payload(key, ",\"publicRoom\":false,\"shareCard\":false")).unwrap();
+        assert!(!off.share_card && !off.may_share_card());
+        assert!(!on.same_posture(&off), "the toggle is posture: a change is logged");
+        // The persisted shape carries it, and a file from before P6b (no
+        // shareCard) loads as on.
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let written = PersistedCap { room_key_b64: b64.clone(), chia_mode: true, public_room: Some(false), share_card: false };
+        let text = serde_json::to_string(&written).unwrap();
+        assert!(text.contains("\"shareCard\":false"));
+        let back: PersistedCap = serde_json::from_str(&text).unwrap();
+        assert!(!back.share_card, "the toggle survives a restart");
+        let older: PersistedCap =
+            serde_json::from_str(&format!("{{\"roomKeyB64\":\"{b64}\",\"chiaMode\":true,\"publicRoom\":false}}")).unwrap();
+        assert!(older.share_card);
+    }
+
+    #[test]
+    fn p6b_member_cards_are_verified_and_filed_under_the_room_but_never_our_own() {
+        let me = iroh::SecretKey::generate();
+        let a = iroh::SecretKey::generate();
+        let b = iroh::SecretKey::generate();
+        let now = 1_700_000_000u64;
+        let card_a = crate::chia_contact::make_card(&a, &[7u8; 32], now);
+        let card_me = crate::chia_contact::make_card(&me, &[8u8; 32], now);
+        let mut card_b = crate::chia_contact::make_card(&b, &[9u8; 32], now);
+        card_b.issued_at += 1; // signature no longer matches
+        let cards = serde_json::to_string(&vec![card_a.clone(), card_me, card_b]).unwrap();
+        let body = payload([4u8; 32], &format!(",\"publicRoom\":false,\"memberCards\":{cards}"));
+        let peers = Mutex::new(crate::chia_contact::PeerBook::default());
+        let filed = file_member_cards(&peers, &me.public(), "room-x", &body, now);
+        assert_eq!(filed, 1, "one good card of another node");
+        let book = peers.lock().unwrap();
+        assert_eq!(book.peers.len(), 1);
+        let entry = &book.peers[&a.public().to_string()];
+        assert_eq!(entry.ck.as_deref(), Some(card_a.ck.as_str()));
+        assert!(entry.rooms.contains("room-x"));
+        drop(book);
+        assert_eq!(file_member_cards(&peers, &me.public(), "room-x", &body, now), 0, "filed once");
+        assert_eq!(file_member_cards(&peers, &me.public(), "room-x", &payload([4u8; 32], ""), now), 0, "no cards, nothing");
     }
 }
