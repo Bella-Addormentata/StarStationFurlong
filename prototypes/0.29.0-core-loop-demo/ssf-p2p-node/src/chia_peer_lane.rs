@@ -20,16 +20,20 @@
 //! The peer set (§14 (1), (2)):
 //!   - PINS, `SSF_CHIA_PEERS=host[:port],…`: the player's own full node, or one
 //!     they trust. A pin is always consulted and counts toward the two; by
-//!     default it must agree with one public peer from another network group;
+//!     default it must agree with one public peer from another network group
+//!     (so at most three pin addresses connect, one place kept for that peer);
 //!     `SSF_CHIA_PIN_ONLY=1` makes the pin's verdict final alone (and dials no
 //!     public peer at all). An unreachable pin is a non‑final verdict on money
 //!     paths, never a silent fall‑back to public peers; the presence lane may
 //!     still read from public peers meanwhile.
 //!   - PUBLIC peers come from three sources: the DNS introducer (fresh this
-//!     run; asked when the stored and gossiped candidates run out, at most
-//!     every [`INTRODUCE_EVERY`], sooner only after a lookup that named
-//!     nobody), `RequestPeers` gossip from a connected peer, and the store of
-//!     known‑good peers kept in `chia_peers.json` across runs. Two agreeing
+//!     run; asked only when the stored and gossiped candidates fall short:
+//!     nothing left to dial, or a money request without a pin that has no
+//!     fresh peer yet; at most every [`INTRODUCE_EVERY`], sooner only after a
+//!     lookup that named nobody; a stored or gossiped peer it names this run
+//!     counts as fresh from then on), `RequestPeers` gossip from a connected
+//!     peer, and the store of known‑good peers kept in `chia_peers.json`
+//!     across runs. Two agreeing
 //!     peers must come from DISTINCT sources and distinct network groups
 //!     (IPv4 /16, IPv6 /32; an IPv4‑mapped IPv6 address is its IPv4 address),
 //!     and one of them must be fresh (a pin or the introducer), so a poisoned
@@ -320,8 +324,11 @@ impl Lane {
                 // Nothing public is ever dialled in this mode.
                 break;
             }
-            self.refill(&mut state).await;
-            if !self.dial(&mut state).await {
+            self.refill(&mut state, trust).await;
+            // A refill can change the pool without a dial (a connected stored
+            // peer the introducer named is fresh now), so the round is spent
+            // only when there was nothing to dial AND nothing new to choose.
+            if !self.dial(&mut state).await && self.choose(&state, trust).is_none() {
                 break;
             }
         }
@@ -389,7 +396,12 @@ impl Lane {
             state.pin_retry_after = Some(now + PIN_RETRY_AFTER);
             return;
         }
-        while state.conns.len() >= MAX_CONNS {
+        // Outside pin-only mode one place is kept for the public peer the
+        // agreement needs, however many addresses the pins resolve to.
+        let pin_cap = if self.pin_only { MAX_CONNS } else { MAX_CONNS - 1 };
+        let pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
+        targets.truncate(pin_cap.saturating_sub(pins_up));
+        while state.conns.len() + targets.len() > MAX_CONNS {
             let Some(i) = state.conns.iter().rposition(|c| c.source() != Source::Pin) else { break };
             let peer = state.conns.remove(i);
             eprintln!("⛓️ chain peers: {} ({}) let go: making room for a pin", peer.addr(), peer.source().label());
@@ -400,13 +412,16 @@ impl Lane {
         state.pin_retry_after = if state.conns.iter().any(|c| c.source() == Source::Pin) { None } else { Some(Instant::now() + PIN_RETRY_AFTER) };
     }
 
-    /// Top up the candidate queue: the store once, the introducer when due
-    /// (its last answer used up and [`INTRODUCE_EVERY`] passed, or
-    /// [`INTRODUCE_RETRY`] after an answer that named nobody), and gossip from
-    /// every connection not yet asked. The interval holds across requests and
-    /// dial rounds alike: while the introducer cools down, the queued, stored
-    /// and gossiped candidates are what there is to try.
-    async fn refill(&self, state: &mut LaneState) {
+    /// Top up the candidate queue: the store once; the introducer only when
+    /// the quieter sources fall short (nothing stored or gossiped left to
+    /// dial, or a money request without a pin that has no fresh peer yet,
+    /// which the store and gossip can never supply) and it is due (its last
+    /// answer used up and [`INTRODUCE_EVERY`] passed, or [`INTRODUCE_RETRY`]
+    /// after an answer that named nobody); and gossip from every connection
+    /// not yet asked. The interval holds across requests and dial rounds
+    /// alike: while the introducer cools down, the queued, stored and
+    /// gossiped candidates are what there is to try.
+    async fn refill(&self, state: &mut LaneState, trust: Trust) {
         if !state.store_loaded {
             state.store_loaded = true;
             state.known = self.store_path.as_deref().map(load_store).unwrap_or_default();
@@ -418,9 +433,13 @@ impl Lane {
                 .collect();
             push_candidates(state, stored);
         }
+        let now = Instant::now();
+        let ready = state.candidates.iter().any(|c| !state.cooling.get(&c.addr).is_some_and(|until| now < *until));
+        let need_fresh = trust == Trust::Agreed && self.pins.is_empty() && !state.conns.iter().any(|c| c.source().is_fresh());
         let introduce = !self.net.introducers.is_empty()
-            && state.introduce_after.is_none_or(|at| Instant::now() >= at)
-            && !state.candidates.iter().any(|c| c.source == Source::Introducer);
+            && state.introduce_after.is_none_or(|at| now >= at)
+            && !state.candidates.iter().any(|c| c.source == Source::Introducer)
+            && (need_fresh || !ready);
         if introduce {
             let mut found = Vec::new();
             for name in &self.net.introducers {
@@ -875,21 +894,22 @@ pub(crate) fn push_verdict(outcomes: &[AckOutcome]) -> Result<(), ChainError> {
 }
 
 /// Is a spend pushed earlier still live? Accepted anywhere: yes (it is in a
-/// mempool again). Refused everywhere: dead only when a refusal is FINAL —
-/// the bundle itself can never land — since a refusal for fee or load says
-/// nothing about a copy an earlier peer may still hold; such a verdict stays
-/// unknown and the coins stay parked (release only with evidence). Else
-/// unknown.
+/// mempool again). Refused everywhere: dead only when EVERY peer's refusal is
+/// FINAL — the bundle itself can never land — since a refusal for fee or load
+/// says nothing about a copy an earlier peer may still hold, and one peer's
+/// final word against another's policy refusal is no evidence either (a
+/// dishonest peer could claim a double spend). Such a verdict stays unknown
+/// and the coins stay parked (release only with evidence). Else unknown.
 pub(crate) fn live_verdict(outcomes: &[AckOutcome]) -> Result<bool, ChainError> {
     if outcomes.iter().any(|o| *o == AckOutcome::Accepted) {
         return Ok(true);
     }
     if outcomes.iter().all(|o| matches!(o, AckOutcome::Failed(_))) {
-        if outcomes.iter().any(|o| matches!(o, AckOutcome::Failed(why) if refusal_is_final(why))) {
+        if outcomes.iter().all(|o| matches!(o, AckOutcome::Failed(why) if refusal_is_final(why))) {
             return Ok(false);
         }
         return Err(unanswered(format!(
-            "spend liveness: refused for policy or load, not on the bundle itself, so it may still be live elsewhere ({})",
+            "spend liveness: refused, but not by every peer for a reason final on the bundle itself, so it may still be live elsewhere ({})",
             describe(outcomes)
         )));
     }
@@ -979,18 +999,31 @@ fn close_later(peer: Arc<PeerConn>) {
     tokio::spawn(async move { peer.close().await });
 }
 
+/// Queue candidates not yet known. An address already queued or connected is
+/// not queued again (one address, one vote), but a fresh mention of it is
+/// kept: a stored or gossiped peer the introducer names this run counts as an
+/// introducer peer from then on, so a warm start whose store already holds
+/// everything the introducer answers can still form an agreed pair.
 fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
     for cand in &mut new {
         cand.addr = canonical(cand.addr);
     }
-    let present: HashSet<SocketAddr> =
-        state.candidates.iter().map(|c| c.addr).chain(state.conns.iter().map(|c| c.addr())).collect();
-    new.retain(|c| !present.contains(&c.addr));
     for cand in new {
-        if state.candidates.len() >= CANDIDATE_CAP {
-            break;
+        if let Some(conn) = state.conns.iter().find(|c| c.addr() == cand.addr) {
+            if conn.promote(cand.source) {
+                eprintln!("⛓️ chain peers: {} now counts as {}: the introducer named it this run", cand.addr, cand.source.label());
+            }
+            continue;
         }
-        state.candidates.push_back(cand);
+        if let Some(queued) = state.candidates.iter_mut().find(|c| c.addr == cand.addr) {
+            if cand.source == Source::Introducer && !queued.source.is_fresh() {
+                queued.source = cand.source;
+            }
+            continue;
+        }
+        if state.candidates.len() < CANDIDATE_CAP {
+            state.candidates.push_back(cand);
+        }
     }
 }
 
@@ -1677,6 +1710,80 @@ mod tests {
         assert_eq!(state.candidates[0].addr, native);
     }
 
+    #[tokio::test]
+    async fn four_reachable_pins_leave_a_place_for_the_public_peer() {
+        let mut pins = Vec::new();
+        let mut nodes = Vec::new();
+        for _ in 0..4 {
+            let node = full_node(vec![], (1, None), Some(peak_at(100))).await;
+            pins.push(node.addr.to_string());
+            nodes.push(node);
+        }
+        let public = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(public.addr, Source::Introducer)], pins, false, None);
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Agreed).peak_height().await.unwrap(), 100);
+        let conns = lane.live_conns().await;
+        assert!(conns.len() <= MAX_CONNS);
+        assert_eq!(conns.iter().filter(|c| c.source() == Source::Pin).count(), MAX_CONNS - 1, "one place is kept for a public peer");
+        assert!(conns.iter().any(|c| c.addr() == public.addr), "and the public peer took it");
+    }
+
+    #[tokio::test]
+    async fn a_warm_start_dials_the_store_first_and_asks_the_introducer_only_for_a_fresh_peer() {
+        // The store knows A and B; "127.0.0.1" stands in for the introducer and
+        // names A again (the network's port is A's). A presence read is served
+        // from the store without a lookup; a money read needs a fresh peer, so
+        // the introducer is asked, and A, named this run, counts as fresh
+        // although the store queued it first.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let store = temp_store("warm");
+        let now = unix_now();
+        let known = vec![StoredPeer { addr: a.addr.to_string(), last_ok: now }, StoredPeer { addr: b.addr.to_string(), last_ok: now }];
+        write_store(&store, &StoreFile { v: 1, peers: known }).unwrap();
+        let net = Network { introducers: vec!["127.0.0.1".to_string()], port: a.addr.port(), ..net() };
+        let lane = Arc::new(Lane::new(net, vec![], false, Some(store)).with_tls(TLS.clone()));
+
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        assert!(lane.state.lock().await.introduce_after.is_none(), "the store served the presence read; the introducer was not asked");
+
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1);
+        assert!(lane.state.lock().await.introduce_after.is_some(), "a money read without a pin needs a fresh peer: the introducer was asked");
+        let conns = lane.live_conns().await;
+        let source_of = |addr: SocketAddr| conns.iter().find(|c| c.addr() == addr).map(|c| c.source());
+        assert_eq!(source_of(a.addr), Some(Source::Introducer), "named by the introducer this run, A counts as fresh");
+        assert_eq!(source_of(b.addr), Some(Source::Store));
+    }
+
+    #[tokio::test]
+    async fn a_pin_and_a_stored_peer_settle_a_money_read_without_the_introducer() {
+        let pin = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let stored = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let store = temp_store("pinned-warm");
+        write_store(&store, &StoreFile { v: 1, peers: vec![StoredPeer { addr: stored.addr.to_string(), last_ok: unix_now() }] }).unwrap();
+        // Port 1 is nobody's: an introducer answer would be dialled and fail,
+        // and the lookup would leave its mark on `introduce_after`.
+        let net = Network { introducers: vec!["127.0.0.1".to_string()], port: 1, ..net() };
+        let lane = Arc::new(Lane::new(net, vec![pin.addr.to_string()], false, Some(store)).with_tls(TLS.clone()));
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Agreed).peak_height().await.unwrap(), 100);
+        assert!(lane.state.lock().await.introduce_after.is_none(), "the pin and the stored peer agreed; the introducer was not asked");
+    }
+
+    #[test]
+    fn a_queued_stored_candidate_the_introducer_names_becomes_fresh() {
+        let mut state = LaneState::default();
+        let addr: SocketAddr = "203.0.113.5:58444".parse().unwrap();
+        push_candidates(&mut state, vec![Candidate { addr, source: Source::Store }]);
+        push_candidates(&mut state, vec![Candidate { addr, source: Source::Introducer }]);
+        assert_eq!(state.candidates.len(), 1, "one address, one vote");
+        assert_eq!(state.candidates[0].source, Source::Introducer);
+        // Nothing moves away from fresh: a later gossiped mention changes nothing.
+        push_candidates(&mut state, vec![Candidate { addr, source: Source::Gossip }]);
+        assert_eq!(state.candidates.len(), 1);
+        assert_eq!(state.candidates[0].source, Source::Introducer);
+    }
+
     #[test]
     fn verdicts_on_acks_without_a_socket() {
         let failed = || AckOutcome::Failed("x: INVALID_FEE_TOO_CLOSE_TO_ZERO".to_string());
@@ -1687,7 +1794,8 @@ mod tests {
         assert!(matches!(push_verdict(&[failed(), silent()]), Err(ChainError::Unanswered(_))));
         assert_eq!(live_verdict(&[AckOutcome::Accepted, failed()]).unwrap(), true);
         assert_eq!(live_verdict(&[dead(), dead()]).unwrap(), false);
-        assert_eq!(live_verdict(&[failed(), dead()]).unwrap(), false, "one final refusal settles it");
+        assert!(live_verdict(&[failed(), dead()]).is_err(), "a final refusal from one peer alone does not settle it");
+        assert!(live_verdict(&[dead(), silent()]).is_err());
         assert!(live_verdict(&[failed(), failed()]).is_err(), "policy refusals alone leave the spend parked");
         assert!(live_verdict(&[failed(), silent()]).is_err());
         assert!(live_verdict(&[silent()]).is_err());

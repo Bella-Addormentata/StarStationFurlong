@@ -264,7 +264,9 @@ struct Pending {
 /// stops its reader and the socket closes.
 pub struct PeerConn {
     addr: SocketAddr,
-    source: Source,
+    /// Where the address came from; may move to a fresher source
+    /// ([`Self::promote`]) when the introducer names it this run.
+    source: Mutex<Source>,
     group: Group,
     sink: tokio::sync::Mutex<Sink>,
     pending: Arc<Mutex<Pending>>,
@@ -281,7 +283,7 @@ pub struct PeerConn {
 
 impl std::fmt::Debug for PeerConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PeerConn({} via {})", self.addr, self.source.label())
+        write!(f, "PeerConn({} via {})", self.addr, self.source().label())
     }
 }
 
@@ -321,7 +323,7 @@ impl PeerConn {
         let reader = tokio::spawn(read_loop(stream, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
         let conn = Arc::new(Self {
             addr,
-            source,
+            source: Mutex::new(source),
             group: group_of(addr),
             sink: tokio::sync::Mutex::new(sink),
             pending,
@@ -382,7 +384,20 @@ impl PeerConn {
     }
 
     pub fn source(&self) -> Source {
-        self.source
+        *self.source.lock().unwrap()
+    }
+
+    /// A fresher provenance for the same address: a stored or gossiped peer
+    /// the introducer names this run becomes an introducer peer, one
+    /// connection and one vote still. Nothing moves away from fresh and a pin
+    /// is never relabelled. True when the label changed.
+    pub fn promote(&self, to: Source) -> bool {
+        let mut source = self.source.lock().unwrap();
+        if to == Source::Introducer && !source.is_fresh() {
+            *source = to;
+            return true;
+        }
+        false
     }
 
     pub fn group(&self) -> Group {
