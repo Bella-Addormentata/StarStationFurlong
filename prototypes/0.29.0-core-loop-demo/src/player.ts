@@ -2591,6 +2591,9 @@ export class Player {
     door: DoorTarget,
     hooks: DoorSequenceHooks,
     spawnAtThrough = true,
+    // 🚪🔒 The tube walk's arrival half: points from the door out along the
+    // tube, the spawn LAST (instead of `through`); the walk-in retraces them.
+    via?: ReadonlyArray<{ x: number; z: number }>,
   ): void {
     this.doorSeq++; // invalidate any in-flight requestOpen completion
     this._cancelSit();
@@ -2605,7 +2608,12 @@ export class Player {
     this.doorHooks = hooks;
     this.adapterOutTarget = null;
     this.adapterOutPath = [];
-    if (spawnAtThrough) {
+    if (spawnAtThrough && via && via.length > 0) {
+      const spawn = via[via.length - 1];
+      this.mesh.position.x = spawn.x;
+      this.mesh.position.z = spawn.z;
+      this.vestibuleTrail = via.slice(0, -1).map((p) => ({ x: p.x, z: p.z }));
+    } else if (spawnAtThrough) {
       this.mesh.position.x = door.through.x;
       this.mesh.position.z = door.through.z;
       this.vestibuleTrail = []; // a new room: nothing to retrace

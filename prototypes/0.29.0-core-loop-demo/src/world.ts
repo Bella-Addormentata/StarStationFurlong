@@ -4837,6 +4837,12 @@ export class World {
     }
     if (!waiting()) return false;
     const segments = ds.getDockingState(doorId)?.segments ?? null;
+    // The tube walked is the one drawn: a chain edited from elsewhere since
+    // (its mesh is kept while walked) gets the fade, not a seal that no
+    // longer matches where the player stands.
+    if (this.pairedVestibules.get(doorId)?.userData.segmentsKey !== JSON.stringify(segments)) {
+      return false;
+    }
     // Posed from the door as it stands now (both builders anchor by id), not
     // from the cached tube, which may predate this room's layout.
     const tube = this.buildDoorConnector(doorId as DoorId);
@@ -4867,8 +4873,9 @@ export class World {
   }
 
   /**
-   * Open the seal: draw the room again. Called once the player stands at the
-   * arrival door's `through` point (or, on a failure, behind the fade). The
+   * Open the seal: draw the room again. Called once the player stands where
+   * the arrival walk-in starts (arrivalWalkIn, or the door's `through` point
+   * when there is no tube walk), or, on a failure, behind the fade. The
    * arrival door's own tube is built and made solid first, so the view the
    * seal hands over to is the same closed tube.
    */
@@ -4912,26 +4919,69 @@ export class World {
   }
 
   /**
+   * 🚪🔒 Where on a tube the walk changes rooms: `hold` from this door along
+   * the walkway, which is `fromFar` short of the far door. The far side's
+   * walk-in starts `fromFar` from its own door, the same spot. That is as far
+   * as `through` sits from a door, or half the tube when it is shorter.
+   */
+  private tubeWalkGeometry(
+    doorId: string,
+    segments: readonly ConnectorSegment[] | null | undefined,
+  ): {
+    toRoom: (p: { x: number; z: number }) => { x: number; z: number };
+    line: ReturnType<typeof connectorCentreline>;
+    out: number;
+    fromFar: number;
+  } | null {
+    const door = findDoor(doorId);
+    const pose = physicalDoorPoseOrNull(doorId);
+    if (!door || !pose) return null;
+    const c = Math.cos(pose.outwardYaw),
+      sn = Math.sin(pose.outwardYaw);
+    const out = (door.through.x - pose.x) * sn + (door.through.z - pose.z) * c;
+    const line = connectorCentreline(segments);
+    return {
+      toRoom: (p) => ({ x: pose.x + p.x * c + p.z * sn, z: pose.z - p.x * sn + p.z * c }),
+      line,
+      out,
+      fromFar: Math.min(out, line.length / 2),
+    };
+  }
+
+  /**
    * 🚪🔒 In first person, the walk through `door`'s tube: from `through`
-   * along the walkway's centreline, round every bend, to the point as far
-   * from the far door as `through` is from this one, which is where the
-   * arrival walk-in starts on the other side. Room coordinates. Null outside
-   * first person (the room view keeps the short step and the fade).
+   * along the walkway's centreline, round every bend, to the spot where the
+   * far side's walk-in starts (tubeWalkGeometry). Room coordinates. Null
+   * outside first person (the room view keeps the short step and the fade).
    */
   private vestibuleWalkPath(door: DoorTarget): Array<{ x: number; z: number }> | null {
     if (!this.isFirstPersonView()) return null;
-    const pose = physicalDoorPoseOrNull(door.id);
-    if (!pose) return null;
-    const yaw = pose.outwardYaw;
-    const c = Math.cos(yaw),
-      sn = Math.sin(yaw);
-    const out = (door.through.x - pose.x) * sn + (door.through.z - pose.z) * c;
-    const line = connectorCentreline(this.dockingSystem?.getDockingState(door.id)?.segments);
-    const to = Math.max(out + 0.2, line.length - out);
-    return walkwayBetween(line, out, to).map((p) => ({
-      x: pose.x + p.x * c + p.z * sn,
-      z: pose.z - p.x * sn + p.z * c,
-    }));
+    const g = this.tubeWalkGeometry(door.id, this.dockingSystem?.getDockingState(door.id)?.segments);
+    if (!g) return null;
+    const hold = g.line.length - g.fromFar;
+    return walkwayBetween(g.line, Math.min(g.out, hold), hold).map(g.toRoom);
+  }
+
+  /**
+   * 🚪🔒 The arrival half of the tube walk: from the spot the departure walk
+   * stopped (tubeWalkGeometry's `fromFar` out along this door's walkway) back
+   * to the door, round any bend. The spot comes LAST. Null outside first
+   * person, or when there is no tube to walk (the walk-in starts at
+   * `through` as before).
+   */
+  private arrivalWalkIn(doorId: string): Array<{ x: number; z: number }> | null {
+    if (!this.isFirstPersonView()) return null;
+    const own = this.dockingSystem?.getDockingState(doorId)?.segments;
+    // Before this room's own record of the chain lands, the chain just walked
+    // seen from this end (the same fallback unsealAirlock builds the tube by).
+    const segments = own?.length
+      ? own
+      : this.airlockSegments
+        ? mirrorSegments(this.airlockSegments)
+        : null;
+    const g = this.tubeWalkGeometry(doorId, segments);
+    if (!g) return null;
+    return walkwayBetween(g.line, 0, g.fromFar).map(g.toRoom);
   }
 
   // ── Adapter transit choreography (T1 of issue #30) ──────────────────────────
@@ -5478,6 +5528,8 @@ export class World {
     this.player.enterFromDoor(
       arrival,
       this._makeArrivalHooks(arrival, false, bounce ? arrival.id : undefined),
+      true,
+      this.arrivalWalkIn(arrival.id) ?? undefined,
     );
   }
 
