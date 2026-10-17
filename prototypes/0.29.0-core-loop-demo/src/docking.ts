@@ -4451,6 +4451,25 @@ export class DoorDockingPortSystem {
     return out;
   }
 
+  /** 🚪🔒 Is this door built and its leaves fully shut (the airlock seal)? */
+  public isDoorShut(doorId: string): boolean {
+    return this.doorObjects.has(doorId) && !this.isDoorAjar(doorId);
+  }
+
+  /** 🚪🔒 Put this door's leaves straight to shut, dropping any slide in
+   *  flight (and its callback). For the airlock: a door the join opened behind
+   *  the seal must be shut again before the player is staged in front of it. */
+  public snapDoorShut(doorId: string): void {
+    const group = this.doorObjects.get(doorId);
+    const left = group?.getObjectByName("leftLeaf");
+    const right = group?.getObjectByName("rightLeaf");
+    if (!left || !right) return;
+    this.slideAnims.delete(doorId);
+    left.position.x = -DOOR_LEAF_SHUT_OFFSET;
+    right.position.x = DOOR_LEAF_SHUT_OFFSET;
+    this.doorApertureListener?.();
+  }
+
   /**
    * 🚪 #159: are this door's leaves anywhere but fully shut — open, opening or
    * closing? The hull is cut open behind exactly these doors. Behind SHUT
