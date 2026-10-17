@@ -4812,15 +4812,17 @@ export class World {
    * for the door behind them to shut, then swap the drawn scene for a
    * stand-in of the same straight vestibule, both ends closed. False (and
    * nothing changed) when there is no straight vestibule to stand in, the
-   * player is not waiting in it, or the door does not shut in time; the
+   * player is not waiting in it in first person, or the door does not shut in time; the
    * caller then covers the swap with the fade as before.
    */
-  public async sealAirlock(doorId: string): Promise<boolean> {
+  public async sealAirlock(doorId: string, firstPerson: () => boolean): Promise<boolean> {
     const ds = this.dockingSystem;
     const vestibule = this.pairedVestibules.get(doorId);
     if (!ds || !vestibule || (ds.getDockingState(doorId)?.segments?.length ?? 0) > 0) return false;
     const waiting = () =>
-      this.player.getDoorPhase() === "ADAPTER_HOLD" && this.player.getActiveDoorId() === doorId;
+      this.player.getDoorPhase() === "ADAPTER_HOLD" &&
+      this.player.getActiveDoorId() === doorId &&
+      firstPerson(); // a zoom-out during the waits falls back to the fade
     const deadline = performance.now() + 2000;
     while (!ds.isDoorShut(doorId)) {
       if (!waiting() || performance.now() > deadline) return false;
@@ -4868,12 +4870,12 @@ export class World {
     // updatePairedVestibules keeps a tube while its door is being walked.
     const arrivalState = arrivalId ? ds?.getDockingState(arrivalId) : undefined;
     if (arrivalId && !(arrivalState?.segments?.length) && physicalDoorPoseOrNull(arrivalId)) {
-      let vestibule = this.pairedVestibules.get(arrivalId);
-      if (!vestibule) {
-        vestibule = this.buildDoorConnector(arrivalId);
-        this.platformGroup.add(vestibule);
-        this.pairedVestibules.set(arrivalId, vestibule);
-      }
+      // Built fresh from the arrival room's pose: a tube kept under the same
+      // door id may still stand where the departure room had that door.
+      this.disposeVestibule(arrivalId);
+      const vestibule = this.buildDoorConnector(arrivalId);
+      this.platformGroup.add(vestibule);
+      this.pairedVestibules.set(arrivalId, vestibule);
       setVestibuleOpacity(vestibule, 1);
     }
     this.disposeObject3D(scene);

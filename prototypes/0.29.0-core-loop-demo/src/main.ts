@@ -3932,7 +3932,7 @@ async function transitTo(
     // policy is still the one bound.
     ...(airlockEligible
       ? {
-          seal: () => world.sealAirlock(departureDoorId),
+          seal: () => world.sealAirlock(departureDoorId, () => multiScaleZoom?.getLevel() === 1),
           unseal: () => world.unsealAirlock(),
         }
       : {}),
@@ -10665,6 +10665,8 @@ function findArcadeControl(scene: THREE.Scene): { deviceId: string; control: "se
 
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
+  // 🚪🔒 Sealed in the airlock the room on screen is a stand-in: nothing to click.
+  if (world.getAirlockScene()) return;
 
   // ── First-person pointer-lock click model (#49): the click paired with the
   //    mousedown that freed the cursor from pointer lock is swallowed — its
