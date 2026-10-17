@@ -30,7 +30,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes32, Coin};
-use crate::chia_chain::ChainAccess;
+use crate::chia_chain::{ChainAccess, PagedRecords};
 use clvm_traits::{clvm_curried_args, clvm_list, ToClvm};
 use clvm_utils::{CurriedProgram, ToTreeHash, TreeHash};
 use clvmr::serde::node_from_bytes;
@@ -312,24 +312,22 @@ pub struct Unspent {
     pub partial: bool,
 }
 
-/// The unspent coins at `puzzle_hash`, following the listing's cursor.
+/// The unspent coins at `puzzle_hash`, following the listing's cursor. Spent
+/// coins are asked for as well: the chain pages by a coin's latest change, so
+/// a coin listed unspent on one page comes again, spent, on a later one when
+/// the chain moved on in between, and only that later record says so
+/// ([`PagedRecords`]); the spent ones are dropped once every page is in.
 pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<Unspent> {
-    let mut coins = Vec::new();
+    let mut gathered = PagedRecords::default();
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
     let partial = loop {
         let listing = client
-            .coin_records_by_puzzle_hash(puzzle_hash, false, cursor.take())
+            .coin_records_by_puzzle_hash(puzzle_hash, true, cursor.take())
             .await
             .map_err(|e| anyhow!("coin lookup: {e}"))?;
         pages += 1;
-        coins.extend(
-            listing
-                .records
-                .into_iter()
-                .filter(|r| !r.spent)
-                .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index }),
-        );
+        gathered.fold(listing.records);
         let truncated = listing.truncated;
         match listing.next_cursor {
             Some(next) if truncated => {
@@ -341,6 +339,12 @@ pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Resu
             _ => break truncated,
         }
     };
+    let coins = gathered
+        .into_records()
+        .into_iter()
+        .filter(|r| !r.spent)
+        .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index })
+        .collect();
     Ok(Unspent { coins, partial })
 }
 
@@ -1006,6 +1010,23 @@ mod tests {
                 }
             })
             .collect())
+    }
+
+    #[tokio::test]
+    async fn a_coin_spent_between_two_pages_is_not_counted_unspent() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::{CoinListing, CoinRecord};
+        // Coin 1 is unspent on the first page and spent by the time the second
+        // is read, where it comes again (the chain pages by latest change).
+        let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), Bytes32::new([9u8; 32]), u64::from(seed));
+        let rec = |c: Coin, height: u32, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: height, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
+        let first = CoinListing { records: vec![rec(coin(1), 80, None), rec(coin(2), 85, None)], truncated: true, next_cursor: Some("page-2".into()) };
+        let second = CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(3), 101, None)], truncated: false, next_cursor: None };
+        let chain = Scripted::new(vec![first, second]);
+        let got = unspent_at(&chain, Bytes32::new([9u8; 32])).await.unwrap();
+        assert_eq!(got.coins.iter().map(|c| c.coin.amount).collect::<Vec<_>>(), vec![2, 3], "coin 1, spent between the pages, is gone");
+        assert!(!got.partial);
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "spent coins asked for, so the spend can be seen");
     }
 
     #[test]

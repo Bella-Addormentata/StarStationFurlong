@@ -38,8 +38,10 @@
 //!     pin that has no fresh peer yet; at most every [`INTRODUCE_EVERY`],
 //!     sooner only after a
 //!     lookup that named nobody; a stored or gossiped peer it names this run
-//!     counts as fresh from then on, up to the per-source cap below, so the
-//!     pool keeps a second source), `RequestPeers` gossip from a connected
+//!     counts as fresh from then on, up to the per-source cap below and never
+//!     the last stored or gossiped peer the lane knows while another fresh
+//!     peer is at hand, so a second source stays to pair with),
+//!     `RequestPeers` gossip from a connected
 //!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed),
 //!     and the store of known‑good peers kept in `chia_peers.json`
 //!     across runs. Two agreeing
@@ -1384,8 +1386,11 @@ fn close_later(peer: Arc<PeerConn>) {
 /// kept: a stored or gossiped peer the introducer names this run counts as an
 /// introducer peer from then on, so a warm start whose store already holds
 /// everything the introducer answers can still form an agreed pair; no more
-/// of them than [`PER_SOURCE_CAP`], as with dials, so one connection keeps
-/// its source and the pair has two to draw on. A full
+/// of them than [`PER_SOURCE_CAP`], as with dials, and never the last stored
+/// or gossiped peer among connections and queue while a fresh peer is at
+/// hand or named in the same answer (two stored peers the introducer names
+/// in full would both turn introducer, one source, with no pair to be made
+/// until gossip adds another), so a second source stays to pair with. A full
 /// queue admits a newcomer in place of the queued address that has failed the
 /// most dials, so dead addresses cannot shut fresh ones out; a queue full of
 /// addresses that never failed keeps what it has.
@@ -1393,20 +1398,34 @@ fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
     for cand in &mut new {
         cand.addr = canonical(cand.addr);
     }
-    for cand in new {
+    for i in 0..new.len() {
+        let cand = Candidate { ..new[i] };
+        // A relabelling never takes the last stored or gossiped peer away
+        // while a fresh peer is at hand, or named in this very answer: two
+        // stored peers the introducer names in full would both turn
+        // introducer, one source, with no pair to be made until gossip adds
+        // another. Named alone, with nothing fresh anywhere, the last one
+        // does turn fresh: only the introducer can make a peer fresh, while
+        // gossip brings a second source back any time.
+        let unfresh = state.conns.iter().filter(|c| !c.source().is_fresh()).count() + state.candidates.iter().filter(|c| !c.source.is_fresh()).count();
+        let fresh_elsewhere = state.conns.iter().any(|c| c.source().is_fresh() && c.addr() != cand.addr)
+            || state.candidates.iter().any(|c| c.source.is_fresh() && c.addr != cand.addr)
+            || new[i + 1..].iter().any(|c| c.source.is_fresh() && c.addr != cand.addr);
+        let keep_last = unfresh <= 1 && fresh_elsewhere;
         if let Some(conn) = state.conns.iter().find(|c| c.addr() == cand.addr) {
             // Promotion respects the per-source cap like a dial does: were
             // every connection relabelled introducer, no pair (two sources)
             // could form, no swap would complete one, and a full pool would
             // hold still for good.
             let held = state.conns.iter().filter(|c| c.source() == cand.source).count();
-            if held < PER_SOURCE_CAP && conn.promote(cand.source) {
+            let last = !conn.source().is_fresh() && keep_last;
+            if held < PER_SOURCE_CAP && !last && conn.promote(cand.source) {
                 eprintln!("⛓️ chain peers: {} now counts as {}: the introducer named it this run", cand.addr, cand.source.label());
             }
             continue;
         }
         if let Some(queued) = state.candidates.iter_mut().find(|c| c.addr == cand.addr) {
-            if cand.source == Source::Introducer && !queued.source.is_fresh() {
+            if cand.source == Source::Introducer && !queued.source.is_fresh() && !keep_last {
                 queued.source = cand.source;
             }
             continue;
@@ -2602,6 +2621,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_stored_peers_the_introducer_names_in_full_keep_one_source_between_them() {
+        // A warm start from a two-peer store, no pin: the introducer is asked
+        // before the first dial (nothing fresh yet) and names both. Were both
+        // relabelled, the pool would hold one source and no pair; the last
+        // stored peer keeps its label, queued or connected alike, and the
+        // money request is answered. (Named alone, with nothing fresh anywhere,
+        // a stored peer still turns fresh:
+        // a_queued_stored_candidate_the_introducer_names_becomes_fresh.)
+        let a = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Store), (b.addr, Source::Store)], vec![], false, None);
+        {
+            let mut state = lane.state.lock().await;
+            let named = vec![a.addr, b.addr].into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect();
+            push_candidates(&mut state, named);
+            let sources: Vec<Source> = state.candidates.iter().map(|c| c.source).collect();
+            assert_eq!(sources, vec![Source::Introducer, Source::Store], "one relabelled, the last stored peer kept");
+        }
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let got = money.coin_records_by_names(vec![coin(4).coin_id()], true, None).await.unwrap();
+        assert_eq!(got.records.len(), 1);
+        // Connected now, named again: the stored peer still keeps its label.
+        {
+            let mut state = lane.state.lock().await;
+            let named = vec![a.addr, b.addr].into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect();
+            push_candidates(&mut state, named);
+        }
+        let conns = lane.live_conns().await;
+        assert_eq!(conns.iter().filter(|p| p.source() == Source::Store).count(), 1, "the last stored connection is not relabelled");
+        assert_eq!(conns.iter().filter(|p| p.source() == Source::Introducer).count(), 1);
+    }
+
+    #[tokio::test]
     async fn the_introducer_naming_every_pooled_peer_promotes_no_more_than_the_cap() {
         // A warm start after a failed introducer lookup: three stored peers
         // and one gossiped fill the pool, none fresh, so no pair forms. The
@@ -3011,6 +3063,20 @@ mod tests {
         push_candidates(&mut state, vec![Candidate { addr, source: Source::Gossip, failures: 0 }]);
         assert_eq!(state.candidates.len(), 1);
         assert_eq!(state.candidates[0].source, Source::Introducer);
+    }
+
+    #[test]
+    fn a_lone_stored_candidate_named_beside_newcomers_keeps_its_source() {
+        // The introducer names the one stored peer AND a newcomer: the
+        // newcomer is fresh, so the stored peer stays the second source the
+        // pair needs instead of turning introducer too.
+        let mut state = LaneState::default();
+        let x: SocketAddr = "203.0.113.5:58444".parse().unwrap();
+        let y: SocketAddr = "198.51.100.7:58444".parse().unwrap();
+        push_candidates(&mut state, vec![Candidate { addr: x, source: Source::Store, failures: 0 }]);
+        push_candidates(&mut state, vec![Candidate { addr: x, source: Source::Introducer, failures: 0 }, Candidate { addr: y, source: Source::Introducer, failures: 0 }]);
+        let sources: Vec<(SocketAddr, Source)> = state.candidates.iter().map(|c| (c.addr, c.source)).collect();
+        assert_eq!(sources, vec![(x, Source::Store), (y, Source::Introducer)]);
     }
 
     #[test]
