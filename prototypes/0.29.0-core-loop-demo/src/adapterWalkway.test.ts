@@ -11,6 +11,7 @@ import {
   buildConnectorEndCap,
   connectorCentreline,
   foldChainEnd,
+  headingAcrossConnector,
   walkwayBetween,
   type ConnectorSegment,
 } from './adapter';
@@ -80,6 +81,31 @@ describe('walkwayBetween', () => {
     const path = walkwayBetween(line, 1.1, 1.9);
     expect(path[path.length - 1]).toMatchObject({ x: 0, s: 1.9 });
     expect(path[path.length - 1].z).toBeCloseTo(1.9, 9);
+  });
+});
+
+describe('headingAcrossConnector', () => {
+  const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
+
+  it('looking out of a straight tube is looking into the far room', () => {
+    // Out of a south door (yaw 0) into a north door (outward yaw π).
+    expect(headingAcrossConnector(0, 0, 0, Math.PI)).toBeCloseTo(0, 9);
+    // Out of an east door into a south door: the far room is turned.
+    const east = Math.PI / 2;
+    expect(wrap(headingAcrossConnector(east, east, 0, 0) - Math.PI)).toBeCloseTo(0, 9);
+  });
+
+  it('looking along the end of a bend is looking square into the far room', () => {
+    const line = connectorCentreline(BENT);
+    const out = 0.4,
+      arr = -1.1;
+    const h = headingAcrossConnector(out + line.endYaw, out, line.endYaw, arr);
+    expect(wrap(h - (arr + Math.PI))).toBeCloseTo(0, 9);
+  });
+
+  it('keeps a look off to one side the same amount off', () => {
+    const h = headingAcrossConnector(0.3 + 0.2, 0.3, 0, 2);
+    expect(wrap(h - (2 + Math.PI + 0.2))).toBeCloseTo(0, 9);
   });
 });
 

@@ -2568,6 +2568,28 @@ export class Player {
   }
 
   /**
+   * 🚪🔒 Which way the scripted walk through a door's tube is heading right
+   * now (atan2(dx, dz), the first-person look's convention): out along the
+   * tube, back along its trail, or in through the arrival door. Null when it
+   * is not walking one. First person turns the view with it.
+   */
+  getTubeWalkHeading(): number | null {
+    const trailTop = this.vestibuleTrail[this.vestibuleTrail.length - 1];
+    let target: { x: number; z: number } | null | undefined = null;
+    if (this.doorPhase === "ADAPTER_OUT" && !this.adapterOutWaitingOpen) {
+      target = this.adapterOutTarget;
+    } else if (this.doorPhase === "ARRIVE") {
+      target = trailTop ?? this.doorTarget?.front;
+    } else if (this.doorPhase === "RETURN") {
+      target = trailTop;
+    }
+    if (!target) return null;
+    const dx = target.x - this.mesh.position.x;
+    const dz = target.z - this.mesh.position.z;
+    return dx * dx + dz * dz > 1e-6 ? Math.atan2(dx, dz) : null;
+  }
+
+  /**
    * Door involved in the ACTIVE walk-through/transit sequence, or null (#51 —
    * the camera-facing door fade restores full opacity on a door while the
    * player approaches / crosses it).

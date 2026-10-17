@@ -1237,6 +1237,24 @@ export function buildConnectorEndCap(
   return cap;
 }
 
+/**
+ * 🚪🔒 A heading (the first-person look's convention: direction
+ * (sin h, cos h)) carried through a connection from the room at one end to
+ * the room at the other, so it points the same way along the tube. The two
+ * doors' outward headings are each in their own room; `endYaw` is the tube's
+ * heading at its far end in the departure door's frame (connectorCentreline),
+ * where the arrival door faces back along it.
+ */
+export function headingAcrossConnector(
+  heading: number,
+  departureOutwardYaw: number,
+  endYaw: number,
+  arrivalOutwardYaw: number,
+): number {
+  const h = heading - departureOutwardYaw - endYaw - Math.PI + arrivalOutwardYaw;
+  return Math.atan2(Math.sin(h), Math.cos(h));
+}
+
 // ── #62 P3: far-room projection pose ─────────────────────────────────────────
 
 /** Room half-width (11.8 / 2) — the projection box's centre sits this far past

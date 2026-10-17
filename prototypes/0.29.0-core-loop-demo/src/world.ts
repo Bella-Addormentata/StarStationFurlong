@@ -151,6 +151,7 @@ import {
   buildConnectorEndCap,
   buildDockPortStub,
   connectorCentreline,
+  headingAcrossConnector,
   setVestibuleLightState,
   setVestibuleOpacity,
   walkwayBetween,
@@ -539,6 +540,10 @@ export class World {
    *  (straight into the room, perpendicular to the frame). main.ts wires it
    *  to the zoom view, which ignores it outside first person. */
   public onFirstPersonArrival: ((yaw: number) => void) | null = null;
+  /** 🚪🔒 Walking a tube: ease a first-person look toward this heading. */
+  public onFirstPersonSteer: ((yaw: number, dt: number) => void) | null = null;
+  /** 🚪🔒 The first-person look's heading (null outside first person). */
+  public getFirstPersonHeading: (() => number | null) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
@@ -4023,6 +4028,9 @@ export class World {
     // player.update() is where WASD-to-release lives (#33 D0.3).
     if (this.isPlayerActive()) {
       this.player.update(deltaTime, inputManager);
+      // 🚪🔒 Walking a tube in first person, you face the way you walk.
+      const tubeHeading = this.player.getTubeWalkHeading();
+      if (tubeHeading !== null) this.onFirstPersonSteer?.(tubeHeading, deltaTime);
     }
     // 🪑 Stamp the moment a local seat claim begins (a seat clash compares it).
     this.syncLocalSeat();
@@ -4814,6 +4822,10 @@ export class World {
   /** The chain the sealed tube stands in for (null: a straight vestibule),
    *  so the arrival tube can be built to match before its own record lands. */
   private airlockSegments: ConnectorSegment[] | null = null;
+  /** 🚪🔒 The first-person look when the seal closed, with what it takes to
+   *  carry it through the tube into the arrival room (headingAcrossConnector). */
+  private airlockLook: { heading: number; departureOutwardYaw: number; endYaw: number } | null =
+    null;
 
   /**
    * Seal the airlock around a player waiting in `doorId`'s vestibule: wait
@@ -4868,6 +4880,12 @@ export class World {
     scene.add(new THREE.AmbientLight(0xffffff, 0.7));
     scene.add(tube);
     this.airlockSegments = segments && segments.length > 0 ? segments.map((g) => ({ ...g })) : null;
+    const heading = this.getFirstPersonHeading?.() ?? null;
+    const pose = physicalDoorPoseOrNull(doorId);
+    this.airlockLook =
+      heading !== null && pose
+        ? { heading, departureOutwardYaw: pose.outwardYaw, endYaw: line.endYaw }
+        : null;
     this.airlock = scene;
     return true;
   }
@@ -4885,26 +4903,22 @@ export class World {
     this.airlock = null;
     const departureSegments = this.airlockSegments;
     this.airlockSegments = null;
+    this.airlockLook = null;
     const arrivalId = this.player.getActiveDoorId();
-    const ds = this.dockingSystem;
-    // Any built door will do: on a first crossing the arrival room's own
-    // record of the pairing is written only after the swap returns, and
-    // updatePairedVestibules keeps a tube while its door is being walked.
+    // The tube built here is the one just walked, seen from this end, not
+    // the arrival room's own record of it: on a first crossing that record is
+    // written only after the swap returns, and an older one may predate an
+    // edit made from the other room. updatePairedVestibules keeps this tube
+    // while its door is being walked, then brings it in line with the record.
     if (arrivalId && physicalDoorPoseOrNull(arrivalId)) {
       // Built fresh from the arrival room's pose: a tube kept under the same
       // door id may still stand where the departure room had that door.
       this.disposeVestibule(arrivalId);
-      const own = ds?.getDockingState(arrivalId)?.segments;
-      let vestibule: THREE.Group;
-      if (!own?.length && departureSegments) {
-        // The record is not here yet: the same chain seen from this end, as
-        // transitTo will write it (so the rebuild-on-diff key already agrees).
-        const mirrored = mirrorSegments(departureSegments);
-        vestibule = buildConnectorChain(arrivalId, mirrored);
-        vestibule.userData.segmentsKey = JSON.stringify(mirrored);
-      } else {
-        vestibule = this.buildDoorConnector(arrivalId);
-      }
+      const walked = departureSegments ? mirrorSegments(departureSegments) : null;
+      const vestibule = walked
+        ? buildConnectorChain(arrivalId, walked)
+        : buildVestibule(arrivalId as DoorId);
+      vestibule.userData.segmentsKey = JSON.stringify(walked);
       this.platformGroup.add(vestibule);
       this.pairedVestibules.set(arrivalId, vestibule);
       setVestibuleOpacity(vestibule, 1);
@@ -4916,6 +4930,19 @@ export class World {
   private isFirstPersonView(): boolean {
     const zoom = (window as any).multiScaleZoom;
     return typeof zoom?.getLevel === "function" && zoom.getLevel() === 1;
+  }
+
+  /**
+   * 🚪🔒 The segments of the tube drawn at `doorId`, read back from its
+   * rebuild key. It can lag the live record: a tube is kept as it is while its
+   * door is being walked, and the walk must follow the walls you see.
+   */
+  private drawnSegments(doorId: string): ConnectorSegment[] | null | undefined {
+    const key: unknown = this.pairedVestibules.get(doorId)?.userData.segmentsKey;
+    if (typeof key !== "string" || key.startsWith("⚓")) {
+      return this.dockingSystem?.getDockingState(doorId)?.segments;
+    }
+    return JSON.parse(key) as ConnectorSegment[] | null;
   }
 
   /**
@@ -4956,7 +4983,7 @@ export class World {
    */
   private vestibuleWalkPath(door: DoorTarget): Array<{ x: number; z: number }> | null {
     if (!this.isFirstPersonView()) return null;
-    const g = this.tubeWalkGeometry(door.id, this.dockingSystem?.getDockingState(door.id)?.segments);
+    const g = this.tubeWalkGeometry(door.id, this.drawnSegments(door.id));
     if (!g) return null;
     const hold = g.line.length - g.fromFar;
     return walkwayBetween(g.line, Math.min(g.out, hold), hold).map(g.toRoom);
@@ -4971,14 +4998,13 @@ export class World {
    */
   private arrivalWalkIn(doorId: string): Array<{ x: number; z: number }> | null {
     if (!this.isFirstPersonView()) return null;
-    const own = this.dockingSystem?.getDockingState(doorId)?.segments;
-    // Before this room's own record of the chain lands, the chain just walked
-    // seen from this end (the same fallback unsealAirlock builds the tube by).
-    const segments = own?.length
-      ? own
-      : this.airlockSegments
+    // Sealed, the tube is the one just walked seen from this end (the same
+    // one unsealAirlock builds); behind the fade, this room's own record.
+    const segments = this.airlock
+      ? this.airlockSegments
         ? mirrorSegments(this.airlockSegments)
-        : null;
+        : null
+      : this.dockingSystem?.getDockingState(doorId)?.segments;
     const g = this.tubeWalkGeometry(doorId, segments);
     if (!g) return null;
     return walkwayBetween(g.line, 0, g.fromFar).map(g.toRoom);
@@ -5038,8 +5064,7 @@ export class World {
     setVestibuleLightState(vestibule, "cycling");
     // 🚪🔒 The far module's door, shut, at the end of the tube you walk.
     if (!vestibule.getObjectByName("airlockFarHatch")) {
-      const segments = this.dockingSystem?.getDockingState(doorId)?.segments;
-      vestibule.add(buildConnectorEndCap(segments, "far"));
+      vestibule.add(buildConnectorEndCap(this.drawnSegments(doorId), "far"));
     }
     this.transitVestibuleDoorId = doorId;
   }
@@ -5506,8 +5531,15 @@ export class World {
     // look's heading is room-local and used to carry over unchanged from the
     // old room, so it rarely matched the door you walked out of. Only the
     // heading is set; the up/down tilt is kept.
+    // 🚪🔒 Sealed in the airlock, the room changes while you look down the
+    // tube, so the look is carried through it instead (the walk-in then turns
+    // it square to the door as you come in).
+    const arrivalOutward = physicalDoorPose(arrival.id).outwardYaw;
+    const look = this.airlock ? this.airlockLook : null;
     this.onFirstPersonArrival?.(
-      inwardFirstPersonYaw(physicalDoorPose(arrival.id).outwardYaw),
+      look
+        ? headingAcrossConnector(look.heading, look.departureOutwardYaw, look.endYaw, arrivalOutward)
+        : inwardFirstPersonYaw(arrivalOutward),
     );
     // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
     // arrivals — the traveler walks in, gets the hint, and is walked right
