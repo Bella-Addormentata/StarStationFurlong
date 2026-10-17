@@ -2112,9 +2112,40 @@ mod tests {
         SpendBundle::new(vec![], chia_bls::G2Element::default())
     }
 
-    /// A loopback address nothing listens on.
+    /// A loopback address no full node answers at: every connection is closed
+    /// the moment it is accepted, so a dial fails at once. The listener stays
+    /// bound for the test's duration (the task holds it), so the port cannot
+    /// be handed to another test's mock node meanwhile, which a port merely
+    /// bound and released could be.
     async fn closed() -> SocketAddr {
-        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap()
+        vacancy().await.addr
+    }
+
+    /// A [`closed`] address a mock node can take over later (a pin coming
+    /// back up): [`Vacancy::release`] drops the listener an instant before the
+    /// mock binds the same address.
+    struct Vacancy {
+        addr: SocketAddr,
+        keeper: tokio::task::JoinHandle<()>,
+    }
+
+    impl Vacancy {
+        async fn release(self) -> SocketAddr {
+            self.keeper.abort();
+            let _ = self.keeper.await;
+            self.addr
+        }
+    }
+
+    async fn vacancy() -> Vacancy {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let keeper = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        Vacancy { addr, keeper }
     }
 
     #[tokio::test]
@@ -2208,7 +2239,7 @@ mod tests {
         assert_eq!(only.live_count().await, 1, "no public peer is dialled in pin-only mode");
 
         // A pin nobody listens on: money paths are non-final, whatever public peers exist.
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let closed = closed().await;
         let public = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
         let pinned = lane(vec![(public.addr, Source::Introducer)], vec![closed.to_string()], false, None);
         let err = PeerLane::new(pinned.clone(), Trust::Agreed).peak_height().await.unwrap_err();
@@ -2771,7 +2802,7 @@ mod tests {
         // The introducer's earlier answer named only a dead address, cooling in
         // the queue; its interval has passed, and "127.0.0.1" (standing in for
         // the introducer) now names a live replacement.
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let closed = closed().await;
         let fresh = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
         let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
         let net = Network { introducers: vec!["127.0.0.1".to_string()], port: fresh.addr.port(), ..net() };
@@ -2833,14 +2864,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_pin_is_dialled_again_once_its_cooldown_passes() {
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let vacancy = vacancy().await;
+        let closed = vacancy.addr;
         let public = full_node(vec![], (1, None), Some(peak_at(100))).await;
         let lane = lane(vec![(public.addr, Source::Introducer)], vec![closed.to_string()], false, None);
         let carrier = PeerLane::new(lane.clone(), Trust::Carrier);
         assert_eq!(carrier.peak_height().await.unwrap(), 100, "the carrier reads from the public peer while the pin is down");
         // The pin comes up on its address. Until its cooldown passes the public
         // connection keeps serving and the pin is left alone...
-        let pin = crate::chia_peer::mock::spawn_on(closed, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
+        let pin = crate::chia_peer::mock::spawn_on(vacancy.release().await, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
         assert_eq!(carrier.peak_height().await.unwrap(), 100);
         assert!(!pin.seen.lock().unwrap().contains(&chia_protocol::ProtocolMessageTypes::Handshake), "not dialled while cooling down");
         // ...and once it has, the pin is dialled before the public peer is used again.
@@ -2911,7 +2943,7 @@ mod tests {
     async fn pins_behind_unreachable_addresses_are_still_reached() {
         let mut pins = Vec::new();
         for _ in 0..3 {
-            pins.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string());
+            pins.push(closed().await.to_string());
         }
         let healthy = full_node(vec![], (1, None), Some(peak_at(100))).await;
         pins.push(healthy.addr.to_string());
@@ -2921,7 +2953,7 @@ mod tests {
         assert_eq!(mixed.live_conns().await.iter().filter(|c| c.source() == Source::Pin).count(), 1);
         // Pin-only mode with the reachable address fifth in the list.
         let mut five = pins;
-        five.insert(0, tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string());
+        five.insert(0, closed().await.to_string());
         let only = lane(vec![], five, true, None);
         assert_eq!(PeerLane::new(only.clone(), Trust::Agreed).peak_height().await.unwrap(), 100);
         assert_eq!(only.live_conns().await.len(), 1);
@@ -2954,13 +2986,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_that_refused_the_dial_keeps_its_place_in_the_queue() {
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let vacancy = vacancy().await;
+        let closed = vacancy.addr;
         let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
         let lane = lane(vec![(closed, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
         let money = PeerLane::new(lane.clone(), Trust::Agreed);
         assert!(money.peak_height().await.is_err());
         assert!(lane.state.lock().await.candidates.iter().any(|c| c.addr == closed), "the failed dial keeps its place");
-        let _late = crate::chia_peer::mock::spawn_on(closed, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
+        let _late = crate::chia_peer::mock::spawn_on(vacancy.release().await, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
         lane.expire_pin_cooldown().await;
         assert_eq!(money.peak_height().await.unwrap(), 100, "dialled again once it came up");
     }
@@ -3147,13 +3180,14 @@ mod tests {
         // that is down may be the pin whose network group a pair needs).
         let first = full_node(vec![], (1, None), Some(peak_at(100))).await;
         let public = full_node(vec![], (1, None), Some(peak_at(100))).await;
-        let second_addr = closed().await;
+        let second = vacancy().await;
+        let second_addr = second.addr;
         let pinned = lane(vec![(public.addr, Source::Introducer)], vec![first.addr.to_string(), second_addr.to_string()], false, None);
         let money = PeerLane::new(pinned.clone(), Trust::Agreed);
         let pins_up = |conns: Vec<Arc<PeerConn>>| conns.iter().filter(|c| c.source() == Source::Pin).count();
         assert_eq!(money.peak_height().await.unwrap(), 100);
         assert_eq!(pins_up(pinned.live_conns().await), 1);
-        let _second = spawn_on(second_addr, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
+        let _second = spawn_on(second.release().await, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
         assert_eq!(money.peak_height().await.unwrap(), 100);
         assert_eq!(pins_up(pinned.live_conns().await), 1, "the cooldown holds: a live pin is no reason to hurry");
         pinned.expire_pin_cooldown().await;
