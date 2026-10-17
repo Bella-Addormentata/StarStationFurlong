@@ -4863,7 +4863,11 @@ export class World {
     this.airlock = null;
     const arrivalId = this.player.getActiveDoorId();
     const ds = this.dockingSystem;
-    if (arrivalId && ds?.getDockingState(arrivalId)?.pairedSuccessfully) {
+    // Any built door will do: on a first crossing the arrival room's own
+    // record of the pairing is written only after the swap returns, and
+    // updatePairedVestibules keeps a tube while its door is being walked.
+    const arrivalState = arrivalId ? ds?.getDockingState(arrivalId) : undefined;
+    if (arrivalId && !(arrivalState?.segments?.length) && physicalDoorPoseOrNull(arrivalId)) {
       let vestibule = this.pairedVestibules.get(arrivalId);
       if (!vestibule) {
         vestibule = this.buildDoorConnector(arrivalId);
@@ -5391,6 +5395,9 @@ export class World {
       !canEditRoom().ok &&
       !this.oneWayBounceGuard;
     this.oneWayBounceGuard = false;
+    // 🚪🔒 Sealed in the airlock: the join may have opened this door behind
+    // the seal (a pairing landing). Shut it, so the walk-in opens it in view.
+    if (this.airlock) this.dockingSystem?.snapDoorShut(arrival.id);
     this.player.enterFromDoor(
       arrival,
       this._makeArrivalHooks(arrival, false, bounce ? arrival.id : undefined),

@@ -44,7 +44,7 @@ import {
 // 🕹️ Shared arcade games: their pad bytes ride lane kind 1 as a subtype.
 import { routeArcadeTick, setArcadeSender } from "./arcadeNesSession";
 import { isArcadeTickFlags } from "./arcadeNet";
-import { MultiScaleZoomView } from "./zoom";
+import { MultiScaleZoomView, setCameraModeLock } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
 import { deviceFocus, isDeviceFocusActive } from "./deviceFocus";
@@ -10157,6 +10157,8 @@ function updateHUDP2P(status: string, color: string) {
 function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
+  // 🚪🔒 Sealed in the airlock, the view stays first person.
+  setCameraModeLock(() => world.getAirlockScene() !== null);
   multiScaleZoom.mount(document.body);
   world.onFirstPersonSeat = (faceAngle) => multiScaleZoom?.requestFirstPerson(faceAngle);
   world.onFirstPersonArrival = (yaw) => multiScaleZoom?.faceFirstPersonHeading(yaw);
