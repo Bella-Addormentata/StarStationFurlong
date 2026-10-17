@@ -133,8 +133,10 @@ pub const GOSSIP_RETRY: Duration = Duration::from_secs(60);
 pub const PER_SOURCE_CAP: usize = MAX_CONNS - 1;
 /// Addresses taken from one introducer answer or one gossip answer.
 pub const ADDRS_PER_ANSWER: usize = 32;
-/// Pages one listing follows before it reports itself cut short with a cursor.
-pub const PAGES_PER_LISTING: usize = 8;
+/// Requests one coin-state lookup may spend when a peer answers for fewer ids
+/// than it was asked (Chia caps a request at its response-item limit and
+/// echoes the ids it took).
+pub const STATE_ROUNDS: usize = 8;
 /// A peer this many blocks or more behind another is lagging: its verdict is
 /// non-final rather than agreed at the common height.
 pub const MAX_PEAK_LAG: u32 = 6;
@@ -440,9 +442,11 @@ impl Lane {
     /// Take a public connection out of the pool: logged with `why`, cooling
     /// for `after`, back in the queue for a later dial, closed off the lock.
     fn let_go(&self, state: &mut LaneState, peer: &Arc<PeerConn>, after: Duration, why: &str) {
+        if !unpool(state, peer) {
+            close_later(peer.clone());
+            return;
+        }
         eprintln!("⛓️ chain peers: {} ({}) let go: {why}", peer.addr(), peer.source().label());
-        state.conns.retain(|c| c.addr() != peer.addr());
-        state.gossiped.remove(&peer.addr());
         requeue(state, peer, after);
         close_later(peer.clone());
     }
@@ -776,12 +780,19 @@ impl Lane {
         }
     }
 
-    /// Remember the public peers of an agreed verdict as known-good.
+    /// Remember the public peers of an agreed verdict as known-good: only the
+    /// connections still in the pool, so a verdict that overlapped an eviction
+    /// (another request found the same peers disagreeing) restores nothing.
     async fn note_good(&self, peers: &[Arc<PeerConn>]) {
         let mut state = self.state.lock().await;
         let now = unix_now();
         let mut changed = false;
-        for peer in peers.iter().filter(|p| p.source() != Source::Pin) {
+        let pooled: Vec<Arc<PeerConn>> = peers
+            .iter()
+            .filter(|p| p.source() != Source::Pin && state.conns.iter().any(|c| Arc::ptr_eq(c, p)))
+            .cloned()
+            .collect();
+        for peer in &pooled {
             let addr = peer.addr().to_string();
             match state.known.iter_mut().find(|p| p.addr == addr) {
                 Some(entry) => {
@@ -810,11 +821,13 @@ impl Lane {
         let mut state = self.state.lock().await;
         let until = Instant::now() + RETRY_AFTER;
         for peer in peers.iter().filter(|p| p.source() != Source::Pin) {
+            if !unpool(&mut state, peer) {
+                // Gone from the pool already: a verdict on that connection says
+                // nothing about whoever holds its address now.
+                close_later(peer.clone());
+                continue;
+            }
             eprintln!("⛓️ chain peers: {} ({}) let go: {why}", peer.addr(), peer.source().label());
-            state.conns.retain(|c| c.addr() != peer.addr());
-            // Asked for gossip again if it ever returns (a disagreement is
-            // about its answers, not its address book).
-            state.gossiped.remove(&peer.addr());
             state.cooling.insert(peer.addr(), until);
             self.forget(&mut state, peer.addr());
             close_later(peer.clone());
@@ -826,9 +839,9 @@ impl Lane {
     /// schedule).
     async fn drop_conn(&self, peer: &Arc<PeerConn>) {
         let mut state = self.state.lock().await;
-        state.conns.retain(|c| c.addr() != peer.addr());
-        state.gossiped.remove(&peer.addr());
-        requeue(&mut state, peer, RECONNECT_AFTER);
+        if unpool(&mut state, peer) {
+            requeue(&mut state, peer, RECONNECT_AFTER);
+        }
         close_later(peer.clone());
     }
 
@@ -1206,6 +1219,16 @@ pub(crate) fn replaceable(facts: &[(Source, Group)], cand: (Source, Group), pinn
     })
 }
 
+/// Take exactly `peer` out of the pool, never a later connection to the same
+/// address (a request that slept through a reconnect holds a stale handle),
+/// clearing its gossip marker. False when it was not pooled any more.
+fn unpool(state: &mut LaneState, peer: &Arc<PeerConn>) -> bool {
+    let Some(i) = state.conns.iter().position(|c| Arc::ptr_eq(c, peer)) else { return false };
+    state.conns.remove(i);
+    state.gossiped.remove(&peer.addr());
+    true
+}
+
 /// Put a public peer whose connection is gone back in the queue, not to be
 /// dialled before `after`. Pins are resolved afresh on their own schedule.
 fn requeue(state: &mut LaneState, peer: &PeerConn, after: Duration) {
@@ -1357,8 +1380,11 @@ pub(crate) fn records_from(states: Vec<CoinState>, include_spent: bool, min_heig
 /// `hinted`): `RequestPuzzleState` from `cursor`, else from the block before
 /// `min_height` (its header fetched first, so a watcher's incremental scan
 /// asks only for what changed since; the peer rejecting that start as a
-/// reorg sends the listing back to genesis), else from genesis; followed for
-/// [`PAGES_PER_LISTING`] pages, then cut short with a cursor.
+/// reorg sends the listing back to genesis), else from genesis. ONE protocol
+/// page: a peer with more to say leaves the listing cut short with a cursor,
+/// and the caller's page budget (`chia_resolve::MAX_PAGES_PER_POLL`,
+/// `chia_faucet::MAX_FAUCET_PAGES`, `chia_publish::MAX_RECONCILE_PAGES`)
+/// decides how far to follow; no second budget hides beneath it.
 async fn listing_on(
     peer: Arc<PeerConn>,
     net: Network,
@@ -1386,9 +1412,7 @@ async fn listing_on(
         }
     };
     let filters = CoinStateFilters::new(include_spent, true, hinted, 0);
-    let mut states: HashMap<Bytes32, CoinState> = HashMap::new();
-    let mut pages = 0;
-    while pages < PAGES_PER_LISTING {
+    let page = loop {
         let page = peer
             .request_fallible::<RespondPuzzleState, RejectPuzzleState, _>(RequestPuzzleState::new(
                 keys.clone(),
@@ -1399,39 +1423,24 @@ async fn listing_on(
             ))
             .await
             .map_err(ChainError::Unanswered)?;
-        let page = match page {
-            Ok(page) => page,
+        match page {
+            Ok(page) => break page,
             Err(reject) if from_header && reject.reason == RejectStateReason::Reorg => {
                 // The block before `min_height` is not on the peer's chain any
                 // more: the listing starts over from genesis, once.
                 from_header = false;
                 previous = None;
                 header_hash = net.genesis;
-                states.clear();
-                continue;
             }
             Err(reject) => return Err(ChainError::Refused(format!("coin listing rejected: {:?}", reject.reason))),
-        };
-        pages += 1;
-        from_header = false;
-        for state in page.coin_states {
-            states.insert(state.coin.coin_id(), state);
         }
-        previous = Some(page.height);
-        header_hash = page.header_hash;
-        if page.is_finished {
-            return Ok(CoinListing {
-                records: records_from(states.into_values().collect(), include_spent, min_height),
-                truncated: false,
-                next_cursor: None,
-            });
-        }
+    };
+    let records = records_from(page.coin_states, include_spent, min_height);
+    if page.is_finished {
+        Ok(CoinListing { records, truncated: false, next_cursor: None })
+    } else {
+        Ok(CoinListing { records, truncated: true, next_cursor: Some(encode_cursor(page.height, page.header_hash)) })
     }
-    Ok(CoinListing {
-        records: records_from(states.into_values().collect(), include_spent, min_height),
-        truncated: true,
-        next_cursor: Some(encode_cursor(previous.unwrap_or(0), header_hash)),
-    })
 }
 
 /// Where an incremental listing starts: the block before `min_height` and its
@@ -1445,16 +1454,37 @@ async fn start_before(peer: &Arc<PeerConn>, min_height: u32) -> Option<(Option<u
     }
 }
 
-/// One peer's states for the coins named.
+/// One peer's states for the coins named. The peer echoes the ids it answered
+/// for (a request is capped at its response-item limit); the rest are asked
+/// again, and a lookup still short after [`STATE_ROUNDS`] requests, or one the
+/// peer makes no progress on, is cut short with no cursor, which every caller
+/// treats as incomplete (the wallet lease keeps its coins parked).
 async fn states_on(peer: Arc<PeerConn>, net: Network, names: Vec<Bytes32>, include_spent: bool) -> Result<CoinListing, ChainError> {
-    let answer = peer
-        .request_fallible::<RespondCoinState, RejectCoinState, _>(RequestCoinState::new(names, None, net.genesis, false))
-        .await
-        .map_err(ChainError::Unanswered)?;
-    match answer {
-        Ok(answer) => Ok(CoinListing { records: records_from(answer.coin_states, include_spent, None), truncated: false, next_cursor: None }),
-        Err(reject) => Err(ChainError::Refused(format!("coin states rejected: {:?}", reject.reason))),
+    let mut seen: HashSet<Bytes32> = HashSet::new();
+    let mut wanted: Vec<Bytes32> = names.into_iter().filter(|id| seen.insert(*id)).collect();
+    let mut states: Vec<CoinState> = Vec::new();
+    for _ in 0..STATE_ROUNDS {
+        let answer = peer
+            .request_fallible::<RespondCoinState, RejectCoinState, _>(RequestCoinState::new(wanted.clone(), None, net.genesis, false))
+            .await
+            .map_err(ChainError::Unanswered)?;
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(reject) => return Err(ChainError::Refused(format!("coin states rejected: {:?}", reject.reason))),
+        };
+        let echoed: HashSet<Bytes32> = answer.coin_ids.iter().copied().collect();
+        states.extend(answer.coin_states);
+        let before = wanted.len();
+        wanted.retain(|id| !echoed.contains(id));
+        if wanted.is_empty() {
+            return Ok(CoinListing { records: records_from(states, include_spent, None), truncated: false, next_cursor: None });
+        }
+        if wanted.len() == before {
+            // No progress: the peer answers for none of what is left.
+            break;
+        }
     }
+    Ok(CoinListing { records: records_from(states, include_spent, None), truncated: true, next_cursor: None })
 }
 
 /// One peer's puzzle reveal and solution for a spend.
@@ -2412,6 +2442,123 @@ mod tests {
         retrying.expire_pin_cooldown().await;
         assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1, "asked again, A's gossip brought B");
         assert_eq!(asked(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_capped_coin_state_reply_is_followed_until_every_id_is_answered() {
+        // Chia caps a coin-state request at its response-item limit and echoes
+        // the ids it took. A peer answering one id per request is asked again
+        // for the rest until every id is answered; a peer answering none of
+        // what is left leaves the listing cut short with no cursor, which the
+        // wallet lease treats as incomplete (its coins stay parked).
+        let states = vec![state(1, 90, None), state(2, 80, Some(85)), state(3, 95, None)];
+        let capped = |cap: usize| -> Handler {
+            let states = states.clone();
+            let base = node(states.clone(), (1, None), vec![]);
+            Arc::new(move |m: &Message| {
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestCoinState {
+                    let req = RequestCoinState::from_bytes(&m.data).unwrap();
+                    let taken: Vec<Bytes32> = req.coin_ids.iter().take(cap).copied().collect();
+                    let named: Vec<CoinState> = states.iter().filter(|s| taken.contains(&s.coin.coin_id())).cloned().collect();
+                    vec![reply(&RespondCoinState::new(taken, named))]
+                } else {
+                    base(m)
+                }
+            })
+        };
+        let names: Vec<Bytes32> = states.iter().map(|s| s.coin.coin_id()).collect();
+        let asked = |n: &MockNode| n.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestCoinState).count();
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), capped(1)).await;
+        let b = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), capped(1)).await;
+        let money = PeerLane::new(lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None), Trust::Agreed);
+        let listing = money.coin_records_by_names(names.clone(), true, None).await.unwrap();
+        assert_eq!(listing.records.len(), 3);
+        assert!(!listing.truncated);
+        assert_eq!((asked(&a), asked(&b)), (3, 3), "one request per id the peers took");
+        let mute = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), capped(0)).await;
+        let mute_too = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), capped(0)).await;
+        let money = PeerLane::new(lane(vec![(mute.addr, Source::Introducer), (mute_too.addr, Source::Gossip)], vec![], false, None), Trust::Agreed);
+        let listing = money.coin_records_by_names(names, true, None).await.unwrap();
+        assert!(listing.records.is_empty() && listing.truncated && listing.next_cursor.is_none(), "cut short with no way to go on");
+        assert_eq!(asked(&mute), 1, "no progress, no second request");
+    }
+
+    #[tokio::test]
+    async fn a_listing_is_one_protocol_page_with_a_cursor_for_the_rest() {
+        // A peer with more to say ends its page unfinished: the listing is one
+        // page, cut short with a cursor at the page's height and header, and
+        // the caller's page budget decides how far to follow.
+        let states = vec![state(1, 90, None)];
+        let unfinished: Handler = {
+            let states = states.clone();
+            let base = node(states.clone(), (1, None), vec![]);
+            Arc::new(move |m: &Message| {
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPuzzleState {
+                    let req = RequestPuzzleState::from_bytes(&m.data).unwrap();
+                    vec![reply(&RespondPuzzleState::new(req.puzzle_hashes, 100, header_at(100, genesis()).header_hash(), false, states.clone()))]
+                } else {
+                    base(m)
+                }
+            })
+        };
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), unfinished).await;
+        let carrier = PeerLane::new(lane(vec![(a.addr, Source::Introducer)], vec![], false, None), Trust::Carrier);
+        let listing = carrier.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap();
+        assert_eq!(listing.records.len(), 1);
+        assert!(listing.truncated);
+        assert_eq!(decode_cursor(listing.next_cursor.as_ref().unwrap()).unwrap(), (100, header_at(100, genesis()).header_hash()));
+        assert_eq!(
+            a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPuzzleState).count(),
+            1,
+            "one page per listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_success_cannot_restore_an_evicted_peer() {
+        // Two requests overlap: one evicts the public peers for disagreeing,
+        // the other had matching answers and records its success afterwards.
+        // Only connections still in the pool are remembered, so the store
+        // stays empty.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let store = temp_store("late-success");
+        let _ = std::fs::remove_file(&store);
+        let pool = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, Some(store.clone()));
+        let money = PeerLane::new(pool.clone(), Trust::Agreed);
+        assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1);
+        let conns = pool.live_conns().await;
+        assert_eq!(pool.state.lock().await.known.len(), 2, "both remembered");
+        pool.evict(&conns, "disagreed (test)").await;
+        pool.note_good(&conns).await;
+        assert!(pool.state.lock().await.known.is_empty(), "a late success restores nothing");
+        assert!(!store.exists() || serde_json::from_slice::<StoreFile>(&std::fs::read(&store).unwrap()).unwrap().peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_handle_cannot_drop_a_replacement_connection() {
+        // A request that slept through a reconnect still holds the old
+        // connection; dropping or evicting through that handle must not touch
+        // the replacement now holding the address.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let store = temp_store("stale-handle");
+        let _ = std::fs::remove_file(&store);
+        let pool = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, Some(store.clone()));
+        let money = PeerLane::new(pool.clone(), Trust::Agreed);
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        let old = pool.live_conns().await.into_iter().find(|c| c.addr() == a.addr).unwrap();
+        pool.drop_conn(&old).await;
+        pool.expire_pin_cooldown().await;
+        assert_eq!(money.peak_height().await.unwrap(), 100, "dialled again");
+        let new = pool.live_conns().await.into_iter().find(|c| c.addr() == a.addr).unwrap();
+        assert!(!Arc::ptr_eq(&old, &new));
+        pool.drop_conn(&old).await;
+        pool.evict(&[old.clone()], "stale verdict (test)").await;
+        assert!(pool.live_conns().await.iter().any(|c| Arc::ptr_eq(c, &new)), "the replacement stays pooled");
+        let state = pool.state.lock().await;
+        assert!(!state.cooling.contains_key(&a.addr), "and its address is not cooling");
+        assert!(state.known.iter().any(|p| p.addr == a.addr.to_string()), "nor forgotten");
     }
 
     #[tokio::test]
