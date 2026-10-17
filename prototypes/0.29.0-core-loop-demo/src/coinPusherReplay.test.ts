@@ -11,7 +11,7 @@ import {
   type CoinPusherState, type DropTrace, type PusherDropMark, type PusherHole,
 } from './games/coinPusher';
 import {
-  cabinetView, PAY_MS, STEP_MS, planDrops, queueDrops, REPLAY_MAX, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
+  cabinetView, CLOCK_SAMPLES, clockOffset, noteClock, PAY_MS, STEP_MS, planDrops, queueDrops, REPLAY_MAX, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
 } from './coinPusherReplay';
 
 const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088, barTop: 0.08, boardExitX: -0.04, boardExitY: 0.18 };
@@ -178,6 +178,47 @@ describe('coin pusher replay', () => {
     expect(done.live).toHaveLength(0);
     const sort = (ps: { chipId: number }[]) => [...ps].sort((a, b) => a.chipId - b.chipId);
     expect(sort(replayView(last.plan, last.plan.endMs).table)).toEqual(sort(restingView(after, GEOM)));
+  });
+
+  const mod1 = (x: number): number => x - Math.floor(x);
+
+  it("replays a drop on the viewer's own clock, however far it runs from the operator's", () => {
+    const before = fill(30);
+    const at = 80_000;
+    const phase = currentPusherPhase(before, at);
+    const r = processInsert(before, 'p', 1, phase, 77);
+    const after: CoinPusherState = { ...r.state, recentDrops: [{ chipId: r.chipId, hole: 1, phase, atMs: at, seed: 77 }] };
+    // The record reaches each viewer 300 ms after the settle, by the operator's clock.
+    for (const skew of [0, -10 * 60_000, 10 * 60_000, 1_234]) {
+      const seenAt = at + 300 + skew;
+      const samples = noteClock([], before, after, seenAt);
+      const [plan] = planDrops(before, after, GEOM, clockOffset(samples))!;
+      // In step with the pusher this viewer draws (currentPusherPhase at its own clock)...
+      expect(mod1(currentPusherPhase(after, plan.startMs) - phase + 0.5) - 0.5).toBeCloseTo(0, 6);
+      // ...within half a sweep of when it arrived, so it plays out instead of
+      // waiting minutes at its slot or being over before it's seen.
+      expect(Math.abs(seenAt - plan.startMs)).toBeLessThanOrEqual(PUSHER_PERIOD_MS / 2);
+      const mid = cabinetView([plan], plan.startMs + ENTRY_MS).view!;
+      expect(mid.entries.length + mid.boards.length + mid.chutes.length).toBe(1);
+      expect(cabinetView([plan], plan.startMs + plan.plan.endMs).view).toBeNull();
+    }
+  });
+
+  it('tells the clock offset from the quickest of the last CLOCK_SAMPLES arrivals', () => {
+    const before = fill(10);
+    const r = processInsert(before, 'p', 0, 0.2, 5);
+    const after: CoinPusherState = { ...r.state, recentDrops: [{ chipId: r.chipId, hole: 0, phase: 0.2, atMs: 1_000, seed: 5 }] };
+    expect(clockOffset([])).toBe(0);
+    let samples = noteClock([], before, after, 61_400);
+    // One record noticed late (a tab in the background) doesn't move it.
+    samples = noteClock(samples, before, after, 900_000);
+    expect(clockOffset(samples)).toBe(60_400);
+    // A record with no new drop, or no time on it, adds nothing.
+    expect(noteClock(samples, after, after, 5_000)).toEqual(samples);
+    expect(noteClock(samples, before, { ...after, recentDrops: [{ chipId: r.chipId, hole: 0 }] }, 5_000)).toEqual(samples);
+    // A new operator's clock takes over within CLOCK_SAMPLES records.
+    for (let i = 0; i < CLOCK_SAMPLES; i++) samples = noteClock(samples, before, after, 2_000 + i);
+    expect(clockOffset(samples)).toBe(1_000);
   });
 
   it("won't replay drops it can't: no seed on a mark, or a gap", () => {

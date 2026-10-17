@@ -399,7 +399,9 @@ export interface ScheduledReplay {
  * board, a gap, a new machine, one emptied in between): the cabinet then just draws the
  * record.
  */
-export function planDrops(prev: CoinPusherState, next: CoinPusherState, geom: ReplayGeometry): ScheduledReplay[] | null {
+export function planDrops(
+  prev: CoinPusherState, next: CoinPusherState, geom: ReplayGeometry, offsetMs = 0,
+): ScheduledReplay[] | null {
   // Emptied in between (which keeps the chip ids and marks): the drops
   // after it ran on an empty machine, not on `prev`.
   if (next.totalEmptied !== prev.totalEmptied) return null;
@@ -413,10 +415,42 @@ export function planDrops(prev: CoinPusherState, next: CoinPusherState, geom: Re
     if (mark.phase === undefined || mark.atMs === undefined) return null;
     const trace = traceDrop(before, mark);
     if (!trace) return null;
-    out.push({ plan: planReplay(before, trace, geom), startMs: dropStartMs(next, { phase: mark.phase, atMs: mark.atMs }) });
+    // On this page's clock (offsetMs ahead of the operator's), at the moment
+    // the pusher this page draws stood at the drop's phase.
+    const startMs = dropStartMs(next, { phase: mark.phase, atMs: mark.atMs + offsetMs });
+    out.push({ plan: planReplay(before, trace, geom), startMs });
     before = trace.after;
   }
   return out;
+}
+
+/** How many records' arrivals a cabinet keeps to tell how far its clock runs
+ *  from the operator's (clockOffset). */
+export const CLOCK_SAMPLES = 8;
+
+/**
+ * A record's arrival, against when the operator settled its newest drop: the
+ * cabinet's clock less the operator's, plus how long the record took to
+ * arrive. Kept as the last CLOCK_SAMPLES (unchanged when the record brings no
+ * new drop with a settle time), so one record noticed late (a tab in the
+ * background) doesn't count and a new operator's clock takes over within a
+ * few records.
+ */
+export function noteClock(samples: readonly number[], prev: CoinPusherState, next: CoinPusherState, now: number): number[] {
+  if (!Number.isFinite(now)) return [...samples];
+  let at = -Infinity;
+  for (const d of next.recentDrops ?? []) {
+    if (d.chipId >= prev.nextChipId && d.atMs !== undefined && d.atMs > at) at = d.atMs;
+  }
+  if (at === -Infinity) return [...samples];
+  return [...samples, now - at].slice(-CLOCK_SAMPLES);
+}
+
+/** How far this page's clock runs ahead of the operator's (behind when
+ *  negative), from noteClock's samples: the quickest arrival, which waited
+ *  least on the way. Zero before any. */
+export function clockOffset(samples: readonly number[]): number {
+  return samples.length ? Math.min(...samples) : 0;
 }
 
 /** How many drops a cabinet replays at once. A replay lasts its coin's fall
@@ -431,12 +465,13 @@ export const REPLAY_MAX = 32;
  * A new record seen: every drop since the one before queued behind the
  * replays still playing (cabinetView drops each once it's over). When the
  * new drops can't all be replayed (planDrops), the queue is dropped and the
- * cabinet draws the record.
+ * cabinet draws the record. `offsetMs` (clockOffset) puts the drops on the
+ * cabinet's own clock, which cabinetView's `now` and the drawn pusher use.
  */
 export function queueDrops(
-  replays: readonly ScheduledReplay[], prev: CoinPusherState, next: CoinPusherState, geom: ReplayGeometry,
+  replays: readonly ScheduledReplay[], prev: CoinPusherState, next: CoinPusherState, geom: ReplayGeometry, offsetMs = 0,
 ): ScheduledReplay[] {
-  const planned = planDrops(prev, next, geom);
+  const planned = planDrops(prev, next, geom, offsetMs);
   if (!planned) return [];
   // Even a drop already played out stays queued: while an older one is in
   // the air its table is the one to draw (cabinetView prunes it after).

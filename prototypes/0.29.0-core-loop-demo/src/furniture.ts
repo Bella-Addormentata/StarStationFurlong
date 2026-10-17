@@ -55,7 +55,7 @@ import {
   type CoinPusherState,
 } from "./games/coinPusher";
 import {
-  cabinetView, queueDrops, restingView, type CabinetView, type ReplayGeometry, type ScheduledReplay, type TablePose,
+  cabinetView, clockOffset, noteClock, queueDrops, restingView, type CabinetView, type ReplayGeometry, type ScheduledReplay, type TablePose,
 } from "./coinPusherReplay";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
 import { createArcadeScreenPainter } from "./arcadeScreen";
@@ -8664,15 +8664,23 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
    *  with when its coin went in, by this page's clock), oldest first. */
   let seen: CoinPusherState | null = null;
   let replays: ScheduledReplay[] = [];
+  /** How records' drops have arrived against the operator's clock
+   *  (noteClock), so they replay on this page's clock however far apart. */
+  let clockSamples: number[] = [];
 
   /** A new record: queue a replay of every drop since the record before
    *  (several can settle between two frames), or, when they can't all be
    *  replayed, drop the replays and draw the record. */
-  const noticeRecord = (state: CoinPusherState | null): void => {
+  const noticeRecord = (state: CoinPusherState | null, now: number): void => {
     const prev = seen;
     seen = state;
     if (!state || (prev && prev.tick === state.tick && prev.nextChipId === state.nextChipId)) return;
-    replays = prev ? queueDrops(replays, prev, state, geom) : [];
+    if (!prev) {
+      replays = [];
+      return;
+    }
+    clockSamples = noteClock(clockSamples, prev, state, now);
+    replays = queueDrops(replays, prev, state, geom, clockOffset(clockSamples));
   };
 
   /** A coin on its way down the board or the chute. */
@@ -8726,7 +8734,7 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
       const now = Date.now();
       const state = readCoinPusherState(itemId);
-      noticeRecord(state);
+      noticeRecord(state, now);
 
       // Every drop settled since the last frame, even several at once.
       if (state && shownUpTo !== undefined) {
