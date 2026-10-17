@@ -299,7 +299,7 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
     }
 }
 
-/// Gateway pages followed per listing (one HTTPS call each). A faucet address is
+/// Listing pages followed per listing (one peer request each). A faucet address is
 /// permissionless, so a flood of tiny outputs could stretch the listing past one
 /// page; the pages are followed up to this bound (as `chia_resolve::read_hint`
 /// does) and past it the status says so (`partial`) instead of silently
@@ -365,7 +365,7 @@ pub struct FaucetReply {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<FaucetStatus>,
     /// The id of the coin a claim or gift spent (with `unanswered` set: the coin
-    /// its bundle spends, if the gateway took it).
+    /// its bundle spends, if the peers took it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spent_coin: Option<String>,
     /// On a claim or give that went out: the snapshot BARRIER, taken under
@@ -377,7 +377,7 @@ pub struct FaucetReply {
     /// review, round 13).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_snapshot: Option<u64>,
-    /// On a claim or give whose push the gateway did not ANSWER (a timeout
+    /// On a claim or give whose push the chain did not ANSWER (a timeout
     /// above all): why. The spend may be in the mempool all the same, so its
     /// inputs stay parked and the browser keeps its TAKING…/GIVING… until
     /// reconciliation settles the spend, exactly as after an accepted push;
@@ -454,7 +454,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
             // above the barrier that shows the spend settled (or the gift
             // landed). The barrier goes out even when the read right after it
             // fails, so a later poll can settle a spend the chain dropped; the
-            // polls bring the status. A push the gateway did not answer went out
+            // polls bring the status. A push the chain did not answer went out
             // as well (`unanswered` set, round 14): its spend may be live, so the
             // browser keeps the action pending the same way.
             if reply.ok && matches!(reply.op.as_str(), "claim" | "give") {
@@ -483,7 +483,7 @@ async fn status(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fau
 async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetStatus> {
     let peak = crate::chia_resolve::peak_height(client)
         .await
-        .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
+        .ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
     let listing = unspent_at(client, params.puzzle_hash()).await?;
     let mut st = summarize(params, peak, &listing.coins, listing.partial);
     #[cfg(feature = "chia-publish")]
@@ -689,11 +689,11 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     // mempool settles the claim) counts as a coin in the wallet. Without this,
     // two loopback requests could both see an empty wallet before either gift
     // confirms and each draw a mojo from a different ready coin (#245 review,
-    // round 3). The lease is held across the gateway reads, as the heartbeat
+    // round 3). The lease is held across the chain reads, as the heartbeat
     // holds it across its own.
     let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
     // A sealed lease (its file from the last run unreadable) refuses here,
-    // before any gateway read, with the reason (#245 review, round 19).
+    // before any chain read, with the reason (#245 review, round 19).
     crate::chia_publish::WALLET_LEASE.ensure_open()?;
     crate::chia_publish::WALLET_LEASE.reconcile(client).await;
     if crate::chia_publish::WALLET_LEASE.incoming_pending() {
@@ -713,7 +713,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     }
     let peak = crate::chia_resolve::peak_height(client)
         .await
-        .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
+        .ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
     let faucet_ph = params.puzzle_hash();
     let coins = unspent_at(client, faucet_ph).await?.coins;
     let Some(target) = coins
@@ -878,7 +878,7 @@ async fn give(
 }
 
 /// What a push leaves for the reply (#245 review, round 14): `Ok(None)` when the
-/// gateway accepted it; `Ok(Some(why))` when it did not ANSWER — the spend may
+/// peers accepted it; `Ok(Some(why))` when it did not ANSWER — the spend may
 /// be live and its inputs stay parked, so the request is answered as SENT with
 /// `unanswered` set, never as a refusal that would let the player spend again
 /// from other coins; `Err` only for a rejection, which proves nothing was spent,
@@ -1252,7 +1252,7 @@ mod tests {
         // Unanswered: the spend may be live; the request is answered as SENT with the reason.
         let unanswered = pushed(Err(PushError::Unanswered(anyhow!("operation timed out")))).unwrap();
         assert_eq!(unanswered.as_deref(), Some("operation timed out"));
-        // Rejected: nothing was spent; the request is refused with the gateway's reason.
+        // Rejected: nothing was spent; the request is refused with the chain's reason.
         let refused = pushed(Err(PushError::Rejected("DOUBLE_SPEND".into()))).unwrap_err();
         assert!(refused.to_string().contains("DOUBLE_SPEND"), "{refused}");
         // Not sent: the lease could not save the parking, so nothing left; the

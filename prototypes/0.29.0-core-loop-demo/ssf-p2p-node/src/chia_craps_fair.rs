@@ -118,7 +118,7 @@ async fn push_fair_record(
 /// confirms, violating the commit→reveal ordering assumption. ~200 s bound.
 ///
 /// The listing is PAGED like every other wallet listing (#245 review, round 15):
-/// `spent` was selected across up to [`MAX_FAUCET_PAGES`] gateway pages, so the
+/// `spent` was selected across up to [`MAX_FAUCET_PAGES`] listing pages, so the
 /// first page alone could simply not hold it while it still sits unspent on a
 /// later one, and the reveal would go out before the commit confirmed. A
 /// listing cut short that does not show `spent` proves nothing either way
