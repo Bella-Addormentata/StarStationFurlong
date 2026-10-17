@@ -47,8 +47,13 @@
 //!     [`PER_SOURCE_CAP`] of the [`MAX_CONNS`] connections, and a full pool
 //!     that cannot form a pair lets a connection go (a redundant one first,
 //!     never a pin) for a candidate whose source AND network group would
-//!     complete one. A stored peer that disagrees with a verdict, or with a
-//!     pin, is evicted; so is a public peer whose announced peak lags, by more
+//!     complete one; a pool with room whose only dialable candidates are
+//!     introducer peers kept out by that cap (three connected introducer
+//!     peers that know nobody) lets one of them go, one already asked for
+//!     gossip, so a waiting one can bring its own, and it rejoins the queue
+//!     after [`RETRY_AFTER`]. A stored peer that disagrees with a verdict,
+//!     or with a pin, is evicted; so is a public peer whose announced peak
+//!     lags, by more
 //!     than [`MAX_PEAK_LAG`] blocks, a height at least two other peers reach
 //!     (one peer's announcement, inflated or not, evicts nobody), and the two
 //!     peers of an agreed pair must be within that lag of each other. A peer that stops
@@ -632,8 +637,10 @@ impl Lane {
     /// Dial the next few candidates, sources not yet connected first (fresh
     /// ones ahead), no source past [`PER_SOURCE_CAP`]. A full pool that cannot
     /// form an agreed pair first lets one redundant public connection go when
-    /// a candidate from a source it lacks is waiting. `false` when there was
-    /// nothing to dial.
+    /// a candidate from a source it lacks is waiting; a pool with room that
+    /// cannot form one, whose only dialable candidates are introducer peers
+    /// the cap keeps out, lets one connected introducer peer go for the first
+    /// of them ([`Self::rotation`]). `false` when there was nothing to dial.
     async fn dial(&self, state: &mut LaneState) -> bool {
         let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
         let now = Instant::now();
@@ -685,6 +692,14 @@ impl Lane {
             }
         }
         ready.sort_by_key(|c| (have.contains(&c.source), groups.contains(&group_of(c.addr)), !c.source.is_fresh()));
+        if first.is_none() {
+            if let Some(i) = self.rotation(state, &ready) {
+                let peer = state.conns[i].clone();
+                self.let_go(state, &peer, RETRY_AFTER, "making room for a waiting introducer peer and its gossip");
+                // Queued again by `let_go`, cooling: it waits with the others.
+                later.extend(state.candidates.drain(..));
+            }
+        }
         if let Some(cand) = first {
             ready.insert(0, cand);
         }
@@ -762,6 +777,39 @@ impl Lane {
                 }
             }
         }
+    }
+
+    /// In a pool with room that cannot form an agreed pair, whose every
+    /// dialable candidate waits only on [`PER_SOURCE_CAP`], the connection to
+    /// let go so the first waiting introducer peer can be dialled and asked
+    /// for gossip: three connected introducer peers that know nobody would
+    /// otherwise hold their cap for good, and the second source a pair needs
+    /// would never be found. Among that source's connections, each already
+    /// asked for gossip and never a pin, one whose network group another
+    /// connection shares first, then the newest; one per dial round. `None`
+    /// when nothing waits, when the pool could already pair, or when the
+    /// waiting candidates are stored or gossiped peers: those cannot bring
+    /// the fresh peer such a pool lacks, only the introducer can.
+    fn rotation(&self, state: &LaneState, ready: &[Candidate]) -> Option<usize> {
+        let cand = ready.first()?;
+        if state.conns.len() >= MAX_CONNS || !cand.source.is_fresh() || self.choose(state, Trust::Agreed).is_some() {
+            return None;
+        }
+        let held = state.conns.iter().filter(|c| c.source() == cand.source).count();
+        if held < PER_SOURCE_CAP || ready.iter().any(|c| c.source != cand.source) {
+            return None;
+        }
+        let mut groups: HashMap<Group, usize> = HashMap::new();
+        for c in &state.conns {
+            *groups.entry(c.group()).or_default() += 1;
+        }
+        state
+            .conns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.source() == cand.source && c.source() != Source::Pin && state.gossiped.contains_key(&c.addr()))
+            .max_by_key(|(_, c)| groups[&c.group()])
+            .map(|(i, _)| i)
     }
 
     fn forget(&self, state: &mut LaneState, addr: SocketAddr) {
@@ -1837,6 +1885,35 @@ mod tests {
         assert!(conns.iter().filter(|c| c.source() == Source::Introducer).count() <= PER_SOURCE_CAP, "one source never holds the whole pool");
         assert!(conns.iter().any(|c| c.source() == Source::Gossip), "the gossiped peer got a slot");
         assert!(c.seen.lock().unwrap().contains(&chia_protocol::ProtocolMessageTypes::RequestCoinState), "and took part in the verdict");
+    }
+
+    #[tokio::test]
+    async fn three_introducer_peers_that_know_nobody_make_room_for_one_that_gossips_a_second_source() {
+        // A, B and D came from the introducer and gossip nobody; E, from the
+        // introducer too, waits behind the per-source cap and would gossip C,
+        // the second source the pair needs. Without rotation the three would
+        // hold their cap for good and every money request would fail.
+        let c = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let a = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let d = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let e = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![state(4, 50, None)], (1, None), vec![c.addr])).await;
+        let seeds = vec![(a.addr, Source::Introducer), (b.addr, Source::Introducer), (d.addr, Source::Introducer), (e.addr, Source::Introducer)];
+        let lane = lane(seeds, vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let got = money.coin_records_by_names(vec![coin(4).coin_id()], true, None).await.unwrap();
+        assert_eq!(got.records.len(), 1);
+        let conns = lane.live_conns().await;
+        assert!(conns.len() <= MAX_CONNS);
+        assert!(conns.iter().filter(|p| p.source() == Source::Introducer).count() <= PER_SOURCE_CAP, "the cap holds");
+        assert!(conns.iter().any(|p| p.addr() == e.addr), "the waiting introducer peer got a slot");
+        assert!(conns.iter().any(|p| p.addr() == c.addr && p.source() == Source::Gossip), "and its gossip brought the second source");
+        assert!(c.seen.lock().unwrap().contains(&chia_protocol::ProtocolMessageTypes::RequestCoinState), "which took part in the verdict");
+        let gone: Vec<SocketAddr> = [a.addr, b.addr, d.addr].into_iter().filter(|x| !conns.iter().any(|p| p.addr() == *x)).collect();
+        assert_eq!(gone.len(), 1, "exactly one of the three that knew nobody was let go: {gone:?}");
+        let state = lane.state.lock().await;
+        assert!(state.cooling.contains_key(&gone[0]), "it cools before another dial");
+        assert!(state.candidates.iter().any(|q| q.addr == gone[0]), "and waits in the queue, to be asked for gossip again");
     }
 
     #[tokio::test]
