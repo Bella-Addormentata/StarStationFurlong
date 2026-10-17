@@ -4829,7 +4829,6 @@ export class World {
       await new Promise((r) => setTimeout(r, 50));
     }
     if (!waiting()) return false;
-    vestibule.updateWorldMatrix(true, false);
     const tube = buildVestibule(doorId);
     // Both ends shut: the door behind, and the far module's door ahead.
     const capMat = new THREE.MeshStandardMaterial({ color: 0x3a4454, roughness: 0.6, metalness: 0.4 });
@@ -4840,8 +4839,12 @@ export class World {
     }
     setVestibuleOpacity(tube, 1);
     setVestibuleLightState(tube, "cycling");
+    // Posed from the door as it stands now (buildVestibule anchors by id),
+    // not from the cached tube, which may predate this room's layout.
+    this.platformGroup.updateWorldMatrix(true, false);
+    tube.updateMatrix();
     tube.matrixAutoUpdate = false;
-    tube.matrix.copy(vestibule.matrixWorld);
+    tube.matrix.premultiply(this.platformGroup.matrixWorld);
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x05070b);
     scene.add(new THREE.AmbientLight(0xffffff, 0.7));
@@ -5057,7 +5060,12 @@ export class World {
     // to that walk's hooks: never auto-opened or auto-closed under it.
     const scriptedDoorId = this.player.getActiveDoorId();
     for (const door of DOORS) {
-      if (door.id === scriptedDoorId) continue;
+      if (door.id === scriptedDoorId) {
+        // Handled by the walk: count it as auto-opened so it is not opened
+        // again the moment the walk ends with the player at its front.
+        this.fpAutoOpened.add(door.id);
+        continue;
+      }
       const approachDist = Math.hypot(p.x - door.front.x, p.z - door.front.z);
 
       const state = ds.getDockingState(door.id);
