@@ -70,6 +70,7 @@ import {
 } from './pathfinding';
 import { roomHalfExtents, roomPlaceBounds } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
+import { rebuildStands } from './stands';
 import { DEVICES, rebuildDevices } from './devices';
 import { registerFurnitureHandles } from './furnitureHandles';
 import type { FurnitureHandleSinks } from './furnitureHandles';
@@ -481,6 +482,7 @@ function commitSpawnMany(world: World, items: FurnitureItem[]): void {
   rebuildObstacles();
   rebakeWalkableGrid();
   rebuildSeats();
+  rebuildStands(); // 🎰 a table's stands, the croupier's post among them
   rebuildDevices();
   world.getPlayer().onObstaclesChanged();
   world.refreshOutdoorFloor();
@@ -498,6 +500,10 @@ function commitSpawn(world: World, item: FurnitureItem): void {
   rebuildObstacles();
   rebakeWalkableGrid();
   rebuildSeats();
+  // 🎰 …and its stands: the doc echo's reconcile no-ops on this local add, so
+  // without this a spawned craps / roulette table has no croupier post and no
+  // robot ever walks to it (until a reload rebuilt the list).
+  rebuildStands();
   rebuildDevices();
   world.getPlayer().onObstaclesChanged();
   world.refreshOutdoorFloor(); // 🏊 a spawned pool hides the outdoor floor
