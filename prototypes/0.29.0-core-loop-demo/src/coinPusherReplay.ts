@@ -5,7 +5,8 @@
  * so a cabinet that drew just the record would show each drop as a jump. It
  * replays the drop instead: traceDrop gives the coin's path down the drop
  * board and the table after every physics substep, and this module turns that
- * into a pose for every chip at any moment — the coin falling and spinning
+ * into a pose for every chip at any moment — the coin going in flat at the
+ * front slot and up on its edge over its hole, falling and spinning
  * down the board, dropping the chute, standing on its edge in front of the
  * bar, tipping over when pushed, sliding, stepping off the upper platform and
  * falling into the tray.
@@ -45,6 +46,17 @@ export interface TablePose {
   y: number;
   /** 1 standing on its edge face to the player, 0 lying flat. */
   tip: number;
+}
+
+/** The dropped coin on its way from the front slot to the hole: `s` runs
+ *  0 → 1, lying flat along its track, then up on its edge over the hole at
+ *  (u, h) where the board path starts. */
+export interface EntryPose {
+  chipId: number;
+  s: number;
+  u: number;
+  h: number;
+  spin: number;
 }
 
 /** The dropped coin on its way down the board. */
@@ -106,6 +118,7 @@ function chutePose(trace: DropTrace, t: number, geom: ReplayGeometry): ChutePose
 
 export interface ReplayView {
   table: TablePose[];
+  entry: EntryPose | null;
   board: BoardPose | null;
   chute: ChutePose | null;
   /** The replay is over: draw the machine record itself from now on. */
@@ -184,10 +197,6 @@ export function reachBelow(a: number, geom: ReplayGeometry): number {
 /** How far behind its centre a chip turned `a` from flat reaches. */
 export function reachBack(a: number, geom: ReplayGeometry): number {
   return CHIP_R * Math.cos(a) + (geom.level / 2) * Math.sin(a);
-}
-
-function backOf(p: TablePose, geom: ReplayGeometry): number {
-  return p.x - reachBack(p.tip * Math.PI / 2, geom);
 }
 
 /** The surface a chip at rest is lying or standing on. */
@@ -306,9 +315,11 @@ export function replayView(replay: Replay, t: number): ReplayView {
         const tip = 1 - s * s;
         const a = tip * Math.PI / 2;
         const support = lerp(surfaceUnder(from, geom), surfaceUnder(cur, geom), s);
-        // And its back no further back than the back of where the physics
-        // has it (ahead of the bar that pushed it), however far over it is.
-        const x = Math.max(lerp(from.x, cur.x, s), backOf(cur, geom) + reachBack(a, geom));
+        // And on the upper platform its back stays ahead of the bar's face
+        // (the bar is what usually knocks it over), however far over it is.
+        const slide = lerp(from.x, cur.x, s);
+        const x = tr.from.lower ? slide
+          : Math.max(slide, pusherFaceX(trace.phase + t / PUSHER_PERIOD_MS) + reachBack(a, geom));
         table.set(id, { ...blend(from, cur, s), x, y: support + reachBelow(a, geom), tip });
       } else {
         // Off the upper front: forward along the platform until its back is
@@ -324,9 +335,14 @@ export function replayView(replay: Replay, t: number): ReplayView {
       }
     }
   }
+  let entry: EntryPose | null = null;
   let board: BoardPose | null = null;
   let chute: ChutePose | null = null;
-  if (t < trace.fallMs) {
+  if (t < trace.entryMs) {
+    const first = trace.board[0];
+    entry = { chipId: trace.chipId, s: t / trace.entryMs, u: first.u, h: first.h, spin: first.spin };
+    table.delete(trace.chipId);
+  } else if (t < trace.fallMs) {
     const path = trace.board;
     let k = 0;
     while (k + 1 < path.length && path[k + 1].t <= t) k++;
@@ -339,7 +355,7 @@ export function replayView(replay: Replay, t: number): ReplayView {
     chute = chutePose(trace, t, geom);
     table.delete(trace.chipId);
   }
-  return { table: [...table.values()], board, chute, done: t >= replay.endMs };
+  return { table: [...table.values()], entry, board, chute, done: t >= replay.endMs };
 }
 
 /** The machine at rest, as the cabinet draws it outside a replay. */
@@ -407,6 +423,7 @@ export function queueDrops(
  *  every coin still on the board or down the chute. */
 export interface CabinetView {
   table: TablePose[];
+  entries: EntryPose[];
   boards: BoardPose[];
   chutes: ChutePose[];
 }
@@ -428,8 +445,9 @@ export function cabinetView(replays: readonly ScheduledReplay[], now: number): {
   if (live.length === 0) return { view: null, live };
   const base = views[Math.max(0, k)];
   const falling = views.filter((_, i) => !landed[i]);
+  const entries = falling.flatMap((v) => (v.entry ? [v.entry] : []));
   const boards = falling.flatMap((v) => (v.board ? [v.board] : []));
   const chutes = falling.flatMap((v) => (v.chute ? [v.chute] : []));
-  const inFlight = new Set([...boards, ...chutes].map((c) => c.chipId));
-  return { view: { table: base.table.filter((p) => !inFlight.has(p.chipId)), boards, chutes }, live };
+  const inFlight = new Set([...entries, ...boards, ...chutes].map((c) => c.chipId));
+  return { view: { table: base.table.filter((p) => !inFlight.has(p.chipId)), entries, boards, chutes }, live };
 }

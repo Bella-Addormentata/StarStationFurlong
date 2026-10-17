@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  CHIP_R, chipsInMachine, currentPusherPhase, emptyMachine, PLAT_LOW_FRONT, PLAT_UP_FRONT, pusherFaceX,
+  CHIP_R, CHUTE_MS, chipsInMachine, ENTRY_MS, currentPusherPhase, emptyMachine, PLAT_LOW_FRONT, PLAT_UP_FRONT, pusherFaceX,
   RECENT_DROPS_MAX, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
   type CoinPusherState, type DropTrace, type PusherDropMark, type PusherHole,
 } from './games/coinPusher';
@@ -32,7 +32,15 @@ describe('coin pusher replay', () => {
     const before = fill(30);
     const { r, trace } = traced(before, 1, 0.2, 77);
     const plan = planReplay(before, trace, GEOM);
-    const onBoard = replayView(plan, trace.fallMs / 2);
+    // First in through its front slot, flat, to the top of its hole.
+    const goingIn = replayView(plan, trace.entryMs / 2);
+    expect(goingIn.entry).toMatchObject({ chipId: r.chipId, s: 0.5, u: trace.board[0].u, h: trace.board[0].h });
+    expect(goingIn.board).toBeNull();
+    expect(goingIn.table.some((p) => p.chipId === r.chipId)).toBe(false);
+    expect(trace.board[0].t).toBe(trace.entryMs);
+
+    const onBoard = replayView(plan, (trace.entryMs + trace.fallMs) / 2);
+    expect(onBoard.entry).toBeNull();
     expect(onBoard.board?.chipId).toBe(r.chipId);
     expect(onBoard.chute).toBeNull();
     expect(onBoard.table.some((p) => p.chipId === r.chipId)).toBe(false);
@@ -46,7 +54,9 @@ describe('coin pusher replay', () => {
     expect(chute.chute!.s).toBeLessThan(1);
 
     const landed = replayView(plan, trace.landMs);
-    expect(landed.table.find((p) => p.chipId === r.chipId)).toMatchObject({ tip: 1, x: trace.landX, u: trace.landU });
+    const coin = landed.table.find((p) => p.chipId === r.chipId)!;
+    expect(coin).toMatchObject({ tip: 1, u: trace.landU });
+    expect(coin.x).toBeCloseTo(trace.landX, 3);
   });
 
   it('ends on the machine as published, and says so', () => {
@@ -69,7 +79,7 @@ describe('coin pusher replay', () => {
     let found: { r: ReturnType<typeof processInsert>; trace: DropTrace } | null = null;
     for (let i = 0; i < 200 && !found; i++) {
       const phase = i / 200;
-      const land = (phase + (simulateBoard(1, phase, 9).fallMs + 160) / PUSHER_PERIOD_MS) % 1;
+      const land = (phase + (ENTRY_MS + simulateBoard(1, phase, 9).fallMs + CHUTE_MS) / PUSHER_PERIOD_MS) % 1;
       if (land > 0.6 && land < 0.9) found = traced(before, 1, phase, 9);
     }
     const { r, trace } = found!;
@@ -148,7 +158,7 @@ describe('coin pusher replay', () => {
     for (const p of plans) expect(p.startMs).toBeCloseTo(at, -1);
 
     // All three coins are on the board at once, none on the table yet.
-    const early = cabinetView(plans, at + 50).view!;
+    const early = cabinetView(plans, at + ENTRY_MS + 50).view!;
     expect(early.boards.map((b) => b.chipId).sort()).toEqual(marks.map((m) => m.chipId));
     expect(early.table.some((p) => marks.some((m) => m.chipId === p.chipId))).toBe(false);
 
@@ -244,7 +254,7 @@ describe('coin pusher replay', () => {
     }
     expect(replays).toHaveLength(12);
     const view = cabinetView(replays, records[2].atMs + 50).view!;
-    expect(view.boards).toHaveLength(12);
+    expect(view.entries.length + view.boards.length).toBe(12);
     expect(REPLAY_MAX).toBeGreaterThan(RECENT_DROPS_MAX);
   });
 

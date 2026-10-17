@@ -5246,8 +5246,8 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       kind: "coinPusher",
       front: { x: 0, z: -1.0 },
       faceAngle: 0,
-      eye: { x: 0, y: 1.42, z: -1.0 },
-      anchor: { x: 0, y: 1.08, z: 0.08 },
+      eye: { x: 0, y: 1.55, z: -1.0 },
+      anchor: { x: 0, y: 1.10, z: 0.08 },
     },
   },
   // 📺 Smart TV on the wall (#186): the terminal's frame — flush-mounted,
@@ -8388,7 +8388,7 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   // Above the lower platform the cabinet is glass on three sides, as seaside
   // pushers are, so a crowd can watch from the sides too; it leans in a
   // little as it rises. sideX(y) is the outside of a side at height y.
-  const GLASS_Y0 = 0.80, GLASS_Y1 = 1.47;
+  const GLASS_Y0 = 0.80, GLASS_Y1 = 1.51;
   const HALF_Y0 = 0.31, HALF_Y1 = 0.25;
   const sideX = (y: number): number => HALF_Y0 + (HALF_Y1 - HALF_Y0) * (y - GLASS_Y0) / (GLASS_Y1 - GLASS_Y0);
   const LEAN = Math.atan2(HALF_Y0 - HALF_Y1, GLASS_Y1 - GLASS_Y0);
@@ -8410,7 +8410,7 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   const chromeMat = m(CHROME, 0.35, 0.7);
   place(new THREE.BoxGeometry(0.62, 0.03, 0.92), bodyMat, 0, 0.535, 0.05);
   place(new THREE.BoxGeometry(0.62, GLASS_Y0 - 0.55, 0.03), bodyMat, 0, (GLASS_Y0 + 0.55) / 2, 0.505);
-  slab(GLASS_Y0, 1.49, 0.03, (y) => -sideX(y), (y) => sideX(y), bodyMat, 0.505);
+  slab(GLASS_Y0, 1.53, 0.03, (y) => -sideX(y), (y) => sideX(y), bodyMat, 0.505);
   place(new THREE.BoxGeometry(0.62, 0.22, 0.03), bodyMat, 0, 0.65, -0.395);
 
   // ── The channel: two platforms between lit side walls ─────────────────────
@@ -8483,14 +8483,41 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   }
 
   // ── Glass front, sides and roof ────────────────────────────────────────────
+  // (and the coin slots along the top of the front, with their tracks back
+  // to the board: TRACK_* is the track's surface at its two ends)
+  const SLOT_Y = 1.478;
+  const TRACK_Z0 = -0.38, TRACK_Z1 = BOARD_Z - 0.035;
+  const TRACK_Y0 = SLOT_Y - CHIP_H / 2, TRACK_Y1 = BOARD_TOP + 0.03;
   const frontGlass = m(GLASS, 0.05, 0.0);
   frontGlass.transparent = true;
   frontGlass.depthWrite = false;
   frontGlass.userData.baseOpacity = 0.16;
-  slab(0.76, 1.46, 0.006, (y) => -(sideX(y) - 0.03), (y) => sideX(y) - 0.03, frontGlass, -0.385);
-  place(new THREE.BoxGeometry(2 * sideX(1.475), 0.03, 0.04), chromeMat, 0, 1.475, -0.385);
+  slab(0.76, 1.495, 0.006, (y) => -(sideX(y) - 0.03), (y) => sideX(y) - 0.03, frontGlass, -0.385);
+  // The coin slots, one per hole, along the top of the front glass: a coin
+  // goes in flat, slides back down its clear track under the roof to the top
+  // of the board, and turns up on its edge into the hole. Nothing solid but
+  // the slots' bezels, so the board shows through. Each bezel lights with
+  // its hole's rim (paintHoles).
+  // Clear, so a coin above eye height shows from below as it slides back.
+  const trackMat = m(GLASS, 0.1, 0.0);
+  trackMat.depthWrite = false;
+  trackMat.userData.baseOpacity = 0.35;
+  const trackLen = Math.hypot(TRACK_Z1 - TRACK_Z0, TRACK_Y0 - TRACK_Y1);
+  const trackTilt = Math.atan2(TRACK_Y0 - TRACK_Y1, TRACK_Z1 - TRACK_Z0);
+  HOLE_US.forEach((u, i) => {
+    const x = tableX(u);
+    const bezel = place(new THREE.BoxGeometry(0.046, 0.016, 0.004), holeRimMeshes[i].material as THREE.Material, x, SLOT_Y, -0.390);
+    bezel.userData.coinSlot = i;
+    place(new THREE.PlaneGeometry(0.036, 0.007), m(0x040814, 0.9, 0.05), x, SLOT_Y, -0.3925, Math.PI);
+    const midZ = (TRACK_Z0 + TRACK_Z1) / 2, midY = (TRACK_Y0 + TRACK_Y1) / 2;
+    place(new THREE.BoxGeometry(0.04, 0.003, trackLen), trackMat, x, midY - 0.0015, midZ).rotation.x = trackTilt;
+    for (const rx of [-0.021, 0.021]) {
+      place(new THREE.BoxGeometry(0.003, 0.008, trackLen), frameMat, x + rx, midY + 0.002, midZ).rotation.x = trackTilt;
+    }
+  });
+  place(new THREE.BoxGeometry(2 * sideX(1.51), 0.03, 0.04), chromeMat, 0, 1.51, -0.385);
   // A glass roof back to the backbox, so the playfield shows from above too.
-  place(new THREE.BoxGeometry(2 * sideX(1.485) - 0.04, 0.006, 0.70), frontGlass, 0, 1.485, -0.045);
+  place(new THREE.BoxGeometry(2 * sideX(1.52) - 0.04, 0.006, 0.70), frontGlass, 0, 1.52, -0.045);
   // The side windows: a solid panel up to the lower platform, then a pane
   // leaning in, framed in chrome.
   const sideGlass = m(GLASS, 0.05, 0.0);
@@ -8651,6 +8678,33 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
 
   /** A coin on its way down the board or the chute. */
   const drawFalling = (idx: number, view: CabinetView): number => {
+    for (const e of view.entries) {
+      // In flat through its slot, back along its track, up on its edge over
+      // the hole and down into it.
+      const chip = acquireChip(idx++);
+      const x = tableX(e.u);
+      const s = e.s;
+      const onTrack = (z: number): number =>
+        TRACK_Y0 + (TRACK_Y1 - TRACK_Y0) * (z - TRACK_Z0) / (TRACK_Z1 - TRACK_Z0) + CHIP_H / 2;
+      const overHole = BOARD_TOP + 0.027 + CHIP_RAD;
+      if (s < 0.1) {
+        chip.position.set(x, SLOT_Y, TRACK_Z0 - 0.04 + 0.04 * (s / 0.1));
+        chip.rotation.set(0, 0, 0);
+      } else if (s < 0.7) {
+        const z = TRACK_Z0 + (TRACK_Z1 - TRACK_Z0) * ((s - 0.1) / 0.6);
+        chip.position.set(x, onTrack(z), z);
+        chip.rotation.set(0, 0, 0);
+      } else if (s < 0.85) {
+        const d = (s - 0.7) / 0.15;
+        chip.position.set(x, onTrack(TRACK_Z1) + (overHole - onTrack(TRACK_Z1)) * d, TRACK_Z1 + (BOARD_Z - TRACK_Z1) * d);
+        chip.rotation.set(d * Math.PI / 2, d * e.spin, 0);
+      } else {
+        const d = (s - 0.85) / 0.15;
+        chip.position.set(x, overHole + (boardY(e.h) - overHole) * d * d, BOARD_Z);
+        chip.rotation.set(Math.PI / 2, e.spin, 0);
+      }
+      chip.material = chipLooks[e.chipId % 2];
+    }
     for (const b of view.boards) {
       const chip = acquireChip(idx++);
       chip.position.set(tableX(b.u), boardY(b.h), BOARD_Z);

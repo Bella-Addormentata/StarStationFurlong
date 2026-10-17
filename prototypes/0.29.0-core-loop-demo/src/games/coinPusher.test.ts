@@ -28,6 +28,8 @@ import { describe, expect, it } from 'vitest';
 import {
   advanceSim,
   chipsInMachine,
+  CHUTE_MS,
+  ENTRY_MS,
   CHIP_R,
   computeConservation,
   currentPusherPhase,
@@ -1208,7 +1210,7 @@ describe('the drop lands standing', () => {
     // look for a phase whose coin lands where it is wanted.
     for (let i = 0; i < 1000; i++) {
       const p = i / 1000;
-      const fall = simulateBoard(hole, p, seed).fallMs + 160;
+      const fall = ENTRY_MS + simulateBoard(hole, p, seed).fallMs + CHUTE_MS;
       const at = (p + fall / PUSHER_PERIOD_MS) % 1;
       if (Math.abs(at - landPhase) < 0.004) return p;
     }
@@ -1220,7 +1222,7 @@ describe('the drop lands standing', () => {
     const r = processInsert(s0, PLAYER1, 0, 0.3, 4242, true);
     const board = simulateBoard(0, 0.3, 4242);
     expect(r.landedU).toBe(Math.max(-U_MAX, Math.min(U_MAX, board.exitU)));
-    expect(r.trace!.landMs).toBe(board.fallMs + 160);
+    expect(r.trace!.landMs).toBe(ENTRY_MS + board.fallMs + CHUTE_MS);
     const landed = r.trace!.frames[0].upper.find((p) => p.chipIds.includes(r.chipId))!;
     expect(landed).toMatchObject({ standing: true, count: 1, u: r.landedU, x: r.landedX });
   });

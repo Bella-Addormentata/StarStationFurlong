@@ -249,6 +249,11 @@ export const BOARD_STEP_MS = 4;
 /** A coin still on the board after this long (balanced on a peg, say) is let
  *  out where it is: the board never holds a drop up. */
 export const BOARD_MAX_MS = 6000;
+/** From the coin slot on the front of the cabinet, lying flat along its
+ *  track to the top of the drop board, and turning up on its edge into the
+ *  hole: the drop's physics starts there, but the coin is on its way (and the
+ *  pusher sweeping) from the slot. */
+export const ENTRY_MS = 600;
 /** From the board's bottom edge down the chute onto the upper platform. */
 export const CHUTE_MS = 160;
 /** A coin that lands with the bar's face within this of its furthest reach
@@ -1189,7 +1194,9 @@ export function hasRoomForDrop(state: CoinPusherState): boolean {
  *  physics substep from the landing on. */
 export interface DropTrace {
   board: BoardSample[];
-  /** ms from the hole to the bottom of the board, and to the platform. */
+  /** ms from the front slot to the hole (the board path starts there), to
+   *  the bottom of the board, and to the platform. */
+  entryMs: number;
   fallMs: number;
   landMs: number;
   /** The pusher phase the coin went into the hole at: with landMs, where
@@ -1258,7 +1265,7 @@ export function processInsert(
   //    settled after the last drop), so any phase is consistent with the
   //    piles: none sits inside the pusher's reach, whatever its position.
   const board = simulateBoard(hole, dropPhase, seed, trace);
-  const landMs = board.fallMs + CHUTE_MS;
+  const landMs = ENTRY_MS + board.fallMs + CHUTE_MS;
   const landPhase = mod1(dropPhase + landMs / PUSHER_PERIOD_MS);
 
   // 2. It lands standing on its edge just in front of the bar's face — or,
@@ -1302,7 +1309,8 @@ export function processInsert(
   return {
     ...out,
     trace: {
-      board: board.path!, fallMs: board.fallMs, landMs, phase: dropPhase, landX: landedX, landU: landedU, chipId, frames: frames!,
+      board: board.path!.map((p) => ({ ...p, t: p.t + ENTRY_MS })),
+      entryMs: ENTRY_MS, fallMs: ENTRY_MS + board.fallMs, landMs, phase: dropPhase, landX: landedX, landU: landedU, chipId, frames: frames!,
       after: cur,
     },
   };
