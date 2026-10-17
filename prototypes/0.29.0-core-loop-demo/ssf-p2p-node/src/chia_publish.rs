@@ -128,7 +128,7 @@ pub struct WalletLease {
     /// The spend bundle each parked spend pushed, by spend number: what the
     /// liveness question hands the peers again (`ChainAccess::spend_live`),
     /// since the peer protocol has no mempool query (plan §14 (6)). Attached
-    /// right after the parking and saved with it ([`WalletLease::attach_bundle`]).
+    /// in the same write as the parking ([`WalletLease::park_with_bundle`]).
     bundles: std::sync::Mutex<HashMap<u64, SpendBundle>>,
     incoming: std::sync::Mutex<Option<Bytes32>>,
     /// Spend numbers handed out so far (see [`Parking`]).
@@ -252,12 +252,36 @@ impl WalletLease {
     /// back on an explicit rejection; a transport error keeps it. `Err` means
     /// NOTHING is parked and the spend must not leave: the lease is sealed, or
     /// the parking could not be saved and a restart would forget the spend
-    /// (#245 review, round 19).
+    /// (#245 review, round 19). Pushes park through [`Self::park_with_bundle`],
+    /// which saves the bundle in the same write; the bundle-less form serves
+    /// the lease tests.
+    #[cfg(test)]
     pub fn park(&self, coin_ids: impl IntoIterator<Item = Bytes32>) -> Result<Parking, LeaseError> {
         self.park_at(coin_ids, Instant::now())
     }
 
+    #[cfg(test)]
     pub fn park_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) -> Result<Parking, LeaseError> {
+        self.park_with_bundle_at(coin_ids, None, now)
+    }
+
+    /// Park the coins a spend is about to consume AND keep its bundle, in ONE
+    /// write of the lease file, so reconciliation can ask the peers whether
+    /// the spend is still live ([`ChainAccess::spend_live`]) after any
+    /// restart. A parking saved before its bundle would, after a crash between
+    /// the two writes, hold the wallet's coins with no bundle to ask about
+    /// until an outside spend settled them. `Err` means nothing is parked or
+    /// kept and the spend must not leave.
+    pub fn park_with_bundle(&self, coin_ids: impl IntoIterator<Item = Bytes32>, bundle: &SpendBundle) -> Result<Parking, LeaseError> {
+        self.park_with_bundle_at(coin_ids, Some(bundle), Instant::now())
+    }
+
+    fn park_with_bundle_at(
+        &self,
+        coin_ids: impl IntoIterator<Item = Bytes32>,
+        bundle: Option<&SpendBundle>,
+        now: Instant,
+    ) -> Result<Parking, LeaseError> {
         self.ensure_open()?;
         let spend = self.spends.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let coins: Vec<Bytes32> = coin_ids.into_iter().collect();
@@ -267,29 +291,18 @@ impl WalletLease {
                 pending.insert(*id, Parked { at: now, spend });
             }
         }
+        if let Some(bundle) = bundle {
+            self.bundles.lock().unwrap().insert(spend, bundle.clone());
+        }
         if let Err(e) = self.persist() {
-            // Not saved, so not sent: take the parking back whole (by its spend
-            // number, as a rejection would) and let the caller refuse the
-            // spend. The number is used up, so no later spend shares it.
+            // Not saved, so not sent: take the parking and its bundle back whole
+            // (by the spend number, as a rejection would) and let the caller
+            // refuse the spend. The number is used up, so no later spend shares it.
             self.pending.lock().unwrap().retain(|_, parked| parked.spend != spend);
+            self.bundles.lock().unwrap().remove(&spend);
             return Err(LeaseError::Unsaved(e));
         }
         Ok(Parking { spend, coins })
-    }
-
-    /// Keep the bundle a parking is about to push, so reconciliation can ask
-    /// the peers whether it is still live ([`ChainAccess::spend_live`]). Saved
-    /// at once like the parking itself; `Err` means it is not kept and the
-    /// spend must not leave (the caller unparks), since a restart would then
-    /// hold the coins with no way to settle them but the chain.
-    pub fn attach_bundle(&self, parking: &Parking, bundle: &SpendBundle) -> Result<(), LeaseError> {
-        self.ensure_open()?;
-        self.bundles.lock().unwrap().insert(parking.spend, bundle.clone());
-        if let Err(e) = self.persist() {
-            self.bundles.lock().unwrap().remove(&parking.spend);
-            return Err(LeaseError::Unsaved(e));
-        }
-        Ok(())
     }
 
     /// `Err` while the lease is sealed (see [`WalletLease::restore`]). Every
@@ -648,11 +661,7 @@ pub async fn push_parked_with(
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = Bytes32>,
 ) -> Result<(), PushError> {
-    let parking = lease.park(inputs).map_err(PushError::NotSent)?;
-    if let Err(e) = lease.attach_bundle(&parking, &bundle) {
-        lease.unpark(&parking);
-        return Err(PushError::NotSent(e));
-    }
+    let parking = lease.park_with_bundle(inputs, &bundle).map_err(PushError::NotSent)?;
     match client.push_tx(bundle).await {
         Ok(()) => Ok(()),
         Err(ChainError::Refused(why)) => {
@@ -1583,6 +1592,28 @@ mod tests {
         assert!(WALLET_LEASE.is_pending(&coin));
         let text = outcome.unwrap_err().to_string();
         assert!(text.contains("unanswered") && text.contains("stay parked"), "{text}");
+    }
+
+    #[test]
+    fn a_parking_and_its_bundle_land_in_one_write() {
+        let path = std::env::temp_dir().join(format!("ssf-lease-one-write-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let lease = WalletLease::new();
+        lease.restore(&path);
+        let ours = Bytes32::new([5u8; 32]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let parking = lease.park_with_bundle([ours], &bundle).unwrap();
+        let file: LeaseFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.parked.len(), 1, "the coin is parked");
+        assert_eq!(file.bundles.len(), 1, "and its bundle is in the same file, from the same write");
+        assert_eq!(file.bundles[0].spend, parking.spend);
+        // Restored after a crash, the spend still carries the bundle to ask the peers with.
+        let again = WalletLease::new();
+        again.restore(&path);
+        let due = again.due_at(Instant::now() + RECONCILE_GRACE + Duration::from_secs(1));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].bundle.as_ref().map(|b| b.name()), Some(bundle.name()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

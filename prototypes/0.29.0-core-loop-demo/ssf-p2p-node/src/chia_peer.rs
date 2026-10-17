@@ -72,6 +72,16 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a fresh connection is given to announce its peak (the full node
 /// sends `NewPeakWallet` right after the handshake and on every new block).
 pub const PEAK_WAIT: Duration = Duration::from_secs(5);
+/// One bound for writing a frame to a peer: a peer that stopped reading must
+/// not hang its caller (which may hold the wallet lease) on a full socket.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a graceful websocket close may take before the socket is simply
+/// dropped.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A peak announcement older than this is not taken at its word: the peer is
+/// first asked whether the chain has moved past it, so a stalled or half-open
+/// connection cannot report an old height as the current one.
+pub const PEAK_STALE: Duration = Duration::from_secs(600);
 
 /// The chain the node binds to: its handshake name, its genesis challenge (the
 /// §14 (4) binding), the full nodes' default port and the DNS introducers that
@@ -133,13 +143,15 @@ impl Source {
 /// different ones. IPv4 groups by /16 and IPv6 by /32, as Chia's own peer
 /// manager does; loopback groups by PORT, so two full nodes on this machine
 /// (a drill, or the tests' mock nodes) count as distinct while one machine
-/// running one node does not.
+/// running one node does not. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`)
+/// is the IPv4 address it maps, so one peer cannot count twice under its two
+/// spellings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Group([u8; 5]);
 
 pub fn group_of(addr: SocketAddr) -> Group {
     let port = addr.port().to_be_bytes();
-    match addr.ip() {
+    match addr.ip().to_canonical() {
         IpAddr::V4(v4) if v4.is_loopback() => Group([0, 127, 0, port[0], port[1]]),
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -151,6 +163,13 @@ pub fn group_of(addr: SocketAddr) -> Group {
             Group([6, o[0], o[1], o[2], o[3]])
         }
     }
+}
+
+/// A socket address with an IPv4-mapped IPv6 address written as the IPv4
+/// address it maps, so a peer has ONE spelling in the pool, the candidate
+/// queue, the cooling list and the store.
+pub fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// A peer's latest announced peak.
@@ -251,6 +270,10 @@ pub struct PeerConn {
     pending: Arc<Mutex<Pending>>,
     next_id: AtomicU16,
     peak: watch::Receiver<Option<Peak>>,
+    /// When the latest peak was announced (or last proved current).
+    peak_at: Arc<Mutex<Option<Instant>>>,
+    #[cfg(test)]
+    peak_stale_for_test: AtomicBool,
     alive: Arc<AtomicBool>,
     gate: Mutex<RateGate>,
     reader: JoinHandle<()>,
@@ -273,6 +296,7 @@ impl PeerConn {
     /// names what the peer failed: unreachable, not a full node, another
     /// network, or block 0 not descending from the configured genesis.
     pub async fn connect(addr: SocketAddr, source: Source, net: &Network, tls: Arc<rustls::ClientConfig>) -> Result<Arc<Self>> {
+        let addr = canonical(addr);
         let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| anyhow!("tcp connect timed out"))?
@@ -293,7 +317,8 @@ impl PeerConn {
         let (handshake_tx, handshake_rx) = oneshot::channel();
         let pending = Arc::new(Mutex::new(Pending { waiting: HashMap::new(), handshake: Some(handshake_tx) }));
         let alive = Arc::new(AtomicBool::new(true));
-        let reader = tokio::spawn(read_loop(stream, pending.clone(), peak_tx, alive.clone()));
+        let peak_at = Arc::new(Mutex::new(None));
+        let reader = tokio::spawn(read_loop(stream, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
         let conn = Arc::new(Self {
             addr,
             source,
@@ -302,6 +327,9 @@ impl PeerConn {
             pending,
             next_id: AtomicU16::new(1),
             peak: peak_rx,
+            peak_at,
+            #[cfg(test)]
+            peak_stale_for_test: AtomicBool::new(false),
             alive,
             gate: Mutex::new(RateGate::new()),
             reader,
@@ -390,6 +418,35 @@ impl PeerConn {
         }
     }
 
+    /// The latest announced peak, without waiting.
+    pub fn peak_now(&self) -> Option<Peak> {
+        *self.peak.borrow()
+    }
+
+    /// How long ago the peer announced its peak, or last proved it current
+    /// ([`PeerConn::touch_peak`]); `None` before the first announcement.
+    pub fn peak_age(&self) -> Option<Duration> {
+        #[cfg(test)]
+        if self.peak_stale_for_test.load(Ordering::Relaxed) {
+            return Some(PEAK_STALE + Duration::from_secs(1));
+        }
+        self.peak_at.lock().unwrap().map(|at| at.elapsed())
+    }
+
+    /// The peer just proved the chain has not moved past its announced peak:
+    /// count the announcement as fresh again.
+    pub fn touch_peak(&self) {
+        *self.peak_at.lock().unwrap() = Some(Instant::now());
+        #[cfg(test)]
+        self.peak_stale_for_test.store(false, Ordering::Relaxed);
+    }
+
+    /// Make the announced peak read as older than [`PEAK_STALE`] (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_peak_stale(&self) {
+        self.peak_stale_for_test.store(true, Ordering::Relaxed);
+    }
+
     /// Send a message that expects no answer.
     pub async fn send<B>(&self, body: B) -> Result<()>
     where
@@ -466,18 +523,45 @@ impl PeerConn {
         }
     }
 
+    /// Write one frame, within [`SEND_TIMEOUT`]. A write that fails or times
+    /// out marks the connection dead: the socket is not coming back.
     async fn send_message(&self, message: Message) -> Result<()> {
         let bytes = message.to_bytes().context("encoding")?;
-        let mut sink = self.sink.lock().await;
-        sink.send(WsMessage::Binary(bytes)).await.map_err(|e| anyhow!("send to {}: {e}", self.addr))?;
-        Ok(())
+        let sent = tokio::time::timeout(SEND_TIMEOUT, async {
+            let mut sink = self.sink.lock().await;
+            sink.send(WsMessage::Binary(bytes)).await
+        })
+        .await;
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.alive.store(false, Ordering::Relaxed);
+                Err(anyhow!("send to {}: {e}", self.addr))
+            }
+            Err(_) => {
+                self.alive.store(false, Ordering::Relaxed);
+                Err(anyhow!("send to {} timed out after {}s", self.addr, SEND_TIMEOUT.as_secs()))
+            }
+        }
     }
 
-    /// Close the socket; the reader ends and the connection reads dead.
+    /// Close the connection: it reads dead at once, every waiting request
+    /// learns it, the reader stops, and the websocket close frame is attempted
+    /// for at most [`CLOSE_TIMEOUT`] before the socket is simply dropped. A
+    /// peer that stopped reading cannot hold the caller here.
     pub async fn close(&self) {
         self.alive.store(false, Ordering::Relaxed);
-        let mut sink = self.sink.lock().await;
-        let _ = sink.close().await;
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.waiting.clear();
+            pending.handshake = None;
+        }
+        self.reader.abort();
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+            let mut sink = self.sink.lock().await;
+            let _ = sink.close().await;
+        })
+        .await;
     }
 }
 
@@ -485,7 +569,13 @@ impl PeerConn {
 /// announcements, which carry no id, go to their slots; everything else the
 /// node does not subscribe to yet (coin-state and mempool updates) is
 /// dropped. When the socket ends, every waiting request learns it.
-async fn read_loop(mut stream: Stream, pending: Arc<Mutex<Pending>>, peak: watch::Sender<Option<Peak>>, alive: Arc<AtomicBool>) {
+async fn read_loop(
+    mut stream: Stream,
+    pending: Arc<Mutex<Pending>>,
+    peak: watch::Sender<Option<Peak>>,
+    peak_at: Arc<Mutex<Option<Instant>>>,
+    alive: Arc<AtomicBool>,
+) {
     while let Some(frame) = stream.next().await {
         let frame = match frame {
             Ok(frame) => frame,
@@ -512,6 +602,7 @@ async fn read_loop(mut stream: Stream, pending: Arc<Mutex<Pending>>, peak: watch
                     }
                     ProtocolMessageTypes::NewPeakWallet => {
                         if let Ok(announced) = NewPeakWallet::from_bytes(&message.data) {
+                            *peak_at.lock().unwrap() = Some(Instant::now());
                             peak.send_replace(Some(Peak { height: announced.height, header_hash: announced.header_hash }));
                         }
                     }
@@ -649,7 +740,20 @@ pub(crate) mod mock {
     }
 
     pub(crate) async fn spawn(network_id: &str, node_type: NodeType, genesis_prev: Bytes32, peak: Option<Peak>, handler: Handler) -> MockNode {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        spawn_on("127.0.0.1:0".parse().unwrap(), network_id, node_type, genesis_prev, peak, handler).await
+    }
+
+    /// [`spawn`] on a given address (a test that brings a node up on an
+    /// address a lane already knows).
+    pub(crate) async fn spawn_on(
+        bind: SocketAddr,
+        network_id: &str,
+        node_type: NodeType,
+        genesis_prev: Bytes32,
+        peak: Option<Peak>,
+        handler: Handler,
+    ) -> MockNode {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let cert = chia_ssl::ChiaCertificate::generate().unwrap();
         let (chain, key) = pem_identity(&cert).unwrap();
@@ -824,6 +928,13 @@ mod tests {
         let l2: SocketAddr = "127.0.0.1:1002".parse().unwrap();
         assert_ne!(group_of(l1), group_of(l2), "two local full nodes count as distinct");
         assert_ne!(group_of(l1), group_of(a));
+        // An IPv4-mapped IPv6 spelling is the IPv4 address it maps: one group, one address.
+        let mapped: SocketAddr = "[::ffff:203.0.113.5]:58444".parse().unwrap();
+        assert_eq!(group_of(mapped), group_of(a), "mapped and native forms share the /16 group");
+        assert_eq!(canonical(mapped), a);
+        assert_eq!(canonical(a), a);
+        let mapped_loop: SocketAddr = "[::ffff:127.0.0.1]:1001".parse().unwrap();
+        assert_eq!(group_of(mapped_loop), group_of(l1));
     }
 
     #[test]
