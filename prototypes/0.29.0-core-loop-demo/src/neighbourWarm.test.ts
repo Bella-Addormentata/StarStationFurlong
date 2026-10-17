@@ -1,9 +1,10 @@
 /**
  * 🚪🔥 Warm neighbours (neighbourWarm.createNeighbourWarmer), over stand-in
  * sessions: which rooms it dials, when it hangs up, what it hands a join, and
- * how it treats a failed open, a keyed room and a pass that changed.
+ * how it treats a failed open, a keyed room, a pass that changed, and how
+ * many sessions it lets be open or dialling at once.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import type { RoomSession } from './roomSession';
 import { createNeighbourWarmer, MAX_WARM_NEIGHBOURS, RETRY_MS } from './neighbourWarm';
@@ -32,7 +33,6 @@ function fakeSession(roomId: string, fill?: (doc: Y.Doc) => void): FakeSession {
 /** A stand-in opener: each dial waits until the test answers it. */
 function harness() {
   const dials: Array<{ address: string; answer: (s: RoomSession | null) => Promise<void> }> = [];
-  let clock = 0;
   const warmer = createNeighbourWarmer({
     open: (address) =>
       new Promise<RoomSession | null>((resolve) => {
@@ -40,17 +40,26 @@ function harness() {
           address,
           answer: async (s) => {
             resolve(s);
-            await Promise.resolve();
-            await Promise.resolve();
+            await flush();
           },
         });
       }),
-    now: () => clock,
   });
-  return { warmer, dials, tick: (ms: number) => (clock += ms) };
+  return { warmer, dials };
+}
+
+async function flush(): Promise<void> {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
 }
 
 const n = (roomId: string, address = `pass:${roomId}`) => ({ roomId, address });
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('createNeighbourWarmer', () => {
   it('dials each neighbour once, never the current room, up to the cap', () => {
@@ -98,8 +107,8 @@ describe('createNeighbourWarmer', () => {
     expect(dials.map((d) => d.address)).toEqual(['pass:b', 'pass:a']);
   });
 
-  it('hangs up a keyed room and leaves it alone until the retry time', async () => {
-    const { warmer, dials, tick } = harness();
+  it('hangs up a keyed room and dials it again only after the retry time', async () => {
+    const { warmer, dials } = harness();
     warmer.setNeighbours([n('vault')], 'here');
     const s = fakeSession('vault', (d) => d.getMap('roomInfo').set('accessMode', 'keyed'));
     await dials[0].answer(s);
@@ -107,23 +116,57 @@ describe('createNeighbourWarmer', () => {
     expect(warmer.warmStateFor('vault')).toBeNull();
     warmer.setNeighbours([n('vault')], 'here');
     expect(dials).toHaveLength(1);
-    tick(RETRY_MS);
-    warmer.setNeighbours([n('vault')], 'here');
+    vi.advanceTimersByTime(RETRY_MS);
     expect(dials).toHaveLength(2);
   });
 
-  it('retries a failed open only after the retry time', async () => {
-    const { warmer, dials, tick } = harness();
+  it('hangs up a room that turns keyed while warm', async () => {
+    const { warmer, dials } = harness();
+    warmer.setNeighbours([n('vault')], 'here');
+    const s = fakeSession('vault');
+    await dials[0].answer(s);
+    expect(warmer.warmRoomIds()).toEqual(['vault']);
+    s.doc.getMap('roomInfo').set('accessMode', 'keyed');
+    await flush();
+    expect(s.closes).toBe(1);
+    expect(warmer.warmRoomIds()).toEqual([]);
+  });
+
+  it('retries a failed open by itself after the retry time', async () => {
+    const { warmer, dials } = harness();
     warmer.setNeighbours([n('far')], 'here');
     await dials[0].answer(null);
     warmer.setNeighbours([n('far')], 'here');
     expect(dials).toHaveLength(1);
-    tick(RETRY_MS - 1);
-    warmer.setNeighbours([n('far')], 'here');
+    vi.advanceTimersByTime(RETRY_MS - 1);
     expect(dials).toHaveLength(1);
-    tick(1);
-    warmer.setNeighbours([n('far')], 'here');
+    vi.advanceTimersByTime(1);
     expect(dials).toHaveLength(2);
+    await dials[1].answer(fakeSession('far'));
+    expect(warmer.warmRoomIds()).toEqual(['far']);
+  });
+
+  it('cancels the retry of a room that is no longer next door', async () => {
+    const { warmer, dials } = harness();
+    warmer.setNeighbours([n('far')], 'here');
+    await dials[0].answer(null);
+    warmer.setNeighbours([], 'here');
+    vi.advanceTimersByTime(RETRY_MS);
+    expect(dials).toHaveLength(1);
+  });
+
+  it('counts unwanted opens still dialling against the cap', async () => {
+    const { warmer, dials } = harness();
+    const first = Array.from({ length: MAX_WARM_NEIGHBOURS }, (_, i) => n(`a${i}`));
+    const second = Array.from({ length: MAX_WARM_NEIGHBOURS }, (_, i) => n(`b${i}`));
+    warmer.setNeighbours(first, 'here');
+    warmer.setNeighbours(second, 'here');
+    // The first four cannot be called off, so nothing new is dialled yet.
+    expect(dials).toHaveLength(MAX_WARM_NEIGHBOURS);
+    const late = fakeSession('a0');
+    await dials[0].answer(late);
+    expect(late.closes).toBe(1);
+    expect(dials.map((d) => d.address).slice(MAX_WARM_NEIGHBOURS)).toEqual(['pass:b0']);
   });
 
   it('redials when the door holds a new pass for the same room', async () => {

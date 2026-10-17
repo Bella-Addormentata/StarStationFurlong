@@ -10,9 +10,12 @@
  * join's sync starts, exactly like the room-cache restore, so the gate opens
  * as soon as the channel is up and the host ships only what changed since.
  *
- * Read-only: nothing here ever writes to a neighbour's doc. One hop only and
- * at most `max` rooms; a room whose access mode is KEYED is hung up at once.
- * A failed open is retried no sooner than RETRY_MS later. Never throws.
+ * Read-only: nothing here ever writes to a neighbour's doc. One hop only, and
+ * at most `max` sessions open or dialling at once (an open that is no longer
+ * wanted still counts until it finishes, since it cannot be called off). A
+ * room whose access mode is or becomes KEYED is hung up. A failed or refused
+ * open is retried RETRY_MS later while the room is still next door. Never
+ * throws.
  */
 
 import * as Y from 'yjs';
@@ -27,8 +30,6 @@ export interface WarmNeighbour {
 export interface NeighbourWarmerDeps {
   /** Open a background session (roomSession.openRoomSession). */
   open: (address: string) => Promise<RoomSession | null>;
-  /** The clock (tests). */
-  now?: () => number;
 }
 
 export interface NeighbourWarmer {
@@ -59,7 +60,10 @@ interface Entry {
   opening: boolean;
   /** When the last open failed or was refused, else null. */
   failedAt: number | null;
-  wanted: boolean;
+  /** The pending retry, while one is scheduled. */
+  retry: ReturnType<typeof setTimeout> | null;
+  /** Stops watching the session's access mode. */
+  unwatch: (() => void) | null;
 }
 
 /** Is this replica's room set to KEYED entry (roomInfo.accessMode)? */
@@ -72,17 +76,60 @@ function isKeyed(doc: Y.Doc): boolean {
 }
 
 export function createNeighbourWarmer(deps: NeighbourWarmerDeps, max = MAX_WARM_NEIGHBOURS): NeighbourWarmer {
-  const now = deps.now ?? Date.now;
+  /** The rooms wanted warm, by id. */
   const entries = new Map<string, Entry>();
+  /** Opens not yet finished, wanted or not. */
+  let inFlight = 0;
 
-  const drop = (entry: Entry): void => {
+  const hangUp = (entry: Entry): void => {
+    entry.unwatch?.();
+    entry.unwatch = null;
     entry.session?.close();
     entry.session = null;
-    entries.delete(entry.roomId);
+  };
+
+  const drop = (entry: Entry): void => {
+    if (entry.retry !== null) clearTimeout(entry.retry);
+    entry.retry = null;
+    hangUp(entry);
+    if (entries.get(entry.roomId) === entry) entries.delete(entry.roomId);
+  };
+
+  const failed = (entry: Entry): void => {
+    hangUp(entry);
+    entry.failedAt = Date.now();
+    if (entry.retry !== null) clearTimeout(entry.retry);
+    entry.retry = setTimeout(() => {
+      entry.retry = null;
+      pump();
+    }, RETRY_MS);
+  };
+
+  const accept = (entry: Entry, session: RoomSession): void => {
+    entry.session = session;
+    entry.failedAt = null;
+    // A room that turns KEYED while warm is hung up like one that was keyed.
+    const roomInfo = session.doc.getMap('roomInfo');
+    const watch = (): void => {
+      if (!isKeyed(session.doc)) return;
+      // Out of the doc's own transaction before the session is torn down.
+      queueMicrotask(() => {
+        if (entry.session === session) failed(entry);
+      });
+    };
+    roomInfo.observe(watch);
+    entry.unwatch = () => {
+      try {
+        roomInfo.unobserve(watch);
+      } catch {
+        /* doc destroyed */
+      }
+    };
   };
 
   const dial = (entry: Entry): void => {
     entry.opening = true;
+    inFlight++;
     let opened: Promise<RoomSession | null>;
     try {
       opened = deps.open(entry.address);
@@ -92,20 +139,31 @@ export function createNeighbourWarmer(deps: NeighbourWarmerDeps, max = MAX_WARM_
     void opened
       .catch(() => null)
       .then((session) => {
+        inFlight--;
         entry.opening = false;
-        // No longer next door (or the warmer was cleared) while it dialled.
-        if (!entry.wanted || entries.get(entry.roomId) !== entry) {
+        if (entries.get(entry.roomId) !== entry) {
+          // No longer next door (or the warmer was cleared) while it dialled.
           session?.close();
-          if (entries.get(entry.roomId) === entry) entries.delete(entry.roomId);
-          return;
-        }
-        if (!session || session.closed || isKeyed(session.doc)) {
+        } else if (!session || session.closed || isKeyed(session.doc)) {
           session?.close();
-          entry.failedAt = now();
-          return;
+          failed(entry);
+        } else {
+          accept(entry, session);
         }
-        entry.session = session;
+        pump();
       });
+  };
+
+  /** Dial the wanted rooms that need it, within the cap. */
+  const pump = (): void => {
+    for (const entry of entries.values()) {
+      if (entry.session?.closed) hangUp(entry);
+      if (entry.session || entry.opening) continue;
+      if (entry.failedAt !== null && Date.now() - entry.failedAt < RETRY_MS) continue;
+      const open = [...entries.values()].filter((e) => e.session).length;
+      if (open + inFlight >= max) return;
+      dial(entry);
+    }
   };
 
   return {
@@ -118,31 +176,15 @@ export function createNeighbourWarmer(deps: NeighbourWarmerDeps, max = MAX_WARM_
       }
       for (const entry of [...entries.values()]) {
         const next = wanted.get(entry.roomId);
-        if (!next) {
-          entry.wanted = false;
-          if (!entry.opening) drop(entry);
-          else entries.delete(entry.roomId);
-          continue;
-        }
-        // The door now holds a different pass for the same room: redial.
-        if (next.address !== entry.address) {
-          entry.wanted = false;
-          if (!entry.opening) drop(entry);
-          else entries.delete(entry.roomId);
-        }
+        // Gone, or the door now holds a different pass for it: hang up.
+        if (!next || next.address !== entry.address) drop(entry);
       }
       for (const n of wanted.values()) {
-        const entry = entries.get(n.roomId);
-        if (entry) {
-          // A session the far end hung up, or a failure old enough: retry.
-          if (entry.session?.closed) entry.session = null;
-          if (!entry.session && !entry.opening && (entry.failedAt === null || now() - entry.failedAt >= RETRY_MS)) dial(entry);
-          continue;
+        if (!entries.has(n.roomId)) {
+          entries.set(n.roomId, { ...n, session: null, opening: false, failedAt: null, retry: null, unwatch: null });
         }
-        const fresh: Entry = { ...n, session: null, opening: false, failedAt: null, wanted: true };
-        entries.set(n.roomId, fresh);
-        dial(fresh);
       }
+      pump();
     },
 
     warmStateFor(roomId) {
@@ -172,10 +214,7 @@ export function createNeighbourWarmer(deps: NeighbourWarmerDeps, max = MAX_WARM_
     },
 
     closeAll() {
-      for (const entry of [...entries.values()]) {
-        entry.wanted = false;
-        drop(entry);
-      }
+      for (const entry of [...entries.values()]) drop(entry);
     },
   };
 }
