@@ -1281,6 +1281,12 @@ pub async fn heartbeat_loop(
     let mut node_attempt: Option<Instant> = None;
     let mut era_guard_logged = false;
     let peak_client = crate::chia_chain::connect();
+    // The era clock for a signed write is the AGREED peak (§14 (5)). The
+    // watcher's peak in `hub.chia_peak` is one carrier peer's word: enough to
+    // time reads and the inbound marks, not to pick the era a spend is filed
+    // under, since a peer lying about the height would file the record where
+    // no reader looks. Read within `PEAK_MAX_AGE_SECS`, it serves the next ticks.
+    let mut agreed_peak = crate::chia_resolve::ChainPeak::default();
     // Without the watcher nothing ever reads our record back, so the peers'
     // acceptance is the only confirmation there is.
     let watcher_confirms = crate::chia_watch::watch_enabled();
@@ -1326,20 +1332,22 @@ pub async fn heartbeat_loop(
         // last address must say so, or its peers keep dialing the old ones until
         // the record expires. The room publisher below still skips an empty set.
 
-        // The era is the chain's clock: the watcher's last peak while it is
-        // fresh (it reads every tick, but a long or stalled scan can leave
-        // it blocks — or an era — behind), else one chain call of our
-        // own, shared back so the inbound marks and the next tick have it.
-        // Height and read time travel as one snapshot (`ChainPeak`), so a
-        // stale height is never judged by a newer time. No peak, no write.
-        // Read only when something era-bound may be written this tick.
+        // The era is the chain's clock as the agreed lane sees it: the last
+        // agreed peak while it is fresh, else one agreed read now, shared back
+        // so the inbound marks and the watcher's next tick have it (an agreed
+        // height serves them at least as well as a carrier's; the carrier's
+        // never serves here). Height and read time travel as one snapshot
+        // (`ChainPeak`), so a stale height is never judged by a newer time. No
+        // agreed peak, no write. Read only when something era-bound may be
+        // written this tick.
         let now_unix = crate::chia_resolve::unix_now();
         let knock_waiting = !hub.knock_queue.lock().unwrap().is_empty();
-        let mut peak = hub.chia_peak.lock().unwrap().fresh(now_unix).unwrap_or(0);
+        let mut peak = agreed_peak.fresh(now_unix).unwrap_or(0);
         if peak == 0 && (findable || knock_waiting || beacon_sk.is_some()) {
             peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
             if peak > 0 {
-                *hub.chia_peak.lock().unwrap() = crate::chia_resolve::ChainPeak::new(peak, now_unix);
+                agreed_peak = crate::chia_resolve::ChainPeak::new(peak, now_unix);
+                *hub.chia_peak.lock().unwrap() = agreed_peak;
             }
         }
 

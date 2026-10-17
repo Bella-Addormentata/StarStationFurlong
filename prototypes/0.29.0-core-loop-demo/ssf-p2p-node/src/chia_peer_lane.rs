@@ -25,7 +25,9 @@
 //!     `SSF_CHIA_PIN_ONLY=1` makes the pin's verdict final alone (and dials no
 //!     public peer at all). An unreachable pin is a non‑final verdict on money
 //!     paths, never a silent fall‑back to public peers; the presence lane may
-//!     still read from public peers meanwhile.
+//!     still read from public peers meanwhile. A pin that is down is dialled
+//!     again after [`PIN_RETRY_AFTER`] whether or not another pin is up: the
+//!     missing one may be the pin whose network group the pair needs.
 //!   - PUBLIC peers come from three sources: the DNS introducer (fresh this
 //!     run; asked only when the stored and gossiped candidates fall short:
 //!     nothing left to dial, or a money request without a pin that has no
@@ -47,7 +49,10 @@
 //!     (one peer's announcement, inflated or not, evicts nobody), and the two
 //!     peers of an agreed pair must be within that lag of each other. A peer that stops
 //!     answering, or whose connection drops, returns to the queue and is
-//!     dialled again after [`RECONNECT_AFTER`]; pins keep their own retry.
+//!     dialled again after [`RECONNECT_AFTER`]; pins keep their own retry. An
+//!     address that fails [`MAX_DIAL_FAILURES`] dials in a row is given up,
+//!     and a full queue drops such an address for a newcomer, so dead
+//!     addresses cannot shut fresh ones out.
 //!   - Every connection passes the header‑0 genesis binding before it counts
 //!     (`chia_peer.rs`, §14 (4)); a peak announced more than
 //!     [`crate::chia_peer::PEAK_STALE`] ago is checked against the chain
@@ -97,7 +102,8 @@ pub const MAX_CONNS: usize = 4;
 pub const CANDIDATE_CAP: usize = 256;
 /// Candidates dialled at once.
 pub const PARALLEL_DIALS: usize = 4;
-/// Rounds of dialling one request may spend before it gives up.
+/// Rounds of dialling one request may spend before it gives up (the peers the
+/// last round reaches are still judged).
 pub const MAX_ROUNDS: usize = 4;
 /// How long a public address that failed or disagreed is left alone.
 pub const RETRY_AFTER: Duration = Duration::from_secs(600);
@@ -106,6 +112,9 @@ pub const PIN_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// How long a public peer that stopped answering, or whose connection dropped,
 /// waits in the queue before it is dialled again (a brief outage, not a fault).
 pub const RECONNECT_AFTER: Duration = Duration::from_secs(30);
+/// Failed dials in a row after which a public address is given up rather than
+/// queued again (a pin is resolved and retried on its own schedule).
+pub const MAX_DIAL_FAILURES: u8 = 3;
 /// How often the introducer is asked again while peers are wanted.
 pub const INTRODUCE_EVERY: Duration = Duration::from_secs(1800);
 /// How soon it is asked again after a lookup that named nobody (DNS down, the
@@ -171,6 +180,11 @@ struct LaneState {
     introduce_after: Option<Instant>,
     /// When the pins may be dialled again after failing (`None`: now).
     pin_retry_after: Option<Instant>,
+    /// What the last pin dial learnt: how many pin connections the pins can
+    /// give (their resolved addresses, up to the pins' share of the pool).
+    /// `None` before the first dial, or while a pin does not resolve: the pins
+    /// count as short then.
+    pin_target: Option<usize>,
     /// Connections already asked for gossip.
     gossiped: HashSet<SocketAddr>,
     store_loaded: bool,
@@ -181,6 +195,8 @@ struct LaneState {
 struct Candidate {
     addr: SocketAddr,
     source: Source,
+    /// Dials that failed in a row; [`MAX_DIAL_FAILURES`] gives the address up.
+    failures: u8,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -237,7 +253,7 @@ impl Lane {
         {
             let mut state = self.state.try_lock().expect("fresh lane");
             for (addr, source) in seeds {
-                state.candidates.push_back(Candidate { addr: canonical(addr), source });
+                state.candidates.push_back(Candidate { addr: canonical(addr), source, failures: 0 });
             }
         }
         self
@@ -297,7 +313,7 @@ impl Lane {
     #[cfg(test)]
     pub async fn live_count(&self) -> usize {
         let mut state = self.state.lock().await;
-        state.conns.retain(|c| c.alive());
+        self.reap(&mut state);
         state.conns.len()
     }
 
@@ -306,12 +322,16 @@ impl Lane {
         let mut state = self.state.lock().await;
         self.reap(&mut state);
         let pinned = !self.pins.is_empty();
-        for _ in 0..MAX_ROUNDS {
-            // A pin is dialled BEFORE any public peer is accepted, and again
-            // whenever its cooldown has passed: the carrier would otherwise
-            // ride a public fallback for as long as that connection lives.
-            let pin_up = |state: &LaneState| state.conns.iter().any(|c| c.source() == Source::Pin);
-            if pinned && !pin_up(&state) && state.pin_retry_after.is_none_or(|at| Instant::now() >= at) {
+        let pin_up = |state: &LaneState| state.conns.iter().any(|c| c.source() == Source::Pin);
+        // One pass more than there are dial rounds: the peers the LAST round
+        // reached are judged like any other before the request gives up.
+        for round in 0..=MAX_ROUNDS {
+            // Pins are dialled BEFORE any public peer is accepted, and again
+            // whenever their cooldown has passed while one is missing. A live
+            // pin does not stand in for a down one: the missing pin may be the
+            // one whose network group the pair needs, and the carrier would
+            // otherwise ride a public fallback for as long as that lives.
+            if pinned && self.pins_short(&state) && state.pin_retry_after.is_none_or(|at| Instant::now() >= at) {
                 self.dial_pins(&mut state).await;
             }
             if trust == Trust::Agreed {
@@ -331,8 +351,9 @@ impl Lane {
                     self.pins.join(", ")
                 )));
             }
-            if self.pin_only {
-                // Nothing public is ever dialled in this mode.
+            if self.pin_only || round == MAX_ROUNDS {
+                // Nothing public is ever dialled in pin-only mode; otherwise
+                // the dial rounds are spent.
                 break;
             }
             self.refill(&mut state, trust).await;
@@ -420,6 +441,8 @@ impl Lane {
     /// failed) leave the pool and return to the queue, to be dialled again
     /// after [`RECONNECT_AFTER`].
     fn reap(&self, state: &mut LaneState) {
+        let now = Instant::now();
+        state.cooling.retain(|_, until| now < *until);
         let (alive, dead): (Vec<Arc<PeerConn>>, Vec<Arc<PeerConn>>) = state.conns.drain(..).partition(|c| c.alive());
         state.conns = alive;
         for peer in dead {
@@ -443,30 +466,47 @@ impl Lane {
         }
     }
 
-    /// Resolve and dial every pin not connected. A pin outranks any public
-    /// connection for a slot; a pin that fails is left alone for
-    /// [`PIN_RETRY_AFTER`] (its owner may be restarting it) and tried again.
+    /// Are fewer pin connections live than the pins can give? So before the
+    /// first dial, and while a pin does not resolve.
+    fn pins_short(&self, state: &LaneState) -> bool {
+        let up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
+        state.pin_target.is_none_or(|target| up < target)
+    }
+
+    /// Resolve and dial every pin not connected, up to the pins' share of the
+    /// pool. A pin outranks any public connection for a slot; a pin that fails
+    /// is left alone for [`PIN_RETRY_AFTER`] (its owner may be restarting it)
+    /// and tried again, whether or not another pin is up.
     async fn dial_pins(&self, state: &mut LaneState) {
         let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
         let now = Instant::now();
+        // Outside pin-only mode one place is kept for the public peer the
+        // agreement needs, however many addresses the pins resolve to.
+        let pin_cap = if self.pin_only { MAX_CONNS } else { MAX_CONNS - 1 };
+        let mut resolved: HashSet<SocketAddr> = HashSet::new();
+        let mut unresolved = 0;
         let mut targets = Vec::new();
         for pin in &self.pins {
-            for addr in resolve_pin(pin, self.net.port).await {
+            let addrs = resolve_pin(pin, self.net.port).await;
+            if addrs.is_empty() {
+                unresolved += 1;
+            }
+            for addr in addrs {
+                resolved.insert(addr);
                 if !connected.contains(&addr) && !state.cooling.get(&addr).is_some_and(|until| now < *until) {
-                    targets.push(Candidate { addr, source: Source::Pin });
+                    targets.push(Candidate { addr, source: Source::Pin, failures: 0 });
                 }
             }
         }
+        // What the pins can give; a pin that did not resolve keeps them short.
+        state.pin_target = (unresolved == 0).then_some(pin_cap.min(resolved.len()));
         if targets.is_empty() {
             state.pin_retry_after = Some(now + PIN_RETRY_AFTER);
             return;
         }
-        // Outside pin-only mode one place is kept for the public peer the
-        // agreement needs, however many addresses the pins resolve to. The cap
-        // is on LIVE pin connections, not on the addresses tried: a batch that
-        // fails is followed by the next, so a reachable address listed behind
-        // unreachable ones is still reached in this call.
-        let pin_cap = if self.pin_only { MAX_CONNS } else { MAX_CONNS - 1 };
+        // The cap is on LIVE pin connections, not on the addresses tried: a
+        // batch that fails is followed by the next, so a reachable address
+        // listed behind unreachable ones is still reached in this call.
         let mut targets: VecDeque<Candidate> = targets.into();
         loop {
             let pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
@@ -484,7 +524,9 @@ impl Lane {
             }
             self.dial_batch(state, batch, PIN_RETRY_AFTER).await;
         }
-        state.pin_retry_after = if state.conns.iter().any(|c| c.source() == Source::Pin) { None } else { Some(Instant::now() + PIN_RETRY_AFTER) };
+        // Still short (an address failed, or a pin did not resolve): the next
+        // try waits for the cooldown, a live pin or not.
+        state.pin_retry_after = self.pins_short(state).then(|| Instant::now() + PIN_RETRY_AFTER);
     }
 
     /// Top up the candidate queue: the store once; the introducer only when
@@ -504,7 +546,7 @@ impl Lane {
                 .known
                 .iter()
                 .filter_map(|p| p.addr.parse::<SocketAddr>().ok())
-                .map(|addr| Candidate { addr, source: Source::Store })
+                .map(|addr| Candidate { addr, source: Source::Store, failures: 0 })
                 .collect();
             push_candidates(state, stored);
         }
@@ -527,7 +569,7 @@ impl Lane {
             found.truncate(ADDRS_PER_ANSWER);
             let n = found.len();
             state.introduce_after = Some(Instant::now() + if n == 0 { INTRODUCE_RETRY } else { INTRODUCE_EVERY });
-            push_candidates(state, found.into_iter().map(|addr| Candidate { addr, source: Source::Introducer }).collect());
+            push_candidates(state, found.into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect());
             eprintln!("⛓️ chain peers: the introducer named {n} full nodes");
         }
         let unasked: Vec<Arc<PeerConn>> = state.conns.iter().filter(|c| !state.gossiped.contains(&c.addr())).cloned().collect();
@@ -544,7 +586,7 @@ impl Lane {
                     addrs.shuffle(&mut rand::thread_rng());
                     addrs.truncate(ADDRS_PER_ANSWER);
                     let n = addrs.len();
-                    push_candidates(state, addrs.into_iter().map(|addr| Candidate { addr, source: Source::Gossip }).collect());
+                    push_candidates(state, addrs.into_iter().map(|addr| Candidate { addr, source: Source::Gossip, failures: 0 }).collect());
                     eprintln!("⛓️ chain peers: {} gossiped {n} full nodes", conn.addr());
                 }
                 Err(e) => eprintln!("⛓️ chain peers: {} gossip: {e:#}", conn.addr()),
@@ -667,10 +709,17 @@ impl Lane {
                     eprintln!("⛓️ chain peers: {} ({}): {e:#}", cand.addr, cand.source.label());
                     state.cooling.insert(cand.addr, now + cool_for);
                     self.forget(state, cand.addr);
-                    if cand.source != Source::Pin {
-                        // Kept for a later try once the cooldown passes; pins
-                        // are resolved and retried on their own schedule.
-                        push_candidates(state, vec![cand]);
+                    if cand.source == Source::Pin {
+                        // Pins are resolved and retried on their own schedule.
+                        continue;
+                    }
+                    // Kept for a later try once the cooldown passes, until the
+                    // address has failed often enough to be given up.
+                    let failures = cand.failures + 1;
+                    if failures < MAX_DIAL_FAILURES {
+                        push_candidates(state, vec![Candidate { failures, ..cand }]);
+                    } else {
+                        eprintln!("⛓️ chain peers: {} ({}) given up after {failures} failed dials", cand.addr, cand.source.label());
                     }
                 }
             }
@@ -729,6 +778,9 @@ impl Lane {
         for peer in peers.iter().filter(|p| p.source() != Source::Pin) {
             eprintln!("⛓️ chain peers: {} ({}) let go: {why}", peer.addr(), peer.source().label());
             state.conns.retain(|c| c.addr() != peer.addr());
+            // Asked for gossip again if it ever returns (a disagreement is
+            // about its answers, not its address book).
+            state.gossiped.remove(&peer.addr());
             state.cooling.insert(peer.addr(), until);
             self.forget(&mut state, peer.addr());
             close_later(peer.clone());
@@ -746,9 +798,11 @@ impl Lane {
         close_later(peer.clone());
     }
 
+    /// The connections still alive; one found dead here (the carrier looking
+    /// for a stand-in, say) returns to the queue like any dropped peer.
     async fn live_conns(&self) -> Vec<Arc<PeerConn>> {
         let mut state = self.state.lock().await;
-        state.conns.retain(|c| c.alive());
+        self.reap(&mut state);
         state.conns.clone()
     }
 
@@ -1125,7 +1179,7 @@ fn requeue(state: &mut LaneState, peer: &PeerConn, after: Duration) {
         return;
     }
     state.cooling.insert(peer.addr(), Instant::now() + after);
-    push_candidates(state, vec![Candidate { addr: peer.addr(), source: peer.source() }]);
+    push_candidates(state, vec![Candidate { addr: peer.addr(), source: peer.source(), failures: 0 }]);
 }
 
 /// Close a connection off the lane's lock: the websocket close is bounded,
@@ -1138,7 +1192,10 @@ fn close_later(peer: Arc<PeerConn>) {
 /// not queued again (one address, one vote), but a fresh mention of it is
 /// kept: a stored or gossiped peer the introducer names this run counts as an
 /// introducer peer from then on, so a warm start whose store already holds
-/// everything the introducer answers can still form an agreed pair.
+/// everything the introducer answers can still form an agreed pair. A full
+/// queue admits a newcomer in place of the queued address that has failed the
+/// most dials, so dead addresses cannot shut fresh ones out; a queue full of
+/// addresses that never failed keeps what it has.
 fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
     for cand in &mut new {
         cand.addr = canonical(cand.addr);
@@ -1158,6 +1215,12 @@ fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
         }
         if state.candidates.len() < CANDIDATE_CAP {
             state.candidates.push_back(cand);
+        } else if cand.failures == 0 {
+            let worst = state.candidates.iter().map(|c| c.failures).max().filter(|f| *f > 0);
+            if let Some(i) = worst.and_then(|w| state.candidates.iter().position(|c| c.failures == w)) {
+                state.candidates.remove(i);
+                state.candidates.push_back(cand);
+            }
         }
     }
 }
@@ -1441,7 +1504,7 @@ impl ChainAccess for PeerLane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chia_peer::mock::{header_at, reply, spawn, Handler, MockNode};
+    use crate::chia_peer::mock::{header_at, reply, spawn, spawn_on, Handler, MockNode};
     use crate::chia_peer::tls_client_config;
     use chia_protocol::{Coin, Message, NodeType, Program, PuzzleSolutionResponse, TimestampedPeerInfo};
     use chia_traits::Streamable;
@@ -1523,6 +1586,11 @@ mod tests {
 
     fn bundle() -> SpendBundle {
         SpendBundle::new(vec![], chia_bls::G2Element::default())
+    }
+
+    /// A loopback address nothing listens on.
+    async fn closed() -> SocketAddr {
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap()
     }
 
     #[tokio::test]
@@ -1953,8 +2021,8 @@ mod tests {
         let mut state = LaneState::default();
         let native: SocketAddr = "203.0.113.5:58444".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:203.0.113.5]:58444".parse().unwrap();
-        push_candidates(&mut state, vec![Candidate { addr: mapped, source: Source::Gossip }]);
-        push_candidates(&mut state, vec![Candidate { addr: native, source: Source::Introducer }]);
+        push_candidates(&mut state, vec![Candidate { addr: mapped, source: Source::Gossip, failures: 0 }]);
+        push_candidates(&mut state, vec![Candidate { addr: native, source: Source::Introducer, failures: 0 }]);
         assert_eq!(state.candidates.len(), 1, "the mapped spelling and the native one are one address");
         assert_eq!(state.candidates[0].addr, native);
     }
@@ -2023,12 +2091,12 @@ mod tests {
     fn a_queued_stored_candidate_the_introducer_names_becomes_fresh() {
         let mut state = LaneState::default();
         let addr: SocketAddr = "203.0.113.5:58444".parse().unwrap();
-        push_candidates(&mut state, vec![Candidate { addr, source: Source::Store }]);
-        push_candidates(&mut state, vec![Candidate { addr, source: Source::Introducer }]);
+        push_candidates(&mut state, vec![Candidate { addr, source: Source::Store, failures: 0 }]);
+        push_candidates(&mut state, vec![Candidate { addr, source: Source::Introducer, failures: 0 }]);
         assert_eq!(state.candidates.len(), 1, "one address, one vote");
         assert_eq!(state.candidates[0].source, Source::Introducer);
         // Nothing moves away from fresh: a later gossiped mention changes nothing.
-        push_candidates(&mut state, vec![Candidate { addr, source: Source::Gossip }]);
+        push_candidates(&mut state, vec![Candidate { addr, source: Source::Gossip, failures: 0 }]);
         assert_eq!(state.candidates.len(), 1);
         assert_eq!(state.candidates[0].source, Source::Introducer);
     }
@@ -2091,6 +2159,150 @@ mod tests {
         assert_eq!(from_90.iter().map(|r| r.coin.amount).collect::<Vec<_>>(), vec![1, 3]);
         let unspent = records_from(states, false, None);
         assert_eq!(unspent.iter().map(|r| r.coin.amount).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_pin_is_dialled_again_while_another_pin_is_live() {
+        // Two pins, one down. A money read settles on the live pin and the
+        // public peer, but the missing pin is still wanted: it is dialled again
+        // once its cooldown passes, not before, although a pin is up (the one
+        // that is down may be the pin whose network group a pair needs).
+        let first = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let public = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let second_addr = closed().await;
+        let pinned = lane(vec![(public.addr, Source::Introducer)], vec![first.addr.to_string(), second_addr.to_string()], false, None);
+        let money = PeerLane::new(pinned.clone(), Trust::Agreed);
+        let pins_up = |conns: Vec<Arc<PeerConn>>| conns.iter().filter(|c| c.source() == Source::Pin).count();
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        assert_eq!(pins_up(pinned.live_conns().await), 1);
+        let _second = spawn_on(second_addr, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        assert_eq!(pins_up(pinned.live_conns().await), 1, "the cooldown holds: a live pin is no reason to hurry");
+        pinned.expire_pin_cooldown().await;
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        assert_eq!(pins_up(pinned.live_conns().await), 2, "the missing pin is dialled again once the cooldown passes");
+    }
+
+    #[tokio::test]
+    async fn a_peer_reached_in_the_last_dial_round_is_used() {
+        // Dead addresses ahead of one live peer, enough that the live one is
+        // dialled only in the last round: the request still uses it rather
+        // than reporting nobody reachable with a connection open.
+        let live = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let mut seeds = Vec::new();
+        for _ in 0..PER_SOURCE_CAP * (MAX_ROUNDS - 1) {
+            seeds.push((closed().await, Source::Gossip));
+        }
+        seeds.push((live.addr, Source::Gossip));
+        let queue = lane(seeds, vec![], false, None);
+        assert_eq!(PeerLane::new(queue.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        assert_eq!(queue.live_conns().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_peer_evicted_for_disagreeing_is_asked_for_gossip_again_when_it_returns() {
+        // The introducer names A; A gossips B; B contradicts A once, so both
+        // are let go. Named by the introducer again, A answers alike now and
+        // must be asked for gossip again, or B is never found and no pair forms.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agreeing = node(vec![state(1, 90, None)], (1, None), vec![]);
+        let contradicting = node(vec![state(1, 90, Some(99))], (1, None), vec![]);
+        let once: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPuzzleState && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                contradicting(m)
+            } else {
+                agreeing(m)
+            }
+        });
+        let b = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), once).await;
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![state(1, 90, None)], (1, None), vec![b.addr])).await;
+        let net = Network { introducers: vec!["127.0.0.1".to_string()], port: a.addr.port(), ..net() };
+        let found = Arc::new(Lane::new(net, vec![], false, None).with_tls(TLS.clone()));
+        let money = PeerLane::new(found.clone(), Trust::Agreed);
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        assert_eq!(found.live_conns().await.len(), 0);
+        found.state.lock().await.introduce_after = None;
+        found.expire_pin_cooldown().await;
+        assert_eq!(
+            money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(),
+            1,
+            "A's gossip brought B back for the pair"
+        );
+        assert_eq!(found.live_conns().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_dead_connection_the_carrier_fallback_finds_is_queued_again() {
+        // Two peers are up and one connection dies. The carrier's search for a
+        // stand-in finds it dead, and the peer returns to the queue for a later
+        // dial like any dropped peer, rather than vanishing from the lane.
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let pool = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        assert_eq!(PeerLane::new(pool.clone(), Trust::Agreed).peak_height().await.unwrap(), 100);
+        let conns = pool.live_conns().await;
+        assert_eq!(conns.len(), 2);
+        let dead = conns.iter().find(|c| c.addr() == b.addr).unwrap().clone();
+        dead.close().await;
+        for _ in 0..100 {
+            if !dead.alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!dead.alive());
+        assert_eq!(pool.live_conns().await.len(), 1);
+        let state = pool.state.lock().await;
+        assert!(state.candidates.iter().any(|c| c.addr == b.addr), "found dead, the peer is queued again");
+        assert!(state.cooling.contains_key(&b.addr), "and cooling");
+    }
+
+    #[tokio::test]
+    async fn an_address_that_keeps_failing_the_dial_is_given_up() {
+        let dead = closed().await;
+        let stubborn = lane(vec![(dead, Source::Gossip)], vec![], false, None);
+        let carrier = PeerLane::new(stubborn.clone(), Trust::Carrier);
+        for failures in 1..=MAX_DIAL_FAILURES {
+            assert!(carrier.peak_height().await.is_err());
+            {
+                let state = stubborn.state.lock().await;
+                if failures < MAX_DIAL_FAILURES {
+                    assert_eq!(state.candidates.front().map(|c| c.failures), Some(failures), "queued again, its failures counted");
+                } else {
+                    assert!(state.candidates.is_empty(), "given up after {MAX_DIAL_FAILURES} failed dials");
+                }
+            }
+            stubborn.expire_pin_cooldown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_of_failed_addresses_makes_room_for_a_newcomer() {
+        // The queue is full of addresses cooling after a failed dial. A
+        // newcomer takes one of their places (a queue full of addresses that
+        // never failed keeps what it has), and the next request reaches it.
+        let live = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let crowded = lane(vec![], vec![], false, None);
+        {
+            let mut state = crowded.state.lock().await;
+            let until = Instant::now() + RETRY_AFTER;
+            for n in 0..CANDIDATE_CAP {
+                let addr = SocketAddr::from(([10, 0, (n / 256) as u8, (n % 256) as u8], 58444));
+                state.candidates.push_back(Candidate { addr, source: Source::Gossip, failures: 0 });
+                state.cooling.insert(addr, until);
+            }
+            let late = SocketAddr::from(([10, 1, 0, 1], 58444));
+            push_candidates(&mut state, vec![Candidate { addr: late, source: Source::Gossip, failures: 0 }]);
+            assert!(!state.candidates.iter().any(|c| c.addr == late), "nothing queued has failed, so nothing makes room");
+            for c in state.candidates.iter_mut() {
+                c.failures = 1;
+            }
+            push_candidates(&mut state, vec![Candidate { addr: live.addr, source: Source::Gossip, failures: 0 }]);
+            assert_eq!(state.candidates.len(), CANDIDATE_CAP, "the queue stays at its cap");
+            assert!(state.candidates.iter().any(|c| c.addr == live.addr), "the newcomer took a failed address's place");
+        }
+        assert_eq!(PeerLane::new(crowded.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
     }
 
     #[tokio::test]
