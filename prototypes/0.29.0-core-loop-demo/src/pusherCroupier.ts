@@ -511,7 +511,7 @@ function settleOneInsert(
     // lastDrop keeps only the latest.
     recentDrops: [
       ...(state.recentDrops ?? []),
-      { chipId: drop.chipId, hole: request.hole },
+      { chipId: drop.chipId, hole: request.hole, phase: timing.dropPhase, atMs: now, seed },
     ].slice(-RECENT_DROPS_MAX),
   };
   const result = settleCoinPusherInsert(machineId, state, next, request);

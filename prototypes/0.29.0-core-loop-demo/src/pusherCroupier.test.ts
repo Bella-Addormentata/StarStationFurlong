@@ -256,6 +256,9 @@ describe('operateCoinPusher', () => {
     const after = readCoinPusherState(MACHINE)!;
     expect(after.recentDrops).toHaveLength(RECENT_DROPS_MAX);
     expect(after.recentDrops!.at(-1)!.chipId).toBe(after.nextChipId - 1);
+    // Each mark carries what replays its drop, as lastDrop does.
+    const d = after.lastDrop!;
+    expect(after.recentDrops!.at(-1)).toEqual({ chipId: d.chipId, hole: d.hole, phase: d.phase, atMs: d.atMs, seed: d.seed });
   });
 
   it('refuses a request from a player without a chip, and nothing moves', () => {

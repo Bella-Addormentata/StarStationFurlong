@@ -353,6 +353,9 @@ describe('normalizeCoinPusherState', () => {
   it('keeps the recent drop marks, and only their known fields', () => {
     const s = { ...fill(5), recentDrops: [{ chipId: 4, hole: 2, extra: 'x' }, { chipId: 5, hole: 0 }] };
     expect(normalizeCoinPusherState(s)!.recentDrops).toEqual([{ chipId: 4, hole: 2 }, { chipId: 5, hole: 0 }]);
+    const replayable = { ...fill(5), recentDrops: [{ chipId: 4, hole: 2, phase: 0.25, atMs: 900, seed: 7, extra: 1 }] };
+    expect(normalizeCoinPusherState(replayable)!.recentDrops)
+      .toEqual([{ chipId: 4, hole: 2, phase: 0.25, atMs: 900, seed: 7 }]);
   });
 });
 
@@ -365,6 +368,7 @@ describe('recent drops', () => {
 
   it('the guard takes up to RECENT_DROPS_MAX well-formed marks and nothing else', () => {
     expect(isCoinPusherState({ ...base, recentDrops: marks(0, 1, 2) })).toBe(true);
+    expect(isCoinPusherState({ ...base, recentDrops: [{ chipId: 1, hole: 0, phase: 0.5, atMs: 10, seed: 3 }] })).toBe(true);
     const many = Array.from({ length: RECENT_DROPS_MAX + 1 }, (_, i) => ({ chipId: i, hole: 0 }));
     for (const bad of [
       many,
@@ -374,6 +378,11 @@ describe('recent drops', () => {
       [{ hole: 1 }],
       // A mark for a chip the machine hasn't dropped.
       [{ chipId: base.nextChipId, hole: 0 }],
+      // What replays it, malformed.
+      [{ chipId: 1, hole: 0, phase: 1.5 }],
+      [{ chipId: 1, hole: 0, atMs: Infinity }],
+      [{ chipId: 1, hole: 0, seed: 2 ** 32 }],
+      [{ chipId: 1, hole: 0, seed: 0.5 }],
       'marks',
     ]) {
       expect(isCoinPusherState({ ...base, recentDrops: bad as never })).toBe(false);
@@ -1282,7 +1291,9 @@ describe('traceDrop', () => {
 
   it('dates the drop to when its coin went in, on the shared sweep clock', () => {
     const s0 = { ...initialCoinPusherState(OWNER, 1_000), pusherPhase: 0.3 };
-    for (const lag of [0, 250, 990]) {
+    // A press stamped up to MAX_DROP_LEAD_MS ahead of the operator's clock
+    // is in the future when it settles: the drop starts then, not a cycle back.
+    for (const lag of [-MAX_DROP_LEAD_MS, -200, 0, 250, 990]) {
       const pressed = 7_777;
       const phase = currentPusherPhase(s0, pressed);
       const r = processInsert(s0, PLAYER1, 0, phase, 1);

@@ -6,10 +6,12 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  chipsInMachine, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
-  type CoinPusherState, type DropTrace, type PusherHole,
+  chipsInMachine, currentPusherPhase, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
+  type CoinPusherState, type DropTrace, type PusherDropMark, type PusherHole,
 } from './games/coinPusher';
-import { PAY_MS, planReplay, replayView, restingView, TIP_MS, type ReplayGeometry } from './coinPusherReplay';
+import {
+  cabinetView, PAY_MS, planDrops, planReplay, replayView, restingView, TIP_MS, type ReplayGeometry,
+} from './coinPusherReplay';
 
 const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088 };
 
@@ -80,6 +82,25 @@ describe('coin pusher replay', () => {
     expect(after.tip).toBe(0);
   });
 
+  it('draws a coin knocked over as it lands tipping, not arriving flat', () => {
+    // Drop after drop into one hole: a coin left standing is soon landed on.
+    let before = initialCoinPusherState('owner', 0);
+    let hit: { r: ReturnType<typeof processInsert>; trace: DropTrace } | null = null;
+    for (let i = 0; i < 400 && !hit; i++) {
+      const t = traced(before, 1, (i * 0.618) % 1, i);
+      const first = t.trace.frames[0].upper.find((p) => p.chipIds.includes(t.r.chipId));
+      if (!first?.standing) hit = t;
+      else before = t.r.state;
+    }
+    const { r, trace } = hit!;
+    const plan = planReplay(before, trace, GEOM);
+    const tip = plan.transitions.get(r.chipId)!.find((t) => t.kind === 'tip')!;
+    expect(tip.t).toBe(trace.landMs);
+    const mid = replayView(plan, trace.landMs + TIP_MS / 2).table.find((p) => p.chipId === r.chipId)!;
+    expect(mid.tip).toBeGreaterThan(0);
+    expect(mid.tip).toBeLessThan(1);
+  });
+
   it('drops paid chips into the tray, then lets them go', () => {
     let before = fill(120);
     let pay: { r: ReturnType<typeof processInsert>; trace: DropTrace } | null = null;
@@ -96,5 +117,57 @@ describe('coin pusher replay', () => {
     expect(falling.y).toBeLessThan(-GEOM.lowerDrop);
     expect(replayView(plan, out.t + PAY_MS).table.some((p) => p.chipId === chip)).toBe(false);
     expect(chipsInMachine(r.state)).toBe(chipsInMachine(before) + 1 - r.paid);
+  });
+
+  it('replays every drop settled between two frames, each from the one before', () => {
+    // Three drops settled in one operator poll, as pusherCroupier writes them.
+    const before = fill(40);
+    let s = before;
+    const at = 50_000;
+    const marks: PusherDropMark[] = [];
+    for (let i = 0; i < 3; i++) {
+      const hole = i as PusherHole;
+      const phase = currentPusherPhase(s, at + i);
+      const seed = 100 + i;
+      const r = processInsert(s, 'p', hole, phase, seed);
+      marks.push({ chipId: r.chipId, hole, phase, atMs: at + i, seed });
+      s = r.state;
+    }
+    const after: CoinPusherState = { ...s, recentDrops: marks };
+    const plans = planDrops(before, after, GEOM)!;
+    expect(plans.map((p) => p.plan.trace.chipId)).toEqual(marks.map((m) => m.chipId));
+    for (const p of plans) expect(p.startMs).toBeCloseTo(at, -1);
+
+    // All three coins are on the board at once, none on the table yet.
+    const early = cabinetView(plans, at + 50).view!;
+    expect(early.boards.map((b) => b.chipId).sort()).toEqual(marks.map((m) => m.chipId));
+    expect(early.table.some((p) => marks.some((m) => m.chipId === p.chipId))).toBe(false);
+
+    // Once the last coin lands, the table is the last drop's: it ran on the
+    // machine the others left, and it ends on the machine as published.
+    const last = plans[2];
+    const landed = last.startMs + last.plan.trace.landMs;
+    // (Less any coin of an earlier drop still falling: it is drawn there.)
+    const atLanding = cabinetView(plans, landed).view!;
+    const falling = new Set([...atLanding.boards, ...atLanding.chutes].map((c) => c.chipId));
+    expect(atLanding.table).toEqual(
+      replayView(last.plan, landed - last.startMs).table.filter((p) => !falling.has(p.chipId)));
+    const end = last.startMs + last.plan.endMs;
+    expect(cabinetView(plans, end - 1).view).not.toBeNull();
+    const done = cabinetView(plans, end);
+    expect(done.view).toBeNull();
+    expect(done.live).toHaveLength(0);
+    const sort = (ps: { chipId: number }[]) => [...ps].sort((a, b) => a.chipId - b.chipId);
+    expect(sort(replayView(last.plan, last.plan.endMs).table)).toEqual(sort(restingView(after, GEOM)));
+  });
+
+  it("won't replay drops it can't: no seed on a mark, or a gap", () => {
+    const before = fill(20);
+    const r = processInsert(before, 'p', 1, 0.3, 9);
+    const mark = { chipId: r.chipId, hole: 1 as PusherHole, phase: 0.3, atMs: 1_000, seed: 9 };
+    expect(planDrops(before, { ...r.state, recentDrops: [mark] }, GEOM)).toHaveLength(1);
+    expect(planDrops(before, { ...r.state, recentDrops: [{ chipId: r.chipId, hole: 1 }] }, GEOM)).toBeNull();
+    expect(planDrops(fill(19), { ...r.state, recentDrops: [mark] }, GEOM)).toBeNull();
+    expect(planDrops(r.state, r.state, GEOM)).toBeNull();
   });
 });

@@ -339,12 +339,22 @@ export interface PusherLastDrop {
   seed?: number;
 }
 
-/** One settled drop as the cabinet shows it: the hole it came through. */
+/** One settled drop as the cabinet shows it: the hole it came through, and
+ *  what replays it (traceDrop) — so a cabinet that sees several drops settle
+ *  between two of its frames replays each, not just the last. */
 export interface PusherDropMark {
   /** The chip it dropped (a machine's chip ids rise by one a drop). */
   chipId: number;
   hole: PusherHole;
+  /** As on PusherLastDrop; absent on a mark from before the drop board. */
+  phase?: number;
+  atMs?: number;
+  seed?: number;
 }
+
+/** What a drop is replayed from (traceDrop, dropStartMs): a PusherLastDrop
+ *  or a PusherDropMark. */
+export type ReplayableDrop = Pick<PusherDropMark, 'chipId' | 'hole' | 'phase' | 'atMs' | 'seed'>;
 
 /** Settled drops the machine remembers for the cabinet (recentDrops). A poll
  *  settles at most a handful, so this covers several polls' worth landing
@@ -529,7 +539,10 @@ function isRecentDrops(v: unknown, nextChipId: number): v is PusherDropMark[] {
   return Array.isArray(v) && v.length <= RECENT_DROPS_MAX && v.every((d: unknown) => {
     if (typeof d !== 'object' || d === null) return false;
     const m = d as Partial<PusherDropMark>;
-    return isCountInt(m.chipId) && (m.chipId as number) < nextChipId && isHole(m.hole);
+    return isCountInt(m.chipId) && (m.chipId as number) < nextChipId && isHole(m.hole)
+      && (m.phase === undefined || isPhase(m.phase))
+      && (m.atMs === undefined || isTimestamp(m.atMs))
+      && (m.seed === undefined || isSeed(m.seed));
   });
 }
 
@@ -611,7 +624,13 @@ export function normalizeCoinPusherState(v: unknown): CoinPusherState | null {
     if (d.seed !== undefined) out.lastDrop.seed = d.seed;
   }
   if (v.recentDrops) {
-    out.recentDrops = v.recentDrops.map((d) => ({ chipId: d.chipId, hole: d.hole }));
+    out.recentDrops = v.recentDrops.map((d) => {
+      const mark: PusherDropMark = { chipId: d.chipId, hole: d.hole };
+      if (d.phase !== undefined) mark.phase = d.phase;
+      if (d.atMs !== undefined) mark.atMs = d.atMs;
+      if (d.seed !== undefined) mark.seed = d.seed;
+      return mark;
+    });
   }
   return out;
 }
@@ -1180,6 +1199,8 @@ export interface DropTrace {
   /** The table just as the coin lands (it is standing there), then after
    *  every substep of the settle; the last one is the published machine. */
   frames: TableFrame[];
+  /** The machine after the drop: what the next drop is replayed from. */
+  after: CoinPusherState;
 }
 
 /**
@@ -1279,6 +1300,7 @@ export function processInsert(
     ...out,
     trace: {
       board: board.path!, fallMs: board.fallMs, landMs, landX: landedX, landU: landedU, chipId, frames: frames!,
+      after: cur,
     },
   };
 }
@@ -1286,28 +1308,33 @@ export function processInsert(
 /**
  * Replay a settled drop for the cabinet: `before` is the machine as it was
  * just before it (its nextChipId is the drop's chip), `drop` the record the
- * operator published with it. Null when the record can't be replayed (a drop
- * from before the drop board carries no seed) or doesn't follow `before`.
+ * operator published with it (lastDrop, or its recentDrops mark). Null when
+ * the record can't be replayed (a drop from before the drop board carries no
+ * seed) or doesn't follow `before`. Who dropped it doesn't change the drop.
  */
-export function traceDrop(before: CoinPusherState, drop: PusherLastDrop): DropTrace | null {
-  if (drop.seed === undefined || drop.chipId !== before.nextChipId) return null;
+export function traceDrop(before: CoinPusherState, drop: ReplayableDrop): DropTrace | null {
+  if (drop.seed === undefined || drop.phase === undefined || drop.chipId !== before.nextChipId) return null;
   try {
-    return processInsert(before, drop.player, drop.hole, drop.phase, drop.seed, true).trace ?? null;
+    return processInsert(before, 'replay', drop.hole, drop.phase, drop.seed, true).trace ?? null;
   } catch {
     return null;
   }
 }
 
 /**
- * When a drop went into its hole, on the shared sweep clock: the last moment
- * at or before the drop settled (`atMs`) that the pusher stood at the drop's
- * phase. The operator settles a drop within a second of its press (an older
+ * When a drop went into its hole, on the shared sweep clock: the moment the
+ * pusher stood at the drop's phase within the timing window around the
+ * settle (`atMs`) — up to MAX_DROP_LEAD_MS after it (a press stamped by a
+ * clock running ahead of the operator's) and up to the rest of a cycle
+ * before it. The operator honours a press only inside that window (an older
  * one goes in at the operator's own phase), so this is that moment, and a
  * cabinet that replays the drop from it shows it in step with the pusher it
  * is drawing.
  */
-export function dropStartMs(state: CoinPusherState, drop: PusherLastDrop): number {
-  return drop.atMs - mod1(currentPusherPhase(state, drop.atMs) - drop.phase) * PUSHER_PERIOD_MS;
+export function dropStartMs(state: CoinPusherState, drop: { phase: number; atMs: number }): number {
+  const lead = MAX_DROP_LEAD_MS / PUSHER_PERIOD_MS;
+  const behind = mod1(currentPusherPhase(state, drop.atMs) - drop.phase + lead) - lead;
+  return drop.atMs - behind * PUSHER_PERIOD_MS;
 }
 
 // ── Owner-only door: empty the machine ───────────────────────────────────────

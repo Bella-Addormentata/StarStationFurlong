@@ -50,11 +50,13 @@ import type {
 // board — the pusher bar from the sweep clock, the chips from the shared
 // state, and every drop replayed from its seed (coinPusherReplay.ts).
 import {
-  BOARD_H, BOARD_PEGS, CHIP_R, CHIP_T, FIELD_HALF_W, HOLE_US, PEG_R, SETTLE_MS,
-  currentPusherPhase, dropStartMs, pusherFaceX, traceDrop, unseenDropHoles,
+  BOARD_H, BOARD_PEGS, CHIP_R, CHIP_T, FIELD_HALF_W, HOLE_US, PEG_R,
+  RECENT_DROPS_MAX, currentPusherPhase, pusherFaceX, unseenDropHoles,
   type CoinPusherState,
 } from "./games/coinPusher";
-import { planReplay, replayView, restingView, type Replay, type ReplayGeometry, type TablePose } from "./coinPusherReplay";
+import {
+  cabinetView, planDrops, restingView, type CabinetView, type ReplayGeometry, type ScheduledReplay, type TablePose,
+} from "./coinPusherReplay";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
 import { createArcadeScreenPainter } from "./arcadeScreen";
 // 📺 The cabinets' curved CRT tube and its screen shader (#194).
@@ -8583,25 +8585,49 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
    *  the first read, so drops already on the record when it loads don't
    *  flash. */
   let shownUpTo: number | undefined;
-  /** The last record this cabinet saw, and the drop it is replaying (with
-   *  when that drop's coin went in, by this page's clock). */
+  /** The last record this cabinet saw, and the drops it is replaying (each
+   *  with when its coin went in, by this page's clock), oldest first. */
   let seen: CoinPusherState | null = null;
-  let replay: { plan: Replay; startMs: number } | null = null;
+  let replays: ScheduledReplay[] = [];
 
-  /** A new record: replay it when it is one drop on from the record before,
-   *  carries the seed to replay it with, and isn't over already. */
+  /** A new record: queue a replay of every drop since the record before
+   *  (several can settle between two frames), or, when they can't all be
+   *  replayed, drop the replays and draw the record. */
   const noticeRecord = (state: CoinPusherState | null, now: number): void => {
     const prev = seen;
     seen = state;
     if (!state || (prev && prev.tick === state.tick && prev.nextChipId === state.nextChipId)) return;
-    replay = null;
-    const drop = state.lastDrop;
-    if (!prev || !drop || state.nextChipId !== prev.nextChipId + 1) return;
-    const trace = traceDrop(prev, drop);
-    if (!trace) return;
-    const startMs = dropStartMs(state, drop);
-    if (now - startMs >= trace.landMs + SETTLE_MS) return;
-    replay = { plan: planReplay(prev, trace, geom), startMs };
+    const planned = prev ? planDrops(prev, state, geom) : null;
+    replays = planned
+      ? [...replays, ...planned.filter((r) => now - r.startMs < r.plan.endMs)].slice(-RECENT_DROPS_MAX)
+      : [];
+  };
+
+  /** A coin on its way down the board or the chute. */
+  const drawFalling = (idx: number, view: CabinetView): number => {
+    for (const b of view.boards) {
+      const chip = acquireChip(idx++);
+      chip.position.set(tableX(b.u), boardY(b.h), BOARD_Z);
+      chip.rotation.set(Math.PI / 2, b.spin, 0);
+      chip.material = chipLooks[b.chipId % 2];
+    }
+    for (const c of view.chutes) {
+      // Off the bottom of the board onto the bar's shelf, then off its
+      // front edge onto the platform, standing.
+      const chip = acquireChip(idx++);
+      const fromY = BOARD_Y0, toY = UPPER_Y + CHIP_RAD;
+      const z = tableZ(c.landX);
+      const s = c.s;
+      chip.position.set(
+        tableX(c.exitU + (c.landU - c.exitU) * s),
+        s < 0.5 ? fromY - (fromY - (UPPER_Y + 0.04 + CHIP_RAD)) * (s / 0.5) ** 2
+          : (UPPER_Y + 0.04 + CHIP_RAD) - (UPPER_Y + 0.04 - toY + CHIP_RAD) * ((s - 0.5) / 0.5) ** 2,
+        BOARD_Z + (z - BOARD_Z) * Math.min(1, s / 0.75),
+      );
+      chip.rotation.set(Math.PI / 2, c.spin, 0);
+      chip.material = chipLooks[c.chipId % 2];
+    }
+    return idx;
   };
 
   const handle: CoinPusherVisualHandle = {
@@ -8629,33 +8655,12 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       let idx = 0;
       if (state) {
         let poses: TablePose[];
-        const view = replay ? replayView(replay.plan, Math.max(0, now - replay.startMs)) : null;
-        if (view && !view.done) {
+        const { view, live } = cabinetView(replays, now);
+        replays = live;
+        if (view) {
           poses = view.table;
-          if (view.board) {
-            const chip = acquireChip(idx++);
-            chip.position.set(tableX(view.board.u), boardY(view.board.h), BOARD_Z);
-            chip.rotation.set(Math.PI / 2, view.board.spin, 0);
-            chip.material = chipLooks[view.board.chipId % 2];
-          } else if (view.chute) {
-            // Off the bottom of the board onto the bar's shelf, then off its
-            // front edge onto the platform, standing.
-            const c = view.chute;
-            const chip = acquireChip(idx++);
-            const fromY = BOARD_Y0, toY = UPPER_Y + CHIP_RAD;
-            const z = tableZ(c.landX);
-            const s = c.s;
-            chip.position.set(
-              tableX(c.exitU + (c.landU - c.exitU) * s),
-              s < 0.5 ? fromY - (fromY - (UPPER_Y + 0.04 + CHIP_RAD)) * (s / 0.5) ** 2
-                : (UPPER_Y + 0.04 + CHIP_RAD) - (UPPER_Y + 0.04 - toY + CHIP_RAD) * ((s - 0.5) / 0.5) ** 2,
-              BOARD_Z + (z - BOARD_Z) * Math.min(1, s / 0.75),
-            );
-            chip.rotation.set(Math.PI / 2, c.spin, 0);
-            chip.material = chipLooks[c.chipId % 2];
-          }
+          idx = drawFalling(idx, view);
         } else {
-          replay = null;
           poses = restingView(state, geom);
         }
         for (const p of poses) poseChip(acquireChip(idx++), p);

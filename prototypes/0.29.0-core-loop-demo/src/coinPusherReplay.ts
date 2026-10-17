@@ -17,7 +17,7 @@
  */
 
 import {
-  CHIP_R, PLAT_LOW_FRONT, PLAT_UP_FRONT,
+  CHIP_R, dropStartMs, PLAT_LOW_FRONT, PLAT_UP_FRONT, RECENT_DROPS_MAX, traceDrop,
   type CoinPusherState, type DropTrace, type Pile,
 } from './games/coinPusher';
 
@@ -142,7 +142,10 @@ export function planReplay(before: CoinPusherState, trace: DropTrace, geom: Repl
     else transitions.set(id, [tr]);
   };
   let endMs = frames.length ? frames[frames.length - 1].t : trace.landMs;
-  let prev = start;
+  // The coin lands standing where the trace says; the landing's own settle
+  // (frames[0]) may already have tipped it, which is a tip to draw too.
+  let prev = new Map(start);
+  prev.set(trace.chipId, { lower: false, x: trace.landX, u: trace.landU, level: 0, standing: true });
   let prevT = trace.landMs;
   for (const frame of frames) {
     for (const [id, was] of prev) {
@@ -253,4 +256,66 @@ export function replayView(replay: Replay, t: number): ReplayView {
 /** The machine at rest, as the cabinet draws it outside a replay. */
 export function restingView(state: CoinPusherState, geom: ReplayGeometry): TablePose[] {
   return [...placements(state.upper, state.lower)].map(([id, p]) => poseOf(id, p, geom));
+}
+
+/** A drop's replay and when its coin went in (by the shared sweep clock). */
+export interface ScheduledReplay {
+  plan: Replay;
+  startMs: number;
+}
+
+/**
+ * Every drop between two records the cabinet saw, each replayed from the
+ * machine the one before it left: the operator can settle several drops
+ * between two frames, and the record's recentDrops marks carry what replays
+ * each. Null when any of them can't be replayed (a mark from before the drop
+ * board, a gap, a new or emptied machine): the cabinet then just draws the
+ * record.
+ */
+export function planDrops(prev: CoinPusherState, next: CoinPusherState, geom: ReplayGeometry): ScheduledReplay[] | null {
+  const n = next.nextChipId - prev.nextChipId;
+  if (n <= 0 || n > RECENT_DROPS_MAX) return null;
+  const marks = (next.recentDrops ?? []).filter((d) => d.chipId >= prev.nextChipId);
+  if (marks.length !== n) return null;
+  const out: ScheduledReplay[] = [];
+  let before = prev;
+  for (const mark of marks) {
+    if (mark.phase === undefined || mark.atMs === undefined) return null;
+    const trace = traceDrop(before, mark);
+    if (!trace) return null;
+    out.push({ plan: planReplay(before, trace, geom), startMs: dropStartMs(next, { phase: mark.phase, atMs: mark.atMs }) });
+    before = trace.after;
+  }
+  return out;
+}
+
+/** Everything the cabinet draws while drops are replaying: the table, and
+ *  every coin still on the board or down the chute. */
+export interface CabinetView {
+  table: TablePose[];
+  boards: BoardPose[];
+  chutes: ChutePose[];
+}
+
+/**
+ * The cabinet's view at `now` of the drops it is replaying, oldest first, and
+ * which of them are still going. Each drop's physics ran on the machine the
+ * one before it left, so the table comes from the latest drop whose coin has
+ * landed — which cuts short any earlier drop's settle still playing — or,
+ * while none has, from the oldest's table before its coin; the coins on the
+ * board and down the chute come from every drop. Null when all are over:
+ * draw the machine record.
+ */
+export function cabinetView(replays: readonly ScheduledReplay[], now: number): { view: CabinetView | null; live: ScheduledReplay[] } {
+  const views = replays.map((r) => replayView(r.plan, Math.max(0, now - r.startMs)));
+  const landed = replays.map((r) => now - r.startMs >= r.plan.trace.landMs);
+  const k = landed.lastIndexOf(true);
+  const live = replays.filter((_, i) => (i < k ? !landed[i] : !views[i].done));
+  if (live.length === 0) return { view: null, live };
+  const base = views[Math.max(0, k)];
+  const falling = views.filter((_, i) => !landed[i]);
+  const boards = falling.flatMap((v) => (v.board ? [v.board] : []));
+  const chutes = falling.flatMap((v) => (v.chute ? [v.chute] : []));
+  const inFlight = new Set([...boards, ...chutes].map((c) => c.chipId));
+  return { view: { table: base.table.filter((p) => !inFlight.has(p.chipId)), boards, chutes }, live };
 }
