@@ -1,40 +1,44 @@
-//! The chain-access seam (#231 P7 / TODO #13 phase 0 — S‑0 step 1).
+//! The chain-access seam (#231 P7 / TODO #13 — S‑0).
 //!
 //! Every chain read and every push the node makes goes through [`ChainAccess`]:
 //! the presence reader and the beat watcher (`chia_resolve`, `chia_watch`), the
 //! publisher and its wallet lease (`chia_publish`), the faucet dish
 //! (`chia_faucet`) and the craps fairness records (`chia_craps_fair`). The one
-//! place the node chooses HOW it reaches the chain is [`connect`].
+//! place the node chooses HOW it reaches the chain is [`connect`] (money
+//! paths) and [`connect_carrier`] (the presence lane).
 //!
-//! Today the only implementation is the testnet11 HTTPS gateway, [`Gateway`]
-//! over `chia-sdk-coinset`: the central infrastructure that plan §14 (5) and
-//! the TODO item "Remove the coinset.org dependency from the chain lane"
-//! retire. S‑0 step 2 adds the peer-protocol implementation behind this same
-//! trait and proves it path by path (presence first, then publish, faucet and
-//! craps-fair); step 3 deletes [`Gateway`] and `chia-sdk-coinset` leaves
-//! `Cargo.toml` (Dorkmo, 2026‑10‑12: removed outright, no fallback). Nothing
-//! outside this file names the gateway crate, so that removal touches this
-//! file and `Cargo.toml` alone.
+//! Since S‑0 step 2 the only implementation is the PEER LANE
+//! ([`crate::chia_peer_lane::PeerLane`]): Chia full-node peers over the
+//! light-wallet protocol, as plan §6 and §14 ratified (#231 D1). The testnet11
+//! HTTPS gateway that step 1 put behind this trait is gone with it, and
+//! `chia-sdk-coinset` has left `Cargo.toml` (Dorkmo, 2026‑10‑12: removed
+//! outright, no fallback); nothing the shipped node runs can name coinset.org.
 //!
-//! The trait speaks the node's vocabulary, not the gateway's:
+//! The trait speaks the node's vocabulary, not a transport's:
 //!   - a LISTING ([`CoinListing`]) is the records found plus whether the source
 //!     cut it short and the cursor to continue it with — the two facts every
 //!     caller already pages on; a listing cut short with no cursor stays
 //!     visible as such (the wallet lease and the wallet read it as incomplete);
-//!   - a failure is either [`ChainError::Unanswered`] (transport: the request
-//!     may or may not have reached the chain, so a push may be live) or
+//!   - a failure is either [`ChainError::Unanswered`] (no authoritative answer:
+//!     a transport failure, or peers that do not agree — the request may or
+//!     may not have reached the chain, so a push may be live) or
 //!     [`ChainError::Refused`] (the source answered and said no, with its
 //!     reason, so a refused push spent nothing). `push_parked` keeps its two
 //!     outcomes apart on exactly that distinction (#245 review, round 14).
 //!
-//! The seam changes no behaviour: every request, parameter and error path maps
-//! one to one onto what the call sites did against the gateway client. It only
-//! moves the choice of transport into one place.
+//! Two shapes changed with the peer lane, because the wallet protocol has them
+//! differently: a spend comes back as its puzzle reveal and solution
+//! ([`PuzzleAndSolution`]; the callers never read the coin), and the mempool
+//! question is asked by handing the spend bundle over again
+//! ([`ChainAccess::spend_live`]; plan §14 (6): there is no mempool query).
 
 use std::future::Future;
+use std::sync::{Arc, LazyLock};
 
-use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient, GetCoinRecordsResponse};
+use chia_protocol::{Bytes32, Coin, Program, SpendBundle};
+
+use crate::chia_peer::Network;
+use crate::chia_peer_lane::{Lane, PeerLane, Trust};
 
 /// One coin as the chain lists it: the coin, the height of the block that
 /// confirmed it, and whether (and at which height) it was spent.
@@ -60,11 +64,21 @@ pub struct CoinListing {
     pub next_cursor: Option<String>,
 }
 
+/// A spend as the chain serves it: the puzzle that was revealed and the
+/// solution it ran with. Everything the node reads out of a spend (the
+/// `create_coin` memos) comes from running these two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PuzzleAndSolution {
+    pub puzzle_reveal: Program,
+    pub solution: Program,
+}
+
 /// Why a chain request failed.
 #[derive(Debug)]
 pub enum ChainError {
-    /// No answer: a transport failure (a timeout above all). The request may
-    /// have reached the chain all the same — a push may be live in the mempool.
+    /// No authoritative answer: a transport failure (a timeout above all), or
+    /// peers that did not agree. The request may have reached the chain all
+    /// the same — a push may be live in the mempool.
     Unanswered(anyhow::Error),
     /// The source answered and refused, with its reason. It holds nothing of
     /// the request: a refused push spent nothing.
@@ -83,12 +97,9 @@ impl std::fmt::Display for ChainError {
 impl std::error::Error for ChainError {}
 
 /// What the node asks of the chain. Seven operations, one per thing a call
-/// site does today; S‑0 step 2 adds coin-state subscription here when the peer
-/// implementation replaces the mempool probe with `TransactionAck` plus a
-/// subscription (plan §14 (6)). The write-side operations
-/// (`coin_records_by_names`, `coin_in_mempool`, `push_tx`) have callers only in
-/// a `chia-publish` build; the trait keeps one shape in both builds so an
-/// implementation is written once.
+/// site does. The write-side operations (`coin_records_by_names`,
+/// `spend_live`, `push_tx`) have callers only in a `chia-publish` build; the
+/// trait keeps one shape in both builds so an implementation is written once.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub trait ChainAccess: Send + Sync {
     /// Coins whose creating spend carried `hint` as a memo, confirmed at
@@ -127,13 +138,17 @@ pub trait ChainAccess: Send + Sync {
         &self,
         coin_id: Bytes32,
         height: u32,
-    ) -> impl Future<Output = Result<Option<CoinSpend>, ChainError>> + Send;
+    ) -> impl Future<Output = Result<Option<PuzzleAndSolution>, ChainError>> + Send;
 
     /// The height of the chain's current peak.
     fn peak_height(&self) -> impl Future<Output = Result<u32, ChainError>> + Send;
 
-    /// Whether the mempool holds a spend bundle that consumes `coin_id`.
-    fn coin_in_mempool(&self, coin_id: Bytes32) -> impl Future<Output = Result<bool, ChainError>> + Send;
+    /// Whether a spend pushed earlier is still live: `bundle` is handed to the
+    /// mempool again (the wallet protocol has no mempool query; plan §14 (6)).
+    /// `Ok(true)`: the mempool holds it, or took it back; `Ok(false)`: the
+    /// mempool refuses it now, so the spend is dead — its inputs went to
+    /// another spend, or the bundle no longer passes — and will never land.
+    fn spend_live(&self, bundle: SpendBundle) -> impl Future<Output = Result<bool, ChainError>> + Send;
 
     /// Hand `bundle` to the mempool. `Ok` means accepted; [`ChainError::Refused`]
     /// means the source said no and nothing was spent; [`ChainError::Unanswered`]
@@ -141,163 +156,38 @@ pub trait ChainAccess: Send + Sync {
     fn push_tx(&self, bundle: SpendBundle) -> impl Future<Output = Result<(), ChainError>> + Send;
 }
 
-/// The chain the node reads and writes through today: the testnet11 HTTPS
-/// gateway. This alias is what the call sites construct; when S‑0 step 2 lands
-/// the peer implementation it points there and nothing else moves.
-pub type Chain = Gateway;
+/// The chain the node reads and writes through: the peer lane.
+pub type Chain = PeerLane;
 
-/// The node's one construction site for chain access. No I/O happens here: the
-/// gateway client opens its connections on the first request.
+/// The process's one lane: its pins and mode come from the environment
+/// (`SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY`), its known-good peers from
+/// `chia_peers.json`. Connections open on the first request and are shared by
+/// every handle.
+static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| Arc::new(Lane::from_env(Network::testnet11())));
+
+/// Chain access for MONEY paths (plan §14 (5)): two peers must agree, or the
+/// pin decides in pin-only mode. The publisher's wallet and lease, the faucet
+/// and the craps fairness lane construct this. No I/O happens here.
 pub fn connect() -> Chain {
-    Gateway { client: CoinsetClient::testnet11() }
+    PeerLane::new(LANE.clone(), Trust::Agreed)
 }
 
-/// The testnet11 HTTPS gateway (`https://testnet11.api.coinset.org`, pinned in
-/// `chia-sdk-coinset`): the implementation S‑0 step 3 deletes. Every method
-/// maps the gateway's answer onto the seam's types: a transport error is
-/// [`ChainError::Unanswered`], `success: false` is [`ChainError::Refused`] with
-/// the gateway's reason (or "no reason given"), except for a puzzle-and-solution
-/// lookup, where the gateway says `success: false` for a coin it has no spend
-/// for and the answer is `None`.
-pub struct Gateway {
-    client: CoinsetClient,
+/// Chain access for the PRESENCE lane (plan §14 (5)): the first reachable
+/// peer. The resolver and the watcher construct this: their records are
+/// signed and sealed, so the chain is only their carrier.
+pub fn connect_carrier() -> Chain {
+    PeerLane::new(LANE.clone(), Trust::Carrier)
 }
 
-fn unanswered<E: std::error::Error + Send + Sync + 'static>(e: E) -> ChainError {
-    ChainError::Unanswered(anyhow::Error::new(e))
-}
-
-fn reason(error: Option<String>) -> String {
-    error.unwrap_or_else(|| "no reason given".to_string())
-}
-
-fn listing(resp: GetCoinRecordsResponse) -> Result<CoinListing, ChainError> {
-    if !resp.success {
-        return Err(ChainError::Refused(reason(resp.error)));
-    }
-    Ok(CoinListing {
-        records: resp
-            .coin_records
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| CoinRecord {
-                coin: r.coin,
-                confirmed_block_index: r.confirmed_block_index,
-                spent: r.spent,
-                spent_block_index: r.spent_block_index,
-            })
-            .collect(),
-        truncated: resp.truncated.unwrap_or(false),
-        next_cursor: resp.next_cursor,
-    })
-}
-
-impl ChainAccess for Gateway {
-    fn coin_records_by_hint(
-        &self,
-        hint: Bytes32,
-        start_height: Option<u32>,
-        include_spent: bool,
-        cursor: Option<String>,
-    ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
-        async move {
-            let resp = self
-                .client
-                .get_coin_records_by_hint(hint, start_height, None, Some(include_spent), cursor)
-                .await
-                .map_err(unanswered)?;
-            listing(resp)
-        }
-    }
-
-    fn coin_records_by_puzzle_hash(
-        &self,
-        puzzle_hash: Bytes32,
-        include_spent: bool,
-        cursor: Option<String>,
-    ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
-        async move {
-            let resp = self
-                .client
-                .get_coin_records_by_puzzle_hash(puzzle_hash, None, None, Some(include_spent), cursor)
-                .await
-                .map_err(unanswered)?;
-            listing(resp)
-        }
-    }
-
-    fn coin_records_by_names(
-        &self,
-        names: Vec<Bytes32>,
-        include_spent: bool,
-        cursor: Option<String>,
-    ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
-        async move {
-            let resp = self
-                .client
-                .get_coin_records_by_names(names, None, None, Some(include_spent), cursor)
-                .await
-                .map_err(unanswered)?;
-            listing(resp)
-        }
-    }
-
-    fn puzzle_and_solution(
-        &self,
-        coin_id: Bytes32,
-        height: u32,
-    ) -> impl Future<Output = Result<Option<CoinSpend>, ChainError>> + Send {
-        async move {
-            let resp = self
-                .client
-                .get_puzzle_and_solution(coin_id, Some(height))
-                .await
-                .map_err(unanswered)?;
-            Ok(if resp.success { resp.coin_solution } else { None })
-        }
-    }
-
-    fn peak_height(&self) -> impl Future<Output = Result<u32, ChainError>> + Send {
-        async move {
-            let resp = self.client.get_blockchain_state().await.map_err(unanswered)?;
-            if !resp.success {
-                return Err(ChainError::Refused(reason(resp.error)));
-            }
-            resp.blockchain_state
-                .map(|s| s.peak.height)
-                .ok_or_else(|| ChainError::Refused("a successful answer carried no blockchain state".to_string()))
-        }
-    }
-
-    fn coin_in_mempool(&self, coin_id: Bytes32) -> impl Future<Output = Result<bool, ChainError>> + Send {
-        async move {
-            let resp = self
-                .client
-                .get_mempool_items_by_coin_name(coin_id)
-                .await
-                .map_err(unanswered)?;
-            if !resp.success {
-                return Err(ChainError::Refused(reason(resp.error)));
-            }
-            Ok(resp.mempool_items.is_some_and(|items| !items.is_empty()))
-        }
-    }
-
-    fn push_tx(&self, bundle: SpendBundle) -> impl Future<Output = Result<(), ChainError>> + Send {
-        async move {
-            let resp = self.client.push_tx(bundle).await.map_err(unanswered)?;
-            if !resp.success {
-                return Err(ChainError::Refused(reason(resp.error)));
-            }
-            Ok(())
-        }
-    }
+/// One line for the startup log: which peers, which posture.
+pub fn describe() -> String {
+    LANE.describe()
 }
 
 /// Chains for tests: no socket is ever opened. [`testing::Unanswering`] answers
-/// nothing (every request fails as [`ChainError::Unanswered`], what a dead
-/// gateway or a timeout produces), the shape S‑0 step 3 keeps when the gateway
-/// goes: tests run against a mock or the peer simulator, never a host.
+/// nothing (every request fails as [`ChainError::Unanswered`], what unreachable
+/// peers produce). Tests run against this mock or the mock full node in
+/// `chia_peer`, never a host.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -342,7 +232,7 @@ pub(crate) mod testing {
             &self,
             _coin_id: Bytes32,
             _height: u32,
-        ) -> impl Future<Output = Result<Option<CoinSpend>, ChainError>> + Send {
+        ) -> impl Future<Output = Result<Option<PuzzleAndSolution>, ChainError>> + Send {
             async { Err(silence()) }
         }
 
@@ -350,7 +240,7 @@ pub(crate) mod testing {
             async { Err(silence()) }
         }
 
-        fn coin_in_mempool(&self, _coin_id: Bytes32) -> impl Future<Output = Result<bool, ChainError>> + Send {
+        fn spend_live(&self, _bundle: SpendBundle) -> impl Future<Output = Result<bool, ChainError>> + Send {
             async { Err(silence()) }
         }
 
@@ -363,74 +253,6 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia_sdk_coinset::{CoinRecord as GatewayRecord, GetMempoolItemsResponse, GetPuzzleAndSolutionResponse, PushTxResponse};
-
-    fn coin(seed: u8) -> Coin {
-        Coin::new(Bytes32::new([seed; 32]), Bytes32::new([seed.wrapping_add(1); 32]), u64::from(seed))
-    }
-
-    fn gateway_record(seed: u8, confirmed: u32, spent_at: Option<u32>) -> GatewayRecord {
-        GatewayRecord {
-            coin: coin(seed),
-            coinbase: false,
-            confirmed_block_index: confirmed,
-            spent: spent_at.is_some(),
-            spent_block_index: spent_at.unwrap_or(0),
-            timestamp: 1_791_700_000,
-        }
-    }
-
-    #[test]
-    fn a_listing_keeps_the_records_the_cut_and_the_cursor() {
-        let resp = GetCoinRecordsResponse {
-            coin_records: Some(vec![gateway_record(1, 100, None), gateway_record(2, 90, Some(95))]),
-            error: None,
-            success: true,
-            truncated: Some(true),
-            next_cursor: Some("page-2".to_string()),
-        };
-        let got = listing(resp).unwrap();
-        assert_eq!(
-            got,
-            CoinListing {
-                records: vec![
-                    CoinRecord { coin: coin(1), confirmed_block_index: 100, spent: false, spent_block_index: 0 },
-                    CoinRecord { coin: coin(2), confirmed_block_index: 90, spent: true, spent_block_index: 95 },
-                ],
-                truncated: true,
-                next_cursor: Some("page-2".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn a_listing_without_records_or_flags_is_complete_and_empty() {
-        // A Chia full node answers without `truncated` or a cursor; the gateway
-        // leaves `coin_records` out when nothing matched. Both read as a
-        // complete, empty listing — what every caller did with the raw answer.
-        let resp = GetCoinRecordsResponse { coin_records: None, error: None, success: true, truncated: None, next_cursor: None };
-        assert_eq!(listing(resp).unwrap(), CoinListing::default());
-    }
-
-    #[test]
-    fn a_refusal_carries_the_reason_or_says_none_was_given() {
-        let refused = GetCoinRecordsResponse {
-            coin_records: None,
-            error: Some("hint store unavailable".to_string()),
-            success: false,
-            truncated: None,
-            next_cursor: None,
-        };
-        match listing(refused) {
-            Err(ChainError::Refused(why)) => assert_eq!(why, "hint store unavailable"),
-            other => panic!("{other:?}"),
-        }
-        let silent = GetCoinRecordsResponse { coin_records: None, error: None, success: false, truncated: None, next_cursor: None };
-        match listing(silent) {
-            Err(ChainError::Refused(why)) => assert_eq!(why, "no reason given"),
-            other => panic!("{other:?}"),
-        }
-    }
 
     #[test]
     fn the_two_failures_read_apart() {
@@ -452,15 +274,9 @@ mod tests {
     }
 
     #[test]
-    fn gateway_answer_shapes_the_seam_relies_on_still_exist() {
-        // The three one-field answers the gateway implementation reads: a push,
-        // a mempool probe and a puzzle-and-solution lookup. Constructing them
-        // here pins the field names the crate exposes.
-        let push = PushTxResponse { status: Some("SUCCESS".to_string()), error: None, success: true };
-        assert!(push.success);
-        let probe = GetMempoolItemsResponse { mempool_items: Some(vec![]), error: None, success: true };
-        assert!(!probe.mempool_items.is_some_and(|items| !items.is_empty()), "an empty item list is not 'in the mempool'");
-        let spend = GetPuzzleAndSolutionResponse { coin_solution: None, error: Some("not spent".to_string()), success: false };
-        assert!(!spend.success && spend.coin_solution.is_none());
+    fn the_two_handles_carry_their_trust_without_opening_anything() {
+        assert_eq!(connect().trust(), Trust::Agreed);
+        assert_eq!(connect_carrier().trust(), Trust::Carrier);
+        assert!(describe().contains("testnet11"));
     }
 }
