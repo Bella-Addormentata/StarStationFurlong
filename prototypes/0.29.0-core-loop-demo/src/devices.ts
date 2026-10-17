@@ -5971,7 +5971,8 @@ export function coinPusherGearCard(itemId: string, isHouse: () => boolean): Gear
       const operator = coinPusherOperatorState();
       const rows = [
         gearSection([
-          `EACH DROP COSTS ${PUSHER_ANTE} CHIP · PICK ONE OF ${HOLE_COUNT} HOLES AND TIME IT AGAINST THE PUSHER`,
+          `EACH DROP COSTS ${PUSHER_ANTE} CHIP · PICK ONE OF ${HOLE_COUNT} HOLES · IT BOUNCES DOWN THE PEGS AND LANDS ON ITS EDGE`,
+          'A COIN STANDS UNTIL THE PUSHER OR ANOTHER CHIP KNOCKS IT OVER',
           'CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS',
           'THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE',
           `THE MACHINE HOLDS UP TO ${MACHINE_MAX_CHIPS} CHIPS`,

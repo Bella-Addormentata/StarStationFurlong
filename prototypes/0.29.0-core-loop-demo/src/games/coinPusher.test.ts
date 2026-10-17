@@ -3,9 +3,11 @@
  *
  * These vitest specs exercise the pure engine surface of coinPusher.ts:
  *   • shape guard accepts valid + rejects hostile peer states
- *   • peg deflection is deterministic per (hole, timing bucket, seed)
- *   • the sweep pusher advances chips forward monotonically
- *   • chips stack at the same x-column (piles)
+ *   • the drop board is deterministic per (hole, timing bucket, seed), and
+ *     every coin gets out of it
+ *   • a coin lands standing on its edge, and tips over when pushed
+ *   • the sweep pusher advances chips forward monotonically, never sideways
+ *   • chips stack at the same spot (piles)
  *   • pushed piles cascade through contacting piles ahead
  *   • an upper-front-edge tip drops chips onto the lower platform
  *   • a chip landing on a full lower stack overflows to the front (spill)
@@ -33,7 +35,14 @@ import {
   emptyMachine,
   hashInts,
   hasRoomForDrop,
-  HOLE_XS,
+  BOARD_MAX_MS,
+  BOARD_PEGS,
+  CHIP_T,
+  contactSpacing,
+  dropStartMs,
+  FIELD_HALF_W,
+  HOLE_US,
+  LIP_SLIDE,
   initialCoinPusherState,
   insertOnPlatform,
   isCoinPusherState,
@@ -47,7 +56,6 @@ import {
   MAX_STACK_HEIGHT,
   MAX_TIMESTAMP_MS,
   normalizeCoinPusherState,
-  PEG_ROWS,
   PILE_STEP,
   PLAT_LOW_BACK,
   PLAT_LOW_FRONT,
@@ -62,9 +70,11 @@ import {
   resolveDropTiming,
   SETTLE_MS,
   settlePiles,
-  simulatePeg,
+  simulateBoard,
   stepMachine,
   TICKS_PER_DROP,
+  traceDrop,
+  U_MAX,
   unseenDropHoles,
   type CoinPusherState,
   type Pile,
@@ -79,10 +89,15 @@ const PLAYER2 = 'player-Carol';
 
 /** Build a single pile at x holding `count` fresh chip ids drawn from `next`
  *  (a mutable id counter). Used to keep fixtures conservation-balanced. */
-function pileN(x: number, count: number, next: { id: number }): Pile {
+function pileN(x: number, count: number, next: { id: number }, u = 0): Pile {
   const chipIds: number[] = [];
   for (let i = 0; i < count; i++) chipIds.push(next.id++);
-  return { x, count, chipIds };
+  return { x, u, count, chipIds };
+}
+
+/** One chip standing on its edge at (x, u). */
+function standingAt(x: number, next: { id: number }, u = 0): Pile {
+  return { x, u, count: 1, chipIds: [next.id++], standing: true };
 }
 
 /** Build a conservation-balanced state from a hand-authored pile layout so
@@ -113,12 +128,14 @@ function assertConserved(state: CoinPusherState, label = 'invariant') {
   expect(c.chipsInMachine).toBeGreaterThanOrEqual(0);
 }
 
-/** `perPlatform` piles of 8 chips on each platform, spaced one pile apart
- *  from each platform's back edge, with a balanced ledger. */
+/** `perPlatform` piles of 8 chips on each platform, packed a pile apart in
+ *  rows of five from each platform's back edge, the rows a pile apart
+ *  across the table, with a balanced ledger. */
 function fullMachine(perPlatform: number): CoinPusherState {
   const next = { id: 1 };
   const row = (from: number): Pile[] =>
-    Array.from({ length: perPlatform }, (_, i) => pileN(from + CHIP_R + i * PILE_STEP, 8, next));
+    Array.from({ length: perPlatform }, (_, i) =>
+      pileN(from + CHIP_R + (i % 5) * PILE_STEP, 8, next, -U_MAX + Math.floor(i / 5) * PILE_STEP));
   const upper = row(0);
   const lower = row(PLAT_LOW_BACK);
   return {
@@ -175,7 +192,7 @@ describe('shape guards', () => {
   it('rejects malformed piles (count / chipIds mismatch)', () => {
     const bad: CoinPusherState = {
       ...initialCoinPusherState(OWNER),
-      upper: [{ x: 0.30, count: 2, chipIds: [1] }], // count != length
+      upper: [{ x: 0.30, u: 0, count: 2, chipIds: [1] }], // count != length
     };
     expect(isCoinPusherState(bad)).toBe(false);
   });
@@ -199,19 +216,19 @@ describe('shape guards', () => {
     const megaChips = Array.from({ length: 10_000 }, (_, i) => i + 1);
     const bad: CoinPusherState = {
       ...initialCoinPusherState(OWNER),
-      upper: [{ x: 0.30, count: megaChips.length, chipIds: megaChips }],
+      upper: [{ x: 0.30, u: 0, count: megaChips.length, chipIds: megaChips }],
     };
     expect(isCoinPusherState(bad)).toBe(false);
   });
 
   it('rejects a state holding more chips than the cabinet can (aggregate cap)', () => {
     // Every pile sits on its platform and within its own limit, and the
-    // ledger balances, but the total does not fit: 20 piles × 8 = 160.
-    const over = fullMachine(10);
-    expect(chipsInMachine(over)).toBe(160);
+    // ledger balances, but the total does not fit: 34 piles × 8 = 272.
+    const over = fullMachine(17);
+    expect(chipsInMachine(over)).toBe(272);
     expect(isCoinPusherState(over)).toBe(false);
     // …while a machine at exactly the cap is accepted.
-    const atCap = fullMachine(8);
+    const atCap = fullMachine(16);
     expect(chipsInMachine(atCap)).toBe(MACHINE_MAX_CHIPS);
     expect(isCoinPusherState(atCap)).toBe(true);
   });
@@ -489,11 +506,76 @@ describe('settlePiles', () => {
     expect(r[2].x).toBeCloseTo(0.30 + PILE_STEP, 9);
   });
 
-  it('enforces leftConstraint on the leftmost pile', () => {
+  it('holds every pile its half-depth ahead of the pusher face', () => {
     const n = { id: 1 };
-    const piles = [pileN(0.02, 1, n)];
-    const { piles: r } = settlePiles(piles, 0.10, PLAT_UP_FRONT);
-    expect(r[0].x).toBeCloseTo(0.10, 9);
+    const piles = [pileN(0.02, 1, n), pileN(0.03, 1, n, 0.15)];
+    const { piles: r, toppled } = settlePiles(piles, 0.10, PLAT_UP_FRONT);
+    expect(r.map((p) => p.x)).toEqual([0.10 + CHIP_R, 0.10 + CHIP_R]);
+    // The bar spans the table: a pile anywhere across it is pushed, and no
+    // pile moves sideways.
+    expect(r.map((p) => p.u)).toEqual([0, 0.15]);
+    expect(toppled).toEqual([]);
+  });
+
+  it('only piles that touch across the table push each other', () => {
+    const n = { id: 1 };
+    // Side by side, a coin and a half apart across: no contact at all.
+    const apart = settlePiles([pileN(0.30, 1, n), pileN(0.30, 1, n, 2 * CHIP_R)], -Infinity, PLAT_UP_FRONT);
+    expect(apart.piles.map((p) => p.x)).toEqual([0.30, 0.30]);
+    // Half a coin across: the front one sits where the two discs touch.
+    const du = CHIP_R;
+    const glancing = settlePiles([pileN(0.30, 1, n), pileN(0.30, 1, n, du)], -Infinity, PLAT_UP_FRONT);
+    expect(glancing.piles[1].x - glancing.piles[0].x).toBeCloseTo(Math.sqrt(4 * CHIP_R * CHIP_R - du * du), 12);
+    expect(glancing.piles[1].u).toBe(du);
+  });
+
+  it('tips a standing chip forward onto its face when it is pushed', () => {
+    const n = { id: 1 };
+    const coin = standingAt(0.20, n, 0.05);
+    const { piles: r, toppled } = settlePiles([coin], 0.25, PLAT_UP_FRONT);
+    expect(toppled).toEqual(coin.chipIds);
+    expect(r).toHaveLength(1);
+    expect(r[0].standing).toBeUndefined();
+    // It is shoved to the face, then falls over its front edge.
+    expect(r[0].x).toBeCloseTo(0.25 + CHIP_T / 2 + CHIP_T / 2 + CHIP_R, 12);
+    expect(r[0].u).toBe(0.05);
+  });
+
+  it('leaves a standing chip standing when nothing reaches it', () => {
+    const n = { id: 1 };
+    const coin = standingAt(0.30, n);
+    const { piles: r, toppled } = settlePiles([coin, pileN(0.45, 2, n)], 0.30 - CHIP_T / 2, PLAT_UP_FRONT);
+    expect(toppled).toEqual([]);
+    expect(r[0]).toEqual(coin);
+  });
+
+  it('a tipped chip that falls onto a flat pile stacks on it, and pushes on through it', () => {
+    const n = { id: 1 };
+    const coin = standingAt(0.20, n);
+    // Flat pile centred where the coin's centre lands when it tips over.
+    const target = pileN(0.20 + CHIP_T / 2 + CHIP_R, 2, n);
+    const { piles: r } = settlePiles([coin, target], -Infinity, PLAT_UP_FRONT);
+    // Untouched, it stands…
+    expect(r.find((p) => p.standing)).toBeDefined();
+    const pushed = settlePiles([coin, target], 0.21, PLAT_UP_FRONT);
+    // …pushed, it falls onto the pile: three high there now.
+    expect(pushed.toppled).toEqual(coin.chipIds);
+    const stack = pushed.piles.find((p) => p.chipIds.includes(coin.chipIds[0]))!;
+    expect(stack.chipIds).toEqual([...target.chipIds, ...coin.chipIds]);
+  });
+
+  it('a standing chip is a thin slab: a coin behind it reaches its face', () => {
+    const n = { id: 1 };
+    const flat = pileN(0.10, 1, n);
+    const coin = standingAt(0.10, n);
+    expect(contactSpacing(flat, coin)).toBeCloseTo(CHIP_R + CHIP_T / 2, 12);
+    expect(contactSpacing(coin, flat)).toBeCloseTo(CHIP_R + CHIP_T / 2, 12);
+    expect(contactSpacing(coin, standingAt(0.10, n))).toBe(CHIP_T);
+    // Off to the side by more than a radius, a disc meets the slab's end.
+    const side = pileN(0.10, 1, n, 1.5 * CHIP_R);
+    const d = 0.5 * CHIP_R;
+    expect(contactSpacing(coin, side)).toBeCloseTo(Math.sqrt(CHIP_R * CHIP_R - d * d) + CHIP_T / 2, 12);
+    expect(contactSpacing(coin, pileN(0.10, 1, n, 2 * CHIP_R))).toBe(-Infinity);
   });
 
   it('evicts any pile whose centre is past frontEdge', () => {
@@ -519,7 +601,7 @@ describe('settlePiles', () => {
 
 describe('insertOnPlatform', () => {
   it('creates a new pile when landing on an empty platform', () => {
-    const { piles, fallen } = insertOnPlatform([], 0.30, [1], PLAT_UP_FRONT);
+    const { piles, fallen } = insertOnPlatform([], 0.30, 0, [1], PLAT_UP_FRONT);
     expect(piles).toHaveLength(1);
     expect(piles[0].chipIds).toEqual([1]);
     expect(fallen).toHaveLength(0);
@@ -528,7 +610,7 @@ describe('insertOnPlatform', () => {
   it('stacks (merges) when landing atop an existing pile', () => {
     const n = { id: 1 };
     const base = [pileN(0.30, 1, n)];
-    const { piles } = insertOnPlatform(base, 0.30, [n.id++], PLAT_UP_FRONT);
+    const { piles } = insertOnPlatform(base, 0.30, 0, [n.id++], PLAT_UP_FRONT);
     expect(piles).toHaveLength(1);
     expect(piles[0].count).toBe(2);
     expect(piles[0].chipIds).toEqual([1, 2]);
@@ -537,7 +619,7 @@ describe('insertOnPlatform', () => {
   it('stacks when landing within CHIP_R of an existing pile (snap tolerance)', () => {
     const n = { id: 1 };
     const base = [pileN(0.30, 1, n)];
-    const { piles } = insertOnPlatform(base, 0.30 + CHIP_R * 0.9, [n.id++], PLAT_UP_FRONT);
+    const { piles } = insertOnPlatform(base, 0.30 + CHIP_R * 0.9, 0, [n.id++], PLAT_UP_FRONT);
     expect(piles).toHaveLength(1);
     expect(piles[0].count).toBe(2);
   });
@@ -546,7 +628,7 @@ describe('insertOnPlatform', () => {
     const n = { id: 1 };
     const base = [pileN(0.30, 1, n)];
     // > CHIP_R off the existing centre → not a stack.
-    const { piles } = insertOnPlatform(base, 0.30 + CHIP_R * 1.5, [n.id++], PLAT_UP_FRONT);
+    const { piles } = insertOnPlatform(base, 0.30 + CHIP_R * 1.5, 0, [n.id++], PLAT_UP_FRONT);
     expect(piles).toHaveLength(2);
   });
 
@@ -556,7 +638,7 @@ describe('insertOnPlatform', () => {
     const n = { id: 1 };
     const base = [pileN(0.30, 1, n), pileN(0.30 + PILE_STEP * 0.9, 1, n)];
     const startFrontX = base[1].x;
-    const { piles } = insertOnPlatform(base, 0.30, [n.id++], PLAT_UP_FRONT);
+    const { piles } = insertOnPlatform(base, 0.30, 0, [n.id++], PLAT_UP_FRONT);
     expect(piles).toHaveLength(2);
     expect(piles[0].count).toBe(2);
     expect(piles[1].count).toBe(1);
@@ -572,7 +654,7 @@ describe('insertOnPlatform', () => {
     const back = pileN(PLAT_UP_FRONT - PILE_STEP * 1.05, 1, n);
     const front = pileN(PLAT_UP_FRONT - PILE_STEP * 0.05, 1, n);
     const base = [back, front];
-    const { piles, fallen } = insertOnPlatform(base, back.x, [n.id++], PLAT_UP_FRONT);
+    const { piles, fallen } = insertOnPlatform(base, back.x, 0, [n.id++], PLAT_UP_FRONT);
     expect(fallen).toHaveLength(1);
     expect(fallen[0].chipIds).toEqual([2]);
     expect(piles).toHaveLength(1);
@@ -584,7 +666,7 @@ describe('insertOnPlatform', () => {
     // forward as a NEW pile at x + PILE_STEP.
     const n = { id: 1 };
     const base = [pileN(0.30, MAX_STACK_HEIGHT, n)];
-    const { piles } = insertOnPlatform(base, 0.30, [n.id++], PLAT_UP_FRONT);
+    const { piles } = insertOnPlatform(base, 0.30, 0, [n.id++], PLAT_UP_FRONT);
     expect(piles).toHaveLength(2);
     // Landing pile stays capped, spill goes forward.
     const back = piles.find((p) => Math.abs(p.x - 0.30) <= CHIP_R)!;
@@ -604,7 +686,7 @@ describe('insertOnPlatform', () => {
       pileN(0.30 + PILE_STEP * 3, 1, n),
     ];
     const initial = base.reduce((s, p) => s + p.count, 0);
-    const { piles, fallen } = insertOnPlatform(base, 0.30, [n.id++], PLAT_UP_FRONT);
+    const { piles, fallen } = insertOnPlatform(base, 0.30, 0, [n.id++], PLAT_UP_FRONT);
     // No chip lost — total conserved.
     const finalCount = piles.reduce((s, p) => s + p.count, 0) + fallen.reduce((s, p) => s + p.count, 0);
     expect(finalCount).toBe(initial + 1);
@@ -625,7 +707,7 @@ describe('insertOnPlatform', () => {
       pileN(startX + PILE_STEP * 3, MAX_STACK_HEIGHT, n),
     ];
     const initial = base.reduce((s, p) => s + p.count, 0);
-    const { piles, fallen } = insertOnPlatform(base, startX, [n.id++], PLAT_UP_FRONT);
+    const { piles, fallen } = insertOnPlatform(base, startX, 0, [n.id++], PLAT_UP_FRONT);
     const totalCount = piles.reduce((s, p) => s + p.count, 0) + fallen.reduce((s, p) => s + p.count, 0);
     expect(totalCount).toBe(initial + 1);
     // Something must have fallen off the front (the chain-cascaded overflow).
@@ -637,7 +719,7 @@ describe('insertOnPlatform', () => {
     // merge with, but the column still can't stand past MAX_STACK_HEIGHT.
     const n = { id: 1 };
     const tall = pileN(0.40, MAX_STACK_HEIGHT + 2, n);
-    const { piles, fallen } = insertOnPlatform([], 0.80, tall.chipIds, PLAT_LOW_FRONT);
+    const { piles, fallen } = insertOnPlatform([], 0.80, 0, tall.chipIds, PLAT_LOW_FRONT);
     expect(fallen).toEqual([]);
     expect(piles.map((p) => p.count)).toEqual([MAX_STACK_HEIGHT, 2]);
     expect(piles[1].x).toBeCloseTo(0.80 + PILE_STEP, 12);
@@ -645,60 +727,84 @@ describe('insertOnPlatform', () => {
   });
 });
 
-// ── simulatePeg ──────────────────────────────────────────────────────────────
+// ── simulateBoard ────────────────────────────────────────────────────────────
 
-describe('simulatePeg', () => {
+describe('simulateBoard', () => {
   it('is deterministic for the same (hole, timing, seed)', () => {
     for (const h of [0, 1, 2] as const) {
       for (const t of [0, 0.25, 0.5, 0.75, 0.999]) {
-        const a = simulatePeg(h, t, 12345);
-        const b = simulatePeg(h, t, 12345);
-        expect(a).toBe(b);
+        expect(simulateBoard(h, t, 12345, true)).toEqual(simulateBoard(h, t, 12345, true));
       }
     }
   });
 
-  it('different seeds usually yield different trajectories', () => {
+  it('different seeds usually yield different paths', () => {
     let diff = 0;
     for (let s = 0; s < 20; s++) {
-      if (simulatePeg(1, 0.5, s) !== simulatePeg(1, 0.5, s + 1000)) diff++;
+      if (simulateBoard(1, 0.5, s).exitU !== simulateBoard(1, 0.5, s + 1000).exitU) diff++;
     }
-    expect(diff).toBeGreaterThan(10);
+    expect(diff).toBeGreaterThan(15);
   });
 
-  it('lands within +/-(TIMING_OFFSET + PEG_ROWS*PEG_DEFLECTION) of the hole', () => {
-    // Every possible walk stays within this analytic bound.
+  it('every coin gets out between the rails, and none is held up on a peg', () => {
+    const rand = lcg(5);
+    let slowest = 0;
+    for (let i = 0; i < 600; i++) {
+      const run = simulateBoard((i % 3) as PusherHole, rand(), (rand() * 2 ** 32) >>> 0);
+      expect(Math.abs(run.exitU)).toBeLessThanOrEqual(FIELD_HALF_W - CHIP_R + 1e-12);
+      slowest = Math.max(slowest, run.fallMs);
+    }
+    // Well inside the cap that would let a stuck coin out.
+    expect(slowest).toBeLessThan(BOARD_MAX_MS / 2);
+  });
+
+  it('bounces off the pegs: coins spread across the board, and each hole leans its own way', () => {
+    const rand = lcg(17);
+    const lanes = new Set<number>();
+    const mean = [0, 0, 0];
+    const N = 300;
     for (const h of [0, 1, 2] as const) {
-      for (const s of [1, 2, 3, 42, 999]) {
-        for (const t of [0, 0.5, 1]) {
-          const x = simulatePeg(h, t, s);
-          const maxDrift = CHIP_R + PEG_ROWS * 0.020;
-          expect(Math.abs(x - HOLE_XS[h])).toBeLessThanOrEqual(maxDrift + 1e-9);
+      for (let i = 0; i < N; i++) {
+        const u = simulateBoard(h, rand(), (rand() * 2 ** 32) >>> 0).exitU;
+        mean[h] += u / N;
+        lanes.add(Math.floor((u + FIELD_HALF_W) / (2 * CHIP_R)));
+      }
+    }
+    // Seven coin-widths across, and coins come out of every one of them.
+    expect(lanes.size).toBe(7);
+    expect(mean[0]).toBeLessThan(mean[1]);
+    expect(mean[1]).toBeLessThan(mean[2]);
+  });
+
+  it('never leaves a coin inside a peg', () => {
+    const rand = lcg(23);
+    for (let i = 0; i < 60; i++) {
+      const run = simulateBoard((i % 3) as PusherHole, rand(), (rand() * 2 ** 32) >>> 0, true);
+      for (const p of run.path!) {
+        for (const peg of BOARD_PEGS) {
+          expect(Math.hypot(p.u - peg.u, p.h - peg.h)).toBeGreaterThan(CHIP_R);
         }
       }
     }
   });
 
-  it('exhausts a broad set of landing sites across a seed sweep', () => {
-    // A 5-row symmetric walk of ±PEG_DEFLECTION yields (5 + 1) = 6 distinct
-    // landing sums (from -5·d to +5·d in steps of 2·d). A well-distributed
-    // hash must hit at least 5 of the 6 across a 500-seed sweep.
-    const uniq = new Set<number>();
-    for (let s = 0; s < 500; s++) {
-      const x = simulatePeg(1, 0.5, s);
-      uniq.add(Math.round(x * 1000)); // 1mm bucket
-    }
-    expect(uniq.size).toBeGreaterThanOrEqual(5);
+  it('traces the path from the hole to the bottom edge', () => {
+    const run = simulateBoard(2, 0.4, 99, true);
+    const path = run.path!;
+    expect(path[0].t).toBe(0);
+    expect(Math.abs(path[0].u - HOLE_US[2])).toBeLessThan(0.02);
+    expect(path[path.length - 1]).toMatchObject({ t: run.fallMs, u: run.exitU, h: 0 });
+    for (let i = 1; i < path.length; i++) expect(path[i].t).toBeGreaterThan(path[i - 1].t);
+    // Asked for no path, it keeps none, and the outcome is the same.
+    expect(simulateBoard(2, 0.4, 99)).toEqual({ exitU: run.exitU, fallMs: run.fallMs });
   });
 
   it('handles out-of-range timing safely (clamps)', () => {
-    // Not a crash / not a NaN — clamps into a normal walk.
-    const x = simulatePeg(1, -0.5, 7);
-    expect(Number.isFinite(x)).toBe(true);
-    const y = simulatePeg(1, 2, 7);
-    expect(Number.isFinite(y)).toBe(true);
-    const z = simulatePeg(1, NaN, 7);
-    expect(Number.isFinite(z)).toBe(true);
+    for (const t of [-0.5, 2, NaN]) {
+      const run = simulateBoard(1, t, 7);
+      expect(Number.isFinite(run.exitU)).toBe(true);
+      expect(run.fallMs).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -937,7 +1043,7 @@ describe('processInsert', () => {
   });
 
   it('refuses a drop into a full machine', () => {
-    const full = fullMachine(8);
+    const full = fullMachine(16);
     expect(chipsInMachine(full)).toBe(MACHINE_MAX_CHIPS);
     expect(() => processInsert(full, PLAYER1, 1, 0.5, 42)).toThrow(/full/);
   });
@@ -1081,5 +1187,145 @@ describe('chipsInMachine', () => {
       (n) => [pileN(0.70, 3, n)],
     );
     expect(chipsInMachine(s)).toBe(5);
+  });
+});
+
+// ── Standing coins, replays and older records ────────────────────────────────
+
+describe('the drop lands standing', () => {
+  /** The drop phase whose coin lands with the bar's face at `landPhase`. */
+  const dropPhaseFor = (hole: PusherHole, seed: number, landPhase: number): number => {
+    // The fall depends on the drop's own phase only through the hash, so
+    // look for a phase whose coin lands where it is wanted.
+    for (let i = 0; i < 1000; i++) {
+      const p = i / 1000;
+      const fall = simulateBoard(hole, p, seed).fallMs + 160;
+      const at = (p + fall / PUSHER_PERIOD_MS) % 1;
+      if (Math.abs(at - landPhase) < 0.004) return p;
+    }
+    throw new Error('no such phase');
+  };
+
+  it('in front of the bar, at the spot across the table it left the board', () => {
+    const s0 = fill(20);
+    const r = processInsert(s0, PLAYER1, 0, 0.3, 4242, true);
+    const board = simulateBoard(0, 0.3, 4242);
+    expect(r.landedU).toBe(Math.max(-U_MAX, Math.min(U_MAX, board.exitU)));
+    expect(r.trace!.landMs).toBe(board.fallMs + 160);
+    const landed = r.trace!.frames[0].upper.find((p) => p.chipIds.includes(r.chipId))!;
+    expect(landed).toMatchObject({ standing: true, count: 1, u: r.landedU, x: r.landedX });
+  });
+
+  it('stays standing when it lands as the bar reaches the front, and is never reached by it', () => {
+    const s0 = initialCoinPusherState(OWNER, 0);
+    const phase = dropPhaseFor(1, 31, 0.5);
+    const r = processInsert(s0, PLAYER1, 1, phase, 31);
+    expect(r.landedX).toBe(PUSHER_MAX_X + CHIP_T / 2);
+    expect(r.state.upper).toEqual([{ x: r.landedX, u: r.landedU, count: 1, chipIds: [r.chipId], standing: true }]);
+    // A further cycle leaves it as it is.
+    const idle = advanceSim(r.state, SETTLE_MS);
+    expect(idle.state.upper).toEqual(r.state.upper);
+    expect(LIP_SLIDE).toBeGreaterThan(0);
+  });
+
+  it('is knocked over when it lands with the bar going back: the bar comes forward and tips it', () => {
+    const s0 = initialCoinPusherState(OWNER, 0);
+    const phase = dropPhaseFor(1, 31, 0.75);
+    const r = processInsert(s0, PLAYER1, 1, phase, 31, true);
+    const frames = r.trace!.frames;
+    const tippedAt = frames.findIndex((f) => f.upper.some((p) => p.chipIds.includes(r.chipId) && !p.standing));
+    expect(frames[0].upper[0].standing).toBe(true);
+    // It stood for a while before the bar came back for it…
+    expect(tippedAt).toBeGreaterThan(5);
+    // …and lies flat ahead of the bar's furthest reach.
+    expect(r.state.upper).toEqual([{ x: expect.any(Number), u: r.landedU, count: 1, chipIds: [r.chipId] }]);
+    expect(r.state.upper[0].x).toBeGreaterThanOrEqual(PUSHER_MAX_X + CHIP_R);
+  });
+
+  it('machines at rest keep some coins standing', () => {
+    const rand = lcg(41);
+    let s = initialCoinPusherState(OWNER, 0);
+    let standing = 0;
+    for (let i = 0; i < 300; i++) {
+      s = processInsert(s, PLAYER1, Math.floor(rand() * 3) as PusherHole, rand() * 0.999, (rand() * 2 ** 32) >>> 0).state;
+      standing += s.upper.filter((p) => p.standing).length;
+      expect(isCoinPusherState(s)).toBe(true);
+    }
+    expect(standing).toBeGreaterThan(30);
+  });
+});
+
+describe('traceDrop', () => {
+  const dropOf = (r: ReturnType<typeof processInsert>, hole: PusherHole, phase: number, seed?: number) => ({
+    requestId: 'r', player: PLAYER1, hole, chipId: r.chipId, landedX: r.landedX, landedU: r.landedU,
+    paid: r.paid, phase, honored: true, atMs: 5_000, ...(seed === undefined ? {} : { seed }),
+  });
+
+  it('replays a drop from the record before it to exactly the record after it', () => {
+    const s0 = fill(80);
+    const r = processInsert(s0, PLAYER1, 2, 0.61, 2024);
+    const trace = traceDrop(s0, dropOf(r, 2, 0.61, 2024))!;
+    const last = trace.frames[trace.frames.length - 1];
+    expect(last.upper).toEqual(r.state.upper);
+    expect(last.lower).toEqual(r.state.lower);
+    expect(trace.frames.flatMap((f) => f.paid)).toEqual(r.paidChipIds);
+    expect(trace.board[trace.board.length - 1].t).toBe(trace.fallMs);
+    expect(trace.chipId).toBe(r.chipId);
+  });
+
+  it("is null for a drop it can't replay: no seed, or not the next drop", () => {
+    const s0 = fill(10);
+    const r = processInsert(s0, PLAYER1, 1, 0.2, 5);
+    expect(traceDrop(s0, dropOf(r, 1, 0.2))).toBeNull();
+    expect(traceDrop(fill(11), dropOf(r, 1, 0.2, 5))).toBeNull();
+  });
+
+  it('dates the drop to when its coin went in, on the shared sweep clock', () => {
+    const s0 = { ...initialCoinPusherState(OWNER, 1_000), pusherPhase: 0.3 };
+    for (const lag of [0, 250, 990]) {
+      const pressed = 7_777;
+      const phase = currentPusherPhase(s0, pressed);
+      const r = processInsert(s0, PLAYER1, 0, phase, 1);
+      const start = dropStartMs(r.state, { ...dropOf(r, 0, phase, 1), atMs: pressed + lag });
+      expect(start).toBeCloseTo(pressed, 6);
+    }
+  });
+});
+
+describe('records from before the drop board', () => {
+  it('read with every pile on the centre line', () => {
+    const s = fill(30);
+    const old = {
+      ...s,
+      upper: s.upper.filter((p) => !p.standing).map(({ x, count, chipIds }) => ({ x, count, chipIds })),
+      lower: s.lower.map(({ x, count, chipIds }) => ({ x, count, chipIds })),
+    };
+    old.totalInserted = chipsInMachine(old as CoinPusherState) + old.totalPaid + old.totalEmptied;
+    expect(isCoinPusherState(old)).toBe(true);
+    const lifted = normalizeCoinPusherState(old)!;
+    expect([...lifted.upper, ...lifted.lower].every((p) => p.u === 0)).toBe(true);
+    // And a drop plays on it.
+    expect(isCoinPusherState(processInsert(lifted, PLAYER1, 1, 0.5, 3).state)).toBe(true);
+  });
+
+  it('the guard refuses a pile off the table across, or a standing pile that is not one chip', () => {
+    const s = fill(30);
+    const p0 = s.lower[0];
+    for (const u of [U_MAX + 0.001, -U_MAX - 0.001, Number.NaN, Infinity]) {
+      expect(isCoinPusherState({ ...s, lower: [{ ...p0, u }, ...s.lower.slice(1)] }), `u ${u}`).toBe(false);
+    }
+    const two = { x: 0.3, u: 0, count: 2, chipIds: [1, 2], standing: true };
+    expect(isCoinPusherState({ ...s, upper: [two] })).toBe(false);
+    expect(isCoinPusherState({ ...s, upper: [{ ...two, count: 1, chipIds: [1], standing: false }] })).toBe(false);
+  });
+
+  it("the guard checks a drop record's seed", () => {
+    const s = fill(5);
+    const d = { requestId: 'r', player: PLAYER1, hole: 1, chipId: 1, landedX: 0.3, paid: 0, phase: 0.5, honored: true, atMs: 1 };
+    expect(isCoinPusherState({ ...s, lastDrop: d })).toBe(true);
+    expect(isCoinPusherState({ ...s, lastDrop: { ...d, seed: 7, landedU: 0.1 } })).toBe(true);
+    for (const seed of [-1, 2 ** 32, 1.5, '7']) {
+      expect(isCoinPusherState({ ...s, lastDrop: { ...d, seed } }), `seed ${seed}`).toBe(false);
+    }
   });
 });

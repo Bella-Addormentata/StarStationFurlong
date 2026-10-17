@@ -128,7 +128,7 @@ describe('coin pusher cabinet removal', () => {
     handle.update(0.016);
     const chipsDrawn: THREE.Mesh[] = [];
     group.traverse((obj) => {
-      if (obj instanceof THREE.Mesh && obj.visible && obj.geometry instanceof THREE.CylinderGeometry) {
+      if (obj instanceof THREE.Mesh && obj.visible && obj.userData.coinPusherChip) {
         chipsDrawn.push(obj);
       }
     });
@@ -159,7 +159,7 @@ describe('coin pusher cabinet removal', () => {
     const chipsShown = (): number => {
       let n = 0;
       group.traverse((obj) => {
-        if (!(obj instanceof THREE.Mesh) || !(obj.geometry instanceof THREE.CylinderGeometry)) return;
+        if (!(obj instanceof THREE.Mesh) || !obj.userData.coinPusherChip) return;
         let shown = true;
         for (let o: THREE.Object3D | null = obj; o; o = o.parent) shown &&= o.visible;
         if (shown) n += 1;
