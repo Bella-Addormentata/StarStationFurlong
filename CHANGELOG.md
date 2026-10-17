@@ -9,7 +9,7 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- **🔭 The helm's ship atlas cuts a module's corners at its cupola ends ([#PRNUM](https://github.com/Bella-Addormentata/StarStationFurlong/pull/PRNUM), follow-up to [#222](https://github.com/Bella-Addormentata/StarStationFurlong/pull/222)).** The docking computer's **SHIP ATLAS** drew every module as a full rectangle, so a module with a cupola looked as if its floor's corners stuck out past the glass. It now draws each module's floor the way the room has it, with the corners at each cupola end cut at 45° and the tip window marked, for the module you are in and for every module joined to it.
+- **🔭 The helm's ship atlas cuts a module's corners at its cupola ends ([#261](https://github.com/Bella-Addormentata/StarStationFurlong/pull/261), follow-up to [#222](https://github.com/Bella-Addormentata/StarStationFurlong/pull/222)).** The docking computer's **SHIP ATLAS** drew every module as a full rectangle, so a module with a cupola looked as if its floor's corners stuck out past the glass. It now draws each module's floor the way the room has it, with the corners at each cupola end cut at 45° and the tip window marked, for the module you are in and for every module joined to it.
 
 ## v0.40.0 — 2026-10-13
 
