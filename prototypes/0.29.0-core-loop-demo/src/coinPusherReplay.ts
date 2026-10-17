@@ -127,6 +127,17 @@ function poseOf(id: number, p: Placement, geom: ReplayGeometry): TablePose {
 
 const lerp = (a: number, b: number, s: number): number => a + (b - a) * s;
 
+/** How far below its centre a chip turned `a` from flat (π/2 standing on its
+ *  edge) reaches: the rim's lowest point. */
+export function reachBelow(a: number, geom: ReplayGeometry): number {
+  return CHIP_R * Math.sin(a) + (geom.level / 2) * Math.cos(a);
+}
+
+/** The surface a chip at rest is lying or standing on. */
+function surfaceUnder(p: TablePose, geom: ReplayGeometry): number {
+  return p.y - reachBelow(p.tip * Math.PI / 2, geom);
+}
+
 function blend(a: TablePose, b: TablePose, s: number): TablePose {
   return { chipId: a.chipId, x: lerp(a.x, b.x, s), u: lerp(a.u, b.u, s), y: lerp(a.y, b.y, s), tip: lerp(a.tip, b.tip, s) };
 }
@@ -218,8 +229,15 @@ export function replayView(replay: Replay, t: number): ReplayView {
       if (!cur || t >= tr.t + dur) continue;
       const s = (t - tr.t) / dur;
       if (tr.kind === 'tip') {
-        // Over on its front edge: it lifts off its foot and falls flat.
-        table.set(id, { ...blend(from, cur, s), tip: 1 - s * s });
+        // Over on its front edge: it rolls onto it and falls flat, its centre
+        // as high above what it rests on as the turned coin's lowest point
+        // is below it — never into the deck. That support moves from the
+        // platform it stood on to whatever it lands on, a stack or the lower
+        // platform.
+        const tip = 1 - s * s;
+        const a = tip * Math.PI / 2;
+        const support = lerp(surfaceUnder(from, geom), surfaceUnder(cur, geom), s);
+        table.set(id, { ...blend(from, cur, s), y: support + reachBelow(a, geom), tip });
       } else {
         // Off the upper front: forward along the platform, then down.
         const edge = Math.max(from.x, PLAT_UP_FRONT);

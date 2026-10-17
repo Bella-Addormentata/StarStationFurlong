@@ -6,11 +6,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  chipsInMachine, currentPusherPhase, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
+  CHIP_R, chipsInMachine, currentPusherPhase, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
   type CoinPusherState, type DropTrace, type PusherDropMark, type PusherHole,
 } from './games/coinPusher';
 import {
-  cabinetView, PAY_MS, planDrops, planReplay, replayView, restingView, TIP_MS, type ReplayGeometry,
+  cabinetView, PAY_MS, planDrops, planReplay, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
 } from './coinPusherReplay';
 
 const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088 };
@@ -80,6 +80,14 @@ describe('coin pusher replay', () => {
     expect(mid.tip).toBeLessThan(1);
     const after = replayView(plan, tip.t + TIP_MS).table.find((p) => p.chipId === r.chipId)!;
     expect(after.tip).toBe(0);
+    // All the way over, the turned coin stays on top of the deck it stood
+    // on and the chip it falls onto, never through them.
+    const start = replayView(plan, tip.t).table.find((p) => p.chipId === r.chipId)!;
+    const floor = Math.min(start.y - CHIP_R, after.y - GEOM.level / 2);
+    for (let k = 0; k <= 20; k++) {
+      const p = replayView(plan, tip.t + (TIP_MS * k) / 20).table.find((q) => q.chipId === r.chipId)!;
+      expect(p.y - reachBelow(p.tip * Math.PI / 2, GEOM)).toBeGreaterThanOrEqual(floor - 1e-9);
+    }
   });
 
   it('draws a coin knocked over as it lands tipping, not arriving flat', () => {
