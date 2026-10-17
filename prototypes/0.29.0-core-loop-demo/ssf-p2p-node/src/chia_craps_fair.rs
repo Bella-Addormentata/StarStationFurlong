@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use chia_bls::SecretKey;
 use chia_protocol::{Bytes, Bytes32, Coin};
-use crate::chia_chain::ChainAccess;
+use crate::chia_chain::{ChainAccess, CoinRecord, PagedRecords};
 use sha2::{Digest, Sha256};
 
 use crate::chia_faucet::{unspent_at, MAX_FAUCET_PAGES};
@@ -161,15 +161,14 @@ fn confirmed_gone(listing_complete: bool, unspent: &[Coin], spent: &Coin) -> boo
     listing_complete && !unspent.iter().any(|c| c == spent)
 }
 
-/// Resolve every PUBLIC fairness record published under (table, round): the raw
-/// plaintext payloads (commit and/or reveal), in confirmation order. Read-only.
-pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>>> {
-    let client = crate::chia_chain::connect();
-    let hint = fair_hint(table, round);
-    // Every page, up to the bound every wallet listing shares: a transcript
-    // with records missing proves nothing, so a listing still cut short is an
-    // error, not a shorter transcript.
-    let mut records = Vec::new();
+/// Every coin under `hint`, pages followed up to the bound every wallet listing
+/// shares: a transcript with records missing proves nothing, so a listing
+/// still cut short is an error, not a shorter transcript. A coin a later page
+/// lists again (spent since the earlier page: the chain pages by latest
+/// change) is one coin, in its later state ([`PagedRecords`]), so no record is
+/// read twice.
+async fn fair_coins(client: &impl ChainAccess, hint: Bytes32) -> Result<Vec<CoinRecord>> {
+    let mut gathered = PagedRecords::default();
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
     loop {
@@ -178,7 +177,7 @@ pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>
             .await
             .map_err(|e| anyhow!("hint lookup: {e}"))?;
         pages += 1;
-        records.extend(listing.records);
+        gathered.fold(listing.records);
         let truncated = listing.truncated;
         match listing.next_cursor {
             Some(next) if truncated => {
@@ -191,6 +190,15 @@ pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>
             _ => break,
         }
     }
+    Ok(gathered.into_records())
+}
+
+/// Resolve every PUBLIC fairness record published under (table, round): the raw
+/// plaintext payloads (commit and/or reveal), in confirmation order. Read-only.
+pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>>> {
+    let client = crate::chia_chain::connect();
+    let hint = fair_hint(table, round);
+    let mut records = fair_coins(&client, hint).await?;
     records.sort_by_key(|r| r.confirmed_block_index);
     let mut out = Vec::new();
     for rec in records {
@@ -316,6 +324,22 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_record_coin_listed_again_spent_on_a_later_page_is_read_once() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::CoinListing;
+        // The commit's coin is unspent on the first page and spent (the reveal
+        // consumed it) by the time the second page is read, where it comes
+        // again: one record, in its later state, not two transcripts.
+        let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), Bytes32::new([9u8; 32]), u64::from(seed));
+        let rec = |c: Coin, height: u32, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: height, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
+        let first = CoinListing { records: vec![rec(coin(1), 80, None)], truncated: true, next_cursor: Some("page-2".into()) };
+        let second = CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(2), 101, None)], truncated: false, next_cursor: None };
+        let chain = Scripted::new(vec![first, second]);
+        let coins = fair_coins(&chain, Bytes32::new([1u8; 32])).await.unwrap();
+        assert_eq!(coins.iter().map(|r| (r.coin.amount, r.spent)).collect::<Vec<_>>(), vec![(1, true), (2, false)]);
+    }
 
     // GOLDEN VECTORS captured from the browser's src/games/fairDice.ts for
     // seed="ab"×32, beacon="cd"×32, table="t", round=3. Pinned here so the Rust

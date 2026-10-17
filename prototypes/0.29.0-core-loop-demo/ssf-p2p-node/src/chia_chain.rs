@@ -32,6 +32,7 @@
 //! question is asked by handing the spend bundle over again
 //! ([`ChainAccess::spend_live`]; plan §14 (6): there is no mempool query).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, LazyLock};
 
@@ -62,6 +63,35 @@ pub struct CoinListing {
     pub records: Vec<CoinRecord>,
     pub truncated: bool,
     pub next_cursor: Option<String>,
+}
+
+/// The records gathered across a listing's pages. The chain pages by a coin's
+/// LATEST change, not by its creation: a coin listed unspent on an early page
+/// comes again, spent, on a later one when the chain moved on between the two
+/// requests. Folding each page in by coin id keeps the later record, so a
+/// caller that follows a cursor neither holds a coin the chain has since
+/// spent nor sees one coin twice. Spent coins must be asked for, or the later
+/// record never arrives.
+#[derive(Debug, Default)]
+pub struct PagedRecords {
+    by_id: HashMap<Bytes32, CoinRecord>,
+}
+
+impl PagedRecords {
+    /// Fold one page in: a coin listed before is replaced by its later record.
+    pub fn fold(&mut self, page: Vec<CoinRecord>) {
+        for record in page {
+            self.by_id.insert(record.coin.coin_id(), record);
+        }
+    }
+
+    /// Every coin once, in the order a single page has: by confirming height,
+    /// then id.
+    pub fn into_records(self) -> Vec<CoinRecord> {
+        let mut records: Vec<CoinRecord> = self.by_id.into_values().collect();
+        records.sort_by(|a, b| (a.confirmed_block_index, a.coin.coin_id()).cmp(&(b.confirmed_block_index, b.coin.coin_id())));
+        records
+    }
 }
 
 /// A spend as the chain serves it: the puzzle that was revealed and the
@@ -248,11 +278,94 @@ pub(crate) mod testing {
             async { Err(silence()) }
         }
     }
+
+    /// A chain that answers listings from a script: the pages in order,
+    /// whatever the key or cursor asked for, then nothing. It keeps whether
+    /// each listing asked for spent coins. Everything else is unanswered.
+    pub(crate) struct Scripted {
+        pages: std::sync::Mutex<std::collections::VecDeque<CoinListing>>,
+        pub(crate) asked_spent: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl Scripted {
+        pub(crate) fn new(pages: Vec<CoinListing>) -> Self {
+            Self { pages: std::sync::Mutex::new(pages.into()), asked_spent: std::sync::Mutex::new(Vec::new()) }
+        }
+
+        fn page(&self, include_spent: bool) -> Result<CoinListing, ChainError> {
+            self.asked_spent.lock().unwrap().push(include_spent);
+            self.pages.lock().unwrap().pop_front().ok_or_else(silence)
+        }
+    }
+
+    impl ChainAccess for Scripted {
+        fn coin_records_by_hint(
+            &self,
+            _hint: Bytes32,
+            _start_height: Option<u32>,
+            include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
+            let page = self.page(include_spent);
+            async move { page }
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
+            let page = self.page(include_spent);
+            async move { page }
+        }
+
+        fn coin_records_by_names(
+            &self,
+            _names: Vec<Bytes32>,
+            include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
+            let page = self.page(include_spent);
+            async move { page }
+        }
+
+        fn puzzle_and_solution(
+            &self,
+            _coin_id: Bytes32,
+            _height: u32,
+        ) -> impl Future<Output = Result<Option<PuzzleAndSolution>, ChainError>> + Send {
+            async { Err(silence()) }
+        }
+
+        fn peak_height(&self) -> impl Future<Output = Result<u32, ChainError>> + Send {
+            async { Err(silence()) }
+        }
+
+        fn spend_live(&self, _bundle: SpendBundle) -> impl Future<Output = Result<bool, ChainError>> + Send {
+            async { Err(silence()) }
+        }
+
+        fn push_tx(&self, _bundle: SpendBundle) -> impl Future<Output = Result<(), ChainError>> + Send {
+            async { Err(silence()) }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_coin_listed_again_on_a_later_page_keeps_its_later_record() {
+        let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), Bytes32::new([9u8; 32]), u64::from(seed));
+        let rec = |c: Coin, height: u32, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: height, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
+        let mut gathered = PagedRecords::default();
+        gathered.fold(vec![rec(coin(2), 85, None), rec(coin(1), 80, None)]);
+        gathered.fold(vec![rec(coin(1), 80, Some(101)), rec(coin(3), 101, None)]);
+        let records = gathered.into_records();
+        assert_eq!(records.iter().map(|r| (r.coin.amount, r.spent)).collect::<Vec<_>>(), vec![(1, true), (2, false), (3, false)]);
+    }
 
     #[test]
     fn the_two_failures_read_apart() {
