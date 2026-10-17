@@ -8382,14 +8382,33 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   }
 
   // ── Cabinet shell: floor, back, sides, the skirt under the tray ───────────
-  place(new THREE.BoxGeometry(0.62, 0.03, 0.92), m(BODY, 0.55, 0.45), 0, 0.535, 0.05);
-  place(new THREE.BoxGeometry(0.62, 1.16, 0.03), m(BODY, 0.55, 0.45), 0, 1.13, 0.505);
-  for (const sx of [-0.295, 0.295]) {
-    place(new THREE.BoxGeometry(0.03, 0.92, 0.92), m(BODY, 0.55, 0.45), sx, 1.01, 0.05);
-    // Chrome edge where the glass meets the side.
-    place(new THREE.BoxGeometry(0.035, 0.92, 0.03), m(CHROME, 0.35, 0.7), sx, 1.01, -0.395);
-  }
-  place(new THREE.BoxGeometry(0.62, 0.22, 0.03), m(BODY, 0.55, 0.45), 0, 0.65, -0.395);
+  // Above the lower platform the cabinet is glass on three sides, as seaside
+  // pushers are, so a crowd can watch from the sides too; it leans in a
+  // little as it rises. sideX(y) is the outside of a side at height y.
+  const GLASS_Y0 = 0.80, GLASS_Y1 = 1.47;
+  const HALF_Y0 = 0.31, HALF_Y1 = 0.25;
+  const sideX = (y: number): number => HALF_Y0 + (HALF_Y1 - HALF_Y0) * (y - GLASS_Y0) / (GLASS_Y1 - GLASS_Y0);
+  const LEAN = Math.atan2(HALF_Y0 - HALF_Y1, GLASS_Y1 - GLASS_Y0);
+  const SIDE_LEN = Math.hypot(HALF_Y0 - HALF_Y1, GLASS_Y1 - GLASS_Y0);
+  /** A slab `depth` thick from y0 up to y1 whose left and right edges follow
+   *  xl(y) and xr(y): a box with its corners moved, placed at (0, 0, z). */
+  const slab = (y0: number, y1: number, depth: number, xl: (y: number) => number, xr: (y: number) => number,
+    mat: THREE.Material, z: number): THREE.Mesh => {
+    const g = new THREE.BoxGeometry(1, 1, depth);
+    const pos = g.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const y = y0 + (pos.getY(i) + 0.5) * (y1 - y0);
+      pos.setXY(i, pos.getX(i) < 0 ? xl(y) : xr(y), y);
+    }
+    g.computeVertexNormals();
+    return place(g, mat, 0, 0, z);
+  };
+  const bodyMat = m(BODY, 0.55, 0.45);
+  const chromeMat = m(CHROME, 0.35, 0.7);
+  place(new THREE.BoxGeometry(0.62, 0.03, 0.92), bodyMat, 0, 0.535, 0.05);
+  place(new THREE.BoxGeometry(0.62, GLASS_Y0 - 0.55, 0.03), bodyMat, 0, (GLASS_Y0 + 0.55) / 2, 0.505);
+  slab(GLASS_Y0, 1.49, 0.03, (y) => -sideX(y), (y) => sideX(y), bodyMat, 0.505);
+  place(new THREE.BoxGeometry(0.62, 0.22, 0.03), bodyMat, 0, 0.65, -0.395);
 
   // ── The channel: two platforms between lit side walls ─────────────────────
   // Solid blocks from the floor up, so the step and the platforms read as one
@@ -8401,8 +8420,11 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   place(new THREE.BoxGeometry(FIELD_W + 0.04, 0.03, 0.08), m(CHROME, 0.4, 0.5), 0, TRAY_Y - 0.015, TRAY_Z);
   place(new THREE.BoxGeometry(FIELD_W, 0.012, 0.06), m(0x14181e, 0.85, 0.1), 0, TRAY_Y + 0.004, TRAY_Z);
   // Side walls of the channel, and the panels out to the cabinet's sides,
-  // with a strip of warm light along the top of each wall.
-  const wallMat = m(0x161d2a, 0.8, 0.2);
+  // with a strip of warm light along the top of each wall. The walls are
+  // glass too, so the side windows look straight in at the coins.
+  const wallMat = m(GLASS, 0.05, 0.0);
+  wallMat.depthWrite = false;
+  wallMat.userData.baseOpacity = 0.10;
   const neonMat = m(NEON, 0.4, 0.2, NEON, 0.9);
   const lampMat = m(NEON, 0.4, 0.2, NEON, 0.6);
   for (const side of [-1, 1]) {
@@ -8410,12 +8432,17 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     place(new THREE.BoxGeometry(0.012, 0.62, 0.80), wallMat, wx, 1.09, 0.09);
     place(new THREE.BoxGeometry(0.014, 0.012, 0.80), neonMat, wx, 1.405, 0.09);
     // A fascia either side of the channel behind the glass, so the player
-    // looks in through a lit window: a gold edge and a column of lamps.
-    const fx = side * (FIELD_W / 2 + 0.012 + 0.085);
-    place(new THREE.BoxGeometry(0.17, 0.70, 0.02), m(BODY, 0.55, 0.45), fx, 1.11, -0.36);
+    // looks in through a lit window: a gold edge and a column of lamps. Its
+    // outer edge follows the cabinet's lean.
+    const inner = FIELD_W / 2 + 0.012;
+    const outer = (y: number): number => sideX(y) - 0.02;
+    slab(0.76, 1.46, 0.02,
+      side < 0 ? (y) => -outer(y) : () => inner,
+      side < 0 ? () => -inner : (y) => outer(y), bodyMat, -0.36);
     place(new THREE.BoxGeometry(0.008, 0.70, 0.024), m(GOLD, 0.35, 0.6), side * (FIELD_W / 2 + 0.016), 1.11, -0.36);
     for (let i = 0; i < 6; i++) {
-      place(new THREE.CircleGeometry(0.012, 16), lampMat, fx, 0.86 + i * 0.1, -0.3715, Math.PI);
+      const ly = 0.86 + i * 0.1;
+      place(new THREE.CircleGeometry(0.012, 16), lampMat, side * (inner + outer(ly)) / 2, ly, -0.3715, Math.PI);
     }
   }
 
@@ -8452,15 +8479,34 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     holeRimMeshes.push(rim);
   }
 
-  // ── Glass front ────────────────────────────────────────────────────────────
+  // ── Glass front, sides and roof ────────────────────────────────────────────
   const frontGlass = m(GLASS, 0.05, 0.0);
   frontGlass.transparent = true;
   frontGlass.depthWrite = false;
   frontGlass.userData.baseOpacity = 0.16;
-  place(new THREE.BoxGeometry(0.56, 0.70, 0.006), frontGlass, 0, 1.11, -0.385);
-  place(new THREE.BoxGeometry(0.62, 0.03, 0.04), m(CHROME, 0.35, 0.7), 0, 1.475, -0.385);
+  slab(0.76, 1.46, 0.006, (y) => -(sideX(y) - 0.03), (y) => sideX(y) - 0.03, frontGlass, -0.385);
+  place(new THREE.BoxGeometry(2 * sideX(1.475), 0.03, 0.04), chromeMat, 0, 1.475, -0.385);
   // A glass roof back to the backbox, so the playfield shows from above too.
-  place(new THREE.BoxGeometry(0.56, 0.006, 0.70), frontGlass, 0, 1.485, -0.045);
+  place(new THREE.BoxGeometry(2 * sideX(1.485) - 0.04, 0.006, 0.70), frontGlass, 0, 1.485, -0.045);
+  // The side windows: a solid panel up to the lower platform, then a pane
+  // leaning in, framed in chrome.
+  const sideGlass = m(GLASS, 0.05, 0.0);
+  sideGlass.depthWrite = false;
+  sideGlass.userData.baseOpacity = 0.12;
+  const glassMidY = (GLASS_Y0 + GLASS_Y1) / 2;
+  for (const side of [-1, 1]) {
+    place(new THREE.BoxGeometry(0.03, GLASS_Y0 - 0.55, 0.92), bodyMat, side * (HALF_Y0 - 0.015), (GLASS_Y0 + 0.55) / 2, 0.05);
+    const leanIn = (mesh: THREE.Mesh): THREE.Mesh => { mesh.rotation.z = side * LEAN; return mesh; };
+    const midX = side * (sideX(glassMidY) - 0.015);
+    leanIn(place(new THREE.BoxGeometry(0.006, SIDE_LEN, 0.86), sideGlass, midX, glassMidY, 0.05));
+    // Front and back posts, and rails along the bottom and top.
+    for (const z of [-0.395, 0.475]) {
+      leanIn(place(new THREE.BoxGeometry(0.035, SIDE_LEN, 0.03), chromeMat, midX, glassMidY, z));
+    }
+    for (const y of [GLASS_Y0, GLASS_Y1]) {
+      place(new THREE.BoxGeometry(0.035, 0.02, 0.90), chromeMat, side * (sideX(y) - 0.0175), y, 0.04);
+    }
+  }
 
   // ── Backbox with the marquee, above the board ─────────────────────────────
   place(new THREE.BoxGeometry(0.62, 0.26, 0.20), m(BODY, 0.55, 0.45), 0, 1.62, 0.41);
