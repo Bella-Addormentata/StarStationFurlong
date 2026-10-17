@@ -219,11 +219,20 @@ function framePoses(replay: Replay, t: number): Map<number, TablePose> {
 
 /** Where a chip falling into the tray is drawn, `s` of the way there. */
 function payPose(id: number, from: TablePose, s: number, geom: ReplayGeometry): TablePose {
-  const lip = PLAT_LOW_FRONT + CHIP_R;
-  const x = lerp(Math.max(from.x, lip - CHIP_R), lip + 2 * CHIP_R, s);
-  const y = lerp(from.y, -geom.trayDrop + geom.level / 2, s * s);
-  return { chipId: id, x, u: from.u, y, tip: 0 };
+  // Off the front along the deck until its back is past the lip, then down.
+  const clear = Math.max(from.x, PLAT_LOW_FRONT + CHIP_R);
+  if (s < EDGE_SHARE) return { chipId: id, x: lerp(from.x, clear, s / EDGE_SHARE), u: from.u, y: from.y, tip: 0 };
+  const d = (s - EDGE_SHARE) / (1 - EDGE_SHARE);
+  return {
+    chipId: id, x: lerp(clear, clear + CHIP_R, d), u: from.u,
+    y: lerp(from.y, -geom.trayDrop + geom.level / 2, d * d), tip: 0,
+  };
 }
+
+/** The share of a step down or a payout spent sliding over the edge before
+ *  the chip falls: it falls only once its back is past the edge, so it never
+ *  dips into the platform it is leaving. */
+const EDGE_SHARE = 0.4;
 
 /** Everything the cabinet draws `t` ms after the drop's coin went in. */
 export function replayView(replay: Replay, t: number): ReplayView {
@@ -258,12 +267,15 @@ export function replayView(replay: Replay, t: number): ReplayView {
         const x = Math.max(lerp(from.x, cur.x, s), backOf(cur, geom) + reachBack(a, geom));
         table.set(id, { ...blend(from, cur, s), x, y: support + reachBelow(a, geom), tip });
       } else {
-        // Off the upper front: forward along the platform, then down.
-        const edge = Math.max(from.x, PLAT_UP_FRONT);
+        // Off the upper front: forward along the platform until its back is
+        // past the edge, then down onto the lower one (which it lands on
+        // clear of the edge too: dropToLower).
+        const clear = Math.max(from.x, PLAT_UP_FRONT + CHIP_R);
+        const d = (s - EDGE_SHARE) / (1 - EDGE_SHARE);
         table.set(id, {
           ...blend(from, cur, s),
-          x: s < 0.4 ? lerp(from.x, edge, s / 0.4) : lerp(edge, cur.x, (s - 0.4) / 0.6),
-          y: s < 0.4 ? from.y : lerp(from.y, cur.y, ((s - 0.4) / 0.6) ** 2),
+          x: s < EDGE_SHARE ? lerp(from.x, clear, s / EDGE_SHARE) : lerp(clear, Math.max(cur.x, clear), d),
+          y: s < EDGE_SHARE ? from.y : lerp(from.y, cur.y, d * d),
         });
       }
     }
@@ -327,6 +339,28 @@ export function planDrops(prev: CoinPusherState, next: CoinPusherState, geom: Re
     before = trace.after;
   }
   return out;
+}
+
+/** How many drops a cabinet replays at once. A replay lasts its coin's fall
+ *  (a second or two, up to BOARD_MAX_MS) plus a pusher cycle, and holds the
+ *  table after each of its few dozen substeps; this keeps a crowd dropping
+ *  several chips a second all drawn, and the memory bounded. Past it the
+ *  oldest goes, as the history of drops (RECENT_DROPS_MAX) never needs to:
+ *  that only covers what settles between two frames. */
+export const REPLAY_MAX = 32;
+
+/**
+ * A new record seen: every drop since the one before queued behind the
+ * replays still playing, and those that are over by `now` left out. When the
+ * new drops can't all be replayed (planDrops), the queue is dropped and the
+ * cabinet draws the record.
+ */
+export function queueDrops(
+  replays: readonly ScheduledReplay[], prev: CoinPusherState, next: CoinPusherState, now: number, geom: ReplayGeometry,
+): ScheduledReplay[] {
+  const planned = planDrops(prev, next, geom);
+  if (!planned) return [];
+  return [...replays, ...planned.filter((r) => now - r.startMs < r.plan.endMs)].slice(-REPLAY_MAX);
 }
 
 /** Everything the cabinet draws while drops are replaying: the table, and

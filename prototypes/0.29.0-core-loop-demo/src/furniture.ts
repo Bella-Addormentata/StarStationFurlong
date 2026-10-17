@@ -51,11 +51,11 @@ import type {
 // state, and every drop replayed from its seed (coinPusherReplay.ts).
 import {
   BOARD_H, BOARD_PEGS, CHIP_R, CHIP_T, FIELD_HALF_W, HOLE_US, PEG_R,
-  RECENT_DROPS_MAX, currentPusherPhase, pusherFaceX, unseenDropHoles,
+  currentPusherPhase, pusherFaceX, unseenDropHoles,
   type CoinPusherState,
 } from "./games/coinPusher";
 import {
-  cabinetView, planDrops, restingView, type CabinetView, type ReplayGeometry, type ScheduledReplay, type TablePose,
+  cabinetView, queueDrops, restingView, type CabinetView, type ReplayGeometry, type ScheduledReplay, type TablePose,
 } from "./coinPusherReplay";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
 import { createArcadeScreenPainter } from "./arcadeScreen";
@@ -8597,10 +8597,7 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     const prev = seen;
     seen = state;
     if (!state || (prev && prev.tick === state.tick && prev.nextChipId === state.nextChipId)) return;
-    const planned = prev ? planDrops(prev, state, geom) : null;
-    replays = planned
-      ? [...replays, ...planned.filter((r) => now - r.startMs < r.plan.endMs)].slice(-RECENT_DROPS_MAX)
-      : [];
+    replays = prev ? queueDrops(replays, prev, state, now, geom) : [];
   };
 
   /** A coin on its way down the board or the chute. */

@@ -6,11 +6,12 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  CHIP_R, chipsInMachine, currentPusherPhase, emptyMachine, pusherFaceX, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
+  CHIP_R, chipsInMachine, currentPusherPhase, emptyMachine, PLAT_LOW_FRONT, PLAT_UP_FRONT, pusherFaceX,
+  RECENT_DROPS_MAX, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
   type CoinPusherState, type DropTrace, type PusherDropMark, type PusherHole,
 } from './games/coinPusher';
 import {
-  cabinetView, PAY_MS, planDrops, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
+  cabinetView, PAY_MS, planDrops, queueDrops, REPLAY_MAX, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
 } from './coinPusherReplay';
 
 const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088 };
@@ -121,7 +122,7 @@ describe('coin pusher replay', () => {
     const plan = planReplay(before, trace, GEOM);
     const chip = r.paidChipIds[0];
     const out = plan.transitions.get(chip)!.find((t) => t.kind === 'pay')!;
-    const falling = replayView(plan, out.t + PAY_MS / 2).table.find((p) => p.chipId === chip)!;
+    const falling = replayView(plan, out.t + PAY_MS * 0.8).table.find((p) => p.chipId === chip)!;
     expect(falling.y).toBeLessThan(-GEOM.lowerDrop);
     expect(replayView(plan, out.t + PAY_MS).table.some((p) => p.chipId === chip)).toBe(false);
     expect(chipsInMachine(r.state)).toBe(chipsInMachine(before) + 1 - r.paid);
@@ -211,5 +212,76 @@ describe('coin pusher replay', () => {
     const mark = { chipId: r.chipId, hole: 1 as PusherHole, phase: 0.3, atMs: 1_000, seed: 9 };
     expect(planDrops(before, { ...r.state, recentDrops: [mark] }, GEOM)).toBeNull();
     expect(planDrops(emptied, { ...r.state, recentDrops: [mark] }, GEOM)).toHaveLength(1);
+  });
+
+  /** A crowd at the machine: `polls` operator polls `pollMs` apart, each
+   *  settling `perPoll` drops, as pusherCroupier writes them. */
+  function crowd(start: CoinPusherState, polls: number, perPoll: number, pollMs: number, at: number) {
+    const records: { state: CoinPusherState; atMs: number }[] = [];
+    let s = start;
+    for (let k = 0; k < polls; k++) {
+      const atMs = at + k * pollMs;
+      for (let j = 0; j < perPoll; j++) {
+        const hole = ((k + j) % 3) as PusherHole;
+        const phase = currentPusherPhase(s, atMs);
+        const seed = 1_000 + k * perPoll + j;
+        const r = processInsert(s, 'p', hole, phase, seed);
+        s = { ...r.state, recentDrops: [...(s.recentDrops ?? []), { chipId: r.chipId, hole, phase, atMs, seed }].slice(-RECENT_DROPS_MAX) };
+      }
+      records.push({ state: s, atMs });
+    }
+    return records;
+  }
+
+  it('keeps every coin of a crowd in the air, past the history of drops', () => {
+    // Twelve drops in three polls, seen poll by poll: more than the eight
+    // marks a record keeps, all on the board at once.
+    const start = fill(30);
+    const records = crowd(start, 3, 4, 100, 80_000);
+    let replays = queueDrops([], start, records[0].state, records[0].atMs, GEOM);
+    for (let k = 1; k < records.length; k++) {
+      replays = queueDrops(replays, records[k - 1].state, records[k].state, records[k].atMs, GEOM);
+    }
+    expect(replays).toHaveLength(12);
+    const view = cabinetView(replays, records[2].atMs + 50).view!;
+    expect(view.boards).toHaveLength(12);
+    expect(REPLAY_MAX).toBeGreaterThan(RECENT_DROPS_MAX);
+  });
+
+  it('never draws a chip inside a platform: off an edge only once clear of it', () => {
+    // Every chip of every view of a busy machine's replays, through steps
+    // down, payouts and tips at once: wherever its back is still over a
+    // deck, its lowest point is on or above that deck.
+    const start = fill(120);
+    const records = crowd(start, 10, 2, 400, 90_000);
+    let replays: ReturnType<typeof queueDrops> = [];
+    let prev = start;
+    let steps = 0;
+    let pays = 0;
+    for (const rec of records) {
+      replays = queueDrops(replays, prev, rec.state, rec.atMs, GEOM);
+      prev = rec.state;
+      for (const r of replays) {
+        for (const list of r.plan.transitions.values()) {
+          for (const tr of list) { if (tr.kind === 'step') steps++; if (tr.kind === 'pay') pays++; }
+        }
+      }
+    }
+    const all = queueDrops([], start, records[0].state, records[0].atMs, GEOM)
+      .concat(...records.slice(1).map((rec, k) => queueDrops([], records[k].state, rec.state, rec.atMs, GEOM)));
+    const end = Math.max(...all.map((r) => r.startMs + r.plan.endMs));
+    for (let t = records[0].atMs; t <= end; t += 7) {
+      const view = cabinetView(all, t).view;
+      if (!view) continue;
+      for (const p of view.table) {
+        const a = p.tip * Math.PI / 2;
+        const bottom = p.y - reachBelow(a, GEOM);
+        const back = p.x - reachBack(a, GEOM);
+        if (back < PLAT_UP_FRONT - 1e-9) expect(bottom).toBeGreaterThanOrEqual(-1e-6);
+        if (back < PLAT_LOW_FRONT - 1e-9) expect(bottom).toBeGreaterThanOrEqual(-GEOM.lowerDrop - 1e-6);
+      }
+    }
+    expect(steps).toBeGreaterThan(0);
+    expect(pays).toBeGreaterThan(0);
   });
 });
