@@ -13,6 +13,7 @@ import {
   chooseArrivalDoor,
   doorBeingCrossed,
   doorFaceWorld,
+  inwardFirstPersonYaw,
   pickFacingDoor,
   type ArrivalDoor,
   type CrossingDoor,
@@ -472,5 +473,46 @@ describe('🚶 the door the walker is pressed into (#182)', () => {
   it('returns null for a doorless room', () => {
     expect(crossing([], 5.5, 0)).toBeNull();
     expect(crossing([], 0, 0)).toBeNull();
+  });
+});
+
+
+describe('🚶🧭 first person arrives facing straight into the room', () => {
+  // doorLayout.poseFromWall's outward normals, one per wall.
+  const OUTWARD: Record<DoorWall, number> = {
+    'y-': Math.PI,
+    'y+': 0,
+    'x-': -Math.PI / 2,
+    'x+': Math.PI / 2,
+  };
+  // Where a door on each wall sits, relative to the room centre.
+  const DOOR_AT: Record<DoorWall, { x: number; z: number }> = {
+    'y-': { x: 0, z: -6 },
+    'y+': { x: 0, z: 6 },
+    'x-': { x: -6, z: 0 },
+    'x+': { x: 6, z: 0 },
+  };
+
+  it('looks from each wall straight at the opposite wall, square to the frame', () => {
+    for (const wall of Object.keys(OUTWARD) as DoorWall[]) {
+      const yaw = inwardFirstPersonYaw(OUTWARD[wall]);
+      // The look's XZ forward is (sin, cos) of its yaw.
+      const fx = Math.sin(yaw);
+      const fz = Math.cos(yaw);
+      const door = DOOR_AT[wall];
+      const len = Math.hypot(door.x, door.z);
+      // Pointing back at the room centre: exactly opposite the door's offset.
+      expect(fx).toBeCloseTo(-door.x / len, 12);
+      expect(fz).toBeCloseTo(-door.z / len, 12);
+    }
+  });
+
+  it('folds into (−π, π] whatever outward yaw it is handed', () => {
+    for (const out of [0, Math.PI, -Math.PI, Math.PI / 2, -Math.PI / 2, 5 * Math.PI, -7.25]) {
+      const yaw = inwardFirstPersonYaw(out);
+      expect(yaw).toBeGreaterThan(-Math.PI);
+      expect(yaw).toBeLessThanOrEqual(Math.PI);
+      expect(angDiff(yaw, out + Math.PI)).toBeCloseTo(0, 12);
+    }
   });
 });

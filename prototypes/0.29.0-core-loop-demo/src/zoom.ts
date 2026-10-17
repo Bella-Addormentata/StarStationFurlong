@@ -407,6 +407,17 @@ export class MultiScaleZoomView {
     if (this.currentLevel === 2) this.zoomIn();
   }
 
+  /**
+   * 🚶🧭 Turn the first-person look to `heading` (radians, same convention as
+   * the mouse-look yaw), keeping the up/down tilt. Used on arrival through a
+   * door so the view faces straight into the new room. Does nothing outside
+   * first person: the room views have their own camera.
+   */
+  public faceFirstPersonHeading(heading: number): void {
+    if (this.currentLevel !== 1 || !Number.isFinite(heading)) return;
+    yaw = heading;
+  }
+
   /** Return from level 1 to the orthographic room view, then run `onReady`. */
   public requestRoomView(onReady: () => void): void {
     if (this.currentLevel === 2) {
