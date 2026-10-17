@@ -2717,7 +2717,10 @@ async fn beacon_fallback(hub: &SharedHub, iroh_ep: &IrohEndpoint, room_id: &str,
         }
         last.insert(room_id.to_string(), std::time::Instant::now());
     }
-    let client = chia_chain::connect();
+    // A beacon is signed by the node it names and checked when decoded, so the
+    // chain is only its carrier: the first reachable peer will do (plan §14 (5)),
+    // as for the presence reader and the watcher.
+    let client = chia_chain::connect_carrier();
     let now = chia_resolve::unix_now();
     let Some(peak) = chia_resolve::peak_height(&client).await else { return };
     let beacons = match chia_resolve::read_beacons(&client, peak, now).await {
