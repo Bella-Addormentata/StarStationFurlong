@@ -23,7 +23,7 @@ use chia_bls::{aggregate, sign, PublicKey, SecretKey, Signature};
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_puzzle_types::standard::StandardArgs;
 use chia_puzzle_types::DeriveSynthetic;
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
+use crate::chia_chain::{ChainAccess, ChainError};
 use chia_sdk_driver::{SpendContext, StandardLayer};
 use chia_sdk_signer::{AggSigConstants, RequiredSignature};
 use chia_sdk_types::{Conditions, TESTNET11_CONSTANTS};
@@ -490,7 +490,7 @@ impl WalletLease {
     /// lease gate (every writer does; the dish's status read takes it for
     /// this), and `release` is compare-and-release besides, so a verdict can
     /// never remove a marker parked after it was formed.
-    pub async fn reconcile(&self, client: &CoinsetClient) {
+    pub async fn reconcile(&self, client: &impl ChainAccess) {
         let due = self.due_at(Instant::now());
         if due.is_empty() {
             return;
@@ -504,24 +504,17 @@ impl WalletLease {
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
         let complete = loop {
-            let resp = match client
-                .get_coin_records_by_names(coins.clone(), None, None, Some(true), cursor.take())
-                .await
-            {
-                Ok(resp) if resp.success => resp,
-                Ok(resp) => {
-                    eprintln!("⛓️ wallet lease: coin lookup unsuccessful ({:?}); parked coins stay parked", resp.error);
-                    return;
-                }
+            let listing = match client.coin_records_by_names(coins.clone(), true, cursor.take()).await {
+                Ok(listing) => listing,
                 Err(e) => {
-                    eprintln!("⛓️ wallet lease: coin lookup failed ({e}); parked coins stay parked");
+                    eprintln!("⛓️ wallet lease: coin lookup {e}; parked coins stay parked");
                     return;
                 }
             };
             pages += 1;
-            records.extend(resp.coin_records.unwrap_or_default());
-            let truncated = resp.truncated.unwrap_or(false);
-            match resp.next_cursor {
+            records.extend(listing.records);
+            let truncated = listing.truncated;
+            match listing.next_cursor {
                 Some(next) if truncated => {
                     if pages >= MAX_RECONCILE_PAGES {
                         break false;
@@ -542,14 +535,10 @@ impl WalletLease {
             self.probe_cursor.store(*last, std::sync::atomic::Ordering::Relaxed);
         }
         for (spend, coin) in probes {
-            let seen = match client.get_mempool_items_by_coin_name(coin).await {
-                Ok(resp) if resp.success => Some(resp.mempool_items.is_some_and(|items| !items.is_empty())),
-                Ok(resp) => {
-                    eprintln!("⛓️ wallet lease: mempool lookup unsuccessful ({:?}); spend stays parked", resp.error);
-                    None
-                }
+            let seen = match client.coin_in_mempool(coin).await {
+                Ok(seen) => Some(seen),
                 Err(e) => {
-                    eprintln!("⛓️ wallet lease: mempool lookup failed ({e}); spend stays parked");
+                    eprintln!("⛓️ wallet lease: mempool lookup {e}; spend stays parked");
                     None
                 }
             };
@@ -566,11 +555,12 @@ impl WalletLease {
 /// review, round 9). The three outcomes of a push, and what each leaves:
 ///   - accepted (`Ok`): the inputs stay parked until the chain or the mempool
 ///     settles the spend ([`WalletLease::reconcile`]);
-///   - rejected by the gateway (an explicit `success: false`,
+///   - refused by the chain source ([`ChainError::Refused`], surfaced as
 ///     [`PushError::Rejected`]): it holds nothing of the spend, so the inputs
 ///     are handed back at once;
-///   - a transport error (a timeout above all, [`PushError::Unanswered`]):
-///     INDETERMINATE — the request may have reached the gateway and the spend
+///   - a transport error (a timeout above all, [`ChainError::Unanswered`],
+///     surfaced as [`PushError::Unanswered`]): INDETERMINATE — the request may
+///     have reached the chain and the spend
 ///     may be in the mempool while the chain still lists the inputs unspent —
 ///     so the inputs stay parked and reconciliation settles them (dropped: free
 ///     again after the grace; landed: gone with the confirmation).
@@ -582,7 +572,7 @@ impl WalletLease {
 /// Callers hold the lease gate. For the dish's TAKE the input is the FAUCET
 /// coin, not ours: parking it keeps a second TAKE off it the same way.
 pub async fn push_parked(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = Bytes32>,
 ) -> Result<(), PushError> {
@@ -595,30 +585,29 @@ pub async fn push_parked(
 /// leaves, since a restart would forget it (#245 review, round 19).
 pub async fn push_parked_with(
     lease: &WalletLease,
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = Bytes32>,
 ) -> Result<(), PushError> {
     let parking = lease.park(inputs).map_err(PushError::NotSent)?;
-    let resp = match client.push_tx(bundle).await {
-        Ok(resp) => resp,
-        Err(e) => return Err(PushError::Unanswered(anyhow::Error::new(e))),
-    };
-    if !resp.success {
-        lease.unpark(&parking);
-        return Err(PushError::Rejected(resp.error.unwrap_or_else(|| "no reason given".to_string())));
+    match client.push_tx(bundle).await {
+        Ok(()) => Ok(()),
+        Err(ChainError::Refused(why)) => {
+            lease.unpark(&parking);
+            Err(PushError::Rejected(why))
+        }
+        Err(ChainError::Unanswered(e)) => Err(PushError::Unanswered(e)),
     }
-    Ok(())
 }
 
 /// How a push through [`push_parked`] failed, and what it left behind.
 #[derive(Debug)]
 pub enum PushError {
-    /// The gateway answered `success: false` (its reason inside): it holds
+    /// The chain source refused the spend (its reason inside): it holds
     /// nothing of the spend, and the inputs were handed back. Nothing was
     /// spent, so the action can be refused outright and tried again.
     Rejected(String),
-    /// The gateway did not answer (a timeout, a dropped connection): the bundle
+    /// The chain source did not answer (a timeout, a dropped connection): the bundle
     /// may be in the mempool all the same, so the inputs stay parked until
     /// reconciliation settles the spend. NOT a refusal: a caller that reported
     /// it as one would let its user spend again, from other coins, while the
@@ -636,7 +625,7 @@ impl std::fmt::Display for PushError {
             Self::Rejected(reason) => write!(f, "push_tx rejected: {reason}"),
             Self::Unanswered(e) => write!(
                 f,
-                "coinset push_tx unanswered: {e:#} (the coins it spends stay parked until the chain or the mempool settles them)"
+                "push_tx unanswered: {e:#} (the coins it spends stay parked until the chain or the mempool settles them)"
             ),
             Self::NotSent(e) => write!(f, "spend not sent: {e}"),
         }
@@ -753,7 +742,7 @@ impl Default for WalletLease {
 /// parked coins while a free one sits on the next, and a one-page read then
 /// called a funded wallet unfunded (#245 review, round 9).
 pub async fn find_spendable_coin(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     puzzle_hash: Bytes32,
 ) -> Result<Option<Coin>> {
     let listing = crate::chia_faucet::unspent_at(client, puzzle_hash).await?;
@@ -1061,7 +1050,7 @@ pub async fn publish_node_presence(
 
     let _lease = WALLET_LEASE.lock().await;
     WALLET_LEASE.ensure_open()?;
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     WALLET_LEASE.reconcile(&client).await;
     // A spend of ours still settling (the previous presence write, or a room
     // publish) keeps its coin parked — and a wallet holding more coins would
@@ -1111,7 +1100,7 @@ pub async fn heartbeat_loop(
     let self_id = iroh_sk.public().to_string();
     let mut node_attempt: Option<Instant> = None;
     let mut era_guard_logged = false;
-    let peak_client = CoinsetClient::testnet11();
+    let peak_client = crate::chia_chain::connect();
     // Without the watcher nothing ever reads our record back, so the gateway's
     // acceptance is the only confirmation there is.
     let watcher_confirms = crate::chia_watch::watch_enabled();
@@ -1321,7 +1310,7 @@ pub async fn publish_presence(
     // A sealed lease refuses before any gateway read (push_parked would refuse
     // regardless; this spares the reads and names the reason at once).
     WALLET_LEASE.ensure_open()?;
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     WALLET_LEASE.reconcile(&client).await;
     let our_ph = our_puzzle_hash(chia_sk);
     let coin = find_spendable_coin(&client, our_ph)
@@ -1514,14 +1503,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_unanswered_push_is_not_a_rejection_and_keeps_its_inputs_parked() {
-        // Nothing listens here, so the push gets no answer from any gateway: the
-        // outcome is INDETERMINATE (a timeout reads the same), not a refusal.
-        let client = CoinsetClient::new("http://127.0.0.1:9".to_string());
+        // The chain never answers (the test chain says so, as a dead gateway or
+        // a timeout would): the outcome is INDETERMINATE, not a refusal.
+        let client = crate::chia_chain::testing::Unanswering;
         let coin = Bytes32::new([42u8; 32]);
         let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
         let outcome = tokio::time::timeout(Duration::from_secs(20), push_parked(&client, bundle, [coin]))
             .await
-            .expect("a refused connection answers at once");
+            .expect("the test chain answers at once");
         assert!(matches!(outcome, Err(PushError::Unanswered(_))), "{outcome:?}");
         // The coin stays parked for reconciliation to settle, and the error says
         // so: it is what a caller passes on when it cannot tell its user that
@@ -1688,9 +1677,9 @@ mod tests {
         assert!(!lease.is_pending(&ours), "a parking that was not saved is not kept either");
         assert!(matches!(lease.mark_incoming(faucet_coin), Err(LeaseError::Unsaved(_))));
         assert!(!lease.incoming_pending());
-        // Through push_parked the spend is NOT SENT: no gateway is asked (none
-        // listens here; had one been asked, the outcome would read unanswered).
-        let client = CoinsetClient::new("http://127.0.0.1:9".to_string());
+        // Through push_parked the spend is NOT SENT: the chain is never asked
+        // (had it been, the test chain would have read unanswered).
+        let client = crate::chia_chain::testing::Unanswering;
         let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
         let outcome = push_parked_with(&lease, &client, bundle, [ours]).await;
         assert!(matches!(outcome, Err(PushError::NotSent(LeaseError::Unsaved(_)))), "{outcome:?}");

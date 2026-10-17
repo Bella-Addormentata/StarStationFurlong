@@ -30,7 +30,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes32, Coin};
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
+use crate::chia_chain::ChainAccess;
 use clvm_traits::{clvm_curried_args, clvm_list, ToClvm};
 use clvm_utils::{CurriedProgram, ToTreeHash, TreeHash};
 use clvmr::serde::node_from_bytes;
@@ -312,29 +312,26 @@ pub struct Unspent {
     pub partial: bool,
 }
 
-/// The unspent coins at `puzzle_hash`, following the gateway's cursor.
-pub async fn unspent_at(client: &CoinsetClient, puzzle_hash: Bytes32) -> Result<Unspent> {
+/// The unspent coins at `puzzle_hash`, following the listing's cursor.
+pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<Unspent> {
     let mut coins = Vec::new();
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
     let partial = loop {
-        let resp = client
-            .get_coin_records_by_puzzle_hash(puzzle_hash, None, None, Some(false), cursor.take())
+        let listing = client
+            .coin_records_by_puzzle_hash(puzzle_hash, false, cursor.take())
             .await
-            .map_err(|e| anyhow!("coinset get_coin_records_by_puzzle_hash failed: {e}"))?;
-        if !resp.success {
-            return Err(anyhow!("coin lookup unsuccessful: {:?}", resp.error));
-        }
+            .map_err(|e| anyhow!("coin lookup: {e}"))?;
         pages += 1;
         coins.extend(
-            resp.coin_records
-                .unwrap_or_default()
+            listing
+                .records
                 .into_iter()
                 .filter(|r| !r.spent)
                 .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index }),
         );
-        let truncated = resp.truncated.unwrap_or(false);
-        match resp.next_cursor {
+        let truncated = listing.truncated;
+        match listing.next_cursor {
             Some(next) if truncated => {
                 if pages >= MAX_FAUCET_PAGES {
                     break true;
@@ -430,7 +427,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
         );
     };
     let params = FaucetParams::for_room(&room_key);
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let result = match req.op.as_str() {
         "status" => status(ctx, &client, &params).await.map(|s| FaucetReply {
             op: "status".into(),
@@ -474,7 +471,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
     }
 }
 
-async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetParams) -> Result<FaucetStatus> {
+async fn status(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetStatus> {
     // One snapshot at a time, numbered as it completes (see STATUS_TURN). Taken
     // before the wallet lease below, never after it: the writers take the lease
     // alone, so the two never wait on each other in a cycle.
@@ -483,7 +480,7 @@ async fn status(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &Faucet
 }
 
 /// The snapshot itself; the caller holds `STATUS_TURN`.
-async fn status_under_turn(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetParams) -> Result<FaucetStatus> {
+async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetStatus> {
     let peak = crate::chia_resolve::peak_height(client)
         .await
         .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
@@ -558,7 +555,7 @@ impl WalletView {
 }
 
 #[cfg(feature = "chia-publish")]
-async fn wallet_view(client: &CoinsetClient, sk: &chia_bls::SecretKey) -> Result<WalletView> {
+async fn wallet_view(client: &impl ChainAccess, sk: &chia_bls::SecretKey) -> Result<WalletView> {
     let ph = crate::chia_publish::our_puzzle_hash(sk);
     let listing = unspent_at(client, ph).await?;
     let owned: Vec<Coin> = listing.coins.into_iter().map(|c| c.coin).collect();
@@ -678,7 +675,7 @@ fn wallet_part(
 
 /// CLAIM: spend the readiest faucet coin, GIFT to our own address, keyless.
 #[cfg(feature = "chia-publish")]
-async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetParams) -> Result<FaucetReply> {
+async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetReply> {
     use chia_protocol::{CoinSpend, Program, SpendBundle};
     use clvmr::serde::node_to_bytes;
 
@@ -778,7 +775,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &CoinsetClient, params: &FaucetP
 }
 
 #[cfg(not(feature = "chia-publish"))]
-async fn claim(_ctx: &FaucetContext<'_>, _client: &CoinsetClient, _params: &FaucetParams) -> Result<FaucetReply> {
+async fn claim(_ctx: &FaucetContext<'_>, _client: &impl ChainAccess, _params: &FaucetParams) -> Result<FaucetReply> {
     Err(anyhow!("this node was built without publishing; it cannot take a mojo"))
 }
 
@@ -787,7 +784,7 @@ async fn claim(_ctx: &FaucetContext<'_>, _client: &CoinsetClient, _params: &Fauc
 #[cfg(feature = "chia-publish")]
 async fn give(
     ctx: &FaucetContext<'_>,
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     params: &FaucetParams,
     amount: u64,
 ) -> Result<FaucetReply> {
@@ -873,7 +870,7 @@ async fn give(
 #[cfg(not(feature = "chia-publish"))]
 async fn give(
     _ctx: &FaucetContext<'_>,
-    _client: &CoinsetClient,
+    _client: &impl ChainAccess,
     _params: &FaucetParams,
     _amount: u64,
 ) -> Result<FaucetReply> {

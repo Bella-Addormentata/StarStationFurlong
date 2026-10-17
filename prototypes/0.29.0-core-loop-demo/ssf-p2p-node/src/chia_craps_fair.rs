@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use chia_bls::SecretKey;
 use chia_protocol::{Bytes, Bytes32, Coin};
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
+use crate::chia_chain::ChainAccess;
 use sha2::{Digest, Sha256};
 
 use crate::chia_faucet::{unspent_at, MAX_FAUCET_PAGES};
@@ -98,7 +98,7 @@ pub fn derive_dice(seed_hex: &str, beacon_hex: &str, table: &str, round: u64) ->
 /// may still have landed, so the coin stays parked until the chain or the
 /// mempool settles it; an outright rejection frees it).
 async fn push_fair_record(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     chia_sk: &SecretKey,
     coin: Coin,
     table: &str,
@@ -124,7 +124,7 @@ async fn push_fair_record(
 /// listing cut short that does not show `spent` proves nothing either way
 /// ([`confirmed_gone`]): the wait goes on.
 async fn wait_for_next_coin(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     our_ph: Bytes32,
     spent: &Coin,
 ) -> Result<Coin> {
@@ -164,16 +164,13 @@ fn confirmed_gone(listing_complete: bool, unspent: &[Coin], spent: &Coin) -> boo
 /// Resolve every PUBLIC fairness record published under (table, round): the raw
 /// plaintext payloads (commit and/or reveal), in confirmation order. Read-only.
 pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>>> {
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let hint = fair_hint(table, round);
-    let resp = client
-        .get_coin_records_by_hint(hint, None, None, Some(true), None)
+    let mut records = client
+        .coin_records_by_hint(hint, None, true, None)
         .await
-        .map_err(|e| anyhow!("get_coin_records_by_hint: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("hint lookup unsuccessful: {:?}", resp.error));
-    }
-    let mut records = resp.coin_records.unwrap_or_default();
+        .map_err(|e| anyhow!("hint lookup: {e}"))?
+        .records;
     records.sort_by_key(|r| r.confirmed_block_index);
     let mut out = Vec::new();
     for rec in records {
@@ -196,7 +193,7 @@ pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>
 /// re-derive + verify the dice — proving the on-chain fairness transcript loop.
 /// T1 uses a placeholder beacon; T2 swaps in a real testnet block header_hash.
 pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let our_ph = our_puzzle_hash(chia_sk);
 
     // Unique per run so re-runs don't pile records under one hint.
