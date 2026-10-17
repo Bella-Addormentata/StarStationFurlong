@@ -26,8 +26,9 @@
 //! planned into holds in the private rooms it was met in. Our own record is
 //! read too, so seeing it confirm restarts the dance exactly as a room record
 //! did. The watcher also publishes the chain peak it saw (`hub.chia_peak`:
-//! height and read time as one snapshot), the era clock for the inbound marks
-//! and the presence publisher.
+//! height and read time as one snapshot), the era clock for the inbound marks.
+//! The presence publisher reads its era from the AGREED lane instead: one
+//! carrier peer's height is not what a signed write is filed under.
 //!
 //! Pure pieces ([`BeatSchedule`], [`plan_holds`]) are unit-tested; the loop
 //! itself is thin glue over them, the reader and `main::hold_dial`.
