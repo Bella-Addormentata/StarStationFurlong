@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- **🚪🔒 You walk the whole tube, bent or long, before the airlock swaps rooms ([#269](https://github.com/Bella-Addormentata/StarStationFurlong/pull/269)).** In first person, walking through a public door now carries you along the full length of the tube between the modules. The walk follows every bend of a connector chain, with the view turning as you go, and a shut door waits at the far end. The room is swapped there with both doors shut, and that door then opens. A long gangway takes as long to cross as its length says, at walking pace. Bent tubes no longer fade. If the crossing fails, you walk back the same way, round the bends. The isometric view keeps its short step and the fade.
+
 - **🏒⚙ The air hockey table has one settings gear, by the scoreboard ([#266](https://github.com/Bella-Addormentata/StarStationFurlong/pull/266)).** The two gears on the end rails are replaced by a single gear on the long side rail at the centre line, right at the foot of the scoreboard pole, where either player can reach it. The card it opens is unchanged.
 
 - **🚪🔒 Public doors work like an airlock in first person ([#265](https://github.com/Bella-Addormentata/StarStationFurlong/pull/265)).** Walking through a public door in first person now takes you into the vestibule with the door shutting behind you, and the next module is swapped in while both doors are shut, so there is no fade to black. The tube stays lit amber while the next room loads, then the far door opens and you walk in. Bent connector tubes, the isometric view and owner-only doors keep the fade for now. Each player cycles the airlock on their own, so in a busy tube other players may vanish or appear in it.
