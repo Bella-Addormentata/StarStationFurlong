@@ -57,12 +57,19 @@ pub struct CoinRecord {
 /// listing both cut short and without a cursor is incomplete with no way to go
 /// on — each caller decides what that means for it (the wallet lease keeps its
 /// coins parked, the wallet reports the listing partial, the resolver treats
-/// the listing as ended and re-reads next beat).
+/// the listing as ended and re-reads next beat). `judged_at` is the chain height
+/// the records are the coins' states as of (in the peer lane, the lowest
+/// knowledge height among the answering peers); `None` from a source that
+/// cannot date its answers. The wallet lease frees a coin a complete listing
+/// leaves out only when that height reaches the one the coin was seen
+/// confirmed at: a pair of peers still syncing, standing below it, knows
+/// nothing of the coin and says nothing about its spend.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoinListing {
     pub records: Vec<CoinRecord>,
     pub truncated: bool,
     pub next_cursor: Option<String>,
+    pub judged_at: Option<u32>,
 }
 
 /// The records gathered across a listing's pages. The chain pages by a coin's
