@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- **🔭 The helm's ship atlas cuts a module's corners at its cupola ends ([#261](https://github.com/Bella-Addormentata/StarStationFurlong/pull/261), follow-up to [#222](https://github.com/Bella-Addormentata/StarStationFurlong/pull/222)).** The docking computer's **SHIP ATLAS** drew every module as a full rectangle, so a module with a cupola looked as if its floor's corners stuck out past the glass. It now draws each module's floor the way the room has it, with the corners at each cupola end cut at 45° and the tip window marked, for the module you are in and for every module joined to it.
+
 - **🚪🔒 You walk the whole tube, bent or long, before the airlock swaps rooms ([#269](https://github.com/Bella-Addormentata/StarStationFurlong/pull/269)).** In first person, walking through a public door now carries you along the full length of the tube between the modules. The walk follows every bend of a connector chain, with the view turning as you go, and a shut door waits at the far end. The room is swapped there with both doors shut, and that door then opens. A long gangway takes as long to cross as its length says, at walking pace. Bent tubes no longer fade. If the crossing fails, you walk back the same way, round the bends. The isometric view keeps its short step and the fade.
 
 - **🏒⚙ The air hockey table has one settings gear, by the scoreboard ([#266](https://github.com/Bella-Addormentata/StarStationFurlong/pull/266)).** The two gears on the end rails are replaced by a single gear on the long side rail at the centre line, right at the foot of the scoreboard pole, where either player can reach it. The card it opens is unchanged.

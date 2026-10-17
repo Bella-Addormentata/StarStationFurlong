@@ -144,7 +144,8 @@ import type { AirHockeyThemeSpec } from './airHockeyTheme';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
 // ⚓ #163: the helm's docking computer draws the ship atlas in room metres.
-import { roomHalfExtents } from './floorPlanDoc';
+import { roomHalfExtents, roomCupolas } from './floorPlanDoc';
+import { moduleCupolaGlass, moduleOutline } from './stationPlan';
 import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
@@ -3783,15 +3784,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const W = canvas.width, H = canvas.height;
     const cssScale = canvas.clientWidth ? canvas.width / canvas.clientWidth : 2;
     const { halfX, halfZ } = roomHalfExtents();
-    // Module outline corners, rotated into this room's frame (three.js
-    // rotation.y: x' = x·cos + z·sin, z' = −x·sin + z·cos).
-    const corners = (m: { x: number; z: number; rotY: number; halfX: number; halfZ: number }) => {
-      const c = Math.cos(m.rotY), s = Math.sin(m.rotY);
-      return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sz]) => {
-        const lx = sx * m.halfX, lz = sz * m.halfZ;
-        return { x: m.x + lx * c + lz * s, z: m.z - lx * s + lz * c };
-      });
-    };
+    // 🔭 This module, with the corners its cupola ends cut off (issue 219).
+    const self = { x: 0, z: 0, rotY: 0, halfX, halfZ, cupola: roomCupolas().map((c) => c.wall) };
+    // Module outlines rotated into this room's frame, each cupola end's
+    // corners cut as its floor is (stationPlan.moduleOutline).
+    const corners = moduleOutline;
     // Where each port's round half sits: just outside its door (the stub's
     // middle), so the marker lands on the adapter itself.
     const portAt = (doorId: string) => {
@@ -3844,12 +3841,23 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       ctx.fillText(m.name.slice(0, 18).toUpperCase(), px(m.x), pz(m.z));
     }
     // This module.
-    poly(corners({ x: 0, z: 0, rotY: 0, halfX, halfZ }));
+    poly(corners(self));
     ctx.fillStyle = 'rgba(62,146,184,0.16)';
     ctx.fill();
     ctx.strokeStyle = '#3E92B8';
     ctx.lineWidth = 4;
     ctx.stroke();
+    // 🔭 Each cupola's tip window, bright, on this module and the others.
+    ctx.strokeStyle = '#9FE8FF';
+    ctx.lineWidth = 5;
+    for (const m of [self, ...connected]) {
+      for (const glass of moduleCupolaGlass(m)) {
+        ctx.beginPath();
+        ctx.moveTo(px(glass.tip[0].x), pz(glass.tip[0].z));
+        ctx.lineTo(px(glass.tip[1].x), pz(glass.tip[1].z));
+        ctx.stroke();
+      }
+    }
     ctx.fillStyle = '#80D8FF';
     ctx.fillText('THIS MODULE', px(0), pz(0));
     // Ports.
