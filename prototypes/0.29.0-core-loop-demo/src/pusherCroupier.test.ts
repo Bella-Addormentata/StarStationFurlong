@@ -256,6 +256,9 @@ describe('operateCoinPusher', () => {
     const after = readCoinPusherState(MACHINE)!;
     expect(after.recentDrops).toHaveLength(RECENT_DROPS_MAX);
     expect(after.recentDrops!.at(-1)!.chipId).toBe(after.nextChipId - 1);
+    // Each mark carries what replays its drop, as lastDrop does.
+    const d = after.lastDrop!;
+    expect(after.recentDrops!.at(-1)).toEqual({ chipId: d.chipId, hole: d.hole, phase: d.phase, atMs: d.atMs, seed: d.seed });
   });
 
   it('refuses a request from a player without a chip, and nothing moves', () => {
@@ -353,15 +356,18 @@ describe('operateCoinPusher', () => {
 
   it('refuses a drop into a full machine', () => {
     const n = { id: 1 };
-    const pile = (x: number): Pile => {
+    const pile = (x: number, u: number): Pile => {
       const chipIds = Array.from({ length: 8 }, () => n.id++);
-      return { x, count: 8, chipIds };
+      return { x, u, count: 8, chipIds };
     };
-    // 8 piles of 8 on each platform, spaced one pile apart: 128 chips.
+    // 16 piles of 8 on each platform, four rows of four a pile apart: 256
+    // chips.
+    const grid = (back: number): Pile[] =>
+      Array.from({ length: 16 }, (_, i) => pile(back + 0.03 + (i % 4) * 0.06, -0.15 + Math.floor(i / 4) * 0.06));
     const full: CoinPusherState = {
       ...initialCoinPusherState(OPERATOR, 0),
-      upper: Array.from({ length: 8 }, (_, i) => pile(0.03 + i * 0.06)),
-      lower: Array.from({ length: 8 }, (_, i) => pile(0.63 + i * 0.06)),
+      upper: grid(0),
+      lower: grid(0.60),
       totalInserted: MACHINE_MAX_CHIPS,
     };
     full.nextChipId = n.id;
