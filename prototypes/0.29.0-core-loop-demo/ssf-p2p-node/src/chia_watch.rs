@@ -39,7 +39,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chia_protocol::Bytes32;
-use chia_sdk_coinset::CoinsetClient;
 
 use crate::chia_lane::{self, ChiaPresenceRecord};
 use crate::chia_resolve::{self, FoundRecord, HintCursor};
@@ -249,7 +248,7 @@ pub fn watch_enabled() -> bool {
 /// gateway is unreachable — it just waits for the next tick.
 pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     let self_id = iroh_ep.id().to_string();
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let mut sched = BeatSchedule::from_env();
     let mut cursors: HashMap<(String, [u8; 32]), HintCursor> = HashMap::new();
     let mut cache: HashMap<String, RoomCache> = HashMap::new();

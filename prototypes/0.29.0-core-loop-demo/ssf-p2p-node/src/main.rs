@@ -16,6 +16,11 @@ use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, RelayMap, RelayUrl
 use iroh::endpoint::presets::Minimal;
 
 mod chia_lane;
+// S‑0 step 1 (#231 P7, TODO #13 phase 0): the chain-access seam. Every chain
+// read and push below goes through its trait; the gateway client is named in
+// that one file alone, so the peer lane replaces it there.
+#[cfg(feature = "chia-read")]
+mod chia_chain;
 // Chain READS (#231 D3: in the default build): per-room caps, the generic hint
 // reader and the P1 beat/hold watcher.
 #[cfg(feature = "chia-read")]

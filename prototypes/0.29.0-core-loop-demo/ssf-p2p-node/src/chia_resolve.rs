@@ -39,7 +39,7 @@ use std::collections::HashSet;
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes, Bytes32, CoinSpend};
 use chia_puzzle_types::Memos;
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
+use crate::chia_chain::ChainAccess;
 use chia_sdk_types::{run_puzzle, Conditions};
 use clvm_traits::{FromClvm, ToClvm};
 use clvmr::{Allocator, NodePtr};
@@ -215,7 +215,7 @@ pub fn rank_and_dedupe(mut found: Vec<FoundRecord>) -> Vec<FoundRecord> {
 /// continues the same listing, so no page is ever skipped. A capped or failed
 /// poll re-reads what it skipped next time.
 pub async fn read_hint(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     hint: Bytes32,
     room_key: &[u8; 32],
     now: u64,
@@ -229,7 +229,7 @@ pub async fn read_hint(
 /// how a ciphertext becomes a record differs. The opener gets the ciphertext
 /// and the height of the block that confirmed the coin (v2's era rule).
 pub async fn read_hint_with(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     hint: Bytes32,
     cursor: &mut HintCursor,
     opener: &(dyn Fn(&[u8], u32) -> Option<ChiaPresenceRecord> + Sync),
@@ -239,16 +239,13 @@ pub async fn read_hint_with(
     // `listed` = the gateway reported the listing's last page this poll.
     let mut listed = false;
     for _ in 0..MAX_PAGES_PER_POLL {
-        let resp = client
-            .get_coin_records_by_hint(hint, start, None, Some(true), page.clone())
+        let listing = client
+            .coin_records_by_hint(hint, start, true, page.clone())
             .await
-            .map_err(|e| anyhow!("get_coin_records_by_hint: {e}"))?;
-        if !resp.success {
-            return Err(anyhow!("hint lookup unsuccessful: {:?}", resp.error));
-        }
-        coins.extend(resp.coin_records.unwrap_or_default());
-        match (resp.truncated, resp.next_cursor) {
-            (Some(true), Some(next)) => page = Some(next),
+            .map_err(|e| anyhow!("hint lookup: {e}"))?;
+        coins.extend(listing.records);
+        match (listing.truncated, listing.next_cursor) {
+            (true, Some(next)) => page = Some(next),
             _ => {
                 listed = true;
                 break;
@@ -368,7 +365,7 @@ pub fn scan_eras(peak: u32) -> Vec<u64> {
 /// it; what the other hint found is returned all the same. Only when every
 /// hint failed is the error returned.
 pub async fn read_ck(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     ck: &[u8; 32],
     peak: u32,
     now: u64,
@@ -426,7 +423,7 @@ pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
 /// signer; only the node's own signature does.
 pub async fn resolve_presence_by_ck(ck: &[u8; 32], node_id: &str) -> Result<Option<ChiaPresenceRecord>> {
     let now = unix_now();
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let peak = peak_height(&client).await.ok_or_else(|| anyhow!("chain peak unavailable"))?;
     let mut all = Vec::new();
     let mut cursors = std::collections::HashMap::new();
@@ -456,7 +453,7 @@ pub const ONE_SHOT_MAX_ROUNDS: usize = 4;
 /// is examined or [`ONE_SHOT_MAX_ROUNDS`] is spent — never left at page 8.
 pub async fn resolve_all(room_key: &[u8; 32]) -> Result<Vec<FoundRecord>> {
     let now = unix_now();
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let mut all = Vec::new();
     for e in scan_epochs(now) {
         let hint = Bytes32::new(chia_lane::derive_hint(room_key, e));
@@ -495,17 +492,13 @@ pub async fn resolve_by_room_key(room_key: &[u8; 32]) -> Result<Option<ChiaPrese
     Ok(resolve_all(room_key).await?.into_iter().next().map(|f| f.record))
 }
 
-/// The chain's current peak height from the gateway, or `None` when the call
-/// fails (the caller logs and keeps its last beat).
-pub async fn peak_height(client: &CoinsetClient) -> Option<u32> {
-    match client.get_blockchain_state().await {
-        Ok(resp) if resp.success => resp.blockchain_state.map(|s| s.peak.height),
-        Ok(resp) => {
-            eprintln!("⛓️ ChiaHub reader: get_blockchain_state unsuccessful: {:?}", resp.error);
-            None
-        }
+/// The chain's current peak height, or `None` when the call fails (the caller
+/// logs and keeps its last beat).
+pub async fn peak_height(client: &impl ChainAccess) -> Option<u32> {
+    match client.peak_height().await {
+        Ok(height) => Some(height),
         Err(e) => {
-            eprintln!("⛓️ ChiaHub reader: get_blockchain_state failed: {e}");
+            eprintln!("⛓️ ChiaHub reader: peak height {e}");
             None
         }
     }
@@ -519,18 +512,14 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 pub(crate) async fn fetch_coin_spend(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     coin_id: Bytes32,
     height: u32,
 ) -> Result<Option<CoinSpend>> {
-    let resp = client
-        .get_puzzle_and_solution(coin_id, Some(height))
+    client
+        .puzzle_and_solution(coin_id, height)
         .await
-        .map_err(|e| anyhow!("get_puzzle_and_solution: {e}"))?;
-    if !resp.success {
-        return Ok(None);
-    }
-    Ok(resp.coin_solution)
+        .map_err(|e| anyhow!("puzzle and solution: {e}"))
 }
 
 /// Run the parent spend and return the ciphertext (2nd memo) of the create_coin
