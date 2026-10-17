@@ -10054,6 +10054,7 @@ function setupZoomView() {
   multiScaleZoom = new MultiScaleZoomView();
   multiScaleZoom.mount(document.body);
   world.onFirstPersonSeat = (faceAngle) => multiScaleZoom?.requestFirstPerson(faceAngle);
+  world.onFirstPersonArrival = (yaw) => multiScaleZoom?.faceFirstPersonHeading(yaw);
   world.onRequestRoomView = (onReady) => multiScaleZoom?.requestRoomView(onReady);
   (window as any).multiScaleZoom = multiScaleZoom;
 }

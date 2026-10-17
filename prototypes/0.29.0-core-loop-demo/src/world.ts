@@ -132,7 +132,7 @@ import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
 import {
-  chooseArrivalDoor, doorBeingCrossed,
+  chooseArrivalDoor, doorBeingCrossed, inwardFirstPersonYaw,
   type ArrivalDoor, type CrossingDoor,
 } from "./doorMatch";
 import type { FurnitureRecord } from "./furnitureDoc";
@@ -532,6 +532,10 @@ export class World {
   /** 🕹️ Arcade-cabinet screens — painted only by a focused cabinet's UI. */
   private arcadeCabinetVisuals: Map<string, ArcadeCabinetVisualHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
+  /** 🚶🧭 Arrival through a door: turn a first-person look to this heading
+   *  (straight into the room, perpendicular to the frame). main.ts wires it
+   *  to the zoom view, which ignores it outside first person. */
+  public onFirstPersonArrival: ((yaw: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
@@ -5271,6 +5275,14 @@ export class World {
       const hArr = physicalDoorPose(arrival.id).outwardYaw + Math.PI;
       addStationBias(hArr - hDep);
     }
+    // 🚶🧭 Owner request: in first person, come out of the arrival door
+    // looking straight into the new room, perpendicular to its frame. The
+    // look's heading is room-local and used to carry over unchanged from the
+    // old room, so it rarely matched the door you walked out of. Only the
+    // heading is set; the up/down tilt is kept.
+    this.onFirstPersonArrival?.(
+      inwardFirstPersonYaw(physicalDoorPose(arrival.id).outwardYaw),
+    );
     // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
     // arrivals — the traveler walks in, gets the hint, and is walked right
     // back out (the return departure is exactly what OUT permits). The
