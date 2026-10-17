@@ -8365,16 +8365,18 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   };
 
   // ── Base (plinth, legs, the ⚙ kick panel) ─────────────────────────────────
-  place(new THREE.BoxGeometry(0.80, 0.10, 0.80), m(BODY, 0.55, 0.40), 0, 0.05, 0.10);
-  for (const [lx, lz] of [[-0.32, -0.24], [0.32, -0.24], [-0.32, 0.44], [0.32, 0.44]] as const) {
+  // The front legs and kick panel sit under the cabinet's front, so the
+  // floor's overhang doesn't hide the gear from the player standing there.
+  place(new THREE.BoxGeometry(0.80, 0.10, 0.92), m(BODY, 0.55, 0.40), 0, 0.05, 0.05);
+  for (const [lx, lz] of [[-0.32, -0.36], [0.32, -0.36], [-0.32, 0.44], [0.32, 0.44]] as const) {
     place(new THREE.BoxGeometry(0.09, 0.42, 0.09), m(CHROME, 0.4, 0.6), lx, 0.31, lz);
     place(new THREE.BoxGeometry(0.11, 0.03, 0.11), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
   }
   // ⚙ One settings gear (settingsGear.ts) centred on a kick panel between
   // the front legs, as on the slot machine: the machine card (rules, what's
   // inside).
-  place(new THREE.BoxGeometry(0.55, 0.36, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.31, -0.22);
-  for (const gear of addSettingsGear(place, m, 0, 0.31, -0.237, 0.06, Math.PI)) {
+  place(new THREE.BoxGeometry(0.55, 0.36, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.31, -0.40);
+  for (const gear of addSettingsGear(place, m, 0, 0.31, -0.417, 0.06, Math.PI)) {
     gear.userData.settingsGear = itemId;
   }
 
