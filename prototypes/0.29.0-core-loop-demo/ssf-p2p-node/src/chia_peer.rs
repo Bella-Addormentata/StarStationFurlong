@@ -475,6 +475,12 @@ impl PeerConn {
         self.peak_stale_for_test.store(true, Ordering::Relaxed);
     }
 
+    /// Make the announced peak read as made `by` ago (tests).
+    #[cfg(test)]
+    pub(crate) fn backdate_peak(&self, by: Duration) {
+        *self.peak_at.lock().unwrap() = Some(Instant::now().checked_sub(by).unwrap_or_else(Instant::now));
+    }
+
     /// Send a message that expects no answer.
     pub async fn send<B>(&self, body: B) -> Result<()>
     where

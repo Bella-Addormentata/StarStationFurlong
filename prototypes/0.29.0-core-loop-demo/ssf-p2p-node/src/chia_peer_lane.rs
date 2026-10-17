@@ -93,7 +93,9 @@
 //!   - Every connection passes the header‑0 genesis binding before it counts
 //!     (`chia_peer.rs`, §14 (4)); a peak announced more than
 //!     [`crate::chia_peer::PEAK_STALE`] ago is checked against the chain
-//!     before it is reported.
+//!     before it is reported, more than [`PEAK_FRESH_AGREED`] ago for an
+//!     agreed read, the publisher's era clock. The peers that answer, a
+//!     carrier's one or an agreed pair, are remembered in the store.
 //!
 //! The mempool delta (§14 (6)): the wallet protocol has no mempool query, so
 //! `spend_live` hands the parked spend bundle to the peers AGAIN and reads
@@ -178,6 +180,19 @@ pub const PEAK_SETTLE_ATTEMPTS: usize = 3;
 /// A peer this many blocks or more behind another is lagging: its verdict is
 /// non-final rather than agreed at the common height.
 pub const MAX_PEAK_LAG: u32 = 6;
+/// An agreed peak read trusts an announcement this old at most; older, the
+/// peer is asked whether the chain has moved past its peak
+/// ([`Lane::prove_current`]). The agreed height is the publisher's era clock:
+/// with the publisher's 90 s cache (`chia_resolve::PEAK_MAX_AGE_SECS`) and
+/// this, the height it writes under is at most two minutes behind the chain,
+/// under seven blocks, inside the era guard's budget (`ERA_GUARD_BLOCKS`:
+/// eight blocks for age, [`MAX_PEAK_LAG`] for the pair's lag). A peer that
+/// answers requests but stopped announcing peaks would otherwise serve a
+/// height up to [`PEAK_STALE`] old, and the chain could cross an era boundary
+/// unseen, the record signed for the era before and rejected by its readers.
+/// A carrier read keeps the longer threshold: its records are signed and
+/// sealed, their era read from them.
+pub const PEAK_FRESH_AGREED: Duration = Duration::from_secs(30);
 
 /// What a call site needs of a verdict (see the module notes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,10 +408,7 @@ impl Lane {
             if trust == Trust::Agreed {
                 self.let_laggards_go(&mut state);
             }
-            if let Some(set) = self.choose(&state, trust) {
-                if trust == Trust::Agreed {
-                    self.pair_in_step(&mut state, &set)?;
-                }
+            if let Some(set) = self.choose_in_step(&mut state, trust)? {
                 return Ok(set);
             }
             if pinned && !pin_up(&state) && trust == Trust::Agreed {
@@ -416,7 +428,7 @@ impl Lane {
             // A refill can change the pool without a dial (a connected stored
             // peer the introducer named is fresh now), so the round is spent
             // only when there was nothing to dial AND nothing new to choose.
-            if !self.dial(&mut state).await && self.choose(&state, trust).is_none() {
+            if !self.dial(&mut state).await && self.choose(&state, trust, &[]).is_none() {
                 break;
             }
         }
@@ -456,11 +468,43 @@ impl Lane {
         }
     }
 
+    /// [`Self::choose`], and for an agreed verdict a pair in step
+    /// ([`Self::pair_in_step`]). A lagging public peer is let go there and the
+    /// choice is made again without it. A lagging pin stays (the operator's
+    /// node, syncing), but another pin may still pair with the public peer, so
+    /// the choice is made again without the lagging pin before its lag is
+    /// reported: a lagging first pin would otherwise block a healthy second one
+    /// on every request. `Ok(None)`: no pair at all; the lag error when every
+    /// pair was out of step.
+    fn choose_in_step(&self, state: &mut LaneState, trust: Trust) -> Result<Option<Vec<Arc<PeerConn>>>, ChainError> {
+        let mut set_aside: Vec<SocketAddr> = Vec::new();
+        let mut first_lag: Option<ChainError> = None;
+        loop {
+            let Some(set) = self.choose(state, trust, &set_aside) else {
+                return match first_lag {
+                    Some(e) => Err(e),
+                    None => Ok(None),
+                };
+            };
+            if trust == Trust::Carrier {
+                return Ok(Some(set));
+            }
+            match self.pair_in_step(state, &set) {
+                Ok(()) => return Ok(Some(set)),
+                Err((lagging, e)) => {
+                    set_aside.push(lagging);
+                    first_lag.get_or_insert(e);
+                }
+            }
+        }
+    }
+
     /// The two peers of an agreed pair must announce peaks within
     /// [`MAX_PEAK_LAG`] of each other, or the verdict is non-final: a lagging
     /// public peer is let go (back in the queue after [`RECONNECT_AFTER`]), a
-    /// lagging pin stays, as in [`Lane::peak`].
-    fn pair_in_step(&self, state: &mut LaneState, pair: &[Arc<PeerConn>]) -> Result<(), ChainError> {
+    /// lagging pin stays, as in [`Lane::peak`]. The error names the lagging
+    /// peer's address, so [`Self::choose_in_step`] can choose again without it.
+    fn pair_in_step(&self, state: &mut LaneState, pair: &[Arc<PeerConn>]) -> Result<(), (SocketAddr, ChainError)> {
         let mut known: Vec<(&Arc<PeerConn>, u32)> = pair.iter().filter_map(|c| c.peak_now().map(|p| (c, p.height))).collect();
         if known.len() < 2 {
             return Ok(());
@@ -478,11 +522,14 @@ impl Lane {
             self.let_go(state, low, RECONNECT_AFTER, &format!("lags {lag} blocks behind {}", high.addr()));
             "non-final, the lagging peer is let go"
         };
-        Err(unanswered(format!(
-            "{} lags {lag} blocks behind {} (height {low_height} against {high_height}); {fate}",
+        Err((
             low.addr(),
-            high.addr()
-        )))
+            unanswered(format!(
+                "{} lags {lag} blocks behind {} (height {low_height} against {high_height}); {fate}",
+                low.addr(),
+                high.addr()
+            )),
+        ))
     }
 
     /// Take a public connection out of the pool: logged with `why`, cooling
@@ -511,12 +558,15 @@ impl Lane {
         }
     }
 
-    fn choose(&self, state: &LaneState, trust: Trust) -> Option<Vec<Arc<PeerConn>>> {
-        let conns = &state.conns;
+    /// The connections a `trust` verdict would be taken from, the addresses
+    /// in `excluding` left out of the choice (a pin out of step, kept
+    /// connected but not chosen: [`Self::choose_in_step`]).
+    fn choose(&self, state: &LaneState, trust: Trust, excluding: &[SocketAddr]) -> Option<Vec<Arc<PeerConn>>> {
+        let conns: Vec<&Arc<PeerConn>> = state.conns.iter().filter(|c| !excluding.contains(&c.addr())).collect();
         match trust {
             Trust::Carrier => {
                 let pin = conns.iter().find(|c| c.source() == Source::Pin);
-                pin.or_else(|| conns.first()).map(|c| vec![c.clone()])
+                pin.or_else(|| conns.first()).map(|c| vec![(*c).clone()])
             }
             Trust::Agreed => {
                 let facts: Vec<(Source, Group)> = conns.iter().map(|c| (c.source(), c.group())).collect();
@@ -722,7 +772,7 @@ impl Lane {
             // first, never a pin); that candidate is dialled first.
             let facts: Vec<(Source, Group)> = state.conns.iter().map(|c| (c.source(), c.group())).collect();
             let pinned = !self.pins.is_empty();
-            let swap = if self.choose(state, Trust::Agreed).is_none() {
+            let swap = if self.choose(state, Trust::Agreed, &[]).is_none() {
                 ready.iter().enumerate().find_map(|(ci, c)| {
                     replaceable(&facts, (c.source, group_of(c.addr)), pinned, self.pin_only).map(|i| (ci, i))
                 })
@@ -848,7 +898,7 @@ impl Lane {
     /// the fresh peer such a pool lacks, only the introducer can.
     fn rotation(&self, state: &LaneState, ready: &[Candidate]) -> Option<usize> {
         let cand = ready.first()?;
-        if state.conns.len() >= MAX_CONNS || !cand.source.is_fresh() || self.choose(state, Trust::Agreed).is_some() {
+        if state.conns.len() >= MAX_CONNS || !cand.source.is_fresh() || self.choose(state, Trust::Agreed, &[]).is_some() {
             return None;
         }
         let held = state.conns.iter().filter(|c| c.source() == cand.source).count();
@@ -884,7 +934,11 @@ impl Lane {
         }
     }
 
-    /// Remember the public peers of an agreed verdict as known-good: only the
+    /// Remember the public peers of a verdict as known-good: an agreed pair's,
+    /// or the one peer that answered a carrier (a presence-only session would
+    /// otherwise never fill the store and start every run from the
+    /// introducer; restored as stored peers, they are no fresher than before,
+    /// so a money read still needs the introducer or a pin). Only the
     /// connections still in the pool, so a verdict that overlapped an eviction
     /// (another request found the same peers disagreeing) restores nothing.
     async fn note_good(&self, peers: &[Arc<PeerConn>]) {
@@ -1007,7 +1061,10 @@ impl Lane {
                         }
                     }
                 };
-                settle(vec![answered]).await?.ok_or_else(|| unanswered(format!("{what}: the peer's answer could not be settled")))
+                let (peer, answer) = answered;
+                let settled = settle(vec![(peer.clone(), answer)]).await?.ok_or_else(|| unanswered(format!("{what}: the peer's answer could not be settled")))?;
+                self.note_good(&[peer]).await;
+                Ok(settled)
             }
             Trust::Agreed => {
                 let answers = join_all(peers.iter().cloned().map(|p| op(p))).await;
@@ -1067,14 +1124,21 @@ impl Lane {
     /// The peak as `trust` sees it. Agreed: every peer's announced peak must
     /// name one chain — at the lowest height among them, the peers ahead must
     /// serve the same header hash; a peer further behind than
-    /// [`MAX_PEAK_LAG`] blocks makes the verdict non-final.
+    /// [`MAX_PEAK_LAG`] blocks makes the verdict non-final; and an
+    /// announcement older than [`PEAK_FRESH_AGREED`] is checked against the
+    /// chain first ([`PEAK_STALE`] for a carrier), since the agreed height is
+    /// the publisher's era clock.
     async fn peak(&self, trust: Trust) -> Result<u32, ChainError> {
         let peers = self.peers_for(trust).await?;
+        let fresh_for = match trust {
+            Trust::Carrier => PEAK_STALE,
+            Trust::Agreed => PEAK_FRESH_AGREED,
+        };
         let mut peaks: Vec<(Arc<PeerConn>, Peak)> = Vec::new();
         for peer in &peers {
             match peer.wait_peak(PEAK_WAIT).await {
                 Some(peak) => {
-                    if peer.peak_age().is_some_and(|age| age > PEAK_STALE) {
+                    if peer.peak_age().is_some_and(|age| age > fresh_for) {
                         self.prove_current(peer, peak).await?;
                     }
                     peaks.push((peer.clone(), peak));
@@ -1135,9 +1199,7 @@ impl Lane {
                 }
             }
         }
-        if peers.len() > 1 {
-            self.note_good(&peers).await;
-        }
+        self.note_good(&peers).await;
         Ok(low.height)
     }
 
@@ -1903,6 +1965,7 @@ async fn listing_on(
     cursor: Option<String>,
 ) -> Result<Page, ChainError> {
     let mut from_header = false;
+    let mut anchor: Option<(u32, Bytes32)> = None;
     let (mut previous, mut header_hash) = match cursor {
         None => match min_height {
             Some(min) if min > 0 => match start_before(&peer, min).await {
@@ -1916,24 +1979,7 @@ async fn listing_on(
         },
         Some(cursor) => {
             let (height, hash, knowledge, knowledge_hash) = decode_cursor(&cursor)?;
-            // The pages before this one were judged as of `knowledge`. A reorg
-            // above the boundary since then, the boundary header surviving,
-            // would have this page list the changes past the boundary on the
-            // new chain, where a coin whose spend the reorg undid has its
-            // latest change back before the boundary: on no page at all, the
-            // listing finishing complete without it. So the peer first shows
-            // the header at that height; another, or none, and the listing is
-            // refused, to start over.
-            match peer.request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(knowledge)).await {
-                Ok(Ok(answer)) if answer.header_block.header_hash() == knowledge_hash => {}
-                Ok(_) => {
-                    return Err(ChainError::Refused(format!(
-                        "the chain reorganised above the listing's cursor (height {height}): {} no longer has the header at {knowledge} the earlier pages were judged under; the listing starts over",
-                        peer.addr()
-                    )))
-                }
-                Err(e) => return Err(ChainError::Unanswered(e)),
-            }
+            anchor = Some((knowledge, knowledge_hash));
             (Some(height), hash)
         }
     };
@@ -1955,6 +2001,30 @@ async fn listing_on(
             ))
             .await
             .map_err(ChainError::Unanswered)?;
+        if let Some((knowledge, knowledge_hash)) = anchor {
+            // The pages before this one were judged as of `knowledge`. A reorg
+            // above the boundary since then, the boundary header surviving,
+            // would have this page list the changes past the boundary on the
+            // new chain, where a coin whose spend the reorg undid has its
+            // latest change back before the boundary: on no page at all, the
+            // listing finishing complete without it. So the peer shows the
+            // header at that height, asked AFTER the page and inside the peak
+            // bracket below, so a reorg during any attempt is seen (a check
+            // before the page alone would miss one landing between the two);
+            // another header, or none, and the listing is refused, to start
+            // over.
+            match peer.request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(knowledge)).await {
+                Ok(Ok(answer)) if answer.header_block.header_hash() == knowledge_hash => {}
+                Ok(_) => {
+                    return Err(ChainError::Refused(format!(
+                        "the chain reorganised above the listing's cursor (height {}): {} no longer has the header at {knowledge} the earlier pages were judged under; the listing starts over",
+                        previous.unwrap_or(0),
+                        peer.addr()
+                    )))
+                }
+                Err(e) => return Err(ChainError::Unanswered(e)),
+            }
+        }
         match page {
             Ok(page) => {
                 // The peer's announced peak must stand still across the
@@ -3123,6 +3193,146 @@ mod tests {
         let live = lane.live_conns().await;
         assert_eq!(live.len(), 1, "the peer that gave no answer is gone from the pool");
         assert_eq!(live[0].addr(), a.addr);
+    }
+
+    #[tokio::test]
+    async fn a_reorg_after_the_cursor_check_still_starts_the_listing_over() {
+        // As in a_reorg_above_the_cursor_boundary_starts_the_listing_over, but
+        // the peers reorganise the moment the resumed request reaches them: a
+        // header check made before the request would pass on the old chain and
+        // the page come from the new one, coin 4's undone spend lost. The
+        // header is asked for after the page, inside the peak bracket, so the
+        // listing is refused all the same.
+        let history = vec![state(1, 90, None), state(4, 80, Some(100))];
+        let undone = vec![state(1, 90, None), state(4, 80, None)];
+        let flipping = || -> Handler {
+            let before = paged(history.clone(), Some(92), None);
+            let after = paged_to(undone.clone(), 99, None, None);
+            let reorged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            Arc::new(move |m: &Message| {
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPuzzleState {
+                    let req = RequestPuzzleState::from_bytes(&m.data).unwrap();
+                    if req.previous_height == Some(92) {
+                        reorged.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                if !reorged.load(std::sync::atomic::Ordering::SeqCst) {
+                    return before(m);
+                }
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestBlockHeader {
+                    let req = RequestBlockHeader::from_bytes(&m.data).unwrap();
+                    if req.height > 99 {
+                        return vec![reply(&RejectHeaderRequest::new(req.height))];
+                    }
+                }
+                after(m)
+            })
+        };
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), flipping()).await;
+        let b = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), flipping()).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let first = money.coin_records_by_puzzle_hash(Bytes32::new([9u8; 32]), false, None).await.unwrap();
+        assert!(first.truncated);
+        let err = money.coin_records_by_puzzle_hash(Bytes32::new([9u8; 32]), false, first.next_cursor).await.unwrap_err();
+        assert!(matches!(err, ChainError::Refused(_)) && err.to_string().contains("reorganised"), "{err}");
+        assert_eq!(lane.live_count().await, 2);
+        let again = money.coin_records_by_puzzle_hash(Bytes32::new([9u8; 32]), false, None).await.unwrap();
+        let mut amounts: Vec<u64> = again.records.iter().map(|r| r.coin.amount).collect();
+        amounts.sort_unstable();
+        assert_eq!(amounts, vec![1, 4], "started over, coin 4 is back, unspent");
+    }
+
+    #[tokio::test]
+    async fn a_lagging_pin_does_not_block_a_healthy_one() {
+        // Pin A lags ten blocks; pin B and the public peer stand at 110. The
+        // pair tried first, A with the public peer, is out of step, and a pin
+        // is never let go; the choice is made again without A, and B pairs
+        // with the public peer. A stays connected, to catch up.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(110))).await;
+        let public = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(110))).await;
+        let lane = lane(vec![(public.addr, Source::Introducer)], vec![a.addr.to_string(), b.addr.to_string()], false, None);
+        // A carrier read connects the pins; A is put first, so the agreed
+        // choice tries it first, whatever order the dials finished in.
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        {
+            let mut state = lane.state.lock().await;
+            assert_eq!(state.conns.len(), 2, "both pins connected");
+            state.conns.sort_by_key(|c| c.addr() != a.addr);
+        }
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.peak_height().await.unwrap(), 110, "B and the public peer agree");
+        let got = money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap();
+        assert_eq!(got.records.len(), 1);
+        assert_eq!(lane.live_count().await, 3, "the lagging pin stays connected");
+    }
+
+    #[tokio::test]
+    async fn a_carrier_only_session_fills_the_store_for_the_next_run() {
+        // A presence-only session reads from one peer at a time; the peers that
+        // answer are remembered all the same, so the next run starts from the
+        // store rather than the introducer. Restored as a stored peer, A is no
+        // fresher than before.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let store = temp_store("carrier-store");
+        let _ = std::fs::remove_file(&store);
+        let first_run = lane(vec![(a.addr, Source::Introducer)], vec![], false, Some(store.clone()));
+        let carrier = PeerLane::new(first_run.clone(), Trust::Carrier);
+        assert_eq!(carrier.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1);
+        assert_eq!(load_store(&store).iter().map(|p| p.addr.clone()).collect::<Vec<_>>(), vec![a.addr.to_string()], "the carrier's peer is remembered");
+
+        let second_run = lane(vec![], vec![], false, Some(store.clone()));
+        assert_eq!(PeerLane::new(second_run.clone(), Trust::Carrier).peak_height().await.unwrap(), 100, "served from the store, no seeds");
+        let conns = second_run.live_conns().await;
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].source(), Source::Store);
+        assert_eq!(load_store(&store).len(), 1, "a peak read remembers the peer too");
+    }
+
+    #[tokio::test]
+    async fn an_agreed_peak_read_checks_an_announcement_older_than_half_a_minute() {
+        // Both peers answer requests but announced their peak a minute ago. A
+        // carrier read takes the announcement (its threshold is PEAK_STALE);
+        // an agreed read, the publisher's era clock, asks for the block above
+        // it first. The default mock serves it, so the chain moved on
+        // unannounced: the stalled connection is let go, the read non-final.
+        // A quiet chain (no block above) keeps its peak and the announcement
+        // counts as fresh again.
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane_ab = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane_ab.clone(), Trust::Agreed);
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        for conn in lane_ab.live_conns().await {
+            conn.backdate_peak(PEAK_FRESH_AGREED + Duration::from_secs(30));
+        }
+        assert_eq!(PeerLane::new(lane_ab.clone(), Trust::Carrier).peak_height().await.unwrap(), 100, "a carrier read keeps a minute-old announcement");
+        let err = money.peak_height().await.unwrap_err();
+        assert!(err.to_string().contains("stale"), "{err}");
+        assert!(lane_ab.live_count().await < 2, "the stalled connection is let go");
+
+        let quiet = |base: Handler| -> Handler {
+            Arc::new(move |m: &Message| {
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestBlockHeader {
+                    let req = RequestBlockHeader::from_bytes(&m.data).unwrap();
+                    if req.height > 100 {
+                        return vec![reply(&RejectHeaderRequest::new(req.height))];
+                    }
+                }
+                base(m)
+            })
+        };
+        let c = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), quiet(node(vec![], (1, None), vec![]))).await;
+        let d = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), quiet(node(vec![], (1, None), vec![]))).await;
+        let lane_cd = lane(vec![(c.addr, Source::Introducer), (d.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane_cd.clone(), Trust::Agreed);
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        for conn in lane_cd.live_conns().await {
+            conn.backdate_peak(PEAK_FRESH_AGREED + Duration::from_secs(30));
+        }
+        assert_eq!(money.peak_height().await.unwrap(), 100, "a quiet chain keeps its peak");
+        assert!(lane_cd.live_conns().await.iter().all(|c| c.peak_age().is_some_and(|age| age < PEAK_FRESH_AGREED)), "the announcements count as fresh again");
     }
 
     #[tokio::test]
