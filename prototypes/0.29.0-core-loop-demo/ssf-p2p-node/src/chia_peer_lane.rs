@@ -27,14 +27,18 @@
 //!     paths, never a silent fall‑back to public peers; the presence lane may
 //!     still read from public peers meanwhile. A pin that is down is dialled
 //!     again after [`PIN_RETRY_AFTER`] whether or not another pin is up: the
-//!     missing one may be the pin whose network group the pair needs.
+//!     missing one may be the pin whose network group the pair needs. Two
+//!     pins naming one node (a host and its address, say) are one pin, and a
+//!     connection reached through public discovery to an address a pin
+//!     resolves to counts as the pin from then on.
 //!   - PUBLIC peers come from three sources: the DNS introducer (fresh this
 //!     run; asked only when the stored and gossiped candidates fall short:
 //!     nothing left to dial, or a money request without a pin that has no
 //!     fresh peer yet; at most every [`INTRODUCE_EVERY`], sooner only after a
 //!     lookup that named nobody; a stored or gossiped peer it names this run
 //!     counts as fresh from then on), `RequestPeers` gossip from a connected
-//!     peer, and the store of known‑good peers kept in `chia_peers.json`
+//!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed),
+//!     and the store of known‑good peers kept in `chia_peers.json`
 //!     across runs. Two agreeing
 //!     peers must come from DISTINCT sources and distinct network groups
 //!     (IPv4 /16, IPv6 /32; an IPv4‑mapped IPv6 address is its IPv4 address),
@@ -120,6 +124,9 @@ pub const INTRODUCE_EVERY: Duration = Duration::from_secs(1800);
 /// How soon it is asked again after a lookup that named nobody (DNS down, the
 /// machine offline): a first run has nothing else to try.
 pub const INTRODUCE_RETRY: Duration = Duration::from_secs(60);
+/// How long a connection whose gossip request failed waits before it is asked
+/// again (a request that failed says nothing about the peer's address book).
+pub const GOSSIP_RETRY: Duration = Duration::from_secs(60);
 /// Connections one public source may hold at once: one slot always stays for
 /// another source, so four introducer peers cannot fill the pool and shut
 /// gossip and the store out of the agreed pair (§14 (2)).
@@ -185,8 +192,9 @@ struct LaneState {
     /// `None` before the first dial, or while a pin does not resolve: the pins
     /// count as short then.
     pin_target: Option<usize>,
-    /// Connections already asked for gossip.
-    gossiped: HashSet<SocketAddr>,
+    /// Connections asked for gossip: `None`, it answered (not asked again);
+    /// `Some(at)`, the request failed (asked again after `at`).
+    gossiped: HashMap<SocketAddr, Option<Instant>>,
     store_loaded: bool,
     known: Vec<StoredPeer>,
 }
@@ -259,12 +267,14 @@ impl Lane {
         self
     }
 
-    /// Let the pins be dialled again at once (tests).
+    /// Let the pins, the cooling addresses and the failed gossip requests be
+    /// tried again at once (tests).
     #[cfg(test)]
     pub async fn expire_pin_cooldown(&self) {
         let mut state = self.state.lock().await;
         state.pin_retry_after = None;
         state.cooling.clear();
+        state.gossiped.retain(|_, retry| retry.is_none());
     }
 
     /// Reuse a TLS configuration (tests share one certificate).
@@ -478,11 +488,11 @@ impl Lane {
     /// is left alone for [`PIN_RETRY_AFTER`] (its owner may be restarting it)
     /// and tried again, whether or not another pin is up.
     async fn dial_pins(&self, state: &mut LaneState) {
-        let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
         let now = Instant::now();
         // Outside pin-only mode one place is kept for the public peer the
         // agreement needs, however many addresses the pins resolve to.
         let pin_cap = if self.pin_only { MAX_CONNS } else { MAX_CONNS - 1 };
+        let mut pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
         let mut resolved: HashSet<SocketAddr> = HashSet::new();
         let mut unresolved = 0;
         let mut targets = Vec::new();
@@ -492,8 +502,21 @@ impl Lane {
                 unresolved += 1;
             }
             for addr in addrs {
-                resolved.insert(addr);
-                if !connected.contains(&addr) && !state.cooling.get(&addr).is_some_and(|until| now < *until) {
+                if !resolved.insert(addr) {
+                    // Two pins naming one node (a host and its address, say).
+                    continue;
+                }
+                if let Some(conn) = state.conns.iter().find(|c| c.addr() == addr) {
+                    // Reached through public discovery while the pin did not
+                    // resolve: the operator's node all the same, so it counts
+                    // as the pin from here on, within the pins' share.
+                    if pins_up < pin_cap && conn.promote(Source::Pin) {
+                        pins_up += 1;
+                        eprintln!("⛓️ chain peers: {addr} now counts as a pin: {pin} resolves to it");
+                    }
+                    continue;
+                }
+                if !state.cooling.get(&addr).is_some_and(|until| now < *until) {
                     targets.push(Candidate { addr, source: Source::Pin, failures: 0 });
                 }
             }
@@ -501,7 +524,7 @@ impl Lane {
         // What the pins can give; a pin that did not resolve keeps them short.
         state.pin_target = (unresolved == 0).then_some(pin_cap.min(resolved.len()));
         if targets.is_empty() {
-            state.pin_retry_after = Some(now + PIN_RETRY_AFTER);
+            state.pin_retry_after = self.pins_short(state).then(|| now + PIN_RETRY_AFTER);
             return;
         }
         // The cap is on LIVE pin connections, not on the addresses tried: a
@@ -572,9 +595,14 @@ impl Lane {
             push_candidates(state, found.into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect());
             eprintln!("⛓️ chain peers: the introducer named {n} full nodes");
         }
-        let unasked: Vec<Arc<PeerConn>> = state.conns.iter().filter(|c| !state.gossiped.contains(&c.addr())).cloned().collect();
+        let unasked: Vec<Arc<PeerConn>> = state
+            .conns
+            .iter()
+            .filter(|c| !state.gossiped.get(&c.addr()).is_some_and(|retry| retry.is_none() || retry.is_some_and(|at| now < at)))
+            .cloned()
+            .collect();
         for conn in unasked {
-            state.gossiped.insert(conn.addr());
+            state.gossiped.insert(conn.addr(), None);
             match conn.request::<RespondPeers, _>(RequestPeers::new()).await {
                 Ok(answer) => {
                     let mut addrs: Vec<SocketAddr> = answer
@@ -589,7 +617,10 @@ impl Lane {
                     push_candidates(state, addrs.into_iter().map(|addr| Candidate { addr, source: Source::Gossip, failures: 0 }).collect());
                     eprintln!("⛓️ chain peers: {} gossiped {n} full nodes", conn.addr());
                 }
-                Err(e) => eprintln!("⛓️ chain peers: {} gossip: {e:#}", conn.addr()),
+                Err(e) => {
+                    state.gossiped.insert(conn.addr(), Some(Instant::now() + GOSSIP_RETRY));
+                    eprintln!("⛓️ chain peers: {} gossip: {e:#} (asked again in {} s)", conn.addr(), GOSSIP_RETRY.as_secs());
+                }
             }
         }
     }
@@ -698,7 +729,10 @@ impl Lane {
         for (cand, result) in join_all(dials).await {
             match result {
                 Ok(conn) => {
-                    if state.conns.len() < MAX_CONNS {
+                    if state.conns.iter().any(|c| c.addr() == cand.addr) {
+                        // One connection per address, whoever dialled it twice.
+                        close_later(conn);
+                    } else if state.conns.len() < MAX_CONNS {
                         eprintln!("⛓️ chain peers: {} ({}) connected", cand.addr, cand.source.label());
                         state.conns.push(conn);
                     } else {
@@ -2303,6 +2337,81 @@ mod tests {
             assert!(state.candidates.iter().any(|c| c.addr == live.addr), "the newcomer took a failed address's place");
         }
         assert_eq!(PeerLane::new(crowded.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+    }
+
+    #[tokio::test]
+    async fn pins_naming_one_node_twice_count_once() {
+        // Three spellings of one node ahead of a distinct pin: the node is
+        // dialled once and the distinct pin still gets its place, so the pins'
+        // share of the pool is not spent on one node.
+        let one = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let other = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let public = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let mapped = format!("[::ffff:{}]:{}", one.addr.ip(), one.addr.port());
+        let pins = vec![one.addr.to_string(), mapped, one.addr.to_string(), other.addr.to_string()];
+        let twice = lane(vec![(public.addr, Source::Introducer)], pins, false, None);
+        assert_eq!(PeerLane::new(twice.clone(), Trust::Agreed).peak_height().await.unwrap(), 100);
+        let conns = twice.live_conns().await;
+        let pin_addrs: Vec<SocketAddr> = conns.iter().filter(|c| c.source() == Source::Pin).map(|c| c.addr()).collect();
+        assert_eq!(pin_addrs.len(), 2, "one connection per node: {pin_addrs:?}");
+        assert!(pin_addrs.contains(&one.addr) && pin_addrs.contains(&other.addr));
+        assert_eq!(twice.state.lock().await.pin_target, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_pin_reached_through_public_discovery_counts_as_the_pin_once_it_resolves() {
+        // The pin did not resolve at first (the state a failed lookup leaves:
+        // no pin target, a retry pending) and the carrier reached the same
+        // node through gossip. When the pin resolves to that live connection,
+        // the connection counts as the pin: money reads have their pin, and
+        // no second connection to the node is opened.
+        let own = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let public = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let recovered = lane(vec![(own.addr, Source::Gossip), (public.addr, Source::Introducer)], vec![own.addr.to_string()], false, None);
+        {
+            let mut state = recovered.state.lock().await;
+            state.pin_target = None;
+            state.pin_retry_after = Some(Instant::now() + PIN_RETRY_AFTER);
+        }
+        assert_eq!(PeerLane::new(recovered.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        let money = PeerLane::new(recovered.clone(), Trust::Agreed);
+        let err = money.peak_height().await.unwrap_err();
+        assert!(err.to_string().contains("unreachable"), "{err}");
+        recovered.expire_pin_cooldown().await;
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        let conns = recovered.live_conns().await;
+        assert_eq!(conns.len(), 2, "no second connection to the node");
+        assert!(conns.iter().any(|c| c.addr() == own.addr && c.source() == Source::Pin), "the gossiped connection is the pin now");
+    }
+
+    #[tokio::test]
+    async fn a_failed_gossip_request_is_asked_again_later() {
+        // A's first answer to RequestPeers is not a peer list, so a money read
+        // finds no second source. A is not asked again at once, but once the
+        // retry delay has passed it gossips B and the pair forms.
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = node(vec![state(1, 90, None)], (1, None), vec![b.addr]);
+        let flaky: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                vec![reply(&RespondBlockHeader::new(header_at(1, genesis())))]
+            } else {
+                base(m)
+            }
+        });
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), flaky).await;
+        let retrying = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        let money = PeerLane::new(retrying.clone(), Trust::Agreed);
+        let asked = || a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPeers).count();
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert!(matches!(retrying.state.lock().await.gossiped.get(&a.addr), Some(Some(_))), "marked to ask again later, not never");
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert_eq!(asked(), 1, "not asked again before the delay");
+        retrying.expire_pin_cooldown().await;
+        assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1, "asked again, A's gossip brought B");
+        assert_eq!(asked(), 2);
     }
 
     #[tokio::test]

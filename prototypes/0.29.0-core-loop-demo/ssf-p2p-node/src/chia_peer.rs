@@ -388,16 +388,21 @@ impl PeerConn {
     }
 
     /// A fresher provenance for the same address: a stored or gossiped peer
-    /// the introducer names this run becomes an introducer peer, one
-    /// connection and one vote still. Nothing moves away from fresh and a pin
-    /// is never relabelled. True when the label changed.
+    /// the introducer names this run counts as an introducer peer from then
+    /// on, and a public connection to an address a pin resolves to counts as
+    /// the pin. Nothing moves away from fresh except up to a pin, and a pin is
+    /// never relabelled.
     pub fn promote(&self, to: Source) -> bool {
         let mut source = self.source.lock().unwrap();
-        if to == Source::Introducer && !source.is_fresh() {
+        let up = match to {
+            Source::Pin => *source != Source::Pin,
+            Source::Introducer => !source.is_fresh(),
+            Source::Store | Source::Gossip => false,
+        };
+        if up {
             *source = to;
-            return true;
         }
-        false
+        up
     }
 
     pub fn group(&self) -> Group {
