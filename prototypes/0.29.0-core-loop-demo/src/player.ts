@@ -293,6 +293,9 @@ export class Player {
    */
   private adapterOutTarget: { x: number; z: number } | null = null;
   private readonly ADAPTER_OUT_DIST = 1.2;
+  /** 🚪🔒 walkIntoVestibule: stand at the threshold until the door is open
+   *  (the walk skips collision, so it must not pass through moving leaves). */
+  private adapterOutWaitingOpen = false;
   /** Defensive cap on ADAPTER_HOLD — the swap driver should always resolve
    *  (success or failure) via enterFromDoor long before this fires. */
   private readonly ADAPTER_HOLD_TIMEOUT = 8.0;
@@ -2323,6 +2326,7 @@ export class Player {
               x: door.through.x + ox * this.ADAPTER_OUT_DIST,
               z: door.through.z + oz * this.ADAPTER_OUT_DIST,
             };
+            this.adapterOutWaitingOpen = false;
             this.doorPhase = "ADAPTER_OUT";
           } else {
             this.doorPhase = "PEEK";
@@ -2399,6 +2403,14 @@ export class Player {
 
       // ── T1: scripted walk onward into the vestibule (no collision) ─────────
       case "ADAPTER_OUT": {
+        if (this.adapterOutWaitingOpen) {
+          this.character.setState("idle", door.faceAngle);
+          this.doorTimer += deltaTime;
+          // A door that never reports open is walked through anyway rather
+          // than leaving the player stuck in the doorway.
+          if (this.doorTimer > this.DOOR_WAIT_TIMEOUT) this.adapterOutWaitingOpen = false;
+          return;
+        }
         const target = this.adapterOutTarget;
         if (!target) {
           // Defensive: target is always set with the phase.
@@ -2615,6 +2627,13 @@ export class Player {
     };
     this.doorTimer = 0;
     this.doorPhase = "ADAPTER_OUT";
+    this.adapterOutWaitingOpen = true;
+    const seq = this.doorSeq;
+    hooks.requestOpen(() => {
+      if (seq !== this.doorSeq || this.doorPhase !== "ADAPTER_OUT") return;
+      this.adapterOutWaitingOpen = false;
+      this.doorTimer = 0;
+    });
   }
 
   /**

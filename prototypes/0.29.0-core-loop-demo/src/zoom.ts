@@ -517,6 +517,12 @@ export class MultiScaleZoomView {
     this.zoomOut();
   }
 
+  /** 🚪🔒 In first person with the camera at the eye (not still flying in
+   *  from the room view). */
+  public isFirstPersonSettled(): boolean {
+    return this.currentLevel === 1 && !isTransitioningFirstPerson;
+  }
+
   private zoomIn() {
     // Device focus owns the camera — HUD zoom buttons must not steal it
     // (the keydown path is guarded upstream; this covers the buttons).

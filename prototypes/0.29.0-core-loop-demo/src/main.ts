@@ -3932,7 +3932,7 @@ async function transitTo(
     // policy is still the one bound.
     ...(airlockEligible
       ? {
-          seal: () => world.sealAirlock(departureDoorId, () => multiScaleZoom?.getLevel() === 1),
+          seal: () => world.sealAirlock(departureDoorId, () => multiScaleZoom?.isFirstPersonSettled() === true),
           unseal: () => world.unsealAirlock(),
         }
       : {}),

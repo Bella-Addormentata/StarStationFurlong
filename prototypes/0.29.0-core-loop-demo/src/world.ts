@@ -5092,21 +5092,27 @@ export class World {
         deviceFocus.forceRelease();
         roomEdit.forceExit();
         this.spawnTransitVestibule(door.id);
-        // 🚪🔒 Airlock crossing: walk on into the vestibule; the door shuts
-        // behind you at the hold point and the swap starts there (main.ts
-        // seals the airlock for it when it can, else fades as before).
-        this.fpAutoOpened.delete(door.id); // the walk closes it now
         const seed = state!.connectedRoomAddress;
-        this.player.walkIntoVestibule(door, {
-          requestOpen: (onOpened) => {
-            ds.openDoor(door.id, onOpened);
-            return true;
-          },
-          requestClose: () => ds.closeDoor(door.id),
-          onThrough: () => {},
-          onAdapterHold: () => this.onAdapterTransit?.(seed, door.id),
-          holdInVestibule: () => this.airlock !== null,
-        });
+        // A bent connector chain can be shorter than the straight walk: it
+        // keeps the immediate fade at the threshold.
+        if ((state?.segments?.length ?? 0) > 0) {
+          this.onAdapterTransit?.(seed, door.id);
+        } else {
+          // 🚪🔒 Airlock crossing: walk on into the vestibule; the door shuts
+          // behind you at the hold point and the swap starts there (main.ts
+          // seals the airlock for it when it can, else fades as before).
+          this.fpAutoOpened.delete(door.id); // the walk closes it now
+          this.player.walkIntoVestibule(door, {
+            requestOpen: (onOpened) => {
+              ds.openDoor(door.id, onOpened);
+              return true;
+            },
+            requestClose: () => ds.closeDoor(door.id),
+            onThrough: () => {},
+            onAdapterHold: () => this.onAdapterTransit?.(seed, door.id),
+            holdInVestibule: () => this.airlock !== null,
+          });
+        }
       }
     }
     // Step clear of EVERY doorway to re-arm — including a disabled or unpaired
