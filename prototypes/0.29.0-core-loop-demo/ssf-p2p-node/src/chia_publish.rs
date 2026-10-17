@@ -977,12 +977,13 @@ pub const ADDR_CHANGE_DEBOUNCE_SECS: u64 = 10 * 60;
 /// in the next era and be filed under a hint it is not valid for. The guard
 /// budgets for how old the agreed height may be
 /// ([`crate::chia_resolve::PEAK_MAX_AGE_SECS`], 90 s, about five blocks at
-/// 18.75 s each: eight) AND for how far it may trail the chain: an agreed
-/// height is the LOWER of the pair's, up to
-/// [`crate::chia_peer_lane::MAX_PEAK_LAG`] blocks behind the higher peer, so
-/// a cached height a minute old could otherwise still pass the guard while
-/// the chain had entered the next era, and the write be signed for the era
-/// before.
+/// 18.75 s each, plus the announcement's own age, at most
+/// [`crate::chia_peer_lane::PEAK_FRESH_AGREED`] for an agreed read: eight)
+/// AND for how far it may trail the chain: an agreed height is the LOWER of
+/// the pair's, up to [`crate::chia_peer_lane::MAX_PEAK_LAG`] blocks behind
+/// the higher peer, so a cached height a minute old could otherwise still
+/// pass the guard while the chain had entered the next era, and the write be
+/// signed for the era before.
 pub const ERA_GUARD_BLOCKS: u32 = 8 + crate::chia_peer_lane::MAX_PEAK_LAG;
 /// A write the watcher has not seen confirmed on chain after this long is
 /// tried again: the peers' acceptance puts a spend in the mempool, and a
@@ -1707,13 +1708,15 @@ mod tests {
 
     #[test]
     fn a_stale_peak_stays_inside_the_era_guard() {
-        // The publisher trusts a cached peak this old at most, and that peak is
-        // the lower of an agreed pair's, up to MAX_PEAK_LAG behind the higher:
-        // those seconds of blocks and that lag together still leave end-of-era
-        // guard blocks to spare. Peers at ERA-9 and ERA-3 give an agreed height
-        // of ERA-9, inside the guard.
+        // The publisher trusts a cached peak this old at most, the agreed read
+        // behind it an announcement at most PEAK_FRESH_AGREED old, and that
+        // peak is the lower of an agreed pair's, up to MAX_PEAK_LAG behind the
+        // higher: those seconds of blocks and that lag together still leave
+        // end-of-era guard blocks to spare. Peers at ERA-9 and ERA-3 give an
+        // agreed height of ERA-9, inside the guard.
         let secs_per_block = ERA_SECS / u64::from(ERA_BLOCKS);
-        let cache_blocks = u32::try_from(crate::chia_resolve::PEAK_MAX_AGE_SECS.div_ceil(secs_per_block)).unwrap();
+        let age_secs = crate::chia_resolve::PEAK_MAX_AGE_SECS + crate::chia_peer_lane::PEAK_FRESH_AGREED.as_secs();
+        let cache_blocks = u32::try_from(age_secs.div_ceil(secs_per_block)).unwrap();
         let lag = crate::chia_peer_lane::MAX_PEAK_LAG;
         assert!(ERA_GUARD_BLOCKS > cache_blocks + lag, "{ERA_GUARD_BLOCKS} blocks against {cache_blocks} of cache age and {lag} of lag");
         assert!(era_guard(ERA_BLOCKS - 9), "an agreed height six behind a peer at ERA-3 is held");
