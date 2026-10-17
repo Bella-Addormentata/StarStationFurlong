@@ -187,7 +187,7 @@ export function setNorthDoorUnlocked(on: boolean): void {
  * The same physical connector described from the FAR room's door: segments in
  * reverse order with flex bends NEGATED (traversing a circular arc backwards
  * reverses the heading change: Δheading(B→A) = −Δheading(A→B)); extensions
- * unchanged. ⚓ A dock's two halves swap ends and stay halves — a dock read
+ * unchanged, telescoping stretch included. ⚓ A dock's two halves swap ends and stay halves — a dock read
  * from the far door is still a dock.
  */
 export function mirrorSegments(segments: ConnectorSegment[]): ConnectorSegment[] {
@@ -196,6 +196,12 @@ export function mirrorSegments(segments: ConnectorSegment[]): ConnectorSegment[]
       ? { kind: 'flex' as const, bendDeg: -(s.bendDeg ?? 0), stretch: s.stretch ?? 0 }
       : s.kind === 'dock'
         ? { kind: 'dock' as const }
-        : { kind: 'ext' as const, bays: s.bays, skin: s.skin },
+        : {
+            kind: 'ext' as const,
+            bays: s.bays,
+            skin: s.skin,
+            // 🛬 A telescoped extension is just as long from either end.
+            ...(s.stretch !== undefined ? { stretch: s.stretch } : {}),
+          },
   );
 }

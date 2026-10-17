@@ -263,6 +263,17 @@ describe('dock — parts and mirror', () => {
     const mixed: ConnectorSegment[] = [{ kind: 'flex', bendDeg: 10, stretch: 0 }, { kind: 'dock' }];
     expect(mirrorSegments(mixed)).toEqual([{ kind: 'dock' }, { kind: 'flex', bendDeg: -10, stretch: 0 }]);
   });
+
+  it('a telescoped extension keeps its stretch read from the far door', () => {
+    const chain: ConnectorSegment[] = [
+      { kind: 'ext', bays: 4, skin: 'solid', stretch: 0.6 },
+      { kind: 'flex', bendDeg: 20, stretch: 0.1 },
+    ];
+    expect(mirrorSegments(chain)).toEqual([
+      { kind: 'flex', bendDeg: -20, stretch: 0.1 },
+      { kind: 'ext', bays: 4, skin: 'solid', stretch: 0.6 },
+    ]);
+  });
 });
 
 describe('dockRules — classify', () => {
