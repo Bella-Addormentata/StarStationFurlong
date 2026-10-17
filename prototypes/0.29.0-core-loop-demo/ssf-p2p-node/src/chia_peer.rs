@@ -196,6 +196,12 @@ pub struct Peak {
 pub fn tls_client_config() -> Result<Arc<rustls::ClientConfig>> {
     let cert = chia_ssl::ChiaCertificate::generate().context("minting the peer certificate")?;
     let (chain, key) = pem_identity(&cert)?;
+    tls_client_config_for(chain, key)
+}
+
+/// [`tls_client_config`] presenting a given certificate chain and key (the
+/// tests present one another CA signed, to see it turned away).
+pub(crate) fn tls_client_config_for(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<Arc<rustls::ClientConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -710,6 +716,11 @@ impl RateGate {
 /// the configured previous hash, and the test's own handler for every other
 /// request (its replies are sent under the request's id). Nothing here is
 /// compiled into the node.
+/// An in-process full node for the tests. Its TLS server demands what a real
+/// full node demands, a client certificate the Chia CA signed, and checks it
+/// against the CA certificate `chia-ssl` ships ([`chia_ca_roots`]), so every
+/// connection test proves the lane presents one; a client without it never
+/// gets to the handshake.
 #[cfg(test)]
 pub(crate) mod mock {
     use super::*;
@@ -788,6 +799,17 @@ pub(crate) mod mock {
             .collect()
     }
 
+    /// The Chia CA certificate `chia-ssl` ships, as the one trust root a full
+    /// node checks client certificates against.
+    pub(crate) fn chia_ca_roots() -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut chia_ssl::CHIA_CA_CRT.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        assert_eq!(roots.len(), 1, "the one Chia CA certificate");
+        roots
+    }
+
     pub(crate) async fn spawn(network_id: &str, node_type: NodeType, genesis_prev: Bytes32, peak: Option<Peak>, handler: Handler) -> MockNode {
         spawn_on("127.0.0.1:0".parse().unwrap(), network_id, node_type, genesis_prev, peak, handler).await
     }
@@ -806,10 +828,14 @@ pub(crate) mod mock {
         let addr = listener.local_addr().unwrap();
         let cert = chia_ssl::ChiaCertificate::generate().unwrap();
         let (chain, key) = pem_identity(&cert).unwrap();
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(chia_ca_roots()), provider.clone())
+            .build()
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()
-            .with_no_client_auth()
+            .with_client_cert_verifier(clients)
             .with_single_cert(chain, key)
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
@@ -893,6 +919,49 @@ mod tests {
 
     fn tls() -> Arc<rustls::ClientConfig> {
         tls_client_config().unwrap()
+    }
+
+    /// A certificate chain a CA other than Chia's signed, as a stranger
+    /// without `chia-ssl` would present.
+    fn foreign_identity() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.distinguished_name.push(rcgen::DnType::CommonName, "Not the Chia CA");
+        let ca_cert = ca.self_signed(&ca_key).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["chia.net".to_string()]).unwrap().signed_by(&key, &ca_cert, &ca_key).unwrap();
+        (vec![cert.der().clone()], PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+    }
+
+    /// The mock full node demands what a real one demands: a client
+    /// certificate the Chia CA signed. The lane's is admitted; a client with
+    /// no certificate, or with one another CA signed, is turned away before
+    /// its handshake is read.
+    #[tokio::test]
+    async fn a_full_node_admits_only_a_client_certificate_the_chia_ca_signed() {
+        let peak = Peak { height: 10, header_hash: header_at(10, genesis()).header_hash() };
+        let node = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak), silent()).await;
+        let conn = PeerConn::connect(node.addr, Source::Introducer, &net(), tls()).await.unwrap();
+        assert!(conn.alive(), "the lane's Chia-CA certificate is admitted");
+        assert_eq!(node.seen.lock().unwrap().len(), 2, "handshake and binding header read");
+        drop(conn);
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let anonymous = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyServer(provider)))
+            .with_no_client_auth();
+        let refused = PeerConn::connect(node.addr, Source::Introducer, &net(), Arc::new(anonymous)).await;
+        assert!(refused.is_err(), "a client with no certificate is refused");
+        assert_eq!(node.seen.lock().unwrap().len(), 2, "its handshake was never read");
+
+        let (chain, key) = foreign_identity();
+        let refused = PeerConn::connect(node.addr, Source::Introducer, &net(), tls_client_config_for(chain, key).unwrap()).await;
+        assert!(refused.is_err(), "a certificate another CA signed is refused");
+        assert_eq!(node.seen.lock().unwrap().len(), 2, "its handshake was never read");
     }
 
     #[tokio::test]
