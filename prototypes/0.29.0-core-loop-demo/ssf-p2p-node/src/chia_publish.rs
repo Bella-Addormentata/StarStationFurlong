@@ -31,7 +31,8 @@ use clvmr::Allocator;
 use serde::{Deserialize, Serialize};
 
 use crate::chia_contact::InboundVerified;
-use crate::chia_lane::{self, AddrEntry, ChiaPresenceRecord, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_PRESENCE};
+use crate::chia_knock::{KnockRequest, SentKnock};
+use crate::chia_lane::{self, AddrEntry, BeaconV2, ChiaPresenceRecord, KnockV2, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_KNOCK, KIND_PRESENCE};
 use crate::chia_rooms::ChiaRoomCap;
 
 /// Fee (mojos) for a publish. 0 confirms when the mempool is quiet (the usual
@@ -1046,27 +1047,132 @@ pub async fn publish_node_presence(
     let plain = chia_lane::encode_presence_v2(&record, iroh_sk)?;
     let sealed = chia_lane::seal_v2(ck, KIND_PRESENCE, era, &plain)?;
     let hint = Bytes32::new(chia_lane::derive_ck_hint(ck, era));
-    let ciphertext = Bytes::new(sealed);
+    publish_memo(chia_sk, hint, sealed, "presence").await?;
+    Ok(hint)
+}
 
+/// The shared tail of every era-bound write (presence, knock, beacon): under
+/// the lease, reconcile, refuse while a spend of ours is still settling, pick
+/// the payer's largest free coin, spend it to itself carrying `[hint, body]`,
+/// push with the input parked. Returns the INPUT coin's id: the chain's
+/// `spent_block_index` for it is the height the write confirmed at.
+///
+/// Refusing while a spend settles (#231 P6a): a wallet holding more coins
+/// would spend ANOTHER one beside the pending write — two records landing for
+/// one era, the era's write budget paid twice. The confirmation timeout is a
+/// retry for a spend the mempool DROPPED, so a pending one waits for
+/// reconciliation's verdict (the heartbeat tries again on its retry cadence).
+async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &str) -> Result<Bytes32> {
     let _lease = WALLET_LEASE.lock().await;
     WALLET_LEASE.ensure_open()?;
     let client = crate::chia_chain::connect();
     WALLET_LEASE.reconcile(&client).await;
-    // A spend of ours still settling (the previous presence write, or a room
-    // publish) keeps its coin parked — and a wallet holding more coins would
-    // spend ANOTHER one beside it: two records landing for one era, the era's
-    // write budget paid twice. The confirmation timeout is a retry for a spend
-    // the mempool DROPPED, so a pending one waits for reconciliation's verdict
-    // (the heartbeat tries again on its retry cadence).
     if WALLET_LEASE.outgoing_pending() {
-        return Err(anyhow!("a spend from this wallet is still settling — the presence write waits for its verdict"));
+        return Err(anyhow!("a spend from this wallet is still settling — the {what} write waits for its verdict"));
     }
-    let our_ph = our_puzzle_hash(chia_sk);
+    let our_ph = our_puzzle_hash(payer);
     let coin = find_spendable_coin(&client, our_ph)
         .await?
         .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
-    let bundle = build_publish_bundle(chia_sk, coin, hint, ciphertext)?;
+    let bundle = build_publish_bundle(payer, coin, hint, Bytes::new(body))?;
     push_parked(&client, bundle, [coin.coin_id()]).await?;
+    Ok(coin.coin_id())
+}
+
+// ── #231 P6b: knocks and beacons ─────────────────────────────────────────────
+
+/// D7: the beacon role is opt-in (`SSF_CHIA_BEACON=1`): a public entry point
+/// that keeps the welcome room served and lets a newcomer with nobody to dial
+/// find it. Off by default, since the beacon hint is derivable by anyone and a
+/// roster of every active node id would be a public weekly directory.
+pub fn beacon_enabled() -> bool {
+    std::env::var("SSF_CHIA_BEACON").ok().as_deref() == Some("1")
+}
+
+const CTX_BEACON_WALLET: &str = "ssf-chia-beacon-wallet-v1";
+/// Where the beacon's last write is remembered, 0600 like every node file.
+pub const BEACON_MARK_FILE: &str = "beacon_mark.json";
+/// Retries of a knock that failed to leave (an unfunded wallet, a spend still
+/// settling) before the request is dropped; the next dial exhaustion queues
+/// it again.
+pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
+
+/// The beacon's own wallet key, derived from the main key so no second seed
+/// file is minted, funded SEPARATELY (its address is printed at startup): a
+/// clear-text node id must never share coin lineage with the sealed records.
+pub fn beacon_wallet_key(chia_sk: &SecretKey) -> SecretKey {
+    SecretKey::from_seed(&blake3::derive_key(CTX_BEACON_WALLET, &chia_sk.to_bytes()))
+}
+
+/// What the beacon last wrote.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BeaconMark {
+    pub era: u64,
+    pub last_at: u64,
+    pub hint: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+impl BeaconMark {
+    pub fn load(path: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        let _ = crate::chia_contact::tighten_private(path);
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        crate::chia_contact::write_private(path, &bytes)
+    }
+}
+
+/// Once per era, as this node id: a new era, no mark, or a mark another
+/// identity left.
+pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
+    match mark {
+        None => true,
+        Some(m) => m.era != era || m.node_id.as_deref() != Some(node_id),
+    }
+}
+
+/// Write one knock for `req`: the knocker's node id, its contact key when it
+/// is findable (so the host can read its presence and dial it there) and the
+/// room's lane id, signed (iroh key), sealed to the host's card key, filed
+/// under the host's inbox hint for the room's lane. Returns the hint and the
+/// input coin whose spent height is the knock's confirmation height.
+pub async fn publish_knock(
+    iroh_sk: &iroh::SecretKey,
+    chia_sk: &SecretKey,
+    own_ck: Option<&[u8; 32]>,
+    req: &KnockRequest,
+    room_key: &[u8; 32],
+    era: u64,
+    now: u64,
+) -> Result<(Bytes32, Bytes32)> {
+    let knock = KnockV2 {
+        era,
+        from: iroh_sk.public(),
+        ck_from: own_ck.copied(),
+        issued_at: now,
+        expires_at: now + 2 * ERA_SECS,
+        rooms: vec![chia_lane::room_lane_id(&req.room)],
+    };
+    let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
+    let sealed = chia_lane::seal_to_kx(&req.kx_host, KIND_KNOCK, era, &plain)?;
+    let lane = chia_lane::derive_lane_token(room_key);
+    let hint = Bytes32::new(chia_lane::derive_inbox_hint(&req.ck_host, &lane, era));
+    let coin = publish_memo(chia_sk, hint, sealed, "knock").await?;
+    Ok((hint, coin))
+}
+
+/// Write this era's beacon from the beacon wallet: the node id in the clear
+/// under the era's public hint, nothing else. Returns the hint.
+pub async fn publish_beacon(iroh_sk: &iroh::SecretKey, beacon_sk: &SecretKey, era: u64, now: u64) -> Result<Bytes32> {
+    let beacon = BeaconV2 { era, node_id: iroh_sk.public(), issued_at: now, expires_at: now + 2 * ERA_SECS };
+    let plain = chia_lane::encode_beacon_v2(&beacon, iroh_sk)?;
+    let hint = Bytes32::new(chia_lane::derive_beacon_hint(era));
+    publish_memo(beacon_sk, hint, plain.to_vec(), "beacon").await?;
     Ok(hint)
 }
 
@@ -1123,6 +1229,15 @@ pub async fn heartbeat_loop(
             if m.confirmed { "confirmed" } else { "awaiting confirmation" }
         );
     }
+    // #231 P6b/D7: the beacon role, when opted into — its own payer, its own mark.
+    let beacon_sk = beacon_enabled().then(|| beacon_wallet_key(&chia_sk));
+    let beacon_mark_path = std::path::Path::new(BEACON_MARK_FILE);
+    let mut beacon_mark: Option<BeaconMark> = beacon_sk.as_ref().and_then(|_| BeaconMark::load(beacon_mark_path));
+    let mut beacon_attempt: Option<Instant> = None;
+    if let (Some(_), Some(m)) = (&beacon_sk, &beacon_mark) {
+        println!("⛓️ ChiaHub beacon: last written in era {} (hint {})", m.era, &m.hint[..m.hint.len().min(16)]);
+    }
+    let knocks_path = std::path::Path::new(crate::chia_knock::KNOCKS_FILE);
     loop {
         tokio::time::sleep(Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
         // Live addresses (F3 rule: hints are live data, not a boot-time snapshot).
@@ -1137,22 +1252,25 @@ pub async fn heartbeat_loop(
         // last address must say so, or its peers keep dialing the old ones until
         // the record expires. The room publisher below still skips an empty set.
 
+        // The era is the chain's clock: the watcher's last peak while it is
+        // fresh (it reads every tick, but a long or stalled scan can leave
+        // it blocks — or an era — behind), else one gateway call of our
+        // own, shared back so the inbound marks and the next tick have it.
+        // Height and read time travel as one snapshot (`ChainPeak`), so a
+        // stale height is never judged by a newer time. No peak, no write.
+        // Read only when something era-bound may be written this tick.
+        let now_unix = crate::chia_resolve::unix_now();
+        let knock_waiting = !hub.knock_queue.lock().unwrap().is_empty();
+        let mut peak = hub.chia_peak.lock().unwrap().fresh(now_unix).unwrap_or(0);
+        if peak == 0 && (findable || knock_waiting || beacon_sk.is_some()) {
+            peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
+            if peak > 0 {
+                *hub.chia_peak.lock().unwrap() = crate::chia_resolve::ChainPeak::new(peak, now_unix);
+            }
+        }
+
         // ── #231 P6a: the node's OWN presence first (priority over room publishes) ──
         if findable {
-            // The era is the chain's clock: the watcher's last peak while it is
-            // fresh (it reads every tick, but a long or stalled scan can leave
-            // it blocks — or an era — behind), else one gateway call of our
-            // own, shared back so the inbound marks and the next tick have it.
-            // Height and read time travel as one snapshot (`ChainPeak`), so a
-            // stale height is never judged by a newer time. No peak, no write.
-            let now_unix = crate::chia_resolve::unix_now();
-            let mut peak = hub.chia_peak.lock().unwrap().fresh(now_unix).unwrap_or(0);
-            if peak == 0 {
-                peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
-                if peak > 0 {
-                    *hub.chia_peak.lock().unwrap() = crate::chia_resolve::ChainPeak::new(peak, now_unix);
-                }
-            }
             if peak > 0 && era_guard(peak) {
                 if !era_guard_logged {
                     println!("⛓️ ChiaHub presence: the era ends within {ERA_GUARD_BLOCKS} blocks — holding this write for the new era");
@@ -1219,6 +1337,113 @@ pub async fn heartbeat_loop(
             }
         }
 
+        // ── #231 P6b: one KNOCK per tick, after presence and before the room
+        // publishes (priority presence > knock > beacon). A queued request is
+        // still honoured only if its room still allows cards (the toggle may
+        // have flipped, the browser may have declared the room public), the
+        // host was not knocked on this era already, and the two are not linked
+        // meanwhile (a link by any path cancels the knock). Era-bound like
+        // presence: no write without a peak or inside the era's guard blocks.
+        if knock_waiting && peak > 0 && !era_guard(peak) {
+            let era = chia_lane::era_of(peak);
+            let next = loop {
+                let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
+                let cap = hub.chia_rooms.lock().unwrap().get(&req.room).cloned();
+                let Some(cap) = cap.filter(|c| c.may_share_card()) else {
+                    println!("⛓️ ChiaHub knock: not knocking on {} for room {} — the room no longer shares cards", short(&req.host), req.room);
+                    continue;
+                };
+                if hub.knocks.lock().unwrap().knocked_this_era(&req.host, era) {
+                    continue;
+                }
+                if req.host.parse::<iroh::PublicKey>().is_ok_and(|pk| crate::linked_in_room(&hub, &req.room, &pk)) {
+                    continue;
+                }
+                break Some((req, cap.room_key));
+            };
+            if let Some((mut req, room_key)) = next {
+                let own_ck = hub.contact_key_durable.then_some(&hub.contact_key);
+                match publish_knock(&iroh_sk, &chia_sk, own_ck, &req, &room_key, era, now_unix).await {
+                    Ok((hint, coin)) => {
+                        let hint_hex = hex::encode(hint.to_bytes());
+                        println!(
+                            "⛓️ ChiaHub knock: knocked on {} for room {} in era {era} · inbox hint {} — both sides dial on the confirmation height",
+                            short(&req.host),
+                            req.room,
+                            &hint_hex[..16]
+                        );
+                        let mut book = hub.knocks.lock().unwrap();
+                        book.record_sent(SentKnock {
+                            host: req.host.clone(),
+                            room: req.room.clone(),
+                            era,
+                            hint: hint_hex,
+                            coin_id: hex::encode(coin.to_bytes()),
+                            pushed_at: now_unix,
+                            confirmed_height: 0,
+                            last_rendezvous: 0,
+                        });
+                        if let Err(e) = book.save(knocks_path) {
+                            eprintln!("⛓️ ChiaHub knock: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
+                        }
+                    }
+                    Err(e) => {
+                        req.attempts = req.attempts.saturating_add(1);
+                        if req.attempts < MAX_KNOCK_ATTEMPTS {
+                            eprintln!("⛓️ ChiaHub knock: knock on {} for room {} failed: {e:#} (retry next tick)", short(&req.host), req.room);
+                            hub.knock_queue.lock().unwrap().push_back(req);
+                        } else {
+                            eprintln!(
+                                "⛓️ ChiaHub knock: knock on {} for room {} failed {} times: {e:#} — dropped; the next dial exhaustion asks again",
+                                short(&req.host),
+                                req.room,
+                                req.attempts
+                            );
+                        }
+                    }
+                }
+                continue; // one spend per tick
+            }
+        }
+
+        // ── #231 P6b/D7: the BEACON, once per era, only while this node has
+        // accepted an unsolicited direct inbound connection this era (the
+        // measured bit: a beacon that cannot be reached is noise), paid by its
+        // own wallet.
+        if let Some(beacon_sk) = &beacon_sk {
+            if peak > 0 && !era_guard(peak) {
+                let era = chia_lane::era_of(peak);
+                let inbound = hub.inbound_verified.lock().unwrap().clone();
+                let reachable = inbound.flags_for(false, peak, now_unix) != 0 || inbound.flags_for(true, peak, now_unix) != 0;
+                let retry_ok = beacon_attempt
+                    .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
+                    .unwrap_or(true);
+                if reachable && retry_ok && beacon_due(beacon_mark.as_ref(), era, &self_id) {
+                    beacon_attempt = Some(Instant::now());
+                    match publish_beacon(&iroh_sk, beacon_sk, era, now_unix).await {
+                        Ok(hint) => {
+                            let mark = BeaconMark {
+                                era,
+                                last_at: now_unix,
+                                hint: hex::encode(hint.to_bytes()),
+                                node_id: Some(self_id.clone()),
+                            };
+                            if let Err(e) = mark.save(beacon_mark_path) {
+                                eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
+                            }
+                            println!("⛓️ ChiaHub beacon: published for era {era} · hint {}", &mark.hint[..16]);
+                            beacon_mark = Some(mark);
+                        }
+                        Err(e) => eprintln!(
+                            "⛓️ ChiaHub beacon: publish for era {era} failed: {e:#} (retry in {} min; the beacon wallet is funded separately)",
+                            HEARTBEAT_RETRY_SECS / 60
+                        ),
+                    }
+                    continue; // one spend per tick
+                }
+            }
+        }
+
         if addrs.is_empty() {
             continue; // nothing routable to advertise under a room key yet
         }
@@ -1269,6 +1494,11 @@ pub async fn heartbeat_loop(
             break; // one publish per tick — see doc comment (mempool double-spend)
         }
     }
+}
+
+/// The first characters of a node id, for the log.
+fn short(node_id: &str) -> &str {
+    &node_id[..node_id.len().min(16)]
 }
 
 /// Full publish: seal the presence record, find our coin, spend-to-self with the

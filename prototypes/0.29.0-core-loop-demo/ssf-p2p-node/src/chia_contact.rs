@@ -335,10 +335,47 @@ impl PeerBook {
         changed
     }
 
+    /// #231 P6b: a knock from `node_id` carried its contact key, signed by the
+    /// knocker itself: filed under `room` so its presence is read by key and
+    /// the dial-back has addresses. A card already held keeps its own key (the
+    /// card also names the kx key; a knock does not), so the knock's key lands
+    /// only where no card has. Returns true when the book changed.
+    pub fn record_knock(&mut self, node_id: &str, ck: &[u8; 32], room: &str) -> bool {
+        if !self.peers.contains_key(node_id) && self.peers.len() >= MAX_PEERS {
+            let evict = self
+                .peers
+                .iter()
+                .min_by_key(|(id, e)| (e.last_ok.max(e.card_issued_at), (*id).clone()))
+                .map(|(id, _)| id.clone());
+            if let Some(id) = evict {
+                self.peers.remove(&id);
+            }
+        }
+        let entry = self.peers.entry(node_id.to_string()).or_default();
+        let mut changed = !entry.rooms.contains(room) && entry.rooms.len() < MAX_ROOMS_PER_PEER && entry.rooms.insert(room.to_string());
+        if entry.card_issued_at == 0 {
+            let ck_s = ck_b64(ck);
+            if entry.ck.as_deref() != Some(ck_s.as_str()) {
+                entry.ck = Some(ck_s);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The contact key held for a node id, if any.
     pub fn ck_of(&self, node_id: &str) -> Option<[u8; 32]> {
         let ck = self.peers.get(node_id)?.ck.as_deref()?;
         base64::Engine::decode(&base64::prelude::BASE64_STANDARD, ck).ok()?.try_into().ok()
+    }
+
+    /// #231 P6b: the contact key AND the card key held for a node id — what a
+    /// knock to it needs (the hint by the first, the seal to the second).
+    pub fn card_keys_of(&self, node_id: &str) -> Option<([u8; 32], [u8; 32])> {
+        let entry = self.peers.get(node_id)?;
+        let ck = self.ck_of(node_id)?;
+        let kx: [u8; 32] = hex::decode(entry.kx_pk.as_deref()?).ok()?.try_into().ok()?;
+        Some((ck, kx))
     }
 
     /// Every peer with a contact key: (node id, ck, rooms met in).
@@ -652,6 +689,27 @@ mod tests {
         let rooms = &book.peers[&node].rooms;
         assert_eq!(rooms.len(), MAX_ROOMS_PER_PEER, "the set stays at its cap");
         assert!(rooms.contains("room-0") && !rooms.contains("room-overflow"));
+    }
+
+    #[test]
+    fn a_knock_files_the_knocker_key_only_where_no_card_has() {
+        let mut book = PeerBook::default();
+        assert!(book.record_knock("j", &[5u8; 32], "r"));
+        assert_eq!(book.ck_of("j"), Some([5u8; 32]));
+        assert!(book.peers["j"].kx_pk.is_none(), "a knock names no card key");
+        assert!(book.peers["j"].rooms.contains("r"));
+        assert!(!book.record_knock("j", &[5u8; 32], "r"), "nothing new");
+        assert!(book.record_knock("j", &[6u8; 32], "s"), "a new key or a new room changes the book");
+        assert_eq!(book.ck_of("j"), Some([6u8; 32]), "no card yet: the knock's key stands");
+        let sk = iroh::SecretKey::generate();
+        let card = verify_card(&make_card(&sk, &[7u8; 32], 100), 100).unwrap();
+        let node = sk.public().to_string();
+        book.record_card(&card, "r");
+        assert!(!book.record_knock(&node, &[8u8; 32], "r"), "a card already held keeps its key");
+        assert_eq!(book.ck_of(&node), Some([7u8; 32]));
+        assert_eq!(book.with_ck().len(), 2, "both are read by key");
+        assert_eq!(book.card_keys_of(&node), Some(([7u8; 32], card.kx_pk)), "a card gives both keys a knock needs");
+        assert_eq!(book.card_keys_of("j"), None, "a knock's key alone cannot be knocked back to");
     }
 
     #[test]

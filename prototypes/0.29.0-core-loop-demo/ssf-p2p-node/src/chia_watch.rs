@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use chia_protocol::Bytes32;
 
+use crate::chia_knock::InboxKnock;
 use crate::chia_lane::{self, ChiaPresenceRecord};
 use crate::chia_resolve::{self, FoundRecord, HintCursor};
 
@@ -265,6 +266,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // Per peer: the contact key the record was read under, and the record.
     let mut node_cache: HashMap<String, ([u8; 32], FoundRecord)> = HashMap::new();
     let mut own_ck_height: u32 = 0;
+    // #231 P6b: our inbox (knocks sealed to our card key), one cursor per hint,
+    // and the knock book's two clocks (confirmations we wait for, dial-backs due).
+    let mut inbox_cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
+    let kx_secret = crate::chia_contact::kx_card_secret(&hub.secret_key);
+    let knocks_path = std::path::Path::new(crate::chia_knock::KNOCKS_FILE);
     println!(
         "⛓️ ChiaHub watcher on: reads every {} blocks per room (×{} while connected), hold {}s × {}s, {} holds/room",
         sched.beat_blocks,
@@ -327,7 +333,25 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         // confirms the write (a fresh node has no rooms or cards yet, and an
         // unconfirmed write is retried every confirmation timeout).
         let self_publishing = hub.presence_publishing.load(std::sync::atomic::Ordering::Relaxed);
-        if readable.is_empty() && peers.is_empty() && !self_publishing {
+        // #231 P6b: the rooms whose inbox we read — where we hand out our card
+        // (a knocker needs it to seal to us) and only with a durable contact
+        // key (nobody holds a card of a key that changes every start).
+        let inbox_rooms: Vec<(String, [u8; 32])> = if hub.contact_key_durable {
+            hub.chia_rooms
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, cap)| cap.may_share_card())
+                .map(|(room, cap)| (room.clone(), cap.room_key))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let knocks_live = {
+            let book = hub.knocks.lock().unwrap();
+            !book.sent.is_empty() || !book.inbox.is_empty()
+        };
+        if readable.is_empty() && peers.is_empty() && !self_publishing && inbox_rooms.is_empty() && !knocks_live {
             continue;
         }
 
@@ -490,6 +514,146 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             }
             ck_cursors.retain(|hint, _| live_ck_hints.contains(hint));
             self_cursors.retain(|hint, _| live_ck_hints.contains(hint));
+
+            // ── #231 P6b: our INBOX — one read per sharing room per beat. A knock
+            // names the knocker (signed), the room (by lane id, matched to the
+            // room the hint was read for) and, when the knocker is findable, its
+            // contact key, filed so its presence is read by key. The knock's
+            // confirmation height starts the rendezvous clock on our side.
+            let mut live_inbox: HashSet<[u8; 32]> = HashSet::new();
+            for (room, room_key) in &inbox_rooms {
+                live_inbox.extend(chia_resolve::live_inbox_hints(&own_ck, room_key, peak));
+                if !sched.due(&inbox_sched_key(room), peak, false) {
+                    continue;
+                }
+                match chia_resolve::read_inbox(&client, &kx_secret, &own_ck, room_key, room, peak, now_unix, &mut inbox_cursors).await {
+                    Ok(found) => {
+                        for f in found {
+                            let from = f.item.from.to_string();
+                            if from == self_id {
+                                continue;
+                            }
+                            let new = {
+                                let mut book = hub.knocks.lock().unwrap();
+                                let new = book.record_inbox(InboxKnock {
+                                    from: from.clone(),
+                                    room: room.clone(),
+                                    era: f.item.era,
+                                    confirmed_height: f.confirmed_height,
+                                    coin_id: hex::encode(f.coin_id.to_bytes()),
+                                    last_rendezvous: f.confirmed_height,
+                                });
+                                if new {
+                                    if let Err(e) = book.save(knocks_path) {
+                                        eprintln!("⛓️ ChiaHub inbox: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
+                                    }
+                                }
+                                new
+                            };
+                            if !new {
+                                continue;
+                            }
+                            println!(
+                                "⛓️ ChiaHub inbox: {} knocked for room {room} (confirmed at height {}) — dialing it back on the schedule",
+                                short(&from),
+                                f.confirmed_height
+                            );
+                            if let Some(ck) = f.item.ck_from {
+                                let mut book = hub.peers.lock().unwrap();
+                                if book.record_knock(&from, &ck, room) {
+                                    let _ = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => eprintln!("⛓️ ChiaHub inbox: read for room {room} failed: {err:#}"),
+                }
+            }
+            inbox_cursors.retain(|hint, _| live_inbox.contains(hint));
+            sched.forget_where(|key| {
+                key.starts_with(INBOX_SCHED_PREFIX) && !inbox_rooms.iter().any(|(r, _)| inbox_sched_key(r) == key)
+            });
+
+            // ── #231 P6b: the knocks WE sent — their confirmation height, read off
+            // the coin each spend consumed (every tick while one is pending: the
+            // first boundary is ten blocks after it).
+            let pending: Vec<Bytes32> = hub
+                .knocks
+                .lock()
+                .unwrap()
+                .pending_sent()
+                .iter()
+                .filter_map(|h| hex::decode(h).ok()?.try_into().ok().map(Bytes32::new))
+                .collect();
+            if !pending.is_empty() {
+                match chia_resolve::spent_heights(&client, pending).await {
+                    Ok(spent) => {
+                        let mut book = hub.knocks.lock().unwrap();
+                        let mut changed = false;
+                        for (coin, height) in spent {
+                            let coin_hex = hex::encode(coin.to_bytes());
+                            let era = book.sent.iter().find(|k| k.coin_id == coin_hex).map(|k| k.era);
+                            match era {
+                                Some(era) if chia_lane::era_of(height) != era => {
+                                    println!("⛓️ ChiaHub knock: our knock confirmed at height {height}, outside era {era} — the host will not read it; forgotten, the next dial exhaustion knocks again");
+                                    changed |= book.drop_sent(&coin_hex);
+                                }
+                                Some(_) => {
+                                    if book.confirm_sent(&coin_hex, height) {
+                                        println!("⛓️ ChiaHub knock: our knock confirmed at height {height} — dialing the host on the schedule from here");
+                                        changed = true;
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        if changed {
+                            let _ = book.save(knocks_path);
+                        }
+                    }
+                    Err(e) => eprintln!("⛓️ ChiaHub knock: could not read our knocks' confirmation: {e:#}"),
+                }
+            }
+            {
+                let mut book = hub.knocks.lock().unwrap();
+                if book.prune(peak) > 0 {
+                    let _ = book.save(knocks_path);
+                }
+            }
+
+            // ── #231 P6b: RENDEZVOUS — every dial-back whose boundary fell since
+            // the last, on both sides: the knocker toward the host, the host
+            // toward the knocker, in the knock's room. Addresses come from the
+            // target's freshest presence when we hold its key; with none, iroh
+            // asks the DHT for the node id (the shipped posture for a bare id).
+            // Only in a room this node still holds and still shares cards in
+            // (a room gone public dials nobody back), never a linked target,
+            // never past the room's hold slots.
+            let due = {
+                let mut book = hub.knocks.lock().unwrap();
+                let due = book.due_dialbacks(peak);
+                if !due.is_empty() {
+                    let _ = book.save(knocks_path);
+                }
+                due
+            };
+            for d in due {
+                let Ok(target_pub) = d.target.parse::<iroh::PublicKey>() else { continue };
+                let held = hub.rooms.lock().unwrap().contains_key(&d.room);
+                let sharing = hub.chia_rooms.lock().unwrap().get(&d.room).is_some_and(|c| c.may_share_card());
+                if !held || !sharing || crate::linked_in_room(&hub, &d.room, &target_pub) {
+                    continue;
+                }
+                if shared.active.lock().unwrap().get(&d.room).copied().unwrap_or(0) >= MAX_HOLDS_PER_ROOM {
+                    continue;
+                }
+                let addrs = node_cache
+                    .get(&d.target)
+                    .map(|(_, f)| crate::chia_public_dial_addrs(&f.record.addrs))
+                    .unwrap_or_default();
+                let source = if d.we_knocked { "knock rendezvous: we knocked" } else { "knock rendezvous: they knocked" };
+                spawn_hold(&hub, &iroh_ep, &shared, &d.room, HoldCandidate { node_id: d.target.clone(), addrs }, source);
+            }
         }
         // Holds: each peer's freshest cached record, in the readable rooms it was
         // met in and is not connected to — with or without a chain peak this
@@ -642,6 +806,17 @@ const CK_SCHED_PREFIX: &str = "ck:";
 
 /// The beat entry of the read of our own contact key.
 const SELF_SCHED_KEY: &str = "self";
+
+/// #231 P6b: the beat entry of a room's inbox read.
+const INBOX_SCHED_PREFIX: &str = "inbox:";
+fn inbox_sched_key(room: &str) -> String {
+    format!("{INBOX_SCHED_PREFIX}{room}")
+}
+
+/// The first characters of a node id, for the log.
+fn short(node_id: &str) -> &str {
+    &node_id[..node_id.len().min(16)]
+}
 
 /// The beat entry of a room record read. Room ids are free strings, so the
 /// prefix keeps a room named `self` or `ck:…` from taking another entry's beat.

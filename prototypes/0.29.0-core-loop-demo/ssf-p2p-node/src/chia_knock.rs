@@ -77,6 +77,8 @@ pub struct KnockRequest {
     pub ck_host: [u8; 32],
     /// The host's contact-card key the knock is sealed to.
     pub kx_host: [u8; 32],
+    /// Failed attempts to send it so far (the publisher drops it after a few).
+    pub attempts: u8,
 }
 
 /// Queue a request, once per (room, host); bounded, the oldest dropped.
@@ -205,6 +207,15 @@ impl KnockBook {
         changed
     }
 
+    /// A knock of ours the chain confirmed OUTSIDE its era (the host's reader
+    /// rejects it, so nobody dials back): forgotten, the next dial exhaustion
+    /// knocks again. Returns true when one went.
+    pub fn drop_sent(&mut self, coin_id: &str) -> bool {
+        let before = self.sent.len();
+        self.sent.retain(|k| k.coin_id != coin_id);
+        before != self.sent.len()
+    }
+
     /// File a knock read from the inbox, once per coin; bounded, the oldest
     /// confirmation first out. Returns true when it is new.
     pub fn record_inbox(&mut self, knock: InboxKnock) -> bool {
@@ -304,6 +315,9 @@ mod tests {
         assert!(!book.confirm_sent("c1", 96_900), "confirmed once");
         assert!(book.pending_sent().is_empty());
         assert_eq!(book.sent[0].last_rendezvous, 96_800, "the clock starts at the confirmation");
+        assert!(book.drop_sent("c1"));
+        assert!(!book.drop_sent("c1"));
+        assert!(!book.knocked_this_era("H", 3), "a dropped knock may be knocked again");
     }
 
     #[test]
@@ -378,7 +392,7 @@ mod tests {
     #[test]
     fn queue_takes_each_room_host_pair_once_and_stays_bounded() {
         let mut q = VecDeque::new();
-        let req = |room: &str, host: &str| KnockRequest { room: room.into(), host: host.into(), ck_host: [1; 32], kx_host: [2; 32] };
+        let req = |room: &str, host: &str| KnockRequest { room: room.into(), host: host.into(), ck_host: [1; 32], kx_host: [2; 32], attempts: 0 };
         assert!(enqueue(&mut q, req("r", "H")));
         assert!(!enqueue(&mut q, req("r", "H")), "queued once");
         assert!(enqueue(&mut q, req("s", "H")), "another room is another knock");

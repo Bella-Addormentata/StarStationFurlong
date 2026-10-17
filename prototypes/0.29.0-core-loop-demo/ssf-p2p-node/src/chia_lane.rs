@@ -485,6 +485,7 @@ const CTX_INBOX_LANE: &str = "ssf-chia-inbox-lane-v1";
 const CTX_INBOX_HINT: &str = "ssf-chia-inbox-hint-v1";
 const CTX_BEACON_HINT: &str = "ssf-chia-beacon-hint-v1";
 const CTX_KNOCK_ROOM: &str = "ssf-chia-knock-room-v1";
+#[cfg(feature = "chia-read")] // the X25519 seal needs the curve the read build brings
 const CTX_KNOCK_SEAL: &str = "ssf-chia-knock-seal-v1";
 /// Rooms one knock may name (the address slots of the shared layout).
 pub const MAX_KNOCK_ROOMS: usize = MAX_V2_ADDRS;
@@ -673,6 +674,7 @@ pub fn decode_beacon_v2(bytes: &[u8], expected_era: u64) -> Result<BeaconV2> {
 
 /// Bytes a sealed-to-key blob adds to its plaintext: the ephemeral public
 /// key, the nonce and the AEAD tag.
+#[cfg(feature = "chia-read")]
 pub const KX_SEAL_OVERHEAD: usize = 32 + 24 + 16;
 
 /// Seal `plaintext` to the holder of the X25519 secret behind `recipient_pk`
@@ -681,6 +683,7 @@ pub const KX_SEAL_OVERHEAD: usize = 32 + 24 + 16;
 /// and kind ‖ era bind as associated data, as [`seal_v2`] does. Blob:
 /// `[32B ephemeral pk ‖ 24B nonce ‖ ciphertext]`. Every holder of the host's
 /// contact key can find the hint this lands under; only the host opens it.
+#[cfg(feature = "chia-read")]
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
@@ -705,6 +708,7 @@ pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, plaintext: &[u8])
 /// Open a blob [`seal_to_kx`] made for the holder of `recipient_sk`, for
 /// `kind` in `era`. Fails on another recipient, a tampered blob, or a blob
 /// sealed for another kind or era.
+#[cfg(feature = "chia-read")]
 pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, sealed: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
     if sealed.len() < KX_SEAL_OVERHEAD {
@@ -722,6 +726,7 @@ pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, sealed: &[u8]) 
 
 /// X25519: our secret × their public point. An all-zero result (their point
 /// was of low order) is refused rather than used as a key.
+#[cfg(feature = "chia-read")]
 fn kx_shared(our_sk: &[u8; 32], their_pk: &[u8; 32]) -> Result<[u8; 32]> {
     let shared = curve25519_dalek::MontgomeryPoint(*their_pk).mul_clamped(*our_sk).to_bytes();
     if shared == [0u8; 32] {
@@ -732,6 +737,7 @@ fn kx_shared(our_sk: &[u8; 32], their_pk: &[u8; 32]) -> Result<[u8; 32]> {
 
 /// The sealing key: the shared secret bound to both public keys, so a blob
 /// cannot be re-addressed.
+#[cfg(feature = "chia-read")]
 fn kx_seal_key(shared: &[u8; 32], e_pk: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 32] {
     let mut material = [0u8; 96];
     material[..32].copy_from_slice(shared);
@@ -822,6 +828,7 @@ mod p6b_tests {
     }
 
     #[test]
+    #[cfg(feature = "chia-read")]
     fn sealed_to_key_opens_for_the_recipient_alone() {
         let host_sk = [11u8; 32];
         let host_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(host_sk).to_bytes();

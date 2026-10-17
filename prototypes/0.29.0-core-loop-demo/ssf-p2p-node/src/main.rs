@@ -1361,6 +1361,13 @@ async fn main() -> Result<()> {
         match chia_wallet::load_or_mint_bls_key(seed_path) {
             Ok(chia_sk) => {
                 chia_wallet::log_receive_address(&chia_sk);
+                // #231 P6b/D7: the beacon role pays from a wallet of its own.
+                if chia_publish::beacon_enabled() {
+                    println!(
+                        "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund {} at a testnet11 faucet",
+                        chia_wallet::testnet_address(&chia_publish::beacon_wallet_key(&chia_sk))
+                    );
+                }
                 // The wallet lease's parking outlives the process (#245 review,
                 // round 17): a zero-fee spend can still sit in the mempool after
                 // a restart, and the restored parking keeps its inputs, and a
@@ -1917,6 +1924,12 @@ async fn handle_wt_connection_inner(
                                         );
                                         if filed > 0 {
                                             println!("📇 {filed} member card(s) from room {}'s pass filed — their presence is now findable by key", envelope.room);
+                                        }
+                                        // And ours to the tabs, so the browser can carry it
+                                        // in this room's passes (P6b): a live private cap
+                                        // is the browser saying the room may have it.
+                                        if hub_clone.contact_key_durable && chia_contact::share_card_enabled() {
+                                            broadcast_own_card(&hub_clone, &envelope.room).await;
                                         }
                                     }
                                 } else {
@@ -2616,6 +2629,50 @@ async fn dial_peer_inner(
         }
     }
 
+    // #231 P6b: the ladder AND the chain holds are exhausted. Two last resorts,
+    // by the room's posture.
+    #[cfg(feature = "chia-read")]
+    {
+        let cap = hub.chia_rooms.lock().unwrap().get(&room_id).cloned();
+        match cap {
+            // A private room whose host we hold a card for: KNOCK — one record
+            // only the host can open, saying we want in; both sides then dial
+            // on its confirmation height (`chia_knock`). Queued for the
+            // publisher (one spend per tick, once per host per era); without
+            // the publish build or a funded wallet nothing leaves, and the
+            // publisher's log says so.
+            Some(cap) if cap.may_share_card() => {
+                let keys = hub.peers.lock().unwrap().card_keys_of(&target_str);
+                if let Some((ck, kx)) = keys {
+                    let req = chia_knock::KnockRequest {
+                        room: room_id.clone(),
+                        host: target_str.clone(),
+                        ck_host: ck,
+                        kx_host: kx,
+                        attempts: 0,
+                    };
+                    if chia_knock::enqueue(&mut hub.knock_queue.lock().unwrap(), req) {
+                        println!(
+                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock is queued (written once per era; both sides dial on its confirmation height)"
+                        );
+                    }
+                    report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; knocking through the chain")).await;
+                    return;
+                }
+            }
+            // The welcome room, or any PUBLIC room: no inbox, no knock (N8). Dial
+            // the newest BEACONS instead (D7): nodes that opted into being public
+            // entry points this era, by node id through the DHT, so the room is
+            // reached through any of them and its relay — additive, only after
+            // the pass's own hints failed, since the beacon hint is anyone's to
+            // fill.
+            Some(cap) if cap.public_room == Some(true) => {
+                beacon_fallback(&hub, &iroh_ep, &room_id, dial_tier).await;
+            }
+            _ => {}
+        }
+    }
+
     report_dial_status(
         &hub,
         &send,
@@ -2625,6 +2682,82 @@ async fn dial_peer_inner(
         Some(&format!("no route after {} attempts", MAX_DIAL_ATTEMPTS)),
     )
     .await;
+}
+
+/// #231 P6b/D7: beacons dialed per public room per fall-through, at most.
+#[cfg(feature = "chia-read")]
+pub const BEACON_DIALS: usize = 3;
+
+/// #231 P6b/D7: when a public room's beacons were last read, per room — one
+/// read per [`chia_watch::TARGET_COOLDOWN`], since every exhausted dial in the
+/// welcome room would otherwise read the hint again.
+#[cfg(feature = "chia-read")]
+static BEACON_READ_AT: std::sync::LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// #231 P6b/D7: the public room's last resort — read this era's (and the last
+/// era's) beacons and hold-dial the newest few by node id, each on its own
+/// single-flight claim, as unvetted members of `room_id`. Their addresses come
+/// from the DHT (the shipped posture for a bare node id); a beacon carries none.
+#[cfg(feature = "chia-read")]
+async fn beacon_fallback(hub: &SharedHub, iroh_ep: &IrohEndpoint, room_id: &str, dial_tier: u8) {
+    {
+        let mut last = BEACON_READ_AT.lock().unwrap();
+        if last.get(room_id).is_some_and(|t| t.elapsed() < chia_watch::TARGET_COOLDOWN) {
+            return;
+        }
+        last.insert(room_id.to_string(), std::time::Instant::now());
+    }
+    let client = chia_chain::connect();
+    let now = chia_resolve::unix_now();
+    let Some(peak) = chia_resolve::peak_height(&client).await else { return };
+    let beacons = match chia_resolve::read_beacons(&client, peak, now).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("⛓️ ChiaHub beacons: read failed: {e:#}");
+            return;
+        }
+    };
+    if beacons.is_empty() {
+        println!("⛓️ ChiaHub beacons: nobody beacons this era or last — room {room_id} stays unreached by the chain");
+        return;
+    }
+    let self_id = iroh_ep.id();
+    let mut started = 0usize;
+    for b in beacons {
+        if started >= BEACON_DIALS {
+            break;
+        }
+        let pk = b.item.node_id;
+        if pk == self_id || linked_in_room(hub, room_id, &pk) || !hub.dialing.lock().unwrap().insert(pk) {
+            continue;
+        }
+        started += 1;
+        let target = pk.to_string();
+        println!(
+            "⛓️ ChiaHub beacons: dialing beacon {} for room {room_id} (era {}, by node id through the DHT)",
+            &target[..target.len().min(16)],
+            b.item.era
+        );
+        let hub_b = hub.clone();
+        let ep_b = iroh_ep.clone();
+        let room_b = room_id.to_string();
+        let tier = dial_tier.min(TIER_UNVETTED);
+        tokio::spawn(async move {
+            hold_dial(hub_b.clone(), ep_b, room_b, pk, target, vec![], tier, None).await;
+            release_dial(&hub_b, pk);
+        });
+    }
+}
+
+/// #231 P6b: hand this node's own contact card to the local tabs of `room_id`
+/// (kind `card`, node-local lane), so the browser can carry it in the room's
+/// passes. Sent whenever a live private cap for the room is accepted.
+#[cfg(feature = "chia-read")]
+async fn broadcast_own_card(hub: &SharedHub, room_id: &str) {
+    let card = chia_contact::make_card(&hub.secret_key, &hub.contact_key, chia_resolve::unix_now());
+    let Ok(payload) = serde_json::to_vec(&card) else { return };
+    broadcast_local_envelope(hub, room_id, "card", payload).await;
 }
 
 /// #231 P1 HOLD WINDOW: dial `target` at `addrs` every `HOLD_PERIOD` for up to
@@ -3287,13 +3420,19 @@ async fn broadcast_bridge_status(
         "status": status,
         "detail": detail,
     });
+    broadcast_local_envelope(hub, room_id, "bridge", body.to_string().into_bytes()).await;
+}
+
+/// Push one node-authored envelope of a node-local `kind` (see
+/// [`is_local_lane_kind`]) to EVERY local browser in a room.
+async fn broadcast_local_envelope(hub: &SharedHub, room_id: &str, kind: &str, payload: Vec<u8>) {
     let env = SsfEnvelope {
         v: 1,
         room: room_id.to_string(),
-        kind: "bridge".to_string(),
+        kind: kind.to_string(),
         seq: 0,
         author: vec![],
-        payload: body.to_string().into_bytes(),
+        payload,
         sig: None,
         iroh_node_id: None,
         iroh_relay_urls: None,
@@ -3428,7 +3567,7 @@ fn is_control_kind(kind: &str) -> bool {
 /// remote peer is dropped at the iroh ingress before it can be forwarded to
 /// the tabs as if the node had said it.
 fn is_local_lane_kind(kind: &str) -> bool {
-    matches!(kind, "cap" | "faucet" | "bridge")
+    matches!(kind, "cap" | "faucet" | "bridge" | "card")
 }
 
 /// M5.0 STRICT admission: a control envelope must be sig-Valid. Unlike

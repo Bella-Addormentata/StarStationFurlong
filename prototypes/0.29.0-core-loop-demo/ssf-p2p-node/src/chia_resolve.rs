@@ -80,6 +80,16 @@ pub struct FoundRecord {
     pub hint: Bytes32,
 }
 
+/// #231 P6b: a decoded item of any record kind plus where it sat on chain —
+/// what [`read_hint_items`] returns; [`FoundRecord`] is its presence shape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoundItem<T> {
+    pub item: T,
+    pub coin_id: Bytes32,
+    pub confirmed_height: u32,
+    pub hint: Bytes32,
+}
+
 /// Per-hint read position for incremental polls.
 #[derive(Clone, Debug, Default)]
 pub struct HintCursor {
@@ -234,6 +244,21 @@ pub async fn read_hint_with(
     cursor: &mut HintCursor,
     opener: &(dyn Fn(&[u8], u32) -> Option<ChiaPresenceRecord> + Sync),
 ) -> Result<Vec<FoundRecord>> {
+    Ok(read_hint_items(client, hint, cursor, opener)
+        .await?
+        .into_iter()
+        .map(|f| FoundRecord { record: f.item, coin_id: f.coin_id, confirmed_height: f.confirmed_height, hint: f.hint })
+        .collect())
+}
+
+/// [`read_hint_with`] for ANY record kind (#231 P6b: knocks and beacons read
+/// through the same listing, paging, parent-fetch, cursor and flood rules).
+pub async fn read_hint_items<T: Send>(
+    client: &impl ChainAccess,
+    hint: Bytes32,
+    cursor: &mut HintCursor,
+    opener: &(dyn Fn(&[u8], u32) -> Option<T> + Sync),
+) -> Result<Vec<FoundItem<T>>> {
     let Resume { start, mut page, mut max_height, mut examined_all } = cursor.resume();
     let mut coins = Vec::new();
     // `listed` = the gateway reported the listing's last page this poll.
@@ -293,13 +318,8 @@ pub async fn read_hint_with(
             Some(ct) => ct,
             None => continue,
         };
-        if let Some(record) = opener(&ciphertext, rec.confirmed_block_index) {
-            out.push(FoundRecord {
-                record,
-                coin_id: Bytes32::new(coin_id),
-                confirmed_height: rec.confirmed_block_index,
-                hint,
-            });
+        if let Some(item) = opener(&ciphertext, rec.confirmed_block_index) {
+            out.push(FoundItem { item, coin_id: Bytes32::new(coin_id), confirmed_height: rec.confirmed_block_index, hint });
         }
     }
     cursor.backlog = capped;
@@ -411,6 +431,159 @@ pub async fn read_ck(
 /// The hints a v2 reader of `ck` has in play at `peak` (for cursor pruning).
 pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
     scan_eras(peak).into_iter().map(|era| chia_lane::derive_ck_hint(ck, era)).collect()
+}
+
+// ── #231 P6b: the inbox (knocks sealed to us) and the public beacons ────────
+
+/// Open one knock ciphertext read under our inbox hint for `era`: sealed to
+/// our card key, signed by its knocker, filed in its own era, not expired, not
+/// from the far future, and naming `lane_id` (the room the hint was read for)
+/// among its rooms. `None` for anything else.
+pub fn decode_knock_for(
+    kx_secret: &[u8; 32],
+    ciphertext: &[u8],
+    era: u64,
+    confirmed_height: u32,
+    now: u64,
+    lane_id: &[u8; chia_lane::ROOM_LANE_ID_LEN],
+) -> Option<chia_lane::KnockV2> {
+    if chia_lane::era_of(confirmed_height) != era {
+        return None;
+    }
+    let plain = chia_lane::open_with_kx(kx_secret, chia_lane::KIND_KNOCK, era, ciphertext).ok()?;
+    let knock = chia_lane::decode_knock_v2(&plain, era).ok()?;
+    if knock.expires_at < now || knock.issued_at > now.saturating_add(MAX_FUTURE_SKEW_V2_SECS) {
+        return None;
+    }
+    knock.rooms.contains(lane_id).then_some(knock)
+}
+
+/// One incremental read of our INBOX for `room`'s lane: both scan eras' hints
+/// under our contact key and the room's lane token, cursors kept by the caller
+/// per hint, the same transactional failure rule as [`read_ck`].
+pub async fn read_inbox(
+    client: &impl ChainAccess,
+    kx_secret: &[u8; 32],
+    own_ck: &[u8; 32],
+    room_key: &[u8; 32],
+    room_id: &str,
+    peak: u32,
+    now: u64,
+    cursors: &mut std::collections::HashMap<[u8; 32], HintCursor>,
+) -> Result<Vec<FoundItem<chia_lane::KnockV2>>> {
+    let lane = chia_lane::derive_lane_token(room_key);
+    let lane_id = chia_lane::room_lane_id(room_id);
+    let mut found = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut any_ok = false;
+    for era in scan_eras(peak) {
+        let hint = chia_lane::derive_inbox_hint(own_ck, &lane, era);
+        let cursor = cursors.entry(hint).or_default();
+        let before = cursor.clone();
+        let opener = |ct: &[u8], height: u32| decode_knock_for(kx_secret, ct, era, height, now, &lane_id);
+        match read_hint_items(client, Bytes32::new(hint), cursor, &opener).await {
+            Ok(items) => {
+                any_ok = true;
+                found.extend(items);
+            }
+            Err(e) => {
+                *cursor = before;
+                cursor.backlog = true;
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(e) if !any_ok => Err(e),
+        Some(e) => {
+            eprintln!("⛓️ ChiaHub inbox: one of a room's era hints failed and will be re-read next beat: {e:#}");
+            Ok(found)
+        }
+        None => Ok(found),
+    }
+}
+
+/// The inbox hints of `room` in play at `peak` (for cursor pruning).
+pub fn live_inbox_hints(own_ck: &[u8; 32], room_key: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
+    let lane = chia_lane::derive_lane_token(room_key);
+    scan_eras(peak).into_iter().map(|era| chia_lane::derive_inbox_hint(own_ck, &lane, era)).collect()
+}
+
+/// Beacons a reader keeps: the newest by signed time, one per node.
+pub const BEACONS_KEPT: usize = 20;
+
+/// One beacon record read under the era's public hint: signed, in its era,
+/// not expired, not from the far future.
+pub fn decode_beacon_for(ciphertext: &[u8], era: u64, confirmed_height: u32, now: u64) -> Option<chia_lane::BeaconV2> {
+    if chia_lane::era_of(confirmed_height) != era {
+        return None;
+    }
+    let beacon = chia_lane::decode_beacon_v2(ciphertext, era).ok()?;
+    if beacon.expires_at < now || beacon.issued_at > now.saturating_add(MAX_FUTURE_SKEW_V2_SECS) {
+        return None;
+    }
+    Some(beacon)
+}
+
+/// Newest first, one per node: the order beacon readers rank in.
+pub fn rank_beacons(mut found: Vec<FoundItem<chia_lane::BeaconV2>>) -> Vec<FoundItem<chia_lane::BeaconV2>> {
+    found.sort_by(|a, b| {
+        b.item.issued_at.cmp(&a.item.issued_at).then_with(|| b.confirmed_height.cmp(&a.confirmed_height))
+    });
+    let mut seen: HashSet<iroh::PublicKey> = HashSet::new();
+    found.retain(|f| seen.insert(f.item.node_id));
+    found.truncate(BEACONS_KEPT);
+    found
+}
+
+/// ONE-SHOT: the newest [`BEACONS_KEPT`] beacons of this era and the last —
+/// the public entry points a newcomer with nobody to dial may try (D7). The
+/// hint is derivable by anyone and may be flooded or pre-filled: the one-shot
+/// budget bounds the read and the newest-first order keeps what matters.
+pub async fn read_beacons(client: &impl ChainAccess, peak: u32, now: u64) -> Result<Vec<FoundItem<chia_lane::BeaconV2>>> {
+    let mut all = Vec::new();
+    let mut cursors: std::collections::HashMap<[u8; 32], HintCursor> = std::collections::HashMap::new();
+    for round in 1..=ONE_SHOT_MAX_ROUNDS {
+        for era in scan_eras(peak) {
+            let hint = chia_lane::derive_beacon_hint(era);
+            let cursor = cursors.entry(hint).or_default();
+            let opener = |ct: &[u8], height: u32| decode_beacon_for(ct, era, height, now);
+            all.extend(read_hint_items(client, Bytes32::new(hint), cursor, &opener).await?);
+        }
+        if !cursors.values().any(|c| c.has_more()) {
+            break;
+        }
+        if round == ONE_SHOT_MAX_ROUNDS {
+            eprintln!("⛓️ ChiaHub beacons: the beacon hints still had more after {round} rounds — budget spent, taking the newest read");
+        }
+    }
+    Ok(rank_beacons(all))
+}
+
+/// The heights at which the given coins were SPENT, for those the chain lists
+/// as spent (#231 P6b: a knock's confirmation height, read by its knocker off
+/// the coin its spend consumed). Pages are followed within the poll budget;
+/// a coin not yet spent, or not listed, is simply absent.
+pub async fn spent_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) -> Result<Vec<(Bytes32, u32)>> {
+    if coin_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut page: Option<String> = None;
+    for _ in 0..MAX_PAGES_PER_POLL {
+        let listing = client
+            .coin_records_by_names(coin_ids.clone(), true, page.clone())
+            .await
+            .map_err(|e| anyhow!("coin lookup by name: {e}"))?;
+        out.extend(listing.records.iter().filter(|r| r.spent && r.spent_block_index > 0).map(|r| (r.coin.coin_id(), r.spent_block_index)));
+        match (listing.truncated, listing.next_cursor) {
+            (true, Some(next)) => page = Some(next),
+            _ => break,
+        }
+    }
+    Ok(out)
 }
 
 /// ONE-SHOT: the freshest presence record `node_id` published under its
