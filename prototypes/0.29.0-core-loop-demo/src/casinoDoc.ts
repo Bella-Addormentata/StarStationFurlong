@@ -1183,8 +1183,9 @@ function isCoinPusherOperatorLease(value: unknown): value is CoinPusherOperatorL
 }
 
 export function readCoinPusherState(machineId: string): CoinPusherState | null {
-  const value = ensureMap().get(`pusher:${machineId}`);
-  return isCoinPusherState(value) ? value : null;
+  // Normalized, so a machine stored before the drop board reads with every
+  // pile on the centre line.
+  return normalizeCoinPusherState(ensureMap().get(`pusher:${machineId}`));
 }
 
 /** True when something is stored under `pusher:<mid>` that isn't a machine

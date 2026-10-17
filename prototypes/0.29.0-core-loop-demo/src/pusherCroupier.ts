@@ -482,8 +482,10 @@ function settleOneInsert(
 
   const timing = resolveDropTiming(state, request.phase, request.requestedAt, now);
   let drop: ReturnType<typeof processInsert>;
+  // Published with the drop, so every cabinet replays it exactly.
+  const seed = drawSeed() >>> 0;
   try {
-    drop = processInsert(state, request.player, request.hole, timing.dropPhase, drawSeed());
+    drop = processInsert(state, request.player, request.hole, timing.dropPhase, seed);
   } catch (err) {
     // Unreachable for a guarded request; never let one poison the queue, and
     // never clear it without an answer.
@@ -498,10 +500,12 @@ function settleOneInsert(
       hole: request.hole,
       chipId: drop.chipId,
       landedX: drop.landedX,
+      landedU: drop.landedU,
       paid: drop.paid,
       phase: timing.dropPhase,
       honored: timing.honored,
       atMs: now,
+      seed,
     },
     // Every settled drop, for the cabinet: a poll can settle several, and
     // lastDrop keeps only the latest.
