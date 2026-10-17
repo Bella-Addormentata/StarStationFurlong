@@ -180,4 +180,11 @@ export interface DoorSequenceHooks {
    * here — mid-hold, behind the full-screen fade.
    */
   onAdapterHold?: () => void;
+  /**
+   * 🚪🔒 Consulted when ADAPTER_HOLD reaches its defensive timeout: true keeps
+   * the avatar waiting in the vestibule instead of walking itself back in.
+   * The airlock crossing sets it while both doors are sealed and the room is
+   * being swapped behind them (the swap's own watchdog bounds the wait).
+   */
+  holdInVestibule?: () => boolean;
 }

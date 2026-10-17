@@ -4453,6 +4453,11 @@ export class DoorDockingPortSystem {
    * wall shows through it as a bright hairline down the middle of every closed
    * door.
    */
+  /** 🚪🔒 Is this door built and its leaves fully shut (the airlock seal)? */
+  public isDoorShut(doorId: string): boolean {
+    return this.doorObjects.has(doorId) && !this.isDoorAjar(doorId);
+  }
+
   private isDoorAjar(doorId: string): boolean {
     // Opening counts from its first frame, so the wall parts WITH the leaves.
     if (this.slideAnims.get(doorId)?.openTarget === DOOR_LEAF_OPEN_OFFSET)

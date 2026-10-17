@@ -2438,7 +2438,7 @@ export class Player {
       case "ADAPTER_HOLD": {
         this.character.setState("idle", door.faceAngle);
         this.doorTimer += deltaTime;
-        if (this.doorTimer > this.ADAPTER_HOLD_TIMEOUT) {
+        if (this.doorTimer > this.ADAPTER_HOLD_TIMEOUT && !hooks.holdInVestibule?.()) {
           // Defensive cap — the swap never resolved. Re-open the door and
           // walk back inside (RETURN's completion closes it and restores
           // MANUAL). enterFromDoor still takes over cleanly if the transit
@@ -2584,6 +2584,37 @@ export class Player {
       if (seq !== this.doorSeq || this.doorPhase !== "ARRIVE_OPEN") return;
       this.doorPhase = "ARRIVE";
     });
+  }
+
+  /**
+   * 🚪🔒 First-person airlock entry: the player has walked into an OPEN
+   * doorway themselves, so skip the approach and the THROUGH leg and carry
+   * them straight on into the vestibule (ADAPTER_OUT → ADAPTER_HOLD, the same
+   * legs the click path runs after THROUGH). Input is swallowed from here, as
+   * for every adapter transit; the hold closes the door behind them and fires
+   * hooks.onAdapterHold, which starts the swap.
+   */
+  walkIntoVestibule(door: DoorTarget, hooks: DoorSequenceHooks): void {
+    this.doorSeq++; // invalidate any in-flight requestOpen completion
+    this._cancelSit();
+    this._cancelDeviceApproach();
+    this.pendingDest = null;
+    this.pendingSeat = null;
+    this.pendingDoor = null;
+    this.pendingDevice = null;
+    this._clearPath();
+    this._removeReticle();
+
+    this.doorTarget = door;
+    this.doorHooks = hooks;
+    const ox = Math.sin(door.faceAngle);
+    const oz = Math.cos(door.faceAngle);
+    this.adapterOutTarget = {
+      x: door.through.x + ox * this.ADAPTER_OUT_DIST,
+      z: door.through.z + oz * this.ADAPTER_OUT_DIST,
+    };
+    this.doorTimer = 0;
+    this.doorPhase = "ADAPTER_OUT";
   }
 
   /**
