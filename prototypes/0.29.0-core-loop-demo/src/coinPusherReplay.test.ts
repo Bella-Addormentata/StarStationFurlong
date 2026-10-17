@@ -11,7 +11,7 @@ import {
   type CoinPusherState, type DropTrace, type PusherDropMark, type PusherHole,
 } from './games/coinPusher';
 import {
-  cabinetView, PAY_MS, planDrops, queueDrops, REPLAY_MAX, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
+  cabinetView, PAY_MS, STEP_MS, planDrops, queueDrops, REPLAY_MAX, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
 } from './coinPusherReplay';
 
 const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088, barTop: 0.08, boardExitX: -0.04, boardExitY: 0.18 };
@@ -369,5 +369,38 @@ describe('coin pusher replay', () => {
     expect(q).toHaveLength(1);
     // Long over: nothing left to draw but the record.
     expect(cabinetView(q, at + 60_000)).toEqual({ view: null, live: [] });
+  });
+
+  it('draws a chip paid straight off the upper platform stepping down first', () => {
+    // An upper chip that lands on a full lower contact chain can spill
+    // through it into the tray inside one substep: gone from the next frame.
+    const before = fill(10);
+    const { trace } = traced(before, 1, 0.3, 21);
+    const chip = 9_999;
+    const edge = { x: PLAT_UP_FRONT - 0.005, u: 0.05, count: 1, chipIds: [chip] };
+    const t0 = trace.landMs;
+    const fake: DropTrace = {
+      ...trace,
+      frames: [
+        { t: t0, upper: [...trace.frames[0].upper, edge], lower: trace.frames[0].lower, paid: [] },
+        { t: t0 + 20, upper: trace.frames[0].upper, lower: trace.frames[0].lower, paid: [chip] },
+      ],
+    };
+    const plan = planReplay({ ...before, upper: [...before.upper, edge] }, fake, GEOM);
+    const pay = plan.transitions.get(chip)!.find((t) => t.kind === 'pay')!;
+    let onLower = false;
+    for (let k = 0; k <= 60; k++) {
+      const t = pay.t + ((STEP_MS + PAY_MS) * k) / 60;
+      const p = replayView(plan, t).table.find((q) => q.chipId === chip);
+      if (!p) continue;
+      const bottom = p.y - reachBelow(p.tip * Math.PI / 2, GEOM);
+      const back = p.x - reachBack(p.tip * Math.PI / 2, GEOM);
+      if (back < PLAT_UP_FRONT - 1e-9) expect(bottom).toBeGreaterThanOrEqual(-1e-6);
+      if (back < PLAT_LOW_FRONT - 1e-9) expect(bottom).toBeGreaterThanOrEqual(-GEOM.lowerDrop - 1e-6);
+      if (Math.abs(bottom + GEOM.lowerDrop) < 1e-6) onLower = true;
+    }
+    expect(onLower).toBe(true);
+    expect(replayView(plan, pay.t + STEP_MS + PAY_MS).table.some((q) => q.chipId === chip)).toBe(false);
+    expect(plan.endMs).toBeGreaterThanOrEqual(pay.t + STEP_MS + PAY_MS);
   });
 });

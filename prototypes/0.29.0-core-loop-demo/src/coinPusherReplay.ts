@@ -18,7 +18,7 @@
  */
 
 import {
-  CHIP_R, dropStartMs, PLAT_LOW_FRONT, PLAT_UP_FRONT, PUSHER_PERIOD_MS, pusherFaceX, RECENT_DROPS_MAX, traceDrop,
+  CHIP_R, dropStartMs, PLAT_LOW_BACK, PLAT_LOW_FRONT, PLAT_UP_FRONT, PUSHER_PERIOD_MS, pusherFaceX, RECENT_DROPS_MAX, traceDrop,
   type CoinPusherState, type DropTrace, type Pile,
 } from './games/coinPusher';
 
@@ -229,7 +229,7 @@ export function planReplay(before: CoinPusherState, trace: DropTrace, geom: Repl
       const now = frame.chips.get(id);
       if (!now) {
         add(id, { kind: 'pay', t: prevT, from: was });
-        endMs = Math.max(endMs, prevT + PAY_MS);
+        endMs = Math.max(endMs, prevT + payMs(was));
         continue;
       }
       if (was.standing && !now.standing) {
@@ -270,6 +270,28 @@ function framePoses(replay: Replay, t: number): Map<number, TablePose> {
   return out;
 }
 
+/** Off the upper front, `s` of the way: forward along the platform until
+ *  its back is past the edge, then down onto the lower one (which it lands
+ *  on clear of the edge too: dropToLower). */
+function stepPose(from: TablePose, to: TablePose, s: number): TablePose {
+  const clear = Math.max(from.x, PLAT_UP_FRONT + CHIP_R);
+  const d = (s - EDGE_SHARE) / (1 - EDGE_SHARE);
+  return {
+    ...blend(from, to, s),
+    x: s < EDGE_SHARE ? lerp(from.x, clear, s / EDGE_SHARE) : lerp(clear, Math.max(to.x, clear), d),
+    y: s < EDGE_SHARE ? from.y : lerp(from.y, to.y, d * d),
+  };
+}
+
+/** Where a chip paid out straight off the upper platform is drawn landing
+ *  on the lower one before it goes over the lower front. */
+const LOWER_LANDING = (from: Placement): Placement =>
+  ({ lower: true, x: PLAT_LOW_BACK + CHIP_R, u: from.u, level: 0, standing: false });
+
+/** How long a payout from `from` is drawn: a step down first when it went
+ *  from the upper platform. */
+const payMs = (from: Placement): number => (from.lower ? PAY_MS : STEP_MS + PAY_MS);
+
 /** Where a chip falling into the tray is drawn, `s` of the way there. */
 function payPose(id: number, from: TablePose, s: number, geom: ReplayGeometry): TablePose {
   // Off the front along the deck until its back is past the lip, then down.
@@ -296,7 +318,16 @@ export function replayView(replay: Replay, t: number): ReplayView {
       if (t < tr.t) continue;
       const from = poseOf(id, tr.from, geom);
       if (tr.kind === 'pay') {
-        if (t < tr.t + PAY_MS) table.set(id, payPose(id, from, (t - tr.t) / PAY_MS, geom));
+        if (t >= tr.t + payMs(tr.from)) continue;
+        if (tr.from.lower) {
+          table.set(id, payPose(id, from, (t - tr.t) / PAY_MS, geom));
+        } else if (t < tr.t + STEP_MS) {
+          // Off the upper platform and straight through a full lower one in
+          // one substep: drawn stepping down first, then paid out.
+          table.set(id, stepPose(from, poseOf(id, LOWER_LANDING(tr.from), geom), (t - tr.t) / STEP_MS));
+        } else {
+          table.set(id, payPose(id, poseOf(id, LOWER_LANDING(tr.from), geom), (t - tr.t - STEP_MS) / PAY_MS, geom));
+        }
         continue;
       }
       const dur = tr.kind === 'tip' ? TIP_MS : STEP_MS;
@@ -322,16 +353,7 @@ export function replayView(replay: Replay, t: number): ReplayView {
           : Math.max(slide, pusherFaceX(trace.phase + t / PUSHER_PERIOD_MS) + reachBack(a, geom));
         table.set(id, { ...blend(from, cur, s), x, y: support + reachBelow(a, geom), tip });
       } else {
-        // Off the upper front: forward along the platform until its back is
-        // past the edge, then down onto the lower one (which it lands on
-        // clear of the edge too: dropToLower).
-        const clear = Math.max(from.x, PLAT_UP_FRONT + CHIP_R);
-        const d = (s - EDGE_SHARE) / (1 - EDGE_SHARE);
-        table.set(id, {
-          ...blend(from, cur, s),
-          x: s < EDGE_SHARE ? lerp(from.x, clear, s / EDGE_SHARE) : lerp(clear, Math.max(cur.x, clear), d),
-          y: s < EDGE_SHARE ? from.y : lerp(from.y, cur.y, d * d),
-        });
+        table.set(id, stepPose(from, cur, s));
       }
     }
   }

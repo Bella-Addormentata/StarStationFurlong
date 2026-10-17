@@ -962,6 +962,19 @@ export function settlePiles(
       }
     }
     if (tipping.length === 0) break;
+    // A coin going over falls forward onto its face: any standing coin it
+    // falls across is knocked over too, rather than left standing inside it
+    // (the next pass's sort would put that coin behind the fallen one, where
+    // nothing pushes it).
+    for (let k = 0; k < tipping.length; k++) {
+      const p = tipping[k];
+      const fallen: Pile = { x: p.x + CHIP_T / 2 + CHIP_R, u: p.u, count: 1, chipIds: [] };
+      for (const q of work) {
+        if (!q.standing || tipping.includes(q) || q.x <= p.x || q.x > fallen.x) continue;
+        const spacing = contactSpacing(q, fallen);
+        if (spacing !== -Infinity && fallen.x - q.x < spacing - PUSH_EPS) tipping.push(q);
+      }
+    }
     for (const p of tipping) {
       work.splice(work.indexOf(p), 1);
       toppled.push(...p.chipIds);

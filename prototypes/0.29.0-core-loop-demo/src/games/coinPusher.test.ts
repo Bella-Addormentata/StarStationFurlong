@@ -517,6 +517,29 @@ describe('settlePiles', () => {
     expect(r[2].x).toBeCloseTo(0.30 + PILE_STEP, 9);
   });
 
+  it('a coin knocked over falls across a standing coin and knocks it over too', () => {
+    // Two standing coins one behind the other; the bar tips the rear one,
+    // which falls flat across the front one.
+    const rear: Pile = { x: 0.496, u: 0, count: 1, chipIds: [1], standing: true };
+    const front: Pile = { x: 0.514, u: 0, count: 1, chipIds: [2], standing: true };
+    const { piles: r, toppled } = settlePiles([rear, front], 0.501, PLAT_UP_FRONT);
+    expect(toppled.sort()).toEqual([1, 2]);
+    expect(r.some((p) => p.standing)).toBe(false);
+    // Nothing is left overlapping.
+    const sorted = [...r].sort((a, b) => a.x - b.x);
+    for (let i = 1; i < sorted.length; i++) {
+      const spacing = contactSpacing(sorted[i - 1], sorted[i]);
+      if (spacing !== -Infinity) expect(sorted[i].x - sorted[i - 1].x).toBeGreaterThanOrEqual(spacing - 1e-9);
+    }
+  });
+
+  it('a coin falling flat beside a standing one, clear of it, leaves it standing', () => {
+    const rear: Pile = { x: 0.496, u: 0, count: 1, chipIds: [1], standing: true };
+    const beside: Pile = { x: 0.514, u: 2 * CHIP_R + 0.001, count: 1, chipIds: [2], standing: true };
+    const { toppled } = settlePiles([rear, beside], 0.501, PLAT_UP_FRONT);
+    expect(toppled).toEqual([1]);
+  });
+
   it('holds every pile its half-depth ahead of the pusher face', () => {
     const n = { id: 1 };
     const piles = [pileN(0.02, 1, n), pileN(0.03, 1, n, 0.15)];
