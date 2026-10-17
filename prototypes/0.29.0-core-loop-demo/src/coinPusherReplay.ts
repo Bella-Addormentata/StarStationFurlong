@@ -87,6 +87,10 @@ interface Transition {
   kind: 'tip' | 'step' | 'pay';
   t: number;
   from: Placement;
+  /** The substep frame that has it tipped or stepped down, and its time:
+   *  until then the frames still have it as it was. */
+  to?: Placement;
+  toT?: number;
 }
 
 interface Frame {
@@ -133,6 +137,15 @@ export function reachBelow(a: number, geom: ReplayGeometry): number {
   return CHIP_R * Math.sin(a) + (geom.level / 2) * Math.cos(a);
 }
 
+/** How far behind its centre a chip turned `a` from flat reaches. */
+export function reachBack(a: number, geom: ReplayGeometry): number {
+  return CHIP_R * Math.cos(a) + (geom.level / 2) * Math.sin(a);
+}
+
+function backOf(p: TablePose, geom: ReplayGeometry): number {
+  return p.x - reachBack(p.tip * Math.PI / 2, geom);
+}
+
 /** The surface a chip at rest is lying or standing on. */
 function surfaceUnder(p: TablePose, geom: ReplayGeometry): number {
   return p.y - reachBelow(p.tip * Math.PI / 2, geom);
@@ -167,11 +180,11 @@ export function planReplay(before: CoinPusherState, trace: DropTrace, geom: Repl
         continue;
       }
       if (was.standing && !now.standing) {
-        add(id, { kind: 'tip', t: prevT, from: was });
+        add(id, { kind: 'tip', t: prevT, from: was, to: now, toT: frame.t });
         endMs = Math.max(endMs, prevT + TIP_MS);
       }
       if (!was.lower && now.lower) {
-        add(id, { kind: 'step', t: prevT, from: was });
+        add(id, { kind: 'step', t: prevT, from: was, to: now, toT: frame.t });
         endMs = Math.max(endMs, prevT + STEP_MS);
       }
     }
@@ -225,8 +238,11 @@ export function replayView(replay: Replay, t: number): ReplayView {
         continue;
       }
       const dur = tr.kind === 'tip' ? TIP_MS : STEP_MS;
-      const cur = table.get(id);
-      if (!cur || t >= tr.t + dur) continue;
+      const live = table.get(id);
+      if (!live || t >= tr.t + dur) continue;
+      // Where it is going: the frame that has it over or down, then the
+      // frames after it.
+      const cur = tr.to && tr.toT !== undefined && t < tr.toT ? poseOf(id, tr.to, geom) : live;
       const s = (t - tr.t) / dur;
       if (tr.kind === 'tip') {
         // Over on its front edge: it rolls onto it and falls flat, its centre
@@ -237,7 +253,10 @@ export function replayView(replay: Replay, t: number): ReplayView {
         const tip = 1 - s * s;
         const a = tip * Math.PI / 2;
         const support = lerp(surfaceUnder(from, geom), surfaceUnder(cur, geom), s);
-        table.set(id, { ...blend(from, cur, s), y: support + reachBelow(a, geom), tip });
+        // And its back no further back than the back of where the physics
+        // has it (ahead of the bar that pushed it), however far over it is.
+        const x = Math.max(lerp(from.x, cur.x, s), backOf(cur, geom) + reachBack(a, geom));
+        table.set(id, { ...blend(from, cur, s), x, y: support + reachBelow(a, geom), tip });
       } else {
         // Off the upper front: forward along the platform, then down.
         const edge = Math.max(from.x, PLAT_UP_FRONT);
@@ -287,10 +306,13 @@ export interface ScheduledReplay {
  * machine the one before it left: the operator can settle several drops
  * between two frames, and the record's recentDrops marks carry what replays
  * each. Null when any of them can't be replayed (a mark from before the drop
- * board, a gap, a new or emptied machine): the cabinet then just draws the
+ * board, a gap, a new machine, one emptied in between): the cabinet then just draws the
  * record.
  */
 export function planDrops(prev: CoinPusherState, next: CoinPusherState, geom: ReplayGeometry): ScheduledReplay[] | null {
+  // Emptied in between (which keeps the chip ids and marks): the drops
+  // after it ran on an empty machine, not on `prev`.
+  if (next.totalEmptied !== prev.totalEmptied) return null;
   const n = next.nextChipId - prev.nextChipId;
   if (n <= 0 || n > RECENT_DROPS_MAX) return null;
   const marks = (next.recentDrops ?? []).filter((d) => d.chipId >= prev.nextChipId);

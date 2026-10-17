@@ -6,11 +6,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  CHIP_R, chipsInMachine, currentPusherPhase, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
+  CHIP_R, chipsInMachine, currentPusherPhase, emptyMachine, pusherFaceX, initialCoinPusherState, processInsert, PUSHER_PERIOD_MS, simulateBoard,
   type CoinPusherState, type DropTrace, type PusherDropMark, type PusherHole,
 } from './games/coinPusher';
 import {
-  cabinetView, PAY_MS, planDrops, planReplay, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
+  cabinetView, PAY_MS, planDrops, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
 } from './coinPusherReplay';
 
 const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088 };
@@ -177,5 +177,39 @@ describe('coin pusher replay', () => {
     expect(planDrops(before, { ...r.state, recentDrops: [{ chipId: r.chipId, hole: 1 }] }, GEOM)).toBeNull();
     expect(planDrops(fill(19), { ...r.state, recentDrops: [mark] }, GEOM)).toBeNull();
     expect(planDrops(r.state, r.state, GEOM)).toBeNull();
+  });
+
+  it('keeps every tipping coin ahead of the bar that pushed it', () => {
+    let before = fill(25);
+    let tips = 0;
+    for (let i = 0; i < 60; i++) {
+      const phase = (i * 0.618) % 1;
+      const { r, trace } = traced(before, (i % 3) as PusherHole, phase, 300 + i);
+      const plan = planReplay(before, trace, GEOM);
+      for (const [id, list] of plan.transitions) {
+        for (const tr of list) {
+          if (tr.kind !== 'tip' || tr.from.lower) continue;
+          tips++;
+          for (let k = 0; k <= 12; k++) {
+            const t = tr.t + (TIP_MS * k) / 12;
+            const p = replayView(plan, t).table.find((q) => q.chipId === id);
+            if (!p || p.y < -GEOM.level) continue; // stepped down off the upper platform
+            const face = pusherFaceX(phase + t / PUSHER_PERIOD_MS);
+            expect(p.x - reachBack(p.tip * Math.PI / 2, GEOM)).toBeGreaterThanOrEqual(face - 1e-3);
+          }
+        }
+      }
+      before = r.state;
+    }
+    expect(tips).toBeGreaterThan(5);
+  });
+
+  it("won't replay across an empty: those drops ran on an empty machine", () => {
+    const before = fill(20);
+    const emptied = emptyMachine(before, 'owner').state;
+    const r = processInsert(emptied, 'p', 1, 0.3, 9);
+    const mark = { chipId: r.chipId, hole: 1 as PusherHole, phase: 0.3, atMs: 1_000, seed: 9 };
+    expect(planDrops(before, { ...r.state, recentDrops: [mark] }, GEOM)).toBeNull();
+    expect(planDrops(emptied, { ...r.state, recentDrops: [mark] }, GEOM)).toHaveLength(1);
   });
 });
