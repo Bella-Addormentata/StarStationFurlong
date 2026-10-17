@@ -86,7 +86,13 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// releases a coin whose spend CONFIRMED (the chain lists it spent: it is
 /// gone) or was DROPPED (still unspent on chain and no longer in the mempool:
 /// it is free again), and keeps one whose spend still waits in the mempool,
-/// however long that takes.
+/// however long that takes. A coin the listing does not mention at all is
+/// released only when that listing is complete AND judged at a height the
+/// coin was already seen confirmed at (#271 review, round 17): two peers
+/// still syncing, standing below the coin's creation, know nothing of it,
+/// and their silence must not free a coin whose spend may be live on the
+/// chain ahead of them. So every parking records where its coins were seen
+/// ([`ParkedInput`]).
 ///
 /// Coins are parked PER SPEND (#245 review, round 11): a spend bundle is
 /// atomic — the chain confirms every one of its inputs or none, the mempool
@@ -147,11 +153,37 @@ pub struct WalletLease {
     sealed: std::sync::Mutex<Option<String>>,
 }
 
-/// A parked coin: when, and by which spend (see [`Parking`]).
+/// A parked coin: when, by which spend (see [`Parking`]), and the height it
+/// was seen confirmed at when selected (`None`: unknown, as for a coin an
+/// older node parked), which decides whether a listing that leaves it out
+/// can free it ([`settle`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Parked {
     at: Instant,
     spend: u64,
+    seen_at: Option<u32>,
+}
+
+/// An input a spend consumes, with the height its coin was seen confirmed at
+/// as the listing that selected it reported (our wallet's coins, the faucet
+/// coin a TAKE claims). A bare coin id parks with no height: such a coin is
+/// never freed on a listing's silence alone (#271 review, round 17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkedInput {
+    pub coin_id: Bytes32,
+    pub seen_at: Option<u32>,
+}
+
+impl From<Bytes32> for ParkedInput {
+    fn from(coin_id: Bytes32) -> Self {
+        Self { coin_id, seen_at: None }
+    }
+}
+
+impl From<(Bytes32, u32)> for ParkedInput {
+    fn from((coin_id, seen_at): (Bytes32, u32)) -> Self {
+        Self { coin_id, seen_at: Some(seen_at) }
+    }
 }
 
 /// One spend's parking: its number, unique for the life of the process, and
@@ -170,7 +202,7 @@ pub struct Parking {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueSpend {
     pub spend: u64,
-    pub coins: Vec<Bytes32>,
+    pub coins: Vec<ParkedInput>,
     pub bundle: Option<SpendBundle>,
 }
 
@@ -193,6 +225,11 @@ struct LeaseFile {
 struct ParkedCoin {
     coin: String,
     spend: u64,
+    /// The height the coin was seen confirmed at (since #271 review, round
+    /// 17); absent in files older nodes wrote, whose coins a listing's
+    /// silence then never frees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seen_at: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
@@ -256,12 +293,12 @@ impl WalletLease {
     /// which saves the bundle in the same write; the bundle-less form serves
     /// the lease tests.
     #[cfg(test)]
-    pub fn park(&self, coin_ids: impl IntoIterator<Item = Bytes32>) -> Result<Parking, LeaseError> {
+    pub fn park<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>) -> Result<Parking, LeaseError> {
         self.park_at(coin_ids, Instant::now())
     }
 
     #[cfg(test)]
-    pub fn park_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) -> Result<Parking, LeaseError> {
+    pub fn park_at<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>, now: Instant) -> Result<Parking, LeaseError> {
         self.park_with_bundle_at(coin_ids, None, now)
     }
 
@@ -272,23 +309,24 @@ impl WalletLease {
     /// the two writes, hold the wallet's coins with no bundle to ask about
     /// until an outside spend settled them. `Err` means nothing is parked or
     /// kept and the spend must not leave.
-    pub fn park_with_bundle(&self, coin_ids: impl IntoIterator<Item = Bytes32>, bundle: &SpendBundle) -> Result<Parking, LeaseError> {
+    pub fn park_with_bundle<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>, bundle: &SpendBundle) -> Result<Parking, LeaseError> {
         self.park_with_bundle_at(coin_ids, Some(bundle), Instant::now())
     }
 
-    fn park_with_bundle_at(
+    fn park_with_bundle_at<I: Into<ParkedInput>>(
         &self,
-        coin_ids: impl IntoIterator<Item = Bytes32>,
+        coin_ids: impl IntoIterator<Item = I>,
         bundle: Option<&SpendBundle>,
         now: Instant,
     ) -> Result<Parking, LeaseError> {
         self.ensure_open()?;
         let spend = self.spends.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let coins: Vec<Bytes32> = coin_ids.into_iter().collect();
+        let inputs: Vec<ParkedInput> = coin_ids.into_iter().map(Into::into).collect();
+        let coins: Vec<Bytes32> = inputs.iter().map(|input| input.coin_id).collect();
         {
             let mut pending = self.pending.lock().unwrap();
-            for id in &coins {
-                pending.insert(*id, Parked { at: now, spend });
+            for input in &inputs {
+                pending.insert(input.coin_id, Parked { at: now, spend, seen_at: input.seen_at });
             }
         }
         if let Some(bundle) = bundle {
@@ -378,17 +416,17 @@ impl WalletLease {
     /// coins it parked (sorted), oldest spend first.
     pub fn due_at(&self, now: Instant) -> Vec<DueSpend> {
         let pending = self.pending.lock().unwrap();
-        let mut by_spend: BTreeMap<u64, Vec<Bytes32>> = BTreeMap::new();
+        let mut by_spend: BTreeMap<u64, Vec<ParkedInput>> = BTreeMap::new();
         for (id, parked) in pending.iter() {
             if now.duration_since(parked.at) >= RECONCILE_GRACE {
-                by_spend.entry(parked.spend).or_default().push(*id);
+                by_spend.entry(parked.spend).or_default().push(ParkedInput { coin_id: *id, seen_at: parked.seen_at });
             }
         }
         let bundles = self.bundles.lock().unwrap();
         by_spend
             .into_iter()
             .map(|(spend, mut coins)| {
-                coins.sort();
+                coins.sort_by_key(|c| c.coin_id);
                 DueSpend { spend, coins, bundle: bundles.get(&spend).cloned() }
             })
             .collect()
@@ -478,7 +516,7 @@ impl WalletLease {
             if !seen.insert(id) {
                 return Err(format!("parked coin {:?} listed twice", entry.coin));
             }
-            parked.push((id, entry.spend));
+            parked.push((id, entry.spend, entry.seen_at));
         }
         let incoming = match file.incoming.as_deref() {
             Some(hex_id) => Some(parse_coin_id(hex_id).ok_or_else(|| format!("malformed incoming coin id {hex_id:?}"))?),
@@ -486,7 +524,7 @@ impl WalletLease {
         };
         let mut bundles = Vec::with_capacity(file.bundles.len());
         for entry in &file.bundles {
-            if !parked.iter().any(|(_, spend)| *spend == entry.spend) {
+            if !parked.iter().any(|(_, spend, _)| *spend == entry.spend) {
                 return Err(format!("bundle for spend #{} that parks no coin", entry.spend));
             }
             let bytes = hex::decode(&entry.bundle).map_err(|e| format!("malformed bundle for spend #{}: {e}", entry.spend))?;
@@ -495,8 +533,8 @@ impl WalletLease {
         }
         {
             let mut pending = self.pending.lock().unwrap();
-            for (id, spend) in &parked {
-                pending.entry(*id).or_insert(Parked { at: now, spend: *spend });
+            for (id, spend, seen_at) in &parked {
+                pending.entry(*id).or_insert(Parked { at: now, spend: *spend, seen_at: *seen_at });
             }
             let mut kept = self.bundles.lock().unwrap();
             for (spend, bundle) in bundles {
@@ -540,7 +578,7 @@ impl WalletLease {
         let incoming = (*self.incoming.lock().unwrap()).map(hex::encode);
         let pending = self.pending.lock().unwrap();
         let mut parked: Vec<ParkedCoin> =
-            pending.iter().map(|(id, p)| ParkedCoin { coin: hex::encode(id), spend: p.spend }).collect();
+            pending.iter().map(|(id, p)| ParkedCoin { coin: hex::encode(id), spend: p.spend, seen_at: p.seen_at }).collect();
         parked.sort_by(|a, b| (a.spend, &a.coin).cmp(&(b.spend, &b.coin)));
         let mut bundles: Vec<ParkedBundle> = self
             .bundles
@@ -566,14 +604,18 @@ impl WalletLease {
         if due.is_empty() {
             return;
         }
-        let coins: Vec<Bytes32> = due.iter().flat_map(|d| d.coins.iter().copied()).collect();
+        let coins: Vec<Bytes32> = due.iter().flat_map(|d| d.coins.iter().map(|c| c.coin_id)).collect();
         // One listing for every parked coin, paged like every chain listing:
         // follow the cursor, and if it is still cut short at the cap (or
         // truncated with no cursor), the listing is INCOMPLETE and a spend with
-        // a coin it left out is kept.
+        // a coin it left out is kept. A complete listing settles the coins it
+        // leaves out only from the height it was judged at (the lowest over
+        // its pages; none, once a page came undated): see [`settle`].
         let mut records = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
+        let mut judged_at: Option<u32> = None;
+        let mut undated = false;
         let complete = loop {
             let listing = match client.coin_records_by_names(coins.clone(), true, cursor.take()).await {
                 Ok(listing) => listing,
@@ -584,6 +626,10 @@ impl WalletLease {
             };
             pages += 1;
             records.extend(listing.records);
+            match listing.judged_at {
+                Some(height) => judged_at = Some(judged_at.map_or(height, |lowest| lowest.min(height))),
+                None => undated = true,
+            }
             let truncated = listing.truncated;
             match listing.next_cursor {
                 Some(next) if truncated => {
@@ -616,7 +662,8 @@ impl WalletLease {
             };
             in_mempool.insert(spend, live);
         }
-        let released = settle(&due, &spent_on_chain, &in_mempool, complete);
+        let judged_at = if complete && !undated { judged_at } else { None };
+        let released = settle(&due, &spent_on_chain, &in_mempool, judged_at);
         if !released.is_empty() {
             self.release(&released);
         }
@@ -643,10 +690,10 @@ impl WalletLease {
 ///
 /// Callers hold the lease gate. For the dish's TAKE the input is the FAUCET
 /// coin, not ours: parking it keeps a second TAKE off it the same way.
-pub async fn push_parked(
+pub async fn push_parked<I: Into<ParkedInput>>(
     client: &impl ChainAccess,
     bundle: SpendBundle,
-    inputs: impl IntoIterator<Item = Bytes32>,
+    inputs: impl IntoIterator<Item = I>,
 ) -> Result<(), PushError> {
     push_parked_with(&WALLET_LEASE, client, bundle, inputs).await
 }
@@ -654,12 +701,14 @@ pub async fn push_parked(
 /// [`push_parked`] against a given lease (the process-wide one in production;
 /// tests bring their own). The parking comes FIRST and must be saved: a lease
 /// that cannot park (sealed, or its file unwritable) means the spend never
-/// leaves, since a restart would forget it (#245 review, round 19).
-pub async fn push_parked_with(
+/// leaves, since a restart would forget it (#245 review, round 19). Each
+/// input carries the height its coin was seen confirmed at when the caller
+/// has it ([`ParkedInput`]); a bare coin id parks without one.
+pub async fn push_parked_with<I: Into<ParkedInput>>(
     lease: &WalletLease,
     client: &impl ChainAccess,
     bundle: SpendBundle,
-    inputs: impl IntoIterator<Item = Bytes32>,
+    inputs: impl IntoIterator<Item = I>,
 ) -> Result<(), PushError> {
     let parking = lease.park_with_bundle(inputs, &bundle).map_err(PushError::NotSent)?;
     match client.push_tx(bundle).await {
@@ -760,7 +809,7 @@ pub fn mempool_probes(
 ) -> Vec<(u64, SpendBundle)> {
     let eligible: Vec<(u64, SpendBundle)> = due
         .iter()
-        .filter(|d| !d.coins.is_empty() && d.coins.iter().all(|c| spent_on_chain.get(c) == Some(&false)))
+        .filter(|d| !d.coins.is_empty() && d.coins.iter().all(|c| spent_on_chain.get(&c.coin_id) == Some(&false)))
         .filter_map(|d| d.bundle.as_ref().map(|b| (d.spend, b.clone())))
         .collect();
     let start = eligible.iter().position(|(spend, _)| *spend > after).unwrap_or(0);
@@ -776,25 +825,32 @@ pub fn mempool_probes(
 /// Per spend: any input SPENT on chain → the spend confirmed (or lost that coin
 /// to another spend, which kills ours), so it is released and its other coins
 /// are free or gone. An input the listing does not mention → gone only if the
-/// listing was COMPLETE (no such coin on chain, so no live spend of it and
-/// nothing to double-spend): released then, kept when the listing was cut
-/// short, which says nothing about what it left out. Every input UNSPENT → the
-/// peers decide: the spend is dead (`Some(false)`) → released; live, or not
-/// asked (`None`) → stays parked.
+/// listing was COMPLETE and judged at or above the height that input was seen
+/// confirmed at (`judged_at`; `None` for a listing cut short or undated): the
+/// chain, read where the coin was known to stand, has no such coin, so no live
+/// spend of it and nothing to double-spend. Kept when the listing was cut
+/// short, which says nothing about what it left out; when it was judged
+/// below that height (two peers still syncing know nothing of a coin created
+/// above their view, while its spend may be live on the chain ahead of them,
+/// #271 review, round 17); or when the input's height is unknown (parked by
+/// an older node). Every input UNSPENT → the peers decide: the spend is dead
+/// (`Some(false)`) → released; live, or not asked (`None`) → stays parked.
 pub fn settle(
     due: &[DueSpend],
     spent_on_chain: &HashMap<Bytes32, bool>,
     in_mempool: &HashMap<u64, Option<bool>>,
-    complete: bool,
+    judged_at: Option<u32>,
 ) -> Vec<u64> {
     due.iter()
         .filter(|d| {
-            let states: Vec<Option<bool>> = d.coins.iter().map(|c| spent_on_chain.get(c).copied()).collect();
-            if states.iter().any(|s| *s == Some(true)) {
+            let states: Vec<(Option<bool>, Option<u32>)> =
+                d.coins.iter().map(|c| (spent_on_chain.get(&c.coin_id).copied(), c.seen_at)).collect();
+            if states.iter().any(|(s, _)| *s == Some(true)) {
                 return true;
             }
-            if states.iter().any(|s| s.is_none()) {
-                return complete;
+            if states.iter().any(|(s, _)| s.is_none()) {
+                let Some(judged) = judged_at else { return false };
+                return states.iter().filter(|(s, _)| s.is_none()).all(|(_, seen)| seen.is_some_and(|seen| judged >= seen));
             }
             in_mempool.get(&d.spend).copied().flatten() == Some(false)
         })
@@ -809,7 +865,8 @@ impl Default for WalletLease {
 }
 
 /// Find our largest UNSPENT coin — the one to spend-to-self — skipping coins a
-/// spend is already pending for (see [`WalletLease`]). `None` if unfunded.
+/// spend is already pending for (see [`WalletLease`]), with the height it was
+/// seen confirmed at, which its parking records. `None` if unfunded.
 ///
 /// Every page of the listing is read, up to the bound every wallet listing
 /// shares (`chia_faucet::MAX_FAUCET_PAGES`): the first page can hold only
@@ -818,14 +875,10 @@ impl Default for WalletLease {
 pub async fn find_spendable_coin(
     client: &impl ChainAccess,
     puzzle_hash: Bytes32,
-) -> Result<Option<Coin>> {
+) -> Result<Option<crate::chia_faucet::FaucetCoin>> {
     let listing = crate::chia_faucet::unspent_at(client, puzzle_hash).await?;
-    let mut coins: Vec<Coin> = listing
-        .coins
-        .into_iter()
-        .map(|c| c.coin)
-        .filter(|c| !WALLET_LEASE.is_pending(&c.coin_id()))
-        .collect();
+    let mut coins: Vec<crate::chia_faucet::FaucetCoin> =
+        listing.coins.into_iter().filter(|c| !WALLET_LEASE.is_pending(&c.coin.coin_id())).collect();
     if coins.is_empty() && listing.partial {
         eprintln!(
             "⛓️ wallet: no free coin in the first {} pages at {puzzle_hash}; the listing was cut short, so there may be one further on",
@@ -833,7 +886,7 @@ pub async fn find_spendable_coin(
         );
     }
     // Largest first — the recreated coin keeps the most value for future republishes.
-    coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
+    coins.sort_by_key(|c| std::cmp::Reverse(c.coin.amount));
     Ok(coins.into_iter().next())
 }
 
@@ -1148,8 +1201,8 @@ pub async fn publish_node_presence(
     let coin = find_spendable_coin(&client, our_ph)
         .await?
         .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
-    let bundle = build_publish_bundle(chia_sk, coin, hint, ciphertext)?;
-    push_parked(&client, bundle, [coin.coin_id()]).await?;
+    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, ciphertext)?;
+    push_parked(&client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(hint)
 }
 
@@ -1410,8 +1463,8 @@ pub async fn publish_presence(
 
     // 3. Build + sign the spend-to-self, then push to the mempool with the coin
     //    parked first (push_parked: a timed-out push may still have landed).
-    let bundle = build_publish_bundle(chia_sk, coin, hint, ciphertext)?;
-    push_parked(&client, bundle, [coin.coin_id()]).await?;
+    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, ciphertext)?;
+    push_parked(&client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(hint)
 }
 
@@ -1542,7 +1595,7 @@ mod tests {
         // No timer releases it, however long the spend waits in the mempool:
         // only the chain/mempool verdict does (release).
         assert!(lease.due_at(t0 + Duration::from_secs(5)).is_empty(), "inside the grace: not asked yet");
-        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![DueSpend { spend: parking.spend, coins: vec![a], bundle: None }]);
+        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![DueSpend { spend: parking.spend, coins: vec![a.into()], bundle: None }]);
         lease.release(&[parking.spend]);
         assert!(!lease.is_pending(&a));
         lease.park_at([b], t0).unwrap();
@@ -1584,7 +1637,7 @@ mod tests {
         // both coins stay parked and come due for reconciliation after the grace,
         // as ONE spend.
         let due = lease.due_at(t0 + RECONCILE_GRACE);
-        assert_eq!(due, vec![DueSpend { spend: parking.spend, coins: vec![a, b], bundle: None }]);
+        assert_eq!(due, vec![DueSpend { spend: parking.spend, coins: vec![a.into(), b.into()], bundle: None }]);
         // An explicit rejection hands exactly this parking back.
         lease.unpark(&parking);
         assert!(!lease.is_pending(&a) && !lease.is_pending(&b));
@@ -1641,12 +1694,19 @@ mod tests {
     #[test]
     fn settle_releases_confirmed_and_dropped_spends_and_keeps_the_waiting_ones() {
         let id = |n: u8| Bytes32::new([n; 32]);
-        let spend = |n: u64, coins: &[Bytes32]| DueSpend { spend: n, coins: coins.to_vec(), bundle: Some(SpendBundle::new(vec![], Signature::default())) };
+        // Every coin was seen confirmed at height 90 when selected, except
+        // spend 8's, parked by an older node that recorded no height.
+        let spend = |n: u64, coins: &[Bytes32]| DueSpend {
+            spend: n,
+            coins: coins.iter().map(|c| ParkedInput { coin_id: *c, seen_at: Some(90) }).collect(),
+            bundle: Some(SpendBundle::new(vec![], Signature::default())),
+        };
         // 1 confirmed (its input spent); 2 dropped (unspent, gone from the
         // mempool); 3 waiting (unspent, in the mempool); 4 unknown (unspent,
         // mempool not asked); 5 never existed (not listed); 6 a three-input
-        // GIVE, all unspent and dropped; 7 one input unspent, one not listed.
-        let due = vec![
+        // GIVE, all unspent and dropped; 7 one input unspent, one not listed;
+        // 8 not listed, its height unknown.
+        let mut due = vec![
             spend(1, &[id(1)]),
             spend(2, &[id(2)]),
             spend(3, &[id(3)]),
@@ -1655,6 +1715,9 @@ mod tests {
             spend(6, &[id(6), id(7), id(8)]),
             spend(7, &[id(9), id(10)]),
         ];
+        let mut unknown_height = spend(8, &[id(11)]);
+        unknown_height.coins[0].seen_at = None;
+        due.push(unknown_height);
         let spent_on_chain: HashMap<Bytes32, bool> = [
             (id(1), true), (id(2), false), (id(3), false), (id(4), false),
             (id(6), false), (id(7), false), (id(8), false), (id(9), false),
@@ -1671,14 +1734,26 @@ mod tests {
         assert_eq!(mempool_probes(&bare, &spent_on_chain, 0).iter().map(|(n, _)| *n).collect::<Vec<u64>>(), vec![3, 4, 6]);
         let in_mempool: HashMap<u64, Option<bool>> =
             [(2, Some(false)), (3, Some(true)), (4, None), (6, Some(false))].into_iter().collect();
-        let mut released = settle(&due, &spent_on_chain, &in_mempool, true);
+        // A complete listing judged at 100, above where the missing coins were
+        // seen confirmed: they are gone (5, 7). The coin of unknown height (8)
+        // is never freed on silence alone.
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, Some(100));
         released.sort();
         assert_eq!(released, vec![1, 2, 5, 6, 7]);
         // A listing cut short says nothing about the coins it left out: a spend
         // with one of them stays.
-        let mut released = settle(&due, &spent_on_chain, &in_mempool, false);
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, None);
         released.sort();
         assert_eq!(released, vec![1, 2, 6]);
+        // Complete, but judged below the height the coins were seen confirmed
+        // at: a pair of peers still syncing knows nothing of them, so nothing
+        // missing is freed. Judged exactly there, it is.
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, Some(80));
+        released.sort();
+        assert_eq!(released, vec![1, 2, 6]);
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, Some(90));
+        released.sort();
+        assert_eq!(released, vec![1, 2, 5, 6, 7]);
         // The probes are bounded per pass, and the window rotates: a pass opens
         // after the last spend the previous one asked about and wraps around, so
         // with more spends waiting than one pass covers, none is starved.

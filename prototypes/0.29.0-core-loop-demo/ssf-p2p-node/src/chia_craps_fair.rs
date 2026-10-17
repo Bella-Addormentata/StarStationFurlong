@@ -100,14 +100,14 @@ pub fn derive_dice(seed_hex: &str, beacon_hex: &str, table: &str, round: u64) ->
 async fn push_fair_record(
     client: &impl ChainAccess,
     chia_sk: &SecretKey,
-    coin: Coin,
+    coin: crate::chia_faucet::FaucetCoin,
     table: &str,
     round: u64,
     payload: &[u8],
 ) -> Result<()> {
     let hint = fair_hint(table, round);
-    let bundle = build_publish_bundle(chia_sk, coin, hint, Bytes::new(payload.to_vec()))?;
-    push_parked(client, bundle, [coin.coin_id()]).await?;
+    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, Bytes::new(payload.to_vec()))?;
+    push_parked(client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(())
 }
 
@@ -261,7 +261,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
         coin
     };
     println!("   ✅ commit published; waiting for confirmation…");
-    wait_for_next_coin(&client, our_ph, &coin_a).await?;
+    wait_for_next_coin(&client, our_ph, &coin_a.coin).await?;
 
     // 2. REVEAL (after the "betting window" — here, once the commit confirmed).
     //    Selected afresh under the lease: `wait_for_next_coin`'s pick could have
@@ -280,7 +280,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
         coin
     };
     println!("   ✅ reveal published; waiting for confirmation…");
-    wait_for_next_coin(&client, our_ph, &coin_b).await?;
+    wait_for_next_coin(&client, our_ph, &coin_b.coin).await?;
 
     // 3. RESOLVE both records from testnet11 and VERIFY the transcript.
     let payloads = resolve_fair_records(table, round).await?;
@@ -334,8 +334,9 @@ mod tests {
         // again: one record, in its later state, not two transcripts.
         let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), Bytes32::new([9u8; 32]), u64::from(seed));
         let rec = |c: Coin, height: u32, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: height, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
-        let first = CoinListing { records: vec![rec(coin(1), 80, None)], truncated: true, next_cursor: Some("page-2".into()) };
-        let second = CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(2), 101, None)], truncated: false, next_cursor: None };
+        let first = CoinListing { records: vec![rec(coin(1), 80, None)], truncated: true, next_cursor: Some("page-2".into()), judged_at: None };
+        let second =
+            CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(2), 101, None)], truncated: false, next_cursor: None, judged_at: None };
         let chain = Scripted::new(vec![first, second]);
         let coins = fair_coins(&chain, Bytes32::new([1u8; 32])).await.unwrap();
         assert_eq!(coins.iter().map(|r| (r.coin.amount, r.spent)).collect::<Vec<_>>(), vec![(1, true), (2, false)]);

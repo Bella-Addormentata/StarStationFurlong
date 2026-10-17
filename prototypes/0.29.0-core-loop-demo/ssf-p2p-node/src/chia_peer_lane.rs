@@ -96,6 +96,10 @@
 //!     before it is reported, more than [`PEAK_FRESH_AGREED`] ago for an
 //!     agreed read, the publisher's era clock. The peers that answer, a
 //!     carrier's one or an agreed pair, are remembered in the store.
+//!   - The pool lock is held for choosing and bookkeeping alone; dials,
+//!     introducer lookups and gossip requests run with it released, one
+//!     requester at a time, so a presence read with a live peer is answered
+//!     while a money read is out finding its second one.
 //!
 //! The mempool delta (§14 (6)): the wallet protocol has no mempool query, so
 //! `spend_live` hands the parked spend bundle to the peers AGAIN and reads
@@ -229,7 +233,14 @@ pub struct Lane {
     pin_only: bool,
     store_path: Option<PathBuf>,
     tls: tokio::sync::OnceCell<Arc<rustls::ClientConfig>>,
+    /// The pool: held for choosing and bookkeeping alone, never across a dial,
+    /// a lookup or a gossip request, so a presence read with a live peer is
+    /// answered while a money read is out finding its second one.
     state: tokio::sync::Mutex<LaneState>,
+    /// Discovery (pins, refill, dial) runs under this, one requester at a
+    /// time: two requests short of a peer do not dial the same addresses
+    /// twice, and the second chooses from what the first brought in.
+    discovery: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -313,7 +324,15 @@ impl Lane {
 
     pub fn new(net: Network, pins: Vec<String>, pin_only: bool, store_path: Option<PathBuf>) -> Self {
         let pin_only = pin_only && !pins.is_empty();
-        Self { net, pins, pin_only, store_path, tls: tokio::sync::OnceCell::new(), state: tokio::sync::Mutex::new(LaneState::default()) }
+        Self {
+            net,
+            pins,
+            pin_only,
+            store_path,
+            tls: tokio::sync::OnceCell::new(),
+            state: tokio::sync::Mutex::new(LaneState::default()),
+            discovery: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Seed addresses to try, each with its source (tests).
@@ -388,12 +407,16 @@ impl Lane {
         state.conns.len()
     }
 
-    /// The peers a `trust` verdict is taken from, dialling as needed.
+    /// The peers a `trust` verdict is taken from, dialling as needed. The pool
+    /// lock is taken for choosing and bookkeeping only, never held across a
+    /// dial, a lookup or a gossip request: a presence read with a live peer
+    /// is answered while a money read is out looking for its second one.
+    /// Discovery itself (pins, refill, dial) runs under [`Lane::discovery`],
+    /// one requester at a time, so two requests short of a peer do not dial
+    /// the same addresses twice; the second chooses from what the first
+    /// brought in.
     async fn peers_for(&self, trust: Trust) -> Result<Vec<Arc<PeerConn>>, ChainError> {
-        let mut state = self.state.lock().await;
-        self.reap(&mut state);
         let pinned = !self.pins.is_empty();
-        let pin_up = |state: &LaneState| state.conns.iter().any(|c| c.source() == Source::Pin);
         // One pass more than there are dial rounds: the peers the LAST round
         // reached are judged like any other before the request gives up.
         for round in 0..=MAX_ROUNDS {
@@ -401,44 +424,89 @@ impl Lane {
             // whenever their cooldown has passed while one is missing. A live
             // pin does not stand in for a down one: the missing pin may be the
             // one whose network group the pair needs, and the carrier would
-            // otherwise ride a public fallback for as long as that lives.
-            if pinned && self.pins_short(&state) && state.pin_retry_after.is_none_or(|at| Instant::now() >= at) {
-                self.dial_pins(&mut state).await;
+            // otherwise ride a public fallback for as long as that lives. A
+            // carrier does not wait for a requester already out discovering
+            // (that one dials the pins first too): it reads from the pool.
+            if pinned && self.pins_due().await {
+                match trust {
+                    Trust::Agreed => {
+                        let _discovering = self.discovery.lock().await;
+                        if self.pins_due().await {
+                            self.dial_pins().await;
+                        }
+                    }
+                    Trust::Carrier => {
+                        if let Ok(_discovering) = self.discovery.try_lock() {
+                            if self.pins_due().await {
+                                self.dial_pins().await;
+                            }
+                        }
+                    }
+                }
             }
-            if trust == Trust::Agreed {
-                self.let_laggards_go(&mut state);
-            }
-            if let Some(set) = self.choose_in_step(&mut state, trust)? {
+            if let Some(set) = self.choose_now(trust).await? {
                 return Ok(set);
-            }
-            if pinned && !pin_up(&state) && trust == Trust::Agreed {
-                // §14 (1): a pin that does not answer makes money paths non-final;
-                // it is never quietly replaced by public peers.
-                return Err(unanswered(format!(
-                    "the pinned full node(s) {} are unreachable; money paths stay non-final until one answers",
-                    self.pins.join(", ")
-                )));
             }
             if self.pin_only || round == MAX_ROUNDS {
                 // Nothing public is ever dialled in pin-only mode; otherwise
                 // the dial rounds are spent.
                 break;
             }
-            self.refill(&mut state, trust).await;
+            let _discovering = self.discovery.lock().await;
+            // The pool may have changed while this request waited its turn: a
+            // choice from it spares the dial.
+            if let Some(set) = self.choose_now(trust).await? {
+                return Ok(set);
+            }
+            self.refill(trust).await;
             // A refill can change the pool without a dial (a connected stored
             // peer the introducer named is fresh now), so the round is spent
             // only when there was nothing to dial AND nothing new to choose.
-            if !self.dial(&mut state).await && self.choose(&state, trust, &[]).is_none() {
-                break;
+            if !self.dial().await {
+                let state = self.state.lock().await;
+                if self.choose(&state, trust, &[]).is_none() {
+                    break;
+                }
             }
         }
+        let connected = self.state.lock().await.conns.len();
         Err(unanswered(match trust {
             Trust::Carrier => "no full-node peer reachable".to_string(),
             Trust::Agreed => format!(
-                "fewer than two agreeing full-node peers reachable ({} connected; two are needed, from distinct sources and networks, one of them a pin or the introducer)",
-                state.conns.len()
+                "fewer than two agreeing full-node peers reachable ({connected} connected; two are needed, from distinct sources and networks, one of them a pin or the introducer)"
             ),
         }))
+    }
+
+    /// Are the pins due a dial: fewer live than they can give, and their
+    /// retry cooldown passed?
+    async fn pins_due(&self) -> bool {
+        let state = self.state.lock().await;
+        self.pins_short(&state) && state.pin_retry_after.is_none_or(|at| Instant::now() >= at)
+    }
+
+    /// A choice from the pool as it stands: dead connections reaped,
+    /// laggards let go before an agreed verdict, then [`Self::choose_in_step`].
+    /// `Err` when every pin is down on a money path (§14 (1): a pin that does
+    /// not answer makes money paths non-final; it is never quietly replaced
+    /// by public peers), or when the pins stand out of step.
+    async fn choose_now(&self, trust: Trust) -> Result<Option<Vec<Arc<PeerConn>>>, ChainError> {
+        let mut guard = self.state.lock().await;
+        let state = &mut *guard;
+        self.reap(state);
+        if trust == Trust::Agreed {
+            self.let_laggards_go(state);
+        }
+        if let Some(set) = self.choose_in_step(state, trust)? {
+            return Ok(Some(set));
+        }
+        if !self.pins.is_empty() && trust == Trust::Agreed && !state.conns.iter().any(|c| c.source() == Source::Pin) {
+            return Err(unanswered(format!(
+                "the pinned full node(s) {} are unreachable; money paths stay non-final until one answers",
+                self.pins.join(", ")
+            )));
+        }
+        Ok(None)
     }
 
     /// Before an agreed verdict, a public peer whose announced peak is more
@@ -588,69 +656,87 @@ impl Lane {
     /// connections that make room go back in the queue, so a pin dial that
     /// fails costs the lane no peer); a pin that fails
     /// is left alone for [`PIN_RETRY_AFTER`] (its owner may be restarting it)
-    /// and tried again, whether or not another pin is up.
-    async fn dial_pins(&self, state: &mut LaneState) {
-        let now = Instant::now();
+    /// and tried again, whether or not another pin is up. The pool is locked
+    /// for the bookkeeping between the network waits (resolving, dialling),
+    /// never across one.
+    async fn dial_pins(&self) {
         // Outside pin-only mode one place is kept for the public peer the
         // agreement needs, however many addresses the pins resolve to.
         let pin_cap = if self.pin_only { MAX_CONNS } else { MAX_CONNS - 1 };
-        let mut pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
-        let mut resolved: HashSet<SocketAddr> = HashSet::new();
-        let mut unresolved = 0;
-        let mut targets = Vec::new();
+        let mut named: Vec<Vec<SocketAddr>> = Vec::with_capacity(self.pins.len());
         for pin in &self.pins {
-            let addrs = resolve_pin(pin, self.net.port).await;
-            if addrs.is_empty() {
-                unresolved += 1;
-            }
-            for addr in addrs {
-                if !resolved.insert(addr) {
-                    // Two pins naming one node (a host and its address, say).
-                    continue;
+            named.push(resolve_pin(pin, self.net.port).await);
+        }
+        let mut targets: VecDeque<Candidate> = {
+            let mut guard = self.state.lock().await;
+            let state = &mut *guard;
+            let now = Instant::now();
+            let mut pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
+            let mut resolved: HashSet<SocketAddr> = HashSet::new();
+            let mut unresolved = 0;
+            let mut targets = Vec::new();
+            for (pin, addrs) in self.pins.iter().zip(named) {
+                if addrs.is_empty() {
+                    unresolved += 1;
                 }
-                if let Some(conn) = state.conns.iter().find(|c| c.addr() == addr) {
-                    // Reached through public discovery while the pin did not
-                    // resolve: the operator's node all the same, so it counts
-                    // as the pin from here on, within the pins' share.
-                    if pins_up < pin_cap && conn.promote(Source::Pin) {
-                        pins_up += 1;
-                        eprintln!("⛓️ chain peers: {addr} now counts as a pin: {pin} resolves to it");
+                for addr in addrs {
+                    if !resolved.insert(addr) {
+                        // Two pins naming one node (a host and its address, say).
+                        continue;
                     }
-                    continue;
-                }
-                if !state.cooling.get(&addr).is_some_and(|until| now < *until) {
-                    targets.push(Candidate { addr, source: Source::Pin, failures: 0 });
+                    if let Some(conn) = state.conns.iter().find(|c| c.addr() == addr) {
+                        // Reached through public discovery while the pin did not
+                        // resolve: the operator's node all the same, so it counts
+                        // as the pin from here on, within the pins' share.
+                        if pins_up < pin_cap && conn.promote(Source::Pin) {
+                            pins_up += 1;
+                            eprintln!("⛓️ chain peers: {addr} now counts as a pin: {pin} resolves to it");
+                        }
+                        continue;
+                    }
+                    if !state.cooling.get(&addr).is_some_and(|until| now < *until) {
+                        targets.push(Candidate { addr, source: Source::Pin, failures: 0 });
+                    }
                 }
             }
-        }
-        // What the pins can give; a pin that did not resolve keeps them short.
-        state.pin_target = (unresolved == 0).then_some(pin_cap.min(resolved.len()));
-        if targets.is_empty() {
-            state.pin_retry_after = self.pins_short(state).then(|| now + PIN_RETRY_AFTER);
-            return;
-        }
+            // What the pins can give; a pin that did not resolve keeps them short.
+            state.pin_target = (unresolved == 0).then_some(pin_cap.min(resolved.len()));
+            if targets.is_empty() {
+                state.pin_retry_after = self.pins_short(state).then(|| now + PIN_RETRY_AFTER);
+                return;
+            }
+            targets.into()
+        };
         // The cap is on LIVE pin connections, not on the addresses tried: a
         // batch that fails is followed by the next, so a reachable address
         // listed behind unreachable ones is still reached in this call.
-        let mut targets: VecDeque<Candidate> = targets.into();
         loop {
-            let pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
-            let want = pin_cap.saturating_sub(pins_up).min(targets.len());
-            if want == 0 {
-                break;
-            }
-            let batch: Vec<Candidate> = targets.drain(..want).collect();
-            while state.conns.len() + batch.len() > MAX_CONNS {
-                // The newest public connection makes room and goes back in
-                // the queue, cooling briefly: a pin dial that then fails has
-                // not cost the lane a peer the pair may still need.
-                let Some(peer) = state.conns.iter().rev().find(|c| c.source() != Source::Pin).cloned() else { break };
-                self.let_go(state, &peer, RECONNECT_AFTER, "making room for a pin");
-            }
-            self.dial_batch(state, batch, PIN_RETRY_AFTER).await;
+            let batch: Vec<Candidate> = {
+                let mut guard = self.state.lock().await;
+                let state = &mut *guard;
+                let pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
+                let want = pin_cap.saturating_sub(pins_up).min(targets.len());
+                if want == 0 {
+                    break;
+                }
+                let batch: Vec<Candidate> = targets.drain(..want).collect();
+                while state.conns.len() + batch.len() > MAX_CONNS {
+                    // The newest public connection makes room and goes back in
+                    // the queue, cooling briefly: a pin dial that then fails has
+                    // not cost the lane a peer the pair may still need.
+                    let Some(peer) = state.conns.iter().rev().find(|c| c.source() != Source::Pin).cloned() else { break };
+                    self.let_go(state, &peer, RECONNECT_AFTER, "making room for a pin");
+                }
+                batch
+            };
+            let reached = self.connect_all(batch).await;
+            let mut guard = self.state.lock().await;
+            self.admit(&mut guard, reached, PIN_RETRY_AFTER);
         }
         // Still short (an address failed, or a pin did not resolve): the next
         // try waits for the cooldown, a live pin or not.
+        let mut guard = self.state.lock().await;
+        let state = &mut *guard;
         state.pin_retry_after = self.pins_short(state).then(|| Instant::now() + PIN_RETRY_AFTER);
     }
 
@@ -662,39 +748,58 @@ impl Lane {
     /// after an answer that named nobody); and gossip from every connection
     /// not yet asked. The interval holds across requests and dial rounds
     /// alike: while the introducer cools down, the queued, stored and
-    /// gossiped candidates are what there is to try.
-    async fn refill(&self, state: &mut LaneState, trust: Trust) {
-        if !state.store_loaded {
-            state.store_loaded = true;
-            state.known = self.store_path.as_deref().map(load_store).unwrap_or_default();
-            let stored: Vec<Candidate> = state
-                .known
+    /// gossiped candidates are what there is to try. The lookup and the
+    /// gossip requests run with the pool unlocked; what they bring is merged
+    /// in afterwards.
+    async fn refill(&self, trust: Trust) {
+        let (introduce, unasked) = {
+            let mut guard = self.state.lock().await;
+            let state = &mut *guard;
+            if !state.store_loaded {
+                state.store_loaded = true;
+                state.known = self.store_path.as_deref().map(load_store).unwrap_or_default();
+                let stored: Vec<Candidate> = state
+                    .known
+                    .iter()
+                    .filter_map(|p| p.addr.parse::<SocketAddr>().ok())
+                    .map(|addr| Candidate { addr, source: Source::Store, failures: 0 })
+                    .collect();
+                push_candidates(state, stored);
+            }
+            let now = Instant::now();
+            // "Ready" is a queued candidate the next dial could actually try: not
+            // cooling, not connected, and one the pool has a place for (under its
+            // source's cap or by rotation; in a full pool, one whose swap would
+            // complete a pair). A queue the full pool holds no pair for (every
+            // peer and candidate in one network group, say) is no reason to leave
+            // the introducer unasked once it is due.
+            let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
+            let pooled: Vec<(Source, Group, bool)> =
+                state.conns.iter().map(|c| (c.source(), c.group(), state.gossiped.contains_key(&c.addr()))).collect();
+            let pinned = !self.pins.is_empty();
+            let ready = state.candidates.iter().any(|c| {
+                !connected.contains(&c.addr)
+                    && !state.cooling.get(&c.addr).is_some_and(|until| now < *until)
+                    && tryable(&pooled, (c.source, group_of(c.addr)), pinned, self.pin_only)
+            });
+            let need_fresh = trust == Trust::Agreed && self.pins.is_empty() && !state.conns.iter().any(|c| c.source().is_fresh());
+            // No veto for introducer candidates still queued: those are cooling
+            // after failed dials, and only the deadline and the need decide.
+            let introduce = !self.net.introducers.is_empty() && state.introduce_after.is_none_or(|at| now >= at) && (need_fresh || !ready);
+            let unasked: Vec<Arc<PeerConn>> = state
+                .conns
                 .iter()
-                .filter_map(|p| p.addr.parse::<SocketAddr>().ok())
-                .map(|addr| Candidate { addr, source: Source::Store, failures: 0 })
+                .filter(|c| !state.gossiped.get(&c.addr()).is_some_and(|retry| retry.is_none() || retry.is_some_and(|at| now < at)))
+                .cloned()
                 .collect();
-            push_candidates(state, stored);
-        }
-        let now = Instant::now();
-        // "Ready" is a queued candidate the next dial could actually try: not
-        // cooling, not connected, and one the pool has a place for (under its
-        // source's cap or by rotation; in a full pool, one whose swap would
-        // complete a pair). A queue the full pool holds no pair for (every
-        // peer and candidate in one network group, say) is no reason to leave
-        // the introducer unasked once it is due.
-        let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
-        let pooled: Vec<(Source, Group, bool)> = state.conns.iter().map(|c| (c.source(), c.group(), state.gossiped.contains_key(&c.addr()))).collect();
-        let pinned = !self.pins.is_empty();
-        let ready = state.candidates.iter().any(|c| {
-            !connected.contains(&c.addr)
-                && !state.cooling.get(&c.addr).is_some_and(|until| now < *until)
-                && tryable(&pooled, (c.source, group_of(c.addr)), pinned, self.pin_only)
-        });
-        let need_fresh = trust == Trust::Agreed && self.pins.is_empty() && !state.conns.iter().any(|c| c.source().is_fresh());
-        // No veto for introducer candidates still queued: those are cooling
-        // after failed dials, and only the deadline and the need decide.
-        let introduce = !self.net.introducers.is_empty() && state.introduce_after.is_none_or(|at| now >= at) && (need_fresh || !ready);
-        if introduce {
+            // Marked asked before the requests leave, so no other requester
+            // asks the same peers meanwhile.
+            for conn in &unasked {
+                state.gossiped.insert(conn.addr(), None);
+            }
+            (introduce, unasked)
+        };
+        let found = if introduce {
             let mut found = Vec::new();
             for name in &self.net.introducers {
                 match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host(format!("{name}:{}", self.net.port))).await {
@@ -705,20 +810,13 @@ impl Lane {
             }
             found.shuffle(&mut rand::thread_rng());
             found.truncate(ADDRS_PER_ANSWER);
-            let n = found.len();
-            state.introduce_after = Some(Instant::now() + if n == 0 { INTRODUCE_RETRY } else { INTRODUCE_EVERY });
-            push_candidates(state, found.into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect());
-            eprintln!("⛓️ chain peers: the introducer named {n} full nodes");
-        }
-        let unasked: Vec<Arc<PeerConn>> = state
-            .conns
-            .iter()
-            .filter(|c| !state.gossiped.get(&c.addr()).is_some_and(|retry| retry.is_none() || retry.is_some_and(|at| now < at)))
-            .cloned()
-            .collect();
+            Some(found)
+        } else {
+            None
+        };
+        let mut gossip: Vec<(Arc<PeerConn>, Option<Vec<SocketAddr>>)> = Vec::with_capacity(unasked.len());
         for conn in unasked {
-            state.gossiped.insert(conn.addr(), None);
-            match conn.request::<RespondPeers, _>(RequestPeers::new()).await {
+            let answer = match conn.request::<RespondPeers, _>(RequestPeers::new()).await {
                 Ok(answer) => {
                     let mut addrs: Vec<SocketAddr> = answer
                         .peer_list
@@ -728,13 +826,32 @@ impl Lane {
                         .collect();
                     addrs.shuffle(&mut rand::thread_rng());
                     addrs.truncate(ADDRS_PER_ANSWER);
+                    Some(addrs)
+                }
+                Err(e) => {
+                    eprintln!("⛓️ chain peers: {} gossip: {e:#} (asked again in {} s)", conn.addr(), GOSSIP_RETRY.as_secs());
+                    None
+                }
+            };
+            gossip.push((conn, answer));
+        }
+        let mut guard = self.state.lock().await;
+        let state = &mut *guard;
+        if let Some(found) = found {
+            let n = found.len();
+            state.introduce_after = Some(Instant::now() + if n == 0 { INTRODUCE_RETRY } else { INTRODUCE_EVERY });
+            push_candidates(state, found.into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect());
+            eprintln!("⛓️ chain peers: the introducer named {n} full nodes");
+        }
+        for (conn, answer) in gossip {
+            match answer {
+                Some(addrs) => {
                     let n = addrs.len();
                     push_candidates(state, addrs.into_iter().map(|addr| Candidate { addr, source: Source::Gossip, failures: 0 }).collect());
                     eprintln!("⛓️ chain peers: {} gossiped {n} full nodes", conn.addr());
                 }
-                Err(e) => {
+                None => {
                     state.gossiped.insert(conn.addr(), Some(Instant::now() + GOSSIP_RETRY));
-                    eprintln!("⛓️ chain peers: {} gossip: {e:#} (asked again in {} s)", conn.addr(), GOSSIP_RETRY.as_secs());
                 }
             }
         }
@@ -747,98 +864,109 @@ impl Lane {
     /// cannot form one, whose only dialable candidates are introducer peers
     /// the cap keeps out, lets one connected introducer peer go for the first
     /// of them ([`Self::rotation`]). `false` when there was nothing to dial.
-    async fn dial(&self, state: &mut LaneState) -> bool {
-        let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
-        let now = Instant::now();
-        let mut ready: Vec<Candidate> = Vec::new();
-        let mut later: VecDeque<Candidate> = VecDeque::new();
-        for cand in state.candidates.drain(..) {
-            if connected.contains(&cand.addr) {
-                continue;
-            }
-            if state.cooling.get(&cand.addr).is_some_and(|until| now < *until) {
-                later.push_back(cand);
-            } else {
-                ready.push(cand);
-            }
-        }
-        let have: HashSet<Source> = state.conns.iter().map(|c| c.source()).collect();
-        let groups: HashSet<Group> = state.conns.iter().map(|c| c.group()).collect();
-        let mut first: Option<Candidate> = None;
-        if state.conns.len() >= MAX_CONNS {
-            // A full pool that cannot form a pair makes room for the first
-            // candidate that would complete one, by source AND network group,
-            // letting go a connection the pair can spare (a redundant one
-            // first, never a pin); that candidate is dialled first.
-            let facts: Vec<(Source, Group)> = state.conns.iter().map(|c| (c.source(), c.group())).collect();
-            let pinned = !self.pins.is_empty();
-            let swap = if self.choose(state, Trust::Agreed, &[]).is_none() {
-                ready.iter().enumerate().find_map(|(ci, c)| {
-                    replaceable(&facts, (c.source, group_of(c.addr)), pinned, self.pin_only).map(|i| (ci, i))
-                })
-            } else {
-                None
-            };
-            match swap {
-                Some((ci, i)) => {
-                    let peer = state.conns.remove(i);
-                    eprintln!(
-                        "⛓️ chain peers: {} ({}) let go: making room for a peer that completes a pair",
-                        peer.addr(),
-                        peer.source().label()
-                    );
-                    state.gossiped.remove(&peer.addr());
-                    close_later(peer);
-                    first = Some(ready.remove(ci));
+    /// The batch is chosen under the pool lock, dialled with it released
+    /// ([`Self::connect_all`]) and taken in under it again ([`Self::admit`]).
+    async fn dial(&self) -> bool {
+        let batch: Vec<Candidate> = {
+            let mut guard = self.state.lock().await;
+            let state = &mut *guard;
+            let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
+            let now = Instant::now();
+            let mut ready: Vec<Candidate> = Vec::new();
+            let mut later: VecDeque<Candidate> = VecDeque::new();
+            for cand in state.candidates.drain(..) {
+                if connected.contains(&cand.addr) {
+                    continue;
                 }
-                None => {
-                    state.candidates = ready.into_iter().chain(later).collect();
-                    return false;
+                if state.cooling.get(&cand.addr).is_some_and(|until| now < *until) {
+                    later.push_back(cand);
+                } else {
+                    ready.push(cand);
                 }
             }
-        }
-        ready.sort_by_key(|c| (have.contains(&c.source), groups.contains(&group_of(c.addr)), !c.source.is_fresh()));
-        if first.is_none() {
-            if let Some(i) = self.rotation(state, &ready) {
-                let peer = state.conns[i].clone();
-                self.let_go(state, &peer, RETRY_AFTER, "making room for a waiting introducer peer and its gossip");
-                // Queued again by `let_go`, cooling: it waits with the others.
-                later.extend(state.candidates.drain(..));
+            let have: HashSet<Source> = state.conns.iter().map(|c| c.source()).collect();
+            let groups: HashSet<Group> = state.conns.iter().map(|c| c.group()).collect();
+            let mut first: Option<Candidate> = None;
+            if state.conns.len() >= MAX_CONNS {
+                // A full pool that cannot form a pair makes room for the first
+                // candidate that would complete one, by source AND network group,
+                // letting go a connection the pair can spare (a redundant one
+                // first, never a pin); that candidate is dialled first.
+                let facts: Vec<(Source, Group)> = state.conns.iter().map(|c| (c.source(), c.group())).collect();
+                let pinned = !self.pins.is_empty();
+                let swap = if self.choose(state, Trust::Agreed, &[]).is_none() {
+                    ready.iter().enumerate().find_map(|(ci, c)| {
+                        replaceable(&facts, (c.source, group_of(c.addr)), pinned, self.pin_only).map(|i| (ci, i))
+                    })
+                } else {
+                    None
+                };
+                match swap {
+                    Some((ci, i)) => {
+                        let peer = state.conns.remove(i);
+                        eprintln!(
+                            "⛓️ chain peers: {} ({}) let go: making room for a peer that completes a pair",
+                            peer.addr(),
+                            peer.source().label()
+                        );
+                        state.gossiped.remove(&peer.addr());
+                        close_later(peer);
+                        first = Some(ready.remove(ci));
+                    }
+                    None => {
+                        state.candidates = ready.into_iter().chain(later).collect();
+                        return false;
+                    }
+                }
             }
-        }
-        if let Some(cand) = first {
-            ready.insert(0, cand);
-        }
-        let mut per_source: HashMap<Source, usize> = HashMap::new();
-        for c in &state.conns {
-            *per_source.entry(c.source()).or_default() += 1;
-        }
-        let room = MAX_CONNS - state.conns.len();
-        let mut batch: Vec<Candidate> = Vec::new();
-        let mut rest: Vec<Candidate> = Vec::new();
-        for cand in ready {
-            let held = per_source.entry(cand.source).or_default();
-            if batch.len() < PARALLEL_DIALS.min(room) && *held < PER_SOURCE_CAP {
-                *held += 1;
-                batch.push(cand);
-            } else {
-                rest.push(cand);
+            ready.sort_by_key(|c| (have.contains(&c.source), groups.contains(&group_of(c.addr)), !c.source.is_fresh()));
+            if first.is_none() {
+                if let Some(i) = self.rotation(state, &ready) {
+                    let peer = state.conns[i].clone();
+                    self.let_go(state, &peer, RETRY_AFTER, "making room for a waiting introducer peer and its gossip");
+                    // Queued again by `let_go`, cooling: it waits with the others.
+                    later.extend(state.candidates.drain(..));
+                }
             }
-        }
-        state.candidates = rest.into_iter().chain(later).collect();
-        if batch.is_empty() {
-            return false;
-        }
-        self.dial_batch(state, batch, RETRY_AFTER).await;
+            if let Some(cand) = first {
+                ready.insert(0, cand);
+            }
+            let mut per_source: HashMap<Source, usize> = HashMap::new();
+            for c in &state.conns {
+                *per_source.entry(c.source()).or_default() += 1;
+            }
+            let room = MAX_CONNS - state.conns.len();
+            let mut batch: Vec<Candidate> = Vec::new();
+            let mut rest: Vec<Candidate> = Vec::new();
+            for cand in ready {
+                let held = per_source.entry(cand.source).or_default();
+                if batch.len() < PARALLEL_DIALS.min(room) && *held < PER_SOURCE_CAP {
+                    *held += 1;
+                    batch.push(cand);
+                } else {
+                    rest.push(cand);
+                }
+            }
+            state.candidates = rest.into_iter().chain(later).collect();
+            if batch.is_empty() {
+                return false;
+            }
+            batch
+        };
+        let reached = self.connect_all(batch).await;
+        let mut guard = self.state.lock().await;
+        self.admit(&mut guard, reached, RETRY_AFTER);
         true
     }
 
-    async fn dial_batch(&self, state: &mut LaneState, batch: Vec<Candidate>, cool_for: Duration) {
+    /// Dial a batch in parallel with the pool unlocked: each candidate with
+    /// its connection, or why it failed, for [`Self::admit`].
+    async fn connect_all(&self, batch: Vec<Candidate>) -> Vec<(Candidate, anyhow::Result<Arc<PeerConn>>)> {
         let tls = match self.tls().await {
             Ok(tls) => tls,
             Err(e) => {
                 eprintln!("⛓️ chain peers: {e}");
-                return;
+                return Vec::new();
             }
         };
         let net = self.net.clone();
@@ -850,8 +978,16 @@ impl Lane {
                 (cand, result)
             }
         });
+        join_all(dials).await
+    }
+
+    /// Take a batch's outcome into the pool: one connection per address and
+    /// none past [`MAX_CONNS`] (the pool may have filled meanwhile); a failed
+    /// address cools for `cool_for`, leaves the store and, unless it is a pin
+    /// or has failed too often, waits in the queue for another try.
+    fn admit(&self, state: &mut LaneState, reached: Vec<(Candidate, anyhow::Result<Arc<PeerConn>>)>, cool_for: Duration) {
         let now = Instant::now();
-        for (cand, result) in join_all(dials).await {
+        for (cand, result) in reached {
             match result {
                 Ok(conn) => {
                     if state.conns.iter().any(|c| c.addr() == cand.addr) {
@@ -1781,12 +1917,13 @@ pub(crate) fn settle_pages(pages: &[Page], include_spent: bool, min_height: Opti
         })
         .collect();
     let (records, unknown) = agreed(&lists, |i, _| !pages[i].finished && pages[i].knowledge > knowledge)?;
+    let judged_at = Some(knowledge);
     let listing = if unknown {
-        CoinListing { records, truncated: true, next_cursor: None }
+        CoinListing { records, truncated: true, next_cursor: None, judged_at }
     } else if !finished {
-        CoinListing { records, truncated: true, next_cursor: Some(encode_cursor(height, header_hash, knowledge, knowledge_hash)) }
+        CoinListing { records, truncated: true, next_cursor: Some(encode_cursor(height, header_hash, knowledge, knowledge_hash)), judged_at }
     } else {
-        CoinListing { records, truncated: hidden, next_cursor: None }
+        CoinListing { records, truncated: hidden, next_cursor: None, judged_at }
     };
     Some(Settled { listing, at: (height, header_hash), unverified: above(pages, height) })
 }
@@ -1817,7 +1954,7 @@ pub(crate) fn settle_states(pages: &[Page], include_spent: bool) -> Option<Settl
     let hidden = hides_a_coin(pages, knowledge);
     let lists: Vec<Vec<CoinRecord>> = pages.iter().map(|p| records_from(as_of(p.states.clone(), knowledge), include_spent, None)).collect();
     let (records, unknown) = agreed(&lists, |i, id| pages[i].pending.contains(id))?;
-    let listing = CoinListing { records, truncated: !finished || hidden || unknown, next_cursor: None };
+    let listing = CoinListing { records, truncated: !finished || hidden || unknown, next_cursor: None, judged_at: Some(knowledge) };
     Some(Settled { listing, at: (height, header_hash), unverified: above(pages, height) })
 }
 
@@ -2381,6 +2518,69 @@ mod tests {
 
     fn bundle() -> SpendBundle {
         SpendBundle::new(vec![], chia_bls::G2Element::default())
+    }
+
+    /// A loopback address that accepts a connection and then says nothing:
+    /// a dial of it waits the connect timeout out, as a dial of an
+    /// unresponsive public peer would. The count is of connections accepted.
+    async fn black_hole() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        let keeper = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else { break };
+                held.push(socket);
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (addr, accepted, keeper)
+    }
+
+    /// The pool lock is not held across a dial: a money read short of its
+    /// second peer, waiting on a gossiped address that accepts and then says
+    /// nothing, does not keep a presence read from the live peer the pool
+    /// already has.
+    #[tokio::test]
+    async fn a_presence_read_is_answered_while_a_money_read_is_out_dialling() {
+        let (hole, accepted, keeper) = black_hole().await;
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![hole])).await;
+        let lane = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        assert_eq!(lane.peak(Trust::Carrier).await.unwrap(), 100, "the presence peer is connected");
+        let money = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.peak(Trust::Agreed).await })
+        };
+        // The money read is out dialling once the black hole holds its connection.
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            while accepted.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "the money read dialled the gossiped address");
+        let presence = tokio::time::timeout(Duration::from_secs(3), lane.peak(Trust::Carrier)).await;
+        assert_eq!(presence.expect("answered while the money read is out dialling").unwrap(), 100);
+        assert!(!money.is_finished(), "the money read is still waiting on its dial");
+        money.abort();
+        keeper.abort();
+    }
+
+    /// A coin lookup is dated by the lowest height among the answering peers,
+    /// so a caller can tell a listing judged below where it saw a coin
+    /// confirmed (the wallet lease frees nothing on such a listing's silence)
+    /// from one judged above it.
+    #[tokio::test]
+    async fn a_coin_lookup_is_dated_by_the_peers_lowest_height() {
+        let a = full_node(vec![], (1, None), Some(peak_at(95))).await;
+        let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let got = money.coin_records_by_names(vec![coin(4).coin_id()], true, None).await.unwrap();
+        assert!(got.records.is_empty() && !got.truncated, "neither peer knows the coin: a complete, empty listing");
+        assert_eq!(got.judged_at, Some(95), "dated by the lower peer's height");
     }
 
     /// A loopback address no full node answers at: every connection is closed

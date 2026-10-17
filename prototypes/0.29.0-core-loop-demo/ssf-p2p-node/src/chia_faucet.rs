@@ -542,6 +542,9 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
 struct WalletView {
     owned: Vec<Coin>,
     spendable: Vec<Coin>,
+    /// The height each owned coin was seen confirmed at, by coin id: what the
+    /// parking of the coins a GIVE spends records.
+    seen_at: HashMap<Bytes32, u32>,
     /// The listing was cut short at [`MAX_FAUCET_PAGES`]: `owned` and
     /// `spendable` are what the pages read hold, not the whole wallet.
     partial: bool,
@@ -562,13 +565,14 @@ impl WalletView {
 async fn wallet_view(client: &impl ChainAccess, sk: &chia_bls::SecretKey) -> Result<WalletView> {
     let ph = crate::chia_publish::our_puzzle_hash(sk);
     let listing = unspent_at(client, ph).await?;
+    let seen_at: HashMap<Bytes32, u32> = listing.coins.iter().map(|c| (c.coin.coin_id(), c.confirmed_height)).collect();
     let owned: Vec<Coin> = listing.coins.into_iter().map(|c| c.coin).collect();
     let spendable = owned
         .iter()
         .copied()
         .filter(|c| !crate::chia_publish::WALLET_LEASE.is_pending(&c.coin_id()))
         .collect();
-    Ok(WalletView { owned, spendable, partial: listing.partial })
+    Ok(WalletView { owned, spendable, seen_at, partial: listing.partial })
 }
 
 /// One gift is paid from at most this many of our coins (#245 review, round
@@ -753,7 +757,8 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     // the parking). A mark that cannot be SAVED stops the claim here, before
     // anything leaves: a restart would otherwise forget it (round 19).
     crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id())?;
-    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, [target.coin.coin_id()]).await)?;
+    let unanswered =
+        pushed(crate::chia_publish::push_parked(client, bundle, [(target.coin.coin_id(), target.confirmed_height)]).await)?;
     match &unanswered {
         None => println!(
             "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
@@ -847,7 +852,10 @@ async fn give(
     }
     let bundle = crate::chia_publish::sign_standard_spends(sk, ctx_spend.take())?;
     // Coins parked before the push leaves (round 9): see push_parked.
-    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, coins.iter().map(|c| c.coin_id())).await)?;
+    let inputs = coins
+        .iter()
+        .map(|c| crate::chia_publish::ParkedInput { coin_id: c.coin_id(), seen_at: wallet.seen_at.get(&c.coin_id()).copied() });
+    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, inputs).await)?;
     match &unanswered {
         None => println!(
             "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",
@@ -1020,8 +1028,13 @@ mod tests {
         // is read, where it comes again (the chain pages by latest change).
         let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), Bytes32::new([9u8; 32]), u64::from(seed));
         let rec = |c: Coin, height: u32, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: height, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
-        let first = CoinListing { records: vec![rec(coin(1), 80, None), rec(coin(2), 85, None)], truncated: true, next_cursor: Some("page-2".into()) };
-        let second = CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(3), 101, None)], truncated: false, next_cursor: None };
+        let first = CoinListing {
+            records: vec![rec(coin(1), 80, None), rec(coin(2), 85, None)],
+            truncated: true,
+            next_cursor: Some("page-2".into()),
+            judged_at: None,
+        };
+        let second = CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(3), 101, None)], truncated: false, next_cursor: None, judged_at: None };
         let chain = Scripted::new(vec![first, second]);
         let got = unspent_at(&chain, Bytes32::new([9u8; 32])).await.unwrap();
         assert_eq!(got.coins.iter().map(|c| c.coin.amount).collect::<Vec<_>>(), vec![2, 3], "coin 1, spent between the pages, is gone");
@@ -1220,8 +1233,8 @@ mod tests {
         use crate::chia_publish::LeaseError;
         let ph = Bytes32::new([5u8; 32]);
         let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), ph, amount);
-        let funded = WalletView { owned: vec![coin(1, 5_000)], spendable: vec![coin(1, 5_000)], partial: false };
-        let empty = WalletView { owned: vec![], spendable: vec![], partial: false };
+        let funded = WalletView { owned: vec![coin(1, 5_000)], spendable: vec![coin(1, 5_000)], seen_at: HashMap::new(), partial: false };
+        let empty = WalletView { owned: vec![], spendable: vec![], seen_at: HashMap::new(), partial: false };
         // Open: a funded wallet gives, an empty one takes.
         let part = wallet_part(&funded, false, false, None, 1, true);
         assert!(part.can_give && !part.can_claim, "{part:?}");
@@ -1238,7 +1251,7 @@ mod tests {
         // A wallet dusted into more coins than one gift may spend: GIVE stays on
         // for what the largest coins reach, and the note says to consolidate.
         let dust: Vec<Coin> = (0..100u8).map(|n| coin(n, 1)).collect();
-        let dusted = WalletView { owned: dust.clone(), spendable: dust, partial: false };
+        let dusted = WalletView { owned: dust.clone(), spendable: dust, seen_at: HashMap::new(), partial: false };
         let part = wallet_part(&dusted, false, false, None, 1, true);
         assert!(part.can_give && part.note.contains("many small coins") && part.note.contains("(64 mojos)"), "{part:?}");
     }
