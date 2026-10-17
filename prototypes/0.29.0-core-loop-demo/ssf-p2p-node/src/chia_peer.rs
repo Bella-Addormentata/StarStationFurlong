@@ -767,6 +767,21 @@ pub(crate) mod mock {
         HeaderBlock::new(vec![], reward, None, proof.clone(), None, proof, None, foliage, None, Bytes::new(vec![]), None)
     }
 
+    /// The handler's replies stamped with the request's id, except an
+    /// announcement (`NewPeakWallet`) a handler slips in, which stays
+    /// unsolicited so the client files it as the peer's new peak.
+    fn answers(handler: &Handler, message: &Message) -> Vec<Message> {
+        handler(message)
+            .into_iter()
+            .map(|mut r| {
+                if r.msg_type != ProtocolMessageTypes::NewPeakWallet {
+                    r.id = message.id;
+                }
+                r
+            })
+            .collect()
+    }
+
     pub(crate) async fn spawn(network_id: &str, node_type: NodeType, genesis_prev: Bytes32, peak: Option<Peak>, handler: Handler) -> MockNode {
         spawn_on("127.0.0.1:0".parse().unwrap(), network_id, node_type, genesis_prev, peak, handler).await
     }
@@ -834,10 +849,10 @@ pub(crate) mod mock {
                                     r.id = message.id;
                                     vec![r]
                                 } else {
-                                    handler(&message).into_iter().map(|mut r| { r.id = message.id; r }).collect()
+                                    answers(&handler, &message)
                                 }
                             }
-                            _ => handler(&message).into_iter().map(|mut r| { r.id = message.id; r }).collect(),
+                            _ => answers(&handler, &message),
                         };
                         for r in replies {
                             if ws.send(WsMessage::Binary(r.to_bytes().unwrap())).await.is_err() {
