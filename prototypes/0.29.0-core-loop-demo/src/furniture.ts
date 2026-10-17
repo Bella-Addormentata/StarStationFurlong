@@ -8200,16 +8200,14 @@ function buildSlotMachine({
   // Tray interior (slightly recessed dark)
   place(new THREE.BoxGeometry(0.40, 0.03, 0.10), m(0x14181e, 0.85, 0.1), 0, 0.64, -0.135);
 
-  // ── ⚙️ Settings buttons on the kick panel near the floor ─────────────────
-  // A dark kick panel fills the gap between the front legs, and two gold-rimmed
-  // ⚙️ buttons sit on it. Anyone can press one to read the machine's card
-  // (paytable, RTP, fairness); for the owner the same card is editable.
+  // ── ⚙️ Settings button on the kick panel near the floor ──────────────────
+  // A dark kick panel fills the gap between the front legs, and one gold-rimmed
+  // ⚙️ button sits centred on it. Anyone can press it to read the machine's
+  // card (paytable, RTP, fairness); for the owner the same card is editable.
   place(new THREE.BoxGeometry(0.40, 0.26, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.20, -0.07);
-  for (const gx of [-0.10, 0.10]) {
-    for (const gear of addSettingsGear(place, m, gx, 0.20, -0.086, 0.05, Math.PI)) {
-      gear.userData.slotControl = "settings";
-      gear.userData.slotMachineId = itemId;
-    }
+  for (const gear of addSettingsGear(place, m, 0, 0.20, -0.086, 0.05, Math.PI)) {
+    gear.userData.slotControl = "settings";
+    gear.userData.slotMachineId = itemId;
   }
 
   // ── Pull lever (right side, +x) ───────────────────────────────────────────
