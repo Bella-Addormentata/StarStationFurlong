@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- **🚪🔥 The rooms behind public doors stay loaded, so walking through is quick ([#263](https://github.com/Bella-Addormentata/StarStationFurlong/pull/263)).** While you stand in a module, the game keeps a background session open to each room behind a paired door anyone may walk out of, up to four of them. When you walk through, the next room starts from that copy instead of being loaded from nothing behind the fade, so the screen only blinks. The room you just left stays loaded too, so walking back is quick as well. Doors set to owner-only, IN ONLY doors and keyed rooms keep the old crossing. Showing the next room for real and crossing with no fade at all is the follow-up, [#262](https://github.com/Bella-Addormentata/StarStationFurlong/issues/262).
+
 - **🧭 First person comes out of a door facing into the room.** After walking through a door or vestibule in first person, the view in the next module now always faces straight out of the door you came through, square to its frame, instead of whichever way you happened to be looking. Your up/down tilt is kept.
 
 ## v0.40.0 — 2026-10-13
