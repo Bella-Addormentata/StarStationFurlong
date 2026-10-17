@@ -166,11 +166,31 @@ fn confirmed_gone(listing_complete: bool, unspent: &[Coin], spent: &Coin) -> boo
 pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>>> {
     let client = crate::chia_chain::connect();
     let hint = fair_hint(table, round);
-    let mut records = client
-        .coin_records_by_hint(hint, None, true, None)
-        .await
-        .map_err(|e| anyhow!("hint lookup: {e}"))?
-        .records;
+    // Every page, up to the bound every wallet listing shares: a transcript
+    // with records missing proves nothing, so a listing still cut short is an
+    // error, not a shorter transcript.
+    let mut records = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let listing = client
+            .coin_records_by_hint(hint, None, true, cursor.take())
+            .await
+            .map_err(|e| anyhow!("hint lookup: {e}"))?;
+        pages += 1;
+        records.extend(listing.records);
+        let truncated = listing.truncated;
+        match listing.next_cursor {
+            Some(next) if truncated => {
+                if pages >= MAX_FAUCET_PAGES {
+                    return Err(anyhow!("hint lookup: the listing is cut short at {MAX_FAUCET_PAGES} pages, so records would be missing"));
+                }
+                cursor = Some(next);
+            }
+            _ if truncated => return Err(anyhow!("hint lookup: the listing is cut short with no way to go on")),
+            _ => break,
+        }
+    }
     records.sort_by_key(|r| r.confirmed_block_index);
     let mut out = Vec::new();
     for rec in records {
