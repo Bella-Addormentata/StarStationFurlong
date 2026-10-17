@@ -8352,6 +8352,9 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     lowerDrop: (UPPER_Y - LOWER_Y) / K,
     trayDrop: (UPPER_Y - TRAY_Y) / K,
     level: (CHIP_H + 0.0004) / K,
+    barTop: 0.04 / K,
+    boardExitX: (UPPER_Z_BACK - BOARD_Z) / K,
+    boardExitY: (BOARD_Y0 - UPPER_Y) / K,
   };
 
   const cabinet = new THREE.Group();
@@ -8655,18 +8658,10 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       chip.material = chipLooks[b.chipId % 2];
     }
     for (const c of view.chutes) {
-      // Off the bottom of the board onto the bar's shelf, then off its
-      // front edge onto the platform, standing.
+      // Off the bottom of the board onto the bar's top, then off its front
+      // edge onto the platform, standing (coinPusherReplay's chutePose).
       const chip = acquireChip(idx++);
-      const fromY = BOARD_Y0, toY = UPPER_Y + CHIP_RAD;
-      const z = tableZ(c.landX);
-      const s = c.s;
-      chip.position.set(
-        tableX(c.exitU + (c.landU - c.exitU) * s),
-        s < 0.5 ? fromY - (fromY - (UPPER_Y + 0.04 + CHIP_RAD)) * (s / 0.5) ** 2
-          : (UPPER_Y + 0.04 + CHIP_RAD) - (UPPER_Y + 0.04 - toY + CHIP_RAD) * ((s - 0.5) / 0.5) ** 2,
-        BOARD_Z + (z - BOARD_Z) * Math.min(1, s / 0.75),
-      );
+      chip.position.set(tableX(c.u), UPPER_Y + c.y * K, tableZ(c.x));
       chip.rotation.set(Math.PI / 2, c.spin, 0);
       chip.material = chipLooks[c.chipId % 2];
     }

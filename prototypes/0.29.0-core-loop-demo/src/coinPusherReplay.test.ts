@@ -14,7 +14,7 @@ import {
   cabinetView, PAY_MS, planDrops, queueDrops, REPLAY_MAX, planReplay, reachBack, reachBelow, replayView, restingView, TIP_MS, type ReplayGeometry,
 } from './coinPusherReplay';
 
-const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088 };
+const GEOM: ReplayGeometry = { lowerDrop: 0.2, trayDrop: 0.31, level: 0.0088, barTop: 0.08, boardExitX: -0.04, boardExitY: 0.18 };
 
 function fill(n: number): CoinPusherState {
   let s = initialCoinPusherState('owner', 0);
@@ -283,5 +283,31 @@ describe('coin pusher replay', () => {
     }
     expect(steps).toBeGreaterThan(0);
     expect(pays).toBeGreaterThan(0);
+  });
+
+  it('drops the coin off the bar, never through it, on either stroke', () => {
+    // Over every part of the sweep: the coin is below the bar's top only
+    // with its back in front of the bar's face, and lands where it should.
+    const before = fill(20);
+    let forward = 0;
+    let back = 0;
+    for (let i = 0; i < 80; i++) {
+      const phase = i / 80;
+      const { trace } = traced(before, (i % 3) as PusherHole, phase, 500 + i);
+      const landPhase = (phase + trace.landMs / PUSHER_PERIOD_MS) % 1;
+      if (landPhase < 0.5) forward++; else back++;
+      const plan = planReplay(before, trace, GEOM);
+      for (let k = 0; k <= 40; k++) {
+        const t = trace.fallMs + ((trace.landMs - trace.fallMs) * k) / 40 - (k === 40 ? 1e-6 : 0);
+        const c = replayView(plan, t).chute!;
+        const face = pusherFaceX(phase + t / PUSHER_PERIOD_MS);
+        if (c.y - CHIP_R < GEOM.barTop - 1e-9) expect(c.x - GEOM.level / 2).toBeGreaterThanOrEqual(face - 1e-9);
+      }
+      const end = replayView(plan, trace.landMs - 1e-6).chute!;
+      expect(end.x).toBeCloseTo(trace.landX, 2);
+      expect(end.y).toBeCloseTo(CHIP_R, 3);
+    }
+    expect(forward).toBeGreaterThan(10);
+    expect(back).toBeGreaterThan(10);
   });
 });

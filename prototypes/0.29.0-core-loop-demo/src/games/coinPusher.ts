@@ -1192,6 +1192,9 @@ export interface DropTrace {
   /** ms from the hole to the bottom of the board, and to the platform. */
   fallMs: number;
   landMs: number;
+  /** The pusher phase the coin went into the hole at: with landMs, where
+   *  the bar is all the way down the chute. */
+  phase: number;
   /** Where it landed standing (x along the upper platform, u across). */
   landX: number;
   landU: number;
@@ -1299,7 +1302,7 @@ export function processInsert(
   return {
     ...out,
     trace: {
-      board: board.path!, fallMs: board.fallMs, landMs, landX: landedX, landU: landedU, chipId, frames: frames!,
+      board: board.path!, fallMs: board.fallMs, landMs, phase: dropPhase, landX: landedX, landU: landedU, chipId, frames: frames!,
       after: cur,
     },
   };

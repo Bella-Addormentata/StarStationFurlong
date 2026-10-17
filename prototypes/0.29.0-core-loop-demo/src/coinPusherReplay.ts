@@ -17,7 +17,7 @@
  */
 
 import {
-  CHIP_R, dropStartMs, PLAT_LOW_FRONT, PLAT_UP_FRONT, RECENT_DROPS_MAX, traceDrop,
+  CHIP_R, dropStartMs, PLAT_LOW_FRONT, PLAT_UP_FRONT, PUSHER_PERIOD_MS, pusherFaceX, RECENT_DROPS_MAX, traceDrop,
   type CoinPusherState, type DropTrace, type Pile,
 } from './games/coinPusher';
 
@@ -29,6 +29,12 @@ export interface ReplayGeometry {
   trayDrop: number;
   /** Rise from one chip in a stack to the next (its thickness and a hair). */
   level: number;
+  /** The top of the pusher bar above the upper platform. */
+  barTop: number;
+  /** Where a coin leaves the bottom of the drop board: back along the table
+   *  (x, behind the platform: negative) and its centre's height. */
+  boardExitX: number;
+  boardExitY: number;
 }
 
 /** A chip on the table (or tipping, stepping down, falling to the tray). */
@@ -50,7 +56,8 @@ export interface BoardPose {
 }
 
 /** The dropped coin between the bottom of the board and the platform:
- *  `s` runs 0 → 1 from leaving the board to landing at (landX, landU). */
+ *  `s` runs 0 → 1 from leaving the board to landing at (landX, landU). It
+ *  is standing, at (x, u) with its centre `y` above the upper platform. */
 export interface ChutePose {
   chipId: number;
   s: number;
@@ -58,6 +65,43 @@ export interface ChutePose {
   spin: number;
   landX: number;
   landU: number;
+  x: number;
+  u: number;
+  y: number;
+}
+
+/**
+ * The coin down the chute, `t` ms after it went in: off the bottom of the
+ * board onto the pusher bar's top, forward along it, and off its front edge
+ * onto the platform, standing, at the landing. It drops below the bar's top
+ * only once its back is past the bar's face, and while it does it keeps in
+ * front of the face — which, on a retracting stroke, is still over the spot
+ * it lands on until the moment it lands.
+ */
+function chutePose(trace: DropTrace, t: number, geom: ReplayGeometry): ChutePose {
+  const last = trace.board[trace.board.length - 1];
+  const s = (t - trace.fallMs) / (trace.landMs - trace.fallMs);
+  const shelf = geom.barTop + CHIP_R;
+  const half = geom.level / 2;
+  const midX = lerp(geom.boardExitX, trace.landX, 0.5);
+  let x: number;
+  let y: number;
+  if (s < 0.5) {
+    const d = s / 0.5;
+    x = lerp(geom.boardExitX, midX, d);
+    y = lerp(geom.boardExitY, shelf, d * d);
+  } else if (s < 0.75) {
+    x = lerp(midX, trace.landX, (s - 0.5) / 0.25);
+    y = shelf;
+  } else {
+    const d = (s - 0.75) / 0.25;
+    x = Math.max(trace.landX, pusherFaceX(trace.phase + t / PUSHER_PERIOD_MS) + half);
+    y = lerp(shelf, CHIP_R, d * d);
+  }
+  return {
+    chipId: trace.chipId, s, exitU: last.u, spin: last.spin, landX: trace.landX, landU: trace.landU,
+    x, u: lerp(last.u, trace.landU, s), y,
+  };
 }
 
 export interface ReplayView {
@@ -292,11 +336,7 @@ export function replayView(replay: Replay, t: number): ReplayView {
     board = { chipId: trace.chipId, u: lerp(a.u, b.u, s), h: lerp(a.h, b.h, s), spin: lerp(a.spin, b.spin, s) };
     table.delete(trace.chipId);
   } else if (t < trace.landMs) {
-    const last = trace.board[trace.board.length - 1];
-    chute = {
-      chipId: trace.chipId, s: (t - trace.fallMs) / (trace.landMs - trace.fallMs),
-      exitU: last.u, spin: last.spin, landX: trace.landX, landU: trace.landU,
-    };
+    chute = chutePose(trace, t, geom);
     table.delete(trace.chipId);
   }
   return { table: [...table.values()], board, chute, done: t >= replay.endMs };
