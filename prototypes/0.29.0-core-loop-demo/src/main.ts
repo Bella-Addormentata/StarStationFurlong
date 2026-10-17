@@ -15,7 +15,14 @@ import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
-import { roomIsPublicSpace } from "./network/roomCap.ts";
+import {
+  newerCard,
+  normalizeContactCard,
+  readNodeCard,
+  readShareCard,
+  roomIsPublicSpace,
+  writeNodeCard,
+} from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
   packTick,
@@ -27,6 +34,7 @@ import {
   ADDRESSED_TICK_BYTES,
   TICK_BYTES,
   type MovementTick,
+  type ContactCard as NodeContactCard,
   type RoomBootstrap,
   type RoomMemberHint,
 } from "./network/protocol";
@@ -622,12 +630,15 @@ function roomPassageIsPublic(): boolean {
 // notifies both; so a room flipping public/private reaches the node live
 // whichever record flipped it. Each cap carries a sequence number, so one that
 // left earlier but lands later cannot overwrite the current posture.
-networkProvider.setPublicRoomProbe((roomId) =>
-  roomIsPublicSpace(
+/** N8: is `roomId` public space as far as this session can tell right now?
+ *  The cap's probe, and (#231 P6b) the pass minter's reason to carry no card. */
+function roomIsPublicSpaceNow(roomId: string): boolean {
+  return roomIsPublicSpace(
     roomId === DEFAULT_STATION.welcomeRoomId,
     doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
-  ),
-);
+  );
+}
+networkProvider.setPublicRoomProbe(roomIsPublicSpaceNow);
 subscribeDoorPolicy(() => {
   void networkProvider.refreshRoomCap();
   refreshWarmNeighbours(); // 🚪🔥 a door made public or private
@@ -879,11 +890,21 @@ function normalizeMemberHint(value: unknown): RoomMemberHint | null {
   }
   const relayHints = normalizeStringArray(entry.irohRelayUrls);
   const directHints = normalizeStringArray(entry.irohDirectAddrs);
+  // #231 P6b: a card rides only when it names this very node (the node checks
+  // the signature; a card for another node is noise here).
+  const card = normalizeContactCard(entry.nodeCard);
   return {
     irohNodeId: entry.irohNodeId,
     irohRelayUrls: relayHints.length ? relayHints : undefined,
     irohDirectAddrs: directHints.length ? directHints : undefined,
+    nodeCard: card && card.nodeId === entry.irohNodeId ? card : undefined,
   };
+}
+
+/** #231 P6b: hints with no contact card on any of them — what a PUBLIC room's
+ *  pass carries (N8 extends to `ck`: a bundled or public room names no key). */
+function stripMemberCards(hints: RoomMemberHint[]): RoomMemberHint[] {
+  return hints.map(({ nodeCard: _card, ...rest }) => rest);
 }
 
 function collectMemberHints(
@@ -926,9 +947,12 @@ function mergeMemberHints(...hintLists: RoomMemberHint[][]): RoomMemberHint[] {
           irohDirectAddrs: hint.irohDirectAddrs
             ? [...hint.irohDirectAddrs]
             : undefined,
+          nodeCard: hint.nodeCard,
         });
         continue;
       }
+      // #231 P6b: of two cards for one node, the newer stands.
+      existing.nodeCard = newerCard(existing.nodeCard, hint.nodeCard);
 
       const relays = new Set([
         ...(existing.irohRelayUrls ?? []),
@@ -951,12 +975,19 @@ function getLocalNodeHint(
   if (!fingerprint.iroh_node_id) return null;
   const relayHints = normalizeStringArray(fingerprint.iroh_relay_urls);
   const directHints = normalizeStringArray(fingerprint.iroh_direct_addrs);
+  // #231 P6b: our node's own card, once it handed us one over the `card`
+  // lane — only when it is THIS node's (a reinstalled node has a new id).
+  const card = localNodeCard ?? readNodeCard();
   return {
     irohNodeId: fingerprint.iroh_node_id,
     irohRelayUrls: relayHints.length ? relayHints : undefined,
     irohDirectAddrs: directHints.length ? directHints : undefined,
+    nodeCard: card && card.nodeId === fingerprint.iroh_node_id ? card : undefined,
   };
 }
+
+/** #231 P6b: the local node's contact card as last received this session. */
+let localNodeCard: NodeContactCard | null = null;
 
 // ── Network status rows (network details panel) ──────────────────────────────
 function setNetworkRow(id: string, value: string, color?: string): void {
@@ -2047,6 +2078,21 @@ async function joinRoomAtEpoch(
       // drops peer-sent ones, but an older node forwards them), so it is
       // ignored here: nothing a room peer sends may set the dish's address.
       if (env.kind === "faucet") return;
+      // #231 P6b: the LOCAL node's own contact card (node-local lane, the node
+      // drops peer-sent ones). Kept for the passes minted from here on; only a
+      // card naming the node we are connected to counts.
+      if (env.kind === "card" && typeof env.payload === "string") {
+        try {
+          const card = normalizeContactCard(JSON.parse(atob(env.payload)));
+          if (card && card.nodeId === localFingerprint?.iroh_node_id) {
+            localNodeCard = newerCard(localNodeCard ?? undefined, card) ?? card;
+            writeNodeCard(localNodeCard);
+          }
+        } catch {
+          /* malformed card: ignored */
+        }
+        return;
+      }
       if (env.kind === "bridge" && typeof env.payload === "string") {
         try {
           const status = JSON.parse(atob(env.payload)) as {
@@ -8555,7 +8601,12 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   const roomId = activeBootstrap?.roomId ?? getDefaultRoomId();
   const roomKeyB64 =
     activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
-  const localHint = getLocalNodeHint(fingerprint);
+  const rawLocalHint = getLocalNodeHint(fingerprint);
+  // #231 P6b: no card in a public room's hints (N8 extends to `ck`).
+  const localHint =
+    rawLocalHint && roomIsPublicSpaceNow(roomId)
+      ? stripMemberCards([rawLocalHint])[0]
+      : rawLocalHint;
   return {
     v: 2,
     roomId,
@@ -8585,10 +8636,15 @@ function buildOutgoingBootstrap(
     : (activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId));
 
   const localHint = getLocalNodeHint(fingerprint);
-  const mergedHints = mergeMemberHints(
+  const allHints = mergeMemberHints(
     localHint ? [localHint] : [],
     collectMemberHints(activeBootstrap),
   );
+  // #231 P6b: a pass to a PUBLIC room (the welcome room, or one anyone may
+  // walk into) carries no contact card — N8 extends to `ck`; a private room's
+  // pass carries every member card known, ours included, so a member who
+  // cannot reach another can still find and knock on it by key.
+  const mergedHints = roomIsPublicSpaceNow(roomId) ? stripMemberCards(allHints) : allHints;
   const primaryHint = localHint ?? mergedHints[0];
 
   return {
@@ -8831,6 +8887,22 @@ function refreshChiaModeToggle() {
   toggle.checked = on;
   toggle.disabled = !roomId; // no room context yet -> nothing to toggle
   if (state) state.textContent = on ? "ON" : "OFF";
+  refreshShareCardToggle(roomId);
+}
+
+// #231 P6b: the per-room "share my card in this room" switch beside it. On by
+// default; the flag is per-room in localStorage (`ssf-chia-share-card-<roomId>`)
+// and rides the room cap, where the node honours it for cards and its inbox.
+function refreshShareCardToggle(roomId: string | undefined) {
+  const toggle = document.getElementById(
+    "share-card-toggle",
+  ) as HTMLInputElement | null;
+  const state = document.getElementById("share-card-state");
+  if (!toggle) return;
+  const on = roomId ? readShareCard(roomId) : true;
+  toggle.checked = on;
+  toggle.disabled = !roomId;
+  if (state) state.textContent = on ? "ON" : "OFF";
 }
 
 function setupNetworkDetailsPanel() {
@@ -8985,6 +9057,40 @@ function setupNetworkDetailsPanel() {
       }
     });
     refreshChiaModeToggle();
+  }
+
+  // #231 P6b: the "share my card in this room" switch — writes the per-room
+  // flag and re-sends the cap so the node honours it live.
+  const shareToggle = document.getElementById(
+    "share-card-toggle",
+  ) as HTMLInputElement | null;
+  if (shareToggle) {
+    shareToggle.addEventListener("change", () => {
+      const roomId = (window as unknown as { __ssfRoomId?: string })
+        .__ssfRoomId;
+      const on = shareToggle.checked;
+      const state = document.getElementById("share-card-state");
+      if (state) state.textContent = on ? "ON" : "OFF";
+      if (roomId) {
+        try {
+          localStorage.setItem(`ssf-chia-share-card-${roomId}`, on ? "1" : "0");
+        } catch {
+          /* privacy mode */
+        }
+      }
+      void networkProvider.refreshRoomCap();
+      if (feedback) {
+        feedback.textContent = on
+          ? "Contact card shared in this room: its members can find this station by key and knock when every live route fails (private rooms only; public rooms never carry cards)."
+          : "Contact card not shared in this room: members get no key for this station, and the node reads no knocks for it.";
+        setTimeout(() => {
+          if (feedback) feedback.textContent = "";
+        }, 5000);
+      }
+    });
+    refreshShareCardToggle(
+      (window as unknown as { __ssfRoomId?: string }).__ssfRoomId,
+    );
   }
 
   // ?seed= deep-link import (unchanged bootstrap path — only the input it

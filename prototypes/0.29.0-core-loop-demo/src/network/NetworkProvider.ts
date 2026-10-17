@@ -23,7 +23,7 @@ import type {
   TransportMode,
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
-import { buildRoomCapPayload, nextCapSeq, readChiaMode } from './roomCap.ts';
+import { buildRoomCapPayload, memberCardsOf, nextCapSeq, readChiaMode, readShareCard } from './roomCap.ts';
 import type { FaucetOp, FaucetRequestTicket } from '../faucetDish.ts';
 
 export interface NetworkDebugInfo {
@@ -255,11 +255,19 @@ export class NetworkProvider implements NetworkProviderPort {
     try {
       const publicRoom = this.#publicRoomProbe(roomId);
       this.#capSeq = nextCapSeq(this.#capSeq);
-      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq);
+      // #231 P6b: the room's share-my-card toggle and the cards its pass
+      // carries for its members (this session's boot, when it is this room's).
+      const boot = this.#boot;
+      const memberCards = boot?.roomId === roomId ? memberCardsOf(boot.memberHints) : [];
+      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq, readShareCard(roomId), memberCards);
       const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
-      // Small payload (<128 B) — a single btoa is safe. Node decodes with
-      // BASE64_STANDARD, which btoa produces.
-      const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
+      // A few KB at most (member cards); chunked so the spread never trips an
+      // argument limit. Node decodes with BASE64_STANDARD, which btoa produces.
+      let payloadText = '';
+      for (let i = 0; i < payloadBytes.length; i += 0x8000) {
+        payloadText += String.fromCharCode(...payloadBytes.subarray(i, i + 0x8000));
+      }
+      const payloadB64 = btoa(payloadText);
       const wire = { v: 1, room: roomId, kind: 'cap', seq: 0, author: '', payload: payloadB64 };
       const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
       const packet = new Uint8Array(4 + jsonBytes.length);
