@@ -33,8 +33,10 @@
 //!     resolves to counts as the pin from then on.
 //!   - PUBLIC peers come from three sources: the DNS introducer (fresh this
 //!     run; asked only when the stored and gossiped candidates fall short:
-//!     nothing left to dial, or a money request without a pin that has no
-//!     fresh peer yet; at most every [`INTRODUCE_EVERY`], sooner only after a
+//!     nothing queued that the next dial could try (a queue the full pool
+//!     holds no pair for counts as nothing), or a money request without a
+//!     pin that has no fresh peer yet; at most every [`INTRODUCE_EVERY`],
+//!     sooner only after a
 //!     lookup that named nobody; a stored or gossiped peer it names this run
 //!     counts as fresh from then on), `RequestPeers` gossip from a connected
 //!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed),
@@ -43,7 +45,10 @@
 //!     peers must come from DISTINCT sources and distinct network groups
 //!     (IPv4 /16, IPv6 /32; an IPv4‑mapped IPv6 address is its IPv4 address),
 //!     and one of them must be fresh (a pin or the introducer), so a poisoned
-//!     store cannot make an eclipse stick. One source holds at most
+//!     store cannot make an eclipse stick. Their listings are judged as of
+//!     the lowest height both are complete through ([`settle_pages`]), so a
+//!     peer a block ahead, or one that cut a page at its item limit, does not
+//!     read as a disagreement. One source holds at most
 //!     [`PER_SOURCE_CAP`] of the [`MAX_CONNS`] connections, and a full pool
 //!     that cannot form a pair lets a connection go (a redundant one first,
 //!     never a pin) for a candidate whose source AND network group would
@@ -493,7 +498,9 @@ impl Lane {
     }
 
     /// Resolve and dial every pin not connected, up to the pins' share of the
-    /// pool. A pin outranks any public connection for a slot; a pin that fails
+    /// pool. A pin outranks any public connection for a slot (the public
+    /// connections that make room go back in the queue, so a pin dial that
+    /// fails costs the lane no peer); a pin that fails
     /// is left alone for [`PIN_RETRY_AFTER`] (its owner may be restarting it)
     /// and tried again, whether or not another pin is up.
     async fn dial_pins(&self, state: &mut LaneState) {
@@ -548,11 +555,11 @@ impl Lane {
             }
             let batch: Vec<Candidate> = targets.drain(..want).collect();
             while state.conns.len() + batch.len() > MAX_CONNS {
-                let Some(i) = state.conns.iter().rposition(|c| c.source() != Source::Pin) else { break };
-                let peer = state.conns.remove(i);
-                eprintln!("⛓️ chain peers: {} ({}) let go: making room for a pin", peer.addr(), peer.source().label());
-                state.gossiped.remove(&peer.addr());
-                close_later(peer);
+                // The newest public connection makes room and goes back in
+                // the queue, cooling briefly: a pin dial that then fails has
+                // not cost the lane a peer the pair may still need.
+                let Some(peer) = state.conns.iter().rev().find(|c| c.source() != Source::Pin).cloned() else { break };
+                self.let_go(state, &peer, RECONNECT_AFTER, "making room for a pin");
             }
             self.dial_batch(state, batch, PIN_RETRY_AFTER).await;
         }
@@ -583,7 +590,20 @@ impl Lane {
             push_candidates(state, stored);
         }
         let now = Instant::now();
-        let ready = state.candidates.iter().any(|c| !state.cooling.get(&c.addr).is_some_and(|until| now < *until));
+        // "Ready" is a queued candidate the next dial could actually try: not
+        // cooling, not connected, and one the pool has a place for (under its
+        // source's cap or by rotation; in a full pool, one whose swap would
+        // complete a pair). A queue the full pool holds no pair for (every
+        // peer and candidate in one network group, say) is no reason to leave
+        // the introducer unasked once it is due.
+        let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
+        let pooled: Vec<(Source, Group, bool)> = state.conns.iter().map(|c| (c.source(), c.group(), state.gossiped.contains_key(&c.addr()))).collect();
+        let pinned = !self.pins.is_empty();
+        let ready = state.candidates.iter().any(|c| {
+            !connected.contains(&c.addr)
+                && !state.cooling.get(&c.addr).is_some_and(|until| now < *until)
+                && tryable(&pooled, (c.source, group_of(c.addr)), pinned, self.pin_only)
+        });
         let need_fresh = trust == Trust::Agreed && self.pins.is_empty() && !state.conns.iter().any(|c| c.source().is_fresh());
         // No veto for introducer candidates still queued: those are cooling
         // after failed dials, and only the deadline and the need decide.
@@ -910,18 +930,38 @@ impl Lane {
         F: Fn(Arc<PeerConn>) -> Fut + Send + Sync,
         Fut: Future<Output = Result<T, ChainError>> + Send,
     {
+        self.ask_by(what, trust, op, |mut answers: Vec<T>| {
+            let alike = answers.iter().all(|v| *v == answers[0]);
+            alike.then(|| answers.swap_remove(0))
+        })
+        .await
+    }
+
+    /// [`Self::ask`] with its own notion of agreement: `settle` turns the
+    /// peers' answers (one per peer, every one of them Ok) into the verdict,
+    /// or `None` when they do not agree. A carrier's one answer is settled
+    /// alone.
+    async fn ask_by<T, U, F, Fut, S>(&self, what: &str, trust: Trust, op: F, settle: S) -> Result<U, ChainError>
+    where
+        T: Send,
+        U: Send,
+        F: Fn(Arc<PeerConn>) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<T, ChainError>> + Send,
+        S: Fn(Vec<T>) -> Option<U> + Send + Sync,
+    {
         let peers = self.peers_for(trust).await?;
         match trust {
             Trust::Carrier => {
                 let first = peers[0].clone();
+                let alone = |v: T| settle(vec![v]).ok_or_else(|| unanswered(format!("{what}: the peer's answer could not be settled")));
                 match op(first.clone()).await {
-                    Ok(v) => Ok(v),
+                    Ok(v) => alone(v),
                     Err(ChainError::Refused(why)) => Err(ChainError::Refused(why)),
                     Err(ChainError::Unanswered(e)) => {
                         self.drop_conn(&first).await;
                         let next = self.live_conns().await.into_iter().find(|c| c.addr() != first.addr());
                         match next {
-                            Some(next) => op(next).await,
+                            Some(next) => op(next).await.and_then(alone),
                             None => Err(ChainError::Unanswered(e)),
                         }
                     }
@@ -929,12 +969,18 @@ impl Lane {
             }
             Trust::Agreed => {
                 let answers = join_all(peers.iter().cloned().map(|p| op(p))).await;
-                self.verdict(what, &peers, answers).await
+                self.verdict(what, &peers, answers, settle).await
             }
         }
     }
 
-    async fn verdict<T: PartialEq>(&self, what: &str, peers: &[Arc<PeerConn>], answers: Vec<Result<T, ChainError>>) -> Result<T, ChainError> {
+    async fn verdict<T: Send, U: Send>(
+        &self,
+        what: &str,
+        peers: &[Arc<PeerConn>],
+        answers: Vec<Result<T, ChainError>>,
+        settle: impl FnOnce(Vec<T>) -> Option<U> + Send,
+    ) -> Result<U, ChainError> {
         let mut oks: Vec<T> = Vec::new();
         let mut refusals: Vec<String> = Vec::new();
         let mut silences: Vec<String> = Vec::new();
@@ -956,9 +1002,9 @@ impl Lane {
             return Err(unanswered(format!("{what}: {} of {} peers unanswered ({})", silences.len(), peers.len(), silences.join("; "))));
         }
         if oks.len() == peers.len() {
-            if oks.iter().all(|v| *v == oks[0]) {
+            if let Some(settled) = settle(oks) {
                 self.note_good(peers).await;
-                return Ok(oks.swap_remove(0));
+                return Ok(settled);
             }
             self.evict(peers, "disagreed on a verdict").await;
             return Err(unanswered(format!(
@@ -1267,6 +1313,24 @@ pub(crate) fn replaceable(facts: &[(Source, Group)], cand: (Source, Group), pinn
     })
 }
 
+/// Could the next dial try a candidate of `cand`'s source and network group,
+/// against the connections `pooled` (source, group, asked for gossip yet)?
+/// With room in the pool: when its source is under [`PER_SOURCE_CAP`], or a
+/// rotation could make room (a fresh candidate, a connection of its source
+/// already asked for gossip; [`Lane::rotation`]). In a full pool: only when
+/// the pool cannot pair and the swap [`replaceable`] names would complete
+/// one. [`Lane::refill`] asks the introducer when nothing queued passes: a
+/// full pool and a queue all in one network group would otherwise keep it
+/// unasked for good, however long ago it last answered.
+pub(crate) fn tryable(pooled: &[(Source, Group, bool)], cand: (Source, Group), pinned: bool, pin_only: bool) -> bool {
+    let facts: Vec<(Source, Group)> = pooled.iter().map(|(s, g, _)| (*s, *g)).collect();
+    if facts.len() >= MAX_CONNS {
+        return pick_agreed(&facts, pinned, pin_only).is_none() && replaceable(&facts, cand, pinned, pin_only).is_some();
+    }
+    let held = facts.iter().filter(|(s, _)| *s == cand.0).count();
+    held < PER_SOURCE_CAP || (cand.0.is_fresh() && pooled.iter().any(|(s, _, asked)| *s == cand.0 && *s != Source::Pin && *asked))
+}
+
 /// Take exactly `peer` out of the pool, never a later connection to the same
 /// address (a request that slept through a reconnect holds a stale handle),
 /// clearing its gossip marker. False when it was not pooled any more.
@@ -1424,6 +1488,85 @@ pub(crate) fn records_from(states: Vec<CoinState>, include_spent: bool, min_heig
     records
 }
 
+/// One peer's raw answer to a listing, before the pair is judged: the coin
+/// states it returned, complete through `height` (its peak for a finished
+/// listing, the page boundary otherwise), the header hash there, and whether
+/// it has more to say.
+#[derive(Debug, Clone)]
+pub(crate) struct Page {
+    pub states: Vec<CoinState>,
+    pub height: u32,
+    pub header_hash: Bytes32,
+    pub finished: bool,
+}
+
+/// Judge the peers' pages of one listing together. Two honest peers need not
+/// cut a listing at the same block: one hits its response-item limit
+/// earlier, one is simply a block or two ahead, and a record in that gap
+/// would read as a disagreement and evict a healthy peer. So the pages are
+/// compared as of the LOWEST height any of them is complete through: coins
+/// created above it are left out, spends above it not yet seen; what remains
+/// must match, or there is no verdict (`None`). The listing is complete when
+/// a page at that height is finished; otherwise it continues from there.
+pub(crate) fn settle_pages(pages: Vec<Page>, include_spent: bool, min_height: Option<u32>) -> Option<CoinListing> {
+    let low = pages.iter().min_by_key(|p| p.height)?;
+    let (height, header_hash) = (low.height, low.header_hash);
+    let finished = pages.iter().any(|p| p.height == height && p.finished);
+    let records = settle_records(pages, height, include_spent, min_height)?;
+    Some(CoinListing { records, truncated: !finished, next_cursor: (!finished).then(|| encode_cursor(height, header_hash)) })
+}
+
+/// [`settle_pages`] for coin-state lookups, which carry no cursor: judged as
+/// of the lowest announced peak, cut short when any peer's lookup was.
+pub(crate) fn settle_states(pages: Vec<Page>, include_spent: bool) -> Option<CoinListing> {
+    let height = pages.iter().map(|p| p.height).min()?;
+    let finished = pages.iter().all(|p| p.finished);
+    let records = settle_records(pages, height, include_spent, None)?;
+    Some(CoinListing { records, truncated: !finished, next_cursor: None })
+}
+
+/// The records every page agrees on as of `height`, or `None`.
+fn settle_records(pages: Vec<Page>, height: u32, include_spent: bool, min_height: Option<u32>) -> Option<Vec<CoinRecord>> {
+    let mut agreed: Option<Vec<CoinRecord>> = None;
+    for page in pages {
+        let records = records_from(as_of(page.states, height), include_spent, min_height);
+        match &agreed {
+            None => agreed = Some(records),
+            Some(first) if *first == records => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
+}
+
+/// The coin states as the chain stood at `height`: coins created above it
+/// are not there yet, spends above it have not happened.
+fn as_of(states: Vec<CoinState>, height: u32) -> Vec<CoinState> {
+    states
+        .into_iter()
+        .filter(|s| !s.created_height.is_some_and(|h| h > height))
+        .map(|mut s| {
+            if s.spent_height.is_some_and(|h| h > height) {
+                s.spent_height = None;
+            }
+            s
+        })
+        .collect()
+}
+
+/// A coin-state answer as a page complete through the peer's announced peak
+/// (its view is at least that current), or through any height when it has
+/// announced none.
+fn page_of(peer: &PeerConn, states: Vec<CoinState>, finished: bool) -> Page {
+    let peak = peer.peak_now();
+    Page {
+        states,
+        height: peak.map_or(u32::MAX, |p| p.height),
+        header_hash: peak.map_or(Bytes32::new([0u8; 32]), |p| p.header_hash),
+        finished,
+    }
+}
+
 /// One peer's listing under `keys` (puzzle hashes, read as hints too when
 /// `hinted`): `RequestPuzzleState` from `cursor`, else from the block before
 /// `min_height` (its header fetched first, so a watcher's incremental scan
@@ -1432,16 +1575,17 @@ pub(crate) fn records_from(states: Vec<CoinState>, include_spent: bool, min_heig
 /// page: a peer with more to say leaves the listing cut short with a cursor,
 /// and the caller's page budget (`chia_resolve::MAX_PAGES_PER_POLL`,
 /// `chia_faucet::MAX_FAUCET_PAGES`, `chia_publish::MAX_RECONCILE_PAGES`)
-/// decides how far to follow; no second budget hides beneath it.
+/// decides how far to follow; no second budget hides beneath it. The page
+/// comes back raw, spent coins included: [`settle_pages`] judges the peers'
+/// pages together and filters afterwards.
 async fn listing_on(
     peer: Arc<PeerConn>,
     net: Network,
     keys: Vec<Bytes32>,
     hinted: bool,
-    include_spent: bool,
     min_height: Option<u32>,
     cursor: Option<String>,
-) -> Result<CoinListing, ChainError> {
+) -> Result<Page, ChainError> {
     let mut from_header = false;
     let (mut previous, mut header_hash) = match cursor {
         None => match min_height {
@@ -1459,7 +1603,11 @@ async fn listing_on(
             (Some(height), hash)
         }
     };
-    let filters = CoinStateFilters::new(include_spent, true, hinted, 0);
+    // Spent coins are always asked for: the pages are judged as of one
+    // height, and a peer ahead of it would otherwise hide a coin spent in the
+    // gap that the other peer still lists. The caller's choice is applied by
+    // [`settle_pages`].
+    let filters = CoinStateFilters::new(true, true, hinted, 0);
     let page = loop {
         let page = peer
             .request_fallible::<RespondPuzzleState, RejectPuzzleState, _>(RequestPuzzleState::new(
@@ -1483,12 +1631,7 @@ async fn listing_on(
             Err(reject) => return Err(ChainError::Refused(format!("coin listing rejected: {:?}", reject.reason))),
         }
     };
-    let records = records_from(page.coin_states, include_spent, min_height);
-    if page.is_finished {
-        Ok(CoinListing { records, truncated: false, next_cursor: None })
-    } else {
-        Ok(CoinListing { records, truncated: true, next_cursor: Some(encode_cursor(page.height, page.header_hash)) })
-    }
+    Ok(Page { states: page.coin_states, height: page.height, header_hash: page.header_hash, finished: page.is_finished })
 }
 
 /// Where an incremental listing starts: the block before `min_height` and its
@@ -1507,7 +1650,7 @@ async fn start_before(peer: &Arc<PeerConn>, min_height: u32) -> Option<(Option<u
 /// again, and a lookup still short after [`STATE_ROUNDS`] requests, or one the
 /// peer makes no progress on, is cut short with no cursor, which every caller
 /// treats as incomplete (the wallet lease keeps its coins parked).
-async fn states_on(peer: Arc<PeerConn>, net: Network, names: Vec<Bytes32>, include_spent: bool) -> Result<CoinListing, ChainError> {
+async fn states_on(peer: Arc<PeerConn>, net: Network, names: Vec<Bytes32>) -> Result<Page, ChainError> {
     let mut seen: HashSet<Bytes32> = HashSet::new();
     let mut wanted: Vec<Bytes32> = names.into_iter().filter(|id| seen.insert(*id)).collect();
     let mut states: Vec<CoinState> = Vec::new();
@@ -1525,14 +1668,14 @@ async fn states_on(peer: Arc<PeerConn>, net: Network, names: Vec<Bytes32>, inclu
         let before = wanted.len();
         wanted.retain(|id| !echoed.contains(id));
         if wanted.is_empty() {
-            return Ok(CoinListing { records: records_from(states, include_spent, None), truncated: false, next_cursor: None });
+            return Ok(page_of(&peer, states, true));
         }
         if wanted.len() == before {
             // No progress: the peer answers for none of what is left.
             break;
         }
     }
-    Ok(CoinListing { records: records_from(states, include_spent, None), truncated: true, next_cursor: None })
+    Ok(page_of(&peer, states, false))
 }
 
 /// One peer's puzzle reveal and solution for a spend.
@@ -1555,9 +1698,12 @@ impl ChainAccess for PeerLane {
         let net = self.lane.net.clone();
         async move {
             self.lane
-                .ask("coins by hint", self.trust, move |peer| {
-                    listing_on(peer, net.clone(), vec![hint], true, include_spent, start_height, cursor.clone())
-                })
+                .ask_by(
+                    "coins by hint",
+                    self.trust,
+                    move |peer| listing_on(peer, net.clone(), vec![hint], true, start_height, cursor.clone()),
+                    move |pages| settle_pages(pages, include_spent, start_height),
+                )
                 .await
         }
     }
@@ -1571,9 +1717,12 @@ impl ChainAccess for PeerLane {
         let net = self.lane.net.clone();
         async move {
             self.lane
-                .ask("coins by puzzle hash", self.trust, move |peer| {
-                    listing_on(peer, net.clone(), vec![puzzle_hash], false, include_spent, None, cursor.clone())
-                })
+                .ask_by(
+                    "coins by puzzle hash",
+                    self.trust,
+                    move |peer| listing_on(peer, net.clone(), vec![puzzle_hash], false, None, cursor.clone()),
+                    move |pages| settle_pages(pages, include_spent, None),
+                )
                 .await
         }
     }
@@ -1587,7 +1736,12 @@ impl ChainAccess for PeerLane {
         let net = self.lane.net.clone();
         async move {
             self.lane
-                .ask("coins by id", self.trust, move |peer| states_on(peer, net.clone(), names.clone(), include_spent))
+                .ask_by(
+                    "coins by id",
+                    self.trust,
+                    move |peer| states_on(peer, net.clone(), names.clone()),
+                    move |pages| settle_states(pages, include_spent),
+                )
                 .await
         }
     }
@@ -1684,6 +1838,24 @@ mod tests {
 
     fn peak_at(height: u32) -> Peak {
         Peak { height, header_hash: header_at(height, genesis()).header_hash() }
+    }
+
+    /// A full node that honours `previous_height`: the coins changed after
+    /// it, cut at `boundary` while that lies ahead (an unfinished page), else
+    /// through height 100, finished.
+    fn paged(states: Vec<CoinState>, boundary: Option<u32>) -> Handler {
+        let base = node(states.clone(), (1, None), vec![]);
+        Arc::new(move |m: &Message| {
+            if m.msg_type != chia_protocol::ProtocolMessageTypes::RequestPuzzleState {
+                return base(m);
+            }
+            let req = RequestPuzzleState::from_bytes(&m.data).unwrap();
+            let since = req.previous_height.unwrap_or(0);
+            let changed = |s: &CoinState| s.created_height.unwrap_or(0).max(s.spent_height.unwrap_or(0));
+            let cut = boundary.filter(|b| *b > since).unwrap_or(100);
+            let page: Vec<CoinState> = states.iter().filter(|s| changed(s) > since && changed(s) <= cut).cloned().collect();
+            vec![reply(&RespondPuzzleState::new(req.puzzle_hashes, cut, header_at(cut, genesis()).header_hash(), cut == 100, page))]
+        })
     }
 
     fn lane(seeds: Vec<(SocketAddr, Source)>, pins: Vec<String>, pin_only: bool, store: Option<PathBuf>) -> Arc<Lane> {
@@ -1914,6 +2086,109 @@ mod tests {
         let state = lane.state.lock().await;
         assert!(state.cooling.contains_key(&gone[0]), "it cools before another dial");
         assert!(state.candidates.iter().any(|q| q.addr == gone[0]), "and waits in the queue, to be asked for gossip again");
+    }
+
+    #[tokio::test]
+    async fn peers_cutting_a_listing_at_different_blocks_still_agree() {
+        // The same history on both: A serves it in one page through height
+        // 100; B hits its item limit at 92 and finishes on a second request.
+        // Judged as of 92 the pages agree, the cursor continues from there,
+        // and the second request brings the rest. Nobody is evicted.
+        let history = vec![state(1, 90, None), state(2, 80, Some(85)), state(3, 95, None)];
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), paged(history.clone(), None)).await;
+        let b = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), paged(history, Some(92))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let first = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap();
+        assert_eq!(
+            first.records.iter().map(|r| (r.coin.amount, r.confirmed_block_index, r.spent)).collect::<Vec<_>>(),
+            vec![(2, 80, true), (1, 90, false)],
+            "as of height 92: the coin confirmed at 95 is not there yet"
+        );
+        assert!(first.truncated);
+        assert_eq!(decode_cursor(first.next_cursor.as_deref().unwrap()).unwrap(), (92, header_at(92, genesis()).header_hash()));
+        let rest = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, first.next_cursor).await.unwrap();
+        assert_eq!(rest.records.iter().map(|r| (r.coin.amount, r.confirmed_block_index)).collect::<Vec<_>>(), vec![(3, 95)]);
+        assert!(!rest.truncated && rest.next_cursor.is_none());
+        assert_eq!(lane.live_count().await, 2, "two honest peers, both kept");
+    }
+
+    #[test]
+    fn pages_are_judged_as_of_the_lowest_height_they_are_complete_through() {
+        let hash = |h: u32| header_at(h, genesis()).header_hash();
+        // One peer a block ahead sees a coin and a spend the other does not
+        // yet: judged as of 100 both agree, and the listing is complete.
+        let behind = Page { states: vec![state(1, 90, None), state(2, 80, None)], height: 100, header_hash: hash(100), finished: true };
+        let ahead = Page { states: vec![state(1, 90, None), state(2, 80, Some(101)), state(3, 101, None)], height: 101, header_hash: hash(101), finished: true };
+        let settled = settle_pages(vec![behind.clone(), ahead], true, None).unwrap();
+        assert_eq!(settled.records.iter().map(|r| (r.coin.amount, r.spent)).collect::<Vec<_>>(), vec![(2, false), (1, false)]);
+        assert!(!settled.truncated && settled.next_cursor.is_none());
+        // A page cut at 92 against a finished one: judged as of 92, continued from there.
+        let cut = Page { states: vec![state(2, 80, None), state(1, 90, None)], height: 92, header_hash: hash(92), finished: false };
+        let settled = settle_pages(vec![behind.clone(), cut], true, None).unwrap();
+        assert_eq!(settled.records.iter().map(|r| r.coin.amount).collect::<Vec<_>>(), vec![2, 1]);
+        assert!(settled.truncated);
+        assert_eq!(decode_cursor(settled.next_cursor.as_deref().unwrap()).unwrap(), (92, hash(92)));
+        // A real difference below the common height is still no verdict.
+        let other = Page { states: vec![state(1, 90, None), state(2, 81, None)], height: 100, header_hash: hash(100), finished: true };
+        assert!(settle_pages(vec![behind, other], true, None).is_none());
+    }
+
+    #[test]
+    fn a_candidate_the_pool_is_full_against_does_not_count_as_ready() {
+        // Four connections and a candidate all in one /16: no swap completes
+        // a pair, so nothing queued can be tried and the introducer is due.
+        let g = |a: &str| group_of(a.parse().unwrap());
+        let one = g("203.0.113.1:58444");
+        let full = vec![(Source::Introducer, one, true), (Source::Introducer, one, true), (Source::Introducer, one, true), (Source::Gossip, one, true)];
+        assert!(!tryable(&full, (Source::Introducer, one), false, false), "same group: the swap would not pair");
+        assert!(tryable(&full, (Source::Introducer, g("198.51.100.1:58444")), false, false), "another group: swapped in, it pairs with the gossiped peer");
+        // With room, the source cap decides; a rotation counts as room for an introducer peer.
+        let three = vec![(Source::Introducer, one, true); 3];
+        assert!(tryable(&three, (Source::Introducer, one), false, false), "an introducer peer asked for gossip can rotate out");
+        assert!(tryable(&three, (Source::Gossip, one), false, false), "a gossiped peer has the free place");
+        let unasked = vec![(Source::Introducer, one, false); 3];
+        assert!(!tryable(&unasked, (Source::Introducer, one), false, false), "nothing to rotate yet");
+        let stored = vec![(Source::Store, one, true); 3];
+        assert!(!tryable(&stored, (Source::Store, one), false, false), "no rotation among stored peers: only the introducer brings a fresh one");
+    }
+
+    #[tokio::test]
+    async fn public_peers_displaced_for_a_pin_retry_are_queued_again() {
+        // One live pin, two pins that do not answer, three public peers: the
+        // retry of the two dead pins makes room for them and fails. The two
+        // public peers it displaced are queued again, and when the last
+        // public peer is gone they are the ones that give the pin its pair.
+        let live = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let (dead1, dead2) = (closed().await, closed().await);
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let c = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let seeds = vec![(a.addr, Source::Introducer), (b.addr, Source::Introducer), (c.addr, Source::Introducer)];
+        let lane = lane(seeds, vec![live.addr.to_string(), dead1.to_string(), dead2.to_string()], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        assert_eq!(lane.live_count().await, 4, "the pin and three public peers");
+        lane.expire_pin_cooldown().await;
+        assert_eq!(money.peak_height().await.unwrap(), 100, "the pin retry fails; the pair stands");
+        let conns = lane.live_conns().await;
+        assert_eq!(conns.len(), 2, "two public peers made room for the two pin dials");
+        let displaced: Vec<SocketAddr> = [a.addr, b.addr, c.addr].into_iter().filter(|x| !conns.iter().any(|p| p.addr() == *x)).collect();
+        assert_eq!(displaced.len(), 2);
+        {
+            let state = lane.state.lock().await;
+            for addr in &displaced {
+                assert!(state.candidates.iter().any(|q| q.addr == *addr), "{addr} is queued again");
+                assert!(state.cooling.contains_key(addr), "{addr} cools before it is dialled again");
+            }
+        }
+        // The remaining public peer goes; the displaced ones are what is left to pair with.
+        let last = conns.into_iter().find(|p| p.source() != Source::Pin).unwrap();
+        lane.drop_conn(&last).await;
+        lane.expire_pin_cooldown().await;
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        let conns = lane.live_conns().await;
+        assert!(conns.iter().any(|p| displaced.contains(&p.addr())), "a displaced peer is back in the pool");
     }
 
     #[tokio::test]

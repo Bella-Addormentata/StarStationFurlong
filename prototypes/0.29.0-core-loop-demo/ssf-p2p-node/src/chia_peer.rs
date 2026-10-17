@@ -167,9 +167,17 @@ pub fn group_of(addr: SocketAddr) -> Group {
 
 /// A socket address with an IPv4-mapped IPv6 address written as the IPv4
 /// address it maps, so a peer has ONE spelling in the pool, the candidate
-/// queue, the cooling list and the store.
+/// queue, the cooling list and the store. Any other address is left as it
+/// is: a native IPv6 address keeps its scope id (`[fe80::1%3]:58444` names a
+/// node on THAT link, and rebuilt without the scope it could not be reached).
 pub fn canonical(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
 }
 
 /// A peer's latest announced peak.
@@ -953,6 +961,10 @@ mod tests {
         assert_eq!(group_of(mapped), group_of(a), "mapped and native forms share the /16 group");
         assert_eq!(canonical(mapped), a);
         assert_eq!(canonical(a), a);
+        // A native IPv6 address keeps its scope id: the link is part of the address.
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 58444, 0, 3));
+        assert_eq!(canonical(scoped), scoped, "the scope id survives");
+        assert_eq!(group_of(scoped), group_of("[fe80::2]:58444".parse().unwrap()), "and the /32 group ignores it");
         let mapped_loop: SocketAddr = "[::ffff:127.0.0.1]:1001".parse().unwrap();
         assert_eq!(group_of(mapped_loop), group_of(l1));
     }
