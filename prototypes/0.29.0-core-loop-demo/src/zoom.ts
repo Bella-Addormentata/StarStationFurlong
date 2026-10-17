@@ -143,6 +143,13 @@ let isBlinking = false;
 let blinkProgress = 0.0; // 0.0 to 1.0 (0=open, 0.5=fully closed, 1.0=fully open again)
 let pendingZoomOutAction = false;
 
+/** 🚪🔒 True while the view must stay first person (the sealed airlock: only
+ *  the closed vestibule is drawn while the room is swapped behind it). */
+let cameraModeLocked: () => boolean = () => false;
+export function setCameraModeLock(locked: () => boolean): void {
+  cameraModeLocked = locked;
+}
+
 // ── First-person pointer-lock click model (#49) ──────────────────────────────
 // While LOCKED the mouse is hidden and drives look-around; a click frees the
 // cursor for interaction (seats / doors / floor-walk raycasts in main.ts's
@@ -418,6 +425,22 @@ export class MultiScaleZoomView {
     yaw = heading;
   }
 
+  /**
+   * 🚪🔒 Ease the first-person look toward `heading` over `dt` seconds, so a
+   * scripted walk through a tube turns the view round its bends. Does
+   * nothing outside first person.
+   */
+  public steerFirstPersonHeading(heading: number, dt: number): void {
+    if (this.currentLevel !== 1 || !Number.isFinite(heading) || !(dt > 0)) return;
+    const d = Math.atan2(Math.sin(heading - yaw), Math.cos(heading - yaw));
+    yaw += d * (1 - Math.exp(-dt / 0.25));
+  }
+
+  /** 🚪🔒 The first-person look's heading; null outside first person. */
+  public getFirstPersonHeading(): number | null {
+    return this.currentLevel === 1 ? yaw : null;
+  }
+
   /** Return from level 1 to the orthographic room view, then run `onReady`. */
   public requestRoomView(onReady: () => void): void {
     if (this.currentLevel === 2) {
@@ -510,10 +533,16 @@ export class MultiScaleZoomView {
     this.zoomOut();
   }
 
+  /** 🚪🔒 In first person with the camera at the eye (not still flying in
+   *  from the room view). */
+  public isFirstPersonSettled(): boolean {
+    return this.currentLevel === 1 && !isTransitioningFirstPerson;
+  }
+
   private zoomIn() {
     // Device focus owns the camera — HUD zoom buttons must not steal it
     // (the keydown path is guarded upstream; this covers the buttons).
-    if (isDeviceFocusActive()) return;
+    if (isDeviceFocusActive() || cameraModeLocked()) return;
     // 🪐 Issue 218: in from the planet view is the station view, still level 3.
     if (this.currentLevel === 3 && isExteriorOrbitView()) {
       setExteriorOrbitView(false);
@@ -555,7 +584,7 @@ export class MultiScaleZoomView {
 
   private zoomOut() {
     // Device focus owns the camera — see zoomIn() guard.
-    if (isDeviceFocusActive()) return;
+    if (isDeviceFocusActive() || cameraModeLocked()) return;
     if (this.currentLevel < 8) {
       if (this.currentLevel === 1) {
         // Trigger eyelid blink before returning to standard room view (Level 2)
@@ -921,6 +950,8 @@ export class MultiScaleZoomView {
       if (blinkProgress >= 1.0) {
         isBlinking = false;
         blinkProgress = 0.0;
+      } else if (blinkProgress >= 0.5 && pendingZoomOutAction && cameraModeLocked()) {
+        pendingZoomOutAction = false; // 🚪🔒 sealed in the airlock: stay first person
       } else if (blinkProgress >= 0.5 && pendingZoomOutAction) {
         // At mid-blink (eyes fully closed), execute the actual camera swap zoom out instantly!
         pendingZoomOutAction = false;

@@ -4067,13 +4067,12 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     place(new THREE.BoxGeometry(AH_GOAL_HALF_W * 2, 0.05, 0.09), tm('catchSlot', 0.7, 0.05), 0, AH_SURFACE_Y - 0.005, ez);
   }
 
-  // ⚙ Settings gears (settingsGear.ts): one on each end rail, at that
-  // player's right hand, opening the table card (rules, who holds each end,
-  // the owner's RESET).
-  for (const [gx, gz] of [[-endSegX, -endZ], [endSegX, endZ]] as const) {
-    for (const gear of addSettingsGear(place, m, gx, railTop + 0.006, gz, 0.04)) {
-      gear.userData.settingsGear = ctx.itemId;
-    }
+  // ⚙ Settings gear (settingsGear.ts): one, on the +x side rail at the
+  // centre line, right at the foot of the scoreboard pole, opening the table
+  // card (rules, who holds each end, the owner's RESET). Both players reach
+  // it equally, and it stays clear of either end's play.
+  for (const gear of addSettingsGear(place, m, sideX, railTop + 0.006, 0, 0.04)) {
+    gear.userData.settingsGear = ctx.itemId;
   }
 
   // Goal lamps — one over each mouth; flashGoal() strobes the breached end.

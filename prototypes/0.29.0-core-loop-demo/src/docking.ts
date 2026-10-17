@@ -132,6 +132,7 @@ import {
   roomCupolas,
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
+import type { CupolaWall } from "./cupola";
 import {
   readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumberHere, stationGates, steppedGateNumberHere,
 } from "./stationAtlas";
@@ -2994,6 +2995,8 @@ export class DoorDockingPortSystem {
     halfX: number;
     halfZ: number;
     dock: boolean;
+    /** 🔭 Its cupola end walls, when the atlas knows them (issue 219). */
+    cupola?: CupolaWall[];
   }> {
     const out: ReturnType<DoorDockingPortSystem["connectedModules"]> = [];
     for (const [doorId, st] of this.doorState) {
@@ -3001,7 +3004,8 @@ export class DoorDockingPortSystem {
       if (!this.doorObjects.has(doorId)) continue; // this room's doors only
       const roomId = roomIdFromSeed(st.connectedRoomAddress);
       const farWall = this.farWallFor(st);
-      const dims = roomId ? readAtlas()[roomId]?.dims : undefined;
+      const entry = roomId ? readAtlas()[roomId] : undefined;
+      const dims = entry?.dims;
       const pose = projectionPoseForDoor(
         doorId,
         st.segments,
@@ -3016,6 +3020,7 @@ export class DoorDockingPortSystem {
         ...pose,
         ...moduleHalves(dims),
         dock: isDockChain(st.segments),
+        ...(entry?.cupola ? { cupola: entry.cupola } : {}),
       });
     }
     return out;
@@ -4444,6 +4449,25 @@ export class DoorDockingPortSystem {
       out.push({ wall: pose.wall, lateral: pose.tangent === "x" ? pose.x : pose.z });
     }
     return out;
+  }
+
+  /** 🚪🔒 Is this door built and its leaves fully shut (the airlock seal)? */
+  public isDoorShut(doorId: string): boolean {
+    return this.doorObjects.has(doorId) && !this.isDoorAjar(doorId);
+  }
+
+  /** 🚪🔒 Put this door's leaves straight to shut, dropping any slide in
+   *  flight (and its callback). For the airlock: a door the join opened behind
+   *  the seal must be shut again before the player is staged in front of it. */
+  public snapDoorShut(doorId: string): void {
+    const group = this.doorObjects.get(doorId);
+    const left = group?.getObjectByName("leftLeaf");
+    const right = group?.getObjectByName("rightLeaf");
+    if (!left || !right) return;
+    this.slideAnims.delete(doorId);
+    left.position.x = -DOOR_LEAF_SHUT_OFFSET;
+    right.position.x = DOOR_LEAF_SHUT_OFFSET;
+    this.doorApertureListener?.();
   }
 
   /**

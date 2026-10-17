@@ -44,7 +44,7 @@ import {
 // 🕹️ Shared arcade games: their pad bytes ride lane kind 1 as a subtype.
 import { routeArcadeTick, setArcadeSender } from "./arcadeNesSession";
 import { isArcadeTickFlags } from "./arcadeNet";
-import { MultiScaleZoomView } from "./zoom";
+import { MultiScaleZoomView, setCameraModeLock } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
 import { deviceFocus, isDeviceFocusActive } from "./deviceFocus";
@@ -3602,6 +3602,12 @@ interface RoomSwapChoreography {
    *  transit lights the vestibule 'fault' and walks back in; the beam-in has
    *  nothing to restage (the avatar never moved). */
   fail: () => void;
+  /** 🚪🔒 Airlock crossing: seal the player in the vestibule INSTEAD of the
+   *  fade (true when sealed; false falls back to the fade). */
+  seal?: () => Promise<boolean>;
+  /** …and open the seal again: after `arrive`, or behind the fade on a
+   *  failure. */
+  unseal?: () => void;
 }
 
 /**
@@ -3623,6 +3629,7 @@ async function performRoomSwap(
   // memory, but joinRoom(target) overwrites it — this is the way back.
   const originalBoot = activeBootstrap;
   let leftOriginalRoom = false;
+  let sealed = false;
   try {
     const imported = decodeBootstrapInput(seedString);
     if (!imported) {
@@ -3632,7 +3639,10 @@ async function performRoomSwap(
     // Rooms WE minted this session (PROVISION NEW MODULE) are first-entries
     // into a fresh unowned room — claim the defaults; everything else joins.
     const claiming = mintedRoomIds.has(target.roomId);
-    await transitFadeTo(true);
+    // 🚪🔒 Both doors shut around the player: the swap runs behind the seal,
+    // with no fade. Anything else is covered by the curtain as before.
+    sealed = (await choreography.seal?.().catch(() => false)) === true;
+    if (!sealed) await transitFadeTo(true);
     // Swap watchdog (review fix F3): a stalled leave/join would otherwise
     // hold the opaque curtain forever with all input dead. The timeout
     // throws into the catch below, whose recovery path already handles a
@@ -3688,13 +3698,23 @@ async function performRoomSwap(
     // Any repair the arrival walk-in depends on (birth-door healing) runs
     // BEFORE the avatar is staged, so completeAdapterArrival finds the door.
     choreography.beforeArrive?.();
-    // Stage the avatar behind the opaque curtain.
+    // Stage the avatar behind the opaque curtain (or the seal).
     choreography.arrive();
-    await transitFadeTo(false);
+    if (sealed) {
+      sealed = false;
+      choreography.unseal?.();
+    } else {
+      await transitFadeTo(false);
+    }
     return "ok";
   } catch (err) {
     console.warn("Room swap failed — restoring the departure room:", err);
     await transitFadeTo(true); // no-op visually if already opaque
+    // 🚪🔒 The curtain is down: the seal can open behind it.
+    if (sealed) {
+      sealed = false;
+      choreography.unseal?.();
+    }
     let stranded = false;
     if (leftOriginalRoom) {
       // Tear down whatever half-open session the failed join left behind
@@ -3854,6 +3874,9 @@ async function transitTo(
       : (passSeed(depRoomId) ?? null)
     : null;
 
+  const airlockEligible =
+    multiScaleZoom?.getLevel() === 1 &&
+    readDoorPolicy(departureDoorId).passage === "public";
   const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
     // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
     // data loss, or the doorless claim that replaced the lobby-contamination
@@ -3902,6 +3925,16 @@ async function transitTo(
         depLateral,
       ),
     fail: () => world.failAdapterTransit(departureDoorId),
+    // 🚪🔒 The airlock crossing (owner request): in first person, through a
+    // public door, straight or bent tube, the room is swapped while both
+    // doors are shut, with no fade. Read now, while the departure room's
+    // policy is still the one bound.
+    ...(airlockEligible
+      ? {
+          seal: () => world.sealAirlock(departureDoorId, () => multiScaleZoom?.isFirstPersonSettled() === true),
+          unseal: () => world.unsealAirlock(),
+        }
+      : {}),
   });
   if (result instanceof Error) {
     showHint("Dock seal failed.");
@@ -10123,9 +10156,13 @@ function updateHUDP2P(status: string, color: string) {
 function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
+  // 🚪🔒 Sealed in the airlock, the view stays first person.
+  setCameraModeLock(() => world.getAirlockScene() !== null);
   multiScaleZoom.mount(document.body);
   world.onFirstPersonSeat = (faceAngle) => multiScaleZoom?.requestFirstPerson(faceAngle);
   world.onFirstPersonArrival = (yaw) => multiScaleZoom?.faceFirstPersonHeading(yaw);
+  world.onFirstPersonSteer = (yaw, dt) => multiScaleZoom?.steerFirstPersonHeading(yaw, dt);
+  world.getFirstPersonHeading = () => multiScaleZoom?.getFirstPersonHeading() ?? null;
   world.onRequestRoomView = (onReady) => multiScaleZoom?.requestRoomView(onReady);
   (window as any).multiScaleZoom = multiScaleZoom;
 }
@@ -10629,6 +10666,8 @@ function findArcadeControl(scene: THREE.Scene): { deviceId: string; control: "se
 
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
+  // 🚪🔒 Sealed in the airlock the room on screen is a stand-in: nothing to click.
+  if (world.getAirlockScene()) return;
 
   // ── First-person pointer-lock click model (#49): the click paired with the
   //    mousedown that freed the cursor from pointer lock is swallowed — its
@@ -11123,7 +11162,11 @@ function animate() {
   // Render — camera stays locked except for the rig's 45° view detents. In
   // space the far pass draws the planet and distant traffic behind the
   // station (farOrbitView.ts); elsewhere this is one plain render.
-  renderWithFarPass(renderer, scene, camera);
+  // 🚪🔒 While the airlock is sealed only the closed vestibule is drawn: the
+  // room is being swapped behind it.
+  const airlock = world.getAirlockScene();
+  if (airlock) renderer.render(airlock, camera);
+  else renderWithFarPass(renderer, scene, camera);
 }
 
 /**
