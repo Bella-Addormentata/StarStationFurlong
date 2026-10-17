@@ -39,10 +39,13 @@
 //!     and one of them must be fresh (a pin or the introducer), so a poisoned
 //!     store cannot make an eclipse stick. One source holds at most
 //!     [`PER_SOURCE_CAP`] of the [`MAX_CONNS`] connections, and a full pool
-//!     that cannot form a pair lets a redundant connection go for a candidate
-//!     from a source it lacks. A stored peer that disagrees with a verdict,
-//!     or with a pin, is evicted; so is a public peer whose announced peak
-//!     lags the furthest one by more than [`MAX_PEAK_LAG`] blocks.
+//!     that cannot form a pair lets a connection go (a redundant one first,
+//!     never a pin) for a candidate whose source AND network group would
+//!     complete one. A stored peer that disagrees with a verdict, or with a
+//!     pin, is evicted; so is a public peer whose announced peak lags the
+//!     furthest one by more than [`MAX_PEAK_LAG`] blocks. A peer that stops
+//!     answering, or whose connection drops, returns to the queue and is
+//!     dialled again after [`RECONNECT_AFTER`]; pins keep their own retry.
 //!   - Every connection passes the header‑0 genesis binding before it counts
 //!     (`chia_peer.rs`, §14 (4)); a peak announced more than
 //!     [`crate::chia_peer::PEAK_STALE`] ago is checked against the chain
@@ -80,7 +83,7 @@ use futures_util::future::join_all;
 use rand::seq::SliceRandom;
 
 use crate::chia_chain::{ChainAccess, ChainError, CoinListing, CoinRecord, PuzzleAndSolution};
-use crate::chia_peer::{canonical, Group, Network, Peak, PeerConn, Source, CONNECT_TIMEOUT, PEAK_STALE, PEAK_WAIT};
+use crate::chia_peer::{canonical, group_of, Group, Network, Peak, PeerConn, Source, CONNECT_TIMEOUT, PEAK_STALE, PEAK_WAIT};
 
 /// Known-good public peers, kept across runs (beside the node's other files).
 pub const STORE_FILE: &str = "chia_peers.json";
@@ -98,6 +101,9 @@ pub const MAX_ROUNDS: usize = 4;
 pub const RETRY_AFTER: Duration = Duration::from_secs(600);
 /// How long a pin that failed is left alone (its owner may be restarting it).
 pub const PIN_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// How long a public peer that stopped answering, or whose connection dropped,
+/// waits in the queue before it is dialled again (a brief outage, not a fault).
+pub const RECONNECT_AFTER: Duration = Duration::from_secs(30);
 /// How often the introducer is asked again while peers are wanted.
 pub const INTRODUCE_EVERY: Duration = Duration::from_secs(1800);
 /// How soon it is asked again after a lookup that named nobody (DNS down, the
@@ -296,7 +302,7 @@ impl Lane {
     /// The peers a `trust` verdict is taken from, dialling as needed.
     async fn peers_for(&self, trust: Trust) -> Result<Vec<Arc<PeerConn>>, ChainError> {
         let mut state = self.state.lock().await;
-        state.conns.retain(|c| c.alive());
+        self.reap(&mut state);
         let pinned = !self.pins.is_empty();
         for _ in 0..MAX_ROUNDS {
             // A pin is dialled BEFORE any public peer is accepted, and again
@@ -359,7 +365,20 @@ impl Lane {
             eprintln!("⛓️ chain peers: {} ({}) let go: lags {behind} blocks behind the furthest peer", peer.addr(), peer.source().label());
             state.gossiped.remove(&peer.addr());
             state.cooling.insert(peer.addr(), until);
+            push_candidates(state, vec![Candidate { addr: peer.addr(), source: peer.source() }]);
             close_later(peer);
+        }
+    }
+
+    /// Connections that died on their own (the peer closed, the reader
+    /// failed) leave the pool and return to the queue, to be dialled again
+    /// after [`RECONNECT_AFTER`].
+    fn reap(&self, state: &mut LaneState) {
+        let (alive, dead): (Vec<Arc<PeerConn>>, Vec<Arc<PeerConn>>) = state.conns.drain(..).partition(|c| c.alive());
+        state.conns = alive;
+        for peer in dead {
+            state.gossiped.remove(&peer.addr());
+            requeue(state, &peer, RECONNECT_AFTER);
         }
     }
 
@@ -397,18 +416,28 @@ impl Lane {
             return;
         }
         // Outside pin-only mode one place is kept for the public peer the
-        // agreement needs, however many addresses the pins resolve to.
+        // agreement needs, however many addresses the pins resolve to. The cap
+        // is on LIVE pin connections, not on the addresses tried: a batch that
+        // fails is followed by the next, so a reachable address listed behind
+        // unreachable ones is still reached in this call.
         let pin_cap = if self.pin_only { MAX_CONNS } else { MAX_CONNS - 1 };
-        let pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
-        targets.truncate(pin_cap.saturating_sub(pins_up));
-        while state.conns.len() + targets.len() > MAX_CONNS {
-            let Some(i) = state.conns.iter().rposition(|c| c.source() != Source::Pin) else { break };
-            let peer = state.conns.remove(i);
-            eprintln!("⛓️ chain peers: {} ({}) let go: making room for a pin", peer.addr(), peer.source().label());
-            state.gossiped.remove(&peer.addr());
-            close_later(peer);
+        let mut targets: VecDeque<Candidate> = targets.into();
+        loop {
+            let pins_up = state.conns.iter().filter(|c| c.source() == Source::Pin).count();
+            let want = pin_cap.saturating_sub(pins_up).min(targets.len());
+            if want == 0 {
+                break;
+            }
+            let batch: Vec<Candidate> = targets.drain(..want).collect();
+            while state.conns.len() + batch.len() > MAX_CONNS {
+                let Some(i) = state.conns.iter().rposition(|c| c.source() != Source::Pin) else { break };
+                let peer = state.conns.remove(i);
+                eprintln!("⛓️ chain peers: {} ({}) let go: making room for a pin", peer.addr(), peer.source().label());
+                state.gossiped.remove(&peer.addr());
+                close_later(peer);
+            }
+            self.dial_batch(state, batch, PIN_RETRY_AFTER).await;
         }
-        self.dial_batch(state, targets, PIN_RETRY_AFTER).await;
         state.pin_retry_after = if state.conns.iter().any(|c| c.source() == Source::Pin) { None } else { Some(Instant::now() + PIN_RETRY_AFTER) };
     }
 
@@ -499,20 +528,33 @@ impl Lane {
             }
         }
         let have: HashSet<Source> = state.conns.iter().map(|c| c.source()).collect();
+        let groups: HashSet<Group> = state.conns.iter().map(|c| c.group()).collect();
+        let mut first: Option<Candidate> = None;
         if state.conns.len() >= MAX_CONNS {
+            // A full pool that cannot form a pair makes room for the first
+            // candidate that would complete one, by source AND network group,
+            // letting go a connection the pair can spare (a redundant one
+            // first, never a pin); that candidate is dialled first.
             let facts: Vec<(Source, Group)> = state.conns.iter().map(|c| (c.source(), c.group())).collect();
-            let wanted = ready.iter().any(|c| !have.contains(&c.source));
-            let spare = if wanted && self.choose(state, Trust::Agreed).is_none() { redundant(&facts) } else { None };
-            match spare {
-                Some(i) => {
+            let pinned = !self.pins.is_empty();
+            let swap = if self.choose(state, Trust::Agreed).is_none() {
+                ready.iter().enumerate().find_map(|(ci, c)| {
+                    replaceable(&facts, (c.source, group_of(c.addr)), pinned, self.pin_only).map(|i| (ci, i))
+                })
+            } else {
+                None
+            };
+            match swap {
+                Some((ci, i)) => {
                     let peer = state.conns.remove(i);
                     eprintln!(
-                        "⛓️ chain peers: {} ({}) let go: making room for a peer from another source",
+                        "⛓️ chain peers: {} ({}) let go: making room for a peer that completes a pair",
                         peer.addr(),
                         peer.source().label()
                     );
                     state.gossiped.remove(&peer.addr());
                     close_later(peer);
+                    first = Some(ready.remove(ci));
                 }
                 None => {
                     state.candidates = ready.into_iter().chain(later).collect();
@@ -520,7 +562,10 @@ impl Lane {
                 }
             }
         }
-        ready.sort_by_key(|c| (have.contains(&c.source), !c.source.is_fresh()));
+        ready.sort_by_key(|c| (have.contains(&c.source), groups.contains(&group_of(c.addr)), !c.source.is_fresh()));
+        if let Some(cand) = first {
+            ready.insert(0, cand);
+        }
         let mut per_source: HashMap<Source, usize> = HashMap::new();
         for c in &state.conns {
             *per_source.entry(c.source()).or_default() += 1;
@@ -577,6 +622,11 @@ impl Lane {
                     eprintln!("⛓️ chain peers: {} ({}): {e:#}", cand.addr, cand.source.label());
                     state.cooling.insert(cand.addr, now + cool_for);
                     self.forget(state, cand.addr);
+                    if cand.source != Source::Pin {
+                        // Kept for a later try once the cooldown passes; pins
+                        // are resolved and retried on their own schedule.
+                        push_candidates(state, vec![cand]);
+                    }
                 }
             }
         }
@@ -640,11 +690,14 @@ impl Lane {
         }
     }
 
-    /// Drop one connection that stopped answering; it is dialled again later.
+    /// Drop one connection that stopped answering; it returns to the queue
+    /// and is dialled again after [`RECONNECT_AFTER`] (a pin on its own
+    /// schedule).
     async fn drop_conn(&self, peer: &Arc<PeerConn>) {
         let mut state = self.state.lock().await;
         state.conns.retain(|c| c.addr() != peer.addr());
         state.gossiped.remove(&peer.addr());
+        requeue(&mut state, peer, RECONNECT_AFTER);
         close_later(peer.clone());
     }
 
@@ -919,14 +972,28 @@ pub(crate) fn live_verdict(outcomes: &[AckOutcome]) -> Result<bool, ChainError> 
 /// Whether a full node's reason for refusing a bundle says the bundle can
 /// NEVER land (an input already spent, a condition that fails, a bad
 /// signature, a malformed spend), as against its own policy or state (a fee
-/// too low for a full mempool, "seen before", not synced). The names are
-/// chia-blockchain's `Err` codes as `TransactionAck.error` spells them; an
-/// unknown reason is not final.
+/// too low for a full mempool, "seen before", not synced, a timelock not yet
+/// reached). The names are chia-blockchain's `Err` codes as
+/// `TransactionAck.error` spells them; an unknown reason is not final.
 pub(crate) fn refusal_is_final(reason: &str) -> bool {
     const FINAL: &[&str] = &[
         "DOUBLE_SPEND",
         "UNKNOWN_UNSPENT",
-        "ASSERT_",
+        // Assertions on the spend's own coins and announcements fail for good.
+        "ASSERT_MY_COIN_ID_FAILED",
+        "ASSERT_MY_PARENT_ID_FAILED",
+        "ASSERT_MY_PUZZLEHASH_FAILED",
+        "ASSERT_MY_AMOUNT_FAILED",
+        "ASSERT_MY_BIRTH_SECONDS_FAILED",
+        "ASSERT_MY_BIRTH_HEIGHT_FAILED",
+        "ASSERT_COIN_ANNOUNCEMENT_FAILED",
+        "ASSERT_PUZZLE_ANNOUNCEMENT_FAILED",
+        "ASSERT_CONCURRENT_SPEND_FAILED",
+        "ASSERT_CONCURRENT_PUZZLE_FAILED",
+        "ASSERT_EPHEMERAL_FAILED",
+        // A "before" timelock that failed is past for good; a plain timelock
+        // (ASSERT_SECONDS_*, ASSERT_HEIGHT_*) can still pass and is NOT here.
+        "ASSERT_BEFORE_",
         "MINTING_COIN",
         "RESERVE_FEE_CONDITION_FAILED",
         "COIN_AMOUNT_",
@@ -981,16 +1048,33 @@ pub(crate) fn pick_agreed(peers: &[(Source, Group)], pinned: bool, pin_only: boo
     None
 }
 
-/// Among connected peers, one whose source another connection shares (the
-/// newest such public one), so letting it go loses the pool no source an
-/// agreed pair could use. `None` when every source is held once, or only by
-/// pins.
-pub(crate) fn redundant(facts: &[(Source, Group)]) -> Option<usize> {
+/// In a full pool that cannot form an agreed pair, the connection to let go
+/// so that `cand`, once connected, completes one: among the connections that
+/// are not pins, a redundant one first (its source held twice), newest
+/// first, the first whose removal makes [`pick_agreed`] succeed with `cand` in
+/// its place. `None` when no single swap would help.
+pub(crate) fn replaceable(facts: &[(Source, Group)], cand: (Source, Group), pinned: bool, pin_only: bool) -> Option<usize> {
     let mut held: HashMap<Source, usize> = HashMap::new();
     for (source, _) in facts {
         *held.entry(*source).or_default() += 1;
     }
-    facts.iter().rposition(|(source, _)| *source != Source::Pin && held[source] >= 2)
+    let mut order: Vec<usize> = (0..facts.len()).rev().filter(|&i| facts[i].0 != Source::Pin).collect();
+    order.sort_by_key(|&i| held[&facts[i].0] < 2);
+    order.into_iter().find(|&i| {
+        let mut trial: Vec<(Source, Group)> = facts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, f)| *f).collect();
+        trial.push(cand);
+        pick_agreed(&trial, pinned, pin_only).is_some()
+    })
+}
+
+/// Put a public peer whose connection is gone back in the queue, not to be
+/// dialled before `after`. Pins are resolved afresh on their own schedule.
+fn requeue(state: &mut LaneState, peer: &PeerConn, after: Duration) {
+    if peer.source() == Source::Pin {
+        return;
+    }
+    state.cooling.insert(peer.addr(), Instant::now() + after);
+    push_candidates(state, vec![Candidate { addr: peer.addr(), source: peer.source() }]);
 }
 
 /// Close a connection off the lane's lock: the websocket close is bounded,
@@ -1307,7 +1391,7 @@ impl ChainAccess for PeerLane {
 mod tests {
     use super::*;
     use crate::chia_peer::mock::{header_at, reply, spawn, Handler, MockNode};
-    use crate::chia_peer::{group_of, tls_client_config};
+    use crate::chia_peer::tls_client_config;
     use chia_protocol::{Coin, Message, NodeType, Program, PuzzleSolutionResponse, TimestampedPeerInfo};
     use chia_traits::Streamable;
     use std::sync::{LazyLock, Mutex};
@@ -1680,19 +1764,94 @@ mod tests {
     }
 
     #[test]
-    fn a_redundant_connection_shares_its_source_and_is_never_a_pin() {
-        let g = |n: u16| group_of(SocketAddr::from(([127, 0, 0, 1], n)));
-        assert_eq!(redundant(&[(Source::Introducer, g(1)), (Source::Store, g(2))]), None);
-        assert_eq!(redundant(&[(Source::Introducer, g(1)), (Source::Introducer, g(2)), (Source::Store, g(3))]), Some(1));
-        assert_eq!(redundant(&[(Source::Pin, g(1)), (Source::Pin, g(2))]), None);
-        assert_eq!(redundant(&[(Source::Gossip, g(1)), (Source::Pin, g(2)), (Source::Gossip, g(3))]), Some(2));
+    fn a_full_pool_makes_room_for_the_candidate_that_completes_a_pair() {
+        use Source::{Gossip as G, Introducer as I, Pin as P, Store as S};
+        // Distinct IPv4 /16s.
+        let g = |n: u8| group_of(SocketAddr::from(([10, n, 0, 1], 58444)));
+        // Three introducer peers and a gossip peer in one /16: a gossip peer
+        // from another /16 completes a pair once a redundant introducer goes.
+        let one_group = [(I, g(1)), (I, g(1)), (I, g(1)), (G, g(1))];
+        assert_eq!(replaceable(&one_group, (G, g(2)), false, false), Some(2), "the newest redundant introducer");
+        assert_eq!(replaceable(&one_group, (I, g(2)), false, false), Some(2), "an introducer from another group pairs with the gossip peer");
+        assert_eq!(replaceable(&one_group, (G, g(1)), false, false), None, "the same group helps nobody");
+        // A pin and three introducer peers in its /16: room for one elsewhere.
+        let pinned = [(P, g(1)), (I, g(1)), (I, g(1)), (I, g(1))];
+        assert_eq!(replaceable(&pinned, (I, g(2)), true, false), Some(3));
+        assert_eq!(replaceable(&pinned, (S, g(1)), true, false), None);
+        // Every source once, all in one group: the newest public peer goes.
+        let spread = [(P, g(1)), (I, g(1)), (G, g(1)), (S, g(1))];
+        assert_eq!(replaceable(&spread, (G, g(2)), true, false), Some(3));
+        // Pins are never the ones let go.
+        assert_eq!(replaceable(&[(P, g(1)), (P, g(2))], (I, g(3)), true, false), None);
+    }
+
+    #[tokio::test]
+    async fn pins_behind_unreachable_addresses_are_still_reached() {
+        let mut pins = Vec::new();
+        for _ in 0..3 {
+            pins.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string());
+        }
+        let healthy = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        pins.push(healthy.addr.to_string());
+        let public = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let mixed = lane(vec![(public.addr, Source::Introducer)], pins.clone(), false, None);
+        assert_eq!(PeerLane::new(mixed.clone(), Trust::Agreed).peak_height().await.unwrap(), 100, "the fourth pin address is reached in the same call");
+        assert_eq!(mixed.live_conns().await.iter().filter(|c| c.source() == Source::Pin).count(), 1);
+        // Pin-only mode with the reachable address fifth in the list.
+        let mut five = pins;
+        five.insert(0, tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string());
+        let only = lane(vec![], five, true, None);
+        assert_eq!(PeerLane::new(only.clone(), Trust::Agreed).peak_height().await.unwrap(), 100);
+        assert_eq!(only.live_conns().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn peers_that_drop_out_are_dialled_again_after_a_cooldown() {
+        // Two peers answer, then their connections die, as in a brief outage.
+        // With nothing left to discover the lane still finds them again once
+        // the cooldown passes, because dropped peers return to the queue.
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        for conn in lane.live_conns().await {
+            conn.close().await;
+        }
+        let err = money.peak_height().await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        {
+            let state = lane.state.lock().await;
+            assert_eq!(state.candidates.len(), 2, "both peers are queued again");
+            assert!(state.candidates.iter().all(|c| state.cooling.contains_key(&c.addr)), "and cooling");
+        }
+        lane.expire_pin_cooldown().await;
+        assert_eq!(money.peak_height().await.unwrap(), 100, "dialled again once the cooldown passed");
+        assert_eq!(lane.live_conns().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_refused_the_dial_keeps_its_place_in_the_queue() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(closed, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert!(money.peak_height().await.is_err());
+        assert!(lane.state.lock().await.candidates.iter().any(|c| c.addr == closed), "the failed dial keeps its place");
+        let _late = crate::chia_peer::mock::spawn_on(closed, "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![], (1, None), vec![])).await;
+        lane.expire_pin_cooldown().await;
+        assert_eq!(money.peak_height().await.unwrap(), 100, "dialled again once it came up");
     }
 
     #[test]
     fn only_a_final_refusal_kills_a_spend() {
         assert!(refusal_is_final("203.0.113.5:58444: DOUBLE_SPEND"));
         assert!(refusal_is_final("x: ASSERT_MY_COIN_ID_FAILED"));
+        assert!(refusal_is_final("x: ASSERT_COIN_ANNOUNCEMENT_FAILED"));
+        assert!(refusal_is_final("x: ASSERT_BEFORE_HEIGHT_ABSOLUTE_FAILED"), "a 'before' timelock that failed is past for good");
         assert!(refusal_is_final("x: BAD_AGGREGATE_SIGNATURE"));
+        assert!(!refusal_is_final("x: ASSERT_HEIGHT_RELATIVE_FAILED"), "a timelock can still pass");
+        assert!(!refusal_is_final("x: ASSERT_SECONDS_ABSOLUTE_FAILED"));
         assert!(!refusal_is_final("x: INVALID_FEE_TOO_CLOSE_TO_ZERO"));
         assert!(!refusal_is_final("x: ALREADY_INCLUDING_TRANSACTION"));
         assert!(!refusal_is_final("x: MEMPOOL_CONFLICT"));
