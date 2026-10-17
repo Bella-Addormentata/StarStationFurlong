@@ -44,7 +44,10 @@
 //!     `RequestPeers` gossip from a connected
 //!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed),
 //!     and the store of known‑good peers kept in `chia_peers.json`
-//!     across runs. Two agreeing
+//!     across runs; whatever the three name, only a public, internet-routable
+//!     address is queued (the node's own address judge, as for a presence
+//!     record), so a stranger's word never has the node probe its own
+//!     network, and a private address reaches the lane as a pin alone. Two agreeing
 //!     peers must come from DISTINCT sources and distinct network groups
 //!     (IPv4 /16, IPv6 /32; an IPv4‑mapped IPv6 address is its IPv4 address),
 //!     and one of them must be fresh (a pin or the introducer), so a poisoned
@@ -55,9 +58,11 @@
 //!     item limit, does not read as a disagreement; a coin only the peer
 //!     ahead has seen, or one a peer has not got to yet (a page the peer
 //!     ahead cut short, a capped coin-state lookup), is unknown rather than
-//!     absent and leaves the lookup incomplete; a cursor goes out only once
-//!     every peer has shown the header it names; and a page is dated by a
-//!     peak that stood still across the request, header and height alike.
+//!     absent and leaves the lookup incomplete; no listing or coin-state
+//!     lookup counts, cursor or none, until every peer standing above the
+//!     height judged has shown the header there; and every page, finished or
+//!     cut, is dated by a peak that stood still across the request, header
+//!     and height alike.
 //!     One source holds at most
 //!     [`PER_SOURCE_CAP`] of the [`MAX_CONNS`] connections, and a full pool
 //!     that cannot form a pair lets a connection go (a redundant one first,
@@ -224,6 +229,12 @@ struct LaneState {
     gossiped: HashMap<SocketAddr, Option<Instant>>,
     store_loaded: bool,
     known: Vec<StoredPeer>,
+    /// Tests only: judge discovered addresses as the node does, admitting
+    /// public, internet-routable ones alone. Off, every address a test's mock
+    /// full node or pure case names is admitted, loopback and documentation
+    /// ranges included.
+    #[cfg(test)]
+    public_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1393,10 +1404,17 @@ fn close_later(peer: Arc<PeerConn>) {
 /// until gossip adds another), so a second source stays to pair with. A full
 /// queue admits a newcomer in place of the queued address that has failed the
 /// most dials, so dead addresses cannot shut fresh ones out; a queue full of
-/// addresses that never failed keeps what it has.
+/// addresses that never failed keeps what it has. Whatever named it, an
+/// address off the public internet (loopback, LAN, link-local, carrier-grade
+/// NAT: [`public`]) is set aside, never queued; only a pin may name one.
 fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
     for cand in &mut new {
         cand.addr = canonical(cand.addr);
+    }
+    let named = new.len();
+    new.retain(|c| admitted(state, c.addr));
+    if new.len() < named {
+        eprintln!("⛓️ chain peers: {} of the {named} addresses named are not public and are set aside", named - new.len());
     }
     for i in 0..new.len() {
         let cand = Candidate { ..new[i] };
@@ -1440,6 +1458,34 @@ fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
             }
         }
     }
+}
+
+/// Is a discovered address one the lane may dial? Only a public,
+/// internet-routable one ([`crate::ipv4_is_public`], [`crate::ipv6_is_public`]:
+/// the judges a presence record's addresses pass). The introducer, a
+/// gossiping peer and the store name addresses the lane cannot vouch for, and
+/// a loopback, LAN, link-local or carrier-grade NAT address among them would
+/// have the node probe its own network, or the operator's, on a stranger's
+/// word. A pin is the operator's own word: resolved and dialled by
+/// [`Lane::dial_pins`], it never passes here. (A mapped IPv6 address has been
+/// made its IPv4 address by [`canonical`] first; both judges reject it alike.)
+fn public(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => crate::ipv4_is_public(ip),
+        IpAddr::V6(ip) => crate::ipv6_is_public(ip),
+    }
+}
+
+/// [`public`], unless the test admits every address ([`LaneState::public_only`]
+/// off: its mock full nodes listen on loopback).
+#[cfg(test)]
+fn admitted(state: &LaneState, addr: SocketAddr) -> bool {
+    !state.public_only || public(addr)
+}
+
+#[cfg(not(test))]
+fn admitted(_: &LaneState, addr: SocketAddr) -> bool {
+    public(addr)
 }
 
 /// A pin as typed: `ip:port`, a bare IP (the network's port), or a host name
@@ -1542,7 +1588,8 @@ pub(crate) fn records_from(states: Vec<CoinState>, include_spent: bool, min_heig
 /// request started after, `None` from genesis), the header hash there,
 /// whether it has more to say, `knowledge`, the height the peer's view stood
 /// at when it made the page (`height` for a finished page, its announced
-/// peak, steady across the request, for one cut at the item limit), and for
+/// peak for one cut at the item limit; either way a peak that stood still
+/// across the request, header and height alike), and for
 /// a coin-state lookup `pending`, the ids the peer never got to.
 #[derive(Debug, Clone)]
 pub(crate) struct Page {
@@ -1555,13 +1602,14 @@ pub(crate) struct Page {
     pub pending: Vec<Bytes32>,
 }
 
-/// What settling the peers' pages gives: the listing; the cursor's height
-/// and header when it hands one out; and then the pages (by index) whose
-/// peer stands above that height and has not shown the header there yet, to
-/// be asked for it before the cursor is trusted.
+/// What settling the peers' pages gives: the listing; the height the pages
+/// were judged at (the lowest among them) and the header there; and the
+/// pages (by index) whose peer stands above that height and has not shown
+/// the header there yet, to be asked for it before the listing is trusted,
+/// cursor or none ([`confirmed`]).
 pub(crate) struct Settled {
     pub listing: CoinListing,
-    pub cursor_at: Option<(u32, Bytes32)>,
+    pub at: (u32, Bytes32),
     pub unverified: Vec<usize>,
 }
 
@@ -1581,8 +1629,9 @@ pub(crate) struct Settled {
 /// coin is left out and the listing comes back cut short with no cursor,
 /// since a cursor past it would lose the coin on that peer's word alone. Any
 /// other absence is a disagreement, as is a differing record or another
-/// header at the lowest height; a page above that height is to show the
-/// header there ([`Settled::unverified`]) before a cursor goes out. The
+/// header at the lowest height; and a page above that height is to show the
+/// header there ([`Settled::unverified`]) before the listing counts, cursor or
+/// none, since a peer on another fork may hold the very same coins. The
 /// listing is complete when a page at the lowest height is finished and
 /// nothing was left out above the lowest knowledge: a coin only the peer
 /// ahead has seen leaves the listing INCOMPLETE (cut short, no cursor), not
@@ -1609,31 +1658,44 @@ pub(crate) fn settle_pages(pages: &[Page], include_spent: bool, min_height: Opti
         })
         .collect();
     let (records, unknown) = agreed(&lists, |i, _| !pages[i].finished && pages[i].knowledge > knowledge)?;
-    if unknown {
-        let listing = CoinListing { records, truncated: true, next_cursor: None };
-        return Some(Settled { listing, cursor_at: None, unverified: vec![] });
-    }
-    if !finished {
-        let unverified = pages.iter().enumerate().filter(|(_, p)| p.height > height).map(|(i, _)| i).collect();
-        let listing = CoinListing { records, truncated: true, next_cursor: Some(encode_cursor(height, header_hash)) };
-        return Some(Settled { listing, cursor_at: Some((height, header_hash)), unverified });
-    }
-    Some(Settled { listing: CoinListing { records, truncated: hidden, next_cursor: None }, cursor_at: None, unverified: vec![] })
+    let listing = if unknown {
+        CoinListing { records, truncated: true, next_cursor: None }
+    } else if !finished {
+        CoinListing { records, truncated: true, next_cursor: Some(encode_cursor(height, header_hash)) }
+    } else {
+        CoinListing { records, truncated: hidden, next_cursor: None }
+    };
+    Some(Settled { listing, at: (height, header_hash), unverified: above(pages, height) })
+}
+
+/// The pages (by index) whose peer stands above `height`: to show the header
+/// there before the verdict counts.
+fn above(pages: &[Page], height: u32) -> Vec<usize> {
+    pages.iter().enumerate().filter(|(_, p)| p.height > height).map(|(i, _)| i).collect()
 }
 
 /// [`settle_pages`] for coin-state lookups, which carry no cursor and whose
-/// answers are the coins' states as the peer knew them at `knowledge`: judged
-/// as of the lowest knowledge; a coin a peer never got to ([`Page::pending`],
-/// its lookup capped) is unknown there, not absent, and left out; cut short
-/// when any peer's lookup was, or when a coin created above that knowledge
-/// had to be left out.
-pub(crate) fn settle_states(pages: &[Page], include_spent: bool) -> Option<CoinListing> {
+/// answers are the coins' states as the peer knew them at `knowledge`, under
+/// the peak it announced there: judged as of the lowest knowledge, where the
+/// peers must stand on one header (another header at that height is a
+/// disagreement, and a peer above it is to show the header it serves there,
+/// [`Settled::unverified`], before the lookup counts); a coin a peer never
+/// got to ([`Page::pending`], its lookup capped) is unknown there, not
+/// absent, and left out; cut short when any peer's lookup was, or when a
+/// coin created above that knowledge had to be left out.
+pub(crate) fn settle_states(pages: &[Page], include_spent: bool) -> Option<Settled> {
+    let low = pages.iter().min_by_key(|p| p.height)?;
+    let (height, header_hash) = (low.height, low.header_hash);
+    if pages.iter().any(|p| p.height == height && p.header_hash != header_hash) {
+        return None;
+    }
     let knowledge = pages.iter().map(|p| p.knowledge).min()?;
     let finished = pages.iter().all(|p| p.finished);
     let hidden = hides_a_coin(pages, knowledge);
     let lists: Vec<Vec<CoinRecord>> = pages.iter().map(|p| records_from(as_of(p.states.clone(), knowledge), include_spent, None)).collect();
     let (records, unknown) = agreed(&lists, |i, id| pages[i].pending.contains(id))?;
-    Some(CoinListing { records, truncated: !finished || hidden || unknown, next_cursor: None })
+    let listing = CoinListing { records, truncated: !finished || hidden || unknown, next_cursor: None };
+    Some(Settled { listing, at: (height, header_hash), unverified: above(pages, height) })
 }
 
 /// The records every list gives alike, and whether any coin had to be left
@@ -1696,28 +1758,42 @@ fn as_of(states: Vec<CoinState>, height: u32) -> Vec<CoinState> {
         .collect()
 }
 
-/// Settle the peers' pages and, when a cursor goes out, have every peer that
-/// stands above its height show the header there: a peer on another fork
-/// with the same coins would otherwise hand the pair a cursor the other side
-/// rejects as a reorg one request later. Another header, or none, is a
-/// disagreement; a peer that does not answer leaves the verdict unanswered.
-async fn settle_listing(answers: Vec<(Arc<PeerConn>, Page)>, include_spent: bool, min_height: Option<u32>) -> Result<Option<CoinListing>, ChainError> {
-    let pages: Vec<Page> = answers.iter().map(|(_, p)| p.clone()).collect();
-    let Some(settled) = settle_pages(&pages, include_spent, min_height) else { return Ok(None) };
-    if let Some((height, hash)) = settled.cursor_at {
-        for i in settled.unverified {
-            let peer = &answers[i].0;
-            match peer.request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(height)).await {
-                Ok(Ok(answer)) if answer.header_block.header_hash() == hash => {}
-                Ok(_) => {
-                    eprintln!("⛓️ chain peers: {} does not have the header the listing cursor names at height {height}", peer.addr());
-                    return Ok(None);
-                }
-                Err(e) => return Err(ChainError::Unanswered(e)),
+/// Have every peer whose page stands above the height the pages were judged
+/// at show the header there, before any verdict counts: a peer on another
+/// fork holding the very same coins would otherwise pass as agreeing, and,
+/// when a cursor goes out, hand the pair one the other side rejects as a
+/// reorg one request later. Another header, or none, is a disagreement; a
+/// peer that does not answer leaves the verdict unanswered. A carrier's lone
+/// answer has nobody to ask.
+async fn confirmed(answers: &[(Arc<PeerConn>, Page)], settled: Settled) -> Result<Option<CoinListing>, ChainError> {
+    let (height, hash) = settled.at;
+    for i in settled.unverified {
+        let peer = &answers[i].0;
+        match peer.request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(height)).await {
+            Ok(Ok(answer)) if answer.header_block.header_hash() == hash => {}
+            Ok(_) => {
+                eprintln!("⛓️ chain peers: {} does not have the header at height {height} the other peers' pages stand on", peer.addr());
+                return Ok(None);
             }
+            Err(e) => return Err(ChainError::Unanswered(e)),
         }
     }
     Ok(Some(settled.listing))
+}
+
+/// Settle the peers' listing pages ([`settle_pages`]) and have the peers ahead
+/// show the header at the height judged ([`confirmed`]).
+async fn settle_listing(answers: Vec<(Arc<PeerConn>, Page)>, include_spent: bool, min_height: Option<u32>) -> Result<Option<CoinListing>, ChainError> {
+    let pages: Vec<Page> = answers.iter().map(|(_, p)| p.clone()).collect();
+    let Some(settled) = settle_pages(&pages, include_spent, min_height) else { return Ok(None) };
+    confirmed(&answers, settled).await
+}
+
+/// [`settle_listing`] for coin-state lookups ([`settle_states`]).
+async fn settle_names(answers: Vec<(Arc<PeerConn>, Page)>, include_spent: bool) -> Result<Option<CoinListing>, ChainError> {
+    let pages: Vec<Page> = answers.iter().map(|(_, p)| p.clone()).collect();
+    let Some(settled) = settle_states(&pages, include_spent) else { return Ok(None) };
+    confirmed(&answers, settled).await
 }
 
 /// One peer's listing under `keys` (puzzle hashes, read as hints too when
@@ -1775,44 +1851,50 @@ async fn listing_on(
             .await
             .map_err(ChainError::Unanswered)?;
         match page {
-            Ok(page) if page.is_finished => {
-                break Page {
-                    knowledge: page.height,
-                    states: page.coin_states,
-                    height: page.height,
-                    header_hash: page.header_hash,
-                    finished: true,
-                    since: previous,
-                    pending: vec![],
-                };
-            }
             Ok(page) => {
-                // A page cut at the item limit says nothing about how far the
+                // The peer's announced peak must stand still across the
+                // request, header and height alike, finished page or not. A
+                // page cut at the item limit says nothing about how far the
                 // peer's view reached; its announced peak does, if it stood
-                // still across the request, header and height alike (an
-                // announcement landing between the answer and this line would
-                // date the page a block late; a new block at the same height
-                // would mix two chains into one page).
+                // still (an announcement landing between the answer and this
+                // line would date the page a block late; a new block at the
+                // same height would mix two chains into one page). A finished
+                // page is dated by the peer's own word, the peak it names, and
+                // needs no announcement; but the node reads that peak before
+                // it queries its coins, so a peak that moved meanwhile may
+                // have put another chain's coins under the header named, and
+                // the page is asked for again.
                 let after = peer.peak_now();
-                match (before, after) {
-                    (Some(b), Some(a)) if b == a => {
-                        break Page {
-                            states: page.coin_states,
-                            height: page.height,
-                            header_hash: page.header_hash,
-                            finished: false,
-                            knowledge: a.height,
-                            since: previous,
-                            pending: vec![],
-                        };
-                    }
-                    (None, None) => return Err(unanswered(format!("{} announced no peak to date its listing by", peer.addr()))),
-                    _ => {
-                        attempts += 1;
-                        if attempts >= PEAK_SETTLE_ATTEMPTS {
-                            return Err(unanswered(format!("{}: its peak moved during each of {attempts} listing requests", peer.addr())));
+                if before == after {
+                    match after {
+                        _ if page.is_finished => {
+                            break Page {
+                                knowledge: page.height,
+                                states: page.coin_states,
+                                height: page.height,
+                                header_hash: page.header_hash,
+                                finished: true,
+                                since: previous,
+                                pending: vec![],
+                            };
                         }
+                        Some(peak) => {
+                            break Page {
+                                states: page.coin_states,
+                                height: page.height,
+                                header_hash: page.header_hash,
+                                finished: false,
+                                knowledge: peak.height,
+                                since: previous,
+                                pending: vec![],
+                            };
+                        }
+                        None => return Err(unanswered(format!("{} announced no peak to date its listing by", peer.addr()))),
                     }
+                }
+                attempts += 1;
+                if attempts >= PEAK_SETTLE_ATTEMPTS {
+                    return Err(unanswered(format!("{}: its peak moved during each of {attempts} listing requests", peer.addr())));
                 }
             }
             Err(reject) if from_header && reject.reason == RejectStateReason::Reorg => {
@@ -1956,10 +2038,7 @@ impl ChainAccess for PeerLane {
                     "coins by id",
                     self.trust,
                     move |peer| states_on(peer, net.clone(), names.clone()),
-                    move |answers: Vec<(Arc<PeerConn>, Page)>| {
-                        let pages: Vec<Page> = answers.into_iter().map(|(_, p)| p).collect();
-                        std::future::ready(Ok(settle_states(&pages, include_spent)))
-                    },
+                    move |answers| settle_names(answers, include_spent),
                 )
                 .await
         }
@@ -2096,6 +2175,12 @@ mod tests {
             let named: Vec<CoinState> = states.iter().filter(|s| ids.contains(&s.coin.coin_id())).cloned().collect();
             vec![reply(&RespondCoinState::new(ids, named))]
         })
+    }
+
+    /// How many headers a mock node was asked for: one at connect (the genesis
+    /// binding at height 0), then one per header it had to show.
+    fn headers_asked(node: &MockNode) -> usize {
+        node.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestBlockHeader).count()
     }
 
     fn lane(seeds: Vec<(SocketAddr, Source)>, pins: Vec<String>, pin_only: bool, store: Option<PathBuf>) -> Arc<Lane> {
@@ -2381,7 +2466,7 @@ mod tests {
         );
         assert!(first.truncated);
         assert_eq!(decode_cursor(first.next_cursor.as_deref().unwrap()).unwrap(), (92, header_at(92, genesis()).header_hash()));
-        assert!(a.seen.lock().unwrap().contains(&chia_protocol::ProtocolMessageTypes::RequestBlockHeader), "A was asked for the header at 92");
+        assert_eq!(headers_asked(&a), 2, "the binding at 0, then the header at 92");
         let rest = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, first.next_cursor).await.unwrap();
         assert_eq!(
             rest.records.iter().map(|r| (r.coin.amount, r.confirmed_block_index, r.spent)).collect::<Vec<_>>(),
@@ -2406,7 +2491,7 @@ mod tests {
         let money = PeerLane::new(lane.clone(), Trust::Agreed);
         let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
         assert!(err.to_string().contains("disagree"), "{err}");
-        assert!(a.seen.lock().unwrap().contains(&chia_protocol::ProtocolMessageTypes::RequestBlockHeader), "A was asked for the header at 92");
+        assert_eq!(headers_asked(&a), 2, "the binding at 0, then the header at 92");
         assert_eq!(lane.live_count().await, 0, "both public peers let go");
     }
 
@@ -2489,6 +2574,7 @@ mod tests {
         let settled = settle_pages(&[behind.clone(), ahead], true, None).unwrap();
         assert_eq!(amounts(&settled.listing), vec![(2, false), (1, false)]);
         assert!(!settled.listing.truncated && settled.listing.next_cursor.is_none());
+        assert_eq!((settled.at, settled.unverified), ((100, hash(100)), vec![1]), "complete, yet the peer ahead is to show the header at 100");
         // A coin only the peer ahead has seen: the listing is cut short, not complete without it.
         let newer = page(vec![state(1, 90, None), state(2, 80, None), state(3, 101, None)], 101, true, 101);
         let settled = settle_pages(&[behind.clone(), newer], true, None).unwrap();
@@ -2504,7 +2590,7 @@ mod tests {
         let settled = settle_pages(&[whole.clone(), cut.clone()], true, None).unwrap();
         assert_eq!(amounts(&settled.listing), vec![(2, true), (1, false)]);
         assert!(settled.listing.truncated);
-        assert_eq!(settled.cursor_at, Some((92, hash(92))));
+        assert_eq!(settled.at, (92, hash(92)));
         assert_eq!(settled.unverified, vec![0], "the finished peer stands above 92");
         // The same cut by a peer whose view stopped at 93, before the spend:
         // it lists coin 4 unspent, and the whole page, taken as of 93, agrees.
@@ -2523,7 +2609,8 @@ mod tests {
         let seen = page(vec![state(7, 100, None)], 100, true, 100);
         let unseen = page(vec![], 99, true, 99);
         let states = settle_states(&[seen, unseen], true).unwrap();
-        assert!(states.records.is_empty() && states.truncated && states.next_cursor.is_none());
+        assert!(states.listing.records.is_empty() && states.listing.truncated && states.listing.next_cursor.is_none());
+        assert_eq!((states.at, states.unverified), ((99, hash(99)), vec![0]), "judged at 99 under the lower peer's header, which the peer at 100 is to show");
         // A continuation after 92 judged with a peer a block behind: the peer
         // at 100 lists coin 5 (created at 90, spent at 100); the peer at 99
         // does not, the latest change it knows of (90) lying before the start.
@@ -2551,8 +2638,11 @@ mod tests {
         let all = page(vec![state(1, 90, None), state(2, 80, None)], 100, true, 100);
         let capped = Page { pending: vec![coin(2).coin_id()], ..page(vec![state(1, 90, None)], 100, false, 100) };
         let states = settle_states(&[all.clone(), capped], true).unwrap();
-        assert_eq!(amounts(&states), vec![(1, false)]);
-        assert!(states.truncated);
+        assert_eq!(amounts(&states.listing), vec![(1, false)]);
+        assert!(states.listing.truncated);
+        // Two lookups at one height on different headers: the same coins on another fork disagree.
+        let other_header = Page { header_hash: Bytes32::new([0xAB; 32]), ..all.clone() };
+        assert!(settle_states(&[all.clone(), other_header], true).is_none());
         let short = page(vec![state(1, 90, None)], 100, true, 100);
         assert!(settle_states(&[all, short], true).is_none());
     }
@@ -2612,24 +2702,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_peak_renamed_at_the_same_height_during_a_lookup_is_asked_again() {
-        // A's first answer comes with a new peak at the SAME height on another
-        // header: a same-height reorg between the two readings. Height alone
-        // would pass it; the lookup is asked again and dated by a peak that
-        // stood still, header and all. The same for a listing page cut at its
-        // item limit.
+        // A stood on another header at height 100, and its first answer comes
+        // with a new peak at the SAME height, B's header: a same-height reorg
+        // between the two readings (onto B's chain, so the two then agree).
+        // Height alone would pass it; the lookup is asked again and dated by a
+        // peak that stood still, header and all. The same for a listing page
+        // cut at its item limit.
         let renamed = |kind: chia_protocol::ProtocolMessageTypes, base: Handler| -> Handler {
             let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
             Arc::new(move |m: &Message| {
                 let mut out = Vec::new();
                 if m.msg_type == kind && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    out.push(reply(&NewPeakWallet::new(Bytes32::new([0xAB; 32]), 100, 0, 0)));
+                    out.push(reply(&NewPeakWallet::new(header_at(100, genesis()).header_hash(), 100, 0, 0)));
                 }
                 out.extend(base(m));
                 out
             })
         };
         let one = vec![state(1, 90, None)];
-        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), renamed(chia_protocol::ProtocolMessageTypes::RequestCoinState, node(one.clone(), (1, None), vec![]))).await;
+        let elsewhere = Peak { height: 100, header_hash: Bytes32::new([0xAB; 32]) };
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(elsewhere), renamed(chia_protocol::ProtocolMessageTypes::RequestCoinState, node(one.clone(), (1, None), vec![]))).await;
         let b = full_node(one, (1, None), Some(peak_at(100))).await;
         let lane_ab = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
         let money = PeerLane::new(lane_ab.clone(), Trust::Agreed);
@@ -2640,7 +2732,7 @@ mod tests {
         assert_eq!(lane_ab.live_count().await, 2);
 
         let history = vec![state(1, 90, None), state(2, 80, Some(85)), state(3, 95, None)];
-        let c = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), renamed(chia_protocol::ProtocolMessageTypes::RequestPuzzleState, paged(history.clone(), Some(92), None))).await;
+        let c = spawn("mocknet", NodeType::FullNode, genesis(), Some(elsewhere), renamed(chia_protocol::ProtocolMessageTypes::RequestPuzzleState, paged(history.clone(), Some(92), None))).await;
         let d = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), paged(history, None, None)).await;
         let lane_cd = lane(vec![(c.addr, Source::Introducer), (d.addr, Source::Gossip)], vec![], false, None);
         let money = PeerLane::new(lane_cd.clone(), Trust::Agreed);
@@ -2649,6 +2741,143 @@ mod tests {
         let asked = c.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPuzzleState).count();
         assert_eq!(asked, 2, "the cut page was asked for again");
         assert_eq!(lane_cd.live_count().await, 2);
+    }
+
+    #[test]
+    fn a_discovered_address_off_the_public_internet_is_never_queued() {
+        // The introducer, gossip and the store name addresses the lane cannot
+        // vouch for: a loopback, LAN, link-local, carrier-grade NAT or
+        // documentation address among them, mapped into IPv6 or not, is set
+        // aside, so a stranger's word never has the node probe its own
+        // network. The dialer reads the queue alone, so what is set aside is
+        // never dialled; only a pin may name such an address, and pins are
+        // resolved and dialled on their own, never queued here.
+        let mut state = LaneState { public_only: true, ..LaneState::default() };
+        let shady = [
+            "127.0.0.1:58444",
+            "10.0.0.7:58444",
+            "192.168.1.9:58444",
+            "172.16.0.2:58444",
+            "169.254.1.1:58444",
+            "100.64.0.1:58444",
+            "0.0.0.0:58444",
+            "203.0.113.5:58444",
+            "[::1]:58444",
+            "[fe80::1]:58444",
+            "[fd00::1]:58444",
+            "[::ffff:10.0.0.7]:58444",
+            "[2001:db8::1]:58444",
+        ];
+        for (i, addr) in shady.iter().enumerate() {
+            let source = [Source::Introducer, Source::Gossip, Source::Store][i % 3];
+            push_candidates(&mut state, vec![Candidate { addr: addr.parse().unwrap(), source, failures: 0 }]);
+        }
+        assert!(state.candidates.is_empty(), "{:?}", state.candidates);
+        let public: Vec<SocketAddr> = ["1.2.3.4:58444", "[2001:4860::8888]:58444", "[::ffff:5.6.7.8]:58444"].iter().map(|a| a.parse().unwrap()).collect();
+        push_candidates(&mut state, public.iter().map(|addr| Candidate { addr: *addr, source: Source::Gossip, failures: 0 }).collect());
+        let queued: Vec<SocketAddr> = state.candidates.iter().map(|c| c.addr).collect();
+        assert_eq!(queued, vec![public[0], public[1], "5.6.7.8:58444".parse().unwrap()], "public addresses queued, the mapped one as its IPv4");
+        // The tests' own mock full nodes listen on loopback: without the judge they are admitted.
+        let mut lax = LaneState::default();
+        push_candidates(&mut lax, vec![Candidate { addr: "127.0.0.1:58444".parse().unwrap(), source: Source::Gossip, failures: 0 }]);
+        assert_eq!(lax.candidates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_peer_ahead_on_another_fork_with_the_same_coins_is_a_disagreement() {
+        // B stands two blocks above A and lists the very same coins, but the
+        // header it serves at A's height is another chain's. Agreement on the
+        // coins alone would take B's word for A's chain; the pair disagrees,
+        // for a finished listing (no cursor to tell by) and a coin-state
+        // lookup alike. On one chain, the header shown, the same two heights
+        // agree.
+        let forked = |base: Handler, at: u32| -> Handler {
+            Arc::new(move |m: &Message| {
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestBlockHeader {
+                    let req = RequestBlockHeader::from_bytes(&m.data).unwrap();
+                    if req.height == at {
+                        return vec![reply(&RespondBlockHeader::new(header_at(at, Bytes32::new([0xAB; 32]))))];
+                    }
+                }
+                base(m)
+            })
+        };
+        let history = vec![state(1, 90, None), state(2, 80, Some(85))];
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), paged_to(history.clone(), 100, None, None)).await;
+        let b = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(102)), forked(paged_to(history.clone(), 102, None, None), 100)).await;
+        let lane_ab = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane_ab.clone(), Trust::Agreed);
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        assert_eq!(headers_asked(&b), 2, "the binding at 0, then the header at 100");
+        assert_eq!(lane_ab.live_count().await, 0, "both public peers let go");
+
+        let c = full_node(history.clone(), (1, None), Some(peak_at(100))).await;
+        let d = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(102)), forked(node(history.clone(), (1, None), vec![]), 100)).await;
+        let lane_cd = lane(vec![(c.addr, Source::Introducer), (d.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane_cd.clone(), Trust::Agreed);
+        let err = money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        assert_eq!(headers_asked(&d), 2, "the binding at 0, then the header at 100");
+        assert_eq!(lane_cd.live_count().await, 0);
+
+        let e = full_node(history.clone(), (1, None), Some(peak_at(100))).await;
+        let f = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(102)), paged_to(history, 102, None, None)).await;
+        let lane_ef = lane(vec![(e.addr, Source::Introducer), (f.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane_ef.clone(), Trust::Agreed);
+        let got = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap();
+        assert_eq!(got.records.len(), 2);
+        assert!(!got.truncated && got.next_cursor.is_none());
+        assert_eq!(headers_asked(&f), 2, "F showed the header at 100");
+        assert_eq!(headers_asked(&e), 1, "E, at the height judged, had nothing to show beyond the binding");
+        let got = money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap();
+        assert_eq!(got.records.len(), 1);
+        assert_eq!(lane_ef.live_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_finished_page_made_while_the_peak_moved_is_asked_again() {
+        // A announces a new peak together with its finished page. The page
+        // names the peak the node read before it queried its coins, and a
+        // reorg in between would put another chain's coins under that header;
+        // the page is asked for again and taken once the peak stood still. A
+        // peer whose peak moves on every try is reported unanswered rather
+        // than judged.
+        let bump = |every: bool| -> Handler {
+            let base = node(vec![state(1, 90, None)], (1, None), vec![]);
+            let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            Arc::new(move |m: &Message| {
+                let mut out = Vec::new();
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPuzzleState {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if every || n == 0 {
+                        let height = 101 + n;
+                        out.push(reply(&NewPeakWallet::new(header_at(height, genesis()).header_hash(), height, 0, 0)));
+                    }
+                }
+                out.extend(base(m));
+                out
+            })
+        };
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), bump(false)).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let settled_lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(settled_lane.clone(), Trust::Agreed);
+        let got = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap();
+        assert_eq!(got.records.len(), 1);
+        assert!(!got.truncated && got.next_cursor.is_none());
+        let asked = a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPuzzleState).count();
+        assert_eq!(asked, 2, "the finished page was asked for again once the peak had moved");
+        assert_eq!(settled_lane.live_count().await, 2);
+
+        let restless = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), bump(true)).await;
+        let d = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let restless_lane = lane(vec![(restless.addr, Source::Introducer), (d.addr, Source::Gossip)], vec![], false, None);
+        let restless_money = PeerLane::new(restless_lane.clone(), Trust::Agreed);
+        let err = restless_money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("moved"), "{err}");
+        let asked = restless.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPuzzleState).count();
+        assert_eq!(asked, PEAK_SETTLE_ATTEMPTS, "every try was spent");
     }
 
     #[tokio::test]
