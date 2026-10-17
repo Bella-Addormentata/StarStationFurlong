@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use chia_bls::SecretKey;
 use chia_protocol::{Bytes, Bytes32, Coin};
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
+use crate::chia_chain::ChainAccess;
 use sha2::{Digest, Sha256};
 
 use crate::chia_faucet::{unspent_at, MAX_FAUCET_PAGES};
@@ -98,7 +98,7 @@ pub fn derive_dice(seed_hex: &str, beacon_hex: &str, table: &str, round: u64) ->
 /// may still have landed, so the coin stays parked until the chain or the
 /// mempool settles it; an outright rejection frees it).
 async fn push_fair_record(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     chia_sk: &SecretKey,
     coin: Coin,
     table: &str,
@@ -118,13 +118,13 @@ async fn push_fair_record(
 /// confirms, violating the commit→reveal ordering assumption. ~200 s bound.
 ///
 /// The listing is PAGED like every other wallet listing (#245 review, round 15):
-/// `spent` was selected across up to [`MAX_FAUCET_PAGES`] gateway pages, so the
+/// `spent` was selected across up to [`MAX_FAUCET_PAGES`] listing pages, so the
 /// first page alone could simply not hold it while it still sits unspent on a
 /// later one, and the reveal would go out before the commit confirmed. A
 /// listing cut short that does not show `spent` proves nothing either way
 /// ([`confirmed_gone`]): the wait goes on.
 async fn wait_for_next_coin(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     our_ph: Bytes32,
     spent: &Coin,
 ) -> Result<Coin> {
@@ -164,16 +164,33 @@ fn confirmed_gone(listing_complete: bool, unspent: &[Coin], spent: &Coin) -> boo
 /// Resolve every PUBLIC fairness record published under (table, round): the raw
 /// plaintext payloads (commit and/or reveal), in confirmation order. Read-only.
 pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>>> {
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let hint = fair_hint(table, round);
-    let resp = client
-        .get_coin_records_by_hint(hint, None, None, Some(true), None)
-        .await
-        .map_err(|e| anyhow!("get_coin_records_by_hint: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("hint lookup unsuccessful: {:?}", resp.error));
+    // Every page, up to the bound every wallet listing shares: a transcript
+    // with records missing proves nothing, so a listing still cut short is an
+    // error, not a shorter transcript.
+    let mut records = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let listing = client
+            .coin_records_by_hint(hint, None, true, cursor.take())
+            .await
+            .map_err(|e| anyhow!("hint lookup: {e}"))?;
+        pages += 1;
+        records.extend(listing.records);
+        let truncated = listing.truncated;
+        match listing.next_cursor {
+            Some(next) if truncated => {
+                if pages >= MAX_FAUCET_PAGES {
+                    return Err(anyhow!("hint lookup: the listing is cut short at {MAX_FAUCET_PAGES} pages, so records would be missing"));
+                }
+                cursor = Some(next);
+            }
+            _ if truncated => return Err(anyhow!("hint lookup: the listing is cut short with no way to go on")),
+            _ => break,
+        }
     }
-    let mut records = resp.coin_records.unwrap_or_default();
     records.sort_by_key(|r| r.confirmed_block_index);
     let mut out = Vec::new();
     for rec in records {
@@ -196,7 +213,7 @@ pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>
 /// re-derive + verify the dice — proving the on-chain fairness transcript loop.
 /// T1 uses a placeholder beacon; T2 swaps in a real testnet block header_hash.
 pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let our_ph = our_puzzle_hash(chia_sk);
 
     // Unique per run so re-runs don't pile records under one hint.

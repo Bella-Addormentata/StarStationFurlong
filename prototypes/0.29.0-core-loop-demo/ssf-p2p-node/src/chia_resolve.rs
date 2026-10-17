@@ -13,13 +13,13 @@
 //!   decode_signed -> freshness checks.
 //!
 //! Rules the reader lives by (third follow-up on #231, verified against the
-//! full node's `hint_store` and the coinset gateway):
+//! full node's `hint_store`):
 //!   * `include_spent_coins=true` always — the current record's coin is spent
 //!     the moment its publisher republishes.
 //!   * Reads are INCREMENTAL: a [`HintCursor`] remembers the highest confirmed
 //!     height examined and resumes `CURSOR_OVERLAP_BLOCKS` below it; coins
 //!     already examined are skipped by coin id. A listing longer than
-//!     [`MAX_PAGES_PER_POLL`] is continued next poll from the gateway's parked
+//!     [`MAX_PAGES_PER_POLL`] is continued next poll from the listing's parked
 //!     cursor, and the height only moves once a listing ended fully examined.
 //!   * Parent fetches are capped per poll ([`MAX_PARENT_FETCHES_PER_POLL`]); a
 //!     flooded hint costs a bounded number of calls, not a scan of 50,000 ids.
@@ -37,9 +37,9 @@
 use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
-use chia_protocol::{Bytes, Bytes32, CoinSpend};
+use chia_protocol::{Bytes, Bytes32};
 use chia_puzzle_types::Memos;
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
+use crate::chia_chain::{ChainAccess, PuzzleAndSolution};
 use chia_sdk_types::{run_puzzle, Conditions};
 use clvm_traits::{FromClvm, ToClvm};
 use clvmr::{Allocator, NodePtr};
@@ -53,7 +53,7 @@ pub const MAX_FUTURE_SKEW_V2_SECS: u64 = 2 * 3600;
 
 /// Parent-spend fetches per hint per poll. Bounds the cost of a flooded hint.
 pub const MAX_PARENT_FETCHES_PER_POLL: usize = 50;
-/// Gateway pages followed per hint per poll (each page is one HTTPS call).
+/// Listing pages followed per hint per poll (each page is one peer request).
 pub const MAX_PAGES_PER_POLL: usize = 8;
 /// Blocks re-read below the cursor on every poll: a late-confirming spend or a
 /// short reorg still gets seen.
@@ -90,7 +90,7 @@ pub struct HintCursor {
     /// bounded by `SEEN_CAP` as a flood stop, never cleared mid-cycle.
     pub seen: HashSet<[u8; 32]>,
     /// A listing the last poll could not finish inside `MAX_PAGES_PER_POLL`:
-    /// the next poll continues it from the gateway's cursor instead of starting
+    /// the next poll continues it from the listing's cursor instead of starting
     /// over, and `last_height` never moves past pages nobody has fetched.
     pub pending: Option<PendingPage>,
     /// The last poll hit `MAX_PARENT_FETCHES_PER_POLL` and left listed coins
@@ -100,12 +100,12 @@ pub struct HintCursor {
 }
 
 /// Where a page-capped poll stopped, so the next poll continues the SAME
-/// listing. A gateway cursor is only meaningful for the query that produced
+/// listing. A listing cursor is only meaningful for the query that produced
 /// it, so the query's `start_height` travels with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingPage {
     pub start_height: Option<u32>,
-    /// The gateway's `next_cursor` for the first page not yet fetched.
+    /// The listing's `next_cursor` for the first page not yet fetched.
     pub next_cursor: String,
     /// Highest confirmed height on the pages fetched so far.
     pub max_height: u32,
@@ -140,7 +140,7 @@ impl HintCursor {
     }
 
     /// Take the next poll's starting point: the pending listing if there is
-    /// one (taken, so a cursor the gateway no longer honours fails once and
+    /// one (taken, so a cursor the peers no longer honour fails once and
     /// the poll after starts fresh), else a fresh listing from `start_height`.
     fn resume(&mut self) -> Resume {
         match self.pending.take() {
@@ -207,15 +207,15 @@ pub fn rank_and_dedupe(mut found: Vec<FoundRecord>) -> Vec<FoundRecord> {
     found
 }
 
-/// Read every record under `hint` not yet examined by `cursor`. Follows gateway
+/// Read every record under `hint` not yet examined by `cursor`. Follows listing
 /// pages, reads spent coins, caps parent fetches, verifies and filters. The
-/// cursor's `last_height` advances only when a listing ENDED (the gateway sent
+/// cursor's `last_height` advances only when a listing ENDED (the peer sent
 /// its last page) and every coin it listed was examined; a poll that spends its
-/// page budget first parks the gateway cursor in `pending` and the next poll
+/// page budget first parks the listing cursor in `pending` and the next poll
 /// continues the same listing, so no page is ever skipped. A capped or failed
 /// poll re-reads what it skipped next time.
 pub async fn read_hint(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     hint: Bytes32,
     room_key: &[u8; 32],
     now: u64,
@@ -229,26 +229,23 @@ pub async fn read_hint(
 /// how a ciphertext becomes a record differs. The opener gets the ciphertext
 /// and the height of the block that confirmed the coin (v2's era rule).
 pub async fn read_hint_with(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     hint: Bytes32,
     cursor: &mut HintCursor,
     opener: &(dyn Fn(&[u8], u32) -> Option<ChiaPresenceRecord> + Sync),
 ) -> Result<Vec<FoundRecord>> {
     let Resume { start, mut page, mut max_height, mut examined_all } = cursor.resume();
     let mut coins = Vec::new();
-    // `listed` = the gateway reported the listing's last page this poll.
+    // `listed` = the peer reported the listing's last page this poll.
     let mut listed = false;
     for _ in 0..MAX_PAGES_PER_POLL {
-        let resp = client
-            .get_coin_records_by_hint(hint, start, None, Some(true), page.clone())
+        let listing = client
+            .coin_records_by_hint(hint, start, true, page.clone())
             .await
-            .map_err(|e| anyhow!("get_coin_records_by_hint: {e}"))?;
-        if !resp.success {
-            return Err(anyhow!("hint lookup unsuccessful: {:?}", resp.error));
-        }
-        coins.extend(resp.coin_records.unwrap_or_default());
-        match (resp.truncated, resp.next_cursor) {
-            (Some(true), Some(next)) => page = Some(next),
+            .map_err(|e| anyhow!("hint lookup: {e}"))?;
+        coins.extend(listing.records);
+        match (listing.truncated, listing.next_cursor) {
+            (true, Some(next)) => page = Some(next),
             _ => {
                 listed = true;
                 break;
@@ -368,7 +365,7 @@ pub fn scan_eras(peak: u32) -> Vec<u64> {
 /// it; what the other hint found is returned all the same. Only when every
 /// hint failed is the error returned.
 pub async fn read_ck(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     ck: &[u8; 32],
     peak: u32,
     now: u64,
@@ -426,7 +423,7 @@ pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
 /// signer; only the node's own signature does.
 pub async fn resolve_presence_by_ck(ck: &[u8; 32], node_id: &str) -> Result<Option<ChiaPresenceRecord>> {
     let now = unix_now();
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect_carrier();
     let peak = peak_height(&client).await.ok_or_else(|| anyhow!("chain peak unavailable"))?;
     let mut all = Vec::new();
     let mut cursors = std::collections::HashMap::new();
@@ -456,7 +453,7 @@ pub const ONE_SHOT_MAX_ROUNDS: usize = 4;
 /// is examined or [`ONE_SHOT_MAX_ROUNDS`] is spent — never left at page 8.
 pub async fn resolve_all(room_key: &[u8; 32]) -> Result<Vec<FoundRecord>> {
     let now = unix_now();
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect_carrier();
     let mut all = Vec::new();
     for e in scan_epochs(now) {
         let hint = Bytes32::new(chia_lane::derive_hint(room_key, e));
@@ -495,17 +492,13 @@ pub async fn resolve_by_room_key(room_key: &[u8; 32]) -> Result<Option<ChiaPrese
     Ok(resolve_all(room_key).await?.into_iter().next().map(|f| f.record))
 }
 
-/// The chain's current peak height from the gateway, or `None` when the call
-/// fails (the caller logs and keeps its last beat).
-pub async fn peak_height(client: &CoinsetClient) -> Option<u32> {
-    match client.get_blockchain_state().await {
-        Ok(resp) if resp.success => resp.blockchain_state.map(|s| s.peak.height),
-        Ok(resp) => {
-            eprintln!("⛓️ ChiaHub reader: get_blockchain_state unsuccessful: {:?}", resp.error);
-            None
-        }
+/// The chain's current peak height, or `None` when the call fails (the caller
+/// logs and keeps its last beat).
+pub async fn peak_height(client: &impl ChainAccess) -> Option<u32> {
+    match client.peak_height().await {
+        Ok(height) => Some(height),
         Err(e) => {
-            eprintln!("⛓️ ChiaHub reader: get_blockchain_state failed: {e}");
+            eprintln!("⛓️ ChiaHub reader: peak height {e}");
             None
         }
     }
@@ -519,23 +512,19 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 pub(crate) async fn fetch_coin_spend(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     coin_id: Bytes32,
     height: u32,
-) -> Result<Option<CoinSpend>> {
-    let resp = client
-        .get_puzzle_and_solution(coin_id, Some(height))
+) -> Result<Option<PuzzleAndSolution>> {
+    client
+        .puzzle_and_solution(coin_id, height)
         .await
-        .map_err(|e| anyhow!("get_puzzle_and_solution: {e}"))?;
-    if !resp.success {
-        return Ok(None);
-    }
-    Ok(resp.coin_solution)
+        .map_err(|e| anyhow!("puzzle and solution: {e}"))
 }
 
 /// Run the parent spend and return the ciphertext (2nd memo) of the create_coin
 /// whose FIRST memo is our `hint` — the ecosystem hint convention we published with.
-pub(crate) fn extract_ciphertext(coin_spend: &CoinSpend, hint: Bytes32) -> Result<Option<Vec<u8>>> {
+pub(crate) fn extract_ciphertext(coin_spend: &PuzzleAndSolution, hint: Bytes32) -> Result<Option<Vec<u8>>> {
     let mut allocator = Allocator::new();
     let puzzle: NodePtr = coin_spend
         .puzzle_reveal
@@ -569,7 +558,7 @@ pub(crate) fn extract_ciphertext(coin_spend: &CoinSpend, hint: Bytes32) -> Resul
 }
 
 /// How old a cached chain peak may be before it is as good as none. The watcher
-/// reads the peak once per tick, but a long or stalled scan — or the gateway
+/// reads the peak once per tick, but a long or stalled scan — or the peers
 /// down — can leave it blocks, or an era, behind: a publisher signing by it
 /// would write for an era that has ended, and an inbound mark stamped with it
 /// would name one. Kept well inside the publisher's eight end-of-era guard
@@ -700,7 +689,7 @@ mod tests {
         assert_eq!(resumed.page.as_deref(), Some("page-9"));
         assert_eq!(resumed.max_height, 5_300);
         assert!(!resumed.examined_all, "an earlier parent-capped poll taints the whole listing");
-        assert!(c.pending.is_none(), "taken: a cursor the gateway refuses fails once, then we start fresh");
+        assert!(c.pending.is_none(), "taken: a cursor the peers refuse fails once, then we start fresh");
         assert_eq!(c.last_height, 5_000, "resuming alone never advances the height");
         assert!(!c.has_more(), "nothing parked and no backlog: the hint is examined");
         c.backlog = true;
