@@ -1114,6 +1114,129 @@ export function foldChainEnd(segments: ConnectorSegment[]): {
 /** Gap between the door face / chain end and the heavy portal planes. */
 export const CHAIN_PORTAL_MARGIN = 0.3;
 
+// ── 🚪🔒 The walkway through a connection (airlock crossing) ────────────────
+
+/** A point on a connection's walkway centreline in the connector's own frame
+ *  (z = 0 at the door face, +Z outward, the frame buildVestibule and
+ *  buildConnectorChain build in), with `s` the distance walked to reach it. */
+export interface WalkwayPoint {
+  x: number;
+  z: number;
+  s: number;
+}
+
+/**
+ * The walkway centreline from the door face to the far end: a straight
+ * vestibule is one DEPTH-long run; a chain folds its portal margins and each
+ * segment exactly as foldChainEnd does, following every flex joint's arc.
+ * Points are about `spacing` apart. `endYaw` is the heading at the far end.
+ */
+export function connectorCentreline(
+  segments?: readonly ConnectorSegment[] | null,
+  spacing = 0.4,
+): { points: WalkwayPoint[]; length: number; endYaw: number } {
+  const points: WalkwayPoint[] = [{ x: 0, z: 0, s: 0 }];
+  let x = 0,
+    z = 0,
+    yaw = 0,
+    s = 0;
+  const run = (
+    len: number,
+    frameAt: (t: number) => { x: number; z: number; yaw: number },
+  ): void => {
+    if (len <= 0) return;
+    const c = Math.cos(yaw),
+      sn = Math.sin(yaw);
+    const n = Math.max(1, Math.ceil(len / spacing));
+    for (let i = 1; i <= n; i++) {
+      const f = frameAt(i / n);
+      points.push({ x: x + f.x * c + f.z * sn, z: z - f.x * sn + f.z * c, s: s + (len * i) / n });
+    }
+    const e = frameAt(1);
+    x += e.x * c + e.z * sn;
+    z += -e.x * sn + e.z * c;
+    yaw += e.yaw;
+    s += len;
+  };
+  const straight = (len: number): void => run(len, (t) => ({ x: 0, z: len * t, yaw: 0 }));
+  if (!segments || segments.length === 0) {
+    straight(DEPTH);
+  } else {
+    straight(CHAIN_PORTAL_MARGIN);
+    for (const seg of segments) {
+      if (seg.kind === "flex") {
+        const th = THREE.MathUtils.degToRad(clampFlexBendFine(seg.bendDeg ?? 0));
+        const len = FLEX_REST_LEN + clampFlexStretch(seg.stretch ?? 0);
+        run(len, (t) => flexArcFrame(th, len, t));
+      } else {
+        straight(segmentExit(seg).z);
+      }
+    }
+    straight(CHAIN_PORTAL_MARGIN);
+  }
+  return { points, length: s, endYaw: yaw };
+}
+
+/** The walkway between two distances along the centreline: every sampled
+ *  point past `from`, ending exactly at `to` (interpolated). */
+export function walkwayBetween(
+  line: { points: readonly WalkwayPoint[] },
+  from: number,
+  to: number,
+): WalkwayPoint[] {
+  const out: WalkwayPoint[] = [];
+  const pts = line.points;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1],
+      b = pts[i];
+    if (b.s <= from) continue;
+    if (b.s >= to) {
+      const t = b.s > a.s ? (to - a.s) / (b.s - a.s) : 1;
+      out.push({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t, s: to });
+      return out;
+    }
+    out.push(b);
+  }
+  const last = pts[pts.length - 1];
+  if (last && (out.length === 0 || out[out.length - 1].s < last.s)) out.push(last);
+  return out;
+}
+
+/**
+ * A shut hatch across one end of a connection, in the connector's frame: the
+ * door at its face (`near`) or the far module's door at its end (`far`). The
+ * airlock shows the far one while you walk the tube, and both while sealed.
+ */
+export function buildConnectorEndCap(
+  segments: readonly ConnectorSegment[] | null | undefined,
+  end: "near" | "far",
+): THREE.Group {
+  const cap = new THREE.Group();
+  cap.name = end === "far" ? "airlockFarHatch" : "airlockNearHatch";
+  const slab = new THREE.Mesh(
+    new THREE.BoxGeometry(INNER_W, INNER_H, 0.04),
+    new THREE.MeshStandardMaterial({ color: 0x3a4454, roughness: 0.6, metalness: 0.4 }),
+  );
+  slab.position.y = INNER_H / 2;
+  cap.add(slab);
+  // A dark seam down the middle, so it reads as a pair of shut door leaves.
+  const seam = new THREE.Mesh(
+    new THREE.BoxGeometry(0.04, INNER_H - 0.2, 0.05),
+    new THREE.MeshStandardMaterial({ color: 0x151a22, roughness: 0.8 }),
+  );
+  seam.position.y = INNER_H / 2;
+  cap.add(seam);
+  if (end === "near") {
+    cap.position.z = 0.02;
+    return cap;
+  }
+  const line = connectorCentreline(segments, 10);
+  const tip = line.points[line.points.length - 1];
+  cap.position.set(tip.x - Math.sin(line.endYaw) * 0.02, 0, tip.z - Math.cos(line.endYaw) * 0.02);
+  cap.rotation.y = line.endYaw;
+  return cap;
+}
+
 // ── #62 P3: far-room projection pose ─────────────────────────────────────────
 
 /** Room half-width (11.8 / 2) — the projection box's centre sits this far past

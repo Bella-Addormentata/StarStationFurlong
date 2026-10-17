@@ -3876,8 +3876,7 @@ async function transitTo(
 
   const airlockEligible =
     multiScaleZoom?.getLevel() === 1 &&
-    readDoorPolicy(departureDoorId).passage === "public" &&
-    !(depState?.segments?.length);
+    readDoorPolicy(departureDoorId).passage === "public";
   const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
     // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
     // data loss, or the doorless claim that replaced the lobby-contamination
@@ -3927,7 +3926,7 @@ async function transitTo(
       ),
     fail: () => world.failAdapterTransit(departureDoorId),
     // 🚪🔒 The airlock crossing (owner request): in first person, through a
-    // public door with a straight vestibule, the room is swapped while both
+    // public door, straight or bent tube, the room is swapped while both
     // doors are shut, with no fade. Read now, while the departure room's
     // policy is still the one bound.
     ...(airlockEligible

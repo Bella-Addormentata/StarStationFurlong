@@ -96,7 +96,7 @@ import {
   forgetCasinoTable,
 } from "./casinoTableSession";
 import type { CasinoTableVisualHandle } from "./casinoTable3d";
-import { northDoorUnlocked } from "./stationParts";
+import { mirrorSegments, northDoorUnlocked } from "./stationParts";
 import { rebuildObstacles } from "./obstacles";
 import {
   rebakeWalkableGrid,
@@ -148,11 +148,14 @@ import type { DoorLayoutRecord } from "./doorLayoutDoc";
 import {
   buildVestibule,
   buildConnectorChain,
+  buildConnectorEndCap,
   buildDockPortStub,
+  connectorCentreline,
   setVestibuleLightState,
   setVestibuleOpacity,
+  walkwayBetween,
 } from "./adapter";
-import type { VestibuleDoorId } from "./adapter";
+import type { ConnectorSegment, VestibuleDoorId } from "./adapter";
 import {
   findDevice,
   rebuildDevices,
@@ -4792,6 +4795,7 @@ export class World {
         this.onAdapterTransit?.(seed, door.id);
       },
       holdInVestibule: () => this.airlock !== null,
+      vestibulePath: () => this.vestibuleWalkPath(door),
     });
   }
 
@@ -4807,18 +4811,21 @@ export class World {
     return this.airlock;
   }
 
+  /** The chain the sealed tube stands in for (null: a straight vestibule),
+   *  so the arrival tube can be built to match before its own record lands. */
+  private airlockSegments: ConnectorSegment[] | null = null;
+
   /**
    * Seal the airlock around a player waiting in `doorId`'s vestibule: wait
    * for the door behind them to shut, then swap the drawn scene for a
-   * stand-in of the same straight vestibule, both ends closed. False (and
-   * nothing changed) when there is no straight vestibule to stand in, the
-   * player is not waiting in it in first person, or the door does not shut in time; the
-   * caller then covers the swap with the fade as before.
+   * stand-in of the same tube, straight or bent, with both ends closed.
+   * False (and nothing changed) when there is no tube to stand in, the
+   * player is not waiting in it in first person, or the door does not shut
+   * in time; the caller then covers the swap with the fade as before.
    */
   public async sealAirlock(doorId: string, firstPerson: () => boolean): Promise<boolean> {
     const ds = this.dockingSystem;
-    const vestibule = this.pairedVestibules.get(doorId);
-    if (!ds || !vestibule || (ds.getDockingState(doorId)?.segments?.length ?? 0) > 0) return false;
+    if (!ds || !this.pairedVestibules.has(doorId)) return false;
     const waiting = () =>
       this.player.getDoorPhase() === "ADAPTER_HOLD" &&
       this.player.getActiveDoorId() === doorId &&
@@ -4829,18 +4836,23 @@ export class World {
       await new Promise((r) => setTimeout(r, 50));
     }
     if (!waiting()) return false;
-    const tube = buildVestibule(doorId);
+    const segments = ds.getDockingState(doorId)?.segments ?? null;
+    // Posed from the door as it stands now (both builders anchor by id), not
+    // from the cached tube, which may predate this room's layout.
+    const tube = this.buildDoorConnector(doorId as DoorId);
     // Both ends shut: the door behind, and the far module's door ahead.
-    const capMat = new THREE.MeshStandardMaterial({ color: 0x3a4454, roughness: 0.6, metalness: 0.4 });
-    for (const z of [0.02, 2.98]) {
-      const cap = new THREE.Mesh(new THREE.BoxGeometry(3.0, 3.2, 0.04), capMat);
-      cap.position.set(0, 1.6, z);
-      tube.add(cap);
+    tube.add(buildConnectorEndCap(segments, "near"));
+    tube.add(buildConnectorEndCap(segments, "far"));
+    // A lamp every few metres along the walkway, so a long tube is lit.
+    const line = connectorCentreline(segments);
+    for (let d = Math.min(1.5, line.length / 2); d < line.length; d += 6) {
+      const at = walkwayBetween(line, 0, d).pop()!;
+      const lamp = new THREE.PointLight(0xffe2b0, 18, 8);
+      lamp.position.set(at.x, 2.8, at.z);
+      tube.add(lamp);
     }
     setVestibuleOpacity(tube, 1);
     setVestibuleLightState(tube, "cycling");
-    // Posed from the door as it stands now (buildVestibule anchors by id),
-    // not from the cached tube, which may predate this room's layout.
     this.platformGroup.updateWorldMatrix(true, false);
     tube.updateMatrix();
     tube.matrixAutoUpdate = false;
@@ -4848,10 +4860,8 @@ export class World {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x05070b);
     scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-    const lamp = new THREE.PointLight(0xffe2b0, 18, 8);
-    lamp.position.set(0, 2.8, 1.5);
-    tube.add(lamp);
     scene.add(tube);
+    this.airlockSegments = segments && segments.length > 0 ? segments.map((g) => ({ ...g })) : null;
     this.airlock = scene;
     return true;
   }
@@ -4859,29 +4869,69 @@ export class World {
   /**
    * Open the seal: draw the room again. Called once the player stands at the
    * arrival door's `through` point (or, on a failure, behind the fade). The
-   * arrival door's own vestibule is built and made solid first, so the view
-   * the seal hands over to is the same closed tube.
+   * arrival door's own tube is built and made solid first, so the view the
+   * seal hands over to is the same closed tube.
    */
   public unsealAirlock(): void {
     const scene = this.airlock;
     if (!scene) return;
     this.airlock = null;
+    const departureSegments = this.airlockSegments;
+    this.airlockSegments = null;
     const arrivalId = this.player.getActiveDoorId();
     const ds = this.dockingSystem;
     // Any built door will do: on a first crossing the arrival room's own
     // record of the pairing is written only after the swap returns, and
     // updatePairedVestibules keeps a tube while its door is being walked.
-    const arrivalState = arrivalId ? ds?.getDockingState(arrivalId) : undefined;
-    if (arrivalId && !(arrivalState?.segments?.length) && physicalDoorPoseOrNull(arrivalId)) {
+    if (arrivalId && physicalDoorPoseOrNull(arrivalId)) {
       // Built fresh from the arrival room's pose: a tube kept under the same
       // door id may still stand where the departure room had that door.
       this.disposeVestibule(arrivalId);
-      const vestibule = this.buildDoorConnector(arrivalId);
+      const own = ds?.getDockingState(arrivalId)?.segments;
+      let vestibule: THREE.Group;
+      if (!own?.length && departureSegments) {
+        // The record is not here yet: the same chain seen from this end, as
+        // transitTo will write it (so the rebuild-on-diff key already agrees).
+        const mirrored = mirrorSegments(departureSegments);
+        vestibule = buildConnectorChain(arrivalId, mirrored);
+        vestibule.userData.segmentsKey = JSON.stringify(mirrored);
+      } else {
+        vestibule = this.buildDoorConnector(arrivalId);
+      }
       this.platformGroup.add(vestibule);
       this.pairedVestibules.set(arrivalId, vestibule);
       setVestibuleOpacity(vestibule, 1);
     }
     this.disposeObject3D(scene);
+  }
+
+  /** 🚪🔒 True while the camera is in first person (zoom level 1). */
+  private isFirstPersonView(): boolean {
+    const zoom = (window as any).multiScaleZoom;
+    return typeof zoom?.getLevel === "function" && zoom.getLevel() === 1;
+  }
+
+  /**
+   * 🚪🔒 In first person, the walk through `door`'s tube: from `through`
+   * along the walkway's centreline, round every bend, to the point as far
+   * from the far door as `through` is from this one, which is where the
+   * arrival walk-in starts on the other side. Room coordinates. Null outside
+   * first person (the room view keeps the short step and the fade).
+   */
+  private vestibuleWalkPath(door: DoorTarget): Array<{ x: number; z: number }> | null {
+    if (!this.isFirstPersonView()) return null;
+    const pose = physicalDoorPoseOrNull(door.id);
+    if (!pose) return null;
+    const yaw = pose.outwardYaw;
+    const c = Math.cos(yaw),
+      sn = Math.sin(yaw);
+    const out = (door.through.x - pose.x) * sn + (door.through.z - pose.z) * c;
+    const line = connectorCentreline(this.dockingSystem?.getDockingState(door.id)?.segments);
+    const to = Math.max(out + 0.2, line.length - out);
+    return walkwayBetween(line, out, to).map((p) => ({
+      x: pose.x + p.x * c + p.z * sn,
+      z: pose.z - p.x * sn + p.z * c,
+    }));
   }
 
   // ── Adapter transit choreography (T1 of issue #30) ──────────────────────────
@@ -4936,6 +4986,11 @@ export class World {
       this.pairedVestibules.set(doorId, vestibule);
     }
     setVestibuleLightState(vestibule, "cycling");
+    // 🚪🔒 The far module's door, shut, at the end of the tube you walk.
+    if (!vestibule.getObjectByName("airlockFarHatch")) {
+      const segments = this.dockingSystem?.getDockingState(doorId)?.segments;
+      vestibule.add(buildConnectorEndCap(segments, "far"));
+    }
     this.transitVestibuleDoorId = doorId;
   }
 
@@ -4949,7 +5004,13 @@ export class World {
     this.transitVestibuleDoorId = null;
     if (!doorId) return;
     const vestibule = this.pairedVestibules.get(doorId);
-    if (vestibule) setVestibuleLightState(vestibule, "idle");
+    if (!vestibule) return;
+    setVestibuleLightState(vestibule, "idle");
+    const hatch = vestibule.getObjectByName("airlockFarHatch");
+    if (hatch) {
+      vestibule.remove(hatch);
+      this.disposeObject3D(hatch);
+    }
   }
 
   /** Remove and dispose one paired-door vestibule (geometries + materials). */
@@ -5106,26 +5167,21 @@ export class World {
         roomEdit.forceExit();
         this.spawnTransitVestibule(door.id);
         const seed = state!.connectedRoomAddress;
-        // A bent connector chain can be shorter than the straight walk: it
-        // keeps the immediate fade at the threshold.
-        if ((state?.segments?.length ?? 0) > 0) {
-          this.onAdapterTransit?.(seed, door.id);
-        } else {
-          // 🚪🔒 Airlock crossing: walk on into the vestibule; the door shuts
-          // behind you at the hold point and the swap starts there (main.ts
-          // seals the airlock for it when it can, else fades as before).
-          this.fpAutoOpened.delete(door.id); // the walk closes it now
-          this.player.walkIntoVestibule(door, {
-            requestOpen: (onOpened) => {
-              ds.openDoor(door.id, onOpened);
-              return true;
-            },
-            requestClose: () => ds.closeDoor(door.id),
-            onThrough: () => {},
-            onAdapterHold: () => this.onAdapterTransit?.(seed, door.id),
-            holdInVestibule: () => this.airlock !== null,
-          });
-        }
+        // 🚪🔒 Airlock crossing: walk on through the tube, straight or bent,
+        // to its far door; the door behind shuts and the swap starts there
+        // (main.ts seals the airlock for it when it can, else fades as before).
+        this.fpAutoOpened.delete(door.id); // the walk closes it now
+        this.player.walkIntoVestibule(door, {
+          requestOpen: (onOpened) => {
+            ds.openDoor(door.id, onOpened);
+            return true;
+          },
+          requestClose: () => ds.closeDoor(door.id),
+          onThrough: () => {},
+          onAdapterHold: () => this.onAdapterTransit?.(seed, door.id),
+          holdInVestibule: () => this.airlock !== null,
+          vestibulePath: () => this.vestibuleWalkPath(door),
+        });
       }
     }
     // Step clear of EVERY doorway to re-arm — including a disabled or unpaired

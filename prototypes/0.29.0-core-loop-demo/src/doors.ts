@@ -187,4 +187,11 @@ export interface DoorSequenceHooks {
    * being swapped behind them (the swap's own watchdog bounds the wait).
    */
   holdInVestibule?: () => boolean;
+  /**
+   * 🚪🔒 The walk from `through` along the tube to the hold point, in room
+   * coordinates (the last entry IS the hold point), read as the avatar
+   * enters ADAPTER_OUT. Absent or null: the classic short step out. A path
+   * that bends is walked back the same way if the avatar returns.
+   */
+  vestibulePath?: () => Array<{ x: number; z: number }> | null;
 }
