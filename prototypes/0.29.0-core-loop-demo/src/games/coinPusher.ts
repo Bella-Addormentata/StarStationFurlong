@@ -1333,18 +1333,17 @@ export function traceDrop(before: CoinPusherState, drop: ReplayableDrop): DropTr
 }
 
 /**
- * When a drop went into its hole, on the shared sweep clock: the moment the
- * pusher stood at the drop's phase within the timing window around the
- * settle (`atMs`) — up to MAX_DROP_LEAD_MS after it (a press stamped by a
- * clock running ahead of the operator's) and up to the rest of a cycle
- * before it. The operator honours a press only inside that window (an older
- * one goes in at the operator's own phase), so this is that moment, and a
- * cabinet that replays the drop from it shows it in step with the pusher it
- * is drawing.
+ * When a drop went into its hole, on the shared sweep clock: the moment
+ * nearest the settle (`atMs`) that the pusher stood at the drop's phase —
+ * within half a sweep either way. The operator honours a press only from
+ * MAX_DROP_LEAD_MS (a clock running ahead of its own) after the settle to
+ * MAX_DROP_LAG_MS before it, give or take DROP_PHASE_MATCH_MS and a poll's
+ * wait, all well inside half a sweep (an older press goes in at the
+ * operator's own phase), so this is that moment, and a cabinet that replays
+ * the drop from it shows it in step with the pusher it is drawing.
  */
 export function dropStartMs(state: CoinPusherState, drop: { phase: number; atMs: number }): number {
-  const lead = MAX_DROP_LEAD_MS / PUSHER_PERIOD_MS;
-  const behind = mod1(currentPusherPhase(state, drop.atMs) - drop.phase + lead) - lead;
+  const behind = mod1(currentPusherPhase(state, drop.atMs) - drop.phase + 0.5) - 0.5;
   return drop.atMs - behind * PUSHER_PERIOD_MS;
 }
 

@@ -8669,11 +8669,11 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   /** A new record: queue a replay of every drop since the record before
    *  (several can settle between two frames), or, when they can't all be
    *  replayed, drop the replays and draw the record. */
-  const noticeRecord = (state: CoinPusherState | null, now: number): void => {
+  const noticeRecord = (state: CoinPusherState | null): void => {
     const prev = seen;
     seen = state;
     if (!state || (prev && prev.tick === state.tick && prev.nextChipId === state.nextChipId)) return;
-    replays = prev ? queueDrops(replays, prev, state, now, geom) : [];
+    replays = prev ? queueDrops(replays, prev, state, geom) : [];
   };
 
   /** A coin on its way down the board or the chute. */
@@ -8727,7 +8727,7 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
       const now = Date.now();
       const state = readCoinPusherState(itemId);
-      noticeRecord(state, now);
+      noticeRecord(state);
 
       // Every drop settled since the last frame, even several at once.
       if (state && shownUpTo !== undefined) {

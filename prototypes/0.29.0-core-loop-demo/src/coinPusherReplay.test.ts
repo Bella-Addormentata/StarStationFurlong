@@ -248,9 +248,9 @@ describe('coin pusher replay', () => {
     // marks a record keeps, all on the board at once.
     const start = fill(30);
     const records = crowd(start, 3, 4, 100, 80_000);
-    let replays = queueDrops([], start, records[0].state, records[0].atMs, GEOM);
+    let replays = queueDrops([], start, records[0].state, GEOM);
     for (let k = 1; k < records.length; k++) {
-      replays = queueDrops(replays, records[k - 1].state, records[k].state, records[k].atMs, GEOM);
+      replays = queueDrops(replays, records[k - 1].state, records[k].state, GEOM);
     }
     expect(replays).toHaveLength(12);
     const view = cabinetView(replays, records[2].atMs + 50).view!;
@@ -269,7 +269,7 @@ describe('coin pusher replay', () => {
     let steps = 0;
     let pays = 0;
     for (const rec of records) {
-      replays = queueDrops(replays, prev, rec.state, rec.atMs, GEOM);
+      replays = queueDrops(replays, prev, rec.state, GEOM);
       prev = rec.state;
       for (const r of replays) {
         for (const list of r.plan.transitions.values()) {
@@ -277,8 +277,8 @@ describe('coin pusher replay', () => {
         }
       }
     }
-    const all = queueDrops([], start, records[0].state, records[0].atMs, GEOM)
-      .concat(...records.slice(1).map((rec, k) => queueDrops([], records[k].state, rec.state, rec.atMs, GEOM)));
+    const all = queueDrops([], start, records[0].state, GEOM)
+      .concat(...records.slice(1).map((rec, k) => queueDrops([], records[k].state, rec.state, GEOM)));
     const end = Math.max(...all.map((r) => r.startMs + r.plan.endMs));
     for (let t = records[0].atMs; t <= end; t += 7) {
       const view = cabinetView(all, t).view;
@@ -319,5 +319,55 @@ describe('coin pusher replay', () => {
     }
     expect(forward).toBeGreaterThan(10);
     expect(back).toBeGreaterThan(10);
+  });
+
+  it('keeps the newest landed table while an older drop is still in the air', () => {
+    // Two drops settled in turn, the second pressed well before the first
+    // (a lagging claim): it lands and plays out while the first coin is
+    // still on the board. The table must not go back to the first's.
+    const start = fill(40);
+    const at = 70_000;
+    const marks: PusherDropMark[] = [];
+    let s = start;
+    for (const [hole, seed] of [[0, 11], [2, 12]] as const) {
+      const phase = currentPusherPhase(s, at);
+      const r = processInsert(s, 'p', hole, phase, seed);
+      marks.push({ chipId: r.chipId, hole, phase, atMs: at, seed });
+      s = r.state;
+    }
+    let replays = queueDrops([], start, { ...s, recentDrops: marks }, GEOM);
+    expect(replays).toHaveLength(2);
+    const quick = { ...replays[1], startMs: replays[0].startMs - replays[1].plan.endMs - 200 };
+    replays = [replays[0], quick];
+    const quickEnd = quick.startMs + quick.plan.endMs;
+    const slowLand = replays[0].startMs + replays[0].plan.trace.landMs;
+    expect(quickEnd).toBeLessThan(slowLand);
+    // Feed `live` back frame by frame, as the cabinet does: once the second
+    // drop has played out, the table stays its final one until the first
+    // coin lands (less that coin, still in the air).
+    const slowChip = replays[0].plan.trace.chipId;
+    const sort = (ps: { chipId: number }[]) => [...ps].sort((x, y) => x.chipId - y.chipId);
+    const finalQuick = sort(replayView(quick.plan, quick.plan.endMs).table).filter((p) => p.chipId !== slowChip);
+    let checked = 0;
+    for (let t = quickEnd - 50; t < slowLand; t += 37) {
+      const { view, live } = cabinetView(replays, t);
+      replays = live;
+      if (t < quickEnd) continue;
+      expect(sort(view!.table)).toEqual(finalQuick);
+      checked++;
+    }
+    expect(checked).toBeGreaterThan(3);
+  });
+
+  it('queues a later drop even when it has already played out', () => {
+    const start = fill(30);
+    const at = 60_000;
+    const phase = currentPusherPhase(start, at);
+    const r = processInsert(start, 'p', 1, phase, 3);
+    const next = { ...r.state, recentDrops: [{ chipId: r.chipId, hole: 1 as PusherHole, phase, atMs: at, seed: 3 }] };
+    const q = queueDrops([], start, next, GEOM);
+    expect(q).toHaveLength(1);
+    // Long over: nothing left to draw but the record.
+    expect(cabinetView(q, at + 60_000)).toEqual({ view: null, live: [] });
   });
 });

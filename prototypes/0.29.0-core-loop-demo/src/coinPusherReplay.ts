@@ -407,16 +407,18 @@ export const REPLAY_MAX = 32;
 
 /**
  * A new record seen: every drop since the one before queued behind the
- * replays still playing, and those that are over by `now` left out. When the
+ * replays still playing (cabinetView drops each once it's over). When the
  * new drops can't all be replayed (planDrops), the queue is dropped and the
  * cabinet draws the record.
  */
 export function queueDrops(
-  replays: readonly ScheduledReplay[], prev: CoinPusherState, next: CoinPusherState, now: number, geom: ReplayGeometry,
+  replays: readonly ScheduledReplay[], prev: CoinPusherState, next: CoinPusherState, geom: ReplayGeometry,
 ): ScheduledReplay[] {
   const planned = planDrops(prev, next, geom);
   if (!planned) return [];
-  return [...replays, ...planned.filter((r) => now - r.startMs < r.plan.endMs)].slice(-REPLAY_MAX);
+  // Even a drop already played out stays queued: while an older one is in
+  // the air its table is the one to draw (cabinetView prunes it after).
+  return [...replays, ...planned].slice(-REPLAY_MAX);
 }
 
 /** Everything the cabinet draws while drops are replaying: the table, and
@@ -441,7 +443,10 @@ export function cabinetView(replays: readonly ScheduledReplay[], now: number): {
   const views = replays.map((r) => replayView(r.plan, Math.max(0, now - r.startMs)));
   const landed = replays.map((r) => now - r.startMs >= r.plan.trace.landMs);
   const k = landed.lastIndexOf(true);
-  const live = replays.filter((_, i) => (i < k ? !landed[i] : !views[i].done));
+  // The latest landed drop's table stays the one drawn until every older
+  // drop still in the air has landed, even once its own replay is over.
+  const olderAirborne = landed.some((l, i) => i < k && !l);
+  const live = replays.filter((_, i) => (i < k ? !landed[i] : i === k ? !views[i].done || olderAirborne : !views[i].done));
   if (live.length === 0) return { view: null, live };
   const base = views[Math.max(0, k)];
   const falling = views.filter((_, i) => !landed[i]);

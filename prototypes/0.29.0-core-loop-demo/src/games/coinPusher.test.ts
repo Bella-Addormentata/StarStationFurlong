@@ -1302,6 +1302,11 @@ describe('traceDrop', () => {
       const start = dropStartMs(r.state, { ...dropOf(r, 0, phase, 1), atMs: pressed + lag });
       expect(start).toBeCloseTo(pressed, 6);
     }
+    // The furthest lead the operator honours, with the phase off by as much
+    // as it lets pass, still starts then.
+    const pressed = 9_999;
+    const ahead = { phase: (currentPusherPhase(s0, pressed) + DROP_PHASE_MATCH_MS / PUSHER_PERIOD_MS / 2) % 1, atMs: pressed - MAX_DROP_LEAD_MS };
+    expect(Math.abs(dropStartMs(s0, ahead) - pressed)).toBeLessThan(DROP_PHASE_MATCH_MS);
   });
 });
 
