@@ -197,12 +197,13 @@ pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
 
 /// #231 P6b: file the member cards a `cap` payload carries into the address
 /// book under `room` — each verified (signature, skew), our own skipped — and
-/// save the book when it changed. Returns how many were new or newer. The
-/// CALLER has checked the accepted cap's [`ChiaRoomCap::may_share_card`]: a
-/// public, bundled or posture-unknown room's hints never fill the book, for
-/// the reason the `contact` frame gives.
+/// save the book to `peers_path` when it changed. Returns how many were new or
+/// newer. The CALLER has checked the accepted cap's
+/// [`ChiaRoomCap::may_share_card`]: a public, bundled or posture-unknown
+/// room's hints never fill the book, for the reason the `contact` frame gives.
 pub fn file_member_cards(
     peers: &Mutex<crate::chia_contact::PeerBook>,
+    peers_path: &std::path::Path,
     self_id: &iroh::PublicKey,
     room: &str,
     payload: &[u8],
@@ -226,8 +227,8 @@ pub fn file_member_cards(
         }
     }
     if filed > 0 {
-        if let Err(e) = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE)) {
-            eprintln!("⛓️ ChiaHub contact: could not save {}: {e}", crate::chia_contact::PEERS_FILE);
+        if let Err(e) = book.save(peers_path) {
+            eprintln!("⛓️ ChiaHub contact: could not save {}: {e}", peers_path.display());
         }
     }
     filed
@@ -627,15 +628,20 @@ mod tests {
         let cards = serde_json::to_string(&vec![card_a.clone(), card_me, card_b]).unwrap();
         let body = payload([4u8; 32], &format!(",\"publicRoom\":false,\"memberCards\":{cards}"));
         let peers = Mutex::new(crate::chia_contact::PeerBook::default());
-        let filed = file_member_cards(&peers, &me.public(), "room-x", &body, now);
+        let dir = std::env::temp_dir().join(format!("ssf-member-cards-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::chia_contact::PEERS_FILE);
+        let filed = file_member_cards(&peers, &path, &me.public(), "room-x", &body, now);
         assert_eq!(filed, 1, "one good card of another node");
+        assert_eq!(crate::chia_contact::PeerBook::load(&path).peers.len(), 1, "saved where it was told");
         let book = peers.lock().unwrap();
         assert_eq!(book.peers.len(), 1);
         let entry = &book.peers[&a.public().to_string()];
         assert_eq!(entry.ck.as_deref(), Some(card_a.ck.as_str()));
         assert!(entry.rooms.contains("room-x"));
         drop(book);
-        assert_eq!(file_member_cards(&peers, &me.public(), "room-x", &body, now), 0, "filed once");
-        assert_eq!(file_member_cards(&peers, &me.public(), "room-x", &payload([4u8; 32], ""), now), 0, "no cards, nothing");
+        assert_eq!(file_member_cards(&peers, &path, &me.public(), "room-x", &body, now), 0, "filed once");
+        assert_eq!(file_member_cards(&peers, &path, &me.public(), "room-x", &payload([4u8; 32], ""), now), 0, "no cards, nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

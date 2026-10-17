@@ -1917,6 +1917,7 @@ async fn handle_wt_connection_inner(
                                     if accepted.as_ref().is_some_and(|cap| cap.may_share_card()) {
                                         let filed = chia_rooms::file_member_cards(
                                             &hub_clone.peers,
+                                            std::path::Path::new(chia_contact::PEERS_FILE),
                                             &iroh_clone.id(),
                                             &envelope.room,
                                             &envelope.payload,
