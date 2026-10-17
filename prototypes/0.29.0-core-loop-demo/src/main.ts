@@ -634,6 +634,7 @@ subscribeDoorPolicy(() => {
 });
 subscribeDoorLayout(() => {
   void networkProvider.refreshRoomCap();
+  refreshWarmNeighbours(); // 🚪🔥 a door fitted or removed
 });
 // 🏒 #115: give the air-hockey session its outbound datagram seam. The
 // provider is a boot-time singleton and sendTick self-gates on connection
@@ -1976,8 +1977,9 @@ async function joinRoomAtEpoch(
   // 🚪🔥 A warm neighbour's replica, applied the same silent way (before
   // start()): the room is already known when the channel comes up, so the
   // arrival gate opens at once and the host ships only what changed since.
-  const warmSeeded = neighbourWarmer.seedDoc(sync.doc, boot.roomId);
-  if (warmSeeded) console.log(`🚪🔥 joined ${boot.roomId} from its warm replica`);
+  if (neighbourWarmer.seedDoc(sync.doc, boot.roomId)) {
+    console.log(`🚪🔥 joined ${boot.roomId} from its warm replica`);
+  }
   await sync.start();
   if (epoch !== sessionEpoch) {
     // Superseded while the sync spun up. A concurrent leaveRoom may already
@@ -2002,12 +2004,13 @@ async function joinRoomAtEpoch(
   // No awaits below this line — the epoch can no longer go stale mid-bind,
   // so every observer/handler below attaches to the CURRENT session's doc.
 
-  // 🚪🔥 A warm session (open, or still dialling) may already have linked this
-  // node to the room's host, so no bridge `connected` status may ever reach
-  // this session (the node does not dial a peer it is already linked to). Arm
-  // the gate now and ask again, as the background sessions do: only the
-  // host's own VERIFIED answer opens it, never the node's unsigned replica.
-  if ((warmSeeded || neighbourWarmer.isWarming(boot.roomId)) && !roomHostedHere(boot.roomId)) {
+  // 🚪🔥 A warm session (open, dialling, or already hung up) may have linked
+  // this node to the room's host, and the node keeps that peer and does not
+  // dial it again, so no bridge `connected` status may ever reach this
+  // session. Arm the gate for every room hosted elsewhere and ask again, as
+  // the background sessions do: only the host's own VERIFIED answer opens it,
+  // never the node's unsigned replica.
+  if (!roomHostedHere(boot.roomId)) {
     sync.markPeerLinked();
     sync.resync();
   }
