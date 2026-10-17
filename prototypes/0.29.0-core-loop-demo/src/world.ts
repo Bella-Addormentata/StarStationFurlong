@@ -5012,7 +5012,8 @@ export class World {
     const ds = this.dockingSystem;
     if (zoomLevel !== 1 || !ds || this.isMorphing || !this.isPlayerActive()) {
       if (this.fpAutoOpened.size && ds) {
-        for (const id of this.fpAutoOpened) ds.closeDoor(id);
+        const scripted = this.player.getActiveDoorId();
+        for (const id of this.fpAutoOpened) if (id !== scripted) ds.closeDoor(id);
       }
       this.fpAutoOpened.clear();
       this.fpTransitArmed = true;
@@ -5052,7 +5053,11 @@ export class World {
       DOOR_OPENING_WIDTH,
     );
 
+    // 🚪🔒 A door in a scripted walk (the vestibule walk among them) belongs
+    // to that walk's hooks: never auto-opened or auto-closed under it.
+    const scriptedDoorId = this.player.getActiveDoorId();
     for (const door of DOORS) {
+      if (door.id === scriptedDoorId) continue;
       const approachDist = Math.hypot(p.x - door.front.x, p.z - door.front.z);
 
       const state = ds.getDockingState(door.id);
