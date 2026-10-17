@@ -4282,14 +4282,12 @@ const buildAlligatorsTable = (ctx: BuildCtx): void => {
   const rimGeo = new THREE.TorusGeometry(IA_TABLE_R + 0.05, 0.05, 10, 72);
   rimGeo.rotateX(Math.PI / 2);
   place(rimGeo, m(0xb8a46a, 0.35, 0.55), 0, S + 0.02, 0);
-  // ⚙ Settings gears (settingsGear.ts) on the cabinet's skirt, one a little
-  // to each seat's left, opening the table card (rules, the seats, the
-  // owner's RESET).
-  for (let seat = 0; seat < IA_SEATS; seat++) {
-    const g = seatAngle(seat) - 0.22;
-    for (const gear of addSettingsGear(place, m, Math.cos(g) * 1.075, S - 0.11, Math.sin(g) * 1.075, 0.06, Math.atan2(Math.cos(g), Math.sin(g)))) {
-      gear.userData.settingsGear = ctx.itemId;
-    }
+  // ⚙ One settings gear (settingsGear.ts) on the cabinet's skirt, a little
+  // to seat 0's left, opening the table card (rules, the seats, the owner's
+  // RESET). One gear per machine.
+  const g = seatAngle(0) - 0.22;
+  for (const gear of addSettingsGear(place, m, Math.cos(g) * 1.075, S - 0.11, Math.sin(g) * 1.075, 0.06, Math.atan2(Math.cos(g), Math.sin(g)))) {
+    gear.userData.settingsGear = ctx.itemId;
   }
 
   // The spinning top — CanvasTexture (NearestFilter, the wall-screen idiom):
@@ -8355,13 +8353,12 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     place(new THREE.BoxGeometry(0.09, 0.42, 0.09), m(CHROME, 0.4, 0.6), lx, 0.31, lz);
     place(new THREE.BoxGeometry(0.11, 0.03, 0.11), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
   }
-  // ⚙ Settings gears (settingsGear.ts) on a kick panel between the front
-  // legs, as on the slot machine: the machine card (rules, what's inside).
+  // ⚙ One settings gear (settingsGear.ts) centred on a kick panel between
+  // the front legs, as on the slot machine: the machine card (rules, what's
+  // inside).
   place(new THREE.BoxGeometry(0.55, 0.36, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.31, -0.22);
-  for (const gx of [-0.13, 0.13]) {
-    for (const gear of addSettingsGear(place, m, gx, 0.31, -0.237, 0.06, Math.PI)) {
-      gear.userData.settingsGear = itemId;
-    }
+  for (const gear of addSettingsGear(place, m, 0, 0.31, -0.237, 0.06, Math.PI)) {
+    gear.userData.settingsGear = itemId;
   }
   // Machine body — an open-fronted shell (back, floor, low skirts), so the
   // playfield shows through the glass. (A solid body box here would hide the
