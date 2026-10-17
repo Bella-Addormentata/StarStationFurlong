@@ -514,3 +514,23 @@ export function doorBeingCrossed(
   }
   return best;
 }
+
+
+// ── 🚶🧭 First-person heading on arrival ─────────────────────────────────────
+
+/**
+ * The first-person heading that looks straight into the room from a door on a
+ * wall whose outward normal is `outwardYaw`: perpendicular to the door frame,
+ * pointing in. Same convention as the first-person look (`sin`, `cos` of the
+ * yaw is the XZ forward) and as doorLayout's `outwardYaw`, folded to (−π, π].
+ *
+ * Owner request: walking through a door in first person used to arrive facing
+ * whatever way the look happened to point in the old room, which rarely
+ * matched the door you came out of. The look now turns to face straight out
+ * of that door into the new room; the up/down tilt is left alone.
+ */
+export function inwardFirstPersonYaw(outwardYaw: number): number {
+  const a = outwardYaw + Math.PI;
+  const folded = a - 2 * Math.PI * Math.floor((a + Math.PI) / (2 * Math.PI));
+  return folded === -Math.PI ? Math.PI : folded;
+}

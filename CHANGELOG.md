@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- **🧭 First person comes out of a door facing into the room.** After walking through a door or vestibule in first person, the view in the next module now always faces straight out of the door you came through, square to its frame, instead of whichever way you happened to be looking. Your up/down tilt is kept.
+
 ## v0.40.0 — 2026-10-13
 
 - **📜 The plan documents agree with the decisions on record ([#259](https://github.com/Bella-Addormentata/StarStationFurlong/pull/259), [#231](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) S-0 step 0).** Six downstream plans and the sovereign plan carry dated one-line errata: B-7 gates browser chain code only (D2), so node-side chain work waits on S-0's chain-access seam and, for anything that moves money, on S-2, PR E and PR F; the coinset gateway client goes away outright with no dev/test fallback, once all nine gateway call sites run on the peer implementation; and the ChiaHub review records what has landed (#238, #245, #254), that presence is keyed by a per-node contact key, and that its §4 punch-intent protocol was superseded by the beat watcher and hold. Documentation only.
