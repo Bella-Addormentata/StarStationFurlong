@@ -42,6 +42,9 @@ export interface NeighbourWarmer {
   /** Apply `roomId`'s warm state to `doc` (a join's fresh doc, BEFORE its
    *  sync starts, like the room-cache restore). True when it did. */
   seedDoc(doc: Y.Doc, roomId: string): boolean;
+  /** Is a session to `roomId` open OR still dialling? Either way this node
+   *  may already be linked to that room's host. */
+  isWarming(roomId: string): boolean;
   /** The rooms with an open session (diagnostics, tests). */
   warmRoomIds(): string[];
   /** Hang up everything. */
@@ -207,6 +210,11 @@ export function createNeighbourWarmer(deps: NeighbourWarmerDeps, max = MAX_WARM_
       } catch {
         return false;
       }
+    },
+
+    isWarming(roomId) {
+      const entry = entries.get(roomId);
+      return !!entry && (entry.opening || (!!entry.session && !entry.session.closed));
     },
 
     warmRoomIds() {

@@ -83,6 +83,18 @@ describe('createNeighbourWarmer', () => {
     expect(warmer.seedDoc(new Y.Doc(), 'elsewhere')).toBe(false);
   });
 
+  it('counts a room as warming while its open is still dialling', async () => {
+    const { warmer, dials } = harness();
+    warmer.setNeighbours([n('next')], 'here');
+    expect(warmer.isWarming('next')).toBe(true);
+    expect(warmer.seedDoc(new Y.Doc(), 'next')).toBe(false);
+    await dials[0].answer(fakeSession('next'));
+    expect(warmer.isWarming('next')).toBe(true);
+    expect(warmer.isWarming('elsewhere')).toBe(false);
+    warmer.setNeighbours([], 'here');
+    expect(warmer.isWarming('next')).toBe(false);
+  });
+
   it('hangs up a room that is no longer next door, including one still dialling', async () => {
     const { warmer, dials } = harness();
     warmer.setNeighbours([n('a'), n('b')], 'here');

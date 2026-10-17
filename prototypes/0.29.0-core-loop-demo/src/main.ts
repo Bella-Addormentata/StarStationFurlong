@@ -2002,12 +2002,12 @@ async function joinRoomAtEpoch(
   // No awaits below this line — the epoch can no longer go stale mid-bind,
   // so every observer/handler below attaches to the CURRENT session's doc.
 
-  // 🚪🔥 The warm session already linked this node to the room's host, so no
-  // bridge `connected` status may ever reach this session (the node does not
-  // dial a peer it is already linked to). Arm the gate now and ask again, as
-  // the background sessions do: only the host's own VERIFIED answer opens it,
-  // never the node's unsigned replica.
-  if (warmSeeded && !roomHostedHere(boot.roomId)) {
+  // 🚪🔥 A warm session (open, or still dialling) may already have linked this
+  // node to the room's host, so no bridge `connected` status may ever reach
+  // this session (the node does not dial a peer it is already linked to). Arm
+  // the gate now and ask again, as the background sessions do: only the
+  // host's own VERIFIED answer opens it, never the node's unsigned replica.
+  if ((warmSeeded || neighbourWarmer.isWarming(boot.roomId)) && !roomHostedHere(boot.roomId)) {
     sync.markPeerLinked();
     sync.resync();
   }
