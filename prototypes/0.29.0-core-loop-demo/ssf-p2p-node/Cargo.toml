@@ -102,6 +102,10 @@ curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false, optional
 # The tests' mock full node builds a header block, whose BLS fields need the
 # crate the publish feature makes optional.
 chia-bls = { version = "0.36", features = ["serde"] }
+# The TLS test mints a certificate chain a CA other than Chia's signed, to see
+# the mock full node turn it away as a real one would. Already in the tree
+# through `chia-ssl`; nothing new is built.
+rcgen = "0.13"
 
 [features]
 default = ["chia-read"]
