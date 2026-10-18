@@ -83,8 +83,9 @@ export function buildRoomCapPayload(
 }
 
 /** A contact card as it may arrive from a pass or from the node: every field
- *  present with its type, nothing more trusted than that (the node verifies the
- *  signature). `null` for anything else. */
+ *  present with its type, the timestamp one the node can read, nothing more
+ *  trusted than that (the node verifies the signature). `null` for anything
+ *  else. */
 export function normalizeContactCard(value: unknown): ContactCard | null {
   if (!value || typeof value !== 'object') return null;
   const c = value as Record<string, unknown>;
@@ -92,8 +93,13 @@ export function normalizeContactCard(value: unknown): ContactCard | null {
   if (typeof c.ck !== 'string' || c.ck.length === 0) return null;
   if (typeof c.kxPk !== 'string' || c.kxPk.length === 0) return null;
   if (typeof c.sig !== 'string' || c.sig.length === 0) return null;
-  if (typeof c.issuedAt !== 'number' || !Number.isFinite(c.issuedAt) || c.issuedAt < 0) return null;
-  return { nodeId: c.nodeId, ck: c.ck, kxPk: c.kxPk, issuedAt: Math.floor(c.issuedAt), sig: c.sig };
+  // A timestamp the node reads as a u64: a safe integer. A card saying `1e100`
+  // (or anything past 2^53) is left out HERE, since the node refuses a cap it
+  // cannot read whole — the room's key and posture, and a later Share Card
+  // OFF, with it (#272 review round 13). A fraction is floored, as before.
+  const issuedAt = typeof c.issuedAt === 'number' ? Math.floor(c.issuedAt) : Number.NaN;
+  if (!Number.isSafeInteger(issuedAt) || issuedAt < 0) return null;
+  return { nodeId: c.nodeId, ck: c.ck, kxPk: c.kxPk, issuedAt, sig: c.sig };
 }
 
 /** Of two cards for one node, the one issued later (a rotated key wins). */
@@ -200,6 +206,14 @@ export function cardsForPass(
   });
 }
 
+/** JSON for `btoa`: every character beyond Latin-1 spelled as the `\\uXXXX`
+ *  escape JSON allows, since `JSON.stringify` writes such characters as they
+ *  are and `btoa` takes Latin-1 alone (#272 review round 13). Reads back the
+ *  same; a surrogate pair becomes two escapes, as JSON spells one. */
+export function latin1Json(value: unknown): string {
+  return JSON.stringify(value).replace(/[^\u0000-\u00ff]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 /** #231 P6b: a pass seed with every node card struck from its member hints —
  *  what may leave for a PUBLIC audience (#272 review round 11). A seed is the
  *  base64 JSON of a `RoomBootstrap`, bare or in a pass URL's `?seed=` param;
@@ -209,7 +223,8 @@ export function cardsForPass(
  *  contact key out of the older pass. The route stays (node ids, relays,
  *  direct addresses); only the cards go. A seed with no card, or one that is
  *  not such JSON (a bundled station's URL, a bare room fragment), is returned
- *  as it is. */
+ *  as it is. A seed whose JSON spells a character beyond Latin-1 is re-encoded
+ *  the same way (`latin1Json`, round 13), never handed back with its cards. */
 export function seedWithoutCards(seed: string): string {
   const strip = (b64: string): string | null => {
     let boot: unknown;
@@ -226,19 +241,22 @@ export function seedWithoutCards(seed: string): string {
       const { nodeCard: _card, ...route } = h as { nodeCard?: unknown };
       return route;
     });
-    return btoa(JSON.stringify({ ...(boot as object), memberHints: routes }));
+    return btoa(latin1Json({ ...(boot as object), memberHints: routes }));
   };
+  // A pass URL carries the seed in its `seed` param. Only the URL parse is
+  // guarded: a seed that fails to strip is never returned with its cards.
+  let url: URL | null = null;
   try {
-    const url = new URL(seed);
-    const q = url.searchParams.get('seed');
-    if (q) {
-      const stripped = strip(q);
-      if (stripped === null) return seed;
-      url.searchParams.set('seed', stripped);
-      return url.toString();
-    }
+    url = new URL(seed);
   } catch {
-    /* not a URL: a bare seed */
+    url = null; // not a URL: a bare seed
+  }
+  const q = url?.searchParams.get('seed');
+  if (url && q) {
+    const stripped = strip(q);
+    if (stripped === null) return seed;
+    url.searchParams.set('seed', stripped);
+    return url.toString();
   }
   return strip(seed) ?? seed;
 }

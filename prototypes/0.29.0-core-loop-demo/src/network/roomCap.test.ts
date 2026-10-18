@@ -6,6 +6,7 @@ import {
   buildRoomCapPayload,
   cardsForPass,
   forgetSessionFlags,
+  latin1Json,
   seedWithoutCards,
   memberCardsOf,
   newerCard,
@@ -55,6 +56,13 @@ describe('room cap payload (N8 / D3)', () => {
     expect(normalizeContactCard({ ...card('a'), ck: '' })).toBeNull();
     expect(normalizeContactCard({ ...card('a'), issuedAt: '100' })).toBeNull();
     expect(normalizeContactCard({ ...card('a'), issuedAt: -1 })).toBeNull();
+    // A timestamp the node cannot read as a u64 leaves the card out — not the cap (round 13).
+    expect(normalizeContactCard({ ...card('a'), issuedAt: 1e100 })).toBeNull();
+    expect(normalizeContactCard({ ...card('a'), issuedAt: 2 ** 53 })).toBeNull();
+    expect(normalizeContactCard({ ...card('a'), issuedAt: Number.POSITIVE_INFINITY })).toBeNull();
+    expect(normalizeContactCard({ ...card('a'), issuedAt: Number.NaN })).toBeNull();
+    expect(normalizeContactCard({ ...card('a'), issuedAt: Number.MAX_SAFE_INTEGER })).toEqual(card('a', Number.MAX_SAFE_INTEGER));
+    expect(normalizeContactCard({ ...card('a'), issuedAt: 0 })).toEqual(card('a', 0));
     expect(normalizeContactCard({ ...card('a'), sig: undefined })).toBeNull();
     expect(normalizeContactCard(null)).toBeNull();
     expect(normalizeContactCard('card')).toBeNull();
@@ -71,8 +79,12 @@ describe('room cap payload (N8 / D3)', () => {
       { irohNodeId: 'c', nodeCard: card('x') },
       { irohNodeId: 'a', nodeCard: card('a', 200) },
       { irohNodeId: 'd', nodeCard: { nodeId: 'd' } as never },
+      { irohNodeId: 'e', nodeCard: card('e', 1e100) },
     ];
     expect(memberCardsOf(hints)).toEqual([card('a')]);
+    // One malformed card leaves the roster, never the cap: the key, the
+    // posture and the rest of the cards still go (round 13).
+    expect(buildRoomCapPayload('k', false, false, 1, true, memberCardsOf(hints))).toMatchObject({ roomKeyB64: 'k', memberCards: [card('a')], passPrivate: true });
     expect(memberCardsOf(undefined)).toEqual([]);
   });
 
@@ -325,6 +337,26 @@ describe('room cap payload (N8 / D3)', () => {
     expect(seedWithoutCards('#room=module-hub')).toBe('#room=module-hub');
     expect(seedWithoutCards(btoa('not json'))).toBe(btoa('not json'));
     expect(seedWithoutCards(btoa('[1,2]'))).toBe(btoa('[1,2]'));
+  });
+
+  it('re-encodes a seed whose JSON spells a character beyond Latin-1, bare or in a pass URL (review round 13)', () => {
+    // A seed is base64 of JSON, and JSON may spell any character as \uXXXX:
+    // parsed, the character is real, and `btoa` takes Latin-1 alone. The
+    // stripped seed spells it the same way and reads back the same — and is
+    // never handed back with its cards.
+    const relay = 'https://relay/\u{1F680}';
+    const boot = {
+      v: 2, roomId: 'r', roomKeyB64: 'a2V5', wtUrl: 'wss://\u0100.example/ssf', certHashesB64: ['c'],
+      memberHints: [{ irohNodeId: 'me', irohRelayUrls: [relay], nodeCard: card('me') }, { irohNodeId: 'them', nodeCard: card('them') }],
+      issuedAt: 5,
+    };
+    const routes = [{ irohNodeId: 'me', irohRelayUrls: [relay] }, { irohNodeId: 'them' }];
+    expect(() => btoa(JSON.stringify(boot))).toThrow();
+    expect(latin1Json({ a: '\u0100\u{1F680}' })).toBe('{"a":"\\u0100\\ud83d\\ude80"}');
+    const seed = btoa(latin1Json(boot));
+    expect(JSON.parse(atob(seedWithoutCards(seed)))).toEqual({ ...boot, memberHints: routes });
+    const url = new URL(seedWithoutCards(`ssf://room?seed=${encodeURIComponent(seed)}`));
+    expect(JSON.parse(atob(url.searchParams.get('seed')!))).toEqual({ ...boot, memberHints: routes });
   });
 
   it('sequences caps by the clock but never at or below the last one', () => {
