@@ -99,9 +99,9 @@ function machineWith(n: number, owner = OWNER): CoinPusherState {
 /** A published machine plus a pending request whose drop pays out (at least
  *  `minPaid` chips). */
 function payingSetup(minPaid = 1): { base: CoinPusherState; req: PusherInsertRequest; next: CoinPusherState } {
-  const base = machineWith(60);
+  const base = machineWith(300);
   for (let seed = 0; seed < 500; seed++) {
-    const req = request(PLAYER, `req-${seed}`);
+    const req = request(PLAYER, `req-${seed}`, (seed % 3) as PusherHole, (seed * 0.618) % 1);
     const next = dropFor(base, req, seed);
     if (next.lastDrop!.paid >= minPaid) {
       writeCoinPusherState(MACHINE, base);

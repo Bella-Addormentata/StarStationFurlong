@@ -207,10 +207,12 @@ import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
 // reads the sweep clock and the machine's meter from it.
 import {
   chipsInMachine, currentPusherPhase, pusherFaceX,
-  HOLE_COUNT, HOLE_XS, MACHINE_MAX_CHIPS, PLAT_UP_FRONT, PUSHER_ANTE,
+  HOLE_COUNT, MACHINE_MAX_CHIPS, PLAT_UP_FRONT, PUSHER_ANTE,
   PUSHER_REQUEST_TTL_MS,
 } from './games/coinPusher';
 import type { CoinPusherState, PusherHole, PusherRefusalReason } from './games/coinPusher';
+/** The drop board's holes as the panel names them, left to right. */
+const COIN_PUSHER_HOLE_NAMES = ['LEFT', 'MIDDLE', 'RIGHT'] as const;
 import type { ArcadeScreenPainter } from './arcadeScreen';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
@@ -5977,7 +5979,8 @@ export function coinPusherGearCard(itemId: string, isHouse: () => boolean): Gear
       const operator = coinPusherOperatorState();
       const rows = [
         gearSection([
-          `EACH DROP COSTS ${PUSHER_ANTE} CHIP · PICK ONE OF ${HOLE_COUNT} HOLES AND TIME IT AGAINST THE PUSHER`,
+          `EACH DROP COSTS ${PUSHER_ANTE} CHIP · PICK ONE OF ${HOLE_COUNT} HOLES · IT BOUNCES DOWN THE PEGS AND LANDS ON ITS EDGE`,
+          'A COIN STANDS UNTIL THE PUSHER OR ANOTHER CHIP KNOCKS IT OVER',
           'CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS',
           'THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE',
           `THE MACHINE HOLDS UP TO ${MACHINE_MAX_CHIPS} CHIPS`,
@@ -6213,7 +6216,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       timingNote = '';
     }
     const status = panel.querySelector<HTMLElement>('#cp-status')!;
-    status.textContent = flash || (online ? 'PICK A HOLE AND TIME YOUR DROP'
+    status.textContent = flash || (online ? 'PICK A HOLE AND DROP A CHIP'
       : operator === 'starting' ? 'THE MACHINE IS STARTING UP…'
         : 'MACHINE OFFLINE — ITS OWNER RUNS IT');
     panel.querySelector<HTMLElement>('#cp-timing-note')!.textContent = timingNote;
@@ -6224,8 +6227,6 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       btn.style.borderColor = i === selectedHole ? '#D4A84B' : '#3A424C';
       btn.style.background = i === selectedHole
         ? 'rgba(212,168,75,0.18)' : 'rgba(212,168,75,0.05)';
-      const mark = panel.querySelector<HTMLElement>(`#cp-mark-${i}`);
-      if (mark) mark.style.background = i === selectedHole ? '#D4A84B' : '#3A424C';
     }
     const insertBtn = panel.querySelector<HTMLButtonElement>('#cp-insert')!;
     insertBtn.disabled = !dropOpen;
@@ -6234,7 +6235,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         : pending ? 'DROPPING…'
           : chips < PUSHER_ANTE ? 'NEED A CHIP — VISIT THE CASHIER'
             : full ? 'MACHINE FULL'
-              : `DROP ONE CHIP · HOLE ${selectedHole + 1}`;
+              : `DROP ONE CHIP · ${COIN_PUSHER_HOLE_NAMES[selectedHole]}`;
     paintTray('cp-rack', chipsFor(chips), 'Your chips', 'NO CHIPS — VISIT THE CASHIER');
     paintTray('cp-won', chipsFor(lastPaid ?? 0), 'Your last drop paid',
       lastPaid === 0 ? 'NOTHING FELL' : '');
@@ -6295,16 +6296,15 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         <div id="cp-status" role="status" aria-live="polite" style="min-height:14px;text-align:center;font-size:9px;color:${GT_GOLD_BRIGHT};font-weight:800;"></div>
         <div id="cp-timing-note" aria-live="polite" style="min-height:11px;text-align:center;font-size:8px;color:#E8ECF2;"></div>
         <div style="display:flex;flex-direction:column;gap:3px;">
-          <div style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">THE PUSHER — DROP AS IT SWEEPS PAST YOUR HOLE</div>
+          <div style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">THE PUSHER — A COIN THAT LANDS AS IT REACHES THE FRONT STAYS STANDING</div>
           <div style="position:relative;height:24px;background:#0A0E1F;border:1px solid #3A424C;border-radius:4px;overflow:hidden;">
             <div id="cp-bar" style="position:absolute;top:0;bottom:0;left:0;width:0;background:linear-gradient(90deg,#4A5560,#8A93A0);border-right:3px solid #D4A84B;"></div>
-            ${HOLE_XS.map((x, i) => `<div id="cp-mark-${i}" style="position:absolute;top:3px;bottom:3px;left:${((x / PLAT_UP_FRONT) * 100).toFixed(2)}%;width:2px;margin-left:-1px;background:#3A424C;"></div>`).join('')}
           </div>
         </div>
         <div style="display:flex;gap:6px;">
-          ${HOLE_XS.map((_, i) => `
+          ${COIN_PUSHER_HOLE_NAMES.map((name, i) => `
             <button id="cp-hole-${i}" style="flex:1;padding:12px 6px;background:rgba(212,168,75,0.05);border:2px solid #3A424C;color:${GT_GOLD};font:800 10px inherit;cursor:pointer;">
-              HOLE ${i + 1}
+              ${name}
             </button>
           `).join('')}
         </div>
@@ -6326,7 +6326,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
           <canvas id="cp-inside" role="img" width="760" height="112" style="width:380px;height:56px;"></canvas>
           <button id="cp-empty" style="padding:8px;background:rgba(230,80,60,0.10);border:1px solid #A03020;color:#FF9070;font:800 10px inherit;cursor:pointer;">OPEN THE DOOR &amp; EMPTY THE MACHINE</button>
         </div>
-        <div style="font-size:8px;color:${GT_DIM};text-align:center;line-height:1.6;">← / → PICK A HOLE · SPACE DROPS ONE CHIP · CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS · THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE</div>
+        <div style="font-size:8px;color:${GT_DIM};text-align:center;line-height:1.6;">← / → PICK A HOLE · SPACE DROPS ONE CHIP · IT BOUNCES DOWN THE PEGS AND LANDS ON ITS EDGE · CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS · THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE</div>
       `;
       panel.addEventListener('click', (e) => e.stopPropagation());
       for (let i = 0; i < HOLE_COUNT; i++) {

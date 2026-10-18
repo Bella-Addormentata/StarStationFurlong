@@ -46,12 +46,17 @@ import type {
   PropAnimHandle,
   FaucetDishHandle,
 } from "./devices";
-// 🪙 Coin pusher visual driver: the cabinet draws the engine's cross-section —
-// the pusher bar from the sweep clock, the piles from the shared state.
+// 🪙 Coin pusher visual driver: the cabinet draws the engine's table and drop
+// board — the pusher bar from the sweep clock, the chips from the shared
+// state, and every drop replayed from its seed (coinPusherReplay.ts).
 import {
-  CHIP_R, HOLE_XS, PLAT_LOW_BACK, PLAT_LOW_FRONT, PLAT_UP_FRONT,
+  BOARD_H, BOARD_PEGS, CHIP_R, CHIP_T, FIELD_HALF_W, HOLE_US, PEG_R,
   currentPusherPhase, pusherFaceX, unseenDropHoles,
+  type CoinPusherState,
 } from "./games/coinPusher";
+import {
+  cabinetView, clockOffset, noteClock, queueDrops, restingView, type CabinetView, type ReplayGeometry, type ScheduledReplay, type TablePose,
+} from "./coinPusherReplay";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
 import { createArcadeScreenPainter } from "./arcadeScreen";
 // 📺 The cabinets' curved CRT tube and its screen shader (#194).
@@ -5238,8 +5243,8 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       kind: "coinPusher",
       front: { x: 0, z: -1.0 },
       faceAngle: 0,
-      eye: { x: 0, y: 1.30, z: -0.85 },
-      anchor: { x: 0, y: 0.90, z: 0.05 },
+      eye: { x: 0, y: 1.55, z: -1.0 },
+      anchor: { x: 0, y: 1.10, z: 0.08 },
     },
   },
   // 📺 Smart TV on the wall (#186): the terminal's frame — flush-mounted,
@@ -8289,27 +8294,33 @@ function buildSlotMachine({
 }
 
 // ── 🪙 Coin pusher (issue #135) ──────────────────────────────────────────────
-// A stand-up arcade cabinet with a glass-fronted box: three drop holes in the
-// top, a stepped upper/lower platform inside, a sweeping pusher bar at the
-// back of the upper platform, and a coin tray at the front. Chips stay INSIDE
-// the machine until a drop pushes them off the front of the LOWER platform
-// (paid to that drop's player) or the owner opens the door to empty it. No
-// auto-siphon.
+// A stand-up arcade cabinet behind a glass front: a vertical DROP BOARD of
+// pegs at the back with three coin holes along its top, a sweeping pusher bar
+// under it, a stepped upper/lower platform and a coin tray at the front.
+// Chips stay INSIDE the machine until a drop pushes them off the front of the
+// LOWER platform (paid to that drop's player) or the owner opens the door to
+// empty it. No auto-siphon.
 //
-// The engine (games/coinPusher.ts) models ONE back-to-front axis, and the
-// cabinet draws exactly that cross-section: the holes sit in a back-to-front
-// row over the upper platform at the engine's hole positions, every pile is
-// drawn on the centre line at its engine position, and the pusher bar's front
-// face follows the engine's pusherFaceX(phase) through the same mapping.
+// The engine (games/coinPusher.ts) models the table from above (x back to
+// front, u across) and the board from the front (u across, h up); the
+// cabinet draws both at one scale, CP_SCALE metres to the engine unit, so a
+// chip is drawn where the engine has it and the pegs where it bounces off
+// them. Each drop is replayed from its seed (coinPusherReplay.ts): the coin
+// falls down the board, lands standing on its edge in front of the bar and
+// tips over when it is pushed.
 //
-// The cabinet occupies the rear ~1 m of the 1×1 footprint. Standing-only
-// device (no seat); the player walks up, focuses, times a drop, and inserts.
+// Standing-only device (no seat); the player walks up, focuses, times a drop,
+// and inserts.
 //
 // Coordinate scheme (metres, item origin at rot 0):
-//   +z points AWAY from the player standing at the front (x=0, z=-1.0).
-//   Upper platform:  z ∈ [+0.10, +0.32], y ≈ 0.90   engine x ∈ [0, 0.60]
-//   Lower platform:  z ∈ [-0.14, +0.10], y ≈ 0.70   engine x ∈ [0.60, 1.20]
-//   Payout tray:     z ≈ -0.20 (chips paid out leave the model)
+//   +z points AWAY from the player standing at the front (x=0, z=-1.0); the
+//   engine's +u (the player's right) is −x.
+//   Upper platform:  z ∈ [ 0.00, +0.30], top y = 0.90   engine x ∈ [0, 0.60]
+//   Lower platform:  z ∈ [-0.30,  0.00], top y = 0.80   engine x ∈ [0.60, 1.20]
+//   Drop board:      z ≈ +0.32, y ∈ [0.99, 1.39], over the pusher's travel
+//   Payout tray:     z ≈ -0.35 (chips paid out leave the model)
+const CP_SCALE = 0.5;
+
 function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, attach }: BuildCtx) {
   // Palette (matches slot machine gunmetal + gold family so machines read as
   // a coherent arcade set on the floor).
@@ -8320,17 +8331,26 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   const CHIP_G  = 0xd4a84b; // pusher chip gold (matches cage chip color)
   const CHIP_C  = 0xe8e2d2; // ivory chip alt
   const LIGHT   = 0xfff0c8; // warm top light
+  const NEON    = 0xffc860; // the channel's lit trim
 
-  // Engine axis → cabinet z. Upper platform back edge sits 5 mm in front of
-  // the rear wall so the retracted bar never z-fights it.
-  const UPPER_Z_BACK = 0.315, UPPER_Z_FRONT = 0.10;
-  const LOWER_Z_BACK = 0.10, LOWER_Z_FRONT = -0.14;
-  const Z_SCALE = (UPPER_Z_BACK - UPPER_Z_FRONT) / (PLAT_UP_FRONT - 0);
-  const upperZ = (x: number): number =>
-    UPPER_Z_BACK - (x / PLAT_UP_FRONT) * (UPPER_Z_BACK - UPPER_Z_FRONT);
-  const lowerZ = (x: number): number =>
-    LOWER_Z_BACK - ((x - PLAT_LOW_BACK) / (PLAT_LOW_FRONT - PLAT_LOW_BACK))
-      * (LOWER_Z_BACK - LOWER_Z_FRONT);
+  const K = CP_SCALE;
+  const UPPER_Z_BACK = 0.30;
+  const UPPER_Y = 0.90, LOWER_Y = 0.80, TRAY_Y = 0.745, TRAY_Z = -0.35;
+  const BOARD_Z = 0.32, BOARD_Y0 = 0.99;
+  const FIELD_W = 2 * FIELD_HALF_W * K;
+  /** Engine table x → cabinet z; engine u → cabinet x. */
+  const tableZ = (x: number): number => UPPER_Z_BACK - x * K;
+  const tableX = (u: number): number => -u * K;
+  const boardY = (h: number): number => BOARD_Y0 + h * K;
+  const CHIP_RAD = CHIP_R * K, CHIP_H = CHIP_T * K;
+  const geom: ReplayGeometry = {
+    lowerDrop: (UPPER_Y - LOWER_Y) / K,
+    trayDrop: (UPPER_Y - TRAY_Y) / K,
+    level: (CHIP_H + 0.0004) / K,
+    barTop: 0.04 / K,
+    boardExitX: (UPPER_Z_BACK - BOARD_Z) / K,
+    boardExitY: (BOARD_Y0 - UPPER_Y) / K,
+  };
 
   const cabinet = new THREE.Group();
   attach(cabinet);
@@ -8344,41 +8364,181 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     cabinet.add(light);
   };
 
-  // ── Cabinet outer shell ────────────────────────────────────────────────────
-  // Base plinth
-  place(new THREE.BoxGeometry(0.80, 0.10, 0.80), m(BODY, 0.55, 0.40), 0, 0.05, 0.10);
-  // Legs
-  for (const [lx, lz] of [[-0.32, -0.24], [0.32, -0.24], [-0.32, 0.44], [0.32, 0.44]] as const) {
+  // ── Base (plinth, legs, the ⚙ kick panel) ─────────────────────────────────
+  // The front legs and kick panel sit under the cabinet's front, so the
+  // floor's overhang doesn't hide the gear from the player standing there.
+  place(new THREE.BoxGeometry(0.80, 0.10, 0.92), m(BODY, 0.55, 0.40), 0, 0.05, 0.05);
+  for (const [lx, lz] of [[-0.32, -0.36], [0.32, -0.36], [-0.32, 0.44], [0.32, 0.44]] as const) {
     place(new THREE.BoxGeometry(0.09, 0.42, 0.09), m(CHROME, 0.4, 0.6), lx, 0.31, lz);
     place(new THREE.BoxGeometry(0.11, 0.03, 0.11), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
   }
   // ⚙ One settings gear (settingsGear.ts) centred on a kick panel between
   // the front legs, as on the slot machine: the machine card (rules, what's
   // inside).
-  place(new THREE.BoxGeometry(0.55, 0.36, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.31, -0.22);
-  for (const gear of addSettingsGear(place, m, 0, 0.31, -0.237, 0.06, Math.PI)) {
+  place(new THREE.BoxGeometry(0.55, 0.36, 0.02), m(0x14181e, 0.85, 0.1), 0, 0.31, -0.40);
+  for (const gear of addSettingsGear(place, m, 0, 0.31, -0.417, 0.06, Math.PI)) {
     gear.userData.settingsGear = itemId;
   }
-  // Machine body — an open-fronted shell (back, floor, low skirts), so the
-  // playfield shows through the glass. (A solid body box here would hide the
-  // platforms, the pusher and every chip from outside the cabinet.)
-  place(new THREE.BoxGeometry(0.72, 0.60, 0.02), m(BODY, 0.55, 0.45), 0, 0.84, 0.45);
-  place(new THREE.BoxGeometry(0.72, 0.02, 0.72), m(BODY, 0.55, 0.45), 0, 0.55, 0.10);
-  for (const sx of [-0.35, 0.35]) {
-    place(new THREE.BoxGeometry(0.02, 0.16, 0.72), m(BODY, 0.55, 0.45), sx, 0.62, 0.10);
-  }
-  place(new THREE.BoxGeometry(0.72, 0.12, 0.02), m(BODY, 0.55, 0.45), 0, 0.60, -0.26);
-  // Chrome corner posts front-facing
-  for (const sx of [-0.36, 0.36]) {
-    place(new THREE.BoxGeometry(0.03, 0.62, 0.03), m(CHROME, 0.35, 0.7), sx, 0.84, -0.25);
-  }
-  // Marquee / top box (holds the drop holes)
-  place(new THREE.BoxGeometry(0.76, 0.30, 0.76), m(BODY, 0.55, 0.45), 0, 1.29, 0.10);
-  place(new THREE.BoxGeometry(0.72, 0.04, 0.72), m(GOLD, 0.4, 0.5), 0, 1.46, 0.10);
-  // Top warm light
-  addLight(new THREE.PointLight(LIGHT, 0, 2.2), 0, 1.60, 0.10, 0.40);
 
-  // ── Marquee display: the title, or a short message from the panel ─────────
+  // ── Cabinet shell: floor, back, sides, the skirt under the tray ───────────
+  // Above the lower platform the cabinet is glass on three sides, as seaside
+  // pushers are, so a crowd can watch from the sides too; it leans in a
+  // little as it rises. sideX(y) is the outside of a side at height y.
+  const GLASS_Y0 = 0.80, GLASS_Y1 = 1.51;
+  const HALF_Y0 = 0.31, HALF_Y1 = 0.25;
+  const sideX = (y: number): number => HALF_Y0 + (HALF_Y1 - HALF_Y0) * (y - GLASS_Y0) / (GLASS_Y1 - GLASS_Y0);
+  const LEAN = Math.atan2(HALF_Y0 - HALF_Y1, GLASS_Y1 - GLASS_Y0);
+  const SIDE_LEN = Math.hypot(HALF_Y0 - HALF_Y1, GLASS_Y1 - GLASS_Y0);
+  /** A slab `depth` thick from y0 up to y1 whose left and right edges follow
+   *  xl(y) and xr(y): a box with its corners moved, placed at (0, 0, z). */
+  const slab = (y0: number, y1: number, depth: number, xl: (y: number) => number, xr: (y: number) => number,
+    mat: THREE.Material, z: number): THREE.Mesh => {
+    const g = new THREE.BoxGeometry(1, 1, depth);
+    const pos = g.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const y = y0 + (pos.getY(i) + 0.5) * (y1 - y0);
+      pos.setXY(i, pos.getX(i) < 0 ? xl(y) : xr(y), y);
+    }
+    g.computeVertexNormals();
+    return place(g, mat, 0, 0, z);
+  };
+  const bodyMat = m(BODY, 0.55, 0.45);
+  const chromeMat = m(CHROME, 0.35, 0.7);
+  place(new THREE.BoxGeometry(0.62, 0.03, 0.92), bodyMat, 0, 0.535, 0.05);
+  place(new THREE.BoxGeometry(0.62, GLASS_Y0 - 0.55, 0.03), bodyMat, 0, (GLASS_Y0 + 0.55) / 2, 0.505);
+  slab(GLASS_Y0, 1.53, 0.03, (y) => -sideX(y), (y) => sideX(y), bodyMat, 0.505);
+  place(new THREE.BoxGeometry(0.62, 0.22, 0.03), bodyMat, 0, 0.65, -0.395);
+
+  // ── The channel: two platforms between lit side walls ─────────────────────
+  // Solid blocks from the floor up, so the step and the platforms read as one
+  // piece; their tops are the engine's platforms.
+  const deckMat = m(0x8f9aaa, 0.3, 0.6);
+  const upperPlatform = place(new THREE.BoxGeometry(FIELD_W, UPPER_Y - 0.55, 0.30), deckMat, 0, (UPPER_Y + 0.55) / 2, tableZ(0.30));
+  place(new THREE.BoxGeometry(FIELD_W, LOWER_Y - 0.55, 0.30), deckMat, 0, (LOWER_Y + 0.55) / 2, tableZ(0.90));
+  // The tray chips paid out fall into, under the lower platform's lip.
+  place(new THREE.BoxGeometry(FIELD_W + 0.04, 0.03, 0.08), m(CHROME, 0.4, 0.5), 0, TRAY_Y - 0.015, TRAY_Z);
+  place(new THREE.BoxGeometry(FIELD_W, 0.012, 0.06), m(0x14181e, 0.85, 0.1), 0, TRAY_Y + 0.004, TRAY_Z);
+  // Side walls of the channel, and the panels out to the cabinet's sides,
+  // with a strip of warm light along the top of each wall. The walls are
+  // glass too, so the side windows look straight in at the coins.
+  const wallMat = m(GLASS, 0.05, 0.0);
+  wallMat.depthWrite = false;
+  wallMat.userData.baseOpacity = 0.10;
+  const neonMat = m(NEON, 0.4, 0.2, NEON, 0.9);
+  const lampMat = m(NEON, 0.4, 0.2, NEON, 0.6);
+  for (const side of [-1, 1]) {
+    const wx = side * (FIELD_W / 2 + 0.006);
+    place(new THREE.BoxGeometry(0.012, 0.62, 0.80), wallMat, wx, 1.09, 0.09);
+    place(new THREE.BoxGeometry(0.014, 0.012, 0.80), neonMat, wx, 1.405, 0.09);
+    // A fascia either side of the channel behind the glass, so the player
+    // looks in through a lit window: a gold edge and a column of lamps. Its
+    // outer edge follows the cabinet's lean.
+    const inner = FIELD_W / 2 + 0.012;
+    const outer = (y: number): number => sideX(y) - 0.02;
+    slab(0.76, 1.46, 0.02,
+      side < 0 ? (y) => -outer(y) : () => inner,
+      side < 0 ? () => -inner : (y) => outer(y), bodyMat, -0.36);
+    place(new THREE.BoxGeometry(0.008, 0.70, 0.024), m(GOLD, 0.35, 0.6), side * (FIELD_W / 2 + 0.016), 1.11, -0.36);
+    for (let i = 0; i < 6; i++) {
+      const ly = 0.86 + i * 0.1;
+      place(new THREE.CircleGeometry(0.012, 16), lampMat, side * (inner + outer(ly)) / 2, ly, -0.3715, Math.PI);
+    }
+  }
+
+  // ── The drop board ─────────────────────────────────────────────────────────
+  const BOARD_TOP = boardY(BOARD_H);
+  place(new THREE.BoxGeometry(FIELD_W, BOARD_TOP - BOARD_Y0 + 0.04, 0.01), m(0x0b1730, 0.85, 0.1), 0, (BOARD_TOP + BOARD_Y0) / 2, BOARD_Z + 0.017);
+  // Pegs: short chrome pins standing out of the board toward the player.
+  const pegGeo = new THREE.CylinderGeometry(PEG_R * K, PEG_R * K, 0.026, 12);
+  pegGeo.rotateX(Math.PI / 2);
+  const pegMat = m(0xe6c46a, 0.25, 0.8, 0x5a4210, 0.6);
+  for (const peg of BOARD_PEGS) place(pegGeo, pegMat, tableX(peg.u), boardY(peg.h), BOARD_Z + 0.001);
+  // A gold frame round the board.
+  const frameMat = m(GOLD, 0.35, 0.6);
+  for (const y of [BOARD_Y0 - 0.005, BOARD_TOP]) {
+    place(new THREE.BoxGeometry(FIELD_W, 0.006, 0.004), frameMat, 0, y, BOARD_Z + 0.011);
+  }
+  // A clear pane over the board keeps the coin in its plane.
+  const glassMat = m(GLASS, 0.05, 0.0);
+  glassMat.transparent = true;
+  // Every material here is transparent (the fade-in), so draw order is by
+  // distance: glass that wrote depth would hide whatever sorts after it.
+  glassMat.depthWrite = false;
+  glassMat.userData.baseOpacity = 0.12;
+  place(new THREE.BoxGeometry(FIELD_W, BOARD_TOP - BOARD_Y0, 0.004), glassMat, 0, (BOARD_TOP + BOARD_Y0) / 2, BOARD_Z - 0.013);
+  // The coin ledge along the top, with the three holes in it.
+  place(new THREE.BoxGeometry(FIELD_W + 0.03, 0.025, 0.05), m(BODY, 0.5, 0.5), 0, BOARD_TOP + 0.0125, BOARD_Z);
+  const holeRimMeshes: THREE.Mesh[] = [];
+  for (const u of HOLE_US) {
+    const rim = place(new THREE.TorusGeometry(0.02, 0.004, 8, 20), m(GOLD, 0.35, 0.6), tableX(u), BOARD_TOP + 0.027, BOARD_Z);
+    rim.rotation.x = -Math.PI / 2;
+    rim.scale.set(1, 0.45, 1); // a slot a coin goes into on its edge
+    const slot = place(new THREE.PlaneGeometry(0.036, 0.008), m(0x040814, 0.9, 0.05), tableX(u), BOARD_TOP + 0.026, BOARD_Z);
+    slot.rotation.x = -Math.PI / 2;
+    holeRimMeshes.push(rim);
+  }
+
+  // ── Glass front, sides and roof ────────────────────────────────────────────
+  // (and the coin slots along the top of the front, with their tracks back
+  // to the board: TRACK_* is the track's surface at its two ends)
+  const SLOT_Y = 1.478;
+  const TRACK_Z0 = -0.38, TRACK_Z1 = BOARD_Z - 0.035;
+  const TRACK_Y0 = SLOT_Y - CHIP_H / 2, TRACK_Y1 = BOARD_TOP + 0.03;
+  const frontGlass = m(GLASS, 0.05, 0.0);
+  frontGlass.transparent = true;
+  frontGlass.depthWrite = false;
+  frontGlass.userData.baseOpacity = 0.16;
+  slab(0.76, 1.495, 0.006, (y) => -(sideX(y) - 0.03), (y) => sideX(y) - 0.03, frontGlass, -0.385);
+  // The coin slots, one per hole, along the top of the front glass: a coin
+  // goes in flat, slides back down its clear track under the roof to the top
+  // of the board, and turns up on its edge into the hole. Nothing solid but
+  // the slots' bezels, so the board shows through. Each bezel lights with
+  // its hole's rim (paintHoles).
+  // Clear, so a coin above eye height shows from below as it slides back.
+  const trackMat = m(GLASS, 0.1, 0.0);
+  trackMat.depthWrite = false;
+  trackMat.userData.baseOpacity = 0.35;
+  const trackLen = Math.hypot(TRACK_Z1 - TRACK_Z0, TRACK_Y0 - TRACK_Y1);
+  const trackTilt = Math.atan2(TRACK_Y0 - TRACK_Y1, TRACK_Z1 - TRACK_Z0);
+  HOLE_US.forEach((u, i) => {
+    const x = tableX(u);
+    const bezel = place(new THREE.BoxGeometry(0.046, 0.016, 0.004), holeRimMeshes[i].material as THREE.Material, x, SLOT_Y, -0.390);
+    bezel.userData.coinSlot = i;
+    place(new THREE.PlaneGeometry(0.036, 0.007), m(0x040814, 0.9, 0.05), x, SLOT_Y, -0.3925, Math.PI);
+    const midZ = (TRACK_Z0 + TRACK_Z1) / 2, midY = (TRACK_Y0 + TRACK_Y1) / 2;
+    place(new THREE.BoxGeometry(0.04, 0.003, trackLen), trackMat, x, midY - 0.0015, midZ).rotation.x = trackTilt;
+    for (const rx of [-0.021, 0.021]) {
+      place(new THREE.BoxGeometry(0.003, 0.008, trackLen), frameMat, x + rx, midY + 0.002, midZ).rotation.x = trackTilt;
+    }
+  });
+  place(new THREE.BoxGeometry(2 * sideX(1.51), 0.03, 0.04), chromeMat, 0, 1.51, -0.385);
+  // A glass roof back to the backbox, so the playfield shows from above too.
+  place(new THREE.BoxGeometry(2 * sideX(1.52) - 0.04, 0.006, 0.70), frontGlass, 0, 1.52, -0.045);
+  // The side windows: a solid panel up to the lower platform, then a pane
+  // leaning in, framed in chrome.
+  const sideGlass = m(GLASS, 0.05, 0.0);
+  sideGlass.depthWrite = false;
+  sideGlass.userData.baseOpacity = 0.12;
+  const glassMidY = (GLASS_Y0 + GLASS_Y1) / 2;
+  for (const side of [-1, 1]) {
+    place(new THREE.BoxGeometry(0.03, GLASS_Y0 - 0.55, 0.92), bodyMat, side * (HALF_Y0 - 0.015), (GLASS_Y0 + 0.55) / 2, 0.05);
+    const leanIn = (mesh: THREE.Mesh): THREE.Mesh => { mesh.rotation.z = side * LEAN; return mesh; };
+    const midX = side * (sideX(glassMidY) - 0.015);
+    leanIn(place(new THREE.BoxGeometry(0.006, SIDE_LEN, 0.86), sideGlass, midX, glassMidY, 0.05));
+    // Front and back posts, and rails along the bottom and top.
+    for (const z of [-0.395, 0.475]) {
+      leanIn(place(new THREE.BoxGeometry(0.035, SIDE_LEN, 0.03), chromeMat, midX, glassMidY, z));
+    }
+    for (const y of [GLASS_Y0, GLASS_Y1]) {
+      place(new THREE.BoxGeometry(0.035, 0.02, 0.90), chromeMat, side * (sideX(y) - 0.0175), y, 0.04);
+    }
+  }
+
+  // ── Backbox with the marquee, above the board ─────────────────────────────
+  place(new THREE.BoxGeometry(0.62, 0.26, 0.20), m(BODY, 0.55, 0.45), 0, 1.62, 0.41);
+  place(new THREE.BoxGeometry(0.64, 0.03, 0.22), m(GOLD, 0.4, 0.5), 0, 1.765, 0.41);
+  addLight(new THREE.PointLight(LIGHT, 0, 1.6), 0, 1.30, -0.05, 0.35);
+
   const marqueeCanvas = document.createElement('canvas');
   marqueeCanvas.width = 512; marqueeCanvas.height = 96;
   const marqueeCtx = marqueeCanvas.getContext('2d')!;
@@ -8406,81 +8566,74 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   {
     const mat = new THREE.MeshBasicMaterial({ map: marqueeTex, transparent: true, opacity: 0 });
     mat.userData.baseOpacity = 0.96;
-    place(new THREE.PlaneGeometry(0.60, 0.18), mat, 0, 1.30, -0.28);
+    place(new THREE.PlaneGeometry(0.56, 0.105), mat, 0, 1.62, 0.307, Math.PI);
   }
-
-  // ── Three drop holes in a back-to-front row over the upper platform ───────
-  // At the engine's HOLE_XS, so a chip lands under the hole it went into.
-  // The RIM (gold torus) takes the highlight; the DISC is the dark opening.
-  const holeRimMeshes: THREE.Mesh[] = [];
-  for (let i = 0; i < HOLE_XS.length; i++) {
-    const z = upperZ(HOLE_XS[i]);
-    const rim = place(new THREE.TorusGeometry(0.022, 0.005, 8, 20), m(GOLD, 0.35, 0.6), 0, 1.485, z);
-    rim.rotation.x = -Math.PI / 2;
-    const disc = place(new THREE.CircleGeometry(0.018, 20), m(0x040814, 0.9, 0.05), 0, 1.484, z);
-    disc.rotation.x = -Math.PI / 2;
-    holeRimMeshes.push(rim);
-  }
-
-  // ── Interior stepped platforms (upper is BEHIND lower, one step down) ──────
-  // Upper platform (rear half of interior, higher). z ∈ [+0.10, +0.32].
-  const upperPlatform = place(
-    new THREE.BoxGeometry(0.68, 0.02, 0.22),
-    m(0xc0c8d0, 0.35, 0.55),
-    0, 0.90, 0.21,
-  );
-  // Lower platform (front half, lower). z ∈ [-0.14, +0.10]
-  place(
-    new THREE.BoxGeometry(0.68, 0.02, 0.24),
-    m(0xc0c8d0, 0.35, 0.55),
-    0, 0.70, -0.02,
-  );
-  // Rear wall of upper platform (pusher hides behind)
-  place(new THREE.BoxGeometry(0.72, 0.20, 0.02), m(BODY, 0.55, 0.4), 0, 1.00, 0.33);
-  // Step riser between upper and lower
-  place(new THREE.BoxGeometry(0.68, 0.20, 0.02), m(0x2f3846, 0.55, 0.4), 0, 0.80, 0.10);
-  // Payout tray at the very front — chips falling off the lower platform land here.
-  place(new THREE.BoxGeometry(0.68, 0.04, 0.14), m(CHROME, 0.4, 0.5), 0, 0.68, -0.20);
-  place(new THREE.BoxGeometry(0.64, 0.02, 0.12), m(0x14181e, 0.85, 0.1), 0, 0.685, -0.20);
-
-  // ── Glass front / sides ────────────────────────────────────────────────────
-  const glassMat = m(GLASS, 0.05, 0.0);
-  glassMat.transparent = true;
-  glassMat.userData.baseOpacity = 0.20;
-  // Front glass
-  place(new THREE.BoxGeometry(0.68, 0.60, 0.008), glassMat, 0, 0.84, -0.24);
-  // Side glass L/R
-  place(new THREE.BoxGeometry(0.008, 0.60, 0.70), glassMat, -0.34, 0.84, 0.10);
-  place(new THREE.BoxGeometry(0.008, 0.60, 0.70), glassMat, 0.34, 0.84, 0.10);
 
   // ── Pusher bar (its front face tracks the engine's pusherFaceX) ────────────
-  const BAR_DEPTH = 0.08;
+  // Deep enough that its back stays under the board and the backbox wall at
+  // full stroke.
+  const BAR_DEPTH = 0.18;
   const pusher = new THREE.Group();
-  pusher.position.set(0, 0.93, UPPER_Z_BACK + BAR_DEPTH / 2);
+  pusher.position.set(0, UPPER_Y + 0.02, UPPER_Z_BACK + BAR_DEPTH / 2);
   cabinet.add(pusher);
   const barMat = m(CHROME, 0.35, 0.7);
-  pusher.add(new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.05, BAR_DEPTH), barMat));
+  pusher.add(new THREE.Mesh(new THREE.BoxGeometry(FIELD_W - 0.004, 0.04, BAR_DEPTH), barMat));
+  // A gold stripe along its pushing face.
+  const stripe = new THREE.Mesh(new THREE.BoxGeometry(FIELD_W - 0.004, 0.012, 0.002), m(GOLD, 0.35, 0.6));
+  stripe.position.set(0, 0.006, -BAR_DEPTH / 2 - 0.001);
+  pusher.add(stripe);
 
-  // ── Chip pile visuals (rebuilt from state each frame) ──────────────────────
-  // Chips are drawn at the engine's scale, so neighbouring piles touch but
-  // never overlap, exactly as the engine keeps them.
-  const CHIP_H = 0.006;
-  const chipGeometry = new THREE.CylinderGeometry(CHIP_R * Z_SCALE, CHIP_R * Z_SCALE, CHIP_H, 14);
+  // ── Chips (posed every frame, from the record or a replay) ────────────────
+  // Gold or ivory by chip id, with a stamped face so a spinning coin is seen
+  // to spin.
+  const faceCanvas = document.createElement('canvas');
+  faceCanvas.width = 64; faceCanvas.height = 64;
+  {
+    const c = faceCanvas.getContext('2d')!;
+    c.fillStyle = '#ffffff';
+    c.fillRect(0, 0, 64, 64);
+    c.strokeStyle = '#8a7a58';
+    c.lineWidth = 4;
+    c.beginPath(); c.arc(32, 32, 26, 0, Math.PI * 2); c.stroke();
+    c.fillStyle = '#8a7a58';
+    c.font = "bold 30px 'SF Mono','Consolas',monospace";
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText('★', 32, 34);
+  }
+  const faceTex = new THREE.CanvasTexture(faceCanvas);
+  faceTex.colorSpace = THREE.SRGBColorSpace;
+  const chipGeometry = new THREE.CylinderGeometry(CHIP_RAD, CHIP_RAD, CHIP_H, 20);
   // Built after the registration traversal, so the fade-in never reaches
   // these materials: update() copies the bar's revealed opacity onto them.
-  const chipMaterials = [m(CHIP_G, 0.4, 0.35), m(CHIP_C, 0.4, 0.15)];
+  const chipSides = [m(CHIP_G, 0.4, 0.35), m(CHIP_C, 0.4, 0.15)];
+  const chipFaces = chipSides.map((side) => {
+    const face = m(side.color.getHex(), 0.4, 0.3);
+    face.map = faceTex;
+    return face;
+  });
+  /** One material array per colour: [edge, top face, bottom face]. */
+  const chipLooks: THREE.Material[][] = chipSides.map((side, i) => [side, chipFaces[i], chipFaces[i]]);
   const chipPool: THREE.Mesh[] = [];
   const pileGroup = new THREE.Group();
   cabinet.add(pileGroup);
   const acquireChip = (index: number): THREE.Mesh => {
     if (index >= chipPool.length) {
-      const mesh = new THREE.Mesh(chipGeometry, chipMaterials[0]);
+      const mesh = new THREE.Mesh(chipGeometry, chipLooks[0]);
+      mesh.userData.coinPusherChip = true;
       chipPool.push(mesh);
       pileGroup.add(mesh);
     }
     const chip = chipPool[index];
     chip.visible = true;
     return chip;
+  };
+  /** Draw a table pose: `tip` 1 stands the coin on its edge, face to the
+   *  player (its axis along z); 0 lays it flat. */
+  const poseChip = (chip: THREE.Mesh, p: TablePose): void => {
+    chip.position.set(tableX(p.u), UPPER_Y + p.y * K, tableZ(p.x));
+    chip.rotation.set(p.tip * Math.PI / 2, 0, 0);
+    chip.material = chipLooks[p.chipId % 2];
   };
 
   // ── Hole lighting: the selected hole glows; each drop flashes and fades ───
@@ -8504,11 +8657,81 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
    *  the first read, so drops already on the record when it loads don't
    *  flash. */
   let shownUpTo: number | undefined;
+  /** The last record this cabinet saw, and the drops it is replaying (each
+   *  with when its coin went in, by this page's clock), oldest first. */
+  let seen: CoinPusherState | null = null;
+  let replays: ScheduledReplay[] = [];
+  /** How records' drops have arrived against the operator's clock
+   *  (noteClock), so they replay on this page's clock however far apart. */
+  let clockSamples: number[] = [];
+
+  /** A new record: queue a replay of every drop since the record before
+   *  (several can settle between two frames), or, when they can't all be
+   *  replayed, drop the replays and draw the record. */
+  const noticeRecord = (state: CoinPusherState | null, now: number): void => {
+    const prev = seen;
+    seen = state;
+    if (!state || (prev && prev.tick === state.tick && prev.nextChipId === state.nextChipId)) return;
+    if (!prev) {
+      replays = [];
+      return;
+    }
+    clockSamples = noteClock(clockSamples, prev, state, now);
+    replays = queueDrops(replays, prev, state, geom, clockOffset(clockSamples));
+  };
+
+  /** A coin on its way down the board or the chute. */
+  const drawFalling = (idx: number, view: CabinetView): number => {
+    for (const e of view.entries) {
+      // In flat through its slot, back along its track, up on its edge over
+      // the hole and down into it.
+      const chip = acquireChip(idx++);
+      const x = tableX(e.u);
+      const s = e.s;
+      const onTrack = (z: number): number =>
+        TRACK_Y0 + (TRACK_Y1 - TRACK_Y0) * (z - TRACK_Z0) / (TRACK_Z1 - TRACK_Z0) + CHIP_H / 2;
+      const overHole = BOARD_TOP + 0.027 + CHIP_RAD;
+      if (s < 0.1) {
+        chip.position.set(x, SLOT_Y, TRACK_Z0 - 0.04 + 0.04 * (s / 0.1));
+        chip.rotation.set(0, 0, 0);
+      } else if (s < 0.7) {
+        const z = TRACK_Z0 + (TRACK_Z1 - TRACK_Z0) * ((s - 0.1) / 0.6);
+        chip.position.set(x, onTrack(z), z);
+        chip.rotation.set(0, 0, 0);
+      } else if (s < 0.85) {
+        const d = (s - 0.7) / 0.15;
+        chip.position.set(x, onTrack(TRACK_Z1) + (overHole - onTrack(TRACK_Z1)) * d, TRACK_Z1 + (BOARD_Z - TRACK_Z1) * d);
+        chip.rotation.set(d * Math.PI / 2, d * e.spin, 0);
+      } else {
+        const d = (s - 0.85) / 0.15;
+        chip.position.set(x, overHole + (boardY(e.h) - overHole) * d * d, BOARD_Z);
+        chip.rotation.set(Math.PI / 2, e.spin, 0);
+      }
+      chip.material = chipLooks[e.chipId % 2];
+    }
+    for (const b of view.boards) {
+      const chip = acquireChip(idx++);
+      chip.position.set(tableX(b.u), boardY(b.h), BOARD_Z);
+      chip.rotation.set(Math.PI / 2, b.spin, 0);
+      chip.material = chipLooks[b.chipId % 2];
+    }
+    for (const c of view.chutes) {
+      // Off the bottom of the board onto the bar's top, then off its front
+      // edge onto the platform, standing (coinPusherReplay's chutePose).
+      const chip = acquireChip(idx++);
+      chip.position.set(tableX(c.u), UPPER_Y + c.y * K, tableZ(c.x));
+      chip.rotation.set(Math.PI / 2, c.spin, 0);
+      chip.material = chipLooks[c.chipId % 2];
+    }
+    return idx;
+  };
 
   const handle: CoinPusherVisualHandle = {
     update(dt: number): void {
       const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
+      const now = Date.now();
       const state = readCoinPusherState(itemId);
+      noticeRecord(state, now);
 
       // Every drop settled since the last frame, even several at once.
       if (state && shownUpTo !== undefined) {
@@ -8517,29 +8740,26 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       shownUpTo = state?.nextChipId;
 
       if (state) {
-        const face = pusherFaceX(currentPusherPhase(state, Date.now()));
-        pusher.position.z = upperZ(face) + BAR_DEPTH / 2;
+        const face = pusherFaceX(currentPusherPhase(state, now));
+        pusher.position.z = tableZ(face) + BAR_DEPTH / 2;
       }
 
-      for (const mat of chipMaterials) mat.opacity = barMat.opacity;
+      for (const look of chipLooks) for (const mat of look) mat.opacity = barMat.opacity;
       // World's zoom-level hiding doesn't reach the chips either (it hides only
       // the meshes it registered): they show and hide with their platform.
       pileGroup.visible = upperPlatform.visible;
       let idx = 0;
       if (state) {
-        for (const [piles, toZ, baseY] of [
-          [state.upper, upperZ, 0.91 + CHIP_H / 2],
-          [state.lower, lowerZ, 0.71 + CHIP_H / 2],
-        ] as const) {
-          for (const pile of piles) {
-            const z = toZ(pile.x);
-            for (let ci = 0; ci < pile.count; ci++) {
-              const chip = acquireChip(idx++);
-              chip.position.set(0, baseY + ci * (CHIP_H + 0.0005), z);
-              chip.material = chipMaterials[pile.chipIds[ci] % 2];
-            }
-          }
+        let poses: TablePose[];
+        const { view, live } = cabinetView(replays, now);
+        replays = live;
+        if (view) {
+          poses = view.table;
+          idx = drawFalling(idx, view);
+        } else {
+          poses = restingView(state, geom);
         }
+        for (const p of poses) poseChip(acquireChip(idx++), p);
       }
       for (let i = idx; i < chipPool.length; i++) chipPool[i].visible = false;
 
@@ -8566,11 +8786,12 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     },
     dispose(): void {
       // The chip meshes come out of the cabinet first, so the removal's
-      // traversal doesn't free their geometry and material a second time.
+      // traversal doesn't free their geometry and materials a second time.
       pileGroup.clear();
       chipPool.length = 0;
       chipGeometry.dispose();
-      for (const mat of chipMaterials) mat.dispose();
+      for (const mat of [...chipSides, ...chipFaces]) mat.dispose();
+      faceTex.dispose();
     },
   };
   // The upper platform mesh carries the handle so world.ts collects it the
