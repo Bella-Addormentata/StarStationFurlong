@@ -1879,17 +1879,13 @@ pub fn beacon_step(mark: &BeaconMark, word: Option<(crate::chia_resolve::WriteSt
 }
 
 /// Settle the lease's parked spends against the chain now (under the gate),
-/// then give the lease's word on each of `coins` ([`WalletLease::lease_word`]).
-/// For the knock and beacon verdicts, which would otherwise wait for the next
-/// writer to reconcile; asked BEFORE the chain lookups, so a write confirming
-/// in between is seen by them (#272 review round 2).
-pub async fn lease_words(client: &impl ChainAccess, coins: &[Bytes32]) -> HashMap<Bytes32, LeaseWord> {
-    lease_standing(client, coins, &[]).await.0
-}
-
-/// [`lease_words`], and which of `spends` the lease still holds — parked or
-/// settling ([`WalletLease::holds_spend`]) — read in the same breath, under
-/// the gate, so the two answers describe one state (#272 review round 12).
+/// then give the lease's word on each of `coins` ([`WalletLease::lease_word`])
+/// and which of `spends` it still holds — parked or settling
+/// ([`WalletLease::holds_spend`], #272 review round 12) — read in the same
+/// breath, so the two answers describe one state. For the knock and beacon
+/// verdicts, which would otherwise wait for the next writer to reconcile;
+/// asked BEFORE the chain lookups, so a write confirming in between is seen
+/// by them (#272 review round 2).
 pub async fn lease_standing(client: &impl ChainAccess, coins: &[Bytes32], spends: &[u64]) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
     let _gate = WALLET_LEASE.lock().await;
     WALLET_LEASE.reconcile(client).await;
