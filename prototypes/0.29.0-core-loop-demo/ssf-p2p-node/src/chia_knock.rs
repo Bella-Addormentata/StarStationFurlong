@@ -18,10 +18,13 @@
 //! connected target is never dialed. No further spend: the schedule is
 //! derived from `h`, never written.
 //!
-//! A confirmation is final here only once it is [`SETTLED_DEPTH`] blocks deep:
-//! until then both sides look the knock's coin up again each tick, and a
-//! reorganization that moves the block that holds it moves both clocks with
-//! it, one that drops the block stops them (#272 review round 7).
+//! A confirmation is final here only once a lookup on the agreed lane finds the
+//! knock's coin unmoved [`SETTLED_DEPTH`] blocks deep — never by age alone,
+//! since the node may have been away, or its lookups failing, while a
+//! reorganization moved it (#272 review round 8); until then both sides look
+//! the coin up again each tick, and a reorganization that moves the block that
+//! holds it moves both clocks with it, one that drops the block stops them, and
+//! one that moves it outside its era voids the knock on both sides (round 7).
 #![cfg(feature = "chia-read")]
 
 use std::collections::VecDeque;
@@ -43,11 +46,12 @@ pub const RENDEZVOUS_FAR_STEP: u32 = 10 * DEFAULT_BEAT_BLOCKS;
 /// How long after its confirmation a knock is dialed on: two eras, the
 /// record's own validity.
 pub const RENDEZVOUS_SPAN: u32 = 2 * ERA_BLOCKS;
-/// A confirmation younger than this many blocks (about ten minutes) is judged
-/// again every tick: a reorganization can move the block that holds a knock, or
-/// drop it, and both sides' clocks must follow (#272 review round 7). Chia's
-/// reorganizations are rare and shallow — a few blocks — so one this deep is
-/// final here, which also bounds the lookups a tick makes.
+/// A confirmation is judged again every tick until a lookup on the agreed lane
+/// finds it unmoved this many blocks (about ten minutes) deep: a reorganization
+/// can move the block that holds a knock, or drop it, and both sides' clocks
+/// must follow (#272 review round 7). Chia's reorganizations are rare and
+/// shallow — a few blocks — so one found this deep is final here, which also
+/// bounds the lookups a tick makes.
 pub const SETTLED_DEPTH: u32 = 32;
 /// Entries kept per side, oldest first out.
 pub const MAX_SENT: usize = 256;
@@ -79,7 +83,8 @@ pub fn rendezvous_due(confirmed: u32, last: u32, peak: u32) -> bool {
     peak > last && next_boundary_after(confirmed, last).is_some_and(|b| b <= peak)
 }
 
-/// Is a knock confirmed at `confirmed` final at chain peak `peak`?
+/// Is a knock confirmed at `confirmed` deep enough at chain peak `peak` for a
+/// lookup that finds it there to make it final?
 pub fn settled(confirmed: u32, peak: u32) -> bool {
     confirmed != 0 && peak >= confirmed.saturating_add(SETTLED_DEPTH)
 }
@@ -131,6 +136,11 @@ pub struct SentKnock {
     /// clock resumes above it); set to the confirmation height on confirming.
     #[serde(default)]
     pub last_rendezvous: u32,
+    /// True once a lookup on the agreed lane found the knock's coin unmoved
+    /// [`SETTLED_DEPTH`] blocks deep: final, looked up no more (#272 review
+    /// round 8). Age alone never settles a knock.
+    #[serde(default)]
+    pub settled: bool,
 }
 
 /// A knock read from this node's inbox.
@@ -145,6 +155,23 @@ pub struct InboxKnock {
     pub coin_id: String,
     #[serde(default)]
     pub last_rendezvous: u32,
+    /// As [`SentKnock::settled`]: a lookup found the coin unmoved deep enough.
+    #[serde(default)]
+    pub settled: bool,
+}
+
+/// What a fresh lookup of a knock's coin did to its inbox entry
+/// ([`KnockBook::reclock_inbox`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InboxMove {
+    /// The clock moved to the coin's new height.
+    Reclocked,
+    /// The coin sits outside the knock's era now: the knock is void on both
+    /// sides (the knocker forgets one the chain confirmed outside its era, and
+    /// the inbox reader would not have accepted it), so the entry went.
+    Dropped,
+    /// No entry by that coin, or the same height again.
+    Unchanged,
 }
 
 /// Who a dial-back is for, and in which room.
@@ -215,15 +242,25 @@ impl KnockBook {
     }
 
     /// The knocks of ours the chain's word is still wanted on: every pending
-    /// one and, given an agreed `peak` to judge by, every confirmed one not yet
-    /// [`settled`] there — a reorganization can still move or drop the block
-    /// that holds it (#272 review round 7).
+    /// one and, given an agreed `peak` to judge by, every confirmed one no
+    /// lookup has settled yet ([`Self::settle_sent`]) — a reorganization can
+    /// still move or drop the block that holds it (#272 review round 7), and
+    /// age alone proves it did not: the node may have been away, or its
+    /// lookups failing, the whole while (round 8).
     pub fn unsettled_sent(&self, peak: Option<u32>) -> Vec<SentKnock> {
-        self.sent
-            .iter()
-            .filter(|k| k.confirmed_height == 0 || peak.is_some_and(|p| !settled(k.confirmed_height, p)))
-            .cloned()
-            .collect()
+        self.sent.iter().filter(|k| k.confirmed_height == 0 || (peak.is_some() && !k.settled)).cloned().collect()
+    }
+
+    /// A lookup on the agreed lane found the knock's coin where the book says,
+    /// [`SETTLED_DEPTH`] blocks deep: final, looked up no more (#272 review
+    /// round 8). Returns true when something changed.
+    pub fn settle_sent(&mut self, coin_id: &str, hint: &str) -> bool {
+        let mut changed = false;
+        for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height != 0 && !k.settled) {
+            k.settled = true;
+            changed = true;
+        }
+        changed
     }
 
     /// The chain says the knock that spent `coin_id` under `hint` confirmed at
@@ -243,6 +280,7 @@ impl KnockBook {
                 k.last_rendezvous = height;
             }
             k.confirmed_height = height;
+            k.settled = false;
             changed = true;
         }
         changed
@@ -257,6 +295,7 @@ impl KnockBook {
         for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height != 0) {
             k.confirmed_height = 0;
             k.last_rendezvous = 0;
+            k.settled = false;
             changed = true;
         }
         changed
@@ -301,27 +340,47 @@ impl KnockBook {
         true
     }
 
-    /// The knocks read whose confirmation is not yet [`settled`] at the agreed
-    /// `peak`: their coins are looked up again each tick, since a
-    /// reorganization can still move or drop the block that holds one (#272
-    /// review round 7).
-    pub fn unsettled_inbox(&self, peak: u32) -> Vec<InboxKnock> {
-        self.inbox.iter().filter(|k| !settled(k.confirmed_height, peak)).cloned().collect()
+    /// The knocks read that no lookup has settled yet ([`Self::settle_inbox`]):
+    /// their coins are looked up again each tick, since a reorganization can
+    /// still move or drop the block that holds one (#272 review round 7) and
+    /// age alone proves nothing (round 8).
+    pub fn unsettled_inbox(&self) -> Vec<InboxKnock> {
+        self.inbox.iter().filter(|k| !k.settled).cloned().collect()
+    }
+
+    /// A lookup found the coin that carried a knock read where the book says,
+    /// [`SETTLED_DEPTH`] blocks deep: final (#272 review round 8). Returns true
+    /// when something changed.
+    pub fn settle_inbox(&mut self, coin_id: &str) -> bool {
+        let mut changed = false;
+        for k in self.inbox.iter_mut().filter(|k| k.coin_id == coin_id && !k.settled) {
+            k.settled = true;
+            changed = true;
+        }
+        changed
     }
 
     /// The coin that carried a knock read sits in another block now (a
     /// reorganization moved it): its clock follows, as [`Self::confirm_sent`]'s
-    /// does. Returns true when something changed.
-    pub fn reclock_inbox(&mut self, coin_id: &str, height: u32) -> bool {
-        let mut changed = false;
-        for k in self.inbox.iter_mut().filter(|k| k.coin_id == coin_id && k.confirmed_height != height) {
-            if k.last_rendezvous == k.confirmed_height {
-                k.last_rendezvous = height;
-            }
-            k.confirmed_height = height;
-            changed = true;
+    /// does — unless that block lies outside the knock's era, which voids the
+    /// knock on both sides (round 8: the knocker forgets one confirmed outside
+    /// its era, and the inbox reader would not have accepted it), so the entry
+    /// goes instead.
+    pub fn reclock_inbox(&mut self, coin_id: &str, height: u32) -> InboxMove {
+        let Some(i) = self.inbox.iter().position(|k| k.coin_id == coin_id && k.confirmed_height != height) else {
+            return InboxMove::Unchanged;
+        };
+        if era_of(height) != self.inbox[i].era {
+            self.inbox.remove(i);
+            return InboxMove::Dropped;
         }
-        changed
+        let k = &mut self.inbox[i];
+        if k.last_rendezvous == k.confirmed_height {
+            k.last_rendezvous = height;
+        }
+        k.confirmed_height = height;
+        k.settled = false;
+        InboxMove::Reclocked
     }
 
     /// The coin that carried a knock read is no longer on the chain (a
@@ -433,6 +492,7 @@ mod tests {
             pushed_at,
             confirmed_height: 0,
             last_rendezvous: 0,
+            settled: false,
         }
     }
 
@@ -486,10 +546,15 @@ mod tests {
         assert!(book.confirm_sent("c1", "ab", 1000));
         assert!(book.unsettled_sent(None).is_empty(), "no agreed peak: a confirmed knock is left as it is");
         assert_eq!(book.unsettled_sent(Some(1000 + SETTLED_DEPTH - 1)).len(), 1, "young: judged again");
-        assert!(book.unsettled_sent(Some(1000 + SETTLED_DEPTH)).is_empty(), "settled: final");
+        assert_eq!(book.unsettled_sent(Some(1000 + SETTLED_DEPTH)).len(), 1, "deep enough, but no lookup said so yet: still judged (round 8)");
+        assert!(!settled(1000, 1000 + SETTLED_DEPTH - 1) && settled(1000, 1000 + SETTLED_DEPTH), "the depth a lookup must find it at");
+        assert!(book.settle_sent("c1", "ab"));
+        assert!(!book.settle_sent("c1", "ab"), "settled once");
+        assert!(book.unsettled_sent(Some(1000 + SETTLED_DEPTH)).is_empty(), "settled by a lookup: final");
         assert!(!book.confirm_sent("c1", "ab", 1000), "the same height again changes nothing");
         assert!(book.confirm_sent("c1", "ab", 1002), "moved to another block: the clock follows");
         assert_eq!((book.sent[0].confirmed_height, book.sent[0].last_rendezvous), (1002, 1002));
+        assert!(!book.sent[0].settled, "moved: looked up again until a lookup settles it anew");
         let due = book.due_dialbacks(1012);
         assert_eq!(due.len(), 1);
         assert!(book.mark_dialed(&due[0], 1012));
@@ -504,19 +569,53 @@ mod tests {
         assert!(book.knocked_this_era("H", 3), "it may yet land: no second knock this era");
         assert!(book.confirm_sent("c1", "ab", 1005), "landed again");
         assert_eq!((book.sent[0].confirmed_height, book.sent[0].last_rendezvous), (1005, 1005));
-        // The host's side.
-        let read = |height: u32| InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: height, coin_id: "k1".into(), last_rendezvous: height };
-        assert!(book.record_inbox(read(2000)));
-        assert_eq!(book.unsettled_inbox(2000 + SETTLED_DEPTH - 1).len(), 1);
-        assert!(book.unsettled_inbox(2000 + SETTLED_DEPTH).is_empty());
-        assert!(!book.reclock_inbox("k1", 2000));
-        assert!(book.reclock_inbox("k1", 2002));
-        assert_eq!((book.inbox[0].confirmed_height, book.inbox[0].last_rendezvous), (2002, 2002));
-        assert!(!book.reclock_inbox("zz", 5), "an unknown coin moves nothing");
+        // The host's side (heights inside the knock's era: the era rule holds here too).
+        let h0 = 3 * ERA_BLOCKS;
+        let read = |height: u32| InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: height, coin_id: "k1".into(), last_rendezvous: height, settled: false };
+        assert!(book.record_inbox(read(h0 + 2000)));
+        assert_eq!(book.unsettled_inbox().len(), 1);
+        assert_eq!(book.reclock_inbox("k1", h0 + 2000), InboxMove::Unchanged, "the same height again");
+        assert_eq!(book.reclock_inbox("k1", h0 + 2002), InboxMove::Reclocked);
+        assert_eq!((book.inbox[0].confirmed_height, book.inbox[0].last_rendezvous), (h0 + 2002, h0 + 2002));
+        assert_eq!(book.reclock_inbox("zz", 5), InboxMove::Unchanged, "an unknown coin moves nothing");
+        assert!(book.settle_inbox("k1"));
+        assert!(!book.settle_inbox("k1"), "settled once");
+        assert!(book.unsettled_inbox().is_empty(), "settled by a lookup: final");
+        assert_eq!(book.reclock_inbox("k1", h0 + 2003), InboxMove::Reclocked, "moved all the same (the loop never asks for a settled one, the book allows it)");
+        assert!(!book.inbox[0].settled, "moved: looked up again");
         assert!(book.drop_inbox("k1"));
         assert!(!book.drop_inbox("k1"));
         assert!(book.inbox.is_empty());
-        assert!(book.record_inbox(read(2004)), "listed again once it landed anew: filed afresh");
+        assert!(book.record_inbox(read(h0 + 2004)), "listed again once it landed anew: filed afresh");
+        assert_eq!(book.reclock_inbox("k1", 4 * ERA_BLOCKS + 1), InboxMove::Dropped, "moved outside its era: void on both sides, the knocker's own rule");
+        assert!(book.inbox.is_empty());
+        assert_eq!(book.reclock_inbox("k1", 4 * ERA_BLOCKS + 1), InboxMove::Unchanged, "gone: nothing to move");
+    }
+
+    #[test]
+    fn age_alone_settles_nothing_only_a_lookup_does() {
+        // #272 review round 8: a node away, or its lookups failing, for longer
+        // than SETTLED_DEPTH blocks has not seen whether a reorganization moved
+        // its knock meanwhile. An entry stays up for judging, however deep,
+        // until a lookup on the agreed lane finds it unmoved deep enough; that
+        // word is kept in the book, and a book written before it was kept is
+        // judged again from the start.
+        let mut book = KnockBook::default();
+        book.record_sent(sent("H", 3, "c1", 100));
+        book.confirm_sent("c1", "ab", 1000);
+        assert_eq!(book.unsettled_sent(Some(1000 + 10 * SETTLED_DEPTH)).len(), 1, "back after a long absence: judged, however deep");
+        assert!(book.confirm_sent("c1", "ab", 1002), "the lookup says it moved meanwhile: the clock follows");
+        assert!(book.settle_sent("c1", "ab"), "found unmoved deep enough: final");
+        assert!(book.unsettled_sent(Some(9_000)).is_empty());
+        assert!(book.unsettled_sent(None).is_empty());
+        let saved = serde_json::to_string(&book).unwrap();
+        assert_eq!(serde_json::from_str::<KnockBook>(&saved).unwrap(), book, "the word is kept");
+        let old: SentKnock = serde_json::from_str(r#"{"host":"H","room":"r","era":3,"hint":"ab","coin_id":"c","pushed_at":1,"confirmed_height":1000}"#).unwrap();
+        assert!(!old.settled, "an entry from before the word was kept is judged again");
+        book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 3 * ERA_BLOCKS + 5, coin_id: "k1".into(), last_rendezvous: 3 * ERA_BLOCKS + 5, settled: false });
+        assert_eq!(book.unsettled_inbox().len(), 1, "a knock read: judged until a lookup settles it, whatever the peak");
+        assert!(book.settle_inbox("k1"));
+        assert!(book.unsettled_inbox().is_empty());
     }
 
     #[test]
@@ -531,6 +630,7 @@ mod tests {
             confirmed_height: 2000,
             coin_id: "k1".into(),
             last_rendezvous: 2000,
+            settled: false,
         }));
         assert!(!book.record_inbox(InboxKnock {
             from: "J".into(),
@@ -539,6 +639,7 @@ mod tests {
             confirmed_height: 2000,
             coin_id: "k1".into(),
             last_rendezvous: 2000,
+            settled: false,
         }), "the same coin files once");
         assert!(book.due_dialbacks(1005).is_empty(), "before the first boundary");
         let due = book.due_dialbacks(1012);
@@ -562,7 +663,7 @@ mod tests {
         let mut book = KnockBook::default();
         book.record_sent(sent("H", 3, "c1", 100));
         book.confirm_sent("c1", "ab", 1000);
-        book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 1000, coin_id: "k1".into(), last_rendezvous: 1000 });
+        book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 1000, coin_id: "k1".into(), last_rendezvous: 1000, settled: false });
         let due = book.due_dialbacks(1012);
         assert_eq!(due.iter().map(|d| d.target.as_str()).collect::<Vec<_>>(), vec!["H", "J"], "equal waits keep the book's order");
         // The room had one hold slot: H's hold started, J's did not.
@@ -594,6 +695,7 @@ mod tests {
             confirmed_height: height,
             coin_id: coin.into(),
             last_rendezvous: height,
+            settled: false,
         };
         assert!(book.record_inbox(knock(3 * ERA_BLOCKS + 10, "k1")));
         assert!(!book.record_inbox(knock(3 * ERA_BLOCKS + 10, "k1")), "the same coin again");
@@ -627,6 +729,7 @@ mod tests {
                 confirmed_height: 100 + i as u32,
                 coin_id: format!("k{i}"),
                 last_rendezvous: 0,
+                settled: false,
             });
         }
         assert_eq!(book.inbox.len(), MAX_INBOX);
@@ -639,8 +742,8 @@ mod tests {
         book.record_sent(sent("pending-now", 3, "c", 3));
         book.record_sent(sent("confirmed-last-era", 2, "d", 4));
         book.confirm_sent("d", "ab", 70_000);
-        book.record_inbox(InboxKnock { from: "x".into(), room: "r".into(), era: 1, confirmed_height: 40_001, coin_id: "k".into(), last_rendezvous: 0 });
-        book.record_inbox(InboxKnock { from: "y".into(), room: "r".into(), era: 2, confirmed_height: 70_001, coin_id: "l".into(), last_rendezvous: 0 });
+        book.record_inbox(InboxKnock { from: "x".into(), room: "r".into(), era: 1, confirmed_height: 40_001, coin_id: "k".into(), last_rendezvous: 0, settled: false });
+        book.record_inbox(InboxKnock { from: "y".into(), room: "r".into(), era: 2, confirmed_height: 70_001, coin_id: "l".into(), last_rendezvous: 0, settled: false });
         let peak = 3 * ERA_BLOCKS + 5; // era 3
         assert_eq!(book.prune(peak), 2, "era 1 on both sides; the pending knock of era 2 is kept for the chain's word");
         let hosts: Vec<&str> = book.sent.iter().map(|k| k.host.as_str()).collect();
@@ -676,7 +779,8 @@ mod tests {
         let mut book = KnockBook::default();
         book.record_sent(sent("H", 3, "c1", 100));
         book.confirm_sent("c1", "ab", 1000);
-        book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 2000, coin_id: "k1".into(), last_rendezvous: 2000 });
+        book.settle_sent("c1", "ab");
+        book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 2000, coin_id: "k1".into(), last_rendezvous: 2000, settled: false });
         book.save(&path).unwrap();
         assert_eq!(KnockBook::load(&path), book);
         std::fs::write(&path, b"{not json").unwrap();

@@ -1798,6 +1798,7 @@ pub async fn heartbeat_loop(
                             pushed_at: now_unix,
                             confirmed_height: 0,
                             last_rendezvous: 0,
+                            settled: false,
                         });
                         if let Err(e) = book.save(knocks_path) {
                             eprintln!("⛓️ ChiaHub knock: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);

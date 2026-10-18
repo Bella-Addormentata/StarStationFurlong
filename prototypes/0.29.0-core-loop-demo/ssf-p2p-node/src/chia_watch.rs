@@ -570,6 +570,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                     confirmed_height: f.confirmed_height,
                                     coin_id: hex::encode(f.coin_id.to_bytes()),
                                     last_rendezvous: f.confirmed_height,
+                                    settled: false,
                                 });
                                 if new {
                                     if let Err(e) = book.save(knocks_path) {
@@ -678,6 +679,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                             println!("⛓️ ChiaHub knock: the chain moved our knock from height {was} to {height} (a reorganization) — the schedule follows");
                                         }
                                         changed = true;
+                                    } else if knock_peak.is_some_and(|p| crate::chia_knock::settled(height, p)) && book.settle_sent(&coin_hex, &hint_hex) {
+                                        // Found where the book says, SETTLED_DEPTH deep, by
+                                        // THIS lookup: final. Age alone never settles it
+                                        // (#272 review round 8).
+                                        changed = true;
                                     }
                                 }
                                 WriteStanding::Dead(why) => {
@@ -703,14 +709,15 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     Err(e) => eprintln!("⛓️ ChiaHub knock: could not read our knocks' confirmation: {e:#}"),
                 }
             }
-            // ── #231 P6b: the knocks READ, while young (#272 review round 7):
-            // the coin that carried each is looked up again on the agreed lane
-            // until its confirmation is SETTLED_DEPTH deep — moved by a
-            // reorganization, its clock follows (the knocker's does the same
-            // above); gone, nobody is dialed back for it, and the inbox files
-            // it afresh should its spend land again.
+            // ── #231 P6b: the knocks READ, until settled (#272 review round
+            // 7): the coin that carried each is looked up again on the agreed
+            // lane until a lookup finds it unmoved SETTLED_DEPTH deep (round 8:
+            // age alone proves nothing) — moved by a reorganization, its clock
+            // follows (the knocker's does the same above), or the knock is void
+            // when the move left its era; gone, nobody is dialed back for it,
+            // and the inbox files it afresh should its spend land again.
             if let Some(agreed_peak) = knock_peak {
-                let young = hub.knocks.lock().unwrap().unsettled_inbox(agreed_peak);
+                let young = hub.knocks.lock().unwrap().unsettled_inbox();
                 if !young.is_empty() {
                     let coins: Vec<Bytes32> = young.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
                     match chia_resolve::coin_heights(&agreed, coins).await {
@@ -723,9 +730,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                     continue;
                                 };
                                 match heights.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h) {
-                                    Some(h) if h == k.confirmed_height => {}
-                                    Some(h) => {
-                                        if book.reclock_inbox(&k.coin_id, h) {
+                                    Some(h) if h == k.confirmed_height => {
+                                        // Where the book says; deep enough: final (round 8).
+                                        if crate::chia_knock::settled(h, agreed_peak) && book.settle_inbox(&k.coin_id) {
+                                            changed = true;
+                                        }
+                                    }
+                                    Some(h) => match book.reclock_inbox(&k.coin_id, h) {
+                                        crate::chia_knock::InboxMove::Reclocked => {
                                             println!(
                                                 "⛓️ ChiaHub inbox: the chain moved {}'s knock from height {} to {h} (a reorganization) — the schedule follows",
                                                 short(&k.from),
@@ -733,7 +745,16 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                             );
                                             changed = true;
                                         }
-                                    }
+                                        crate::chia_knock::InboxMove::Dropped => {
+                                            println!(
+                                                "⛓️ ChiaHub inbox: the chain moved {}'s knock from height {} to {h}, outside its era (a reorganization) — void, as the knocker's own rule says; forgotten",
+                                                short(&k.from),
+                                                k.confirmed_height
+                                            );
+                                            changed = true;
+                                        }
+                                        crate::chia_knock::InboxMove::Unchanged => {}
+                                    },
                                     None => {
                                         if book.drop_inbox(&k.coin_id) {
                                             println!(
@@ -741,6 +762,12 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                                 short(&k.from),
                                                 k.confirmed_height
                                             );
+                                            // Its spend may land again under the SAME coin id, at
+                                            // any height: the hint's cursor must examine that id
+                                            // again, and the room's inbox read come forward (round 8).
+                                            if let Some((_, room_key)) = inbox_rooms.iter().find(|(r, _)| *r == k.room) {
+                                                forget_inbox_coin(&mut inbox_cursors, &mut sched, &own_ck, room_key, &k.room, k.era, coin.to_bytes());
+                                            }
                                             changed = true;
                                         }
                                     }
@@ -966,6 +993,30 @@ const CK_SCHED_PREFIX: &str = "ck:";
 const SELF_SCHED_KEY: &str = "self";
 
 /// #231 P6b: the beat entry of a room's inbox read.
+/// #231 P6b (#272 review round 8): a knock read from the inbox left the chain
+/// (its block reorganized away) and its entry went; its spend may land again
+/// under the SAME coin id, at any height — and the hint's cursor still lists
+/// that id as examined, so the listing would skip it: for good below the height
+/// examined, until the next cycle clears the set above it. The id is forgotten
+/// and the room's inbox read falls due at the next tick instead of the next
+/// beat.
+fn forget_inbox_coin(
+    cursors: &mut HashMap<[u8; 32], HintCursor>,
+    sched: &mut BeatSchedule,
+    own_ck: &[u8; 32],
+    room_key: &[u8; 32],
+    room: &str,
+    era: u64,
+    coin: [u8; 32],
+) {
+    let lane = chia_lane::derive_lane_token(room_key);
+    let hint = chia_lane::derive_inbox_hint(own_ck, &lane, era);
+    if let Some(cursor) = cursors.get_mut(&hint) {
+        cursor.seen.remove(&coin);
+    }
+    sched.forget(&inbox_sched_key(room));
+}
+
 const INBOX_SCHED_PREFIX: &str = "inbox:";
 fn inbox_sched_key(room: &str) -> String {
     format!("{INBOX_SCHED_PREFIX}{room}")
@@ -1063,6 +1114,29 @@ mod tests {
         let mut twin = a;
         twin[31] ^= 1;
         assert_ne!(ck_sched_key(&a), ck_sched_key(&twin), "a key sharing a's first bytes has its own beat entry");
+    }
+
+    #[test]
+    fn a_dropped_inbox_coin_is_examined_again_and_the_read_falls_due() {
+        // #272 review round 8: the inbox entry of a knock whose block
+        // reorganized away is dropped; the same spend landing again carries the
+        // same coin id, which the hint's cursor had marked examined.
+        let (own_ck, room_key) = ([1u8; 32], [2u8; 32]);
+        let lane = chia_lane::derive_lane_token(&room_key);
+        let hint = chia_lane::derive_inbox_hint(&own_ck, &lane, 3);
+        let other = chia_lane::derive_inbox_hint(&own_ck, &lane, 2);
+        let coin = [9u8; 32];
+        let mut cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
+        cursors.entry(hint).or_default().seen.extend([coin, [8u8; 32]]);
+        cursors.entry(other).or_default().seen.insert(coin);
+        let mut sched = BeatSchedule::new(32);
+        assert!(sched.due(&inbox_sched_key("r"), 1_000, false));
+        assert!(!sched.due(&inbox_sched_key("r"), 1_001, false), "read this beat already");
+        forget_inbox_coin(&mut cursors, &mut sched, &own_ck, &room_key, "r", 3, coin);
+        assert!(!cursors[&hint].seen.contains(&coin), "the coin is examined again");
+        assert!(cursors[&hint].seen.contains(&[8u8; 32]), "the others stay examined");
+        assert!(cursors[&other].seen.contains(&coin), "another era's hint is another cursor");
+        assert!(sched.due(&inbox_sched_key("r"), 1_001, false), "the room's inbox read falls due at once");
     }
 
     #[test]
