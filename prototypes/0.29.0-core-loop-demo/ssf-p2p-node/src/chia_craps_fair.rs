@@ -30,10 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use chia_bls::SecretKey;
 use chia_protocol::{Bytes, Bytes32, Coin};
-use chia_sdk_coinset::{ChiaRpcClient, CoinsetClient};
+use crate::chia_chain::{ChainAccess, CoinRecord, PagedRecords};
 use sha2::{Digest, Sha256};
 
-use crate::chia_faucet::{unspent_at, MAX_FAUCET_PAGES};
+use crate::chia_faucet::MAX_FAUCET_PAGES;
 use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, push_parked, WALLET_LEASE};
 use crate::chia_resolve::{extract_ciphertext, fetch_coin_spend};
 
@@ -98,82 +98,92 @@ pub fn derive_dice(seed_hex: &str, beacon_hex: &str, table: &str, round: u64) ->
 /// may still have landed, so the coin stays parked until the chain or the
 /// mempool settles it; an outright rejection frees it).
 async fn push_fair_record(
-    client: &CoinsetClient,
+    client: &impl ChainAccess,
     chia_sk: &SecretKey,
-    coin: Coin,
+    coin: crate::chia_faucet::FaucetCoin,
     table: &str,
     round: u64,
     payload: &[u8],
 ) -> Result<()> {
     let hint = fair_hint(table, round);
-    let bundle = build_publish_bundle(chia_sk, coin, hint, Bytes::new(payload.to_vec()))?;
-    push_parked(client, bundle, [coin.coin_id()]).await?;
+    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, Bytes::new(payload.to_vec()))?;
+    push_parked(client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(())
 }
 
-/// Poll until `spent` is no longer in the unspent set, then return the largest
-/// remaining spendable coin. Waiting for `spent` to disappear (rather than
-/// simply returning the first coin that differs from it) is safe when the wallet
-/// has multiple coins: a larger coin could be returned before `spent`'s spend
-/// confirms, violating the commit→reveal ordering assumption. ~200 s bound.
-///
-/// The listing is PAGED like every other wallet listing (#245 review, round 15):
-/// `spent` was selected across up to [`MAX_FAUCET_PAGES`] gateway pages, so the
-/// first page alone could simply not hold it while it still sits unspent on a
-/// later one, and the reveal would go out before the commit confirmed. A
-/// listing cut short that does not show `spent` proves nothing either way
-/// ([`confirmed_gone`]): the wait goes on.
-async fn wait_for_next_coin(
-    client: &CoinsetClient,
-    our_ph: Bytes32,
-    spent: &Coin,
-) -> Result<Coin> {
-    let mut cut_short = false;
+/// Poll until the chain reports `spent` SPENT: the coin's own record, asked
+/// for by id and marked spent at a height, from the agreed peers. Its absence
+/// from a wallet listing proved nothing: a listing cut short may have left it
+/// on a page never reached (#245 review, round 15), and a COMPLETE listing from
+/// peers standing below the coin's creation height omits it just the same, so
+/// absence would have passed for the commit's confirmation and let the reveal
+/// go out first (#271 review, round 19). Peers behind the spend report the
+/// coin unspent, and the wait goes on; the next coin is picked afresh under the
+/// wallet lease by the caller. ~200 s bound.
+async fn wait_for_spend(client: &impl ChainAccess, spent: &Coin) -> Result<()> {
     for attempt in 0..40u32 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let listing = unspent_at(client, our_ph).await?;
-        cut_short = listing.partial;
-        let unspent: Vec<Coin> = listing.coins.into_iter().map(|c| c.coin).collect();
-        if confirmed_gone(!listing.partial, &unspent, spent) {
-            if let Some(next) = unspent.into_iter().max_by_key(|c| c.amount) {
-                return Ok(next);
-            }
+        let seen = client
+            .coin_records_by_names(vec![spent.coin_id()], true, None)
+            .await
+            .map_err(|e| anyhow!("coin lookup: {e}"))?;
+        if spend_confirmed(&seen.records, spent) {
+            return Ok(());
         }
         if attempt % 4 == 3 {
             println!("   …waiting for block confirmation ({}s)", (attempt + 1) * 5);
         }
-    }
-    if cut_short {
-        return Err(anyhow!(
-            "timed out (~200 s): the wallet listing is cut short at {MAX_FAUCET_PAGES} pages, so whether the spend confirmed cannot be read"
-        ));
     }
     Err(anyhow!(
         "timed out (~200 s) waiting for the spend to confirm — testnet slow or unfunded"
     ))
 }
 
-/// Whether a wallet listing proves `spent` gone from the unspent set: absent
-/// from a COMPLETE listing. Absent from one cut short, it may sit on a page the
-/// listing never reached, so that is unknown, not confirmed (#245 review,
-/// round 15).
-fn confirmed_gone(listing_complete: bool, unspent: &[Coin], spent: &Coin) -> bool {
-    listing_complete && !unspent.iter().any(|c| c == spent)
+/// Whether the records prove `spent` spent: its own record, marked spent. No
+/// record (peers that have not reached its creation block, a lookup cut
+/// short) and an unspent record are no evidence, so the wait goes on.
+fn spend_confirmed(records: &[CoinRecord], spent: &Coin) -> bool {
+    records.iter().any(|r| r.coin == *spent && r.spent)
+}
+
+/// Every coin under `hint`, pages followed up to the bound every wallet listing
+/// shares: a transcript with records missing proves nothing, so a listing
+/// still cut short is an error, not a shorter transcript. A coin a later page
+/// lists again (spent since the earlier page: the chain pages by latest
+/// change) is one coin, in its later state ([`PagedRecords`]), so no record is
+/// read twice.
+async fn fair_coins(client: &impl ChainAccess, hint: Bytes32) -> Result<Vec<CoinRecord>> {
+    let mut gathered = PagedRecords::default();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let listing = client
+            .coin_records_by_hint(hint, None, true, cursor.take())
+            .await
+            .map_err(|e| anyhow!("hint lookup: {e}"))?;
+        pages += 1;
+        gathered.fold(listing.records);
+        let truncated = listing.truncated;
+        match listing.next_cursor {
+            Some(next) if truncated => {
+                if pages >= MAX_FAUCET_PAGES {
+                    return Err(anyhow!("hint lookup: the listing is cut short at {MAX_FAUCET_PAGES} pages, so records would be missing"));
+                }
+                cursor = Some(next);
+            }
+            _ if truncated => return Err(anyhow!("hint lookup: the listing is cut short with no way to go on")),
+            _ => break,
+        }
+    }
+    Ok(gathered.into_records())
 }
 
 /// Resolve every PUBLIC fairness record published under (table, round): the raw
 /// plaintext payloads (commit and/or reveal), in confirmation order. Read-only.
 pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>>> {
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let hint = fair_hint(table, round);
-    let resp = client
-        .get_coin_records_by_hint(hint, None, None, Some(true), None)
-        .await
-        .map_err(|e| anyhow!("get_coin_records_by_hint: {e}"))?;
-    if !resp.success {
-        return Err(anyhow!("hint lookup unsuccessful: {:?}", resp.error));
-    }
-    let mut records = resp.coin_records.unwrap_or_default();
+    let mut records = fair_coins(&client, hint).await?;
     records.sort_by_key(|r| r.confirmed_block_index);
     let mut out = Vec::new();
     for rec in records {
@@ -196,7 +206,7 @@ pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>
 /// re-derive + verify the dice — proving the on-chain fairness transcript loop.
 /// T1 uses a placeholder beacon; T2 swaps in a real testnet block header_hash.
 pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
-    let client = CoinsetClient::testnet11();
+    let client = crate::chia_chain::connect();
     let our_ph = our_puzzle_hash(chia_sk);
 
     // Unique per run so re-runs don't pile records under one hint.
@@ -236,11 +246,11 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
         coin
     };
     println!("   ✅ commit published; waiting for confirmation…");
-    wait_for_next_coin(&client, our_ph, &coin_a).await?;
+    wait_for_spend(&client, &coin_a.coin).await?;
 
-    // 2. REVEAL (after the "betting window" — here, once the commit confirmed).
-    //    Selected afresh under the lease: `wait_for_next_coin`'s pick could have
-    //    been taken by another writer in the meantime.
+    // 2. REVEAL (after the "betting window" — here, once the commit confirmed:
+    //    the chain shows the commit's coin spent). The reveal's coin is
+    //    selected afresh under the lease, which knows the commit's inputs.
     let reveal_payload = serde_json::to_vec(&serde_json::json!({
         "t": table, "r": round, "k": "reveal", "seed": seed_hex, "beacon": beacon_hex,
     }))?;
@@ -255,7 +265,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
         coin
     };
     println!("   ✅ reveal published; waiting for confirmation…");
-    wait_for_next_coin(&client, our_ph, &coin_b).await?;
+    wait_for_spend(&client, &coin_b.coin).await?;
 
     // 3. RESOLVE both records from testnet11 and VERIFY the transcript.
     let payloads = resolve_fair_records(table, round).await?;
@@ -300,6 +310,23 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_record_coin_listed_again_spent_on_a_later_page_is_read_once() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::CoinListing;
+        // The commit's coin is unspent on the first page and spent (the reveal
+        // consumed it) by the time the second page is read, where it comes
+        // again: one record, in its later state, not two transcripts.
+        let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), Bytes32::new([9u8; 32]), u64::from(seed));
+        let rec = |c: Coin, height: u32, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: height, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
+        let first = CoinListing { records: vec![rec(coin(1), 80, None)], truncated: true, next_cursor: Some("page-2".into()), judged_at: None };
+        let second =
+            CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(2), 101, None)], truncated: false, next_cursor: None, judged_at: None };
+        let chain = Scripted::new(vec![first, second]);
+        let coins = fair_coins(&chain, Bytes32::new([1u8; 32])).await.unwrap();
+        assert_eq!(coins.iter().map(|r| (r.coin.amount, r.spent)).collect::<Vec<_>>(), vec![(1, true), (2, false)]);
+    }
+
     // GOLDEN VECTORS captured from the browser's src/games/fairDice.ts for
     // seed="ab"×32, beacon="cd"×32, table="t", round=3. Pinned here so the Rust
     // port is proven byte-for-byte identical to the TS spec (and can't drift).
@@ -334,19 +361,19 @@ mod tests {
     }
 
     #[test]
-    fn a_coin_missing_from_a_listing_cut_short_is_not_confirmed_gone() {
+    fn only_the_coins_own_spent_record_confirms_the_commit() {
         let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), Bytes32::new([0u8; 32]), amount);
+        let rec = |c: Coin, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: 90, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
         let spent = coin(1, 500);
-        let others = vec![coin(2, 700), coin(3, 100)];
-        // Still listed: not gone, whatever the listing's completeness.
-        assert!(!confirmed_gone(true, &[spent.clone(), others[0].clone()], &spent));
-        assert!(!confirmed_gone(false, &[spent.clone()], &spent));
-        // Absent from a COMPLETE listing: confirmed gone.
-        assert!(confirmed_gone(true, &others, &spent));
-        // Absent from a listing cut short: it may sit on a page never reached —
-        // unknown, and the reveal must wait (#245 review, round 15).
-        assert!(!confirmed_gone(false, &others, &spent));
-        assert!(!confirmed_gone(false, &[], &spent));
+        // Its own record, spent: confirmed.
+        assert!(spend_confirmed(&[rec(coin(2, 700), None), rec(spent.clone(), Some(101))], &spent));
+        // Its record unspent (peers behind the spend): the wait goes on.
+        assert!(!spend_confirmed(&[rec(spent.clone(), None)], &spent));
+        // No record of it at all (peers behind its creation block, a lookup
+        // cut short): absence is no evidence, whatever else is listed
+        // (#271 review, round 19).
+        assert!(!spend_confirmed(&[], &spent));
+        assert!(!spend_confirmed(&[rec(coin(2, 700), Some(101)), rec(coin(3, 100), None)], &spent));
     }
 
     #[test]

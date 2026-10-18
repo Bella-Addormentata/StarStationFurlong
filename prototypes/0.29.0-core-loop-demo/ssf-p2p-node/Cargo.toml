@@ -15,7 +15,7 @@ iroh = { version = "1", default-features = false, features = ["tls-ring", "portm
 iroh-mainline-address-lookup = "0.4"
 # Zero-hint same-LAN discovery (bare room key resolves on the local network, no internet needed).
 iroh-mdns-address-lookup = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -45,7 +45,7 @@ chacha20poly1305 = "0.10"
 # the Windows-GNU DLL export-ordinal limit at link time (the same iroh-relay cdylib
 # limit the iroh dep comment above already fights). Sub-crates only = far fewer
 # exported symbols. Slice 2 (wallet key + address) needs just these four; the
-# driver/types/signer/coinset crates get added as the publish/resolve slices land.
+# driver/types/signer crates joined as the publish/resolve slices landed.
 #
 # WINDOWS-GNU LINK NOTE: even the slim set tips the node's total DLL-export count
 # over the 16-bit ordinal ceiling, because `iroh-relay` is force-built as an
@@ -59,12 +59,29 @@ chia-bls = { version = "0.36", optional = true, features = ["serde"] }
 chia-protocol = { version = "0.36", optional = true, features = ["serde"] }
 chia-puzzle-types = { version = "0.36", optional = true }
 chia-sdk-utils = { version = "0.34", optional = true }
-# Slice 4 (publish) + Slice 5 (resolve): spend construction, signing, coinset RPC.
-# chia-sdk-coinset needs a TLS backend for testnet11 HTTPS (off by default) — enable rustls.
+# Slice 4 (publish) + Slice 5 (resolve): spend construction and signing.
 chia-sdk-driver = { version = "0.34", optional = true }
 chia-sdk-types = { version = "0.34", optional = true }
 chia-sdk-signer = { version = "0.34", optional = true }
-chia-sdk-coinset = { version = "0.34", optional = true, features = ["rustls"] }
+# S-0 step 2 (#231 D1; plan §6/§14): the chain lane reaches Chia FULL-NODE PEERS
+# over the light-wallet protocol — TLS websockets to port 58444 — instead of
+# an HTTPS gateway (its client crate left with it; nothing here names a
+# gateway host). The connection is the node's own (`chia_peer.rs`): the
+# upstream `chia-sdk-client` hard-wires its TLS to either OpenSSL or rustls on
+# `aws-lc-rs` (with bindgen), and §14's crate audit prefers the graph to stay
+# on the one `ring` provider iroh already brings. So: rustls on ring, the
+# websocket crate without any TLS feature (the TLS stream is opened here), and
+# `chia-ssl` for the Chia-CA-signed client certificate every full node
+# requires (minted per process, never written to disk). `chia-ssl` pulls `rsa`
+# (0.10 release candidate; RSA is used for local key generation and
+# certificate signing only, never to decrypt anything from the network).
+chia-ssl = { version = "0.42", optional = true }
+chia-traits = { version = "0.36", optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 # Allocator for the signer's RequiredSignature::from_coin_spends (already in the
 # graph transitively; direct dep just makes clvmr::Allocator nameable).
 clvmr = { version = "0.16", optional = true }
@@ -81,13 +98,24 @@ sha2 = { version = "0.10", optional = true }
 # curve lands in the binary (Windows-GNU export-ordinal budget, see above).
 curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false, optional = true }
 
+[dev-dependencies]
+# The tests' mock full node builds a header block, whose BLS fields need the
+# crate the publish feature makes optional.
+chia-bls = { version = "0.36", features = ["serde"] }
+# The TLS test mints a certificate chain a CA other than Chia's signed, to see
+# the mock full node turn it away as a real one would. Already in the tree
+# through `chia-ssl`; nothing new is built.
+rcgen = "0.13"
+
 [features]
 default = ["chia-read"]
 # Chain READS (#231 D3: on by default). Lookup-by-hint, parent-spend fetch and
 # record decode for the presence reader + P1 watcher. No wallet, no seed, no spends.
 chia-read = [
     "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-types",
-    "dep:chia-sdk-coinset", "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
+    "dep:chia-ssl", "dep:chia-traits", "dep:tokio-tungstenite", "dep:tokio-rustls",
+    "dep:rustls", "dep:rustls-pemfile", "dep:futures-util",
+    "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
     "dep:curve25519-dalek",
 ]
 # Chain WRITES: the BLS wallet seed + `txch1…` address, spend-to-self publish,
