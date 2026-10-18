@@ -425,6 +425,22 @@ export class MultiScaleZoomView {
     yaw = heading;
   }
 
+  /**
+   * 🚪🔒 Ease the first-person look toward `heading` over `dt` seconds, so a
+   * scripted walk through a tube turns the view round its bends. Does
+   * nothing outside first person.
+   */
+  public steerFirstPersonHeading(heading: number, dt: number): void {
+    if (this.currentLevel !== 1 || !Number.isFinite(heading) || !(dt > 0)) return;
+    const d = Math.atan2(Math.sin(heading - yaw), Math.cos(heading - yaw));
+    yaw += d * (1 - Math.exp(-dt / 0.25));
+  }
+
+  /** 🚪🔒 The first-person look's heading; null outside first person. */
+  public getFirstPersonHeading(): number | null {
+    return this.currentLevel === 1 ? yaw : null;
+  }
+
   /** Return from level 1 to the orthographic room view, then run `onReady`. */
   public requestRoomView(onReady: () => void): void {
     if (this.currentLevel === 2) {

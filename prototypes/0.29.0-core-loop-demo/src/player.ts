@@ -296,6 +296,11 @@ export class Player {
   /** 🚪🔒 walkIntoVestibule: stand at the threshold until the door is open
    *  (the walk skips collision, so it must not pass through moving leaves). */
   private adapterOutWaitingOpen = false;
+  /** 🚪🔒 The rest of the walk along the tube after adapterOutTarget, and the
+   *  points already walked (from `through`), so a walk back retraces the
+   *  tube's bends instead of cutting through its walls. */
+  private adapterOutPath: Array<{ x: number; z: number }> = [];
+  private vestibuleTrail: Array<{ x: number; z: number }> = [];
   /** Defensive cap on ADAPTER_HOLD — the swap driver should always resolve
    *  (success or failure) via enterFromDoor long before this fires. */
   private readonly ADAPTER_HOLD_TIMEOUT = 8.0;
@@ -2320,12 +2325,7 @@ export class Player {
           // T1 branch point: a paired door begins the adapter transit —
           // walk onward into the vestibule instead of the peek look-around.
           if (hooks.beginTransit && hooks.beginTransit()) {
-            const ox = Math.sin(door.faceAngle);
-            const oz = Math.cos(door.faceAngle);
-            this.adapterOutTarget = {
-              x: door.through.x + ox * this.ADAPTER_OUT_DIST,
-              z: door.through.z + oz * this.ADAPTER_OUT_DIST,
-            };
+            this._planAdapterOut(door, hooks);
             this.adapterOutWaitingOpen = false;
             this.doorPhase = "ADAPTER_OUT";
           } else {
@@ -2356,6 +2356,10 @@ export class Player {
 
       // ── Scripted walk back inside to the front point (no collision) ────────
       case "RETURN": {
+        if (this.vestibuleTrail.length > 0) {
+          this._stepBackThroughTube(pos, deltaTime);
+          return;
+        }
         const dx = door.front.x - pos.x;
         const dz = door.front.z - pos.z;
         const dist = Math.sqrt(dx * dx + dz * dz);
@@ -2411,7 +2415,7 @@ export class Player {
           if (this.doorTimer > this.DOOR_WAIT_TIMEOUT) this.adapterOutWaitingOpen = false;
           return;
         }
-        const target = this.adapterOutTarget;
+        let target = this.adapterOutTarget;
         if (!target) {
           // Defensive: target is always set with the phase.
           this.doorPhase = "ADAPTER_HOLD";
@@ -2419,31 +2423,46 @@ export class Player {
           hooks.onAdapterHold?.();
           return;
         }
-        const dx = target.x - pos.x;
-        const dz = target.z - pos.z;
-        const dist = Math.sqrt(dx * dx + dz * dz);
+        let budget = this.SPEED * deltaTime;
+        for (;;) {
+          const dx = target.x - pos.x;
+          const dz = target.z - pos.z;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          const next = this.adapterOutPath[0];
+          if (next && dist <= budget) {
+            // 🚪🔒 Past this point of the tube's walkway and on toward the
+            // next in the same frame, so the walk never stalls between them.
+            pos.x = target.x;
+            pos.z = target.z;
+            budget -= dist;
+            this.vestibuleTrail.push(target);
+            this.adapterOutPath.shift();
+            this.adapterOutTarget = target = next;
+            continue;
+          }
 
-        if (dist < 0.06) {
-          pos.x = target.x;
-          pos.z = target.z;
-          this.adapterOutTarget = null;
-          this.doorPhase = "ADAPTER_HOLD";
-          this.doorTimer = 0;
-          this.character.setState("idle", door.faceAngle);
-          // Seal the departure door behind us; the swap runs during HOLD.
-          hooks.requestClose();
-          hooks.onAdapterHold?.();
+          if (dist < 0.06) {
+            pos.x = target.x;
+            pos.z = target.z;
+            this.adapterOutTarget = null;
+            this.doorPhase = "ADAPTER_HOLD";
+            this.doorTimer = 0;
+            this.character.setState("idle", door.faceAngle);
+            // Seal the departure door behind us; the swap runs during HOLD.
+            hooks.requestClose();
+            hooks.onAdapterHold?.();
+            return;
+          }
+
+          const nx = dx / dist;
+          const nz = dz / dist;
+          this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+          const step = Math.min(budget, dist);
+          pos.x += nx * step;
+          pos.z += nz * step;
+          this.character.setState("walk", this.logicalAngle);
           return;
         }
-
-        const nx = dx / dist;
-        const nz = dz / dist;
-        this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
-        const step = Math.min(this.SPEED * deltaTime, dist);
-        pos.x += nx * step;
-        pos.z += nz * step;
-        this.character.setState("walk", this.logicalAngle);
-        return;
       }
 
       // ── T1: idle at the hold point while the room swap runs ────────────────
@@ -2478,6 +2497,10 @@ export class Player {
 
       // ── T1 arrival: scripted walk in from `through` to `front` ─────────────
       case "ARRIVE": {
+        if (this.vestibuleTrail.length > 0) {
+          this._stepBackThroughTube(pos, deltaTime);
+          return;
+        }
         const dx = door.front.x - pos.x;
         const dz = door.front.z - pos.z;
         const dist = Math.sqrt(dx * dx + dz * dz);
@@ -2545,6 +2568,28 @@ export class Player {
   }
 
   /**
+   * 🚪🔒 Which way the scripted walk through a door's tube is heading right
+   * now (atan2(dx, dz), the first-person look's convention): out along the
+   * tube, back along its trail, or in through the arrival door. Null when it
+   * is not walking one. First person turns the view with it.
+   */
+  getTubeWalkHeading(): number | null {
+    const trailTop = this.vestibuleTrail[this.vestibuleTrail.length - 1];
+    let target: { x: number; z: number } | null | undefined = null;
+    if (this.doorPhase === "ADAPTER_OUT" && !this.adapterOutWaitingOpen) {
+      target = this.adapterOutTarget;
+    } else if (this.doorPhase === "ARRIVE") {
+      target = trailTop ?? this.doorTarget?.front;
+    } else if (this.doorPhase === "RETURN") {
+      target = trailTop;
+    }
+    if (!target) return null;
+    const dx = target.x - this.mesh.position.x;
+    const dz = target.z - this.mesh.position.z;
+    return dx * dx + dz * dz > 1e-6 ? Math.atan2(dx, dz) : null;
+  }
+
+  /**
    * Door involved in the ACTIVE walk-through/transit sequence, or null (#51 —
    * the camera-facing door fade restores full opacity on a door while the
    * player approaches / crosses it).
@@ -2568,6 +2613,9 @@ export class Player {
     door: DoorTarget,
     hooks: DoorSequenceHooks,
     spawnAtThrough = true,
+    // 🚪🔒 The tube walk's arrival half: points from the door out along the
+    // tube, the spawn LAST (instead of `through`); the walk-in retraces them.
+    via?: ReadonlyArray<{ x: number; z: number }>,
   ): void {
     this.doorSeq++; // invalidate any in-flight requestOpen completion
     this._cancelSit();
@@ -2581,9 +2629,16 @@ export class Player {
     this.doorTarget = door;
     this.doorHooks = hooks;
     this.adapterOutTarget = null;
-    if (spawnAtThrough) {
+    this.adapterOutPath = [];
+    if (spawnAtThrough && via && via.length > 0) {
+      const spawn = via[via.length - 1];
+      this.mesh.position.x = spawn.x;
+      this.mesh.position.z = spawn.z;
+      this.vestibuleTrail = via.slice(0, -1).map((p) => ({ x: p.x, z: p.z }));
+    } else if (spawnAtThrough) {
       this.mesh.position.x = door.through.x;
       this.mesh.position.z = door.through.z;
+      this.vestibuleTrail = []; // a new room: nothing to retrace
     }
     this.logicalAngle = snapTo8Ways(door.faceAngle + Math.PI); // face inward
     this.character.setState("idle", this.logicalAngle);
@@ -2596,6 +2651,53 @@ export class Player {
       if (seq !== this.doorSeq || this.doorPhase !== "ARRIVE_OPEN") return;
       this.doorPhase = "ARRIVE";
     });
+  }
+
+  /** 🚪🔒 Where ADAPTER_OUT walks: the hooks' path along the tube when there
+   *  is one, else the classic short step straight out past `through`. */
+  private _planAdapterOut(door: DoorTarget, hooks: DoorSequenceHooks): void {
+    const path = hooks.vestibulePath?.() ?? null;
+    this.vestibuleTrail = [{ x: door.through.x, z: door.through.z }];
+    if (path && path.length > 0) {
+      this.adapterOutPath = path.map((p) => ({ x: p.x, z: p.z }));
+      this.adapterOutTarget = this.adapterOutPath.shift()!;
+      return;
+    }
+    this.adapterOutPath = [];
+    const ox = Math.sin(door.faceAngle);
+    const oz = Math.cos(door.faceAngle);
+    this.adapterOutTarget = {
+      x: door.through.x + ox * this.ADAPTER_OUT_DIST,
+      z: door.through.z + oz * this.ADAPTER_OUT_DIST,
+    };
+  }
+
+  /** 🚪🔒 Walking back in from the tube: retrace the walked points in reverse
+   *  (the last one is `through`); the caller walks on to the door's front once
+   *  the trail is used up. */
+  private _stepBackThroughTube(pos: THREE.Vector3, deltaTime: number): void {
+    let budget = this.SPEED * deltaTime;
+    for (;;) {
+      const target = this.vestibuleTrail[this.vestibuleTrail.length - 1];
+      if (!target) return;
+      const dx = target.x - pos.x;
+      const dz = target.z - pos.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist <= budget) {
+        pos.x = target.x;
+        pos.z = target.z;
+        budget -= dist;
+        this.vestibuleTrail.pop();
+        continue;
+      }
+      const nx = dx / dist;
+      const nz = dz / dist;
+      this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+      pos.x += nx * budget;
+      pos.z += nz * budget;
+      this.character.setState("walk", this.logicalAngle);
+      return;
+    }
   }
 
   /**
@@ -2619,12 +2721,7 @@ export class Player {
 
     this.doorTarget = door;
     this.doorHooks = hooks;
-    const ox = Math.sin(door.faceAngle);
-    const oz = Math.cos(door.faceAngle);
-    this.adapterOutTarget = {
-      x: door.through.x + ox * this.ADAPTER_OUT_DIST,
-      z: door.through.z + oz * this.ADAPTER_OUT_DIST,
-    };
+    this._planAdapterOut(door, hooks);
     this.doorTimer = 0;
     this.doorPhase = "ADAPTER_OUT";
     this.adapterOutWaitingOpen = true;
@@ -2673,6 +2770,8 @@ export class Player {
     this.doorTarget = null;
     this.doorHooks = null;
     this.adapterOutTarget = null;
+    this.adapterOutPath = [];
+    this.vestibuleTrail = [];
     this.doorTimer = 0;
     // 🧬 Vat teardown: a beam ends any spawn choreography — its vat seals
     // behind us — and drops the clearance squeeze (beginVatSpawn beams first,
