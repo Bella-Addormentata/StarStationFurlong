@@ -563,9 +563,9 @@ pub async fn read_beacons(client: &impl ChainAccess, peak: u32, now: u64) -> Res
 }
 
 /// The heights at which the given coins were SPENT, for those the chain lists
-/// as spent (#231 P6b: a knock's confirmation height, read by its knocker off
-/// the coin its spend consumed). Pages are followed within the poll budget;
-/// a coin not yet spent, or not listed, is simply absent.
+/// as spent (#231 P6b: one input of a write's standing — a spent input alone
+/// proves nothing about the write, see [`write_standing`]). Pages are followed
+/// within the poll budget; a coin not yet spent, or not listed, is simply absent.
 pub async fn spent_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) -> Result<Vec<(Bytes32, u32)>> {
     if coin_ids.is_empty() {
         return Ok(Vec::new());
@@ -584,6 +584,92 @@ pub async fn spent_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) ->
         }
     }
     Ok(out)
+}
+
+/// #231 P6b: whether a write's own coin sits under `hint` — the coin a
+/// spend-to-self creates names the coin it spent as its parent, so the child
+/// under the hint whose `parent_coin_info` is the write's INPUT is the write
+/// itself, confirmed where that child confirmed. The input's spent flag alone
+/// says nothing of the write (#272 review): the mempool may have dropped the
+/// write and a later spend of ours taken the same coin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HintChild {
+    /// The write's own coin is under the hint, confirmed at this height.
+    Confirmed(u32),
+    /// The listing ran to its end and no coin under the hint names the input
+    /// as its parent; judged at this height (`None`: the source gave none).
+    Absent { judged_at: Option<u32> },
+    /// The listing was cut short before its end: nothing can be said yet.
+    Unknown,
+}
+
+/// Look for the write that spent `parent` among the coins under `hint`,
+/// paging within the poll budget.
+pub async fn child_under_hint(client: &impl ChainAccess, hint: Bytes32, parent: Bytes32) -> Result<HintChild> {
+    let mut page: Option<String> = None;
+    let mut judged_at: Option<u32> = None;
+    let mut undated = false;
+    for _ in 0..MAX_PAGES_PER_POLL {
+        let listing = client
+            .coin_records_by_hint(hint, None, true, page.take())
+            .await
+            .map_err(|e| anyhow!("hint lookup: {e}"))?;
+        if let Some(rec) = listing.records.iter().find(|r| r.coin.parent_coin_info == parent) {
+            return Ok(HintChild::Confirmed(rec.confirmed_block_index));
+        }
+        match listing.judged_at {
+            Some(h) => judged_at = Some(judged_at.map_or(h, |lowest| lowest.min(h))),
+            None => undated = true,
+        }
+        match (listing.truncated, listing.next_cursor) {
+            (true, Some(next)) => page = Some(next),
+            (true, None) => return Ok(HintChild::Unknown),
+            (false, _) => return Ok(HintChild::Absent { judged_at: if undated { None } else { judged_at } }),
+        }
+    }
+    Ok(HintChild::Unknown)
+}
+
+/// Where a pending write stands (#231 P6b knocks and beacons, #272 review).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteStanding {
+    /// On chain, confirmed at this height.
+    Confirmed(u32),
+    /// Never landed, for the reason given: the writer forgets it and may write again.
+    Dead(&'static str),
+    /// Not settled yet: left as it is, asked again next tick.
+    Pending,
+}
+
+/// Judge a pending write from the chain's word: `child` is what sits under its
+/// hint ([`child_under_hint`]), `spent_at` the height its input was spent at
+/// when the chain lists it spent ([`spent_heights`]), `parked` whether the
+/// wallet lease still holds the input (its spend may still be live in a
+/// mempool). Only the write's OWN coin confirms it. An input spent with no
+/// child under the hint went to ANOTHER spend of ours — but only on a listing
+/// judged at or past that spend, since a source still behind it may not list
+/// the child yet. An input unspent and no longer parked was dropped by the
+/// mempool (the lease frees a coin only on that verdict or on confirmation).
+/// Nothing here is decided by the clock.
+pub fn write_standing(child: &HintChild, spent_at: Option<u32>, parked: bool) -> WriteStanding {
+    match child {
+        HintChild::Confirmed(height) => WriteStanding::Confirmed(*height),
+        HintChild::Unknown => WriteStanding::Pending,
+        HintChild::Absent { judged_at } => match spent_at {
+            Some(spent) if judged_at.is_some_and(|judged| judged >= spent) => {
+                WriteStanding::Dead("its coin went to another spend of ours")
+            }
+            Some(_) => WriteStanding::Pending,
+            None if !parked => WriteStanding::Dead("the mempool dropped it"),
+            None => WriteStanding::Pending,
+        },
+    }
+}
+
+/// A 32-byte id from its hex, as the node files write them.
+pub fn parse_hex32(hex_id: &str) -> Option<Bytes32> {
+    let bytes: [u8; 32] = hex::decode(hex_id).ok()?.try_into().ok()?;
+    Some(Bytes32::new(bytes))
 }
 
 /// ONE-SHOT: the freshest presence record `node_id` published under its
@@ -953,5 +1039,61 @@ mod tests {
         assert_eq!(hints.len(), 2);
         assert_eq!(hints[0], chia_lane::derive_ck_hint(&ck, 5));
         assert_eq!(hints[1], chia_lane::derive_ck_hint(&ck, 4));
+    }
+
+    #[test]
+    fn a_write_is_judged_by_its_own_coin_under_the_hint_not_by_its_spent_input() {
+        let absent = |judged_at| HintChild::Absent { judged_at };
+        assert_eq!(write_standing(&HintChild::Confirmed(900), Some(900), false), WriteStanding::Confirmed(900));
+        assert_eq!(write_standing(&HintChild::Confirmed(900), None, true), WriteStanding::Confirmed(900), "the child is the proof, whatever the input says");
+        assert_eq!(write_standing(&HintChild::Unknown, Some(900), false), WriteStanding::Pending, "a listing cut short decides nothing");
+        assert_eq!(write_standing(&absent(Some(950)), Some(900), true), WriteStanding::Dead("its coin went to another spend of ours"));
+        assert_eq!(write_standing(&absent(Some(900)), Some(900), false), WriteStanding::Dead("its coin went to another spend of ours"), "judged at the spend itself is enough");
+        assert_eq!(write_standing(&absent(Some(899)), Some(900), false), WriteStanding::Pending, "a source behind the spend may not list the child yet");
+        assert_eq!(write_standing(&absent(None), Some(900), false), WriteStanding::Pending, "an undated listing cannot say");
+        assert_eq!(write_standing(&absent(Some(950)), None, true), WriteStanding::Pending, "unspent and still parked: the spend may be live in a mempool");
+        assert_eq!(write_standing(&absent(Some(950)), None, false), WriteStanding::Dead("the mempool dropped it"));
+        assert_eq!(write_standing(&absent(None), None, false), WriteStanding::Dead("the mempool dropped it"), "the lease's verdict needs no height");
+    }
+
+    #[tokio::test]
+    async fn the_child_under_the_hint_is_found_by_its_parent_through_the_pages() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use chia_protocol::Coin;
+        let input = Bytes32::new([7u8; 32]);
+        let hint = Bytes32::new([8u8; 32]);
+        let rec = |parent: u8, height: u32| CoinRecord {
+            coin: Coin::new(Bytes32::new([parent; 32]), Bytes32::new([1u8; 32]), 1),
+            confirmed_block_index: height,
+            spent: false,
+            spent_block_index: 0,
+        };
+        let page = |records: Vec<CoinRecord>, truncated: bool, next: Option<&str>, judged_at: Option<u32>| CoinListing {
+            records,
+            truncated,
+            next_cursor: next.map(str::to_string),
+            judged_at,
+        };
+        // Two pages: the write's own coin is on the second.
+        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(120)), page(vec![rec(7, 101)], false, None, Some(120))]);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed(101));
+        // A listing run to its end without it, judged at the lowest height over its pages.
+        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(130)), page(vec![rec(2, 101)], false, None, Some(120))]);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Absent { judged_at: Some(120) });
+        // One undated page leaves the listing undated.
+        let chain = Scripted::new(vec![page(vec![], true, Some("c"), Some(130)), page(vec![], false, None, None)]);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Absent { judged_at: None });
+        // Cut short with nowhere to go on: unknown.
+        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, None, Some(130))]);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Unknown);
+        // Still cut short when the page budget is spent: unknown too.
+        let pages: Vec<CoinListing> = (0..MAX_PAGES_PER_POLL + 1).map(|_| page(vec![], true, Some("c"), Some(130))).collect();
+        let chain = Scripted::new(pages);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Unknown);
+        // A chain that does not answer is an error, not a verdict.
+        assert!(child_under_hint(&crate::chia_chain::testing::Unanswering, hint, input).await.is_err());
+        assert_eq!(parse_hex32(&hex::encode(input.to_bytes())), Some(input));
+        assert_eq!(parse_hex32("zz"), None);
+        assert_eq!(parse_hex32("0011"), None, "the wrong length is no id");
     }
 }

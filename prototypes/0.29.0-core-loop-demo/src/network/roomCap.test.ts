@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_CAP_MEMBER_CARDS,
   buildRoomCapPayload,
+  cardsForPass,
   memberCardsOf,
   newerCard,
   nextCapSeq,
@@ -59,6 +60,22 @@ describe('room cap payload (N8 / D3)', () => {
     ];
     expect(memberCardsOf(hints)).toEqual([card('a')]);
     expect(memberCardsOf(undefined)).toEqual([]);
+  });
+
+  it('P6b: a pass carries no card in a public room, and not ours while Share Card is off', () => {
+    const hints = [
+      { irohNodeId: 'me', nodeCard: card('me') },
+      { irohNodeId: 'them', nodeCard: card('them') },
+      { irohNodeId: 'bare' },
+    ];
+    expect(cardsForPass(hints, true, true, 'me').map((h) => h.nodeCard)).toEqual([undefined, undefined, undefined]);
+    expect(cardsForPass(hints, false, true, 'me')).toEqual(hints);
+    // The switch is off for this room: our own card stays home, the others
+    // (shared into this room by their owners) still ride.
+    const off = cardsForPass(hints, false, false, 'me');
+    expect(off).toEqual([{ irohNodeId: 'me' }, { irohNodeId: 'them', nodeCard: card('them') }, { irohNodeId: 'bare' }]);
+    expect(cardsForPass(hints, false, false, undefined)).toEqual(hints);
+    expect(hints[0].nodeCard).toEqual(card('me'));
   });
 
   it('sequences caps by the clock but never at or below the last one', () => {

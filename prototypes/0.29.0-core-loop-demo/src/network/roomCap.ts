@@ -1,4 +1,4 @@
-import type { ContactCard } from './protocol.ts';
+import type { ContactCard, RoomMemberHint } from './protocol.ts';
 
 /**
  * The `cap` envelope payload the browser hands its LOCAL node over loopback
@@ -101,6 +101,29 @@ export function readShareCard(roomId: string): boolean {
   } catch {
     return true;
   }
+}
+
+/** #231 P6b: the hints a PASS carries, card-wise. A pass to a PUBLIC room
+ *  carries no card at all (N8 extends to `ck`). A pass to a private room
+ *  carries every card known — except this station's own while the room's
+ *  "Share Card" switch is off (#272 review): the switch is per room, the
+ *  cached card is not, so a card received in another room, or before the
+ *  switch went off, must not ride out of this one. Other members' cards stay:
+ *  each came in with this room's pass, where its owner's own switch put it. */
+export function cardsForPass(
+  hints: readonly RoomMemberHint[],
+  publicRoom: boolean,
+  shareOwnCard: boolean,
+  selfNodeId: string | null | undefined,
+): RoomMemberHint[] {
+  return hints.map((hint) => {
+    if (!hint.nodeCard) return hint;
+    if (publicRoom || (!shareOwnCard && hint.irohNodeId === selfNodeId)) {
+      const { nodeCard: _card, ...rest } = hint;
+      return rest;
+    }
+    return hint;
+  });
 }
 
 /** Where the LOCAL node's own card is kept once it arrives over the `card`

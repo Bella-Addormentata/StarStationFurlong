@@ -16,6 +16,7 @@ import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
 import {
+  cardsForPass,
   newerCard,
   normalizeContactCard,
   readNodeCard,
@@ -899,12 +900,6 @@ function normalizeMemberHint(value: unknown): RoomMemberHint | null {
     irohDirectAddrs: directHints.length ? directHints : undefined,
     nodeCard: card && card.nodeId === entry.irohNodeId ? card : undefined,
   };
-}
-
-/** #231 P6b: hints with no contact card on any of them — what a PUBLIC room's
- *  pass carries (N8 extends to `ck`: a bundled or public room names no key). */
-function stripMemberCards(hints: RoomMemberHint[]): RoomMemberHint[] {
-  return hints.map(({ nodeCard: _card, ...rest }) => rest);
 }
 
 function collectMemberHints(
@@ -8601,11 +8596,16 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   const roomKeyB64 =
     activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
   const rawLocalHint = getLocalNodeHint(fingerprint);
-  // #231 P6b: no card in a public room's hints (N8 extends to `ck`).
-  const localHint =
-    rawLocalHint && roomIsPublicSpaceNow(roomId)
-      ? stripMemberCards([rawLocalHint])[0]
-      : rawLocalHint;
+  // #231 P6b: no card in a public room's hints (N8 extends to `ck`), and none
+  // of ours while this room's Share Card switch is off (#272 review).
+  const localHint = rawLocalHint
+    ? cardsForPass(
+        [rawLocalHint],
+        roomIsPublicSpaceNow(roomId),
+        readShareCard(roomId),
+        fingerprint.iroh_node_id,
+      )[0]
+    : rawLocalHint;
   return {
     v: 2,
     roomId,
@@ -8641,9 +8641,17 @@ function buildOutgoingBootstrap(
   );
   // #231 P6b: a pass to a PUBLIC room (the welcome room, or one anyone may
   // walk into) carries no contact card — N8 extends to `ck`; a private room's
-  // pass carries every member card known, ours included, so a member who
-  // cannot reach another can still find and knock on it by key.
-  const mergedHints = roomIsPublicSpaceNow(roomId) ? stripMemberCards(allHints) : allHints;
+  // pass carries every member card known, so a member who cannot reach
+  // another can still find and knock on it by key — ours among them only
+  // while this room's Share Card switch is on: the switch is per room, the
+  // cached card is not, so a card received elsewhere, or before the switch
+  // went off, must not ride out of this room (#272 review).
+  const mergedHints = cardsForPass(
+    allHints,
+    roomIsPublicSpaceNow(roomId),
+    readShareCard(roomId),
+    fingerprint.iroh_node_id,
+  );
   const primaryHint = localHint ?? mergedHints[0];
 
   return {

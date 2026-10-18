@@ -8,8 +8,9 @@
 //! H's contact-card key under H's INBOX hint for the room's lane, so only H
 //! learns that J wants in, and which room (named by a lane id, never by its
 //! id). The chain is then the shared clock: the block that CONFIRMED the knock,
-//! `h`, is read by J off its own spent coin and by H off the coin under its
-//! inbox hint, and both dial at the same heights after it — `h + 10n` for
+//! `h`, is read by both off the knock's own coin under H's inbox hint (J finds
+//! it as the child of the coin it spent), and both dial at the same heights
+//! after it — `h + 10n` for
 //! n = 1..6 (twenty minutes of near-continuous holds, since a hold window is
 //! about ten blocks long), then every tenth beat (320 blocks) for the rest of
 //! two eras — so a hold started on one side meets a hold started on the other
@@ -101,8 +102,10 @@ pub struct SentKnock {
     pub era: u64,
     /// The inbox hint written under, hex (what the operator can look up).
     pub hint: String,
-    /// The coin the knock spend consumed, hex: the chain's `spent_block_index`
-    /// for it is the knock's confirmation height.
+    /// The coin the knock spend consumed, hex: the knock's own coin names it
+    /// as parent, which is how the knock is found again under the hint and
+    /// judged ([`crate::chia_resolve::write_standing`]) — its spent flag alone
+    /// proves nothing, since a dropped knock's coin goes to the next write.
     pub coin_id: String,
     pub pushed_at: u64,
     /// 0 until the spend confirmed.
@@ -190,9 +193,9 @@ impl KnockBook {
         self.sent.push(knock);
     }
 
-    /// The input coin ids (hex) of knocks whose confirmation is not known yet.
-    pub fn pending_sent(&self) -> Vec<String> {
-        self.sent.iter().filter(|k| k.confirmed_height == 0).map(|k| k.coin_id.clone()).collect()
+    /// The knocks whose standing is not known yet (neither confirmed nor dropped).
+    pub fn pending_sent(&self) -> Vec<SentKnock> {
+        self.sent.iter().filter(|k| k.confirmed_height == 0).cloned().collect()
     }
 
     /// The chain says the knock that spent `coin_id` confirmed at `height`;
@@ -207,9 +210,10 @@ impl KnockBook {
         changed
     }
 
-    /// A knock of ours the chain confirmed OUTSIDE its era (the host's reader
-    /// rejects it, so nobody dials back): forgotten, the next dial exhaustion
-    /// knocks again. Returns true when one went.
+    /// A knock of ours that never counts — the chain confirmed it OUTSIDE its
+    /// era (the host's reader rejects it, so nobody dials back), or its spend
+    /// never landed ([`crate::chia_resolve::WriteStanding::Dead`]): forgotten,
+    /// the next dial exhaustion knocks again. Returns true when one went.
     pub fn drop_sent(&mut self, coin_id: &str) -> bool {
         let before = self.sent.len();
         self.sent.retain(|k| k.coin_id != coin_id);
@@ -245,23 +249,50 @@ impl KnockBook {
     }
 
     /// Every dial-back whose boundary fell since it was last planned, at chain
-    /// peak `peak`; each is marked planned at `peak` so a boundary is dialed
-    /// once. The knocker dials the host, the host dials the knocker.
-    pub fn due_dialbacks(&mut self, peak: u32) -> Vec<DialBack> {
-        let mut out = Vec::new();
-        for k in self.sent.iter_mut().filter(|k| k.confirmed_height != 0) {
+    /// peak `peak`, the longest-waiting first. The knocker dials the host, the
+    /// host dials the knocker. Nothing is marked here: a boundary is planned
+    /// with [`KnockBook::mark_dialed`] once its hold actually starts, so a
+    /// dial-back the room had no hold slot for (#272 review) stays due and,
+    /// having waited longest, comes first next tick.
+    pub fn due_dialbacks(&self, peak: u32) -> Vec<DialBack> {
+        let mut out: Vec<(u32, DialBack)> = Vec::new();
+        for k in self.sent.iter().filter(|k| k.confirmed_height != 0) {
             if rendezvous_due(k.confirmed_height, k.last_rendezvous, peak) {
-                k.last_rendezvous = peak;
-                out.push(DialBack { target: k.host.clone(), room: k.room.clone(), we_knocked: true });
+                out.push((k.last_rendezvous, DialBack { target: k.host.clone(), room: k.room.clone(), we_knocked: true }));
             }
         }
-        for k in self.inbox.iter_mut() {
+        for k in self.inbox.iter() {
             if rendezvous_due(k.confirmed_height, k.last_rendezvous, peak) {
-                k.last_rendezvous = peak;
-                out.push(DialBack { target: k.from.clone(), room: k.room.clone(), we_knocked: false });
+                out.push((k.last_rendezvous, DialBack { target: k.from.clone(), room: k.room.clone(), we_knocked: false }));
             }
         }
-        out
+        out.sort_by_key(|(last, _)| *last);
+        out.into_iter().map(|(_, d)| d).collect()
+    }
+
+    /// The dial-back `d` was planned at `peak` (its hold started, or it was
+    /// moot: the room gone, sharing no cards, or the two linked): the boundary
+    /// clock of every entry it stands for — the same target, room and side,
+    /// due at `peak` — moves up, so that boundary is not dialed twice. Returns
+    /// true when something changed.
+    pub fn mark_dialed(&mut self, d: &DialBack, peak: u32) -> bool {
+        let mut changed = false;
+        if d.we_knocked {
+            for k in self.sent.iter_mut().filter(|k| k.confirmed_height != 0 && k.host == d.target && k.room == d.room) {
+                if rendezvous_due(k.confirmed_height, k.last_rendezvous, peak) {
+                    k.last_rendezvous = peak;
+                    changed = true;
+                }
+            }
+        } else {
+            for k in self.inbox.iter_mut().filter(|k| k.from == d.target && k.room == d.room) {
+                if rendezvous_due(k.confirmed_height, k.last_rendezvous, peak) {
+                    k.last_rendezvous = peak;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 }
 
@@ -310,7 +341,7 @@ mod tests {
         assert!(book.knocked_this_era("H", 3));
         assert!(!book.knocked_this_era("H", 4), "a new era knocks again");
         assert!(!book.knocked_this_era("G", 3), "another host is another knock");
-        assert_eq!(book.pending_sent(), vec!["c1".to_string()]);
+        assert_eq!(book.pending_sent().iter().map(|k| k.coin_id.as_str()).collect::<Vec<_>>(), vec!["c1"]);
         assert!(book.confirm_sent("c1", 96_800));
         assert!(!book.confirm_sent("c1", 96_900), "confirmed once");
         assert!(book.pending_sent().is_empty());
@@ -344,11 +375,42 @@ mod tests {
         assert!(book.due_dialbacks(1005).is_empty(), "before the first boundary");
         let due = book.due_dialbacks(1012);
         assert_eq!(due, vec![DialBack { target: "H".into(), room: "r".into(), we_knocked: true }]);
+        assert_eq!(book.due_dialbacks(1012), due, "nothing is planned until its hold starts");
+        assert!(book.mark_dialed(&due[0], 1012));
+        assert!(!book.mark_dialed(&due[0], 1012), "planned once");
         assert!(book.due_dialbacks(1015).is_empty(), "the same boundary is not dialed twice");
         let due = book.due_dialbacks(2011);
         assert_eq!(due.len(), 2, "our knock's h+20 and the inbox knock's h+10 fall in this interval");
         assert!(due.iter().any(|d| d.target == "J" && !d.we_knocked));
         assert!(due.iter().any(|d| d.target == "H" && d.we_knocked));
+        for d in &due {
+            assert!(book.mark_dialed(d, 2011));
+        }
+        assert!(book.due_dialbacks(2015).is_empty());
+    }
+
+    #[test]
+    fn a_dial_back_passed_over_stays_due_and_comes_first() {
+        let mut book = KnockBook::default();
+        book.record_sent(sent("H", 3, "c1", 100));
+        book.confirm_sent("c1", 1000);
+        book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 1000, coin_id: "k1".into(), last_rendezvous: 1000 });
+        let due = book.due_dialbacks(1012);
+        assert_eq!(due.iter().map(|d| d.target.as_str()).collect::<Vec<_>>(), vec!["H", "J"], "equal waits keep the book's order");
+        // The room had one hold slot: H's hold started, J's did not.
+        assert!(book.mark_dialed(&due[0], 1012));
+        let again = book.due_dialbacks(1013);
+        assert_eq!(again, vec![DialBack { target: "J".into(), room: "r".into(), we_knocked: false }], "the boundary J was passed over for is still due");
+        assert!(book.mark_dialed(&again[0], 1013));
+        assert!(book.due_dialbacks(1015).is_empty());
+        // At the next boundary the one planned longest ago comes first.
+        let next = book.due_dialbacks(1022);
+        assert_eq!(next.iter().map(|d| d.target.as_str()).collect::<Vec<_>>(), vec!["H", "J"]);
+        book.inbox[0].last_rendezvous = 1011;
+        let next = book.due_dialbacks(1022);
+        assert_eq!(next.iter().map(|d| d.target.as_str()).collect::<Vec<_>>(), vec!["J", "H"], "the longest-waiting first");
+        assert!(!book.mark_dialed(&DialBack { target: "X".into(), room: "r".into(), we_knocked: true }, 1022), "an unknown dial-back marks nothing");
+        assert!(!book.mark_dialed(&DialBack { target: "J".into(), room: "r".into(), we_knocked: true }, 1022), "the side is part of the identity");
     }
 
     #[test]

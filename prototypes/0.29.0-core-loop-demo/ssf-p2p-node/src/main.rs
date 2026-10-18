@@ -2605,7 +2605,7 @@ async fn dial_peer_inner(
                                 chia_watch::HOLD_WINDOW.as_secs()
                             );
                             // hold_dial reports its own outcome to the browser.
-                            hold_dial(
+                            let ok = hold_dial(
                                 hub.clone(),
                                 iroh_ep.clone(),
                                 room_id.clone(),
@@ -2628,7 +2628,14 @@ async fn dial_peer_inner(
                                     let _ = book.save(std::path::Path::new(chia_contact::PEERS_FILE));
                                 }
                             }
-                            return;
+                            // Settled only when the peer linked (or the room went
+                            // away, which `ok` also says). A hold on stale v1
+                            // addresses falls through to the knock below, as the
+                            // contact-key hold does: returning here left a host
+                            // with stale addresses never knocked on (#272 review).
+                            if ok {
+                                return;
+                            }
                         }
                     }
                     Ok(None) => {}

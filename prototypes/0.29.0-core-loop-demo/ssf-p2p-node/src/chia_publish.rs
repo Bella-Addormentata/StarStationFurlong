@@ -387,6 +387,12 @@ impl WalletLease {
         Ok(())
     }
 
+    /// Is `coin` parked — consumed by a spend the chain and the mempool have
+    /// not settled yet (#231 P6b: the knock and beacon verdicts ask)?
+    pub fn is_parked(&self, coin: &Bytes32) -> bool {
+        self.pending.lock().unwrap().contains_key(coin)
+    }
+
     /// A spend from OUR wallet is still settling: a coin is parked other than
     /// the faucet coin a claim spent (the dish's coin, not ours; that one is
     /// [`WalletLease::incoming_pending`]). Read from the lease, never inferred
@@ -1183,22 +1189,40 @@ pub async fn publish_node_presence(
     let plain = chia_lane::encode_presence_v2(&record, iroh_sk)?;
     let sealed = chia_lane::seal_v2(ck, KIND_PRESENCE, era, &plain)?;
     let hint = Bytes32::new(chia_lane::derive_ck_hint(ck, era));
-    publish_memo(chia_sk, hint, sealed, "presence").await?;
+    let write = publish_memo(chia_sk, hint, sealed, "presence").await?;
+    if !write.acked {
+        return Err(anyhow!("push_tx unanswered — the coin stays parked until the chain or the mempool settles it; the write is retried after the lease's verdict"));
+    }
     Ok(hint)
+}
+
+/// What an era-bound write left behind: the INPUT coin its spend consumed and
+/// whether the peers acknowledged the push. An unanswered push (`acked`
+/// false) is a write all the same — its input is parked and the bundle may be
+/// in a mempool — so the knock and beacon writers file it as pending, like an
+/// acknowledged one, and let the chain settle it (#272 review); the presence
+/// writer still reports it as a failure, since its mark's retry waits on the
+/// lease either way.
+pub struct MemoWrite {
+    pub coin: Bytes32,
+    pub acked: bool,
 }
 
 /// The shared tail of every era-bound write (presence, knock, beacon): under
 /// the lease, reconcile, refuse while a spend of ours is still settling, pick
 /// the payer's largest free coin, spend it to itself carrying `[hint, body]`,
-/// push with the input parked. Returns the INPUT coin's id: the chain's
-/// `spent_block_index` for it is the height the write confirmed at.
+/// push with the input parked. Returns what the write left behind
+/// ([`MemoWrite`]): the INPUT coin's id — the write's own coin names it as
+/// parent, which is how the write is found again under its hint and judged
+/// ([`crate::chia_resolve::write_standing`]) — and whether the push was
+/// acknowledged.
 ///
 /// Refusing while a spend settles (#231 P6a): a wallet holding more coins
 /// would spend ANOTHER one beside the pending write — two records landing for
 /// one era, the era's write budget paid twice. The confirmation timeout is a
 /// retry for a spend the mempool DROPPED, so a pending one waits for
 /// reconciliation's verdict (the heartbeat tries again on its retry cadence).
-async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &str) -> Result<Bytes32> {
+async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &str) -> Result<MemoWrite> {
     let _lease = WALLET_LEASE.lock().await;
     WALLET_LEASE.ensure_open()?;
     let client = crate::chia_chain::connect();
@@ -1211,8 +1235,20 @@ async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &st
         .await?
         .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
     let bundle = build_publish_bundle(payer, coin.coin, hint, Bytes::new(body))?;
-    push_parked(&client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
-    Ok(coin.coin.coin_id())
+    let input = coin.coin.coin_id();
+    match push_parked(&client, bundle, [(input, coin.confirmed_height)]).await {
+        Ok(()) => Ok(MemoWrite { coin: input, acked: true }),
+        // Indeterminate, not failed: the bundle may be in a mempool and the
+        // input is parked. Reported as a write, so the caller files it as
+        // pending and lets the chain's word settle it — filed as a failure it
+        // would be written AGAIN beside the first once the lease frees the
+        // coin (#272 review).
+        Err(PushError::Unanswered(e)) => {
+            eprintln!("⛓️ ChiaHub {what}: the push went unanswered ({e:#}) — filed as pending; the chain's word settles it");
+            Ok(MemoWrite { coin: input, acked: false })
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ── #231 P6b: knocks and beacons ─────────────────────────────────────────────
@@ -1248,6 +1284,18 @@ pub struct BeaconMark {
     pub hint: String,
     #[serde(default)]
     pub node_id: Option<String>,
+    /// The input coin the beacon spend consumed, hex: the beacon's own coin
+    /// names it as parent, which is how the write is found again under the
+    /// hint ([`crate::chia_resolve::child_under_hint`]).
+    #[serde(default)]
+    pub coin_id: String,
+    /// The beacon's own coin was read back under the era's hint. Until then
+    /// the write is PENDING (#272 review): the peers' acceptance puts a spend
+    /// in a mempool, and a zero-fee spend can still be dropped from it. A
+    /// pending mark is settled by the chain's word — confirmed, or dead and
+    /// then written again — never by the clock, and never written over.
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 impl BeaconMark {
@@ -1264,7 +1312,10 @@ impl BeaconMark {
 }
 
 /// Once per era, as this node id: a new era, no mark, or a mark another
-/// identity left.
+/// identity left. A mark of this era and identity holds whether confirmed or
+/// still pending — a pending one is settled by [`beacon_standing`], and the
+/// heartbeat clears it (so the beacon is due again) only on the chain's word
+/// that the write is dead.
 pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
     match mark {
         None => true,
@@ -1272,11 +1323,47 @@ pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
     }
 }
 
+/// #231 P6b: the chain's word on a pending beacon mark — its own coin under
+/// the era's hint, its input's spent flag, and whether the lease still parks
+/// the input ([`crate::chia_resolve::write_standing`]). `None` when the chain
+/// could not be asked this tick, or the mark names no coin (nothing to judge).
+pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Option<crate::chia_resolve::WriteStanding> {
+    let coin = crate::chia_resolve::parse_hex32(&mark.coin_id)?;
+    let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
+    let child = match crate::chia_resolve::child_under_hint(client, hint, coin).await {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("⛓️ ChiaHub beacon: could not read under the beacon hint: {e:#}");
+            return None;
+        }
+    };
+    let spent_at = match crate::chia_resolve::spent_heights(client, vec![coin]).await {
+        Ok(spent) => spent.into_iter().find(|(c, _)| *c == coin).map(|(_, h)| h),
+        Err(e) => {
+            eprintln!("⛓️ ChiaHub beacon: could not read the beacon's input: {e:#}");
+            return None;
+        }
+    };
+    let parked = still_parked(client, &[coin]).await.contains(&coin);
+    Some(crate::chia_resolve::write_standing(&child, spent_at, parked))
+}
+
+/// Settle the lease's parked spends against the chain now (under the gate),
+/// then say which of `coins` are still parked: their spends may still be live
+/// in a mempool, so a write filed by one of them is left pending. For the
+/// knock and beacon verdicts, which would otherwise wait for the next writer
+/// to reconcile.
+pub async fn still_parked(client: &impl ChainAccess, coins: &[Bytes32]) -> HashSet<Bytes32> {
+    let _gate = WALLET_LEASE.lock().await;
+    WALLET_LEASE.reconcile(client).await;
+    coins.iter().copied().filter(|c| WALLET_LEASE.is_parked(c)).collect()
+}
+
 /// Write one knock for `req`: the knocker's node id, its contact key when it
 /// is findable (so the host can read its presence and dial it there) and the
 /// room's lane id, signed (iroh key), sealed to the host's card key, filed
 /// under the host's inbox hint for the room's lane. Returns the hint and the
-/// input coin whose spent height is the knock's confirmation height.
+/// write ([`MemoWrite`]: the input coin the knock is found again by).
 pub async fn publish_knock(
     iroh_sk: &iroh::SecretKey,
     chia_sk: &SecretKey,
@@ -1285,7 +1372,7 @@ pub async fn publish_knock(
     room_key: &[u8; 32],
     era: u64,
     now: u64,
-) -> Result<(Bytes32, Bytes32)> {
+) -> Result<(Bytes32, MemoWrite)> {
     let knock = KnockV2 {
         era,
         from: iroh_sk.public(),
@@ -1298,18 +1385,19 @@ pub async fn publish_knock(
     let sealed = chia_lane::seal_to_kx(&req.kx_host, KIND_KNOCK, era, &plain)?;
     let lane = chia_lane::derive_lane_token(room_key);
     let hint = Bytes32::new(chia_lane::derive_inbox_hint(&req.ck_host, &lane, era));
-    let coin = publish_memo(chia_sk, hint, sealed, "knock").await?;
-    Ok((hint, coin))
+    let write = publish_memo(chia_sk, hint, sealed, "knock").await?;
+    Ok((hint, write))
 }
 
 /// Write this era's beacon from the beacon wallet: the node id in the clear
-/// under the era's public hint, nothing else. Returns the hint.
-pub async fn publish_beacon(iroh_sk: &iroh::SecretKey, beacon_sk: &SecretKey, era: u64, now: u64) -> Result<Bytes32> {
+/// under the era's public hint, nothing else. Returns the hint and the write
+/// ([`MemoWrite`]: the input coin the beacon is found again by).
+pub async fn publish_beacon(iroh_sk: &iroh::SecretKey, beacon_sk: &SecretKey, era: u64, now: u64) -> Result<(Bytes32, MemoWrite)> {
     let beacon = BeaconV2 { era, node_id: iroh_sk.public(), issued_at: now, expires_at: now + 2 * ERA_SECS };
     let plain = chia_lane::encode_beacon_v2(&beacon, iroh_sk)?;
     let hint = Bytes32::new(chia_lane::derive_beacon_hint(era));
-    publish_memo(beacon_sk, hint, plain.to_vec(), "beacon").await?;
-    Ok(hint)
+    let write = publish_memo(beacon_sk, hint, plain.to_vec(), "beacon").await?;
+    Ok((hint, write))
 }
 
 /// Slice 6: the REAL-room publisher — what makes the lane operate beyond the
@@ -1377,7 +1465,12 @@ pub async fn heartbeat_loop(
     let mut beacon_mark: Option<BeaconMark> = beacon_sk.as_ref().and_then(|_| BeaconMark::load(beacon_mark_path));
     let mut beacon_attempt: Option<Instant> = None;
     if let (Some(_), Some(m)) = (&beacon_sk, &beacon_mark) {
-        println!("⛓️ ChiaHub beacon: last written in era {} (hint {})", m.era, &m.hint[..m.hint.len().min(16)]);
+        println!(
+            "⛓️ ChiaHub beacon: last written in era {} (hint {}, {})",
+            m.era,
+            &m.hint[..m.hint.len().min(16)],
+            if m.confirmed { "confirmed" } else { "awaiting confirmation" }
+        );
     }
     let knocks_path = std::path::Path::new(crate::chia_knock::KNOCKS_FILE);
     loop {
@@ -1508,21 +1601,28 @@ pub async fn heartbeat_loop(
             if let Some((mut req, room_key)) = next {
                 let own_ck = hub.contact_key_durable.then_some(&hub.contact_key);
                 match publish_knock(&iroh_sk, &chia_sk, own_ck, &req, &room_key, era, now_unix).await {
-                    Ok((hint, coin)) => {
+                    Ok((hint, write)) => {
                         let hint_hex = hex::encode(hint.to_bytes());
                         println!(
-                            "⛓️ ChiaHub knock: knocked on {} for room {} in era {era} · inbox hint {} — both sides dial on the confirmation height",
+                            "⛓️ ChiaHub knock: {} on {} for room {} in era {era} · inbox hint {} — both sides dial on the confirmation height",
+                            if write.acked { "knocked" } else { "knock pushed, unanswered (filed as pending; the chain's word settles it)" },
                             short(&req.host),
                             req.room,
                             &hint_hex[..16]
                         );
+                        // Filed whether or not the push was answered: an
+                        // unanswered knock may be in a mempool with its coin
+                        // parked, and only a filed knock gets its confirmation
+                        // clock, or is forgotten on the chain's word that it
+                        // died — unfiled, it would be knocked again beside the
+                        // first (#272 review).
                         let mut book = hub.knocks.lock().unwrap();
                         book.record_sent(SentKnock {
                             host: req.host.clone(),
                             room: req.room.clone(),
                             era,
                             hint: hint_hex,
-                            coin_id: hex::encode(coin.to_bytes()),
+                            coin_id: hex::encode(write.coin.to_bytes()),
                             pushed_at: now_unix,
                             confirmed_height: 0,
                             last_rendezvous: 0,
@@ -1557,6 +1657,40 @@ pub async fn heartbeat_loop(
         if let Some(beacon_sk) = &beacon_sk {
             if peak > 0 && !era_guard(peak) {
                 let era = chia_lane::era_of(peak);
+                // A pending mark of this era is settled by the chain's word
+                // first: confirmed, it stands; dead (the mempool dropped the
+                // spend, or its coin went to another write), it is cleared and
+                // the beacon is due again. Marked at the peers' acceptance
+                // alone, a dropped beacon would leave this node undiscoverable
+                // for the rest of the era (#272 review).
+                let pending_mark = beacon_mark
+                    .as_ref()
+                    .filter(|m| m.era == era && m.node_id.as_deref() == Some(&self_id) && !m.confirmed && !m.coin_id.is_empty())
+                    .cloned();
+                if let Some(m) = pending_mark {
+                    use crate::chia_resolve::WriteStanding;
+                    match beacon_standing(&peak_client, &m).await {
+                        Some(WriteStanding::Confirmed(height)) if chia_lane::era_of(height) != era => {
+                            println!("⛓️ ChiaHub beacon: the era {era} beacon confirmed at height {height}, outside its era — readers will not take it; writing it again");
+                            beacon_mark = None;
+                            let _ = std::fs::remove_file(beacon_mark_path);
+                        }
+                        Some(WriteStanding::Confirmed(height)) => {
+                            let mark = BeaconMark { confirmed: true, ..m };
+                            if let Err(e) = mark.save(beacon_mark_path) {
+                                eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
+                            }
+                            println!("⛓️ ChiaHub beacon: the era {era} beacon is confirmed on chain at height {height}");
+                            beacon_mark = Some(mark);
+                        }
+                        Some(WriteStanding::Dead(why)) => {
+                            println!("⛓️ ChiaHub beacon: the era {era} beacon never landed — {why}; writing it again");
+                            beacon_mark = None;
+                            let _ = std::fs::remove_file(beacon_mark_path);
+                        }
+                        Some(WriteStanding::Pending) | None => {}
+                    }
+                }
                 let inbound = hub.inbound_verified.lock().unwrap().clone();
                 let reachable = inbound.flags_for(false, peak, now_unix) != 0 || inbound.flags_for(true, peak, now_unix) != 0;
                 let retry_ok = beacon_attempt
@@ -1565,17 +1699,23 @@ pub async fn heartbeat_loop(
                 if reachable && retry_ok && beacon_due(beacon_mark.as_ref(), era, &self_id) {
                     beacon_attempt = Some(Instant::now());
                     match publish_beacon(&iroh_sk, beacon_sk, era, now_unix).await {
-                        Ok(hint) => {
+                        Ok((hint, write)) => {
                             let mark = BeaconMark {
                                 era,
                                 last_at: now_unix,
                                 hint: hex::encode(hint.to_bytes()),
                                 node_id: Some(self_id.clone()),
+                                coin_id: hex::encode(write.coin.to_bytes()),
+                                confirmed: false,
                             };
                             if let Err(e) = mark.save(beacon_mark_path) {
                                 eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
                             }
-                            println!("⛓️ ChiaHub beacon: published for era {era} · hint {}", &mark.hint[..16]);
+                            println!(
+                                "⛓️ ChiaHub beacon: {} for era {era} · hint {} — pending until its own coin is read back",
+                                if write.acked { "published" } else { "pushed, unanswered" },
+                                &mark.hint[..16]
+                            );
                             beacon_mark = Some(mark);
                         }
                         Err(e) => eprintln!(
@@ -1757,6 +1897,23 @@ mod tests {
         assert!(era_guard(ERA_BLOCKS - 1));
         assert!(!era_guard(ERA_BLOCKS));
         assert!(era_guard(3 * ERA_BLOCKS - 1));
+    }
+
+    #[test]
+    fn a_pending_beacon_mark_holds_until_the_chain_settles_it() {
+        assert!(beacon_due(None, 5, "n"), "never written: due");
+        let pending = BeaconMark { era: 5, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false };
+        assert!(!beacon_due(Some(&pending), 5, "n"), "pending: the chain's word settles it, not a second write");
+        let confirmed = BeaconMark { confirmed: true, ..pending.clone() };
+        assert!(!beacon_due(Some(&confirmed), 5, "n"));
+        assert!(beacon_due(Some(&confirmed), 6, "n"), "a new era");
+        assert!(beacon_due(Some(&confirmed), 5, "other"), "another identity's mark");
+        // A mark file from before the fields reads as pending with no coin to judge.
+        let legacy: BeaconMark = serde_json::from_str(r#"{"era":5,"last_at":1,"hint":"h","node_id":"n"}"#).unwrap();
+        assert!(!legacy.confirmed);
+        assert!(legacy.coin_id.is_empty());
+        let round: BeaconMark = serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+        assert_eq!(round, pending);
     }
 
     #[test]
