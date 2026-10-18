@@ -86,7 +86,7 @@ grep -o -E '"repo": "[^"]+", "commit": "[0-9a-f]{40}"' $APP/scripts/emulatorjs-s
 grep -n -E '^\s*uses:|https?://|apt-get|npm (ci|install|run)|cargo (build|install)|curl |wget ' .github/workflows/release.yml
 # where the lockfiles download from: expect registry.npmjs.org alone and the crates.io index alone, and no git or path dependency or [patch] section in the manifests (any of those names a new host or a vendored copy)
 grep -h -o -E '"resolved": "[a-z]+://[^/"]+' $APP/package-lock.json | sort | uniq -c; grep -h -o -E '^source = "[^"#]+' $APP/ssf-p2p-node/Cargo.lock $APP/src-tauri/Cargo.lock | sort | uniq -c; grep -n -E 'git = |path = |^\[patch' $APP/ssf-p2p-node/Cargo.toml $APP/src-tauri/Cargo.toml
-# every literal external URL in the browser
+# every literal external URL in the browser (the SVG namespace `http://www.w3.org/2000/svg` in qrCode.ts is an XML identifier the browser never fetches, not a host; since 2026‑10‑18, #273)
 grep -rn -o -E 'https?://[A-Za-z0-9./_-]+' $APP/src --include='*.ts' | grep -v '[.]test[.]ts'
 # the stylesheets and the inline styles: a url() or @import fetches with no TypeScript sink (expect nothing: no stylesheet names an outside resource today)
 grep -rn -E '@import|url\(' --include='*.css' $APP/src $APP/public $APP/index.html $APP/public/arcade/frame.html
