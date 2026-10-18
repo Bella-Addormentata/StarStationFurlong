@@ -16,11 +16,15 @@ use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, RelayMap, RelayUrl
 use iroh::endpoint::presets::Minimal;
 
 mod chia_lane;
-// S‑0 step 1 (#231 P7, TODO #13 phase 0): the chain-access seam. Every chain
-// read and push below goes through its trait; the gateway client is named in
-// that one file alone, so the peer lane replaces it there.
+// S‑0 (#231 D1, TODO #13): the chain-access seam and the peer lane behind it.
+// Every chain read and push below goes through the seam's trait; the lane
+// reaches Chia full-node peers over the light-wallet protocol (no gateway).
 #[cfg(feature = "chia-read")]
 mod chia_chain;
+#[cfg(feature = "chia-read")]
+mod chia_peer;
+#[cfg(feature = "chia-read")]
+mod chia_peer_lane;
 // Chain READS (#231 D3: in the default build): per-room caps, the generic hint
 // reader and the P1 beat/hold watcher.
 #[cfg(feature = "chia-read")]
@@ -1330,6 +1334,10 @@ async fn main() -> Result<()> {
     // does with the chain (reads on by default — #231 D3; publishing behind
     // SSF_CHIA_LANE=1 in a chia-publish build).
     chia_lane::startup_status(&secret_key, &iroh_direct_addrs);
+    // S‑0 step 2: which full-node peers the chain lane will use, and the trust
+    // posture money paths take (pins, pin-only, or two agreeing public peers).
+    #[cfg(feature = "chia-read")]
+    println!("⛓️ Chain lane: {}", chia_chain::describe());
 
     // ⛓️ ChiaHub lane C1 SLICE 2 (chia-publish feature): load/mint the node's
     // Chia BLS identity and print its testnet11 receive address to fund. ONLY
@@ -2227,7 +2235,7 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
         return;
     }
     let now = chia_resolve::unix_now();
-    // A peak the watcher read too long ago (it or the gateway down, maybe across
+    // A peak the watcher read too long ago (it or the peers down, maybe across
     // an era boundary) would date this mark into an era that has ended; an
     // unknown height makes the ledger judge by elapsed time instead.
     let height = hub.chia_peak.lock().unwrap().fresh(now).unwrap_or(0);

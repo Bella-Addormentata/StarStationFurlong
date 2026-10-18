@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use chia_bls::{aggregate, sign, PublicKey, SecretKey, Signature};
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend, SpendBundle};
+use chia_traits::Streamable;
 use chia_puzzle_types::standard::StandardArgs;
 use chia_puzzle_types::DeriveSynthetic;
 use crate::chia_chain::{ChainAccess, ChainError};
@@ -49,7 +50,7 @@ pub fn our_puzzle_hash(chia_sk: &SecretKey) -> Bytes32 {
     StandardArgs::curry_tree_hash(synthetic_pk).into()
 }
 
-/// A spend pushed a moment ago may not show on the gateway yet (its coins still
+/// A spend pushed a moment ago may not show on the chain yet (its coins still
 /// unspent, the mempool item not indexed): parked coins younger than this are
 /// not asked about. Testnet11 confirms in about a block (18.75 s).
 pub const RECONCILE_GRACE: Duration = Duration::from_secs(20);
@@ -71,10 +72,10 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// its own publishes; this covers every writer.)
 ///
 /// Parked before, not after, the push (#245 review, round 9): a push that
-/// fails on the TRANSPORT (a timeout above all) is indeterminate — the gateway
+/// fails on the TRANSPORT (a timeout above all) is indeterminate — the chain
 /// may hold the bundle — and a coin parked only on success would be free for
 /// the next writer to select while its spend sits in the mempool. So the
-/// inputs are parked first; an explicit REJECTION from the gateway (it holds
+/// inputs are parked first; an explicit REJECTION from the chain (it holds
 /// nothing of the spend) hands them back at once, a transport error leaves
 /// them parked for the reconciliation below to settle.
 ///
@@ -85,7 +86,13 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// releases a coin whose spend CONFIRMED (the chain lists it spent: it is
 /// gone) or was DROPPED (still unspent on chain and no longer in the mempool:
 /// it is free again), and keeps one whose spend still waits in the mempool,
-/// however long that takes.
+/// however long that takes. A coin the listing does not mention at all is
+/// released only when that listing is complete AND judged at a height the
+/// coin was already seen confirmed at (#271 review, round 17): two peers
+/// still syncing, standing below the coin's creation, know nothing of it,
+/// and their silence must not free a coin whose spend may be live on the
+/// chain ahead of them. So every parking records where its coins were seen
+/// ([`ParkedInput`]).
 ///
 /// Coins are parked PER SPEND (#245 review, round 11): a spend bundle is
 /// atomic — the chain confirms every one of its inputs or none, the mempool
@@ -124,6 +131,11 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 pub struct WalletLease {
     gate: tokio::sync::Mutex<()>,
     pending: std::sync::Mutex<HashMap<Bytes32, Parked>>,
+    /// The spend bundle each parked spend pushed, by spend number: what the
+    /// liveness question hands the peers again (`ChainAccess::spend_live`),
+    /// since the peer protocol has no mempool query (plan §14 (6)). Attached
+    /// in the same write as the parking ([`WalletLease::park_with_bundle`]).
+    bundles: std::sync::Mutex<HashMap<u64, SpendBundle>>,
     incoming: std::sync::Mutex<Option<Bytes32>>,
     /// Spend numbers handed out so far (see [`Parking`]).
     spends: std::sync::atomic::AtomicU64,
@@ -141,11 +153,37 @@ pub struct WalletLease {
     sealed: std::sync::Mutex<Option<String>>,
 }
 
-/// A parked coin: when, and by which spend (see [`Parking`]).
+/// A parked coin: when, by which spend (see [`Parking`]), and the height it
+/// was seen confirmed at when selected (`None`: unknown, as for a coin an
+/// older node parked), which decides whether a listing that leaves it out
+/// can free it ([`settle`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Parked {
     at: Instant,
     spend: u64,
+    seen_at: Option<u32>,
+}
+
+/// An input a spend consumes, with the height its coin was seen confirmed at
+/// as the listing that selected it reported (our wallet's coins, the faucet
+/// coin a TAKE claims). A bare coin id parks with no height: such a coin is
+/// never freed on a listing's silence alone (#271 review, round 17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkedInput {
+    pub coin_id: Bytes32,
+    pub seen_at: Option<u32>,
+}
+
+impl From<Bytes32> for ParkedInput {
+    fn from(coin_id: Bytes32) -> Self {
+        Self { coin_id, seen_at: None }
+    }
+}
+
+impl From<(Bytes32, u32)> for ParkedInput {
+    fn from((coin_id, seen_at): (Bytes32, u32)) -> Self {
+        Self { coin_id, seen_at: Some(seen_at) }
+    }
 }
 
 /// One spend's parking: its number, unique for the life of the process, and
@@ -158,11 +196,14 @@ pub struct Parking {
     coins: Vec<Bytes32>,
 }
 
-/// A parked spend old enough to ask the gateway about.
+/// A parked spend old enough to ask the chain about, with the bundle it
+/// pushed (none for a spend parked by an older node that kept no bundle: such
+/// a spend is settled by the chain alone, never by the liveness question).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueSpend {
     pub spend: u64,
-    pub coins: Vec<Bytes32>,
+    pub coins: Vec<ParkedInput>,
+    pub bundle: Option<SpendBundle>,
 }
 
 /// The parking on disk (see [`WalletLease::restore`]): the parked coins with
@@ -174,12 +215,27 @@ struct LeaseFile {
     parked: Vec<ParkedCoin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     incoming: Option<String>,
+    /// The bundles behind the parked spends (hex of their wire bytes), since
+    /// S‑0 step 2; absent in files older nodes wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bundles: Vec<ParkedBundle>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
 struct ParkedCoin {
     coin: String,
     spend: u64,
+    /// The height the coin was seen confirmed at (since #271 review, round
+    /// 17); absent in files older nodes wrote, whose coins a listing's
+    /// silence then never frees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seen_at: Option<u32>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct ParkedBundle {
+    spend: u64,
+    bundle: String,
 }
 
 /// Write `bytes` to `path` as a whole: into a temporary file beside it, then a
@@ -214,6 +270,7 @@ impl WalletLease {
         Self {
             gate: tokio::sync::Mutex::new(()),
             pending: std::sync::Mutex::new(HashMap::new()),
+            bundles: std::sync::Mutex::new(HashMap::new()),
             incoming: std::sync::Mutex::new(None),
             spends: std::sync::atomic::AtomicU64::new(0),
             probe_cursor: std::sync::atomic::AtomicU64::new(0),
@@ -232,26 +289,55 @@ impl WalletLease {
     /// back on an explicit rejection; a transport error keeps it. `Err` means
     /// NOTHING is parked and the spend must not leave: the lease is sealed, or
     /// the parking could not be saved and a restart would forget the spend
-    /// (#245 review, round 19).
-    pub fn park(&self, coin_ids: impl IntoIterator<Item = Bytes32>) -> Result<Parking, LeaseError> {
+    /// (#245 review, round 19). Pushes park through [`Self::park_with_bundle`],
+    /// which saves the bundle in the same write; the bundle-less form serves
+    /// the lease tests.
+    #[cfg(test)]
+    pub fn park<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>) -> Result<Parking, LeaseError> {
         self.park_at(coin_ids, Instant::now())
     }
 
-    pub fn park_at(&self, coin_ids: impl IntoIterator<Item = Bytes32>, now: Instant) -> Result<Parking, LeaseError> {
+    #[cfg(test)]
+    pub fn park_at<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>, now: Instant) -> Result<Parking, LeaseError> {
+        self.park_with_bundle_at(coin_ids, None, now)
+    }
+
+    /// Park the coins a spend is about to consume AND keep its bundle, in ONE
+    /// write of the lease file, so reconciliation can ask the peers whether
+    /// the spend is still live ([`ChainAccess::spend_live`]) after any
+    /// restart. A parking saved before its bundle would, after a crash between
+    /// the two writes, hold the wallet's coins with no bundle to ask about
+    /// until an outside spend settled them. `Err` means nothing is parked or
+    /// kept and the spend must not leave.
+    pub fn park_with_bundle<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>, bundle: &SpendBundle) -> Result<Parking, LeaseError> {
+        self.park_with_bundle_at(coin_ids, Some(bundle), Instant::now())
+    }
+
+    fn park_with_bundle_at<I: Into<ParkedInput>>(
+        &self,
+        coin_ids: impl IntoIterator<Item = I>,
+        bundle: Option<&SpendBundle>,
+        now: Instant,
+    ) -> Result<Parking, LeaseError> {
         self.ensure_open()?;
         let spend = self.spends.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let coins: Vec<Bytes32> = coin_ids.into_iter().collect();
+        let inputs: Vec<ParkedInput> = coin_ids.into_iter().map(Into::into).collect();
+        let coins: Vec<Bytes32> = inputs.iter().map(|input| input.coin_id).collect();
         {
             let mut pending = self.pending.lock().unwrap();
-            for id in &coins {
-                pending.insert(*id, Parked { at: now, spend });
+            for input in &inputs {
+                pending.insert(input.coin_id, Parked { at: now, spend, seen_at: input.seen_at });
             }
         }
+        if let Some(bundle) = bundle {
+            self.bundles.lock().unwrap().insert(spend, bundle.clone());
+        }
         if let Err(e) = self.persist() {
-            // Not saved, so not sent: take the parking back whole (by its spend
-            // number, as a rejection would) and let the caller refuse the
-            // spend. The number is used up, so no later spend shares it.
+            // Not saved, so not sent: take the parking and its bundle back whole
+            // (by the spend number, as a rejection would) and let the caller
+            // refuse the spend. The number is used up, so no later spend shares it.
             self.pending.lock().unwrap().retain(|_, parked| parked.spend != spend);
+            self.bundles.lock().unwrap().remove(&spend);
             return Err(LeaseError::Unsaved(e));
         }
         Ok(Parking { spend, coins })
@@ -268,7 +354,7 @@ impl WalletLease {
         }
     }
 
-    /// The gateway REJECTED the spend outright, so it holds nothing of it and
+    /// The chain REJECTED the spend outright, so it holds nothing of it and
     /// the coins are free again (compare-and-release, see [`Parking`]).
     pub fn unpark(&self, parking: &Parking) {
         self.release(&[parking.spend]);
@@ -279,8 +365,8 @@ impl WalletLease {
     /// Only a verdict clears it, never the clock (#245 review, round 10): a
     /// zero-fee spend can wait in the mempool for hours, so an eviction on
     /// elapsed time would free a coin whose spend is still live — the very
-    /// double-spend, or second gift, the lease exists to prevent. A gateway
-    /// that cannot be asked keeps the coin parked, fail closed; a gateway that
+    /// double-spend, or second gift, the lease exists to prevent. A chain
+    /// that cannot be asked keeps the coin parked, fail closed; a chain that
     /// is down can take no spend either, so nothing is lost meanwhile.
     pub fn is_pending(&self, coin_id: &Bytes32) -> bool {
         self.pending.lock().unwrap().contains_key(coin_id)
@@ -326,21 +412,22 @@ impl WalletLease {
         }
     }
 
-    /// The parked spends old enough to ask the gateway about, each with the
+    /// The parked spends old enough to ask the chain about, each with the
     /// coins it parked (sorted), oldest spend first.
     pub fn due_at(&self, now: Instant) -> Vec<DueSpend> {
         let pending = self.pending.lock().unwrap();
-        let mut by_spend: BTreeMap<u64, Vec<Bytes32>> = BTreeMap::new();
+        let mut by_spend: BTreeMap<u64, Vec<ParkedInput>> = BTreeMap::new();
         for (id, parked) in pending.iter() {
             if now.duration_since(parked.at) >= RECONCILE_GRACE {
-                by_spend.entry(parked.spend).or_default().push(*id);
+                by_spend.entry(parked.spend).or_default().push(ParkedInput { coin_id: *id, seen_at: parked.seen_at });
             }
         }
+        let bundles = self.bundles.lock().unwrap();
         by_spend
             .into_iter()
             .map(|(spend, mut coins)| {
-                coins.sort();
-                DueSpend { spend, coins }
+                coins.sort_by_key(|c| c.coin_id);
+                DueSpend { spend, coins, bundle: bundles.get(&spend).cloned() }
             })
             .collect()
     }
@@ -352,13 +439,14 @@ impl WalletLease {
     /// the next change saves, or a restart reconciles it away; never under.
     pub fn release(&self, spends: &[u64]) {
         self.pending.lock().unwrap().retain(|_, parked| !spends.contains(&parked.spend));
+        self.bundles.lock().unwrap().retain(|spend, _| !spends.contains(spend));
         self.persist_or_log("a release");
     }
 
     /// Take the parking the previous run left in `path`, and keep writing the
     /// parking there from now on (#245 review, round 17). Restored spends get
     /// a FRESH grace before reconciliation asks about them (round 18): a
-    /// restart can fall inside the first grace, before the gateway's mempool
+    /// restart can fall inside the first grace, before the peers' mempool
     /// index has the spend, and a probe then would read its inputs unspent
     /// and absent and free them while the spend is live. The chain and the
     /// mempool then settle them exactly as they would have without the
@@ -428,16 +516,29 @@ impl WalletLease {
             if !seen.insert(id) {
                 return Err(format!("parked coin {:?} listed twice", entry.coin));
             }
-            parked.push((id, entry.spend));
+            parked.push((id, entry.spend, entry.seen_at));
         }
         let incoming = match file.incoming.as_deref() {
             Some(hex_id) => Some(parse_coin_id(hex_id).ok_or_else(|| format!("malformed incoming coin id {hex_id:?}"))?),
             None => None,
         };
+        let mut bundles = Vec::with_capacity(file.bundles.len());
+        for entry in &file.bundles {
+            if !parked.iter().any(|(_, spend, _)| *spend == entry.spend) {
+                return Err(format!("bundle for spend #{} that parks no coin", entry.spend));
+            }
+            let bytes = hex::decode(&entry.bundle).map_err(|e| format!("malformed bundle for spend #{}: {e}", entry.spend))?;
+            let bundle = SpendBundle::from_bytes(&bytes).map_err(|e| format!("unreadable bundle for spend #{}: {e}", entry.spend))?;
+            bundles.push((entry.spend, bundle));
+        }
         {
             let mut pending = self.pending.lock().unwrap();
-            for (id, spend) in &parked {
-                pending.entry(*id).or_insert(Parked { at: now, spend: *spend });
+            for (id, spend, seen_at) in &parked {
+                pending.entry(*id).or_insert(Parked { at: now, spend: *spend, seen_at: *seen_at });
+            }
+            let mut kept = self.bundles.lock().unwrap();
+            for (spend, bundle) in bundles {
+                kept.entry(spend).or_insert(bundle);
             }
         }
         self.spends.fetch_max(file.spends, std::sync::atomic::Ordering::Relaxed);
@@ -477,15 +578,23 @@ impl WalletLease {
         let incoming = (*self.incoming.lock().unwrap()).map(hex::encode);
         let pending = self.pending.lock().unwrap();
         let mut parked: Vec<ParkedCoin> =
-            pending.iter().map(|(id, p)| ParkedCoin { coin: hex::encode(id), spend: p.spend }).collect();
+            pending.iter().map(|(id, p)| ParkedCoin { coin: hex::encode(id), spend: p.spend, seen_at: p.seen_at }).collect();
         parked.sort_by(|a, b| (a.spend, &a.coin).cmp(&(b.spend, &b.coin)));
-        LeaseFile { v: 1, spends: self.spends.load(std::sync::atomic::Ordering::Relaxed), parked, incoming }
+        let mut bundles: Vec<ParkedBundle> = self
+            .bundles
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(spend, bundle)| bundle.to_bytes().ok().map(|bytes| ParkedBundle { spend: *spend, bundle: hex::encode(bytes) }))
+            .collect();
+        bundles.sort_by_key(|b| b.spend);
+        LeaseFile { v: 1, spends: self.spends.load(std::sync::atomic::Ordering::Relaxed), parked, incoming, bundles }
     }
 
     /// Settle the parked spends against the chain and the mempool: ask the
-    /// gateway about every spend past the grace, then release what [`settle`]
+    /// chain about every spend past the grace, then release what [`settle`]
     /// says. Lookups that fail leave their spends parked, FAIL CLOSED: a coin
-    /// stays parked until the gateway gives an authoritative answer, however
+    /// stays parked until the chain gives an authoritative answer, however
     /// long that takes; nothing here is decided by the clock. Callers hold the
     /// lease gate (every writer does; the dish's status read takes it for
     /// this), and `release` is compare-and-release besides, so a verdict can
@@ -495,14 +604,18 @@ impl WalletLease {
         if due.is_empty() {
             return;
         }
-        let coins: Vec<Bytes32> = due.iter().flat_map(|d| d.coins.iter().copied()).collect();
-        // One listing for every parked coin, paged like every coinset listing:
+        let coins: Vec<Bytes32> = due.iter().flat_map(|d| d.coins.iter().map(|c| c.coin_id)).collect();
+        // One listing for every parked coin, paged like every chain listing:
         // follow the cursor, and if it is still cut short at the cap (or
         // truncated with no cursor), the listing is INCOMPLETE and a spend with
-        // a coin it left out is kept.
+        // a coin it left out is kept. A complete listing settles the coins it
+        // leaves out only from the height it was judged at (the lowest over
+        // its pages; none, once a page came undated): see [`settle`].
         let mut records = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
+        let mut judged_at: Option<u32> = None;
+        let mut undated = false;
         let complete = loop {
             let listing = match client.coin_records_by_names(coins.clone(), true, cursor.take()).await {
                 Ok(listing) => listing,
@@ -513,6 +626,10 @@ impl WalletLease {
             };
             pages += 1;
             records.extend(listing.records);
+            match listing.judged_at {
+                Some(height) => judged_at = Some(judged_at.map_or(height, |lowest| lowest.min(height))),
+                None => undated = true,
+            }
             let truncated = listing.truncated;
             match listing.next_cursor {
                 Some(next) if truncated => {
@@ -525,26 +642,28 @@ impl WalletLease {
             }
         };
         let spent_on_chain: HashMap<Bytes32, bool> = records.iter().map(|r| (r.coin.coin_id(), r.spent)).collect();
-        // One mempool question per spend the chain still lists unspent in full
-        // (see `mempool_probes`): a bundle sits in the mempool with all of its
-        // inputs or with none, so any one of them answers for the spend.
+        // One liveness question per spend the chain still lists unspent in
+        // full (see `mempool_probes`): its bundle goes to the peers again, and
+        // their acks say whether it is live (in a mempool, or taken back) or
+        // dead (refused everywhere, so it will never land).
         let mut in_mempool: HashMap<u64, Option<bool>> = HashMap::new();
         let after = self.probe_cursor.load(std::sync::atomic::Ordering::Relaxed);
         let probes = mempool_probes(&due, &spent_on_chain, after);
         if let Some((last, _)) = probes.last() {
             self.probe_cursor.store(*last, std::sync::atomic::Ordering::Relaxed);
         }
-        for (spend, coin) in probes {
-            let seen = match client.coin_in_mempool(coin).await {
-                Ok(seen) => Some(seen),
+        for (spend, bundle) in probes {
+            let live = match client.spend_live(bundle).await {
+                Ok(live) => Some(live),
                 Err(e) => {
-                    eprintln!("⛓️ wallet lease: mempool lookup {e}; spend stays parked");
+                    eprintln!("⛓️ wallet lease: liveness of spend #{spend} {e}; spend stays parked");
                     None
                 }
             };
-            in_mempool.insert(spend, seen);
+            in_mempool.insert(spend, live);
         }
-        let released = settle(&due, &spent_on_chain, &in_mempool, complete);
+        let judged_at = if complete && !undated { judged_at } else { None };
+        let released = settle(&due, &spent_on_chain, &in_mempool, judged_at);
         if !released.is_empty() {
             self.release(&released);
         }
@@ -571,10 +690,10 @@ impl WalletLease {
 ///
 /// Callers hold the lease gate. For the dish's TAKE the input is the FAUCET
 /// coin, not ours: parking it keeps a second TAKE off it the same way.
-pub async fn push_parked(
+pub async fn push_parked<I: Into<ParkedInput>>(
     client: &impl ChainAccess,
     bundle: SpendBundle,
-    inputs: impl IntoIterator<Item = Bytes32>,
+    inputs: impl IntoIterator<Item = I>,
 ) -> Result<(), PushError> {
     push_parked_with(&WALLET_LEASE, client, bundle, inputs).await
 }
@@ -582,14 +701,16 @@ pub async fn push_parked(
 /// [`push_parked`] against a given lease (the process-wide one in production;
 /// tests bring their own). The parking comes FIRST and must be saved: a lease
 /// that cannot park (sealed, or its file unwritable) means the spend never
-/// leaves, since a restart would forget it (#245 review, round 19).
-pub async fn push_parked_with(
+/// leaves, since a restart would forget it (#245 review, round 19). Each
+/// input carries the height its coin was seen confirmed at when the caller
+/// has it ([`ParkedInput`]); a bare coin id parks without one.
+pub async fn push_parked_with<I: Into<ParkedInput>>(
     lease: &WalletLease,
     client: &impl ChainAccess,
     bundle: SpendBundle,
-    inputs: impl IntoIterator<Item = Bytes32>,
+    inputs: impl IntoIterator<Item = I>,
 ) -> Result<(), PushError> {
-    let parking = lease.park(inputs).map_err(PushError::NotSent)?;
+    let parking = lease.park_with_bundle(inputs, &bundle).map_err(PushError::NotSent)?;
     match client.push_tx(bundle).await {
         Ok(()) => Ok(()),
         Err(ChainError::Refused(why)) => {
@@ -662,17 +783,19 @@ impl std::fmt::Display for LeaseError {
 
 impl std::error::Error for LeaseError {}
 
-/// How many spends one reconciliation asks the mempool about (one HTTPS call
+/// How many spends one reconciliation asks the peers about (one re-push
 /// each); the rest wait for the next pass. Spends in flight are one per writer
 /// action, so the bound is rarely reached, and it keeps a pass under the lease
 /// short whatever is parked (#245 review, round 11).
 pub const MAX_MEMPOOL_PROBES: usize = 8;
 
-/// Which due spends need the mempool's word, and the coin to ask with: a spend
-/// EVERY input of which the chain still lists unspent. One with a spent input
-/// is settled without the mempool (confirmed, or dead to another spend of that
-/// coin); one with an input the listing left out is settled by whether the
-/// listing was complete. One probe per spend, at most [`MAX_MEMPOOL_PROBES`].
+/// Which due spends need the peers' word on liveness, and the bundle to ask
+/// with: a spend EVERY input of which the chain still lists unspent, and whose
+/// bundle the lease kept. One with a spent input is settled without the
+/// question (confirmed, or dead to another spend of that coin); one with an
+/// input the listing left out is settled by whether the listing was complete;
+/// one without a bundle (parked by an older node) waits for the chain. One
+/// probe per spend, at most [`MAX_MEMPOOL_PROBES`].
 ///
 /// The window ROTATES (#245 review, round 13): it opens at the first eligible
 /// spend numbered above `after` — the last spend the previous pass asked about
@@ -683,17 +806,17 @@ pub fn mempool_probes(
     due: &[DueSpend],
     spent_on_chain: &HashMap<Bytes32, bool>,
     after: u64,
-) -> Vec<(u64, Bytes32)> {
-    let eligible: Vec<(u64, Bytes32)> = due
+) -> Vec<(u64, SpendBundle)> {
+    let eligible: Vec<(u64, SpendBundle)> = due
         .iter()
-        .filter(|d| d.coins.iter().all(|c| spent_on_chain.get(c) == Some(&false)))
-        .filter_map(|d| d.coins.first().map(|c| (d.spend, *c)))
+        .filter(|d| !d.coins.is_empty() && d.coins.iter().all(|c| spent_on_chain.get(&c.coin_id) == Some(&false)))
+        .filter_map(|d| d.bundle.as_ref().map(|b| (d.spend, b.clone())))
         .collect();
     let start = eligible.iter().position(|(spend, _)| *spend > after).unwrap_or(0);
     eligible[start..]
         .iter()
         .chain(eligible[..start].iter())
-        .copied()
+        .cloned()
         .take(MAX_MEMPOOL_PROBES)
         .collect()
 }
@@ -702,25 +825,32 @@ pub fn mempool_probes(
 /// Per spend: any input SPENT on chain → the spend confirmed (or lost that coin
 /// to another spend, which kills ours), so it is released and its other coins
 /// are free or gone. An input the listing does not mention → gone only if the
-/// listing was COMPLETE (no such coin on chain, so no live spend of it and
-/// nothing to double-spend): released then, kept when the listing was cut
-/// short, which says nothing about what it left out. Every input UNSPENT → the
-/// mempool decides: not there (`Some(false)`) → dropped, released; there, or
-/// not asked (`None`) → stays parked.
+/// listing was COMPLETE and judged at or above the height that input was seen
+/// confirmed at (`judged_at`; `None` for a listing cut short or undated): the
+/// chain, read where the coin was known to stand, has no such coin, so no live
+/// spend of it and nothing to double-spend. Kept when the listing was cut
+/// short, which says nothing about what it left out; when it was judged
+/// below that height (two peers still syncing know nothing of a coin created
+/// above their view, while its spend may be live on the chain ahead of them,
+/// #271 review, round 17); or when the input's height is unknown (parked by
+/// an older node). Every input UNSPENT → the peers decide: the spend is dead
+/// (`Some(false)`) → released; live, or not asked (`None`) → stays parked.
 pub fn settle(
     due: &[DueSpend],
     spent_on_chain: &HashMap<Bytes32, bool>,
     in_mempool: &HashMap<u64, Option<bool>>,
-    complete: bool,
+    judged_at: Option<u32>,
 ) -> Vec<u64> {
     due.iter()
         .filter(|d| {
-            let states: Vec<Option<bool>> = d.coins.iter().map(|c| spent_on_chain.get(c).copied()).collect();
-            if states.iter().any(|s| *s == Some(true)) {
+            let states: Vec<(Option<bool>, Option<u32>)> =
+                d.coins.iter().map(|c| (spent_on_chain.get(&c.coin_id).copied(), c.seen_at)).collect();
+            if states.iter().any(|(s, _)| *s == Some(true)) {
                 return true;
             }
-            if states.iter().any(|s| s.is_none()) {
-                return complete;
+            if states.iter().any(|(s, _)| s.is_none()) {
+                let Some(judged) = judged_at else { return false };
+                return states.iter().filter(|(s, _)| s.is_none()).all(|(_, seen)| seen.is_some_and(|seen| judged >= seen));
             }
             in_mempool.get(&d.spend).copied().flatten() == Some(false)
         })
@@ -735,7 +865,8 @@ impl Default for WalletLease {
 }
 
 /// Find our largest UNSPENT coin — the one to spend-to-self — skipping coins a
-/// spend is already pending for (see [`WalletLease`]). `None` if unfunded.
+/// spend is already pending for (see [`WalletLease`]), with the height it was
+/// seen confirmed at, which its parking records. `None` if unfunded.
 ///
 /// Every page of the listing is read, up to the bound every wallet listing
 /// shares (`chia_faucet::MAX_FAUCET_PAGES`): the first page can hold only
@@ -744,14 +875,10 @@ impl Default for WalletLease {
 pub async fn find_spendable_coin(
     client: &impl ChainAccess,
     puzzle_hash: Bytes32,
-) -> Result<Option<Coin>> {
+) -> Result<Option<crate::chia_faucet::FaucetCoin>> {
     let listing = crate::chia_faucet::unspent_at(client, puzzle_hash).await?;
-    let mut coins: Vec<Coin> = listing
-        .coins
-        .into_iter()
-        .map(|c| c.coin)
-        .filter(|c| !WALLET_LEASE.is_pending(&c.coin_id()))
-        .collect();
+    let mut coins: Vec<crate::chia_faucet::FaucetCoin> =
+        listing.coins.into_iter().filter(|c| !WALLET_LEASE.is_pending(&c.coin.coin_id())).collect();
     if coins.is_empty() && listing.partial {
         eprintln!(
             "⛓️ wallet: no free coin in the first {} pages at {puzzle_hash}; the listing was cut short, so there may be one further on",
@@ -759,7 +886,7 @@ pub async fn find_spendable_coin(
         );
     }
     // Largest first — the recreated coin keeps the most value for future republishes.
-    coins.sort_by_key(|c| std::cmp::Reverse(c.amount));
+    coins.sort_by_key(|c| std::cmp::Reverse(c.coin.amount));
     Ok(coins.into_iter().next())
 }
 
@@ -889,7 +1016,7 @@ pub fn publish_due(mark: Option<&PublishMark>, room_key: &[u8; 32], addrs_sig: &
 // debounced, at most MAX_NODE_WRITES_PER_ERA times an era. Idle writes nothing.
 // The mark of what was written persists in `publish_marks.json` and is set only
 // after the push succeeded, so a restart never doubles a write; a failed push
-// (an unfunded wallet, the gateway down) retries on the heartbeat's retry
+// (an unfunded wallet, the peers down) retries on the heartbeat's retry
 // cadence. Presence has PRIORITY over the room-keyed v1 publishes in the same
 // tick (one spend per tick, see the heartbeat's doc comment).
 
@@ -899,10 +1026,19 @@ pub const MAX_NODE_WRITES_PER_ERA: u32 = 8;
 /// An address change republishes no sooner than this after the last write.
 pub const ADDR_CHANGE_DEBOUNCE_SECS: u64 = 10 * 60;
 /// No publish in the last blocks of an era: a spend pushed there could confirm
-/// in the next era and be filed under a hint it is not valid for.
-pub const ERA_GUARD_BLOCKS: u32 = 8;
+/// in the next era and be filed under a hint it is not valid for. The guard
+/// budgets for how old the agreed height may be
+/// ([`crate::chia_resolve::PEAK_MAX_AGE_SECS`], 90 s, about five blocks at
+/// 18.75 s each, plus the announcement's own age, at most
+/// [`crate::chia_peer_lane::PEAK_FRESH_AGREED`] for an agreed read: eight)
+/// AND for how far it may trail the chain: an agreed height is the LOWER of
+/// the pair's, up to [`crate::chia_peer_lane::MAX_PEAK_LAG`] blocks behind
+/// the higher peer, so a cached height a minute old could otherwise still
+/// pass the guard while the chain had entered the next era, and the write be
+/// signed for the era before.
+pub const ERA_GUARD_BLOCKS: u32 = 8 + crate::chia_peer_lane::MAX_PEAK_LAG;
 /// A write the watcher has not seen confirmed on chain after this long is
-/// tried again: the gateway's acceptance puts a spend in the mempool, and a
+/// tried again: the peers' acceptance puts a spend in the mempool, and a
 /// zero-fee spend can still be dropped from it. The wallet lease keeps a
 /// retry from touching a coin whose spend is still pending, so an early retry
 /// fails harmlessly as "unfunded" rather than double-spending — and
@@ -923,7 +1059,7 @@ pub struct NodePublishMark {
     /// The hint written under, hex (what the operator can look up).
     pub hint: String,
     /// The watcher read this write back from the chain (or no watcher runs,
-    /// in which case the gateway's acceptance is all there is). Until then
+    /// in which case the peers' acceptance is all there is). Until then
     /// the write is pending and is retried after [`PRESENCE_CONFIRM_TIMEOUT_SECS`].
     #[serde(default)]
     pub confirmed: bool,
@@ -1065,8 +1201,8 @@ pub async fn publish_node_presence(
     let coin = find_spendable_coin(&client, our_ph)
         .await?
         .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
-    let bundle = build_publish_bundle(chia_sk, coin, hint, ciphertext)?;
-    push_parked(&client, bundle, [coin.coin_id()]).await?;
+    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, ciphertext)?;
+    push_parked(&client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(hint)
 }
 
@@ -1101,7 +1237,13 @@ pub async fn heartbeat_loop(
     let mut node_attempt: Option<Instant> = None;
     let mut era_guard_logged = false;
     let peak_client = crate::chia_chain::connect();
-    // Without the watcher nothing ever reads our record back, so the gateway's
+    // The era clock for a signed write is the AGREED peak (§14 (5)). The
+    // watcher's peak in `hub.chia_peak` is one carrier peer's word: enough to
+    // time reads and the inbound marks, not to pick the era a spend is filed
+    // under, since a peer lying about the height would file the record where
+    // no reader looks. Read within `PEAK_MAX_AGE_SECS`, it serves the next ticks.
+    let mut agreed_peak = crate::chia_resolve::ChainPeak::default();
+    // Without the watcher nothing ever reads our record back, so the peers'
     // acceptance is the only confirmation there is.
     let watcher_confirms = crate::chia_watch::watch_enabled();
     // Findable: told so (D4 default) AND holding a durable contact key — a key
@@ -1139,18 +1281,20 @@ pub async fn heartbeat_loop(
 
         // ── #231 P6a: the node's OWN presence first (priority over room publishes) ──
         if findable {
-            // The era is the chain's clock: the watcher's last peak while it is
-            // fresh (it reads every tick, but a long or stalled scan can leave
-            // it blocks — or an era — behind), else one gateway call of our
-            // own, shared back so the inbound marks and the next tick have it.
-            // Height and read time travel as one snapshot (`ChainPeak`), so a
-            // stale height is never judged by a newer time. No peak, no write.
+            // The era is the chain's clock as the agreed lane sees it: the last
+            // agreed peak while it is fresh, else one agreed read now, shared
+            // back so the inbound marks and the watcher's next tick have it (an
+            // agreed height serves them at least as well as a carrier's; the
+            // carrier's never serves here). Height and read time travel as one
+            // snapshot (`ChainPeak`), so a stale height is never judged by a
+            // newer time. No agreed peak, no write.
             let now_unix = crate::chia_resolve::unix_now();
-            let mut peak = hub.chia_peak.lock().unwrap().fresh(now_unix).unwrap_or(0);
+            let mut peak = agreed_peak.fresh(now_unix).unwrap_or(0);
             if peak == 0 {
                 peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
                 if peak > 0 {
-                    *hub.chia_peak.lock().unwrap() = crate::chia_resolve::ChainPeak::new(peak, now_unix);
+                    agreed_peak = crate::chia_resolve::ChainPeak::new(peak, now_unix);
+                    *hub.chia_peak.lock().unwrap() = agreed_peak;
                 }
             }
             if peak > 0 && era_guard(peak) {
@@ -1307,7 +1451,7 @@ pub async fn publish_presence(
     // 2. Find our fundable coin (pays for the spend) — under the wallet lease,
     //    so no other writer picks the same coin before this spend confirms.
     let _lease = WALLET_LEASE.lock().await;
-    // A sealed lease refuses before any gateway read (push_parked would refuse
+    // A sealed lease refuses before any chain read (push_parked would refuse
     // regardless; this spares the reads and names the reason at once).
     WALLET_LEASE.ensure_open()?;
     let client = crate::chia_chain::connect();
@@ -1319,8 +1463,8 @@ pub async fn publish_presence(
 
     // 3. Build + sign the spend-to-self, then push to the mempool with the coin
     //    parked first (push_parked: a timed-out push may still have landed).
-    let bundle = build_publish_bundle(chia_sk, coin, hint, ciphertext)?;
-    push_parked(&client, bundle, [coin.coin_id()]).await?;
+    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, ciphertext)?;
+    push_parked(&client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(hint)
 }
 
@@ -1387,13 +1531,18 @@ mod tests {
 
     #[test]
     fn a_stale_peak_stays_inside_the_era_guard() {
-        // The publisher trusts a cached peak this old at most; that many seconds
-        // of blocks still leave end-of-era guard blocks to spare.
+        // The publisher trusts a cached peak this old at most, the agreed read
+        // behind it an announcement at most PEAK_FRESH_AGREED old, and that
+        // peak is the lower of an agreed pair's, up to MAX_PEAK_LAG behind the
+        // higher: those seconds of blocks and that lag together still leave
+        // end-of-era guard blocks to spare. Peers at ERA-9 and ERA-3 give an
+        // agreed height of ERA-9, inside the guard.
         let secs_per_block = ERA_SECS / u64::from(ERA_BLOCKS);
-        assert!(
-            crate::chia_resolve::PEAK_MAX_AGE_SECS < u64::from(ERA_GUARD_BLOCKS) * secs_per_block,
-            "a stale peak stays inside the guard"
-        );
+        let age_secs = crate::chia_resolve::PEAK_MAX_AGE_SECS + crate::chia_peer_lane::PEAK_FRESH_AGREED.as_secs();
+        let cache_blocks = u32::try_from(age_secs.div_ceil(secs_per_block)).unwrap();
+        let lag = crate::chia_peer_lane::MAX_PEAK_LAG;
+        assert!(ERA_GUARD_BLOCKS > cache_blocks + lag, "{ERA_GUARD_BLOCKS} blocks against {cache_blocks} of cache age and {lag} of lag");
+        assert!(era_guard(ERA_BLOCKS - 9), "an agreed height six behind a peer at ERA-3 is held");
     }
 
     #[test]
@@ -1446,7 +1595,7 @@ mod tests {
         // No timer releases it, however long the spend waits in the mempool:
         // only the chain/mempool verdict does (release).
         assert!(lease.due_at(t0 + Duration::from_secs(5)).is_empty(), "inside the grace: not asked yet");
-        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![DueSpend { spend: parking.spend, coins: vec![a] }]);
+        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![DueSpend { spend: parking.spend, coins: vec![a.into()], bundle: None }]);
         lease.release(&[parking.spend]);
         assert!(!lease.is_pending(&a));
         lease.park_at([b], t0).unwrap();
@@ -1488,12 +1637,12 @@ mod tests {
         // both coins stay parked and come due for reconciliation after the grace,
         // as ONE spend.
         let due = lease.due_at(t0 + RECONCILE_GRACE);
-        assert_eq!(due, vec![DueSpend { spend: parking.spend, coins: vec![a, b] }]);
+        assert_eq!(due, vec![DueSpend { spend: parking.spend, coins: vec![a.into(), b.into()], bundle: None }]);
         // An explicit rejection hands exactly this parking back.
         lease.unpark(&parking);
         assert!(!lease.is_pending(&a) && !lease.is_pending(&b));
         // …but never a NEWER parking of the same coin: a later writer's spend of
-        // a coin the gateway rejected the first time keeps its marker.
+        // a coin the chain rejected the first time keeps its marker.
         let first = lease.park_at([a], t0).unwrap();
         lease.unpark(&first);
         let _second = lease.park_at([a], t0 + Duration::from_secs(1)).unwrap();
@@ -1503,7 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unanswered_push_is_not_a_rejection_and_keeps_its_inputs_parked() {
-        // The chain never answers (the test chain says so, as a dead gateway or
+        // The chain never answers (the test chain says so, as unreachable peers or
         // a timeout would): the outcome is INDETERMINATE, not a refusal.
         let client = crate::chia_chain::testing::Unanswering;
         let coin = Bytes32::new([42u8; 32]);
@@ -1521,14 +1670,43 @@ mod tests {
     }
 
     #[test]
+    fn a_parking_and_its_bundle_land_in_one_write() {
+        let path = std::env::temp_dir().join(format!("ssf-lease-one-write-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let lease = WalletLease::new();
+        lease.restore(&path);
+        let ours = Bytes32::new([5u8; 32]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let parking = lease.park_with_bundle([ours], &bundle).unwrap();
+        let file: LeaseFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.parked.len(), 1, "the coin is parked");
+        assert_eq!(file.bundles.len(), 1, "and its bundle is in the same file, from the same write");
+        assert_eq!(file.bundles[0].spend, parking.spend);
+        // Restored after a crash, the spend still carries the bundle to ask the peers with.
+        let again = WalletLease::new();
+        again.restore(&path);
+        let due = again.due_at(Instant::now() + RECONCILE_GRACE + Duration::from_secs(1));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].bundle.as_ref().map(|b| b.name()), Some(bundle.name()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn settle_releases_confirmed_and_dropped_spends_and_keeps_the_waiting_ones() {
         let id = |n: u8| Bytes32::new([n; 32]);
-        let spend = |n: u64, coins: &[Bytes32]| DueSpend { spend: n, coins: coins.to_vec() };
+        // Every coin was seen confirmed at height 90 when selected, except
+        // spend 8's, parked by an older node that recorded no height.
+        let spend = |n: u64, coins: &[Bytes32]| DueSpend {
+            spend: n,
+            coins: coins.iter().map(|c| ParkedInput { coin_id: *c, seen_at: Some(90) }).collect(),
+            bundle: Some(SpendBundle::new(vec![], Signature::default())),
+        };
         // 1 confirmed (its input spent); 2 dropped (unspent, gone from the
         // mempool); 3 waiting (unspent, in the mempool); 4 unknown (unspent,
         // mempool not asked); 5 never existed (not listed); 6 a three-input
-        // GIVE, all unspent and dropped; 7 one input unspent, one not listed.
-        let due = vec![
+        // GIVE, all unspent and dropped; 7 one input unspent, one not listed;
+        // 8 not listed, its height unknown.
+        let mut due = vec![
             spend(1, &[id(1)]),
             spend(2, &[id(2)]),
             spend(3, &[id(3)]),
@@ -1537,32 +1715,51 @@ mod tests {
             spend(6, &[id(6), id(7), id(8)]),
             spend(7, &[id(9), id(10)]),
         ];
+        let mut unknown_height = spend(8, &[id(11)]);
+        unknown_height.coins[0].seen_at = None;
+        due.push(unknown_height);
         let spent_on_chain: HashMap<Bytes32, bool> = [
             (id(1), true), (id(2), false), (id(3), false), (id(4), false),
             (id(6), false), (id(7), false), (id(8), false), (id(9), false),
         ]
         .into_iter()
         .collect();
-        // One probe per spend whose inputs are all unspent, with its first coin;
+        // One probe per spend whose inputs are all unspent, with its bundle;
         // the three-input spend is ONE question, not three.
         let probes = mempool_probes(&due, &spent_on_chain, 0);
-        assert_eq!(probes, vec![(2, id(2)), (3, id(3)), (4, id(4)), (6, id(6))]);
+        assert_eq!(probes.iter().map(|(n, _)| *n).collect::<Vec<u64>>(), vec![2, 3, 4, 6]);
+        // A spend whose bundle the lease never kept is not asked about.
+        let mut bare = due.clone();
+        bare[1].bundle = None;
+        assert_eq!(mempool_probes(&bare, &spent_on_chain, 0).iter().map(|(n, _)| *n).collect::<Vec<u64>>(), vec![3, 4, 6]);
         let in_mempool: HashMap<u64, Option<bool>> =
             [(2, Some(false)), (3, Some(true)), (4, None), (6, Some(false))].into_iter().collect();
-        let mut released = settle(&due, &spent_on_chain, &in_mempool, true);
+        // A complete listing judged at 100, above where the missing coins were
+        // seen confirmed: they are gone (5, 7). The coin of unknown height (8)
+        // is never freed on silence alone.
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, Some(100));
         released.sort();
         assert_eq!(released, vec![1, 2, 5, 6, 7]);
         // A listing cut short says nothing about the coins it left out: a spend
         // with one of them stays.
-        let mut released = settle(&due, &spent_on_chain, &in_mempool, false);
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, None);
         released.sort();
         assert_eq!(released, vec![1, 2, 6]);
+        // Complete, but judged below the height the coins were seen confirmed
+        // at: a pair of peers still syncing knows nothing of them, so nothing
+        // missing is freed. Judged exactly there, it is.
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, Some(80));
+        released.sort();
+        assert_eq!(released, vec![1, 2, 6]);
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, Some(90));
+        released.sort();
+        assert_eq!(released, vec![1, 2, 5, 6, 7]);
         // The probes are bounded per pass, and the window rotates: a pass opens
         // after the last spend the previous one asked about and wraps around, so
         // with more spends waiting than one pass covers, none is starved.
         let many: Vec<DueSpend> = (20..30u64).map(|n| spend(n, &[id(n as u8)])).collect();
         let all_unspent: HashMap<Bytes32, bool> = (20..30u8).map(|n| (id(n), false)).collect();
-        let ids = |probes: Vec<(u64, Bytes32)>| probes.into_iter().map(|(n, _)| n).collect::<Vec<u64>>();
+        let ids = |probes: Vec<(u64, SpendBundle)>| probes.into_iter().map(|(n, _)| n).collect::<Vec<u64>>();
         let first = ids(mempool_probes(&many, &all_unspent, 0));
         assert_eq!(first, (20..28).collect::<Vec<u64>>());
         let second = ids(mempool_probes(&many, &all_unspent, 27));
@@ -1617,7 +1814,7 @@ mod tests {
         assert!(second.is_pending(&ours) && second.is_pending(&faucet_coin));
         assert!(second.outgoing_pending() && second.incoming_pending());
         // …due for reconciliation after a FRESH grace (a restart can fall inside
-        // the first one, before the gateway's mempool has the spend), under
+        // the first one, before the peers' mempool has the spend), under
         // their old spend numbers…
         assert!(second.due_at(Instant::now()).is_empty());
         let due: Vec<u64> = second.due_at(Instant::now() + RECONCILE_GRACE).iter().map(|d| d.spend).collect();

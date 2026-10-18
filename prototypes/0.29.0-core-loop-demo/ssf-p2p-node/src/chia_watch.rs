@@ -26,8 +26,9 @@
 //! planned into holds in the private rooms it was met in. Our own record is
 //! read too, so seeing it confirm restarts the dance exactly as a room record
 //! did. The watcher also publishes the chain peak it saw (`hub.chia_peak`:
-//! height and read time as one snapshot), the era clock for the inbound marks
-//! and the presence publisher.
+//! height and read time as one snapshot), the era clock for the inbound marks.
+//! The presence publisher reads its era from the AGREED lane instead: one
+//! carrier peer's height is not what a signed write is filed under.
 //!
 //! Pure pieces ([`BeatSchedule`], [`plan_holds`]) are unit-tested; the loop
 //! itself is thin glue over them, the reader and `main::hold_dial`.
@@ -59,7 +60,7 @@ pub const MAX_HOLDS_PER_ROOM: usize = 4;
 pub const TARGET_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Distinct contact keys read per watcher tick, at most (two hint scans each).
 /// The address book holds up to `MAX_PEERS` (512) peers — a private-room member
-/// can leave one card per node identity it cycles through — so the gateway load
+/// can leave one card per node identity it cycles through — so the chain load
 /// per tick is bounded here, well below the book's cap, and the keys take turns
 /// through the whole book, the longest-waiting first.
 pub const MAX_CK_READS_PER_TICK: usize = 8;
@@ -245,10 +246,12 @@ pub fn watch_enabled() -> bool {
 
 /// The watcher: beat-aligned reads for every readable room, then holds for
 /// every unknown member the records describe. Never affects the mesh when the
-/// gateway is unreachable — it just waits for the next tick.
+/// chain is unreachable — it just waits for the next tick.
 pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     let self_id = iroh_ep.id().to_string();
-    let client = crate::chia_chain::connect();
+    // The presence lane: records are signed and sealed, so the first reachable
+    // peer carries them (plan §14 (5)).
+    let client = crate::chia_chain::connect_carrier();
     let mut sched = BeatSchedule::from_env();
     let mut cursors: HashMap<(String, [u8; 32]), HintCursor> = HashMap::new();
     let mut cache: HashMap<String, RoomCache> = HashMap::new();

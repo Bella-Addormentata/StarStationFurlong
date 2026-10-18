@@ -92,7 +92,7 @@ impl ChiaRoomCap {
     /// Should the reader (rung-6 resolve, P1 watcher) read this room's hint?
     /// Everything not KNOWN to be public space — reads are free and need no
     /// arming (D3); public rooms carry nothing under their hint by
-    /// construction (D6), so skipping them only saves gateway calls.
+    /// construction (D6), so skipping them only saves chain calls.
     pub fn may_read(&self) -> bool {
         self.public_room != Some(true)
     }

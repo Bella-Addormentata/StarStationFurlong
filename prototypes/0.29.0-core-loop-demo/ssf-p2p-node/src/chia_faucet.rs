@@ -30,7 +30,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes32, Coin};
-use crate::chia_chain::ChainAccess;
+use crate::chia_chain::{ChainAccess, PagedRecords};
 use clvm_traits::{clvm_curried_args, clvm_list, ToClvm};
 use clvm_utils::{CurriedProgram, ToTreeHash, TreeHash};
 use clvmr::serde::node_from_bytes;
@@ -299,7 +299,7 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
     }
 }
 
-/// Gateway pages followed per listing (one HTTPS call each). A faucet address is
+/// Listing pages followed per listing (one peer request each). A faucet address is
 /// permissionless, so a flood of tiny outputs could stretch the listing past one
 /// page; the pages are followed up to this bound (as `chia_resolve::read_hint`
 /// does) and past it the status says so (`partial`) instead of silently
@@ -312,24 +312,22 @@ pub struct Unspent {
     pub partial: bool,
 }
 
-/// The unspent coins at `puzzle_hash`, following the listing's cursor.
+/// The unspent coins at `puzzle_hash`, following the listing's cursor. Spent
+/// coins are asked for as well: the chain pages by a coin's latest change, so
+/// a coin listed unspent on one page comes again, spent, on a later one when
+/// the chain moved on in between, and only that later record says so
+/// ([`PagedRecords`]); the spent ones are dropped once every page is in.
 pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<Unspent> {
-    let mut coins = Vec::new();
+    let mut gathered = PagedRecords::default();
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
     let partial = loop {
         let listing = client
-            .coin_records_by_puzzle_hash(puzzle_hash, false, cursor.take())
+            .coin_records_by_puzzle_hash(puzzle_hash, true, cursor.take())
             .await
             .map_err(|e| anyhow!("coin lookup: {e}"))?;
         pages += 1;
-        coins.extend(
-            listing
-                .records
-                .into_iter()
-                .filter(|r| !r.spent)
-                .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index }),
-        );
+        gathered.fold(listing.records);
         let truncated = listing.truncated;
         match listing.next_cursor {
             Some(next) if truncated => {
@@ -341,6 +339,12 @@ pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Resu
             _ => break truncated,
         }
     };
+    let coins = gathered
+        .into_records()
+        .into_iter()
+        .filter(|r| !r.spent)
+        .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index })
+        .collect();
     Ok(Unspent { coins, partial })
 }
 
@@ -365,7 +369,7 @@ pub struct FaucetReply {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<FaucetStatus>,
     /// The id of the coin a claim or gift spent (with `unanswered` set: the coin
-    /// its bundle spends, if the gateway took it).
+    /// its bundle spends, if the peers took it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spent_coin: Option<String>,
     /// On a claim or give that went out: the snapshot BARRIER, taken under
@@ -377,7 +381,7 @@ pub struct FaucetReply {
     /// review, round 13).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_snapshot: Option<u64>,
-    /// On a claim or give whose push the gateway did not ANSWER (a timeout
+    /// On a claim or give whose push the chain did not ANSWER (a timeout
     /// above all): why. The spend may be in the mempool all the same, so its
     /// inputs stay parked and the browser keeps its TAKING…/GIVING… until
     /// reconciliation settles the spend, exactly as after an accepted push;
@@ -454,7 +458,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
             // above the barrier that shows the spend settled (or the gift
             // landed). The barrier goes out even when the read right after it
             // fails, so a later poll can settle a spend the chain dropped; the
-            // polls bring the status. A push the gateway did not answer went out
+            // polls bring the status. A push the chain did not answer went out
             // as well (`unanswered` set, round 14): its spend may be live, so the
             // browser keeps the action pending the same way.
             if reply.ok && matches!(reply.op.as_str(), "claim" | "give") {
@@ -483,7 +487,7 @@ async fn status(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fau
 async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetStatus> {
     let peak = crate::chia_resolve::peak_height(client)
         .await
-        .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
+        .ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
     let listing = unspent_at(client, params.puzzle_hash()).await?;
     let mut st = summarize(params, peak, &listing.coins, listing.partial);
     #[cfg(feature = "chia-publish")]
@@ -538,6 +542,9 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
 struct WalletView {
     owned: Vec<Coin>,
     spendable: Vec<Coin>,
+    /// The height each owned coin was seen confirmed at, by coin id: what the
+    /// parking of the coins a GIVE spends records.
+    seen_at: HashMap<Bytes32, u32>,
     /// The listing was cut short at [`MAX_FAUCET_PAGES`]: `owned` and
     /// `spendable` are what the pages read hold, not the whole wallet.
     partial: bool,
@@ -558,13 +565,14 @@ impl WalletView {
 async fn wallet_view(client: &impl ChainAccess, sk: &chia_bls::SecretKey) -> Result<WalletView> {
     let ph = crate::chia_publish::our_puzzle_hash(sk);
     let listing = unspent_at(client, ph).await?;
+    let seen_at: HashMap<Bytes32, u32> = listing.coins.iter().map(|c| (c.coin.coin_id(), c.confirmed_height)).collect();
     let owned: Vec<Coin> = listing.coins.into_iter().map(|c| c.coin).collect();
     let spendable = owned
         .iter()
         .copied()
         .filter(|c| !crate::chia_publish::WALLET_LEASE.is_pending(&c.coin_id()))
         .collect();
-    Ok(WalletView { owned, spendable, partial: listing.partial })
+    Ok(WalletView { owned, spendable, seen_at, partial: listing.partial })
 }
 
 /// One gift is paid from at most this many of our coins (#245 review, round
@@ -689,11 +697,11 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     // mempool settles the claim) counts as a coin in the wallet. Without this,
     // two loopback requests could both see an empty wallet before either gift
     // confirms and each draw a mojo from a different ready coin (#245 review,
-    // round 3). The lease is held across the gateway reads, as the heartbeat
+    // round 3). The lease is held across the chain reads, as the heartbeat
     // holds it across its own.
     let _lease = crate::chia_publish::WALLET_LEASE.lock().await;
     // A sealed lease (its file from the last run unreadable) refuses here,
-    // before any gateway read, with the reason (#245 review, round 19).
+    // before any chain read, with the reason (#245 review, round 19).
     crate::chia_publish::WALLET_LEASE.ensure_open()?;
     crate::chia_publish::WALLET_LEASE.reconcile(client).await;
     if crate::chia_publish::WALLET_LEASE.incoming_pending() {
@@ -713,7 +721,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     }
     let peak = crate::chia_resolve::peak_height(client)
         .await
-        .ok_or_else(|| anyhow!("chain peak unavailable (gateway down?)"))?;
+        .ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
     let faucet_ph = params.puzzle_hash();
     let coins = unspent_at(client, faucet_ph).await?.coins;
     let Some(target) = coins
@@ -749,7 +757,8 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     // the parking). A mark that cannot be SAVED stops the claim here, before
     // anything leaves: a restart would otherwise forget it (round 19).
     crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id())?;
-    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, [target.coin.coin_id()]).await)?;
+    let unanswered =
+        pushed(crate::chia_publish::push_parked(client, bundle, [(target.coin.coin_id(), target.confirmed_height)]).await)?;
     match &unanswered {
         None => println!(
             "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
@@ -843,7 +852,10 @@ async fn give(
     }
     let bundle = crate::chia_publish::sign_standard_spends(sk, ctx_spend.take())?;
     // Coins parked before the push leaves (round 9): see push_parked.
-    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, coins.iter().map(|c| c.coin_id())).await)?;
+    let inputs = coins
+        .iter()
+        .map(|c| crate::chia_publish::ParkedInput { coin_id: c.coin_id(), seen_at: wallet.seen_at.get(&c.coin_id()).copied() });
+    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, inputs).await)?;
     match &unanswered {
         None => println!(
             "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",
@@ -878,7 +890,7 @@ async fn give(
 }
 
 /// What a push leaves for the reply (#245 review, round 14): `Ok(None)` when the
-/// gateway accepted it; `Ok(Some(why))` when it did not ANSWER — the spend may
+/// peers accepted it; `Ok(Some(why))` when it did not ANSWER — the spend may
 /// be live and its inputs stay parked, so the request is answered as SENT with
 /// `unanswered` set, never as a refusal that would let the player spend again
 /// from other coins; `Err` only for a rejection, which proves nothing was spent,
@@ -1006,6 +1018,28 @@ mod tests {
                 }
             })
             .collect())
+    }
+
+    #[tokio::test]
+    async fn a_coin_spent_between_two_pages_is_not_counted_unspent() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::{CoinListing, CoinRecord};
+        // Coin 1 is unspent on the first page and spent by the time the second
+        // is read, where it comes again (the chain pages by latest change).
+        let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), Bytes32::new([9u8; 32]), u64::from(seed));
+        let rec = |c: Coin, height: u32, spent: Option<u32>| CoinRecord { coin: c, confirmed_block_index: height, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
+        let first = CoinListing {
+            records: vec![rec(coin(1), 80, None), rec(coin(2), 85, None)],
+            truncated: true,
+            next_cursor: Some("page-2".into()),
+            judged_at: None,
+        };
+        let second = CoinListing { records: vec![rec(coin(1), 80, Some(101)), rec(coin(3), 101, None)], truncated: false, next_cursor: None, judged_at: None };
+        let chain = Scripted::new(vec![first, second]);
+        let got = unspent_at(&chain, Bytes32::new([9u8; 32])).await.unwrap();
+        assert_eq!(got.coins.iter().map(|c| c.coin.amount).collect::<Vec<_>>(), vec![2, 3], "coin 1, spent between the pages, is gone");
+        assert!(!got.partial);
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "spent coins asked for, so the spend can be seen");
     }
 
     #[test]
@@ -1199,8 +1233,8 @@ mod tests {
         use crate::chia_publish::LeaseError;
         let ph = Bytes32::new([5u8; 32]);
         let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), ph, amount);
-        let funded = WalletView { owned: vec![coin(1, 5_000)], spendable: vec![coin(1, 5_000)], partial: false };
-        let empty = WalletView { owned: vec![], spendable: vec![], partial: false };
+        let funded = WalletView { owned: vec![coin(1, 5_000)], spendable: vec![coin(1, 5_000)], seen_at: HashMap::new(), partial: false };
+        let empty = WalletView { owned: vec![], spendable: vec![], seen_at: HashMap::new(), partial: false };
         // Open: a funded wallet gives, an empty one takes.
         let part = wallet_part(&funded, false, false, None, 1, true);
         assert!(part.can_give && !part.can_claim, "{part:?}");
@@ -1217,7 +1251,7 @@ mod tests {
         // A wallet dusted into more coins than one gift may spend: GIVE stays on
         // for what the largest coins reach, and the note says to consolidate.
         let dust: Vec<Coin> = (0..100u8).map(|n| coin(n, 1)).collect();
-        let dusted = WalletView { owned: dust.clone(), spendable: dust, partial: false };
+        let dusted = WalletView { owned: dust.clone(), spendable: dust, seen_at: HashMap::new(), partial: false };
         let part = wallet_part(&dusted, false, false, None, 1, true);
         assert!(part.can_give && part.note.contains("many small coins") && part.note.contains("(64 mojos)"), "{part:?}");
     }
@@ -1252,7 +1286,7 @@ mod tests {
         // Unanswered: the spend may be live; the request is answered as SENT with the reason.
         let unanswered = pushed(Err(PushError::Unanswered(anyhow!("operation timed out")))).unwrap();
         assert_eq!(unanswered.as_deref(), Some("operation timed out"));
-        // Rejected: nothing was spent; the request is refused with the gateway's reason.
+        // Rejected: nothing was spent; the request is refused with the chain's reason.
         let refused = pushed(Err(PushError::Rejected("DOUBLE_SPEND".into()))).unwrap_err();
         assert!(refused.to_string().contains("DOUBLE_SPEND"), "{refused}");
         // Not sent: the lease could not save the parking, so nothing left; the
