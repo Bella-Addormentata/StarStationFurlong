@@ -51,7 +51,10 @@
 //!     peers must come from DISTINCT sources and distinct network groups
 //!     (IPv4 /16, IPv6 /32; an IPv4‑mapped IPv6 address is its IPv4 address),
 //!     and one of them must be fresh (a pin or the introducer), so a poisoned
-//!     store cannot make an eclipse stick. Their listings are judged over
+//!     store cannot make an eclipse stick; an address keeps every source
+//!     that names it, and a connection two sources named may stand for
+//!     either in a pair, once, so a cold start whose peers gossip only the
+//!     introducer's own addresses pairs all the same. Their listings are judged over
 //!     the changes both have reached ([`settle_pages`]: taken as of the lower
 //!     peak, cut to the changes between the request's start and the lower
 //!     page boundary), so a peer a block ahead, or one that cut a page at its
@@ -136,7 +139,7 @@ use futures_util::future::join_all;
 use rand::seq::SliceRandom;
 
 use crate::chia_chain::{ChainAccess, ChainError, CoinListing, CoinRecord, PuzzleAndSolution};
-use crate::chia_peer::{canonical, group_of, Group, Network, Peak, PeerConn, Source, CONNECT_TIMEOUT, PEAK_STALE, PEAK_WAIT};
+use crate::chia_peer::{canonical, group_of, Group, Network, Peak, PeerConn, Source, Sources, CONNECT_TIMEOUT, PEAK_STALE, PEAK_WAIT};
 
 /// Known-good public peers, kept across runs (beside the node's other files).
 pub const STORE_FILE: &str = "chia_peers.json";
@@ -277,9 +280,21 @@ struct LaneState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Candidate {
     addr: SocketAddr,
-    source: Source,
+    /// Every source that named the address, and the one it is held under.
+    sources: Sources,
     /// Dials that failed in a row; [`MAX_DIAL_FAILURES`] gives the address up.
     failures: u8,
+}
+
+impl Candidate {
+    fn new(addr: SocketAddr, source: Source) -> Self {
+        Self { addr, sources: Sources::of(source), failures: 0 }
+    }
+
+    /// The source the address is held under ([`Sources::under`]).
+    fn source(&self) -> Source {
+        self.sources.under()
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -344,7 +359,7 @@ impl Lane {
         {
             let mut state = self.state.try_lock().expect("fresh lane");
             for (addr, source) in seeds {
-                state.candidates.push_back(Candidate { addr: canonical(addr), source, failures: 0 });
+                state.candidates.push_back(Candidate::new(canonical(addr), source));
             }
         }
         self
@@ -640,7 +655,7 @@ impl Lane {
                 pin.or_else(|| conns.first()).map(|c| vec![(*c).clone()])
             }
             Trust::Agreed => {
-                let facts: Vec<(Source, Group)> = conns.iter().map(|c| (c.source(), c.group())).collect();
+                let facts: Vec<(Sources, Group)> = conns.iter().map(|c| (c.sources(), c.group())).collect();
                 let picked = pick_agreed(&facts, !self.pins.is_empty(), self.pin_only)?;
                 Some(picked.into_iter().map(|i| conns[i].clone()).collect())
             }
@@ -698,7 +713,7 @@ impl Lane {
                         continue;
                     }
                     if !state.cooling.get(&addr).is_some_and(|until| now < *until) {
-                        targets.push(Candidate { addr, source: Source::Pin, failures: 0 });
+                        targets.push(Candidate::new(addr, Source::Pin));
                     }
                 }
             }
@@ -765,7 +780,7 @@ impl Lane {
                     .known
                     .iter()
                     .filter_map(|p| p.addr.parse::<SocketAddr>().ok())
-                    .map(|addr| Candidate { addr, source: Source::Store, failures: 0 })
+                    .map(|addr| Candidate::new(addr, Source::Store))
                     .collect();
                 push_candidates(state, stored);
             }
@@ -777,13 +792,13 @@ impl Lane {
             // peer and candidate in one network group, say) is no reason to leave
             // the introducer unasked once it is due.
             let connected: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).collect();
-            let pooled: Vec<(Source, Group, bool)> =
-                state.conns.iter().map(|c| (c.source(), c.group(), state.gossiped.contains_key(&c.addr()))).collect();
+            let pooled: Vec<(Sources, Group, bool)> =
+                state.conns.iter().map(|c| (c.sources(), c.group(), state.gossiped.contains_key(&c.addr()))).collect();
             let pinned = !self.pins.is_empty();
             let ready = state.candidates.iter().any(|c| {
                 !connected.contains(&c.addr)
                     && !state.cooling.get(&c.addr).is_some_and(|until| now < *until)
-                    && tryable(&pooled, (c.source, group_of(c.addr)), pinned, self.pin_only)
+                    && tryable(&pooled, (c.sources, group_of(c.addr)), pinned, self.pin_only)
             });
             let need_fresh = trust == Trust::Agreed && self.pins.is_empty() && !state.conns.iter().any(|c| c.source().is_fresh());
             // No veto for introducer candidates still queued: those are cooling
@@ -843,14 +858,14 @@ impl Lane {
         if let Some(found) = found {
             let n = found.len();
             state.introduce_after = Some(Instant::now() + if n == 0 { INTRODUCE_RETRY } else { INTRODUCE_EVERY });
-            push_candidates(state, found.into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect());
+            push_candidates(state, found.into_iter().map(|addr| Candidate::new(addr, Source::Introducer)).collect());
             eprintln!("⛓️ chain peers: the introducer named {n} full nodes");
         }
         for (conn, answer) in gossip {
             match answer {
                 Some(addrs) => {
                     let n = addrs.len();
-                    push_candidates(state, addrs.into_iter().map(|addr| Candidate { addr, source: Source::Gossip, failures: 0 }).collect());
+                    push_candidates(state, addrs.into_iter().map(|addr| Candidate::new(addr, Source::Gossip)).collect());
                     eprintln!("⛓️ chain peers: {} gossiped {n} full nodes", conn.addr());
                 }
                 None => {
@@ -895,11 +910,11 @@ impl Lane {
                 // candidate that would complete one, by source AND network group,
                 // letting go a connection the pair can spare (a redundant one
                 // first, never a pin); that candidate is dialled first.
-                let facts: Vec<(Source, Group)> = state.conns.iter().map(|c| (c.source(), c.group())).collect();
+                let facts: Vec<(Sources, Group)> = state.conns.iter().map(|c| (c.sources(), c.group())).collect();
                 let pinned = !self.pins.is_empty();
                 let swap = if self.choose(state, Trust::Agreed, &[]).is_none() {
                     ready.iter().enumerate().find_map(|(ci, c)| {
-                        replaceable(&facts, (c.source, group_of(c.addr)), pinned, self.pin_only).map(|i| (ci, i))
+                        replaceable(&facts, (c.sources, group_of(c.addr)), pinned, self.pin_only).map(|i| (ci, i))
                     })
                 } else {
                     None
@@ -922,7 +937,7 @@ impl Lane {
                     }
                 }
             }
-            ready.sort_by_key(|c| (have.contains(&c.source), groups.contains(&group_of(c.addr)), !c.source.is_fresh()));
+            ready.sort_by_key(|c| (have.contains(&c.source()), groups.contains(&group_of(c.addr)), !c.source().is_fresh()));
             if first.is_none() {
                 if let Some(i) = self.rotation(state, &ready) {
                     let peer = state.conns[i].clone();
@@ -942,7 +957,7 @@ impl Lane {
             let mut batch: Vec<Candidate> = Vec::new();
             let mut rest: Vec<Candidate> = Vec::new();
             for cand in ready {
-                let held = per_source.entry(cand.source).or_default();
+                let held = per_source.entry(cand.source()).or_default();
                 if batch.len() < PARALLEL_DIALS.min(room) && *held < PER_SOURCE_CAP {
                     *held += 1;
                     batch.push(cand);
@@ -977,7 +992,7 @@ impl Lane {
             let tls = tls.clone();
             let net = net.clone();
             async move {
-                let result = PeerConn::connect(cand.addr, cand.source, &net, tls).await;
+                let result = PeerConn::connect(cand.addr, cand.sources, &net, tls).await;
                 (cand, result)
             }
         });
@@ -997,17 +1012,17 @@ impl Lane {
                         // One connection per address, whoever dialled it twice.
                         close_later(conn);
                     } else if state.conns.len() < MAX_CONNS {
-                        eprintln!("⛓️ chain peers: {} ({}) connected", cand.addr, cand.source.label());
+                        eprintln!("⛓️ chain peers: {} ({}) connected", cand.addr, cand.source().label());
                         state.conns.push(conn);
                     } else {
                         close_later(conn);
                     }
                 }
                 Err(e) => {
-                    eprintln!("⛓️ chain peers: {} ({}): {e:#}", cand.addr, cand.source.label());
+                    eprintln!("⛓️ chain peers: {} ({}): {e:#}", cand.addr, cand.source().label());
                     state.cooling.insert(cand.addr, now + cool_for);
                     self.forget(state, cand.addr);
-                    if cand.source == Source::Pin {
+                    if cand.source() == Source::Pin {
                         // Pins are resolved and retried on their own schedule.
                         continue;
                     }
@@ -1017,7 +1032,7 @@ impl Lane {
                     if failures < MAX_DIAL_FAILURES {
                         push_candidates(state, vec![Candidate { failures, ..cand }]);
                     } else {
-                        eprintln!("⛓️ chain peers: {} ({}) given up after {failures} failed dials", cand.addr, cand.source.label());
+                        eprintln!("⛓️ chain peers: {} ({}) given up after {failures} failed dials", cand.addr, cand.source().label());
                     }
                 }
             }
@@ -1037,11 +1052,11 @@ impl Lane {
     /// the fresh peer such a pool lacks, only the introducer can.
     fn rotation(&self, state: &LaneState, ready: &[Candidate]) -> Option<usize> {
         let cand = ready.first()?;
-        if state.conns.len() >= MAX_CONNS || !cand.source.is_fresh() || self.choose(state, Trust::Agreed, &[]).is_some() {
+        if state.conns.len() >= MAX_CONNS || !cand.source().is_fresh() || self.choose(state, Trust::Agreed, &[]).is_some() {
             return None;
         }
-        let held = state.conns.iter().filter(|c| c.source() == cand.source).count();
-        if held < PER_SOURCE_CAP || ready.iter().any(|c| c.source != cand.source) {
+        let held = state.conns.iter().filter(|c| c.source() == cand.source()).count();
+        if held < PER_SOURCE_CAP || ready.iter().any(|c| c.source() != cand.source()) {
             return None;
         }
         let mut groups: HashMap<Group, usize> = HashMap::new();
@@ -1052,7 +1067,7 @@ impl Lane {
             .conns
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.source() == cand.source && c.source() != Source::Pin && state.gossiped.contains_key(&c.addr()))
+            .filter(|(_, c)| c.source() == cand.source() && c.source() != Source::Pin && state.gossiped.contains_key(&c.addr()))
             .max_by_key(|(_, c)| groups[&c.group()])
             .map(|(i, _)| i)
     }
@@ -1520,32 +1535,35 @@ fn describe(outcomes: &[AckOutcome]) -> String {
 }
 
 /// Which connected peers may form an agreed verdict (plan §14 (1), (2)).
-/// `peers` are (source, group) per connection. With pins: the pin alone in
-/// pin-only mode, else the pin plus one public peer from another group.
-/// Without: two peers from distinct sources and groups, the first of them
-/// fresh (the introducer this run).
-pub(crate) fn pick_agreed(peers: &[(Source, Group)], pinned: bool, pin_only: bool) -> Option<Vec<usize>> {
+/// `peers` are (sources, group) per connection: a [`Source`], or every source
+/// that named the address ([`Sources`]). With pins: the pin alone in pin-only
+/// mode, else the pin plus one public peer from another group. Without: two
+/// peers standing for distinct sources, in distinct groups, the first of them
+/// for a fresh source (the introducer this run); a connection two sources
+/// named may stand for either, once, so three introducer peers whose gossip
+/// names only one another still pair (#271 review, round 20).
+pub(crate) fn pick_agreed<S: Into<Sources> + Copy>(peers: &[(S, Group)], pinned: bool, pin_only: bool) -> Option<Vec<usize>> {
+    let peers: Vec<(Sources, Group)> = peers.iter().map(|(s, g)| ((*s).into(), *g)).collect();
     if pinned {
-        let mut pins = peers.iter().enumerate().filter(|(_, (s, _))| *s == Source::Pin).map(|(i, _)| i);
+        let mut pins = peers.iter().enumerate().filter(|(_, (s, _))| s.under() == Source::Pin).map(|(i, _)| i);
         let first = pins.next()?;
         if pin_only {
             return Some(vec![first]);
         }
         // Any live pin may pair with a public peer outside its own group.
         for pin in std::iter::once(first).chain(pins) {
-            if let Some(public) = peers.iter().position(|(s, g)| *s != Source::Pin && *g != peers[pin].1) {
+            if let Some(public) = peers.iter().position(|(s, g)| s.under() != Source::Pin && *g != peers[pin].1) {
                 return Some(vec![pin, public]);
             }
         }
         return None;
     }
     for (i, (sa, ga)) in peers.iter().enumerate() {
-        if !sa.is_fresh() {
-            continue;
-        }
-        for (j, (sb, gb)) in peers.iter().enumerate() {
-            if i != j && sb != sa && gb != ga {
-                return Some(vec![i, j]);
+        for fresh in sa.iter().filter(|s| s.is_fresh()) {
+            for (j, (sb, gb)) in peers.iter().enumerate() {
+                if i != j && gb != ga && sb.iter().any(|s| s != fresh) {
+                    return Some(vec![i, j]);
+                }
             }
         }
     }
@@ -1557,15 +1575,17 @@ pub(crate) fn pick_agreed(peers: &[(Source, Group)], pinned: bool, pin_only: boo
 /// are not pins, a redundant one first (its source held twice), newest
 /// first, the first whose removal makes [`pick_agreed`] succeed with `cand` in
 /// its place. `None` when no single swap would help.
-pub(crate) fn replaceable(facts: &[(Source, Group)], cand: (Source, Group), pinned: bool, pin_only: bool) -> Option<usize> {
+pub(crate) fn replaceable<S: Into<Sources> + Copy>(facts: &[(S, Group)], cand: (S, Group), pinned: bool, pin_only: bool) -> Option<usize> {
+    let facts: Vec<(Sources, Group)> = facts.iter().map(|(s, g)| ((*s).into(), *g)).collect();
+    let cand: (Sources, Group) = (cand.0.into(), cand.1);
     let mut held: HashMap<Source, usize> = HashMap::new();
-    for (source, _) in facts {
-        *held.entry(*source).or_default() += 1;
+    for (sources, _) in &facts {
+        *held.entry(sources.under()).or_default() += 1;
     }
-    let mut order: Vec<usize> = (0..facts.len()).rev().filter(|&i| facts[i].0 != Source::Pin).collect();
-    order.sort_by_key(|&i| held[&facts[i].0] < 2);
+    let mut order: Vec<usize> = (0..facts.len()).rev().filter(|&i| facts[i].0.under() != Source::Pin).collect();
+    order.sort_by_key(|&i| held[&facts[i].0.under()] < 2);
     order.into_iter().find(|&i| {
-        let mut trial: Vec<(Source, Group)> = facts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, f)| *f).collect();
+        let mut trial: Vec<(Sources, Group)> = facts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, f)| *f).collect();
         trial.push(cand);
         pick_agreed(&trial, pinned, pin_only).is_some()
     })
@@ -1580,13 +1600,15 @@ pub(crate) fn replaceable(facts: &[(Source, Group)], cand: (Source, Group), pinn
 /// one. [`Lane::refill`] asks the introducer when nothing queued passes: a
 /// full pool and a queue all in one network group would otherwise keep it
 /// unasked for good, however long ago it last answered.
-pub(crate) fn tryable(pooled: &[(Source, Group, bool)], cand: (Source, Group), pinned: bool, pin_only: bool) -> bool {
-    let facts: Vec<(Source, Group)> = pooled.iter().map(|(s, g, _)| (*s, *g)).collect();
+pub(crate) fn tryable<S: Into<Sources> + Copy>(pooled: &[(S, Group, bool)], cand: (S, Group), pinned: bool, pin_only: bool) -> bool {
+    let facts: Vec<(Sources, Group)> = pooled.iter().map(|(s, g, _)| ((*s).into(), *g)).collect();
+    let cand: (Sources, Group) = (cand.0.into(), cand.1);
     if facts.len() >= MAX_CONNS {
         return pick_agreed(&facts, pinned, pin_only).is_none() && replaceable(&facts, cand, pinned, pin_only).is_some();
     }
-    let held = facts.iter().filter(|(s, _)| *s == cand.0).count();
-    held < PER_SOURCE_CAP || (cand.0.is_fresh() && pooled.iter().any(|(s, _, asked)| *s == cand.0 && *s != Source::Pin && *asked))
+    let under = cand.0.under();
+    let held = facts.iter().filter(|(s, _)| s.under() == under).count();
+    held < PER_SOURCE_CAP || (under.is_fresh() && facts.iter().zip(pooled).any(|((s, _), (_, _, asked))| s.under() == under && under != Source::Pin && *asked))
 }
 
 /// Take exactly `peer` out of the pool, never a later connection to the same
@@ -1606,7 +1628,7 @@ fn requeue(state: &mut LaneState, peer: &PeerConn, after: Duration) {
         return;
     }
     state.cooling.insert(peer.addr(), Instant::now() + after);
-    push_candidates(state, vec![Candidate { addr: peer.addr(), source: peer.source(), failures: 0 }]);
+    push_candidates(state, vec![Candidate { addr: peer.addr(), sources: peer.sources(), failures: 0 }]);
 }
 
 /// Close a connection off the lane's lock: the websocket close is bounded,
@@ -1616,10 +1638,13 @@ fn close_later(peer: Arc<PeerConn>) {
 }
 
 /// Queue candidates not yet known. An address already queued or connected is
-/// not queued again (one address, one vote), but a fresh mention of it is
-/// kept: a stored or gossiped peer the introducer names this run counts as an
-/// introducer peer from then on, so a warm start whose store already holds
-/// everything the introducer answers can still form an agreed pair; no more
+/// not queued again (one address, one vote), but every source that names it
+/// is remembered ([`Sources`]: a connection two sources named may stand for
+/// either in a pair, so three introducer peers whose gossip names only one
+/// another still pair), and a fresh mention of it relabels it: a stored or
+/// gossiped peer the introducer names this run counts as an introducer peer
+/// from then on, so a warm start whose store already holds everything the
+/// introducer answers can still form an agreed pair; no more
 /// of them than [`PER_SOURCE_CAP`], as with dials, and never the last stored
 /// or gossiped peer among connections and queue while a fresh peer is at
 /// hand or named in the same answer (two stored peers the introducer names
@@ -1650,26 +1675,34 @@ fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
         // another. Named alone, with nothing fresh anywhere, the last one
         // does turn fresh: only the introducer can make a peer fresh, while
         // gossip brings a second source back any time.
-        let unfresh = state.conns.iter().filter(|c| !c.source().is_fresh()).count() + state.candidates.iter().filter(|c| !c.source.is_fresh()).count();
+        let unfresh = state.conns.iter().filter(|c| !c.source().is_fresh()).count() + state.candidates.iter().filter(|c| !c.source().is_fresh()).count();
         let fresh_elsewhere = state.conns.iter().any(|c| c.source().is_fresh() && c.addr() != cand.addr)
-            || state.candidates.iter().any(|c| c.source.is_fresh() && c.addr != cand.addr)
-            || new[i + 1..].iter().any(|c| c.source.is_fresh() && c.addr != cand.addr);
+            || state.candidates.iter().any(|c| c.source().is_fresh() && c.addr != cand.addr)
+            || new[i + 1..].iter().any(|c| c.source().is_fresh() && c.addr != cand.addr);
         let keep_last = unfresh <= 1 && fresh_elsewhere;
         if let Some(conn) = state.conns.iter().find(|c| c.addr() == cand.addr) {
             // Promotion respects the per-source cap like a dial does: were
             // every connection relabelled introducer, no pair (two sources)
             // could form, no swap would complete one, and a full pool would
             // hold still for good.
-            let held = state.conns.iter().filter(|c| c.source() == cand.source).count();
+            let held = state.conns.iter().filter(|c| c.source() == cand.source()).count();
             let last = !conn.source().is_fresh() && keep_last;
-            if held < PER_SOURCE_CAP && !last && conn.promote(cand.source) {
-                eprintln!("⛓️ chain peers: {} now counts as {}: the introducer named it this run", cand.addr, cand.source.label());
+            if held < PER_SOURCE_CAP && !last && conn.promote(cand.source()) {
+                eprintln!("⛓️ chain peers: {} now counts as {}: the introducer named it this run", cand.addr, cand.source().label());
+            } else if conn.add_source(cand.source()) {
+                // Held under its first source still, the connection may stand
+                // for this one in a pair ([`pick_agreed`]): on a cold start
+                // whose peers gossip only the introducer's own addresses, that
+                // is the second source the pair needs.
+                eprintln!("⛓️ chain peers: {} ({}) is named by {} too", cand.addr, conn.source().label(), cand.source().label());
             }
             continue;
         }
         if let Some(queued) = state.candidates.iter_mut().find(|c| c.addr == cand.addr) {
-            if cand.source == Source::Introducer && !queued.source.is_fresh() && !keep_last {
-                queued.source = cand.source;
+            if cand.source() == Source::Introducer && !queued.source().is_fresh() && !keep_last {
+                queued.sources.promote(Source::Introducer);
+            } else {
+                queued.sources.add(cand.source());
             }
             continue;
         }
@@ -1698,7 +1731,7 @@ fn displaceable(queue: &VecDeque<Candidate>, cand: &Candidate) -> Option<usize> 
     if let Some(worst) = queue.iter().map(|c| c.failures).max().filter(|f| *f > 0) {
         return queue.iter().position(|c| c.failures == worst);
     }
-    let kind = |c: &Candidate| (c.source, group_of(c.addr));
+    let kind = |c: &Candidate| (c.source(), group_of(c.addr));
     if queue.iter().any(|c| kind(c) == kind(cand)) {
         return None;
     }
@@ -2936,6 +2969,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cold_start_whose_gossip_names_only_the_introducers_peers_still_pairs() {
+        // No pin, no store: the introducer names A, B and C, and each of the
+        // three gossips those same three addresses and nobody else. Were a
+        // second naming of a connected address thrown away, the pool would
+        // hold one source for as long as discovery kept answering alike, and
+        // every money request would fail with three healthy peers in three
+        // network groups connected. Each address keeps every source that
+        // named it instead, and the pair stands one connection for the
+        // introducer and another for gossip.
+        let everyone: Arc<std::sync::Mutex<Vec<SocketAddr>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gossiping_everyone = |everyone: Arc<std::sync::Mutex<Vec<SocketAddr>>>| -> Handler {
+            let base = node(vec![state(4, 50, None)], (1, None), vec![]);
+            Arc::new(move |m: &Message| {
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers {
+                    let named = everyone.lock().unwrap().iter().map(|a| TimestampedPeerInfo::new(a.ip().to_string(), a.port(), 1)).collect();
+                    vec![reply(&RespondPeers::new(named))]
+                } else {
+                    base(m)
+                }
+            })
+        };
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), gossiping_everyone(everyone.clone())).await;
+        let b = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), gossiping_everyone(everyone.clone())).await;
+        let c = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), gossiping_everyone(everyone.clone())).await;
+        *everyone.lock().unwrap() = vec![a.addr, b.addr, c.addr];
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Introducer), (c.addr, Source::Introducer)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let got = money.coin_records_by_names(vec![coin(4).coin_id()], true, None).await.unwrap();
+        assert_eq!(got.records.len(), 1);
+        let conns = lane.live_conns().await;
+        assert_eq!(conns.len(), 3, "the three stay connected: {:?}", conns.iter().map(|p| p.addr()).collect::<Vec<_>>());
+        assert!(conns.iter().all(|p| p.source() == Source::Introducer), "each is held under the introducer, which named it first");
+        assert!(conns.iter().all(|p| p.sources().named_by(Source::Gossip)), "and remembers that gossip named it too");
+        for n in [&a, &b, &c] {
+            assert!(n.seen.lock().unwrap().contains(&chia_protocol::ProtocolMessageTypes::RequestPeers), "{} was asked for gossip", n.addr);
+        }
+        assert!(lane.state.lock().await.candidates.is_empty(), "a connected address is never queued again");
+    }
+
+    #[tokio::test]
     async fn peers_cutting_a_listing_at_different_blocks_still_agree() {
         // The same history on both: A serves it in one page through height
         // 100; B hits its item limit at 92 and finishes on a second request.
@@ -3279,16 +3352,16 @@ mod tests {
         ];
         for (i, addr) in shady.iter().enumerate() {
             let source = [Source::Introducer, Source::Gossip, Source::Store][i % 3];
-            push_candidates(&mut state, vec![Candidate { addr: addr.parse().unwrap(), source, failures: 0 }]);
+            push_candidates(&mut state, vec![Candidate::new(addr.parse().unwrap(), source)]);
         }
         assert!(state.candidates.is_empty(), "{:?}", state.candidates);
         let public: Vec<SocketAddr> = ["1.2.3.4:58444", "[2001:4860::8888]:58444", "[::ffff:5.6.7.8]:58444"].iter().map(|a| a.parse().unwrap()).collect();
-        push_candidates(&mut state, public.iter().map(|addr| Candidate { addr: *addr, source: Source::Gossip, failures: 0 }).collect());
+        push_candidates(&mut state, public.iter().map(|addr| Candidate::new(*addr, Source::Gossip)).collect());
         let queued: Vec<SocketAddr> = state.candidates.iter().map(|c| c.addr).collect();
         assert_eq!(queued, vec![public[0], public[1], "5.6.7.8:58444".parse().unwrap()], "public addresses queued, the mapped one as its IPv4");
         // The tests' own mock full nodes listen on loopback: without the judge they are admitted.
         let mut lax = LaneState::default();
-        push_candidates(&mut lax, vec![Candidate { addr: "127.0.0.1:58444".parse().unwrap(), source: Source::Gossip, failures: 0 }]);
+        push_candidates(&mut lax, vec![Candidate::new("127.0.0.1:58444".parse().unwrap(), Source::Gossip)]);
         assert_eq!(lax.candidates.len(), 1);
     }
 
@@ -3764,9 +3837,9 @@ mod tests {
         let lane = lane(vec![(a.addr, Source::Store), (b.addr, Source::Store)], vec![], false, None);
         {
             let mut state = lane.state.lock().await;
-            let named = vec![a.addr, b.addr].into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect();
+            let named = vec![a.addr, b.addr].into_iter().map(|addr| Candidate::new(addr, Source::Introducer)).collect();
             push_candidates(&mut state, named);
-            let sources: Vec<Source> = state.candidates.iter().map(|c| c.source).collect();
+            let sources: Vec<Source> = state.candidates.iter().map(|c| c.source()).collect();
             assert_eq!(sources, vec![Source::Introducer, Source::Store], "one relabelled, the last stored peer kept");
         }
         let money = PeerLane::new(lane.clone(), Trust::Agreed);
@@ -3775,12 +3848,13 @@ mod tests {
         // Connected now, named again: the stored peer still keeps its label.
         {
             let mut state = lane.state.lock().await;
-            let named = vec![a.addr, b.addr].into_iter().map(|addr| Candidate { addr, source: Source::Introducer, failures: 0 }).collect();
+            let named = vec![a.addr, b.addr].into_iter().map(|addr| Candidate::new(addr, Source::Introducer)).collect();
             push_candidates(&mut state, named);
         }
         let conns = lane.live_conns().await;
         assert_eq!(conns.iter().filter(|p| p.source() == Source::Store).count(), 1, "the last stored connection is not relabelled");
         assert_eq!(conns.iter().filter(|p| p.source() == Source::Introducer).count(), 1);
+        assert!(conns.iter().all(|p| p.sources().named_by(Source::Introducer) && p.sources().named_by(Source::Store)), "both remember both sources");
     }
 
     #[tokio::test]
@@ -3802,7 +3876,7 @@ mod tests {
         assert_eq!(lane.live_count().await, 4, "the four connected all the same");
         {
             let mut state = lane.state.lock().await;
-            let named = nodes.iter().map(|n| Candidate { addr: n.addr, source: Source::Introducer, failures: 0 }).collect();
+            let named = nodes.iter().map(|n| Candidate::new(n.addr, Source::Introducer)).collect();
             push_candidates(&mut state, named);
         }
         let conns = lane.live_conns().await;
@@ -4118,8 +4192,8 @@ mod tests {
         let mut state = LaneState::default();
         let native: SocketAddr = "203.0.113.5:58444".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:203.0.113.5]:58444".parse().unwrap();
-        push_candidates(&mut state, vec![Candidate { addr: mapped, source: Source::Gossip, failures: 0 }]);
-        push_candidates(&mut state, vec![Candidate { addr: native, source: Source::Introducer, failures: 0 }]);
+        push_candidates(&mut state, vec![Candidate::new(mapped, Source::Gossip)]);
+        push_candidates(&mut state, vec![Candidate::new(native, Source::Introducer)]);
         assert_eq!(state.candidates.len(), 1, "the mapped spelling and the native one are one address");
         assert_eq!(state.candidates[0].addr, native);
     }
@@ -4188,14 +4262,17 @@ mod tests {
     fn a_queued_stored_candidate_the_introducer_names_becomes_fresh() {
         let mut state = LaneState::default();
         let addr: SocketAddr = "203.0.113.5:58444".parse().unwrap();
-        push_candidates(&mut state, vec![Candidate { addr, source: Source::Store, failures: 0 }]);
-        push_candidates(&mut state, vec![Candidate { addr, source: Source::Introducer, failures: 0 }]);
+        push_candidates(&mut state, vec![Candidate::new(addr, Source::Store)]);
+        push_candidates(&mut state, vec![Candidate::new(addr, Source::Introducer)]);
         assert_eq!(state.candidates.len(), 1, "one address, one vote");
-        assert_eq!(state.candidates[0].source, Source::Introducer);
-        // Nothing moves away from fresh: a later gossiped mention changes nothing.
-        push_candidates(&mut state, vec![Candidate { addr, source: Source::Gossip, failures: 0 }]);
+        assert_eq!(state.candidates[0].source(), Source::Introducer);
+        // Nothing moves away from fresh: a later gossiped mention does not
+        // relabel it, but is remembered, so connected it may stand for gossip.
+        push_candidates(&mut state, vec![Candidate::new(addr, Source::Gossip)]);
         assert_eq!(state.candidates.len(), 1);
-        assert_eq!(state.candidates[0].source, Source::Introducer);
+        assert_eq!(state.candidates[0].source(), Source::Introducer);
+        assert!(state.candidates[0].sources.named_by(Source::Gossip));
+        assert_eq!(state.candidates[0].sources.iter().collect::<Vec<_>>(), vec![Source::Introducer, Source::Store, Source::Gossip]);
     }
 
     #[test]
@@ -4206,9 +4283,9 @@ mod tests {
         let mut state = LaneState::default();
         let x: SocketAddr = "203.0.113.5:58444".parse().unwrap();
         let y: SocketAddr = "198.51.100.7:58444".parse().unwrap();
-        push_candidates(&mut state, vec![Candidate { addr: x, source: Source::Store, failures: 0 }]);
-        push_candidates(&mut state, vec![Candidate { addr: x, source: Source::Introducer, failures: 0 }, Candidate { addr: y, source: Source::Introducer, failures: 0 }]);
-        let sources: Vec<(SocketAddr, Source)> = state.candidates.iter().map(|c| (c.addr, c.source)).collect();
+        push_candidates(&mut state, vec![Candidate::new(x, Source::Store)]);
+        push_candidates(&mut state, vec![Candidate::new(x, Source::Introducer), Candidate::new(y, Source::Introducer)]);
+        let sources: Vec<(SocketAddr, Source)> = state.candidates.iter().map(|c| (c.addr, c.source())).collect();
         assert_eq!(sources, vec![(x, Source::Store), (y, Source::Introducer)]);
     }
 
@@ -4240,6 +4317,18 @@ mod tests {
         assert_eq!(pick_agreed(&[(Source::Store, g(1)), (Source::Introducer, g(1))], false, false), None);
         // Store + gossip without anything fresh: no.
         assert_eq!(pick_agreed(&[(Source::Store, g(1)), (Source::Gossip, g(2))], false, false), None);
+        // An address two sources named stands for either, once per connection:
+        // introducer peers whose gossip names only one another pair, the one
+        // standing for the introducer first; one connection, one group, or
+        // nothing fresh among the sources, and they do not.
+        let both = |g| (Sources::of(Source::Introducer).with(Source::Gossip), g);
+        let only = |s, g| (Sources::of(s), g);
+        assert_eq!(pick_agreed(&[both(g(1)), both(g(2)), both(g(3))], false, false), Some(vec![0, 1]));
+        assert_eq!(pick_agreed(&[both(g(1)), only(Source::Introducer, g(2))], false, false), Some(vec![1, 0]), "the one gossip named too stands for gossip");
+        assert_eq!(pick_agreed(&[both(g(1)), both(g(1))], false, false), None, "one group");
+        assert_eq!(pick_agreed(&[both(g(1))], false, false), None, "one connection, one vote");
+        assert_eq!(pick_agreed(&[(Sources::of(Source::Store).with(Source::Gossip), g(1)), (Sources::of(Source::Store).with(Source::Gossip), g(2))], false, false), None, "nothing fresh");
+        assert_eq!(pick_agreed(&[(Sources::of(Source::Pin).with(Source::Introducer), g(1)), both(g(2))], true, false), Some(vec![0, 1]), "a pin the introducer names too is the pin");
         // Pinned: the pin plus a public peer from another group; pin-only: the pin alone.
         let peers = [(Source::Gossip, g(1)), (Source::Pin, g(2)), (Source::Store, g(2))];
         assert_eq!(pick_agreed(&peers, true, false), Some(vec![1, 0]));
@@ -4405,20 +4494,20 @@ mod tests {
             let until = Instant::now() + RETRY_AFTER;
             for n in 0..CANDIDATE_CAP {
                 let addr = SocketAddr::from(([10, 0, (n / 256) as u8, (n % 256) as u8], 58444));
-                state.candidates.push_back(Candidate { addr, source: Source::Gossip, failures: 0 });
+                state.candidates.push_back(Candidate::new(addr, Source::Gossip));
                 state.cooling.insert(addr, until);
             }
             let same_group = SocketAddr::from(([10, 0, 1, 1], 58444));
-            push_candidates(&mut state, vec![Candidate { addr: same_group, source: Source::Gossip, failures: 0 }]);
+            push_candidates(&mut state, vec![Candidate::new(same_group, Source::Gossip)]);
             assert!(!state.candidates.iter().any(|c| c.addr == same_group), "nothing queued has failed and the queue holds its group, so nothing makes room");
             let elsewhere = SocketAddr::from(([10, 1, 0, 1], 58444));
-            push_candidates(&mut state, vec![Candidate { addr: elsewhere, source: Source::Gossip, failures: 0 }]);
+            push_candidates(&mut state, vec![Candidate::new(elsewhere, Source::Gossip)]);
             assert_eq!(state.candidates.len(), CANDIDATE_CAP, "the queue stays at its cap");
             assert!(state.candidates.iter().any(|c| c.addr == elsewhere), "a newcomer from another network group takes a redundant address's place");
             for c in state.candidates.iter_mut() {
                 c.failures = 1;
             }
-            push_candidates(&mut state, vec![Candidate { addr: live.addr, source: Source::Gossip, failures: 0 }]);
+            push_candidates(&mut state, vec![Candidate::new(live.addr, Source::Gossip)]);
             assert_eq!(state.candidates.len(), CANDIDATE_CAP, "the queue stays at its cap");
             assert!(state.candidates.iter().any(|c| c.addr == live.addr), "the newcomer took a failed address's place");
         }
