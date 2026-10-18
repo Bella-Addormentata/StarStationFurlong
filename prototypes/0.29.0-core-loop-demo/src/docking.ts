@@ -11,6 +11,7 @@
 
 import * as THREE from "three";
 import { findDoor } from "./doors";
+import { seedWithoutCards } from "./network/roomCap";
 import type { DoorId } from "./doors";
 import {
   physicalDoorPose, portForDoor, poseFromWall,
@@ -1593,7 +1594,9 @@ export class DoorDockingPortSystem {
         }
         if (activeDoorId) this.untouchedPrefills.delete(activeDoorId); // INITIATE = intentional
         if (state && addrInput && pinInput) {
-          state.connectedRoomAddress = addrInput.value.trim();
+          // 🔑 As the doors doc will hold it: the route, never a pass's node
+          // cards (#272 review round 12), so the record read back compares equal.
+          state.connectedRoomAddress = seedWithoutCards(addrInput.value.trim());
           state.pinCode = pinInput.value.trim();
 
           if (!state.connectedRoomAddress) {
@@ -4140,7 +4143,7 @@ export class DoorDockingPortSystem {
   ) {
     const state = this.doorState.get(doorId);
     if (state) {
-      state.connectedRoomAddress = targetAddr;
+      state.connectedRoomAddress = seedWithoutCards(targetAddr);
       state.pairingPending = true;
       // 🚪 A peer's request: only an address, never which of its doors — so it
       // can never prove it is this door's existing connection. completePairing
@@ -4357,7 +4360,7 @@ export class DoorDockingPortSystem {
       sameGeometry
     )
       return;
-    state.connectedRoomAddress = address;
+    state.connectedRoomAddress = seedWithoutCards(address);
     state.segments = geometry?.segments;
     state.farDoor = geometry?.farDoor;
     state.farWall = geometry?.farWall;

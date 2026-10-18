@@ -570,7 +570,7 @@ async fn wallet_view(client: &impl ChainAccess, sk: &chia_bls::SecretKey) -> Res
     let spendable = owned
         .iter()
         .copied()
-        .filter(|c| !crate::chia_publish::WALLET_LEASE.is_pending(&c.coin_id()))
+        .filter(|c| !crate::chia_publish::WALLET_LEASE.is_taken(&c.coin_id()))
         .collect();
     Ok(WalletView { owned, spendable, seen_at, partial: listing.partial })
 }
@@ -727,7 +727,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     let Some(target) = coins
         .iter()
         .filter(|c| c.ready(params, peak))
-        .filter(|c| !crate::chia_publish::WALLET_LEASE.is_pending(&c.coin.coin_id()))
+        .filter(|c| !crate::chia_publish::WALLET_LEASE.is_taken(&c.coin.coin_id()))
         .max_by_key(|c| (c.coin.amount, std::cmp::Reverse(c.confirmed_height)))
     else {
         return Err(anyhow!("no mojo in the dish right now; it refills on the block clock"));

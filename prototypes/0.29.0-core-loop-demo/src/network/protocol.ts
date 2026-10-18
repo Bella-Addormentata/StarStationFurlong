@@ -63,11 +63,28 @@ export interface NetworkStats {
   loss: number;          // 0..1, from the ping/pong probe
 }
 
+/** #231 P6b: a node's CONTACT CARD, signed by the node itself (the same JSON
+ *  the node's `contact` control frame carries): its contact key `ck` (base64),
+ *  under which its per-node presence is filed on the chain, and its long-term
+ *  card key `kxPk` (hex), which knocks to it are sealed to. A member hint may
+ *  carry its node's card so a member can find and knock on another before
+ *  ever meeting it; the node verifies the signature before using any of it. */
+export interface ContactCard {
+  nodeId: string;
+  ck: string;
+  kxPk: string;
+  issuedAt: number;
+  sig: string;
+}
+
 /** Join string / QR payload: URL + certhash(es) + challenge (v006 §12.2). */
 export interface RoomMemberHint {
   irohNodeId: string;
   irohRelayUrls?: string[];
   irohDirectAddrs?: string[];
+  /** #231 P6b: the member node's own contact card, when it shares one in this
+   *  room. Never present in a public room's hints (N8 extends to `ck`). */
+  nodeCard?: ContactCard;
 }
 
 /**

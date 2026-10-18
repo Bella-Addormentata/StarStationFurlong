@@ -262,6 +262,28 @@ pub struct PeerEntry {
     pub last_fail: u64,
     #[serde(default)]
     pub fail_count: u32,
+    /// #231 P6b: unix seconds this peer's key was last filed from a KNOCK it
+    /// sent us (0: never). Counts as contact for pruning and eviction, so a
+    /// first-time knocker whose first holds fail is not forgotten before its
+    /// rendezvous is over (#272 review round 2); not a card, so `card_issued_at`
+    /// stays 0 and a card still takes over the key.
+    #[serde(default)]
+    pub knocked_at: u64,
+    /// #231 P6b (#272 review round 14): the signed `issued_at` of the knock
+    /// whose key is held (0: none). The inbox is read era by era, the current
+    /// first, and a hint's listing runs in the chain's order, not time's, so
+    /// an older knock read after a newer one never puts the knocker's earlier
+    /// key back — and the knock that read first is never read again (the
+    /// book keeps each knock's coin).
+    #[serde(default)]
+    pub knock_issued_at: u64,
+}
+
+impl PeerEntry {
+    /// When this peer was last in contact by any sign: a link, a card, a knock.
+    pub fn last_contact(&self) -> u64 {
+        self.last_ok.max(self.card_issued_at).max(self.knocked_at)
+    }
 }
 
 /// `peers.json`: node id (hex) -> entry.
@@ -310,7 +332,7 @@ impl PeerBook {
             let evict = self
                 .peers
                 .iter()
-                .min_by_key(|(id, e)| (e.last_ok.max(e.card_issued_at), (*id).clone()))
+                .min_by_key(|(id, e)| (e.last_contact(), (*id).clone()))
                 .map(|(id, _)| id.clone());
             if let Some(id) = evict {
                 self.peers.remove(&id);
@@ -335,10 +357,56 @@ impl PeerBook {
         changed
     }
 
+    /// #231 P6b: a knock from `node_id` carried its contact key, signed by the
+    /// knocker itself: filed under `room` so its presence is read by key and
+    /// the dial-back has addresses. A card already held keeps its own key (the
+    /// card also names the kx key; a knock does not), so the knock's key lands
+    /// only where no card has — and only from a knock issued no earlier than
+    /// the one whose key is held (`issued_at`, signed by the knocker; #272
+    /// review round 14), since knocks are read newest era first. The knock
+    /// counts as contact at `now` (`knocked_at`), whichever era it came from.
+    /// Returns true when the book changed.
+    pub fn record_knock(&mut self, node_id: &str, ck: &[u8; 32], room: &str, issued_at: u64, now: u64) -> bool {
+        if !self.peers.contains_key(node_id) && self.peers.len() >= MAX_PEERS {
+            let evict = self
+                .peers
+                .iter()
+                .min_by_key(|(id, e)| (e.last_contact(), (*id).clone()))
+                .map(|(id, _)| id.clone());
+            if let Some(id) = evict {
+                self.peers.remove(&id);
+            }
+        }
+        let entry = self.peers.entry(node_id.to_string()).or_default();
+        let mut changed = !entry.rooms.contains(room) && entry.rooms.len() < MAX_ROOMS_PER_PEER && entry.rooms.insert(room.to_string());
+        if entry.card_issued_at == 0 && issued_at >= entry.knock_issued_at {
+            let ck_s = ck_b64(ck);
+            if entry.ck.as_deref() != Some(ck_s.as_str()) || entry.knock_issued_at != issued_at {
+                entry.ck = Some(ck_s);
+                entry.knock_issued_at = issued_at;
+                changed = true;
+            }
+        }
+        if now > entry.knocked_at {
+            entry.knocked_at = now;
+            changed = true;
+        }
+        changed
+    }
+
     /// The contact key held for a node id, if any.
     pub fn ck_of(&self, node_id: &str) -> Option<[u8; 32]> {
         let ck = self.peers.get(node_id)?.ck.as_deref()?;
         base64::Engine::decode(&base64::prelude::BASE64_STANDARD, ck).ok()?.try_into().ok()
+    }
+
+    /// #231 P6b: the contact key AND the card key held for a node id — what a
+    /// knock to it needs (the hint by the first, the seal to the second).
+    pub fn card_keys_of(&self, node_id: &str) -> Option<([u8; 32], [u8; 32])> {
+        let entry = self.peers.get(node_id)?;
+        let ck = self.ck_of(node_id)?;
+        let kx: [u8; 32] = hex::decode(entry.kx_pk.as_deref()?).ok()?.try_into().ok()?;
+        Some((ck, kx))
     }
 
     /// Every peer with a contact key: (node id, ck, rooms met in).
@@ -364,12 +432,12 @@ impl PeerBook {
     }
 
     /// Forget peers that failed [`PRUNE_FAILED_WINDOWS`] holds in a row with no
-    /// success (and no fresh card) for [`PRUNE_AFTER_SECS`]. Returns how many.
+    /// contact of any kind — a link, a fresh card, a knock — for
+    /// [`PRUNE_AFTER_SECS`]. Returns how many.
     pub fn prune(&mut self, now: u64) -> usize {
         let before = self.peers.len();
         self.peers.retain(|_, e| {
-            let newest = e.last_ok.max(e.card_issued_at);
-            !(e.fail_count >= PRUNE_FAILED_WINDOWS && now.saturating_sub(newest) >= PRUNE_AFTER_SECS)
+            !(e.fail_count >= PRUNE_FAILED_WINDOWS && now.saturating_sub(e.last_contact()) >= PRUNE_AFTER_SECS)
         });
         before - self.peers.len()
     }
@@ -652,6 +720,93 @@ mod tests {
         let rooms = &book.peers[&node].rooms;
         assert_eq!(rooms.len(), MAX_ROOMS_PER_PEER, "the set stays at its cap");
         assert!(rooms.contains("room-0") && !rooms.contains("room-overflow"));
+    }
+
+    #[test]
+    fn a_knock_files_the_knocker_key_only_where_no_card_has() {
+        let now = 1_791_700_000u64;
+        let mut book = PeerBook::default();
+        assert!(book.record_knock("j", &[5u8; 32], "r", now - 10, now));
+        assert_eq!(book.ck_of("j"), Some([5u8; 32]));
+        assert!(book.peers["j"].kx_pk.is_none(), "a knock names no card key");
+        assert_eq!(book.peers["j"].card_issued_at, 0, "a knock is not a card");
+        assert_eq!(book.peers["j"].knocked_at, now);
+        assert!(book.peers["j"].rooms.contains("r"));
+        assert!(!book.record_knock("j", &[5u8; 32], "r", now - 10, now), "nothing new");
+        assert!(book.record_knock("j", &[5u8; 32], "r", now - 10, now + 1), "a later knock is contact");
+        assert!(book.record_knock("j", &[6u8; 32], "s", now - 5, now + 1), "a new key or a new room changes the book");
+        assert_eq!(book.ck_of("j"), Some([6u8; 32]), "no card yet: the knock's key stands");
+        let sk = iroh::SecretKey::generate();
+        let card = verify_card(&make_card(&sk, &[7u8; 32], 100), 100).unwrap();
+        let node = sk.public().to_string();
+        book.record_card(&card, "r");
+        assert!(book.record_knock(&node, &[8u8; 32], "r", now - 10, now), "a card already held keeps its key; the knock still counts as contact");
+        assert_eq!(book.ck_of(&node), Some([7u8; 32]));
+        assert!(!book.record_knock(&node, &[8u8; 32], "r", now - 10, now), "nothing new");
+        assert_eq!(book.with_ck().len(), 2, "both are read by key");
+        assert_eq!(book.card_keys_of(&node), Some(([7u8; 32], card.kx_pk)), "a card gives both keys a knock needs");
+        assert_eq!(book.card_keys_of("j"), None, "a knock's key alone cannot be knocked back to");
+    }
+
+    #[test]
+    fn an_older_knock_read_after_a_newer_one_never_puts_the_earlier_key_back() {
+        let now = 1_791_700_000u64;
+        // The current era's hint is read first: the knock issued at 200 carries
+        // the knocker's rotated key; the era before, read next, holds the knock
+        // issued at 100 with the key it replaced. Both are filed at the same
+        // observation time.
+        let mut book = PeerBook::default();
+        assert!(book.record_knock("j", &[2u8; 32], "r", 200, now));
+        assert!(!book.record_knock("j", &[1u8; 32], "r", 100, now), "an older knock, same room, same time: nothing changes");
+        assert_eq!(book.ck_of("j"), Some([2u8; 32]), "the newer knock's key stands");
+        assert_eq!(book.peers["j"].knock_issued_at, 200);
+        assert_eq!(book.peers["j"].knocked_at, now);
+        // The older knock still counts as contact and names its room.
+        assert!(book.record_knock("j", &[1u8; 32], "s", 100, now + 1), "a new room, a later observation: contact");
+        assert_eq!(book.ck_of("j"), Some([2u8; 32]), "...but not the key");
+        assert!(book.peers["j"].rooms.contains("s"));
+        // Read the other way round, the same book results.
+        let mut other = PeerBook::default();
+        assert!(other.record_knock("j", &[1u8; 32], "r", 100, now));
+        assert!(other.record_knock("j", &[2u8; 32], "r", 200, now));
+        assert_eq!(other.ck_of("j"), Some([2u8; 32]));
+        assert_eq!(other.peers["j"].knock_issued_at, 200);
+        // A knock issued at the same second with another key replaces, as a card of the same time does.
+        assert!(other.record_knock("j", &[3u8; 32], "r", 200, now));
+        assert_eq!(other.ck_of("j"), Some([3u8; 32]));
+        // An entry an older node wrote has no knock time: the next knock's key lands.
+        let old: PeerEntry = serde_json::from_str(r#"{"ck":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","knocked_at":5}"#).unwrap();
+        assert_eq!(old.knock_issued_at, 0);
+        book.peers.insert("k".into(), old);
+        assert!(book.record_knock("k", &[9u8; 32], "r", 100, now));
+        assert_eq!(book.ck_of("k"), Some([9u8; 32]));
+    }
+
+    #[test]
+    fn a_fresh_knocker_survives_three_failed_holds() {
+        // #272 review round 2: a first-time knocker has no link and no card,
+        // so with the knock not counted it read as a week stale at once.
+        let now = 1_791_700_000u64;
+        let mut book = PeerBook::default();
+        book.record_knock("j", &[5u8; 32], "r", now - 10, now);
+        book.note_fail("j", now + 1);
+        book.note_fail("j", now + 2);
+        book.note_fail("j", now + 3);
+        assert_eq!(book.peers["j"].fail_count, PRUNE_FAILED_WINDOWS);
+        assert_eq!(book.prune(now + 4), 0, "three failed holds right after the knock: kept");
+        assert_eq!(book.prune(now + PRUNE_AFTER_SECS - 1), 0);
+        assert_eq!(book.prune(now + PRUNE_AFTER_SECS), 1, "a week with no success and no newer knock: gone");
+        // The knock counts for eviction order too: the knocker is not the first out.
+        let mut book = PeerBook::default();
+        for i in 0..MAX_PEERS - 1 {
+            let sk = iroh::SecretKey::generate();
+            book.record_card(&verify_card(&make_card(&sk, &[7u8; 32], now - 10_000 + i as u64), now).unwrap(), "r");
+        }
+        book.record_knock("j", &[5u8; 32], "r", now - 10, now);
+        let sk = iroh::SecretKey::generate();
+        book.record_card(&verify_card(&make_card(&sk, &[7u8; 32], now), now).unwrap(), "r");
+        assert_eq!(book.peers.len(), MAX_PEERS);
+        assert!(book.peers.contains_key("j"), "the fresh knocker stays; the oldest card went");
     }
 
     #[test]

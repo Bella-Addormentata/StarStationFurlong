@@ -15,7 +15,27 @@ import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
-import { roomIsPublicSpace } from "./network/roomCap.ts";
+import {
+  acceptNodeCard,
+  bridgeMemberHints,
+  cardsForPass,
+  collectMemberHints,
+  mergeMemberHints,
+  nodeSharesCard,
+  normalizeMemberHint,
+  normalizeStringArray,
+  passageReading,
+  readChiaMode,
+  readNodeCard,
+  readShareCard,
+  roomIsPublicSpace,
+  roomPostureProbe,
+  routeHint,
+  setChiaMode,
+  setShareCard,
+  type PostureSources,
+  writeNodeCard,
+} from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
 import {
   packTick,
@@ -27,6 +47,7 @@ import {
   ADDRESSED_TICK_BYTES,
   TICK_BYTES,
   type MovementTick,
+  type ContactCard as NodeContactCard,
   type RoomBootstrap,
   type RoomMemberHint,
 } from "./network/protocol";
@@ -600,6 +621,13 @@ const networkProvider = new NetworkProvider();
  *  bound, or null between a leave and the next join's binds (see the N8 probe
  *  below: until this names a room, that room's passage is unknown → PUBLIC). */
 let doorDocsBoundFor: string | null = null;
+/** 🛰️ Did this join seed the room's replica from a copy this install kept that
+ *  HELD the room's state (a cached snapshot taken while synced, or a warm
+ *  neighbour's synced replica)? Then its door documents describe the room as
+ *  last seen, and the posture probe may read them before the host's state
+ *  arrives (#272 review round 4). A cached copy of a visit the host never
+ *  answered does not count (round 5). Reset with `doorDocsBoundFor`. */
+let roomReplicaSeeded = false;
 
 function roomPassageIsPublic(): boolean {
   const ids = [...readAllDoorLayout().keys()];
@@ -610,24 +638,41 @@ function roomPassageIsPublic(): boolean {
 // ⛓️ N8 (#231): the node learns from us whether a room is PUBLIC SPACE — the
 // bundled welcome room, or a room anyone may walk into — and never publishes
 // an address under such a room's key (anyone can derive its hint). Until the
-// probe answers the node assumes public, so a wrong answer can only withhold
-// a publish. The door docs the probe reads are globally bound and re-bound per
-// join, and the first cap of a join goes out at connect, BEFORE the new room's
-// docs are bound: so the probe only reads them once `doorDocsBoundFor` names
-// this exact room (set right before the last of the two binds), and says
-// PUBLIC until then — never the previous room's doors for the new room.
+// probe can answer, the cap says UNKNOWN (null on the wire): the node then
+// publishes nothing under the key, as for PUBLIC, but may use the cards a
+// private pass brought — file them, knock on the host — so a first visit whose
+// every live route fails still finds the host (#272 review round 3); a pass
+// MINTED before the answer still carries no card (`roomIsPublicSpaceNow`).
+// The door docs the probe reads are globally bound and re-bound per join, and
+// the first cap of a join goes out at connect, BEFORE the new room's docs are
+// bound: so the probe only reads them once `doorDocsBoundFor` names this exact
+// room (set right before the last of the two binds), and says UNKNOWN until
+// then — never the previous room's doors for the new room. Nor the EMPTY
+// replica of an uncached first visit (#272 review round 4): until the host's
+// state lands its defaults read public, which is no reading, so the probe also
+// waits for usable state (`stateUsable`: synced, or seeded from a replica this
+// install kept) and the cap is re-sent when the state arrives.
 // Re-stamped on every door-policy change AND every door-layout change (a door
 // fitted with no policy record of its own takes the default, which is public,
 // so a new door alone can open the room), and on every room bind, which
 // notifies both; so a room flipping public/private reaches the node live
 // whichever record flipped it. Each cap carries a sequence number, so one that
 // left earlier but lands later cannot overwrite the current posture.
-networkProvider.setPublicRoomProbe((roomId) =>
-  roomIsPublicSpace(
-    roomId === DEFAULT_STATION.welcomeRoomId,
-    doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
-  ),
-);
+/** N8: is `roomId` public space as far as this session can tell right now?
+ *  The cap's probe, and (#231 P6b) the pass minter's reason to carry no card. */
+const postureSources: PostureSources = {
+  bundled: (roomId) => roomId === DEFAULT_STATION.welcomeRoomId,
+  docsBoundFor: () => doorDocsBoundFor,
+  stateUsable: () => roomReplicaSeeded || roomStateArrivedNow(),
+  passagePublic: roomPassageIsPublic,
+};
+function roomIsPublicSpaceNow(roomId: string): boolean {
+  return roomIsPublicSpace(postureSources.bundled(roomId), passageReading(postureSources, roomId));
+}
+/** The cap's posture for `roomId`: public, private, or not known yet
+ *  (#272 review round 3) — see `roomPosture`. */
+const roomPostureNow = roomPostureProbe(postureSources);
+networkProvider.setPublicRoomProbe(roomPostureNow);
 subscribeDoorPolicy(() => {
   void networkProvider.refreshRoomCap();
   refreshWarmNeighbours(); // 🚪🔥 a door made public or private
@@ -864,99 +909,28 @@ function getOrCreateRoomKeyB64(roomId: string): string {
   }
 }
 
-function normalizeStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter(
-    (entry): entry is string => typeof entry === "string" && entry.length > 0,
-  );
-}
-
-function normalizeMemberHint(value: unknown): RoomMemberHint | null {
-  if (!value || typeof value !== "object") return null;
-  const entry = value as Record<string, unknown>;
-  if (typeof entry.irohNodeId !== "string" || entry.irohNodeId.length === 0) {
-    return null;
-  }
-  const relayHints = normalizeStringArray(entry.irohRelayUrls);
-  const directHints = normalizeStringArray(entry.irohDirectAddrs);
-  return {
-    irohNodeId: entry.irohNodeId,
-    irohRelayUrls: relayHints.length ? relayHints : undefined,
-    irohDirectAddrs: directHints.length ? directHints : undefined,
-  };
-}
-
-function collectMemberHints(
-  boot: RoomBootstrap | null | undefined,
-): RoomMemberHint[] {
-  if (!boot) return [];
-  const hints: RoomMemberHint[] = [];
-
-  if (Array.isArray(boot.memberHints)) {
-    for (const hint of boot.memberHints) {
-      const normalized = normalizeMemberHint(hint);
-      if (normalized) {
-        hints.push(normalized);
-      }
-    }
-  }
-
-  if (boot.irohNodeId) {
-    hints.push({
-      irohNodeId: boot.irohNodeId,
-      irohRelayUrls: boot.irohRelayUrls ?? boot.relays,
-      irohDirectAddrs: boot.irohDirectAddrs,
-    });
-  }
-
-  return hints;
-}
-
-function mergeMemberHints(...hintLists: RoomMemberHint[][]): RoomMemberHint[] {
-  const merged = new Map<string, RoomMemberHint>();
-  for (const list of hintLists) {
-    for (const hint of list) {
-      const existing = merged.get(hint.irohNodeId);
-      if (!existing) {
-        merged.set(hint.irohNodeId, {
-          irohNodeId: hint.irohNodeId,
-          irohRelayUrls: hint.irohRelayUrls
-            ? [...hint.irohRelayUrls]
-            : undefined,
-          irohDirectAddrs: hint.irohDirectAddrs
-            ? [...hint.irohDirectAddrs]
-            : undefined,
-        });
-        continue;
-      }
-
-      const relays = new Set([
-        ...(existing.irohRelayUrls ?? []),
-        ...(hint.irohRelayUrls ?? []),
-      ]);
-      const addrs = new Set([
-        ...(existing.irohDirectAddrs ?? []),
-        ...(hint.irohDirectAddrs ?? []),
-      ]);
-      existing.irohRelayUrls = relays.size ? Array.from(relays) : undefined;
-      existing.irohDirectAddrs = addrs.size ? Array.from(addrs) : undefined;
-    }
-  }
-  return Array.from(merged.values());
-}
-
 function getLocalNodeHint(
   fingerprint: LocalFingerprint,
 ): RoomMemberHint | null {
   if (!fingerprint.iroh_node_id) return null;
   const relayHints = normalizeStringArray(fingerprint.iroh_relay_urls);
   const directHints = normalizeStringArray(fingerprint.iroh_direct_addrs);
+  // #231 P6b: our node's own card, once it handed us one over the `card`
+  // lane — only when it is THIS node's (a reinstalled node has a new id), and
+  // only while the node still hands it out: the card is cached here, so a
+  // node restarted with sharing off says so in its fingerprint (#272 review
+  // round 3).
+  const card = localNodeCard ?? readNodeCard();
   return {
     irohNodeId: fingerprint.iroh_node_id,
     irohRelayUrls: relayHints.length ? relayHints : undefined,
     irohDirectAddrs: directHints.length ? directHints : undefined,
+    nodeCard: card && card.nodeId === fingerprint.iroh_node_id && nodeSharesCard(fingerprint) ? card : undefined,
   };
 }
+
+/** #231 P6b: the local node's contact card as last received this session. */
+let localNodeCard: NodeContactCard | null = null;
 
 // ── Network status rows (network details panel) ──────────────────────────────
 function setNetworkRow(id: string, value: string, color?: string): void {
@@ -1845,8 +1819,10 @@ async function joinRoomAtEpoch(
   remoteLastSeen.clear();
   world.clearRemotePlayers();
   // ⛓️ N8: the door docs about to be bound are not this room's yet — the cap
-  // sent at connect must say PUBLIC until both are (see the probe's comment).
+  // sent at connect must say UNKNOWN until both are, and the room's state is
+  // usable (see the probe's comment).
   doorDocsBoundFor = null;
+  roomReplicaSeeded = false;
   // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
   // world.ts activeRoomId). Published BEFORE the connect await (the id is
   // known synchronously) so a trunk opened during the connect window keys
@@ -1955,7 +1931,14 @@ async function joinRoomAtEpoch(
   // and an owned room's cached `owner` suppresses the claimRoomDefaults
   // rename-revert race. CRDT idempotence makes any interleaving safe; a corrupt
   // blob is discarded inside restoreRoomSnapshot (degrades to today's no-cache).
-  const restoredFromCache = await restoreRoomSnapshot(sync.doc, boot.roomId);
+  const restored = await restoreRoomSnapshot(sync.doc, boot.roomId);
+  const restoredFromCache = restored !== null;
+  // ⛓️ A kept copy is usable room state for the posture probe (#272 review
+  // round 4) only if it HELD the host's state when it was taken (round 5): the
+  // writer snapshots a visit the host never answered too (our own presence in
+  // an otherwise empty room), and that copy's doors are the defaults, which
+  // read PUBLIC. For THIS join only: a superseding join reset the flag already.
+  if (restored?.synced && epoch === sessionEpoch) roomReplicaSeeded = true;
   if (epoch !== sessionEpoch) {
     // Superseded during the cache read — same unwind as the post-start guard.
     const docWasDestroyed =
@@ -1979,6 +1962,7 @@ async function joinRoomAtEpoch(
   // arrival gate opens at once and the host ships only what changed since.
   if (neighbourWarmer.seedDoc(sync.doc, boot.roomId)) {
     console.log(`🚪🔥 joined ${boot.roomId} from its warm replica`);
+    roomReplicaSeeded = true;
   }
   await sync.start();
   if (epoch !== sessionEpoch) {
@@ -2019,10 +2003,19 @@ async function joinRoomAtEpoch(
   // and finally in leaveRoom, synchronously before the doc is destroyed).
   // `owned` is sampled at write time — ownership can resolve after join.
   roomCacheHandle?.detach(); // stale handle from a superseded session, if any
-  roomCacheHandle = attachRoomCache(sync.doc, boot.roomId, () =>
-    isLocalPlayerRoomOwner(
-      (sync.doc.getMap("roomInfo").get("owner") as string) || "",
-    ),
+  // 💾 Each snapshot records whether the replica HELD the host's state when it
+  // was taken (#272 review round 5): seeded from a copy that did, or the state
+  // arrived this session (`routeRoomReady`). A visit the host never answered is
+  // cached for the next join's state vector, but not believed.
+  const seededUsable = roomReplicaSeeded;
+  roomCacheHandle = attachRoomCache(
+    sync.doc,
+    boot.roomId,
+    () =>
+      isLocalPlayerRoomOwner(
+        (sync.doc.getMap("roomInfo").get("owner") as string) || "",
+      ),
+    () => seededUsable || routeRoomReady(sync, roomHostedHere(boot.roomId)),
   );
   {
     const cacheEpoch = epoch;
@@ -2047,6 +2040,24 @@ async function joinRoomAtEpoch(
       // drops peer-sent ones, but an older node forwards them), so it is
       // ignored here: nothing a room peer sends may set the dish's address.
       if (env.kind === "faucet") return;
+      // #231 P6b: the LOCAL node's own contact card (node-local lane: a P6b
+      // node drops peer-sent ones, an older node forwards them, so the card
+      // counts only with a valid signature by the node we are connected to —
+      // #272 review round 15, `acceptNodeCard`). Kept for the passes minted
+      // from here on.
+      if (env.kind === "card" && typeof env.payload === "string") {
+        try {
+          const held = localNodeCard ?? readNodeCard();
+          const kept = acceptNodeCard(held, JSON.parse(atob(env.payload)), localFingerprint?.iroh_node_id);
+          if (kept && kept !== held) {
+            localNodeCard = kept;
+            writeNodeCard(kept);
+          }
+        } catch {
+          /* malformed card: ignored */
+        }
+        return;
+      }
       if (env.kind === "bridge" && typeof env.payload === "string") {
         try {
           const status = JSON.parse(atob(env.payload)) as {
@@ -2270,9 +2281,14 @@ async function joinRoomAtEpoch(
   // 🚪🔥 …and once the live state has truly arrived: a warm or cached join can
   // pass the arrival gate on owner+name before roomStateArrivedNow holds, and
   // a sync that changes no door would never notify the door listeners.
+  // ⛓️ The room cap likewise (#272 review round 4): its posture probe says
+  // UNKNOWN until the room's state is usable, so the reading the state now
+  // allows goes to the node here, door change or none.
   for (const synced of [sync.whenServerSynced, sync.whenLinkedSynced]) {
     void synced.then(() => {
-      if (epoch === sessionEpoch && yjsSync === sync) refreshWarmNeighbours();
+      if (epoch !== sessionEpoch || yjsSync !== sync) return;
+      refreshWarmNeighbours();
+      void networkProvider.refreshRoomCap();
     });
   }
   void awaitInitialRoomState(SYNC_GATE_MS).then(() => {
@@ -2359,10 +2375,16 @@ async function joinRoomAtEpoch(
     });
     // Contacts (keyed identity §8): our card embeds our node reachability (the
     // same local hint passes carry) so a friend can dial us for a DM / mesh link.
+    // #231 P6b: the ROUTE alone, never our node's contact card (#272 review
+    // round 7): a personal card goes wherever the player pastes it and, with
+    // consent, on through friend-of-friend introductions, outside any room;
+    // our card rides only in a private room's pass, by that room's switch.
     initContacts({
       myName: () => getPlayerName(),
-      myHints: () =>
-        localFingerprint ? getLocalNodeHint(localFingerprint) : null,
+      myHints: () => {
+        const hint = localFingerprint ? getLocalNodeHint(localFingerprint) : null;
+        return hint ? routeHint(hint) : null;
+      },
     });
     initDirectMessages({
       resolve: resolveBridgeBootstrap,
@@ -3328,6 +3350,7 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // ⛓️ N8: likewise, the public-room probe must not read this room's doors for
   // whatever room is joined next.
   doorDocsBoundFor = null;
+  roomReplicaSeeded = false;
   // We are now roomless (issue #60 review): clear the active-pass room so a
   // swap that leaves but never re-joins (stranded) can't wedge a pass showing
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the
@@ -6422,7 +6445,10 @@ async function withBackgroundRoom<T>(
       bootRecord: () => provider!.getBootRecord(),
     });
     // NOTE: no restoreRoomSnapshot — the owner-match must see network truth.
-    cache = attachRoomCache(sync.doc, boot.roomId, () => true);
+    // The node hosts the maker's module, so its first answer is the room's
+    // state (`routeRoomReady` with hostedHere).
+    const maker = sync;
+    cache = attachRoomCache(sync.doc, boot.roomId, () => true, () => routeRoomReady(maker, true));
     await sync.start();
     // Converge with the node (which hosts the maker's module), then ALWAYS
     // pull once more and wait — the first SyncStep2 can reflect a partially
@@ -8554,7 +8580,17 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   const roomId = activeBootstrap?.roomId ?? getDefaultRoomId();
   const roomKeyB64 =
     activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
-  const localHint = getLocalNodeHint(fingerprint);
+  const rawLocalHint = getLocalNodeHint(fingerprint);
+  // #231 P6b: no card in a public room's hints (N8 extends to `ck`), and none
+  // of ours while this room's Share Card switch is off (#272 review).
+  const localHint = rawLocalHint
+    ? cardsForPass(
+        [rawLocalHint],
+        roomIsPublicSpaceNow(roomId),
+        readShareCard(roomId) && nodeSharesCard(fingerprint),
+        fingerprint.iroh_node_id,
+      )[0]
+    : rawLocalHint;
   return {
     v: 2,
     roomId,
@@ -8584,9 +8620,22 @@ function buildOutgoingBootstrap(
     : (activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId));
 
   const localHint = getLocalNodeHint(fingerprint);
-  const mergedHints = mergeMemberHints(
+  const allHints = mergeMemberHints(
     localHint ? [localHint] : [],
     collectMemberHints(activeBootstrap),
+  );
+  // #231 P6b: a pass to a PUBLIC room (the welcome room, or one anyone may
+  // walk into) carries no contact card — N8 extends to `ck`; a private room's
+  // pass carries every member card known, so a member who cannot reach
+  // another can still find and knock on it by key — ours among them only
+  // while this room's Share Card switch is on: the switch is per room, the
+  // cached card is not, so a card received elsewhere, or before the switch
+  // went off, must not ride out of this room (#272 review).
+  const mergedHints = cardsForPass(
+    allHints,
+    roomIsPublicSpaceNow(roomId),
+    readShareCard(roomId) && nodeSharesCard(fingerprint),
+    fingerprint.iroh_node_id,
   );
   const primaryHint = localHint ?? mergedHints[0];
 
@@ -8783,10 +8832,10 @@ async function resolveBridgeBootstrap(
 
   const roomId = imported.roomId || localBoot.roomId || getDefaultRoomId();
   const importedHints = collectMemberHints(imported);
-  const mergedHints = mergeMemberHints(
-    importedHints,
-    collectMemberHints(localBoot),
-  );
+  // #231 P6b (#272 review round 14): our node joins the pass's hints as a
+  // ROUTE, never with our card — the pass is the destination room's word on
+  // cards (`bridgeMemberHints`).
+  const mergedHints = bridgeMemberHints(imported, localBoot);
   const remoteHint = importedHints[0];
 
   return {
@@ -8819,16 +8868,25 @@ function refreshChiaModeToggle() {
   const state = document.getElementById("chia-mode-state");
   if (!toggle) return;
   const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
-  let on = false;
-  if (roomId) {
-    try {
-      on = localStorage.getItem(`ssf-chia-mode-${roomId}`) === "1";
-    } catch {
-      /* privacy mode */
-    }
-  }
+  const on = roomId ? readChiaMode(roomId) : false;
   toggle.checked = on;
   toggle.disabled = !roomId; // no room context yet -> nothing to toggle
+  if (state) state.textContent = on ? "ON" : "OFF";
+  refreshShareCardToggle(roomId);
+}
+
+// #231 P6b: the per-room "share my card in this room" switch beside it. On by
+// default; the flag is per-room in localStorage (`ssf-chia-share-card-<roomId>`)
+// and rides the room cap, where the node honours it for cards and its inbox.
+function refreshShareCardToggle(roomId: string | undefined) {
+  const toggle = document.getElementById(
+    "share-card-toggle",
+  ) as HTMLInputElement | null;
+  const state = document.getElementById("share-card-state");
+  if (!toggle) return;
+  const on = roomId ? readShareCard(roomId) : true;
+  toggle.checked = on;
+  toggle.disabled = !roomId;
   if (state) state.textContent = on ? "ON" : "OFF";
 }
 
@@ -8965,13 +9023,10 @@ function setupNetworkDetailsPanel() {
       const on = chiaToggle.checked;
       const state = document.getElementById("chia-mode-state");
       if (state) state.textContent = on ? "ON" : "OFF";
-      if (roomId) {
-        try {
-          localStorage.setItem(`ssf-chia-mode-${roomId}`, on ? "1" : "0");
-        } catch {
-          /* privacy mode */
-        }
-      }
+      // Recorded for this session first, persisted on top (#272 review round
+      // 6): a refused write must not leave the switch saying one thing and
+      // every reader (the cap's refreshes) the other.
+      if (roomId) setChiaMode(roomId, on);
       // Apply live — re-send this room's cap to the local node with the new flag.
       void networkProvider.resendRoomCap(on);
       if (feedback) {
@@ -8984,6 +9039,38 @@ function setupNetworkDetailsPanel() {
       }
     });
     refreshChiaModeToggle();
+  }
+
+  // #231 P6b: the "share my card in this room" switch — writes the per-room
+  // flag and re-sends the cap so the node honours it live.
+  const shareToggle = document.getElementById(
+    "share-card-toggle",
+  ) as HTMLInputElement | null;
+  if (shareToggle) {
+    shareToggle.addEventListener("change", () => {
+      const roomId = (window as unknown as { __ssfRoomId?: string })
+        .__ssfRoomId;
+      const on = shareToggle.checked;
+      const state = document.getElementById("share-card-state");
+      if (state) state.textContent = on ? "ON" : "OFF";
+      // Recorded for this session first, persisted on top (#272 review round
+      // 6): a browser that refuses the write (privacy mode, quota) must not
+      // leave the switch saying OFF while the cap and the pass builders keep
+      // reading the stored ON and the node keeps handing our card out.
+      if (roomId) setShareCard(roomId, on);
+      void networkProvider.refreshRoomCap();
+      if (feedback) {
+        feedback.textContent = on
+          ? "Contact card shared in this room: its members can find this station by key and knock when every live route fails (private rooms only; public rooms never carry cards)."
+          : "Contact card not shared in this room: members get no key for this station, and the node reads no knocks for it.";
+        setTimeout(() => {
+          if (feedback) feedback.textContent = "";
+        }, 5000);
+      }
+    });
+    refreshShareCardToggle(
+      (window as unknown as { __ssfRoomId?: string }).__ssfRoomId,
+    );
   }
 
   // ?seed= deep-link import (unchanged bootstrap path — only the input it

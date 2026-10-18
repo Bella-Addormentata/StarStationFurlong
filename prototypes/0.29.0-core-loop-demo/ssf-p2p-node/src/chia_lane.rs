@@ -206,9 +206,9 @@ pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String]) {
 // holds), and the sealed blob binds kind ‖ era as associated data. Nothing on
 // chain is keyed by a room.
 //
-// Three kinds share the header; this file ships the presence codec. The knock
-// (joiner → host inbox, sealed to the host's `kx_pk`) and the opt-in beacon
-// (D7) land with P6b, which also carries the cards in passes.
+// Three kinds share the header. The presence codec is P6a's; the knock (joiner
+// → host inbox, sealed to the host's card key) and the opt-in beacon (D7) are
+// P6b's, further down in this file.
 
 /// Blocks per era: seven days at testnet11's ~18.75 s block time.
 pub const ERA_BLOCKS: u32 = 32_256;
@@ -218,9 +218,7 @@ pub const ERA_SECS: u64 = 7 * 24 * 3600;
 /// Record kinds, signed into the header. Knock and beacon are P6b's; their
 /// values are fixed here so no later record can collide with presence.
 pub const KIND_PRESENCE: u8 = 1;
-#[allow(dead_code)]
 pub const KIND_KNOCK: u8 = 2;
-#[allow(dead_code)]
 pub const KIND_BEACON: u8 = 3;
 /// The fixed plaintext size of every v2 record.
 pub const RECORD_V2_LEN: usize = 320;
@@ -273,6 +271,25 @@ fn v2_aad(kind: u8, era: u64) -> Vec<u8> {
     aad.extend_from_slice(V2_AAD_PREFIX);
     aad.push(kind);
     aad.extend_from_slice(&era.to_le_bytes());
+    aad
+}
+
+/// The associated data of a blob sealed to a key: kind ‖ era, then the PARENT
+/// of the coin that carries it — the writer's input coin, known before the
+/// spend is built. A blob copied under another coin (anyone who saw it on
+/// chain can re-issue the same hint and memo) has another parent and does not
+/// open, so a knock cannot be replayed into a second clock or a second inbox
+/// entry (#272 review round 3). And `lane`, the room's SECRET lane token
+/// ([`derive_lane_token`], from the room key): the hint is public on chain and
+/// the host's card key rides in every room's pass, so without it anyone holding
+/// the host's card from another room could seal fresh knocks of its own under
+/// an observed hint; with it a knock opens only for a writer who held the room
+/// key (#272 review round 5).
+#[cfg(feature = "chia-read")]
+fn kx_aad(kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32]) -> Vec<u8> {
+    let mut aad = v2_aad(kind, era);
+    aad.extend_from_slice(carrier_parent);
+    aad.extend_from_slice(lane);
     aad
 }
 
@@ -454,6 +471,439 @@ pub fn decode_presence_v2(bytes: &[u8], expected_era: u64) -> Result<PresenceV2>
         expires_at: u64::from_le_bytes(bytes[OFF_EXPIRES_AT..OFF_EXPIRES_AT + 8].try_into().unwrap()),
         addrs,
     })
+}
+
+// ── #231 P6b: the knock (kind 2) and the beacon (kind 3) ────────────────────
+//
+// KNOCK — a joiner J that exhausted every dial to a host H whose contact card
+// it holds writes ONE record into H's inbox: filed under
+// `blake3("ssf-chia-inbox-hint-v1", ck_H ‖ lane ‖ era)`, where the LANE is
+// derived from the room key J and H share ([`derive_lane_token`]), so a knock
+// takes both H's card and membership of one of H's rooms; a leaked pass floods
+// that one lane, and H keeps reading its other rooms' lanes (the third
+// follow-up on #231 wrote "per issued pass"; P6b makes it per room, which needs
+// no change to the card). The plaintext is SIGNED by J and then SEALED to H's
+// long-term card key `kx_pk` ([`seal_to_kx`]): every holder of `ck_H` can find
+// the hint, only H can read who knocked and for which rooms. Room ids ride
+// inside the ciphertext as 16-byte lane ids ([`room_lane_id`]), never in the
+// hint — nothing on chain is keyed by a room. J's own contact key rides along
+// (the slot presence uses for `kx_pk`) when J is findable, so H can dial J by
+// its presence; zeros otherwise, and H dials by node id alone.
+//
+// Both sides then rendezvous on the knock's CONFIRMATION HEIGHT, the one
+// clock they share without talking (`chia_knock::rendezvous_due`).
+//
+// BEACON — an opt-in public entry point (D7) writes one record per era, in
+// the CLEAR, under `blake3("ssf-chia-beacon-hint-v1", era)`: its node id and
+// nothing else (no address, no key), while its own inbound bit is set. A
+// newcomer with nobody to dial reads the newest beacons and dials them by node
+// id for the welcome room. Beacons spend from a wallet key of their own, so a
+// clear node id never shares coin lineage with a sealed record.
+
+const CTX_INBOX_LANE: &str = "ssf-chia-inbox-lane-v1";
+const CTX_INBOX_HINT: &str = "ssf-chia-inbox-hint-v1";
+const CTX_BEACON_HINT: &str = "ssf-chia-beacon-hint-v1";
+const CTX_KNOCK_ROOM: &str = "ssf-chia-knock-room-v1";
+#[cfg(feature = "chia-read")] // the X25519 seal needs the curve the read build brings
+const CTX_KNOCK_SEAL: &str = "ssf-chia-knock-seal-v1";
+/// Rooms one knock may name (the address slots of the shared layout).
+pub const MAX_KNOCK_ROOMS: usize = MAX_V2_ADDRS;
+/// A room's lane id inside a knock: the first bytes of a keyed hash of its id.
+pub const ROOM_LANE_ID_LEN: usize = 16;
+
+/// The inbox lane of a room: what a knocker needs besides the host's card.
+pub fn derive_lane_token(room_key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(CTX_INBOX_LANE, room_key)
+}
+
+/// A host's inbox hint for one lane in one era.
+pub fn derive_inbox_hint(ck_host: &[u8; 32], lane: &[u8; 32], era: u64) -> [u8; 32] {
+    let mut material = [0u8; 72];
+    material[..32].copy_from_slice(ck_host);
+    material[32..64].copy_from_slice(lane);
+    material[64..].copy_from_slice(&era.to_le_bytes());
+    blake3::derive_key(CTX_INBOX_HINT, &material)
+}
+
+/// The public beacon hint of an era: derivable by anyone, so it is only ever
+/// read additively behind a pass's own hints.
+pub fn derive_beacon_hint(era: u64) -> [u8; 32] {
+    blake3::derive_key(CTX_BEACON_HINT, &era.to_le_bytes())
+}
+
+/// How a knock names a room without writing its id: a keyed hash, truncated.
+/// The host compares against the rooms it holds; nobody else learns anything.
+pub fn room_lane_id(room_id: &str) -> [u8; ROOM_LANE_ID_LEN] {
+    let full = blake3::derive_key(CTX_KNOCK_ROOM, room_id.as_bytes());
+    full[..ROOM_LANE_ID_LEN].try_into().unwrap()
+}
+
+/// The knock (kind 2): who knocked, in which era, for which of the host's
+/// rooms, with the knocker's own contact key when it is findable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnockV2 {
+    pub era: u64,
+    pub from: iroh::PublicKey,
+    /// The knocker's contact key, so the host can read its presence and dial
+    /// it there; `None` when the knocker is not findable (the host dials by
+    /// node id alone).
+    pub ck_from: Option<[u8; 32]>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    /// Lane ids of the rooms the knocker wants in, at most [`MAX_KNOCK_ROOMS`].
+    pub rooms: Vec<[u8; ROOM_LANE_ID_LEN]>,
+}
+
+/// The beacon (kind 3): a node id in the clear, nothing else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeaconV2 {
+    pub era: u64,
+    pub node_id: iroh::PublicKey,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
+/// The shared v2 header: version, kind, era, signer, the 32-byte key slot and
+/// the two times, written into a zeroed buffer.
+fn write_v2_header(buf: &mut [u8; RECORD_V2_LEN], kind: u8, era: u64, node_id: &iroh::PublicKey, key_slot: &[u8; 32], issued_at: u64, expires_at: u64) {
+    buf[OFF_VERSION] = RECORD_V2_VERSION;
+    buf[OFF_KIND] = kind;
+    buf[OFF_ERA..OFF_ERA + 8].copy_from_slice(&era.to_le_bytes());
+    buf[OFF_NODE_ID..OFF_NODE_ID + 32].copy_from_slice(node_id.as_bytes());
+    buf[OFF_KX_PK..OFF_KX_PK + 32].copy_from_slice(key_slot);
+    buf[OFF_ISSUED_AT..OFF_ISSUED_AT + 8].copy_from_slice(&issued_at.to_le_bytes());
+    buf[OFF_EXPIRES_AT..OFF_EXPIRES_AT + 8].copy_from_slice(&expires_at.to_le_bytes());
+}
+
+/// Sign the body with the record's own node key, into the signature slot.
+fn sign_v2(buf: &mut [u8; RECORD_V2_LEN], secret: &iroh::SecretKey) {
+    let sig = secret.sign(&buf[..OFF_SIG]);
+    buf[OFF_SIG..].copy_from_slice(&sig.to_bytes());
+}
+
+/// What the shared header says, once length, version, kind, era, signature and
+/// the reserved bytes checked out. The body's kind-specific part is the caller's.
+struct V2Header {
+    node_id: iroh::PublicKey,
+    key_slot: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    count: usize,
+}
+
+fn read_v2_header(bytes: &[u8], expected_kind: u8, expected_era: u64) -> Result<V2Header> {
+    if bytes.len() != RECORD_V2_LEN {
+        return Err(anyhow!("v2 record is {} bytes, expected {RECORD_V2_LEN}", bytes.len()));
+    }
+    if bytes[OFF_VERSION] != RECORD_V2_VERSION {
+        return Err(anyhow!("v2 record version {} unsupported", bytes[OFF_VERSION]));
+    }
+    if bytes[OFF_KIND] != expected_kind {
+        return Err(anyhow!("record kind {} is not kind {expected_kind}", bytes[OFF_KIND]));
+    }
+    let era = u64::from_le_bytes(bytes[OFF_ERA..OFF_ERA + 8].try_into().unwrap());
+    if era != expected_era {
+        return Err(anyhow!("record signed for era {era}, read under era {expected_era}"));
+    }
+    let node_bytes: [u8; 32] = bytes[OFF_NODE_ID..OFF_NODE_ID + 32].try_into().unwrap();
+    let node_id = iroh::PublicKey::from_bytes(&node_bytes).map_err(|e| anyhow!("record node_id invalid: {e:?}"))?;
+    let sig_bytes: [u8; 64] = bytes[OFF_SIG..].try_into().unwrap();
+    node_id
+        .verify(&bytes[..OFF_SIG], &iroh::Signature::from_bytes(&sig_bytes))
+        .map_err(|e| anyhow!("record signature invalid: {e:?}"))?;
+    if bytes[OFF_RESERVED..OFF_SIG].iter().any(|&b| b != 0) {
+        return Err(anyhow!("record body is not canonical (reserved bytes set)"));
+    }
+    Ok(V2Header {
+        node_id,
+        key_slot: bytes[OFF_KX_PK..OFF_KX_PK + 32].try_into().unwrap(),
+        issued_at: u64::from_le_bytes(bytes[OFF_ISSUED_AT..OFF_ISSUED_AT + 8].try_into().unwrap()),
+        expires_at: u64::from_le_bytes(bytes[OFF_EXPIRES_AT..OFF_EXPIRES_AT + 8].try_into().unwrap()),
+        count: bytes[OFF_ADDR_COUNT] as usize,
+    })
+}
+
+/// Encode + sign a knock into its fixed 320-byte plaintext (sealed to the host
+/// by [`seal_to_kx`] afterwards). The room lane ids take the address slots,
+/// the knocker's contact key the key slot (zeros when withheld).
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn encode_knock_v2(knock: &KnockV2, secret: &iroh::SecretKey) -> Result<[u8; RECORD_V2_LEN]> {
+    if knock.from != secret.public() {
+        return Err(anyhow!("knock `from` is not the signing key"));
+    }
+    if knock.rooms.is_empty() || knock.rooms.len() > MAX_KNOCK_ROOMS {
+        return Err(anyhow!("a knock names 1 to {MAX_KNOCK_ROOMS} rooms, not {}", knock.rooms.len()));
+    }
+    let mut buf = [0u8; RECORD_V2_LEN];
+    write_v2_header(&mut buf, KIND_KNOCK, knock.era, &knock.from, &knock.ck_from.unwrap_or([0u8; 32]), knock.issued_at, knock.expires_at);
+    buf[OFF_ADDR_COUNT] = knock.rooms.len() as u8;
+    for (i, lane) in knock.rooms.iter().enumerate() {
+        let slot = &mut buf[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN];
+        slot[..ROOM_LANE_ID_LEN].copy_from_slice(lane);
+    }
+    sign_v2(&mut buf, secret);
+    Ok(buf)
+}
+
+/// Decode + verify a knock plaintext read under an inbox hint of `expected_era`.
+/// Rejects the wrong length, version, kind or era, a bad signature and a
+/// non-canonical body. The knock's room list is the host's to match against
+/// the rooms it holds; freshness is the reader's job.
+pub fn decode_knock_v2(bytes: &[u8], expected_era: u64) -> Result<KnockV2> {
+    let h = read_v2_header(bytes, KIND_KNOCK, expected_era)?;
+    if h.count == 0 || h.count > MAX_KNOCK_ROOMS {
+        return Err(anyhow!("knock names {} rooms, expected 1 to {MAX_KNOCK_ROOMS}", h.count));
+    }
+    if bytes[OFF_ADDRS + h.count * ADDR_SLOT_LEN..OFF_RESERVED].iter().any(|&b| b != 0) {
+        return Err(anyhow!("knock body is not canonical (unused room slots set)"));
+    }
+    let mut rooms = Vec::with_capacity(h.count);
+    for i in 0..h.count {
+        let slot = &bytes[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN];
+        if slot[ROOM_LANE_ID_LEN..].iter().any(|&b| b != 0) {
+            return Err(anyhow!("knock room slot {i} is not canonical"));
+        }
+        rooms.push(slot[..ROOM_LANE_ID_LEN].try_into().unwrap());
+    }
+    let ck_from = if h.key_slot == [0u8; 32] { None } else { Some(h.key_slot) };
+    Ok(KnockV2 { era: expected_era, from: h.node_id, ck_from, issued_at: h.issued_at, expires_at: h.expires_at, rooms })
+}
+
+/// Encode + sign a beacon: the header alone, every slot zero.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn encode_beacon_v2(beacon: &BeaconV2, secret: &iroh::SecretKey) -> Result<[u8; RECORD_V2_LEN]> {
+    if beacon.node_id != secret.public() {
+        return Err(anyhow!("beacon node_id is not the signing key"));
+    }
+    let mut buf = [0u8; RECORD_V2_LEN];
+    write_v2_header(&mut buf, KIND_BEACON, beacon.era, &beacon.node_id, &[0u8; 32], beacon.issued_at, beacon.expires_at);
+    sign_v2(&mut buf, secret);
+    Ok(buf)
+}
+
+/// Decode + verify a beacon read under the beacon hint of `expected_era`: a
+/// beacon carries no key and no address, so every slot must be zero.
+pub fn decode_beacon_v2(bytes: &[u8], expected_era: u64) -> Result<BeaconV2> {
+    let h = read_v2_header(bytes, KIND_BEACON, expected_era)?;
+    if h.count != 0 || h.key_slot != [0u8; 32] || bytes[OFF_ADDRS..OFF_RESERVED].iter().any(|&b| b != 0) {
+        return Err(anyhow!("beacon body is not canonical (a beacon carries no key and no address)"));
+    }
+    Ok(BeaconV2 { era: expected_era, node_id: h.node_id, issued_at: h.issued_at, expires_at: h.expires_at })
+}
+
+/// Bytes a sealed-to-key blob adds to its plaintext: the ephemeral public
+/// key, the nonce and the AEAD tag.
+#[cfg(feature = "chia-read")]
+pub const KX_SEAL_OVERHEAD: usize = 32 + 24 + 16;
+
+/// Seal `plaintext` to the holder of the X25519 secret behind `recipient_pk`
+/// (a host's card key): an ephemeral X25519 key agrees a shared secret, the
+/// XChaCha20-Poly1305 key is derived from it together with both public keys,
+/// and kind ‖ era ‖ `carrier_parent` ‖ `lane` bind as associated data
+/// ([`kx_aad`]: the parent of the coin the blob will ride on, so a copy under
+/// another coin never opens, and the room's secret lane token, so only a holder
+/// of the room key can have written it). Blob: `[32B ephemeral pk ‖ 24B nonce ‖
+/// ciphertext]`. Every holder of the host's contact key can find the hint this
+/// lands under; only the host opens it, only under the coin it was written by,
+/// and only for the room whose lane it was sealed with.
+#[cfg(feature = "chia-read")]
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::Payload;
+    let mut e_sk = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut e_sk);
+    let e_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(e_sk).to_bytes();
+    let key = kx_seal_key(&kx_shared(&e_sk, recipient_pk)?, &e_pk, recipient_pk);
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let mut nonce = [0u8; 24];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let aad = kx_aad(kind, era, carrier_parent, lane);
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
+        .map_err(|e| anyhow!("seal_to_kx failed: {e:?}"))?;
+    let mut out = Vec::with_capacity(KX_SEAL_OVERHEAD + plaintext.len());
+    out.extend_from_slice(&e_pk);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Open a blob [`seal_to_kx`] made for the holder of `recipient_sk`, for
+/// `kind` in `era`, read from a coin whose parent is `carrier_parent`, for the
+/// room whose secret lane token is `lane`. Fails on another recipient, a
+/// tampered blob, or a blob sealed for another kind, era, carrier (a copy under
+/// a new coin, #272 review round 3) or lane (a writer without the room key,
+/// round 5).
+#[cfg(feature = "chia-read")]
+pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::Payload;
+    if sealed.len() < KX_SEAL_OVERHEAD {
+        return Err(anyhow!("sealed-to-key blob too short"));
+    }
+    let e_pk: [u8; 32] = sealed[..32].try_into().unwrap();
+    let recipient_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(*recipient_sk).to_bytes();
+    let key = kx_seal_key(&kx_shared(recipient_sk, &e_pk)?, &e_pk, &recipient_pk);
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let aad = kx_aad(kind, era, carrier_parent, lane);
+    cipher
+        .decrypt(XNonce::from_slice(&sealed[32..56]), Payload { msg: &sealed[56..], aad: &aad })
+        .map_err(|e| anyhow!("open_with_kx failed (not sealed to this key, kind, era, carrier coin or room lane?): {e:?}"))
+}
+
+/// X25519: our secret × their public point. An all-zero result (their point
+/// was of low order) is refused rather than used as a key.
+#[cfg(feature = "chia-read")]
+fn kx_shared(our_sk: &[u8; 32], their_pk: &[u8; 32]) -> Result<[u8; 32]> {
+    let shared = curve25519_dalek::MontgomeryPoint(*their_pk).mul_clamped(*our_sk).to_bytes();
+    if shared == [0u8; 32] {
+        return Err(anyhow!("X25519 agreement with a low-order point refused"));
+    }
+    Ok(shared)
+}
+
+/// The sealing key: the shared secret bound to both public keys, so a blob
+/// cannot be re-addressed.
+#[cfg(feature = "chia-read")]
+fn kx_seal_key(shared: &[u8; 32], e_pk: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 32] {
+    let mut material = [0u8; 96];
+    material[..32].copy_from_slice(shared);
+    material[32..64].copy_from_slice(e_pk);
+    material[64..].copy_from_slice(recipient_pk);
+    blake3::derive_key(CTX_KNOCK_SEAL, &material)
+}
+
+#[cfg(test)]
+mod p6b_tests {
+    use super::*;
+
+    fn knock(sk: &iroh::SecretKey, ck: Option<[u8; 32]>, rooms: &[&str]) -> KnockV2 {
+        KnockV2 {
+            era: 7,
+            from: sk.public(),
+            ck_from: ck,
+            issued_at: 1_791_700_000,
+            expires_at: 1_791_700_000 + 2 * ERA_SECS,
+            rooms: rooms.iter().map(|r| room_lane_id(r)).collect(),
+        }
+    }
+
+    #[test]
+    fn knock_roundtrips_and_names_rooms_by_lane_id_only() {
+        let sk = iroh::SecretKey::generate();
+        let k = knock(&sk, Some([5u8; 32]), &["lobby", "workshop"]);
+        let bytes = encode_knock_v2(&k, &sk).unwrap();
+        assert_eq!(bytes.len(), RECORD_V2_LEN);
+        assert_eq!(bytes[OFF_KIND], KIND_KNOCK);
+        assert!(!bytes.windows(5).any(|w| w == b"lobby"), "no room id in the clear");
+        let back = decode_knock_v2(&bytes, 7).unwrap();
+        assert_eq!(back, k);
+        assert!(back.rooms.contains(&room_lane_id("lobby")) && !back.rooms.contains(&room_lane_id("cellar")));
+        // Withheld contact key: zeros on the wire, None back.
+        let quiet = knock(&sk, None, &["lobby"]);
+        let back = decode_knock_v2(&encode_knock_v2(&quiet, &sk).unwrap(), 7).unwrap();
+        assert_eq!(back.ck_from, None);
+    }
+
+    #[test]
+    fn knock_rejects_wrong_era_kind_signer_and_non_canonical_bodies() {
+        let sk = iroh::SecretKey::generate();
+        let k = knock(&sk, None, &["lobby"]);
+        let bytes = encode_knock_v2(&k, &sk).unwrap();
+        assert!(decode_knock_v2(&bytes, 8).is_err(), "read under another era's hint");
+        assert!(decode_beacon_v2(&bytes, 7).is_err(), "a knock is not a beacon");
+        assert!(decode_presence_v2(&bytes, 7).is_err(), "a knock is not presence");
+        let mut flipped = bytes;
+        flipped[OFF_ADDRS] ^= 1;
+        assert!(decode_knock_v2(&flipped, 7).is_err(), "a changed room fails the signature");
+        let mut padded = k.clone();
+        padded.rooms = vec![];
+        assert!(encode_knock_v2(&padded, &sk).is_err(), "a knock names at least one room");
+        padded.rooms = vec![[1u8; ROOM_LANE_ID_LEN]; MAX_KNOCK_ROOMS + 1];
+        assert!(encode_knock_v2(&padded, &sk).is_err());
+        let other = iroh::SecretKey::generate();
+        assert!(encode_knock_v2(&k, &other).is_err(), "signed by the knocker alone");
+        // A canonical body re-signed with stray bytes in an unused slot fails.
+        let mut dirty = [0u8; RECORD_V2_LEN];
+        dirty.copy_from_slice(&encode_knock_v2(&k, &sk).unwrap());
+        dirty[OFF_ADDRS + ADDR_SLOT_LEN + 3] = 9;
+        sign_v2(&mut dirty, &sk);
+        assert!(decode_knock_v2(&dirty, 7).is_err(), "unused room slots must be zero");
+        let mut tail = [0u8; RECORD_V2_LEN];
+        tail.copy_from_slice(&encode_knock_v2(&k, &sk).unwrap());
+        tail[OFF_ADDRS + ROOM_LANE_ID_LEN] = 1;
+        sign_v2(&mut tail, &sk);
+        assert!(decode_knock_v2(&tail, 7).is_err(), "the bytes after a lane id must be zero");
+    }
+
+    #[test]
+    fn beacon_roundtrips_and_carries_nothing_but_a_node_id() {
+        let sk = iroh::SecretKey::generate();
+        let b = BeaconV2 { era: 3, node_id: sk.public(), issued_at: 100, expires_at: 100 + 2 * ERA_SECS };
+        let bytes = encode_beacon_v2(&b, &sk).unwrap();
+        assert_eq!(decode_beacon_v2(&bytes, 3).unwrap(), b);
+        assert!(bytes[OFF_KX_PK..OFF_KX_PK + 32].iter().all(|&x| x == 0), "no key");
+        assert!(bytes[OFF_ADDR_COUNT..OFF_SIG].iter().all(|&x| x == 0), "no address");
+        assert!(decode_beacon_v2(&bytes, 4).is_err());
+        assert!(decode_knock_v2(&bytes, 3).is_err(), "a beacon is not a knock");
+        let mut keyed = [0u8; RECORD_V2_LEN];
+        keyed.copy_from_slice(&bytes);
+        keyed[OFF_KX_PK] = 7;
+        sign_v2(&mut keyed, &sk);
+        assert!(decode_beacon_v2(&keyed, 3).is_err(), "a beacon with a key is not canonical");
+        assert!(encode_beacon_v2(&b, &iroh::SecretKey::generate()).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "chia-read")]
+    fn sealed_to_key_opens_for_the_recipient_alone() {
+        let host_sk = [11u8; 32];
+        let host_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(host_sk).to_bytes();
+        let plain = [0x42u8; RECORD_V2_LEN];
+        let carrier = [5u8; 32]; // the writer's input coin: the parent of the coin the blob rides on
+        let lane = derive_lane_token(&[3u8; 32]); // the room's secret lane token
+        let blob = seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap();
+        assert_eq!(blob.len(), RECORD_V2_LEN + KX_SEAL_OVERHEAD);
+        assert_eq!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob).unwrap(), plain.to_vec());
+        assert!(open_with_kx(&[12u8; 32], KIND_KNOCK, 7, &carrier, &lane, &blob).is_err(), "another key");
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 8, &carrier, &lane, &blob).is_err(), "another era");
+        assert!(open_with_kx(&host_sk, KIND_BEACON, 7, &carrier, &lane, &blob).is_err(), "another kind");
+        let mut tampered = blob.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &tampered).is_err());
+        let mut readdressed = blob.clone();
+        readdressed[0] ^= 1;
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &readdressed).is_err(), "the ephemeral key is bound in");
+        assert!(
+            open_with_kx(&host_sk, KIND_KNOCK, 7, &[6u8; 32], &lane, &blob).is_err(),
+            "another carrier: the same blob copied under a coin with another parent does not open (#272 review round 3)"
+        );
+        assert!(
+            open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &derive_lane_token(&[4u8; 32]), &blob).is_err(),
+            "another room's lane: a blob sealed without this room's key does not open (#272 review round 5)"
+        );
+        assert_ne!(seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap(), blob, "fresh key and nonce every time");
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob[..KX_SEAL_OVERHEAD - 1]).is_err(), "too short");
+        assert!(seal_to_kx(&[0u8; 32], KIND_KNOCK, 7, &carrier, &lane, &plain).is_err(), "a low-order recipient point is refused");
+    }
+
+    #[test]
+    fn inbox_lane_and_hints_separate_rooms_hosts_and_eras() {
+        let ck_a = [1u8; 32];
+        let ck_b = [2u8; 32];
+        let lane_x = derive_lane_token(&[3u8; 32]);
+        let lane_y = derive_lane_token(&[4u8; 32]);
+        assert_ne!(lane_x, lane_y);
+        assert_ne!(lane_x, [3u8; 32], "a lane is not the room key");
+        let h = derive_inbox_hint(&ck_a, &lane_x, 7);
+        assert_ne!(h, derive_inbox_hint(&ck_b, &lane_x, 7), "another host");
+        assert_ne!(h, derive_inbox_hint(&ck_a, &lane_y, 7), "another room");
+        assert_ne!(h, derive_inbox_hint(&ck_a, &lane_x, 8), "another era");
+        assert_ne!(h, derive_ck_hint(&ck_a, 7), "never the presence hint");
+        assert_eq!(h, derive_inbox_hint(&ck_a, &lane_x, 7), "deterministic");
+        assert_ne!(derive_beacon_hint(7), derive_beacon_hint(8));
+        assert_eq!(room_lane_id("lobby"), room_lane_id("lobby"));
+        assert_ne!(room_lane_id("lobby"), room_lane_id("lobbz"));
+    }
 }
 
 #[cfg(test)]

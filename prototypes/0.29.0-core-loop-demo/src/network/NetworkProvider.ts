@@ -23,7 +23,7 @@ import type {
   TransportMode,
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
-import { buildRoomCapPayload, nextCapSeq, readChiaMode } from './roomCap.ts';
+import { buildRoomCapPayload, memberCardsOf, nextCapSeq, readChiaMode, readShareCard } from './roomCap.ts';
 import type { FaucetOp, FaucetRequestTicket } from '../faucetDish.ts';
 
 export interface NetworkDebugInfo {
@@ -78,7 +78,11 @@ export class NetworkProvider implements NetworkProviderPort {
   #connectedAt = 0;
   #boot: RoomBootstrap | null = null;
   /** N8 probe: is this room public space? Installed by main.ts. */
-  #publicRoomProbe: ((roomId: string) => boolean) | null = null;
+  #publicRoomProbe: ((roomId: string) => boolean | undefined) | null = null;
+  /** #272 review round 9: this provider warms a room the player holds a pass
+   *  to (roomPasses.ts), with no posture probe: its cap says so, carries the
+   *  pass's cards and arms nothing. */
+  #passPrefetch = false;
   /** Last cap `seq` sent (see roomCap.ts): caps ride separate streams. */
   #capSeq = 0;
 
@@ -239,27 +243,44 @@ export class NetworkProvider implements NetworkProviderPort {
    *  derive the room's chia lookup hint and seal presence records; it holds the
    *  room's plaintext doc already, so this is loopback-only and exposes nothing
    *  new. Fire-and-forget. The payload also carries N8's `publicRoom` flag from
-   *  the installed probe; a provider with no probe (every background provider)
-   *  sends no cap at all — see the guard below. Same `[u32-LE len][JSON]`
+   *  the installed probe (`null` while the probe cannot say yet, #272 review
+   *  round 3); a provider with no probe sends no cap at all — see the guard
+   *  below — except a pass prefetch's (`markPassPrefetch`, round 9), whose
+   *  cap says unknown and arms nothing. Same `[u32-LE len][JSON]`
    *  framing the node reads on every browser->node stream. */
   async sendRoomCap(roomId: string, roomKeyB64: string, chiaMode: boolean): Promise<void> {
     if (!this.#wt || this.#mode === 'offline') return;
-    // N8: only a provider that can vouch for the room's posture speaks. The
-    // background providers (passes, far-door and departure writes, direct
+    // N8: only a provider that can vouch for the room's posture speaks for
+    // it. The background providers (far-door and departure writes, direct
     // messages, room sessions) have no probe; a cap from one of them would
     // overwrite the primary session's reading for that room with a blanket
     // PUBLIC — fail-closed, but it would switch reads off for a room the
     // player is standing in. The node holds no cap for a room nobody vouched
-    // for, which is the same fail-closed outcome without the override.
-    if (!this.#publicRoomProbe) return;
+    // for, which is the same fail-closed outcome without the override. The
+    // one exception (#272 review round 9) is a PASS PREFETCH: USE PASS warms
+    // the room here, in the background, and the primary session joins only
+    // once that is READY — which, with every live route to the host failing,
+    // takes the knock the pass's cards allow. Its cap says the posture is
+    // unknown, carries the pass's cards and arms nothing, and the node never
+    // lets it replace a cap the primary session sent.
+    const prefetch = this.#passPrefetch;
+    if (!this.#publicRoomProbe && !prefetch) return;
     try {
-      const publicRoom = this.#publicRoomProbe(roomId);
+      const publicRoom = prefetch ? null : this.#publicRoomProbe!(roomId);
       this.#capSeq = nextCapSeq(this.#capSeq);
-      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq);
+      // #231 P6b: the room's share-my-card toggle and the cards its pass
+      // carries for its members (this session's boot, when it is this room's).
+      const boot = this.#boot;
+      const memberCards = boot?.roomId === roomId ? memberCardsOf(boot.memberHints) : [];
+      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq, readShareCard(roomId), memberCards, prefetch);
       const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
-      // Small payload (<128 B) — a single btoa is safe. Node decodes with
-      // BASE64_STANDARD, which btoa produces.
-      const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
+      // A few KB at most (member cards); chunked so the spread never trips an
+      // argument limit. Node decodes with BASE64_STANDARD, which btoa produces.
+      let payloadText = '';
+      for (let i = 0; i < payloadBytes.length; i += 0x8000) {
+        payloadText += String.fromCharCode(...payloadBytes.subarray(i, i + 0x8000));
+      }
+      const payloadB64 = btoa(payloadText);
       const wire = { v: 1, room: roomId, kind: 'cap', seq: 0, author: '', payload: payloadB64 };
       const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
       const packet = new Uint8Array(4 + jsonBytes.length);
@@ -290,8 +311,16 @@ export class NetworkProvider implements NetworkProviderPort {
    *  passage). main.ts installs it on the primary provider at boot, before any
    *  join; a provider without one never sends a cap, so a node never publishes
    *  under a key the browser has not vouched for. */
-  setPublicRoomProbe(probe: (roomId: string) => boolean): void {
+  setPublicRoomProbe(probe: (roomId: string) => boolean | undefined): void {
     this.#publicRoomProbe = probe;
+  }
+
+  /** #272 review round 9: this provider is a pass prefetch's (roomPasses.ts).
+   *  It sends the room's cap with no posture and nothing armed — the pass's
+   *  cards, so the node can knock on a host every live route fails to reach,
+   *  and the room's key, so the welcome room's beacon fall-through knows it. */
+  markPassPrefetch(): void {
+    this.#passPrefetch = true;
   }
 
   /** Re-send the current room's cap with its CURRENT flags — called when the

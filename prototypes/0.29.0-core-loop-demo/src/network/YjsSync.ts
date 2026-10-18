@@ -409,6 +409,9 @@ export class YjsSync {
     // only, a single point of dial failure) so the node bootstrap-dials EVERY
     // reachable member — any live one bootstraps us, then transitive gossip
     // meshes the rest.
+    // #231 P6b: only the dial hints ride here — never a member's contact
+    // card. The node relays this envelope to the whole mesh; cards reach the
+    // node over the loopback `cap` lane alone.
     if (memberHints.length > 0) {
       wireEnvelope.iroh_member_hints = memberHints.map((h: any) => ({
         irohNodeId: h.irohNodeId,

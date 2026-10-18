@@ -38,6 +38,7 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import { isDockChain, projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 import { halfAlongWall } from './doorMatch';
 import { CUPOLA_WALLS, type CupolaWall } from './cupola';
+import { seedWithoutCards } from './network/roomCap';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -2154,7 +2155,11 @@ export function pushAtlasToDoc(): void {
           lateral: door.lateral,
           // Known either way ⇒ published either way; unknown stays unsent.
           ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
-          ...(isOwn && door.targetSeed ? { targetSeed: door.targetSeed } : {}),
+          // 🔑 A door's seed travels whatever the posture, so it travels with
+          // the route alone: a docked module's pass carries its members' node
+          // cards, and a public room's audience gets no contact key out of it
+          // (#231 P6b, #272 review round 12; the room's own seed below, too).
+          ...(isOwn && door.targetSeed ? { targetSeed: seedWithoutCards(door.targetSeed) } : {}),
         };
       }
       const rec: SharedAtlasEntry = {
@@ -2221,7 +2226,14 @@ export function pushAtlasToDoc(): void {
           Date.now() + MAX_GOSSIP_SKEW_MS,
         ),
       };
-      if (isOwn && entry.seed && ctx.isPassagePublic()) rec.seed = entry.seed;
+      // 🔑 The seed travels only while passage is public — and then with every
+      // member's node card struck (#231 P6b, #272 review round 11): the stored
+      // seed may be a pass minted while the room was private, cards and all,
+      // and a public room's audience gets routes, never contact keys. The
+      // pull writes the doc's copy back over the stored seed, which only the
+      // helm uses, to fly here; passes are minted from the live member hints,
+      // never from it, so nothing is lost with the cards.
+      if (isOwn && entry.seed && ctx.isPassagePublic()) rec.seed = seedWithoutCards(entry.seed);
       if (known
         && JSON.stringify({ ...known, updatedAt: 0 }) === JSON.stringify({ ...rec, updatedAt: 0 })) continue;
       sharedMap!.set(entry.roomId, rec);

@@ -18,7 +18,9 @@
 //! room's cooldowns so the dance restarts in step.
 //!
 //! N5′ (#231 first follow-up): cached addresses are re-dialed first; the chain
-//! is read only on the beat. `SSF_CHIA_WATCH=0` turns the watcher off.
+//! is read only on the beat. `SSF_CHIA_WATCH=0` turns the watcher off — and
+//! with it the knocks this node would write (`chia_knock::knocks_available`,
+//! #272 review round 14): a sent knock is judged and dialed from here.
 //!
 //! #231 P6a: the same beat and hold now serve the PER-NODE presence records
 //! (record v2): every peer whose contact card sits in `peers.json` has its own
@@ -41,8 +43,9 @@ use std::time::{Duration, Instant};
 
 use chia_protocol::Bytes32;
 
+use crate::chia_knock::{DialBack, InboxKnock};
 use crate::chia_lane::{self, ChiaPresenceRecord};
-use crate::chia_resolve::{self, FoundRecord, HintCursor};
+use crate::chia_resolve::{self, FoundRecord, HintCursor, LeaseWord, WriteStanding};
 
 /// Blocks per beat: reads align to peak heights that are multiples of this.
 /// 32 blocks ≈ 10 min at testnet11's ~18.75 s block time. `SSF_CHIA_BEAT_BLOCKS`.
@@ -141,6 +144,13 @@ pub struct PlanContext<'a> {
     pub cooldown_until: &'a HashMap<String, Instant>,
     /// Holds currently running for this room.
     pub active_holds: usize,
+    /// Hold slots kept free for the rendezvous dial-backs due in this room
+    /// that found none last tick (#272 review round 11): the record planners
+    /// run around the dial-back planner each tick and refilled every slot a
+    /// finished hold freed before it ran, so with enough cached peers rotating
+    /// through their cooldowns a due knocker with no cached record never got
+    /// its dial-back. A starved dial-back reserves its slot for the next tick.
+    pub reserved: usize,
     pub now_unix: u64,
     pub now: Instant,
 }
@@ -148,13 +158,14 @@ pub struct PlanContext<'a> {
 /// The symmetric trigger's decision: which records in `records` (one per node,
 /// freshest first) deserve a hold right now. Skips ourselves, connected peers,
 /// in-flight dials, cooled-down targets, expired records and records with no
-/// dialable public address; caps the result by the room's free hold slots.
+/// dialable public address; caps the result by the room's free hold slots,
+/// less the slots reserved for due dial-backs ([`PlanContext::reserved`]).
 pub fn plan_holds(
     records: &[ChiaPresenceRecord],
     ctx: &PlanContext<'_>,
     addr_filter: &dyn Fn(&[String]) -> Vec<SocketAddr>,
 ) -> Vec<HoldCandidate> {
-    let free = MAX_HOLDS_PER_ROOM.saturating_sub(ctx.active_holds);
+    let free = MAX_HOLDS_PER_ROOM.saturating_sub(ctx.active_holds.saturating_add(ctx.reserved));
     let mut ranked: Vec<&ChiaPresenceRecord> = records.iter().collect();
     ranked.sort_by_key(|r| std::cmp::Reverse(r.issued_at));
     let mut out = Vec::new();
@@ -237,11 +248,34 @@ pub struct WatchShared {
     pub cooldowns: Mutex<HashMap<(String, String), Instant>>,
     /// room -> holds in flight.
     pub active: Mutex<HashMap<String, usize>>,
+    /// room -> hold slots kept free for due rendezvous dial-backs that found
+    /// none last tick (see [`PlanContext::reserved`]); rewritten by every tick
+    /// that planned dial-backs on an agreed peak.
+    pub reserved: Mutex<HashMap<String, usize>>,
 }
 
 /// Is the watcher enabled? `SSF_CHIA_WATCH=0` is the kill switch.
 pub fn watch_enabled() -> bool {
     std::env::var("SSF_CHIA_WATCH").ok().as_deref() != Some("0")
+}
+
+/// #231 P6b: settle the wallet lease's parked spends against the chain, then
+/// give the lease's word on each of `coins` ([`LeaseWord`]) and which of
+/// `spends` it still holds — parked, or settling (#272 review round 12): what
+/// a knock's standing needs beside the chain's lookups
+/// ([`chia_resolve::write_standing`]).
+#[cfg(feature = "chia-publish")]
+async fn lease_standing(client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32], spends: &[u64]) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
+    crate::chia_publish::lease_standing(client, coins, spends).await
+}
+
+/// A read-only build has no lease: its word on every coin is unknown, which
+/// kills nothing — a knock it finds pending (another build's) stays pending
+/// until the chain confirms it, its coin goes to another spend, or two eras
+/// pass (#272 review round 2) — and it holds no spend.
+#[cfg(not(feature = "chia-publish"))]
+async fn lease_standing(_client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32], _spends: &[u64]) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
+    (coins.iter().map(|c| (*c, LeaseWord::Unknown)).collect(), HashSet::new())
 }
 
 /// The watcher: beat-aligned reads for every readable room, then holds for
@@ -252,6 +286,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // The presence lane: records are signed and sealed, so the first reachable
     // peer carries them (plan §14 (5)).
     let client = crate::chia_chain::connect_carrier();
+    // #231 P6b: the knock verdicts (confirmed, dead) are judged on the AGREED
+    // lane, like the writes they settle: a knock forgotten on one peer's word
+    // would be knocked again beside the first.
+    let agreed = crate::chia_chain::connect();
     let mut sched = BeatSchedule::from_env();
     let mut cursors: HashMap<(String, [u8; 32]), HintCursor> = HashMap::new();
     let mut cache: HashMap<String, RoomCache> = HashMap::new();
@@ -268,6 +306,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // Per peer: the contact key the record was read under, and the record.
     let mut node_cache: HashMap<String, ([u8; 32], FoundRecord)> = HashMap::new();
     let mut own_ck_height: u32 = 0;
+    // #231 P6b: our inbox (knocks sealed to our card key), one cursor per hint,
+    // and the knock book's two clocks (confirmations we wait for, dial-backs due).
+    let mut inbox_cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
+    let kx_secret = crate::chia_contact::kx_card_secret(&hub.secret_key);
+    let knocks_path = std::path::Path::new(crate::chia_knock::KNOCKS_FILE);
     println!(
         "⛓️ ChiaHub watcher on: reads every {} blocks per room (×{} while connected), hold {}s × {}s, {} holds/room",
         sched.beat_blocks,
@@ -330,7 +373,25 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         // confirms the write (a fresh node has no rooms or cards yet, and an
         // unconfirmed write is retried every confirmation timeout).
         let self_publishing = hub.presence_publishing.load(std::sync::atomic::Ordering::Relaxed);
-        if readable.is_empty() && peers.is_empty() && !self_publishing {
+        // #231 P6b: the rooms whose inbox we read — where we hand out our card
+        // (a knocker needs it to seal to us) and only with a durable contact
+        // key (nobody holds a card of a key that changes every start).
+        let inbox_rooms: Vec<(String, [u8; 32])> = if hub.contact_key_durable {
+            hub.chia_rooms
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, cap)| cap.may_use_cards())
+                .map(|(room, cap)| (room.clone(), cap.room_key))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let knocks_live = {
+            let book = hub.knocks.lock().unwrap();
+            !book.sent.is_empty() || !book.inbox.is_empty()
+        };
+        if readable.is_empty() && peers.is_empty() && !self_publishing && inbox_rooms.is_empty() && !knocks_live {
             continue;
         }
 
@@ -390,12 +451,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 .map(|((_, node), until)| (node.clone(), *until))
                 .collect();
             let active_holds = shared.active.lock().unwrap().get(&room).copied().unwrap_or(0);
+            let reserved = shared.reserved.lock().unwrap().get(room.as_str()).copied().unwrap_or(0);
             let ctx = PlanContext {
                 self_id: &self_id,
                 connected: &connected,
                 dialing: &dialing,
                 cooldown_until: &cooldown_until,
                 active_holds,
+                reserved,
                 now_unix,
                 now: Instant::now(),
             };
@@ -493,6 +556,339 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             }
             ck_cursors.retain(|hint, _| live_ck_hints.contains(hint));
             self_cursors.retain(|hint, _| live_ck_hints.contains(hint));
+
+            // ── #231 P6b: our INBOX — one read per sharing room per beat. A knock
+            // names the knocker (signed), the room (by lane id, matched to the
+            // room the hint was read for) and, when the knocker is findable, its
+            // contact key, filed so its presence is read by key. The knock's
+            // confirmation height starts the rendezvous clock on our side — the
+            // clock both sides dial by, so the read is an AGREED one (plan §14
+            // (5)): one carrier peer naming another height in the same era
+            // would put us on another schedule than the knocker, and the coin
+            // is never read again to correct it (#272 review round 3).
+            let mut live_inbox: HashSet<[u8; 32]> = HashSet::new();
+            for (room, room_key) in &inbox_rooms {
+                live_inbox.extend(chia_resolve::live_inbox_hints(&own_ck, room_key, peak));
+                if !sched.due(&inbox_sched_key(room), peak, false) {
+                    continue;
+                }
+                match chia_resolve::read_inbox(&agreed, &kx_secret, &own_ck, room_key, room, peak, now_unix, &mut inbox_cursors).await {
+                    Ok(found) => {
+                        for f in found {
+                            let from = f.item.from.to_string();
+                            if from == self_id {
+                                continue;
+                            }
+                            let new = {
+                                let mut book = hub.knocks.lock().unwrap();
+                                let new = book.record_inbox(InboxKnock {
+                                    from: from.clone(),
+                                    room: room.clone(),
+                                    era: f.item.era,
+                                    confirmed_height: f.confirmed_height,
+                                    coin_id: hex::encode(f.coin_id.to_bytes()),
+                                    last_rendezvous: f.confirmed_height,
+                                    settled: false,
+                                });
+                                if new {
+                                    if let Err(e) = book.save(knocks_path) {
+                                        eprintln!("⛓️ ChiaHub inbox: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
+                                    }
+                                }
+                                new
+                            };
+                            if !new {
+                                continue;
+                            }
+                            println!(
+                                "⛓️ ChiaHub inbox: {} knocked for room {room} (confirmed at height {}) — dialing it back on the schedule",
+                                short(&from),
+                                f.confirmed_height
+                            );
+                            if let Some(ck) = f.item.ck_from {
+                                let mut book = hub.peers.lock().unwrap();
+                                if book.record_knock(&from, &ck, room, f.item.issued_at, now_unix) {
+                                    let _ = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => eprintln!("⛓️ ChiaHub inbox: read for room {room} failed: {err:#}"),
+                }
+            }
+            inbox_cursors.retain(|hint, _| live_inbox.contains(hint));
+            sched.forget_where(|key| {
+                key.starts_with(INBOX_SCHED_PREFIX) && !inbox_rooms.iter().any(|(r, _)| inbox_sched_key(r) == key)
+            });
+
+            // ── #231 P6b: the knock book's own clock is an AGREED peak (plan
+            // §14 (5)): pruning and planning forget or move rendezvous state,
+            // and one carrier peer naming a future height would otherwise
+            // empty the book or skip every boundary (#272 review round 2). No
+            // agreed peak this tick: nothing is pruned, nothing is planned; the
+            // reads above ran on the carrier's peak as before.
+            let knocks_in_book = {
+                let book = hub.knocks.lock().unwrap();
+                !book.sent.is_empty() || !book.inbox.is_empty()
+            };
+            let knock_peak: Option<u32> = if knocks_in_book { chia_resolve::peak_height(&agreed).await } else { None };
+            // 0 when there is none: nothing comes due at 0, nothing is marked.
+            let kpeak = knock_peak.unwrap_or(0);
+
+            // ── #231 P6b: the knocks WE sent — each pending one judged by the
+            // chain's word (every tick while one is pending: the first boundary
+            // is ten blocks after the confirmation): its own coin under the
+            // host's inbox hint confirms it; an input gone to another spend of
+            // ours, or unspent and dropped on the wallet lease's word, means
+            // the knock never landed and is forgotten (the next dial exhaustion
+            // knocks again). The input's spent flag alone proves nothing (#272
+            // review): a dropped knock's coin is the next write's input. The
+            // lease is asked FIRST, the chain after, so a knock confirming in
+            // between is seen by the lookups and never read as dropped. Each
+            // verdict names its entry by input coin AND hint (#272 review round
+            // 4): a dropped knock's input is released to the next write, which
+            // may be another knock, so two entries can share a coin. An input
+            // spent with no child under the hint is the coin's going to another
+            // write of ours only while the lease no longer holds the knock's
+            // own spend (round 12): the two lookups are separate requests, and
+            // a reorganization between them lists the input spent by the knock
+            // itself while the hint's listing, on the new fork, lacks it — the
+            // lease pushes the spend again, and the knock stays pending. A knock
+            // CONFIRMED less than SETTLED_DEPTH blocks ago is judged again too
+            // (#272 review round 7): a reorganization can move the block that
+            // holds it (the clock follows) or drop it (pending again, nobody
+            // dialed, until the chain's word) — the host's side does the same
+            // with the knocks it read, below.
+            let pending = hub.knocks.lock().unwrap().unsettled_sent(knock_peak);
+            if !pending.is_empty() {
+                let coins: Vec<Bytes32> = pending.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
+                let spends: Vec<u64> = pending.iter().filter_map(|k| k.spend).collect();
+                let (words, held) = lease_standing(&agreed, &coins, &spends).await;
+                match chia_resolve::spent_heights(&agreed, coins.clone()).await {
+                    Ok(spent) => {
+                        // Each verdict: input coin, hint, era, the height the
+                        // entry stood confirmed at (0: pending), whether a
+                        // listing run to its end and judged at or past that
+                        // height lacked the write (a cut listing, or one judged
+                        // below it by peers behind the block, says nothing —
+                        // round 9), and the standing.
+                        let mut verdicts: Vec<(String, String, u64, u32, bool, WriteStanding)> = Vec::new();
+                        for k in &pending {
+                            let (Some(coin), Some(hint)) = (chia_resolve::parse_hex32(&k.coin_id), chia_resolve::parse_hex32(&k.hint)) else {
+                                verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, false, WriteStanding::Dead("its entry in the knock book is malformed")));
+                                continue;
+                            };
+                            let child = match chia_resolve::child_under_hint(&agreed, hint, coin).await {
+                                Ok(child) => child,
+                                Err(e) => {
+                                    eprintln!("⛓️ ChiaHub knock: could not read under our knock's inbox hint: {e:#}");
+                                    continue;
+                                }
+                            };
+                            let spent_at = spent.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
+                            let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
+                            let ours = k.spend.is_some_and(|s| held.contains(&s));
+                            let gone = child.gone_since(k.confirmed_height);
+                            verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, gone, chia_resolve::write_standing(&child, spent_at, lease, ours)));
+                        }
+                        let mut book = hub.knocks.lock().unwrap();
+                        let mut changed = false;
+                        for (coin_hex, hint_hex, era, was, gone, standing) in verdicts {
+                            match standing {
+                                WriteStanding::Confirmed { height, .. } if chia_lane::era_of(height) != era => {
+                                    println!("⛓️ ChiaHub knock: our knock confirmed at height {height}, outside era {era} — the host will not read it; forgotten, the next dial exhaustion knocks again");
+                                    changed |= book.drop_sent(&coin_hex, &hint_hex);
+                                }
+                                WriteStanding::Confirmed { height, seen_at } => {
+                                    if book.confirm_sent(&coin_hex, &hint_hex, height) {
+                                        if was == 0 {
+                                            println!("⛓️ ChiaHub knock: our knock confirmed at height {height} — dialing the host on the schedule from here");
+                                        } else {
+                                            println!("⛓️ ChiaHub knock: the chain moved our knock from height {was} to {height} (a reorganization) — the schedule follows");
+                                        }
+                                        changed = true;
+                                    } else if knock_peak.is_some_and(|p| crate::chia_knock::settled_by(height, p, seen_at)) && book.settle_sent(&coin_hex, &hint_hex) {
+                                        // Found where the book says, SETTLED_DEPTH deep at the
+                                        // agreed peak AND at the height the lookup's own peers
+                                        // stood (round 10: peers behind the peak prove it only
+                                        // as deep as they see it, an undated lookup no depth),
+                                        // by THIS lookup: final. Age alone never settles it
+                                        // (#272 review round 8).
+                                        changed = true;
+                                    }
+                                }
+                                WriteStanding::Dead(why) => {
+                                    println!("⛓️ ChiaHub knock: our knock never landed — {why}; forgotten, the next dial exhaustion knocks again");
+                                    changed |= book.drop_sent(&coin_hex, &hint_hex);
+                                }
+                                WriteStanding::Pending if gone => {
+                                    // Confirmed last tick, under no block now by a
+                                    // listing judged past the one that held it: that
+                                    // block is gone. Its spend may land again; until
+                                    // the chain says, nobody is dialed.
+                                    if book.unconfirm_sent(&coin_hex, &hint_hex) {
+                                        println!("⛓️ ChiaHub knock: the block that confirmed our knock at height {was} is gone (a reorganization) — waiting for the chain's word again");
+                                        changed = true;
+                                    }
+                                }
+                                WriteStanding::Pending => {}
+                            }
+                        }
+                        if changed {
+                            let _ = book.save(knocks_path);
+                        }
+                    }
+                    Err(e) => eprintln!("⛓️ ChiaHub knock: could not read our knocks' confirmation: {e:#}"),
+                }
+            }
+            // ── #231 P6b: the knocks READ, until settled (#272 review round
+            // 7): the coin that carried each is looked up again on the agreed
+            // lane until a lookup finds it unmoved SETTLED_DEPTH deep, at the
+            // agreed peak and at the lookup's own judged height alike (round 8:
+            // age alone proves nothing; round 10: nor does a peak the answering
+            // peers have not reached) — moved by a reorganization, its clock
+            // follows (the knocker's does the same above), or the knock is void
+            // when the move left its era; gone — on a listing judged at or past
+            // its block (round 9: peers behind it know nothing of the coin) —
+            // nobody is dialed back for it, and the inbox files it afresh
+            // should its spend land again.
+            if let Some(agreed_peak) = knock_peak {
+                let young = hub.knocks.lock().unwrap().unsettled_inbox();
+                if !young.is_empty() {
+                    let coins: Vec<Bytes32> = young.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
+                    match chia_resolve::coin_heights(&agreed, coins).await {
+                        Ok(Some(heights)) => {
+                            let mut book = hub.knocks.lock().unwrap();
+                            let mut changed = false;
+                            for k in &young {
+                                let Some(coin) = chia_resolve::parse_hex32(&k.coin_id) else {
+                                    changed |= book.drop_inbox(&k.coin_id); // malformed: on no chain
+                                    continue;
+                                };
+                                use crate::chia_knock::CoinWord;
+                                let found = heights.found.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
+                                match crate::chia_knock::coin_word(found, heights.judged_at, k.confirmed_height, agreed_peak) {
+                                    CoinWord::Settled => {
+                                        // Where the book says, deep enough, by THIS lookup: final (round 8).
+                                        if book.settle_inbox(&k.coin_id) {
+                                            changed = true;
+                                        }
+                                    }
+                                    // Where the book says, young: asked again next tick. Or on no
+                                    // page of a listing judged below the knock's block (round 9):
+                                    // peers behind it know nothing of the coin; nothing is decided.
+                                    CoinWord::Unmoved | CoinWord::Unjudged => {}
+                                    CoinWord::MovedTo(h) => match book.reclock_inbox(&k.coin_id, h) {
+                                        crate::chia_knock::InboxMove::Reclocked => {
+                                            println!(
+                                                "⛓️ ChiaHub inbox: the chain moved {}'s knock from height {} to {h} (a reorganization) — the schedule follows",
+                                                short(&k.from),
+                                                k.confirmed_height
+                                            );
+                                            changed = true;
+                                        }
+                                        crate::chia_knock::InboxMove::Dropped => {
+                                            println!(
+                                                "⛓️ ChiaHub inbox: the chain moved {}'s knock from height {} to {h}, outside its era (a reorganization) — void, as the knocker's own rule says; forgotten",
+                                                short(&k.from),
+                                                k.confirmed_height
+                                            );
+                                            changed = true;
+                                        }
+                                        crate::chia_knock::InboxMove::Unchanged => {}
+                                    },
+                                    CoinWord::Gone => {
+                                        if book.drop_inbox(&k.coin_id) {
+                                            println!(
+                                                "⛓️ ChiaHub inbox: the block that held {}'s knock (height {}) is gone (a reorganization) — not dialing it back unless it lands again",
+                                                short(&k.from),
+                                                k.confirmed_height
+                                            );
+                                            // Its spend may land again under the SAME coin id, at
+                                            // any height: the hint's cursor must examine that id
+                                            // again, and the room's inbox read come forward (round 8).
+                                            if let Some((_, room_key)) = inbox_rooms.iter().find(|(r, _)| *r == k.room) {
+                                                forget_inbox_coin(&mut inbox_cursors, &mut sched, &own_ck, room_key, &k.room, k.era, coin.to_bytes());
+                                            }
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if changed {
+                                let _ = book.save(knocks_path);
+                            }
+                        }
+                        // Cut short: nothing is said of the coins it did not reach.
+                        Ok(None) => {}
+                        Err(e) => eprintln!("⛓️ ChiaHub inbox: could not look the young knocks' coins up again: {e:#}"),
+                    }
+                }
+            }
+            if let Some(agreed_peak) = knock_peak {
+                let mut book = hub.knocks.lock().unwrap();
+                if book.prune(agreed_peak) > 0 {
+                    let _ = book.save(knocks_path);
+                }
+            }
+
+            // ── #231 P6b: RENDEZVOUS — every dial-back whose boundary fell since
+            // the last, on both sides: the knocker toward the host, the host
+            // toward the knocker, in the knock's room. Addresses come from the
+            // target's freshest presence when we hold its key; with none, iroh
+            // asks the DHT for the node id (the shipped posture for a bare id).
+            // Only in a room this node still holds and still shares cards in
+            // (a room gone public dials nobody back), never a linked target,
+            // never past the room's hold slots. A boundary is planned (its
+            // clock moved up) only once its hold started, or when it is moot;
+            // one the room had no slot for, or whose target another dial
+            // already claims, stays due and comes first next tick (#272 review),
+            // and one the room had no slot for keeps the next slot a finished
+            // hold frees from the record planners (round 11), which otherwise
+            // refilled every slot ahead of it, tick after tick.
+            let due = hub.knocks.lock().unwrap().due_dialbacks(kpeak);
+            let mut planned: Vec<DialBack> = Vec::new();
+            let mut starved: HashMap<String, usize> = HashMap::new();
+            for d in due {
+                let Ok(target_pub) = d.target.parse::<iroh::PublicKey>() else {
+                    planned.push(d); // never dialable: not retried every tick
+                    continue;
+                };
+                let held = hub.rooms.lock().unwrap().contains_key(&d.room);
+                let sharing = hub.chia_rooms.lock().unwrap().get(&d.room).is_some_and(|c| c.may_use_cards());
+                if !held || !sharing || crate::linked_in_room(&hub, &d.room, &target_pub) {
+                    planned.push(d); // moot at this boundary
+                    continue;
+                }
+                if shared.active.lock().unwrap().get(&d.room).copied().unwrap_or(0) >= MAX_HOLDS_PER_ROOM {
+                    *starved.entry(d.room.clone()).or_default() += 1; // no slot: still due, and the next free one is kept for it
+                    continue;
+                }
+                let addrs = node_cache
+                    .get(&d.target)
+                    .map(|(_, f)| crate::chia_public_dial_addrs(&f.record.addrs))
+                    .unwrap_or_default();
+                let source = if d.we_knocked { "knock rendezvous: we knocked" } else { "knock rendezvous: they knocked" };
+                if spawn_hold(&hub, &iroh_ep, &shared, &d.room, HoldCandidate { node_id: d.target.clone(), addrs }, source) {
+                    planned.push(d);
+                }
+            }
+            if knock_peak.is_some() {
+                // Planned on an agreed peak: the reservations are this tick's
+                // word (none due, none kept). Without one nothing was due here,
+                // and last tick's reservations stand.
+                *shared.reserved.lock().unwrap() = starved;
+            }
+            if !planned.is_empty() {
+                let mut book = hub.knocks.lock().unwrap();
+                let mut changed = false;
+                for d in &planned {
+                    changed |= book.mark_dialed(d, kpeak);
+                }
+                if changed {
+                    let _ = book.save(knocks_path);
+                }
+            }
         }
         // Holds: each peer's freshest cached record, in the readable rooms it was
         // met in and is not connected to — with or without a chain peak this
@@ -523,12 +919,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     .map(|((_, node), until)| (node.clone(), *until))
                     .collect();
                 let active_holds = shared.active.lock().unwrap().get(room).copied().unwrap_or(0);
+                let reserved = shared.reserved.lock().unwrap().get(room.as_str()).copied().unwrap_or(0);
                 let ctx = PlanContext {
                     self_id: &self_id,
                     connected: &connected,
                     dialing: &dialing,
                     cooldown_until: &cooldown_until,
                     active_holds,
+                    reserved,
                     now_unix,
                     now: Instant::now(),
                 };
@@ -559,6 +957,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
 /// target in cooldown. The outcome is also noted in the address book when the
 /// target is a peer whose card we hold, read off the room (a hold cut short by
 /// the room's removal notes nothing; `source` names what found it, for the log).
+/// Returns whether the hold started: false when the target is already being
+/// dialed by another path (its claim is taken) or its id does not parse.
 fn spawn_hold(
     hub: &crate::SharedHub,
     iroh_ep: &iroh::Endpoint,
@@ -566,10 +966,10 @@ fn spawn_hold(
     room: &str,
     cand: HoldCandidate,
     source: &str,
-) {
-    let Ok(target_pub) = cand.node_id.parse::<iroh::PublicKey>() else { return };
+) -> bool {
+    let Ok(target_pub) = cand.node_id.parse::<iroh::PublicKey>() else { return false };
     if !hub.dialing.lock().unwrap().insert(target_pub) {
-        return;
+        return false;
     }
     *shared.active.lock().unwrap().entry(room.to_string()).or_insert(0) += 1;
     println!(
@@ -621,6 +1021,7 @@ fn spawn_hold(
                 .insert((room_h, cand.node_id), Instant::now() + TARGET_COOLDOWN);
         }
     });
+    true
 }
 
 /// The order contact keys are offered a read in this tick: never-read keys
@@ -645,6 +1046,41 @@ const CK_SCHED_PREFIX: &str = "ck:";
 
 /// The beat entry of the read of our own contact key.
 const SELF_SCHED_KEY: &str = "self";
+
+/// #231 P6b: the beat entry of a room's inbox read.
+/// #231 P6b (#272 review round 8): a knock read from the inbox left the chain
+/// (its block reorganized away) and its entry went; its spend may land again
+/// under the SAME coin id, at any height — and the hint's cursor still lists
+/// that id as examined, so the listing would skip it: for good below the height
+/// examined, until the next cycle clears the set above it. The id is forgotten
+/// and the room's inbox read falls due at the next tick instead of the next
+/// beat.
+fn forget_inbox_coin(
+    cursors: &mut HashMap<[u8; 32], HintCursor>,
+    sched: &mut BeatSchedule,
+    own_ck: &[u8; 32],
+    room_key: &[u8; 32],
+    room: &str,
+    era: u64,
+    coin: [u8; 32],
+) {
+    let lane = chia_lane::derive_lane_token(room_key);
+    let hint = chia_lane::derive_inbox_hint(own_ck, &lane, era);
+    if let Some(cursor) = cursors.get_mut(&hint) {
+        cursor.seen.remove(&coin);
+    }
+    sched.forget(&inbox_sched_key(room));
+}
+
+const INBOX_SCHED_PREFIX: &str = "inbox:";
+fn inbox_sched_key(room: &str) -> String {
+    format!("{INBOX_SCHED_PREFIX}{room}")
+}
+
+/// The first characters of a node id, for the log.
+fn short(node_id: &str) -> &str {
+    &node_id[..node_id.len().min(16)]
+}
 
 /// The beat entry of a room record read. Room ids are free strings, so the
 /// prefix keeps a room named `self` or `ck:…` from taking another entry's beat.
@@ -736,6 +1172,29 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_inbox_coin_is_examined_again_and_the_read_falls_due() {
+        // #272 review round 8: the inbox entry of a knock whose block
+        // reorganized away is dropped; the same spend landing again carries the
+        // same coin id, which the hint's cursor had marked examined.
+        let (own_ck, room_key) = ([1u8; 32], [2u8; 32]);
+        let lane = chia_lane::derive_lane_token(&room_key);
+        let hint = chia_lane::derive_inbox_hint(&own_ck, &lane, 3);
+        let other = chia_lane::derive_inbox_hint(&own_ck, &lane, 2);
+        let coin = [9u8; 32];
+        let mut cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
+        cursors.entry(hint).or_default().seen.extend([coin, [8u8; 32]]);
+        cursors.entry(other).or_default().seen.insert(coin);
+        let mut sched = BeatSchedule::new(32);
+        assert!(sched.due(&inbox_sched_key("r"), 1_000, false));
+        assert!(!sched.due(&inbox_sched_key("r"), 1_001, false), "read this beat already");
+        forget_inbox_coin(&mut cursors, &mut sched, &own_ck, &room_key, "r", 3, coin);
+        assert!(!cursors[&hint].seen.contains(&coin), "the coin is examined again");
+        assert!(cursors[&hint].seen.contains(&[8u8; 32]), "the others stay examined");
+        assert!(cursors[&other].seen.contains(&coin), "another era's hint is another cursor");
+        assert!(sched.due(&inbox_sched_key("r"), 1_001, false), "the room's inbox read falls due at once");
+    }
+
+    #[test]
     fn env_beat_falls_back_to_default() {
         let s = BeatSchedule::new(0);
         assert_eq!(s.beat_blocks, 1, "zero is clamped, never a division by zero");
@@ -787,6 +1246,7 @@ mod tests {
             dialing: &dialing,
             cooldown_until: &cooldown,
             active_holds: 0,
+            reserved: 0,
             now_unix,
             now,
         };
@@ -811,6 +1271,7 @@ mod tests {
             dialing: &empty,
             cooldown_until: &expired,
             active_holds: MAX_HOLDS_PER_ROOM - 1,
+            reserved: 0,
             now_unix: 5,
             now,
         };
@@ -830,6 +1291,45 @@ mod tests {
         let ids: Vec<String> = plan_holds(&records, &ctx_free, &parse_all).into_iter().map(|c| c.node_id).collect();
         assert_eq!(ids.len(), MAX_HOLDS_PER_ROOM, "never more holds than the per-room cap");
         assert_eq!(ids[0], "f", "freshest first, its expired cooldown ignored");
+    }
+
+    #[test]
+    fn a_starved_dialback_keeps_the_next_free_slot_from_the_record_planners() {
+        // #272 review round 11: the room-record planner runs before the
+        // dial-back planner each tick and the contact-card planner after it,
+        // and both fill the same hold slots; with cached peers rotating through
+        // their cooldowns they refilled every slot a finished hold freed, and a
+        // due knocker with no cached record never got its dial-back. A dial-back
+        // that found no slot reserves one: the planners leave it free until the
+        // dial-back takes it.
+        let now = Instant::now();
+        let empty: HashSet<String> = HashSet::new();
+        let none: HashMap<String, Instant> = HashMap::new();
+        let records: Vec<ChiaPresenceRecord> = (0..6)
+            .map(|i| rec(&format!("{}", (b'a' + i) as char), 1_000 + i as u64, 0, &["198.51.100.9:1"]))
+            .collect();
+        let ctx = |active_holds: usize, reserved: usize| PlanContext {
+            self_id: "me",
+            connected: &empty,
+            dialing: &empty,
+            cooldown_until: &none,
+            active_holds,
+            reserved,
+            now_unix: 5,
+            now,
+        };
+        // Tick 1: nothing reserved, the planner fills every slot; the dial-back finds none and reserves one.
+        assert_eq!(plan_holds(&records, &ctx(0, 0), &parse_all).len(), MAX_HOLDS_PER_ROOM);
+        // Tick 2: a hold finished, but the slot is the dial-back's: the planner leaves it.
+        assert!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 1, 1), &parse_all).is_empty(), "the freed slot is kept for the dial-back");
+        // Two freed, one reserved: one for the planner.
+        assert_eq!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 2, 1), &parse_all).len(), 1);
+        // Two dial-backs starved: two kept.
+        assert!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 2, 2), &parse_all).is_empty());
+        // A reservation larger than the room never underflows.
+        assert!(plan_holds(&records, &ctx(0, MAX_HOLDS_PER_ROOM + 3), &parse_all).is_empty());
+        // The dial-back planned (or moot): nothing reserved, the planner fills again.
+        assert_eq!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 1, 0), &parse_all).len(), 1);
     }
 
     #[test]

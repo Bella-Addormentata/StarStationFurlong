@@ -2,8 +2,10 @@
  * 💾 Room-doc snapshot cache (durability Tier A — room-durability-plan.md §3)
  *
  * One IndexedDB database (`ssf-room-cache`), one store, key = roomId, value =
- * `{ update, savedAt, lastUsedAt, bytes, owned }` where `update` is a FULL
- * self-contained snapshot (`Y.encodeStateAsUpdate(doc)`), never an update log.
+ * `{ update, savedAt, lastUsedAt, bytes, owned, synced }` where `update` is a
+ * FULL self-contained snapshot (`Y.encodeStateAsUpdate(doc)`), never an update
+ * log, and `synced` says whether the replica held the room's state when it was
+ * taken (#272 review round 5; see `snapshotUsable`).
  * Hand-rolled instead of y-indexeddb on purpose: our docs are created per join
  * and destroyed on leave (y-indexeddb's long-lived-doc lifecycle races
  * `doc.destroy()` during room swaps), restore must be ONE awaitable read the
@@ -38,12 +40,38 @@ const TOTAL_CAP_BYTES = 50_000_000;
 /** Trailing debounce for the doc-update writer. */
 const DEBOUNCE_MS = 1_000;
 
-interface CacheRow {
+export interface CacheRow {
   update: Uint8Array;
   savedAt: number;
   lastUsedAt: number;
   bytes: number;
   owned: boolean;
+  /** Did the replica HOLD the room's state when the snapshot was taken (#272
+   *  review round 5): synced from its host this session, or seeded from a
+   *  snapshot that was? A visit the host never answered is cached too (its
+   *  state vector spares the next join a full resend), but its door documents
+   *  are the empty replica's defaults, which read PUBLIC, so the posture
+   *  probe must not believe it. Absent on rows saved before the flag: not
+   *  believed either. */
+  synced?: boolean;
+}
+
+/** The row a snapshot is saved as. */
+export function cacheRowOf(update: Uint8Array, owned: boolean, synced: boolean, now: number = Date.now()): CacheRow {
+  return { update, savedAt: now, lastUsedAt: now, bytes: update.byteLength, owned, synced };
+}
+
+/** May a restored snapshot be read as the room's state — its doors, and so
+ *  its posture? Only one taken while the replica held the host's state; a row
+ *  saved before the flag existed is not believed. */
+export function snapshotUsable(row: Pick<CacheRow, 'synced'> | null | undefined): boolean {
+  return row?.synced === true;
+}
+
+/** What a restore says: a snapshot applied, and whether it may be read as the
+ *  room's state (`snapshotUsable`). */
+export interface RestoredSnapshot {
+  synced: boolean;
 }
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
@@ -152,29 +180,31 @@ async function enforceCaps(db: IDBDatabase): Promise<void> {
 }
 
 /**
- * Restore a cached snapshot into `doc` (call BEFORE sync.start()). Returns true
- * when a snapshot applied. A corrupt blob is deleted and reported false —
- * exactly today's no-cache behavior.
+ * Restore a cached snapshot into `doc` (call BEFORE sync.start()). Returns what
+ * applied — and whether it may be read as the room's state — or null when
+ * nothing did. A corrupt blob is deleted and reported null — exactly today's
+ * no-cache behavior.
  */
-export async function restoreRoomSnapshot(doc: Y.Doc, roomId: string): Promise<boolean> {
+export async function restoreRoomSnapshot(doc: Y.Doc, roomId: string): Promise<RestoredSnapshot | null> {
   try {
     const db = await openDb();
-    if (!db) return false;
+    if (!db) return null;
     const row = await idbGet(db, roomId);
-    if (!row || !(row.update instanceof Uint8Array) || row.update.byteLength === 0) return false;
+    if (!row || !(row.update instanceof Uint8Array) || row.update.byteLength === 0) return null;
     try {
       Y.applyUpdate(doc, row.update, 'room-cache');
     } catch (err) {
       console.warn(`💾 room cache: corrupt snapshot for ${roomId} — discarding`, err);
       void idbDelete(db, roomId);
-      return false;
+      return null;
     }
     // Touch LRU (fire-and-forget).
     void idbPut(db, roomId, { ...row, lastUsedAt: Date.now() });
-    console.log(`💾 room cache: restored ${roomId} (${row.update.byteLength} bytes, saved ${new Date(row.savedAt).toLocaleString()})`);
-    return true;
+    const synced = snapshotUsable(row);
+    console.log(`💾 room cache: restored ${roomId} (${row.update.byteLength} bytes, saved ${new Date(row.savedAt).toLocaleString()}${synced ? '' : '; the host had not answered when it was taken'})`);
+    return { synced };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -186,11 +216,13 @@ export interface RoomCacheHandle {
 }
 
 /**
- * Attach a debounced snapshot writer to `doc`. `owned()` is sampled at write
- * time (ownership can resolve after join). Writer listeners stack with the
- * ysync sender, and both guard against the destroyed-doc window.
+ * Attach a debounced snapshot writer to `doc`. `owned()` and `synced()` are
+ * sampled at write time (ownership can resolve after join; the host's state
+ * arrives after it, or the replica was seeded from a snapshot that held it —
+ * #272 review round 5). Writer listeners stack with the ysync sender, and both
+ * guard against the destroyed-doc window.
  */
-export function attachRoomCache(doc: Y.Doc, roomId: string, owned: () => boolean): RoomCacheHandle {
+export function attachRoomCache(doc: Y.Doc, roomId: string, owned: () => boolean, synced: () => boolean): RoomCacheHandle {
   let timer: number | null = null;
   let detached = false;
 
@@ -206,16 +238,12 @@ export function attachRoomCache(doc: Y.Doc, roomId: string, owned: () => boolean
       }
       let isOwned = false;
       try { isOwned = owned(); } catch { /* ownership unresolved */ }
+      let isSynced = false;
+      try { isSynced = synced(); } catch { /* not known: not believed */ }
       void (async () => {
         const db = await openDb();
         if (!db) return;
-        await idbPut(db, roomId, {
-          update,
-          savedAt: Date.now(),
-          lastUsedAt: Date.now(),
-          bytes: update.byteLength,
-          owned: isOwned,
-        });
+        await idbPut(db, roomId, cacheRowOf(update, isOwned, isSynced));
         void enforceCaps(db);
       })();
     } catch { /* cache write is never fatal */ }

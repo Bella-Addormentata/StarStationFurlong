@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   atlasComponent, atlasLayout, atlasPoses, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, moduleOverlapAt, pushAtlasToDoc,
-  readAtlas, seedAtlasDefaults,
+  readAtlas, roomIdFromSeed, seedAtlasDefaults,
 } from './stationAtlas';
 import type { BundledAtlasEntry } from './stationAtlas';
 
@@ -740,5 +740,65 @@ describe('🔭 cupola gossip edges (issue 219, review)', () => {
     });
     bind('module-self');
     expect((doc.getMap('atlas').get('module-a') as { cupola?: unknown }).cupola).toEqual(['y-']);
+  });
+});
+
+describe("#231 P6b — a public room's seed carries no node cards (#272 review round 11)", () => {
+  const card = (nodeId: string) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt: 100, sig: 'ff' });
+  const seedOf = (hints: unknown[]) => btoa(JSON.stringify({
+    v: 2, roomId: 'module-self', roomKeyB64: 'a2V5', wtUrl: '', certHashesB64: ['c'], memberHints: hints, issuedAt: 5,
+  }));
+
+  it('publishes the stored seed only once passage is public, and then with every card struck', () => {
+    // A pass minted while the room was private carries the members' cards,
+    // and the atlas keeps the room's seed as that pass had it.
+    const seed = seedOf([
+      { irohNodeId: 'me', nodeCard: card('me') },
+      { irohNodeId: 'them', irohRelayUrls: ['https://relay'], nodeCard: card('them') },
+    ]);
+    harvestIntoAtlas({ roomId: 'module-self', name: 'SELF', seed, doors: [{ doorId: 'd:1', targetSeed: '#room=module-nbr' }] });
+    let publicNow = false;
+    bindStationAtlasDoc(doc, { roomId: 'module-self', isPassagePublic: () => publicNow });
+    const published = () => doc.getMap('atlas').get('module-self') as { seed?: string } | undefined;
+    expect(published()).toBeDefined();
+    expect(published()!.seed).toBeUndefined();
+    // The room's passage goes public: the seed travels, cards struck, routes
+    // and the room key kept …
+    publicNow = true;
+    pushAtlasToDoc();
+    const out = JSON.parse(atob(published()!.seed!));
+    expect(out.memberHints).toEqual([{ irohNodeId: 'me' }, { irohNodeId: 'them', irohRelayUrls: ['https://relay'] }]);
+    expect(out.roomKeyB64).toBe('a2V5');
+    // … and still names the room, so the helm's own berth seed (the doc's
+    // copy, pulled back over the stored one) and a visitor's both reach it.
+    expect(roomIdFromSeed(published()!.seed!)).toBe('module-self');
+    expect(roomIdFromSeed(readAtlas()['module-self'].seed!)).toBe('module-self');
+  });
+
+  it("publishes a docked pass as a door's seed with every card struck, while private and once public (round 12)", () => {
+    // A module docked with a private pass: the pass, cards and all, is the
+    // door's address in the doors doc and the door's seed in the atlas. Door
+    // seeds travel whatever the posture, so they travel with the route alone,
+    // before and after the room's own passage goes public.
+    const seedFor = (roomId: string, hints: unknown[]) => btoa(JSON.stringify({
+      v: 2, roomId, roomKeyB64: 'a2V5', wtUrl: '', certHashesB64: ['c'], memberHints: hints, issuedAt: 5,
+    }));
+    const dock = seedFor('module-dock', [{ irohNodeId: 'host', irohRelayUrls: ['https://relay'], nodeCard: card('host') }, { irohNodeId: 'bare' }]);
+    const route = [{ irohNodeId: 'host', irohRelayUrls: ['https://relay'] }, { irohNodeId: 'bare' }];
+    harvestIntoAtlas({ roomId: 'module-self', name: 'SELF', seed: seedOf([{ irohNodeId: 'me', nodeCard: card('me') }]), doors: [{ doorId: 'd:bay', targetSeed: dock }] });
+    let publicNow = false;
+    bindStationAtlasDoc(doc, { roomId: 'module-self', isPassagePublic: () => publicNow });
+    const published = () => doc.getMap('atlas').get('module-self') as { seed?: string; doors: Record<string, { targetSeed?: string; targetRoomId: string }> };
+    // Private: the door's seed travels, cards struck and route kept; the room's own seed does not.
+    expect(published().seed).toBeUndefined();
+    expect(published().doors['d:bay'].targetRoomId).toBe('module-dock');
+    expect(JSON.parse(atob(published().doors['d:bay'].targetSeed!)).memberHints).toEqual(route);
+    expect(roomIdFromSeed(published().doors['d:bay'].targetSeed!)).toBe('module-dock');
+    // Public: both seeds travel, neither with a card.
+    publicNow = true;
+    pushAtlasToDoc();
+    expect(JSON.parse(atob(published().seed!)).memberHints).toEqual([{ irohNodeId: 'me' }]);
+    expect(JSON.parse(atob(published().doors['d:bay'].targetSeed!)).memberHints).toEqual(route);
+    expect(JSON.parse(atob(published().doors['d:bay'].targetSeed!)).roomKeyB64).toBe('a2V5');
   });
 });

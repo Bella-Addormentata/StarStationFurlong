@@ -34,6 +34,10 @@ export interface LocalFingerprint {
   /** R1: the iroh UDP port ACTUALLY bound (post random-port fallback) —
    *  the port a router forward must target. */
   iroh_port?: number;
+  /** #231 P6b: whether the node hands out its contact card at all (a durable
+   *  contact key and `SSF_CHIA_SHARE_CARD` not `0`). Absent from older nodes,
+   *  which `nodeSharesCard` (roomCap.ts) reads as sharing. */
+  share_card?: boolean;
 }
 
 const HEX_32 = /^[0-9a-f]{64}$/i;
@@ -85,5 +89,6 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (typeof r.iroh_port === 'number' && Number.isInteger(r.iroh_port) && r.iroh_port >= 0 && r.iroh_port <= 65535) {
     fp.iroh_port = r.iroh_port;
   }
+  if (typeof r.share_card === 'boolean') fp.share_card = r.share_card;
   return fp;
 }
