@@ -185,7 +185,9 @@ pub struct WalletLease {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Settling {
     coins: Vec<ParkedInput>,
-    /// The height the chain listed its inputs spent at (the latest, when they differ).
+    /// The height the chain listed its inputs spent at (the latest, when they
+    /// differ) as of the LAST listing: a listing that names another height
+    /// moves it, and the depth is measured from there (round 11).
     spent_at: u32,
     bundle: SpendBundle,
 }
@@ -558,7 +560,7 @@ impl WalletLease {
     /// the lease tests; a reconciliation retires through [`WalletLease::retire`],
     /// which keeps a spend released as SPENT settling (round 10).
     pub fn release(&self, spends: &[u64]) {
-        self.retire(spends, Vec::new(), &[], &[], Instant::now());
+        self.retire(spends, Vec::new(), &[], &[], &[], Instant::now());
     }
 
     /// What a reconciliation decided, in ONE write of the file (#272 review
@@ -569,12 +571,18 @@ impl WalletLease {
     /// grace, never over a NEWER marker of the same coin (a coin a later spend
     /// took meanwhile keeps that spend's marker; a re-parked spend none of
     /// whose coins is free again is forgotten, its bundle with it, so no bundle
-    /// parks no coin); `done` settling spends are forgotten.
-    fn retire(&self, released: &[u64], settling: Vec<(u64, Settling)>, reparked: &[u64], done: &[u64], now: Instant) {
+    /// parks no coin); `reclocked` settling spends take the height the chain
+    /// now lists them spent at (round 11); `done` settling spends are forgotten.
+    fn retire(&self, released: &[u64], settling: Vec<(u64, Settling)>, reparked: &[u64], reclocked: &[(u64, u32)], done: &[u64], now: Instant) {
         let back: Vec<(u64, Settling)> = {
             let mut kept = self.settling.lock().unwrap();
             for spend in done {
                 kept.remove(spend);
+            }
+            for (spend, height) in reclocked {
+                if let Some(s) = kept.get_mut(spend) {
+                    s.spent_at = *height;
+                }
             }
             let back = reparked.iter().filter_map(|spend| kept.remove(spend).map(|s| (*spend, s))).collect();
             kept.extend(settling);
@@ -894,7 +902,7 @@ impl WalletLease {
         let judged = if undated { None } else { judged_at };
         let judged_complete = if complete { judged } else { None };
         let released = settle(&due, &spent_on_chain, &in_mempool, judged_complete);
-        let words = release_words(&due, &released, &spent_on_chain, &in_mempool);
+        let mut words = release_words(&due, &released, &spent_on_chain, &in_mempool);
         // Round 10: a spend released as SPENT keeps its bundle SETTLING, under
         // the height the chain spent its inputs at, until a listing finds them
         // spent SETTLED_DEPTH deep; one released on the peers' refusal, or on
@@ -910,11 +918,15 @@ impl WalletLease {
             })
             .collect();
         let mut reparked = Vec::new();
+        let mut reclocked: Vec<(u64, u32)> = Vec::new();
         let mut done = Vec::new();
         for (spend, s) in &settling {
             let inputs: Vec<(Option<bool>, Option<u32>)> =
                 s.coins.iter().map(|c| (spent_on_chain.get(&c.coin_id).copied(), c.seen_at)).collect();
-            match settling_step(s.spent_at, &inputs, judged, judged_complete) {
+            // Where this listing says the spend stands now (round 11): the
+            // latest height it names any input spent at.
+            let current = s.coins.iter().filter_map(|c| spent_heights.get(&c.coin_id).copied()).max();
+            match settling_step(s.spent_at, current, &inputs, judged, judged_complete) {
                 SettlingStep::Keep => {}
                 SettlingStep::Repark => {
                     println!(
@@ -923,17 +935,28 @@ impl WalletLease {
                     );
                     reparked.push(*spend);
                 }
+                SettlingStep::Reclock(height) => {
+                    println!(
+                        "⛓️ wallet lease: the chain moved the block that spent spend #{spend}'s coins from height {} to {height} (a reorganization); settling from there",
+                        s.spent_at
+                    );
+                    reclocked.push((*spend, height));
+                }
                 SettlingStep::Done(spent) => {
-                    if !spent {
+                    if spent {
+                        // Final: the word SPENT outlives the settling record for
+                        // this run, as a release's word does.
+                        words.extend(s.coins.iter().map(|c| (c.coin_id, LeaseWord::Spent)));
+                    } else {
                         println!("⛓️ wallet lease: spend #{spend}'s coins are on no chain the peers know; forgotten");
                     }
                     done.push(*spend);
                 }
             }
         }
-        if !released.is_empty() || !reparked.is_empty() || !done.is_empty() {
+        if !released.is_empty() || !reparked.is_empty() || !reclocked.is_empty() || !done.is_empty() {
             self.remember(&words);
-            self.retire(&released, now_settling, &reparked, &done, now);
+            self.retire(&released, now_settling, &reparked, &reclocked, &done, now);
         }
     }
 }
@@ -949,6 +972,11 @@ pub enum SettlingStep {
     /// parked again under its number and bundle, so the liveness probe pushes
     /// it again and no writer selects the coin meanwhile.
     Repark,
+    /// The listing names the inputs spent at another height: a reorganization
+    /// moved the block that holds the spend, with no tick in between seeing
+    /// the inputs unspent (round 11). The record follows, and the depth is
+    /// measured from the block that holds the spend now.
+    Reclock(u32),
     /// Final — `true`: every input spent [`crate::chia_knock::SETTLED_DEPTH`]
     /// deep at the listing's judged height; `false`: the inputs are on no
     /// chain the peers know, absent from a complete listing judged at or past
@@ -957,28 +985,42 @@ pub enum SettlingStep {
     Done(bool),
 }
 
-/// Judge a settling spend, spent at `spent_at`, by a listing: `inputs` is
-/// each input's spent flag where the listing names it (`None`: absent) with
-/// the height the coin was seen confirmed at when selected; `judged` the
-/// height the listing was judged at (`None`: undated), `judged_complete` the
-/// same only when the listing ran to its end. A listing judged below the
-/// spent height, or undated, lists the inputs unspent without proving the
-/// block gone (peers behind it); one cut short says nothing of the coins it
-/// left out; a coin whose height is unknown is never freed on silence.
-/// Nothing here is decided by the clock.
-pub fn settling_step(spent_at: u32, inputs: &[(Option<bool>, Option<u32>)], judged: Option<u32>, judged_complete: Option<u32>) -> SettlingStep {
+/// Judge a settling spend, recorded spent at `spent_at`, by a listing:
+/// `current` is the latest height the listing names any of its inputs spent
+/// at (`None`: none spent), `inputs` each input's spent flag where the listing
+/// names it (`None`: absent) with the height the coin was seen confirmed at
+/// when selected; `judged` the height the listing was judged at (`None`:
+/// undated), `judged_complete` the same only when the listing ran to its end.
+/// A listing judged below the spent height, or undated, lists the inputs
+/// unspent without proving the block gone (peers behind it); one cut short
+/// says nothing of the coins it left out; a coin whose height is unknown is
+/// never freed on silence. The depth is measured from the block the listing
+/// says holds the spend NOW, never from the first inclusion (round 11: a
+/// reorganization can move the block with no tick in between seeing the
+/// inputs unspent). Nothing here is decided by the clock.
+pub fn settling_step(
+    spent_at: u32,
+    current: Option<u32>,
+    inputs: &[(Option<bool>, Option<u32>)],
+    judged: Option<u32>,
+    judged_complete: Option<u32>,
+) -> SettlingStep {
     if judged.is_some_and(|j| j >= spent_at) && inputs.iter().any(|(spent, _)| *spent == Some(false)) {
         return SettlingStep::Repark;
     }
+    let height = current.unwrap_or(spent_at);
     let final_word = |spent: Option<bool>, seen: Option<u32>| match spent {
-        Some(true) => judged.is_some_and(|j| crate::chia_knock::settled(spent_at, j)),
+        Some(true) => judged.is_some_and(|j| crate::chia_knock::settled(height, j)),
         Some(false) => false,
         None => judged_complete.is_some_and(|j| seen.is_some_and(|seen| j >= seen)),
     };
     if !inputs.is_empty() && inputs.iter().all(|(spent, seen)| final_word(*spent, *seen)) {
         return SettlingStep::Done(inputs.iter().all(|(spent, _)| *spent == Some(true)));
     }
-    SettlingStep::Keep
+    match current {
+        Some(moved) if moved != spent_at => SettlingStep::Reclock(moved),
+        _ => SettlingStep::Keep,
+    }
 }
 
 /// Push `bundle`, which consumes `inputs`, with the inputs PARKED FIRST (#245
@@ -2977,23 +3019,38 @@ mod tests {
         // #272 review round 10: the pure judgment behind the lease's settling set.
         use crate::chia_knock::SETTLED_DEPTH;
         use SettlingStep::*;
+        let d = SETTLED_DEPTH;
         let one = |spent: Option<bool>| vec![(spent, Some(900u32))];
-        assert_eq!(settling_step(1000, &one(Some(false)), Some(1000), Some(1000)), Repark, "unspent, judged at the spend itself: the block is gone");
-        assert_eq!(settling_step(1000, &one(Some(false)), Some(1000), None), Repark, "cut short or not: the coin is named");
-        assert_eq!(settling_step(1000, &one(Some(false)), Some(999), Some(999)), Keep, "peers behind the spend list it unspent and prove nothing");
-        assert_eq!(settling_step(1000, &one(Some(false)), None, None), Keep, "undated: nothing is said");
-        assert_eq!(settling_step(1000, &one(Some(true)), Some(1000 + SETTLED_DEPTH - 1), None), Keep, "spent, not deep enough");
-        assert_eq!(settling_step(1000, &one(Some(true)), Some(1000 + SETTLED_DEPTH), None), Done(true), "spent SETTLED_DEPTH deep at the judged height: final");
-        assert_eq!(settling_step(1000, &one(Some(true)), None, None), Keep, "undated: no depth is proved");
-        assert_eq!(settling_step(1000, &one(None), Some(950), Some(950)), Done(false), "on no chain the peers know, past the coin's own confirmation");
-        assert_eq!(settling_step(1000, &one(None), Some(950), None), Keep, "absent from a listing cut short: nothing is said");
-        assert_eq!(settling_step(1000, &one(None), Some(899), Some(899)), Keep, "absent below its confirmation: peers behind it");
-        assert_eq!(settling_step(1000, &[(None, None)], Some(5000), Some(5000)), Keep, "no height known for the coin: never freed on silence");
-        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (Some(false), Some(900))], Some(1000), Some(1000)), Repark, "one input back unspent: parked again, the probe decides");
-        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (Some(false), Some(900))], Some(5000), Some(5000)), Repark, "however deep the other stands");
-        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + SETTLED_DEPTH), Some(1000 + SETTLED_DEPTH)), Done(false), "one spent deep, one on no chain: nothing left to settle");
-        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + SETTLED_DEPTH), None), Keep, "the absent one unjudged by a listing cut short");
-        assert_eq!(settling_step(1000, &[], Some(5000), Some(5000)), Keep, "no inputs: nothing to judge");
+        let spent_at = |h: u32| (Some(h), one(Some(true)));
+        // Unspent again.
+        assert_eq!(settling_step(1000, None, &one(Some(false)), Some(1000), Some(1000)), Repark, "unspent, judged at the spend itself: the block is gone");
+        assert_eq!(settling_step(1000, None, &one(Some(false)), Some(1000), None), Repark, "cut short or not: the coin is named");
+        assert_eq!(settling_step(1000, None, &one(Some(false)), Some(999), Some(999)), Keep, "peers behind the spend list it unspent and prove nothing");
+        assert_eq!(settling_step(1000, None, &one(Some(false)), None, None), Keep, "undated: nothing is said");
+        // Spent where the record says.
+        let (cur, inputs) = spent_at(1000);
+        assert_eq!(settling_step(1000, cur, &inputs, Some(1000 + d - 1), None), Keep, "spent, not deep enough");
+        assert_eq!(settling_step(1000, cur, &inputs, Some(1000 + d), None), Done(true), "spent SETTLED_DEPTH deep at the judged height: final, cut short or not");
+        assert_eq!(settling_step(1000, cur, &inputs, None, None), Keep, "undated: no depth is proved");
+        // Spent in ANOTHER block (round 11): a reorganization moved the spend
+        // with no tick in between seeing the inputs unspent. The record moves,
+        // and the depth is measured from the block that holds the spend now.
+        let (cur, inputs) = spent_at(1031);
+        assert_eq!(settling_step(1000, cur, &inputs, Some(1032), Some(1032)), Reclock(1031), "deep from the first inclusion, one block from the new: moved, not settled");
+        assert_eq!(settling_step(1000, cur, &inputs, Some(1031 + d - 1), None), Reclock(1031));
+        assert_eq!(settling_step(1000, cur, &inputs, Some(1031 + d), None), Done(true), "deep from the block that holds it now");
+        assert_eq!(settling_step(1031, cur, &inputs, Some(1031 + d - 1), None), Keep, "already re-clocked: nothing new");
+        // Absent.
+        assert_eq!(settling_step(1000, None, &one(None), Some(950), Some(950)), Done(false), "on no chain the peers know, past the coin's own confirmation");
+        assert_eq!(settling_step(1000, None, &one(None), Some(950), None), Keep, "absent from a listing cut short: nothing is said");
+        assert_eq!(settling_step(1000, None, &one(None), Some(899), Some(899)), Keep, "absent below its confirmation: peers behind it");
+        assert_eq!(settling_step(1000, None, &[(None, None)], Some(5000), Some(5000)), Keep, "no height known for the coin: never freed on silence");
+        // Several inputs.
+        assert_eq!(settling_step(1000, Some(1000), &[(Some(true), Some(900)), (Some(false), Some(900))], Some(1000), Some(1000)), Repark, "one input back unspent: parked again, the probe decides");
+        assert_eq!(settling_step(1000, Some(1005), &[(Some(true), Some(900)), (Some(false), Some(900))], Some(5000), Some(5000)), Repark, "however deep the other stands, and wherever it moved");
+        assert_eq!(settling_step(1000, Some(1000), &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + d), Some(1000 + d)), Done(false), "one spent deep, one on no chain: nothing left to settle");
+        assert_eq!(settling_step(1000, Some(1000), &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + d), None), Keep, "the absent one unjudged by a listing cut short");
+        assert_eq!(settling_step(1000, None, &[], Some(5000), Some(5000)), Keep, "no inputs: nothing to judge");
     }
 
     #[tokio::test]
@@ -3073,10 +3130,23 @@ mod tests {
         again.reconcile_at(&listing(Some(1005), Some(1006)), t2).await;
         assert!(again.is_settling(&id) && !again.is_parked(&id));
         assert_eq!(on_disk().settling[0].spent_at, 1005);
-        // … and found spent SETTLED_DEPTH deep at the listing's own height: final.
-        again.reconcile_at(&listing(Some(1005), Some(1005 + SETTLED_DEPTH)), t2).await;
-        assert!(!again.is_settling(&id) && !again.is_parked(&id) && !again.is_taken(&id));
-        assert_eq!(again.lease_word(&id), LeaseWord::Spent, "this run remembers the release");
+        // … moved to yet another block by a reorganization no tick saw the
+        // input unspent in between (round 11): the record follows, in the file
+        // too, and a listing deep enough from the OLD height settles nothing …
+        again.reconcile_at(&listing(Some(1020), Some(1021)), t2).await;
+        assert!(again.is_settling(&id) && !again.is_parked(&id));
+        assert_eq!(on_disk().settling[0].spent_at, 1020, "re-clocked to the block that holds it now");
+        again.reconcile_at(&listing(Some(1020), Some(1005 + SETTLED_DEPTH)), t2).await;
+        assert!(again.is_settling(&id), "deep from the first inclusion, shallow from the block that holds it: still settling");
+        // … across a restart …
+        let third = WalletLease::new();
+        third.restore(&path);
+        assert!(third.is_settling(&id) && !third.is_parked(&id));
+        assert_eq!(third.lease_word(&id), LeaseWord::Spent);
+        // … and found spent SETTLED_DEPTH deep from there, at the listing's own height: final.
+        third.reconcile_at(&listing(Some(1020), Some(1020 + SETTLED_DEPTH)), t2).await;
+        assert!(!third.is_settling(&id) && !third.is_parked(&id) && !third.is_taken(&id));
+        assert_eq!(third.lease_word(&id), LeaseWord::Spent, "this run remembers the settlement");
         assert!(on_disk().settling.is_empty());
         // A settling spend whose input is on no chain the peers know — absent
         // from a complete listing judged past the coin's own confirmation — has

@@ -142,6 +142,13 @@ pub struct PlanContext<'a> {
     pub cooldown_until: &'a HashMap<String, Instant>,
     /// Holds currently running for this room.
     pub active_holds: usize,
+    /// Hold slots kept free for the rendezvous dial-backs due in this room
+    /// that found none last tick (#272 review round 11): the record planners
+    /// run around the dial-back planner each tick and refilled every slot a
+    /// finished hold freed before it ran, so with enough cached peers rotating
+    /// through their cooldowns a due knocker with no cached record never got
+    /// its dial-back. A starved dial-back reserves its slot for the next tick.
+    pub reserved: usize,
     pub now_unix: u64,
     pub now: Instant,
 }
@@ -149,13 +156,14 @@ pub struct PlanContext<'a> {
 /// The symmetric trigger's decision: which records in `records` (one per node,
 /// freshest first) deserve a hold right now. Skips ourselves, connected peers,
 /// in-flight dials, cooled-down targets, expired records and records with no
-/// dialable public address; caps the result by the room's free hold slots.
+/// dialable public address; caps the result by the room's free hold slots,
+/// less the slots reserved for due dial-backs ([`PlanContext::reserved`]).
 pub fn plan_holds(
     records: &[ChiaPresenceRecord],
     ctx: &PlanContext<'_>,
     addr_filter: &dyn Fn(&[String]) -> Vec<SocketAddr>,
 ) -> Vec<HoldCandidate> {
-    let free = MAX_HOLDS_PER_ROOM.saturating_sub(ctx.active_holds);
+    let free = MAX_HOLDS_PER_ROOM.saturating_sub(ctx.active_holds.saturating_add(ctx.reserved));
     let mut ranked: Vec<&ChiaPresenceRecord> = records.iter().collect();
     ranked.sort_by_key(|r| std::cmp::Reverse(r.issued_at));
     let mut out = Vec::new();
@@ -238,6 +246,10 @@ pub struct WatchShared {
     pub cooldowns: Mutex<HashMap<(String, String), Instant>>,
     /// room -> holds in flight.
     pub active: Mutex<HashMap<String, usize>>,
+    /// room -> hold slots kept free for due rendezvous dial-backs that found
+    /// none last tick (see [`PlanContext::reserved`]); rewritten by every tick
+    /// that planned dial-backs on an agreed peak.
+    pub reserved: Mutex<HashMap<String, usize>>,
 }
 
 /// Is the watcher enabled? `SSF_CHIA_WATCH=0` is the kill switch.
@@ -435,12 +447,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 .map(|((_, node), until)| (node.clone(), *until))
                 .collect();
             let active_holds = shared.active.lock().unwrap().get(&room).copied().unwrap_or(0);
+            let reserved = shared.reserved.lock().unwrap().get(room.as_str()).copied().unwrap_or(0);
             let ctx = PlanContext {
                 self_id: &self_id,
                 connected: &connected,
                 dialing: &dialing,
                 cooldown_until: &cooldown_until,
                 active_holds,
+                reserved,
                 now_unix,
                 now: Instant::now(),
             };
@@ -816,9 +830,13 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // never past the room's hold slots. A boundary is planned (its
             // clock moved up) only once its hold started, or when it is moot;
             // one the room had no slot for, or whose target another dial
-            // already claims, stays due and comes first next tick (#272 review).
+            // already claims, stays due and comes first next tick (#272 review),
+            // and one the room had no slot for keeps the next slot a finished
+            // hold frees from the record planners (round 11), which otherwise
+            // refilled every slot ahead of it, tick after tick.
             let due = hub.knocks.lock().unwrap().due_dialbacks(kpeak);
             let mut planned: Vec<DialBack> = Vec::new();
+            let mut starved: HashMap<String, usize> = HashMap::new();
             for d in due {
                 let Ok(target_pub) = d.target.parse::<iroh::PublicKey>() else {
                     planned.push(d); // never dialable: not retried every tick
@@ -831,7 +849,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     continue;
                 }
                 if shared.active.lock().unwrap().get(&d.room).copied().unwrap_or(0) >= MAX_HOLDS_PER_ROOM {
-                    continue; // no slot: still due
+                    *starved.entry(d.room.clone()).or_default() += 1; // no slot: still due, and the next free one is kept for it
+                    continue;
                 }
                 let addrs = node_cache
                     .get(&d.target)
@@ -841,6 +860,12 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 if spawn_hold(&hub, &iroh_ep, &shared, &d.room, HoldCandidate { node_id: d.target.clone(), addrs }, source) {
                     planned.push(d);
                 }
+            }
+            if knock_peak.is_some() {
+                // Planned on an agreed peak: the reservations are this tick's
+                // word (none due, none kept). Without one nothing was due here,
+                // and last tick's reservations stand.
+                *shared.reserved.lock().unwrap() = starved;
             }
             if !planned.is_empty() {
                 let mut book = hub.knocks.lock().unwrap();
@@ -882,12 +907,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     .map(|((_, node), until)| (node.clone(), *until))
                     .collect();
                 let active_holds = shared.active.lock().unwrap().get(room).copied().unwrap_or(0);
+                let reserved = shared.reserved.lock().unwrap().get(room.as_str()).copied().unwrap_or(0);
                 let ctx = PlanContext {
                     self_id: &self_id,
                     connected: &connected,
                     dialing: &dialing,
                     cooldown_until: &cooldown_until,
                     active_holds,
+                    reserved,
                     now_unix,
                     now: Instant::now(),
                 };
@@ -1207,6 +1234,7 @@ mod tests {
             dialing: &dialing,
             cooldown_until: &cooldown,
             active_holds: 0,
+            reserved: 0,
             now_unix,
             now,
         };
@@ -1231,6 +1259,7 @@ mod tests {
             dialing: &empty,
             cooldown_until: &expired,
             active_holds: MAX_HOLDS_PER_ROOM - 1,
+            reserved: 0,
             now_unix: 5,
             now,
         };
@@ -1250,6 +1279,45 @@ mod tests {
         let ids: Vec<String> = plan_holds(&records, &ctx_free, &parse_all).into_iter().map(|c| c.node_id).collect();
         assert_eq!(ids.len(), MAX_HOLDS_PER_ROOM, "never more holds than the per-room cap");
         assert_eq!(ids[0], "f", "freshest first, its expired cooldown ignored");
+    }
+
+    #[test]
+    fn a_starved_dialback_keeps_the_next_free_slot_from_the_record_planners() {
+        // #272 review round 11: the room-record planner runs before the
+        // dial-back planner each tick and the contact-card planner after it,
+        // and both fill the same hold slots; with cached peers rotating through
+        // their cooldowns they refilled every slot a finished hold freed, and a
+        // due knocker with no cached record never got its dial-back. A dial-back
+        // that found no slot reserves one: the planners leave it free until the
+        // dial-back takes it.
+        let now = Instant::now();
+        let empty: HashSet<String> = HashSet::new();
+        let none: HashMap<String, Instant> = HashMap::new();
+        let records: Vec<ChiaPresenceRecord> = (0..6)
+            .map(|i| rec(&format!("{}", (b'a' + i) as char), 1_000 + i as u64, 0, &["198.51.100.9:1"]))
+            .collect();
+        let ctx = |active_holds: usize, reserved: usize| PlanContext {
+            self_id: "me",
+            connected: &empty,
+            dialing: &empty,
+            cooldown_until: &none,
+            active_holds,
+            reserved,
+            now_unix: 5,
+            now,
+        };
+        // Tick 1: nothing reserved, the planner fills every slot; the dial-back finds none and reserves one.
+        assert_eq!(plan_holds(&records, &ctx(0, 0), &parse_all).len(), MAX_HOLDS_PER_ROOM);
+        // Tick 2: a hold finished, but the slot is the dial-back's: the planner leaves it.
+        assert!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 1, 1), &parse_all).is_empty(), "the freed slot is kept for the dial-back");
+        // Two freed, one reserved: one for the planner.
+        assert_eq!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 2, 1), &parse_all).len(), 1);
+        // Two dial-backs starved: two kept.
+        assert!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 2, 2), &parse_all).is_empty());
+        // A reservation larger than the room never underflows.
+        assert!(plan_holds(&records, &ctx(0, MAX_HOLDS_PER_ROOM + 3), &parse_all).is_empty());
+        // The dial-back planned (or moot): nothing reserved, the planner fills again.
+        assert_eq!(plan_holds(&records, &ctx(MAX_HOLDS_PER_ROOM - 1, 0), &parse_all).len(), 1);
     }
 
     #[test]

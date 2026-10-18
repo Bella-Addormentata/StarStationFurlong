@@ -6,6 +6,7 @@ import {
   buildRoomCapPayload,
   cardsForPass,
   forgetSessionFlags,
+  seedWithoutCards,
   memberCardsOf,
   newerCard,
   nextCapSeq,
@@ -291,6 +292,39 @@ describe('room cap payload (N8 / D3)', () => {
       { irohNodeId: 'them', nodeCard: card('them') },
     ]);
     expect(cardsForPass(hints, false, roomSwitch && nodeSharesCard({ share_card: true }), 'me')).toEqual(hints);
+  });
+
+  it('strikes every node card from a pass seed bound for a public audience, and leaves other seeds alone', () => {
+    // #272 review round 11: the atlas publishes a public room's stored seed
+    // into the room doc; one minted while the room was private carries cards.
+    const boot = {
+      v: 2, roomId: 'r', roomKeyB64: 'a2V5', wtUrl: '', certHashesB64: ['c'],
+      memberHints: [
+        { irohNodeId: 'me', irohRelayUrls: ['https://relay'], nodeCard: card('me') },
+        { irohNodeId: 'them', nodeCard: card('them') },
+        { irohNodeId: 'bare' },
+      ],
+      issuedAt: 5,
+    };
+    const routes = [{ irohNodeId: 'me', irohRelayUrls: ['https://relay'] }, { irohNodeId: 'them' }, { irohNodeId: 'bare' }];
+    const seed = btoa(JSON.stringify(boot));
+    expect(JSON.parse(atob(seedWithoutCards(seed)))).toEqual({ ...boot, memberHints: routes });
+    // In a pass URL's seed param, bare scheme or http: the other params stay.
+    const asUrl = seedWithoutCards(`ssf://room?seed=${encodeURIComponent(seed)}`);
+    expect(asUrl.startsWith('ssf://room?seed=')).toBe(true);
+    expect(JSON.parse(atob(new URL(asUrl).searchParams.get('seed')!)).memberHints).toEqual(routes);
+    const http = new URL(seedWithoutCards(`https://station.example/play?x=1&seed=${encodeURIComponent(seed)}`));
+    expect(http.searchParams.get('x')).toBe('1');
+    expect(JSON.parse(atob(http.searchParams.get('seed')!)).memberHints).toEqual(routes);
+    // Nothing to strike: returned as it is, byte for byte.
+    const cardless = btoa(JSON.stringify({ ...boot, memberHints: [{ irohNodeId: 'bare' }] }));
+    expect(seedWithoutCards(cardless)).toBe(cardless);
+    const cardlessUrl = `ssf://room?seed=${encodeURIComponent(cardless)}`;
+    expect(seedWithoutCards(cardlessUrl)).toBe(cardlessUrl);
+    expect(seedWithoutCards('ssf://room?seed=welcome')).toBe('ssf://room?seed=welcome');
+    expect(seedWithoutCards('#room=module-hub')).toBe('#room=module-hub');
+    expect(seedWithoutCards(btoa('not json'))).toBe(btoa('not json'));
+    expect(seedWithoutCards(btoa('[1,2]'))).toBe(btoa('[1,2]'));
   });
 
   it('sequences caps by the clock but never at or below the last one', () => {

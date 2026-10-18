@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   atlasComponent, atlasLayout, atlasPoses, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, moduleOverlapAt, pushAtlasToDoc,
-  readAtlas, seedAtlasDefaults,
+  readAtlas, roomIdFromSeed, seedAtlasDefaults,
 } from './stationAtlas';
 import type { BundledAtlasEntry } from './stationAtlas';
 
@@ -740,5 +740,38 @@ describe('🔭 cupola gossip edges (issue 219, review)', () => {
     });
     bind('module-self');
     expect((doc.getMap('atlas').get('module-a') as { cupola?: unknown }).cupola).toEqual(['y-']);
+  });
+});
+
+describe("#231 P6b — a public room's seed carries no node cards (#272 review round 11)", () => {
+  const card = (nodeId: string) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt: 100, sig: 'ff' });
+  const seedOf = (hints: unknown[]) => btoa(JSON.stringify({
+    v: 2, roomId: 'module-self', roomKeyB64: 'a2V5', wtUrl: '', certHashesB64: ['c'], memberHints: hints, issuedAt: 5,
+  }));
+
+  it('publishes the stored seed only once passage is public, and then with every card struck', () => {
+    // A pass minted while the room was private carries the members' cards,
+    // and the atlas keeps the room's seed as that pass had it.
+    const seed = seedOf([
+      { irohNodeId: 'me', nodeCard: card('me') },
+      { irohNodeId: 'them', irohRelayUrls: ['https://relay'], nodeCard: card('them') },
+    ]);
+    harvestIntoAtlas({ roomId: 'module-self', name: 'SELF', seed, doors: [{ doorId: 'd:1', targetSeed: '#room=module-nbr' }] });
+    let publicNow = false;
+    bindStationAtlasDoc(doc, { roomId: 'module-self', isPassagePublic: () => publicNow });
+    const published = () => doc.getMap('atlas').get('module-self') as { seed?: string } | undefined;
+    expect(published()).toBeDefined();
+    expect(published()!.seed).toBeUndefined();
+    // The room's passage goes public: the seed travels, cards struck, routes
+    // and the room key kept …
+    publicNow = true;
+    pushAtlasToDoc();
+    const out = JSON.parse(atob(published()!.seed!));
+    expect(out.memberHints).toEqual([{ irohNodeId: 'me' }, { irohNodeId: 'them', irohRelayUrls: ['https://relay'] }]);
+    expect(out.roomKeyB64).toBe('a2V5');
+    // … and still names the room, so the helm's own berth seed (the doc's
+    // copy, pulled back over the stored one) and a visitor's both reach it.
+    expect(roomIdFromSeed(published()!.seed!)).toBe('module-self');
+    expect(roomIdFromSeed(readAtlas()['module-self'].seed!)).toBe('module-self');
   });
 });

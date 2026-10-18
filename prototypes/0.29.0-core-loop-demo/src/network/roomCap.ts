@@ -200,6 +200,49 @@ export function cardsForPass(
   });
 }
 
+/** #231 P6b: a pass seed with every node card struck from its member hints —
+ *  what may leave for a PUBLIC audience (#272 review round 11). A seed is the
+ *  base64 JSON of a `RoomBootstrap`, bare or in a pass URL's `?seed=` param;
+ *  one minted while the room was private carries the members' cards, and the
+ *  station atlas publishes the room's stored seed into the room doc once its
+ *  passage is public, so a public visitor would have read every member's
+ *  contact key out of the older pass. The route stays (node ids, relays,
+ *  direct addresses); only the cards go. A seed with no card, or one that is
+ *  not such JSON (a bundled station's URL, a bare room fragment), is returned
+ *  as it is. */
+export function seedWithoutCards(seed: string): string {
+  const strip = (b64: string): string | null => {
+    let boot: unknown;
+    try {
+      boot = JSON.parse(atob(b64));
+    } catch {
+      return null;
+    }
+    if (!boot || typeof boot !== 'object') return null;
+    const hints = (boot as { memberHints?: unknown }).memberHints;
+    if (!Array.isArray(hints) || !hints.some((h) => !!h && typeof h === 'object' && 'nodeCard' in (h as object))) return null;
+    const routes = hints.map((h) => {
+      if (!h || typeof h !== 'object') return h;
+      const { nodeCard: _card, ...route } = h as { nodeCard?: unknown };
+      return route;
+    });
+    return btoa(JSON.stringify({ ...(boot as object), memberHints: routes }));
+  };
+  try {
+    const url = new URL(seed);
+    const q = url.searchParams.get('seed');
+    if (q) {
+      const stripped = strip(q);
+      if (stripped === null) return seed;
+      url.searchParams.set('seed', stripped);
+      return url.toString();
+    }
+  } catch {
+    /* not a URL: a bare seed */
+  }
+  return strip(seed) ?? seed;
+}
+
 /** Where the LOCAL node's own card is kept once it arrives over the `card`
  *  lane, so passes minted later can carry it. */
 export const NODE_CARD_KEY = 'ssf-node-card';

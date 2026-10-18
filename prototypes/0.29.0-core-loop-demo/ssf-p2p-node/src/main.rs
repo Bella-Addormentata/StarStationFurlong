@@ -470,6 +470,13 @@ pub struct HubState {
     /// re-decided by the next dial anyway.
     #[cfg(feature = "chia-read")]
     pub knock_queue: Mutex<std::collections::VecDeque<chia_knock::KnockRequest>>,
+    /// #231 P6b: the knock queue has a consumer — the heartbeat loop was
+    /// spawned (the publish build, `SSF_CHIA_LANE=1`, a wallet loaded). Without
+    /// one a queued knock would never leave, so rung 6 promises none and says
+    /// what a chain knock needs instead (#272 review round 11). Raised once at
+    /// startup, before any dial runs.
+    #[cfg(feature = "chia-read")]
+    pub knock_publishing: std::sync::atomic::AtomicBool,
     /// #231 P6b: the knock book (`knocks.json`): knocks we sent (one per host
     /// per era) and knocks read from our inbox, each with the confirmation
     /// height both sides dial by.
@@ -1560,6 +1567,8 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-read")]
         knock_queue: Mutex::new(std::collections::VecDeque::new()),
         #[cfg(feature = "chia-read")]
+        knock_publishing: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "chia-read")]
         knocks: Mutex::new(chia_knock::KnockBook::load(std::path::Path::new(chia_knock::KNOCKS_FILE))),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
@@ -1658,6 +1667,8 @@ async fn main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     if chia_publish_enabled() {
         if let Some(chia_sk) = chia_heartbeat_sk.clone() {
+            // The knock queue has its consumer (#272 review round 11).
+            hub.knock_publishing.store(true, std::sync::atomic::Ordering::Relaxed);
             let hub_hb = hub.clone();
             let iroh_hb = iroh_endpoint.clone();
             let iroh_sk_hb = secret_key.clone();
@@ -2668,12 +2679,21 @@ async fn dial_peer_inner(
             // A private room whose host we hold a card for: KNOCK — one record
             // only the host can open, saying we want in; both sides then dial
             // on its confirmation height (`chia_knock`). Queued for the
-            // publisher (one spend per tick, once per host per era); without
-            // the publish build or a funded wallet nothing leaves, and the
-            // publisher's log says so.
+            // publisher (one spend per tick, once per host per era) — only
+            // while one runs: without the publish build, `SSF_CHIA_LANE=1` and
+            // a wallet the queue has no consumer, so no knock is queued or
+            // promised and the log says what one needs (#272 review round
+            // 11); an unfunded wallet is the publisher's to report.
             Some(cap) if cap.may_use_cards() => {
                 let keys = hub.peers.lock().unwrap().card_keys_of(&target_str);
                 if let Some((ck, kx)) = keys {
+                    if !hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed) {
+                        println!(
+                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with SSF_CHIA_LANE=1 and a wallet loaded (not queued)"
+                        );
+                        report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; this node cannot knock (publishing off)")).await;
+                        return;
+                    }
                     let req = chia_knock::KnockRequest {
                         room: room_id.clone(),
                         host: target_str.clone(),
