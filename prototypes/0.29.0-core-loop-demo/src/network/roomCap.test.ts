@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   MAX_CAP_MEMBER_CARDS,
+  bridgeMemberHints,
   buildRoomCapPayload,
   cardsForPass,
   forgetSessionFlags,
@@ -357,6 +358,33 @@ describe('room cap payload (N8 / D3)', () => {
     expect(JSON.parse(atob(seedWithoutCards(seed)))).toEqual({ ...boot, memberHints: routes });
     const url = new URL(seedWithoutCards(`ssf://room?seed=${encodeURIComponent(seed)}`));
     expect(JSON.parse(atob(url.searchParams.get('seed')!))).toEqual({ ...boot, memberHints: routes });
+  });
+
+  it('P6b: a bridged join adds our route to a pass, never our card, so a cardless public pass stays cardless (review round 14)', () => {
+    // Standing in private room A with Share Card on: our default bootstrap carries our card.
+    const local = {
+      v: 2 as const, roomId: 'A', roomKeyB64: 'a2V5', wtUrl: 'https://127.0.0.1:4443', certHashesB64: ['c'],
+      memberHints: [{ irohNodeId: 'me', irohRelayUrls: ['https://relay-a'], nodeCard: card('me') }],
+      irohNodeId: 'me', irohRelayUrls: ['https://relay-a'],
+    };
+    // A pass to public room B carries routes alone (its minter struck the cards).
+    const publicPass = {
+      v: 2 as const, roomId: 'B', roomKeyB64: 'Yg==', wtUrl: 'https://127.0.0.1:4443', certHashesB64: [],
+      memberHints: [{ irohNodeId: 'host', irohRelayUrls: ['https://relay-b'] }],
+    };
+    const bridged = bridgeMemberHints(publicPass, local);
+    expect(bridged).toEqual([{ irohNodeId: 'host', irohRelayUrls: ['https://relay-b'] }, { irohNodeId: 'me', irohRelayUrls: ['https://relay-a'] }]);
+    expect(memberCardsOf(bridged)).toEqual([]);
+    // Neither the prefetch's cap nor the first cap of the join, posture unknown, calls B's pass private.
+    expect(buildRoomCapPayload('Yg==', false, null, 1, true, memberCardsOf(bridged), true))
+      .toEqual({ roomKeyB64: 'Yg==', chiaMode: false, publicRoom: null, seq: 1, shareCard: true, prefetch: true });
+    expect(buildRoomCapPayload('Yg==', false, null, 2, true, memberCardsOf(bridged))).not.toHaveProperty('passPrivate');
+    // A private pass keeps every card it carries — one for our own node included, as its minter put it there.
+    const privatePass = { ...publicPass, roomId: 'C', memberHints: [{ irohNodeId: 'host', nodeCard: card('host') }, { irohNodeId: 'me', nodeCard: card('me', 50) }] };
+    const kept = bridgeMemberHints(privatePass, local);
+    expect(memberCardsOf(kept)).toEqual([card('host'), card('me', 50)]);
+    expect(kept.find((h) => h.irohNodeId === 'me')).toEqual({ irohNodeId: 'me', irohRelayUrls: ['https://relay-a'], nodeCard: card('me', 50) });
+    expect(buildRoomCapPayload('Yw==', false, null, 3, true, memberCardsOf(kept), true)).toMatchObject({ memberCards: [card('host'), card('me', 50)], passPrivate: true });
   });
 
   it('sequences caps by the clock but never at or below the last one', () => {

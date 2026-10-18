@@ -16,10 +16,15 @@ import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
 import {
+  bridgeMemberHints,
   cardsForPass,
+  collectMemberHints,
+  mergeMemberHints,
   newerCard,
   nodeSharesCard,
   normalizeContactCard,
+  normalizeMemberHint,
+  normalizeStringArray,
   passageReading,
   readChiaMode,
   readNodeCard,
@@ -903,94 +908,6 @@ function getOrCreateRoomKeyB64(roomId: string): string {
   } catch {
     return generateRoomKeyB64();
   }
-}
-
-function normalizeStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter(
-    (entry): entry is string => typeof entry === "string" && entry.length > 0,
-  );
-}
-
-function normalizeMemberHint(value: unknown): RoomMemberHint | null {
-  if (!value || typeof value !== "object") return null;
-  const entry = value as Record<string, unknown>;
-  if (typeof entry.irohNodeId !== "string" || entry.irohNodeId.length === 0) {
-    return null;
-  }
-  const relayHints = normalizeStringArray(entry.irohRelayUrls);
-  const directHints = normalizeStringArray(entry.irohDirectAddrs);
-  // #231 P6b: a card rides only when it names this very node (the node checks
-  // the signature; a card for another node is noise here).
-  const card = normalizeContactCard(entry.nodeCard);
-  return {
-    irohNodeId: entry.irohNodeId,
-    irohRelayUrls: relayHints.length ? relayHints : undefined,
-    irohDirectAddrs: directHints.length ? directHints : undefined,
-    nodeCard: card && card.nodeId === entry.irohNodeId ? card : undefined,
-  };
-}
-
-function collectMemberHints(
-  boot: RoomBootstrap | null | undefined,
-): RoomMemberHint[] {
-  if (!boot) return [];
-  const hints: RoomMemberHint[] = [];
-
-  if (Array.isArray(boot.memberHints)) {
-    for (const hint of boot.memberHints) {
-      const normalized = normalizeMemberHint(hint);
-      if (normalized) {
-        hints.push(normalized);
-      }
-    }
-  }
-
-  if (boot.irohNodeId) {
-    hints.push({
-      irohNodeId: boot.irohNodeId,
-      irohRelayUrls: boot.irohRelayUrls ?? boot.relays,
-      irohDirectAddrs: boot.irohDirectAddrs,
-    });
-  }
-
-  return hints;
-}
-
-function mergeMemberHints(...hintLists: RoomMemberHint[][]): RoomMemberHint[] {
-  const merged = new Map<string, RoomMemberHint>();
-  for (const list of hintLists) {
-    for (const hint of list) {
-      const existing = merged.get(hint.irohNodeId);
-      if (!existing) {
-        merged.set(hint.irohNodeId, {
-          irohNodeId: hint.irohNodeId,
-          irohRelayUrls: hint.irohRelayUrls
-            ? [...hint.irohRelayUrls]
-            : undefined,
-          irohDirectAddrs: hint.irohDirectAddrs
-            ? [...hint.irohDirectAddrs]
-            : undefined,
-          nodeCard: hint.nodeCard,
-        });
-        continue;
-      }
-      // #231 P6b: of two cards for one node, the newer stands.
-      existing.nodeCard = newerCard(existing.nodeCard, hint.nodeCard);
-
-      const relays = new Set([
-        ...(existing.irohRelayUrls ?? []),
-        ...(hint.irohRelayUrls ?? []),
-      ]);
-      const addrs = new Set([
-        ...(existing.irohDirectAddrs ?? []),
-        ...(hint.irohDirectAddrs ?? []),
-      ]);
-      existing.irohRelayUrls = relays.size ? Array.from(relays) : undefined;
-      existing.irohDirectAddrs = addrs.size ? Array.from(addrs) : undefined;
-    }
-  }
-  return Array.from(merged.values());
 }
 
 function getLocalNodeHint(
@@ -8913,10 +8830,10 @@ async function resolveBridgeBootstrap(
 
   const roomId = imported.roomId || localBoot.roomId || getDefaultRoomId();
   const importedHints = collectMemberHints(imported);
-  const mergedHints = mergeMemberHints(
-    importedHints,
-    collectMemberHints(localBoot),
-  );
+  // #231 P6b (#272 review round 14): our node joins the pass's hints as a
+  // ROUTE, never with our card — the pass is the destination room's word on
+  // cards (`bridgeMemberHints`).
+  const mergedHints = bridgeMemberHints(imported, localBoot);
   const remoteHint = importedHints[0];
 
   return {

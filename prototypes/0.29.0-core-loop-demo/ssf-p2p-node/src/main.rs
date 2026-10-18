@@ -471,9 +471,12 @@ pub struct HubState {
     #[cfg(feature = "chia-read")]
     pub knock_queue: Mutex<std::collections::VecDeque<chia_knock::KnockRequest>>,
     /// #231 P6b: the knock queue has a consumer — the heartbeat loop was
-    /// spawned (the publish build, `SSF_CHIA_LANE=1`, a wallet loaded). Without
-    /// one a queued knock would never leave, so rung 6 promises none and says
-    /// what a chain knock needs instead (#272 review round 11). Raised once at
+    /// spawned (the publish build, `SSF_CHIA_LANE=1`, a wallet loaded) — and
+    /// the watcher runs (`SSF_CHIA_WATCH` not 0), which judges a sent knock
+    /// and dials at its rendezvous (`chia_knock::knocks_available`, #272 review
+    /// round 14). Without both a queued knock would never leave, or would
+    /// spend a coin its sender never dials on, so rung 6 promises none and
+    /// says what a chain knock needs instead (round 11). Raised once at
     /// startup, before any dial runs.
     #[cfg(feature = "chia-read")]
     pub knock_publishing: std::sync::atomic::AtomicBool,
@@ -1667,8 +1670,18 @@ async fn main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     if chia_publish_enabled() {
         if let Some(chia_sk) = chia_heartbeat_sk.clone() {
-            // The knock queue has its consumer (#272 review round 11).
-            hub.knock_publishing.store(true, std::sync::atomic::Ordering::Relaxed);
+            // The knock queue has its consumer (#272 review round 11) — and
+            // rung 6 queues a knock only while the watcher runs too (round
+            // 14): the watcher judges a sent knock by the chain's word and
+            // dials at its rendezvous; without it the knock spends a coin and
+            // the host alone dials. `SSF_CHIA_WATCH=0` keeps knocks off.
+            if chia_knock::knocks_available(true, chia_watch::watch_enabled()) {
+                hub.knock_publishing.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                println!(
+                    "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous; presence publishes as before"
+                );
+            }
             let hub_hb = hub.clone();
             let iroh_hb = iroh_endpoint.clone();
             let iroh_sk_hb = secret_key.clone();
@@ -2680,18 +2693,20 @@ async fn dial_peer_inner(
             // only the host can open, saying we want in; both sides then dial
             // on its confirmation height (`chia_knock`). Queued for the
             // publisher (one spend per tick, once per host per era) — only
-            // while one runs: without the publish build, `SSF_CHIA_LANE=1` and
-            // a wallet the queue has no consumer, so no knock is queued or
-            // promised and the log says what one needs (#272 review round
-            // 11); an unfunded wallet is the publisher's to report.
+            // while one runs, and the watcher with it: without the publish
+            // build, `SSF_CHIA_LANE=1` and a wallet the queue has no consumer,
+            // and without the watcher a sent knock is never judged or dialed
+            // on, so no knock is queued or promised and the log says what one
+            // needs (#272 review rounds 11 and 14); an unfunded wallet is the
+            // publisher's to report.
             Some(cap) if cap.may_use_cards() => {
                 let keys = hub.peers.lock().unwrap().card_keys_of(&target_str);
                 if let Some((ck, kx)) = keys {
                     if !hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed) {
                         println!(
-                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with SSF_CHIA_LANE=1 and a wallet loaded (not queued)"
+                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with SSF_CHIA_LANE=1, a wallet loaded and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
                         );
-                        report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; this node cannot knock (publishing off)")).await;
+                        report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; this node cannot knock (publishing or the watcher off)")).await;
                         return;
                     }
                     let req = chia_knock::KnockRequest {

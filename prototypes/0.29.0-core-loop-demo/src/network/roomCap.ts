@@ -1,4 +1,4 @@
-import type { ContactCard, RoomMemberHint } from './protocol.ts';
+import type { ContactCard, RoomBootstrap, RoomMemberHint } from './protocol.ts';
 
 /**
  * The `cap` envelope payload the browser hands its LOCAL node over loopback
@@ -181,6 +181,96 @@ export function setShareCard(roomId: string, on: boolean): void {
 export function routeHint(hint: RoomMemberHint): RoomMemberHint {
   const { nodeCard: _card, ...route } = hint;
   return route;
+}
+
+/** The non-empty strings of an array-shaped value, nothing else. */
+export function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
+}
+
+/** A member hint as a pass or a room doc may spell it: a node id, its routes,
+ *  and (#231 P6b) its card only when the card names this very node — the node
+ *  checks the signature; a card for another node is noise here. */
+export function normalizeMemberHint(value: unknown): RoomMemberHint | null {
+  if (!value || typeof value !== 'object') return null;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.irohNodeId !== 'string' || entry.irohNodeId.length === 0) {
+    return null;
+  }
+  const relayHints = normalizeStringArray(entry.irohRelayUrls);
+  const directHints = normalizeStringArray(entry.irohDirectAddrs);
+  const card = normalizeContactCard(entry.nodeCard);
+  return {
+    irohNodeId: entry.irohNodeId,
+    irohRelayUrls: relayHints.length ? relayHints : undefined,
+    irohDirectAddrs: directHints.length ? directHints : undefined,
+    nodeCard: card && card.nodeId === entry.irohNodeId ? card : undefined,
+  };
+}
+
+/** Every member hint a bootstrap carries: its `memberHints`, then the legacy
+ *  single-peer fields as one more. */
+export function collectMemberHints(boot: RoomBootstrap | null | undefined): RoomMemberHint[] {
+  if (!boot) return [];
+  const hints: RoomMemberHint[] = [];
+  if (Array.isArray(boot.memberHints)) {
+    for (const hint of boot.memberHints) {
+      const normalized = normalizeMemberHint(hint);
+      if (normalized) {
+        hints.push(normalized);
+      }
+    }
+  }
+  if (boot.irohNodeId) {
+    hints.push({
+      irohNodeId: boot.irohNodeId,
+      irohRelayUrls: boot.irohRelayUrls ?? boot.relays,
+      irohDirectAddrs: boot.irohDirectAddrs,
+    });
+  }
+  return hints;
+}
+
+/** One hint per node: routes unioned, and of two cards for one node the
+ *  newer stands (#231 P6b). */
+export function mergeMemberHints(...hintLists: RoomMemberHint[][]): RoomMemberHint[] {
+  const merged = new Map<string, RoomMemberHint>();
+  for (const list of hintLists) {
+    for (const hint of list) {
+      const existing = merged.get(hint.irohNodeId);
+      if (!existing) {
+        merged.set(hint.irohNodeId, {
+          irohNodeId: hint.irohNodeId,
+          irohRelayUrls: hint.irohRelayUrls ? [...hint.irohRelayUrls] : undefined,
+          irohDirectAddrs: hint.irohDirectAddrs ? [...hint.irohDirectAddrs] : undefined,
+          nodeCard: hint.nodeCard,
+        });
+        continue;
+      }
+      existing.nodeCard = newerCard(existing.nodeCard, hint.nodeCard);
+      const relays = new Set([...(existing.irohRelayUrls ?? []), ...(hint.irohRelayUrls ?? [])]);
+      const addrs = new Set([...(existing.irohDirectAddrs ?? []), ...(hint.irohDirectAddrs ?? [])]);
+      existing.irohRelayUrls = relays.size ? Array.from(relays) : undefined;
+      existing.irohDirectAddrs = addrs.size ? Array.from(addrs) : undefined;
+    }
+  }
+  return Array.from(merged.values());
+}
+
+/** #231 P6b (#272 review round 14): the member hints of an imported pass
+ *  resolved against the LOCAL node for a bridged join — the pass's own hints,
+ *  cards and all, and our node as a ROUTE. Our own card never rides in: the
+ *  local bootstrap attaches it by the posture of the room we STAND in, while
+ *  the pass is the destination room's word on cards. A cardless pass to a
+ *  public room, imported while standing in a private one, would otherwise
+ *  reach the node as a private pass (`passPrivate`, our card its only card)
+ *  for as long as the posture is unknown — which, for a pass prefetch, is
+ *  always — and the node would file contacts and read the inbox for a room
+ *  whose pass brought none. A card the pass itself carries for our node stays:
+ *  its minter put it there. */
+export function bridgeMemberHints(imported: RoomBootstrap, localBoot: RoomBootstrap): RoomMemberHint[] {
+  return mergeMemberHints(collectMemberHints(imported), collectMemberHints(localBoot).map(routeHint));
 }
 
 /** #231 P6b: the hints a PASS carries, card-wise. A pass to a PUBLIC room

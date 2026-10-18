@@ -18,7 +18,9 @@
 //! room's cooldowns so the dance restarts in step.
 //!
 //! N5′ (#231 first follow-up): cached addresses are re-dialed first; the chain
-//! is read only on the beat. `SSF_CHIA_WATCH=0` turns the watcher off.
+//! is read only on the beat. `SSF_CHIA_WATCH=0` turns the watcher off — and
+//! with it the knocks this node would write (`chia_knock::knocks_available`,
+//! #272 review round 14): a sent knock is judged and dialed from here.
 //!
 //! #231 P6a: the same beat and hold now serve the PER-NODE presence records
 //! (record v2): every peer whose contact card sits in `peers.json` has its own
@@ -605,7 +607,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             );
                             if let Some(ck) = f.item.ck_from {
                                 let mut book = hub.peers.lock().unwrap();
-                                if book.record_knock(&from, &ck, room, now_unix) {
+                                if book.record_knock(&from, &ck, room, f.item.issued_at, now_unix) {
                                     let _ = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE));
                                 }
                             }

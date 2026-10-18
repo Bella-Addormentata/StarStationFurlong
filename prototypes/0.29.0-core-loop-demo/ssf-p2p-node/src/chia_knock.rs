@@ -59,6 +59,17 @@ pub const MAX_INBOX: usize = 256;
 /// Knocks waiting for the publisher at once.
 pub const MAX_QUEUE: usize = 64;
 
+/// #231 P6b (#272 review round 14): may rung 6 queue a knock? Only while BOTH
+/// halves of a knock run on this node: the publisher — the queue's consumer,
+/// which spends the knock — and the watcher, which judges the sent knock by
+/// the chain's word and dials the host at every rendezvous height it sets.
+/// Publishing without watching (`SSF_CHIA_WATCH=0`) would spend a coin on a
+/// knock whose sender never dials: the host alone would, at a peer every live
+/// route had already failed to reach.
+pub fn knocks_available(publishing: bool, watching: bool) -> bool {
+    publishing && watching
+}
+
 /// The first rendezvous boundary strictly above `after` for a knock confirmed
 /// at `confirmed`, or `None` once the span is over.
 pub fn next_boundary_after(confirmed: u32, after: u32) -> Option<u32> {
@@ -524,6 +535,14 @@ impl KnockBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_knock_needs_the_publisher_and_the_watcher_both() {
+        assert!(knocks_available(true, true));
+        assert!(!knocks_available(true, false), "SSF_CHIA_WATCH=0 with publishing on: a knock would spend a coin and its sender never dial");
+        assert!(!knocks_available(false, true), "no consumer for the queue");
+        assert!(!knocks_available(false, false));
+    }
 
     #[test]
     fn rendezvous_boundaries_run_near_then_far_then_stop() {
