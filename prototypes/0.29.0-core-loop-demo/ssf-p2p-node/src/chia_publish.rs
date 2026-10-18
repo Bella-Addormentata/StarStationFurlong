@@ -485,6 +485,26 @@ impl WalletLease {
         self.settling.lock().unwrap().values().any(|s| s.coins.iter().any(|c| c.coin_id == *coin))
     }
 
+    /// Does the lease still hold spend number `spend` — its inputs parked (the
+    /// push in flight, or in a mempool) or settling (included, not yet
+    /// SETTLED_DEPTH deep)? What a knock or beacon verdict asks before reading
+    /// an input listed spent with no child under the hint as the coin's going
+    /// to ANOTHER spend of ours (#272 review round 12): the two lookups behind
+    /// that verdict are separate requests, and a reorganization between them
+    /// lists the input spent by this very spend while the hint's listing, made
+    /// on the new fork, lacks its child. The lease pushes such a spend again;
+    /// a write forgotten meanwhile would lose its clock and be written again
+    /// beside the first. Numbers outlive a restart with the file.
+    pub fn holds_spend(&self, spend: u64) -> bool {
+        self.pending.lock().unwrap().values().any(|p| p.spend == spend) || self.settling.lock().unwrap().contains_key(&spend)
+    }
+
+    /// The number of the spend `coin` is parked under, if any: what a writer
+    /// keeps beside its write once the push left (round 12).
+    pub fn spend_of(&self, coin: &Bytes32) -> Option<u64> {
+        self.pending.lock().unwrap().get(coin).map(|p| p.spend)
+    }
+
     /// Must a writer leave `coin` alone when selecting? Parked, or settling
     /// (round 10): a coin the chain listed spent can read unspent again after
     /// a reorganization, and then the spend that consumed it is parked again
@@ -1580,6 +1600,11 @@ pub async fn publish_node_presence(
 pub struct MemoWrite {
     pub coin: Bytes32,
     pub acked: bool,
+    /// The lease's number for the spend (#272 review round 12), kept beside
+    /// the write so its verdicts can ask whether the lease still holds it
+    /// ([`WalletLease::holds_spend`]). `None` only if the input was not parked
+    /// once the push returned, which the lease does not allow.
+    pub spend: Option<u64>,
 }
 
 /// The shared tail of every era-bound write (presence, knock, beacon): under
@@ -1634,7 +1659,7 @@ async fn publish_memo_with(
     let body = body(input)?;
     let bundle = build_publish_bundle(payer, coin.coin, hint, Bytes::new(body))?;
     match push_parked(&client, bundle, [(input, coin.confirmed_height)]).await {
-        Ok(()) => Ok(MemoWrite { coin: input, acked: true }),
+        Ok(()) => Ok(MemoWrite { coin: input, acked: true, spend: WALLET_LEASE.spend_of(&input) }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
         // input is parked. Reported as a write, so the caller files it as
         // pending and lets the chain's word settle it — filed as a failure it
@@ -1642,7 +1667,7 @@ async fn publish_memo_with(
         // coin (#272 review).
         Err(PushError::Unanswered(e)) => {
             eprintln!("⛓️ ChiaHub {what}: the push went unanswered ({e:#}) — filed as pending; the chain's word settles it");
-            Ok(MemoWrite { coin: input, acked: false })
+            Ok(MemoWrite { coin: input, acked: false, spend: WALLET_LEASE.spend_of(&input) })
         }
         Err(e) => Err(e.into()),
     }
@@ -1727,6 +1752,13 @@ pub struct BeaconMark {
     /// without a beacon for the rest of the era, restart or not.
     #[serde(default)]
     pub settled: bool,
+    /// The wallet lease's number for the beacon's spend (#272 review round
+    /// 12): while the lease holds it, an input listed spent with no coin under
+    /// the hint is a fork between the two lookups, not another write of ours
+    /// ([`crate::chia_resolve::write_standing`]). `None` in a mark an older
+    /// node wrote.
+    #[serde(default)]
+    pub spend: Option<u64>,
 }
 
 impl BeaconMark {
@@ -1769,11 +1801,17 @@ pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
 /// end and judged at or past the mark's confirmation lacked the coin
 /// ([`crate::chia_resolve::HintChild::gone_since`], round 9: the block that
 /// confirmed it is gone). `None` when the chain could not be asked this tick,
-/// or the mark names no coin (nothing to judge).
+/// or the mark names no coin (nothing to judge). The lease is asked in the
+/// same breath whether it still holds the mark's spend (round 12), so an
+/// input listed spent with no coin under the hint by a fork between the two
+/// lookups reads pending, not dead.
 pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
     let coin = crate::chia_resolve::parse_hex32(&mark.coin_id)?;
     let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
-    let lease = lease_words(client, &[coin]).await.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
+    let spends: Vec<u64> = mark.spend.into_iter().collect();
+    let (words, held) = lease_standing(client, &[coin], &spends).await;
+    let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
+    let ours = mark.spend.is_some_and(|s| held.contains(&s));
     let child = match crate::chia_resolve::child_under_hint(client, hint, coin).await {
         Ok(child) => child,
         Err(e) => {
@@ -1788,7 +1826,7 @@ pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Op
             return None;
         }
     };
-    Some((crate::chia_resolve::write_standing(&child, spent_at, lease), child.gone_since(mark.confirmed_height)))
+    Some((crate::chia_resolve::write_standing(&child, spent_at, lease, ours), child.gone_since(mark.confirmed_height)))
 }
 
 /// What the heartbeat does with a judged beacon mark (#272 review round 9).
@@ -1846,9 +1884,19 @@ pub fn beacon_step(mark: &BeaconMark, word: Option<(crate::chia_resolve::WriteSt
 /// writer to reconcile; asked BEFORE the chain lookups, so a write confirming
 /// in between is seen by them (#272 review round 2).
 pub async fn lease_words(client: &impl ChainAccess, coins: &[Bytes32]) -> HashMap<Bytes32, LeaseWord> {
+    lease_standing(client, coins, &[]).await.0
+}
+
+/// [`lease_words`], and which of `spends` the lease still holds — parked or
+/// settling ([`WalletLease::holds_spend`]) — read in the same breath, under
+/// the gate, so the two answers describe one state (#272 review round 12).
+pub async fn lease_standing(client: &impl ChainAccess, coins: &[Bytes32], spends: &[u64]) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
     let _gate = WALLET_LEASE.lock().await;
     WALLET_LEASE.reconcile(client).await;
-    coins.iter().map(|c| (*c, WALLET_LEASE.lease_word(c))).collect()
+    (
+        coins.iter().map(|c| (*c, WALLET_LEASE.lease_word(c))).collect(),
+        spends.iter().copied().filter(|s| WALLET_LEASE.holds_spend(*s)).collect(),
+    )
 }
 
 /// Why a knock was not written after all (#272 review round 5): what allowed
@@ -2193,6 +2241,7 @@ pub async fn heartbeat_loop(
                             confirmed_height: 0,
                             last_rendezvous: 0,
                             settled: false,
+                            spend: write.spend,
                         });
                         if let Err(e) = book.save(knocks_path) {
                             eprintln!("⛓️ ChiaHub knock: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
@@ -2309,6 +2358,7 @@ pub async fn heartbeat_loop(
                                 confirmed: false,
                                 confirmed_height: 0,
                                 settled: false,
+                                spend: write.spend,
                             };
                             if let Err(e) = mark.save(beacon_mark_path) {
                                 eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
@@ -2568,7 +2618,7 @@ mod tests {
     #[test]
     fn a_pending_beacon_mark_holds_until_the_chain_settles_it() {
         assert!(beacon_due(None, 5, "n"), "never written: due");
-        let pending = BeaconMark { era: 5, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false };
+        let pending = BeaconMark { era: 5, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false, spend: None };
         assert!(!beacon_due(Some(&pending), 5, "n"), "pending: the chain's word settles it, not a second write");
         let confirmed = BeaconMark { confirmed: true, ..pending.clone() };
         assert!(!beacon_due(Some(&confirmed), 5, "n"));
@@ -2595,7 +2645,7 @@ mod tests {
         let era = 5u64;
         let h0 = 5 * ERA_BLOCKS;
         let found = |height: u32, seen_at: Option<u32>| Confirmed { height, seen_at };
-        let pending = BeaconMark { era, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false };
+        let pending = BeaconMark { era, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false, spend: None };
         assert!(pending.unsettled_for(era, "n"));
         assert!(!pending.unsettled_for(era, "other") && !pending.unsettled_for(era + 1, "n"));
         assert!(!BeaconMark { coin_id: String::new(), ..pending.clone() }.unsettled_for(era, "n"), "no coin: nothing to judge");
@@ -3051,6 +3101,69 @@ mod tests {
         assert_eq!(settling_step(1000, Some(1000), &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + d), Some(1000 + d)), Done(false), "one spent deep, one on no chain: nothing left to settle");
         assert_eq!(settling_step(1000, Some(1000), &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + d), None), Keep, "the absent one unjudged by a listing cut short");
         assert_eq!(settling_step(1000, None, &[], Some(5000), Some(5000)), Keep, "no inputs: nothing to judge");
+    }
+
+    #[tokio::test]
+    async fn the_lease_holds_a_spend_by_number_while_parked_or_settling() {
+        // #272 review round 12: a knock or beacon verdict reads its input
+        // spent with no child under the hint as the coin's going to ANOTHER
+        // spend of ours — but the two lookups behind it are separate requests,
+        // and a reorganization between them lists the input spent by the
+        // write's OWN spend while the hint's listing, on the new fork, lacks
+        // its child. The writer keeps the lease's number for its spend, and
+        // while the lease holds that number (parked, or settling) the write is
+        // pending, never dead: the lease pushes the spend again.
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_knock::SETTLED_DEPTH;
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-holds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let _ = std::fs::remove_file(&path);
+        let ours = Coin::new(Bytes32::new([4u8; 32]), Bytes32::new([2u8; 32]), 7);
+        let id = ours.coin_id();
+        let listing = |spent: Option<u32>, judged_at: Option<u32>| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: ours.clone(), confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at,
+            }])
+        };
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let lease = WalletLease::new();
+        lease.restore(&path);
+        assert!(!lease.holds_spend(1) && lease.spend_of(&id).is_none(), "nothing parked: no spend is held");
+        let parking = lease.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        let n = parking.spend;
+        assert_eq!(lease.spend_of(&id), Some(n), "the writer learns its spend's number from the parking");
+        assert!(lease.holds_spend(n) && !lease.holds_spend(n + 1));
+        // Included: released as spent, settling — still held.
+        let t1 = t0 + RECONCILE_GRACE;
+        lease.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        assert!(lease.is_settling(&id) && lease.holds_spend(n));
+        assert_eq!(lease.spend_of(&id), None, "settling is not parked");
+        // Across a restart, by the same number.
+        let again = WalletLease::new();
+        again.restore(&path);
+        assert!(again.holds_spend(n), "the number outlives the restart with the settling record");
+        // The block gone: parked again under its number — held.
+        again.reconcile_at(&listing(None, Some(1000)), t1).await;
+        assert!(again.is_parked(&id) && again.holds_spend(n));
+        assert_eq!(again.spend_of(&id), Some(n));
+        // Landed anew and settled SETTLED_DEPTH deep: forgotten — held no more.
+        let t2 = t1 + RECONCILE_GRACE;
+        again.reconcile_at(&listing(Some(1005), Some(1006)), t2).await;
+        assert!(again.holds_spend(n));
+        again.reconcile_at(&listing(Some(1005), Some(1005 + SETTLED_DEPTH)), t2).await;
+        assert!(!again.holds_spend(n) && !again.is_taken(&id));
+        // A spend released on the peers' refusal is held no more either.
+        let other = WalletLease::new();
+        let p = other.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        assert!(other.holds_spend(p.spend));
+        other.release(&[p.spend]);
+        assert!(!other.holds_spend(p.spend) && other.spend_of(&id).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

@@ -763,13 +763,20 @@ pub enum WriteStanding {
 /// An input unspent is dead only on the lease's word that the peers refused
 /// the spend ([`LeaseWord::Dropped`]); still parked, released as spent (the
 /// lookups lag the lease then) or unknown to this run, it stays pending —
-/// silence never kills a write (#272 review round 2). Nothing here is decided
-/// by the clock.
-pub fn write_standing(child: &HintChild, spent_at: Option<u32>, lease: LeaseWord) -> WriteStanding {
+/// silence never kills a write (#272 review round 2). `held` says whether the
+/// lease still holds the write's OWN spend — parked, or settling (#272 review
+/// round 12): the two lookups are separate requests, and a reorganization
+/// between them can list the input spent by this very spend while the hint's
+/// listing, made on the new fork, lacks its child; while the lease holds the
+/// spend, the coin went to no other write of ours and the lease pushes the
+/// spend again, so the write is pending, not dead. Nothing here is decided by
+/// the clock.
+pub fn write_standing(child: &HintChild, spent_at: Option<u32>, lease: LeaseWord, held: bool) -> WriteStanding {
     match child {
         HintChild::Confirmed { height, judged_at } => WriteStanding::Confirmed { height: *height, seen_at: *judged_at },
         HintChild::Unknown => WriteStanding::Pending,
         HintChild::Absent { judged_at } => match spent_at {
+            Some(_) if held => WriteStanding::Pending,
             Some(spent) if judged_at.is_some_and(|judged| judged >= spent) => {
                 WriteStanding::Dead("its coin went to another spend of ours")
             }
@@ -1227,24 +1234,37 @@ mod tests {
         use LeaseWord::{Dropped, Parked, Spent, Unknown};
         let absent = |judged_at| HintChild::Absent { judged_at };
         let found = |judged_at| HintChild::Confirmed { height: 900, judged_at };
-        assert_eq!(write_standing(&found(Some(950)), Some(900), Spent), WriteStanding::Confirmed { height: 900, seen_at: Some(950) });
-        assert_eq!(write_standing(&found(None), None, Parked), WriteStanding::Confirmed { height: 900, seen_at: None }, "the child is the proof, whatever the input says; the lookup's own height rides along (round 10)");
-        assert_eq!(write_standing(&HintChild::Unknown, Some(900), Dropped), WriteStanding::Pending, "a listing cut short decides nothing");
-        assert_eq!(write_standing(&absent(Some(950)), Some(900), Parked), WriteStanding::Dead("its coin went to another spend of ours"));
-        assert_eq!(write_standing(&absent(Some(900)), Some(900), Spent), WriteStanding::Dead("its coin went to another spend of ours"), "judged at the spend itself is enough");
-        assert_eq!(write_standing(&absent(Some(899)), Some(900), Spent), WriteStanding::Pending, "a source behind the spend may not list the child yet");
-        assert_eq!(write_standing(&absent(None), Some(900), Spent), WriteStanding::Pending, "an undated listing cannot say");
-        assert_eq!(write_standing(&absent(Some(950)), None, Parked), WriteStanding::Pending, "unspent and still parked: the spend may be live in a mempool");
-        assert_eq!(write_standing(&absent(Some(950)), None, Dropped), WriteStanding::Dead("the mempool dropped it"));
-        assert_eq!(write_standing(&absent(None), None, Dropped), WriteStanding::Dead("the mempool dropped it"), "the lease's verdict needs no height");
+        assert_eq!(write_standing(&found(Some(950)), Some(900), Spent, false), WriteStanding::Confirmed { height: 900, seen_at: Some(950) });
+        assert_eq!(write_standing(&found(None), None, Parked, false), WriteStanding::Confirmed { height: 900, seen_at: None }, "the child is the proof, whatever the input says; the lookup's own height rides along (round 10)");
+        assert_eq!(write_standing(&HintChild::Unknown, Some(900), Dropped, false), WriteStanding::Pending, "a listing cut short decides nothing");
+        assert_eq!(write_standing(&absent(Some(950)), Some(900), Parked, false), WriteStanding::Dead("its coin went to another spend of ours"));
+        assert_eq!(write_standing(&absent(Some(900)), Some(900), Spent, false), WriteStanding::Dead("its coin went to another spend of ours"), "judged at the spend itself is enough");
+        assert_eq!(write_standing(&absent(Some(899)), Some(900), Spent, false), WriteStanding::Pending, "a source behind the spend may not list the child yet");
+        assert_eq!(write_standing(&absent(None), Some(900), Spent, false), WriteStanding::Pending, "an undated listing cannot say");
+        assert_eq!(write_standing(&absent(Some(950)), None, Parked, false), WriteStanding::Pending, "unspent and still parked: the spend may be live in a mempool");
+        assert_eq!(write_standing(&absent(Some(950)), None, Dropped, false), WriteStanding::Dead("the mempool dropped it"));
+        assert_eq!(write_standing(&absent(None), None, Dropped, false), WriteStanding::Dead("the mempool dropped it"), "the lease's verdict needs no height");
         // The race (#272 review round 2): the write confirmed after the lease
         // reconciled (it released the input as spent) but the chain lookups,
         // made first, still showed the input unspent and no child — not dead.
-        assert_eq!(write_standing(&absent(Some(950)), None, Spent), WriteStanding::Pending, "released as spent: the lookups lag the lease, the write is not dead");
+        assert_eq!(write_standing(&absent(Some(950)), None, Spent, false), WriteStanding::Pending, "released as spent: the lookups lag the lease, the write is not dead");
         // A lease that knows nothing of the coin (a restart, publishing off, a
         // read-only build) never kills a write.
-        assert_eq!(write_standing(&absent(Some(950)), None, Unknown), WriteStanding::Pending, "unknown to the lease: pending");
-        assert_eq!(write_standing(&absent(None), None, Unknown), WriteStanding::Pending);
+        assert_eq!(write_standing(&absent(Some(950)), None, Unknown, false), WriteStanding::Pending, "unknown to the lease: pending");
+        assert_eq!(write_standing(&absent(None), None, Unknown, false), WriteStanding::Pending);
+        // A fork between the two lookups (#272 review round 12): the input
+        // lookup listed the coin spent at 1000 — by THIS write's spend — and a
+        // reorganization dropped that block before the hint lookup, judged at
+        // 1006 on the new fork, found no child. While the lease still holds
+        // the spend (settling, or parked again already) the coin went to no
+        // other write of ours: pending — the lease pushes the spend again, and
+        // the write is found under its hint anew or dies on the lease's word.
+        assert_eq!(write_standing(&absent(Some(1006)), Some(1000), Spent, true), WriteStanding::Pending, "settling: a fork between the lookups, not another spend");
+        assert_eq!(write_standing(&absent(Some(1006)), Some(1000), Parked, true), WriteStanding::Pending, "parked again already: the lease pushes it again");
+        assert_eq!(write_standing(&absent(Some(1006)), Some(1000), Spent, false), WriteStanding::Dead("its coin went to another spend of ours"), "the lease holds no such spend: the coin did go to another write");
+        assert_eq!(write_standing(&absent(Some(1006)), Some(1000), Unknown, false), WriteStanding::Dead("its coin went to another spend of ours"), "an older entry with no number is judged as before");
+        assert_eq!(write_standing(&found(Some(1006)), Some(1000), Spent, true), WriteStanding::Confirmed { height: 900, seen_at: Some(1006) }, "the child found: confirmed, held or not");
+        assert_eq!(write_standing(&absent(Some(1006)), None, Parked, true), WriteStanding::Pending, "unspent and held: live in a mempool");
     }
 
     /// A chain whose listings refuse every page cursor (as full nodes do once

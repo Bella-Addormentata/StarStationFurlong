@@ -151,6 +151,14 @@ pub struct SentKnock {
     /// round 8). Age alone never settles a knock.
     #[serde(default)]
     pub settled: bool,
+    /// The wallet lease's number for the knock's spend (#272 review round 12):
+    /// while the lease still holds it (parked, or settling), an input listed
+    /// spent with no coin under the hint is a fork between the two lookups —
+    /// the lease pushes the spend again — not the coin's going to another
+    /// write of ours ([`crate::chia_resolve::write_standing`]). `None` in an
+    /// entry an older node wrote.
+    #[serde(default)]
+    pub spend: Option<u64>,
 }
 
 /// A knock read from this node's inbox.
@@ -548,6 +556,7 @@ mod tests {
             confirmed_height: 0,
             last_rendezvous: 0,
             settled: false,
+            spend: None,
         }
     }
 

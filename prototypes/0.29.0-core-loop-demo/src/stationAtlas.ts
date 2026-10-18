@@ -2155,7 +2155,11 @@ export function pushAtlasToDoc(): void {
           lateral: door.lateral,
           // Known either way ⇒ published either way; unknown stays unsent.
           ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
-          ...(isOwn && door.targetSeed ? { targetSeed: door.targetSeed } : {}),
+          // 🔑 A door's seed travels whatever the posture, so it travels with
+          // the route alone: a docked module's pass carries its members' node
+          // cards, and a public room's audience gets no contact key out of it
+          // (#231 P6b, #272 review round 12; the room's own seed below, too).
+          ...(isOwn && door.targetSeed ? { targetSeed: seedWithoutCards(door.targetSeed) } : {}),
         };
       }
       const rec: SharedAtlasEntry = {

@@ -258,20 +258,22 @@ pub fn watch_enabled() -> bool {
 }
 
 /// #231 P6b: settle the wallet lease's parked spends against the chain, then
-/// give the lease's word on each of `coins` ([`LeaseWord`]): what a knock's
-/// standing needs beside the chain's lookups ([`chia_resolve::write_standing`]).
+/// give the lease's word on each of `coins` ([`LeaseWord`]) and which of
+/// `spends` it still holds — parked, or settling (#272 review round 12): what
+/// a knock's standing needs beside the chain's lookups
+/// ([`chia_resolve::write_standing`]).
 #[cfg(feature = "chia-publish")]
-async fn lease_words(client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32]) -> HashMap<Bytes32, LeaseWord> {
-    crate::chia_publish::lease_words(client, coins).await
+async fn lease_standing(client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32], spends: &[u64]) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
+    crate::chia_publish::lease_standing(client, coins, spends).await
 }
 
 /// A read-only build has no lease: its word on every coin is unknown, which
 /// kills nothing — a knock it finds pending (another build's) stays pending
 /// until the chain confirms it, its coin goes to another spend, or two eras
-/// pass (#272 review round 2).
+/// pass (#272 review round 2) — and it holds no spend.
 #[cfg(not(feature = "chia-publish"))]
-async fn lease_words(_client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32]) -> HashMap<Bytes32, LeaseWord> {
-    coins.iter().map(|c| (*c, LeaseWord::Unknown)).collect()
+async fn lease_standing(_client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32], _spends: &[u64]) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
+    (coins.iter().map(|c| (*c, LeaseWord::Unknown)).collect(), HashSet::new())
 }
 
 /// The watcher: beat-aligned reads for every readable room, then holds for
@@ -643,7 +645,13 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // between is seen by the lookups and never read as dropped. Each
             // verdict names its entry by input coin AND hint (#272 review round
             // 4): a dropped knock's input is released to the next write, which
-            // may be another knock, so two entries can share a coin. A knock
+            // may be another knock, so two entries can share a coin. An input
+            // spent with no child under the hint is the coin's going to another
+            // write of ours only while the lease no longer holds the knock's
+            // own spend (round 12): the two lookups are separate requests, and
+            // a reorganization between them lists the input spent by the knock
+            // itself while the hint's listing, on the new fork, lacks it — the
+            // lease pushes the spend again, and the knock stays pending. A knock
             // CONFIRMED less than SETTLED_DEPTH blocks ago is judged again too
             // (#272 review round 7): a reorganization can move the block that
             // holds it (the clock follows) or drop it (pending again, nobody
@@ -652,7 +660,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             let pending = hub.knocks.lock().unwrap().unsettled_sent(knock_peak);
             if !pending.is_empty() {
                 let coins: Vec<Bytes32> = pending.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
-                let words = lease_words(&agreed, &coins).await;
+                let spends: Vec<u64> = pending.iter().filter_map(|k| k.spend).collect();
+                let (words, held) = lease_standing(&agreed, &coins, &spends).await;
                 match chia_resolve::spent_heights(&agreed, coins.clone()).await {
                     Ok(spent) => {
                         // Each verdict: input coin, hint, era, the height the
@@ -676,8 +685,9 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             };
                             let spent_at = spent.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
                             let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
+                            let ours = k.spend.is_some_and(|s| held.contains(&s));
                             let gone = child.gone_since(k.confirmed_height);
-                            verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, gone, chia_resolve::write_standing(&child, spent_at, lease)));
+                            verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, gone, chia_resolve::write_standing(&child, spent_at, lease, ours)));
                         }
                         let mut book = hub.knocks.lock().unwrap();
                         let mut changed = false;

@@ -23,6 +23,7 @@ import {
 } from './adapter';
 import type { DoorWall } from './doorLayoutDoc';
 import { defaultDoorLayoutRecords, doorSetIsMarkedEmpty, normalizeWall, readAllDoorLayout } from './doorLayoutDoc';
+import { seedWithoutCards } from './network/roomCap';
 
 /**
  * Serializable pairing record — one per door id. Plain JSON (no nested Y
@@ -165,15 +166,21 @@ export function isDoorRecord(value: unknown): value is DoorRecord {
  *  never a crash, identical on every client), and farDoor/farYawDeg must be
  *  exact enum values or they vanish. */
 function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
+  // 🔑 A door's address is a seed link, and a pass to a private room carries
+  // its members' node cards; the doors doc is read by everyone in the room, so
+  // an address leaves it — and enters it (buildDoorPairing) — with the route
+  // alone (#231 P6b, #272 review round 12). A record an older client wrote
+  // with the cards in is stripped here, on the way in, before anything reads
+  // or republishes it (the atlas harvest, the arrival mirror).
   // Tombstones carry no chain — only the ⚓ dock berth memory, bounded the
   // same way as a pairing's far geometry (it is fed back into one by DOCK).
   if (!r.paired) {
-    const out: DoorTombstone = { paired: false, retiredAddress: r.retiredAddress };
+    const out: DoorTombstone = { paired: false, retiredAddress: seedWithoutCards(r.retiredAddress) };
     const memory = sanitizeBerthMemory(r.dock);
     if (memory) out.dock = memory;
     return out;
   }
-  const out: DoorPairing = { paired: true, connectedRoomAddress: r.connectedRoomAddress };
+  const out: DoorPairing = { paired: true, connectedRoomAddress: seedWithoutCards(r.connectedRoomAddress) };
   if (Array.isArray(r.segments) && r.segments.length > 0 && r.segments.length <= 8) {
     const clean: ConnectorSegment[] = [];
     let ok = true;
@@ -445,7 +452,8 @@ export interface DoorGeometry {
 /** The one pairing-record shape every writer produces (near side, mirror,
  *  and the far-room dock write). */
 export function buildDoorPairing(address: string, geometry?: DoorGeometry): DoorPairing {
-  const record: DoorPairing = { paired: true, connectedRoomAddress: address };
+  // 🔑 The route alone, never the pass's node cards (see sanitizeDoorGeometry).
+  const record: DoorPairing = { paired: true, connectedRoomAddress: seedWithoutCards(address) };
   if (geometry?.segments && geometry.segments.length > 0) record.segments = geometry.segments;
   if (geometry?.farDoor) record.farDoor = geometry.farDoor;
   if (geometry?.farWall) record.farWall = geometry.farWall;
@@ -543,7 +551,7 @@ export function writeDoorTombstone(
 
 /** The one tombstone shape every writer produces (see buildDoorPairing). */
 export function buildDoorTombstone(retiredAddress: string, dock?: DockBerthMemory): DoorTombstone {
-  const record: DoorTombstone = { paired: false, retiredAddress };
+  const record: DoorTombstone = { paired: false, retiredAddress: seedWithoutCards(retiredAddress) };
   if (dock) {
     const memory: DockBerthMemory = { undockedAt: dock.undockedAt };
     if (dock.farDoor) memory.farDoor = dock.farDoor;
