@@ -3,7 +3,7 @@
  * hex, the same 32 bytes in base64, a port — or it is not the node.
  */
 import { describe, expect, it } from 'vitest';
-import { parseNodeFingerprint } from './nodeFingerprint';
+import { isTestnetAddress, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -21,6 +21,21 @@ describe('parseNodeFingerprint', () => {
     // #231 P6b: the node's card-sharing flag rides when it is a boolean, and only then.
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, share_card: false })).toEqual({ hex: HEX, base64: B64, port: 4443, share_card: false });
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, share_card: 'no' })?.share_card).toBeUndefined();
+  });
+
+  it('keeps the node\'s receive address only in the shape of a testnet11 address (🏦 Bank app RECEIVE)', () => {
+    // 58 bech32 characters after `txch1`: 52 for the 32-byte puzzle hash, 6 of checksum.
+    const addr = 'txch1' + 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
+    expect(isTestnetAddress(addr)).toBe(true);
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_address: addr })?.chia_address).toBe(addr);
+    // A read-only node sends none; an older node sends none: nothing is invented.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_address).toBeUndefined();
+    // Not an address: a mainnet prefix (real XCH would go to it), a bech32 character
+    // outside the set, a length that is not a standard puzzle's, or not a string.
+    for (const bad of ['xch1' + addr.slice(5), addr.slice(0, -1) + 'b', addr.slice(0, -1), addr + 'q', addr.toUpperCase(), 42, null, '']) {
+      expect(isTestnetAddress(bad)).toBe(false);
+      expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_address: bad })?.chia_address).toBeUndefined();
+    }
   });
 
   it('refuses what is not a fingerprint: a stranger on the port, or a shape that merely passes a truthiness check', () => {
