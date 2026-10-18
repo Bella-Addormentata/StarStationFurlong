@@ -108,7 +108,8 @@ impl Network {
 
 /// Where a peer's address came from (plan §14 (2)): an agreement needs two
 /// peers from DISTINCT sources, one of them fresh (a pin, or the introducer
-/// this run), so a poisoned peer store cannot make an eclipse sticky.
+/// this run), so a poisoned peer store cannot make an eclipse sticky. An
+/// address several sources name keeps every one of them ([`Sources`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
@@ -136,6 +137,89 @@ impl Source {
             Source::Store => "store",
             Source::Gossip => "gossip",
         }
+    }
+
+    pub const ALL: [Source; 4] = [Source::Pin, Source::Introducer, Source::Store, Source::Gossip];
+
+    fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+}
+
+/// Every source that has named one address this run (plan §14 (2)): the one
+/// the address is held under — the first to name it, or the fresher one it
+/// was promoted to ([`Sources::promote`]), which the lane's per-source cap
+/// counts it against and its logs label it by — and every other that has
+/// named it since ([`Sources::add`]). An agreed pair needs two connections
+/// standing for two distinct sources, one of them fresh; a connection two
+/// sources named may stand for either, once
+/// ([`crate::chia_peer_lane::pick_agreed`]), so a cold start whose peers
+/// gossip only the introducer's own addresses still pairs, instead of holding
+/// one source for as long as discovery answers alike (#271 review, round 20).
+/// Which source a pair uses a connection for changes nothing about who vouched
+/// for the address: the introducer named it, and so did a peer, and both
+/// facts stand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sources {
+    under: Source,
+    named: u8,
+}
+
+impl Sources {
+    pub fn of(source: Source) -> Self {
+        Self { under: source, named: source.bit() }
+    }
+
+    /// `self`, named by `source` too.
+    pub fn with(mut self, source: Source) -> Self {
+        self.add(source);
+        self
+    }
+
+    /// The source the address is held and counted under.
+    pub fn under(self) -> Source {
+        self.under
+    }
+
+    pub fn named_by(self, source: Source) -> bool {
+        self.named & source.bit() != 0
+    }
+
+    /// Record that `source` named the address as well. True when it had not.
+    pub fn add(&mut self, source: Source) -> bool {
+        let before = self.named;
+        self.named |= source.bit();
+        self.named != before
+    }
+
+    /// Hold the address under a fresher source: a stored or gossiped peer the
+    /// introducer names this run counts as an introducer peer from then on,
+    /// and a public connection to an address a pin resolves to counts as the
+    /// pin. Nothing moves away from fresh except up to a pin, and a pin is
+    /// never relabelled. The source it was held under stays among those that
+    /// named it.
+    pub fn promote(&mut self, to: Source) -> bool {
+        let up = match to {
+            Source::Pin => self.under != Source::Pin,
+            Source::Introducer => !self.under.is_fresh(),
+            Source::Store | Source::Gossip => false,
+        };
+        if up {
+            self.under = to;
+            self.named |= to.bit();
+        }
+        up
+    }
+
+    /// Every source that named the address, the one it is held under first.
+    pub fn iter(self) -> impl Iterator<Item = Source> {
+        std::iter::once(self.under).chain(Source::ALL.into_iter().filter(move |s| *s != self.under && self.named_by(*s)))
+    }
+}
+
+impl From<Source> for Sources {
+    fn from(source: Source) -> Self {
+        Self::of(source)
     }
 }
 
@@ -312,9 +396,10 @@ struct Pending {
 /// stops its reader and the socket closes.
 pub struct PeerConn {
     addr: SocketAddr,
-    /// Where the address came from; may move to a fresher source
-    /// ([`Self::promote`]) when the introducer names it this run.
-    source: Mutex<Source>,
+    /// Every source that named the address, and the one it is held under,
+    /// which may move to a fresher source ([`Self::promote`]) when the
+    /// introducer or a pin names it this run.
+    sources: Mutex<Sources>,
     group: Group,
     sink: tokio::sync::Mutex<Sink>,
     pending: Arc<Mutex<Pending>>,
@@ -345,7 +430,7 @@ impl PeerConn {
     /// Open, handshake and bind one connection (see the module notes). `Err`
     /// names what the peer failed: unreachable, not a full node, another
     /// network, or block 0 not descending from the configured genesis.
-    pub async fn connect(addr: SocketAddr, source: Source, net: &Network, tls: Arc<rustls::ClientConfig>) -> Result<Arc<Self>> {
+    pub async fn connect(addr: SocketAddr, sources: impl Into<Sources>, net: &Network, tls: Arc<rustls::ClientConfig>) -> Result<Arc<Self>> {
         let addr = canonical(addr);
         let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -371,7 +456,7 @@ impl PeerConn {
         let reader = tokio::spawn(read_loop(stream, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
         let conn = Arc::new(Self {
             addr,
-            source: Mutex::new(source),
+            sources: Mutex::new(sources.into()),
             group: group_of(addr),
             sink: tokio::sync::Mutex::new(sink),
             pending,
@@ -431,26 +516,24 @@ impl PeerConn {
         self.addr
     }
 
+    /// The source the address is held under ([`Sources::under`]).
     pub fn source(&self) -> Source {
-        *self.source.lock().unwrap()
+        self.sources().under()
     }
 
-    /// A fresher provenance for the same address: a stored or gossiped peer
-    /// the introducer names this run counts as an introducer peer from then
-    /// on, and a public connection to an address a pin resolves to counts as
-    /// the pin. Nothing moves away from fresh except up to a pin, and a pin is
-    /// never relabelled.
+    /// Every source that named the address ([`Sources`]).
+    pub fn sources(&self) -> Sources {
+        *self.sources.lock().unwrap()
+    }
+
+    /// [`Sources::promote`]: hold the address under a fresher source.
     pub fn promote(&self, to: Source) -> bool {
-        let mut source = self.source.lock().unwrap();
-        let up = match to {
-            Source::Pin => *source != Source::Pin,
-            Source::Introducer => !source.is_fresh(),
-            Source::Store | Source::Gossip => false,
-        };
-        if up {
-            *source = to;
-        }
-        up
+        self.sources.lock().unwrap().promote(to)
+    }
+
+    /// [`Sources::add`]: `source` named this address too. True when it had not.
+    pub fn add_source(&self, source: Source) -> bool {
+        self.sources.lock().unwrap().add(source)
     }
 
     pub fn group(&self) -> Group {
