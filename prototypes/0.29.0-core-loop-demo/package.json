@@ -16,6 +16,7 @@
   "devDependencies": {
     "@types/node": "^20.19.43",
     "@types/three": "^0.167.2",
+    "jsqr": "^1.4.0",
     "typescript": "^5.9.3",
     "vite": "^6.4.3",
     "vitest": "^4.1.11"

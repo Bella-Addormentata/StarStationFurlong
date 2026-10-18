@@ -38,6 +38,23 @@ export interface LocalFingerprint {
    *  contact key and `SSF_CHIA_SHARE_CARD` not `0`). Absent from older nodes,
    *  which `nodeSharesCard` (roomCap.ts) reads as sharing. */
   share_card?: boolean;
+  /** ⛓️🏦 The node's testnet11 receive address (`txch1…`) while it has a
+   *  wallet loaded (the publish build with `SSF_CHIA_LANE=1`): where TXCH is
+   *  sent to fund the node's chain writes. Shown by the Bank app with COPY
+   *  and a QR code; absent from read-only nodes and older ones. Kept only
+   *  when it has the shape of a testnet11 address (`isTestnetAddress`). */
+  chia_address?: string;
+}
+
+/** A testnet11 standard-puzzle address: the `txch` prefix, the bech32m
+ *  separator and 58 bech32 characters (52 for 32 bytes of puzzle hash, 6 of
+ *  checksum). The character set is bech32's (no `1`, `b`, `i`, `o`); the
+ *  checksum itself is the node's to verify, this is the shape check that
+ *  keeps a stray string out of the Bank app's QR. */
+const TESTNET_ADDRESS = /^txch1[02-9ac-hj-np-z]{58}$/;
+
+export function isTestnetAddress(v: unknown): v is string {
+  return typeof v === 'string' && TESTNET_ADDRESS.test(v);
 }
 
 const HEX_32 = /^[0-9a-f]{64}$/i;
@@ -90,5 +107,6 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
     fp.iroh_port = r.iroh_port;
   }
   if (typeof r.share_card === 'boolean') fp.share_card = r.share_card;
+  if (isTestnetAddress(r.chia_address)) fp.chia_address = r.chia_address;
   return fp;
 }

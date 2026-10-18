@@ -248,6 +248,15 @@ pub struct Fingerprint {
     /// private-room pass. Read live per request.
     #[serde(default)]
     pub share_card: bool,
+    /// ⛓️🏦 The node's testnet11 receive address (`txch1…`) while a wallet is
+    /// loaded (the publish build with `SSF_CHIA_LANE=1`), so the SpacePhone's
+    /// Bank app can show where to send TXCH — COPY and a QR code — the way the
+    /// faucet dish shows the jar's address. Read live per request from the
+    /// wallet the hub holds; absent while no wallet is loaded. The fingerprint
+    /// is the loopback API's answer to this machine's own browser: the address
+    /// never rides in a pass or a card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_address: Option<String>,
 }
 
 // ── Mesh tuning (M3/M5.x — see brainstorming/m345-v029-build-plan.md §2) ──────
@@ -723,7 +732,45 @@ pub fn compute_fingerprint(
         reachability,
         iroh_port,
         share_card: false,
+        chia_address: None,
     })
+}
+
+#[cfg(test)]
+mod fingerprint_json_tests {
+    use super::Fingerprint;
+
+    fn fp() -> Fingerprint {
+        Fingerprint {
+            hex: "00".repeat(32),
+            base64: "A".repeat(43) + "=",
+            port: 4443,
+            iroh_node_id: String::new(),
+            iroh_relay_urls: vec![],
+            iroh_direct_addrs: vec![],
+            reachability: "local-only".into(),
+            iroh_port: 44442,
+            share_card: false,
+            chia_address: None,
+        }
+    }
+
+    /// 🏦 The Bank app reads the address from the fingerprint: it rides only
+    /// while a wallet is loaded, and an answer without it (a read-only node, an
+    /// older one) parses back with none rather than an empty string.
+    #[test]
+    fn the_receive_address_rides_in_the_fingerprint_only_while_a_wallet_is_loaded() {
+        let none = serde_json::to_string(&fp()).unwrap();
+        assert!(!none.contains("chia_address"), "{none}");
+        let mut some = fp();
+        some.chia_address = Some("txch1qq".into());
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(json.contains("\"chia_address\":\"txch1qq\""), "{json}");
+        let back: Fingerprint = serde_json::from_str(&none).unwrap();
+        assert_eq!(back.chia_address, None);
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chia_address.as_deref(), Some("txch1qq"));
+    }
 }
 
 fn load_configured_relays_from_env() -> Vec<String> {
@@ -4433,6 +4480,14 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     #[cfg(feature = "chia-read")]
                     {
                         fp.share_card = hub_clone.contact_key_durable && chia_contact::share_card_enabled();
+                    }
+                    // ⛓️🏦 The wallet's receive address, live too: a wallet is
+                    // loaded at startup or not at all, but the Bank app reads
+                    // the fingerprint, and this is the one place the browser
+                    // learns where its node is paid (never a pass, never a card).
+                    #[cfg(feature = "chia-publish")]
+                    {
+                        fp.chia_address = hub_clone.chia_wallet.lock().unwrap().as_ref().map(chia_wallet::testnet_address);
                     }
                     serde_json::to_string(&*fp).unwrap()
                 };
