@@ -384,6 +384,46 @@ describe('NetworkProvider — a dial it still owns', () => {
  * the node opened is forwarded traffic, which a room peer could have sent, and
  * must never pass for the node's answer (the spoofing fix).
  */
+describe('NetworkProvider — the room cap (#231 N8 / P6b)', () => {
+  const card = { nodeId: 'host', ck: 'Y2s=', kxPk: 'ab', issuedAt: 100, sig: 'ff' };
+  const PASS: RoomBootstrap = { ...BOOT, roomKeyB64: 'a2V5', memberHints: [{ irohNodeId: 'host', nodeCard: card }] };
+  /** The `cap` payloads among the streams the provider opened, decoded. */
+  const caps = (wt: FakeTransport) =>
+    wt.opened
+      .flatMap((s) => unframe(s.written))
+      .filter((env) => env.kind === 'cap')
+      .map((env) => JSON.parse(atob(env.payload as string)) as Record<string, unknown>);
+
+  it("a provider with no probe sends none; a pass prefetch sends the pass's cards with no posture and nothing armed", async () => {
+    // #272 review round 9: USE PASS warms a room on a background provider,
+    // which has no posture probe and so sent no cap — the node got neither the
+    // pass's cards nor leave to use them, and with every live route to the
+    // host failing it could not knock, so the room never became ready and the
+    // primary session (which joins only then) never sent its own cap.
+    const background = new FakeTransport();
+    background.acceptHandshake();
+    queueTransports(background);
+    const plain = new NetworkProvider();
+    await plain.connect(PASS);
+    await settle();
+    expect(caps(background)).toEqual([]);
+    await plain.disconnect();
+
+    const warming = new FakeTransport();
+    warming.acceptHandshake();
+    queueTransports(warming);
+    const prefetch = new NetworkProvider();
+    prefetch.markPassPrefetch();
+    await prefetch.connect(PASS);
+    await vi.waitFor(() => expect(caps(warming)).toHaveLength(1));
+    expect(caps(warming)[0]).toEqual({
+      roomKeyB64: 'a2V5', chiaMode: false, publicRoom: null, seq: expect.any(Number), shareCard: true, prefetch: true, memberCards: [card], passPrivate: true,
+    });
+    await vi.waitFor(() => expect(warming.opened[0].closed).toBe(true)); // one frame, then FIN
+    await prefetch.disconnect();
+  });
+});
+
 describe('NetworkProvider — the faucet request stream', () => {
   async function connected(): Promise<{ wt: FakeTransport; provider: NetworkProvider; replies: unknown[]; envelopes: Array<{ kind?: string }> }> {
     const wt = new FakeTransport();

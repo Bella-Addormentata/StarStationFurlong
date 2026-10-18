@@ -605,27 +605,52 @@ pub async fn spent_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) ->
     Ok(out)
 }
 
+/// What a lookup by coin id found (#272 review rounds 7 and 9): each of the
+/// coins asked for that is on the chain, with the height of the block that
+/// holds it, and the height the listing was judged at — the lowest over its
+/// pages, none once a page came undated. A coin the listing does not name is
+/// gone only if the listing was judged at or past the height the coin was
+/// last seen confirmed at ([`crate::chia_knock::coin_word`]): peers still
+/// behind that block know nothing of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoinHeights {
+    pub found: Vec<(Bytes32, u32)>,
+    pub judged_at: Option<u32>,
+}
+
 /// #231 P6b (#272 review round 7): where the coins named by `coin_ids` stand
-/// NOW — each one found, with the height of the block that holds it. A coin a
-/// listing run to its end does not name is no longer on the chain (a
-/// reorganization took its block); a listing cut short says nothing of the
-/// coins it did not reach, so `None` comes back and nothing is judged.
-pub async fn coin_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) -> Result<Option<Vec<(Bytes32, u32)>>> {
+/// NOW — each one found, with the height of the block that holds it, and the
+/// height the listing was judged at. A coin a listing run to its end does not
+/// name is no longer on the chain (a reorganization took its block) — as far
+/// as a listing judged at or past its block can tell (round 9); a listing cut
+/// short says nothing of the coins it did not reach, so `None` comes back and
+/// nothing is judged.
+pub async fn coin_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) -> Result<Option<CoinHeights>> {
     if coin_ids.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(CoinHeights::default()));
     }
-    let mut out = Vec::new();
+    let mut out = CoinHeights::default();
+    let mut undated = false;
     let mut page: Option<String> = None;
     for _ in 0..MAX_PAGES_PER_POLL {
         let listing = client
             .coin_records_by_names(coin_ids.clone(), true, page.take())
             .await
             .map_err(|e| anyhow!("coin lookup by name: {e}"))?;
-        out.extend(listing.records.iter().map(|r| (r.coin.coin_id(), r.confirmed_block_index)));
+        out.found.extend(listing.records.iter().map(|r| (r.coin.coin_id(), r.confirmed_block_index)));
+        match listing.judged_at {
+            Some(h) => out.judged_at = Some(out.judged_at.map_or(h, |lowest| lowest.min(h))),
+            None => undated = true,
+        }
         match (listing.truncated, listing.next_cursor) {
             (true, Some(next)) => page = Some(next),
             (true, None) => return Ok(None),
-            (false, _) => return Ok(Some(out)),
+            (false, _) => {
+                if undated {
+                    out.judged_at = None;
+                }
+                return Ok(Some(out));
+            }
         }
     }
     Ok(None)
@@ -646,6 +671,18 @@ pub enum HintChild {
     Absent { judged_at: Option<u32> },
     /// The listing was cut short before its end: nothing can be said yet.
     Unknown,
+}
+
+impl HintChild {
+    /// Does this word say a write CONFIRMED at `confirmed` is no longer there
+    /// (#272 review round 9)? Only a listing run to its end, judged at or past
+    /// that height, without the write. A listing judged below it — replacement
+    /// peers still behind the block that holds the write — or one undated says
+    /// nothing of it, nor does one cut short; and nothing is said of a write
+    /// never confirmed (`confirmed` 0).
+    pub fn gone_since(&self, confirmed: u32) -> bool {
+        confirmed != 0 && matches!(self, HintChild::Absent { judged_at: Some(judged) } if *judged >= confirmed)
+    }
 }
 
 /// Look for the write that spent `parent` among the coins under `hint`,
@@ -1319,19 +1356,40 @@ mod tests {
         };
         let (a, b) = (rec(1, 100), rec(2, 105));
         let ids = vec![a.coin.coin_id(), b.coin.coin_id(), Bytes32::new([9u8; 32])];
-        let page = |records: Vec<CoinRecord>, truncated: bool, next: Option<&str>| CoinListing { records, truncated, next_cursor: next.map(str::to_string), judged_at: Some(120) };
-        let chain = Scripted::new(vec![page(vec![a.clone()], true, Some("c")), page(vec![b.clone()], false, None)]);
+        let page = |records: Vec<CoinRecord>, truncated: bool, next: Option<&str>, judged_at: Option<u32>| CoinListing { records, truncated, next_cursor: next.map(str::to_string), judged_at };
+        let found = vec![(a.coin.coin_id(), 100), (b.coin.coin_id(), 105)];
+        let chain = Scripted::new(vec![page(vec![a.clone()], true, Some("c"), Some(120)), page(vec![b.clone()], false, None, Some(118))]);
         assert_eq!(
             coin_heights(&chain, ids.clone()).await.unwrap(),
-            Some(vec![(a.coin.coin_id(), 100), (b.coin.coin_id(), 105)]),
-            "the third coin is on no page: it left the chain"
+            Some(CoinHeights { found: found.clone(), judged_at: Some(118) }),
+            "the third coin is on no page: it left the chain, as far as a listing judged at 118 (the lowest page) can tell (round 9)"
         );
-        let chain = Scripted::new(vec![page(vec![a.clone()], true, None)]);
+        let chain = Scripted::new(vec![page(vec![a.clone()], true, Some("c"), Some(120)), page(vec![b.clone()], false, None, None)]);
+        assert_eq!(
+            coin_heights(&chain, ids.clone()).await.unwrap(),
+            Some(CoinHeights { found, judged_at: None }),
+            "a page undated: the listing is undated, and says nothing of the coins it lacks"
+        );
+        let chain = Scripted::new(vec![page(vec![a.clone()], true, None, Some(120))]);
         assert_eq!(coin_heights(&chain, ids.clone()).await.unwrap(), None, "cut short with nowhere to go on: nothing is said");
-        let pages: Vec<CoinListing> = (0..MAX_PAGES_PER_POLL + 1).map(|_| page(vec![], true, Some("c"))).collect();
+        let pages: Vec<CoinListing> = (0..MAX_PAGES_PER_POLL + 1).map(|_| page(vec![], true, Some("c"), Some(120))).collect();
         assert_eq!(coin_heights(&Scripted::new(pages), ids.clone()).await.unwrap(), None, "the page budget spent: nothing is said");
-        assert_eq!(coin_heights(&chain, vec![]).await.unwrap(), Some(vec![]), "no coins, no lookup");
+        assert_eq!(coin_heights(&chain, vec![]).await.unwrap(), Some(CoinHeights::default()), "no coins, no lookup");
         assert!(coin_heights(&crate::chia_chain::testing::Unanswering, ids).await.is_err());
+    }
+
+    #[test]
+    fn a_missing_write_is_gone_only_on_a_listing_judged_past_its_confirmation() {
+        // #272 review round 9: replacement peers answering below the block
+        // that confirmed a write do not list it, and prove nothing by that.
+        let absent = |judged_at| HintChild::Absent { judged_at };
+        assert!(absent(Some(100)).gone_since(100), "judged at the confirmation itself: the block would be listed");
+        assert!(absent(Some(150)).gone_since(100));
+        assert!(!absent(Some(99)).gone_since(100), "peers behind the confirmation know nothing of it");
+        assert!(!absent(None).gone_since(100), "undated: nothing is said");
+        assert!(!HintChild::Unknown.gone_since(100), "cut short: nothing is said");
+        assert!(!HintChild::Confirmed(100).gone_since(100));
+        assert!(!absent(Some(150)).gone_since(0), "a write never confirmed has no block to lose");
     }
 
     #[tokio::test]

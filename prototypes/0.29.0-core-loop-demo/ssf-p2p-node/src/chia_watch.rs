@@ -642,9 +642,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 match chia_resolve::spent_heights(&agreed, coins.clone()).await {
                     Ok(spent) => {
                         // Each verdict: input coin, hint, era, the height the
-                        // entry stood confirmed at (0: pending), whether the
-                        // hint's listing ran to its end WITHOUT the write (a
-                        // cut listing says nothing), and the standing.
+                        // entry stood confirmed at (0: pending), whether a
+                        // listing run to its end and judged at or past that
+                        // height lacked the write (a cut listing, or one judged
+                        // below it by peers behind the block, says nothing —
+                        // round 9), and the standing.
                         let mut verdicts: Vec<(String, String, u64, u32, bool, WriteStanding)> = Vec::new();
                         for k in &pending {
                             let (Some(coin), Some(hint)) = (chia_resolve::parse_hex32(&k.coin_id), chia_resolve::parse_hex32(&k.hint)) else {
@@ -660,7 +662,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             };
                             let spent_at = spent.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
                             let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
-                            let gone = matches!(child, chia_resolve::HintChild::Absent { .. });
+                            let gone = child.gone_since(k.confirmed_height);
                             verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, gone, chia_resolve::write_standing(&child, spent_at, lease)));
                         }
                         let mut book = hub.knocks.lock().unwrap();
@@ -690,10 +692,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                     println!("⛓️ ChiaHub knock: our knock never landed — {why}; forgotten, the next dial exhaustion knocks again");
                                     changed |= book.drop_sent(&coin_hex, &hint_hex);
                                 }
-                                WriteStanding::Pending if was != 0 && gone => {
-                                    // Confirmed last tick, under no block now: the
-                                    // one that held it is gone. Its spend may land
-                                    // again; until the chain says, nobody is dialed.
+                                WriteStanding::Pending if gone => {
+                                    // Confirmed last tick, under no block now by a
+                                    // listing judged past the one that held it: that
+                                    // block is gone. Its spend may land again; until
+                                    // the chain says, nobody is dialed.
                                     if book.unconfirm_sent(&coin_hex, &hint_hex) {
                                         println!("⛓️ ChiaHub knock: the block that confirmed our knock at height {was} is gone (a reorganization) — waiting for the chain's word again");
                                         changed = true;
@@ -714,8 +717,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // lane until a lookup finds it unmoved SETTLED_DEPTH deep (round 8:
             // age alone proves nothing) — moved by a reorganization, its clock
             // follows (the knocker's does the same above), or the knock is void
-            // when the move left its era; gone, nobody is dialed back for it,
-            // and the inbox files it afresh should its spend land again.
+            // when the move left its era; gone — on a listing judged at or past
+            // its block (round 9: peers behind it know nothing of the coin) —
+            // nobody is dialed back for it, and the inbox files it afresh
+            // should its spend land again.
             if let Some(agreed_peak) = knock_peak {
                 let young = hub.knocks.lock().unwrap().unsettled_inbox();
                 if !young.is_empty() {
@@ -729,14 +734,20 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                     changed |= book.drop_inbox(&k.coin_id); // malformed: on no chain
                                     continue;
                                 };
-                                match heights.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h) {
-                                    Some(h) if h == k.confirmed_height => {
-                                        // Where the book says; deep enough: final (round 8).
-                                        if crate::chia_knock::settled(h, agreed_peak) && book.settle_inbox(&k.coin_id) {
+                                use crate::chia_knock::CoinWord;
+                                let found = heights.found.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
+                                match crate::chia_knock::coin_word(found, heights.judged_at, k.confirmed_height, agreed_peak) {
+                                    CoinWord::Settled => {
+                                        // Where the book says, deep enough, by THIS lookup: final (round 8).
+                                        if book.settle_inbox(&k.coin_id) {
                                             changed = true;
                                         }
                                     }
-                                    Some(h) => match book.reclock_inbox(&k.coin_id, h) {
+                                    // Where the book says, young: asked again next tick. Or on no
+                                    // page of a listing judged below the knock's block (round 9):
+                                    // peers behind it know nothing of the coin; nothing is decided.
+                                    CoinWord::Unmoved | CoinWord::Unjudged => {}
+                                    CoinWord::MovedTo(h) => match book.reclock_inbox(&k.coin_id, h) {
                                         crate::chia_knock::InboxMove::Reclocked => {
                                             println!(
                                                 "⛓️ ChiaHub inbox: the chain moved {}'s knock from height {} to {h} (a reorganization) — the schedule follows",
@@ -755,7 +766,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                         }
                                         crate::chia_knock::InboxMove::Unchanged => {}
                                     },
-                                    None => {
+                                    CoinWord::Gone => {
                                         if book.drop_inbox(&k.coin_id) {
                                             println!(
                                                 "⛓️ ChiaHub inbox: the block that held {}'s knock (height {}) is gone (a reorganization) — not dialing it back unless it lands again",

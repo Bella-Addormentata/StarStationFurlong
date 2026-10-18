@@ -1398,6 +1398,21 @@ pub struct BeaconMark {
     /// then written again — never by the clock, and never written over.
     #[serde(default)]
     pub confirmed: bool,
+    /// The height the beacon's own coin was read back at, 0 while pending
+    /// (#272 review round 9): a listing judged at or past it that lacks the
+    /// coin says the block that held it is gone; one judged below it says
+    /// nothing. 0 too in a mark written before the height was kept: judged
+    /// again from the start.
+    #[serde(default)]
+    pub confirmed_height: u32,
+    /// A lookup on the agreed lane found the beacon's coin unmoved
+    /// [`crate::chia_knock::SETTLED_DEPTH`] blocks deep: final, judged no more
+    /// (round 9). Until then a confirmed mark is judged again each tick, as a
+    /// knock is: a shallow reorganization can drop the block that confirmed
+    /// it, and a mark final at its first inclusion would leave the node
+    /// without a beacon for the rest of the era, restart or not.
+    #[serde(default)]
+    pub settled: bool,
 }
 
 impl BeaconMark {
@@ -1411,13 +1426,20 @@ impl BeaconMark {
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         crate::chia_contact::write_private(path, &bytes)
     }
+
+    /// Judged this tick (#272 review round 9): a mark of this era, as this
+    /// identity, naming a coin, that no lookup has settled yet — pending, or
+    /// confirmed and not yet found [`crate::chia_knock::SETTLED_DEPTH`] deep.
+    pub fn unsettled_for(&self, era: u64, node_id: &str) -> bool {
+        self.era == era && self.node_id.as_deref() == Some(node_id) && !self.settled && !self.coin_id.is_empty()
+    }
 }
 
 /// Once per era, as this node id: a new era, no mark, or a mark another
 /// identity left. A mark of this era and identity holds whether confirmed or
-/// still pending — a pending one is settled by [`beacon_standing`], and the
-/// heartbeat clears it (so the beacon is due again) only on the chain's word
-/// that the write is dead.
+/// still pending — it is judged by [`beacon_step`] on the chain's word, and
+/// the heartbeat clears it (so the beacon is due again) only on the word that
+/// the write is dead, or confirmed outside its era.
 pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
     match mark {
         None => true,
@@ -1429,9 +1451,12 @@ pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
 /// input FIRST (#272 review round 2: a beacon confirming after the chain was
 /// read but before the lease reconciled read as dropped), then its own coin
 /// under the era's hint and its input's spent flag
-/// ([`crate::chia_resolve::write_standing`]). `None` when the chain could not
-/// be asked this tick, or the mark names no coin (nothing to judge).
-pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Option<crate::chia_resolve::WriteStanding> {
+/// ([`crate::chia_resolve::write_standing`]), with whether a listing run to its
+/// end and judged at or past the mark's confirmation lacked the coin
+/// ([`crate::chia_resolve::HintChild::gone_since`], round 9: the block that
+/// confirmed it is gone). `None` when the chain could not be asked this tick,
+/// or the mark names no coin (nothing to judge).
+pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
     let coin = crate::chia_resolve::parse_hex32(&mark.coin_id)?;
     let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
     let lease = lease_words(client, &[coin]).await.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
@@ -1449,7 +1474,54 @@ pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Op
             return None;
         }
     };
-    Some(crate::chia_resolve::write_standing(&child, spent_at, lease))
+    Some((crate::chia_resolve::write_standing(&child, spent_at, lease), child.gone_since(mark.confirmed_height)))
+}
+
+/// What the heartbeat does with a judged beacon mark (#272 review round 9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BeaconStep {
+    /// Nothing new: judged again next tick.
+    Keep,
+    /// The mark changed — confirmed, moved, settled, or pending again: save it.
+    Save(BeaconMark),
+    /// The write is void, for the reason given: forget the mark, the beacon is
+    /// due again.
+    Forget(String),
+}
+
+/// Judge a beacon mark by the chain's word (`word`: [`beacon_standing`]'s,
+/// `None` when the chain could not be asked) against `era`, the current one,
+/// and `peak`, the agreed peak. A confirmed mark is judged again until a
+/// lookup finds its coin unmoved [`crate::chia_knock::SETTLED_DEPTH`] deep, as
+/// a knock is ([`crate::chia_knock::coin_word`]): the chain moving the block
+/// that holds it moves the mark; a listing judged at or past its block that
+/// lacks the coin returns the mark to PENDING — the spend may land again, and
+/// the wallet lease pushes a bundle it still holds parked again when its input
+/// reads unspent — and only the lease's word that the spend is dead, or its
+/// coin gone to another write of ours, frees the era for a replacement
+/// ([`crate::chia_resolve::write_standing`]); a listing judged below the block,
+/// or undated, decides nothing. A beacon confirmed outside its era is void.
+/// Nothing here is decided by the clock.
+pub fn beacon_step(mark: &BeaconMark, word: Option<(crate::chia_resolve::WriteStanding, bool)>, era: u64, peak: u32) -> BeaconStep {
+    use crate::chia_resolve::WriteStanding;
+    match word {
+        None => BeaconStep::Keep,
+        Some((WriteStanding::Confirmed(height), _)) if chia_lane::era_of(height) != era => {
+            BeaconStep::Forget(format!("confirmed at height {height}, outside its era — readers will not take it"))
+        }
+        Some((WriteStanding::Confirmed(height), _)) if !mark.confirmed || mark.confirmed_height != height => {
+            BeaconStep::Save(BeaconMark { confirmed: true, confirmed_height: height, settled: false, ..mark.clone() })
+        }
+        Some((WriteStanding::Confirmed(height), _)) if crate::chia_knock::settled(height, peak) => {
+            BeaconStep::Save(BeaconMark { settled: true, ..mark.clone() })
+        }
+        Some((WriteStanding::Confirmed(_), _)) => BeaconStep::Keep,
+        Some((WriteStanding::Dead(why), _)) => BeaconStep::Forget(format!("never landed — {why}")),
+        Some((WriteStanding::Pending, true)) if mark.confirmed => {
+            BeaconStep::Save(BeaconMark { confirmed: false, confirmed_height: 0, settled: false, ..mark.clone() })
+        }
+        Some((WriteStanding::Pending, _)) => BeaconStep::Keep,
+    }
 }
 
 /// Settle the lease's parked spends against the chain now (under the gate),
@@ -1624,7 +1696,13 @@ pub async fn heartbeat_loop(
             "⛓️ ChiaHub beacon: last written in era {} (hint {}, {})",
             m.era,
             &m.hint[..m.hint.len().min(16)],
-            if m.confirmed { "confirmed" } else { "awaiting confirmation" }
+            if m.settled {
+                "settled"
+            } else if m.confirmed {
+                "confirmed, judged again until a lookup finds it settled"
+            } else {
+                "awaiting confirmation"
+            }
         );
     }
     let knocks_path = std::path::Path::new(crate::chia_knock::KNOCKS_FILE);
@@ -1837,38 +1915,55 @@ pub async fn heartbeat_loop(
         if let Some(beacon_sk) = &beacon_sk {
             if peak > 0 && !era_guard(peak) {
                 let era = chia_lane::era_of(peak);
-                // A pending mark of this era is settled by the chain's word
-                // first: confirmed, it stands; dead (the mempool dropped the
-                // spend, or its coin went to another write), it is cleared and
-                // the beacon is due again. Marked at the peers' acceptance
-                // alone, a dropped beacon would leave this node undiscoverable
-                // for the rest of the era (#272 review).
-                let pending_mark = beacon_mark
-                    .as_ref()
-                    .filter(|m| m.era == era && m.node_id.as_deref() == Some(&self_id) && !m.confirmed && !m.coin_id.is_empty())
-                    .cloned();
-                if let Some(m) = pending_mark {
-                    use crate::chia_resolve::WriteStanding;
-                    match beacon_standing(&peak_client, &m).await {
-                        Some(WriteStanding::Confirmed(height)) if chia_lane::era_of(height) != era => {
-                            println!("⛓️ ChiaHub beacon: the era {era} beacon confirmed at height {height}, outside its era — readers will not take it; writing it again");
+                // A mark of this era not yet settled is judged by the chain's
+                // word first (#272 review rounds 1 and 9): pending, it is
+                // confirmed, or dead (the mempool dropped the spend, or its
+                // coin went to another write) and the beacon due again;
+                // confirmed, it is judged until a lookup finds its coin
+                // SETTLED_DEPTH deep — the chain moving its block moves the
+                // mark, and a listing judged past its block that lacks the
+                // coin returns it to pending, with no replacement until the
+                // lease's word that the spend is dead. Marked final at the
+                // peers' acceptance, or at its first inclusion, a dropped
+                // beacon would leave this node undiscoverable for the rest of
+                // the era, restart or not.
+                if let Some(m) = beacon_mark.as_ref().filter(|m| m.unsettled_for(era, &self_id)).cloned() {
+                    match beacon_step(&m, beacon_standing(&peak_client, &m).await, era, peak) {
+                        BeaconStep::Keep => {}
+                        BeaconStep::Forget(why) => {
+                            println!("⛓️ ChiaHub beacon: the era {era} beacon {why}; writing it again");
                             beacon_mark = None;
                             let _ = std::fs::remove_file(beacon_mark_path);
                         }
-                        Some(WriteStanding::Confirmed(height)) => {
-                            let mark = BeaconMark { confirmed: true, ..m };
+                        BeaconStep::Save(mark) => {
+                            if mark.settled {
+                                println!(
+                                    "⛓️ ChiaHub beacon: the era {era} beacon stands at height {} — found unmoved {} blocks deep, final",
+                                    mark.confirmed_height,
+                                    crate::chia_knock::SETTLED_DEPTH
+                                );
+                            } else if !mark.confirmed {
+                                println!(
+                                    "⛓️ ChiaHub beacon: the block that confirmed the era {era} beacon at height {} is gone (a reorganization) — waiting for the chain's word again",
+                                    m.confirmed_height
+                                );
+                            } else if m.confirmed && m.confirmed_height != 0 {
+                                println!(
+                                    "⛓️ ChiaHub beacon: the chain moved the era {era} beacon from height {} to {} (a reorganization)",
+                                    m.confirmed_height, mark.confirmed_height
+                                );
+                            } else {
+                                println!(
+                                    "⛓️ ChiaHub beacon: the era {era} beacon is confirmed on chain at height {} — judged again until a lookup finds it {} blocks deep",
+                                    mark.confirmed_height,
+                                    crate::chia_knock::SETTLED_DEPTH
+                                );
+                            }
                             if let Err(e) = mark.save(beacon_mark_path) {
                                 eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
                             }
-                            println!("⛓️ ChiaHub beacon: the era {era} beacon is confirmed on chain at height {height}");
                             beacon_mark = Some(mark);
                         }
-                        Some(WriteStanding::Dead(why)) => {
-                            println!("⛓️ ChiaHub beacon: the era {era} beacon never landed — {why}; writing it again");
-                            beacon_mark = None;
-                            let _ = std::fs::remove_file(beacon_mark_path);
-                        }
-                        Some(WriteStanding::Pending) | None => {}
                     }
                 }
                 let inbound = hub.inbound_verified.lock().unwrap().clone();
@@ -1896,6 +1991,8 @@ pub async fn heartbeat_loop(
                                 node_id: Some(self_id.clone()),
                                 coin_id: hex::encode(write.coin.to_bytes()),
                                 confirmed: false,
+                                confirmed_height: 0,
+                                settled: false,
                             };
                             if let Err(e) = mark.save(beacon_mark_path) {
                                 eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
@@ -2032,7 +2129,7 @@ mod tests {
     use super::*;
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
-        ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false, pass_private: false }
+        ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false, pass_private: false, prefetch: false }
     }
 
     #[test]
@@ -2155,7 +2252,7 @@ mod tests {
     #[test]
     fn a_pending_beacon_mark_holds_until_the_chain_settles_it() {
         assert!(beacon_due(None, 5, "n"), "never written: due");
-        let pending = BeaconMark { era: 5, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false };
+        let pending = BeaconMark { era: 5, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false };
         assert!(!beacon_due(Some(&pending), 5, "n"), "pending: the chain's word settles it, not a second write");
         let confirmed = BeaconMark { confirmed: true, ..pending.clone() };
         assert!(!beacon_due(Some(&confirmed), 5, "n"));
@@ -2167,6 +2264,61 @@ mod tests {
         assert!(legacy.coin_id.is_empty());
         let round: BeaconMark = serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
         assert_eq!(round, pending);
+    }
+
+    #[test]
+    fn a_beacon_is_judged_until_a_lookup_settles_it_and_pending_again_when_its_block_goes() {
+        // #272 review round 9: a mark final at its first inclusion left the
+        // node without a beacon for the rest of the era when a shallow
+        // reorganization dropped that block. The mark now follows the chain's
+        // word as a knock does, keeps what it learned across a restart, and
+        // frees the era for a replacement only on the word that the spend is
+        // dead.
+        use crate::chia_knock::SETTLED_DEPTH;
+        use crate::chia_resolve::WriteStanding::{Confirmed, Dead, Pending};
+        let era = 5u64;
+        let h0 = 5 * ERA_BLOCKS;
+        let pending = BeaconMark { era, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false };
+        assert!(pending.unsettled_for(era, "n"));
+        assert!(!pending.unsettled_for(era, "other") && !pending.unsettled_for(era + 1, "n"));
+        assert!(!BeaconMark { coin_id: String::new(), ..pending.clone() }.unsettled_for(era, "n"), "no coin: nothing to judge");
+        // No word from the chain, or a pending write still pending: nothing.
+        assert_eq!(beacon_step(&pending, None, era, h0 + 50), BeaconStep::Keep);
+        assert_eq!(beacon_step(&pending, Some((Pending, false)), era, h0 + 50), BeaconStep::Keep);
+        // Confirmed: the height is kept, the mark judged again.
+        let BeaconStep::Save(confirmed) = beacon_step(&pending, Some((Confirmed(h0 + 40), false)), era, h0 + 50) else { panic!("confirmed: saved") };
+        assert_eq!((confirmed.confirmed, confirmed.confirmed_height, confirmed.settled), (true, h0 + 40, false));
+        assert!(confirmed.unsettled_for(era, "n"), "young: judged again");
+        assert!(!beacon_due(Some(&confirmed), era, "n"));
+        // Found where the mark says, young: nothing yet; deep enough: settled, final.
+        assert_eq!(beacon_step(&confirmed, Some((Confirmed(h0 + 40), false)), era, h0 + 40 + SETTLED_DEPTH - 1), BeaconStep::Keep);
+        let BeaconStep::Save(settled) = beacon_step(&confirmed, Some((Confirmed(h0 + 40), false)), era, h0 + 40 + SETTLED_DEPTH) else { panic!("settled: saved") };
+        assert!(settled.settled && !settled.unsettled_for(era, "n"));
+        // Moved by a reorganization: the mark follows, unsettled again.
+        let BeaconStep::Save(moved) = beacon_step(&confirmed, Some((Confirmed(h0 + 42), false)), era, h0 + 100) else { panic!("moved: saved") };
+        assert_eq!((moved.confirmed_height, moved.settled), (h0 + 42, false));
+        // The block is gone, by a listing judged past it: pending again — no
+        // replacement is written, the spend may land again …
+        let BeaconStep::Save(again) = beacon_step(&confirmed, Some((Pending, true)), era, h0 + 100) else { panic!("gone: saved") };
+        assert_eq!((again.confirmed, again.confirmed_height, again.settled), (false, 0, false));
+        assert!(!beacon_due(Some(&again), era, "n"), "pending again: the era is not free for a replacement");
+        assert!(again.unsettled_for(era, "n"));
+        // … but a listing judged below the block, or undated, is no such word.
+        assert_eq!(beacon_step(&confirmed, Some((Pending, false)), era, h0 + 100), BeaconStep::Keep, "peers behind the confirmation: nothing is decided");
+        // Dead on the lease's word, or confirmed outside its era: the mark
+        // goes and the beacon is due again.
+        assert!(matches!(beacon_step(&again, Some((Dead("the mempool dropped it"), false)), era, h0 + 100), BeaconStep::Forget(why) if why.contains("the mempool dropped it")));
+        assert!(matches!(beacon_step(&pending, Some((Confirmed(h0 - 1), false)), era, h0 + 100), BeaconStep::Forget(why) if why.contains("outside its era")));
+        // Across a restart: the file keeps the height and the settlement, and a
+        // mark written before they were kept (round 1's shape) is judged again.
+        let kept: BeaconMark = serde_json::from_slice(&serde_json::to_vec(&confirmed).unwrap()).unwrap();
+        assert_eq!(kept, confirmed);
+        assert!(kept.unsettled_for(era, "n"));
+        let old: BeaconMark = serde_json::from_str(r#"{"era":5,"last_at":1,"hint":"h","node_id":"n","coin_id":"c","confirmed":true}"#).unwrap();
+        assert!(old.confirmed && old.confirmed_height == 0 && !old.settled && old.unsettled_for(era, "n"), "final at its first inclusion no more: judged again");
+        let BeaconStep::Save(learned) = beacon_step(&old, Some((Confirmed(h0 + 40), false)), era, h0 + 50) else { panic!("the height is learned") };
+        assert_eq!(learned.confirmed_height, h0 + 40);
+        assert_eq!(beacon_step(&old, Some((Pending, false)), era, h0 + 50), BeaconStep::Keep, "with no height kept, no listing can say its block is gone");
     }
 
     #[test]

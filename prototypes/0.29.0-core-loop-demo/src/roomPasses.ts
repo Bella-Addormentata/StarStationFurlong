@@ -16,6 +16,10 @@
  *     passive YjsSync bound to that room's doc;
  *   - the prefetch bootstrap carries the host's memberHints, so the node dials
  *     the host and the room's state streams in;
+ *   - the prefetch's own `cap` hands the node the room key and the pass's
+ *     member cards, with no posture and nothing armed (#231 P6b, #272 review
+ *     round 9), so a host every live route fails to reach can be knocked on
+ *     through the chain — which is what makes such a prefetch READY at all;
  *   - "ready" = the node answered AND the host's roomInfo (name/owner) has
  *     arrived — i.e. the room is genuinely downloaded, not just "my node
  *     acknowledged". Until then the row shows LOADING.
@@ -242,6 +246,11 @@ function startPrefetch(pass: RoomPass): void {
   if (prior) stopPrefetch(pass.roomId);
 
   const provider = new NetworkProvider();
+  // #231 P6b (#272 review round 9): the node learns this room's key and the
+  // pass's member cards from the prefetch itself — the primary session joins
+  // only once the room is READY, and with every live route to the host
+  // failing that takes the knock the cards allow. No posture, nothing armed.
+  provider.markPassPrefetch();
   const pf: Prefetch = { provider, sync: null, state: 'connecting', epoch };
   prefetches.set(pass.roomId, pf);
   notify();

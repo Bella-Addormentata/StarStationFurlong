@@ -174,6 +174,46 @@ pub enum InboxMove {
     Unchanged,
 }
 
+/// A fresh lookup's word on the coin that carried a knock read (#272 review
+/// rounds 7–9), from where the listing found it (`found`), the height the
+/// listing was judged at, the height the book holds the knock confirmed at
+/// (`saved`) and the agreed peak — [`coin_word`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoinWord {
+    /// Found where the book says, [`SETTLED_DEPTH`] deep: final.
+    Settled,
+    /// Found where the book says, not deep enough yet: asked again next tick.
+    Unmoved,
+    /// Found in another block: a reorganization moved it.
+    MovedTo(u32),
+    /// On no page of a listing run to its end and judged at or past the saved
+    /// height: the block that held it is gone.
+    Gone,
+    /// On no page, but the listing was judged below the saved height, or came
+    /// undated: peers still behind the block that holds the coin know nothing
+    /// of it (round 9). Nothing is decided.
+    Unjudged,
+}
+
+/// See [`CoinWord`]. A coin a complete listing does not name is gone only
+/// when the listing was judged at or past the height the book holds it
+/// confirmed at: replacement peers answering below that block do not list
+/// it, and prove nothing by that.
+pub fn coin_word(found: Option<u32>, judged_at: Option<u32>, saved: u32, peak: u32) -> CoinWord {
+    match found {
+        Some(h) if h == saved => {
+            if settled(h, peak) {
+                CoinWord::Settled
+            } else {
+                CoinWord::Unmoved
+            }
+        }
+        Some(h) => CoinWord::MovedTo(h),
+        None if judged_at.is_some_and(|judged| judged >= saved) => CoinWord::Gone,
+        None => CoinWord::Unjudged,
+    }
+}
+
 /// Who a dial-back is for, and in which room.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DialBack {
@@ -616,6 +656,22 @@ mod tests {
         assert_eq!(book.unsettled_inbox().len(), 1, "a knock read: judged until a lookup settles it, whatever the peak");
         assert!(book.settle_inbox("k1"));
         assert!(book.unsettled_inbox().is_empty());
+    }
+
+    #[test]
+    fn a_lookup_behind_the_confirmation_says_nothing_of_a_missing_coin() {
+        // #272 review round 9: the host's lookup of a knock's coin can be
+        // answered by replacement peers standing below the block that holds
+        // it; a listing that does not name the coin proves it gone only when
+        // judged at or past that block.
+        use CoinWord::*;
+        assert_eq!(coin_word(None, Some(98), 100, 200), Unjudged, "judged at 98: the peers have not reached the block");
+        assert_eq!(coin_word(None, None, 100, 200), Unjudged, "undated: nothing is said");
+        assert_eq!(coin_word(None, Some(100), 100, 200), Gone, "judged at the block itself");
+        assert_eq!(coin_word(None, Some(150), 100, 200), Gone);
+        assert_eq!(coin_word(Some(100), Some(98), 100, 100 + SETTLED_DEPTH - 1), Unmoved, "found where the book says, young");
+        assert_eq!(coin_word(Some(100), None, 100, 100 + SETTLED_DEPTH), Settled, "deep enough: the lookup's own word settles it");
+        assert_eq!(coin_word(Some(103), Some(200), 100, 200), MovedTo(103));
     }
 
     #[test]

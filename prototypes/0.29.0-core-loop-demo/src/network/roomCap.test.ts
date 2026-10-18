@@ -112,6 +112,20 @@ describe('room cap payload (N8 / D3)', () => {
     expect(buildRoomCapPayload('k', false, false, 1, true, cards).passPrivate).toBe(true);
   });
 
+  it("P6b: a pass prefetch's cap says UNKNOWN whatever it was told, arms nothing and carries the pass's cards", () => {
+    // #272 review round 9: USE PASS warms a room on a provider with no posture
+    // probe; its cap must let the node use the pass's cards (knock on a host
+    // every live route fails to reach) without claiming a posture, arming
+    // publishing or sharing our own card.
+    const cards = [card('host')];
+    expect(buildRoomCapPayload('k', true, false, 3, true, cards, true)).toEqual({
+      roomKeyB64: 'k', chiaMode: false, publicRoom: null, seq: 3, shareCard: true, prefetch: true, memberCards: cards, passPrivate: true,
+    });
+    expect(buildRoomCapPayload('k', true, true, 3, false, [], true)).toEqual({ roomKeyB64: 'k', chiaMode: false, publicRoom: null, seq: 3, shareCard: false, prefetch: true });
+    expect(buildRoomCapPayload('k', true, false, 3, true, cards)).toMatchObject({ chiaMode: true, publicRoom: false });
+    expect(buildRoomCapPayload('k', true, false, 3, true, cards).prefetch).toBeUndefined();
+  });
+
   it('P6b: a first visit\'s cap says UNKNOWN until the room\'s state is usable, then what its doors say', () => {
     // #272 review round 4: the whole first-visit sequence. The door documents
     // are bound right after the sync starts, while the replica is still EMPTY

@@ -87,6 +87,16 @@ pub struct ChiaRoomCap {
     /// authorizes reads (free and harmless); publishing under the room key and
     /// handing out the contact card wait for a live cap.
     pub restored: bool,
+    /// #272 review round 9: sent by a background PASS PREFETCH (the room list
+    /// warming a room the player holds a pass to, `roomPasses.ts`), not by the
+    /// primary session. The prefetch cannot read the room's posture, so the
+    /// cap says unknown and arms nothing: the pass's cards may be used (filed,
+    /// the host knocked on — the knock is what makes an unreachable room's
+    /// prefetch ready at all), and the bundled key is known for the beacon
+    /// fall-through; nothing is published and no card of ours is handed out.
+    /// It never replaces a cap the primary session sent in this process, and
+    /// any cap of the primary session replaces it (`seq` 0). Never persisted.
+    pub prefetch: bool,
 }
 
 impl ChiaRoomCap {
@@ -97,6 +107,7 @@ impl ChiaRoomCap {
             && self.public_room == other.public_room
             && self.share_card == other.share_card
             && self.pass_private == other.pass_private
+            && self.prefetch == other.prefetch
     }
 
     /// May the publisher write a presence record under this room's key?
@@ -147,6 +158,10 @@ struct RoomCapPayload {
     /// cards actually sent.
     #[serde(rename = "passPrivate", default)]
     pass_private: bool,
+    /// #272 review round 9: a background pass prefetch's cap — see
+    /// [`ChiaRoomCap::prefetch`].
+    #[serde(default)]
+    prefetch: bool,
 }
 
 fn default_true() -> bool {
@@ -199,15 +214,25 @@ pub fn is_bundled_room_key(room_key: &[u8; 32]) -> bool {
 pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
     let parsed: RoomCapPayload = serde_json::from_slice(payload).ok()?;
     let room_key = decode_room_key(&parsed.room_key_b64)?;
-    let public_room = if is_bundled_room_key(&room_key) { Some(true) } else { parsed.public_room };
+    // A pass prefetch cannot read the room's posture and arms nothing, whatever
+    // it sent (#272 review round 9); the bundled key is public space all the
+    // same. Its `seq` is 0 so any cap of the primary session replaces it.
+    let public_room = if is_bundled_room_key(&room_key) {
+        Some(true)
+    } else if parsed.prefetch {
+        None
+    } else {
+        parsed.public_room
+    };
     Some(ChiaRoomCap {
         room_key,
-        chia_mode: parsed.chia_mode,
+        chia_mode: parsed.chia_mode && !parsed.prefetch,
         share_card: parsed.share_card,
         public_room,
-        seq: parsed.seq,
+        seq: if parsed.prefetch { 0 } else { parsed.seq },
         restored: false,
         pass_private: parsed.pass_private && !parsed.member_cards.is_empty(),
+        prefetch: parsed.prefetch,
     })
 }
 
@@ -262,6 +287,14 @@ pub fn file_member_cards(
 /// at once, and a write made after the lock is released could put the stale cap
 /// on disk last — restored at the next start (with seq 0) as a private, armed
 /// room the browser had already declared public.
+///
+/// A pass prefetch's cap ([`ChiaRoomCap::prefetch`], #272 review round 9)
+/// fills a room the primary session has not spoken for in this process — no
+/// cap held, one restored from disk (which uses no cards anyway), or an
+/// earlier prefetch's — and never replaces one it has: the primary session's
+/// posture and switches stand, and the cap returned is the one held, so the
+/// caller files the prefetch's cards under it where it allows cards. `then`
+/// does not run for a prefetch's cap: its word is for this process alone.
 pub fn ingest_room_cap(
     rooms: &Mutex<HashMap<String, ChiaRoomCap>>,
     room: &str,
@@ -275,6 +308,22 @@ pub fn ingest_room_cap(
             return None;
         }
     };
+    if cap.prefetch {
+        let mut map = rooms.lock().unwrap();
+        if let Some(prev) = map.get(room).filter(|prev| !prev.restored && !prev.prefetch) {
+            return Some(prev.clone());
+        }
+        let changed = !map.get(room).is_some_and(|prev| prev.same_posture(&cap));
+        map.insert(room.to_string(), cap.clone());
+        drop(map);
+        if changed {
+            println!(
+                "⛓️ ChiaHub lane: room {room} key received from a pass prefetch · posture unknown — the pass's cards may be used, nothing is published or handed out{}",
+                if cap.share_card { "" } else { " · card sharing off for this room" },
+            );
+        }
+        return Some(cap);
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -464,6 +513,7 @@ pub fn load_persisted_caps() -> Vec<(String, ChiaRoomCap)> {
                 seq: 0,
                 restored: true,
                 pass_private: false,
+                prefetch: false,
             },
         ));
     }
@@ -619,6 +669,7 @@ mod tests {
             seq: 0,
             restored: false,
             pass_private: false,
+            prefetch: false,
         };
         assert!(private.may_share_card(), "a private room shares (and files the peers' cards), armed or not");
         assert!(private.may_use_cards());
@@ -671,6 +722,59 @@ mod tests {
         assert!(!old.pass_private && old.may_use_cards(), "a browser that predates the flag: known private still uses cards");
         let bundled = parse_room_cap(&payload(decode_room_key(BUNDLED_ROOM_KEYS_B64[0]).unwrap(), &format!(",\"publicRoom\":null,\"passPrivate\":true,\"memberCards\":[{card}]"))).unwrap();
         assert!(!bundled.may_use_cards(), "the bundled welcome key never uses cards, whatever the pass says");
+    }
+
+    #[test]
+    fn p6b_a_pass_prefetch_speaks_for_a_room_the_primary_session_has_not() {
+        // #272 review round 9: USE PASS warms a room in the background, on a
+        // provider that cannot read the room's posture — and the primary
+        // session joins only once that prefetch is ready, which, with every
+        // live route to the host failing, takes a knock. The prefetch's cap
+        // carries the pass's cards with no posture and arms nothing, never
+        // overrides a cap the primary session sent, and yields to any.
+        let key = [4u8; 32];
+        let card = "{\"nodeId\":\"n\",\"ck\":\"Y2s=\",\"kxPk\":\"ab\",\"issuedAt\":1,\"sig\":\"ff\"}";
+        let prefetch_payload = payload(key, &format!(",\"prefetch\":true,\"chiaMode\":true,\"publicRoom\":false,\"seq\":900,\"passPrivate\":true,\"memberCards\":[{card}]"));
+        let cap = parse_room_cap(&prefetch_payload).unwrap();
+        assert!(cap.prefetch && cap.pass_private);
+        assert_eq!(cap.public_room, None, "a prefetch cannot read the posture, whatever it sent");
+        assert!(!cap.chia_mode && cap.seq == 0, "arms nothing, and yields to any cap of the primary session");
+        assert!(cap.may_use_cards() && !cap.may_share_card() && !cap.may_publish() && !cap.hands_out_own_card(true, true));
+        assert!(cap.may_read());
+        let bare = parse_room_cap(&payload(key, ",\"prefetch\":true")).unwrap();
+        assert!(bare.prefetch && !bare.pass_private && !bare.may_use_cards(), "no cards: nothing to use, the room is held for its key alone");
+        let bundled = parse_room_cap(&payload(decode_room_key(BUNDLED_ROOM_KEYS_B64[0]).unwrap(), ",\"prefetch\":true")).unwrap();
+        assert_eq!(bundled.public_room, Some(true), "the bundled key is public space: held for the beacon fall-through, no cards");
+        assert!(!bundled.may_use_cards() && !bundled.may_read());
+
+        let rooms = Mutex::new(HashMap::new());
+        let persisted = std::sync::Mutex::new(Vec::new());
+        let hook = |room: &str, c: &ChiaRoomCap| persisted.lock().unwrap().push((room.to_string(), c.seq));
+        // 1. Nothing held: the prefetch's cap is installed, and not persisted.
+        let held = ingest_room_cap(&rooms, "r", &prefetch_payload, hook).unwrap();
+        assert!(held.prefetch && held.may_use_cards());
+        assert_eq!(rooms.lock().unwrap()["r"].seq, 0);
+        assert!(persisted.lock().unwrap().is_empty(), "a prefetch's word is for this process");
+        // 2. The primary session speaks (any seq): its cap replaces the prefetch's.
+        let primary = ingest_room_cap(&rooms, "r", &payload(key, ",\"chiaMode\":true,\"publicRoom\":false,\"seq\":5"), hook).unwrap();
+        assert!(!primary.prefetch && primary.may_publish());
+        assert_eq!(*persisted.lock().unwrap(), vec![("r".to_string(), 5)]);
+        // 3. A later prefetch (the room re-warmed after a leave) changes nothing
+        //    of it, and hands back the cap held so its cards are filed under it.
+        let back = ingest_room_cap(&rooms, "r", &prefetch_payload, hook).unwrap();
+        assert_eq!(back, primary, "the primary session's posture and switches stand");
+        assert_eq!(rooms.lock().unwrap()["r"], primary);
+        assert_eq!(persisted.lock().unwrap().len(), 1);
+        // 4. A cap restored from disk uses no cards: a prefetch replaces it, as
+        //    the primary session's first cap would.
+        rooms.lock().unwrap().insert("s".to_string(), ChiaRoomCap { restored: true, public_room: Some(false), chia_mode: true, ..parse_room_cap(&payload(key, "")).unwrap() });
+        let over = ingest_room_cap(&rooms, "s", &prefetch_payload, hook).unwrap();
+        assert!(over.prefetch && !over.restored && over.may_use_cards() && !over.may_publish());
+        // 5. A prefetch replaces an earlier prefetch (a fresher seed); the
+        //    room's own switch off, its cards stay unused.
+        let again = ingest_room_cap(&rooms, "s", &payload(key, &format!(",\"prefetch\":true,\"shareCard\":false,\"passPrivate\":true,\"memberCards\":[{card}]")), hook).unwrap();
+        assert!(again.prefetch && !again.share_card && !again.may_use_cards());
+        assert_eq!(persisted.lock().unwrap().len(), 1);
     }
 
     #[test]

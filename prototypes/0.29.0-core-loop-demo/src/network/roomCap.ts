@@ -43,6 +43,16 @@ export interface RoomCapPayload {
    *  pass's cards — file them, knock on the host — though it hands out none of
    *  its own until the room is known private. Sent only with `memberCards`. */
   passPrivate?: boolean;
+  /** #272 review round 9: sent by a background PASS PREFETCH (the room list
+   *  warming a room the player holds a pass to, roomPasses.ts), not by the
+   *  primary session. The prefetch cannot read the room's posture, so the cap
+   *  says unknown and arms nothing: the node may use the pass's cards — file
+   *  them, knock on the host when every live route fails, which is what makes
+   *  an unreachable room's prefetch ready at all — and knows the room's key
+   *  (the bundled one, for the welcome room's beacon fall-through); it
+   *  publishes nothing and hands out no card of ours. The node never lets it
+   *  replace a cap the primary session sent. */
+  prefetch?: boolean;
 }
 
 /** Cards one cap carries at most (a room's roster, not an address book). */
@@ -55,14 +65,16 @@ export function buildRoomCapPayload(
   seq: number,
   shareCard: boolean = true,
   memberCards: readonly ContactCard[] = [],
+  prefetch: boolean = false,
 ): RoomCapPayload {
   const payload: RoomCapPayload = {
     roomKeyB64,
-    chiaMode: !!chiaMode,
-    publicRoom: publicRoom === undefined || publicRoom === null ? null : !!publicRoom,
+    chiaMode: !prefetch && !!chiaMode,
+    publicRoom: prefetch || publicRoom === undefined || publicRoom === null ? null : !!publicRoom,
     seq: Math.max(0, Math.floor(seq)) || 0,
     shareCard: shareCard !== false,
   };
+  if (prefetch) payload.prefetch = true;
   if (payload.publicRoom !== true && memberCards.length > 0) {
     payload.memberCards = memberCards.slice(0, MAX_CAP_MEMBER_CARDS);
     payload.passPrivate = true;
