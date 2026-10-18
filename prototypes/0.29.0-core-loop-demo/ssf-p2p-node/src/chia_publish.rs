@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chia_contact::InboundVerified;
 use crate::chia_knock::{KnockRequest, SentKnock};
+use crate::chia_resolve::LeaseWord;
 use crate::chia_lane::{self, AddrEntry, BeaconV2, ChiaPresenceRecord, KnockV2, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_KNOCK, KIND_PRESENCE};
 use crate::chia_rooms::ChiaRoomCap;
 
@@ -152,7 +153,17 @@ pub struct WalletLease {
     /// not be read (see [`WalletLease::restore`]). Nothing parks, and nothing
     /// is written over the file.
     sealed: std::sync::Mutex<Option<String>>,
+    /// Why a reconciliation released each coin (#231 P6b, #272 review round
+    /// 2): the knock and beacon verdicts ask ([`WalletLease::lease_word`]),
+    /// since an unspent input is dead only on the word that the peers refused
+    /// its spend. This run's memory only — the file carries the parking, not
+    /// the verdicts — and bounded ([`MAX_RELEASES_REMEMBERED`]).
+    released: std::sync::Mutex<HashMap<Bytes32, LeaseWord>>,
 }
+
+/// Release verdicts remembered at most; past it the memory starts afresh (a
+/// forgotten verdict reads as [`LeaseWord::Unknown`], which kills nothing).
+pub const MAX_RELEASES_REMEMBERED: usize = 4096;
 
 /// A parked coin: when, by which spend (see [`Parking`]), and the height it
 /// was seen confirmed at when selected (`None`: unknown, as for a coin an
@@ -277,6 +288,7 @@ impl WalletLease {
             probe_cursor: std::sync::atomic::AtomicU64::new(0),
             store: std::sync::Mutex::new(None),
             sealed: std::sync::Mutex::new(None),
+            released: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -388,9 +400,31 @@ impl WalletLease {
     }
 
     /// Is `coin` parked — consumed by a spend the chain and the mempool have
-    /// not settled yet (#231 P6b: the knock and beacon verdicts ask)?
+    /// not settled yet?
     pub fn is_parked(&self, coin: &Bytes32) -> bool {
         self.pending.lock().unwrap().contains_key(coin)
+    }
+
+    /// The lease's word on `coin` (#231 P6b, #272 review round 2): parked,
+    /// released as spent or as dropped by a reconciliation of THIS run, or
+    /// unknown. A coin parked again by a later spend reads as parked, whatever
+    /// an older release said.
+    pub fn lease_word(&self, coin: &Bytes32) -> LeaseWord {
+        if self.is_parked(coin) {
+            return LeaseWord::Parked;
+        }
+        self.released.lock().unwrap().get(coin).copied().unwrap_or(LeaseWord::Unknown)
+    }
+
+    /// Remember why coins were released, for [`WalletLease::lease_word`].
+    fn remember(&self, words: &[(Bytes32, LeaseWord)]) {
+        let mut released = self.released.lock().unwrap();
+        if released.len() + words.len() > MAX_RELEASES_REMEMBERED {
+            released.clear();
+        }
+        for (coin, word) in words {
+            released.insert(*coin, *word);
+        }
     }
 
     /// A spend from OUR wallet is still settling: a coin is parked other than
@@ -672,6 +706,7 @@ impl WalletLease {
         let judged_at = if complete && !undated { judged_at } else { None };
         let released = settle(&due, &spent_on_chain, &in_mempool, judged_at);
         if !released.is_empty() {
+            self.remember(&release_words(&due, &released, &spent_on_chain, &in_mempool));
             self.release(&released);
         }
     }
@@ -863,6 +898,31 @@ pub fn settle(
         })
         .map(|d| d.spend)
         .collect()
+}
+
+/// Why each coin of the spends [`settle`] released goes: SPENT when the chain
+/// listed an input of its spend spent, DROPPED when every input was unspent and
+/// the peers refused the bundle. A spend released on the listing's silence
+/// alone (its coins absent at a height they were known at) gets no word — such
+/// a coin reads as unknown, which kills nothing (#231 P6b, #272 review round 2).
+pub fn release_words(
+    due: &[DueSpend],
+    released: &[u64],
+    spent_on_chain: &HashMap<Bytes32, bool>,
+    in_mempool: &HashMap<u64, Option<bool>>,
+) -> Vec<(Bytes32, LeaseWord)> {
+    let mut out = Vec::new();
+    for d in due.iter().filter(|d| released.contains(&d.spend)) {
+        let word = if d.coins.iter().any(|c| spent_on_chain.get(&c.coin_id) == Some(&true)) {
+            LeaseWord::Spent
+        } else if in_mempool.get(&d.spend).copied().flatten() == Some(false) {
+            LeaseWord::Dropped
+        } else {
+            continue;
+        };
+        out.extend(d.coins.iter().map(|c| (c.coin_id, word)));
+    }
+    out
 }
 
 impl Default for WalletLease {
@@ -1323,13 +1383,16 @@ pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
     }
 }
 
-/// #231 P6b: the chain's word on a pending beacon mark — its own coin under
-/// the era's hint, its input's spent flag, and whether the lease still parks
-/// the input ([`crate::chia_resolve::write_standing`]). `None` when the chain
-/// could not be asked this tick, or the mark names no coin (nothing to judge).
+/// #231 P6b: the standing of a pending beacon mark — the lease's word on its
+/// input FIRST (#272 review round 2: a beacon confirming after the chain was
+/// read but before the lease reconciled read as dropped), then its own coin
+/// under the era's hint and its input's spent flag
+/// ([`crate::chia_resolve::write_standing`]). `None` when the chain could not
+/// be asked this tick, or the mark names no coin (nothing to judge).
 pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Option<crate::chia_resolve::WriteStanding> {
     let coin = crate::chia_resolve::parse_hex32(&mark.coin_id)?;
     let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
+    let lease = lease_words(client, &[coin]).await.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
     let child = match crate::chia_resolve::child_under_hint(client, hint, coin).await {
         Ok(child) => child,
         Err(e) => {
@@ -1344,19 +1407,18 @@ pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Op
             return None;
         }
     };
-    let parked = still_parked(client, &[coin]).await.contains(&coin);
-    Some(crate::chia_resolve::write_standing(&child, spent_at, parked))
+    Some(crate::chia_resolve::write_standing(&child, spent_at, lease))
 }
 
 /// Settle the lease's parked spends against the chain now (under the gate),
-/// then say which of `coins` are still parked: their spends may still be live
-/// in a mempool, so a write filed by one of them is left pending. For the
-/// knock and beacon verdicts, which would otherwise wait for the next writer
-/// to reconcile.
-pub async fn still_parked(client: &impl ChainAccess, coins: &[Bytes32]) -> HashSet<Bytes32> {
+/// then give the lease's word on each of `coins` ([`WalletLease::lease_word`]).
+/// For the knock and beacon verdicts, which would otherwise wait for the next
+/// writer to reconcile; asked BEFORE the chain lookups, so a write confirming
+/// in between is seen by them (#272 review round 2).
+pub async fn lease_words(client: &impl ChainAccess, coins: &[Bytes32]) -> HashMap<Bytes32, LeaseWord> {
     let _gate = WALLET_LEASE.lock().await;
     WALLET_LEASE.reconcile(client).await;
-    coins.iter().copied().filter(|c| WALLET_LEASE.is_parked(c)).collect()
+    coins.iter().map(|c| (*c, WALLET_LEASE.lease_word(c))).collect()
 }
 
 /// Write one knock for `req`: the knocker's node id, its contact key when it
@@ -1897,6 +1959,49 @@ mod tests {
         assert!(era_guard(ERA_BLOCKS - 1));
         assert!(!era_guard(ERA_BLOCKS));
         assert!(era_guard(3 * ERA_BLOCKS - 1));
+    }
+
+    #[test]
+    fn a_release_remembers_why_and_the_lease_answers_parked_spent_dropped_or_unknown() {
+        let coin = |seed: u8| Bytes32::new([seed; 32]);
+        let due = vec![
+            DueSpend { spend: 1, coins: vec![coin(1).into(), coin(2).into()], bundle: None },
+            DueSpend { spend: 2, coins: vec![coin(3).into()], bundle: None },
+            DueSpend { spend: 3, coins: vec![(coin(4), 50).into()], bundle: None },
+            DueSpend { spend: 4, coins: vec![coin(5).into()], bundle: None },
+        ];
+        let spent: HashMap<Bytes32, bool> = [(coin(1), true), (coin(2), false), (coin(3), false), (coin(5), false)].into_iter().collect();
+        let mempool: HashMap<u64, Option<bool>> = [(2, Some(false)), (4, Some(true))].into_iter().collect();
+        // Spend 1 confirmed (one input spent), spend 2 was refused everywhere,
+        // spend 3's coin is absent at a height it was known at, spend 4 is live.
+        let released = settle(&due, &spent, &mempool, Some(60));
+        assert_eq!(released, vec![1, 2, 3]);
+        let words = release_words(&due, &released, &spent, &mempool);
+        assert_eq!(
+            words,
+            vec![(coin(1), LeaseWord::Spent), (coin(2), LeaseWord::Spent), (coin(3), LeaseWord::Dropped)],
+            "the silent release of spend 3 gets no word"
+        );
+        let lease = WalletLease::new();
+        let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
+        let parking = lease.park_with_bundle([coin(9)], &bundle).unwrap();
+        lease.remember(&words);
+        assert_eq!(lease.lease_word(&coin(9)), LeaseWord::Parked);
+        assert_eq!(lease.lease_word(&coin(1)), LeaseWord::Spent);
+        assert_eq!(lease.lease_word(&coin(2)), LeaseWord::Spent, "every coin of a confirmed spend is spent to the lease");
+        assert_eq!(lease.lease_word(&coin(3)), LeaseWord::Dropped);
+        assert_eq!(lease.lease_word(&coin(4)), LeaseWord::Unknown, "released on silence: unknown");
+        assert_eq!(lease.lease_word(&coin(5)), LeaseWord::Unknown, "still due, never parked here: unknown");
+        // A coin parked again by a later spend reads as parked over its old word.
+        let _again = lease.park_with_bundle([coin(3)], &bundle).unwrap();
+        assert_eq!(lease.lease_word(&coin(3)), LeaseWord::Parked);
+        lease.unpark(&parking);
+        assert_eq!(lease.lease_word(&coin(9)), LeaseWord::Unknown, "handed back by a rejection: no verdict, unknown");
+        // The memory is bounded: past the cap it starts afresh.
+        let many: Vec<(Bytes32, LeaseWord)> = (0..MAX_RELEASES_REMEMBERED).map(|i| (Bytes32::new([(i % 251) as u8, (i / 251) as u8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), LeaseWord::Dropped)).collect();
+        lease.remember(&many);
+        assert_eq!(lease.lease_word(&coin(1)), LeaseWord::Unknown, "the old verdicts went with the reset");
+        assert_eq!(lease.lease_word(&many[0].0), LeaseWord::Dropped);
     }
 
     #[test]

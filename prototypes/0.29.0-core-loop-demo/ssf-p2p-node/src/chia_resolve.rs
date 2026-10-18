@@ -630,6 +630,25 @@ pub async fn child_under_hint(client: &impl ChainAccess, hint: Bytes32, parent: 
     Ok(HintChild::Unknown)
 }
 
+/// The wallet lease's word on a write's input (#231 P6b, #272 review round 2):
+/// what reconciliation decided about the spend that consumed it, as far as
+/// THIS run knows. Asked before the chain is, so a write confirming between
+/// the two is seen by the chain lookups and never mistaken for a dropped spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseWord {
+    /// Still parked: the spend may be live in a mempool.
+    Parked,
+    /// Released because the chain listed the input spent (by this write, or
+    /// by another that took the coin): the chain lookups say which.
+    Spent,
+    /// Released because every peer refused the bundle: the spend will never
+    /// land. The one word that can call an unspent input DEAD.
+    Dropped,
+    /// Nothing known: not parked and no release remembered — a restart, a
+    /// lease that was never restored (publishing off), a read-only build.
+    Unknown,
+}
+
 /// Where a pending write stands (#231 P6b knocks and beacons, #272 review).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteStanding {
@@ -643,15 +662,17 @@ pub enum WriteStanding {
 
 /// Judge a pending write from the chain's word: `child` is what sits under its
 /// hint ([`child_under_hint`]), `spent_at` the height its input was spent at
-/// when the chain lists it spent ([`spent_heights`]), `parked` whether the
-/// wallet lease still holds the input (its spend may still be live in a
-/// mempool). Only the write's OWN coin confirms it. An input spent with no
-/// child under the hint went to ANOTHER spend of ours — but only on a listing
-/// judged at or past that spend, since a source still behind it may not list
-/// the child yet. An input unspent and no longer parked was dropped by the
-/// mempool (the lease frees a coin only on that verdict or on confirmation).
-/// Nothing here is decided by the clock.
-pub fn write_standing(child: &HintChild, spent_at: Option<u32>, parked: bool) -> WriteStanding {
+/// when the chain lists it spent ([`spent_heights`]), `lease` the wallet
+/// lease's word on the input ([`LeaseWord`], asked BEFORE the two lookups).
+/// Only the write's OWN coin confirms it. An input spent with no child under
+/// the hint went to ANOTHER spend of ours — but only on a listing judged at or
+/// past that spend, since a source still behind it may not list the child yet.
+/// An input unspent is dead only on the lease's word that the peers refused
+/// the spend ([`LeaseWord::Dropped`]); still parked, released as spent (the
+/// lookups lag the lease then) or unknown to this run, it stays pending —
+/// silence never kills a write (#272 review round 2). Nothing here is decided
+/// by the clock.
+pub fn write_standing(child: &HintChild, spent_at: Option<u32>, lease: LeaseWord) -> WriteStanding {
     match child {
         HintChild::Confirmed(height) => WriteStanding::Confirmed(*height),
         HintChild::Unknown => WriteStanding::Pending,
@@ -660,7 +681,7 @@ pub fn write_standing(child: &HintChild, spent_at: Option<u32>, parked: bool) ->
                 WriteStanding::Dead("its coin went to another spend of ours")
             }
             Some(_) => WriteStanding::Pending,
-            None if !parked => WriteStanding::Dead("the mempool dropped it"),
+            None if lease == LeaseWord::Dropped => WriteStanding::Dead("the mempool dropped it"),
             None => WriteStanding::Pending,
         },
     }
@@ -1043,17 +1064,26 @@ mod tests {
 
     #[test]
     fn a_write_is_judged_by_its_own_coin_under_the_hint_not_by_its_spent_input() {
+        use LeaseWord::{Dropped, Parked, Spent, Unknown};
         let absent = |judged_at| HintChild::Absent { judged_at };
-        assert_eq!(write_standing(&HintChild::Confirmed(900), Some(900), false), WriteStanding::Confirmed(900));
-        assert_eq!(write_standing(&HintChild::Confirmed(900), None, true), WriteStanding::Confirmed(900), "the child is the proof, whatever the input says");
-        assert_eq!(write_standing(&HintChild::Unknown, Some(900), false), WriteStanding::Pending, "a listing cut short decides nothing");
-        assert_eq!(write_standing(&absent(Some(950)), Some(900), true), WriteStanding::Dead("its coin went to another spend of ours"));
-        assert_eq!(write_standing(&absent(Some(900)), Some(900), false), WriteStanding::Dead("its coin went to another spend of ours"), "judged at the spend itself is enough");
-        assert_eq!(write_standing(&absent(Some(899)), Some(900), false), WriteStanding::Pending, "a source behind the spend may not list the child yet");
-        assert_eq!(write_standing(&absent(None), Some(900), false), WriteStanding::Pending, "an undated listing cannot say");
-        assert_eq!(write_standing(&absent(Some(950)), None, true), WriteStanding::Pending, "unspent and still parked: the spend may be live in a mempool");
-        assert_eq!(write_standing(&absent(Some(950)), None, false), WriteStanding::Dead("the mempool dropped it"));
-        assert_eq!(write_standing(&absent(None), None, false), WriteStanding::Dead("the mempool dropped it"), "the lease's verdict needs no height");
+        assert_eq!(write_standing(&HintChild::Confirmed(900), Some(900), Spent), WriteStanding::Confirmed(900));
+        assert_eq!(write_standing(&HintChild::Confirmed(900), None, Parked), WriteStanding::Confirmed(900), "the child is the proof, whatever the input says");
+        assert_eq!(write_standing(&HintChild::Unknown, Some(900), Dropped), WriteStanding::Pending, "a listing cut short decides nothing");
+        assert_eq!(write_standing(&absent(Some(950)), Some(900), Parked), WriteStanding::Dead("its coin went to another spend of ours"));
+        assert_eq!(write_standing(&absent(Some(900)), Some(900), Spent), WriteStanding::Dead("its coin went to another spend of ours"), "judged at the spend itself is enough");
+        assert_eq!(write_standing(&absent(Some(899)), Some(900), Spent), WriteStanding::Pending, "a source behind the spend may not list the child yet");
+        assert_eq!(write_standing(&absent(None), Some(900), Spent), WriteStanding::Pending, "an undated listing cannot say");
+        assert_eq!(write_standing(&absent(Some(950)), None, Parked), WriteStanding::Pending, "unspent and still parked: the spend may be live in a mempool");
+        assert_eq!(write_standing(&absent(Some(950)), None, Dropped), WriteStanding::Dead("the mempool dropped it"));
+        assert_eq!(write_standing(&absent(None), None, Dropped), WriteStanding::Dead("the mempool dropped it"), "the lease's verdict needs no height");
+        // The race (#272 review round 2): the write confirmed after the lease
+        // reconciled (it released the input as spent) but the chain lookups,
+        // made first, still showed the input unspent and no child — not dead.
+        assert_eq!(write_standing(&absent(Some(950)), None, Spent), WriteStanding::Pending, "released as spent: the lookups lag the lease, the write is not dead");
+        // A lease that knows nothing of the coin (a restart, publishing off, a
+        // read-only build) never kills a write.
+        assert_eq!(write_standing(&absent(Some(950)), None, Unknown), WriteStanding::Pending, "unknown to the lease: pending");
+        assert_eq!(write_standing(&absent(None), None, Unknown), WriteStanding::Pending);
     }
 
     #[tokio::test]

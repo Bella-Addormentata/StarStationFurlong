@@ -43,7 +43,7 @@ use chia_protocol::Bytes32;
 
 use crate::chia_knock::{DialBack, InboxKnock};
 use crate::chia_lane::{self, ChiaPresenceRecord};
-use crate::chia_resolve::{self, FoundRecord, HintCursor, WriteStanding};
+use crate::chia_resolve::{self, FoundRecord, HintCursor, LeaseWord, WriteStanding};
 
 /// Blocks per beat: reads align to peak heights that are multiples of this.
 /// 32 blocks ≈ 10 min at testnet11's ~18.75 s block time. `SSF_CHIA_BEAT_BLOCKS`.
@@ -246,19 +246,20 @@ pub fn watch_enabled() -> bool {
 }
 
 /// #231 P6b: settle the wallet lease's parked spends against the chain, then
-/// say which of `coins` are still parked — their spends may still be live in a
-/// mempool, so a knock filed by one of them is left pending
-/// ([`chia_resolve::write_standing`]).
+/// give the lease's word on each of `coins` ([`LeaseWord`]): what a knock's
+/// standing needs beside the chain's lookups ([`chia_resolve::write_standing`]).
 #[cfg(feature = "chia-publish")]
-async fn still_parked(client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32]) -> HashSet<Bytes32> {
-    crate::chia_publish::still_parked(client, coins).await
+async fn lease_words(client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32]) -> HashMap<Bytes32, LeaseWord> {
+    crate::chia_publish::lease_words(client, coins).await
 }
 
-/// A read-only build parks nothing: a knock it finds pending was another
-/// build's, and an unspent input of one is a write that never landed for it.
+/// A read-only build has no lease: its word on every coin is unknown, which
+/// kills nothing — a knock it finds pending (another build's) stays pending
+/// until the chain confirms it, its coin goes to another spend, or two eras
+/// pass (#272 review round 2).
 #[cfg(not(feature = "chia-publish"))]
-async fn still_parked(_client: &impl crate::chia_chain::ChainAccess, _coins: &[Bytes32]) -> HashSet<Bytes32> {
-    HashSet::new()
+async fn lease_words(_client: &impl crate::chia_chain::ChainAccess, coins: &[Bytes32]) -> HashMap<Bytes32, LeaseWord> {
+    coins.iter().map(|c| (*c, LeaseWord::Unknown)).collect()
 }
 
 /// The watcher: beat-aligned reads for every readable room, then holds for
@@ -583,7 +584,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             );
                             if let Some(ck) = f.item.ck_from {
                                 let mut book = hub.peers.lock().unwrap();
-                                if book.record_knock(&from, &ck, room) {
+                                if book.record_knock(&from, &ck, room, now_unix) {
                                     let _ = book.save(std::path::Path::new(crate::chia_contact::PEERS_FILE));
                                 }
                             }
@@ -597,20 +598,36 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 key.starts_with(INBOX_SCHED_PREFIX) && !inbox_rooms.iter().any(|(r, _)| inbox_sched_key(r) == key)
             });
 
+            // ── #231 P6b: the knock book's own clock is an AGREED peak (plan
+            // §14 (5)): pruning and planning forget or move rendezvous state,
+            // and one carrier peer naming a future height would otherwise
+            // empty the book or skip every boundary (#272 review round 2). No
+            // agreed peak this tick: nothing is pruned, nothing is planned; the
+            // reads above ran on the carrier's peak as before.
+            let knocks_in_book = {
+                let book = hub.knocks.lock().unwrap();
+                !book.sent.is_empty() || !book.inbox.is_empty()
+            };
+            let knock_peak: Option<u32> = if knocks_in_book { chia_resolve::peak_height(&agreed).await } else { None };
+            // 0 when there is none: nothing comes due at 0, nothing is marked.
+            let kpeak = knock_peak.unwrap_or(0);
+
             // ── #231 P6b: the knocks WE sent — each pending one judged by the
             // chain's word (every tick while one is pending: the first boundary
             // is ten blocks after the confirmation): its own coin under the
             // host's inbox hint confirms it; an input gone to another spend of
-            // ours, or unspent and no longer parked by the wallet lease, means
+            // ours, or unspent and dropped on the wallet lease's word, means
             // the knock never landed and is forgotten (the next dial exhaustion
             // knocks again). The input's spent flag alone proves nothing (#272
-            // review): a dropped knock's coin is the next write's input.
+            // review): a dropped knock's coin is the next write's input. The
+            // lease is asked FIRST, the chain after, so a knock confirming in
+            // between is seen by the lookups and never read as dropped.
             let pending = hub.knocks.lock().unwrap().pending_sent();
             if !pending.is_empty() {
                 let coins: Vec<Bytes32> = pending.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
+                let words = lease_words(&agreed, &coins).await;
                 match chia_resolve::spent_heights(&agreed, coins.clone()).await {
                     Ok(spent) => {
-                        let parked = still_parked(&agreed, &coins).await;
                         let mut verdicts: Vec<(String, u64, WriteStanding)> = Vec::new();
                         for k in &pending {
                             let (Some(coin), Some(hint)) = (chia_resolve::parse_hex32(&k.coin_id), chia_resolve::parse_hex32(&k.hint)) else {
@@ -625,7 +642,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                 }
                             };
                             let spent_at = spent.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
-                            verdicts.push((k.coin_id.clone(), k.era, chia_resolve::write_standing(&child, spent_at, parked.contains(&coin))));
+                            let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
+                            verdicts.push((k.coin_id.clone(), k.era, chia_resolve::write_standing(&child, spent_at, lease)));
                         }
                         let mut book = hub.knocks.lock().unwrap();
                         let mut changed = false;
@@ -655,9 +673,9 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     Err(e) => eprintln!("⛓️ ChiaHub knock: could not read our knocks' confirmation: {e:#}"),
                 }
             }
-            {
+            if let Some(agreed_peak) = knock_peak {
                 let mut book = hub.knocks.lock().unwrap();
-                if book.prune(peak) > 0 {
+                if book.prune(agreed_peak) > 0 {
                     let _ = book.save(knocks_path);
                 }
             }
@@ -673,7 +691,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // clock moved up) only once its hold started, or when it is moot;
             // one the room had no slot for, or whose target another dial
             // already claims, stays due and comes first next tick (#272 review).
-            let due = hub.knocks.lock().unwrap().due_dialbacks(peak);
+            let due = hub.knocks.lock().unwrap().due_dialbacks(kpeak);
             let mut planned: Vec<DialBack> = Vec::new();
             for d in due {
                 let Ok(target_pub) = d.target.parse::<iroh::PublicKey>() else {
@@ -702,7 +720,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 let mut book = hub.knocks.lock().unwrap();
                 let mut changed = false;
                 for d in &planned {
-                    changed |= book.mark_dialed(d, peak);
+                    changed |= book.mark_dialed(d, kpeak);
                 }
                 if changed {
                     let _ = book.save(knocks_path);

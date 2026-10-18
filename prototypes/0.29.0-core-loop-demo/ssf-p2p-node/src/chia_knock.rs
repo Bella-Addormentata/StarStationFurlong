@@ -235,15 +235,18 @@ impl KnockBook {
         true
     }
 
-    /// Forget what the chain no longer honours at `peak`: every entry two eras
-    /// past its own (the record expired), and a knock of ours still pending
-    /// from an era that ended (a knock confirmed outside its era is noise to
-    /// the host; the next dial exhaustion knocks again in the new era).
-    /// Returns how many went.
+    /// Forget what the chain no longer honours at `peak` (an AGREED peak: this
+    /// forgets rendezvous state, #272 review round 2): every entry two eras
+    /// past its own, the record's own validity. A knock of ours still pending
+    /// when its era ended is KEPT within that window: the era's end proves
+    /// nothing about its spend — it may have confirmed late in the era while
+    /// the lookup lagged — and the chain's word settles it (the watcher drops
+    /// a knock confirmed outside its era explicitly). It blocks no new knock,
+    /// since the once-per-era rule is per era. Returns how many went.
     pub fn prune(&mut self, peak: u32) -> usize {
         let era = era_of(peak);
         let before = self.sent.len() + self.inbox.len();
-        self.sent.retain(|k| k.era + 2 > era && (k.confirmed_height != 0 || k.era == era));
+        self.sent.retain(|k| k.era + 2 > era);
         self.inbox.retain(|k| k.era + 2 > era);
         before - self.sent.len() - self.inbox.len()
     }
@@ -444,11 +447,14 @@ mod tests {
         book.record_inbox(InboxKnock { from: "x".into(), room: "r".into(), era: 1, confirmed_height: 40_001, coin_id: "k".into(), last_rendezvous: 0 });
         book.record_inbox(InboxKnock { from: "y".into(), room: "r".into(), era: 2, confirmed_height: 70_001, coin_id: "l".into(), last_rendezvous: 0 });
         let peak = 3 * ERA_BLOCKS + 5; // era 3
-        assert_eq!(book.prune(peak), 3, "era 1 on both sides and the pending knock of era 2");
+        assert_eq!(book.prune(peak), 2, "era 1 on both sides; the pending knock of era 2 is kept for the chain's word");
         let hosts: Vec<&str> = book.sent.iter().map(|k| k.host.as_str()).collect();
-        assert_eq!(hosts, vec!["pending-now", "confirmed-last-era"]);
+        assert_eq!(hosts, vec!["pending-last-era", "pending-now", "confirmed-last-era"]);
+        assert!(!book.knocked_this_era("pending-last-era", 3), "a pending knock of the last era blocks no knock in this one");
         assert_eq!(book.inbox.len(), 1);
         assert_eq!(book.inbox[0].from, "y");
+        assert_eq!(book.prune(4 * ERA_BLOCKS), 3, "two eras on: era 2 goes, pending or not");
+        assert_eq!(book.sent.iter().map(|k| k.host.as_str()).collect::<Vec<_>>(), vec!["pending-now"]);
     }
 
     #[test]
