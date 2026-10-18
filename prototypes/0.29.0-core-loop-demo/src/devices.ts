@@ -264,6 +264,7 @@ import {
   type FaucetOp,
   type FaucetRequestTicket,
 } from './faucetDish';
+import { qrSvg } from './qrCode';
 
 /** The helm's FUEL gauge: its figure, fill and colour. */
 function fuelGauge(fuel: number, capacity: number): { text: string; pct: number; color: string } {
@@ -4817,8 +4818,9 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
           ${FAUCET_GIVE_AMOUNTS.map((g, i) => btn(`faucet-give-${i}`, g.label, !canGive(g.mojos))).join('')}
         </div>
         <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
-          Or pay into the jar from any Chia wallet (testnet11):
+          Or pay into the jar from any Chia wallet (testnet11): scan the code or copy the address.
         </div>
+        ${st ? `<div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(st.address, { module: 2, quiet: 2, dark: '#040816', light: CH_GOLD, label: 'QR code of the jar\'s testnet11 address' })}</div>` : ''}
         <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
           <code id="faucet-address" style="flex:1; font-size:8.5px; color:${CH_GOLD}; word-break:break-all; user-select:all;">${st ? escapeHtml(st.address) : '…'}</code>
           ${btn('faucet-copy', copied ? 'COPIED' : 'COPY', !st)}
