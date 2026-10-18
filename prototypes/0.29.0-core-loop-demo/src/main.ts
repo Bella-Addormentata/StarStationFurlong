@@ -16,13 +16,12 @@ import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
 import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, setFaucetReply } from "./faucetDish";
 import {
+  acceptNodeCard,
   bridgeMemberHints,
   cardsForPass,
   collectMemberHints,
   mergeMemberHints,
-  newerCard,
   nodeSharesCard,
-  normalizeContactCard,
   normalizeMemberHint,
   normalizeStringArray,
   passageReading,
@@ -2041,15 +2040,18 @@ async function joinRoomAtEpoch(
       // drops peer-sent ones, but an older node forwards them), so it is
       // ignored here: nothing a room peer sends may set the dish's address.
       if (env.kind === "faucet") return;
-      // #231 P6b: the LOCAL node's own contact card (node-local lane, the node
-      // drops peer-sent ones). Kept for the passes minted from here on; only a
-      // card naming the node we are connected to counts.
+      // #231 P6b: the LOCAL node's own contact card (node-local lane: a P6b
+      // node drops peer-sent ones, an older node forwards them, so the card
+      // counts only with a valid signature by the node we are connected to —
+      // #272 review round 15, `acceptNodeCard`). Kept for the passes minted
+      // from here on.
       if (env.kind === "card" && typeof env.payload === "string") {
         try {
-          const card = normalizeContactCard(JSON.parse(atob(env.payload)));
-          if (card && card.nodeId === localFingerprint?.iroh_node_id) {
-            localNodeCard = newerCard(localNodeCard ?? undefined, card) ?? card;
-            writeNodeCard(localNodeCard);
+          const held = localNodeCard ?? readNodeCard();
+          const kept = acceptNodeCard(held, JSON.parse(atob(env.payload)), localFingerprint?.iroh_node_id);
+          if (kept && kept !== held) {
+            localNodeCard = kept;
+            writeNodeCard(kept);
           }
         } catch {
           /* malformed card: ignored */

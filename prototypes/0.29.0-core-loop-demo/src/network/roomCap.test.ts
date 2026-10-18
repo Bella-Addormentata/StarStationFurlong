@@ -1,11 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import * as ed from '@noble/ed25519';
 import {
   MAX_CAP_MEMBER_CARDS,
+  NODE_CARD_KEY,
+  acceptNodeCard,
   bridgeMemberHints,
   buildRoomCapPayload,
   cardsForPass,
+  contactCardSignBytes,
   forgetSessionFlags,
   latin1Json,
   seedWithoutCards,
@@ -16,6 +20,7 @@ import {
   normalizeContactCard,
   passageReading,
   readChiaMode,
+  readNodeCard,
   readShareCard,
   roomIsPublicSpace,
   roomPosture,
@@ -24,6 +29,7 @@ import {
   setChiaMode,
   setShareCard,
   type PostureSources,
+  verifyContactCard,
 } from './roomCap';
 
 const card = (nodeId: string, issuedAt = 100) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt, sig: 'ff' });
@@ -385,6 +391,50 @@ describe('room cap payload (N8 / D3)', () => {
     expect(memberCardsOf(kept)).toEqual([card('host'), card('me', 50)]);
     expect(kept.find((h) => h.irohNodeId === 'me')).toEqual({ irohNodeId: 'me', irohRelayUrls: ['https://relay-a'], nodeCard: card('me', 50) });
     expect(buildRoomCapPayload('Yw==', false, null, 3, true, memberCardsOf(kept), true)).toMatchObject({ memberCards: [card('host'), card('me', 50)], passPrivate: true });
+  });
+
+  it("P6b: the node's own card is kept only with a valid signature by the node it names (review round 15)", () => {
+    const sk = ed.utils.randomPrivateKey();
+    const nodeId = ed.etc.bytesToHex(ed.getPublicKey(sk));
+    const sign = (c: { nodeId: string; ck: string; kxPk: string; issuedAt: number }) =>
+      ({ ...c, sig: ed.etc.bytesToHex(ed.sign(contactCardSignBytes(c), sk)) });
+    const ck = (b: number) => btoa(String.fromCharCode(...new Uint8Array(32).fill(b)));
+    const genuine = sign({ nodeId, ck: ck(7), kxPk: 'ab'.repeat(32), issuedAt: 1_000 });
+    expect(verifyContactCard(genuine)).toBe(true);
+    // A peer's forgery an older node forwarded: it names our node, is dated at
+    // the end of time, and is signed by nobody.
+    const forged = { ...genuine, issuedAt: Number.MAX_SAFE_INTEGER, sig: 'ff'.repeat(64) };
+    expect(verifyContactCard(forged)).toBe(false);
+    expect(verifyContactCard({ ...genuine, issuedAt: 1_001 })).toBe(false); // a field changed under the signature
+    expect(verifyContactCard({ ...genuine, nodeId: 'ab'.repeat(32) })).toBe(false); // another node's id
+    expect(verifyContactCard({ ...genuine, sig: 'zz' })).toBe(false);
+    // The handler's rule: the forwarded forgery first, the genuine card after it.
+    expect(acceptNodeCard(null, forged, nodeId)).toBeNull();
+    expect(acceptNodeCard(null, genuine, nodeId)).toEqual(genuine);
+    expect(acceptNodeCard(genuine, forged, nodeId)).toEqual(genuine);
+    const rotated = sign({ nodeId, ck: ck(8), kxPk: 'ab'.repeat(32), issuedAt: 2_000 });
+    expect(acceptNodeCard(genuine, rotated, nodeId)).toEqual(rotated);
+    expect(acceptNodeCard(rotated, genuine, nodeId)).toEqual(rotated); // an older genuine card never comes back
+    expect(acceptNodeCard(genuine, rotated, 'ab'.repeat(32))).toEqual(genuine); // not the node we are connected to
+    expect(acceptNodeCard(genuine, rotated, undefined)).toEqual(genuine);
+    expect(acceptNodeCard(genuine, 'not a card', nodeId)).toEqual(genuine);
+    // A forgery an older build persisted is dropped on read; a genuine card is read back.
+    const store = new Map<string, string>([[NODE_CARD_KEY, JSON.stringify(forged)]]);
+    const stub = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    } as unknown as Storage;
+    const had = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', { value: stub, configurable: true, writable: true });
+    try {
+      expect(readNodeCard()).toBeNull();
+      store.set(NODE_CARD_KEY, JSON.stringify(genuine));
+      expect(readNodeCard()).toEqual(genuine);
+    } finally {
+      if (had) Object.defineProperty(globalThis, 'localStorage', had);
+      else delete (globalThis as { localStorage?: Storage }).localStorage;
+    }
   });
 
   it('sequences caps by the clock but never at or below the last one', () => {

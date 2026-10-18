@@ -1,4 +1,11 @@
+import * as ed from '@noble/ed25519';
+import { blake3 } from '@noble/hashes/blake3';
+import { sha512 } from '@noble/hashes/sha512';
 import type { ContactCard, RoomBootstrap, RoomMemberHint } from './protocol.ts';
+
+// @noble's synchronous verify needs the hash wired once (keypair.ts does the
+// same; whichever module loads first).
+if (!ed.etc.sha512Sync) ed.etc.sha512Sync = (...m: Uint8Array[]) => sha512(ed.etc.concatBytes(...m));
 
 /**
  * The `cap` envelope payload the browser hands its LOCAL node over loopback
@@ -100,6 +107,40 @@ export function normalizeContactCard(value: unknown): ContactCard | null {
   const issuedAt = typeof c.issuedAt === 'number' ? Math.floor(c.issuedAt) : Number.NaN;
   if (!Number.isSafeInteger(issuedAt) || issuedAt < 0) return null;
   return { nodeId: c.nodeId, ck: c.ck, kxPk: c.kxPk, issuedAt, sig: c.sig };
+}
+
+/** What a node signs for its contact card (`chia_contact::card_sign_bytes`):
+ *  blake3 over a domain prefix and the card's fields, newline-separated. */
+export function contactCardSignBytes(card: Pick<ContactCard, 'nodeId' | 'ck' | 'kxPk' | 'issuedAt'>): Uint8Array {
+  return blake3(new TextEncoder().encode(`ssf-contact-card:v1\n${card.nodeId}\n${card.ck}\n${card.kxPk}\n${card.issuedAt}`));
+}
+
+/** #231 P6b (#272 review round 15): does the card carry a valid Ed25519
+ *  signature by the node it names (the node id is the key, hex)? What the
+ *  node checks of every card it receives (`chia_contact::verify_card`), done
+ *  here for the one card the browser KEEPS — its own node's, off the `card`
+ *  lane — because a pre-P6b node does not know that lane and forwards a
+ *  peer's envelope of the kind: a forgery naming our node with a far-future
+ *  `issuedAt` would otherwise take the slot and defeat every genuine card
+ *  after it (`newerCard`), and the passes minted here would carry a card
+ *  every recipient rejects. */
+export function verifyContactCard(card: ContactCard): boolean {
+  try {
+    if (!/^[0-9a-f]{64}$/i.test(card.nodeId) || !/^[0-9a-f]{128}$/i.test(card.sig)) return false;
+    return ed.verify(ed.etc.hexToBytes(card.sig), contactCardSignBytes(card), ed.etc.hexToBytes(card.nodeId));
+  } catch {
+    return false;
+  }
+}
+
+/** #231 P6b (#272 review round 15): the card to hold once `incoming` arrived
+ *  over the `card` lane — `incoming`, when it names `nodeId` (the node we are
+ *  connected to), its signature verifies and it is at least as new as `held`;
+ *  otherwise `held`, unchanged. */
+export function acceptNodeCard(held: ContactCard | null, incoming: unknown, nodeId: string | null | undefined): ContactCard | null {
+  const card = normalizeContactCard(incoming);
+  if (!card || !nodeId || card.nodeId !== nodeId || !verifyContactCard(card)) return held;
+  return newerCard(held ?? undefined, card) ?? card;
 }
 
 /** Of two cards for one node, the one issued later (a rotated key wins). */
@@ -358,7 +399,10 @@ export const NODE_CARD_KEY = 'ssf-node-card';
 export function readNodeCard(): ContactCard | null {
   try {
     const raw = localStorage.getItem(NODE_CARD_KEY);
-    return raw ? normalizeContactCard(JSON.parse(raw)) : null;
+    const card = raw ? normalizeContactCard(JSON.parse(raw)) : null;
+    // A card an older build kept unverified is checked on the way out (#272
+    // review round 15): a forgery stored then is dropped here.
+    return card && verifyContactCard(card) ? card : null;
   } catch {
     return null;
   }
