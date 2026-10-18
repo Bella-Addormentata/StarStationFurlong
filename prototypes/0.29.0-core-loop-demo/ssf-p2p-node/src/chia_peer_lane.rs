@@ -212,6 +212,11 @@ pub const MAX_PEAK_LAG: u32 = 6;
 /// A carrier read keeps the longer threshold: its records are signed and
 /// sealed, their era read from them.
 pub const PEAK_FRESH_AGREED: Duration = Duration::from_secs(30);
+/// How long [`Lane::prove_current`] waits for the higher announcement a peer
+/// owes once it has served the block above its last one: the chain moved
+/// during the check, and the peer's announcement of it arrives before, or a
+/// moment after, its answer (#271 review, round 23).
+pub const PEAK_GRACE: Duration = Duration::from_secs(1);
 
 /// What a call site needs of a verdict (see the module notes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1032,7 +1037,8 @@ impl Lane {
     /// is in, so it could not stand for the second peer of an agreed pair; a
     /// pin reached again under a public alias keeps the pin's connection, the
     /// alias making room for it, and any other newcomer is the alias and is
-    /// set aside like a failed dial), and none past [`MAX_CONNS`] (the pool
+    /// set aside like a failed dial, the sources that named it lent to the
+    /// connection kept), and none past [`MAX_CONNS`] (the pool
     /// may have filled meanwhile); a failed address cools for `cool_for`,
     /// leaves the store and, unless it is a pin or has failed too often, waits
     /// in the queue for another try ([`Self::aside`]).
@@ -1042,7 +1048,9 @@ impl Lane {
             match result {
                 Ok(conn) => {
                     if state.conns.iter().any(|c| c.addr() == cand.addr) {
-                        // One connection per address, whoever dialled it twice.
+                        // One connection per address, whoever dialled it twice;
+                        // the sources that named this dial hold for the one kept.
+                        push_candidates(state, cand.sources.iter().map(|s| Candidate::new(cand.addr, s)).collect());
                         close_later(conn);
                         continue;
                     }
@@ -1066,6 +1074,15 @@ impl Lane {
                                 twin.addr(),
                                 twin.source().label()
                             );
+                            // What named the alias named the node: the connection
+                            // kept stands for those sources too, promoted or named
+                            // by them as `push_candidates` does for a connected
+                            // address the introducer names. A warm start whose
+                            // stored IPv4 peers the introducer answers under IPv6
+                            // would otherwise hold a pool with no fresh source, and
+                            // no pair, for as long as the introducer stays unasked
+                            // (#271 review, round 23).
+                            push_candidates(state, cand.sources.iter().map(|s| Candidate::new(twin.addr(), s)).collect());
                             close_later(conn);
                             self.aside(state, cand, now + cool_for);
                             continue;
@@ -1357,10 +1374,12 @@ impl Lane {
         let mut peaks: Vec<(Arc<PeerConn>, Peak)> = Vec::new();
         for peer in &peers {
             match peer.wait_peak(PEAK_WAIT).await {
-                Some(peak) => {
-                    if peer.peak_age().is_some_and(|age| age > fresh_for) {
-                        self.prove_current(peer, peak).await?;
-                    }
+                Some(announced) => {
+                    let peak = if peer.peak_age().is_some_and(|age| age > fresh_for) {
+                        self.prove_current(peer, announced).await?
+                    } else {
+                        announced
+                    };
                     peaks.push((peer.clone(), peak));
                 }
                 None => {
@@ -1433,12 +1452,17 @@ impl Lane {
     /// A peak announced more than [`PEAK_STALE`] ago is checked before it
     /// counts: the peer is asked for the header one block above it. No such
     /// block means the chain really has not moved (a quiet stretch), and the
-    /// announcement is fresh again; a header, or no answer, means the
-    /// connection stopped relaying peaks (stalled, or half-open), so it is let
-    /// go and the request is non-final until a live peer answers. A peak at
-    /// the top of the `u32` range has no block above it to ask for: the
-    /// announcement is not credible, and the connection is let go the same.
-    async fn prove_current(&self, peer: &Arc<PeerConn>, peak: Peak) -> Result<(), ChainError> {
+    /// announcement is fresh again. A header means the chain has moved past
+    /// the announcement: when the peer announced a higher peak meanwhile, or
+    /// does within [`PEAK_GRACE`], the chain moved during the check and the
+    /// peer relayed it, so that announcement is the one that counts (#271
+    /// review, round 23); otherwise, as with no answer at all, the connection
+    /// stopped relaying peaks (stalled, or half-open), so it is let go and the
+    /// request is non-final until a live peer answers. A peak at the top of
+    /// the `u32` range has no block above it to ask for: the announcement is
+    /// not credible, and the connection is let go the same. Returns the peak
+    /// to judge by: the one given, or the newer one.
+    async fn prove_current(&self, peer: &Arc<PeerConn>, peak: Peak) -> Result<Peak, ChainError> {
         let Some(above) = peak.height.checked_add(1) else {
             self.drop_conn(peer).await;
             return Err(unanswered(format!(
@@ -1451,12 +1475,16 @@ impl Lane {
         match answer {
             Ok(Err(_)) => {
                 peer.touch_peak();
-                Ok(())
+                Ok(peak)
             }
             Ok(Ok(_)) => {
+                if let Some(moved) = peer.wait_peak_past(peak.height, PEAK_GRACE).await {
+                    peer.touch_peak();
+                    return Ok(moved);
+                }
                 self.drop_conn(peer).await;
                 Err(unanswered(format!(
-                    "{}'s peak announcement (height {}) is stale: the chain has moved past it; the connection is let go",
+                    "{}'s peak announcement (height {}) is stale: the chain has moved past it and the peer did not say so; the connection is let go",
                     peer.addr(),
                     peak.height
                 )))
@@ -4326,6 +4354,78 @@ mod tests {
             assert!(state.cooling.contains_key(&r.addr) && state.candidates.iter().any(|q| q.addr == r.addr), "and waits in the queue");
         }
         assert_eq!(money.peak_height().await.unwrap(), 100, "the next read settles on the two peers in step");
+    }
+
+    #[tokio::test]
+    async fn an_alias_the_introducer_names_lends_its_source_to_the_connection_kept() {
+        // A warm start: A (stored) and C (gossiped) are connected, no fresh
+        // source among them, so no pair. The introducer then names `twin`, A's
+        // other address presenting A's certificate. One node is one
+        // connection, so the twin is closed and set aside, but what the
+        // introducer said about the node holds for the connection kept: A
+        // stands for the introducer too, and the read pairs A and C. Closing
+        // the alias with its source lost left the pool stored-and-gossiped
+        // only, with the introducer not asked again for half an hour (#271
+        // review, round 23).
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let twin = spawn_as("127.0.0.1:0".parse().unwrap(), a.cert.clone(), "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![state(1, 90, None)], (1, None), vec![])).await;
+        let c = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let warm = lane(vec![(a.addr, Source::Store), (c.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(warm.clone(), Trust::Agreed);
+        assert!(money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.is_err(), "no fresh source: no pair");
+        assert_eq!(warm.live_count().await, 2);
+        {
+            let mut state = warm.state.lock().await;
+            push_candidates(&mut state, vec![Candidate::new(twin.addr, Source::Introducer)]);
+        }
+        assert_eq!(money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap().records.len(), 1);
+        let conns = warm.live_conns().await;
+        let live: Vec<SocketAddr> = conns.iter().map(|p| p.addr()).collect();
+        assert!(live.len() == 2 && live.contains(&a.addr) && live.contains(&c.addr), "one node, one connection: the alias is closed: {live:?}");
+        let kept = conns.iter().find(|p| p.addr() == a.addr).unwrap();
+        assert!(kept.sources().named_by(Source::Introducer), "the introducer's naming of the node holds for the connection kept");
+        let state = warm.state.lock().await;
+        assert!(state.cooling.contains_key(&twin.addr), "the alias cools like a failed dial");
+    }
+
+    #[tokio::test]
+    async fn a_peak_announced_while_its_staleness_is_probed_is_taken_not_punished() {
+        // A's announcement has aged past the agreed freshness, so the read asks
+        // A for the header one above it. The chain moves just then: A
+        // announces 101 and then serves the header at 101. A relays peaks
+        // after all, so it stays and its new announcement is the one judged;
+        // with B at 100 beside it the read settles at 100 (#271 review, round
+        // 23). A healthy peer was let go here before, with a reconnect
+        // cooldown, for a race it did not lose.
+        let moving: Handler = {
+            let base = node(vec![], (1, None), vec![]);
+            Arc::new(move |m: &Message| {
+                if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestBlockHeader {
+                    let req = RequestBlockHeader::from_bytes(&m.data).unwrap();
+                    if req.height == 101 {
+                        let header = header_at(101, genesis());
+                        return vec![reply(&chia_protocol::NewPeakWallet::new(header.header_hash(), 101, 0, 0)), reply(&RespondBlockHeader::new(header))];
+                    }
+                }
+                base(m)
+            })
+        };
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), moving).await;
+        let b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane_ab = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane_ab.clone(), Trust::Agreed);
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        for conn in lane_ab.live_conns().await {
+            if conn.addr() == a.addr {
+                conn.backdate_peak(PEAK_FRESH_AGREED + Duration::from_secs(30));
+            }
+        }
+        assert_eq!(money.peak_height().await.unwrap(), 100, "the pair holds, B at 100 the lower peak");
+        let conns = lane_ab.live_conns().await;
+        assert_eq!(conns.len(), 2, "nobody is let go");
+        let kept = conns.iter().find(|c| c.addr() == a.addr).expect("A stays");
+        assert_eq!(kept.peak_now().map(|p| p.height), Some(101), "A's new announcement is on file");
+        assert!(kept.peak_age().is_some_and(|age| age < PEAK_FRESH_AGREED), "and counts as fresh");
     }
 
     #[tokio::test]
