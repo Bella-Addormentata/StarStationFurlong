@@ -30,7 +30,7 @@
 //! literal) and no part of the stack picks a crypto provider on its own.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -143,9 +143,14 @@ impl Source {
 /// different ones. IPv4 groups by /16 and IPv6 by /32, as Chia's own peer
 /// manager does; loopback groups by PORT, so two full nodes on this machine
 /// (a drill, or the tests' mock nodes) count as distinct while one machine
-/// running one node does not. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`)
-/// is the IPv4 address it maps, so one peer cannot count twice under its two
-/// spellings.
+/// running one node does not. An IPv4 address in IPv6 clothing is the IPv4
+/// address it carries ([`embedded_ipv4`]: mapped `::ffff:a.b.c.d`, the
+/// deprecated compatible `::a.b.c.d`, 6to4 `2002:AABB:CCDD::` and NAT64
+/// `64:ff9b::a.b.c.d`, the forms `ipv6_is_public` admits as that IPv4), so
+/// one peer cannot count twice under two spellings: a node reached at its
+/// public IPv4 address and gossiped under the alias a NAT64 host or a 6to4
+/// relay gives it would otherwise supply both of a money read's votes (#271
+/// review, round 18).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Group([u8; 5]);
 
@@ -158,11 +163,40 @@ pub fn group_of(addr: SocketAddr) -> Group {
             Group([4, o[0], o[1], 0, 0])
         }
         IpAddr::V6(v6) if v6.is_loopback() => Group([0, 127, 1, port[0], port[1]]),
-        IpAddr::V6(v6) => {
-            let o = v6.octets();
-            Group([6, o[0], o[1], o[2], o[3]])
-        }
+        IpAddr::V6(v6) => match embedded_ipv4(v6) {
+            Some(v4) => group_of(SocketAddr::new(IpAddr::V4(v4), addr.port())),
+            None => {
+                let o = v6.octets();
+                Group([6, o[0], o[1], o[2], o[3]])
+            }
+        },
     }
+}
+
+/// The IPv4 address an IPv6 address carries, in the forms the public-address
+/// judge (`ipv6_is_public`, main.rs) unwraps and judges as that IPv4: mapped
+/// and compatible (after the loopback and unspecified checks, so `::1` and
+/// `::` carry none), 6to4 (`2002::/16`) and the NAT64 well-known prefix
+/// (`64:ff9b::/96`). The local-use translation prefix (`64:ff9b:1::/48`) and
+/// Teredo carry none the lane would dial as that IPv4 and stay native. The
+/// spelling is kept ([`canonical`] folds the mapped form alone): the alias
+/// is how the host that gossiped it reaches the node.
+pub(crate) fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    if let Some(v4) = ip.to_ipv4() {
+        return Some(v4);
+    }
+    let seg = ip.segments();
+    let v4_of = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if seg[0] == 0x2002 {
+        return Some(v4_of(seg[1], seg[2]));
+    }
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+        return Some(v4_of(seg[6], seg[7]));
+    }
+    None
 }
 
 /// A socket address with an IPv4-mapped IPv6 address written as the IPv4
@@ -1057,6 +1091,36 @@ mod tests {
         assert_eq!(group_of(scoped), group_of("[fe80::2]:58444".parse().unwrap()), "and the /32 group ignores it");
         let mapped_loop: SocketAddr = "[::ffff:127.0.0.1]:1001".parse().unwrap();
         assert_eq!(group_of(mapped_loop), group_of(l1));
+    }
+
+    #[test]
+    fn an_ipv4_in_ipv6_clothing_shares_its_ipv4_group() {
+        // A node reached at a public IPv4 address may be gossiped under the
+        // alias a NAT64 host, a 6to4 relay or the deprecated compatible form
+        // gives it. The public-address judge admits each as that IPv4, and
+        // the group follows, so one node never supplies both of a money
+        // read's votes under two spellings. The spelling itself is kept: the
+        // alias is how the host that gossiped it reaches the node.
+        let v4: SocketAddr = "203.0.113.5:58444".parse().unwrap();
+        let nat64: SocketAddr = "[64:ff9b::203.0.113.5]:58444".parse().unwrap();
+        let six_to_four: SocketAddr = "[2002:cb00:7105::1]:58444".parse().unwrap();
+        let compatible: SocketAddr = "[::203.0.113.5]:58444".parse().unwrap();
+        for alias in [nat64, six_to_four, compatible] {
+            assert_eq!(group_of(alias), group_of(v4), "{alias}");
+            assert_eq!(canonical(alias), alias, "{alias}: the spelling is kept");
+        }
+        let elsewhere: SocketAddr = "[64:ff9b::198.51.100.1]:58444".parse().unwrap();
+        assert_ne!(group_of(elsewhere), group_of(v4), "another IPv4 behind the same prefix is another group");
+        // The local-use translation prefix and Teredo carry no address the
+        // lane would dial as that IPv4: native /32 groups, as the judge has it.
+        let local_use: SocketAddr = "[64:ff9b:1::203.0.113.5]:58444".parse().unwrap();
+        let teredo: SocketAddr = "[2001:0:cb00:7105::1]:58444".parse().unwrap();
+        assert_ne!(group_of(local_use), group_of(v4));
+        assert_ne!(group_of(teredo), group_of(v4));
+        assert_eq!(group_of(local_use), group_of("[64:ff9b:1:ffff::1]:58444".parse().unwrap()), "the /32");
+        assert_eq!(embedded_ipv4("::1".parse().unwrap()), None);
+        assert_eq!(embedded_ipv4("::".parse().unwrap()), None);
+        assert_eq!(embedded_ipv4("::ffff:127.0.0.1".parse().unwrap()), Some(Ipv4Addr::LOCALHOST));
     }
 
     #[test]
