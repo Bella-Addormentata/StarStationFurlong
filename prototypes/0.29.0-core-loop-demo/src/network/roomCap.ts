@@ -104,14 +104,51 @@ export function memberCardsOf(hints: readonly { irohNodeId: string; nodeCard?: C
   return out;
 }
 
-/** The per-room "share my card" flag (`ssf-chia-share-card-<roomId>`): on
- *  unless the player turned it off; tolerant of privacy mode. */
-export function readShareCard(roomId: string): boolean {
+/** The switches flipped THIS session, per room, consulted before storage
+ *  (#272 review round 6): a browser that refuses the write (privacy mode, a
+ *  full quota) must not leave the panel saying OFF while the cap, the pass
+ *  builders and the node keep reading the stored ON. The choice is recorded
+ *  here first and persisted on top, best-effort; every reader asks here first. */
+const sessionFlags = new Map<string, boolean>();
+
+function readFlag(key: string, fromStored: (stored: string | null) => boolean): boolean {
+  const live = sessionFlags.get(key);
+  if (live !== undefined) return live;
   try {
-    return localStorage.getItem(`ssf-chia-share-card-${roomId}`) !== '0';
+    return fromStored(localStorage.getItem(key));
   } catch {
-    return true;
+    return fromStored(null);
   }
+}
+
+function writeFlag(key: string, on: boolean): void {
+  sessionFlags.set(key, on);
+  try {
+    localStorage.setItem(key, on ? '1' : '0');
+  } catch {
+    /* privacy mode: the choice holds for this session all the same */
+  }
+}
+
+/** Tests: forget this session's choices. */
+export function forgetSessionFlags(): void {
+  sessionFlags.clear();
+}
+
+const shareCardKey = (roomId: string) => `ssf-chia-share-card-${roomId}`;
+const chiaModeKey = (roomId: string) => `ssf-chia-mode-${roomId}`;
+
+/** The per-room "share my card" flag (`ssf-chia-share-card-<roomId>`): on
+ *  unless the player turned it off — this session (`setShareCard`) or in a
+ *  stored one; tolerant of privacy mode. */
+export function readShareCard(roomId: string): boolean {
+  return readFlag(shareCardKey(roomId), (stored) => stored !== '0');
+}
+
+/** The Share Card switch's word for `roomId`, effective at once for every
+ *  reader, persisted when the browser allows. */
+export function setShareCard(roomId: string, on: boolean): void {
+  writeFlag(shareCardKey(roomId), on);
 }
 
 /** #231 P6b: the hints a PASS carries, card-wise. A pass to a PUBLIC room
@@ -227,12 +264,15 @@ export function nodeSharesCard(fp: { share_card?: boolean } | null | undefined):
   return fp?.share_card !== false;
 }
 
-/** The per-room chia-mode flag (`ssf-chia-mode-<roomId>`), tolerant of privacy
- *  mode where localStorage throws. */
+/** The per-room chia-mode flag (`ssf-chia-mode-<roomId>`): this session's
+ *  word (`setChiaMode`) before the stored one; tolerant of privacy mode where
+ *  localStorage throws. */
 export function readChiaMode(roomId: string): boolean {
-  try {
-    return localStorage.getItem(`ssf-chia-mode-${roomId}`) === '1';
-  } catch {
-    return false;
-  }
+  return readFlag(chiaModeKey(roomId), (stored) => stored === '1');
+}
+
+/** The Chia Mesh switch's word for `roomId`, effective at once for every
+ *  reader, persisted when the browser allows. */
+export function setChiaMode(roomId: string, on: boolean): void {
+  writeFlag(chiaModeKey(roomId), on);
 }

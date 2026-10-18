@@ -21,10 +21,13 @@ import {
   nodeSharesCard,
   normalizeContactCard,
   passageReading,
+  readChiaMode,
   readNodeCard,
   readShareCard,
   roomIsPublicSpace,
   roomPostureProbe,
+  setChiaMode,
+  setShareCard,
   type PostureSources,
   writeNodeCard,
 } from "./network/roomCap.ts";
@@ -8939,14 +8942,7 @@ function refreshChiaModeToggle() {
   const state = document.getElementById("chia-mode-state");
   if (!toggle) return;
   const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
-  let on = false;
-  if (roomId) {
-    try {
-      on = localStorage.getItem(`ssf-chia-mode-${roomId}`) === "1";
-    } catch {
-      /* privacy mode */
-    }
-  }
+  const on = roomId ? readChiaMode(roomId) : false;
   toggle.checked = on;
   toggle.disabled = !roomId; // no room context yet -> nothing to toggle
   if (state) state.textContent = on ? "ON" : "OFF";
@@ -9101,13 +9097,10 @@ function setupNetworkDetailsPanel() {
       const on = chiaToggle.checked;
       const state = document.getElementById("chia-mode-state");
       if (state) state.textContent = on ? "ON" : "OFF";
-      if (roomId) {
-        try {
-          localStorage.setItem(`ssf-chia-mode-${roomId}`, on ? "1" : "0");
-        } catch {
-          /* privacy mode */
-        }
-      }
+      // Recorded for this session first, persisted on top (#272 review round
+      // 6): a refused write must not leave the switch saying one thing and
+      // every reader (the cap's refreshes) the other.
+      if (roomId) setChiaMode(roomId, on);
       // Apply live — re-send this room's cap to the local node with the new flag.
       void networkProvider.resendRoomCap(on);
       if (feedback) {
@@ -9134,13 +9127,11 @@ function setupNetworkDetailsPanel() {
       const on = shareToggle.checked;
       const state = document.getElementById("share-card-state");
       if (state) state.textContent = on ? "ON" : "OFF";
-      if (roomId) {
-        try {
-          localStorage.setItem(`ssf-chia-share-card-${roomId}`, on ? "1" : "0");
-        } catch {
-          /* privacy mode */
-        }
-      }
+      // Recorded for this session first, persisted on top (#272 review round
+      // 6): a browser that refuses the write (privacy mode, quota) must not
+      // leave the switch saying OFF while the cap and the pass builders keep
+      // reading the stored ON and the node keeps handing our card out.
+      if (roomId) setShareCard(roomId, on);
       void networkProvider.refreshRoomCap();
       if (feedback) {
         feedback.textContent = on

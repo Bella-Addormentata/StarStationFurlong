@@ -3,15 +3,20 @@ import {
   MAX_CAP_MEMBER_CARDS,
   buildRoomCapPayload,
   cardsForPass,
+  forgetSessionFlags,
   memberCardsOf,
   newerCard,
   nextCapSeq,
   nodeSharesCard,
   normalizeContactCard,
   passageReading,
+  readChiaMode,
+  readShareCard,
   roomIsPublicSpace,
   roomPosture,
   roomPostureProbe,
+  setChiaMode,
+  setShareCard,
   type PostureSources,
 } from './roomCap';
 
@@ -140,6 +145,56 @@ describe('room cap payload (N8 / D3)', () => {
     state.docsBoundFor = 'other';
     expect(probe('r')).toBeUndefined();
     expect(probe('welcome')).toBe(true);
+  });
+
+  it('P6b: a switch flipped while storage refuses the write still holds for the cap and the pass', () => {
+    // #272 review round 6: Share Card OFF in a browser whose localStorage
+    // throws on write (privacy mode, a full quota) used to update the panel
+    // alone: the cap and the pass builders read storage, which still said ON.
+    const kept = new Map<string, string>();
+    const refusing = {
+      getItem: (k: string) => kept.get(k) ?? null,
+      setItem: () => {
+        throw new Error('QuotaExceededError');
+      },
+      removeItem: (k: string) => void kept.delete(k),
+      clear: () => kept.clear(),
+      key: () => null,
+      length: 0,
+    } as unknown as Storage;
+    const had = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', { value: refusing, configurable: true, writable: true });
+    try {
+      forgetSessionFlags();
+      kept.set('ssf-chia-share-card-r', '1'); // a stored ON from an earlier session
+      expect(readShareCard('r')).toBe(true);
+      setShareCard('r', false);
+      expect(kept.get('ssf-chia-share-card-r')).toBe('1'); // the write was refused…
+      expect(readShareCard('r')).toBe(false); // …and the choice holds all the same
+      // The cap the node reads, and the pass a member is handed, both see OFF.
+      expect(buildRoomCapPayload('k', false, false, 1, readShareCard('r'), [card('host')]).shareCard).toBe(false);
+      const hints = [{ irohNodeId: 'me', nodeCard: card('me') }, { irohNodeId: 'host', nodeCard: card('host') }];
+      const pass = cardsForPass(hints, false, readShareCard('r'), 'me');
+      expect(pass[0].nodeCard).toBeUndefined();
+      expect(pass[1].nodeCard).toEqual(card('host'));
+      setShareCard('r', true);
+      expect(readShareCard('r')).toBe(true);
+      // Another room is untouched; the Chia Mesh switch works the same way.
+      expect(readShareCard('s')).toBe(true);
+      expect(readChiaMode('r')).toBe(false);
+      setChiaMode('r', true);
+      expect(readChiaMode('r')).toBe(true);
+      setChiaMode('r', false);
+      expect(readChiaMode('r')).toBe(false);
+      // A browser that allows the write persists it too.
+      refusing.setItem = (k: string, v: string) => void kept.set(k, v);
+      setShareCard('t', false);
+      expect(kept.get('ssf-chia-share-card-t')).toBe('0');
+    } finally {
+      forgetSessionFlags();
+      if (had) Object.defineProperty(globalThis, 'localStorage', had);
+      else delete (globalThis as { localStorage?: Storage }).localStorage;
+    }
   });
 
   it('P6b: a node that hands out no card keeps the cached one out of every pass', () => {
