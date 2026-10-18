@@ -18,10 +18,12 @@ import { clearFaucetRoom, closeFaucetRoom, openFaucetRoom, parseFaucetReply, set
 import {
   cardsForPass,
   newerCard,
+  nodeSharesCard,
   normalizeContactCard,
   readNodeCard,
   readShareCard,
   roomIsPublicSpace,
+  roomPosture,
   writeNodeCard,
 } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
@@ -619,12 +621,16 @@ function roomPassageIsPublic(): boolean {
 // ⛓️ N8 (#231): the node learns from us whether a room is PUBLIC SPACE — the
 // bundled welcome room, or a room anyone may walk into — and never publishes
 // an address under such a room's key (anyone can derive its hint). Until the
-// probe answers the node assumes public, so a wrong answer can only withhold
-// a publish. The door docs the probe reads are globally bound and re-bound per
-// join, and the first cap of a join goes out at connect, BEFORE the new room's
-// docs are bound: so the probe only reads them once `doorDocsBoundFor` names
-// this exact room (set right before the last of the two binds), and says
-// PUBLIC until then — never the previous room's doors for the new room.
+// probe can answer, the cap says UNKNOWN (null on the wire): the node then
+// publishes nothing under the key, as for PUBLIC, but may use the cards a
+// private pass brought — file them, knock on the host — so a first visit whose
+// every live route fails still finds the host (#272 review round 3); a pass
+// MINTED before the answer still carries no card (`roomIsPublicSpaceNow`).
+// The door docs the probe reads are globally bound and re-bound per join, and
+// the first cap of a join goes out at connect, BEFORE the new room's docs are
+// bound: so the probe only reads them once `doorDocsBoundFor` names this exact
+// room (set right before the last of the two binds), and says UNKNOWN until
+// then — never the previous room's doors for the new room.
 // Re-stamped on every door-policy change AND every door-layout change (a door
 // fitted with no policy record of its own takes the default, which is public,
 // so a new door alone can open the room), and on every room bind, which
@@ -639,7 +645,15 @@ function roomIsPublicSpaceNow(roomId: string): boolean {
     doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
   );
 }
-networkProvider.setPublicRoomProbe(roomIsPublicSpaceNow);
+/** The cap's posture for `roomId`: public, private, or not known yet
+ *  (#272 review round 3) — see `roomPosture`. */
+function roomPostureNow(roomId: string): boolean | undefined {
+  return roomPosture(
+    roomId === DEFAULT_STATION.welcomeRoomId,
+    doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
+  );
+}
+networkProvider.setPublicRoomProbe(roomPostureNow);
 subscribeDoorPolicy(() => {
   void networkProvider.refreshRoomCap();
   refreshWarmNeighbours(); // 🚪🔥 a door made public or private
@@ -971,13 +985,16 @@ function getLocalNodeHint(
   const relayHints = normalizeStringArray(fingerprint.iroh_relay_urls);
   const directHints = normalizeStringArray(fingerprint.iroh_direct_addrs);
   // #231 P6b: our node's own card, once it handed us one over the `card`
-  // lane — only when it is THIS node's (a reinstalled node has a new id).
+  // lane — only when it is THIS node's (a reinstalled node has a new id), and
+  // only while the node still hands it out: the card is cached here, so a
+  // node restarted with sharing off says so in its fingerprint (#272 review
+  // round 3).
   const card = localNodeCard ?? readNodeCard();
   return {
     irohNodeId: fingerprint.iroh_node_id,
     irohRelayUrls: relayHints.length ? relayHints : undefined,
     irohDirectAddrs: directHints.length ? directHints : undefined,
-    nodeCard: card && card.nodeId === fingerprint.iroh_node_id ? card : undefined,
+    nodeCard: card && card.nodeId === fingerprint.iroh_node_id && nodeSharesCard(fingerprint) ? card : undefined,
   };
 }
 
@@ -8602,7 +8619,7 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
     ? cardsForPass(
         [rawLocalHint],
         roomIsPublicSpaceNow(roomId),
-        readShareCard(roomId),
+        readShareCard(roomId) && nodeSharesCard(fingerprint),
         fingerprint.iroh_node_id,
       )[0]
     : rawLocalHint;
@@ -8649,7 +8666,7 @@ function buildOutgoingBootstrap(
   const mergedHints = cardsForPass(
     allHints,
     roomIsPublicSpaceNow(roomId),
-    readShareCard(roomId),
+    readShareCard(roomId) && nodeSharesCard(fingerprint),
     fingerprint.iroh_node_id,
   );
   const primaryHint = localHint ?? mergedHints[0];

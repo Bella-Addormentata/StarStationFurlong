@@ -220,11 +220,24 @@ impl KnockBook {
         before != self.sent.len()
     }
 
-    /// File a knock read from the inbox, once per coin; bounded, the oldest
-    /// confirmation first out. Returns true when it is new.
+    /// File a knock read from the inbox. A copy of a knock under another coin
+    /// never opens (its sealing binds the carrier's parent, #272 review round
+    /// 3), so two knocks here from one knocker for one room in one era are two
+    /// GENUINE writes — a knocker that lost its book and knocked again — and
+    /// the knocker's own clock is its latest: a newer confirmation replaces
+    /// the older entry, an older one listed later (the reader lists the newest
+    /// coins first) is ignored, the same coin again is ignored. Bounded, the
+    /// oldest confirmation first out. Returns true when the book changed.
     pub fn record_inbox(&mut self, knock: InboxKnock) -> bool {
         if self.inbox.iter().any(|k| k.coin_id == knock.coin_id) {
             return false;
+        }
+        if let Some(i) = self.inbox.iter().position(|k| k.from == knock.from && k.room == knock.room && k.era == knock.era) {
+            if self.inbox[i].confirmed_height >= knock.confirmed_height {
+                return false;
+            }
+            self.inbox[i] = knock;
+            return true;
         }
         while self.inbox.len() >= MAX_INBOX {
             if let Some((i, _)) = self.inbox.iter().enumerate().min_by_key(|(_, k)| k.confirmed_height) {
@@ -414,6 +427,36 @@ mod tests {
         assert_eq!(next.iter().map(|d| d.target.as_str()).collect::<Vec<_>>(), vec!["J", "H"], "the longest-waiting first");
         assert!(!book.mark_dialed(&DialBack { target: "X".into(), room: "r".into(), we_knocked: true }, 1022), "an unknown dial-back marks nothing");
         assert!(!book.mark_dialed(&DialBack { target: "J".into(), room: "r".into(), we_knocked: true }, 1022), "the side is part of the identity");
+    }
+
+    #[test]
+    fn one_inbox_clock_per_knocker_per_room_per_era_and_it_is_the_newest() {
+        // #272 review round 3: replayed copies never decode (chia_lane), so a
+        // second knock from one knocker in one era is its own re-knock, and
+        // its clock is the latest one.
+        let mut book = KnockBook::default();
+        let knock = |height: u32, coin: &str| InboxKnock {
+            from: "J".into(),
+            room: "r".into(),
+            era: 3,
+            confirmed_height: height,
+            coin_id: coin.into(),
+            last_rendezvous: height,
+        };
+        assert!(book.record_inbox(knock(3 * ERA_BLOCKS + 10, "k1")));
+        assert!(!book.record_inbox(knock(3 * ERA_BLOCKS + 10, "k1")), "the same coin again");
+        assert!(book.record_inbox(knock(3 * ERA_BLOCKS + 300, "k2")), "a later knock from the same knocker replaces the clock");
+        assert_eq!(book.inbox.len(), 1);
+        assert_eq!((book.inbox[0].confirmed_height, book.inbox[0].coin_id.as_str()), (3 * ERA_BLOCKS + 300, "k2"));
+        assert!(!book.record_inbox(knock(3 * ERA_BLOCKS + 100, "k3")), "an older one listed later (the newest coins come first) is ignored");
+        assert_eq!(book.inbox[0].coin_id, "k2");
+        let mut other_room = knock(3 * ERA_BLOCKS + 400, "k4");
+        other_room.room = "s".into();
+        assert!(book.record_inbox(other_room), "another room is another intent");
+        let mut other_era = knock(4 * ERA_BLOCKS + 1, "k5");
+        other_era.era = 4;
+        assert!(book.record_inbox(other_era), "another era is another intent");
+        assert_eq!(book.inbox.len(), 3);
     }
 
     #[test]

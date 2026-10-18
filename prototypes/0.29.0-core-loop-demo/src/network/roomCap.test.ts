@@ -6,8 +6,10 @@ import {
   memberCardsOf,
   newerCard,
   nextCapSeq,
+  nodeSharesCard,
   normalizeContactCard,
   roomIsPublicSpace,
+  roomPosture,
 } from './roomCap';
 
 const card = (nodeId: string, issuedAt = 100) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt, sig: 'ff' });
@@ -76,6 +78,46 @@ describe('room cap payload (N8 / D3)', () => {
     expect(off).toEqual([{ irohNodeId: 'me' }, { irohNodeId: 'them', nodeCard: card('them') }, { irohNodeId: 'bare' }]);
     expect(cardsForPass(hints, false, false, undefined)).toEqual(hints);
     expect(hints[0].nodeCard).toEqual(card('me'));
+  });
+
+  it('P6b: the cap says UNKNOWN (null) until the door docs are bound, and a private pass\'s cards ride with passPrivate', () => {
+    // #272 review round 3: a first visit by a private pass, no room document
+    // yet — the cap says "not known" rather than PUBLIC, and carries the
+    // pass's cards with the pass's word, so the node can knock on the host
+    // when every live route fails; the pass MINTER still treats unknown as
+    // public (roomIsPublicSpace) and carries no card.
+    expect(roomPosture(true, undefined)).toBe(true);
+    expect(roomPosture(true, false)).toBe(true);
+    expect(roomPosture(false, true)).toBe(true);
+    expect(roomPosture(false, false)).toBe(false);
+    expect(roomPosture(false, undefined)).toBeUndefined();
+    const cards = [card('host')];
+    const firstVisit = buildRoomCapPayload('k', false, undefined, 1, true, cards);
+    expect(firstVisit.publicRoom).toBeNull();
+    expect(firstVisit.memberCards).toEqual(cards);
+    expect(firstVisit.passPrivate).toBe(true);
+    expect(buildRoomCapPayload('k', false, null, 1, true, []).passPrivate).toBeUndefined();
+    expect(buildRoomCapPayload('k', false, true, 1, true, cards)).toEqual({ roomKeyB64: 'k', chiaMode: false, publicRoom: true, seq: 1, shareCard: true });
+    expect(buildRoomCapPayload('k', false, false, 1, true, cards).passPrivate).toBe(true);
+  });
+
+  it('P6b: a node that hands out no card keeps the cached one out of every pass', () => {
+    // #272 review round 3: the node restarted with SSF_CHIA_SHARE_CARD=0; the
+    // browser still holds the card it was handed before.
+    expect(nodeSharesCard({ share_card: false })).toBe(false);
+    expect(nodeSharesCard({ share_card: true })).toBe(true);
+    expect(nodeSharesCard({})).toBe(true);
+    expect(nodeSharesCard(null)).toBe(true);
+    const hints = [
+      { irohNodeId: 'me', nodeCard: card('me') },
+      { irohNodeId: 'them', nodeCard: card('them') },
+    ];
+    const roomSwitch = true;
+    expect(cardsForPass(hints, false, roomSwitch && nodeSharesCard({ share_card: false }), 'me')).toEqual([
+      { irohNodeId: 'me' },
+      { irohNodeId: 'them', nodeCard: card('them') },
+    ]);
+    expect(cardsForPass(hints, false, roomSwitch && nodeSharesCard({ share_card: true }), 'me')).toEqual(hints);
   });
 
   it('sequences caps by the clock but never at or below the last one', () => {

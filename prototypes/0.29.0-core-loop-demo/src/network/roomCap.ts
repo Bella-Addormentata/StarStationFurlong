@@ -14,11 +14,15 @@ import type { ContactCard, RoomMemberHint } from './protocol.ts';
  *                 address under such a key, armed or not, and never reads under
  *                 it either (D6). The node also recognises the bundled key on its
  *                 own (`chia_rooms.rs`), so this flag is belt, that is braces.
+ *                 `null`: not known YET — the first cap of a join goes out before
+ *                 the room's door documents are bound (#272 review round 3); the
+ *                 node then publishes nothing under the key, as for PUBLIC, but
+ *                 may use the cards a private pass brought (`passPrivate`).
  */
 export interface RoomCapPayload {
   roomKeyB64: string;
   chiaMode: boolean;
-  publicRoom: boolean;
+  publicRoom: boolean | null;
   /** Monotonic within a browser session (the ms clock, bumped past the last
    *  one sent). Every cap rides its own stream and streams may land out of
    *  order, so the node keeps the highest `seq` it has seen per room and drops
@@ -33,6 +37,12 @@ export interface RoomCapPayload {
    *  them. Never sent for a public room (N8 extends to `ck`); the node verifies
    *  every card and files them only where the room's posture allows cards. */
   memberCards?: ContactCard[];
+  /** #231 P6b (#272 review round 3): this session joined by a pass that
+   *  carried member cards. A pass to a public room carries none (its minter
+   *  strips them), so while the posture is not yet known the node may USE the
+   *  pass's cards — file them, knock on the host — though it hands out none of
+   *  its own until the room is known private. Sent only with `memberCards`. */
+  passPrivate?: boolean;
 }
 
 /** Cards one cap carries at most (a room's roster, not an address book). */
@@ -41,7 +51,7 @@ export const MAX_CAP_MEMBER_CARDS = 64;
 export function buildRoomCapPayload(
   roomKeyB64: string,
   chiaMode: boolean,
-  publicRoom: boolean,
+  publicRoom: boolean | null | undefined,
   seq: number,
   shareCard: boolean = true,
   memberCards: readonly ContactCard[] = [],
@@ -49,12 +59,13 @@ export function buildRoomCapPayload(
   const payload: RoomCapPayload = {
     roomKeyB64,
     chiaMode: !!chiaMode,
-    publicRoom: !!publicRoom,
+    publicRoom: publicRoom === undefined || publicRoom === null ? null : !!publicRoom,
     seq: Math.max(0, Math.floor(seq)) || 0,
     shareCard: shareCard !== false,
   };
-  if (!payload.publicRoom && memberCards.length > 0) {
+  if (payload.publicRoom !== true && memberCards.length > 0) {
     payload.memberCards = memberCards.slice(0, MAX_CAP_MEMBER_CARDS);
+    payload.passPrivate = true;
   }
   return payload;
 }
@@ -158,9 +169,28 @@ export function nextCapSeq(last: number, nowMs: number = Date.now()): number {
  *  door-policy reading main.ts already uses to decide whether a room's seed may
  *  ride in the shared atlas. Unknown (undefined) passage counts as PUBLIC: fail
  *  closed — a key is only ever published under once the doc has said it is
- *  private. */
+ *  private, and a pass minted before then carries no card. */
 export function roomIsPublicSpace(bundled: boolean, passagePublic: boolean | undefined): boolean {
   return bundled || passagePublic !== false;
+}
+
+/** The posture the CAP carries (#272 review round 3): `true` public, `false`
+ *  private, `undefined` not known yet — the bundled room is public whatever its
+ *  doors say, any other room's posture is its doors', and until they are bound
+ *  there is none. Unlike `roomIsPublicSpace`, which decides what a pass minted
+ *  now may carry (nothing, until known), the cap says "unknown" so the node can
+ *  tell "not yet" from "public" and let a private pass's cards work before the
+ *  door documents have synced; publishing fails closed either way. */
+export function roomPosture(bundled: boolean, passagePublic: boolean | undefined): boolean | undefined {
+  return bundled ? true : passagePublic;
+}
+
+/** #231 P6b (#272 review round 3): does the local node hand out its contact
+ *  card at all? Its fingerprint says (`share_card`); a node that predates the
+ *  flag never handed one out, so absent reads as sharing. Off, this station's
+ *  cached card rides in no pass, whatever a room's own switch says. */
+export function nodeSharesCard(fp: { share_card?: boolean } | null | undefined): boolean {
+  return fp?.share_card !== false;
 }
 
 /** The per-room chia-mode flag (`ssf-chia-mode-<roomId>`), tolerant of privacy

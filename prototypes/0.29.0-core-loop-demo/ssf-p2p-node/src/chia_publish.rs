@@ -1283,6 +1283,19 @@ pub struct MemoWrite {
 /// retry for a spend the mempool DROPPED, so a pending one waits for
 /// reconciliation's verdict (the heartbeat tries again on its retry cadence).
 async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &str) -> Result<MemoWrite> {
+    publish_memo_with(payer, hint, move |_| Ok(body), what).await
+}
+
+/// [`publish_memo`] whose body is built once the INPUT coin is chosen: `body`
+/// gets the input's id — the parent of the coin the memo will ride on — so a
+/// knock can bind its sealing to it ([`chia_lane::seal_to_kx`], #272 review
+/// round 3).
+async fn publish_memo_with(
+    payer: &SecretKey,
+    hint: Bytes32,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    what: &str,
+) -> Result<MemoWrite> {
     let _lease = WALLET_LEASE.lock().await;
     WALLET_LEASE.ensure_open()?;
     let client = crate::chia_chain::connect();
@@ -1294,8 +1307,9 @@ async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &st
     let coin = find_spendable_coin(&client, our_ph)
         .await?
         .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
-    let bundle = build_publish_bundle(payer, coin.coin, hint, Bytes::new(body))?;
     let input = coin.coin.coin_id();
+    let body = body(input)?;
+    let bundle = build_publish_bundle(payer, coin.coin, hint, Bytes::new(body))?;
     match push_parked(&client, bundle, [(input, coin.confirmed_height)]).await {
         Ok(()) => Ok(MemoWrite { coin: input, acked: true }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
@@ -1319,6 +1333,25 @@ async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &st
 /// roster of every active node id would be a public weekly directory.
 pub fn beacon_enabled() -> bool {
     std::env::var("SSF_CHIA_BEACON").ok().as_deref() == Some("1")
+}
+
+/// #231 P6b/D7: a beacon is an entry point to the WELCOME room and nothing
+/// else (#272 review round 3): a newcomer dialing it joins that room through
+/// it, and a room this node does not serve has no doc to answer a sync with
+/// and nobody to relay to. So the beacon is written only while this node
+/// SERVES the welcome room — a local browser bound it, or it came back served
+/// from disk — known here by the bundled key its cap carries.
+pub fn serves_welcome_room(hub: &crate::SharedHub) -> bool {
+    let welcome: Vec<String> = hub
+        .chia_rooms
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, cap)| crate::chia_rooms::is_bundled_room_key(&cap.room_key))
+        .map(|(room, _)| room.clone())
+        .collect();
+    let rooms = hub.rooms.lock().unwrap();
+    welcome.iter().any(|room| rooms.get(room).is_some_and(|r| r.served))
 }
 
 const CTX_BEACON_WALLET: &str = "ssf-chia-beacon-wallet-v1";
@@ -1444,10 +1477,20 @@ pub async fn publish_knock(
         rooms: vec![chia_lane::room_lane_id(&req.room)],
     };
     let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
-    let sealed = chia_lane::seal_to_kx(&req.kx_host, KIND_KNOCK, era, &plain)?;
     let lane = chia_lane::derive_lane_token(room_key);
     let hint = Bytes32::new(chia_lane::derive_inbox_hint(&req.ck_host, &lane, era));
-    let write = publish_memo(chia_sk, hint, sealed, "knock").await?;
+    // Sealed once the input coin is known: its id is the parent of the coin
+    // the knock rides on, and the sealing binds it, so the host opens the
+    // knock under that coin alone — a copy under another never decodes
+    // (#272 review round 3).
+    let kx_host = req.kx_host;
+    let write = publish_memo_with(
+        chia_sk,
+        hint,
+        move |input| chia_lane::seal_to_kx(&kx_host, KIND_KNOCK, era, &input.to_bytes(), &plain),
+        "knock",
+    )
+    .await?;
     Ok((hint, write))
 }
 
@@ -1526,6 +1569,7 @@ pub async fn heartbeat_loop(
     let beacon_mark_path = std::path::Path::new(BEACON_MARK_FILE);
     let mut beacon_mark: Option<BeaconMark> = beacon_sk.as_ref().and_then(|_| BeaconMark::load(beacon_mark_path));
     let mut beacon_attempt: Option<Instant> = None;
+    let mut welcome_warned = false;
     if let (Some(_), Some(m)) = (&beacon_sk, &beacon_mark) {
         println!(
             "⛓️ ChiaHub beacon: last written in era {} (hint {}, {})",
@@ -1648,8 +1692,8 @@ pub async fn heartbeat_loop(
             let next = loop {
                 let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
                 let cap = hub.chia_rooms.lock().unwrap().get(&req.room).cloned();
-                let Some(cap) = cap.filter(|c| c.may_share_card()) else {
-                    println!("⛓️ ChiaHub knock: not knocking on {} for room {} — the room no longer shares cards", short(&req.host), req.room);
+                let Some(cap) = cap.filter(|c| c.may_use_cards()) else {
+                    println!("⛓️ ChiaHub knock: not knocking on {} for room {} — the room no longer uses cards", short(&req.host), req.room);
                     continue;
                 };
                 if hub.knocks.lock().unwrap().knocked_this_era(&req.host, era) {
@@ -1758,7 +1802,16 @@ pub async fn heartbeat_loop(
                 let retry_ok = beacon_attempt
                     .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
                     .unwrap_or(true);
-                if reachable && retry_ok && beacon_due(beacon_mark.as_ref(), era, &self_id) {
+                // A beacon leads to the welcome room: none is written while
+                // this node does not serve it (#272 review round 3).
+                let serves_welcome = serves_welcome_room(&hub);
+                if !serves_welcome && !welcome_warned {
+                    eprintln!(
+                        "⛓️ ChiaHub beacon: not advertising — this node does not serve the welcome room (a beacon is an entry point to it; open the welcome room in the local browser once and the node keeps it)"
+                    );
+                    welcome_warned = true;
+                }
+                if reachable && serves_welcome && retry_ok && beacon_due(beacon_mark.as_ref(), era, &self_id) {
                     beacon_attempt = Some(Instant::now());
                     match publish_beacon(&iroh_sk, beacon_sk, era, now_unix).await {
                         Ok((hint, write)) => {
@@ -1905,7 +1958,7 @@ mod tests {
     use super::*;
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
-        ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false }
+        ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false, pass_private: false }
     }
 
     #[test]

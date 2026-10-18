@@ -365,7 +365,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, cap)| cap.may_share_card())
+                .filter(|(_, cap)| cap.may_use_cards())
                 .map(|(room, cap)| (room.clone(), cap.room_key))
                 .collect()
         } else {
@@ -543,14 +543,18 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // names the knocker (signed), the room (by lane id, matched to the
             // room the hint was read for) and, when the knocker is findable, its
             // contact key, filed so its presence is read by key. The knock's
-            // confirmation height starts the rendezvous clock on our side.
+            // confirmation height starts the rendezvous clock on our side — the
+            // clock both sides dial by, so the read is an AGREED one (plan §14
+            // (5)): one carrier peer naming another height in the same era
+            // would put us on another schedule than the knocker, and the coin
+            // is never read again to correct it (#272 review round 3).
             let mut live_inbox: HashSet<[u8; 32]> = HashSet::new();
             for (room, room_key) in &inbox_rooms {
                 live_inbox.extend(chia_resolve::live_inbox_hints(&own_ck, room_key, peak));
                 if !sched.due(&inbox_sched_key(room), peak, false) {
                     continue;
                 }
-                match chia_resolve::read_inbox(&client, &kx_secret, &own_ck, room_key, room, peak, now_unix, &mut inbox_cursors).await {
+                match chia_resolve::read_inbox(&agreed, &kx_secret, &own_ck, room_key, room, peak, now_unix, &mut inbox_cursors).await {
                     Ok(found) => {
                         for f in found {
                             let from = f.item.from.to_string();
@@ -699,7 +703,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     continue;
                 };
                 let held = hub.rooms.lock().unwrap().contains_key(&d.room);
-                let sharing = hub.chia_rooms.lock().unwrap().get(&d.room).is_some_and(|c| c.may_share_card());
+                let sharing = hub.chia_rooms.lock().unwrap().get(&d.room).is_some_and(|c| c.may_use_cards());
                 if !held || !sharing || crate::linked_in_room(&hub, &d.room, &target_pub) {
                     planned.push(d); // moot at this boundary
                     continue;

@@ -18,6 +18,9 @@ describe('parseNodeFingerprint', () => {
     })).toEqual({
       hex: HEX, base64: B64, port: 4443, iroh_node_id: 'abc', iroh_relay_urls: ['https://r'], reachability: 'cgnat', iroh_port: 11204,
     });
+    // #231 P6b: the node's card-sharing flag rides when it is a boolean, and only then.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, share_card: false })).toEqual({ hex: HEX, base64: B64, port: 4443, share_card: false });
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, share_card: 'no' })?.share_card).toBeUndefined();
   });
 
   it('refuses what is not a fingerprint: a stranger on the port, or a shape that merely passes a truthiness check', () => {

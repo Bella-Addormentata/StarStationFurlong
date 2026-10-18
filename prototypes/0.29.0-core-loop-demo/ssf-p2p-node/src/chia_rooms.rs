@@ -61,12 +61,21 @@ pub struct ChiaRoomCap {
     /// N8 posture. `Some(true)`: bundled-seed or PUBLIC-passage room — never
     /// published under, never read under. `Some(false)`: the browser resolved
     /// the door policy and the room is private. `None`: the browser never said
-    /// (a build from before N8 sends no flag). Silence FAILS CLOSED for
+    /// (a build from before N8 sends no flag) or does not know YET (`null` on
+    /// the wire: the first cap of a join goes out before the room's door
+    /// documents are bound, #272 review round 3). Silence FAILS CLOSED for
     /// publishing — the unsafe direction is writing an address under a key that
     /// turns out to be public — and counts as unknown for reading, which is
     /// free and harmless either way. Set by the browser OR forced to
     /// `Some(true)` by the bundled-key check below.
     pub public_room: Option<bool>,
+    /// #231 P6b (#272 review round 3): this session joined by a pass that
+    /// carried member cards. A pass to a public room carries none (its minter
+    /// strips them), so while the posture is not yet known the pass's cards
+    /// may be USED — filed, knocked on — though ours is not handed out until
+    /// the room is known private ([`ChiaRoomCap::may_use_cards`]). Never
+    /// persisted: a restored cap uses no cards anyway.
+    pub pass_private: bool,
     /// The browser's per-session cap sequence number (0 from a browser that
     /// predates it). Every cap rides its own stream and streams may land out
     /// of order, so [`ingest_room_cap`] drops a cap older than the one it
@@ -87,6 +96,7 @@ impl ChiaRoomCap {
             && self.chia_mode == other.chia_mode
             && self.public_room == other.public_room
             && self.share_card == other.share_card
+            && self.pass_private == other.pass_private
     }
 
     /// May the publisher write a presence record under this room's key?
@@ -132,6 +142,11 @@ struct RoomCapPayload {
     /// Verified and filed by [`file_member_cards`], never trusted as sent.
     #[serde(rename = "memberCards", default)]
     member_cards: Vec<crate::chia_contact::ContactCard>,
+    /// #231 P6b (#272 review round 3): the browser joined by a pass carrying
+    /// member cards — see [`ChiaRoomCap::pass_private`]. Counts only with
+    /// cards actually sent.
+    #[serde(rename = "passPrivate", default)]
+    pass_private: bool,
 }
 
 fn default_true() -> bool {
@@ -192,6 +207,7 @@ pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
         public_room,
         seq: parsed.seq,
         restored: false,
+        pass_private: parsed.pass_private && !parsed.member_cards.is_empty(),
     })
 }
 
@@ -199,8 +215,9 @@ pub fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
 /// book under `room` — each verified (signature, skew), our own skipped — and
 /// save the book to `peers_path` when it changed. Returns how many were new or
 /// newer. The CALLER has checked the accepted cap's
-/// [`ChiaRoomCap::may_share_card`]: a public, bundled or posture-unknown
-/// room's hints never fill the book, for the reason the `contact` frame gives.
+/// [`ChiaRoomCap::may_use_cards`]: a public or bundled room's hints, or a
+/// posture-unknown room's without a private pass, never fill the book, for the
+/// reason the `contact` frame gives.
 pub fn file_member_cards(
     peers: &Mutex<crate::chia_contact::PeerBook>,
     peers_path: &std::path::Path,
@@ -312,11 +329,25 @@ pub fn ingest_room_cap(
 /// the arming toggle: a card lets the other side find US once we publish, and
 /// theirs lets us find them, whether or not either publishes yet.
 impl ChiaRoomCap {
-    /// Known private by a cap from THIS process (a restored cap's posture may
-    /// be stale), never the bundled welcome key, and the room's own toggle on
-    /// (#231 P6b).
+    /// May this room's cards be USED here (#231 P6b): the pass's member cards
+    /// filed, a host knocked on, our inbox read for the room? Known private by
+    /// a cap from THIS process (a restored cap's posture may be stale), or — a
+    /// first visit by a private pass, before the room's door documents have
+    /// synced (#272 review round 3) — posture not yet known while the pass
+    /// carried member cards (a pass to a public room carries none); never the
+    /// bundled welcome key, and the room's own toggle on.
+    pub fn may_use_cards(&self) -> bool {
+        self.share_card
+            && !self.restored
+            && !is_bundled_room_key(&self.room_key)
+            && (self.public_room == Some(false) || (self.public_room.is_none() && self.pass_private))
+    }
+
+    /// May OUR card be handed out for this room — to its connected peers, and
+    /// to the local tabs for the passes they mint? Only once the room is KNOWN
+    /// private: the pass's word admits the pass's cards, not ours.
     pub fn may_share_card(&self) -> bool {
-        self.share_card && self.public_room == Some(false) && !self.restored && !is_bundled_room_key(&self.room_key)
+        self.may_use_cards() && self.public_room == Some(false)
     }
 }
 
@@ -421,6 +452,7 @@ pub fn load_persisted_caps() -> Vec<(String, ChiaRoomCap)> {
                 public_room,
                 seq: 0,
                 restored: true,
+                pass_private: false,
             },
         ));
     }
@@ -575,8 +607,10 @@ mod tests {
             public_room: Some(false),
             seq: 0,
             restored: false,
+            pass_private: false,
         };
         assert!(private.may_share_card(), "a private room shares (and files the peers' cards), armed or not");
+        assert!(private.may_use_cards());
         let muted = ChiaRoomCap { share_card: false, ..private.clone() };
         assert!(!muted.may_share_card(), "P6b: the room's own toggle turns cards off");
         assert!(muted.may_read() && !muted.posture_unknown(), "and nothing else");
@@ -589,9 +623,35 @@ mod tests {
         assert!(!public.may_share_card());
         let unknown = ChiaRoomCap { public_room: None, ..private.clone() };
         assert!(!unknown.may_share_card(), "an unstated posture fails closed");
+        assert!(!unknown.may_use_cards(), "and uses no cards without a private pass");
+        // #272 review round 3: a first visit by a private pass, the door docs
+        // not yet synced — the pass's cards are used (filed, knocked on), ours
+        // waits for the posture.
+        let first_visit = ChiaRoomCap { public_room: None, pass_private: true, ..private.clone() };
+        assert!(first_visit.may_use_cards() && !first_visit.may_share_card(), "a private pass admits its cards, not ours");
+        assert!(!ChiaRoomCap { public_room: Some(true), ..first_visit.clone() }.may_use_cards(), "a pass's word never overrides a public posture");
+        assert!(!ChiaRoomCap { share_card: false, ..first_visit.clone() }.may_use_cards(), "nor the room's own toggle");
+        assert!(!ChiaRoomCap { restored: true, ..first_visit.clone() }.may_use_cards(), "nor a restored cap");
+        assert!(!private.same_posture(&first_visit), "the pass's word is posture: a change is logged");
         let bundled_key = decode_room_key(BUNDLED_ROOM_KEYS_B64[0]).unwrap();
         let bundled = ChiaRoomCap { room_key: bundled_key, public_room: Some(false), ..private.clone() };
         assert!(!bundled.may_share_card(), "the bundled welcome key never gets a card, whatever a browser says");
+    }
+
+    #[test]
+    fn p6b_a_private_pass_speaks_for_a_room_whose_posture_is_not_yet_known() {
+        let key = [4u8; 32];
+        let card = "{\"nodeId\":\"n\",\"ck\":\"Y2s=\",\"kxPk\":\"ab\",\"issuedAt\":1,\"sig\":\"ff\"}";
+        let first = parse_room_cap(&payload(key, &format!(",\"publicRoom\":null,\"passPrivate\":true,\"memberCards\":[{card}]"))).unwrap();
+        assert_eq!(first.public_room, None, "null on the wire: not yet known");
+        assert!(first.pass_private && first.may_use_cards() && !first.may_share_card());
+        assert!(!first.may_publish(), "and nothing is published under a key whose posture is unknown");
+        let no_cards = parse_room_cap(&payload(key, ",\"publicRoom\":null,\"passPrivate\":true")).unwrap();
+        assert!(!no_cards.pass_private, "the flag counts only with cards actually sent");
+        let old = parse_room_cap(&payload(key, ",\"publicRoom\":false")).unwrap();
+        assert!(!old.pass_private && old.may_use_cards(), "a browser that predates the flag: known private still uses cards");
+        let bundled = parse_room_cap(&payload(decode_room_key(BUNDLED_ROOM_KEYS_B64[0]).unwrap(), &format!(",\"publicRoom\":null,\"passPrivate\":true,\"memberCards\":[{card}]"))).unwrap();
+        assert!(!bundled.may_use_cards(), "the bundled welcome key never uses cards, whatever the pass says");
     }
 
     #[test]

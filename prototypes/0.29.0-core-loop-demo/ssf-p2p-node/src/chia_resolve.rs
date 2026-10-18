@@ -231,18 +231,20 @@ pub async fn read_hint(
     now: u64,
     cursor: &mut HintCursor,
 ) -> Result<Vec<FoundRecord>> {
-    read_hint_with(client, hint, cursor, &|ciphertext, _height| decode_blob(room_key, ciphertext, now)).await
+    read_hint_with(client, hint, cursor, &|ciphertext, _parent, _height| decode_blob(room_key, ciphertext, now)).await
 }
 
 /// [`read_hint`] with the OPENER as a parameter: the listing, paging, parent
 /// fetching, cursor and flood rules are the same for every record kind; only
-/// how a ciphertext becomes a record differs. The opener gets the ciphertext
-/// and the height of the block that confirmed the coin (v2's era rule).
+/// how a ciphertext becomes a record differs. The opener gets the ciphertext,
+/// the parent of the coin that carried it (the writer's input: what a knock's
+/// sealing is bound to, #272 review round 3) and the height of the block that
+/// confirmed the coin (v2's era rule).
 pub async fn read_hint_with(
     client: &impl ChainAccess,
     hint: Bytes32,
     cursor: &mut HintCursor,
-    opener: &(dyn Fn(&[u8], u32) -> Option<ChiaPresenceRecord> + Sync),
+    opener: &(dyn Fn(&[u8], Bytes32, u32) -> Option<ChiaPresenceRecord> + Sync),
 ) -> Result<Vec<FoundRecord>> {
     Ok(read_hint_items(client, hint, cursor, opener)
         .await?
@@ -257,7 +259,7 @@ pub async fn read_hint_items<T: Send>(
     client: &impl ChainAccess,
     hint: Bytes32,
     cursor: &mut HintCursor,
-    opener: &(dyn Fn(&[u8], u32) -> Option<T> + Sync),
+    opener: &(dyn Fn(&[u8], Bytes32, u32) -> Option<T> + Sync),
 ) -> Result<Vec<FoundItem<T>>> {
     let Resume { start, mut page, mut max_height, mut examined_all } = cursor.resume();
     let mut coins = Vec::new();
@@ -318,7 +320,7 @@ pub async fn read_hint_items<T: Send>(
             Some(ct) => ct,
             None => continue,
         };
-        if let Some(item) = opener(&ciphertext, rec.confirmed_block_index) {
+        if let Some(item) = opener(&ciphertext, rec.coin.parent_coin_info, rec.confirmed_block_index) {
             out.push(FoundItem { item, coin_id: Bytes32::new(coin_id), confirmed_height: rec.confirmed_block_index, hint });
         }
     }
@@ -398,7 +400,7 @@ pub async fn read_ck(
         let hint = chia_lane::derive_ck_hint(ck, era);
         let cursor = cursors.entry(hint).or_default();
         let before = cursor.clone();
-        let opener = |ct: &[u8], height: u32| decode_v2_presence(ck, ct, era, height, now);
+        let opener = |ct: &[u8], _parent: Bytes32, height: u32| decode_v2_presence(ck, ct, era, height, now);
         match read_hint_with(client, Bytes32::new(hint), cursor, &opener).await {
             Ok(records) => {
                 any_ok = true;
@@ -436,12 +438,15 @@ pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
 // ── #231 P6b: the inbox (knocks sealed to us) and the public beacons ────────
 
 /// Open one knock ciphertext read under our inbox hint for `era`: sealed to
-/// our card key, signed by its knocker, filed in its own era, not expired, not
+/// our card key UNDER the coin that carried it (`carrier_parent`, the coin's
+/// parent — a copy of the blob under another coin does not open, #272 review
+/// round 3), signed by its knocker, filed in its own era, not expired, not
 /// from the far future, and naming `lane_id` (the room the hint was read for)
 /// among its rooms. `None` for anything else.
 pub fn decode_knock_for(
     kx_secret: &[u8; 32],
     ciphertext: &[u8],
+    carrier_parent: &[u8; 32],
     era: u64,
     confirmed_height: u32,
     now: u64,
@@ -450,7 +455,7 @@ pub fn decode_knock_for(
     if chia_lane::era_of(confirmed_height) != era {
         return None;
     }
-    let plain = chia_lane::open_with_kx(kx_secret, chia_lane::KIND_KNOCK, era, ciphertext).ok()?;
+    let plain = chia_lane::open_with_kx(kx_secret, chia_lane::KIND_KNOCK, era, carrier_parent, ciphertext).ok()?;
     let knock = chia_lane::decode_knock_v2(&plain, era).ok()?;
     if knock.expires_at < now || knock.issued_at > now.saturating_add(MAX_FUTURE_SKEW_V2_SECS) {
         return None;
@@ -480,7 +485,7 @@ pub async fn read_inbox(
         let hint = chia_lane::derive_inbox_hint(own_ck, &lane, era);
         let cursor = cursors.entry(hint).or_default();
         let before = cursor.clone();
-        let opener = |ct: &[u8], height: u32| decode_knock_for(kx_secret, ct, era, height, now, &lane_id);
+        let opener = |ct: &[u8], parent: Bytes32, height: u32| decode_knock_for(kx_secret, ct, &parent.to_bytes(), era, height, now, &lane_id);
         match read_hint_items(client, Bytes32::new(hint), cursor, &opener).await {
             Ok(items) => {
                 any_ok = true;
@@ -549,7 +554,7 @@ pub async fn read_beacons(client: &impl ChainAccess, peak: u32, now: u64) -> Res
         for era in scan_eras(peak) {
             let hint = chia_lane::derive_beacon_hint(era);
             let cursor = cursors.entry(hint).or_default();
-            let opener = |ct: &[u8], height: u32| decode_beacon_for(ct, era, height, now);
+            let opener = |ct: &[u8], _parent: Bytes32, height: u32| decode_beacon_for(ct, era, height, now);
             all.extend(read_hint_items(client, Bytes32::new(hint), cursor, &opener).await?);
         }
         if !cursors.values().any(|c| c.has_more()) {
@@ -873,6 +878,35 @@ impl ChainPeak {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_knock_opens_only_under_the_coin_it_was_written_by() {
+        // #272 review round 3: a chain observer can copy an inbox hint and its
+        // sealed memo into a coin of its own. The sealing binds the carrier's
+        // parent (the knocker's input coin), so the copy never decodes.
+        let knocker = iroh::SecretKey::generate();
+        let host_sk = [11u8; 32];
+        let host_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(host_sk).to_bytes();
+        let era = 7u64;
+        let height = 7 * chia_lane::ERA_BLOCKS + 5;
+        let now = 1_000u64;
+        let lane = chia_lane::room_lane_id("r");
+        let knock = chia_lane::KnockV2 {
+            era,
+            from: knocker.public(),
+            ck_from: Some([3u8; 32]),
+            issued_at: now,
+            expires_at: now + 2 * chia_lane::ERA_SECS,
+            rooms: vec![lane],
+        };
+        let plain = chia_lane::encode_knock_v2(&knock, &knocker).unwrap();
+        let input = [5u8; 32];
+        let sealed = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &plain).unwrap();
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, era, height, now, &lane), Some(knock), "under its own coin: the knock");
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &[6u8; 32], era, height, now, &lane), None, "the same blob under a copier's coin: nothing");
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, era, height + chia_lane::ERA_BLOCKS, now, &lane), None, "outside its era");
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, era, height, now, &chia_lane::room_lane_id("s")), None, "another room");
+    }
 
     fn sealed_record(room_key: &[u8; 32], sk: &iroh::SecretKey, issued_at: u64, expires_at: u64) -> Vec<u8> {
         let record = ChiaPresenceRecord {

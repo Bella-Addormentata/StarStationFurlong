@@ -78,7 +78,7 @@ export class NetworkProvider implements NetworkProviderPort {
   #connectedAt = 0;
   #boot: RoomBootstrap | null = null;
   /** N8 probe: is this room public space? Installed by main.ts. */
-  #publicRoomProbe: ((roomId: string) => boolean) | null = null;
+  #publicRoomProbe: ((roomId: string) => boolean | undefined) | null = null;
   /** Last cap `seq` sent (see roomCap.ts): caps ride separate streams. */
   #capSeq = 0;
 
@@ -239,7 +239,8 @@ export class NetworkProvider implements NetworkProviderPort {
    *  derive the room's chia lookup hint and seal presence records; it holds the
    *  room's plaintext doc already, so this is loopback-only and exposes nothing
    *  new. Fire-and-forget. The payload also carries N8's `publicRoom` flag from
-   *  the installed probe; a provider with no probe (every background provider)
+   *  the installed probe (`null` while the probe cannot say yet, #272 review
+   *  round 3); a provider with no probe (every background provider)
    *  sends no cap at all — see the guard below. Same `[u32-LE len][JSON]`
    *  framing the node reads on every browser->node stream. */
   async sendRoomCap(roomId: string, roomKeyB64: string, chiaMode: boolean): Promise<void> {
@@ -298,7 +299,7 @@ export class NetworkProvider implements NetworkProviderPort {
    *  passage). main.ts installs it on the primary provider at boot, before any
    *  join; a provider without one never sends a cap, so a node never publishes
    *  under a key the browser has not vouched for. */
-  setPublicRoomProbe(probe: (roomId: string) => boolean): void {
+  setPublicRoomProbe(probe: (roomId: string) => boolean | undefined): void {
     this.#publicRoomProbe = probe;
   }
 
