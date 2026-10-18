@@ -104,11 +104,13 @@ export function memberCardsOf(hints: readonly { irohNodeId: string; nodeCard?: C
   return out;
 }
 
-/** The switches flipped THIS session, per room, consulted before storage
- *  (#272 review round 6): a browser that refuses the write (privacy mode, a
- *  full quota) must not leave the panel saying OFF while the cap, the pass
- *  builders and the node keep reading the stored ON. The choice is recorded
- *  here first and persisted on top, best-effort; every reader asks here first. */
+/** The switches flipped THIS session that the browser REFUSED to store, per
+ *  room, consulted before storage (#272 review round 6): a browser that refuses
+ *  the write (privacy mode, a full quota) must not leave the panel saying OFF
+ *  while the cap, the pass builders and the node keep reading the stored ON.
+ *  The choice is recorded here first and persisted on top; once stored, the
+ *  copy here goes (round 7): storage is the one word every tab of this
+ *  station reads, and a copy kept would hide a later OFF another tab stored. */
 const sessionFlags = new Map<string, boolean>();
 
 function readFlag(key: string, fromStored: (stored: string | null) => boolean): boolean {
@@ -126,8 +128,9 @@ function writeFlag(key: string, on: boolean): void {
   try {
     localStorage.setItem(key, on ? '1' : '0');
   } catch {
-    /* privacy mode: the choice holds for this session all the same */
+    return; /* privacy mode: the choice holds for this session all the same */
   }
+  sessionFlags.delete(key); // stored: every tab reads it from there now
 }
 
 /** Tests: forget this session's choices. */
@@ -149,6 +152,17 @@ export function readShareCard(roomId: string): boolean {
  *  reader, persisted when the browser allows. */
 export function setShareCard(roomId: string, on: boolean): void {
   writeFlag(shareCardKey(roomId), on);
+}
+
+/** #231 P6b: a member hint as a ROUTE alone — node id, relays, direct
+ *  addresses — and no contact card. What leaves the room-gated pass builders
+ *  (the personal contact card a player hands a friend, and through it the
+ *  friend-of-friend introductions it consents to) carries no card: a card is
+ *  handed out in a private room's pass, by the room's and the node's switches,
+ *  and nowhere else (#272 review round 7). */
+export function routeHint(hint: RoomMemberHint): RoomMemberHint {
+  const { nodeCard: _card, ...route } = hint;
+  return route;
 }
 
 /** #231 P6b: the hints a PASS carries, card-wise. A pass to a PUBLIC room

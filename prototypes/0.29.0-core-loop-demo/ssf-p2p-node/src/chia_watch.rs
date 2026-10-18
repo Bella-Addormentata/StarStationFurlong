@@ -628,17 +628,26 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // between is seen by the lookups and never read as dropped. Each
             // verdict names its entry by input coin AND hint (#272 review round
             // 4): a dropped knock's input is released to the next write, which
-            // may be another knock, so two entries can share a coin.
-            let pending = hub.knocks.lock().unwrap().pending_sent();
+            // may be another knock, so two entries can share a coin. A knock
+            // CONFIRMED less than SETTLED_DEPTH blocks ago is judged again too
+            // (#272 review round 7): a reorganization can move the block that
+            // holds it (the clock follows) or drop it (pending again, nobody
+            // dialed, until the chain's word) — the host's side does the same
+            // with the knocks it read, below.
+            let pending = hub.knocks.lock().unwrap().unsettled_sent(knock_peak);
             if !pending.is_empty() {
                 let coins: Vec<Bytes32> = pending.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
                 let words = lease_words(&agreed, &coins).await;
                 match chia_resolve::spent_heights(&agreed, coins.clone()).await {
                     Ok(spent) => {
-                        let mut verdicts: Vec<(String, String, u64, WriteStanding)> = Vec::new();
+                        // Each verdict: input coin, hint, era, the height the
+                        // entry stood confirmed at (0: pending), whether the
+                        // hint's listing ran to its end WITHOUT the write (a
+                        // cut listing says nothing), and the standing.
+                        let mut verdicts: Vec<(String, String, u64, u32, bool, WriteStanding)> = Vec::new();
                         for k in &pending {
                             let (Some(coin), Some(hint)) = (chia_resolve::parse_hex32(&k.coin_id), chia_resolve::parse_hex32(&k.hint)) else {
-                                verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, WriteStanding::Dead("its entry in the knock book is malformed")));
+                                verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, false, WriteStanding::Dead("its entry in the knock book is malformed")));
                                 continue;
                             };
                             let child = match chia_resolve::child_under_hint(&agreed, hint, coin).await {
@@ -650,11 +659,12 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             };
                             let spent_at = spent.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
                             let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
-                            verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, chia_resolve::write_standing(&child, spent_at, lease)));
+                            let gone = matches!(child, chia_resolve::HintChild::Absent { .. });
+                            verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, gone, chia_resolve::write_standing(&child, spent_at, lease)));
                         }
                         let mut book = hub.knocks.lock().unwrap();
                         let mut changed = false;
-                        for (coin_hex, hint_hex, era, standing) in verdicts {
+                        for (coin_hex, hint_hex, era, was, gone, standing) in verdicts {
                             match standing {
                                 WriteStanding::Confirmed(height) if chia_lane::era_of(height) != era => {
                                     println!("⛓️ ChiaHub knock: our knock confirmed at height {height}, outside era {era} — the host will not read it; forgotten, the next dial exhaustion knocks again");
@@ -662,13 +672,26 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                 }
                                 WriteStanding::Confirmed(height) => {
                                     if book.confirm_sent(&coin_hex, &hint_hex, height) {
-                                        println!("⛓️ ChiaHub knock: our knock confirmed at height {height} — dialing the host on the schedule from here");
+                                        if was == 0 {
+                                            println!("⛓️ ChiaHub knock: our knock confirmed at height {height} — dialing the host on the schedule from here");
+                                        } else {
+                                            println!("⛓️ ChiaHub knock: the chain moved our knock from height {was} to {height} (a reorganization) — the schedule follows");
+                                        }
                                         changed = true;
                                     }
                                 }
                                 WriteStanding::Dead(why) => {
                                     println!("⛓️ ChiaHub knock: our knock never landed — {why}; forgotten, the next dial exhaustion knocks again");
                                     changed |= book.drop_sent(&coin_hex, &hint_hex);
+                                }
+                                WriteStanding::Pending if was != 0 && gone => {
+                                    // Confirmed last tick, under no block now: the
+                                    // one that held it is gone. Its spend may land
+                                    // again; until the chain says, nobody is dialed.
+                                    if book.unconfirm_sent(&coin_hex, &hint_hex) {
+                                        println!("⛓️ ChiaHub knock: the block that confirmed our knock at height {was} is gone (a reorganization) — waiting for the chain's word again");
+                                        changed = true;
+                                    }
                                 }
                                 WriteStanding::Pending => {}
                             }
@@ -678,6 +701,59 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                         }
                     }
                     Err(e) => eprintln!("⛓️ ChiaHub knock: could not read our knocks' confirmation: {e:#}"),
+                }
+            }
+            // ── #231 P6b: the knocks READ, while young (#272 review round 7):
+            // the coin that carried each is looked up again on the agreed lane
+            // until its confirmation is SETTLED_DEPTH deep — moved by a
+            // reorganization, its clock follows (the knocker's does the same
+            // above); gone, nobody is dialed back for it, and the inbox files
+            // it afresh should its spend land again.
+            if let Some(agreed_peak) = knock_peak {
+                let young = hub.knocks.lock().unwrap().unsettled_inbox(agreed_peak);
+                if !young.is_empty() {
+                    let coins: Vec<Bytes32> = young.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
+                    match chia_resolve::coin_heights(&agreed, coins).await {
+                        Ok(Some(heights)) => {
+                            let mut book = hub.knocks.lock().unwrap();
+                            let mut changed = false;
+                            for k in &young {
+                                let Some(coin) = chia_resolve::parse_hex32(&k.coin_id) else {
+                                    changed |= book.drop_inbox(&k.coin_id); // malformed: on no chain
+                                    continue;
+                                };
+                                match heights.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h) {
+                                    Some(h) if h == k.confirmed_height => {}
+                                    Some(h) => {
+                                        if book.reclock_inbox(&k.coin_id, h) {
+                                            println!(
+                                                "⛓️ ChiaHub inbox: the chain moved {}'s knock from height {} to {h} (a reorganization) — the schedule follows",
+                                                short(&k.from),
+                                                k.confirmed_height
+                                            );
+                                            changed = true;
+                                        }
+                                    }
+                                    None => {
+                                        if book.drop_inbox(&k.coin_id) {
+                                            println!(
+                                                "⛓️ ChiaHub inbox: the block that held {}'s knock (height {}) is gone (a reorganization) — not dialing it back unless it lands again",
+                                                short(&k.from),
+                                                k.confirmed_height
+                                            );
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if changed {
+                                let _ = book.save(knocks_path);
+                            }
+                        }
+                        // Cut short: nothing is said of the coins it did not reach.
+                        Ok(None) => {}
+                        Err(e) => eprintln!("⛓️ ChiaHub inbox: could not look the young knocks' coins up again: {e:#}"),
+                    }
                 }
             }
             if let Some(agreed_peak) = knock_peak {

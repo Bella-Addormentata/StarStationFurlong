@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   MAX_CAP_MEMBER_CARDS,
@@ -15,6 +17,7 @@ import {
   roomIsPublicSpace,
   roomPosture,
   roomPostureProbe,
+  routeHint,
   setChiaMode,
   setShareCard,
   type PostureSources,
@@ -195,6 +198,66 @@ describe('room cap payload (N8 / D3)', () => {
       if (had) Object.defineProperty(globalThis, 'localStorage', had);
       else delete (globalThis as { localStorage?: Storage }).localStorage;
     }
+  });
+
+  it("P6b: a switch stored successfully is read back from storage, so another tab's later word is seen", () => {
+    // #272 review round 7: the session copy a refused write leaves behind must
+    // not outlive a write that WORKED — tab A's ON would hide the OFF tab B
+    // stored afterwards, and A would hand our card out on its next pass.
+    const kept = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => kept.get(k) ?? null,
+      setItem: (k: string, v: string) => void kept.set(k, v),
+      removeItem: (k: string) => void kept.delete(k),
+      clear: () => kept.clear(),
+      key: () => null,
+      length: 0,
+    } as unknown as Storage;
+    const had = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true, writable: true });
+    try {
+      forgetSessionFlags();
+      setShareCard('r', true);
+      expect(kept.get('ssf-chia-share-card-r')).toBe('1');
+      kept.set('ssf-chia-share-card-r', '0'); // another tab turned it off
+      expect(readShareCard('r')).toBe(false);
+      setChiaMode('r', true);
+      kept.set('ssf-chia-mode-r', '0');
+      expect(readChiaMode('r')).toBe(false);
+      // A refused write still holds for this tab…
+      storage.setItem = () => {
+        throw new Error('QuotaExceededError');
+      };
+      setShareCard('r', true);
+      expect(kept.get('ssf-chia-share-card-r')).toBe('0');
+      expect(readShareCard('r')).toBe(true);
+      // …until a write works again, after which storage speaks.
+      storage.setItem = (k: string, v: string) => void kept.set(k, v);
+      setShareCard('r', false);
+      expect(kept.get('ssf-chia-share-card-r')).toBe('0');
+      kept.set('ssf-chia-share-card-r', '1');
+      expect(readShareCard('r')).toBe(true);
+    } finally {
+      forgetSessionFlags();
+      if (had) Object.defineProperty(globalThis, 'localStorage', had);
+      else delete (globalThis as { localStorage?: Storage }).localStorage;
+    }
+  });
+
+  it('P6b: the personal contact card carries the route alone, never the node card', () => {
+    // #272 review round 7: a contact card goes wherever the player pastes it
+    // and, with consent, on through friend-of-friend introductions, outside
+    // any room; our node's card is handed out in a private room's pass alone.
+    const hint = { irohNodeId: 'me', irohRelayUrls: ['https://relay'], irohDirectAddrs: ['198.51.100.7:4444'], nodeCard: card('me') };
+    expect(routeHint(hint)).toEqual({ irohNodeId: 'me', irohRelayUrls: ['https://relay'], irohDirectAddrs: ['198.51.100.7:4444'] });
+    expect('nodeCard' in routeHint(hint)).toBe(false);
+    expect(routeHint({ irohNodeId: 'bare' })).toEqual({ irohNodeId: 'bare' });
+    // And main.ts hands the contacts module that route, not the pass hint.
+    const main = readFileSync(fileURLToPath(new URL('../main.ts', import.meta.url)), 'utf8');
+    const at = main.indexOf('initContacts({');
+    expect(at).toBeGreaterThan(0);
+    const block = main.slice(at, main.indexOf('});', at));
+    expect(block).toContain('routeHint(');
   });
 
   it('P6b: a node that hands out no card keeps the cached one out of every pass', () => {

@@ -179,6 +179,19 @@ impl HintCursor {
     pub fn seen_full(&self) -> bool {
         self.seen.len() >= SEEN_CAP
     }
+
+    /// Put the cursor back as it was before a read that FAILED, so nothing that
+    /// read examined counts as seen — minus any parked page cursor: `resume`
+    /// took it so a cursor the peers no longer honour (a reorganization above
+    /// it) fails ONCE; put back, it would be refused every beat and the hint
+    /// never read again until it rotated out (#272 review round 7). The fresh
+    /// listing starts below `last_height`, which never passed the pages nobody
+    /// fetched, so nothing is skipped; `backlog` says there is more to read.
+    pub fn roll_back(&mut self, before: HintCursor) {
+        *self = before;
+        self.pending = None;
+        self.backlog = true;
+    }
 }
 
 /// The epochs a reader scans at `now`: next, current and previous. The next
@@ -382,9 +395,10 @@ pub fn scan_eras(peak: u32) -> Vec<u64> {
 
 /// One incremental read of a contact key's presence: both scan eras' hints,
 /// cursors kept by the caller per hint (so the watcher pays only for new coins
-/// beat after beat). A hint whose read fails has its cursor put back exactly
-/// as it was, so nothing it examined counts as seen and the next beat re-reads
-/// it; what the other hint found is returned all the same. Only when every
+/// beat after beat). A hint whose read fails has its cursor put back as it
+/// was, minus any parked page cursor ([`HintCursor::roll_back`]), so nothing
+/// it examined counts as seen and the next beat re-reads it; what the other
+/// hint found is returned all the same. Only when every
 /// hint failed is the error returned.
 pub async fn read_ck(
     client: &impl ChainAccess,
@@ -412,8 +426,7 @@ pub async fn read_ck(
                 // one-shot resolver then spends a retry round on it instead of
                 // taking the other hint's clean finish for "all read"; the
                 // watcher re-reads it next beat either way.
-                *cursor = before;
-                cursor.backlog = true;
+                cursor.roll_back(before);
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
@@ -494,8 +507,7 @@ pub async fn read_inbox(
                 found.extend(items);
             }
             Err(e) => {
-                *cursor = before;
-                cursor.backlog = true;
+                cursor.roll_back(before);
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
@@ -591,6 +603,32 @@ pub async fn spent_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) ->
         }
     }
     Ok(out)
+}
+
+/// #231 P6b (#272 review round 7): where the coins named by `coin_ids` stand
+/// NOW — each one found, with the height of the block that holds it. A coin a
+/// listing run to its end does not name is no longer on the chain (a
+/// reorganization took its block); a listing cut short says nothing of the
+/// coins it did not reach, so `None` comes back and nothing is judged.
+pub async fn coin_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) -> Result<Option<Vec<(Bytes32, u32)>>> {
+    if coin_ids.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut out = Vec::new();
+    let mut page: Option<String> = None;
+    for _ in 0..MAX_PAGES_PER_POLL {
+        let listing = client
+            .coin_records_by_names(coin_ids.clone(), true, page.take())
+            .await
+            .map_err(|e| anyhow!("coin lookup by name: {e}"))?;
+        out.extend(listing.records.iter().map(|r| (r.coin.coin_id(), r.confirmed_block_index)));
+        match (listing.truncated, listing.next_cursor) {
+            (true, Some(next)) => page = Some(next),
+            (true, None) => return Ok(None),
+            (false, _) => return Ok(Some(out)),
+        }
+    }
+    Ok(None)
 }
 
 /// #231 P6b: whether a write's own coin sits under `hint` — the coin a
@@ -1158,6 +1196,142 @@ mod tests {
         // read-only build) never kills a write.
         assert_eq!(write_standing(&absent(Some(950)), None, Unknown), WriteStanding::Pending, "unknown to the lease: pending");
         assert_eq!(write_standing(&absent(None), None, Unknown), WriteStanding::Pending);
+    }
+
+    /// A chain whose listings refuse every page cursor (as full nodes do once
+    /// a reorganization passed the cursor's position) and answer a fresh
+    /// listing from a script of pages; everything else unanswered.
+    struct CursorRefusing {
+        pages: std::sync::Mutex<std::collections::VecDeque<crate::chia_chain::CoinListing>>,
+        fresh_listings: std::sync::Mutex<usize>,
+    }
+
+    fn unanswered() -> crate::chia_chain::ChainError {
+        crate::chia_chain::ChainError::Unanswered(anyhow!("test chain"))
+    }
+
+    impl crate::chia_chain::ChainAccess for CursorRefusing {
+        fn coin_records_by_hint(
+            &self,
+            _hint: Bytes32,
+            _start_height: Option<u32>,
+            _include_spent: bool,
+            cursor: Option<String>,
+        ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, crate::chia_chain::ChainError>> + Send {
+            let answer = if cursor.is_some() {
+                Err(crate::chia_chain::ChainError::Unanswered(anyhow!("cursor refused (test chain)")))
+            } else {
+                *self.fresh_listings.lock().unwrap() += 1;
+                self.pages.lock().unwrap().pop_front().ok_or_else(unanswered)
+            };
+            async move { answer }
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            _include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn coin_records_by_names(
+            &self,
+            _names: Vec<Bytes32>,
+            _include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn puzzle_and_solution(
+            &self,
+            _coin_id: Bytes32,
+            _height: u32,
+        ) -> impl std::future::Future<Output = Result<Option<PuzzleAndSolution>, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn peak_height(&self) -> impl std::future::Future<Output = Result<u32, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn spend_live(&self, _bundle: chia_protocol::SpendBundle) -> impl std::future::Future<Output = Result<bool, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn push_tx(&self, _bundle: chia_protocol::SpendBundle) -> impl std::future::Future<Output = Result<(), crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_page_cursor_is_dropped_so_the_next_inbox_read_starts_fresh() {
+        // #272 review round 7: a listing parked mid-way (page budget spent)
+        // resumes from the peers' cursor; after a reorganization the peers
+        // refuse that cursor. `resume` takes it so the refusal happens once —
+        // but the failed read's rollback put it back, so the hint was refused
+        // every beat and never read again until it rotated out.
+        use crate::chia_chain::CoinListing;
+        let empty = || CoinListing { records: vec![], truncated: false, next_cursor: None, judged_at: Some(10 * chia_lane::ERA_BLOCKS) };
+        let chain = CursorRefusing { pages: std::sync::Mutex::new(vec![empty(), empty(), empty(), empty()].into()), fresh_listings: std::sync::Mutex::new(0) };
+        let (kx_secret, own_ck, room_key) = ([11u8; 32], [12u8; 32], [13u8; 32]);
+        let peak = 10 * chia_lane::ERA_BLOCKS + 5;
+        let lane = chia_lane::derive_lane_token(&room_key);
+        let parked = chia_lane::derive_inbox_hint(&own_ck, &lane, chia_lane::era_of(peak));
+        let mut cursors = std::collections::HashMap::new();
+        cursors.insert(
+            parked,
+            HintCursor {
+                last_height: peak - 100,
+                pending: Some(PendingPage { start_height: Some(peak - 200), next_cursor: "stale".into(), max_height: peak - 100, examined_all: true }),
+                ..Default::default()
+            },
+        );
+        // Beat 1: the parked hint's cursor is refused (the other era's hint reads fine).
+        assert!(read_inbox(&chain, &kx_secret, &own_ck, &room_key, "r", peak, 1_000, &mut cursors).await.unwrap().is_empty());
+        let after = &cursors[&parked];
+        assert_eq!(after.pending, None, "the refused cursor is not kept");
+        assert!(after.backlog, "there is still something to read");
+        assert_eq!(after.last_height, peak - 100, "nothing examined moved");
+        assert_eq!(*chain.fresh_listings.lock().unwrap(), 1, "the other era listed fresh");
+        // Beat 2: a fresh listing for the hint, accepted, instead of the same refusal.
+        assert!(read_inbox(&chain, &kx_secret, &own_ck, &room_key, "r", peak, 1_000, &mut cursors).await.unwrap().is_empty());
+        assert_eq!(*chain.fresh_listings.lock().unwrap(), 3, "both eras listed fresh");
+        let after = &cursors[&parked];
+        assert_eq!(after.pending, None);
+        assert!(!after.backlog, "the listing ran to its end");
+    }
+
+    #[tokio::test]
+    async fn young_knock_coins_are_looked_up_again_and_a_cut_listing_judges_none() {
+        // #272 review round 7: the coins that carried the knocks read, looked
+        // up again while their confirmation is young — one that left the
+        // chain is on no page of a listing run to its end.
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use chia_protocol::Coin;
+        let rec = |parent: u8, height: u32| CoinRecord {
+            coin: Coin::new(Bytes32::new([parent; 32]), Bytes32::new([1u8; 32]), 1),
+            confirmed_block_index: height,
+            spent: false,
+            spent_block_index: 0,
+        };
+        let (a, b) = (rec(1, 100), rec(2, 105));
+        let ids = vec![a.coin.coin_id(), b.coin.coin_id(), Bytes32::new([9u8; 32])];
+        let page = |records: Vec<CoinRecord>, truncated: bool, next: Option<&str>| CoinListing { records, truncated, next_cursor: next.map(str::to_string), judged_at: Some(120) };
+        let chain = Scripted::new(vec![page(vec![a.clone()], true, Some("c")), page(vec![b.clone()], false, None)]);
+        assert_eq!(
+            coin_heights(&chain, ids.clone()).await.unwrap(),
+            Some(vec![(a.coin.coin_id(), 100), (b.coin.coin_id(), 105)]),
+            "the third coin is on no page: it left the chain"
+        );
+        let chain = Scripted::new(vec![page(vec![a.clone()], true, None)]);
+        assert_eq!(coin_heights(&chain, ids.clone()).await.unwrap(), None, "cut short with nowhere to go on: nothing is said");
+        let pages: Vec<CoinListing> = (0..MAX_PAGES_PER_POLL + 1).map(|_| page(vec![], true, Some("c"))).collect();
+        assert_eq!(coin_heights(&Scripted::new(pages), ids.clone()).await.unwrap(), None, "the page budget spent: nothing is said");
+        assert_eq!(coin_heights(&chain, vec![]).await.unwrap(), Some(vec![]), "no coins, no lookup");
+        assert!(coin_heights(&crate::chia_chain::testing::Unanswering, ids).await.is_err());
     }
 
     #[tokio::test]

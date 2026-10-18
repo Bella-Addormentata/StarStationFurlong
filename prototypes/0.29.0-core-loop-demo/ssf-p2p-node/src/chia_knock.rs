@@ -17,6 +17,11 @@
 //! and the two NATs are open at once. The first link ends the dance: a
 //! connected target is never dialed. No further spend: the schedule is
 //! derived from `h`, never written.
+//!
+//! A confirmation is final here only once it is [`SETTLED_DEPTH`] blocks deep:
+//! until then both sides look the knock's coin up again each tick, and a
+//! reorganization that moves the block that holds it moves both clocks with
+//! it, one that drops the block stops them (#272 review round 7).
 #![cfg(feature = "chia-read")]
 
 use std::collections::VecDeque;
@@ -38,6 +43,12 @@ pub const RENDEZVOUS_FAR_STEP: u32 = 10 * DEFAULT_BEAT_BLOCKS;
 /// How long after its confirmation a knock is dialed on: two eras, the
 /// record's own validity.
 pub const RENDEZVOUS_SPAN: u32 = 2 * ERA_BLOCKS;
+/// A confirmation younger than this many blocks (about ten minutes) is judged
+/// again every tick: a reorganization can move the block that holds a knock, or
+/// drop it, and both sides' clocks must follow (#272 review round 7). Chia's
+/// reorganizations are rare and shallow — a few blocks — so one this deep is
+/// final here, which also bounds the lookups a tick makes.
+pub const SETTLED_DEPTH: u32 = 32;
 /// Entries kept per side, oldest first out.
 pub const MAX_SENT: usize = 256;
 pub const MAX_INBOX: usize = 256;
@@ -66,6 +77,11 @@ pub fn next_boundary_after(confirmed: u32, after: u32) -> Option<u32> {
 /// Is a boundary of a knock confirmed at `confirmed` inside `(last, peak]`?
 pub fn rendezvous_due(confirmed: u32, last: u32, peak: u32) -> bool {
     peak > last && next_boundary_after(confirmed, last).is_some_and(|b| b <= peak)
+}
+
+/// Is a knock confirmed at `confirmed` final at chain peak `peak`?
+pub fn settled(confirmed: u32, peak: u32) -> bool {
+    confirmed != 0 && peak >= confirmed.saturating_add(SETTLED_DEPTH)
 }
 
 /// A knock the dial ladder asked for, waiting for the publisher (RAM only: a
@@ -198,17 +214,49 @@ impl KnockBook {
         self.sent.iter().filter(|k| k.confirmed_height == 0).cloned().collect()
     }
 
+    /// The knocks of ours the chain's word is still wanted on: every pending
+    /// one and, given an agreed `peak` to judge by, every confirmed one not yet
+    /// [`settled`] there — a reorganization can still move or drop the block
+    /// that holds it (#272 review round 7).
+    pub fn unsettled_sent(&self, peak: Option<u32>) -> Vec<SentKnock> {
+        self.sent
+            .iter()
+            .filter(|k| k.confirmed_height == 0 || peak.is_some_and(|p| !settled(k.confirmed_height, p)))
+            .cloned()
+            .collect()
+    }
+
     /// The chain says the knock that spent `coin_id` under `hint` confirmed at
-    /// `height`; the rendezvous clock starts there. An entry is named by BOTH
-    /// (#272 review round 4): a dropped knock's input is released to the next
-    /// write, which may be another knock to another host, so two entries can
-    /// share an input coin — their hints tell them apart. Returns true when
-    /// something changed.
+    /// `height`; the rendezvous clock starts there — or, the knock being
+    /// confirmed at another height already, a reorganization moved its block
+    /// and the clock follows (#272 review round 7): a clock not yet dialed on
+    /// moves whole, one already dialed on keeps the peak it was last planned
+    /// at, and its next boundary is counted from the new height above that. An
+    /// entry is named by BOTH (#272 review round 4): a dropped knock's input is
+    /// released to the next write, which may be another knock to another host,
+    /// so two entries can share an input coin — their hints tell them apart.
+    /// Returns true when something changed.
     pub fn confirm_sent(&mut self, coin_id: &str, hint: &str, height: u32) -> bool {
         let mut changed = false;
-        for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height == 0) {
+        for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height != height) {
+            if k.last_rendezvous == k.confirmed_height {
+                k.last_rendezvous = height;
+            }
             k.confirmed_height = height;
-            k.last_rendezvous = height;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The block that confirmed the knock is gone (a reorganization; its spend
+    /// may land again): the knock is pending once more, its clock stopped, and
+    /// the chain's word is awaited — it still counts as this era's knock on its
+    /// host (#272 review round 7). Returns true when something changed.
+    pub fn unconfirm_sent(&mut self, coin_id: &str, hint: &str) -> bool {
+        let mut changed = false;
+        for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height != 0) {
+            k.confirmed_height = 0;
+            k.last_rendezvous = 0;
             changed = true;
         }
         changed
@@ -251,6 +299,40 @@ impl KnockBook {
         }
         self.inbox.push(knock);
         true
+    }
+
+    /// The knocks read whose confirmation is not yet [`settled`] at the agreed
+    /// `peak`: their coins are looked up again each tick, since a
+    /// reorganization can still move or drop the block that holds one (#272
+    /// review round 7).
+    pub fn unsettled_inbox(&self, peak: u32) -> Vec<InboxKnock> {
+        self.inbox.iter().filter(|k| !settled(k.confirmed_height, peak)).cloned().collect()
+    }
+
+    /// The coin that carried a knock read sits in another block now (a
+    /// reorganization moved it): its clock follows, as [`Self::confirm_sent`]'s
+    /// does. Returns true when something changed.
+    pub fn reclock_inbox(&mut self, coin_id: &str, height: u32) -> bool {
+        let mut changed = false;
+        for k in self.inbox.iter_mut().filter(|k| k.coin_id == coin_id && k.confirmed_height != height) {
+            if k.last_rendezvous == k.confirmed_height {
+                k.last_rendezvous = height;
+            }
+            k.confirmed_height = height;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The coin that carried a knock read is no longer on the chain (a
+    /// reorganization dropped its block): nobody is dialed back for it. The
+    /// knocker's own book sees its knock pending again; should the spend land
+    /// anew, the inbox lists the coin again above the height examined and
+    /// files it afresh (#272 review round 7). Returns true when one went.
+    pub fn drop_inbox(&mut self, coin_id: &str) -> bool {
+        let before = self.inbox.len();
+        self.inbox.retain(|k| k.coin_id != coin_id);
+        before != self.inbox.len()
     }
 
     /// Forget what the chain no longer honours at `peak` (an AGREED peak: this
@@ -385,12 +467,56 @@ mod tests {
         assert!(!book.knocked_this_era("G", 3), "another host is another knock");
         assert_eq!(book.pending_sent().iter().map(|k| k.coin_id.as_str()).collect::<Vec<_>>(), vec!["c1"]);
         assert!(book.confirm_sent("c1", "ab", 96_800));
-        assert!(!book.confirm_sent("c1", "ab", 96_900), "confirmed once");
+        assert!(!book.confirm_sent("c1", "ab", 96_800), "the same height again changes nothing");
         assert!(book.pending_sent().is_empty());
         assert_eq!(book.sent[0].last_rendezvous, 96_800, "the clock starts at the confirmation");
         assert!(book.drop_sent("c1", "ab"));
         assert!(!book.drop_sent("c1", "ab"));
         assert!(!book.knocked_this_era("H", 3), "a dropped knock may be knocked again");
+    }
+
+    #[test]
+    fn a_young_confirmation_follows_the_chain_until_it_settles() {
+        // #272 review round 7: a reorganization can move or drop the block
+        // that holds a knock; until a confirmation is SETTLED_DEPTH deep both
+        // sides keep asking, and their clocks follow the chain.
+        let mut book = KnockBook::default();
+        book.record_sent(sent("H", 3, "c1", 100));
+        assert_eq!(book.unsettled_sent(None).len(), 1, "a pending knock is always judged");
+        assert!(book.confirm_sent("c1", "ab", 1000));
+        assert!(book.unsettled_sent(None).is_empty(), "no agreed peak: a confirmed knock is left as it is");
+        assert_eq!(book.unsettled_sent(Some(1000 + SETTLED_DEPTH - 1)).len(), 1, "young: judged again");
+        assert!(book.unsettled_sent(Some(1000 + SETTLED_DEPTH)).is_empty(), "settled: final");
+        assert!(!book.confirm_sent("c1", "ab", 1000), "the same height again changes nothing");
+        assert!(book.confirm_sent("c1", "ab", 1002), "moved to another block: the clock follows");
+        assert_eq!((book.sent[0].confirmed_height, book.sent[0].last_rendezvous), (1002, 1002));
+        let due = book.due_dialbacks(1012);
+        assert_eq!(due.len(), 1);
+        assert!(book.mark_dialed(&due[0], 1012));
+        assert!(book.confirm_sent("c1", "ab", 1003), "moved again after a dial-back");
+        assert_eq!((book.sent[0].confirmed_height, book.sent[0].last_rendezvous), (1003, 1012), "the boundary dialed stays dialed");
+        assert!(book.due_dialbacks(1012).is_empty());
+        assert!(!book.due_dialbacks(1013).is_empty(), "the new schedule's first boundary above the last plan: 1003 + 10");
+        assert!(book.unconfirm_sent("c1", "ab"), "the block is gone: pending again");
+        assert!(!book.unconfirm_sent("c1", "ab"));
+        assert_eq!(book.pending_sent().len(), 1);
+        assert!(book.due_dialbacks(2000).is_empty(), "nobody is dialed for a knock off the chain");
+        assert!(book.knocked_this_era("H", 3), "it may yet land: no second knock this era");
+        assert!(book.confirm_sent("c1", "ab", 1005), "landed again");
+        assert_eq!((book.sent[0].confirmed_height, book.sent[0].last_rendezvous), (1005, 1005));
+        // The host's side.
+        let read = |height: u32| InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: height, coin_id: "k1".into(), last_rendezvous: height };
+        assert!(book.record_inbox(read(2000)));
+        assert_eq!(book.unsettled_inbox(2000 + SETTLED_DEPTH - 1).len(), 1);
+        assert!(book.unsettled_inbox(2000 + SETTLED_DEPTH).is_empty());
+        assert!(!book.reclock_inbox("k1", 2000));
+        assert!(book.reclock_inbox("k1", 2002));
+        assert_eq!((book.inbox[0].confirmed_height, book.inbox[0].last_rendezvous), (2002, 2002));
+        assert!(!book.reclock_inbox("zz", 5), "an unknown coin moves nothing");
+        assert!(book.drop_inbox("k1"));
+        assert!(!book.drop_inbox("k1"));
+        assert!(book.inbox.is_empty());
+        assert!(book.record_inbox(read(2004)), "listed again once it landed anew: filed afresh");
     }
 
     #[test]

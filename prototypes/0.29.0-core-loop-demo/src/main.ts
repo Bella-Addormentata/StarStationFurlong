@@ -26,6 +26,7 @@ import {
   readShareCard,
   roomIsPublicSpace,
   roomPostureProbe,
+  routeHint,
   setChiaMode,
   setShareCard,
   type PostureSources,
@@ -2455,10 +2456,16 @@ async function joinRoomAtEpoch(
     });
     // Contacts (keyed identity §8): our card embeds our node reachability (the
     // same local hint passes carry) so a friend can dial us for a DM / mesh link.
+    // #231 P6b: the ROUTE alone, never our node's contact card (#272 review
+    // round 7): a personal card goes wherever the player pastes it and, with
+    // consent, on through friend-of-friend introductions, outside any room;
+    // our card rides only in a private room's pass, by that room's switch.
     initContacts({
       myName: () => getPlayerName(),
-      myHints: () =>
-        localFingerprint ? getLocalNodeHint(localFingerprint) : null,
+      myHints: () => {
+        const hint = localFingerprint ? getLocalNodeHint(localFingerprint) : null;
+        return hint ? routeHint(hint) : null;
+      },
     });
     initDirectMessages({
       resolve: resolveBridgeBootstrap,
