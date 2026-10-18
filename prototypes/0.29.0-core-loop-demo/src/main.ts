@@ -613,10 +613,12 @@ const networkProvider = new NetworkProvider();
  *  bound, or null between a leave and the next join's binds (see the N8 probe
  *  below: until this names a room, that room's passage is unknown → PUBLIC). */
 let doorDocsBoundFor: string | null = null;
-/** 🛰️ Did this join seed the room's replica from a copy this install kept (the
- *  cached snapshot, or a warm neighbour's)? Then its door documents describe
- *  the room as last seen, and the posture probe may read them before the
- *  host's state arrives (#272 review round 4). Reset with `doorDocsBoundFor`. */
+/** 🛰️ Did this join seed the room's replica from a copy this install kept that
+ *  HELD the room's state (a cached snapshot taken while synced, or a warm
+ *  neighbour's synced replica)? Then its door documents describe the room as
+ *  last seen, and the posture probe may read them before the host's state
+ *  arrives (#272 review round 4). A cached copy of a visit the host never
+ *  answered does not count (round 5). Reset with `doorDocsBoundFor`. */
 let roomReplicaSeeded = false;
 
 function roomPassageIsPublic(): boolean {
@@ -2009,10 +2011,14 @@ async function joinRoomAtEpoch(
   // and an owned room's cached `owner` suppresses the claimRoomDefaults
   // rename-revert race. CRDT idempotence makes any interleaving safe; a corrupt
   // blob is discarded inside restoreRoomSnapshot (degrades to today's no-cache).
-  const restoredFromCache = await restoreRoomSnapshot(sync.doc, boot.roomId);
+  const restored = await restoreRoomSnapshot(sync.doc, boot.roomId);
+  const restoredFromCache = restored !== null;
   // ⛓️ A kept copy is usable room state for the posture probe (#272 review
-  // round 4) — for THIS join only: a superseding join reset the flag already.
-  if (restoredFromCache && epoch === sessionEpoch) roomReplicaSeeded = true;
+  // round 4) only if it HELD the host's state when it was taken (round 5): the
+  // writer snapshots a visit the host never answered too (our own presence in
+  // an otherwise empty room), and that copy's doors are the defaults, which
+  // read PUBLIC. For THIS join only: a superseding join reset the flag already.
+  if (restored?.synced && epoch === sessionEpoch) roomReplicaSeeded = true;
   if (epoch !== sessionEpoch) {
     // Superseded during the cache read — same unwind as the post-start guard.
     const docWasDestroyed =
@@ -2077,10 +2083,19 @@ async function joinRoomAtEpoch(
   // and finally in leaveRoom, synchronously before the doc is destroyed).
   // `owned` is sampled at write time — ownership can resolve after join.
   roomCacheHandle?.detach(); // stale handle from a superseded session, if any
-  roomCacheHandle = attachRoomCache(sync.doc, boot.roomId, () =>
-    isLocalPlayerRoomOwner(
-      (sync.doc.getMap("roomInfo").get("owner") as string) || "",
-    ),
+  // 💾 Each snapshot records whether the replica HELD the host's state when it
+  // was taken (#272 review round 5): seeded from a copy that did, or the state
+  // arrived this session (`routeRoomReady`). A visit the host never answered is
+  // cached for the next join's state vector, but not believed.
+  const seededUsable = roomReplicaSeeded;
+  roomCacheHandle = attachRoomCache(
+    sync.doc,
+    boot.roomId,
+    () =>
+      isLocalPlayerRoomOwner(
+        (sync.doc.getMap("roomInfo").get("owner") as string) || "",
+      ),
+    () => seededUsable || routeRoomReady(sync, roomHostedHere(boot.roomId)),
   );
   {
     const cacheEpoch = epoch;
@@ -6501,7 +6516,10 @@ async function withBackgroundRoom<T>(
       bootRecord: () => provider!.getBootRecord(),
     });
     // NOTE: no restoreRoomSnapshot — the owner-match must see network truth.
-    cache = attachRoomCache(sync.doc, boot.roomId, () => true);
+    // The node hosts the maker's module, so its first answer is the room's
+    // state (`routeRoomReady` with hostedHere).
+    const maker = sync;
+    cache = attachRoomCache(sync.doc, boot.roomId, () => true, () => routeRoomReady(maker, true));
     await sync.start();
     // Converge with the node (which hosts the maker's module), then ALWAYS
     // pull once more and wait — the first SyncStep2 can reflect a partially

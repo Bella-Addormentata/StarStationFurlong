@@ -1283,16 +1283,21 @@ pub struct MemoWrite {
 /// retry for a spend the mempool DROPPED, so a pending one waits for
 /// reconciliation's verdict (the heartbeat tries again on its retry cadence).
 async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &str) -> Result<MemoWrite> {
-    publish_memo_with(payer, hint, move |_| Ok(body), what).await
+    publish_memo_with(payer, hint, None, move |_| Ok(body), what).await
 }
 
 /// [`publish_memo`] whose body is built once the INPUT coin is chosen: `body`
 /// gets the input's id — the parent of the coin the memo will ride on — so a
 /// knock can bind its sealing to it ([`chia_lane::seal_to_kx`], #272 review
-/// round 3).
+/// round 3). With a `gate`, `body` runs and the spend is pushed UNDER it: a
+/// knock's authorization is read again there, after the lease and coin
+/// lookups, so a room's word that changed while the spend was prepared is seen
+/// (`body` answers [`Withdrawn`]) and no cap can land between that check and
+/// the push — the card gate's own contract (#272 review round 5).
 async fn publish_memo_with(
     payer: &SecretKey,
     hint: Bytes32,
+    gate: Option<&tokio::sync::Mutex<()>>,
     body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
     what: &str,
 ) -> Result<MemoWrite> {
@@ -1308,6 +1313,10 @@ async fn publish_memo_with(
         .await?
         .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
     let input = coin.coin.coin_id();
+    let _gate = match gate {
+        Some(gate) => Some(gate.lock().await),
+        None => None,
+    };
     let body = body(input)?;
     let bundle = build_publish_bundle(payer, coin.coin, hint, Bytes::new(body))?;
     match push_parked(&client, bundle, [(input, coin.confirmed_height)]).await {
@@ -1454,40 +1463,80 @@ pub async fn lease_words(client: &impl ChainAccess, coins: &[Bytes32]) -> HashMa
     coins.iter().map(|c| (*c, WALLET_LEASE.lease_word(c))).collect()
 }
 
-/// Write one knock for `req`: the knocker's node id, its contact key when it
-/// is findable (so the host can read its presence and dial it there) and the
-/// room's lane id, signed (iroh key), sealed to the host's card key, filed
-/// under the host's inbox hint for the room's lane. Returns the hint and the
-/// write ([`MemoWrite`]: the input coin the knock is found again by).
+/// Why a knock was not written after all (#272 review round 5): what allowed
+/// it when it was queued no longer holds at SPEND time. Told apart from a
+/// failure by the publisher, which drops the request instead of retrying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Withdrawn(pub &'static str);
+
+impl std::fmt::Display for Withdrawn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Withdrawn {}
+
+/// What a knock on a room's host may leave with, decided at SPEND time from
+/// the room's LIVE cap (#272 review round 5): nothing, when the room no longer
+/// uses cards (gone public, its switch off, the cap gone) or the two linked
+/// meanwhile; otherwise a knock, carrying our contact key only where our card
+/// may be handed out at all ([`ChiaRoomCap::hands_out_own_card`]).
+pub fn knock_leave(
+    cap: Option<&ChiaRoomCap>,
+    linked: bool,
+    key_durable: bool,
+    share_enabled: bool,
+    contact_key: &[u8; 32],
+) -> Result<Option<[u8; 32]>, Withdrawn> {
+    let Some(cap) = cap.filter(|c| c.may_use_cards()) else {
+        return Err(Withdrawn("the room no longer uses cards"));
+    };
+    if linked {
+        return Err(Withdrawn("the two are linked meanwhile"));
+    }
+    Ok(cap.hands_out_own_card(key_durable, share_enabled).then_some(*contact_key))
+}
+
+/// Write one knock for `req`: the knocker's node id, its contact key when
+/// `leave` hands one out (so the host can read its presence and dial it there)
+/// and the room's lane id, signed (iroh key), sealed to the host's card key
+/// WITH the room's secret lane token, filed under the host's inbox hint for
+/// that lane. `leave` is asked under `gate` once the input coin is chosen,
+/// after the lease and coin lookups (#272 review round 5): its answer is the
+/// room's word at spend time, and [`Withdrawn`] writes nothing. Returns the
+/// hint and the write ([`MemoWrite`]: the input coin the knock is found again
+/// by).
 pub async fn publish_knock(
     iroh_sk: &iroh::SecretKey,
     chia_sk: &SecretKey,
-    own_ck: Option<&[u8; 32]>,
+    gate: &tokio::sync::Mutex<()>,
+    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
     req: &KnockRequest,
     room_key: &[u8; 32],
     era: u64,
     now: u64,
 ) -> Result<(Bytes32, MemoWrite)> {
-    let knock = KnockV2 {
-        era,
-        from: iroh_sk.public(),
-        ck_from: own_ck.copied(),
-        issued_at: now,
-        expires_at: now + 2 * ERA_SECS,
-        rooms: vec![chia_lane::room_lane_id(&req.room)],
-    };
-    let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
     let lane = chia_lane::derive_lane_token(room_key);
     let hint = Bytes32::new(chia_lane::derive_inbox_hint(&req.ck_host, &lane, era));
-    // Sealed once the input coin is known: its id is the parent of the coin
-    // the knock rides on, and the sealing binds it, so the host opens the
-    // knock under that coin alone — a copy under another never decodes
-    // (#272 review round 3).
+    let lane_id = chia_lane::room_lane_id(&req.room);
+    let from = iroh_sk.public();
+    // Built and sealed once the input coin is known: its id is the parent of
+    // the coin the knock rides on, and the sealing binds it (so the host opens
+    // the knock under that coin alone — a copy under another never decodes,
+    // #272 review round 3) and the lane token (so only a holder of the room
+    // key can have written it, round 5).
     let kx_host = req.kx_host;
     let write = publish_memo_with(
         chia_sk,
         hint,
-        move |input| chia_lane::seal_to_kx(&kx_host, KIND_KNOCK, era, &input.to_bytes(), &plain),
+        Some(gate),
+        move |input| {
+            let ck_from = leave()?;
+            let knock = KnockV2 { era, from, ck_from, issued_at: now, expires_at: now + 2 * ERA_SECS, rooms: vec![lane_id] };
+            let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
+            chia_lane::seal_to_kx(&kx_host, KIND_KNOCK, era, &input.to_bytes(), &lane, &plain)
+        },
         "knock",
     )
     .await?;
@@ -1702,17 +1751,28 @@ pub async fn heartbeat_loop(
                 if req.host.parse::<iroh::PublicKey>().is_ok_and(|pk| crate::linked_in_room(&hub, &req.room, &pk)) {
                     continue;
                 }
-                break Some((req, cap.room_key, cap.hands_out_own_card(hub.contact_key_durable, crate::chia_contact::share_card_enabled())));
+                break Some((req, cap.room_key));
             };
-            if let Some((mut req, room_key, with_key)) = next {
-                // Our contact key rides in the knock only where our card may be
-                // handed out at all (#272 review round 4): the node's own Share
-                // Card switch on, a durable key, and the room KNOWN private — a
-                // private pass's word admits its cards, not ours. A bare knock
-                // still names our node id, which the host dials back through
-                // the DHT.
-                let own_ck = with_key.then_some(&hub.contact_key);
-                match publish_knock(&iroh_sk, &chia_sk, own_ck, &req, &room_key, era, now_unix).await {
+            if let Some((mut req, room_key)) = next {
+                // The room's word is read AGAIN at spend time, under the card
+                // gate, after the lease and coin lookups (#272 review round 5):
+                // a cap turning the room public or its switch off meanwhile
+                // withdraws the knock, and our contact key rides in it only
+                // where our card may be handed out at all (round 4: the node's
+                // own Share Card switch on, a durable key, the room KNOWN
+                // private — a private pass's word admits its cards, not ours).
+                // A bare knock still names our node id, which the host dials
+                // back through the DHT.
+                let leave = {
+                    let hub = hub.clone();
+                    let (room, host) = (req.room.clone(), req.host.clone());
+                    move || {
+                        let cap = hub.chia_rooms.lock().unwrap().get(&room).cloned();
+                        let linked = host.parse::<iroh::PublicKey>().is_ok_and(|pk| crate::linked_in_room(&hub, &room, &pk));
+                        knock_leave(cap.as_ref(), linked, hub.contact_key_durable, crate::chia_contact::share_card_enabled(), &hub.contact_key)
+                    }
+                };
+                match publish_knock(&iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await {
                     Ok((hint, write)) => {
                         let hint_hex = hex::encode(hint.to_bytes());
                         println!(
@@ -1742,6 +1802,13 @@ pub async fn heartbeat_loop(
                         if let Err(e) = book.save(knocks_path) {
                             eprintln!("⛓️ ChiaHub knock: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
                         }
+                    }
+                    Err(e) if e.downcast_ref::<Withdrawn>().is_some() => {
+                        println!(
+                            "⛓️ ChiaHub knock: not knocking on {} for room {} — {e} (the room's word changed while the spend was prepared)",
+                            short(&req.host),
+                            req.room
+                        );
                     }
                     Err(e) => {
                         req.attempts = req.attempts.saturating_add(1);
@@ -1965,6 +2032,27 @@ mod tests {
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
         ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false, pass_private: false }
+    }
+
+    #[test]
+    fn a_knock_leaves_on_the_rooms_word_at_spend_time() {
+        // #272 review round 5: the word read when the knock was queued may be
+        // stale by the time the lease and coin lookups are done; the spend
+        // asks again, and a withdrawn knock is not a failed one.
+        let ck = [7u8; 32];
+        let private = cap(1, false, Some(false));
+        assert_eq!(knock_leave(Some(&private), false, true, true, &ck), Ok(Some(ck)), "known private, sharing: the key rides");
+        assert_eq!(knock_leave(Some(&private), false, false, true, &ck), Ok(None), "a key not kept across restarts: a bare knock");
+        assert_eq!(knock_leave(Some(&private), false, true, false, &ck), Ok(None), "the node's own switch off: a bare knock");
+        let first_visit = ChiaRoomCap { public_room: None, pass_private: true, ..private.clone() };
+        assert_eq!(knock_leave(Some(&first_visit), false, true, true, &ck), Ok(None), "a private pass admits its cards, not ours: bare");
+        let gone = Err(Withdrawn("the room no longer uses cards"));
+        assert_eq!(knock_leave(Some(&ChiaRoomCap { public_room: Some(true), ..private.clone() }), false, true, true, &ck), gone, "gone public meanwhile");
+        assert_eq!(knock_leave(Some(&ChiaRoomCap { share_card: false, ..private.clone() }), false, true, true, &ck), gone, "its switch turned off meanwhile");
+        assert_eq!(knock_leave(None, false, true, true, &ck), gone, "the cap gone");
+        assert_eq!(knock_leave(Some(&private), true, true, true, &ck), Err(Withdrawn("the two are linked meanwhile")));
+        let err: anyhow::Error = Withdrawn("x").into();
+        assert!(err.downcast_ref::<Withdrawn>().is_some(), "the publisher tells a withdrawn knock from a failed one");
     }
 
     #[test]

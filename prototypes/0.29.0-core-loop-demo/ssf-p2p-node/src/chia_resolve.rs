@@ -440,13 +440,15 @@ pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
 /// Open one knock ciphertext read under our inbox hint for `era`: sealed to
 /// our card key UNDER the coin that carried it (`carrier_parent`, the coin's
 /// parent — a copy of the blob under another coin does not open, #272 review
-/// round 3), signed by its knocker, filed in its own era, not expired, not
+/// round 3) and WITH the room's secret lane token (`lane`: a writer without the
+/// room key cannot seal one, round 5), signed by its knocker, filed in its own era, not expired, not
 /// from the far future, and naming `lane_id` (the room the hint was read for)
 /// among its rooms. `None` for anything else.
 pub fn decode_knock_for(
     kx_secret: &[u8; 32],
     ciphertext: &[u8],
     carrier_parent: &[u8; 32],
+    lane: &[u8; 32],
     era: u64,
     confirmed_height: u32,
     now: u64,
@@ -455,7 +457,7 @@ pub fn decode_knock_for(
     if chia_lane::era_of(confirmed_height) != era {
         return None;
     }
-    let plain = chia_lane::open_with_kx(kx_secret, chia_lane::KIND_KNOCK, era, carrier_parent, ciphertext).ok()?;
+    let plain = chia_lane::open_with_kx(kx_secret, chia_lane::KIND_KNOCK, era, carrier_parent, lane, ciphertext).ok()?;
     let knock = chia_lane::decode_knock_v2(&plain, era).ok()?;
     if knock.expires_at < now || knock.issued_at > now.saturating_add(MAX_FUTURE_SKEW_V2_SECS) {
         return None;
@@ -485,7 +487,7 @@ pub async fn read_inbox(
         let hint = chia_lane::derive_inbox_hint(own_ck, &lane, era);
         let cursor = cursors.entry(hint).or_default();
         let before = cursor.clone();
-        let opener = |ct: &[u8], parent: Bytes32, height: u32| decode_knock_for(kx_secret, ct, &parent.to_bytes(), era, height, now, &lane_id);
+        let opener = |ct: &[u8], parent: Bytes32, height: u32| decode_knock_for(kx_secret, ct, &parent.to_bytes(), &lane, era, height, now, &lane_id);
         match read_hint_items(client, Bytes32::new(hint), cursor, &opener).await {
             Ok(items) => {
                 any_ok = true;
@@ -891,6 +893,7 @@ mod tests {
         let height = 7 * chia_lane::ERA_BLOCKS + 5;
         let now = 1_000u64;
         let lane = chia_lane::room_lane_id("r");
+        let lane_token = chia_lane::derive_lane_token(&[9u8; 32]); // the room's secret lane token
         let knock = chia_lane::KnockV2 {
             era,
             from: knocker.public(),
@@ -901,11 +904,48 @@ mod tests {
         };
         let plain = chia_lane::encode_knock_v2(&knock, &knocker).unwrap();
         let input = [5u8; 32];
-        let sealed = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &plain).unwrap();
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, era, height, now, &lane), Some(knock), "under its own coin: the knock");
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &[6u8; 32], era, height, now, &lane), None, "the same blob under a copier's coin: nothing");
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, era, height + chia_lane::ERA_BLOCKS, now, &lane), None, "outside its era");
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, era, height, now, &chia_lane::room_lane_id("s")), None, "another room");
+        let sealed = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &lane_token, &plain).unwrap();
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, &lane_token, era, height, now, &lane), Some(knock), "under its own coin: the knock");
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &[6u8; 32], &lane_token, era, height, now, &lane), None, "the same blob under a copier's coin: nothing");
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, &lane_token, era, height + chia_lane::ERA_BLOCKS, now, &lane), None, "outside its era");
+        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, &lane_token, era, height, now, &chia_lane::room_lane_id("s")), None, "another room");
+    }
+
+    #[test]
+    fn a_knock_sealed_without_the_rooms_key_does_not_open_under_its_hint() {
+        // #272 review round 5: the inbox hint is public on chain and the host's
+        // card key rides in every room's pass, so a holder of the host's card
+        // from ANOTHER room, knowing this room's id, could seal fresh knocks of
+        // its own under an observed hint. The sealing binds the room's secret
+        // lane token (derived from the room key), which that writer lacks.
+        let knocker = iroh::SecretKey::generate();
+        let host_sk = [11u8; 32];
+        let host_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(host_sk).to_bytes();
+        let era = 7u64;
+        let height = 7 * chia_lane::ERA_BLOCKS + 5;
+        let now = 1_000u64;
+        let lane_id = chia_lane::room_lane_id("r");
+        let lane_token = chia_lane::derive_lane_token(&[9u8; 32]);
+        let knock = chia_lane::KnockV2 {
+            era,
+            from: knocker.public(),
+            ck_from: None,
+            issued_at: now,
+            expires_at: now + 2 * chia_lane::ERA_SECS,
+            rooms: vec![lane_id],
+        };
+        let plain = chia_lane::encode_knock_v2(&knock, &knocker).unwrap();
+        let input = [5u8; 32];
+        for stranger in [chia_lane::derive_lane_token(&[10u8; 32]), [0u8; 32]] {
+            let forged = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &stranger, &plain).unwrap();
+            assert_eq!(
+                decode_knock_for(&host_sk, &forged, &input, &lane_token, era, height, now, &lane_id),
+                None,
+                "sealed with another room's lane, or none: not a knock on this room, under the right hint or not"
+            );
+        }
+        let genuine = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &lane_token, &plain).unwrap();
+        assert_eq!(decode_knock_for(&host_sk, &genuine, &input, &lane_token, era, height, now, &lane_id), Some(knock));
     }
 
     fn sealed_record(room_key: &[u8; 32], sk: &iroh::SecretKey, issued_at: u64, expires_at: u64) -> Vec<u8> {

@@ -279,11 +279,17 @@ fn v2_aad(kind: u8, era: u64) -> Vec<u8> {
 /// spend is built. A blob copied under another coin (anyone who saw it on
 /// chain can re-issue the same hint and memo) has another parent and does not
 /// open, so a knock cannot be replayed into a second clock or a second inbox
-/// entry (#272 review round 3).
+/// entry (#272 review round 3). And `lane`, the room's SECRET lane token
+/// ([`derive_lane_token`], from the room key): the hint is public on chain and
+/// the host's card key rides in every room's pass, so without it anyone holding
+/// the host's card from another room could seal fresh knocks of its own under
+/// an observed hint; with it a knock opens only for a writer who held the room
+/// key (#272 review round 5).
 #[cfg(feature = "chia-read")]
-fn kx_aad(kind: u8, era: u64, carrier_parent: &[u8; 32]) -> Vec<u8> {
+fn kx_aad(kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32]) -> Vec<u8> {
     let mut aad = v2_aad(kind, era);
     aad.extend_from_slice(carrier_parent);
+    aad.extend_from_slice(lane);
     aad
 }
 
@@ -693,14 +699,16 @@ pub const KX_SEAL_OVERHEAD: usize = 32 + 24 + 16;
 /// Seal `plaintext` to the holder of the X25519 secret behind `recipient_pk`
 /// (a host's card key): an ephemeral X25519 key agrees a shared secret, the
 /// XChaCha20-Poly1305 key is derived from it together with both public keys,
-/// and kind ‖ era ‖ `carrier_parent` bind as associated data ([`kx_aad`]: the
-/// parent of the coin the blob will ride on, so a copy under another coin
-/// never opens). Blob: `[32B ephemeral pk ‖ 24B nonce ‖ ciphertext]`. Every
-/// holder of the host's contact key can find the hint this lands under; only
-/// the host opens it, and only under the coin it was written by.
+/// and kind ‖ era ‖ `carrier_parent` ‖ `lane` bind as associated data
+/// ([`kx_aad`]: the parent of the coin the blob will ride on, so a copy under
+/// another coin never opens, and the room's secret lane token, so only a holder
+/// of the room key can have written it). Blob: `[32B ephemeral pk ‖ 24B nonce ‖
+/// ciphertext]`. Every holder of the host's contact key can find the hint this
+/// lands under; only the host opens it, only under the coin it was written by,
+/// and only for the room whose lane it was sealed with.
 #[cfg(feature = "chia-read")]
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
     let mut e_sk = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut e_sk);
@@ -709,7 +717,7 @@ pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &
     let cipher = XChaCha20Poly1305::new((&key).into());
     let mut nonce = [0u8; 24];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let aad = kx_aad(kind, era, carrier_parent);
+    let aad = kx_aad(kind, era, carrier_parent, lane);
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
         .map_err(|e| anyhow!("seal_to_kx failed: {e:?}"))?;
@@ -721,11 +729,13 @@ pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &
 }
 
 /// Open a blob [`seal_to_kx`] made for the holder of `recipient_sk`, for
-/// `kind` in `era`, read from a coin whose parent is `carrier_parent`. Fails
-/// on another recipient, a tampered blob, or a blob sealed for another kind,
-/// era or carrier (a copy under a new coin, #272 review round 3).
+/// `kind` in `era`, read from a coin whose parent is `carrier_parent`, for the
+/// room whose secret lane token is `lane`. Fails on another recipient, a
+/// tampered blob, or a blob sealed for another kind, era, carrier (a copy under
+/// a new coin, #272 review round 3) or lane (a writer without the room key,
+/// round 5).
 #[cfg(feature = "chia-read")]
-pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
     if sealed.len() < KX_SEAL_OVERHEAD {
         return Err(anyhow!("sealed-to-key blob too short"));
@@ -734,10 +744,10 @@ pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, carrier_parent:
     let recipient_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(*recipient_sk).to_bytes();
     let key = kx_seal_key(&kx_shared(recipient_sk, &e_pk)?, &e_pk, &recipient_pk);
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let aad = kx_aad(kind, era, carrier_parent);
+    let aad = kx_aad(kind, era, carrier_parent, lane);
     cipher
         .decrypt(XNonce::from_slice(&sealed[32..56]), Payload { msg: &sealed[56..], aad: &aad })
-        .map_err(|e| anyhow!("open_with_kx failed (not sealed to this key, kind, era or carrier coin?): {e:?}"))
+        .map_err(|e| anyhow!("open_with_kx failed (not sealed to this key, kind, era, carrier coin or room lane?): {e:?}"))
 }
 
 /// X25519: our secret × their public point. An all-zero result (their point
@@ -850,25 +860,30 @@ mod p6b_tests {
         let host_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(host_sk).to_bytes();
         let plain = [0x42u8; RECORD_V2_LEN];
         let carrier = [5u8; 32]; // the writer's input coin: the parent of the coin the blob rides on
-        let blob = seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &plain).unwrap();
+        let lane = derive_lane_token(&[3u8; 32]); // the room's secret lane token
+        let blob = seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap();
         assert_eq!(blob.len(), RECORD_V2_LEN + KX_SEAL_OVERHEAD);
-        assert_eq!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &blob).unwrap(), plain.to_vec());
-        assert!(open_with_kx(&[12u8; 32], KIND_KNOCK, 7, &carrier, &blob).is_err(), "another key");
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 8, &carrier, &blob).is_err(), "another era");
-        assert!(open_with_kx(&host_sk, KIND_BEACON, 7, &carrier, &blob).is_err(), "another kind");
+        assert_eq!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob).unwrap(), plain.to_vec());
+        assert!(open_with_kx(&[12u8; 32], KIND_KNOCK, 7, &carrier, &lane, &blob).is_err(), "another key");
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 8, &carrier, &lane, &blob).is_err(), "another era");
+        assert!(open_with_kx(&host_sk, KIND_BEACON, 7, &carrier, &lane, &blob).is_err(), "another kind");
         let mut tampered = blob.clone();
         *tampered.last_mut().unwrap() ^= 1;
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &tampered).is_err());
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &tampered).is_err());
         let mut readdressed = blob.clone();
         readdressed[0] ^= 1;
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &readdressed).is_err(), "the ephemeral key is bound in");
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &readdressed).is_err(), "the ephemeral key is bound in");
         assert!(
-            open_with_kx(&host_sk, KIND_KNOCK, 7, &[6u8; 32], &blob).is_err(),
+            open_with_kx(&host_sk, KIND_KNOCK, 7, &[6u8; 32], &lane, &blob).is_err(),
             "another carrier: the same blob copied under a coin with another parent does not open (#272 review round 3)"
         );
-        assert_ne!(seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &plain).unwrap(), blob, "fresh key and nonce every time");
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &blob[..KX_SEAL_OVERHEAD - 1]).is_err(), "too short");
-        assert!(seal_to_kx(&[0u8; 32], KIND_KNOCK, 7, &carrier, &plain).is_err(), "a low-order recipient point is refused");
+        assert!(
+            open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &derive_lane_token(&[4u8; 32]), &blob).is_err(),
+            "another room's lane: a blob sealed without this room's key does not open (#272 review round 5)"
+        );
+        assert_ne!(seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap(), blob, "fresh key and nonce every time");
+        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob[..KX_SEAL_OVERHEAD - 1]).is_err(), "too short");
+        assert!(seal_to_kx(&[0u8; 32], KIND_KNOCK, 7, &carrier, &lane, &plain).is_err(), "a low-order recipient point is refused");
     }
 
     #[test]
