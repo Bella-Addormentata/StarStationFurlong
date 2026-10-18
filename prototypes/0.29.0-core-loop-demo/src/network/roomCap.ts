@@ -125,22 +125,42 @@ export function contactCardSignBytes(card: Pick<ContactCard, 'nodeId' | 'ck' | '
  *  after it (`newerCard`), and the passes minted here would carry a card
  *  every recipient rejects. */
 export function verifyContactCard(card: ContactCard): boolean {
+  // Every hint's card is verified as it is normalized (round 16), and a pass
+  // is decoded many times over a session, so each distinct card is checked
+  // once: a signature does not change its mind.
+  const key = `${card.nodeId}\n${card.ck}\n${card.kxPk}\n${card.issuedAt}\n${card.sig}`;
+  const known = verifiedCards.get(key);
+  if (known !== undefined) return known;
+  let ok = false;
   try {
-    if (!/^[0-9a-f]{64}$/i.test(card.nodeId) || !/^[0-9a-f]{128}$/i.test(card.sig)) return false;
-    return ed.verify(ed.etc.hexToBytes(card.sig), contactCardSignBytes(card), ed.etc.hexToBytes(card.nodeId));
+    ok = /^[0-9a-f]{64}$/i.test(card.nodeId) && /^[0-9a-f]{128}$/i.test(card.sig)
+      && ed.verify(ed.etc.hexToBytes(card.sig), contactCardSignBytes(card), ed.etc.hexToBytes(card.nodeId));
   } catch {
-    return false;
+    ok = false;
   }
+  if (verifiedCards.size >= VERIFIED_CARDS_KEPT) verifiedCards.delete(verifiedCards.keys().next().value!);
+  verifiedCards.set(key, ok);
+  return ok;
 }
+
+/** Verdicts on cards seen this session, oldest out first. */
+const VERIFIED_CARDS_KEPT = 512;
+const verifiedCards = new Map<string, boolean>();
 
 /** #231 P6b (#272 review round 15): the card to hold once `incoming` arrived
  *  over the `card` lane — `incoming`, when it names `nodeId` (the node we are
- *  connected to), its signature verifies and it is at least as new as `held`;
- *  otherwise `held`, unchanged. */
+ *  connected to), its signature verifies and it is at least as new as the card
+ *  held FOR THAT NODE; otherwise `held`, unchanged. The slot is one per
+ *  browser, not per node (round 16): after a switch of nodes it still holds
+ *  the previous node's card, and dates compare only between cards of one
+ *  node — a card held for another node yields whatever its date, else
+ *  `getLocalNodeHint` would leave it out and every pass minted here would go
+ *  without our card. */
 export function acceptNodeCard(held: ContactCard | null, incoming: unknown, nodeId: string | null | undefined): ContactCard | null {
   const card = normalizeContactCard(incoming);
   if (!card || !nodeId || card.nodeId !== nodeId || !verifyContactCard(card)) return held;
-  return newerCard(held ?? undefined, card) ?? card;
+  const ours = held && held.nodeId === nodeId ? held : undefined;
+  return newerCard(ours, card) ?? card;
 }
 
 /** Of two cards for one node, the one issued later (a rotated key wins). */
@@ -231,8 +251,14 @@ export function normalizeStringArray(value: unknown): string[] {
 }
 
 /** A member hint as a pass or a room doc may spell it: a node id, its routes,
- *  and (#231 P6b) its card only when the card names this very node — the node
- *  checks the signature; a card for another node is noise here. */
+ *  and (#231 P6b) its card only when the card names this very node AND its
+ *  signature verifies (#272 review round 16). The node checks every card it is
+ *  handed too, but hints MERGE before that, the newer card of two standing
+ *  (`mergeMemberHints`): a pass carrying a forged card for a member, dated at
+ *  the end of time, would otherwise displace that member's genuine card in
+ *  every pass minted from it — our own card, verified off the `card` lane,
+ *  among them — and every recipient would reject the forgery and lose the way
+ *  to knock. The route stays whatever the card. */
 export function normalizeMemberHint(value: unknown): RoomMemberHint | null {
   if (!value || typeof value !== 'object') return null;
   const entry = value as Record<string, unknown>;
@@ -246,7 +272,7 @@ export function normalizeMemberHint(value: unknown): RoomMemberHint | null {
     irohNodeId: entry.irohNodeId,
     irohRelayUrls: relayHints.length ? relayHints : undefined,
     irohDirectAddrs: directHints.length ? directHints : undefined,
-    nodeCard: card && card.nodeId === entry.irohNodeId ? card : undefined,
+    nodeCard: card && card.nodeId === entry.irohNodeId && verifyContactCard(card) ? card : undefined,
   };
 }
 
@@ -274,7 +300,8 @@ export function collectMemberHints(boot: RoomBootstrap | null | undefined): Room
 }
 
 /** One hint per node: routes unioned, and of two cards for one node the
- *  newer stands (#231 P6b). */
+ *  newer stands (#231 P6b) — every card here verified where its hint was
+ *  normalized or kept (`normalizeMemberHint`, `acceptNodeCard`). */
 export function mergeMemberHints(...hintLists: RoomMemberHint[][]): RoomMemberHint[] {
   const merged = new Map<string, RoomMemberHint>();
   for (const list of hintLists) {

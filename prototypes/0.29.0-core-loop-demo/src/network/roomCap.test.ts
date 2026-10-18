@@ -9,15 +9,18 @@ import {
   bridgeMemberHints,
   buildRoomCapPayload,
   cardsForPass,
+  collectMemberHints,
   contactCardSignBytes,
   forgetSessionFlags,
   latin1Json,
   seedWithoutCards,
   memberCardsOf,
+  mergeMemberHints,
   newerCard,
   nextCapSeq,
   nodeSharesCard,
   normalizeContactCard,
+  normalizeMemberHint,
   passageReading,
   readChiaMode,
   readNodeCard,
@@ -33,6 +36,20 @@ import {
 } from './roomCap';
 
 const card = (nodeId: string, issuedAt = 100) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt, sig: 'ff' });
+
+// A node per name, its id the hex Ed25519 key, and cards it signs (round 16:
+// a hint's card rides only verified, so the merge fixtures are signed).
+const keyOf = new Map<string, Uint8Array>();
+const nodeOf = (name: string) => {
+  let sk = keyOf.get(name);
+  if (!sk) { sk = ed.utils.randomPrivateKey(); keyOf.set(name, sk); }
+  return ed.etc.bytesToHex(ed.getPublicKey(sk));
+};
+const ck32 = (b: number) => btoa(String.fromCharCode(...new Uint8Array(32).fill(b)));
+const signed = (name: string, issuedAt = 100, ckByte = 7) => {
+  const c = { nodeId: nodeOf(name), ck: ck32(ckByte), kxPk: 'ab'.repeat(32), issuedAt };
+  return { ...c, sig: ed.etc.bytesToHex(ed.sign(contactCardSignBytes(c), keyOf.get(name)!)) };
+};
 
 describe('room cap payload (N8 / D3)', () => {
   it('carries the key, both flags coerced to booleans, and the sequence number', () => {
@@ -367,30 +384,58 @@ describe('room cap payload (N8 / D3)', () => {
   });
 
   it('P6b: a bridged join adds our route to a pass, never our card, so a cardless public pass stays cardless (review round 14)', () => {
+    const me = nodeOf('me'), host = nodeOf('host');
     // Standing in private room A with Share Card on: our default bootstrap carries our card.
     const local = {
       v: 2 as const, roomId: 'A', roomKeyB64: 'a2V5', wtUrl: 'https://127.0.0.1:4443', certHashesB64: ['c'],
-      memberHints: [{ irohNodeId: 'me', irohRelayUrls: ['https://relay-a'], nodeCard: card('me') }],
-      irohNodeId: 'me', irohRelayUrls: ['https://relay-a'],
+      memberHints: [{ irohNodeId: me, irohRelayUrls: ['https://relay-a'], nodeCard: signed('me') }],
+      irohNodeId: me, irohRelayUrls: ['https://relay-a'],
     };
     // A pass to public room B carries routes alone (its minter struck the cards).
     const publicPass = {
       v: 2 as const, roomId: 'B', roomKeyB64: 'Yg==', wtUrl: 'https://127.0.0.1:4443', certHashesB64: [],
-      memberHints: [{ irohNodeId: 'host', irohRelayUrls: ['https://relay-b'] }],
+      memberHints: [{ irohNodeId: host, irohRelayUrls: ['https://relay-b'] }],
     };
     const bridged = bridgeMemberHints(publicPass, local);
-    expect(bridged).toEqual([{ irohNodeId: 'host', irohRelayUrls: ['https://relay-b'] }, { irohNodeId: 'me', irohRelayUrls: ['https://relay-a'] }]);
+    expect(bridged).toEqual([{ irohNodeId: host, irohRelayUrls: ['https://relay-b'] }, { irohNodeId: me, irohRelayUrls: ['https://relay-a'] }]);
     expect(memberCardsOf(bridged)).toEqual([]);
     // Neither the prefetch's cap nor the first cap of the join, posture unknown, calls B's pass private.
     expect(buildRoomCapPayload('Yg==', false, null, 1, true, memberCardsOf(bridged), true))
       .toEqual({ roomKeyB64: 'Yg==', chiaMode: false, publicRoom: null, seq: 1, shareCard: true, prefetch: true });
     expect(buildRoomCapPayload('Yg==', false, null, 2, true, memberCardsOf(bridged))).not.toHaveProperty('passPrivate');
     // A private pass keeps every card it carries — one for our own node included, as its minter put it there.
-    const privatePass = { ...publicPass, roomId: 'C', memberHints: [{ irohNodeId: 'host', nodeCard: card('host') }, { irohNodeId: 'me', nodeCard: card('me', 50) }] };
+    const privatePass = { ...publicPass, roomId: 'C', memberHints: [{ irohNodeId: host, nodeCard: signed('host') }, { irohNodeId: me, nodeCard: signed('me', 50) }] };
     const kept = bridgeMemberHints(privatePass, local);
-    expect(memberCardsOf(kept)).toEqual([card('host'), card('me', 50)]);
-    expect(kept.find((h) => h.irohNodeId === 'me')).toEqual({ irohNodeId: 'me', irohRelayUrls: ['https://relay-a'], nodeCard: card('me', 50) });
-    expect(buildRoomCapPayload('Yw==', false, null, 3, true, memberCardsOf(kept), true)).toMatchObject({ memberCards: [card('host'), card('me', 50)], passPrivate: true });
+    expect(memberCardsOf(kept)).toEqual([signed('host'), signed('me', 50)]);
+    expect(kept.find((h) => h.irohNodeId === me)).toEqual({ irohNodeId: me, irohRelayUrls: ['https://relay-a'], nodeCard: signed('me', 50) });
+    expect(buildRoomCapPayload('Yw==', false, null, 3, true, memberCardsOf(kept), true)).toMatchObject({ memberCards: [signed('host'), signed('me', 50)], passPrivate: true });
+  });
+
+  it("P6b: a pass's card rides only verified, so a forged card for our node never displaces the genuine one in the passes minted here (review round 16)", () => {
+    const me = nodeOf('me'), host = nodeOf('host');
+    const genuine = signed('me', 1_000);
+    // A pass whose minter put a forgery in for us: our id, the end of time, no valid signature.
+    const forged = { ...genuine, issuedAt: Number.MAX_SAFE_INTEGER, sig: 'ff'.repeat(64) };
+    const pass = {
+      v: 2 as const, roomId: 'C', roomKeyB64: 'Yw==', wtUrl: 'https://127.0.0.1:4443', certHashesB64: [],
+      memberHints: [{ irohNodeId: host, irohRelayUrls: ['https://relay-c'], nodeCard: signed('host') }, { irohNodeId: me, irohRelayUrls: ['https://relay-me'], nodeCard: forged }],
+    };
+    // Normalized, the forged card is gone and the route stays; a card naming another node goes too.
+    expect(normalizeMemberHint(pass.memberHints[1])).toEqual({ irohNodeId: me, irohRelayUrls: ['https://relay-me'] });
+    expect(normalizeMemberHint({ irohNodeId: me, nodeCard: signed('host') })).toEqual({ irohNodeId: me });
+    expect(normalizeMemberHint({ irohNodeId: host, nodeCard: signed('host') })).toEqual({ irohNodeId: host, nodeCard: signed('host') });
+    // The outgoing pass: our verified local card first, the imported hints after it (buildOutgoingBootstrap).
+    const localHint = { irohNodeId: me, irohRelayUrls: ['https://relay-a'], nodeCard: genuine };
+    const merged = mergeMemberHints([localHint], collectMemberHints(pass));
+    expect(merged.find((h) => h.irohNodeId === me)).toEqual({ irohNodeId: me, irohRelayUrls: ['https://relay-a', 'https://relay-me'], nodeCard: genuine });
+    expect(memberCardsOf(merged)).toEqual([genuine, signed('host')]);
+    // A pass carrying a NEWER genuine card for us still wins the merge: dates compare between verified cards.
+    const rotated = signed('me', 2_000, 8);
+    const newerPass = { ...pass, memberHints: [{ irohNodeId: me, nodeCard: rotated }] };
+    expect(mergeMemberHints([localHint], collectMemberHints(newerPass))[0].nodeCard).toEqual(rotated);
+    // The cache answers the same way the verification did.
+    expect(verifyContactCard(forged)).toBe(false);
+    expect(verifyContactCard(genuine)).toBe(true);
   });
 
   it("P6b: the node's own card is kept only with a valid signature by the node it names (review round 15)", () => {
@@ -418,6 +463,14 @@ describe('room cap payload (N8 / D3)', () => {
     expect(acceptNodeCard(genuine, rotated, 'ab'.repeat(32))).toEqual(genuine); // not the node we are connected to
     expect(acceptNodeCard(genuine, rotated, undefined)).toEqual(genuine);
     expect(acceptNodeCard(genuine, 'not a card', nodeId)).toEqual(genuine);
+    // Round 16: the slot still holds the PREVIOUS node's card after a switch of
+    // nodes — a genuine card of the node now connected replaces it whatever
+    // the dates, equal or older included; dates compare within one node only.
+    const previous = signed('previous', 2_000);
+    expect(acceptNodeCard(previous, genuine, nodeId)).toEqual(genuine);
+    expect(acceptNodeCard(signed('previous', 1_000), genuine, nodeId)).toEqual(genuine);
+    expect(acceptNodeCard(previous, { ...genuine, issuedAt: 1 }, nodeId)).toEqual(previous); // ...only a VERIFIED card of ours replaces it
+    expect(acceptNodeCard(previous, forged, nodeId)).toEqual(previous);
     // A forgery an older build persisted is dropped on read; a genuine card is read back.
     const store = new Map<string, string>([[NODE_CARD_KEY, JSON.stringify(forged)]]);
     const stub = {
