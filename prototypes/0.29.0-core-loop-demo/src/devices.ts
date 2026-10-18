@@ -4820,7 +4820,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
           Or pay into the jar from any Chia wallet (testnet11): scan the code or copy the address.
         </div>
-        ${st ? `<div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(st.address, { module: 2, quiet: 2, dark: '#040816', light: CH_GOLD, label: 'QR code of the jar\'s testnet11 address' })}</div>` : ''}
+        ${st ? `<div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(st.address, { module: 2, dark: '#040816', light: CH_GOLD, label: 'QR code of the jar\'s testnet11 address' })}</div>` : ''}
         <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
           <code id="faucet-address" style="flex:1; font-size:8.5px; color:${CH_GOLD}; word-break:break-all; user-select:all;">${st ? escapeHtml(st.address) : '…'}</code>
           ${btn('faucet-copy', copied ? 'COPIED' : 'COPY', !st)}

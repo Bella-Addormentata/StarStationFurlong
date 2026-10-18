@@ -14,7 +14,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
-import { clearFaucetRoom, closeFaucetRoom, formatMojos, latestFaucetStatus, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
+import { clearFaucetRoom, closeFaucetRoom, failFaucetRequest, formatMojos, latestFaucetError, latestFaucetStatus, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
 import { qrSvg } from "./qrCode";
 import {
   acceptNodeCard,
@@ -4786,9 +4786,32 @@ function harvestStationAtlas(): void {
  *  address; a refused clipboard leaves the address selectable instead. */
 let bankAddressCopied = false;
 
+/** Ask the node for a faucet status, whose wallet half is RECEIVE's balance.
+ *  The reply lands in the dish's store, whose subscribers repaint the view;
+ *  a request that cannot leave (no node, a failed stream) is filed there too,
+ *  the way the dish files its own polls, so the screen says why instead of
+ *  reading "reading the chain…" for good. Rooms without a dish have no poll
+ *  of their own, so this runs on open and on REFRESH. The balance travels
+ *  over the room's link to the node, so there is nothing to ask before a room
+ *  is joined, and nothing while no wallet is loaded. */
+function requestBankBalance(): void {
+  const roomId = activeBootstrap?.roomId;
+  if (!roomId || !localFingerprint?.chia_address) return;
+  const { seq, sent } = networkProvider.requestFaucet("status");
+  sent.catch((e: unknown) => failFaucetRequest(roomId, "status", seq, e));
+}
+
 function renderBankApp(): void {
   const view = document.getElementById("phone-app-bank");
   if (!view) return;
+  // Keyboard focus survives the innerHTML replacement (the TREASURY pattern):
+  // Tab is the phone's toggle, not a tab stop, so a control destroyed under
+  // the player by a balance landing or the COPIED timer would strand them on
+  // body. Controls here carry stable ids; the view itself holds focus right
+  // after opening.
+  const active = document.activeElement as HTMLElement | null;
+  const hadFocus = Boolean(active && view.contains(active));
+  const focusedId = hadFocus && active !== view ? active!.id : "";
   // Same black-inheritance fix as the VENTURES app (portfolio/property rows).
   view.style.color = "#e8d5a3";
   const esc = (s: string) =>
@@ -4847,20 +4870,32 @@ function renderBankApp(): void {
       }
       const roomId = activeBootstrap?.roomId ?? null;
       const st = roomId ? latestFaucetStatus(roomId) : null;
+      const err = roomId ? latestFaucetError(roomId) : null;
       const owned = st?.walletMojos ?? null;
       const spendable = st?.walletSpendableMojos ?? owned;
       const confirming = owned !== null && spendable !== null && spendable < owned ? owned - spendable : 0n;
-      const balance =
-        owned === null
-          ? "reading the chain…"
-          : `${formatMojos(owned)}${st?.walletPartial ? "+ (listing cut short; it holds more)" : ""}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming)` : ""}`;
+      // The balance is read over the room's link to the node, so there is
+      // none before a room is joined. A failed read is shown as such (the
+      // store keeps the node's last error until a later answer clears it) and
+      // a balance kept from before it is dated, not passed off as current.
+      const balance = !roomId
+        ? "shown once you are in a room (your node answers over the room's link)"
+        : owned === null
+          ? err ? "not read yet" : "reading the chain…"
+          : `${formatMojos(owned)}${st?.walletPartial ? "+ (listing cut short; it holds more)" : ""}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming)` : ""}${err ? " (as of the last successful read)" : ""}`;
+      const btnStyle = (lit: boolean) =>
+        `flex-shrink:0; padding:6px 10px; background:rgba(212,168,75,${lit ? "0.25" : "0.10"}); border:1px solid rgba(212,168,75,0.35); border-radius:4px; color:#f0c060; font:800 9px 'Courier New', monospace; letter-spacing:1px; cursor:pointer;`;
       return `
-        <div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(addr, { module: 3, quiet: 2, dark: "#040816", light: "#f0c060", label: "QR code of this node's testnet11 address" })}</div>
+        <div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(addr, { module: 3, dark: "#040816", light: "#f0c060", label: "QR code of this node's testnet11 address" })}</div>
         <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
           <code id="bank-address" style="flex:1; font-size:8.5px; color:#f0c060; word-break:break-all; user-select:all;">${esc(addr)}</code>
-          <button type="button" id="bank-copy-address" aria-label="Copy the address" style="flex-shrink:0; padding:6px 10px; background:rgba(212,168,75,${bankAddressCopied ? "0.25" : "0.10"}); border:1px solid rgba(212,168,75,0.35); border-radius:4px; color:#f0c060; font:800 9px 'Courier New', monospace; letter-spacing:1px; cursor:pointer;">${bankAddressCopied ? "COPIED" : "COPY"}</button>
+          <button type="button" id="bank-copy-address" aria-label="Copy the address" style="${btnStyle(bankAddressCopied)}">${bankAddressCopied ? "COPIED" : "COPY"}</button>
         </div>
-        <div style="font-size:10px; margin-top:6px;">Balance: <span style="color:#f0c060;">${balance}</span></div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:6px; font-size:10px;">
+          <span style="flex:1; min-width:0;">Balance: <span style="color:#f0c060;">${balance}</span></span>
+          ${roomId ? `<button type="button" id="bank-refresh-balance" aria-label="Read the balance again" style="${btnStyle(false)}">REFRESH</button>` : ""}
+        </div>
+        ${err ? `<div style="font-size:8.5px; color:#f0a060; margin-top:4px; line-height:1.6;">Your node's last answer: ${esc(err)}</div>` : ""}
         <div style="font-size:8.5px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
           <span style="color:#f0c060; font-weight:800;">testnet11 only.</span> Scan the code or paste the address in a testnet11
           wallet (a testnet faucet gives TXCH for free). One coin pays this node's chain writes — presence, knocks, the
@@ -4906,7 +4941,9 @@ function renderBankApp(): void {
     </div>
   `;
   view.querySelector<HTMLButtonElement>("#bank-copy-address")?.addEventListener("click", () => {
-    const addr = localFingerprint?.chia_address;
+    // The address this render shows, so the text, the code and the clipboard
+    // agree even if the fingerprint was refreshed under the open view.
+    const addr = view.querySelector("#bank-address")?.textContent;
     if (!addr) return;
     navigator.clipboard?.writeText(addr).then(
       () => {
@@ -4923,6 +4960,33 @@ function renderBankApp(): void {
       },
     );
   });
+  view.querySelector<HTMLButtonElement>("#bank-refresh-balance")?.addEventListener("click", () => requestBankBalance());
+  if (!view.dataset.wired) {
+    view.dataset.wired = "1";
+    // ↑/↓ move between the view's buttons: Tab cannot (the app reserves it as
+    // the phone's toggle and preventDefaults every press), and a COPY only a
+    // pointer can reach is decorative. Opening the app lands focus on the view
+    // itself, from where ↓ reaches the first button. Nothing acts on a phone
+    // that is put away: a control left focused inside it still receives keys.
+    view.addEventListener("keydown", (e) => {
+      if (!treasuryViewOnScreen(view)) return;
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      const stops = [...view.querySelectorAll<HTMLElement>("button:not([disabled])")].filter((el) => el.offsetParent !== null);
+      if (stops.length === 0) return;
+      e.preventDefault();
+      const here = stops.indexOf(e.target as HTMLElement);
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
+    });
+  }
+  if (hadFocus) {
+    // The same control where it still exists, else the first one, else the view.
+    const target =
+      (focusedId ? view.querySelector<HTMLElement>(`#${CSS.escape(focusedId)}`) : null) ??
+      (focusedId ? view.querySelector<HTMLElement>("button:not([disabled])") : null) ??
+      view;
+    target.focus({ preventScroll: true });
+  }
 }
 
 // ── 🏦 TREASURY view (PR C) ──────────────────────────────────────────────────
@@ -7971,9 +8035,15 @@ function setupSpacePhoneOverlay() {
       renderBankApp();
       // 🏦 RECEIVE's balance is the wallet half of the faucet status answer:
       // ask the node once on open (the store's subscribers repaint the view
-      // when it lands); with no node the request rejects and the panel keeps
-      // saying it is reading. Nothing to ask while no wallet is loaded.
-      if (localFingerprint?.chia_address) networkProvider.requestFaucet("status").sent.catch(() => {});
+      // when the answer, or the failure to ask, lands).
+      requestBankBalance();
+      // Land focus in the view so its ↑/↓ traversal reaches COPY and REFRESH
+      // without a pointer (Tab is the app's phone toggle, not a tab stop).
+      const bv = document.getElementById("phone-app-bank");
+      if (bv) {
+        bv.setAttribute("tabindex", "-1");
+        bv.focus({ preventScroll: true });
+      }
     }
     if (id === "treasury") {
       treasuryDetailId = "";
