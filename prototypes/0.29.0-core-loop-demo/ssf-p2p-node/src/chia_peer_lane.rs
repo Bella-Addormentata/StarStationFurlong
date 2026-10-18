@@ -1442,10 +1442,11 @@ pub(crate) fn push_verdict(outcomes: &[AckOutcome]) -> Result<(), ChainError> {
 
 /// Is a spend pushed earlier still live? Accepted anywhere: yes (it is in a
 /// mempool again). Refused everywhere: dead only when EVERY peer's refusal is
-/// FINAL — the bundle itself can never land — since a refusal for fee or load
-/// says nothing about a copy an earlier peer may still hold, and one peer's
-/// final word against another's policy refusal is no evidence either (a
-/// dishonest peer could claim a double spend). Such a verdict stays unknown
+/// FINAL — the bundle itself can never land — since a refusal for fee or load,
+/// or for an input the peer does not know (a peer behind the input's creation
+/// block), says nothing about a copy an earlier peer may still hold, and one
+/// peer's final word against another's policy refusal is no evidence either
+/// (a dishonest peer could claim a double spend). Such a verdict stays unknown
 /// and the coins stay parked (release only with evidence). Else unknown.
 pub(crate) fn live_verdict(outcomes: &[AckOutcome]) -> Result<bool, ChainError> {
     if outcomes.iter().any(|o| *o == AckOutcome::Accepted) {
@@ -1467,12 +1468,15 @@ pub(crate) fn live_verdict(outcomes: &[AckOutcome]) -> Result<bool, ChainError> 
 /// NEVER land (an input already spent, a condition that fails, a bad
 /// signature, a malformed spend), as against its own policy or state (a fee
 /// too low for a full mempool, "seen before", not synced, a timelock not yet
-/// reached). The names are chia-blockchain's `Err` codes as
+/// reached, an input it does not know: `UNKNOWN_UNSPENT` is what a node that
+/// has not reached the input's creation block says of a perfectly live spend,
+/// and the liveness peers are chosen afresh, so two lagging replacements
+/// could say it together while the spend sits in a mempool elsewhere; #271
+/// review, round 19). The names are chia-blockchain's `Err` codes as
 /// `TransactionAck.error` spells them; an unknown reason is not final.
 pub(crate) fn refusal_is_final(reason: &str) -> bool {
     const FINAL: &[&str] = &[
         "DOUBLE_SPEND",
-        "UNKNOWN_UNSPENT",
         // Assertions on the spend's own coins and announcements fail for good.
         "ASSERT_MY_COIN_ID_FAILED",
         "ASSERT_MY_PARENT_ID_FAILED",
@@ -2859,6 +2863,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peers_that_do_not_know_an_input_leave_a_spend_parked() {
+        // The liveness question goes to whichever pair is live now, not to
+        // the pair that took the push. Two replacements behind the input's
+        // creation block refuse the bundle with UNKNOWN_UNSPENT: the coin is
+        // unknown to THEM while the spend may sit in a mempool elsewhere, so
+        // the verdict is unknown (the wallet lease keeps the inputs parked),
+        // not dead. One peer that knows the input and calls the spend a
+        // double spend, beside one that does not know it, is no evidence
+        // either.
+        let behind_a = full_node(vec![], (3, Some("UNKNOWN_UNSPENT")), Some(peak_at(100))).await;
+        let behind_b = full_node(vec![], (3, Some("UNKNOWN_UNSPENT")), Some(peak_at(100))).await;
+        let lagging = PeerLane::new(lane(vec![(behind_a.addr, Source::Introducer), (behind_b.addr, Source::Gossip)], vec![], false, None), Trust::Agreed);
+        let err = lagging.spend_live(bundle()).await.unwrap_err();
+        assert!(matches!(err, ChainError::Unanswered(_)), "{err}");
+        assert!(err.to_string().contains("UNKNOWN_UNSPENT"), "{err}");
+
+        let knows = full_node(vec![], (3, Some("DOUBLE_SPEND")), Some(peak_at(100))).await;
+        let mixed = PeerLane::new(lane(vec![(knows.addr, Source::Introducer), (behind_b.addr, Source::Gossip)], vec![], false, None), Trust::Agreed);
+        let err = mixed.spend_live(bundle()).await.unwrap_err();
+        assert!(matches!(err, ChainError::Unanswered(_)), "{err}");
+    }
+
+    #[tokio::test]
     async fn four_introducer_peers_leave_room_for_a_gossiped_second_source() {
         // Four peers from one source would fill the pool and never agree; the
         // per-source cap keeps a slot, and A's gossip brings C, another source.
@@ -4078,6 +4105,7 @@ mod tests {
         assert!(refusal_is_final("x: ASSERT_BEFORE_HEIGHT_ABSOLUTE_FAILED"), "a 'before' timelock that failed is past for good");
         assert!(refusal_is_final("x: BAD_AGGREGATE_SIGNATURE"));
         assert!(!refusal_is_final("x: ASSERT_HEIGHT_RELATIVE_FAILED"), "a timelock can still pass");
+        assert!(!refusal_is_final("x: UNKNOWN_UNSPENT"), "a peer behind the input's creation block says so of a live spend");
         assert!(!refusal_is_final("x: ASSERT_SECONDS_ABSOLUTE_FAILED"));
         assert!(!refusal_is_final("x: INVALID_FEE_TOO_CLOSE_TO_ZERO"));
         assert!(!refusal_is_final("x: ALREADY_INCLUDING_TRANSACTION"));
