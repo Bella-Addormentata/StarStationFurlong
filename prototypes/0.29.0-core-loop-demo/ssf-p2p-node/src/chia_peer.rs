@@ -609,6 +609,36 @@ impl PeerConn {
         }
     }
 
+    /// A peak announced above `height`, waiting up to `timeout` for one: the
+    /// announcement a peer makes while its last one is being checked against
+    /// the chain arrives before, or a moment after, its answer to that check
+    /// (the lane's `prove_current`; #271 review, round 23).
+    pub async fn wait_peak_past(&self, height: u32, timeout: Duration) -> Option<Peak> {
+        let mut rx = self.peak.clone();
+        if let Some(peak) = *rx.borrow_and_update() {
+            if peak.height > height {
+                return Some(peak);
+            }
+        }
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => return None,
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    if let Some(peak) = *rx.borrow() {
+                        if peak.height > height {
+                            return Some(peak);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The latest announced peak, without waiting.
     pub fn peak_now(&self) -> Option<Peak> {
         *self.peak.borrow()
