@@ -54,7 +54,11 @@
 //!     store cannot make an eclipse stick; an address keeps every source
 //!     that names it, and a connection two sources named may stand for
 //!     either in a pair, once, so a cold start whose peers gossip only the
-//!     introducer's own addresses pairs all the same. Their listings are judged over
+//!     introducer's own addresses pairs all the same. Two connections are
+//!     two nodes: the lane holds one connection per full node, told by the
+//!     certificate it presents ([`crate::chia_peer::Identity`]), so a
+//!     dual-stack node reached at both its addresses, or a pin found again
+//!     under a public alias, holds one place and casts one vote. Their listings are judged over
 //!     the changes both have reached ([`settle_pages`]: taken as of the lower
 //!     peak, cut to the changes between the request's start and the lower
 //!     page boundary), so a peer a block ahead, or one that cut a page at its
@@ -85,10 +89,13 @@
 //!     gossip, so a waiting one can bring its own, and it rejoins the queue
 //!     after [`RETRY_AFTER`]. A stored peer that disagrees with a verdict,
 //!     or with a pin, is evicted; so is a public peer whose announced peak
-//!     lags, by more
-//!     than [`MAX_PEAK_LAG`] blocks, a height at least two other peers reach
-//!     (one peer's announcement, inflated or not, evicts nobody), and the two
-//!     peers of an agreed pair must be within that lag of each other. A peer that stops
+//!     stands more than [`MAX_PEAK_LAG`] blocks away from a height two OTHER
+//!     peers in distinct network groups both reach, behind it or alone ahead
+//!     of it (one peer's announcement, inflated or not, condemns nobody, and
+//!     two peers in one network group corroborate nothing between them); the
+//!     two peers of an agreed pair must be within that lag of each other, or
+//!     the pair is passed over, non-final, for one without either of them,
+//!     while discovery looks for a peer to break the tie. A peer that stops
 //!     answering, or whose connection drops, returns to the queue and is
 //!     dialled again after [`RECONNECT_AFTER`]; pins keep their own retry. An
 //!     address that fails [`MAX_DIAL_FAILURES`] dials in a row is given up,
@@ -267,6 +274,9 @@ struct LaneState {
     /// Connections asked for gossip: `None`, it answered (not asked again);
     /// `Some(at)`, the request failed (asked again after `at`).
     gossiped: HashMap<SocketAddr, Option<Instant>>,
+    /// Why the last agreed choice found no pair in step, when it found pairs
+    /// at all ([`Lane::choose_in_step`]): the request's final error says so.
+    out_of_step: Option<String>,
     store_loaded: bool,
     known: Vec<StoredPeer>,
     /// Tests only: judge discovered addresses as the node does, admitting
@@ -487,10 +497,12 @@ impl Lane {
                 }
             }
         }
-        let connected = self.state.lock().await.conns.len();
-        Err(unanswered(match trust {
-            Trust::Carrier => "no full-node peer reachable".to_string(),
-            Trust::Agreed => format!(
+        let state = self.state.lock().await;
+        let connected = state.conns.len();
+        Err(unanswered(match (trust, state.out_of_step.as_deref()) {
+            (Trust::Carrier, _) => "no full-node peer reachable".to_string(),
+            (Trust::Agreed, Some(why)) => format!("no two full-node peers in step: {why}"),
+            (Trust::Agreed, None) => format!(
                 "fewer than two agreeing full-node peers reachable ({connected} connected; two are needed, from distinct sources and networks, one of them a pin or the introducer)"
             ),
         }))
@@ -504,7 +516,7 @@ impl Lane {
     }
 
     /// A choice from the pool as it stands: dead connections reaped,
-    /// laggards let go before an agreed verdict, then [`Self::choose_in_step`].
+    /// outliers let go before an agreed verdict, then [`Self::choose_in_step`].
     /// `Err` when every pin is down on a money path (§14 (1): a pin that does
     /// not answer makes money paths non-final; it is never quietly replaced
     /// by public peers), or when the pins stand out of step.
@@ -513,7 +525,7 @@ impl Lane {
         let state = &mut *guard;
         self.reap(state);
         if trust == Trust::Agreed {
-            self.let_laggards_go(state);
+            self.let_outliers_go(state);
         }
         if let Some(set) = self.choose_in_step(state, trust)? {
             return Ok(Some(set));
@@ -527,95 +539,73 @@ impl Lane {
         Ok(None)
     }
 
-    /// Before an agreed verdict, a public peer whose announced peak is more
-    /// than [`MAX_PEAK_LAG`] blocks behind the pool's reference height is let
-    /// go: its answers describe an older chain state, so a match between it
-    /// and a current peer would not mean what an agreement should. The
-    /// reference is the SECOND-highest announced height, one at least two
-    /// peers reach, so a single announcement, inflated or not, evicts nobody;
-    /// with two announcements nothing is let go here and a gap inside the
-    /// chosen pair is judged by [`Self::pair_in_step`]. Pins stay; a lagging
-    /// pin makes the verdict non-final there and in [`Lane::peak`]. Heights
-    /// are compared by saturating subtraction: an announcement is an untrusted
-    /// `u32` and may sit at the top of the range.
-    fn let_laggards_go(&self, state: &mut LaneState) {
-        let mut heights: Vec<u32> = state.conns.iter().filter_map(|c| c.peak_now()).map(|p| p.height).collect();
-        heights.sort_unstable_by(|a, b| b.cmp(a));
-        let Some(&reference) = heights.get(1) else { return };
-        let lagging: Vec<Arc<PeerConn>> = state
+    /// Before an agreed verdict, a public peer whose announced peak stands
+    /// more than [`MAX_PEAK_LAG`] blocks away from a height two OTHER peers in
+    /// distinct network groups both reach is let go ([`outlier`]): below it,
+    /// the peer lags, and its answers describe an older chain state, so a
+    /// match between it and a current peer would not mean what an agreement
+    /// should; above it, with no peer in another group anywhere near its
+    /// height, the peer stands alone ahead of everything two independent
+    /// peers agree on (an inflated announcement, or one node ahead of a
+    /// lagging pool; let go and dialled again after [`RETRY_AFTER`], it is
+    /// back either way). Nothing is let go on one peer's word, and two peers
+    /// in one network group (one host on two ports, say) corroborate nothing
+    /// between them, so a pool of two, or of one group against one peer,
+    /// lets nobody go here: a gap inside the chosen pair is then non-final
+    /// ([`pair_in_step`]) and discovery goes on for a peer that can break the
+    /// tie. Pins stay; a lagging pin makes the verdict non-final there and in
+    /// [`Lane::peak`]. Heights are compared by saturating arithmetic: an
+    /// announcement is an untrusted `u32` and may sit at the top of the
+    /// range (#271 review, round 21).
+    fn let_outliers_go(&self, state: &mut LaneState) {
+        let announced: Vec<(SocketAddr, Group, u32)> =
+            state.conns.iter().filter_map(|c| c.peak_now().map(|p| (c.addr(), c.group(), p.height))).collect();
+        let outliers: Vec<(Arc<PeerConn>, String)> = state
             .conns
             .iter()
-            .filter(|c| c.source() != Source::Pin && c.peak_now().is_some_and(|p| reference.saturating_sub(p.height) > MAX_PEAK_LAG))
-            .cloned()
+            .filter(|c| c.source() != Source::Pin)
+            .filter_map(|c| outlier(&announced, c.addr(), c.group(), c.peak_now()?.height).map(|why| (c.clone(), why)))
             .collect();
-        for peer in lagging {
-            let behind = reference.saturating_sub(peer.peak_now().map(|p| p.height).unwrap_or(0));
-            self.let_go(state, &peer, RETRY_AFTER, &format!("lags {behind} blocks behind the height the other peers reach"));
+        for (peer, why) in outliers {
+            self.let_go(state, &peer, RETRY_AFTER, &why);
         }
     }
 
     /// [`Self::choose`], and for an agreed verdict a pair in step
-    /// ([`Self::pair_in_step`]). A lagging public peer is let go there and the
-    /// choice is made again without it. A lagging pin stays (the operator's
-    /// node, syncing), but another pin may still pair with the public peer, so
-    /// the choice is made again without the lagging pin before its lag is
-    /// reported: a lagging first pin would otherwise block a healthy second one
-    /// on every request. `Ok(None)`: no pair at all; the lag error when every
-    /// pair was out of step.
+    /// ([`pair_in_step`]). The pairs the pool offers are gone through twice:
+    /// first setting aside the lower peer of each pair out of step (the
+    /// common case, one peer behind), then the higher, since an inflated
+    /// announcement first in line would otherwise hide every pair without it;
+    /// a pin out of step is set aside like any other, so another pin gets its
+    /// turn with the public peer, or the pin its turn with another public
+    /// peer. Nobody is let go here: which of two peers is wrong, one peer's
+    /// word cannot tell ([`Self::let_outliers_go`] lets a peer go on two
+    /// independent peers' word). `Ok(None)`: no pair in step; when there were
+    /// pairs at all, the first gap is noted in [`LaneState::out_of_step`] for
+    /// the request's final error, and discovery goes on for a peer to break
+    /// the tie (a lagging pin stays non-final throughout: §14 (1)).
     fn choose_in_step(&self, state: &mut LaneState, trust: Trust) -> Result<Option<Vec<Arc<PeerConn>>>, ChainError> {
-        let mut set_aside: Vec<SocketAddr> = Vec::new();
-        let mut first_lag: Option<ChainError> = None;
-        loop {
-            let Some(set) = self.choose(state, trust, &set_aside) else {
-                return match first_lag {
-                    Some(e) => Err(e),
-                    None => Ok(None),
-                };
-            };
-            if trust == Trust::Carrier {
-                return Ok(Some(set));
-            }
-            match self.pair_in_step(state, &set) {
-                Ok(()) => return Ok(Some(set)),
-                Err((lagging, e)) => {
-                    set_aside.push(lagging);
-                    first_lag.get_or_insert(e);
+        if trust == Trust::Carrier {
+            return Ok(self.choose(state, trust, &[]));
+        }
+        let mut first_gap: Option<String> = None;
+        for pass in 0..2 {
+            let mut set_aside: Vec<SocketAddr> = Vec::new();
+            while let Some(set) = self.choose(state, trust, &set_aside) {
+                match pair_in_step(&set) {
+                    Ok(()) => {
+                        state.out_of_step = None;
+                        return Ok(Some(set));
+                    }
+                    Err(gap) => {
+                        first_gap.get_or_insert_with(|| gap.describe());
+                        set_aside.push(if pass == 0 { gap.low.addr() } else { gap.high.addr() });
+                    }
                 }
             }
         }
-    }
-
-    /// The two peers of an agreed pair must announce peaks within
-    /// [`MAX_PEAK_LAG`] of each other, or the verdict is non-final: a lagging
-    /// public peer is let go (back in the queue after [`RECONNECT_AFTER`]), a
-    /// lagging pin stays, as in [`Lane::peak`]. The error names the lagging
-    /// peer's address, so [`Self::choose_in_step`] can choose again without it.
-    fn pair_in_step(&self, state: &mut LaneState, pair: &[Arc<PeerConn>]) -> Result<(), (SocketAddr, ChainError)> {
-        let mut known: Vec<(&Arc<PeerConn>, u32)> = pair.iter().filter_map(|c| c.peak_now().map(|p| (c, p.height))).collect();
-        if known.len() < 2 {
-            return Ok(());
-        }
-        known.sort_by_key(|(_, height)| *height);
-        let (low, low_height) = known[0];
-        let (high, high_height) = known[known.len() - 1];
-        let lag = high_height - low_height;
-        if lag <= MAX_PEAK_LAG {
-            return Ok(());
-        }
-        let fate = if low.source() == Source::Pin {
-            "non-final until the pinned node catches up"
-        } else {
-            self.let_go(state, low, RECONNECT_AFTER, &format!("lags {lag} blocks behind {}", high.addr()));
-            "non-final, the lagging peer is let go"
-        };
-        Err((
-            low.addr(),
-            unanswered(format!(
-                "{} lags {lag} blocks behind {} (height {low_height} against {high_height}); {fate}",
-                low.addr(),
-                high.addr()
-            )),
-        ))
+        state.out_of_step = first_gap;
+        Ok(None)
     }
 
     /// Take a public connection out of the pool: logged with `why`, cooling
@@ -999,10 +989,16 @@ impl Lane {
         join_all(dials).await
     }
 
-    /// Take a batch's outcome into the pool: one connection per address and
-    /// none past [`MAX_CONNS`] (the pool may have filled meanwhile); a failed
-    /// address cools for `cool_for`, leaves the store and, unless it is a pin
-    /// or has failed too often, waits in the queue for another try.
+    /// Take a batch's outcome into the pool: one connection per address, one
+    /// per NODE (plan §14 (2): the same certificate under another address is
+    /// the same full node reached again, whatever network group that address
+    /// is in, so it could not stand for the second peer of an agreed pair; a
+    /// pin reached again under a public alias keeps the pin's connection, the
+    /// alias making room for it, and any other newcomer is the alias and is
+    /// set aside like a failed dial), and none past [`MAX_CONNS`] (the pool
+    /// may have filled meanwhile); a failed address cools for `cool_for`,
+    /// leaves the store and, unless it is a pin or has failed too often, waits
+    /// in the queue for another try ([`Self::aside`]).
     fn admit(&self, state: &mut LaneState, reached: Vec<(Candidate, anyhow::Result<Arc<PeerConn>>)>, cool_for: Duration) {
         let now = Instant::now();
         for (cand, result) in reached {
@@ -1011,7 +1007,34 @@ impl Lane {
                     if state.conns.iter().any(|c| c.addr() == cand.addr) {
                         // One connection per address, whoever dialled it twice.
                         close_later(conn);
-                    } else if state.conns.len() < MAX_CONNS {
+                        continue;
+                    }
+                    if let Some(twin) = state.conns.iter().find(|c| c.identity() == conn.identity()).cloned() {
+                        if cand.source() == Source::Pin && twin.source() != Source::Pin {
+                            eprintln!(
+                                "⛓️ chain peers: {} ({}) is the pinned node {} under another address: the pin takes its place",
+                                twin.addr(),
+                                twin.source().label(),
+                                cand.addr
+                            );
+                            if unpool(state, &twin) {
+                                close_later(twin.clone());
+                            }
+                            self.aside(state, Candidate { addr: twin.addr(), sources: twin.sources(), failures: 0 }, now + cool_for);
+                        } else {
+                            eprintln!(
+                                "⛓️ chain peers: {} ({}) is {} ({}) under another address: one node, one connection",
+                                cand.addr,
+                                cand.source().label(),
+                                twin.addr(),
+                                twin.source().label()
+                            );
+                            close_later(conn);
+                            self.aside(state, cand, now + cool_for);
+                            continue;
+                        }
+                    }
+                    if state.conns.len() < MAX_CONNS {
                         eprintln!("⛓️ chain peers: {} ({}) connected", cand.addr, cand.source().label());
                         state.conns.push(conn);
                     } else {
@@ -1020,22 +1043,28 @@ impl Lane {
                 }
                 Err(e) => {
                     eprintln!("⛓️ chain peers: {} ({}): {e:#}", cand.addr, cand.source().label());
-                    state.cooling.insert(cand.addr, now + cool_for);
-                    self.forget(state, cand.addr);
-                    if cand.source() == Source::Pin {
-                        // Pins are resolved and retried on their own schedule.
-                        continue;
-                    }
-                    // Kept for a later try once the cooldown passes, until the
-                    // address has failed often enough to be given up.
-                    let failures = cand.failures + 1;
-                    if failures < MAX_DIAL_FAILURES {
-                        push_candidates(state, vec![Candidate { failures, ..cand }]);
-                    } else {
-                        eprintln!("⛓️ chain peers: {} ({}) given up after {failures} failed dials", cand.addr, cand.source().label());
-                    }
+                    self.aside(state, cand, now + cool_for);
                 }
             }
+        }
+    }
+
+    /// A dial that came to nothing (the address failed, or reached a node
+    /// already connected under another address): the address cools until
+    /// `until`, leaves the store, and unless it is a pin (resolved and retried
+    /// on the pins' own schedule) or has come to nothing [`MAX_DIAL_FAILURES`]
+    /// times in a row, waits in the queue for another try.
+    fn aside(&self, state: &mut LaneState, cand: Candidate, until: Instant) {
+        state.cooling.insert(cand.addr, until);
+        self.forget(state, cand.addr);
+        if cand.source() == Source::Pin {
+            return;
+        }
+        let failures = cand.failures + 1;
+        if failures < MAX_DIAL_FAILURES {
+            push_candidates(state, vec![Candidate { failures, ..cand }]);
+        } else {
+            eprintln!("⛓️ chain peers: {} ({}) given up after {failures} dials that came to nothing", cand.addr, cand.source().label());
         }
     }
 
@@ -1314,14 +1343,14 @@ impl Lane {
             }
             let lag = peak.height - low.height;
             if lag > MAX_PEAK_LAG {
-                // A pin is never let go: the operator's own node is syncing or
-                // the public peer is ahead of the truth; either way, non-final
-                // until the two agree. Anyone else lagging this far is dropped.
+                // The pair was in step when chosen; an announcement since has
+                // parted them. Nobody is let go on the other's word alone
+                // (`let_outliers_go` does that, on two independent peers'
+                // word, before the next choice): non-final until they agree.
                 let fate = if low_peer.source() == Source::Pin {
                     "non-final until the pinned node catches up"
                 } else {
-                    self.drop_conn(&low_peer).await;
-                    "non-final, the lagging peer is let go"
+                    "non-final until another peer says which is right"
                 };
                 return Err(unanswered(format!(
                     "{} lags {lag} blocks behind {} (height {} against {}); {fate}",
@@ -1541,7 +1570,9 @@ fn describe(outcomes: &[AckOutcome]) -> String {
 /// peers standing for distinct sources, in distinct groups, the first of them
 /// for a fresh source (the introducer this run); a connection two sources
 /// named may stand for either, once, so three introducer peers whose gossip
-/// names only one another still pair (#271 review, round 20).
+/// names only one another still pair (#271 review, round 20). Two connections
+/// are two nodes: the lane admits one connection per certificate identity
+/// (`admit`), so a dual-stack node under two addresses casts one vote.
 pub(crate) fn pick_agreed<S: Into<Sources> + Copy>(peers: &[(S, Group)], pinned: bool, pin_only: bool) -> Option<Vec<usize>> {
     let peers: Vec<(Sources, Group)> = peers.iter().map(|(s, g)| ((*s).into(), *g)).collect();
     if pinned {
@@ -1609,6 +1640,93 @@ pub(crate) fn tryable<S: Into<Sources> + Copy>(pooled: &[(S, Group, bool)], cand
     let under = cand.0.under();
     let held = facts.iter().filter(|(s, _)| s.under() == under).count();
     held < PER_SOURCE_CAP || (under.is_fresh() && facts.iter().zip(pooled).any(|((s, _), (_, _, asked))| s.under() == under && under != Source::Pin && *asked))
+}
+
+/// Does a peer announcing `height` stand out of step with the rest of the
+/// pool? `announced` holds (address, network group, announced height) for
+/// every connection with a known peak, the peer itself among them or not.
+/// The others' corroborated height is the highest height two of them in
+/// distinct network groups both reach ([`corroborated`]); the peer is an
+/// outlier when it stands more than [`MAX_PEAK_LAG`] blocks below it
+/// (lagging), or more than that above it with no peer in another group
+/// within the lag of its own height (alone ahead of everything two
+/// independent peers agree on). With no two others in distinct groups there
+/// is no corroboration and no outlier: one peer's word condemns nobody, and
+/// two peers in one group (one host on two ports, say) corroborate nothing
+/// between them (#271 review, round 21). The reason, or `None`.
+pub(crate) fn outlier(announced: &[(SocketAddr, Group, u32)], addr: SocketAddr, group: Group, height: u32) -> Option<String> {
+    let others: Vec<(SocketAddr, Group, u32)> = announced.iter().copied().filter(|(a, _, _)| *a != addr).collect();
+    let reference = corroborated(&others)?;
+    if reference.saturating_sub(height) > MAX_PEAK_LAG {
+        return Some(format!("lags {} blocks behind the height two other peers reach", reference - height));
+    }
+    let near = others.iter().any(|(_, g, h)| *g != group && h.saturating_add(MAX_PEAK_LAG) >= height);
+    if height.saturating_sub(reference) > MAX_PEAK_LAG && !near {
+        return Some(format!(
+            "announces height {height}, {} blocks above anything two other peers reach, and no peer elsewhere comes near it",
+            height - reference
+        ));
+    }
+    None
+}
+
+/// The highest height two of `peers` in distinct network groups both reach;
+/// `None` with fewer than two groups among them.
+pub(crate) fn corroborated(peers: &[(SocketAddr, Group, u32)]) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    for (i, (_, ga, ha)) in peers.iter().enumerate() {
+        for (_, gb, hb) in &peers[i + 1..] {
+            let both = (*ha).min(*hb);
+            if gb != ga && best.is_none_or(|b| both > b) {
+                best = Some(both);
+            }
+        }
+    }
+    best
+}
+
+/// Two peers of an agreed pair whose announced peaks stand more than
+/// [`MAX_PEAK_LAG`] blocks apart ([`pair_in_step`]).
+struct Gap {
+    low: Arc<PeerConn>,
+    low_height: u32,
+    high: Arc<PeerConn>,
+    high_height: u32,
+}
+
+impl Gap {
+    fn describe(&self) -> String {
+        let lag = self.high_height - self.low_height;
+        let (low, high) = (self.low.addr(), self.high.addr());
+        let (lh, hh) = (self.low_height, self.high_height);
+        if self.low.source() == Source::Pin {
+            format!("{low} (pinned, height {lh}) lags {lag} blocks behind {high} (height {hh}); non-final until the pinned node catches up")
+        } else if self.high.source() == Source::Pin {
+            format!("{high} (pinned, height {hh}) stands {lag} blocks ahead of {low} (height {lh}); non-final until another peer says which is right")
+        } else {
+            format!("{low} (height {lh}) and {high} (height {hh}) stand {lag} blocks apart; non-final until another peer says which is right")
+        }
+    }
+}
+
+/// The two peers of an agreed pair must announce peaks within
+/// [`MAX_PEAK_LAG`] of each other, or the verdict is non-final. Nobody is let
+/// go here: one peer's word cannot tell which of the two is wrong
+/// ([`Lane::let_outliers_go`] lets a peer go on two independent peers' word),
+/// so the pair is passed over and [`Lane::choose_in_step`] chooses again
+/// without one of them.
+fn pair_in_step(pair: &[Arc<PeerConn>]) -> Result<(), Gap> {
+    let mut known: Vec<(&Arc<PeerConn>, u32)> = pair.iter().filter_map(|c| c.peak_now().map(|p| (c, p.height))).collect();
+    if known.len() < 2 {
+        return Ok(());
+    }
+    known.sort_by_key(|(_, height)| *height);
+    let (low, low_height) = known[0];
+    let (high, high_height) = known[known.len() - 1];
+    if high_height - low_height <= MAX_PEAK_LAG {
+        return Ok(());
+    }
+    Err(Gap { low: low.clone(), low_height, high: high.clone(), high_height })
 }
 
 /// Take exactly `peer` out of the pool, never a later connection to the same
@@ -2506,7 +2624,7 @@ impl ChainAccess for PeerLane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chia_peer::mock::{header_at, reply, spawn, spawn_on, Handler, MockNode};
+    use crate::chia_peer::mock::{header_at, reply, spawn, spawn_as, spawn_on, Handler, MockNode};
     use crate::chia_peer::tls_client_config;
     use chia_protocol::{Coin, Message, NewPeakWallet, NodeType, Program, PuzzleSolutionResponse, TimestampedPeerInfo};
     use chia_traits::Streamable;
@@ -3944,22 +4062,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_public_peer_lagging_the_furthest_peak_is_let_go_before_an_agreed_listing() {
+    async fn two_peers_out_of_step_wait_for_a_third_to_say_which_is_right() {
+        // `ahead` (introducer) and `behind` (gossip) stand seven blocks apart:
+        // one word against another, so neither is let go and the pair is
+        // passed over, non-final. `ahead` gossips C, which agrees with it:
+        // against two independent peers `behind` lags, is let go, and `ahead`
+        // and C settle the read, all within one request.
+        let c = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100 + MAX_PEAK_LAG + 1))).await;
+        let ahead = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100 + MAX_PEAK_LAG + 1)), node(vec![state(1, 90, None)], (1, None), vec![c.addr])).await;
         let behind = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
-        let ahead = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100 + MAX_PEAK_LAG + 1))).await;
-        let lane = lane(vec![(behind.addr, Source::Introducer), (ahead.addr, Source::Gossip)], vec![], false, None);
-        let money = PeerLane::new(lane.clone(), Trust::Agreed);
-        let err = money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap_err();
-        assert!(err.to_string().contains("lags"), "{err}");
-        let conns = lane.live_conns().await;
-        assert_eq!(conns.len(), 1);
-        assert_eq!(conns[0].addr(), ahead.addr, "the lagging peer was let go, the current one kept");
+        let broken = lane(vec![(ahead.addr, Source::Introducer), (behind.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(broken.clone(), Trust::Agreed);
+        assert_eq!(money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap().records.len(), 1);
+        let live: Vec<SocketAddr> = broken.live_conns().await.iter().map(|p| p.addr()).collect();
+        assert!(live.contains(&ahead.addr) && live.contains(&c.addr), "{live:?}");
+        assert!(!live.contains(&behind.addr), "the lagging peer is let go once two independent peers contradict it: {live:?}");
+        {
+            let state = broken.state.lock().await;
+            assert!(state.cooling.contains_key(&behind.addr) && state.candidates.iter().any(|q| q.addr == behind.addr), "and waits in the queue");
+        }
+
+        // With nobody to break the tie, both stay and the read is non-final.
+        let ahead2 = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100 + MAX_PEAK_LAG + 1))).await;
+        let behind2 = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let tied = lane(vec![(ahead2.addr, Source::Introducer), (behind2.addr, Source::Gossip)], vec![], false, None);
+        let err = PeerLane::new(tied.clone(), Trust::Agreed).coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap_err();
+        assert!(err.to_string().contains("apart"), "{err}");
+        assert_eq!(tied.live_count().await, 2, "neither is let go on the other's word");
     }
 
     #[tokio::test]
-    async fn an_inflated_peak_from_a_third_peer_evicts_nobody() {
+    async fn an_inflated_peak_from_a_third_peer_condemns_no_honest_peer() {
         // Two honest peers agree at 100; a third announces a height far above.
-        // One peer's word is no reference: the honest pair stays and settles.
+        // Alone ahead of a height two independent peers reach, the third is the
+        // one let go; the honest pair stays and settles.
         let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
         let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
         let liar = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100 + MAX_PEAK_LAG + 1))).await;
@@ -3968,6 +4104,114 @@ mod tests {
         assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1);
         let conns = lane.live_conns().await;
         assert!(conns.iter().any(|c| c.addr() == a.addr) && conns.iter().any(|c| c.addr() == b.addr), "both honest peers stay");
+        assert!(!conns.iter().any(|c| c.addr() == liar.addr), "the announcer alone ahead is let go");
+    }
+
+    #[tokio::test]
+    async fn an_inflated_introducer_first_in_line_hides_no_honest_pair() {
+        // A, from the introducer, announces a height far above B (introducer
+        // too) and C (gossip), who agree. A is first in line for a pair, so
+        // (A, C) is tried first and is out of step. Evicting C on A's word,
+        // then failing for want of a pair, would have destroyed the honest
+        // pair and let A do it again to every replacement. A stands alone
+        // above a height two independent peers reach: A is the one let go,
+        // and B and C settle the read.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100 + MAX_PEAK_LAG + 1))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let c = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Introducer), (c.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1);
+        let live: Vec<SocketAddr> = lane.live_conns().await.iter().map(|p| p.addr()).collect();
+        assert!(live.contains(&b.addr) && live.contains(&c.addr), "the honest pair stays: {live:?}");
+        assert!(!live.contains(&a.addr), "the inflated announcer is let go: {live:?}");
+        let state = lane.state.lock().await;
+        assert!(state.cooling.contains_key(&a.addr) && state.candidates.iter().any(|q| q.addr == a.addr), "and waits in the queue, to be dialled again later");
+    }
+
+    #[tokio::test]
+    async fn two_inflated_announcers_on_one_host_corroborate_nothing() {
+        // L1 and L2 listen on one port at two loopback addresses: one network
+        // group (the pool's stand-in for one host), both announcing a height
+        // far above H1 (introducer) and H2 (gossip), who agree. Taking the
+        // second-highest announcement as the pool's reference would have let
+        // the pair on one host evict both honest peers and block every money
+        // read. One group is one voice: against H1 and H2, two independent
+        // peers, each announcer stands alone ahead and is let go; H1 and H2
+        // settle the read.
+        let inflated = Some(peak_at(100 + MAX_PEAK_LAG + 1));
+        let l1 = full_node(vec![state(1, 90, None)], (1, None), inflated).await;
+        let l2 = spawn_on(SocketAddr::from(([127, 0, 0, 2], l1.addr.port())), "mocknet", NodeType::FullNode, genesis(), inflated, node(vec![state(1, 90, None)], (1, None), vec![])).await;
+        assert_eq!(group_of(l1.addr), group_of(l2.addr), "one network group");
+        let h1 = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let h2 = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(l1.addr, Source::Introducer), (h1.addr, Source::Introducer), (l2.addr, Source::Gossip), (h2.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1);
+        let live: Vec<SocketAddr> = lane.live_conns().await.iter().map(|p| p.addr()).collect();
+        assert!(live.contains(&h1.addr) && live.contains(&h2.addr), "the honest pair stays: {live:?}");
+        assert!(!live.contains(&l1.addr) && !live.contains(&l2.addr), "both announcers on the one host are let go: {live:?}");
+    }
+
+    #[tokio::test]
+    async fn one_node_under_two_addresses_holds_one_connection_and_casts_one_vote() {
+        // `twin` presents A's certificate at another address (a dual-stack
+        // node reached at its IPv4 and its IPv6 address, say): another network
+        // group, another source, the same node. The second connection is
+        // closed and its address set aside like a failed dial, so the pair's
+        // second vote has to come from somebody else: the read fails with the
+        // one node alone and settles once C, another node, is at hand.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let twin = spawn_as("127.0.0.1:0".parse().unwrap(), a.cert.clone(), "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![state(1, 90, None)], (1, None), vec![])).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (twin.addr, Source::Gossip)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let err = money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap_err();
+        assert!(matches!(err, ChainError::Unanswered(_)), "{err}");
+        let conns = lane.live_conns().await;
+        assert_eq!(conns.iter().map(|p| p.addr()).collect::<Vec<_>>(), vec![a.addr], "one node, one connection");
+        let shown = PeerConn::connect(twin.addr, Source::Gossip, &net(), TLS.clone()).await.unwrap();
+        assert_eq!(shown.identity(), conns[0].identity(), "the twin shows A's identity");
+        {
+            let state = lane.state.lock().await;
+            assert!(state.cooling.contains_key(&twin.addr), "the alias cools like a failed dial");
+            assert!(state.candidates.iter().any(|q| q.addr == twin.addr && q.failures == 1), "and is queued as one that came to nothing once");
+        }
+        let c = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        lane.state.lock().await.candidates.push_back(Candidate::new(c.addr, Source::Gossip));
+        assert_eq!(money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap().records.len(), 1);
+        assert!(c.seen.lock().unwrap().contains(&chia_protocol::ProtocolMessageTypes::RequestCoinState), "the other node took part");
+        assert_eq!(lane.live_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_pin_found_again_under_a_public_alias_is_not_its_own_cross_check() {
+        // The operator pins A; public discovery names `twin`, A's other
+        // address, presenting A's certificate. Pinned, the pair is the pin
+        // plus a public peer from another group, and the twin would have been
+        // that peer. One node is one connection: the twin is set aside and the
+        // read waits for C, somebody else.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let twin = spawn_as("127.0.0.1:0".parse().unwrap(), a.cert.clone(), "mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), node(vec![state(1, 90, None)], (1, None), vec![])).await;
+        let pinned = lane(vec![(twin.addr, Source::Introducer)], vec![a.addr.to_string()], false, None);
+        let money = PeerLane::new(pinned.clone(), Trust::Agreed);
+        let err = money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap_err();
+        assert!(matches!(err, ChainError::Unanswered(_)), "{err}");
+        let conns = pinned.live_conns().await;
+        assert_eq!(conns.iter().map(|p| (p.addr(), p.source())).collect::<Vec<_>>(), vec![(a.addr, Source::Pin)], "the pin stands, its alias is set aside");
+        let c = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        pinned.state.lock().await.candidates.push_back(Candidate::new(c.addr, Source::Gossip));
+        assert_eq!(money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap().records.len(), 1);
+
+        // Reached before the pin (a stored or gossiped address first), the
+        // alias makes room for the pin instead of standing in its way.
+        let later = lane(vec![], vec![a.addr.to_string()], false, None);
+        later.state.lock().await.conns.push(PeerConn::connect(twin.addr, Source::Introducer, &net(), TLS.clone()).await.unwrap());
+        let d = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        later.state.lock().await.candidates.push_back(Candidate::new(d.addr, Source::Gossip));
+        assert_eq!(PeerLane::new(later.clone(), Trust::Agreed).coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap().records.len(), 1);
+        let live: Vec<(SocketAddr, Source)> = later.live_conns().await.iter().map(|p| (p.addr(), p.source())).collect();
+        assert!(live.contains(&(a.addr, Source::Pin)) && live.contains(&(d.addr, Source::Gossip)), "{live:?}");
+        assert!(!live.iter().any(|(x, _)| *x == twin.addr), "the alias made room for the pin: {live:?}");
     }
 
     #[tokio::test]
@@ -4338,6 +4582,47 @@ mod tests {
         // Two pins: the public peer shares the first pin's group, the second pin pairs with it.
         assert_eq!(pick_agreed(&[(Source::Pin, g(1)), (Source::Pin, g(2)), (Source::Introducer, g(1))], true, false), Some(vec![1, 2]));
         assert_eq!(pick_agreed(&[(Source::Pin, g(1)), (Source::Pin, g(2)), (Source::Introducer, g(1))], true, true), Some(vec![0]), "pin-only: the first pin alone");
+    }
+
+    #[test]
+    fn an_outlier_is_told_by_two_independent_peers_never_by_one_or_by_one_group() {
+        let at = |n: u16| SocketAddr::from(([127, 0, 0, 1], n));
+        let g = |n: u16| group_of(at(n));
+        let peer = |n: u16, h: u32| (at(n), g(n), h);
+        let far = MAX_PEAK_LAG + 1;
+        // Two honest peers at 100 in distinct groups: a third announcing far
+        // above stands alone ahead, a fourth far below lags; the honest ones stay.
+        let pool = [peer(1, 100), peer(2, 100), peer(3, 100 + far), peer(4, 100 - far)];
+        assert!(outlier(&pool, at(3), g(3), 100 + far).is_some_and(|w| w.contains("above")));
+        assert!(outlier(&pool, at(4), g(4), 100 - far).is_some_and(|w| w.contains("lags")));
+        assert_eq!(outlier(&pool, at(1), g(1), 100), None);
+        assert_eq!(outlier(&pool, at(2), g(2), 100), None);
+        // Two peers alone: neither condemns the other.
+        let two = [peer(1, 100), peer(2, 1000)];
+        assert_eq!(outlier(&two, at(1), g(1), 100), None);
+        assert_eq!(outlier(&two, at(2), g(2), 1000), None);
+        // Two announcers in ONE group (one port at two loopback addresses: one
+        // host) corroborate nothing against an honest peer; the honest peer
+        // and another, in distinct groups, corroborate against each of them.
+        let host = |ip: [u8; 4], h: u32| (SocketAddr::from((ip, 7)), group_of(SocketAddr::from((ip, 7))), h);
+        let one_group = [host([127, 0, 0, 1], 1000), host([127, 0, 0, 2], 1000), peer(3, 100), peer(4, 100)];
+        assert_eq!(one_group[0].1, one_group[1].1, "one group");
+        assert_eq!(outlier(&one_group[..3], one_group[2].0, one_group[2].1, 100), None, "two peers in one group corroborate nothing");
+        assert_eq!(outlier(&one_group, one_group[2].0, one_group[2].1, 100), None);
+        assert!(outlier(&one_group, one_group[0].0, one_group[0].1, 1000).is_some_and(|w| w.contains("above")), "two independent peers corroborate against each announcer");
+        assert!(outlier(&one_group, one_group[1].0, one_group[1].1, 1000).is_some());
+        // A peer far ahead beside another far ahead in a distinct group is not
+        // alone: the pair behind is the one that lags.
+        let camps = [peer(1, 1000), peer(2, 1000), peer(3, 100), peer(4, 100)];
+        assert_eq!(outlier(&camps, at(1), g(1), 1000), None);
+        assert!(outlier(&camps, at(3), g(3), 100).is_some_and(|w| w.contains("lags")));
+        // The top of the range breaks no arithmetic.
+        let top = [peer(1, u32::MAX), peer(2, u32::MAX - 2), peer(3, 100)];
+        assert_eq!(outlier(&top, at(1), g(1), u32::MAX), None);
+        assert!(outlier(&top, at(3), g(3), 100).is_some_and(|w| w.contains("lags")));
+        assert_eq!(corroborated(&[peer(1, 5)]), None);
+        assert_eq!(corroborated(&[host([127, 0, 0, 1], 5), host([127, 0, 0, 2], 9)]), None, "one group");
+        assert_eq!(corroborated(&[peer(1, 5), peer(2, 9), peer(3, 7)]), Some(7));
     }
 
     #[test]

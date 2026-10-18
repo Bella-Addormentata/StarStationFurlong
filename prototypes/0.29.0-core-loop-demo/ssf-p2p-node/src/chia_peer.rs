@@ -298,6 +298,32 @@ pub fn canonical(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Which full node a connection reached (plan §14 (2): one node, one vote):
+/// the blake3 hash of the certificate the node presented in the TLS
+/// handshake. A full node keeps one certificate however many addresses it
+/// listens on, so a node reached at its IPv4 address and again at its IPv6
+/// address, two network groups, shows one identity, and the lane holds one
+/// connection per identity ([`crate::chia_peer_lane`], admission): a
+/// dual-stack node, or a pin found again under a public alias, cannot cast
+/// both votes of a money read (#271 review, round 21). Two nodes run under one
+/// copied certificate look like one node and hold one connection; two nodes
+/// of one operator under separate certificates are told apart only by their
+/// network groups, as before.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Identity([u8; 32]);
+
+impl Identity {
+    fn of_certificate(der: &[u8]) -> Self {
+        Self(*blake3::hash(der).as_bytes())
+    }
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Identity({:02x}{:02x}{:02x}{:02x}…)", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+
 /// A peer's latest announced peak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peak {
@@ -401,6 +427,8 @@ pub struct PeerConn {
     /// introducer or a pin names it this run.
     sources: Mutex<Sources>,
     group: Group,
+    /// The node behind the address, by the certificate it presented.
+    identity: Identity,
     sink: tokio::sync::Mutex<Sink>,
     pending: Arc<Mutex<Pending>>,
     next_id: AtomicU16,
@@ -442,6 +470,11 @@ impl PeerConn {
             .await
             .map_err(|_| anyhow!("tls handshake timed out"))?
             .context("tls handshake")?;
+        let identity = {
+            let (_, session) = tls_stream.get_ref();
+            let cert = session.peer_certificates().and_then(|chain| chain.first()).ok_or_else(|| anyhow!("peer presented no certificate"))?;
+            Identity::of_certificate(cert.as_ref())
+        };
         let request = format!("wss://{addr}/ws").into_client_request().context("websocket request")?;
         let (ws, _response) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::client_async(request, tls_stream))
             .await
@@ -458,6 +491,7 @@ impl PeerConn {
             addr,
             sources: Mutex::new(sources.into()),
             group: group_of(addr),
+            identity,
             sink: tokio::sync::Mutex::new(sink),
             pending,
             next_id: AtomicU16::new(1),
@@ -538,6 +572,12 @@ impl PeerConn {
 
     pub fn group(&self) -> Group {
         self.group
+    }
+
+    /// The node behind the connection ([`Identity`]): two connections showing
+    /// one identity reached one full node under two addresses.
+    pub fn identity(&self) -> Identity {
+        self.identity
     }
 
     /// Still connected, as far as the reader knows.
@@ -850,6 +890,9 @@ pub(crate) mod mock {
 
     pub(crate) struct MockNode {
         pub addr: SocketAddr,
+        /// The certificate the node presents; [`spawn_as`] brings up a second
+        /// address of the same node.
+        pub cert: Arc<chia_ssl::ChiaCertificate>,
         /// What the node announces after a handshake; set before clients connect.
         pub peak: Arc<Mutex<Option<Peak>>>,
         /// Every request type received, in order, across connections.
@@ -941,9 +984,23 @@ pub(crate) mod mock {
         peak: Option<Peak>,
         handler: Handler,
     ) -> MockNode {
+        spawn_as(bind, Arc::new(chia_ssl::ChiaCertificate::generate().unwrap()), network_id, node_type, genesis_prev, peak, handler).await
+    }
+
+    /// [`spawn_on`] presenting a given certificate: a second address of a node
+    /// already running ([`MockNode::cert`]), as a dual-stack full node shows
+    /// one certificate at both its addresses.
+    pub(crate) async fn spawn_as(
+        bind: SocketAddr,
+        cert: Arc<chia_ssl::ChiaCertificate>,
+        network_id: &str,
+        node_type: NodeType,
+        genesis_prev: Bytes32,
+        peak: Option<Peak>,
+        handler: Handler,
+    ) -> MockNode {
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let cert = chia_ssl::ChiaCertificate::generate().unwrap();
         let (chain, key) = pem_identity(&cert).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(chia_ca_roots()), provider.clone())
@@ -1012,7 +1069,7 @@ pub(crate) mod mock {
                 });
             }
         });
-        MockNode { addr, peak, seen, task }
+        MockNode { addr, cert, peak, seen, task }
     }
 }
 
