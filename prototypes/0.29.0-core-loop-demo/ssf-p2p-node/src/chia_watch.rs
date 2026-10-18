@@ -669,11 +669,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                         let mut changed = false;
                         for (coin_hex, hint_hex, era, was, gone, standing) in verdicts {
                             match standing {
-                                WriteStanding::Confirmed(height) if chia_lane::era_of(height) != era => {
+                                WriteStanding::Confirmed { height, .. } if chia_lane::era_of(height) != era => {
                                     println!("⛓️ ChiaHub knock: our knock confirmed at height {height}, outside era {era} — the host will not read it; forgotten, the next dial exhaustion knocks again");
                                     changed |= book.drop_sent(&coin_hex, &hint_hex);
                                 }
-                                WriteStanding::Confirmed(height) => {
+                                WriteStanding::Confirmed { height, seen_at } => {
                                     if book.confirm_sent(&coin_hex, &hint_hex, height) {
                                         if was == 0 {
                                             println!("⛓️ ChiaHub knock: our knock confirmed at height {height} — dialing the host on the schedule from here");
@@ -681,9 +681,12 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                             println!("⛓️ ChiaHub knock: the chain moved our knock from height {was} to {height} (a reorganization) — the schedule follows");
                                         }
                                         changed = true;
-                                    } else if knock_peak.is_some_and(|p| crate::chia_knock::settled(height, p)) && book.settle_sent(&coin_hex, &hint_hex) {
-                                        // Found where the book says, SETTLED_DEPTH deep, by
-                                        // THIS lookup: final. Age alone never settles it
+                                    } else if knock_peak.is_some_and(|p| crate::chia_knock::settled_by(height, p, seen_at)) && book.settle_sent(&coin_hex, &hint_hex) {
+                                        // Found where the book says, SETTLED_DEPTH deep at the
+                                        // agreed peak AND at the height the lookup's own peers
+                                        // stood (round 10: peers behind the peak prove it only
+                                        // as deep as they see it, an undated lookup no depth),
+                                        // by THIS lookup: final. Age alone never settles it
                                         // (#272 review round 8).
                                         changed = true;
                                     }
@@ -714,8 +717,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             }
             // ── #231 P6b: the knocks READ, until settled (#272 review round
             // 7): the coin that carried each is looked up again on the agreed
-            // lane until a lookup finds it unmoved SETTLED_DEPTH deep (round 8:
-            // age alone proves nothing) — moved by a reorganization, its clock
+            // lane until a lookup finds it unmoved SETTLED_DEPTH deep, at the
+            // agreed peak and at the lookup's own judged height alike (round 8:
+            // age alone proves nothing; round 10: nor does a peak the answering
+            // peers have not reached) — moved by a reorganization, its clock
             // follows (the knocker's does the same above), or the knock is void
             // when the move left its era; gone — on a listing judged at or past
             // its block (round 9: peers behind it know nothing of the coin) —

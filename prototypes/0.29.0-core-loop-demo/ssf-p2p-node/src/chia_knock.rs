@@ -89,6 +89,16 @@ pub fn settled(confirmed: u32, peak: u32) -> bool {
     confirmed != 0 && peak >= confirmed.saturating_add(SETTLED_DEPTH)
 }
 
+/// Is a coin found at `confirmed` by a lookup judged at `seen_at` (the height
+/// the answering peers stood at; `None`: undated) settled at agreed peak
+/// `peak` (#272 review round 10)? Only when it stands [`SETTLED_DEPTH`] deep
+/// BOTH at the peak and at the lookup's own height: peers behind the peak
+/// prove the coin only as deep as they see it, and an undated lookup proves
+/// no depth at all, however far the peak has gone.
+pub fn settled_by(confirmed: u32, peak: u32, seen_at: Option<u32>) -> bool {
+    settled(confirmed, peak) && seen_at.is_some_and(|seen| settled(confirmed, seen))
+}
+
 /// A knock the dial ladder asked for, waiting for the publisher (RAM only: a
 /// knock not yet sent is re-decided by the next dial anyway).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,9 +190,12 @@ pub enum InboxMove {
 /// (`saved`) and the agreed peak — [`coin_word`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoinWord {
-    /// Found where the book says, [`SETTLED_DEPTH`] deep: final.
+    /// Found where the book says, [`SETTLED_DEPTH`] deep at the agreed peak
+    /// and at the lookup's own judged height alike ([`settled_by`]): final.
     Settled,
-    /// Found where the book says, not deep enough yet: asked again next tick.
+    /// Found where the book says, not deep enough yet — at the peak, or at the
+    /// height the answering peers stood (round 10), or the lookup came
+    /// undated: asked again next tick.
     Unmoved,
     /// Found in another block: a reorganization moved it.
     MovedTo(u32),
@@ -198,11 +211,13 @@ pub enum CoinWord {
 /// See [`CoinWord`]. A coin a complete listing does not name is gone only
 /// when the listing was judged at or past the height the book holds it
 /// confirmed at: replacement peers answering below that block do not list
-/// it, and prove nothing by that.
+/// it, and prove nothing by that. A coin found where the book says is
+/// settled only as deep as the listing's own judged height shows it, as
+/// well as the peak ([`settled_by`], round 10).
 pub fn coin_word(found: Option<u32>, judged_at: Option<u32>, saved: u32, peak: u32) -> CoinWord {
     match found {
         Some(h) if h == saved => {
-            if settled(h, peak) {
+            if settled_by(h, peak, judged_at) {
                 CoinWord::Settled
             } else {
                 CoinWord::Unmoved
@@ -670,7 +685,15 @@ mod tests {
         assert_eq!(coin_word(None, Some(100), 100, 200), Gone, "judged at the block itself");
         assert_eq!(coin_word(None, Some(150), 100, 200), Gone);
         assert_eq!(coin_word(Some(100), Some(98), 100, 100 + SETTLED_DEPTH - 1), Unmoved, "found where the book says, young");
-        assert_eq!(coin_word(Some(100), None, 100, 100 + SETTLED_DEPTH), Settled, "deep enough: the lookup's own word settles it");
+        assert_eq!(coin_word(Some(100), Some(100 + SETTLED_DEPTH), 100, 100 + SETTLED_DEPTH), Settled, "deep enough at the peak and at the lookup's own height: its word settles it");
+        // Round 10: the lookup's word reaches only as deep as the peers that
+        // gave it stood; the agreed peak alone proves nothing of the coin.
+        assert_eq!(coin_word(Some(100), Some(100 + SETTLED_DEPTH - 1), 100, 100 + SETTLED_DEPTH), Unmoved, "the peak is deep enough, the peers answering are not");
+        assert_eq!(coin_word(Some(100), None, 100, 100 + SETTLED_DEPTH), Unmoved, "undated: no depth is proved");
+        assert_eq!(coin_word(Some(100), Some(100 + 2 * SETTLED_DEPTH), 100, 100 + SETTLED_DEPTH - 1), Unmoved, "the peers deep enough, the agreed peak not: nothing yet");
+        assert!(settled_by(100, 100 + SETTLED_DEPTH, Some(100 + SETTLED_DEPTH)));
+        assert!(!settled_by(100, 100 + SETTLED_DEPTH, Some(100 + SETTLED_DEPTH - 1)) && !settled_by(100, 100 + SETTLED_DEPTH, None));
+        assert!(!settled_by(0, 1000, Some(1000)), "a coin never confirmed settles nowhere");
         assert_eq!(coin_word(Some(103), Some(200), 100, 200), MovedTo(103));
     }
 

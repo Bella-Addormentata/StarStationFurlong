@@ -664,8 +664,14 @@ pub async fn coin_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) -> 
 /// write and a later spend of ours taken the same coin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HintChild {
-    /// The write's own coin is under the hint, confirmed at this height.
-    Confirmed(u32),
+    /// The write's own coin is under the hint, confirmed at `height`, found
+    /// by a lookup judged at `judged_at` (the lowest height over the pages
+    /// read up to the one that held it; `None` once a page came undated). That
+    /// is the height the answering peers stood at, and bounds how deep THEY
+    /// saw the coin (#272 review round 10): a settlement is a lookup's word,
+    /// so its depth is measured at the lookup's own height as well as the
+    /// agreed peak, and an undated lookup settles nothing.
+    Confirmed { height: u32, judged_at: Option<u32> },
     /// The listing ran to its end and no coin under the hint names the input
     /// as its parent; judged at this height (`None`: the source gave none).
     Absent { judged_at: Option<u32> },
@@ -696,12 +702,12 @@ pub async fn child_under_hint(client: &impl ChainAccess, hint: Bytes32, parent: 
             .coin_records_by_hint(hint, None, true, page.take())
             .await
             .map_err(|e| anyhow!("hint lookup: {e}"))?;
-        if let Some(rec) = listing.records.iter().find(|r| r.coin.parent_coin_info == parent) {
-            return Ok(HintChild::Confirmed(rec.confirmed_block_index));
-        }
         match listing.judged_at {
             Some(h) => judged_at = Some(judged_at.map_or(h, |lowest| lowest.min(h))),
             None => undated = true,
+        }
+        if let Some(rec) = listing.records.iter().find(|r| r.coin.parent_coin_info == parent) {
+            return Ok(HintChild::Confirmed { height: rec.confirmed_block_index, judged_at: if undated { None } else { judged_at } });
         }
         match (listing.truncated, listing.next_cursor) {
             (true, Some(next)) => page = Some(next),
@@ -721,7 +727,9 @@ pub enum LeaseWord {
     /// Still parked: the spend may be live in a mempool.
     Parked,
     /// Released because the chain listed the input spent (by this write, or
-    /// by another that took the coin): the chain lookups say which.
+    /// by another that took the coin): the chain lookups say which. Kept in
+    /// the lease file while the spend SETTLES (#272 review round 10), so the
+    /// word outlives a restart until the input is spent SETTLED_DEPTH deep.
     Spent,
     /// Released because every peer refused the bundle: the spend will never
     /// land. The one word that can call an unspent input DEAD.
@@ -734,8 +742,11 @@ pub enum LeaseWord {
 /// Where a pending write stands (#231 P6b knocks and beacons, #272 review).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteStanding {
-    /// On chain, confirmed at this height.
-    Confirmed(u32),
+    /// On chain, confirmed at `height`, by a lookup judged at `seen_at`
+    /// (`None`: undated), carried through so a settlement is measured at the
+    /// lookup's own height ([`crate::chia_knock::settled_by`], #272 review
+    /// round 10).
+    Confirmed { height: u32, seen_at: Option<u32> },
     /// Never landed, for the reason given: the writer forgets it and may write again.
     Dead(&'static str),
     /// Not settled yet: left as it is, asked again next tick.
@@ -756,7 +767,7 @@ pub enum WriteStanding {
 /// by the clock.
 pub fn write_standing(child: &HintChild, spent_at: Option<u32>, lease: LeaseWord) -> WriteStanding {
     match child {
-        HintChild::Confirmed(height) => WriteStanding::Confirmed(*height),
+        HintChild::Confirmed { height, judged_at } => WriteStanding::Confirmed { height: *height, seen_at: *judged_at },
         HintChild::Unknown => WriteStanding::Pending,
         HintChild::Absent { judged_at } => match spent_at {
             Some(spent) if judged_at.is_some_and(|judged| judged >= spent) => {
@@ -1215,8 +1226,9 @@ mod tests {
     fn a_write_is_judged_by_its_own_coin_under_the_hint_not_by_its_spent_input() {
         use LeaseWord::{Dropped, Parked, Spent, Unknown};
         let absent = |judged_at| HintChild::Absent { judged_at };
-        assert_eq!(write_standing(&HintChild::Confirmed(900), Some(900), Spent), WriteStanding::Confirmed(900));
-        assert_eq!(write_standing(&HintChild::Confirmed(900), None, Parked), WriteStanding::Confirmed(900), "the child is the proof, whatever the input says");
+        let found = |judged_at| HintChild::Confirmed { height: 900, judged_at };
+        assert_eq!(write_standing(&found(Some(950)), Some(900), Spent), WriteStanding::Confirmed { height: 900, seen_at: Some(950) });
+        assert_eq!(write_standing(&found(None), None, Parked), WriteStanding::Confirmed { height: 900, seen_at: None }, "the child is the proof, whatever the input says; the lookup's own height rides along (round 10)");
         assert_eq!(write_standing(&HintChild::Unknown, Some(900), Dropped), WriteStanding::Pending, "a listing cut short decides nothing");
         assert_eq!(write_standing(&absent(Some(950)), Some(900), Parked), WriteStanding::Dead("its coin went to another spend of ours"));
         assert_eq!(write_standing(&absent(Some(900)), Some(900), Spent), WriteStanding::Dead("its coin went to another spend of ours"), "judged at the spend itself is enough");
@@ -1388,7 +1400,7 @@ mod tests {
         assert!(!absent(Some(99)).gone_since(100), "peers behind the confirmation know nothing of it");
         assert!(!absent(None).gone_since(100), "undated: nothing is said");
         assert!(!HintChild::Unknown.gone_since(100), "cut short: nothing is said");
-        assert!(!HintChild::Confirmed(100).gone_since(100));
+        assert!(!HintChild::Confirmed { height: 100, judged_at: Some(100) }.gone_since(100));
         assert!(!absent(Some(150)).gone_since(0), "a write never confirmed has no block to lose");
     }
 
@@ -1410,9 +1422,16 @@ mod tests {
             next_cursor: next.map(str::to_string),
             judged_at,
         };
-        // Two pages: the write's own coin is on the second.
-        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(120)), page(vec![rec(7, 101)], false, None, Some(120))]);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed(101));
+        // Two pages: the write's own coin is on the second, found by a lookup
+        // judged at the lowest height over the pages read (round 10).
+        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(130)), page(vec![rec(7, 101)], false, None, Some(120))]);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: Some(120) });
+        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(120)), page(vec![rec(7, 101)], true, Some("d"), Some(130))]);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: Some(120) }, "the lowest page so far, not the one that held it");
+        // Found after an undated page: the height the peers stood at is
+        // unknown, and no settlement can be measured by it.
+        let chain = Scripted::new(vec![page(vec![], true, Some("c"), None), page(vec![rec(7, 101)], false, None, Some(130))]);
+        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: None });
         // A listing run to its end without it, judged at the lowest height over its pages.
         let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(130)), page(vec![rec(2, 101)], false, None, Some(120))]);
         assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Absent { judged_at: Some(120) });

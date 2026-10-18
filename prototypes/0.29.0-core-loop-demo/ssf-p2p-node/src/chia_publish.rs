@@ -159,7 +159,42 @@ pub struct WalletLease {
     /// its spend. This run's memory only — the file carries the parking, not
     /// the verdicts — and bounded ([`MAX_RELEASES_REMEMBERED`]).
     released: std::sync::Mutex<HashMap<Bytes32, LeaseWord>>,
+    /// Spends released as SPENT that the chain has not yet settled
+    /// [`crate::chia_knock::SETTLED_DEPTH`] deep (#272 review round 10), by
+    /// spend number: their inputs, the height the chain listed them spent at,
+    /// and the bundle. A reorganization can drop the block that confirmed a
+    /// spend; its inputs then read unspent again and a knock or beacon it
+    /// carried returns to PENDING — with the bundle forgotten at the release,
+    /// nothing could push the spend again, the writer waited on it for the
+    /// rest of the era, and a writer selecting the freed coin raced the spend
+    /// the mempool took back. So a spend released as spent is SETTLING: not
+    /// parked (its coins are spent, the wallet's next coin is the one it
+    /// created), but kept with its bundle in the lease file, its coins never
+    /// selected ([`WalletLease::is_taken`]), until a listing finds its inputs
+    /// spent SETTLED_DEPTH deep at the listing's own judged height — and
+    /// parked AGAIN, under its own number and bundle, the moment a listing
+    /// judged at or past the spent height lists an input unspent, so the
+    /// liveness probe pushes the spend again ([`mempool_probes`]) and the
+    /// chain or the mempool settles it anew ([`settling_step`]). Bounded
+    /// ([`MAX_SETTLING`]).
+    settling: std::sync::Mutex<BTreeMap<u64, Settling>>,
 }
+
+/// A spend released as spent, kept until the chain settles it (see
+/// [`WalletLease`]'s `settling`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Settling {
+    coins: Vec<ParkedInput>,
+    /// The height the chain listed its inputs spent at (the latest, when they differ).
+    spent_at: u32,
+    bundle: SpendBundle,
+}
+
+/// Settling spends kept at most (#272 review round 10): past it the oldest
+/// is forgotten, with a log line, as a release forgot every spend before —
+/// a bound on the file, reached only if the chain cannot be read for as long
+/// as it takes a node to make this many spends.
+pub const MAX_SETTLING: usize = 64;
 
 /// Release verdicts remembered at most; past it the memory starts afresh (a
 /// forgotten verdict reads as [`LeaseWord::Unknown`], which kills nothing).
@@ -231,6 +266,27 @@ struct LeaseFile {
     /// S‑0 step 2; absent in files older nodes wrote.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bundles: Vec<ParkedBundle>,
+    /// The spends released as spent and not yet settled SETTLED_DEPTH deep,
+    /// with their bundles (#272 review round 10); absent in older files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    settling: Vec<SettlingSpend>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct SettlingSpend {
+    spend: u64,
+    /// The height the chain listed the inputs spent at.
+    spent_at: u32,
+    coins: Vec<SettlingCoin>,
+    /// Hex of the bundle's wire bytes.
+    bundle: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct SettlingCoin {
+    coin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seen_at: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
@@ -289,6 +345,7 @@ impl WalletLease {
             store: std::sync::Mutex::new(None),
             sealed: std::sync::Mutex::new(None),
             released: std::sync::Mutex::new(HashMap::new()),
+            settling: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -406,14 +463,33 @@ impl WalletLease {
     }
 
     /// The lease's word on `coin` (#231 P6b, #272 review round 2): parked,
-    /// released as spent or as dropped by a reconciliation of THIS run, or
-    /// unknown. A coin parked again by a later spend reads as parked, whatever
-    /// an older release said.
+    /// spent and still settling (kept in the file, so this word outlives a
+    /// restart; round 10), released as spent or as dropped by a reconciliation
+    /// of THIS run, or unknown. A coin parked again by a later spend reads as
+    /// parked, whatever an older release said.
     pub fn lease_word(&self, coin: &Bytes32) -> LeaseWord {
         if self.is_parked(coin) {
             return LeaseWord::Parked;
         }
+        if self.is_settling(coin) {
+            return LeaseWord::Spent;
+        }
         self.released.lock().unwrap().get(coin).copied().unwrap_or(LeaseWord::Unknown)
+    }
+
+    /// Is `coin` an input of a spend released as spent that the chain has not
+    /// settled SETTLED_DEPTH deep yet (#272 review round 10)?
+    pub fn is_settling(&self, coin: &Bytes32) -> bool {
+        self.settling.lock().unwrap().values().any(|s| s.coins.iter().any(|c| c.coin_id == *coin))
+    }
+
+    /// Must a writer leave `coin` alone when selecting? Parked, or settling
+    /// (round 10): a coin the chain listed spent can read unspent again after
+    /// a reorganization, and then the spend that consumed it is parked again
+    /// and pushed again by the lease — never taken by a new write, which would
+    /// race it in the mempool.
+    pub fn is_taken(&self, coin: &Bytes32) -> bool {
+        self.is_pending(coin) || self.is_settling(coin)
     }
 
     /// Remember why coins were released, for [`WalletLease::lease_word`].
@@ -478,9 +554,57 @@ impl WalletLease {
     /// that spend's number and stays, whatever a stale verdict says. A release
     /// the file cannot take is logged: it then over-parks a settled coin until
     /// the next change saves, or a restart reconciles it away; never under.
+    /// The forget path — a rejection's hand-back ([`WalletLease::unpark`]) and
+    /// the lease tests; a reconciliation retires through [`WalletLease::retire`],
+    /// which keeps a spend released as SPENT settling (round 10).
     pub fn release(&self, spends: &[u64]) {
-        self.pending.lock().unwrap().retain(|_, parked| !spends.contains(&parked.spend));
-        self.bundles.lock().unwrap().retain(|spend, _| !spends.contains(spend));
+        self.retire(spends, Vec::new(), &[], &[], Instant::now());
+    }
+
+    /// What a reconciliation decided, in ONE write of the file (#272 review
+    /// round 10): `released` spends leave the parking (compare-and-release, as
+    /// [`WalletLease::release`]); those among them released as spent with a
+    /// bundle, `settling`, are kept settling under their numbers; `reparked`
+    /// settling spends go back into the parking under theirs, with a fresh
+    /// grace, never over a NEWER marker of the same coin (a coin a later spend
+    /// took meanwhile keeps that spend's marker; a re-parked spend none of
+    /// whose coins is free again is forgotten, its bundle with it, so no bundle
+    /// parks no coin); `done` settling spends are forgotten.
+    fn retire(&self, released: &[u64], settling: Vec<(u64, Settling)>, reparked: &[u64], done: &[u64], now: Instant) {
+        let back: Vec<(u64, Settling)> = {
+            let mut kept = self.settling.lock().unwrap();
+            for spend in done {
+                kept.remove(spend);
+            }
+            let back = reparked.iter().filter_map(|spend| kept.remove(spend).map(|s| (*spend, s))).collect();
+            kept.extend(settling);
+            while kept.len() > MAX_SETTLING {
+                if let Some((oldest, _)) = kept.pop_first() {
+                    eprintln!(
+                        "⛓️ wallet lease: more than {MAX_SETTLING} spends settling; the oldest, #{oldest}, is forgotten before the chain settled it"
+                    );
+                }
+            }
+            back
+        };
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.retain(|_, parked| !released.contains(&parked.spend));
+            let mut bundles = self.bundles.lock().unwrap();
+            bundles.retain(|spend, _| !released.contains(spend));
+            for (spend, s) in back {
+                let mut parked_any = false;
+                for c in &s.coins {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = pending.entry(c.coin_id) {
+                        slot.insert(Parked { at: now, spend, seen_at: c.seen_at });
+                        parked_any = true;
+                    }
+                }
+                if parked_any {
+                    bundles.insert(spend, s.bundle);
+                }
+            }
+        }
         self.persist_or_log("a release");
     }
 
@@ -507,17 +631,17 @@ impl WalletLease {
             Ok(bytes) => match serde_json::from_slice::<LeaseFile>(&bytes) {
                 Ok(file) => self
                     .load(&file, Instant::now())
-                    .map(|parked| (file.spends, parked))
+                    .map(|counts| (file.spends, counts))
                     .map_err(|e| format!("{} holds a {e}", path.display())),
                 Err(e) => Err(format!("{} is unreadable ({e})", path.display())),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, 0)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, (0, 0))),
             Err(e) => Err(format!("cannot read {}: {e}", path.display())),
         };
         match read {
-            Ok((_, 0)) => {}
-            Ok((spends, parked)) => println!(
-                "⛓️ wallet lease: {parked} coin(s) still parked from the last run (spends up to #{spends}); the chain and the mempool settle them"
+            Ok((_, (0, 0))) => {}
+            Ok((spends, (parked, settling))) => println!(
+                "⛓️ wallet lease: {parked} coin(s) still parked and {settling} spend(s) still settling from the last run (spends up to #{spends}); the chain and the mempool settle them"
             ),
             Err(why) => {
                 eprintln!(
@@ -531,7 +655,10 @@ impl WalletLease {
     }
 
     /// Merge a stored parking into the lease (see [`WalletLease::restore`]):
-    /// how many coins it parked. Checked WHOLE before anything is taken, so a
+    /// how many coins it parked and how many spends it had settling (round
+    /// 10: each numbered inside the counter and neither parked nor listed
+    /// twice, with inputs, a spent height and a readable bundle). Checked
+    /// WHOLE before anything is taken, so a
     /// file that fails any check leaves the lease untouched and seals it: what
     /// it recorded is unknown, not forgotten. The checks (#245 review, round
     /// 21): the version this node writes; every coin id well formed and listed
@@ -540,7 +667,7 @@ impl WalletLease {
     /// counter had fallen behind its entries would hand a new spend a restored
     /// number, and one verdict would then release both (compare-and-release
     /// relies on the numbers being distinct).
-    fn load(&self, file: &LeaseFile, now: Instant) -> Result<usize, String> {
+    fn load(&self, file: &LeaseFile, now: Instant) -> Result<(usize, usize), String> {
         if file.v != 1 {
             return Err(format!("version {} this node does not read (it writes version 1)", file.v));
         }
@@ -572,6 +699,29 @@ impl WalletLease {
             let bundle = SpendBundle::from_bytes(&bytes).map_err(|e| format!("unreadable bundle for spend #{}: {e}", entry.spend))?;
             bundles.push((entry.spend, bundle));
         }
+        let mut settling: Vec<(u64, Settling)> = Vec::with_capacity(file.settling.len());
+        for entry in &file.settling {
+            if entry.spend == 0 || entry.spend > file.spends {
+                return Err(format!(
+                    "settling spend #{} outside its spend counter #{} (spends run 1..=counter)",
+                    entry.spend, file.spends
+                ));
+            }
+            if parked.iter().any(|(_, spend, _)| *spend == entry.spend) || settling.iter().any(|(spend, _)| *spend == entry.spend) {
+                return Err(format!("settling spend #{} listed as parked too, or twice", entry.spend));
+            }
+            if entry.coins.is_empty() || entry.spent_at == 0 {
+                return Err(format!("settling spend #{} with no inputs or no spent height", entry.spend));
+            }
+            let mut coins = Vec::with_capacity(entry.coins.len());
+            for c in &entry.coins {
+                let coin_id = parse_coin_id(&c.coin).ok_or_else(|| format!("malformed settling coin id {:?}", c.coin))?;
+                coins.push(ParkedInput { coin_id, seen_at: c.seen_at });
+            }
+            let bytes = hex::decode(&entry.bundle).map_err(|e| format!("malformed bundle for settling spend #{}: {e}", entry.spend))?;
+            let bundle = SpendBundle::from_bytes(&bytes).map_err(|e| format!("unreadable bundle for settling spend #{}: {e}", entry.spend))?;
+            settling.push((entry.spend, Settling { coins, spent_at: entry.spent_at, bundle }));
+        }
         {
             let mut pending = self.pending.lock().unwrap();
             for (id, spend, seen_at) in &parked {
@@ -582,11 +732,18 @@ impl WalletLease {
                 kept.entry(spend).or_insert(bundle);
             }
         }
+        let settling_count = settling.len();
+        {
+            let mut kept = self.settling.lock().unwrap();
+            for (spend, s) in settling {
+                kept.entry(spend).or_insert(s);
+            }
+        }
         self.spends.fetch_max(file.spends, std::sync::atomic::Ordering::Relaxed);
         if let Some(incoming) = incoming {
             *self.incoming.lock().unwrap() = Some(incoming);
         }
-        Ok(parked.len())
+        Ok((parked.len(), settling_count))
     }
 
     /// Write the parking to the store, if [`WalletLease::restore`] named one:
@@ -629,23 +786,49 @@ impl WalletLease {
             .filter_map(|(spend, bundle)| bundle.to_bytes().ok().map(|bytes| ParkedBundle { spend: *spend, bundle: hex::encode(bytes) }))
             .collect();
         bundles.sort_by_key(|b| b.spend);
-        LeaseFile { v: 1, spends: self.spends.load(std::sync::atomic::Ordering::Relaxed), parked, incoming, bundles }
+        let settling: Vec<SettlingSpend> = self
+            .settling
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(spend, s)| {
+                s.bundle.to_bytes().ok().map(|bytes| SettlingSpend {
+                    spend: *spend,
+                    spent_at: s.spent_at,
+                    coins: s.coins.iter().map(|c| SettlingCoin { coin: hex::encode(c.coin_id), seen_at: c.seen_at }).collect(),
+                    bundle: hex::encode(bytes),
+                })
+            })
+            .collect();
+        LeaseFile { v: 1, spends: self.spends.load(std::sync::atomic::Ordering::Relaxed), parked, incoming, bundles, settling }
     }
 
     /// Settle the parked spends against the chain and the mempool: ask the
     /// chain about every spend past the grace, then release what [`settle`]
-    /// says. Lookups that fail leave their spends parked, FAIL CLOSED: a coin
-    /// stays parked until the chain gives an authoritative answer, however
-    /// long that takes; nothing here is decided by the clock. Callers hold the
-    /// lease gate (every writer does; the dish's status read takes it for
-    /// this), and `release` is compare-and-release besides, so a verdict can
-    /// never remove a marker parked after it was formed.
+    /// says — and judge the spends still SETTLING by the same listing
+    /// ([`settling_step`], round 10). Lookups that fail leave their spends
+    /// parked, FAIL CLOSED: a coin stays parked until the chain gives an
+    /// authoritative answer, however long that takes; nothing here is decided
+    /// by the clock. Callers hold the lease gate (every writer does; the
+    /// dish's status read takes it for this), and `release` is
+    /// compare-and-release besides, so a verdict can never remove a marker
+    /// parked after it was formed.
     pub async fn reconcile(&self, client: &impl ChainAccess) {
-        let due = self.due_at(Instant::now());
-        if due.is_empty() {
+        self.reconcile_at(client, Instant::now()).await
+    }
+
+    /// [`WalletLease::reconcile`] at a given instant (the tests' clock).
+    async fn reconcile_at(&self, client: &impl ChainAccess, now: Instant) {
+        let due = self.due_at(now);
+        let settling: Vec<(u64, Settling)> = self.settling.lock().unwrap().iter().map(|(spend, s)| (*spend, s.clone())).collect();
+        if due.is_empty() && settling.is_empty() {
             return;
         }
-        let coins: Vec<Bytes32> = due.iter().flat_map(|d| d.coins.iter().map(|c| c.coin_id)).collect();
+        // The settling spends' inputs ride the same listing.
+        let mut coins: Vec<Bytes32> = due.iter().flat_map(|d| d.coins.iter().map(|c| c.coin_id)).collect();
+        coins.extend(settling.iter().flat_map(|(_, s)| s.coins.iter().map(|c| c.coin_id)));
+        coins.sort();
+        coins.dedup();
         // One listing for every parked coin, paged like every chain listing:
         // follow the cursor, and if it is still cut short at the cap (or
         // truncated with no cursor), the listing is INCOMPLETE and a spend with
@@ -683,6 +866,8 @@ impl WalletLease {
             }
         };
         let spent_on_chain: HashMap<Bytes32, bool> = records.iter().map(|r| (r.coin.coin_id(), r.spent)).collect();
+        let spent_heights: HashMap<Bytes32, u32> =
+            records.iter().filter(|r| r.spent).map(|r| (r.coin.coin_id(), r.spent_block_index)).collect();
         // One liveness question per spend the chain still lists unspent in
         // full (see `mempool_probes`): its bundle goes to the peers again, and
         // their acks say whether it is live (in a mempool, or taken back) or
@@ -703,13 +888,97 @@ impl WalletLease {
             };
             in_mempool.insert(spend, live);
         }
-        let judged_at = if complete && !undated { judged_at } else { None };
-        let released = settle(&due, &spent_on_chain, &in_mempool, judged_at);
-        if !released.is_empty() {
-            self.remember(&release_words(&due, &released, &spent_on_chain, &in_mempool));
-            self.release(&released);
+        // The height the listing was judged at for a coin it NAMES (its spent
+        // flag stands as of it, cut short or not), and for one it leaves out
+        // (which says nothing unless the listing ran to its end).
+        let judged = if undated { None } else { judged_at };
+        let judged_complete = if complete { judged } else { None };
+        let released = settle(&due, &spent_on_chain, &in_mempool, judged_complete);
+        let words = release_words(&due, &released, &spent_on_chain, &in_mempool);
+        // Round 10: a spend released as SPENT keeps its bundle SETTLING, under
+        // the height the chain spent its inputs at, until a listing finds them
+        // spent SETTLED_DEPTH deep; one released on the peers' refusal, or on
+        // the listing's silence, or parked by an older node without a bundle,
+        // is forgotten as before.
+        let now_settling: Vec<(u64, Settling)> = due
+            .iter()
+            .filter(|d| released.contains(&d.spend))
+            .filter_map(|d| {
+                let bundle = d.bundle.clone()?;
+                let spent_at = d.coins.iter().filter_map(|c| spent_heights.get(&c.coin_id).copied()).max()?;
+                Some((d.spend, Settling { coins: d.coins.clone(), spent_at, bundle }))
+            })
+            .collect();
+        let mut reparked = Vec::new();
+        let mut done = Vec::new();
+        for (spend, s) in &settling {
+            let inputs: Vec<(Option<bool>, Option<u32>)> =
+                s.coins.iter().map(|c| (spent_on_chain.get(&c.coin_id).copied(), c.seen_at)).collect();
+            match settling_step(s.spent_at, &inputs, judged, judged_complete) {
+                SettlingStep::Keep => {}
+                SettlingStep::Repark => {
+                    println!(
+                        "⛓️ wallet lease: the block that spent spend #{spend}'s coins at height {} is gone (a reorganization); parked again, to be pushed again",
+                        s.spent_at
+                    );
+                    reparked.push(*spend);
+                }
+                SettlingStep::Done(spent) => {
+                    if !spent {
+                        println!("⛓️ wallet lease: spend #{spend}'s coins are on no chain the peers know; forgotten");
+                    }
+                    done.push(*spend);
+                }
+            }
+        }
+        if !released.is_empty() || !reparked.is_empty() || !done.is_empty() {
+            self.remember(&words);
+            self.retire(&released, now_settling, &reparked, &done, now);
         }
     }
+}
+
+/// What a reconciliation does with a spend released as spent and not yet
+/// settled (see [`WalletLease`]'s `settling`, #272 review round 10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettlingStep {
+    /// Nothing decided: judged again next pass.
+    Keep,
+    /// An input reads UNSPENT on a listing judged at or past the height it
+    /// was spent at: the block that held the spend is gone. The spend is
+    /// parked again under its number and bundle, so the liveness probe pushes
+    /// it again and no writer selects the coin meanwhile.
+    Repark,
+    /// Final — `true`: every input spent [`crate::chia_knock::SETTLED_DEPTH`]
+    /// deep at the listing's judged height; `false`: the inputs are on no
+    /// chain the peers know, absent from a complete listing judged at or past
+    /// their own confirmation, so there is nothing to settle and nothing to
+    /// push again.
+    Done(bool),
+}
+
+/// Judge a settling spend, spent at `spent_at`, by a listing: `inputs` is
+/// each input's spent flag where the listing names it (`None`: absent) with
+/// the height the coin was seen confirmed at when selected; `judged` the
+/// height the listing was judged at (`None`: undated), `judged_complete` the
+/// same only when the listing ran to its end. A listing judged below the
+/// spent height, or undated, lists the inputs unspent without proving the
+/// block gone (peers behind it); one cut short says nothing of the coins it
+/// left out; a coin whose height is unknown is never freed on silence.
+/// Nothing here is decided by the clock.
+pub fn settling_step(spent_at: u32, inputs: &[(Option<bool>, Option<u32>)], judged: Option<u32>, judged_complete: Option<u32>) -> SettlingStep {
+    if judged.is_some_and(|j| j >= spent_at) && inputs.iter().any(|(spent, _)| *spent == Some(false)) {
+        return SettlingStep::Repark;
+    }
+    let final_word = |spent: Option<bool>, seen: Option<u32>| match spent {
+        Some(true) => judged.is_some_and(|j| crate::chia_knock::settled(spent_at, j)),
+        Some(false) => false,
+        None => judged_complete.is_some_and(|j| seen.is_some_and(|seen| j >= seen)),
+    };
+    if !inputs.is_empty() && inputs.iter().all(|(spent, seen)| final_word(*spent, *seen)) {
+        return SettlingStep::Done(inputs.iter().all(|(spent, _)| *spent == Some(true)));
+    }
+    SettlingStep::Keep
 }
 
 /// Push `bundle`, which consumes `inputs`, with the inputs PARKED FIRST (#245
@@ -932,8 +1201,11 @@ impl Default for WalletLease {
 }
 
 /// Find our largest UNSPENT coin — the one to spend-to-self — skipping coins a
-/// spend is already pending for (see [`WalletLease`]), with the height it was
-/// seen confirmed at, which its parking records. `None` if unfunded.
+/// spend is already pending for, or settling ([`WalletLease::is_taken`]: a
+/// coin the chain listed spent can read unspent again after a reorganization,
+/// and the lease then parks and pushes its spend again rather than a writer
+/// taking it), with the height it was seen confirmed at, which its parking
+/// records. `None` if unfunded.
 ///
 /// Every page of the listing is read, up to the bound every wallet listing
 /// shares (`chia_faucet::MAX_FAUCET_PAGES`): the first page can hold only
@@ -945,7 +1217,7 @@ pub async fn find_spendable_coin(
 ) -> Result<Option<crate::chia_faucet::FaucetCoin>> {
     let listing = crate::chia_faucet::unspent_at(client, puzzle_hash).await?;
     let mut coins: Vec<crate::chia_faucet::FaucetCoin> =
-        listing.coins.into_iter().filter(|c| !WALLET_LEASE.is_pending(&c.coin.coin_id())).collect();
+        listing.coins.into_iter().filter(|c| !WALLET_LEASE.is_taken(&c.coin.coin_id())).collect();
     if coins.is_empty() && listing.partial {
         eprintln!(
             "⛓️ wallet: no free coin in the first {} pages at {puzzle_hash}; the listing was cut short, so there may be one further on",
@@ -1492,7 +1764,9 @@ pub enum BeaconStep {
 /// Judge a beacon mark by the chain's word (`word`: [`beacon_standing`]'s,
 /// `None` when the chain could not be asked) against `era`, the current one,
 /// and `peak`, the agreed peak. A confirmed mark is judged again until a
-/// lookup finds its coin unmoved [`crate::chia_knock::SETTLED_DEPTH`] deep, as
+/// lookup finds its coin unmoved [`crate::chia_knock::SETTLED_DEPTH`] deep —
+/// at the agreed peak and at the lookup's own judged height alike, an undated
+/// lookup settling nothing ([`crate::chia_knock::settled_by`], round 10) — as
 /// a knock is ([`crate::chia_knock::coin_word`]): the chain moving the block
 /// that holds it moves the mark; a listing judged at or past its block that
 /// lacks the coin returns the mark to PENDING — the spend may land again, and
@@ -1506,16 +1780,16 @@ pub fn beacon_step(mark: &BeaconMark, word: Option<(crate::chia_resolve::WriteSt
     use crate::chia_resolve::WriteStanding;
     match word {
         None => BeaconStep::Keep,
-        Some((WriteStanding::Confirmed(height), _)) if chia_lane::era_of(height) != era => {
+        Some((WriteStanding::Confirmed { height, .. }, _)) if chia_lane::era_of(height) != era => {
             BeaconStep::Forget(format!("confirmed at height {height}, outside its era — readers will not take it"))
         }
-        Some((WriteStanding::Confirmed(height), _)) if !mark.confirmed || mark.confirmed_height != height => {
+        Some((WriteStanding::Confirmed { height, .. }, _)) if !mark.confirmed || mark.confirmed_height != height => {
             BeaconStep::Save(BeaconMark { confirmed: true, confirmed_height: height, settled: false, ..mark.clone() })
         }
-        Some((WriteStanding::Confirmed(height), _)) if crate::chia_knock::settled(height, peak) => {
+        Some((WriteStanding::Confirmed { height, seen_at }, _)) if crate::chia_knock::settled_by(height, peak, seen_at) => {
             BeaconStep::Save(BeaconMark { settled: true, ..mark.clone() })
         }
-        Some((WriteStanding::Confirmed(_), _)) => BeaconStep::Keep,
+        Some((WriteStanding::Confirmed { .. }, _)) => BeaconStep::Keep,
         Some((WriteStanding::Dead(why), _)) => BeaconStep::Forget(format!("never landed — {why}")),
         Some((WriteStanding::Pending, true)) if mark.confirmed => {
             BeaconStep::Save(BeaconMark { confirmed: false, confirmed_height: 0, settled: false, ..mark.clone() })
@@ -2278,6 +2552,7 @@ mod tests {
         use crate::chia_resolve::WriteStanding::{Confirmed, Dead, Pending};
         let era = 5u64;
         let h0 = 5 * ERA_BLOCKS;
+        let found = |height: u32, seen_at: Option<u32>| Confirmed { height, seen_at };
         let pending = BeaconMark { era, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false };
         assert!(pending.unsettled_for(era, "n"));
         assert!(!pending.unsettled_for(era, "other") && !pending.unsettled_for(era + 1, "n"));
@@ -2286,16 +2561,20 @@ mod tests {
         assert_eq!(beacon_step(&pending, None, era, h0 + 50), BeaconStep::Keep);
         assert_eq!(beacon_step(&pending, Some((Pending, false)), era, h0 + 50), BeaconStep::Keep);
         // Confirmed: the height is kept, the mark judged again.
-        let BeaconStep::Save(confirmed) = beacon_step(&pending, Some((Confirmed(h0 + 40), false)), era, h0 + 50) else { panic!("confirmed: saved") };
+        let BeaconStep::Save(confirmed) = beacon_step(&pending, Some((found(h0 + 40, Some(h0 + 50)), false)), era, h0 + 50) else { panic!("confirmed: saved") };
         assert_eq!((confirmed.confirmed, confirmed.confirmed_height, confirmed.settled), (true, h0 + 40, false));
         assert!(confirmed.unsettled_for(era, "n"), "young: judged again");
         assert!(!beacon_due(Some(&confirmed), era, "n"));
         // Found where the mark says, young: nothing yet; deep enough: settled, final.
-        assert_eq!(beacon_step(&confirmed, Some((Confirmed(h0 + 40), false)), era, h0 + 40 + SETTLED_DEPTH - 1), BeaconStep::Keep);
-        let BeaconStep::Save(settled) = beacon_step(&confirmed, Some((Confirmed(h0 + 40), false)), era, h0 + 40 + SETTLED_DEPTH) else { panic!("settled: saved") };
+        assert_eq!(beacon_step(&confirmed, Some((found(h0 + 40, Some(h0 + 40 + SETTLED_DEPTH - 1)), false)), era, h0 + 40 + SETTLED_DEPTH - 1), BeaconStep::Keep);
+        let BeaconStep::Save(settled) = beacon_step(&confirmed, Some((found(h0 + 40, Some(h0 + 40 + SETTLED_DEPTH)), false)), era, h0 + 40 + SETTLED_DEPTH) else { panic!("settled: saved") };
         assert!(settled.settled && !settled.unsettled_for(era, "n"));
+        // Round 10: the lookup's word reaches only as deep as the peers that
+        // gave it stood; the agreed peak alone proves nothing of the coin.
+        assert_eq!(beacon_step(&confirmed, Some((found(h0 + 40, Some(h0 + 40 + SETTLED_DEPTH - 1)), false)), era, h0 + 40 + SETTLED_DEPTH), BeaconStep::Keep, "the peak is deep enough, the peers answering are not");
+        assert_eq!(beacon_step(&confirmed, Some((found(h0 + 40, None), false)), era, h0 + 100), BeaconStep::Keep, "undated: no depth is proved");
         // Moved by a reorganization: the mark follows, unsettled again.
-        let BeaconStep::Save(moved) = beacon_step(&confirmed, Some((Confirmed(h0 + 42), false)), era, h0 + 100) else { panic!("moved: saved") };
+        let BeaconStep::Save(moved) = beacon_step(&confirmed, Some((found(h0 + 42, Some(h0 + 100)), false)), era, h0 + 100) else { panic!("moved: saved") };
         assert_eq!((moved.confirmed_height, moved.settled), (h0 + 42, false));
         // The block is gone, by a listing judged past it: pending again — no
         // replacement is written, the spend may land again …
@@ -2308,7 +2587,7 @@ mod tests {
         // Dead on the lease's word, or confirmed outside its era: the mark
         // goes and the beacon is due again.
         assert!(matches!(beacon_step(&again, Some((Dead("the mempool dropped it"), false)), era, h0 + 100), BeaconStep::Forget(why) if why.contains("the mempool dropped it")));
-        assert!(matches!(beacon_step(&pending, Some((Confirmed(h0 - 1), false)), era, h0 + 100), BeaconStep::Forget(why) if why.contains("outside its era")));
+        assert!(matches!(beacon_step(&pending, Some((found(h0 - 1, Some(h0 + 100)), false)), era, h0 + 100), BeaconStep::Forget(why) if why.contains("outside its era")));
         // Across a restart: the file keeps the height and the settlement, and a
         // mark written before they were kept (round 1's shape) is judged again.
         let kept: BeaconMark = serde_json::from_slice(&serde_json::to_vec(&confirmed).unwrap()).unwrap();
@@ -2316,7 +2595,7 @@ mod tests {
         assert!(kept.unsettled_for(era, "n"));
         let old: BeaconMark = serde_json::from_str(r#"{"era":5,"last_at":1,"hint":"h","node_id":"n","coin_id":"c","confirmed":true}"#).unwrap();
         assert!(old.confirmed && old.confirmed_height == 0 && !old.settled && old.unsettled_for(era, "n"), "final at its first inclusion no more: judged again");
-        let BeaconStep::Save(learned) = beacon_step(&old, Some((Confirmed(h0 + 40), false)), era, h0 + 50) else { panic!("the height is learned") };
+        let BeaconStep::Save(learned) = beacon_step(&old, Some((found(h0 + 40, Some(h0 + 50)), false)), era, h0 + 50) else { panic!("the height is learned") };
         assert_eq!(learned.confirmed_height, h0 + 40);
         assert_eq!(beacon_step(&old, Some((Pending, false)), era, h0 + 50), BeaconStep::Keep, "with no height kept, no listing can say its block is gone");
     }
@@ -2625,6 +2904,7 @@ mod tests {
         // spends it held may be live, so nothing parks and no spend leaves, and
         // the file is left as it is for the operator, never written over.
         let one = hex::encode([1u8; 32]);
+        let empty_bundle = hex::encode(SpendBundle::new(vec![], Signature::default()).to_bytes().unwrap());
         let broken: Vec<String> = vec![
             "not json".to_string(),
             r#"{"v":1,"spends":3,"parked":[{"coin":"zz","spend":3}]}"#.to_string(),
@@ -2635,6 +2915,14 @@ mod tests {
             format!(r#"{{"v":1,"spends":0,"parked":[{{"coin":"{one}","spend":1}}]}}"#),
             format!(r#"{{"v":1,"spends":2,"parked":[{{"coin":"{one}","spend":0}}]}}"#),
             format!(r#"{{"v":1,"spends":2,"parked":[{{"coin":"{one}","spend":1}},{{"coin":"{one}","spend":2}}]}}"#),
+            // Round 10: a settling spend outside the counter, one parked too,
+            // one with no inputs, one with no spent height, one with an
+            // unreadable bundle.
+            format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":2,"spent_at":5,"coins":[{{"coin":"{one}"}}],"bundle":"{empty_bundle}"}}]}}"#),
+            format!(r#"{{"v":1,"spends":1,"parked":[{{"coin":"{one}","spend":1}}],"settling":[{{"spend":1,"spent_at":5,"coins":[{{"coin":"{one}"}}],"bundle":"{empty_bundle}"}}]}}"#),
+            format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":5,"coins":[],"bundle":"{empty_bundle}"}}]}}"#),
+            format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":0,"coins":[{{"coin":"{one}"}}],"bundle":"{empty_bundle}"}}]}}"#),
+            format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":5,"coins":[{{"coin":"{one}"}}],"bundle":"zz"}}]}}"#),
         ];
         for text in &broken {
             let bytes = text.as_bytes();
@@ -2681,6 +2969,146 @@ mod tests {
         assert!(lease.is_pending(&ours) && std::fs::read_to_string(&path).unwrap().contains(&hex::encode(ours)));
         lease.unpark(&parking);
         assert!(!lease.is_pending(&ours));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_settling_spend_is_parked_again_or_settled_by_the_listings_judged_height() {
+        // #272 review round 10: the pure judgment behind the lease's settling set.
+        use crate::chia_knock::SETTLED_DEPTH;
+        use SettlingStep::*;
+        let one = |spent: Option<bool>| vec![(spent, Some(900u32))];
+        assert_eq!(settling_step(1000, &one(Some(false)), Some(1000), Some(1000)), Repark, "unspent, judged at the spend itself: the block is gone");
+        assert_eq!(settling_step(1000, &one(Some(false)), Some(1000), None), Repark, "cut short or not: the coin is named");
+        assert_eq!(settling_step(1000, &one(Some(false)), Some(999), Some(999)), Keep, "peers behind the spend list it unspent and prove nothing");
+        assert_eq!(settling_step(1000, &one(Some(false)), None, None), Keep, "undated: nothing is said");
+        assert_eq!(settling_step(1000, &one(Some(true)), Some(1000 + SETTLED_DEPTH - 1), None), Keep, "spent, not deep enough");
+        assert_eq!(settling_step(1000, &one(Some(true)), Some(1000 + SETTLED_DEPTH), None), Done(true), "spent SETTLED_DEPTH deep at the judged height: final");
+        assert_eq!(settling_step(1000, &one(Some(true)), None, None), Keep, "undated: no depth is proved");
+        assert_eq!(settling_step(1000, &one(None), Some(950), Some(950)), Done(false), "on no chain the peers know, past the coin's own confirmation");
+        assert_eq!(settling_step(1000, &one(None), Some(950), None), Keep, "absent from a listing cut short: nothing is said");
+        assert_eq!(settling_step(1000, &one(None), Some(899), Some(899)), Keep, "absent below its confirmation: peers behind it");
+        assert_eq!(settling_step(1000, &[(None, None)], Some(5000), Some(5000)), Keep, "no height known for the coin: never freed on silence");
+        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (Some(false), Some(900))], Some(1000), Some(1000)), Repark, "one input back unspent: parked again, the probe decides");
+        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (Some(false), Some(900))], Some(5000), Some(5000)), Repark, "however deep the other stands");
+        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + SETTLED_DEPTH), Some(1000 + SETTLED_DEPTH)), Done(false), "one spent deep, one on no chain: nothing left to settle");
+        assert_eq!(settling_step(1000, &[(Some(true), Some(900)), (None, Some(900))], Some(1000 + SETTLED_DEPTH), None), Keep, "the absent one unjudged by a listing cut short");
+        assert_eq!(settling_step(1000, &[], Some(5000), Some(5000)), Keep, "no inputs: nothing to judge");
+    }
+
+    #[tokio::test]
+    async fn a_spent_spend_keeps_its_bundle_settling_and_is_parked_again_when_its_block_goes() {
+        // #272 review round 10: the chain listed a knock's input spent, the
+        // lease released the spend and forgot its bundle; a reorganization
+        // then dropped the block, the knock returned to pending with nothing
+        // left to push it again, and the freed coin was the next writer's to
+        // take while the mempool may have taken the spend back.
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_knock::SETTLED_DEPTH;
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-settling-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let _ = std::fs::remove_file(&path);
+        let ours = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([2u8; 32]), 7);
+        let id = ours.coin_id();
+        let listing = |spent: Option<u32>, judged_at: Option<u32>| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: ours.clone(), confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at,
+            }])
+        };
+        let empty = |truncated: bool, judged_at: Option<u32>| Scripted::new(vec![CoinListing { records: vec![], truncated, next_cursor: None, judged_at }]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let lease = WalletLease::new();
+        lease.restore(&path);
+        let parking = lease.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        assert!(lease.is_taken(&id));
+        // Past the grace the chain lists the input spent at 1000: the spend is
+        // released as spent — its coin no longer parked, the wallet not
+        // spending — but kept SETTLING with its bundle, in the file, and its
+        // coin is no writer's to take.
+        let t1 = t0 + RECONCILE_GRACE;
+        lease.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        assert!(!lease.is_parked(&id) && lease.is_settling(&id) && lease.is_taken(&id));
+        assert_eq!(lease.lease_word(&id), LeaseWord::Spent);
+        assert!(!lease.outgoing_pending(), "settling is not spending: the wallet's next coin is the one the spend created");
+        let on_disk = || serde_json::from_slice::<LeaseFile>(&std::fs::read(&path).unwrap()).unwrap();
+        let file = on_disk();
+        assert!(file.parked.is_empty() && file.bundles.is_empty());
+        assert_eq!(file.settling.len(), 1);
+        assert_eq!((file.settling[0].spend, file.settling[0].spent_at, file.settling[0].coins[0].seen_at), (parking.spend, 1000, Some(900)));
+        // Across a restart the settlement is still open, with the word.
+        let again = WalletLease::new();
+        again.restore(&path);
+        assert!(again.is_settling(&id) && !again.is_parked(&id) && again.is_taken(&id));
+        assert_eq!(again.lease_word(&id), LeaseWord::Spent, "the word outlives the restart");
+        // Peers behind the spend list the input unspent, an undated listing
+        // lists it so, a listing finds it spent but not deep enough, a listing
+        // cut short leaves it out: nothing is decided by any of them.
+        again.reconcile_at(&listing(None, Some(999)), t1).await;
+        again.reconcile_at(&listing(None, None), t1).await;
+        again.reconcile_at(&listing(Some(1000), Some(1000 + SETTLED_DEPTH - 1)), t1).await;
+        again.reconcile_at(&empty(true, Some(5000)), t1).await;
+        assert!(again.is_settling(&id) && !again.is_parked(&id));
+        // Unspent on a listing judged at the spend: the block is gone. The
+        // spend is parked again under its own number, with its bundle, due
+        // after a fresh grace for the liveness probe to push it again; the
+        // coin stays no writer's to take.
+        again.reconcile_at(&listing(None, Some(1000)), t1).await;
+        assert!(again.is_parked(&id) && !again.is_settling(&id) && again.is_taken(&id));
+        assert_eq!(again.lease_word(&id), LeaseWord::Parked);
+        assert!(again.outgoing_pending());
+        assert!(again.due_at(t1).is_empty(), "a fresh grace");
+        let due = again.due_at(t1 + RECONCILE_GRACE);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].spend, due[0].bundle.as_ref().map(|b| b.name())), (parking.spend, Some(bundle.name())));
+        let file = on_disk();
+        assert_eq!((file.parked.len(), file.bundles.len(), file.settling.len()), (1, 1, 0));
+        assert_eq!((file.parked[0].spend, file.bundles[0].spend), (parking.spend, parking.spend));
+        // Landed again, in another block: settling anew from that height …
+        let t2 = t1 + RECONCILE_GRACE;
+        again.reconcile_at(&listing(Some(1005), Some(1006)), t2).await;
+        assert!(again.is_settling(&id) && !again.is_parked(&id));
+        assert_eq!(on_disk().settling[0].spent_at, 1005);
+        // … and found spent SETTLED_DEPTH deep at the listing's own height: final.
+        again.reconcile_at(&listing(Some(1005), Some(1005 + SETTLED_DEPTH)), t2).await;
+        assert!(!again.is_settling(&id) && !again.is_parked(&id) && !again.is_taken(&id));
+        assert_eq!(again.lease_word(&id), LeaseWord::Spent, "this run remembers the release");
+        assert!(on_disk().settling.is_empty());
+        // A settling spend whose input is on no chain the peers know — absent
+        // from a complete listing judged past the coin's own confirmation — has
+        // nothing left to settle or to push: forgotten.
+        let other = WalletLease::new();
+        other.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        other.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        assert!(other.is_settling(&id));
+        other.reconcile_at(&empty(false, Some(899)), t1).await;
+        assert!(other.is_settling(&id), "absent below its confirmation: peers behind it");
+        other.reconcile_at(&empty(false, Some(950)), t1).await;
+        assert!(!other.is_settling(&id) && !other.is_parked(&id));
+        // A spend released as spent WITHOUT a bundle (parked by an older node)
+        // has nothing to push again: forgotten at the release, as before.
+        let bare = WalletLease::new();
+        bare.park_at([(id, 900)], t0).unwrap();
+        bare.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        assert!(!bare.is_settling(&id) && !bare.is_parked(&id));
+        assert_eq!(bare.lease_word(&id), LeaseWord::Spent);
+        // A coin a LATER spend took meanwhile keeps that spend's marker when
+        // the older spend is parked again (compare-and-release); an older
+        // spend none of whose coins is free again is forgotten, bundle and all.
+        let raced = WalletLease::new();
+        let old = raced.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        raced.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        let newer = raced.park_with_bundle_at([(id, 900)], Some(&bundle), t1).unwrap();
+        assert!(raced.is_parked(&id) && raced.is_settling(&id));
+        raced.reconcile_at(&listing(None, Some(1000)), t1).await;
+        assert!(raced.is_parked(&id) && !raced.is_settling(&id));
+        let due = raced.due_at(t1 + RECONCILE_GRACE);
+        assert_eq!(due.iter().map(|d| d.spend).collect::<Vec<u64>>(), vec![newer.spend], "the newer marker stands");
+        assert!(old.spend < newer.spend && !raced.snapshot().bundles.iter().any(|b| b.spend == old.spend), "no bundle parks no coin");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
