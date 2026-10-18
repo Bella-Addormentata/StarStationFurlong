@@ -198,11 +198,15 @@ impl KnockBook {
         self.sent.iter().filter(|k| k.confirmed_height == 0).cloned().collect()
     }
 
-    /// The chain says the knock that spent `coin_id` confirmed at `height`;
-    /// the rendezvous clock starts there. Returns true when something changed.
-    pub fn confirm_sent(&mut self, coin_id: &str, height: u32) -> bool {
+    /// The chain says the knock that spent `coin_id` under `hint` confirmed at
+    /// `height`; the rendezvous clock starts there. An entry is named by BOTH
+    /// (#272 review round 4): a dropped knock's input is released to the next
+    /// write, which may be another knock to another host, so two entries can
+    /// share an input coin — their hints tell them apart. Returns true when
+    /// something changed.
+    pub fn confirm_sent(&mut self, coin_id: &str, hint: &str, height: u32) -> bool {
         let mut changed = false;
-        for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.confirmed_height == 0) {
+        for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height == 0) {
             k.confirmed_height = height;
             k.last_rendezvous = height;
             changed = true;
@@ -213,10 +217,11 @@ impl KnockBook {
     /// A knock of ours that never counts — the chain confirmed it OUTSIDE its
     /// era (the host's reader rejects it, so nobody dials back), or its spend
     /// never landed ([`crate::chia_resolve::WriteStanding::Dead`]): forgotten,
-    /// the next dial exhaustion knocks again. Returns true when one went.
-    pub fn drop_sent(&mut self, coin_id: &str) -> bool {
+    /// the next dial exhaustion knocks again. Named by input coin AND hint, as
+    /// [`Self::confirm_sent`]. Returns true when one went.
+    pub fn drop_sent(&mut self, coin_id: &str, hint: &str) -> bool {
         let before = self.sent.len();
-        self.sent.retain(|k| k.coin_id != coin_id);
+        self.sent.retain(|k| !(k.coin_id == coin_id && k.hint == hint));
         before != self.sent.len()
     }
 
@@ -350,6 +355,27 @@ mod tests {
     }
 
     #[test]
+    fn two_knocks_on_one_input_coin_are_judged_apart() {
+        // #272 review round 4: knock A's push died, the wallet lease released
+        // its input, and the publisher spent that same coin on knock B to
+        // another host before the watcher judged A. Both entries name the
+        // coin; the chain's word on A (dead: the input went to another write
+        // of ours) must forget A alone, and B's confirmation must start B's
+        // clock alone.
+        let mut book = KnockBook::default();
+        book.record_sent(SentKnock { hint: "aa".into(), ..sent("H", 3, "x", 100) });
+        book.record_sent(SentKnock { hint: "bb".into(), ..sent("G", 3, "x", 200) });
+        assert_eq!(book.pending_sent().len(), 2);
+        assert!(!book.drop_sent("x", "cc"), "no entry is named by a hint it was not written under");
+        assert!(book.drop_sent("x", "aa"));
+        assert_eq!(book.sent.iter().map(|k| k.host.as_str()).collect::<Vec<_>>(), vec!["G"], "A alone is forgotten");
+        assert!(!book.confirm_sent("x", "aa", 96_800), "a forgotten knock has no clock to start");
+        assert!(book.confirm_sent("x", "bb", 96_800));
+        assert_eq!((book.sent[0].confirmed_height, book.sent[0].last_rendezvous), (96_800, 96_800));
+        assert!(book.knocked_this_era("G", 3) && !book.knocked_this_era("H", 3), "H may be knocked on again");
+    }
+
+    #[test]
     fn one_knock_per_host_per_era_and_confirmation_by_coin() {
         let mut book = KnockBook::default();
         assert!(!book.knocked_this_era("H", 3));
@@ -358,12 +384,12 @@ mod tests {
         assert!(!book.knocked_this_era("H", 4), "a new era knocks again");
         assert!(!book.knocked_this_era("G", 3), "another host is another knock");
         assert_eq!(book.pending_sent().iter().map(|k| k.coin_id.as_str()).collect::<Vec<_>>(), vec!["c1"]);
-        assert!(book.confirm_sent("c1", 96_800));
-        assert!(!book.confirm_sent("c1", 96_900), "confirmed once");
+        assert!(book.confirm_sent("c1", "ab", 96_800));
+        assert!(!book.confirm_sent("c1", "ab", 96_900), "confirmed once");
         assert!(book.pending_sent().is_empty());
         assert_eq!(book.sent[0].last_rendezvous, 96_800, "the clock starts at the confirmation");
-        assert!(book.drop_sent("c1"));
-        assert!(!book.drop_sent("c1"));
+        assert!(book.drop_sent("c1", "ab"));
+        assert!(!book.drop_sent("c1", "ab"));
         assert!(!book.knocked_this_era("H", 3), "a dropped knock may be knocked again");
     }
 
@@ -371,7 +397,7 @@ mod tests {
     fn dialbacks_come_due_on_the_schedule_once_each_for_both_sides() {
         let mut book = KnockBook::default();
         book.record_sent(sent("H", 3, "c1", 100));
-        book.confirm_sent("c1", 1000);
+        book.confirm_sent("c1", "ab", 1000);
         assert!(book.record_inbox(InboxKnock {
             from: "J".into(),
             room: "r".into(),
@@ -409,7 +435,7 @@ mod tests {
     fn a_dial_back_passed_over_stays_due_and_comes_first() {
         let mut book = KnockBook::default();
         book.record_sent(sent("H", 3, "c1", 100));
-        book.confirm_sent("c1", 1000);
+        book.confirm_sent("c1", "ab", 1000);
         book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 1000, coin_id: "k1".into(), last_rendezvous: 1000 });
         let due = book.due_dialbacks(1012);
         assert_eq!(due.iter().map(|d| d.target.as_str()).collect::<Vec<_>>(), vec!["H", "J"], "equal waits keep the book's order");
@@ -482,11 +508,11 @@ mod tests {
 
         let mut book = KnockBook::default();
         book.record_sent(sent("old", 1, "a", 1));
-        book.confirm_sent("a", 40_000);
+        book.confirm_sent("a", "ab", 40_000);
         book.record_sent(sent("pending-last-era", 2, "b", 2));
         book.record_sent(sent("pending-now", 3, "c", 3));
         book.record_sent(sent("confirmed-last-era", 2, "d", 4));
-        book.confirm_sent("d", 70_000);
+        book.confirm_sent("d", "ab", 70_000);
         book.record_inbox(InboxKnock { from: "x".into(), room: "r".into(), era: 1, confirmed_height: 40_001, coin_id: "k".into(), last_rendezvous: 0 });
         book.record_inbox(InboxKnock { from: "y".into(), room: "r".into(), era: 2, confirmed_height: 70_001, coin_id: "l".into(), last_rendezvous: 0 });
         let peak = 3 * ERA_BLOCKS + 5; // era 3
@@ -523,7 +549,7 @@ mod tests {
         assert_eq!(KnockBook::load(&path), KnockBook::default(), "no file, empty book");
         let mut book = KnockBook::default();
         book.record_sent(sent("H", 3, "c1", 100));
-        book.confirm_sent("c1", 1000);
+        book.confirm_sent("c1", "ab", 1000);
         book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 2000, coin_id: "k1".into(), last_rendezvous: 2000 });
         book.save(&path).unwrap();
         assert_eq!(KnockBook::load(&path), book);

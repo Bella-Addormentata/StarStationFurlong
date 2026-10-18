@@ -349,6 +349,17 @@ impl ChiaRoomCap {
     pub fn may_share_card(&self) -> bool {
         self.may_use_cards() && self.public_room == Some(false)
     }
+
+    /// Is OUR card handed out for this room at all (#272 review round 4) —
+    /// broadcast to the tabs for their passes, or carried as the contact key
+    /// in a knock, by which the host reads our presence? [`Self::may_share_card`]
+    /// and two facts about the node: its key is durable (a key lost on restart
+    /// names nothing to find) and its own Share Card switch is on. A knock
+    /// written without it still names our node id, which the host dials back
+    /// through the DHT.
+    pub fn hands_out_own_card(&self, key_durable: bool, share_enabled: bool) -> bool {
+        key_durable && share_enabled && self.may_share_card()
+    }
 }
 
 // ── #231 P6a: cap persistence (`rooms/<hex-room-id>.cap`) ───────────────────
@@ -629,6 +640,14 @@ mod tests {
         // waits for the posture.
         let first_visit = ChiaRoomCap { public_room: None, pass_private: true, ..private.clone() };
         assert!(first_visit.may_use_cards() && !first_visit.may_share_card(), "a private pass admits its cards, not ours");
+        // #272 review round 4: the key a KNOCK carries, and the card broadcast
+        // to the tabs, are our card handed out — the same rule, plus the
+        // node's own switch and a durable key.
+        assert!(private.hands_out_own_card(true, true));
+        assert!(!private.hands_out_own_card(false, true), "a key not kept across restarts is not handed out");
+        assert!(!private.hands_out_own_card(true, false), "nor any while the node's own switch is off");
+        assert!(!first_visit.hands_out_own_card(true, true), "a private pass admits its cards, not ours: the knock goes bare");
+        assert!(!public.hands_out_own_card(true, true));
         assert!(!ChiaRoomCap { public_room: Some(true), ..first_visit.clone() }.may_use_cards(), "a pass's word never overrides a public posture");
         assert!(!ChiaRoomCap { share_card: false, ..first_visit.clone() }.may_use_cards(), "nor the room's own toggle");
         assert!(!ChiaRoomCap { restored: true, ..first_visit.clone() }.may_use_cards(), "nor a restored cap");

@@ -185,6 +185,40 @@ export function roomPosture(bundled: boolean, passagePublic: boolean | undefined
   return bundled ? true : passagePublic;
 }
 
+/** What the cap's probe, and the pass minter, read a room's passage from
+ *  (#272 review round 4). The door documents are bound per join and, on a
+ *  first visit with nothing cached, EMPTY until the room's state arrives — and
+ *  empty door documents read as the four cardinal defaults, which are PUBLIC.
+ *  So the passage is read only once the documents bound are this room's AND
+ *  the room's state is usable: arrived from its host (or from the local node,
+ *  for a room hosted here), or seeded from a replica this install kept. Until
+ *  then the passage is not known: the cap says so (`roomPosture` → null) and a
+ *  private pass's cards stay usable, instead of a public reading nothing backs
+ *  overwriting them. main.ts wires the sources. */
+export interface PostureSources {
+  /** Is `roomId` the room whose pass ships in the build? */
+  bundled: (roomId: string) => boolean;
+  /** The room whose door documents are the ones bound, or null between a
+   *  leave and the next join's binds. */
+  docsBoundFor: () => string | null;
+  /** Is the bound room's state usable: synced from its host, or seeded from a
+   *  cached or warm replica? */
+  stateUsable: () => boolean;
+  /** The bound door documents' reading: does some door let anyone walk in? */
+  passagePublic: () => boolean;
+}
+
+/** `roomId`'s passage as the sources allow it to be read: `undefined` until
+ *  its own documents are bound and its state is usable. */
+export function passageReading(src: PostureSources, roomId: string): boolean | undefined {
+  return src.docsBoundFor() === roomId && src.stateUsable() ? src.passagePublic() : undefined;
+}
+
+/** The cap's posture probe over `src` — see `roomPosture`. */
+export function roomPostureProbe(src: PostureSources): (roomId: string) => boolean | undefined {
+  return (roomId) => roomPosture(src.bundled(roomId), passageReading(src, roomId));
+}
+
 /** #231 P6b (#272 review round 3): does the local node hand out its contact
  *  card at all? Its fingerprint says (`share_card`); a node that predates the
  *  flag never handed one out, so absent reads as sharing. Off, this station's

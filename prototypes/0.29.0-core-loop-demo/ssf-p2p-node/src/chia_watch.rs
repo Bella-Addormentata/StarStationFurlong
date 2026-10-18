@@ -625,17 +625,20 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // knocks again). The input's spent flag alone proves nothing (#272
             // review): a dropped knock's coin is the next write's input. The
             // lease is asked FIRST, the chain after, so a knock confirming in
-            // between is seen by the lookups and never read as dropped.
+            // between is seen by the lookups and never read as dropped. Each
+            // verdict names its entry by input coin AND hint (#272 review round
+            // 4): a dropped knock's input is released to the next write, which
+            // may be another knock, so two entries can share a coin.
             let pending = hub.knocks.lock().unwrap().pending_sent();
             if !pending.is_empty() {
                 let coins: Vec<Bytes32> = pending.iter().filter_map(|k| chia_resolve::parse_hex32(&k.coin_id)).collect();
                 let words = lease_words(&agreed, &coins).await;
                 match chia_resolve::spent_heights(&agreed, coins.clone()).await {
                     Ok(spent) => {
-                        let mut verdicts: Vec<(String, u64, WriteStanding)> = Vec::new();
+                        let mut verdicts: Vec<(String, String, u64, WriteStanding)> = Vec::new();
                         for k in &pending {
                             let (Some(coin), Some(hint)) = (chia_resolve::parse_hex32(&k.coin_id), chia_resolve::parse_hex32(&k.hint)) else {
-                                verdicts.push((k.coin_id.clone(), k.era, WriteStanding::Dead("its entry in the knock book is malformed")));
+                                verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, WriteStanding::Dead("its entry in the knock book is malformed")));
                                 continue;
                             };
                             let child = match chia_resolve::child_under_hint(&agreed, hint, coin).await {
@@ -647,25 +650,25 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             };
                             let spent_at = spent.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
                             let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
-                            verdicts.push((k.coin_id.clone(), k.era, chia_resolve::write_standing(&child, spent_at, lease)));
+                            verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, chia_resolve::write_standing(&child, spent_at, lease)));
                         }
                         let mut book = hub.knocks.lock().unwrap();
                         let mut changed = false;
-                        for (coin_hex, era, standing) in verdicts {
+                        for (coin_hex, hint_hex, era, standing) in verdicts {
                             match standing {
                                 WriteStanding::Confirmed(height) if chia_lane::era_of(height) != era => {
                                     println!("⛓️ ChiaHub knock: our knock confirmed at height {height}, outside era {era} — the host will not read it; forgotten, the next dial exhaustion knocks again");
-                                    changed |= book.drop_sent(&coin_hex);
+                                    changed |= book.drop_sent(&coin_hex, &hint_hex);
                                 }
                                 WriteStanding::Confirmed(height) => {
-                                    if book.confirm_sent(&coin_hex, height) {
+                                    if book.confirm_sent(&coin_hex, &hint_hex, height) {
                                         println!("⛓️ ChiaHub knock: our knock confirmed at height {height} — dialing the host on the schedule from here");
                                         changed = true;
                                     }
                                 }
                                 WriteStanding::Dead(why) => {
                                     println!("⛓️ ChiaHub knock: our knock never landed — {why}; forgotten, the next dial exhaustion knocks again");
-                                    changed |= book.drop_sent(&coin_hex);
+                                    changed |= book.drop_sent(&coin_hex, &hint_hex);
                                 }
                                 WriteStanding::Pending => {}
                             }

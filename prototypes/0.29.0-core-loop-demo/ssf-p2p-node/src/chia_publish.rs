@@ -1702,10 +1702,16 @@ pub async fn heartbeat_loop(
                 if req.host.parse::<iroh::PublicKey>().is_ok_and(|pk| crate::linked_in_room(&hub, &req.room, &pk)) {
                     continue;
                 }
-                break Some((req, cap.room_key));
+                break Some((req, cap.room_key, cap.hands_out_own_card(hub.contact_key_durable, crate::chia_contact::share_card_enabled())));
             };
-            if let Some((mut req, room_key)) = next {
-                let own_ck = hub.contact_key_durable.then_some(&hub.contact_key);
+            if let Some((mut req, room_key, with_key)) = next {
+                // Our contact key rides in the knock only where our card may be
+                // handed out at all (#272 review round 4): the node's own Share
+                // Card switch on, a durable key, and the room KNOWN private — a
+                // private pass's word admits its cards, not ours. A bare knock
+                // still names our node id, which the host dials back through
+                // the DHT.
+                let own_ck = with_key.then_some(&hub.contact_key);
                 match publish_knock(&iroh_sk, &chia_sk, own_ck, &req, &room_key, era, now_unix).await {
                     Ok((hint, write)) => {
                         let hint_hex = hex::encode(hint.to_bytes());

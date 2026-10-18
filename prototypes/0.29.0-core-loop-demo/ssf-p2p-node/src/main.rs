@@ -1948,9 +1948,9 @@ async fn handle_wt_connection_inner(
                                         // in this room's passes (P6b): a live private cap
                                         // is the browser saying the room may have it — a
                                         // pass's word alone is not (`may_share_card`).
-                                        if hub_clone.contact_key_durable
-                                            && chia_contact::share_card_enabled()
-                                            && accepted.as_ref().is_some_and(|cap| cap.may_share_card())
+                                        if accepted
+                                            .as_ref()
+                                            .is_some_and(|cap| cap.hands_out_own_card(hub_clone.contact_key_durable, chia_contact::share_card_enabled()))
                                         {
                                             broadcast_own_card(&hub_clone, &envelope.room).await;
                                         }

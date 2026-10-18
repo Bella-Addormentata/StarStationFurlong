@@ -20,10 +20,12 @@ import {
   newerCard,
   nodeSharesCard,
   normalizeContactCard,
+  passageReading,
   readNodeCard,
   readShareCard,
   roomIsPublicSpace,
-  roomPosture,
+  roomPostureProbe,
+  type PostureSources,
   writeNodeCard,
 } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
@@ -611,6 +613,11 @@ const networkProvider = new NetworkProvider();
  *  bound, or null between a leave and the next join's binds (see the N8 probe
  *  below: until this names a room, that room's passage is unknown → PUBLIC). */
 let doorDocsBoundFor: string | null = null;
+/** 🛰️ Did this join seed the room's replica from a copy this install kept (the
+ *  cached snapshot, or a warm neighbour's)? Then its door documents describe
+ *  the room as last seen, and the posture probe may read them before the
+ *  host's state arrives (#272 review round 4). Reset with `doorDocsBoundFor`. */
+let roomReplicaSeeded = false;
 
 function roomPassageIsPublic(): boolean {
   const ids = [...readAllDoorLayout().keys()];
@@ -630,7 +637,11 @@ function roomPassageIsPublic(): boolean {
 // the first cap of a join goes out at connect, BEFORE the new room's docs are
 // bound: so the probe only reads them once `doorDocsBoundFor` names this exact
 // room (set right before the last of the two binds), and says UNKNOWN until
-// then — never the previous room's doors for the new room.
+// then — never the previous room's doors for the new room. Nor the EMPTY
+// replica of an uncached first visit (#272 review round 4): until the host's
+// state lands its defaults read public, which is no reading, so the probe also
+// waits for usable state (`stateUsable`: synced, or seeded from a replica this
+// install kept) and the cap is re-sent when the state arrives.
 // Re-stamped on every door-policy change AND every door-layout change (a door
 // fitted with no policy record of its own takes the default, which is public,
 // so a new door alone can open the room), and on every room bind, which
@@ -639,20 +650,18 @@ function roomPassageIsPublic(): boolean {
 // left earlier but lands later cannot overwrite the current posture.
 /** N8: is `roomId` public space as far as this session can tell right now?
  *  The cap's probe, and (#231 P6b) the pass minter's reason to carry no card. */
+const postureSources: PostureSources = {
+  bundled: (roomId) => roomId === DEFAULT_STATION.welcomeRoomId,
+  docsBoundFor: () => doorDocsBoundFor,
+  stateUsable: () => roomReplicaSeeded || roomStateArrivedNow(),
+  passagePublic: roomPassageIsPublic,
+};
 function roomIsPublicSpaceNow(roomId: string): boolean {
-  return roomIsPublicSpace(
-    roomId === DEFAULT_STATION.welcomeRoomId,
-    doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
-  );
+  return roomIsPublicSpace(postureSources.bundled(roomId), passageReading(postureSources, roomId));
 }
 /** The cap's posture for `roomId`: public, private, or not known yet
  *  (#272 review round 3) — see `roomPosture`. */
-function roomPostureNow(roomId: string): boolean | undefined {
-  return roomPosture(
-    roomId === DEFAULT_STATION.welcomeRoomId,
-    doorDocsBoundFor === roomId ? roomPassageIsPublic() : undefined,
-  );
-}
+const roomPostureNow = roomPostureProbe(postureSources);
 networkProvider.setPublicRoomProbe(roomPostureNow);
 subscribeDoorPolicy(() => {
   void networkProvider.refreshRoomCap();
@@ -1888,8 +1897,10 @@ async function joinRoomAtEpoch(
   remoteLastSeen.clear();
   world.clearRemotePlayers();
   // ⛓️ N8: the door docs about to be bound are not this room's yet — the cap
-  // sent at connect must say PUBLIC until both are (see the probe's comment).
+  // sent at connect must say UNKNOWN until both are, and the room's state is
+  // usable (see the probe's comment).
   doorDocsBoundFor = null;
+  roomReplicaSeeded = false;
   // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
   // world.ts activeRoomId). Published BEFORE the connect await (the id is
   // known synchronously) so a trunk opened during the connect window keys
@@ -1999,6 +2010,9 @@ async function joinRoomAtEpoch(
   // rename-revert race. CRDT idempotence makes any interleaving safe; a corrupt
   // blob is discarded inside restoreRoomSnapshot (degrades to today's no-cache).
   const restoredFromCache = await restoreRoomSnapshot(sync.doc, boot.roomId);
+  // ⛓️ A kept copy is usable room state for the posture probe (#272 review
+  // round 4) — for THIS join only: a superseding join reset the flag already.
+  if (restoredFromCache && epoch === sessionEpoch) roomReplicaSeeded = true;
   if (epoch !== sessionEpoch) {
     // Superseded during the cache read — same unwind as the post-start guard.
     const docWasDestroyed =
@@ -2022,6 +2036,7 @@ async function joinRoomAtEpoch(
   // arrival gate opens at once and the host ships only what changed since.
   if (neighbourWarmer.seedDoc(sync.doc, boot.roomId)) {
     console.log(`🚪🔥 joined ${boot.roomId} from its warm replica`);
+    roomReplicaSeeded = true;
   }
   await sync.start();
   if (epoch !== sessionEpoch) {
@@ -2328,9 +2343,14 @@ async function joinRoomAtEpoch(
   // 🚪🔥 …and once the live state has truly arrived: a warm or cached join can
   // pass the arrival gate on owner+name before roomStateArrivedNow holds, and
   // a sync that changes no door would never notify the door listeners.
+  // ⛓️ The room cap likewise (#272 review round 4): its posture probe says
+  // UNKNOWN until the room's state is usable, so the reading the state now
+  // allows goes to the node here, door change or none.
   for (const synced of [sync.whenServerSynced, sync.whenLinkedSynced]) {
     void synced.then(() => {
-      if (epoch === sessionEpoch && yjsSync === sync) refreshWarmNeighbours();
+      if (epoch !== sessionEpoch || yjsSync !== sync) return;
+      refreshWarmNeighbours();
+      void networkProvider.refreshRoomCap();
     });
   }
   void awaitInitialRoomState(SYNC_GATE_MS).then(() => {
@@ -3386,6 +3406,7 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // ⛓️ N8: likewise, the public-room probe must not read this room's doors for
   // whatever room is joined next.
   doorDocsBoundFor = null;
+  roomReplicaSeeded = false;
   // We are now roomless (issue #60 review): clear the active-pass room so a
   // swap that leaves but never re-joins (stranded) can't wedge a pass showing
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the

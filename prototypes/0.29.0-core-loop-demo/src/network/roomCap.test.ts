@@ -8,8 +8,11 @@ import {
   nextCapSeq,
   nodeSharesCard,
   normalizeContactCard,
+  passageReading,
   roomIsPublicSpace,
   roomPosture,
+  roomPostureProbe,
+  type PostureSources,
 } from './roomCap';
 
 const card = (nodeId: string, issuedAt = 100) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt, sig: 'ff' });
@@ -99,6 +102,44 @@ describe('room cap payload (N8 / D3)', () => {
     expect(buildRoomCapPayload('k', false, null, 1, true, []).passPrivate).toBeUndefined();
     expect(buildRoomCapPayload('k', false, true, 1, true, cards)).toEqual({ roomKeyB64: 'k', chiaMode: false, publicRoom: true, seq: 1, shareCard: true });
     expect(buildRoomCapPayload('k', false, false, 1, true, cards).passPrivate).toBe(true);
+  });
+
+  it('P6b: a first visit\'s cap says UNKNOWN until the room\'s state is usable, then what its doors say', () => {
+    // #272 review round 4: the whole first-visit sequence. The door documents
+    // are bound right after the sync starts, while the replica is still EMPTY
+    // — and empty door documents read as the cardinal defaults, which are
+    // public. Read then, the cap would say PUBLIC and the node would stop
+    // using the private pass's cards before the host's state could land.
+    const state = { docsBoundFor: null as string | null, stateUsable: false, passagePublic: true };
+    const src: PostureSources = {
+      bundled: (roomId) => roomId === 'welcome',
+      docsBoundFor: () => state.docsBoundFor,
+      stateUsable: () => state.stateUsable,
+      passagePublic: () => state.passagePublic,
+    };
+    const probe = roomPostureProbe(src);
+    const cards = [card('host')];
+    const cap = () => buildRoomCapPayload('k', false, probe('r'), 1, true, cards);
+    // 1. connect: no door documents are bound yet.
+    expect(cap()).toMatchObject({ publicRoom: null, passPrivate: true, memberCards: cards });
+    expect(roomIsPublicSpace(src.bundled('r'), passageReading(src, 'r'))).toBe(true); // a pass minted now carries no card
+    // 2. the room's documents are bound, the replica is empty: its defaults
+    //    read public, which is no reading at all.
+    state.docsBoundFor = 'r';
+    expect(passageReading(src, 'r')).toBeUndefined();
+    expect(cap()).toMatchObject({ publicRoom: null, passPrivate: true, memberCards: cards });
+    // 3. the host's state lands (or a kept replica seeded it): its doors speak.
+    state.stateUsable = true;
+    state.passagePublic = false;
+    expect(cap()).toMatchObject({ publicRoom: false, passPrivate: true, memberCards: cards });
+    expect(roomIsPublicSpace(src.bundled('r'), passageReading(src, 'r'))).toBe(false);
+    state.passagePublic = true;
+    expect(cap()).toEqual({ roomKeyB64: 'k', chiaMode: false, publicRoom: true, seq: 1, shareCard: true });
+    // Another room's documents bound say nothing about this one; the bundled
+    // room is public whatever is bound or synced.
+    state.docsBoundFor = 'other';
+    expect(probe('r')).toBeUndefined();
+    expect(probe('welcome')).toBe(true);
   });
 
   it('P6b: a node that hands out no card keeps the cached one out of every pass', () => {
