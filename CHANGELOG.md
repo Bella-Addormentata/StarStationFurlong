@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+## v0.42.0 — 2026-10-18
+
 - **🏦🔳 The Bank app shows where to send TXCH: your node's address as a QR code, with COPY and the balance ([#273](https://github.com/Bella-Addormentata/StarStationFurlong/pull/273), [#20](https://github.com/Bella-Addormentata/StarStationFurlong/issues/20) phone apps; the QR left open in [#245](https://github.com/Bella-Addormentata/StarStationFurlong/pull/245)).** To fund a station node you had to read its `txch1…` address off the node's startup log and type it into a wallet. The SpacePhone's Bank app now has a RECEIVE section between ACCOUNT and PORTFOLIO: the node's testnet11 address as a QR code a phone wallet scans off the screen, the same address as text with a COPY button, the balance the node reads (the part still confirming called out, a REFRESH button to read again, and a failed read shown as the node's last answer instead of a spinner), and a testnet11-only note: a mainnet wallet refuses a `txch` address, so real XCH cannot land there by mistake. The address shows only while the node has a wallet loaded (the publish build started with `SSF_CHIA_LANE=1`) and only in that machine's own browser; it never rides in a pass or a card. The faucet dish's cashier shows the jar's QR code above its address. Both codes are drawn by the station's own QR encoder and keep the standard's four-module quiet zone; the encoder is read back in tests by an independent decoder. Nothing is fetched and no outside host is added. ↑/↓ reach COPY and REFRESH from the keyboard. Three Copilot review rounds, five findings, all fixed.
 
 ## v0.41.0 — 2026-10-18
