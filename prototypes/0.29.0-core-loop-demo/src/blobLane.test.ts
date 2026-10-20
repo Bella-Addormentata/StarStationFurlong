@@ -4,7 +4,7 @@
  * node's status answers are shape-checked.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { __test, blobLaneNodeId, blobLaneReady, blobUrl, forgetBlobLane, formatBytes, setBlobLaneNode, setBlobLaneRoom } from './blobLane';
+import { __test, blobLaneNodeId, blobNodeTag, blobLaneReady, blobUrl, forgetBlobLane, formatBytes, setBlobLaneNode, setBlobLaneRoom } from './blobLane';
 import { setNodeMediaOrigin } from './tvConsent';
 import { tvNow, tvWallNow } from './tvDoc';
 
@@ -48,6 +48,17 @@ describe('blobLane', () => {
     expect(blobUrl(HASH)).toBe(`${ORIGIN}/blob/${HASH}?cap=${CAP}`);
     expect(blobUrl('../api/fingerprint')).toBeNull();
     expect(blobUrl(HASH.toUpperCase())).toBeNull();
+  });
+
+  it('tags the node a blob is read from, so a restarted node is a new mount', () => {
+    setNodeMediaOrigin(ORIGIN, tvNow(), tvWallNow());
+    setBlobLaneRoom('room-1');
+    setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID });
+    const before = blobNodeTag();
+    setBlobLaneNode({ origin: ORIGIN, cap: 'd'.repeat(64), irohId: ID });
+    expect(blobNodeTag()).not.toBe(before);
+    setBlobLaneNode(null);
+    expect(blobNodeTag()).toBe('');
   });
 
   it('shape-checks the node\'s status answers', () => {

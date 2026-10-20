@@ -44,12 +44,23 @@ const CAP_RE = /^[0-9a-f]{64}$/;
 
 let node: BlobNode | null = null;
 let room = '';
+/** Moves whenever the node's token changes (a restarted node, or none): an
+ *  answer to a request made under an older one describes a store that is
+ *  gone, and is dropped on arrival rather than written over the new node's. */
+let generation = 0;
 
 /** main.ts, on every fingerprint probe: the node and its token, or null
  *  when the node did not answer or runs without the lane. */
 export function setBlobLaneNode(n: BlobNode | null): void {
   const ok = n && CAP_RE.test(n.cap) && HEX_64.test(n.irohId) ? n : null;
-  if (ok?.cap !== node?.cap) statuses.clear(); // a restarted node holds nothing
+  if (ok?.cap !== node?.cap) {
+    // A restarted node holds nothing: what the old one said goes, and so do
+    // its polls still in flight (their answers are dropped by generation).
+    generation++;
+    statuses.clear();
+    polling.clear();
+    lastPoll.clear();
+  }
   node = ok;
 }
 
@@ -105,6 +116,7 @@ export function importBlob(
   const url = route('/api/blob/import', { room, mime: file.type });
   if (!url) return Promise.resolve({ error: 'The FILE tile needs this station\'s node (the desktop app) running.' });
   if (file.size === 0) return Promise.resolve({ error: 'That file is empty.' });
+  const gen = generation;
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url);
@@ -113,7 +125,9 @@ export function importBlob(
     xhr.onload = () => {
       let body: { hash?: unknown; size?: unknown; error?: unknown } = {};
       try { body = JSON.parse(xhr.responseText) as typeof body; } catch { /* not JSON */ }
-      if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
+      if (gen !== generation) {
+        resolve({ error: 'Your node restarted while taking the file — choose it again.' });
+      } else if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
         statuses.set(body.hash, { state: 'complete', have: file.size, size: file.size });
         resolve({ hash: body.hash, size: file.size });
       } else {
@@ -130,8 +144,10 @@ export function importBlob(
 export async function fetchBlob(hash: string, size: number, provider: string, mime = ''): Promise<string | null> {
   const url = HEX_64.test(hash) && HEX_64.test(provider) ? route('/api/blob/fetch', { room, hash, size: String(size), from: provider, mime }) : null;
   if (!url) return 'The FILE lane needs this station\'s node (the desktop app) running.';
+  const gen = generation;
   try {
     const res = await fetch(url, { method: 'POST', redirect: 'error' });
+    if (gen !== generation) return 'Your node restarted — press FETCH again.';
     if (res.ok) {
       statuses.set(hash, { state: 'queued', have: 0, size });
       return null;
@@ -171,16 +187,24 @@ export function blobState(hash: string, now = performance.now()): BlobState {
   if (!settled && !polling.has(hash) && now - (lastPoll.get(hash) ?? -Infinity) >= POLL_MS) {
     const url = HEX_64.test(hash) ? route('/api/blob/status', { hash }) : null;
     if (url) {
+      const gen = generation;
       polling.add(hash);
       lastPoll.set(hash, now);
       void fetch(url, { redirect: 'error' })
         .then((res) => (res.ok ? res.json() : null))
-        .then((body) => { statuses.set(hash, parseState(body)); })
+        .then((body) => { if (gen === generation) statuses.set(hash, parseState(body)); })
         .catch(() => { /* kept as it was; the next tick asks again */ })
-        .finally(() => polling.delete(hash));
+        .finally(() => { if (gen === generation) polling.delete(hash); });
     }
   }
   return known;
+}
+
+/** What identifies the node a blob is read from now — its origin and its
+ *  token's first digits — for the theatre's mount key: a node that changed
+ *  under a mounted player is a new mount, not a stale `src`. '' without one. */
+export function blobNodeTag(): string {
+  return blobLaneReady() ? `${node!.origin}#${node!.cap.slice(0, 8)}` : '';
 }
 
 /** Tests only. */

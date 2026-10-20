@@ -41,6 +41,7 @@ use iroh::{EndpointAddr, PublicKey};
 use iroh_blobs::provider::events::{
     AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode, ThrottleMode,
 };
+use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::Hash;
 use n0_future::StreamExt;
@@ -96,9 +97,12 @@ struct Held {
     /// What the webview is told it is: `video/*` or `audio/*`, else octet-stream.
     mime: String,
     phase: Phase,
-    /// Bytes this blob holds against the quota: the declared size while a
-    /// transfer runs, what arrived once it ends (a failed transfer's partial
-    /// bytes stay on disk until the next start, so they stay counted).
+    /// Bytes this blob holds against the quota. A fetch is charged its whole
+    /// declaration from the moment it is queued and keeps that charge even
+    /// when it fails: the request asks for no byte past the declaration, so
+    /// that is the most it can have put on disk, and a failed transfer's
+    /// bytes stay there until the next start empties the cache. A retry
+    /// takes the charge over (raised to its own declaration if larger).
     charged: u64,
 }
 
@@ -217,7 +221,7 @@ impl BlobLane {
     fn fail(&self, hash: &Hash, why: &str) {
         let mut held = self.held.lock().unwrap();
         if let Some(h) = held.get_mut(hash) {
-            h.charged = h.have;
+            // The charge stays (see `Held::charged`): what landed is on disk.
             h.phase = Phase::Failed(why.to_string());
         }
         eprintln!("📦 blob {}: {why}", hash.fmt_short());
@@ -243,14 +247,18 @@ impl BlobLane {
                     continue;
                 }
             };
-            let mut progress = self.store.remote().fetch(conn.clone(), hash).stream();
+            // The ceiling is in the REQUEST: only the declared bytes are asked
+            // for, so a provider holding a larger blob cannot write past the
+            // declaration here — the transfer ends partial, and fails below.
+            let request = GetRequest::blob_ranges(hash, ChunkRanges::bytes(0..size));
+            let mut progress = self.store.remote().execute_get(conn.clone(), request).stream();
             let outcome: Result<(), String> = loop {
                 match tokio::time::timeout(STALL_TIMEOUT, progress.next()).await {
                     Err(_) => break Err("the transfer stalled".into()),
                     Ok(None) => break Err("the transfer ended without a result".into()),
                     Ok(Some(iroh_blobs::api::remote::GetProgressItem::Progress(n))) => {
-                        // The hard ceiling: the declaration is peer-written,
-                        // so bytes past it end the transfer.
+                        // The request already stops at the declaration; this
+                        // is the second fence, should a provider send more.
                         if n > size {
                             break Err("the blob is larger than the room said".into());
                         }
@@ -489,11 +497,14 @@ pub async fn handle_http(
                 return reply(socket, "413 Payload Too Large", cors, &err_json("not enough room in this node's blob quota")).await;
             }
             let result = lane.import(socket, body_start, len).await;
-            lane.held.lock().unwrap().remove(&placeholder);
             match result {
                 Ok(hash) => {
                     {
+                        // The reservation becomes the blob's in one step: a
+                        // moment with neither counted would let another
+                        // upload or FETCH take the same room in the quota.
                         let mut held = lane.held.lock().unwrap();
+                        held.remove(&placeholder);
                         let h = held.entry(hash).or_insert(Held {
                             rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: len,
                         });
@@ -508,7 +519,10 @@ pub async fn handle_http(
                     let body = serde_json::json!({ "hash": hash.to_hex(), "size": len }).to_string();
                     reply(socket, "200 OK", cors, &body).await;
                 }
-                Err(e) => reply(socket, "500 Internal Server Error", cors, &err_json(&format!("import failed: {e}"))).await,
+                Err(e) => {
+                    lane.held.lock().unwrap().remove(&placeholder);
+                    reply(socket, "500 Internal Server Error", cors, &err_json(&format!("import failed: {e}"))).await
+                }
             }
         }
         ("POST", "/api/blob/fetch") => {
@@ -767,7 +781,27 @@ mod tests {
         queue(&lane_b2, 1000);
         lane_b2.clone().run_fetch(ep_b.clone(), tag.hash, 1000, vec![ep_a.id()]).await;
         assert!(matches!(lane_b2.held.lock().unwrap()[&tag.hash].phase, Phase::Failed(_)));
+        // …and asked for no more than it declared: the store holds a partial
+        // blob of about the declared size, never the whole 300 KB.
+        match lane_b2.store.blobs().status(tag.hash).await.unwrap() {
+            iroh_blobs::api::proto::BlobStatus::Partial { .. } | iroh_blobs::api::proto::BlobStatus::NotFound => {}
+            other => panic!("expected a partial blob, got {other:?}"),
+        }
+        let mut stored = 0u64;
+        for e in walk(&tmp.join("b2")) {
+            stored += std::fs::metadata(e).map(|m| m.len()).unwrap_or(0);
+        }
+        assert!(stored < 200_000, "the store took {stored} bytes for a 1000-byte declaration");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { out.extend(walk(&p)); } else if p.extension().is_none_or(|x| x != "db") { out.push(p); }
+        }
+        out
     }
 
     #[test]

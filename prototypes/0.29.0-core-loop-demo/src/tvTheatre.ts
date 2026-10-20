@@ -30,7 +30,7 @@ import {
   redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
-import { blobLaneReady, blobState, blobUrl, fetchBlob, formatBytes } from './blobLane';
+import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes } from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
 import { suspendStickKeys } from './freeFlightStick';
@@ -567,6 +567,10 @@ function unmountPlayer(t: Theatre): void {
  *  PREVIOUSLY ON) is a new key and gets a fresh iframe; seekable players
  *  follow a replay through the controller instead. */
 function mountKey(source: TvSource, started: number): string {
+  // A blob is read from this viewer's node: a node that restarted (a new
+  // token) or moved port is another mount, so the player is rebuilt on the
+  // new URL and a failure on the old node does not stick.
+  if (source.kind === 'blob') return `${sourceId(source)}@${blobNodeTag()}`;
   return isStartOnly(source) ? `${sourceId(source)}@${started}` : sourceId(source);
 }
 
@@ -848,15 +852,17 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
   const html = `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
     <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk until your node restarts. Nothing is fetched until you press</div>
     ${failed}
-    <button type="button" data-tv-fetch="${escapeHtml(source.hash)}">📦 FETCH ${escapeHtml(size)}</button>`;
+    <button type="button" data-tv-fetch="${escapeHtml(source.hash)}" data-tv-fetch-size="${source.size}" data-tv-fetch-from="${escapeHtml(source.provider)}">📦 FETCH ${escapeHtml(size)}</button>`;
   if (!t.notice.hidden && t.lastNotice === html) return;
   showNotice(t, html);
   t.notice.querySelector<HTMLButtonElement>('[data-tv-fetch]')?.addEventListener('click', (e) => {
     const btn = e.currentTarget as HTMLButtonElement;
-    // The press is for THE FILE THE BUTTON NAMED: a peer may have changed
-    // the programme between the render and the click.
+    // The press is for THE TRANSFER THE BUTTON SHOWED — this file, this
+    // size, from this node: a peer may have changed any of them between the
+    // render and the click, and the press consents to none of the changes.
     const now = readTv(t.itemId).source;
-    if (!now || now.kind !== 'blob' || now.hash !== btn.dataset.tvFetch) return;
+    if (!now || now.kind !== 'blob' || now.hash !== btn.dataset.tvFetch
+      || String(now.size) !== btn.dataset.tvFetchSize || now.provider !== btn.dataset.tvFetchFrom) return;
     btn.disabled = true;
     void fetchBlob(now.hash, now.size, now.provider, now.mime ?? '').then((refused) => {
       // Kept for the notice the next tick draws (a button again, with why).
