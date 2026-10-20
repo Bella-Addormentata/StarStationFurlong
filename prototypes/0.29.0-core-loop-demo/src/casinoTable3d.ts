@@ -646,13 +646,19 @@ class DicePair {
       new THREE.Vector3(p.x - 0.055, FELT_Y + this.half, p.z),
       new THREE.Vector3(p.x + 0.055, FELT_Y + this.half, p.z),
     ];
+    const faceChange = values !== undefined;
+    // The frame driver asks again every frame: a slide already headed for
+    // these spots carries on rather than starting over from where it is.
+    if (this.mode === 'sliding' && !faceChange) {
+      const same = (u: THREE.Vector3[]) => this.bodies.every((b, i) => b.slideTo.distanceTo(u[i]) < 1e-4);
+      if (same(targets) || same([targets[1], targets[0]])) return;
+    }
     // Each die goes to the nearer spot, so the pair never slides through itself.
     const [a, c] = this.bodies;
     if (a.pos.distanceTo(targets[1]) + c.pos.distanceTo(targets[0]) < a.pos.distanceTo(targets[0]) + c.pos.distanceTo(targets[1]) - 1e-6) {
       targets.reverse();
     }
     const far = this.bodies.some((b, i) => b.pos.distanceTo(targets[i]) > 0.01);
-    const faceChange = values !== undefined;
     if (!far && !faceChange && this.mode === 'rest') return;
     this.bodies.forEach((b, i) => {
       b.slideFrom.copy(b.pos);
@@ -808,8 +814,6 @@ class DicePair {
     for (let iter = 0; iter < 6; iter++) {
       let mtv = diceOverlap(a.pos, a.quat, c.pos, c.quat, this.half);
       if (!mtv) return;
-      // Exactly on top of each other (a reset mid-flight): part them sideways.
-      if (mtv.lengthSq() < 1e-12) mtv = new THREE.Vector3(DIE_SIZE, 0, 0);
       const low = a.pos.y <= floor + 0.02 && c.pos.y <= floor + 0.02;
       let push: THREE.Vector3;
       if (low) {

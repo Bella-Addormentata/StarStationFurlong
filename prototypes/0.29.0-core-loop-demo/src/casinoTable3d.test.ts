@@ -155,6 +155,37 @@ describe('the craps dice', () => {
     expect(worst).toBeLessThan(0.002);
   });
 
+  it('finish a slide when the frame driver asks for it every frame', () => {
+    const { h, dice } = crapsTable();
+    const to = { x: 0.9, z: -0.3 };
+    let f = 0;
+    // casinoTablesFrame re-sends the same spot on every frame of the slide.
+    for (; f < 120 && h.diceState() === 'rest' && Math.abs(dice[0].position.x + dice[1].position.x - 2 * to.x) > 1e-3; f++) {
+      h.diceRestAt(to);
+      h.update(1 / 120);
+    }
+    // A 1.1 s slide at most, so well inside 120 frames at 120 Hz.
+    expect(f).toBeLessThan(120);
+    expect((dice[0].position.z + dice[1].position.z) / 2).toBeCloseTo(to.z, 3);
+  });
+
+  it('a shallow touch in the air moves them only a hair', () => {
+    const { h } = crapsTable();
+    type Body = { pos: THREE.Vector3; quat: THREE.Quaternion; vel: THREE.Vector3 };
+    const pair = (h as unknown as { dice: { bodies: Body[]; collide(bounce: boolean): void } }).dice;
+    const [a, b] = pair.bodies;
+    // In the air, square to each other, a hair closer than touching along z.
+    a.pos.set(0, 1.5, 0); b.pos.set(0, 1.5, DIE_SIZE - 5e-7);
+    a.quat.identity(); b.quat.identity();
+    a.vel.set(0, 0, 0.5); b.vel.set(0, 0, -0.5);
+    pair.collide(true);
+    expect(a.pos.distanceTo(new THREE.Vector3(0, 1.5, 0))).toBeLessThan(0.002);
+    expect(Math.abs(b.pos.x)).toBeLessThan(1e-6);
+    // And the knock is along the contact (z), not sideways.
+    expect(Math.abs(a.vel.x)).toBeLessThan(1e-9);
+    expect(a.vel.z).toBeLessThan(0);
+  });
+
   it('are solid to the overlap test itself', () => {
     const q = new THREE.Quaternion();
     const half = DIE_SIZE / 2;
