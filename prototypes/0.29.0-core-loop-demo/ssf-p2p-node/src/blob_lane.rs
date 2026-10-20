@@ -71,6 +71,17 @@ const MAX_FETCHES: usize = 2;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// A transfer that moves no byte for this long has stalled, and fails.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// What a blob of `size` bytes can take on disk, the most a fetch of it can
+/// write: its data rounded up to whole 16 KiB chunk groups (a ranged request
+/// is asked for in whole BLAKE3 chunks, and the store keeps groups), plus its
+/// hash tree (64 bytes per group). Every charge against the quota is this,
+/// never the bare size, so a declaration that rounds up cannot overrun it.
+pub fn storage_bound(size: u64) -> u64 {
+    const GROUP: u64 = 16 * 1024;
+    let groups = size.div_ceil(GROUP).max(1);
+    groups.saturating_mul(GROUP).saturating_add(groups.saturating_mul(64))
+}
+
 /// The longest room id a blob route accepts (the browser's are far shorter).
 const MAX_ROOM_LEN: usize = 256;
 /// The longest request head the HTTP API reads before it gives up.
@@ -220,8 +231,10 @@ impl BlobLane {
 
     fn fail(&self, hash: &Hash, why: &str) {
         let mut held = self.held.lock().unwrap();
-        if let Some(h) = held.get_mut(hash) {
-            // The charge stays (see `Held::charged`): what landed is on disk.
+        // Only a transfer still running can fail: an import of the same file
+        // that completed meanwhile is whole, and stays so. The charge stays
+        // (see `Held::charged`): what landed is on disk.
+        if let Some(h) = held.get_mut(hash).filter(|h| matches!(h.phase, Phase::Queued | Phase::Fetching)) {
             h.phase = Phase::Failed(why.to_string());
         }
         eprintln!("📦 blob {}: {why}", hash.fmt_short());
@@ -231,8 +244,14 @@ impl BlobLane {
     /// id, take the blob under its declared size, check what arrived.
     async fn run_fetch(self: Arc<Self>, endpoint: iroh::Endpoint, hash: Hash, size: u64, providers: Vec<PublicKey>) {
         let Ok(_slot) = self.slots.acquire().await else { return };
-        if let Some(h) = self.held.lock().unwrap().get_mut(&hash) {
-            h.phase = Phase::Fetching;
+        {
+            // An import of the same file may have landed while this waited:
+            // the work is done, and must not be marked fetching again.
+            let mut held = self.held.lock().unwrap();
+            match held.get_mut(&hash) {
+                Some(h) if h.phase == Phase::Queued => h.phase = Phase::Fetching,
+                _ => return,
+            }
         }
         let mut last_err = String::from("no provider answered");
         for provider in providers {
@@ -262,7 +281,7 @@ impl BlobLane {
                         if n > size {
                             break Err("the blob is larger than the room said".into());
                         }
-                        if let Some(h) = self.held.lock().unwrap().get_mut(&hash) {
+                        if let Some(h) = self.held.lock().unwrap().get_mut(&hash).filter(|h| h.phase == Phase::Fetching) {
                             h.have = n;
                         }
                     }
@@ -279,7 +298,7 @@ impl BlobLane {
                             let mut held = self.held.lock().unwrap();
                             if let Some(h) = held.get_mut(&hash) {
                                 h.have = got;
-                                h.charged = got;
+                                h.charged = storage_bound(got);
                                 h.phase = Phase::Complete;
                             }
                             println!("📦 blob {}: fetched {got} bytes from {}", hash.fmt_short(), provider.fmt_short());
@@ -485,10 +504,10 @@ pub async fn handle_http(
             let placeholder = Hash::new(nonce);
             let reserved = {
                 let mut held = lane.held.lock().unwrap();
-                let fits = BlobLane::charged(&held) + len <= lane.quota;
+                let fits = BlobLane::charged(&held) + storage_bound(len) <= lane.quota;
                 if fits {
                     held.insert(placeholder, Held {
-                        rooms: HashSet::new(), size: len, have: 0, mime: mime.clone(), phase: Phase::Importing, charged: len,
+                        rooms: HashSet::new(), size: len, have: 0, mime: mime.clone(), phase: Phase::Importing, charged: storage_bound(len),
                     });
                 }
                 fits
@@ -506,13 +525,13 @@ pub async fn handle_http(
                         let mut held = lane.held.lock().unwrap();
                         held.remove(&placeholder);
                         let h = held.entry(hash).or_insert(Held {
-                            rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: len,
+                            rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len),
                         });
                         h.rooms.insert(room);
                         h.phase = Phase::Complete;
                         h.have = len;
                         h.size = len;
-                        h.charged = len;
+                        h.charged = storage_bound(len);
                         h.mime = mime;
                     }
                     println!("📦 blob {}: imported {len} bytes", hash.fmt_short());
@@ -573,11 +592,11 @@ pub async fn handle_http(
                     let failed_charge = held.get(&hash).map(|h| h.charged).unwrap_or(0);
                     if providers.is_empty() {
                         Verdict::NotConnected
-                    } else if BlobLane::charged(&held) - failed_charge + size.max(failed_charge) > lane.quota {
+                    } else if BlobLane::charged(&held) - failed_charge + storage_bound(size).max(failed_charge) > lane.quota {
                         Verdict::NoRoom
                     } else {
                         held.insert(hash, Held {
-                            rooms: HashSet::from([room]), size, have: 0, mime, phase: Phase::Queued, charged: size.max(failed_charge),
+                            rooms: HashSet::from([room]), size, have: 0, mime, phase: Phase::Queued, charged: storage_bound(size).max(failed_charge),
                         });
                         Verdict::Start
                     }
@@ -791,7 +810,17 @@ mod tests {
         for e in walk(&tmp.join("b2")) {
             stored += std::fs::metadata(e).map(|m| m.len()).unwrap_or(0);
         }
-        assert!(stored < 200_000, "the store took {stored} bytes for a 1000-byte declaration");
+        assert!(stored <= storage_bound(1000), "the store took {stored} bytes for a 1000-byte declaration, over its charge of {}", storage_bound(1000));
+
+        // An import of the same file landing while a FETCH waited for its
+        // slot: the queued fetch does nothing, and nothing marks it failed.
+        let lane_d = BlobLane::open_at(tmp.join("d"), 1 << 30).await.unwrap();
+        queue(&lane_d, size);
+        lane_d.held.lock().unwrap().get_mut(&tag.hash).unwrap().phase = Phase::Complete;
+        lane_d.clone().run_fetch(ep_c.clone(), tag.hash, size, vec![ep_a.id()]).await;
+        assert_eq!(lane_d.held.lock().unwrap()[&tag.hash].phase, Phase::Complete);
+        lane_d.fail(&tag.hash, "a late failure");
+        assert_eq!(lane_d.held.lock().unwrap()[&tag.hash].phase, Phase::Complete);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -802,6 +831,15 @@ mod tests {
             if p.is_dir() { out.extend(walk(&p)); } else if p.extension().is_none_or(|x| x != "db") { out.push(p); }
         }
         out
+    }
+
+    #[test]
+    fn storage_bounds() {
+        assert_eq!(storage_bound(0), 16 * 1024 + 64);
+        assert_eq!(storage_bound(1), 16 * 1024 + 64);
+        assert_eq!(storage_bound(16 * 1024), 16 * 1024 + 64);
+        assert_eq!(storage_bound(16 * 1024 + 1), 2 * (16 * 1024 + 64));
+        assert!(storage_bound(u64::MAX) >= u64::MAX / 2);
     }
 
     #[test]
