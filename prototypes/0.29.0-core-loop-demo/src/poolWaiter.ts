@@ -18,7 +18,7 @@ import * as THREE from "three";
 import type { Player } from "./player";
 import {
   CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell, walkableGridRevision,
-  walkable,
+  walkable, robotClear, nearestWalkableCell, nearestReachableOnGrid,
 } from "./pathfinding";
 import { backOffStep, occupied, segmentFree, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
@@ -50,6 +50,9 @@ const GULP_TIME = 0.3; // drink shrinks away (drunk!)
 const SERVE_COOLDOWN = 6; // s before the next drink can be grabbed
 const BACK_OFF_SPEED = 0.7; // 🤖↔🦊 step-back pace to the serve standoff
 const BLOCKED_TURN_SECS = 2; // 🤖↔🦊 patrol held up this long → turn back
+/** 🧭 Last straight hop allowed off the planned route onto a goal that isn't
+ *  clear floor itself (a dock, a croupier post or a stand beside a table). */
+const FINAL_HOP = 0.8;
 const DOCK_AFTER_SECS = 12; // 🔌 idle this long with no fox near → return to dock
 const DOCK_WAKE_RANGE = 4.5; // 🔌 a fox this close wakes the bot off the dock
 const REFILL_TIME = 14; // s until an emptied tray slot is restocked
@@ -337,6 +340,9 @@ export class PoolWaiter {
    *  clipping straight through), and the goal they were computed for. */
   private path: Array<{ x: number; z: number }> = [];
   private pathGoalKey = "";
+  /** 🧭 Where the planned route ends: the goal itself, or the nearest clear
+   *  floor to it when the goal is under furniture (null ⇒ nowhere to go). */
+  private routeEnd: { x: number; z: number } | null = null;
   /** 🤖↔🦊 Where every avatar in the room stands (local fox + peers), handed
    *  over by the world each frame — the robot never walks over them. */
   private avatars: readonly XZ[] = [];
@@ -366,9 +372,10 @@ export class PoolWaiter {
     this.avatars = avatars;
   }
 
-  /** Free floor on the walk grid at (x,z) — where a swerve or step-back may go. */
+  /** Clear floor at (x,z) — a cell away from any furniture — where a swerve
+   *  or step-back may go. */
   private static isFree(x: number, z: number): boolean {
-    return walkable[worldToRow(z)]?.[worldToCol(x)] === true;
+    return robotClear[worldToRow(z)]?.[worldToCol(x)] === true;
   }
 
   /** World-space footprint of the bot (x,z) — used to pick the nearest robot
@@ -1423,11 +1430,19 @@ export class PoolWaiter {
    * 🧭 #77C: walk toward (tx,tz) along an A*-routed path so the bot rounds
    * furniture / passes through door openings instead of clipping straight
    * through — the review's straight-line-through-tables gap. Recomputes the
-   * route only when the goal changes; if no path exists (target behind a wall,
-   * or the bot is off-grid) it falls back to a direct line so it never freezes.
-   * Returns true once within `arriveDist`; animates the leg swing while moving.
+   * route only when the goal changes (planRoute: clear floor first, never a
+   * straight line through furniture). A `soft` goal (patrol waypoint) under
+   * furniture or past a too-narrow aisle is swapped for the nearest clear
+   * floor. Returns true once within `arriveDist` (or at that nearest floor,
+   * or when there's nowhere to go); animates the leg swing while moving.
    */
-  private walkTo(dt: number, tx: number, tz: number, arriveDist: number): boolean {
+  private walkTo(
+    dt: number,
+    tx: number,
+    tz: number,
+    arriveDist: number,
+    soft = false,
+  ): boolean {
     const pos = this.group.position;
     if (Math.hypot(tx - pos.x, tz - pos.z) < arriveDist) {
       this.path = [];
@@ -1435,19 +1450,23 @@ export class PoolWaiter {
     }
     // The goal AND the grid it was planned on: a rebake (furniture added,
     // moved, removed) invalidates the route.
-    const key = `${tx.toFixed(1)},${tz.toFixed(1)}@${walkableGridRevision()}`;
+    const key = `${tx.toFixed(1)},${tz.toFixed(1)}${soft ? "~" : ""}@${walkableGridRevision()}`;
     if (key !== this.pathGoalKey) {
       this.pathGoalKey = key;
-      this.path = findPath(
-        worldToRow(pos.z),
-        worldToCol(pos.x),
-        worldToRow(tz),
-        worldToCol(tx),
-      );
+      this.planRoute(pos, tx, tz, soft);
     }
-    // Drop waypoints already reached, then aim at the next one (or the goal
-    // directly when the route is empty — the straight-line fallback).
-    let target = this.path[0] ?? { x: tx, z: tz };
+    const end = this.routeEnd;
+    if (!end) return true; // walled in — nowhere to walk to
+    if (
+      this.path.length === 0 &&
+      (end.x !== tx || end.z !== tz) &&
+      Math.hypot(end.x - pos.x, end.z - pos.z) < Math.max(arriveDist, 0.12)
+    ) {
+      return true; // as close as the floor allows
+    }
+    // Drop waypoints already reached, then aim at the next one (or the
+    // route's end once the planned cells run out).
+    let target = this.path[0] ?? end;
     let dx = target.x - pos.x;
     let dz = target.z - pos.z;
     let dist = Math.hypot(dx, dz);
@@ -1459,10 +1478,10 @@ export class PoolWaiter {
       this.path.length > 0 &&
       (dist < CELL_SIZE * 0.5 ||
         (occupied(target, this.avatars) &&
-          segmentFree(pos, this.path[1] ?? { x: tx, z: tz }, PoolWaiter.isFree)))
+          segmentFree(pos, this.path[1] ?? end, PoolWaiter.isFree)))
     ) {
       this.path.shift();
-      target = this.path[0] ?? { x: tx, z: tz };
+      target = this.path[0] ?? end;
       dx = target.x - pos.x;
       dz = target.z - pos.z;
       dist = Math.hypot(dx, dz);
@@ -1498,6 +1517,63 @@ export class PoolWaiter {
     return false;
   }
 
+  /**
+   * 🧭 Plan this.path / this.routeEnd from `pos` to (tx,tz).
+   *
+   * Leg 1 runs over the robot-clear grid (a cell of floor between the robot
+   * and any furniture) to the clear cell nearest the goal; an aisle too
+   * narrow for that is not squeezed through. A `soft` goal (a patrol
+   * waypoint) ends there: as near as clear floor allows. A post the robot
+   * must stand ON (croupier post, dock, stand, stage) gets leg 2 over the
+   * plain walk grid from there, the short careful approach to a spot beside
+   * a table. Either way the route only ever crosses walkable cells, plus a
+   * last hop of at most FINAL_HOP onto a goal that is itself under
+   * furniture (a dock) — never a straight line through a table.
+   */
+  private planRoute(pos: { x: number; z: number }, tx: number, tz: number, soft: boolean): void {
+    const goal = { x: tx, z: tz };
+    const gr = worldToRow(tz);
+    const gc = worldToCol(tx);
+    const path: Array<{ x: number; z: number }> = [];
+    const sameCell = (a: { x: number; z: number }, b: { x: number; z: number }): boolean =>
+      worldToRow(a.z) === worldToRow(b.z) && worldToCol(a.x) === worldToCol(b.x);
+    // Snap the start onto a grid (a docked robot stands on its dock); with
+    // no clear floor anywhere near (furniture dropped round it), plain floor.
+    let grids = soft ? [robotClear] : [robotClear, walkable];
+    let at = nearestWalkableCell(pos.x, pos.z, 4, robotClear);
+    if (!at) {
+      at = nearestWalkableCell(pos.x, pos.z, 4, walkable);
+      grids = [walkable];
+    }
+    if (!at) {
+      this.path = [];
+      this.routeEnd = null;
+      return;
+    }
+    if (!sameCell(at, pos)) path.push(at);
+    for (const grid of grids) {
+      if (sameCell(at, goal)) break;
+      const near = nearestReachableOnGrid(tx, tz, at, grid);
+      if (!near) continue;
+      if (!sameCell(at, near)) {
+        path.push(
+          ...findPath(worldToRow(at.z), worldToCol(at.x), worldToRow(near.z), worldToCol(near.x), grid),
+        );
+      }
+      at = near;
+    }
+    this.path = path;
+    // The last hop may end on the goal's own cell (a dock under the robot's
+    // feet) but must not cross any other furniture.
+    const hopFree = (x: number, z: number): boolean =>
+      walkable[worldToRow(z)]?.[worldToCol(x)] === true ||
+      (worldToRow(z) === gr && worldToCol(x) === gc);
+    this.routeEnd =
+      Math.hypot(at.x - tx, at.z - tz) <= FINAL_HOP && segmentFree(at, goal, hopFree)
+        ? goal
+        : at;
+  }
+
   private foxDistance(player: Player): number {
     // Read the mesh position directly (getPosition() clones a Vector3, and
     // this runs per frame per bot).
@@ -1531,7 +1607,7 @@ export class PoolWaiter {
       if (next >= 0 && next < this.patrol.length) this.patrolIndex = next;
       return;
     }
-    if (this.walkTo(dt, tx, tz, 0.1)) {
+    if (this.walkTo(dt, tx, tz, 0.1, true)) {
       // Reached this waypoint → ping-pong to the next.
       const next = this.patrolIndex + this.patrolDir;
       if (next < 0 || next >= this.patrol.length)
