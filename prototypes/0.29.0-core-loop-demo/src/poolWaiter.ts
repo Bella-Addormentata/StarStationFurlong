@@ -18,7 +18,9 @@ import * as THREE from "three";
 import type { Player } from "./player";
 import {
   CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell, walkableGridRevision,
+  walkable,
 } from "./pathfinding";
+import { backOffStep, occupied, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
 import { FURNITURE, type FurnitureItem } from "./furniture";
@@ -46,6 +48,8 @@ const SIP_TIME = 5.0; // held in the paw, sipped over five seconds
 const SIP_CYCLES = 3; // paw-to-muzzle raises across the sip
 const GULP_TIME = 0.3; // drink shrinks away (drunk!)
 const SERVE_COOLDOWN = 6; // s before the next drink can be grabbed
+const BACK_OFF_SPEED = 0.7; // 🤖↔🦊 step-back pace to the serve standoff
+const BLOCKED_TURN_SECS = 2; // 🤖↔🦊 patrol held up this long → turn back
 const DOCK_AFTER_SECS = 12; // 🔌 idle this long with no fox near → return to dock
 const DOCK_WAKE_RANGE = 4.5; // 🔌 a fox this close wakes the bot off the dock
 const REFILL_TIME = 14; // s until an emptied tray slot is restocked
@@ -333,6 +337,11 @@ export class PoolWaiter {
    *  clipping straight through), and the goal they were computed for. */
   private path: Array<{ x: number; z: number }> = [];
   private pathGoalKey = "";
+  /** 🤖↔🦊 Where every avatar in the room stands (local fox + peers), handed
+   *  over by the world each frame — the robot never walks over them. */
+  private avatars: readonly XZ[] = [];
+  /** 🤖↔🦊 How long the current walk has been held up by someone in the way. */
+  private blockedSecs = 0;
 
   constructor(
     scene: THREE.Scene,
@@ -349,6 +358,17 @@ export class PoolWaiter {
     const [sx, sz] = spawnPos ? [spawnPos.x, spawnPos.z] : this.patrol[0];
     this.group.position.set(sx, 0, sz);
     scene.add(this.group);
+  }
+
+  /** 🤖↔🦊 Avatar positions to keep clear of (the world refreshes them every
+   *  frame before update; the robot only reads them). */
+  public setAvatars(avatars: readonly XZ[]): void {
+    this.avatars = avatars;
+  }
+
+  /** Free floor on the walk grid at (x,z) — where a swerve or step-back may go. */
+  private static isFree(x: number, z: number): boolean {
+    return walkable[worldToRow(z)]?.[worldToCol(x)] === true;
   }
 
   /** World-space footprint of the bot (x,z) — used to pick the nearest robot
@@ -1431,7 +1451,12 @@ export class PoolWaiter {
     let dx = target.x - pos.x;
     let dz = target.z - pos.z;
     let dist = Math.hypot(dx, dz);
-    while (this.path.length > 0 && dist < CELL_SIZE * 0.5) {
+    // 🤖↔🦊 A route point somebody is standing on counts as passed — the
+    // robot walks round them to the next one instead of over them.
+    while (
+      this.path.length > 0 &&
+      (dist < CELL_SIZE * 0.5 || occupied(target, this.avatars))
+    ) {
       this.path.shift();
       target = this.path[0] ?? { x: tx, z: tz };
       dx = target.x - pos.x;
@@ -1439,8 +1464,24 @@ export class PoolWaiter {
       dist = Math.hypot(dx, dz);
     }
     if (dist > 0.001) {
-      const nx = dx / dist;
-      const nz = dz / dist;
+      // 🤖↔🦊 Keep out of everyone's personal space: swerve round a player in
+      // the way, or stand and wait when there's no room to pass.
+      const dir = steerStep(
+        pos,
+        { x: dx / dist, z: dz / dist },
+        this.avatars,
+        PoolWaiter.isFree,
+      );
+      if (!dir) {
+        this.blockedSecs += dt;
+        this.legL.rotation.x = 0;
+        this.legR.rotation.x = 0;
+        this.body.position.y = 0;
+        return false;
+      }
+      this.blockedSecs = 0;
+      const nx = dir.x;
+      const nz = dir.z;
       this.turnToward(Math.atan2(nx, nz), dt);
       const step = Math.min(WALK_SPEED * dt, dist);
       pos.x += nx * step;
@@ -1477,6 +1518,15 @@ export class PoolWaiter {
 
   private updatePatrol(dt: number): void {
     const [tx, tz] = this.patrol[this.patrolIndex];
+    // 🤖↔🦊 Someone standing on the waypoint, or a player blocking the aisle
+    // for a while: turn back along the route rather than push through.
+    if (occupied({ x: tx, z: tz }, this.avatars) || this.blockedSecs > BLOCKED_TURN_SECS) {
+      this.blockedSecs = 0;
+      this.patrolDir = -this.patrolDir as 1 | -1;
+      const next = this.patrolIndex + this.patrolDir;
+      if (next >= 0 && next < this.patrol.length) this.patrolIndex = next;
+      return;
+    }
     if (this.walkTo(dt, tx, tz, 0.1)) {
       // Reached this waypoint → ping-pong to the next.
       const next = this.patrolIndex + this.patrolDir;
@@ -1545,6 +1595,16 @@ export class PoolWaiter {
 
     // Keep facing the fox throughout the exchange.
     if (dist > 0.01) this.turnToward(Math.atan2(dx / dist, dz / dist), dt);
+
+    // 🤖↔🦊 Hand the drink over from a polite distance: a fox that walked
+    // right up to the tray gets a step back, so the robot never stands in
+    // its avatar (or in front of the table it's playing at).
+    const backStep = BACK_OFF_SPEED * dt;
+    const back = backOffStep(bp, pp, PoolWaiter.isFree, backStep);
+    if (back) {
+      bp.x += back.x * backStep;
+      bp.z += back.z * backStep;
+    }
 
     // Fox wandered off before the sip — quietly put everything back.
     if (

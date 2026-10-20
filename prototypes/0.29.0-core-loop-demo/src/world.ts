@@ -382,6 +382,8 @@ export class World {
    *  belong to — one robot per placed dock. A room with NO dock has NO robot
    *  (owner request 2026-07-21: robots come ONLY from the docking system). */
   private robots = new Map<string, PoolWaiter>();
+  /** 🤖↔🦊 Avatar spots the robots keep clear of, refilled every frame. */
+  private robotAvatarSpots: Array<{ x: number; z: number }> = [];
   /** Route the live robots were built with — a change rebuilds them all. */
   private robotsPatrol: Array<[number, number]> | null = null;
   /** 🏋️ Cooldown (s) between row-formation escort walks, so a blocked path
@@ -4142,7 +4144,23 @@ export class World {
       this.updateShipPilots();
       this.updateDisassembly();
     }
-    for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
+    // 🤖↔🦊 Robots keep out of everyone's personal space — the local fox
+    // (focused on a table too: its mesh is hidden but it still stands
+    // there) and every peer's avatar.
+    const avatars = this.robotAvatarSpots;
+    avatars.length = 0;
+    if (this.isPlayerActive()) {
+      const p = this.player.mesh.position;
+      avatars.push({ x: p.x, z: p.z });
+    }
+    for (const avatar of this.remotePlayers.values()) {
+      const p = avatar.rig.masterGroup.position;
+      avatars.push({ x: p.x, z: p.z });
+    }
+    for (const bot of this.robots.values()) {
+      bot.setAvatars(avatars);
+      bot.update(deltaTime, activePlayer);
+    }
 
     this.updateCoachFollow(deltaTime, activePlayer, zoomLevel === 1);
 
