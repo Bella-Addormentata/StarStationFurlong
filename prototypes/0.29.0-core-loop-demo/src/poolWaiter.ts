@@ -18,7 +18,7 @@ import * as THREE from "three";
 import type { Player } from "./player";
 import {
   CELL_SIZE, findPath, worldToCol, worldToRow, colToWorld, rowToWorld, nearestReachableCell, walkableGridRevision,
-  walkable, robotClear, nearestWalkableCell, nearestReachableOnGrid, nearestReachableMatching,
+  walkable, robotClear, nearestReachableOnGrid, nearestReachableMatching, stepOffFurniture,
 } from "./pathfinding";
 import { backOffStep, occupied, segmentFree, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
@@ -53,6 +53,11 @@ const BLOCKED_TURN_SECS = 2; // 🤖↔🦊 patrol held up this long → turn ba
 /** 🧭 Last straight hop allowed off the planned route onto a goal that isn't
  *  clear floor itself (a dock, a croupier post or a stand beside a table). */
 const FINAL_HOP = 0.8;
+/** 🧭 Longest walk over cramped floor (cells beside furniture) allowed at the
+ *  end of a route onto a post. Further than this and the post counts as out
+ *  of reach: the robot waits on the nearest clear floor instead of edging
+ *  down a narrow aisle. */
+const APPROACH_MAX = 2.5;
 const DOCK_AFTER_SECS = 12; // 🔌 idle this long with no fox near → return to dock
 const DOCK_WAKE_RANGE = 4.5; // 🔌 a fox this close wakes the bot off the dock
 const REFILL_TIME = 14; // s until an emptied tray slot is restocked
@@ -1543,12 +1548,12 @@ export class PoolWaiter {
     // Departure: a robot on cramped floor (beside a table, at a post) walks
     // the plain grid to the nearest clear floor, never cutting across a
     // table to reach it. One standing on furniture itself (its dock) first
-    // steps to the nearest walkable cell. With no clear floor reachable at
+    // steps off it, crossing nothing but that furniture. With no clear floor reachable at
     // all (furniture dropped round it) the whole route uses plain floor.
     let grids = soft ? [robotClear] : [robotClear, walkable];
     let at: { x: number; z: number } | null = { x: pos.x, z: pos.z };
     if (!walkable[worldToRow(pos.z)]?.[worldToCol(pos.x)]) {
-      at = nearestWalkableCell(pos.x, pos.z, 4, walkable);
+      at = stepOffFurniture(pos.x, pos.z, 4);
       if (at) path.push(at);
     }
     if (!at) {
@@ -1570,9 +1575,20 @@ export class PoolWaiter {
       const near = nearestReachableOnGrid(tx, tz, at, grid);
       if (!near) continue;
       if (!sameCell(at, near)) {
-        path.push(
-          ...findPath(worldToRow(at.z), worldToCol(at.x), worldToRow(near.z), worldToCol(near.x), grid),
+        const leg = findPath(
+          worldToRow(at.z), worldToCol(at.x), worldToRow(near.z), worldToCol(near.x), grid,
         );
+        // The plain-grid leg is only the short careful approach to a post.
+        if (grid === walkable && grids.length > 1) {
+          let len = 0;
+          let prev = at;
+          for (const p of leg) {
+            len += Math.hypot(p.x - prev.x, p.z - prev.z);
+            prev = p;
+          }
+          if (len > APPROACH_MAX) break;
+        }
+        path.push(...leg);
       }
       at = near;
     }

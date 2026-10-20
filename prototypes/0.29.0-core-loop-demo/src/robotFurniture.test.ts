@@ -141,6 +141,35 @@ describe('robot still reaches posts beside tables', () => {
     }
   });
 
+  it('does not edge down a long narrow aisle to reach a post', () => {
+    // Two rows of tables leave a 0.5 m aisle (z 0.5..1.0) 6 m long, too
+    // narrow for clear floor. A post in its middle is out of reach: the
+    // robot waits on clear floor instead of brushing the tables.
+    const t = (id: string, x: number, z: number): FurnitureItem => ({ ...craps(x, z, 0), id });
+    loadRoom([t('a', -1.5, 0), t('b', 1.5, 0), t('c', -1.5, 1.5), t('d', 1.5, 1.5)]);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: 3.75 });
+    bot.setCroupierPost({ x: 0.25, z: 0.75, faceAngle: 0 });
+    const r = walk(bot, 40);
+    expect(r.travelled).toBeGreaterThan(0.5);
+    expect(r.closest).toBeGreaterThan(ROBOT_HALF_WIDTH);
+  });
+
+  it('steps off its dock without crossing the table next to it', () => {
+    // A robot inside furniture (as on its dock) beside another table: it
+    // must step off over open floor, never through the neighbour.
+    loadRoom([craps(0, 0, 0), { ...craps(0, 1.0, 0), id: 'test-craps-2' }]);
+    const inOwn = (x: number, z: number): boolean => x > -1.5 && x < 1.5 && z > -0.5 && z < 0.5;
+    const bot = new PoolWaiter(new THREE.Scene(), [[0.25, -3], [0.25, -4]], { x: 0.25, z: 0.4 });
+    let crossedNeighbour = false;
+    for (let t = 0; t < 20; t += 1 / 30) {
+      bot.update(1 / 30, null);
+      const p = bot.getPosition();
+      if (!inOwn(p.x, p.z) && clearance(p.x, p.z) < 0) crossedNeighbour = true;
+    }
+    expect(crossedNeighbour).toBe(false);
+    expect(bot.getPosition().z).toBeLessThan(-1); // left by the open south side
+  });
+
   it('walks back onto its charging dock', () => {
     loadRoom(CASINO_FURNITURE);
     const dock = CASINO_FURNITURE.find((i) => i.kind === 'charging-dock')!;

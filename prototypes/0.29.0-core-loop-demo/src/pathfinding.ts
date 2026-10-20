@@ -274,6 +274,44 @@ export function nearestReachableMatching(
   return null;
 }
 
+/**
+ * 🤖 Where a robot standing ON furniture (its dock) steps off to: the nearest
+ * walkable cell within `maxRing` whose straight line from (wx,wz) crosses
+ * only walkable floor or the furniture the robot is standing on — never a
+ * neighbouring table. Null when there is no such cell.
+ */
+export function stepOffFurniture(
+  wx: number,
+  wz: number,
+  maxRing: number,
+): { x: number; z: number } | null {
+  const under = OBSTACLES.filter((b) => wx > b.x0 && wx < b.x1 && wz > b.z0 && wz < b.z1);
+  const r0 = worldToRow(wz);
+  const c0 = worldToCol(wx);
+  const candidates: Array<{ x: number; z: number; d: number }> = [];
+  for (let dr = -maxRing; dr <= maxRing; dr++) {
+    for (let dc = -maxRing; dc <= maxRing; dc++) {
+      if (!walkable[r0 + dr]?.[c0 + dc]) continue;
+      const x = colToWorld(c0 + dc);
+      const z = rowToWorld(r0 + dr);
+      candidates.push({ x, z, d: Math.hypot(x - wx, z - wz) });
+    }
+  }
+  candidates.sort((a, b) => a.d - b.d);
+  const ok = (x: number, z: number): boolean =>
+    walkable[worldToRow(z)]?.[worldToCol(x)] === true ||
+    under.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
+  for (const c of candidates) {
+    const n = Math.max(1, Math.ceil(c.d / 0.1));
+    let free = true;
+    for (let i = 1; i <= n && free; i++) {
+      free = ok(wx + ((c.x - wx) * i) / n, wz + ((c.z - wz) * i) / n);
+    }
+    if (free) return { x: c.x, z: c.z };
+  }
+  return null;
+}
+
 // ── A* implementation ─────────────────────────────────────────────────────────
 interface Node {
   row: number;
