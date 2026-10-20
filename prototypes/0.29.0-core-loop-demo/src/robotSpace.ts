@@ -48,15 +48,45 @@ export function occupied(p: XZ, avatars: readonly XZ[], radius = PERSONAL_SPACE)
   return !!n && n.dist < radius;
 }
 
-/** A move is polite when, for every avatar, the robot ends up outside their
- *  personal space, or at least no closer than it already was (so a player who
- *  walks right up to the robot doesn't freeze it, it just won't step nearer). */
+/** Closest distance from `a` to the segment `from`→`to`. */
+function segmentDist(a: XZ, from: XZ, to: XZ): number {
+  const vx = to.x - from.x;
+  const vz = to.z - from.z;
+  const len2 = vx * vx + vz * vz;
+  const t = len2 > 0 ? Math.max(0, Math.min(1, ((a.x - from.x) * vx + (a.z - from.z) * vz) / len2)) : 0;
+  return Math.hypot(a.x - (from.x + vx * t), a.z - (from.z + vz * t));
+}
+
+/** A move is polite when, for every avatar, the robot stays outside their
+ *  personal space along the WHOLE move, or at least never gets closer than
+ *  it already was (so a player who walks right up to the robot doesn't
+ *  freeze it, it just won't step nearer). */
 function polite(from: XZ, to: XZ, avatars: readonly XZ[], space: number): boolean {
   for (const a of avatars) {
-    const after = Math.hypot(a.x - to.x, a.z - to.z);
-    if (after >= space) continue;
+    const closest = segmentDist(a, from, to);
+    if (closest >= space) continue;
     const before = Math.hypot(a.x - from.x, a.z - from.z);
-    if (after < before - 1e-6) return false;
+    if (closest < before - 1e-6) return false;
+  }
+  return true;
+}
+
+/** Spacing of the floor samples along a move — well under a 0.5 m walk-grid
+ *  cell, so a swerve can't skip over a blocked cell or clip a table corner. */
+const FLOOR_SAMPLE = 0.1;
+
+/** True when every floor sample from `from` to `to` (excluding the start,
+ *  where the robot already stands) is free. */
+export function segmentFree(
+  from: XZ,
+  to: XZ,
+  isFree: (x: number, z: number) => boolean,
+): boolean {
+  const len = Math.hypot(to.x - from.x, to.z - from.z);
+  const n = Math.max(1, Math.ceil(len / FLOOR_SAMPLE));
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    if (!isFree(from.x + (to.x - from.x) * t, from.z + (to.z - from.z) * t)) return false;
   }
   return true;
 }
@@ -66,8 +96,9 @@ function polite(from: XZ, to: XZ, avatars: readonly XZ[], space: number): boolea
  * returns the unit direction to actually walk, or null to stand and wait.
  * Straight ahead is kept when it doesn't run into anyone within LOOKAHEAD;
  * otherwise the robot swerves (away from the person first) up to 90°, taking
- * only swerves that land on free floor (`isFree`). Straight ahead skips the
- * floor check, so a robot off the walk grid still follows its route.
+ * only swerves whose whole lookahead runs over free floor (`isFree`).
+ * Straight ahead skips the floor check, so a robot off the walk grid still
+ * follows its route.
  */
 export function steerStep(
   pos: XZ,
@@ -81,9 +112,11 @@ export function steerStep(
   if (polite(pos, ahead(dir), avatars, space)) return dir;
 
   // Swerve away from whoever is nearest first: the side they are NOT on.
+  // cross > 0 ⇒ the avatar is on the side a NEGATIVE angle below turns
+  // toward, so the away side is the positive angle.
   const near = nearestAvatar(pos, avatars)!;
   const cross = dir.x * (near.avatar.z - pos.z) - dir.z * (near.avatar.x - pos.x);
-  const away = cross > 0 ? -1 : 1;
+  const away = cross > 0 ? 1 : -1;
   for (const angle of SWERVES) {
     for (const side of [away, -away]) {
       const a = angle * side;
@@ -91,7 +124,7 @@ export function steerStep(
       const s = Math.sin(a);
       const d = { x: dir.x * c + dir.z * s, z: -dir.x * s + dir.z * c };
       const to = ahead(d);
-      if (!isFree(to.x, to.z)) continue;
+      if (!segmentFree(pos, to, isFree)) continue;
       if (polite(pos, to, avatars, space)) return d;
     }
   }
@@ -100,12 +133,14 @@ export function steerStep(
 
 /**
  * While serving: the unit direction to step back along when the served
- * player is nearer than `standoff`, or null when the robot is far enough.
- * Never backs onto blocked floor (`isFree`) — it then just stays put.
+ * player (`from`) is nearer than `standoff`, or null when the robot is far
+ * enough. Stays put rather than back onto blocked floor (`isFree`) or into
+ * anyone else's personal space (`avatars`, which may include `from`).
  */
 export function backOffStep(
   pos: XZ,
   from: XZ,
+  avatars: readonly XZ[],
   isFree: (x: number, z: number) => boolean,
   step: number,
   standoff = SERVE_STANDOFF,
@@ -116,8 +151,11 @@ export function backOffStep(
   if (d >= standoff) return null;
   // Exactly on top: any consistent direction will do.
   const dir = d > 1e-4 ? { x: dx / d, z: dz / d } : { x: 0, z: 1 };
-  // Probe a little past the step so the robot doesn't back into a table edge.
+  // Probe a little past the step so the robot doesn't back into a table edge
+  // or towards somebody standing behind it.
   const probe = Math.max(step, 0.3);
-  if (!isFree(pos.x + dir.x * probe, pos.z + dir.z * probe)) return null;
+  const to = { x: pos.x + dir.x * probe, z: pos.z + dir.z * probe };
+  if (!segmentFree(pos, to, isFree)) return null;
+  if (!polite(pos, to, avatars, PERSONAL_SPACE)) return null;
   return dir;
 }

@@ -20,7 +20,7 @@ import {
   CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell, walkableGridRevision,
   walkable,
 } from "./pathfinding";
-import { backOffStep, occupied, steerStep, type XZ } from "./robotSpace";
+import { backOffStep, occupied, segmentFree, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
 import { FURNITURE, type FurnitureItem } from "./furniture";
@@ -1451,11 +1451,15 @@ export class PoolWaiter {
     let dx = target.x - pos.x;
     let dz = target.z - pos.z;
     let dist = Math.hypot(dx, dz);
-    // 🤖↔🦊 A route point somebody is standing on counts as passed — the
-    // robot walks round them to the next one instead of over them.
+    // 🤖↔🦊 A route point somebody is standing on counts as passed when the
+    // straight line on to the following point is clear floor, so the robot
+    // heads round them instead of over them without cutting a furniture
+    // corner. Otherwise the point stays and steerStep swerves or waits.
     while (
       this.path.length > 0 &&
-      (dist < CELL_SIZE * 0.5 || occupied(target, this.avatars))
+      (dist < CELL_SIZE * 0.5 ||
+        (occupied(target, this.avatars) &&
+          segmentFree(pos, this.path[1] ?? { x: tx, z: tz }, PoolWaiter.isFree)))
     ) {
       this.path.shift();
       target = this.path[0] ?? { x: tx, z: tz };
@@ -1600,7 +1604,7 @@ export class PoolWaiter {
     // right up to the tray gets a step back, so the robot never stands in
     // its avatar (or in front of the table it's playing at).
     const backStep = BACK_OFF_SPEED * dt;
-    const back = backOffStep(bp, pp, PoolWaiter.isFree, backStep);
+    const back = backOffStep(bp, pp, this.avatars, PoolWaiter.isFree, backStep);
     if (back) {
       bp.x += back.x * backStep;
       bp.z += back.z * backStep;

@@ -13,6 +13,7 @@ import {
   SERVE_STANDOFF,
   backOffStep,
   occupied,
+  segmentFree,
   steerStep,
   type XZ,
 } from './robotSpace';
@@ -61,6 +62,36 @@ describe('steerStep', () => {
     expect(dir.z).toBeLessThan(0);
   });
 
+  it('picks the away side first even when both swerves are clear', () => {
+    // Player just off the line on +z: both 30° swerves are clear, so the
+    // choice is the preference alone and must be the −z side.
+    const above = steerStep({ x: 0, z: 0 }, EAST, [{ x: 1.59, z: 0.01 }], open)!;
+    expect(above.z).toBeLessThan(0);
+    const below = steerStep({ x: 0, z: 0 }, EAST, [{ x: 1.59, z: -0.01 }], open)!;
+    expect(below.z).toBeGreaterThan(0);
+  });
+
+  it('rejects a move that passes through someone even if it ends farther away', () => {
+    // A frame step straight on would walk into the player at x=0.2 before
+    // the 0.6 m probe comes out the other side.
+    const player = { x: 0.2, z: 0 };
+    const dir = steerStep({ x: 0, z: 0 }, EAST, [player], open);
+    expect(dir).not.toEqual(EAST);
+    if (dir) {
+      const step = { x: dir.x * 0.02, z: dir.z * 0.02 };
+      expect(Math.hypot(player.x - step.x, player.z - step.z)).toBeGreaterThanOrEqual(0.2);
+    }
+  });
+
+  it('never swerves across a blocked cell between the robot and the probe end', () => {
+    // A thin wall at z∈[0.2,0.4] beside the route: the probe of the +z
+    // swerves would land beyond it, but the floor in between is blocked.
+    const wall = (_x: number, z: number): boolean => !(z > 0.2 && z < 0.4);
+    const player = { x: 1.5, z: -0.2 };
+    const dir = steerStep({ x: 0.5, z: 0 }, EAST, [player], wall);
+    if (dir) expect(segmentFree({ x: 0.5, z: 0 }, { x: 0.5 + dir.x * LOOKAHEAD, z: dir.z * LOOKAHEAD }, wall)).toBe(true);
+  });
+
   it('stands and waits when the aisle is blocked and there is no room to swerve', () => {
     const corridor = (_x: number, z: number): boolean => Math.abs(z) < 0.2;
     const player = { x: 2, z: 0 };
@@ -90,17 +121,33 @@ describe('occupied', () => {
 
 describe('backOffStep', () => {
   it('steps straight back from a fox closer than the standoff', () => {
-    const dir = backOffStep({ x: 0, z: 0 }, { x: 0.6, z: 0 }, open, 0.01)!;
+    const dir = backOffStep({ x: 0, z: 0 }, { x: 0.6, z: 0 }, [], open, 0.01)!;
     expect(dir.x).toBeCloseTo(-1);
     expect(dir.z).toBeCloseTo(0);
   });
 
   it('holds still once at the standoff', () => {
-    expect(backOffStep({ x: 0, z: 0 }, { x: SERVE_STANDOFF, z: 0 }, open, 0.01)).toBeNull();
+    expect(backOffStep({ x: 0, z: 0 }, { x: SERVE_STANDOFF, z: 0 }, [], open, 0.01)).toBeNull();
+  });
+
+  it('does not back into another player standing behind it', () => {
+    const served = { x: 0.6, z: 0 };
+    const peer = { x: -1.05, z: 0 };
+    expect(backOffStep({ x: 0, z: 0 }, served, [served, peer], open, 0.01)).toBeNull();
+    // Nobody behind: the served player alone doesn't stop the step back.
+    expect(backOffStep({ x: 0, z: 0 }, served, [served], open, 0.01)).not.toBeNull();
   });
 
   it('does not back into furniture', () => {
     const wallBehind = (x: number): boolean => x > -0.1;
-    expect(backOffStep({ x: 0, z: 0 }, { x: 0.6, z: 0 }, wallBehind, 0.01)).toBeNull();
+    expect(backOffStep({ x: 0, z: 0 }, { x: 0.6, z: 0 }, [], wallBehind, 0.01)).toBeNull();
+  });
+});
+
+describe('segmentFree', () => {
+  it('samples the whole move, not just its end', () => {
+    const wall = (x: number): boolean => !(x > 0.3 && x < 0.42);
+    expect(segmentFree({ x: 0, z: 0 }, { x: 0.6, z: 0 }, wall)).toBe(false);
+    expect(segmentFree({ x: 0, z: 0 }, { x: 0.25, z: 0 }, wall)).toBe(true);
   });
 });
