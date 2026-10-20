@@ -529,6 +529,37 @@ function faceUpQuat(value: number): THREE.Quaternion {
   }
 }
 
+/** How far two dice (cubes of half-size `half`) overlap, by the separating
+ *  axis test: null when they don't touch, else the shortest push that parts
+ *  them, as a vector from `pa` toward `pb`. Exported for the tests. */
+export function diceOverlap(
+  pa: THREE.Vector3, qa: THREE.Quaternion, pb: THREE.Vector3, qb: THREE.Quaternion, half: number,
+): THREE.Vector3 | null {
+  const A = [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)].map((v) => v.applyQuaternion(qa));
+  const B = [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)].map((v) => v.applyQuaternion(qb));
+  const axes = [...A, ...B];
+  for (const a of A) for (const b of B) {
+    const c = new THREE.Vector3().crossVectors(a, b);
+    // Parallel edges give no new axis (the face axes already cover it).
+    if (c.lengthSq() > 1e-6) axes.push(c.normalize());
+  }
+  const d = new THREE.Vector3().subVectors(pb, pa);
+  let best = Infinity;
+  let bestAxis: THREE.Vector3 | null = null;
+  for (const L of axes) {
+    const ra = half * (Math.abs(A[0].dot(L)) + Math.abs(A[1].dot(L)) + Math.abs(A[2].dot(L)));
+    const rb = half * (Math.abs(B[0].dot(L)) + Math.abs(B[1].dot(L)) + Math.abs(B[2].dot(L)));
+    const dl = d.dot(L);
+    const overlap = ra + rb - Math.abs(dl);
+    if (overlap <= 0) return null;
+    if (overlap < best) {
+      best = overlap;
+      bestAxis = L.clone().multiplyScalar(dl < 0 ? -1 : 1);
+    }
+  }
+  return bestAxis ? bestAxis.multiplyScalar(best) : null;
+}
+
 /** Small seeded PRNG (mulberry32) so a throw tumbles alike on every client. */
 function prng(seed: number): () => number {
   let a = seed >>> 0;
@@ -564,6 +595,7 @@ class DicePair {
   private landing: [number, number] | null = null;
   private faces: [number, number] = [...NEUTRAL_FACES];
   private rand: () => number = prng(1);
+  private slideDur = 0.55;
   private readonly half = DIE_SIZE / 2;
 
   constructor(private readonly felt: FeltRect) {
@@ -614,8 +646,19 @@ class DicePair {
       new THREE.Vector3(p.x - 0.055, FELT_Y + this.half, p.z),
       new THREE.Vector3(p.x + 0.055, FELT_Y + this.half, p.z),
     ];
-    const far = this.bodies.some((b, i) => b.pos.distanceTo(targets[i]) > 0.01);
     const faceChange = values !== undefined;
+    // The frame driver asks again every frame: a slide already headed for
+    // these spots carries on rather than starting over from where it is.
+    if (this.mode === 'sliding' && !faceChange) {
+      const same = (u: THREE.Vector3[]) => this.bodies.every((b, i) => b.slideTo.distanceTo(u[i]) < 1e-4);
+      if (same(targets) || same([targets[1], targets[0]])) return;
+    }
+    // Each die goes to the nearer spot, so the pair never slides through itself.
+    const [a, c] = this.bodies;
+    if (a.pos.distanceTo(targets[1]) + c.pos.distanceTo(targets[0]) < a.pos.distanceTo(targets[0]) + c.pos.distanceTo(targets[1]) - 1e-6) {
+      targets.reverse();
+    }
+    const far = this.bodies.some((b, i) => b.pos.distanceTo(targets[i]) > 0.01);
     if (!far && !faceChange && this.mode === 'rest') return;
     this.bodies.forEach((b, i) => {
       b.slideFrom.copy(b.pos);
@@ -623,6 +666,10 @@ class DicePair {
       b.from.copy(b.quat);
       b.to.copy(this.restQuat(this.faces[i], i * 0.35));
     });
+    // A short nudge is quick; a push across the table takes a beat longer,
+    // so the stickman's stick reads as moving them.
+    const dist = Math.max(...this.bodies.map((b, i) => b.pos.distanceTo(targets[i])));
+    this.slideDur = Math.min(1.1, 0.35 + dist * 0.45);
     this.mode = 'sliding';
     this.t = 0;
   }
@@ -633,6 +680,7 @@ class DicePair {
     this.bodies.forEach((b, i) => {
       b.pos.set(p.x + (i ? 0.05 : -0.05), FELT_Y + this.half + 0.07, p.z);
     });
+    this.collide(false);
   }
 
   throwFrom(from: FeltPoint, dir: FeltPoint, power: number, seed: number): void {
@@ -666,6 +714,7 @@ class DicePair {
         b.quat.copy(this.restQuat(values[i], i * 0.35));
         b.pos.y = FELT_Y + this.half;
       });
+      this.collide(false);
       this.mode = 'rest';
       this.apply();
     }
@@ -675,15 +724,19 @@ class DicePair {
     if (dt <= 0) return;
     this.t += dt;
     if (this.mode === 'sliding') {
-      const k = Math.min(1, this.t / 0.55);
+      const k = Math.min(1, this.t / this.slideDur);
       const e = k * k * (3 - 2 * k);
       for (const b of this.bodies) {
         b.pos.lerpVectors(b.slideFrom, b.slideTo, e);
         b.quat.slerpQuaternions(b.from, b.to, e);
       }
+      this.collide(false);
       if (k >= 1) this.mode = 'rest';
     } else if (this.mode === 'flying') {
-      this.stepFlight(Math.min(dt, 1 / 30));
+      // Small steps, so a fast die can't jump clean through the other one.
+      const step = Math.min(dt, 1 / 30);
+      const n = Math.ceil(step / (1 / 120));
+      for (let i = 0; i < n; i++) this.stepFlight(step / n);
       const slow = this.bodies.every((b) => Math.hypot(b.vel.x, b.vel.z) < 0.35 && b.pos.y < FELT_Y + this.half + 0.01);
       if (this.landing && (slow || this.t > 3.2) && this.t > 0.7) {
         this.bodies.forEach((b, i) => {
@@ -705,6 +758,7 @@ class DicePair {
         this.clampToFelt(b);
         b.quat.slerpQuaternions(b.from, b.to, e);
       }
+      this.collide(false);
       if (k >= 1) this.mode = 'rest';
     }
     this.apply();
@@ -747,14 +801,64 @@ class DicePair {
         b.quat.premultiply(tmp);
       }
     }
-    // The two dice must not pass through each other.
+    this.collide(true);
+  }
+
+  /** The dice are solid: wherever they are and however they're turned, push
+   *  them apart until their boxes no longer overlap (and, in flight, bounce
+   *  them off each other). A push never sinks a die into the felt or through
+   *  the rail, so it is repeated a few times for a die pinned on a wall. */
+  private collide(bounce: boolean): void {
     const [a, c] = this.bodies;
-    const dx = c.pos.x - a.pos.x, dz = c.pos.z - a.pos.z;
-    const d = Math.hypot(dx, dz);
-    if (d < DIE_SIZE * 1.05 && d > 1e-6) {
-      const push = (DIE_SIZE * 1.05 - d) / 2;
-      a.pos.x -= (dx / d) * push; a.pos.z -= (dz / d) * push;
-      c.pos.x += (dx / d) * push; c.pos.z += (dz / d) * push;
+    const floor = FELT_Y + this.half;
+    for (let iter = 0; iter < 6; iter++) {
+      let mtv = diceOverlap(a.pos, a.quat, c.pos, c.quat, this.half);
+      if (!mtv) return;
+      const low = a.pos.y <= floor + 0.02 && c.pos.y <= floor + 0.02;
+      let push: THREE.Vector3;
+      if (low) {
+        // Both on the felt: part them across it, never into it, along the
+        // line between them — just far enough (bisected) that they clear.
+        const u = new THREE.Vector3(c.pos.x - a.pos.x, 0, c.pos.z - a.pos.z);
+        if (u.lengthSq() < 1e-12) u.set(mtv.x, 0, mtv.z);
+        if (u.lengthSq() < 1e-12) u.set(1, 0, 0);
+        u.normalize();
+        const pa = new THREE.Vector3(), pc = new THREE.Vector3();
+        const clear = (t: number) => {
+          pa.copy(a.pos).addScaledVector(u, -t / 2);
+          pc.copy(c.pos).addScaledVector(u, t / 2);
+          return !diceOverlap(pa, a.quat, pc, c.quat, this.half);
+        };
+        let lo = 0, hi = DIE_SIZE * 1.8;
+        for (let k = 0; k < 18; k++) {
+          const mid = (lo + hi) / 2;
+          if (clear(mid)) hi = mid; else lo = mid;
+        }
+        push = u.multiplyScalar((hi + 0.001) / 2);
+        mtv = push.clone();
+      } else {
+        // In the air: the shortest way apart, half each, plus a hair.
+        push = mtv.clone().multiplyScalar(0.5).addScaledVector(mtv.clone().normalize(), 0.0005);
+      }
+      a.pos.sub(push);
+      c.pos.add(push);
+      for (const b of this.bodies) {
+        if (b.pos.y < floor) b.pos.y = floor;
+        this.clampToFelt(b);
+      }
+      if (bounce) {
+        const n = mtv.clone().normalize();
+        const vn = new THREE.Vector3().subVectors(c.vel, a.vel).dot(n);
+        if (vn < 0) {
+          // Equal masses, a fairly lively knock (restitution 0.5).
+          const j = -(1 + 0.5) * vn / 2;
+          a.vel.addScaledVector(n, -j);
+          c.vel.addScaledVector(n, j);
+          const kick = Math.min(1, -vn) * 12;
+          a.spin.x += (this.rand() - 0.5) * kick; a.spin.z += (this.rand() - 0.5) * kick;
+          c.spin.x += (this.rand() - 0.5) * kick; c.spin.z += (this.rand() - 0.5) * kick;
+        }
+      }
     }
   }
 

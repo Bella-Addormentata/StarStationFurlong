@@ -338,7 +338,10 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
   if (!animating) {
     h.setPuck(s.point);
     if (s.phase !== 'settled' && !localHold.has(id)) {
-      const shooterSeat = s.shooter !== undefined ? readSeat(id, s.shooter) : null;
+      // The stickman keeps the dice through the betting countdown and only
+      // pushes them over to the shooter once betting closes (the shooter's
+      // throw window); until then nobody has dice in front of them.
+      const shooterSeat = s.phase === 'closing' && s.shooter !== undefined ? readSeat(id, s.shooter) : null;
       const stand = shooterSeat ? standLocal(kind, shooterSeat.stand) : null;
       h.diceRestAt(stand ? diceSpotFor(stand, CRAPS_LAYOUT.felt) : STICKMAN_DICE_SPOT);
     }
