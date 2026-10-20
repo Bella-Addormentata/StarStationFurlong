@@ -272,6 +272,7 @@ import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, 
 import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
 import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
+import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
 import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
@@ -2142,6 +2143,9 @@ async function joinRoomAtEpoch(
   // remote. Same T0 seam — a joiner walks in on a movie already running and
   // anchors its clock to the sample it finds.
   bindTvDoc(sync.doc);
+  // 📦 The room a FILE is imported or fetched for: the node shares a blob
+  // only with that room's members (blobLane.ts).
+  setBlobLaneRoom(boot.roomId);
   // 🕹 Bind the shared arcade map (#193): each cabinet's game, and
   // who is at its controls. Same T0 seam.
   bindArcadeDoc(sync.doc);
@@ -8683,6 +8687,11 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // deliberately is beyond what this page can tell from here.)
   setOwnMediaOrigins([window.location.origin]);
   setNodeMediaOrigin(fingerprint ? nodeOrigin : null, tvNow(), tvWallNow());
+  // 📦 The blob lane rides on the same trust: its token and the node's id
+  // from this round's fingerprint, or nothing (blobLane.ts).
+  setBlobLaneNode(fingerprint?.blob_cap && fingerprint.iroh_node_id
+    ? { origin: nodeOrigin, cap: fingerprint.blob_cap, irohId: fingerprint.iroh_node_id }
+    : null);
   if (!fingerprint) {
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have

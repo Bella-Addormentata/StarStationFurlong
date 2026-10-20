@@ -30,6 +30,8 @@ import {
   redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
+import { blobLaneReady, blobState, blobUrl, fetchBlob, formatBytes } from './blobLane';
+import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
 import { suspendStickKeys } from './freeFlightStick';
 
@@ -195,8 +197,12 @@ class HtmlVideoPlayerAdapter implements Adapter {
   constructor(
     host: HTMLElement, url: string, onFail: (why: string) => void,
     private onBlocked: () => void, private onUnblocked: () => void = () => undefined,
+    /** CORS mode, so the request carries an Origin: the node's blob route
+     *  answers only an allowed one (blobLane.ts). */
+    crossOrigin = false,
   ) {
     const v = document.createElement('video');
+    if (crossOrigin) v.crossOrigin = 'anonymous';
     v.src = url;
     v.playsInline = true;
     v.preload = 'auto';
@@ -638,7 +644,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     );
     return;
   }
-  const url = sourceFileUrl(source);
+  const url = source.kind === 'blob' ? blobUrl(source.hash) : sourceFileUrl(source);
   if (url) {
     adopt(new HtmlVideoPlayerAdapter(t.screen, url, fail, () => {
       if (!live()) return;
@@ -654,7 +660,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     }, () => {
       // The browser let the sound through after all: the notice comes down.
       if (live() && !t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) hideNotice(t);
-    }));
+    }, source.kind === 'blob'));
     return;
   }
   if (source.kind === 'archive') {
@@ -700,7 +706,9 @@ function theatreTick(rtt: () => number): void {
     // reconnection requests would go to a stranger. A source that lost its
     // consent comes down and is asked about again. Whatever was mounted
     // before comes down meanwhile — the old programme is over either way.
-    const consent = mediaConsent(rec.source!);
+    // A blob plays from this viewer's own node, and only while the page
+    // trusts the node's origin (blobLane.ts): the same lapse as a URL on it.
+    const consent = rec.source!.kind === 'blob' ? (blobLaneReady() ? 'ok' : 'refuse') : mediaConsent(rec.source!);
     // A mount that is over — another source, a start-only embed's new
     // start, a consent withdrawn — comes down FIRST, while its registration
     // still names the programme it was mounted for: the unregistration
@@ -715,8 +723,18 @@ function theatreTick(rtt: () => number): void {
     // files nothing new under it (a replay of the same seekable source
     // keeps the player and moves it on to the new programme).
     t.playerFor = rec.started;
-    if (consent !== 'ok') {
+    if (consent !== 'ok' && rec.source!.kind === 'blob') {
+      showBlobNotice(t, rec.source!, null);
+    } else if (consent !== 'ok') {
       showConsentNotice(t, rec.source!, consent);
+    } else if (rec.source!.kind === 'blob' && t.mounted !== key && t.mounted !== `failed:${key}`) {
+      // The file is played once this viewer's node holds all of it; until
+      // then the notice says where it is, and FETCH is the viewer's press.
+      // No mount budget: the bytes are already on this machine, and the
+      // transfer that put them there was asked for by a press.
+      const st = blobState(rec.source!.hash);
+      if (st.state === 'complete') mountPlayer(t, rec.source!, key, rtt);
+      else showBlobNotice(t, rec.source!, st);
     } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
       // A URL on a host the viewer accepted is asked about before anything
       // fetches it (tvConsent needsRedirectProbe / probeRedirect): a CORS
@@ -791,6 +809,60 @@ function startRedirectProbe(t: Theatre, url: string, key: string): void {
       t.probeAbort = null;
       t.probing = '';
     }
+  });
+}
+
+/** Why this viewer's node turned the last FETCH down, for the file it was
+ *  for (the node's own words: not connected to the holder, no quota). */
+let blobAskRefused: { hash: string; why: string } | null = null;
+
+/** 📦 A blob this viewer's node does not hold whole yet: where it is, and
+ *  FETCH — the press that asks the viewer's own node to take it from the
+ *  node that put it on (blobLane.ts). `st` null: no node to ask. */
+function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>, st: BlobState | null): void {
+  const size = formatBytes(source.size);
+  const from = `${source.provider.slice(0, 8)}…`;
+  if (st === null) {
+    showNotice(t, `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
+      <div class="tv-theatre-lane">SOVEREIGN LANE — a file from a room member's node, played from yours: it needs this station's node (the desktop app) running here</div>`);
+    return;
+  }
+  if (st.state === 'unknown') {
+    showNotice(t, '<div>ASKING YOUR NODE…</div><div class="tv-theatre-lane">whether it holds this file yet</div>');
+    return;
+  }
+  if (st.state === 'importing') {
+    showNotice(t, '<div>YOUR NODE IS STILL TAKING THE FILE</div><div class="tv-theatre-lane">it plays once it is all in</div>');
+    return;
+  }
+  if (st.state === 'queued' || st.state === 'fetching') {
+    const pct = st.size > 0 ? Math.min(100, Math.floor((st.have / st.size) * 100)) : 0;
+    showNotice(t, `<div>📦 FETCHING · ${pct}%</div>
+      <div class="tv-theatre-lane">${escapeHtml(formatBytes(st.have))} of ${escapeHtml(size)} from ${escapeHtml(from)}, every byte checked against the file's hash — it plays when the last one is in</div>`);
+    return;
+  }
+  // 'none' or 'failed': the button. Its words are constant per programme,
+  // so the same ask every tick keeps the button under the finger.
+  const why = st.state === 'failed' ? st.why || 'no reason given' : blobAskRefused?.hash === source.hash ? blobAskRefused.why : '';
+  const failed = why ? `<div class="tv-theatre-lane">the last try stopped: ${escapeHtml(why)}</div>` : '';
+  const html = `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
+    <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk until your node restarts. Nothing is fetched until you press</div>
+    ${failed}
+    <button type="button" data-tv-fetch="${escapeHtml(source.hash)}">📦 FETCH ${escapeHtml(size)}</button>`;
+  if (!t.notice.hidden && t.lastNotice === html) return;
+  showNotice(t, html);
+  t.notice.querySelector<HTMLButtonElement>('[data-tv-fetch]')?.addEventListener('click', (e) => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    // The press is for THE FILE THE BUTTON NAMED: a peer may have changed
+    // the programme between the render and the click.
+    const now = readTv(t.itemId).source;
+    if (!now || now.kind !== 'blob' || now.hash !== btn.dataset.tvFetch) return;
+    btn.disabled = true;
+    void fetchBlob(now.hash, now.size, now.provider, now.mime ?? '').then((refused) => {
+      // Kept for the notice the next tick draws (a button again, with why).
+      blobAskRefused = refused ? { hash: now.hash, why: refused } : null;
+      if (refused) btn.disabled = false;
+    });
   });
 }
 

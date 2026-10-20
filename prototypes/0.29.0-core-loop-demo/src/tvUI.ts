@@ -15,7 +15,7 @@
 import type { DeviceUI } from './devices';
 import {
   formatClock, handRemote, holdsSpareRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
-  putDownRemote, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource,
+  putDownRemote, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource, TV_MAX_TITLE,
   sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
   tvResume, tvRevision, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, powerKey, volumeKey,
 } from './tvDoc';
@@ -26,6 +26,7 @@ import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
+import { blobLaneNodeId, blobLaneReady, formatBytes, importBlob } from './blobLane';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -324,7 +325,7 @@ const TILES: Tile[] = [
   { key: 'youtube', icon: '▶️', label: 'YOUTUBE', lane: 'CONVENIENCE', hint: 'paste a watch / youtu.be / shorts link, or an 11-character id', live: true },
   { key: 'archive', icon: '🏛️', label: 'ARCHIVE.ORG', lane: 'CONVENIENCE', hint: 'paste a details/ or download/ link — public-domain films', live: true },
   { key: 'url', icon: '🔗', label: 'URL', lane: 'CONVENIENCE', hint: 'paste a direct link to an mp4 / webm', live: true },
-  { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'your own file, over the room (blob lane)', live: false },
+  { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'a video or audio file from this computer — your node hands it to the room, and each viewer presses FETCH (mp4 / webm play best)', live: true },
   { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'a magnet or .torrent, fetched by the host node', live: false },
   { key: 'karaoke', icon: '🎤', label: 'KARAOKE', lane: 'SOVEREIGN', hint: 'MP3+G, with the mic on the audio lane', live: false },
 ];
@@ -333,10 +334,25 @@ const TILES: Tile[] = [
  *  with the convenience lanes on — and without them the URL tile is labelled
  *  for what it plays here, a file on the viewer's own origins. */
 function visibleTiles(): Tile[] {
-  if (convenienceLanesEnabled()) return TILES;
-  return TILES.filter((t) => sourceKindAllowed(t.key)).map((t) => t.key === 'url'
+  // 📦 FILE needs the node's blob lane (blobLane.ts): a browser alone has
+  // nowhere to put the file for the room to take it from.
+  const tiles = TILES.map((t) => t.key === 'file' && !blobLaneReady()
+    ? { ...t, live: false, hint: 'needs this station\'s node (the desktop app) running here: the file goes from your node to theirs' }
+    : t);
+  if (convenienceLanesEnabled()) return tiles;
+  return tiles.filter((t) => sourceKindAllowed(t.key)).map((t) => t.key === 'url'
     ? { ...t, lane: 'SOVEREIGN', hint: `paste a link to an mp4 / webm on this station's node or your own origin — ${SERVERLESS_ONLY}` }
     : t);
+}
+
+/** 📦 The file the FILE tile has chosen, kept across repaints (a file input
+ *  cannot be given its selection back), until a PLAY or SCHEDULE takes it. */
+let pickedFile: File | null = null;
+
+/** The title a file's name gives the record: the name without its
+ *  extension, in the record's bound. */
+export function fileTitle(name: string): string {
+  return name.replace(/\.[A-Za-z0-9]{1,5}$/, '').slice(0, TV_MAX_TITLE) || 'a file';
 }
 
 const SCHEDULE_CHOICES: Array<{ label: string; minutes: number }> = [
@@ -607,7 +623,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       display:flex; flex-direction:column; align-items:center; gap:3px; padding:8px 4px;
       background:${on ? 'rgba(0,229,255,0.12)' : 'rgba(10,14,34,0.9)'}; border:1px solid ${on ? CYAN : 'rgba(212,168,75,0.18)'};
       border-radius:10px; color:${t.live ? GOLD_BRIGHT : DIM}; font-family:inherit; font-size:8.5px; font-weight:800; cursor:${t.live ? 'pointer' : 'default'};">
-      <span style="font-size:16px;">${t.icon}</span><span>${t.label}</span>${laneBadge(t.lane)}${t.live ? '' : `<span style="font-size:7px; color:${DIM};">NOT YET PROVISIONED</span>`}
+      <span style="font-size:16px;">${t.icon}</span><span>${t.label}</span>${laneBadge(t.lane)}${t.live ? '' : `<span style="font-size:7px; color:${DIM};">${t.key === 'file' ? 'NEEDS YOUR NODE' : 'NOT YET PROVISIONED'}</span>`}
     </button>`;
   }).join('');
   const tile = offered.find((t) => t.key === activeTile) ?? offered[0]!;
@@ -645,7 +661,10 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <div class="phone-access-header">SOURCES</div>
       <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px;">${tiles}</div>
       <div class="phone-access-note">${esc(tile.hint)}</div>
-      <input type="text" data-tv-paste="1" placeholder="${esc(tile.key === 'youtube' ? 'https://www.youtube.com/watch?v=…' : tile.key === 'archive' ? 'https://archive.org/details/…' : 'https://…/film.mp4')}" autocomplete="off" aria-label="Paste a link">
+      ${tile.key === 'file'
+        ? `<input type="file" data-tv-file="1" accept="video/*,audio/*" aria-label="Choose a file">
+           <div style="font-size:9.5px; color:${GOLD_BRIGHT};">${pickedFile ? `CHOSEN: ${esc(pickedFile.name)} · ${esc(formatBytes(pickedFile.size))}` : 'no file chosen yet'}</div>`
+        : `<input type="text" data-tv-paste="1" placeholder="${esc(tile.key === 'youtube' ? 'https://www.youtube.com/watch?v=…' : tile.key === 'archive' ? 'https://archive.org/details/…' : 'https://…/film.mp4')}" autocomplete="off" aria-label="Paste a link">`}
       <div style="display:flex; gap:6px; flex-wrap:wrap;">
         ${smallButton(`data-tv-play="${esc(tv.id)}"`, '▶ PLAY NOW')}
         ${SCHEDULE_CHOICES.map((c) => smallButton(`data-tv-schedule="${c.minutes}" data-tv-id="${esc(tv.id)}"`, `🕒 ${c.label}`)).join('')}
@@ -732,6 +751,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     // one included: a PLAY on a bad link must not let an older archive
     // lookup land its film after the refusal was shown.
     const gen = ++resolveGen;
+    if (activeTile === 'file') return sourceFromFile(id, gen);
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
     if (!parsed) {
@@ -763,6 +783,44 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     }
     return { source: parsed, text };
   };
+
+  /** 📦 The chosen file, handed to this page's node first: the record can
+   *  only name a blob the holder's node already holds. Voided like an
+   *  archive lookup by anything that moves the programme meanwhile. */
+  const sourceFromFile = async (id: string, gen: number): Promise<{ source: TvSource; text: string } | null> => {
+    const file = pickedFile;
+    const provider = blobLaneNodeId();
+    if (!file) {
+      feedback('Choose a file first.');
+      return null;
+    }
+    if (!provider) {
+      feedback('The FILE tile needs this station\'s node (the desktop app) running here.');
+      return null;
+    }
+    const epoch = tvDocEpoch();
+    const revision = tvRevision(id);
+    feedback(`Handing ${file.name} to your node…`);
+    const got = await importBlob(file, (sent, total) => {
+      if (gen === resolveGen) feedback(`Handing ${file.name} to your node… ${total ? Math.floor((sent / total) * 100) : 0}%`);
+    });
+    if (gen !== resolveGen || epoch !== tvDocEpoch() || tvRevision(id) !== revision) return null; // overtaken
+    if ('error' in got) {
+      feedback(got.error);
+      return null;
+    }
+    const source = sanitizeSource({ kind: 'blob', hash: got.hash, size: got.size, provider, mime: file.type, title: fileTitle(file.name) });
+    if (!source) {
+      feedback('That file cannot go on the TV.');
+      return null;
+    }
+    if (pickedFile === file) pickedFile = null;
+    return { source, text: '' };
+  };
+  host.querySelector<HTMLInputElement>('[data-tv-file]')?.addEventListener('change', (e) => {
+    pickedFile = (e.target as HTMLInputElement).files?.[0] ?? null;
+    renderTvPhoneApp(host, deps);
+  });
 
   // The box is cleared BEFORE the write that takes its link: the write
   // notifies the phone synchronously, the repaint may rebuild the box and

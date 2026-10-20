@@ -54,3 +54,13 @@ describe('parseNodeFingerprint', () => {
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: '4443' })).toBeNull();
   });
 });
+
+describe('the blob lane token', () => {
+  it('rides as 64 hex digits, and only so', () => {
+    const cap = 'ab'.repeat(32);
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, blob_cap: cap })?.blob_cap).toBe(cap);
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, blob_cap: 'AB'.repeat(32) })?.blob_cap).toBeUndefined();
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, blob_cap: 'ab' })?.blob_cap).toBeUndefined();
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, blob_cap: 7 })?.blob_cap).toBeUndefined();
+  });
+});

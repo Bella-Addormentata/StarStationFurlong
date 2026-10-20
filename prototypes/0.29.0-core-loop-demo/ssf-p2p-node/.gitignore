@@ -4,3 +4,4 @@ iroh_node_id.key
 chia_identity.seed
 wallet_lease.json
 target/
+blob-cache/

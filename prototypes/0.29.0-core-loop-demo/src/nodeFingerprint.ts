@@ -44,6 +44,10 @@ export interface LocalFingerprint {
    *  and a QR code; absent from read-only nodes and older ones. Kept only
    *  when it has the shape of a testnet11 address (`isTestnetAddress`). */
   chia_address?: string;
+  /** 📦 This launch's blob-lane token (64 hex): what the node's `/blob` and
+   *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
+   *  Absent while the node runs without the lane, and from older nodes. */
+  blob_cap?: string;
 }
 
 /** A testnet11 standard-puzzle address: the `txch` prefix, the bech32m
@@ -108,5 +112,6 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   }
   if (typeof r.share_card === 'boolean') fp.share_card = r.share_card;
   if (isTestnetAddress(r.chia_address)) fp.chia_address = r.chia_address;
+  if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   return fp;
 }

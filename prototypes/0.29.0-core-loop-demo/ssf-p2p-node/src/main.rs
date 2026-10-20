@@ -16,6 +16,9 @@ use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, RelayMap, RelayUrl
 use iroh::endpoint::presets::Minimal;
 
 mod chia_lane;
+// 📦 The blob lane (media plan §4 step 1): a member's file as a verified
+// BLAKE3 blob, fetched on the local page's FETCH and played from this node.
+mod blob_lane;
 // S‑0 (#231 D1, TODO #13): the chain-access seam and the peer lane behind it.
 // Every chain read and push below goes through the seam's trait; the lane
 // reaches Chia full-node peers over the light-wallet protocol (no gateway).
@@ -257,6 +260,12 @@ pub struct Fingerprint {
     /// never rides in a pass or a card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_address: Option<String>,
+    /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
+    /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
+    /// Only a page whose origin the API grants can read the answer, and it
+    /// changes at every start. Absent while the lane is not running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_cap: Option<String>,
 }
 
 // ── Mesh tuning (M3/M5.x — see brainstorming/m345-v029-build-plan.md §2) ──────
@@ -499,6 +508,9 @@ pub struct HubState {
     /// coin) on the local browser's request. `None` while publishing is off.
     #[cfg(feature = "chia-publish")]
     pub chia_wallet: Mutex<Option<chia_bls::SecretKey>>,
+    /// 📦 The blob lane, or None when its store could not be opened (the
+    /// node runs on without it; its routes answer 503).
+    pub blobs: Option<Arc<blob_lane::BlobLane>>,
 }
 
 /// R1 live reachability posture. The auto public-IP echo loop writes here as
@@ -733,6 +745,7 @@ pub fn compute_fingerprint(
         iroh_port,
         share_card: false,
         chia_address: None,
+        blob_cap: None,
     })
 }
 
@@ -752,6 +765,7 @@ mod fingerprint_json_tests {
             iroh_port: 44442,
             share_card: false,
             chia_address: None,
+            blob_cap: None,
         }
     }
 
@@ -1154,7 +1168,7 @@ async fn main() -> Result<()> {
     // Build Endpoint incorporating ALPN "ssf" (B3 fix) and persistent SecretKey (C1 fix)
     let mut builder = IrohEndpoint::builder(Minimal)
         .secret_key(secret_key.clone())
-        .alpns(vec![b"ssf".to_vec()]); // Ensure B3 is resolved so we do not reject inbound ALPN
+        .alpns(vec![b"ssf".to_vec(), iroh_blobs::ALPN.to_vec()]); // Ensure B3 is resolved so we do not reject inbound ALPN; 📦 the blob lane's beside it
 
     // Configure relay map from SSF_RELAYS (comma-separated URLs).
     // Placeholder defaults are intentionally removed: operators provide real relays.
@@ -1584,6 +1598,18 @@ async fn main() -> Result<()> {
         (ck, durable, book, caps)
     };
 
+    // 📦 The blob lane's store, emptied at every start (blob_lane.rs). A
+    // store that cannot open costs the lane, never the node.
+    let blobs = match blob_lane::BlobLane::open().await {
+        Ok(lane) => {
+            println!("📦 Blob lane ready (cache in blob-cache/, emptied at start)");
+            Some(lane)
+        }
+        Err(e) => {
+            eprintln!("⚠️ Blob lane off — its store could not open: {e:?}");
+            None
+        }
+    };
     let hub = Arc::new(HubState {
         rooms: Mutex::new(HashMap::new()),
         fingerprint: Mutex::new(fingerprint),
@@ -1622,6 +1648,7 @@ async fn main() -> Result<()> {
         knocks: Mutex::new(chia_knock::KnockBook::load(std::path::Path::new(chia_knock::KNOCKS_FILE))),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
+        blobs,
     });
 
     // 💾 C4/B restore: load persisted room docs and serve them from boot.
@@ -2331,6 +2358,19 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         println!("🚀 Inbound P2P Swarm handshake from peer: {}", remote_id);
         #[cfg(feature = "chia-read")]
         note_inbound_verified(&hub, remote_id, &inbound_path);
+
+        // 📦 A blob-lane connection is answered by the lane, under its serving
+        // rule (a connected member of the blob's room), and never enters the
+        // room machinery below.
+        if connection.alpn() == iroh_blobs::ALPN {
+            match hub.blobs.clone() {
+                Some(lane) => {
+                    tokio::spawn(lane.serve_connection(hub.clone(), connection));
+                }
+                None => connection.close(0u32.into(), b"no blob lane"),
+            }
+            continue;
+        }
 
         let hub_clone = hub.clone();
         let iroh_clone = endpoint.clone();
@@ -4395,12 +4435,25 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
         let hub_clone = hub.clone();
         let iroh_snapshot = iroh_endpoint.clone();
         tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let n = match socket.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                _ => return,
+            // The whole request head, up to its blank line: a blob URL's
+            // query and an upload's headers can outgrow one small read. What
+            // follows the head is the start of an upload's body.
+            let mut buf = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i;
+                }
+                if buf.len() >= blob_lane::MAX_HEAD {
+                    return;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(10), socket.read(&mut chunk)).await {
+                    Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                    _ => return,
+                }
             };
-            let req = String::from_utf8_lossy(&buf[..n]);
+            let req = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let body_start: Vec<u8> = buf.get(head_end + 4..).map(<[u8]>::to_vec).unwrap_or_default();
             
             let req_lines: Vec<&str> = req.lines().collect();
             let mut origin_header = None;
@@ -4446,12 +4499,25 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     .unwrap_or(false)
             };
 
+            let origin_ok = origin_header.as_deref().is_some_and(origin_allowed);
             let cors_origin = match origin_header {
                 Some(ref o) if origin_allowed(o) => {
                     format!("Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n", o)
                 }
                 _ => String::new(),
             };
+
+            // 📦 The blob lane's routes (blob_lane.rs) — its gate is its own:
+            // an allowed Origin AND this launch's token.
+            if let Some(head) = blob_lane::parse_head(&req) {
+                if head.method != "OPTIONS" && blob_lane::is_blob_route(&head.path) {
+                    blob_lane::handle_http(
+                        hub_clone.blobs.clone(), hub_clone.clone(), iroh_snapshot.clone(),
+                        &mut socket, head, &body_start, origin_ok, &cors_origin,
+                    ).await;
+                    return;
+                }
+            }
 
             if req.starts_with("GET /api/fingerprint") {
                 let fp_json = {
@@ -4489,6 +4555,12 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     {
                         fp.chia_address = hub_clone.chia_wallet.lock().unwrap().as_ref().map(chia_wallet::testnet_address);
                     }
+                    // 📦 The blob lane's token, for this machine's own page
+                    // only: an origin the API does not grant cannot read the
+                    // answer (no Access-Control-Allow-Origin for it), and a
+                    // request with no Origin at all is a local process, not a
+                    // web page.
+                    fp.blob_cap = hub_clone.blobs.as_ref().map(|b| b.cap.clone());
                     serde_json::to_string(&*fp).unwrap()
                 };
                 let response = format!(
@@ -4510,7 +4582,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 // (harmless for loopback-origin pages, which skip the gate).
                 let response = format!(
                     "HTTP/1.1 204 No Content\r\n\
-                     {}Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                     {}Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n\
                      Access-Control-Allow-Headers: *\r\n\
                      Access-Control-Allow-Private-Network: true\r\n\
                      Connection: close\r\n\r\n",

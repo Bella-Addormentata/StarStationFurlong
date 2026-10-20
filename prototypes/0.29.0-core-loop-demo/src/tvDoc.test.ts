@@ -10,7 +10,7 @@ import {
   bindTvDoc, claimRemote, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, iHoldRemote, isStartOnly,
   markTvPageAwake, mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readPower, readProgramme,
   readRemote, readSample, readTv, remoteKey, remoteStatus, renewRemote, sanitizeSource, setTvClock,
-  setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, subscribeTvKey, tvHeartbeat,
+  setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, sourceLane, subscribeTvKey, tvHeartbeat,
   tvKey, tvNoteEnd, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
   tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
   TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey,
@@ -1000,6 +1000,24 @@ describe('sources', () => {
     expect(isStartOnly({ kind: 'archive', identifier: 'x', file: '' })).toBe(true);
     expect(isStartOnly({ kind: 'archive', identifier: 'x', file: 'a.mp4' })).toBe(false);
     expect(isStartOnly({ kind: 'youtube', videoId: 'uPwPecwX2zs' })).toBe(false);
+  });
+
+  it('📦 reads a blob source only with a hash, a provider id and a size it can bound', () => {
+    const H = 'b'.repeat(64);
+    const P = 'a'.repeat(64);
+    expect(sanitizeSource({ kind: 'blob', hash: H, size: 1234, provider: P, mime: 'video/mp4', title: 'Sintel' }))
+      .toEqual({ kind: 'blob', hash: H, size: 1234, provider: P, mime: 'video/mp4', title: 'Sintel' });
+    // A type that is not plainly video/* or audio/* is left out, the source kept.
+    expect(sanitizeSource({ kind: 'blob', hash: H, size: 1, provider: P, mime: 'text/html' })).toEqual({ kind: 'blob', hash: H, size: 1, provider: P });
+    expect(sanitizeSource({ kind: 'blob', hash: H.toUpperCase(), size: 1, provider: P })).toBeNull();
+    expect(sanitizeSource({ kind: 'blob', hash: H, size: 1, provider: 'not-a-node' })).toBeNull();
+    expect(sanitizeSource({ kind: 'blob', hash: H, size: 0, provider: P })).toBeNull();
+    expect(sanitizeSource({ kind: 'blob', hash: H, size: 2 ** 41, provider: P })).toBeNull();
+    expect(sanitizeSource({ kind: 'blob', hash: H, size: '12', provider: P })).toBeNull();
+    expect(sourceLane({ kind: 'blob', hash: H, size: 1, provider: P })).toBe('SOVEREIGN');
+    expect(sourceFileUrl({ kind: 'blob', hash: H, size: 1, provider: P })).toBeNull(); // read from the viewer's own node, never a URL in the record
+    expect(sourceLabel({ kind: 'blob', hash: H, size: 1, provider: P })).toBe('a file · bbbbbbbb');
+    expect(isStartOnly({ kind: 'blob', hash: H, size: 1, provider: P })).toBe(false);
   });
 
   it('labels and file URLs', () => {
