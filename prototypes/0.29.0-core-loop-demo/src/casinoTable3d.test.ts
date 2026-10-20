@@ -1,11 +1,12 @@
 /**
  * 🎲 The 3D craps table's chips (#226): however many chips are on the felt,
- * every one renders — a full chip pool grows rather than dropping chips.
+ * every one renders — a full chip pool grows rather than dropping chips; and
+ * the two dice are solid, never sinking into each other.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
-import { railStacks, type CasinoTableVisualHandle } from './casinoTable3d';
+import { DIE_SIZE, diceOverlap, railStacks, type CasinoTableVisualHandle } from './casinoTable3d';
 import { railChipCounts } from './chipDisplay';
 import { buildItemGroup } from './furniture';
 
@@ -98,5 +99,70 @@ describe('the Fair / Friendly plaque', () => {
     const dx = Math.max(0, Math.abs(rp.x - ROULETTE_WHEEL.x) - w / 2);
     const dz = Math.max(0, Math.abs(rp.z - ROULETTE_WHEEL.z) - h / 2);
     expect(Math.hypot(dx, dz)).toBeGreaterThan(ROULETTE_WHEEL.r + 0.03);
+  });
+});
+
+describe('the craps dice', () => {
+  beforeEach(() => {
+    vi.stubGlobal('document', { createElement: fakeCanvas });
+    vi.stubGlobal('window', {});
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  function crapsTable() {
+    const group = buildItemGroup({ id: 'craps-1', kind: 'craps-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    let handle: CasinoTableVisualHandle | null = null;
+    group.traverse((o) => {
+      if (o.userData.casinoTable) handle = o.userData.casinoTable as CasinoTableVisualHandle;
+    });
+    const dice: THREE.Mesh[] = [];
+    group.traverse((o) => {
+      const g = (o as THREE.Mesh).geometry as THREE.BoxGeometry | undefined;
+      if (g?.type === 'BoxGeometry' && Math.abs(g.parameters.width - DIE_SIZE) < 1e-9) dice.push(o as THREE.Mesh);
+    });
+    expect(dice).toHaveLength(2);
+    return { h: handle as unknown as CasinoTableVisualHandle, dice };
+  }
+
+  /** How deep the two dice sink into each other (0 = apart or just touching). */
+  function depth(dice: THREE.Mesh[]): number {
+    const [a, b] = dice;
+    return diceOverlap(a.position, a.quaternion, b.position, b.quaternion, DIE_SIZE / 2)?.length() ?? 0;
+  }
+
+  it('never overlap in flight, on landing or at rest', () => {
+    const { h, dice } = crapsTable();
+    let worst = 0;
+    for (let seed = 1; seed <= 120; seed++) {
+      // Throws from both rails and the stickman, straight and at angles,
+      // soft and hard; some straight into the back wall.
+      const fromSide = seed % 3 === 0 ? -1 : seed % 3 === 1 ? 1 : 0;
+      const from = { x: (seed % 7 - 3) * 0.25, z: fromSide * 0.3 };
+      const dir = { x: Math.sin(seed), z: fromSide === 0 ? -1 : -fromSide };
+      h.diceThrow(from, dir, (seed % 5) / 4, seed * 2654435761);
+      const faces: [number, number] = [1 + (seed % 6), 1 + ((seed * 5) % 6)];
+      for (let f = 0; f < 300; f++) {
+        if (f === 20) h.diceLand(faces);
+        h.update(1 / 60);
+        worst = Math.max(worst, depth(dice));
+      }
+      expect(h.diceState()).toBe('rest');
+      // Then the stickman gathers them up and pushes them back out.
+      h.diceRestAt({ x: 0, z: 0.3 });
+      for (let f = 0; f < 90; f++) { h.update(1 / 60); worst = Math.max(worst, depth(dice)); }
+    }
+    // A hair of contact within one frame is fine; visibly inside is not.
+    expect(worst).toBeLessThan(0.002);
+  });
+
+  it('are solid to the overlap test itself', () => {
+    const q = new THREE.Quaternion();
+    const half = DIE_SIZE / 2;
+    expect(diceOverlap(new THREE.Vector3(0, 0, 0), q, new THREE.Vector3(DIE_SIZE * 1.01, 0, 0), q, half)).toBeNull();
+    const hit = diceOverlap(new THREE.Vector3(0, 0, 0), q, new THREE.Vector3(DIE_SIZE * 0.9, 0, 0), q, half)!;
+    expect(hit.x).toBeCloseTo(DIE_SIZE * 0.1, 6);
+    // Turned 45°, a die's corner reaches further: the same gap now overlaps.
+    const turned = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 4);
+    expect(diceOverlap(new THREE.Vector3(0, 0, 0), turned, new THREE.Vector3(DIE_SIZE * 1.1, 0, 0), q, half)).not.toBeNull();
   });
 });
