@@ -97,6 +97,28 @@ describe('robot patrols stay clear of furniture', () => {
   });
 });
 
+describe('robot leaves cramped floor without crossing furniture', () => {
+  it('walks out of a one-cell gap between two tables along the gap, not across a table', () => {
+    // The nearest clear floor by straight-line rings is across the lower
+    // table; the robot must walk out of the gap's end instead.
+    loadRoom([craps(0, 0, 0), { ...craps(0, 1.5, 0), id: 'test-craps-2' }]);
+    const bot = new PoolWaiter(new THREE.Scene(), [[0.25, -3], [0.25, -4]], { x: 0.25, z: 0.75 });
+    const r = walk(bot, 30);
+    expect(r.travelled).toBeGreaterThan(3);
+    expect(r.closest).toBeGreaterThan(0.2); // the gap itself is 0.25 each side
+  });
+
+  it('does not hop onto a patrol waypoint right beside a table', () => {
+    // (0.25, 0.75) is walkable but only 0.25 m from the table edge: the
+    // patrol stops on the clear floor beside it instead.
+    loadRoom([craps(0, 0, 0)]);
+    const bot = new PoolWaiter(new THREE.Scene(), [[0.25, 0.75], [0.25, 3.5]], { x: 0.25, z: 3.5 });
+    const r = walk(bot, 60);
+    expect(r.travelled).toBeGreaterThan(3);
+    expect(r.closest).toBeGreaterThan(ROBOT_HALF_WIDTH);
+  });
+});
+
 describe('robot still reaches posts beside tables', () => {
   it('walks to each casino table croupier post and stands on it', () => {
     loadRoom(CASINO_FURNITURE);

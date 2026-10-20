@@ -99,6 +99,15 @@ describe('steerStep', () => {
     expect(walkPast({ x: 0, z: 0 }, [player], corridor)).toBeGreaterThanOrEqual(PERSONAL_SPACE - 0.05);
   });
 
+  it('walks onto a post short of a player even when the full lookahead would not fit', () => {
+    // Corridor, post at x=1, player at x=2.1: the post keeps 1.1 m, but a
+    // 0.6 m probe from x=0.6 would end 0.9 m from them.
+    const corridor = (_x: number, z: number): boolean => Math.abs(z) < 0.2;
+    const player = { x: 2.1, z: 0 };
+    expect(steerStep({ x: 0.6, z: 0 }, EAST, [player], corridor)).toBeNull();
+    expect(steerStep({ x: 0.6, z: 0 }, EAST, [player], corridor, PERSONAL_SPACE, 0.4)).toEqual(EAST);
+  });
+
   it('never steps closer to a player who walked up inside its space', () => {
     const pos = { x: 0, z: 0 };
     const player = { x: 0.5, z: 0 };

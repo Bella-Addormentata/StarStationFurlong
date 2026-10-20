@@ -17,8 +17,8 @@
 import * as THREE from "three";
 import type { Player } from "./player";
 import {
-  CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell, walkableGridRevision,
-  walkable, robotClear, nearestWalkableCell, nearestReachableOnGrid,
+  CELL_SIZE, findPath, worldToCol, worldToRow, colToWorld, rowToWorld, nearestReachableCell, walkableGridRevision,
+  walkable, robotClear, nearestWalkableCell, nearestReachableOnGrid, nearestReachableMatching,
 } from "./pathfinding";
 import { backOffStep, occupied, segmentFree, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
@@ -1494,6 +1494,9 @@ export class PoolWaiter {
         { x: dx / dist, z: dz / dist },
         this.avatars,
         PoolWaiter.isFree,
+        undefined,
+        // Last leg: look no further than the spot it is walking onto.
+        this.path.length === 0 ? dist : undefined,
       );
       if (!dir) {
         this.blockedSecs += dt;
@@ -1537,20 +1540,31 @@ export class PoolWaiter {
     const path: Array<{ x: number; z: number }> = [];
     const sameCell = (a: { x: number; z: number }, b: { x: number; z: number }): boolean =>
       worldToRow(a.z) === worldToRow(b.z) && worldToCol(a.x) === worldToCol(b.x);
-    // Snap the start onto a grid (a docked robot stands on its dock); with
-    // no clear floor anywhere near (furniture dropped round it), plain floor.
+    // Departure: a robot on cramped floor (beside a table, at a post) walks
+    // the plain grid to the nearest clear floor, never cutting across a
+    // table to reach it. One standing on furniture itself (its dock) first
+    // steps to the nearest walkable cell. With no clear floor reachable at
+    // all (furniture dropped round it) the whole route uses plain floor.
     let grids = soft ? [robotClear] : [robotClear, walkable];
-    let at = nearestWalkableCell(pos.x, pos.z, 4, robotClear);
-    if (!at) {
+    let at: { x: number; z: number } | null = { x: pos.x, z: pos.z };
+    if (!walkable[worldToRow(pos.z)]?.[worldToCol(pos.x)]) {
       at = nearestWalkableCell(pos.x, pos.z, 4, walkable);
-      grids = [walkable];
+      if (at) path.push(at);
     }
     if (!at) {
       this.path = [];
       this.routeEnd = null;
       return;
     }
-    if (!sameCell(at, pos)) path.push(at);
+    const onClear = (r: number, c: number): boolean => robotClear[r]?.[c] === true;
+    const entry = nearestReachableMatching(at, walkable, onClear);
+    if (entry) {
+      path.push(...entry.path);
+      at = entry.cell;
+    } else {
+      grids = [walkable];
+      at = { x: colToWorld(worldToCol(at.x)), z: rowToWorld(worldToRow(at.z)) };
+    }
     for (const grid of grids) {
       if (sameCell(at, goal)) break;
       const near = nearestReachableOnGrid(tx, tz, at, grid);
@@ -1563,11 +1577,15 @@ export class PoolWaiter {
       at = near;
     }
     this.path = path;
-    // The last hop may end on the goal's own cell (a dock under the robot's
-    // feet) but must not cross any other furniture.
-    const hopFree = (x: number, z: number): boolean =>
-      walkable[worldToRow(z)]?.[worldToCol(x)] === true ||
-      (worldToRow(z) === gr && worldToCol(x) === gc);
+    // The last hop onto a post may end on the goal's own cell (a dock under
+    // the robot's feet) but must not cross any other furniture. A soft goal
+    // (patrol waypoint) only hops over clear floor, so it never brushes a
+    // table it was rerouted away from.
+    const hopFree = soft
+      ? (x: number, z: number): boolean => robotClear[worldToRow(z)]?.[worldToCol(x)] === true
+      : (x: number, z: number): boolean =>
+          walkable[worldToRow(z)]?.[worldToCol(x)] === true ||
+          (worldToRow(z) === gr && worldToCol(x) === gc);
     this.routeEnd =
       Math.hypot(at.x - tx, at.z - tz) <= FINAL_HOP && segmentFree(at, goal, hopFree)
         ? goal

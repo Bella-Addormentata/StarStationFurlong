@@ -232,6 +232,48 @@ export function nearestReachableOnGrid(
   return { x: colToWorld(best.c), z: rowToWorld(best.r) };
 }
 
+/**
+ * 🤖 Nearest cell (by walking distance over `grid`, same moves as findPath)
+ * from the cell at `from` that satisfies `match`, with the route to it, or
+ * null when none is reachable. Robots use it to step off cramped floor onto
+ * clear floor without cutting across a table to get there.
+ */
+export function nearestReachableMatching(
+  from: { x: number; z: number },
+  grid: boolean[][],
+  match: (row: number, col: number) => boolean,
+): { cell: { x: number; z: number }; path: Array<{ x: number; z: number }> } | null {
+  const sr = worldToRow(from.z);
+  const sc = worldToCol(from.x);
+  if (!grid[sr]?.[sc]) return null;
+  const parent = new Map<number, number>([[sr * GRID_SIZE + sc, -1]]);
+  const queue: Array<[number, number]> = [[sr, sc]];
+  for (let i = 0; i < queue.length; i++) {
+    const [r, c] = queue[i];
+    if (match(r, c)) {
+      const path: Array<{ x: number; z: number }> = [];
+      for (let k = r * GRID_SIZE + c; k !== sr * GRID_SIZE + sc; k = parent.get(k)!) {
+        path.unshift({ x: colToWorld(k % GRID_SIZE), z: rowToWorld(Math.floor(k / GRID_SIZE)) });
+      }
+      return { cell: { x: colToWorld(c), z: rowToWorld(r) }, path };
+    }
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        const nr = r + dr;
+        const nc = c + dc;
+        if (!grid[nr]?.[nc]) continue;
+        if (dr !== 0 && dc !== 0 && (!grid[r + dr]?.[c] || !grid[r]?.[c + dc])) continue;
+        const k = nr * GRID_SIZE + nc;
+        if (parent.has(k)) continue;
+        parent.set(k, r * GRID_SIZE + c);
+        queue.push([nr, nc]);
+      }
+    }
+  }
+  return null;
+}
+
 // ── A* implementation ─────────────────────────────────────────────────────────
 interface Node {
   row: number;

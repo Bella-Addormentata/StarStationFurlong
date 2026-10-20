@@ -98,7 +98,9 @@ export function segmentFree(
  * otherwise the robot swerves (away from the person first) up to 90°, taking
  * only swerves whose whole lookahead runs over free floor (`isFree`).
  * Straight ahead skips the floor check, so a robot off the walk grid still
- * follows its route.
+ * follows its route. `reach` is how far the robot still has to go: the
+ * straight-ahead look stops there, so a post short of someone's personal
+ * space can still be walked onto.
  */
 export function steerStep(
   pos: XZ,
@@ -106,10 +108,11 @@ export function steerStep(
   avatars: readonly XZ[],
   isFree: (x: number, z: number) => boolean,
   space = PERSONAL_SPACE,
+  reach = LOOKAHEAD,
 ): XZ | null {
   if (avatars.length === 0) return dir;
-  const ahead = (d: XZ): XZ => ({ x: pos.x + d.x * LOOKAHEAD, z: pos.z + d.z * LOOKAHEAD });
-  if (polite(pos, ahead(dir), avatars, space)) return dir;
+  const ahead = (d: XZ, len = LOOKAHEAD): XZ => ({ x: pos.x + d.x * len, z: pos.z + d.z * len });
+  if (polite(pos, ahead(dir, Math.min(reach, LOOKAHEAD)), avatars, space)) return dir;
 
   // Swerve away from whoever is nearest first: the side they are NOT on.
   // cross > 0 ⇒ the avatar is on the side a NEGATIVE angle below turns
