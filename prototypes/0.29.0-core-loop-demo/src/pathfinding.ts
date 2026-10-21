@@ -251,6 +251,15 @@ export function robotFits(x: number, z: number): boolean {
   return true;
 }
 
+/** 🤖 True when (x,z) lies inside any obstacle box (exact geometry, not
+ *  cell centres). */
+export function insideObstacle(x: number, z: number): boolean {
+  for (const b of OBSTACLES) {
+    if (x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1) return true;
+  }
+  return false;
+}
+
 /**
  * 🤖 Every cell of `grid` reachable from the cell at `from` (same moves as
  * findPath), as keys `row * GRID_SIZE + col`; empty when `from` isn't on it.

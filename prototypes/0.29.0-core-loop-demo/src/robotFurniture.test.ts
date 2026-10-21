@@ -232,6 +232,27 @@ describe('robot still reaches posts beside tables', () => {
     expect(r.closest).toBeGreaterThan(0);
   });
 
+  it('does not hop onto an off-centre patrol spot that would brush a table', () => {
+    // (0.25, 1.99) sits in a robot-clear cell but only 0.31 m from the
+    // craps table's edge at z=2.3.
+    loadRoom([craps(0, 2.8, 0)]);
+    const bot = new PoolWaiter(new THREE.Scene(), [[0.25, 1.99], [0.25, -2]], { x: 0.25, z: -2 });
+    const r = walk(bot, 40);
+    expect(r.travelled).toBeGreaterThan(1);
+    expect(r.closest).toBeGreaterThanOrEqual(ROBOT_HALF_WIDTH - 1e-6);
+  });
+
+  it('does not walk into a table covering its dock even when the cell centre is open', () => {
+    // The dock at (0.25, 2.45) is inside the table (z 2.3..3.3), but its
+    // cell's centre (z=2.25) is walkable floor.
+    loadRoom([craps(0, 2.8, 0)]);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: -2 });
+    bot.setDock({ x: 0.25, z: 2.45, faceAngle: 0 });
+    const r = walk(bot, 60);
+    expect(r.travelled).toBeGreaterThan(1);
+    expect(r.closest).toBeGreaterThan(0);
+  });
+
   it('walks back onto its charging dock', () => {
     loadRoom(CASINO_FURNITURE);
     const dock = CASINO_FURNITURE.find((i) => i.kind === 'charging-dock')!;

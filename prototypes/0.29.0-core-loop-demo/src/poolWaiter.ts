@@ -19,7 +19,7 @@ import type { Player } from "./player";
 import {
   CELL_SIZE, findPath, worldToCol, worldToRow, colToWorld, rowToWorld, nearestReachableCell, walkableGridRevision,
   walkable, robotClear, nearestReachableOnGrid, nearestReachableMatching, stepOffFurniture,
-  reachableCells, GRID_SIZE, robotFits,
+  reachableCells, GRID_SIZE, robotFits, insideObstacle,
 } from "./pathfinding";
 import { backOffStep, occupied, segmentFree, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
@@ -1613,7 +1613,9 @@ export class PoolWaiter {
       // and for soft goals, stop on the clear floor nearest the goal.
       let approach: Array<{ x: number; z: number }> | null = null;
       let approachFrom: { x: number; z: number } | null = null;
-      if (!soft && walkable[worldToRow(tz)]?.[worldToCol(tx)]) {
+      // A post whose exact spot is under furniture is out of reach, even
+      // when its cell's centre is still walkable.
+      if (!soft && walkable[worldToRow(tz)]?.[worldToCol(tx)] && !insideObstacle(tx, tz)) {
         // Every reachable clear cell within APPROACH_MAX of the post is a
         // candidate start for the last stretch; take the shortest walk.
         const gr = worldToRow(tz);
@@ -1655,9 +1657,14 @@ export class PoolWaiter {
     // moved over a post, a dock or a script spot) stops on the floor beside
     // it. A soft goal (patrol waypoint) only hops over clear floor, so it
     // never brushes a table it was rerouted away from.
-    const hopGrid = soft ? robotClear : walkable;
-    const hopFree = (x: number, z: number): boolean =>
-      hopGrid[worldToRow(z)]?.[worldToCol(x)] === true;
+    // Checked against the furniture itself, not just cells: a soft hop must
+    // keep the robot's whole body clear; a hop onto a post may come as
+    // close as the post itself does but never enter furniture.
+    const hopFree = soft
+      ? (x: number, z: number): boolean =>
+          robotClear[worldToRow(z)]?.[worldToCol(x)] === true && robotFits(x, z)
+      : (x: number, z: number): boolean =>
+          walkable[worldToRow(z)]?.[worldToCol(x)] === true && !insideObstacle(x, z);
     this.routeEnd =
       Math.hypot(at.x - tx, at.z - tz) <= FINAL_HOP && segmentFree(at, goal, hopFree)
         ? goal
