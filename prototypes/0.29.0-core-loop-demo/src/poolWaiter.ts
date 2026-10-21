@@ -1451,7 +1451,6 @@ export class PoolWaiter {
     tz: number,
     arriveDist: number,
     soft = false,
-    ontoDock = false,
   ): boolean {
     const pos = this.group.position;
     if (Math.hypot(tx - pos.x, tz - pos.z) < arriveDist) {
@@ -1460,10 +1459,10 @@ export class PoolWaiter {
     }
     // The goal AND the grid it was planned on: a rebake (furniture added,
     // moved, removed) invalidates the route.
-    const key = `${tx.toFixed(1)},${tz.toFixed(1)}${soft ? "~" : ""}${ontoDock ? "D" : ""}@${walkableGridRevision()}`;
+    const key = `${tx.toFixed(1)},${tz.toFixed(1)}${soft ? "~" : ""}@${walkableGridRevision()}`;
     if (key !== this.pathGoalKey) {
       this.pathGoalKey = key;
-      this.planRoute(pos, tx, tz, soft, ontoDock);
+      this.planRoute(pos, tx, tz, soft);
     }
     const end = this.routeEnd;
     if (!end) return true; // walled in — nowhere to walk to
@@ -1558,11 +1557,8 @@ export class PoolWaiter {
     tx: number,
     tz: number,
     soft: boolean,
-    ontoDock: boolean,
   ): void {
     const goal = { x: tx, z: tz };
-    const gr = worldToRow(tz);
-    const gc = worldToCol(tx);
     const path: Array<{ x: number; z: number }> = [];
     const sameCell = (a: { x: number; z: number }, b: { x: number; z: number }): boolean =>
       worldToRow(a.z) === worldToRow(b.z) && worldToCol(a.x) === worldToCol(b.x);
@@ -1614,16 +1610,14 @@ export class PoolWaiter {
       at = near;
     }
     this.path = path;
-    // The last hop onto a post crosses walkable floor only; onto the
-    // robot's own dock it may also end on the dock's cell. Any other goal
-    // under furniture (a table moved over a post or a script spot) stops on
-    // the floor beside it. A soft goal (patrol waypoint) only hops over
-    // clear floor, so it never brushes a table it was rerouted away from.
-    const hopFree = soft
-      ? (x: number, z: number): boolean => robotClear[worldToRow(z)]?.[worldToCol(x)] === true
-      : (x: number, z: number): boolean =>
-          walkable[worldToRow(z)]?.[worldToCol(x)] === true ||
-          (ontoDock && worldToRow(z) === gr && worldToCol(x) === gc);
+    // The last hop onto a post or dock crosses walkable floor only (a dock
+    // pad is floor, not an obstacle), so a goal under furniture (a table
+    // moved over a post, a dock or a script spot) stops on the floor beside
+    // it. A soft goal (patrol waypoint) only hops over clear floor, so it
+    // never brushes a table it was rerouted away from.
+    const hopGrid = soft ? robotClear : walkable;
+    const hopFree = (x: number, z: number): boolean =>
+      hopGrid[worldToRow(z)]?.[worldToCol(x)] === true;
     this.routeEnd =
       Math.hypot(at.x - tx, at.z - tz) <= FINAL_HOP && segmentFree(at, goal, hopFree)
         ? goal
@@ -1643,7 +1637,7 @@ export class PoolWaiter {
   private updateDock(dt: number): void {
     const dock = this.dockTarget;
     if (!dock) return;
-    if (this.walkTo(dt, dock.x, dock.z, 0.12, false, true)) {
+    if (this.walkTo(dt, dock.x, dock.z, 0.12)) {
       // Charging: face the dock, legs settle, a slow recharge bob.
       this.turnToward(dock.faceAngle, dt);
       this.legL.rotation.x = 0;

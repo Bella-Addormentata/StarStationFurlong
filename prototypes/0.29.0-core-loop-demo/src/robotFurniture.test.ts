@@ -180,6 +180,16 @@ describe('robot still reaches posts beside tables', () => {
     expect(r.closest).toBeGreaterThan(ROBOT_HALF_WIDTH);
   });
 
+  it('waits beside a table moved over its dock instead of walking into it', () => {
+    const dock: FurnitureItem = { id: 'test-dock', kind: 'charging-dock', pos: { x: 0.25, z: 0.25 }, rot: 0 } as FurnitureItem;
+    loadRoom([dock, craps(0, 0, 0)]);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: 3.25 });
+    bot.setDock({ x: 0.25, z: 0.25, faceAngle: 0 });
+    const r = walk(bot, 60);
+    expect(r.travelled).toBeGreaterThan(1);
+    expect(r.closest).toBeGreaterThan(0);
+  });
+
   it('walks back onto its charging dock', () => {
     loadRoom(CASINO_FURNITURE);
     const dock = CASINO_FURNITURE.find((i) => i.kind === 'charging-dock')!;
