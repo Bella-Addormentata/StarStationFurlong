@@ -348,6 +348,8 @@ export class PoolWaiter {
   /** 🧭 Where the planned route ends: the goal itself, or the nearest clear
    *  floor to it when the goal is under furniture (null ⇒ nowhere to go). */
   private routeEnd: { x: number; z: number } | null = null;
+  /** 🧭 Set while a swerve has the robot off its planned cells. */
+  private offRoute = false;
   /** 🤖↔🦊 Where every avatar in the room stands (local fox + peers), handed
    *  over by the world each frame — the robot never walks over them. */
   private avatars: readonly XZ[] = [];
@@ -1315,7 +1317,9 @@ export class PoolWaiter {
       this.pathGoalKey = "";
     };
     if (step.kind === "goto") {
-      if (this.walkTo(dt, step.x, step.z, 0.15)) advance();
+      // Owner-authored spots may land anywhere: stop on clear floor near one
+      // under furniture rather than walk into it.
+      if (this.walkTo(dt, step.x, step.z, 0.15, true)) advance();
     } else if (step.kind === "say") {
       // 🔇 Retry until delivered (the entry quiet window drops lines; an empty
       // room drops them all) — the step holds here until its line lands, then
@@ -1447,6 +1451,7 @@ export class PoolWaiter {
     tz: number,
     arriveDist: number,
     soft = false,
+    ontoDock = false,
   ): boolean {
     const pos = this.group.position;
     if (Math.hypot(tx - pos.x, tz - pos.z) < arriveDist) {
@@ -1455,10 +1460,10 @@ export class PoolWaiter {
     }
     // The goal AND the grid it was planned on: a rebake (furniture added,
     // moved, removed) invalidates the route.
-    const key = `${tx.toFixed(1)},${tz.toFixed(1)}${soft ? "~" : ""}@${walkableGridRevision()}`;
+    const key = `${tx.toFixed(1)},${tz.toFixed(1)}${soft ? "~" : ""}${ontoDock ? "D" : ""}@${walkableGridRevision()}`;
     if (key !== this.pathGoalKey) {
       this.pathGoalKey = key;
-      this.planRoute(pos, tx, tz, soft);
+      this.planRoute(pos, tx, tz, soft, ontoDock);
     }
     const end = this.routeEnd;
     if (!end) return true; // walled in — nowhere to walk to
@@ -1500,8 +1505,9 @@ export class PoolWaiter {
         this.avatars,
         PoolWaiter.isFree,
         undefined,
-        // Last leg: look no further than the spot it is walking onto.
-        this.path.length === 0 ? dist : undefined,
+        // Look no further than the point it is walking to (the next
+        // waypoint, or the spot it is walking onto).
+        dist,
       );
       if (!dir) {
         this.blockedSecs += dt;
@@ -1511,6 +1517,15 @@ export class PoolWaiter {
         return false;
       }
       this.blockedSecs = 0;
+      // A swerve takes the robot off its planned cells: once it walks
+      // straight again, replan from where it is rather than cut back to
+      // the old route across a table corner.
+      if (dir !== undefined && (dir.x !== dx / dist || dir.z !== dz / dist)) {
+        this.offRoute = true;
+      } else if (this.offRoute) {
+        this.offRoute = false;
+        this.pathGoalKey = "";
+      }
       const nx = dir.x;
       const nz = dir.z;
       this.turnToward(Math.atan2(nx, nz), dt);
@@ -1538,7 +1553,13 @@ export class PoolWaiter {
    * last hop of at most FINAL_HOP onto a goal that is itself under
    * furniture (a dock) — never a straight line through a table.
    */
-  private planRoute(pos: { x: number; z: number }, tx: number, tz: number, soft: boolean): void {
+  private planRoute(
+    pos: { x: number; z: number },
+    tx: number,
+    tz: number,
+    soft: boolean,
+    ontoDock: boolean,
+  ): void {
     const goal = { x: tx, z: tz };
     const gr = worldToRow(tz);
     const gc = worldToCol(tx);
@@ -1593,15 +1614,16 @@ export class PoolWaiter {
       at = near;
     }
     this.path = path;
-    // The last hop onto a post may end on the goal's own cell (a dock under
-    // the robot's feet) but must not cross any other furniture. A soft goal
-    // (patrol waypoint) only hops over clear floor, so it never brushes a
-    // table it was rerouted away from.
+    // The last hop onto a post crosses walkable floor only; onto the
+    // robot's own dock it may also end on the dock's cell. Any other goal
+    // under furniture (a table moved over a post or a script spot) stops on
+    // the floor beside it. A soft goal (patrol waypoint) only hops over
+    // clear floor, so it never brushes a table it was rerouted away from.
     const hopFree = soft
       ? (x: number, z: number): boolean => robotClear[worldToRow(z)]?.[worldToCol(x)] === true
       : (x: number, z: number): boolean =>
           walkable[worldToRow(z)]?.[worldToCol(x)] === true ||
-          (worldToRow(z) === gr && worldToCol(x) === gc);
+          (ontoDock && worldToRow(z) === gr && worldToCol(x) === gc);
     this.routeEnd =
       Math.hypot(at.x - tx, at.z - tz) <= FINAL_HOP && segmentFree(at, goal, hopFree)
         ? goal
@@ -1621,7 +1643,7 @@ export class PoolWaiter {
   private updateDock(dt: number): void {
     const dock = this.dockTarget;
     if (!dock) return;
-    if (this.walkTo(dt, dock.x, dock.z, 0.12)) {
+    if (this.walkTo(dt, dock.x, dock.z, 0.12, false, true)) {
       // Charging: face the dock, legs settle, a slow recharge bob.
       this.turnToward(dock.faceAngle, dt);
       this.legL.rotation.x = 0;
@@ -1718,6 +1740,7 @@ export class PoolWaiter {
     if (back) {
       bp.x += back.x * backStep;
       bp.z += back.z * backStep;
+      this.pathGoalKey = ""; // moved off route: replan when walking resumes
     }
 
     // Fox wandered off before the sip — quietly put everything back.

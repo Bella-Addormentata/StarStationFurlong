@@ -170,6 +170,16 @@ describe('robot still reaches posts beside tables', () => {
     expect(bot.getPosition().z).toBeLessThan(-1); // left by the open south side
   });
 
+  it('stops beside a table covering a scripted goto spot instead of walking into it', () => {
+    loadRoom([craps(0, 0, 0)]);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: 3.25 });
+    bot.setRoutine('custom');
+    bot.setScript([{ kind: 'goto', x: 0.25, z: 0.25 }, { kind: 'goto', x: 0.25, z: 3.25 }]);
+    const r = walk(bot, 40);
+    expect(r.travelled).toBeGreaterThan(1);
+    expect(r.closest).toBeGreaterThan(ROBOT_HALF_WIDTH);
+  });
+
   it('walks back onto its charging dock', () => {
     loadRoom(CASINO_FURNITURE);
     const dock = CASINO_FURNITURE.find((i) => i.kind === 'charging-dock')!;
