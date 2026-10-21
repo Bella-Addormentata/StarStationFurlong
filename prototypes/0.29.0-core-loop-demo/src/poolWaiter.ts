@@ -19,7 +19,7 @@ import type { Player } from "./player";
 import {
   CELL_SIZE, findPath, worldToCol, worldToRow, colToWorld, rowToWorld, nearestReachableCell, walkableGridRevision,
   walkable, robotClear, nearestReachableOnGrid, nearestReachableMatching, stepOffFurniture,
-  reachableCells, GRID_SIZE,
+  reachableCells, GRID_SIZE, robotFits,
 } from "./pathfinding";
 import { backOffStep, occupied, segmentFree, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
@@ -380,10 +380,11 @@ export class PoolWaiter {
     this.avatars = avatars;
   }
 
-  /** Clear floor at (x,z) — a cell away from any furniture — where a swerve
-   *  or step-back may go. */
+  /** Clear floor at (x,z) — a robot-clear cell, with the robot's whole body
+   *  clear of furniture at that exact spot — where a swerve or step-back may
+   *  go. */
   private static isFree(x: number, z: number): boolean {
-    return robotClear[worldToRow(z)]?.[worldToCol(x)] === true;
+    return robotClear[worldToRow(z)]?.[worldToCol(x)] === true && robotFits(x, z);
   }
 
   /** World-space footprint of the bot (x,z) — used to pick the nearest robot
@@ -988,6 +989,15 @@ export class PoolWaiter {
     }
     if (!this.walkTo(dt, this.danceSpot.x, this.danceSpot.z, 0.15)) {
       this.resetExercisePose();
+      return;
+    }
+    // Stopped short (the pad is out of reach on clear floor): wait there
+    // rather than dance off the floor.
+    if (
+      Math.hypot(this.group.position.x - this.danceSpot.x, this.group.position.z - this.danceSpot.z) > 0.15
+    ) {
+      this.resetExercisePose();
+      this.idlePose();
       return;
     }
     const face = this.stageYaw ?? this.dockTarget?.faceAngle ?? 0;

@@ -232,6 +232,25 @@ export function nearestReachableOnGrid(
   return { x: colToWorld(best.c), z: rowToWorld(best.r) };
 }
 
+/** 🤖 How far a robot's body reaches from its centre (the ×1.4 waiter). */
+export const ROBOT_RADIUS = 0.35;
+
+/**
+ * 🤖 True when a robot centred at (x,z) touches no furniture, game or wall:
+ * at least ROBOT_RADIUS from every obstacle box and inside the room's walk
+ * box. Robot-clear cells guarantee this at their centres only; swerves and
+ * the serve step-back move off centres, so they check the body itself.
+ */
+export function robotFits(x: number, z: number): boolean {
+  if (!insideRoomWalk(x, z)) return false;
+  for (const b of OBSTACLES) {
+    const dx = Math.max(b.x0 - x, 0, x - b.x1);
+    const dz = Math.max(b.z0 - z, 0, z - b.z1);
+    if (dx * dx + dz * dz < ROBOT_RADIUS * ROBOT_RADIUS) return false;
+  }
+  return true;
+}
+
 /**
  * 🤖 Every cell of `grid` reachable from the cell at `from` (same moves as
  * findPath), as keys `row * GRID_SIZE + col`; empty when `from` isn't on it.

@@ -97,6 +97,23 @@ describe('robot patrols stay clear of furniture', () => {
   });
 });
 
+describe('robot dodging players near furniture', () => {
+  it('swerves round a player without brushing the table beside it', () => {
+    // The fox stands in the patrol aisle right beside the craps table: the
+    // robot's swerve options all run along the table edge.
+    loadRoom([craps(0, 2.8, 0)]);
+    const bot = new PoolWaiter(new THREE.Scene(), [[-3, 1.75], [3, 1.75]], { x: -3, z: 1.75 });
+    let closest = Infinity;
+    for (let t = 0; t < 30; t += 1 / 30) {
+      bot.setAvatars([{ x: 0, z: 1.25 }]);
+      bot.update(1 / 30, null);
+      const p = bot.getPosition();
+      closest = Math.min(closest, clearance(p.x, p.z));
+    }
+    expect(closest).toBeGreaterThanOrEqual(0.35 - 1e-6);
+  });
+});
+
 describe('robot leaves cramped floor without crossing furniture', () => {
   it('walks out of a one-cell gap between two tables along the gap, not across a table', () => {
     // The nearest clear floor by straight-line rings is across the lower
