@@ -5,3 +5,4 @@ chia_identity.seed
 wallet_lease.json
 target/
 blob-cache/
+torrent-cache/

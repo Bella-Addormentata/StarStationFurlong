@@ -141,7 +141,7 @@ impl BlobLane {
         Self::open_at(std::env::current_dir()?.join(CACHE_DIR), quota).await
     }
 
-    async fn open_at(dir: PathBuf, quota: u64) -> Result<Arc<Self>> {
+    pub(crate) async fn open_at(dir: PathBuf, quota: u64) -> Result<Arc<Self>> {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
@@ -214,7 +214,7 @@ impl BlobLane {
     }
 
     /// The JSON the status route answers for `hash`.
-    fn status_json(&self, hash: &Hash) -> String {
+    pub(crate) fn status_json(&self, hash: &Hash) -> String {
         let held = self.held.lock().unwrap();
         let Some(h) = held.get(hash) else {
             return r#"{"state":"none"}"#.to_string();
@@ -317,6 +317,54 @@ impl BlobLane {
             }
         }
         self.fail(&hash, &last_err);
+    }
+
+    /// Reserve a file of `len` bytes against the quota before a byte of it
+    /// is written, under a key of its own until the hash is known: a random
+    /// one, so two imports at once are two reservations. None when it does
+    /// not fit.
+    pub(crate) fn reserve(&self, len: u64, mime: &str) -> Option<Hash> {
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let placeholder = Hash::new(nonce);
+        let mut held = self.held.lock().unwrap();
+        if Self::charged(&held) + storage_bound(len) > self.quota {
+            return None;
+        }
+        held.insert(placeholder, Held {
+            rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len),
+        });
+        Some(placeholder)
+    }
+
+    /// Give a reservation back (the import did not happen).
+    pub(crate) fn unreserve(&self, placeholder: &Hash) {
+        self.held.lock().unwrap().remove(placeholder);
+    }
+
+    /// The reservation becomes the imported blob's, for `room`, in one step:
+    /// a moment with neither counted would let another import or FETCH take
+    /// the same room in the quota.
+    pub(crate) fn settle(&self, placeholder: Hash, hash: Hash, len: u64, room: String, mime: String) {
+        let mut held = self.held.lock().unwrap();
+        held.remove(&placeholder);
+        let h = held.entry(hash).or_insert(Held {
+            rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len),
+        });
+        h.rooms.insert(room);
+        h.phase = Phase::Complete;
+        h.have = len;
+        h.size = len;
+        h.charged = storage_bound(len);
+        h.mime = mime;
+    }
+
+    /// Store a file already on this machine's disk (the torrent lane's
+    /// download); its hash, or why not. The caller reserved it.
+    #[cfg_attr(not(feature = "torrent"), allow(dead_code))]
+    pub(crate) async fn add_file(&self, path: &std::path::Path) -> Result<Hash> {
+        let tag = self.store.blobs().add_path(path).await.map_err(|e| anyhow!("{e}"))?;
+        Ok(tag.hash)
     }
 
     /// Stream `len` body bytes (the first `already` read with the head) into
@@ -441,7 +489,7 @@ pub fn parse_range(h: Option<&String>, len: u64) -> std::result::Result<Option<(
     Ok(Some((start, end)))
 }
 
-fn valid_room(r: &str) -> bool {
+pub(crate) fn valid_room(r: &str) -> bool {
     !r.is_empty() && r.len() <= MAX_ROOM_LEN && r.chars().all(|c| !c.is_control())
 }
 
@@ -450,7 +498,7 @@ pub fn is_blob_route(path: &str) -> bool {
     path.starts_with("/blob/") || path.starts_with("/api/blob/")
 }
 
-async fn reply(socket: &mut tokio::net::TcpStream, status: &str, cors: &str, body: &str) {
+pub(crate) async fn reply(socket: &mut tokio::net::TcpStream, status: &str, cors: &str, body: &str) {
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{cors}Cache-Control: private, no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -458,7 +506,7 @@ async fn reply(socket: &mut tokio::net::TcpStream, status: &str, cors: &str, bod
     let _ = socket.write_all(resp.as_bytes()).await;
 }
 
-fn err_json(why: &str) -> String {
+pub(crate) fn err_json(why: &str) -> String {
     serde_json::json!({ "error": why }).to_string()
 }
 
@@ -496,50 +544,19 @@ pub async fn handle_http(
                 return reply(socket, "411 Length Required", cors, &err_json("the upload needs its length")).await;
             };
             let mime = safe_mime(head.query.get("mime").map(String::as_str).unwrap_or(""));
-            // Reserve the whole file against the quota before a byte is
-            // written, under a key of its own until the hash is known: a
-            // random one, so two uploads at once are two reservations.
-            let mut nonce = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-            let placeholder = Hash::new(nonce);
-            let reserved = {
-                let mut held = lane.held.lock().unwrap();
-                let fits = BlobLane::charged(&held) + storage_bound(len) <= lane.quota;
-                if fits {
-                    held.insert(placeholder, Held {
-                        rooms: HashSet::new(), size: len, have: 0, mime: mime.clone(), phase: Phase::Importing, charged: storage_bound(len),
-                    });
-                }
-                fits
-            };
-            if !reserved {
+            let Some(placeholder) = lane.reserve(len, &mime) else {
                 return reply(socket, "413 Payload Too Large", cors, &err_json("not enough room in this node's blob quota")).await;
-            }
+            };
             let result = lane.import(socket, body_start, len).await;
             match result {
                 Ok(hash) => {
-                    {
-                        // The reservation becomes the blob's in one step: a
-                        // moment with neither counted would let another
-                        // upload or FETCH take the same room in the quota.
-                        let mut held = lane.held.lock().unwrap();
-                        held.remove(&placeholder);
-                        let h = held.entry(hash).or_insert(Held {
-                            rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len),
-                        });
-                        h.rooms.insert(room);
-                        h.phase = Phase::Complete;
-                        h.have = len;
-                        h.size = len;
-                        h.charged = storage_bound(len);
-                        h.mime = mime;
-                    }
+                    lane.settle(placeholder, hash, len, room, mime);
                     println!("📦 blob {}: imported {len} bytes", hash.fmt_short());
                     let body = serde_json::json!({ "hash": hash.to_hex(), "size": len }).to_string();
                     reply(socket, "200 OK", cors, &body).await;
                 }
                 Err(e) => {
-                    lane.held.lock().unwrap().remove(&placeholder);
+                    lane.unreserve(&placeholder);
                     reply(socket, "500 Internal Server Error", cors, &err_json(&format!("import failed: {e}"))).await
                 }
             }
@@ -690,7 +707,7 @@ async fn serve_bytes(
     Ok(())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
