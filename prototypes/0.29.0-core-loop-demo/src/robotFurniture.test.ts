@@ -284,6 +284,17 @@ describe('robot still reaches posts beside tables', () => {
     expect(r.closest).toBeGreaterThan(0);
   });
 
+  it('does not clip a table corner on the way to its own cell centre either', () => {
+    // From (0.01, 0.31) the line to its cell centre (0.25, 0.25) passes
+    // (0.09, 0.29), inside the table at (-1.3, -0.2); a different way out
+    // (or standing still) is the only safe choice.
+    loadRoom([craps(-1.3, -0.2, 0)]);
+    expect(clearance(0.01, 0.31)).toBeGreaterThan(0);
+    const bot = new PoolWaiter(new THREE.Scene(), [[-3, 3], [-3, -3]], { x: 0.01, z: 0.31 });
+    const r = walk(bot, 20);
+    expect(r.closest).toBeGreaterThan(0);
+  });
+
   it('does not walk a straight line to a scripted goto outside the room', () => {
     // (32.25, 0.25) is off the grid; its flattened cell key used to alias a
     // real cell, so the robot walked straight at it through the table.

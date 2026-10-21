@@ -1658,14 +1658,31 @@ export class PoolWaiter {
       }
     }
     // The robot leaves from its exact spot, not its cell's centre: when the
-    // straight line to the first waypoint would clip a table corner, walk to
-    // the centre of the cell it stands in first.
+    // straight line to the first waypoint would clip a table corner, go by
+    // the centre of its own cell or a neighbouring one, whichever is nearest
+    // with both legs clear of furniture. No safe way out: stay put.
     const first = path[0] ?? at;
+    const noFurniture = (x: number, z: number): boolean => !insideObstacle(x, z);
     if (
       walkable[worldToRow(pos.z)]?.[worldToCol(pos.x)] === true &&
-      !segmentFree(pos, first, (x, z) => !insideObstacle(x, z))
+      !segmentFree(pos, first, noFurniture)
     ) {
-      path.unshift({ x: colToWorld(worldToCol(pos.x)), z: rowToWorld(worldToRow(pos.z)) });
+      const r0 = worldToRow(pos.z);
+      const c0 = worldToCol(pos.x);
+      const vias: Array<{ x: number; z: number }> = [];
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          if (walkable[r0 + dr]?.[c0 + dc]) vias.push({ x: colToWorld(c0 + dc), z: rowToWorld(r0 + dr) });
+        }
+      }
+      vias.sort((a, b) => Math.hypot(a.x - pos.x, a.z - pos.z) - Math.hypot(b.x - pos.x, b.z - pos.z));
+      const via = vias.find((v) => segmentFree(pos, v, noFurniture) && segmentFree(v, first, noFurniture));
+      if (!via) {
+        this.path = [];
+        this.routeEnd = null;
+        return;
+      }
+      path.unshift(via);
     }
     this.path = path;
     // The last hop onto a post or dock crosses walkable floor only (a dock
