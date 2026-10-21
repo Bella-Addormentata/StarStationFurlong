@@ -22,7 +22,7 @@ function withNode(torrent: boolean) {
   setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID, torrent });
 }
 
-const complete = { state: 'complete', id: INFO, name: 'Sintel', have: 129_000_000, size: 129_000_000, peers: 0, uploaded: 0, why: '', hash: HASH, mime: 'video/mp4' };
+const complete = { state: 'complete', id: INFO, room: 'room-1', name: 'Sintel', have: 129_000_000, size: 129_000_000, peers: 0, uploaded: 0, why: '', hash: HASH, mime: 'video/mp4' };
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -80,6 +80,32 @@ describe('torrentLane', () => {
     expect(source).toEqual({ kind: 'blob', hash: HASH, size: 129_000_000, provider: ID, mime: 'video/mp4', title: 'Sintel' });
     // No magnet, tracker or info hash ever rides in the record.
     expect(JSON.stringify(source)).not.toContain(INFO);
+  });
+
+  it('plays nothing held for another room', () => {
+    withNode(true);
+    expect(torrentSource(parseTorrentState({ ...complete, room: 'room-2' }))).toBeNull();
+  });
+
+  it('drops the finished file at START, and an answer asked before it', async () => {
+    withNode(true);
+    const pending: Array<(r: Response) => void> = [];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(complete), { status: 200 })));
+    await refreshTorrentState();
+    expect(torrentSource()).not.toBeNull();
+    // A status asked before START answers only after it: it must not land.
+    vi.stubGlobal('fetch', vi.fn((url: string) => url.includes('/status')
+      ? new Promise<Response>((r) => { pending.push(r); })
+      : Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 202 }))));
+    const stale = refreshTorrentState();
+    expect(await startTorrent(`magnet:?xt=urn:btih:${INFO}`)).toBeNull();
+    expect(torrentSource()).toBeNull();
+    // The stale one answers last, after START's own ask came back.
+    pending[1]!(new Response(JSON.stringify({ ...complete, state: 'metadata', hash: null }), { status: 200 }));
+    await new Promise((r) => setTimeout(r, 0));
+    pending[0]!(new Response(JSON.stringify(complete), { status: 200 }));
+    await stale;
+    expect(torrentState().state).toBe('metadata');
   });
 
   it('forgets a restarted node\'s torrent', async () => {

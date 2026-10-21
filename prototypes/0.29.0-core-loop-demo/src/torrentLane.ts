@@ -29,6 +29,8 @@ export type TorrentState =
       peers: number;
       uploaded: number;
       why: string;
+      /** The room the node holds the file for: the only room PLAY may name it in. */
+      room: string;
       /** Set once complete: the blob the file became, and its type. */
       hash: string | null;
       mime: string | null;
@@ -40,6 +42,13 @@ const HEX_40 = /^[0-9a-f]{40}$/;
 
 let last: TorrentState = { state: 'unknown' };
 let lastGen = -1;
+/** Moves at every START and STOP: a status asked before one describes what
+ *  it changed, and is dropped on arrival. */
+let epoch = 0;
+/** Orders status answers: an older request's answer never lands over a
+ *  newer one's. */
+let asked = 0;
+let landed = 0;
 
 export function parseTorrentState(body: unknown): TorrentState {
   if (!body || typeof body !== 'object') return { state: 'unknown' };
@@ -60,6 +69,7 @@ export function parseTorrentState(body: unknown): TorrentState {
         peers: n(r.peers),
         uploaded: n(r.uploaded),
         why: str(r.why, 300),
+        room: str(r.room, 256),
         hash,
         mime: typeof r.mime === 'string' ? r.mime.slice(0, 80) : null,
       };
@@ -79,14 +89,16 @@ export function torrentState(): TorrentState {
 export async function refreshTorrentState(): Promise<TorrentState> {
   const url = nodeRoute('/api/torrent/status', {});
   const gen = blobLaneGeneration();
+  const at = epoch;
+  const n = ++asked;
   if (!url) return torrentState();
   try {
     const res = await fetch(url, { redirect: 'error' });
     const st = parseTorrentState(res.ok ? await res.json() : null);
-    if (gen === blobLaneGeneration()) {
-      last = st;
-      lastGen = gen;
-    }
+    if (gen !== blobLaneGeneration() || at !== epoch || n < landed) return torrentState();
+    last = st;
+    lastGen = gen;
+    landed = n;
     return st;
   } catch {
     return torrentState();
@@ -116,12 +128,20 @@ export async function startTorrent(magnet: string): Promise<string | null> {
   if (!text.startsWith('magnet:?')) return 'Paste a magnet link (it starts with magnet:?).';
   if (!torrentLaneReady()) return 'The TORRENT tile needs this station\'s node, built with torrents, running here.';
   const why = await post('/api/torrent/add', { room: blobLaneRoom() }, text);
-  if (!why) void refreshTorrentState();
+  if (!why) {
+    // The finished file the remote held is no longer the node's answer:
+    // nothing is playable until the node says so of the new torrent.
+    epoch++;
+    last = { state: 'unknown' };
+    void refreshTorrentState();
+  }
   return why;
 }
 
 export async function stopTorrent(): Promise<string | null> {
   const why = await post('/api/torrent/stop', {});
+  epoch++;
+  last = { state: 'unknown' };
   void refreshTorrentState();
   return why;
 }
@@ -130,7 +150,9 @@ export async function stopTorrent(): Promise<string | null> {
  *  this page's node. Null until it is complete. */
 export function torrentSource(st: TorrentState = torrentState()): TvSource | null {
   const provider = blobLaneNodeId();
-  if (st.state !== 'complete' || !st.hash || !provider) return null;
+  // The node serves the blob only to members of the room it was fetched
+  // for: in another room the viewers' FETCH would be refused.
+  if (st.state !== 'complete' || !st.hash || !provider || st.room !== blobLaneRoom()) return null;
   return sanitizeSource({
     kind: 'blob', hash: st.hash, size: st.size, provider, mime: st.mime ?? '',
     title: (st.name || 'a torrent').slice(0, TV_MAX_TITLE),
@@ -158,4 +180,7 @@ export function torrentLine(st: TorrentState, fmt: (n: number) => string): strin
 export function forgetTorrentLane(): void {
   last = { state: 'unknown' };
   lastGen = -1;
+  epoch = 0;
+  asked = 0;
+  landed = 0;
 }

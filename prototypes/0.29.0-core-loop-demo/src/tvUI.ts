@@ -800,7 +800,9 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const source = torrentSource();
       if (!source) {
         const st = torrentState();
-        feedback(st.state === 'metadata' || st.state === 'downloading' || st.state === 'importing'
+        feedback(st.state === 'complete'
+          ? 'That download was for another room — paste the magnet again here.'
+          : st.state === 'metadata' || st.state === 'downloading' || st.state === 'importing'
           ? 'The download is not finished yet — PLAY NOW puts it on the TV once it is.'
           : 'Paste a magnet and press 🧲 START first; PLAY NOW takes the file once it is downloaded.');
         return null;

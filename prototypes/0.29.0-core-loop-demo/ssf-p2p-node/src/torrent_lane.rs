@@ -100,6 +100,9 @@ struct Job {
     /// The blob, once the file is in the lane.
     blob: Option<(Hash, String)>,
     task: Option<tokio::task::AbortHandle>,
+    /// Its torrent, reservation and cache directory are gone: only then may
+    /// the next START replace it (a phase turns final before teardown runs).
+    torn: bool,
 }
 
 /// How the lane runs: from the environment in the node, by hand in a test.
@@ -385,15 +388,17 @@ impl TorrentLane {
             return Err(anyhow!("{} is {got} bytes, not the {len} the torrent said", rel.display()));
         }
         let hash = self.blobs.add_file(&path).await?;
-        // The reservation becomes the blob's under the job's lock, so a STOP
-        // either came first (and cleanup gives the reservation back) or finds
-        // the job complete.
+        // The bytes are in the store now, so they are charged whatever came
+        // meanwhile: the reservation becomes the blob's under the job's lock.
+        // A STOP that already gave the reservation back leaves `settle` to
+        // charge it afresh; a STOP after this finds no reservation to free.
+        // Only a job still importing shows the blob as its result.
         let mut done = false;
         self.update(seq, |j| {
+            j.reserved = None;
+            self.blobs.settle(reserved, hash, len, j.room.clone(), mime.to_string());
             if j.phase == Phase::Importing {
                 done = true;
-                j.reserved = None;
-                self.blobs.settle(reserved, hash, len, j.room.clone(), mime.to_string());
                 j.blob = Some((hash, mime.to_string()));
                 j.phase = Phase::Complete;
             }
@@ -421,6 +426,7 @@ impl TorrentLane {
             self.blobs.unreserve(&r);
         }
         let _ = tokio::fs::remove_dir_all(self.dir.join(info_hash)).await;
+        self.update(seq, |j| j.torn = true);
     }
 
     /// START, from this node's page: the pasted magnet, for `room`. The
@@ -433,9 +439,12 @@ impl TorrentLane {
             if job.as_ref().is_some_and(|j| matches!(j.phase, Phase::Metadata | Phase::Downloading | Phase::Importing)) {
                 return Err(("409 Conflict", "a torrent is already running on this node — STOP it first".into()));
             }
+            if job.as_ref().is_some_and(|j| !j.torn) {
+                return Err(("409 Conflict", "the last torrent is still being cleaned up — try again in a moment".into()));
+            }
             *job = Some(Job {
                 seq, info_hash: info_hash.clone(), name, room, phase: Phase::Metadata,
-                have: 0, size: 0, peers: 0, uploaded: 0, reserved: None, torrent: None, blob: None, task: None,
+                have: 0, size: 0, peers: 0, uploaded: 0, reserved: None, torrent: None, blob: None, task: None, torn: false,
             });
         }
         let task = tokio::spawn(self.clone().run(seq, magnet));
@@ -449,7 +458,14 @@ impl TorrentLane {
         let seq = {
             let mut job = self.job.lock().unwrap();
             match job.as_mut() {
-                Some(j) if matches!(j.phase, Phase::Metadata | Phase::Downloading | Phase::Importing) => {
+                // While the file goes into the store the task is left to
+                // finish: aborted there, bytes could land with no charge. It
+                // sees the STOP, charges what it stored, and tears down.
+                Some(j) if j.phase == Phase::Importing => {
+                    j.phase = Phase::Stopped;
+                    None
+                }
+                Some(j) if matches!(j.phase, Phase::Metadata | Phase::Downloading) => {
                     j.phase = Phase::Stopped;
                     if let Some(t) = j.task.take() {
                         t.abort();
@@ -461,8 +477,8 @@ impl TorrentLane {
         };
         if let Some(seq) = seq {
             self.cleanup(seq).await;
-            println!("🧲 torrent stopped from this node's page");
         }
+        println!("🧲 torrent stopped from this node's page");
     }
 
     fn status_json(&self) -> String {
@@ -479,7 +495,7 @@ impl TorrentLane {
             Phase::Stopped => ("stopped", ""),
         };
         serde_json::json!({
-            "state": state, "why": why, "id": j.info_hash, "name": j.name,
+            "state": state, "why": why, "id": j.info_hash, "name": j.name, "room": j.room,
             "have": j.have, "size": j.size, "peers": j.peers, "uploaded": j.uploaded,
             "hash": j.blob.as_ref().map(|b| b.0.to_hex().to_string()),
             "mime": j.blob.as_ref().map(|b| b.1.clone()),
@@ -767,6 +783,7 @@ mod tests {
         assert_eq!(st["state"], "complete", "{st}");
         assert_eq!(st["size"], video.len() as u64);
         assert_eq!(st["mime"], "video/webm");
+        assert_eq!(st["room"], "room-1");
         // The blob is the clip, byte for byte, held for the room it came for.
         let hash = <Hash as std::str::FromStr>::from_str(st["hash"].as_str().unwrap()).unwrap();
         assert_eq!(hash, Hash::new(&video));
@@ -786,10 +803,15 @@ mod tests {
         let st = wait_for(&lane, |s| s["state"] != "metadata").await;
         assert_eq!(st["state"], "failed", "{st}");
         assert_eq!(st["size"], 0, "the file list came from a loopback peer: {st}");
-        // A new paste after a failure runs; STOP ends it.
+        // A new paste after a failure runs (once the failed one is torn
+        // down); STOP ends it.
+        wait_for(&lane, |_| lane.job.lock().unwrap().as_ref().is_some_and(|j| j.torn)).await;
         lane.start("room-1".into(), &format!("magnet:?xt=urn:btih:{id}")).unwrap();
         lane.stop().await;
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&lane.status_json()).unwrap()["state"], "stopped");
+        // With no dialable peer it may have failed on its own first; either
+        // way it ends torn down.
+        let st = wait_for(&lane, |_| lane.job.lock().unwrap().as_ref().is_some_and(|j| j.torn)).await;
+        assert!(matches!(st["state"].as_str(), Some("stopped" | "failed")), "{st}");
         // And the session's blocklist holds for piece dials: handed the whole
         // .torrent and the seeder's address, it still takes nothing from it.
         let session = lane.session().await.unwrap();
