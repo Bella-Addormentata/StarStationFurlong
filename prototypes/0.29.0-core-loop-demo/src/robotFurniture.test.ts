@@ -154,6 +154,31 @@ describe('robot still reaches posts beside tables', () => {
     expect(r.closest).toBeGreaterThan(ROBOT_HALF_WIDTH);
   });
 
+  it('reaches a post in a narrow aisle from the end with the short approach', () => {
+    // Same four tables: the post at (1.25, 0.75) is 2.5 m in from the
+    // aisle's east end, though the clear floor nearest it in a straight
+    // line is across the tables to the north.
+    const t = (id: string, x: number, z: number): FurnitureItem => ({ ...craps(x, z, 0), id });
+    loadRoom([t('a', -1.5, 0), t('b', 1.5, 0), t('c', -1.5, 1.5), t('d', 1.5, 1.5)]);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: 3.75 });
+    bot.setCroupierPost({ x: 1.25, z: 0.75, faceAngle: 0 });
+    const r = walk(bot, 60);
+    const p = bot.getPosition();
+    expect(Math.hypot(p.x - 1.25, p.z - 0.75)).toBeLessThan(0.15);
+    expect(r.closest).toBeGreaterThan(0.2); // the aisle itself is 0.25 each side
+  });
+
+  it('stays put when shut in a narrow aisle with no clear floor to reach', () => {
+    const t = (id: string, x: number, z: number, rot: 0 | 1): FurnitureItem => ({ ...craps(x, z, rot), id });
+    loadRoom([
+      t('a', -1.5, 0, 0), t('b', 1.5, 0, 0), t('c', -1.5, 1.5, 0), t('d', 1.5, 1.5, 0),
+      t('w', -3.5, 0.75, 1), t('e', 3.5, 0.75, 1),
+    ]);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: 0.75 });
+    const r = walk(bot, 30);
+    expect(r.travelled).toBeLessThan(0.3);
+  });
+
   it('steps off its dock without crossing the table next to it', () => {
     // A robot inside furniture (as on its dock) beside another table: it
     // must step off over open floor, never through the neighbour.

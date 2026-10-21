@@ -233,6 +233,19 @@ export function nearestReachableOnGrid(
 }
 
 /**
+ * 🤖 Every cell of `grid` reachable from the cell at `from` (same moves as
+ * findPath), as keys `row * GRID_SIZE + col`; empty when `from` isn't on it.
+ */
+export function reachableCells(from: { x: number; z: number }, grid: boolean[][]): Set<number> {
+  const seen = new Set<number>();
+  nearestReachableMatching(from, grid, (r, c) => {
+    seen.add(r * GRID_SIZE + c);
+    return false;
+  });
+  return seen;
+}
+
+/**
  * 🤖 Nearest cell (by walking distance over `grid`, same moves as findPath)
  * from the cell at `from` that satisfies `match`, with the route to it, or
  * null when none is reachable. Robots use it to step off cramped floor onto

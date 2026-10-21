@@ -19,6 +19,7 @@ import type { Player } from "./player";
 import {
   CELL_SIZE, findPath, worldToCol, worldToRow, colToWorld, rowToWorld, nearestReachableCell, walkableGridRevision,
   walkable, robotClear, nearestReachableOnGrid, nearestReachableMatching, stepOffFurniture,
+  reachableCells, GRID_SIZE,
 } from "./pathfinding";
 import { backOffStep, occupied, segmentFree, steerStep, type XZ } from "./robotSpace";
 import type { WorkoutPose } from "./voxelCharacter";
@@ -1560,14 +1561,11 @@ export class PoolWaiter {
   ): void {
     const goal = { x: tx, z: tz };
     const path: Array<{ x: number; z: number }> = [];
-    const sameCell = (a: { x: number; z: number }, b: { x: number; z: number }): boolean =>
-      worldToRow(a.z) === worldToRow(b.z) && worldToCol(a.x) === worldToCol(b.x);
     // Departure: a robot on cramped floor (beside a table, at a post) walks
     // the plain grid to the nearest clear floor, never cutting across a
     // table to reach it. One standing on furniture itself (its dock) first
-    // steps off it, crossing nothing but that furniture. With no clear floor reachable at
-    // all (furniture dropped round it) the whole route uses plain floor.
-    let grids = soft ? [robotClear] : [robotClear, walkable];
+    // steps off it, crossing nothing but that furniture. A robot with no
+    // clear floor reachable at all (furniture dropped round it) stays put.
     let at: { x: number; z: number } | null = { x: pos.x, z: pos.z };
     if (!walkable[worldToRow(pos.z)]?.[worldToCol(pos.x)]) {
       at = stepOffFurniture(pos.x, pos.z, 4);
@@ -1580,34 +1578,66 @@ export class PoolWaiter {
     }
     const onClear = (r: number, c: number): boolean => robotClear[r]?.[c] === true;
     const entry = nearestReachableMatching(at, walkable, onClear);
-    if (entry) {
-      path.push(...entry.path);
-      at = entry.cell;
-    } else {
-      grids = [walkable];
-      at = { x: colToWorld(worldToCol(at.x)), z: rowToWorld(worldToRow(at.z)) };
+    if (!entry) {
+      this.path = path;
+      this.routeEnd = path.length > 0 ? at : null;
+      return;
     }
-    for (const grid of grids) {
-      if (sameCell(at, goal)) break;
-      const near = nearestReachableOnGrid(tx, tz, at, grid);
-      if (!near) continue;
-      if (!sameCell(at, near)) {
-        const leg = findPath(
-          worldToRow(at.z), worldToCol(at.x), worldToRow(near.z), worldToCol(near.x), grid,
-        );
-        // The plain-grid leg is only the short careful approach to a post.
-        if (grid === walkable && grids.length > 1) {
-          let len = 0;
-          let prev = at;
-          for (const p of leg) {
-            len += Math.hypot(p.x - prev.x, p.z - prev.z);
-            prev = p;
+    path.push(...entry.path);
+    at = entry.cell;
+    const cellKey = (p: { x: number; z: number }): number =>
+      worldToRow(p.z) * GRID_SIZE + worldToCol(p.x);
+    const clearLeg = (from: { x: number; z: number }, to: { x: number; z: number }) =>
+      cellKey(from) === cellKey(to)
+        ? []
+        : findPath(worldToRow(from.z), worldToCol(from.x), worldToRow(to.z), worldToCol(to.x), robotClear);
+    const goalCell = { x: colToWorld(worldToCol(tx)), z: rowToWorld(worldToRow(tz)) };
+    const clearReach = reachableCells(at, robotClear);
+    if (clearReach.has(cellKey(goal))) {
+      path.push(...clearLeg(at, goalCell));
+      at = goalCell;
+    } else {
+      // A post (hard goal) on cramped floor: find the reachable clear cell
+      // with the shortest walk to it, from any side, and walk the last
+      // stretch over plain floor if that is at most APPROACH_MAX. Otherwise,
+      // and for soft goals, stop on the clear floor nearest the goal.
+      let approach: Array<{ x: number; z: number }> | null = null;
+      let approachFrom: { x: number; z: number } | null = null;
+      if (!soft && walkable[worldToRow(tz)]?.[worldToCol(tx)]) {
+        // Every reachable clear cell within APPROACH_MAX of the post is a
+        // candidate start for the last stretch; take the shortest walk.
+        const gr = worldToRow(tz);
+        const gc = worldToCol(tx);
+        const ring = Math.ceil(APPROACH_MAX / CELL_SIZE);
+        let best = APPROACH_MAX + 1e-6;
+        for (let r = gr - ring; r <= gr + ring; r++) {
+          for (let c = gc - ring; c <= gc + ring; c++) {
+            if (!clearReach.has(r * GRID_SIZE + c)) continue;
+            const from = { x: colToWorld(c), z: rowToWorld(r) };
+            if (Math.hypot(from.x - goalCell.x, from.z - goalCell.z) > best) continue;
+            const leg = findPath(r, c, gr, gc, walkable);
+            let len = 0;
+            let prev = from;
+            for (const p of leg) {
+              len += Math.hypot(p.x - prev.x, p.z - prev.z);
+              prev = p;
+            }
+            if (leg.length > 0 && len < best) {
+              best = len;
+              approach = leg;
+              approachFrom = from;
+            }
           }
-          if (len > APPROACH_MAX) break;
         }
-        path.push(...leg);
       }
-      at = near;
+      if (approach && approachFrom) {
+        path.push(...clearLeg(at, approachFrom), ...approach);
+        at = goalCell;
+      } else {
+        const near = nearestReachableOnGrid(tx, tz, at, robotClear) ?? at;
+        path.push(...clearLeg(at, near));
+        at = near;
+      }
     }
     this.path = path;
     // The last hop onto a post or dock crosses walkable floor only (a dock
