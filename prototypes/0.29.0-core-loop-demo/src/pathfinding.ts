@@ -45,6 +45,17 @@ export const GRID_HALF = GRID_SIZE / 2;
  */
 export const walkable: boolean[][] = [];
 
+/**
+ * 🤖 robotClear[row][col] === true → walkable AND all 8 neighbours walkable.
+ * The grid only checks cell CENTRES, so a walker on a cell beside a table has
+ * its middle just 0.25 m from the table edge — fine for the fox (it has its
+ * own collision resolver), but a robot (≈0.35 m wide each side, no collision)
+ * following that route visibly walks into the table. Robots plan on this
+ * grid so they keep a cell of floor between themselves and any furniture,
+ * game or wall. Rebaked together with `walkable`.
+ */
+export const robotClear: boolean[][] = [];
+
 /** Re-bake the walkable grid from the current OBSTACLES list, in place. */
 /** Bumped on every rebake — anything holding a planned path (a robot on
  *  its way somewhere) re-plans when this changes, so furniture dropped onto
@@ -76,6 +87,18 @@ export function rebakeWalkableGrid(): void {
       // box, and (🔭) a cupola's cut corners (floorPlanDoc.insideRoomWalk).
       if (!insideRoomWalk(wx, wz)) blocked = true;
       cells[col] = !blocked;
+    }
+  }
+  for (let row = 0; row < GRID_SIZE; row++) {
+    const clear = robotClear[row] ?? (robotClear[row] = []);
+    for (let col = 0; col < GRID_SIZE; col++) {
+      let ok = walkable[row][col];
+      for (let dr = -1; ok && dr <= 1; dr++) {
+        for (let dc = -1; ok && dc <= 1; dc++) {
+          if (!walkable[row + dr]?.[col + dc]) ok = false;
+        }
+      }
+      clear[col] = ok;
     }
   }
 }
@@ -113,6 +136,7 @@ export function nearestWalkableCell(
   wx: number,
   wz: number,
   maxRing: number,
+  grid: boolean[][] = walkable,
 ): { x: number; z: number } | null {
   const r0 = worldToRow(wz);
   const c0 = worldToCol(wx);
@@ -120,7 +144,7 @@ export function nearestWalkableCell(
     for (let dr = -ring; dr <= ring; dr++) {
       for (let dc = -ring; dc <= ring; dc++) {
         if (Math.max(Math.abs(dr), Math.abs(dc)) !== ring) continue;
-        if (walkable[r0 + dr]?.[c0 + dc]) {
+        if (grid[r0 + dr]?.[c0 + dc]) {
           return { x: colToWorld(c0 + dc), z: rowToWorld(r0 + dr) };
         }
       }
@@ -144,8 +168,9 @@ export function nearestReachableCell(
   wz: number,
   maxRing: number,
   from: { x: number; z: number },
+  grid: boolean[][] = walkable,
 ): { x: number; z: number } | null {
-  const start = nearestWalkableCell(from.x, from.z, 3);
+  const start = nearestWalkableCell(from.x, from.z, 3, grid);
   if (!start) return null;
   const sr = worldToRow(start.z);
   const sc = worldToCol(start.x);
@@ -157,12 +182,177 @@ export function nearestReachableCell(
         if (Math.max(Math.abs(dr), Math.abs(dc)) !== ring) continue;
         const r = r0 + dr;
         const c = c0 + dc;
-        if (!walkable[r]?.[c]) continue;
-        if ((r === sr && c === sc) || findPath(sr, sc, r, c).length > 0) {
+        if (!grid[r]?.[c]) continue;
+        if ((r === sr && c === sc) || findPath(sr, sc, r, c, grid).length > 0) {
           return { x: colToWorld(c), z: rowToWorld(r) };
         }
       }
     }
+  }
+  return null;
+}
+
+/**
+ * 🤖 The cell of `grid` reachable from the cell at `from` (by the same
+ * 8-way, no-corner-cut moves as findPath) whose centre is nearest the WORLD
+ * point (wx,wz), or null when `from` isn't on the grid. One flood fill, so
+ * it answers "as close as I can get" even when the goal sits in a different
+ * floor patch far away — robots use it when furniture covers their goal.
+ */
+export function nearestReachableOnGrid(
+  wx: number,
+  wz: number,
+  from: { x: number; z: number },
+  grid: boolean[][],
+): { x: number; z: number } | null {
+  const sr = worldToRow(from.z);
+  const sc = worldToCol(from.x);
+  if (!grid[sr]?.[sc]) return null;
+  const seen = new Set<number>([sr * GRID_SIZE + sc]);
+  const queue: Array<[number, number]> = [[sr, sc]];
+  let best = { r: sr, c: sc, d: Math.hypot(colToWorld(sc) - wx, rowToWorld(sr) - wz) };
+  for (let i = 0; i < queue.length; i++) {
+    const [r, c] = queue[i];
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        const nr = r + dr;
+        const nc = c + dc;
+        if (!grid[nr]?.[nc]) continue;
+        if (dr !== 0 && dc !== 0 && (!grid[r + dr]?.[c] || !grid[r]?.[c + dc])) continue;
+        const k = nr * GRID_SIZE + nc;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        queue.push([nr, nc]);
+        const d = Math.hypot(colToWorld(nc) - wx, rowToWorld(nr) - wz);
+        if (d < best.d) best = { r: nr, c: nc, d };
+      }
+    }
+  }
+  return { x: colToWorld(best.c), z: rowToWorld(best.r) };
+}
+
+/** 🤖 How far a robot's body reaches from its centre (the ×1.4 waiter). */
+export const ROBOT_RADIUS = 0.35;
+
+/**
+ * 🤖 True when a robot centred at (x,z) touches no furniture, game or wall:
+ * at least ROBOT_RADIUS from every obstacle box and inside the room's walk
+ * box. Robot-clear cells guarantee this at their centres only; swerves and
+ * the serve step-back move off centres, so they check the body itself.
+ */
+export function robotFits(x: number, z: number): boolean {
+  if (!insideRoomWalk(x, z)) return false;
+  for (const b of OBSTACLES) {
+    const dx = Math.max(b.x0 - x, 0, x - b.x1);
+    const dz = Math.max(b.z0 - z, 0, z - b.z1);
+    if (dx * dx + dz * dz < ROBOT_RADIUS * ROBOT_RADIUS) return false;
+  }
+  return true;
+}
+
+/** 🤖 True when (x,z) lies inside any obstacle box (exact geometry, not
+ *  cell centres). */
+export function insideObstacle(x: number, z: number): boolean {
+  for (const b of OBSTACLES) {
+    if (x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1) return true;
+  }
+  return false;
+}
+
+/**
+ * 🤖 Every cell of `grid` reachable from the cell at `from` (same moves as
+ * findPath), as keys `row * GRID_SIZE + col`; empty when `from` isn't on it.
+ */
+export function reachableCells(from: { x: number; z: number }, grid: boolean[][]): Set<number> {
+  const seen = new Set<number>();
+  nearestReachableMatching(from, grid, (r, c) => {
+    seen.add(r * GRID_SIZE + c);
+    return false;
+  });
+  return seen;
+}
+
+/**
+ * 🤖 Nearest cell (by walking distance over `grid`, same moves as findPath)
+ * from the cell at `from` that satisfies `match`, with the route to it, or
+ * null when none is reachable. Robots use it to step off cramped floor onto
+ * clear floor without cutting across a table to get there.
+ */
+export function nearestReachableMatching(
+  from: { x: number; z: number },
+  grid: boolean[][],
+  match: (row: number, col: number) => boolean,
+): { cell: { x: number; z: number }; path: Array<{ x: number; z: number }> } | null {
+  const sr = worldToRow(from.z);
+  const sc = worldToCol(from.x);
+  if (!grid[sr]?.[sc]) return null;
+  const parent = new Map<number, number>([[sr * GRID_SIZE + sc, -1]]);
+  const queue: Array<[number, number]> = [[sr, sc]];
+  for (let i = 0; i < queue.length; i++) {
+    const [r, c] = queue[i];
+    if (match(r, c)) {
+      const path: Array<{ x: number; z: number }> = [];
+      for (let k = r * GRID_SIZE + c; k !== sr * GRID_SIZE + sc; k = parent.get(k)!) {
+        path.unshift({ x: colToWorld(k % GRID_SIZE), z: rowToWorld(Math.floor(k / GRID_SIZE)) });
+      }
+      return { cell: { x: colToWorld(c), z: rowToWorld(r) }, path };
+    }
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        const nr = r + dr;
+        const nc = c + dc;
+        if (!grid[nr]?.[nc]) continue;
+        if (dr !== 0 && dc !== 0 && (!grid[r + dr]?.[c] || !grid[r]?.[c + dc])) continue;
+        const k = nr * GRID_SIZE + nc;
+        if (parent.has(k)) continue;
+        parent.set(k, r * GRID_SIZE + c);
+        queue.push([nr, nc]);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 🤖 Where a robot standing ON furniture (its dock) steps off to: the nearest
+ * walkable cell within `maxRing` whose straight line from (wx,wz) crosses
+ * only walkable floor or the furniture the robot is standing on — never a
+ * neighbouring table. Null when there is no such cell.
+ */
+export function stepOffFurniture(
+  wx: number,
+  wz: number,
+  maxRing: number,
+): { x: number; z: number } | null {
+  const under = OBSTACLES.filter((b) => wx > b.x0 && wx < b.x1 && wz > b.z0 && wz < b.z1);
+  const r0 = worldToRow(wz);
+  const c0 = worldToCol(wx);
+  const candidates: Array<{ x: number; z: number; d: number }> = [];
+  for (let dr = -maxRing; dr <= maxRing; dr++) {
+    for (let dc = -maxRing; dc <= maxRing; dc++) {
+      if (!walkable[r0 + dr]?.[c0 + dc]) continue;
+      const x = colToWorld(c0 + dc);
+      const z = rowToWorld(r0 + dr);
+      candidates.push({ x, z, d: Math.hypot(x - wx, z - wz) });
+    }
+  }
+  candidates.sort((a, b) => a.d - b.d);
+  // Cells are judged by their centre, so a walkable cell can still hold the
+  // corner of a neighbouring table: check the furniture itself too.
+  const inside = (b: { x0: number; x1: number; z0: number; z1: number }, x: number, z: number): boolean =>
+    x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1;
+  const ok = (x: number, z: number): boolean =>
+    under.some((b) => inside(b, x, z)) ||
+    (walkable[worldToRow(z)]?.[worldToCol(x)] === true && !OBSTACLES.some((b) => inside(b, x, z)));
+  for (const c of candidates) {
+    const n = Math.max(1, Math.ceil(c.d / 0.1));
+    let free = true;
+    for (let i = 1; i <= n && free; i++) {
+      free = ok(wx + ((c.x - wx) * i) / n, wz + ((c.z - wz) * i) / n);
+    }
+    if (free) return { x: c.x, z: c.z };
   }
   return null;
 }
@@ -190,11 +380,13 @@ function octile(dr: number, dc: number): number {
  * Run A* from (startRow, startCol) to (goalRow, goalCol).
  * Returns an ordered array of world-space waypoints [{ x, z }, …] from the
  * first step after the start position up to and including the goal, or an
- * empty array when no path exists.
+ * empty array when no path exists. `grid` is the walk grid to plan on
+ * (robots pass `robotClear`).
  */
 export function findPath(
   startRow: number, startCol: number,
   goalRow:  number, goalCol:  number,
+  grid: boolean[][] = walkable,
 ): Array<{ x: number; z: number }> {
   // Clamp goal to grid bounds
   goalRow  = Math.max(0, Math.min(GRID_SIZE - 1, goalRow));
@@ -202,7 +394,7 @@ export function findPath(
   startRow = Math.max(0, Math.min(GRID_SIZE - 1, startRow));
   startCol = Math.max(0, Math.min(GRID_SIZE - 1, startCol));
 
-  if (!walkable[goalRow][goalCol]) return [];
+  if (!grid[goalRow][goalCol]) return [];
   if (startRow === goalRow && startCol === goalCol) return [];
 
   const key = (r: number, c: number) => r * GRID_SIZE + c;
@@ -253,13 +445,13 @@ export function findPath(
       const nr = current.row + dr;
       const nc = current.col + dc;
       if (nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE) continue;
-      if (!walkable[nr][nc]) continue;
+      if (!grid[nr][nc]) continue;
 
       // For diagonal moves, require both cardinal neighbours to be walkable
       // (prevents cutting through obstacle corners)
       if (dr !== 0 && dc !== 0) {
-        if (!walkable[current.row + dr][current.col] ||
-            !walkable[current.row][current.col + dc]) continue;
+        if (!grid[current.row + dr][current.col] ||
+            !grid[current.row][current.col + dc]) continue;
       }
 
       const nk = key(nr, nc);
