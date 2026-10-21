@@ -253,6 +253,48 @@ describe('robot still reaches posts beside tables', () => {
     expect(r.closest).toBeGreaterThan(0);
   });
 
+  it('steps off its dock off-centre without clipping a neighbouring table corner', () => {
+    // From (0.49, 0.49) the nearest off-step is (0.25, 0.75); the straight
+    // line there passes (0.43, 0.555), inside the second table even though
+    // that cell's centre is open floor.
+    const own = craps(0, 0, 0);
+    loadRoom([own, { ...craps(0.76, 2, 1), id: 'test-craps-2' }]);
+    const ownBox = OBSTACLES.filter((b) => 0.49 > b.x0 && 0.49 < b.x1 && 0.49 > b.z0 && 0.49 < b.z1);
+    const inOwn = (x: number, z: number): boolean =>
+      ownBox.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
+    const bot = new PoolWaiter(new THREE.Scene(), [[-3, 3], [-3, -3]], { x: 0.49, z: 0.49 });
+    let crossedNeighbour = false;
+    for (let t = 0; t < 20; t += 1 / 30) {
+      bot.update(1 / 30, null);
+      const p = bot.getPosition();
+      if (!inOwn(p.x, p.z) && clearance(p.x, p.z) < 0) crossedNeighbour = true;
+    }
+    expect(crossedNeighbour).toBe(false);
+  });
+
+  it('leaves an off-centre spot without clipping the table corner beside it', () => {
+    // From (-0.01, -0.11) the first grid waypoint is (-0.75, 0.25): the
+    // straight line there cuts the corner of the table at (1.4, 0.4)…
+    // unless the robot first steps to its own cell's centre.
+    loadRoom([craps(1.4, 0.4, 0), { ...craps(0, -1, 0), id: 'test-craps-2' }]);
+    expect(clearance(-0.01, -0.11)).toBeGreaterThan(0);
+    const bot = new PoolWaiter(new THREE.Scene(), [[-3, 3], [-3, -3]], { x: -0.01, z: -0.11 });
+    const r = walk(bot, 20);
+    expect(r.travelled).toBeGreaterThan(1);
+    expect(r.closest).toBeGreaterThan(0);
+  });
+
+  it('does not walk a straight line to a scripted goto outside the room', () => {
+    // (32.25, 0.25) is off the grid; its flattened cell key used to alias a
+    // real cell, so the robot walked straight at it through the table.
+    loadRoom([craps(3, 0.25, 1)]);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: 0.25 });
+    bot.setRoutine('custom');
+    bot.setScript([{ kind: 'goto', x: 32.25, z: 0.25 }]);
+    const r = walk(bot, 30);
+    expect(r.closest).toBeGreaterThan(0);
+  });
+
   it('walks back onto its charging dock', () => {
     loadRoom(CASINO_FURNITURE);
     const dock = CASINO_FURNITURE.find((i) => i.kind === 'charging-dock')!;

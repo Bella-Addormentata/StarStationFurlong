@@ -1494,9 +1494,13 @@ export class PoolWaiter {
     // straight line on to the following point is clear floor, so the robot
     // heads round them instead of over them without cutting a furniture
     // corner. Otherwise the point stays and steerStep swerves or waits.
+    // A point near enough counts as reached only when the line on from here
+    // misses every table corner; otherwise walk right onto it first.
+    const onwardClear = (): boolean =>
+      segmentFree(pos, this.path[1] ?? end, (x, z) => !insideObstacle(x, z));
     while (
       this.path.length > 0 &&
-      (dist < CELL_SIZE * 0.5 ||
+      ((dist < CELL_SIZE * 0.5 && (dist < 0.02 || onwardClear())) ||
         (occupied(target, this.avatars) &&
           segmentFree(pos, this.path[1] ?? end, PoolWaiter.isFree)))
     ) {
@@ -1603,7 +1607,9 @@ export class PoolWaiter {
         : findPath(worldToRow(from.z), worldToCol(from.x), worldToRow(to.z), worldToCol(to.x), robotClear);
     const goalCell = { x: colToWorld(worldToCol(tx)), z: rowToWorld(worldToRow(tz)) };
     const clearReach = reachableCells(at, robotClear);
-    if (clearReach.has(cellKey(goal))) {
+    // A goal off the grid (a script goto outside the room) must not alias
+    // another cell through its flattened key.
+    if (robotClear[worldToRow(tz)]?.[worldToCol(tx)] === true && clearReach.has(cellKey(goal))) {
       path.push(...clearLeg(at, goalCell));
       at = goalCell;
     } else {
@@ -1650,6 +1656,16 @@ export class PoolWaiter {
         path.push(...clearLeg(at, near));
         at = near;
       }
+    }
+    // The robot leaves from its exact spot, not its cell's centre: when the
+    // straight line to the first waypoint would clip a table corner, walk to
+    // the centre of the cell it stands in first.
+    const first = path[0] ?? at;
+    if (
+      walkable[worldToRow(pos.z)]?.[worldToCol(pos.x)] === true &&
+      !segmentFree(pos, first, (x, z) => !insideObstacle(x, z))
+    ) {
+      path.unshift({ x: colToWorld(worldToCol(pos.x)), z: rowToWorld(worldToRow(pos.z)) });
     }
     this.path = path;
     // The last hop onto a post or dock crosses walkable floor only (a dock

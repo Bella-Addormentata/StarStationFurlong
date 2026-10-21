@@ -339,9 +339,13 @@ export function stepOffFurniture(
     }
   }
   candidates.sort((a, b) => a.d - b.d);
+  // Cells are judged by their centre, so a walkable cell can still hold the
+  // corner of a neighbouring table: check the furniture itself too.
+  const inside = (b: { x0: number; x1: number; z0: number; z1: number }, x: number, z: number): boolean =>
+    x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1;
   const ok = (x: number, z: number): boolean =>
-    walkable[worldToRow(z)]?.[worldToCol(x)] === true ||
-    under.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
+    under.some((b) => inside(b, x, z)) ||
+    (walkable[worldToRow(z)]?.[worldToCol(x)] === true && !OBSTACLES.some((b) => inside(b, x, z)));
   for (const c of candidates) {
     const n = Math.max(1, Math.ceil(c.d / 0.1));
     let free = true;
