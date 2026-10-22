@@ -406,13 +406,15 @@ export function agoText(at: number, now: number): string {
 }
 
 /** Where a library row's file would play from, for this holder now. */
-type Whereabouts = 'mine' | 'theirs' | 'away' | 'unknown';
+type Whereabouts = 'mine' | 'lost' | 'theirs' | 'away' | 'unknown';
 function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (e.source.kind !== 'blob') return 'unknown';
-  if (nodeHolds(e.source.hash)) return 'mine';
-  if (e.source.provider === blobLaneNodeId()) return 'away'; // named this node, which no longer holds it
+  // Nothing is said before the node has answered (no node, or not yet).
   const reach = nodeReaches(e.source.provider);
-  return reach === null ? 'unknown' : reach ? 'theirs' : 'away';
+  if (reach === null) return 'unknown';
+  if (nodeHolds(e.source.hash)) return 'mine';
+  if (e.source.provider === blobLaneNodeId()) return 'lost'; // names this node, which no longer holds it (a restart empties it)
+  return reach ? 'theirs' : 'away';
 }
 
 /** The title a file's name gives the record: the name without its
@@ -754,7 +756,7 @@ function torrentBlock(): string {
     const chosen = torrentPick?.id === st.id && st.files.some((f) => f.index === torrentPick!.index) ? torrentPick.index : st.pick;
     const pick = st.files.find((f) => f.index === chosen);
     const rows = st.files.map((f) => `<label style="display:flex; gap:6px; align-items:center; font-size:9.5px; color:${f.fits ? GOLD_BRIGHT : DIM}; cursor:pointer;">
-        <input type="radio" name="tv-torrent-pick" data-tv-torrent-pick="${f.index}" ${f.index === chosen ? 'checked' : ''}>
+        <input type="radio" name="tv-torrent-pick" data-tv-torrent-pick="${f.index}" ${f.index === chosen ? 'checked' : ''} style="width:auto; flex:none; margin:0; padding:0;">
         <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(f.name)}">${esc(f.name)}</span>
         <span style="white-space:nowrap;">${esc(formatBytes(f.size))}${f.fits ? '' : ' · TOO BIG FOR YOUR NODE'}</span>
       </label>`).join('');
@@ -805,6 +807,7 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     const whereText = where === 'mine' ? `<span style="color:${GREEN};">ON YOUR NODE</span>`
       : where === 'theirs' ? `<span style="color:${CYAN};">ITS NODE IS HERE</span>`
       : where === 'away' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'AWAY — GET IT AGAIN' : 'ITS NODE IS AWAY'}</span>`
+      : where === 'lost' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'GONE FROM YOUR NODE — GET IT AGAIN' : 'GONE FROM YOUR NODE — CHOOSE IT AGAIN ON 📁 FILE'}</span>`
       : '';
     const again = e.torrent && canAgain && where !== 'mine'
       ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
@@ -1157,8 +1160,8 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback(r.error);
       return;
     }
-    feedback(where === 'away'
-      ? `Now on: ${entry.title}. The node that shared it is not connected to yours: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
+    feedback(where === 'away' || where === 'lost'
+      ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'The node that shared it is not connected to yours'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
       : `Now on: ${entry.title}`);
     deps.openTheatre(id);
   }));

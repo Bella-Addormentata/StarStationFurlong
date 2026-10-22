@@ -152,6 +152,8 @@ export function importBlob(
         resolve({ error: 'Your node restarted while taking the file — choose it again.' });
       } else if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
         statuses.set(body.hash, { state: 'complete', have: file.size, size: file.size });
+        // Held for this room now: the library says so before its next ask.
+        if (heldHere && heldHere.gen === gen && heldHere.room === room) heldHere.held.add(body.hash);
         resolve({ hash: body.hash, size: file.size });
       } else {
         resolve({ error: typeof body.error === 'string' && body.error ? `Your node: ${body.error}.` : 'Your node did not take the file.' });
@@ -211,7 +213,6 @@ export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
 
 /** This page's node holds `hash` whole for this room (as it last said). */
 export function nodeHolds(hash: string): boolean {
-  if (statuses.get(hash)?.state === 'complete') return true;
   return !!heldHere && heldHere.gen === generation && heldHere.room === room && heldHere.held.has(hash);
 }
 
