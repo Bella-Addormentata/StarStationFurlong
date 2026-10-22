@@ -8,7 +8,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ARCADE_WIRE_NATIVE, packArcadeTick, unpackArcadeTick } from './arcadeNet';
+import { ARCADE_WIRE_NATIVE, packArcadeTick, pipe, unpackArcadeTick } from './arcadeNet';
 import type { ArcadeLink } from './arcadeNesSession';
 import type { LrState } from './games/lanternRoad';
 
@@ -370,6 +370,38 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     a.closed = true;
     await run(13000);
     expect(c.mod.nativeSeatStatus(ITEM)).toEqual(['free', 'free', 'free', 'free']);
+  });
+
+  it('shrugs off a save state that is not one, and takes the next', async () => {
+    const [a] = await room('a');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    const pads = padScript(5);
+    await run(1000, () => host.setButtons(pads()));
+    // The host hears no one asking: only a broken save is in the doc.
+    lose = (_from, to, bytes) => to === a && unpackArcadeTick(bytes, ARCADE_WIRE_NATIVE)?.type === 'sync';
+    const late = await openPage('late');
+    await run(300, () => host.setButtons(pads()));
+    expect(late.mod.nativeArcadeCopyInfo(ITEM)?.started).toBe(false);
+    const m = a.games.readNativeArcade(ITEM)!;
+    const next = (a.mod.nativeArcadeCopyInfo(ITEM)!.next - 2) & 0xffff;
+    const data = await pipe(new TextEncoder().encode('{ not a save'), new CompressionStream('deflate'));
+    a.games.writeNativeSnapshot(ITEM, { kind: 'arcade-native-snapshot', id: m.id, next, data });
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown) => void rejections.push(err);
+    process.on('unhandledRejection', onRejection);
+    try {
+      await run(300, () => host.setButtons(pads()));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+    expect(rejections).toEqual([]);
+    expect(late.mod.nativeArcadeCopyInfo(ITEM)?.started).toBe(false);
+    // The host hears the asks again: a real save, and the late page plays.
+    lose = () => false;
+    await run(3000, () => host.setButtons(pads()));
+    expect(late.mod.nativeArcadeCopyInfo(ITEM)?.started).toBe(true);
   });
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {

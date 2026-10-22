@@ -589,7 +589,12 @@ function tryRestore(itemId: string, copy: Copy): void {
   pipe(snap.data, new DecompressionStream('deflate'), MAX_STATE_JSON_BYTES).then(
     (json) => {
       copy.restoring = false;
-      const state = copy.game.restore(JSON.parse(new TextDecoder().decode(json)));
+      let state: unknown;
+      try {
+        state = copy.game.restore(JSON.parse(new TextDecoder().decode(json)));
+      } catch {
+        state = null;
+      }
       if (state === null) return; // not a save state: wait for the next
       copy.state = state;
       copy.next = snap.next;

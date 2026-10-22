@@ -66,6 +66,8 @@ const SWING_HIT_TO = 11;
 const SWING_COOL = 6;
 const STAFF_REACH = 18 * SUB;
 export const MAX_HP = 3;
+/** A beaten enemy's puff of smoke. */
+export const DYING_FRAMES = 24;
 const HURT_FRAMES = 90;
 const REEL_FRAMES = 20;
 const KO_FRAMES = 180;
@@ -752,7 +754,7 @@ function hitEnemies(s: LrState): void {
         e.ground = false;
       }
       if (e.hp <= 0) {
-        e.dying = 24;
+        e.dying = DYING_FRAMES;
         p.score += box.points;
         addPop(s, e.x + (box.w >> 1), e.y, box.points, seat);
       }
@@ -900,7 +902,7 @@ function isEnemy(v: unknown): v is LrEnemy {
   if (!isObj(v)) return false;
   return (v.kind === 'oni' || v.kind === 'lantern' || v.kind === 'kasa')
     && isInt(v.x) && isInt(v.y) && isInt(v.vx) && isInt(v.vy) && isFace(v.face) && isBool(v.ground)
-    && isInt(v.hp, -8, 8) && isInt(v.stun, 0, 0xff) && isInt(v.dying, 0, 0xff) && isBool(v.gone)
+    && isInt(v.hp, -8, 8) && isInt(v.stun, 0, 0xff) && isInt(v.dying, 0, DYING_FRAMES) && isBool(v.gone)
     && isInt(v.t, 0, 0xffff) && isInt(v.homeY);
 }
 

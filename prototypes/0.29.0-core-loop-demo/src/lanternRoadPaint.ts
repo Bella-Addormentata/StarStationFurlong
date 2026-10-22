@@ -16,8 +16,8 @@
  */
 
 import {
-  LR_COLS, LR_GATE_COL, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_SEATS, LR_TILE, LR_VIEW_H, LR_VIEW_W, MAX_HP,
-  SUB, SWING_FRAMES, enemyBox, isLedge, isSolid, type LrEnemy, type LrPlayer, type LrState,
+  DYING_FRAMES, LR_COLS, LR_GATE_COL, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_SEATS, LR_TILE, LR_VIEW_H,
+  LR_VIEW_W, MAX_HP, SUB, SWING_FRAMES, enemyBox, isLedge, isSolid, type LrEnemy, type LrPlayer, type LrState,
 } from './games/lanternRoad';
 
 /** The screen canvas the picture is drawn for (2× the game). */
@@ -650,8 +650,8 @@ function drawEnemy(ctx: CanvasRenderingContext2D, e: LrEnemy, s: LrState, cam: n
   if (bx < -32 || bx > LR_VIEW_W + 32) return;
   if (e.dying > 0) {
     // A puff of smoke.
-    const k = 24 - e.dying;
-    ctx.fillStyle = `rgba(240,230,255,${(e.dying / 24) * 0.8})`;
+    const k = DYING_FRAMES - e.dying;
+    ctx.fillStyle = `rgba(240,230,255,${(e.dying / DYING_FRAMES) * 0.8})`;
     for (let i = 0; i < 5; i++) {
       const a = (i * Math.PI * 2) / 5;
       ctx.beginPath();

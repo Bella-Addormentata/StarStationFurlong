@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  CLEAR_FRAMES, LR_COLS, LR_GATE_COL, LR_LEVEL_W, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_TILE, LR_VIEW_W, MAX_HP,
-  PAD_A, PAD_B, PAD_DOWN, PAD_LEFT, PAD_PRESENT, PAD_RIGHT, SUB, checkLanternRoad, createLanternRoad, isLedge, isSolid,
-  isUp, restoreLanternRoad, safeSpot, staffBox, stepLanternRoad, type LrState,
+  CLEAR_FRAMES, DYING_FRAMES, LR_COLS, LR_GATE_COL, LR_LEVEL_W, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_TILE,
+  LR_VIEW_W, MAX_HP, PAD_A, PAD_B, PAD_DOWN, PAD_LEFT, PAD_PRESENT, PAD_RIGHT, SUB, checkLanternRoad, createLanternRoad,
+  isLedge, isSolid, isUp, restoreLanternRoad, safeSpot, staffBox, stepLanternRoad, type LrState,
 } from './lanternRoad';
 
 const run = (s: LrState, frames: number, pads: (f: number) => readonly number[]) => {
@@ -288,5 +288,9 @@ describe('save states from a peer', () => {
     expect(bad((s) => { s.items = new Array(1000).fill((s.items as unknown[])[0]); })).toBeNull();
     expect(bad((s) => { s.cam = -5; })).toBeNull();
     expect(bad((s) => { s.phase = 'boss'; })).toBeNull();
+    // Past the puff of smoke's last frame: the painter would draw a
+    // negative radius.
+    expect(bad((s) => { (s.enemies as Array<Record<string, unknown>>)[0]!.dying = 255; })).toBeNull();
+    expect(bad((s) => { (s.enemies as Array<Record<string, unknown>>)[0]!.dying = DYING_FRAMES; })).not.toBeNull();
   });
 });
