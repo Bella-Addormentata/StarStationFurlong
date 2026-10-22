@@ -8,6 +8,9 @@
  *   remote:<itemId> → RemoteRecord the remote control's holder (a lease)
  *   volume:<itemId> → { volume }   the set's volume, a body button
  *   power:<itemId>  → { on, seq }  the set's switch, a body button
+ * and one room-wide key per thing the room has watched (the 📚 LIBRARY):
+ *   lib:<sourceId>  → TvLibraryEntry  what it was, when it last played,
+ *                                     and (a torrent's file) how to get it again
  * They are SEPARATE keys so renewing the remote's lease never collides with
  * a playback write (the `giftwish:` precedent in partyDoc.ts), and so a
  * viewer turning the sound down while the holder seeks can never carry a
@@ -65,6 +68,10 @@ export const TV_NUDGE_OVER_MS = 250;
 /** The playback-rate nudge (±3 %) for players that can change rate finely. */
 export const TV_NUDGE_RATE = 0.03;
 export const TV_HISTORY_MAX = 20;
+/** The room's library: the most entries it keeps (the oldest go first). */
+export const TV_LIBRARY_MAX = 200;
+/** The most `lib:` keys one read looks at: the map is peer-writable. */
+const LIBRARY_SCAN_MAX = 2_000;
 export const TV_MAX_TITLE = 80;
 export const TV_MAX_URL = 2048;
 export const TV_MAX_NAME = 32;
@@ -94,6 +101,27 @@ export interface TvHistoryEntry {
   source: TvSource;
   title: string;
   playedAt: number;
+}
+
+/** 🧲 Where a torrent's file came from: the torrent's v1 info hash and the
+ *  file's number in it. All GET AGAIN needs: the holder's own node fetches
+ *  the torrent's file list again and shows it before any download. */
+export interface TvTorrentOrigin {
+  ih: string;
+  file: number;
+}
+
+/** One `lib:` key: a thing the room has watched, kept after everyone who
+ *  watched it has left (the room doc is kept by the nodes that serve it). */
+export interface TvLibraryEntry {
+  source: TvSource;
+  title: string;
+  /** Wall ms: first played (or scheduled) here, and most recently. */
+  addedAt: number;
+  playedAt: number;
+  plays: number;
+  /** A blob that came from a torrent: how to download it again. */
+  torrent?: TvTorrentOrigin;
 }
 
 /** The `tv:` key: what is on and where the playback is. The set's volume is
@@ -489,7 +517,14 @@ export function bindTvDoc(doc: Y.Doc): void {
   lastGapAt = -Infinity;
   gapBridges.length = 0;
   awakeWallAt = NaN;
+  libraryCache = null;
   tvMap.observe((event) => {
+    for (const key of event.keysChanged) {
+      if (key.startsWith('lib:')) {
+        libraryCache = null;
+        break;
+      }
+    }
     noteSamples(event.keysChanged, event.transaction.local);
     notify(event.keysChanged);
   });
@@ -533,10 +568,11 @@ export function subscribeTvKey(key: string, listener: () => void): () => void {
   };
 }
 
-function write(key: string, value: unknown): void {
+function write(key: string, value: unknown, alsoInside?: () => void): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(key, value);
+    alsoInside?.();
   });
 }
 
@@ -878,8 +914,9 @@ function withHistory(rec: TvProgramme, source: TvSource, now: number): TvHistory
   return [{ source, title: titleOf(source), playedAt: now }, ...rest].slice(0, TV_HISTORY_MAX);
 }
 
-/** Play `source` now, from the top. `now` is wall time: the history stamp. */
-export function tvPlay(itemId: string, source: TvSource, now = wallClock()): TvAction {
+/** Play `source` now, from the top. `now` is wall time: the history stamp.
+ *  `torrent` is where a blob came from (torrentLane.ts), for the library. */
+export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torrent?: TvTorrentOrigin): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
@@ -897,13 +934,13 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock()): TvA
     jump: bump(rec.jump),
     endMs: 0, // a new programme: its player says where it ends
     history: withHistory(rec, clean, now),
-  } satisfies TvProgramme);
+  } satisfies TvProgramme, () => noteInLibrary(clean, now, torrent));
   return { ok: true };
 }
 
 /** Schedule `source` for a UTC start — the countdown everyone sees. `now`
  *  is wall time, as `startAt` is. */
-export function tvSchedule(itemId: string, source: TvSource, startAt: number, now = wallClock()): TvAction {
+export function tvSchedule(itemId: string, source: TvSource, startAt: number, now = wallClock(), torrent?: TvTorrentOrigin): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
@@ -922,8 +959,99 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     jump: bump(rec.jump),
     endMs: 0,
     history: withHistory(rec, clean, now),
-  } satisfies TvProgramme);
+  } satisfies TvProgramme, () => noteInLibrary(clean, now, torrent));
   return { ok: true };
+}
+
+// ── 📚 The library (room-wide) ───────────────────────────────────────────────
+// Every PLAY NOW and schedule notes its source under `lib:<sourceId>`, one
+// key each, so two holders noting two films at once never write over each
+// other, and a replay moves its own entry to the top. The record is
+// peer-writable like the rest: a read takes at most LIBRARY_SCAN_MAX keys,
+// keeps only entries whose key is their own source's, and the newest
+// TV_LIBRARY_MAX of those; a write drops what is past that, oldest first.
+
+export function libraryKey(source: TvSource): string {
+  return `lib:${sourceId(source)}`;
+}
+
+const IH_RE = /^[0-9a-f]{40}$/;
+/** The most files a torrent's number may count (the node lists 200 playable
+ *  ones, of any number of files). */
+const TORRENT_FILE_MAX = 1_000_000;
+
+export function sanitizeTorrentOrigin(raw: unknown): TvTorrentOrigin | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  const ih = typeof r.ih === 'string' ? r.ih.toLowerCase() : '';
+  const file = r.file;
+  if (!IH_RE.test(ih) || !Number.isSafeInteger(file) || (file as number) < 0 || (file as number) > TORRENT_FILE_MAX) return undefined;
+  return { ih, file: file as number };
+}
+
+function readLibraryEntry(key: string, raw: unknown): TvLibraryEntry | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const source = sanitizeSource(r.source);
+  if (!source || libraryKey(source) !== key) return null;
+  const playedAt = Math.max(0, num(r.playedAt));
+  const entry: TvLibraryEntry = {
+    source,
+    title: str(r.title, TV_MAX_TITLE) || titleOf(source),
+    addedAt: Math.min(playedAt, Math.max(0, num(r.addedAt, playedAt))),
+    playedAt,
+    plays: Math.max(1, Math.min(counter(r.plays), 1_000_000)),
+  };
+  const torrent = source.kind === 'blob' ? sanitizeTorrentOrigin(r.torrent) : undefined;
+  if (torrent) entry.torrent = torrent;
+  return entry;
+}
+
+let libraryCache: TvLibraryEntry[] | null = null;
+
+/** The room's library, most recently played first. */
+export function readLibrary(): TvLibraryEntry[] {
+  const map = ensureMap();
+  if (libraryCache) return libraryCache;
+  const out: TvLibraryEntry[] = [];
+  let seen = 0;
+  for (const [key, raw] of map.entries()) {
+    if (!key.startsWith('lib:')) continue;
+    if (++seen > LIBRARY_SCAN_MAX) break;
+    const e = readLibraryEntry(key, raw);
+    if (e) out.push(e);
+  }
+  out.sort((a, b) => b.playedAt - a.playedAt);
+  libraryCache = out.slice(0, TV_LIBRARY_MAX);
+  return libraryCache;
+}
+
+/** Inside a programme write's transaction: note `source` as played now. A
+ *  torrent's origin is kept from the entry before when this play has none
+ *  (a replay from the library, or a viewer's held copy). */
+function noteInLibrary(source: TvSource, now: number, torrent?: TvTorrentOrigin): void {
+  const map = ensureMap();
+  const key = libraryKey(source);
+  const prev = readLibraryEntry(key, map.get(key));
+  const origin = source.kind === 'blob' ? (sanitizeTorrentOrigin(torrent) ?? prev?.torrent) : undefined;
+  const entry: TvLibraryEntry = {
+    source,
+    title: titleOf(source),
+    addedAt: prev ? Math.min(prev.addedAt, now) : now,
+    playedAt: now,
+    plays: Math.min((prev?.plays ?? 0) + 1, 1_000_000),
+  };
+  if (origin) entry.torrent = origin;
+  map.set(key, entry);
+  // Past the bound, the oldest go (a key no entry reads from first).
+  const keys: Array<{ key: string; at: number }> = [];
+  for (const [k, raw] of map.entries()) {
+    if (!k.startsWith('lib:')) continue;
+    keys.push({ key: k, at: readLibraryEntry(k, raw)?.playedAt ?? -1 });
+  }
+  if (keys.length <= TV_LIBRARY_MAX) return;
+  keys.sort((a, b) => b.at - a.at);
+  for (const { key: k } of keys.slice(TV_LIBRARY_MAX)) map.delete(k);
 }
 
 /** The holder's heartbeat while playing, and the T0 flip from scheduled. */
@@ -1378,7 +1506,12 @@ export interface TvScreenView {
   /** 0–1 progress when known (a duration is a player fact, so usually 0). */
   lane: TvLane | '';
   clockText: string;
+  /** The home screen's RECENTLY ON shelf: the library's newest titles. */
+  recent?: string[];
 }
+
+/** How many library titles the home screen shows. */
+export const TV_HOME_RECENT = 4;
 
 /** Derive what the in-world screen shows from the records alone, so every
  *  client's prop agrees and the drawing code has nothing to decide. */
@@ -1390,7 +1523,8 @@ export function tvScreenView(itemId: string, now = clock()): TvScreenView {
     : 'REMOTE ON THE SET';
   if (rec.state === 'off') return { state: 'off', title: '', detail: '', lane: '', clockText: '' };
   if (rec.state === 'home' || !rec.source) {
-    return { state: 'home', title: 'FURLONG TV', detail: holderLine, lane: '', clockText: '' };
+    const recent = readLibrary().slice(0, TV_HOME_RECENT).map((e) => e.title);
+    return { state: 'home', title: 'FURLONG TV', detail: holderLine, lane: '', clockText: '', ...(recent.length ? { recent } : {}) };
   }
   const label = sourceLabel(rec.source).toUpperCase();
   const lane = sourceLane(rec.source);

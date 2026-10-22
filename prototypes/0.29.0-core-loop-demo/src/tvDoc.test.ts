@@ -13,7 +13,7 @@ import {
   setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, sourceLane, subscribeTvKey, tvHeartbeat,
   tvKey, tvNoteEnd, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
   tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
-  TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey,
+  TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey, libraryKey, readLibrary, TV_HOME_RECENT, TV_LIBRARY_MAX,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 
@@ -1075,5 +1075,82 @@ describe('`started` is a counter of its own', () => {
     doc.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), seq: 1, started: 40 });
     tvPlay(TV, FILM);
     expect(readTv(TV).started).toBe(41);
+  });
+});
+
+describe('📚 the room\'s library', () => {
+  const IH = '08ada5a7a6183aae1e09d831df6748d566095a10';
+  const BLOB: TvSource = { kind: 'blob', hash: 'b'.repeat(64), size: 129_000_000, provider: 'c'.repeat(64), mime: 'video/mp4', title: 'Sintel' };
+  beforeEach(() => { pickUpRemote(TV); });
+
+  it('notes every play and schedule under a key of its own, newest first', () => {
+    tvPlay(TV, FILM, now);
+    tick(1_000);
+    tvSchedule(TV, CLIP, now + 60_000, now);
+    expect(readLibrary().map((e) => e.title)).toEqual(['example.org · clip.mp4', 'Metropolis']);
+    expect(doc.getMap('tv').get(libraryKey(FILM))).toBeTruthy();
+    tick(1_000);
+    tvPlay(TV, FILM, now);
+    const [top] = readLibrary();
+    expect(top).toMatchObject({ title: 'Metropolis', plays: 2, addedAt: 1_000_000, playedAt: now });
+  });
+
+  it('is the room\'s, shared by every set in it', () => {
+    tvPlay(TV, FILM, now);
+    pickUpRemote('smart-tv-2');
+    tick(5);
+    tvPlay('smart-tv-2', CLIP, now);
+    expect(readLibrary()).toHaveLength(2);
+  });
+
+  it('remembers how a torrent\'s file is got again, and keeps it through a replay', () => {
+    tvPlay(TV, BLOB, now, { ih: IH, file: 3 });
+    expect(readLibrary()[0]!.torrent).toEqual({ ih: IH, file: 3 });
+    // The programme itself names only the blob.
+    expect(JSON.stringify(readTv(TV))).not.toContain(IH);
+    tick(10);
+    tvPlay(TV, { ...BLOB, provider: 'd'.repeat(64) }, now);
+    expect(readLibrary()[0]).toMatchObject({ plays: 2, torrent: { ih: IH, file: 3 }, source: { provider: 'd'.repeat(64) } });
+    // Only a blob carries one, and only a well-formed one.
+    tvPlay(TV, FILM, now, { ih: IH, file: 1 });
+    expect(readLibrary().find((e) => e.source.kind === 'youtube')!.torrent).toBeUndefined();
+    tvPlay(TV, { ...BLOB, hash: 'e'.repeat(64) }, now, { ih: 'nope', file: 1 } as never);
+    expect(readLibrary().find((e) => e.source.kind === 'blob' && e.source.hash === 'e'.repeat(64))!.torrent).toBeUndefined();
+  });
+
+  it('keeps the newest TV_LIBRARY_MAX, dropping the oldest on a write', () => {
+    for (let i = 0; i < TV_LIBRARY_MAX + 3; i++) {
+      tick(1);
+      tvPlay(TV, { kind: 'url', url: `https://example.org/${i}.mp4` }, now);
+    }
+    const lib = readLibrary();
+    expect(lib).toHaveLength(TV_LIBRARY_MAX);
+    expect(lib[0]!.source).toEqual({ kind: 'url', url: `https://example.org/${TV_LIBRARY_MAX + 2}.mp4` });
+    expect([...doc.getMap('tv').keys()].filter((k) => k.startsWith('lib:'))).toHaveLength(TV_LIBRARY_MAX);
+  });
+
+  it('reads a peer\'s entries with care', () => {
+    const map = doc.getMap('tv');
+    map.set('lib:url:https://example.org/a.mp4', { source: { kind: 'url', url: 'javascript:1' }, title: 'x', playedAt: 5 });
+    // An entry under another source's key is not that source's.
+    map.set('lib:youtube:aaaaaaaaaaa', { source: FILM, title: 'forged', playedAt: 9 });
+    map.set(libraryKey(CLIP), { source: CLIP, title: 'y'.repeat(500), playedAt: 'soon', plays: -4, torrent: { ih: IH, file: 1 } });
+    map.set(libraryKey(BLOB), { source: BLOB, playedAt: 7, addedAt: 99, torrent: { ih: IH.toUpperCase(), file: 2 } });
+    const lib = readLibrary();
+    expect(lib.map((e) => e.source.kind)).toEqual(['blob', 'url']);
+    expect(lib[0]).toMatchObject({ title: 'Sintel', addedAt: 7, plays: 1, torrent: { ih: IH, file: 2 } });
+    expect(lib[1]!.title).toHaveLength(80);
+    expect(lib[1]!.torrent).toBeUndefined();
+  });
+
+  it('puts its newest titles on the home screen', () => {
+    expect(tvScreenView(TV).recent).toBeUndefined();
+    for (const [i, t] of ['A', 'B', 'C', 'D', 'E'].entries()) {
+      tick(1);
+      tvPlay(TV, { kind: 'url', url: `https://example.org/${i}.mp4`, title: t }, now);
+    }
+    tvStop(TV);
+    expect(tvScreenView(TV)).toMatchObject({ state: 'home', recent: ['E', 'D', 'C', 'B'] });
+    expect(TV_HOME_RECENT).toBe(4);
   });
 });

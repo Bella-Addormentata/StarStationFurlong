@@ -15,19 +15,22 @@
 import type { DeviceUI } from './devices';
 import {
   formatClock, handRemote, holdsSpareRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
-  putDownRemote, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource, TV_MAX_TITLE,
+  putDownRemote, readLibrary, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource, sourceId, TV_MAX_TITLE,
   sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
   tvResume, tvRevision, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, powerKey, volumeKey,
 } from './tvDoc';
-import type { TvSource } from './tvDoc';
+import type { TvHistoryEntry, TvLibraryEntry, TvSource, TvTorrentOrigin } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
 import { tvPlayerCanSeek, tvPlayerPositionMs } from './tvSession';
 import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
-import { blobLaneNodeId, blobLaneReady, formatBytes, importBlob, torrentLaneReady } from './blobLane';
-import { refreshTorrentState, startTorrent, stopTorrent, torrentLine, torrentSource, torrentState } from './torrentLane';
+import { blobLaneNodeId, blobLaneReady, formatBytes, importBlob, nodeHolds, nodeReaches, refreshHeldBlobs, torrentLaneReady } from './blobLane';
+import {
+  confirmTorrent, MAX_TORRENT_FILE, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile, stopTorrent,
+  torrentLine, torrentOrigin, torrentRunning, torrentSource, torrentState,
+} from './torrentLane';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -327,7 +330,7 @@ const TILES: Tile[] = [
   { key: 'archive', icon: '🏛️', label: 'ARCHIVE.ORG', lane: 'CONVENIENCE', hint: 'paste a details/ or download/ link — public-domain films', live: true },
   { key: 'url', icon: '🔗', label: 'URL', lane: 'CONVENIENCE', hint: 'paste a direct link to an mp4 / webm', live: true },
   { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'a video or audio file from this computer — your node hands it to the room, and each viewer presses FETCH (mp4 / webm play best)', live: true },
-  { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'paste a magnet — your node downloads its video from the public swarm, then hands it to the room like a FILE (viewers never join the swarm)', live: true },
+  { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'paste a magnet or choose a .torrent file — your node shows what is in it, downloads the video you pick from the public swarm, then hands it to the room like a FILE (viewers never join the swarm)', live: true },
   { key: 'karaoke', icon: '🎤', label: 'KARAOKE', lane: 'SOVEREIGN', hint: 'MP3+G, with the mic on the audio lane', live: false },
 ];
 
@@ -352,6 +355,65 @@ function visibleTiles(): Tile[] {
 /** 📦 The file the FILE tile has chosen, kept across repaints (a file input
  *  cannot be given its selection back), until a PLAY or SCHEDULE takes it. */
 let pickedFile: File | null = null;
+
+/** 🧲 The .torrent file the TORRENT tile has chosen, kept like pickedFile
+ *  until a START takes it; and the file picked from the node's list. */
+let pickedTorrent: File | null = null;
+let torrentPick: { id: string; index: number } | null = null;
+
+// ── 📚 The library on the remote ─────────────────────────────────────────────
+
+export type LibraryFilter = 'all' | 'files' | 'torrents' | 'links';
+const LIBRARY_FILTERS: Array<{ key: LibraryFilter; label: string }> = [
+  { key: 'all', label: 'ALL' }, { key: 'files', label: '📁 FILES' }, { key: 'torrents', label: '🧲 TORRENTS' }, { key: 'links', label: '🔗 LINKS' },
+];
+/** Rows the library shows before SHOW MORE, and how many more each press. */
+export const LIBRARY_PAGE = 8;
+let libraryFilter: LibraryFilter = 'all';
+let libraryQuery = '';
+let libraryShown = LIBRARY_PAGE;
+
+/** What a library row is: a file from a node, a torrent's file, or a link. */
+export function libraryKind(e: Pick<TvLibraryEntry, 'source' | 'torrent'>): Exclude<LibraryFilter, 'all'> {
+  if (e.source.kind !== 'blob') return 'links';
+  return e.torrent ? 'torrents' : 'files';
+}
+
+/** The library as the remote lists it: the room's entries, joined by this
+ *  set's own PREVIOUSLY ON (a record from before the library, or written by
+ *  a build without it), newest first, then filtered and searched. */
+export function libraryView(entries: TvLibraryEntry[], history: TvHistoryEntry[], filter: LibraryFilter, query: string): TvLibraryEntry[] {
+  const byId = new Map<string, TvLibraryEntry>();
+  for (const e of entries) byId.set(sourceId(e.source), e);
+  for (const h of history) {
+    const id = sourceId(h.source);
+    if (!byId.has(id)) byId.set(id, { source: h.source, title: h.title, addedAt: h.playedAt, playedAt: h.playedAt, plays: 1 });
+  }
+  const q = query.trim().toLowerCase();
+  return [...byId.values()]
+    .filter((e) => filter === 'all' || libraryKind(e) === filter)
+    .filter((e) => !q || e.title.toLowerCase().includes(q) || sourceLabel(e.source).toLowerCase().includes(q))
+    .sort((a, b) => b.playedAt - a.playedAt);
+}
+
+/** "just now", "5 min ago", "3 h ago", "2 d ago" — wall time, a date by nature. */
+export function agoText(at: number, now: number): string {
+  const s = Math.max(0, Math.floor((now - at) / 1000));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86_400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86_400)} d ago`;
+}
+
+/** Where a library row's file would play from, for this holder now. */
+type Whereabouts = 'mine' | 'theirs' | 'away' | 'unknown';
+function whereabouts(e: TvLibraryEntry): Whereabouts {
+  if (e.source.kind !== 'blob') return 'unknown';
+  if (nodeHolds(e.source.hash)) return 'mine';
+  if (e.source.provider === blobLaneNodeId()) return 'away'; // named this node, which no longer holds it
+  const reach = nodeReaches(e.source.provider);
+  return reach === null ? 'unknown' : reach ? 'theirs' : 'away';
+}
 
 /** The title a file's name gives the record: the name without its
  *  extension, in the record's bound. */
@@ -539,6 +601,11 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const draft = pasteBox && pasteBox.value
         ? { value: pasteBox.value, focused: pasteBox === inside, start: pasteBox.selectionStart, end: pasteBox.selectionEnd }
         : null;
+      // The library's search box is drawn from its own state; only where
+      // the caret was needs carrying.
+      const searching = inside instanceof HTMLInputElement && inside.matches('[data-tv-lib-search]')
+        ? { start: inside.selectionStart, end: inside.selectionEnd }
+        : null;
       host.innerHTML = html;
       phoneHtml = html;
       wireTvApp(host, d);
@@ -549,6 +616,9 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
         (again ?? host).focus({ preventScroll: true });
         if (draft?.focused && again === pasteAgain && pasteAgain) {
           try { pasteAgain.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
+        }
+        if (searching && again instanceof HTMLInputElement) {
+          try { again.setSelectionRange(searching.start, searching.end); } catch { /* not selectable */ }
         }
       }
     }
@@ -646,20 +716,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
         ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
       </div>`
     : '';
-  const history = rec.history.length
-    ? `<div class="phone-access-header" style="margin-top:4px;">PREVIOUSLY ON</div>
-       ${rec.history.slice(0, 8).map((h, i) => {
-         // An entry this build would refuse (playRefusal) is marked; its ▶
-         // still answers, with the reason, as the paste box does.
-         const off = playRefusal(h.source);
-         return `<div class="phone-access-room-row">
-         <span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;">${esc(h.title)}</span>
-         ${laneBadge(sourceLane(h.source))}
-         ${off ? `<span style="font-size:7px; color:${DIM}; font-weight:800;" title="${esc(off)}">OFF HERE</span>` : ''}
-         ${smallButton(`data-tv-history="${i}" data-tv-id="${esc(tv.id)}"`, '▶')}
-       </div>`;
-       }).join('')}`
-    : '';
+  const library = libraryBlock(tv.id, rec.history);
   return `${head}
     <div class="phone-access-section">
       <div class="phone-access-header">SOURCES</div>
@@ -676,33 +733,113 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       </div>
       <div id="tv-app-feedback" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;"></div>
       ${transport}
-      ${history}
     </div>
+    ${library}
     <div class="phone-access-section">
       <div class="phone-access-header">HAND THE REMOTE TO…</div>
       ${handToBlock(deps, tv.id)}
     </div>`;
 }
 
-/** 🧲 The TORRENT tile's own controls: the notice, START / STOP, and the
- *  node's progress (kept current by `pollTorrent` without a repaint). */
+/** 🧲 The TORRENT tile's own controls: the notice, a .torrent picker, START
+ *  / STOP, the file list to confirm, and the node's progress (kept current
+ *  by `pollTorrent` without a repaint). */
 function torrentBlock(): string {
   const st = torrentState();
-  const running = st.state === 'metadata' || st.state === 'downloading' || st.state === 'importing';
-  return `<div class="phone-access-note" style="color:${GOLD};">⚠️ BitTorrent shares pieces of the file with other people while it downloads, from this computer's internet address, and stops when the file is whole. Paste only what you may share — openly licensed films like Sintel or Big Buck Bunny.</div>
+  const running = torrentRunning(st);
+  const notice = `<div class="phone-access-note" style="color:${GOLD};">⚠️ BitTorrent shares pieces of the file with other people while it downloads, from this computer's internet address, and stops when the file is whole. Use only what you may share — openly licensed films like Sintel or Big Buck Bunny.</div>`;
+  const status = `<div data-tv-torrent-status="1" style="font-size:9.5px; color:${GOLD_BRIGHT}; min-height:12px; line-height:1.4;">${esc(torrentLine(st, formatBytes))}</div>`;
+  if (st.state === 'ready') {
+    // LOOK BEFORE YOU DOWNLOAD: the torrent's own names and sizes.
+    const chosen = torrentPick?.id === st.id && st.files.some((f) => f.index === torrentPick!.index) ? torrentPick.index : st.pick;
+    const pick = st.files.find((f) => f.index === chosen);
+    const rows = st.files.map((f) => `<label style="display:flex; gap:6px; align-items:center; font-size:9.5px; color:${f.fits ? GOLD_BRIGHT : DIM}; cursor:pointer;">
+        <input type="radio" name="tv-torrent-pick" data-tv-torrent-pick="${f.index}" ${f.index === chosen ? 'checked' : ''}>
+        <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(f.name)}">${esc(f.name)}</span>
+        <span style="white-space:nowrap;">${esc(formatBytes(f.size))}${f.fits ? '' : ' · TOO BIG FOR YOUR NODE'}</span>
+      </label>`).join('');
+    return `${notice}
+      <div class="phone-access-header" style="margin-top:2px;">📋 ${esc(st.name || 'THE TORRENT')} — WHAT IS IN IT</div>
+      <div style="display:flex; flex-direction:column; gap:4px; max-height:150px; overflow-y:auto;">${rows}</div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        ${smallButton('data-tv-torrent-confirm="1"', pick ? `⬇ DOWNLOAD ${esc(formatBytes(pick.size))}` : '⬇ DOWNLOAD', !!pick && pick.fits)}
+        ${smallButton('data-tv-torrent-stop="1"', '✖ CANCEL')}
+      </div>
+      ${status}`;
+  }
+  return `${notice}
+    ${running ? '' : `<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; font-size:9.5px; color:${GOLD};">
+      <span>or a .torrent file:</span>
+      <input type="file" data-tv-torrent-file="1" accept=".torrent,application/x-bittorrent" aria-label="Choose a .torrent file" style="max-width:170px;">
+    </div>
+    ${pickedTorrent ? `<div style="font-size:9.5px; color:${GOLD_BRIGHT};">CHOSEN: ${esc(pickedTorrent.name)} — 🧲 START reads it (its tracker list is dropped)</div>` : ''}`}
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
       ${running ? smallButton('data-tv-torrent-stop="1"', '⏹ STOP DOWNLOAD') : smallButton('data-tv-torrent-start="1"', '🧲 START')}
     </div>
-    <div data-tv-torrent-status="1" style="font-size:9.5px; color:${GOLD_BRIGHT}; min-height:12px; line-height:1.4;">${esc(torrentLine(st, formatBytes))}</div>`;
+    ${status}`;
+}
+
+/** 📚 The room's library: what anyone here has played, kept with the room.
+ *  Each row says where its file is now — on your node, on the node that
+ *  shared it, or away (🧲 GET AGAIN for a torrent's) — and ▶ plays it. */
+function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
+  void refreshHeldBlobs(); // at most every few seconds; the next paint shows it
+  const all = libraryView(readLibrary(), history, 'all', '');
+  if (all.length === 0) {
+    return `<div class="phone-access-section">
+      <div class="phone-access-header">📚 LIBRARY</div>
+      <div class="phone-access-note">Everything played on a TV in this room lands here, and stays with the room after everyone leaves.</div>
+    </div>`;
+  }
+  const rows = libraryView(readLibrary(), history, libraryFilter, libraryQuery);
+  const shown = rows.slice(0, libraryShown);
+  const wall = Date.now();
+  const canAgain = torrentLaneReady();
+  const list = shown.map((e) => {
+    const kind = libraryKind(e);
+    const where = whereabouts(e);
+    const refused = playRefusal(e.source);
+    const id = esc(sourceId(e.source));
+    const icon = kind === 'files' ? '📁' : kind === 'torrents' ? '🧲' : '🔗';
+    const size = e.source.kind === 'blob' ? ` · ${formatBytes(e.source.size)}` : '';
+    const whereText = where === 'mine' ? `<span style="color:${GREEN};">ON YOUR NODE</span>`
+      : where === 'theirs' ? `<span style="color:${CYAN};">ITS NODE IS HERE</span>`
+      : where === 'away' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'AWAY — GET IT AGAIN' : 'ITS NODE IS AWAY'}</span>`
+      : '';
+    const again = e.torrent && canAgain && where !== 'mine'
+      ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
+      : '';
+    return `<div style="display:flex; flex-direction:column; gap:2px; padding:4px 0; border-top:1px solid rgba(212,168,75,0.1);">
+      <div class="phone-access-room-row">
+        <span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" title="${esc(e.title)}">${icon} ${esc(e.title)}</span>
+        ${refused ? `<span style="font-size:7px; color:${DIM}; font-weight:800;" title="${esc(refused)}">OFF HERE</span>` : ''}
+        ${again}
+        ${smallButton(`data-tv-lib-play="${id}" data-tv-id="${esc(tvId)}"`, '▶')}
+      </div>
+      <div style="font-size:8.5px; color:${DIM};">${esc(sourceLane(e.source))}${esc(size)} · ${e.plays > 1 ? `played ${e.plays}× · ` : ''}${esc(agoText(e.playedAt, wall))}${whereText ? ' · ' : ''}${whereText}</div>
+    </div>`;
+  }).join('');
+  const chips = LIBRARY_FILTERS.map((f) => {
+    const on = f.key === libraryFilter;
+    return `<button type="button" data-tv-lib-filter="${f.key}" style="padding:3px 7px; border-radius:10px; font-family:inherit; font-size:8.5px; font-weight:800; cursor:pointer;
+      background:${on ? 'rgba(0,229,255,0.12)' : 'transparent'}; border:1px solid ${on ? CYAN : 'rgba(212,168,75,0.25)'}; color:${on ? CYAN : GOLD};">${f.label}</button>`;
+  }).join('');
+  return `<div class="phone-access-section">
+    <div class="phone-access-header">📚 LIBRARY · ${all.length}</div>
+    <div style="display:flex; gap:4px; flex-wrap:wrap;">${chips}</div>
+    <input type="text" data-tv-lib-search="1" value="${esc(libraryQuery)}" placeholder="find in the library" autocomplete="off" aria-label="Find in the library">
+    ${list || `<div class="phone-access-note">Nothing here matches.</div>`}
+    ${rows.length > shown.length ? smallButton('data-tv-lib-more="1"', `SHOW MORE (${rows.length - shown.length})`) : ''}
+  </div>`;
 }
 
 /** While a TORRENT tile is on screen, ask the node once a second and write
- *  the line in place; repaint only when START/STOP should swap. Stops
+ *  the line in place; repaint when the torrent moves to another state (the
+ *  file list arrives, the download starts, the file is whole). Stops
  *  itself once no tile is showing. */
 let torrentPoll: ReturnType<typeof setInterval> | null = null;
 function pollTorrent(host: HTMLElement, deps: TvPhoneDeps): void {
   if (torrentPoll) return;
-  const running = (s: string) => s === 'metadata' || s === 'downloading' || s === 'importing';
   void refreshTorrentState();
   torrentPoll = setInterval(() => {
     const el = host.querySelector<HTMLElement>('[data-tv-torrent-status]');
@@ -711,11 +848,13 @@ function pollTorrent(host: HTMLElement, deps: TvPhoneDeps): void {
       torrentPoll = null;
       return;
     }
-    const before = torrentState().state;
+    const before = torrentState();
     void refreshTorrentState().then((st) => {
       const now = host.querySelector<HTMLElement>('[data-tv-torrent-status]');
       if (!now) return;
-      if (running(before) !== running(st.state)) renderTvPhoneApp(host, deps);
+      const moved = before.state !== st.state
+        || (st.state === 'ready' && before.state === 'ready' && (before.id !== st.id || JSON.stringify(before.files) !== JSON.stringify(st.files)));
+      if (moved) renderTvPhoneApp(host, deps);
       else now.textContent = torrentLine(st, formatBytes);
     });
   }, 1_000);
@@ -788,7 +927,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
    *  lookup can take seconds while the box stays editable, and the clear
    *  that follows a write must take only that text — not a newer link typed
    *  meanwhile and never submitted. */
-  const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string } | null> => {
+  const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string; torrent?: TvTorrentOrigin } | null> => {
     // Every attempt supersedes the lookup before it, a refused or malformed
     // one included: a PLAY on a bad link must not let an older archive
     // lookup land its film after the refusal was shown.
@@ -802,12 +941,16 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
         const st = torrentState();
         feedback(st.state === 'complete'
           ? 'That download was for another room — paste the magnet again here.'
-          : st.state === 'metadata' || st.state === 'downloading' || st.state === 'importing'
+          : st.state === 'ready'
+          ? 'Pick a file from the list and press ⬇ DOWNLOAD first; PLAY NOW takes it once it is downloaded.'
+          : torrentRunning(st)
           ? 'The download is not finished yet — PLAY NOW puts it on the TV once it is.'
-          : 'Paste a magnet and press 🧲 START first; PLAY NOW takes the file once it is downloaded.');
+          : 'Paste a magnet (or choose a .torrent file) and press 🧲 START first; PLAY NOW takes the file once it is downloaded.');
         return null;
       }
-      return { source, text: '' };
+      // The library keeps where it came from, for GET AGAIN; the programme
+      // names only the blob.
+      return { source, text: '', torrent: torrentOrigin() ?? undefined };
     }
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
@@ -877,15 +1020,46 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelector<HTMLButtonElement>('[data-tv-torrent-start]')?.addEventListener('click', async () => {
     const box = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
     const text = box?.value ?? '';
-    feedback('Handing the magnet to your node…');
-    const why = await startTorrent(text);
+    // A chosen .torrent goes first; else the paste.
+    const file = text.trim() ? null : pickedTorrent;
+    feedback(file ? `Handing ${file.name} to your node…` : 'Handing the magnet to your node…');
+    const why = file ? await startTorrentFile(file) : await startTorrent(text);
     if (why) {
       feedback(why);
       return;
     }
     feedback('');
+    if (file && pickedTorrent === file) pickedTorrent = null;
+    torrentPick = null;
     const live = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
-    if (live && live.value === text) live.value = '';
+    if (!file && live && live.value === text) live.value = '';
+    renderTvPhoneApp(host, deps);
+  });
+  host.querySelector<HTMLInputElement>('[data-tv-torrent-file]')?.addEventListener('change', (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0] ?? null;
+    if (f && f.size > MAX_TORRENT_FILE) {
+      feedback('That is too big for a .torrent file (over 4 MB).');
+      return;
+    }
+    pickedTorrent = f;
+    renderTvPhoneApp(host, deps);
+  });
+  host.querySelectorAll<HTMLInputElement>('[data-tv-torrent-pick]').forEach((r) => r.addEventListener('change', () => {
+    const st = torrentState();
+    if (st.state === 'ready') torrentPick = { id: st.id, index: Number(r.dataset.tvTorrentPick) };
+    renderTvPhoneApp(host, deps);
+  }));
+  host.querySelector<HTMLButtonElement>('[data-tv-torrent-confirm]')?.addEventListener('click', async () => {
+    const st = torrentState();
+    if (st.state !== 'ready') return;
+    const index = torrentPick?.id === st.id ? torrentPick.index : st.pick;
+    if (index === null) {
+      feedback('Pick a file first.');
+      return;
+    }
+    feedback('Asking your node to download it…');
+    const why = await confirmTorrent(index);
+    feedback(why ?? '');
     renderTvPhoneApp(host, deps);
   });
   host.querySelector<HTMLButtonElement>('[data-tv-torrent-stop]')?.addEventListener('click', async () => {
@@ -924,7 +1098,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     void sourceFromBox(id).then((got) => {
       if (!got) return;
       const taken = takeDraft(got.text);
-      const r = tvPlay(id, got.source);
+      const r = tvPlay(id, got.source, undefined, got.torrent);
       feedback(r.ok ? `Now on: ${sourceLabel(got.source)}` : r.error);
       if (!r.ok && taken) giveBack(got.text);
       if (r.ok) deps.openTheatre(id);
@@ -936,16 +1110,36 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     void sourceFromBox(id).then((got) => {
       if (!got) return;
       const taken = takeDraft(got.text);
-      const r = tvSchedule(id, got.source, Date.now() + minutes * 60_000);
+      const r = tvSchedule(id, got.source, Date.now() + minutes * 60_000, undefined, got.torrent);
       feedback(r.ok ? `Scheduled: ${sourceLabel(got.source)} in ${minutes} min` : r.error);
       if (!r.ok && taken) giveBack(got.text);
     });
   }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-history]').forEach((b) => b.addEventListener('click', () => {
+  // 📚 The library: its filters, its search, and its rows.
+  const libraryEntry = (id: string, key: string) => libraryView(readLibrary(), readTv(id).history, 'all', '').find((e) => sourceId(e.source) === key);
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-filter]').forEach((b) => b.addEventListener('click', () => {
+    libraryFilter = b.dataset.tvLibFilter as LibraryFilter;
+    libraryShown = LIBRARY_PAGE;
+    renderTvPhoneApp(host, deps);
+  }));
+  const search = host.querySelector<HTMLInputElement>('[data-tv-lib-search]');
+  search?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') e.stopPropagation(); // typing must not walk the fox (the paste box's rule)
+  });
+  search?.addEventListener('input', () => {
+    libraryQuery = search.value.slice(0, 80);
+    libraryShown = LIBRARY_PAGE;
+    renderTvPhoneApp(host, deps);
+  });
+  host.querySelector<HTMLButtonElement>('[data-tv-lib-more]')?.addEventListener('click', () => {
+    libraryShown += LIBRARY_PAGE;
+    renderTvPhoneApp(host, deps);
+  });
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-play]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
-    const entry = readTv(id).history[Number(b.dataset.tvHistory)];
+    const entry = libraryEntry(id, b.dataset.tvLibPlay!);
     if (!entry) return;
-    // The paste box's gate: the history is written by peers and by builds
+    // The paste box's gate: the library is written by peers and by builds
     // with the convenience lanes on, and an entry this build would refuse
     // to play is said no to here — the programme on stays as it is.
     const refused = playRefusal(entry.source);
@@ -953,8 +1147,35 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback(refused);
       return;
     }
-    const r = tvPlay(id, entry.source);
-    feedback(r.ok ? `Now on: ${entry.title}` : r.error);
+    // A file your node holds plays from your node: viewers fetch it from
+    // you, whoever shared it first.
+    const where = whereabouts(entry);
+    const me = blobLaneNodeId();
+    const source = entry.source.kind === 'blob' && where === 'mine' && me ? { ...entry.source, provider: me } : entry.source;
+    const r = tvPlay(id, source);
+    if (!r.ok) {
+      feedback(r.error);
+      return;
+    }
+    feedback(where === 'away'
+      ? `Now on: ${entry.title}. The node that shared it is not connected to yours: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
+      : `Now on: ${entry.title}`);
+    deps.openTheatre(id);
+  }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-again]').forEach((b) => b.addEventListener('click', async () => {
+    const entry = libraryEntry(b.dataset.tvId!, b.dataset.tvLibAgain!);
+    if (!entry?.torrent) return;
+    feedback(`Asking your node for ${entry.title} again…`);
+    const why = await startTorrentAgain(entry.torrent);
+    if (why) {
+      feedback(why);
+      return;
+    }
+    // The TORRENT tile shows its file list: nothing downloads before ⬇ DOWNLOAD.
+    torrentPick = null;
+    activeTile = 'magnet';
+    feedback(`🧲 Looking up ${entry.title}: its file list shows on the TORRENT tile, and nothing downloads until you press ⬇ DOWNLOAD.`);
+    renderTvPhoneApp(host, deps);
   }));
   // Where the holder's own player is, when one is mounted here: the record's
   // estimate runs on while a player buffers, and a pause written from it

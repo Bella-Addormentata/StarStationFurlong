@@ -181,6 +181,47 @@ export async function fetchBlob(hash: string, size: number, provider: string, mi
   }
 }
 
+// ── What this node holds, for the TV library ─────────────────────────────────
+
+/** The node's last answer to the held route: the whole blobs it serves to
+ *  this room, and the room members a FETCH from it could dial now. */
+let heldHere: { gen: number; room: string; held: Set<string>; reachable: Set<string>; at: number } | null = null;
+let heldAsking = false;
+const HELD_POLL_MS = 5_000;
+
+/** Ask the node again, at most every HELD_POLL_MS (the library calls this
+ *  on every paint). Resolves once the answer is in, or at once. */
+export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
+  const fresh = heldHere && heldHere.gen === generation && heldHere.room === room && now - heldHere.at < HELD_POLL_MS;
+  if (fresh || heldAsking) return;
+  const url = route('/api/blob/held', { room });
+  if (!url) return;
+  const gen = generation;
+  const asked = room;
+  heldAsking = true;
+  try {
+    const res = await fetch(url, { redirect: 'error' });
+    const body = (res.ok ? await res.json() : null) as { held?: unknown; reachable?: unknown } | null;
+    const hexes = (v: unknown) => new Set((Array.isArray(v) ? v.slice(0, 1000) : []).filter((h): h is string => typeof h === 'string' && HEX_64.test(h)));
+    if (gen === generation && asked === room && body) heldHere = { gen, room: asked, held: hexes(body.held), reachable: hexes(body.reachable), at: now };
+  } catch { /* kept as it was; the next paint asks again */ } finally {
+    heldAsking = false;
+  }
+}
+
+/** This page's node holds `hash` whole for this room (as it last said). */
+export function nodeHolds(hash: string): boolean {
+  if (statuses.get(hash)?.state === 'complete') return true;
+  return !!heldHere && heldHere.gen === generation && heldHere.room === room && heldHere.held.has(hash);
+}
+
+/** Whether a FETCH from this page's node could reach `provider` now: true,
+ *  false, or null when the node has not said (no node, or not asked yet). */
+export function nodeReaches(provider: string): boolean | null {
+  if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
+  return heldHere.reachable.has(provider);
+}
+
 // ── Status, polled while a theatre watches it ────────────────────────────────
 
 const statuses = new Map<string, BlobState>();
@@ -234,6 +275,8 @@ export function blobNodeTag(): string {
 export function forgetBlobLane(): void {
   node = null;
   room = '';
+  heldHere = null;
+  heldAsking = false;
   statuses.clear();
   polling.clear();
   lastPoll.clear();

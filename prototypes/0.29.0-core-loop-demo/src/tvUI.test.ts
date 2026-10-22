@@ -4,7 +4,8 @@
  * never written — from the paste box and from PREVIOUSLY ON alike.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { playRefusal, tvNavIndex } from './tvUI';
+import { agoText, libraryKind, libraryView, playRefusal, tvNavIndex } from './tvUI';
+import type { TvLibraryEntry } from './tvDoc';
 import { forgetMediaConsent, setOwnMediaOrigins } from './tvConsent';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -56,5 +57,46 @@ describe('with the convenience lanes on', () => {
     expect(playRefusal({ kind: 'url', url: 'https://example.org/a.mp4' })).toBeNull();
     expect(playRefusal({ kind: 'url', url: 'http://nas.local/a.mp4' })).toMatch(/private network/);
     expect(playRefusal({ kind: 'url', url: 'http://[fe80::1]/a.mp4' })).toMatch(/private network/);
+  });
+});
+
+describe('📚 the library on the remote', () => {
+  const blob = { kind: 'blob' as const, hash: 'b'.repeat(64), size: 9, provider: 'c'.repeat(64) };
+  const lib: TvLibraryEntry[] = [
+    { source: { ...blob, title: 'Sintel' }, title: 'Sintel', addedAt: 1, playedAt: 30, plays: 2, torrent: { ih: 'a'.repeat(40), file: 0 } },
+    { source: { ...blob, hash: 'd'.repeat(64), title: 'Holiday' }, title: 'Holiday', addedAt: 2, playedAt: 20, plays: 1 },
+    { source: { kind: 'url', url: 'https://example.org/clip.mp4' }, title: 'example.org · clip.mp4', addedAt: 3, playedAt: 10, plays: 1 },
+  ];
+
+  it('sorts files, torrents and links apart', () => {
+    expect(lib.map(libraryKind)).toEqual(['torrents', 'files', 'links']);
+  });
+
+  it('joins this set\'s older PREVIOUSLY ON, newest first, without doubling an entry', () => {
+    const history = [
+      { source: { kind: 'youtube' as const, videoId: 'uPwPecwX2zs' }, title: 'Metropolis', playedAt: 25 },
+      { source: { ...blob, title: 'Sintel' }, title: 'Sintel', playedAt: 5 },
+    ];
+    const all = libraryView(lib, history, 'all', '');
+    expect(all.map((e) => e.title)).toEqual(['Sintel', 'Metropolis', 'Holiday', 'example.org · clip.mp4']);
+    expect(all[0]!.plays).toBe(2); // the library's entry, not the history's
+  });
+
+  it('filters and searches', () => {
+    expect(libraryView(lib, [], 'torrents', '').map((e) => e.title)).toEqual(['Sintel']);
+    expect(libraryView(lib, [], 'files', '').map((e) => e.title)).toEqual(['Holiday']);
+    expect(libraryView(lib, [], 'links', '').map((e) => e.title)).toEqual(['example.org · clip.mp4']);
+    expect(libraryView(lib, [], 'all', '  HOLI ').map((e) => e.title)).toEqual(['Holiday']);
+    expect(libraryView(lib, [], 'all', 'example.org')).toHaveLength(1);
+    expect(libraryView(lib, [], 'files', 'sintel')).toEqual([]);
+  });
+
+  it('says how long ago', () => {
+    const now = 10 * 86_400_000;
+    expect(agoText(now - 5_000, now)).toBe('just now');
+    expect(agoText(now - 5 * 60_000, now)).toBe('5 min ago');
+    expect(agoText(now - 3 * 3_600_000, now)).toBe('3 h ago');
+    expect(agoText(now - 2 * 86_400_000, now)).toBe('2 d ago');
+    expect(agoText(now + 60_000, now)).toBe('just now'); // a peer's clock ahead
   });
 });
