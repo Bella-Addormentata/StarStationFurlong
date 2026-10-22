@@ -165,7 +165,6 @@ import {
   createStorageTrunkUI,
   createGameTableUI,
   createHelmUI,
-  createCashierUI,
   createFaucetDishUI,
   createSlotMachineUI,
   operateActiveSlotMachine,
@@ -237,6 +236,8 @@ import {
   alligatorsGearCard,
 } from "./alligatorsSession";
 import { closeGearCard, toggleGearCard } from "./settingsGear";
+import { cashierGearCard, createCashierUI } from "./cashierSession";
+import type { CashierScreenHandle } from "./cashierScreen";
 import { IA_SEATS } from "./games/alligators";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
@@ -6525,6 +6526,16 @@ export class World {
     return operated;
   }
 
+  /** 🏧 A cashier kiosk's live screen (its builder stows the handle on the
+   *  screen mesh), or null. */
+  private cashierScreen(itemId: string): CashierScreenHandle | null {
+    let handle: CashierScreenHandle | null = null;
+    this.furnitureGroups.get(itemId)?.traverse((child) => {
+      if (!handle && child.userData?.cashierScreen) handle = child.userData.cashierScreen as CashierScreenHandle;
+    });
+    return handle;
+  }
+
   /** ⚙ A settings gear was clicked (settingsGear.ts): open or close that
    *  item's card. False when the item has no gear card. */
   public openSettingsCard(itemId: string): boolean {
@@ -6532,6 +6543,7 @@ export class World {
     const spec = kind === "air-hockey-table" ? airHockeyGearCard(itemId)
       : kind === "alligators-table" ? alligatorsGearCard(itemId)
       : kind === "coin-pusher" ? coinPusherGearCard(itemId, () => canEditRoom().ok)
+      : kind === "cashier-atm" ? cashierGearCard(itemId, () => canEditRoom().ok)
       : null;
     if (!spec) return false;
     toggleGearCard(spec);
@@ -6780,7 +6792,12 @@ export class World {
       // equivalent seam as room editing — canEditRoom funnels main.ts's
       // isLocalPlayerRoomOwner, so a venture-owned room makes every
       // shareholder the house (the #68 V1 rule, applied to the casino).
-      deviceFocus.beginFocus(this.player, device, createCashierUI({ isHouse: () => canEditRoom().ok }));
+      // 🏧 The menu plays on the kiosk's own screen (cashierSession.ts).
+      deviceFocus.beginFocus(this.player, device, createCashierUI({
+        itemId: deviceId,
+        isHouse: () => canEditRoom().ok,
+        screen: this.cashierScreen(deviceId),
+      }));
       return;
     }
 

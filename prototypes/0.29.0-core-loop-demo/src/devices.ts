@@ -172,12 +172,11 @@ import type { CheckersColor } from './games/checkers';
 import type { BoardMarks } from './games/checkersTable';
 import { initialChessState } from './games/chess';
 import type { ChessColor } from './games/chess';
-import { writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
+import { writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
-  readChips, buyInChips, cashOutChips,
-  readCageLedger, subscribeCasino,
+  readChips, subscribeCasino,
   casinoDocEpoch,
   clearSlotPlayRequest,
   readSlotMachineState, readSlotOddsConfig, readSlotReveal,
@@ -4563,146 +4562,12 @@ export function createCloneVatUI(deps: CloneVatUIDeps): DeviceUI {
   };
 }
 
-// ── 🎰 #69 G1: the CASHIER — chips in, chips out, the cage ledger public ─────
-
-export interface CashierUIDeps {
-  /** Owner-equivalent predicate (the one-seam ownership gate, via world). */
-  isHouse: () => boolean;
-}
-
+// 🎰 The casino panels' palette (the cashier itself plays on its kiosk's
+// screen now: cashierScreen.ts + cashierSession.ts).
 const CH_GOLD = '#d4a84b';
 const CH_GOLD_BRIGHT = '#F0C060';
 const CH_DIM = '#4A5560';
 const CH_PINK = '#FF2D95';
-
-/**
- * The cashier ATM's focused UI (#69 G1): YOUR CHIPS, buy-in, cash-out, and
- * the cage ledger — issuance is PUBLIC (every player sees issued/outstanding/
- * house net and the floor balances), which is the whole trust model of
- * doc-recorded chips. Plain language only: chips / cashier / the cage —
- * the Registry-anchored upgrade (G4) keeps this exact screen.
- */
-export function createCashierUI(deps: CashierUIDeps): DeviceUI {
-  let panel: HTMLDivElement | null = null;
-  let unsubscribe: (() => void) | null = null;
-  const myId = getPlayerId();
-
-  const render = (): void => {
-    if (!panel) return;
-    const chips = readChips(myId);
-    const cage = readCageLedger();
-    const btn = (id: string, label: string, disabled = false): string => `
-      <button id="${id}" ${disabled ? 'disabled' : ''} style="
-        flex:1; padding: 8px 6px;
-        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
-        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
-        border-radius: 6px; color: ${disabled ? CH_DIM : CH_GOLD_BRIGHT};
-        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1px;
-        cursor: ${disabled ? 'not-allowed' : 'pointer'};
-      ">${label}</button>`;
-    const floorRows = Object.entries(cage.balances)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([pid, n]) => `
-        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
-          <span style="color:${CH_GOLD};">${readPlayerDisplayName(pid).toUpperCase()}${pid === myId ? ' (YOU)' : ''}</span>
-          <span style="color:${CH_GOLD_BRIGHT};">🪙 ${n}</span>
-        </div>`);
-    const net = cage.houseNet;
-    panel.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
-        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🎰 CASHIER</span>
-        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
-      </div>
-      <div style="display:flex; align-items:baseline; gap:10px;">
-        <span style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">YOUR CHIPS</span>
-        <span style="font-size:26px; font-weight:800; color:${CH_GOLD_BRIGHT};">🪙 ${chips}</span>
-      </div>
-      <canvas id="cashier-rack" width="680" height="150"
-        style="width:340px; height:75px; align-self:flex-start;"></canvas>
-      <div>
-        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">BUY-IN</div>
-        <div style="display:flex; gap:8px;">
-          ${btn('cashier-buy-25', '+25')}
-          ${btn('cashier-buy-100', '+100')}
-          ${btn('cashier-buy-500', '+500')}
-        </div>
-        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
-          Test network — the cage advances chips against your Account.
-          Real Chia buy-ins arrive with the Registry cashier.
-        </div>
-      </div>
-      <div>
-        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">CASH OUT</div>
-        <div style="display:flex; gap:8px;">${btn('cashier-cashout', 'RETURN ALL CHIPS TO THE CAGE', chips <= 0)}</div>
-      </div>
-      <div style="border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:10px 12px; background:rgba(10,16,24,0.6);">
-        <div style="font-size:10px; color:${CH_PINK}; letter-spacing:2px; margin-bottom:6px;">THE CAGE — PUBLIC LEDGER</div>
-        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
-          <span style="color:${CH_DIM};">CHIPS ISSUED</span><span style="color:${CH_GOLD};">${cage.issued}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
-          <span style="color:${CH_DIM};">RETURNED</span><span style="color:${CH_GOLD};">${cage.cashed}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
-          <span style="color:${CH_DIM};">ON THE FLOOR</span><span style="color:${CH_GOLD};">${cage.outstanding}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0; border-top:1px solid rgba(212,168,75,0.12); margin-top:3px;">
-          <span style="color:${CH_DIM};">HOUSE NET</span>
-          <span style="font-weight:800; color:${net >= 0 ? '#00E676' : '#FF8A80'};">${net >= 0 ? '+' : ''}${net}</span>
-        </div>
-        ${floorRows.length ? `<div style="border-top:1px solid rgba(212,168,75,0.12); margin-top:6px; padding-top:5px;">${floorRows.join('')}</div>` : ''}
-      </div>
-      ${deps.isHouse() ? `
-      <div style="font-size:9.5px; color:${CH_PINK}; letter-spacing:0.5px;">
-        ★ YOU ARE THE HOUSE — table games pay from the cage; the ledger above is your book.
-      </div>` : ''}
-      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF CASINO CAGE v1 · chips are room records, ledger public · Registry chips later
-      </div>
-    `;
-    panel.querySelector<HTMLButtonElement>('#cashier-buy-25')?.addEventListener('click', () => buyInChips(myId, 25));
-    panel.querySelector<HTMLButtonElement>('#cashier-buy-100')?.addEventListener('click', () => buyInChips(myId, 100));
-    panel.querySelector<HTMLButtonElement>('#cashier-buy-500')?.addEventListener('click', () => buyInChips(myId, 500));
-    panel.querySelector<HTMLButtonElement>('#cashier-cashout')?.addEventListener('click', () => cashOutChips(myId, readChips(myId)));
-    // 🪙 The cashier ALSO shows the physical tray (the one place number and
-    // chips appear together — it teaches the counting).
-    const rack = panel.querySelector<HTMLCanvasElement>('#cashier-rack');
-    const rctx = rack?.getContext('2d');
-    if (rack && rctx) {
-      rctx.setTransform(2, 0, 0, 2, 0, 0);
-      rctx.clearRect(0, 0, 340, 75);
-      drawChips(rctx, chipsFor(chips), 0, 0, 340, 75, { emptyText: 'THE TRAY IS EMPTY' });
-    }
-  };
-
-  return {
-    mount(host: HTMLElement): void {
-      panel = document.createElement('div');
-      panel.id = 'device-cashier-pane';
-      panel.style.cssText = `
-        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
-        width: 380px; max-height: 90vh; overflow-y: auto;
-        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
-        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
-        padding: 18px; display: flex; flex-direction: column; gap: 12px;
-        color: ${CH_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-        box-sizing: border-box; pointer-events: auto;
-      `;
-      panel.addEventListener('click', (e) => e.stopPropagation());
-      host.appendChild(panel);
-      unsubscribe = subscribeCasino(() => render());
-      render();
-    },
-    unmount(): void {
-      unsubscribe?.();
-      unsubscribe = null;
-      panel?.remove();
-      panel = null;
-    },
-    update(): void { /* observer-driven; nothing per-frame */ },
-  };
-}
 
 // ── ⛓️🥣 The FAUCET DISH — the room's faucet coin, made physical ─────────────
 
