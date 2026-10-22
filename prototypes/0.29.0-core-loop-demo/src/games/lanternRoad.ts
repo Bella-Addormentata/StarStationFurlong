@@ -43,6 +43,10 @@ export const SUB = 16;
 export const LR_TILE = 16;
 const TILE_SUB = LR_TILE * SUB;
 export const LR_SEATS = 4;
+/** The rules' revision, also the save format's. Bump it with any change
+ *  that would make two copies of one match disagree: pages on different
+ *  revisions never share a match (arcadeNativeGames nativeMatchGame). */
+export const LR_REV = 2;
 
 // ── Pad bits (arcadeNet PAD_BIT) ─────────────────────────────────────────────
 
@@ -353,7 +357,7 @@ export interface LrShot {
 }
 
 export interface LrState {
-  v: 2;
+  v: typeof LR_REV;
   frame: number;
   phase: 'play' | 'clear';
   /** Frames left of the STAGE CLEAR card. */
@@ -520,7 +524,7 @@ function newPlayer(): LrPlayer {
  *  same one). */
 export function createLanternRoad(seed: number): LrState {
   return {
-    v: 2, frame: 0, phase: 'play', phaseT: 0, laps: 0, cam: 0, rng: seed | 0,
+    v: LR_REV, frame: 0, phase: 'play', phaseT: 0, laps: 0, cam: 0, rng: seed | 0,
     players: Array.from({ length: LR_SEATS }, newPlayer),
     enemies: spawnEnemies(),
     items: spawnItems(),
@@ -1335,7 +1339,7 @@ const listOf = <T>(v: unknown, item: (x: unknown) => x is T, max = MAX_LIST): v 
 export function restoreLanternRoad(raw: unknown): LrState | null {
   if (!isObj(raw)) return null;
   const s = raw;
-  if (s.v !== 2 || !isInt(s.frame, 0, 0xffffffff) || (s.phase !== 'play' && s.phase !== 'clear')
+  if (s.v !== LR_REV || !isInt(s.frame, 0, 0xffffffff) || (s.phase !== 'play' && s.phase !== 'clear')
     || !isInt(s.phaseT, 0, CLEAR_FRAMES) || !isInt(s.laps, 0, 0xffffff)
     || !isInt(s.cam, 0, LR_LEVEL_W - LR_VIEW_W) || !isInt(s.rng)) return null;
   if (!Array.isArray(s.players) || s.players.length !== LR_SEATS || !s.players.every(isPlayer)) return null;

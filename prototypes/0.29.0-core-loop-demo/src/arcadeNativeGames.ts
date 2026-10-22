@@ -12,7 +12,7 @@
  */
 
 import {
-  LR_SEATS, LR_VIEW_H, LR_VIEW_W, checkLanternRoad, createLanternRoad, restoreLanternRoad, stepLanternRoad,
+  LR_REV, LR_SEATS, LR_VIEW_H, LR_VIEW_W, checkLanternRoad, createLanternRoad, restoreLanternRoad, stepLanternRoad,
   type LrState,
 } from './games/lanternRoad';
 import { paintLanternRoad, paintLanternRoadTitle } from './lanternRoadPaint';
@@ -20,6 +20,8 @@ import { paintLanternRoad, paintLanternRoadTitle } from './lanternRoadPaint';
 export interface NativeGame<S = unknown> {
   /** Stable id: what a cabinet's record names (arcadeDoc `bundled`). */
   id: string;
+  /** The rules' revision: a match names its game by both (nativeMatchGame). */
+  rev: number;
   title: string;
   /** One line for the cabinet menu: what you do. */
   blurb: string;
@@ -45,6 +47,7 @@ export interface NativeGame<S = unknown> {
 
 const LANTERN_ROAD: NativeGame<LrState> = {
   id: 'lantern-road',
+  rev: LR_REV,
   title: 'LANTERN ROAD',
   blurb: 'Up to four friends walk the night street to the shrine.',
   controls: 'ARROWS WALK · X JUMP · Z STAFF · DOWN+X DROP',
@@ -62,6 +65,17 @@ export const NATIVE_GAMES: readonly NativeGame[] = [LANTERN_ROAD as unknown as N
 
 export function nativeGameById(id: string | null | undefined): NativeGame | null {
   return (id && NATIVE_GAMES.find((g) => g.id === id)) || null;
+}
+
+/** What a match record names its game by: the id and the rules' revision.
+ *  A page on another revision (an old tab, or one that loaded an update)
+ *  can't run the same frames or load the host's saves, so it never follows
+ *  or takes a seat in that match: to it, the cabinet is free. */
+export const nativeMatchGame = (game: NativeGame): string => `${game.id}@${game.rev}`;
+
+/** The game a match record names, if this page runs that revision of it. */
+export function nativeGameForMatch(name: string): NativeGame | null {
+  return NATIVE_GAMES.find((g) => nativeMatchGame(g) === name) ?? null;
 }
 
 /** Pad bit the session sets on every seat somebody holds (SELECT's bit:

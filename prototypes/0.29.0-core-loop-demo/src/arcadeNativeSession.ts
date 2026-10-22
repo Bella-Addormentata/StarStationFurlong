@@ -32,7 +32,9 @@
  * the cabinet's game is something else.
  */
 
-import { NATIVE_PRESENT, nativeGameById, type NativeGame } from './arcadeNativeGames';
+import {
+  NATIVE_PRESENT, nativeGameById, nativeGameForMatch, nativeMatchGame, type NativeGame,
+} from './arcadeNativeGames';
 import {
   ARCADE_WIRE_NATIVE, GuestPad, PadLog, PadRuns, frameAdd, frameDiff, packArcadeTick, pipe, unpackArcadeTick,
   type ArcadeTick,
@@ -244,7 +246,8 @@ function newCopy(s: CabinetSession, m: NativeMatch, game: NativeGame, role: 'hos
 }
 
 const isCopyOf = (copy: Copy, m: NativeMatch): boolean =>
-  copy.matchId === m.id && copy.hostPage === m.hostPage && copy.startedAt === m.startedAt && copy.game.id === m.game;
+  copy.matchId === m.id && copy.hostPage === m.hostPage && copy.startedAt === m.startedAt
+  && nativeMatchGame(copy.game) === m.game;
 
 function idsInUse(): Set<number> {
   const taken = new Set<number>();
@@ -277,7 +280,7 @@ function seatsOf(itemId: string, m: NativeMatch): Array<NativeSeat | null> {
   return out;
 }
 
-const nativeSeats = (m: NativeMatch): number => Math.min(NATIVE_MAX_SEATS, nativeGameById(m.game)?.seats ?? 0);
+const nativeSeats = (m: NativeMatch): number => Math.min(NATIVE_MAX_SEATS, nativeGameForMatch(m.game)?.seats ?? 0);
 
 /** The seat this page holds in `m`, or null. */
 function mySeatIn(itemId: string, m: NativeMatch): number | null {
@@ -288,11 +291,14 @@ function mySeatIn(itemId: string, m: NativeMatch): number | null {
 
 /** The cabinet's match as the doc has it, unless it was left behind for a
  *  game the cabinet no longer has (its host gone, the owner changed the
- *  game): nobody follows that one. A live host ends its own when its
+ *  game) or it runs another revision of the game than this page does:
+ *  nobody here follows that one. A live host ends its own when its
  *  cabinet UI lets go. */
 function matchFor(itemId: string): NativeMatch | null {
   const m = readNativeArcade(itemId);
-  return m && (m.hostPage === PAGE || cabinetGame(itemId) === m.game) ? m : null;
+  if (!m) return null;
+  const own = nativeGameById(cabinetGame(itemId));
+  return m.hostPage === PAGE || (own && nativeMatchGame(own) === m.game) ? m : null;
 }
 
 /** Bring the page's copy in line with the doc. */
@@ -306,7 +312,8 @@ function reconcile(itemId: string, s: CabinetSession, m: NativeMatch | null): vo
     return;
   }
   if (copy && isCopyOf(copy, m)) return;
-  if (copy?.role === 'host' && copy.hostPage === m.hostPage && copy.startedAt === m.startedAt && copy.game.id === m.game) {
+  if (copy?.role === 'host' && copy.hostPage === m.hostPage && copy.startedAt === m.startedAt
+    && nativeMatchGame(copy.game) === m.game) {
     // Our own match under a new id (a yield): carry on.
     copy.matchId = m.id;
     return;
@@ -316,7 +323,7 @@ function reconcile(itemId: string, s: CabinetSession, m: NativeMatch | null): vo
     writeNativeArcade(itemId, null);
     return;
   }
-  const game = nativeGameById(m.game);
+  const game = nativeGameForMatch(m.game);
   if (!game) {
     if (copy) {
       s.copy = null;
@@ -760,7 +767,7 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
       const native = nativeGameById(game.id);
       if (!s || !native) return;
       const m = newNativeMatch({
-        id: freshMatchId(idsInUse()), game: native.id, host: getPlayerId(), hostPage: PAGE,
+        id: freshMatchId(idsInUse()), game: nativeMatchGame(native), host: getPlayerId(), hostPage: PAGE,
         hostSeat: seat ?? 0, now: Date.now(),
       });
       newCopy(s, m, native, 'host');

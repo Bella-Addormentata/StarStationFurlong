@@ -30,7 +30,7 @@ export interface NativeMatch {
   id: number;
   /** The game's own seed: every copy starts from the same state. */
   seed: number;
-  /** The game (arcadeNativeGames id). */
+  /** The game and its rules' revision (arcadeNativeGames nativeMatchGame). */
   game: string;
   /** The host's player id, and the page running the reference copy. */
   host: string;
