@@ -140,6 +140,9 @@ export function importBlob(
   if (!url) return Promise.resolve({ error: 'The FILE tile needs this station\'s node (the desktop app) running.' });
   if (file.size === 0) return Promise.resolve({ error: 'That file is empty.' });
   const gen = generation;
+  // The node shares the file with the room it was sent for, and only that
+  // one: an answer that lands after a room change is not this room's file.
+  const asked = room;
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url);
@@ -150,8 +153,12 @@ export function importBlob(
       try { body = JSON.parse(xhr.responseText) as typeof body; } catch { /* not JSON */ }
       if (gen !== generation) {
         resolve({ error: 'Your node restarted while taking the file — choose it again.' });
+      } else if (asked !== room) {
+        resolve({ error: 'You changed rooms while your node took the file — choose it again here.' });
       } else if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
         statuses.set(body.hash, { state: 'complete', have: file.size, size: file.size });
+        // Held for this room now: the library says so before its next ask.
+        if (heldHere && heldHere.gen === gen && heldHere.room === asked) heldHere.held.add(body.hash);
         resolve({ hash: body.hash, size: file.size });
       } else {
         resolve({ error: typeof body.error === 'string' && body.error ? `Your node: ${body.error}.` : 'Your node did not take the file.' });
@@ -179,6 +186,51 @@ export async function fetchBlob(hash: string, size: number, provider: string, mi
   } catch {
     return 'Your node did not answer.';
   }
+}
+
+// ── What this node holds, for the TV library ─────────────────────────────────
+
+/** The node's last answer to the held route: the whole blobs it serves to
+ *  this room, and the room members a FETCH from it could dial now. `more`:
+ *  the node cut its list, so a hash not on it may still be held. */
+let heldHere: { gen: number; room: string; held: Set<string>; more: boolean; reachable: Set<string>; at: number } | null = null;
+let heldAsking = false;
+const HELD_POLL_MS = 5_000;
+
+/** Ask the node again, at most every HELD_POLL_MS (the library calls this
+ *  on every paint). Resolves once the answer is in, or at once. */
+export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
+  const fresh = heldHere && heldHere.gen === generation && heldHere.room === room && now - heldHere.at < HELD_POLL_MS;
+  if (fresh || heldAsking) return;
+  const url = route('/api/blob/held', { room });
+  if (!url) return;
+  const gen = generation;
+  const asked = room;
+  heldAsking = true;
+  try {
+    const res = await fetch(url, { redirect: 'error' });
+    const body = (res.ok ? await res.json() : null) as { held?: unknown; more?: unknown; reachable?: unknown } | null;
+    const hexes = (v: unknown) => new Set((Array.isArray(v) ? v.slice(0, 1000) : []).filter((h): h is string => typeof h === 'string' && HEX_64.test(h)));
+    const more = body?.more === true || (Array.isArray(body?.held) && body.held.length > 1000);
+    if (gen === generation && asked === room && body) heldHere = { gen, room: asked, held: hexes(body.held), more, reachable: hexes(body.reachable), at: now };
+  } catch { /* kept as it was; the next paint asks again */ } finally {
+    heldAsking = false;
+  }
+}
+
+/** Whether this page's node holds `hash` whole for this room, as it last
+ *  said: null when it has not said (no node, not asked yet, or a cut list
+ *  that does not name it). */
+export function nodeHolds(hash: string): boolean | null {
+  if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
+  return heldHere.held.has(hash) ? true : heldHere.more ? null : false;
+}
+
+/** Whether a FETCH from this page's node could reach `provider` now: true,
+ *  false, or null when the node has not said (no node, or not asked yet). */
+export function nodeReaches(provider: string): boolean | null {
+  if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
+  return heldHere.reachable.has(provider);
 }
 
 // ── Status, polled while a theatre watches it ────────────────────────────────
@@ -234,6 +286,8 @@ export function blobNodeTag(): string {
 export function forgetBlobLane(): void {
   node = null;
   room = '';
+  heldHere = null;
+  heldAsking = false;
   statuses.clear();
   polling.clear();
   lastPoll.clear();

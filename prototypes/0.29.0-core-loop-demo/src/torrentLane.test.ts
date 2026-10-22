@@ -5,8 +5,11 @@
  * blob.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { forgetBlobLane, formatBytes, setBlobLaneNode, setBlobLaneRoom, torrentLaneReady } from './blobLane';
-import { forgetTorrentLane, parseTorrentState, refreshTorrentState, startTorrent, torrentLine, torrentSource, torrentState } from './torrentLane';
+import { forgetBlobLane, formatBytes, nodeHolds, nodeReaches, refreshHeldBlobs, setBlobLaneNode, setBlobLaneRoom, torrentLaneReady } from './blobLane';
+import {
+  confirmTorrent, forgetTorrentLane, MAX_TORRENT_FILE, parseTorrentState, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile,
+  torrentLine, torrentOrigin, torrentRunning, torrentSource, torrentState,
+} from './torrentLane';
 import { setNodeMediaOrigin } from './tvConsent';
 import { tvNow, tvWallNow } from './tvDoc';
 
@@ -22,7 +25,14 @@ function withNode(torrent: boolean) {
   setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID, torrent });
 }
 
-const complete = { state: 'complete', id: INFO, room: 'room-1', name: 'Sintel', have: 129_000_000, size: 129_000_000, peers: 0, uploaded: 0, why: '', hash: HASH, mime: 'video/mp4' };
+const complete = {
+  state: 'complete', job: 4, id: INFO, room: 'room-1', name: 'Sintel', have: 129_000_000, size: 129_000_000, peers: 0, uploaded: 0, why: '', hash: HASH, mime: 'video/mp4',
+  pick: 2, files: [{ index: 2, name: 'Sintel/Sintel.mp4', size: 129_000_000, fits: true }],
+};
+const ready = { ...complete, state: 'ready', size: 0, have: 0, hash: null, mime: null, pick: 2, files: [
+  { index: 0, name: 'Sintel/Sintel.mkv', size: 900_000_000, fits: false },
+  { index: 2, name: 'Sintel/Sintel.mp4', size: 129_000_000, fits: true },
+] };
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -122,5 +132,92 @@ describe('torrentLane', () => {
     expect(torrentLine(dl, formatBytes)).toBe('🧲 Sintel: 50% of 123 MB · 1 peer · shared 1.9 MB');
     expect(torrentLine(parseTorrentState({ ...complete, state: 'failed', why: 'no peer sent anything' }), formatBytes)).toBe('⚠️ no peer sent anything');
     expect(torrentLine(parseTorrentState(complete), formatBytes)).toMatch(/stopped sharing/);
+  });
+
+  it('reads the file list a torrent stops at, and offers only a file that is on it', () => {
+    const st = parseTorrentState(ready);
+    expect(st.state === 'ready' && [st.files.map((f) => [f.index, f.fits]), st.pick]).toEqual([[[0, false], [2, true]], 2]);
+    expect(torrentRunning(st)).toBe(true);
+    expect(torrentLine(st, formatBytes)).toMatch(/2 files the TV can play\. Nothing downloads until you pick one/);
+    // A pick that is not on the list, duplicates and junk rows are dropped.
+    const odd = parseTorrentState({ ...ready, pick: 7, files: [...ready.files, { index: 2, name: 'again' }, { index: -1 }, 'x', null] });
+    expect(odd.state === 'ready' && [odd.files.length, odd.pick]).toEqual([2, null]);
+    // A long list is bounded.
+    const many = parseTorrentState({ ...ready, files: Array.from({ length: 900 }, (_, i) => ({ index: i, name: `e${i}.mp4`, size: 1 })) });
+    expect(many.state === 'ready' && many.files.length).toBe(200);
+  });
+
+  it('confirms the pick, and sends a .torrent file as its bytes', async () => {
+    withNode(true);
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify(url.includes('/status') ? ready : { ok: true }), { status: url.includes('/add') ? 202 : 200 });
+    }));
+    expect(parseTorrentState(ready).state === 'ready' && parseTorrentState(ready)).toMatchObject({ job: 4 });
+    expect(await confirmTorrent(4, 2)).toBeNull();
+    expect(calls[0]!.url).toBe(`${ORIGIN}/api/torrent/confirm?cap=${CAP}&job=4&file=2`);
+    expect(calls[0]!.init?.method).toBe('POST');
+    // No list seen yet: nothing is asked.
+    calls.length = 0;
+    expect(await confirmTorrent(0, 2)).toMatch(/file list/);
+    expect(calls).toHaveLength(0);
+    calls.length = 0;
+    const file = new Blob([new Uint8Array([100, 52, 58])]);
+    expect(await startTorrentFile(file)).toBeNull();
+    expect(calls[0]!.url).toBe(`${ORIGIN}/api/torrent/add?cap=${CAP}&room=room-1&kind=torrent`);
+    expect(calls[0]!.init?.body).toBe(file);
+    expect(await startTorrentFile(new Blob([]))).toMatch(/empty/);
+    expect(await startTorrentFile({ size: MAX_TORRENT_FILE + 1 } as Blob)).toMatch(/too big/);
+  });
+
+  it('GET AGAIN asks by the info hash alone, with the file played before offered first', async () => {
+    withNode(true);
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push(`${url} ${String(init?.body ?? '')}`);
+      return new Response(JSON.stringify({ ok: true }), { status: 202 });
+    }));
+    expect(await startTorrentAgain({ ih: INFO, file: 3 })).toBeNull();
+    expect(calls[0]).toBe(`${ORIGIN}/api/torrent/add?cap=${CAP}&room=room-1&file=3 magnet:?xt=urn:btih:${INFO}`);
+    expect(await startTorrentAgain({ ih: 'nope', file: 3 })).toMatch(/does not say which torrent/);
+  });
+
+  it('says where a finished file came from, for the library', () => {
+    expect(torrentOrigin(parseTorrentState(complete))).toEqual({ ih: INFO, file: 2 });
+    expect(torrentOrigin(parseTorrentState(ready))).toBeNull();
+    expect(torrentOrigin(parseTorrentState({ ...complete, id: 'x' }))).toBeNull();
+  });
+});
+
+describe('what this node holds, for the library', () => {
+  it('asks once for the room, and answers per hash and per provider', async () => {
+    withNode(true);
+    let asks = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      asks++;
+      expect(url).toBe(`${ORIGIN}/api/blob/held?cap=${CAP}&room=room-1`);
+      return new Response(JSON.stringify({ held: [HASH, 'junk'], reachable: [ID] }), { status: 200 });
+    }));
+    expect(nodeReaches(ID)).toBeNull(); // not asked yet
+    await refreshHeldBlobs(1_000);
+    await refreshHeldBlobs(2_000); // within the poll interval: not asked again
+    expect(asks).toBe(1);
+    expect(nodeHolds(HASH)).toBe(true);
+    expect(nodeHolds('e'.repeat(64))).toBe(false);
+    expect(nodeReaches(ID)).toBe(true);
+    expect(nodeReaches('f'.repeat(64))).toBe(false);
+    // Another room's answer is not this one's.
+    setBlobLaneRoom('room-2');
+    expect(nodeHolds(HASH)).toBeNull();
+    expect(nodeReaches(ID)).toBeNull();
+  });
+
+  it('takes a hash missing from a cut list as not known, not as gone', async () => {
+    withNode(true);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ held: [HASH], more: true, reachable: [ID] }), { status: 200 })));
+    await refreshHeldBlobs(1_000);
+    expect(nodeHolds(HASH)).toBe(true);
+    expect(nodeHolds('e'.repeat(64))).toBeNull();
   });
 });

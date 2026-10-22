@@ -3,25 +3,43 @@
  * brainstorming/smart-tv-arcade-media-plan.md; the node's half is
  * ssf-p2p-node/src/torrent_lane.rs, built with `--features torrent`).
  *
- * The remote's holder pastes a magnet; THEIR node fetches the one playable
- * file of it from the public swarm (no trackers, a client-only DHT, public
- * peers only) and puts it into the blob lane (blobLane.ts). When it is whole
- * the remote plays it as an ordinary `{ kind: 'blob' }` source, so viewers
- * press FETCH and take it from the holder's node: nobody else joins the
- * swarm, and the magnet itself never goes into the room record.
+ * The remote's holder pastes a magnet or chooses a .torrent file; THEIR
+ * node reads the torrent's file list (from the swarm for a magnet: no
+ * trackers, a client-only DHT, public peers only) and shows it: nothing
+ * downloads until the holder picks a file and presses ⬇ DOWNLOAD. The file
+ * then goes into the blob lane (blobLane.ts), and when it is whole the
+ * remote plays it as an ordinary `{ kind: 'blob' }` source, so viewers press
+ * FETCH and take it from the holder's node: nobody else joins the swarm.
+ * The programme names only the blob; the room's library (tvDoc) keeps the
+ * torrent's info hash and file number beside it, for 🧲 GET AGAIN.
  *
- * Only this page starts a torrent, on the holder's START press: the routes
- * sit behind the blob lane's gate (an allowed Origin and this launch's token).
+ * Only this page starts a torrent, on the holder's START or GET AGAIN press:
+ * the routes sit behind the blob lane's gate (an allowed Origin and this
+ * launch's token).
  */
 
 import { blobLaneGeneration, blobLaneNodeId, blobLaneRoom, nodeRoute, torrentLaneReady } from './blobLane';
-import type { TvSource } from './tvDoc';
+import type { TvSource, TvTorrentOrigin } from './tvDoc';
 import { sanitizeSource, TV_MAX_TITLE } from './tvDoc';
+
+/** One playable file of the torrent, as the node listed it. `fits`: this
+ *  node's cap and quota would take it. */
+export interface TorrentFile {
+  index: number;
+  name: string;
+  size: number;
+  fits: boolean;
+}
 
 export type TorrentState =
   | { state: 'none' }
   | {
-      state: 'metadata' | 'downloading' | 'importing' | 'complete' | 'failed' | 'stopped';
+      /** `ready`: the file list is here, and nothing downloads until the
+       *  holder confirms a file of it (confirmTorrent). */
+      state: 'metadata' | 'ready' | 'downloading' | 'importing' | 'complete' | 'failed' | 'stopped';
+      /** Which of the node's torrents this is: a new START is a new job,
+       *  even of the same torrent. DOWNLOAD names the one it showed. */
+      job: number;
       id: string;
       name: string;
       have: number;
@@ -34,8 +52,16 @@ export type TorrentState =
       /** Set once complete: the blob the file became, and its type. */
       hash: string | null;
       mime: string | null;
+      /** The playable files (from `ready` on), and the one offered or chosen. */
+      files: TorrentFile[];
+      pick: number | null;
     }
   | { state: 'unknown' };
+
+/** The most files the remote lists (the node lists at most 200). */
+const MAX_FILES = 200;
+/** The largest .torrent the node reads. */
+export const MAX_TORRENT_FILE = 4 * 1024 * 1024;
 
 const HEX_64 = /^[0-9a-f]{64}$/;
 const HEX_40 = /^[0-9a-f]{40}$/;
@@ -57,11 +83,20 @@ export function parseTorrentState(body: unknown): TorrentState {
   const str = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, max) : '');
   if (r.state === 'none') return { state: 'none' };
   switch (r.state) {
-    case 'metadata': case 'downloading': case 'importing': case 'complete': case 'failed': case 'stopped': {
+    case 'metadata': case 'ready': case 'downloading': case 'importing': case 'complete': case 'failed': case 'stopped': {
       const hash = typeof r.hash === 'string' && HEX_64.test(r.hash) ? r.hash : null;
       if (r.state === 'complete' && !hash) return { state: 'unknown' };
+      const index = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : null);
+      const files: TorrentFile[] = [];
+      for (const f of Array.isArray(r.files) ? r.files.slice(0, MAX_FILES) : []) {
+        const e = f && typeof f === 'object' ? (f as Record<string, unknown>) : null;
+        const i = e ? index(e.index) : null;
+        if (e && i !== null && !files.some((x) => x.index === i)) files.push({ index: i, name: str(e.name, 120), size: n(e.size), fits: e.fits !== false });
+      }
+      const pick = index(r.pick);
       return {
         state: r.state,
+        job: n(r.job),
         id: typeof r.id === 'string' && HEX_40.test(r.id) ? r.id : '',
         name: str(r.name, 120),
         have: n(r.have),
@@ -72,6 +107,8 @@ export function parseTorrentState(body: unknown): TorrentState {
         room: str(r.room, 256),
         hash,
         mime: typeof r.mime === 'string' ? r.mime.slice(0, 80) : null,
+        files,
+        pick: pick !== null && (files.length === 0 || files.some((f) => f.index === pick)) ? pick : null,
       };
     }
     default: return { state: 'unknown' };
@@ -105,11 +142,12 @@ export async function refreshTorrentState(): Promise<TorrentState> {
   }
 }
 
-async function post(path: string, params: Record<string, string>, body?: string): Promise<string | null> {
+async function post(path: string, params: Record<string, string>, body?: string | Blob): Promise<string | null> {
   const url = nodeRoute(path, params);
   if (!url) return 'The TORRENT tile needs this station\'s node, built with torrents, running here.';
   try {
-    // text/plain: a simple request, so no preflight; the node checks the Origin.
+    // text/plain: a simple request, so no preflight; the node checks the
+    // Origin (a .torrent's bytes go the same way, named by `kind`).
     const res = await fetch(url, { method: 'POST', redirect: 'error', body, headers: body === undefined ? undefined : { 'Content-Type': 'text/plain' } });
     if (res.ok) return null;
     try {
@@ -122,12 +160,33 @@ async function post(path: string, params: Record<string, string>, body?: string)
   }
 }
 
-/** START: hand the pasted magnet to this page's node. Null when it took it. */
-export async function startTorrent(magnet: string): Promise<string | null> {
+/** START: hand the pasted magnet to this page's node. Null when it took it.
+ *  `file` is the file the list offers first (a library entry's). */
+export async function startTorrent(magnet: string, file?: number): Promise<string | null> {
   const text = magnet.trim();
-  if (!text.startsWith('magnet:?')) return 'Paste a magnet link (it starts with magnet:?).';
+  if (!text.startsWith('magnet:?')) return 'Paste a magnet link (it starts with magnet:?), or choose a .torrent file.';
+  return add(text, file === undefined ? {} : { file: String(file) });
+}
+
+/** START with a chosen .torrent file: its bytes go to the node, which keeps
+ *  only its `info` (no tracker, web seed or comment reaches the client). */
+export async function startTorrentFile(file: Blob): Promise<string | null> {
+  if (file.size === 0) return 'That .torrent file is empty.';
+  if (file.size > MAX_TORRENT_FILE) return 'That is too big for a .torrent file (over 4 MB).';
+  return add(file, { kind: 'torrent' });
+}
+
+/** 🧲 GET AGAIN: the torrent a library entry came from, by its info hash
+ *  alone, with the file played before offered first. The node shows the
+ *  torrent's own file list again before anything downloads. */
+export function startTorrentAgain(origin: TvTorrentOrigin): Promise<string | null> {
+  if (!HEX_40.test(origin.ih)) return Promise.resolve('That library entry does not say which torrent it came from.');
+  return startTorrent(`magnet:?xt=urn:btih:${origin.ih}`, origin.file);
+}
+
+async function add(body: string | Blob, params: Record<string, string>): Promise<string | null> {
   if (!torrentLaneReady()) return 'The TORRENT tile needs this station\'s node, built with torrents, running here.';
-  const why = await post('/api/torrent/add', { room: blobLaneRoom() }, text);
+  const why = await post('/api/torrent/add', { room: blobLaneRoom(), ...params }, body);
   if (!why) {
     // The finished file the remote held is no longer the node's answer:
     // nothing is playable until the node says so of the new torrent.
@@ -138,12 +197,35 @@ export async function startTorrent(magnet: string): Promise<string | null> {
   return why;
 }
 
+/** ⬇ DOWNLOAD: the holder's pick from the list of torrent `job` (the one
+ *  the remote showed: the node refuses another's). Null when the node took it. */
+export async function confirmTorrent(job: number, file: number): Promise<string | null> {
+  if (!Number.isSafeInteger(file) || file < 0) return 'Pick a file first.';
+  if (!Number.isSafeInteger(job) || job < 1) return 'Wait for the file list first.';
+  const why = await post('/api/torrent/confirm', { job: String(job), file: String(file) });
+  if (!why) void refreshTorrentState();
+  return why;
+}
+
 export async function stopTorrent(): Promise<string | null> {
   const why = await post('/api/torrent/stop', {});
   epoch++;
   last = { state: 'unknown' };
   void refreshTorrentState();
   return why;
+}
+
+/** Where the finished torrent's file came from, for the library's GET
+ *  AGAIN. Null until it is complete. */
+export function torrentOrigin(st: TorrentState = torrentState()): TvTorrentOrigin | null {
+  if (st.state !== 'complete' || !HEX_40.test(st.id) || st.pick === null) return null;
+  return { ih: st.id, file: st.pick };
+}
+
+/** The torrent is somewhere between START and its file in the blob lane:
+ *  STOP is what the remote offers. */
+export function torrentRunning(st: TorrentState = torrentState()): boolean {
+  return st.state === 'metadata' || st.state === 'ready' || st.state === 'downloading' || st.state === 'importing';
 }
 
 /** The finished torrent as the TV's source: the blob it became, provided by
@@ -165,6 +247,10 @@ export function torrentLine(st: TorrentState, fmt: (n: number) => string): strin
     case 'unknown': return '';
     case 'none': return 'No torrent yet: paste a magnet and press 🧲 START.';
     case 'metadata': return `🧲 Asking the swarm for ${st.name || 'the file list'}…`;
+    case 'ready': {
+      const n = st.files.length;
+      return `📋 ${st.name || 'The torrent'}: ${n} file${n === 1 ? '' : 's'} the TV can play. Nothing downloads until you pick one and press ⬇ DOWNLOAD.`;
+    }
     case 'downloading': {
       const pct = st.size ? Math.floor((st.have / st.size) * 100) : 0;
       return `🧲 ${st.name || 'Downloading'}: ${pct}% of ${fmt(st.size)} · ${st.peers} peer${st.peers === 1 ? '' : 's'} · shared ${fmt(st.uploaded)}`;

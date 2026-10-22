@@ -84,6 +84,8 @@ pub fn storage_bound(size: u64) -> u64 {
 
 /// The longest room id a blob route accepts (the browser's are far shorter).
 const MAX_ROOM_LEN: usize = 256;
+/// The most hashes the held route lists (the TV library holds at most 200).
+const MAX_HELD_LISTED: usize = 1000;
 /// The longest request head the HTTP API reads before it gives up.
 pub const MAX_HEAD: usize = 16 * 1024;
 
@@ -229,6 +231,21 @@ impl BlobLane {
         serde_json::json!({ "state": state, "have": h.have, "size": h.size, "why": why }).to_string()
     }
 
+    /// The JSON the held route answers: every whole blob this node serves to
+    /// `room`'s members, and the members a FETCH from here could dial now
+    /// (`reachable`, each at most `MAX_HELD_LISTED`), so the TV library can
+    /// say which entries play from this node, and whose node an entry names
+    /// is still here, without asking one by one. `more`: the held list was
+    /// cut, so a hash missing from it is not known to be missing.
+    pub(crate) fn held_json(&self, room: &str, reachable: &[PublicKey]) -> String {
+        let held = self.held.lock().unwrap();
+        let mut whole = held.iter().filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room));
+        let hashes: Vec<String> = whole.by_ref().take(MAX_HELD_LISTED).map(|(hash, _)| hash.to_hex().to_string()).collect();
+        let more = whole.next().is_some();
+        let peers: Vec<String> = reachable.iter().take(MAX_HELD_LISTED).map(|p| p.to_string()).collect();
+        serde_json::json!({ "held": hashes, "more": more, "reachable": peers }).to_string()
+    }
+
     fn fail(&self, hash: &Hash, why: &str) {
         let mut held = self.held.lock().unwrap();
         // Only a transfer still running can fail: an import of the same file
@@ -335,6 +352,12 @@ impl BlobLane {
             rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len),
         });
         Some(placeholder)
+    }
+
+    /// Whether a file of `len` bytes would fit in the quota now (a later
+    /// `reserve` still decides).
+    pub(crate) fn fits(&self, len: u64) -> bool {
+        Self::charged(&self.held.lock().unwrap()) + storage_bound(len) <= self.quota
     }
 
     /// Give a reservation back (the import did not happen).
@@ -631,6 +654,15 @@ pub async fn handle_http(
                 }
             }
         }
+        ("GET", "/api/blob/held") => {
+            let room = head.query.get("room").cloned().unwrap_or_default();
+            if !valid_room(&room) {
+                return reply(socket, "400 Bad Request", cors, &err_json("no room")).await;
+            }
+            let reachable: Vec<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().collect()).unwrap_or_default();
+            let body = lane.held_json(&room, &reachable);
+            reply(socket, "200 OK", cors, &body).await;
+        }
         ("GET", "/api/blob/status") => {
             let Some(hash) = hash_param(&head) else {
                 return reply(socket, "400 Bad Request", cors, &err_json("no hash")).await;
@@ -793,6 +825,11 @@ mod tests {
         lane_a.held.lock().unwrap().insert(tag.hash, Held {
             rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size,
         });
+        assert_eq!(
+            lane_a.held_json("r", &[b_id]),
+            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "more": false, "reachable": [b_id.to_string()] }).to_string()
+        );
+        assert_eq!(lane_a.held_json("elsewhere", &[]), r#"{"held":[],"more":false,"reachable":[]}"#);
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
             lane.held.lock().unwrap().insert(tag.hash, Held {
                 rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared,

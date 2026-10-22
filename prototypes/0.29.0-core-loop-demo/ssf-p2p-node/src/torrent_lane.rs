@@ -8,11 +8,23 @@
 //! The §6 rules, and where each one stands here:
 //!
 //! - **Started only from a local command**: `POST /api/torrent/add` behind the
-//!   blob lane's gate (an allowed Origin and this launch's token). Nothing in
-//!   the room record starts a torrent; the record only ever sees the blob.
-//! - **No tracker list, and no tracker from the magnet**: the magnet is
-//!   rebuilt from its info hash alone (`clean_magnet`), so `tr=`, `ws=` and
-//!   `x.pe=` never reach the client, and the session runs with trackers off.
+//!   blob lane's gate (an allowed Origin and this launch's token), with a
+//!   pasted magnet or a chosen .torrent file. Nothing in the room record
+//!   starts a torrent; the record sees the blob, and the TV library keeps
+//!   only the info hash and file number for a later GET AGAIN, which the
+//!   holder's own page sends here like any paste.
+//! - **Look before you download**: the file list (the torrent's own names
+//!   and sizes, not a paste's `dn=`) waits in the status as `ready`, and no
+//!   piece is asked for until the holder picks a file and confirms it
+//!   (`POST /api/torrent/confirm`, naming the status's `job`, so a list
+//!   that changed under the remote is not confirmed). The file's quota is
+//!   reserved right there. A file this node could not hold is marked, and
+//!   refused at confirm with the list left for another pick.
+//! - **No tracker list, and no tracker from the paste**: a magnet is rebuilt
+//!   from its info hash alone (`clean_magnet`), so `tr=`, `ws=` and `x.pe=`
+//!   never reach the client; a .torrent from its `info` dictionary alone
+//!   (`clean_torrent`), so its `announce`, `announce-list` and `url-list`
+//!   never do either. The session runs with trackers off.
 //!   The plan's operator setting for trackers needs the media proxy's
 //!   destination gate on every announce, which librqbit cannot be made to
 //!   use, so per §6 it stays off and is not offered.
@@ -68,6 +80,12 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(180);
 const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// The longest pasted magnet the add route reads.
 const MAX_MAGNET: usize = 8 * 1024;
+/// The largest .torrent file the add route reads (a big one is ~1 MB).
+const MAX_TORRENT_FILE: usize = 4 * 1024 * 1024;
+/// A file list nobody confirms in this long is dropped.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(600);
+/// The most playable files the confirm step lists.
+const MAX_LISTED: usize = 200;
 /// The longest name the status shows (the TV record's title is shorter).
 const MAX_NAME: usize = 120;
 
@@ -75,6 +93,8 @@ const MAX_NAME: usize = 120;
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
     Metadata,
+    /// The file list is here; waiting for the holder to pick and confirm.
+    Ready,
     Downloading,
     Importing,
     Complete,
@@ -103,6 +123,30 @@ struct Job {
     /// Its torrent, reservation and cache directory are gone: only then may
     /// the next START replace it (a phase turns final before teardown runs).
     torn: bool,
+    /// The playable files, once the list is here (index, path, size, type).
+    files: Vec<Playable>,
+    /// The file the confirm step offers first (a library's GET AGAIN names
+    /// the one played before), then the one downloading.
+    pick: Option<usize>,
+    /// Hands the confirmed file to the waiting task.
+    confirm: Option<tokio::sync::oneshot::Sender<usize>>,
+}
+
+/// What a holder pasted or chose: the client only ever sees it cleaned.
+pub enum Added {
+    /// A magnet rebuilt from its info hash alone (`clean_magnet`).
+    Magnet(String),
+    /// A .torrent rebuilt from its `info` dictionary alone (`clean_torrent`).
+    Torrent(Vec<u8>),
+}
+
+/// One file of a torrent the TV can play.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Playable {
+    pub index: usize,
+    pub path: PathBuf,
+    pub size: u64,
+    pub mime: &'static str,
 }
 
 /// How the lane runs: from the environment in the node, by hand in a test.
@@ -259,14 +303,14 @@ impl TorrentLane {
 
     /// Run one torrent from metadata to a blob. Every step re-checks `seq`, so
     /// a STOP (or the next add) leaves nothing of this one to write.
-    async fn run(self: Arc<Self>, seq: u64, magnet: String) {
-        if let Err(e) = self.clone().run_inner(seq, magnet).await {
+    async fn run(self: Arc<Self>, seq: u64, added: Added) {
+        if let Err(e) = self.clone().run_inner(seq, added).await {
             self.fail(seq, format!("{e:#}"));
         }
         self.cleanup(seq).await;
     }
 
-    async fn run_inner(self: Arc<Self>, seq: u64, magnet: String) -> Result<()> {
+    async fn run_inner(self: Arc<Self>, seq: u64, added: Added) -> Result<()> {
         let session = self.session().await?;
         let base = || AddTorrentOptions { disable_trackers: true, overwrite: true, ..Default::default() };
         let timeout = self.settings.metadata_timeout;
@@ -277,49 +321,80 @@ impl TorrentLane {
             (!v.is_empty()).then_some(v)
         };
         let seed_peers = || dialable(&mut self.settings.initial_peers.iter().copied());
+        // A .torrent carries its file list, so listing it touches no network;
+        // a magnet's list comes from peers.
+        let add = match added {
+            Added::Magnet(m) => AddTorrent::from_url(m),
+            Added::Torrent(t) => AddTorrent::from_bytes(t),
+        };
         let listed = tokio::time::timeout(
             timeout,
-            session.add_torrent(AddTorrent::from_url(magnet), Some(AddTorrentOptions { list_only: true, initial_peers: seed_peers(), ..base() })),
+            session.add_torrent(add, Some(AddTorrentOptions { list_only: true, initial_peers: seed_peers(), ..base() })),
         )
         .await
         .map_err(|_| anyhow!("no peer sent this torrent's file list in {} s", timeout.as_secs()))??;
         let AddTorrentResponse::ListOnly(listed) = listed else {
             return Err(anyhow!("the torrent session answered out of turn"));
         };
+        if listed.info.info().private {
+            return Err(anyhow!("this is a private torrent: it only works through its own tracker, which this node never contacts"));
+        }
         let files: Vec<(PathBuf, u64)> = listed.info.iter_file_details().map(|d| (d.filename.to_pathbuf(), d.len)).collect();
-        let Some((index, rel, len, mime)) = pick_file(&files) else {
+        let all = playable_files(&files);
+        let Some(best) = pick_file(&files) else {
             return Err(anyhow!("no video or audio file this TV can play (mp4, webm, mkv, mp3…) in this torrent"));
         };
-        if len > self.max_size {
-            return Err(anyhow!(
-                "{} is {} MB, over this node's {} MB torrent cap (SSF_TORRENT_MAX_MB)",
-                rel.display(),
-                len / (1024 * 1024),
-                self.max_size / (1024 * 1024)
-            ));
-        }
-        let Some(reserved) = self.blobs.reserve(len, mime) else {
-            return Err(anyhow!("not enough room in this node's blob quota for {} MB", len / (1024 * 1024)));
-        };
-        let out = self.dir.join(&listed.info_hash.as_string());
-        let path = out.join(&rel);
+        // LOOK BEFORE YOU DOWNLOAD: the real name, the playable files and
+        // their sizes go on the remote, and nothing is fetched until the
+        // holder picks one and confirms. A magnet's `dn=` and a library
+        // entry's title are anyone's words; this list is the torrent's own.
+        let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
         let mut live = false;
+        let mut playable = Vec::new();
         self.update(seq, |j| {
             if j.phase == Phase::Metadata {
                 live = true;
-                j.phase = Phase::Downloading;
-                j.size = len;
-                j.reserved = Some(reserved);
+                j.phase = Phase::Ready;
                 if let Some(n) = listed.info.name() {
                     j.name = clip(&n, MAX_NAME);
                 }
+                // The file offered first is chosen from the whole torrent,
+                // then kept on the bounded list.
+                let offered = j.pick.filter(|w| all.iter().any(|p| p.index == *w)).unwrap_or(best.0);
+                playable = listed_files(&all, offered);
+                j.pick = Some(offered);
+                j.files = playable.clone();
+                j.confirm = Some(tx);
             }
         });
         if !live {
-            // STOPPED while the list arrived: give the reservation back.
-            self.blobs.unreserve(&reserved);
             return Ok(());
         }
+        let chosen = tokio::time::timeout(CONFIRM_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow!("nobody pressed DOWNLOAD in {} minutes", CONFIRM_TIMEOUT.as_secs() / 60))?
+            .map_err(|_| anyhow!("the download was not confirmed"))?;
+        let Some(Playable { index, path: rel, size: len, mime }) = playable.iter().find(|p| p.index == chosen).cloned() else {
+            return Err(anyhow!("that file is not one this TV can play"));
+        };
+        let out = self.dir.join(listed.info_hash.as_string());
+        let path = out.join(&rel);
+        // DOWNLOAD reserved the file's quota and left it on the job, so a
+        // STOP from here on gives it back in cleanup.
+        let mut reserved = None;
+        self.update(seq, |j| {
+            if j.phase == Phase::Ready {
+                reserved = j.reserved;
+                if reserved.is_some() {
+                    j.phase = Phase::Downloading;
+                    j.size = len;
+                    j.pick = Some(index);
+                }
+            }
+        });
+        let Some(reserved) = reserved else {
+            return Ok(());
+        };
         let added = session
             .add_torrent(
                 AddTorrent::from_bytes(listed.torrent_bytes.clone()),
@@ -431,12 +506,30 @@ impl TorrentLane {
 
     /// START, from this node's page: the pasted magnet, for `room`. The
     /// torrent's id, or the HTTP status and why not.
-    fn start(self: &Arc<Self>, room: String, pasted: &str) -> std::result::Result<String, (&'static str, String)> {
+    /// `pick` is the file the confirm step offers first (a library entry's).
+    fn start(self: &Arc<Self>, room: String, pasted: &str, pick: Option<usize>) -> std::result::Result<String, (&'static str, String)> {
         let (magnet, info_hash, name) = clean_magnet(pasted).map_err(|e| ("400 Bad Request", e.to_string()))?;
+        self.start_with(room, Added::Magnet(magnet), info_hash, name, pick)
+    }
+
+    /// START with a .torrent file's bytes.
+    fn start_file(self: &Arc<Self>, room: String, bytes: &[u8], pick: Option<usize>) -> std::result::Result<String, (&'static str, String)> {
+        let (clean, info_hash, name) = clean_torrent(bytes).map_err(|e| ("400 Bad Request", e.to_string()))?;
+        self.start_with(room, Added::Torrent(clean), info_hash, name, pick)
+    }
+
+    fn start_with(
+        self: &Arc<Self>,
+        room: String,
+        added: Added,
+        info_hash: String,
+        name: String,
+        pick: Option<usize>,
+    ) -> std::result::Result<String, (&'static str, String)> {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         {
             let mut job = self.job.lock().unwrap();
-            if job.as_ref().is_some_and(|j| matches!(j.phase, Phase::Metadata | Phase::Downloading | Phase::Importing)) {
+            if job.as_ref().is_some_and(|j| matches!(j.phase, Phase::Metadata | Phase::Ready | Phase::Downloading | Phase::Importing)) {
                 return Err(("409 Conflict", "a torrent is already running on this node — STOP it first".into()));
             }
             if job.as_ref().is_some_and(|j| !j.torn) {
@@ -445,12 +538,55 @@ impl TorrentLane {
             *job = Some(Job {
                 seq, info_hash: info_hash.clone(), name, room, phase: Phase::Metadata,
                 have: 0, size: 0, peers: 0, uploaded: 0, reserved: None, torrent: None, blob: None, task: None, torn: false,
+                files: Vec::new(), pick, confirm: None,
             });
         }
-        let task = tokio::spawn(self.clone().run(seq, magnet));
+        let task = tokio::spawn(self.clone().run(seq, added));
         self.update(seq, |j| j.task = Some(task.abort_handle()));
         println!("🧲 torrent {info_hash}: started from this node's page");
         Ok(info_hash)
+    }
+
+    /// Why this node would not take a file of `len` bytes now, if it would not.
+    fn too_big(&self, len: u64) -> Option<String> {
+        if len > self.max_size {
+            return Some(format!("that file is {} MB, over this node's {} MB torrent cap (SSF_TORRENT_MAX_MB)", len / (1024 * 1024), self.max_size / (1024 * 1024)));
+        }
+        (!self.blobs.fits(len)).then(|| format!("not enough room in this node's blob quota for {} MB", len.div_ceil(1024 * 1024)))
+    }
+
+    /// DOWNLOAD: the holder confirms `file` from the list of torrent `job`
+    /// (the one their remote showed). The file's quota is reserved here, so
+    /// what was confirmed is what downloads. Why not, if not: a file too big
+    /// for this node leaves the list waiting for another pick.
+    fn confirm(&self, job_seq: u64, file: usize) -> std::result::Result<(), String> {
+        let mut job = self.job.lock().unwrap();
+        let Some(j) = job.as_mut().filter(|j| j.phase == Phase::Ready) else {
+            return Err("there is no file list waiting for DOWNLOAD".into());
+        };
+        if j.seq != job_seq {
+            return Err("another torrent's list is up now: look at it before you download".into());
+        }
+        let Some((size, mime)) = j.files.iter().find(|p| p.index == file).map(|p| (p.size, p.mime)) else {
+            return Err("that file is not one this TV can play".into());
+        };
+        if j.confirm.is_none() {
+            return Err("that list was already confirmed".into());
+        }
+        if let Some(why) = self.too_big(size) {
+            return Err(why);
+        }
+        let Some(reserved) = self.blobs.reserve(size, mime) else {
+            return Err(format!("not enough room in this node's blob quota for {} MB", size.div_ceil(1024 * 1024)));
+        };
+        let tx = j.confirm.take().expect("checked above");
+        if tx.send(file).is_err() {
+            self.blobs.unreserve(&reserved);
+            return Err("the torrent is no longer waiting".into());
+        }
+        j.pick = Some(file);
+        j.reserved = Some(reserved);
+        Ok(())
     }
 
     /// STOP: end a running torrent and take everything of it off the disk.
@@ -465,7 +601,7 @@ impl TorrentLane {
                     j.phase = Phase::Stopped;
                     None
                 }
-                Some(j) if matches!(j.phase, Phase::Metadata | Phase::Downloading) => {
+                Some(j) if matches!(j.phase, Phase::Metadata | Phase::Ready | Phase::Downloading) => {
                     j.phase = Phase::Stopped;
                     if let Some(t) = j.task.take() {
                         t.abort();
@@ -488,6 +624,7 @@ impl TorrentLane {
         };
         let (state, why) = match &j.phase {
             Phase::Metadata => ("metadata", ""),
+            Phase::Ready => ("ready", ""),
             Phase::Downloading => ("downloading", ""),
             Phase::Importing => ("importing", ""),
             Phase::Complete => ("complete", ""),
@@ -495,10 +632,15 @@ impl TorrentLane {
             Phase::Stopped => ("stopped", ""),
         };
         serde_json::json!({
-            "state": state, "why": why, "id": j.info_hash, "name": j.name, "room": j.room,
+            "state": state, "why": why, "job": j.seq, "id": j.info_hash, "name": j.name, "room": j.room,
             "have": j.have, "size": j.size, "peers": j.peers, "uploaded": j.uploaded,
             "hash": j.blob.as_ref().map(|b| b.0.to_hex().to_string()),
             "mime": j.blob.as_ref().map(|b| b.1.clone()),
+            "pick": j.pick,
+            "files": j.files.iter().map(|f| serde_json::json!({
+                "index": f.index, "name": clip(&f.path.to_string_lossy(), MAX_NAME), "size": f.size,
+                "fits": j.phase != Phase::Ready || self.too_big(f.size).is_none(),
+            })).collect::<Vec<_>>(),
         })
         .to_string()
     }
@@ -518,36 +660,75 @@ pub fn clean_magnet(pasted: &str) -> Result<(String, String, String)> {
     Ok((format!("magnet:?xt=urn:btih:{id}"), id, name))
 }
 
+/// A .torrent as the client sees it: its `info` dictionary and nothing else,
+/// so no `announce`, `announce-list`, web seed (`url-list`) or comment the
+/// file carried reaches the swarm code. Also answers its v1 info hash (the
+/// hash of exactly those bytes, so unchanged) and name.
+pub fn clean_torrent(bytes: &[u8]) -> Result<(Vec<u8>, String, String)> {
+    if bytes.len() > MAX_TORRENT_FILE {
+        return Err(anyhow!("that .torrent file is over {} MB", MAX_TORRENT_FILE / (1024 * 1024)));
+    }
+    let t = librqbit::torrent_from_bytes(bytes).map_err(|e| anyhow!("that is not a .torrent file this node can read: {e}"))?;
+    if t.info.data.private {
+        return Err(anyhow!("this is a private torrent: it only works through its own tracker, which this node never contacts"));
+    }
+    let raw: &[u8] = t.info.raw_bytes.as_ref();
+    let mut clean = Vec::with_capacity(raw.len() + 8);
+    clean.extend_from_slice(b"d4:info");
+    clean.extend_from_slice(raw);
+    clean.push(b'e');
+    let name = t.info.data.name.as_ref().map(|n| String::from_utf8_lossy(n.as_ref()).into_owned()).unwrap_or_default();
+    Ok((clean, t.info_hash.as_string(), clip(&name, MAX_NAME)))
+}
+
 fn clip(s: &str, n: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(n).collect()
 }
 
-/// The one file of a torrent the TV plays: the largest mp4/webm (what every
-/// webview plays), else the largest other video, else the largest audio.
-/// Its index, path inside the torrent, length and MIME type. A path that
-/// is not a plain relative one is never picked.
-pub fn pick_file(files: &[(PathBuf, u64)]) -> Option<(usize, PathBuf, u64, &'static str)> {
-    const TIERS: [&[(&str, &str)]; 3] = [
-        &[("mp4", "video/mp4"), ("m4v", "video/mp4"), ("webm", "video/webm")],
-        &[("mkv", "video/x-matroska"), ("mov", "video/quicktime"), ("ogv", "video/ogg")],
-        &[("mp3", "audio/mpeg"), ("m4a", "audio/mp4"), ("ogg", "audio/ogg"), ("opus", "audio/ogg"), ("flac", "audio/flac"), ("wav", "audio/wav")],
-    ];
-    for tier in TIERS {
-        let best = files
-            .iter()
-            .enumerate()
-            .filter(|(_, (p, len))| *len > 0 && !p.as_os_str().is_empty() && p.components().all(|c| matches!(c, Component::Normal(_))))
-            .filter_map(|(i, (p, len))| {
-                let ext = p.extension()?.to_str()?.to_ascii_lowercase();
-                let mime = tier.iter().find(|(e, _)| *e == ext)?.1;
-                Some((i, p.clone(), *len, mime))
-            })
-            .max_by_key(|(_, _, len, _)| *len);
-        if best.is_some() {
-            return best;
+/// What the TV plays, best first: mp4/webm (what every webview plays), then
+/// other video, then audio.
+const TIERS: [&[(&str, &str)]; 3] = [
+    &[("mp4", "video/mp4"), ("m4v", "video/mp4"), ("webm", "video/webm")],
+    &[("mkv", "video/x-matroska"), ("mov", "video/quicktime"), ("ogv", "video/ogg")],
+    &[("mp3", "audio/mpeg"), ("m4a", "audio/mp4"), ("ogg", "audio/ogg"), ("opus", "audio/ogg"), ("flac", "audio/flac"), ("wav", "audio/wav")],
+];
+
+fn playable_tier(p: &std::path::Path) -> Option<(usize, &'static str)> {
+    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    TIERS.iter().enumerate().find_map(|(t, tier)| tier.iter().find(|(e, _)| *e == ext).map(|(_, m)| (t, *m)))
+}
+
+/// Every file of a torrent the TV can play, in the torrent's order. A path
+/// that is not a plain relative one, or an empty file, is never listed.
+pub fn playable_files(files: &[(PathBuf, u64)]) -> Vec<Playable> {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, len))| *len > 0 && !p.as_os_str().is_empty() && p.components().all(|c| matches!(c, Component::Normal(_))))
+        .filter_map(|(index, (p, len))| playable_tier(p).map(|(_, mime)| Playable { index, path: p.clone(), size: *len, mime }))
+        .collect()
+}
+
+/// The confirm step's list: at most MAX_LISTED files in the torrent's order,
+/// always with `offered` on it (in place of the last when it is further on).
+pub fn listed_files(all: &[Playable], offered: usize) -> Vec<Playable> {
+    let mut list: Vec<Playable> = all.iter().take(MAX_LISTED).cloned().collect();
+    if !list.iter().any(|p| p.index == offered) {
+        if let Some(p) = all.iter().find(|p| p.index == offered) {
+            list.truncate(MAX_LISTED - 1);
+            list.push(p.clone());
         }
     }
-    None
+    list
+}
+
+/// The file the confirm step offers first: the largest of the best tier.
+/// Its index, path inside the torrent, length and MIME type.
+pub fn pick_file(files: &[(PathBuf, u64)]) -> Option<(usize, PathBuf, u64, &'static str)> {
+    playable_files(files)
+        .into_iter()
+        .max_by_key(|p| (std::cmp::Reverse(playable_tier(&p.path).map(|t| t.0).unwrap_or(9)), p.size))
+        .map(|p| (p.index, p.path, p.size, p.mime))
 }
 
 /// Every address range that is not global unicast, as the session's
@@ -632,20 +813,38 @@ pub async fn handle_http(
             if !valid_room(&room) {
                 return reply(socket, "400 Bad Request", cors, &err_json("no room")).await;
             }
-            let Some(len) = head.headers.get("content-length").and_then(|v| v.parse::<usize>().ok()).filter(|l| *l <= MAX_MAGNET) else {
-                return reply(socket, "413 Payload Too Large", cors, &err_json("paste one magnet link")).await;
+            // The body is a pasted magnet, or with `kind=torrent` a .torrent
+            // file's bytes. `file` names the one the confirm step offers first.
+            let as_file = head.query.get("kind").is_some_and(|k| k == "torrent");
+            let pick = head.query.get("file").and_then(|f| f.parse::<usize>().ok());
+            let (max, what) = if as_file { (MAX_TORRENT_FILE, "a .torrent file over 4 MB") } else { (MAX_MAGNET, "paste one magnet link") };
+            let Some(len) = head.headers.get("content-length").and_then(|v| v.parse::<usize>().ok()).filter(|l| *l > 0 && *l <= max) else {
+                return reply(socket, "413 Payload Too Large", cors, &err_json(what)).await;
             };
             let mut body = body_start[..body_start.len().min(len)].to_vec();
             while body.len() < len {
-                let mut buf = vec![0u8; len - body.len()];
+                let mut buf = vec![0u8; (len - body.len()).min(64 * 1024)];
                 match tokio::time::timeout(Duration::from_secs(10), socket.read(&mut buf)).await {
                     Ok(Ok(n)) if n > 0 => body.extend_from_slice(&buf[..n]),
-                    _ => return reply(socket, "400 Bad Request", cors, &err_json("the paste ended early")).await,
+                    _ => return reply(socket, "400 Bad Request", cors, &err_json("the upload ended early")).await,
                 }
             }
-            match lane.start(room, &String::from_utf8_lossy(&body)) {
+            let started = if as_file { lane.start_file(room, &body, pick) } else { lane.start(room, &String::from_utf8_lossy(&body), pick) };
+            match started {
                 Ok(id) => reply(socket, "202 Accepted", cors, &serde_json::json!({ "ok": true, "id": id }).to_string()).await,
                 Err((status, why)) => reply(socket, status, cors, &err_json(&why)).await,
+            }
+        }
+        ("POST", "/api/torrent/confirm") => {
+            let Some(file) = head.query.get("file").and_then(|f| f.parse::<usize>().ok()) else {
+                return reply(socket, "400 Bad Request", cors, &err_json("no file named")).await;
+            };
+            let Some(job) = head.query.get("job").and_then(|f| f.parse::<u64>().ok()) else {
+                return reply(socket, "400 Bad Request", cors, &err_json("no list named")).await;
+            };
+            match lane.confirm(job, file) {
+                Ok(()) => reply(socket, "200 OK", cors, &serde_json::json!({ "ok": true }).to_string()).await,
+                Err(why) => reply(socket, "409 Conflict", cors, &err_json(&why)).await,
             }
         }
         ("GET", "/api/torrent/status") => {
@@ -777,8 +976,27 @@ mod tests {
         let Seeded { lane, blobs, id, video, _seeder: _keep, .. } = lane_with_seeder(tmp.0.as_path(), false, 64 * 1024 * 1024).await;
         // Trackers and peer hints in the paste are dropped; the hash is all.
         let pasted = format!("magnet:?xt=urn:btih:{id}&dn=Clip&tr=udp%3A%2F%2F10.0.0.1%3A6969&x.pe=10.0.0.2:6881");
-        assert_eq!(lane.start("room-1".into(), &pasted).unwrap(), id);
-        assert_eq!(lane.start("room-1".into(), &pasted).unwrap_err().0, "409 Conflict");
+        assert_eq!(lane.start("room-1".into(), &pasted, None).unwrap(), id);
+        assert_eq!(lane.start("room-1".into(), &pasted, None).unwrap_err().0, "409 Conflict");
+        // LOOK BEFORE YOU DOWNLOAD: the list waits, nothing is fetched.
+        let st = wait_for(&lane, |s| s["state"] != "metadata").await;
+        assert_eq!(st["state"], "ready", "{st}");
+        assert_eq!(st["name"], "Clip");
+        assert_eq!(st["files"].as_array().unwrap().len(), 1, "only the playable file is listed: {st}");
+        let pick = st["pick"].as_u64().unwrap() as usize;
+        assert_eq!(st["files"][0]["index"], pick as u64);
+        assert_eq!(st["files"][0]["size"], video.len() as u64);
+        assert_eq!(st["files"][0]["fits"], true);
+        assert!(st["files"][0]["name"].as_str().unwrap().ends_with("clip.webm"));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(lane.status_json().contains(r#""state":"ready""#), true);
+        assert_eq!(st["have"], 0);
+        let job = st["job"].as_u64().unwrap();
+        assert!(lane.confirm(job, pick + 1).is_err(), "the text file is not one to confirm");
+        // DOWNLOAD names the list the remote showed: an earlier one's is refused.
+        assert!(lane.confirm(job - 1, pick).unwrap_err().contains("another torrent"));
+        lane.confirm(job, pick).unwrap();
+        assert!(lane.confirm(job, pick).is_err(), "confirmed twice");
         let st = wait_for(&lane, |s| matches!(s["state"].as_str(), Some("complete" | "failed"))).await;
         assert_eq!(st["state"], "complete", "{st}");
         assert_eq!(st["size"], video.len() as u64);
@@ -799,14 +1017,14 @@ mod tests {
         let tmp = TempDir::new("a_loopback_seeder_is_refused_and_stop_cleans_up");
         // The real blocklist: the seeder on 127.0.0.1 is never dialled.
         let Seeded { lane, id, torrent, peer, _seeder: _keep, .. } = lane_with_seeder(tmp.0.as_path(), true, 64 * 1024 * 1024).await;
-        lane.start("room-1".into(), &format!("magnet:?xt=urn:btih:{id}")).unwrap();
+        lane.start("room-1".into(), &format!("magnet:?xt=urn:btih:{id}"), None).unwrap();
         let st = wait_for(&lane, |s| s["state"] != "metadata").await;
         assert_eq!(st["state"], "failed", "{st}");
         assert_eq!(st["size"], 0, "the file list came from a loopback peer: {st}");
         // A new paste after a failure runs (once the failed one is torn
         // down); STOP ends it.
         wait_for(&lane, |_| lane.job.lock().unwrap().as_ref().is_some_and(|j| j.torn)).await;
-        lane.start("room-1".into(), &format!("magnet:?xt=urn:btih:{id}")).unwrap();
+        lane.start("room-1".into(), &format!("magnet:?xt=urn:btih:{id}"), None).unwrap();
         lane.stop().await;
         // With no dialable peer it may have failed on its own first; either
         // way it ends torn down.
@@ -832,10 +1050,73 @@ mod tests {
     async fn a_file_over_the_quota_is_refused_before_download() {
         let tmp = TempDir::new("a_file_over_the_quota_is_refused_before_download");
         let Seeded { lane, id, _seeder: _keep, .. } = lane_with_seeder(tmp.0.as_path(), false, 100_000).await;
-        lane.start("room-1".into(), &format!("magnet:?xt=urn:btih:{id}")).unwrap();
-        let st = wait_for(&lane, |s| matches!(s["state"].as_str(), Some("complete" | "failed" | "downloading"))).await;
-        assert_eq!(st["state"], "failed", "{st}");
-        assert!(st["why"].as_str().unwrap().contains("blob quota"), "{st}");
+        lane.start("room-1".into(), &format!("magnet:?xt=urn:btih:{id}"), None).unwrap();
+        let st = wait_for(&lane, |s| s["state"] != "metadata").await;
+        assert_eq!(st["state"], "ready", "{st}");
+        // The list says it will not fit, DOWNLOAD says why, and the list
+        // stays for another pick (or STOP).
+        assert_eq!(st["files"][0]["fits"], false, "{st}");
+        let why = lane.confirm(st["job"].as_u64().unwrap(), st["pick"].as_u64().unwrap() as usize).unwrap_err();
+        assert!(why.contains("blob quota"), "{why}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&lane.status_json()).unwrap()["state"], "ready");
+        lane.stop().await;
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&lane.status_json()).unwrap()["state"], "stopped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_torrent_file_lands_with_its_trackers_dropped() {
+        let tmp = TempDir::new("a_torrent_file_lands_with_its_trackers_dropped");
+        let Seeded { lane, id, video, torrent, _seeder: _keep, .. } = lane_with_seeder(tmp.0.as_path(), false, 64 * 1024 * 1024).await;
+        // The file as a holder might have it: announce lists and a web seed.
+        let carried = with_trackers(&torrent);
+        assert_eq!(librqbit::torrent_from_bytes(&carried).unwrap().info_hash.as_string(), id);
+        let (clean, hash, name) = clean_torrent(&carried).unwrap();
+        assert_eq!((hash.as_str(), name.as_str()), (id.as_str(), "Clip"));
+        let cleaned = librqbit::torrent_from_bytes(&clean).unwrap();
+        assert_eq!(cleaned.info_hash.as_string(), id);
+        assert!(cleaned.announce.is_none() && cleaned.announce_list.is_empty());
+        assert!(!String::from_utf8_lossy(&clean).contains("tracker.example") && !String::from_utf8_lossy(&clean).contains("seed.example"));
+        // A preselected file that is not playable falls back to the best one.
+        assert_eq!(lane.start_file("room-1".into(), &carried, Some(99)).unwrap(), id);
+        let st = wait_for(&lane, |s| s["state"] != "metadata").await;
+        assert_eq!(st["state"], "ready", "{st}");
+        let pick = st["pick"].as_u64().unwrap() as usize;
+        assert_eq!(st["files"][0]["index"], pick as u64);
+        lane.confirm(st["job"].as_u64().unwrap(), pick).unwrap();
+        let st = wait_for(&lane, |s| matches!(s["state"].as_str(), Some("complete" | "failed"))).await;
+        assert_eq!(st["state"], "complete", "{st}");
+        assert_eq!(st["hash"].as_str().unwrap(), Hash::new(&video).to_hex().to_string());
+    }
+
+    /// `torrent`'s info with an announce, an announce-list, a comment and a
+    /// url-list around it, keys in bencode's sorted order.
+    fn with_trackers(torrent: &[u8]) -> Vec<u8> {
+        let t = librqbit::torrent_from_bytes(torrent).unwrap();
+        let s = |v: &str| format!("{}:{v}", v.len());
+        let tr = s("udp://tracker.example:6969/announce");
+        let mut out = format!("d{}{tr}{}ll{tr}ee{}{}4:info", s("announce"), s("announce-list"), s("comment"), s("from tracker.example")).into_bytes();
+        out.extend_from_slice(t.info.raw_bytes.as_ref());
+        out.extend_from_slice(format!("{}l{}ee", s("url-list"), s("https://seed.example/clip/")).as_bytes());
+        out
+    }
+
+    #[test]
+    fn a_torrent_file_is_read_with_care() {
+        assert!(clean_torrent(b"not bencode").is_err());
+        assert!(clean_torrent(&vec![b'd'; MAX_TORRENT_FILE + 1]).unwrap_err().to_string().contains("over 4 MB"));
+        // A private torrent is refused before anything runs.
+        let info = b"d6:lengthi5e4:name5:a.mp412:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaa7:privatei1ee";
+        let mut t = b"d4:info".to_vec();
+        t.extend_from_slice(info);
+        t.push(b'e');
+        assert!(clean_torrent(&t).unwrap_err().to_string().contains("private"));
+    }
+
+    #[test]
+    fn the_confirm_step_lists_only_playable_files() {
+        let f = |v: &[(&str, u64)]| v.iter().map(|(p, l)| (PathBuf::from(p), *l)).collect::<Vec<_>>();
+        let listed = playable_files(&f(&[("S/a.srt", 9), ("S/ep1.mkv", 5), ("S/../x.mp4", 5), ("S/ep2.mp4", 7), ("S/cover.jpg", 3), ("S/ep3.webm", 0)]));
+        assert_eq!(listed.iter().map(|p| (p.index, p.mime)).collect::<Vec<_>>(), vec![(1, "video/x-matroska"), (3, "video/mp4")]);
     }
 
     #[test]
@@ -861,6 +1142,23 @@ mod tests {
         assert_eq!(pick_file(&f(&[("a.MKV", 5), ("b.mp3", 9)])).unwrap().3, "video/x-matroska");
         assert_eq!(pick_file(&f(&[("a.flac", 5), ("cover.png", 9)])).unwrap().3, "audio/flac");
         assert!(pick_file(&f(&[("../escape.mp4", 5), ("/abs.mp4", 5), ("empty.mp4", 0), ("notes.txt", 9)])).is_none());
+    }
+
+    #[test]
+    fn the_file_offered_first_stays_on_a_long_list() {
+        // 300 short clips, then the film: the film is offered, and listed.
+        let mut files: Vec<(PathBuf, u64)> = (0..300).map(|i| (PathBuf::from(format!("extras/{i}.mp4")), 1_000)).collect();
+        files.push((PathBuf::from("Film.mp4"), 900_000_000));
+        let all = playable_files(&files);
+        let best = pick_file(&files).unwrap().0;
+        assert_eq!(best, 300);
+        let list = listed_files(&all, best);
+        assert_eq!(list.len(), MAX_LISTED);
+        assert_eq!(list.last().unwrap().index, 300);
+        assert!(list.windows(2).all(|w| w[0].index < w[1].index), "still in the torrent's order");
+        // One already on it changes nothing; one not in the torrent is not added.
+        assert_eq!(listed_files(&all, 5).iter().map(|p| p.index).collect::<Vec<_>>(), (0..MAX_LISTED).collect::<Vec<_>>());
+        assert_eq!(listed_files(&all, 9_999).len(), MAX_LISTED);
     }
 
     #[test]

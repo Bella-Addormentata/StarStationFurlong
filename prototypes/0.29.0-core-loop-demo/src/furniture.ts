@@ -11111,15 +11111,15 @@ function buildPartySpeaker(ctx: BuildCtx) {
 
 /** The home screen's source tiles, in the remote's order (tvUI TILES): the
  *  source kind each stands for (sovereignty.ts decides which this build
- *  offers) and whether its lane exists yet (`live`; TORRENT and KARAOKE
- *  are plan §3.3's later tiles, drawn dimmed — FILE arrived with the blob
- *  lane, blobLane.ts). */
+ *  offers) and whether its lane exists yet (`live`; KARAOKE is plan §3.3's
+ *  later tile, drawn dimmed — FILE arrived with the blob lane, blobLane.ts,
+ *  and TORRENT with the torrent lane, torrentLane.ts). */
 const TV_HOME_TILES: ReadonlyArray<{ label: string; kind: string; live: boolean }> = [
   { label: "▶ YOUTUBE", kind: "youtube", live: true },
   { label: "ARCHIVE", kind: "archive", live: true },
   { label: "URL", kind: "url", live: true },
   { label: "FILE", kind: "file", live: true },
-  { label: "TORRENT", kind: "magnet", live: false },
+  { label: "TORRENT", kind: "magnet", live: true },
   { label: "KARAOKE", kind: "karaoke", live: false },
 ];
 
@@ -11202,23 +11202,35 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       g.addColorStop(1, "#06101f");
       c2d.fillStyle = g;
       c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
-      text("FURLONG TV", TV_TEX_W / 2, 48, "bold 26px monospace", "#f0c060", "center");
       // The same shelf the phone's remote offers (tvUI visibleTiles): a lane
       // this build does not offer (sovereignty.ts — YouTube and archive.org
       // without the convenience lanes) is not drawn, and a tile for a lane
       // still to come is drawn dimmed. The screen must not show as live
       // what the remote refuses.
       const tiles = TV_HOME_TILES.filter((tile) => sourceKindAllowed(tile.kind));
-      tiles.forEach((tile, i) => {
-        const x = 24 + (i % 3) * 116;
-        const y = 84 + Math.floor(i / 3) * 50;
-        const live = tile.live;
+      const tile = (label: string, live: boolean, x: number, y: number, w: number, h: number, font: string) => {
         c2d.fillStyle = live ? "rgba(0,229,255,0.10)" : "rgba(255,255,255,0.04)";
-        c2d.fillRect(x, y, 104, 38);
+        c2d.fillRect(x, y, w, h);
         c2d.strokeStyle = live ? "rgba(0,229,255,0.6)" : "rgba(255,255,255,0.12)";
-        c2d.strokeRect(x + 0.5, y + 0.5, 103, 37);
-        text(tile.label, x + 52, y + 19, "bold 11px monospace", live ? "#e8f4ff" : "#4a5560", "center");
-      });
+        c2d.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        text(label, x + w / 2, y + h / 2, font, live ? "#e8f4ff" : "#4a5560", "center");
+      };
+      if (view.recent?.length) {
+        // 📚 The room's library has something: the tiles move left, and its
+        // newest titles take the right (tvDoc readLibrary).
+        text("FURLONG TV", TV_TEX_W / 2, 36, "bold 22px monospace", "#f0c060", "center");
+        tiles.forEach((t, i) => tile(t.label, t.live, 16 + (i % 2) * 92, 62 + Math.floor(i / 2) * 40, 86, 32, "bold 10px monospace"));
+        c2d.fillStyle = "rgba(240,192,96,0.25)";
+        c2d.fillRect(204, 62, 1, 112);
+        text("RECENTLY ON", 216, 72, "bold 11px monospace", "#f0c060");
+        view.recent.forEach((t, i) => {
+          const line = t.length > 23 ? `${t.slice(0, 22)}…` : t;
+          text(line, 216, 98 + i * 22, "11px monospace", "#e8f4ff");
+        });
+      } else {
+        text("FURLONG TV", TV_TEX_W / 2, 48, "bold 26px monospace", "#f0c060", "center");
+        tiles.forEach((t, i) => tile(t.label, t.live, 24 + (i % 3) * 116, 84 + Math.floor(i / 3) * 50, 104, 38, "bold 11px monospace"));
+      }
       text(view.detail, TV_TEX_W / 2, 196, "11px monospace", "#8fa3b8", "center");
       glowLevel = 0.5;
     } else {
