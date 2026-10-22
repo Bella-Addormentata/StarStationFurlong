@@ -235,17 +235,15 @@ impl BlobLane {
     /// `room`'s members, and the members a FETCH from here could dial now
     /// (`reachable`, each at most `MAX_HELD_LISTED`), so the TV library can
     /// say which entries play from this node, and whose node an entry names
-    /// is still here, without asking one by one.
+    /// is still here, without asking one by one. `more`: the held list was
+    /// cut, so a hash missing from it is not known to be missing.
     pub(crate) fn held_json(&self, room: &str, reachable: &[PublicKey]) -> String {
         let held = self.held.lock().unwrap();
-        let hashes: Vec<String> = held
-            .iter()
-            .filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room))
-            .take(MAX_HELD_LISTED)
-            .map(|(hash, _)| hash.to_hex().to_string())
-            .collect();
+        let mut whole = held.iter().filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room));
+        let hashes: Vec<String> = whole.by_ref().take(MAX_HELD_LISTED).map(|(hash, _)| hash.to_hex().to_string()).collect();
+        let more = whole.next().is_some();
         let peers: Vec<String> = reachable.iter().take(MAX_HELD_LISTED).map(|p| p.to_string()).collect();
-        serde_json::json!({ "held": hashes, "reachable": peers }).to_string()
+        serde_json::json!({ "held": hashes, "more": more, "reachable": peers }).to_string()
     }
 
     fn fail(&self, hash: &Hash, why: &str) {
@@ -829,9 +827,9 @@ mod tests {
         });
         assert_eq!(
             lane_a.held_json("r", &[b_id]),
-            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "reachable": [b_id.to_string()] }).to_string()
+            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "more": false, "reachable": [b_id.to_string()] }).to_string()
         );
-        assert_eq!(lane_a.held_json("elsewhere", &[]), r#"{"held":[],"reachable":[]}"#);
+        assert_eq!(lane_a.held_json("elsewhere", &[]), r#"{"held":[],"more":false,"reachable":[]}"#);
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
             lane.held.lock().unwrap().insert(tag.hash, Held {
                 rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared,

@@ -359,7 +359,7 @@ let pickedFile: File | null = null;
 /** 🧲 The .torrent file the TORRENT tile has chosen, kept like pickedFile
  *  until a START takes it; and the file picked from the node's list. */
 let pickedTorrent: File | null = null;
-let torrentPick: { id: string; index: number } | null = null;
+let torrentPick: { job: number; index: number } | null = null;
 
 // ── 📚 The library on the remote ─────────────────────────────────────────────
 
@@ -411,8 +411,9 @@ function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (e.source.kind !== 'blob') return 'unknown';
   // Nothing is said before the node has answered (no node, or not yet).
   const reach = nodeReaches(e.source.provider);
-  if (reach === null) return 'unknown';
-  if (nodeHolds(e.source.hash)) return 'mine';
+  const holds = nodeHolds(e.source.hash);
+  if (reach === null || holds === null) return 'unknown';
+  if (holds) return 'mine';
   if (e.source.provider === blobLaneNodeId()) return 'lost'; // names this node, which no longer holds it (a restart empties it)
   return reach ? 'theirs' : 'away';
 }
@@ -753,7 +754,7 @@ function torrentBlock(): string {
   const status = `<div data-tv-torrent-status="1" style="font-size:9.5px; color:${GOLD_BRIGHT}; min-height:12px; line-height:1.4;">${esc(torrentLine(st, formatBytes))}</div>`;
   if (st.state === 'ready') {
     // LOOK BEFORE YOU DOWNLOAD: the torrent's own names and sizes.
-    const chosen = torrentPick?.id === st.id && st.files.some((f) => f.index === torrentPick!.index) ? torrentPick.index : st.pick;
+    const chosen = torrentPick?.job === st.job && st.files.some((f) => f.index === torrentPick!.index) ? torrentPick.index : st.pick;
     const pick = st.files.find((f) => f.index === chosen);
     const rows = st.files.map((f) => `<label style="display:flex; gap:6px; align-items:center; font-size:9.5px; color:${f.fits ? GOLD_BRIGHT : DIM}; cursor:pointer;">
         <input type="radio" name="tv-torrent-pick" data-tv-torrent-pick="${f.index}" ${f.index === chosen ? 'checked' : ''} style="width:auto; flex:none; margin:0; padding:0;">
@@ -764,7 +765,7 @@ function torrentBlock(): string {
       <div class="phone-access-header" style="margin-top:2px;">📋 ${esc(st.name || 'THE TORRENT')} — WHAT IS IN IT</div>
       <div style="display:flex; flex-direction:column; gap:4px; max-height:150px; overflow-y:auto;">${rows}</div>
       <div style="display:flex; gap:6px; flex-wrap:wrap;">
-        ${smallButton('data-tv-torrent-confirm="1"', pick ? `⬇ DOWNLOAD ${esc(formatBytes(pick.size))}` : '⬇ DOWNLOAD', !!pick && pick.fits)}
+        ${smallButton(`data-tv-torrent-confirm="${st.job}" data-tv-torrent-file-index="${pick?.index ?? ''}"`, pick ? `⬇ DOWNLOAD ${esc(formatBytes(pick.size))}` : '⬇ DOWNLOAD', !!pick && pick.fits)}
         ${smallButton('data-tv-torrent-stop="1"', '✖ CANCEL')}
       </div>
       ${status}`;
@@ -1049,19 +1050,21 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   });
   host.querySelectorAll<HTMLInputElement>('[data-tv-torrent-pick]').forEach((r) => r.addEventListener('change', () => {
     const st = torrentState();
-    if (st.state === 'ready') torrentPick = { id: st.id, index: Number(r.dataset.tvTorrentPick) };
+    if (st.state === 'ready') torrentPick = { job: st.job, index: Number(r.dataset.tvTorrentPick) };
     renderTvPhoneApp(host, deps);
   }));
-  host.querySelector<HTMLButtonElement>('[data-tv-torrent-confirm]')?.addEventListener('click', async () => {
-    const st = torrentState();
-    if (st.state !== 'ready') return;
-    const index = torrentPick?.id === st.id ? torrentPick.index : st.pick;
+  host.querySelector<HTMLButtonElement>('[data-tv-torrent-confirm]')?.addEventListener('click', async (e) => {
+    // The list and file this button was drawn for: the node refuses it if
+    // another torrent's list is up by now.
+    const button = e.currentTarget as HTMLButtonElement;
+    const job = Number(button.dataset.tvTorrentConfirm);
+    const index = button.dataset.tvTorrentFileIndex ? Number(button.dataset.tvTorrentFileIndex) : null;
     if (index === null) {
       feedback('Pick a file first.');
       return;
     }
     feedback('Asking your node to download it…');
-    const why = await confirmTorrent(index);
+    const why = await confirmTorrent(job, index);
     feedback(why ?? '');
     renderTvPhoneApp(host, deps);
   });

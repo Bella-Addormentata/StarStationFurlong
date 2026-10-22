@@ -26,7 +26,7 @@ function withNode(torrent: boolean) {
 }
 
 const complete = {
-  state: 'complete', id: INFO, room: 'room-1', name: 'Sintel', have: 129_000_000, size: 129_000_000, peers: 0, uploaded: 0, why: '', hash: HASH, mime: 'video/mp4',
+  state: 'complete', job: 4, id: INFO, room: 'room-1', name: 'Sintel', have: 129_000_000, size: 129_000_000, peers: 0, uploaded: 0, why: '', hash: HASH, mime: 'video/mp4',
   pick: 2, files: [{ index: 2, name: 'Sintel/Sintel.mp4', size: 129_000_000, fits: true }],
 };
 const ready = { ...complete, state: 'ready', size: 0, have: 0, hash: null, mime: null, pick: 2, files: [
@@ -154,9 +154,14 @@ describe('torrentLane', () => {
       calls.push({ url, init });
       return new Response(JSON.stringify(url.includes('/status') ? ready : { ok: true }), { status: url.includes('/add') ? 202 : 200 });
     }));
-    expect(await confirmTorrent(2)).toBeNull();
-    expect(calls[0]!.url).toBe(`${ORIGIN}/api/torrent/confirm?cap=${CAP}&file=2`);
+    expect(parseTorrentState(ready).state === 'ready' && parseTorrentState(ready)).toMatchObject({ job: 4 });
+    expect(await confirmTorrent(4, 2)).toBeNull();
+    expect(calls[0]!.url).toBe(`${ORIGIN}/api/torrent/confirm?cap=${CAP}&job=4&file=2`);
     expect(calls[0]!.init?.method).toBe('POST');
+    // No list seen yet: nothing is asked.
+    calls.length = 0;
+    expect(await confirmTorrent(0, 2)).toMatch(/file list/);
+    expect(calls).toHaveLength(0);
     calls.length = 0;
     const file = new Blob([new Uint8Array([100, 52, 58])]);
     expect(await startTorrentFile(file)).toBeNull();
@@ -204,7 +209,15 @@ describe('what this node holds, for the library', () => {
     expect(nodeReaches('f'.repeat(64))).toBe(false);
     // Another room's answer is not this one's.
     setBlobLaneRoom('room-2');
-    expect(nodeHolds(HASH)).toBe(false);
+    expect(nodeHolds(HASH)).toBeNull();
     expect(nodeReaches(ID)).toBeNull();
+  });
+
+  it('takes a hash missing from a cut list as not known, not as gone', async () => {
+    withNode(true);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ held: [HASH], more: true, reachable: [ID] }), { status: 200 })));
+    await refreshHeldBlobs(1_000);
+    expect(nodeHolds(HASH)).toBe(true);
+    expect(nodeHolds('e'.repeat(64))).toBeNull();
   });
 });

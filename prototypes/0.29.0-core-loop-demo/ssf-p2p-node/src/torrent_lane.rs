@@ -16,8 +16,10 @@
 //! - **Look before you download**: the file list (the torrent's own names
 //!   and sizes, not a paste's `dn=`) waits in the status as `ready`, and no
 //!   piece is asked for until the holder picks a file and confirms it
-//!   (`POST /api/torrent/confirm`). A file this node could not hold is
-//!   marked, and refused at confirm with the list left for another pick.
+//!   (`POST /api/torrent/confirm`, naming the status's `job`, so a list
+//!   that changed under the remote is not confirmed). The file's quota is
+//!   reserved right there. A file this node could not hold is marked, and
+//!   refused at confirm with the list left for another pick.
 //! - **No tracker list, and no tracker from the paste**: a magnet is rebuilt
 //!   from its info hash alone (`clean_magnet`), so `tr=`, `ws=` and `x.pe=`
 //!   never reach the client; a .torrent from its `info` dictionary alone
@@ -338,7 +340,7 @@ impl TorrentLane {
             return Err(anyhow!("this is a private torrent: it only works through its own tracker, which this node never contacts"));
         }
         let files: Vec<(PathBuf, u64)> = listed.info.iter_file_details().map(|d| (d.filename.to_pathbuf(), d.len)).collect();
-        let playable: Vec<Playable> = playable_files(&files).into_iter().take(MAX_LISTED).collect();
+        let all = playable_files(&files);
         let Some(best) = pick_file(&files) else {
             return Err(anyhow!("no video or audio file this TV can play (mp4, webm, mkv, mp3…) in this torrent"));
         };
@@ -348,6 +350,7 @@ impl TorrentLane {
         // entry's title are anyone's words; this list is the torrent's own.
         let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
         let mut live = false;
+        let mut playable = Vec::new();
         self.update(seq, |j| {
             if j.phase == Phase::Metadata {
                 live = true;
@@ -355,8 +358,11 @@ impl TorrentLane {
                 if let Some(n) = listed.info.name() {
                     j.name = clip(&n, MAX_NAME);
                 }
-                let wanted = j.pick.filter(|w| playable.iter().any(|p| p.index == *w));
-                j.pick = Some(wanted.unwrap_or(best.0));
+                // The file offered first is chosen from the whole torrent,
+                // then kept on the bounded list.
+                let offered = j.pick.filter(|w| all.iter().any(|p| p.index == *w)).unwrap_or(best.0);
+                playable = listed_files(&all, offered);
+                j.pick = Some(offered);
                 j.files = playable.clone();
                 j.confirm = Some(tx);
             }
@@ -371,29 +377,24 @@ impl TorrentLane {
         let Some(Playable { index, path: rel, size: len, mime }) = playable.iter().find(|p| p.index == chosen).cloned() else {
             return Err(anyhow!("that file is not one this TV can play"));
         };
-        if len > self.max_size {
-            return Err(anyhow!("{}: {}", rel.display(), self.too_big(len).unwrap_or_default()));
-        }
-        let Some(reserved) = self.blobs.reserve(len, mime) else {
-            return Err(anyhow!("not enough room in this node's blob quota for {} MB", len / (1024 * 1024)));
-        };
         let out = self.dir.join(listed.info_hash.as_string());
         let path = out.join(&rel);
-        let mut live = false;
+        // DOWNLOAD reserved the file's quota and left it on the job, so a
+        // STOP from here on gives it back in cleanup.
+        let mut reserved = None;
         self.update(seq, |j| {
             if j.phase == Phase::Ready {
-                live = true;
-                j.phase = Phase::Downloading;
-                j.size = len;
-                j.pick = Some(index);
-                j.reserved = Some(reserved);
+                reserved = j.reserved;
+                if reserved.is_some() {
+                    j.phase = Phase::Downloading;
+                    j.size = len;
+                    j.pick = Some(index);
+                }
             }
         });
-        if !live {
-            // STOPPED meanwhile: give the reservation back.
-            self.blobs.unreserve(&reserved);
+        let Some(reserved) = reserved else {
             return Ok(());
-        }
+        };
         let added = session
             .add_torrent(
                 AddTorrent::from_bytes(listed.torrent_bytes.clone()),
@@ -554,22 +555,38 @@ impl TorrentLane {
         (!self.blobs.fits(len)).then(|| format!("not enough room in this node's blob quota for {} MB", len.div_ceil(1024 * 1024)))
     }
 
-    /// DOWNLOAD: the holder confirms `file` from the list. Why not, if not:
-    /// a file too big for this node leaves the list waiting for another pick.
-    fn confirm(&self, file: usize) -> std::result::Result<(), String> {
+    /// DOWNLOAD: the holder confirms `file` from the list of torrent `job`
+    /// (the one their remote showed). The file's quota is reserved here, so
+    /// what was confirmed is what downloads. Why not, if not: a file too big
+    /// for this node leaves the list waiting for another pick.
+    fn confirm(&self, job_seq: u64, file: usize) -> std::result::Result<(), String> {
         let mut job = self.job.lock().unwrap();
         let Some(j) = job.as_mut().filter(|j| j.phase == Phase::Ready) else {
             return Err("there is no file list waiting for DOWNLOAD".into());
         };
-        let Some(size) = j.files.iter().find(|p| p.index == file).map(|p| p.size) else {
+        if j.seq != job_seq {
+            return Err("another torrent's list is up now: look at it before you download".into());
+        }
+        let Some((size, mime)) = j.files.iter().find(|p| p.index == file).map(|p| (p.size, p.mime)) else {
             return Err("that file is not one this TV can play".into());
         };
+        if j.confirm.is_none() {
+            return Err("that list was already confirmed".into());
+        }
         if let Some(why) = self.too_big(size) {
             return Err(why);
         }
-        let tx = j.confirm.take().ok_or("that list was already confirmed")?;
+        let Some(reserved) = self.blobs.reserve(size, mime) else {
+            return Err(format!("not enough room in this node's blob quota for {} MB", size.div_ceil(1024 * 1024)));
+        };
+        let tx = j.confirm.take().expect("checked above");
+        if tx.send(file).is_err() {
+            self.blobs.unreserve(&reserved);
+            return Err("the torrent is no longer waiting".into());
+        }
         j.pick = Some(file);
-        tx.send(file).map_err(|_| "the torrent is no longer waiting".into())
+        j.reserved = Some(reserved);
+        Ok(())
     }
 
     /// STOP: end a running torrent and take everything of it off the disk.
@@ -615,7 +632,7 @@ impl TorrentLane {
             Phase::Stopped => ("stopped", ""),
         };
         serde_json::json!({
-            "state": state, "why": why, "id": j.info_hash, "name": j.name, "room": j.room,
+            "state": state, "why": why, "job": j.seq, "id": j.info_hash, "name": j.name, "room": j.room,
             "have": j.have, "size": j.size, "peers": j.peers, "uploaded": j.uploaded,
             "hash": j.blob.as_ref().map(|b| b.0.to_hex().to_string()),
             "mime": j.blob.as_ref().map(|b| b.1.clone()),
@@ -690,6 +707,19 @@ pub fn playable_files(files: &[(PathBuf, u64)]) -> Vec<Playable> {
         .filter(|(_, (p, len))| *len > 0 && !p.as_os_str().is_empty() && p.components().all(|c| matches!(c, Component::Normal(_))))
         .filter_map(|(index, (p, len))| playable_tier(p).map(|(_, mime)| Playable { index, path: p.clone(), size: *len, mime }))
         .collect()
+}
+
+/// The confirm step's list: at most MAX_LISTED files in the torrent's order,
+/// always with `offered` on it (in place of the last when it is further on).
+pub fn listed_files(all: &[Playable], offered: usize) -> Vec<Playable> {
+    let mut list: Vec<Playable> = all.iter().take(MAX_LISTED).cloned().collect();
+    if !list.iter().any(|p| p.index == offered) {
+        if let Some(p) = all.iter().find(|p| p.index == offered) {
+            list.truncate(MAX_LISTED - 1);
+            list.push(p.clone());
+        }
+    }
+    list
 }
 
 /// The file the confirm step offers first: the largest of the best tier.
@@ -809,7 +839,10 @@ pub async fn handle_http(
             let Some(file) = head.query.get("file").and_then(|f| f.parse::<usize>().ok()) else {
                 return reply(socket, "400 Bad Request", cors, &err_json("no file named")).await;
             };
-            match lane.confirm(file) {
+            let Some(job) = head.query.get("job").and_then(|f| f.parse::<u64>().ok()) else {
+                return reply(socket, "400 Bad Request", cors, &err_json("no list named")).await;
+            };
+            match lane.confirm(job, file) {
                 Ok(()) => reply(socket, "200 OK", cors, &serde_json::json!({ "ok": true }).to_string()).await,
                 Err(why) => reply(socket, "409 Conflict", cors, &err_json(&why)).await,
             }
@@ -958,9 +991,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(lane.status_json().contains(r#""state":"ready""#), true);
         assert_eq!(st["have"], 0);
-        assert!(lane.confirm(pick + 1).is_err(), "the text file is not one to confirm");
-        lane.confirm(pick).unwrap();
-        assert!(lane.confirm(pick).is_err(), "confirmed twice");
+        let job = st["job"].as_u64().unwrap();
+        assert!(lane.confirm(job, pick + 1).is_err(), "the text file is not one to confirm");
+        // DOWNLOAD names the list the remote showed: an earlier one's is refused.
+        assert!(lane.confirm(job - 1, pick).unwrap_err().contains("another torrent"));
+        lane.confirm(job, pick).unwrap();
+        assert!(lane.confirm(job, pick).is_err(), "confirmed twice");
         let st = wait_for(&lane, |s| matches!(s["state"].as_str(), Some("complete" | "failed"))).await;
         assert_eq!(st["state"], "complete", "{st}");
         assert_eq!(st["size"], video.len() as u64);
@@ -1020,7 +1056,7 @@ mod tests {
         // The list says it will not fit, DOWNLOAD says why, and the list
         // stays for another pick (or STOP).
         assert_eq!(st["files"][0]["fits"], false, "{st}");
-        let why = lane.confirm(st["pick"].as_u64().unwrap() as usize).unwrap_err();
+        let why = lane.confirm(st["job"].as_u64().unwrap(), st["pick"].as_u64().unwrap() as usize).unwrap_err();
         assert!(why.contains("blob quota"), "{why}");
         assert_eq!(serde_json::from_str::<serde_json::Value>(&lane.status_json()).unwrap()["state"], "ready");
         lane.stop().await;
@@ -1046,7 +1082,7 @@ mod tests {
         assert_eq!(st["state"], "ready", "{st}");
         let pick = st["pick"].as_u64().unwrap() as usize;
         assert_eq!(st["files"][0]["index"], pick as u64);
-        lane.confirm(pick).unwrap();
+        lane.confirm(st["job"].as_u64().unwrap(), pick).unwrap();
         let st = wait_for(&lane, |s| matches!(s["state"].as_str(), Some("complete" | "failed"))).await;
         assert_eq!(st["state"], "complete", "{st}");
         assert_eq!(st["hash"].as_str().unwrap(), Hash::new(&video).to_hex().to_string());
@@ -1106,6 +1142,23 @@ mod tests {
         assert_eq!(pick_file(&f(&[("a.MKV", 5), ("b.mp3", 9)])).unwrap().3, "video/x-matroska");
         assert_eq!(pick_file(&f(&[("a.flac", 5), ("cover.png", 9)])).unwrap().3, "audio/flac");
         assert!(pick_file(&f(&[("../escape.mp4", 5), ("/abs.mp4", 5), ("empty.mp4", 0), ("notes.txt", 9)])).is_none());
+    }
+
+    #[test]
+    fn the_file_offered_first_stays_on_a_long_list() {
+        // 300 short clips, then the film: the film is offered, and listed.
+        let mut files: Vec<(PathBuf, u64)> = (0..300).map(|i| (PathBuf::from(format!("extras/{i}.mp4")), 1_000)).collect();
+        files.push((PathBuf::from("Film.mp4"), 900_000_000));
+        let all = playable_files(&files);
+        let best = pick_file(&files).unwrap().0;
+        assert_eq!(best, 300);
+        let list = listed_files(&all, best);
+        assert_eq!(list.len(), MAX_LISTED);
+        assert_eq!(list.last().unwrap().index, 300);
+        assert!(list.windows(2).all(|w| w[0].index < w[1].index), "still in the torrent's order");
+        // One already on it changes nothing; one not in the torrent is not added.
+        assert_eq!(listed_files(&all, 5).iter().map(|p| p.index).collect::<Vec<_>>(), (0..MAX_LISTED).collect::<Vec<_>>());
+        assert_eq!(listed_files(&all, 9_999).len(), MAX_LISTED);
     }
 
     #[test]

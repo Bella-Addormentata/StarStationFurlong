@@ -1118,6 +1118,26 @@ describe('📚 the room\'s library', () => {
     expect(readLibrary().find((e) => e.source.kind === 'blob' && e.source.hash === 'e'.repeat(64))!.torrent).toBeUndefined();
   });
 
+  it('takes a time from the far future for none, so it can neither top the list nor outlive a real play', () => {
+    const map = doc.getMap('tv');
+    for (let i = 0; i < TV_LIBRARY_MAX; i++) {
+      const source: TvSource = { kind: 'url', url: `https://example.org/future-${i}.mp4` };
+      map.set(libraryKey(source), { source, title: `future ${i}`, addedAt: 1e100, playedAt: 1e100, plays: 1 });
+    }
+    // A peer clock a few minutes fast is still believed.
+    const soon: TvSource = { kind: 'url', url: 'https://example.org/soon.mp4' };
+    map.set(libraryKey(soon), { source: soon, title: 'soon', addedAt: now + 60_000, playedAt: now + 60_000, plays: 1 });
+    expect(readLibrary()[0]!.title).toBe('soon');
+    expect(readLibrary().find((e) => e.title === 'future 0')).toMatchObject({ playedAt: 0, addedAt: 0 });
+    tick(1);
+    tvPlay(TV, FILM, now);
+    const lib = readLibrary();
+    expect(lib.map((e) => e.title).slice(0, 2)).toEqual(['soon', 'Metropolis']);
+    expect(lib).toHaveLength(TV_LIBRARY_MAX);
+    // The pruning took far-future entries, never the play just written.
+    expect(map.get(libraryKey(FILM))).toBeTruthy();
+  });
+
   it('keeps the newest TV_LIBRARY_MAX, dropping the oldest on a write', () => {
     for (let i = 0; i < TV_LIBRARY_MAX + 3; i++) {
       tick(1);
