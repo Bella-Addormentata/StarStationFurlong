@@ -10,7 +10,7 @@ import * as Y from 'yjs';
 vi.stubGlobal('window', { location: { search: '' }, addEventListener: () => undefined, removeEventListener: () => undefined });
 
 const { bindCasinoDoc, writeCrapsTableState, writeMySeat } = await import('./casinoDoc');
-const { casinoTablesFrame } = await import('./casinoTableSession');
+const { casinoTablesFrame, readFling } = await import('./casinoTableSession');
 const { STICKMAN_DICE_SPOT } = await import('./crapsCroupier');
 const { FURNITURE, FURNITURE_DEFS } = await import('./furniture');
 type CasinoTableVisualHandle = import('./casinoTable3d').CasinoTableVisualHandle;
@@ -69,5 +69,31 @@ describe('the craps dice between rolls', () => {
     // In front of the shooter's own stand: on its side of the table.
     const stand = FURNITURE_DEFS['craps-table'].stands![STAND].stand;
     expect(Math.sign(spot.z)).toBe(Math.sign(stand.z));
+  });
+});
+
+describe('flinging the craps dice', () => {
+  /** A flick that ends at the origin after moving `d` metres in 100 ms. */
+  const flick = (dx: number, dz: number) => [
+    { t: 1000, p: { x: -dx, z: -dz } },
+    { t: 1050, p: { x: -dx / 2, z: -dz / 2 } },
+    { t: 1100, p: { x: 0, z: 0 } },
+  ];
+
+  it('throws them whichever way the flick goes: forward, sideways, back or slanted', () => {
+    for (const [dx, dz] of [[0, 0.3], [0.3, 0], [-0.3, 0], [0, -0.3], [0.2, -0.2]]) {
+      const f = readFling(flick(dx, dz), 1110);
+      expect(f, `flick ${dx},${dz}`).not.toBeNull();
+      const len = Math.hypot(dx, dz);
+      expect(f!.dir.x).toBeCloseTo(dx / len, 5);
+      expect(f!.dir.z).toBeCloseTo(dz / len, 5);
+      expect(f!.power).toBeGreaterThan(0);
+      expect(f!.from).toEqual({ x: 0, z: 0 });
+    }
+  });
+
+  it('just drops them on a slow drag', () => {
+    expect(readFling(flick(0.03, 0.03), 1110)).toBeNull();
+    expect(readFling([], 1110)).toBeNull();
   });
 });
