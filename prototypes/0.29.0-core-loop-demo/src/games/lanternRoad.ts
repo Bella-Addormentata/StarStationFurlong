@@ -1101,6 +1101,8 @@ function stepShots(s: LrState): void {
   const right = (LR_ARENA_CAM + LR_VIEW_W) * SUB + 32 * SUB;
   for (const sh of s.shots) {
     if (sh.kind === 'fire') {
+      // Spent on someone last frame: it goes, and never lands as a flame.
+      if (sh.t < 0) continue;
       sh.vy = Math.min(FALL_MAX, sh.vy + FIRE_GRAVITY);
       sh.x += sh.vx;
       sh.y += sh.vy;

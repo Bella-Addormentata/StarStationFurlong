@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   BOSS_DYING_FRAMES, CLEAR_FRAMES, DYING_FRAMES, FLAME_FRAMES, LR_ARENA_CAM, LR_COLS, LR_GATE_COL, LR_LEVEL_W, LR_MAP,
   LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_TILE, LR_VIEW_W, MAX_HP, PAD_A, PAD_B, PAD_DOWN, PAD_LEFT, PAD_PRESENT,
-  PAD_RIGHT, PUFF_FRAMES, SUB, TAG_FRAMES, bossBox, checkLanternRoad, createLanternRoad, isLedge, isSolid, isUp,
-  restoreLanternRoad, safeSpot, staffBox, stepLanternRoad, type LrState,
+  PAD_RIGHT, PUFF_FRAMES, SUB, TAG_FRAMES, WAVE_FRAMES, bossBox, checkLanternRoad, createLanternRoad, isLedge, isSolid,
+  isUp, restoreLanternRoad, safeSpot, shotBox, staffBox, stepLanternRoad, type LrState,
 } from './lanternRoad';
 
 const run = (s: LrState, frames: number, pads: (f: number) => readonly number[]) => {
@@ -296,7 +296,7 @@ describe('the Great Lantern', () => {
     expect(waves).toBe(2);
   });
 
-  it('hurts a player its fire lands on, and a wave a player does not jump', () => {
+  it('hurts a player who stands in a flame', () => {
     const s = atShrine(1);
     const p = s.players[0]!;
     run(s, 2, () => only(0));
@@ -304,6 +304,45 @@ describe('the Great Lantern', () => {
     s.shots.push({ kind: 'flame', x: p.x, y: p.y + LR_PLAYER_H - 12 * SUB, vx: 0, vy: 0, t: FLAME_FRAMES });
     run(s, 1, () => only(0));
     expect(p.hp).toBe(MAX_HP - 1);
+  });
+
+  const STREET = (LR_ROWS - 2) * LR_TILE * SUB;
+
+  it('spends a fireball on the player it hits, so it never lands as a flame', () => {
+    const s = atShrine(1);
+    const p = s.players[0]!;
+    run(s, 2, () => only(0));
+    // Falling onto their head: it hits this frame and would reach the street the next.
+    const fire = shotBox('fire');
+    s.shots.push({ kind: 'fire', x: p.x, y: STREET - fire.h - 5, vx: 0, vy: 0, t: 0 });
+    run(s, 1, () => only(0));
+    expect(p.hp).toBe(MAX_HP - 1);
+    expect(s.shots).toEqual([expect.objectContaining({ kind: 'fire', t: -1 })]);
+    run(s, 1, () => only(0));
+    expect(s.shots).toEqual([]);
+  });
+
+  /** A wave rolling at a player who stands on the street at the shrine. */
+  function waveAt(jump: boolean): LrState {
+    const s = atShrine(1);
+    const p = s.players[0]!;
+    run(s, 2, () => only(0));
+    const wave = shotBox('wave');
+    s.shots.push({ kind: 'wave', x: p.x - wave.w - 24 * SUB, y: STREET - wave.h, vx: 40, vy: 0, t: WAVE_FRAMES });
+    run(s, 50, (f) => only(jump && f < 16 ? PAD_A : 0));
+    return s;
+  }
+
+  it('knocks down a player who stands in a wave', () => {
+    expect(waveAt(false).players[0]!.hp).toBe(MAX_HP - 1);
+  });
+
+  it('rolls under a player who jumps it', () => {
+    const s = waveAt(true);
+    const p = s.players[0]!;
+    expect(p.hp).toBe(MAX_HP);
+    // It went on past them.
+    expect(s.shots.some((sh) => sh.kind === 'wave' && sh.x > p.x + LR_PLAYER_W)).toBe(true);
   });
 
   it('goes down to staffs while it sits dazed, then burns out and opens the gate', () => {
