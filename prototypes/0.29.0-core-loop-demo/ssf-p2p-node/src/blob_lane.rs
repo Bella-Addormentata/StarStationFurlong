@@ -115,8 +115,10 @@ const DAY_MS: u64 = 24 * 3600 * 1000;
 const HOST_SCAN: Duration = Duration::from_secs(10);
 /// A file the host tried to copy is not tried again for this long.
 const HOST_RETRY: Duration = Duration::from_secs(10 * 60);
-/// The most library entries read per room and scan (the library keeps 200).
+/// The most library entries read per room and scan (the library keeps 200),
+/// and the most keys of the peer-writable `tv` map looked at to find them.
 const HOST_SCAN_ENTRIES: usize = 400;
+const HOST_SCAN_KEYS: usize = 2_000;
 /// The most rooms one node keeps copies for.
 const MAX_HOST_ROOMS: usize = 64;
 /// WHERE: the most files and members one ask covers, how long an answer
@@ -212,6 +214,15 @@ impl Drop for Reading {
 #[cfg(test)]
 static RESTORE_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
+/// What `library.json` holds: the kept files, the rooms this node hosts
+/// (copies on or off), and per hosted room the day's copies (unix ms, charge).
+#[derive(Default)]
+struct Saved {
+    files: Vec<KeptFile>,
+    host: HashMap<String, bool>,
+    spent: HashMap<String, Vec<(u64, u64)>>,
+}
+
 /// One kept file in `library.json`.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KeptFile {
@@ -260,7 +271,8 @@ pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
         _ => None,
     };
     let mut out = Vec::new();
-    for (key, value) in tv.iter(&txn) {
+    // Every key looked at counts, kept or not: the map is anyone's to pad.
+    for (key, value) in tv.iter(&txn).take(HOST_SCAN_KEYS) {
         let Some(id) = key.strip_prefix("lib:blob:") else { continue };
         if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
             continue;
@@ -352,8 +364,8 @@ impl BlobLane {
         // Everything `library.json` names is kept until `restore` has looked
         // at it: a collection that ran while the list was half read would
         // take the files not reached yet.
-        let (listed, host) = if keep { Self::read_library(&dir) } else { Default::default() };
-        let pending: Arc<Mutex<HashSet<Hash>>> = Arc::new(Mutex::new(listed.iter().filter_map(|k| Hash::from_str(&k.hash).ok()).collect()));
+        let saved = if keep { Self::read_library(&dir) } else { Saved::default() };
+        let pending: Arc<Mutex<HashSet<Hash>>> = Arc::new(Mutex::new(saved.files.iter().filter_map(|k| Hash::from_str(&k.hash).ok()).collect()));
         // The store keeps exactly what `held` names (whole, on its way, or a
         // failed fetch's charged bytes) and, while one is written, its temp
         // tag; everything else goes at the next collection.
@@ -388,26 +400,38 @@ impl BlobLane {
             asking: tokio::sync::Mutex::new(()),
         });
         if keep {
-            lane.restore(listed, host).await;
+            lane.restore(saved).await;
         }
         pending.lock().unwrap().clear();
         Ok(lane)
     }
 
-    /// What `library.json` in `dir` says: the files it names, and the rooms
-    /// this node hosts with whether their page wants copies (none, unreadable).
-    fn read_library(dir: &std::path::Path) -> (Vec<KeptFile>, HashMap<String, bool>) {
+    /// What `library.json` in `dir` says (nothing, unreadable).
+    fn read_library(dir: &std::path::Path) -> Saved {
         let saved: Option<serde_json::Value> = std::fs::read(dir.join(LIBRARY_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        let files = saved.as_ref().and_then(|v| v.get("files").cloned()).and_then(|f| serde_json::from_value(f).ok()).unwrap_or_default();
-        let host = saved.as_ref().and_then(|v| v.get("host").cloned()).and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default();
-        (files, host)
+        let field = |k: &str| saved.as_ref().and_then(|v| v.get(k).cloned());
+        Saved {
+            files: field("files").and_then(|f| serde_json::from_value(f).ok()).unwrap_or_default(),
+            host: field("host").and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default(),
+            spent: field("hostSpent").and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default(),
+        }
     }
 
     /// Bring back what `library.json` names and the store holds whole, the
-    /// most recently used first, as far as the quota goes, and the rooms
-    /// this node hosts.
-    async fn restore(&self, listed: Vec<KeptFile>, host: HashMap<String, bool>) {
-        self.hosting.lock().unwrap().rooms = host.into_iter().filter(|(r, _)| valid_room(r)).take(MAX_HOST_ROOMS).collect();
+    /// most recently used first, as far as the quota goes; and the rooms
+    /// this node hosts, with the day's copy charges.
+    async fn restore(&self, saved: Saved) {
+        let Saved { files: listed, host, spent } = saved;
+        {
+            let mut h = self.hosting.lock().unwrap();
+            h.rooms = host.into_iter().filter(|(r, _)| valid_room(r)).take(MAX_HOST_ROOMS).collect();
+            let (now, since) = (now_ms(), now_ms().saturating_sub(DAY_MS));
+            h.spent = spent
+                .into_iter()
+                .filter(|(r, _)| h.rooms.contains_key(r))
+                .map(|(r, list)| (r, list.into_iter().filter(|(at, _)| *at > since && *at <= now).take(HOST_COPY_DAY_COUNT).collect::<Vec<_>>()))
+                .collect();
+        }
         let mut listed: Vec<KeptFile> = listed.into_iter().filter(|k| k.size > 0).collect();
         listed.sort_by(|a, b| b.used.cmp(&a.used));
         let mut charged = 0u64;
@@ -448,8 +472,20 @@ impl BlobLane {
                 .map(|(hash, h)| KeptFile { hash: hash.to_hex().to_string(), size: h.size, mime: h.mime.clone(), rooms: h.rooms.iter().cloned().collect(), used: h.used })
                 .collect()
         };
-        let host = self.hosting.lock().unwrap().rooms.clone();
-        let body = serde_json::json!({ "v": 1, "files": files, "host": host }).to_string();
+        // The rooms hosted, and the day's copy charges: a restart neither
+        // forgets a switch nor hands out a fresh day.
+        let (host, spent) = {
+            let h = self.hosting.lock().unwrap();
+            let since = now_ms().saturating_sub(DAY_MS);
+            let spent: HashMap<String, Vec<(u64, u64)>> = h
+                .spent
+                .iter()
+                .map(|(r, list)| (r.clone(), list.iter().copied().filter(|(at, _)| *at > since).collect::<Vec<_>>()))
+                .filter(|(_, list)| !list.is_empty())
+                .collect();
+            (h.rooms.clone(), spent)
+        };
+        let body = serde_json::json!({ "v": 1, "files": files, "host": host, "hostSpent": spent }).to_string();
         let tmp = self.dir.join(format!("{LIBRARY_FILE}.tmp"));
         if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.dir.join(LIBRARY_FILE))) {
             eprintln!("⚠️ blob-cache/{LIBRARY_FILE} could not be written: {e}");
@@ -462,8 +498,8 @@ impl BlobLane {
 
     /// Make room for `extra` more bytes of charge: let go of failed fetches,
     /// then the whole files used longest ago (never one being read, one
-    /// used within `IN_USE`, nor `except`), until it fits. Nothing goes when even that
-    /// would not be enough. Whether it fits now; the caller persists when
+    /// used within `IN_USE`, nor `except`), until it fits. Nothing goes when
+    /// even that would not be enough. Whether it fits now; the caller persists when
     /// something went.
     fn make_room(held: &mut HashMap<Hash, Held>, quota: u64, extra: u64, except: Option<&Hash>, now: u64) -> (bool, bool) {
         let charged = Self::charged(held);
@@ -613,9 +649,12 @@ impl BlobLane {
                 {
                     continue;
                 }
+                if files >= HOST_COPY_DAY_COUNT {
+                    break; // the day's files: nothing more without asking
+                }
                 let charge = e.size.max(HOST_COPY_MIN_CHARGE);
-                if files >= HOST_COPY_DAY_COUNT || spent + charge > self.host_day {
-                    break; // the day's budget: nothing more without asking
+                if spent + charge > self.host_day {
+                    continue; // too big for what is left of the day; a smaller one may fit
                 }
                 // A failed try's bytes stay counted, as for a FETCH.
                 let failed_charge = held.get(&e.hash).map(|x| x.charged).unwrap_or(0);
@@ -636,7 +675,8 @@ impl BlobLane {
             }
             picked
         };
-        if evicted {
+        // What went, and the charge, are on disk before the transfer starts.
+        if evicted || picked.is_some() {
             self.persist();
         }
         picked
@@ -693,31 +733,44 @@ impl BlobLane {
         // out of this answer (unknown, not "nobody").
         let busy = self.asking.try_lock();
         if let (false, Ok(_one)) = (ask.is_empty(), busy) {
+            // One deadline per member for the dial and all its answers: a
+            // member that never answers costs `WHERE_TIMEOUT`, once, and
+            // what it did answer still counts.
             let asks = peers.iter().map(|peer| {
                 let (store, endpoint, ask, peer) = (self.store.clone(), endpoint.clone(), ask.clone(), *peer);
                 async move {
-                    let mut has = Vec::new();
-                    let Ok(Ok(conn)) = tokio::time::timeout(WHERE_TIMEOUT, endpoint.connect(EndpointAddr::new(peer), iroh_blobs::ALPN)).await else {
-                        return (peer, has);
-                    };
-                    for h in ask {
-                        let mut bits = store.remote().observe(conn.clone(), iroh_blobs::protocol::ObserveRequest::new(h));
-                        if let Ok(Some(Ok(b))) = tokio::time::timeout(WHERE_TIMEOUT, bits.next()).await {
-                            if b.is_complete() {
-                                has.push(h);
+                    let (mut has, mut answered) = (Vec::new(), Vec::new());
+                    let probe = async {
+                        let conn = endpoint.connect(EndpointAddr::new(peer), iroh_blobs::ALPN).await.ok()?;
+                        for h in ask {
+                            let mut bits = store.remote().observe(conn.clone(), iroh_blobs::protocol::ObserveRequest::new(h));
+                            if let Some(Ok(b)) = bits.next().await {
+                                if b.is_complete() {
+                                    has.push(h);
+                                }
                             }
+                            // An observe refused (not shared to this room) is an answer too.
+                            answered.push(h);
                         }
-                    }
-                    conn.close(0u32.into(), b"asked");
-                    (peer, has)
+                        conn.close(0u32.into(), b"asked");
+                        Some(())
+                    };
+                    let _ = tokio::time::timeout(WHERE_TIMEOUT, probe).await;
+                    (peer, has, answered)
                 }
             });
             let answers = n0_future::join_all(asks).await;
+            let done = now_ms();
             let mut seen = self.seen.lock().unwrap();
-            seen.retain(|_, (at, _)| now.saturating_sub(*at) < WHERE_FRESH.as_millis() as u64);
+            seen.retain(|_, (at, _)| done.saturating_sub(*at) < WHERE_FRESH.as_millis() as u64);
             for h in ask {
-                let ids: Vec<PublicKey> = answers.iter().filter(|(_, has)| has.contains(&h)).map(|(p, _)| *p).collect();
-                seen.insert((room.to_string(), h), (now, ids.clone()));
+                let ids: Vec<PublicKey> = answers.iter().filter(|(_, has, _)| has.contains(&h)).map(|(p, _, _)| *p).collect();
+                // Kept, and "nobody" said, only when every member answered.
+                if answers.iter().all(|(_, _, answered)| answered.contains(&h)) {
+                    seen.insert((room.to_string(), h), (done, ids.clone()));
+                } else if ids.is_empty() {
+                    continue;
+                }
                 out.insert(h, ids);
             }
         }
@@ -836,13 +889,22 @@ impl BlobLane {
     }
 
     fn fail(&self, hash: &Hash, why: &str) {
-        let mut held = self.held.lock().unwrap();
-        // Only a transfer still running can fail: an import of the same file
-        // that completed meanwhile is whole, and stays so. The charge stays
-        // (see `Held::charged`): what landed is on disk.
-        if let Some(h) = held.get_mut(hash).filter(|h| matches!(h.phase, Phase::Queued | Phase::Fetching)) {
-            h.phase = Phase::Failed(why.to_string());
+        {
+            let mut held = self.held.lock().unwrap();
+            // Only a transfer still running can fail: an import of the same
+            // file that completed meanwhile is whole, and stays so. The
+            // charge stays (see `Held::charged`): what landed is on disk.
+            if let Some(h) = held.get_mut(hash).filter(|h| matches!(h.phase, Phase::Queued | Phase::Fetching)) {
+                h.phase = Phase::Failed(why.to_string());
+            }
         }
+        // A host copy that failed waits `HOST_RETRY` from now, however long
+        // it ran before failing.
+        let mut h = self.hosting.lock().unwrap();
+        if h.running.values().any(|r| r == hash) {
+            h.tried.insert(*hash, now_ms());
+        }
+        drop(h);
         eprintln!("📦 blob {}: {why}", hash.fmt_short());
     }
 
@@ -1833,6 +1895,36 @@ mod tests {
         h.spent.insert("r".into(), vec![(now - DAY_MS - 1, 5), (now - 10, 7), (now, 1)]);
         assert_eq!(BlobLane::spent_today(&mut h, "r", now), (8, 2));
         assert_eq!(BlobLane::spent_today(&mut h, "elsewhere", now), (0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hosts_day_outlives_a_restart_and_a_big_file_does_not_block_a_small_one() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-host-day-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quiet = Duration::from_secs(3600);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 40, true, quiet).await.unwrap();
+        lane.host_room("r", Some(true)).unwrap();
+        let now = now_ms();
+        lane.hosting.lock().unwrap().spent.insert("r".into(), vec![(now - 1_000, 5 << 30)]);
+        let (sharer, me) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
+        let lib = |hash: Hash, size: u64, played: u64| LibBlob { hash, size, provider: sharer, mime: "video/mp4".into(), played };
+        let (big, small) = (Hash::new(b"big"), Hash::new(b"small"));
+        // 5 GiB of 8 spent: the newer 4 GiB file waits, the older 1 GiB one goes.
+        let entries = || vec![lib(big, 4 << 30, 2_000), lib(small, 1 << 30, 1_000)];
+        assert_eq!(lane.next_copy("r", entries(), &|_| true, &me, now).map(|c| c.0), Some(small));
+        // A copy that ran past the retry time and then failed waits from its failure.
+        lane.hosting.lock().unwrap().tried.insert(small, now - HOST_RETRY.as_millis() as u64 - 1);
+        lane.fail(&small, "the sharer left");
+        assert_eq!(lane.next_copy("r", entries(), &|_| true, &me, now_ms()), None);
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+        // The day's charges were on disk before the transfer: a restart grants no fresh day.
+        let lane = BlobLane::open_with(dir.clone(), 1 << 40, true, quiet).await.unwrap();
+        let spent = BlobLane::spent_today(&mut lane.hosting.lock().unwrap(), "r", now_ms());
+        assert_eq!(spent, ((5u64 << 30) + (1 << 30), 2));
+        assert_eq!(lane.hosting.lock().unwrap().rooms.get("r"), Some(&true));
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

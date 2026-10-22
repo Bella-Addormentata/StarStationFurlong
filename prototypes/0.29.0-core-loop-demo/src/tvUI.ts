@@ -714,8 +714,9 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       ${!mine && owner && readRemote(tv.id).holder ? smallButton(`data-tv-putdown="${esc(tv.id)}"`, '🪑 TAKE BACK (OWNER)') : ''}
     </div>
   </div>`;
+  const hostBlock = hostCopiesBlock();
   if (!mine) {
-    return `${head}<div class="phone-access-section">
+    return `${head}${hostBlock}<div class="phone-access-section">
       <div class="phone-access-note">Pick up the remote to choose what plays. Anyone standing at the set can press its power and volume buttons.</div>
     </div>`;
   }
@@ -764,6 +765,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <div id="tv-app-feedback" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;">${esc(feedbackNow())}</div>
       ${transport}
     </div>
+    ${hostBlock}
     ${library}
     <div class="phone-access-section">
       <div class="phone-access-header">HAND THE REMOTE TO…</div>
@@ -807,6 +809,23 @@ function torrentBlock(): string {
       ${running ? smallButton('data-tv-torrent-stop="1"', '⏹ STOP DOWNLOAD') : smallButton('data-tv-torrent-start="1"', '🧲 START')}
     </div>
     ${status}`;
+}
+
+/** 🏠 This node hosts the room: whether it keeps copies of what is played
+ *  here, and the switch. Shown whoever holds the remote, and before the
+ *  library has its first row (copies are on from the moment the room is). */
+function hostCopiesBlock(): string {
+  void refreshHeldBlobs(); // at most every few seconds; the next paint shows it
+  const hostCopies = nodeHostCopies();
+  if (!hostCopies) return '';
+  return `<div class="phone-access-section">
+    <div style="display:flex; gap:6px; align-items:center; font-size:8.5px; color:${DIM};">
+      <span style="flex:1;">${hostCopies.on
+        ? `🏠 You host this room: your node keeps a copy of each file played here, so visitors can still play it after whoever shared it leaves. Up to ${esc(formatBytes(hostCopies.cap))} a file, ${esc(formatBytes(hostCopies.day))} or ${hostCopies.dayFiles} files a day (today so far: ${hostCopies.files} file${hostCopies.files === 1 ? '' : 's'}, ${esc(formatBytes(hostCopies.spent))}).`
+        : '🏠 You host this room. Your node keeps no copies of what is played here, so a file goes when whoever shared it leaves.'}</span>
+      ${smallButton(`data-tv-host-copies="${hostCopies.on ? '0' : '1'}" title="${hostCopies.on ? 'Stop keeping copies' : 'Keep copies of what is played here'}"`, hostCopies.on ? '🏠 COPIES ON' : '🏠 COPIES OFF')}
+    </div>
+  </div>`;
 }
 
 /** 📚 The room's library: what anyone here has played, kept with the room.
@@ -863,14 +882,6 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     return `<button type="button" data-tv-lib-filter="${f.key}" style="padding:3px 7px; border-radius:10px; font-family:inherit; font-size:8.5px; font-weight:800; cursor:pointer;
       background:${on ? 'rgba(0,229,255,0.12)' : 'transparent'}; border:1px solid ${on ? CYAN : 'rgba(212,168,75,0.25)'}; color:${on ? CYAN : GOLD};">${f.label}</button>`;
   }).join('');
-  const hostCopies = nodeHostCopies();
-  const hostLine = !hostCopies ? ''
-    : `<div style="display:flex; gap:6px; align-items:center; font-size:8.5px; color:${DIM};">
-      <span style="flex:1;">${hostCopies.on
-        ? `🏠 You host this room: your node keeps a copy of each file played here, so visitors can still play it after whoever shared it leaves. Up to ${esc(formatBytes(hostCopies.cap))} a file, ${esc(formatBytes(hostCopies.day))} or ${hostCopies.dayFiles} files a day (today so far: ${hostCopies.files} file${hostCopies.files === 1 ? '' : 's'}, ${esc(formatBytes(hostCopies.spent))}).`
-        : '🏠 You host this room. Your node keeps no copies of what is played here, so a file goes when whoever shared it leaves.'}</span>
-      ${smallButton(`data-tv-host-copies="${hostCopies.on ? '0' : '1'}" title="${hostCopies.on ? 'Stop keeping copies' : 'Keep copies of what is played here'}"`, hostCopies.on ? '🏠 COPIES ON' : '🏠 COPIES OFF')}
-    </div>`;
   const space = nodeLibrarySpace();
   const spaceLine = !space ? ''
     : space.keep
@@ -879,7 +890,6 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
   return `<div class="phone-access-section">
     <div class="phone-access-header">📚 LIBRARY · ${all.length}</div>
     ${spaceLine}
-    ${hostLine}
     <div style="display:flex; gap:4px; flex-wrap:wrap;">${chips}</div>
     <input type="text" data-tv-lib-search="1" value="${esc(libraryQuery)}" placeholder="find in the library" autocomplete="off" aria-label="Find in the library">
     ${list || `<div class="phone-access-note">Nothing here matches.</div>`}

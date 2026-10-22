@@ -278,6 +278,24 @@ describe('🏠 the room\'s host keeps copies, and WHERE finds them', () => {
     expect(calls).toEqual([]);
   });
 
+  it('takes the switch\'s answer only in the room it was pressed in', async () => {
+    const pending: Array<(r: Response) => void> = [];
+    const hostOf = (on: boolean) => ({ on, cap: 1, day: 1, spent: 0, files: 0, dayFiles: 24 });
+    vi.stubGlobal('fetch', vi.fn((url: string) => url.includes('on=')
+      ? new Promise<Response>((r) => { pending.push(r); })
+      : Promise.resolve(new Response(JSON.stringify({ held: [], reachable: [], keep: true, kept: 0, quota: 1, host: hostOf(true) }), { status: 200 }))));
+    setNodeMediaOrigin(ORIGIN, tvNow(), tvWallNow());
+    setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID, torrent: false });
+    setBlobLaneRoom('room-1', true);
+    const pressed = setHostCopies(false); // pressed in room 1; the answer is late
+    setBlobLaneRoom('room-3', true);
+    await refreshHeldBlobs(1_000);
+    expect(nodeHostCopies()?.on).toBe(true);
+    pending[0]!(new Response(JSON.stringify({ host: hostOf(false) }), { status: 200 }));
+    expect(await pressed).toBeNull();
+    expect(nodeHostCopies()?.on).toBe(true); // room 3's switch, not room 1's answer
+  });
+
   it('asks who holds the files, at most every half minute each, and FETCH names them after the provider', async () => {
     withNode(true);
     const calls: string[] = [];

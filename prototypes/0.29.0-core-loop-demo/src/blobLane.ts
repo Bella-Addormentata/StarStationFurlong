@@ -319,13 +319,15 @@ export async function setHostCopies(on: boolean): Promise<string | null> {
   const url = route('/api/blob/host', { room, on: on ? '1' : '0' });
   if (!url) return 'That needs this station\'s node running here.';
   const gen = generation;
+  const asked = room;
   try {
     const res = await fetch(url, { method: 'POST', redirect: 'error' });
     if (!res.ok) return `Your node: ${await errorOf(res, 'it did not take that')}.`;
     const body = (await res.json()) as { host?: unknown };
-    if (gen === generation) {
+    // The answer is the asked room's: it lands only while the page is there.
+    if (gen === generation && asked === room) {
       heldEpoch++; // a held answer asked before says the switch as it was
-      if (heldHere && heldHere.gen === gen && heldHere.room === room) heldHere.host = parseHost(body.host);
+      if (heldHere && heldHere.gen === gen && heldHere.room === asked) heldHere.host = parseHost(body.host);
     }
     return null;
   } catch {
