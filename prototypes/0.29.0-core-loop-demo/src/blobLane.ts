@@ -157,6 +157,7 @@ export function importBlob(
       } else if (asked !== room) {
         resolve({ error: 'You changed rooms while your node took the file — choose it again here.' });
       } else if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
+        bumpStatus(body.hash);
         statuses.set(body.hash, { state: 'complete', have: file.size, size: file.size });
         // Held for this room now: the library says so before its next ask.
         heldEpoch++;
@@ -184,6 +185,7 @@ export async function fetchBlob(hash: string, size: number, provider: string, mi
     const res = await fetch(url, { method: 'POST', redirect: 'error' });
     if (gen !== generation) return 'Your node restarted — press FETCH again.';
     if (res.ok) {
+      bumpStatus(hash);
       statuses.set(hash, { state: 'queued', have: 0, size });
       return null;
     }
@@ -260,6 +262,7 @@ export async function forgetBlob(hash: string): Promise<string | null> {
     if (!res.ok) return `Your node: ${await errorOf(res, 'it did not let the file go')}.`;
     if (gen === generation) {
       heldEpoch++;
+      bumpStatus(hash);
       statuses.delete(hash);
       heldHere?.held.delete(hash);
       if (heldHere) heldHere.at = -Infinity; // ask again: the space changed
@@ -282,7 +285,26 @@ export function nodeReaches(provider: string): boolean | null {
 const statuses = new Map<string, BlobState>();
 const polling = new Set<string>();
 const lastPoll = new Map<string, number>();
+/** Moves per hash when this page changes it on the node (an import, a
+ *  forget, a recheck): a status asked before lands on nothing. */
+const statusVersion = new Map<string, number>();
 const POLL_MS = 1_000;
+/** A whole file can still go (let go from the remote, or to make room), so
+ *  `complete` is asked about again this often while a theatre reads it. */
+const COMPLETE_POLL_MS = 15_000;
+
+function bumpStatus(hash: string): void {
+  statusVersion.set(hash, (statusVersion.get(hash) ?? 0) + 1);
+}
+
+/** Forget what the node said about `hash` and ask again at the next look:
+ *  a player that could not read a `complete` file asks before it mounts
+ *  it again (the node may have let it go). */
+export function recheckBlob(hash: string): void {
+  bumpStatus(hash);
+  statuses.delete(hash);
+  lastPoll.delete(hash);
+}
 
 function parseState(body: unknown): BlobState {
   if (!body || typeof body !== 'object') return { state: 'unknown' };
@@ -302,16 +324,17 @@ function parseState(body: unknown): BlobState {
  *  background at most once a second, so a theatre tick can call it freely. */
 export function blobState(hash: string, now = performance.now()): BlobState {
   const known = statuses.get(hash) ?? { state: 'unknown' };
-  const settled = known.state === 'complete';
-  if (!settled && !polling.has(hash) && now - (lastPoll.get(hash) ?? -Infinity) >= POLL_MS) {
+  const every = known.state === 'complete' ? COMPLETE_POLL_MS : POLL_MS;
+  if (!polling.has(hash) && now - (lastPoll.get(hash) ?? -Infinity) >= every) {
     const url = HEX_64.test(hash) ? route('/api/blob/status', { hash }) : null;
     if (url) {
       const gen = generation;
+      const version = statusVersion.get(hash) ?? 0;
       polling.add(hash);
       lastPoll.set(hash, now);
       void fetch(url, { redirect: 'error' })
         .then((res) => (res.ok ? res.json() : null))
-        .then((body) => { if (gen === generation) statuses.set(hash, parseState(body)); })
+        .then((body) => { if (gen === generation && version === (statusVersion.get(hash) ?? 0)) statuses.set(hash, parseState(body)); })
         .catch(() => { /* kept as it was; the next tick asks again */ })
         .finally(() => { if (gen === generation) polling.delete(hash); });
     }
@@ -336,6 +359,7 @@ export function forgetBlobLane(): void {
   statuses.clear();
   polling.clear();
   lastPoll.clear();
+  statusVersion.clear();
 }
 
 export const __test = { parseState };

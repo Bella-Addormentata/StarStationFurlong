@@ -39,7 +39,8 @@
 //!   start only what it names AND the store holds whole comes back; the
 //!   store's garbage collection removes the rest (partial fetches, files
 //!   let go). When a new file does not fit, the files used longest ago go
-//!   first, never one used in the last `IN_USE` (it may be playing).
+//!   first, never one being read now nor one used in the last `IN_USE`
+//!   (it may be playing).
 //!   `POST /api/blob/forget` lets one go from the page. `SSF_BLOB_KEEP=0`
 //!   empties the cache at every start instead, as before.
 
@@ -47,7 +48,7 @@ use anyhow::{anyhow, Result};
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, PublicKey};
 use iroh_blobs::provider::events::{
-    AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode, ThrottleMode,
+    AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode, RequestUpdate, ThrottleMode,
 };
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::FsStore;
@@ -56,6 +57,7 @@ use n0_future::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -80,7 +82,7 @@ const LIBRARY_FILE: &str = "library.json";
 const IN_USE: Duration = Duration::from_secs(30 * 60);
 /// How often the store removes what no held file needs.
 const GC_INTERVAL: Duration = Duration::from_secs(60);
-/// `used` is written to disk at most this often per file while it plays.
+/// `used` goes to disk at a read once the list was last written this long ago.
 const USED_PERSIST: Duration = Duration::from_secs(10 * 60);
 /// Transfers this node runs at once; a FETCH past it waits for a slot.
 const MAX_FETCHES: usize = 2;
@@ -136,11 +138,33 @@ struct Held {
     charged: u64,
     /// Unix ms it was last imported, fetched or read: the oldest go first.
     used: u64,
+    /// Reads of it running now (HTTP to the page, iroh to a member): a file
+    /// being read is never let go to make room, however long the read.
+    readers: u32,
 }
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
+
+/// A read of a whole file in progress (`BlobLane::reading`).
+struct Reading {
+    lane: Arc<BlobLane>,
+    hash: Hash,
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if let Some(h) = self.lane.held.lock().unwrap().get_mut(&self.hash) {
+            h.readers = h.readers.saturating_sub(1);
+            h.used = now_ms();
+        }
+    }
+}
+
+/// Tests only: a pause before each file `restore` looks at.
+#[cfg(test)]
+static RESTORE_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// One kept file in `library.json`.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -166,6 +190,9 @@ pub struct BlobLane {
     held: Arc<Mutex<HashMap<Hash, Held>>>,
     /// One `library.json` write at a time (they share its temp file).
     writing: Mutex<()>,
+    /// Unix ms `library.json` was last written: a read writes it again once
+    /// this is `USED_PERSIST` old, so a file in steady use is saved as used.
+    saved: AtomicU64,
     slots: tokio::sync::Semaphore,
 }
 
@@ -209,12 +236,19 @@ impl BlobLane {
             }
         }
         let held: Arc<Mutex<HashMap<Hash, Held>>> = Arc::default();
+        // Everything `library.json` names is kept until `restore` has looked
+        // at it: a collection that ran while the list was half read would
+        // take the files not reached yet.
+        let listed = if keep { Self::read_library(&dir) } else { Vec::new() };
+        let pending: Arc<Mutex<HashSet<Hash>>> = Arc::new(Mutex::new(listed.iter().filter_map(|k| Hash::from_str(&k.hash).ok()).collect()));
         // The store keeps exactly what `held` names (whole, on its way, or a
         // failed fetch's charged bytes) and, while one is written, its temp
         // tag; everything else goes at the next collection.
         let protect = held.clone();
+        let protect_pending = pending.clone();
         let add_protected: iroh_blobs::store::ProtectCb = Arc::new(move |live| {
             live.extend(protect.lock().unwrap().keys().copied());
+            live.extend(protect_pending.lock().unwrap().iter().copied());
             Box::pin(async { iroh_blobs::store::ProtectOutcome::Continue })
         });
         let mut options = iroh_blobs::store::fs::options::Options::new(&dir);
@@ -232,27 +266,40 @@ impl BlobLane {
             keep,
             held,
             writing: Mutex::new(()),
+            saved: AtomicU64::new(0),
             slots: tokio::sync::Semaphore::new(MAX_FETCHES),
         });
         if keep {
-            lane.restore().await;
+            lane.restore(listed).await;
         }
+        pending.lock().unwrap().clear();
         Ok(lane)
     }
 
-    /// Bring back what `library.json` names and the store holds whole, the
-    /// most recently used first, as far as the quota goes.
-    async fn restore(&self) {
-        let listed: Vec<KeptFile> = std::fs::read(self.dir.join(LIBRARY_FILE))
+    /// The files `library.json` in `dir` names (none, unreadable).
+    fn read_library(dir: &std::path::Path) -> Vec<KeptFile> {
+        std::fs::read(dir.join(LIBRARY_FILE))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
             .and_then(|v| v.get("files").cloned())
             .and_then(|f| serde_json::from_value(f).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// Bring back what `library.json` names and the store holds whole, the
+    /// most recently used first, as far as the quota goes.
+    async fn restore(&self, listed: Vec<KeptFile>) {
         let mut listed: Vec<KeptFile> = listed.into_iter().filter(|k| k.size > 0).collect();
         listed.sort_by(|a, b| b.used.cmp(&a.used));
         let mut charged = 0u64;
         for k in listed {
+            #[cfg(test)]
+            {
+                let pause = RESTORE_PAUSE_MS.load(Ordering::Relaxed);
+                if pause > 0 {
+                    tokio::time::sleep(Duration::from_millis(pause)).await;
+                }
+            }
             let Ok(hash) = Hash::from_str(&k.hash) else { continue };
             let whole = matches!(self.store.blobs().status(hash).await, Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) if size == k.size);
             let rooms: HashSet<String> = k.rooms.into_iter().filter(|r| valid_room(r)).take(64).collect();
@@ -261,7 +308,7 @@ impl BlobLane {
             }
             charged += storage_bound(k.size);
             self.held.lock().unwrap().insert(hash, Held {
-                rooms, size: k.size, have: k.size, mime: safe_mime(&k.mime), phase: Phase::Complete, charged: storage_bound(k.size), used: k.used,
+                rooms, size: k.size, have: k.size, mime: safe_mime(&k.mime), phase: Phase::Complete, charged: storage_bound(k.size), used: k.used, readers: 0,
             });
         }
         self.persist();
@@ -274,6 +321,7 @@ impl BlobLane {
         }
         // Taken before the snapshot, so an older one never lands last.
         let _one = self.writing.lock().unwrap();
+        self.saved.store(now_ms(), Ordering::Relaxed);
         let files: Vec<KeptFile> = {
             let held = self.held.lock().unwrap();
             held.iter()
@@ -293,8 +341,8 @@ impl BlobLane {
     }
 
     /// Make room for `extra` more bytes of charge: let go of failed fetches,
-    /// then the whole files used longest ago (never one used within
-    /// `IN_USE`, nor `except`), until it fits. Nothing goes when even that
+    /// then the whole files used longest ago (never one being read, one
+    /// used within `IN_USE`, nor `except`), until it fits. Nothing goes when even that
     /// would not be enough. Whether it fits now; the caller persists when
     /// something went.
     fn make_room(held: &mut HashMap<Hash, Held>, quota: u64, extra: u64, except: Option<&Hash>, now: u64) -> (bool, bool) {
@@ -305,7 +353,7 @@ impl BlobLane {
         let recent = now.saturating_sub(IN_USE.as_millis() as u64);
         let mut victims: Vec<(u64, Hash, u64)> = held
             .iter()
-            .filter(|(hash, h)| Some(*hash) != except && (matches!(h.phase, Phase::Failed(_)) || (h.phase == Phase::Complete && h.used < recent)))
+            .filter(|(hash, h)| Some(*hash) != except && (matches!(h.phase, Phase::Failed(_)) || (h.phase == Phase::Complete && h.readers == 0 && h.used < recent)))
             .map(|(hash, h)| (if matches!(h.phase, Phase::Failed(_)) { 0 } else { h.used.max(1) }, *hash, h.charged))
             .collect();
         victims.sort();
@@ -330,7 +378,7 @@ impl BlobLane {
         let recent = now.saturating_sub(IN_USE.as_millis() as u64);
         let freeable: u64 = held
             .values()
-            .filter(|h| matches!(h.phase, Phase::Failed(_)) || (h.phase == Phase::Complete && h.used < recent))
+            .filter(|h| matches!(h.phase, Phase::Failed(_)) || (h.phase == Phase::Complete && h.readers == 0 && h.used < recent))
             .map(|h| h.charged)
             .sum();
         Self::charged(held).saturating_sub(freeable) + extra <= quota
@@ -354,23 +402,29 @@ impl BlobLane {
         Ok(())
     }
 
-    /// Note a read of `hash`: it is in use, and the last to go.
+    /// Note a read of `hash`: it is in use, and the last to go. The list on
+    /// disk is written again once its last write is `USED_PERSIST` old.
     fn touch(&self, hash: &Hash) {
         let now = now_ms();
-        let write = {
-            let mut held = self.held.lock().unwrap();
-            match held.get_mut(hash) {
-                Some(h) => {
-                    let stale = now.saturating_sub(h.used) > USED_PERSIST.as_millis() as u64;
-                    h.used = now;
-                    stale
-                }
-                None => false,
+        let found = match self.held.lock().unwrap().get_mut(hash) {
+            Some(h) => {
+                h.used = now;
+                true
             }
+            None => false,
         };
-        if write {
+        if found && now.saturating_sub(self.saved.load(Ordering::Relaxed)) > USED_PERSIST.as_millis() as u64 {
             self.persist();
         }
+    }
+
+    /// A read of `hash` starts: until the guard drops, the file is not let
+    /// go to make room.
+    fn reading(self: &Arc<Self>, hash: Hash) -> Reading {
+        if let Some(h) = self.held.lock().unwrap().get_mut(&hash) {
+            h.readers += 1;
+        }
+        Reading { lane: self.clone(), hash }
     }
 
     /// May `remote` be served `hash`: the blob is whole here, and `remote` is
@@ -400,7 +454,8 @@ impl BlobLane {
         let remote = conn.remote_id();
         let mask = EventMask {
             connected: ConnectMode::None,
-            get: RequestMode::Intercept,
+            // The transfer's own events say when it ends (`Log`).
+            get: RequestMode::InterceptLog,
             get_many: RequestMode::Disabled,
             push: RequestMode::Disabled,
             observe: ObserveMode::Intercept,
@@ -413,7 +468,21 @@ impl BlobLane {
                 match msg {
                     ProviderMessage::GetRequestReceived(msg) => {
                         let ok = msg.request.ranges.is_blob() && lane.may_serve(&hub, &remote, &msg.request.hash);
+                        // Kept from eviction while the transfer runs: until
+                        // it completes, aborts, or its events stop.
+                        let reading = ok.then(|| lane.reading(msg.request.hash));
                         msg.tx.send(if ok { Ok(()) } else { Err(AbortReason::Permission) }).await.ok();
+                        if let Some(reading) = reading {
+                            let mut updates = msg.rx;
+                            tokio::spawn(async move {
+                                let _reading = reading;
+                                while let Ok(Some(u)) = updates.recv().await {
+                                    if matches!(u, RequestUpdate::Completed(_) | RequestUpdate::Aborted(_)) {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
                     }
                     ProviderMessage::ObserveRequestReceived(msg) => {
                         let ok = lane.may_serve(&hub, &remote, &msg.request.hash);
@@ -570,7 +639,7 @@ impl BlobLane {
                 return None;
             }
             held.insert(placeholder, Held {
-                rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len), used: now,
+                rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len), used: now, readers: 0,
             });
             evicted
         };
@@ -599,7 +668,7 @@ impl BlobLane {
             let mut held = self.held.lock().unwrap();
             held.remove(&placeholder);
             let h = held.entry(hash).or_insert(Held {
-                rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len), used: 0,
+                rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len), used: 0, readers: 0,
             });
             h.rooms.insert(room);
             h.phase = Phase::Complete;
@@ -872,7 +941,7 @@ pub async fn handle_http(
                             Verdict::NoRoom
                         } else {
                             held.insert(hash, Held {
-                                rooms: HashSet::from([room]), size, have: 0, mime, phase: Phase::Queued, charged: storage_bound(size).max(failed_charge), used: now_ms(),
+                                rooms: HashSet::from([room]), size, have: 0, mime, phase: Phase::Queued, charged: storage_bound(size).max(failed_charge), used: now_ms(), readers: 0,
                             });
                             Verdict::Start
                         }
@@ -931,6 +1000,7 @@ pub async fn handle_http(
                 return reply(socket, "404 Not Found", cors, &err_json("not on this node yet")).await;
             };
             lane.touch(&hash);
+            let _reading = lane.reading(hash);
             if let Err(e) = serve_bytes(&lane, socket, &head, hash, len, &mime, cors).await {
                 eprintln!("📦 blob {}: serving ended: {e}", hash.fmt_short());
             }
@@ -1073,7 +1143,7 @@ mod tests {
         let tag = lane_a.store.blobs().add_slice(&data).await.unwrap();
         let size = data.len() as u64;
         lane_a.held.lock().unwrap().insert(tag.hash, Held {
-            rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size, used: 0,
+            rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size, used: 0, readers: 0,
         });
         assert_eq!(
             lane_a.held_json("r", &[b_id]),
@@ -1082,7 +1152,7 @@ mod tests {
         assert!(lane_a.held_json("elsewhere", &[]).starts_with(r#"{"held":[],"#));
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
             lane.held.lock().unwrap().insert(tag.hash, Held {
-                rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared, used: 0,
+                rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared, used: 0, readers: 0,
             });
         };
 
@@ -1092,6 +1162,18 @@ mod tests {
         let mut got = Vec::new();
         lane_b.store.blobs().reader(tag.hash).read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
+        // A's side held the file as being read until the transfer ended.
+        let read_over = |lane: &Arc<BlobLane>| {
+            let h = &lane.held.lock().unwrap()[&tag.hash];
+            h.readers == 0 && h.used > 0
+        };
+        for _ in 0..50 {
+            if read_over(&lane_a) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(read_over(&lane_a), "the served read never ended");
 
         queue(&lane_c, size);
         lane_c.clone().run_fetch(ep_c.clone(), tag.hash, size, vec![ep_a.id()]).await;
@@ -1104,6 +1186,13 @@ mod tests {
         queue(&lane_b2, 1000);
         lane_b2.clone().run_fetch(ep_b.clone(), tag.hash, 1000, vec![ep_a.id()]).await;
         assert!(matches!(lane_b2.held.lock().unwrap()[&tag.hash].phase, Phase::Failed(_)));
+        for _ in 0..100 {
+            if lane_a.held.lock().unwrap()[&tag.hash].readers == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(lane_a.held.lock().unwrap()[&tag.hash].readers, 0, "a read cut off at its declaration never ended");
         // …and asked for no more than it declared: the store holds a partial
         // blob of about the declared size, never the whole 300 KB.
         match lane_b2.store.blobs().status(tag.hash).await.unwrap() {
@@ -1224,6 +1313,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_collection_during_restore_takes_nothing_it_has_not_reached() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-restore-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gc = Duration::from_millis(20);
+        let file = |seed: u32| (0..50_000u32).map(|i| (i.wrapping_mul(seed) % 251) as u8).collect::<Vec<u8>>();
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, gc).await.unwrap();
+        let a = import_bytes(&lane, &file(7), "a").await;
+        let b = import_bytes(&lane, &file(11), "b").await;
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+        // A slow restore: collections run every 20 ms while it looks at each file.
+        RESTORE_PAUSE_MS.store(300, Ordering::Relaxed);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, gc).await.unwrap();
+        RESTORE_PAUSE_MS.store(0, Ordering::Relaxed);
+        for h in [a, b] {
+            assert!(lane.status_json(&h).contains(r#""state":"complete""#), "{}", lane.status_json(&h));
+            assert!(whole(&lane, h).await);
+        }
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_being_read_stays_and_its_use_is_saved() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-reading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = |seed: u32| (0..100_000u32).map(|i| (i.wrapping_mul(seed) % 251) as u8).collect::<Vec<u8>>();
+        // Room for two files, not three.
+        let lane = BlobLane::open_with(dir.clone(), storage_bound(100_000) * 2 + 1000, true, Duration::from_millis(100)).await.unwrap();
+        let a = import_bytes(&lane, &file(7), "a").await;
+        let b = import_bytes(&lane, &file(11), "b").await;
+        let hour = 3_600_000;
+        lane.held.lock().unwrap().get_mut(&a).unwrap().used = now_ms() - 2 * hour;
+        lane.held.lock().unwrap().get_mut(&b).unwrap().used = now_ms() - hour;
+        // A read of A that has run for hours: A stays, B goes instead.
+        let reading = lane.reading(a);
+        let c = import_bytes(&lane, &file(13), "c").await;
+        assert!(lane.status_json(&a).contains("complete"), "the file being read was let go");
+        assert_eq!(lane.status_json(&b), r#"{"state":"none"}"#);
+        assert!(!lane.fits(100_000), "nothing can go: one is being read, one was just used");
+        drop(reading);
+        assert!(lane.held.lock().unwrap()[&a].used > now_ms() - 60_000, "the read's end counts as a use");
+        assert!(lane.held.lock().unwrap()[&a].readers == 0 && lane.held.lock().unwrap()[&c].readers == 0);
+
+        // Use goes to disk once the list's last WRITE is old, however
+        // recent the last read: steady reads are saved, not skipped.
+        let saved_used = |h: Hash| -> u64 {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(LIBRARY_FILE)).unwrap()).unwrap();
+            v["files"].as_array().unwrap().iter().find(|f| f["hash"] == h.to_hex().to_string()).unwrap()["used"].as_u64().unwrap()
+        };
+        lane.held.lock().unwrap().get_mut(&a).unwrap().used = 5;
+        lane.persist();
+        lane.touch(&a); // read just after a write: kept in memory only
+        assert_eq!(saved_used(a), 5);
+        lane.touch(&a);
+        let quiet = now_ms() - USED_PERSIST.as_millis() as u64 - 1_000;
+        lane.saved.store(quiet, Ordering::Relaxed); // the last write was long ago; the last read was not
+        lane.touch(&a);
+        assert!(saved_used(a) > now_ms() - 60_000, "a read in steady use was not saved");
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_cut_held_list_names_the_files_used_last() {
         let dir = std::env::temp_dir().join(format!("ssf-blob-cut-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1231,7 +1384,7 @@ mod tests {
         let hash = |i: u64| Hash::new(i.to_le_bytes());
         for i in 0..=MAX_HELD_LISTED as u64 {
             lane.held.lock().unwrap().insert(hash(i), Held {
-                rooms: HashSet::from(["r".to_string()]), size: 1, have: 1, mime: String::new(), phase: Phase::Complete, charged: 1, used: i,
+                rooms: HashSet::from(["r".to_string()]), size: 1, have: 1, mime: String::new(), phase: Phase::Complete, charged: 1, used: i, readers: 0,
             });
         }
         let got: serde_json::Value = serde_json::from_str(&lane.held_json("r", &[])).unwrap();
