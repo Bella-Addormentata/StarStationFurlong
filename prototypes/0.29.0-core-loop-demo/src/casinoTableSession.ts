@@ -435,6 +435,30 @@ const sumOf = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0);
  *  table visited; tagged with the room doc and round it belongs to. */
 const takeBackLedgers = new Map<string, { epoch: number; round: number; added: Map<string, number[]> }>();
 
+/** The throw a fling of the held dice makes, from the cursor samples taken
+ *  while they were held (felt metres, page-clock ms), or null when the flick
+ *  was too slow and the dice are just dropped. Any direction counts: a shooter
+ *  facing the table often flicks sideways, and the dice bounce off the rails
+ *  wherever they're sent. */
+export function readFling(
+  samples: ReadonlyArray<{ t: number; p: FeltPoint }>,
+  now: number,
+): { from: FeltPoint; dir: FeltPoint; power: number } | null {
+  if (samples.length === 0) return null;
+  const b = samples[samples.length - 1];
+  const a = samples.find((x) => now - x.t <= FLING_WINDOW_MS) ?? b;
+  const dt = Math.max(1, b.t - a.t) / 1000;
+  const vx = (b.p.x - a.p.x) / dt;
+  const vz = (b.p.z - a.p.z) / dt;
+  const speed = Math.hypot(vx, vz);
+  if (speed < FLING_MIN_SPEED) return null;
+  return {
+    from: b.p,
+    dir: { x: vx / speed, z: vz / speed },
+    power: Math.min(1, (speed - FLING_MIN_SPEED) / (FLING_FULL_SPEED - FLING_MIN_SPEED)),
+  };
+}
+
 /** "Forward" for a player at `stand` (table-local): away from their own
  *  rail, toward the far side. */
 function inwardFrom(stand: FeltPoint, halfZ: number): FeltPoint {
@@ -747,29 +771,19 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const samples = held;
     held = null;
     localHold.delete(itemId);
-    const now = performance.now();
-    const recent = samples.filter((x) => now - x.t <= FLING_WINDOW_MS);
-    const a = recent[0] ?? samples[samples.length - 1];
-    const b = samples[samples.length - 1];
-    const dt = Math.max(1, b.t - a.t) / 1000;
-    const vx = (b.p.x - a.p.x) / dt;
-    const vz = (b.p.z - a.p.z) / dt;
-    const speed = Math.hypot(vx, vz);
-    // "Forward" is away from the shooter's own rail, toward the far side.
-    const inward = stand ? inwardFrom(stand, h.halfZ) : { x: 0, z: 1 };
-    const forward = (vx * inward.x + vz * inward.z) / (speed || 1);
-    if (!s || !myThrowPending() || speed < FLING_MIN_SPEED || forward < 0.35) {
-      say('FLING THE DICE FORWARD, ACROSS THE TABLE');
+    const fling = readFling(samples, performance.now());
+    if (!s || !myThrowPending() || !fling) {
+      say('FLICK THE DICE HARDER TO THROW THEM');
       return; // the frame driver slides them back to your spot
     }
     writeDiceThrow(itemId, {
       round: s.round,
       by: me,
-      sx: b.p.x,
-      sz: b.p.z,
-      dx: vx / speed,
-      dz: vz / speed,
-      power: Math.min(1, (speed - FLING_MIN_SPEED) / (FLING_FULL_SPEED - FLING_MIN_SPEED)),
+      sx: fling.from.x,
+      sz: fling.from.z,
+      dx: fling.dir.x,
+      dz: fling.dir.z,
+      power: fling.power,
       seed: Math.floor(Math.random() * 2 ** 31),
     });
   };
