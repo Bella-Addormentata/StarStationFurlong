@@ -114,6 +114,7 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
   const myId = getPlayerId();
   let capture: HTMLDivElement | null = null;
   let strip: HTMLDivElement | null = null;
+  let live: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
   let hover: CashierAct | null = null;
   let focus: CashierAct | null = null;
@@ -123,7 +124,18 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
   const ndc = new THREE.Vector2();
 
   const paint = (): void => {
-    deps.screen?.paint({ chips: readChips(myId), hover, focus, flash });
+    const chips = readChips(myId);
+    deps.screen?.paint({ chips, hover, focus, flash });
+    // The screen is a texture: say the same thing to assistive technology.
+    if (live) {
+      const button = cashierButtons(chips).find((b) => b.act === focus);
+      const text = [
+        `Your chips: ${chips}.`,
+        button ? `Selected: ${button.label}${button.enabled ? '' : ' (unavailable)'}.` : '',
+        flash ? `${flash}.` : '',
+      ].filter(Boolean).join(' ');
+      if (live.textContent !== text) live.textContent = text;
+    }
   };
 
   /** Aim the raycaster from the focus camera through a pointer. */
@@ -183,9 +195,13 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
   // walk; Esc, WASD and Tab pass through (stepping back stays where it was).
   const onKey = (e: KeyboardEvent): void => {
     if (e.ctrlKey || e.metaKey || e.altKey) return; // the browser's shortcuts
+    // The SpacePhone in front owns the keys (as it owns Esc, deviceFocus.ts).
+    if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
     const target = e.target as HTMLElement | null;
-    // Form fields and focused buttons (the ⚙ card's) keep their own keys.
-    if (isFormFieldTarget(target) || target?.tagName === 'BUTTON') return;
+    // Only keys aimed at the kiosk (its focused screen, or nothing focused):
+    // form fields, the ⚙ card's buttons and any other focused UI keep theirs.
+    if (target !== capture && target !== document.body && target !== null) return;
+    if (isFormFieldTarget(target)) return;
     const dir = NAV_KEYS[e.key];
     if (dir) {
       focus = cashierNav(cashierButtons(readChips(myId)), focus, dir);
@@ -205,7 +221,14 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
       flashLeft = 0;
       capture = document.createElement('div');
       capture.id = 'cashier-capture';
-      capture.style.cssText = 'position:absolute; inset:0; pointer-events:auto; background:transparent;';
+      capture.style.cssText = 'position:absolute; inset:0; pointer-events:auto; background:transparent; outline:none;';
+      // Keyboard + screen-reader use: the screen itself takes focus, and a
+      // live region reads out what the texture shows.
+      capture.tabIndex = 0;
+      capture.setAttribute('role', 'application');
+      capture.setAttribute('aria-roledescription', 'cashier screen');
+      capture.setAttribute('aria-label',
+        'Cashier. Arrow keys choose buy in 25, 100 or 500, or cash out all chips; Enter presses. The settings gear opens the cage ledger. Escape steps back.');
       capture.addEventListener('click', onClick);
       capture.addEventListener('pointermove', onMove);
       capture.addEventListener('pointerleave', () => {
@@ -224,7 +247,12 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
       strip.textContent = deps.screen
         ? 'CASHIER · CLICK THE SCREEN · ← → ↑ ↓ + ENTER · ⚙ FOR THE CAGE LEDGER · ESC TO STEP BACK'
         : 'THIS CASHIER HAS NO SCREEN · ESC TO STEP BACK';
-      host.append(capture, strip);
+      live = document.createElement('div');
+      live.setAttribute('role', 'status');
+      live.setAttribute('aria-live', 'polite');
+      live.style.cssText = 'position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap;';
+      host.append(capture, strip, live);
+      capture.focus({ preventScroll: true });
       window.addEventListener('keydown', onKey, true);
       unsubscribe = subscribeCasino(() => paint());
       paint();
@@ -236,7 +264,8 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
       window.removeEventListener('keydown', onKey, true);
       capture?.remove();
       strip?.remove();
-      capture = strip = null;
+      live?.remove();
+      capture = strip = live = null;
       closeGearCard(deps.itemId);
       deps.screen?.paint(null); // back to the attract card
     },
