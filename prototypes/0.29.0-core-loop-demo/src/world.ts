@@ -218,7 +218,8 @@ import { createArcadeCabinetUI as createNesCabinetUI } from "./arcadeNesCabinet"
 import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeNesSession";
 // 🕹🕹 The double-wide cabinet's own games (Lantern Road): the same, four seats.
 import {
-  closeNativeArcadeCabinet, linkNativeArcade, nativeArcadeFrame, registerNativeArcadeVisual, setNativeCabinetGameReader,
+  closeNativeArcadeCabinet, linkNativeArcade, nativeArcadeFrame, nativeSeatStatus, registerNativeArcadeVisual,
+  setNativeCabinetGameReader,
 } from "./arcadeNativeSession";
 import { writeArcade, writeNativeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
@@ -342,6 +343,10 @@ interface RemoteAvatar {
  *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
+
+/** 🕹🕹 A double-wide cabinet stand counts as taken by somebody standing
+ *  this close to it: under half the 0.4 m between its stands. */
+const NATIVE_STAND_TAKEN_M = 0.18;
 
 /** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
  *  falls back to the id-based pose (old gossip without wall data). Anchoring a
@@ -6439,7 +6444,7 @@ export class World {
         onGameChanged: swap("play"),
         openSettings: swap("settings"),
         onPlay: () => countBuiltInPlay(deviceId),
-        link: wide ? linkNativeArcade(deviceId, seat) : undefined,
+        openLink: wide ? () => linkNativeArcade(deviceId, seat) : undefined,
         keys: own.controls,
         notice: wide ? undefined : "MADE FOR THE DOUBLE-WIDE CABINET",
         requestRelease: () => deviceFocus.release(),
@@ -6499,6 +6504,36 @@ export class World {
       if (s && seatStatus(deviceId, n) === "free" && reachable(s)) return s;
     }
     return null;
+  }
+
+  /** 🕹🕹 The double-wide cabinet's own game: this page's stand if it plays
+   *  there, else the nearest reachable stand whose seat is free and nobody
+   *  stands on. Its stands are a stride apart, too close for
+   *  pickFreeStand's 0.7 m test: one player would shut out the next. */
+  private pickNativeSeatStand(deviceId: string): StandSlot | null {
+    const stands = standsForItem(deviceId);
+    const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
+    const reachable = this.standReachability();
+    const status = nativeSeatStatus(deviceId);
+    const mine = status.indexOf("mine");
+    if (mine >= 0) {
+      const own = at(mine);
+      return own && reachable(own) ? own : null;
+    }
+    const others = this.getRemoteAvatarSnapshots();
+    const me = this.player.getPosition();
+    const free = status
+      .map((st, n) => (st === "free" ? at(n) : null))
+      .filter((s): s is StandSlot =>
+        s !== null &&
+        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < NATIVE_STAND_TAKEN_M) &&
+        reachable(s));
+    free.sort(
+      (a, b) =>
+        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
+        Math.hypot(b.front.x - me.x, b.front.z - me.z),
+    );
+    return free[0] ?? null;
   }
 
   /**
@@ -7059,9 +7094,10 @@ export class World {
       // Its own game seats four by stand (s0 = player 1), the free one
       // nearest; no stand free, the front, to watch.
       const own = seats === 4 && nativeEntry(readCabinet(deviceId).game) !== null;
-      const stand = seats === 2 || own ? this.pickFreeStand(deviceId)
-        : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId)
-          : null;
+      const stand = seats === 2 ? this.pickFreeStand(deviceId)
+        : own ? this.pickNativeSeatStand(deviceId)
+          : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId)
+            : null;
       const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : own ? null : 0;
       const target: DeviceTarget = stand
         ? { ...device, front: stand.front, faceAngle: stand.faceAngle }

@@ -44,7 +44,7 @@ import {
   writeNativeSnapshot,
 } from './games/gamesDoc';
 import {
-  NATIVE_MAX_SEATS, newNativeMatch, newNativeSeat, seatIsFor, type NativeMatch, type NativeSeat,
+  NATIVE_MAX_SEATS, newNativeMatch, newNativeSeat, seatIsFor, tokenSeat, type NativeMatch, type NativeSeat,
 } from './games/nativeArcade';
 import { casinoDocEpoch } from './casinoDoc';
 import { getPlayerId } from './identity';
@@ -174,6 +174,10 @@ interface CabinetSession {
   paintCount: number;
   /** What the cabinet shows now ('released': whatever else paints it). */
   shown: string | null;
+  /** This session's picture (or its cabinet UI's) is on the screen, and the
+   *  screen goes back (showAttract) when the cabinet stops being ours. Kept
+   *  apart from `shown`, which a new copy or match resets. */
+  holds: boolean;
 }
 
 const sessions = new Map<string, CabinetSession>();
@@ -182,6 +186,7 @@ const sessions = new Map<string, CabinetSession>();
 export function registerNativeArcadeVisual(itemId: string, handle: ArcadeCabinetVisualHandle, pos: { x: number; z: number }): void {
   const existing = sessions.get(itemId);
   if (existing && existing.docEpoch === casinoDocEpoch()) {
+    if (existing.handle !== handle) existing.holds = false;
     existing.handle = handle;
     existing.pos = pos;
     existing.shown = null;
@@ -191,13 +196,16 @@ export function registerNativeArcadeVisual(itemId: string, handle: ArcadeCabinet
 }
 
 function freshSession(handle: ArcadeCabinetVisualHandle, pos: { x: number; z: number }): CabinetSession {
-  return { handle, pos, docEpoch: casinoDocEpoch(), bornAt: Date.now(), copy: null, link: null, paintCount: 0, shown: null };
+  return {
+    handle, pos, docEpoch: casinoDocEpoch(), bornAt: Date.now(), copy: null, link: null, paintCount: 0, shown: null, holds: false,
+  };
 }
 
 function sessionFor(itemId: string): CabinetSession | null {
   const s = sessions.get(itemId);
   if (!s || s.docEpoch === casinoDocEpoch()) return s ?? null;
   const fresh = freshSession(s.handle, s.pos);
+  fresh.holds = s.holds;
   sessions.set(itemId, fresh);
   return fresh;
 }
@@ -264,7 +272,7 @@ function seatsOf(itemId: string, m: NativeMatch): Array<NativeSeat | null> {
   const out: Array<NativeSeat | null> = [];
   for (let n = 0; n < NATIVE_MAX_SEATS; n++) {
     const seat = n === m.hostSeat || n >= nativeSeats(m) ? null : readNativeSeat(itemId, n);
-    out.push(seat && seatIsFor(seat, m) && seat.page !== m.hostPage ? seat : null);
+    out.push(seat && seatIsFor(seat, m) && seat.page !== m.hostPage && tokenSeat(seat.token) === n ? seat : null);
   }
   return out;
 }
@@ -357,10 +365,10 @@ export function routeNativeArcadeTick(senderId: string, bytes: Uint8Array): void
     if (copy.role !== 'host') return;
     const m = readNativeArcade(itemId);
     if (!m || !isCopyOf(copy, m)) return;
-    const seats = seatsOf(itemId, m);
-    const n = seats.findIndex((seat) => seat?.token === t.token);
-    if (n < 0) return;
-    seatGuest(copy, n, seats[n]!.token, now);
+    // The token names its seat: one guest's ticks never drive another's.
+    const n = tokenSeat(t.token);
+    if (seatsOf(itemId, m)[n]?.token !== t.token) return;
+    seatGuest(copy, n, t.token, now);
     copy.guestPads[n]!.onTick(t);
     copy.lastGuestAt[n] = now;
     return;
@@ -639,11 +647,14 @@ function paint(itemId: string, s: CabinetSession, m: NativeMatch | null, now: nu
   };
   if (!own && !s.copy) {
     // Not one of ours: hand the screen back once, then leave it alone.
-    if (s.shown !== null && s.shown !== 'released') s.handle.showAttract();
+    if (s.holds) s.handle.showAttract();
+    s.holds = false;
     s.shown = 'released';
     return;
   }
   if (s.link?.uiScreen) {
+    // The cabinet UI at this page paints its menu on the screen.
+    s.holds = true;
     s.shown = 'ui';
     return;
   }
@@ -654,6 +665,7 @@ function paint(itemId: string, s: CabinetSession, m: NativeMatch | null, now: nu
       s.handle.setPictureLines?.(game.lines[0], game.lines[1]);
       s.handle.painter.drawWith(draw);
       s.handle.present();
+      s.holds = true;
     });
   const title = (line: string) => {
     const blink = Math.floor(now / TITLE_BLINK_MS) % 2 === 0;
@@ -673,6 +685,7 @@ function paint(itemId: string, s: CabinetSession, m: NativeMatch | null, now: nu
   s.handle.setPictureLines?.(game.lines[0], game.lines[1]);
   s.handle.painter.drawWith((ctx, w, h) => game.paint(ctx, copy.state, w, h));
   s.handle.present();
+  s.holds = true;
 }
 
 // ── The page at the cabinet (arcadeNesCabinet.ts's UI, this link) ───────────
@@ -755,7 +768,7 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
       if (!s || !m || seat === null || seat === m.hostSeat || seat >= nativeSeats(m)) return;
       if (mySeatIn(itemId, m) !== null) return;
       if (seatsOf(itemId, m)[seat] !== null) return; // someone else's
-      writeNativeSeat(itemId, seat, newNativeSeat(m, getPlayerId(), PAGE));
+      writeNativeSeat(itemId, seat, newNativeSeat(m, seat, getPlayerId(), PAGE));
     },
 
     setButtons(pad: number): void {
@@ -788,6 +801,24 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
     },
   };
   return api;
+}
+
+/**
+ * Each stand's seat in the cabinet's game, for the page walking up to it:
+ * this page's, somebody else's, or free. Every stand is free while no game
+ * runs, or once its host has gone quiet for good.
+ */
+export function nativeSeatStatus(itemId: string): Array<'mine' | 'taken' | 'free'> {
+  const out: Array<'mine' | 'taken' | 'free'> = new Array(NATIVE_MAX_SEATS).fill('free');
+  const m = readNativeArcade(itemId);
+  const s = sessionFor(itemId);
+  if (!m || (m.hostPage !== PAGE && s && hostSilentFor(s, s.copy, Date.now()) > HOST_GONE_MS)) return out;
+  const seats = seatsOf(itemId, m);
+  for (let n = 0; n < NATIVE_MAX_SEATS; n++) {
+    const page = n === m.hostSeat ? m.hostPage : seats[n]?.page;
+    out[n] = n >= nativeSeats(m) ? 'taken' : page === undefined ? 'free' : page === PAGE ? 'mine' : 'taken';
+  }
+  return out;
 }
 
 // ── Tests and debugging ──────────────────────────────────────────────────────

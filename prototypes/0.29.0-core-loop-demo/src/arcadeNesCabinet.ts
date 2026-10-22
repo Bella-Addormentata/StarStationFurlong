@@ -200,9 +200,11 @@ export interface ArcadeCabinetUIDeps {
   seats?: 1 | 2;
   /** Leave the cabinet (the strip's LEAVE button). */
   requestRelease: () => void;
-  /** The shared-game session: the NES games' unless given (the cabinet's
-   *  own games bring theirs; tests stub it). */
+  /** The shared-game session: the NES games' unless given (tests stub it). */
   link?: ArcadeLink;
+  /** Or open one when the UI mounts (the cabinet's own games bring theirs):
+   *  a link takes the cabinet's screen, so not before the UI is up. */
+  openLink?: () => ArcadeLink;
   /** The strip's key line while playing (default: the NES pad's). */
   keys?: string;
   /** The menu's status line when it opens (why there's nothing to play). */
@@ -433,7 +435,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       usedByCabinet.clear();
       padHeld[0] = new Set();
       padHeld[1] = new Set();
-      link = deps.link ?? linkArcade(deps.itemId, seat, seats);
+      link = deps.link ?? deps.openLink?.() ?? linkArcade(deps.itemId, seat, seats);
       autoJoin = true;
       setView({ screen: 'menu', cursor: menuCursor, status: deps.visual ? deps.notice ?? null : 'CABINET SCREEN NOT FOUND' });
 

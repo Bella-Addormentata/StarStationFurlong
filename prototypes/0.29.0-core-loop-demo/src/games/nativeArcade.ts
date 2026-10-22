@@ -47,7 +47,8 @@ export interface NativeSeat {
   startedAt: number;
   player: string;
   page: string;
-  /** The guest's ticks carry this, so a stale page can't drive the seat. */
+  /** The guest's ticks carry this, so a stale page can't drive the seat.
+   *  Its low two bits are the seat (seatToken): two seats never share one. */
   token: number;
 }
 
@@ -124,9 +125,18 @@ export function newNativeMatch(args: {
   };
 }
 
-/** A guest's seat in `m`, with a fresh token. */
-export function newNativeSeat(m: NativeMatch, player: string, page: string, random?: () => number): NativeSeat {
+/** A fresh token for seat `seat`: random above, the seat in the low two
+ *  bits, so a guest's tick names its seat and no two seats' tokens match. */
+export function seatToken(seat: number, random: () => number = Math.random): number {
+  return ((randomU16(random) & 0x3fff || 1) << 2) | (seat & (NATIVE_MAX_SEATS - 1));
+}
+
+/** The seat a guest's token names. */
+export const tokenSeat = (token: number): number => token & (NATIVE_MAX_SEATS - 1);
+
+/** A guest's seat `seat` in `m`, with a fresh token. */
+export function newNativeSeat(m: NativeMatch, seat: number, player: string, page: string, random?: () => number): NativeSeat {
   return {
-    kind: 'arcade-native-seat', hostPage: m.hostPage, startedAt: m.startedAt, player, page, token: randomU16(random),
+    kind: 'arcade-native-seat', hostPage: m.hostPage, startedAt: m.startedAt, player, page, token: seatToken(seat, random),
   };
 }

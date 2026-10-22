@@ -311,6 +311,67 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     expect(a.released).toBe(1);
   });
 
+  it('hands the screen back when a running game ends as the cabinet\'s game changes', async () => {
+    const [a, b] = await room('a', 'b');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(300);
+    expect(b.painted.size).toBeGreaterThan(0);
+    // The owner puts another game on: the match ends in the same moment.
+    for (const p of [a, b]) p.mod.setNativeCabinetGameReader(() => null);
+    a.games.writeNativeArcade(ITEM, null);
+    await run(50);
+    expect(a.released).toBe(1);
+    expect(b.released).toBe(1);
+  });
+
+  it('keeps two guests apart even when their seats draw the same random token', async () => {
+    const [a, b, c] = await room('a', 'b', 'c');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    const g1 = link(b, 1);
+    const g2 = link(c, 3);
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    g1.join();
+    g2.join();
+    random.mockRestore();
+    const t1 = a.games.readNativeSeat(ITEM, 1)!.token;
+    const t3 = a.games.readNativeSeat(ITEM, 3)!.token;
+    expect(t1).not.toBe(t3);
+    // Player 4 walks right; player 2 stands still.
+    await run(300);
+    const from = stateOf(a)!.players[3]!.x;
+    let furthest = from;
+    await run(8000, () => {
+      g1.setButtons(0);
+      g2.setButtons(0x80);
+      furthest = Math.max(furthest, stateOf(a)!.players[3]!.x);
+    });
+    // Player 4's presses drove player 4, and both still hold their seats
+    // (each one's ticks kept their own alive).
+    expect(furthest).toBeGreaterThan(from);
+    expect(g1.shared()).toMatchObject({ role: 'guest', player: 2 });
+    expect(g2.shared()).toMatchObject({ role: 'guest', player: 4 });
+  });
+
+  it('tells a page walking up which stands are free, its own, or taken', async () => {
+    const [a, b, c] = await room('a', 'b', 'c');
+    expect(c.mod.nativeSeatStatus(ITEM)).toEqual(['free', 'free', 'free', 'free']);
+    const host = link(a, 1);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    link(b, 3).join();
+    await run(100);
+    expect(a.mod.nativeSeatStatus(ITEM)).toEqual(['free', 'mine', 'free', 'taken']);
+    expect(b.mod.nativeSeatStatus(ITEM)).toEqual(['free', 'taken', 'free', 'mine']);
+    expect(c.mod.nativeSeatStatus(ITEM)).toEqual(['free', 'taken', 'free', 'taken']);
+    // The host's page goes for good: every stand is free again.
+    a.closed = true;
+    await run(13000);
+    expect(c.mod.nativeSeatStatus(ITEM)).toEqual(['free', 'free', 'free', 'free']);
+  });
+
   it('ignores a NES-wire tick, even one with the same match id', async () => {
     const [a, b] = await room('a', 'b');
     const host = link(a, 0);

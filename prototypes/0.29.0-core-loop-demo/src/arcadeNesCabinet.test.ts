@@ -402,6 +402,23 @@ describe('the focus UI', () => {
     expect(link.release).toHaveBeenCalled();
   });
 
+  it("opens a cabinet's own game's link when the UI mounts, not when it is built", () => {
+    const link: ArcadeLink = {
+      shared: () => null, takeError: () => null, host: vi.fn(), stop: vi.fn(), join: vi.fn(), setButtons: vi.fn(),
+      setLocalPad2: vi.fn(), setAudio: vi.fn(), setUiScreen: vi.fn(), release: vi.fn(),
+    };
+    const openLink = vi.fn(() => link);
+    const visual: ArcadeCabinetVisualHandle = { painter: recordingPainter(), present: vi.fn(), showAttract: vi.fn() };
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual, requestRelease: vi.fn(), openLink });
+    // Built for a walk that may never arrive: nothing holds the screen yet.
+    expect(openLink).not.toHaveBeenCalled();
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    expect(openLink).toHaveBeenCalledTimes(1);
+    expect(link.setUiScreen).toHaveBeenLastCalledWith(true);
+    ui.unmount();
+    expect(link.release).toHaveBeenCalledTimes(1);
+  });
+
   it('never takes Esc or Tab, so leaving and the phone still work', () => {
     const { ui, host } = setup();
     ui.mount(host as unknown as HTMLElement);
