@@ -204,8 +204,6 @@ export function crapsNumberBox(n: number, side: -1 | 1): FeltRect {
 
 /** Depth of a number box's bottom (come) and top (don't come) bands. */
 const NUM_BAND = 0.09;
-/** Width of the odds column at the inner edge of each band. */
-const ODDS_COL = 0.045;
 
 /** A number box's bands: travelled come bets and their odds at the bottom,
  *  place bets in the middle, travelled don't come bets, their lay odds (and
@@ -219,10 +217,10 @@ function numberBands(n: number, side: -1 | 1) {
     bottom,
     top,
     middle: rect(box.x0, bottom.z1, box.x1, top.z0),
-    come: rect(box.x0, box.z0, box.x1 - ODDS_COL, bottom.z1),
-    comeOdds: rect(box.x1 - ODDS_COL, box.z0, box.x1, bottom.z1),
-    dontCome: rect(box.x0, top.z0, box.x1 - ODDS_COL, box.z1),
-    dontComeOdds: rect(box.x1 - ODDS_COL, top.z0, box.x1, box.z1),
+    // Odds ride on top of the flat bet they back, so the flat bet and its
+    // odds share one chip area.
+    come: bottom,
+    dontCome: top,
   };
 }
 
@@ -312,11 +310,11 @@ function crapsEnd(side: -1 | 1): FeltRegion<CrapsSpot>[] {
     });
     out.push({
       id: `comeodds:${n}@${tag}`, bet: { type: 'comeodds', pick: n }, rects: [b.bottom],
-      label: 'ODDS', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.comeOdds,
+      label: 'ODDS', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.come,
     });
     out.push({
       id: `dontcomeodds:${n}@${tag}`, bet: { type: 'dontcomeodds', pick: n }, rects: [b.top],
-      label: 'LAY', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.dontComeOdds,
+      label: 'LAY', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.dontCome,
     });
   }
   return out;
@@ -511,38 +509,133 @@ export function chipSlots(r: FeltRect): FeltPoint[] {
 }
 
 /**
- * Give each player one stack position in a chip area: in player-id order,
- * each takes the free slot nearest the place they stand (`anchor`), so a
- * player's chips sit in front of them the way a dealer would set them. A
- * player with no known spot takes the first free slot; when there are more
- * players than slots, the extra players share from the start again.
+ * Place stacks one at a time around stacks already standing (`taken`): in
+ * `rank` then player-id order, each player takes the candidate nearest their
+ * `anchor` (the first one, with no anchor) that clears every stack placed so
+ * far by a chip's width. Candidates closer together than that can't both be
+ * used. Only once no clear candidate is left does a player share the
+ * nearest one, so a live bet is never left out.
  */
-export function assignSlots(
-  slots: readonly FeltPoint[],
-  players: ReadonlyArray<{ pid: string; anchor: FeltPoint | null }>,
+export function assignClearSlots(
+  candidates: readonly FeltPoint[],
+  taken: readonly FeltPoint[],
+  players: ReadonlyArray<{ pid: string; anchor: FeltPoint | null; rank?: number }>,
 ): Map<string, FeltPoint> {
   const out = new Map<string, FeltPoint>();
-  if (slots.length === 0) return out;
-  const free = slots.map((_, i) => i);
-  const ordered = [...players].sort((a, b) => (a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : 0));
-  ordered.forEach((p, k) => {
-    if (free.length === 0) {
-      out.set(p.pid, slots[k % slots.length]);
-      return;
+  if (candidates.length === 0) return out;
+  const placed = [...taken];
+  const ordered = [...players].sort((a, b) =>
+    (a.rank ?? Infinity) - (b.rank ?? Infinity) || (a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : 0));
+  const dist = (p: FeltPoint, q: FeltPoint) => Math.hypot(p.x - q.x, p.z - q.z);
+  const pick = (from: readonly FeltPoint[], anchor: FeltPoint | null) =>
+    anchor ? from.reduce((a, b) => (dist(b, anchor) < dist(a, anchor) ? b : a)) : from[0];
+  for (const p of ordered) {
+    const clear = candidates.filter((c) => placed.every((q) => dist(c, q) >= CHIP_RADIUS * 2 - 1e-9));
+    const at = pick(clear.length > 0 ? clear : candidates, p.anchor);
+    out.set(p.pid, at);
+    placed.push(at);
+  }
+  return out;
+}
+
+// ── Dealer positions ─────────────────────────────────────────────────────────
+//
+// On a real craps table the dealers, not the players, set place bets and
+// travelled come / don't come bets in the number boxes, and the stickman sets
+// the centre bets. Each box is the table in miniature: a player's chips go at
+// the spot in the box that matches where they stand at the rail, the same
+// spot in every box, so the crew can tell whose chips are whose at a glance
+// (value chips all look alike). Roulette gets the same job done with colour
+// chips instead — see rouletteChipColor.
+
+/** How far from the table centre the craps rail positions reach along the
+ *  table (the long-rail corner stands at ±0.9, the end stands past ±1.8). */
+const CRAPS_REACH_X = 1.8;
+/** And across it (the long-rail stands at ±1.5). */
+const CRAPS_REACH_Z = 1.5;
+
+/** True for the craps bets the crew sets by player position (the number
+ *  boxes and the centre), false for the ones a player sets in front of
+ *  themselves (line, field, big 6/8, the come box itself). */
+export function crapsDealerPlaced(bet: CrapsSpot): boolean {
+  switch (bet.type) {
+    case 'place':
+    case 'comeodds':
+    case 'dontcomeodds':
+      return true;
+    case 'come':
+    case 'dontcome':
+      return bet.pick !== undefined;
+    default:
+      return CRAPS_LAYOUT.regions.some((r) => r.side === 0 && spotKey(r.bet) === spotKey(bet));
+  }
+}
+
+/**
+ * Where a dealer sets a player's stack inside `r`: the player's stand
+ * (table-local) scaled down into the box. Along the table the box runs from
+ * the table centre (its inner edge) to the end (its outer edge) on the
+ * player's own end (`side` ±1), or across the whole table for the centre
+ * bets (`side` 0); across the table, the −z rail is the box's −z edge. The
+ * stack stays wholly inside the box, and a box too small for that gets it
+ * centred.
+ */
+export function dealerSpot(r: FeltRect, stand: FeltPoint, side: -1 | 0 | 1): FeltPoint {
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  const u = side === 0
+    ? clamp01((stand.x / CRAPS_REACH_X + 1) / 2)
+    : clamp01((stand.x * side) / CRAPS_REACH_X);
+  const v = clamp01((stand.z / CRAPS_REACH_Z + 1) / 2);
+  const along = (lo: number, hi: number, t: number) => {
+    const a = lo + CHIP_RADIUS;
+    const b = hi - CHIP_RADIUS;
+    return a >= b ? (lo + hi) / 2 : a + (b - a) * t;
+  };
+  // The −1 end reads its box from the outer (−x) edge in, so mirror there.
+  const ux = side < 0 ? 1 - u : u;
+  return { x: along(r.x0, r.x1, ux), z: along(r.z0, r.z1, v) };
+}
+
+/** The chip area a travelled come / don't come bet's odds share with it. */
+export function crapsOddsBaseRect(bet: CrapsSpot, side: -1 | 1): FeltRect | null {
+  if ((bet.type !== 'comeodds' && bet.type !== 'dontcomeodds') || bet.pick === undefined) return null;
+  return crapsChipRect({ type: bet.type === 'comeodds' ? 'come' : 'dontcome', pick: bet.pick }, side);
+}
+
+/** Roulette colour chips, one colour per standing position (the wheel head
+ *  first), none of them the felt's red, black or green. */
+export const ROULETTE_CHIP_COLORS = ['#F2C14E', '#4EA8F2', '#F25EB0', '#9B6BF2', '#F28C38', '#5EE0D0'] as const;
+
+/** The colour of the chips a player at stand `stand` plays at roulette. */
+export function rouletteChipColor(stand: number): string {
+  const n = ROULETTE_CHIP_COLORS.length;
+  return ROULETTE_CHIP_COLORS[((stand % n) + n) % n];
+}
+
+/**
+ * Each seated roulette player's chip colour. A stand can hold two players
+ * (with no free stand the table seats a newcomer at the nearest taken one),
+ * so the first at a stand (player-id order) gets its colour and the rest get
+ * the first colour nobody holds; only past six players do colours repeat.
+ */
+export function rouletteChipColors(seats: Record<string, { stand: number }>): Map<string, string> {
+  const out = new Map<string, string>();
+  const pids = Object.keys(seats).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const used = new Set<string>();
+  const later: string[] = [];
+  for (const pid of pids) {
+    const c = rouletteChipColor(seats[pid].stand);
+    if (used.has(c)) later.push(pid);
+    else {
+      out.set(pid, c);
+      used.add(c);
     }
-    let best = 0;
-    if (p.anchor) {
-      let bd = Infinity;
-      free.forEach((si, fi) => {
-        const d = Math.hypot(slots[si].x - p.anchor!.x, slots[si].z - p.anchor!.z);
-        if (d < bd) {
-          bd = d;
-          best = fi;
-        }
-      });
-    }
-    out.set(p.pid, slots[free[best]]);
-    free.splice(best, 1);
+  }
+  later.forEach((pid, i) => {
+    const free = ROULETTE_CHIP_COLORS.filter((c) => !used.has(c));
+    const c = free[0] ?? ROULETTE_CHIP_COLORS[i % ROULETTE_CHIP_COLORS.length];
+    out.set(pid, c);
+    used.add(c);
   });
   return out;
 }
