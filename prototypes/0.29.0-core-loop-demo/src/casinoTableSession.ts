@@ -51,7 +51,7 @@ import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import {
   assignSlots, chipSlots, crapsChipRect, crapsDealerPlaced, crapsOddsBaseRect, crapsSideFor, CRAPS_LAYOUT,
   CHIP_RADIUS, dealerSpot, hitRegion, hitSettings, LAY_PAYS, nearestInDirection, ODDS_PAYS, regionCenter,
-  rouletteChipColor, ROULETTE_LAYOUT, spotKey,
+  rouletteChipColors, ROULETTE_LAYOUT, spotKey,
 } from './games/casinoLayout';
 import type { CrapsSpot, FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
 import {
@@ -289,7 +289,14 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
   // A box with no such slot left shares rather than hide a live bet.
   const placed = new Map<string, Map<string, FeltPoint>>();
   for (const [key, g] of groups) {
-    const at = new Map(g.spots);
+    // One player per spot: two seated at one stand (the table's fallback
+    // when none is free) means the first, in player order, keeps it and the
+    // other looks for room like a bettor without a spot.
+    const at = new Map<string, FeltPoint>();
+    for (const pid of [...g.spots.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) {
+      const q = g.spots.get(pid)!;
+      if ([...at.values()].every((f) => Math.hypot(q.x - f.x, q.z - f.z) >= CHIP_RADIUS * 2)) at.set(pid, q);
+    }
     const loose = [...g.chips.keys()].filter((pid) => !at.has(pid));
     if (loose.length > 0) {
       const fixed = [...at.values()];
@@ -473,6 +480,7 @@ function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime,
       const seats = readSeats(id);
       const anchors = seatAnchors('roulette-table', seats);
       const regionFor = new Map(ROULETTE_LAYOUT.regions.map((r) => [spotKey(r.bet), r.chipRect]));
+      const colors = rouletteChipColors(seats);
       // Roulette players set their own chips, often in the same box, so each
       // plays chips of their stand's own colour rather than a dealer's spot.
       h.setFeltChips(layoutStacks(
@@ -483,8 +491,10 @@ function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime,
           return rect ? { rect } : null;
         },
         me,
-        (pid) => (seats[pid] ? rouletteChipColor(seats[pid].stand) : undefined),
+        (pid) => colors.get(pid),
       ));
+      // Your rail and hand are your colour chips, the colour your bets show.
+      h.setOwnChipColor(colors.get(me) ?? null);
       h.setHighlight(s.phase === 'settled' && s.result !== null ? rouletteWinners(s.result) : NO_HIGHLIGHT);
     }
   }
@@ -580,9 +590,6 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const h = deps.visual;
   const stand = deps.stand !== null ? standLocal(kind, deps.stand) : null;
   const rail = h && stand ? railFor(stand, h.halfX, h.halfZ) : null;
-  // At roulette your rail and hand are your stand's colour chips, the colour
-  // your bets show in on the felt.
-  h?.setOwnChipColor(game === 'roulette' && deps.stand !== null ? rouletteChipColor(deps.stand) : null);
   const ray = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
 

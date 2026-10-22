@@ -15,7 +15,7 @@ const {
 } = await import('./casinoDoc');
 const { casinoTablesFrame } = await import('./casinoTableSession');
 const { FURNITURE, FURNITURE_DEFS } = await import('./furniture');
-const { crapsChipRect, rouletteChipColor } = await import('./games/casinoLayout');
+const { crapsChipRect, rouletteChipColor, ROULETTE_CHIP_COLORS } = await import('./games/casinoLayout');
 type CasinoTableVisualHandle = import('./casinoTable3d').CasinoTableVisualHandle;
 type FeltStack = import('./casinoTable3d').FeltStack;
 
@@ -113,6 +113,34 @@ describe('craps chips by position', () => {
     }
   });
 
+  it('keeps two players sharing a stand apart, odds and all', () => {
+    // With no free stand the table seats a newcomer at a taken one.
+    writeMySeat(TABLE, 'player-a', seat(NEAR));
+    writeMySeat(TABLE, 'player-b', seat(NEAR));
+    for (const [pid, d] of [['player-a', 5], ['player-b', 25]] as const) {
+      writeMyCrapsBets(TABLE, pid, [
+        { type: 'place', pick: 6, amount: d }, { type: 'come', pick: 8, amount: d }, { type: 'comeodds', pick: 8, amount: d },
+      ]);
+    }
+    const { h, chips } = fakeTable('craps');
+    casinoTablesFrame(1 / 60, new Map([[TABLE, h]]));
+    const all = chips();
+    expect(all).toHaveLength(6);
+    const ground = all.filter((s) => !s.lift);
+    for (let i = 0; i < ground.length; i++) {
+      for (let j = i + 1; j < ground.length; j++) {
+        expect(Math.hypot(ground[i].x - ground[j].x, ground[i].z - ground[j].z)).toBeGreaterThanOrEqual(0.042 - 1e-9);
+      }
+    }
+    // Each player's odds ride on their own come bet.
+    for (const d of [5, 25]) {
+      const odds = all.filter((s) => s.chips[0] === d && s.lift === 1);
+      expect(odds).toHaveLength(1);
+      const flat = ground.find((s) => s.chips[0] === d && Math.abs(s.x - odds[0].x) < 1e-9 && Math.abs(s.z - odds[0].z) < 1e-9);
+      expect(flat).toBeDefined();
+    }
+  });
+
   it('never piles centre bets on each other, in stand order', () => {
     // Every stand bets the 0.17 m-wide yo box.
     stands.forEach((_, i) => {
@@ -166,5 +194,25 @@ describe('roulette colour chips', () => {
     expect(chips().find((s) => s.chips[0] === 25)!.color).toBe(rouletteChipColor(3));
     // Bets of someone no longer at the table stay plain value chips.
     expect(chips().find((s) => s.chips[0] === 1)!.color).toBeUndefined();
+  });
+
+  it('gives two players at one stand different colours, rail and hand too', () => {
+    writeMySeat(TABLE, 'player-a', seat(2));
+    writeMySeat(TABLE, 'player-b', seat(2));
+    writeMyBets(TABLE, 'player-a', 1, [{ type: 'straight', pick: 17, amount: 5 }]);
+    writeMyBets(TABLE, 'player-b', 1, [{ type: 'straight', pick: 17, amount: 25 }]);
+    let own: string | null | undefined;
+    const base = fakeTable('roulette');
+    const h = new Proxy(base.h as unknown as Record<PropertyKey, unknown>, {
+      get: (t, key) => (key === 'setOwnChipColor' ? (c: string | null) => { own = c; } : t[key]),
+    }) as unknown as CasinoTableVisualHandle;
+    casinoTablesFrame(1 / 60, new Map([[TABLE, h]]));
+    const a = base.chips().find((s) => s.chips[0] === 5)!.color;
+    const b = base.chips().find((s) => s.chips[0] === 25)!.color;
+    expect(a).toBe(rouletteChipColor(2)); // first in player order keeps the stand's colour
+    expect(b).not.toBe(a);
+    expect(ROULETTE_CHIP_COLORS).toContain(b);
+    // This page isn't seated here, so its own rail stays value chips.
+    expect(own).toBeNull();
   });
 });

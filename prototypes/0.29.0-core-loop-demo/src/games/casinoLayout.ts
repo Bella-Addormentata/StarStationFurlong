@@ -620,3 +620,31 @@ export function rouletteChipColor(stand: number): string {
   const n = ROULETTE_CHIP_COLORS.length;
   return ROULETTE_CHIP_COLORS[((stand % n) + n) % n];
 }
+
+/**
+ * Each seated roulette player's chip colour. A stand can hold two players
+ * (with no free stand the table seats a newcomer at the nearest taken one),
+ * so the first at a stand (player-id order) gets its colour and the rest get
+ * the first colour nobody holds; only past six players do colours repeat.
+ */
+export function rouletteChipColors(seats: Record<string, { stand: number }>): Map<string, string> {
+  const out = new Map<string, string>();
+  const pids = Object.keys(seats).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const used = new Set<string>();
+  const later: string[] = [];
+  for (const pid of pids) {
+    const c = rouletteChipColor(seats[pid].stand);
+    if (used.has(c)) later.push(pid);
+    else {
+      out.set(pid, c);
+      used.add(c);
+    }
+  }
+  later.forEach((pid, i) => {
+    const free = ROULETTE_CHIP_COLORS.filter((c) => !used.has(c));
+    const c = free[0] ?? ROULETTE_CHIP_COLORS[i % ROULETTE_CHIP_COLORS.length];
+    out.set(pid, c);
+    used.add(c);
+  });
+  return out;
+}
