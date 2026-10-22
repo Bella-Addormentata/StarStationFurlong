@@ -286,6 +286,15 @@ function mySeatIn(itemId: string, m: NativeMatch): number | null {
   return n >= 0 ? n : null;
 }
 
+/** The cabinet's match as the doc has it, unless it was left behind for a
+ *  game the cabinet no longer has (its host gone, the owner changed the
+ *  game): nobody follows that one. A live host ends its own when its
+ *  cabinet UI lets go. */
+function matchFor(itemId: string): NativeMatch | null {
+  const m = readNativeArcade(itemId);
+  return m && (m.hostPage === PAGE || cabinetGame(itemId) === m.game) ? m : null;
+}
+
 /** Bring the page's copy in line with the doc. */
 function reconcile(itemId: string, s: CabinetSession, m: NativeMatch | null): void {
   const copy = s.copy;
@@ -327,7 +336,7 @@ function sessionForMatch(matchId: number): [string, CabinetSession] | null {
   }
   for (const [itemId] of sessions) {
     const s = sessionFor(itemId)!;
-    const m = readNativeArcade(itemId);
+    const m = matchFor(itemId);
     if (m?.id === matchId) {
       reconcile(itemId, s, m);
       if (s.copy?.matchId === matchId) return [itemId, s];
@@ -399,7 +408,7 @@ export function nativeArcadeFrame(dt: number, viewer: { x: number; z: number } |
   const now = Date.now();
   for (const itemId of [...sessions.keys()]) {
     const s = sessionFor(itemId)!;
-    const m = readNativeArcade(itemId);
+    const m = matchFor(itemId);
     reconcile(itemId, s, m);
     const copy = s.copy;
     if (copy) copy.ranNow = 0;
@@ -433,9 +442,15 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   let m = readNativeArcade(itemId);
   if (!m || !isCopyOf(copy, m)) return;
   if (mustYieldId(itemId, m)) {
+    // Ticks carry only the id: move to a fresh one. Copies that followed
+    // the old id start over, their guests' tick counts with them.
     m = { ...m, id: freshMatchId(idsInUse()) };
     writeNativeArcade(itemId, m);
     copy.matchId = m.id;
+    for (let n = 0; n < NATIVE_MAX_SEATS; n++) {
+      copy.guestPads[n]!.reset();
+      copy.lastGuestAt[n] = now;
+    }
   }
   const seats = seatsOf(itemId, m);
   const held: boolean[] = [];
@@ -720,7 +735,7 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
       const s = session();
       if (!s) return null;
       const copy = s.copy;
-      const m = readNativeArcade(itemId);
+      const m = matchFor(itemId);
       if (copy?.role === 'host') {
         return { role: 'host', title: copy.game.title, phase: 'playing', joinAs: null, player: (m?.hostSeat ?? 0) + 1 };
       }
@@ -769,7 +784,7 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
 
     join(): void {
       const s = session();
-      const m = readNativeArcade(itemId);
+      const m = matchFor(itemId);
       if (!s || !m || seat === null || seat === m.hostSeat || seat >= nativeSeats(m)) return;
       if (mySeatIn(itemId, m) !== null) return;
       if (seatsOf(itemId, m)[seat] !== null) return; // someone else's
@@ -815,7 +830,7 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
  */
 export function nativeSeatStatus(itemId: string): Array<'mine' | 'taken' | 'free'> {
   const out: Array<'mine' | 'taken' | 'free'> = new Array(NATIVE_MAX_SEATS).fill('free');
-  const m = readNativeArcade(itemId);
+  const m = matchFor(itemId);
   const s = sessionFor(itemId);
   if (!m || (m.hostPage !== PAGE && s && hostSilentFor(s, s.copy, Date.now()) > HOST_GONE_MS)) return out;
   const seats = seatsOf(itemId, m);

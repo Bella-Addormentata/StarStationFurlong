@@ -325,6 +325,51 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     expect(b.released).toBe(1);
   });
 
+  it('lets go of a match its host left behind once the cabinet\'s game changes', async () => {
+    const [a, b] = await room('a', 'b');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(300);
+    // The host closes the tab: its record stays in the doc, nobody runs it.
+    a.closed = true;
+    await run(13000);
+    expect(b.games.readNativeArcade(ITEM)).not.toBeNull();
+    expect(b.mod.nativeArcadeCopyInfo(ITEM)).not.toBeNull();
+    // The owner puts another game on (the record is still there).
+    b.mod.setNativeCabinetGameReader(() => null);
+    await run(50);
+    expect(b.mod.nativeArcadeCopyInfo(ITEM)).toBeNull();
+    expect(b.released).toBe(1);
+  });
+
+  it('a guest keeps playing when its match moves to a fresh id', async () => {
+    const [a, b] = await room('a', 'b');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    const guest = link(b, 1);
+    guest.join();
+    const pads = padScript(9);
+    await run(3000, () => guest.setButtons(pads()));
+    // Last heard before the move: walking left.
+    await run(500, () => guest.setButtons(0x40));
+    // Another cabinet claimed the same id first: this match must move.
+    const m = a.games.readNativeArcade(ITEM)!;
+    a.games.writeNativeArcade('arcade-wide-2', { ...m, hostPage: 'elsewhere', startedAt: m.startedAt - 1000 });
+    guest.setButtons(0);
+    await run(500);
+    expect(a.games.readNativeArcade(ITEM)!.id).not.toBe(m.id);
+    // Player 2 walks right: the host hears the guest's restarted ticks.
+    const from = stateOf(a)!.players[1]!.x;
+    let furthest = from;
+    await run(2000, () => {
+      guest.setButtons(0x80);
+      furthest = Math.max(furthest, stateOf(a)!.players[1]!.x);
+    });
+    expect(furthest).toBeGreaterThan(from);
+    expect(guest.shared()).toMatchObject({ role: 'guest', player: 2 });
+  });
+
   it('keeps two guests apart even when their seats draw the same random token', async () => {
     const [a, b, c] = await room('a', 'b', 'c');
     const host = link(a, 0);
