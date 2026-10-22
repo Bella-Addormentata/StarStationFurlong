@@ -33,7 +33,7 @@ import { gearSection } from './gearCardParts';
 import { readPlayerDisplayName } from './games/gamesDoc';
 import { escapeHtml } from './htmlEscape';
 import { getPlayerId } from './identity';
-import { closeGearCard, pickSettingsGearAt, toggleGearCard } from './settingsGear';
+import { closeGearCard, isGearCardOpen, pickSettingsGearAt, toggleGearCard } from './settingsGear';
 import type { GearCardSpec } from './settingsGear';
 import { isFormFieldTarget } from './typingFocus';
 
@@ -176,10 +176,18 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
     }
   };
 
+  /** Open (or close) the ⚙ card; from the keyboard, focus moves into it. */
+  const toggleLedger = (fromKeys: boolean): void => {
+    toggleGearCard(cashierGearCard(deps.itemId, deps.isHouse));
+    if (fromKeys && isGearCardOpen(deps.itemId)) {
+      document.getElementById('settings-gear-card')?.querySelector<HTMLElement>('[data-act]')?.focus();
+    }
+  };
+
   const onClick = (e: MouseEvent): void => {
     e.stopPropagation(); // the screen owns its clicks: never a stray release
     if (pickSettingsGearAt(e) === deps.itemId) {
-      toggleGearCard(cashierGearCard(deps.itemId, deps.isHouse));
+      toggleLedger(false);
       return;
     }
     const p = screenAt(e);
@@ -207,6 +215,9 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
       focus = cashierNav(cashierButtons(readChips(myId)), focus, dir);
     } else if ((e.key === 'Enter' || e.key === ' ') && focus) {
       if (!e.repeat) press(focus);
+    } else if (e.key === 'l' || e.key === 'L') {
+      // L: the ⚙ card (the cage ledger) without the mouse.
+      if (!e.repeat) toggleLedger(true);
     } else {
       return;
     }
@@ -228,7 +239,7 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
       capture.setAttribute('role', 'application');
       capture.setAttribute('aria-roledescription', 'cashier screen');
       capture.setAttribute('aria-label',
-        'Cashier. Arrow keys choose buy in 25, 100 or 500, or cash out all chips; Enter presses. The settings gear opens the cage ledger. Escape steps back.');
+        'Cashier. Arrow keys choose buy in 25, 100 or 500, or cash out all chips; Enter presses. L, or the settings gear, opens the cage ledger. Escape steps back.');
       capture.addEventListener('click', onClick);
       capture.addEventListener('pointermove', onMove);
       capture.addEventListener('pointerleave', () => {
@@ -245,7 +256,7 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
         color:${GOLD}; font-family:'SF Mono', 'Monaco', 'Consolas', monospace;
         font-size:10px; letter-spacing:1.5px; box-sizing:border-box; pointer-events:none;`;
       strip.textContent = deps.screen
-        ? 'CASHIER · CLICK THE SCREEN · ← → ↑ ↓ + ENTER · ⚙ FOR THE CAGE LEDGER · ESC TO STEP BACK'
+        ? 'CASHIER · CLICK THE SCREEN · ← → ↑ ↓ + ENTER · ⚙ OR L FOR THE CAGE LEDGER · ESC TO STEP BACK'
         : 'THIS CASHIER HAS NO SCREEN · ESC TO STEP BACK';
       live = document.createElement('div');
       live.setAttribute('role', 'status');
