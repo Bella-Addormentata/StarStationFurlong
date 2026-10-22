@@ -6,7 +6,8 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  forgetBlob, forgetBlobLane, formatBytes, nodeHolds, nodeLibrarySpace, nodeReaches, refreshHeldBlobs, setBlobLaneNode, setBlobLaneRoom, torrentLaneReady,
+  fetchBlob, forgetBlob, forgetBlobLane, formatBytes, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches, refreshHeldBlobs,
+  refreshHolders, setBlobLaneNode, setBlobLaneRoom, setHostCopies, torrentLaneReady,
 } from './blobLane';
 import {
   confirmTorrent, forgetTorrentLane, MAX_TORRENT_FILE, parseTorrentState, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile,
@@ -230,5 +231,62 @@ describe('what this node holds, for the library', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'that file is still on its way — wait for it' }), { status: 409 })));
     expect(await forgetBlob(HASH)).toBe('Your node: that file is still on its way — wait for it.');
     expect(await forgetBlob('nope')).toMatch(/node/);
+  });
+});
+
+describe('🏠 the room\'s host keeps copies, and WHERE finds them', () => {
+  const HOST = 'd'.repeat(64);
+
+  it('a room this machine hosts is declared to its node once, and the switch answers with what it spent', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${url}`);
+      if (url.includes('/api/blob/host')) {
+        const on = !url.includes('on=0');
+        return new Response(JSON.stringify({ host: { on, cap: 4 * 1024 ** 3, day: 8 * 1024 ** 3, spent: 0, files: 0, dayFiles: 24 } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ held: [], reachable: [], keep: true, kept: 0, quota: 1, host: { on: true, cap: 4 * 1024 ** 3, day: 8 * 1024 ** 3, spent: 129_000_000, files: 1, dayFiles: 24 } }), { status: 200 });
+    }));
+    setNodeMediaOrigin(ORIGIN, tvNow(), tvWallNow());
+    setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID, torrent: false });
+    setBlobLaneRoom('room-1', true);
+    setBlobLaneRoom('room-1', true); // the same room again: not declared twice
+    await Promise.resolve();
+    expect(calls).toEqual([`POST ${ORIGIN}/api/blob/host?cap=${CAP}&room=room-1`]);
+    expect(nodeHostCopies()).toBeNull(); // the node has not said yet
+    await refreshHeldBlobs(1_000);
+    expect(nodeHostCopies()).toEqual({ on: true, cap: 4 * 1024 ** 3, day: 8 * 1024 ** 3, spent: 129_000_000, files: 1, dayFiles: 24 });
+    expect(await setHostCopies(false)).toBeNull();
+    expect(calls.at(-1)).toBe(`POST ${ORIGIN}/api/blob/host?cap=${CAP}&room=room-1&on=0`);
+    expect(nodeHostCopies()?.on).toBe(false);
+    // A visitor's page declares nothing.
+    calls.length = 0;
+    setBlobLaneRoom('room-2', false);
+    expect(calls).toEqual([]);
+  });
+
+  it('asks who holds the files, at most every half minute each, and FETCH names them after the provider', async () => {
+    withNode(true);
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${url}`);
+      if (url.includes('/where')) return new Response(JSON.stringify({ holders: { [HASH]: [HOST, 'junk'], ['e'.repeat(64)]: [] } }), { status: 200 });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }));
+    expect(nodeHolders(HASH)).toBeNull();
+    await refreshHolders([HASH, 'e'.repeat(64), 'not a hash'], 1_000);
+    expect(calls).toEqual([`GET ${ORIGIN}/api/blob/where?cap=${CAP}&room=room-1&hashes=${HASH}%2C${'e'.repeat(64)}`]);
+    expect(nodeHolders(HASH)).toEqual([HOST]);
+    expect(nodeHolders('e'.repeat(64))).toEqual([]);
+    await refreshHolders([HASH], 20_000); // asked lately: not again
+    expect(calls).toHaveLength(1);
+    // A file the answer leaves out (the node was busy asking) stays unknown.
+    await refreshHolders(['f'.repeat(64)], 20_000);
+    expect(nodeHolders('f'.repeat(64))).toBeNull();
+    expect(await fetchBlob(HASH, 1000, ID, 'video/webm')).toBeNull();
+    expect(calls.at(-1)).toBe(`POST ${ORIGIN}/api/blob/fetch?cap=${CAP}&room=room-1&hash=${HASH}&size=1000&from=${ID}%2C${HOST}&mime=video%2Fwebm`);
+    // Another room's answer is not this one's.
+    setBlobLaneRoom('room-2');
+    expect(nodeHolders(HASH)).toBeNull();
   });
 });

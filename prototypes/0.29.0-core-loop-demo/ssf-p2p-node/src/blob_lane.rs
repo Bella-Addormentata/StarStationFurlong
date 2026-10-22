@@ -19,8 +19,9 @@
 //!   authenticated room connection with (`remote_peers`), by its id alone —
 //!   no address from the record, no hint, no discovery for an id nobody is
 //!   connected to. A provider outside that set is not reachable from here,
-//!   and the status says so; the hub prefetch and `have` announcements that
-//!   reach a spoke's other spokes are the next slice.
+//!   and the status says so — but a FETCH names every connected member
+//!   WHERE said holds the file (below), so a copy on the room's host serves
+//!   a visitor after the one who shared it has left.
 //! - **WHO IS SERVED**: a peer is answered only for a blob it shares a room
 //!   with — the room the blob was imported or fetched for — and only while it
 //!   is a connected member of that room. Get-many and push are disabled; an
@@ -42,6 +43,22 @@
 //!   first, never one used in the last `IN_USE` (it may be playing).
 //!   `POST /api/blob/forget` lets one go from the page. `SSF_BLOB_KEEP=0`
 //!   empties the cache at every start instead, as before.
+//! - **THE ROOM'S HOST KEEPS COPIES** (plan §4's hub prefetch): the page of
+//!   a room this node hosts says so (`POST /api/blob/host`), and from then on
+//!   the node copies each file the room's TV library names from the member
+//!   who shared it — dialled by id, only while that member is connected to
+//!   it, checked by hash like any fetch — so the file outlives its sharer's
+//!   visit. The library is peer-written, so this automatic fetch runs under
+//!   a per-file cap and a per-room daily budget in bytes and in files
+//!   (`SSF_HOST_COPY_CAP_MB`, default 4 GiB; `SSF_HOST_COPY_DAY_MB`, 8 GiB;
+//!   24 files), one copy per room at a time, and never shares a file with a
+//!   room it was not copied for. The room's page can switch it off.
+//! - **WHERE** (`GET /api/blob/where`, plan §4's `have`, asked rather than
+//!   announced): which connected members of the room hold a file whole —
+//!   asked of each over its own authenticated connection, with an observe
+//!   its serving rule answers only for a member of a room the file is shared
+//!   to, so a holder's word counts for itself alone, and the bytes are still
+//!   checked against the hash.
 
 use anyhow::{anyhow, Result};
 use iroh::endpoint::Connection;
@@ -82,6 +99,30 @@ const IN_USE: Duration = Duration::from_secs(30 * 60);
 const GC_INTERVAL: Duration = Duration::from_secs(60);
 /// `used` is written to disk at most this often per file while it plays.
 const USED_PERSIST: Duration = Duration::from_secs(10 * 60);
+/// 🏠 The largest file the room's host copies without asking, and what it
+/// copies per room in a day (`SSF_HOST_COPY_CAP_MB`, `SSF_HOST_COPY_DAY_MB`).
+const HOST_COPY_CAP_MB: u64 = 4 * 1024;
+const HOST_COPY_DAY_MB: u64 = 8 * 1024;
+/// …and how many files a day, whatever their size.
+const HOST_COPY_DAY_COUNT: usize = 24;
+/// The least one copy is charged against the day's bytes: a thousand tiny
+/// files still cost what checking and indexing them costs.
+const HOST_COPY_MIN_CHARGE: u64 = 1024 * 1024;
+const DAY_MS: u64 = 24 * 3600 * 1000;
+/// How often the host looks at what its rooms played.
+const HOST_SCAN: Duration = Duration::from_secs(10);
+/// A file the host tried to copy is not tried again for this long.
+const HOST_RETRY: Duration = Duration::from_secs(10 * 60);
+/// The most library entries read per room and scan (the library keeps 200).
+const HOST_SCAN_ENTRIES: usize = 400;
+/// The most rooms one node keeps copies for.
+const MAX_HOST_ROOMS: usize = 64;
+/// WHERE: the most files and members one ask covers, how long an answer
+/// stays good, and how long a member gets to answer.
+const WHERE_MAX_HASHES: usize = 16;
+const WHERE_MAX_PEERS: usize = 8;
+const WHERE_FRESH: Duration = Duration::from_secs(60);
+const WHERE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Transfers this node runs at once; a FETCH past it waits for a slot.
 const MAX_FETCHES: usize = 2;
 /// A dial to a connected provider that has not completed in this long fails.
@@ -138,6 +179,11 @@ struct Held {
     used: u64,
 }
 
+/// A size the environment may set in MiB, in bytes.
+fn env_mb(name: &str, default_mb: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_mb).saturating_mul(1024 * 1024)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -150,6 +196,69 @@ struct KeptFile {
     mime: String,
     rooms: Vec<String>,
     used: u64,
+}
+
+/// 🏠 The rooms this node hosts, as their page said, and what it copied for them.
+#[derive(Default)]
+struct Hosting {
+    /// Room → copies on (the default) or off, as the room's page set it.
+    rooms: HashMap<String, bool>,
+    /// Per room: when each copy of the last day started, and its charge.
+    spent: HashMap<String, Vec<(u64, u64)>>,
+    /// Files tried lately (unix ms): not tried again before `HOST_RETRY`.
+    tried: HashMap<Hash, u64>,
+    /// Per room: the file being copied now (one at a time).
+    running: HashMap<String, Hash>,
+}
+
+/// A file the room's TV library names, as the host reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LibBlob {
+    pub hash: Hash,
+    pub size: u64,
+    pub provider: PublicKey,
+    pub mime: String,
+    /// Wall ms it was last played.
+    pub played: u64,
+}
+
+/// The files a room's TV library names: its `tv` map's `lib:blob:<hash>`
+/// entries, as tvDoc.ts writes them. Peer-written, so each is only a
+/// candidate: a copy still dials its provider by id, only while connected,
+/// under the cap and budget, and checks every byte against the hash.
+pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
+    use yrs::{Any, Map, Out, ReadTxn, Transact};
+    let txn = doc.transact();
+    let Some(tv) = txn.get_map("tv") else { return Vec::new() };
+    let num = |v: Option<&Any>| match v {
+        Some(Any::Number(n)) if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 => Some(*n as u64),
+        Some(Any::BigInt(n)) if *n >= 0 => Some(*n as u64),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for (key, value) in tv.iter(&txn) {
+        let Some(id) = key.strip_prefix("lib:blob:") else { continue };
+        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            continue;
+        }
+        let Out::Any(Any::Map(entry)) = value else { continue };
+        let Some(Any::Map(source)) = entry.get("source") else { continue };
+        let text = |k: &str| match source.get(k) {
+            Some(Any::String(s)) => Some(s.to_string()),
+            _ => None,
+        };
+        if text("kind").as_deref() != Some("blob") || text("hash").as_deref() != Some(id) {
+            continue;
+        }
+        let Ok(hash) = Hash::from_str(id) else { continue };
+        let Some(size) = num(source.get("size")).filter(|s| *s > 0 && *s <= 1 << 40) else { continue };
+        let Some(provider) = text("provider").and_then(|p| PublicKey::from_str(&p).ok()) else { continue };
+        out.push(LibBlob { hash, size, provider, mime: text("mime").unwrap_or_default(), played: num(entry.get("playedAt")).unwrap_or(0) });
+        if out.len() >= HOST_SCAN_ENTRIES {
+            break;
+        }
+    }
+    out
 }
 
 pub struct BlobLane {
@@ -167,6 +276,14 @@ pub struct BlobLane {
     /// One `library.json` write at a time (they share its temp file).
     writing: Mutex<()>,
     slots: tokio::sync::Semaphore,
+    hosting: Mutex<Hosting>,
+    /// The host's per-file cap and per-room daily budget, in bytes.
+    host_cap: u64,
+    host_day: u64,
+    /// WHERE's answers lately: (room, file) → (unix ms, holders).
+    seen: Mutex<HashMap<(String, Hash), (u64, Vec<PublicKey>)>>,
+    /// One WHERE ask out at a time; another answers from `seen`.
+    asking: tokio::sync::Mutex<()>,
 }
 
 impl BlobLane {
@@ -174,11 +291,7 @@ impl BlobLane {
     /// with `SSF_BLOB_KEEP=0`). A failure leaves the node running without
     /// the lane; the routes then answer 503.
     pub async fn open() -> Result<Arc<Self>> {
-        let quota = std::env::var("SSF_BLOB_QUOTA_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_QUOTA_MB)
-            .saturating_mul(1024 * 1024);
+        let quota = env_mb("SSF_BLOB_QUOTA_MB", DEFAULT_QUOTA_MB);
         let keep = !std::env::var("SSF_BLOB_KEEP").is_ok_and(|v| v.trim() == "0");
         let lane = Self::open_with(std::env::current_dir()?.join(CACHE_DIR), quota, keep, GC_INTERVAL).await?;
         if keep {
@@ -233,6 +346,11 @@ impl BlobLane {
             held,
             writing: Mutex::new(()),
             slots: tokio::sync::Semaphore::new(MAX_FETCHES),
+            hosting: Mutex::default(),
+            host_cap: env_mb("SSF_HOST_COPY_CAP_MB", HOST_COPY_CAP_MB),
+            host_day: env_mb("SSF_HOST_COPY_DAY_MB", HOST_COPY_DAY_MB),
+            seen: Mutex::default(),
+            asking: tokio::sync::Mutex::new(()),
         });
         if keep {
             lane.restore().await;
@@ -243,12 +361,11 @@ impl BlobLane {
     /// Bring back what `library.json` names and the store holds whole, the
     /// most recently used first, as far as the quota goes.
     async fn restore(&self) {
-        let listed: Vec<KeptFile> = std::fs::read(self.dir.join(LIBRARY_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v.get("files").cloned())
-            .and_then(|f| serde_json::from_value(f).ok())
-            .unwrap_or_default();
+        let saved: Option<serde_json::Value> = std::fs::read(self.dir.join(LIBRARY_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let listed: Vec<KeptFile> = saved.as_ref().and_then(|v| v.get("files").cloned()).and_then(|f| serde_json::from_value(f).ok()).unwrap_or_default();
+        // The rooms this node hosts, and whether their page wants copies.
+        let host: HashMap<String, bool> = saved.as_ref().and_then(|v| v.get("host").cloned()).and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default();
+        self.hosting.lock().unwrap().rooms = host.into_iter().filter(|(r, _)| valid_room(r)).take(MAX_HOST_ROOMS).collect();
         let mut listed: Vec<KeptFile> = listed.into_iter().filter(|k| k.size > 0).collect();
         listed.sort_by(|a, b| b.used.cmp(&a.used));
         let mut charged = 0u64;
@@ -281,7 +398,8 @@ impl BlobLane {
                 .map(|(hash, h)| KeptFile { hash: hash.to_hex().to_string(), size: h.size, mime: h.mime.clone(), rooms: h.rooms.iter().cloned().collect(), used: h.used })
                 .collect()
         };
-        let body = serde_json::json!({ "v": 1, "files": files }).to_string();
+        let host = self.hosting.lock().unwrap().rooms.clone();
+        let body = serde_json::json!({ "v": 1, "files": files, "host": host }).to_string();
         let tmp = self.dir.join(format!("{LIBRARY_FILE}.tmp"));
         if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.dir.join(LIBRARY_FILE))) {
             eprintln!("⚠️ blob-cache/{LIBRARY_FILE} could not be written: {e}");
@@ -326,6 +444,7 @@ impl BlobLane {
     }
 
     /// Whether a file of `len` bytes would fit, letting go of what could go.
+    #[cfg_attr(not(feature = "torrent"), allow(dead_code))]
     fn would_fit(held: &HashMap<Hash, Held>, quota: u64, extra: u64, now: u64) -> bool {
         let recent = now.saturating_sub(IN_USE.as_millis() as u64);
         let freeable: u64 = held
@@ -373,9 +492,190 @@ impl BlobLane {
         }
     }
 
+    // ── 🏠 The room's host keeps copies ─────────────────────────────────────
+
+    /// The page of a room this node hosts says so: copies go on for it,
+    /// unless that page switched them off before. `on` sets it.
+    pub(crate) fn host_room(&self, room: &str, on: Option<bool>) -> std::result::Result<(), &'static str> {
+        {
+            let mut h = self.hosting.lock().unwrap();
+            let was = h.rooms.get(room).copied();
+            if was.is_none() && h.rooms.len() >= MAX_HOST_ROOMS {
+                return Err("this node keeps copies for too many rooms already");
+            }
+            let now = on.or(was).unwrap_or(true);
+            if was == Some(now) {
+                return Ok(());
+            }
+            h.rooms.insert(room.to_string(), now);
+        }
+        self.persist();
+        Ok(())
+    }
+
+    /// The day's copies for `room`: bytes charged and files, the older gone.
+    fn spent_today(h: &mut Hosting, room: &str, now: u64) -> (u64, usize) {
+        let Some(list) = h.spent.get_mut(room) else { return (0, 0) };
+        list.retain(|(at, _)| now.saturating_sub(*at) < DAY_MS);
+        (list.iter().map(|(_, b)| b).sum(), list.len())
+    }
+
+    /// What the held route says of copies for `room`: null when its page
+    /// never said this node hosts it.
+    fn host_json(&self, room: &str) -> serde_json::Value {
+        let mut h = self.hosting.lock().unwrap();
+        let Some(&on) = h.rooms.get(room) else { return serde_json::Value::Null };
+        let (spent, files) = Self::spent_today(&mut h, room, now_ms());
+        serde_json::json!({ "on": on, "cap": self.host_cap, "day": self.host_day, "spent": spent, "files": files, "dayFiles": HOST_COPY_DAY_COUNT })
+    }
+
+    /// The next copy for `room`, queued and charged: the most recently
+    /// played library file this node lacks, from a member `connected` now,
+    /// under the cap, the day's budget and the quota. None while one is
+    /// still on its way, or when nothing qualifies.
+    fn next_copy(&self, room: &str, mut entries: Vec<LibBlob>, connected: &dyn Fn(&PublicKey) -> bool, me: &PublicKey, now: u64) -> Option<(Hash, u64, PublicKey)> {
+        let mut evicted = false;
+        let picked = {
+            let mut h = self.hosting.lock().unwrap();
+            if h.rooms.get(room) != Some(&true) {
+                return None;
+            }
+            let mut held = self.held.lock().unwrap();
+            if h.running.get(room).and_then(|r| held.get(r)).is_some_and(|x| matches!(x.phase, Phase::Queued | Phase::Fetching)) {
+                return None;
+            }
+            h.tried.retain(|_, at| now.saturating_sub(*at) < HOST_RETRY.as_millis() as u64);
+            entries.sort_by(|a, b| b.played.cmp(&a.played));
+            let (spent, files) = Self::spent_today(&mut h, room, now);
+            let mut picked = None;
+            for e in entries {
+                if held.get(&e.hash).is_some_and(|x| !matches!(x.phase, Phase::Failed(_)))
+                    || h.tried.contains_key(&e.hash)
+                    || e.size > self.host_cap
+                    || e.provider == *me
+                    || !connected(&e.provider)
+                {
+                    continue;
+                }
+                let charge = e.size.max(HOST_COPY_MIN_CHARGE);
+                if files >= HOST_COPY_DAY_COUNT || spent + charge > self.host_day {
+                    break; // the day's budget: nothing more without asking
+                }
+                // A failed try's bytes stay counted, as for a FETCH.
+                let failed_charge = held.get(&e.hash).map(|x| x.charged).unwrap_or(0);
+                let charged = storage_bound(e.size).max(failed_charge);
+                let (fits, went) = Self::make_room(&mut held, self.quota, charged - failed_charge, Some(&e.hash), now);
+                evicted |= went;
+                if !fits {
+                    continue;
+                }
+                held.insert(e.hash, Held {
+                    rooms: HashSet::from([room.to_string()]), size: e.size, have: 0, mime: safe_mime(&e.mime), phase: Phase::Queued, charged, used: now,
+                });
+                h.tried.insert(e.hash, now);
+                h.spent.entry(room.to_string()).or_default().push((now, charge));
+                h.running.insert(room.to_string(), e.hash);
+                picked = Some((e.hash, e.size, e.provider));
+                break;
+            }
+            picked
+        };
+        if evicted {
+            self.persist();
+        }
+        picked
+    }
+
+    /// One look at every room this node keeps copies for: what its library
+    /// names, who is connected, and the next copy started.
+    fn copy_round(self: &Arc<Self>, hub: &SharedHub, endpoint: &iroh::Endpoint) {
+        let rooms: Vec<String> = self.hosting.lock().unwrap().rooms.iter().filter(|(_, on)| **on).map(|(r, _)| r.clone()).collect();
+        let me = endpoint.id();
+        for room in rooms {
+            let (entries, connected) = {
+                let rooms = hub.rooms.lock().unwrap();
+                let Some(r) = rooms.get(&room) else { continue };
+                (library_blobs(&r.doc), r.remote_peers.keys().copied().collect::<HashSet<PublicKey>>())
+            };
+            if let Some((hash, size, provider)) = self.next_copy(&room, entries, &|p| connected.contains(p), &me, now_ms()) {
+                println!("📦 blob {}: this room's host keeps a copy ({size} bytes, from {})", hash.fmt_short(), provider.fmt_short());
+                tokio::spawn(self.clone().run_fetch(endpoint.clone(), hash, size, vec![provider]));
+            }
+        }
+    }
+
+    /// WHERE: which of `peers` (connected members of `room`) hold each of
+    /// `hashes` whole. Each is asked over its own connection, with an
+    /// observe its serving rule answers only for a member of a room the file
+    /// is shared to; answers are kept `WHERE_FRESH`, and while another ask
+    /// is out, this one answers from them.
+    pub(crate) async fn holders(&self, endpoint: &iroh::Endpoint, room: &str, peers: Vec<PublicKey>, hashes: Vec<Hash>) -> HashMap<Hash, Vec<PublicKey>> {
+        let now = now_ms();
+        let fresh = |seen: &HashMap<(String, Hash), (u64, Vec<PublicKey>)>, h: &Hash| {
+            seen.get(&(room.to_string(), *h)).filter(|(at, _)| now.saturating_sub(*at) < WHERE_FRESH.as_millis() as u64).map(|(_, ids)| ids.clone())
+        };
+        let mut out = HashMap::new();
+        let mut ask = Vec::new();
+        {
+            let seen = self.seen.lock().unwrap();
+            for h in hashes {
+                match fresh(&seen, &h) {
+                    Some(ids) => {
+                        out.insert(h, ids);
+                    }
+                    None => ask.push(h),
+                }
+            }
+        }
+        if peers.is_empty() {
+            // Nobody to ask: nobody here holds it. (Not kept: a member may connect.)
+            for h in ask.drain(..) {
+                out.insert(h, Vec::new());
+            }
+        }
+        // While another ask is out, the files not answered lately are left
+        // out of this answer (unknown, not "nobody").
+        let busy = self.asking.try_lock();
+        if let (false, Ok(_one)) = (ask.is_empty(), busy) {
+            let asks = peers.iter().map(|peer| {
+                let (store, endpoint, ask, peer) = (self.store.clone(), endpoint.clone(), ask.clone(), *peer);
+                async move {
+                    let mut has = Vec::new();
+                    let Ok(Ok(conn)) = tokio::time::timeout(WHERE_TIMEOUT, endpoint.connect(EndpointAddr::new(peer), iroh_blobs::ALPN)).await else {
+                        return (peer, has);
+                    };
+                    for h in ask {
+                        let mut bits = store.remote().observe(conn.clone(), iroh_blobs::protocol::ObserveRequest::new(h));
+                        if let Ok(Some(Ok(b))) = tokio::time::timeout(WHERE_TIMEOUT, bits.next()).await {
+                            if b.is_complete() {
+                                has.push(h);
+                            }
+                        }
+                    }
+                    conn.close(0u32.into(), b"asked");
+                    (peer, has)
+                }
+            });
+            let answers = n0_future::join_all(asks).await;
+            let mut seen = self.seen.lock().unwrap();
+            seen.retain(|_, (at, _)| now.saturating_sub(*at) < WHERE_FRESH.as_millis() as u64);
+            for h in ask {
+                let ids: Vec<PublicKey> = answers.iter().filter(|(_, has)| has.contains(&h)).map(|(p, _)| *p).collect();
+                seen.insert((room.to_string(), h), (now, ids.clone()));
+                out.insert(h, ids);
+            }
+        }
+        // Only members connected now (an answer may be older than a leave).
+        for ids in out.values_mut() {
+            ids.retain(|p| peers.contains(p));
+        }
+        out
+    }
+
     /// May `remote` be served `hash`: the blob is whole here, and `remote` is
-    /// a connected member of a room it was imported or fetched for.
-    fn may_serve(&self, members: &Members, remote: &PublicKey, hash: &Hash) -> bool {
+    /// a connected member of a room it was imported or fetched for. A get
+    /// served counts as a use (`touch`); an observe (WHERE) does not.
+    fn may_serve(&self, members: &Members, remote: &PublicKey, hash: &Hash, touch: bool) -> bool {
         let rooms: Vec<String> = {
             let held = self.held.lock().unwrap();
             match held.get(hash) {
@@ -384,7 +684,7 @@ impl BlobLane {
             }
         };
         let ok = rooms.iter().any(|r| members(r, remote));
-        if ok {
+        if ok && touch {
             self.touch(hash);
         }
         ok
@@ -412,11 +712,11 @@ impl BlobLane {
             while let Some(msg) = rx.recv().await {
                 match msg {
                     ProviderMessage::GetRequestReceived(msg) => {
-                        let ok = msg.request.ranges.is_blob() && lane.may_serve(&hub, &remote, &msg.request.hash);
+                        let ok = msg.request.ranges.is_blob() && lane.may_serve(&hub, &remote, &msg.request.hash, true);
                         msg.tx.send(if ok { Ok(()) } else { Err(AbortReason::Permission) }).await.ok();
                     }
                     ProviderMessage::ObserveRequestReceived(msg) => {
-                        let ok = lane.may_serve(&hub, &remote, &msg.request.hash);
+                        let ok = lane.may_serve(&hub, &remote, &msg.request.hash, false);
                         msg.tx.send(if ok { Ok(()) } else { Err(AbortReason::Permission) }).await.ok();
                     }
                     _ => {}
@@ -458,7 +758,8 @@ impl BlobLane {
             .collect();
         let peers: Vec<String> = reachable.iter().take(MAX_HELD_LISTED).map(|p| p.to_string()).collect();
         let kept: u64 = held.values().filter(|h| h.phase == Phase::Complete).map(|h| h.charged).sum();
-        serde_json::json!({ "held": hashes, "reachable": peers, "keep": self.keep, "kept": kept, "quota": self.quota }).to_string()
+        drop(held);
+        serde_json::json!({ "held": hashes, "reachable": peers, "keep": self.keep, "kept": kept, "quota": self.quota, "host": self.host_json(room) }).to_string()
     }
 
     fn fail(&self, hash: &Hash, why: &str) {
@@ -580,6 +881,7 @@ impl BlobLane {
 
     /// Whether a file of `len` bytes would fit in the quota now, letting go
     /// of what could go (a later `reserve` still decides).
+    #[cfg_attr(not(feature = "torrent"), allow(dead_code))]
     pub(crate) fn fits(&self, len: u64) -> bool {
         Self::would_fit(&self.held.lock().unwrap(), self.quota, storage_bound(len), now_ms())
     }
@@ -745,6 +1047,17 @@ pub(crate) fn valid_room(r: &str) -> bool {
     !r.is_empty() && r.len() <= MAX_ROOM_LEN && r.chars().all(|c| !c.is_control())
 }
 
+/// 🏠 The host's copier: every few seconds, the next copy for each room
+/// this node keeps copies for (`BlobLane::copy_round`).
+pub fn spawn_host_copier(lane: Arc<BlobLane>, hub: SharedHub, endpoint: iroh::Endpoint) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(HOST_SCAN).await;
+            lane.copy_round(&hub, &endpoint);
+        }
+    });
+}
+
 /// Is this request one of the lane's routes.
 pub fn is_blob_route(path: &str) -> bool {
     path.starts_with("/blob/") || path.starts_with("/api/blob/")
@@ -900,6 +1213,46 @@ pub async fn handle_http(
             let reachable: Vec<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().collect()).unwrap_or_default();
             let body = lane.held_json(&room, &reachable);
             reply(socket, "200 OK", cors, &body).await;
+        }
+        ("POST", "/api/blob/host") => {
+            let room = head.query.get("room").cloned().unwrap_or_default();
+            if !valid_room(&room) {
+                return reply(socket, "400 Bad Request", cors, &err_json("no room")).await;
+            }
+            let on = match head.query.get("on").map(String::as_str) {
+                None => None,
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                Some(_) => return reply(socket, "400 Bad Request", cors, &err_json("on is 0 or 1")).await,
+            };
+            match lane.host_room(&room, on) {
+                Ok(()) => reply(socket, "200 OK", cors, &serde_json::json!({ "host": lane.host_json(&room) }).to_string()).await,
+                Err(why) => reply(socket, "409 Conflict", cors, &err_json(why)).await,
+            }
+        }
+        ("GET", "/api/blob/where") => {
+            let room = head.query.get("room").cloned().unwrap_or_default();
+            if !valid_room(&room) {
+                return reply(socket, "400 Bad Request", cors, &err_json("no room")).await;
+            }
+            let mut hashes: Vec<Hash> = Vec::new();
+            for h in head.query.get("hashes").map(|v| v.split(',').filter_map(|h| Hash::from_str(h.trim()).ok()).collect::<Vec<_>>()).unwrap_or_default() {
+                if !hashes.contains(&h) && hashes.len() < WHERE_MAX_HASHES {
+                    hashes.push(h);
+                }
+            }
+            if hashes.is_empty() {
+                return reply(socket, "400 Bad Request", cors, &err_json("no hashes")).await;
+            }
+            // Asked only of the members this node holds an authenticated
+            // connection with in THIS room, by id.
+            let peers: Vec<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().take(WHERE_MAX_PEERS).collect()).unwrap_or_default();
+            let found = lane.holders(&endpoint, &room, peers, hashes).await;
+            let holders: serde_json::Map<String, serde_json::Value> = found
+                .into_iter()
+                .map(|(h, ids)| (h.to_hex().to_string(), serde_json::Value::from(ids.iter().map(|p| p.to_string()).collect::<Vec<_>>())))
+                .collect();
+            reply(socket, "200 OK", cors, &serde_json::json!({ "holders": holders }).to_string()).await;
         }
         ("POST", "/api/blob/forget") => {
             let Some(hash) = hash_param(&head) else {
@@ -1075,7 +1428,7 @@ mod tests {
         });
         assert_eq!(
             lane_a.held_json("r", &[b_id]),
-            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "keep": false, "kept": size, "quota": 1u64 << 30, "reachable": [b_id.to_string()] }).to_string()
+            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "host": null, "keep": false, "kept": size, "quota": 1u64 << 30, "reachable": [b_id.to_string()] }).to_string()
         );
         assert!(lane_a.held_json("elsewhere", &[]).starts_with(r#"{"held":[],"#));
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
@@ -1219,6 +1572,174 @@ mod tests {
         assert!(!std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap().contains(&b.to_hex().to_string()));
         lane.store.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A room doc whose TV library names `entries` (key, source fields, playedAt).
+    fn library_doc(entries: &[(String, Vec<(&str, yrs::Any)>, f64)]) -> yrs::Doc {
+        use yrs::{Map, Transact};
+        let doc = yrs::Doc::new();
+        let tv = doc.get_or_insert_map("tv");
+        let mut txn = doc.transact_mut();
+        for (key, source, played) in entries {
+            let source: HashMap<String, yrs::Any> = source.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            let entry: HashMap<String, yrs::Any> = HashMap::from([
+                ("source".to_string(), yrs::Any::from(source)),
+                ("title".to_string(), yrs::Any::from("a film")),
+                ("playedAt".to_string(), yrs::Any::Number(*played)),
+            ]);
+            tv.insert(&mut txn, key.as_str(), yrs::Any::from(entry));
+        }
+        tv.insert(&mut txn, "tv:set-1", yrs::Any::from("not a library entry"));
+        drop(txn);
+        doc
+    }
+
+    fn blob_source(hash: &str, size: f64, provider: &str) -> Vec<(&'static str, yrs::Any)> {
+        vec![
+            ("kind", yrs::Any::from("blob")),
+            ("hash", yrs::Any::from(hash)),
+            ("size", yrs::Any::Number(size)),
+            ("provider", yrs::Any::from(provider)),
+            ("mime", yrs::Any::from("video/webm")),
+        ]
+    }
+
+    #[test]
+    fn the_library_is_read_with_care() {
+        let me = iroh::SecretKey::generate().public().to_string();
+        let a = Hash::new(b"a").to_hex().to_string();
+        let b = Hash::new(b"b").to_hex().to_string();
+        let doc = library_doc(&[
+            (format!("lib:blob:{a}"), blob_source(&a, 5000.0, &me), 2000.0),
+            // A key that names another file than its source.
+            (format!("lib:blob:{b}"), blob_source(&a, 5000.0, &me), 3000.0),
+            // No size, a fractional size, a provider that is no key.
+            (format!("lib:blob:{}", Hash::new(b"c").to_hex()), blob_source(&Hash::new(b"c").to_hex(), 0.0, &me), 1.0),
+            (format!("lib:blob:{}", Hash::new(b"d").to_hex()), blob_source(&Hash::new(b"d").to_hex(), 1.5, &me), 1.0),
+            (format!("lib:blob:{}", Hash::new(b"e").to_hex()), blob_source(&Hash::new(b"e").to_hex(), 10.0, "nobody"), 1.0),
+            ("lib:url:https://example.org/a.mp4".to_string(), vec![("kind", yrs::Any::from("url"))], 1.0),
+        ]);
+        let got = library_blobs(&doc);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].hash.to_hex().to_string(), a);
+        assert_eq!((got[0].size, got[0].played, got[0].mime.as_str()), (5000, 2000, "video/webm"));
+        assert_eq!(library_blobs(&yrs::Doc::new()), vec![]);
+    }
+
+    /// The room's host copies what its library names from the member who
+    /// shared it, under the cap and the day's budget; a later visitor's WHERE
+    /// finds the copy on the host, and only there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_keeps_a_copy_a_visitor_can_find() {
+        use iroh::address_lookup::memory::MemoryLookup;
+        let tmp = std::env::temp_dir().join(format!("ssf-blob-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut host = BlobLane::open_with(tmp.join("host"), 1 << 30, true, GC_INTERVAL).await.unwrap();
+        Arc::get_mut(&mut host).unwrap().host_cap = 250_000;
+        let sharer = BlobLane::open_at(tmp.join("sharer"), 1 << 30).await.unwrap();
+        let visitor = BlobLane::open_at(tmp.join("visitor"), 1 << 30).await.unwrap();
+        let bind = || async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::endpoint::RelayMode::Disabled)
+                .alpns(vec![iroh_blobs::ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap()
+        };
+        let (ep_h, ep_s, ep_v) = (bind().await, bind().await, bind().await);
+        for (ep, others) in [(&ep_h, [&ep_s, &ep_v]), (&ep_s, [&ep_h, &ep_v]), (&ep_v, [&ep_h, &ep_s])] {
+            let lookup = MemoryLookup::new();
+            for o in others {
+                lookup.add_endpoint_info(o.addr());
+            }
+            ep.address_lookup().unwrap().add(lookup);
+        }
+        let (h_id, s_id, v_id) = (ep_h.id(), ep_s.id(), ep_v.id());
+        // Everyone is a member of room "r" (the host serves the visitor; the sharer serves the host).
+        let members: Members = Arc::new(move |room, peer| room == "r" && [h_id, s_id, v_id].contains(peer));
+        for (lane, ep) in [(host.clone(), ep_h.clone()), (sharer.clone(), ep_s.clone())] {
+            let members = members.clone();
+            tokio::spawn(async move {
+                while let Some(inc) = ep.accept().await {
+                    let Ok(conn) = inc.await else { continue };
+                    tokio::spawn(lane.clone().serve_with(members.clone(), conn));
+                }
+            });
+        }
+        let film: Vec<u8> = (0..200_000u32).map(|i| (i * 17 % 251) as u8).collect();
+        let big: Vec<u8> = vec![7u8; 300_000];
+        let film_hash = import_bytes(&sharer, &film, "film").await;
+        let big_hash = import_bytes(&sharer, &big, "big").await;
+        let s_hex = s_id.to_string();
+        let doc = library_doc(&[
+            (format!("lib:blob:{}", film_hash.to_hex()), blob_source(&film_hash.to_hex(), film.len() as f64, &s_hex), 2.0),
+            // Over the host's cap (250 KB here): never copied without asking.
+            (format!("lib:blob:{}", big_hash.to_hex()), blob_source(&big_hash.to_hex(), big.len() as f64, &s_hex), 3.0),
+        ]);
+        let now = now_ms();
+        let connected = |p: &PublicKey| *p == s_id;
+
+        // Not a room the host's page said it hosts: nothing.
+        assert_eq!(host.next_copy("r", library_blobs(&doc), &connected, &h_id, now), None);
+        assert_eq!(host.host_json("r"), serde_json::Value::Null);
+        host.host_room("r", None).unwrap();
+        assert_eq!(host.host_json("r")["on"], true);
+        // The sharer is not connected: nothing.
+        assert_eq!(host.next_copy("r", library_blobs(&doc), &|_| false, &h_id, now), None);
+
+        let (hash, size, from) = host.next_copy("r", library_blobs(&doc), &connected, &h_id, now).expect("a copy");
+        assert_eq!((hash, size, from), (film_hash, film.len() as u64, s_id));
+        // One at a time per room.
+        assert_eq!(host.next_copy("r", library_blobs(&doc), &connected, &h_id, now), None);
+        host.clone().run_fetch(ep_h.clone(), hash, size, vec![from]).await;
+        assert!(host.status_json(&film_hash).contains(r#""state":"complete""#), "{}", host.status_json(&film_hash));
+        assert!(host.held_json("r", &[]).contains(&film_hash.to_hex().to_string()));
+        let mut got = Vec::new();
+        host.store.blobs().reader(film_hash).read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, film);
+        // Charged to the day, and nothing more qualifies (the big one is over the cap).
+        assert_eq!(host.host_json("r")["files"], 1);
+        assert_eq!(host.next_copy("r", library_blobs(&doc), &connected, &h_id, now), None);
+
+        // A later visitor asks the room's connected members who has it: the host.
+        let found = visitor.holders(&ep_v, "r", vec![h_id, s_id], vec![film_hash, big_hash]).await;
+        assert_eq!(found[&film_hash].len(), 2, "the host and the sharer both hold the film");
+        assert!(found[&film_hash].contains(&h_id));
+        assert_eq!(found[&big_hash], vec![s_id], "the host never copied the big one");
+        // Once the sharer has left, the answer names only those still connected.
+        let found = visitor.holders(&ep_v, "r", vec![h_id], vec![film_hash]).await;
+        assert_eq!(found[&film_hash], vec![h_id]);
+        // …and the visitor fetches from the host.
+        visitor.held.lock().unwrap().insert(film_hash, Held {
+            rooms: HashSet::from(["r".to_string()]), size, have: 0, mime: String::new(), phase: Phase::Queued, charged: size, used: 0,
+        });
+        visitor.clone().run_fetch(ep_v.clone(), film_hash, size, vec![h_id]).await;
+        assert_eq!(visitor.held.lock().unwrap()[&film_hash].phase, Phase::Complete);
+        // A room the file was not copied for learns nothing from the host.
+        let other = BlobLane::open_at(tmp.join("other"), 1 << 30).await.unwrap();
+        let found = other.holders(&ep_v, "elsewhere", vec![h_id], vec![Hash::new(b"never held")]).await;
+        assert_eq!(found[&Hash::new(b"never held")], vec![]);
+
+        // Switched off by the room's page: no more copies, and it lasts a restart.
+        host.host_room("r", Some(false)).unwrap();
+        host.host_room("r", None).unwrap(); // the page binding again does not switch it back on
+        assert_eq!(host.host_json("r")["on"], false);
+        host.store.shutdown().await.unwrap();
+        drop(host);
+        let host = BlobLane::open_with(tmp.join("host"), 1 << 30, true, GC_INTERVAL).await.unwrap();
+        assert_eq!(host.host_json("r")["on"], false);
+        assert!(host.status_json(&film_hash).contains("complete"), "the copy is kept across the restart");
+        host.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_hosts_day_is_bounded_in_bytes_and_files() {
+        let mut h = Hosting::default();
+        let now = 10 * DAY_MS;
+        h.spent.insert("r".into(), vec![(now - DAY_MS - 1, 5), (now - 10, 7), (now, 1)]);
+        assert_eq!(BlobLane::spent_today(&mut h, "r", now), (8, 2));
+        assert_eq!(BlobLane::spent_today(&mut h, "elsewhere", now), (0, 0));
     }
 
     #[test]
