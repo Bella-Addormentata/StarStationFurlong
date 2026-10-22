@@ -337,6 +337,12 @@ impl BlobLane {
         Some(placeholder)
     }
 
+    /// Whether a file of `len` bytes would fit in the quota now (a later
+    /// `reserve` still decides).
+    pub(crate) fn fits(&self, len: u64) -> bool {
+        Self::charged(&self.held.lock().unwrap()) + storage_bound(len) <= self.quota
+    }
+
     /// Give a reservation back (the import did not happen).
     pub(crate) fn unreserve(&self, placeholder: &Hash) {
         self.held.lock().unwrap().remove(placeholder);
