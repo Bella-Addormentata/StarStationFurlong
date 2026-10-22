@@ -153,7 +153,11 @@ export function importBlob(
       } else if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
         statuses.set(body.hash, { state: 'complete', have: file.size, size: file.size });
         // Held for this room now: the library says so before its next ask.
-        if (heldHere && heldHere.gen === gen && heldHere.room === room) heldHere.held.add(body.hash);
+        heldEpoch++;
+        if (heldHere && heldHere.gen === gen && heldHere.room === room) {
+          heldHere.held.add(body.hash);
+          heldHere.at = -Infinity;
+        }
         resolve({ hash: body.hash, size: file.size });
       } else {
         resolve({ error: typeof body.error === 'string' && body.error ? `Your node: ${body.error}.` : 'Your node did not take the file.' });
@@ -187,8 +191,15 @@ export async function fetchBlob(hash: string, size: number, provider: string, mi
 
 /** The node's last answer to the held route: the whole blobs it serves to
  *  this room, and the room members a FETCH from it could dial now. */
-let heldHere: { gen: number; room: string; held: Set<string>; reachable: Set<string>; at: number } | null = null;
+let heldHere: {
+  gen: number; room: string; held: Set<string>; reachable: Set<string>; at: number;
+  /** The node keeps its files across restarts, and how much of its quota they take. */
+  keep: boolean; kept: number; quota: number;
+} | null = null;
 let heldAsking = false;
+/** Moves when this page changes what the node holds (an import, a forget):
+ *  an answer asked before describes the store as it was, and is dropped. */
+let heldEpoch = 0;
 const HELD_POLL_MS = 5_000;
 
 /** Ask the node again, at most every HELD_POLL_MS (the library calls this
@@ -200,12 +211,16 @@ export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
   if (!url) return;
   const gen = generation;
   const asked = room;
+  const epoch = heldEpoch;
   heldAsking = true;
   try {
     const res = await fetch(url, { redirect: 'error' });
-    const body = (res.ok ? await res.json() : null) as { held?: unknown; reachable?: unknown } | null;
+    const body = (res.ok ? await res.json() : null) as { held?: unknown; reachable?: unknown; keep?: unknown; kept?: unknown; quota?: unknown } | null;
     const hexes = (v: unknown) => new Set((Array.isArray(v) ? v.slice(0, 1000) : []).filter((h): h is string => typeof h === 'string' && HEX_64.test(h)));
-    if (gen === generation && asked === room && body) heldHere = { gen, room: asked, held: hexes(body.held), reachable: hexes(body.reachable), at: now };
+    const n = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0);
+    if (gen === generation && asked === room && epoch === heldEpoch && body) {
+      heldHere = { gen, room: asked, held: hexes(body.held), reachable: hexes(body.reachable), at: now, keep: body.keep === true, kept: n(body.kept), quota: n(body.quota) };
+    }
   } catch { /* kept as it was; the next paint asks again */ } finally {
     heldAsking = false;
   }
@@ -214,6 +229,34 @@ export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
 /** This page's node holds `hash` whole for this room (as it last said). */
 export function nodeHolds(hash: string): boolean {
   return !!heldHere && heldHere.gen === generation && heldHere.room === room && heldHere.held.has(hash);
+}
+
+/** Whether this page's node keeps its files across restarts, and how much
+ *  of its quota they take — null before it said. */
+export function nodeLibrarySpace(): { keep: boolean; kept: number; quota: number } | null {
+  if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
+  return { keep: heldHere.keep, kept: heldHere.kept, quota: heldHere.quota };
+}
+
+/** 🗑 Let a whole file go from this page's node (the room's library entry
+ *  stays). Null when it went, else why not. */
+export async function forgetBlob(hash: string): Promise<string | null> {
+  const url = HEX_64.test(hash) ? route('/api/blob/forget', { hash }) : null;
+  if (!url) return 'That needs this station\'s node running here.';
+  const gen = generation;
+  try {
+    const res = await fetch(url, { method: 'POST', redirect: 'error' });
+    if (!res.ok) return `Your node: ${await errorOf(res, 'it did not let the file go')}.`;
+    if (gen === generation) {
+      heldEpoch++;
+      statuses.delete(hash);
+      heldHere?.held.delete(hash);
+      if (heldHere) heldHere.at = -Infinity; // ask again: the space changed
+    }
+    return null;
+  } catch {
+    return 'Your node did not answer.';
+  }
 }
 
 /** Whether a FETCH from this page's node could reach `provider` now: true,
@@ -278,6 +321,7 @@ export function forgetBlobLane(): void {
   room = '';
   heldHere = null;
   heldAsking = false;
+  heldEpoch = 0;
   statuses.clear();
   polling.clear();
   lastPoll.clear();

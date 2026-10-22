@@ -1617,11 +1617,12 @@ async fn main() -> Result<()> {
         (ck, durable, book, caps)
     };
 
-    // 📦 The blob lane's store, emptied at every start (blob_lane.rs). A
-    // store that cannot open costs the lane, never the node.
+    // 📦 The blob lane's store, with the whole files kept from the last run
+    // (blob_lane.rs; SSF_BLOB_KEEP=0 empties it at start). A store that
+    // cannot open costs the lane, never the node.
     let blobs = match blob_lane::BlobLane::open().await {
         Ok(lane) => {
-            println!("📦 Blob lane ready (cache in blob-cache/, emptied at start)");
+            println!("📦 Blob lane ready (cache in blob-cache/)");
             Some(lane)
         }
         Err(e) => {
