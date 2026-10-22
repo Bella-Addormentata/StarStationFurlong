@@ -1807,6 +1807,13 @@ async fn main() -> Result<()> {
         mesh_maintenance_loop(hub_heartbeat, iroh_heartbeat).await;
     });
 
+    // 📦🏠 The room's host keeps copies of what its rooms' TVs played
+    // (blob_lane.rs): rooms its own page said it hosts, under a cap and a
+    // daily budget.
+    if let Some(lane) = hub.blobs.clone() {
+        blob_lane::spawn_host_copier(lane, hub.clone(), iroh_endpoint.clone());
+    }
+
     // Start background HTTP API for local certificate fingerprint requests.
     // The endpoint handle lets each request refresh direct-addr hints LIVE —
     // portmapper mappings, QAD-observed and external addresses appear minutes

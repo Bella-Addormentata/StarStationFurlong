@@ -2144,8 +2144,10 @@ async function joinRoomAtEpoch(
   // anchors its clock to the sample it finds.
   bindTvDoc(sync.doc);
   // 📦 The room a FILE is imported or fetched for: the node shares a blob
-  // only with that room's members (blobLane.ts).
-  setBlobLaneRoom(boot.roomId);
+  // only with that room's members (blobLane.ts). In a room this machine
+  // hosts, its node also keeps copies of what the TV plays, for visitors
+  // who come after the one who shared it has left.
+  setBlobLaneRoom(boot.roomId, roomHostedHere(boot.roomId));
   // 🕹 Bind the shared arcade map (#193): each cabinet's game, and
   // who is at its controls. Same T0 seam.
   bindArcadeDoc(sync.doc);

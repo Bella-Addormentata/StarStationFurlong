@@ -14,7 +14,11 @@
  *
  * Nothing here fetches on its own: the record is peer-writable, so every
  * transfer is one this viewer pressed for (§4: never automatic beyond a cap
- * and a budget — this slice has neither, so it has no automatic fetch).
+ * and a budget). The one automatic fetch is the NODE's, in a room this page
+ * says it hosts: the host keeps a copy of what the room's TV played, under
+ * its own cap and daily budget (blob_lane.rs), so a later visitor's FETCH
+ * finds it there — WHERE asks the room's connected nodes who holds a file,
+ * and FETCH names them beside the provider.
  *
  * The node's routes ask for this launch's capability token (`blob_cap` in
  * the fingerprint) and an allowed Origin; the token rides in the query so a
@@ -63,14 +67,37 @@ export function setBlobLaneNode(n: BlobNode | null): void {
     statuses.clear();
     polling.clear();
     lastPoll.clear();
+    holdersHere.clear();
   }
   node = ok;
+  declareHosted();
 }
 
+/** This machine hosts the room (main.ts's roomHostedHere): its node keeps
+ *  copies of what the room's TV plays, unless switched off. */
+let hosted = false;
 /** main.ts, on every join: the room a blob is imported or fetched FOR — the
- *  node serves it only to members of that room. */
-export function setBlobLaneRoom(id: string): void {
+ *  node serves it only to members of that room — and whether this machine
+ *  hosts it. */
+export function setBlobLaneRoom(id: string, hostedHere = false): void {
   room = id;
+  hosted = hostedHere;
+  declareHosted();
+}
+
+/** The (generation, room) the node was last told this machine hosts. */
+let declared = '';
+/** Tell the node, once per node and room, that this machine hosts the room:
+ *  copies go on for it unless its page switched them off before. */
+function declareHosted(): void {
+  const key = `${generation}|${room}`;
+  if (!hosted || declared === key) return;
+  const url = route('/api/blob/host', { room });
+  if (!url) return;
+  declared = key;
+  void fetch(url, { method: 'POST', redirect: 'error' })
+    .then((res) => { if (!res.ok) declared = ''; else if (heldHere) heldHere.at = -Infinity; })
+    .catch(() => { declared = ''; });
 }
 
 /** The node runs the lane, and the page trusts the node's origin now. */
@@ -178,7 +205,11 @@ export function importBlob(
  *  the consent; the size is the one the button showed. Null when the node
  *  took the ask, else why not. */
 export async function fetchBlob(hash: string, size: number, provider: string, mime = ''): Promise<string | null> {
-  const url = HEX_64.test(hash) && HEX_64.test(provider) ? route('/api/blob/fetch', { room, hash, size: String(size), from: provider, mime }) : null;
+  // The provider first, then the room's nodes WHERE said hold it (the host's
+  // copy, once the provider has left): the node dials only those it is
+  // connected to in this room, and checks every byte against the hash.
+  const from = [...new Set([provider, ...(nodeHolders(hash) ?? [])])].filter((id) => HEX_64.test(id)).slice(0, 4);
+  const url = HEX_64.test(hash) && HEX_64.test(provider) ? route('/api/blob/fetch', { room, hash, size: String(size), from: from.join(','), mime }) : null;
   if (!url) return 'The FILE lane needs this station\'s node (the desktop app) running.';
   const gen = generation;
   try {
@@ -204,10 +235,31 @@ let heldHere: {
   gen: number; room: string; held: Set<string>; more: boolean; reachable: Set<string>; at: number;
   /** The node keeps its files across restarts, and how much of its quota they take. */
   keep: boolean; kept: number; quota: number;
+  /** Copies for this room, when its page said this machine hosts it. */
+  host: HostCopies | null;
 } | null = null;
+
+/** What the room's host node copies (blob_lane.rs): on or off, its per-file
+ *  cap, its daily budget, and what the last day spent. */
+export interface HostCopies {
+  on: boolean;
+  cap: number;
+  day: number;
+  spent: number;
+  files: number;
+  dayFiles: number;
+}
+
+function parseHost(v: unknown): HostCopies | null {
+  if (!v || typeof v !== 'object') return null;
+  const r = v as Record<string, unknown>;
+  const n = (x: unknown) => (typeof x === 'number' && Number.isSafeInteger(x) && x >= 0 ? x : 0);
+  return { on: r.on === true, cap: n(r.cap), day: n(r.day), spent: n(r.spent), files: n(r.files), dayFiles: n(r.dayFiles) };
+}
 let heldAsking = false;
-/** Moves when this page changes what the node holds (an import, a forget):
- *  an answer asked before describes the store as it was, and is dropped. */
+/** Moves when this page changes what the node holds (an import, a forget)
+ *  or its host switch: an answer asked before describes the node as it was,
+ *  and is dropped. */
 let heldEpoch = 0;
 const HELD_POLL_MS = 5_000;
 
@@ -224,12 +276,15 @@ export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
   heldAsking = true;
   try {
     const res = await fetch(url, { redirect: 'error' });
-    const body = (res.ok ? await res.json() : null) as { held?: unknown; more?: unknown; reachable?: unknown; keep?: unknown; kept?: unknown; quota?: unknown } | null;
+    const body = (res.ok ? await res.json() : null) as { held?: unknown; more?: unknown; reachable?: unknown; keep?: unknown; kept?: unknown; quota?: unknown; host?: unknown } | null;
     const hexes = (v: unknown) => new Set((Array.isArray(v) ? v.slice(0, 1000) : []).filter((h): h is string => typeof h === 'string' && HEX_64.test(h)));
     const n = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0);
     const more = body?.more === true || (Array.isArray(body?.held) && body.held.length > 1000);
     if (gen === generation && asked === room && epoch === heldEpoch && body) {
-      heldHere = { gen, room: asked, held: hexes(body.held), more, reachable: hexes(body.reachable), at: now, keep: body.keep === true, kept: n(body.kept), quota: n(body.quota) };
+      heldHere = {
+        gen, room: asked, held: hexes(body.held), more, reachable: hexes(body.reachable), at: now,
+        keep: body.keep === true, kept: n(body.kept), quota: n(body.quota), host: parseHost(body.host),
+      };
     }
   } catch { /* kept as it was; the next paint asks again */ } finally {
     heldAsking = false;
@@ -249,6 +304,83 @@ export function nodeHolds(hash: string): boolean | null {
 export function nodeLibrarySpace(): { keep: boolean; kept: number; quota: number } | null {
   if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
   return { keep: heldHere.keep, kept: heldHere.kept, quota: heldHere.quota };
+}
+
+/** What this machine's node copies for this room as its host — null when
+ *  the room is not one this machine hosts, or the node has not said. */
+export function nodeHostCopies(): HostCopies | null {
+  if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
+  return heldHere.host;
+}
+
+/** The host's switch: keep copies of what this room's TV plays, or not.
+ *  Null when the node took it, else why not. */
+export async function setHostCopies(on: boolean): Promise<string | null> {
+  const url = route('/api/blob/host', { room, on: on ? '1' : '0' });
+  if (!url) return 'That needs this station\'s node running here.';
+  const gen = generation;
+  const asked = room;
+  try {
+    const res = await fetch(url, { method: 'POST', redirect: 'error' });
+    if (!res.ok) return `Your node: ${await errorOf(res, 'it did not take that')}.`;
+    const body = (await res.json()) as { host?: unknown };
+    // The answer is the asked room's: it lands only while the page is there.
+    if (gen === generation && asked === room) {
+      heldEpoch++; // a held answer asked before says the switch as it was
+      if (heldHere && heldHere.gen === gen && heldHere.room === asked) heldHere.host = parseHost(body.host);
+    }
+    return null;
+  } catch {
+    return 'Your node did not answer.';
+  }
+}
+
+// ── WHERE: which of the room's connected nodes hold a file ──────────────────
+
+/** WHERE's answers: file → the connected room members holding it whole. */
+const holdersHere = new Map<string, { room: string; at: number; ids: string[] }>();
+let whereAsking = false;
+/** An answer is asked again after this long (the node keeps its own for a minute). */
+const WHERE_POLL_MS = 30_000;
+/** The most files one ask names (the node takes 16). */
+const WHERE_MAX = 16;
+
+/** Ask the node which connected room members hold these files, for those
+ *  not asked lately. Resolves once the answer is in, or at once. */
+export async function refreshHolders(hashes: string[], now = performance.now()): Promise<void> {
+  const due = [...new Set(hashes)].filter((h) => {
+    const known = holdersHere.get(h);
+    return HEX_64.test(h) && !(known && known.room === room && now - known.at < WHERE_POLL_MS);
+  }).slice(0, WHERE_MAX);
+  if (due.length === 0 || whereAsking) return;
+  const url = route('/api/blob/where', { room, hashes: due.join(',') });
+  if (!url) return;
+  const gen = generation;
+  const asked = room;
+  whereAsking = true;
+  try {
+    const res = await fetch(url, { redirect: 'error' });
+    const body = (res.ok ? await res.json() : null) as { holders?: unknown } | null;
+    const got = body?.holders && typeof body.holders === 'object' ? (body.holders as Record<string, unknown>) : null;
+    if (gen === generation && asked === room && got) {
+      // A file the answer leaves out is unknown yet (the node was busy
+      // asking), and is asked again on the next paint.
+      for (const h of due) {
+        const ids = got[h];
+        if (!Array.isArray(ids)) continue;
+        holdersHere.set(h, { room: asked, at: now, ids: ids.filter((id): id is string => typeof id === 'string' && HEX_64.test(id)).slice(0, 8) });
+      }
+    }
+  } catch { /* asked again on the next paint */ } finally {
+    whereAsking = false;
+  }
+}
+
+/** The connected room members WHERE last said hold `hash` whole; null
+ *  before it was asked. */
+export function nodeHolders(hash: string): string[] | null {
+  const known = holdersHere.get(hash);
+  return known && known.room === room ? known.ids : null;
 }
 
 /** 🗑 Let a whole file go from this page's node (the room's library entry
@@ -353,6 +485,10 @@ export function blobNodeTag(): string {
 export function forgetBlobLane(): void {
   node = null;
   room = '';
+  hosted = false;
+  declared = '';
+  holdersHere.clear();
+  whereAsking = false;
   heldHere = null;
   heldAsking = false;
   heldEpoch = 0;

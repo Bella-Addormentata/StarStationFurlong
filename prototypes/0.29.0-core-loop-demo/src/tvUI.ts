@@ -27,7 +27,8 @@ import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
 import {
-  blobLaneNodeId, blobLaneReady, forgetBlob, formatBytes, importBlob, nodeHolds, nodeLibrarySpace, nodeReaches, refreshHeldBlobs, torrentLaneReady,
+  blobLaneNodeId, blobLaneReady, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
+  refreshHeldBlobs, refreshHolders, setHostCopies, torrentLaneReady,
 } from './blobLane';
 import {
   confirmTorrent, MAX_TORRENT_FILE, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile, stopTorrent,
@@ -418,8 +419,10 @@ export function agoText(at: number, now: number): string {
   return `${Math.floor(s / 86_400)} d ago`;
 }
 
-/** Where a library row's file would play from, for this holder now. */
-type Whereabouts = 'mine' | 'lost' | 'theirs' | 'away' | 'unknown';
+/** Where a library row's file would play from, for this holder now:
+ *  'copy' — its sharer is gone, but a node here (the room's host, mostly)
+ *  kept a copy. */
+type Whereabouts = 'mine' | 'lost' | 'theirs' | 'copy' | 'away' | 'unknown';
 function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (e.source.kind !== 'blob') return 'unknown';
   // Nothing is said before the node has answered (no node, or not yet).
@@ -427,8 +430,19 @@ function whereabouts(e: TvLibraryEntry): Whereabouts {
   const holds = nodeHolds(e.source.hash);
   if (reach === null || holds === null) return 'unknown';
   if (holds) return 'mine';
-  if (e.source.provider === blobLaneNodeId()) return 'lost'; // names this node, which no longer holds it (let go, or made room)
-  return reach ? 'theirs' : 'away';
+  const me = blobLaneNodeId();
+  if (reach && e.source.provider !== me) return 'theirs';
+  if (copyHolder(e) !== null) return 'copy';
+  if (e.source.provider === me) return 'lost'; // names this node, which no longer holds it (let go, or made room)
+  return 'away';
+}
+
+/** A connected node WHERE said holds the row's file whole, other than this
+ *  one: the provider a PLAY from the library names when its sharer is gone. */
+function copyHolder(e: TvLibraryEntry): string | null {
+  if (e.source.kind !== 'blob') return null;
+  const me = blobLaneNodeId();
+  return (nodeHolders(e.source.hash) ?? []).find((id) => id !== me) ?? null;
 }
 
 /** The title a file's name gives the record: the name without its
@@ -700,8 +714,9 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       ${!mine && owner && readRemote(tv.id).holder ? smallButton(`data-tv-putdown="${esc(tv.id)}"`, '🪑 TAKE BACK (OWNER)') : ''}
     </div>
   </div>`;
+  const hostBlock = hostCopiesBlock();
   if (!mine) {
-    return `${head}<div class="phone-access-section">
+    return `${head}${hostBlock}<div class="phone-access-section">
       <div class="phone-access-note">Pick up the remote to choose what plays. Anyone standing at the set can press its power and volume buttons.</div>
     </div>`;
   }
@@ -750,6 +765,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <div id="tv-app-feedback" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;">${esc(feedbackNow())}</div>
       ${transport}
     </div>
+    ${hostBlock}
     ${library}
     <div class="phone-access-section">
       <div class="phone-access-header">HAND THE REMOTE TO…</div>
@@ -795,6 +811,23 @@ function torrentBlock(): string {
     ${status}`;
 }
 
+/** 🏠 This node hosts the room: whether it keeps copies of what is played
+ *  here, and the switch. Shown whoever holds the remote, and before the
+ *  library has its first row (copies are on from the moment the room is). */
+function hostCopiesBlock(): string {
+  void refreshHeldBlobs(); // at most every few seconds; the next paint shows it
+  const hostCopies = nodeHostCopies();
+  if (!hostCopies) return '';
+  return `<div class="phone-access-section">
+    <div style="display:flex; gap:6px; align-items:center; font-size:8.5px; color:${DIM};">
+      <span style="flex:1;">${hostCopies.on
+        ? `🏠 You host this room: your node keeps a copy of each file played here, so visitors can still play it after whoever shared it leaves. Up to ${esc(formatBytes(hostCopies.cap))} a file, ${esc(formatBytes(hostCopies.day))} or ${hostCopies.dayFiles} files a day (today so far: ${hostCopies.files} file${hostCopies.files === 1 ? '' : 's'}, ${esc(formatBytes(hostCopies.spent))}).`
+        : '🏠 You host this room. Your node keeps no copies of what is played here, so a file goes when whoever shared it leaves.'}</span>
+      ${smallButton(`data-tv-host-copies="${hostCopies.on ? '0' : '1'}" title="${hostCopies.on ? 'Stop keeping copies' : 'Keep copies of what is played here'}"`, hostCopies.on ? '🏠 COPIES ON' : '🏠 COPIES OFF')}
+    </div>
+  </div>`;
+}
+
 /** 📚 The room's library: what anyone here has played, kept with the room.
  *  Each row says where its file is now — on your node, on the node that
  *  shared it, or away (🧲 GET AGAIN for a torrent's) — and ▶ plays it. */
@@ -809,6 +842,9 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
   }
   const rows = libraryView(readLibrary(), history, libraryFilter, libraryQuery);
   const shown = rows.slice(0, libraryShown);
+  // Rows whose sharer is not here: ask the room's nodes who kept a copy
+  // (at most every half minute a file; the next paint shows the answer).
+  void refreshHolders(shown.flatMap((e) => (e.source.kind === 'blob' && !nodeHolds(e.source.hash) && nodeReaches(e.source.provider) !== true ? [e.source.hash] : [])));
   const wall = Date.now();
   const canAgain = torrentLaneReady();
   const list = shown.map((e) => {
@@ -820,10 +856,11 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     const size = e.source.kind === 'blob' ? ` · ${formatBytes(e.source.size)}` : '';
     const whereText = where === 'mine' ? `<span style="color:${GREEN};">ON YOUR NODE</span>`
       : where === 'theirs' ? `<span style="color:${CYAN};">ITS NODE IS HERE</span>`
+      : where === 'copy' ? `<span style="color:${CYAN};">A COPY IS ON A NODE HERE</span>`
       : where === 'away' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'AWAY — GET IT AGAIN' : 'ITS NODE IS AWAY'}</span>`
       : where === 'lost' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'GONE FROM YOUR NODE — GET IT AGAIN' : 'GONE FROM YOUR NODE — CHOOSE IT AGAIN ON 📁 FILE'}</span>`
       : '';
-    const again = e.torrent && canAgain && where !== 'mine'
+    const again = e.torrent && canAgain && where !== 'mine' && where !== 'copy'
       ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
       : '';
     const forget = where === 'mine'
@@ -1178,19 +1215,33 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       return;
     }
     // A file your node holds plays from your node: viewers fetch it from
-    // you, whoever shared it first.
+    // you, whoever shared it first. One whose sharer is gone plays from the
+    // node here that kept a copy.
     const where = whereabouts(entry);
     const me = blobLaneNodeId();
-    const source = entry.source.kind === 'blob' && where === 'mine' && me ? { ...entry.source, provider: me } : entry.source;
+    const copy = where === 'copy' ? copyHolder(entry) : null;
+    const source = entry.source.kind === 'blob' && where === 'mine' && me ? { ...entry.source, provider: me }
+      : entry.source.kind === 'blob' && copy ? { ...entry.source, provider: copy }
+      : entry.source;
     const r = tvPlay(id, source);
     if (!r.ok) {
       feedback(r.error);
       return;
     }
-    feedback(where === 'away' || where === 'lost'
+    feedback(where === 'copy'
+      ? `Now on: ${entry.title}, from the copy a node here kept.`
+      : where === 'away' || where === 'lost'
       ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'The node that shared it is not connected to yours'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
       : `Now on: ${entry.title}`);
     deps.openTheatre(id);
+  }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-host-copies]').forEach((b) => b.addEventListener('click', async () => {
+    const on = b.dataset.tvHostCopies === '1';
+    const why = await setHostCopies(on);
+    feedback(why ?? (on
+      ? 'Your node keeps a copy of each file played in this room from now on, while whoever shared it is connected.'
+      : 'Your node keeps no more copies for this room. The ones it has stay until you 🗑 them or it needs the room.'));
+    renderTvPhoneApp(host, deps);
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-forget]').forEach((b) => b.addEventListener('click', async () => {
     const key = b.dataset.tvLibForget!;

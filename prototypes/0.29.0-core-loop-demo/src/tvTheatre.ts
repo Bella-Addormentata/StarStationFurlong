@@ -30,7 +30,7 @@ import {
   redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
-import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, recheckBlob } from './blobLane';
+import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, recheckBlob, refreshHolders } from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
 import { suspendStickKeys } from './freeFlightStick';
@@ -849,7 +849,10 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
     return;
   }
   // 'none' or 'failed': the button. Its words are constant per programme,
-  // so the same ask every tick keeps the button under the finger.
+  // so the same ask every tick keeps the button under the finger. Which
+  // nodes here kept a copy is asked meanwhile: FETCH names them beside the
+  // provider, so it works after the one who shared the file has left.
+  void refreshHolders([source.hash]);
   const why = st.state === 'failed' ? st.why || 'no reason given' : blobAskRefused?.hash === source.hash ? blobAskRefused.why : '';
   const failed = why ? `<div class="tv-theatre-lane">the last try stopped: ${escapeHtml(why)}</div>` : '';
   const html = `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
