@@ -5,7 +5,9 @@
  * blob.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { forgetBlobLane, formatBytes, nodeHolds, nodeReaches, refreshHeldBlobs, setBlobLaneNode, setBlobLaneRoom, torrentLaneReady } from './blobLane';
+import {
+  forgetBlob, forgetBlobLane, formatBytes, nodeHolds, nodeLibrarySpace, nodeReaches, refreshHeldBlobs, setBlobLaneNode, setBlobLaneRoom, torrentLaneReady,
+} from './blobLane';
 import {
   confirmTorrent, forgetTorrentLane, MAX_TORRENT_FILE, parseTorrentState, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile,
   torrentLine, torrentOrigin, torrentRunning, torrentSource, torrentState,
@@ -211,6 +213,28 @@ describe('what this node holds, for the library', () => {
     setBlobLaneRoom('room-2');
     expect(nodeHolds(HASH)).toBeNull();
     expect(nodeReaches(ID)).toBeNull();
+  });
+
+  it('says how much the node keeps, and lets one of its files go', async () => {
+    withNode(true);
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${url}`);
+      if (url.includes('/forget')) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response(JSON.stringify({ held: [HASH], reachable: [], keep: true, kept: 129_000_000, quota: 8 * 1024 ** 3 }), { status: 200 });
+    }));
+    expect(nodeLibrarySpace()).toBeNull();
+    await refreshHeldBlobs(1_000);
+    expect(nodeLibrarySpace()).toEqual({ keep: true, kept: 129_000_000, quota: 8 * 1024 ** 3 });
+    expect(await forgetBlob(HASH)).toBeNull();
+    expect(calls[1]).toBe(`POST ${ORIGIN}/api/blob/forget?cap=${CAP}&hash=${HASH}`);
+    expect(nodeHolds(HASH)).toBe(false);
+    // The space changed: the next paint asks again at once.
+    await refreshHeldBlobs(1_500);
+    expect(calls).toHaveLength(3);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'that file is still on its way — wait for it' }), { status: 409 })));
+    expect(await forgetBlob(HASH)).toBe('Your node: that file is still on its way — wait for it.');
+    expect(await forgetBlob('nope')).toMatch(/node/);
   });
 
   it('takes a hash missing from a cut list as not known, not as gone', async () => {

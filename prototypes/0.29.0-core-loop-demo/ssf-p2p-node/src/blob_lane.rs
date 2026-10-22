@@ -31,15 +31,24 @@
 //!   and an allowed `Origin`. Nothing is served while a fetch is still
 //!   running: playback starts when the transfer ends (early start, from the
 //!   in-order verified prefix, is a later step).
-//! - **THE CACHE**: one store under `blob-cache/`, emptied at every start, so
-//!   nothing outlives the node's run (delete-on-leave is a node restart for
-//!   now), under one disk quota (`SSF_BLOB_QUOTA_MB`, default 8 GiB).
+//! - **THE LIBRARY ON DISK**: one store under `blob-cache/`, under one disk
+//!   quota (`SSF_BLOB_QUOTA_MB`, default 8 GiB). Whole files outlive the
+//!   node's run, so the TV library's entries still play from this node after
+//!   a restart: `library.json` beside the store names each one (its hash,
+//!   size, type, the rooms it is served to, when it was last used), and at
+//!   start only what it names AND the store holds whole comes back; the
+//!   store's garbage collection removes the rest (partial fetches, files
+//!   let go). When a new file does not fit, the files used longest ago go
+//!   first, never one being read now nor one used in the last `IN_USE`
+//!   (it may be playing).
+//!   `POST /api/blob/forget` lets one go from the page. `SSF_BLOB_KEEP=0`
+//!   empties the cache at every start instead, as before.
 
 use anyhow::{anyhow, Result};
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, PublicKey};
 use iroh_blobs::provider::events::{
-    AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode, ThrottleMode,
+    AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode, RequestUpdate, ThrottleMode,
 };
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::FsStore;
@@ -48,6 +57,7 @@ use n0_future::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -65,6 +75,15 @@ fn hub_members(hub: SharedHub) -> Members {
 const CACHE_DIR: &str = "blob-cache";
 /// The default disk quota for everything the lane holds, imports and fetches.
 const DEFAULT_QUOTA_MB: u64 = 8 * 1024;
+/// The list of whole files the node keeps across restarts, in the store's directory.
+const LIBRARY_FILE: &str = "library.json";
+/// A file used (served, imported, fetched) this recently may be playing: it
+/// is never let go to make room.
+const IN_USE: Duration = Duration::from_secs(30 * 60);
+/// How often the store removes what no held file needs.
+const GC_INTERVAL: Duration = Duration::from_secs(60);
+/// `used` goes to disk at a read once the list was last written this long ago.
+const USED_PERSIST: Duration = Duration::from_secs(10 * 60);
 /// Transfers this node runs at once; a FETCH past it waits for a slot.
 const MAX_FETCHES: usize = 2;
 /// A dial to a connected provider that has not completed in this long fails.
@@ -117,6 +136,44 @@ struct Held {
     /// bytes stay there until the next start empties the cache. A retry
     /// takes the charge over (raised to its own declaration if larger).
     charged: u64,
+    /// Unix ms it was last imported, fetched or read: the oldest go first.
+    used: u64,
+    /// Reads of it running now (HTTP to the page, iroh to a member): a file
+    /// being read is never let go to make room, however long the read.
+    readers: u32,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// A read of a whole file in progress (`BlobLane::reading`).
+struct Reading {
+    lane: Arc<BlobLane>,
+    hash: Hash,
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if let Some(h) = self.lane.held.lock().unwrap().get_mut(&self.hash) {
+            h.readers = h.readers.saturating_sub(1);
+            h.used = now_ms();
+        }
+    }
+}
+
+/// Tests only: a pause before each file `restore` looks at.
+#[cfg(test)]
+static RESTORE_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// One kept file in `library.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeptFile {
+    hash: String,
+    size: u64,
+    mime: String,
+    rooms: Vec<String>,
+    used: u64,
 }
 
 pub struct BlobLane {
@@ -127,42 +184,247 @@ pub struct BlobLane {
     /// allowed origin), and it changes at every start.
     pub cap: String,
     quota: u64,
-    held: Mutex<HashMap<Hash, Held>>,
+    /// Whole files outlive the run (`SSF_BLOB_KEEP`, on unless `0`).
+    keep: bool,
+    /// Shared with the store's garbage collection, which keeps what is here.
+    held: Arc<Mutex<HashMap<Hash, Held>>>,
+    /// One `library.json` write at a time (they share its temp file).
+    writing: Mutex<()>,
+    /// Unix ms `library.json` was last written: a read writes it again once
+    /// this is `USED_PERSIST` old, so a file in steady use is saved as used.
+    saved: AtomicU64,
     slots: tokio::sync::Semaphore,
 }
 
 impl BlobLane {
-    /// Empty the cache and open a fresh store. A failure leaves the node
-    /// running without the lane; the routes then answer 503.
+    /// Open the store, with the files kept from the last run (or emptied,
+    /// with `SSF_BLOB_KEEP=0`). A failure leaves the node running without
+    /// the lane; the routes then answer 503.
     pub async fn open() -> Result<Arc<Self>> {
         let quota = std::env::var("SSF_BLOB_QUOTA_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_QUOTA_MB)
             .saturating_mul(1024 * 1024);
-        Self::open_at(std::env::current_dir()?.join(CACHE_DIR), quota).await
+        let keep = !std::env::var("SSF_BLOB_KEEP").is_ok_and(|v| v.trim() == "0");
+        let lane = Self::open_with(std::env::current_dir()?.join(CACHE_DIR), quota, keep, GC_INTERVAL).await?;
+        if keep {
+            let (n, bytes) = {
+                let held = lane.held.lock().unwrap();
+                (held.len(), Self::charged(&held))
+            };
+            println!("📦 Blob lane keeps its files across restarts: {n} kept ({} MB of {} MB; SSF_BLOB_KEEP=0 empties it at start)", bytes / (1024 * 1024), quota / (1024 * 1024));
+        }
+        Ok(lane)
     }
 
+    /// A fresh, emptied store (the tests' default).
+    #[cfg(test)]
     pub(crate) async fn open_at(dir: PathBuf, quota: u64) -> Result<Arc<Self>> {
-        if dir.exists() {
+        Self::open_with(dir, quota, false, GC_INTERVAL).await
+    }
+
+    pub(crate) async fn open_with(dir: PathBuf, quota: u64, keep: bool, gc_interval: Duration) -> Result<Arc<Self>> {
+        if dir.exists() && !keep {
             std::fs::remove_dir_all(&dir)?;
         }
         std::fs::create_dir_all(&dir)?;
-        let store = FsStore::load(&dir).await.map_err(|e| anyhow!("{e}"))?;
+        // An import cut off by the last stop.
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            if e.file_name().to_string_lossy().starts_with("import-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        let held: Arc<Mutex<HashMap<Hash, Held>>> = Arc::default();
+        // Everything `library.json` names is kept until `restore` has looked
+        // at it: a collection that ran while the list was half read would
+        // take the files not reached yet.
+        let listed = if keep { Self::read_library(&dir) } else { Vec::new() };
+        let pending: Arc<Mutex<HashSet<Hash>>> = Arc::new(Mutex::new(listed.iter().filter_map(|k| Hash::from_str(&k.hash).ok()).collect()));
+        // The store keeps exactly what `held` names (whole, on its way, or a
+        // failed fetch's charged bytes) and, while one is written, its temp
+        // tag; everything else goes at the next collection.
+        let protect = held.clone();
+        let protect_pending = pending.clone();
+        let add_protected: iroh_blobs::store::ProtectCb = Arc::new(move |live| {
+            live.extend(protect.lock().unwrap().keys().copied());
+            live.extend(protect_pending.lock().unwrap().iter().copied());
+            Box::pin(async { iroh_blobs::store::ProtectOutcome::Continue })
+        });
+        let mut options = iroh_blobs::store::fs::options::Options::new(&dir);
+        options.gc = Some(iroh_blobs::store::GcConfig { interval: gc_interval, add_protected: Some(add_protected) });
+        let store = FsStore::load_with_opts(dir.join("blobs.db"), options).await.map_err(|e| anyhow!("{e}"))?;
+        // `held` decides what stays, not tags.
+        store.tags().delete_all().await.map_err(|e| anyhow!("{e}"))?;
         let mut token = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
-        Ok(Arc::new(Self {
+        let lane = Arc::new(Self {
             store,
             dir,
             cap: hex::encode(token),
             quota,
-            held: Mutex::new(HashMap::new()),
+            keep,
+            held,
+            writing: Mutex::new(()),
+            saved: AtomicU64::new(0),
             slots: tokio::sync::Semaphore::new(MAX_FETCHES),
-        }))
+        });
+        if keep {
+            lane.restore(listed).await;
+        }
+        pending.lock().unwrap().clear();
+        Ok(lane)
+    }
+
+    /// The files `library.json` in `dir` names (none, unreadable).
+    fn read_library(dir: &std::path::Path) -> Vec<KeptFile> {
+        std::fs::read(dir.join(LIBRARY_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("files").cloned())
+            .and_then(|f| serde_json::from_value(f).ok())
+            .unwrap_or_default()
+    }
+
+    /// Bring back what `library.json` names and the store holds whole, the
+    /// most recently used first, as far as the quota goes.
+    async fn restore(&self, listed: Vec<KeptFile>) {
+        let mut listed: Vec<KeptFile> = listed.into_iter().filter(|k| k.size > 0).collect();
+        listed.sort_by(|a, b| b.used.cmp(&a.used));
+        let mut charged = 0u64;
+        for k in listed {
+            #[cfg(test)]
+            {
+                let pause = RESTORE_PAUSE_MS.load(Ordering::Relaxed);
+                if pause > 0 {
+                    tokio::time::sleep(Duration::from_millis(pause)).await;
+                }
+            }
+            let Ok(hash) = Hash::from_str(&k.hash) else { continue };
+            let whole = matches!(self.store.blobs().status(hash).await, Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) if size == k.size);
+            let rooms: HashSet<String> = k.rooms.into_iter().filter(|r| valid_room(r)).take(64).collect();
+            if !whole || rooms.is_empty() || charged + storage_bound(k.size) > self.quota {
+                continue;
+            }
+            charged += storage_bound(k.size);
+            self.held.lock().unwrap().insert(hash, Held {
+                rooms, size: k.size, have: k.size, mime: safe_mime(&k.mime), phase: Phase::Complete, charged: storage_bound(k.size), used: k.used, readers: 0,
+            });
+        }
+        self.persist();
+    }
+
+    /// Write the whole files to `library.json` (nothing, without `keep`).
+    fn persist(&self) {
+        if !self.keep {
+            return;
+        }
+        // Taken before the snapshot, so an older one never lands last.
+        let _one = self.writing.lock().unwrap();
+        self.saved.store(now_ms(), Ordering::Relaxed);
+        let files: Vec<KeptFile> = {
+            let held = self.held.lock().unwrap();
+            held.iter()
+                .filter(|(_, h)| h.phase == Phase::Complete && !h.rooms.is_empty())
+                .map(|(hash, h)| KeptFile { hash: hash.to_hex().to_string(), size: h.size, mime: h.mime.clone(), rooms: h.rooms.iter().cloned().collect(), used: h.used })
+                .collect()
+        };
+        let body = serde_json::json!({ "v": 1, "files": files }).to_string();
+        let tmp = self.dir.join(format!("{LIBRARY_FILE}.tmp"));
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.dir.join(LIBRARY_FILE))) {
+            eprintln!("⚠️ blob-cache/{LIBRARY_FILE} could not be written: {e}");
+        }
     }
 
     fn charged(held: &HashMap<Hash, Held>) -> u64 {
         held.values().map(|h| h.charged).sum()
+    }
+
+    /// Make room for `extra` more bytes of charge: let go of failed fetches,
+    /// then the whole files used longest ago (never one being read, one
+    /// used within `IN_USE`, nor `except`), until it fits. Nothing goes when even that
+    /// would not be enough. Whether it fits now; the caller persists when
+    /// something went.
+    fn make_room(held: &mut HashMap<Hash, Held>, quota: u64, extra: u64, except: Option<&Hash>, now: u64) -> (bool, bool) {
+        let charged = Self::charged(held);
+        if charged + extra <= quota {
+            return (true, false);
+        }
+        let recent = now.saturating_sub(IN_USE.as_millis() as u64);
+        let mut victims: Vec<(u64, Hash, u64)> = held
+            .iter()
+            .filter(|(hash, h)| Some(*hash) != except && (matches!(h.phase, Phase::Failed(_)) || (h.phase == Phase::Complete && h.readers == 0 && h.used < recent)))
+            .map(|(hash, h)| (if matches!(h.phase, Phase::Failed(_)) { 0 } else { h.used.max(1) }, *hash, h.charged))
+            .collect();
+        victims.sort();
+        let freeable: u64 = victims.iter().map(|v| v.2).sum();
+        if charged - freeable.min(charged) + extra > quota {
+            return (false, false);
+        }
+        let mut now_charged = charged;
+        for (_, hash, charge) in victims {
+            if now_charged + extra <= quota {
+                break;
+            }
+            held.remove(&hash);
+            now_charged -= charge;
+            println!("📦 blob {}: let go to make room (used longest ago)", hash.fmt_short());
+        }
+        (true, true)
+    }
+
+    /// Whether a file of `len` bytes would fit, letting go of what could go.
+    fn would_fit(held: &HashMap<Hash, Held>, quota: u64, extra: u64, now: u64) -> bool {
+        let recent = now.saturating_sub(IN_USE.as_millis() as u64);
+        let freeable: u64 = held
+            .values()
+            .filter(|h| matches!(h.phase, Phase::Failed(_)) || (h.phase == Phase::Complete && h.readers == 0 && h.used < recent))
+            .map(|h| h.charged)
+            .sum();
+        Self::charged(held).saturating_sub(freeable) + extra <= quota
+    }
+
+    /// The page lets a whole file (or a failed fetch) go from this node.
+    /// Why not, if not.
+    pub(crate) fn forget(&self, hash: &Hash) -> std::result::Result<(), &'static str> {
+        {
+            let mut held = self.held.lock().unwrap();
+            match held.get(hash) {
+                None => return Err("this node does not have that file"),
+                Some(h) if !matches!(h.phase, Phase::Complete | Phase::Failed(_)) => return Err("that file is still on its way — wait for it"),
+                Some(_) => {
+                    held.remove(hash);
+                }
+            }
+        }
+        self.persist();
+        println!("📦 blob {}: let go from this node's page", hash.fmt_short());
+        Ok(())
+    }
+
+    /// Note a read of `hash`: it is in use, and the last to go. The list on
+    /// disk is written again once its last write is `USED_PERSIST` old.
+    fn touch(&self, hash: &Hash) {
+        let now = now_ms();
+        let found = match self.held.lock().unwrap().get_mut(hash) {
+            Some(h) => {
+                h.used = now;
+                true
+            }
+            None => false,
+        };
+        if found && now.saturating_sub(self.saved.load(Ordering::Relaxed)) > USED_PERSIST.as_millis() as u64 {
+            self.persist();
+        }
+    }
+
+    /// A read of `hash` starts: until the guard drops, the file is not let
+    /// go to make room.
+    fn reading(self: &Arc<Self>, hash: Hash) -> Reading {
+        if let Some(h) = self.held.lock().unwrap().get_mut(&hash) {
+            h.readers += 1;
+        }
+        Reading { lane: self.clone(), hash }
     }
 
     /// May `remote` be served `hash`: the blob is whole here, and `remote` is
@@ -175,7 +437,11 @@ impl BlobLane {
                 _ => return false,
             }
         };
-        rooms.iter().any(|r| members(r, remote))
+        let ok = rooms.iter().any(|r| members(r, remote));
+        if ok {
+            self.touch(hash);
+        }
+        ok
     }
 
     /// Answer one inbound blobs-ALPN connection under the serving rule.
@@ -188,7 +454,8 @@ impl BlobLane {
         let remote = conn.remote_id();
         let mask = EventMask {
             connected: ConnectMode::None,
-            get: RequestMode::Intercept,
+            // The transfer's own events say when it ends (`Log`).
+            get: RequestMode::InterceptLog,
             get_many: RequestMode::Disabled,
             push: RequestMode::Disabled,
             observe: ObserveMode::Intercept,
@@ -201,7 +468,21 @@ impl BlobLane {
                 match msg {
                     ProviderMessage::GetRequestReceived(msg) => {
                         let ok = msg.request.ranges.is_blob() && lane.may_serve(&hub, &remote, &msg.request.hash);
+                        // Kept from eviction while the transfer runs: until
+                        // it completes, aborts, or its events stop.
+                        let reading = ok.then(|| lane.reading(msg.request.hash));
                         msg.tx.send(if ok { Ok(()) } else { Err(AbortReason::Permission) }).await.ok();
+                        if let Some(reading) = reading {
+                            let mut updates = msg.rx;
+                            tokio::spawn(async move {
+                                let _reading = reading;
+                                while let Ok(Some(u)) = updates.recv().await {
+                                    if matches!(u, RequestUpdate::Completed(_) | RequestUpdate::Aborted(_)) {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
                     }
                     ProviderMessage::ObserveRequestReceived(msg) => {
                         let ok = lane.may_serve(&hub, &remote, &msg.request.hash);
@@ -239,11 +520,16 @@ impl BlobLane {
     /// cut, so a hash missing from it is not known to be missing.
     pub(crate) fn held_json(&self, room: &str, reachable: &[PublicKey]) -> String {
         let held = self.held.lock().unwrap();
-        let mut whole = held.iter().filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room));
-        let hashes: Vec<String> = whole.by_ref().take(MAX_HELD_LISTED).map(|(hash, _)| hash.to_hex().to_string()).collect();
-        let more = whole.next().is_some();
+        let mut whole: Vec<(&Hash, &Held)> = held.iter().filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room)).collect();
+        let more = whole.len() > MAX_HELD_LISTED;
+        if more {
+            // Cut to the files used last: the ones a library shows first.
+            whole.sort_unstable_by_key(|(_, h)| std::cmp::Reverse(h.used));
+        }
+        let hashes: Vec<String> = whole.iter().take(MAX_HELD_LISTED).map(|(hash, _)| hash.to_hex().to_string()).collect();
         let peers: Vec<String> = reachable.iter().take(MAX_HELD_LISTED).map(|p| p.to_string()).collect();
-        serde_json::json!({ "held": hashes, "more": more, "reachable": peers }).to_string()
+        let kept: u64 = held.values().filter(|h| h.phase == Phase::Complete).map(|h| h.charged).sum();
+        serde_json::json!({ "held": hashes, "more": more, "reachable": peers, "keep": self.keep, "kept": kept, "quota": self.quota }).to_string()
     }
 
     fn fail(&self, hash: &Hash, why: &str) {
@@ -312,12 +598,13 @@ impl BlobLane {
                 Ok(()) => {
                     match self.store.blobs().status(hash).await {
                         Ok(iroh_blobs::api::proto::BlobStatus::Complete { size: got }) if got == size => {
-                            let mut held = self.held.lock().unwrap();
-                            if let Some(h) = held.get_mut(&hash) {
+                            if let Some(h) = self.held.lock().unwrap().get_mut(&hash) {
                                 h.have = got;
                                 h.charged = storage_bound(got);
                                 h.phase = Phase::Complete;
+                                h.used = now_ms();
                             }
+                            self.persist();
                             println!("📦 blob {}: fetched {got} bytes from {}", hash.fmt_short(), provider.fmt_short());
                             return;
                         }
@@ -344,20 +631,28 @@ impl BlobLane {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let placeholder = Hash::new(nonce);
-        let mut held = self.held.lock().unwrap();
-        if Self::charged(&held) + storage_bound(len) > self.quota {
-            return None;
+        let now = now_ms();
+        let evicted = {
+            let mut held = self.held.lock().unwrap();
+            let (fits, evicted) = Self::make_room(&mut held, self.quota, storage_bound(len), None, now);
+            if !fits {
+                return None;
+            }
+            held.insert(placeholder, Held {
+                rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len), used: now, readers: 0,
+            });
+            evicted
+        };
+        if evicted {
+            self.persist();
         }
-        held.insert(placeholder, Held {
-            rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len),
-        });
         Some(placeholder)
     }
 
-    /// Whether a file of `len` bytes would fit in the quota now (a later
-    /// `reserve` still decides).
+    /// Whether a file of `len` bytes would fit in the quota now, letting go
+    /// of what could go (a later `reserve` still decides).
     pub(crate) fn fits(&self, len: u64) -> bool {
-        Self::charged(&self.held.lock().unwrap()) + storage_bound(len) <= self.quota
+        Self::would_fit(&self.held.lock().unwrap(), self.quota, storage_bound(len), now_ms())
     }
 
     /// Give a reservation back (the import did not happen).
@@ -369,30 +664,35 @@ impl BlobLane {
     /// a moment with neither counted would let another import or FETCH take
     /// the same room in the quota.
     pub(crate) fn settle(&self, placeholder: Hash, hash: Hash, len: u64, room: String, mime: String) {
-        let mut held = self.held.lock().unwrap();
-        held.remove(&placeholder);
-        let h = held.entry(hash).or_insert(Held {
-            rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len),
-        });
-        h.rooms.insert(room);
-        h.phase = Phase::Complete;
-        h.have = len;
-        h.size = len;
-        h.charged = storage_bound(len);
-        h.mime = mime;
+        {
+            let mut held = self.held.lock().unwrap();
+            held.remove(&placeholder);
+            let h = held.entry(hash).or_insert(Held {
+                rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len), used: 0, readers: 0,
+            });
+            h.rooms.insert(room);
+            h.phase = Phase::Complete;
+            h.have = len;
+            h.size = len;
+            h.charged = storage_bound(len);
+            h.mime = mime;
+            h.used = now_ms();
+        }
+        self.persist();
     }
 
     /// Store a file already on this machine's disk (the torrent lane's
-    /// download); its hash, or why not. The caller reserved it.
+    /// download): its hash, and the temp tag that keeps it from the store's
+    /// collection until `settle` names it. The caller reserved it.
     #[cfg_attr(not(feature = "torrent"), allow(dead_code))]
-    pub(crate) async fn add_file(&self, path: &std::path::Path) -> Result<Hash> {
-        let tag = self.store.blobs().add_path(path).await.map_err(|e| anyhow!("{e}"))?;
-        Ok(tag.hash)
+    pub(crate) async fn add_file(&self, path: &std::path::Path) -> Result<(Hash, iroh_blobs::api::TempTag)> {
+        let tag = self.store.blobs().add_path(path).temp_tag().await.map_err(|e| anyhow!("{e}"))?;
+        Ok((tag.hash(), tag))
     }
 
     /// Stream `len` body bytes (the first `already` read with the head) into
     /// the store; the hash, or why not.
-    async fn import(&self, socket: &mut tokio::net::TcpStream, already: &[u8], len: u64) -> Result<Hash> {
+    async fn import(&self, socket: &mut tokio::net::TcpStream, already: &[u8], len: u64) -> Result<(Hash, iroh_blobs::api::TempTag)> {
         let mut nonce = [0u8; 8];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let part = self.dir.join(format!("import-{}.part", hex::encode(nonce)));
@@ -413,8 +713,8 @@ impl BlobLane {
             }
             file.flush().await?;
             drop(file);
-            let tag = self.store.blobs().add_path(&part).await.map_err(|e| anyhow!("{e}"))?;
-            Ok(tag.hash)
+            let tag = self.store.blobs().add_path(&part).temp_tag().await.map_err(|e| anyhow!("{e}"))?;
+            Ok((tag.hash(), tag))
         }
         .await;
         let _ = tokio::fs::remove_file(&part).await;
@@ -572,7 +872,7 @@ pub async fn handle_http(
             };
             let result = lane.import(socket, body_start, len).await;
             match result {
-                Ok(hash) => {
+                Ok((hash, _tag)) => {
                     lane.settle(placeholder, hash, len, room, mime);
                     println!("📦 blob {}: imported {len} bytes", hash.fmt_short());
                     let body = serde_json::json!({ "hash": hash.to_hex(), "size": len }).to_string();
@@ -612,6 +912,7 @@ pub async fn handle_http(
                 }
             };
             enum Verdict { Already, NotConnected, NoRoom, Start }
+            let mut evicted = false;
             let verdict = {
                 let mut held = lane.held.lock().unwrap();
                 let already = match held.get_mut(&hash) {
@@ -630,18 +931,26 @@ pub async fn handle_http(
                     // are on disk until the next start); a new FETCH takes
                     // over that charge, raised to the whole declaration.
                     let failed_charge = held.get(&hash).map(|h| h.charged).unwrap_or(0);
+                    let extra = storage_bound(size).max(failed_charge) - failed_charge;
                     if providers.is_empty() {
                         Verdict::NotConnected
-                    } else if BlobLane::charged(&held) - failed_charge + storage_bound(size).max(failed_charge) > lane.quota {
-                        Verdict::NoRoom
                     } else {
-                        held.insert(hash, Held {
-                            rooms: HashSet::from([room]), size, have: 0, mime, phase: Phase::Queued, charged: storage_bound(size).max(failed_charge),
-                        });
-                        Verdict::Start
+                        let (fits, went) = BlobLane::make_room(&mut held, lane.quota, extra, Some(&hash), now_ms());
+                        evicted = went;
+                        if !fits {
+                            Verdict::NoRoom
+                        } else {
+                            held.insert(hash, Held {
+                                rooms: HashSet::from([room]), size, have: 0, mime, phase: Phase::Queued, charged: storage_bound(size).max(failed_charge), used: now_ms(), readers: 0,
+                            });
+                            Verdict::Start
+                        }
                     }
                 }
             };
+            if evicted || matches!(verdict, Verdict::Already) {
+                lane.persist(); // what went, or the room it is shared to now
+            }
             match verdict {
                 Verdict::Already => reply(socket, "200 OK", cors, &serde_json::json!({ "ok": true }).to_string()).await,
                 Verdict::NotConnected => {
@@ -663,6 +972,15 @@ pub async fn handle_http(
             let body = lane.held_json(&room, &reachable);
             reply(socket, "200 OK", cors, &body).await;
         }
+        ("POST", "/api/blob/forget") => {
+            let Some(hash) = hash_param(&head) else {
+                return reply(socket, "400 Bad Request", cors, &err_json("no hash")).await;
+            };
+            match lane.forget(&hash) {
+                Ok(()) => reply(socket, "200 OK", cors, &serde_json::json!({ "ok": true }).to_string()).await,
+                Err(why) => reply(socket, "409 Conflict", cors, &err_json(why)).await,
+            }
+        }
         ("GET", "/api/blob/status") => {
             let Some(hash) = hash_param(&head) else {
                 return reply(socket, "400 Bad Request", cors, &err_json("no hash")).await;
@@ -681,6 +999,8 @@ pub async fn handle_http(
             let Some((len, mime)) = found else {
                 return reply(socket, "404 Not Found", cors, &err_json("not on this node yet")).await;
             };
+            lane.touch(&hash);
+            let _reading = lane.reading(hash);
             if let Err(e) = serve_bytes(&lane, socket, &head, hash, len, &mime, cors).await {
                 eprintln!("📦 blob {}: serving ended: {e}", hash.fmt_short());
             }
@@ -823,16 +1143,16 @@ mod tests {
         let tag = lane_a.store.blobs().add_slice(&data).await.unwrap();
         let size = data.len() as u64;
         lane_a.held.lock().unwrap().insert(tag.hash, Held {
-            rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size,
+            rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size, used: 0, readers: 0,
         });
         assert_eq!(
             lane_a.held_json("r", &[b_id]),
-            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "more": false, "reachable": [b_id.to_string()] }).to_string()
+            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "keep": false, "kept": size, "more": false, "quota": 1u64 << 30, "reachable": [b_id.to_string()] }).to_string()
         );
-        assert_eq!(lane_a.held_json("elsewhere", &[]), r#"{"held":[],"more":false,"reachable":[]}"#);
+        assert!(lane_a.held_json("elsewhere", &[]).starts_with(r#"{"held":[],"#));
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
             lane.held.lock().unwrap().insert(tag.hash, Held {
-                rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared,
+                rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared, used: 0, readers: 0,
             });
         };
 
@@ -842,6 +1162,18 @@ mod tests {
         let mut got = Vec::new();
         lane_b.store.blobs().reader(tag.hash).read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data);
+        // A's side held the file as being read until the transfer ended.
+        let read_over = |lane: &Arc<BlobLane>| {
+            let h = &lane.held.lock().unwrap()[&tag.hash];
+            h.readers == 0 && h.used > 0
+        };
+        for _ in 0..50 {
+            if read_over(&lane_a) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(read_over(&lane_a), "the served read never ended");
 
         queue(&lane_c, size);
         lane_c.clone().run_fetch(ep_c.clone(), tag.hash, size, vec![ep_a.id()]).await;
@@ -854,6 +1186,13 @@ mod tests {
         queue(&lane_b2, 1000);
         lane_b2.clone().run_fetch(ep_b.clone(), tag.hash, 1000, vec![ep_a.id()]).await;
         assert!(matches!(lane_b2.held.lock().unwrap()[&tag.hash].phase, Phase::Failed(_)));
+        for _ in 0..100 {
+            if lane_a.held.lock().unwrap()[&tag.hash].readers == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(lane_a.held.lock().unwrap()[&tag.hash].readers, 0, "a read cut off at its declaration never ended");
         // …and asked for no more than it declared: the store holds a partial
         // blob of about the declared size, never the whole 300 KB.
         match lane_b2.store.blobs().status(tag.hash).await.unwrap() {
@@ -885,6 +1224,177 @@ mod tests {
             if p.is_dir() { out.extend(walk(&p)); } else if p.extension().is_none_or(|x| x != "db") { out.push(p); }
         }
         out
+    }
+
+    /// Put `data` in the lane as an import for room `r` would.
+    async fn import_bytes(lane: &BlobLane, data: &[u8], name: &str) -> Hash {
+        let path = lane.dir.join(format!("{name}.src"));
+        std::fs::write(&path, data).unwrap();
+        let placeholder = lane.reserve(data.len() as u64, "video/webm").expect("room for it");
+        let (hash, _tag) = lane.add_file(&path).await.unwrap();
+        lane.settle(placeholder, hash, data.len() as u64, "r".into(), "video/webm".into());
+        std::fs::remove_file(&path).unwrap();
+        hash
+    }
+
+    async fn whole(lane: &BlobLane, hash: Hash) -> bool {
+        matches!(lane.store.blobs().status(hash).await, Ok(iroh_blobs::api::proto::BlobStatus::Complete { .. }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kept_files_come_back_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gc = Duration::from_millis(100);
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, gc).await.unwrap();
+        let hash = import_bytes(&lane, &data, "a").await;
+        // A file the list names but the store does not hold whole is not brought back.
+        let listed = std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap();
+        assert!(listed.contains(&hash.to_hex().to_string()));
+        let ghost = Hash::new(b"never stored");
+        let with_ghost = listed.replace(r#""files":["#, &format!(r#""files":[{{"hash":"{}","size":5,"mime":"video/mp4","rooms":["r"],"used":9}},"#, ghost.to_hex()));
+        std::fs::write(dir.join(LIBRARY_FILE), with_ghost).unwrap();
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, gc).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await; // a collection ran
+        assert!(lane.status_json(&hash).contains(r#""state":"complete""#), "{}", lane.status_json(&hash));
+        assert_eq!(lane.status_json(&ghost), r#"{"state":"none"}"#);
+        assert!(lane.held_json("r", &[]).contains(&hash.to_hex().to_string()));
+        assert!(lane.held_json("r", &[]).contains(r#""keep":true"#));
+        let mut got = Vec::new();
+        lane.store.blobs().reader(hash).read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, data, "the kept file survived the collection");
+        assert!(!std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap().contains(&ghost.to_hex().to_string()));
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+
+        // SSF_BLOB_KEEP=0: emptied at start, as before.
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, false, gc).await.unwrap();
+        assert_eq!(lane.status_json(&hash), r#"{"state":"none"}"#);
+        assert!(!whole(&lane, hash).await);
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_files_used_longest_ago_go_first_to_make_room() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-room-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = |seed: u32| (0..100_000u32).map(|i| (i.wrapping_mul(seed) % 251) as u8).collect::<Vec<u8>>();
+        // Room for two files, not three.
+        let lane = BlobLane::open_with(dir.clone(), storage_bound(100_000) * 2 + 1000, true, Duration::from_millis(100)).await.unwrap();
+        let a = import_bytes(&lane, &file(7), "a").await;
+        let b = import_bytes(&lane, &file(11), "b").await;
+        let hour = 3_600_000;
+        lane.held.lock().unwrap().get_mut(&a).unwrap().used = now_ms() - 2 * hour;
+        lane.held.lock().unwrap().get_mut(&b).unwrap().used = now_ms() - hour;
+        assert!(lane.fits(100_000));
+        let c = import_bytes(&lane, &file(13), "c").await;
+        // A, used longest ago, went; B stayed.
+        assert_eq!(lane.status_json(&a), r#"{"state":"none"}"#);
+        assert!(lane.status_json(&b).contains("complete") && lane.status_json(&c).contains("complete"));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!whole(&lane, a).await, "the store let A go");
+        assert!(whole(&lane, b).await && whole(&lane, c).await);
+        // A file in use (read just now) never goes: then nothing fits.
+        lane.touch(&b);
+        assert!(!lane.fits(100_000));
+        assert!(lane.reserve(100_000, "video/webm").is_none());
+        // FORGET from the page lets one go.
+        assert!(lane.forget(&Hash::new(b"nothing")).is_err());
+        lane.forget(&b).unwrap();
+        assert!(lane.fits(100_000));
+        assert!(!std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap().contains(&b.to_hex().to_string()));
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_collection_during_restore_takes_nothing_it_has_not_reached() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-restore-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gc = Duration::from_millis(20);
+        let file = |seed: u32| (0..50_000u32).map(|i| (i.wrapping_mul(seed) % 251) as u8).collect::<Vec<u8>>();
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, gc).await.unwrap();
+        let a = import_bytes(&lane, &file(7), "a").await;
+        let b = import_bytes(&lane, &file(11), "b").await;
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+        // A slow restore: collections run every 20 ms while it looks at each file.
+        RESTORE_PAUSE_MS.store(300, Ordering::Relaxed);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, gc).await.unwrap();
+        RESTORE_PAUSE_MS.store(0, Ordering::Relaxed);
+        for h in [a, b] {
+            assert!(lane.status_json(&h).contains(r#""state":"complete""#), "{}", lane.status_json(&h));
+            assert!(whole(&lane, h).await);
+        }
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_being_read_stays_and_its_use_is_saved() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-reading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = |seed: u32| (0..100_000u32).map(|i| (i.wrapping_mul(seed) % 251) as u8).collect::<Vec<u8>>();
+        // Room for two files, not three.
+        let lane = BlobLane::open_with(dir.clone(), storage_bound(100_000) * 2 + 1000, true, Duration::from_millis(100)).await.unwrap();
+        let a = import_bytes(&lane, &file(7), "a").await;
+        let b = import_bytes(&lane, &file(11), "b").await;
+        let hour = 3_600_000;
+        lane.held.lock().unwrap().get_mut(&a).unwrap().used = now_ms() - 2 * hour;
+        lane.held.lock().unwrap().get_mut(&b).unwrap().used = now_ms() - hour;
+        // A read of A that has run for hours: A stays, B goes instead.
+        let reading = lane.reading(a);
+        let c = import_bytes(&lane, &file(13), "c").await;
+        assert!(lane.status_json(&a).contains("complete"), "the file being read was let go");
+        assert_eq!(lane.status_json(&b), r#"{"state":"none"}"#);
+        assert!(!lane.fits(100_000), "nothing can go: one is being read, one was just used");
+        drop(reading);
+        assert!(lane.held.lock().unwrap()[&a].used > now_ms() - 60_000, "the read's end counts as a use");
+        assert!(lane.held.lock().unwrap()[&a].readers == 0 && lane.held.lock().unwrap()[&c].readers == 0);
+
+        // Use goes to disk once the list's last WRITE is old, however
+        // recent the last read: steady reads are saved, not skipped.
+        let saved_used = |h: Hash| -> u64 {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(LIBRARY_FILE)).unwrap()).unwrap();
+            v["files"].as_array().unwrap().iter().find(|f| f["hash"] == h.to_hex().to_string()).unwrap()["used"].as_u64().unwrap()
+        };
+        lane.held.lock().unwrap().get_mut(&a).unwrap().used = 5;
+        lane.persist();
+        lane.touch(&a); // read just after a write: kept in memory only
+        assert_eq!(saved_used(a), 5);
+        lane.touch(&a);
+        let quiet = now_ms() - USED_PERSIST.as_millis() as u64 - 1_000;
+        lane.saved.store(quiet, Ordering::Relaxed); // the last write was long ago; the last read was not
+        lane.touch(&a);
+        assert!(saved_used(a) > now_ms() - 60_000, "a read in steady use was not saved");
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cut_held_list_names_the_files_used_last() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, false, Duration::from_secs(3600)).await.unwrap();
+        let hash = |i: u64| Hash::new(i.to_le_bytes());
+        for i in 0..=MAX_HELD_LISTED as u64 {
+            lane.held.lock().unwrap().insert(hash(i), Held {
+                rooms: HashSet::from(["r".to_string()]), size: 1, have: 1, mime: String::new(), phase: Phase::Complete, charged: 1, used: i, readers: 0,
+            });
+        }
+        let got: serde_json::Value = serde_json::from_str(&lane.held_json("r", &[])).unwrap();
+        assert_eq!(got["more"], true);
+        let listed: Vec<&str> = got["held"].as_array().unwrap().iter().map(|h| h.as_str().unwrap()).collect();
+        assert_eq!(listed.len(), MAX_HELD_LISTED);
+        assert!(listed.contains(&hash(MAX_HELD_LISTED as u64).to_hex().as_str()));
+        assert!(!listed.contains(&hash(0).to_hex().as_str()), "the one used longest ago is the one cut");
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

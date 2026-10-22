@@ -30,7 +30,7 @@ import {
   redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
-import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes } from './blobLane';
+import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, recheckBlob } from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
 import { suspendStickKeys } from './freeFlightStick';
@@ -601,6 +601,9 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     if (!live()) return;
     unmountPlayer(t);
     t.mounted = `failed:${key}`;
+    // A file the node said it held but could not serve may have been let
+    // go since: RETRY asks the node again, and offers FETCH if it is gone.
+    if (source.kind === 'blob') recheckBlob(source.hash);
     showNotice(t, `<div>${escapeHtml(why)}</div>
       <div class="tv-theatre-lane">${escapeHtml(sourceLane(source))} LANE — nothing else in the room depends on it</div>
       <button type="button" data-tv-retry="1">RETRY</button>`);
@@ -850,7 +853,7 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
   const why = st.state === 'failed' ? st.why || 'no reason given' : blobAskRefused?.hash === source.hash ? blobAskRefused.why : '';
   const failed = why ? `<div class="tv-theatre-lane">the last try stopped: ${escapeHtml(why)}</div>` : '';
   const html = `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
-    <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk until your node restarts. Nothing is fetched until you press</div>
+    <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk, kept until your node needs the room (the files used longest ago go first). Nothing is fetched until you press</div>
     ${failed}
     <button type="button" data-tv-fetch="${escapeHtml(source.hash)}" data-tv-fetch-size="${source.size}" data-tv-fetch-from="${escapeHtml(source.provider)}">📦 FETCH ${escapeHtml(size)}</button>`;
   if (!t.notice.hidden && t.lastNotice === html) return;

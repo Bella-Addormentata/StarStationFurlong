@@ -462,7 +462,7 @@ impl TorrentLane {
         if got != len {
             return Err(anyhow!("{} is {got} bytes, not the {len} the torrent said", rel.display()));
         }
-        let hash = self.blobs.add_file(&path).await?;
+        let (hash, _kept) = self.blobs.add_file(&path).await?;
         // The bytes are in the store now, so they are charged whatever came
         // meanwhile: the reservation becomes the blob's under the job's lock.
         // A STOP that already gave the reservation back leaves `settle` to

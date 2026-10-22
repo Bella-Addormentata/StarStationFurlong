@@ -26,7 +26,9 @@ import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
-import { blobLaneNodeId, blobLaneReady, formatBytes, importBlob, nodeHolds, nodeReaches, refreshHeldBlobs, torrentLaneReady } from './blobLane';
+import {
+  blobLaneNodeId, blobLaneReady, forgetBlob, formatBytes, importBlob, nodeHolds, nodeLibrarySpace, nodeReaches, refreshHeldBlobs, torrentLaneReady,
+} from './blobLane';
 import {
   confirmTorrent, MAX_TORRENT_FILE, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile, stopTorrent,
   torrentLine, torrentOrigin, torrentRunning, torrentSource, torrentState,
@@ -356,6 +358,15 @@ function visibleTiles(): Tile[] {
  *  cannot be given its selection back), until a PLAY or SCHEDULE takes it. */
 let pickedFile: File | null = null;
 
+/** The remote's last word (feedback), kept across repaints for a while: a
+ *  repaint rebuilds the line, and a press that also repaints (GET AGAIN, 🗑)
+ *  must not lose what it said. */
+const FEEDBACK_MS = 20_000;
+let feedbackNote = { text: '', at: 0 };
+function feedbackNow(): string {
+  return feedbackNote.text && Date.now() - feedbackNote.at < FEEDBACK_MS ? feedbackNote.text : '';
+}
+
 /** 🧲 The .torrent file the TORRENT tile has chosen, kept like pickedFile
  *  until a START takes it; and the file picked from the node's list. */
 let pickedTorrent: File | null = null;
@@ -372,6 +383,8 @@ export const LIBRARY_PAGE = 8;
 let libraryFilter: LibraryFilter = 'all';
 let libraryQuery = '';
 let libraryShown = LIBRARY_PAGE;
+/** The row whose 🗑 was pressed once: a second press lets the file go. */
+let forgetArmed = '';
 
 /** What a library row is: a file from a node, a torrent's file, or a link. */
 export function libraryKind(e: Pick<TvLibraryEntry, 'source' | 'torrent'>): Exclude<LibraryFilter, 'all'> {
@@ -414,7 +427,7 @@ function whereabouts(e: TvLibraryEntry): Whereabouts {
   const holds = nodeHolds(e.source.hash);
   if (reach === null || holds === null) return 'unknown';
   if (holds) return 'mine';
-  if (e.source.provider === blobLaneNodeId()) return 'lost'; // names this node, which no longer holds it (a restart empties it)
+  if (e.source.provider === blobLaneNodeId()) return 'lost'; // names this node, which no longer holds it (let go, or made room)
   return reach ? 'theirs' : 'away';
 }
 
@@ -734,7 +747,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
         ${smallButton(`data-tv-play="${esc(tv.id)}"`, '▶ PLAY NOW')}
         ${SCHEDULE_CHOICES.map((c) => smallButton(`data-tv-schedule="${c.minutes}" data-tv-id="${esc(tv.id)}"`, `🕒 ${c.label}`)).join('')}
       </div>
-      <div id="tv-app-feedback" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;"></div>
+      <div id="tv-app-feedback" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;">${esc(feedbackNow())}</div>
       ${transport}
     </div>
     ${library}
@@ -813,11 +826,15 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     const again = e.torrent && canAgain && where !== 'mine'
       ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
       : '';
+    const forget = where === 'mine'
+      ? smallButton(`data-tv-lib-forget="${id}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
+      : '';
     return `<div style="display:flex; flex-direction:column; gap:2px; padding:4px 0; border-top:1px solid rgba(212,168,75,0.1);">
       <div class="phone-access-room-row">
         <span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" title="${esc(e.title)}">${icon} ${esc(e.title)}</span>
         ${refused ? `<span style="font-size:7px; color:${DIM}; font-weight:800;" title="${esc(refused)}">OFF HERE</span>` : ''}
         ${again}
+        ${forget}
         ${smallButton(`data-tv-lib-play="${id}" data-tv-id="${esc(tvId)}"`, '▶')}
       </div>
       <div style="font-size:8.5px; color:${DIM};">${esc(sourceLane(e.source))}${esc(size)} · ${e.plays > 1 ? `played ${e.plays}× · ` : ''}${esc(agoText(e.playedAt, wall))}${whereText ? ' · ' : ''}${whereText}</div>
@@ -828,8 +845,14 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     return `<button type="button" data-tv-lib-filter="${f.key}" style="padding:3px 7px; border-radius:10px; font-family:inherit; font-size:8.5px; font-weight:800; cursor:pointer;
       background:${on ? 'rgba(0,229,255,0.12)' : 'transparent'}; border:1px solid ${on ? CYAN : 'rgba(212,168,75,0.25)'}; color:${on ? CYAN : GOLD};">${f.label}</button>`;
   }).join('');
+  const space = nodeLibrarySpace();
+  const spaceLine = !space ? ''
+    : space.keep
+      ? `<div style="font-size:8.5px; color:${DIM};">Your node keeps its files across restarts: ${esc(formatBytes(space.kept))} of ${esc(formatBytes(space.quota))}. When it is full, the ones used longest ago make room.</div>`
+      : `<div style="font-size:8.5px; color:${DIM};">Your node lets its files go when it restarts (SSF_BLOB_KEEP=0).</div>`;
   return `<div class="phone-access-section">
     <div class="phone-access-header">📚 LIBRARY · ${all.length}</div>
+    ${spaceLine}
     <div style="display:flex; gap:4px; flex-wrap:wrap;">${chips}</div>
     <input type="text" data-tv-lib-search="1" value="${esc(libraryQuery)}" placeholder="find in the library" autocomplete="off" aria-label="Find in the library">
     ${list || `<div class="phone-access-note">Nothing here matches.</div>`}
@@ -893,6 +916,7 @@ let resolveGen = 0;
 
 function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   const feedback = (text: string) => {
+    feedbackNote = { text, at: Date.now() };
     const el = host.querySelector<HTMLElement>('#tv-app-feedback');
     if (el) el.textContent = text;
   };
@@ -1167,6 +1191,21 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'The node that shared it is not connected to yours'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
       : `Now on: ${entry.title}`);
     deps.openTheatre(id);
+  }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-forget]').forEach((b) => b.addEventListener('click', async () => {
+    const key = b.dataset.tvLibForget!;
+    if (forgetArmed !== key) {
+      forgetArmed = key;
+      feedback('Press 🗑 again to let your node\'s copy go. The library keeps the entry: ▶ then fetches it from whoever has it.');
+      renderTvPhoneApp(host, deps);
+      return;
+    }
+    forgetArmed = '';
+    const hash = key.startsWith('blob:') ? key.slice(5) : '';
+    const why = await forgetBlob(hash);
+    feedback(why ?? 'Your node let its copy go.');
+    void refreshHeldBlobs();
+    renderTvPhoneApp(host, deps);
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-again]').forEach((b) => b.addEventListener('click', async () => {
     const entry = libraryEntry(b.dataset.tvId!, b.dataset.tvLibAgain!);
