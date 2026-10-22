@@ -70,8 +70,12 @@ export const TV_NUDGE_RATE = 0.03;
 export const TV_HISTORY_MAX = 20;
 /** The room's library: the most entries it keeps (the oldest go first). */
 export const TV_LIBRARY_MAX = 200;
-/** The most `lib:` keys one read looks at: the map is peer-writable. */
+/** The most keys of the tv map one library read looks at: the map is peer-writable. */
 const LIBRARY_SCAN_MAX = 2_000;
+/** A library time further ahead of this page's clock than this is no
+ *  time at all (0): a peer's clock may run a little fast, but an entry
+ *  stamped in the far future would sort first and outlive every real play. */
+const LIBRARY_SKEW_MS = 10 * 60_000;
 export const TV_MAX_TITLE = 80;
 export const TV_MAX_URL = 2048;
 export const TV_MAX_NAME = 32;
@@ -994,11 +998,13 @@ function readLibraryEntry(key: string, raw: unknown): TvLibraryEntry | null {
   const r = raw as Record<string, unknown>;
   const source = sanitizeSource(r.source);
   if (!source || libraryKey(source) !== key) return null;
-  const playedAt = Math.max(0, num(r.playedAt));
+  const latest = wallClock() + LIBRARY_SKEW_MS;
+  const stamp = (v: number) => (v >= 0 && v <= latest ? v : 0);
+  const playedAt = stamp(num(r.playedAt));
   const entry: TvLibraryEntry = {
     source,
     title: str(r.title, TV_MAX_TITLE) || titleOf(source),
-    addedAt: Math.min(playedAt, Math.max(0, num(r.addedAt, playedAt))),
+    addedAt: Math.min(playedAt, stamp(num(r.addedAt, playedAt))),
     playedAt,
     plays: Math.max(1, Math.min(counter(r.plays), 1_000_000)),
   };
@@ -1016,8 +1022,9 @@ export function readLibrary(): TvLibraryEntry[] {
   const out: TvLibraryEntry[] = [];
   let seen = 0;
   for (const [key, raw] of map.entries()) {
-    if (!key.startsWith('lib:')) continue;
+    // Every key counts: a map padded with other keys bounds the read too.
     if (++seen > LIBRARY_SCAN_MAX) break;
+    if (!key.startsWith('lib:')) continue;
     const e = readLibraryEntry(key, raw);
     if (e) out.push(e);
   }

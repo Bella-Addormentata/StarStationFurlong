@@ -30,7 +30,7 @@ import {
   redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
-import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, refreshHolders } from './blobLane';
+import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, recheckBlob, refreshHolders } from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
 import { suspendStickKeys } from './freeFlightStick';
@@ -601,6 +601,9 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     if (!live()) return;
     unmountPlayer(t);
     t.mounted = `failed:${key}`;
+    // A file the node said it held but could not serve may have been let
+    // go since: RETRY asks the node again, and offers FETCH if it is gone.
+    if (source.kind === 'blob') recheckBlob(source.hash);
     showNotice(t, `<div>${escapeHtml(why)}</div>
       <div class="tv-theatre-lane">${escapeHtml(sourceLane(source))} LANE — nothing else in the room depends on it</div>
       <button type="button" data-tv-retry="1">RETRY</button>`);
