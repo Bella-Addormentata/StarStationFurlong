@@ -91,9 +91,55 @@ describe('craps chips by position', () => {
     const flatB = chips().find((s) => s.chips[0] === 1)!;
     expect(Math.hypot(flatA.x - flatB.x, flatA.z - flatB.z)).toBeGreaterThan(0.04);
     expect(odds.lift).toBe(2);
+    // Squarely on top: a heel would reach into a neighbour's stack.
+    expect(odds.x).toBeCloseTo(flatA.x, 9);
     expect(odds.z).toBeCloseTo(flatA.z, 9);
-    expect(odds.x).toBeGreaterThan(flatA.x); // heeled toward the +x end
-    expect(odds.x - flatA.x).toBeLessThan(0.021);
+  });
+
+  it('keeps a bettor who left the table clear of the seated players\' spots', () => {
+    writeMySeat(TABLE, 'player-a', seat(NEAR));
+    writeMySeat(TABLE, 'player-b', seat(END));
+    for (const pid of ['player-a', 'player-b', 'player-gone']) {
+      writeMyCrapsBets(TABLE, pid, [{ type: 'place', pick: 6, amount: 5 }, { type: 'anyseven', amount: 5 }]);
+    }
+    const { h, chips } = fakeTable('craps');
+    casinoTablesFrame(1 / 60, new Map([[TABLE, h]]));
+    const all = chips();
+    expect(all).toHaveLength(6); // nobody's live bet is hidden
+    for (let i = 0; i < all.length; i++) {
+      for (let j = i + 1; j < all.length; j++) {
+        expect(Math.hypot(all[i].x - all[j].x, all[i].z - all[j].z)).toBeGreaterThanOrEqual(0.042 - 1e-9);
+      }
+    }
+  });
+
+  it('never piles centre bets on each other, in stand order', () => {
+    // Every stand bets the 0.17 m-wide yo box.
+    stands.forEach((_, i) => {
+      writeMySeat(TABLE, `player-${i}`, seat(i));
+      writeMyCrapsBets(TABLE, `player-${i}`, [{ type: 'yo', amount: 5 }]);
+    });
+    const { h, chips } = fakeTable('craps');
+    casinoTablesFrame(1 / 60, new Map([[TABLE, h]]));
+    const all = chips();
+    expect(all).toHaveLength(stands.length);
+    // The box holds six stacks: the first six stands get one each.
+    const distinct = new Set(all.map((s) => `${s.x.toFixed(4)},${s.z.toFixed(4)}`));
+    expect(distinct.size).toBe(6);
+    // Two bettors always come out apart, whichever stands they are at.
+    bindCasinoDoc(new Y.Doc());
+    writeCrapsTableState(TABLE, {
+      kind: 'craps', phase: 'betting', round: 4, point: null, dice: null, result: null, resultAt: 0, payouts: null,
+      phaseDeadline: Date.now() + 10_000,
+    });
+    for (const i of [3, 4]) {
+      writeMySeat(TABLE, `player-${i}`, seat(i));
+      writeMyCrapsBets(TABLE, `player-${i}`, [{ type: 'yo', amount: 5 }]);
+    }
+    const two = fakeTable('craps');
+    casinoTablesFrame(1 / 60, new Map([[TABLE, two.h]]));
+    const [p, q] = two.chips();
+    expect(Math.hypot(p.x - q.x, p.z - q.z)).toBeGreaterThanOrEqual(0.042 - 1e-9);
   });
 });
 

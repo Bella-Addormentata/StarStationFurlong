@@ -217,8 +217,8 @@ function numberBands(n: number, side: -1 | 1) {
     bottom,
     top,
     middle: rect(box.x0, bottom.z1, box.x1, top.z0),
-    // Odds ride on top of the flat bet they back (see ODDS_HEEL), so the
-    // flat bet and its odds share one chip area.
+    // Odds ride on top of the flat bet they back, so the flat bet and its
+    // odds share one chip area.
     come: bottom,
     dontCome: top,
   };
@@ -509,20 +509,22 @@ export function chipSlots(r: FeltRect): FeltPoint[] {
 }
 
 /**
- * Give each player one stack position in a chip area: in player-id order,
- * each takes the free slot nearest the place they stand (`anchor`), so a
+ * Give each player one stack position in a chip area: in `rank` order (then
+ * player-id order), each takes the free slot nearest `anchor` (where they
+ * stand, or their spot in a dealer-set box), so a
  * player's chips sit in front of them the way a dealer would set them. A
  * player with no known spot takes the first free slot; when there are more
  * players than slots, the extra players share from the start again.
  */
 export function assignSlots(
   slots: readonly FeltPoint[],
-  players: ReadonlyArray<{ pid: string; anchor: FeltPoint | null }>,
+  players: ReadonlyArray<{ pid: string; anchor: FeltPoint | null; rank?: number }>,
 ): Map<string, FeltPoint> {
   const out = new Map<string, FeltPoint>();
   if (slots.length === 0) return out;
   const free = slots.map((_, i) => i);
-  const ordered = [...players].sort((a, b) => (a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : 0));
+  const ordered = [...players].sort((a, b) =>
+    (a.rank ?? Infinity) - (b.rank ?? Infinity) || (a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : 0));
   ordered.forEach((p, k) => {
     if (free.length === 0) {
       out.set(p.pid, slots[k % slots.length]);
@@ -602,10 +604,6 @@ export function dealerSpot(r: FeltRect, stand: FeltPoint, side: -1 | 0 | 1): Fel
   const ux = side < 0 ? 1 - u : u;
   return { x: along(r.x0, r.x1, ux), z: along(r.z0, r.z1, v) };
 }
-
-/** Craps odds on a travelled come / don't come bet: set on top of the flat
- *  bet, heeled this far toward the box's outer edge so they read apart. */
-export const ODDS_HEEL = CHIP_RADIUS * 0.6;
 
 /** The chip area a travelled come / don't come bet's odds share with it. */
 export function crapsOddsBaseRect(bet: CrapsSpot, side: -1 | 1): FeltRect | null {
