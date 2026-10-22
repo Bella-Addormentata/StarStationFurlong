@@ -204,8 +204,6 @@ export function crapsNumberBox(n: number, side: -1 | 1): FeltRect {
 
 /** Depth of a number box's bottom (come) and top (don't come) bands. */
 const NUM_BAND = 0.09;
-/** Width of the odds column at the inner edge of each band. */
-const ODDS_COL = 0.045;
 
 /** A number box's bands: travelled come bets and their odds at the bottom,
  *  place bets in the middle, travelled don't come bets, their lay odds (and
@@ -219,10 +217,10 @@ function numberBands(n: number, side: -1 | 1) {
     bottom,
     top,
     middle: rect(box.x0, bottom.z1, box.x1, top.z0),
-    come: rect(box.x0, box.z0, box.x1 - ODDS_COL, bottom.z1),
-    comeOdds: rect(box.x1 - ODDS_COL, box.z0, box.x1, bottom.z1),
-    dontCome: rect(box.x0, top.z0, box.x1 - ODDS_COL, box.z1),
-    dontComeOdds: rect(box.x1 - ODDS_COL, top.z0, box.x1, box.z1),
+    // Odds ride on top of the flat bet they back (see ODDS_HEEL), so the
+    // flat bet and its odds share one chip area.
+    come: bottom,
+    dontCome: top,
   };
 }
 
@@ -312,11 +310,11 @@ function crapsEnd(side: -1 | 1): FeltRegion<CrapsSpot>[] {
     });
     out.push({
       id: `comeodds:${n}@${tag}`, bet: { type: 'comeodds', pick: n }, rects: [b.bottom],
-      label: 'ODDS', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.comeOdds,
+      label: 'ODDS', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.come,
     });
     out.push({
       id: `dontcomeodds:${n}@${tag}`, bet: { type: 'dontcomeodds', pick: n }, rects: [b.top],
-      label: 'LAY', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.dontComeOdds,
+      label: 'LAY', fill: null, textSize: 0.022, faint: true, side: s, chipRect: b.dontCome,
     });
   }
   return out;
@@ -545,4 +543,82 @@ export function assignSlots(
     free.splice(best, 1);
   });
   return out;
+}
+
+// ── Dealer positions ─────────────────────────────────────────────────────────
+//
+// On a real craps table the dealers, not the players, set place bets and
+// travelled come / don't come bets in the number boxes, and the stickman sets
+// the centre bets. Each box is the table in miniature: a player's chips go at
+// the spot in the box that matches where they stand at the rail, the same
+// spot in every box, so the crew can tell whose chips are whose at a glance
+// (value chips all look alike). Roulette gets the same job done with colour
+// chips instead — see rouletteChipColor.
+
+/** How far from the table centre the craps rail positions reach along the
+ *  table (the long-rail corner stands at ±0.9, the end stands past ±1.8). */
+const CRAPS_REACH_X = 1.8;
+/** And across it (the long-rail stands at ±1.5). */
+const CRAPS_REACH_Z = 1.5;
+
+/** True for the craps bets the crew sets by player position (the number
+ *  boxes and the centre), false for the ones a player sets in front of
+ *  themselves (line, field, big 6/8, the come box itself). */
+export function crapsDealerPlaced(bet: CrapsSpot): boolean {
+  switch (bet.type) {
+    case 'place':
+    case 'comeodds':
+    case 'dontcomeodds':
+      return true;
+    case 'come':
+    case 'dontcome':
+      return bet.pick !== undefined;
+    default:
+      return CRAPS_LAYOUT.regions.some((r) => r.side === 0 && spotKey(r.bet) === spotKey(bet));
+  }
+}
+
+/**
+ * Where a dealer sets a player's stack inside `r`: the player's stand
+ * (table-local) scaled down into the box. Along the table the box runs from
+ * the table centre (its inner edge) to the end (its outer edge) on the
+ * player's own end (`side` ±1), or across the whole table for the centre
+ * bets (`side` 0); across the table, the −z rail is the box's −z edge. The
+ * stack stays wholly inside the box, and a box too small for that gets it
+ * centred.
+ */
+export function dealerSpot(r: FeltRect, stand: FeltPoint, side: -1 | 0 | 1): FeltPoint {
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  const u = side === 0
+    ? clamp01((stand.x / CRAPS_REACH_X + 1) / 2)
+    : clamp01((stand.x * side) / CRAPS_REACH_X);
+  const v = clamp01((stand.z / CRAPS_REACH_Z + 1) / 2);
+  const along = (lo: number, hi: number, t: number) => {
+    const a = lo + CHIP_RADIUS;
+    const b = hi - CHIP_RADIUS;
+    return a >= b ? (lo + hi) / 2 : a + (b - a) * t;
+  };
+  // The −1 end reads its box from the outer (−x) edge in, so mirror there.
+  const ux = side < 0 ? 1 - u : u;
+  return { x: along(r.x0, r.x1, ux), z: along(r.z0, r.z1, v) };
+}
+
+/** Craps odds on a travelled come / don't come bet: set on top of the flat
+ *  bet, heeled this far toward the box's outer edge so they read apart. */
+export const ODDS_HEEL = CHIP_RADIUS * 0.6;
+
+/** The chip area a travelled come / don't come bet's odds share with it. */
+export function crapsOddsBaseRect(bet: CrapsSpot, side: -1 | 1): FeltRect | null {
+  if ((bet.type !== 'comeodds' && bet.type !== 'dontcomeodds') || bet.pick === undefined) return null;
+  return crapsChipRect({ type: bet.type === 'comeodds' ? 'come' : 'dontcome', pick: bet.pick }, side);
+}
+
+/** Roulette colour chips, one colour per standing position (the wheel head
+ *  first), none of them the felt's red, black or green. */
+export const ROULETTE_CHIP_COLORS = ['#F2C14E', '#4EA8F2', '#F25EB0', '#9B6BF2', '#F28C38', '#5EE0D0'] as const;
+
+/** The colour of the chips a player at stand `stand` plays at roulette. */
+export function rouletteChipColor(stand: number): string {
+  const n = ROULETTE_CHIP_COLORS.length;
+  return ROULETTE_CHIP_COLORS[((stand % n) + n) % n];
 }

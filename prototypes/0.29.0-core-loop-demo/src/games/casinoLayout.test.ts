@@ -12,7 +12,13 @@ import {
   CRAPS_LAYOUT,
   CRAPS_NUMBERS,
   crapsChipRect,
+  crapsDealerPlaced,
   crapsNumberBox,
+  crapsOddsBaseRect,
+  dealerSpot,
+  CHIP_RADIUS,
+  ROULETTE_CHIP_COLORS,
+  rouletteChipColor,
   crapsPuckSpot,
   hitRegion,
   hitSettings,
@@ -101,11 +107,12 @@ describe('the craps felt', () => {
         expect(at(box.z0 + 0.02)).toBe(`comeodds:${n}@${tag}`);
         expect(at((box.z0 + box.z1) / 2)).toBe(`place:${n}@${tag}`);
         expect(at(box.z1 - 0.02)).toBe(`dontcomeodds:${n}@${tag}`);
-        // Odds chips stack beside the come / don't come chips they back.
+        // Odds chips ride on the come / don't come chips they back.
         for (const t of ['come', 'dontcome'] as const) {
           const flat = crapsChipRect({ type: t, pick: n }, side)!;
           const o = crapsChipRect({ type: t === 'come' ? 'comeodds' : 'dontcomeodds', pick: n }, side)!;
-          expect(overlaps(flat, o)).toBe(false);
+          expect(o).toEqual(flat);
+          expect(crapsOddsBaseRect({ type: t === 'come' ? 'comeodds' : 'dontcomeodds', pick: n }, side)).toEqual(flat);
           expect(o.x0 >= box.x0 && o.x1 <= box.x1 + 1e-9 && o.z0 >= box.z0 - 1e-9 && o.z1 <= box.z1 + 1e-9).toBe(true);
         }
       }
@@ -183,6 +190,91 @@ describe('chip slots', () => {
       { pid: 'b', anchor: null },
     ]);
     expect(got.size).toBe(2);
+  });
+});
+
+describe('dealer positions', () => {
+  // The craps stands (furniture.ts crapsStands), stickman first.
+  const stands = [
+    { x: 0, z: 1.5 }, { x: -0.9, z: 1.5 }, { x: 0.9, z: 1.5 },
+    { x: -0.9, z: -1.5 }, { x: 0, z: -1.5 }, { x: 0.9, z: -1.5 },
+    { x: -2, z: 0 }, { x: 2, z: 0 },
+  ];
+  const sideOf = (p: { x: number }) => (p.x < 0 ? -1 : 1) as -1 | 1;
+
+  it('sets the number boxes and the centre by position, line bets by the player', () => {
+    expect(crapsDealerPlaced({ type: 'place', pick: 6 })).toBe(true);
+    expect(crapsDealerPlaced({ type: 'come', pick: 6 })).toBe(true);
+    expect(crapsDealerPlaced({ type: 'dontcome', pick: 4 })).toBe(true);
+    expect(crapsDealerPlaced({ type: 'comeodds', pick: 6 })).toBe(true);
+    expect(crapsDealerPlaced({ type: 'hard', pick: 8 })).toBe(true);
+    expect(crapsDealerPlaced({ type: 'yo' })).toBe(true);
+    for (const type of ['pass', 'passodds', 'dontpass', 'field', 'big6', 'come', 'dontcome'] as const) {
+      expect(crapsDealerPlaced({ type }), type).toBe(false);
+    }
+  });
+
+  it('gives every player a stack spot of their own inside each box', () => {
+    const boxes: Array<{ r: FeltRect; side: -1 | 0 | 1 }> = [];
+    for (const side of [-1, 1] as const) {
+      for (const n of CRAPS_NUMBERS) {
+        for (const type of ['place', 'come', 'dontcome'] as const) {
+          boxes.push({ r: crapsChipRect({ type, pick: n }, side)!, side });
+        }
+      }
+    }
+    for (const rg of CRAPS_LAYOUT.regions) if (rg.side === 0) boxes.push({ r: rg.chipRect, side: 0 });
+    for (const { r, side } of boxes) {
+      const here = stands.filter((p) => side === 0 || sideOf(p) === side);
+      const spots = here.map((p) => dealerSpot(r, p, side));
+      for (const q of spots) {
+        expect(q.x - CHIP_RADIUS).toBeGreaterThanOrEqual(r.x0 - 1e-9);
+        expect(q.x + CHIP_RADIUS).toBeLessThanOrEqual(r.x1 + 1e-9);
+        expect(q.z - CHIP_RADIUS).toBeGreaterThanOrEqual(r.z0 - 1e-9);
+        expect(q.z + CHIP_RADIUS).toBeLessThanOrEqual(r.z1 + 1e-9);
+      }
+      // On the number boxes the stacks of one end never pile on each other.
+      if (side !== 0) {
+        for (let i = 0; i < spots.length; i++) {
+          for (let j = i + 1; j < spots.length; j++) {
+            const d = Math.hypot(spots[i].x - spots[j].x, spots[i].z - spots[j].z);
+            expect(d).toBeGreaterThan(CHIP_RADIUS * 2 - 0.001);
+          }
+        }
+      }
+    }
+  });
+
+  it('is the table in miniature: near rail low, far rail high, the end at the outer edge', () => {
+    for (const side of [-1, 1] as const) {
+      const r = crapsChipRect({ type: 'place', pick: 6 }, side)!;
+      const near = dealerSpot(r, { x: 0.9 * side, z: -1.5 }, side);
+      const far = dealerSpot(r, { x: 0.9 * side, z: 1.5 }, side);
+      const end = dealerSpot(r, { x: 2 * side, z: 0 }, side);
+      expect(near.z).toBeLessThan(far.z);
+      expect(Math.abs(end.x)).toBeGreaterThan(Math.abs(near.x));
+      expect(near.x).toBeCloseTo(far.x);
+    }
+    // The same spot in every box: place 4 and place 10 put a player at the
+    // same corner of each.
+    const at = (n: number) => {
+      const r = crapsChipRect({ type: 'place', pick: n }, 1)!;
+      const q = dealerSpot(r, { x: 2, z: 0 }, 1);
+      return { dx: q.x - r.x0, dz: q.z - r.z0 };
+    };
+    expect(at(4).dx).toBeCloseTo(at(10).dx, 9);
+    expect(at(4).dz).toBeCloseTo(at(10).dz, 9);
+  });
+
+  it('rides odds on the bet they back', () => {
+    expect(crapsOddsBaseRect({ type: 'comeodds', pick: 5 }, 1)).toEqual(crapsChipRect({ type: 'come', pick: 5 }, 1));
+    expect(crapsOddsBaseRect({ type: 'passodds' }, 1)).toBeNull();
+  });
+
+  it('gives every roulette stand a colour of its own, none the felt\'s', () => {
+    expect(new Set([0, 1, 2, 3, 4, 5].map(rouletteChipColor)).size).toBe(6);
+    for (const c of ROULETTE_CHIP_COLORS) expect(['#000000', '#7A1E1E', '#C8102E']).not.toContain(c);
+    expect(rouletteChipColor(6)).toBe(rouletteChipColor(0));
   });
 });
 

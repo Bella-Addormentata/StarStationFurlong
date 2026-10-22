@@ -45,8 +45,13 @@ export interface FeltStack {
   x: number;
   z: number;
   chips: number[];
-  /** Another player's chips: drawn a little darker so yours stand out. */
+  /** Another player's chips: drawn a little darker so yours stand out
+   *  (value chips only — colour chips already say whose they are). */
   dim: boolean;
+  /** Chips already under this stack (odds riding on a flat bet). */
+  lift?: number;
+  /** Roulette colour chips: the owner's colour (the value stays printed). */
+  color?: string;
 }
 
 /** Where a player's chip rail runs: centred at (x, z), along one axis. */
@@ -80,6 +85,9 @@ export interface CasinoTableVisualHandle {
   setRailStacks(stacks: readonly RailStack[]): void;
   /** Chips you are holding, floating over the felt at `p` (null / [] hides). */
   setHand(p: FeltPoint | null, chips: readonly number[]): void;
+  /** Draw your rail and hand as colour chips of this colour (roulette), or
+   *  as value chips (null). */
+  setOwnChipColor(color: string | null): void;
   /** Light up felt regions by id (winners, the rolled number). */
   setHighlight(ids: ReadonlySet<string>): void;
   /** Glow the ⚙️ button (pointer over it). */
@@ -345,9 +353,13 @@ const POOL_DENOMS = [1, 5, 25, 100, 500, 1000] as const;
 /** Starting chips per denomination (felt + rail + hand together); a pool
  *  that fills doubles, so every chip on the table always renders. */
 const CHIP_POOL = 360;
+/** Colour chips start smaller: only roulette tables have them (and grow). */
+const COLOR_CHIP_POOL = 120;
+/** Colour ("wheel") chips are drawn white and tinted per instance with their
+ *  owner's colour, so the stripes come out a shade darker than the body. */
+const COLOR_CHIP_STYLE = { body: '#FFFFFF', stripe: '#A8A8A8', text: '#1A1A1A' };
 
-function chipFaceCanvas(denom: number): HTMLCanvasElement {
-  const s = CHIP_STYLE[denom] ?? CHIP_STYLE[1];
+function chipFaceCanvas(denom: number, s = CHIP_STYLE[denom] ?? CHIP_STYLE[1]): HTMLCanvasElement {
   const cv = document.createElement('canvas');
   cv.width = cv.height = 128;
   const c = cv.getContext('2d')!;
@@ -375,8 +387,7 @@ function chipFaceCanvas(denom: number): HTMLCanvasElement {
   return cv;
 }
 
-function chipSideCanvas(denom: number): HTMLCanvasElement {
-  const s = CHIP_STYLE[denom] ?? CHIP_STYLE[1];
+function chipSideCanvas(denom: number, s = CHIP_STYLE[denom] ?? CHIP_STYLE[1]): HTMLCanvasElement {
   const cv = document.createElement('canvas');
   cv.width = 128;
   cv.height = 8;
@@ -388,6 +399,10 @@ function chipSideCanvas(denom: number): HTMLCanvasElement {
   return cv;
 }
 
+/** A pool's key: the denomination for value chips, its negative for colour
+ *  chips. */
+const colorPool = (d: number) => -d;
+
 class ChipPools {
   private readonly meshes = new Map<number, THREE.InstancedMesh>();
   private readonly used = new Map<number, number>();
@@ -398,8 +413,11 @@ class ChipPools {
   private readonly dim = new THREE.Color(0.62, 0.62, 0.62);
   private readonly lit = new THREE.Color(1, 1, 1);
   private readonly up = new THREE.Vector3(0, 1, 0);
+  private readonly tint = new THREE.Color();
 
-  constructor(ctx: PiecesCtx) {
+  /** `colorChips`: also make the colour-chip pools (roulette only). Every
+   *  pool is made here, at build time, so World files it with the table. */
+  constructor(ctx: PiecesCtx, colorChips = false) {
     const geo = new THREE.CylinderGeometry(CHIP_RADIUS, CHIP_RADIUS, CHIP_H, 24);
     for (const d of POOL_DENOMS) {
       const side = solidCanvas(chipSideCanvas(d));
@@ -409,6 +427,13 @@ class ChipPools {
       const mesh = this.makeMesh(geo, [side, face, face], CHIP_POOL);
       ctx.attach(mesh);
       this.meshes.set(d, mesh);
+      if (colorChips) {
+        const cSide = solidCanvas(chipSideCanvas(d, COLOR_CHIP_STYLE));
+        const cFace = solidCanvas(chipFaceCanvas(d, COLOR_CHIP_STYLE));
+        const cMesh = this.makeMesh(geo, [cSide, cFace, cFace], COLOR_CHIP_POOL);
+        ctx.attach(cMesh);
+        this.meshes.set(colorPool(d), cMesh);
+      }
     }
   }
 
@@ -445,30 +470,32 @@ class ChipPools {
   }
 
   begin(): void {
-    for (const d of POOL_DENOMS) this.used.set(d, 0);
+    for (const key of this.meshes.keys()) this.used.set(key, 0);
   }
 
-  /** Add one chip lying flat at (x, y, z) — y is the chip's bottom face. */
-  add(denom: number, x: number, y: number, z: number, spin: number, dim: boolean): void {
+  /** Add one chip lying flat at (x, y, z) — y is the chip's bottom face. A
+   *  `color` draws it as that colour's chip instead of the value chip. */
+  add(denom: number, x: number, y: number, z: number, spin: number, dim: boolean, color?: string): void {
     const d = (POOL_DENOMS as readonly number[]).includes(denom) ? denom : 1;
-    const i = this.used.get(d) ?? 0;
-    let mesh = this.meshes.get(d)!;
-    if (i >= mesh.instanceMatrix.count) mesh = this.grow(d);
+    const key = color && this.meshes.has(colorPool(d)) ? colorPool(d) : d;
+    const i = this.used.get(key) ?? 0;
+    let mesh = this.meshes.get(key)!;
+    if (i >= mesh.instanceMatrix.count) mesh = this.grow(key);
     this.q.setFromAxisAngle(this.up, spin);
     this.pos.set(x, y + CHIP_H / 2, z);
     this.m4.compose(this.pos, this.q, this.one);
     mesh.setMatrixAt(i, this.m4);
-    mesh.setColorAt(i, dim ? this.dim : this.lit);
-    this.used.set(d, i + 1);
+    mesh.setColorAt(i, key < 0 ? this.tint.set(color!) : dim ? this.dim : this.lit);
+    this.used.set(key, i + 1);
   }
 
   /** A stack, bottom chip first, starting at height y. */
-  stack(chips: readonly number[], x: number, y: number, z: number, dim: boolean, seed: number): void {
+  stack(chips: readonly number[], x: number, y: number, z: number, dim: boolean, seed: number, color?: string): void {
     chips.forEach((d, i) => {
       // A dealer's stack is never perfectly square: a hair of jitter.
       const jx = Math.sin((seed + i) * 12.9898) * 0.0012;
       const jz = Math.cos((seed + i) * 78.233) * 0.0012;
-      this.add(d, x + jx, y + i * CHIP_H, z + jz, (seed * 0.7 + i * 1.3) % (Math.PI * 2), dim);
+      this.add(d, x + jx, y + i * CHIP_H, z + jz, (seed * 0.7 + i * 1.3) % (Math.PI * 2), dim, color);
     });
   }
 
@@ -1217,13 +1244,13 @@ interface Common {
   plaque: { set(fair: boolean): void };
 }
 
-function buildCommon<B>(ctx: PiecesCtx, layout: FeltLayout<B>, halfX: number, halfZ: number, decor: Parameters<typeof makeFeltCanvas>[1], plaqueAt: 'right' | 'front'): Common {
+function buildCommon<B>(ctx: PiecesCtx, layout: FeltLayout<B>, halfX: number, halfZ: number, decor: Parameters<typeof makeFeltCanvas>[1], plaqueAt: 'right' | 'front', colorChips = false): Common {
   const felt = makeFeltCanvas(layout, decor);
   const f = layout.felt;
   const geo = new THREE.PlaneGeometry(f.x1 - f.x0, f.z1 - f.z0);
   geo.rotateX(-Math.PI / 2);
   const feltMesh = ctx.place(geo, felt.mat, (f.x0 + f.x1) / 2, FELT_Y, (f.z0 + f.z1) / 2);
-  const pools = new ChipPools(ctx);
+  const pools = new ChipPools(ctx, colorChips);
   // An invisible collar over the whole padded rail: the pickup's hit box.
   const railGroup = new THREE.Group();
   railGroup.visible = false;
@@ -1289,6 +1316,7 @@ class TableHandle implements CasinoTableVisualHandle {
   private feltStacks: readonly FeltStack[] = [];
   private rail: readonly RailStack[] = [];
   private hand: { p: FeltPoint; chips: readonly number[] } | null = null;
+  private ownColor: string | undefined;
   private dirty = true;
   private highlightKey = '';
   private highlightIds: ReadonlySet<string> = new Set();
@@ -1357,6 +1385,12 @@ class TableHandle implements CasinoTableVisualHandle {
     this.dirty = true;
   }
 
+  setOwnChipColor(color: string | null): void {
+    if ((color ?? undefined) === this.ownColor) return;
+    this.ownColor = color ?? undefined;
+    this.dirty = true;
+  }
+
   setHighlight(ids: ReadonlySet<string>): void {
     const key = [...ids].sort().join('|');
     if (key === this.highlightKey) return;
@@ -1405,7 +1439,7 @@ class TableHandle implements CasinoTableVisualHandle {
       if (Math.hypot(s.x - p.x, s.z - p.z) <= r) return true;
       if (!g) return false;
       a.set(s.x, FELT_Y, s.z);
-      b.set(s.x, FELT_Y + s.chips.length * CHIP_H, s.z);
+      b.set(s.x, FELT_Y + ((s.lift ?? 0) + s.chips.length) * CHIP_H, s.z);
       g.localToWorld(a);
       g.localToWorld(b);
       return ray.ray.distanceSqToSegment(a, b) <= CHIP_RADIUS * CHIP_RADIUS;
@@ -1460,13 +1494,14 @@ class TableHandle implements CasinoTableVisualHandle {
   private rebuildChips(): void {
     const pools = this.c.pools;
     pools.begin();
-    this.feltStacks.forEach((s, i) => pools.stack(s.chips, s.x, FELT_Y + 0.001, s.z, s.dim, i * 7 + 3));
+    this.feltStacks.forEach((s, i) =>
+      pools.stack(s.chips, s.x, FELT_Y + 0.001 + (s.lift ?? 0) * CHIP_H, s.z, s.dim, i * 7 + 3, s.color));
     this.rail.forEach((s, i) => {
-      if (s.count > 0) pools.stack(new Array(s.count).fill(s.denom), s.x, RAIL_Y, s.z, false, 101 + i);
+      if (s.count > 0) pools.stack(new Array(s.count).fill(s.denom), s.x, RAIL_Y, s.z, false, 101 + i, this.ownColor);
     });
     if (this.hand) {
       const chips = [...this.hand.chips].sort((a, b) => b - a);
-      pools.stack(chips, this.hand.p.x, FELT_Y + 0.05, this.hand.p.z, false, 211);
+      pools.stack(chips, this.hand.p.x, FELT_Y + 0.05, this.hand.p.z, false, 211, this.ownColor);
     }
     pools.commit();
   }
@@ -1498,7 +1533,7 @@ export function buildCrapsPieces(ctx: PiecesCtx, halfX: number, halfZ: number): 
 
 /** The roulette table's moving parts (see buildCrapsPieces). */
 export function buildRoulettePieces(ctx: PiecesCtx, halfX: number, halfZ: number): CasinoTableVisualHandle {
-  const c = buildCommon(ctx, ROULETTE_LAYOUT as FeltLayout<RouletteSpot>, halfX, halfZ, rouletteDecor, 'front');
+  const c = buildCommon(ctx, ROULETTE_LAYOUT as FeltLayout<RouletteSpot>, halfX, halfZ, rouletteDecor, 'front', true);
   const wheel = new RouletteWheel(ctx);
   const handle = new TableHandle('roulette', halfX, halfZ, c, null, [], wheel);
   c.feltMesh.userData.casinoTable = handle;

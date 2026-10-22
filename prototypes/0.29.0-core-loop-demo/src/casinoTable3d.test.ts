@@ -61,6 +61,51 @@ describe('the craps table chips', () => {
     expect(chipsDrawn(group)).toBeLessThan(1000);
   });
 
+  it('draws roulette colour chips tinted, and odds lifted onto their flat bet', () => {
+    const tops = (group: THREE.Group) => {
+      const out: Array<{ y: number; color: THREE.Color }> = [];
+      const m = new THREE.Matrix4();
+      const p = new THREE.Vector3();
+      group.traverse((o) => {
+        const mesh = o as THREE.InstancedMesh;
+        if (!mesh.isInstancedMesh) return;
+        for (let i = 0; i < mesh.count; i++) {
+          mesh.getMatrixAt(i, m);
+          p.setFromMatrixPosition(m);
+          const color = new THREE.Color();
+          mesh.getColorAt(i, color);
+          out.push({ y: p.y, color });
+        }
+      });
+      return out;
+    };
+    const handleOf = (group: THREE.Group) => {
+      let handle: CasinoTableVisualHandle | null = null;
+      group.traverse((o) => {
+        if (o.userData.casinoTable) handle = o.userData.casinoTable as CasinoTableVisualHandle;
+      });
+      return handle as unknown as CasinoTableVisualHandle;
+    };
+    const roulette = buildItemGroup({ id: 'roulette-1', kind: 'roulette-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    const r = handleOf(roulette);
+    r.setFeltChips([{ x: 0, z: 0, chips: [5], dim: true, color: '#4EA8F2' }]);
+    r.update(0);
+    const [chip] = tops(roulette);
+    expect(chip.color.getHexString()).toBe(new THREE.Color('#4EA8F2').getHexString());
+
+    const craps = buildItemGroup({ id: 'craps-2', kind: 'craps-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    const c = handleOf(craps);
+    c.setFeltChips([
+      { x: 0.8, z: 0.2, chips: [5, 5, 5], dim: false },
+      { x: 0.81, z: 0.2, chips: [25], dim: false, lift: 3 },
+    ]);
+    c.update(0);
+    const ys = tops(craps).map((t) => t.y).sort((a, b) => a - b);
+    expect(ys).toHaveLength(4);
+    // The odds chip sits on top of the three flat chips, not on the felt.
+    expect(ys[3] - ys[2]).toBeGreaterThan(0.005);
+  });
+
   it('keeps small chips on a crowded rail', () => {
     const rail = railStacks({ x: 0, z: -0.48, axis: 'x', len: 0.62 }, railChipCounts(123456));
     const denoms = new Set(rail.map((s) => s.denom));

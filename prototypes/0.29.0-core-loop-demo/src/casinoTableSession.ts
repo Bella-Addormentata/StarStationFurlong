@@ -49,10 +49,11 @@ import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import {
-  assignSlots, chipSlots, crapsChipRect, crapsSideFor, CRAPS_LAYOUT, hitRegion,
-  hitSettings, LAY_PAYS, nearestInDirection, ODDS_PAYS, regionCenter, ROULETTE_LAYOUT, spotKey,
+  assignSlots, chipSlots, crapsChipRect, crapsDealerPlaced, crapsOddsBaseRect, crapsSideFor, CRAPS_LAYOUT,
+  dealerSpot, hitRegion, hitSettings, LAY_PAYS, nearestInDirection, ODDS_HEEL, ODDS_PAYS, regionCenter,
+  rouletteChipColor, ROULETTE_LAYOUT, spotKey,
 } from './games/casinoLayout';
-import type { FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
+import type { CrapsSpot, FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
 import {
   canPlaceBet, crapsBetLabel, isOddsType, MAX_LAY_MULTIPLE, MAX_ODDS_MULTIPLE, oddsFlat, oddsRoom, pointWasOn,
 } from './games/craps';
@@ -189,8 +190,6 @@ function markAllDirty(): void {
  *  those dice alone (the focused UI moves them under the cursor). */
 const localHold = new Set<string>();
 
-/** Bets laid out as stacks: one per player per box, each in front of its
- *  owner (assignSlots), bottom chip the largest. */
 /** Render bounds on what peers wrote to the room doc: the bet guards accept
  *  any positive stake and any list length, and the felt must never expand one
  *  wild record into millions of chips. Settlement still sees the real bets. */
@@ -216,13 +215,35 @@ function chipsUpTo(amount: number, max: number): number[] {
   return out;
 }
 
+/** Where one bet's chips go. */
+export interface ChipPlan {
+  /** The chip area. */
+  rect: FeltRect;
+  /** The spot a dealer sets this player's stack at (by where they stand), or
+   *  absent for a bet the player sets in front of themselves. */
+  spot?: FeltPoint;
+  /** Odds riding on a flat bet: that bet's spotKey (same rect), and how far
+   *  along x the odds sit heeled off it. */
+  rideOn?: { key: string; heel: number };
+}
+
+/** Bets laid out as stacks: one per player per box, bottom chip the largest.
+ *  A dealer-set bet goes at its owner's spot; any other bet takes the free
+ *  slot nearest its owner (assignSlots). Odds sit on top of their flat bet. */
 function layoutStacks<B extends { type: string; pick?: number; amount: number }>(
   betsByPlayer: Record<string, B[]>,
   anchors: Map<string, FeltPoint>,
-  rectFor: (bet: B, pid: string) => FeltRect | null,
+  planFor: (bet: B, pid: string) => ChipPlan | null,
   me: string,
+  colorFor: (pid: string) => string | undefined = () => undefined,
 ): FeltStack[] {
-  const groups = new Map<string, { rect: FeltRect; chips: Map<string, number[]> }>();
+  const groupKey = (key: string, r: FeltRect) => `${key}|${r.x0.toFixed(3)},${r.z0.toFixed(3)}`;
+  const groups = new Map<string, {
+    rect: FeltRect;
+    chips: Map<string, number[]>;
+    spots: Map<string, FeltPoint>;
+    rideOn?: ChipPlan['rideOn'];
+  }>();
   const pidOrder = Object.keys(betsByPlayer).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   let budget = MAX_TABLE_CHIPS;
   for (const pid of pidOrder) {
@@ -231,14 +252,15 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
     if (budget <= 0 && !mine) continue;
     for (const b of bets.slice(0, MAX_BETS_DRAWN_PER_PLAYER)) {
       if (budget <= 0 && !mine) break;
-      const rect = rectFor(b, pid);
-      if (!rect) continue;
-      const key = `${spotKey(b)}|${rect.x0.toFixed(3)},${rect.z0.toFixed(3)}`;
+      const plan = planFor(b, pid);
+      if (!plan) continue;
+      const key = groupKey(spotKey(b), plan.rect);
       let g = groups.get(key);
       if (!g) {
-        g = { rect, chips: new Map() };
+        g = { rect: plan.rect, chips: new Map(), spots: new Map(), rideOn: plan.rideOn };
         groups.set(key, g);
       }
+      if (plan.spot) g.spots.set(pid, plan.spot);
       const list = g.chips.get(pid) ?? [];
       if (list.length >= MAX_STACK_CHIPS) continue;
       // One chip per bet record when it's a real chip; any other stake (an
@@ -250,17 +272,61 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
       g.chips.set(pid, list);
     }
   }
+  // Where each group's stacks stand: dealer spots as given, the rest in the
+  // free slots nearest their owners.
+  const placed = new Map<string, Map<string, FeltPoint>>();
+  for (const [key, g] of groups) {
+    const at = new Map(g.spots);
+    const loose = [...g.chips.keys()].filter((pid) => !at.has(pid));
+    if (loose.length > 0) {
+      const got = assignSlots(chipSlots(g.rect), loose.map((pid) => ({ pid, anchor: anchors.get(pid) ?? null })));
+      for (const [pid, p] of got) at.set(pid, p);
+    }
+    placed.set(key, at);
+  }
   const out: FeltStack[] = [];
-  for (const g of groups.values()) {
-    const pids = [...g.chips.keys()];
-    const at = assignSlots(chipSlots(g.rect), pids.map((pid) => ({ pid, anchor: anchors.get(pid) ?? null })));
-    for (const pid of pids) {
-      const slot = at.get(pid);
-      if (!slot) continue;
-      out.push({ x: slot.x, z: slot.z, chips: [...g.chips.get(pid)!].sort((a, b) => b - a), dim: pid !== me });
+  for (const [key, g] of groups) {
+    const at = placed.get(key)!;
+    const under = g.rideOn ? groups.get(groupKey(g.rideOn.key, g.rect)) : undefined;
+    const underAt = g.rideOn ? placed.get(groupKey(g.rideOn.key, g.rect)) : undefined;
+    for (const [pid, chips] of g.chips) {
+      let p = at.get(pid);
+      let lift = 0;
+      const base = underAt?.get(pid);
+      if (base && g.rideOn) {
+        p = { x: base.x + g.rideOn.heel, z: base.z };
+        lift = under!.chips.get(pid)?.length ?? 0;
+      }
+      if (!p) continue;
+      const stack: FeltStack = { x: p.x, z: p.z, chips: [...chips].sort((a, b) => b - a), dim: pid !== me };
+      if (lift > 0) stack.lift = lift;
+      const color = colorFor(pid);
+      if (color) stack.color = color;
+      out.push(stack);
     }
   }
   return out;
+}
+
+/** Where a craps bet's chips go for a player standing at `stand` (or nowhere
+ *  known). The number boxes and the centre are set by the crew at the
+ *  player's position; odds on a travelled come / don't come ride on it. */
+export function crapsChipPlan(b: CrapsSpot, stand: FeltPoint | null): ChipPlan | null {
+  const side = crapsSideFor(stand?.x ?? 1);
+  const base = crapsOddsBaseRect(b, side);
+  if (base) {
+    const flat = { type: b.type === 'comeodds' ? 'come' : 'dontcome', pick: b.pick } as CrapsSpot;
+    return {
+      rect: base,
+      spot: stand ? dealerSpot(base, stand, side) : undefined,
+      rideOn: { key: spotKey(flat), heel: ODDS_HEEL * side },
+    };
+  }
+  const rect = crapsChipRect(b, side);
+  if (!rect) return null;
+  if (!stand || !crapsDealerPlaced(b)) return { rect };
+  const centre = CRAPS_LAYOUT.regions.some((r) => r.side === 0 && spotKey(r.bet) === spotKey(b));
+  return { rect, spot: dealerSpot(rect, stand, centre ? 0 : side) };
 }
 
 /** Felt boxes a settled craps roll paid (lit once the dice are down). Place
@@ -351,7 +417,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
       h.setFeltChips(layoutStacks(
         readAllCrapsBets(id),
         anchors,
-        (b: CrapsBet, pid) => crapsChipRect(b, crapsSideFor(anchors.get(pid)?.x ?? 1)),
+        (b: CrapsBet, pid) => crapsChipPlan(b, anchors.get(pid) ?? null),
         me,
       ));
       h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1], pointWasOn(s)) : NO_HIGHLIGHT);
@@ -377,13 +443,20 @@ function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime,
     h.wheelRest(s.phase === 'settled' ? s.result : null);
     if (rt.dirty) {
       rt.dirty = false;
-      const anchors = seatAnchors('roulette-table', readSeats(id));
+      const seats = readSeats(id);
+      const anchors = seatAnchors('roulette-table', seats);
       const regionFor = new Map(ROULETTE_LAYOUT.regions.map((r) => [spotKey(r.bet), r.chipRect]));
+      // Roulette players set their own chips, often in the same box, so each
+      // plays chips of their stand's own colour rather than a dealer's spot.
       h.setFeltChips(layoutStacks(
         readAllBets(id, s.round),
         anchors,
-        (b: RouletteBet) => regionFor.get(spotKey(b)) ?? null,
+        (b: RouletteBet) => {
+          const rect = regionFor.get(spotKey(b));
+          return rect ? { rect } : null;
+        },
         me,
+        (pid) => (seats[pid] ? rouletteChipColor(seats[pid].stand) : undefined),
       ));
       h.setHighlight(s.phase === 'settled' && s.result !== null ? rouletteWinners(s.result) : NO_HIGHLIGHT);
     }
@@ -456,6 +529,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const h = deps.visual;
   const stand = deps.stand !== null ? standLocal(kind, deps.stand) : null;
   const rail = h && stand ? railFor(stand, h.halfX, h.halfZ) : null;
+  // At roulette your rail and hand are your stand's colour chips, the colour
+  // your bets show in on the felt.
+  h?.setOwnChipColor(game === 'roulette' && deps.stand !== null ? rouletteChipColor(deps.stand) : null);
   const ray = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
 
