@@ -59,6 +59,8 @@ import {
 } from "./coinPusherReplay";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
 import { createArcadeScreenPainter } from "./arcadeScreen";
+import { CASHIER_SCREEN_H, CASHIER_SCREEN_W, paintCashierAttract, paintCashierMenu } from "./cashierScreen";
+import type { CashierScreenHandle } from "./cashierScreen";
 // 📺 The cabinets' curved CRT tube and its screen shader (#194).
 import { crtFaceGeometry, crtScreenMaterial, crtTick } from "./arcadeCrt";
 // 🏒 #115: the table sculpt is sized by the SAME playfield constants the pure
@@ -5116,8 +5118,10 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       kind: "cashier",
       front: { x: 0, z: -1.0 },
       faceAngle: 0,
-      eye: { x: 0, y: 1.5, z: -0.9 },
-      anchor: { x: 0, y: 1.3, z: 0 },
+      // Back far enough, and looking low enough, that the whole screen and
+      // the keypad's ⚙ under it are in view (the menu is played on it).
+      eye: { x: 0, y: 1.55, z: -1.0 },
+      anchor: { x: 0, y: 1.15, z: 0 },
     },
   },
   // 🥣 Faucet dish (#231 onboarding): the Chia faucet coin as furniture. Same
@@ -6870,7 +6874,7 @@ function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
 // ── 🎰 Casino fixtures (#69 G1/G2) — cashier ATM + roulette table ────────────
 // Canvas-textured faces follow the game-table idiom: MeshBasicMaterial with
 // transparent + opacity 0 so the morph fade-in machinery raises them with
-// everything else. The cashier UI lives in devices.ts (createCashierUI); the tables play in 3D
+// everything else. The cashier plays on its own screen (cashierScreen.ts + cashierSession.ts); the tables play in 3D
 // (casinoTable3d.ts + casinoTableSession.ts, #226).
 
 /** Cashier sign face: 'CASHIER · CHIPS' gold on dark with a chip pip. */
@@ -6892,25 +6896,7 @@ function drawCashierSign(c2d: CanvasRenderingContext2D): void {
   c2d.fillText("· CHIPS ·", W / 2, 88);
 }
 
-/** Cashier screen face: idle attract loop, drawn once (static in-world). */
-function drawCashierScreen(c2d: CanvasRenderingContext2D): void {
-  const W = 256,
-    H = 192;
-  c2d.fillStyle = "#06121C";
-  c2d.fillRect(0, 0, W, H);
-  c2d.fillStyle = "#0E2A38";
-  c2d.fillRect(8, 8, W - 16, H - 16);
-  c2d.fillStyle = "#00E5FF";
-  c2d.font = "bold 24px monospace";
-  c2d.textAlign = "center";
-  c2d.fillText("BUY-IN", W / 2, 56);
-  c2d.fillText("CASH OUT", W / 2, 92);
-  c2d.fillStyle = "#F0C060";
-  c2d.font = "16px monospace";
-  c2d.fillText("WALK UP TO BEGIN", W / 2, 146);
-}
-
-function buildCashierAtm({ m, flat, place }: BuildCtx) {
+function buildCashierAtm({ m, flat, place, itemId }: BuildCtx) {
   // Plinth + kiosk body (station-steel family).
   place(
     new THREE.BoxGeometry(0.9, 0.12, 0.6),
@@ -6932,16 +6918,20 @@ function buildCashierAtm({ m, flat, place }: BuildCtx) {
     m(0x0a0e1a, 0.5, 0.5),
     0,
     1.32,
-    -0.24,
+    -0.3, // proud of the body front, so the tilted top isn't buried in it
   );
   bezel.rotation.x = 0.24;
+  // 🏧 The screen is live: idle it shows the attract card; at the machine,
+  // cashierSession.ts paints the buy-in / cash-out menu on it and picks the
+  // pressed button from the ray's UV (the handle below).
   const screenCv = document.createElement("canvas");
-  screenCv.width = 256;
-  screenCv.height = 192;
-  drawCashierScreen(screenCv.getContext("2d")!);
+  screenCv.width = CASHIER_SCREEN_W;
+  screenCv.height = CASHIER_SCREEN_H;
+  const screenCtx = screenCv.getContext("2d")!;
+  paintCashierAttract(screenCtx);
   const screenTex = new THREE.CanvasTexture(screenCv);
-  screenTex.minFilter = THREE.NearestFilter;
-  screenTex.magFilter = THREE.NearestFilter;
+  screenTex.minFilter = THREE.LinearFilter;
+  screenTex.magFilter = THREE.LinearFilter;
   screenTex.generateMipmaps = false;
   screenTex.colorSpace = THREE.SRGBColorSpace;
   const screen = place(
@@ -6953,10 +6943,22 @@ function buildCashierAtm({ m, flat, place }: BuildCtx) {
     }),
     0,
     1.325,
-    -0.285,
+    -0.345,
   );
   screen.rotation.x = 0.24;
   screen.rotation.y = Math.PI; // face -z
+  const screenHandle: CashierScreenHandle = {
+    paint(view) {
+      if (view) paintCashierMenu(screenCtx, view);
+      else paintCashierAttract(screenCtx);
+      screenTex.needsUpdate = true;
+    },
+    pick(ray) {
+      const uv = ray.intersectObject(screen, false)[0]?.uv;
+      return uv ? { x: uv.x * CASHIER_SCREEN_W, y: (1 - uv.y) * CASHIER_SCREEN_H } : null;
+    },
+  };
+  screen.userData.cashierScreen = screenHandle;
   // Keypad shelf + chip tray.
   const pad = place(
     new THREE.BoxGeometry(0.5, 0.26, 0.09),
@@ -6965,7 +6967,7 @@ function buildCashierAtm({ m, flat, place }: BuildCtx) {
     0.98,
     -0.27,
   );
-  pad.rotation.x = -0.5;
+  pad.rotation.x = 0.5; // face up toward the player, like an ATM keypad
   place(
     new THREE.BoxGeometry(0.5, 0.06, 0.18),
     m(0xd4a84b, 0.45, 0.5),
@@ -7014,6 +7016,13 @@ function buildCashierAtm({ m, flat, place }: BuildCtx) {
   sign.rotation.y = Math.PI; // face -z
   // Status pip.
   place(new THREE.SphereGeometry(0.03, 8, 6), flat(0x00e676), 0.3, 0.72, -0.28);
+  // ⚙ One settings gear (settingsGear.ts) on the keypad's face, under the
+  // screen, so it is in view at the machine: the cage's public ledger, for
+  // anyone to read. Stood facing −z, then tilted back with the keypad.
+  for (const gear of addSettingsGear(place, m, 0.15, 0.975, -0.326, 0.035, Math.PI)) {
+    gear.rotation.x = 0.5;
+    gear.userData.settingsGear = itemId;
+  }
 }
 
 // ── 🥣 Faucet dish (#231 onboarding) — a self-filling dog dish for mojos. ────
