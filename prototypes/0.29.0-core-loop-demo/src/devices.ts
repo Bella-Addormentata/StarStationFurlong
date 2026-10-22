@@ -644,6 +644,10 @@ export interface ArcadeCabinetVisualHandle {
   present(): void;
   /** Back to the idle attract card (the player stepped away). */
   showAttract(): void;
+  /** The picture's size in game pixels, for the tube's scanlines (a
+   *  cabinet's own game; showAttract puts the NES's back). Absent where the
+   *  tube's lines are fixed. */
+  setPictureLines?(w: number, h: number): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────

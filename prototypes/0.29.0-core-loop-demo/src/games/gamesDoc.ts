@@ -33,6 +33,10 @@ import type { AlligatorsState } from './alligators';
 import type { RoomOwnerKey } from '../treasuryView';
 import { isArcadeMatch, isArcadeSnapshot, snapshotKey } from './arcade';
 import type { ArcadeMatch, ArcadeSnapshot } from './arcade';
+import {
+  NATIVE_MAX_SEATS, isNativeMatch, isNativeSeat, isNativeSnapshot, nativeSeatKey, nativeSnapshotKey,
+} from './nativeArcade';
+import type { NativeMatch, NativeSeat, NativeSnapshot } from './nativeArcade';
 
 /** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`,
  *  air hockey `kind: 'airhockey'` (#115) and insatiable alligators
@@ -186,6 +190,63 @@ export function writeArcadeSnapshot(cabinetId: string, snapshot: ArcadeSnapshot)
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(snapshotKey(cabinetId), snapshot);
+  });
+}
+
+/** 🕹🕹 A cabinet's own game (games/nativeArcade.ts), or null. */
+export function readNativeArcade(cabinetId: string): NativeMatch | null {
+  const value = ensureMap().get(cabinetId);
+  return isNativeMatch(value) ? value : null;
+}
+
+/** 🕹🕹 Every cabinet's own game in the room, by cabinet id. */
+export function readNativeArcadeMatches(): ReadonlyMap<string, NativeMatch> {
+  const out = new Map<string, NativeMatch>();
+  ensureMap().forEach((value, key) => {
+    if (isNativeMatch(value)) out.set(key, value);
+  });
+  return out;
+}
+
+/** 🕹🕹 Start, change or (null) end a cabinet's own game. Ending also drops
+ *  its seats and its save state. */
+export function writeNativeArcade(cabinetId: string, match: NativeMatch | null): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    if (match) {
+      map.set(cabinetId, match);
+      return;
+    }
+    map.delete(cabinetId);
+    map.delete(nativeSnapshotKey(cabinetId));
+    for (let n = 0; n < NATIVE_MAX_SEATS; n++) map.delete(nativeSeatKey(cabinetId, n));
+  });
+}
+
+/** 🕹🕹 A guest's seat at a cabinet's own game, or null. */
+export function readNativeSeat(cabinetId: string, seat: number): NativeSeat | null {
+  const value = ensureMap().get(nativeSeatKey(cabinetId, seat));
+  return isNativeSeat(value) ? value : null;
+}
+
+/** 🕹🕹 Take (or, null, give back) a seat: the page taking it writes it. */
+export function writeNativeSeat(cabinetId: string, seat: number, record: NativeSeat | null): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    if (record) map.set(nativeSeatKey(cabinetId, seat), record);
+    else map.delete(nativeSeatKey(cabinetId, seat));
+  });
+}
+
+export function readNativeSnapshot(cabinetId: string): NativeSnapshot | null {
+  const value = ensureMap().get(nativeSnapshotKey(cabinetId));
+  return isNativeSnapshot(value) ? value : null;
+}
+
+export function writeNativeSnapshot(cabinetId: string, snapshot: NativeSnapshot): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(nativeSnapshotKey(cabinetId), snapshot);
   });
 }
 

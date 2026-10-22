@@ -199,6 +199,7 @@ function recordingPainter() {
     drawCredits: vi.fn(),
     drawCard: vi.fn(),
     drawAttract: vi.fn(),
+    drawWith: vi.fn(),
   } satisfies ArcadeScreenPainter;
 }
 

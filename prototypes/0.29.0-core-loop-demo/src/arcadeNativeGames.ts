@@ -1,0 +1,69 @@
+/**
+ * 🕹🕹 The arcade's OWN games: written for SSF in TypeScript, not ROMs, so
+ * they draw straight onto a cabinet's screen at whatever shape it is (the
+ * double-wide cabinet's two tubes make one 8:3 screen) and seat as many
+ * players as the cabinet has panels. Each is a pure, deterministic game
+ * (create, step on the pads, fingerprint, restore from a save) and a
+ * painter; arcadeNativeSession.ts runs it for the room the way
+ * arcadeNesSession.ts runs a ROM: only pad bytes travel.
+ *
+ * They are the app's own code, under the app's licence, so the cabinet's
+ * credits pages (the bundled ROMs' licences) don't list them.
+ */
+
+import {
+  LR_SEATS, LR_VIEW_H, LR_VIEW_W, checkLanternRoad, createLanternRoad, restoreLanternRoad, stepLanternRoad,
+  type LrState,
+} from './games/lanternRoad';
+import { paintLanternRoad, paintLanternRoadTitle } from './lanternRoadPaint';
+
+export interface NativeGame<S = unknown> {
+  /** Stable id: what a cabinet's record names (arcadeDoc `bundled`). */
+  id: string;
+  title: string;
+  /** One line for the cabinet menu: what you do. */
+  blurb: string;
+  /** One line for the cabinet menu: which buttons. */
+  controls: string;
+  /** Seats: one per control panel it is played from. */
+  seats: number;
+  /** The picture in game pixels: the tube draws a scanline per row. */
+  lines: readonly [number, number];
+  /** The game at its first frame. Every copy gets the same seed. */
+  create(seed: number): S;
+  /** One frame on every seat's pad (seat 0 first). Mutates the state. */
+  step(state: S, pads: readonly number[]): void;
+  /** A 6-bit fingerprint: copies in step compare these. */
+  check(state: S): number;
+  /** A save state as a peer sent it (JSON), or null if it isn't one. */
+  restore(raw: unknown): S | null;
+  /** Draw the state onto the screen canvas, `w`×`h`. */
+  paint(ctx: CanvasRenderingContext2D, state: S, w: number, h: number): void;
+  /** The idle cabinet: the title, and `line` while `blink` is on. */
+  paintTitle(ctx: CanvasRenderingContext2D, line: string, blink: boolean, w: number, h: number): void;
+}
+
+const LANTERN_ROAD: NativeGame<LrState> = {
+  id: 'lantern-road',
+  title: 'LANTERN ROAD',
+  blurb: 'Up to four friends walk the night street to the shrine.',
+  controls: 'ARROWS WALK · X JUMP · Z STAFF · DOWN+X DROP',
+  seats: LR_SEATS,
+  lines: [LR_VIEW_W, LR_VIEW_H],
+  create: createLanternRoad,
+  step: stepLanternRoad,
+  check: checkLanternRoad,
+  restore: restoreLanternRoad,
+  paint: paintLanternRoad,
+  paintTitle: paintLanternRoadTitle,
+};
+
+export const NATIVE_GAMES: readonly NativeGame[] = [LANTERN_ROAD as unknown as NativeGame];
+
+export function nativeGameById(id: string | null | undefined): NativeGame | null {
+  return (id && NATIVE_GAMES.find((g) => g.id === id)) || null;
+}
+
+/** Pad bit the session sets on every seat somebody holds (SELECT's bit:
+ *  a native game never reads SELECT as a button). */
+export const NATIVE_PRESENT = 1 << 2;

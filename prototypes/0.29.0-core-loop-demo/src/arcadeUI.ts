@@ -32,16 +32,20 @@
 import type { DeviceUI } from './devices';
 import {
   builtInEntry, builtInGame, cabinetKey, coreForName, coreLabel, gameLane, iAmP1, insertCoin, mayEjectP1, maySit,
-  mySeat, parseRomUrl, putOnCabinet, readCabinet, readSeat, seatHolders, seatKey, seatLapsed,
+  mySeat, nativeEntry, parseRomUrl, putOnCabinet, readCabinet, readSeat, seatHolders, seatKey, seatLapsed,
   setEmulatorData, standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_CORES, ARCADE_MAX_NAME,
   isArcadeCore,
 } from './arcadeDoc';
 import type { ArcadeCore, ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES as BUILT_IN_GAMES, LICENSE_LABEL } from './arcadeLibrary';
+import { NATIVE_GAMES } from './arcadeNativeGames';
 import { rememberLocalRom, romAcceptList, EMULATOR_FETCH_COMMAND } from './arcadeEmulator';
 import { heldRom, holdRom, sha256Hex, ROM_SHARE_MAX_BYTES } from './arcadeRomShare';
 import type { ArcadeMatch } from './games/arcade';
-import { readArcade, readPlayerDisplayName, subscribeGames, writeArcade } from './games/gamesDoc';
+import {
+  readArcade, readNativeArcade, readNativeSeat, readPlayerDisplayName, subscribeGames, writeArcade, writeNativeArcade,
+} from './games/gamesDoc';
+import { seatIsFor } from './games/nativeArcade';
 import { getPlayerId } from './identity';
 import { urlConsent, urlRefusal } from './tvConsent';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
@@ -192,12 +196,18 @@ function draftGame(): { game: ArcadeGame; file: File | null } | { error: string 
 
 function gameRow(g: ArcadeGame): string {
   return `<span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;">${esc(g.name)}</span>
-    <span style="font-size:9px; color:${DIM}; white-space:nowrap;">${g.bundled ? 'NES · BUILT-IN' : esc(coreLabel(g.core))}</span>
+    <span style="font-size:9px; color:${DIM}; white-space:nowrap;">${nativeEntry(g) ? `OWN GAME · ${nativeEntry(g)!.seats} PLAYERS` : g.bundled ? 'NES · BUILT-IN' : esc(coreLabel(g.core))}</span>
     ${laneBadge(gameLane(g))}`;
 }
 
 /** Under a game: where it plays, and a built-in game's credits. */
 function gameNote(g: ArcadeGame, seats = 1): string {
+  if (nativeEntry(g)) {
+    const where = seats === 4
+      ? 'Made for this cabinet: plays across both screens as one wide picture, a player at each of the four stands, each on their own computer; the room watches.'
+      : 'Made for the double-wide cabinet: it does not play on this one.';
+    return `<div style="font-size:9px; color:${DIM}; line-height:1.4;">${where}</div>`;
+  }
   const lib = builtInEntry(g);
   const where = lib
     ? 'Plays on the cabinet\'s screen with the built-in emulator; the room watches, and the two-player cabinet seats two.'
@@ -249,6 +259,7 @@ export function matchPlayers(m: ArcadeMatch, seats: 1 | 2, me: string): Array<{ 
  *  holder's EJECT), or nothing. */
 function resettable(itemId: string, seats = 1): 'match' | 'seat' | null {
   const game = readCabinet(itemId).game;
+  if (nativeEntry(game)) return readNativeArcade(itemId) ? 'match' : null;
   if (game?.bundled) return readArcade(itemId) ? 'match' : null;
   if (seats === 4) {
     // It frees every stand or none: without EJECT (the deed holder's), only
@@ -268,7 +279,21 @@ function nowPlaying(itemId: string, deps: ArcadeDeviceDeps, owner: boolean): str
   const game = readCabinet(itemId).game;
   const line = (text: string) => `<div style="font-size:10px; color:${GOLD_BRIGHT}; line-height:1.5;">${text}</div>`;
   let lines: string;
-  if (game?.bundled) {
+  const own = nativeEntry(game);
+  if (own) {
+    const m = readNativeArcade(itemId);
+    const me = getPlayerId();
+    const name = (id: string) => (id === me ? 'YOU' : esc(readPlayerDisplayName(id).toUpperCase()));
+    lines = m
+      ? Array.from({ length: own.seats }, (_, n) => {
+        const seat = n === m.hostSeat ? null : readNativeSeat(itemId, n);
+        const who = n === m.hostSeat ? name(m.host)
+          : seat && seatIsFor(seat, m) ? name(seat.player)
+            : `<span style="color:${DIM};">OPEN · STEP UP TO STAND ${n + 1}</span>`;
+        return line(`<span style="color:${PLAYER_TONES[n]};">PLAYER ${n + 1}</span> · ${who}`);
+      }).join('')
+      : line('Nobody · step up to a stand and press Enter to play.');
+  } else if (game?.bundled) {
     const m = readArcade(itemId);
     lines = m
       // A built-in game seats two at the two-player cabinet; elsewhere its
@@ -306,7 +331,8 @@ export function resetArcadeCabinet(itemId: string, owner: boolean, seats = 1): s
   if (!owner) return null;
   const what = resettable(itemId, seats);
   if (what === 'match') {
-    writeArcade(itemId, null);
+    if (nativeEntry(readCabinet(itemId).game)) writeNativeArcade(itemId, null);
+    else writeArcade(itemId, null);
     return 'The game ended · the cabinet is free.';
   }
   if (what === 'seat' && seats === 4) {
@@ -408,8 +434,20 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
       ${owner && game ? smallButton('data-arcade-takeoff="1"', '⏏ TAKE IT OFF') : ''}
     </div>`;
 
-  // The owner's pick, one of two kinds: a free game the app ships, on the
-  // built-in emulator…
+  // The owner's pick: the double-wide cabinet's own games, made for it…
+  const ownGames = owner && deps.seats === 4 ? section('MADE FOR THIS CABINET · 4 PLAYERS', `
+    <div style="font-size:9px; color:${DIM}; line-height:1.4;">Games written for the double-wide cabinet: both screens as one wide picture, a player at each stand, and the room watches.</div>
+    ${NATIVE_GAMES.map((own) => {
+      const on = game?.bundled === own.id;
+      return `<div style="display:flex; gap:6px; align-items:center; font-size:11px;">
+        <span style="color:${GOLD_BRIGHT}; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(own.title)}</span>
+        <span style="font-size:9px; color:${DIM}; white-space:nowrap;">1–${own.seats} PLAYERS</span>
+        ${smallButton(`data-arcade-builtin="${esc(own.id)}"`, on ? '✓ ON' : '▶ PUT ON', !on, on)}
+      </div>`;
+    }).join('')}
+  `) : '';
+
+  // …a free game the app ships, on the built-in emulator…
   const builtIn = owner ? section('FREE GAMES · BUILT-IN EMULATOR', `
     <div style="font-size:9px; color:${DIM}; line-height:1.4;">Ship with the game, play on the cabinet's screen, and the room watches. Players just walk up and press play.</div>
     ${BUILT_IN_GAMES.map((lib) => {
@@ -463,6 +501,7 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
     </div>
     ${section('ON THE CABINET · ONE GAME', onCabinet)}
     ${nowPlaying(itemId, deps, owner)}
+    ${ownGames}
     ${builtIn}
     ${load}
     ${section('EMULATORJS FILES', `${files}<div style="font-size:9px; color:${DIM}; line-height:1.4;">${emulatorFilesText(lanesOn)}</div>`)}

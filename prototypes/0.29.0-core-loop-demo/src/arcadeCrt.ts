@@ -181,12 +181,15 @@ const CRT_MAP_FRAGMENT = /* glsl */ `
  *
  * `span` lets a row of tubes act as one screen: tube `index` of `count`
  * shows its slice of the picture, and the picture's margin of unlit glass
- * runs round the row's outside edges only.
+ * runs round the row's outside edges only. `lines`, when given, is the
+ * scanline count as a uniform the caller keeps (and the row's tubes share),
+ * for a screen whose picture changes size: set it and every tube follows.
  */
 export function crtScreenMaterial(
   texture: THREE.Texture,
   look: CrtLook = ARCADE_CRT_LOOK,
   span: { index: number; count: number } = { index: 0, count: 1 },
+  lines: { value: THREE.Vector2 } = { value: new THREE.Vector2(...look.lines) },
 ): THREE.MeshBasicMaterial {
   const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0, toneMapped: false });
   material.userData.baseOpacity = 1;
@@ -196,7 +199,7 @@ export function crtScreenMaterial(
     // Across a row the side margins are the row's, not each tube's.
     shader.uniforms.uCrtInset = { value: new THREE.Vector2(1 - (1 - look.inset[0]) / span.count, look.inset[1]) };
     shader.uniforms.uCrtSpan = { value: new THREE.Vector2(span.index / span.count, 1 / span.count) };
-    shader.uniforms.uCrtLines = { value: new THREE.Vector2(...look.lines) };
+    shader.uniforms.uCrtLines = lines;
     shader.uniforms.uCrtWarp = { value: look.warp };
     shader.uniforms.uCrtScan = { value: look.scan };
     shader.uniforms.uCrtGlow = { value: look.glow };
