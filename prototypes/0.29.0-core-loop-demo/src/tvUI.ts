@@ -26,7 +26,8 @@ import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
-import { blobLaneNodeId, blobLaneReady, formatBytes, importBlob } from './blobLane';
+import { blobLaneNodeId, blobLaneReady, formatBytes, importBlob, torrentLaneReady } from './blobLane';
+import { refreshTorrentState, startTorrent, stopTorrent, torrentLine, torrentSource, torrentState } from './torrentLane';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -326,7 +327,7 @@ const TILES: Tile[] = [
   { key: 'archive', icon: '🏛️', label: 'ARCHIVE.ORG', lane: 'CONVENIENCE', hint: 'paste a details/ or download/ link — public-domain films', live: true },
   { key: 'url', icon: '🔗', label: 'URL', lane: 'CONVENIENCE', hint: 'paste a direct link to an mp4 / webm', live: true },
   { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'a video or audio file from this computer — your node hands it to the room, and each viewer presses FETCH (mp4 / webm play best)', live: true },
-  { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'a magnet or .torrent, fetched by the host node', live: false },
+  { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'paste a magnet — your node downloads its video from the public swarm, then hands it to the room like a FILE (viewers never join the swarm)', live: true },
   { key: 'karaoke', icon: '🎤', label: 'KARAOKE', lane: 'SOVEREIGN', hint: 'MP3+G, with the mic on the audio lane', live: false },
 ];
 
@@ -338,7 +339,10 @@ function visibleTiles(): Tile[] {
   // nowhere to put the file for the room to take it from.
   const tiles = TILES.map((t) => t.key === 'file' && !blobLaneReady()
     ? { ...t, live: false, hint: 'needs this station\'s node (the desktop app) running here: the file goes from your node to theirs' }
-    : t);
+    // 🧲 TORRENT needs a node built with the torrent lane (torrentLane.ts).
+    : t.key === 'magnet' && !torrentLaneReady()
+      ? { ...t, live: false, hint: 'needs this station\'s node (the desktop app), built with torrents, running here: it downloads, then hands the file to the room' }
+      : t);
   if (convenienceLanesEnabled()) return tiles;
   return tiles.filter((t) => sourceKindAllowed(t.key)).map((t) => t.key === 'url'
     ? { ...t, lane: 'SOVEREIGN', hint: `paste a link to an mp4 / webm on this station's node or your own origin — ${SERVERLESS_ONLY}` }
@@ -623,7 +627,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       display:flex; flex-direction:column; align-items:center; gap:3px; padding:8px 4px;
       background:${on ? 'rgba(0,229,255,0.12)' : 'rgba(10,14,34,0.9)'}; border:1px solid ${on ? CYAN : 'rgba(212,168,75,0.18)'};
       border-radius:10px; color:${t.live ? GOLD_BRIGHT : DIM}; font-family:inherit; font-size:8.5px; font-weight:800; cursor:${t.live ? 'pointer' : 'default'};">
-      <span style="font-size:16px;">${t.icon}</span><span>${t.label}</span>${laneBadge(t.lane)}${t.live ? '' : `<span style="font-size:7px; color:${DIM};">${t.key === 'file' ? 'NEEDS YOUR NODE' : 'NOT YET PROVISIONED'}</span>`}
+      <span style="font-size:16px;">${t.icon}</span><span>${t.label}</span>${laneBadge(t.lane)}${t.live ? '' : `<span style="font-size:7px; color:${DIM};">${t.key === 'file' || t.key === 'magnet' ? 'NEEDS YOUR NODE' : 'NOT YET PROVISIONED'}</span>`}
     </button>`;
   }).join('');
   const tile = offered.find((t) => t.key === activeTile) ?? offered[0]!;
@@ -664,7 +668,8 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       ${tile.key === 'file'
         ? `<input type="file" data-tv-file="1" accept="video/*,audio/*" aria-label="Choose a file">
            <div style="font-size:9.5px; color:${GOLD_BRIGHT};">${pickedFile ? `CHOSEN: ${esc(pickedFile.name)} · ${esc(formatBytes(pickedFile.size))}` : 'no file chosen yet'}</div>`
-        : `<input type="text" data-tv-paste="1" placeholder="${esc(tile.key === 'youtube' ? 'https://www.youtube.com/watch?v=…' : tile.key === 'archive' ? 'https://archive.org/details/…' : 'https://…/film.mp4')}" autocomplete="off" aria-label="Paste a link">`}
+        : `<input type="text" data-tv-paste="1" placeholder="${esc(tile.key === 'youtube' ? 'https://www.youtube.com/watch?v=…' : tile.key === 'archive' ? 'https://archive.org/details/…' : tile.key === 'magnet' ? 'magnet:?xt=urn:btih:…' : 'https://…/film.mp4')}" autocomplete="off" aria-label="${tile.key === 'magnet' ? 'Paste a magnet link' : 'Paste a link'}">`}
+      ${tile.key === 'magnet' ? torrentBlock() : ''}
       <div style="display:flex; gap:6px; flex-wrap:wrap;">
         ${smallButton(`data-tv-play="${esc(tv.id)}"`, '▶ PLAY NOW')}
         ${SCHEDULE_CHOICES.map((c) => smallButton(`data-tv-schedule="${c.minutes}" data-tv-id="${esc(tv.id)}"`, `🕒 ${c.label}`)).join('')}
@@ -677,6 +682,43 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <div class="phone-access-header">HAND THE REMOTE TO…</div>
       ${handToBlock(deps, tv.id)}
     </div>`;
+}
+
+/** 🧲 The TORRENT tile's own controls: the notice, START / STOP, and the
+ *  node's progress (kept current by `pollTorrent` without a repaint). */
+function torrentBlock(): string {
+  const st = torrentState();
+  const running = st.state === 'metadata' || st.state === 'downloading' || st.state === 'importing';
+  return `<div class="phone-access-note" style="color:${GOLD};">⚠️ BitTorrent shares pieces of the file with other people while it downloads, from this computer's internet address, and stops when the file is whole. Paste only what you may share — openly licensed films like Sintel or Big Buck Bunny.</div>
+    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+      ${running ? smallButton('data-tv-torrent-stop="1"', '⏹ STOP DOWNLOAD') : smallButton('data-tv-torrent-start="1"', '🧲 START')}
+    </div>
+    <div data-tv-torrent-status="1" style="font-size:9.5px; color:${GOLD_BRIGHT}; min-height:12px; line-height:1.4;">${esc(torrentLine(st, formatBytes))}</div>`;
+}
+
+/** While a TORRENT tile is on screen, ask the node once a second and write
+ *  the line in place; repaint only when START/STOP should swap. Stops
+ *  itself once no tile is showing. */
+let torrentPoll: ReturnType<typeof setInterval> | null = null;
+function pollTorrent(host: HTMLElement, deps: TvPhoneDeps): void {
+  if (torrentPoll) return;
+  const running = (s: string) => s === 'metadata' || s === 'downloading' || s === 'importing';
+  void refreshTorrentState();
+  torrentPoll = setInterval(() => {
+    const el = host.querySelector<HTMLElement>('[data-tv-torrent-status]');
+    if (!el || !host.classList.contains('active')) {
+      clearInterval(torrentPoll!);
+      torrentPoll = null;
+      return;
+    }
+    const before = torrentState().state;
+    void refreshTorrentState().then((st) => {
+      const now = host.querySelector<HTMLElement>('[data-tv-torrent-status]');
+      if (!now) return;
+      if (running(before) !== running(st.state)) renderTvPhoneApp(host, deps);
+      else now.textContent = torrentLine(st, formatBytes);
+    });
+  }, 1_000);
 }
 
 /** Why THIS build would refuse to play `source` — the words for the feedback
@@ -739,7 +781,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     // the clone walks on until the key is pressed again.
     if (e.key === 'Tab') return;
     e.stopPropagation();
-    if (e.key === 'Enter') host.querySelector<HTMLButtonElement>('[data-tv-play]')?.click();
+    if (e.key === 'Enter') host.querySelector<HTMLButtonElement>(activeTile === 'magnet' ? '[data-tv-torrent-start]' : '[data-tv-play]')?.click();
   });
 
   /** The box's link as a source, with the TEXT it was read from: an archive
@@ -752,6 +794,21 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     // lookup land its film after the refusal was shown.
     const gen = ++resolveGen;
     if (activeTile === 'file') return sourceFromFile(id, gen);
+    if (activeTile === 'magnet') {
+      // 🧲 PLAY takes the finished download, never the pasted magnet: the
+      // room record only ever names the blob it became.
+      const source = torrentSource();
+      if (!source) {
+        const st = torrentState();
+        feedback(st.state === 'complete'
+          ? 'That download was for another room — paste the magnet again here.'
+          : st.state === 'metadata' || st.state === 'downloading' || st.state === 'importing'
+          ? 'The download is not finished yet — PLAY NOW puts it on the TV once it is.'
+          : 'Paste a magnet and press 🧲 START first; PLAY NOW takes the file once it is downloaded.');
+        return null;
+      }
+      return { source, text: '' };
+    }
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
     if (!parsed) {
@@ -817,6 +874,26 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     if (pickedFile === file) pickedFile = null;
     return { source, text: '' };
   };
+  host.querySelector<HTMLButtonElement>('[data-tv-torrent-start]')?.addEventListener('click', async () => {
+    const box = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+    const text = box?.value ?? '';
+    feedback('Handing the magnet to your node…');
+    const why = await startTorrent(text);
+    if (why) {
+      feedback(why);
+      return;
+    }
+    feedback('');
+    const live = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
+    if (live && live.value === text) live.value = '';
+    renderTvPhoneApp(host, deps);
+  });
+  host.querySelector<HTMLButtonElement>('[data-tv-torrent-stop]')?.addEventListener('click', async () => {
+    const why = await stopTorrent();
+    if (why) feedback(why);
+    renderTvPhoneApp(host, deps);
+  });
+  if (host.querySelector('[data-tv-torrent-status]')) pollTorrent(host, deps);
   host.querySelector<HTMLInputElement>('[data-tv-file]')?.addEventListener('change', (e) => {
     pickedFile = (e.target as HTMLInputElement).files?.[0] ?? null;
     renderTvPhoneApp(host, deps);

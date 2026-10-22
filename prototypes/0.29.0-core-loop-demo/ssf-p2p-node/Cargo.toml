@@ -105,6 +105,12 @@ sha2 = { version = "0.10", optional = true }
 # pinned to the exact version iroh-base already locks, so no second copy of the
 # curve lands in the binary (Windows-GNU export-ordinal budget, see above).
 curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false, optional = true }
+# 🧲 `torrent` feature only (torrent_lane.rs). rust-tls keeps OpenSSL out
+# (its SHA-1 is ring's); its reqwest brings aws-lc-rs, so main.rs names ring
+# as rustls' process default. `url` turns the blocklist path into the file://
+# URL librqbit loads it from.
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"], optional = true }
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 # The tests' mock full node builds a header block, whose BLS fields need the
@@ -136,3 +142,14 @@ chia-publish = [
 ]
 # Back-compat alias: `--features chia-lane` keeps meaning "the whole lane".
 chia-lane = ["chia-publish"]
+# 🧲 The TV's TORRENT tile (torrent_lane.rs, media plan §6): librqbit with the
+# forked client-only DHT (vendor/librqbit-dht). Never in a strict build.
+torrent = ["dep:librqbit", "dep:rustls", "dep:url"]
+
+# Two librqbit 9.0.1 crates, forked for the `torrent` feature (unused without
+# it); each one's SSF-FORK.md says what changed. The DHT carries the media
+# plan's §6 rules (client-only, global unicast only); the tracker client binds
+# IPv4 when a host has IPv6 off (trackers stay off either way).
+[patch.crates-io]
+librqbit-dht = { path = "vendor/librqbit-dht" }
+librqbit-tracker-comms = { path = "vendor/librqbit-tracker-comms" }

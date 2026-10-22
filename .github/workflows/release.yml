@@ -383,7 +383,9 @@ jobs:
         run: |
           # One node binary (#231 D3): chain reads are in the default build and
           # publishing is compiled in too, behind the SSF_CHIA_LANE=1 runtime toggle.
-          cargo build --release --features chia-publish --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
+          # 🧲 The TV's torrent lane too (torrent_lane.rs): it opens no socket
+          # until the remote's holder presses START on a pasted magnet.
+          cargo build --release --features chia-publish,torrent --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
           triple=$(rustc -vV | sed -n 's/^host: //p')
           mkdir -p "$RELEASE_FRONTEND/src-tauri/binaries"
           if [ -f "$RELEASE_FRONTEND/ssf-p2p-node/target/release/ssf-p2p-node.exe" ]; then
@@ -456,7 +458,7 @@ jobs:
         with:
           workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
 
-      - name: 🛰️ Build sovereign P2P node (release — one binary, chia-read + chia-publish)
+      - name: 🛰️ Build sovereign P2P node (release — one binary, chia-read + chia-publish + torrent)
         shell: bash
         run: |
           NODE="$RELEASE_FRONTEND/ssf-p2p-node"
@@ -465,7 +467,7 @@ jobs:
           # MSVC, so the Windows-GNU iroh-relay cdylib export-ordinal wall does NOT
           # apply here and no special linker flag is needed (that flag is a
           # local-GNU-only workaround).
-          cargo build --release --features chia-publish --manifest-path "$NODE/Cargo.toml"
+          cargo build --release --features chia-publish,torrent --manifest-path "$NODE/Cargo.toml"
           cp "$NODE/target/release/ssf-p2p-node.exe" ssf-p2p-node.exe
           ls -la ssf-p2p-node*.exe
 

@@ -8690,7 +8690,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // 📦 The blob lane rides on the same trust: its token and the node's id
   // from this round's fingerprint, or nothing (blobLane.ts).
   setBlobLaneNode(fingerprint?.blob_cap && fingerprint.iroh_node_id
-    ? { origin: nodeOrigin, cap: fingerprint.blob_cap, irohId: fingerprint.iroh_node_id }
+    ? { origin: nodeOrigin, cap: fingerprint.blob_cap, irohId: fingerprint.iroh_node_id, torrent: fingerprint.torrent === true }
     : null);
   if (!fingerprint) {
     // Node unreachable this round: keep the last-known fingerprint (if any)

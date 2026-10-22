@@ -48,6 +48,9 @@ export interface LocalFingerprint {
    *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
    *  Absent while the node runs without the lane, and from older nodes. */
   blob_cap?: string;
+  /** 🧲 The node was built with the `torrent` feature and its blob lane is
+   *  running: the TV's TORRENT tile can hand it a magnet (torrentLane.ts). */
+  torrent?: boolean;
 }
 
 /** A testnet11 standard-puzzle address: the `txch` prefix, the bech32m
@@ -113,5 +116,6 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (typeof r.share_card === 'boolean') fp.share_card = r.share_card;
   if (isTestnetAddress(r.chia_address)) fp.chia_address = r.chia_address;
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
+  if (r.torrent === true) fp.torrent = true;
   return fp;
 }

@@ -19,6 +19,8 @@ mod chia_lane;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
 mod blob_lane;
+#[cfg(feature = "torrent")]
+mod torrent_lane;
 // S‑0 (#231 D1, TODO #13): the chain-access seam and the peer lane behind it.
 // Every chain read and push below goes through the seam's trait; the lane
 // reaches Chia full-node peers over the light-wallet protocol (no gateway).
@@ -266,6 +268,11 @@ pub struct Fingerprint {
     /// changes at every start. Absent while the lane is not running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_cap: Option<String>,
+    /// 🧲 This node was built with the `torrent` feature and its blob lane is
+    /// running, so the TV's TORRENT tile can hand it a magnet
+    /// (torrent_lane.rs). Absent (false) otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub torrent: bool,
 }
 
 // ── Mesh tuning (M3/M5.x — see brainstorming/m345-v029-build-plan.md §2) ──────
@@ -746,6 +753,7 @@ pub fn compute_fingerprint(
         share_card: false,
         chia_address: None,
         blob_cap: None,
+        torrent: false,
     })
 }
 
@@ -766,6 +774,7 @@ mod fingerprint_json_tests {
             share_card: false,
             chia_address: None,
             blob_cap: None,
+            torrent: false,
         }
     }
 
@@ -1159,6 +1168,16 @@ async fn query_ip_echo(host: &str) -> Result<std::net::Ipv4Addr> {
 async fn main() -> Result<()> {
     println!("🪐 StarStation Furlong — Standalone P2P Swarm Node");
     println!("📡 Initializing real-time networks...");
+
+    // 🧲 The torrent feature brings a second rustls crypto backend into the
+    // build (librqbit's reqwest uses aws-lc-rs), and with two compiled in
+    // rustls has no process default: name ring, the one the node uses
+    // everywhere else. And empty what the last run's torrents left.
+    #[cfg(feature = "torrent")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        torrent_lane::wipe_cache();
+    }
 
     // First load or generate persistent SecretKey (C1 fix)
     let secret_key = load_or_create_secret_key()?;
@@ -4517,6 +4536,18 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     ).await;
                     return;
                 }
+                // 🧲 The torrent lane's routes (torrent_lane.rs), behind the
+                // same gate; a node built without the feature says so.
+                if head.method != "OPTIONS" && head.path.starts_with("/api/torrent/") {
+                    #[cfg(feature = "torrent")]
+                    torrent_lane::handle_http(hub_clone.blobs.clone(), &mut socket, head, &body_start, origin_ok, &cors_origin).await;
+                    #[cfg(not(feature = "torrent"))]
+                    blob_lane::reply(
+                        &mut socket, "501 Not Implemented", &cors_origin,
+                        &blob_lane::err_json("this node was built without the torrent feature"),
+                    ).await;
+                    return;
+                }
             }
 
             if req.starts_with("GET /api/fingerprint") {
@@ -4561,6 +4592,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     // request with no Origin at all is a local process, not a
                     // web page.
                     fp.blob_cap = hub_clone.blobs.as_ref().map(|b| b.cap.clone());
+                    fp.torrent = cfg!(feature = "torrent") && hub_clone.blobs.is_some();
                     serde_json::to_string(&*fp).unwrap()
                 };
                 let response = format!(

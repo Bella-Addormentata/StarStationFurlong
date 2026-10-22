@@ -30,6 +30,8 @@ export interface BlobNode {
   cap: string;
   /** The node's iroh id: the provider a blob imported here names. */
   irohId: string;
+  /** 🧲 The node runs the torrent lane too (torrentLane.ts). */
+  torrent?: boolean;
 }
 
 export type BlobState =
@@ -78,6 +80,27 @@ export function blobLaneReady(): boolean {
 /** This page's node id, for the record's `provider` (null without a node). */
 export function blobLaneNodeId(): string | null {
   return blobLaneReady() ? node!.irohId : null;
+}
+
+/** 🧲 The node runs the torrent lane, and the blob lane is ready. */
+export function torrentLaneReady(): boolean {
+  return blobLaneReady() && node!.torrent === true;
+}
+
+/** The room the lane imports for (torrentLane.ts sends it with a magnet). */
+export function blobLaneRoom(): string {
+  return room;
+}
+
+/** A gated route on this page's node, or null without one. */
+export function nodeRoute(path: string, params: Record<string, string>): string | null {
+  return route(path, params);
+}
+
+/** Moves whenever the node's token changes (torrentLane.ts drops answers
+ *  from before, as this module does). */
+export function blobLaneGeneration(): number {
+  return generation;
 }
 
 function route(path: string, params: Record<string, string>): string | null {

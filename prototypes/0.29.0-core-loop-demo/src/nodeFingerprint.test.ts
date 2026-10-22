@@ -64,3 +64,11 @@ describe('the blob lane token', () => {
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, blob_cap: 7 })?.blob_cap).toBeUndefined();
   });
 });
+
+describe('the torrent lane flag', () => {
+  it('is set only by a literal true', () => {
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, torrent: true })?.torrent).toBe(true);
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, torrent: 'yes' })?.torrent).toBeUndefined();
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.torrent).toBeUndefined();
+  });
+});

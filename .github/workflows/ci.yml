@@ -13,6 +13,11 @@ name: "✅ PR Checks"
 #      INVISIBLE to a default check, so a PR could break them without anyone
 #      noticing until the tag-time release build (#87's near-miss: a review fix to
 #      the gated module shipped without ever having been compiled).
+#   5. `cargo test --features chia-publish,torrent` — the release build's feature
+#      set, with the TV's torrent lane (torrent_lane.rs + the forked librqbit
+#      crates under vendor/) — and a Windows `cargo check` of the same, since the
+#      torrent feature brings C code (aws-lc-sys) that only the release would
+#      otherwise compile on Windows.
 
 on:
   pull_request:
@@ -53,7 +58,7 @@ jobs:
         working-directory: ${{ env.RELEASE_FRONTEND }}
 
   node-check:
-    name: 🦀 Node cargo check + test (default & chia-publish)
+    name: 🦀 Node cargo check + test (default, chia-publish, torrent)
     runs-on: ubuntu-22.04
     steps:
       - name: 📥 Checkout repository
@@ -82,3 +87,25 @@ jobs:
 
       - name: 🧪 cargo test --features chia-publish
         run: cargo test --features chia-publish --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      - name: 🧪 cargo test --features chia-publish,torrent (the release set)
+        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+  node-check-windows:
+    name: 🦀 Node cargo check on Windows (release features)
+    runs-on: windows-latest # MSVC, as the release builds
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v5
+
+      - name: 🦀 Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 💾 Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
+
+      - name: 🔎 cargo check --features chia-publish,torrent
+        shell: bash
+        run: cargo check --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
