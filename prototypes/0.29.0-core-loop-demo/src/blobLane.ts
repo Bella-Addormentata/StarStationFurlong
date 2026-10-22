@@ -1,0 +1,219 @@
+/**
+ * 📦 blobLane — the page's half of the media lane's step 1 (plan §4,
+ * brainstorming/smart-tv-arcade-media-plan.md; the node's half is
+ * ssf-p2p-node/src/blob_lane.rs).
+ *
+ * A file the remote's holder picks is streamed to THEIR node, which stores
+ * it as a BLAKE3 blob and answers its hash; the TV record then carries
+ * `{ kind: 'blob', hash, size, provider }`, the provider being that node's
+ * iroh id. A viewer's theatre shows FETCH with the size: the press asks the
+ * viewer's OWN node to take the blob from the provider (only if the two
+ * nodes are already connected in this room — the node dials nobody by an
+ * address the record names), and once it is whole the theatre plays it from
+ * that node, `<video crossorigin>` on the node's origin.
+ *
+ * Nothing here fetches on its own: the record is peer-writable, so every
+ * transfer is one this viewer pressed for (§4: never automatic beyond a cap
+ * and a budget — this slice has neither, so it has no automatic fetch).
+ *
+ * The node's routes ask for this launch's capability token (`blob_cap` in
+ * the fingerprint) and an allowed Origin; the token rides in the query so a
+ * <video> can carry it.
+ */
+
+import { trustedNodeMediaOrigin } from './tvConsent';
+
+export interface BlobNode {
+  /** The node's HTTP origin, as the fingerprint probe found it. */
+  origin: string;
+  /** This launch's blob-lane token (fingerprint `blob_cap`). */
+  cap: string;
+  /** The node's iroh id: the provider a blob imported here names. */
+  irohId: string;
+}
+
+export type BlobState =
+  | { state: 'none' }
+  | { state: 'importing' | 'queued' | 'fetching' | 'complete'; have: number; size: number }
+  | { state: 'failed'; have: number; size: number; why: string }
+  /** The node did not answer the status route (yet). */
+  | { state: 'unknown' };
+
+const HEX_64 = /^[0-9a-f]{64}$/;
+const CAP_RE = /^[0-9a-f]{64}$/;
+
+let node: BlobNode | null = null;
+let room = '';
+/** Moves whenever the node's token changes (a restarted node, or none): an
+ *  answer to a request made under an older one describes a store that is
+ *  gone, and is dropped on arrival rather than written over the new node's. */
+let generation = 0;
+
+/** main.ts, on every fingerprint probe: the node and its token, or null
+ *  when the node did not answer or runs without the lane. */
+export function setBlobLaneNode(n: BlobNode | null): void {
+  const ok = n && CAP_RE.test(n.cap) && HEX_64.test(n.irohId) ? n : null;
+  if (ok?.cap !== node?.cap) {
+    // A restarted node holds nothing: what the old one said goes, and so do
+    // its polls still in flight (their answers are dropped by generation).
+    generation++;
+    statuses.clear();
+    polling.clear();
+    lastPoll.clear();
+  }
+  node = ok;
+}
+
+/** main.ts, on every join: the room a blob is imported or fetched FOR — the
+ *  node serves it only to members of that room. */
+export function setBlobLaneRoom(id: string): void {
+  room = id;
+}
+
+/** The node runs the lane, and the page trusts the node's origin now. */
+export function blobLaneReady(): boolean {
+  return node !== null && room !== '' && trustedNodeMediaOrigin() === node.origin;
+}
+
+/** This page's node id, for the record's `provider` (null without a node). */
+export function blobLaneNodeId(): string | null {
+  return blobLaneReady() ? node!.irohId : null;
+}
+
+function route(path: string, params: Record<string, string>): string | null {
+  if (!blobLaneReady()) return null;
+  const q = new URLSearchParams({ cap: node!.cap, ...params });
+  return `${node!.origin}${path}?${q.toString()}`;
+}
+
+/** Where the theatre's <video> reads a whole blob from this page's node. */
+export function blobUrl(hash: string): string | null {
+  return HEX_64.test(hash) ? route(`/blob/${hash}`, {}) : null;
+}
+
+export function formatBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(n >= 100 * 1024 ** 2 ? 0 : 1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+/** The node's words for why a request failed, or a plain fallback. */
+async function errorOf(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (typeof body.error === 'string' && body.error) return body.error;
+  } catch { /* not JSON */ }
+  return fallback;
+}
+
+/** Stream `file` to this page's node. Resolves the hash and size, or the
+ *  reason it could not. XHR rather than fetch: an upload's progress. */
+export function importBlob(
+  file: File,
+  onProgress: (sent: number, total: number) => void = () => undefined,
+): Promise<{ hash: string; size: number } | { error: string }> {
+  const url = route('/api/blob/import', { room, mime: file.type });
+  if (!url) return Promise.resolve({ error: 'The FILE tile needs this station\'s node (the desktop app) running.' });
+  if (file.size === 0) return Promise.resolve({ error: 'That file is empty.' });
+  const gen = generation;
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.upload.onprogress = (e) => onProgress(e.loaded, e.total || file.size);
+    xhr.onerror = () => resolve({ error: 'Your node did not take the file.' });
+    xhr.onload = () => {
+      let body: { hash?: unknown; size?: unknown; error?: unknown } = {};
+      try { body = JSON.parse(xhr.responseText) as typeof body; } catch { /* not JSON */ }
+      if (gen !== generation) {
+        resolve({ error: 'Your node restarted while taking the file — choose it again.' });
+      } else if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
+        statuses.set(body.hash, { state: 'complete', have: file.size, size: file.size });
+        resolve({ hash: body.hash, size: file.size });
+      } else {
+        resolve({ error: typeof body.error === 'string' && body.error ? `Your node: ${body.error}.` : 'Your node did not take the file.' });
+      }
+    };
+    xhr.send(file);
+  });
+}
+
+/** FETCH: ask this page's node to take `hash` from `provider`. The press is
+ *  the consent; the size is the one the button showed. Null when the node
+ *  took the ask, else why not. */
+export async function fetchBlob(hash: string, size: number, provider: string, mime = ''): Promise<string | null> {
+  const url = HEX_64.test(hash) && HEX_64.test(provider) ? route('/api/blob/fetch', { room, hash, size: String(size), from: provider, mime }) : null;
+  if (!url) return 'The FILE lane needs this station\'s node (the desktop app) running.';
+  const gen = generation;
+  try {
+    const res = await fetch(url, { method: 'POST', redirect: 'error' });
+    if (gen !== generation) return 'Your node restarted — press FETCH again.';
+    if (res.ok) {
+      statuses.set(hash, { state: 'queued', have: 0, size });
+      return null;
+    }
+    return await errorOf(res, 'Your node did not take the ask.');
+  } catch {
+    return 'Your node did not answer.';
+  }
+}
+
+// ── Status, polled while a theatre watches it ────────────────────────────────
+
+const statuses = new Map<string, BlobState>();
+const polling = new Set<string>();
+const lastPoll = new Map<string, number>();
+const POLL_MS = 1_000;
+
+function parseState(body: unknown): BlobState {
+  if (!body || typeof body !== 'object') return { state: 'unknown' };
+  const r = body as Record<string, unknown>;
+  const n = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0);
+  switch (r.state) {
+    case 'none': return { state: 'none' };
+    case 'importing': case 'queued': case 'fetching': case 'complete':
+      return { state: r.state, have: n(r.have), size: n(r.size) };
+    case 'failed':
+      return { state: 'failed', have: n(r.have), size: n(r.size), why: typeof r.why === 'string' ? r.why.slice(0, 200) : '' };
+    default: return { state: 'unknown' };
+  }
+}
+
+/** What this page's node last said about `hash`; asks again in the
+ *  background at most once a second, so a theatre tick can call it freely. */
+export function blobState(hash: string, now = performance.now()): BlobState {
+  const known = statuses.get(hash) ?? { state: 'unknown' };
+  const settled = known.state === 'complete';
+  if (!settled && !polling.has(hash) && now - (lastPoll.get(hash) ?? -Infinity) >= POLL_MS) {
+    const url = HEX_64.test(hash) ? route('/api/blob/status', { hash }) : null;
+    if (url) {
+      const gen = generation;
+      polling.add(hash);
+      lastPoll.set(hash, now);
+      void fetch(url, { redirect: 'error' })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((body) => { if (gen === generation) statuses.set(hash, parseState(body)); })
+        .catch(() => { /* kept as it was; the next tick asks again */ })
+        .finally(() => { if (gen === generation) polling.delete(hash); });
+    }
+  }
+  return known;
+}
+
+/** What identifies the node a blob is read from now — its origin and its
+ *  token's first digits — for the theatre's mount key: a node that changed
+ *  under a mounted player is a new mount, not a stale `src`. '' without one. */
+export function blobNodeTag(): string {
+  return blobLaneReady() ? `${node!.origin}#${node!.cap.slice(0, 8)}` : '';
+}
+
+/** Tests only. */
+export function forgetBlobLane(): void {
+  node = null;
+  room = '';
+  statuses.clear();
+  polling.clear();
+  lastPoll.clear();
+}
+
+export const __test = { parseState };

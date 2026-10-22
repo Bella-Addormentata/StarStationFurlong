@@ -247,6 +247,9 @@ export function forgetMountBudget(): void {
 export function mediaOrigin(source: TvSource): string | null {
   if (source.kind === 'youtube') return 'https://www.youtube-nocookie.com';
   if (source.kind === 'archive') return 'https://archive.org';
+  // A blob is read from the viewer's own node, never from a host the
+  // record names (blobLane.ts).
+  if (source.kind === 'blob') return null;
   return normalizeOrigin(source.url);
 }
 

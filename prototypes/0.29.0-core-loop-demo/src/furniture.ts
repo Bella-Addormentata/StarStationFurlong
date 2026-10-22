@@ -11111,13 +11111,14 @@ function buildPartySpeaker(ctx: BuildCtx) {
 
 /** The home screen's source tiles, in the remote's order (tvUI TILES): the
  *  source kind each stands for (sovereignty.ts decides which this build
- *  offers) and whether its lane exists yet (`live`; FILE, TORRENT and
- *  KARAOKE are plan §3.3's later tiles, drawn dimmed). */
+ *  offers) and whether its lane exists yet (`live`; TORRENT and KARAOKE
+ *  are plan §3.3's later tiles, drawn dimmed — FILE arrived with the blob
+ *  lane, blobLane.ts). */
 const TV_HOME_TILES: ReadonlyArray<{ label: string; kind: string; live: boolean }> = [
   { label: "▶ YOUTUBE", kind: "youtube", live: true },
   { label: "ARCHIVE", kind: "archive", live: true },
   { label: "URL", kind: "url", live: true },
-  { label: "FILE", kind: "file", live: false },
+  { label: "FILE", kind: "file", live: true },
   { label: "TORRENT", kind: "magnet", live: false },
   { label: "KARAOKE", kind: "karaoke", live: false },
 ];

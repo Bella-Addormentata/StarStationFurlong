@@ -77,7 +77,16 @@ export const TV_MAX_NAME = 32;
 export type TvSource =
   | { kind: 'youtube'; videoId: string; title?: string }
   | { kind: 'archive'; identifier: string; file: string; title?: string }
-  | { kind: 'url'; url: string; title?: string };
+  | { kind: 'url'; url: string; title?: string }
+  /** 📦 A file one member's node holds (the blob lane, blobLane.ts): its
+   *  BLAKE3 hash, its size in bytes (a declaration — the viewer's node takes
+   *  no byte past it), the holding node's iroh id, and the type the file
+   *  said it was. Each viewer's node fetches it on that viewer's FETCH. */
+  | { kind: 'blob'; hash: string; size: number; provider: string; mime?: string; title?: string };
+
+/** The largest file the blob lane carries in a record (1 TiB): a bound on
+ *  the declaration, not a quota — each viewer's node sets its own. */
+export const TV_MAX_BLOB = 2 ** 40;
 
 export type TvState = 'off' | 'home' | 'scheduled' | 'playing' | 'paused';
 
@@ -617,6 +626,19 @@ export function sanitizeSource(raw: unknown): TvSource | null {
   if (r.kind === 'url') {
     const url = str(r.url, TV_MAX_URL);
     return isHttpUrl(url) ? withTitle({ kind: 'url', url }) : null;
+  }
+  if (r.kind === 'blob') {
+    const hash = str(r.hash, 64);
+    const provider = str(r.provider, 64);
+    const size = r.size;
+    if (!/^[0-9a-f]{64}$/.test(hash) || !/^[0-9a-f]{64}$/.test(provider)) return null;
+    if (!Number.isSafeInteger(size) || (size as number) <= 0 || (size as number) > TV_MAX_BLOB) return null;
+    // The type is only ever a hint to the node, which re-checks it; one
+    // that is not plainly video/* or audio/* is left out.
+    const mime = str(r.mime, 64);
+    const blob: TvSource = { kind: 'blob', hash, size: size as number, provider };
+    if (/^(video|audio)\/[a-z0-9.+-]+$/.test(mime)) blob.mime = mime;
+    return withTitle(blob);
   }
   return null;
 }
@@ -1252,6 +1274,7 @@ export function isStartOnly(s: TvSource): boolean {
 export function sourceId(s: TvSource): string {
   if (s.kind === 'youtube') return `youtube:${s.videoId}`;
   if (s.kind === 'archive') return `archive:${s.identifier}/${s.file}`;
+  if (s.kind === 'blob') return `blob:${s.hash}`;
   return `url:${s.url}`;
 }
 
@@ -1259,6 +1282,7 @@ export function sourceLabel(s: TvSource): string {
   if (s.title) return s.title;
   if (s.kind === 'youtube') return `YouTube · ${s.videoId}`;
   if (s.kind === 'archive') return `archive.org · ${s.identifier}`;
+  if (s.kind === 'blob') return `a file · ${s.hash.slice(0, 8)}`;
   try {
     const u = new URL(s.url);
     const tail = u.pathname.split('/').filter(Boolean).pop() ?? u.hostname;
@@ -1272,7 +1296,9 @@ export function sourceLabel(s: TvSource): string {
 export type TvLane = 'SOVEREIGN' | 'PLAYER-RUN' | 'PUBLIC SWARM' | 'CONVENIENCE';
 export function sourceLane(s: TvSource): TvLane {
   // v1's three sources are all convenience lanes; the blob, torrent and
-  // karaoke kinds that arrive with the node lanes are the sovereign ones.
+  // karaoke kinds that arrive with the node lanes are the sovereign ones —
+  // a blob travels node to node and plays from the viewer's own.
+  if (s.kind === 'blob') return 'SOVEREIGN';
   return s.kind === 'url' && isLoopback(s.url) ? 'SOVEREIGN' : 'CONVENIENCE';
 }
 
