@@ -141,6 +141,9 @@ export function importBlob(
   if (!url) return Promise.resolve({ error: 'The FILE tile needs this station\'s node (the desktop app) running.' });
   if (file.size === 0) return Promise.resolve({ error: 'That file is empty.' });
   const gen = generation;
+  // The node shares the file with the room it was sent for, and only that
+  // one: an answer that lands after a room change is not this room's file.
+  const asked = room;
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url);
@@ -151,11 +154,13 @@ export function importBlob(
       try { body = JSON.parse(xhr.responseText) as typeof body; } catch { /* not JSON */ }
       if (gen !== generation) {
         resolve({ error: 'Your node restarted while taking the file — choose it again.' });
+      } else if (asked !== room) {
+        resolve({ error: 'You changed rooms while your node took the file — choose it again here.' });
       } else if (xhr.status === 200 && typeof body.hash === 'string' && HEX_64.test(body.hash) && body.size === file.size) {
         statuses.set(body.hash, { state: 'complete', have: file.size, size: file.size });
         // Held for this room now: the library says so before its next ask.
         heldEpoch++;
-        if (heldHere && heldHere.gen === gen && heldHere.room === room) {
+        if (heldHere && heldHere.gen === gen && heldHere.room === asked) {
           heldHere.held.add(body.hash);
           heldHere.at = -Infinity;
         }
@@ -191,9 +196,10 @@ export async function fetchBlob(hash: string, size: number, provider: string, mi
 // ── What this node holds, for the TV library ─────────────────────────────────
 
 /** The node's last answer to the held route: the whole blobs it serves to
- *  this room, and the room members a FETCH from it could dial now. */
+ *  this room, and the room members a FETCH from it could dial now. `more`:
+ *  the node cut its list, so a hash not on it may still be held. */
 let heldHere: {
-  gen: number; room: string; held: Set<string>; reachable: Set<string>; at: number;
+  gen: number; room: string; held: Set<string>; more: boolean; reachable: Set<string>; at: number;
   /** The node keeps its files across restarts, and how much of its quota they take. */
   keep: boolean; kept: number; quota: number;
 } | null = null;
@@ -216,20 +222,24 @@ export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
   heldAsking = true;
   try {
     const res = await fetch(url, { redirect: 'error' });
-    const body = (res.ok ? await res.json() : null) as { held?: unknown; reachable?: unknown; keep?: unknown; kept?: unknown; quota?: unknown } | null;
+    const body = (res.ok ? await res.json() : null) as { held?: unknown; more?: unknown; reachable?: unknown; keep?: unknown; kept?: unknown; quota?: unknown } | null;
     const hexes = (v: unknown) => new Set((Array.isArray(v) ? v.slice(0, 1000) : []).filter((h): h is string => typeof h === 'string' && HEX_64.test(h)));
     const n = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0);
+    const more = body?.more === true || (Array.isArray(body?.held) && body.held.length > 1000);
     if (gen === generation && asked === room && epoch === heldEpoch && body) {
-      heldHere = { gen, room: asked, held: hexes(body.held), reachable: hexes(body.reachable), at: now, keep: body.keep === true, kept: n(body.kept), quota: n(body.quota) };
+      heldHere = { gen, room: asked, held: hexes(body.held), more, reachable: hexes(body.reachable), at: now, keep: body.keep === true, kept: n(body.kept), quota: n(body.quota) };
     }
   } catch { /* kept as it was; the next paint asks again */ } finally {
     heldAsking = false;
   }
 }
 
-/** This page's node holds `hash` whole for this room (as it last said). */
-export function nodeHolds(hash: string): boolean {
-  return !!heldHere && heldHere.gen === generation && heldHere.room === room && heldHere.held.has(hash);
+/** Whether this page's node holds `hash` whole for this room, as it last
+ *  said: null when it has not said (no node, not asked yet, or a cut list
+ *  that does not name it). */
+export function nodeHolds(hash: string): boolean | null {
+  if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
+  return heldHere.held.has(hash) ? true : heldHere.more ? null : false;
 }
 
 /** Whether this page's node keeps its files across restarts, and how much

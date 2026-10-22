@@ -447,18 +447,20 @@ impl BlobLane {
     /// `room`'s members, and the members a FETCH from here could dial now
     /// (`reachable`, each at most `MAX_HELD_LISTED`), so the TV library can
     /// say which entries play from this node, and whose node an entry names
-    /// is still here, without asking one by one.
+    /// is still here, without asking one by one. `more`: the held list was
+    /// cut, so a hash missing from it is not known to be missing.
     pub(crate) fn held_json(&self, room: &str, reachable: &[PublicKey]) -> String {
         let held = self.held.lock().unwrap();
-        let hashes: Vec<String> = held
-            .iter()
-            .filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room))
-            .take(MAX_HELD_LISTED)
-            .map(|(hash, _)| hash.to_hex().to_string())
-            .collect();
+        let mut whole: Vec<(&Hash, &Held)> = held.iter().filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room)).collect();
+        let more = whole.len() > MAX_HELD_LISTED;
+        if more {
+            // Cut to the files used last: the ones a library shows first.
+            whole.sort_unstable_by_key(|(_, h)| std::cmp::Reverse(h.used));
+        }
+        let hashes: Vec<String> = whole.iter().take(MAX_HELD_LISTED).map(|(hash, _)| hash.to_hex().to_string()).collect();
         let peers: Vec<String> = reachable.iter().take(MAX_HELD_LISTED).map(|p| p.to_string()).collect();
         let kept: u64 = held.values().filter(|h| h.phase == Phase::Complete).map(|h| h.charged).sum();
-        serde_json::json!({ "held": hashes, "reachable": peers, "keep": self.keep, "kept": kept, "quota": self.quota }).to_string()
+        serde_json::json!({ "held": hashes, "more": more, "reachable": peers, "keep": self.keep, "kept": kept, "quota": self.quota }).to_string()
     }
 
     fn fail(&self, hash: &Hash, why: &str) {
@@ -1075,7 +1077,7 @@ mod tests {
         });
         assert_eq!(
             lane_a.held_json("r", &[b_id]),
-            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "keep": false, "kept": size, "quota": 1u64 << 30, "reachable": [b_id.to_string()] }).to_string()
+            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "keep": false, "kept": size, "more": false, "quota": 1u64 << 30, "reachable": [b_id.to_string()] }).to_string()
         );
         assert!(lane_a.held_json("elsewhere", &[]).starts_with(r#"{"held":[],"#));
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
@@ -1217,6 +1219,27 @@ mod tests {
         lane.forget(&b).unwrap();
         assert!(lane.fits(100_000));
         assert!(!std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap().contains(&b.to_hex().to_string()));
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cut_held_list_names_the_files_used_last() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, false, Duration::from_secs(3600)).await.unwrap();
+        let hash = |i: u64| Hash::new(i.to_le_bytes());
+        for i in 0..=MAX_HELD_LISTED as u64 {
+            lane.held.lock().unwrap().insert(hash(i), Held {
+                rooms: HashSet::from(["r".to_string()]), size: 1, have: 1, mime: String::new(), phase: Phase::Complete, charged: 1, used: i,
+            });
+        }
+        let got: serde_json::Value = serde_json::from_str(&lane.held_json("r", &[])).unwrap();
+        assert_eq!(got["more"], true);
+        let listed: Vec<&str> = got["held"].as_array().unwrap().iter().map(|h| h.as_str().unwrap()).collect();
+        assert_eq!(listed.len(), MAX_HELD_LISTED);
+        assert!(listed.contains(&hash(MAX_HELD_LISTED as u64).to_hex().as_str()));
+        assert!(!listed.contains(&hash(0).to_hex().as_str()), "the one used longest ago is the one cut");
         lane.store.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

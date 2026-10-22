@@ -37,6 +37,9 @@ export type TorrentState =
       /** `ready`: the file list is here, and nothing downloads until the
        *  holder confirms a file of it (confirmTorrent). */
       state: 'metadata' | 'ready' | 'downloading' | 'importing' | 'complete' | 'failed' | 'stopped';
+      /** Which of the node's torrents this is: a new START is a new job,
+       *  even of the same torrent. DOWNLOAD names the one it showed. */
+      job: number;
       id: string;
       name: string;
       have: number;
@@ -93,6 +96,7 @@ export function parseTorrentState(body: unknown): TorrentState {
       const pick = index(r.pick);
       return {
         state: r.state,
+        job: n(r.job),
         id: typeof r.id === 'string' && HEX_40.test(r.id) ? r.id : '',
         name: str(r.name, 120),
         have: n(r.have),
@@ -193,10 +197,12 @@ async function add(body: string | Blob, params: Record<string, string>): Promise
   return why;
 }
 
-/** ⬇ DOWNLOAD: the holder's pick from the list. Null when the node took it. */
-export async function confirmTorrent(file: number): Promise<string | null> {
+/** ⬇ DOWNLOAD: the holder's pick from the list of torrent `job` (the one
+ *  the remote showed: the node refuses another's). Null when the node took it. */
+export async function confirmTorrent(job: number, file: number): Promise<string | null> {
   if (!Number.isSafeInteger(file) || file < 0) return 'Pick a file first.';
-  const why = await post('/api/torrent/confirm', { file: String(file) });
+  if (!Number.isSafeInteger(job) || job < 1) return 'Wait for the file list first.';
+  const why = await post('/api/torrent/confirm', { job: String(job), file: String(file) });
   if (!why) void refreshTorrentState();
   return why;
 }
