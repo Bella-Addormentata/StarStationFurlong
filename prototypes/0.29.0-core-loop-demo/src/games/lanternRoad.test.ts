@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
-  CLEAR_FRAMES, DYING_FRAMES, LR_COLS, LR_GATE_COL, LR_LEVEL_W, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_TILE,
-  LR_VIEW_W, MAX_HP, PAD_A, PAD_B, PAD_DOWN, PAD_LEFT, PAD_PRESENT, PAD_RIGHT, SUB, checkLanternRoad, createLanternRoad,
-  isLedge, isSolid, isUp, restoreLanternRoad, safeSpot, staffBox, stepLanternRoad, type LrState,
+  BOSS_DYING_FRAMES, CLEAR_FRAMES, DYING_FRAMES, FLAME_FRAMES, LR_ARENA_CAM, LR_COLS, LR_GATE_COL, LR_LEVEL_W, LR_MAP,
+  LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_TILE, LR_VIEW_W, MAX_HP, PAD_A, PAD_B, PAD_DOWN, PAD_LEFT, PAD_PRESENT,
+  PAD_RIGHT, PUFF_FRAMES, SUB, TAG_FRAMES, bossBox, checkLanternRoad, createLanternRoad, isLedge, isSolid, isUp,
+  restoreLanternRoad, safeSpot, staffBox, stepLanternRoad, type LrState,
 } from './lanternRoad';
 
 const run = (s: LrState, frames: number, pads: (f: number) => readonly number[]) => {
@@ -194,10 +195,24 @@ describe('enemies', () => {
 });
 
 describe('the gate', () => {
+  it('stays shut while its guardian is about', () => {
+    const s = quiet();
+    run(s, 2, () => only(0));
+    const p = s.players[0]!;
+    p.hurt = 9999;
+    s.cam = LR_ARENA_CAM;
+    p.x = (LR_GATE_COL - 1) * LR_TILE * SUB;
+    p.y = 7 * LR_TILE * SUB;
+    run(s, 60, () => only(PAD_RIGHT));
+    expect(s.phase).toBe('play');
+    expect(s.boss.stage).not.toBe('done');
+  });
+
   it('clears the road, holds the card, then starts a new lap with scores kept', () => {
     const s = quiet();
     run(s, 2, () => only(0));
     const p = s.players[0]!;
+    s.boss.stage = 'done';
     s.cam = LR_LEVEL_W - LR_VIEW_W;
     p.x = (LR_GATE_COL - 1) * LR_TILE * SUB;
     p.y = 7 * LR_TILE * SUB;
@@ -210,15 +225,179 @@ describe('the gate', () => {
     expect(s.laps).toBe(1);
     expect(s.cam).toBe(0);
     expect(p.score).toBe(score);
+    // And the guardian waits at the shrine again.
+    expect(s.boss.stage).toBe('wait');
   });
 });
 
-/** A simple player: run right, jump at walls and gaps, swing often. */
+/** The road at the shrine with `n` players standing on the street. */
+function atShrine(n: number, seed = 3): LrState {
+  const s = quiet(seed);
+  const pads = [0, 1, 2, 3].map((seat) => (seat < n ? PAD_PRESENT : 0));
+  run(s, 2, () => pads);
+  s.cam = LR_ARENA_CAM;
+  s.players.forEach((p, seat) => {
+    if (!p.on) return;
+    p.x = (LR_ARENA_CAM + 180 + seat * 40) * SUB;
+    p.y = (LR_ROWS - 2) * LR_TILE * SUB - LR_PLAYER_H;
+    p.hurt = 0;
+  });
+  return s;
+}
+
+describe('the Great Lantern', () => {
+  it('comes down once the group reaches the shrine, holds the picture, and the yokai flee', () => {
+    const s = createLanternRoad(5);
+    run(s, 2, () => only(0));
+    expect(s.boss.stage).toBe('wait');
+    const p = s.players[0]!;
+    p.hurt = 9999;
+    s.cam = LR_ARENA_CAM - 200;
+    p.x = (LR_ARENA_CAM + 120) * SUB;
+    p.y = 7 * LR_TILE * SUB;
+    run(s, 10, () => only(0));
+    expect(s.boss.stage).toBe('wait');
+    p.x = (LR_ARENA_CAM + 170) * SUB;
+    run(s, 1, () => only(0));
+    expect(s.boss.stage).toBe('enter');
+    expect(s.boss.maxHp).toBe(16 + 4);
+    // Every yokai still on the street goes up in smoke, no points for it.
+    expect(s.enemies.every((e) => e.gone || e.dying > 0)).toBe(true);
+    expect(p.score).toBe(0);
+    // The picture slides onto the shrine and stays, however they walk.
+    run(s, 130, () => only(PAD_LEFT));
+    expect(s.boss.stage).toBe('fight');
+    expect(s.cam).toBe(LR_ARENA_CAM);
+    expect(px(p.x)).toBeGreaterThanOrEqual(LR_ARENA_CAM);
+  });
+
+  it('takes more hits with more players', () => {
+    const one = atShrine(1);
+    const four = atShrine(4);
+    run(one, 2, () => only(0));
+    run(four, 2, () => [PAD_PRESENT, PAD_PRESENT, PAD_PRESENT, PAD_PRESENT]);
+    expect(four.boss.maxHp - one.boss.maxHp).toBe(12);
+  });
+
+  it('spits fire that burns where it lands, and slams down to send waves both ways', () => {
+    const s = atShrine(2);
+    for (const p of s.players) p.hurt = 99999;
+    const seen = new Set<string>();
+    let waves = 0;
+    let flames = 0;
+    run(s, 900, () => {
+      seen.add(s.boss.move);
+      flames = Math.max(flames, s.shots.filter((sh) => sh.kind === 'flame').length);
+      waves = Math.max(waves, s.shots.filter((sh) => sh.kind === 'wave').length);
+      return [PAD_PRESENT, PAD_PRESENT, 0, 0];
+    });
+    for (const move of ['drift', 'spit', 'shake', 'fall', 'dazed', 'rise']) expect(seen.has(move), move).toBe(true);
+    expect(flames).toBeGreaterThan(0);
+    expect(waves).toBe(2);
+  });
+
+  it('hurts a player its fire lands on, and a wave a player does not jump', () => {
+    const s = atShrine(1);
+    const p = s.players[0]!;
+    run(s, 2, () => only(0));
+    // A flame right where they stand.
+    s.shots.push({ kind: 'flame', x: p.x, y: p.y + LR_PLAYER_H - 12 * SUB, vx: 0, vy: 0, t: FLAME_FRAMES });
+    run(s, 1, () => only(0));
+    expect(p.hp).toBe(MAX_HP - 1);
+  });
+
+  it('goes down to staffs while it sits dazed, then burns out and opens the gate', () => {
+    const s = atShrine(1);
+    const p = s.players[0]!;
+    run(s, 2, () => only(0));
+    p.hurt = 999999;
+    const b = s.boss;
+    // Skip ahead to it sitting dazed on the street, right in front of them.
+    b.stage = 'fight';
+    b.move = 'dazed';
+    b.t = 150;
+    b.maxHp = 20;
+    b.hp = 20;
+    b.x = p.x + LR_PLAYER_W + 4 * SUB;
+    b.y = (LR_ROWS - 2) * LR_TILE * SUB - bossBox().h;
+    const hp = b.hp;
+    run(s, 140, (f) => only(f % 24 === 0 ? PAD_B : 0));
+    expect(b.hp).toBeLessThan(hp);
+    expect(p.score).toBeGreaterThan(0);
+    // Finish it off.
+    b.hp = 1;
+    b.move = 'dazed';
+    b.t = 150;
+    b.hurt = 0;
+    run(s, 30, (f) => only(f % 24 === 0 ? PAD_B : 0));
+    expect(b.stage).toBe('dying');
+    expect(p.score).toBeGreaterThanOrEqual(3000);
+    expect(s.shots).toEqual([]);
+    run(s, BOSS_DYING_FRAMES, () => only(0));
+    expect(b.stage).toBe('done');
+    // Now the gate lets them through.
+    p.x = (LR_GATE_COL - 1) * LR_TILE * SUB;
+    run(s, 60, () => only(PAD_RIGHT));
+    expect(s.phase).toBe('clear');
+  });
+});
+
+describe('dropping in and out', () => {
+  it('a player who steps up mid-road drops in beside the others, from zero, in a puff', () => {
+    const s = quiet();
+    run(s, 2, () => only(0));
+    const lead = s.players[0]!;
+    lead.score = 1234;
+    s.cam = 1500;
+    lead.x = (1500 + 300) * SUB;
+    lead.y = 0;
+    run(s, 60, () => only(0));
+    // Seat 3 was played earlier by someone else, who left a score behind.
+    s.players[3]!.score = 999;
+    run(s, 1, () => [PAD_PRESENT, 0, 0, PAD_PRESENT]);
+    const p = s.players[3]!;
+    expect(p.on).toBe(true);
+    expect(p.score).toBe(0);
+    expect(p.tag).toBeGreaterThan(TAG_FRAMES - 3);
+    expect(Math.abs(px(p.x) - px(lead.x))).toBeLessThan(60);
+    expect(s.puffs.some((puff) => puff.seat === 3 && puff.t === PUFF_FRAMES)).toBe(true);
+    // The tag fades.
+    run(s, TAG_FRAMES, () => [PAD_PRESENT, 0, 0, PAD_PRESENT]);
+    expect(p.tag).toBe(0);
+  });
+
+  it('a player who steps away goes in a puff', () => {
+    const s = quiet();
+    run(s, 2, () => [PAD_PRESENT, PAD_PRESENT, 0, 0]);
+    s.puffs = [];
+    run(s, 40, () => [PAD_PRESENT, 0, 0, 0]);
+    expect(s.players[1]!.on).toBe(false);
+    expect(s.puffs.filter((puff) => puff.seat === 1)).toHaveLength(1);
+  });
+});
+
+/** A simple player: run right, jump at walls and gaps, swing often. At the
+ *  shrine: go to the Great Lantern, face it, swing, and jump its waves. */
 function bot(s: LrState, seat: number, f: number): number {
   const p = s.players[seat]!;
   let pad = PAD_PRESENT | PAD_RIGHT;
   if (f % 20 === seat * 5) pad |= PAD_B;
   if (!isUp(p)) return pad;
+  const b = s.boss;
+  if (b.stage === 'fight') {
+    const mid = p.x + LR_PLAYER_W / 2;
+    const bossMid = b.x + bossBox().w / 2;
+    const gap = bossMid - mid;
+    pad = PAD_PRESENT | (f % 16 === seat * 4 ? PAD_B : 0);
+    // Close in, but a body's width short, and face it.
+    if (Math.abs(gap) > (bossBox().w / 2 + 6 * SUB)) pad |= gap > 0 ? PAD_RIGHT : PAD_LEFT;
+    else if (p.face !== (gap > 0 ? 1 : -1)) pad |= gap > 0 ? PAD_RIGHT : PAD_LEFT;
+    const wave = s.shots.some((sh) => sh.kind === 'wave' && Math.abs(sh.x - p.x) < 40 * SUB
+      && (sh.vx > 0) === (sh.x < p.x));
+    if (p.ground && wave && !(p.pad & PAD_A)) pad |= PAD_A;
+    else if (!p.ground && p.vy < 0) pad |= PAD_A;
+    return pad;
+  }
   const col = Math.floor((p.x + LR_PLAYER_W) / (LR_TILE * SUB));
   const feetRow = Math.floor((p.y + LR_PLAYER_H) / (LR_TILE * SUB));
   const wall = isSolid(col + 1, feetRow - 1) || isSolid(col + 1, feetRow - 2);
@@ -230,12 +409,24 @@ function bot(s: LrState, seat: number, f: number): number {
 }
 
 describe('a whole game', () => {
-  it('four bots reach the shrine gate', () => {
+  it('four bots reach the shrine, put out the Great Lantern and go through the gate', () => {
     const s = createLanternRoad(42);
     let f = 0;
-    while (s.phase === 'play' && f < 60 * 60 * 3) {
+    while (s.phase === 'play' && f < 60 * 60 * 6) {
       const frame = f;
       stepLanternRoad(s, [0, 1, 2, 3].map((seat) => bot(s, seat, frame)));
+      f++;
+    }
+    expect(s.phase).toBe('clear');
+    expect(s.boss.stage).toBe('done');
+  });
+
+  it('one bot alone can do it too', () => {
+    const s = createLanternRoad(9);
+    let f = 0;
+    while (s.phase === 'play' && f < 60 * 60 * 8) {
+      const frame = f;
+      stepLanternRoad(s, [bot(s, 0, frame), 0, 0, 0]);
       f++;
     }
     expect(s.phase).toBe('clear');
@@ -280,7 +471,7 @@ describe('save states from a peer', () => {
     };
     expect(restoreLanternRoad(null)).toBeNull();
     expect(restoreLanternRoad('state')).toBeNull();
-    expect(bad((s) => { s.v = 2; })).toBeNull();
+    expect(bad((s) => { s.v = 1; })).toBeNull();
     expect(bad((s) => { s.players = []; })).toBeNull();
     expect(bad((s) => { (s.players as Array<Record<string, unknown>>)[0]!.x = 1.5; })).toBeNull();
     expect(bad((s) => { (s.players as Array<Record<string, unknown>>)[0]!.hp = 99; })).toBeNull();
@@ -292,5 +483,28 @@ describe('save states from a peer', () => {
     // negative radius.
     expect(bad((s) => { (s.enemies as Array<Record<string, unknown>>)[0]!.dying = 255; })).toBeNull();
     expect(bad((s) => { (s.enemies as Array<Record<string, unknown>>)[0]!.dying = DYING_FRAMES; })).not.toBeNull();
+    // The guardian, its fire and the puffs are checked too: the painter
+    // reads their timers as fractions.
+    expect(bad((s) => { (s.boss as Record<string, unknown>).stage = 'asleep'; })).toBeNull();
+    expect(bad((s) => { (s.boss as Record<string, unknown>).hp = 50; })).toBeNull();
+    expect(bad((s) => { Object.assign(s.boss as object, { stage: 'dying', t: BOSS_DYING_FRAMES + 1 }); })).toBeNull();
+    expect(bad((s) => { s.shots = [{ kind: 'flame', x: 0, y: 0, vx: 0, vy: 0, t: FLAME_FRAMES + 1 }]; })).toBeNull();
+    expect(bad((s) => { s.shots = [{ kind: 'flame', x: 0, y: 0, vx: 0, vy: 0, t: FLAME_FRAMES }]; })).not.toBeNull();
+    expect(bad((s) => { s.puffs = [{ x: 0, y: 0, seat: 0, t: PUFF_FRAMES + 1 }]; })).toBeNull();
+    expect(bad((s) => { s.puffs = [{ x: 0, y: 0, seat: 9, t: 1 }]; })).toBeNull();
+  });
+
+  it('carries a save taken mid-fight on exactly', () => {
+    const pads = (s: LrState, f: number) => [0, 1, 2, 3].map((seat) => (seat < 2 ? bot(s, seat, f) : 0));
+    const a = atShrine(2, 11);
+    for (let f = 0; f < 700; f++) stepLanternRoad(a, pads(a, f));
+    expect(a.boss.stage).toBe('fight');
+    const c = restoreLanternRoad(JSON.parse(JSON.stringify(a)))!;
+    expect(c).not.toBeNull();
+    for (let f = 700; f < 1600; f++) {
+      stepLanternRoad(a, pads(a, f));
+      stepLanternRoad(c, pads(c, f));
+    }
+    expect(JSON.stringify(c)).toBe(JSON.stringify(a));
   });
 });

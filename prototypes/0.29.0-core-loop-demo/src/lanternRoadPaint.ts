@@ -1,7 +1,7 @@
 /**
  * 🏮 Lantern Road's picture (games/lanternRoad.ts): the night street, the
- * four players, the yokai, and the score panel, drawn with Canvas2D onto
- * the double-wide cabinet's screen.
+ * four players, the yokai, the Great Lantern at the shrine, and the score
+ * panel, drawn with Canvas2D onto the double-wide cabinet's screen.
  *
  * The game is 512×192 game pixels (8:3), the two tubes side by side; the
  * screen canvas is twice that, so every game pixel is a 2×2 block, and the
@@ -16,8 +16,9 @@
  */
 
 import {
-  DYING_FRAMES, LR_COLS, LR_GATE_COL, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_SEATS, LR_TILE, LR_VIEW_H,
-  LR_VIEW_W, MAX_HP, SUB, SWING_FRAMES, enemyBox, isLedge, isSolid, type LrEnemy, type LrPlayer, type LrState,
+  BOSS_DYING_FRAMES, DYING_FRAMES, LR_COLS, LR_GATE_COL, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_SEATS, LR_TILE,
+  LR_VIEW_H, LR_VIEW_W, MAX_HP, PUFF_FRAMES, SUB, SWING_FRAMES, TAG_FRAMES, bossBox, enemyBox, isLedge, isSolid, shotBox,
+  type LrBoss, type LrEnemy, type LrPlayer, type LrShot, type LrState,
 } from './games/lanternRoad';
 
 /** The screen canvas the picture is drawn for (2× the game). */
@@ -523,8 +524,16 @@ function drawStoneLantern(ctx: CanvasRenderingContext2D, x: number, groundY: num
   ctx.fillRect(x + 6, groundY - 34, 4, 3);
 }
 
-/** The shrine gate (a torii) standing over column `col`. */
-function drawGate(ctx: CanvasRenderingContext2D, x: number, groundY: number): void {
+/** The shrine gate (a torii) standing over column `col`: sealed with a
+ *  rope and a paper charm while its guardian is about, then aglow. */
+function drawGate(ctx: CanvasRenderingContext2D, x: number, groundY: number, open: boolean, t: number): void {
+  if (open) {
+    const glow = ctx.createLinearGradient(0, groundY - 72, 0, groundY);
+    glow.addColorStop(0, 'rgba(255,214,120,0)');
+    glow.addColorStop(1, `rgba(255,214,120,${0.35 + 0.1 * Math.sin(t / 15)})`);
+    ctx.fillStyle = glow;
+    ctx.fillRect(x - 18, groundY - 72, 42, 72);
+  }
   const red = '#e0342a';
   const dark = '#9a1e1a';
   ctx.fillStyle = dark;
@@ -543,6 +552,30 @@ function drawGate(ctx: CanvasRenderingContext2D, x: number, groundY: number): vo
   ctx.fillRect(x - 4, groundY - 90, 14, 12);
   ctx.fillStyle = '#ffd36a';
   ctx.fillRect(x - 2, groundY - 88, 10, 8);
+  if (open) return;
+  // The seal: a straw rope sagging between the posts, paper streamers, and
+  // a glowing charm in the middle.
+  ctx.strokeStyle = '#d8c48a';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(x - 18, groundY - 60);
+  ctx.quadraticCurveTo(x + 3, groundY - 48, x + 24, groundY - 60);
+  ctx.stroke();
+  ctx.fillStyle = '#fff8e8';
+  for (const k of [-10, 16]) {
+    ctx.fillRect(x + k, groundY - 55, 2, 3);
+    ctx.fillRect(x + k + 2, groundY - 52, 2, 3);
+    ctx.fillRect(x + k, groundY - 49, 2, 3);
+  }
+  const pulse = 0.5 + 0.3 * Math.sin(t / 10);
+  ctx.fillStyle = `rgba(255,120,90,${pulse * 0.5})`;
+  ctx.fillRect(x - 3, groundY - 56, 13, 22);
+  ctx.fillStyle = '#f4ead2';
+  ctx.fillRect(x - 1, groundY - 54, 9, 18);
+  ctx.fillStyle = '#c0281e';
+  ctx.fillRect(x + 2, groundY - 51, 3, 3);
+  ctx.fillRect(x + 1, groundY - 46, 5, 1);
+  ctx.fillRect(x + 3, groundY - 45, 1, 6);
 }
 
 function drawWater(ctx: CanvasRenderingContext2D, x: number, t: number): void {
@@ -633,6 +666,15 @@ function drawPlayer(ctx: CanvasRenderingContext2D, s: LrState, seat: number, cam
     }
     return;
   }
+  if (p.tag > 0) {
+    // Just dropped in: their seat over their head, in their colour.
+    ctx.globalAlpha = Math.min(1, p.tag / 20);
+    text(ctx, `${seat + 1}P`, sx + 8, sy - 6 - Math.min(4, (TAG_FRAMES - p.tag) >> 2), 8, SEAT_COLOURS[seat]!.light, 'center');
+    ctx.fillStyle = SEAT_COLOURS[seat]!.light;
+    ctx.fillRect(sx + 7, sy - 3, 3, 1);
+    ctx.fillRect(sx + 8, sy - 2, 1, 1);
+    ctx.globalAlpha = 1;
+  }
   if (p.hurt > 0 && (s.frame >> 2) & 1) return; // blinking
   const legs = legsFor(p);
   const key = legs === 'stand' ? 'player' : legs === 'stride' ? 'playerStride' : legs === 'pass' ? 'playerPass' : 'playerJump';
@@ -720,6 +762,197 @@ function drawItems(ctx: CanvasRenderingContext2D, s: LrState, cam: number): void
   }
 }
 
+// ── The Great Lantern and its fire ───────────────────────────────────────────
+
+function drawBoss(ctx: CanvasRenderingContext2D, b: LrBoss, s: LrState, cam: number): void {
+  if (b.stage === 'wait' || b.stage === 'done') return;
+  const { w: bw, h: bh } = bossBox();
+  const W = bw / SUB;
+  const H = bh / SUB;
+  let bx = Math.round(b.x / SUB) - cam;
+  const by = Math.round(b.y / SUB);
+  const dying = b.stage === 'dying';
+  const k = dying ? BOSS_DYING_FRAMES - b.t : 0; // frames into burning out
+  if ((b.move === 'shake' && b.stage === 'fight') || dying) bx += (s.frame >> 1) & 1 ? 1 : -1;
+  const cx = bx + W / 2;
+  const cy = by + H / 2;
+
+  ctx.globalAlpha = dying ? Math.max(0, b.t / BOSS_DYING_FRAMES) : 1;
+  const glow = ctx.createRadialGradient(cx, cy, 6, cx, cy, 58);
+  glow.addColorStop(0, 'rgba(255,150,70,0.45)');
+  glow.addColorStop(1, 'rgba(255,150,70,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(cx - 58, cy - 58, 116, 116);
+
+  // The hanger and the top cap.
+  ctx.fillStyle = INK;
+  ctx.fillRect(bx + 20, by - 5, 8, 2);
+  ctx.fillRect(bx + 20, by - 5, 2, 5);
+  ctx.fillRect(bx + 26, by - 5, 2, 5);
+  ctx.fillRect(bx + 9, by, 30, 7);
+  ctx.fillStyle = '#5a3a24';
+  ctx.fillRect(bx + 10, by + 1, 28, 5);
+  // The paper body, rounder in the middle, with its bamboo ribs.
+  ctx.fillStyle = INK;
+  ctx.fillRect(bx + 3, by + 6, W - 6, 42);
+  ctx.fillRect(bx, by + 12, W, 30);
+  ctx.fillStyle = '#e0382a';
+  ctx.fillRect(bx + 4, by + 7, W - 8, 40);
+  ctx.fillRect(bx + 1, by + 13, W - 2, 28);
+  ctx.fillStyle = '#ff7a4a';
+  ctx.fillRect(bx + 5, by + 9, 5, 36);
+  ctx.fillStyle = '#a81e1e';
+  for (let r = by + 11; r < by + 46; r += 6) ctx.fillRect(bx + 2, r, W - 4, 1);
+
+  // One great eye: shut tight on a hit, crossed when dazed.
+  const dazed = b.move === 'dazed' && b.stage === 'fight';
+  const flash = b.hurt > 0;
+  const ex = bx + 15;
+  const ey = by + 14;
+  if (dazed || dying) {
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(ex + 3, ey + 1);
+    ctx.lineTo(ex + 15, ey + 11);
+    ctx.moveTo(ex + 15, ey + 1);
+    ctx.lineTo(ex + 3, ey + 11);
+    ctx.stroke();
+  } else if (flash) {
+    ctx.fillStyle = INK;
+    ctx.fillRect(ex, ey + 5, 18, 3);
+  } else {
+    ctx.fillStyle = INK;
+    ctx.fillRect(ex, ey, 18, 13);
+    ctx.fillStyle = '#fff4e0';
+    ctx.fillRect(ex + 1, ey + 1, 16, 11);
+    ctx.fillStyle = INK;
+    ctx.fillRect(ex + 6 + b.face * 4, ey + 3, 6, 7);
+    ctx.fillStyle = '#ffe08a';
+    ctx.fillRect(ex + 7 + b.face * 4, ey + 4, 2, 2);
+  }
+  // The mouth: wide open around each spit, a fiery tongue inside.
+  const spitting = b.stage === 'fight' && b.move === 'spit' && [75, 50, 25].some((at) => Math.abs(b.t - at) < 7);
+  const open = spitting ? 11 : dazed ? 3 : 6;
+  const mx = bx + 12;
+  const my = by + 32;
+  ctx.fillStyle = INK;
+  ctx.fillRect(mx, my, 24, open + 2);
+  ctx.fillStyle = '#3a0a10';
+  ctx.fillRect(mx + 1, my + 1, 22, open);
+  if (open > 4) {
+    ctx.fillStyle = '#ffb030';
+    ctx.fillRect(mx + 7, my + open - 3, 10, 3);
+  }
+  ctx.fillStyle = '#fff4e0';
+  for (let tx = mx + 2; tx < mx + 22; tx += 5) ctx.fillRect(tx, my + 1, 3, 2);
+  // The bottom cap and a tassel.
+  ctx.fillStyle = INK;
+  ctx.fillRect(bx + 9, by + 47, 30, 7);
+  ctx.fillStyle = '#5a3a24';
+  ctx.fillRect(bx + 10, by + 48, 28, 5);
+  ctx.fillStyle = '#ffd36a';
+  ctx.fillRect(bx + 22, by + 54, 4, 4 + ((s.frame >> 3) & 1));
+  if (flash && (s.frame >> 1) & 1) {
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillRect(bx + 1, by + 7, W - 2, 40);
+  }
+  if (dazed) {
+    // Stars round its cap.
+    ctx.fillStyle = '#fff6c8';
+    for (let i = 0; i < 3; i++) {
+      const a = s.frame / 9 + (i * Math.PI * 2) / 3;
+      ctx.fillRect(cx + Math.cos(a) * 18 - 1, by - 8 + Math.sin(a) * 4, 3, 3);
+    }
+  }
+  ctx.globalAlpha = 1;
+  if (dying) {
+    // It burns out: smoke and sparks thrown wide.
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI * 2) / 8 + i;
+      const r = 6 + k * 0.5;
+      ctx.fillStyle = i & 1 ? `rgba(255,190,90,${Math.max(0, 1 - k / 90)})` : `rgba(230,220,250,${Math.max(0, 0.8 - k / 150)})`;
+      ctx.beginPath();
+      ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r * 0.7, 3 + k / 30, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawShot(ctx: CanvasRenderingContext2D, sh: LrShot, s: LrState, cam: number): void {
+  const { w, h } = shotBox(sh.kind);
+  const x = Math.round(sh.x / SUB) - cam;
+  const y = Math.round(sh.y / SUB);
+  const W = w / SUB;
+  const H = h / SUB;
+  if (sh.kind === 'fire') {
+    const flick = (s.frame >> 1) & 1;
+    ctx.fillStyle = 'rgba(255,120,40,0.35)';
+    ctx.beginPath();
+    ctx.arc(x + W / 2, y + H / 2, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ff6a2a';
+    ctx.beginPath();
+    ctx.arc(x + W / 2, y + H / 2, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = flick ? '#fff2a0' : '#ffd040';
+    ctx.fillRect(x + W / 2 - 1, y + H / 2 - 1, 3, 3);
+    return;
+  }
+  if (sh.kind === 'flame') {
+    // A little fire burning on the street, dying down at the end.
+    const life = Math.min(1, sh.t / 15);
+    const tall = Math.round(H * (0.6 + 0.4 * life)) - ((s.frame >> 2) & 1);
+    const base = y + H;
+    ctx.globalAlpha = Math.max(0.2, life);
+    ctx.fillStyle = '#e8402a';
+    ctx.beginPath();
+    ctx.moveTo(x, base);
+    ctx.lineTo(x + W / 2, base - tall);
+    ctx.lineTo(x + W, base);
+    ctx.fill();
+    ctx.fillStyle = '#ffb030';
+    ctx.beginPath();
+    ctx.moveTo(x + 2, base);
+    ctx.lineTo(x + W / 2, base - tall * 0.6);
+    ctx.lineTo(x + W - 2, base);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    return;
+  }
+  // A shock wave: a crest of pale spirit fire rolling along the street.
+  const fade = Math.min(1, sh.t / 20);
+  const lead = sh.vx > 0 ? x + W : x;
+  ctx.globalAlpha = fade;
+  ctx.fillStyle = 'rgba(160,210,255,0.5)';
+  ctx.fillRect(x, y + H - 3, W, 3);
+  ctx.fillStyle = '#cfe8ff';
+  for (let i = 0; i < 4; i++) {
+    const hgt = H - i * 2 - ((s.frame + i) & 1);
+    const col = sh.vx > 0 ? lead - 3 - i * 3 : lead + i * 3;
+    ctx.fillRect(col, y + H - hgt, 3, hgt);
+  }
+  ctx.globalAlpha = 1;
+}
+
+/** Puffs of smoke in a player's colour, where they dropped in or left. */
+function drawPuffs(ctx: CanvasRenderingContext2D, s: LrState, cam: number): void {
+  for (const puff of s.puffs) {
+    const k = PUFF_FRAMES - puff.t;
+    const cx = puff.x / SUB - cam;
+    const cy = puff.y / SUB;
+    ctx.fillStyle = SEAT_COLOURS[puff.seat]!.light;
+    ctx.globalAlpha = Math.max(0, puff.t / PUFF_FRAMES) * 0.8;
+    for (let i = 0; i < 6; i++) {
+      const a = (i * Math.PI * 2) / 6;
+      ctx.beginPath();
+      ctx.arc(cx + Math.cos(a) * (4 + k * 0.5), cy + Math.sin(a) * (3 + k * 0.4), 2 + k / 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
 // ── The score panel and the cards ────────────────────────────────────────────
 
 function text(ctx: CanvasRenderingContext2D, s: string, x: number, y: number, size: number, colour: string, align: CanvasTextAlign = 'left'): void {
@@ -774,6 +1007,33 @@ function drawPops(ctx: CanvasRenderingContext2D, s: LrState, cam: number): void 
   ctx.globalAlpha = 1;
 }
 
+/** The Great Lantern's name as it comes down, then its fire left, under the
+ *  score panel. */
+function drawBossBar(ctx: CanvasRenderingContext2D, s: LrState): void {
+  const b = s.boss;
+  if (b.stage !== 'enter' && b.stage !== 'fight' && b.stage !== 'dying') return;
+  if (b.stage === 'enter') {
+    ctx.globalAlpha = Math.min(1, b.t / 30);
+    ctx.fillStyle = 'rgba(10,4,24,0.6)';
+    ctx.fillRect(0, 118, LR_VIEW_W, 40);
+    text(ctx, 'THE GREAT LANTERN', LR_VIEW_W / 2, 140, 16, '#ff9a5a', 'center');
+    text(ctx, 'GUARDIAN OF THE SHRINE', LR_VIEW_W / 2, 152, 8, '#fff4e0', 'center');
+    ctx.globalAlpha = 1;
+  }
+  const w = 200;
+  const x = (LR_VIEW_W - w) / 2;
+  const fill = b.maxHp > 0 ? Math.max(0, Math.min(1, b.hp / b.maxHp)) : 0;
+  text(ctx, 'GREAT LANTERN', x - 6, 23, 7, '#ffb07a', 'right');
+  ctx.fillStyle = INK;
+  ctx.fillRect(x - 1, 16, w + 2, 7);
+  ctx.fillStyle = '#3a1020';
+  ctx.fillRect(x, 17, w, 5);
+  ctx.fillStyle = b.hurt > 0 && (s.frame >> 1) & 1 ? '#fff4e0' : '#ff6a2a';
+  ctx.fillRect(x, 17, Math.round(w * fill), 5);
+  ctx.fillStyle = '#ffd36a';
+  ctx.fillRect(x, 17, Math.round(w * fill), 1);
+}
+
 function drawClear(ctx: CanvasRenderingContext2D, s: LrState): void {
   ctx.fillStyle = 'rgba(10,4,24,0.6)';
   ctx.fillRect(0, 40, LR_VIEW_W, 100);
@@ -819,7 +1079,7 @@ export function paintLanternRoad(ctx: CanvasRenderingContext2D, s: LrState, w = 
       else if (ch === 'S') drawStoneLantern(ctx, x, (row + 1) * LR_TILE);
     }
   }
-  drawGate(ctx, LR_GATE_COL * LR_TILE - cam + 8, (LR_ROWS - 2) * LR_TILE);
+  drawGate(ctx, LR_GATE_COL * LR_TILE - cam + 8, (LR_ROWS - 2) * LR_TILE, s.boss.stage === 'done', t);
   // The street, bridges, roofs and barrels.
   for (let col = c0; col <= c1; col++) {
     for (let row = 0; row < LR_ROWS; row++) {
@@ -837,9 +1097,14 @@ export function paintLanternRoad(ctx: CanvasRenderingContext2D, s: LrState, w = 
 
   drawItems(ctx, s, cam);
   for (const e of s.enemies) drawEnemy(ctx, e, s, cam);
+  drawBoss(ctx, s.boss, s, cam);
+  for (const sh of s.shots) if (sh.kind !== 'fire') drawShot(ctx, sh, s, cam);
   for (let seat = 0; seat < LR_SEATS; seat++) drawPlayer(ctx, s, seat, cam);
+  for (const sh of s.shots) if (sh.kind === 'fire') drawShot(ctx, sh, s, cam);
+  drawPuffs(ctx, s, cam);
   drawPops(ctx, s, cam);
   drawPanel(ctx, s);
+  drawBossBar(ctx, s);
   if (s.phase === 'clear') drawClear(ctx, s);
   ctx.restore();
 }
