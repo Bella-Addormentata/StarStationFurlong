@@ -56,8 +56,9 @@ let generation = 0;
 export function setBlobLaneNode(n: BlobNode | null): void {
   const ok = n && CAP_RE.test(n.cap) && HEX_64.test(n.irohId) ? n : null;
   if (ok?.cap !== node?.cap) {
-    // A restarted node holds nothing: what the old one said goes, and so do
-    // its polls still in flight (their answers are dropped by generation).
+    // A restarted node is asked afresh (it keeps only its whole files): what
+    // the old one said goes, and so do its polls still in flight (their
+    // answers are dropped by generation).
     generation++;
     statuses.clear();
     polling.clear();
