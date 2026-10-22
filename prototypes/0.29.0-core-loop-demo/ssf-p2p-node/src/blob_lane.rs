@@ -84,6 +84,8 @@ pub fn storage_bound(size: u64) -> u64 {
 
 /// The longest room id a blob route accepts (the browser's are far shorter).
 const MAX_ROOM_LEN: usize = 256;
+/// The most hashes the held route lists (the TV library holds at most 200).
+const MAX_HELD_LISTED: usize = 1000;
 /// The longest request head the HTTP API reads before it gives up.
 pub const MAX_HEAD: usize = 16 * 1024;
 
@@ -227,6 +229,23 @@ impl BlobLane {
             Phase::Failed(why) => ("failed", why.as_str()),
         };
         serde_json::json!({ "state": state, "have": h.have, "size": h.size, "why": why }).to_string()
+    }
+
+    /// The JSON the held route answers: every whole blob this node serves to
+    /// `room`'s members, and the members a FETCH from here could dial now
+    /// (`reachable`, each at most `MAX_HELD_LISTED`), so the TV library can
+    /// say which entries play from this node, and whose node an entry names
+    /// is still here, without asking one by one.
+    pub(crate) fn held_json(&self, room: &str, reachable: &[PublicKey]) -> String {
+        let held = self.held.lock().unwrap();
+        let hashes: Vec<String> = held
+            .iter()
+            .filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room))
+            .take(MAX_HELD_LISTED)
+            .map(|(hash, _)| hash.to_hex().to_string())
+            .collect();
+        let peers: Vec<String> = reachable.iter().take(MAX_HELD_LISTED).map(|p| p.to_string()).collect();
+        serde_json::json!({ "held": hashes, "reachable": peers }).to_string()
     }
 
     fn fail(&self, hash: &Hash, why: &str) {
@@ -637,6 +656,15 @@ pub async fn handle_http(
                 }
             }
         }
+        ("GET", "/api/blob/held") => {
+            let room = head.query.get("room").cloned().unwrap_or_default();
+            if !valid_room(&room) {
+                return reply(socket, "400 Bad Request", cors, &err_json("no room")).await;
+            }
+            let reachable: Vec<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().collect()).unwrap_or_default();
+            let body = lane.held_json(&room, &reachable);
+            reply(socket, "200 OK", cors, &body).await;
+        }
         ("GET", "/api/blob/status") => {
             let Some(hash) = hash_param(&head) else {
                 return reply(socket, "400 Bad Request", cors, &err_json("no hash")).await;
@@ -799,6 +827,11 @@ mod tests {
         lane_a.held.lock().unwrap().insert(tag.hash, Held {
             rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size,
         });
+        assert_eq!(
+            lane_a.held_json("r", &[b_id]),
+            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "reachable": [b_id.to_string()] }).to_string()
+        );
+        assert_eq!(lane_a.held_json("elsewhere", &[]), r#"{"held":[],"reachable":[]}"#);
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
             lane.held.lock().unwrap().insert(tag.hash, Held {
                 rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared,
