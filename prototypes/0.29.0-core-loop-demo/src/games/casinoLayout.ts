@@ -509,41 +509,32 @@ export function chipSlots(r: FeltRect): FeltPoint[] {
 }
 
 /**
- * Give each player one stack position in a chip area: in `rank` order (then
- * player-id order), each takes the free slot nearest `anchor` (where they
- * stand, or their spot in a dealer-set box), so a
- * player's chips sit in front of them the way a dealer would set them. A
- * player with no known spot takes the first free slot; when there are more
- * players than slots, the extra players share from the start again.
+ * Place stacks one at a time around stacks already standing (`taken`): in
+ * `rank` then player-id order, each player takes the candidate nearest their
+ * `anchor` (the first one, with no anchor) that clears every stack placed so
+ * far by a chip's width. Candidates closer together than that can't both be
+ * used. Only once no clear candidate is left does a player share the
+ * nearest one, so a live bet is never left out.
  */
-export function assignSlots(
-  slots: readonly FeltPoint[],
+export function assignClearSlots(
+  candidates: readonly FeltPoint[],
+  taken: readonly FeltPoint[],
   players: ReadonlyArray<{ pid: string; anchor: FeltPoint | null; rank?: number }>,
 ): Map<string, FeltPoint> {
   const out = new Map<string, FeltPoint>();
-  if (slots.length === 0) return out;
-  const free = slots.map((_, i) => i);
+  if (candidates.length === 0) return out;
+  const placed = [...taken];
   const ordered = [...players].sort((a, b) =>
     (a.rank ?? Infinity) - (b.rank ?? Infinity) || (a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : 0));
-  ordered.forEach((p, k) => {
-    if (free.length === 0) {
-      out.set(p.pid, slots[k % slots.length]);
-      return;
-    }
-    let best = 0;
-    if (p.anchor) {
-      let bd = Infinity;
-      free.forEach((si, fi) => {
-        const d = Math.hypot(slots[si].x - p.anchor!.x, slots[si].z - p.anchor!.z);
-        if (d < bd) {
-          bd = d;
-          best = fi;
-        }
-      });
-    }
-    out.set(p.pid, slots[free[best]]);
-    free.splice(best, 1);
-  });
+  const dist = (p: FeltPoint, q: FeltPoint) => Math.hypot(p.x - q.x, p.z - q.z);
+  const pick = (from: readonly FeltPoint[], anchor: FeltPoint | null) =>
+    anchor ? from.reduce((a, b) => (dist(b, anchor) < dist(a, anchor) ? b : a)) : from[0];
+  for (const p of ordered) {
+    const clear = candidates.filter((c) => placed.every((q) => dist(c, q) >= CHIP_RADIUS * 2 - 1e-9));
+    const at = pick(clear.length > 0 ? clear : candidates, p.anchor);
+    out.set(p.pid, at);
+    placed.push(at);
+  }
   return out;
 }
 

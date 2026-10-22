@@ -113,11 +113,11 @@ describe('craps chips by position', () => {
     }
   });
 
-  it('keeps two players sharing a stand apart, odds and all', () => {
+  it('keeps players sharing a stand apart, odds and all', () => {
     // With no free stand the table seats a newcomer at a taken one.
-    writeMySeat(TABLE, 'player-a', seat(NEAR));
-    writeMySeat(TABLE, 'player-b', seat(NEAR));
-    for (const [pid, d] of [['player-a', 5], ['player-b', 25]] as const) {
+    const sharing = [['player-a', 5], ['player-b', 25], ['player-c', 100], ['player-d', 500]] as const;
+    for (const [pid] of sharing) writeMySeat(TABLE, pid, seat(END));
+    for (const [pid, d] of sharing) {
       writeMyCrapsBets(TABLE, pid, [
         { type: 'place', pick: 6, amount: d }, { type: 'come', pick: 8, amount: d }, { type: 'comeodds', pick: 8, amount: d },
       ]);
@@ -125,7 +125,7 @@ describe('craps chips by position', () => {
     const { h, chips } = fakeTable('craps');
     casinoTablesFrame(1 / 60, new Map([[TABLE, h]]));
     const all = chips();
-    expect(all).toHaveLength(6);
+    expect(all).toHaveLength(12);
     const ground = all.filter((s) => !s.lift);
     for (let i = 0; i < ground.length; i++) {
       for (let j = i + 1; j < ground.length; j++) {
@@ -133,7 +133,7 @@ describe('craps chips by position', () => {
       }
     }
     // Each player's odds ride on their own come bet.
-    for (const d of [5, 25]) {
+    for (const [, d] of sharing) {
       const odds = all.filter((s) => s.chips[0] === d && s.lift === 1);
       expect(odds).toHaveLength(1);
       const flat = ground.find((s) => s.chips[0] === d && Math.abs(s.x - odds[0].x) < 1e-9 && Math.abs(s.z - odds[0].z) < 1e-9);

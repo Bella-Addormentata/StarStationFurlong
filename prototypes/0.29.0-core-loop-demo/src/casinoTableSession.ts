@@ -49,7 +49,7 @@ import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import {
-  assignSlots, chipSlots, crapsChipRect, crapsDealerPlaced, crapsOddsBaseRect, crapsSideFor, CRAPS_LAYOUT,
+  assignClearSlots, chipSlots, crapsChipRect, crapsDealerPlaced, crapsOddsBaseRect, crapsSideFor, CRAPS_LAYOUT,
   CHIP_RADIUS, dealerSpot, hitRegion, hitSettings, LAY_PAYS, nearestInDirection, ODDS_PAYS, regionCenter,
   rouletteChipColors, ROULETTE_LAYOUT, spotKey,
 } from './games/casinoLayout';
@@ -235,9 +235,9 @@ export interface ChipPlan {
 }
 
 /** Bets laid out as stacks: one per player per box, bottom chip the largest.
- *  A dealer-set bet goes at its owner's spot; any other bet takes the free
- *  slot nearest its owner (assignSlots), clear of the dealer-set stacks while
- *  there is room. Odds sit on top of their flat bet. */
+ *  A dealer-set bet goes at its owner's spot; any other bet takes the room
+ *  nearest its owner clear of the stacks already down (assignClearSlots).
+ *  Odds sit on top of their flat bet. */
 function layoutStacks<B extends { type: string; pick?: number; amount: number }>(
   betsByPlayer: Record<string, B[]>,
   anchors: Map<string, FeltPoint>,
@@ -283,10 +283,11 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
       g.chips.set(pid, list);
     }
   }
-  // Where each group's stacks stand: dealer spots as given, the rest in the
-  // free slots nearest their owners, keeping a chip's width off the dealer
-  // spots (a bettor who left the table keeps their bets, but not a spot).
-  // A box with no such slot left shares rather than hide a live bet.
+  // Where each group's stacks stand: dealer spots as given, the rest one by
+  // one in the room nearest their owners (spare stand spots first, then the
+  // grid), each a chip's width clear of every stack already down (a bettor
+  // who left the table keeps their bets, but not a spot). A box with no
+  // room left shares rather than hide a live bet.
   const placed = new Map<string, Map<string, FeltPoint>>();
   for (const [key, g] of groups) {
     // One player per spot: two seated at one stand (the table's fallback
@@ -299,10 +300,7 @@ function layoutStacks<B extends { type: string; pick?: number; amount: number }>
     }
     const loose = [...g.chips.keys()].filter((pid) => !at.has(pid));
     if (loose.length > 0) {
-      const fixed = [...at.values()];
-      const all = [...g.spare, ...chipSlots(g.rect)];
-      const clear = all.filter((q) => fixed.every((f) => Math.hypot(q.x - f.x, q.z - f.z) >= CHIP_RADIUS * 2));
-      const got = assignSlots(clear.length > 0 ? clear : all, loose.map((pid) => {
+      const got = assignClearSlots([...g.spare, ...chipSlots(g.rect)], [...at.values()], loose.map((pid) => {
         const n = g.near.get(pid);
         return { pid, anchor: n?.anchor ?? anchors.get(pid) ?? null, rank: n?.rank };
       }));

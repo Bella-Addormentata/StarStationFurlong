@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { isCrapsBet } from './craps';
 import { isRouletteBet } from './roulette';
 import {
-  assignSlots,
+  assignClearSlots,
   chipSlots,
   CRAPS_LAYOUT,
   CRAPS_NUMBERS,
@@ -175,7 +175,7 @@ describe('chip slots', () => {
 
   it('sets each player\'s chips nearest where they stand', () => {
     const slots = chipSlots({ x0: -0.5, z0: 0, x1: 0.5, z1: 0.05 });
-    const got = assignSlots(slots, [
+    const got = assignClearSlots(slots, [], [
       { pid: 'left', anchor: { x: -0.6, z: -1 } },
       { pid: 'right', anchor: { x: 0.6, z: -1 } },
     ]);
@@ -184,8 +184,20 @@ describe('chip slots', () => {
     expect(got.get('left')).not.toEqual(got.get('right'));
   });
 
+  it('never uses two candidates closer than a chip, nor one by a stack already down', () => {
+    // Candidates a third of a chip apart: only every third can be used.
+    const c = Array.from({ length: 9 }, (_, i) => ({ x: i * CHIP_RADIUS * 0.7, z: 0 }));
+    const got = assignClearSlots(c, [{ x: 0, z: 0 }], ['a', 'b'].map((pid) => ({ pid, anchor: null })));
+    const pts = [{ x: 0, z: 0 }, got.get('a')!, got.get('b')!];
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        expect(Math.hypot(pts[i].x - pts[j].x, pts[i].z - pts[j].z)).toBeGreaterThanOrEqual(CHIP_RADIUS * 2 - 1e-9);
+      }
+    }
+  });
+
   it('shares slots once there are more players than room', () => {
-    const got = assignSlots([{ x: 0, z: 0 }], [
+    const got = assignClearSlots([{ x: 0, z: 0 }], [], [
       { pid: 'a', anchor: null },
       { pid: 'b', anchor: null },
     ]);
