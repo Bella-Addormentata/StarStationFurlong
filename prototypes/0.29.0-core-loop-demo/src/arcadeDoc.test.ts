@@ -622,6 +622,34 @@ describe('high scores', () => {
     }
   });
 
+  it('keeps a go entered after a CLEAR on a page that hears of the go first', () => {
+    // The owner clears on o; a host that has heard enters a go on h; page t
+    // gets h's go before o's CLEAR, and enters a go of its own meanwhile.
+    recordHighScores(CAB, LR, [line('old', 100)]);
+    const o = doc;
+    const h = new Y.Doc();
+    const t = new Y.Doc();
+    for (const d of [h, t]) Y.applyUpdate(d, Y.encodeStateAsUpdate(o));
+    owner = true;
+    clearHighScores(CAB, LR);
+    owner = false;
+    Y.applyUpdate(h, Y.encodeStateAsUpdate(o));
+    bindArcadeDoc(h);
+    const fromH: Uint8Array[] = [];
+    const onUpdate = (u: Uint8Array) => fromH.push(u);
+    h.on('update', onUpdate);
+    recordHighScores(CAB, LR, [line('h1', 900)]);
+    h.off('update', onUpdate);
+    for (const u of fromH) Y.applyUpdate(t, u);
+    bindArcadeDoc(t);
+    expect(recordHighScores(CAB, LR, [line('t1', 500)])).toBe(true);
+    for (const a of [o, h, t]) for (const b of [o, h, t]) if (a !== b) Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [o, h, t]) {
+      bindArcadeDoc(d);
+      expect(readHighScores(CAB, LR).map((l) => l.run)).toEqual(['h1']);
+    }
+  });
+
   it('keeps a CLEAR when a page that hadn\'t heard of it enters a go', () => {
     recordHighScores(CAB, LR, [line('old', 100)]);
     const a = doc;

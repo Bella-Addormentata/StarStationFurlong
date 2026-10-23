@@ -620,6 +620,17 @@ function tableLines(itemId: string, gameId: string, clears: number): Array<{ key
 const linesOf = (read: ReadonlyArray<{ line: HighScore | null }>): HighScore[] =>
   read.flatMap(({ line }) => (line ? [line] : []));
 
+/** A table's line keys from before CLEAR number `clears`: those under an
+ *  older count (or none). Lines under a newer one stay: they come from a
+ *  CLEAR this page hasn't heard of yet. */
+function linesBefore(itemId: string, gameId: string, clears: number): string[] {
+  const prefix = `${scoresKey(itemId, gameId)}:`;
+  return arcadeRawKeys(prefix).filter((key) => {
+    const count = /^(\d{1,15}):/.exec(key.slice(prefix.length));
+    return !count || Number(count[1]) < clears;
+  });
+}
+
 /** A cabinet's high-score table for one of its own games, best first. */
 export function readHighScores(itemId: string, gameId: string): HighScore[] {
   return bestLines(linesOf(tableLines(itemId, gameId, tableClears(itemId, gameId))));
@@ -655,14 +666,11 @@ export function recordHighScores(itemId: string, gameId: string, goes: readonly 
     if (had.get(line.run) !== line.score) entries.push([scoreLineKey(itemId, gameId, clears, line.run), line]);
   }
   if (entries.length === 0) return false;
-  // Let go of what was read and is off the table now, and of every line from
+  // Let go of what was read and is off the table now, and of the lines from
   // before a CLEAR; a line past the read limit stays for a later go to rank.
   const kept = new Set(next.map((line) => scoreLineKey(itemId, gameId, clears, line.run)));
   for (const { key } of read) if (!kept.has(key)) entries.push([key, undefined]);
-  const current = `${scoresKey(itemId, gameId)}:${clears}:`;
-  for (const key of arcadeRawKeys(`${scoresKey(itemId, gameId)}:`)) {
-    if (!key.startsWith(current)) entries.push([key, undefined]);
-  }
+  for (const key of linesBefore(itemId, gameId, clears)) entries.push([key, undefined]);
   arcadeRawSetMany(entries);
   return true;
 }
@@ -672,10 +680,9 @@ export function recordHighScores(itemId: string, gameId: string, goes: readonly 
 export function clearHighScores(itemId: string, gameId: string): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
-  const entries: Array<readonly [string, unknown]> = [
-    [scoresKey(itemId, gameId), { clears: tableClears(itemId, gameId) + 1 } satisfies ScoresRecord],
-  ];
-  for (const key of arcadeRawKeys(`${scoresKey(itemId, gameId)}:`)) entries.push([key, undefined]);
+  const clears = tableClears(itemId, gameId) + 1;
+  const entries: Array<readonly [string, unknown]> = [[scoresKey(itemId, gameId), { clears } satisfies ScoresRecord]];
+  for (const key of linesBefore(itemId, gameId, clears)) entries.push([key, undefined]);
   arcadeRawSetMany(entries);
   return { ok: true };
 }
