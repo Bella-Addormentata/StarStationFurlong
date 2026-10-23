@@ -70,7 +70,7 @@ const LANTERN_ROAD: NativeGame<LrState> = {
   rev: LR_REV,
   title: 'LANTERN ROAD',
   blurb: 'Up to four friends walk the night street to the shrine.',
-  controls: 'ARROWS WALK · X JUMP · Z STAFF · DOWN+X DROP',
+  controls: 'WASD/ARROWS WALK · M/X JUMP · N/Z STAFF · DOWN+JUMP DROP',
   seats: LR_SEATS,
   lines: [LR_VIEW_W, LR_VIEW_H],
   create: createLanternRoad,
