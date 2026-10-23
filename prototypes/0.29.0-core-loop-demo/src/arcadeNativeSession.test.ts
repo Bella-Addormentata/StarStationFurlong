@@ -38,6 +38,8 @@ interface Page {
   painted: Map<number, string>;
   titles: string[];
   released: number;
+  /** What the cabinet's sticks and buttons were last told, call by call. */
+  controls: number[][];
   outbox: Uint8Array[];
   sent: Uint8Array[];
   closed: boolean;
@@ -61,7 +63,7 @@ async function openPage(name: string): Promise<Page> {
   arcade.bindArcadeDoc(doc);
   const page: Page = {
     name, lane: `lane-${name}`, mod, games, casino, arcade, player, Y, doc,
-    painted: new Map(), titles: [], released: 0, outbox: [], sent: [], closed: false,
+    painted: new Map(), titles: [], released: 0, controls: [], outbox: [], sent: [], closed: false,
   };
   doc.on('update', (update: Uint8Array, origin: unknown) => {
     if (origin === 'room' || page.closed) return;
@@ -92,6 +94,7 @@ async function openPage(name: string): Promise<Page> {
     present: () => undefined,
     showAttract: () => page.released++,
     setPictureLines: () => undefined,
+    setControls: (pads) => void page.controls.push([...pads]),
   }, { x: 0, z: 0 });
   pages.push(page);
   return page;
@@ -718,6 +721,42 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     const fresh: number[] = [];
     createLanternRoadSound(44100).frame(JSON.parse(first!.state) as LrState, [], (l) => fresh.push(l));
     expect(first!.samples).toEqual(fresh);
+  });
+
+  it("moves every page's sticks and buttons with the players' pads, and rests them when the game ends", async () => {
+    const [a, b, w] = await room('a', 'b', 'w');
+    // Nothing runs yet: at rest, said once.
+    await run(50);
+    expect(w.controls).toEqual([[]]);
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    const guest = link(b, 2);
+    guest.join();
+    await run(300);
+    const RIGHT = 0x80;
+    const LEFT_A = 0x40 | 0x01;
+    host.setButtons(RIGHT);
+    guest.setButtons(LEFT_A);
+    await run(300);
+    // The watcher shows both, at their seats (the game's own PRESENT bit
+    // rides along on a held seat), and nobody at the others.
+    const last = (p: typeof w) => p.controls[p.controls.length - 1]!;
+    expect(last(w)[0]! & 0xf3).toBe(RIGHT);
+    expect(last(w)[2]! & 0xf3).toBe(LEFT_A);
+    expect([last(w)[1], last(w)[3]]).toEqual([0, 0]);
+    expect(last(a)[2]! & 0xf3).toBe(LEFT_A);
+    // The guest sees its own press at once; the others when it comes round.
+    guest.setButtons(0x10);
+    await run(17);
+    expect(last(b)[2]).toBe(0x10);
+    expect(last(w)[2]! & 0xf3).toBe(LEFT_A);
+    await run(300);
+    expect(last(w)[2]! & 0xf3).toBe(0x10);
+    // The game ends: every page's controls rest.
+    host.release();
+    await run(100);
+    for (const p of [a, b, w]) expect(last(p)).toEqual([]);
   });
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {

@@ -187,6 +187,9 @@ interface Copy {
   guestChanges: number;
   guestSeq: number;
   guestBeat: number;
+  /** The pads of the frame it ran last, player 1's first (the cabinet's
+   *  sticks and buttons show them). */
+  pads: number[];
 }
 
 /** The page at the cabinet (the focus UI), if any. */
@@ -211,6 +214,9 @@ interface CabinetSession {
   paintCount: number;
   /** What the cabinet shows now, so a still screen is painted once. */
   shown: string | null;
+  /** Its sticks and buttons were last set by a game here ('live'), or put
+   *  at rest ('rest'), or neither yet (null). */
+  controls: 'live' | 'rest' | null;
 }
 
 const sessions = new Map<string, CabinetSession>();
@@ -224,13 +230,17 @@ export function registerArcadeVisual(itemId: string, handle: ArcadeCabinetVisual
     existing.handle = handle;
     existing.pos = pos;
     existing.shown = null;
+    existing.controls = null;
     return;
   }
   sessions.set(itemId, freshSession(handle, pos));
 }
 
 function freshSession(handle: ArcadeCabinetVisualHandle, pos: { x: number; z: number }): CabinetSession {
-  return { handle, pos, docEpoch: casinoDocEpoch(), bornAt: Date.now(), copy: null, link: null, paintCount: 0, shown: null };
+  return {
+    handle, pos, docEpoch: casinoDocEpoch(), bornAt: Date.now(), copy: null, link: null, paintCount: 0, shown: null,
+    controls: null,
+  };
 }
 
 /** The cabinet's session in the room's current doc (a room change starts it
@@ -278,7 +288,7 @@ function newCopy(
     log: new PadLog(), hostLane: null, lastFramesAt: 0, stalledSince: null, needSync: false,
     syncFrom: null, lastSyncAskAt: 0, restoring: false, triedSnapshot: null,
     hostChecks: new Map(), myChecks: new Map(),
-    guestFor: 0, guestCur: 0, guestPrev: 0, guestChanges: 0, guestSeq: 0, guestBeat: 0,
+    guestFor: 0, guestCur: 0, guestPrev: 0, guestChanges: 0, guestSeq: 0, guestBeat: 0, pads: [0, 0],
   };
   s.copy = copy;
   s.shown = null;
@@ -505,8 +515,27 @@ export function arcadeFrame(dt: number, viewer: { x: number; z: number } | null)
       copy?.machine?.stop();
       s.copy = null;
     }
+    showControls(s, m, now);
     paint(s, m, now, viewer);
   }
+}
+
+/** The cabinet's sticks and buttons: each player's pad in the frame the game
+ *  ran last, and a guest's own as it presses (it comes back from the host a
+ *  little late), every frame (the cabinet skips what hasn't changed). At
+ *  rest while no game runs here, put there once, so the double-wide's other
+ *  session (arcadeNativeSession) can drive them. */
+function showControls(s: CabinetSession, m: ArcadeMatch | null, now: number): void {
+  const copy = s.copy;
+  let pads: number[] = [];
+  if (copy?.started && !copy.needSync && (copy.role === 'host' || hostSilentFor(s, copy, now) <= HOST_SILENT_MS)) {
+    pads = copy.pads.slice();
+    if (copy.role === 'follow' && s.link && m?.guestPage === PAGE) pads[m.hostSeat === 0 ? 1 : 0] = s.link.buttons;
+  }
+  const live = pads.length > 0;
+  if (!live && s.controls === 'rest') return;
+  s.controls = live ? 'live' : 'rest';
+  s.handle.setControls?.(pads);
 }
 
 /** Host: keep the guest pad with whoever holds the seat now. A new holder
@@ -556,6 +585,8 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     const pads = p1 | (p2 << 8);
     if (copy.runs.needsTickBefore(pads)) sendFrames(); // or a run goes unsent
     machine.runFrame(p1, p2);
+    copy.pads[0] = p1;
+    copy.pads[1] = p2;
     copy.runs.record(copy.next, pads);
     copy.next = frameAdd(copy.next, 1);
     if ((copy.next & (CHECK_EVERY - 1)) === 0) copy.latestCheck = machine.check();
@@ -630,6 +661,8 @@ function followFrame(itemId: string, s: CabinetSession, copy: Copy, m: ArcadeMat
   for (let i = 0; i < n; i++) {
     const pads = copy.log.get(copy.next);
     machine.runFrame(pads & 0xff, pads >> 8);
+    copy.pads[0] = pads & 0xff;
+    copy.pads[1] = pads >> 8;
     copy.next = frameAdd(copy.next, 1);
     if ((copy.next & (CHECK_EVERY - 1)) === 0 && copy.next !== 0) {
       copy.myChecks.set(copy.next, machine.check());
