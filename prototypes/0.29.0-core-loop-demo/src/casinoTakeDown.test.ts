@@ -111,3 +111,12 @@ describe('departedChips (the slide back to the rail)', () => {
     expect(departedChips(before.slice(2), [])).toEqual([]);
   });
 });
+
+describe('departedChips with odds on a flat bet', () => {
+  it('slides the odds that left, not the flat bet that stays under them', async () => {
+    const { departedChips } = await import('./casinoTable3d');
+    const flat = { x: 0.2, z: 0.1, chips: [5], dim: false };
+    const odds = { x: 0.2, z: 0.1, chips: [5], dim: false, lift: 1 };
+    expect(departedChips([flat, odds], [flat])).toEqual([{ ...odds, lift: 1 }]);
+  });
+});

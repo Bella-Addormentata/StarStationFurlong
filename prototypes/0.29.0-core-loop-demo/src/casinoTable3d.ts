@@ -1044,6 +1044,9 @@ function takeDownCanvas(): HTMLCanvasElement {
 
 function buildTakeDownButton(ctx: PiecesCtx): {
   mesh: THREE.Mesh;
+  /** Shown or hidden here: World sets every furniture mesh's own `visible`
+   *  back to true each interior frame, so the mesh's parent carries it. */
+  group: THREE.Group;
   place(at: { p: FeltPoint; toward: FeltPoint } | null, ready: boolean): void;
   setHot(hot: boolean): void;
   press(): void;
@@ -1053,8 +1056,10 @@ function buildTakeDownButton(ctx: PiecesCtx): {
   const rim = new THREE.MeshStandardMaterial({ color: 0xd4a84b, metalness: 0.6, roughness: 0.35, emissive: 0x000000 });
   const face = solidCanvas(takeDownCanvas());
   const mesh = new THREE.Mesh(geo, [rim, face, rim]);
-  mesh.visible = false;
-  ctx.attach(mesh);
+  const group = new THREE.Group();
+  group.visible = false;
+  group.add(mesh);
+  ctx.attach(group);
   let hot = false;
   let ready = false;
   let sink = 0;
@@ -1063,8 +1068,9 @@ function buildTakeDownButton(ctx: PiecesCtx): {
   };
   return {
     mesh,
+    group,
     place(at, isReady) {
-      mesh.visible = at !== null;
+      group.visible = at !== null;
       ready = isReady;
       if (at) {
         mesh.position.x = at.p.x;
@@ -1384,13 +1390,15 @@ const SWEEP_S = 0.5;
 const SWEEP_ARM_S = 1;
 
 /** The chips of mine that left the felt between two felt updates: each own
- *  stack's chips past what still stands at that spot (a stack that's gone
- *  gave all of them). Others' stacks never count. */
+ *  stack's chips past what still stands at that spot and height (a stack
+ *  that's gone gave all of them; odds riding on a flat bet share its spot
+ *  and differ by `lift`). Others' stacks never count. */
 export function departedChips(before: readonly FeltStack[], after: readonly FeltStack[]): FeltStack[] {
   const out: FeltStack[] = [];
   for (const s of before) {
     if (s.dim) continue;
-    const still = after.find((a) => !a.dim && Math.abs(a.x - s.x) < 1e-4 && Math.abs(a.z - s.z) < 1e-4);
+    const still = after.find((a) => !a.dim && Math.abs(a.x - s.x) < 1e-4 && Math.abs(a.z - s.z) < 1e-4
+      && (a.lift ?? 0) === (s.lift ?? 0));
     const left = still ? Math.max(0, s.chips.length - still.chips.length) : s.chips.length;
     if (left > 0) out.push({ ...s, chips: s.chips.slice(s.chips.length - left), lift: (s.lift ?? 0) + s.chips.length - left });
   }
@@ -1470,7 +1478,7 @@ class TableHandle implements CasinoTableVisualHandle {
 
   pick(ray: THREE.Raycaster, diceGrabbable: boolean): TablePick | null {
     const targets: THREE.Object3D[] = [this.c.feltMesh, this.c.railHit, this.c.settings.mesh];
-    if (this.c.takeDown.mesh.visible) targets.push(this.c.takeDown.mesh);
+    if (this.c.takeDown.group.visible) targets.push(this.c.takeDown.mesh);
     if (diceGrabbable && this.dice) targets.push(...this.dice.meshes());
     const hits = ray.intersectObjects(targets, false);
     for (const h of hits) {
