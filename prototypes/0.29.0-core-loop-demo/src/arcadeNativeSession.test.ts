@@ -519,7 +519,7 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     stateOf(a)!.players[0]!.score = 2500;
     await run(16000);
     expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => l.score)).toEqual([2500]);
-  });
+  }, 30_000); // half a minute of frames: about 5 s alone, more beside the rest of the suite
 
   it('counts the points a player scores in the moment after stepping away', async () => {
     const [a, b] = await room('a', 'b');
