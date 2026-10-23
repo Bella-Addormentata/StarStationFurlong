@@ -207,6 +207,9 @@ interface Copy {
   soundRate: number;
   /** The frame's cues, collected for the chip. */
   cues: unknown[];
+  /** The pads of the frame it ran last, seat by seat (the cabinet's sticks
+   *  and buttons show them). */
+  pads: number[];
 }
 
 interface LinkState {
@@ -234,6 +237,9 @@ interface CabinetSession {
   holds: boolean;
   /** The cabinet's high scores for the game on screen, as last read. */
   board: { at: number; game: string; lines: HighScore[] } | null;
+  /** Its sticks and buttons were last set by a game here ('live'), or put
+   *  at rest ('rest'), or neither yet (null). */
+  controls: 'live' | 'rest' | null;
 }
 
 const sessions = new Map<string, CabinetSession>();
@@ -246,6 +252,7 @@ export function registerNativeArcadeVisual(itemId: string, handle: ArcadeCabinet
     existing.handle = handle;
     existing.pos = pos;
     existing.shown = null;
+    existing.controls = null;
     return;
   }
   sessions.set(itemId, freshSession(handle, pos));
@@ -254,7 +261,7 @@ export function registerNativeArcadeVisual(itemId: string, handle: ArcadeCabinet
 function freshSession(handle: ArcadeCabinetVisualHandle, pos: { x: number; z: number }): CabinetSession {
   return {
     handle, pos, docEpoch: casinoDocEpoch(), bornAt: Date.now(), copy: null, link: null, paintCount: 0, shown: null, holds: false,
-    board: null,
+    board: null, controls: null,
   };
 }
 
@@ -295,7 +302,7 @@ function newCopy(s: CabinetSession, m: NativeMatch, game: NativeGame, role: 'hos
     logLo: new PadLog(), logHi: new PadLog(), hostLane: null, lastFramesAt: 0, stalledSince: null, needSync: false,
     syncFrom: null, lastSyncAskAt: 0, restoring: false, triedSnapshot: null, hostChecks: new Map(), myChecks: new Map(),
     guestFor: 0, guestCur: 0, guestPrev: 0, guestChanges: 0, guestSeq: 0, guestBeat: 0,
-    sound: null, soundRate: 0, cues: [],
+    sound: null, soundRate: 0, cues: [], pads: new Array<number>(NATIVE_MAX_SEATS).fill(0),
   };
   s.copy = copy;
   s.shown = null;
@@ -314,6 +321,7 @@ const SILENT_SOUND: NativeSound = {
  *  has a speaker: the frame's cues go to the chip, the chip's samples to the
  *  speaker. A chip that throws (made or run) is dropped, never the game. */
 function runFrame(s: CabinetSession, copy: Copy, pads: readonly number[]): void {
+  for (let n = 0; n < NATIVE_MAX_SEATS; n++) copy.pads[n] = pads[n] ?? 0;
   const link = s.link;
   const sink = link?.audio ?? null;
   if (!link || !sink) {
@@ -524,8 +532,28 @@ export function nativeArcadeFrame(dt: number, viewer: { x: number; z: number } |
       }
       s.copy = null;
     }
+    showControls(itemId, s, m, now);
     paint(itemId, s, m, now, viewer);
   }
+}
+
+/** The cabinet's sticks and buttons: each seat's pad in the frame its game
+ *  ran last, and this page's own seat's as it presses (a guest's comes back
+ *  from the host a little late), every frame (the cabinet skips what hasn't
+ *  changed). At rest while no game runs here, put there once, so the
+ *  cabinet's other session (arcadeNesSession) can drive them. */
+function showControls(itemId: string, s: CabinetSession, m: NativeMatch | null, now: number): void {
+  const copy = s.copy;
+  let pads: number[] = [];
+  if (copy?.started && (copy.role === 'host' || hostSilentFor(s, copy, now) <= HOST_SILENT_MS)) {
+    pads = copy.pads.slice();
+    const mine = copy.role === 'follow' && s.link && m ? mySeatIn(itemId, m) : null;
+    if (mine !== null) pads[mine] = s.link!.buttons;
+  }
+  const live = pads.length > 0;
+  if (!live && s.controls === 'rest') return;
+  s.controls = live ? 'live' : 'rest';
+  s.handle.setControls?.(pads);
 }
 
 /** Host: keep seat `n`'s pad with whoever holds it now (a new holder starts

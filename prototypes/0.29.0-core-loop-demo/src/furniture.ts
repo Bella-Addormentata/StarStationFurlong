@@ -8890,15 +8890,21 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
   const deck = place(new THREE.BoxGeometry(W + 0.04, 0.06, 0.30), m(BODY, 0.55, 0.4), 0, 0.93, -0.21);
   deck.rotation.x = 0.18; // front edge dips toward the player
   place(new THREE.BoxGeometry(W + 0.04, 0.012, 0.28), m(0x1a1f2b, 0.8, 0.1), 0, 0.963, -0.21).rotation.x = 0.18;
-  spec.players.forEach((px, i) => {
+  // The players face +z, so their left is +x: each stick on the left (+x)
+  // of its buttons, under the left hand as on the keyboard, on a pivot at
+  // its foot (the plate stays put); the buttons B then A to its right. They
+  // move with that player's pad (arcadeControls).
+  const stations = spec.players.map((px, i): ArcadeStation => {
     const ball = i === 0 ? 0xe02030 : 0x20c060;
-    const buttons = i === 0 ? ([0xe02030, 0x2050e0] as const) : ([0x20c060, 0xe0c020] as const);
-    place(new THREE.CylinderGeometry(0.035, 0.035, 0.012, 16), m(TRIM, 0.8, 0.2), px - 0.14, 0.972, -0.23);
-    place(new THREE.CylinderGeometry(0.008, 0.008, 0.08, 8), m(0xc0c8d0, 0.3, 0.8), px - 0.14, 1.01, -0.23);
-    place(new THREE.SphereGeometry(0.026, 14, 10), m(ball, 0.35, 0.1), px - 0.14, 1.06, -0.23);
-    buttons.forEach((color, b) => {
-      place(new THREE.CylinderGeometry(0.026, 0.026, 0.02, 16), m(color, 0.35, 0.1, color, 0.35), px + 0.06 + b * 0.10, 0.978, -0.23);
-    });
+    const colours = i === 0 ? ([0xe02030, 0x2050e0] as const) : ([0x20c060, 0xe0c020] as const);
+    place(new THREE.CylinderGeometry(0.035, 0.035, 0.012, 16), m(TRIM, 0.8, 0.2), px + 0.14, 0.972, -0.23);
+    const stick = arcadeStick(ctx, px + 0.14, 0.975, -0.23, [
+      [new THREE.CylinderGeometry(0.008, 0.008, 0.08, 8), m(0xc0c8d0, 0.3, 0.8), 0.035],
+      [new THREE.SphereGeometry(0.026, 14, 10), m(ball, 0.35, 0.1), 0.085],
+    ]);
+    const buttons = colours.map((color, b) =>
+      place(new THREE.CylinderGeometry(0.026, 0.026, 0.02, 16), m(color, 0.35, 0.1, color, 0.35), px - 0.06 - b * 0.10, 0.978, -0.23));
+    return { stick, buttons };
   });
 
   // The marquee's lit name and the screen both emulators paint
@@ -8927,6 +8933,8 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
   // ⚙️ on the kick plate's level, between the coin doors: the settings.
   placeArcadeSettingsGear(ctx, 0, -0.19, -1);
 
+  // The players stand at -z, looking +z.
+  surface.visual.setControls = arcadeControls(stations, -1);
   // Both handles on the screen mesh (registerFurnitureHandles files them).
   screen.userData.arcadeScreen = surface.screen;
   screen.userData.arcadeCabinet = surface.visual;
@@ -11442,6 +11450,94 @@ function arcadeScreenSurface(
   return { texture, screen, visual };
 }
 
+// ── 🕹 The sticks and buttons, moving with the players ──────────────────────
+// Each player's stick tilts the way their pad points and their buttons sink
+// while held, on every page in the room: the arcade sessions hand the pads
+// of the frame they ran to the cabinet's setControls (the page that plays a
+// seat shows its own presses at once).
+
+/** The pad bits a cabinet's controls show: the NES's (arcadeMachine), which
+ *  the cabinet's own games use too. */
+const ARCADE_PAD_A = 1 << 0;
+const ARCADE_PAD_B = 1 << 1;
+const ARCADE_PAD_START = 1 << 3;
+const ARCADE_PAD_UP = 1 << 4;
+const ARCADE_PAD_DOWN = 1 << 5;
+const ARCADE_PAD_LEFT = 1 << 6;
+const ARCADE_PAD_RIGHT = 1 << 7;
+/** How far a stick leans when pushed (radians, each way). */
+export const ARCADE_STICK_THROW = 0.3;
+/** How far a held button sinks (metres). */
+export const ARCADE_BUTTON_TRAVEL = 0.006;
+/** The single and double-wide cabinets' buttons: their height, and their
+ *  centre's on the deck, so they stand about a centimetre proud of it and
+ *  still show when held. */
+const ARCADE_BUTTON_H = 0.02;
+const ARCADE_BUTTON_Y = 1.006;
+
+/** One player's controls on a cabinet's deck. */
+interface ArcadeStation {
+  /** The stick's pivot, at its foot. */
+  stick: THREE.Object3D;
+  /** The buttons, left to right as the player sees them: B, A, then START
+   *  where there is a third. */
+  buttons: THREE.Mesh[];
+}
+
+/**
+ * A stick built to move: a pivot at its foot (`x`, `footY`, `z`, in the
+ * cabinet's frame) carrying `parts`, each a geometry and material at a
+ * height above the foot.
+ */
+function arcadeStick(
+  { attach }: BuildCtx,
+  x: number,
+  footY: number,
+  z: number,
+  parts: ReadonlyArray<readonly [THREE.BufferGeometry, THREE.Material, number]>,
+): THREE.Group {
+  const pivot = new THREE.Group();
+  pivot.position.set(x, footY, z);
+  for (const [geo, mat, y] of parts) {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.y = y;
+    pivot.add(mesh);
+  }
+  attach(pivot);
+  return pivot;
+}
+
+/**
+ * Drive `stations` (player 1 first) from pads, for a cabinet whose players
+ * look along -z (`face` 1: they stand at +z) or +z (`face` -1). UP leans a
+ * stick away from its player, RIGHT to their right; a held button sinks and
+ * glows brighter. A player with no pad rests.
+ */
+function arcadeControls(stations: readonly ArcadeStation[], face: 1 | -1): (pads: readonly number[]) => void {
+  const rest = stations.map((st) => st.buttons.map((b) => ({
+    y: b.position.y,
+    glow: (b.material as THREE.MeshStandardMaterial).emissiveIntensity,
+  })));
+  const shown = stations.map(() => 0);
+  const bits = [ARCADE_PAD_B, ARCADE_PAD_A, ARCADE_PAD_START];
+  return (pads) => {
+    stations.forEach((st, i) => {
+      const pad = pads[i] ?? 0;
+      if (shown[i] === pad) return;
+      shown[i] = pad;
+      const back = (pad & ARCADE_PAD_DOWN ? 1 : 0) - (pad & ARCADE_PAD_UP ? 1 : 0);
+      const left = (pad & ARCADE_PAD_LEFT ? 1 : 0) - (pad & ARCADE_PAD_RIGHT ? 1 : 0);
+      st.stick.rotation.set(face * back * ARCADE_STICK_THROW, 0, face * left * ARCADE_STICK_THROW);
+      st.buttons.forEach((button, b) => {
+        const held = (pad & (bits[b] ?? 0)) !== 0;
+        button.position.y = rest[i]![b]!.y - (held ? ARCADE_BUTTON_TRAVEL : 0);
+        const mat = button.material as THREE.MeshStandardMaterial;
+        mat.emissiveIntensity = rest[i]![b]!.glow * (held ? 2 : 1);
+      });
+    });
+  };
+}
+
 /**
  * 🕹 The marquee (#193): the game's name, lit from behind in a box above the
  * screen, like the cabinets of old. Repainted only when the name changes.
@@ -11675,12 +11771,15 @@ function buildArcadeCabinet(ctx: BuildCtx) {
   // The control deck, angled toward the player: joystick left, buttons right.
   const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
   deck.rotation.x = -0.22;
-  place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), -0.17, 1.04, 0.3);
-  place(new THREE.SphereGeometry(0.028, 10, 8), m(0xff3b3b, 0.4, 0.1), -0.17, 1.09, 0.3);
-  const buttons: ReadonlyArray<readonly [number, number]> = [[0.02, TRIM], [0.12, SIDE], [0.22, 0x2fe6a0]];
-  for (const [bx, color] of buttons) {
-    place(new THREE.CylinderGeometry(0.022, 0.022, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), bx, 1.0, 0.31);
-  }
+  // The stick on a pivot at its foot, and the buttons, B, A and START left
+  // to right: they move with the player's pad (arcadeControls).
+  const stick = arcadeStick(ctx, -0.17, 0.995, 0.3, [
+    [new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), 0.045],
+    [new THREE.SphereGeometry(0.028, 10, 8), m(0xff3b3b, 0.4, 0.1), 0.095],
+  ]);
+  const buttonColours: ReadonlyArray<readonly [number, number]> = [[0.02, TRIM], [0.12, SIDE], [0.22, 0x2fe6a0]];
+  const buttons = buttonColours.map(([bx, color]) =>
+    place(new THREE.CylinderGeometry(0.022, 0.022, ARCADE_BUTTON_H, 12), m(color, 0.35, 0.2, color, 0.25), bx, ARCADE_BUTTON_Y, 0.31));
   // Coin door with its slot.
   place(new THREE.BoxGeometry(0.22, 0.16, 0.02), m(0x3d4a5e, 0.5, 0.5), 0, 0.5, d / 2 - 0.005);
   place(new THREE.BoxGeometry(0.05, 0.012, 0.016), m(0x05070c, 0.8, 0.1), 0, 0.52, d / 2 + 0.003);
@@ -11708,6 +11807,7 @@ function buildArcadeCabinet(ctx: BuildCtx) {
     tubes: [0], tubeY: ARCADE_SCREEN_Y - 1.25, tubeW: ARCADE_TUBE_W, tubeH: ARCADE_TUBE_H, tilt: ARCADE_TUBE_TILT,
     body: BODY, bezel: PANEL, material: crtScreenMaterial(surface.texture),
   });
+  surface.visual.setControls = arcadeControls([{ stick, buttons }], 1);
   // Both handles on the screen mesh (registerFurnitureHandles files them):
   // the room record's card, and the built-in emulator's painter.
   screen.userData.arcadeScreen = surface.screen;
@@ -11750,20 +11850,28 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
   // glow, so they read as that colour in a dim room too.
   const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
   deck.rotation.x = -0.22;
+  const stations: ArcadeStation[] = [];
   for (let p = 0; p < ARCADE_WIDE_SEATS; p++) {
     const cx = (p - (ARCADE_WIDE_SEATS - 1) / 2) * (w / ARCADE_WIDE_SEATS);
     const color = PLAYER[p]!;
-    // Each tagged with its station: a click on it seats the player there
-    // (world.ts, arcadeStations.ts).
-    const station = [
-      place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), cx - 0.08, 1.04, 0.3),
-      place(new THREE.SphereGeometry(0.028, 10, 8), m(color, 0.35, 0.1, color, 0.45), cx - 0.08, 1.09, 0.3),
-      ...[0.04, 0.11].map((bx) =>
-        place(new THREE.CylinderGeometry(0.02, 0.02, 0.014, 12), m(color, 0.35, 0.2, color, 0.45), cx + bx, 1.0, 0.31)),
+    // The stick on a pivot at its foot, and the buttons, B then A: they
+    // move with that player's pad (arcadeControls).
+    const stick = arcadeStick(ctx, cx - 0.08, 0.995, 0.3, [
+      [new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), 0.045],
+      [new THREE.SphereGeometry(0.028, 10, 8), m(color, 0.35, 0.1, color, 0.45), 0.095],
+    ]);
+    const buttons = [0.04, 0.11].map((bx) =>
+      place(new THREE.CylinderGeometry(0.02, 0.02, ARCADE_BUTTON_H, 12), m(color, 0.35, 0.2, color, 0.45), cx + bx, ARCADE_BUTTON_Y, 0.31));
+    stations.push({ stick, buttons });
+    // Each part tagged with its station: a click on it seats the player
+    // there (world.ts, arcadeStations.ts).
+    const parts = [
+      ...(stick.children as THREE.Mesh[]),
+      ...buttons,
       place(new THREE.BoxGeometry(0.08, 0.1, 0.02), m(0x3d4a5e, 0.5, 0.5), cx, 0.5, d / 2 - 0.005),
       place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 + 0.003),
     ];
-    for (const mesh of station) mesh.userData.arcadeStation = p;
+    for (const mesh of parts) mesh.userData.arcadeStation = p;
   }
   // ⚙️ in the middle, below the coin doors, just above the plinth: anyone's
   // way to the settings.
@@ -11799,6 +11907,7 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
     body: BODY, bezel: PANEL,
     material: [0, 1].map((index) => crtScreenMaterial(surface.texture, undefined, { index, count: 2 }, lines)),
   });
+  surface.visual.setControls = arcadeControls(stations, 1);
   // Both handles once, on the left screen (registerFurnitureHandles).
   left!.userData.arcadeScreen = surface.screen;
   left!.userData.arcadeCabinet = surface.visual;

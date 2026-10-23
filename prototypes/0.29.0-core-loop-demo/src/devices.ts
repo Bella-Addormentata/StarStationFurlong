@@ -648,6 +648,11 @@ export interface ArcadeCabinetVisualHandle {
    *  cabinet's own game; showAttract puts the NES's back). Absent where the
    *  tube's lines are fixed. */
   setPictureLines?(w: number, h: number): void;
+  /** Each player's stick and buttons, from their pad (player 1 first, as a
+   *  pad byte: A, B, SELECT, START, UP, DOWN, LEFT, RIGHT from bit 0): the
+   *  stick leans the way it points and held buttons sink. A player left
+   *  out rests. Absent where the controls don't move. */
+  setControls?(pads: readonly number[]): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────

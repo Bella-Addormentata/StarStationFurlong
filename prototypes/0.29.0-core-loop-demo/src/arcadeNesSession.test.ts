@@ -44,6 +44,8 @@ interface Page {
   hashes: Map<number, number>;
   cards: string[];
   attract: number;
+  /** What the cabinet's sticks and buttons were last told, call by call. */
+  controls: number[][];
   /** Ticks sent this update (delivered by run()), and every tick sent. */
   outbox: Uint8Array[];
   sent: Uint8Array[];
@@ -77,7 +79,7 @@ async function openPage(name: string, viewer: { x: number; z: number } | null = 
   games.bindGamesDoc(doc);
   const page: Page = {
     name, lane: `lane-${name}`, mod, games, casino, Y, doc,
-    hashes: new Map(), cards: [], attract: 0, outbox: [], sent: [], viewer, closed: false, every: 1,
+    hashes: new Map(), cards: [], attract: 0, controls: [], outbox: [], sent: [], viewer, closed: false, every: 1,
   };
   doc.on('update', (update: Uint8Array, origin: unknown) => {
     if (origin === 'room' || page.closed) return;
@@ -103,6 +105,7 @@ async function openPage(name: string, viewer: { x: number; z: number } | null = 
     },
     present: () => undefined,
     showAttract: () => page.attract++,
+    setControls: (pads) => void page.controls.push([...pads]),
   }, { x: 0, z: 0 });
   pages.push(page);
   return page;
@@ -276,6 +279,33 @@ describe('a shared game, played by two and watched by a third', () => {
     for (const p of [b, c]) expect(hostAt - p.mod.arcadeCopyInfo(ITEM)!.next).toBeLessThan(6);
     expect(ticksOf(b, 'sync').length + ticksOf(c, 'sync').length).toBe(0);
   }, 60_000);
+
+  it("moves every page's sticks and buttons with both players' pads, and rests them when the game ends", async () => {
+    const [a, b, c] = await room(['a', null], ['b', null], ['c', null]);
+    // Nothing runs yet: at rest, said once.
+    await run(50);
+    expect(c.controls).toEqual([[]]);
+    const host = await startGame(a, 0, 2);
+    const guest = link(b, 1, 2);
+    guest.join();
+    await run(50);
+    const last = (p: Page) => p.controls[p.controls.length - 1]!;
+    host.setButtons(0x80); // RIGHT
+    guest.setButtons(0x41); // LEFT + A
+    await run(300);
+    for (const p of [a, b, c]) expect(last(p), p.name).toEqual([0x80, 0x41]);
+    // Player 2 sees its own press at once; the others when it comes round.
+    guest.setButtons(0x10);
+    await run(17);
+    expect(last(b)[1]).toBe(0x10);
+    expect(last(c)[1]).toBe(0x41);
+    await run(300);
+    expect(last(c)).toEqual([0x80, 0x10]);
+    // The game ends: every page's controls rest.
+    host.stop();
+    await run(50);
+    for (const p of [a, b, c]) expect(last(p), p.name).toEqual([]);
+  }, 30_000);
 
   it('player 2 can hand the pad back and take it again', async () => {
     const [a, b] = await room(['a', null], ['b', null]);
