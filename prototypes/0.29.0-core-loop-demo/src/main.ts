@@ -65,6 +65,7 @@ import {
 } from "./alligatorsSession";
 // 🕹️ Shared arcade games: their pad bytes ride lane kind 1 as a subtype.
 import { routeArcadeTick, setArcadeSender } from "./arcadeNesSession";
+import { routeNativeArcadeTick, setNativeArcadeSender } from "./arcadeNativeSession";
 import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView, setCameraModeLock } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
@@ -689,6 +690,7 @@ subscribeDoorLayout(() => {
 setAirHockeySender((buf) => networkProvider.sendTick(buf));
 setAlligatorsSender((buf) => networkProvider.sendTick(buf));
 setArcadeSender((buf) => networkProvider.sendTick(buf));
+setNativeArcadeSender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -3259,7 +3261,9 @@ async function joinRoomAtEpoch(
         seenPeers.add(peerId);
         receivedTicks++;
         remoteLastSeen.set(peerId, performance.now());
+        // Each session reads only its own wire (arcadeNet.ts).
         routeArcadeTick(peerId, raw);
+        routeNativeArcadeTick(peerId, raw);
         return;
       }
       // 🏒 #115: flags bits 6–7 select the tick lane. Mallet/puck ticks are

@@ -216,7 +216,12 @@ import { createArcadeCabinetUI as createNesCabinetUI } from "./arcadeNesCabinet"
 // 🕹️ Shared arcade games: every cabinet's game runs on every page in the
 // room from the host's button presses (arcadeNesSession.ts).
 import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeNesSession";
-import { writeArcade } from "./games/gamesDoc";
+// 🕹🕹 The double-wide cabinet's own games (Lantern Road): the same, four seats.
+import {
+  closeNativeArcadeCabinet, linkNativeArcade, nativeArcadeFrame, nativeSeatStatus, registerNativeArcadeVisual,
+  setNativeCabinetGameReader,
+} from "./arcadeNativeSession";
+import { writeArcade, writeNativeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
 import {
@@ -262,7 +267,7 @@ import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
 import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
 import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
 import { tickRomShare } from "./arcadeRomShare";
-import { arcadeScreenView, builtInEntry, countBuiltInPlay, mySeat, readCabinet, seatStatus } from "./arcadeDoc";
+import { arcadeScreenView, builtInEntry, countBuiltInPlay, mySeat, nativeEntry, readCabinet, seatStatus } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -338,6 +343,10 @@ interface RemoteAvatar {
  *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
+
+/** 🕹🕹 A double-wide cabinet stand counts as taken by somebody standing
+ *  this close to it: under half the 0.4 m between its stands. */
+const NATIVE_STAND_TAKEN_M = 0.18;
 
 /** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
  *  falls back to the id-based pose (old gossip without wall data). Anchoring a
@@ -642,6 +651,10 @@ export class World {
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
+    // 🕹🕹 Which cabinets run one of their own games: the double-wide one,
+    // when its game (the owner's pick) is one.
+    setNativeCabinetGameReader((itemId) =>
+      this.arcadeSeats(itemId) === 4 ? nativeEntry(readCabinet(itemId).game)?.id ?? null : null);
     this.platformGroup = new THREE.Group();
     this.platformGroup.position.set(0, 0, 0);
     this.scene.add(this.platformGroup);
@@ -1830,7 +1843,10 @@ export class World {
         // 🕹️ And an arcade cabinet's screen, which the session paints with
         // the room's shared game (its position sets the watcher repaint rate).
         const arcade = sinks.arcadeCabinetVisuals.get(item.id);
-        if (arcade) registerArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
+        if (arcade) {
+          registerArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
+          registerNativeArcadeVisual(item.id, arcade, { x: item.pos.x, z: item.pos.z });
+        }
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -3208,7 +3224,10 @@ export class World {
         // 🕹️ A moved cabinet keeps its screen; its new spot sets how often
         // watchers repaint it.
         const arcade = this.arcadeCabinetVisuals.get(id);
-        if (arcade) registerArcadeVisual(id, arcade, { x: rec.x, z: rec.z });
+        if (arcade) {
+          registerArcadeVisual(id, arcade, { x: rec.x, z: rec.z });
+          registerNativeArcadeVisual(id, arcade, { x: rec.x, z: rec.z });
+        }
         changedIds.add(id);
       }
     }
@@ -3374,6 +3393,8 @@ export class World {
       // 🕹️ A removed cabinet's shared game ends with it, for everyone.
       closeArcadeCabinet(itemId);
       writeArcade(itemId, null);
+      closeNativeArcadeCabinet(itemId);
+      writeNativeArcade(itemId, null);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -4182,6 +4203,7 @@ export class World {
     // UI, so a host's game runs on this update's buttons, not the last one's.
     const me = this.player.getPosition();
     arcadeFrame(deltaTime, { x: me.x, z: me.z });
+    nativeArcadeFrame(deltaTime, { x: me.x, z: me.z });
 
     // Drive room-edit mode (E2 of #25): force-exit when the view leaves the
     // plain isometric room (zoom ≠ 2 / solar map) + selection-label tracking.
@@ -6402,10 +6424,32 @@ export class World {
    * for both. Each swaps to the other in place, and PLAY is rebuilt when
    * the owner changes the game.
    */
-  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView, seat = 0, seats: 1 | 2 = 1): DeviceUI {
+  private arcadeCabinetUI(deviceId: string, view: ArcadePanelView, seat: number | null = 0, seats: 1 | 2 = 1): DeviceUI {
     const swap = (next: ArcadePanelView) => () => {
       deviceFocus.replaceFocusedUI(this.arcadeCabinetUI(deviceId, next, seat, seats));
     };
+    // 🕹🕹 The double-wide cabinet's own game: on its screen like a built-in
+    // one, from the stand stepped up to (`seat`, null at the front with no
+    // stand free), with four seats. On any other cabinet it doesn't play.
+    const own = nativeEntry(readCabinet(deviceId).game);
+    if (view === "play" && own) {
+      const wide = this.arcadeSeats(deviceId) === 4;
+      return createNesCabinetUI({
+        itemId: deviceId,
+        visual: this.arcadeCabinetVisuals.get(deviceId),
+        game: () => {
+          const now = nativeEntry(readCabinet(deviceId).game);
+          return wide && now === own ? own : null;
+        },
+        onGameChanged: swap("play"),
+        openSettings: swap("settings"),
+        onPlay: () => countBuiltInPlay(deviceId),
+        openLink: wide ? () => linkNativeArcade(deviceId, seat) : undefined,
+        keys: own.controls,
+        notice: wide ? undefined : "MADE FOR THE DOUBLE-WIDE CABINET",
+        requestRelease: () => deviceFocus.release(),
+      });
+    }
     if (view === "play" && builtInEntry(readCabinet(deviceId).game)) {
       return createNesCabinetUI({
         itemId: deviceId,
@@ -6429,7 +6473,7 @@ export class World {
       openSettings: swap("settings"),
       openPlay: swap("play"),
       seats: this.arcadeSeats(deviceId),
-      seat,
+      seat: seat ?? 0,
     });
   }
 
@@ -6460,6 +6504,36 @@ export class World {
       if (s && seatStatus(deviceId, n) === "free" && reachable(s)) return s;
     }
     return null;
+  }
+
+  /** 🕹🕹 The double-wide cabinet's own game: this page's stand if it plays
+   *  there, else the nearest reachable stand whose seat is free and nobody
+   *  stands on. Its stands are a stride apart, too close for
+   *  pickFreeStand's 0.7 m test: one player would shut out the next. */
+  private pickNativeSeatStand(deviceId: string): StandSlot | null {
+    const stands = standsForItem(deviceId);
+    const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
+    const reachable = this.standReachability();
+    const status = nativeSeatStatus(deviceId);
+    const mine = status.indexOf("mine");
+    if (mine >= 0) {
+      const own = at(mine);
+      return own && reachable(own) ? own : null;
+    }
+    const others = this.getRemoteAvatarSnapshots();
+    const me = this.player.getPosition();
+    const free = status
+      .map((st, n) => (st === "free" ? at(n) : null))
+      .filter((s): s is StandSlot =>
+        s !== null &&
+        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < NATIVE_STAND_TAKEN_M) &&
+        reachable(s));
+    free.sort(
+      (a, b) =>
+        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
+        Math.hypot(b.front.x - me.x, b.front.z - me.z),
+    );
+    return free[0] ?? null;
   }
 
   /**
@@ -7017,10 +7091,14 @@ export class World {
       // the one-player cabinet, play from the device front.
       const seats = this.arcadeSeats(deviceId);
       const builtIn = builtInEntry(readCabinet(deviceId).game) !== null;
+      // Its own game seats four by stand (s0 = player 1), the free one
+      // nearest; no stand free, the front, to watch.
+      const own = seats === 4 && nativeEntry(readCabinet(deviceId).game) !== null;
       const stand = seats === 2 ? this.pickFreeStand(deviceId)
-        : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId)
-          : null;
-      const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : 0;
+        : own ? this.pickNativeSeatStand(deviceId)
+          : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId)
+            : null;
+      const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : own ? null : 0;
       const target: DeviceTarget = stand
         ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
         : device;

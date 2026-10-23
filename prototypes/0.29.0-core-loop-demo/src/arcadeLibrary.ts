@@ -38,6 +38,10 @@ export interface ArcadeGame {
   controls: string;
 }
 
+/** What a cabinet's menu needs of its game: a bundled ROM, or one of the
+ *  cabinet's own games (arcadeNativeGames.ts). */
+export type CabinetGame = Pick<ArcadeGame, 'id' | 'title' | 'blurb' | 'controls'>;
+
 export const ARCADE_GAMES: readonly ArcadeGame[] = [
   {
     id: 'thwaite',

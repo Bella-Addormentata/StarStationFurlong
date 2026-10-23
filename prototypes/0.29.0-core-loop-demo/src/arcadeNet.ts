@@ -27,6 +27,14 @@
  *   [4]     0x7f: the rest of the NaN exponent
  *   [5..12] the type's own eight bytes (see packArcadeTick)
  *
+ * TWO WIRES share the lane, told apart by the version bits: 0 is the NES
+ * games' (arcadeNesSession.ts), 1 the cabinet's own games'
+ * (arcadeNativeSession.ts), whose four players need a second FRAMES tick
+ * for players 3 and 4 (type 3, which wire 0 never sends). A client that
+ * speaks only wire 0 drops wire 1's ticks as a later version's, and each
+ * session reads only its own wire, so two matches that drew the same id on
+ * different wires never feed each other's pads.
+ *
  * FRAMES (host → room) carry the pad bytes as two runs: the current pair,
  * held for the last run0+1 frames, and the pair before it, held run1+1
  * frames before that. Pads change a few times a second, so each tick repeats
@@ -78,10 +86,18 @@ const KIND_1 = 0x40;
 const TYPE_FRAMES = 0;
 const TYPE_GUEST = 1;
 const TYPE_SYNC = 2;
+/** Wire 1 only: FRAMES for players 3 and 4. */
+const TYPE_FRAMES_HI = 3;
+
+/** The NES games' wire, and the cabinet's own games' (version bits). */
+export const ARCADE_WIRE_NES = 0;
+export const ARCADE_WIRE_NATIVE = 1;
+export type ArcadeWire = typeof ARCADE_WIRE_NES | typeof ARCADE_WIRE_NATIVE;
 
 export type ArcadeTick =
-  /** Host → room: pad bytes ending at `frame` (p1 | p2 << 8 per frame). */
-  | { type: 'frames'; match: number; frame: number; cur: number; run0: number; prev: number; run1: number; check: number }
+  /** Host → room: pad bytes ending at `frame` (p1 | p2 << 8 per frame; on
+   *  the native wire `half` 1 carries p3 | p4 << 8 instead). */
+  | { type: 'frames'; match: number; frame: number; cur: number; run0: number; prev: number; run1: number; check: number; half?: 0 | 1 }
   /** Guest → host: the guest's pad. `changes` counts its changes (u8) so a
    *  host that missed one can replay `prev` for a frame. */
   | { type: 'guest'; match: number; token: number; cur: number; prev: number; changes: number; seq: number }
@@ -93,10 +109,11 @@ export function isArcadeTickFlags(flags: number): boolean {
   return (flags & 0xe0) === (KIND_1 | ARCADE_TICK_BIT);
 }
 
-export function packArcadeTick(t: ArcadeTick): Uint8Array {
+export function packArcadeTick(t: ArcadeTick, wire: ArcadeWire = ARCADE_WIRE_NES): Uint8Array {
   const b = new Uint8Array(TICK_BYTES);
-  const type = t.type === 'frames' ? TYPE_FRAMES : t.type === 'guest' ? TYPE_GUEST : TYPE_SYNC;
-  b[0] = KIND_1 | ARCADE_TICK_BIT | type;
+  const type = t.type === 'frames' ? (t.half === 1 && wire === ARCADE_WIRE_NATIVE ? TYPE_FRAMES_HI : TYPE_FRAMES)
+    : t.type === 'guest' ? TYPE_GUEST : TYPE_SYNC;
+  b[0] = KIND_1 | ARCADE_TICK_BIT | (wire << 2) | type;
   b[1] = t.match & 0xff;
   b[2] = (t.match >> 8) & 0xff;
   b[3] = 0xc0 | (t.type === 'frames' ? t.check & 0x3f : 0);
@@ -125,21 +142,28 @@ export function packArcadeTick(t: ArcadeTick): Uint8Array {
   return b;
 }
 
-/** Decode a bare 13-byte tick; null if it isn't a well-formed arcade tick
- *  (another lane's, a newer version's, or garbage from a peer). */
-export function unpackArcadeTick(b: Uint8Array): ArcadeTick | null {
+/** Decode a bare 13-byte tick on `wire`; null if it isn't a well-formed
+ *  arcade tick of that wire (another lane's, another wire's, a newer
+ *  version's, or garbage from a peer). */
+export function unpackArcadeTick(b: Uint8Array, wire: ArcadeWire = ARCADE_WIRE_NES): ArcadeTick | null {
   if (b.byteLength < TICK_BYTES || !isArcadeTickFlags(b[0])) return null;
-  if (b[0] & 0x1c) return null; // a later wire version
+  if (((b[0] >> 2) & 0x07) !== wire) return null; // another wire, or a later version
   if ((b[3] & 0xc0) !== 0xc0 || b[4] !== 0x7f) return null; // not NaN-boxed
   const match = b[1] | (b[2] << 8);
   if (match === 0) return null;
   const u16 = (i: number) => b[i] | (b[i + 1] << 8);
   switch (b[0] & 0x03) {
     case TYPE_FRAMES:
-      return {
+    case TYPE_FRAMES_HI: {
+      const hi = (b[0] & 0x03) === TYPE_FRAMES_HI;
+      if (hi && wire !== ARCADE_WIRE_NATIVE) return null;
+      const t: ArcadeTick = {
         type: 'frames', match, frame: u16(5),
         cur: u16(7), run0: b[9], prev: u16(10), run1: b[12], check: b[3] & 0x3f,
       };
+      if (wire === ARCADE_WIRE_NATIVE) t.half = hi ? 1 : 0;
+      return t;
+    }
     case TYPE_GUEST:
       return { type: 'guest', match, token: u16(5), cur: b[7], prev: b[8], changes: b[9], seq: u16(10) };
     case TYPE_SYNC:

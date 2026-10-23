@@ -4,7 +4,10 @@
  * pages and the idle attract card.
  *
  * The canvas is 512×480, exactly twice the NES's 256×240, so each NES pixel is
- * a 2×2 block. The canvas stays clean apart from blacks lifted off pure
+ * a 2×2 block — or, on the double-wide cabinet, 1024×384, its two tubes' 8:3,
+ * where everything here is drawn at 512×480 and stretched to fill it, as
+ * the two tubes stretched it before, and a cabinet's own game (drawWith)
+ * draws at the canvas's own size. The canvas stays clean apart from blacks lifted off pure
  * black: the CRT look (scanlines, bleed, glow, vignette, flicker) is the
  * tube's own material, drawn over this picture in the cabinet (arcadeCrt.ts,
  * #194).
@@ -62,15 +65,22 @@ export interface ArcadeScreenPainter {
   drawCard(title: string, line: string): void;
   /** The idle cabinet: what everyone else in the room sees. */
   drawAttract(): void;
+  /** Hand the whole canvas, at its own size, to a cabinet's own game. */
+  drawWith(paint: (ctx: CanvasRenderingContext2D, w: number, h: number) => void): void;
 }
 
 /** Pages drawCredits can show: one per bundled game plus the closing page. */
 export const CREDIT_PAGES = ARCADE_GAMES.length + 1;
 
-export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScreenPainter {
-  canvas.width = SCREEN_W;
-  canvas.height = SCREEN_H;
+export function createArcadeScreenPainter(
+  canvas: HTMLCanvasElement,
+  size: { w: number; h: number } = { w: SCREEN_W, h: SCREEN_H },
+): ArcadeScreenPainter {
+  canvas.width = size.w;
+  canvas.height = size.h;
   const ctx = canvas.getContext('2d')!;
+  /** Everything but drawWith draws on a 512×480 screen, stretched to the canvas. */
+  const fit = () => ctx.setTransform(size.w / SCREEN_W, 0, 0, size.h / SCREEN_H, 0, 0);
 
   // The NES frame lands here at native size, then scales 2× onto the screen.
   let nes: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; image: ImageData } | null = null;
@@ -104,6 +114,7 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
 
   return {
     drawFrame(frame) {
+      fit();
       const s = nesSurface();
       writeFrameRgba(frame, s.image.data);
       s.ctx.putImageData(s.image, 0, 0);
@@ -112,6 +123,7 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
     },
 
     drawMenu(rows, selected, status, blink) {
+      fit();
       clear();
       header('SSF ARCADE');
       let y = 112;
@@ -135,6 +147,7 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
     },
 
     drawCredits(page) {
+      fit();
       clear();
       header('CREDITS & LICENSES');
       const game: ArcadeGame | undefined = ARCADE_GAMES[page];
@@ -161,17 +174,24 @@ export function createArcadeScreenPainter(canvas: HTMLCanvasElement): ArcadeScre
     },
 
     drawCard(title, line) {
+      fit();
       clear();
       text(title, SCREEN_W / 2, SCREEN_H / 2 - 10, 28, PHOSPHOR, 'center');
       text(line, SCREEN_W / 2, SCREEN_H / 2 + 30, 18, PHOSPHOR_DIM, 'center');
     },
 
     drawAttract() {
+      fit();
       clear();
       text('SSF', SCREEN_W / 2, 170, 72, AMBER, 'center');
       text('ARCADE', SCREEN_W / 2, 240, 52, PHOSPHOR, 'center');
       text(`${ARCADE_GAMES.length} GAMES INSIDE`, SCREEN_W / 2, 310, 20, PHOSPHOR_DIM, 'center');
       text('STEP UP TO PLAY', SCREEN_W / 2, 370, 22, PHOSPHOR, 'center');
+    },
+
+    drawWith(paint) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      paint(ctx, canvas.width, canvas.height);
     },
   };
 }

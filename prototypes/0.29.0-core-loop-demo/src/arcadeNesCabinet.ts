@@ -24,7 +24,7 @@
  * Esc and Tab pass through untouched.
  */
 
-import { ARCADE_GAMES, LICENSE_LABEL, type ArcadeGame } from './arcadeLibrary';
+import { ARCADE_GAMES, LICENSE_LABEL, type CabinetGame } from './arcadeLibrary';
 import type { NesButton, NesPlayer } from './arcadeMachine';
 import { padByte } from './arcadeNet';
 import { CREDIT_PAGES, type ArcadeMenuRow } from './arcadeScreen';
@@ -36,12 +36,14 @@ import { isFormFieldTarget } from './typingFocus';
 // ── Pure menu model (tested) ─────────────────────────────────────────────────
 
 export type MenuEntry =
-  | { kind: 'game'; game: ArcadeGame }
+  | { kind: 'game'; game: CabinetGame }
   | { kind: 'credits' };
 
-/** The cabinet's menu: its one game, then the credits. */
-export function menuFor(game: ArcadeGame | null): MenuEntry[] {
-  return game ? [{ kind: 'game', game }, { kind: 'credits' }] : [{ kind: 'credits' }];
+/** The cabinet's menu: its one game, then the credits — the bundled ROMs'
+ *  licences, which a cabinet's own game (the app's code) has no page in. */
+export function menuFor(game: CabinetGame | null): MenuEntry[] {
+  if (!game) return [{ kind: 'credits' }];
+  return ARCADE_GAMES.some((g) => g.id === game.id) ? [{ kind: 'game', game }, { kind: 'credits' }] : [{ kind: 'game', game }];
 }
 
 export function menuRows(menu: readonly MenuEntry[]): ArcadeMenuRow[] {
@@ -68,7 +70,7 @@ export type ArcadeView =
 
 export type MenuAction =
   | { kind: 'none' }
-  | { kind: 'start'; game: ArcadeGame };
+  | { kind: 'start'; game: CabinetGame };
 
 /** A button pressed while the menu or credits are up. */
 export function menuInput(view: ArcadeView, button: NesButton, menu: readonly MenuEntry[]): { view: ArcadeView; action: MenuAction } {
@@ -181,10 +183,10 @@ export interface ArcadeCabinetUIDeps {
   /** The cabinet's furniture id (its shared game's doc key). */
   itemId: string;
   visual: ArcadeCabinetVisualHandle | undefined;
-  /** The built-in game on the cabinet now (arcadeDoc, the owner's pick), or
-   *  null when it has none or the owner's own. Read every update; default:
-   *  the library's first game. */
-  game?: () => ArcadeGame | null;
+  /** The built-in game on the cabinet now (arcadeDoc, the owner's pick): a
+   *  bundled ROM or the cabinet's own game, or null when it has none or the
+   *  owner's own. Read every update; default: the library's first game. */
+  game?: () => CabinetGame | null;
   /** The cabinet's game is no longer the one this UI was built for: World
    *  builds the UI for the new one in its place. */
   onGameChanged?: () => void;
@@ -198,21 +200,28 @@ export interface ArcadeCabinetUIDeps {
   seats?: 1 | 2;
   /** Leave the cabinet (the strip's LEAVE button). */
   requestRelease: () => void;
-  /** The shared-game session (stubbed in tests). */
+  /** The shared-game session: the NES games' unless given (tests stub it). */
   link?: ArcadeLink;
+  /** Or open one when the UI mounts (the cabinet's own games bring theirs):
+   *  a link takes the cabinet's screen, so not before the UI is up. */
+  openLink?: () => ArcadeLink;
+  /** The strip's key line while playing (default: the NES pad's). */
+  keys?: string;
+  /** The menu's status line when it opens (why there's nothing to play). */
+  notice?: string;
 }
 
 const STRIP_MENU = 'ENTER PLAY · ↑↓ CHOOSE · ESC LEAVE';
 const STRIP_KEYS = 'ARROWS/WASD PAD · X = A · Z = B · ENTER START · SHIFT SELECT';
 
-function stripFor(view: ArcadeView): string {
+function stripFor(view: ArcadeView, keys = STRIP_KEYS): string {
   if (view.screen !== 'shared') return STRIP_MENU;
   if (view.phase === 'ended') return 'PLAYER 1 LEFT · ESC LEAVE';
   if (view.phase === 'loading') return 'LOADING… · ESC LEAVE';
   if (view.phase === 'joining') return 'JOINING THE GAME… · ESC LEAVE';
   if (view.role === 'watcher') return view.joinAs ? `WATCHING · ENTER PLAYS PLAYER ${view.joinAs} · ESC LEAVE` : 'WATCHING · ESC LEAVE';
   const back = view.role === 'host' ? '⌫ END GAME' : '⌫ STOP PLAYING';
-  return `PLAYER ${view.player} · ${STRIP_KEYS} · ${back} · ESC LEAVE`;
+  return `PLAYER ${view.player} · ${keys} · ${back} · ESC LEAVE`;
 }
 
 const sameShared = (a: SharedView, b: ArcadeView): boolean =>
@@ -262,7 +271,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     view = next;
     if (next.screen === 'menu') menuCursor = next.cursor;
     dirty = true;
-    if (stripText) stripText.textContent = stripFor(next);
+    if (stripText) stripText.textContent = stripFor(next, deps.keys);
     if (spoken) {
       const words = describeView(next, menu);
       if (spoken.textContent !== words) spoken.textContent = words;
@@ -300,7 +309,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     if (wasHost) backToMenu();
   };
 
-  const startShared = (game: ArcadeGame) => {
+  const startShared = (game: CabinetGame) => {
     if (!link) return;
     link.host(game);
     const shared = link.shared();
@@ -426,9 +435,9 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       usedByCabinet.clear();
       padHeld[0] = new Set();
       padHeld[1] = new Set();
-      link = deps.link ?? linkArcade(deps.itemId, seat, seats);
+      link = deps.link ?? deps.openLink?.() ?? linkArcade(deps.itemId, seat, seats);
       autoJoin = true;
-      setView({ screen: 'menu', cursor: menuCursor, status: deps.visual ? null : 'CABINET SCREEN NOT FOUND' });
+      setView({ screen: 'menu', cursor: menuCursor, status: deps.visual ? deps.notice ?? null : 'CABINET SCREEN NOT FOUND' });
 
       // Clicks on the view stay with the cabinet (a stray click would
       // otherwise release the focus mid-game); LEAVE and Esc leave.
@@ -452,7 +461,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
         color:#7CFFB0; font:12px 'SF Mono','Monaco','Consolas',monospace;
         box-sizing:border-box; pointer-events:auto;`;
       stripText = document.createElement('span');
-      stripText.textContent = stripFor(view);
+      stripText.textContent = stripFor(view, deps.keys);
       const leave = document.createElement('button');
       leave.textContent = 'LEAVE';
       leave.style.cssText = `

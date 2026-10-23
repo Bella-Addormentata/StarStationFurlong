@@ -199,6 +199,7 @@ function recordingPainter() {
     drawCredits: vi.fn(),
     drawCard: vi.fn(),
     drawAttract: vi.fn(),
+    drawWith: vi.fn(),
   } satisfies ArcadeScreenPainter;
 }
 
@@ -399,6 +400,23 @@ describe('the focus UI', () => {
     expect(link.setButtons).toHaveBeenLastCalledWith(0b1001); // A and Start
     ui.unmount();
     expect(link.release).toHaveBeenCalled();
+  });
+
+  it("opens a cabinet's own game's link when the UI mounts, not when it is built", () => {
+    const link: ArcadeLink = {
+      shared: () => null, takeError: () => null, host: vi.fn(), stop: vi.fn(), join: vi.fn(), setButtons: vi.fn(),
+      setLocalPad2: vi.fn(), setAudio: vi.fn(), setUiScreen: vi.fn(), release: vi.fn(),
+    };
+    const openLink = vi.fn(() => link);
+    const visual: ArcadeCabinetVisualHandle = { painter: recordingPainter(), present: vi.fn(), showAttract: vi.fn() };
+    const ui = createArcadeCabinetUI({ itemId: ITEM, visual, requestRelease: vi.fn(), openLink });
+    // Built for a walk that may never arrive: nothing holds the screen yet.
+    expect(openLink).not.toHaveBeenCalled();
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    expect(openLink).toHaveBeenCalledTimes(1);
+    expect(link.setUiScreen).toHaveBeenLastCalledWith(true);
+    ui.unmount();
+    expect(link.release).toHaveBeenCalledTimes(1);
   });
 
   it('never takes Esc or Tab, so leaving and the phone still work', () => {

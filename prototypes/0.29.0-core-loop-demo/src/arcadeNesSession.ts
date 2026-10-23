@@ -28,7 +28,7 @@
  * screen (the menu, the credits) this layer doesn't paint.
  */
 
-import { ARCADE_GAMES, type ArcadeGame } from './arcadeLibrary';
+import { ARCADE_GAMES, type ArcadeGame, type CabinetGame } from './arcadeLibrary';
 import { ArcadeMachine, NES_FPS } from './arcadeMachine';
 import {
   GuestPad, PadLog, PadRuns, decodeSnapshot, encodeSnapshot, frameAdd, frameDiff,
@@ -765,11 +765,11 @@ export interface SharedView {
   role: 'host' | 'guest' | 'watcher';
   title: string;
   phase: SharedPhase;
-  /** A watcher at a two-player cabinet's free stand: the player it would
-   *  play (the one the host doesn't), else null. */
-  joinAs: 1 | 2 | null;
-  /** Player number this page plays (1 or 2), or null for a watcher. */
-  player: 1 | 2 | null;
+  /** A watcher at a free stand: the player it would play (at a two-player
+   *  cabinet, the one the host doesn't), else null. */
+  joinAs: number | null;
+  /** Player number this page plays (from 1), or null for a watcher. */
+  player: number | null;
 }
 
 export interface ArcadeLink {
@@ -777,11 +777,11 @@ export interface ArcadeLink {
   shared(): SharedView | null;
   /** Why starting a game failed last, once (the menu's status line). */
   takeError(): string | null;
-  /** Start a bundled game here as its host. */
-  host(game: ArcadeGame): void;
-  /** Host: end the game. Guest: hand player 2 back. */
+  /** Start the cabinet's game here as its host. */
+  host(game: CabinetGame): void;
+  /** Host: end the game. Guest: hand the seat back. */
   stop(): void;
-  /** Take player 2 on the running game. */
+  /** Take the free seat this page's stand is on, in the running game. */
   join(): void;
   /** This page's pad this frame: the seat it plays, as a pad byte. */
   setButtons(pad: number): void;
@@ -853,9 +853,10 @@ export function linkArcade(itemId: string, seat: 0 | 1, seats: 1 | 2): ArcadeLin
       return e;
     },
 
-    host(game: ArcadeGame): void {
+    host(entry: CabinetGame): void {
       const s = session();
-      if (!s) return;
+      const game = gameById(entry.id);
+      if (!s || !game) return;
       const hostSeat: 0 | 1 = seats === 2 ? seat : 0;
       const copy = newCopy(s, itemId, 0, PAGE, game, 'host');
       const match = newMatch({

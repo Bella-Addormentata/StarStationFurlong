@@ -224,6 +224,13 @@ describe('registerFurnitureHandles — one list', () => {
     }
   });
 
+  it('both registration paths hand an arcade cabinet to both its sessions (NES and its own games)', () => {
+    for (const [name, text] of [['world.ts', world], ['devMenu.ts', devMenu]] as const) {
+      expect(text, `${name} must register the cabinet with the NES session`).toContain('registerArcadeVisual(');
+      expect(text, `${name} must register the cabinet with its own games' session`).toContain('registerNativeArcadeVisual(');
+    }
+  });
+
   it("World's one-path removal deletes from every sink the list files into (#45 F1)", () => {
     for (const key of Object.keys(freshSinks())) {
       // Per-item maps: `this.<sink>.delete(`; the spinner list is rebuilt by filter.

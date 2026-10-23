@@ -62,7 +62,7 @@ import { createArcadeScreenPainter } from "./arcadeScreen";
 import { CASHIER_SCREEN_H, CASHIER_SCREEN_W, paintCashierAttract, paintCashierMenu } from "./cashierScreen";
 import type { CashierScreenHandle } from "./cashierScreen";
 // 📺 The cabinets' curved CRT tube and its screen shader (#194).
-import { crtFaceGeometry, crtScreenMaterial, crtTick } from "./arcadeCrt";
+import { ARCADE_CRT_LOOK, crtFaceGeometry, crtScreenMaterial, crtTick } from "./arcadeCrt";
 // 🏒 #115: the table sculpt is sized by the SAME playfield constants the pure
 // engine simulates — one source of truth for rails, goals, puck and mallets.
 import {
@@ -1825,6 +1825,11 @@ const ARCADE_WIDE_D = ARCADE_D;
 const ARCADE_WIDE_SEATS = 4;
 /** The double-wide's two tubes stand this far apart: one screen, a seam. */
 const ARCADE_WIDE_TUBE_GAP = 0.008;
+/** The double-wide's screen canvas: its two tubes' 8:3, 512×384 each, so a
+ *  game made for it (arcadeNativeGames.ts) has a pixel for every one of its
+ *  own (Lantern Road is 512×192 at 2×). The NES side stretches to fill it,
+ *  as the two tubes stretched its 4:3 before. */
+const ARCADE_WIDE_CANVAS = { w: 1024, h: 384 };
 
 /** The furniture kinds that are arcade cabinets (main.ts and world.ts tick
  *  them, arcadeDoc keys them by item id alike). */
@@ -11372,14 +11377,23 @@ function paintArcadeScreen(c2d: CanvasRenderingContext2D, w: number, h: number, 
  * World draws at 2 Hz) is painted into the same canvas at its 320×240 layout,
  * scaled. The NES side takes the screen with present() and hands it back
  * with showAttract(), which repaints the latest card.
+ *
+ * The double-wide cabinet passes its own `size` (8:3) and a `lines` uniform
+ * its tubes share: a cabinet's own game sets the scanline count to its
+ * picture's rows (setPictureLines), and showAttract puts the NES's back.
  */
-function arcadeScreenSurface(players: string, setGlow: (i: number) => void, onView?: (view: ArcadeScreenView) => void): {
+function arcadeScreenSurface(
+  players: string,
+  setGlow: (i: number) => void,
+  onView?: (view: ArcadeScreenView) => void,
+  wide?: { size: { w: number; h: number }; lines: { value: THREE.Vector2 } },
+): {
   texture: THREE.CanvasTexture;
   screen: ArcadeScreenHandle;
   visual: ArcadeCabinetVisualHandle;
 } {
   const canvas = document.createElement("canvas");
-  const painter = createArcadeScreenPainter(canvas);
+  const painter = createArcadeScreenPainter(canvas, wide?.size);
   const c2d = canvas.getContext("2d")!;
   const texture = new THREE.CanvasTexture(canvas);
   // Linear filtering over the 2× pixel grid: the tube's bleed starts here.
@@ -11416,9 +11430,11 @@ function arcadeScreenSurface(players: string, setGlow: (i: number) => void, onVi
     },
     showAttract(): void {
       nesHolds = false;
+      wide?.lines.value.set(...ARCADE_CRT_LOOK.lines);
       paintCard();
     },
   };
+  if (wide) visual.setPictureLines = (w, h) => void wide.lines.value.set(w, h);
   paintCard();
   onView?.(latest);
   return { texture, screen, visual };
@@ -11762,14 +11778,18 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
   // Two monitors acting as one screen: butted together behind one pane with
   // no bezel between them, the left half of the picture on the left tube and
   // the right half on the right.
-  const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title));
+  const lines = { value: new THREE.Vector2(...ARCADE_CRT_LOOK.lines) };
+  const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title), {
+    size: ARCADE_WIDE_CANVAS,
+    lines,
+  });
   const tubeX = ARCADE_TUBE_W / 2 + ARCADE_WIDE_TUBE_GAP / 2;
   const [left] = placeArcadeMonitorBay(ctx, {
     y: 1.25, z: ARCADE_UPPER_FACE_Z, face: 1, w, h: 0.7,
     tubes: [-tubeX, tubeX], joined: true,
     tubeY: ARCADE_SCREEN_Y - 1.25, tubeW: ARCADE_TUBE_W, tubeH: ARCADE_TUBE_H, tilt: ARCADE_TUBE_TILT,
     body: BODY, bezel: PANEL,
-    material: [0, 1].map((index) => crtScreenMaterial(surface.texture, undefined, { index, count: 2 })),
+    material: [0, 1].map((index) => crtScreenMaterial(surface.texture, undefined, { index, count: 2 }, lines)),
   });
   // Both handles once, on the left screen (registerFurnitureHandles).
   left!.userData.arcadeScreen = surface.screen;

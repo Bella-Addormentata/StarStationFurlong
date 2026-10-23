@@ -69,6 +69,7 @@
 
 import * as Y from 'yjs';
 import { ARCADE_GAMES as BUILT_IN_GAMES, type ArcadeGame as BuiltInGame } from './arcadeLibrary';
+import { nativeGameById, type NativeGame } from './arcadeNativeGames';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
 import { ownMediaOrigins } from './tvConsent';
 
@@ -166,15 +167,25 @@ export interface ArcadeGame {
 }
 
 /** A built-in game as it goes on a cabinet — always rebuilt from the
- *  library, so a peer's record can name one and nothing else about it. */
+ *  library, so a peer's record can name one and nothing else about it. A
+ *  cabinet's own game (arcadeNativeGames.ts) goes on the same way: `core`
+ *  is only a placeholder there, since no emulator runs it. */
 export function builtInGame(id: string): ArcadeGame | null {
   const lib = BUILT_IN_GAMES.find((g) => g.id === id);
-  return lib ? { name: lib.title, core: 'nes', url: '', size: 0, bundled: lib.id } : null;
+  if (lib) return { name: lib.title, core: 'nes', url: '', size: 0, bundled: lib.id };
+  const own = nativeGameById(id);
+  return own ? { name: own.title, core: 'nes', url: '', size: 0, bundled: own.id } : null;
 }
 
-/** The library entry behind a cabinet's game, or null for the owner's own. */
+/** The library entry behind a cabinet's game, or null for the owner's own
+ *  (and for a cabinet's own game: nativeEntry). */
 export function builtInEntry(g: ArcadeGame | null): BuiltInGame | null {
   return (g?.bundled && BUILT_IN_GAMES.find((b) => b.id === g.bundled)) || null;
+}
+
+/** The cabinet's own game behind a cabinet's game, or null. */
+export function nativeEntry(g: ArcadeGame | null): NativeGame | null {
+  return nativeGameById(g?.bundled);
 }
 
 /** What a cabinet nobody has set up plays: walk up and press play. */
@@ -680,7 +691,8 @@ export function countPlay(itemId: string): void {
 /** A built-in game started on the cabinet: the page that hosts it counts
  *  it (there is no P1 seat — the shared game is its host's). */
 export function countBuiltInPlay(itemId: string): void {
-  if (!builtInEntry(readCuration(itemId).game)) return;
+  const game = readCuration(itemId).game;
+  if (!builtInEntry(game) && !nativeEntry(game)) return;
   write(playsKey(itemId), { plays: bump(readPlays(itemId)) } satisfies PlaysRecord);
 }
 
