@@ -17,10 +17,10 @@ const station = (n: number) => ({ userData: { arcadeStation: n } });
 const screen = { userData: {} };
 
 describe('wideClick', () => {
-  it('is on a station when the mesh clicked is one of its parts', () => {
-    expect(wideClick({ x: 0.1, z: 0.3 }, station(2))).toEqual({ x: 0.1, z: 0.3, onStation: true });
-    expect(wideClick({ x: 0.1, z: 0.3 }, station(0)).onStation).toBe(true);
-    expect(wideClick({ x: 0.1, z: 0.2 }, screen).onStation).toBe(false);
+  it("names the station whose part was clicked, and none for the screens", () => {
+    expect(wideClick({ x: 0.1, z: 0.3 }, station(2))).toEqual({ x: 0.1, z: 0.3, station: 2 });
+    expect(wideClick({ x: 0.1, z: 0.3 }, station(0)).station).toBe(0);
+    expect(wideClick({ x: 0.1, z: 0.2 }, screen).station).toBeNull();
   });
 });
 
@@ -33,6 +33,13 @@ describe('wideStationFor', () => {
     expect(seat(wideStationFor(stands, stands, stands[0]!.front, wideClick({ x: -0.16, z: 0.31 }, station(1))))).toBe(1);
     // Player 3's coin door.
     expect(seat(wideStationFor(stands, stands, far, wideClick({ x: 0.2, z: 0.5 }, station(2))))).toBe(2);
+  });
+
+  it("picks the station clicked even when its stand was moved to be walkable", () => {
+    // Something set down in front of player 2's station pushed its stand out
+    // past player 1's: clicking player 2's stick is still player 2.
+    const moved = stands.map((s, n) => (n === 1 ? { ...s, front: { x: -0.75, z: 1.5 } } : s));
+    expect(seat(wideStationFor(moved, moved, { x: 0, z: 3 }, wideClick({ x: -0.28, z: 0.3 }, station(1))))).toBe(1);
   });
 
   it('keeps the station the player walked up to when they click the screens', () => {
