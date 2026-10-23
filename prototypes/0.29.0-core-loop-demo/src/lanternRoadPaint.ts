@@ -667,10 +667,14 @@ function drawStaff(ctx: CanvasRenderingContext2D, p: LrPlayer, sx: number, sy: n
 const TAG_GAP_X = 16;
 const TAG_GAP_Y = 9;
 
+/** How far a seat tag has risen, `TAG_FRAMES - tag` frames after it showed. */
+const tagRise = (tag: number): number => Math.min(4, (TAG_FRAMES - tag) >> 2);
+
 /**
  * How far above its usual spot each seat's tag goes: players who drop in
  * (or come back) together stand in one spot, so their tags stack instead of
- * printing over each other. Game pixels, by seat (exported for its tests).
+ * printing over each other. Measured where drawPlayer prints them, rise and
+ * all. Game pixels, by seat (exported for its tests).
  */
 export function tagLifts(s: LrState): number[] {
   const lifts = new Array<number>(LR_SEATS).fill(0);
@@ -678,8 +682,8 @@ export function tagLifts(s: LrState): number[] {
   for (let seat = 0; seat < LR_SEATS; seat++) {
     const p = s.players[seat]!;
     if (!p.on || p.ko > 0 || p.tag <= 0) continue;
-    const x = p.x / SUB;
-    const y = p.y / SUB;
+    const x = Math.round(p.x / SUB);
+    const y = Math.round(p.y / SUB) - tagRise(p.tag);
     let lift = 0;
     while (placed.some((q) => Math.abs(q.x - x) < TAG_GAP_X && Math.abs(q.y - (y - lift)) < TAG_GAP_Y)) lift += TAG_GAP_Y;
     placed.push({ x, y: y - lift });
@@ -710,7 +714,7 @@ function drawPlayer(ctx: CanvasRenderingContext2D, s: LrState, seat: number, cam
   if (p.tag > 0) {
     // Just dropped in: their seat over their head, in their colour.
     ctx.globalAlpha = Math.min(1, p.tag / 20);
-    const ty = sy - 6 - lift - Math.min(4, (TAG_FRAMES - p.tag) >> 2);
+    const ty = sy - 6 - lift - tagRise(p.tag);
     text(ctx, `${seat + 1}P`, sx + 8, ty, 8, SEAT_COLOURS[seat]!.light, 'center');
     ctx.fillStyle = SEAT_COLOURS[seat]!.light;
     if (lift > 0) ctx.fillRect(sx + 8, ty + 2, 1, lift);

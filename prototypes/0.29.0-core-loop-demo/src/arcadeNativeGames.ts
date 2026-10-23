@@ -51,8 +51,9 @@ export interface NativeGame<S = unknown> {
   check(state: S): number;
   /** A save state as a peer sent it (JSON), or null if it isn't one. */
   restore(raw: unknown): S | null;
-  /** Each seat's score now, or null for a seat nobody plays: the host
-   *  enters them on the cabinet's high scores. */
+  /** Each seat's score now, or null once nobody plays it (the seat's PRESENT
+   *  bit out a while): the host enters them on the cabinet's high scores,
+   *  and holds a newcomer's pad back until the seat's last player is gone. */
   scores(state: S): ReadonlyArray<number | null>;
   /** Draw the state onto the screen canvas, `w`×`h`. */
   paint(ctx: CanvasRenderingContext2D, state: S, w: number, h: number, hud?: NativeHud): void;

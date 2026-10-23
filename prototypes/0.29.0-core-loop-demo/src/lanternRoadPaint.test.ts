@@ -31,6 +31,18 @@ describe('seat tags', () => {
     expect(lifts[3]).toBe(0);
   });
 
+  it('stack by where the tags are printed, one that has risen included', () => {
+    // A tag rises 4 pixels over its first frames: a player standing a tag's
+    // height lower, whose tag has risen, prints it right over a new one.
+    const s = standing([100, 100, 300, 400]);
+    s.players[1]!.y = 109 * SUB;
+    s.players[1]!.tag = TAG_FRAMES - 16;
+    expect(tagLifts(s)[1]).toBeGreaterThan(0);
+    // And one that hasn't risen yet still clears it.
+    s.players[1]!.tag = TAG_FRAMES;
+    expect(tagLifts(s)[1]).toBe(0);
+  });
+
   it('only count tags that are showing', () => {
     const s = standing([100, 100 + LR_PLAYER_W / SUB / 2, 100, 100]);
     s.players[0]!.tag = 0;

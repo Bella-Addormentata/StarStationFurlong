@@ -28,7 +28,10 @@
  *
  * HIGH SCORES: the host follows each player's go off the game's scores and
  * enters it on the cabinet's table (arcadeDoc `scores:`) when the player
- * steps away, when the game ends, and every SCORES_EVERY_MS meanwhile.
+ * steps away, when the game ends, and every SCORES_EVERY_MS meanwhile. A go
+ * lasts as long as its player is on the road, so the points from the moment
+ * after they let go of the seat count too; someone who takes the seat in
+ * that moment waits it out (their pad held back) and starts their own go.
  *
  * The cabinet's screen: the game while one runs, with the cabinet's best
  * score; while none does, the game's own title, taking turns with the
@@ -116,6 +119,8 @@ export function setNativeArcadeSender(fn: ((buf: Uint8Array) => void) | null): v
 /** Which native game a cabinet is set up for (World installs the reader:
  *  the double-wide cabinet's game, if it is one of ours), else null. */
 let cabinetGame: (itemId: string) => string | null = () => null;
+/** Goes this page has hosted: each one's run id ends with its count. */
+let goCount = 0;
 
 export function setNativeCabinetGameReader(fn: ((itemId: string) => string | null) | null): void {
   cabinetGame = fn ?? (() => null);
@@ -130,6 +135,8 @@ const send = (t: ArcadeTick): void => {
 /** Host: one player's go at a seat, for the cabinet's high scores. */
 interface Go {
   run: string;
+  /** Whose go it is: the game's player at the seat is theirs until it
+   *  leaves the road, whoever holds the seat meanwhile. */
   player: string;
   name: string;
   score: number;
@@ -515,6 +522,9 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     held.push(true);
   }
   const guests = held.some((h, n) => h && n !== m!.hostSeat);
+  // A seat taken while the last player is still on the road: the newcomer's
+  // pad waits until that player has left (in a puff), so they start afresh.
+  const handing = seats.map((seat, n) => !!seat && !!copy.goes[n] && copy.goes[n]!.player !== seat.player);
   const id = m.id;
   const hostSeat = m.hostSeat;
   const sendFrames = (): void => {
@@ -528,7 +538,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   while (copy.acc >= FRAME_S && copy.ranNow < HOST_STEP_MAX) {
     for (let n = 0; n < NATIVE_MAX_SEATS; n++) {
       const pad = n === hostSeat ? (s.link?.buttons ?? 0) : held[n] ? copy.guestPads[n]!.next() : 0;
-      pads[n] = held[n] ? (pad & ~NATIVE_PRESENT & 0xff) | NATIVE_PRESENT : 0;
+      pads[n] = held[n] && !handing[n] ? (pad & ~NATIVE_PRESENT & 0xff) | NATIVE_PRESENT : 0;
     }
     const lo = pads[0]! | (pads[1]! << 8);
     const hi = pads[2]! | (pads[3]! << 8);
@@ -554,23 +564,27 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
 }
 
 /** Host: follow each seat's go off the game's scores. A go ends when its
- *  player steps away (or another takes the seat) and is entered on the
- *  cabinet's high scores then; the rest are entered every SCORES_EVERY_MS. */
+ *  player leaves the road (a moment after stepping away) and is entered on
+ *  the cabinet's high scores then; the rest are entered every
+ *  SCORES_EVERY_MS. */
 function followGoes(itemId: string, copy: Copy, m: NativeMatch, seats: ReadonlyArray<NativeSeat | null>, now: number): void {
   const scores = copy.game.scores(copy.state);
   const ended: Go[] = [];
   for (let n = 0; n < NATIVE_MAX_SEATS; n++) {
     const score = scores[n] ?? null;
-    const player = n === m.hostSeat ? m.host : seats[n]?.player ?? null;
     let go = copy.goes[n] ?? null;
-    if (go && (score === null || (player !== null && player !== go.player))) {
+    if (go && score === null) {
       ended.push(go);
       go = copy.goes[n] = null;
     }
-    if (score === null || player === null) continue;
-    go ??= copy.goes[n] = {
-      run: `${m.hostPage}:${m.startedAt}:${n}:${copy.next}`, player, name: readPlayerDisplayName(player), score, entered: 0,
-    };
+    if (score === null) continue;
+    if (!go) {
+      const player = n === m.hostSeat ? m.host : seats[n]?.player ?? null;
+      if (player === null) continue;
+      go = copy.goes[n] = {
+        run: `${m.hostPage}:${m.startedAt}:${n}:${++goCount}`, player, name: readPlayerDisplayName(player), score, entered: 0,
+      };
+    }
     go.score = score;
   }
   enterGoes(itemId, copy, now, now - copy.goesEnteredAt >= SCORES_EVERY_MS, ended);
