@@ -69,15 +69,17 @@ describe('menu model', () => {
 });
 
 describe('keys', () => {
-  it('maps arrows and WASD to the pad, X/Z to A/B, Enter/Shift to Start/Select', () => {
+  it('maps arrows and WASD to the pad, M/K/X to A and N/J/Z to B, Enter/Shift to Start/Select', () => {
     expect(['ArrowUp', 'KeyW', 'ArrowDown', 'KeyS', 'ArrowLeft', 'KeyA', 'ArrowRight', 'KeyD'].map(keyToButton))
       .toEqual(['UP', 'UP', 'DOWN', 'DOWN', 'LEFT', 'LEFT', 'RIGHT', 'RIGHT']);
-    expect(['KeyX', 'KeyK', 'KeyZ', 'KeyJ', 'Enter', 'ShiftLeft'].map(keyToButton))
-      .toEqual(['A', 'A', 'B', 'B', 'START', 'SELECT']);
+    // WASD's buttons under the right hand, B left of A as on the pad.
+    expect(['KeyN', 'KeyM', 'KeyJ', 'KeyK'].map(keyToButton)).toEqual(['B', 'A', 'B', 'A']);
+    // The arrows' buttons under the left hand.
+    expect(['KeyZ', 'KeyX', 'Enter', 'ShiftLeft'].map(keyToButton)).toEqual(['B', 'A', 'START', 'SELECT']);
   });
 
   it('leaves Esc, Tab and everything else alone', () => {
-    expect(['Escape', 'Tab', 'KeyM', 'Space', 'Backspace'].map(keyToButton)).toEqual([null, null, null, null, null]);
+    expect(['Escape', 'Tab', 'KeyL', 'Comma', 'Space', 'Backspace'].map(keyToButton)).toEqual([null, null, null, null, null, null]);
   });
 });
 

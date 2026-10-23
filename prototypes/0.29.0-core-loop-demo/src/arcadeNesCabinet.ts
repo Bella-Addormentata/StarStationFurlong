@@ -132,15 +132,17 @@ export function describeView(view: ArcadeView, menu: readonly MenuEntry[]): stri
   return `Playing ${view.title} as player ${view.player}. ${back}, Escape leaves the cabinet.`;
 }
 
-/** Keyboard → NES pad (player 1). Arrows or WASD; X/K = A, Z/J = B. */
+/** Keyboard → NES pad (player 1). WASD with N = B and M = A under the
+ *  right hand (J and K above them work too), or the arrows with Z = B and
+ *  X = A under the left. A real pad's order: B on the left, A on the right. */
 export function keyToButton(code: string): NesButton | null {
   switch (code) {
     case 'ArrowUp': case 'KeyW': return 'UP';
     case 'ArrowDown': case 'KeyS': return 'DOWN';
     case 'ArrowLeft': case 'KeyA': return 'LEFT';
     case 'ArrowRight': case 'KeyD': return 'RIGHT';
-    case 'KeyX': case 'KeyK': return 'A';
-    case 'KeyZ': case 'KeyJ': return 'B';
+    case 'KeyM': case 'KeyK': case 'KeyX': return 'A';
+    case 'KeyN': case 'KeyJ': case 'KeyZ': return 'B';
     case 'Enter': case 'NumpadEnter': return 'START';
     case 'ShiftLeft': case 'ShiftRight': return 'SELECT';
     default: return null;
@@ -212,7 +214,7 @@ export interface ArcadeCabinetUIDeps {
 }
 
 const STRIP_MENU = 'ENTER PLAY · ↑↓ CHOOSE · ESC LEAVE';
-const STRIP_KEYS = 'ARROWS/WASD PAD · X = A · Z = B · ENTER START · SHIFT SELECT';
+const STRIP_KEYS = 'WASD + N M  OR  ARROWS + Z X · ENTER START · SHIFT SELECT';
 
 function stripFor(view: ArcadeView, keys = STRIP_KEYS): string {
   if (view.screen !== 'shared') return STRIP_MENU;
