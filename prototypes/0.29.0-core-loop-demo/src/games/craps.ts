@@ -333,6 +333,18 @@ export function canPlaceBet(type: CrapsBetType, point: number | null): boolean {
   return true;
 }
 
+/** Whether a bet may come off the felt while betting is open ("take me
+ *  down"). Real-casino rules: a pass line bet once its point is set, and a
+ *  come bet once it has travelled to a number, are CONTRACT bets and stay
+ *  until they win or lose. Everything else may come down: the don't side
+ *  (the house is glad to see it go), place / big 6 / big 8 / hardways at any
+ *  time, odds, and the one-roll bets before their roll. */
+export function canTakeDown(bet: Pick<CrapsBet, 'type' | 'pick'>, point: number | null): boolean {
+  if (bet.type === 'pass') return point === null;
+  if (bet.type === 'come') return bet.pick === undefined;
+  return true;
+}
+
 export interface BetResolution {
   /** Chips returned to the player for this bet right now (see convention). */
   credited: number;

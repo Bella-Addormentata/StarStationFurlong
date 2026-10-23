@@ -16,7 +16,9 @@
  *    ⚙️ settings card. Press and drag across the chips in your rail to pick
  *    some up; click a box on the felt to bet them (each further click bets
  *    the same chips again); click your own chips on the felt to pick back up
- *    what you put down this round; right-click puts the hand back. When the
+ *    what you put down this round (or a bet that may come down any time);
+ *    the round ↶ button at the end of your rail (or C) takes every bet of
+ *    yours that may come down back at once; right-click puts the hand back. When the
  *    dice come to you, grab them and fling them across the table.
  *
  * THE RULES OF MONEY DO NOT CHANGE: a chip is spent (casinoDoc.spendChips)
@@ -37,7 +39,7 @@ import {
   writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
 } from './casinoDoc';
 import type { TableSeat } from './casinoDoc';
-import { railStacks, RAIL_PITCH } from './casinoTable3d';
+import { railStacks, RAIL_PITCH, TAKE_DOWN_R } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
 import { closeBetting, isCroupierLive, openBetting, rollAndSettle, ROULETTE_PAGE_ID } from './croupier';
@@ -55,7 +57,7 @@ import {
 } from './games/casinoLayout';
 import type { CrapsSpot, FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
 import {
-  canPlaceBet, crapsBetLabel, isOddsType, MAX_LAY_MULTIPLE, MAX_ODDS_MULTIPLE, oddsFlat, oddsRoom, pointWasOn,
+  canPlaceBet, canTakeDown, crapsBetLabel, isOddsType, MAX_LAY_MULTIPLE, MAX_ODDS_MULTIPLE, oddsFlat, oddsRoom, pointWasOn,
 } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/diceFairness';
@@ -139,6 +141,38 @@ export function railFor(stand: FeltPoint, halfX: number, halfZ: number): RailSpe
     return { x: Math.max(-lim, Math.min(lim, stand.x)), z: Math.sign(stand.z) * halfZ, axis: 'x', len };
   }
   return { x: Math.sign(stand.x || 1) * halfX, z: 0, axis: 'z', len: Math.min(0.62, halfZ * 2 - 0.12) };
+}
+
+/** Your rail split for the ↶ take-down button: the chips keep all but the
+ *  last pitch at your right-hand end, where the button sits (`inward`: the
+ *  way you face across the table). */
+export function railWithTakeDown(rail: RailSpec, inward: FeltPoint): { chips: RailSpec; button: FeltPoint } {
+  // Your right hand, facing `inward` with up toward you: (−inward.z, inward.x).
+  const right = rail.axis === 'x' ? Math.sign(-inward.z) || 1 : Math.sign(inward.x) || 1;
+  const slot = Math.max(RAIL_PITCH, TAKE_DOWN_R * 2 + 0.01);
+  const len = Math.max(RAIL_PITCH, rail.len - slot);
+  const shift = right * (slot / 2);
+  const end = right * (rail.len / 2 - slot / 2);
+  return rail.axis === 'x'
+    ? { chips: { ...rail, x: rail.x - shift, len }, button: { x: rail.x + end, z: rail.z } }
+    : { chips: { ...rail, z: rail.z - shift, len }, button: { x: rail.x, z: rail.z + end } };
+}
+
+/** The bets "take me down" returns, and the ones that stay: roulette's all
+ *  come off while betting is open; craps keeps its contract bets (a pass
+ *  line bet with a point on, a come bet that has travelled). */
+export function splitTakeDown<B extends { type: string; pick?: number; amount: number }>(
+  game: 'craps' | 'roulette',
+  bets: readonly B[],
+  point: number | null,
+): { back: B[]; keep: B[] } {
+  const back: B[] = [];
+  const keep: B[] = [];
+  for (const b of bets) {
+    if (game === 'roulette' || canTakeDown(b as unknown as CrapsBet, point)) back.push(b);
+    else keep.push(b);
+  }
+  return { back, keep };
 }
 
 /** Where the dice rest in front of a shooter's stand, on the felt. */
@@ -588,6 +622,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const h = deps.visual;
   const stand = deps.stand !== null ? standLocal(kind, deps.stand) : null;
   const rail = h && stand ? railFor(stand, h.halfX, h.halfZ) : null;
+  /** ↶ Your rail's chips, and the take-down button at its right-hand end. */
+  const railSplit = h && stand && rail ? railWithTakeDown(rail, inwardFrom(stand, h.halfZ)) : null;
+  const toward = h && stand ? (() => { const f = inwardFrom(stand, h.halfZ); return { x: -f.x, z: -f.z }; })() : null;
   const ray = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
 
@@ -620,8 +657,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let liveTick = false;
   /** Keyboard play's selected box (an index into layout.regions), -1: none. */
   let focusIdx = -1;
-  /** Chips I put down this betting window, by spot (the only ones I may take
-   *  back — a craps bet from an earlier roll is a contract on the felt). */
+  /** Chips I put down this betting window, by spot (what a click on a box
+   *  takes back, beside the bets that may come down any time — canTakeDown). */
   let added = new Map<string, number[]>();
   let windowRound = -1;
   // Kept across focus: stepping away and back mid-round keeps what you may
@@ -727,9 +764,22 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       hand = [];
       say('NOT ENOUGH CHIPS FOR THAT STAKE AGAIN — PICK UP FROM YOUR RAIL');
     }
-    if (!pickup) railView = rail ? railStacks(rail, railChipCounts(balance - sumOf(hand))) : [];
+    if (!pickup) railView = railSplit ? railStacks(railSplit.chips, railChipCounts(balance - sumOf(hand))) : [];
     h.setRailStacks(railView);
     h.setHand(cursor, hand);
+    syncTakeDown(true);
+  };
+
+  /** Lit while I have bets that may come down right now, dimmed otherwise
+   *  (betting closes on a clock, so update() checks it too). */
+  let takeDownShown = '';
+  const syncTakeDown = (force = false): void => {
+    if (!h) return;
+    const ready = !!railSplit && bettingOpen() && splitTakeDown(game, myBets(), crapsState()?.point ?? null).back.length > 0;
+    const key = railSplit ? (ready ? 'ready' : 'dim') : 'none';
+    if (!force && key === takeDownShown) return;
+    takeDownShown = key;
+    h.setTakeDown(railSplit && toward ? { p: railSplit.button, toward } : null, ready);
   };
 
   const stackAt = (p: FeltPoint): number => {
@@ -837,9 +887,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const takeBack = (rg: FeltRegion<Spot>): boolean => {
     syncWindow();
     const key = spotKey(rg.bet);
-    // Odds are the one bet you may take down any time the betting is open,
-    // not only this window's chips (the flat bet under them stays).
-    const mine = game === 'craps' && isOddsType(rg.bet.type)
+    // Odds, place, big 6 / 8 and hardways may come down any time the betting
+    // is open, not only this window's chips (the flat bet under odds stays).
+    // The don't side may too, but only with ↶, which takes its odds with it.
+    const mine = game === 'craps' && canTakeDown(rg.bet as CrapsBet, crapsState()?.point ?? null)
+      && rg.bet.type !== 'dontpass' && rg.bet.type !== 'dontcome'
       ? myBets().filter((b) => spotKey(b) === key).map((b) => b.amount)
       : added.get(key) ?? [];
     if (mine.length === 0) return false;
@@ -869,6 +921,38 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (hand.length === 0) hand = back.slice(0, HAND_MAX);
     refreshRail();
     return true;
+  };
+
+  /** ↶ "Take me down": every bet of mine that may come off goes back to the
+   *  rail at once (contract bets stay — see splitTakeDown). */
+  const takeDownAll = (): void => {
+    syncWindow();
+    h?.pressTakeDown();
+    const bets = myBets();
+    if (bets.length === 0) {
+      say('NO BETS OF YOURS ON THE TABLE');
+      return;
+    }
+    if (!bettingOpen()) {
+      say('NO MORE BETS — THOSE CHIPS STAY');
+      return;
+    }
+    const { back, keep } = splitTakeDown(game, bets, crapsState()?.point ?? null);
+    if (back.length === 0) {
+      say('LINE AND COME BETS WITH A POINT STAY UP UNTIL THEY WIN OR LOSE');
+      return;
+    }
+    // The chips slide back across the felt to your rail as they come off.
+    if (railSplit) h?.sweepToRail({ x: railSplit.chips.x, z: railSplit.chips.z });
+    writeBets(keep);
+    const total = sumOf(back.map((b) => b.amount));
+    creditChips(me, total);
+    for (const b of back) added.delete(spotKey(b));
+    saveLedger();
+    say(keep.length > 0
+      ? `TAKEN DOWN — ${total} BACK TO YOUR RAIL · YOUR LINE BETS STAY UP`
+      : `TAKEN DOWN — ${total} BACK TO YOUR RAIL`);
+    refreshRail();
   };
 
   // ── The shooter ───────────────────────────────────────────────────────────
@@ -938,6 +1022,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     cursor = h.projectToFelt(ray);
     const hit = h.pick(ray, myThrowPending());
     h.setSettingsHot(hit?.kind === 'settings');
+    h.setTakeDownHot(hit?.kind === 'takedown');
     if (capture) capture.style.cursor = hit && hit.kind !== 'felt' ? 'pointer' : hit && hitRegion(layout, hit.p) ? 'pointer' : 'default';
     if (held && cursor) {
       held.push({ t: performance.now(), p: cursor });
@@ -979,6 +1064,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     if (hit.kind === 'settings') {
       toggleCard();
+      return;
+    }
+    if (hit.kind === 'takedown') {
+      takeDownAll();
       return;
     }
     if (hit.kind === 'dice') {
@@ -1046,7 +1135,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const KEY_HELP = `${game === 'craps' ? 'Craps' : 'Roulette'} table. Arrow keys choose a box on the felt. `
     + '1 to 6 pick up a 1, 5, 25, 100, 500 or 1000 chip. Enter or Space bets your hand on the box. '
-    + 'Delete takes back the chips you put there this round, or your odds there. 0 puts your hand back. '
+    + 'Delete takes back the chips you put there this round, or your odds there. '
+    + 'C takes all your bets down, as the round button by your rail does. 0 puts your hand back. '
     + `${game === 'craps' ? 'R throws the dice when they are yours. ' : ''}`
     + 'I reads the table. S opens the table card. Escape steps away.';
 
@@ -1169,6 +1259,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       const rg = layout.regions[focusIdx];
       if (rg && takeBack(rg)) announce(describeRegion(rg));
       else announce('Nothing of yours to take back here this round.');
+    } else if (k === 'c' || k === 'C') {
+      takeDownAll();
     } else if (k >= '1' && k <= '6') {
       pickDenom([...CHIP_DENOMS].sort((a, b) => a - b)[Number(k) - 1]);
     } else if (k === '0') {
@@ -1588,7 +1680,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         <div data-live role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;"></div>
         <div style="font-size:9px;color:rgba(212,168,75,0.55);letter-spacing:1px;margin-top:4px;">
           DRAG ACROSS YOUR RAIL TO PICK UP CHIPS · CLICK THE FELT TO BET · RIGHT-CLICK TO PUT THEM BACK · ⚙️ TABLE · ESC TO STEP BACK<br>
-          OR KEYS: ARROWS · 1–6 · ENTER · H FOR HELP</div>`;
+          ↶ BY YOUR CHIPS TAKES YOUR BETS DOWN · OR KEYS: ARROWS · 1–6 · ENTER · C TAKE DOWN · H FOR HELP</div>`;
       host.appendChild(bar);
 
       beatSeat();
@@ -1618,6 +1710,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       h?.setRailStacks([]);
       h?.setHand(null, []);
       h?.setSettingsHot(false);
+      h?.setTakeDownHot(false);
+      h?.setTakeDown(null, false);
+      takeDownShown = '';
       h?.setFocusRegion(null);
       focusIdx = -1;
       card?.remove();
@@ -1636,6 +1731,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         pickup.interval = Math.max(PICKUP_REPEAT_MIN_MS, pickup.interval * 0.8);
         pickup.nextAt = performance.now() + pickup.interval;
       }
+      syncTakeDown();
       renderBar();
     },
   };

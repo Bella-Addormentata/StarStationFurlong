@@ -38,7 +38,8 @@ export type TablePick =
   | { kind: 'felt'; p: FeltPoint }
   | { kind: 'rail'; p: FeltPoint }
   | { kind: 'dice' }
-  | { kind: 'settings' };
+  | { kind: 'settings' }
+  | { kind: 'takedown' };
 
 /** One stack of chips on the felt, bottom chip first. */
 export interface FeltStack {
@@ -92,6 +93,18 @@ export interface CasinoTableVisualHandle {
   setHighlight(ids: ReadonlySet<string>): void;
   /** Glow the ⚙️ button (pointer over it). */
   setSettingsHot(hot: boolean): void;
+  /** ↶ Your take-down button on the rail beside your chips, its arrow
+   *  pointing back at you along `toward` (null hides it). `ready`: you have
+   *  bets that may come down right now (dimmed otherwise). */
+  setTakeDown(at: { p: FeltPoint; toward: FeltPoint } | null, ready: boolean): void;
+  /** Glow the take-down button (pointer over it). */
+  setTakeDownHot(hot: boolean): void;
+  /** Sink the take-down button for a moment (it was pressed). */
+  pressTakeDown(): void;
+  /** Your chips about to leave the felt (a take-down) slide back to `to` on
+   *  your rail: the next felt update that drops chips of yours from a stack
+   *  sends those chips across, the way a dealer pushes them back. */
+  sweepToRail(to: FeltPoint): void;
   /** ⚖️ The plaque beside the ⚙️: a green-circled F (FAIR) or a red-circled F (FRIENDLY). */
   setFairBadge(fair: boolean): void;
   // 🎲 craps
@@ -998,6 +1011,96 @@ function buildSettingsButton(ctx: PiecesCtx, b: { x: number; z: number; r: numbe
   };
 }
 
+// ── ↶ Take-down button ───────────────────────────────────────────────────────
+
+/** Radius of the round take-down button on your rail (a little over a chip). */
+export const TAKE_DOWN_R = 0.024;
+
+function takeDownCanvas(): HTMLCanvasElement {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 128;
+  const c = cv.getContext('2d')!;
+  c.fillStyle = '#5A1620';
+  c.fillRect(0, 0, 128, 128);
+  // A curved arrow sweeping round and down toward the bottom of the canvas
+  // (the mesh turns that edge toward its owner): "bring my chips back".
+  c.strokeStyle = '#F0C060';
+  c.fillStyle = '#F0C060';
+  c.lineWidth = 13;
+  c.lineCap = 'round';
+  // Three quarters of a ring, from the bottom round the left and over the
+  // top, ending on the right where the head points down.
+  c.beginPath();
+  c.arc(60, 58, 30, Math.PI * 0.5, Math.PI * 0.02, false);
+  c.stroke();
+  c.beginPath();
+  c.moveTo(72, 60);
+  c.lineTo(108, 60);
+  c.lineTo(90, 94);
+  c.closePath();
+  c.fill();
+  return cv;
+}
+
+function buildTakeDownButton(ctx: PiecesCtx): {
+  mesh: THREE.Mesh;
+  /** Shown or hidden here: World sets every furniture mesh's own `visible`
+   *  back to true each interior frame, so the mesh's parent carries it. */
+  group: THREE.Group;
+  place(at: { p: FeltPoint; toward: FeltPoint } | null, ready: boolean): void;
+  setHot(hot: boolean): void;
+  press(): void;
+  update(dt: number): void;
+} {
+  const geo = new THREE.CylinderGeometry(TAKE_DOWN_R, TAKE_DOWN_R * 1.08, 0.012, 28);
+  const rim = new THREE.MeshStandardMaterial({ color: 0xd4a84b, metalness: 0.6, roughness: 0.35, emissive: 0x000000 });
+  const face = solidCanvas(takeDownCanvas());
+  const mesh = new THREE.Mesh(geo, [rim, face, rim]);
+  const group = new THREE.Group();
+  group.visible = false;
+  group.add(mesh);
+  ctx.attach(group);
+  let hot = false;
+  let ready = false;
+  let sink = 0;
+  const lift = (): void => {
+    mesh.position.y = RAIL_Y + 0.006 + (hot && ready ? 0.003 : 0) - sink * 0.005;
+  };
+  return {
+    mesh,
+    group,
+    place(at, isReady) {
+      group.visible = at !== null;
+      ready = isReady;
+      if (at) {
+        mesh.position.x = at.p.x;
+        mesh.position.z = at.p.z;
+        // The canvas's bottom edge faces +z unturned: turn it to `toward`.
+        mesh.rotation.y = Math.atan2(at.toward.x, at.toward.z);
+      }
+      face.color.setHex(ready ? 0xffffff : 0x5c5c5c);
+      rim.color.setHex(ready ? 0xd4a84b : 0x6e6250);
+      rim.emissive.setHex(hot && ready ? 0x6f4a10 : 0x000000);
+      lift();
+    },
+    setHot(h) {
+      if (h === hot) return;
+      hot = h;
+      rim.emissive.setHex(hot && ready ? 0x6f4a10 : 0x000000);
+      lift();
+    },
+    press() {
+      sink = 1;
+      lift();
+    },
+    update(dt) {
+      if (sink <= 0) return;
+      sink = Math.max(0, sink - dt / 0.18);
+      lift();
+    },
+  };
+}
+
 // ── ⚖️ Fair / Friendly plaque ────────────────────────────────────────────────
 
 const PLAQUE_W = 0.12;
@@ -1242,6 +1345,7 @@ interface Common {
   railHit: THREE.Mesh;
   settings: { mesh: THREE.Mesh; setHot(hot: boolean): void };
   plaque: { set(fair: boolean): void };
+  takeDown: ReturnType<typeof buildTakeDownButton>;
 }
 
 function buildCommon<B>(ctx: PiecesCtx, layout: FeltLayout<B>, halfX: number, halfZ: number, decor: Parameters<typeof makeFeltCanvas>[1], plaqueAt: 'right' | 'front', colorChips = false): Common {
@@ -1275,7 +1379,30 @@ function buildCommon<B>(ctx: PiecesCtx, layout: FeltLayout<B>, halfX: number, ha
   ctx.attach(railGroup);
   const settings = buildSettingsButton(ctx, layout.settings);
   const plaque = buildFairPlaque(ctx, layout.settings, plaqueAt);
-  return { feltMesh, felt, pools, railHit, settings, plaque };
+  const takeDown = buildTakeDownButton(ctx);
+  return { feltMesh, felt, pools, railHit, settings, plaque, takeDown };
+}
+
+/** How long chips taken down take to slide back to your rail. */
+const SWEEP_S = 0.5;
+/** A take-down that hasn't reached the felt this long after the press
+ *  (nothing came off) stops waiting. */
+const SWEEP_ARM_S = 1;
+
+/** The chips of mine that left the felt between two felt updates: each own
+ *  stack's chips past what still stands at that spot and height (a stack
+ *  that's gone gave all of them; odds riding on a flat bet share its spot
+ *  and differ by `lift`). Others' stacks never count. */
+export function departedChips(before: readonly FeltStack[], after: readonly FeltStack[]): FeltStack[] {
+  const out: FeltStack[] = [];
+  for (const s of before) {
+    if (s.dim) continue;
+    const still = after.find((a) => !a.dim && Math.abs(a.x - s.x) < 1e-4 && Math.abs(a.z - s.z) < 1e-4
+      && (a.lift ?? 0) === (s.lift ?? 0));
+    const left = still ? Math.max(0, s.chips.length - still.chips.length) : s.chips.length;
+    if (left > 0) out.push({ ...s, chips: s.chips.slice(s.chips.length - left), lift: (s.lift ?? 0) + s.chips.length - left });
+  }
+  return out;
 }
 
 /** Pitch between rail stacks (a chip and a sliver of rail). */
@@ -1317,6 +1444,10 @@ class TableHandle implements CasinoTableVisualHandle {
   private rail: readonly RailStack[] = [];
   private hand: { p: FeltPoint; chips: readonly number[] } | null = null;
   private ownColor: string | undefined;
+  /** A take-down waiting for its chips to leave the felt (seconds left). */
+  private sweepArm: { to: FeltPoint; left: number } | null = null;
+  /** Chips sliding back to the rail (t: seconds into the slide). */
+  private sweeps: Array<{ s: FeltStack; to: FeltPoint; t: number }> = [];
   private dirty = true;
   private highlightKey = '';
   private highlightIds: ReadonlySet<string> = new Set();
@@ -1347,10 +1478,12 @@ class TableHandle implements CasinoTableVisualHandle {
 
   pick(ray: THREE.Raycaster, diceGrabbable: boolean): TablePick | null {
     const targets: THREE.Object3D[] = [this.c.feltMesh, this.c.railHit, this.c.settings.mesh];
+    if (this.c.takeDown.group.visible) targets.push(this.c.takeDown.mesh);
     if (diceGrabbable && this.dice) targets.push(...this.dice.meshes());
     const hits = ray.intersectObjects(targets, false);
     for (const h of hits) {
       if (h.object === this.c.settings.mesh) return { kind: 'settings' };
+      if (h.object === this.c.takeDown.mesh) return { kind: 'takedown' };
       if (this.dice && this.dice.meshes().includes(h.object as THREE.Mesh)) return { kind: 'dice' };
       const p = this.toLocal(h.point);
       if (!p) continue;
@@ -1371,8 +1504,19 @@ class TableHandle implements CasinoTableVisualHandle {
   }
 
   setFeltChips(stacks: readonly FeltStack[]): void {
+    if (this.sweepArm) {
+      const gone = departedChips(this.feltStacks, stacks);
+      if (gone.length > 0) {
+        for (const s of gone) this.sweeps.push({ s, to: this.sweepArm.to, t: 0 });
+        this.sweepArm = null;
+      }
+    }
     this.feltStacks = stacks;
     this.dirty = true;
+  }
+
+  sweepToRail(to: FeltPoint): void {
+    this.sweepArm = { to, left: SWEEP_ARM_S };
   }
 
   setRailStacks(stacks: readonly RailStack[]): void {
@@ -1417,6 +1561,18 @@ class TableHandle implements CasinoTableVisualHandle {
     this.c.settings.setHot(hot);
   }
 
+  setTakeDown(at: { p: FeltPoint; toward: FeltPoint } | null, ready: boolean): void {
+    this.c.takeDown.place(at, ready);
+  }
+
+  setTakeDownHot(hot: boolean): void {
+    this.c.takeDown.setHot(hot);
+  }
+
+  pressTakeDown(): void {
+    this.c.takeDown.press();
+  }
+
   setFairBadge(fair: boolean): void {
     this.c.plaque.set(fair);
   }
@@ -1457,6 +1613,9 @@ class TableHandle implements CasinoTableVisualHandle {
     }
     this.wheel?.cancel();
     this.wheel?.restOn(null);
+    this.setTakeDown(null, false);
+    this.sweepArm = null;
+    this.sweeps = [];
   }
 
   diceRestAt(p: FeltPoint, values?: [number, number]): void {
@@ -1499,6 +1658,16 @@ class TableHandle implements CasinoTableVisualHandle {
     this.rail.forEach((s, i) => {
       if (s.count > 0) pools.stack(new Array(s.count).fill(s.denom), s.x, RAIL_Y, s.z, false, 101 + i, this.ownColor);
     });
+    this.sweeps.forEach(({ s, to, t }, i) => {
+      // Eased along the felt, lifted over the rail's lip on the way.
+      const k = Math.min(1, t / SWEEP_S);
+      const e = k * k * (3 - 2 * k);
+      const x = s.x + (to.x - s.x) * e;
+      const z = s.z + (to.z - s.z) * e;
+      const y0 = FELT_Y + 0.001 + (s.lift ?? 0) * CHIP_H;
+      const y = y0 + (RAIL_Y - y0) * e + Math.sin(Math.PI * k) * 0.03;
+      pools.stack(s.chips, x, y, z, false, 307 + i * 5, s.color);
+    });
     if (this.hand) {
       const chips = [...this.hand.chips].sort((a, b) => b - a);
       pools.stack(chips, this.hand.p.x, FELT_Y + 0.05, this.hand.p.z, false, 211, this.ownColor);
@@ -1510,6 +1679,16 @@ class TableHandle implements CasinoTableVisualHandle {
     if (this.dirty) {
       this.dirty = false;
       this.rebuildChips();
+    }
+    this.c.takeDown.update(dt);
+    if (this.sweepArm) {
+      this.sweepArm.left -= dt;
+      if (this.sweepArm.left <= 0) this.sweepArm = null;
+    }
+    if (this.sweeps.length > 0) {
+      for (const sw of this.sweeps) sw.t += dt;
+      this.sweeps = this.sweeps.filter((sw) => sw.t < SWEEP_S);
+      this.dirty = true;
     }
     this.dice?.update(dt);
     for (const p of this.pucks) p.update(dt);
