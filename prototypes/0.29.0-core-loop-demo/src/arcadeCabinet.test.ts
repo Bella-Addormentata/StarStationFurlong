@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import type { ArcadeScreenView } from './arcadeDoc';
+import type { ArcadeCabinetVisualHandle } from './devices';
 
 let fills = 0;
 function fakeCanvas() {
@@ -26,7 +27,9 @@ function fakeCanvas() {
 
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
-const { buildItemGroup, ARCADE_CABINET_KINDS, ARCADE_GEAR_Y, FURNITURE_DEFS } = await import('./furniture');
+const {
+  buildItemGroup, ARCADE_BUTTON_TRAVEL, ARCADE_CABINET_KINDS, ARCADE_GEAR_Y, ARCADE_STICK_THROW, FURNITURE_DEFS,
+} = await import('./furniture');
 const { SEAT_COLOURS } = await import('./lanternRoadPaint');
 
 const ID = 'arcade-cabinet-1';
@@ -322,3 +325,83 @@ describe('the monitor bay (#194)', () => {
 function d(def: { footprint: { d: number } | null }): number {
   return (def.footprint?.d ?? 0) / 2;
 }
+
+describe('the sticks and buttons, moving with the players (setControls)', () => {
+  const UP = 0x10;
+  const RIGHT = 0x80;
+  const A = 0x01;
+  const B = 0x02;
+  const START = 0x08;
+  const kinds = [['arcade-cabinet', 1], ['arcade-cabinet-2p', 2], ['arcade-cabinet-wide', 4]] as const;
+  for (const [kind, players] of kinds) {
+    it(`${kind}: each player's stick leans the way they press, and their buttons sink`, () => {
+      const group = buildItemGroup({ id: kind, kind, pos: { x: 0, z: 0 }, rot: 0, movable: true });
+      let visual: ArcadeCabinetVisualHandle | null = null;
+      group.traverse((obj) => { if (obj.userData.arcadeCabinet) visual = obj.userData.arcadeCabinet as ArcadeCabinetVisualHandle; });
+      const setControls = (visual as ArcadeCabinetVisualHandle | null)?.setControls;
+      expect(setControls).toBeDefined();
+      const def = FURNITURE_DEFS[kind];
+      // The players' side: +z (1) or −z (−1). Away from them is −side along
+      // z, their right is +side along x.
+      const side = Math.sign(def.device!.front.z);
+      const meshes: THREE.Mesh[] = [];
+      group.traverse((obj) => { if (obj instanceof THREE.Mesh) meshes.push(obj); });
+      const at = () => {
+        group.updateMatrixWorld(true);
+        return meshes.map((mesh) => mesh.getWorldPosition(new THREE.Vector3()));
+      };
+      const rest = at();
+      const moved = (pads: number[]) => {
+        setControls!(pads);
+        const now = at();
+        const out = meshes.flatMap((mesh, i) => (now[i]!.distanceTo(rest[i]!) > 1e-6 ? [{ mesh, from: rest[i]!, to: now[i]! }] : []));
+        setControls!([]);
+        return out;
+      };
+      // Whose controls a mesh at x is: the nearest stand's player.
+      const stands = def.stands ?? [{ stand: { x: 0, z: 0 } }];
+      const owner = (x: number) =>
+        stands.reduce((best, st, n) => (Math.abs(st.stand.x - x) < Math.abs(stands[best]!.stand.x - x) ? n : best), 0);
+
+      for (let p = 0; p < players; p++) {
+        const pad = (bits: number) => Array.from({ length: players }, (_, n) => (n === p ? bits : 0));
+        // UP: the stick (shaft and ball) leans away from the player.
+        const up = moved(pad(UP));
+        expect(up.length, `player ${p + 1} UP`).toBe(2);
+        const ball = up.reduce((hi, m) => (m.from.y > hi.from.y ? m : hi));
+        expect(owner(ball.from.x)).toBe(p);
+        expect((ball.to.z - ball.from.z) * -side).toBeGreaterThan(0.02);
+        expect(Math.abs(ball.to.x - ball.from.x)).toBeLessThan(1e-6);
+        // RIGHT: to the player's right.
+        const right = moved(pad(RIGHT)).reduce((hi, m) => (m.from.y > hi.from.y ? m : hi));
+        expect((right.to.x - right.from.x) * side).toBeGreaterThan(0.02);
+        expect(Math.abs(right.to.z - right.from.z)).toBeLessThan(1e-6);
+        // Both at once: a diagonal, as far each way.
+        const diag = moved(pad(UP | RIGHT)).reduce((hi, m) => (m.from.y > hi.from.y ? m : hi));
+        expect((diag.to.z - diag.from.z) * -side).toBeGreaterThan(0.02);
+        expect((diag.to.x - diag.from.x) * side).toBeGreaterThan(0.02);
+        // B then A, left to right as the player sees them: each sinks alone.
+        const sink = (bits: number) => {
+          const m = moved(pad(bits));
+          expect(m.length, `player ${p + 1} button ${bits}`).toBe(1);
+          expect(m[0]!.to.y - m[0]!.from.y).toBeCloseTo(-ARCADE_BUTTON_TRAVEL, 6);
+          expect(owner(m[0]!.from.x)).toBe(p);
+          return m[0]!.from.x * side;
+        };
+        const b = sink(B);
+        const a = sink(A);
+        expect(b).toBeLessThan(a);
+        // The stick is on their left, the buttons to its right, as on the
+        // keyboard (WASD, then N and M).
+        expect(ball.from.x * side).toBeLessThan(b);
+        // The single cabinet's third button is START, right of A.
+        if (kind === 'arcade-cabinet') expect(sink(START)).toBeGreaterThan(a);
+      }
+      // Every press at once, then rest: all back where they were.
+      setControls!(Array.from({ length: players }, () => 0xff));
+      setControls!([]);
+      at().forEach((v, i) => expect(v.distanceTo(rest[i]!)).toBeLessThan(1e-9));
+      expect(ARCADE_STICK_THROW).toBeGreaterThan(0.2);
+    });
+  }
+});
