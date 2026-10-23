@@ -12,12 +12,13 @@
  *                                        double-wide cabinet: a lease each
  *   plays:<itemId>      → PlaysRecord    the attract card's tally, a player's
  *                                        write
- *   scores:<itemId>:<game> → ScoresRecord a cabinet's own game's high-score
- *                                        table (arcadeNativeGames.ts): how
- *                                        often the owner has CLEARed it
- *   scores:<itemId>:<game>:<clears>:<run> → HighScore  one line of it, one
+ *   scores:<itemId>:<game>:<clears>:<run> → HighScore  one line of a
+ *                                        cabinet's own game's high-score
+ *                                        table (arcadeNativeGames.ts), one
  *                                        player's go: the write of the page
  *                                        that hosted the go
+ *   clears:<itemId>:<game>:<n> → ClearRecord the owner's CLEARs of it: the
+ *                                        highest n is the table's count
  * One key per writer: a seat renewal never collides with a change of game, and
  * a play counted the moment the owner changes the game never reverts the
  * change (nor the change the count) — whole-value LWW keeps one of two writes
@@ -244,10 +245,12 @@ export interface HighScore {
   run: string;
 }
 
-/** The `scores:` key of a table: how many times the owner has cleared it.
- *  A line goes under the count its page knew of when it wrote it, so lines
- *  a page wrote before it heard of a CLEAR are no longer on the table. */
-export interface ScoresRecord {
+/** A `clears:` key: the owner's CLEAR that took a table's count to
+ *  `clears`. A line goes under the count its page knew of when it wrote it,
+ *  so lines a page wrote before it heard of a CLEAR are no longer on the
+ *  table. A key per CLEAR, so the count only goes up as pages sync, however
+ *  their writes land. */
+export interface ClearRecord {
   clears: number;
 }
 
@@ -472,6 +475,10 @@ export function playsKey(itemId: string): string {
 export function scoresKey(itemId: string, gameId: string): string {
   return `scores:${itemId}:${gameId}`;
 }
+/** The owner's CLEAR that took a table's count to `clears`. */
+export function clearKey(itemId: string, gameId: string, clears: number): string {
+  return `clears:${itemId}:${gameId}:${clears}`;
+}
 /** One line of a table: a key per go, so two pages entering goes at once
  *  (a host that lost the room a while, and the one that took over) both
  *  keep theirs. */
@@ -590,11 +597,18 @@ const byScore = (a: HighScore, b: HighScore): number => b.score - a.score || a.a
  *  writing more is ignored past it). Entering a go trims what it read. */
 const SCORE_LINES_READ = 500;
 
-/** How many times the owner has cleared a table. */
+/** A table's CLEAR keys, each with the count it names (0 for garbage). */
+function clearKeys(itemId: string, gameId: string): Array<{ key: string; clears: number }> {
+  const prefix = clearKey(itemId, gameId, 0).slice(0, -1);
+  return arcadeRawKeys(prefix, 64).map((key) => {
+    const n = key.slice(prefix.length);
+    return { key, clears: /^\d{1,15}$/.test(n) ? Number(n) : 0 };
+  });
+}
+
+/** How many times the owner has cleared a table: the highest CLEAR. */
 function tableClears(itemId: string, gameId: string): number {
-  const raw = ensureMap().get(scoresKey(itemId, gameId)) as Partial<ScoresRecord> | undefined;
-  const clears = raw && typeof raw === 'object' ? raw.clears : undefined;
-  return Number.isSafeInteger(clears) && (clears as number) >= 0 ? (clears as number) : 0;
+  return clearKeys(itemId, gameId).reduce((most, c) => Math.max(most, c.clears), 0);
 }
 
 /** The best ARCADE_SCORES_MAX of `lines`, one a go, best first. */
@@ -681,7 +695,8 @@ export function clearHighScores(itemId: string, gameId: string): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
   const clears = tableClears(itemId, gameId) + 1;
-  const entries: Array<readonly [string, unknown]> = [[scoresKey(itemId, gameId), { clears } satisfies ScoresRecord]];
+  const entries: Array<readonly [string, unknown]> = [[clearKey(itemId, gameId, clears), { clears } satisfies ClearRecord]];
+  for (const old of clearKeys(itemId, gameId)) entries.push([old.key, undefined]);
   for (const key of linesBefore(itemId, gameId, clears)) entries.push([key, undefined]);
   arcadeRawSetMany(entries);
   return { ok: true };
@@ -689,7 +704,12 @@ export function clearHighScores(itemId: string, gameId: string): ArcadeAction {
 
 /** Call `listener` when a game's table on this cabinet changes. */
 export function subscribeHighScores(itemId: string, gameId: string, listener: () => void): () => void {
-  return subscribeArcadePrefix(scoresKey(itemId, gameId), listener);
+  const lines = subscribeArcadePrefix(`${scoresKey(itemId, gameId)}:`, listener);
+  const clears = subscribeArcadePrefix(clearKey(itemId, gameId, 0).slice(0, -1), listener);
+  return () => {
+    lines();
+    clears();
+  };
 }
 
 /** What the panel, the stage and the screen show: the curation with the

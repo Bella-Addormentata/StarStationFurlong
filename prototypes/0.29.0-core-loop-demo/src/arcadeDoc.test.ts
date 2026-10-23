@@ -17,7 +17,7 @@ import {
   setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
   standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_COUNTER_MAX, ARCADE_DEFAULT_GAME, ARCADE_SEAT_LAPSE_MS,
   isSeatIndex, mySeat, seatHolders, ARCADE_SEATS_MAX, ARCADE_CORES, ejsCore,
-  clearHighScores, mergeHighScores, readHighScores, recordHighScores, scoreLineKey, scoresKey, subscribeHighScores,
+  clearHighScores, clearKey, mergeHighScores, readHighScores, recordHighScores, scoreLineKey, scoresKey, subscribeHighScores,
   ARCADE_SCORE_TOP, ARCADE_SCORES_MAX,
 } from './arcadeDoc';
 import type { ArcadeGame, HighScore } from './arcadeDoc';
@@ -585,8 +585,8 @@ describe('high scores', () => {
     expect(table[0]!.score).toBe(ARCADE_SCORE_TOP);
     expect(table[1]!.name).toHaveLength(32);
     expect(table[1]!.at).toBe(0);
-    // A table key that is not a count reads as never cleared.
-    doc.getMap('arcade').set(scoresKey(CAB, LR), { clears: 'many' });
+    // A CLEAR key that names no count reads as no CLEAR.
+    doc.getMap('arcade').set(`${clearKey(CAB, LR, 0).slice(0, -1)}many`, { clears: 9 });
     expect(readHighScores(CAB, LR)).toHaveLength(2);
   });
 
@@ -648,6 +648,30 @@ describe('high scores', () => {
       bindArcadeDoc(d);
       expect(readHighScores(CAB, LR).map((l) => l.run)).toEqual(['h1']);
     }
+  });
+
+  it('keeps the highest CLEAR when owner tabs apart clear different numbers of times', () => {
+    // Tab a clears once; tab b, apart, clears twice and a go goes up after.
+    // Whichever writes land, the table's count is b's: its go stays on.
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    a.clientID = 2;
+    b.clientID = 1;
+    owner = true;
+    for (const [d, times] of [[a, 1], [b, 2]] as const) {
+      bindArcadeDoc(d);
+      for (let i = 0; i < times; i++) clearHighScores(CAB, LR);
+    }
+    recordHighScores(CAB, LR, [line('b2', 700)]);
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [a, b]) {
+      bindArcadeDoc(d);
+      expect(readHighScores(CAB, LR).map((l) => l.run)).toEqual(['b2']);
+    }
+    // The next CLEAR goes past both, and wipes the go.
+    clearHighScores(CAB, LR);
+    expect(readHighScores(CAB, LR)).toEqual([]);
   });
 
   it('keeps a CLEAR when a page that hadn\'t heard of it enters a go', () => {
