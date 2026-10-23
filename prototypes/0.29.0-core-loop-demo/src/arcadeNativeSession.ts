@@ -765,6 +765,10 @@ function tryRestore(itemId: string, copy: Copy): void {
       copy.syncFrom = null;
       copy.stalledSince = null;
       copy.myChecks.clear();
+      // The chip seats its music on the state it first sees: a fresh one for
+      // the restored state, or the tune would run on from before the jump.
+      // One that threw stays silent until the page lets go of the speaker.
+      if (copy.sound !== SILENT_SOUND) copy.sound = null;
     },
     () => {
       copy.restoring = false;

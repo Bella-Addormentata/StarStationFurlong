@@ -12,6 +12,7 @@ import { ARCADE_WIRE_NATIVE, packArcadeTick, pipe, unpackArcadeTick } from './ar
 import type { ArcadeLink } from './arcadeNesSession';
 import { LR_AWAY_FRAMES, LR_PLAYER_H, LR_PLAYER_W, LR_REV, type LrState } from './games/lanternRoad';
 import { newNativeMatch, newNativeSeat } from './games/nativeArcade';
+import { createLanternRoadSound } from './lanternRoadSound';
 
 type SessionModule = typeof import('./arcadeNativeSession');
 type GamesModule = typeof import('./games/gamesDoc');
@@ -680,6 +681,43 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     }, 48000);
     await run(200);
     expect(samples - were).toBe(((a.mod.nativeArcadeCopyInfo(ITEM)!.next - back + 0x10000) & 0xffff) * 800);
+  });
+
+  it('seats the music afresh on a save state, so a follower resynced mid-road is on the game\'s clock', async () => {
+    const [a, b] = await room('a', 'b');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(300);
+    const watcher = link(b, null);
+    /** What the watcher's speaker got, frame by frame as they were run (a
+     *  save state can take the copy back over frames it had already run):
+     *  the samples, and the state the chip was given. */
+    const heard: Array<{ next: number; samples: number[]; state: string }> = [];
+    watcher.setAudio((l) => {
+      const next = b.mod.nativeArcadeCopyInfo(ITEM)!.next;
+      let frame = heard[heard.length - 1];
+      if (!frame || frame.next !== next || frame.samples.length >= 735) {
+        frame = { next, samples: [], state: JSON.stringify(stateOf(b)) };
+        heard.push(frame);
+      }
+      frame.samples.push(l);
+    }, 44100);
+    await run(600);
+    // The host's copy takes a turn the watcher's never heard of (a lost tick
+    // would do it): the next fingerprint disagrees, the watcher asks for a
+    // save state and carries on from it. (A value a save state may carry:
+    // restoreLanternRoad checks the field's range.)
+    stateOf(a)!.players[0]!.hurt = 60000;
+    await run(3000);
+    const first = heard.find((f) => (JSON.parse(f.state) as LrState).players[0]!.hurt > 1000);
+    expect(first).toBeDefined();
+    expect(first!.samples).toHaveLength(735);
+    // Its first frame after the save state is what a chip meeting that
+    // state for the first time renders: the road's theme where the game's
+    // clock says, not where the old chip had got to.
+    const fresh: number[] = [];
+    createLanternRoadSound(44100).frame(JSON.parse(first!.state) as LrState, [], (l) => fresh.push(l));
+    expect(first!.samples).toEqual(fresh);
   });
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {
