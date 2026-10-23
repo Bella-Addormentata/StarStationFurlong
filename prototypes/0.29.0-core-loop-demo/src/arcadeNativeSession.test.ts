@@ -10,7 +10,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ARCADE_WIRE_NATIVE, packArcadeTick, pipe, unpackArcadeTick } from './arcadeNet';
 import type { ArcadeLink } from './arcadeNesSession';
-import type { LrState } from './games/lanternRoad';
+import { LR_REV, type LrState } from './games/lanternRoad';
+import { newNativeMatch } from './games/nativeArcade';
 
 type SessionModule = typeof import('./arcadeNativeSession');
 type GamesModule = typeof import('./games/gamesDoc');
@@ -447,6 +448,29 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     lose = () => false;
     await run(3000, () => host.setButtons(pads()));
     expect(late.mod.nativeArcadeCopyInfo(ITEM)?.started).toBe(true);
+  });
+
+  it('never follows, or seats anyone in, a match on another revision of the game', async () => {
+    const [a, b] = await room('a', 'b');
+    // A tab from before an update hosts: its record names another revision.
+    for (const game of ['lantern-road', `lantern-road@${LR_REV - 1}`]) {
+      a.games.writeNativeArcade(ITEM, newNativeMatch({
+        id: 77, game, host: 'old-player', hostPage: 'old-page', hostSeat: 0, now: Date.now(),
+      }));
+      await run(100);
+      for (const p of [a, b]) {
+        expect(p.mod.nativeArcadeCopyInfo(ITEM)).toBeNull();
+        expect(p.mod.nativeSeatStatus(ITEM)).toEqual(['free', 'free', 'free', 'free']);
+      }
+      link(b, 2).join();
+      await run(50);
+      expect(b.games.readNativeSeat(ITEM, 2)).toBeNull();
+    }
+    // This page's own match names its revision, so an older tab won't follow it.
+    link(a, 0).host(LANTERN_ROAD);
+    await run(100);
+    expect(b.games.readNativeArcade(ITEM)!.game).toBe(`lantern-road@${LR_REV}`);
+    expect(b.mod.nativeArcadeCopyInfo(ITEM)?.role).toBe('follow');
   });
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {

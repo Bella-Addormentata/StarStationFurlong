@@ -24,6 +24,14 @@
  * bridge or roof. Bit 2 (SELECT's) is not a button here: the session sets
  * it on every seat somebody holds (PRESENT), so joining and leaving are
  * part of the frames like any press, and every copy agrees on who is in.
+ * A player who steps up mid-game drops in beside the others in a puff of
+ * smoke, at zero; one who steps away goes the same way.
+ *
+ * THE SHRINE is guarded: when the picture reaches the road's last stretch
+ * the camera holds, the street's yokai flee, and the Great Lantern comes
+ * down. It drifts over the group, spits fire, and slams down to send shock
+ * waves along the street, then sits dazed for a while: that's when staffs
+ * do the work. Only once it burns out does the gate open.
  */
 
 // ── The picture and the units ────────────────────────────────────────────────
@@ -35,6 +43,10 @@ export const SUB = 16;
 export const LR_TILE = 16;
 const TILE_SUB = LR_TILE * SUB;
 export const LR_SEATS = 4;
+/** The rules' revision, also the save format's. Bump it with any change
+ *  that would make two copies of one match disagree: pages on different
+ *  revisions never share a match (arcadeNativeGames nativeMatchGame). */
+export const LR_REV = 2;
 
 // ── Pad bits (arcadeNet PAD_BIT) ─────────────────────────────────────────────
 
@@ -84,8 +96,12 @@ const WAKE_MARGIN = 64;
 /** Frames the STAGE CLEAR card stays up before the road starts again. */
 export const CLEAR_FRAMES = 360;
 const CLEAR_BONUS = 1000;
-/** Score popups kept at once. */
+/** Score popups (and puffs of smoke) kept at once. */
 const MAX_FX = 24;
+/** A puff of smoke where a player drops in or steps away. */
+export const PUFF_FRAMES = 24;
+/** Frames a player's seat tag shows over their head after they drop in. */
+export const TAG_FRAMES = 90;
 
 // ── The road ─────────────────────────────────────────────────────────────────
 //
@@ -251,6 +267,8 @@ export interface LrPlayer {
   score: number;
   /** Last frame's pad: presses count on the frame they start. */
   pad: number;
+  /** Frames left of their seat's tag over their head (just dropped in). */
+  tag: number;
 }
 
 export type LrEnemyKind = 'oni' | 'lantern' | 'kasa';
@@ -292,8 +310,54 @@ export interface LrPop {
   t: number;
 }
 
+/** Where a player dropped in or stepped away: a puff in their colour. */
+export interface LrPuff {
+  /** Centre, in SUB. */
+  x: number;
+  y: number;
+  seat: number;
+  t: number;
+}
+
+export type LrBossStage = 'wait' | 'enter' | 'fight' | 'dying' | 'done';
+export type LrBossMove = 'drift' | 'spit' | 'shake' | 'fall' | 'dazed' | 'rise';
+
+/** The Great Lantern, the shrine's guardian. */
+export interface LrBoss {
+  /** Waiting for the group, coming down, fighting, burning out, gone. */
+  stage: LrBossStage;
+  move: LrBossMove;
+  /** Top-left, in SUB. */
+  x: number;
+  y: number;
+  vy: number;
+  hp: number;
+  maxHp: number;
+  /** Frames left of the stage (enter, dying) or of the move. */
+  t: number;
+  /** Frames until a staff can hit it again (it flashes). */
+  hurt: number;
+  face: 1 | -1;
+  /** Its float's bob, frames. */
+  wob: number;
+  /** Drifts so far: odd ones end in fire, even ones in a slam. */
+  round: number;
+}
+
+/** Its fire in the air, the flames where it lands, a slam's shock waves. */
+export interface LrShot {
+  kind: 'fire' | 'flame' | 'wave';
+  /** Top-left, in SUB. */
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  /** Frames left (flames and waves); a fire that hits someone is spent. */
+  t: number;
+}
+
 export interface LrState {
-  v: 1;
+  v: typeof LR_REV;
   frame: number;
   phase: 'play' | 'clear';
   /** Frames left of the STAGE CLEAR card. */
@@ -307,6 +371,9 @@ export interface LrState {
   enemies: LrEnemy[];
   items: LrItem[];
   pops: LrPop[];
+  puffs: LrPuff[];
+  boss: LrBoss;
+  shots: LrShot[];
 }
 
 // ── Bodies ───────────────────────────────────────────────────────────────────
@@ -449,7 +516,7 @@ function spawnItems(): LrItem[] {
 function newPlayer(): LrPlayer {
   return {
     on: false, x: 0, y: 0, vx: 0, vy: 0, face: 1, ground: false, hp: MAX_HP, hurt: 0, reel: 0, swing: 0, cool: 0,
-    ko: 0, away: 0, drop: 0, step: 0, score: 0, pad: 0,
+    ko: 0, away: 0, drop: 0, step: 0, score: 0, pad: 0, tag: 0,
   };
 }
 
@@ -457,11 +524,14 @@ function newPlayer(): LrPlayer {
  *  same one). */
 export function createLanternRoad(seed: number): LrState {
   return {
-    v: 1, frame: 0, phase: 'play', phaseT: 0, laps: 0, cam: 0, rng: seed | 0,
+    v: LR_REV, frame: 0, phase: 'play', phaseT: 0, laps: 0, cam: 0, rng: seed | 0,
     players: Array.from({ length: LR_SEATS }, newPlayer),
     enemies: spawnEnemies(),
     items: spawnItems(),
     pops: [],
+    puffs: [],
+    boss: newBoss(),
+    shots: [],
   };
 }
 
@@ -484,11 +554,27 @@ export function safeSpot(px: number): { x: number; y: number } {
   return { x: start * TILE_SUB, y: 0 };
 }
 
-/** Back on the road, a step apart by seat: at the town gate while the
- *  picture is still there, else near the middle of the picture. */
+/** Where a player comes back on the road, px: at the town gate (a step
+ *  apart by seat) while the picture is still there, else beside the others
+ *  who are up, else the middle of the picture. */
+function placeX(s: LrState, seat: number): number {
+  if (s.cam === 0) return 40 + seat * 20;
+  let sum = 0;
+  let n = 0;
+  for (let k = 0; k < LR_SEATS; k++) {
+    const o = s.players[k]!;
+    if (k === seat || !isUp(o)) continue;
+    sum += (o.x + (PLAYER_W >> 1)) >> 4;
+    n++;
+  }
+  const at = n > 0 ? ((sum / n) | 0) + (seat * 2 - 3) * 10 : s.cam + (LR_VIEW_W >> 1) + (seat - 2) * 24 + 12;
+  return Math.max(s.cam + 24, Math.min(s.cam + LR_VIEW_W - 24, at));
+}
+
+/** Back on the road, in a puff of smoke, with their seat's tag over them. */
 function placePlayer(s: LrState, seat: number): void {
   const p = s.players[seat]!;
-  const spot = safeSpot(s.cam === 0 ? 40 + seat * 20 : s.cam + (LR_VIEW_W >> 1) + (seat - 2) * 24 + 12);
+  const spot = safeSpot(placeX(s, seat));
   p.x = spot.x;
   p.y = spot.y;
   p.vx = 0;
@@ -498,11 +584,15 @@ function placePlayer(s: LrState, seat: number): void {
   p.cool = 0;
   p.drop = 0;
   p.reel = 0;
+  p.tag = TAG_FRAMES;
+  addPuff(s, p, seat);
 }
 
+/** Someone stepped up to the seat: a new player, from zero. */
 function startPlayer(s: LrState, seat: number): void {
   const p = s.players[seat]!;
   p.on = true;
+  p.score = 0;
   p.hp = MAX_HP;
   p.ko = 0;
   p.away = 0;
@@ -534,18 +624,31 @@ function addPop(s: LrState, x: number, y: number, points: number, seat: number):
   if (s.pops.length > MAX_FX) s.pops.splice(0, s.pops.length - MAX_FX);
 }
 
-function stepPlayer(s: LrState, seat: number, pad: number): void {
+function addPuff(s: LrState, p: LrPlayer, seat: number): void {
+  s.puffs.push({ x: p.x + (PLAYER_W >> 1), y: p.y + (PLAYER_H >> 1), seat, t: PUFF_FRAMES });
+  if (s.puffs.length > MAX_FX) s.puffs.splice(0, s.puffs.length - MAX_FX);
+}
+
+/** The seat's PRESENT bit: in when it's held, out (in a puff) once it has
+ *  been empty a moment. True while the player is on the road. */
+function presence(s: LrState, seat: number, pad: number): boolean {
   const p = s.players[seat]!;
-  const pressed = pad & ~p.pad;
-  p.pad = pad;
   if (pad & PAD_PRESENT) {
     p.away = 0;
     if (!p.on) startPlayer(s, seat);
   } else if (p.on && ++p.away >= AWAY_FRAMES) {
     p.on = false;
-    return;
+    if (p.ko === 0) addPuff(s, p, seat);
   }
-  if (!p.on) return;
+  return p.on;
+}
+
+function stepPlayer(s: LrState, seat: number, pad: number): void {
+  const p = s.players[seat]!;
+  const pressed = pad & ~p.pad;
+  p.pad = pad;
+  if (!presence(s, seat, pad)) return;
+  if (p.tag > 0) p.tag--;
   if (p.ko > 0) {
     if (--p.ko === 0) {
       p.hp = MAX_HP;
@@ -639,6 +742,13 @@ export function staffBox(p: LrPlayer): { x: number; y: number; w: number; h: num
 // ── The camera ───────────────────────────────────────────────────────────────
 
 function stepCamera(s: LrState): void {
+  // The Great Lantern's fight slides the picture onto the shrine and holds
+  // it there (stragglers are walked along by its left edge).
+  const stage = s.boss.stage;
+  if (stage === 'enter' || stage === 'fight' || stage === 'dying') {
+    s.cam = Math.min(LR_ARENA_CAM, s.cam + CAM_SPEED);
+    return;
+  }
   let lo = Infinity;
   let hi = -Infinity;
   for (const p of s.players) {
@@ -797,6 +907,282 @@ function collectItems(s: LrState): void {
   }
 }
 
+// ── The Great Lantern ────────────────────────────────────────────────────────
+
+/** The picture the fight holds: the road's last. */
+export const LR_ARENA_CAM = LR_LEVEL_W - LR_VIEW_W;
+/** Anyone up who gets this far (px) brings it down. */
+export const LR_ARENA_TRIGGER_X = LR_ARENA_CAM + 160;
+const BOSS_W = 48 * SUB;
+const BOSS_H = 56 * SUB;
+/** The street's top, SUB: where it lands and where fire burns. */
+const STREET_Y = (LR_ROWS - 2) * TILE_SUB;
+/** Its top while it floats: low enough to reach with a jump and a swing. */
+const BOSS_FLOAT_Y = 30 * SUB;
+const BOSS_ENTER_FRAMES = 120;
+/** Hits it takes: more for more players, more each lap (capped). */
+const BOSS_HP = 16;
+const BOSS_HP_PER_PLAYER = 4;
+const BOSS_HP_PER_LAP = 4;
+/** Frames after a hit before the next one lands (from anyone). */
+const BOSS_HIT_GAP = 12;
+const BOSS_HIT_POINTS = 50;
+export const BOSS_DYING_FRAMES = 150;
+/** Every player on the road gets this when it burns out. */
+const BOSS_BONUS = 3000;
+const DRIFT_FRAMES = 150;
+const DRIFT_SPEED = 10;
+const SPIT_FRAMES = 100;
+const SHAKE_FRAMES = 40;
+const FALL_ACCEL = 6;
+const DAZED_FRAMES = 150;
+const RISE_SPEED = 12;
+const MAX_SHOTS = 16;
+const FIRE_GRAVITY = 2;
+export const FLAME_FRAMES = 50;
+const WAVE_SPEED = 40;
+export const WAVE_FRAMES = 110;
+
+const SHOT_BOX: Readonly<Record<LrShot['kind'], { w: number; h: number }>> = {
+  fire: { w: 8 * SUB, h: 8 * SUB },
+  flame: { w: 10 * SUB, h: 12 * SUB },
+  wave: { w: 14 * SUB, h: 10 * SUB },
+};
+
+export function bossBox(): { w: number; h: number } {
+  return { w: BOSS_W, h: BOSS_H };
+}
+
+export function shotBox(kind: LrShot['kind']): { w: number; h: number } {
+  return SHOT_BOX[kind];
+}
+
+function newBoss(): LrBoss {
+  return {
+    stage: 'wait', move: 'drift', x: (LR_ARENA_CAM + 360) * SUB, y: -BOSS_H, vy: 0, hp: 0, maxHp: 0, t: 0, hurt: 0,
+    face: -1, wob: 0, round: 0,
+  };
+}
+
+/** The middle of the players who are up, SUB, or null. */
+function groupCentre(s: LrState): number | null {
+  let sum = 0;
+  let n = 0;
+  for (const p of s.players) {
+    if (!isUp(p)) continue;
+    sum += p.x + (PLAYER_W >> 1);
+    n++;
+  }
+  return n > 0 ? (sum / n) | 0 : null;
+}
+
+/** A player who is up, picked with the game's dice, or null. */
+function randomUp(s: LrState): LrPlayer | null {
+  const up = s.players.filter(isUp);
+  return up.length ? up[nextRandom(s) % up.length]! : null;
+}
+
+function addShot(s: LrState, shot: LrShot): void {
+  if (s.shots.length < MAX_SHOTS) s.shots.push(shot);
+}
+
+function spitFire(s: LrState, b: LrBoss): void {
+  const target = randomUp(s);
+  if (!target) return;
+  const fire = SHOT_BOX.fire;
+  const mx = b.x + (BOSS_W >> 1) - (fire.w >> 1);
+  const my = b.y + BOSS_H - 14 * SUB;
+  const vx = Math.max(-48, Math.min(48, ((target.x + (PLAYER_W >> 1) - mx) / 44) | 0));
+  addShot(s, { kind: 'fire', x: mx, y: my, vx, vy: -20, t: 0 });
+}
+
+function startMove(b: LrBoss, move: LrBossMove, t: number): void {
+  b.move = move;
+  b.t = t;
+}
+
+function stepBoss(s: LrState): void {
+  const b = s.boss;
+  if (b.hurt > 0) b.hurt--;
+  if (b.stage === 'wait') {
+    if (!s.players.some((p) => isUp(p) && p.x + (PLAYER_W >> 1) >= LR_ARENA_TRIGGER_X * SUB)) return;
+    // The group reached the shrine: the street's yokai flee, and down it comes.
+    const on = s.players.filter((p) => p.on).length;
+    b.stage = 'enter';
+    b.t = BOSS_ENTER_FRAMES;
+    b.maxHp = BOSS_HP + BOSS_HP_PER_PLAYER * Math.max(1, on) + BOSS_HP_PER_LAP * Math.min(4, s.laps);
+    b.hp = b.maxHp;
+    for (const e of s.enemies) if (!e.gone && e.dying === 0) e.dying = DYING_FRAMES;
+    return;
+  }
+  if (b.stage === 'enter') {
+    b.t--;
+    b.y = BOSS_FLOAT_Y - (((BOSS_FLOAT_Y + BOSS_H) * b.t) / BOSS_ENTER_FRAMES | 0);
+    if (b.t <= 0) {
+      b.stage = 'fight';
+      b.wob = 0;
+      startMove(b, 'drift', DRIFT_FRAMES);
+    }
+    return;
+  }
+  if (b.stage === 'dying') {
+    if (--b.t <= 0) {
+      b.stage = 'done';
+      b.t = 0;
+    }
+    return;
+  }
+  if (b.stage !== 'fight') return;
+
+  if (b.t > 0) b.t--;
+  const minX = (LR_ARENA_CAM + 12) * SUB;
+  const maxX = (LR_ARENA_CAM + LR_VIEW_W - 12) * SUB - BOSS_W;
+  const float = () => {
+    b.wob = (b.wob + 1) & 0xffff;
+    b.y = BOSS_FLOAT_Y + bob(b.wob + 16, 64, 6 * SUB);
+  };
+  switch (b.move) {
+    case 'drift': {
+      // Over the middle of the group, bobbing.
+      const centre = groupCentre(s);
+      if (centre !== null) {
+        const want = Math.max(minX, Math.min(maxX, centre - (BOSS_W >> 1)));
+        const dx = Math.max(-DRIFT_SPEED, Math.min(DRIFT_SPEED, want - b.x));
+        b.x += dx;
+        if (dx !== 0) b.face = dx < 0 ? -1 : 1;
+      }
+      float();
+      if (b.t === 0) {
+        b.round = (b.round + 1) & 0xffff;
+        if (b.round & 1) startMove(b, 'spit', SPIT_FRAMES);
+        else startMove(b, 'shake', SHAKE_FRAMES);
+      }
+      break;
+    }
+    case 'spit':
+      float();
+      if (b.t === 75 || b.t === 50 || b.t === 25) spitFire(s, b);
+      if (b.t === 0) startMove(b, 'drift', DRIFT_FRAMES);
+      break;
+    case 'shake':
+      // It trembles (the painter shakes it): a slam is coming.
+      if (b.t === 0) {
+        b.vy = 0;
+        startMove(b, 'fall', 0);
+      }
+      break;
+    case 'fall':
+      b.vy = Math.min(FALL_MAX + 40, b.vy + FALL_ACCEL);
+      b.y += b.vy;
+      if (b.y >= STREET_Y - BOSS_H) {
+        // It lands: shock waves run out along the street both ways.
+        b.y = STREET_Y - BOSS_H;
+        b.vy = 0;
+        const wave = SHOT_BOX.wave;
+        const y = STREET_Y - wave.h;
+        addShot(s, { kind: 'wave', x: b.x - wave.w, y, vx: -WAVE_SPEED, vy: 0, t: WAVE_FRAMES });
+        addShot(s, { kind: 'wave', x: b.x + BOSS_W, y, vx: WAVE_SPEED, vy: 0, t: WAVE_FRAMES });
+        startMove(b, 'dazed', DAZED_FRAMES);
+      }
+      break;
+    case 'dazed':
+      if (b.t === 0) startMove(b, 'rise', 0);
+      break;
+    case 'rise':
+      b.y -= RISE_SPEED;
+      if (b.y <= BOSS_FLOAT_Y) {
+        b.y = BOSS_FLOAT_Y;
+        b.wob = 0;
+        startMove(b, 'drift', DRIFT_FRAMES);
+      }
+      break;
+  }
+}
+
+function stepShots(s: LrState): void {
+  if (s.shots.length === 0) return;
+  const left = LR_ARENA_CAM * SUB - 32 * SUB;
+  const right = (LR_ARENA_CAM + LR_VIEW_W) * SUB + 32 * SUB;
+  for (const sh of s.shots) {
+    if (sh.kind === 'fire') {
+      // Spent on someone last frame: it goes, and never lands as a flame.
+      if (sh.t < 0) continue;
+      sh.vy = Math.min(FALL_MAX, sh.vy + FIRE_GRAVITY);
+      sh.x += sh.vx;
+      sh.y += sh.vy;
+      if (sh.y + SHOT_BOX.fire.h >= STREET_Y) {
+        // It lands and burns a while where it fell.
+        const flame = SHOT_BOX.flame;
+        sh.kind = 'flame';
+        sh.x += (SHOT_BOX.fire.w - flame.w) >> 1;
+        sh.y = STREET_Y - flame.h;
+        sh.vx = 0;
+        sh.vy = 0;
+        sh.t = FLAME_FRAMES;
+      }
+    } else if (sh.kind === 'flame') {
+      sh.t--;
+    } else {
+      sh.x += sh.vx;
+      sh.t--;
+    }
+  }
+  s.shots = s.shots.filter((sh) =>
+    (sh.kind === 'fire' ? sh.t >= 0 : sh.t > 0) && sh.x > left && sh.x < right);
+}
+
+/** Staffs on the Great Lantern: one hit at a time, then it flashes. */
+function hitBoss(s: LrState): void {
+  const b = s.boss;
+  if (b.stage !== 'fight' || b.hurt > 0) return;
+  for (let seat = 0; seat < LR_SEATS; seat++) {
+    const p = s.players[seat]!;
+    const staff = staffBox(p);
+    if (!staff || !overlaps(staff.x, staff.y, staff.w, staff.h, b.x, b.y, BOSS_W, BOSS_H)) continue;
+    b.hp -= 1;
+    b.hurt = BOSS_HIT_GAP;
+    p.score += BOSS_HIT_POINTS;
+    addPop(s, staff.x + (staff.w >> 1), staff.y, BOSS_HIT_POINTS, seat);
+    if (b.hp <= 0) {
+      // It burns out: the fire goes with it, and everyone on the road shares the win.
+      b.hp = 0;
+      b.stage = 'dying';
+      b.t = BOSS_DYING_FRAMES;
+      s.shots = [];
+      for (let k = 0; k < LR_SEATS; k++) {
+        const q = s.players[k]!;
+        if (!q.on) continue;
+        q.score += BOSS_BONUS;
+        addPop(s, q.x + (PLAYER_W >> 1), q.y, BOSS_BONUS, k);
+      }
+    }
+    return;
+  }
+}
+
+/** Its body (unless it sits dazed), its fire and its waves hurt. */
+function touchBoss(s: LrState): void {
+  const b = s.boss;
+  if (b.stage !== 'fight' && s.shots.length === 0) return;
+  for (const p of s.players) {
+    if (!isUp(p) || p.hurt > 0) continue;
+    const mid = p.x + (PLAYER_W >> 1);
+    if (b.stage === 'fight' && b.move !== 'dazed'
+      && overlaps(p.x, p.y, PLAYER_W, PLAYER_H, b.x + 6 * SUB, b.y + 6 * SUB, BOSS_W - 12 * SUB, BOSS_H - 8 * SUB)) {
+      hurtPlayer(p, b.x + (BOSS_W >> 1) < mid);
+      continue;
+    }
+    for (const sh of s.shots) {
+      const box = SHOT_BOX[sh.kind];
+      if (sh.kind === 'fire' && sh.t < 0) continue;
+      if (!overlaps(p.x, p.y, PLAYER_W, PLAYER_H, sh.x + SUB, sh.y + SUB, box.w - 2 * SUB, box.h - SUB)) continue;
+      hurtPlayer(p, sh.x + (box.w >> 1) < mid);
+      if (sh.kind === 'fire') sh.t = -1; // spent
+      break;
+    }
+  }
+}
+
 // ── The frame ────────────────────────────────────────────────────────────────
 
 /** Everyone back at the start of the road, scores kept. */
@@ -806,6 +1192,9 @@ function newLap(s: LrState): void {
   s.enemies = spawnEnemies();
   s.items = spawnItems();
   s.pops = [];
+  s.puffs = [];
+  s.boss = newBoss();
+  s.shots = [];
   for (let seat = 0; seat < LR_SEATS; seat++) {
     const p = s.players[seat]!;
     if (!p.on) continue;
@@ -827,17 +1216,15 @@ export function stepLanternRoad(s: LrState, pads: readonly number[]): void {
     pop.y -= 8;
   }
   if (s.pops.length && s.pops[0]!.t <= 0) s.pops = s.pops.filter((p) => p.t > 0);
+  for (const puff of s.puffs) puff.t -= 1;
+  if (s.puffs.length && s.puffs[0]!.t <= 0) s.puffs = s.puffs.filter((p) => p.t > 0);
 
   if (s.phase === 'clear') {
     // The card is up: players come and go, nobody moves.
     for (let seat = 0; seat < LR_SEATS; seat++) {
-      const p = s.players[seat]!;
-      const pad = pads[seat] ?? 0;
-      p.pad = pad;
-      if (pad & PAD_PRESENT) {
-        p.away = 0;
-        if (!p.on) startPlayer(s, seat);
-      } else if (p.on && ++p.away >= AWAY_FRAMES) p.on = false;
+      const pad = (pads[seat] ?? 0) & 0xff;
+      s.players[seat]!.pad = pad;
+      presence(s, seat, pad);
     }
     if (--s.phaseT <= 0) {
       s.phase = 'play';
@@ -850,15 +1237,19 @@ export function stepLanternRoad(s: LrState, pads: readonly number[]): void {
   for (let seat = 0; seat < LR_SEATS; seat++) stepPlayer(s, seat, (pads[seat] ?? 0) & 0xff);
   stepCamera(s);
   for (const e of s.enemies) stepEnemy(s, e);
+  stepBoss(s);
+  stepShots(s);
   hitEnemies(s);
+  hitBoss(s);
   touchEnemies(s);
+  touchBoss(s);
   collectItems(s);
   if (s.enemies.length > 0 && s.enemies.every((e) => e.gone)) s.enemies = [];
   else if (s.frame % 600 === 0) s.enemies = s.enemies.filter((e) => !e.gone);
 
-  // Through the shrine gate: the road is cleared.
+  // Through the shrine gate, once its guardian is gone: the road is cleared.
   const gateX = (LR_GATE_COL * TILE_SUB) + (TILE_SUB >> 1);
-  if (s.players.some((p) => isUp(p) && p.x + (PLAYER_W >> 1) >= gateX)) {
+  if (s.boss.stage === 'done' && s.players.some((p) => isUp(p) && p.x + (PLAYER_W >> 1) >= gateX)) {
     s.phase = 'clear';
     s.phaseT = CLEAR_FRAMES;
     for (let seat = 0; seat < LR_SEATS; seat++) {
@@ -895,7 +1286,8 @@ function isPlayer(v: unknown): v is LrPlayer {
     && isBool(v.ground) && isInt(v.hp, 0, MAX_HP) && isInt(v.hurt, 0, 0xffff) && isInt(v.reel, 0, 0xff)
     && isInt(v.swing, 0, SWING_FRAMES)
     && isInt(v.cool, 0, 0xff) && isInt(v.ko, 0, 0xffff) && isInt(v.away, 0, 0xffff) && isInt(v.drop, 0, 0xff)
-    && isInt(v.step, 0, 0x7fffffff) && isInt(v.score, 0, Number.MAX_SAFE_INTEGER) && isInt(v.pad, 0, 0xff);
+    && isInt(v.step, 0, 0x7fffffff) && isInt(v.score, 0, Number.MAX_SAFE_INTEGER) && isInt(v.pad, 0, 0xff)
+    && isInt(v.tag, 0, TAG_FRAMES);
 }
 
 function isEnemy(v: unknown): v is LrEnemy {
@@ -910,6 +1302,31 @@ function isItem(v: unknown): v is LrItem {
   return isObj(v) && (v.kind === 'coin' || v.kind === 'rice') && isInt(v.x) && isInt(v.y) && isBool(v.taken);
 }
 
+function isPuff(v: unknown): v is LrPuff {
+  return isObj(v) && isInt(v.x) && isInt(v.y) && isInt(v.seat, 0, LR_SEATS - 1) && isInt(v.t, 0, PUFF_FRAMES);
+}
+
+const BOSS_STAGES: readonly unknown[] = ['wait', 'enter', 'fight', 'dying', 'done'];
+const BOSS_MOVES: readonly unknown[] = ['drift', 'spit', 'shake', 'fall', 'dazed', 'rise'];
+
+function isBoss(v: unknown): v is LrBoss {
+  if (!isObj(v)) return false;
+  // Its timer's top depends on the stage: the painter reads it as a fraction.
+  const tMax = v.stage === 'enter' ? BOSS_ENTER_FRAMES : v.stage === 'dying' ? BOSS_DYING_FRAMES
+    : Math.max(DRIFT_FRAMES, SPIT_FRAMES, SHAKE_FRAMES, DAZED_FRAMES);
+  return BOSS_STAGES.includes(v.stage) && BOSS_MOVES.includes(v.move)
+    && isInt(v.x) && isInt(v.y) && isInt(v.vy) && isInt(v.maxHp, 0, 999) && isInt(v.hp, 0, v.maxHp as number)
+    && isInt(v.t, 0, tMax) && isInt(v.hurt, 0, BOSS_HIT_GAP) && isFace(v.face) && isInt(v.wob, 0, 0xffff)
+    && isInt(v.round, 0, 0xffff);
+}
+
+function isShot(v: unknown): v is LrShot {
+  if (!isObj(v) || (v.kind !== 'fire' && v.kind !== 'flame' && v.kind !== 'wave')) return false;
+  const tMax = v.kind === 'flame' ? FLAME_FRAMES : v.kind === 'wave' ? WAVE_FRAMES : 0;
+  return isInt(v.x) && isInt(v.y) && isInt(v.vx, -0xffff, 0xffff) && isInt(v.vy, -0xffff, 0xffff)
+    && isInt(v.t, -1, tMax);
+}
+
 function isPop(v: unknown): v is LrPop {
   return isObj(v) && isInt(v.x) && isInt(v.y) && isInt(v.points, 0, 1e9) && isInt(v.seat, 0, LR_SEATS - 1) && isInt(v.t, -1, 0xff);
 }
@@ -922,10 +1339,11 @@ const listOf = <T>(v: unknown, item: (x: unknown) => x is T, max = MAX_LIST): v 
 export function restoreLanternRoad(raw: unknown): LrState | null {
   if (!isObj(raw)) return null;
   const s = raw;
-  if (s.v !== 1 || !isInt(s.frame, 0, 0xffffffff) || (s.phase !== 'play' && s.phase !== 'clear')
+  if (s.v !== LR_REV || !isInt(s.frame, 0, 0xffffffff) || (s.phase !== 'play' && s.phase !== 'clear')
     || !isInt(s.phaseT, 0, CLEAR_FRAMES) || !isInt(s.laps, 0, 0xffffff)
     || !isInt(s.cam, 0, LR_LEVEL_W - LR_VIEW_W) || !isInt(s.rng)) return null;
   if (!Array.isArray(s.players) || s.players.length !== LR_SEATS || !s.players.every(isPlayer)) return null;
   if (!listOf(s.enemies, isEnemy) || !listOf(s.items, isItem) || !listOf(s.pops, isPop, MAX_FX)) return null;
+  if (!listOf(s.puffs, isPuff, MAX_FX) || !isBoss(s.boss) || !listOf(s.shots, isShot, MAX_SHOTS)) return null;
   return s as unknown as LrState;
 }
