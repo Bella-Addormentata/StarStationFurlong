@@ -33,6 +33,13 @@
  * waves along the street, then sits dazed for a while: that's when staffs
  * do the work. Only once it burns out does the gate open: its seal falls
  * away for a second first, so a group already under it sees it open.
+ *
+ * THE SOUND is not part of the state. A frame can be stepped with a list to
+ * collect its CUES on (a jump, a coin, the Great Lantern landing: LrCue),
+ * and the state comes out the same with or without one; the cabinet's
+ * sound chip (lanternRoadSound.ts) turns the cues and the state into
+ * samples for the page at the cabinet. A save state carries no cues, so a
+ * page that joins late hears nothing of what happened before it.
  */
 
 // ── The picture and the units ────────────────────────────────────────────────
@@ -378,6 +385,38 @@ export interface LrState {
   shots: LrShot[];
 }
 
+// ── Cues: what a frame did that makes a sound ────────────────────────────────
+
+export type LrCueKind =
+  /** A player jumps, drops through a ledge, or swings the staff. */
+  | 'jump' | 'drop' | 'swing'
+  /** The staff lands on a yokai; a yokai goes up in smoke. */
+  | 'hit' | 'beaten'
+  /** A coin; a rice ball eaten for a heart; one eaten at full hearts, for points. */
+  | 'coin' | 'heal' | 'bonus'
+  /** A player loses a heart; loses their last one; falls into the river or a gap. */
+  | 'hurt' | 'ko' | 'fall'
+  /** A puff of smoke: someone drops in, steps away, or comes back. */
+  | 'puff'
+  /** The Great Lantern: comes down, spits fire, trembles before a slam, lands,
+   *  takes a hit, burns out; then the gate's seal falls. */
+  | 'boss-enter' | 'boss-fire' | 'boss-shake' | 'boss-slam' | 'boss-hit' | 'boss-down' | 'gate'
+  /** The road is cleared. */
+  | 'clear';
+
+export interface LrCue {
+  kind: LrCueKind;
+  /** Where along the road, px: the sound chip pans it across the two tubes. */
+  x: number;
+}
+
+/** The frame's cue list while a frame runs with one (stepLanternRoad). */
+let cues: LrCue[] | null = null;
+
+function cue(kind: LrCueKind, xSub: number): void {
+  if (cues) cues.push({ kind, x: xSub >> 4 });
+}
+
 // ── Bodies ───────────────────────────────────────────────────────────────────
 
 const ENEMY_BOX: Readonly<Record<LrEnemyKind, { w: number; h: number; hp: number; points: number }>> = {
@@ -621,6 +660,7 @@ function hurtPlayer(p: LrPlayer, fromLeft: boolean): void {
     p.ko = KO_FRAMES;
     p.vx = 0;
   }
+  cue(p.ko > 0 ? 'ko' : 'hurt', p.x);
 }
 
 function addPop(s: LrState, x: number, y: number, points: number, seat: number): void {
@@ -631,6 +671,7 @@ function addPop(s: LrState, x: number, y: number, points: number, seat: number):
 function addPuff(s: LrState, p: LrPlayer, seat: number): void {
   s.puffs.push({ x: p.x + (PLAYER_W >> 1), y: p.y + (PLAYER_H >> 1), seat, t: PUFF_FRAMES });
   if (s.puffs.length > MAX_FX) s.puffs.splice(0, s.puffs.length - MAX_FX);
+  cue('puff', p.x);
 }
 
 /** The seat's PRESENT bit: in when it's held, out (in a puff) once it has
@@ -683,15 +724,21 @@ function stepPlayer(s: LrState, seat: number, pad: number): void {
     if (pad & PAD_DOWN && standsOnLedge(p)) {
       p.drop = DROP_FRAMES;
       p.ground = false;
+      cue('drop', p.x);
     } else {
       p.vy = -JUMP;
       p.ground = false;
+      cue('jump', p.x);
     }
   }
   if (!(pad & PAD_A) && p.vy < -JUMP_CUT) p.vy = -JUMP_CUT;
   // The staff.
-  if (pressed & PAD_B && p.swing === 0 && p.cool === 0 && !knocked) p.swing = SWING_FRAMES;
-  else if (p.swing > 0 && --p.swing === 0) p.cool = SWING_COOL;
+  if (pressed & PAD_B && p.swing === 0 && p.cool === 0 && !knocked) {
+    p.swing = SWING_FRAMES;
+    cue('swing', p.x);
+  } else if (p.swing > 0 && --p.swing === 0) {
+    p.cool = SWING_COOL;
+  }
 
   p.vy = Math.min(FALL_MAX, p.vy + GRAVITY);
   if (moveX(p, PLAYER_W, PLAYER_H, p.vx)) p.vx = 0;
@@ -710,9 +757,11 @@ function stepPlayer(s: LrState, seat: number, pad: number): void {
   if (p.y > LR_ROWS * TILE_SUB) {
     p.hp -= 1;
     p.hurt = HURT_FRAMES;
+    cue('fall', p.x);
     if (p.hp <= 0) {
       p.hp = 0;
       p.ko = KO_FRAMES;
+      cue('ko', p.x);
     }
     placePlayer(s, seat);
   }
@@ -867,10 +916,12 @@ function hitEnemies(s: LrState): void {
         e.vy = -40;
         e.ground = false;
       }
+      cue('hit', e.x);
       if (e.hp <= 0) {
         e.dying = DYING_FRAMES;
         p.score += box.points;
         addPop(s, e.x + (box.w >> 1), e.y, box.points, seat);
+        cue('beaten', e.x);
       }
     }
   }
@@ -901,11 +952,14 @@ function collectItems(s: LrState): void {
       if (it.kind === 'coin') {
         p.score += 50;
         addPop(s, it.x, it.y - r, 50, seat);
+        cue('coin', it.x);
       } else if (p.hp < MAX_HP) {
         p.hp += 1;
+        cue('heal', it.x);
       } else {
         p.score += 300;
         addPop(s, it.x, it.y - r, 300, seat);
+        cue('bonus', it.x);
       }
     }
   }
@@ -1001,6 +1055,7 @@ function spitFire(s: LrState, b: LrBoss): void {
   const my = b.y + BOSS_H - 14 * SUB;
   const vx = Math.max(-48, Math.min(48, ((target.x + (PLAYER_W >> 1) - mx) / 44) | 0));
   addShot(s, { kind: 'fire', x: mx, y: my, vx, vy: -20, t: 0 });
+  cue('boss-fire', mx);
 }
 
 function startMove(b: LrBoss, move: LrBossMove, t: number): void {
@@ -1020,6 +1075,7 @@ function stepBoss(s: LrState): void {
     b.maxHp = BOSS_HP + BOSS_HP_PER_PLAYER * Math.max(1, on) + BOSS_HP_PER_LAP * Math.min(4, s.laps);
     b.hp = b.maxHp;
     for (const e of s.enemies) if (!e.gone && e.dying === 0) e.dying = DYING_FRAMES;
+    cue('boss-enter', b.x + (BOSS_W >> 1));
     return;
   }
   if (b.stage === 'enter') {
@@ -1036,6 +1092,7 @@ function stepBoss(s: LrState): void {
     if (--b.t <= 0) {
       b.stage = 'done';
       b.t = GATE_OPEN_FRAMES;
+      cue('gate', LR_GATE_COL * TILE_SUB);
     }
     return;
   }
@@ -1065,8 +1122,12 @@ function stepBoss(s: LrState): void {
       float();
       if (b.t === 0) {
         b.round = (b.round + 1) & 0xffff;
-        if (b.round & 1) startMove(b, 'spit', SPIT_FRAMES);
-        else startMove(b, 'shake', SHAKE_FRAMES);
+        if (b.round & 1) {
+          startMove(b, 'spit', SPIT_FRAMES);
+        } else {
+          startMove(b, 'shake', SHAKE_FRAMES);
+          cue('boss-shake', b.x + (BOSS_W >> 1));
+        }
       }
       break;
     }
@@ -1094,6 +1155,7 @@ function stepBoss(s: LrState): void {
         addShot(s, { kind: 'wave', x: b.x - wave.w, y, vx: -WAVE_SPEED, vy: 0, t: WAVE_FRAMES });
         addShot(s, { kind: 'wave', x: b.x + BOSS_W, y, vx: WAVE_SPEED, vy: 0, t: WAVE_FRAMES });
         startMove(b, 'dazed', DAZED_FRAMES);
+        cue('boss-slam', b.x + (BOSS_W >> 1));
       }
       break;
     case 'dazed':
@@ -1154,12 +1216,14 @@ function hitBoss(s: LrState): void {
     b.hurt = BOSS_HIT_GAP;
     p.score += BOSS_HIT_POINTS;
     addPop(s, staff.x + (staff.w >> 1), staff.y, BOSS_HIT_POINTS, seat);
+    cue('boss-hit', b.x + (BOSS_W >> 1));
     if (b.hp <= 0) {
       // It burns out: the fire goes with it, and everyone on the road shares the win.
       b.hp = 0;
       b.stage = 'dying';
       b.t = BOSS_DYING_FRAMES;
       s.shots = [];
+      cue('boss-down', b.x + (BOSS_W >> 1));
       for (let k = 0; k < LR_SEATS; k++) {
         const q = s.players[k]!;
         if (!q.on) continue;
@@ -1218,9 +1282,20 @@ function newLap(s: LrState): void {
 }
 
 /**
- * Run one frame on the four seats' pads (seat 0 first). Mutates `s`.
+ * Run one frame on the four seats' pads (seat 0 first). Mutates `s`. What
+ * the frame did that makes a sound is pushed onto `sounds`, if given; the
+ * state is the same either way.
  */
-export function stepLanternRoad(s: LrState, pads: readonly number[]): void {
+export function stepLanternRoad(s: LrState, pads: readonly number[], sounds?: LrCue[]): void {
+  cues = sounds ?? null;
+  try {
+    stepFrame(s, pads);
+  } finally {
+    cues = null;
+  }
+}
+
+function stepFrame(s: LrState, pads: readonly number[]): void {
   s.frame = (s.frame + 1) >>> 0;
   for (const pop of s.pops) {
     pop.t -= 1;
@@ -1271,6 +1346,7 @@ export function stepLanternRoad(s: LrState, pads: readonly number[]): void {
       p.vx = 0;
       p.swing = 0;
     }
+    cue('clear', gateX);
   }
 }
 
