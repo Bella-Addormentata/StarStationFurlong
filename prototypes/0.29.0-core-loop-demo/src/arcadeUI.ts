@@ -31,10 +31,10 @@
 
 import type { DeviceUI } from './devices';
 import {
-  builtInEntry, builtInGame, cabinetKey, coreForName, coreLabel, gameLane, iAmP1, insertCoin, mayEjectP1, maySit,
-  mySeat, nativeEntry, parseRomUrl, putOnCabinet, readCabinet, readSeat, seatHolders, seatKey, seatLapsed,
-  setEmulatorData, standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_CORES, ARCADE_MAX_NAME,
-  isArcadeCore,
+  builtInEntry, builtInGame, cabinetKey, clearHighScores, coreForName, coreLabel, gameLane, iAmP1, insertCoin,
+  mayEjectP1, maySit, mySeat, nativeEntry, parseRomUrl, putOnCabinet, readCabinet, readHighScores, readSeat,
+  seatHolders, seatKey, seatLapsed, setEmulatorData, standUp, subscribeArcadeKey, subscribeHighScores, takeOffCabinet,
+  ARCADE_CORES, ARCADE_MAX_NAME, isArcadeCore,
 } from './arcadeDoc';
 import type { ArcadeCore, ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES as BUILT_IN_GAMES, LICENSE_LABEL } from './arcadeLibrary';
@@ -324,6 +324,28 @@ function nowPlaying(itemId: string, deps: ArcadeDeviceDeps, owner: boolean): str
   return section('NOW PLAYING', `${lines}${reset}`);
 }
 
+/** SETTINGS' HIGH SCORES, for a cabinet's own game: the cabinet's best ten,
+ *  for anyone to read, and the owner's CLEAR. */
+function highScoresSection(itemId: string, game: ArcadeGame | null, owner: boolean): string {
+  const own = nativeEntry(game);
+  if (!own) return '';
+  const lines = readHighScores(itemId, own.id);
+  const rows = lines.length > 0
+    ? lines.map((l, i) => `<div style="display:flex; gap:8px; font-size:10px; color:${i === 0 ? GOLD_BRIGHT : GOLD}; line-height:1.5;">
+        <span style="width:18px; text-align:right; color:${DIM};">${i + 1}.</span>
+        <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(l.name.toUpperCase())}</span>
+        <span style="font-variant-numeric:tabular-nums;">${String(l.score).padStart(6, '0')}</span>
+      </div>`).join('')
+    : `<div style="font-size:10px; color:${DIM};">No scores yet · the best ten go up here.</div>`;
+  const clear = owner
+    ? `<div style="display:flex; gap:6px; align-items:center; justify-content:space-between;">
+        <span style="font-size:9px; color:${DIM}; line-height:1.4;">CLEAR wipes this cabinet's table for ${esc(own.title)}.</span>
+        ${smallButton(`data-arcade-clear-scores="${esc(own.id)}"`, '✕ CLEAR', lines.length > 0)}
+      </div>`
+    : '';
+  return section(`HIGH SCORES · ${esc(own.title)}`, `${rows}${clear}`);
+}
+
 /** The owner's RESET: end the match or free the players' seats (player
  *  one's, or the double-wide cabinet's four). The note (null: not the
  *  owner's press). Exported for its tests. */
@@ -501,6 +523,7 @@ function renderSettings(itemId: string, deps: ArcadeDeviceDeps): string {
     </div>
     ${section('ON THE CABINET · ONE GAME', onCabinet)}
     ${nowPlaying(itemId, deps, owner)}
+    ${highScoresSection(itemId, game, owner)}
     ${ownGames}
     ${builtIn}
     ${load}
@@ -549,6 +572,10 @@ function wirePanel(panel: HTMLElement, itemId: string, deps: ArcadeDeviceDeps, r
   q<HTMLButtonElement>('[data-arcade-reset]')?.addEventListener('click', () => {
     const text = resetArcadeCabinet(itemId, deps.canEdit(), deps.seats);
     if (text) note(text);
+  });
+  q<HTMLButtonElement>('[data-arcade-clear-scores]')?.addEventListener('click', (e) => {
+    const r = clearHighScores(itemId, (e.currentTarget as HTMLButtonElement).dataset.arcadeClearScores ?? '');
+    note(r.ok ? 'The high scores are cleared.' : r.error);
   });
   q<HTMLButtonElement>('[data-arcade-takeoff]')?.addEventListener('click', () => {
     const r = takeOffCabinet(itemId);
@@ -663,6 +690,7 @@ export function createArcadeCabinetUI(deps: ArcadeDeviceDeps): DeviceUI {
         subscribeArcadeKey(cabinetKey(deps.itemId), render),
         ...Array.from({ length: deps.seats === 4 ? 4 : 1 }, (_, n) => subscribeArcadeKey(seatKey(deps.itemId, n), render)),
         subscribeGames(render), // a built-in game's match: who is at which stand
+        ...NATIVE_GAMES.map((own) => subscribeHighScores(deps.itemId, own.id, render)),
       ];
       unsubscribe = () => { for (const s of subs) s(); };
       // The seat lapses without a write; the status line moves with it.

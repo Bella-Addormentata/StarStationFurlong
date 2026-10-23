@@ -31,7 +31,8 @@
  * the camera holds, the street's yokai flee, and the Great Lantern comes
  * down. It drifts over the group, spits fire, and slams down to send shock
  * waves along the street, then sits dazed for a while: that's when staffs
- * do the work. Only once it burns out does the gate open.
+ * do the work. Only once it burns out does the gate open: its seal falls
+ * away for a second first, so a group already under it sees it open.
  */
 
 // ── The picture and the units ────────────────────────────────────────────────
@@ -46,7 +47,7 @@ export const LR_SEATS = 4;
 /** The rules' revision, also the save format's. Bump it with any change
  *  that would make two copies of one match disagree: pages on different
  *  revisions never share a match (arcadeNativeGames nativeMatchGame). */
-export const LR_REV = 2;
+export const LR_REV = 3;
 
 // ── Pad bits (arcadeNet PAD_BIT) ─────────────────────────────────────────────
 
@@ -333,7 +334,8 @@ export interface LrBoss {
   vy: number;
   hp: number;
   maxHp: number;
-  /** Frames left of the stage (enter, dying) or of the move. */
+  /** Frames left of the stage (enter, dying, the gate opening once done)
+   *  or of the move. */
   t: number;
   /** Frames until a staff can hit it again (it flashes). */
   hurt: number;
@@ -390,6 +392,8 @@ export function enemyBox(kind: LrEnemyKind): { w: number; h: number } {
 
 export const LR_PLAYER_W = PLAYER_W;
 export const LR_PLAYER_H = PLAYER_H;
+/** Frames a player stays on the road after their seat's PRESENT bit goes. */
+export const LR_AWAY_FRAMES = AWAY_FRAMES;
 
 interface Body {
   x: number;
@@ -928,6 +932,9 @@ const BOSS_HP_PER_LAP = 4;
 const BOSS_HIT_GAP = 12;
 const BOSS_HIT_POINTS = 50;
 export const BOSS_DYING_FRAMES = 150;
+/** Its seal falling away once it is gone: the gate opens before anyone
+ *  can go through, even a group already standing under it. */
+export const GATE_OPEN_FRAMES = 60;
 /** Every player on the road gets this when it burns out. */
 const BOSS_BONUS = 3000;
 const DRIFT_FRAMES = 150;
@@ -1028,8 +1035,12 @@ function stepBoss(s: LrState): void {
   if (b.stage === 'dying') {
     if (--b.t <= 0) {
       b.stage = 'done';
-      b.t = 0;
+      b.t = GATE_OPEN_FRAMES;
     }
+    return;
+  }
+  if (b.stage === 'done') {
+    if (b.t > 0) b.t--;
     return;
   }
   if (b.stage !== 'fight') return;
@@ -1247,9 +1258,10 @@ export function stepLanternRoad(s: LrState, pads: readonly number[]): void {
   if (s.enemies.length > 0 && s.enemies.every((e) => e.gone)) s.enemies = [];
   else if (s.frame % 600 === 0) s.enemies = s.enemies.filter((e) => !e.gone);
 
-  // Through the shrine gate, once its guardian is gone: the road is cleared.
+  // Through the shrine gate, once its guardian is gone and the gate is open:
+  // the road is cleared.
   const gateX = (LR_GATE_COL * TILE_SUB) + (TILE_SUB >> 1);
-  if (s.boss.stage === 'done' && s.players.some((p) => isUp(p) && p.x + (PLAYER_W >> 1) >= gateX)) {
+  if (s.boss.stage === 'done' && s.boss.t === 0 && s.players.some((p) => isUp(p) && p.x + (PLAYER_W >> 1) >= gateX)) {
     s.phase = 'clear';
     s.phaseT = CLEAR_FRAMES;
     for (let seat = 0; seat < LR_SEATS; seat++) {
@@ -1313,7 +1325,7 @@ function isBoss(v: unknown): v is LrBoss {
   if (!isObj(v)) return false;
   // Its timer's top depends on the stage: the painter reads it as a fraction.
   const tMax = v.stage === 'enter' ? BOSS_ENTER_FRAMES : v.stage === 'dying' ? BOSS_DYING_FRAMES
-    : Math.max(DRIFT_FRAMES, SPIT_FRAMES, SHAKE_FRAMES, DAZED_FRAMES);
+    : v.stage === 'done' ? GATE_OPEN_FRAMES : Math.max(DRIFT_FRAMES, SPIT_FRAMES, SHAKE_FRAMES, DAZED_FRAMES);
   return BOSS_STAGES.includes(v.stage) && BOSS_MOVES.includes(v.move)
     && isInt(v.x) && isInt(v.y) && isInt(v.vy) && isInt(v.maxHp, 0, 999) && isInt(v.hp, 0, v.maxHp as number)
     && isInt(v.t, 0, tMax) && isInt(v.hurt, 0, BOSS_HIT_GAP) && isFace(v.face) && isInt(v.wob, 0, 0xffff)

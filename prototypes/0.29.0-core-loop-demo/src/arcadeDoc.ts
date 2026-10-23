@@ -12,6 +12,13 @@
  *                                        double-wide cabinet: a lease each
  *   plays:<itemId>      → PlaysRecord    the attract card's tally, a player's
  *                                        write
+ *   scores:<itemId>:<game>:<clears>:<run> → HighScore  one line of a
+ *                                        cabinet's own game's high-score
+ *                                        table (arcadeNativeGames.ts), one
+ *                                        player's go: the write of the page
+ *                                        that hosted the go
+ *   clears:<itemId>:<game>:<n> → ClearRecord the owner's CLEARs of it: the
+ *                                        highest n is the table's count
  * One key per writer: a seat renewal never collides with a change of game, and
  * a play counted the moment the owner changes the game never reverts the
  * change (nor the change the count) — whole-value LWW keeps one of two writes
@@ -86,6 +93,10 @@ export const ARCADE_MAX_PLAYER = 32;
 export const ARCADE_BLINK_MS = 800;
 /** The most players a cabinet seats: the double-wide cabinet's four. */
 export const ARCADE_SEATS_MAX = 4;
+/** Lines on a cabinet's high-score table. */
+export const ARCADE_SCORES_MAX = 10;
+/** The highest score a table shows (a peer's record is clamped to it). */
+export const ARCADE_SCORE_TOP = 99_999_999;
 
 // ── Cores and games ──────────────────────────────────────────────────────────
 
@@ -222,6 +233,27 @@ export interface PlaysRecord {
   plays: number;
 }
 
+/** One line of a cabinet's high-score table. */
+export interface HighScore {
+  /** Display copy of the player's name when the score was set. */
+  name: string;
+  score: number;
+  /** The recording page's clock when the score was set (shown as a date). */
+  at: number;
+  /** One player's go in one match: a later, higher score from the same go
+   *  replaces its line instead of adding another. */
+  run: string;
+}
+
+/** A `clears:` key: the owner's CLEAR that took a table's count to
+ *  `clears`. A line goes under the count its page knew of when it wrote it,
+ *  so lines a page wrote before it heard of a CLEAR are no longer on the
+ *  table. A key per CLEAR, so the count only goes up as pages sync, however
+ *  their writes land. */
+export interface ClearRecord {
+  clears: number;
+}
+
 export interface SeatRecord {
   /** P1's identity pub (base64url), '' when the controls are free. */
   holder: string;
@@ -248,6 +280,7 @@ let arcadeMap: Y.Map<unknown> | null = null;
 let bindingEpoch = 0;
 const listeners = new Set<() => void>();
 const keyListeners = new Map<string, Set<() => void>>();
+const prefixListeners = new Map<string, Set<() => void>>();
 
 let clock: () => number = () => Date.now();
 export function setArcadeClock(fn: () => number): void {
@@ -292,6 +325,16 @@ function notify(changedKeys?: Set<string>): void {
       }
     }
   }
+  for (const [prefix, keyed] of prefixListeners) {
+    if (changedKeys && ![...changedKeys].some((k) => k.startsWith(prefix))) continue;
+    for (const listener of [...keyed]) {
+      try {
+        listener();
+      } catch (err) {
+        console.error(`[arcade] listener for '${prefix}…' threw during doc notify:`, err);
+      }
+    }
+  }
 }
 
 function docAlive(): boolean {
@@ -333,6 +376,20 @@ function ensureMap(): Y.Map<unknown> {
 export function subscribeArcade(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+/** Call `listener` when any key starting with `prefix` changes. */
+export function subscribeArcadePrefix(prefix: string, listener: () => void): () => void {
+  let keyed = prefixListeners.get(prefix);
+  if (!keyed) {
+    keyed = new Set();
+    prefixListeners.set(prefix, keyed);
+  }
+  keyed.add(listener);
+  return () => {
+    keyed!.delete(listener);
+    if (keyed!.size === 0) prefixListeners.delete(prefix);
+  };
 }
 
 export function subscribeArcadeKey(key: string, listener: () => void): () => void {
@@ -412,6 +469,21 @@ export function isSeatIndex(v: unknown): v is number {
 }
 export function playsKey(itemId: string): string {
   return `plays:${itemId}`;
+}
+/** A cabinet's own game's high scores: one table per game, so putting
+ *  another game on and back keeps each one's. */
+export function scoresKey(itemId: string, gameId: string): string {
+  return `scores:${itemId}:${gameId}`;
+}
+/** The owner's CLEAR that took a table's count to `clears`. */
+export function clearKey(itemId: string, gameId: string, clears: number): string {
+  return `clears:${itemId}:${gameId}:${clears}`;
+}
+/** One line of a table: a key per go, so two pages entering goes at once
+ *  (a host that lost the room a while, and the one that took over) both
+ *  keep theirs. */
+export function scoreLineKey(itemId: string, gameId: string, clears: number, run: string): string {
+  return `${scoresKey(itemId, gameId)}:${clears}:${run}`;
 }
 
 // ── Identity and authority seams (registered by main.ts, never asserted by a caller) ──
@@ -505,6 +577,139 @@ export function readPlays(itemId: string): number {
   const raw = ensureMap().get(playsKey(itemId)) as Partial<PlaysRecord> | undefined;
   if (!raw || typeof raw !== 'object') return PLAYS_DEFAULT.plays;
   return counter(raw.plays);
+}
+
+/** A high-score line as a peer may have written it, or null. */
+function sanitizeScore(raw: unknown): HighScore | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const name = str(r.name, ARCADE_MAX_PLAYER).trim();
+  const run = str(r.run, 160);
+  if (!name || !run || !Number.isSafeInteger(r.score) || (r.score as number) <= 0) return null;
+  return { name, score: Math.min(ARCADE_SCORE_TOP, r.score as number), at: Math.max(0, num(r.at)), run };
+}
+
+/** Best first; a tie goes to whoever set it first. */
+const byScore = (a: HighScore, b: HighScore): number => b.score - a.score || a.at - b.at || (a.run < b.run ? -1 : 1);
+
+/** The most line keys a table read looks at: well past what pages that
+ *  each kept ten lines apart for a while could bring back together (a peer
+ *  writing more is ignored past it). Entering a go trims what it read. */
+const SCORE_LINES_READ = 500;
+
+/** A table's CLEAR keys, each with the count it names (0 for garbage). */
+function clearKeys(itemId: string, gameId: string): Array<{ key: string; clears: number }> {
+  const prefix = clearKey(itemId, gameId, 0).slice(0, -1);
+  return arcadeRawKeys(prefix, 64).map((key) => {
+    const n = key.slice(prefix.length);
+    return { key, clears: /^\d{1,15}$/.test(n) ? Number(n) : 0 };
+  });
+}
+
+/** How many times the owner has cleared a table: the highest CLEAR. */
+function tableClears(itemId: string, gameId: string): number {
+  return clearKeys(itemId, gameId).reduce((most, c) => Math.max(most, c.clears), 0);
+}
+
+/** The best ARCADE_SCORES_MAX of `lines`, one a go, best first. */
+function bestLines(lines: readonly HighScore[]): HighScore[] {
+  const seen = new Set<string>();
+  const out: HighScore[] = [];
+  for (const line of [...lines].sort(byScore)) {
+    if (seen.has(line.run)) continue;
+    seen.add(line.run);
+    out.push(line);
+  }
+  return out.slice(0, ARCADE_SCORES_MAX);
+}
+
+/** A table's line keys (all of them, up to SCORE_LINES_READ), each with its
+ *  line or null for garbage. */
+function tableLines(itemId: string, gameId: string, clears: number): Array<{ key: string; line: HighScore | null }> {
+  const map = ensureMap();
+  return arcadeRawKeys(`${scoresKey(itemId, gameId)}:${clears}:`, SCORE_LINES_READ)
+    .map((key) => ({ key, line: sanitizeScore(map.get(key)) }));
+}
+
+const linesOf = (read: ReadonlyArray<{ line: HighScore | null }>): HighScore[] =>
+  read.flatMap(({ line }) => (line ? [line] : []));
+
+/** A table's line keys from before CLEAR number `clears`: those under an
+ *  older count (or none). Lines under a newer one stay: they come from a
+ *  CLEAR this page hasn't heard of yet. */
+function linesBefore(itemId: string, gameId: string, clears: number): string[] {
+  const prefix = `${scoresKey(itemId, gameId)}:`;
+  return arcadeRawKeys(prefix).filter((key) => {
+    const count = /^(\d{1,15}):/.exec(key.slice(prefix.length));
+    return !count || Number(count[1]) < clears;
+  });
+}
+
+/** A cabinet's high-score table for one of its own games, best first. */
+export function readHighScores(itemId: string, gameId: string): HighScore[] {
+  return bestLines(linesOf(tableLines(itemId, gameId, tableClears(itemId, gameId))));
+}
+
+/** `table` with `goes` entered: a go already on it keeps its better score,
+ *  a new one goes in where it ranks, and the table keeps its best
+ *  ARCADE_SCORES_MAX. Pure (exported for its tests). */
+export function mergeHighScores(table: readonly HighScore[], goes: readonly HighScore[]): HighScore[] {
+  const byRun = new Map(table.map((line) => [line.run, line]));
+  for (const go of goes) {
+    const clean = sanitizeScore(go);
+    if (!clean) continue;
+    const had = byRun.get(clean.run);
+    if (!had || clean.score > had.score) byRun.set(clean.run, clean);
+  }
+  return [...byRun.values()].sort(byScore).slice(0, ARCADE_SCORES_MAX);
+}
+
+/** Enter players' scores on the cabinet's table (the page hosting the game
+ *  does, as each player's go ends and now and then while it lasts). Writes
+ *  only the goes that make the table or better their line on it (a score
+ *  that doesn't make it costs nothing), and in the same update lets go of
+ *  lines pushed off it and any from before a CLEAR. Whether it wrote. */
+export function recordHighScores(itemId: string, gameId: string, goes: readonly HighScore[]): boolean {
+  const clears = tableClears(itemId, gameId);
+  const read = tableLines(itemId, gameId, clears);
+  const table = bestLines(linesOf(read));
+  const next = mergeHighScores(table, goes);
+  const had = new Map(table.map((line) => [line.run, line.score]));
+  const entries: Array<readonly [string, unknown]> = [];
+  for (const line of next) {
+    if (had.get(line.run) !== line.score) entries.push([scoreLineKey(itemId, gameId, clears, line.run), line]);
+  }
+  if (entries.length === 0) return false;
+  // Let go of what was read and is off the table now, and of the lines from
+  // before a CLEAR; a line past the read limit stays for a later go to rank.
+  const kept = new Set(next.map((line) => scoreLineKey(itemId, gameId, clears, line.run)));
+  for (const { key } of read) if (!kept.has(key)) entries.push([key, undefined]);
+  for (const key of linesBefore(itemId, gameId, clears)) entries.push([key, undefined]);
+  arcadeRawSetMany(entries);
+  return true;
+}
+
+/** Wipe a game's table on this cabinet (the owner): its count goes up, so a
+ *  line a page writes before it hears of the CLEAR stays off it too. */
+export function clearHighScores(itemId: string, gameId: string): ArcadeAction {
+  const gate = ownerGate();
+  if (!gate.ok) return gate;
+  const clears = tableClears(itemId, gameId) + 1;
+  const entries: Array<readonly [string, unknown]> = [[clearKey(itemId, gameId, clears), { clears } satisfies ClearRecord]];
+  for (const old of clearKeys(itemId, gameId)) entries.push([old.key, undefined]);
+  for (const key of linesBefore(itemId, gameId, clears)) entries.push([key, undefined]);
+  arcadeRawSetMany(entries);
+  return { ok: true };
+}
+
+/** Call `listener` when a game's table on this cabinet changes. */
+export function subscribeHighScores(itemId: string, gameId: string, listener: () => void): () => void {
+  const lines = subscribeArcadePrefix(`${scoresKey(itemId, gameId)}:`, listener);
+  const clears = subscribeArcadePrefix(clearKey(itemId, gameId, 0).slice(0, -1), listener);
+  return () => {
+    lines();
+    clears();
+  };
 }
 
 /** What the panel, the stage and the screen show: the curation with the

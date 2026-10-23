@@ -7,8 +7,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { setConvenienceLanesForTest } from './sovereignty';
 import {
-  bindArcadeDoc, insertCoin, putOnCabinet, takeOffCabinet, setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate,
-  setArcadeIdentity, setArcadePageId, setEmulatorData, standUp,
+  bindArcadeDoc, builtInGame, insertCoin, putOnCabinet, recordHighScores, takeOffCabinet, setArcadeClock,
+  setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData, standUp,
 } from './arcadeDoc';
 import type { ArcadeGame } from './arcadeDoc';
 import { ARCADE_GAMES } from './arcadeLibrary';
@@ -261,5 +261,34 @@ describe('the double-wide cabinet\'s four players (#242)', () => {
     expect(html).toContain('data-arcade-reset="1"');
     expect(html).not.toContain('data-arcade-reset="1" disabled');
     expect(resetArcadeCabinet(CAB, true, 4)).toBe('The players stood up · the cabinet is free.');
+  });
+});
+
+describe('HIGH SCORES for the double-wide cabinet\'s own game', () => {
+  const wide = (canEdit: boolean): ArcadeDeviceDeps => ({ ...deps('settings', canEdit), seats: 4 });
+  const putOnLanternRoad = () => ownerPuts(builtInGame('lantern-road')!);
+
+  it('lists the best for anyone, escaped, with CLEAR for the owner alone', () => {
+    putOnLanternRoad();
+    let html = renderArcadePanel(CAB, wide(false));
+    expect(html).toContain('HIGH SCORES · LANTERN ROAD');
+    expect(html).toContain('No scores yet');
+    recordHighScores(CAB, 'lantern-road', [
+      { name: 'Bob <b>', score: 700, at: 1, run: 'r1' },
+      { name: 'Carol', score: 4200, at: 2, run: 'r2' },
+    ]);
+    html = renderArcadePanel(CAB, wide(false));
+    expect(html).toMatch(/1\.[\s\S]*CAROL[\s\S]*004200[\s\S]*2\.[\s\S]*BOB &lt;B&gt;[\s\S]*000700/);
+    expect(html).not.toContain('<b>');
+    expect(html).not.toContain('data-arcade-clear-scores');
+    html = renderArcadePanel(CAB, wide(true));
+    expect(html).toContain('data-arcade-clear-scores="lantern-road"');
+    expect(html).not.toContain('data-arcade-clear-scores="lantern-road" disabled');
+  });
+
+  it('shows no table for a game that isn\'t the cabinet\'s own', () => {
+    ownerPuts(LJ65);
+    recordHighScores(CAB, 'lantern-road', [{ name: 'Carol', score: 4200, at: 2, run: 'r2' }]);
+    expect(renderArcadePanel(CAB, wide(true))).not.toContain('HIGH SCORES');
   });
 });

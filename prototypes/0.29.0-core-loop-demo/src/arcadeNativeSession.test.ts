@@ -10,12 +10,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ARCADE_WIRE_NATIVE, packArcadeTick, pipe, unpackArcadeTick } from './arcadeNet';
 import type { ArcadeLink } from './arcadeNesSession';
-import { LR_REV, type LrState } from './games/lanternRoad';
-import { newNativeMatch } from './games/nativeArcade';
+import { LR_AWAY_FRAMES, LR_PLAYER_H, LR_PLAYER_W, LR_REV, type LrState } from './games/lanternRoad';
+import { newNativeMatch, newNativeSeat } from './games/nativeArcade';
 
 type SessionModule = typeof import('./arcadeNativeSession');
 type GamesModule = typeof import('./games/gamesDoc');
 type CasinoModule = typeof import('./casinoDoc');
+type ArcadeDocModule = typeof import('./arcadeDoc');
 type YModule = typeof import('yjs');
 
 const ITEM = 'arcade-wide-1';
@@ -27,6 +28,9 @@ interface Page {
   mod: SessionModule;
   games: GamesModule;
   casino: CasinoModule;
+  arcade: ArcadeDocModule;
+  /** This page's player id. */
+  player: string;
   Y: YModule;
   doc: InstanceType<YModule['Doc']>;
   /** Painted frames: the frame number each shows → the state's JSON. */
@@ -47,12 +51,15 @@ async function openPage(name: string): Promise<Page> {
   const casino = await import('./casinoDoc');
   const games = await import('./games/gamesDoc');
   const mod = await import('./arcadeNativeSession');
+  const arcade = await import('./arcadeDoc');
+  const player = (await import('./identity')).getPlayerId();
   const doc = new Y.Doc();
   for (const other of pages) if (!other.closed) Y.applyUpdate(doc, Y.encodeStateAsUpdate(other.doc), 'room');
   casino.bindCasinoDoc(doc);
   games.bindGamesDoc(doc);
+  arcade.bindArcadeDoc(doc);
   const page: Page = {
-    name, lane: `lane-${name}`, mod, games, casino, Y, doc,
+    name, lane: `lane-${name}`, mod, games, casino, arcade, player, Y, doc,
     painted: new Map(), titles: [], released: 0, outbox: [], sent: [], closed: false,
   };
   doc.on('update', (update: Uint8Array, origin: unknown) => {
@@ -472,6 +479,164 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     expect(b.games.readNativeArcade(ITEM)!.game).toBe(`lantern-road@${LR_REV}`);
     expect(b.mod.nativeArcadeCopyInfo(ITEM)?.role).toBe('follow');
   });
+
+  it('enters a player\'s score on the cabinet\'s high scores as they step away, the rest as the game ends', async () => {
+    const [a, b] = await room('a', 'b');
+    a.doc.getMap('players').set(b.player, { name: 'Bob' });
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    const guest = link(b, 2);
+    guest.join();
+    await run(300);
+    // Points the host's copy (the reference) has them on.
+    const s = stateOf(a)!;
+    s.players[0]!.score = 1200;
+    s.players[2]!.score = 700;
+    await run(50);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road')).toEqual([]);
+    guest.stop(); // Bob steps away: his player leaves the road half a second later
+    await run(700);
+    expect(b.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 700]]);
+    host.stop();
+    await run(50);
+    const table = b.arcade.readHighScores(ITEM, 'lantern-road');
+    expect(table.map((l) => l.score)).toEqual([1200, 700]);
+    expect(table[0]!.name).toBe(a.player.slice(0, 8)); // no name in the room: their id's start
+    expect(new Set(table.map((l) => l.run)).size).toBe(2);
+  });
+
+  it('enters the goes still being played every so often, so a host closing the tab loses little', async () => {
+    const [a] = await room('a');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    stateOf(a)!.players[0]!.score = 950;
+    await run(16000);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => l.score)).toEqual([950]);
+    // The same go scoring more replaces its line rather than adding one.
+    stateOf(a)!.players[0]!.score = 2500;
+    await run(16000);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => l.score)).toEqual([2500]);
+  });
+
+  it('counts the points a player scores in the moment after stepping away', async () => {
+    const [a, b] = await room('a', 'b');
+    a.doc.getMap('players').set(b.player, { name: 'Bob' });
+    link(a, 0).host(LANTERN_ROAD);
+    await run(100);
+    const guest = link(b, 2);
+    guest.join();
+    await run(300);
+    stateOf(a)!.players[2]!.score = 700;
+    await run(50);
+    guest.stop();
+    await run(100);
+    // His seat is free, his player still on the road: the boss falls to a
+    // star he threw, and the bonus is his.
+    expect(a.games.readNativeSeat(ITEM, 2)).toBeNull();
+    expect(stateOf(a)!.players[2]!.on).toBe(true);
+    stateOf(a)!.players[2]!.score = 3700;
+    await run(700);
+    expect(stateOf(a)!.players[2]!.on).toBe(false);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 3700]]);
+  });
+
+  it('counts a point scored on the frame before the player leaves, in the same update', async () => {
+    const [a, b] = await room('a', 'b');
+    a.doc.getMap('players').set(b.player, { name: 'Bob' });
+    link(a, 0).host(LANTERN_ROAD);
+    await run(100);
+    const guest = link(b, 2);
+    guest.join();
+    await run(300);
+    stateOf(a)!.players[2]!.score = 700;
+    await run(50);
+    guest.stop();
+    await run(50);
+    // His player's last frame on the road picks up a coin, and the host
+    // runs that frame and the next (he's gone) in one update.
+    const s = stateOf(a)!;
+    const p = s.players[2]!;
+    p.away = LR_AWAY_FRAMES - 2;
+    s.items.push({ kind: 'coin', x: p.x + LR_PLAYER_W / 2, y: p.y + LR_PLAYER_H / 2, taken: false });
+    const before = s.frame;
+    vi.setSystemTime(Date.now() + 50);
+    a.mod.nativeArcadeFrame(3 / 60, { x: 0, z: 1 });
+    expect(s.frame - before).toBeGreaterThanOrEqual(2);
+    expect(p.on).toBe(false);
+    expect(p.score).toBe(750);
+    await run(50);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 750]]);
+  });
+
+  it('starts someone who takes a seat the moment it is let go on a go of their own', async () => {
+    const [a, b, c] = await room('a', 'b', 'c');
+    a.doc.getMap('players').set(b.player, { name: 'Bob' });
+    a.doc.getMap('players').set(c.player, { name: 'Cat' });
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    const bob = link(b, 2);
+    bob.join();
+    await run(300);
+    stateOf(a)!.players[2]!.score = 700;
+    await run(50);
+    bob.stop();
+    const cat = link(c, 2);
+    cat.join();
+    await run(50);
+    expect(c.games.readNativeSeat(ITEM, 2)?.player).toBe(c.player);
+    // Bob's player leaves the road first; Cat's comes on after, from nothing.
+    await run(1000);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 700]]);
+    expect(stateOf(a)!.players[2]!.on).toBe(true);
+    expect(stateOf(a)!.players[2]!.score).toBe(0);
+    stateOf(a)!.players[2]!.score = 50;
+    await run(50);
+    host.stop();
+    await run(50);
+    expect(c.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 700], ['Cat', 50]]);
+  });
+
+  it('gives every go its own line, even two that start on the same frame count, a wrap apart', async () => {
+    const [a] = await room('a');
+    link(a, 0).host(LANTERN_ROAD);
+    await run(100);
+    // Eighteen minutes of frames, quickly: one page, a screen that keeps nothing.
+    a.mod.registerNativeArcadeVisual(ITEM, {
+      painter: {
+        drawFrame: () => undefined, drawMenu: () => undefined, drawCredits: () => undefined,
+        drawCard: () => undefined, drawAttract: () => undefined, drawWith: () => undefined,
+      },
+      present: () => undefined, showAttract: () => undefined, setPictureLines: () => undefined,
+    }, { x: 0, z: 0 });
+    const m = a.games.readNativeArcade(ITEM)!;
+    const next = () => a.mod.nativeArcadeCopyInfo(ITEM)!.next;
+    const frame = () => {
+      vi.setSystemTime(Date.now() + 1000 / 60);
+      a.mod.nativeArcadeFrame(1 / 60, null);
+      a.outbox.length = 0;
+      a.sent.length = 0;
+    };
+    // A go at seat 2 that starts on the frame this returns (the guest's page
+    // needn't run: the seat in the doc is what puts their player on).
+    const play = (score: number): number => {
+      a.games.writeNativeSeat(ITEM, 2, newNativeSeat(m, 2, 'bob-player', 'bob-page'));
+      frame();
+      const at = next();
+      expect(stateOf(a)!.players[2]!.on).toBe(true);
+      stateOf(a)!.players[2]!.score = score;
+      frame();
+      a.games.writeNativeSeat(ITEM, 2, null);
+      for (let i = 0; i < 40; i++) frame();
+      return at;
+    };
+    const first = play(300);
+    while (next() !== ((first - 1) & 0xffff)) frame();
+    expect(play(400)).toBe(first);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => l.score)).toEqual([400, 300]);
+  }, 60_000);
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {
     const [a, b] = await room('a', 'b');

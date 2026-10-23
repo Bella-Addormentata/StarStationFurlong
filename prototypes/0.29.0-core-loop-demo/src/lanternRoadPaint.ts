@@ -15,10 +15,11 @@
  * behind the street are drawn once too and scrolled at their own pace.
  */
 
+import type { NativeBoardLine, NativeHud } from './arcadeNativeGames';
 import {
-  BOSS_DYING_FRAMES, DYING_FRAMES, LR_COLS, LR_GATE_COL, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_SEATS, LR_TILE,
-  LR_VIEW_H, LR_VIEW_W, MAX_HP, PUFF_FRAMES, SUB, SWING_FRAMES, TAG_FRAMES, bossBox, enemyBox, isLedge, isSolid, shotBox,
-  type LrBoss, type LrEnemy, type LrPlayer, type LrShot, type LrState,
+  BOSS_DYING_FRAMES, DYING_FRAMES, GATE_OPEN_FRAMES, LR_COLS, LR_GATE_COL, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS,
+  LR_SEATS, LR_TILE, LR_VIEW_H, LR_VIEW_W, MAX_HP, PUFF_FRAMES, SUB, SWING_FRAMES, TAG_FRAMES, bossBox, enemyBox, isLedge,
+  isSolid, shotBox, type LrBoss, type LrEnemy, type LrPlayer, type LrShot, type LrState,
 } from './games/lanternRoad';
 
 /** The screen canvas the picture is drawn for (2× the game). */
@@ -526,11 +527,13 @@ function drawStoneLantern(ctx: CanvasRenderingContext2D, x: number, groundY: num
 
 /** The shrine gate (a torii) standing over column `col`: sealed with a
  *  rope and a paper charm while its guardian is about, then aglow. */
-function drawGate(ctx: CanvasRenderingContext2D, x: number, groundY: number, open: boolean, t: number): void {
-  if (open) {
+/** The shrine gate. `open` runs 0 (sealed) to 1 (open): as its guardian
+ *  burns out the seal drops away and the light comes up between the posts. */
+function drawGate(ctx: CanvasRenderingContext2D, x: number, groundY: number, open: number, t: number): void {
+  if (open > 0) {
     const glow = ctx.createLinearGradient(0, groundY - 72, 0, groundY);
     glow.addColorStop(0, 'rgba(255,214,120,0)');
-    glow.addColorStop(1, `rgba(255,214,120,${0.35 + 0.1 * Math.sin(t / 15)})`);
+    glow.addColorStop(1, `rgba(255,214,120,${(0.35 + 0.1 * Math.sin(t / 15)) * open})`);
     ctx.fillStyle = glow;
     ctx.fillRect(x - 18, groundY - 72, 42, 72);
   }
@@ -552,9 +555,21 @@ function drawGate(ctx: CanvasRenderingContext2D, x: number, groundY: number, ope
   ctx.fillRect(x - 4, groundY - 90, 14, 12);
   ctx.fillStyle = '#ffd36a';
   ctx.fillRect(x - 2, groundY - 88, 10, 8);
-  if (open) return;
+  if (open >= 1) return;
   // The seal: a straw rope sagging between the posts, paper streamers, and
-  // a glowing charm in the middle.
+  // a glowing charm in the middle. Opening, it falls and fades, and the
+  // charm throws sparks as it goes.
+  ctx.save();
+  if (open > 0) {
+    ctx.globalAlpha = 1 - open;
+    ctx.fillStyle = '#ffe08a';
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4 + open * 2;
+      const r = 4 + open * 26;
+      ctx.fillRect(x + 4 + Math.cos(a) * r, groundY - 45 + Math.sin(a) * r * 0.7, 2, 2);
+    }
+    ctx.translate(0, Math.round(open * open * 40));
+  }
   ctx.strokeStyle = '#d8c48a';
   ctx.lineWidth = 3;
   ctx.beginPath();
@@ -576,6 +591,7 @@ function drawGate(ctx: CanvasRenderingContext2D, x: number, groundY: number, ope
   ctx.fillRect(x + 2, groundY - 51, 3, 3);
   ctx.fillRect(x + 1, groundY - 46, 5, 1);
   ctx.fillRect(x + 3, groundY - 45, 1, 6);
+  ctx.restore();
 }
 
 function drawWater(ctx: CanvasRenderingContext2D, x: number, t: number): void {
@@ -647,7 +663,36 @@ function drawStaff(ctx: CanvasRenderingContext2D, p: LrPlayer, sx: number, sy: n
   }
 }
 
-function drawPlayer(ctx: CanvasRenderingContext2D, s: LrState, seat: number, cam: number): void {
+/** Room a seat tag needs: tags closer than this stack. */
+const TAG_GAP_X = 16;
+const TAG_GAP_Y = 9;
+
+/** How far a seat tag has risen, `TAG_FRAMES - tag` frames after it showed. */
+const tagRise = (tag: number): number => Math.min(4, (TAG_FRAMES - tag) >> 2);
+
+/**
+ * How far above its usual spot each seat's tag goes: players who drop in
+ * (or come back) together stand in one spot, so their tags stack instead of
+ * printing over each other. Measured where drawPlayer prints them, rise and
+ * all. Game pixels, by seat (exported for its tests).
+ */
+export function tagLifts(s: LrState): number[] {
+  const lifts = new Array<number>(LR_SEATS).fill(0);
+  const placed: Array<{ x: number; y: number }> = [];
+  for (let seat = 0; seat < LR_SEATS; seat++) {
+    const p = s.players[seat]!;
+    if (!p.on || p.ko > 0 || p.tag <= 0) continue;
+    const x = Math.round(p.x / SUB);
+    const y = Math.round(p.y / SUB) - tagRise(p.tag);
+    let lift = 0;
+    while (placed.some((q) => Math.abs(q.x - x) < TAG_GAP_X && Math.abs(q.y - (y - lift)) < TAG_GAP_Y)) lift += TAG_GAP_Y;
+    placed.push({ x, y: y - lift });
+    lifts[seat] = lift;
+  }
+  return lifts;
+}
+
+function drawPlayer(ctx: CanvasRenderingContext2D, s: LrState, seat: number, cam: number, lift = 0): void {
   const p = s.players[seat]!;
   if (!p.on) return;
   const sx = Math.round(p.x / SUB) - cam - 3;
@@ -669,8 +714,10 @@ function drawPlayer(ctx: CanvasRenderingContext2D, s: LrState, seat: number, cam
   if (p.tag > 0) {
     // Just dropped in: their seat over their head, in their colour.
     ctx.globalAlpha = Math.min(1, p.tag / 20);
-    text(ctx, `${seat + 1}P`, sx + 8, sy - 6 - Math.min(4, (TAG_FRAMES - p.tag) >> 2), 8, SEAT_COLOURS[seat]!.light, 'center');
+    const ty = sy - 6 - lift - tagRise(p.tag);
+    text(ctx, `${seat + 1}P`, sx + 8, ty, 8, SEAT_COLOURS[seat]!.light, 'center');
     ctx.fillStyle = SEAT_COLOURS[seat]!.light;
+    if (lift > 0) ctx.fillRect(sx + 8, ty + 2, 1, lift);
     ctx.fillRect(sx + 7, sy - 3, 3, 1);
     ctx.fillRect(sx + 8, sy - 2, 1, 1);
     ctx.globalAlpha = 1;
@@ -999,6 +1046,17 @@ function drawPanel(ctx: CanvasRenderingContext2D, s: LrState): void {
   }
 }
 
+/** The cabinet's best, on the dirt under the street: the table's, or a
+ *  player's now if they've gone past it. */
+function drawHi(ctx: CanvasRenderingContext2D, s: LrState, hi: number): void {
+  const best = s.players.reduce((top, p) => (p.on ? Math.max(top, p.score) : top), hi);
+  const beaten = best > hi && hi > 0;
+  ctx.fillStyle = 'rgba(8,4,18,0.55)';
+  ctx.fillRect(LR_VIEW_W / 2 - 38, LR_VIEW_H - 13, 76, 11);
+  text(ctx, `HI ${String(best).padStart(6, '0')}`, LR_VIEW_W / 2, LR_VIEW_H - 4, 8,
+    beaten && (s.frame >> 4) & 1 ? '#fff4e0' : '#ffd36a', 'center');
+}
+
 function drawPops(ctx: CanvasRenderingContext2D, s: LrState, cam: number): void {
   for (const pop of s.pops) {
     ctx.globalAlpha = Math.min(1, pop.t / 12);
@@ -1052,7 +1110,9 @@ function drawClear(ctx: CanvasRenderingContext2D, s: LrState): void {
  * Draw the state onto a `w`×`h` canvas context (the cabinet's screen, 2×
  * the game). Leaves the context's transform as it found it.
  */
-export function paintLanternRoad(ctx: CanvasRenderingContext2D, s: LrState, w = LR_CANVAS_W, h = LR_CANVAS_H): void {
+export function paintLanternRoad(
+  ctx: CanvasRenderingContext2D, s: LrState, w = LR_CANVAS_W, h = LR_CANVAS_H, hud?: NativeHud,
+): void {
   backdrop ??= buildBackdrop();
   ctx.save();
   ctx.setTransform(w / LR_VIEW_W, 0, 0, h / LR_VIEW_H, 0, 0);
@@ -1079,7 +1139,8 @@ export function paintLanternRoad(ctx: CanvasRenderingContext2D, s: LrState, w = 
       else if (ch === 'S') drawStoneLantern(ctx, x, (row + 1) * LR_TILE);
     }
   }
-  drawGate(ctx, LR_GATE_COL * LR_TILE - cam + 8, (LR_ROWS - 2) * LR_TILE, s.boss.stage === 'done', t);
+  const open = s.boss.stage === 'done' ? 1 - s.boss.t / GATE_OPEN_FRAMES : 0;
+  drawGate(ctx, LR_GATE_COL * LR_TILE - cam + 8, (LR_ROWS - 2) * LR_TILE, open, t);
   // The street, bridges, roofs and barrels.
   for (let col = c0; col <= c1; col++) {
     for (let row = 0; row < LR_ROWS; row++) {
@@ -1099,18 +1160,22 @@ export function paintLanternRoad(ctx: CanvasRenderingContext2D, s: LrState, w = 
   for (const e of s.enemies) drawEnemy(ctx, e, s, cam);
   drawBoss(ctx, s.boss, s, cam);
   for (const sh of s.shots) if (sh.kind !== 'fire') drawShot(ctx, sh, s, cam);
-  for (let seat = 0; seat < LR_SEATS; seat++) drawPlayer(ctx, s, seat, cam);
+  const lifts = tagLifts(s);
+  for (let seat = 0; seat < LR_SEATS; seat++) drawPlayer(ctx, s, seat, cam, lifts[seat]);
   for (const sh of s.shots) if (sh.kind === 'fire') drawShot(ctx, sh, s, cam);
   drawPuffs(ctx, s, cam);
   drawPops(ctx, s, cam);
   drawPanel(ctx, s);
+  if (hud) drawHi(ctx, s, hud.hi);
   drawBossBar(ctx, s);
   if (s.phase === 'clear') drawClear(ctx, s);
   ctx.restore();
 }
 
 /** The idle cabinet's card while nobody plays: the title over the street. */
-export function paintLanternRoadTitle(ctx: CanvasRenderingContext2D, line: string, blink: boolean, w = LR_CANVAS_W, h = LR_CANVAS_H): void {
+/** The idle cabinet's street: the town at the road's start, two lanterns,
+ *  and the context scaled to game pixels (the caller restores it). */
+function idleStreet(ctx: CanvasRenderingContext2D, w: number, h: number): void {
   backdrop ??= buildBackdrop();
   ctx.save();
   ctx.setTransform(w / LR_VIEW_W, 0, 0, h / LR_VIEW_H, 0, 0);
@@ -1124,6 +1189,10 @@ export function paintLanternRoadTitle(ctx: CanvasRenderingContext2D, line: strin
   }
   drawLantern(ctx, 120, 30, 0);
   drawLantern(ctx, 376, 30, 0);
+}
+
+export function paintLanternRoadTitle(ctx: CanvasRenderingContext2D, line: string, blink: boolean, w = LR_CANVAS_W, h = LR_CANVAS_H): void {
+  idleStreet(ctx, w, h);
   // A dark band so the words read over the town's lit windows.
   const band = ctx.createLinearGradient(0, 52, 0, 142);
   band.addColorStop(0, 'rgba(10,4,24,0)');
@@ -1139,6 +1208,39 @@ export function paintLanternRoadTitle(ctx: CanvasRenderingContext2D, line: strin
     const spr = sprite(`p${seat}:player`, SPRITE_MAPS.player!, seatPalette(seat));
     ctx.drawImage(spr.right, 196 + seat * 30, (LR_ROWS - 2) * LR_TILE - LR_PLAYER_H / SUB - 2);
   }
+  ctx.restore();
+}
+
+/** Ranks' colours on the score page: gold, silver, bronze, then paper. */
+const RANK_COLOURS = ['#ffd36a', '#dfe6f0', '#e0a070'];
+
+/**
+ * The idle cabinet's other page: the cabinet's best ten, in two columns,
+ * over the same street. Names are players' own text, drawn as text (never
+ * markup), cut to fit.
+ */
+export function paintLanternRoadScores(
+  ctx: CanvasRenderingContext2D, board: readonly NativeBoardLine[], line: string, blink: boolean,
+  w = LR_CANVAS_W, h = LR_CANVAS_H,
+): void {
+  idleStreet(ctx, w, h);
+  ctx.fillStyle = 'rgba(10,4,24,0.78)';
+  ctx.fillRect(28, 14, LR_VIEW_W - 56, 134);
+  ctx.fillStyle = '#e0342a';
+  ctx.fillRect(28, 14, LR_VIEW_W - 56, 2);
+  ctx.fillRect(28, 146, LR_VIEW_W - 56, 2);
+  text(ctx, 'LANTERN ROAD · BEST ON THIS CABINET', LR_VIEW_W / 2, 32, 11, '#ffd36a', 'center');
+  board.slice(0, 10).forEach((row, i) => {
+    const col = i < 5 ? 0 : 1;
+    const x = col === 0 ? 52 : 276;
+    const y = 54 + (i % 5) * 18;
+    const colour = RANK_COLOURS[i] ?? '#fff4e0';
+    const name = row.name.toUpperCase().slice(0, 12);
+    text(ctx, `${i + 1}`.padStart(2, ' '), x, y, 10, colour);
+    text(ctx, name, x + 22, y, 10, colour);
+    text(ctx, String(row.score).padStart(6, '0'), x + 184, y, 10, colour, 'right');
+  });
+  if (blink) text(ctx, line, LR_VIEW_W / 2, 168, 11, '#7CFFB0', 'center');
   ctx.restore();
 }
 

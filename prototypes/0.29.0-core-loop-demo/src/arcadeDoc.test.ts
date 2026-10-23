@@ -17,8 +17,10 @@ import {
   setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
   standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_COUNTER_MAX, ARCADE_DEFAULT_GAME, ARCADE_SEAT_LAPSE_MS,
   isSeatIndex, mySeat, seatHolders, ARCADE_SEATS_MAX, ARCADE_CORES, ejsCore,
+  clearHighScores, clearKey, mergeHighScores, readHighScores, recordHighScores, scoreLineKey, scoresKey, subscribeHighScores,
+  ARCADE_SCORE_TOP, ARCADE_SCORES_MAX,
 } from './arcadeDoc';
-import type { ArcadeGame } from './arcadeDoc';
+import type { ArcadeGame, HighScore } from './arcadeDoc';
 import { ARCADE_GAMES } from './arcadeLibrary';
 
 const CAB = 'arcade-cabinet-1';
@@ -509,6 +511,184 @@ describe('the tally', () => {
     for (const d of [alice, bob]) {
       bindArcadeDoc(d);
       expect(readCabinet(CAB)).toMatchObject({ game: PACMAN, plays: 1 });
+    }
+  });
+});
+
+describe('high scores', () => {
+  const LR = 'lantern-road';
+  const line = (run: string, score: number, name = run.toUpperCase(), at = 0): HighScore => ({ name, score, at, run });
+
+  it('keeps the best ten, best first, a tie to whoever set it first', () => {
+    const goes = Array.from({ length: 12 }, (_, i) => line(`go${i}`, (i + 1) * 100, `P${i}`, i));
+    goes.push(line('late', 1200, 'LATE', 99));
+    const table = mergeHighScores([], goes);
+    expect(table).toHaveLength(ARCADE_SCORES_MAX);
+    expect(table.map((l) => l.run).slice(0, 3)).toEqual(['go11', 'late', 'go10']);
+    expect(table.at(-1)!.score).toBe(400);
+  });
+
+  it('a later, higher score from the same go replaces its line; a lower one or a zero changes nothing', () => {
+    let table = mergeHighScores([], [line('a', 500), line('b', 300)]);
+    table = mergeHighScores(table, [line('b', 800), line('a', 200), line('c', 0)]);
+    expect(table.map((l) => [l.run, l.score])).toEqual([['b', 800], ['a', 500]]);
+  });
+
+  it('writes only the goes that change the table, a key each, one table per game', () => {
+    const writes: string[] = [];
+    doc.getMap('arcade').observe((e) => { for (const k of e.keysChanged) writes.push(k); });
+    let heard = 0;
+    subscribeHighScores(CAB, LR, () => heard++);
+    expect(recordHighScores(CAB, LR, [line('a', 500, 'Alice')])).toBe(true);
+    expect(recordHighScores(CAB, LR, [line('a', 500, 'Alice')])).toBe(false);
+    expect(recordHighScores(CAB, LR, [line('a', 0, 'Alice')])).toBe(false);
+    expect(recordHighScores(CAB, LR, [line('a', 500, 'Alice'), line('b', 300, 'Bob')])).toBe(true);
+    expect(writes).toEqual([scoreLineKey(CAB, LR, 0, 'a'), scoreLineKey(CAB, LR, 0, 'b')]);
+    expect(heard).toBe(2);
+    expect(readHighScores(CAB, LR)).toEqual([line('a', 500, 'Alice'), line('b', 300, 'Bob')]);
+    expect(readHighScores(CAB, 'another-game')).toEqual([]);
+    expect(readHighScores('arcade-cabinet-2', LR)).toEqual([]);
+  });
+
+  it('lets go of the lines pushed off the table', () => {
+    recordHighScores(CAB, LR, Array.from({ length: ARCADE_SCORES_MAX }, (_, i) => line(`go${i}`, (i + 1) * 100)));
+    recordHighScores(CAB, LR, [line('best', 5000)]);
+    const keys = [...doc.getMap('arcade').keys()].filter((k) => k.startsWith(`${scoresKey(CAB, LR)}:`));
+    expect(keys).toHaveLength(ARCADE_SCORES_MAX);
+    expect(keys).not.toContain(scoreLineKey(CAB, LR, 0, 'go0'));
+    expect(readHighScores(CAB, LR)[0]!.run).toBe('best');
+  });
+
+  it('ranks every page\'s lines once they meet, however many came back together', () => {
+    // Five hosts kept ten lines each apart; synced, the best is the last key.
+    const arcade = doc.getMap('arcade');
+    for (let i = 0; i < 49; i++) arcade.set(scoreLineKey(CAB, LR, 0, `go${i}`), line(`go${i}`, (i + 1) * 10));
+    arcade.set(scoreLineKey(CAB, LR, 0, 'top'), line('top', 99_000));
+    expect(readHighScores(CAB, LR)[0]!.run).toBe('top');
+    // The next go entered trims the rest, and keeps the best.
+    expect(recordHighScores(CAB, LR, [line('new', 1000)])).toBe(true);
+    expect(readHighScores(CAB, LR).map((l) => l.run).slice(0, 2)).toEqual(['top', 'new']);
+    expect([...arcade.keys()].filter((k) => k.startsWith(`${scoresKey(CAB, LR)}:`))).toHaveLength(ARCADE_SCORES_MAX);
+  });
+
+  it('reads a peer\'s garbage as no line, clamps a silly score, and keeps one line a go', () => {
+    const lines: unknown[] = [
+      null, 'x', { name: '', score: 5, at: 0, run: 'r0' }, { name: 'NaN', score: Number.NaN, at: 0, run: 'r1' },
+      { name: 'neg', score: -4, at: 0, run: 'r2' }, { name: 'frac', score: 1.5, at: 0, run: 'r3' },
+      { name: 'big', score: Number.MAX_SAFE_INTEGER, at: 0, run: 'r4' },
+      { name: 'x'.repeat(200), score: 10, at: 'soon', run: 'r5' },
+      { name: 'dup', score: 9, at: 0, run: 'r5' },
+    ];
+    lines.forEach((l, i) => doc.getMap('arcade').set(scoreLineKey(CAB, LR, 0, `k${i}`), l));
+    const table = readHighScores(CAB, LR);
+    expect(table.map((l) => l.run)).toEqual(['r4', 'r5']);
+    expect(table[0]!.score).toBe(ARCADE_SCORE_TOP);
+    expect(table[1]!.name).toHaveLength(32);
+    expect(table[1]!.at).toBe(0);
+    // A CLEAR key that names no count reads as no CLEAR.
+    doc.getMap('arcade').set(`${clearKey(CAB, LR, 0).slice(0, -1)}many`, { clears: 9 });
+    expect(readHighScores(CAB, LR)).toHaveLength(2);
+  });
+
+  it('only the owner clears a table', () => {
+    recordHighScores(CAB, LR, [line('a', 500)]);
+    expect(clearHighScores(CAB, LR)).toEqual({ ok: false, error: 'Only the room owner changes the cabinet.' });
+    expect(readHighScores(CAB, LR)).toHaveLength(1);
+    owner = true;
+    expect(clearHighScores(CAB, LR)).toEqual({ ok: true });
+    expect(readHighScores(CAB, LR)).toEqual([]);
+    expect([...doc.getMap('arcade').keys()].filter((k) => k.startsWith(`${scoresKey(CAB, LR)}:`))).toEqual([]);
+    // The same go scoring on goes back up: it's still being played.
+    recordHighScores(CAB, LR, [line('a', 600)]);
+    expect(readHighScores(CAB, LR).map((l) => l.score)).toEqual([600]);
+  });
+
+  it('keeps both goes when two pages enter theirs at once', () => {
+    // The host lost the room a while and played on; another page took the
+    // cabinet over meanwhile. Each enters its goes on its own doc, then the
+    // two sync: both lines are on the table.
+    recordHighScores(CAB, LR, [line('old', 100)]);
+    const a = doc;
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    recordHighScores(CAB, LR, [line('a1', 900)]);
+    bindArcadeDoc(b);
+    recordHighScores(CAB, LR, [line('b1', 700)]);
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [a, b]) {
+      bindArcadeDoc(d);
+      expect(readHighScores(CAB, LR).map((l) => l.run)).toEqual(['a1', 'b1', 'old']);
+    }
+  });
+
+  it('keeps a go entered after a CLEAR on a page that hears of the go first', () => {
+    // The owner clears on o; a host that has heard enters a go on h; page t
+    // gets h's go before o's CLEAR, and enters a go of its own meanwhile.
+    recordHighScores(CAB, LR, [line('old', 100)]);
+    const o = doc;
+    const h = new Y.Doc();
+    const t = new Y.Doc();
+    for (const d of [h, t]) Y.applyUpdate(d, Y.encodeStateAsUpdate(o));
+    owner = true;
+    clearHighScores(CAB, LR);
+    owner = false;
+    Y.applyUpdate(h, Y.encodeStateAsUpdate(o));
+    bindArcadeDoc(h);
+    const fromH: Uint8Array[] = [];
+    const onUpdate = (u: Uint8Array) => fromH.push(u);
+    h.on('update', onUpdate);
+    recordHighScores(CAB, LR, [line('h1', 900)]);
+    h.off('update', onUpdate);
+    for (const u of fromH) Y.applyUpdate(t, u);
+    bindArcadeDoc(t);
+    expect(recordHighScores(CAB, LR, [line('t1', 500)])).toBe(true);
+    for (const a of [o, h, t]) for (const b of [o, h, t]) if (a !== b) Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [o, h, t]) {
+      bindArcadeDoc(d);
+      expect(readHighScores(CAB, LR).map((l) => l.run)).toEqual(['h1']);
+    }
+  });
+
+  it('keeps the highest CLEAR when owner tabs apart clear different numbers of times', () => {
+    // Tab a clears once; tab b, apart, clears twice and a go goes up after.
+    // Whichever writes land, the table's count is b's: its go stays on.
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    a.clientID = 2;
+    b.clientID = 1;
+    owner = true;
+    for (const [d, times] of [[a, 1], [b, 2]] as const) {
+      bindArcadeDoc(d);
+      for (let i = 0; i < times; i++) clearHighScores(CAB, LR);
+    }
+    recordHighScores(CAB, LR, [line('b2', 700)]);
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [a, b]) {
+      bindArcadeDoc(d);
+      expect(readHighScores(CAB, LR).map((l) => l.run)).toEqual(['b2']);
+    }
+    // The next CLEAR goes past both, and wipes the go.
+    clearHighScores(CAB, LR);
+    expect(readHighScores(CAB, LR)).toEqual([]);
+  });
+
+  it('keeps a CLEAR when a page that hadn\'t heard of it enters a go', () => {
+    recordHighScores(CAB, LR, [line('old', 100)]);
+    const a = doc;
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    recordHighScores(CAB, LR, [line('a1', 900)]); // a's host, offline
+    bindArcadeDoc(b);
+    owner = true;
+    clearHighScores(CAB, LR); // the owner, on b
+    recordHighScores(CAB, LR, [line('b1', 700)]); // a go after the CLEAR
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [a, b]) {
+      bindArcadeDoc(d);
+      expect(readHighScores(CAB, LR).map((l) => l.run)).toEqual(['b1']);
     }
   });
 });
