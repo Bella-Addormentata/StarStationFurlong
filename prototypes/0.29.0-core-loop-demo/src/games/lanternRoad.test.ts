@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
-  BOSS_DYING_FRAMES, CLEAR_FRAMES, DYING_FRAMES, FLAME_FRAMES, LR_ARENA_CAM, LR_COLS, LR_GATE_COL, LR_LEVEL_W, LR_MAP,
-  LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_TILE, LR_VIEW_W, MAX_HP, PAD_A, PAD_B, PAD_DOWN, PAD_LEFT, PAD_PRESENT,
-  PAD_RIGHT, PUFF_FRAMES, SUB, TAG_FRAMES, WAVE_FRAMES, bossBox, checkLanternRoad, createLanternRoad, isLedge, isSolid,
-  isUp, restoreLanternRoad, safeSpot, shotBox, staffBox, stepLanternRoad, type LrState,
+  BOSS_DYING_FRAMES, CLEAR_FRAMES, DYING_FRAMES, FLAME_FRAMES, GATE_OPEN_FRAMES, LR_ARENA_CAM, LR_COLS, LR_GATE_COL,
+  LR_LEVEL_W, LR_MAP, LR_PLAYER_H, LR_PLAYER_W, LR_ROWS, LR_TILE, LR_VIEW_W, MAX_HP, PAD_A, PAD_B, PAD_DOWN, PAD_LEFT,
+  PAD_PRESENT, PAD_RIGHT, PUFF_FRAMES, SUB, TAG_FRAMES, WAVE_FRAMES, bossBox, checkLanternRoad, createLanternRoad,
+  isLedge, isSolid, isUp, restoreLanternRoad, safeSpot, shotBox, staffBox, stepLanternRoad, type LrState,
 } from './lanternRoad';
 
 const run = (s: LrState, frames: number, pads: (f: number) => readonly number[]) => {
@@ -227,6 +227,26 @@ describe('the gate', () => {
     expect(p.score).toBe(score);
     // And the guardian waits at the shrine again.
     expect(s.boss.stage).toBe('wait');
+  });
+
+  it('opens for a moment before the card, even with the group already under it', () => {
+    const s = quiet();
+    run(s, 2, () => only(0));
+    const p = s.players[0]!;
+    p.hurt = 9999;
+    s.cam = LR_ARENA_CAM;
+    p.x = (LR_GATE_COL + 1) * LR_TILE * SUB;
+    p.y = 7 * LR_TILE * SUB;
+    // The guardian burns out with them standing past the gate.
+    s.boss.stage = 'dying';
+    s.boss.t = 1;
+    run(s, 1, () => only(0));
+    expect(s.boss.stage).toBe('done');
+    expect(s.boss.t).toBe(GATE_OPEN_FRAMES);
+    run(s, GATE_OPEN_FRAMES - 1, () => only(0));
+    expect(s.phase).toBe('play');
+    run(s, 1, () => only(0));
+    expect(s.phase).toBe('clear');
   });
 });
 

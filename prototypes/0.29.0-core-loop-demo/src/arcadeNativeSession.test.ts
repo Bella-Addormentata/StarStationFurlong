@@ -16,6 +16,7 @@ import { newNativeMatch } from './games/nativeArcade';
 type SessionModule = typeof import('./arcadeNativeSession');
 type GamesModule = typeof import('./games/gamesDoc');
 type CasinoModule = typeof import('./casinoDoc');
+type ArcadeDocModule = typeof import('./arcadeDoc');
 type YModule = typeof import('yjs');
 
 const ITEM = 'arcade-wide-1';
@@ -27,6 +28,9 @@ interface Page {
   mod: SessionModule;
   games: GamesModule;
   casino: CasinoModule;
+  arcade: ArcadeDocModule;
+  /** This page's player id. */
+  player: string;
   Y: YModule;
   doc: InstanceType<YModule['Doc']>;
   /** Painted frames: the frame number each shows → the state's JSON. */
@@ -47,12 +51,15 @@ async function openPage(name: string): Promise<Page> {
   const casino = await import('./casinoDoc');
   const games = await import('./games/gamesDoc');
   const mod = await import('./arcadeNativeSession');
+  const arcade = await import('./arcadeDoc');
+  const player = (await import('./identity')).getPlayerId();
   const doc = new Y.Doc();
   for (const other of pages) if (!other.closed) Y.applyUpdate(doc, Y.encodeStateAsUpdate(other.doc), 'room');
   casino.bindCasinoDoc(doc);
   games.bindGamesDoc(doc);
+  arcade.bindArcadeDoc(doc);
   const page: Page = {
-    name, lane: `lane-${name}`, mod, games, casino, Y, doc,
+    name, lane: `lane-${name}`, mod, games, casino, arcade, player, Y, doc,
     painted: new Map(), titles: [], released: 0, outbox: [], sent: [], closed: false,
   };
   doc.on('update', (update: Uint8Array, origin: unknown) => {
@@ -471,6 +478,46 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     await run(100);
     expect(b.games.readNativeArcade(ITEM)!.game).toBe(`lantern-road@${LR_REV}`);
     expect(b.mod.nativeArcadeCopyInfo(ITEM)?.role).toBe('follow');
+  });
+
+  it('enters a player\'s score on the cabinet\'s high scores as they step away, the rest as the game ends', async () => {
+    const [a, b] = await room('a', 'b');
+    a.doc.getMap('players').set(b.player, { name: 'Bob' });
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    const guest = link(b, 2);
+    guest.join();
+    await run(300);
+    // Points the host's copy (the reference) has them on.
+    const s = stateOf(a)!;
+    s.players[0]!.score = 1200;
+    s.players[2]!.score = 700;
+    await run(50);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road')).toEqual([]);
+    guest.stop(); // Bob steps away: his player leaves the road half a second later
+    await run(700);
+    expect(b.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 700]]);
+    host.stop();
+    await run(50);
+    const table = b.arcade.readHighScores(ITEM, 'lantern-road');
+    expect(table.map((l) => l.score)).toEqual([1200, 700]);
+    expect(table[0]!.name).toBe(a.player.slice(0, 8)); // no name in the room: their id's start
+    expect(new Set(table.map((l) => l.run)).size).toBe(2);
+  });
+
+  it('enters the goes still being played every so often, so a host closing the tab loses little', async () => {
+    const [a] = await room('a');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(100);
+    stateOf(a)!.players[0]!.score = 950;
+    await run(16000);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => l.score)).toEqual([950]);
+    // The same go scoring more replaces its line rather than adding one.
+    stateOf(a)!.players[0]!.score = 2500;
+    await run(16000);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => l.score)).toEqual([2500]);
   });
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {

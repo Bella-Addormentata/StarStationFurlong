@@ -26,8 +26,13 @@
  * been collecting. Copies fingerprint the state every 32 frames, and one
  * that disagrees with the host's asks for a save state too.
  *
- * The cabinet's screen: the game while one runs; while none does, the
- * game's own title (the cabinet's game is a native one: the reader World
+ * HIGH SCORES: the host follows each player's go off the game's scores and
+ * enters it on the cabinet's table (arcadeDoc `scores:`) when the player
+ * steps away, when the game ends, and every SCORES_EVERY_MS meanwhile.
+ *
+ * The cabinet's screen: the game while one runs, with the cabinet's best
+ * score; while none does, the game's own title, taking turns with the
+ * high-score table (the cabinet's game is a native one: the reader World
  * installs says so); and the screen is handed back (showAttract) the moment
  * the cabinet's game is something else.
  */
@@ -41,9 +46,10 @@ import {
 } from './arcadeNet';
 import type { ArcadeLink, SharedPhase, SharedView } from './arcadeNesSession';
 import { freshMatchId, randomU16 } from './games/arcade';
+import { readHighScores, recordHighScores, type HighScore } from './arcadeDoc';
 import {
-  readNativeArcade, readNativeArcadeMatches, readNativeSeat, readNativeSnapshot, writeNativeArcade, writeNativeSeat,
-  writeNativeSnapshot,
+  readNativeArcade, readNativeArcadeMatches, readNativeSeat, readNativeSnapshot, readPlayerDisplayName, writeNativeArcade,
+  writeNativeSeat, writeNativeSnapshot,
 } from './games/gamesDoc';
 import {
   NATIVE_MAX_SEATS, newNativeMatch, newNativeSeat, seatIsFor, tokenSeat, type NativeMatch, type NativeSeat,
@@ -73,6 +79,15 @@ const PAINT_NEAR_M = 3.5;
 const PAINT_MID_M = 8;
 /** The title's PRESS START blinks this often. */
 const TITLE_BLINK_MS = 500;
+/** The idle cabinet's two pages: the title this long, then the high scores
+ *  (once there are any) for the rest of the cycle. */
+const ATTRACT_TITLE_MS = 8000;
+const ATTRACT_CYCLE_MS = 13000;
+/** The host enters the goes still being played this often too, so a host
+ *  page that closes mid-game loses no more than this of anyone's score. */
+const SCORES_EVERY_MS = 15000;
+/** How often a cabinet rereads its high scores for the screen. */
+const BOARD_READ_MS = 500;
 /** The most JSON a save state may inflate to. */
 const MAX_STATE_JSON_BYTES = 1024 * 1024;
 
@@ -112,6 +127,16 @@ const send = (t: ArcadeTick): void => {
 
 // ── Per-cabinet runtime ──────────────────────────────────────────────────────
 
+/** Host: one player's go at a seat, for the cabinet's high scores. */
+interface Go {
+  run: string;
+  player: string;
+  name: string;
+  score: number;
+  /** The score last entered on the table. */
+  entered: number;
+}
+
 /** This page's copy of one match. */
 interface Copy {
   matchId: number;
@@ -138,6 +163,10 @@ interface Copy {
   lastSnapshotAt: number;
   latestCheck: number;
   sendToggle: boolean;
+  /** Each seat's go now (null: nobody plays it), and when they were last
+   *  all entered on the high scores. */
+  goes: Array<Go | null>;
+  goesEnteredAt: number;
   // Follower
   logLo: PadLog;
   logHi: PadLog;
@@ -180,6 +209,8 @@ interface CabinetSession {
    *  screen goes back (showAttract) when the cabinet stops being ours. Kept
    *  apart from `shown`, which a new copy or match resets. */
   holds: boolean;
+  /** The cabinet's high scores for the game on screen, as last read. */
+  board: { at: number; game: string; lines: HighScore[] } | null;
 }
 
 const sessions = new Map<string, CabinetSession>();
@@ -200,6 +231,7 @@ export function registerNativeArcadeVisual(itemId: string, handle: ArcadeCabinet
 function freshSession(handle: ArcadeCabinetVisualHandle, pos: { x: number; z: number }): CabinetSession {
   return {
     handle, pos, docEpoch: casinoDocEpoch(), bornAt: Date.now(), copy: null, link: null, paintCount: 0, shown: null, holds: false,
+    board: null,
   };
 }
 
@@ -236,6 +268,7 @@ function newCopy(s: CabinetSession, m: NativeMatch, game: NativeGame, role: 'hos
     guestTokens: new Array<number>(NATIVE_MAX_SEATS).fill(0),
     lastGuestAt: new Array<number>(NATIVE_MAX_SEATS).fill(0),
     syncAsked: false, snapshotBusy: false, lastSnapshotAt: 0, latestCheck: 0, sendToggle: false,
+    goes: new Array<Go | null>(NATIVE_MAX_SEATS).fill(null), goesEnteredAt: now,
     logLo: new PadLog(), logHi: new PadLog(), hostLane: null, lastFramesAt: 0, stalledSince: null, needSync: false,
     syncFrom: null, lastSyncAskAt: 0, restoring: false, triedSnapshot: null, hostChecks: new Map(), myChecks: new Map(),
     guestFor: 0, guestCur: 0, guestPrev: 0, guestChanges: 0, guestSeq: 0, guestBeat: 0,
@@ -305,6 +338,7 @@ function matchFor(itemId: string): NativeMatch | null {
 function reconcile(itemId: string, s: CabinetSession, m: NativeMatch | null): void {
   const copy = s.copy;
   if (!m) {
+    if (copy?.role === 'host') enterGoes(itemId, copy, Date.now(), true); // the owner's RESET
     if (copy) {
       s.copy = null;
       s.shown = null;
@@ -318,6 +352,7 @@ function reconcile(itemId: string, s: CabinetSession, m: NativeMatch | null): vo
     copy.matchId = m.id;
     return;
   }
+  if (copy?.role === 'host') enterGoes(itemId, copy, Date.now(), true); // replaced
   if (m.hostPage === PAGE) {
     // A record naming this page that it no longer runs (a reload): end it.
     writeNativeArcade(itemId, null);
@@ -510,11 +545,49 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   if (copy.ranNow > 0) {
     copy.sendToggle = !copy.sendToggle;
     if (guests || copy.sendToggle) sendFrames();
+    followGoes(itemId, copy, m, seats, now);
   }
   if (copy.syncAsked && !copy.snapshotBusy && now - copy.lastSnapshotAt >= SNAPSHOT_MIN_GAP_MS) {
     copy.syncAsked = false;
     void writeSnapshot(itemId, s, copy);
   }
+}
+
+/** Host: follow each seat's go off the game's scores. A go ends when its
+ *  player steps away (or another takes the seat) and is entered on the
+ *  cabinet's high scores then; the rest are entered every SCORES_EVERY_MS. */
+function followGoes(itemId: string, copy: Copy, m: NativeMatch, seats: ReadonlyArray<NativeSeat | null>, now: number): void {
+  const scores = copy.game.scores(copy.state);
+  const ended: Go[] = [];
+  for (let n = 0; n < NATIVE_MAX_SEATS; n++) {
+    const score = scores[n] ?? null;
+    const player = n === m.hostSeat ? m.host : seats[n]?.player ?? null;
+    let go = copy.goes[n] ?? null;
+    if (go && (score === null || (player !== null && player !== go.player))) {
+      ended.push(go);
+      go = copy.goes[n] = null;
+    }
+    if (score === null || player === null) continue;
+    go ??= copy.goes[n] = {
+      run: `${m.hostPage}:${m.startedAt}:${n}:${copy.next}`, player, name: readPlayerDisplayName(player), score, entered: 0,
+    };
+    go.score = score;
+  }
+  enterGoes(itemId, copy, now, now - copy.goesEnteredAt >= SCORES_EVERY_MS, ended);
+}
+
+/** Host: enter goes on the cabinet's high scores: those `ended`, and with
+ *  `all` every go still being played (a table that doesn't change costs no
+ *  write). */
+function enterGoes(itemId: string, copy: Copy, now: number, all: boolean, ended: readonly Go[] = []): void {
+  const lines: HighScore[] = [];
+  for (const go of [...ended, ...(all ? copy.goes : [])]) {
+    if (!go || go.score <= go.entered) continue;
+    lines.push({ name: go.name, score: go.score, at: now, run: go.run });
+    go.entered = go.score;
+  }
+  if (all) copy.goesEnteredAt = now;
+  if (lines.length > 0) recordHighScores(itemId, copy.game.id, lines);
 }
 
 async function writeSnapshot(itemId: string, s: CabinetSession, copy: Copy): Promise<void> {
@@ -694,14 +767,20 @@ function paint(itemId: string, s: CabinetSession, m: NativeMatch | null, now: nu
       s.handle.present();
       s.holds = true;
     });
-  const title = (line: string) => {
+  const title = (line: string, idle = false) => {
     const blink = Math.floor(now / TITLE_BLINK_MS) % 2 === 0;
+    const board = idle ? boardOf(itemId, s, game, now) : [];
+    if (board.length > 0 && now % ATTRACT_CYCLE_MS >= ATTRACT_TITLE_MS) {
+      const key = board.map((l) => `${l.score}:${l.name}`).join('|');
+      return picture(`scores:${game.id}:${line}:${blink}:${key}`,
+        (ctx, w, h) => game.paintScores(ctx, board, line, blink, w, h));
+    }
     picture(`title:${game.id}:${line}:${blink}`, (ctx, w, h) => game.paintTitle(ctx, line, blink, w, h));
   };
-  if (!copy || (copy.role === 'follow' && !m)) return title('STEP UP AND PRESS START');
+  if (!copy || (copy.role === 'follow' && !m)) return title('STEP UP AND PRESS START', true);
   if (copy.role === 'follow') {
     const silent = hostSilentFor(s, copy, now);
-    if (silent > HOST_GONE_MS) return title('STEP UP AND PRESS START');
+    if (silent > HOST_GONE_MS) return title('STEP UP AND PRESS START', true);
     if (silent > HOST_SILENT_MS) return title('THE HOST LEFT THE GAME');
   }
   if (!copy.started) return title('JOINING…');
@@ -710,9 +789,19 @@ function paint(itemId: string, s: CabinetSession, m: NativeMatch | null, now: nu
   if (s.shown === 'game' && s.paintCount % paintEvery(s, viewer) !== 0) return;
   s.shown = 'game';
   s.handle.setPictureLines?.(game.lines[0], game.lines[1]);
-  s.handle.painter.drawWith((ctx, w, h) => game.paint(ctx, copy.state, w, h));
+  const hud = { hi: boardOf(itemId, s, game, now)[0]?.score ?? 0 };
+  s.handle.painter.drawWith((ctx, w, h) => game.paint(ctx, copy.state, w, h, hud));
   s.handle.present();
   s.holds = true;
+}
+
+/** The cabinet's high scores for `game`, reread at most every BOARD_READ_MS. */
+function boardOf(itemId: string, s: CabinetSession, game: NativeGame, now: number): HighScore[] {
+  const b = s.board;
+  if (b && b.game === game.id && now - b.at < BOARD_READ_MS) return b.lines;
+  const lines = readHighScores(itemId, game.id);
+  s.board = { at: now, game: game.id, lines };
+  return lines;
 }
 
 // ── The page at the cabinet (arcadeNesCabinet.ts's UI, this link) ───────────
@@ -780,6 +869,7 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
       if (!s) return;
       const m = readNativeArcade(itemId);
       if (s.copy?.role === 'host') {
+        enterGoes(itemId, s.copy, Date.now(), true);
         s.copy = null;
         s.shown = null;
         if (m && m.hostPage === PAGE) writeNativeArcade(itemId, null);

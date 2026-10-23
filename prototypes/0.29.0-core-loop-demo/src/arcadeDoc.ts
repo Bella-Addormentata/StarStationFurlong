@@ -12,6 +12,9 @@
  *                                        double-wide cabinet: a lease each
  *   plays:<itemId>      → PlaysRecord    the attract card's tally, a player's
  *                                        write
+ *   scores:<itemId>:<game> → ScoresRecord a cabinet's own game's high scores
+ *                                        (arcadeNativeGames.ts): its host's
+ *                                        write, the owner's CLEAR
  * One key per writer: a seat renewal never collides with a change of game, and
  * a play counted the moment the owner changes the game never reverts the
  * change (nor the change the count) — whole-value LWW keeps one of two writes
@@ -86,6 +89,10 @@ export const ARCADE_MAX_PLAYER = 32;
 export const ARCADE_BLINK_MS = 800;
 /** The most players a cabinet seats: the double-wide cabinet's four. */
 export const ARCADE_SEATS_MAX = 4;
+/** Lines on a cabinet's high-score table. */
+export const ARCADE_SCORES_MAX = 10;
+/** The highest score a table shows (a peer's record is clamped to it). */
+export const ARCADE_SCORE_TOP = 99_999_999;
 
 // ── Cores and games ──────────────────────────────────────────────────────────
 
@@ -220,6 +227,23 @@ export type CabinetCuration = Omit<CabinetRecord, 'plays'>;
 /** The `plays:` key: P1's tally, apart from the owner's curation. */
 export interface PlaysRecord {
   plays: number;
+}
+
+/** One line of a cabinet's high-score table. */
+export interface HighScore {
+  /** Display copy of the player's name when the score was set. */
+  name: string;
+  score: number;
+  /** The recording page's clock when the score was set (shown as a date). */
+  at: number;
+  /** One player's go in one match: a later, higher score from the same go
+   *  replaces its line instead of adding another. */
+  run: string;
+}
+
+/** The `scores:` key: the best ARCADE_SCORES_MAX, best first. */
+export interface ScoresRecord {
+  scores: HighScore[];
 }
 
 export interface SeatRecord {
@@ -413,6 +437,11 @@ export function isSeatIndex(v: unknown): v is number {
 export function playsKey(itemId: string): string {
   return `plays:${itemId}`;
 }
+/** A cabinet's own game's high scores: one table per game, so putting
+ *  another game on and back keeps each one's. */
+export function scoresKey(itemId: string, gameId: string): string {
+  return `scores:${itemId}:${gameId}`;
+}
 
 // ── Identity and authority seams (registered by main.ts, never asserted by a caller) ──
 
@@ -505,6 +534,73 @@ export function readPlays(itemId: string): number {
   const raw = ensureMap().get(playsKey(itemId)) as Partial<PlaysRecord> | undefined;
   if (!raw || typeof raw !== 'object') return PLAYS_DEFAULT.plays;
   return counter(raw.plays);
+}
+
+/** A high-score line as a peer may have written it, or null. */
+function sanitizeScore(raw: unknown): HighScore | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const name = str(r.name, ARCADE_MAX_PLAYER).trim();
+  const run = str(r.run, 160);
+  if (!name || !run || !Number.isSafeInteger(r.score) || (r.score as number) <= 0) return null;
+  return { name, score: Math.min(ARCADE_SCORE_TOP, r.score as number), at: Math.max(0, num(r.at)), run };
+}
+
+/** Best first; a tie goes to whoever set it first. */
+const byScore = (a: HighScore, b: HighScore): number => b.score - a.score || a.at - b.at || (a.run < b.run ? -1 : 1);
+
+/** A cabinet's high-score table for one of its own games, best first. */
+export function readHighScores(itemId: string, gameId: string): HighScore[] {
+  const raw = ensureMap().get(scoresKey(itemId, gameId)) as Partial<ScoresRecord> | undefined;
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.scores)) return [];
+  const seen = new Set<string>();
+  const out: HighScore[] = [];
+  for (const line of raw.scores.slice(0, ARCADE_SCORES_MAX * 4)) {
+    const clean = sanitizeScore(line);
+    if (!clean || seen.has(clean.run)) continue;
+    seen.add(clean.run);
+    out.push(clean);
+  }
+  return out.sort(byScore).slice(0, ARCADE_SCORES_MAX);
+}
+
+/** `table` with `goes` entered: a go already on it keeps its better score,
+ *  a new one goes in where it ranks, and the table keeps its best
+ *  ARCADE_SCORES_MAX. Pure (exported for its tests). */
+export function mergeHighScores(table: readonly HighScore[], goes: readonly HighScore[]): HighScore[] {
+  const byRun = new Map(table.map((line) => [line.run, line]));
+  for (const go of goes) {
+    const clean = sanitizeScore(go);
+    if (!clean) continue;
+    const had = byRun.get(clean.run);
+    if (!had || clean.score > had.score) byRun.set(clean.run, clean);
+  }
+  return [...byRun.values()].sort(byScore).slice(0, ARCADE_SCORES_MAX);
+}
+
+/** Enter players' scores on the cabinet's table (the page hosting the game
+ *  does, as each player's go ends and now and then while it lasts). Writes
+ *  only when the table changes: a score that doesn't make it costs nothing.
+ *  Whether it wrote. */
+export function recordHighScores(itemId: string, gameId: string, goes: readonly HighScore[]): boolean {
+  const table = readHighScores(itemId, gameId);
+  const next = mergeHighScores(table, goes);
+  const same = next.length === table.length
+    && next.every((line, i) => line.run === table[i]!.run && line.score === table[i]!.score);
+  if (same) return false;
+  write(scoresKey(itemId, gameId), { scores: next } satisfies ScoresRecord);
+  return true;
+}
+
+/** Wipe a game's table on this cabinet (the owner). */
+export function clearHighScores(itemId: string, gameId: string): ArcadeAction {
+  const gate = ownerGate();
+  if (!gate.ok) return gate;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.delete(scoresKey(itemId, gameId));
+  });
+  return { ok: true };
 }
 
 /** What the panel, the stage and the screen show: the curation with the

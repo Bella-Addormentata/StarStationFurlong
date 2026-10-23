@@ -17,8 +17,9 @@ import {
   setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
   standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_COUNTER_MAX, ARCADE_DEFAULT_GAME, ARCADE_SEAT_LAPSE_MS,
   isSeatIndex, mySeat, seatHolders, ARCADE_SEATS_MAX, ARCADE_CORES, ejsCore,
+  clearHighScores, mergeHighScores, readHighScores, recordHighScores, scoresKey, ARCADE_SCORE_TOP, ARCADE_SCORES_MAX,
 } from './arcadeDoc';
-import type { ArcadeGame } from './arcadeDoc';
+import type { ArcadeGame, HighScore } from './arcadeDoc';
 import { ARCADE_GAMES } from './arcadeLibrary';
 
 const CAB = 'arcade-cabinet-1';
@@ -510,6 +511,66 @@ describe('the tally', () => {
       bindArcadeDoc(d);
       expect(readCabinet(CAB)).toMatchObject({ game: PACMAN, plays: 1 });
     }
+  });
+});
+
+describe('high scores', () => {
+  const LR = 'lantern-road';
+  const line = (run: string, score: number, name = run.toUpperCase(), at = 0): HighScore => ({ name, score, at, run });
+
+  it('keeps the best ten, best first, a tie to whoever set it first', () => {
+    const goes = Array.from({ length: 12 }, (_, i) => line(`go${i}`, (i + 1) * 100, `P${i}`, i));
+    goes.push(line('late', 1200, 'LATE', 99));
+    const table = mergeHighScores([], goes);
+    expect(table).toHaveLength(ARCADE_SCORES_MAX);
+    expect(table.map((l) => l.run).slice(0, 3)).toEqual(['go11', 'late', 'go10']);
+    expect(table.at(-1)!.score).toBe(400);
+  });
+
+  it('a later, higher score from the same go replaces its line; a lower one or a zero changes nothing', () => {
+    let table = mergeHighScores([], [line('a', 500), line('b', 300)]);
+    table = mergeHighScores(table, [line('b', 800), line('a', 200), line('c', 0)]);
+    expect(table.map((l) => [l.run, l.score])).toEqual([['b', 800], ['a', 500]]);
+  });
+
+  it('writes only when the table changes, one table per game', () => {
+    const writes: string[] = [];
+    doc.getMap('arcade').observe((e) => { for (const k of e.keysChanged) writes.push(k); });
+    expect(recordHighScores(CAB, LR, [line('a', 500, 'Alice')])).toBe(true);
+    expect(recordHighScores(CAB, LR, [line('a', 500, 'Alice')])).toBe(false);
+    expect(recordHighScores(CAB, LR, [line('a', 0, 'Alice')])).toBe(false);
+    expect(writes).toEqual([scoresKey(CAB, LR)]);
+    expect(readHighScores(CAB, LR)).toEqual([line('a', 500, 'Alice')]);
+    expect(readHighScores(CAB, 'another-game')).toEqual([]);
+    expect(readHighScores('arcade-cabinet-2', LR)).toEqual([]);
+  });
+
+  it('reads a peer\'s garbage as no line, clamps a silly score, and keeps one line a go', () => {
+    doc.getMap('arcade').set(scoresKey(CAB, LR), {
+      scores: [
+        null, 'x', { name: '', score: 5, at: 0, run: 'r0' }, { name: 'NaN', score: Number.NaN, at: 0, run: 'r1' },
+        { name: 'neg', score: -4, at: 0, run: 'r2' }, { name: 'frac', score: 1.5, at: 0, run: 'r3' },
+        { name: 'big', score: Number.MAX_SAFE_INTEGER, at: 0, run: 'r4' },
+        { name: 'x'.repeat(200), score: 10, at: 'soon', run: 'r5' },
+        { name: 'dup', score: 9, at: 0, run: 'r5' },
+      ],
+    });
+    const table = readHighScores(CAB, LR);
+    expect(table.map((l) => l.run)).toEqual(['r4', 'r5']);
+    expect(table[0]!.score).toBe(ARCADE_SCORE_TOP);
+    expect(table[1]!.name).toHaveLength(32);
+    expect(table[1]!.at).toBe(0);
+    doc.getMap('arcade').set(scoresKey(CAB, LR), { scores: 'many' });
+    expect(readHighScores(CAB, LR)).toEqual([]);
+  });
+
+  it('only the owner clears a table', () => {
+    recordHighScores(CAB, LR, [line('a', 500)]);
+    expect(clearHighScores(CAB, LR)).toEqual({ ok: false, error: 'Only the room owner changes the cabinet.' });
+    expect(readHighScores(CAB, LR)).toHaveLength(1);
+    owner = true;
+    expect(clearHighScores(CAB, LR)).toEqual({ ok: true });
+    expect(readHighScores(CAB, LR)).toEqual([]);
   });
 });
 

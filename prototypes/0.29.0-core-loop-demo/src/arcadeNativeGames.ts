@@ -15,7 +15,19 @@ import {
   LR_REV, LR_SEATS, LR_VIEW_H, LR_VIEW_W, checkLanternRoad, createLanternRoad, restoreLanternRoad, stepLanternRoad,
   type LrState,
 } from './games/lanternRoad';
-import { paintLanternRoad, paintLanternRoadTitle } from './lanternRoadPaint';
+import { paintLanternRoad, paintLanternRoadScores, paintLanternRoadTitle } from './lanternRoadPaint';
+
+/** What the session lays over a game's own picture. */
+export interface NativeHud {
+  /** The best score on the cabinet's table for this game (0: none yet). */
+  hi: number;
+}
+
+/** A line of the cabinet's high-score table, as the attract screen shows it. */
+export interface NativeBoardLine {
+  name: string;
+  score: number;
+}
 
 export interface NativeGame<S = unknown> {
   /** Stable id: what a cabinet's record names (arcadeDoc `bundled`). */
@@ -39,10 +51,17 @@ export interface NativeGame<S = unknown> {
   check(state: S): number;
   /** A save state as a peer sent it (JSON), or null if it isn't one. */
   restore(raw: unknown): S | null;
+  /** Each seat's score now, or null for a seat nobody plays: the host
+   *  enters them on the cabinet's high scores. */
+  scores(state: S): ReadonlyArray<number | null>;
   /** Draw the state onto the screen canvas, `w`×`h`. */
-  paint(ctx: CanvasRenderingContext2D, state: S, w: number, h: number): void;
+  paint(ctx: CanvasRenderingContext2D, state: S, w: number, h: number, hud?: NativeHud): void;
   /** The idle cabinet: the title, and `line` while `blink` is on. */
   paintTitle(ctx: CanvasRenderingContext2D, line: string, blink: boolean, w: number, h: number): void;
+  /** The idle cabinet's other page: the high-score table, best first. */
+  paintScores(
+    ctx: CanvasRenderingContext2D, board: readonly NativeBoardLine[], line: string, blink: boolean, w: number, h: number,
+  ): void;
 }
 
 const LANTERN_ROAD: NativeGame<LrState> = {
@@ -57,8 +76,10 @@ const LANTERN_ROAD: NativeGame<LrState> = {
   step: stepLanternRoad,
   check: checkLanternRoad,
   restore: restoreLanternRoad,
+  scores: (s) => s.players.map((p) => (p.on ? p.score : null)),
   paint: paintLanternRoad,
   paintTitle: paintLanternRoadTitle,
+  paintScores: paintLanternRoadScores,
 };
 
 export const NATIVE_GAMES: readonly NativeGame[] = [LANTERN_ROAD as unknown as NativeGame];
