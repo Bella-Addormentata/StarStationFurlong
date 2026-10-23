@@ -585,8 +585,10 @@ function sanitizeScore(raw: unknown): HighScore | null {
 /** Best first; a tie goes to whoever set it first. */
 const byScore = (a: HighScore, b: HighScore): number => b.score - a.score || a.at - b.at || (a.run < b.run ? -1 : 1);
 
-/** The most line keys a table read looks at: entering a go trims the rest. */
-const SCORE_LINES_READ = ARCADE_SCORES_MAX * 4;
+/** The most line keys a table read looks at: well past what pages that
+ *  each kept ten lines apart for a while could bring back together (a peer
+ *  writing more is ignored past it). Entering a go trims what it read. */
+const SCORE_LINES_READ = 500;
 
 /** How many times the owner has cleared a table. */
 function tableClears(itemId: string, gameId: string): number {
@@ -607,19 +609,20 @@ function bestLines(lines: readonly HighScore[]): HighScore[] {
   return out.slice(0, ARCADE_SCORES_MAX);
 }
 
-function tableLines(itemId: string, gameId: string, clears: number): HighScore[] {
+/** A table's line keys (all of them, up to SCORE_LINES_READ), each with its
+ *  line or null for garbage. */
+function tableLines(itemId: string, gameId: string, clears: number): Array<{ key: string; line: HighScore | null }> {
   const map = ensureMap();
-  const out: HighScore[] = [];
-  for (const key of arcadeRawKeys(`${scoresKey(itemId, gameId)}:${clears}:`, SCORE_LINES_READ)) {
-    const clean = sanitizeScore(map.get(key));
-    if (clean) out.push(clean);
-  }
-  return out;
+  return arcadeRawKeys(`${scoresKey(itemId, gameId)}:${clears}:`, SCORE_LINES_READ)
+    .map((key) => ({ key, line: sanitizeScore(map.get(key)) }));
 }
+
+const linesOf = (read: ReadonlyArray<{ line: HighScore | null }>): HighScore[] =>
+  read.flatMap(({ line }) => (line ? [line] : []));
 
 /** A cabinet's high-score table for one of its own games, best first. */
 export function readHighScores(itemId: string, gameId: string): HighScore[] {
-  return bestLines(tableLines(itemId, gameId, tableClears(itemId, gameId)));
+  return bestLines(linesOf(tableLines(itemId, gameId, tableClears(itemId, gameId))));
 }
 
 /** `table` with `goes` entered: a go already on it keeps its better score,
@@ -643,7 +646,8 @@ export function mergeHighScores(table: readonly HighScore[], goes: readonly High
  *  lines pushed off it and any from before a CLEAR. Whether it wrote. */
 export function recordHighScores(itemId: string, gameId: string, goes: readonly HighScore[]): boolean {
   const clears = tableClears(itemId, gameId);
-  const table = bestLines(tableLines(itemId, gameId, clears));
+  const read = tableLines(itemId, gameId, clears);
+  const table = bestLines(linesOf(read));
   const next = mergeHighScores(table, goes);
   const had = new Map(table.map((line) => [line.run, line.score]));
   const entries: Array<readonly [string, unknown]> = [];
@@ -651,9 +655,13 @@ export function recordHighScores(itemId: string, gameId: string, goes: readonly 
     if (had.get(line.run) !== line.score) entries.push([scoreLineKey(itemId, gameId, clears, line.run), line]);
   }
   if (entries.length === 0) return false;
+  // Let go of what was read and is off the table now, and of every line from
+  // before a CLEAR; a line past the read limit stays for a later go to rank.
   const kept = new Set(next.map((line) => scoreLineKey(itemId, gameId, clears, line.run)));
+  for (const { key } of read) if (!kept.has(key)) entries.push([key, undefined]);
+  const current = `${scoresKey(itemId, gameId)}:${clears}:`;
   for (const key of arcadeRawKeys(`${scoresKey(itemId, gameId)}:`)) {
-    if (!kept.has(key)) entries.push([key, undefined]);
+    if (!key.startsWith(current)) entries.push([key, undefined]);
   }
   arcadeRawSetMany(entries);
   return true;

@@ -559,6 +559,18 @@ describe('high scores', () => {
     expect(readHighScores(CAB, LR)[0]!.run).toBe('best');
   });
 
+  it('ranks every page\'s lines once they meet, however many came back together', () => {
+    // Five hosts kept ten lines each apart; synced, the best is the last key.
+    const arcade = doc.getMap('arcade');
+    for (let i = 0; i < 49; i++) arcade.set(scoreLineKey(CAB, LR, 0, `go${i}`), line(`go${i}`, (i + 1) * 10));
+    arcade.set(scoreLineKey(CAB, LR, 0, 'top'), line('top', 99_000));
+    expect(readHighScores(CAB, LR)[0]!.run).toBe('top');
+    // The next go entered trims the rest, and keeps the best.
+    expect(recordHighScores(CAB, LR, [line('new', 1000)])).toBe(true);
+    expect(readHighScores(CAB, LR).map((l) => l.run).slice(0, 2)).toEqual(['top', 'new']);
+    expect([...arcade.keys()].filter((k) => k.startsWith(`${scoresKey(CAB, LR)}:`))).toHaveLength(ARCADE_SCORES_MAX);
+  });
+
   it('reads a peer\'s garbage as no line, clamps a silly score, and keeps one line a go', () => {
     const lines: unknown[] = [
       null, 'x', { name: '', score: 5, at: 0, run: 'r0' }, { name: 'NaN', score: Number.NaN, at: 0, run: 'r1' },
