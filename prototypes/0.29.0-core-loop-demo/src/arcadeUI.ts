@@ -33,7 +33,7 @@ import type { DeviceUI } from './devices';
 import {
   builtInEntry, builtInGame, cabinetKey, clearHighScores, coreForName, coreLabel, gameLane, iAmP1, insertCoin,
   mayEjectP1, maySit, mySeat, nativeEntry, parseRomUrl, putOnCabinet, readCabinet, readHighScores, readSeat,
-  scoresKey, seatHolders, seatKey, seatLapsed, setEmulatorData, standUp, subscribeArcadeKey, takeOffCabinet,
+  seatHolders, seatKey, seatLapsed, setEmulatorData, standUp, subscribeArcadeKey, subscribeHighScores, takeOffCabinet,
   ARCADE_CORES, ARCADE_MAX_NAME, isArcadeCore,
 } from './arcadeDoc';
 import type { ArcadeCore, ArcadeGame } from './arcadeDoc';
@@ -690,7 +690,7 @@ export function createArcadeCabinetUI(deps: ArcadeDeviceDeps): DeviceUI {
         subscribeArcadeKey(cabinetKey(deps.itemId), render),
         ...Array.from({ length: deps.seats === 4 ? 4 : 1 }, (_, n) => subscribeArcadeKey(seatKey(deps.itemId, n), render)),
         subscribeGames(render), // a built-in game's match: who is at which stand
-        ...NATIVE_GAMES.map((own) => subscribeArcadeKey(scoresKey(deps.itemId, own.id), render)),
+        ...NATIVE_GAMES.map((own) => subscribeHighScores(deps.itemId, own.id, render)),
       ];
       unsubscribe = () => { for (const s of subs) s(); };
       // The seat lapses without a write; the status line moves with it.

@@ -12,9 +12,12 @@
  *                                        double-wide cabinet: a lease each
  *   plays:<itemId>      → PlaysRecord    the attract card's tally, a player's
  *                                        write
- *   scores:<itemId>:<game> → ScoresRecord a cabinet's own game's high scores
- *                                        (arcadeNativeGames.ts): its host's
- *                                        write, the owner's CLEAR
+ *   scores:<itemId>:<game> → ScoresRecord a cabinet's own game's high-score
+ *                                        table (arcadeNativeGames.ts): how
+ *                                        often the owner has CLEARed it
+ *   scores:<itemId>:<game>:<clears>:<run> → HighScore  one line of it, one
+ *                                        player's go: the write of the page
+ *                                        that hosted the go
  * One key per writer: a seat renewal never collides with a change of game, and
  * a play counted the moment the owner changes the game never reverts the
  * change (nor the change the count) — whole-value LWW keeps one of two writes
@@ -241,9 +244,11 @@ export interface HighScore {
   run: string;
 }
 
-/** The `scores:` key: the best ARCADE_SCORES_MAX, best first. */
+/** The `scores:` key of a table: how many times the owner has cleared it.
+ *  A line goes under the count its page knew of when it wrote it, so lines
+ *  a page wrote before it heard of a CLEAR are no longer on the table. */
 export interface ScoresRecord {
-  scores: HighScore[];
+  clears: number;
 }
 
 export interface SeatRecord {
@@ -272,6 +277,7 @@ let arcadeMap: Y.Map<unknown> | null = null;
 let bindingEpoch = 0;
 const listeners = new Set<() => void>();
 const keyListeners = new Map<string, Set<() => void>>();
+const prefixListeners = new Map<string, Set<() => void>>();
 
 let clock: () => number = () => Date.now();
 export function setArcadeClock(fn: () => number): void {
@@ -316,6 +322,16 @@ function notify(changedKeys?: Set<string>): void {
       }
     }
   }
+  for (const [prefix, keyed] of prefixListeners) {
+    if (changedKeys && ![...changedKeys].some((k) => k.startsWith(prefix))) continue;
+    for (const listener of [...keyed]) {
+      try {
+        listener();
+      } catch (err) {
+        console.error(`[arcade] listener for '${prefix}…' threw during doc notify:`, err);
+      }
+    }
+  }
 }
 
 function docAlive(): boolean {
@@ -357,6 +373,20 @@ function ensureMap(): Y.Map<unknown> {
 export function subscribeArcade(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+/** Call `listener` when any key starting with `prefix` changes. */
+export function subscribeArcadePrefix(prefix: string, listener: () => void): () => void {
+  let keyed = prefixListeners.get(prefix);
+  if (!keyed) {
+    keyed = new Set();
+    prefixListeners.set(prefix, keyed);
+  }
+  keyed.add(listener);
+  return () => {
+    keyed!.delete(listener);
+    if (keyed!.size === 0) prefixListeners.delete(prefix);
+  };
 }
 
 export function subscribeArcadeKey(key: string, listener: () => void): () => void {
@@ -441,6 +471,12 @@ export function playsKey(itemId: string): string {
  *  another game on and back keeps each one's. */
 export function scoresKey(itemId: string, gameId: string): string {
   return `scores:${itemId}:${gameId}`;
+}
+/** One line of a table: a key per go, so two pages entering goes at once
+ *  (a host that lost the room a while, and the one that took over) both
+ *  keep theirs. */
+export function scoreLineKey(itemId: string, gameId: string, clears: number, run: string): string {
+  return `${scoresKey(itemId, gameId)}:${clears}:${run}`;
 }
 
 // ── Identity and authority seams (registered by main.ts, never asserted by a caller) ──
@@ -549,19 +585,41 @@ function sanitizeScore(raw: unknown): HighScore | null {
 /** Best first; a tie goes to whoever set it first. */
 const byScore = (a: HighScore, b: HighScore): number => b.score - a.score || a.at - b.at || (a.run < b.run ? -1 : 1);
 
-/** A cabinet's high-score table for one of its own games, best first. */
-export function readHighScores(itemId: string, gameId: string): HighScore[] {
+/** The most line keys a table read looks at: entering a go trims the rest. */
+const SCORE_LINES_READ = ARCADE_SCORES_MAX * 4;
+
+/** How many times the owner has cleared a table. */
+function tableClears(itemId: string, gameId: string): number {
   const raw = ensureMap().get(scoresKey(itemId, gameId)) as Partial<ScoresRecord> | undefined;
-  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.scores)) return [];
+  const clears = raw && typeof raw === 'object' ? raw.clears : undefined;
+  return Number.isSafeInteger(clears) && (clears as number) >= 0 ? (clears as number) : 0;
+}
+
+/** The best ARCADE_SCORES_MAX of `lines`, one a go, best first. */
+function bestLines(lines: readonly HighScore[]): HighScore[] {
   const seen = new Set<string>();
   const out: HighScore[] = [];
-  for (const line of raw.scores.slice(0, ARCADE_SCORES_MAX * 4)) {
-    const clean = sanitizeScore(line);
-    if (!clean || seen.has(clean.run)) continue;
-    seen.add(clean.run);
-    out.push(clean);
+  for (const line of [...lines].sort(byScore)) {
+    if (seen.has(line.run)) continue;
+    seen.add(line.run);
+    out.push(line);
   }
-  return out.sort(byScore).slice(0, ARCADE_SCORES_MAX);
+  return out.slice(0, ARCADE_SCORES_MAX);
+}
+
+function tableLines(itemId: string, gameId: string, clears: number): HighScore[] {
+  const map = ensureMap();
+  const out: HighScore[] = [];
+  for (const key of arcadeRawKeys(`${scoresKey(itemId, gameId)}:${clears}:`, SCORE_LINES_READ)) {
+    const clean = sanitizeScore(map.get(key));
+    if (clean) out.push(clean);
+  }
+  return out;
+}
+
+/** A cabinet's high-score table for one of its own games, best first. */
+export function readHighScores(itemId: string, gameId: string): HighScore[] {
+  return bestLines(tableLines(itemId, gameId, tableClears(itemId, gameId)));
 }
 
 /** `table` with `goes` entered: a go already on it keeps its better score,
@@ -580,27 +638,43 @@ export function mergeHighScores(table: readonly HighScore[], goes: readonly High
 
 /** Enter players' scores on the cabinet's table (the page hosting the game
  *  does, as each player's go ends and now and then while it lasts). Writes
- *  only when the table changes: a score that doesn't make it costs nothing.
- *  Whether it wrote. */
+ *  only the goes that make the table or better their line on it (a score
+ *  that doesn't make it costs nothing), and in the same update lets go of
+ *  lines pushed off it and any from before a CLEAR. Whether it wrote. */
 export function recordHighScores(itemId: string, gameId: string, goes: readonly HighScore[]): boolean {
-  const table = readHighScores(itemId, gameId);
+  const clears = tableClears(itemId, gameId);
+  const table = bestLines(tableLines(itemId, gameId, clears));
   const next = mergeHighScores(table, goes);
-  const same = next.length === table.length
-    && next.every((line, i) => line.run === table[i]!.run && line.score === table[i]!.score);
-  if (same) return false;
-  write(scoresKey(itemId, gameId), { scores: next } satisfies ScoresRecord);
+  const had = new Map(table.map((line) => [line.run, line.score]));
+  const entries: Array<readonly [string, unknown]> = [];
+  for (const line of next) {
+    if (had.get(line.run) !== line.score) entries.push([scoreLineKey(itemId, gameId, clears, line.run), line]);
+  }
+  if (entries.length === 0) return false;
+  const kept = new Set(next.map((line) => scoreLineKey(itemId, gameId, clears, line.run)));
+  for (const key of arcadeRawKeys(`${scoresKey(itemId, gameId)}:`)) {
+    if (!kept.has(key)) entries.push([key, undefined]);
+  }
+  arcadeRawSetMany(entries);
   return true;
 }
 
-/** Wipe a game's table on this cabinet (the owner). */
+/** Wipe a game's table on this cabinet (the owner): its count goes up, so a
+ *  line a page writes before it hears of the CLEAR stays off it too. */
 export function clearHighScores(itemId: string, gameId: string): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
-  const map = ensureMap();
-  boundDoc!.transact(() => {
-    map.delete(scoresKey(itemId, gameId));
-  });
+  const entries: Array<readonly [string, unknown]> = [
+    [scoresKey(itemId, gameId), { clears: tableClears(itemId, gameId) + 1 } satisfies ScoresRecord],
+  ];
+  for (const key of arcadeRawKeys(`${scoresKey(itemId, gameId)}:`)) entries.push([key, undefined]);
+  arcadeRawSetMany(entries);
   return { ok: true };
+}
+
+/** Call `listener` when a game's table on this cabinet changes. */
+export function subscribeHighScores(itemId: string, gameId: string, listener: () => void): () => void {
+  return subscribeArcadePrefix(scoresKey(itemId, gameId), listener);
 }
 
 /** What the panel, the stage and the screen show: the curation with the

@@ -548,6 +548,8 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     copy.hi.record(copy.next, hi);
     copy.next = frameAdd(copy.next, 1);
     if ((copy.next & (CHECK_EVERY - 1)) === 0) copy.latestCheck = copy.game.check(copy.state);
+    // Every frame: a player can score and leave the road within one update.
+    followGoes(itemId, copy, m, seats, now);
     copy.acc -= FRAME_S;
     copy.ranNow++;
   }
@@ -555,7 +557,6 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   if (copy.ranNow > 0) {
     copy.sendToggle = !copy.sendToggle;
     if (guests || copy.sendToggle) sendFrames();
-    followGoes(itemId, copy, m, seats, now);
   }
   if (copy.syncAsked && !copy.snapshotBusy && now - copy.lastSnapshotAt >= SNAPSHOT_MIN_GAP_MS) {
     copy.syncAsked = false;
@@ -563,10 +564,10 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
   }
 }
 
-/** Host: follow each seat's go off the game's scores. A go ends when its
- *  player leaves the road (a moment after stepping away) and is entered on
- *  the cabinet's high scores then; the rest are entered every
- *  SCORES_EVERY_MS. */
+/** Host, after each frame: follow each seat's go off the game's scores. A
+ *  go ends when its player leaves the road (a moment after stepping away)
+ *  and is entered on the cabinet's high scores then; the rest are entered
+ *  every SCORES_EVERY_MS. */
 function followGoes(itemId: string, copy: Copy, m: NativeMatch, seats: ReadonlyArray<NativeSeat | null>, now: number): void {
   const scores = copy.game.scores(copy.state);
   const ended: Go[] = [];

@@ -392,6 +392,8 @@ export function enemyBox(kind: LrEnemyKind): { w: number; h: number } {
 
 export const LR_PLAYER_W = PLAYER_W;
 export const LR_PLAYER_H = PLAYER_H;
+/** Frames a player stays on the road after their seat's PRESENT bit goes. */
+export const LR_AWAY_FRAMES = AWAY_FRAMES;
 
 interface Body {
   x: number;

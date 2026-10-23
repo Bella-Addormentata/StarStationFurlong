@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ARCADE_WIRE_NATIVE, packArcadeTick, pipe, unpackArcadeTick } from './arcadeNet';
 import type { ArcadeLink } from './arcadeNesSession';
-import { LR_REV, type LrState } from './games/lanternRoad';
+import { LR_AWAY_FRAMES, LR_PLAYER_H, LR_PLAYER_W, LR_REV, type LrState } from './games/lanternRoad';
 import { newNativeMatch, newNativeSeat } from './games/nativeArcade';
 
 type SessionModule = typeof import('./arcadeNativeSession');
@@ -540,6 +540,34 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     await run(700);
     expect(stateOf(a)!.players[2]!.on).toBe(false);
     expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 3700]]);
+  });
+
+  it('counts a point scored on the frame before the player leaves, in the same update', async () => {
+    const [a, b] = await room('a', 'b');
+    a.doc.getMap('players').set(b.player, { name: 'Bob' });
+    link(a, 0).host(LANTERN_ROAD);
+    await run(100);
+    const guest = link(b, 2);
+    guest.join();
+    await run(300);
+    stateOf(a)!.players[2]!.score = 700;
+    await run(50);
+    guest.stop();
+    await run(50);
+    // His player's last frame on the road picks up a coin, and the host
+    // runs that frame and the next (he's gone) in one update.
+    const s = stateOf(a)!;
+    const p = s.players[2]!;
+    p.away = LR_AWAY_FRAMES - 2;
+    s.items.push({ kind: 'coin', x: p.x + LR_PLAYER_W / 2, y: p.y + LR_PLAYER_H / 2, taken: false });
+    const before = s.frame;
+    vi.setSystemTime(Date.now() + 50);
+    a.mod.nativeArcadeFrame(3 / 60, { x: 0, z: 1 });
+    expect(s.frame - before).toBeGreaterThanOrEqual(2);
+    expect(p.on).toBe(false);
+    expect(p.score).toBe(750);
+    await run(50);
+    expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => [l.name, l.score])).toEqual([['Bob', 750]]);
   });
 
   it('starts someone who takes a seat the moment it is let go on a go of their own', async () => {
