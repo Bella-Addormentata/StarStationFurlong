@@ -11138,7 +11138,7 @@ function onCanvasClick(event: MouseEvent): void {
       const deviceId = deviceHits[0].object.userData.deviceId as string;
       if (deviceId) {
         if (!multiScaleZoom || multiScaleZoom.getLevel() === 2) {
-          world.requestDeviceFocus(deviceId);
+          world.requestDeviceFocus(deviceId, deviceHits[0]);
           return; // Halt floor-click routing
         }
         // Level 1: the focus-camera hand-off stays deferred (#33 D0.2) —

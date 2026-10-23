@@ -59,6 +59,8 @@ import {
 } from "./coinPusherReplay";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
 import { createArcadeScreenPainter } from "./arcadeScreen";
+// 🕹🕹 The double-wide's stations wear Lantern Road's ninjas' colours.
+import { SEAT_COLOURS } from "./lanternRoadPaint";
 import { CASHIER_SCREEN_H, CASHIER_SCREEN_W, paintCashierAttract, paintCashierMenu } from "./cashierScreen";
 import type { CashierScreenHandle } from "./cashierScreen";
 // 📺 The cabinets' curved CRT tube and its screen shader (#194).
@@ -11728,8 +11730,9 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
   const BODY = 0x141a2e;
   const PANEL = 0x1a1f2a;
   const SIDE = 0x00e5ff;
-  /** P1 to P4, left to right: the colours four-player cabinets used. */
-  const PLAYER = [0xff3b3b, 0x3b8bff, 0x2fe6a0, 0xffd23b];
+  /** P1 to P4, left to right: Lantern Road's ninjas' own colours, so the
+   *  station a player stands at is their ninja's colour. */
+  const PLAYER = SEAT_COLOURS.map((c) => parseInt(c.main.slice(1), 16));
   const w = ARCADE_WIDE_W;
   const d = ARCADE_WIDE_D;
   const bayDepth = arcadeBayDepth(ARCADE_TUBE_H, ARCADE_TUBE_TILT);
@@ -11743,19 +11746,24 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
     place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 - 0.006), 1.0, 0.05);
   }
   // The control deck: four stations, a stick and two buttons each, and a
-  // coin slot each below, lit in the player's colour.
+  // coin slot each below, lit in the player's colour: the balls and buttons
+  // glow, so they read as that colour in a dim room too.
   const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
   deck.rotation.x = -0.22;
   for (let p = 0; p < ARCADE_WIDE_SEATS; p++) {
     const cx = (p - (ARCADE_WIDE_SEATS - 1) / 2) * (w / ARCADE_WIDE_SEATS);
     const color = PLAYER[p]!;
-    place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), cx - 0.08, 1.04, 0.3);
-    place(new THREE.SphereGeometry(0.028, 10, 8), m(color, 0.4, 0.1), cx - 0.08, 1.09, 0.3);
-    for (const bx of [0.04, 0.11]) {
-      place(new THREE.CylinderGeometry(0.02, 0.02, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), cx + bx, 1.0, 0.31);
-    }
-    place(new THREE.BoxGeometry(0.08, 0.1, 0.02), m(0x3d4a5e, 0.5, 0.5), cx, 0.5, d / 2 - 0.005);
-    place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 + 0.003);
+    // Each tagged with its station: a click on it seats the player there
+    // (world.ts, arcadeStations.ts).
+    const station = [
+      place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), cx - 0.08, 1.04, 0.3),
+      place(new THREE.SphereGeometry(0.028, 10, 8), m(color, 0.35, 0.1, color, 0.45), cx - 0.08, 1.09, 0.3),
+      ...[0.04, 0.11].map((bx) =>
+        place(new THREE.CylinderGeometry(0.02, 0.02, 0.014, 12), m(color, 0.35, 0.2, color, 0.45), cx + bx, 1.0, 0.31)),
+      place(new THREE.BoxGeometry(0.08, 0.1, 0.02), m(0x3d4a5e, 0.5, 0.5), cx, 0.5, d / 2 - 0.005),
+      place(new THREE.BoxGeometry(0.04, 0.012, 0.016), m(color, 0.4, 0.2, color, 0.6), cx, 0.52, d / 2 + 0.003),
+    ];
+    for (const mesh of station) mesh.userData.arcadeStation = p;
   }
   // ⚙️ in the middle, below the coin doors, just above the plinth: anyone's
   // way to the settings.

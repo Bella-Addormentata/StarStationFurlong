@@ -27,6 +27,7 @@ function fakeCanvas() {
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
 const { buildItemGroup, ARCADE_CABINET_KINDS, ARCADE_GEAR_Y, FURNITURE_DEFS } = await import('./furniture');
+const { SEAT_COLOURS } = await import('./lanternRoadPaint');
 
 const ID = 'arcade-cabinet-1';
 
@@ -241,6 +242,35 @@ describe('the double-wide cabinet as built', () => {
     const box = new THREE.Box3().setFromObject(marquee);
     expect(box.min.y).toBeGreaterThan(new THREE.Box3().setFromObject(screen!).max.y); // above the screens
     expect(box.max.x - box.min.x).toBeGreaterThan(1.4); // across both of them
+  });
+
+  it("has four stations, each in front of its own stand, in that player's ninja colour", () => {
+    const parts = new Map<number, THREE.Mesh[]>();
+    buildWide().traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh) || obj.userData.arcadeStation === undefined) return;
+      const n = obj.userData.arcadeStation as number;
+      parts.set(n, [...(parts.get(n) ?? []), obj]);
+    });
+    expect([...parts.keys()].sort()).toEqual([0, 1, 2, 3]);
+    const stands = FURNITURE_DEFS['arcade-cabinet-wide'].stands!;
+    for (const [n, meshes] of parts) {
+      // A stick (shaft and ball), two buttons, a coin door and its light.
+      expect(meshes.length).toBe(6);
+      for (const mesh of meshes) {
+        const x = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3()).x;
+        const nearest = stands.reduce((best, s, i) =>
+          Math.abs(s.stand.x - x) < Math.abs(stands[best]!.stand.x - x) ? i : best, 0);
+        expect(nearest).toBe(n);
+      }
+      // The ball, the buttons and the coin light glow in the ninja's colour.
+      const lit = meshes.map((mesh) => mesh.material as THREE.MeshStandardMaterial)
+        .filter((mat) => mat.emissiveIntensity > 0 && mat.emissive.getHex() !== 0);
+      expect(lit.length).toBe(4);
+      for (const mat of lit) {
+        expect('#' + mat.color.getHexString()).toBe(SEAT_COLOURS[n]!.main);
+        expect('#' + mat.emissive.getHexString()).toBe(SEAT_COLOURS[n]!.main);
+      }
+    }
   });
 
   it('counts every size as an arcade cabinet', () => {
