@@ -302,9 +302,17 @@ function newCopy(s: CabinetSession, m: NativeMatch, game: NativeGame, role: 'hos
   return copy;
 }
 
+/** What a chip that threw is replaced by: silence until the page lets go of
+ *  the speaker (a fresh chip the next time it listens), never the game. */
+const SILENT_SOUND: NativeSound = {
+  frame(): void {
+    /* the chip threw: nothing until the next listener */
+  },
+};
+
 /** Run one frame of the game, with its sound when the page at the cabinet
  *  has a speaker: the frame's cues go to the chip, the chip's samples to the
- *  speaker. A chip that throws is dropped, never the game. */
+ *  speaker. A chip that throws (made or run) is dropped, never the game. */
 function runFrame(s: CabinetSession, copy: Copy, pads: readonly number[]): void {
   const link = s.link;
   const sink = link?.audio ?? null;
@@ -313,17 +321,18 @@ function runFrame(s: CabinetSession, copy: Copy, pads: readonly number[]): void 
     copy.game.step(copy.state, pads);
     return;
   }
-  if (!copy.sound || copy.soundRate !== link.sampleRate) {
-    copy.sound = copy.game.sound(link.sampleRate);
-    copy.soundRate = link.sampleRate;
-  }
   copy.cues.length = 0;
   copy.game.step(copy.state, pads, copy.cues);
   try {
+    if (!copy.sound || copy.soundRate !== link.sampleRate) {
+      copy.sound = copy.game.sound(link.sampleRate);
+      copy.soundRate = link.sampleRate;
+    }
     copy.sound.frame(copy.state, copy.cues, sink);
   } catch (err) {
     console.error('[arcade] the cabinet game\'s sound stopped:', err);
-    copy.sound = null;
+    copy.sound = SILENT_SOUND;
+    copy.soundRate = link.sampleRate;
   }
 }
 

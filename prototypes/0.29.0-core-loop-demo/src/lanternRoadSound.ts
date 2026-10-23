@@ -25,13 +25,17 @@
  * cabinet mid-game plays the right tune: the road's theme while the group
  * walks (looped), the Great Lantern's while it is coming down or fighting,
  * silence while it burns out and the gate stands open, and the STAGE CLEAR
- * jingle once through on the card. Three tunes in data (LR_TUNES), each a
- * few tracks of [note, sixteenths] pairs, written for the game. Music is
- * on by default and can be left out (createLanternRoadSound's `music`),
- * which a cabinet switch can use later.
+ * jingle once through on the card. The road's theme keeps the game's frame
+ * count and the jingle the card's, so every page at the cabinet is on the
+ * same bar, and a page that gets its speaker late comes in where the tune
+ * is rather than at bar one. Three tunes in data (LR_TUNES), each a few
+ * tracks of [note, sixteenths] pairs, written for the game in D minor, the
+ * tuned effects in the same key. Music is on by default and can be left
+ * out (createLanternRoadSound's `music`), which a cabinet switch can use
+ * later.
  */
 
-import { LR_VIEW_W, type LrCue, type LrCueKind, type LrState } from './games/lanternRoad';
+import { CLEAR_FRAMES, LR_VIEW_W, type LrCue, type LrCueKind, type LrState } from './games/lanternRoad';
 
 /** The game's frames a second: a frame of sound is this long. */
 export const LR_SOUND_FPS = 60;
@@ -61,11 +65,15 @@ interface Osc {
   acc: number;
 }
 
-const newOsc = (): Osc => ({ phase: 0, lfsr: 1, acc: 0 });
+/** The noise's shift register at rest: a mixed word, so a noise doesn't open
+ *  on a run of one level (seeded with 1 it gives fourteen alike: a thump). */
+const LFSR_SEED = 0x2d5a;
+
+const newOsc = (): Osc => ({ phase: 0, lfsr: LFSR_SEED, acc: 0 });
 
 function resetOsc(o: Osc): void {
   o.phase = 0;
-  o.lfsr = 1;
+  o.lfsr = LFSR_SEED;
   o.acc = 0;
 }
 
@@ -82,7 +90,9 @@ function osc(o: Osc, wave: Wave, duty: number, hz: number, sampleRate: number): 
   }
   o.phase += hz / sampleRate;
   if (o.phase >= 1) o.phase -= Math.floor(o.phase);
-  if (wave === 'pulse') return o.phase < duty ? 1 : -1;
+  // A pulse up for `duty` of its cycle, its two levels set so it carries no
+  // offset: a narrow one would otherwise sit below zero and step on every gap.
+  if (wave === 'pulse') return o.phase < duty ? 2 * (1 - duty) : -2 * duty;
   return 4 * Math.abs(o.phase - 0.5) - 1;
 }
 
@@ -100,7 +110,7 @@ export interface LrFxStage {
   to: number;
   /** Frames. */
   len: number;
-  /** Peak level, 0..1. */
+  /** Level, 0..1: the wave's half swing (a narrow pulse peaks above it). */
   vol: number;
   /** The level over the stage: fading out, held (with a short fade at the end), or fading with a flutter. */
   env: 'fade' | 'hold' | 'flutter';
@@ -118,21 +128,26 @@ const tri = (from: number, to: number, len: number, vol: number, env: LrFxStage[
 const noise = (from: number, to: number, len: number, vol: number, env: LrFxStage['env'] = 'fade'): LrFxStage =>
   ({ wave: 'noise', duty: 0.5, from, to, len, vol, env });
 
-/** The sound of each cue. `clear` has none of its own: the music plays its jingle. */
+/** The sound of each cue. `clear` has none of its own: the music plays its
+ *  jingle. The tuned ones (coin, heal, bonus, gate) sit in the road's D
+ *  minor, so a coin never argues with the bass. */
 export const LR_FX: Readonly<Record<LrCueKind, LrFx>> = {
   jump: [[pulse(260, 880, 9, 0.16)]],
   drop: [[pulse(520, 180, 7, 0.12)]],
   swing: [[noise(14000, 3000, 6, 0.1)]],
   hit: [[pulse(200, 90, 6, 0.2, 0.125, 'hold')], [noise(9000, 3000, 3, 0.1)]],
   beaten: [[noise(7000, 1500, 14, 0.16)], [pulse(440, 110, 12, 0.08, 0.5)]],
-  coin: [[pulse(988, 988, 4, 0.14, 0.5, 'hold'), pulse(1319, 1319, 12, 0.14, 0.5)]],
+  // A5 up to D6.
+  coin: [[pulse(880, 880, 4, 0.14, 0.5, 'hold'), pulse(1175, 1175, 12, 0.14, 0.5)]],
+  // D5 F5 A5 D6.
   heal: [[
-    pulse(523, 523, 3, 0.12, 0.25, 'hold'), pulse(659, 659, 3, 0.12, 0.25, 'hold'), pulse(784, 784, 3, 0.12, 0.25, 'hold'),
-    pulse(1047, 1047, 12, 0.12, 0.25),
+    pulse(587, 587, 3, 0.12, 0.25, 'hold'), pulse(698, 698, 3, 0.12, 0.25, 'hold'), pulse(880, 880, 3, 0.12, 0.25, 'hold'),
+    pulse(1175, 1175, 12, 0.12, 0.25),
   ]],
+  // A5 C6 D6 F6, sparkling over F, Bb and C.
   bonus: [[
-    pulse(784, 784, 3, 0.13, 0.5, 'hold'), pulse(988, 988, 3, 0.13, 0.5, 'hold'), pulse(1175, 1175, 3, 0.13, 0.5, 'hold'),
-    pulse(1568, 1568, 16, 0.13, 0.5, 'fade', [0, 4, 7]),
+    pulse(880, 880, 3, 0.13, 0.5, 'hold'), pulse(1047, 1047, 3, 0.13, 0.5, 'hold'), pulse(1175, 1175, 3, 0.13, 0.5, 'hold'),
+    pulse(1397, 1397, 16, 0.13, 0.5, 'fade', [0, 5, 7]),
   ]],
   hurt: [[pulse(420, 140, 14, 0.18, 0.5, 'flutter')]],
   ko: [[pulse(660, 80, 36, 0.18, 0.25)], [noise(4000, 1000, 10, 0.08)]],
@@ -144,29 +159,39 @@ export const LR_FX: Readonly<Record<LrCueKind, LrFx>> = {
   'boss-slam': [[noise(1800, 400, 24, 0.26)], [tri(80, 24, 30, 0.3)]],
   'boss-hit': [[pulse(280, 120, 7, 0.2, 0.125, 'hold')], [noise(9000, 2000, 4, 0.1)]],
   'boss-down': [[noise(10000, 600, 100, 0.2)], [pulse(880, 55, 100, 0.12, 0.25)]],
+  // D6 F#6 A6 D7 over D5: the one bright chord, with the street silent.
   gate: [
     [
-      pulse(1047, 1047, 6, 0.14, 0.5, 'hold'), pulse(1319, 1319, 6, 0.14, 0.5, 'hold'), pulse(1568, 1568, 6, 0.14, 0.5, 'hold'),
-      pulse(2093, 2093, 30, 0.14, 0.5),
+      pulse(1175, 1175, 6, 0.14, 0.5, 'hold'), pulse(1480, 1480, 6, 0.14, 0.5, 'hold'), pulse(1760, 1760, 6, 0.14, 0.5, 'hold'),
+      pulse(2349, 2349, 30, 0.14, 0.5),
     ],
-    [tri(523, 523, 40, 0.12)],
+    [tri(587, 587, 40, 0.12)],
   ],
   clear: [],
 };
 
-/** Effects sounding at once (a two-layer effect takes two). */
-const FX_CHANNELS = 6;
+/** Effects sounding at once (a two-layer effect takes two): four players'
+ *  doings and the Great Lantern's besides. */
+const FX_CHANNELS = 8;
 
 interface FxChannel {
   stages: readonly LrFxStage[] | null;
   stage: number;
   /** Frames into the stage. */
   f: number;
-  /** Frames since it was struck: the oldest gives way when all are busy. */
+  /** Frames since it was struck: one struck this frame is never given up. */
   age: number;
   left: number;
   right: number;
   osc: Osc;
+}
+
+/** Frames a channel has left to play. */
+function framesLeft(ch: FxChannel): number {
+  if (!ch.stages) return 0;
+  let left = ch.stages[ch.stage]!.len - ch.f;
+  for (let i = ch.stage + 1; i < ch.stages.length; i++) left += ch.stages[i]!.len;
+  return left;
 }
 
 /** The level of a stage `f` frames in. */
@@ -311,14 +336,16 @@ export const LR_TUNES: Readonly<Record<LrTuneId, LrTune>> = {
         ],
       },
       {
+        // The flattened step comes on the third beat, except under the held
+        // notes of bars 2 and 6, where it waits for the last eighth.
         wave: 'tri', vol: 0.15,
         notes: [
           ...eighths(38, 38, 38, 38, 39, 39, 38, 38),
-          ...eighths(38, 38, 38, 38, 39, 39, 38, 38),
+          ...eighths(38, 38, 38, 38, 38, 38, 39, 38),
           ...eighths(38, 38, 38, 38, 39, 39, 38, 38),
           ...eighths(38, 38, 34, 34, 45, 45, 43, 41),
           ...eighths(45, 45, 45, 45, 46, 46, 45, 45),
-          ...eighths(45, 45, 45, 45, 46, 46, 45, 45),
+          ...eighths(45, 45, 45, 45, 45, 45, 46, 45),
           ...eighths(45, 45, 45, 45, 46, 46, 45, 45),
           ...eighths(45, 45, 41, 41, 39, 39, 38, 38),
         ],
@@ -461,7 +488,7 @@ export function createLanternRoadSound(sampleRate: number, opts: LrSoundOptions 
   const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 48000;
   const music = opts.music ?? true;
   const perFrame = rate / LR_SOUND_FPS;
-  /** Samples owed: a rate that doesn't divide by 60 renders 735 or 736 a frame and keeps time over a second. */
+  /** Samples owed: a rate that doesn't divide by 60 (22050) renders 367 or 368 a frame and keeps time over a second. */
   let owed = 0;
 
   const channels: FxChannel[] = Array.from({ length: FX_CHANNELS }, () => ({
@@ -475,14 +502,22 @@ export function createLanternRoadSound(sampleRate: number, opts: LrSoundOptions 
   const strike = (c: LrCue, cam: number): void => {
     const fx = LR_FX[c.kind];
     if (!fx || fx.length === 0) return;
-    // Across the two tubes: constant power, so the middle is as loud as a side.
+    // Across the two tubes: constant power, scaled so the middle of the
+    // picture is the table's level and a side is 3 dB over it.
     const pan = Math.max(-1, Math.min(1, ((c.x - cam) / LR_VIEW_W) * 2 - 1));
     const angle = ((pan + 1) * Math.PI) / 4;
-    const left = Math.cos(angle);
-    const right = Math.sin(angle);
+    const left = Math.cos(angle) * Math.SQRT2;
+    const right = Math.sin(angle) * Math.SQRT2;
     for (const layer of fx) {
       let ch = channels.find((k) => k.stages === null);
-      if (!ch) ch = channels.reduce((oldest, k) => (k.age > oldest.age ? k : oldest));
+      if (!ch) {
+        // All busy: the one nearest its end gives way, never one struck this
+        // frame (then the layer is dropped instead).
+        let nearest: FxChannel | null = null;
+        for (const k of channels) if (k.age > 0 && (!nearest || framesLeft(k) < framesLeft(nearest))) nearest = k;
+        if (!nearest) continue;
+        ch = nearest;
+      }
       ch.stages = layer;
       ch.stage = 0;
       ch.f = 0;
@@ -500,7 +535,12 @@ export function createLanternRoadSound(sampleRate: number, opts: LrSoundOptions 
       if (want !== tune) {
         tune = want;
         tracks = want ? trackStates(LR_TUNES[want]) : [];
-        pos = 0;
+        // Where to come in: the road's theme keeps the game's clock and the
+        // fanfare the card's (CLEAR_FRAMES down to 0), so a page that first
+        // sees the card late never has it cut off; the Great Lantern's
+        // starts as it comes down.
+        const length = tracks[0]?.length ?? 0;
+        pos = want === 'road' && length > 0 ? s.frame % length : want === 'clear' ? Math.max(0, CLEAR_FRAMES - s.phaseT) : 0;
       }
       // The effects: one of each kind a frame, the first of them.
       const seen = new Set<LrCueKind>();

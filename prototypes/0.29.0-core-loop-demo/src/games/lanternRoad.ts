@@ -757,12 +757,11 @@ function stepPlayer(s: LrState, seat: number, pad: number): void {
   if (p.y > LR_ROWS * TILE_SUB) {
     p.hp -= 1;
     p.hurt = HURT_FRAMES;
-    cue('fall', p.x);
     if (p.hp <= 0) {
       p.hp = 0;
       p.ko = KO_FRAMES;
-      cue('ko', p.x);
     }
+    cue(p.ko > 0 ? 'ko' : 'fall', p.x);
     placePlayer(s, seat);
   }
 }
@@ -1287,11 +1286,12 @@ function newLap(s: LrState): void {
  * state is the same either way.
  */
 export function stepLanternRoad(s: LrState, pads: readonly number[], sounds?: LrCue[]): void {
+  const outer = cues;
   cues = sounds ?? null;
   try {
     stepFrame(s, pads);
   } finally {
-    cues = null;
+    cues = outer;
   }
 }
 

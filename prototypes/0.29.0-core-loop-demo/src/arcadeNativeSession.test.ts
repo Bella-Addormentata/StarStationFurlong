@@ -654,14 +654,15 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     expect(samples).toBe(a.mod.nativeArcadeCopyInfo(ITEM)!.next * 800);
     expect(loudest).toBeGreaterThan(0);
     expect(loudest).toBeLessThanOrEqual(1);
-    // A page at another stand hears it too, at its own rate; the room's
-    // other pages paint the cabinet silent.
+    // A page at another stand hears it too, at its own rate, for every frame
+    // it runs from then on; the room's other pages paint the cabinet silent.
     const watcher = link(b, 2);
     let heard = 0;
+    const from = b.mod.nativeArcadeCopyInfo(ITEM)!.next;
     watcher.setAudio(() => heard++, 44100);
     await run(500);
     expect(heard).toBeGreaterThan(0);
-    expect(heard % 735).toBe(0);
+    expect(heard).toBe(((b.mod.nativeArcadeCopyInfo(ITEM)!.next - from + 0x10000) & 0xffff) * 735);
     // Leaving the cabinet (the speaker handed back, the link released) is silence.
     host.setAudio(null, 48000);
     const were = samples;
@@ -671,6 +672,14 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     expect(samples).toBe(were);
     expect(heard).toBe(heardWere);
     expect(a.mod.nativeArcadeCopyInfo(ITEM)!.next).toBeGreaterThan(were / 800);
+    // The speaker back (the page returns to the cabinet): sound again, a frame of samples a frame.
+    const back = a.mod.nativeArcadeCopyInfo(ITEM)!.next;
+    host.setAudio((l, r) => {
+      samples++;
+      loudest = Math.max(loudest, Math.abs(l), Math.abs(r));
+    }, 48000);
+    await run(200);
+    expect(samples - were).toBe(((a.mod.nativeArcadeCopyInfo(ITEM)!.next - back + 0x10000) & 0xffff) * 800);
   });
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {

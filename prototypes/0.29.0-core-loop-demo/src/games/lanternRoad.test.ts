@@ -591,29 +591,41 @@ describe('cues', () => {
     expect(kinds(back)).toContain('puff');
   });
 
-  it('a fall into the river', () => {
+  it('a fall into the river, and a last-heart fall that is the knock-out', () => {
     const s = quiet();
     run(s, 2, () => only(0));
     const p = s.players[0]!;
-    s.cam = 1100;
-    p.x = (1100 + 200) * SUB;
-    p.y = 10 * LR_TILE * SUB;
-    const heard = kinds(cuesOf(s, 0, 40));
+    const drop = () => {
+      s.cam = 1100;
+      p.x = (1100 + 200) * SUB;
+      p.y = 10 * LR_TILE * SUB;
+      return kinds(cuesOf(s, 0, 40));
+    };
+    const heard = drop();
     expect(heard).toContain('fall');
     expect(heard).toContain('puff');
     expect(heard).not.toContain('ko');
+    // On their last heart the fall is the knock-out: one sound, not two.
+    p.hp = 1;
+    p.hurt = 0;
+    const last = drop();
+    expect(last).toContain('ko');
+    expect(last).not.toContain('fall');
+    expect(p.ko).toBeGreaterThan(0);
   });
 
   it('the Great Lantern coming down, its fire, its shake and slam, its hits, its end, the gate, the clear', () => {
     const s = atShrine(2);
+    s.enemies = createLanternRoad(3).enemies; // the street's yokai, to flee
     for (const p of s.players) p.hurt = 99999;
     const heard: LrCue[] = [];
     for (let f = 0; f < 900; f++) stepLanternRoad(s, [PAD_PRESENT, PAD_PRESENT, 0, 0], heard);
     const seen = new Set(kinds(heard));
     for (const kind of ['boss-enter', 'boss-fire', 'boss-shake', 'boss-slam']) expect(seen.has(kind), kind).toBe(true);
-    // One enter, and the yokai fleeing score no 'beaten'.
+    // One enter, and the yokai fleeing score no 'beaten' (they are all gone).
     expect(kinds(heard).filter((k) => k === 'boss-enter')).toHaveLength(1);
     expect(seen.has('beaten')).toBe(false);
+    expect(s.enemies).toEqual([]);
 
     const t = atShrine(1);
     const p = t.players[0]!;
@@ -640,17 +652,31 @@ describe('cues', () => {
     expect(t.phase).toBe('clear');
   });
 
-  it('leave the state exactly as it is without them', () => {
-    const pads = (s: LrState, f: number) => [0, 1, 2, 3].map((seat) => (f > seat * 90 ? bot(s, seat, f) : 0));
+  it('leave the state exactly as it is without them, through the Great Lantern, the card and a new lap', () => {
     const silent = createLanternRoad(7);
     const heard = createLanternRoad(7);
     const cues: LrCue[] = [];
-    for (let f = 0; f < 2000; f++) {
+    let cleared = -1;
+    const pads = (s: LrState, f: number) => [0, 1, 2, 3].map((seat) => {
+      // Seat 4 steps away during the card and comes back on the next lap.
+      if (seat === 3 && cleared >= 0 && f > cleared + 60 && f < cleared + CLEAR_FRAMES + 60) return 0;
+      return f > seat * 90 ? bot(s, seat, f) : 0;
+    });
+    let f = 0;
+    for (; f < 60 * 60 * 8 && (cleared < 0 || f < cleared + CLEAR_FRAMES + 300); f++) {
       stepLanternRoad(silent, pads(silent, f));
       stepLanternRoad(heard, pads(heard, f), cues);
+      if (f % 32 === 0) expect(checkLanternRoad(heard), `frame ${f}`).toBe(checkLanternRoad(silent));
+      if (cleared < 0 && silent.phase === 'clear') cleared = f;
     }
+    expect(cleared).toBeGreaterThan(0);
+    expect(silent.laps).toBe(1);
+    expect(silent.players[3]!.on).toBe(true);
     expect(JSON.stringify(heard)).toBe(JSON.stringify(silent));
-    expect(cues.length).toBeGreaterThan(50);
+    const seen = new Set<string>(cues.map((c) => c.kind));
+    for (const kind of ['jump', 'swing', 'hit', 'beaten', 'coin', 'boss-enter', 'boss-slam', 'boss-hit', 'boss-down', 'gate', 'clear', 'puff']) {
+      expect(seen.has(kind), kind).toBe(true);
+    }
     // And every cue is placed somewhere on the road.
     for (const c of cues) {
       expect(Number.isInteger(c.x)).toBe(true);
