@@ -221,6 +221,8 @@ import {
   closeNativeArcadeCabinet, linkNativeArcade, nativeArcadeFrame, nativeSeatStatus, registerNativeArcadeVisual,
   setNativeCabinetGameReader,
 } from "./arcadeNativeSession";
+// 🕹🕹 Which of the double-wide's four stations a click or a walk-up names.
+import { wideClick, wideStationFor, type WideClick } from "./arcadeStations";
 import { writeArcade, writeNativeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
@@ -6484,13 +6486,14 @@ export class World {
     return kind === "arcade-cabinet-wide" ? 4 : kind === "arcade-cabinet-2p" ? 2 : 1;
   }
 
-  /** 🕹🕹🕹🕹 The double-wide cabinet's stand for this page (#242): its own
-   *  seat's, else the lowest seat nobody holds — by the seats' leases, not by
-   *  who stands near (four stands a step apart). None free, or none it can
-   *  walk to: null, the device front. Its own seat's stand counts only while
-   *  it can walk there (furniture set down since it sat can fence one off),
-   *  and the panel at the front still shows its seat. */
-  private pickArcadeSeatStand(deviceId: string): StandSlot | null {
+  /** 🕹🕹🕹🕹 The double-wide cabinet's stand for this page's own-cartridge
+   *  play (#242): its own seat's, else the station it walked up to or
+   *  clicked (`click`, where the click met the cabinet), by the seats'
+   *  leases. None free, or none it can walk to: null, the device front. Its
+   *  own seat's stand counts only while it can walk there (furniture set
+   *  down since it sat can fence one off), and the panel at the front still
+   *  shows its seat. */
+  private pickArcadeSeatStand(deviceId: string, click?: WideClick): StandSlot | null {
     const stands = standsForItem(deviceId);
     const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
     const reachable = this.standReachability();
@@ -6499,18 +6502,22 @@ export class World {
       const own = at(mine);
       return own && reachable(own) ? own : null;
     }
+    const all: StandSlot[] = [];
+    const free: StandSlot[] = [];
     for (let n = 0; n < 4; n++) {
       const s = at(n);
-      if (s && seatStatus(deviceId, n) === "free" && reachable(s)) return s;
+      if (!s) continue;
+      all.push(s);
+      if (seatStatus(deviceId, n) === "free" && reachable(s)) free.push(s);
     }
-    return null;
+    return wideStationFor(all, free, this.player.getPosition(), click);
   }
 
   /** 🕹🕹 The double-wide cabinet's own game: this page's stand if it plays
-   *  there, else the nearest reachable stand whose seat is free and nobody
-   *  stands on. Its stands are a stride apart, too close for
-   *  pickFreeStand's 0.7 m test: one player would shut out the next. */
-  private pickNativeSeatStand(deviceId: string): StandSlot | null {
+   *  there, else the station it walked up to or clicked (`click`) whose seat
+   *  is free and nobody stands on. Its stands are a stride apart, too close
+   *  for pickFreeStand's 0.7 m test: one player would shut out the next. */
+  private pickNativeSeatStand(deviceId: string, click?: WideClick): StandSlot | null {
     const stands = standsForItem(deviceId);
     const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
     const reachable = this.standReachability();
@@ -6521,19 +6528,19 @@ export class World {
       return own && reachable(own) ? own : null;
     }
     const others = this.getRemoteAvatarSnapshots();
-    const me = this.player.getPosition();
-    const free = status
-      .map((st, n) => (st === "free" ? at(n) : null))
-      .filter((s): s is StandSlot =>
-        s !== null &&
+    const all: StandSlot[] = [];
+    const free: StandSlot[] = [];
+    status.forEach((st, n) => {
+      const s = at(n);
+      if (!s) return;
+      all.push(s);
+      if (
+        st === "free" &&
         !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < NATIVE_STAND_TAKEN_M) &&
-        reachable(s));
-    free.sort(
-      (a, b) =>
-        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
-        Math.hypot(b.front.x - me.x, b.front.z - me.z),
-    );
-    return free[0] ?? null;
+        reachable(s)
+      ) free.push(s);
+    });
+    return wideStationFor(all, free, this.player.getPosition(), click);
   }
 
   /**
@@ -6649,7 +6656,13 @@ export class World {
     this.onFirstPersonSeat?.(this.player.getSeatedFacing());
   }
 
-  public requestDeviceFocus(deviceId: string): void {
+  /** `click`: where the click met the device and the mesh it met, when one
+   *  did (the double-wide arcade cabinet seats a player at the station they
+   *  clicked). */
+  public requestDeviceFocus(
+    deviceId: string,
+    click?: { point: { x: number; z: number }; object: { userData: Record<string, unknown> } },
+  ): void {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;
 
@@ -7086,17 +7099,20 @@ export class World {
     if (device.kind === "arcade") {
       // The two-player cabinet has a stand per player (s0 = player 1):
       // walk to the free one, and its index is the seat. The double-wide
-      // cabinet's four stands are its owner's own game's players (#242):
-      // this page's seat's, or the lowest free one. Its built-in games, and
-      // the one-player cabinet, play from the device front.
+      // cabinet's four stands are its owner's own game's players (#242),
+      // and its own game's (s0 = player 1): this page's seat's, else the
+      // free station it walked up to or clicked, so the station is the
+      // player number. Its built-in games, and the one-player cabinet, play
+      // from the device front; the own game with no stand free, from the
+      // front, to watch.
       const seats = this.arcadeSeats(deviceId);
       const builtIn = builtInEntry(readCabinet(deviceId).game) !== null;
-      // Its own game seats four by stand (s0 = player 1), the free one
-      // nearest; no stand free, the front, to watch.
       const own = seats === 4 && nativeEntry(readCabinet(deviceId).game) !== null;
+      // The station clicked (or walked up to) is the player number.
+      const at = click && seats === 4 ? wideClick(click.point, click.object) : undefined;
       const stand = seats === 2 ? this.pickFreeStand(deviceId)
-        : own ? this.pickNativeSeatStand(deviceId)
-          : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId)
+        : own ? this.pickNativeSeatStand(deviceId, at)
+          : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId, at)
             : null;
       const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : own ? null : 0;
       const target: DeviceTarget = stand
