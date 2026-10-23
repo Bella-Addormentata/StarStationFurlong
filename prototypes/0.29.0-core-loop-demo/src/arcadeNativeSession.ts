@@ -38,10 +38,16 @@
  * high-score table (the cabinet's game is a native one: the reader World
  * installs says so); and the screen is handed back (showAttract) the moment
  * the cabinet's game is something else.
+ *
+ * The cabinet's sound: the page at the cabinet hands its speaker over on
+ * the link (setAudio, as the NES cabinet does), and every frame that page's
+ * copy runs is stepped with a cue list and rendered by the game's sound
+ * chip into the speaker, so the sound keeps step with the picture. Pages
+ * that only paint the cabinet for the room run their frames silent.
  */
 
 import {
-  NATIVE_PRESENT, nativeGameById, nativeGameForMatch, nativeMatchGame, type NativeGame,
+  NATIVE_PRESENT, nativeGameById, nativeGameForMatch, nativeMatchGame, type NativeGame, type NativeSound,
 } from './arcadeNativeGames';
 import {
   ARCADE_WIRE_NATIVE, GuestPad, PadLog, PadRuns, frameAdd, frameDiff, packArcadeTick, pipe, unpackArcadeTick,
@@ -194,10 +200,20 @@ interface Copy {
   guestChanges: number;
   guestSeq: number;
   guestBeat: number;
+  // Sound, while the page at the cabinet has a speaker
+  /** The game's sound chip (null while nobody listens: the music starts
+   *  over when somebody does). */
+  sound: NativeSound | null;
+  soundRate: number;
+  /** The frame's cues, collected for the chip. */
+  cues: unknown[];
 }
 
 interface LinkState {
   buttons: number;
+  /** The cabinet's speaker while this page is at it (null: silent). */
+  audio: ((left: number, right: number) => void) | null;
+  sampleRate: number;
   uiScreen: boolean;
   error: string | null;
 }
@@ -279,10 +295,45 @@ function newCopy(s: CabinetSession, m: NativeMatch, game: NativeGame, role: 'hos
     logLo: new PadLog(), logHi: new PadLog(), hostLane: null, lastFramesAt: 0, stalledSince: null, needSync: false,
     syncFrom: null, lastSyncAskAt: 0, restoring: false, triedSnapshot: null, hostChecks: new Map(), myChecks: new Map(),
     guestFor: 0, guestCur: 0, guestPrev: 0, guestChanges: 0, guestSeq: 0, guestBeat: 0,
+    sound: null, soundRate: 0, cues: [],
   };
   s.copy = copy;
   s.shown = null;
   return copy;
+}
+
+/** What a chip that threw is replaced by: silence until the page lets go of
+ *  the speaker (a fresh chip the next time it listens), never the game. */
+const SILENT_SOUND: NativeSound = {
+  frame(): void {
+    /* the chip threw: nothing until the next listener */
+  },
+};
+
+/** Run one frame of the game, with its sound when the page at the cabinet
+ *  has a speaker: the frame's cues go to the chip, the chip's samples to the
+ *  speaker. A chip that throws (made or run) is dropped, never the game. */
+function runFrame(s: CabinetSession, copy: Copy, pads: readonly number[]): void {
+  const link = s.link;
+  const sink = link?.audio ?? null;
+  if (!link || !sink) {
+    copy.sound = null;
+    copy.game.step(copy.state, pads);
+    return;
+  }
+  copy.cues.length = 0;
+  copy.game.step(copy.state, pads, copy.cues);
+  try {
+    if (!copy.sound || copy.soundRate !== link.sampleRate) {
+      copy.sound = copy.game.sound(link.sampleRate);
+      copy.soundRate = link.sampleRate;
+    }
+    copy.sound.frame(copy.state, copy.cues, sink);
+  } catch (err) {
+    console.error('[arcade] the cabinet game\'s sound stopped:', err);
+    copy.sound = SILENT_SOUND;
+    copy.soundRate = link.sampleRate;
+  }
 }
 
 const isCopyOf = (copy: Copy, m: NativeMatch): boolean =>
@@ -543,7 +594,7 @@ function hostFrame(itemId: string, s: CabinetSession, copy: Copy, dt: number, no
     const lo = pads[0]! | (pads[1]! << 8);
     const hi = pads[2]! | (pads[3]! << 8);
     if (copy.lo.needsTickBefore(lo) || copy.hi.needsTickBefore(hi)) sendFrames();
-    copy.game.step(copy.state, pads);
+    runFrame(s, copy, pads);
     copy.lo.record(copy.next, lo);
     copy.hi.record(copy.next, hi);
     copy.next = frameAdd(copy.next, 1);
@@ -662,7 +713,7 @@ function followFrame(itemId: string, s: CabinetSession, copy: Copy, m: NativeMat
     pads[1] = lo >> 8;
     pads[2] = hi & 0xff;
     pads[3] = hi >> 8;
-    copy.game.step(copy.state, pads);
+    runFrame(s, copy, pads);
     copy.next = frameAdd(copy.next, 1);
     if ((copy.next & (CHECK_EVERY - 1)) === 0 && copy.next !== 0) {
       copy.myChecks.set(copy.next, copy.game.check(copy.state));
@@ -714,6 +765,10 @@ function tryRestore(itemId: string, copy: Copy): void {
       copy.syncFrom = null;
       copy.stalledSince = null;
       copy.myChecks.clear();
+      // The chip seats its music on the state it first sees: a fresh one for
+      // the restored state, or the tune would run on from before the jump.
+      // One that threw stays silent until the page lets go of the speaker.
+      if (copy.sound !== SILENT_SOUND) copy.sound = null;
     },
     () => {
       copy.restoring = false;
@@ -827,7 +882,7 @@ function boardOf(itemId: string, s: CabinetSession, game: NativeGame, now: numbe
  * watch, and start a game as player 1 if none runs).
  */
 export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLink {
-  const link: LinkState = { buttons: 0, uiScreen: true, error: null };
+  const link: LinkState = { buttons: 0, audio: null, sampleRate: 48000, uiScreen: true, error: null };
   const room = roomId();
   let epoch = casinoDocEpoch();
   const session = () => {
@@ -912,8 +967,9 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
       // this computer plays nobody (yet).
     },
 
-    setAudio(): void {
-      // The cabinet's own games are silent for now.
+    setAudio(sink, sampleRate): void {
+      link.audio = sink;
+      link.sampleRate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 48000;
     },
 
     setUiScreen(on: boolean): void {
@@ -929,6 +985,7 @@ export function linkNativeArcade(itemId: string, seat: number | null): ArcadeLin
         s.link = null;
         s.shown = null;
       }
+      link.audio = null;
       link.buttons = 0;
     },
   };

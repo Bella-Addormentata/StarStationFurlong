@@ -12,6 +12,7 @@ import { ARCADE_WIRE_NATIVE, packArcadeTick, pipe, unpackArcadeTick } from './ar
 import type { ArcadeLink } from './arcadeNesSession';
 import { LR_AWAY_FRAMES, LR_PLAYER_H, LR_PLAYER_W, LR_REV, type LrState } from './games/lanternRoad';
 import { newNativeMatch, newNativeSeat } from './games/nativeArcade';
+import { createLanternRoadSound } from './lanternRoadSound';
 
 type SessionModule = typeof import('./arcadeNativeSession');
 type GamesModule = typeof import('./games/gamesDoc');
@@ -637,6 +638,87 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     expect(play(400)).toBe(first);
     expect(a.arcade.readHighScores(ITEM, 'lantern-road').map((l) => l.score)).toEqual([400, 300]);
   }, 60_000);
+
+  it('sounds for the page at the cabinet with a speaker, a frame of samples a frame, and nowhere else', async () => {
+    const [a, b] = await room('a', 'b');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    let samples = 0;
+    let loudest = 0;
+    host.setAudio((l, r) => {
+      samples++;
+      loudest = Math.max(loudest, Math.abs(l), Math.abs(r));
+    }, 48000);
+    await run(500);
+    // 48 kHz at 60 frames a second: 800 samples for every frame the host ran.
+    expect(a.mod.nativeArcadeCopyInfo(ITEM)!.next).toBeGreaterThan(20);
+    expect(samples).toBe(a.mod.nativeArcadeCopyInfo(ITEM)!.next * 800);
+    expect(loudest).toBeGreaterThan(0);
+    expect(loudest).toBeLessThanOrEqual(1);
+    // A page at another stand hears it too, at its own rate, for every frame
+    // it runs from then on; the room's other pages paint the cabinet silent.
+    const watcher = link(b, 2);
+    let heard = 0;
+    const from = b.mod.nativeArcadeCopyInfo(ITEM)!.next;
+    watcher.setAudio(() => heard++, 44100);
+    await run(500);
+    expect(heard).toBeGreaterThan(0);
+    expect(heard).toBe(((b.mod.nativeArcadeCopyInfo(ITEM)!.next - from + 0x10000) & 0xffff) * 735);
+    // Leaving the cabinet (the speaker handed back, the link released) is silence.
+    host.setAudio(null, 48000);
+    const were = samples;
+    watcher.release();
+    const heardWere = heard;
+    await run(200);
+    expect(samples).toBe(were);
+    expect(heard).toBe(heardWere);
+    expect(a.mod.nativeArcadeCopyInfo(ITEM)!.next).toBeGreaterThan(were / 800);
+    // The speaker back (the page returns to the cabinet): sound again, a frame of samples a frame.
+    const back = a.mod.nativeArcadeCopyInfo(ITEM)!.next;
+    host.setAudio((l, r) => {
+      samples++;
+      loudest = Math.max(loudest, Math.abs(l), Math.abs(r));
+    }, 48000);
+    await run(200);
+    expect(samples - were).toBe(((a.mod.nativeArcadeCopyInfo(ITEM)!.next - back + 0x10000) & 0xffff) * 800);
+  });
+
+  it('seats the music afresh on a save state, so a follower resynced mid-road is on the game\'s clock', async () => {
+    const [a, b] = await room('a', 'b');
+    const host = link(a, 0);
+    host.host(LANTERN_ROAD);
+    await run(300);
+    const watcher = link(b, null);
+    /** What the watcher's speaker got, frame by frame as they were run (a
+     *  save state can take the copy back over frames it had already run):
+     *  the samples, and the state the chip was given. */
+    const heard: Array<{ next: number; samples: number[]; state: string }> = [];
+    watcher.setAudio((l) => {
+      const next = b.mod.nativeArcadeCopyInfo(ITEM)!.next;
+      let frame = heard[heard.length - 1];
+      if (!frame || frame.next !== next || frame.samples.length >= 735) {
+        frame = { next, samples: [], state: JSON.stringify(stateOf(b)) };
+        heard.push(frame);
+      }
+      frame.samples.push(l);
+    }, 44100);
+    await run(600);
+    // The host's copy takes a turn the watcher's never heard of (a lost tick
+    // would do it): the next fingerprint disagrees, the watcher asks for a
+    // save state and carries on from it. (A value a save state may carry:
+    // restoreLanternRoad checks the field's range.)
+    stateOf(a)!.players[0]!.hurt = 60000;
+    await run(3000);
+    const first = heard.find((f) => (JSON.parse(f.state) as LrState).players[0]!.hurt > 1000);
+    expect(first).toBeDefined();
+    expect(first!.samples).toHaveLength(735);
+    // Its first frame after the save state is what a chip meeting that
+    // state for the first time renders: the road's theme where the game's
+    // clock says, not where the old chip had got to.
+    const fresh: number[] = [];
+    createLanternRoadSound(44100).frame(JSON.parse(first!.state) as LrState, [], (l) => fresh.push(l));
+    expect(first!.samples).toEqual(fresh);
+  });
 
   it('ignores a NES-wire tick, even one with the same match id', async () => {
     const [a, b] = await room('a', 'b');

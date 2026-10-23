@@ -10,19 +10,23 @@
 
 /** How far ahead of the audio clock a chunk is queued after a gap. */
 const LEAD_S = 0.06;
-/** Queue further ahead than this (the tab was hidden, the game ran fast)
- *  and the queue restarts at LEAD_S instead of drifting behind the picture. */
+/** Queue further ahead than this (the tab was hidden, the game ran fast, a
+ *  follower caught up) and what is queued is dropped and the queue restarts
+ *  at LEAD_S, instead of playing under the new chunks or drifting behind
+ *  the picture. */
 const MAX_AHEAD_S = 0.3;
 /** Cabinet volume: chiptune square waves are loud next to room audio. */
 const VOLUME = 0.35;
-/** Samples buffered per chunk: a few frames' worth at 48 kHz. */
-const CAPACITY = 8192;
+/** Samples buffered per chunk, in frames at the speaker's rate: more than
+ *  a follower catching up pushes in one update (the sessions' CATCH_UP_MAX
+ *  of 8 frames), at any rate the device runs at. */
+const CAPACITY_FRAMES = 12;
 
 export class ArcadeSpeaker {
   private ctx: AudioContext | null = null;
   private gain: GainNode | null = null;
-  private left = new Float32Array(CAPACITY);
-  private right = new Float32Array(CAPACITY);
+  private left: Float32Array<ArrayBuffer>;
+  private right: Float32Array<ArrayBuffer>;
   private count = 0;
   private nextTime = 0;
   /** Chunks queued on the audio clock and not yet ended (clear() stops them). */
@@ -42,6 +46,9 @@ export class ArcadeSpeaker {
       this.ctx = null; // No audio device: the games run silent.
     }
     this.sampleRate = this.ctx?.sampleRate ?? 48000;
+    const capacity = Math.ceil(this.sampleRate / 60) * CAPACITY_FRAMES || 8192;
+    this.left = new Float32Array(capacity);
+    this.right = new Float32Array(capacity);
   }
 
   /** Call from a user gesture: browsers start contexts made without one suspended. */
@@ -51,7 +58,7 @@ export class ArcadeSpeaker {
 
   /** The emulator's per-sample callback. */
   readonly push = (l: number, r: number): void => {
-    if (this.count >= CAPACITY) return;
+    if (this.count >= this.left.length) return;
     this.left[this.count] = l;
     this.right[this.count] = r;
     this.count++;
@@ -70,6 +77,7 @@ export class ArcadeSpeaker {
     source.buffer = buffer;
     source.connect(this.gain);
     const now = ctx.currentTime;
+    if (this.nextTime > now + MAX_AHEAD_S) this.stopQueued(); // ran ahead: it would play under what comes now
     if (this.nextTime < now || this.nextTime > now + MAX_AHEAD_S) this.nextTime = now + LEAD_S;
     source.onended = () => this.queued.delete(source);
     this.queued.add(source);
@@ -81,6 +89,11 @@ export class ArcadeSpeaker {
    *  stop what is already queued, so the next game starts a fresh queue. */
   clear(): void {
     this.count = 0;
+    this.stopQueued();
+    this.nextTime = 0;
+  }
+
+  private stopQueued(): void {
     for (const source of this.queued) {
       try {
         source.stop();
@@ -89,7 +102,6 @@ export class ArcadeSpeaker {
       }
     }
     this.queued.clear();
-    this.nextTime = 0;
   }
 
   close(): void {

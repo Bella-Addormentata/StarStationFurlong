@@ -3,8 +3,8 @@
  * they draw straight onto a cabinet's screen at whatever shape it is (the
  * double-wide cabinet's two tubes make one 8:3 screen) and seat as many
  * players as the cabinet has panels. Each is a pure, deterministic game
- * (create, step on the pads, fingerprint, restore from a save) and a
- * painter; arcadeNativeSession.ts runs it for the room the way
+ * (create, step on the pads, fingerprint, restore from a save), a painter
+ * and a sound chip; arcadeNativeSession.ts runs it for the room the way
  * arcadeNesSession.ts runs a ROM: only pad bytes travel.
  *
  * They are the app's own code, under the app's licence, so the cabinet's
@@ -13,9 +13,10 @@
 
 import {
   LR_REV, LR_SEATS, LR_VIEW_H, LR_VIEW_W, checkLanternRoad, createLanternRoad, restoreLanternRoad, stepLanternRoad,
-  type LrState,
+  type LrCue, type LrState,
 } from './games/lanternRoad';
 import { paintLanternRoad, paintLanternRoadScores, paintLanternRoadTitle } from './lanternRoadPaint';
+import { createLanternRoadSound } from './lanternRoadSound';
 
 /** What the session lays over a game's own picture. */
 export interface NativeHud {
@@ -29,7 +30,15 @@ export interface NativeBoardLine {
   score: number;
 }
 
-export interface NativeGame<S = unknown> {
+/** A game's sound chip, for the page at the cabinet: the session feeds it
+ *  every frame it runs and hands its samples to the cabinet's speaker. */
+export interface NativeSound<S = unknown, C = unknown> {
+  /** Render one frame of sound (1/60 s): the state after the frame and the
+   *  cues the frame collected, as stereo samples (−1..1) into `push`. */
+  frame(state: S, cues: readonly C[], push: (left: number, right: number) => void): void;
+}
+
+export interface NativeGame<S = unknown, C = unknown> {
   /** Stable id: what a cabinet's record names (arcadeDoc `bundled`). */
   id: string;
   /** The rules' revision: a match names its game by both (nativeMatchGame). */
@@ -45,8 +54,12 @@ export interface NativeGame<S = unknown> {
   lines: readonly [number, number];
   /** The game at its first frame. Every copy gets the same seed. */
   create(seed: number): S;
-  /** One frame on every seat's pad (seat 0 first). Mutates the state. */
-  step(state: S, pads: readonly number[]): void;
+  /** One frame on every seat's pad (seat 0 first). Mutates the state. What
+   *  happened in it that makes a sound goes on `cues`, if given: the state
+   *  comes out the same with or without. */
+  step(state: S, pads: readonly number[], cues?: C[]): void;
+  /** The game's sound chip at `sampleRate`, for the page at the cabinet. */
+  sound(sampleRate: number): NativeSound<S, C>;
   /** A 6-bit fingerprint: copies in step compare these. */
   check(state: S): number;
   /** A save state as a peer sent it (JSON), or null if it isn't one. */
@@ -65,7 +78,7 @@ export interface NativeGame<S = unknown> {
   ): void;
 }
 
-const LANTERN_ROAD: NativeGame<LrState> = {
+const LANTERN_ROAD: NativeGame<LrState, LrCue> = {
   id: 'lantern-road',
   rev: LR_REV,
   title: 'LANTERN ROAD',
@@ -75,6 +88,7 @@ const LANTERN_ROAD: NativeGame<LrState> = {
   lines: [LR_VIEW_W, LR_VIEW_H],
   create: createLanternRoad,
   step: stepLanternRoad,
+  sound: (sampleRate) => createLanternRoadSound(sampleRate),
   check: checkLanternRoad,
   restore: restoreLanternRoad,
   scores: (s) => s.players.map((p) => (p.on ? p.score : null)),
