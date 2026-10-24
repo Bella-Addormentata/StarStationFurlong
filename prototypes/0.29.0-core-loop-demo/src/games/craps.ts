@@ -113,7 +113,7 @@ export interface CrapsTableState {
   /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
    *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
   lastShooter?: string;
-  /** 🧾 This table's incarnation (casinoDoc newTableInc), kept roll to roll:
+  /** 🧾 This table's incarnation (casinoDoc tableIncFor), kept roll to roll:
    *  a table set up again under the same id pays its own rolls. */
   inc?: string;
   /** ⚖️ This round's seed commitments (see SeedRoundFields). */

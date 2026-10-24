@@ -35,12 +35,12 @@ import {
   clearTableKeys,
   creditTableOutcome,
   feltStake,
-  newTableInc,
   readAllBets,
   readCroupierBeat,
   readFeltStakes,
   readTableOperatorLease,
   readTableState,
+  tableIncFor,
   transactCasino,
   writeCroupierBeat,
   writeTableOperatorLease,
@@ -375,7 +375,7 @@ export function openBetting(tableId: string, round: number): void {
     resultAt: 0,
     payouts: null,
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
-    inc: readTableState(tableId)?.inc ?? newTableInc(),
+    inc: readTableState(tableId)?.inc ?? tableIncFor(tableId),
   });
 }
 

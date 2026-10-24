@@ -33,13 +33,13 @@ import {
   casinoDocEpoch,
   clearTableKeys,
   creditTableOutcome,
-  newTableInc,
   readAllCrapsBets,
   readCrapsFairnessPref,
   readCrapsTableState,
   readDiceThrow,
   readFeltStakes,
   readSeats,
+  tableIncFor,
   transactCasino,
   writeCrapsTableState,
   writeDiceThrow,
@@ -144,7 +144,7 @@ export function openCrapsBetting(
     ...(lastShooter !== undefined ? { lastShooter } : {}),
     fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
-    inc: readCrapsTableState(tableId)?.inc ?? newTableInc(),
+    inc: readCrapsTableState(tableId)?.inc ?? tableIncFor(tableId),
   });
 }
 

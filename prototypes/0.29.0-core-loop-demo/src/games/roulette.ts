@@ -78,7 +78,7 @@ export interface RouletteTableState {
   /** ⚖️ Voided: the house seed couldn't be revealed, so no pocket and every
    *  stake was returned. */
   voided?: boolean;
-  /** 🧾 This table's incarnation (casinoDoc newTableInc), kept round to round:
+  /** 🧾 This table's incarnation (casinoDoc tableIncFor), kept round to round:
    *  a table set up again under the same id pays its own rounds. */
   inc?: string;
 }

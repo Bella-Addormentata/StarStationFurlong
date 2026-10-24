@@ -23,7 +23,8 @@
  *                                        what a craps settle left up
  *                                        (stickman-written)
  *   gone:<tableId>:<inc>      → 1        that incarnation of the table was
- *                                        removed (clearTableKeys)
+ *                                        removed (clearTableKeys); the bare
+ *                                        `gone:<tableId>:` counts removals
  *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
  *   throw:<tableId>           → DiceThrow (the shooter's fling, or the
  *                                        stickman's when it throws for them)
@@ -106,6 +107,8 @@
  */
 
 import * as Y from 'yjs';
+import { sha256 } from '@noble/hashes/sha256';
+import { bytesToHex } from '@noble/hashes/utils';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { isCrapsBet, isCrapsTableState, isTableIncField, MAX_BET_AMOUNT, MAX_BETS_PER_PLAYER } from './games/craps';
@@ -494,7 +497,7 @@ const MAX_TABLE_OUTCOME = Number.MAX_SAFE_INTEGER - TABLE_RECORD_FULL;
  * to it unless it already names this outcome, and of two written at once the
  * doc keeps one, so the player is paid for one outcome, never both. The
  * removal is the last outcome: once paid, nothing more from that table is.
- * `inc` is the table's incarnation (newTableInc), so a table set up again
+ * `inc` is the table's incarnation (tableIncFor), so a table set up again
  * under the same id has a record of its own. A record whose stored total has
  * reached TABLE_RECORD_FULL takes no more: the next outcome goes on in the
  * next record of the chain (`~1`, `~2`…). Full is read from the stored total
@@ -530,11 +533,21 @@ export function creditTableOutcome(
   });
 }
 
-/** A fresh table incarnation, given when a table's first round opens (and to a
- *  table from an earlier build at its next): names its outcomes for
- *  creditTableOutcome. */
-export function newTableInc(): string {
-  return Math.random().toString(36).slice(2, 12);
+/** The incarnation a table takes when its first round opens (and a table
+ *  from an earlier build at its next): it names the table's outcomes for
+ *  creditTableOutcome and the lists put down on it. It is drawn from the
+ *  table and the record of its removals (its `gone:` marks), not at random:
+ *  two pages opening the same table at once, before either hears of the
+ *  other, name it alike, so what each pays meets on one record, as their
+ *  states meet on one key; a table put back after a removal is a new one. */
+export function tableIncFor(tableId: string): string {
+  const map = ensureMap();
+  const prefix = `gone:${tableId}:`;
+  const removals = [...map.entries()].filter(([key]) => key.startsWith(prefix))
+    .map(([key, value]): [string, unknown] => [key.slice(prefix.length), value])
+    .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+  const named = `ssf-table-inc-v1|${tableId}|${JSON.stringify(removals)}`;
+  return bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
 }
 
 /** Every chip record in the bound room (one per page per account), oldest
@@ -632,10 +645,14 @@ export function clearTableKeys(tableId: string): void {
     // build put down on one of those carries none either (ofIncarnation). No
     // mark for a table this page never saw up (a page leaving a room for one
     // without it reconciles the old room's tables away).
+    // The bare mark counts the removals, so a table whose state an earlier
+    // build rewrote without one names a new incarnation once put back
+    // (tableIncFor).
     const was = map.get(`table:${tableId}`);
     if (isRouletteTableState(was) || isCrapsTableState(was)) {
       if (was.inc !== undefined) map.set(goneKey(tableId, was.inc), 1);
-      map.set(goneKey(tableId, ''), 1);
+      const count = map.get(goneKey(tableId, ''));
+      map.set(goneKey(tableId, ''), (Number.isSafeInteger(count) ? count as number : 0) + 1);
     }
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
