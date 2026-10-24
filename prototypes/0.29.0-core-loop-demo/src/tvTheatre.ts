@@ -41,6 +41,9 @@ import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
 import { attachScreenHost, detachScreenHost, setScreenHostShown } from './tvScreenLayer';
 import type { TvScreenHandle } from './devices';
+import {
+  autoFetchOn, autoFetchVerdict, noteAutoFetch, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX,
+} from './tvAutoFetch';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
 
@@ -796,12 +799,16 @@ function theatreTick(rtt: () => number): void {
       showConsentNotice(t, rec.source!, consent);
     } else if (rec.source!.kind === 'blob' && t.mounted !== key && t.mounted !== `failed:${key}`) {
       // The file is played once this viewer's node holds all of it; until
-      // then the notice says where it is, and FETCH is the viewer's press.
-      // No mount budget: the bytes are already on this machine, and the
-      // transfer that put them there was asked for by a press.
+      // then the notice says where it is, and the node is asked for it by
+      // AUTO-FETCH within the viewer's cap, budget and switch, else by the
+      // viewer's FETCH. No mount budget: the bytes are already on this
+      // machine, and the transfer that put them there was bounded by those.
       const st = blobState(rec.source!.hash);
       if (st.state === 'complete') mountPlayer(t, rec.source!, key, rtt);
-      else showBlobNotice(t, rec.source!, st);
+      else {
+        autoFetch(rec.source!, st);
+        showBlobNotice(t, rec.source!, st);
+      }
     } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
       // A URL on a host the viewer accepted is asked about before anything
       // fetches it (tvConsent needsRedirectProbe / probeRedirect): a CORS
@@ -890,6 +897,30 @@ function startRedirectProbe(t: Theatre, url: string, key: string): void {
  *  for (the node's own words: not connected to the holder, no quota). */
 let blobAskRefused: { hash: string; why: string } | null = null;
 
+/** The file AUTO-FETCH last asked for: no second is asked for while it is
+ *  still on its way. */
+let autoFetching: string | null = null;
+
+/** 📦 AUTO-FETCH (tvAutoFetch): a file this viewer's node has never been
+ *  asked for ('none') is asked for without a press, within the viewer's cap,
+ *  budget and switch, once per file per page. A transfer that failed keeps
+ *  its FETCH button and its reason, and one still unknown waits for the
+ *  node's answer. */
+function autoFetch(source: Extract<TvSource, { kind: 'blob' }>, st: BlobState): void {
+  if (st.state !== 'none') return;
+  if (autoFetching !== null && autoFetching !== source.hash) {
+    const prev = blobState(autoFetching).state;
+    if (prev === 'queued' || prev === 'fetching') return;
+  }
+  if (autoFetchVerdict(source.hash, source.size) !== 'go') return;
+  noteAutoFetch(source.hash, source.size);
+  autoFetching = source.hash;
+  void fetchBlob(source.hash, source.size, source.provider, source.mime ?? '').then((refused) => {
+    // Kept for the notice the next tick draws: FETCH, with why.
+    blobAskRefused = refused ? { hash: source.hash, why: refused } : null;
+  });
+}
+
 /** 📦 A blob this viewer's node does not hold whole yet: where it is, and
  *  FETCH — the press that asks the viewer's own node to take it from the
  *  node that put it on (blobLane.ts). `st` null: no node to ask. */
@@ -911,7 +942,7 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
   }
   if (st.state === 'queued' || st.state === 'fetching') {
     const pct = st.size > 0 ? Math.min(100, Math.floor((st.have / st.size) * 100)) : 0;
-    showNotice(t, `<div>📦 FETCHING · ${pct}%</div>
+    showNotice(t, `<div>📦 FETCHING · ${pct}%${autoFetching === source.hash ? ' · AUTO-FETCH' : ''}</div>
       <div class="tv-theatre-lane">${escapeHtml(formatBytes(st.have))} of ${escapeHtml(size)} from ${escapeHtml(from)}, every byte checked against the file's hash — it plays when the last one is in</div>`);
     return;
   }
@@ -922,8 +953,17 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
   void refreshHolders([source.hash]);
   const why = st.state === 'failed' ? st.why || 'no reason given' : blobAskRefused?.hash === source.hash ? blobAskRefused.why : '';
   const failed = why ? `<div class="tv-theatre-lane">the last try stopped: ${escapeHtml(why)}</div>` : '';
+  // Why AUTO-FETCH has not taken it, or that it is asking: its ask is out
+  // until the node answers (FETCHING, or a refusal with why).
+  const verdict = autoFetchVerdict(source.hash, source.size);
+  const asking = autoFetching === source.hash && st.state === 'none' && !why;
+  const wait = asking || verdict === 'go' ? 'AUTO-FETCH is asking your node for it'
+    : verdict === 'off' ? 'AUTO-FETCH is off: nothing is fetched until you press'
+    : verdict === 'big' ? `it is bigger than the ${formatBytes(TV_AUTO_FETCH_MAX)} AUTO-FETCH takes by itself: nothing is fetched until you press`
+    : verdict === 'day' ? `AUTO-FETCH has taken its ${formatBytes(TV_AUTO_FETCH_DAY)} for today: nothing more is fetched until you press`
+    : 'nothing more is fetched until you press';
   const html = `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
-    <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk, kept until your node needs the room (the files used longest ago go first). Nothing is fetched until you press</div>
+    <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk, kept until your node needs the room (the files used longest ago go first). ${escapeHtml(wait)}</div>
     ${failed}
     <button type="button" data-tv-fetch="${escapeHtml(source.hash)}" data-tv-fetch-size="${source.size}" data-tv-fetch-from="${escapeHtml(source.provider)}">📦 FETCH ${escapeHtml(size)}</button>`;
   if (!t.notice.hidden && t.lastNotice === html) return;
@@ -1063,6 +1103,11 @@ function renderTheatreChrome(t: Theatre): void {
     mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
     mine && seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
     mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
+    // Every viewer's own switch, for a file from a member's node.
+    rec.source?.kind === 'blob'
+      ? btn(`data-tv-autofetch="1" aria-pressed="${autoFetchOn()}"`, autoFetchOn() ? '📦 AUTO-FETCH: ON' : '📦 AUTO-FETCH: OFF',
+        `Take a file shown on a TV without a press: up to ${formatBytes(TV_AUTO_FETCH_MAX)} a file and ${formatBytes(TV_AUTO_FETCH_DAY)} a day`)
+      : '',
     // archive.org's own player takes no volume from us: the set's level
     // drives every other player; theirs is adjusted inside the frame. And
     // a frame that never loaded gives no sign of it: RELOAD is the retry.
@@ -1097,6 +1142,10 @@ function renderTheatreChrome(t: Theatre): void {
     c.querySelector<HTMLButtonElement>('[data-tv-back]')?.addEventListener('click', () => { tvSeek(t.itemId, Math.max(0, pos() - 10_000)); });
     c.querySelector<HTMLButtonElement>('[data-tv-fwd]')?.addEventListener('click', () => { tvSeek(t.itemId, pos() + 10_000); });
     c.querySelector<HTMLButtonElement>('[data-tv-stop]')?.addEventListener('click', () => { tvStop(t.itemId); });
+    c.querySelector<HTMLButtonElement>('[data-tv-autofetch]')?.addEventListener('click', () => {
+      setAutoFetchOn(!autoFetchOn());
+      renderTheatreChrome(t);
+    });
     c.querySelector<HTMLButtonElement>('[data-tv-pickup]')?.addEventListener('click', () => { pickUpRemote(t.itemId); });
     c.querySelector<HTMLInputElement>('[data-tv-volume]')?.addEventListener('change', (e) => {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));

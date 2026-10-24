@@ -1,0 +1,93 @@
+/**
+ * 📦 tvAutoFetch — FETCH without a press, within the viewer's cap, budget and
+ * switch, once per file per page; and what a browser without storage keeps.
+ */
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  autoFetchOn, autoFetchSpent, autoFetchVerdict, noteAutoFetch, resetAutoFetchForTest, setAutoFetchOn,
+  TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX, TV_AUTO_FETCH_WINDOW_MS,
+} from './tvAutoFetch';
+
+const store = new Map<string, string>();
+let throwing = false;
+(globalThis as { localStorage?: unknown }).localStorage = {
+  getItem: (k: string) => { if (throwing) throw new Error('blocked'); return store.get(k) ?? null; },
+  setItem: (k: string, v: string) => { if (throwing) throw new Error('blocked'); store.set(k, v); },
+  removeItem: (k: string) => { store.delete(k); },
+};
+
+const GB = 2 ** 30;
+const hash = (n: number) => n.toString(16).padStart(64, '0');
+
+beforeEach(() => {
+  store.clear();
+  throwing = false;
+  resetAutoFetchForTest();
+});
+
+describe('AUTO-FETCH', () => {
+  it('is on by default, and the viewer\'s switch turns it off and on again', () => {
+    expect(autoFetchOn()).toBe(true);
+    expect(autoFetchVerdict(hash(1), GB)).toBe('go');
+    setAutoFetchOn(false);
+    expect(autoFetchOn()).toBe(false);
+    expect(autoFetchVerdict(hash(1), GB)).toBe('off');
+    setAutoFetchOn(true);
+    expect(autoFetchVerdict(hash(1), GB)).toBe('go');
+  });
+
+  it('takes a file up to the cap, never one past it or of a size no file has', () => {
+    expect(autoFetchVerdict(hash(1), TV_AUTO_FETCH_MAX)).toBe('go');
+    expect(autoFetchVerdict(hash(1), TV_AUTO_FETCH_MAX + 1)).toBe('big');
+    expect(autoFetchVerdict(hash(1), -1)).toBe('big');
+    expect(autoFetchVerdict(hash(1), 1.5)).toBe('big');
+  });
+
+  it('asks for each file once per page, and keeps to the day\'s budget, which refills as a day passes', () => {
+    const t0 = 1_800_000_000_000;
+    noteAutoFetch(hash(1), 2 * GB, t0);
+    expect(autoFetchVerdict(hash(1), 2 * GB, t0)).toBe('asked'); // a failure is not retried by itself
+    noteAutoFetch(hash(2), 2 * GB, t0 + 1);
+    noteAutoFetch(hash(3), 2 * GB, t0 + 2);
+    expect(autoFetchSpent(t0 + 3)).toBe(6 * GB);
+    expect(autoFetchVerdict(hash(4), 2 * GB, t0 + 3)).toBe('go'); // exactly the day's 8 GB
+    noteAutoFetch(hash(4), 2 * GB, t0 + 3);
+    expect(autoFetchVerdict(hash(5), 1, t0 + 4)).toBe('day');
+    expect(autoFetchSpent(t0 + 4)).toBe(TV_AUTO_FETCH_DAY);
+    // A day after the first: its 2 GB are free again.
+    expect(autoFetchVerdict(hash(5), 2 * GB, t0 + TV_AUTO_FETCH_WINDOW_MS)).toBe('go');
+    expect(autoFetchSpent(t0 + TV_AUTO_FETCH_WINDOW_MS)).toBe(6 * GB);
+  });
+
+  it('shares the switch and the budget through storage (another tab of this browser), and reads garbage there as nothing spent', () => {
+    const t0 = 1_800_000_000_000;
+    noteAutoFetch(hash(1), 7 * GB, t0);
+    resetAutoFetchForTest(); // another page: its own asks, the browser's budget
+    expect(autoFetchVerdict(hash(1), GB, t0 + 1)).toBe('go');
+    expect(autoFetchVerdict(hash(2), GB + 1, t0 + 1)).toBe('day');
+    store.set('ssf-tv-auto-fetch', '0');
+    expect(autoFetchOn()).toBe(false);
+    store.set('ssf-tv-auto-fetch-spent', 'not json');
+    store.delete('ssf-tv-auto-fetch');
+    expect(autoFetchSpent(t0)).toBe(0);
+    store.set('ssf-tv-auto-fetch-spent', JSON.stringify([{ at: t0, size: -5 }, { at: 'x', size: GB }, null, { at: t0, size: GB }]));
+    expect(autoFetchSpent(t0)).toBe(GB);
+  });
+
+  it('a clock set back still counts what was fetched: a spend stamped ahead of now is never forgotten early', () => {
+    const t0 = 1_800_000_000_000;
+    noteAutoFetch(hash(1), 8 * GB, t0);
+    expect(autoFetchVerdict(hash(2), 1, t0 - 60 * 60 * 1000)).toBe('day');
+  });
+
+  it('holds for the page where storage throws (a private window): on by default, the switch and the spend kept in memory', () => {
+    throwing = true;
+    expect(autoFetchOn()).toBe(true);
+    setAutoFetchOn(false);
+    expect(autoFetchOn()).toBe(false);
+    setAutoFetchOn(true);
+    const t0 = 1_800_000_000_000;
+    noteAutoFetch(hash(1), 8 * GB, t0);
+    expect(autoFetchVerdict(hash(2), 1, t0 + 1)).toBe('day');
+  });
+});
