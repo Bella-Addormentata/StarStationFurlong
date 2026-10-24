@@ -410,9 +410,16 @@ export function tvTheatreItemId(): string | null {
 }
 
 export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(itemId)): void {
+  // The phone's WATCH slides the phone away without blurring the button:
+  // a control left focused offscreen would take the next Space (WATCH
+  // again) or, a field, the world's keys. Only a phone already put away:
+  // an automatic open never takes focus from a phone in use.
+  const phone = document.getElementById('spacephone-container');
+  const focused = document.activeElement;
+  if (phone && !phone.classList.contains('active') && focused instanceof HTMLElement && phone.contains(focused)) focused.blur();
   if (theatre && theatre.itemId !== itemId) closeTvTheatre();
   if (theatre) return;
-  if (dismissed?.itemId === itemId) dismissed = null; // a WATCH is this viewer asking again
+  dismissed.delete(itemId); // a WATCH is this viewer asking again
   // The bar: the set's name and programme, the notices (a consent ask,
   // FETCH, TAP TO PLAY), where the room is and the controls. Not a dialog
   // and not modal: the world goes on around it, keys and clicks included.
@@ -420,6 +427,10 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
   root.id = 'tv-theatre';
   root.setAttribute('role', 'region');
   root.setAttribute('aria-label', 'Television (T: to the controls, Escape: back to the world)');
+  // A key typed on the bar is the bar's, past the helm's flight stick too
+  // (freeFlightStick): Space on a focused button presses it rather than
+  // braking the ship. barKeys keeps such keys from input.ts.
+  root.dataset.stickAside = '1';
   root.innerHTML = `
     <div class="tv-theatre-panel">
       <div class="tv-theatre-head"></div>
@@ -431,7 +442,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
   // window and would walk the player or wake a device behind it.
   root.addEventListener('click', (e) => e.stopPropagation());
   document.body.appendChild(root);
-  const onKey = (e: KeyboardEvent) => barKeys(root, e);
+  const onKey = (e: KeyboardEvent) => barKeys(root, e, () => (theatre?.root === root ? embedControls(theatre) : []));
   window.addEventListener('keydown', onKey, true);
   theatre = {
     root,
@@ -473,7 +484,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
  *  nor eat a button's own Enter or Space; Tab and Shift+Tab move along the
  *  bar, and Escape hands the keys back to the world. Keyups are never held,
  *  so a key held as focus moved is still released to the world. */
-function barKeys(root: HTMLElement, e: KeyboardEvent): void {
+function barKeys(root: HTMLElement, e: KeyboardEvent, extra: () => HTMLElement[] = () => []): void {
   const target = e.target instanceof Node ? e.target : null;
   if (target && root.contains(target)) {
     e.stopPropagation();
@@ -481,7 +492,7 @@ function barKeys(root: HTMLElement, e: KeyboardEvent): void {
       (document.activeElement as HTMLElement | null)?.blur?.();
     } else if (e.key === 'Tab') {
       e.preventDefault();
-      const focusable = theatreFocusable(root);
+      const focusable = [...theatreFocusable(root), ...extra()];
       if (focusable.length === 0) return;
       const at = focusable.indexOf(document.activeElement as HTMLElement);
       const next = e.shiftKey
@@ -505,6 +516,13 @@ function barKeys(root: HTMLElement, e: KeyboardEvent): void {
   first.focus();
 }
 
+/** archive.org's own player, laid on the set: its volume and its controls
+ *  are inside its frame (the adapter has no API), so the frame takes the
+ *  pointer and comes last in the bar's Tab order. Nothing for other sources. */
+function embedControls(t: Theatre): HTMLElement[] {
+  return t.player instanceof ArchiveEmbedAdapter ? [...t.screen.querySelectorAll<HTMLElement>('iframe')] : [];
+}
+
 /** The bar's controls in order: its buttons and the volume slider. */
 function theatreFocusable(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')];
@@ -512,7 +530,7 @@ function theatreFocusable(root: HTMLElement): HTMLElement[] {
 
 /** The programme this viewer turned off with ✕ (the set, and the record's
  *  `started`): the room tick does not turn it back on by itself. */
-let dismissed: { itemId: string; started: number } | null = null;
+const dismissed = new Map<string, number>();
 
 /** Take the picture off the set and the bar down. `byViewer`: the ✕ on the
  *  bar, which keeps this programme off until the next one or a WATCH. */
@@ -520,7 +538,7 @@ export function closeTvTheatre(byViewer = false): void {
   if (!theatre) return;
   const t = theatre;
   theatre = null;
-  if (byViewer) dismissed = { itemId: t.itemId, started: readTv(t.itemId).started };
+  if (byViewer) dismissed.set(t.itemId, readTv(t.itemId).started);
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
   const hadFocus = t.root.contains(document.activeElement);
@@ -602,7 +620,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
   // the screen once it is adopted.
   const set = screenProvider(t.itemId) ?? null;
   const textured = asTexture(source);
-  if (set && !textured) attachScreenHost(t.screen, set.plane, set.planeW, set.planeH);
+  if (set && !textured) attachScreenHost(t.screen, set.plane, set.planeW, set.planeH, source.kind === 'archive' && !sourceFileUrl(source));
   else parkingLot().appendChild(t.screen);
   const adopt = (player: Adapter) => {
     if (!live()) {
@@ -1083,26 +1101,24 @@ export function updateTvChip(itemIds: readonly string[]): void {
   let label = '';
   let target = '';
   if (!theatre) {
+    // A set in the room with something on shows it: the theatre opens by
+    // itself on the first such set, putting the picture on it, unless this
+    // viewer turned that set's programme off (✕) — a dismissal per set,
+    // gone with the programme or a WATCH. Otherwise the chip offers WATCH.
     for (const id of itemIds) {
       const rec = readTv(id);
       if (!rec.source || rec.state === 'off' || rec.state === 'home') continue;
+      if (chipOpen && dismissed.get(id) !== rec.started) {
+        chipOpen(id);
+        if (theatre) return;
+      }
+      if (target) continue;
       const pb = readPlayback(id);
       const what = sourceLabel(rec.source).toUpperCase();
       label = pb.state === 'scheduled'
         ? `📺 ${what} · ${countdownText(pb.countdownMs)} · WATCH`
         : pb.state === 'paused' ? `📺 ${what} · PAUSED · WATCH` : `📺 NOW ON: ${what} · WATCH`;
       target = id;
-      break;
-    }
-  }
-  // A set in the room with something on shows it: the theatre opens by
-  // itself, putting the picture on the set, unless this viewer turned this
-  // programme off (✕) — then the chip offers WATCH until the next one.
-  if (target && chipOpen) {
-    const started = readTv(target).started;
-    if (!(dismissed && dismissed.itemId === target && dismissed.started === started)) {
-      chipOpen(target);
-      if (theatre) return;
     }
   }
   const key = label ? `${target}|${label}` : '';

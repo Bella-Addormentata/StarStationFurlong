@@ -54,8 +54,10 @@ function camera(): THREE.Camera | null {
 
 /** Lay `host` (which the adapter fills with its iframe) on `plane`, a
  *  `planeW` × `planeH` metre screen facing +z. One picture at a time: a
- *  second call moves the layer to the new host. */
-export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, planeW: number, planeH: number): void {
+ *  second call moves the layer to the new host. `interactive`: the picture
+ *  takes the pointer (archive.org's embed, whose volume and controls are
+ *  only inside its frame); otherwise clicks go through to the world. */
+export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, planeW: number, planeH: number, interactive = false): void {
   detachScreenHost();
   host.style.width = `${HOST_W}px`;
   host.style.height = `${HOST_H}px`;
@@ -73,8 +75,8 @@ export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, plane
   const object = new CSS3DObject(host);
   // CSS3DObject sets its element's pointer events back to `auto`: the
   // picture takes none, or it would catch the world's clicks and offer the
-  // embed's own controls.
-  host.style.pointerEvents = 'none';
+  // embed's own controls — unless those controls are the only ones.
+  host.style.pointerEvents = interactive ? 'auto' : 'none';
   object.matrixAutoUpdate = false;
   scene.add(object);
   const onResize = () => renderer.setSize(window.innerWidth, window.innerHeight);
