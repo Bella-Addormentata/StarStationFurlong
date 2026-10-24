@@ -393,6 +393,25 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
   });
 
+  it('picked up in an empty room on LOOP, the headless beat takes the room on from the lap it is on, not from the top', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tvSetLoop(TV, true);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV); // the holder leaves: nobody runs the laps
+    const started = readTv(TV).started;
+    now += 100_000; // 150 s of a 60 s film: 30 s into its third lap
+    setTvPageId('B');
+    setTvIdentity(() => ({ pub: 'BBBBbob', name: 'Bob' }));
+    pickUpRemote(TV); // from the phone, no theatre open
+    tickTvRoom([TV], now);
+    expect(readTv(TV)).toMatchObject({ state: 'playing', started, positionMs: 30_000 });
+    run(3_000);
+    expect(readTv(TV)).toMatchObject({ state: 'playing', started });
+    expect(readPlayback(TV, now).positionMs).toBe(33_000);
+  });
+
   it('a clip that laps on every theatre tick still has its end filed, so the headless beat loops it on once the theatre closes', () => {
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/blip.mp4' });

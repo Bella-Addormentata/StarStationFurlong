@@ -1357,6 +1357,86 @@ describe('🔁 LOOP, through the record', () => {
     expect(p.playing).toBe(true);
   });
 
+  it('with nobody holding the remote, a viewer at the end of a LOOP film plays the lap the room works out for itself', () => {
+    // No holder writes the lap: the reading wraps into it (readPlayback),
+    // and nothing else moves — no new start, no transport write.
+    const p = new FakePlayer(true);
+    p.duration = 10_000;
+    const h = harness(p, { loopEnd: 10_000 });
+    h.set({ positionMs: 9_900, lap: 0 });
+    h.tick();
+    p.seek(10_000); // ran out
+    p.playing = false;
+    p.log.length = 0;
+    h.set({ positionMs: 300, lap: 1 });
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:300']);
+    expect(p.playing).toBe(true);
+    expect(p.ended).toBe(false);
+    // And a player still running past where the room wrapped is sent there
+    // too, the tick the lap begins.
+    p.position = 9_950;
+    p.log.length = 0;
+    h.set({ positionMs: 150, lap: 2 });
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:150']);
+  });
+
+  it('a clip shorter than the seek band laps too, with nobody holding the remote: each lap a replay the tick it begins', () => {
+    const p = new FakePlayer(true);
+    p.duration = 1_000;
+    const seeks = () => p.log.filter((l) => l.startsWith('seek'));
+    const h = harness(p, { loopEnd: 1_000 });
+    h.set({ positionMs: 900, lap: 0 });
+    h.tick();
+    p.seek(1_000); // ran out: 300 ms into the next lap is inside the band of the end
+    p.playing = false;
+    p.log.length = 0;
+    h.set({ positionMs: 300, lap: 1 });
+    h.tick(400);
+    expect(seeks()).toEqual(['seek:300']);
+    expect(p.playing).toBe(true);
+    expect(p.ended).toBe(false);
+    // The lap plays out, and the next is replayed as it begins.
+    p.position = 700;
+    h.set({ positionMs: 700, lap: 1 });
+    h.tick(400);
+    p.seek(1_000);
+    p.playing = false;
+    p.log.length = 0;
+    h.set({ positionMs: 100, lap: 2 });
+    h.tick(400);
+    expect(seeks()).toEqual(['seek:100']);
+    // Even one that ends again before a tick has seen it play: no cooldown.
+    p.seek(1_000);
+    p.playing = false;
+    p.log.length = 0;
+    h.set({ positionMs: 50, lap: 3 });
+    h.tick(400);
+    expect(seeks()).toEqual(['seek:50']);
+  });
+
+  it('a viewer left at the end by a holder who has gone replays the first lap the room works out for itself', () => {
+    const p = new FakePlayer(true);
+    p.duration = 1_000;
+    const h = harness(p, { loopEnd: 1_000 });
+    h.set({ positionMs: 900 });
+    h.tick();
+    p.seek(1_000);
+    p.playing = false;
+    // The holder's record runs on past the end: its lap is the holder's to
+    // write, and the player waits at the end for it.
+    h.set({ positionMs: 1_400 });
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.ended).toBe(true);
+    p.log.length = 0;
+    // Its remote goes quiet: the room is eight laps on, 200 ms into the next.
+    h.set({ positionMs: 200, lap: 8 });
+    h.tick(400);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:200']);
+    expect(p.playing).toBe(true);
+  });
+
   it('a lap\'s position comes from the media end the record carries, never from what this player can seek to', () => {
     expect(loopPosition(15_000, 60_000)).toBe(15_000); // a 60 s film, whatever prefix a host without ranges lets this player seek in
     expect(loopPosition(65_000, 60_000)).toBe(5_000);
