@@ -488,6 +488,19 @@ export function blobState(hash: string, now = performance.now()): BlobState {
   return known;
 }
 
+/** What this page's node says about `hash`, asked now rather than read
+ *  from the polled answers blobState keeps. */
+export async function blobStateNow(hash: string): Promise<BlobState> {
+  const url = HEX_64.test(hash) ? route('/api/blob/status', { hash }) : null;
+  if (!url) return { state: 'unknown' };
+  try {
+    const res = await fetch(url, { redirect: 'error' });
+    return parseState(res.ok ? await res.json() : null);
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
 /** What identifies the node a blob is read from now — its origin and its
  *  token's first digits — for the theatre's mount key: a node that changed
  *  under a mounted player is a new mount, not a stale `src`. '' without one. */

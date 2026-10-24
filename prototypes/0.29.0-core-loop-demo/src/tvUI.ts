@@ -26,8 +26,9 @@ import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
+import { readyForRoom } from './tvShrink';
 import {
-  blobLaneNodeId, blobLaneReady, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
+  blobLaneNodeId, blobLaneReady, blobLaneRoom, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
   refreshHeldBlobs, refreshHolders, setHostCopies, torrentLaneReady,
 } from './blobLane';
 import {
@@ -367,6 +368,20 @@ let feedbackNote = { text: '', at: 0 };
 function feedbackNow(): string {
   return feedbackNote.text && Date.now() - feedbackNote.at < FEEDBACK_MS ? feedbackNote.text : '';
 }
+
+/** What a PLAY or a schedule from the remote puts on: the source, the box
+ *  text it was read from, a torrent's origin for GET AGAIN, and the
+ *  original this node lets go once the room plays its copy (tvShrink.ts). */
+interface Shared {
+  source: TvSource;
+  text: string;
+  torrent?: TvTorrentOrigin;
+  drop?: string;
+}
+
+/** The chosen FILE being got ready for the room (tvShrink.ts): a PLAY
+ *  pressed again meanwhile waits for the same film. */
+let fileGettingReady: { got: Shared; room: string } | null = null;
 
 /** 🧲 The .torrent file the TORRENT tile has chosen, kept like pickedFile
  *  until a START takes it; and the file picked from the node's list. */
@@ -997,13 +1012,25 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   /** The box's link as a source, with the TEXT it was read from: an archive
    *  lookup can take seconds while the box stays editable, and the clear
    *  that follows a write must take only that text — not a newer link typed
-   *  meanwhile and never submitted. */
-  const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string; torrent?: TvTorrentOrigin } | null> => {
+   *  meanwhile and never submitted. A film from this page's node comes with
+   *  the original to `drop` once the room plays its copy. */
+  const sourceFromBox = async (id: string): Promise<Shared | null> => {
     // Every attempt supersedes the lookup before it, a refused or malformed
     // one included: a PLAY on a bad link must not let an older archive
     // lookup land its film after the refusal was shown.
     const gen = ++resolveGen;
-    if (activeTile === 'file') return sourceFromFile(id, gen);
+    if (activeTile === 'file') {
+      const waiting = !pickedFile && fileGettingReady?.room === blobLaneRoom() ? fileGettingReady : null;
+      const got = waiting?.got ?? (await sourceFromFile(id, gen));
+      if (!got) return null;
+      const mine = waiting ?? { got, room: blobLaneRoom() };
+      fileGettingReady = mine;
+      try {
+        return await readied(got, gen);
+      } finally {
+        if (fileGettingReady === mine && gen === resolveGen) fileGettingReady = null;
+      }
+    }
     if (activeTile === 'magnet') {
       // 🧲 PLAY takes the finished download, never the pasted magnet: the
       // room record only ever names the blob it became.
@@ -1021,7 +1048,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       }
       // The library keeps where it came from, for GET AGAIN; the programme
       // names only the blob.
-      return { source, text: '', torrent: torrentOrigin() ?? undefined };
+      return readied({ source, text: '', torrent: torrentOrigin() ?? undefined }, gen);
     }
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
@@ -1053,6 +1080,26 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback('No playable file found — using their embed (start-time sync only).');
     }
     return { source: parsed, text };
+  };
+
+  /** 🗜 A film from this page's node goes to the room as the copy this
+   *  machine makes of it first (tvShrink.ts), or as it is where there is
+   *  nothing to gain; the remote says only that it is getting it ready.
+   *  Voided by the next attempt from this remote, or a room change. */
+  const readied = async (got: Shared, gen: number): Promise<Shared | null> => {
+    if (got.source.kind !== 'blob') return got;
+    const name = got.source.title || 'the film';
+    const say = (done: number) => {
+      if (gen === resolveGen) feedback(`Getting ${name} ready for the room… ${Math.floor(done * 100)}% · it plays once it is ready, while the station stays open`);
+    };
+    say(0);
+    const ready = await readyForRoom(got.source, say);
+    if (!ready || gen !== resolveGen) return null;
+    return { ...got, source: ready.source, drop: ready.drop ?? undefined };
+  };
+  /** The room plays the copy now: its original leaves this node. */
+  const dropOriginal = (got: Shared) => {
+    if (got.drop) void forgetBlob(got.drop).then(() => refreshHeldBlobs());
   };
 
   /** 📦 The chosen file, handed to this page's node first: the record can
@@ -1174,7 +1221,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const r = tvPlay(id, got.source, undefined, got.torrent);
       feedback(r.ok ? `Now on: ${sourceLabel(got.source)}` : r.error);
       if (!r.ok && taken) giveBack(got.text);
-      if (r.ok) deps.openTheatre(id);
+      if (r.ok) {
+        dropOriginal(got);
+        deps.openTheatre(id);
+      }
     });
   });
   host.querySelectorAll<HTMLButtonElement>('[data-tv-schedule]').forEach((b) => b.addEventListener('click', () => {
@@ -1186,6 +1236,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const r = tvSchedule(id, got.source, Date.now() + minutes * 60_000, undefined, got.torrent);
       feedback(r.ok ? `Scheduled: ${sourceLabel(got.source)} in ${minutes} min` : r.error);
       if (!r.ok && taken) giveBack(got.text);
+      if (r.ok) dropOriginal(got);
     });
   }));
   // 📚 The library: its filters, its search, and its rows.
