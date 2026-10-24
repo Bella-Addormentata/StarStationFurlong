@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   acceptMediaOrigin, allowMount, consentRefusal, forgetMediaConsent, isPrivateHost, mayMountNow, mediaConsent, mediaOrigin,
   needsRedirectProbe, ownMediaOrigins, probeRedirect, redirectVerdict, setNodeMediaOrigin, setOwnMediaOrigins,
-  trustedNodeMediaOrigin, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS, urlConsent, urlRefusal,
+  trustedNodeMediaOrigin, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, TV_NODE_TRUST_MS, TV_VIEWER_MOUNT_BUDGET, urlConsent, urlRefusal,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
@@ -173,7 +173,7 @@ describe('the mount budget: consent per origin bounds nothing cumulative', () =>
     for (let i = 0; i < TV_MOUNT_BUDGET; i++) expect(mayMountNow('tv-1', t0 + i * 1_000)).toBe(true);
     expect(mayMountNow('tv-1', t0 + 7_000)).toBe(false); // a seventh programme inside the minute: PLAY, not a fetch
     expect(mayMountNow('tv-1', t0 + 8_000)).toBe(false); // asked every tick: still no, and nothing counted
-    expect(mayMountNow('tv-2', t0 + 8_000)).toBe(true); // another set has a budget of its own
+    expect(mayMountNow('tv-2', t0 + 8_000)).toBe(true); // another set has a budget of its own (inside the viewer's)
     allowMount('tv-1'); // PLAY: the next mount is the viewer's, and the window starts over
     expect(mayMountNow('tv-1', t0 + 9_000)).toBe(true);
     for (let i = 1; i < TV_MOUNT_BUDGET; i++) expect(mayMountNow('tv-1', t0 + 9_000 + i)).toBe(true);
@@ -182,6 +182,24 @@ describe('the mount budget: consent per origin bounds nothing cumulative', () =>
     expect(mayMountNow('tv-1', t0 + 9_000 + TV_MOUNT_WINDOW_MS)).toBe(true);
     forgetMediaConsent(); // leaving the room forgets the budget with the consents
     expect(mayMountNow('tv-1', t0 + 9_001 + TV_MOUNT_WINDOW_MS)).toBe(true);
+  });
+
+  it('bounds the viewer across sets: a fresh item id buys no fresh budget, and a PLAY press buys one window', () => {
+    const t0 = 2_000_000;
+    // A peer stopping one set and starting another, each under a new id:
+    // every set is inside its own budget, and the viewer's runs out.
+    for (let i = 0; i < TV_VIEWER_MOUNT_BUDGET; i++) expect(mayMountNow(`tv-${i}`, t0 + i * 1_000)).toBe(true);
+    expect(mayMountNow('tv-new', t0 + 20_000)).toBe(false);
+    expect(mayMountNow('tv-new', t0 + 21_000)).toBe(false); // asked every tick: still no, and nothing counted
+    allowMount('tv-new'); // PLAY on the set the viewer is shown: its mount, and the window starts over
+    expect(mayMountNow('tv-new', t0 + 22_000)).toBe(true);
+    for (let i = 1; i < TV_VIEWER_MOUNT_BUDGET; i++) expect(mayMountNow(`tv-more-${i}`, t0 + 23_000 + i)).toBe(true);
+    expect(mayMountNow('tv-yet-another', t0 + 24_000)).toBe(false); // one window per press
+    // A rate, never a lock: the window's first mount ages out, and one more fits.
+    expect(mayMountNow('tv-yet-another', t0 + 22_000 + TV_MOUNT_WINDOW_MS)).toBe(true);
+    expect(mayMountNow('tv-last', t0 + 22_000 + TV_MOUNT_WINDOW_MS)).toBe(false);
+    forgetMediaConsent(); // leaving the room forgets the viewer's window too
+    expect(mayMountNow('tv-last', t0 + 22_000 + TV_MOUNT_WINDOW_MS)).toBe(true);
   });
 });
 

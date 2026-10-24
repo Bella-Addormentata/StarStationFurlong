@@ -215,32 +215,46 @@ export async function probeRedirect(url: string, fetchImpl: typeof fetch = fetch
  *  its mounts age out, so the budget is a rate and never a lock. */
 export const TV_MOUNT_BUDGET = 6;
 export const TV_MOUNT_WINDOW_MS = 60_000;
+/** The same across every set this viewer is shown: the theatre opens on a
+ *  set that comes on by itself, so a peer who stops one set and starts
+ *  another under a fresh item id would otherwise buy a fresh budget each
+ *  time. Two sets' worth, so a viewer between two sets that are both being
+ *  flipped through is not stopped, and no number of sets buys more. */
+export const TV_VIEWER_MOUNT_BUDGET = 2 * TV_MOUNT_BUDGET;
 
 /** Per set: the monotonic times of the automatic mounts inside the window. */
 const mounts = new Map<string, number[]>();
+/** Every set's: the viewer-wide window, kept across set switches. */
+let viewerMounts: number[] = [];
 
-/** May the theatre mount a new source for `itemId` on its own at `now`? A
- *  yes is counted; a no counts nothing, so asking again every tick changes
- *  nothing until a mount ages out of the window or the viewer presses PLAY. */
+/** May the theatre mount a new source for `itemId` on its own at `now` — a
+ *  probe or a mount? A yes is counted, on the set and viewer-wide; a no
+ *  counts nothing, so asking again every tick changes nothing until a mount
+ *  ages out of the window or the viewer presses PLAY. */
 export function mayMountNow(itemId: string, now: number): boolean {
   const recent = (mounts.get(itemId) ?? []).filter((t) => now - t < TV_MOUNT_WINDOW_MS);
-  if (recent.length >= TV_MOUNT_BUDGET) {
+  viewerMounts = viewerMounts.filter((t) => now - t < TV_MOUNT_WINDOW_MS);
+  if (recent.length >= TV_MOUNT_BUDGET || viewerMounts.length >= TV_VIEWER_MOUNT_BUDGET) {
     mounts.set(itemId, recent);
     return false;
   }
   recent.push(now);
   mounts.set(itemId, recent);
+  viewerMounts.push(now);
   return true;
 }
 
-/** The viewer pressed PLAY on a set past its budget: the next mount is
- *  theirs, and the window starts over. */
+/** The viewer pressed PLAY on a set past its budget, the set's or their
+ *  own: the next mount is theirs, and both windows start over — a press
+ *  buys one window, and only the viewer can press. */
 export function allowMount(itemId: string): void {
   mounts.delete(itemId);
+  viewerMounts = [];
 }
 
 export function forgetMountBudget(): void {
   mounts.clear();
+  viewerMounts = [];
 }
 
 /** The origin a source's bytes come from. */

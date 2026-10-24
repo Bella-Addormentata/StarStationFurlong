@@ -27,7 +27,7 @@ import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
   readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
-  sourceLane, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
+  sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
@@ -118,6 +118,8 @@ class YouTubePlayerAdapter implements Adapter {
   private player: YtPlayerLike | null = null;
   private ready = false;
   private state = -1;
+  /** The browser refused playVideo() without a gesture: the bar shows TAP TO PLAY. */
+  private blocked = false;
   private readonly readyTimer: number;
 
   /** No `autoplay`: the controller starts the player when the record says,
@@ -125,11 +127,14 @@ class YouTubePlayerAdapter implements Adapter {
    *  applied the set's volume. With autoplay the iframe sounded at the
    *  player's own level for the tick before that, a set at volume 0
    *  included; and a countdown or a paused set must not sound at all. */
-  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void, autoplay = false) {
+  constructor(
+    host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void,
+    private onBlocked: () => void = () => undefined, private onUnblocked: () => void = () => undefined,
+  ) {
     const mount = document.createElement('div');
     host.appendChild(mount);
     const playerVars: Record<string, unknown> = {
-      autoplay: autoplay ? 1 : 0, playsinline: 1, rel: 0, enablejsapi: 1, modestbranding: 1,
+      autoplay: 0, playsinline: 1, rel: 0, enablejsapi: 1, modestbranding: 1,
     };
     // Bounded readiness, through the attempt-scoped failure path: an
     // adopted player that never reports ready would otherwise hide the
@@ -148,10 +153,27 @@ class YouTubePlayerAdapter implements Adapter {
       playerVars,
       events: {
         onReady: () => { this.ready = true; window.clearTimeout(this.readyTimer); },
-        onStateChange: (e: { data: number }) => { this.state = e.data; },
+        onStateChange: (e: { data: number }) => {
+          this.state = e.data;
+          if (e.data === 1) this.unblock();
+        },
         onError: (e: { data: number }) => onFail(`YouTube player error ${e.data}`),
+        // The browser held back the controller's playVideo() for want of a
+        // gesture (a viewer who walked into a room already playing): the
+        // frame takes no pointer and is in no Tab order, so the bar's TAP
+        // TO PLAY is the gesture, and its press calls playVideo again.
+        onAutoplayBlocked: () => {
+          if (this.blocked) return;
+          this.blocked = true;
+          this.onBlocked();
+        },
       },
     });
+  }
+  private unblock(): void {
+    if (!this.blocked) return;
+    this.blocked = false;
+    this.onUnblocked();
   }
   isReady(): boolean { return this.ready; }
   /** 1 = PLAYING, 3 = BUFFERING: both count as "going". */
@@ -528,9 +550,15 @@ function theatreFocusable(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')];
 }
 
-/** The programme this viewer turned off with ✕ (the set, and the record's
- *  `started`): the room tick does not turn it back on by itself. */
-const dismissed = new Map<string, number>();
+/** The programme this viewer turned off with ✕ (the set, the record's
+ *  `started`, and the room's doc it was in — another room may reuse the item
+ *  id and the counter): the room tick does not turn it back on by itself. */
+const dismissed = new Map<string, { started: number; epoch: number }>();
+
+function isDismissed(itemId: string, started: number): boolean {
+  const d = dismissed.get(itemId);
+  return d !== undefined && d.started === started && d.epoch === tvDocEpoch();
+}
 
 /** Take the picture off the set and the bar down. `byViewer`: the ✕ on the
  *  bar, which keeps this programme off until the next one or a WATCH. */
@@ -538,7 +566,7 @@ export function closeTvTheatre(byViewer = false): void {
   if (!theatre) return;
   const t = theatre;
   theatre = null;
-  if (byViewer) dismissed.set(t.itemId, readTv(t.itemId).started);
+  if (byViewer) dismissed.set(t.itemId, { started: readTv(t.itemId).started, epoch: tvDocEpoch() });
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
   const hadFocus = t.root.contains(document.activeElement);
@@ -652,6 +680,25 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
       });
     }
   };
+  // TAP TO PLAY: the browser refused to start the player without a gesture
+  // (a <video>'s play() rejected, YouTube's onAutoplayBlocked); the press is
+  // the gesture, and it asks the player again.
+  const blocked = () => {
+    if (!live()) return;
+    // The controller retries play() every tick while blocked: the notice
+    // (and the button under the finger) that is already up stays up.
+    if (!t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) return;
+    showNotice(t, `<button type="button" data-tv-tap="1">▶ TAP TO PLAY</button>
+      <div class="tv-theatre-lane">your browser wants a tap before sound</div>`);
+    t.notice.querySelector<HTMLButtonElement>('[data-tv-tap]')?.addEventListener('click', () => {
+      hideNotice(t);
+      t.player?.play();
+    });
+  };
+  const unblocked = () => {
+    // The browser let the sound through after all: the notice comes down.
+    if (live() && !t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) hideNotice(t);
+  };
   if (source.kind === 'youtube') {
     showNotice(t, `<div>REACHING YOUTUBE…</div><div class="tv-theatre-lane">CONVENIENCE LANE</div>`);
     loadYouTubeApi().then(
@@ -660,7 +707,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
         // loaded: build no iframe for it — adopt() would destroy one, but
         // the constructor had already inserted it and started its load.
         if (!live()) return;
-        adopt(new YouTubePlayerAdapter(t.screen, source.videoId, yt, fail));
+        adopt(new YouTubePlayerAdapter(t.screen, source.videoId, yt, fail, blocked, unblocked));
       },
       (err: Error) => fail(err.message || 'YouTube is unreachable'),
     );
@@ -668,21 +715,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
   }
   const url = source.kind === 'blob' ? blobUrl(source.hash) : sourceFileUrl(source);
   if (url) {
-    adopt(new HtmlVideoPlayerAdapter(t.screen, url, fail, () => {
-      if (!live()) return;
-      // The controller retries play() every tick while blocked: the notice
-      // (and the button under the finger) that is already up stays up.
-      if (!t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) return;
-      showNotice(t, `<button type="button" data-tv-tap="1">▶ TAP TO PLAY</button>
-        <div class="tv-theatre-lane">your browser wants a tap before sound</div>`);
-      t.notice.querySelector<HTMLButtonElement>('[data-tv-tap]')?.addEventListener('click', () => {
-        hideNotice(t);
-        t.player?.play();
-      });
-    }, () => {
-      // The browser let the sound through after all: the notice comes down.
-      if (live() && !t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) hideNotice(t);
-    }, textured));
+    adopt(new HtmlVideoPlayerAdapter(t.screen, url, fail, blocked, unblocked, textured));
     return;
   }
   if (source.kind === 'archive') {
@@ -783,8 +816,10 @@ function theatreTick(rtt: () => number): void {
       // could rotate shape-valid sources on this viewer's own node — or
       // query strings on an accepted host — and have every open theatre
       // fetch each in turn without end. So every request this theatre makes
-      // on its own, a probe as much as a mount, is counted per set
-      // (tvConsent mayMountNow); a probe's unit covers the mount its
+      // on its own, a probe as much as a mount, is counted per set and
+      // across every set this viewer is shown — the theatre opens by itself
+      // on a set that comes on, so a new set is no new budget (tvConsent
+      // mayMountNow); a probe's unit covers the mount its
       // verdict allows (budgetedKey), and past the budget what is on is
       // shown with PLAY — the press is the consent that spends the next.
       if (verdict === null) {
@@ -920,15 +955,16 @@ function showRedirectNotice(t: Theatre, source: TvSource, key: string): void {
     <div class="tv-theatre-lane">${escapeHtml(host || 'this host')} answers this link with a redirect, and your browser would follow it without saying where — paste the link it redirects to instead</div>`);
 }
 
-/** PLAY? — the set's automatic mounts for the minute are spent
- *  (tvConsent mayMountNow): what is on is shown, and the press mounts it. */
+/** PLAY? — the automatic mounts for the minute are spent, the set's or the
+ *  viewer's (tvConsent mayMountNow): what is on is shown, and the press
+ *  mounts it. */
 function showMountNotice(t: Theatre, source: TvSource, key: string): void {
   // The button under the finger stays — the same ask every tick is one ask —
   // but only for the SAME programme: the next source gets its own.
   const asking = t.notice.hidden ? null : t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]');
   if (asking && asking.dataset.tvMount === key) return;
   showNotice(t, `<div>▶ PLAY ${escapeHtml(sourceLabel(source))}?</div>
-    <div class="tv-theatre-lane">the programme changed more than ${TV_MOUNT_BUDGET} times in a minute — your browser fetches no more on its own until you say so; whoever holds the remote cannot decide that for you</div>
+    <div class="tv-theatre-lane">the TVs here changed programme more than ${TV_MOUNT_BUDGET} times in a minute — your browser fetches no more on its own until you say so; whoever holds the remote cannot decide that for you</div>
     <button type="button" data-tv-mount="${escapeHtml(key)}">▶ PLAY</button>`);
   t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]')?.addEventListener('click', () => {
     // The press is consent for THE PROGRAMME THE BUTTON NAMED: a peer may
@@ -1108,7 +1144,7 @@ export function updateTvChip(itemIds: readonly string[]): void {
     for (const id of itemIds) {
       const rec = readTv(id);
       if (!rec.source || rec.state === 'off' || rec.state === 'home') continue;
-      if (chipOpen && dismissed.get(id) !== rec.started) {
+      if (chipOpen && !isDismissed(id, rec.started)) {
         chipOpen(id);
         if (theatre) return;
       }

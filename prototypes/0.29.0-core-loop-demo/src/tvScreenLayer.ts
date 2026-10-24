@@ -62,6 +62,9 @@ export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, plane
   host.style.width = `${HOST_W}px`;
   host.style.height = `${HOST_H}px`;
   host.style.background = '#000';
+  // Seen from behind the set, the screen shows nothing (a WebGL plane is
+  // one-sided): the DOM picture would show through the cabinet, mirrored.
+  host.style.backfaceVisibility = 'hidden';
   const renderer = new CSS3DRenderer();
   renderer.setSize(window.innerWidth, window.innerHeight);
   const el = renderer.domElement;
