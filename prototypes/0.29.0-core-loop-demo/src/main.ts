@@ -71,6 +71,7 @@ import { MultiScaleZoomView, setCameraModeLock } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
 import { deviceFocus, isDeviceFocusActive } from "./deviceFocus";
+import { wheelPixels, wheelTargetZooms, type FovZoom } from "./firstPersonZoom";
 import {
   getPlayerId,
   getPlayerName,
@@ -10396,6 +10397,65 @@ function updateHUDP2P(status: string, color: string) {
 // zoom keys live in zoom.ts; since #223 the HUD has +/- buttons again too, in
 // cameraRig's top-right view cross. Past the planet view both need
 // ?devzoom=1.
+// 🔍 First-person zoom (firstPersonZoom.ts): the mouse wheel, or a two-finger
+// pinch, narrows and widens the view in first person and in a device focus
+// (the craps felt, an arcade cabinet, the TV), within set limits. The room
+// views keep the wheel unbound. Panels that scroll keep their wheel.
+function liveFirstPersonZoom(): FovZoom | null {
+  if (document.getElementById("spacephone-container")?.classList.contains("active")) return null;
+  return deviceFocus.getZoom() ?? (isDeviceFocusActive() ? null : multiScaleZoom?.getFirstPersonZoom() ?? null);
+}
+
+function zoomTargetOk(target: EventTarget | null): boolean {
+  const canvas = window.gameRenderer?.renderer?.domElement ?? null;
+  // Under pointer lock the wheel lands on the locked canvas.
+  if (document.pointerLockElement && document.pointerLockElement === canvas) return true;
+  return wheelTargetZooms(target instanceof Element ? target : null, canvas, document.getElementById("device-ui-host"));
+}
+
+function setupFirstPersonZoomInput() {
+  window.addEventListener("wheel", (e) => {
+    // A touchpad pinch arrives as Ctrl + wheel, so it zooms the view too;
+    // outside first person both stay the browser's own.
+    const zoom = liveFirstPersonZoom();
+    if (!zoom || !zoomTargetOk(e.target)) return;
+    e.preventDefault();
+    zoom.wheel(wheelPixels(e));
+  }, { passive: false });
+
+  let pinching: FovZoom | null = null;
+  const spread = (t: TouchList) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  window.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 2) {
+      pinching?.pinchEnd();
+      pinching = null;
+      return;
+    }
+    const zoom = liveFirstPersonZoom();
+    if (!zoom || !zoomTargetOk(e.touches[0].target) || !zoomTargetOk(e.touches[1].target)) return;
+    pinching = zoom;
+    zoom.pinchStart(spread(e.touches));
+  }, { passive: true });
+  window.addEventListener("touchmove", (e) => {
+    if (!pinching || e.touches.length !== 2) return;
+    if (pinching !== liveFirstPersonZoom()) {
+      pinching.pinchEnd();
+      pinching = null;
+      return;
+    }
+    // Not the browser's page zoom: the pinch is the camera's.
+    if (e.cancelable) e.preventDefault();
+    pinching.pinchMove(spread(e.touches));
+  }, { passive: false });
+  const endPinch = (e: TouchEvent) => {
+    if (e.touches.length >= 2) return;
+    pinching?.pinchEnd();
+    pinching = null;
+  };
+  window.addEventListener("touchend", endPinch, { passive: true });
+  window.addEventListener("touchcancel", endPinch, { passive: true });
+}
+
 function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
@@ -10653,6 +10713,7 @@ async function init() {
   inputManager = new inputModule.InputManager();
   setupNetworkDetailsPanel();
   setupZoomView();
+  setupFirstPersonZoomInput();
 
   // Camera rig: the top-right view cross — 45° rotation arrows + zoom (#223).
   // Injected probes keep cameraRig.ts import-cycle-free: it must not import

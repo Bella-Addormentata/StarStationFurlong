@@ -23,6 +23,7 @@ import { isDeviceFocusActive } from './deviceFocus';
 import { rotateIsoOffset } from './cameraRig';
 import { STAND_EYE_OFFSET } from './player';
 import { isFormFieldTarget } from './typingFocus';
+import { FovZoom } from './firstPersonZoom';
 
 // Base (yaw-0) isometric offsets for the ortho levels — the camera rig
 // (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
@@ -130,6 +131,12 @@ let yaw = 0;   // Left-Right rotation (radians)
 let pitch = 0; // Up-Down rotation (radians)
 let initializedMouseLookOffset = false;
 let perspectiveCamera: THREE.PerspectiveCamera | null = null;
+/** 🔍 The free-look camera's field of view, before any wheel or pinch zoom. */
+const FIRST_PERSON_FOV = 65;
+/** 🔍 Wheel and pinch zoom of the free-look view; back to normal whenever
+ *  the view leaves first person. */
+const firstPersonFov = new FovZoom(FIRST_PERSON_FOV);
+let firstPersonFovAt = 0;
 let orthographicCamera: THREE.OrthographicCamera | null = null;
 
 // 🟢 Transition / Animation states
@@ -539,6 +546,12 @@ export class MultiScaleZoomView {
     return this.currentLevel === 1 && !isTransitioningFirstPerson;
   }
 
+  /** 🔍 The free-look view's wheel / pinch zoom, while first person is
+   *  settled (not mid-flight in from the room view); null otherwise. */
+  public getFirstPersonZoom(): FovZoom | null {
+    return this.isFirstPersonSettled() ? firstPersonFov : null;
+  }
+
   private zoomIn() {
     // Device focus owns the camera — HUD zoom buttons must not steal it
     // (the keydown path is guarded upstream; this covers the buttons).
@@ -675,7 +688,7 @@ export class MultiScaleZoomView {
         // — FIRST PERSON perspective camera —
         if (!perspectiveCamera) {
           const aspect = window.innerWidth / window.innerHeight;
-          perspectiveCamera = new THREE.PerspectiveCamera(65, aspect, 0.1, 1000);
+          perspectiveCamera = new THREE.PerspectiveCamera(FIRST_PERSON_FOV, aspect, 0.1, 1000);
           
           window.addEventListener('resize', () => {
             if (perspectiveCamera) {
@@ -687,6 +700,13 @@ export class MultiScaleZoomView {
 
         // Re-assign active camera in global renderer
         window.gameRenderer.camera = perspectiveCamera as any;
+
+        // 🔍 Ease toward the wheel / pinch zoom (the projection matrix is
+        // rebuilt at the end of this method).
+        const now = performance.now();
+        const fovDt = firstPersonFovAt > 0 ? Math.min(0.1, (now - firstPersonFovAt) / 1000) : 0;
+        firstPersonFovAt = now;
+        perspectiveCamera.fov = firstPersonFov.step(fovDt);
 
         // Query the player's active position dynamically so we look FROM the player's head instead of at them.
         const playerPos = (window as any).world?.getPlayer()?.getPosition() || new THREE.Vector3(0, 0, 1.5);
@@ -751,6 +771,10 @@ export class MultiScaleZoomView {
           perspectiveCamera.lookAt(targetX, targetY, targetZ);
         }
       } else {
+        // 🔍 The next visit to first person starts at the normal view.
+        firstPersonFov.reset();
+        firstPersonFovAt = 0;
+
         // Exiting First Person — re-assign OrthographicCamera
         if (orthographicCamera) {
           window.gameRenderer.camera = orthographicCamera;
