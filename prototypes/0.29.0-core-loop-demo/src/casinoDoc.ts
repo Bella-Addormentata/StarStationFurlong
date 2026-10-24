@@ -36,9 +36,13 @@
  * at once both count, on every page. One writer per record means a record is
  * only ever overwritten by the binding that holds its last value (a fresh
  * writer id each bind), so no change is lost, and the doc grows by a record
- * per page per player, not per bet. It is the first step of the computed
- * tables (see the "Computed casino tables" design). Trust is unchanged:
- * honest clients, as before; signed records come with the computed tables.
+ * per page per player, not per bet. Sums are exact (bigint), so every page
+ * gets the same one whatever order records arrive in. A slot machine's own
+ * bankroll is an account in the same ledger, named by its `slot-bankroll:`
+ * key, whose stored value is its opening balance. It is the first step of
+ * the computed tables (see the "Computed casino tables" design). Trust is
+ * unchanged: honest clients, as before; signed records come with the
+ * computed tables.
  *
  * The HOUSE keeps no stored record at all — everything about the cage is
  * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
@@ -177,10 +181,10 @@ export function subscribeCasinoKey(key: string, listener: () => void): () => voi
 
 // ── Chips: the chip ledger (see CHIP LEDGER above) ──────────────────────────
 
-/** One page's running total of what it has done to one player's chips since
- *  it bound the room. Only the page that made it ever writes it. */
+/** One page's running total of what it has done to one account since it
+ *  bound the room. Only the page that made it ever writes it. */
 export interface ChipRecord {
-  /** whose chips */
+  /** whose chips: a player id, or a slot bankroll's key (isBankrollAccount) */
   p: string;
   /** net chips added (negative: taken) */
   d: number;
@@ -192,10 +196,20 @@ export interface ChipRecord {
   at: number;
 }
 
+/** A slot machine's own bankroll is a ledger account too, named by its key
+ *  (`slot-bankroll:machine:<mid>`, the legacy `slot-bankroll:shared`), so two
+ *  pages moving chips in or out of it at once both count, as for a player. */
+const BANKROLL_PREFIX = 'slot-bankroll:machine:';
+const SHARED_BANKROLL_KEY = 'slot-bankroll:shared';
+
+function isBankrollAccount(account: string): boolean {
+  return account.startsWith(BANKROLL_PREFIX) || account === SHARED_BANKROLL_KEY;
+}
+
 export function isChipRecord(value: unknown): value is ChipRecord {
   if (typeof value !== 'object' || value === null) return false;
   const r = value as Partial<ChipRecord>;
-  return typeof r.p === 'string' && r.p.length > 0 && r.p.length <= 128
+  return typeof r.p === 'string' && r.p.length > 0 && r.p.length <= 256
     && Number.isSafeInteger(r.d)
     && Number.isSafeInteger(r.b) && (r.b as number) >= 0
     && Number.isSafeInteger(r.c) && (r.c as number) >= 0
@@ -206,22 +220,28 @@ let chipsMap: Y.Map<unknown> | null = null;
 /** This binding's prefix for the records it writes: a fresh one each bind, so
  *  a record is only ever overwritten by the binding that holds its last value. */
 let chipWriter = '';
-/** The bound ledger, summed: player → Σ record totals, and the cage totals. */
+/** This binding's current record key per account, and how many records it has
+ *  started afresh because one was full (a total past the safe-integer range). */
+let chipKeys = new Map<string, string>();
+let chipRolls = 0;
+/** The bound ledger, summed exactly (bigint, so every page gets the same sum
+ *  whatever order the records came in): account → Σ records, and the cage
+ *  totals. */
 interface ChipIndex {
-  byPlayer: Map<string, number>;
+  byAccount: Map<string, bigint>;
   /** each counted record as counted (so an overwrite or delete is undone exactly) */
   counted: Map<string, ChipRecord>;
-  bought: number;
-  cashed: number;
+  bought: bigint;
+  cashed: bigint;
 }
-let chipIndex: ChipIndex = { byPlayer: new Map(), counted: new Map(), bought: 0, cashed: 0 };
-/** Players whose chips changed since the last notify. */
+let chipIndex: ChipIndex = { byAccount: new Map(), counted: new Map(), bought: 0n, cashed: 0n };
+/** Accounts whose chips changed since the last notify. */
 const chipsTouched = new Set<string>();
 
-function countChipRecord(ix: ChipIndex, rec: ChipRecord, sign: 1 | -1): void {
-  ix.byPlayer.set(rec.p, (ix.byPlayer.get(rec.p) ?? 0) + sign * rec.d);
-  ix.bought += sign * rec.b;
-  ix.cashed += sign * rec.c;
+function countChipRecord(ix: ChipIndex, rec: ChipRecord, sign: 1n | -1n): void {
+  ix.byAccount.set(rec.p, (ix.byAccount.get(rec.p) ?? 0n) + sign * BigInt(rec.d));
+  ix.bought += sign * BigInt(rec.b);
+  ix.cashed += sign * BigInt(rec.c);
   chipsTouched.add(rec.p);
 }
 
@@ -231,17 +251,19 @@ function recountChipKey(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
   const value = map.get(key);
   const now = isChipRecord(value) ? value : undefined;
   if (before === now) return;
-  if (before) { countChipRecord(ix, before, -1); ix.counted.delete(key); }
-  if (now) { countChipRecord(ix, now, 1); ix.counted.set(key, now); }
+  if (before) { countChipRecord(ix, before, -1n); ix.counted.delete(key); }
+  if (now) { countChipRecord(ix, now, 1n); ix.counted.set(key, now); }
 }
 
 function bindChipLedger(doc: Y.Doc): void {
   const map = doc.getMap<unknown>('casinoChips');
-  const ix: ChipIndex = { byPlayer: new Map(), counted: new Map(), bought: 0, cashed: 0 };
+  const ix: ChipIndex = { byAccount: new Map(), counted: new Map(), bought: 0n, cashed: 0n };
   for (const key of map.keys()) recountChipKey(ix, map, key);
   chipsMap = map;
   chipIndex = ix;
   chipWriter = `${doc.clientID.toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  chipKeys = new Map();
+  chipRolls = 0;
   chipsTouched.clear();
   // Recount BEFORE any observer runs, so a casino-map listener firing in the
   // same transaction (a settle that writes a machine and a payout together)
@@ -253,7 +275,9 @@ function bindChipLedger(doc: Y.Doc): void {
   });
   map.observe(() => {
     if (chipIndex !== ix || chipsTouched.size === 0) return;
-    const changed = new Set([...chipsTouched].map((pid) => `bal:${pid}`));
+    const changed = new Set([...chipsTouched].map(
+      (account) => (isBankrollAccount(account) ? account : `bal:${account}`),
+    ));
     chipsTouched.clear();
     notify(changed);
   });
@@ -264,52 +288,75 @@ function ensureChips(): Y.Map<unknown> {
   return chipsMap!;
 }
 
-/** The opening balance: what a build before the ledger stored. */
-function legacyChips(playerId: string): number {
-  return safeCount(ensureMap(), `bal:${playerId}`);
+function clampSafe(n: bigint): number {
+  const max = BigInt(Number.MAX_SAFE_INTEGER);
+  return Number(n > max ? max : n < -max ? -max : n);
+}
+
+/** An account's chips: its opening balance (what a build before the ledger
+ *  stored under `bal:<pid>`, or under the bankroll's own key) + Σ records. */
+function readLedgerAccount(account: string): number {
+  const map = ensureMap();
+  const opening = safeCount(map, isBankrollAccount(account) ? account : `bal:${account}`);
+  return Math.max(0, clampSafe(BigInt(opening) + (chipIndex.byAccount.get(account) ?? 0n)));
 }
 
 export function readChips(playerId: string): number {
-  ensureChips();
-  const total = legacyChips(playerId) + (chipIndex.byPlayer.get(playerId) ?? 0);
-  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, total));
+  return readLedgerAccount(playerId);
 }
 
-/**
- * Add `delta` chips to `playerId` (negative takes them): this page's record
- * for the player, with the change added. Counted at once, so later reads in
- * the same transaction see it. Call it inside the transaction that makes the
- * change it pays for. `cage` marks a buy-in or a cash-out for the cage totals.
- */
-function addChips(playerId: string, delta: number, cage?: 'buy' | 'cashout'): void {
-  if (!Number.isSafeInteger(delta) || delta === 0 || playerId.length === 0 || playerId.length > 128) return;
-  const map = ensureChips();
-  const key = `${chipWriter}:${playerId}`;
-  const stored = map.get(key);
-  const was = isChipRecord(stored) && stored.p === playerId ? stored : null;
-  const rec: ChipRecord = {
-    p: playerId,
+function nextChipRecord(was: ChipRecord | null, account: string, delta: number, cage?: 'buy' | 'cashout'): ChipRecord {
+  return {
+    p: account,
     d: (was?.d ?? 0) + delta,
     b: (was?.b ?? 0) + (cage === 'buy' && delta > 0 ? delta : 0),
     c: (was?.c ?? 0) + (cage === 'cashout' && delta < 0 ? -delta : 0),
     at: Date.now(),
   };
-  if (!Number.isSafeInteger(rec.d) || !Number.isSafeInteger(rec.b) || !Number.isSafeInteger(rec.c)) return;
+}
+
+function isWholeRecord(rec: ChipRecord): boolean {
+  return Number.isSafeInteger(rec.d) && Number.isSafeInteger(rec.b) && Number.isSafeInteger(rec.c);
+}
+
+/**
+ * Add `delta` chips to `account` (negative takes them): this page's record
+ * for it, with the change added (or, when that record's total would leave the
+ * safe-integer range, a fresh record beside it). Counted at once, so later
+ * reads in the same transaction see it. Call it inside the transaction that
+ * makes the change it pays for. `cage` marks a buy-in or a cash-out.
+ */
+function addChips(account: string, delta: number, cage?: 'buy' | 'cashout'): void {
+  if (!Number.isSafeInteger(delta) || delta === 0 || account.length === 0 || account.length > 256) return;
+  const map = ensureChips();
+  let key = chipKeys.get(account) ?? `${chipWriter}:${account}`;
+  const stored = map.get(key);
+  let rec = nextChipRecord(isChipRecord(stored) && stored.p === account ? stored : null, account, delta, cage);
+  if (!isWholeRecord(rec)) {
+    chipRolls += 1;
+    key = `${chipWriter}~${chipRolls}:${account}`;
+    rec = nextChipRecord(null, account, delta, cage);
+  }
+  chipKeys.set(account, key);
   boundDoc!.transact(() => {
     map.set(key, rec);
     recountChipKey(chipIndex, map, key);
   });
 }
 
-/** A money key's balance: a player's chips (`bal:<pid>`) or a stored count. */
+/** A money key's balance: a player's chips (`bal:<pid>`), a slot bankroll's
+ *  ledger account, or a stored count. */
 function readAccount(map: Y.Map<unknown>, key: string): number {
-  return key.startsWith('bal:') ? readChips(key.slice(4)) : safeCount(map, key);
+  if (key.startsWith('bal:')) return readChips(key.slice(4));
+  if (isBankrollAccount(key)) return readLedgerAccount(key);
+  return safeCount(map, key);
 }
 
 /** Move a money key from `before` (as just read) to `after`: a chip record
- *  for a player, a plain write for a machine's own count. */
+ *  for a ledger account, a plain write for any other stored count. */
 function writeAccount(map: Y.Map<unknown>, key: string, before: number, after: number): void {
   if (key.startsWith('bal:')) addChips(key.slice(4), after - before);
+  else if (isBankrollAccount(key)) addChips(key, after - before);
   else map.set(key, after);
 }
 
@@ -345,11 +392,11 @@ export function creditChips(playerId: string, amount: number): void {
   addChips(playerId, amount);
 }
 
-/** Every chip record in the bound room (one per page per player), oldest
+/** Every chip record in the bound room (one per page per account), oldest
  *  change first (the history behind a balance; debugging). */
-export function readChipRecords(playerId?: string): ChipRecord[] {
+export function readChipRecords(account?: string): ChipRecord[] {
   ensureChips();
-  const out = [...chipIndex.counted.values()].filter((r) => playerId === undefined || r.p === playerId);
+  const out = [...chipIndex.counted.values()].filter((r) => account === undefined || r.p === account);
   return out.sort((a, b) => a.at - b.at);
 }
 
@@ -368,11 +415,13 @@ export interface CageLedger {
 export function readCageLedger(): CageLedger {
   const map = ensureMap();
   ensureChips();
-  let issued = chipIndex.bought, cashed = chipIndex.cashed, outstanding = 0;
-  const players = new Set<string>(chipIndex.byPlayer.keys());
+  let issued = chipIndex.bought, cashed = chipIndex.cashed, outstanding = 0n;
+  const players = new Set<string>(
+    [...chipIndex.byAccount.keys()].filter((account) => !isBankrollAccount(account)),
+  );
   for (const [key, value] of map.entries()) {
     if (!Number.isSafeInteger(value) || (value as number) < 0) continue;
-    const n = value as number;
+    const n = BigInt(value as number);
     if (key.startsWith('bought:')) issued += n;
     else if (key.startsWith('cashed:')) cashed += n;
     else if (key.startsWith('bal:')) players.add(key.slice(4));
@@ -380,10 +429,16 @@ export function readCageLedger(): CageLedger {
   const balances: Record<string, number> = {};
   for (const pid of players) {
     const n = readChips(pid);
-    outstanding += n;
+    outstanding += BigInt(n);
     if (n > 0) balances[pid] = n;
   }
-  return { issued, cashed, outstanding, houseNet: issued - cashed - outstanding, balances };
+  return {
+    issued: clampSafe(issued),
+    cashed: clampSafe(cashed),
+    outstanding: clampSafe(outstanding),
+    houseNet: clampSafe(issued - cashed - outstanding),
+    balances,
+  };
 }
 
 // ── Roulette table state + bets ──────────────────────────────────────────────
@@ -963,7 +1018,7 @@ export function hasSlotEscrow(machineId: string): boolean {
 export function slotMachineHoldsChips(machineId: string): boolean {
   const map = ensureMap();
   return map.has(`slot-escrow:${machineId}`)
-    || safeCount(map, `slot-bankroll:machine:${machineId}`) > 0;
+    || readAccount(map, `slot-bankroll:machine:${machineId}`) > 0;
 }
 
 export interface SlotSharedBankrollLease {
@@ -1029,8 +1084,8 @@ function slotFundingBalanceKey(
   config: SlotFundingConfig,
 ): string {
   if (config.mode === 'owner') return `bal:${config.ownerId}`;
-  if (config.mode === 'machine') return `slot-bankroll:machine:${machineId}`;
-  return 'slot-bankroll:shared';
+  if (config.mode === 'machine') return `${BANKROLL_PREFIX}${machineId}`;
+  return SHARED_BANKROLL_KEY;
 }
 
 function safeCount(map: Y.Map<unknown>, key: string): number {
@@ -1061,11 +1116,11 @@ export function depositSlotFunding(
   const map = ensureMap();
   const fundingKey = slotFundingBalanceKey(machineId, config);
   const ownerBalance = readChips(ownerId);
-  const fundingBalance = safeCount(map, fundingKey);
+  const fundingBalance = readAccount(map, fundingKey);
   if (ownerBalance < amount || !Number.isSafeInteger(fundingBalance + amount)) return false;
   boundDoc!.transact(() => {
     addChips(ownerId, -amount);
-    map.set(fundingKey, fundingBalance + amount);
+    writeAccount(map, fundingKey, fundingBalance, fundingBalance + amount);
   });
   return true;
 }
@@ -1084,10 +1139,10 @@ export function withdrawSlotFunding(
   const map = ensureMap();
   const fundingKey = slotFundingBalanceKey(machineId, config);
   const ownerBalance = readChips(ownerId);
-  const fundingBalance = safeCount(map, fundingKey);
+  const fundingBalance = readAccount(map, fundingKey);
   if (fundingBalance < amount || !Number.isSafeInteger(ownerBalance + amount)) return false;
   boundDoc!.transact(() => {
-    map.set(fundingKey, fundingBalance - amount);
+    writeAccount(map, fundingKey, fundingBalance, fundingBalance - amount);
     addChips(ownerId, amount);
   });
   return true;
@@ -1219,14 +1274,18 @@ export function refundSlotWager(
 export function drainSlotMachineFunding(machineId: string): boolean {
   const map = ensureMap();
   const fundingKey = `slot-bankroll:machine:${machineId}`;
-  const amount = safeCount(map, fundingKey);
+  const amount = readAccount(map, fundingKey);
   if (amount <= 0) return true;
   const config = readSlotFundingConfig(machineId);
   if (!config) return false;
   const ownerBalance = readChips(config.ownerId);
   if (!Number.isSafeInteger(ownerBalance + amount)) return false;
+  // The bankroll's opening balance goes with its key (clearSlotMachineKeys
+  // deletes it too); the records take out the rest.
+  const opening = safeCount(map, fundingKey);
   boundDoc!.transact(() => {
     map.delete(fundingKey);
+    addChips(fundingKey, opening - amount);
     addChips(config.ownerId, amount);
   });
   return true;

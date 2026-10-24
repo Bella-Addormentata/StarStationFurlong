@@ -111,6 +111,128 @@ describe('two pages moving one player\'s chips at once', () => {
   });
 });
 
+describe('sums past the safe-integer range', () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+  const record = (d: number) => ({ p: PLAYER, d, b: 0, c: 0, at: 0 });
+
+  it('add up exactly, whatever order the records arrive in', () => {
+    for (const order of [['a', 'b', 'c'], ['a', 'c', 'b'], ['c', 'b', 'a']]) {
+      const doc = new Y.Doc();
+      pageA.bindCasinoDoc(doc);
+      const values: Record<string, number> = { a: MAX, b: 2, c: -MAX };
+      for (const key of order) doc.getMap('casinoChips').set(key, record(values[key]));
+      expect(pageA.readChips(PLAYER)).toBe(2);
+    }
+  });
+
+  it('undo a rewritten or deleted record exactly', () => {
+    const chips = docA.getMap('casinoChips');
+    chips.set('a', record(MAX));
+    chips.set('b', record(2));
+    chips.delete('a');
+    expect(pageA.readChips(PLAYER)).toBe(2);
+  });
+
+  it('a page whose record would leave the range starts a fresh one, and the change still lands', () => {
+    docA.getMap('casino').set(`bal:${PLAYER}`, MAX);
+    sync(docA, docB);
+    expect(pageA.spendChips(PLAYER, MAX)).toBe(true);
+    sync(docA, docB);
+    pageB.creditChips(PLAYER, 1);
+    sync(docA, docB);
+    expect(pageA.readChips(PLAYER)).toBe(1);
+    expect(pageA.spendChips(PLAYER, 1)).toBe(true);
+    expect(pageA.readChips(PLAYER)).toBe(0);
+    expect(pageA.spendChips(PLAYER, 1)).toBe(false);
+    sync(docA, docB);
+    expect(pageB.readChips(PLAYER)).toBe(0);
+  });
+
+  it('so does one whose lifetime buy-ins would', () => {
+    pageA.buyInChips(PLAYER, MAX);
+    expect(pageA.cashOutChips(PLAYER, MAX)).toBe(MAX);
+    pageA.buyInChips(PLAYER, 5);
+    expect(pageA.readChips(PLAYER)).toBe(5);
+    expect(pageA.readChipRecords(PLAYER)).toHaveLength(2);
+  });
+});
+
+describe('a slot machine\'s own bankroll', () => {
+  const MACHINE = 'slot-1';
+  const funding = { mode: 'machine' as const, ownerId: OTHER };
+
+  beforeEach(() => {
+    pageA.buyInChips(OTHER, 1_000);
+    pageA.buyInChips(PLAYER, 100);
+    pageA.writeSlotFundingConfig(MACHINE, funding);
+    sync(docA, docB);
+  });
+
+  it('two pages depositing at once both count', () => {
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    expect(pageB.depositSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) {
+      expect(page.readSlotFundingBalance(MACHINE, funding)).toBe(200);
+      expect(page.readChips(OTHER)).toBe(800);
+    }
+  });
+
+  it('two pages withdrawing the same chips at once keep the total: the bankroll owes the overdraft and reads empty until it is refilled', () => {
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    sync(docA, docB);
+    expect(pageA.withdrawSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    expect(pageB.withdrawSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    sync(docA, docB);
+    expect(pageA.readChips(OTHER)).toBe(1_100);
+    expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(0);
+    expect(pageA.withdrawSlotFunding(MACHINE, OTHER, 1)).toBe(false);
+    expect(pageA.reserveSlotWager(MACHINE, PLAYER, 10, funding, 50)).toBe('insufficient-bankroll');
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, 150)).toBe(true);
+    expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(50);
+  });
+
+  it('a spin settled on one page and a deposit on another both land', () => {
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, 500)).toBe(true);
+    sync(docA, docB);
+    expect(pageA.reserveSlotWager(MACHINE, PLAYER, 10, funding, 50)).toBe('ok');
+    expect(pageA.settleSlotWager(MACHINE, PLAYER, funding, 30)).toBe(true);
+    expect(pageB.depositSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) {
+      expect(page.readSlotFundingBalance(MACHINE, funding)).toBe(500 + 10 - 30 + 100);
+      expect(page.readChips(PLAYER)).toBe(100 - 10 + 30);
+      expect(page.readChips(OTHER)).toBe(1_000 - 600);
+    }
+  });
+
+  it('opens with what an earlier build stored, and a teardown pays out exactly what it holds', () => {
+    docA.getMap('casino').set(`slot-bankroll:machine:${MACHINE}`, 300);
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, 50)).toBe(true);
+    expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(350);
+    expect(pageA.slotMachineHoldsChips(MACHINE)).toBe(true);
+    expect(pageA.drainSlotMachineFunding(MACHINE)).toBe(true);
+    expect(pageA.readChips(OTHER)).toBe(1_000 - 50 + 350);
+    expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(0);
+    expect(pageA.slotMachineHoldsChips(MACHINE)).toBe(false);
+    pageA.clearSlotMachineKeys(MACHINE);
+    expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(0);
+  });
+
+  it('is not a player: the cage ledger leaves it out', () => {
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    expect(Object.keys(pageA.readCageLedger().balances).sort()).toEqual([OTHER, PLAYER].sort());
+  });
+
+  it('its key listeners hear a change that arrives from another page', () => {
+    const heard = vi.fn();
+    pageA.subscribeCasinoKey(`slot-bankroll:machine:${MACHINE}`, heard);
+    expect(pageB.depositSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    sync(docA, docB);
+    expect(heard).toHaveBeenCalled();
+  });
+});
+
 describe('a room saved by an earlier build', () => {
   it('opens with each player\'s stored balance, and never writes it again', () => {
     const saved = new Y.Doc();
