@@ -15,7 +15,7 @@
 
 import {
   holderAnchorMs, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv,
-  renewRemote, scheduleStarted,
+  renewRemote, scheduleStarted, setTvPressesOpen,
   subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvProgrammeEnded, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
@@ -237,6 +237,7 @@ function publishEnd(id: string, rec: { started: number; endMs: number }): void {
 let driveArmed = true;
 export function armTvDrive(on: boolean): void {
   driveArmed = on;
+  setTvPressesOpen(on);
 }
 export function tvDriveArmed(): boolean {
   return driveArmed;
@@ -333,6 +334,7 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
  *  before its doc goes (main.ts leaveRoomNow). */
 export function leaveTvRoom(itemIds: readonly string[]): void {
   driveArmed = false; // synchronously: the next tick, mid-leave, does nothing
+  setTvPressesOpen(false); // nor a press that lands meanwhile (tvDoc press)
   liveIds = [];
   for (const id of itemIds) {
     if (iHoldRemote(id)) putDownRemote(id);

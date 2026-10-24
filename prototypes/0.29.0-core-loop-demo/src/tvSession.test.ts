@@ -160,6 +160,22 @@ describe('tickTvRoom', () => {
     expect(readRemote('tv-2').holder).toBe('');
   });
 
+  it('a press that lands while the room is being left is refused: the room left keeps its programme and its clock', () => {
+    const A = { kind: 'url', url: 'https://example.org/a.mp4' } as const;
+    const B = { kind: 'url', url: 'https://example.org/b.mp4' } as const;
+    expect(tvPlay(TV, A)).toEqual({ ok: true });
+    leaveTvRoom([TV]);
+    const left = readTv(TV);
+    // An archive.org lookup or an upload started before the leave lands in
+    // its flush: no press takes the clock or changes the programme now.
+    expect(tvPlay(TV, B)).toEqual({ ok: false, error: 'Leaving this room.' });
+    expect(tvTogglePower(TV)).toBe(true); // still on
+    expect(readTv(TV)).toEqual(left);
+    expect(readRemote(TV).holder).toBe('');
+    armTvDrive(true); // the next room's docs are bound
+    expect(tvPlay(TV, B)).toEqual({ ok: true });
+  });
+
   it('a removed set takes this client\'s hold on its remote with it', () => {
     pickUpRemote(TV);
     pickUpRemote('tv-2');

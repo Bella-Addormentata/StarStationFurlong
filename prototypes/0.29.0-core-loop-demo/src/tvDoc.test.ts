@@ -479,6 +479,55 @@ describe('the programme', () => {
     expect(readPower(TV)).toMatchObject({ on: false, seq: 1 });
   });
 
+  it('a press on one device never loses to the clock page\'s beat on another taken before it saw the press', () => {
+    // Alice's page keeps the clock and beats on her doc while Bob, on his,
+    // pauses: both written before either has seen the other. The beat has a
+    // key of its own, so whichever device the merge favours, Bob's PAUSE
+    // stands, and the beat taken under the action before it is not laid
+    // over it.
+    for (const [aliceId, bobId] of [[1, 2], [2, 1]] as const) {
+      const alice = new Y.Doc();
+      alice.clientID = aliceId;
+      bindTvDoc(alice);
+      iAm(ALICE, 'Alice');
+      setTvPageId('A');
+      expect(tvPlay(TV, FILM)).toEqual({ ok: true });
+      const bob = new Y.Doc();
+      bob.clientID = bobId;
+      Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+      bindTvDoc(bob);
+      iAm(BOB, 'Bob');
+      setTvPageId('B');
+      tick(1_000);
+      expect(tvPause(TV, 31_000)).toEqual({ ok: true });
+      bindTvDoc(alice);
+      iAm(ALICE, 'Alice');
+      setTvPageId('A');
+      expect(tvHeartbeat(TV, 31_200)).toEqual({ ok: true }); // she has not seen the pause yet
+      Y.applyUpdate(alice, Y.encodeStateAsUpdate(bob));
+      Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+      for (const d of [alice, bob]) {
+        bindTvDoc(d);
+        expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 31_000 });
+        expect(readRemote(TV).holder).toBe(BOB);
+      }
+    }
+  });
+
+  it('a beat is read over the programme it was taken under, while newer than the record\'s own sample', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    tick(TV_HEARTBEAT_MS);
+    expect(tvHeartbeat(TV, 3_000)).toEqual({ ok: true });
+    const beaten = readProgramme(TV);
+    expect(beaten).toMatchObject({ state: 'playing', positionMs: 3_000, at: now });
+    expect(doc.getMap('tv').get(tvKey(TV))).toMatchObject({ positionMs: 0 }); // the record itself is untouched
+    // A page from before the beat key beats into the record itself: newer
+    // than the beat, it stands.
+    doc.getMap('tv').set(tvKey(TV), { ...beaten, positionMs: 6_000, seq: beaten.seq + 1 });
+    expect(readProgramme(TV)).toMatchObject({ positionMs: 6_000, seq: beaten.seq + 1 });
+  });
+
   it('a power press on one device never undoes the holder\'s heartbeat on another, nor the other way round', () => {
     // Alice (the holder) beats on her doc while Bob switches the set off on
     // his, offline; synced both ways, the set is off AND Alice's position

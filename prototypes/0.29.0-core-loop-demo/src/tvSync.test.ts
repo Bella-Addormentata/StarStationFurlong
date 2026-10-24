@@ -937,7 +937,7 @@ describe('the holder as the room\'s clock', () => {
     h.set({ positionMs: 45_000 }); // the new holder has moved the room on
     h.tick(TV_SEEK_COOLDOWN_MS); // a viewer now: follows the record, carries no target
     expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000', 'seek:45000']);
-    expect(h.c.positionMs()).toBe(0); // the player's own clock: nothing pending for a viewer
+    expect(h.c.positionMs()).toBe(45_000); // a viewer's press acts where the room is, not at its player's 0
     p.land();
     expect(p.position).toBe(45_000);
     opts.hold = true; // picked up again, no transport write since: `jump` unchanged
@@ -956,7 +956,7 @@ describe('the holder as the room\'s clock', () => {
     expect(p.log.filter((l) => l.startsWith('seek')).at(-1)).toBe('seek:50000');
   });
 
-  it('names where the room is for a transport write: the target a jump still carries the player to, the record for a jump not yet followed, else the player', () => {
+  it('names where the room is for a transport write: the target a jump still carries the player to, the record for a jump not yet followed, else the player; a viewer, the record', () => {
     const p = new FakePlayer(true);
     p.lazy = true;
     const h = harness(p, { hold: true });
@@ -985,7 +985,9 @@ describe('the holder as the room\'s clock', () => {
     viewer.position = 5_000;
     const hv = harness(viewer);
     hv.set({ positionMs: 40_000 });
-    expect(hv.c.positionMs()).toBe(5_000); // a viewer's player is only ever where it is
+    // A viewer's press (anyone's goes through) acts where the room is: its
+    // player, behind at 5 s or on the last film, is not where the room is.
+    expect(hv.c.positionMs()).toBe(40_000);
   });
 
   it('a player with no clock (the archive embed) is played and never beats', () => {
