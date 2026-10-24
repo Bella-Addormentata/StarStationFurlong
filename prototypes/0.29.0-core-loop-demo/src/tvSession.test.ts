@@ -9,7 +9,7 @@ import { isTvKind, tvLabel } from './tvSession';
 import {
   bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, remoteKey,
   setTvClock,
-  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS,
+  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvSetLoop, tvTogglePower, TV_HEARTBEAT_MS,
   TV_LEASE_LAPSE_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import {
@@ -370,6 +370,26 @@ describe('tickTvRoom', () => {
     unregisterLive();
     run(60_000);
     expect(readTv(TV).state).toBe('playing');
+  });
+
+  it('with LOOP on, the headless beat starts the programme over at the end it carries, lap after lap; LOOP off, the next end is home', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    const first = readTv(TV).started;
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 25_000, canSeek: () => true, started: () => first, endMs: () => 30_000 });
+    run(1_000);
+    tvHeartbeat(TV, 25_000);
+    unregister(); // the holder closes the theatre at 25 s; the record runs on headlessly
+    tvSetLoop(TV, true);
+    run(6_000); // 31 s: past the end
+    expect(readTv(TV)).toMatchObject({ state: 'playing', endMs: 30_000, started: first + 1 });
+    expect(readPlayback(TV, now).positionMs).toBeLessThan(TV_HEARTBEAT_MS); // from the top
+    run(30_000); // the second lap ends on the end the record kept: no player was needed to know it
+    expect(readTv(TV)).toMatchObject({ state: 'playing', started: first + 2 });
+    expect(readTv(TV).history).toHaveLength(1); // one showing, however many laps
+    tvSetLoop(TV, false);
+    run(31_000);
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
   });
 
   it('an end reported by a player mounted for a programme that has moved on is not filed under the new one', () => {

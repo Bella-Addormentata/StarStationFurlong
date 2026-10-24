@@ -27,7 +27,7 @@ import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
   readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
-  sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
+  sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetLoop, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
@@ -1050,7 +1050,8 @@ function renderTheatreChrome(t: Theatre): void {
   const where = pb.state === 'scheduled' ? countdownText(pb.countdownMs)
     : pb.state === 'paused' ? `PAUSED · ${formatClock(pb.positionMs)}`
     : pb.state === 'playing' ? `● ${formatClock(pb.positionMs)}` : '';
-  const status = `${who}${where ? ` · ${where}` : ''}${sync}`;
+  const loop = rec.loop && !startOnly ? ' · 🔁 LOOP' : '';
+  const status = `${who}${where ? ` · ${where}` : ''}${loop}${sync}`;
   if (status !== t.lastStatus) {
     t.status.textContent = status;
     t.lastStatus = status;
@@ -1063,6 +1064,10 @@ function renderTheatreChrome(t: Theatre): void {
     mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
     mine && seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
     mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
+    // archive.org's own player never says it ended, so it has nothing to loop.
+    mine && rec.source && !startOnly
+      ? btn(`data-tv-loop="1" aria-pressed="${rec.loop}"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF', 'At the end, start the film over')
+      : '',
     // archive.org's own player takes no volume from us: the set's level
     // drives every other player; theirs is adjusted inside the frame. And
     // a frame that never loaded gives no sign of it: RELOAD is the retry.
@@ -1097,6 +1102,7 @@ function renderTheatreChrome(t: Theatre): void {
     c.querySelector<HTMLButtonElement>('[data-tv-back]')?.addEventListener('click', () => { tvSeek(t.itemId, Math.max(0, pos() - 10_000)); });
     c.querySelector<HTMLButtonElement>('[data-tv-fwd]')?.addEventListener('click', () => { tvSeek(t.itemId, pos() + 10_000); });
     c.querySelector<HTMLButtonElement>('[data-tv-stop]')?.addEventListener('click', () => { tvStop(t.itemId); });
+    c.querySelector<HTMLButtonElement>('[data-tv-loop]')?.addEventListener('click', () => { tvSetLoop(t.itemId, !readTv(t.itemId).loop); });
     c.querySelector<HTMLButtonElement>('[data-tv-pickup]')?.addEventListener('click', () => { pickUpRemote(t.itemId); });
     c.querySelector<HTMLInputElement>('[data-tv-volume]')?.addEventListener('change', (e) => {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));

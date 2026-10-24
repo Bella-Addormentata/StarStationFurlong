@@ -10,7 +10,10 @@ import type { TvPlayer } from './tvSync';
 import { TV_HEARTBEAT_MS, TV_NUDGE_RATE } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
 import * as Y from 'yjs';
-import { bindTvDoc, markTvPageAwake, pickUpRemote, setTvClock, setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay } from './tvDoc';
+import {
+  bindTvDoc, markTvPageAwake, pickUpRemote, readTv, setTvClock, setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay,
+  tvSetLoop,
+} from './tvDoc';
 
 class FakePlayer implements TvPlayer {
   position = 0;
@@ -1220,5 +1223,44 @@ describe('a holder that picked the remote up on a stale reading', () => {
     expect(h.beats).toEqual([12_000]); // the seek landed at once (a prompt player): the beat from the anchor is the fresh sample that un-stales the room
     h.tick();
     expect(h.beats).toEqual([12_000]); // one beat per TV_HEARTBEAT_MS, as ever
+  });
+});
+
+describe('🔁 LOOP, through the record', () => {
+  it('the holder\'s player ending with LOOP on starts the programme over: the record replays it and the player goes back to 0 and plays; LOOP off, the next end is home', () => {
+    let now = 200_000;
+    setTvClock(() => now);
+    setTvHostPredicate(() => false);
+    setTvPageId('A');
+    bindTvDoc(new Y.Doc());
+    setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    pickUpRemote('tv-1');
+    tvPlay('tv-1', { kind: 'url', url: 'https://example.org/clip.mp4' });
+    tvSetLoop('tv-1', true);
+    const p = new FakePlayer(true);
+    p.duration = 5_000;
+    const c = new TvSyncController({ itemId: 'tv-1', player: p, now: () => now });
+    const step = () => {
+      now += 400;
+      markTvPageAwake(now);
+      c.tick();
+    };
+    step();
+    expect(p.playing).toBe(true);
+    const first = readTv('tv-1').started;
+    p.seek(5_000); // the clip runs out
+    p.playing = false;
+    step();
+    expect(readTv('tv-1')).toMatchObject({ state: 'playing', started: first + 1, positionMs: 0, loop: true });
+    step(); // the holder follows its own replay: back to the top, where the room is 400 ms on
+    expect(p.log.at(-2)).toBe('seek:400');
+    expect(p.position).toBe(400);
+    expect(p.ended).toBe(false);
+    expect(p.playing).toBe(true);
+    tvSetLoop('tv-1', false);
+    p.seek(5_000);
+    p.playing = false;
+    step();
+    expect(readTv('tv-1')).toMatchObject({ state: 'home', source: null });
   });
 });

@@ -163,6 +163,11 @@ export interface TvProgramme {
    *  the programme where the media does (tvSession's headless beat). Never
    *  a sample: writing it bumps neither `seq` nor `jump`. */
   endMs: number;
+  /** LOOP: at the media's end the programme starts over from the top
+   *  (tvProgrammeEnded) instead of going back to the home screen. The set's
+   *  setting, kept across programmes until it is turned off, and the
+   *  holder's to set like the rest of this record (tvSetLoop). */
+  loop: boolean;
   /** The holder's name on the sample, for the screen's "with <name>" line. */
   history: TvHistoryEntry[];
 }
@@ -201,6 +206,7 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   started: 0,
   jump: 0,
   endMs: 0,
+  loop: false,
   history: [],
 };
 
@@ -724,6 +730,7 @@ export function readProgramme(itemId: string): TvProgramme {
     started: counter(raw.started),
     jump: counter(raw.jump),
     endMs: Math.max(0, Math.floor(num(raw.endMs))),
+    loop: raw.loop === true,
     history,
   };
 }
@@ -1137,6 +1144,36 @@ export function tvNoteEnd(itemId: string, endMs: number | null): TvAction {
   return { ok: true };
 }
 
+/** LOOP on or off. Neither a sample nor a transport action — `seq` and
+ *  `jump` stay — and kept across programmes: the next film loops too. */
+export function tvSetLoop(itemId: string, on: boolean): TvAction {
+  const gate = mayControl(itemId);
+  if (!gate.ok) return gate;
+  const rec = readProgramme(itemId);
+  if (rec.loop === on) return { ok: true };
+  write(tvKey(itemId), { ...rec, loop: on } satisfies TvProgramme);
+  return { ok: true };
+}
+
+/** The media ran to its end — the holder's player said so (tvSync), or the
+ *  headless beat reached the end the record carries (tvSession). With LOOP
+ *  on, the same programme starts over from the top: a new start, as PLAY
+ *  NOW again is, so a player that can seek is sent back to 0 and one that
+ *  cannot is rebuilt. The history and the library stay as they are (a loop
+ *  is not another showing), and so does `endMs`: the same media ends in the
+ *  same place, which is how a holder with no player of its own loops it
+ *  again. Otherwise back to the home screen. */
+export function tvProgrammeEnded(itemId: string): TvAction {
+  const gate = mayControl(itemId);
+  if (!gate.ok) return gate;
+  const rec = readProgramme(itemId);
+  if (!rec.loop || !rec.source) return tvStop(itemId);
+  write(tvKey(itemId), {
+    ...rec, state: 'playing', startAt: 0, positionMs: 0, seq: bump(rec.seq), started: bump(rec.started), jump: bump(rec.jump),
+  } satisfies TvProgramme);
+  return { ok: true };
+}
+
 /** Back to the home screen (the programme stays in history). */
 export function tvStop(itemId: string): TvAction {
   const gate = mayControl(itemId);
@@ -1539,8 +1576,9 @@ export function tvScreenView(itemId: string, now = clock()): TvScreenView {
   if (pb.state === 'scheduled') {
     return { state: 'scheduled', title: label, detail: countdownText(pb.countdownMs), lane, clockText: '' };
   }
+  const loop = rec.loop ? 'LOOP · ' : '';
   if (pb.state === 'paused') {
-    return { state: 'paused', title: label, detail: `PAUSED · ${holderLine}`, lane, clockText: formatClock(pb.positionMs) };
+    return { state: 'paused', title: label, detail: `PAUSED · ${loop}${holderLine}`, lane, clockText: formatClock(pb.positionMs) };
   }
-  return { state: 'playing', title: label, detail: holderLine, lane, clockText: formatClock(pb.positionMs) };
+  return { state: 'playing', title: label, detail: `${loop}${holderLine}`, lane, clockText: formatClock(pb.positionMs) };
 }

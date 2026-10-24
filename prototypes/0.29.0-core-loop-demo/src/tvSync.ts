@@ -29,7 +29,7 @@
  */
 
 import {
-  driftAction, holderAnchorMs, iHoldRemote, markTvPageAwake, readPlayback, readTv, tvHeartbeat, tvNow, tvStop,
+  driftAction, holderAnchorMs, iHoldRemote, markTvPageAwake, readPlayback, readTv, tvHeartbeat, tvNow, tvProgrammeEnded,
   TV_HEARTBEAT_MS, TV_NUDGE_RATE, TV_SEEK_OVER_MS,
 } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -98,7 +98,8 @@ export interface TvSyncDeps {
   heartbeat?: (positionMs: number) => void;
   volume?: () => number;
   /** The holder's player reached the end: the programme is over. Default:
-   *  tvStop — back to the home screen, the film kept in history. */
+   *  tvProgrammeEnded — from the top again with LOOP on, else back to the
+   *  home screen, the film kept in history. */
   onEnded?: () => void;
 }
 
@@ -195,7 +196,7 @@ export class TvSyncController {
     this.started = deps.started ?? (() => readTv(deps.itemId).started);
     this.heartbeat = deps.heartbeat ?? ((p) => { tvHeartbeat(deps.itemId, p); });
     this.volume = deps.volume ?? (() => readTv(deps.itemId).volume);
-    this.onEnded = deps.onEnded ?? (() => { tvStop(deps.itemId); });
+    this.onEnded = deps.onEnded ?? (() => { tvProgrammeEnded(deps.itemId); });
   }
 
   /** The lead for this page: half the round trip to its own node for a
