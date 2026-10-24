@@ -904,6 +904,9 @@ let blobAskRefused: { hash: string; why: string } | null = null;
 let autoFetching: string | null = null;
 /** Its ask is still out to the node (the transfer's state says nothing yet). */
 let autoFetchAsking = false;
+/** The file whose transfer FETCHING calls AUTO-FETCH's: the one it asked
+ *  for, until a press asks for it again (a retry is the viewer's own). */
+let autoFetchLabel: string | null = null;
 /** When this page began waiting for WHERE's answer on the file on the set,
  *  in this room (each room's WHERE is its own, and so is its wait). */
 let autoFetchWhere: { hash: string; epoch: number; since: number } | null = null;
@@ -939,6 +942,7 @@ function autoFetch(source: Extract<TvSource, { kind: 'blob' }>, st: BlobState): 
   }
   noteAutoFetch(source.hash, source.size);
   autoFetching = source.hash;
+  autoFetchLabel = source.hash;
   autoFetchAsking = true;
   void fetchBlob(source.hash, source.size, source.provider, source.mime ?? '').then((refused) => {
     // Kept for the notice the next tick draws: FETCH, with why. And the
@@ -971,7 +975,7 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
   }
   if (st.state === 'queued' || st.state === 'fetching') {
     const pct = st.size > 0 ? Math.min(100, Math.floor((st.have / st.size) * 100)) : 0;
-    showNotice(t, `<div>📦 FETCHING · ${pct}%${autoFetching === source.hash ? ' · AUTO-FETCH' : ''}</div>
+    showNotice(t, `<div>📦 FETCHING · ${pct}%${autoFetchLabel === source.hash ? ' · AUTO-FETCH' : ''}</div>
       <div class="tv-theatre-lane">${escapeHtml(formatBytes(st.have))} of ${escapeHtml(size)} from ${escapeHtml(from)}, every byte checked against the file's hash — it plays when the last one is in</div>`);
     return;
   }
@@ -1011,6 +1015,7 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
       || String(now.size) !== btn.dataset.tvFetchSize || now.provider !== btn.dataset.tvFetchFrom) return;
     btn.disabled = true;
     notePressedFetch(now.hash); // AUTO-FETCH asks for it no more from here, whenever its WHERE lands
+    if (autoFetchLabel === now.hash) autoFetchLabel = null; // and this transfer is the press's
     void fetchBlob(now.hash, now.size, now.provider, now.mime ?? '').then((refused) => {
       // Kept for the notice the next tick draws (a button again, with why).
       blobAskRefused = refused ? { hash: now.hash, why: refused } : null;
