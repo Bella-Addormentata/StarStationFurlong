@@ -37,9 +37,10 @@
  * only ever overwritten by the binding that holds its last value (a fresh
  * writer id each bind), so no change is lost, and the doc grows by a record
  * per page per player, not per bet. What a roulette or craps table pays a
- * player is the one exception: it rides one record per table and player,
- * which names the outcome it paid last, so a round settled on one page while
- * another removed the table pays one of the two (creditTableOutcome). Sums
+ * player is the one exception: it rides one record per table (each time it
+ * is set up) and player, which names the outcome it paid last, so a round
+ * settled on one page while another removed the table pays one of the two
+ * (creditTableOutcome). Sums
  * are exact (bigint), so every page gets the same one whatever order records
  * arrive in. A slot machine's own bankroll is an account in the same ledger,
  * named by its `slot-bankroll:` key, whose stored value is its opening
@@ -62,7 +63,7 @@
 import * as Y from 'yjs';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
-import { isCrapsBet, isCrapsTableState } from './games/craps';
+import { isCrapsBet, isCrapsTableState, MAX_BETS_PER_PLAYER } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import {
   isSlotMachineState, isSlotOddsConfig, isSlotPlayRequest, isSlotReveal,
@@ -417,27 +418,33 @@ export function creditChips(playerId: string, amount: number): void {
  * holder's pages can each carry out the same outcome (both refund a removed
  * table), or two that exclude each other (one settles a round while the other
  * removes the table), before either hears of the other. So what a table pays a
- * player rides one record per table and player, `tbl:<tableId>:<pid>`, naming
- * the outcome it paid last: a write adds to it unless it already names this
- * outcome, and of two written at once the doc keeps one, so the player is paid
- * for one outcome, never both. `inc` is the table's incarnation (newTableInc):
- * a table set up again under the same id has outcomes of its own.
+ * player rides one record per table incarnation and player,
+ * `tbl:<tableId>:<inc>:<pid>`, naming the outcome it paid last: a write adds
+ * to it unless it already names this outcome, and of two written at once the
+ * doc keeps one, so the player is paid for one outcome, never both. The
+ * removal is the last outcome: once paid, nothing more from that table is.
+ * `inc` is the table's incarnation (newTableInc), so a table set up again
+ * under the same id has a record of its own. A total that would leave the
+ * safe range goes on in the next record of the chain (`~1`, `~2`…), which
+ * every page names alike, so an outcome there still counts once.
  */
 export function creditTableOutcome(
   tableId: string, inc: string, outcome: number | 'end', playerId: string, amount: number,
 ): void {
   if (!Number.isSafeInteger(amount) || amount <= 0 || playerId.length === 0 || playerId.length > 256) return;
   const map = ensureChips();
-  const key = `tbl:${tableId}:${playerId}`;
-  const ev = `${inc}:${outcome}`;
+  const base = `tbl:${tableId}:${inc}:${playerId}`;
+  let link = 0;
+  while (map.has(`${base}~${link + 1}`)) link += 1;
+  let key = link === 0 ? base : `${base}~${link}`;
   const stored = map.get(key);
   const was = isChipRecord(stored) && stored.p === playerId ? stored : null;
-  if (was?.ev === ev) return;
-  const d = (was?.d ?? 0) + amount;
-  // (Past the safe range, which no table reaches: a plain credit instead.)
+  const ev = String(outcome);
+  if (was?.ev === ev || was?.ev === 'end') return;
+  let d = (was?.d ?? 0) + amount;
   if (!Number.isSafeInteger(d)) {
-    addChips(playerId, amount);
-    return;
+    key = `${base}~${link + 1}`;
+    d = amount;
   }
   const rec: ChipRecord = { p: playerId, d, b: 0, c: 0, at: Date.now(), ev };
   boundDoc!.transact(() => {
@@ -602,7 +609,7 @@ function isTableBets(value: unknown): value is TableBets {
   if (typeof value !== 'object' || value === null) return false;
   const t = value as Partial<TableBets>;
   return Number.isInteger(t.round) && (t.round as number) >= 1
-    && Array.isArray(t.bets) && t.bets.every(isRouletteBet);
+    && Array.isArray(t.bets) && t.bets.length <= MAX_BETS_PER_PLAYER && t.bets.every(isRouletteBet);
 }
 
 export function readMyBets(tableId: string, playerId: string, round: number): RouletteBet[] {
@@ -654,7 +661,8 @@ export function writeCrapsTableState(tableId: string, state: CrapsTableState): v
 function isCrapsTableBets(value: unknown): value is CrapsTableBets {
   if (typeof value !== 'object' || value === null) return false;
   const t = value as Partial<CrapsTableBets>;
-  return t.kind === 'craps' && Array.isArray(t.bets) && t.bets.every(isCrapsBet);
+  return t.kind === 'craps' && Array.isArray(t.bets) && t.bets.length <= MAX_BETS_PER_PLAYER
+    && t.bets.every(isCrapsBet);
 }
 
 export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {

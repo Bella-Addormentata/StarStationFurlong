@@ -39,6 +39,7 @@ import {
   readCrapsTableState,
   readDiceThrow,
   readSeats,
+  transactCasino,
   writeCrapsTableState,
   writeDiceThrow,
 } from './casinoDoc';
@@ -322,8 +323,11 @@ const PAGE_ID = CRAPS_PAGE_ID;
  *  shooter's throw, timing them out. World ticks it every frame on every
  *  editor's client whatever they're looking at; only the operator page acts,
  *  so shareholders in a venture room never race the settle. If that page
- *  goes away, any editor's next ROLL press finishes the turn. */
-export function tickManualCraps(tableId: string, now = Date.now()): void {
+ *  goes away, any editor's next ROLL press finishes the turn. On a robot
+ *  table (one of the owner's pages not driving it pressed ROLL before the
+ *  robot's first beat) `autoShowMs` gives the settle its show beat, so the
+ *  driving page opens the next window as usual. */
+export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: number): void {
   // Every editor samples (throttled), so whoever presses ROLL has already
   // seen the seated players' heartbeats move and can slide them the dice.
   sampleSeats(tableId, now);
@@ -340,7 +344,7 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
   // Just took the turn over: let the operator stamp converge first, so a
   // rival takeover's write wins or loses before either page settles.
   if (took !== undefined && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
-  tickCrapsClosing(tableId, s, undefined, took !== undefined ? Infinity : now);
+  tickCrapsClosing(tableId, s, autoShowMs, took !== undefined ? Infinity : now);
   tookOverAt.delete(tableId);
 }
 
@@ -442,6 +446,15 @@ export function tickAutoStickman(tableId: string): void {
       closeCrapsBetting(tableId, s, now);
     }
   } else if (s.phase === 'closing') {
+    if (s.operator !== undefined && s.operator !== PAGE_ID) {
+      // A manual turn another page holds: it settles it (tickManualCraps).
+      // Only once it has sat for MANUAL_TAKEOVER_MS (that page is gone) does
+      // the robot take it over and finish it.
+      if (now - noteClosing(tableId, s, now) >= MANUAL_TAKEOVER_MS) {
+        writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
+      }
+      return;
+    }
     tickCrapsClosing(tableId, s, CRAPS_SHOW_MS, now);
   } else if (s.phase === 'settled') {
     if (s.phaseDeadline != null && now >= s.phaseDeadline) {
@@ -459,17 +472,20 @@ export function tickAutoStickman(tableId: string): void {
  * no operator, so stakes are not refunded (matches the manual-mode limitation).
  */
 export function closeCrapsTable(tableId: string): void {
-  if (canRunCroupier()) {
-    const inc = readCrapsTableState(tableId)?.inc ?? '';
-    for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
-      const staked = bets.reduce((sum, b) => sum + b.amount, 0);
-      // Each of the deed holder's pages runs this, and the page driving the
-      // table may be settling a roll meanwhile: the table's one outcome per
-      // bettor pays one of them (croupier.closeTable).
-      creditTableOutcome(tableId, inc, 'end', pid, staked);
+  // One transaction: no page sees the refunds without the table gone.
+  transactCasino(() => {
+    if (canRunCroupier()) {
+      const inc = readCrapsTableState(tableId)?.inc ?? '';
+      for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
+        const staked = bets.reduce((sum, b) => sum + b.amount, 0);
+        // Each of the deed holder's pages runs this, and the page driving the
+        // table may be settling a roll meanwhile: the table's one outcome per
+        // bettor pays one of them (croupier.closeTable).
+        creditTableOutcome(tableId, inc, 'end', pid, staked);
+      }
     }
-  }
-  clearTableKeys(tableId);
+    clearTableKeys(tableId);
+  });
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────

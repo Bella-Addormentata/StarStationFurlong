@@ -239,11 +239,19 @@ const BET_TYPES: readonly string[] = [
 ];
 
 /** Shape guard — bets cross the room-doc trust boundary (peer writes). */
+/** The most chips one bet record holds, and the most records one player's
+ *  list holds (the felt puts down one chip a record, 1000 at most, and 400
+ *  records a player). At the best odds on either table (36 for 1) a list's
+ *  return stays far inside the safe-integer range, so no funded wager can
+ *  win more than the chip ledger can pay. A list past either reads as no bets. */
+export const MAX_BET_AMOUNT = 1_000_000_000;
+export const MAX_BETS_PER_PLAYER = 1_000;
+
 export function isCrapsBet(value: unknown): value is CrapsBet {
   if (typeof value !== 'object' || value === null) return false;
   const b = value as Partial<CrapsBet>;
   if (typeof b.type !== 'string' || !BET_TYPES.includes(b.type)) return false;
-  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0) return false;
+  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0 || (b.amount as number) > MAX_BET_AMOUNT) return false;
   if (b.type === 'place') {
     return Number.isInteger(b.pick) && POINT_NUMBERS.has(b.pick as number);
   }

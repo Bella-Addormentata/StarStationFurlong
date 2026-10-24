@@ -41,6 +41,7 @@ import {
 // its narration + teardown refund.
 import {
   closeCrapsTable,
+  CRAPS_SHOW_MS,
   crapsBeatLine,
   tickAutoStickman,
   tickManualCraps,
@@ -6289,24 +6290,28 @@ export class World {
     // Throttle the heartbeat off wall-clock (not a dt accumulator — a single NaN
     // dt would wedge an accumulator forever while tickAutoCroupier kept running).
     const autoCroupier = canRunCroupier();
-    if (tables.length && autoCroupier) {
-      // Of the deed holder's open pages, one drives (the table-operator lease).
-      if (takeTableTurn()) {
-        const now = Date.now();
-        const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
-        if (beatNow) this.croupierLastBeatAt = now;
-        for (const t of tables) {
-          if (beatNow) beatCroupier(t.id);
-          if (t.kind === "craps-table") tickAutoStickman(t.id);
-          else tickAutoCroupier(t.id);
-        }
+    // Of the deed holder's open pages, one drives (the table-operator lease).
+    if (tables.length && autoCroupier && takeTableTurn()) {
+      const now = Date.now();
+      const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
+      if (beatNow) this.croupierLastBeatAt = now;
+      for (const t of tables) {
+        if (beatNow) beatCroupier(t.id);
+        if (t.kind === "craps-table") tickAutoStickman(t.id);
+        else tickAutoCroupier(t.id);
       }
     }
-    // 🎲 #226: a manual craps table (no robot running it): the page whose
-    // manual ROLL slid the dice out carries that shooter's turn, focused or
-    // not (tickManualCraps returns at once on every other editor's page).
-    else if (crapsTables.length && canEditRoom().ok) {
-      for (const t of crapsTables) if (!isCroupierLive(t.id)) tickManualCraps(t.id);
+    // 🎲 #226: a manual craps turn: the page whose manual ROLL slid the dice
+    // out carries that shooter's turn, focused or not (tickManualCraps
+    // returns at once on every other page). On a table a robot runs (ROLL
+    // was pressed here before its first beat, or on one of the owner's pages
+    // not driving it) the settle takes the robot's show beat, so the robot
+    // opens the next window as usual.
+    else if (crapsTables.length && (autoCroupier || canEditRoom().ok)) {
+      for (const t of crapsTables) {
+        const robot = autoCroupier || isCroupierLive(t.id);
+        tickManualCraps(t.id, Date.now(), robot ? CRAPS_SHOW_MS : undefined);
+      }
     }
     // ⚖️ Fair tables: every client with chips down commits its seed while the
     // window is open and reveals it at "no more bets" (fairTableSeeds.ts).

@@ -13,7 +13,7 @@
  * returns 0 — the chips are already gone.
  */
 
-import { isFairnessTranscript, isSeedRoundFields, isTableIncField } from './craps';
+import { isFairnessTranscript, isSeedRoundFields, isTableIncField, MAX_BET_AMOUNT } from './craps';
 import type { FairnessTranscript } from './craps';
 
 /** Numbers that pay RED (standard wheel). Everything 1–36 not here is black. */
@@ -95,7 +95,7 @@ export function isRouletteBet(value: unknown): value is RouletteBet {
   if (typeof value !== 'object' || value === null) return false;
   const b = value as Partial<RouletteBet>;
   if (typeof b.type !== 'string' || !BET_TYPES.includes(b.type)) return false;
-  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0) return false;
+  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0 || (b.amount as number) > MAX_BET_AMOUNT) return false;
   if (b.type === 'straight') {
     return Number.isInteger(b.pick) && (b.pick as number) >= 0 && (b.pick as number) <= 36;
   }

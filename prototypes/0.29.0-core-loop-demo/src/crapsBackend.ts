@@ -33,6 +33,7 @@ import {
   readCrapsBackendPref,
   readCrapsFairnessPref,
   readCrapsTableState,
+  transactCasino,
   writeCrapsTableState,
   writeMyCrapsBets,
 } from './casinoDoc';
@@ -185,40 +186,44 @@ class LocalCrapsBackend implements CrapsBackend {
     );
     for (const pid of forfeited) remaining[pid] = [];
     const now = Date.now();
-    writeCrapsTableState(tableId, {
-      kind: 'craps',
-      phase: 'settled',
-      round,
-      point: nextPoint(pointBefore, sum),
-      dice: [d1, d2],
-      result: sum,
-      resultAt: now,
-      payouts,
-      sevenOut: shooterHandOver(pointBefore, sum),
-      // 🎲 #226: the hand's shooter rides through the settle (the operator
-      // passes the dice on when it opens the next window after a seven-out).
-      ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
-      ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
-      ...(transcript ? { fairness: transcript } : {}),
-      // ⚖️ The round's commitments stay on the settled record so anyone can
-      // check the transcript against them.
-      ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
-      // The commits and wagers as this page froze them, not as the shared
-      // state reads now (anyone can rewrite it after the reveals).
-      ...frozenFields(tableId, before),
-      ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
-      ...(before.inc !== undefined ? { inc: before.inc } : {}),
-      ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+    // One transaction: a page sees the settled roll, what it paid, and the
+    // pruned felts together.
+    transactCasino(() => {
+      writeCrapsTableState(tableId, {
+        kind: 'craps',
+        phase: 'settled',
+        round,
+        point: nextPoint(pointBefore, sum),
+        dice: [d1, d2],
+        result: sum,
+        resultAt: now,
+        payouts,
+        sevenOut: shooterHandOver(pointBefore, sum),
+        // 🎲 #226: the hand's shooter rides through the settle (the operator
+        // passes the dice on when it opens the next window after a seven-out).
+        ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
+        ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
+        ...(transcript ? { fairness: transcript } : {}),
+        // ⚖️ The round's commitments stay on the settled record so anyone can
+        // check the transcript against them.
+        ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+        // The commits and wagers as this page froze them, not as the shared
+        // state reads now (anyone can rewrite it after the reveals).
+        ...frozenFields(tableId, before),
+        ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
+        ...(before.inc !== undefined ? { inc: before.inc } : {}),
+        ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+      });
+      settledRound(tableId, before);
+      // A page that removed the table meanwhile refunds the felt instead, never
+      // as well: the table's one outcome per bettor (creditTableOutcome).
+      for (const [pid, amount] of Object.entries(payouts)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
+      // Prune the felt: rewrite each player's list to only the bets that survived
+      // (standing pass/place). Empty ⇒ their felt clears.
+      for (const [pid, bets] of Object.entries(remaining)) {
+        writeMyCrapsBets(tableId, pid, bets);
+      }
     });
-    settledRound(tableId, before);
-    // A page that removed the table meanwhile refunds the felt instead, never
-    // as well: the table's one outcome per bettor (creditTableOutcome).
-    for (const [pid, amount] of Object.entries(payouts)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
-    // Prune the felt: rewrite each player's list to only the bets that survived
-    // (standing pass/place). Empty ⇒ their felt clears.
-    for (const [pid, bets] of Object.entries(remaining)) {
-      writeMyCrapsBets(tableId, pid, bets);
-    }
     return [d1, d2];
   }
 }

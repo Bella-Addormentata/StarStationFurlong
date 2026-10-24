@@ -17,6 +17,7 @@ type Page = {
   casino: typeof import('./casinoDoc');
   croupier: typeof import('./croupier');
   craps: typeof import('./crapsCroupier');
+  backend: typeof import('./crapsBackend');
   doc: Y.Doc;
 };
 
@@ -38,9 +39,10 @@ async function loadPage(): Promise<Page> {
   const casino = await import('./casinoDoc');
   const croupier = await import('./croupier');
   const craps = await import('./crapsCroupier');
+  const backend = await import('./crapsBackend');
   const doc = new Y.Doc();
   casino.bindCasinoDoc(doc);
-  return { casino, croupier, craps, doc };
+  return { casino, croupier, craps, backend, doc };
 }
 
 function sync(a: Y.Doc, b: Y.Doc): void {
@@ -50,6 +52,21 @@ function sync(a: Y.Doc, b: Y.Doc): void {
 
 function turn(page: Page, now: number): boolean {
   return page.croupier.takeTableTurn(now);
+}
+
+/** Let an async settle (the dice's hashing) land. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Count the updates a page's doc sends while `act` runs. */
+function updatesDuring(page: Page, act: () => void): number {
+  let n = 0;
+  const count = (): void => { n += 1; };
+  page.doc.on('update', count);
+  act();
+  page.doc.off('update', count);
+  return n;
 }
 
 let a: Page;
@@ -132,6 +149,15 @@ describe('a table torn down on both pages', () => {
     expect(b.casino.readChips(bettor)).toBe(100);
   });
 
+  it('sends the refunds and the removal as one update, so no page sees one without the other', () => {
+    betAndShare();
+    expect(updatesDuring(b, () => b.croupier.closeTable(TABLE))).toBe(1);
+    const craps = 'craps-1';
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    expect(updatesDuring(a, () => a.craps.closeCrapsTable(craps))).toBe(1);
+  });
+
   it('refunds them once when the page not driving removes it first and the driver hears after', () => {
     betAndShare();
     b.croupier.closeTable(TABLE); // refunds, then clears the bets
@@ -165,7 +191,8 @@ describe('a table torn down on both pages', () => {
     betAndShare();
     a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
     sync(a.doc, b.doc);
-    a.croupier.rollAndSettle(TABLE, 1); // a plain RNG table settles at once
+    // A plain RNG table settles at once, the round and its pay in one update.
+    expect(updatesDuring(a, () => a.croupier.rollAndSettle(TABLE, 1))).toBe(1);
     expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', result: 1 });
     expect(a.casino.readChips(bettor)).toBe(130);
     b.croupier.closeTable(TABLE); // b still sees the round closing
@@ -213,6 +240,77 @@ describe('a table set up again under the same id', () => {
     a.croupier.closeTable(TABLE);
     a.croupier.openBetting(TABLE, 1);
     expect(a.casino.readTableState(TABLE)!.inc).not.toBe(inc);
+  });
+});
+
+describe('bets the chip ledger could not pay', () => {
+  it('a bet past the largest stake, or a list past the most records, reads as no bets', () => {
+    a.casino.writeMyBets(TABLE, 'player-huge', 1, [{ type: 'red', amount: 2 ** 52 }]);
+    a.casino.writeMyBets(TABLE, 'player-long', 1, Array.from({ length: 1001 }, () => ({ type: 'red' as const, amount: 1 })));
+    a.casino.writeMyBets(TABLE, 'player-full', 1, Array.from({ length: 1000 }, () => ({ type: 'red' as const, amount: 1000 })));
+    expect(Object.keys(a.casino.readAllBets(TABLE, 1))).toEqual(['player-full']);
+    const craps = 'craps-1';
+    a.casino.writeMyCrapsBets(craps, 'player-huge', [{ type: 'pass', amount: 2 ** 52 }]);
+    a.casino.writeMyCrapsBets(craps, 'player-long', Array.from({ length: 1001 }, () => ({ type: 'pass' as const, amount: 1 })));
+    a.casino.writeMyCrapsBets(craps, 'player-full', [{ type: 'pass', amount: 1000 }]);
+    expect(Object.keys(a.casino.readAllCrapsBets(craps))).toEqual(['player-full']);
+  });
+});
+
+describe('a manual craps roll held by the owner\'s page that is not driving', () => {
+  const table = 'craps-1';
+  let now = 2_000_000_000;
+  const later = (ms: number): void => {
+    now += ms;
+    vi.setSystemTime(now);
+  };
+
+  /** Page a drives; page b pressed THROW THE DICE before the robot's first
+   *  beat, so b holds this roll. */
+  function heldByB(): void {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    later(0);
+    a.casino.writeCrapsFairnessPref(table, 'rng');
+    turn(a, now);
+    sync(a.doc, b.doc);
+    b.craps.openCrapsBetting(table, 1, null);
+    const s = b.casino.readCrapsTableState(table)!;
+    b.casino.writeCrapsTableState(table, { ...s, phase: 'closing', operator: b.backend.CRAPS_PAGE_ID, phaseDeadline: now });
+    sync(a.doc, b.doc);
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('is rolled there with the robot\'s show beat, and the robot opens the next roll', async () => {
+    heldByB();
+    later(100);
+    a.craps.tickAutoStickman(table); // the robot leaves b's roll alone
+    expect(a.casino.readDiceThrow(table)).toBeNull();
+    b.craps.tickManualCraps(table, now, b.craps.CRAPS_SHOW_MS);
+    await flush();
+    sync(a.doc, b.doc);
+    const settled = a.casino.readCrapsTableState(table)!;
+    expect(settled).toMatchObject({ phase: 'settled', round: 1 });
+    expect(settled.phaseDeadline).toBe(now + a.craps.CRAPS_SHOW_MS);
+    later(a.craps.CRAPS_SHOW_MS);
+    a.craps.tickAutoStickman(table);
+    expect(a.casino.readCrapsTableState(table)).toMatchObject({ phase: 'betting', round: 2 });
+  });
+
+  it('is taken over by the robot once the page holding it has gone quiet', async () => {
+    heldByB();
+    a.craps.tickAutoStickman(table);
+    later(a.craps.MANUAL_TAKEOVER_MS - 100);
+    a.craps.tickAutoStickman(table);
+    expect(a.casino.readCrapsTableState(table)?.operator).toBe(b.backend.CRAPS_PAGE_ID);
+    later(200);
+    a.craps.tickAutoStickman(table);
+    expect(a.casino.readCrapsTableState(table)?.operator).toBe(a.backend.CRAPS_PAGE_ID);
+    a.craps.tickAutoStickman(table);
+    await flush();
+    expect(a.casino.readCrapsTableState(table)).toMatchObject({ phase: 'settled', round: 1 });
   });
 });
 

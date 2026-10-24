@@ -446,6 +446,54 @@ describe('what a table pays a player', () => {
     expect(pageA.readChips(PLAYER)).toBe(60);
   });
 
+  it('a removal is the last outcome: a round settled after it hears of the refund pays nothing', () => {
+    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
+    sync(docA, docB);
+    pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 60);
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(30);
+  });
+
+  it('a late removal of the table before never touches what its replacement paid, whichever page wins', async () => {
+    for (const [clientA, clientB] of [[1, 2], [2, 1]]) {
+      docA = new Y.Doc();
+      docB = new Y.Doc();
+      docA.clientID = clientA;
+      docB.clientID = clientB;
+      pageA = await loadPage(docA);
+      pageB = await loadPage(docB);
+      // Page a refunds the old table, then pays the new one's round 1; page b
+      // refunds the old table too, before hearing any of it.
+      pageA.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
+      pageA.creditTableOutcome(TABLE, 'inc2', 1, PLAYER, 60);
+      pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
+      sync(docA, docB);
+      for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(90);
+    }
+  });
+
+  it('past the safe range goes on in the next record of the chain, and an outcome there still counts once', () => {
+    const max = Number.MAX_SAFE_INTEGER;
+    const sum = (page: CasinoDoc): bigint =>
+      page.readChipRecords(PLAYER).reduce((n, r) => n + BigInt(r.d), 0n);
+    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, max - 5);
+    sync(docA, docB);
+    // Round 2 on both pages at once, then again on one: the same next record.
+    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 10);
+    pageB.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 10);
+    sync(docA, docB);
+    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 10);
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) {
+      expect(sum(page)).toBe(BigInt(max) + 5n);
+      expect(page.readChipRecords(PLAYER)).toHaveLength(2);
+    }
+    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 7);
+    pageB.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 7); // after the removal: nothing
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) expect(sum(page)).toBe(BigInt(max) + 12n);
+  });
+
   it('rides one record per table and player, however many rounds it pays', () => {
     for (let round = 1; round <= 50; round++) pageA.creditTableOutcome(TABLE, 'inc1', round, PLAYER, 2);
     pageA.creditTableOutcome('craps-1', 'inc9', 1, PLAYER, 3);

@@ -39,6 +39,7 @@ import {
   readCroupierBeat,
   readTableOperatorLease,
   readTableState,
+  transactCasino,
   writeCroupierBeat,
   writeTableOperatorLease,
   writeTableState,
@@ -259,30 +260,33 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   }
   const payouts = result === null ? {} : resolveRound(bets, result);
   const now = Date.now();
-  writeTableState(tableId, {
-    kind: 'roulette',
-    phase: 'settled',
-    round,
-    result,
-    resultAt: now,
-    payouts,
-    ...(voided ? { voided: true } : {}),
-    ...(fairness ? { fairness } : {}),
-    ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
-    // The commits and wagers as this page froze them, not as the shared
-    // state reads now (anyone can rewrite it after the reveals).
-    ...frozenFields(tableId, before),
-    ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
-    ...(before.inc !== undefined ? { inc: before.inc } : {}),
-    ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+  // One transaction: a page sees the settled round and what it paid together.
+  transactCasino(() => {
+    writeTableState(tableId, {
+      kind: 'roulette',
+      phase: 'settled',
+      round,
+      result,
+      resultAt: now,
+      payouts,
+      ...(voided ? { voided: true } : {}),
+      ...(fairness ? { fairness } : {}),
+      ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+      // The commits and wagers as this page froze them, not as the shared
+      // state reads now (anyone can rewrite it after the reveals).
+      ...frozenFields(tableId, before),
+      ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
+      ...(before.inc !== undefined ? { inc: before.inc } : {}),
+      ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+    });
+    settledRound(tableId, before);
+    // One credit per bettor for the round, its payout and refund together: a
+    // page that removed the table meanwhile refunds the same bettor instead,
+    // never as well (creditTableOutcome).
+    const owed: Record<string, number> = { ...payouts };
+    for (const [pid, amount] of Object.entries(refunds)) owed[pid] = (owed[pid] ?? 0) + amount;
+    for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
   });
-  settledRound(tableId, before);
-  // One credit per bettor for the round, its payout and refund together: a
-  // page that removed the table meanwhile refunds the same bettor instead,
-  // never as well (creditTableOutcome).
-  const owed: Record<string, number> = { ...payouts };
-  for (const [pid, amount] of Object.entries(refunds)) owed[pid] = (owed[pid] ?? 0) + amount;
-  for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
 }
 
 /** "No more bets": close the window and freeze the round's commitments.
@@ -355,9 +359,10 @@ export function tickAutoCroupier(tableId: string): void {
  * still cleared.
  */
 export function closeTable(tableId: string): void {
-  if (canRunCroupier()) {
+  // One transaction: no page sees the refunds without the table gone.
+  transactCasino(() => {
     const s = readTableState(tableId);
-    if (s && s.phase !== 'settled') {
+    if (canRunCroupier() && s && s.phase !== 'settled') {
       for (const [pid, bets] of Object.entries(readAllBets(tableId, s.round))) {
         const staked = bets.reduce((sum, b) => sum + b.amount, 0);
         // Each of the deed holder's pages runs this, whichever removed the
@@ -366,8 +371,8 @@ export function closeTable(tableId: string): void {
         creditTableOutcome(tableId, s.inc ?? '', 'end', pid, staked);
       }
     }
-  }
-  clearTableKeys(tableId);
+    clearTableKeys(tableId);
+  });
 }
 
 export function beatCroupier(tableId: string): void {
