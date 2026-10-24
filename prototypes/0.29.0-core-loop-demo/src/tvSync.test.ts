@@ -5,7 +5,8 @@
  * scheduled programme parks at 0 and starts at T0; a paused one holds.
  */
 import { describe, expect, it } from 'vitest';
-import { replayNeedsRemount, TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync';
+import { lapRemountIsFree, replayNeedsRemount, TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync';
+import { forgetMountBudget, mayMountNow, TV_MOUNT_BUDGET } from './tvConsent';
 import type { TvPlayer } from './tvSync';
 import { TV_HEARTBEAT_MS, TV_NUDGE_RATE } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -1274,5 +1275,31 @@ describe('🔁 LOOP, through the record', () => {
     expect(replayNeedsRemount(seekable, 1, 2)).toBe(false); // the controller seeks it back
     const running = new FakePlayer(true, false);
     expect(replayNeedsRemount(running, 1, 2)).toBe(false); // still playing: rebuilt once it runs out
+  });
+
+  it('a looping clip rebuilt lap after lap spends none of the mount budget; one shorter than the floor spends it as any mount does', () => {
+    forgetMountBudget();
+    let now = 1_000_000;
+    let mountedAt = now;
+    // The theatre's rule: a lap's rebuild is free past the floor, else it asks the budget.
+    const lapMount = () => {
+      if (!lapRemountIsFree(mountedAt, now) && !mayMountNow('tv-1', now)) return false;
+      mountedAt = now;
+      return true;
+    };
+    for (let lap = 0; lap < 3 * TV_MOUNT_BUDGET; lap++) {
+      now += 8_000; // an 8 s clip, played to its end each lap
+      expect(lapMount()).toBe(true);
+    }
+    for (let i = 0; i < TV_MOUNT_BUDGET; i++) expect(mayMountNow('tv-1', now + i)).toBe(true); // the budget is whole
+    forgetMountBudget();
+    let laps = 0;
+    for (let lap = 0; lap < 3 * TV_MOUNT_BUDGET; lap++) {
+      now += 1_000; // a 1 s clip: counted, so six laps in the minute and then PLAY
+      if (!lapMount()) break; // refused: the player is down and the bar shows PLAY, so no more laps run out
+      laps++;
+    }
+    expect(laps).toBe(TV_MOUNT_BUDGET);
+    expect(mayMountNow('tv-1', now)).toBe(false); // what remounts it next is the budget's window, or the press
   });
 });

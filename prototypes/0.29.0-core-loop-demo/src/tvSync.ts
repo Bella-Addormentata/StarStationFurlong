@@ -128,6 +128,19 @@ export function replayNeedsRemount(player: TvPlayer, mountedFor: number, started
   return mountedFor !== started && player.isEnded() && !player.canSeek;
 }
 
+/** A lap's rebuild (above) fetches again the source this viewer's own player
+ *  just played to its end, so it comes no faster than the clip runs here —
+ *  not the source churn the theatre's mount budget is for (tvConsent
+ *  mayMountNow), and a looping film is not stopped at its seventh lap in a
+ *  minute. Free only when the player it replaces was built at least
+ *  TV_LAP_REMOUNT_MIN_MS ago (`mountedAtMs`, monotonic): a clip shorter than
+ *  that still counts, so a near-empty one cannot have the theatre fetch on
+ *  every tick. */
+export const TV_LAP_REMOUNT_MIN_MS = 5_000;
+export function lapRemountIsFree(mountedAtMs: number, now: number): boolean {
+  return now - mountedAtMs >= TV_LAP_REMOUNT_MIN_MS;
+}
+
 export class TvSyncController {
   private readonly now: () => number;
   private readonly rttMs: () => number;

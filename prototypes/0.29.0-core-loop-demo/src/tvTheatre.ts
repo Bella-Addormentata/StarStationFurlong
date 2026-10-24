@@ -22,7 +22,7 @@
  * offers a retry, and nothing else in the room depends on them.
  */
 
-import { replayNeedsRemount, TvSyncController } from './tvSync';
+import { lapRemountIsFree, replayNeedsRemount, TvSyncController } from './tvSync';
 import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
@@ -360,6 +360,9 @@ interface Theatre {
    *  follows a replay and keeps this, one that cannot seek is rebuilt
    *  (tvSync replayNeedsRemount). */
   mountedFor: number;
+  /** When the adapter was built (tvNow): a LOOP lap's rebuild of a player
+   *  that ran for at least TV_LAP_REMOUNT_MIN_MS is not counted (tvSync). */
+  mountedAt: number;
   /** The mount key of what the adapter was built for ('' = nothing mounted):
    *  the sourceId, plus the programme's `started` for a start-only embed. */
   mounted: string;
@@ -494,6 +497,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     onKey,
     playerFor: -1,
     mountedFor: -1,
+    mountedAt: 0,
     probing: '',
     probeAbort: null,
     budgetedKey: '',
@@ -635,6 +639,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
   unmountPlayer(t);
   t.mounted = key;
   t.mountedFor = t.playerFor; // this tick's programme (theatreTick notes it before mounting)
+  t.mountedAt = tvNow();
   const token = t.attempt;
   const live = () => theatre === t && t.attempt === token;
   const fail = (why: string) => {
@@ -792,9 +797,12 @@ function theatreTick(rtt: () => number): void {
     // …and so does a player that ran out and cannot seek back to follow a
     // new start of the same source (a replay, a LOOP lap): rebuilt, it
     // plays from the top.
-    const stale = t.mounted !== '' && (consent !== 'ok' || (t.mounted !== key && t.mounted !== `failed:${key}`)
-      || (t.player !== null && replayNeedsRemount(t.player, t.mountedFor, rec.started)));
+    const lap = t.mounted === key && t.player !== null && replayNeedsRemount(t.player, t.mountedFor, rec.started);
+    const stale = t.mounted !== '' && (consent !== 'ok' || (t.mounted !== key && t.mounted !== `failed:${key}`) || lap);
     if (stale) unmountPlayer(t);
+    // That rebuild comes no faster than the clip runs here, so it is not
+    // the churn the mount budget counts (tvSync lapRemountIsFree).
+    if (lap && consent === 'ok' && lapRemountIsFree(t.mountedAt, tvNow())) t.budgetedKey = key;
     // The programme the player is (or is about to be) mounted for — noted
     // here, on the theatre's own tick, so between a source change and this
     // tick the registration still names the OLD programme and tvSession
