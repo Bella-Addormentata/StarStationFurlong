@@ -475,6 +475,7 @@ export class TvSyncController {
       if (this.pendingTarget === null && !this.endedHandled) {
         this.endedHandled = true;
         this.onEnded();
+        this.followLap(p, now);
       }
       return pb;
     }
@@ -489,6 +490,29 @@ export class TvSyncController {
       this.lastBeatAt = now;
     }
     return pb;
+  }
+
+  /** A LOOP lap the end handler just wrote (tvProgrammeEnded) starts the
+   *  room over from the top as of now: the holder's own player follows it
+   *  in the same tick, from where the record now says (0), not on the next
+   *  one — by then the room is a tick into the lap, so every lap would skip
+   *  its first tick, and a clip shorter than a tick would be sent straight
+   *  to its end and ended again, unplayed. A player that cannot seek is
+   *  rebuilt for the lap instead (tvTheatre, replayNeedsRemount). */
+  private followLap(p: TvPlayer, now: number): void {
+    const jump = this.jump();
+    if (!p.canSeek || jump === this.appliedJump) return;
+    const pb = this.playback(now, 0);
+    if (pb.state !== 'playing') return; // LOOP off: back home, which the next tick follows
+    this.appliedJump = jump;
+    this.countdownJump = null;
+    this.seenStarted = this.started();
+    this.endedHandled = false;
+    this.aim(p, reachable(holderAnchorMs(pb), p), now);
+    this.settlePending(p, now);
+    // A seek that lands later (YouTube's) is waited for as any jump's: the
+    // tick it un-ends the player plays it.
+    if (!p.isEnded() && !p.isPlaying()) p.play();
   }
 
   /** The holder takes aim at a transport target: the seek goes out now if

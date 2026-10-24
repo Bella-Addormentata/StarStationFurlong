@@ -162,6 +162,12 @@ export interface TvProgramme {
    *  publishes where its own player is; a lookup started under an older
    *  revision is void. */
   jump: number;
+  /** The LOOP laps this record has run (tvProgrammeEnded), each bumped
+   *  with `jump`: a lap is a transport write the players follow, but no
+   *  one's programme action, so a lookup in flight (an upload, an
+   *  archive.org lookup, for PLAY NOW over a looping film) reads past it
+   *  (tvRevision). */
+  laps: number;
   /** Where the media ends, in ms, as the holder's player reported it for
    *  THIS programme (tvNoteEnd) — 0 until a player knows, and for a live
    *  stream. It travels with the record so that a holder handed the remote
@@ -212,6 +218,7 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   started: 0,
   showing: 0,
   jump: 0,
+  laps: 0,
   endMs: 0,
   loop: false,
   history: [],
@@ -641,7 +648,7 @@ export function tvPageId(): string {
 const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
 const num = (v: unknown, fallback = 0): number =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-/** One rule for every revision counter (`seq`, `started`, `jump`, the
+/** One rule for every revision counter (`seq`, `started`, `jump`, `laps`, the
  *  switch's `seq`): a reader compares it for CHANGE, never for order, and a
  *  writer moves it by one, so it must be a whole number that one more still
  *  moves. A peer's `Number.MAX_VALUE` passes as a finite number, yet adding
@@ -739,6 +746,7 @@ export function readProgramme(itemId: string): TvProgramme {
     started,
     showing: Number.isSafeInteger(shown) && (shown as number) >= 0 && (shown as number) <= started ? (shown as number) : started,
     jump: counter(raw.jump),
+    laps: counter(raw.laps),
     endMs: Math.max(0, Math.floor(num(raw.endMs))),
     loop: raw.loop === true,
     history,
@@ -775,9 +783,12 @@ export function readTv(itemId: string): TvRecord {
 }
 
 /** The revision a lookup in flight is checked against: any programme action
- *  (`jump`) or power press (`seq`) meanwhile voids it. */
+ *  (`jump`) or power press (`seq`) meanwhile voids it. A LOOP lap moves
+ *  `jump` and `laps` together, so it does not: a film that loops while an
+ *  upload runs is the film that upload is to replace. */
 export function tvRevision(itemId: string): string {
-  return `${readProgramme(itemId).jump}:${readPower(itemId).seq}`;
+  const rec = readProgramme(itemId);
+  return `${rec.jump - rec.laps}:${readPower(itemId).seq}`;
 }
 
 export function readRemote(itemId: string): RemoteRecord {
@@ -1185,6 +1196,7 @@ export function tvProgrammeEnded(itemId: string): TvAction {
   if (!rec.loop || !rec.source) return tvStop(itemId);
   write(tvKey(itemId), {
     ...rec, state: 'playing', startAt: 0, positionMs: 0, seq: bump(rec.seq), started: bump(rec.started), jump: bump(rec.jump),
+    laps: bump(rec.laps),
   } satisfies TvProgramme);
   return { ok: true };
 }

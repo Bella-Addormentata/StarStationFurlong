@@ -1058,6 +1058,26 @@ describe('🔁 LOOP', () => {
     expect(readProgramme(TV).loop).toBe(false);
   });
 
+  it('a lap leaves a lookup in flight standing (an upload for PLAY NOW over a looping film); a programme action still voids it', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, CLIP);
+    tvSetLoop(TV, true);
+    const revision = tvRevision(TV);
+    tvProgrammeEnded(TV);
+    tvProgrammeEnded(TV);
+    expect(readTv(TV).laps).toBe(2);
+    expect(tvRevision(TV)).toBe(revision);
+    tvPause(TV, 1_000);
+    expect(tvRevision(TV)).not.toBe(revision);
+    const paused = tvRevision(TV);
+    tvSetLoop(TV, false);
+    tvProgrammeEnded(TV); // the end with LOOP off is STOP: home
+    expect(readTv(TV).state).toBe('home');
+    expect(tvRevision(TV)).not.toBe(paused);
+    doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), laps: -3 });
+    expect(readProgramme(TV).laps).toBe(0);
+  });
+
   it('at the end starts the same programme over from the top, the end kept and the history and library left alone; without it, home', () => {
     pickUpRemote(TV);
     tvPlay(TV, CLIP);

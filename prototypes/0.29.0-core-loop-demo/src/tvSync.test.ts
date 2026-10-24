@@ -1253,16 +1253,50 @@ describe('🔁 LOOP, through the record', () => {
     p.playing = false;
     step();
     expect(readTv('tv-1')).toMatchObject({ state: 'playing', started: first + 1, positionMs: 0, loop: true });
-    step(); // the holder follows its own replay: back to the top, where the room is 400 ms on
-    expect(p.log.at(-2)).toBe('seek:400');
-    expect(p.position).toBe(400);
+    // The holder follows its own lap in the same tick: from the top, where
+    // the record starts it, not a tick into it.
+    expect(p.log.slice(-2)).toEqual(['seek:0', 'play']);
+    expect(p.position).toBe(0);
     expect(p.ended).toBe(false);
     expect(p.playing).toBe(true);
+    const seeks = p.log.filter((l) => l.startsWith('seek')).length;
+    step(); // and the next tick has nothing left to follow
+    expect(p.log.filter((l) => l.startsWith('seek')).length).toBe(seeks);
     tvSetLoop('tv-1', false);
     p.seek(5_000);
     p.playing = false;
     step();
     expect(readTv('tv-1')).toMatchObject({ state: 'home', source: null });
+  });
+
+  it('a clip shorter than a tick still plays every lap from the top, never sent to its end unplayed', () => {
+    let now = 300_000;
+    setTvClock(() => now);
+    setTvHostPredicate(() => false);
+    setTvPageId('A');
+    bindTvDoc(new Y.Doc());
+    setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    pickUpRemote('tv-1');
+    tvPlay('tv-1', { kind: 'url', url: 'https://example.org/blip.mp4' });
+    tvSetLoop('tv-1', true);
+    const p = new FakePlayer(true);
+    p.duration = 300; // shorter than the theatre's 400 ms tick
+    const c = new TvSyncController({ itemId: 'tv-1', player: p, now: () => now });
+    const step = () => {
+      now += 400;
+      markTvPageAwake(now);
+      c.tick();
+    };
+    step();
+    const first = readTv('tv-1').started;
+    for (let lap = 1; lap <= 5; lap++) {
+      p.seek(300); // it played out between ticks
+      p.playing = false;
+      step();
+      expect(readTv('tv-1').started).toBe(first + lap);
+      expect(p.log.slice(-2)).toEqual(['seek:0', 'play']);
+      expect(p.ended).toBe(false);
+    }
   });
 
   it('a player that ran out and cannot seek back is rebuilt for a new start; one that can seek, or has not run out, or is for this start, is kept', () => {
