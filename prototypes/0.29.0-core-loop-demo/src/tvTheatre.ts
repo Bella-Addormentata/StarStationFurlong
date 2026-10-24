@@ -39,7 +39,7 @@ import { SERVERLESS_ONLY } from './sovereignty';
 import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, recheckBlob, refreshHolders } from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
-import { attachScreenHost, detachScreenHost } from './tvScreenLayer';
+import { attachScreenHost, detachScreenHost, setScreenHostShown } from './tvScreenLayer';
 import type { TvScreenHandle } from './devices';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
@@ -347,6 +347,8 @@ interface Theatre {
   lastNotice: string;
   /** The set's screen the picture is on while one is mounted. */
   shownOn: TvScreenHandle | null;
+  /** The bar's keys (barKeys), removed on close. */
+  onKey: (e: KeyboardEvent) => void;
   /** The mount key whose URL the redirect probe (tvConsent probeRedirect)
    *  is out for, '' when none: one probe per programme, and its answer is
    *  read from tvConsent on the tick after it lands. */
@@ -417,7 +419,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
   const root = document.createElement('div');
   root.id = 'tv-theatre';
   root.setAttribute('role', 'region');
-  root.setAttribute('aria-label', 'Television');
+  root.setAttribute('aria-label', 'Television (T: to the controls, Escape: back to the world)');
   root.innerHTML = `
     <div class="tv-theatre-panel">
       <div class="tv-theatre-head"></div>
@@ -429,6 +431,8 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
   // window and would walk the player or wake a device behind it.
   root.addEventListener('click', (e) => e.stopPropagation());
   document.body.appendChild(root);
+  const onKey = (e: KeyboardEvent) => barKeys(root, e);
+  window.addEventListener('keydown', onKey, true);
   theatre = {
     root,
     itemId,
@@ -449,6 +453,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     lastHead: '',
     lastNotice: '',
     shownOn: null,
+    onKey,
     playerFor: -1,
     probing: '',
     probeAbort: null,
@@ -458,6 +463,46 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
   theatre.timer = window.setInterval(() => theatreTick(rtt), 400);
   theatreTick(rtt);
   updateTvChip([itemId]);
+}
+
+/** The bar's keyboard, without making it modal (capture phase on window,
+ *  ahead of the world's own listeners). T, from the world, puts focus on
+ *  the bar's first control: a consent ask, FETCH or TAP TO PLAY is reached
+ *  without a pointer. With focus on the bar, every key stays on it, so the
+ *  world's shortcuts (Tab's phone, Enter's quick chat, WASD) neither fire
+ *  nor eat a button's own Enter or Space; Tab and Shift+Tab move along the
+ *  bar, and Escape hands the keys back to the world. Keyups are never held,
+ *  so a key held as focus moved is still released to the world. */
+function barKeys(root: HTMLElement, e: KeyboardEvent): void {
+  const target = e.target instanceof Node ? e.target : null;
+  if (target && root.contains(target)) {
+    e.stopPropagation();
+    if (e.key === 'Escape') {
+      (document.activeElement as HTMLElement | null)?.blur?.();
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      const focusable = theatreFocusable(root);
+      if (focusable.length === 0) return;
+      const at = focusable.indexOf(document.activeElement as HTMLElement);
+      const next = e.shiftKey
+        ? focusable[(at <= 0 ? focusable.length : at) - 1]!
+        : focusable[(at + 1) % focusable.length]!;
+      next.focus();
+    }
+    return;
+  }
+  // T for TV, from the world only: never while typing, with a modifier, or
+  // with the phone open (its fields and its own keys).
+  if (e.key !== 't' && e.key !== 'T') return;
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  const el = target instanceof HTMLElement ? target : null;
+  if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+  if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
+  const first = theatreFocusable(root)[0];
+  if (!first) return;
+  e.preventDefault();
+  e.stopPropagation();
+  first.focus();
 }
 
 /** The bar's controls in order: its buttons and the volume slider. */
@@ -477,8 +522,11 @@ export function closeTvTheatre(byViewer = false): void {
   theatre = null;
   if (byViewer) dismissed = { itemId: t.itemId, started: readTv(t.itemId).started };
   window.clearInterval(t.timer);
+  window.removeEventListener('keydown', t.onKey, true);
+  const hadFocus = t.root.contains(document.activeElement);
   unmountPlayer(t);
   t.root.remove();
+  if (hadFocus) (document.activeElement as HTMLElement | null)?.blur?.();
 }
 
 function unmountPlayer(t: Theatre): void {
@@ -740,6 +788,11 @@ function theatreTick(rtt: () => number): void {
       }
     }
   }
+  // A picture laid on the set in the DOM shows only while the programme
+  // plays or pauses, as the set's own video plane does (furniture.ts): a
+  // countdown stays the set's card.
+  const pbNow = readPlayback(t.itemId).state;
+  setScreenHostShown(pbNow === 'playing' || pbNow === 'paused');
   t.controller?.tick();
   renderTheatreChrome(t);
 }

@@ -163,21 +163,25 @@ describe('the smart TV as built', () => {
     const video = { videoWidth: 640, videoHeight: 480, addEventListener: () => undefined, removeEventListener: () => undefined } as unknown as HTMLVideoElement;
     handle.draw(view('scheduled', 'METROPOLIS'));
     handle.showVideo(video);
-    const [picture] = pictures();
-    expect(picture).toBeDefined();
-    expect(picture!.visible).toBe(false); // a countdown is the card
+    const [mesh] = pictures();
+    expect(mesh).toBeDefined();
+    // World sets every furniture mesh's own `visible` each frame: the gate
+    // is on the frame around it, and must hold whatever the mesh says.
+    mesh!.visible = true;
+    const picture = { get visible() { let o: THREE.Object3D | null = mesh!; while (o) { if (!o.visible) return false; o = o.parent; } return true; }, scale: mesh!.scale };
+    expect(picture.visible).toBe(false); // a countdown is the card
     handle.draw(view('playing', 'METROPOLIS'));
-    expect(picture!.visible).toBe(true);
-    expect(picture!.scale.y).toBeCloseTo(handle.planeH);
-    expect(picture!.scale.x).toBeCloseTo(handle.planeH * (4 / 3));
-    expect(picture!.scale.x).toBeLessThan(handle.planeW);
+    expect(picture.visible).toBe(true);
+    expect(picture.scale.y).toBeCloseTo(handle.planeH);
+    expect(picture.scale.x).toBeCloseTo(handle.planeH * (4 / 3));
+    expect(picture.scale.x).toBeLessThan(handle.planeW);
     handle.draw(view('paused', 'METROPOLIS'));
-    expect(picture!.visible).toBe(true);
+    expect(picture.visible).toBe(true);
     handle.draw(view('home'));
-    expect(picture!.visible).toBe(false);
+    expect(picture.visible).toBe(false);
     handle.draw(view('playing', 'METROPOLIS'));
     handle.showVideo(null);
-    expect(picture!.visible).toBe(false);
+    expect(picture.visible).toBe(false);
     expect(pictures()).toHaveLength(0); // the texture is let go
   });
 

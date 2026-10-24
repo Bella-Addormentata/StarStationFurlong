@@ -11180,10 +11180,15 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   let viewState: TvScreenView["state"] = "off";
   const pictureMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
   const picture = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), pictureMat);
-  picture.position.z = 0.001;
-  picture.visible = false;
   picture.raycast = () => undefined; // clicks land on the set, as before
-  screen.add(picture);
+  // Shown and hidden through a Group, not the mesh: World sets every
+  // furniture mesh's own `visible` on each frame (the zoom's interior pass),
+  // which would put an empty white plane over the card.
+  const pictureFrame = new THREE.Group();
+  pictureFrame.position.z = 0.001;
+  pictureFrame.visible = false;
+  pictureFrame.add(picture);
+  screen.add(pictureFrame);
   /** Fit the video's own shape inside the screen (letterbox or pillarbox). */
   const fitPicture = () => {
     const vw = video?.videoWidth ?? 0;
@@ -11226,8 +11231,8 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
     viewState = view.state;
-    picture.visible = pictureOn();
-    if (picture.visible) {
+    pictureFrame.visible = pictureOn();
+    if (pictureFrame.visible) {
       // The picture is up: the card behind it is the black around it.
       fill("#000000");
       glowLevel = 1.1;
@@ -11343,7 +11348,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       // back) with the picture.
       last = "";
       if (lastView) handle.draw(lastView);
-      else picture.visible = pictureOn();
+      else pictureFrame.visible = pictureOn();
     },
     plane: screen,
     planeW: screenW,

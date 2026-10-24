@@ -6,10 +6,12 @@
  * sampled into a texture, so it is laid over the set's screen plane in the
  * DOM instead: one CSS3DRenderer layer over the world's canvas, holding one
  * CSS3DObject that copies the plane's world matrix every frame, so the
- * picture sits on the set as the camera swings and zooms. The layer takes no
- * pointer events (the world under it keeps its clicks; the remote and the
- * theatre's bar are the controls), and, being over the canvas, it is not
- * hidden by whatever stands between the camera and the set.
+ * picture sits on the set as the camera swings and zooms, and is shown only
+ * while the set's screen is (World hides the furniture outside the room
+ * view) and the theatre says the programme is playing or paused. The layer
+ * takes no pointer events (the world under it keeps its clicks; the remote
+ * and the theatre's bar are the controls), and, being over the canvas, it is
+ * not hidden by whatever stands between the camera and the set.
  */
 
 import * as THREE from 'three';
@@ -31,6 +33,20 @@ interface Layer {
 }
 
 let layer: Layer | null = null;
+/** The theatre's word: the programme is playing or paused (a countdown and
+ *  a home screen are the set's own card). */
+let shown = false;
+
+/** Whether the laid picture may show (tvTheatre, every tick). */
+export function setScreenHostShown(on: boolean): void {
+  shown = on;
+}
+
+/** The plane is drawn: it and every ancestor visible. */
+function drawn(o: THREE.Object3D | null): boolean {
+  for (; o; o = o.parent) if (!o.visible) return false;
+  return true;
+}
 
 function camera(): THREE.Camera | null {
   return (window as unknown as { gameRenderer?: { camera?: THREE.Camera } }).gameRenderer?.camera ?? null;
@@ -44,7 +60,6 @@ export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, plane
   host.style.width = `${HOST_W}px`;
   host.style.height = `${HOST_H}px`;
   host.style.background = '#000';
-  host.style.pointerEvents = 'none';
   const renderer = new CSS3DRenderer();
   renderer.setSize(window.innerWidth, window.innerHeight);
   const el = renderer.domElement;
@@ -56,6 +71,10 @@ export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, plane
   document.body.appendChild(el);
   const scene = new THREE.Scene();
   const object = new CSS3DObject(host);
+  // CSS3DObject sets its element's pointer events back to `auto`: the
+  // picture takes none, or it would catch the world's clicks and offer the
+  // embed's own controls.
+  host.style.pointerEvents = 'none';
   object.matrixAutoUpdate = false;
   scene.add(object);
   const onResize = () => renderer.setSize(window.innerWidth, window.innerHeight);
@@ -66,6 +85,7 @@ export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, plane
   const step = () => {
     if (layer !== l) return;
     const cam = camera();
+    l.object.visible = shown && drawn(l.plane);
     if (cam) {
       // The host is fitted inside the plane (16:9 into whatever the set is).
       const s = Math.min(l.planeW / HOST_W, l.planeH / HOST_H);
