@@ -27,7 +27,7 @@ import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
   readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
-  sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
+  readCrt, sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetCrt, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
@@ -1063,6 +1063,13 @@ function renderTheatreChrome(t: Theatre): void {
     mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
     mine && seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
     mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
+    // The set's LOOK, a body button like VOLUME: only for a film on the
+    // set's own screen (an embed's frame lies over it, out of the pass's
+    // reach).
+    t.shownOn
+      ? btn(`data-tv-look="1" aria-pressed="${readCrt(t.itemId)}"`, readCrt(t.itemId) ? '📺 LOOK: CRT' : '📺 LOOK: CLEAN',
+        "The set's picture: the arcade's CRT look, or the film as it is")
+      : '',
     // archive.org's own player takes no volume from us: the set's level
     // drives every other player; theirs is adjusted inside the frame. And
     // a frame that never loaded gives no sign of it: RELOAD is the retry.
@@ -1098,6 +1105,7 @@ function renderTheatreChrome(t: Theatre): void {
     c.querySelector<HTMLButtonElement>('[data-tv-fwd]')?.addEventListener('click', () => { tvSeek(t.itemId, pos() + 10_000); });
     c.querySelector<HTMLButtonElement>('[data-tv-stop]')?.addEventListener('click', () => { tvStop(t.itemId); });
     c.querySelector<HTMLButtonElement>('[data-tv-pickup]')?.addEventListener('click', () => { pickUpRemote(t.itemId); });
+    c.querySelector<HTMLButtonElement>('[data-tv-look]')?.addEventListener('click', () => { tvSetCrt(t.itemId, !readCrt(t.itemId)); });
     c.querySelector<HTMLInputElement>('[data-tv-volume]')?.addEventListener('change', (e) => {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));
     });
