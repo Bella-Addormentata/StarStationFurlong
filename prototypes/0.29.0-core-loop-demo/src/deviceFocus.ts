@@ -45,6 +45,7 @@ import { rotateIsoOffset } from './cameraRig';
 import type { DeviceTarget, DeviceUI } from './devices';
 import type { Player } from './player';
 import { isFormFieldTarget } from './typingFocus';
+import { FovZoom } from './firstPersonZoom';
 
 /**
  * PREPARING (TR2 of #35) sits between arrival and the camera ease: devices
@@ -66,6 +67,8 @@ const EASE_TIME = 0.45;
 const ISO_OFFSET = new THREE.Vector3(22, 26, 22);
 /** Scratch vector for the rotated offset (avoids per-ease allocation). */
 const ROTATED_ISO = new THREE.Vector3();
+/** The focus camera's field of view before any wheel or pinch zoom. */
+const FOCUS_FOV = 50;
 
 class DeviceFocusController {
   private state: FocusState = 'IDLE';
@@ -102,6 +105,14 @@ class DeviceFocusController {
   private easeFromLook = new THREE.Vector3();
   private easeToLook = new THREE.Vector3();
   private currentLook = new THREE.Vector3();
+  /**
+   * 🔍 Wheel / pinch zoom of the focused view (firstPersonZoom.ts). Kept from
+   * one focus to the next, so a player who sized the craps felt or an arcade
+   * screen to their screen finds it that way next time; the eases carry the
+   * field of view in from and back out to FOCUS_FOV.
+   */
+  private readonly zoom = new FovZoom(FOCUS_FOV);
+  private easeFromFov = FOCUS_FOV;
 
   constructor() {
     // Esc precedence (plan §D0.3), stacked so it never fights existing owners:
@@ -149,6 +160,12 @@ class DeviceFocusController {
   /** Perspective camera currently rendering the focused device, when active. */
   public getCamera(): THREE.PerspectiveCamera | null {
     return this.isActive() ? this.focusCam : null;
+  }
+
+  /** 🔍 The focused view's wheel / pinch zoom, once the camera has arrived
+   *  at the device; null otherwise. */
+  public getZoom(): FovZoom | null {
+    return this.state === 'FOCUSED' ? this.zoom : null;
   }
 
   /** Current controller state (debug/verification handle). */
@@ -224,6 +241,7 @@ class DeviceFocusController {
     this.easeFromLook.copy(this.currentLook);
     this.easeToPos.copy(playerPos).add(rotateIsoOffset(ISO_OFFSET, ROTATED_ISO));
     this.easeToLook.set(playerPos.x, playerPos.y + 0.6, playerPos.z);
+    this.easeFromFov = this.focusCam.fov;
     this.easeT = 0;
     player.mesh.visible = true; // fades back in during the ease
     this.state = 'RELEASING';
@@ -279,6 +297,7 @@ class DeviceFocusController {
         // Arrived at the device eye — hide the avatar (zoom.ts:387–391
         // pattern) and mount the UI.
         if (this.player) this.player.mesh.visible = false;
+        this.zoom.snap();
         this.state = 'FOCUSED';
         if (this.active) {
           this.active.ui.mount(this.ensureHost());
@@ -286,6 +305,7 @@ class DeviceFocusController {
         }
       }
     } else if (this.state === 'FOCUSED') {
+      if (this.focusCam) this.setFov(this.zoom.step(dt));
       this.active?.ui.update(dt);
     } else if (this.state === 'RELEASING') {
       const s = this.stepEase(dt);
@@ -350,7 +370,7 @@ class DeviceFocusController {
 
     if (!this.focusCam) {
       this.focusCam = new THREE.PerspectiveCamera(
-        50, window.innerWidth / window.innerHeight, 0.05, 1000,
+        FOCUS_FOV, window.innerWidth / window.innerHeight, 0.05, 1000,
       );
       window.addEventListener('resize', () => {
         if (this.focusCam) {
@@ -371,6 +391,7 @@ class DeviceFocusController {
     this.easeToPos.copy(this.active.device.eye);
     this.easeFromLook.set(playerPos.x, playerPos.y + 0.6, playerPos.z);
     this.easeToLook.copy(this.active.device.anchor);
+    this.easeFromFov = FOCUS_FOV;
     this.easeT = 0;
 
     this.focusCam.position.copy(this.easeFromPos);
@@ -389,8 +410,17 @@ class DeviceFocusController {
       this.focusCam.position.lerpVectors(this.easeFromPos, this.easeToPos, s);
       this.currentLook.lerpVectors(this.easeFromLook, this.easeToLook, s);
       this.focusCam.lookAt(this.currentLook);
+      // 🔍 In: from the plain view to the player's zoom. Out: back to plain.
+      const toFov = this.state === 'RELEASING' ? FOCUS_FOV : this.zoom.targetFov();
+      this.setFov(this.easeFromFov + (toFov - this.easeFromFov) * s);
     }
     return s;
+  }
+
+  private setFov(fov: number): void {
+    if (!this.focusCam || this.focusCam.fov === fov) return;
+    this.focusCam.fov = fov;
+    this.focusCam.updateProjectionMatrix();
   }
 
   /** Restore the ortho camera + avatar and hand control back to the player. */

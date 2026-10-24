@@ -1017,7 +1017,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   };
 
   const onMove = (e: PointerEvent): void => {
-    if (!h || !aim(e)) return;
+    if (pinching() || !h || !aim(e)) return;
     dropStaleHold();
     cursor = h.projectToFelt(ray);
     const hit = h.pick(ray, myThrowPending());
@@ -1046,8 +1046,20 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (hand.length > 0) h.setHand(cursor, hand);
   };
 
+  /** 🔍 Fingers down on the felt. A second one makes the touch a pinch that
+   *  zooms the view (firstPersonZoom.ts), never a bet, a pickup or a throw. */
+  const touches = new Set<number>();
+  const pinching = (): boolean => touches.size >= 2;
+
   const onDown = (e: PointerEvent): void => {
     e.stopPropagation();
+    if (e.pointerType === 'touch') {
+      touches.add(e.pointerId);
+      if (pinching()) {
+        dropGesture();
+        return;
+      }
+    }
     if (!h || !aim(e)) return;
     if (e.button === 2) {
       if (hand.length) {
@@ -1108,7 +1120,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  put down what's held without acting on it — no throw, no more pickup. */
   const onCancel = (e: PointerEvent): void => {
     e.stopPropagation();
+    touches.delete(e.pointerId);
     if (capture?.hasPointerCapture(e.pointerId)) capture.releasePointerCapture(e.pointerId);
+    dropGesture();
+  };
+
+  /** Put down what's held without acting on it: no throw, no more pickup. */
+  function dropGesture(): void {
     if (pickup) {
       pickup = null;
       refreshRail();
@@ -1117,10 +1135,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       held = null;
       localHold.delete(itemId); // the frame driver slides the dice back
     }
-  };
+  }
 
   const onUp = (e: PointerEvent): void => {
     e.stopPropagation();
+    touches.delete(e.pointerId);
     if (capture?.hasPointerCapture(e.pointerId)) capture.releasePointerCapture(e.pointerId);
     if (pickup) {
       pickup = null;
