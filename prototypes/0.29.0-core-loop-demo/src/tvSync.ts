@@ -101,6 +101,12 @@ export interface TvSyncDeps {
    *  tvProgrammeEnded — from the top again with LOOP on, else back to the
    *  home screen, the film kept in history. */
   onEnded?: () => void;
+  /** The holder's player followed a LOOP lap in the tick it ended into it
+   *  (followLap): it is in the lap now, the same media from the top. The
+   *  theatre names the lap in its player-of-record registration at once,
+   *  or a clip that laps on every tick would never have its end filed for
+   *  the programme it is on (tvSession noteKnownEnd). */
+  onLapFollowed?: (started: number) => void;
 }
 
 /** After a seek, leave a VIEWER's player alone for this long: a seek that is
@@ -504,15 +510,17 @@ export class TvSyncController {
     if (!p.canSeek || jump === this.appliedJump) return;
     const pb = this.playback(now, 0);
     if (pb.state !== 'playing') return; // LOOP off: back home, which the next tick follows
+    const started = this.started();
     this.appliedJump = jump;
     this.countdownJump = null;
-    this.seenStarted = this.started();
+    this.seenStarted = started;
     this.endedHandled = false;
     this.aim(p, reachable(holderAnchorMs(pb), p), now);
     this.settlePending(p, now);
     // A seek that lands later (YouTube's) is waited for as any jump's: the
     // tick it un-ends the player plays it.
     if (!p.isEnded() && !p.isPlaying()) p.play();
+    this.deps.onLapFollowed?.(started);
   }
 
   /** The holder takes aim at a transport target: the seek goes out now if

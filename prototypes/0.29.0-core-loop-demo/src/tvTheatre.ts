@@ -674,7 +674,12 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
       set.showVideo(player.video);
       t.shownOn = set;
     }
-    const controller = new TvSyncController({ itemId: t.itemId, player, rttMs: rtt });
+    const controller = new TvSyncController({
+      itemId: t.itemId, player, rttMs: rtt,
+      // A LOOP lap this player followed as it ended (tvSync followLap): the
+      // registration below names the lap at once, not at the next tick.
+      onLapFollowed: (started) => { if (live() && t.controller === controller) t.playerFor = started; },
+    });
     t.controller = controller;
     // Only a player with a clock becomes the room's clock; the archive embed
     // reports nothing, so the headless heartbeat (tvSession) keeps beating.
