@@ -604,11 +604,13 @@ function unmountPlayer(t: Theatre): void {
  *  nor replay, so a new programme START of the same source (PLAY NOW again,
  *  PREVIOUSLY ON) is a new key and gets a fresh iframe; seekable players
  *  follow a replay through the controller instead. */
-function mountKey(source: TvSource, started: number): string {
+export function mountKey(source: TvSource, started: number): string {
   // A blob is read from this viewer's node: a node that restarted (a new
   // token) or moved port is another mount, so the player is rebuilt on the
-  // new URL and a failure on the old node does not stick.
-  if (source.kind === 'blob') return `${sourceId(source)}@${blobNodeTag()}`;
+  // new URL and a failure on the old node does not stick. And by the file
+  // itself, not its programme (sourceId): a smaller copy is the same
+  // programme as its original (`was`), but another file to read.
+  if (source.kind === 'blob') return `blob:${source.hash}@${blobNodeTag()}`;
   return isStartOnly(source) ? `${sourceId(source)}@${started}` : sourceId(source);
 }
 
