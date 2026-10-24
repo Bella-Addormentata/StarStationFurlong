@@ -10417,6 +10417,9 @@ function setupFirstPersonZoomInput() {
   window.addEventListener("wheel", (e) => {
     // A touchpad pinch arrives as Ctrl + wheel, so it zooms the view too;
     // outside first person both stay the browser's own.
+    // A wheel something under the pointer already took (the holotable map's
+    // own zoom, the helm's ALT digits) is not the camera's.
+    if (e.defaultPrevented) return;
     const zoom = liveFirstPersonZoom();
     if (!zoom || !zoomTargetOk(e.target)) return;
     e.preventDefault();
