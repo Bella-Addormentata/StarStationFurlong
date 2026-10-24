@@ -11,6 +11,7 @@ import type { TvScreenView } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
 
 let fills = 0;
+let drawnFrames = 0;
 /** Every setTransform call, by the canvas it was made on. */
 const transforms = new Map<object, number[][]>();
 function fakeCanvas() {
@@ -19,6 +20,7 @@ function fakeCanvas() {
     get: (target, key) => {
       if (key in target) return target[key];
       if (key === 'fillRect') return () => { fills++; };
+      if (key === 'drawImage') return () => { drawnFrames++; };
       if (key === 'setTransform') return (...m: number[]) => { transforms.set(canvas, [...(transforms.get(canvas) ?? []), m]); };
       if (key === 'measureText') return () => ({ width: 40 });
       if (key === 'createLinearGradient') return () => ({ addColorStop: () => undefined });
@@ -223,6 +225,50 @@ describe('the smart TV as built', () => {
     handle.showVideo(null);
     expect(material().userData.crtLook).toBeUndefined();
     expect(material().map).toBeNull();
+  });
+
+  it('draws a film down once a new frame, as the browser says one came, and lets the look go with the set', () => {
+    const group = build('smart-tv');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
+    const handle = s.tvScreens.get('smart-tv-1')!;
+    let mesh: THREE.Mesh | null = null;
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.tvPicture) mesh = obj; });
+    const render = () => mesh!.onBeforeRender(null as never, null as never, null as never, null as never, null as never, null as never);
+    let frame: (() => void) | null = null;
+    const film = {
+      videoWidth: 1920, videoHeight: 1080, readyState: 4, currentTime: 0,
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      requestVideoFrameCallback: (cb: () => void) => { frame = cb; return 1; },
+    } as unknown as HTMLVideoElement & { currentTime: number };
+    handle.draw(view('playing', 'METROPOLIS'));
+    handle.showVideo(film);
+    drawnFrames = 0;
+    render();
+    expect(drawnFrames).toBe(1); // the first frame
+    // Renders with no new frame draw nothing, though the clock moves on.
+    film.currentTime = 0.01;
+    render();
+    film.currentTime = 0.02;
+    render();
+    expect(drawnFrames).toBe(1);
+    frame!();
+    render();
+    render();
+    expect(drawnFrames).toBe(2);
+    // The set removed (World closes the theatre first, which takes the film
+    // off, then runs every `dispose*` hook): the CRT material and canvas
+    // go too, though they are off the mesh by then.
+    const crt = mesh!.material as THREE.MeshBasicMaterial;
+    const gone: string[] = [];
+    crt.addEventListener('dispose', () => gone.push('material'));
+    crt.map!.addEventListener('dispose', () => gone.push('canvas'));
+    handle.showVideo(null);
+    expect(mesh!.material).not.toBe(crt);
+    group.traverse((obj) => {
+      for (const [key, hook] of Object.entries(obj.userData)) if (key.startsWith('dispose') && typeof hook === 'function') hook();
+    });
+    expect(gone.sort()).toEqual(['canvas', 'material']);
   });
 
   it('draws on the home screen only the tiles this build offers: YOUTUBE and ARCHIVE go with the convenience lanes', () => {

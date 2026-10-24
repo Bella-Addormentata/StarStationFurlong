@@ -11201,9 +11201,34 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   const crtLines = { value: new THREE.Vector2(...TV_CRT_LOOK.lines) };
   const crtMat = new THREE.MeshBasicMaterial({ map: crtTex, color: 0xffffff, toneMapped: false });
   applyCrtLook(crtMat, TV_CRT_LOOK, undefined, crtLines);
+  // Off the mesh while CLEAN or nothing plays, so the removal's traversal
+  // would not reach them: their own teardown hook (World runs every
+  // `dispose*` on userData).
+  picture.userData.disposeCrt = () => {
+    crtMat.dispose();
+    crtTex.dispose();
+  };
   let crtOn = true;
-  /** The film time last drawn down (NaN: draw the next frame whatever it is). */
+  /** A frame of the film not drawn down yet. Where the browser says when
+   *  one comes (requestVideoFrameCallback, as three's VideoTexture asks),
+   *  it is set then: a 24 fps film is drawn 24 times a second, not once a
+   *  render. Each new film or size sets it too (the first frame, paused or
+   *  not). */
+  let crtFresh = true;
+  /** Without that: the film time last drawn down (NaN: draw the next frame
+   *  whatever it is). */
   let crtDrawn = NaN;
+  const framesSaid = (v: HTMLVideoElement): boolean => "requestVideoFrameCallback" in v;
+  /** Watch `v`'s frames while it is the one shown. */
+  const watchFrames = (v: HTMLVideoElement) => {
+    if (!framesSaid(v)) return;
+    const onFrame = () => {
+      if (video !== v) return; // another film since: this one is let go
+      crtFresh = true;
+      v.requestVideoFrameCallback(onFrame);
+    };
+    v.requestVideoFrameCallback(onFrame);
+  };
   /** The canvas in the film's shape: its rows, and as many columns as keep
    *  the pixels square. */
   const sizeCrt = () => {
@@ -11221,6 +11246,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     crt2d.fillStyle = "#000000";
     crt2d.fillRect(0, 0, cols, rows);
     crtTex.needsUpdate = true;
+    crtFresh = true;
     crtDrawn = NaN;
   };
   const applyLook = () => {
@@ -11231,11 +11257,13 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     if (picture.material !== crtMat || !video) return;
     crtTick(performance.now() / 1000);
     // HAVE_CURRENT_DATA: a frame to draw. A paused film is drawn once.
-    if (video.readyState < 2 || video.currentTime === crtDrawn) return;
+    if (video.readyState < 2) return;
+    if (framesSaid(video) ? !crtFresh : video.currentTime === crtDrawn) return;
     crt2d.imageSmoothingEnabled = true;
     crt2d.imageSmoothingQuality = "high";
     crt2d.drawImage(video, 0, 0, crtCanvas.width, crtCanvas.height);
     crtTex.needsUpdate = true;
+    crtFresh = false;
     crtDrawn = video.currentTime;
   };
   // Shown and hidden through a Group, not the mesh: World sets every
@@ -11402,6 +11430,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
         v.addEventListener("loadedmetadata", fitPicture);
       }
       pictureMat.map = videoTex;
+      if (v) watchFrames(v);
       pictureMat.needsUpdate = true;
       fitPicture();
       applyLook();
