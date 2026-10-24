@@ -1299,6 +1299,42 @@ describe('🔁 LOOP, through the record', () => {
     }
   });
 
+  it('a viewer of a clip shorter than its tick, ticking out of step with the holder, plays every lap: a room past the end is in the next lap', () => {
+    let now = 400_000;
+    setTvClock(() => now);
+    setTvHostPredicate(() => false);
+    setTvPageId('A');
+    bindTvDoc(new Y.Doc());
+    setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
+    pickUpRemote('tv-1');
+    tvPlay('tv-1', { kind: 'url', url: 'https://example.org/blip.mp4' });
+    tvSetLoop('tv-1', true);
+    const holderP = new FakePlayer(true);
+    const viewerP = new FakePlayer(true);
+    holderP.duration = viewerP.duration = 300;
+    const holder = new TvSyncController({ itemId: 'tv-1', player: holderP, now: () => now });
+    const viewer = new TvSyncController({ itemId: 'tv-1', player: viewerP, now: () => now, iHold: () => false });
+    const run = (p: FakePlayer) => {
+      if (!p.playing || p.ended) return;
+      p.position = Math.min(p.duration, p.position + 50);
+      if (p.position >= p.duration) {
+        p.ended = true;
+        p.playing = false;
+      }
+    };
+    let viewerPlayed = 0;
+    for (let ms = 0; ms < 6_000; ms += 50) {
+      now += 50;
+      run(holderP);
+      run(viewerP);
+      if (ms % 400 === 0) holder.tick();
+      if (ms % 400 === 350) viewer.tick(); // 350 ms behind the holder's timer
+      if (ms >= 2_000 && viewerP.playing) viewerPlayed++;
+    }
+    expect(readTv('tv-1').started).toBeGreaterThan(10); // the holder laps on
+    expect(viewerPlayed).toBeGreaterThan(10); // and the viewer keeps playing along, not held at the end
+  });
+
   it('a player that ran out and cannot seek back is rebuilt for a new start; one that can seek, or has not run out, or is for this start, is kept', () => {
     const stuck = new FakePlayer(true, false); // a host without range support
     stuck.ended = true;

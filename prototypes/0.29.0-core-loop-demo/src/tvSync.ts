@@ -81,6 +81,18 @@ function reachable(ms: number, p: TvPlayer): number {
   return Math.min(Math.max(ms, range.startMs), range.endMs);
 }
 
+/** Where a LOOP programme's room is in a file of this player's: a record
+ *  past the end is that far into a later lap (the holder starts one over
+ *  each time the file ends). A viewer that learns of a lap only once the
+ *  room has run past the file's end — a clip shorter than its tick and
+ *  the lap's delivery — joins the lap there, instead of waiting at the end
+ *  for a replay the record will never name. Anything else is as it reads. */
+export function loopPosition(ms: number, p: TvPlayer, loop: boolean): number {
+  const range = p.seekableRange();
+  if (!loop || !range || range.startMs !== 0 || !(range.endMs > 0) || ms < range.endMs) return ms;
+  return ms % range.endMs;
+}
+
 export interface TvSyncDeps {
   itemId: string;
   player: TvPlayer;
@@ -101,6 +113,8 @@ export interface TvSyncDeps {
    *  tvProgrammeEnded — from the top again with LOOP on, else back to the
    *  home screen, the film kept in history. */
   onEnded?: () => void;
+  /** The record's LOOP (tvDoc `loop`). */
+  loop?: () => boolean;
   /** The holder's player followed a LOOP lap in the tick it ended into it
    *  (followLap): it is in the lap now, the same media from the top. The
    *  theatre names the lap in its player-of-record registration at once,
@@ -157,6 +171,7 @@ export class TvSyncController {
   private readonly heartbeat: (positionMs: number) => void;
   private readonly volume: () => number;
   private readonly onEnded: () => void;
+  private readonly loop: () => boolean;
   private endedHandled = false;
   private lastBeatAt = -Infinity;
   private lastSeekAt = -Infinity;
@@ -227,6 +242,7 @@ export class TvSyncController {
     this.heartbeat = deps.heartbeat ?? ((p) => { tvHeartbeat(deps.itemId, p); });
     this.volume = deps.volume ?? (() => readTv(deps.itemId).volume);
     this.onEnded = deps.onEnded ?? (() => { tvProgrammeEnded(deps.itemId); });
+    this.loop = deps.loop ?? (() => readTv(deps.itemId).loop);
   }
 
   /** The lead for this page: half the round trip to its own node for a
@@ -631,9 +647,11 @@ export class TvSyncController {
       // lands, and a seek and a play() every tick meanwhile would only
       // interrupt its buffering. Otherwise hold until the record moves on
       // (the holder ends the programme).
-      const before = pb.positionMs < p.currentMs();
+      // With LOOP on, a room past the file's end is in a later lap.
+      const at = loopPosition(pb.positionMs, p, this.loop());
+      const before = at < p.currentMs();
       if ((transport && before) || newProgramme) this.replayDue = jump;
-      const far = pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS;
+      const far = at < p.currentMs() - TV_SEEK_OVER_MS;
       const owed = this.replayDue !== null;
       const fresh = owed && this.replayDue !== this.replayIssuedFor;
       // A record at or past this player's end is nowhere to go: a new
@@ -643,9 +661,9 @@ export class TvSyncController {
       // The replay stays owed: the record moving back before the end (a
       // rewind) is followed on that tick, as any.
       const range = p.seekableRange();
-      const atEnd = range !== null && pb.positionMs >= range.endMs;
+      const atEnd = range !== null && at >= range.endMs;
       if (!atEnd && p.canSeek && (far || owed) && (fresh || now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
-        p.seek(pb.positionMs);
+        p.seek(at);
         this.lastSeekAt = now;
         this.replayIssuedFor = this.replayDue;
         this.setRate(1);
@@ -666,7 +684,7 @@ export class TvSyncController {
     // as any programme.
     if (newProgramme && (p.canSeek || p.hasClock)) {
       if (!p.canSeek) return pb;
-      p.seek(reachable(pb.positionMs, p));
+      p.seek(reachable(loopPosition(pb.positionMs, p, this.loop()), p));
       this.lastSeekAt = now;
       this.setRate(1);
       this.seenStarted = started;
