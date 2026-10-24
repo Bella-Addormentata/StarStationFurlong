@@ -28,7 +28,7 @@
 
 import {
   casinoDocEpoch,
-  creditChips,
+  creditTableOutcome,
   readAllCrapsBets,
   readCrapsBackendPref,
   readCrapsFairnessPref,
@@ -125,6 +125,7 @@ class LocalCrapsBackend implements CrapsBackend {
           ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
           ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
           ...frozenFields(tableId, before),
+          ...(before.inc !== undefined ? { inc: before.inc } : {}),
           ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
         });
         settledRound(tableId, before);
@@ -206,10 +207,13 @@ class LocalCrapsBackend implements CrapsBackend {
       // state reads now (anyone can rewrite it after the reveals).
       ...frozenFields(tableId, before),
       ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
+      ...(before.inc !== undefined ? { inc: before.inc } : {}),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
     settledRound(tableId, before);
-    for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
+    // A page that removed the table meanwhile refunds the felt instead, never
+    // as well: the table's one outcome per bettor (creditTableOutcome).
+    for (const [pid, amount] of Object.entries(payouts)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
     // Prune the felt: rewrite each player's list to only the bets that survived
     // (standing pass/place). Empty ⇒ their felt clears.
     for (const [pid, bets] of Object.entries(remaining)) {

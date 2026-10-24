@@ -404,6 +404,56 @@ describe('chip records', () => {
   });
 });
 
+describe('what a table pays a player', () => {
+  const TABLE = 'roulette-1';
+
+  it('one outcome paid on two pages counts once, whichever hears of the other first', () => {
+    pageA.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
+    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
+    sync(docA, docB);
+    pageA.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30); // heard after
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(30);
+  });
+
+  it('a round settled on one page while the other removed the table pays one of the two, never both', () => {
+    pageA.creditTableOutcome(TABLE, 'inc1', 7, PLAYER, 60); // the payout
+    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30); // the refund
+    sync(docA, docB);
+    const chips = pageA.readChips(PLAYER);
+    expect([60, 30]).toContain(chips);
+    expect(pageB.readChips(PLAYER)).toBe(chips);
+  });
+
+  it('outcomes one after another all count, round after round and then the removal', () => {
+    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, 20);
+    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 40);
+    sync(docA, docB);
+    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 10); // standing bets
+    pageB.creditTableOutcome(TABLE, 'inc1', 2, OTHER, 5);
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) {
+      expect(page.readChips(PLAYER)).toBe(70);
+      expect(page.readChips(OTHER)).toBe(5);
+    }
+  });
+
+  it('a table set up again under the same id pays its own rounds and its own removal', () => {
+    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, 20);
+    pageA.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 10);
+    pageA.creditTableOutcome(TABLE, 'inc2', 1, PLAYER, 20);
+    pageA.creditTableOutcome(TABLE, 'inc2', 'end', PLAYER, 10);
+    expect(pageA.readChips(PLAYER)).toBe(60);
+  });
+
+  it('rides one record per table and player, however many rounds it pays', () => {
+    for (let round = 1; round <= 50; round++) pageA.creditTableOutcome(TABLE, 'inc1', round, PLAYER, 2);
+    pageA.creditTableOutcome('craps-1', 'inc9', 1, PLAYER, 3);
+    expect(pageA.readChips(PLAYER)).toBe(103);
+    expect(pageA.readChipRecords(PLAYER)).toHaveLength(2);
+  });
+});
+
 describe('the cage ledger', () => {
   it('adds the ledger\'s buy-ins and cash-outs to an earlier build\'s lifetime totals', () => {
     const map = docA.getMap('casino');

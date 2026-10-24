@@ -113,6 +113,9 @@ export interface CrapsTableState {
   /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
    *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
   lastShooter?: string;
+  /** 🧾 This table's incarnation (casinoDoc newTableInc), kept roll to roll:
+   *  a table set up again under the same id pays its own rolls. */
+  inc?: string;
   /** ⚖️ This round's seed commitments (see SeedRoundFields). */
   houseCommit?: string;
   commits?: Record<string, string>;
@@ -262,6 +265,11 @@ function isPlayerIdField(v: unknown): boolean {
   return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 128);
 }
 
+/** A table state's incarnation (`inc`), when it has one. */
+export function isTableIncField(v: unknown): boolean {
+  return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 32);
+}
+
 function isDicePair(value: unknown): value is [number, number] {
   return Array.isArray(value)
     && value.length === 2
@@ -297,6 +305,7 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && isPlayerIdField(s.shooter)
     && isPlayerIdField(s.lastShooter)
     && isPlayerIdField(s.operator)
+    && isTableIncField(s.inc)
     && isSeedRoundFields(s)
     && (s.fairMode === undefined || FAIRNESS_MODES.includes(s.fairMode));
 }

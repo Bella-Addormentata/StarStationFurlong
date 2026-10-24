@@ -31,9 +31,9 @@ import { canRunCroupier } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
-  chipEventDigest,
   clearTableKeys,
-  creditChipsOnce,
+  creditTableOutcome,
+  newTableInc,
   readAllCrapsBets,
   readCrapsFairnessPref,
   readCrapsTableState,
@@ -142,6 +142,7 @@ export function openCrapsBetting(
     ...(lastShooter !== undefined ? { lastShooter } : {}),
     fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
+    inc: readCrapsTableState(tableId)?.inc ?? newTableInc(),
   });
 }
 
@@ -452,18 +453,20 @@ export function tickAutoStickman(tableId: string): void {
 /**
  * Tear a craps table down cleanly on removal (mirrors croupier.closeTable). The
  * REFUND of every standing bet (stakes were debited at placement) runs ONLY on
- * the elected operator so it happens exactly once; every client then wipes the
+ * the deed holder's pages, and counts once however many of them run it
+ * (creditTableOutcome); every client then wipes the
  * table's casino keys (idempotent LWW delete). A manual venture/legacy room has
  * no operator, so stakes are not refunded (matches the manual-mode limitation).
  */
 export function closeCrapsTable(tableId: string): void {
   if (canRunCroupier()) {
-    const round = readCrapsTableState(tableId)?.round ?? 0;
+    const inc = readCrapsTableState(tableId)?.inc ?? '';
     for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
       const staked = bets.reduce((sum, b) => sum + b.amount, 0);
-      // Each of the deed holder's pages runs this: keyed by the bets it
-      // returns, the refund counts once (croupier.closeTable).
-      if (staked > 0) creditChipsOnce(`teardown:${tableId}:${round}:${chipEventDigest(bets)}`, pid, staked);
+      // Each of the deed holder's pages runs this, and the page driving the
+      // table may be settling a roll meanwhile: the table's one outcome per
+      // bettor pays one of them (croupier.closeTable).
+      creditTableOutcome(tableId, inc, 'end', pid, staked);
     }
   }
   clearTableKeys(tableId);

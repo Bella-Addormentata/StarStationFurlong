@@ -36,13 +36,16 @@
  * at once both count, on every page. One writer per record means a record is
  * only ever overwritten by the binding that holds its last value (a fresh
  * writer id each bind), so no change is lost, and the doc grows by a record
- * per page per player, not per bet. Sums are exact (bigint), so every page
- * gets the same one whatever order records arrive in. A slot machine's own
- * bankroll is an account in the same ledger, named by its `slot-bankroll:`
- * key, whose stored value is its opening balance. It is the first step of
- * the computed tables (see the "Computed casino tables" design). Trust is
- * unchanged: honest clients, as before; signed records come with the
- * computed tables.
+ * per page per player, not per bet. What a roulette or craps table pays a
+ * player is the one exception: it rides one record per table and player,
+ * which names the outcome it paid last, so a round settled on one page while
+ * another removed the table pays one of the two (creditTableOutcome). Sums
+ * are exact (bigint), so every page gets the same one whatever order records
+ * arrive in. A slot machine's own bankroll is an account in the same ledger,
+ * named by its `slot-bankroll:` key, whose stored value is its opening
+ * balance. It is the first step of the computed tables (see the "Computed
+ * casino tables" design). Trust is unchanged: honest clients, as before;
+ * signed records come with the computed tables.
  *
  * The HOUSE keeps no stored record at all — everything about the cage is
  * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
@@ -194,6 +197,8 @@ export interface ChipRecord {
   c: number;
   /** writer-clock ms of the last change, for reading the history only */
   at: number;
+  /** a table's record only (creditTableOutcome): the last outcome it paid */
+  ev?: string;
 }
 
 /** A slot machine's own bankroll is a ledger account too, named by its key
@@ -213,7 +218,8 @@ export function isChipRecord(value: unknown): value is ChipRecord {
     && Number.isSafeInteger(r.d)
     && Number.isSafeInteger(r.b) && (r.b as number) >= 0
     && Number.isSafeInteger(r.c) && (r.c as number) >= 0
-    && typeof r.at === 'number' && Number.isFinite(r.at);
+    && typeof r.at === 'number' && Number.isFinite(r.at)
+    && (r.ev === undefined || (typeof r.ev === 'string' && r.ev.length <= 64));
 }
 
 let chipsMap: Y.Map<unknown> | null = null;
@@ -406,35 +412,45 @@ export function creditChips(playerId: string, amount: number): void {
 }
 
 /**
- * Credit `amount` chips to `playerId` for one event that several pages may each
- * carry out (every page of the deed holder's refunds a removed table). The
- * record is keyed by the event, not the page, and holds the same value on
- * every page, so doing it twice writes one record and it counts once. Build
- * `eventKey` from what the credit is for, as every page sees it (chipEventDigest).
+ * Credit `amount` chips to `playerId` for one outcome of one table: a settled
+ * round (`outcome` its number) or the table's removal ('end'). Two of the deed
+ * holder's pages can each carry out the same outcome (both refund a removed
+ * table), or two that exclude each other (one settles a round while the other
+ * removes the table), before either hears of the other. So what a table pays a
+ * player rides one record per table and player, `tbl:<tableId>:<pid>`, naming
+ * the outcome it paid last: a write adds to it unless it already names this
+ * outcome, and of two written at once the doc keeps one, so the player is paid
+ * for one outcome, never both. `inc` is the table's incarnation (newTableInc):
+ * a table set up again under the same id has outcomes of its own.
  */
-export function creditChipsOnce(eventKey: string, playerId: string, amount: number): void {
+export function creditTableOutcome(
+  tableId: string, inc: string, outcome: number | 'end', playerId: string, amount: number,
+): void {
   if (!Number.isSafeInteger(amount) || amount <= 0 || playerId.length === 0 || playerId.length > 256) return;
   const map = ensureChips();
-  const key = `once:${eventKey}:${playerId}`;
+  const key = `tbl:${tableId}:${playerId}`;
+  const ev = `${inc}:${outcome}`;
   const stored = map.get(key);
-  if (isChipRecord(stored) && stored.p === playerId && stored.d === amount) return;
-  const rec: ChipRecord = { p: playerId, d: amount, b: 0, c: 0, at: 0 };
+  const was = isChipRecord(stored) && stored.p === playerId ? stored : null;
+  if (was?.ev === ev) return;
+  const d = (was?.d ?? 0) + amount;
+  // (Past the safe range, which no table reaches: a plain credit instead.)
+  if (!Number.isSafeInteger(d)) {
+    addChips(playerId, amount);
+    return;
+  }
+  const rec: ChipRecord = { p: playerId, d, b: 0, c: 0, at: Date.now(), ev };
   boundDoc!.transact(() => {
     map.set(key, rec);
     recountChipKey(chipIndex, map, key);
   });
 }
 
-/** A short digest of a synced value (FNV-1a over its JSON), the same on every
- *  page that holds it: names what a creditChipsOnce credit is for. */
-export function chipEventDigest(value: unknown): string {
-  const text = JSON.stringify(value) ?? '';
-  let h = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(36);
+/** A fresh table incarnation, given when a table's first round opens (and to a
+ *  table from an earlier build at its next): names its outcomes for
+ *  creditTableOutcome. */
+export function newTableInc(): string {
+  return Math.random().toString(36).slice(2, 12);
 }
 
 /** Every chip record in the bound room (one per page per account), oldest

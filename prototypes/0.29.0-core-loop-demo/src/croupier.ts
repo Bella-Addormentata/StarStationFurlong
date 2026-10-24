@@ -32,10 +32,9 @@
 
 import {
   casinoDocEpoch,
-  chipEventDigest,
   clearTableKeys,
-  creditChips,
-  creditChipsOnce,
+  creditTableOutcome,
+  newTableInc,
   readAllBets,
   readCroupierBeat,
   readTableOperatorLease,
@@ -274,11 +273,16 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     // state reads now (anyone can rewrite it after the reveals).
     ...frozenFields(tableId, before),
     ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
+    ...(before.inc !== undefined ? { inc: before.inc } : {}),
     ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
   });
   settledRound(tableId, before);
-  for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
-  for (const [pid, amount] of Object.entries(refunds)) creditChips(pid, amount);
+  // One credit per bettor for the round, its payout and refund together: a
+  // page that removed the table meanwhile refunds the same bettor instead,
+  // never as well (creditTableOutcome).
+  const owed: Record<string, number> = { ...payouts };
+  for (const [pid, amount] of Object.entries(refunds)) owed[pid] = (owed[pid] ?? 0) + amount;
+  for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
 }
 
 /** "No more bets": close the window and freeze the round's commitments.
@@ -302,6 +306,7 @@ export function openBetting(tableId: string, round: number): void {
     resultAt: 0,
     payouts: null,
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
+    inc: readTableState(tableId)?.inc ?? newTableInc(),
   });
 }
 
@@ -342,9 +347,9 @@ export function tickAutoCroupier(tableId: string): void {
 /**
  * Tear a table down cleanly on removal from a room. Safe to call on any client:
  * the REFUND of an unresolved round (stakes were debited at placement, and once
- * the records vanish there is no other credit-back path) runs ONLY on the elected
- * operator (canRunCroupier) so it happens exactly once and never double-credits;
- * every client then wipes the table's casino keys (idempotent LWW delete) so no
+ * the records vanish there is no other credit-back path) runs ONLY on the deed
+ * holder's pages (canRunCroupier), and counts once however many of them run it
+ * (creditTableOutcome); every client then wipes the table's casino keys (idempotent LWW delete) so no
  * orphan records survive. In a manual venture/legacy room there is no operator,
  * so stakes are not refunded (matches the manual-mode limitation) — the keys are
  * still cleared.
@@ -356,8 +361,9 @@ export function closeTable(tableId: string): void {
       for (const [pid, bets] of Object.entries(readAllBets(tableId, s.round))) {
         const staked = bets.reduce((sum, b) => sum + b.amount, 0);
         // Each of the deed holder's pages runs this, whichever removed the
-        // table first: the refund is keyed by the bets it returns, so it counts once.
-        if (staked > 0) creditChipsOnce(`teardown:${tableId}:${s.round}:${chipEventDigest(bets)}`, pid, staked);
+        // table first, and the page driving it may be settling this very
+        // round: the table's one outcome per bettor pays one of them.
+        creditTableOutcome(tableId, s.inc ?? '', 'end', pid, staked);
       }
     }
   }
