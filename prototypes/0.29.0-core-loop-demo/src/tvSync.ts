@@ -29,7 +29,7 @@
  */
 
 import {
-  driftAction, holderAnchorMs, iHoldRemote, markTvPageAwake, readPlayback, readTv, tvHeartbeat, tvNow, tvStop,
+  driftAction, holderAnchorMs, iHoldRemote, markTvPageAwake, readPlayback, readTv, tvHeartbeat, tvNow, tvProgrammeEnded,
   TV_HEARTBEAT_MS, TV_NUDGE_RATE, TV_SEEK_OVER_MS,
 } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -81,6 +81,20 @@ function reachable(ms: number, p: TvPlayer): number {
   return Math.min(Math.max(ms, range.startMs), range.endMs);
 }
 
+/** Where a LOOP lap's room is: a record past the media's end (`lapMs`,
+ *  the end the record carries — tvDoc `endMs` — with LOOP on, else 0) is
+ *  that far into the lap. A viewer that learns of a lap only once the room
+ *  has run past the end — a clip shorter than its tick and the lap's
+ *  delivery — joins the lap there, instead of waiting at the end for a
+ *  replay the record will never name. The media's end as the holder's
+ *  player knew it, never what this player can seek to (a prefix of a file
+ *  on a host without ranges, a live window). Unknown, or LOOP off: as it
+ *  reads. */
+export function loopPosition(ms: number, lapMs: number): number {
+  if (!(lapMs > 0) || !(ms >= lapMs)) return ms;
+  return ms % lapMs;
+}
+
 export interface TvSyncDeps {
   itemId: string;
   player: TvPlayer;
@@ -98,8 +112,18 @@ export interface TvSyncDeps {
   heartbeat?: (positionMs: number) => void;
   volume?: () => number;
   /** The holder's player reached the end: the programme is over. Default:
-   *  tvStop — back to the home screen, the film kept in history. */
+   *  tvProgrammeEnded — from the top again with LOOP on, else back to the
+   *  home screen, the film kept in history. */
   onEnded?: () => void;
+  /** A LOOP lap's length: the media's end the record carries (tvDoc
+   *  `endMs`) with LOOP on, else 0. */
+  loopEnd?: () => number;
+  /** The holder's player followed a LOOP lap in the tick it ended into it
+   *  (followLap): it is in the lap now, the same media from the top. The
+   *  theatre names the lap in its player-of-record registration at once,
+   *  or a clip that laps on every tick would never have its end filed for
+   *  the programme it is on (tvSession noteKnownEnd). */
+  onLapFollowed?: (started: number) => void;
 }
 
 /** After a seek, leave a VIEWER's player alone for this long: a seek that is
@@ -116,6 +140,30 @@ export const TV_SEEK_COOLDOWN_MS = 2_000;
  *  keeping no clock at all. */
 export const TV_SEEK_WAIT_MS = 10_000;
 
+/** A new start of the programme (a replay, a LOOP lap) that the player it
+ *  was mounted for cannot follow: it ran out and cannot seek back (a host
+ *  without range support). The theatre builds it again from the top; left
+ *  as it is, its controller would wait on a rewind it can never issue, and
+ *  the holder's would end the programme again once that wait ran out, lap
+ *  after lap with nothing played. `mountedFor` is the `started` the player
+ *  was built for. */
+export function replayNeedsRemount(player: TvPlayer, mountedFor: number, started: number): boolean {
+  return mountedFor !== started && player.isEnded() && !player.canSeek;
+}
+
+/** A lap's rebuild (above) fetches again the source this viewer's own player
+ *  just played to its end, so it comes no faster than the clip runs here —
+ *  not the source churn the theatre's mount budget is for (tvConsent
+ *  mayMountNow), and a looping film is not stopped at its seventh lap in a
+ *  minute. Free only when the player it replaces was built at least
+ *  TV_LAP_REMOUNT_MIN_MS ago (`mountedAtMs`, monotonic): a clip shorter than
+ *  that still counts, so a near-empty one cannot have the theatre fetch on
+ *  every tick. */
+export const TV_LAP_REMOUNT_MIN_MS = 5_000;
+export function lapRemountIsFree(mountedAtMs: number, now: number): boolean {
+  return now - mountedAtMs >= TV_LAP_REMOUNT_MIN_MS;
+}
+
 export class TvSyncController {
   private readonly now: () => number;
   private readonly rttMs: () => number;
@@ -126,6 +174,7 @@ export class TvSyncController {
   private readonly heartbeat: (positionMs: number) => void;
   private readonly volume: () => number;
   private readonly onEnded: () => void;
+  private readonly loopEnd: () => number;
   private endedHandled = false;
   private lastBeatAt = -Infinity;
   private lastSeekAt = -Infinity;
@@ -176,6 +225,12 @@ export class TvSyncController {
    *  or by a player that cannot seek yet, still restarts the player on the
    *  tick it can. */
   private seenStarted: number | null = null;
+  /** A viewer: the LOOP lap the room was on as of its last tick, when
+   *  nobody runs the laps (readPlayback `lap`), else null. A lap no write
+   *  names changes neither `started` nor `jump`, and a clip shorter than
+   *  the seek band is never "far" from its end: a change of lap is the
+   *  replay's own signal. */
+  private seenLap: number | null = null;
   /** The transport revision of a countdown this controller parked for
    *  (tvDoc `jump`, as SCHEDULE wrote it): the holder's first playing tick
    *  past T0 follows it like any jump — to the time since T0 — and forgets
@@ -195,7 +250,11 @@ export class TvSyncController {
     this.started = deps.started ?? (() => readTv(deps.itemId).started);
     this.heartbeat = deps.heartbeat ?? ((p) => { tvHeartbeat(deps.itemId, p); });
     this.volume = deps.volume ?? (() => readTv(deps.itemId).volume);
-    this.onEnded = deps.onEnded ?? (() => { tvStop(deps.itemId); });
+    this.onEnded = deps.onEnded ?? (() => { tvProgrammeEnded(deps.itemId); });
+    this.loopEnd = deps.loopEnd ?? (() => {
+      const rec = readTv(deps.itemId);
+      return rec.loop ? rec.endMs : 0;
+    });
   }
 
   /** The lead for this page: half the round trip to its own node for a
@@ -450,6 +509,7 @@ export class TvSyncController {
       if (this.pendingTarget === null && !this.endedHandled) {
         this.endedHandled = true;
         this.onEnded();
+        this.followLap(p, now);
       }
       return pb;
     }
@@ -464,6 +524,31 @@ export class TvSyncController {
       this.lastBeatAt = now;
     }
     return pb;
+  }
+
+  /** A LOOP lap the end handler just wrote (tvProgrammeEnded) starts the
+   *  room over from the top as of now: the holder's own player follows it
+   *  in the same tick, from where the record now says (0), not on the next
+   *  one — by then the room is a tick into the lap, so every lap would skip
+   *  its first tick, and a clip shorter than a tick would be sent straight
+   *  to its end and ended again, unplayed. A player that cannot seek is
+   *  rebuilt for the lap instead (tvTheatre, replayNeedsRemount). */
+  private followLap(p: TvPlayer, now: number): void {
+    const jump = this.jump();
+    if (!p.canSeek || jump === this.appliedJump) return;
+    const pb = this.playback(now, 0);
+    if (pb.state !== 'playing') return; // LOOP off: back home, which the next tick follows
+    const started = this.started();
+    this.appliedJump = jump;
+    this.countdownJump = null;
+    this.seenStarted = started;
+    this.endedHandled = false;
+    this.aim(p, reachable(holderAnchorMs(pb), p), now);
+    this.settlePending(p, now);
+    // A seek that lands later (YouTube's) is waited for as any jump's: the
+    // tick it un-ends the player plays it.
+    if (!p.isEnded() && !p.isPlaying()) p.play();
+    this.deps.onLapFollowed?.(started);
   }
 
   /** The holder takes aim at a transport target: the seek goes out now if
@@ -558,10 +643,17 @@ export class TvSyncController {
       return pb;
     }
     this.seenJump = jump;
+    // A lap with nobody to write it (readPlayback `lap`) is a replay, as a
+    // new programme is: one this viewer has not seen begin, or — on the
+    // first tick it is seen at all — any past the run the room's anchor
+    // began in.
+    const lap = pb.lap ?? null;
+    const newLap = lap !== null && lap !== (this.seenLap ?? 0);
     if (p.isEnded()) {
       // The new programme's revision is consumed here: a replay owed from
       // here on (replayDue) carries it until the player un-ends.
       this.seenStarted = started;
+      this.seenLap = lap;
       // A player at its end is never play()ed as it stands (it would start
       // over). A record well BEFORE the end is a rewind or a replay: seek
       // there — which un-ends the player — and go; so is a record anywhere
@@ -574,11 +666,18 @@ export class TvSyncController {
       // lands, and a seek and a play() every tick meanwhile would only
       // interrupt its buffering. Otherwise hold until the record moves on
       // (the holder ends the programme).
-      const before = pb.positionMs < p.currentMs();
-      if ((transport && before) || newProgramme) this.replayDue = jump;
-      const far = pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS;
+      // With LOOP on, a room past the media's end is that far into a lap —
+      // one this viewer has seen start (a replay owed): never a holder
+      // merely stalled before the end, whose record runs on past it.
+      if (newProgramme || newLap) this.replayDue = jump;
+      const at = this.replayDue !== null ? loopPosition(pb.positionMs, this.loopEnd()) : pb.positionMs;
+      const before = at < p.currentMs();
+      if (transport && before) this.replayDue = jump;
+      const far = at < p.currentMs() - TV_SEEK_OVER_MS;
       const owed = this.replayDue !== null;
-      const fresh = owed && this.replayDue !== this.replayIssuedFor;
+      // A new lap is a new revision of its own: a clip that ends again
+      // before a tick has seen it play is replayed at once all the same.
+      const fresh = owed && (this.replayDue !== this.replayIssuedFor || newLap);
       // A record at or past this player's end is nowhere to go: a new
       // programme the holder already ran out (PLAY NOW, then +10 s past a
       // short file's end before this tick) leaves the player at the end
@@ -586,9 +685,9 @@ export class TvSyncController {
       // The replay stays owed: the record moving back before the end (a
       // rewind) is followed on that tick, as any.
       const range = p.seekableRange();
-      const atEnd = range !== null && pb.positionMs >= range.endMs;
+      const atEnd = range !== null && at >= range.endMs;
       if (!atEnd && p.canSeek && (far || owed) && (fresh || now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
-        p.seek(pb.positionMs);
+        p.seek(at);
         this.lastSeekAt = now;
         this.replayIssuedFor = this.replayDue;
         this.setRate(1);
@@ -607,15 +706,19 @@ export class TvSyncController {
     // asked while paused and resumed before the ranges arrived included;
     // one that never can (a start-only embed, no clock) is simply played,
     // as any programme.
-    if (newProgramme && (p.canSeek || p.hasClock)) {
+    // A new lap nobody wrote, on a player still running the last one, the
+    // same.
+    if ((newProgramme || newLap) && (p.canSeek || p.hasClock)) {
       if (!p.canSeek) return pb;
-      p.seek(reachable(pb.positionMs, p));
+      p.seek(reachable(loopPosition(pb.positionMs, this.loopEnd()), p));
       this.lastSeekAt = now;
       this.setRate(1);
       this.seenStarted = started;
+      this.seenLap = lap;
       return pb;
     }
     this.seenStarted = started;
+    this.seenLap = lap;
     // Measured against what this player can reach, as the seek is: the
     // record may name a position this viewer's media does not have (a live
     // window that has moved on), and a player already at the window's edge

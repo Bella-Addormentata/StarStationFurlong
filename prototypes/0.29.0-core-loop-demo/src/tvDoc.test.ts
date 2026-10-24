@@ -7,11 +7,11 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, claimRemote, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, iHoldRemote, isStartOnly,
+  bindTvDoc, claimRemote, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, holderAnchorMs, iHoldRemote, isStartOnly,
   markTvPageAwake, mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readPower, readProgramme,
   readRemote, readSample, readTv, remoteKey, remoteStatus, renewRemote, sanitizeSource, setTvClock,
   setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, sourceLane, subscribeTvKey, tvHeartbeat,
-  tvKey, tvNoteEnd, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
+  tvKey, tvNoteEnd, tvPause, tvPlay, tvProgrammeEnded, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetLoop, tvSetVolume, tvStop,
   tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
   TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey, libraryKey, readLibrary, TV_HOME_RECENT, TV_LIBRARY_MAX,
   sourceId,
@@ -928,15 +928,186 @@ describe('the sync rule: anchor on receipt, never on the holder\'s clock', () =>
     expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 });
   });
 
-  it('a late joiner anchors the record it finds to its own now', () => {
+  it("a late joiner runs the record it finds on by its writer's clock, from its own now", () => {
     pickUpRemote(TV);
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 50_000);
+    expect(readProgramme(TV).at).toBe(now); // the writer's wall clock, with the position
     const late = new Y.Doc();
     Y.applyUpdate(late, Y.encodeStateAsUpdate(doc));
     now += 5_000;
+    setTvPageId('B');
+    iAm(BOB, 'Bob');
     bindTvDoc(late);
-    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 50_000, receivedAt: now });
+    // Written 5 s ago by the writer's clock: the room is 5 s on.
+    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 55_000, receivedAt: now, wall: true });
+    expect(readPlayback(TV).positionMs).toBe(55_000);
+    // The holder's next beat is fresh on arrival: anchored as any sample.
+    setTvPageId('A');
+    iAm(ALICE, 'Alice');
+    now += 1_000;
+    tvHeartbeat(TV, 56_000);
+    expect(readSample(TV)).toMatchObject({ positionMs: 56_000, receivedAt: now });
+    expect(readSample(TV)).not.toHaveProperty('wall');
+  });
+
+  it("never runs a record back, nor on from a clock it cannot read", () => {
+    let wall = now;
+    setTvClock(() => now, () => wall);
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    // The writer's clock a minute AHEAD of the joiner's: no time has passed
+    // by the joiner's reading, and it starts where the record says.
+    wall += 60_000;
+    tvHeartbeat(TV, 50_000);
+    wall -= 60_000;
+    const late = new Y.Doc();
+    Y.applyUpdate(late, Y.encodeStateAsUpdate(doc));
+    bindTvDoc(late);
+    expect(readSample(TV)).toMatchObject({ positionMs: 50_000 });
+    // A record from before the field (no `at`): anchored to now, as ever.
+    const old = new Y.Doc();
+    old.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), at: undefined });
+    wall += 3_600_000;
+    bindTvDoc(old);
+    expect(readSample(TV)).toEqual({ seq: readProgramme(TV).seq, positionMs: 50_000, receivedAt: now });
+  });
+
+  it('a looping film plays on in an empty room, and whoever walks in joins the lap it is on', () => {
+    pickUpRemote(TV);
+    tvSetLoop(TV, true);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV); // the holder leaves: nobody runs the laps
+    const later = Y.encodeStateAsUpdate(doc);
+    now += 100_000;
+    setTvPageId('B');
+    iAm(BOB, 'Bob');
+    const late = new Y.Doc();
+    Y.applyUpdate(late, later);
+    bindTvDoc(late);
+    // 150 s of a 60 s clip: 30 s into its third lap.
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 30_000 });
+    // And on, lap after lap, with no one writing a thing.
+    now += 40_000;
+    expect(readPlayback(TV).positionMs).toBe(10_000);
+    expect(tvScreenView(TV).clockText).toBe('0:10');
+    // Without LOOP, past the end is the end: nothing wraps it.
+    setTvPageId('A');
+    iAm(ALICE, 'Alice');
+    bindTvDoc(doc);
+    pickUpRemote(TV);
+    tvSetLoop(TV, false);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV);
+    now += 100_000;
+    expect(readPlayback(TV).positionMs).toBe(150_000);
+  });
+
+  it('a viewer follows a live holder\'s laps, and runs its own once the remote goes quiet', () => {
+    pickUpRemote(TV);
+    tvSetLoop(TV, true);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 59_000);
+    iAm(BOB, 'Bob'); // a viewer on this page, the holder's lease live
+    now += 3_000;
+    // The holder's player is the room's clock: its lap comes as a write.
+    expect(readPlayback(TV).positionMs).toBe(62_000);
+    now += TV_LEASE_LAPSE_MS;
+    // Gone quiet: the viewer works the lap out for itself.
+    expect(remoteStatus(TV)).toBe('free');
+    expect(readPlayback(TV).positionMs).toBe(59_000 + 3_000 + TV_LEASE_LAPSE_MS - 60_000);
+  });
+
+  it('whoever picks the remote up in an empty room takes the lap it is on, and runs the laps from their first beat', () => {
+    pickUpRemote(TV);
+    tvSetLoop(TV, true);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV); // the holder leaves
+    now += 100_000;
+    setTvPageId('B');
+    iAm(BOB, 'Bob');
+    // Picked up without a look at the set first: 150 s of a 60 s clip is
+    // 30 s into its third lap, for the new holder as for anyone watching —
+    // never 150 s, which a holder's player would take for the end.
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    expect(iHoldRemote(TV)).toBe(true);
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 30_000, lap: 2 });
+    expect(holderAnchorMs(readPlayback(TV))).toBe(30_000);
+    // The holder's first beat, from there, is the room's clock: past the
+    // end now is its player ending, and its own lap (tvProgrammeEnded).
+    tvHeartbeat(TV, 30_000);
+    expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 30_000, running: true, countdownMs: 0 });
+    now += 3_000;
+    renewRemote(TV);
+    tvHeartbeat(TV, 59_000);
+    now += 3_000;
+    expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 62_000, running: true, countdownMs: 0 });
+  });
+
+  it('a viewer watching the empty room stays on its lap when someone else picks the remote up, until their first beat', () => {
+    pickUpRemote(TV);
+    tvSetLoop(TV, true);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV);
+    now += 100_000;
+    setTvPageId('B');
+    iAm(BOB, 'Bob');
+    expect(readPlayback(TV)).toMatchObject({ positionMs: 30_000, lap: 2 });
+    // Carol picks the remote up on her page: her lease lands here, and no
+    // beat yet.
+    const carols = new Y.Doc();
+    Y.applyUpdate(carols, Y.encodeStateAsUpdate(doc));
+    carols.getMap('tv').set(remoteKey(TV), { holder: 'CCCCcarolpub', name: 'Carol', leaseAt: now, by: 'CCCCcarolpub', page: 'C' });
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(carols));
+    expect(remoteStatus(TV)).toBe('held');
+    now += 1_000;
+    expect(readPlayback(TV)).toMatchObject({ positionMs: 31_000, lap: 2 });
+    // Her first beat, from where she took the room: her laps from here.
+    const rec = readProgramme(TV);
+    carols.getMap('tv').set(tvKey(TV), { ...rec, positionMs: 31_000, seq: rec.seq + 1 });
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(carols));
+    now += 5_000;
+    expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 36_000, running: true, countdownMs: 0 });
+  });
+
+  it('a viewer back from a sleep waits for a live holder\'s beat, and follows the room again once nobody holds the remote', () => {
+    pickUpRemote(TV);
+    tvSetLoop(TV, true);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 60_000);
+    markTvPageAwake(now);
+    tvHeartbeat(TV, 10_000);
+    setTvPageId('B'); // a viewer's page; Alice's keeps the remote
+    iAm(BOB, 'Bob');
+    tick(500);
+    markTvPageAwake(now);
+    tick(120_000); // Bob's lid closed for two minutes
+    markTvPageAwake(now);
+    expect(readPlayback(TV).stale).toBe(true);
+    // Alice is still there: her renewal lands past the wake window, and the
+    // reading stays stale until her next beat.
+    const alices = new Y.Doc();
+    Y.applyUpdate(alices, Y.encodeStateAsUpdate(doc));
+    for (let i = 0; i < 4; i++) { tick(500); markTvPageAwake(now); }
+    alices.getMap('tv').set(remoteKey(TV), { ...readRemote(TV), leaseAt: readRemote(TV).leaseAt + 1 });
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(alices));
+    expect(remoteStatus(TV)).toBe('held');
+    for (let i = 0; i < 15; i++) { tick(500); markTvPageAwake(now); } // 9.5 s since waking
+    expect(readPlayback(TV).stale).toBe(true);
+    // Then nothing: her remote goes quiet, and no beat is coming. The room
+    // is where its anchor says, laps and all, and Bob's player follows it.
+    for (let i = 0; i < 2; i++) { tick(500); markTvPageAwake(now); }
+    expect(remoteStatus(TV)).toBe('free');
+    const pb = readPlayback(TV);
+    expect(pb.stale).toBeUndefined();
+    expect(pb).toEqual({ state: 'playing', positionMs: (10_000 + 131_000) % 60_000, running: true, countdownMs: 0, lap: 2 });
   });
 
   it('expectedPositionMs and driftAction', () => {
@@ -1041,6 +1212,98 @@ describe('sources', () => {
   });
 });
 
+describe('🔁 LOOP', () => {
+  it('is the holder\'s to set, neither a sample nor a transport action, kept across programmes, and read as a boolean whatever a peer wrote', () => {
+    expect(tvSetLoop(TV, true).ok).toBe(false); // nobody holds the remote
+    pickUpRemote(TV);
+    tvPlay(TV, CLIP);
+    const { seq, jump, started } = readTv(TV);
+    expect(tvSetLoop(TV, true)).toEqual({ ok: true });
+    expect(readTv(TV)).toMatchObject({ loop: true, seq, jump, started });
+    tvStop(TV);
+    tvPlay(TV, FILM);
+    expect(readTv(TV).loop).toBe(true); // the set's setting: the next film loops too
+    iAm(BOB);
+    setTvPageId('B');
+    expect(tvSetLoop(TV, false).ok).toBe(false); // not the holder
+    doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), loop: 'yes' });
+    expect(readProgramme(TV).loop).toBe(false);
+  });
+
+  it('a lap leaves a lookup in flight standing (an upload for PLAY NOW over a looping film); a programme action still voids it', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, CLIP);
+    tvSetLoop(TV, true);
+    const revision = tvRevision(TV);
+    tvProgrammeEnded(TV);
+    tvProgrammeEnded(TV);
+    expect(readTv(TV).laps).toBe(2);
+    expect(tvRevision(TV)).toBe(revision);
+    tvPause(TV, 1_000);
+    expect(tvRevision(TV)).not.toBe(revision);
+    const paused = tvRevision(TV);
+    tvSetLoop(TV, false);
+    tvProgrammeEnded(TV); // the end with LOOP off is STOP: home
+    expect(readTv(TV).state).toBe('home');
+    expect(tvRevision(TV)).not.toBe(paused);
+    doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), laps: -3 });
+    expect(readProgramme(TV).laps).toBe(0);
+  });
+
+  it('a lap that wraps one counter past its ceiling and not the other is still no action', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, CLIP);
+    tvSetLoop(TV, true);
+    doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), jump: TV_COUNTER_MAX, laps: 0 });
+    const revision = tvRevision(TV);
+    tvProgrammeEnded(TV);
+    expect(readTv(TV)).toMatchObject({ jump: 0, laps: 1 });
+    expect(tvRevision(TV)).toBe(revision);
+    tvProgrammeEnded(TV);
+    expect(tvRevision(TV)).toBe(revision);
+  });
+
+  it('at the end starts the same programme over from the top, the end kept and the history and library left alone; without it, home', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 30_000);
+    tvHeartbeat(TV, 30_000);
+    tvSetLoop(TV, true);
+    const before = readTv(TV);
+    const library = readLibrary();
+    expect(tvProgrammeEnded(TV)).toEqual({ ok: true });
+    const after = readTv(TV);
+    expect(after).toMatchObject({ state: 'playing', source: CLIP, positionMs: 0, endMs: 30_000, loop: true });
+    // A new start, as PLAY NOW again is: a player that cannot seek is rebuilt, one that can goes back to 0.
+    expect(after.started).toBeGreaterThan(before.started);
+    expect(after.jump).toBeGreaterThan(before.jump);
+    expect(after.seq).toBeGreaterThan(before.seq);
+    expect(after.history).toEqual(before.history);
+    expect(readLibrary()).toEqual(library);
+    // The same showing: a viewer's ✕ is kept against it, so a lap does not undo it.
+    expect(after.showing).toBe(before.showing);
+    expect(before.showing).toBe(before.started);
+    expect(readPlayback(TV).positionMs).toBe(0);
+    tvPlay(TV, CLIP); // PLAY NOW again is another showing
+    expect(readTv(TV).showing).toBe(readTv(TV).started);
+    expect(readTv(TV).showing).toBeGreaterThan(after.showing);
+    tvSchedule(TV, CLIP, now + 60_000);
+    expect(readTv(TV).showing).toBe(readTv(TV).started);
+    // A peer's garbage, or a showing ahead of the start, reads as the start.
+    for (const bad of ['1', -1, 1.5, readTv(TV).started + 1]) {
+      doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), showing: bad });
+      expect(readProgramme(TV).showing).toBe(readProgramme(TV).started);
+    }
+    tvPlay(TV, CLIP);
+    tvSetLoop(TV, false);
+    expect(tvProgrammeEnded(TV)).toEqual({ ok: true });
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
+    iAm(BOB);
+    setTvPageId('B');
+    expect(tvProgrammeEnded(TV).ok).toBe(false); // only the holder ends a programme
+  });
+});
+
 describe('the in-world screen', () => {
   it('derives its view from the records alone', () => {
     expect(tvScreenView(TV)).toMatchObject({ state: 'off', title: '' });
@@ -1055,6 +1318,10 @@ describe('the in-world screen', () => {
     expect(tvScreenView(TV)).toMatchObject({ state: 'playing', title: 'METROPOLIS', lane: 'CONVENIENCE', clockText: '1:01' });
     tvPause(TV, 61_000);
     expect(tvScreenView(TV).detail).toBe('PAUSED · REMOTE · Alice');
+    tvSetLoop(TV, true);
+    expect(tvScreenView(TV).detail).toBe('PAUSED · LOOP · REMOTE · Alice');
+    tvResume(TV);
+    expect(tvScreenView(TV).detail).toBe('LOOP · REMOTE · Alice');
   });
 });
 

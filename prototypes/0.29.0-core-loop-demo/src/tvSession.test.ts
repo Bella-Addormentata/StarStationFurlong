@@ -9,9 +9,10 @@ import { isTvKind, tvLabel } from './tvSession';
 import {
   bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, remoteKey,
   setTvClock,
-  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS,
+  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvSetLoop, tvTogglePower, TV_HEARTBEAT_MS,
   TV_LEASE_LAPSE_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
+import { TvSyncController, type TvPlayer } from './tvSync';
 import {
   armTvDrive, forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvDriveArmed,
   tvPlayerCanSeek, tvPlayerPositionMs, tvRoomPlayers,
@@ -370,6 +371,92 @@ describe('tickTvRoom', () => {
     unregisterLive();
     run(60_000);
     expect(readTv(TV).state).toBe('playing');
+  });
+
+  it('with LOOP on, the headless beat starts the programme over at the end it carries, lap after lap; LOOP off, the next end is home', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    const first = readTv(TV).started;
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 25_000, canSeek: () => true, started: () => first, endMs: () => 30_000 });
+    run(1_000);
+    tvHeartbeat(TV, 25_000);
+    unregister(); // the holder closes the theatre at 25 s; the record runs on headlessly
+    tvSetLoop(TV, true);
+    run(6_000); // 31 s: past the end
+    expect(readTv(TV)).toMatchObject({ state: 'playing', endMs: 30_000, started: first + 1 });
+    expect(readPlayback(TV, now).positionMs).toBeLessThan(TV_HEARTBEAT_MS); // from the top
+    run(30_000); // the second lap ends on the end the record kept: no player was needed to know it
+    expect(readTv(TV)).toMatchObject({ state: 'playing', started: first + 2 });
+    expect(readTv(TV).history).toHaveLength(1); // one showing, however many laps
+    tvSetLoop(TV, false);
+    run(31_000);
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
+  });
+
+  it('picked up in an empty room on LOOP, the headless beat takes the room on from the lap it is on, not from the top', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tvSetLoop(TV, true);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV); // the holder leaves: nobody runs the laps
+    const started = readTv(TV).started;
+    now += 100_000; // 150 s of a 60 s film: 30 s into its third lap
+    setTvPageId('B');
+    setTvIdentity(() => ({ pub: 'BBBBbob', name: 'Bob' }));
+    pickUpRemote(TV); // from the phone, no theatre open
+    tickTvRoom([TV], now);
+    expect(readTv(TV)).toMatchObject({ state: 'playing', started, positionMs: 30_000 });
+    run(3_000);
+    expect(readTv(TV)).toMatchObject({ state: 'playing', started });
+    expect(readPlayback(TV, now).positionMs).toBe(33_000);
+  });
+
+  it('a clip that laps on every theatre tick still has its end filed, so the headless beat loops it on once the theatre closes', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/blip.mp4' });
+    tvSetLoop(TV, true);
+    const DUR = 300; // shorter than the theatre's 400 ms tick
+    let pos = 0;
+    let playing = false;
+    let last = now;
+    const player: TvPlayer = {
+      canNudge: true, canSeek: true, hasClock: true,
+      isReady: () => true, isPlaying: () => playing, isEnded: () => pos >= DUR,
+      play: () => { playing = true; }, pause: () => { playing = false; },
+      seek: (ms) => { pos = Math.min(Math.max(0, ms), DUR); },
+      currentMs: () => pos, seekableRange: () => ({ startMs: 0, endMs: DUR }),
+      setRate: () => {}, setVolume: () => {},
+    };
+    // The theatre: its registration names the programme its tick last saw,
+    // and a lap its controller followed as the clip ended.
+    let playerFor = readTv(TV).started;
+    let metadata = false; // the length arrives with the media's metadata, after the mount
+    const c = new TvSyncController({ itemId: TV, player, now: () => now, onLapFollowed: (started) => { playerFor = started; } });
+    const unregister = registerTvPlayerOfRecord(TV, {
+      positionMs: () => c.positionMs(), canSeek: () => true, started: () => playerFor, endMs: () => (metadata ? DUR : null),
+    });
+    const first = readTv(TV).started;
+    // The theatre's 400 ms tick and World's 500 ms room tick, interleaved:
+    // the clip laps on every theatre tick, the first before any room tick.
+    for (let ms = 0; ms <= 4_000; ms += 100) {
+      now += 100;
+      if (playing) pos = Math.min(DUR, pos + (now - last));
+      last = now;
+      if (ms % 400 === 0) {
+        playerFor = readTv(TV).started;
+        c.tick();
+      }
+      if (ms % 500 === 0) tickTvRoom([TV], now);
+      metadata = true;
+    }
+    expect(readTv(TV).started).toBeGreaterThan(first + 5); // it laps
+    expect(readTv(TV).endMs).toBe(DUR); // and its end is in the record
+    unregister(); // the holder closes the theatre
+    const closed = readTv(TV).started;
+    run(2_000);
+    expect(readTv(TV)).toMatchObject({ state: 'playing' });
+    expect(readTv(TV).started).toBeGreaterThan(closed); // the headless beat laps it on its end
   });
 
   it('an end reported by a player mounted for a programme that has moved on is not filed under the new one', () => {

@@ -17,7 +17,7 @@ import {
   formatClock, handRemote, holdsSpareRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
   putDownRemote, readLibrary, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource, sourceId, TV_MAX_TITLE,
   sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
-  tvResume, tvRevision, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, powerKey, volumeKey,
+  tvResume, tvRevision, tvSchedule, tvSeek, tvSetLoop, tvSetVolume, tvStop, tvTogglePower, powerKey, volumeKey,
 } from './tvDoc';
 import type { TvHistoryEntry, TvLibraryEntry, TvSource, TvTorrentOrigin } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
@@ -762,7 +762,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
         ${!startOnly && pb.state === 'playing' ? smallButton(`data-tv-pause="${esc(tv.id)}"`, '⏸') : ''}
         ${!startOnly && pb.state === 'paused' ? smallButton(`data-tv-resume="${esc(tv.id)}"`, '▶') : ''}
         ${seekable && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
-        ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek or volume from here</span>` : ''}
+        ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek, volume or loop from here</span>` : ''}
         ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
         ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
       </div>`
@@ -781,6 +781,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <div style="display:flex; gap:6px; flex-wrap:wrap;">
         ${smallButton(`data-tv-play="${esc(tv.id)}"`, '▶ PLAY NOW')}
         ${SCHEDULE_CHOICES.map((c) => smallButton(`data-tv-schedule="${c.minutes}" data-tv-id="${esc(tv.id)}"`, `🕒 ${c.label}`)).join('')}
+        ${smallButton(`data-tv-loop="${esc(tv.id)}" aria-pressed="${rec.loop}" title="At the end, start the film over (stays on for the next one)"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF')}
       </div>
       <div id="tv-app-feedback" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;">${esc(feedbackNow())}</div>
       ${transport}
@@ -1357,6 +1358,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-back]').forEach((b) => b.addEventListener('click', () => { tvSeek(b.dataset.tvBack!, Math.max(0, pos(b.dataset.tvBack!) - 10_000)); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-fwd]').forEach((b) => b.addEventListener('click', () => { tvSeek(b.dataset.tvFwd!, pos(b.dataset.tvFwd!) + 10_000); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-stop]').forEach((b) => b.addEventListener('click', () => { tvStop(b.dataset.tvStop!); }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-loop]').forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.tvLoop!;
+    tvSetLoop(id, !readTv(id).loop);
+  }));
   host.querySelectorAll<HTMLInputElement>('[data-tv-volume]').forEach((i) => i.addEventListener('change', () => { tvSetVolume(i.dataset.tvVolume!, Number(i.value)); }));
   // PICK UP / PUT DOWN are wired by set id above; HAND TO… names its set too.
   wireHandOver(host, feedback);
