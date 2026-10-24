@@ -13,7 +13,7 @@ vi.stubGlobal('window', { location: { search: '' } });
 const {
   bindCasinoDoc, buyInChips, readAllCrapsBets, readChips, readCrapsTableState, readDiceThrow, readSeedRecord,
   readTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyBets, writeMyCrapsBets,
-  writeMySeedRecord, writeTableState,
+  writeMySeedRecord, writeTableOperatorLease, writeTableState,
 } = await import('./casinoDoc');
 const {
   BET_WINDOW_MS, CLOSING_MS, rollAndSettle, ROULETTE_PAGE_ID, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier,
@@ -286,6 +286,22 @@ describe('a Fair roulette round', () => {
     expect(s.payouts?.[BOB]).toBeUndefined();
   });
 
+  it('a bet emptied after "no more bets" still loses what it held then', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette'); // both reveal: the pocket is computable now
+    expect(readChips(BOB)).toBe(90);
+    writeMyBets(t, BOB, 1, []); // Bob takes his black down after the close
+    expect(readChips(BOB)).toBe(100);
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(readChips(BOB)).toBe(90);
+  });
+
   it("rewriting the closing state's wager hash too doesn't get a rewritten bet paid", async () => {
     const t = freshTable();
     rouletteToClosing(t);
@@ -335,6 +351,21 @@ describe('a Fair roulette round', () => {
     await flush();
     expect(readTableState(t)?.phase).toBe('closing');
     writeTableState(t, { ...readTableState(t)!, operator: ROULETTE_PAGE_ID });
+    rollAndSettle(t, closing.round);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('settled');
+  });
+
+  it("an auto round isn't settled on a page another of the owner's pages took the tables from", async () => {
+    const t = freshTable();
+    const closing = rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    writeTableOperatorLease({ page: 'owner-other-tab', player: 'owner', beat: 3 });
+    rollAndSettle(t, closing.round);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('closing');
+    writeTableOperatorLease({ page: ROULETTE_PAGE_ID, player: 'owner', beat: 4 });
     rollAndSettle(t, closing.round);
     await flush();
     expect(readTableState(t)?.phase).toBe('settled');
@@ -393,7 +424,7 @@ describe('a Fair roulette round', () => {
     expect(s.houseCommit).toBeTruthy();
   });
 
-  it('a void round refunds only the frozen stake, not a list inflated after the close', async () => {
+  it('a void round gives back no list inflated after the close: it loses what it held then', async () => {
     const t = freshTable();
     tickAutoCroupier(t);
     writeTableState(t, { ...readTableState(t)!, houseCommit: 'f'.repeat(64) });
@@ -404,12 +435,13 @@ describe('a Fair roulette round', () => {
     tickAutoCroupier(t);
     playersLook(t, 'roulette', [AMY]);
     writeMyBets(t, AMY, 1, [{ type: 'red', amount: 90 }]); // rewritten after the close
-    const before = readChips(AMY);
+    expect(readChips(AMY)).toBe(10); // the 90 held on the felt
     later(CLOSING_MS);
     tickAutoCroupier(t);
     await flush();
     expect(readTableState(t)).toMatchObject({ phase: 'settled', voided: true });
-    expect(readChips(AMY)).toBe(before);
+    // The 10 frozen at the close are lost; the 80 it grew by were never taken.
+    expect(readChips(AMY)).toBe(90);
   });
 
   it("a void round refunds a bettor who never revealed, too", async () => {
@@ -636,6 +668,7 @@ describe('a Fair roulette round', () => {
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);
+    buyInChips('player-Late', 7);
     writeMyBets(t, 'player-Late', 1, [{ type: 'red', amount: 7 }]); // lands just after the close
     playersLook(t, 'roulette');
     const before = readChips('player-Late');
@@ -903,11 +936,11 @@ describe('a Fair craps roll', () => {
     expect(s.fairness?.parties).toEqual(['house', AMY]);
   });
 
-  it("the house's first ROLL on a fresh Fair table with bets down only opens the window", () => {
+  it("the house's first ROLL on a fresh Fair table only opens the window", () => {
     const t = freshTable();
-    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
     expect(pressManualRoll(t)).toMatch(/PRESS AGAIN/);
     expect(readCrapsTableState(t)?.phase).toBe('betting');
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
     playersLook(t, 'craps', [AMY]);
     expect(pressManualRoll(t)).toBeNull();
     const s = readCrapsTableState(t)!;
@@ -934,6 +967,28 @@ describe('a Fair craps roll', () => {
     const s = readCrapsTableState(t)!;
     expect(s.phase).toBe('settled');
     expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(readAllCrapsBets(t)[BOB]).toBeUndefined();
+  });
+
+  it('craps charges a frozen bettor whose list was emptied after the close what it held then', async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    writeMyCrapsBets(t, BOB, [{ type: 'field', amount: 5 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps');
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps');
+    writeMyCrapsBets(t, BOB, []);
+    expect(readChips(BOB)).toBe(100);
+    later(CRAPS_CLOSING_MS);
+    tickAutoStickman(t);
+    await flush();
+    const s = readCrapsTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(readChips(BOB)).toBe(95);
     expect(readAllCrapsBets(t)[BOB]).toBeUndefined();
   });
 
@@ -986,6 +1041,22 @@ describe('a Fair craps roll', () => {
     playersLook(t, 'craps', [AMY]);
     const closing = readCrapsTableState(t)!;
     writeCrapsTableState(t, { ...closing, operator: 'player-Other:abc123' });
+    rollAndSettleCraps(t, closing.round, closing.point);
+    await flush();
+    expect(readCrapsTableState(t)?.phase).toBe('closing');
+  });
+
+  it("an auto craps roll isn't settled on a page another of the owner's pages took the tables from", async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    const closing = readCrapsTableState(t)!;
+    writeTableOperatorLease({ page: 'owner-other-tab', player: 'owner', beat: 3 });
     rollAndSettleCraps(t, closing.round, closing.point);
     await flush();
     expect(readCrapsTableState(t)?.phase).toBe('closing');

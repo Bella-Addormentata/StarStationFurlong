@@ -15,11 +15,11 @@
  * CRAPS ≠ ROULETTE: a roulette settle clears the felt every spin. A craps roll
  * only settles the bets that GOT a decision — a pass line waiting on its point,
  * a working place bet, ride to the next roll. So the settle also PRUNES each
- * player's bet list (writeMyCrapsBets with the survivors) and carries the POINT
- * forward into the next betting window. This is the one place a client other
- * than the bet's owner rewrites `bets:<id>:<pid>` — safe because it happens at
- * the settle, disjoint from the players' betting window (documented v1; the G4
- * Registry chips + a claim lane close it for real).
+ * player's bets (casinoDoc pruneCrapsBets: the survivors, as the stickman's
+ * own `kept:<id>:<pid>`, never the player's `bets:` key) and carries the POINT
+ * forward into the next betting window. The survivors play until the player
+ * writes a list after that roll, so an edit that crossed the dice is dropped
+ * rather than bringing back bets the roll resolved (casinoDoc crapsFelt).
  *
  * NO SHARED CLOCK — same as croupier.ts: the operator's Date.now() drives the
  * deadlines. ⚖️ FAIRNESS: by default the dice come from the house's seed mixed
@@ -27,17 +27,20 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { canRunCroupier } from './croupier';
+import { RECONNECTING_NOTICE, tablesAwake, tablesWakeCount, timerOnThisClock } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
   clearTableKeys,
-  creditChips,
+  creditTableOutcome,
   readAllCrapsBets,
   readCrapsFairnessPref,
   readCrapsTableState,
   readDiceThrow,
+  readFeltStakes,
   readSeats,
+  tableIncFor,
+  transactCasino,
   writeCrapsTableState,
   writeDiceThrow,
 } from './casinoDoc';
@@ -141,6 +144,7 @@ export function openCrapsBetting(
     ...(lastShooter !== undefined ? { lastShooter } : {}),
     fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
+    inc: readCrapsTableState(tableId)?.inc ?? tableIncFor(tableId),
   });
 }
 
@@ -320,8 +324,11 @@ const PAGE_ID = CRAPS_PAGE_ID;
  *  shooter's throw, timing them out. World ticks it every frame on every
  *  editor's client whatever they're looking at; only the operator page acts,
  *  so shareholders in a venture room never race the settle. If that page
- *  goes away, any editor's next ROLL press finishes the turn. */
-export function tickManualCraps(tableId: string, now = Date.now()): void {
+ *  goes away, any editor's next ROLL press finishes the turn. On a robot
+ *  table (one of the owner's pages not driving it pressed ROLL before the
+ *  robot's first beat) `autoShowMs` gives the settle its show beat, so the
+ *  driving page opens the next window as usual. */
+export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: number): void {
   // Every editor samples (throttled), so whoever presses ROLL has already
   // seen the seated players' heartbeats move and can slide them the dice.
   sampleSeats(tableId, now);
@@ -330,7 +337,8 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
   // A takeover marker counts only for the turn it took, in this room doc;
   // losing the turn (or it ending) drops it.
   const mark = tookOverAt.get(tableId);
-  const took = mark && s && mark.epoch === casinoDocEpoch() && mark.round === s.round ? mark.at : undefined;
+  const took = mark && s && mark.epoch === casinoDocEpoch() && mark.inc === s.inc && mark.round === s.round
+    ? mark.at : undefined;
   if (s?.phase !== 'closing' || s.operator !== PAGE_ID) {
     tookOverAt.delete(tableId);
     return;
@@ -338,7 +346,10 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
   // Just took the turn over: let the operator stamp converge first, so a
   // rival takeover's write wins or loses before either page settles.
   if (took !== undefined && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
-  tickCrapsClosing(tableId, s, undefined, took !== undefined ? Infinity : now);
+  // 💤 A page waking from a sleep holds this turn only in a doc that may not
+  // have heard a takeover yet: it waits to be awake again (noteTablesRunning).
+  if (!tablesAwake(now)) return;
+  tickCrapsClosing(tableId, s, autoShowMs, took !== undefined ? Infinity : now);
   tookOverAt.delete(tableId);
 }
 
@@ -350,9 +361,12 @@ export function tickManualCraps(tableId: string, now = Date.now()): void {
 export const MANUAL_TAKEOVER_MS = CRAPS_SHOOTER_MS + 10_000;
 
 /** When this page first saw each table's current closing turn (its epoch,
- *  round and operator), by this page's clock. tickManualCraps notes it every
- *  frame on every editor's page, so the watch starts as the turn does. */
-const closingSeen = new Map<string, { epoch: number; round: number; operator: string | undefined; at: number }>();
+ *  incarnation, round and operator), by this page's clock. tickManualCraps
+ *  notes it every frame on every editor's page, so the watch starts as the
+ *  turn does. */
+const closingSeen = new Map<string, {
+  epoch: number; wake: number; inc: string | undefined; round: number; operator: string | undefined; at: number;
+}>();
 
 function noteClosing(tableId: string, s: CrapsTableState | null, now: number): number {
   if (s?.phase !== 'closing') {
@@ -360,14 +374,18 @@ function noteClosing(tableId: string, s: CrapsTableState | null, now: number): n
     return now;
   }
   const epoch = casinoDocEpoch();
+  const wake = tablesWakeCount();
   const seen = closingSeen.get(tableId);
-  if (seen && seen.epoch === epoch && seen.round === s.round && seen.operator === s.operator) return seen.at;
-  closingSeen.set(tableId, { epoch, round: s.round, operator: s.operator, at: now });
+  if (seen && seen.epoch === epoch && seen.wake === wake && seen.inc === s.inc && seen.round === s.round
+    && seen.operator === s.operator) {
+    return seen.at;
+  }
+  closingSeen.set(tableId, { epoch, wake, inc: s.inc, round: s.round, operator: s.operator, at: now });
   return now;
 }
 const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
 /** Turns this page took over: when (this page's own clock), and which. */
-const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>();
+const tookOverAt = new Map<string, { at: number; inc: string | undefined; round: number; epoch: number }>();
 
 /**
  * The house's ROLL on a manual table. Returns a notice for the press, or
@@ -382,15 +400,14 @@ const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>
  *    converged — never two settles from two shareholders' presses.
  */
 export function pressManualRoll(tableId: string, now = Date.now()): string | null {
+  // 💤 Just woken: the doc may not have heard the room yet (noteTablesRunning).
+  if (!tablesAwake(now)) return RECONNECTING_NOTICE;
   if (!readCrapsTableState(tableId)) {
+    // The first press only opens the window: bets go down on an open table
+    // (casinoDoc STAKES ON THE FELT), and on a Fair one the bettors need to
+    // see the house commit and add their seeds before "no more bets".
     openCrapsBetting(tableId, 1, null);
-    // ⚖️ A Fair window with bets already down only opens on this press: the
-    // bettors need to see the house commit and add their seeds before "no
-    // more bets", or the house seed alone would decide the roll.
-    const opened = readCrapsTableState(tableId);
-    if (opened?.houseCommit && Object.keys(readAllCrapsBets(tableId)).length > 0) {
-      return 'BETS OPEN — PRESS AGAIN TO ROLL';
-    }
+    return 'BETS OPEN — PRESS AGAIN TO ROLL';
   }
   const s = readCrapsTableState(tableId);
   if (!s) return null;
@@ -411,7 +428,7 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
     return 'THE DICE ARE OUT — ANOTHER HOUSE MEMBER IS RUNNING THIS ROLL';
   }
   writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
-  tookOverAt.set(tableId, { at: now, round: s.round, epoch: casinoDocEpoch() });
+  tookOverAt.set(tableId, { at: now, inc: s.inc, round: s.round, epoch: casinoDocEpoch() });
   return null;
 }
 
@@ -420,7 +437,8 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
  * real transition. The window ARMS when there are live bets (so an empty come-out
  * table stays quiet, but a point cycle with standing bets keeps rolling), then
  * betting → closing → settled → next window on the deadlines. Call ONLY when
- * canRunCroupier() (the caller gates), else two clients race the settle.
+ * canRunCroupier() and takeTableTurn() (the caller gates), else two clients
+ * race the settle.
  */
 export function tickAutoStickman(tableId: string): void {
   const now = Date.now();
@@ -428,6 +446,23 @@ export function tickAutoStickman(tableId: string): void {
   const s = readCrapsTableState(tableId);
   if (!s) {
     openCrapsBetting(tableId, 1, null);
+    return;
+  }
+  if (s.phase === 'closing' && s.operator !== undefined && s.operator !== PAGE_ID) {
+    // A manual turn another page holds: it settles it (tickManualCraps).
+    // Only once it has sat for MANUAL_TAKEOVER_MS (that page is gone) does
+    // the robot take it over and finish it.
+    if (now - noteClosing(tableId, s, now) >= MANUAL_TAKEOVER_MS) {
+      writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
+    }
+    return;
+  }
+  const span = s.phase === 'betting' ? CRAPS_BET_WINDOW_MS
+    : s.phase === 'closing' ? (s.shooter !== undefined ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS)
+    : CRAPS_SHOW_MS;
+  const deadline = timerOnThisClock(s, span, now);
+  if (deadline !== s.phaseDeadline) {
+    writeCrapsTableState(tableId, { ...s, phaseDeadline: deadline });
     return;
   }
   if (s.phase === 'betting') {
@@ -448,20 +483,25 @@ export function tickAutoStickman(tableId: string): void {
 }
 
 /**
- * Tear a craps table down cleanly on removal (mirrors croupier.closeTable). The
- * REFUND of every standing bet (stakes were debited at placement) runs ONLY on
- * the elected operator so it happens exactly once; every client then wipes the
- * table's casino keys (idempotent LWW delete). A manual venture/legacy room has
- * no operator, so stakes are not refunded (matches the manual-mode limitation).
+ * Tear a craps table down cleanly on removal (mirrors croupier.closeTable).
+ * Held stakes go back as their lists go. The REFUND of what an earlier build's
+ * standing bets took runs on every page that hears of the removal, and counts
+ * once however many run it (creditTableOutcome); every client then wipes the
+ * table's casino keys (idempotent LWW delete).
  */
 export function closeCrapsTable(tableId: string): void {
-  if (canRunCroupier()) {
-    for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
-      const staked = bets.reduce((sum, b) => sum + b.amount, 0);
-      if (staked > 0) creditChips(pid, staked);
+  // One transaction: no page sees the refunds without the table gone.
+  transactCasino(() => {
+    const inc = readCrapsTableState(tableId)?.inc ?? '';
+    for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
+      // A held stake goes back with its list. What an earlier build's list
+      // took, each page refunds, and the page driving the table may be
+      // settling a roll meanwhile: the table's one outcome per bettor pays
+      // one of them (croupier.closeTable).
+      if (taken > 0) creditTableOutcome(tableId, inc, 'end', pid, taken);
     }
-  }
-  clearTableKeys(tableId);
+    clearTableKeys(tableId);
+  });
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────

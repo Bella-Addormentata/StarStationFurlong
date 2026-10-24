@@ -14,11 +14,14 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  creditChips,
   depositSlotFunding,
+  drainSlotMachineFunding,
   hasSlotEscrow,
   LEGACY_SLOT_LEASE_READ_CAP,
   readChips,
   readLegacySlotOperatorMachineIds,
+  readSlotFundingBalance,
   readSlotFundingConfig,
   readSlotMachineState,
   readSlotOperatorLease,
@@ -480,8 +483,8 @@ describe('a round on a machine this session no longer operates', () => {
     const map = doc.getMap('casino');
     doc.transact(() => {
       map.delete(`slot-escrow:${M1}`);
-      map.set(`bal:${PLAYER}`, 100);
-      map.set(`bal:${OPERATOR}`, 10_000);
+      creditChips(PLAYER, 100 - readChips(PLAYER));
+      creditChips(OPERATOR, 10_000 - readChips(OPERATOR));
     });
     writeSlotMachineState(M1, { ...readSlotMachineState(M1)!, phase: 'settled', credited: 0 });
     fund(M1, OTHER);
@@ -947,7 +950,7 @@ describe('a removed machine', () => {
     expect(slotOperatorWatchCount()).toBe(2); // the lease, and the teardown waiting
     // The operator tears it down (its stake refunded, its bankroll paid out).
     expect(refundSlotWager(M1, PLAYER, BET, { mode: 'machine', ownerId: OPERATOR })).toBe(true);
-    doc.getMap('casino').delete(`slot-bankroll:machine:${M1}`);
+    expect(drainSlotMachineFunding(M1)).toBe(true);
     tickSlotMachineRoom([], false, at(T0 + 200));
     expect(slotOperatorWatchCount()).toBe(1);
     expect(readSlotMachineState(M1)).toBeNull();
@@ -1056,7 +1059,7 @@ describe('a removed machine', () => {
     closeSlotMachine(M1, true);
     const ready = becomeOperator([]);
     await acceptsDone();
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000);
+    expect(readSlotFundingBalance(M1, funding)).toBe(1_000);
     expect(readSlotFundingConfig(M1)).not.toBeNull();
     tickSlotMachineRoom([], false, at(ready + 100));
     expect(readSlotOperatorLease()).toBeNull();
@@ -1070,7 +1073,7 @@ describe('a removed machine', () => {
     closeSlotMachine(M1, true);
     becomeOperator([]);
     await acceptsDone();
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000);
+    expect(readSlotFundingBalance(M1, funding)).toBe(1_000);
   });
 
   it('with a stake locked but no round to refund it by, keeps the stake and the machine', async () => {
@@ -1083,7 +1086,7 @@ describe('a removed machine', () => {
     const ready = becomeOperator([]);
     await acceptsDone();
     expect(hasSlotEscrow(M1)).toBe(true);
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000 + BET - RESERVE);
+    expect(readSlotFundingBalance(M1, funding)).toBe(1_000 + BET - RESERVE);
     expect(readChips(PLAYER)).toBe(100 - BET);
     tickSlotMachineRoom([], false, at(ready + 100));
     expect(readSlotOperatorLease()).toBeNull();
@@ -1098,7 +1101,7 @@ describe('a removed machine', () => {
     expect(slotOperatorWatchCount()).toBe(0);
     expect(readSlotOperatorLease()).toBeNull();
     expect(hasSlotEscrow(M1)).toBe(true);
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).not.toBeUndefined();
+    expect(readSlotFundingBalance(M1, { mode: 'machine', ownerId: OPERATOR })).toBeGreaterThan(0);
   });
 
   it('takes no wager from an accept paused at an await when it is removed', async () => {

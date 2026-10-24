@@ -28,23 +28,26 @@
 
 import {
   casinoDocEpoch,
-  creditChips,
+  creditTableOutcome,
+  feltStake,
   readAllCrapsBets,
   readCrapsBackendPref,
   readCrapsFairnessPref,
+  pruneCrapsBets,
   readCrapsTableState,
+  transactCasino,
   writeCrapsTableState,
-  writeMyCrapsBets,
 } from './casinoDoc';
 import type { CrapsBackendKind } from './casinoDoc';
 import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 // 🎲🔀 The dice-fairness mode drives HOW the roll is produced (rng / commit-reveal
 // / multiparty / block-beacon) — switchable per table; see games/diceFairness.ts.
 import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
-import type { FairnessTranscript } from './games/craps';
+import type { CrapsBet, CrapsTableState, FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
-import { frozenFields, frozenWagers, gatherRound, roundSettleable, settledRound } from './fairTableSeeds';
+import { frozenFields, frozenWagers, gatherRound, heldAtClose, roundSettleable, settledRound } from './fairTableSeeds';
 import { getPlayerId } from './identity';
+import { stillDrivesTables, tablesAwake } from './croupier';
 
 /** This page, as a manual table's operator: player id plus a per-load nonce,
  *  so two tabs of one player are still two operators. */
@@ -116,22 +119,34 @@ class LocalCrapsBackend implements CrapsBackend {
         const before = readCrapsTableState(tableId);
         if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return null;
         if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return null;
+        if (before.operator === undefined && !stillDrivesTables()) return null;
+        if (!tablesAwake()) return null;
         const now = Date.now();
-        writeCrapsTableState(tableId, {
-          kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
-          resultAt: now, payouts: {}, voided: true,
-          ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
-          ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
-          ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
-          ...frozenFields(tableId, before),
-          ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
-        });
-        settledRound(tableId, before);
         // Every bet stands — as frozen at "no more bets". A list rewritten
         // since can't be restored from its hash, so it's cleared like a
-        // forfeit rather than left to ride into the next roll.
-        const { voided } = frozenWagers(tableId, before, readAllCrapsBets(tableId));
-        for (const pid of voided) writeMyCrapsBets(tableId, pid, []);
+        // forfeit (losing what it held then) rather than left to ride. Every
+        // frozen bettor's felt and outcome are written all the same, as a
+        // settle writes them: another page may be settling this very roll
+        // with dice, and the doc keeps one page's roll whole.
+        const live = readAllCrapsBets(tableId);
+        const { bets: standing, voided } = frozenWagers(tableId, before, live);
+        const left: Record<string, CrapsBet[]> = { ...standing };
+        for (const pid of voided) left[pid] = [];
+        const held = heldBy(tableId, before, Object.keys(left));
+        transactCasino(() => {
+          writeCrapsTableState(tableId, {
+            kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
+            resultAt: now, payouts: {}, voided: true,
+            ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
+            ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
+            ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+            ...frozenFields(tableId, before),
+            ...(before.inc !== undefined ? { inc: before.inc } : {}),
+            ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+          });
+          settledRound(tableId, before);
+          feltAfterRoll(tableId, before, round, left, {}, held);
+        });
         return null;
       }
       const gathered = gatherRound(tableId, closing);
@@ -162,13 +177,21 @@ class LocalCrapsBackend implements CrapsBackend {
     // 🎲 A manual roll settles only on the page still holding its lease: the
     // hashing can outlive it (a suspended tab another member took over from).
     if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return dice;
+    // 🤖 An auto roll settles only on the page still driving the tables
+    // (croupier.ts table-operator lease): another of the owner's pages may
+    // have taken over while this one hashed.
+    if (before.operator === undefined && !stillDrivesTables()) return dice;
+    // 💤 Nor, a manual roll either, on a page that slept since it last ran
+    // its tables (croupier.noteTablesRunning).
+    if (!tablesAwake()) return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     // ⚖️ A bettor who committed but never revealed forfeits every bet on the
     // felt this roll — withholding a seed to dodge a result must cost them.
     // Only wagers frozen at "no more bets" settle: the reveals made the dice
     // computable, so a list rewritten since is void and cleared like a forfeit.
-    const { bets: allBets, voided } = frozenWagers(tableId, before, readAllCrapsBets(tableId));
+    const live = readAllCrapsBets(tableId);
+    const { bets: allBets, voided } = frozenWagers(tableId, before, live);
     forfeited = [...forfeited, ...voided];
     for (const pid of forfeited) delete allBets[pid];
     const { payouts, remaining } = resolveCrapsRound(
@@ -178,39 +201,67 @@ class LocalCrapsBackend implements CrapsBackend {
       pointBefore,
     );
     for (const pid of forfeited) remaining[pid] = [];
+    // A list rewritten (or emptied) since the close loses what it held then.
+    const held = heldBy(tableId, before, Object.keys(remaining));
     const now = Date.now();
-    writeCrapsTableState(tableId, {
-      kind: 'craps',
-      phase: 'settled',
-      round,
-      point: nextPoint(pointBefore, sum),
-      dice: [d1, d2],
-      result: sum,
-      resultAt: now,
-      payouts,
-      sevenOut: shooterHandOver(pointBefore, sum),
-      // 🎲 #226: the hand's shooter rides through the settle (the operator
-      // passes the dice on when it opens the next window after a seven-out).
-      ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
-      ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
-      ...(transcript ? { fairness: transcript } : {}),
-      // ⚖️ The round's commitments stay on the settled record so anyone can
-      // check the transcript against them.
-      ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
-      // The commits and wagers as this page froze them, not as the shared
-      // state reads now (anyone can rewrite it after the reveals).
-      ...frozenFields(tableId, before),
-      ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
-      ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+    // One transaction: a page sees the settled roll, what it paid, and the
+    // pruned felts together.
+    transactCasino(() => {
+      writeCrapsTableState(tableId, {
+        kind: 'craps',
+        phase: 'settled',
+        round,
+        point: nextPoint(pointBefore, sum),
+        dice: [d1, d2],
+        result: sum,
+        resultAt: now,
+        payouts,
+        sevenOut: shooterHandOver(pointBefore, sum),
+        // 🎲 #226: the hand's shooter rides through the settle (the operator
+        // passes the dice on when it opens the next window after a seven-out).
+        ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
+        ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
+        ...(transcript ? { fairness: transcript } : {}),
+        // ⚖️ The round's commitments stay on the settled record so anyone can
+        // check the transcript against them.
+        ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+        // The commits and wagers as this page froze them, not as the shared
+        // state reads now (anyone can rewrite it after the reveals).
+        ...frozenFields(tableId, before),
+        ...(before.unseeded !== undefined ? { unseeded: before.unseeded } : {}),
+        ...(before.inc !== undefined ? { inc: before.inc } : {}),
+        ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+      });
+      settledRound(tableId, before);
+      feltAfterRoll(tableId, before, round, remaining, payouts, held);
     });
-    settledRound(tableId, before);
-    for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
-    // Prune the felt: rewrite each player's list to only the bets that survived
-    // (standing pass/place). Empty ⇒ their felt clears.
-    for (const [pid, bets] of Object.entries(remaining)) {
-      writeMyCrapsBets(tableId, pid, bets);
-    }
     return [d1, d2];
+  }
+}
+
+/** What each bettor's list held at the close (the settle takes it). */
+function heldBy(tableId: string, before: CrapsTableState, pids: string[]): Record<string, number> {
+  return Object.fromEntries(pids.map((pid) => [pid, heldAtClose(tableId, before, pid)]));
+}
+
+/**
+ * 🪙 What a settled roll does to each bettor's felt and chips (casinoDoc
+ * STAKES ON THE FELT), inside the settle's transaction: what stays up of
+ * each list is pruned onto the felt (empty: it clears), and the bettor's one
+ * outcome for the roll is what it won, less what the list held at the close,
+ * plus what the felt holds after it. So the bets that stay up hold their
+ * chips again, and what an earlier build's list took and still stands stays
+ * taken. Written for every bettor, a roll that moves nothing too, so a rival
+ * page's settle of the same roll meets it on every key (creditTableOutcome).
+ */
+function feltAfterRoll(
+  tableId: string, before: CrapsTableState, round: number,
+  left: Record<string, CrapsBet[]>, payouts: Record<string, number>, held: Record<string, number>,
+): void {
+  for (const [pid, bets] of Object.entries(left)) {
+    pruneCrapsBets(tableId, pid, round, bets);
+    const after = feltStake(tableId, pid).net;
+    creditTableOutcome(tableId, before.inc ?? '', round, pid, (payouts[pid] ?? 0) - (held[pid] ?? 0) + after);
   }
 }
 

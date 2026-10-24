@@ -8,17 +8,17 @@
  * lease is written for the room, the session waits OPERATOR_LEASE_SETTLE_MS
  * for the doc to converge, then works while it keeps the lease (renewed every
  * OPERATOR_LEASE_RENEW_MS, lapsing after OPERATOR_LEASE_MS). One operator for
- * the room, not one per cabinet: a player's `bal:` is a whole value, so two
- * sessions settling that player's drops on two cabinets at once would each
- * write it, and the merge would keep only one of the two writes. World ticks
+ * the room, not one per cabinet: that dates from when a player's chips were one
+ * whole value, which two sessions settling that player's drops on two cabinets
+ * at once would each write, the merge keeping only one. Chips are now records
+ * that add up in any order (casinoDoc's CHIP LEDGER). World ticks
  * the room every frame (tickCoinPusherRoom); there is no start/stop control to
  * fight the tick, and a session whose room has no cabinet left lets the lease
  * go.
  *
  * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
  * could each take it and settle drops; when the docs merge only one machine
- * value survives while both players' balance writes do (or one balance write
- * survives where both debited it). Settling can't be made partition-safe
+ * value survives while both players' chip records do. Settling can't be made partition-safe
  * without an authoritative ledger (the Registry-anchored chips), so a session
  * on ANOTHER device takes over a lease it has seen lapse only
  * OPERATOR_UNCLEAN_TAKEOVER_MS later, in case its holder is only cut off.

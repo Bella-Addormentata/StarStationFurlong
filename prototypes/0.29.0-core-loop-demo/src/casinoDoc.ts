@@ -9,26 +9,103 @@
  * changing this module's read/write shape.
  *
  * Key layout (all values plain JSON, whole-value transacted writes, LWW):
- *   bal:<playerId>            → number   current chips (written by its OWNER
- *                                        for buy-in/bet/cash-out, and by the
- *                                        CROUPIER for payouts — see below)
- *   bought:<playerId>         → number   lifetime chips issued to the player
- *   cashed:<playerId>         → number   lifetime chips returned to the cage
+ *   bal:<playerId>            → number   chips as builds before the chip
+ *                                        ledger stored them (read-only here:
+ *                                        the opening balance, see CHIP LEDGER)
+ *   bought:<playerId>         → number   lifetime chips issued, ditto
+ *   cashed:<playerId>         → number   lifetime chips returned, ditto
  *   table:<tableId>           → RouletteTableState (croupier-written)
- *   bets:<tableId>:<playerId> → { round, bets: RouletteBet[] } (owner-written)
+ *   bets:<tableId>:<playerId> → { round, held: RouletteBet[], inc, taken? }
+ *                                        (owner-written; craps: { kind, held,
+ *                                        inc, base, taken? }; an earlier
+ *                                        build's: { round?, kind?, bets },
+ *                                        and the stickman's prune of one adds
+ *                                        inc, pruned; see STAKES ON THE FELT)
+ *   kept:<tableId>:<playerId> → { round, kept: CrapsBet[], inc, taken? }
+ *                                        what a craps settle left up
+ *                                        (stickman-written)
+ *   gone:<tableId>:<inc>      → 1        that incarnation of the table was
+ *                                        removed (clearTableKeys); the bare
+ *                                        `gone:<tableId>:` counts removals
  *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
  *   throw:<tableId>           → DiceThrow (the shooter's fling, or the
  *                                        stickman's when it throws for them)
  *
  * Every player-scoped key is written by exactly one writer in normal play, so
- * per-key LWW is safe. The one shared writer pair is bal:<pid> (owner spends,
- * croupier credits payouts): the windows are disjoint in practice — players
- * bet during 'betting', the croupier credits at the settle write — and a
- * dev-phase race degrades to one lost update, visible in the public cage
- * ledger. Documented v1 semantics; the G4 Registry chips close it for real.
+ * per-key LWW is safe. The one exception is an earlier build's craps list,
+ * which the stickman prunes where it lies, as earlier builds' stickman did:
+ * that page writing its list at the very moment of a roll's settle can lose
+ * the write, as it could before (see STAKES ON THE FELT).
+ *
+ * 🧾 CHIP LEDGER: a player's chips are no longer one stored number that the
+ * player (bets, buy-in, cash-out) and every operator (payouts, slots, the
+ * coin pusher) all overwrite, where two writes at once kept only one. They
+ * are records in the doc's `casinoChips` map: each page keeps one record per
+ * player it has paid or charged (`<writer>:<playerId>` →
+ * ChipRecord: whose chips, the net change, how much of it was bought or
+ * cashed at the cage), and only that page writes it. A player's chips = their
+ * stored `bal:` (what builds before the ledger left there, read as the opening
+ * balance and never written again) + the sum of every page's record for them.
+ * A sum doesn't care about order, so two pages paying or charging one player
+ * at once both count, on every page. One writer per record means a record is
+ * only ever overwritten by the binding that holds its last value (a fresh
+ * writer id each bind), so no change is lost, and the doc grows by a record
+ * per page per player, not per bet. What a roulette or craps table pays a
+ * player is the one exception: it rides one record per table (each time it
+ * is set up) and player, which names the outcome it paid last, so a round
+ * settled on one page while another removed the table pays one of the two
+ * (creditTableOutcome). Sums
+ * are exact (bigint), so every page gets the same one whatever order records
+ * arrive in. A slot machine's own bankroll is an account in the same ledger,
+ * named by its `slot-bankroll:` key, whose stored value is its opening
+ * balance. It is the first step of the computed tables (see the "Computed
+ * casino tables" design). Trust is unchanged: honest clients, as before;
+ * signed records come with the computed tables.
+ *
+ * 🪙 STAKES ON THE FELT: chips bet at roulette or craps are not taken from
+ * the player when they go down. They stay the player's, held on the felt by
+ * the bet list itself: a player's chips = their ledger total − every held
+ * list on a live round (a roulette list of the table's current round before
+ * it settles, any craps list on a table that is up). The settle turns a
+ * round's stakes into one ledger change per bettor (won − staked, in the
+ * table's outcome record) in the same transaction that ends the round, so
+ * no page ever counts a stake both held and paid. Taking a bet down,
+ * removing the table, or a round that leaves a list behind (a late bet)
+ * hands its chips back with no credit at all: the list stops holding them.
+ * The bet list is one whole value per player, and so is what it holds: two
+ * tabs of one player placing at once keep one list and its chips, a
+ * take-down and a removal at once hand them back once. Only the player
+ * writes their list: what a craps roll leaves up the stickman writes as
+ * `kept`, which plays until the player writes a list after that roll, so a
+ * list written before the roll settled never brings back bets it resolved
+ * (crapsFelt). An earlier build's list the stickman also prunes where it
+ * lies, as earlier builds did, so that page reads the felt as the roll left
+ * it; the prune is marked as the stickman's (`pruned`), so it plays only as
+ * the `kept` record of the settle the doc kept. A list goes down only on a
+ * table that is up.
+ *
+ * A list an earlier build put down (under `bets`) took its chips as it went
+ * down. What it took rides with it as `taken`, through the player's rewrites
+ * too: the list holds only the rest (FeltStake `net`, below 0 when the
+ * player took more down than it took), the settle pays its wins in full, and
+ * a removal refunds what it took, in the table's outcome record. Nothing is
+ * handed back on a rewrite, so two tabs, or a tab and a removal, can't hand
+ * it back twice. A craps settle at the very moment of the removal can win
+ * that record over the refund: what the bets it kept up had taken is then
+ * owed back by the `kept` record it left (keptOwed), and paid as the
+ * removal's outcome when that record goes.
+ *
+ * A write at the very moment of a removal (a settle, a bet) outlives the
+ * removal's delete, as a concurrent write does in the doc. So the removal
+ * leaves `gone:<tableId>:<inc>` behind: a state of a removed incarnation
+ * reads as no table and holds nothing, and a list belongs to the incarnation
+ * it was put down on (its `inc`), so a table put back under the same id
+ * starts clean. A list this build put down on an earlier build's state
+ * carries none, and plays on until the table is first removed, which also
+ * leaves `gone:<tableId>:`.
  *
  * The HOUSE keeps no stored record at all — everything about the cage is
- * DERIVED: issued = Σ bought, outstanding = Σ bal, house net = issued −
+ * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
  * cashed − outstanding. Nothing to inflate, nothing to desync; issuance is
  * public on the cashier screen (the fiction's "trust the casino, verify the
  * ledger").
@@ -40,9 +117,11 @@
  */
 
 import * as Y from 'yjs';
+import { sha256 } from '@noble/hashes/sha256';
+import { bytesToHex } from '@noble/hashes/utils';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
-import { isCrapsBet, isCrapsTableState } from './games/craps';
+import { isCrapsBet, isCrapsTableState, isTableIncField, MAX_BET_AMOUNT, MAX_BETS_PER_PLAYER } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import {
   isSlotMachineState, isSlotOddsConfig, isSlotPlayRequest, isSlotReveal,
@@ -62,19 +141,21 @@ import type {
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
 
-/** One player's open bets on one table (round-stamped: stale rounds ignore). */
-export interface TableBets {
-  round: number;
-  bets: RouletteBet[];
-}
+/** One player's open bets on one table (round-stamped: stale rounds ignore).
+ *  This build writes them under `held`: the chips stay the player's, held on
+ *  the felt, until the round settles (see STAKES ON THE FELT). A list under
+ *  `bets` is an earlier build's, whose chips were taken when it went down. */
+export type TableBets =
+  | { round: number; held: RouletteBet[]; inc?: string }
+  | { round: number; bets: RouletteBet[] };
 
 /** 🎲 One player's craps bets. Unlike roulette these PERSIST across rolls (a
  *  pass line rides its point; a place bet stays working), so there is no round
- *  stamp — the stickman prunes the list at each settle (see games/craps.ts). */
-export interface CrapsTableBets {
-  kind: 'craps';
-  bets: CrapsBet[];
-}
+ *  stamp — the stickman prunes the list at each settle (see games/craps.ts).
+ *  `held` or an earlier build's `bets`, as for roulette. */
+export type CrapsTableBets =
+  | { kind: 'craps'; held: CrapsBet[]; inc?: string }
+  | { kind: 'craps'; bets: CrapsBet[] };
 
 let boundDoc: Y.Doc | null = null;
 let casinoMap: Y.Map<unknown> | null = null;
@@ -120,10 +201,21 @@ export function bindCasinoDoc(doc: Y.Doc, roomId = ''): void {
   boundDoc = doc;
   pinPlayerKeys(doc);
   casinoMap = doc.getMap('casino');
+  bindChipLedger(doc);
+  bindHeldStakes(doc, casinoMap);
   // 🪙 Index the coin pushers' requests now, outside any operator poll, and
   // observe ahead of notify() so listeners never see a stale index.
   pusherRequestIndex(casinoMap);
-  casinoMap.observe((event) => notify(event.keysChanged));
+  casinoMap.observe((event) => {
+    if (heldTouched.size === 0) {
+      notify(event.keysChanged);
+      return;
+    }
+    const keys = new Set(event.keysChanged);
+    for (const pid of heldTouched) keys.add(`bal:${pid}`);
+    heldTouched.clear();
+    notify(keys);
+  });
   indexLegacySlotLeases(casinoMap);
   notify(); // repaint subscribers from the fresh doc
 }
@@ -161,33 +253,210 @@ export function subscribeCasinoKey(key: string, listener: () => void): () => voi
   };
 }
 
-/** Non-negative integer read (doc values cross the peer trust boundary). */
-function readCount(key: string): number {
-  const v = ensureMap().get(key);
-  return Number.isInteger(v) && (v as number) >= 0 ? (v as number) : 0;
+// ── Chips: the chip ledger (see CHIP LEDGER above) ──────────────────────────
+
+/** One page's running total of what it has done to one account since it
+ *  bound the room. Only the page that made it ever writes it. */
+export interface ChipRecord {
+  /** whose chips: a player id, or a slot bankroll's key (isBankrollAccount) */
+  p: string;
+  /** net chips added (negative: taken) */
+  d: number;
+  /** chips bought at the cage, part of `d` */
+  b: number;
+  /** chips cashed out at the cage, part of `d` */
+  c: number;
+  /** writer-clock ms of the last change, for reading the history only */
+  at: number;
+  /** a table's record only (creditTableOutcome): the last outcome it paid */
+  ev?: string;
 }
 
-function writeCount(key: string, value: number): void {
-  const map = ensureMap();
-  boundDoc!.transact(() => {
-    map.set(key, Math.max(0, Math.floor(value)));
+/** A slot machine's own bankroll is a ledger account too, named by its key
+ *  (`slot-bankroll:machine:<mid>`, the legacy `slot-bankroll:shared`), so two
+ *  pages moving chips in or out of it at once both count, as for a player. */
+const BANKROLL_PREFIX = 'slot-bankroll:machine:';
+const SHARED_BANKROLL_KEY = 'slot-bankroll:shared';
+
+function isBankrollAccount(account: string): boolean {
+  return account.startsWith(BANKROLL_PREFIX) || account === SHARED_BANKROLL_KEY;
+}
+
+export function isChipRecord(value: unknown): value is ChipRecord {
+  if (typeof value !== 'object' || value === null) return false;
+  const r = value as Partial<ChipRecord>;
+  return typeof r.p === 'string' && r.p.length > 0 && r.p.length <= 256
+    && Number.isSafeInteger(r.d)
+    && Number.isSafeInteger(r.b) && (r.b as number) >= 0
+    && Number.isSafeInteger(r.c) && (r.c as number) >= 0
+    && typeof r.at === 'number' && Number.isFinite(r.at)
+    && (r.ev === undefined || (typeof r.ev === 'string' && r.ev.length <= 64));
+}
+
+let chipsMap: Y.Map<unknown> | null = null;
+/** This binding's prefix for the records it writes: a fresh one each bind, so
+ *  a record is only ever overwritten by the binding that holds its last value. */
+let chipWriter = '';
+/** This binding's current record key per account, and how many records it has
+ *  started afresh because one was full (a total past the safe-integer range). */
+let chipKeys = new Map<string, string>();
+let chipRolls = 0;
+/** The bound ledger, summed exactly (bigint, so every page gets the same sum
+ *  whatever order the records came in): account → Σ records, and the cage
+ *  totals. */
+interface ChipIndex {
+  byAccount: Map<string, bigint>;
+  /** each counted record as counted (so an overwrite or delete is undone exactly) */
+  counted: Map<string, ChipRecord>;
+  bought: bigint;
+  cashed: bigint;
+}
+let chipIndex: ChipIndex = { byAccount: new Map(), counted: new Map(), bought: 0n, cashed: 0n };
+/** Accounts whose chips changed since the last notify. */
+const chipsTouched = new Set<string>();
+
+function countChipRecord(ix: ChipIndex, rec: ChipRecord, sign: 1n | -1n): void {
+  ix.byAccount.set(rec.p, (ix.byAccount.get(rec.p) ?? 0n) + sign * BigInt(rec.d));
+  ix.bought += sign * BigInt(rec.b);
+  ix.cashed += sign * BigInt(rec.c);
+  chipsTouched.add(rec.p);
+}
+
+/** Bring one key's record in the index in line with the map. */
+function recountChipKey(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
+  const before = ix.counted.get(key);
+  const value = map.get(key);
+  const now = isChipRecord(value) ? value : undefined;
+  if (before === now) return;
+  if (before) { countChipRecord(ix, before, -1n); ix.counted.delete(key); }
+  if (now) { countChipRecord(ix, now, 1n); ix.counted.set(key, now); }
+}
+
+function bindChipLedger(doc: Y.Doc): void {
+  const map = doc.getMap<unknown>('casinoChips');
+  const ix: ChipIndex = { byAccount: new Map(), counted: new Map(), bought: 0n, cashed: 0n };
+  for (const key of map.keys()) recountChipKey(ix, map, key);
+  chipsMap = map;
+  chipIndex = ix;
+  chipWriter = `${doc.clientID.toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  chipKeys = new Map();
+  chipRolls = 0;
+  chipsTouched.clear();
+  // Recount BEFORE any observer runs, so a casino-map listener firing in the
+  // same transaction (a settle that writes a machine and a payout together)
+  // already reads the new chips.
+  doc.on('beforeObserverCalls', (tr: Y.Transaction) => {
+    if (chipIndex !== ix) return; // a binding we've moved off
+    const keys = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
+    if (keys) for (const key of keys) if (key !== null) recountChipKey(ix, map, key);
+  });
+  map.observe(() => {
+    if (chipIndex !== ix || chipsTouched.size === 0) return;
+    const changed = new Set([...chipsTouched].map(
+      (account) => (isBankrollAccount(account) ? account : `bal:${account}`),
+    ));
+    chipsTouched.clear();
+    notify(changed);
   });
 }
 
-// ── Chips ────────────────────────────────────────────────────────────────────
+function ensureChips(): Y.Map<unknown> {
+  ensureMap();
+  return chipsMap!;
+}
 
+function clampSafe(n: bigint): number {
+  const max = BigInt(Number.MAX_SAFE_INTEGER);
+  return Number(n > max ? max : n < -max ? -max : n);
+}
+
+/** An account's chips, exactly: its opening balance (what a build before the
+ *  ledger stored under `bal:<pid>`, or under the bankroll's own key) + Σ
+ *  records. Below 0 when two pages spent the same chips at once. */
+function ledgerTotal(account: string): bigint {
+  const map = ensureMap();
+  const opening = legacyCount(map, isBankrollAccount(account) ? account : `bal:${account}`);
+  return opening + (chipIndex.byAccount.get(account) ?? 0n);
+}
+
+/** A count an earlier build stored (`bal:`, `bought:`, `cashed:`, a
+ *  bankroll), exactly: those builds kept any non-negative integer, even past
+ *  the safe range. Anything else reads as 0. */
+function legacyCount(map: Y.Map<unknown>, key: string): bigint {
+  const value = map.get(key);
+  return Number.isInteger(value) && (value as number) >= 0 ? BigInt(value as number) : 0n;
+}
+
+/** An account's chips as a number: never below 0, never past the safe range. */
+function readLedgerAccount(account: string): number {
+  return Math.max(0, clampSafe(ledgerTotal(account)));
+}
+
+/** A player's chips to play with: their ledger total less what they have
+ *  held on felts. Never below 0, never past the safe range. */
 export function readChips(playerId: string): number {
-  return readCount(`bal:${playerId}`);
+  return Math.max(0, clampSafe(ledgerTotal(playerId) - heldStake(playerId)));
 }
 
-/** Cashier BUY-IN: the cage issues chips to the player (own-key writes). */
-export function buyInChips(playerId: string, amount: number): void {
-  if (!Number.isInteger(amount) || amount <= 0) return;
-  const map = ensureMap();
+function nextChipRecord(was: ChipRecord | null, account: string, delta: number, cage?: 'buy' | 'cashout'): ChipRecord {
+  return {
+    p: account,
+    d: (was?.d ?? 0) + delta,
+    b: (was?.b ?? 0) + (cage === 'buy' && delta > 0 ? delta : 0),
+    c: (was?.c ?? 0) + (cage === 'cashout' && delta < 0 ? -delta : 0),
+    at: Date.now(),
+  };
+}
+
+function isWholeRecord(rec: ChipRecord): boolean {
+  return Number.isSafeInteger(rec.d) && Number.isSafeInteger(rec.b) && Number.isSafeInteger(rec.c);
+}
+
+/**
+ * Add `delta` chips to `account` (negative takes them): this page's record
+ * for it, with the change added (or, when that record's total would leave the
+ * safe-integer range, a fresh record beside it). Counted at once, so later
+ * reads in the same transaction see it. Call it inside the transaction that
+ * makes the change it pays for. `cage` marks a buy-in or a cash-out.
+ */
+function addChips(account: string, delta: number, cage?: 'buy' | 'cashout'): void {
+  if (!Number.isSafeInteger(delta) || delta === 0 || account.length === 0 || account.length > 256) return;
+  const map = ensureChips();
+  let key = chipKeys.get(account) ?? `${chipWriter}:${account}`;
+  const stored = map.get(key);
+  let rec = nextChipRecord(isChipRecord(stored) && stored.p === account ? stored : null, account, delta, cage);
+  if (!isWholeRecord(rec)) {
+    chipRolls += 1;
+    key = `${chipWriter}~${chipRolls}:${account}`;
+    rec = nextChipRecord(null, account, delta, cage);
+  }
+  chipKeys.set(account, key);
   boundDoc!.transact(() => {
-    map.set(`bal:${playerId}`, readCount(`bal:${playerId}`) + amount);
-    map.set(`bought:${playerId}`, readCount(`bought:${playerId}`) + amount);
+    map.set(key, rec);
+    recountChipKey(chipIndex, map, key);
   });
+}
+
+/** A money key's balance: a player's chips (`bal:<pid>`), a slot bankroll's
+ *  ledger account, or a stored count. */
+function readAccount(map: Y.Map<unknown>, key: string): number {
+  if (key.startsWith('bal:')) return readChips(key.slice(4));
+  if (isBankrollAccount(key)) return readLedgerAccount(key);
+  return safeCount(map, key);
+}
+
+/** Move a money key from `before` (as just read) to `after`: a chip record
+ *  for a ledger account, a plain write for any other stored count. */
+function writeAccount(map: Y.Map<unknown>, key: string, before: number, after: number): void {
+  if (key.startsWith('bal:')) addChips(key.slice(4), after - before);
+  else if (isBankrollAccount(key)) addChips(key, after - before);
+  else map.set(key, after);
+}
+
+/** Cashier BUY-IN: the cage issues chips to the player. */
+export function buyInChips(playerId: string, amount: number): void {
+  if (!Number.isSafeInteger(amount) || amount <= 0) return;
+  addChips(playerId, amount, 'buy');
 }
 
 /** Cashier CASH-OUT: chips go back to the cage. Returns chips returned. */
@@ -195,27 +464,117 @@ export function cashOutChips(playerId: string, amount: number): number {
   const bal = readChips(playerId);
   const n = Math.min(bal, Math.max(0, Math.floor(amount)));
   if (n <= 0) return 0;
-  const map = ensureMap();
-  boundDoc!.transact(() => {
-    map.set(`bal:${playerId}`, bal - n);
-    map.set(`cashed:${playerId}`, readCount(`cashed:${playerId}`) + n);
-  });
+  addChips(playerId, -n, 'cashout');
   return n;
 }
 
-/** Stake chips on the felt (bet placement). False when the balance is short. */
+/** Take chips from a player now. False when the balance is short. (A table
+ *  bet doesn't: its list holds the chips, see STAKES ON THE FELT.) */
 export function spendChips(playerId: string, amount: number): boolean {
   if (!Number.isInteger(amount) || amount <= 0) return false;
   const bal = readChips(playerId);
   if (bal < amount) return false;
-  writeCount(`bal:${playerId}`, bal - amount);
+  addChips(playerId, -amount);
   return true;
 }
 
-/** Return chips to a player (bet refund by its owner, payout by the croupier). */
+/** Return chips to a player (bet refund by its owner, payout by the croupier).
+ *  Always lands: the ledger holds any total; reads stop at the safe range. */
 export function creditChips(playerId: string, amount: number): void {
-  if (!Number.isInteger(amount) || amount <= 0) return;
-  writeCount(`bal:${playerId}`, readChips(playerId) + amount);
+  if (!Number.isSafeInteger(amount) || amount <= 0) return;
+  addChips(playerId, amount);
+}
+
+/** A table's chip record past this total (either way) takes no more
+ *  (creditTableOutcome), and one outcome moves at most the rest of the safe
+ *  range, so a record never leaves it. No table comes near either: a bet
+ *  list returns at most 3.6e13 (games/craps MAX_BET_AMOUNT). */
+const TABLE_RECORD_FULL = 2 ** 52;
+const MAX_TABLE_OUTCOME = Number.MAX_SAFE_INTEGER - TABLE_RECORD_FULL;
+
+/**
+ * Move `amount` chips to `playerId` (negative: from them) for one outcome of
+ * one table: a settled round (`outcome` its number: what it paid less what it
+ * took off the felt) or the table's removal ('end': what an earlier build's
+ * stakes took, refunded). A round writes its outcome for every bettor, even
+ * one that moves nothing, so it competes with another page's settle of the
+ * same round on the same record, as the state and the kept bets do. Two
+ * pages can each carry out the same outcome (both refund a removed
+ * table), or two that exclude each other (one settles a round while the other
+ * removes the table), before either hears of the other. So what a table pays a
+ * player rides one record per table incarnation and player,
+ * `tbl:<tableId>:<inc>:<pid>`, naming the outcome it paid last: a write adds
+ * to it unless it already names this outcome, and of two written at once the
+ * doc keeps one, so the player is paid for one outcome, never both. The
+ * removal is the last outcome: once paid, nothing more from that table is.
+ * `inc` is the table's incarnation (tableIncFor), so a table set up again
+ * under the same id has a record of its own. A record whose stored total has
+ * reached TABLE_RECORD_FULL takes no more: the next outcome goes on in the
+ * next record of the chain (`~1`, `~2`…). Full is read from the stored total
+ * alone, never the amount, so two pages paying different amounts at once
+ * still write the same record, and the last record is always where the last
+ * outcome (and a removal) was paid. Two pages that each go on settling
+ * rounds without hearing of the other (one cut off from the room) build two
+ * chains on one record, and the doc keeps one of them, with its table state:
+ * the one table lease keeps that to a page that never hears the room
+ * (croupier.takeTableTurn), and the computed tables end it.
+ */
+export function creditTableOutcome(
+  tableId: string, inc: string, outcome: number | 'end', playerId: string, amount: number,
+): void {
+  if (!Number.isSafeInteger(amount) || Math.abs(amount) > MAX_TABLE_OUTCOME) return;
+  if (playerId.length === 0 || playerId.length > 256) return;
+  const map = ensureChips();
+  const { base, link, was } = lastOutcome(map, tableId, inc, playerId);
+  const ev = String(outcome);
+  if (was?.ev === ev || was?.ev === 'end') return;
+  const full = was !== null && Math.abs(was.d) >= TABLE_RECORD_FULL;
+  const last = link === 0 ? base : `${base}~${link}`;
+  const key = full ? `${base}~${link + 1}` : last;
+  const d = (full ? 0 : was?.d ?? 0) + amount;
+  const rec: ChipRecord = { p: playerId, d, b: 0, c: 0, at: Date.now(), ev };
+  boundDoc!.transact(() => {
+    map.set(key, rec);
+    recountChipKey(chipIndex, map, key);
+    heldDirty = true; // a removal's outcome ends what kept bets owe (keptOwed)
+  });
+}
+
+/** The last record of a table's outcome chain for a player (see
+ *  creditTableOutcome): its base key, which link it is, and what it holds. */
+function lastOutcome(
+  chips: Y.Map<unknown>, tableId: string, inc: string, playerId: string,
+): { base: string; link: number; was: ChipRecord | null } {
+  const base = `tbl:${tableId}:${inc}:${playerId}`;
+  let link = 0;
+  while (chips.has(`${base}~${link + 1}`)) link += 1;
+  const stored = chips.get(link === 0 ? base : `${base}~${link}`);
+  return { base, link, was: isChipRecord(stored) && stored.p === playerId ? stored : null };
+}
+
+/** The incarnation a table takes when its first round opens (and a table
+ *  from an earlier build at its next): it names the table's outcomes for
+ *  creditTableOutcome and the lists put down on it. It is drawn from the
+ *  table and the record of its removals (its `gone:` marks), not at random:
+ *  two pages opening the same table at once, before either hears of the
+ *  other, name it alike, so what each pays meets on one record, as their
+ *  states meet on one key; a table put back after a removal is a new one. */
+export function tableIncFor(tableId: string): string {
+  const map = ensureMap();
+  const prefix = `gone:${tableId}:`;
+  const removals = [...map.entries()].filter(([key]) => key.startsWith(prefix))
+    .map(([key, value]): [string, unknown] => [key.slice(prefix.length), value])
+    .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+  const named = `ssf-table-inc-v1|${tableId}|${JSON.stringify(removals)}`;
+  return bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
+}
+
+/** Every chip record in the bound room (one per page per account), oldest
+ *  change first (the history behind a balance; debugging). */
+export function readChipRecords(account?: string): ChipRecord[] {
+  ensureChips();
+  const out = [...chipIndex.counted.values()].filter((r) => account === undefined || r.p === account);
+  return out.sort((a, b) => a.at - b.at);
 }
 
 // ── The cage ledger (all DERIVED — see module header) ────────────────────────
@@ -232,26 +591,60 @@ export interface CageLedger {
 
 export function readCageLedger(): CageLedger {
   const map = ensureMap();
-  let issued = 0, cashed = 0, outstanding = 0;
-  const balances: Record<string, number> = {};
+  ensureChips();
+  let issued = chipIndex.bought, cashed = chipIndex.cashed, outstanding = 0n;
+  const players = new Set<string>(
+    [...chipIndex.byAccount.keys()].filter((account) => !isBankrollAccount(account)),
+  );
   for (const [key, value] of map.entries()) {
     if (!Number.isInteger(value) || (value as number) < 0) continue;
-    const n = value as number;
+    const n = BigInt(value as number);
     if (key.startsWith('bought:')) issued += n;
     else if (key.startsWith('cashed:')) cashed += n;
-    else if (key.startsWith('bal:')) {
-      outstanding += n;
-      if (n > 0) balances[key.slice(4)] = n;
-    }
+    else if (key.startsWith('bal:')) players.add(key.slice(4));
   }
-  return { issued, cashed, outstanding, houseNet: issued - cashed - outstanding, balances };
+  const balances: Record<string, number> = {};
+  for (const pid of players) {
+    // (Chips held on a felt are in play, not out with the player.)
+    const total = ledgerTotal(pid) - heldStake(pid);
+    if (total <= 0n) continue;
+    outstanding += total;
+    balances[pid] = clampSafe(total);
+  }
+  return {
+    issued: clampSafe(issued),
+    cashed: clampSafe(cashed),
+    outstanding: clampSafe(outstanding),
+    houseNet: clampSafe(issued - cashed - outstanding),
+    balances,
+  };
 }
 
 // ── Roulette table state + bets ──────────────────────────────────────────────
 
 export function readTableState(tableId: string): RouletteTableState | null {
-  const value = ensureMap().get(`table:${tableId}`);
-  return isRouletteTableState(value) ? value : null;
+  const map = ensureMap();
+  const value = map.get(`table:${tableId}`);
+  return isRouletteTableState(value) && !removed(map, tableId, value) ? value : null;
+}
+
+/** `gone:` key of a table's incarnation (see STAKES ON THE FELT). */
+function goneKey(tableId: string, inc: string): string {
+  return `gone:${tableId}:${inc}`;
+}
+
+/** A state of an incarnation the table's removal has ended (written at the
+ *  moment of the removal, it outlived the delete). A state an earlier build
+ *  wrote has no incarnation: its removal marks `gone:<tableId>:`, and a table
+ *  put back after it starts an incarnation of its own (openBetting). */
+function removed(map: Y.Map<unknown>, tableId: string, s: RouletteTableState | CrapsTableState): boolean {
+  return map.has(goneKey(tableId, s.inc ?? ''));
+}
+
+/** Whether incarnation `inc` of a table (undefined: an earlier build's,
+ *  which has none) has been removed. */
+export function tableIncRemoved(tableId: string, inc: string | undefined): boolean {
+  return ensureMap().has(goneKey(tableId, inc ?? ''));
 }
 
 /** Croupier-only in practice (the UI gates on the house predicate). */
@@ -259,17 +652,47 @@ export function writeTableState(tableId: string, state: RouletteTableState): voi
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`table:${tableId}`, state);
+    heldDirty = true;
   });
 }
 
 /** 🎰 Wipe every casino key for a table (its state, croupier heartbeat, and all
  *  per-player bets) — the removal teardown so a deleted table leaves no orphan
- *  records. Refunding outstanding stakes is the CALLER's job (croupier.closeTable),
- *  done before this so the bet records are still readable. One transact. */
+ *  records. Held stakes go back with their lists; refunding an earlier build's
+ *  lists is the CALLER's job (croupier.closeTable), done before this so the
+ *  bet records are still readable. Leaves the incarnation's `gone:` mark, so
+ *  a state or list written at the same moment stays ended. One transact. */
 export function clearTableKeys(tableId: string): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
+  const keptPrefix = `kept:${tableId}:`;
   boundDoc!.transact(() => {
+    // What kept bets left by an earlier removal still owe is paid before
+    // they go (keptOwed).
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(keptPrefix)) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
+    }
+    // The incarnation removed, and any before it that had none: a list this
+    // build put down on one of those carries none either (ofIncarnation). No
+    // mark for a table this page never saw up (a page leaving a room for one
+    // without it reconciles the old room's tables away), nor for a state of
+    // an incarnation a removal already ended (a write at its moment left it
+    // behind). An earlier build's state up has no incarnation, so the mark
+    // is the one a page that hasn't heard of the removal gives it at its next
+    // round (tableIncFor, alike on every page): that round, opened at the
+    // moment of the removal, is ended too. The bare mark counts the
+    // removals, an earlier build's state too though it reads as ended (that
+    // page may have rewritten it after a removal), so a table put back
+    // always names a new incarnation.
+    const was = map.get(`table:${tableId}`);
+    if (isRouletteTableState(was) || isCrapsTableState(was)) {
+      const up = !removed(map, tableId, was);
+      if (up) map.set(goneKey(tableId, was.inc ?? tableIncFor(tableId)), 1);
+      if (up || was.inc === undefined) {
+        const count = map.get(goneKey(tableId, ''));
+        map.set(goneKey(tableId, ''), (Number.isSafeInteger(count) ? count as number : 0) + 1);
+      }
+    }
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
     // 🎲 The per-table config keys ride the same map — a removed table must
@@ -281,8 +704,10 @@ export function clearTableKeys(tableId: string): void {
     const seatPrefix = `seat:${tableId}:`;
     const seedPrefix = `fseed:${tableId}:`;
     for (const key of [...map.keys()]) {
-      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix) || key.startsWith(seedPrefix)) map.delete(key);
+      if (key.startsWith(betPrefix) || key.startsWith(keptPrefix) || key.startsWith(seatPrefix)
+        || key.startsWith(seedPrefix)) map.delete(key);
     }
+    heldDirty = true;
   });
 }
 
@@ -306,23 +731,164 @@ export function writeCroupierBeat(tableId: string, beatAt: number): void {
   });
 }
 
-function isTableBets(value: unknown): value is TableBets {
-  if (typeof value !== 'object' || value === null) return false;
-  const t = value as Partial<TableBets>;
-  return Number.isInteger(t.round) && (t.round as number) >= 1
-    && Array.isArray(t.bets) && t.bets.every(isRouletteBet);
+// ── 🎰 The table operator lease ──────────────────────────────────────────────
+// The deed holder can have the room open on several pages (tabs, devices), and
+// every one of them may run the croupier. Only the page holding
+// `table-operator` drives the auto tables, so a round is settled and paid once
+// (chip records add up, so two settles would pay twice). Its holder rewrites it
+// every few seconds (`beat`); croupier.ts takeTableTurn has the rules.
+
+export interface TableOperatorLease {
+  /** the driving page (croupier.ts ROULETTE_PAGE_ID) */
+  page: string;
+  /** its player, the deed holder when it claimed */
+  player: string;
+  /** bumped on each renewal, so other pages see it is alive */
+  beat: number;
+}
+
+export const TABLE_OPERATOR_KEY = 'table-operator';
+
+export function readTableOperatorLease(): TableOperatorLease | null {
+  const v = ensureMap().get(TABLE_OPERATOR_KEY);
+  if (typeof v !== 'object' || v === null) return null;
+  const l = v as Partial<TableOperatorLease>;
+  return typeof l.page === 'string' && l.page.length > 0 && l.page.length <= 256
+    && typeof l.player === 'string' && l.player.length > 0 && l.player.length <= 128
+    && Number.isSafeInteger(l.beat)
+    ? { page: l.page, player: l.player, beat: l.beat as number }
+    : null;
+}
+
+export function writeTableOperatorLease(lease: TableOperatorLease): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(TABLE_OPERATOR_KEY, lease);
+  });
+}
+
+/** One player's bets on a table as they play, and the chips of them already
+ *  taken from the player (`taken`: an earlier build's list took its chips as
+ *  it went down, and a list rewritten from one carries what it took). The
+ *  rest, `net`, is held on the felt: off the player's chips until the round
+ *  settles (see STAKES ON THE FELT). `net` is below 0 when a rewrite left
+ *  fewer bets than were taken: the difference is back with the player. */
+export interface FeltStake {
+  net: number;
+  taken: number;
+}
+
+const NO_STAKE: FeltStake = { net: 0, taken: 0 };
+
+/** Most chips one list can take or hold (bets × the largest stake). */
+const MAX_LIST_STAKE = MAX_BETS_PER_PLAYER * MAX_BET_AMOUNT;
+
+/** A stored list's bets and what of them was taken, either shape: this
+ *  build's `held` (with `taken` when rewritten from an earlier build's list,
+ *  and craps' `base`), or an earlier build's `bets`, all taken. Null for junk,
+ *  or a list put down on another incarnation of the table than `inc`. */
+function storedList<B extends { amount: number }>(
+  value: unknown, isBet: (b: unknown) => boolean, at: Incarnation,
+): { bets: B[]; taken: number; legacy: boolean; base?: number; pruned?: boolean } | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const t = value as { held?: unknown; bets?: unknown; inc?: unknown; taken?: unknown; base?: unknown; pruned?: unknown };
+  const held = t.held !== undefined;
+  const list = held ? t.held : t.bets;
+  if (held && t.bets !== undefined) return null;
+  if (!Array.isArray(list) || list.length > MAX_BETS_PER_PLAYER || !list.every(isBet)) return null;
+  if (!ofIncarnation(t, held, at)) return null;
+  const bets = list as B[];
+  if (!held) {
+    // The stickman's prune of an earlier build's list (pruneCrapsBets) says
+    // so; that build writes its own lists afresh, never with the mark.
+    if (t.pruned !== undefined && !(Number.isSafeInteger(t.pruned) && (t.pruned as number) >= 1)) return null;
+    return {
+      bets, taken: bets.reduce((n, b) => n + b.amount, 0), legacy: true,
+      ...(t.pruned !== undefined ? { pruned: true } : {}),
+    };
+  }
+  if (t.taken !== undefined && !(Number.isSafeInteger(t.taken) && (t.taken as number) > 0 && (t.taken as number) <= MAX_LIST_STAKE)) {
+    return null;
+  }
+  if (t.base !== undefined && !(Number.isSafeInteger(t.base) && (t.base as number) >= 0)) return null;
+  return {
+    bets, taken: (t.taken as number | undefined) ?? 0, legacy: false,
+    ...(t.base !== undefined ? { base: t.base as number } : {}),
+  };
+}
+
+/** The incarnation of a table its lists must carry to play there: the live
+ *  state's (none: no table up), and whether this build's lists carrying none
+ *  still belong (`bare`: until the table has been removed under this id once,
+ *  the only time a state with no incarnation, an earlier build's, can have
+ *  been live while this build put lists down on it). */
+interface Incarnation {
+  inc: string | undefined;
+  bare: boolean;
+}
+
+function incarnationOf(map: Y.Map<unknown>, tableId: string, s: { inc?: string } | null): Incarnation {
+  return { inc: s?.inc, bare: !map.has(goneKey(tableId, '')) };
+}
+
+/** Whether a stored list was put down on the incarnation `at` of its table. A
+ *  held list put down on a table that had one carries it, and one put down on
+ *  an earlier build's state, which had none, goes with whichever is up until
+ *  the table is removed. An earlier build's own list carries none and goes
+ *  with whichever is up: such a page may still be betting. One this build's
+ *  stickman pruned carries the incarnation it was pruned on. */
+function ofIncarnation(t: { inc?: unknown }, held: boolean, at: Incarnation): boolean {
+  if (t.inc === undefined) return held ? at.bare : true;
+  return isTableIncField(t.inc) && t.inc === at.inc;
+}
+
+const stakeOf = (l: { bets: readonly { amount: number }[]; taken: number }): FeltStake => ({
+  net: l.bets.reduce((n, b) => n + b.amount, 0) - l.taken,
+  taken: l.taken,
+});
+
+/** A stored roulette list for its round (see storedList). */
+function rouletteList(value: unknown, at: Incarnation): { round: number; bets: RouletteBet[]; taken: number } | null {
+  const round = (value as { round?: unknown } | null)?.round;
+  if (!Number.isInteger(round) || (round as number) < 1) return null;
+  const list = storedList<RouletteBet>(value, isRouletteBet, at);
+  if (!list || list.base !== undefined) return null;
+  return { round: round as number, bets: list.bets, taken: list.taken };
+}
+
+/** A roulette list that plays the table's current round: that round's, before
+ *  it settles. */
+function liveRouletteList(
+  map: Y.Map<unknown>, tableId: string, playerId: string, s: RouletteTableState | null,
+): { bets: RouletteBet[]; taken: number } | null {
+  if (!s || s.phase === 'settled') return null;
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, s));
+  return list && list.round === s.round ? list : null;
 }
 
 export function readMyBets(tableId: string, playerId: string, round: number): RouletteBet[] {
-  const value = ensureMap().get(`bets:${tableId}:${playerId}`);
-  if (!isTableBets(value) || value.round !== round) return [];
-  return value.bets;
+  const map = ensureMap();
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, readTableState(tableId)));
+  return list && list.round === round ? list.bets : [];
 }
 
+/** The bettor's own write of their list for `round`, its chips held on the
+ *  felt. What an earlier build's list (or one rewritten from it) took goes on
+ *  with the rewrite, so nothing is handed back twice. Only while the table
+ *  is up: a list on no table would hold nothing. */
 export function writeMyBets(tableId: string, playerId: string, round: number, bets: RouletteBet[]): void {
   const map = ensureMap();
+  const s = readTableState(tableId);
+  if (!s) return;
+  const was = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, s));
+  const taken = was && was.round === round ? was.taken : 0;
   boundDoc!.transact(() => {
-    map.set(`bets:${tableId}:${playerId}`, { round, bets });
+    map.set(`bets:${tableId}:${playerId}`, {
+      round, held: bets,
+      ...(s.inc !== undefined ? { inc: s.inc } : {}),
+      ...(taken > 0 ? { taken } : {}),
+    });
+    heldDirty = true;
   });
 }
 
@@ -331,11 +897,45 @@ export function writeMyBets(tableId: string, playerId: string, round: number, be
 export function readAllBets(tableId: string, round: number): Record<string, RouletteBet[]> {
   const prefix = `bets:${tableId}:`;
   const out: Record<string, RouletteBet[]> = {};
-  for (const [key, value] of ensureMap().entries()) {
+  const map = ensureMap();
+  const at = incarnationOf(map, tableId, readTableState(tableId));
+  for (const [key, value] of map.entries()) {
     if (!key.startsWith(prefix)) continue;
-    if (!isTableBets(value) || value.round !== round) continue;
-    if (value.bets.length === 0) continue;
-    out[key.slice(prefix.length)] = value.bets;
+    const list = rouletteList(value, at);
+    if (!list || list.round !== round || list.bets.length === 0) continue;
+    out[key.slice(prefix.length)] = list.bets;
+  }
+  return out;
+}
+
+/** What a player's list on a table holds on the felt and what of it was
+ *  taken already, as it plays now (NO_STAKE when it doesn't): the settle
+ *  charges the one and the removal refunds the other. */
+export function feltStake(tableId: string, playerId: string): FeltStake {
+  const map = ensureMap();
+  const roulette = readTableState(tableId);
+  if (roulette) {
+    const list = liveRouletteList(map, tableId, playerId, roulette);
+    return list ? stakeOf(list) : NO_STAKE;
+  }
+  const craps = readCrapsTableState(tableId);
+  const list = craps ? crapsFelt(map, tableId, playerId, craps.inc) : null;
+  return list ? stakeOf(list) : NO_STAKE;
+}
+
+/** feltStake for every player with a list on the table (empty ones too: a
+ *  list emptied by a rewrite can still carry what it took). */
+export function readFeltStakes(tableId: string): Record<string, FeltStake> {
+  const map = ensureMap();
+  const out: Record<string, FeltStake> = {};
+  for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
+    for (const key of map.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const pid = key.slice(prefix.length);
+      if (out[pid]) continue;
+      const stake = feltStake(tableId, pid);
+      if (stake.net !== 0 || stake.taken !== 0) out[pid] = stake;
+    }
   }
   return out;
 }
@@ -344,11 +944,14 @@ export function readAllBets(tableId: string, round: number): Record<string, Roul
 // Same casino-map keys as roulette (`table:<id>`, `bets:<id>:<pid>`) — a given
 // table is one game, so the shapes never collide, and clearTableKeys /
 // creditChips / the croupier heartbeat are already game-agnostic. Craps bets are
-// NOT round-stamped: they carry across rolls until the stickman prunes them.
+// NOT round-stamped: they carry across rolls. The player writes `bets:`; at
+// each settle the stickman writes what stays up as `kept:<id>:<pid>`, so the
+// two never write one key (see crapsFelt).
 
 export function readCrapsTableState(tableId: string): CrapsTableState | null {
-  const value = ensureMap().get(`table:${tableId}`);
-  return isCrapsTableState(value) ? value : null;
+  const map = ensureMap();
+  const value = map.get(`table:${tableId}`);
+  return isCrapsTableState(value) && !removed(map, tableId, value) ? value : null;
 }
 
 /** Stickman-only in practice (the UI gates on the house predicate). */
@@ -356,38 +959,243 @@ export function writeCrapsTableState(tableId: string, state: CrapsTableState): v
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`table:${tableId}`, state);
+    heldDirty = true;
   });
 }
 
-function isCrapsTableBets(value: unknown): value is CrapsTableBets {
-  if (typeof value !== 'object' || value === null) return false;
-  const t = value as Partial<CrapsTableBets>;
-  return t.kind === 'craps' && Array.isArray(t.bets) && t.bets.every(isCrapsBet);
+/** A player's own stored craps list (see storedList). */
+function crapsOwnList(value: unknown, at: Incarnation): ReturnType<typeof storedList<CrapsBet>> {
+  if ((value as { kind?: unknown } | null)?.kind !== 'craps') return null;
+  return storedList<CrapsBet>(value, isCrapsBet, at);
+}
+
+/** What the stickman's settle of `round` left up of a player's list, and what
+ *  of it an earlier build took (`taken`). */
+function keptList(value: unknown, at: Incarnation): { round: number; bets: CrapsBet[]; taken: number } | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const t = value as { round?: unknown; kept?: unknown; inc?: unknown; taken?: unknown };
+  if (!Number.isSafeInteger(t.round) || (t.round as number) < 1) return null;
+  if (!Array.isArray(t.kept) || t.kept.length > MAX_BETS_PER_PLAYER || !t.kept.every(isCrapsBet)) return null;
+  if (t.inc === undefined ? !at.bare : t.inc !== at.inc) return null;
+  if (t.taken !== undefined && !(Number.isSafeInteger(t.taken) && (t.taken as number) > 0 && (t.taken as number) <= MAX_LIST_STAKE)) {
+    return null;
+  }
+  return { round: t.round as number, bets: t.kept as CrapsBet[], taken: (t.taken as number | undefined) ?? 0 };
+}
+
+/** What a craps settle's `kept` record still owes its player back: what an
+ *  earlier build's bets it kept up had taken, once their table's removal
+ *  came at the same moment as the settle and the doc kept the settle's
+ *  outcome over the removal's (which refunded them). The record left behind
+ *  owes it, in the player's chips, until the table's outcome record pays it
+ *  as the removal would have (payKeptOwed), when the kept record goes. */
+function keptOwed(
+  map: Y.Map<unknown>, chips: Y.Map<unknown>, tableId: string, playerId: string, value: unknown,
+): { inc: string; owed: number } | null {
+  const inc = (value as { inc?: unknown } | null)?.inc;
+  if (inc !== undefined && (typeof inc !== 'string' || !isTableIncField(inc))) return null;
+  const kept = keptList(value, { inc, bare: inc === undefined });
+  if (!kept || kept.taken === 0) return null;
+  const at = inc ?? '';
+  if (!map.has(goneKey(tableId, at))) return null;
+  if (lastOutcome(chips, tableId, at, playerId).was?.ev === 'end') return null;
+  return { inc: at, owed: kept.taken };
+}
+
+/** Pay what a player's kept record owes (keptOwed) as the removal's outcome,
+ *  before the record is overwritten or deleted. Once paid, it owes nothing:
+ *  two pages paying it at once pay one outcome. */
+function payKeptOwed(map: Y.Map<unknown>, tableId: string, playerId: string): void {
+  const due = keptOwed(map, ensureChips(), tableId, playerId, map.get(`kept:${tableId}:${playerId}`));
+  if (due) creditTableOutcome(tableId, due.inc, 'end', playerId, due.owed);
+}
+
+/** 🎲 A player's craps bets as they play, of the two keys: their own list,
+ *  unless the stickman has settled a roll since they wrote it, when what that
+ *  settle left up (`kept`) plays instead. A list counts as written after the
+ *  settle of roll `base - 1` (writeMyCrapsBets); an earlier build's list,
+ *  which has no `base`, plays unless it is the stickman's prune of it
+ *  (pruneCrapsBets), which plays only as the kept record: two pages settling
+ *  one roll can each prune it, and the doc may keep one page's prune with
+ *  the other's kept record and outcome. So a list written before a roll
+ *  settled (a take-down that crossed the dice) never brings back bets the
+ *  roll resolved: the edit is dropped, the felt stays as the roll left it. */
+function crapsFelt(
+  map: Y.Map<unknown>, tableId: string, playerId: string, inc: string | undefined,
+): { bets: CrapsBet[]; taken: number } | null {
+  const at = incarnationOf(map, tableId, { inc });
+  const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), at);
+  const kept = keptList(map.get(`kept:${tableId}:${playerId}`), at);
+  if (!kept) return own;
+  const keep = { bets: kept.bets, taken: kept.taken };
+  if (!own) return keep;
+  if (!own.legacy) return own.base !== undefined && own.base > kept.round ? own : keep;
+  return own.pruned ? keep : own;
 }
 
 export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
-  const value = ensureMap().get(`bets:${tableId}:${playerId}`);
-  return isCrapsTableBets(value) ? value.bets : [];
+  return crapsFelt(ensureMap(), tableId, playerId, readCrapsTableState(tableId)?.inc)?.bets ?? [];
 }
 
+/** The bettor's own write of their craps list, its chips held on the felt.
+ *  `base` is the roll it is for (the next one once a roll has settled), and
+ *  what an earlier build's list took goes on with it, as for writeMyBets.
+ *  Only while the table is up. */
 export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsBet[]): void {
   const map = ensureMap();
+  const s = readCrapsTableState(tableId);
+  if (!s) return;
+  const taken = crapsFelt(map, tableId, playerId, s.inc)?.taken ?? 0;
+  const base = s.phase === 'settled' ? s.round + 1 : s.round;
   boundDoc!.transact(() => {
-    map.set(`bets:${tableId}:${playerId}`, { kind: 'craps', bets });
+    map.set(`bets:${tableId}:${playerId}`, {
+      kind: 'craps', held: bets, base,
+      ...(s.inc !== undefined ? { inc: s.inc } : {}),
+      ...(taken > 0 ? { taken } : {}),
+    });
+    heldDirty = true;
+  });
+}
+
+/** The stickman's record, at the settle of `round`, of a player's bets that
+ *  stay up (none: the roll resolved them all), held on the felt from then.
+ *  This build's player's own list is never written: what an earlier build's
+ *  list took is handed back, and the kept bets hold their chips. An earlier
+ *  build's list is pruned where it lies, as earlier builds did, so its page
+ *  reads the felt as the roll left it, and what it took of the bets that stay
+ *  stays taken (`taken`); the prune is marked (`pruned`), and that page's
+ *  own next write, which never is, plays as a new list. */
+export function pruneCrapsBets(tableId: string, playerId: string, round: number, bets: CrapsBet[]): void {
+  const map = ensureMap();
+  const inc = readCrapsTableState(tableId)?.inc;
+  const key = `bets:${tableId}:${playerId}`;
+  const own = crapsOwnList(map.get(key), incarnationOf(map, tableId, { inc }));
+  const taken = own?.legacy ? bets.reduce((n, b) => n + b.amount, 0) : 0;
+  boundDoc!.transact(() => {
+    payKeptOwed(map, tableId, playerId); // a record an earlier removal left
+    if (own?.legacy) map.set(key, { kind: 'craps', bets, ...(inc !== undefined ? { inc } : {}), pruned: round });
+    map.set(`kept:${tableId}:${playerId}`, {
+      round, kept: bets,
+      ...(inc !== undefined ? { inc } : {}),
+      ...(taken > 0 ? { taken } : {}),
+    });
+    heldDirty = true;
   });
 }
 
 /** Every player's standing craps bets on one table (the stickman's settle read;
  *  also drives the "on the felt" spectator view). Empty lists are omitted. */
 export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
-  const prefix = `bets:${tableId}:`;
+  const map = ensureMap();
   const out: Record<string, CrapsBet[]> = {};
-  for (const [key, value] of ensureMap().entries()) {
-    if (!key.startsWith(prefix)) continue;
-    if (!isCrapsTableBets(value) || value.bets.length === 0) continue;
-    out[key.slice(prefix.length)] = value.bets;
+  const inc = readCrapsTableState(tableId)?.inc;
+  const pids = new Set<string>();
+  for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
+    for (const key of map.keys()) if (key.startsWith(prefix)) pids.add(key.slice(prefix.length));
+  }
+  for (const pid of pids) {
+    const list = crapsFelt(map, tableId, pid, inc);
+    if (list && list.bets.length > 0) out[pid] = list.bets;
   }
   return out;
+}
+
+// ── 🪙 Stakes on the felt (see STAKES ON THE FELT above) ─────────────────────
+
+/** Chips each player has held on felts, summed from the lists themselves
+ *  (countHeldStakes). */
+let heldStakes = new Map<string, bigint>();
+/** The sums as listeners last heard them (what a recount is compared with). */
+let heldHeard = new Map<string, bigint>();
+/** A local write to a table or a list since the last count. */
+let heldDirty = true;
+/** Players whose held chips changed since the last notify. */
+const heldTouched = new Set<string>();
+
+/** The table whose id a key carries after its prefix (the longest of `ids`
+ *  that fits, should one id begin with another's). */
+function tableOf(ids: Iterable<string>, rest: string): string | null {
+  let tableId: string | null = null;
+  for (const id of ids) {
+    if (rest.startsWith(`${id}:`) && (tableId === null || id.length > tableId.length)) tableId = id;
+  }
+  return tableId;
+}
+
+/** Chips each player has held on felts (and, below 0, what kept records left
+ *  by a removal owe them back: keptOwed). */
+function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string, bigint> {
+  const tables = new Map<string, RouletteTableState | CrapsTableState>();
+  const gone = new Set<string>();
+  for (const [key, value] of map.entries()) {
+    if (key.startsWith('gone:') && key.endsWith(':')) gone.add(key.slice('gone:'.length, -1));
+    if (!key.startsWith('table:')) continue;
+    const tableId = key.slice('table:'.length);
+    if ((isRouletteTableState(value) || isCrapsTableState(value)) && !removed(map, tableId, value)) {
+      tables.set(tableId, value);
+    }
+  }
+  const out = new Map<string, bigint>();
+  if (tables.size === 0 && gone.size === 0) return out;
+  const seen = new Set<string>();
+  for (const [key, value] of map.entries()) {
+    const prefix = key.startsWith('bets:') ? 'bets:' : key.startsWith('kept:') ? 'kept:' : null;
+    if (prefix === null) continue;
+    const rest = key.slice(prefix.length);
+    const removedId = prefix === 'kept:' ? tableOf(gone, rest) : null;
+    if (removedId !== null) {
+      const pid = rest.slice(removedId.length + 1);
+      const due = keptOwed(map, chips, removedId, pid, value);
+      if (due) out.set(pid, (out.get(pid) ?? 0n) - BigInt(due.owed));
+    }
+    const tableId = tableOf(tables.keys(), rest);
+    if (tableId === null) continue;
+    const pid = rest.slice(tableId.length + 1);
+    // A craps player's two keys make one felt: count it once.
+    if (seen.has(`${tableId}:${pid}`)) continue;
+    seen.add(`${tableId}:${pid}`);
+    const s = tables.get(tableId)!;
+    const list = s.kind === 'craps' ? crapsFelt(map, tableId, pid, s.inc) : liveRouletteList(map, tableId, pid, s);
+    if (!list) continue;
+    const net = stakeOf(list).net;
+    if (net !== 0) out.set(pid, (out.get(pid) ?? 0n) + BigInt(net));
+  }
+  return out;
+}
+
+function heldStake(playerId: string): bigint {
+  if (heldDirty) {
+    heldStakes = countHeldStakes(ensureMap(), ensureChips());
+    heldDirty = false;
+  }
+  return heldStakes.get(playerId) ?? 0n;
+}
+
+/** Recount the held chips before any observer runs whenever a transaction
+ *  touched a table or a list, and note whose changed for their listeners. */
+function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
+  const chips = doc.getMap<unknown>('casinoChips');
+  heldStakes = countHeldStakes(map, chips);
+  heldHeard = heldStakes;
+  heldDirty = false;
+  heldTouched.clear();
+  doc.on('beforeObserverCalls', (tr: Y.Transaction) => {
+    if (casinoMap !== map) return; // a binding we've moved off
+    const keys = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
+    const counts = (k: string | null): boolean =>
+      k !== null && (k.startsWith('table:') || k.startsWith('bets:') || k.startsWith('kept:') || k.startsWith('gone:'));
+    // A table's outcome record too: a removal's ends what kept bets owe.
+    const outcomes = tr.changed.get(chips as unknown as Y.AbstractType<Y.YEvent<any>>);
+    const ends = (k: string | null): boolean => k !== null && k.startsWith('tbl:');
+    if (!(keys && [...keys].some(counts)) && !(outcomes && [...outcomes].some(ends))) return;
+    const fresh = countHeldStakes(map, chips);
+    for (const pid of new Set([...fresh.keys(), ...heldHeard.keys()])) {
+      if ((fresh.get(pid) ?? 0n) !== (heldHeard.get(pid) ?? 0n)) heldTouched.add(pid);
+    }
+    heldStakes = fresh;
+    heldHeard = fresh;
+    heldDirty = false;
+  });
 }
 
 // ── 🎲🎡 #226: who stands where, and the shooter's throw ─────────────────────
@@ -733,7 +1541,7 @@ function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
 }
 
 /** 🎰 The room's slot operator lease: ONE session operates every slot machine
- *  in the room (slotCroupier.ts), so a player's `bal:` has one slot writer. */
+ *  in the room (slotCroupier.ts), so each machine has one writer. */
 export const SLOT_OPERATOR_KEY = 'slot-operator';
 
 export function readSlotOperatorLease(): SlotOperatorLease | null {
@@ -824,7 +1632,7 @@ export function hasSlotEscrow(machineId: string): boolean {
 export function slotMachineHoldsChips(machineId: string): boolean {
   const map = ensureMap();
   return map.has(`slot-escrow:${machineId}`)
-    || safeCount(map, `slot-bankroll:machine:${machineId}`) > 0;
+    || readAccount(map, `slot-bankroll:machine:${machineId}`) > 0;
 }
 
 export interface SlotSharedBankrollLease {
@@ -890,8 +1698,8 @@ function slotFundingBalanceKey(
   config: SlotFundingConfig,
 ): string {
   if (config.mode === 'owner') return `bal:${config.ownerId}`;
-  if (config.mode === 'machine') return `slot-bankroll:machine:${machineId}`;
-  return 'slot-bankroll:shared';
+  if (config.mode === 'machine') return `${BANKROLL_PREFIX}${machineId}`;
+  return SHARED_BANKROLL_KEY;
 }
 
 function safeCount(map: Y.Map<unknown>, key: string): number {
@@ -904,7 +1712,7 @@ export function readSlotFundingBalance(
   config: SlotFundingConfig,
 ): number {
   if (!isSlotFundingConfig(config)) return 0;
-  return safeCount(ensureMap(), slotFundingBalanceKey(machineId, config));
+  return readAccount(ensureMap(), slotFundingBalanceKey(machineId, config));
 }
 
 /** Move the owner's chips into a dedicated/shared bankroll. */
@@ -920,14 +1728,13 @@ export function depositSlotFunding(
   // shared balances withdrawable, but do not allow new shared funding.
   if (config.mode === 'shared') return false;
   const map = ensureMap();
-  const ownerKey = `bal:${ownerId}`;
   const fundingKey = slotFundingBalanceKey(machineId, config);
-  const ownerBalance = safeCount(map, ownerKey);
-  const fundingBalance = safeCount(map, fundingKey);
+  const ownerBalance = readChips(ownerId);
+  const fundingBalance = readAccount(map, fundingKey);
   if (ownerBalance < amount || !Number.isSafeInteger(fundingBalance + amount)) return false;
   boundDoc!.transact(() => {
-    map.set(ownerKey, ownerBalance - amount);
-    map.set(fundingKey, fundingBalance + amount);
+    addChips(ownerId, -amount);
+    writeAccount(map, fundingKey, fundingBalance, fundingBalance + amount);
   });
   return true;
 }
@@ -944,14 +1751,13 @@ export function withdrawSlotFunding(
   const sharedLease = config.mode === 'shared' ? readSlotSharedBankrollLease() : null;
   if (sharedLease && sharedLease.expiresAt > Date.now()) return false;
   const map = ensureMap();
-  const ownerKey = `bal:${ownerId}`;
   const fundingKey = slotFundingBalanceKey(machineId, config);
-  const ownerBalance = safeCount(map, ownerKey);
-  const fundingBalance = safeCount(map, fundingKey);
+  const ownerBalance = readChips(ownerId);
+  const fundingBalance = readAccount(map, fundingKey);
   if (fundingBalance < amount || !Number.isSafeInteger(ownerBalance + amount)) return false;
   boundDoc!.transact(() => {
-    map.set(fundingKey, fundingBalance - amount);
-    map.set(ownerKey, ownerBalance + amount);
+    writeAccount(map, fundingKey, fundingBalance, fundingBalance - amount);
+    addChips(ownerId, amount);
   });
   return true;
 }
@@ -984,20 +1790,24 @@ export function reserveSlotWager(
   const playerKey = `bal:${playerId}`;
   const fundingKey = slotFundingBalanceKey(machineId, config);
   const escrowKey = `slot-escrow:${machineId}`;
-  const playerBalance = safeCount(map, playerKey);
+  const playerBalance = readChips(playerId);
   if (playerBalance < bet) return 'insufficient-player-funds';
   if (safeCount(map, escrowKey) > 0) return 'insufficient-bankroll';
+  // A bankroll in overdraft (two withdrawals of the same chips at once) takes
+  // no spin until it is refilled, whatever the paytable.
+  const fundingAccount = fundingKey.startsWith('bal:') ? fundingKey.slice(4) : fundingKey;
+  if (ledgerTotal(fundingAccount) < 0n) return 'insufficient-bankroll';
 
   const sameAccount = playerKey === fundingKey;
-  const fundingBalance = safeCount(map, fundingKey);
+  const fundingBalance = readAccount(map, fundingKey);
   const afterStake = sameAccount ? fundingBalance : fundingBalance + bet;
   if (!Number.isSafeInteger(afterStake) || afterStake < maximumPayout) {
     return 'insufficient-bankroll';
   }
 
   boundDoc!.transact(() => {
-    if (!sameAccount) map.set(playerKey, playerBalance - bet);
-    map.set(fundingKey, afterStake - maximumPayout);
+    if (!sameAccount) addChips(playerId, -bet);
+    writeAccount(map, fundingKey, fundingBalance, afterStake - maximumPayout);
     map.set(escrowKey, maximumPayout);
   });
   return 'ok';
@@ -1026,8 +1836,8 @@ export function settleSlotWager(
   if (payout > escrow) return false;
   const fundingKey = slotFundingBalanceKey(machineId, config);
   const playerKey = `bal:${playerId}`;
-  const fundingBalance = safeCount(map, fundingKey);
-  const playerBalance = safeCount(map, playerKey);
+  const fundingBalance = readAccount(map, fundingKey);
+  const playerBalance = readChips(playerId);
   const returned = escrow - payout;
   const sameAccount = fundingKey === playerKey;
   const nextFunding = fundingBalance + returned + (sameAccount ? payout : 0);
@@ -1036,8 +1846,8 @@ export function settleSlotWager(
     || (!sameAccount && !Number.isSafeInteger(nextPlayer))) return false;
   boundDoc!.transact(() => {
     map.delete(escrowKey);
-    map.set(fundingKey, nextFunding);
-    if (!sameAccount && payout > 0) map.set(playerKey, nextPlayer);
+    writeAccount(map, fundingKey, fundingBalance, nextFunding);
+    if (!sameAccount && payout > 0) addChips(playerId, payout);
   });
   return true;
 }
@@ -1059,8 +1869,8 @@ export function refundSlotWager(
   const escrow = safeCount(map, escrowKey);
   const fundingKey = slotFundingBalanceKey(machineId, config);
   const playerKey = `bal:${playerId}`;
-  const fundingBalance = safeCount(map, fundingKey);
-  const playerBalance = safeCount(map, playerKey);
+  const fundingBalance = readAccount(map, fundingKey);
+  const playerBalance = readChips(playerId);
   const sameAccount = fundingKey === playerKey;
   if (!sameAccount && fundingBalance + escrow < bet) return false;
   const nextFunding = sameAccount
@@ -1070,28 +1880,28 @@ export function refundSlotWager(
   if (!Number.isSafeInteger(nextFunding) || !Number.isSafeInteger(nextPlayer)) return false;
   boundDoc!.transact(() => {
     map.delete(escrowKey);
-    map.set(fundingKey, nextFunding);
-    if (!sameAccount) map.set(playerKey, nextPlayer);
+    writeAccount(map, fundingKey, fundingBalance, nextFunding);
+    if (!sameAccount) addChips(playerId, bet);
   });
   return true;
 }
 
 /** Return a removed machine's private bankroll to the configured owner.
- *  False when it holds chips that can't be paid out (no owner to pay, or
- *  the owner's balance can't take them): nothing is written then. */
+ *  False when it holds chips that can't be paid out (no owner to pay, more
+ *  than the safe range, or the owner's balance can't take them): nothing is
+ *  written then. */
 export function drainSlotMachineFunding(machineId: string): boolean {
-  const map = ensureMap();
-  const fundingKey = `slot-bankroll:machine:${machineId}`;
-  const amount = safeCount(map, fundingKey);
-  if (amount <= 0) return true;
+  const fundingKey = `${BANKROLL_PREFIX}${machineId}`;
+  const total = ledgerTotal(fundingKey);
+  if (total <= 0n) return true;
   const config = readSlotFundingConfig(machineId);
-  if (!config) return false;
-  const ownerKey = `bal:${config.ownerId}`;
-  const ownerBalance = safeCount(map, ownerKey);
+  if (!config || total > BigInt(Number.MAX_SAFE_INTEGER)) return false;
+  const amount = Number(total);
+  const ownerBalance = readChips(config.ownerId);
   if (!Number.isSafeInteger(ownerBalance + amount)) return false;
   boundDoc!.transact(() => {
-    map.delete(fundingKey);
-    map.set(ownerKey, ownerBalance + amount);
+    addChips(fundingKey, -amount);
+    addChips(config.ownerId, amount);
   });
   return true;
 }
@@ -1106,7 +1916,8 @@ export function clearSlotMachineKeys(machineId: string): void {
     map.delete(`slot-odds:${machineId}`);
     map.delete(`slot-funding:${machineId}`);
     map.delete(`slot-operator:${machineId}`);
-    map.delete(`slot-bankroll:machine:${machineId}`);
+    // The bankroll's stored value stays: it is its ledger account's opening
+    // balance, which the records already drawn against it assume.
     map.delete(`slot-escrow:${machineId}`);
     const sharedLease = readSlotSharedBankrollLease();
     if (sharedLease?.machineId === machineId) map.delete(SHARED_BANKROLL_LEASE_KEY);
@@ -1156,8 +1967,8 @@ export function clearSlotMachineKeys(machineId: string): void {
 // the requests authenticated: like every key in this map, a peer can write a
 // request naming another player (a drop at that player's cost, paid to that
 // player) or a door request naming the owner (the owner's own chips, back to
-// the owner). That is no more than writing that player's `bal:` directly,
-// which any peer can already do; authenticated accounts come with the
+// the owner). That is no more than writing a chip record for that
+// player, which any peer can already do; authenticated accounts come with the
 // Registry chips.
 //
 // PARTITIONS: the operator lease is a Y.Map record, not a mutex; see
@@ -1610,8 +2421,7 @@ export function settleCoinPusherInsert(
     return 'invalid';
   }
   const map = ensureMap();
-  const balanceKey = `bal:${request.player}`;
-  const balance = safeCount(map, balanceKey);
+  const balance = readChips(request.player);
   if (balance < PUSHER_ANTE) return 'no-chips';
   const nextBalance = balance - PUSHER_ANTE + paid;
   if (!Number.isSafeInteger(nextBalance)) return 'balance-full';
@@ -1620,7 +2430,7 @@ export function settleCoinPusherInsert(
   };
   boundDoc!.transact(() => {
     map.set(`pusher:${machineId}`, normalized);
-    map.set(balanceKey, nextBalance);
+    addChips(request.player, nextBalance - balance);
     map.set(coinPusherResultKey(machineId, request.player), result);
     map.delete(coinPusherRequestKey(machineId, request.player));
   });
@@ -1685,13 +2495,12 @@ export function commitCoinPusherEmpty(
     return null;
   }
   const map = ensureMap();
-  const ownerKey = `bal:${base.ownerId}`;
-  const ownerBalance = safeCount(map, ownerKey);
+  const ownerBalance = readChips(base.ownerId);
   if (!Number.isSafeInteger(ownerBalance + emptied)) return null;
   const answer: PusherDoorResult = { kind: 'opened', requestId: request.requestId, emptied, atMs };
   boundDoc!.transact(() => {
     map.set(`pusher:${machineId}`, normalized);
-    if (emptied > 0) map.set(ownerKey, ownerBalance + emptied);
+    if (emptied > 0) addChips(base.ownerId, emptied);
     map.set(`pusher-door:${machineId}`, answer);
     map.delete(`pusher-empty:${machineId}`);
   });
@@ -1717,13 +2526,12 @@ export function drainAndClearCoinPusher(machineId: string, recipientId: string):
   const map = ensureMap();
   const state = readCoinPusherState(machineId);
   const inside = state ? chipsInMachine(state) : 0;
-  const ownerKey = `bal:${recipientId}`;
-  const ownerBalance = safeCount(map, ownerKey);
+  const ownerBalance = readChips(recipientId);
   if (inside > 0 && (recipientId.length === 0 || recipientId.length > 128
     || !Number.isSafeInteger(ownerBalance + inside))) return null;
   const credit = inside;
   boundDoc!.transact(() => {
-    if (credit > 0) map.set(ownerKey, ownerBalance + credit);
+    if (credit > 0) addChips(recipientId, credit);
     map.delete(`pusher:${machineId}`);
     map.delete(`pusher-empty:${machineId}`);
     map.delete(`pusher-door:${machineId}`);
@@ -1740,9 +2548,9 @@ export function drainAndClearCoinPusher(machineId: string, recipientId: string):
 // debug handles attached only when a DOM exists.
 if (typeof window !== 'undefined') {
   (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
-    readChips, buyInChips, cashOutChips, spendChips, creditChips,
+    readChips, buyInChips, cashOutChips, spendChips, creditChips, readChipRecords,
     readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
-    readCroupierBeat, writeCroupierBeat,
+    readCroupierBeat, writeCroupierBeat, readTableOperatorLease,
     readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
     readCrapsBackendPref, writeCrapsBackendPref,
     readCrapsFairnessPref, writeCrapsFairnessPref,

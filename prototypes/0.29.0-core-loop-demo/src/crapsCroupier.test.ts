@@ -106,8 +106,10 @@ describe('who is at the table', () => {
 });
 
 describe("the house's ROLL", () => {
-  it('opens round 1 on a table nobody has run, and slides the dice out under this page', () => {
+  it('opens round 1 on a table nobody has run, then slides the dice out under this page', () => {
     const t = freshTable();
+    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // bets go down on an open table
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'betting', round: 1 });
     expect(pressManualRoll(t, at(T0))).toBeNull();
     const s = readCrapsTableState(t)!;
     expect(s.phase).toBe('closing');
@@ -118,8 +120,8 @@ describe("the house's ROLL", () => {
 
   it('waits for a newly seen line bettor, then hands them the dice', () => {
     const t = freshTable();
+    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // the window opens first
     writeMyCrapsBets(t, BOB, [{ type: 'pass', amount: 5 }]);
-    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // a Fair window opens first
     seat(t, BOB, 1);
     expect(pressManualRoll(t, at(T0))).toMatch(/CHECKING WHO IS AT THE TABLE/);
     expect(readCrapsTableState(t)?.phase).toBe('betting');
@@ -130,8 +132,8 @@ describe("the house's ROLL", () => {
 
   it('settles the shooter\'s throw on the operator page', async () => {
     const t = freshTable();
+    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // the window opens first
     writeMyCrapsBets(t, BOB, [{ type: 'pass', amount: 5 }]);
-    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // a Fair window opens first
     seat(t, BOB, 1);
     tickManualCraps(t, at(T0));
     seat(t, BOB, 2);
@@ -144,8 +146,8 @@ describe("the house's ROLL", () => {
 
   it('has the stickman throw when the shooter runs out of time', async () => {
     const t = freshTable();
+    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // the window opens first
     writeMyCrapsBets(t, BOB, [{ type: 'pass', amount: 5 }]);
-    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // a Fair window opens first
     seat(t, BOB, 1);
     tickManualCraps(t, at(T0));
     seat(t, BOB, 2);
