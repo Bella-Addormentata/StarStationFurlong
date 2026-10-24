@@ -174,6 +174,48 @@ function spinTo(pocket: number): void {
 
 const sum = (bets: readonly { amount: number }[]): number => bets.reduce((n, b) => n + b.amount, 0);
 
+describe('a settle the computer slept through', () => {
+  const bettor = 'player-Carol';
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('writes nothing as it wakes, before its doc hears the room, and settles once it is awake', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    let now = 2_000_000_000;
+    const tick = (ms: number): void => {
+      for (let left = ms; left > 0; left -= 1_000) {
+        now += Math.min(left, 1_000);
+        vi.setSystemTime(now);
+        a.croupier.noteTablesRunning(now);
+      }
+    };
+    vi.setSystemTime(now);
+    a.casino.buyInChips(bettor, 100);
+    turn(a, now);
+    a.croupier.openBetting(TABLE, 1); // a Fair round: its settle hashes
+    expect(a.casino.readTableState(TABLE)?.houseCommit).toBeTruthy();
+    a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
+    a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
+    tick(1_000);
+    a.croupier.rollAndSettle(TABLE, 1);
+    now += 20_000; // the computer sleeps mid-hash
+    vi.setSystemTime(now);
+    await flush();
+    expect(a.casino.readTableState(TABLE)?.phase).toBe('closing');
+    expect(a.casino.readChips(bettor)).toBe(70);
+    tick(1_000); // awake: a lapse to wait out
+    a.croupier.rollAndSettle(TABLE, 1);
+    await flush();
+    expect(a.casino.readTableState(TABLE)?.phase).toBe('closing');
+    tick(a.croupier.TABLE_LEASE_LAPSE_MS);
+    a.croupier.rollAndSettle(TABLE, 1);
+    await flush();
+    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', round: 1 });
+  });
+});
+
 describe('stakes on the felt', () => {
   const bettor = 'player-Carol';
 
@@ -855,8 +897,13 @@ describe('bets the chip ledger could not pay', () => {
 describe('a manual craps roll held by the owner\'s page that is not driving', () => {
   const table = 'craps-1';
   let now = 2_000_000_000;
+  /** Time passes, both pages running their tables every second of it. */
   const later = (ms: number): void => {
-    now += ms;
+    for (let left = ms; left > 0; left -= 1_000) {
+      now += Math.min(left, 1_000);
+      vi.setSystemTime(now);
+      for (const page of [a, b]) page.croupier.noteTablesRunning(now);
+    }
     vi.setSystemTime(now);
   };
 
@@ -894,6 +941,22 @@ describe('a manual craps roll held by the owner\'s page that is not driving', ()
     expect(a.casino.readCrapsTableState(table)).toMatchObject({ phase: 'betting', round: 2 });
   });
 
+  it('is not rolled on that page while it wakes from a sleep, and is once it is awake', async () => {
+    heldByB();
+    later(1_000);
+    now += 20_000; // page b sleeps through it
+    vi.setSystemTime(now);
+    b.croupier.noteTablesRunning(now); // its first frame awake
+    b.craps.tickManualCraps(table, now);
+    await flush();
+    expect(b.casino.readCrapsTableState(table)?.phase).toBe('closing');
+    expect(b.casino.readDiceThrow(table)).toBeNull(); // no dice thrown on that doc
+    later(b.croupier.TABLE_LEASE_LAPSE_MS);
+    b.craps.tickManualCraps(table, now);
+    await flush();
+    expect(b.casino.readCrapsTableState(table)).toMatchObject({ phase: 'settled', round: 1 });
+  });
+
   it('on a table put back under the same id, waits out its own full time', () => {
     heldByB();
     a.craps.tickAutoStickman(table); // the robot starts watching b's roll
@@ -928,8 +991,13 @@ describe('a manual craps roll held by the owner\'s page that is not driving', ()
 
 describe('a SPIN pressed on the owner\'s page that is not driving', () => {
   let now = 2_000_000_000;
+  /** Time passes, both pages running their tables every second of it. */
   const later = (ms: number): void => {
-    now += ms;
+    for (let left = ms; left > 0; left -= 1_000) {
+      now += Math.min(left, 1_000);
+      vi.setSystemTime(now);
+      for (const page of [a, b]) page.croupier.noteTablesRunning(now);
+    }
     vi.setSystemTime(now);
   };
 

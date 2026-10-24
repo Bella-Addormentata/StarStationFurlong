@@ -27,7 +27,7 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { timerOnThisClock } from './croupier';
+import { tablesAwake, timerOnThisClock } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
@@ -346,6 +346,9 @@ export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: 
   // Just took the turn over: let the operator stamp converge first, so a
   // rival takeover's write wins or loses before either page settles.
   if (took !== undefined && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
+  // 💤 A page waking from a sleep holds this turn only in a doc that may not
+  // have heard a takeover yet: it waits to be awake again (noteTablesRunning).
+  if (!tablesAwake(now)) return;
   tickCrapsClosing(tableId, s, autoShowMs, took !== undefined ? Infinity : now);
   tookOverAt.delete(tableId);
 }

@@ -34,6 +34,7 @@ import {
   croupierBeatLine,
   HEARTBEAT_MS,
   isCroupierLive,
+  noteTablesRunning,
   takeTableTurn,
   tickAutoCroupier,
 } from "./croupier";
@@ -6284,6 +6285,9 @@ export class World {
     // headless), only the room's elected operator session (below).
     const coinPushers = FURNITURE.filter((i) => i.kind === "coin-pusher");
     const tables = [...rouletteTables, ...crapsTables];
+    // 💤 Every page running tables marks the frame, so one waking from a
+    // sleep acts on none until its doc has caught up (croupier.ts).
+    if (tables.length) noteTablesRunning();
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.

@@ -47,7 +47,7 @@ import type { CrapsBet, CrapsTableState, FairnessTranscript } from './games/crap
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
 import { frozenFields, frozenWagers, gatherRound, heldAtClose, roundSettleable, settledRound } from './fairTableSeeds';
 import { getPlayerId } from './identity';
-import { stillDrivesTables } from './croupier';
+import { stillDrivesTables, tablesAwake } from './croupier';
 
 /** This page, as a manual table's operator: player id plus a per-load nonce,
  *  so two tabs of one player are still two operators. */
@@ -120,6 +120,7 @@ class LocalCrapsBackend implements CrapsBackend {
         if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return null;
         if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return null;
         if (before.operator === undefined && !stillDrivesTables()) return null;
+        if (!tablesAwake()) return null;
         const now = Date.now();
         // Every bet stands — as frozen at "no more bets". A list rewritten
         // since can't be restored from its hash, so it's cleared like a
@@ -180,6 +181,9 @@ class LocalCrapsBackend implements CrapsBackend {
     // (croupier.ts table-operator lease): another of the owner's pages may
     // have taken over while this one hashed.
     if (before.operator === undefined && !stillDrivesTables()) return dice;
+    // 💤 Nor, a manual roll either, on a page that slept since it last ran
+    // its tables (croupier.noteTablesRunning).
+    if (!tablesAwake()) return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     // ⚖️ A bettor who committed but never revealed forfeits every bet on the

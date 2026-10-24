@@ -1588,7 +1588,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     else if (s.operator !== undefined && s.operator !== ROULETTE_PAGE_ID) {
       // Another house member's SPIN holds this round. Take it over only once
       // they've had time to settle it (they may have left mid-round).
-      const k = `${casinoDocEpoch()}:${s.round}:${s.operator}`;
+      const k = `${casinoDocEpoch()}:${s.inc ?? ''}:${s.round}:${s.operator}`;
       if (spinSeen?.key !== k) spinSeen = { key: k, at: Date.now() };
       if (Date.now() - spinSeen.at < SPIN_TAKEOVER_MS) {
         say('THE WHEEL IS SPINNING — ANOTHER HOUSE MEMBER IS RUNNING THIS ROUND');

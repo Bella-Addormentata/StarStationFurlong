@@ -111,10 +111,6 @@ let leaseSeen: { page: string; beat: number; at: number } | null = null;
 /** When this page claimed the lease it holds (null: it holds none it claimed). */
 let leaseClaimedAt: number | null = null;
 let leaseRenewedAt = 0;
-/** When this page last asked for its turn, and the earliest it may drive
- *  again after it stopped asking for a lapse (see takeTableTurn). */
-let lastTurnAt: number | null = null;
-let driveFrom = 0;
 
 function noteLease(lease: TableOperatorLease | null, now: number): void {
   const epoch = casinoDocEpoch();
@@ -122,8 +118,6 @@ function noteLease(lease: TableOperatorLease | null, now: number): void {
     leaseEpoch = epoch;
     leaseSeen = null;
     leaseClaimedAt = null;
-    lastTurnAt = null;
-    driveFrom = 0;
   }
   if (!lease) leaseSeen = null;
   else if (!leaseSeen || leaseSeen.page !== lease.page || leaseSeen.beat !== lease.beat) {
@@ -138,20 +132,52 @@ function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: st
     || (leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
 }
 
+/** When this page last ran its tables, in this room doc, and the earliest it
+ *  may act on them again after it stopped running them for a lapse. */
+let tablesEpoch = -1;
+let tablesRanAt: number | null = null;
+let tablesFrom = 0;
+
+/**
+ * This page is running its tables this frame (World calls it every frame the
+ * room has tables, whoever drives them; takeTableTurn calls it too). A page
+ * that stopped for a lapse or more (the computer slept, the tab froze) may
+ * wake on a doc that hasn't heard another page take its tables over
+ * meanwhile, and a settle written on that doc would overwrite the other
+ * page's rounds when the two meet (creditTableOutcome keeps one running
+ * record per table and player). So it waits out a lapse again, acting on no
+ * table, for the doc to catch up (tablesAwake). A page cut off from the room
+ * while it keeps running can't tell, and the computed tables end that case.
+ */
+export function noteTablesRunning(now = Date.now()): void {
+  const epoch = casinoDocEpoch();
+  if (epoch !== tablesEpoch) {
+    tablesEpoch = epoch;
+    tablesRanAt = null;
+    tablesFrom = 0;
+  }
+  if (tablesRanAt !== null && now - tablesRanAt >= TABLE_LEASE_LAPSE_MS) tablesFrom = now + TABLE_LEASE_LAPSE_MS;
+  tablesRanAt = now;
+}
+
+/** May this page act on its tables now (drive them, settle a round)? Not
+ *  while it waits out a lapse after it stopped running them, nor once a
+ *  lapse has gone by since it last ran them: a settle resuming from its
+ *  awaits after a sleep, before the page's next frame. A page that hasn't
+ *  run them in this doc yet may. */
+export function tablesAwake(now = Date.now()): boolean {
+  if (tablesRanAt === null || casinoDocEpoch() !== tablesEpoch) return true;
+  return now >= tablesFrom && now - tablesRanAt < TABLE_LEASE_LAPSE_MS;
+}
+
 /**
  * May this page drive the auto tables this frame? Call it every frame from a
  * page that canRunCroupier(), and drive only on true. It claims a free lease,
  * keeps renewing its own, and leaves one another of the deed holder's pages
- * holds alone. A fresh claim drives only after TABLE_LEASE_SETTLE_MS.
- *
- * A page that stopped asking for a lapse or more (the computer slept, the
- * tab froze) may wake on a doc that hasn't heard another page take over
- * meanwhile, and a settle written on that doc would overwrite the other
- * page's rounds when the two meet (creditTableOutcome keeps one running
- * record per table and player). So it waits out a lapse again before it
- * drives, for the doc to catch up: it then sees the other page's lease, or
- * its own, writing nothing meanwhile. A page cut off from the room while it
- * keeps running can't tell, and the computed tables are what end that case.
+ * holds alone. A fresh claim drives only after TABLE_LEASE_SETTLE_MS. A page
+ * waking from a sleep claims and renews nothing until it is awake again
+ * (noteTablesRunning): by then its doc shows the other page's lease, or its
+ * own.
  */
 export function takeTableTurn(
   now = Date.now(),
@@ -160,9 +186,8 @@ export function takeTableTurn(
 ): boolean {
   const lease = readTableOperatorLease();
   noteLease(lease, now);
-  if (lastTurnAt !== null && now - lastTurnAt >= TABLE_LEASE_LAPSE_MS) driveFrom = now + TABLE_LEASE_LAPSE_MS;
-  lastTurnAt = now;
-  if (now < driveFrom) return false; // nor claims or renews on that doc
+  noteTablesRunning(now);
+  if (!tablesAwake(now)) return false;
   if (lease?.page !== pageId) {
     if (!leaseIsFree(lease, now, playerId)) return false;
     writeTableOperatorLease({ page: pageId, player: playerId, beat: 1 });
@@ -269,6 +294,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // 🤖 An auto round settles only on the page still driving the tables: the
   // hashing can outlive its lease (another of the owner's pages took over).
   if (before.operator === undefined && !stillDrivesTables()) return;
+  // 💤 Nor, a manual round either, on a page that slept since it last ran
+  // its tables: its doc may not have heard who took them over meanwhile.
+  if (!tablesAwake()) return;
   // ⚖️ Only the wagers frozen at "no more bets" settle (the reveals made the
   // pocket computable; a rewritten list is void), and a bettor who committed
   // but never revealed forfeits this round's bets.
