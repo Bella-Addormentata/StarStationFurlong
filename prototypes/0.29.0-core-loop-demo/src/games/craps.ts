@@ -220,11 +220,14 @@ function isPidMap(v: unknown, max: number): boolean {
       && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
 }
 
-function isPidCountMap(v: unknown, max: number): boolean {
+/** Chips per player, either sign (a stake held on the felt can be below 0:
+ *  casinoDoc FeltStake), never past what one list can hold. */
+function isPidStakeMap(v: unknown, max: number): boolean {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
   const entries = Object.entries(v);
   return entries.length <= max
-    && entries.every(([pid, n]) => pid.length > 0 && pid.length <= 128 && Number.isSafeInteger(n) && (n as number) >= 0);
+    && entries.every(([pid, n]) => pid.length > 0 && pid.length <= 128 && Number.isSafeInteger(n)
+      && Math.abs(n as number) <= MAX_BETS_PER_PLAYER * MAX_BET_AMOUNT);
 }
 
 /** Shape guard for the peer-written seed fields (bounded like transcripts). */
@@ -234,7 +237,7 @@ export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
   if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
   if (s.sigs !== undefined && !isPidMap(s.sigs, FAIRNESS_MAX_PARTIES - 1)) return false;
-  if (s.stakes !== undefined && !isPidCountMap(s.stakes, 2 * FAIRNESS_MAX_PARTIES)) return false;
+  if (s.stakes !== undefined && !isPidStakeMap(s.stakes, 2 * FAIRNESS_MAX_PARTIES)) return false;
   return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 

@@ -810,6 +810,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const placeHand = (rg: FeltRegion<Spot>): void => {
     syncWindow();
+    // 🪙 Bets hold their chips on a table that is up (casinoDoc STAKES ON THE
+    // FELT): until the house (or its robot) opens this one, nothing goes down.
+    if (!(game === 'craps' ? crapsState() : rouletteState())) {
+      say(deps.isHouse()
+        ? `PRESS ${game === 'craps' ? 'ROLL' : 'SPIN'} ON ⚙ TO OPEN THE TABLE`
+        : "THE TABLE ISN'T OPEN YET — WAIT FOR THE HOUSE");
+      return;
+    }
     if (!bettingOpen()) {
       say(phase() === 'settled' ? 'WAIT FOR THE NEXT ROUND' : 'NO MORE BETS');
       return;

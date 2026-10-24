@@ -31,13 +31,14 @@
  */
 
 import {
-  betsHeld,
   casinoDocEpoch,
   clearTableKeys,
   creditTableOutcome,
+  feltStake,
   newTableInc,
   readAllBets,
   readCroupierBeat,
+  readFeltStakes,
   readTableOperatorLease,
   readTableState,
   transactCasino,
@@ -259,20 +260,20 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   if (!voided) for (const pid of forfeited) delete bets[pid];
   const payouts = result === null ? {} : resolveRound(bets, result);
   // 🪙 What the round does to each bettor's chips (casinoDoc STAKES ON THE
-  // FELT). A held list hands its chips back as the round ends, so the settle
-  // takes what it held and pays what it won. An earlier build's list took
-  // its chips when it went down, so its win is paid in full, and a stake the
-  // round gives back is refunded.
+  // FELT). A list stops holding its chips as the round ends, so the settle
+  // takes what it held and pays what it won. What an earlier build's list
+  // took isn't held: its win is paid in full, and a stake the round gives
+  // back is refunded.
   const owed: Record<string, number> = {};
-  for (const [pid, list] of Object.entries(live)) {
-    const staked = list.reduce((n, b) => n + b.amount, 0);
-    const held = heldAtClose(tableId, before, pid, staked);
+  for (const pid of new Set([...Object.keys(live), ...rewritten])) {
+    const held = heldAtClose(tableId, before, pid);
     let delta: number;
     // A bet that missed the freeze (it arrived just after "no more bets"),
-    // or any bet on a void round, goes back to its bettor.
-    if (omitted.includes(pid) || (voided && !rewritten.includes(pid))) delta = held > 0 ? 0 : staked;
-    // A list rewritten after the close is lost as it was frozen (the
-    // rewrite could shrink it), and never paid.
+    // or any bet on a void round, goes back to its bettor: what it held is
+    // released as the round ends, and what was taken of it is refunded.
+    if (omitted.includes(pid) || (voided && !rewritten.includes(pid))) delta = feltStake(tableId, pid).taken;
+    // A list rewritten (or emptied) after the close is lost as it was
+    // frozen (the rewrite could shrink it), and never paid.
     else if (rewritten.includes(pid)) delta = -held;
     // (A forfeit wins nothing.)
     else delta = (payouts[pid] ?? 0) - held;
@@ -413,26 +414,25 @@ export function timerOnThisClock(
 /**
  * Tear a table down cleanly on removal from a room. Safe to call on any client.
  * Stakes held on the felt go back to their players as the lists go. The REFUND
- * of an earlier build's lists on an unresolved round (it took their chips, and
- * once the records vanish there is no other credit-back path) runs ONLY on the
- * deed holder's pages (canRunCroupier), and counts once however many of them
- * run it (creditTableOutcome); every client then wipes the table's casino
- * keys (idempotent LWW delete) so no orphan records survive. In a manual
- * venture/legacy room there is no operator, so an earlier build's stakes are
- * not refunded (matches the manual-mode limitation); held ones still go back.
+ * of what an earlier build's lists took on an unresolved round (once the
+ * records vanish there is no other credit-back path) runs ONLY on the deed
+ * holder's pages (canRunCroupier), and counts once however many of them run
+ * it (creditTableOutcome); every client then wipes the table's casino keys
+ * (idempotent LWW delete) so no orphan records survive. In a manual
+ * venture/legacy room there is no operator, so what they took is not
+ * refunded (matches the manual-mode limitation); held stakes still go back.
  */
 export function closeTable(tableId: string): void {
   // One transaction: no page sees the refunds without the table gone.
   transactCasino(() => {
     const s = readTableState(tableId);
     if (canRunCroupier() && s && s.phase !== 'settled') {
-      for (const [pid, bets] of Object.entries(readAllBets(tableId, s.round))) {
-        // A held stake goes back with its list. An earlier build's list took
-        // its chips: each of the deed holder's pages refunds it, whichever
-        // removed the table first, and the page driving it may be settling
-        // this very round: the table's one outcome per bettor pays one.
-        if (betsHeld(tableId, pid)) continue;
-        creditTableOutcome(tableId, s.inc ?? '', 'end', pid, bets.reduce((sum, b) => sum + b.amount, 0));
+      for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
+        // A held stake goes back with its list. What an earlier build's list
+        // took, each of the deed holder's pages refunds, whichever removed
+        // the table first, and the page driving it may be settling this very
+        // round: the table's one outcome per bettor pays one.
+        if (taken > 0) creditTableOutcome(tableId, s.inc ?? '', 'end', pid, taken);
       }
     }
     clearTableKeys(tableId);

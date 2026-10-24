@@ -15,11 +15,11 @@
  * CRAPS ≠ ROULETTE: a roulette settle clears the felt every spin. A craps roll
  * only settles the bets that GOT a decision — a pass line waiting on its point,
  * a working place bet, ride to the next roll. So the settle also PRUNES each
- * player's bet list (writeMyCrapsBets with the survivors) and carries the POINT
- * forward into the next betting window. This is the one place a client other
- * than the bet's owner rewrites `bets:<id>:<pid>` — safe because it happens at
- * the settle, disjoint from the players' betting window (documented v1; the G4
- * Registry chips + a claim lane close it for real).
+ * player's bets (casinoDoc pruneCrapsBets: the survivors, as the stickman's
+ * own `kept:<id>:<pid>`, never the player's `bets:` key) and carries the POINT
+ * forward into the next betting window. The survivors play until the player
+ * writes a list after that roll, so an edit that crossed the dice is dropped
+ * rather than bringing back bets the roll resolved (casinoDoc crapsFelt).
  *
  * NO SHARED CLOCK — same as croupier.ts: the operator's Date.now() drives the
  * deadlines. ⚖️ FAIRNESS: by default the dice come from the house's seed mixed
@@ -30,7 +30,6 @@
 import { canRunCroupier, timerOnThisClock } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
-  betsHeld,
   casinoDocEpoch,
   clearTableKeys,
   creditTableOutcome,
@@ -39,6 +38,7 @@ import {
   readCrapsFairnessPref,
   readCrapsTableState,
   readDiceThrow,
+  readFeltStakes,
   readSeats,
   transactCasino,
   writeCrapsTableState,
@@ -390,14 +390,11 @@ const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>
  */
 export function pressManualRoll(tableId: string, now = Date.now()): string | null {
   if (!readCrapsTableState(tableId)) {
+    // The first press only opens the window: bets go down on an open table
+    // (casinoDoc STAKES ON THE FELT), and on a Fair one the bettors need to
+    // see the house commit and add their seeds before "no more bets".
     openCrapsBetting(tableId, 1, null);
-    // ⚖️ A Fair window with bets already down only opens on this press: the
-    // bettors need to see the house commit and add their seeds before "no
-    // more bets", or the house seed alone would decide the roll.
-    const opened = readCrapsTableState(tableId);
-    if (opened?.houseCommit && Object.keys(readAllCrapsBets(tableId)).length > 0) {
-      return 'BETS OPEN — PRESS AGAIN TO ROLL';
-    }
+    return 'BETS OPEN — PRESS AGAIN TO ROLL';
   }
   const s = readCrapsTableState(tableId);
   if (!s) return null;
@@ -486,13 +483,12 @@ export function closeCrapsTable(tableId: string): void {
   transactCasino(() => {
     if (canRunCroupier()) {
       const inc = readCrapsTableState(tableId)?.inc ?? '';
-      for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
-        // A held stake goes back with its list. An earlier build's list took
-        // its chips: each of the deed holder's pages refunds it, and the page
-        // driving the table may be settling a roll meanwhile: the table's one
-        // outcome per bettor pays one of them (croupier.closeTable).
-        if (betsHeld(tableId, pid)) continue;
-        creditTableOutcome(tableId, inc, 'end', pid, bets.reduce((sum, b) => sum + b.amount, 0));
+      for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
+        // A held stake goes back with its list. What an earlier build's list
+        // took, each of the deed holder's pages refunds, and the page driving
+        // the table may be settling a roll meanwhile: the table's one outcome
+        // per bettor pays one of them (croupier.closeTable).
+        if (taken > 0) creditTableOutcome(tableId, inc, 'end', pid, taken);
       }
     }
     clearTableKeys(tableId);

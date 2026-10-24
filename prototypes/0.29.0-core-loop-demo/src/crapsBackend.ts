@@ -138,9 +138,9 @@ class LocalCrapsBackend implements CrapsBackend {
           });
           settledRound(tableId, before);
           for (const pid of voided) {
-            const held = heldAtClose(tableId, before, pid, live[pid].reduce((n, b) => n + b.amount, 0));
-            if (held > 0) creditTableOutcome(tableId, before.inc ?? '', round, pid, -held);
-            pruneCrapsBets(tableId, pid, []);
+            const held = heldAtClose(tableId, before, pid);
+            if (held !== 0) creditTableOutcome(tableId, before.inc ?? '', round, pid, -held);
+            pruneCrapsBets(tableId, pid, round, []);
           }
         });
         return null;
@@ -195,15 +195,15 @@ class LocalCrapsBackend implements CrapsBackend {
     );
     for (const pid of forfeited) remaining[pid] = [];
     // 🪙 What the roll does to each bettor's chips (casinoDoc STAKES ON THE
-    // FELT): a held list's bets that came down take what they held, and what
-    // they won is paid; the bets that stay up stay held. An earlier build's
-    // list took its chips when it went down: its win is paid in full. A list
-    // rewritten since the close loses what it held then.
+    // FELT): the settle takes what the list held at the close, pays what the
+    // roll won, and the bets that stay up are held again, as kept. What an
+    // earlier build's list took isn't held, so its win comes in full and its
+    // standing bets' chips back to be held. A list rewritten (or emptied)
+    // since the close loses what it held then.
     const owed: Record<string, number> = {};
     for (const [pid, left] of Object.entries(remaining)) {
-      const held = heldAtClose(tableId, before, pid, (live[pid] ?? []).reduce((n, b) => n + b.amount, 0));
       const stays = left.reduce((n, b) => n + b.amount, 0);
-      const delta = (payouts[pid] ?? 0) - (held > 0 ? held - stays : 0);
+      const delta = (payouts[pid] ?? 0) - heldAtClose(tableId, before, pid) + stays;
       if (delta !== 0) owed[pid] = delta;
     }
     const now = Date.now();
@@ -239,10 +239,10 @@ class LocalCrapsBackend implements CrapsBackend {
       // One change per bettor for the roll, counted once however many pages
       // settle it (creditTableOutcome).
       for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
-      // Prune the felt: rewrite each player's list to only the bets that survived
-      // (standing pass/place). Empty ⇒ their felt clears.
+      // Prune the felt: what stays up of each player's list (standing
+      // pass/place), as the stickman's own record. Empty ⇒ their felt clears.
       for (const [pid, bets] of Object.entries(remaining)) {
-        pruneCrapsBets(tableId, pid, bets);
+        pruneCrapsBets(tableId, pid, round, bets);
       }
     });
     return [d1, d2];

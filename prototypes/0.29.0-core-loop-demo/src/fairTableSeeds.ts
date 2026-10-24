@@ -43,8 +43,8 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import {
-  betsHeld,
   casinoDocEpoch,
+  feltStake,
   casinoRoomId,
   readAllBets,
   readAllCrapsBets,
@@ -312,14 +312,14 @@ export function frozenFields(
 }
 
 /** The chips a bettor's list held on the felt as round `s` closed: what the
- *  freeze recorded, so a list rewritten since can't change what the round
- *  takes, or on a round that froze none (RNG, or a bettor who missed the
- *  freeze) what it holds now. 0 for an earlier build's list, whose chips were
- *  taken when it went down (casinoDoc STAKES ON THE FELT). */
-export function heldAtClose(tableId: string, s: TableState, pid: string, staked: number): number {
+ *  freeze recorded, so a list rewritten (or emptied) since can't change what
+ *  the round takes, or on a round that froze none (RNG, or a bettor who missed
+ *  the freeze) what it holds now. Only what wasn't taken already: 0 for an
+ *  earlier build's list (casinoDoc FeltStake). */
+export function heldAtClose(tableId: string, s: TableState, pid: string): number {
   const frozen = frozenFields(tableId, s).stakes;
   if (frozen && Object.prototype.hasOwnProperty.call(frozen, pid)) return frozen[pid];
-  return betsHeld(tableId, pid) ? staked : 0;
+  return feltStake(tableId, pid).net;
 }
 
 /** Forget the snapshots of every table no longer in the room (`live` is the
@@ -504,7 +504,7 @@ export function freezeCommits(
   for (const pid of [...Object.keys(commits), ...unseeded]) {
     const list = game === 'craps' ? readMyCrapsBets(tableId, pid) : readMyBets(tableId, pid, s.round);
     wagers[pid] = wagerFingerprint(list);
-    stakes[pid] = betsHeld(tableId, pid) ? list.reduce((n, b) => n + b.amount, 0) : 0;
+    stakes[pid] = feltStake(tableId, pid).net;
   }
   // The operator's own copy of what it froze: its settle goes by this.
   noteFrozen(tableId, { ...s, commits, wagers, sigs, stakes }, true);
@@ -518,7 +518,8 @@ export function wagerFingerprint(bets: readonly unknown[]): string {
 
 /** The settle's bets on a round that froze its wagers: only the frozen
  *  bettors, and only lists unchanged since the close. A list rewritten after
- *  "no more bets" is `voided` (its bets are not paid — the settle clears them).
+ *  "no more bets" is `voided` (its bets are not paid — the settle clears them),
+ *  and so is a frozen bettor's list emptied or gone since (not in `bets`).
  *  A round without frozen wagers (RNG) settles the bets as they stand. */
 export function frozenWagers<T>(
   tableId: string,
@@ -539,6 +540,7 @@ export function frozenWagers<T>(
     if (wagerFingerprint(list) === want) out[pid] = list;
     else voided.push(pid);
   }
+  for (const pid of Object.keys(wagers)) if (!Object.prototype.hasOwnProperty.call(bets, pid)) voided.push(pid);
   return { bets: out, voided: voided.sort(), omitted: omitted.sort() };
 }
 

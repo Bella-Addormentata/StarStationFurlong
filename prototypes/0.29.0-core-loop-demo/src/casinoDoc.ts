@@ -15,10 +15,12 @@
  *   bought:<playerId>         → number   lifetime chips issued, ditto
  *   cashed:<playerId>         → number   lifetime chips returned, ditto
  *   table:<tableId>           → RouletteTableState (croupier-written)
- *   bets:<tableId>:<playerId> → { round, held: RouletteBet[], inc } (owner-
- *                                        written; craps: { kind, held, inc },
- *                                        pruned by the stickman; see STAKES ON
+ *   bets:<tableId>:<playerId> → { round, held: RouletteBet[], inc, taken? }
+ *                                        (owner-written; craps: { kind, held,
+ *                                        inc, base, taken? }; see STAKES ON
  *                                        THE FELT)
+ *   kept:<tableId>:<playerId> → { round, kept: CrapsBet[], inc, of? } what a
+ *                                        craps settle left up (stickman-written)
  *   gone:<tableId>:<inc>      → 1        that incarnation of the table was
  *                                        removed (clearTableKeys)
  *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
@@ -65,10 +67,19 @@
  * hands its chips back with no credit at all: the list stops holding them.
  * The bet list is one whole value per player, and so is what it holds: two
  * tabs of one player placing at once keep one list and its chips, a
- * take-down and a removal at once hand them back once. A list an earlier
- * build put down (under `bets`, chips taken already) plays as it did: paid
- * in full by the settle, refunded on removal, and handed back to its player
- * when this build rewrites it.
+ * take-down and a removal at once hand them back once. Only the player
+ * writes their list: what a craps roll leaves up the stickman writes as
+ * `kept`, which plays until the player writes a list after that roll, so a
+ * list written before the roll settled never brings back bets it resolved
+ * (crapsFelt). A list goes down only on a table that is up.
+ *
+ * A list an earlier build put down (under `bets`) took its chips as it went
+ * down. What it took rides with it as `taken`, through the player's rewrites
+ * too: the list holds only the rest (FeltStake `net`, below 0 when the
+ * player took more down than it took), the settle pays its wins in full, and
+ * a removal refunds what it took, in the table's outcome record. Nothing is
+ * handed back on a rewrite, so two tabs, or a tab and a removal, can't hand
+ * it back twice.
  *
  * A write at the very moment of a removal (a settle, a bet) outlives the
  * removal's delete, as a concurrent write does in the doc. So the removal
@@ -90,9 +101,11 @@
  */
 
 import * as Y from 'yjs';
+import { sha256 } from '@noble/hashes/sha256';
+import { bytesToHex } from '@noble/hashes/utils';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
-import { isCrapsBet, isCrapsTableState, isTableIncField, MAX_BETS_PER_PLAYER } from './games/craps';
+import { isCrapsBet, isCrapsTableState, isTableIncField, MAX_BET_AMOUNT, MAX_BETS_PER_PLAYER } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import {
   isSlotMachineState, isSlotOddsConfig, isSlotPlayRequest, isSlotReveal,
@@ -580,10 +593,11 @@ function goneKey(tableId: string, inc: string): string {
 }
 
 /** A state of an incarnation the table's removal has ended (written at the
- *  moment of the removal, it outlived the delete). A state with no
- *  incarnation, an earlier build's, is never marked. */
+ *  moment of the removal, it outlived the delete). A state an earlier build
+ *  wrote has no incarnation: its removal marks `gone:<tableId>:`, and a table
+ *  put back after it starts an incarnation of its own (openBetting). */
 function removed(map: Y.Map<unknown>, tableId: string, s: RouletteTableState | CrapsTableState): boolean {
-  return s.inc !== undefined && map.has(goneKey(tableId, s.inc));
+  return map.has(goneKey(tableId, s.inc ?? ''));
 }
 
 /** Croupier-only in practice (the UI gates on the house predicate). */
@@ -606,9 +620,7 @@ export function clearTableKeys(tableId: string): void {
   const betPrefix = `bets:${tableId}:`;
   boundDoc!.transact(() => {
     const was = map.get(`table:${tableId}`);
-    if ((isRouletteTableState(was) || isCrapsTableState(was)) && was.inc !== undefined) {
-      map.set(goneKey(tableId, was.inc), 1);
-    }
+    if (isRouletteTableState(was) || isCrapsTableState(was)) map.set(goneKey(tableId, was.inc ?? ''), 1);
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
     // 🎲 The per-table config keys ride the same map — a removed table must
@@ -619,8 +631,10 @@ export function clearTableKeys(tableId: string): void {
     map.delete(`throw:${tableId}`);
     const seatPrefix = `seat:${tableId}:`;
     const seedPrefix = `fseed:${tableId}:`;
+    const keptPrefix = `kept:${tableId}:`;
     for (const key of [...map.keys()]) {
-      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix) || key.startsWith(seedPrefix)) map.delete(key);
+      if (key.startsWith(betPrefix) || key.startsWith(keptPrefix) || key.startsWith(seatPrefix)
+        || key.startsWith(seedPrefix)) map.delete(key);
     }
     heldDirty = true;
   });
@@ -682,45 +696,116 @@ export function writeTableOperatorLease(lease: TableOperatorLease): void {
   });
 }
 
-/** A stored roulette list, either shape: its round, its bets, and whether its
- *  chips are held on the felt (this build) or were taken (an earlier one's).
- *  Null too for a list put down on another incarnation of the table than
- *  `inc`, the live one's (none: no table up). */
-function rouletteList(value: unknown, inc: string | undefined): { round: number; bets: RouletteBet[]; held: boolean } | null {
+/** One player's bets on a table as they play, and the chips of them already
+ *  taken from the player (`taken`: an earlier build's list took its chips as
+ *  it went down, and a list rewritten from one carries what it took). The
+ *  rest, `net`, is held on the felt: off the player's chips until the round
+ *  settles (see STAKES ON THE FELT). `net` is below 0 when a rewrite left
+ *  fewer bets than were taken: the difference is back with the player. */
+export interface FeltStake {
+  net: number;
+  taken: number;
+}
+
+const NO_STAKE: FeltStake = { net: 0, taken: 0 };
+
+/** Most chips one list can take or hold (bets × the largest stake). */
+const MAX_LIST_STAKE = MAX_BETS_PER_PLAYER * MAX_BET_AMOUNT;
+
+/** A stored list's bets and what of them was taken, either shape: this
+ *  build's `held` (with `taken` when rewritten from an earlier build's list,
+ *  and craps' `base`), or an earlier build's `bets`, all taken. Null for junk,
+ *  or a list put down on another incarnation of the table than `inc`. */
+function storedList<B extends { amount: number }>(
+  value: unknown, isBet: (b: unknown) => boolean, at: Incarnation,
+): { bets: B[]; taken: number; legacy: boolean; base?: number } | null {
   if (typeof value !== 'object' || value === null) return null;
-  const t = value as { round?: unknown; held?: unknown; bets?: unknown; inc?: unknown };
-  if (!Number.isInteger(t.round) || (t.round as number) < 1) return null;
+  const t = value as { held?: unknown; bets?: unknown; inc?: unknown; taken?: unknown; base?: unknown };
   const held = t.held !== undefined;
   const list = held ? t.held : t.bets;
   if (held && t.bets !== undefined) return null;
-  if (!Array.isArray(list) || list.length > MAX_BETS_PER_PLAYER || !list.every(isRouletteBet)) return null;
-  if (!ofIncarnation(t, held, inc)) return null;
-  return { round: t.round as number, bets: list as RouletteBet[], held };
+  if (!Array.isArray(list) || list.length > MAX_BETS_PER_PLAYER || !list.every(isBet)) return null;
+  if (!ofIncarnation(t, held, at)) return null;
+  const bets = list as B[];
+  if (!held) return { bets, taken: bets.reduce((n, b) => n + b.amount, 0), legacy: true };
+  if (t.taken !== undefined && !(Number.isSafeInteger(t.taken) && (t.taken as number) > 0 && (t.taken as number) <= MAX_LIST_STAKE)) {
+    return null;
+  }
+  if (t.base !== undefined && !(Number.isSafeInteger(t.base) && (t.base as number) >= 0)) return null;
+  return {
+    bets, taken: (t.taken as number | undefined) ?? 0, legacy: false,
+    ...(t.base !== undefined ? { base: t.base as number } : {}),
+  };
 }
 
-/** Whether a stored list was put down on incarnation `inc` of its table. A
+/** The incarnation of a table its lists must carry to play there: the live
+ *  state's (none: no table up), and whether lists carrying none still belong
+ *  (`bare`: until a table with no incarnation, an earlier build's, has been
+ *  removed under this id). */
+interface Incarnation {
+  inc: string | undefined;
+  bare: boolean;
+}
+
+function incarnationOf(map: Y.Map<unknown>, tableId: string, s: { inc?: string } | null): Incarnation {
+  return { inc: s?.inc, bare: !map.has(goneKey(tableId, '')) };
+}
+
+/** Whether a stored list was put down on the incarnation `at` of its table. A
  *  held list put down on a table that had one carries it; an earlier build's
  *  list, or one from before its table had one, carries none and goes with
- *  whichever is up. */
-function ofIncarnation(t: { inc?: unknown }, held: boolean, inc: string | undefined): boolean {
-  if (t.inc === undefined) return true;
-  return held && isTableIncField(t.inc) && t.inc === inc;
+ *  whichever is up, unless such a table was removed here. */
+function ofIncarnation(t: { inc?: unknown }, held: boolean, at: Incarnation): boolean {
+  if (t.inc === undefined) return at.bare;
+  return held && isTableIncField(t.inc) && t.inc === at.inc;
+}
+
+const stakeOf = (l: { bets: readonly { amount: number }[]; taken: number }): FeltStake => ({
+  net: l.bets.reduce((n, b) => n + b.amount, 0) - l.taken,
+  taken: l.taken,
+});
+
+/** A stored roulette list for its round (see storedList). */
+function rouletteList(value: unknown, at: Incarnation): { round: number; bets: RouletteBet[]; taken: number } | null {
+  const round = (value as { round?: unknown } | null)?.round;
+  if (!Number.isInteger(round) || (round as number) < 1) return null;
+  const list = storedList<RouletteBet>(value, isRouletteBet, at);
+  if (!list || list.base !== undefined) return null;
+  return { round: round as number, bets: list.bets, taken: list.taken };
+}
+
+/** A roulette list that plays the table's current round: that round's, before
+ *  it settles. */
+function liveRouletteList(
+  map: Y.Map<unknown>, tableId: string, playerId: string, s: RouletteTableState | null,
+): { bets: RouletteBet[]; taken: number } | null {
+  if (!s || s.phase === 'settled') return null;
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, s));
+  return list && list.round === s.round ? list : null;
 }
 
 export function readMyBets(tableId: string, playerId: string, round: number): RouletteBet[] {
-  const list = rouletteList(ensureMap().get(`bets:${tableId}:${playerId}`), readTableState(tableId)?.inc);
+  const map = ensureMap();
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, readTableState(tableId)));
   return list && list.round === round ? list.bets : [];
 }
 
 /** The bettor's own write of their list for `round`, its chips held on the
- *  felt. A live list an earlier build put down (its chips already taken) is
- *  handed back in the same transaction, so its chips are held, not taken twice. */
+ *  felt. What an earlier build's list (or one rewritten from it) took goes on
+ *  with the rewrite, so nothing is handed back twice. Only while the table
+ *  is up: a list on no table would hold nothing. */
 export function writeMyBets(tableId: string, playerId: string, round: number, bets: RouletteBet[]): void {
   const map = ensureMap();
-  const inc = readTableState(tableId)?.inc;
+  const s = readTableState(tableId);
+  if (!s) return;
+  const was = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, s));
+  const taken = was && was.round === round ? was.taken : 0;
   boundDoc!.transact(() => {
-    returnTakenStake(map, tableId, playerId);
-    map.set(`bets:${tableId}:${playerId}`, inc === undefined ? { round, held: bets } : { round, held: bets, inc });
+    map.set(`bets:${tableId}:${playerId}`, {
+      round, held: bets,
+      ...(s.inc !== undefined ? { inc: s.inc } : {}),
+      ...(taken > 0 ? { taken } : {}),
+    });
     heldDirty = true;
   });
 }
@@ -730,30 +815,56 @@ export function writeMyBets(tableId: string, playerId: string, round: number, be
 export function readAllBets(tableId: string, round: number): Record<string, RouletteBet[]> {
   const prefix = `bets:${tableId}:`;
   const out: Record<string, RouletteBet[]> = {};
-  const inc = readTableState(tableId)?.inc;
-  for (const [key, value] of ensureMap().entries()) {
+  const map = ensureMap();
+  const at = incarnationOf(map, tableId, readTableState(tableId));
+  for (const [key, value] of map.entries()) {
     if (!key.startsWith(prefix)) continue;
-    const list = rouletteList(value, inc);
+    const list = rouletteList(value, at);
     if (!list || list.round !== round || list.bets.length === 0) continue;
     out[key.slice(prefix.length)] = list.bets;
   }
   return out;
 }
 
-/** Whether a player's list on a table holds its chips on the felt (this
- *  build's), rather than having had them taken when it went down (an earlier
- *  build's): the settle and the removal pay the two differently. */
-export function betsHeld(tableId: string, playerId: string): boolean {
-  const value = ensureMap().get(`bets:${tableId}:${playerId}`);
-  const inc = (readTableState(tableId) ?? readCrapsTableState(tableId))?.inc;
-  return (rouletteList(value, inc) ?? crapsList(value, inc))?.held ?? false;
+/** What a player's list on a table holds on the felt and what of it was
+ *  taken already, as it plays now (NO_STAKE when it doesn't): the settle
+ *  charges the one and the removal refunds the other. */
+export function feltStake(tableId: string, playerId: string): FeltStake {
+  const map = ensureMap();
+  const roulette = readTableState(tableId);
+  if (roulette) {
+    const list = liveRouletteList(map, tableId, playerId, roulette);
+    return list ? stakeOf(list) : NO_STAKE;
+  }
+  const craps = readCrapsTableState(tableId);
+  const list = craps ? crapsFelt(map, tableId, playerId, craps.inc) : null;
+  return list ? stakeOf(list) : NO_STAKE;
+}
+
+/** feltStake for every player with a list on the table (empty ones too: a
+ *  list emptied by a rewrite can still carry what it took). */
+export function readFeltStakes(tableId: string): Record<string, FeltStake> {
+  const map = ensureMap();
+  const out: Record<string, FeltStake> = {};
+  for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
+    for (const key of map.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const pid = key.slice(prefix.length);
+      if (out[pid]) continue;
+      const stake = feltStake(tableId, pid);
+      if (stake.net !== 0 || stake.taken !== 0) out[pid] = stake;
+    }
+  }
+  return out;
 }
 
 // ── 🎲 Craps table state + bets (#69 G3) ─────────────────────────────────────
 // Same casino-map keys as roulette (`table:<id>`, `bets:<id>:<pid>`) — a given
 // table is one game, so the shapes never collide, and clearTableKeys /
 // creditChips / the croupier heartbeat are already game-agnostic. Craps bets are
-// NOT round-stamped: they carry across rolls until the stickman prunes them.
+// NOT round-stamped: they carry across rolls. The player writes `bets:`; at
+// each settle the stickman writes what stays up as `kept:<id>:<pid>`, so the
+// two never write one key (see crapsFelt).
 
 export function readCrapsTableState(tableId: string): CrapsTableState | null {
   const map = ensureMap();
@@ -770,48 +881,88 @@ export function writeCrapsTableState(tableId: string, state: CrapsTableState): v
   });
 }
 
-/** A stored craps list, either shape (see rouletteList). */
-function crapsList(value: unknown, inc: string | undefined): { bets: CrapsBet[]; held: boolean } | null {
+/** A player's own stored craps list (see storedList). */
+function crapsOwnList(value: unknown, at: Incarnation): ReturnType<typeof storedList<CrapsBet>> {
+  if ((value as { kind?: unknown } | null)?.kind !== 'craps') return null;
+  return storedList<CrapsBet>(value, isCrapsBet, at);
+}
+
+/** What the stickman's settle of `round` left up of a player's list, and the
+ *  earlier build's list it settled, if it was one (`of`, its fingerprint). */
+function keptList(value: unknown, at: Incarnation): { round: number; bets: CrapsBet[]; of?: string } | null {
   if (typeof value !== 'object' || value === null) return null;
-  const t = value as { kind?: unknown; held?: unknown; bets?: unknown; inc?: unknown };
-  if (t.kind !== 'craps') return null;
-  const held = t.held !== undefined;
-  const list = held ? t.held : t.bets;
-  if (held && t.bets !== undefined) return null;
-  if (!Array.isArray(list) || list.length > MAX_BETS_PER_PLAYER || !list.every(isCrapsBet)) return null;
-  if (!ofIncarnation(t, held, inc)) return null;
-  return { bets: list as CrapsBet[], held };
+  const t = value as { round?: unknown; kept?: unknown; inc?: unknown; of?: unknown };
+  if (!Number.isSafeInteger(t.round) || (t.round as number) < 1) return null;
+  if (!Array.isArray(t.kept) || t.kept.length > MAX_BETS_PER_PLAYER || !t.kept.every(isCrapsBet)) return null;
+  if (t.inc === undefined ? !at.bare : t.inc !== at.inc) return null;
+  if (t.of !== undefined && (typeof t.of !== 'string' || t.of.length !== 64)) return null;
+  return { round: t.round as number, bets: t.kept as CrapsBet[], ...(typeof t.of === 'string' ? { of: t.of } : {}) };
+}
+
+/** An earlier build's list, hashed: how a settle names the one it took over. */
+function legacyFingerprint(bets: readonly CrapsBet[]): string {
+  return bytesToHex(sha256(new TextEncoder().encode(`ssf-legacy-craps-v1|${JSON.stringify(bets)}`)));
+}
+
+/** 🎲 A player's craps bets as they play, of the two keys: their own list,
+ *  unless the stickman has settled a roll since they wrote it, when what that
+ *  settle left up (`kept`) plays instead. A list counts as written after the
+ *  settle of roll `base - 1` (writeMyCrapsBets); an earlier build's list,
+ *  which has no `base`, plays unless it is the very one a settle took over.
+ *  So a list written before a roll settled (a take-down that crossed the
+ *  dice) never brings back bets the roll resolved: the edit is dropped, the
+ *  felt stays as the roll left it. Kept bets were taken nothing. */
+function crapsFelt(
+  map: Y.Map<unknown>, tableId: string, playerId: string, inc: string | undefined,
+): { bets: CrapsBet[]; taken: number } | null {
+  const at = incarnationOf(map, tableId, { inc });
+  const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), at);
+  const kept = keptList(map.get(`kept:${tableId}:${playerId}`), at);
+  if (!kept) return own;
+  const keep = { bets: kept.bets, taken: 0 };
+  if (!own) return keep;
+  if (!own.legacy) return own.base !== undefined && own.base > kept.round ? own : keep;
+  return kept.of === legacyFingerprint(own.bets) ? keep : own;
 }
 
 export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
-  return crapsList(ensureMap().get(`bets:${tableId}:${playerId}`), readCrapsTableState(tableId)?.inc)?.bets ?? [];
+  return crapsFelt(ensureMap(), tableId, playerId, readCrapsTableState(tableId)?.inc)?.bets ?? [];
 }
 
-/** The bettor's own write of their craps list, its chips held on the felt
- *  (an earlier build's list is handed back first, as for writeMyBets). */
+/** The bettor's own write of their craps list, its chips held on the felt.
+ *  `base` is the roll it is for (the next one once a roll has settled), and
+ *  what an earlier build's list took goes on with it, as for writeMyBets.
+ *  Only while the table is up. */
 export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsBet[]): void {
   const map = ensureMap();
-  const inc = readCrapsTableState(tableId)?.inc;
+  const s = readCrapsTableState(tableId);
+  if (!s) return;
+  const taken = crapsFelt(map, tableId, playerId, s.inc)?.taken ?? 0;
+  const base = s.phase === 'settled' ? s.round + 1 : s.round;
   boundDoc!.transact(() => {
-    returnTakenStake(map, tableId, playerId);
-    map.set(`bets:${tableId}:${playerId}`, inc === undefined ? { kind: 'craps', held: bets } : { kind: 'craps', held: bets, inc });
+    map.set(`bets:${tableId}:${playerId}`, {
+      kind: 'craps', held: bets, base,
+      ...(s.inc !== undefined ? { inc: s.inc } : {}),
+      ...(taken > 0 ? { taken } : {}),
+    });
     heldDirty = true;
   });
 }
 
-/** The stickman's rewrite of a player's craps list at a settle (the bets that
- *  stay up): the list keeps its kind, held or an earlier build's, and its
- *  incarnation. */
-export function pruneCrapsBets(tableId: string, playerId: string, bets: CrapsBet[]): void {
+/** The stickman's record, at the settle of `round`, of a player's bets that
+ *  stay up (none: the roll resolved them all). Never the player's own key.
+ *  Their chips are held as kept (taken nothing: the settle paid what an
+ *  earlier build's list took). */
+export function pruneCrapsBets(tableId: string, playerId: string, round: number, bets: CrapsBet[]): void {
   const map = ensureMap();
-  const key = `bets:${tableId}:${playerId}`;
-  const value = map.get(key);
-  const held = crapsList(value, readCrapsTableState(tableId)?.inc)?.held ?? true;
-  const inc = (value as { inc?: unknown } | undefined)?.inc;
-  const next: CrapsTableBets = !held ? { kind: 'craps', bets }
-    : typeof inc === 'string' ? { kind: 'craps', held: bets, inc } : { kind: 'craps', held: bets };
+  const inc = readCrapsTableState(tableId)?.inc;
+  const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, { inc }));
   boundDoc!.transact(() => {
-    map.set(key, next);
+    map.set(`kept:${tableId}:${playerId}`, {
+      round, kept: bets,
+      ...(inc !== undefined ? { inc } : {}),
+      ...(own?.legacy ? { of: legacyFingerprint(own.bets) } : {}),
+    });
     heldDirty = true;
   });
 }
@@ -819,49 +970,21 @@ export function pruneCrapsBets(tableId: string, playerId: string, bets: CrapsBet
 /** Every player's standing craps bets on one table (the stickman's settle read;
  *  also drives the "on the felt" spectator view). Empty lists are omitted. */
 export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
-  const prefix = `bets:${tableId}:`;
+  const map = ensureMap();
   const out: Record<string, CrapsBet[]> = {};
   const inc = readCrapsTableState(tableId)?.inc;
-  for (const [key, value] of ensureMap().entries()) {
-    if (!key.startsWith(prefix)) continue;
-    const list = crapsList(value, inc);
-    if (!list || list.bets.length === 0) continue;
-    out[key.slice(prefix.length)] = list.bets;
+  const pids = new Set<string>();
+  for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
+    for (const key of map.keys()) if (key.startsWith(prefix)) pids.add(key.slice(prefix.length));
+  }
+  for (const pid of pids) {
+    const list = crapsFelt(map, tableId, pid, inc);
+    if (list && list.bets.length > 0) out[pid] = list.bets;
   }
   return out;
 }
 
 // ── 🪙 Stakes on the felt (see STAKES ON THE FELT above) ─────────────────────
-
-/** Chips a stored list holds on the felt of table state `s`: a held roulette
- *  list of the current round before it settles, any held craps list. */
-function heldOn(s: RouletteTableState | CrapsTableState, value: unknown): bigint {
-  const list = s.kind === 'craps' ? crapsList(value, s.inc) : rouletteList(value, s.inc);
-  if (!list?.held) return 0n;
-  if (s.kind === 'roulette') {
-    const r = list as { round: number };
-    if (r.round !== s.round || s.phase === 'settled') return 0n;
-  }
-  return list.bets.reduce((n, b) => n + BigInt(b.amount), 0n);
-}
-
-/** Chips a list an earlier build put down took and hasn't paid back yet: a
- *  live roulette list (as heldOn), any craps list. */
-function takenOn(s: RouletteTableState | CrapsTableState | null, value: unknown): number {
-  if (!s) return 0;
-  const list = s.kind === 'roulette' ? rouletteList(value, s.inc) : crapsList(value, s.inc);
-  if (!list || list.held) return 0;
-  if (s.kind === 'roulette' && ((list as { round: number }).round !== s.round || s.phase === 'settled')) return 0;
-  return list.bets.reduce((n, b) => n + b.amount, 0);
-}
-
-/** An earlier build's live list, about to be rewritten by its own player:
- *  the chips it took go back to them, so the rewrite can hold them instead. */
-function returnTakenStake(map: Y.Map<unknown>, tableId: string, playerId: string): void {
-  const s = readTableState(tableId) ?? readCrapsTableState(tableId);
-  const taken = takenOn(s, map.get(`bets:${tableId}:${playerId}`));
-  if (taken > 0) addChips(playerId, taken);
-}
 
 /** Chips each player has held on felts, summed from the lists themselves. */
 let heldStakes = new Map<string, bigint>();
@@ -883,9 +1006,11 @@ function countHeldStakes(map: Y.Map<unknown>): Map<string, bigint> {
   }
   const out = new Map<string, bigint>();
   if (tables.size === 0) return out;
-  for (const [key, value] of map.entries()) {
-    if (!key.startsWith('bets:')) continue;
-    const rest = key.slice('bets:'.length);
+  const seen = new Set<string>();
+  for (const key of map.keys()) {
+    const prefix = key.startsWith('bets:') ? 'bets:' : key.startsWith('kept:') ? 'kept:' : null;
+    if (prefix === null) continue;
+    const rest = key.slice(prefix.length);
     // The table whose id the key carries (the longest that fits, should one
     // id begin with another's).
     let tableId: string | null = null;
@@ -893,10 +1018,15 @@ function countHeldStakes(map: Y.Map<unknown>): Map<string, bigint> {
       if (rest.startsWith(`${id}:`) && (tableId === null || id.length > tableId.length)) tableId = id;
     }
     if (tableId === null) continue;
-    const held = heldOn(tables.get(tableId)!, value);
-    if (held === 0n) continue;
     const pid = rest.slice(tableId.length + 1);
-    out.set(pid, (out.get(pid) ?? 0n) + held);
+    // A craps player's two keys make one felt: count it once.
+    if (seen.has(`${tableId}:${pid}`)) continue;
+    seen.add(`${tableId}:${pid}`);
+    const s = tables.get(tableId)!;
+    const list = s.kind === 'craps' ? crapsFelt(map, tableId, pid, s.inc) : liveRouletteList(map, tableId, pid, s);
+    if (!list) continue;
+    const net = stakeOf(list).net;
+    if (net !== 0) out.set(pid, (out.get(pid) ?? 0n) + BigInt(net));
   }
   return out;
 }
@@ -920,7 +1050,7 @@ function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
     if (casinoMap !== map) return; // a binding we've moved off
     const keys = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
     const counts = (k: string | null): boolean =>
-      k !== null && (k.startsWith('table:') || k.startsWith('bets:') || k.startsWith('gone:'));
+      k !== null && (k.startsWith('table:') || k.startsWith('bets:') || k.startsWith('kept:') || k.startsWith('gone:'));
     if (!keys || ![...keys].some(counts)) return;
     const fresh = countHeldStakes(map);
     for (const pid of new Set([...fresh.keys(), ...heldHeard.keys()])) {

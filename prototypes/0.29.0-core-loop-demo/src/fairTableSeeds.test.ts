@@ -286,6 +286,22 @@ describe('a Fair roulette round', () => {
     expect(s.payouts?.[BOB]).toBeUndefined();
   });
 
+  it('a bet emptied after "no more bets" still loses what it held then', async () => {
+    const t = freshTable();
+    rouletteToClosing(t);
+    playersLook(t, 'roulette'); // both reveal: the pocket is computable now
+    expect(readChips(BOB)).toBe(90);
+    writeMyBets(t, BOB, 1, []); // Bob takes his black down after the close
+    expect(readChips(BOB)).toBe(100);
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(readChips(BOB)).toBe(90);
+  });
+
   it("rewriting the closing state's wager hash too doesn't get a rewritten bet paid", async () => {
     const t = freshTable();
     rouletteToClosing(t);
@@ -920,11 +936,11 @@ describe('a Fair craps roll', () => {
     expect(s.fairness?.parties).toEqual(['house', AMY]);
   });
 
-  it("the house's first ROLL on a fresh Fair table with bets down only opens the window", () => {
+  it("the house's first ROLL on a fresh Fair table only opens the window", () => {
     const t = freshTable();
-    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
     expect(pressManualRoll(t)).toMatch(/PRESS AGAIN/);
     expect(readCrapsTableState(t)?.phase).toBe('betting');
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
     playersLook(t, 'craps', [AMY]);
     expect(pressManualRoll(t)).toBeNull();
     const s = readCrapsTableState(t)!;
@@ -951,6 +967,28 @@ describe('a Fair craps roll', () => {
     const s = readCrapsTableState(t)!;
     expect(s.phase).toBe('settled');
     expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(readAllCrapsBets(t)[BOB]).toBeUndefined();
+  });
+
+  it('craps charges a frozen bettor whose list was emptied after the close what it held then', async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    writeMyCrapsBets(t, BOB, [{ type: 'field', amount: 5 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps');
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps');
+    writeMyCrapsBets(t, BOB, []);
+    expect(readChips(BOB)).toBe(100);
+    later(CRAPS_CLOSING_MS);
+    tickAutoStickman(t);
+    await flush();
+    const s = readCrapsTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.payouts?.[BOB]).toBeUndefined();
+    expect(readChips(BOB)).toBe(95);
     expect(readAllCrapsBets(t)[BOB]).toBeUndefined();
   });
 
