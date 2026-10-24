@@ -5,14 +5,14 @@
  * scheduled programme parks at 0 and starts at T0; a paused one holds.
  */
 import { describe, expect, it } from 'vitest';
-import { lapRemountIsFree, replayNeedsRemount, TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync';
+import { lapRemountIsFree, loopPosition, replayNeedsRemount, TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync';
 import { forgetMountBudget, mayMountNow, TV_MOUNT_BUDGET } from './tvConsent';
 import type { TvPlayer } from './tvSync';
 import { TV_HEARTBEAT_MS, TV_NUDGE_RATE } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, markTvPageAwake, pickUpRemote, readTv, setTvClock, setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay,
+  bindTvDoc, markTvPageAwake, pickUpRemote, readTv, setTvClock, setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvNoteEnd, tvPlay,
   tvSetLoop,
 } from './tvDoc';
 
@@ -73,7 +73,7 @@ class FakePlayer implements TvPlayer {
 }
 
 /** `opts.hold` is read on every tick: a test flips it to hand the remote over. */
-function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded?: () => void } = {}) {
+function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded?: () => void; loopEnd?: number } = {}) {
   let now = 100_000;
   let pb: PlaybackNow = { state: 'playing', positionMs: 0, running: true, countdownMs: 0 };
   let jump = 0;
@@ -91,6 +91,7 @@ function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded
     heartbeat: (p) => beats.push(p),
     volume: () => 55,
     onEnded: opts.onEnded,
+    loopEnd: () => opts.loopEnd ?? 0,
   });
   return {
     c, beats,
@@ -1309,6 +1310,7 @@ describe('🔁 LOOP, through the record', () => {
     pickUpRemote('tv-1');
     tvPlay('tv-1', { kind: 'url', url: 'https://example.org/blip.mp4' });
     tvSetLoop('tv-1', true);
+    tvNoteEnd('tv-1', 300); // the holder's player said where it ends (tvSession files it)
     const holderP = new FakePlayer(true);
     const viewerP = new FakePlayer(true);
     holderP.duration = viewerP.duration = 300;
@@ -1333,6 +1335,34 @@ describe('🔁 LOOP, through the record', () => {
     }
     expect(readTv('tv-1').started).toBeGreaterThan(10); // the holder laps on
     expect(viewerPlayed).toBeGreaterThan(10); // and the viewer keeps playing along, not held at the end
+  });
+
+  it('a viewer at the end of a LOOP film waits for the lap: a holder stalled just before the end runs the record past it, and that is no lap', () => {
+    const p = new FakePlayer(true);
+    p.duration = 10_000;
+    const h = harness(p, { loopEnd: 10_000 });
+    h.set({ positionMs: 9_900 });
+    h.tick();
+    p.seek(10_000); // ran out
+    p.playing = false;
+    p.log.length = 0;
+    h.set({ positionMs: 10_300 }); // the holder buffers at 9.9 s; its sample runs on past the end
+    h.tick(400);
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    expect(p.ended).toBe(true);
+    h.replay({ positionMs: 10_300 }); // the lap, landing late: the room is 300 ms into it
+    h.tick(0);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:300']);
+    expect(p.playing).toBe(true);
+  });
+
+  it('a lap\'s position comes from the media end the record carries, never from what this player can seek to', () => {
+    expect(loopPosition(15_000, 60_000)).toBe(15_000); // a 60 s film, whatever prefix a host without ranges lets this player seek in
+    expect(loopPosition(65_000, 60_000)).toBe(5_000);
+    expect(loopPosition(60_000, 60_000)).toBe(0);
+    expect(loopPosition(15_000, 0)).toBe(15_000); // no end known, or LOOP off: as it reads
+    expect(loopPosition(15_000, NaN)).toBe(15_000);
   });
 
   it('a player that ran out and cannot seek back is rebuilt for a new start; one that can seek, or has not run out, or is for this start, is kept', () => {

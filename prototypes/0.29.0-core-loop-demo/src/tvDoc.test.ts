@@ -1078,6 +1078,19 @@ describe('🔁 LOOP', () => {
     expect(readProgramme(TV).laps).toBe(0);
   });
 
+  it('a lap that wraps one counter past its ceiling and not the other is still no action', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, CLIP);
+    tvSetLoop(TV, true);
+    doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), jump: TV_COUNTER_MAX, laps: 0 });
+    const revision = tvRevision(TV);
+    tvProgrammeEnded(TV);
+    expect(readTv(TV)).toMatchObject({ jump: 0, laps: 1 });
+    expect(tvRevision(TV)).toBe(revision);
+    tvProgrammeEnded(TV);
+    expect(tvRevision(TV)).toBe(revision);
+  });
+
   it('at the end starts the same programme over from the top, the end kept and the history and library left alone; without it, home', () => {
     pickUpRemote(TV);
     tvPlay(TV, CLIP);

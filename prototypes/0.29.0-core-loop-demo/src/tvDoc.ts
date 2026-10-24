@@ -788,7 +788,10 @@ export function readTv(itemId: string): TvRecord {
  *  upload runs is the film that upload is to replace. */
 export function tvRevision(itemId: string): string {
   const rec = readProgramme(itemId);
-  return `${rec.jump - rec.laps}:${readPower(itemId).seq}`;
+  // Modulo the counters' range (0…TV_COUNTER_MAX): each wraps on its own
+  // (bump), and a lap that wraps one and not the other is still no action.
+  const d = rec.jump - rec.laps;
+  return `${d < 0 ? d + TV_COUNTER_MAX + 1 : d}:${readPower(itemId).seq}`;
 }
 
 export function readRemote(itemId: string): RemoteRecord {

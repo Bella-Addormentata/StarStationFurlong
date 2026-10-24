@@ -81,16 +81,18 @@ function reachable(ms: number, p: TvPlayer): number {
   return Math.min(Math.max(ms, range.startMs), range.endMs);
 }
 
-/** Where a LOOP programme's room is in a file of this player's: a record
- *  past the end is that far into a later lap (the holder starts one over
- *  each time the file ends). A viewer that learns of a lap only once the
- *  room has run past the file's end — a clip shorter than its tick and
- *  the lap's delivery — joins the lap there, instead of waiting at the end
- *  for a replay the record will never name. Anything else is as it reads. */
-export function loopPosition(ms: number, p: TvPlayer, loop: boolean): number {
-  const range = p.seekableRange();
-  if (!loop || !range || range.startMs !== 0 || !(range.endMs > 0) || ms < range.endMs) return ms;
-  return ms % range.endMs;
+/** Where a LOOP lap's room is: a record past the media's end (`lapMs`,
+ *  the end the record carries — tvDoc `endMs` — with LOOP on, else 0) is
+ *  that far into the lap. A viewer that learns of a lap only once the room
+ *  has run past the end — a clip shorter than its tick and the lap's
+ *  delivery — joins the lap there, instead of waiting at the end for a
+ *  replay the record will never name. The media's end as the holder's
+ *  player knew it, never what this player can seek to (a prefix of a file
+ *  on a host without ranges, a live window). Unknown, or LOOP off: as it
+ *  reads. */
+export function loopPosition(ms: number, lapMs: number): number {
+  if (!(lapMs > 0) || !(ms >= lapMs)) return ms;
+  return ms % lapMs;
 }
 
 export interface TvSyncDeps {
@@ -113,8 +115,9 @@ export interface TvSyncDeps {
    *  tvProgrammeEnded — from the top again with LOOP on, else back to the
    *  home screen, the film kept in history. */
   onEnded?: () => void;
-  /** The record's LOOP (tvDoc `loop`). */
-  loop?: () => boolean;
+  /** A LOOP lap's length: the media's end the record carries (tvDoc
+   *  `endMs`) with LOOP on, else 0. */
+  loopEnd?: () => number;
   /** The holder's player followed a LOOP lap in the tick it ended into it
    *  (followLap): it is in the lap now, the same media from the top. The
    *  theatre names the lap in its player-of-record registration at once,
@@ -171,7 +174,7 @@ export class TvSyncController {
   private readonly heartbeat: (positionMs: number) => void;
   private readonly volume: () => number;
   private readonly onEnded: () => void;
-  private readonly loop: () => boolean;
+  private readonly loopEnd: () => number;
   private endedHandled = false;
   private lastBeatAt = -Infinity;
   private lastSeekAt = -Infinity;
@@ -242,7 +245,10 @@ export class TvSyncController {
     this.heartbeat = deps.heartbeat ?? ((p) => { tvHeartbeat(deps.itemId, p); });
     this.volume = deps.volume ?? (() => readTv(deps.itemId).volume);
     this.onEnded = deps.onEnded ?? (() => { tvProgrammeEnded(deps.itemId); });
-    this.loop = deps.loop ?? (() => readTv(deps.itemId).loop);
+    this.loopEnd = deps.loopEnd ?? (() => {
+      const rec = readTv(deps.itemId);
+      return rec.loop ? rec.endMs : 0;
+    });
   }
 
   /** The lead for this page: half the round trip to its own node for a
@@ -647,10 +653,13 @@ export class TvSyncController {
       // lands, and a seek and a play() every tick meanwhile would only
       // interrupt its buffering. Otherwise hold until the record moves on
       // (the holder ends the programme).
-      // With LOOP on, a room past the file's end is in a later lap.
-      const at = loopPosition(pb.positionMs, p, this.loop());
+      // With LOOP on, a room past the media's end is that far into a lap —
+      // one this viewer has seen start (a replay owed): never a holder
+      // merely stalled before the end, whose record runs on past it.
+      if (newProgramme) this.replayDue = jump;
+      const at = this.replayDue !== null ? loopPosition(pb.positionMs, this.loopEnd()) : pb.positionMs;
       const before = at < p.currentMs();
-      if ((transport && before) || newProgramme) this.replayDue = jump;
+      if (transport && before) this.replayDue = jump;
       const far = at < p.currentMs() - TV_SEEK_OVER_MS;
       const owed = this.replayDue !== null;
       const fresh = owed && this.replayDue !== this.replayIssuedFor;
@@ -684,7 +693,7 @@ export class TvSyncController {
     // as any programme.
     if (newProgramme && (p.canSeek || p.hasClock)) {
       if (!p.canSeek) return pb;
-      p.seek(reachable(loopPosition(pb.positionMs, p, this.loop()), p));
+      p.seek(reachable(loopPosition(pb.positionMs, this.loopEnd()), p));
       this.lastSeekAt = now;
       this.setRate(1);
       this.seenStarted = started;
