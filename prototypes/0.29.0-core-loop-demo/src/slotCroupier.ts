@@ -6,11 +6,12 @@
  * takes the room's `slot-operator` lease, waits OPERATOR_LEASE_SETTLE_MS for
  * the doc to converge, then works while it keeps the lease (renewed every
  * OPERATOR_LEASE_RENEW_MS, lapsing after OPERATOR_LEASE_MS). One operator for
- * the room, not one per machine: a player's `bal:` is a whole value, so two
- * sessions settling that player's spins on two machines at once would each
- * write it, and the merge would keep only one of the two writes (a debit or a
- * payout would vanish). The session operates the machines whose bankroll its
- * player owns:
+ * the room, not one per machine: that dates from when a player's chips were
+ * one whole value, which two sessions settling that player's spins on two
+ * machines at once would each write, the merge keeping only one. Chips are now
+ * records that add up in any order (casinoDoc's CHIP LEDGER); the lease stays
+ * for the machines' own whole values. The session operates the machines whose
+ * bankroll its player owns:
  *   • AUTO: the room's deed holder (canRunCroupier) operates every one.
  *   • BY HAND (a venture room, where nobody runs the croupier): a room owner
  *     starts one from its service panel, and this page operates the machines

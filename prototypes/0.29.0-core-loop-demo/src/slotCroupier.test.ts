@@ -14,6 +14,7 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  creditChips,
   depositSlotFunding,
   hasSlotEscrow,
   LEGACY_SLOT_LEASE_READ_CAP,
@@ -480,8 +481,8 @@ describe('a round on a machine this session no longer operates', () => {
     const map = doc.getMap('casino');
     doc.transact(() => {
       map.delete(`slot-escrow:${M1}`);
-      map.set(`bal:${PLAYER}`, 100);
-      map.set(`bal:${OPERATOR}`, 10_000);
+      creditChips(PLAYER, 100 - readChips(PLAYER));
+      creditChips(OPERATOR, 10_000 - readChips(OPERATOR));
     });
     writeSlotMachineState(M1, { ...readSlotMachineState(M1)!, phase: 'settled', credited: 0 });
     fund(M1, OTHER);
