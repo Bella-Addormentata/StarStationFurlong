@@ -13,30 +13,36 @@ env:
 
 jobs:
   probe:
-    name: 🧲 probe (listen=${{ matrix.listen }}, trackers=${{ matrix.trackers != '' }})
-    runs-on: ubuntu-22.04
+    name: 🧲 probe (${{ matrix.os }}, listen=${{ matrix.listen }}, trackers=${{ matrix.trackers != '' }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        listen: ['0', '1']
-        trackers: ['', 'udp://tracker.opentrackr.org:1337/announce,udp://explodie.org:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.demonii.com:1337/announce']
+        # Run 1 (ubuntu, all four listen/tracker variants) is done; this run
+        # checks the shipped shape on Windows, as the release builds.
+        os: [windows-latest]
+        listen: ['0']
+        trackers: ['']
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
-          key: probe-ubuntu-22.04
+          key: probe-${{ matrix.os }}
       - name: 🔨 build the probe
         run: cargo test --features torrent --no-run --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
       - name: 🐧 control swarm (an Ubuntu ISO's info hash, metadata only)
         run: |
           name=$(curl -fsSL https://releases.ubuntu.com/24.04/ | grep -o 'ubuntu-24\.04[.0-9]*-desktop-amd64\.iso\.torrent' | head -1)
-          curl -fsSL "https://releases.ubuntu.com/24.04/$name" -o /tmp/ubuntu.torrent
-          python3 - <<'PY' >> "$GITHUB_ENV"
+          curl -fsSL "https://releases.ubuntu.com/24.04/$name" -o ubuntu.torrent
+          python - <<'PY' >> "$GITHUB_ENV"
           import hashlib
-          b = open('/tmp/ubuntu.torrent', 'rb').read()
+          b = open('ubuntu.torrent', 'rb').read()
           def end(i):
               c = b[i:i+1]
               if c == b'i': return b.index(b'e', i) + 1
