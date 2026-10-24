@@ -44,7 +44,7 @@ import { escapeHtml } from './htmlEscape';
 import { attachScreenHost, detachScreenHost, setScreenHostShown } from './tvScreenLayer';
 import type { TvScreenHandle } from './devices';
 import {
-  autoFetchOn, autoFetchVerdict, noteAutoFetch, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX,
+  autoFetchOn, autoFetchVerdict, noteAutoFetch, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX, TV_AUTO_FETCH_MIN_CHARGE,
 } from './tvAutoFetch';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
@@ -904,8 +904,9 @@ let blobAskRefused: { hash: string; why: string } | null = null;
 let autoFetching: string | null = null;
 /** Its ask is still out to the node (the transfer's state says nothing yet). */
 let autoFetchAsking = false;
-/** When this page began waiting for WHERE's answer on the file on the set. */
-let autoFetchWhere: { hash: string; since: number } | null = null;
+/** When this page began waiting for WHERE's answer on the file on the set,
+ *  in this room (each room's WHERE is its own, and so is its wait). */
+let autoFetchWhere: { hash: string; epoch: number; since: number } | null = null;
 /** How long AUTO-FETCH waits for WHERE before asking the provider alone. */
 const AUTO_FETCH_WHERE_WAIT_MS = 5_000;
 
@@ -931,7 +932,8 @@ function autoFetch(source: Extract<TvSource, { kind: 'blob' }>, st: BlobState): 
   if (nodeHolders(source.hash) === null) {
     void refreshHolders([source.hash]);
     const now = tvNow();
-    if (autoFetchWhere?.hash !== source.hash) autoFetchWhere = { hash: source.hash, since: now };
+    const epoch = tvDocEpoch();
+    if (autoFetchWhere?.hash !== source.hash || autoFetchWhere.epoch !== epoch) autoFetchWhere = { hash: source.hash, epoch, since: now };
     if (now - autoFetchWhere.since < AUTO_FETCH_WHERE_WAIT_MS) return;
   }
   noteAutoFetch(source.hash, source.size);
@@ -986,7 +988,7 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
     : verdict === 'go' ? 'nothing more is fetched until you press'
     : verdict === 'off' ? 'AUTO-FETCH is off: nothing is fetched until you press'
     : verdict === 'big' ? `it is bigger than the ${formatBytes(TV_AUTO_FETCH_MAX)} AUTO-FETCH takes by itself: nothing is fetched until you press`
-    : verdict === 'day' ? `AUTO-FETCH has taken its ${formatBytes(TV_AUTO_FETCH_DAY)} for today: nothing more is fetched until you press`
+    : verdict === 'day' ? `AUTO-FETCH has used today's ${formatBytes(TV_AUTO_FETCH_DAY)} (each file counts at least ${formatBytes(TV_AUTO_FETCH_MIN_CHARGE)}): nothing more is fetched until you press`
     : 'nothing more is fetched until you press';
   const html = `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
     <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk, kept until your node needs the room (the files used longest ago go first). ${escapeHtml(wait)}</div>

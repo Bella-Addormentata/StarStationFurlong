@@ -10,7 +10,9 @@
  *
  * - **A cap per file**: TV_AUTO_FETCH_MAX. A bigger file keeps FETCH.
  * - **A budget per day**: TV_AUTO_FETCH_DAY over the last 24 h, counted from
- *   what this browser asked for, kept with the switch.
+ *   what this browser asked for, kept with the switch — every ask at least
+ *   TV_AUTO_FETCH_MIN_CHARGE, so tiny files put on one after another (each
+ *   refused, say) buy a bounded number of asks a day, not an endless run.
  * - **One at a time**: the theatre asks for no second file while the last
  *   one it asked for is still on its way (the theatre's own check).
  * - **Once per file per page**: an ask that failed or was refused is not
@@ -25,6 +27,9 @@
 export const TV_AUTO_FETCH_MAX = 2 * 2 ** 30;
 export const TV_AUTO_FETCH_DAY = 8 * 2 ** 30;
 export const TV_AUTO_FETCH_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** What an ask counts against the day at the least: 128 asks a day. */
+export const TV_AUTO_FETCH_MIN_CHARGE = 64 * 2 ** 20;
+const charge = (size: number): number => Math.max(size, TV_AUTO_FETCH_MIN_CHARGE);
 
 const SWITCH_KEY = 'ssf-tv-auto-fetch';
 const SPENT_KEY = 'ssf-tv-auto-fetch-spent';
@@ -106,7 +111,8 @@ function readSpent(now: number): Spend[] {
     }));
 }
 
-/** What this browser has fetched by itself in the last day, in bytes. */
+/** What this browser has fetched by itself in the last day, in bytes (each
+ *  ask at least TV_AUTO_FETCH_MIN_CHARGE). */
 export function autoFetchSpent(now = Date.now()): number {
   return readSpent(now).reduce((sum, e) => sum + e.size, 0);
 }
@@ -118,7 +124,7 @@ export function autoFetchVerdict(hash: string, size: number, now = Date.now()): 
   if (!autoFetchOn()) return 'off';
   if (asked.has(hash)) return 'asked';
   if (!Number.isSafeInteger(size) || size < 0 || size > TV_AUTO_FETCH_MAX) return 'big';
-  if (autoFetchSpent(now) + size > TV_AUTO_FETCH_DAY) return 'day';
+  if (autoFetchSpent(now) + charge(size) > TV_AUTO_FETCH_DAY) return 'day';
   return 'go';
 }
 
@@ -126,13 +132,15 @@ export function autoFetchVerdict(hash: string, size: number, now = Date.now()): 
  *  never asked for by itself again from this page. */
 export function noteAutoFetch(hash: string, size: number, now = Date.now()): void {
   asked.add(hash);
-  const spend = { at: now, size, h: hash.slice(0, 16) };
+  const spend = { at: now, size: charge(size), h: hash.slice(0, 16) };
   try {
     localStorage.setItem(SPENT_KEY, JSON.stringify(compact([...readSpent(now), spend])));
     spentHere = null;
   } catch {
-    // Folded only among themselves: none of them is in storage to be counted twice.
-    spentHere = compact([...(spentHere ?? []), spend]);
+    // Folded only among themselves (none of them is in storage to be
+    // counted twice), and only those still inside the day: a spend that
+    // has expired, folded into a newer one, would count for another day.
+    spentHere = compact([...(spentHere ?? []).filter((e) => now - e.at < TV_AUTO_FETCH_WINDOW_MS), spend]);
   }
 }
 

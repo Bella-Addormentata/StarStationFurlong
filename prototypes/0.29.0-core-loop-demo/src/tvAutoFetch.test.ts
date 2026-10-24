@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   autoFetchOn, autoFetchSpent, autoFetchVerdict, noteAutoFetch, resetAutoFetchForTest, setAutoFetchOn,
-  TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX, TV_AUTO_FETCH_WINDOW_MS,
+  TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX, TV_AUTO_FETCH_MIN_CHARGE, TV_AUTO_FETCH_WINDOW_MS,
 } from './tvAutoFetch';
 
 const store = new Map<string, string>();
@@ -109,7 +109,7 @@ describe('AUTO-FETCH', () => {
     full = false;
     noteAutoFetch(hash(4), 0, t0 + 4); // the next write storage takes keeps all of it
     resetAutoFetchForTest(); // another page
-    expect(autoFetchSpent(t0 + 5)).toBe(8 * GB);
+    expect(autoFetchSpent(t0 + 5)).toBe(8 * GB + TV_AUTO_FETCH_MIN_CHARGE);
     setAutoFetchOn(false);
     full = true;
     setAutoFetchOn(true);
@@ -145,5 +145,26 @@ describe('AUTO-FETCH', () => {
     noteAutoFetch(hash(71), small, t0 + 70);
     resetAutoFetchForTest(); // another page reads what storage now holds
     expect(autoFetchSpent(t0 + 71)).toBe(71 * small);
+  });
+
+  it('counts every ask at least the minimum charge: tiny files put on one after another buy a bounded number of asks a day', () => {
+    const t0 = 1_800_000_000_000;
+    let n = 0;
+    while (n < 1_000 && autoFetchVerdict(hash(n + 1), 1, t0 + n) === 'go') {
+      noteAutoFetch(hash(n + 1), 1, t0 + n);
+      n++;
+    }
+    expect(n).toBe(TV_AUTO_FETCH_DAY / TV_AUTO_FETCH_MIN_CHARGE); // 128
+    expect(autoFetchVerdict(hash(n + 1), 1, t0 + n)).toBe('day');
+  });
+
+  it('lets what this page kept by itself expire as storage would: a spend past its day is never folded into a newer one', () => {
+    const t0 = 1_800_000_000_000;
+    const small = 100 * 2 ** 20;
+    throwing = true;
+    for (let i = 0; i < 64; i++) noteAutoFetch(hash(i + 1), small, t0 + i);
+    const t1 = t0 + TV_AUTO_FETCH_WINDOW_MS + 1_000;
+    for (let i = 0; i < 64; i++) noteAutoFetch(hash(i + 101), small, t1 + i);
+    expect(autoFetchSpent(t1 + 64)).toBe(64 * small);
   });
 });
