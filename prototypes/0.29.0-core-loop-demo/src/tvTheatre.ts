@@ -161,9 +161,10 @@ class YouTubePlayerAdapter implements Adapter {
         // The browser held back the controller's playVideo() for want of a
         // gesture (a viewer who walked into a room already playing): the
         // frame takes no pointer and is in no Tab order, so the bar's TAP
-        // TO PLAY is the gesture, and its press calls playVideo again.
+        // TO PLAY is the gesture, and its press calls playVideo again. Said
+        // on every refusal, the one after a press included (the press took
+        // the notice down); a notice already up stays as it is.
         onAutoplayBlocked: () => {
-          if (this.blocked) return;
           this.blocked = true;
           this.onBlocked();
         },

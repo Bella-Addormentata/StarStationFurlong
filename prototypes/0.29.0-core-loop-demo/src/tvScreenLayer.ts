@@ -8,7 +8,9 @@
  * CSS3DObject that copies the plane's world matrix every frame, so the
  * picture sits on the set as the camera swings and zooms, and is shown only
  * while the set's screen is (World hides the furniture outside the room
- * view) and the theatre says the programme is playing or paused. The layer
+ * view) and the theatre says the programme is playing or paused — hidden by
+ * CSS visibility, never taken out of the document, so an iframe laid during
+ * a countdown loads and is ready at T0. The layer
  * takes no pointer events (the world under it keeps its clicks; the remote
  * and the theatre's bar are the controls), and, being over the canvas, it is
  * not hidden by whatever stands between the camera and the set.
@@ -90,7 +92,11 @@ export function attachScreenHost(host: HTMLElement, plane: THREE.Object3D, plane
   const step = () => {
     if (layer !== l) return;
     const cam = camera();
-    l.object.visible = shown && drawn(l.plane);
+    // Not the object's `visible`: CSS3DRenderer leaves an invisible object
+    // out of the document, and an iframe out of it does not load — YouTube's
+    // laid during a countdown would time out before T0.
+    const vis = shown && drawn(l.plane) ? '' : 'hidden';
+    if (l.object.element.style.visibility !== vis) l.object.element.style.visibility = vis;
     if (cam) {
       // The host is fitted inside the plane (16:9 into whatever the set is).
       const s = Math.min(l.planeW / HOST_W, l.planeH / HOST_H);
