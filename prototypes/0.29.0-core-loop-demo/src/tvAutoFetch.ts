@@ -43,9 +43,10 @@ interface Spend {
 /** What this page could not keep in storage — one that throws on every
  *  call (a private window, blocked site data), or only on a write (its
  *  quota full) — and that holds for this page all the same: its switch
- *  over what storage says, its spend on top of what storage holds. Cleared
- *  by the next write that storage takes. Otherwise storage is read every
- *  time, so two tabs share one budget and one switch. */
+ *  over what storage says, and the spends storage did not take (those
+ *  alone: what storage holds is read from storage) on top of what it
+ *  holds. Cleared by the next write that storage takes. Otherwise storage
+ *  is read every time, so two tabs share one budget and one switch. */
 let switchHere: boolean | null = null;
 let spentHere: Spend[] | null = null;
 /** The files this page has asked for by itself. */
@@ -125,12 +126,13 @@ export function autoFetchVerdict(hash: string, size: number, now = Date.now()): 
  *  never asked for by itself again from this page. */
 export function noteAutoFetch(hash: string, size: number, now = Date.now()): void {
   asked.add(hash);
-  const list = compact([...readSpent(now), { at: now, size, h: hash.slice(0, 16) }]);
+  const spend = { at: now, size, h: hash.slice(0, 16) };
   try {
-    localStorage.setItem(SPENT_KEY, JSON.stringify(list));
+    localStorage.setItem(SPENT_KEY, JSON.stringify(compact([...readSpent(now), spend])));
     spentHere = null;
   } catch {
-    spentHere = list;
+    // Folded only among themselves: none of them is in storage to be counted twice.
+    spentHere = compact([...(spentHere ?? []), spend]);
   }
 }
 

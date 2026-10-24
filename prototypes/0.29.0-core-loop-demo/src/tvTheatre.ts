@@ -976,10 +976,14 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
   const why = st.state === 'failed' ? st.why || 'no reason given' : blobAskRefused?.hash === source.hash ? blobAskRefused.why : '';
   const failed = why ? `<div class="tv-theatre-lane">the last try stopped: ${escapeHtml(why)}</div>` : '';
   // Why AUTO-FETCH has not taken it, or that it is asking: its ask is out
-  // until the node answers (FETCHING, or a refusal with why).
+  // until the node answers (FETCHING, or a refusal with why). One it may
+  // still make waits for WHERE or for the file before it; a transfer that
+  // failed is the press's to try again (autoFetch takes only 'none').
   const verdict = autoFetchVerdict(source.hash, source.size);
-  const asking = autoFetching === source.hash && st.state === 'none' && !why;
-  const wait = asking || verdict === 'go' ? 'AUTO-FETCH is asking your node for it'
+  const asking = autoFetching === source.hash && autoFetchAsking;
+  const wait = asking ? 'AUTO-FETCH is asking your node for it'
+    : verdict === 'go' && st.state === 'none' && !why ? 'AUTO-FETCH asks your node for it next'
+    : verdict === 'go' ? 'nothing more is fetched until you press'
     : verdict === 'off' ? 'AUTO-FETCH is off: nothing is fetched until you press'
     : verdict === 'big' ? `it is bigger than the ${formatBytes(TV_AUTO_FETCH_MAX)} AUTO-FETCH takes by itself: nothing is fetched until you press`
     : verdict === 'day' ? `AUTO-FETCH has taken its ${formatBytes(TV_AUTO_FETCH_DAY)} for today: nothing more is fetched until you press`

@@ -132,4 +132,18 @@ describe('AUTO-FETCH', () => {
     expect(autoFetchSpent(t0 + n)).toBe(n * small);
     expect((JSON.parse(store.get('ssf-tv-auto-fetch-spent')!) as unknown[]).length).toBeLessThanOrEqual(64);
   });
+
+  it('counts each spend once where storage holds a full record and will not take the next: nothing it holds is counted again', () => {
+    const t0 = 1_800_000_000_000;
+    const small = 100 * 2 ** 20;
+    for (let i = 0; i < 64; i++) noteAutoFetch(hash(i + 1), small, t0 + i);
+    expect(autoFetchSpent(t0 + 64)).toBe(64 * small);
+    full = true;
+    for (let i = 64; i < 70; i++) noteAutoFetch(hash(i + 1), small, t0 + i);
+    expect(autoFetchSpent(t0 + 70)).toBe(70 * small);
+    full = false;
+    noteAutoFetch(hash(71), small, t0 + 70);
+    resetAutoFetchForTest(); // another page reads what storage now holds
+    expect(autoFetchSpent(t0 + 71)).toBe(71 * small);
+  });
 });
