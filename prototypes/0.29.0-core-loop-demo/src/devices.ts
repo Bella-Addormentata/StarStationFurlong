@@ -488,11 +488,21 @@ export interface AirHockeyVisualHandle {
  * (furniture.ts) stows it in the screen mesh's userData.tvScreen; World
  * collects it and, at ~2 Hz, hands it the view tvDoc derives from the room
  * record (tvScreenView) — the handle redraws only when the view changed.
- * The picture itself is not here (plan §3.4): the screen shows the home
- * screen, the countdown and the now-playing card; the theatre plays video.
+ * The picture is on this screen too: the theatre (tvTheatre.ts) hands a
+ * playing <video> to `showVideo`, which puts its frames on the plane, and
+ * lays an embed's iframe over `plane` (tvScreenLayer.ts).
  */
 export interface TvScreenHandle {
   draw(view: import('./tvDoc').TvScreenView): void;
+  /** Put this <video>'s frames on the screen, fitted inside it (black bars
+   *  for another shape), while the set is playing or paused; null takes the
+   *  picture off and leaves the drawn card. */
+  showVideo(video: HTMLVideoElement | null): void;
+  /** The screen plane, facing +z in its own frame, and its size in metres:
+   *  where a DOM picture (an embed's iframe) is laid in the world. */
+  readonly plane: THREE.Object3D;
+  readonly planeW: number;
+  readonly planeH: number;
 }
 
 // ── 🕹 Arcade cabinet screen handle (#193 — shared with the furniture builder) ─

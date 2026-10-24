@@ -260,7 +260,7 @@ import { listContacts, getContact } from "./contacts";
 // 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
 // screen view the prop draws.
 import { createSmartTvUI } from "./tvUI";
-import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
+import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, setTvScreenProvider, updateTvChip } from "./tvTheatre";
 import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
 // 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
@@ -657,6 +657,8 @@ export class World {
     // when its game (the owner's pick) is one.
     setNativeCabinetGameReader((itemId) =>
       this.arcadeSeats(itemId) === 4 ? nativeEntry(readCabinet(itemId).game)?.id ?? null : null);
+    // 📺 The theatre puts its picture on the set's own screen.
+    setTvScreenProvider((itemId) => this.tvScreens.get(itemId));
     this.platformGroup = new THREE.Group();
     this.platformGroup.position.set(0, 0, 0);
     this.scene.add(this.platformGroup);

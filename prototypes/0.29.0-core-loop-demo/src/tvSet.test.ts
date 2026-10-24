@@ -148,6 +148,43 @@ describe('the smart TV as built', () => {
     expect(glow!.intensity).toBe(0);
   });
 
+  it('puts a handed-in video on the screen, fitted inside it, only while the set plays or pauses', () => {
+    const group = build('tv-stand');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'tv-stand-1', obj); });
+    const handle = s.tvScreens.get('tv-stand-1')!;
+    const pictures = () => {
+      const out: THREE.Mesh[] = [];
+      group.traverse((obj) => { if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.VideoTexture) out.push(obj); });
+      return out;
+    };
+    expect(pictures()).toHaveLength(0);
+    // A 4:3 video on a wide screen: pillarboxed, the full height.
+    const video = { videoWidth: 640, videoHeight: 480, addEventListener: () => undefined, removeEventListener: () => undefined } as unknown as HTMLVideoElement;
+    handle.draw(view('scheduled', 'METROPOLIS'));
+    handle.showVideo(video);
+    const [mesh] = pictures();
+    expect(mesh).toBeDefined();
+    // World sets every furniture mesh's own `visible` each frame: the gate
+    // is on the frame around it, and must hold whatever the mesh says.
+    mesh!.visible = true;
+    const picture = { get visible() { let o: THREE.Object3D | null = mesh!; while (o) { if (!o.visible) return false; o = o.parent; } return true; }, scale: mesh!.scale };
+    expect(picture.visible).toBe(false); // a countdown is the card
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(picture.visible).toBe(true);
+    expect(picture.scale.y).toBeCloseTo(handle.planeH);
+    expect(picture.scale.x).toBeCloseTo(handle.planeH * (4 / 3));
+    expect(picture.scale.x).toBeLessThan(handle.planeW);
+    handle.draw(view('paused', 'METROPOLIS'));
+    expect(picture.visible).toBe(true);
+    handle.draw(view('home'));
+    expect(picture.visible).toBe(false);
+    handle.draw(view('playing', 'METROPOLIS'));
+    handle.showVideo(null);
+    expect(picture.visible).toBe(false);
+    expect(pictures()).toHaveLength(0); // the texture is let go
+  });
+
   it('draws on the home screen only the tiles this build offers: YOUTUBE and ARCHIVE go with the convenience lanes', () => {
     const group = build('smart-tv');
     const s = sinks();

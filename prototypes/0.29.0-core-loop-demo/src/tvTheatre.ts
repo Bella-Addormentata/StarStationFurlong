@@ -1,15 +1,21 @@
 /**
  * 📺 tvTheatre — the DOM half of the TV: the player adapters (the YouTube
- * IFrame API, an HTML <video>, the archive.org embed) and the THEATRE, the
- * overlay any room member opens to watch what the set is showing, in sync
- * with everyone else (tvSync.ts drives the adapter from the room record).
+ * IFrame API, an HTML <video>, the archive.org embed) and the THEATRE, which
+ * plays what the set is showing ON THE SET, in sync with everyone else
+ * (tvSync.ts drives the adapter from the room record), with a slim bar at the
+ * foot of the window for its notices and controls. Never a popup.
  *
- * WHY A PANEL AND NOT THE IN-WORLD SCREEN (plan §3.4): a cross-origin iframe
- * cannot be sampled into a texture, and a cross-origin <video> without CORS
- * headers taints one — but both play fine as DOM. So v1 draws the status,
- * the menu and the countdown on the prop's CanvasTexture (furniture.ts) and
- * plays the picture here. The in-world iframe (CSS3D hole-punch) is spike
- * S1; the node's media proxy later feeds a VideoTexture for files.
+ * WHERE THE PICTURE GOES: a <video> (a file from the node, a link) is handed
+ * to the set's screen handle (furniture.ts showVideo), which puts its frames
+ * on the in-world screen as a texture. That needs an untainted video: a blob
+ * comes from the node with CORS, and a link on another host is only mounted
+ * after a CORS check (tvConsent probeRedirect), so both are asked for in CORS
+ * mode. An embed's iframe cannot be sampled into a texture at all, so it is
+ * laid over the set's screen plane in the DOM (tvScreenLayer.ts).
+ *
+ * A set in the room that is playing opens the theatre on its own (the room
+ * tick, updateTvChip); ✕ on the bar turns the picture off for this viewer
+ * until the next programme, and the chip's WATCH brings it back.
  *
  * Sovereignty (plan §3.3): YouTube and archive.org are CONVENIENCE lanes.
  * They are labelled as such on the panel, an unreachable one says so and
@@ -21,7 +27,7 @@ import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
   readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
-  sourceLane, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
+  sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
@@ -33,7 +39,8 @@ import { SERVERLESS_ONLY } from './sovereignty';
 import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, recheckBlob, refreshHolders } from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
-import { suspendStickKeys } from './freeFlightStick';
+import { attachScreenHost, detachScreenHost, setScreenHostShown } from './tvScreenLayer';
+import type { TvScreenHandle } from './devices';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
 
@@ -111,6 +118,8 @@ class YouTubePlayerAdapter implements Adapter {
   private player: YtPlayerLike | null = null;
   private ready = false;
   private state = -1;
+  /** The browser refused playVideo() without a gesture: the bar shows TAP TO PLAY. */
+  private blocked = false;
   private readonly readyTimer: number;
 
   /** No `autoplay`: the controller starts the player when the record says,
@@ -118,11 +127,14 @@ class YouTubePlayerAdapter implements Adapter {
    *  applied the set's volume. With autoplay the iframe sounded at the
    *  player's own level for the tick before that, a set at volume 0
    *  included; and a countdown or a paused set must not sound at all. */
-  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void, autoplay = false) {
+  constructor(
+    host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void,
+    private onBlocked: () => void = () => undefined, private onUnblocked: () => void = () => undefined,
+  ) {
     const mount = document.createElement('div');
     host.appendChild(mount);
     const playerVars: Record<string, unknown> = {
-      autoplay: autoplay ? 1 : 0, playsinline: 1, rel: 0, enablejsapi: 1, modestbranding: 1,
+      autoplay: 0, playsinline: 1, rel: 0, enablejsapi: 1, modestbranding: 1,
     };
     // Bounded readiness, through the attempt-scoped failure path: an
     // adopted player that never reports ready would otherwise hide the
@@ -141,10 +153,28 @@ class YouTubePlayerAdapter implements Adapter {
       playerVars,
       events: {
         onReady: () => { this.ready = true; window.clearTimeout(this.readyTimer); },
-        onStateChange: (e: { data: number }) => { this.state = e.data; },
+        onStateChange: (e: { data: number }) => {
+          this.state = e.data;
+          if (e.data === 1) this.unblock();
+        },
         onError: (e: { data: number }) => onFail(`YouTube player error ${e.data}`),
+        // The browser held back the controller's playVideo() for want of a
+        // gesture (a viewer who walked into a room already playing): the
+        // frame takes no pointer and is in no Tab order, so the bar's TAP
+        // TO PLAY is the gesture, and its press calls playVideo again. Said
+        // on every refusal, the one after a press included (the press took
+        // the notice down); a notice already up stays as it is.
+        onAutoplayBlocked: () => {
+          this.blocked = true;
+          this.onBlocked();
+        },
       },
     });
+  }
+  private unblock(): void {
+    if (!this.blocked) return;
+    this.blocked = false;
+    this.onUnblocked();
   }
   isReady(): boolean { return this.ready; }
   /** 1 = PLAYING, 3 = BUFFERING: both count as "going". */
@@ -197,8 +227,8 @@ class HtmlVideoPlayerAdapter implements Adapter {
   constructor(
     host: HTMLElement, url: string, onFail: (why: string) => void,
     private onBlocked: () => void, private onUnblocked: () => void = () => undefined,
-    /** CORS mode, so the request carries an Origin: the node's blob route
-     *  answers only an allowed one (blobLane.ts). */
+    /** CORS mode: the node's blob route answers only an allowed Origin
+     *  (blobLane.ts), and only an untainted video can be the set's texture. */
     crossOrigin = false,
   ) {
     const v = document.createElement('video');
@@ -311,6 +341,9 @@ interface Theatre {
   root: HTMLDivElement;
   itemId: string;
   label: string;
+  /** Where the mounted adapter puts its element: a new one per mount, laid
+   *  on the set (an iframe, tvScreenLayer) or parked out of sight (a
+   *  <video>, whose frames the set's screen takes). */
   screen: HTMLDivElement;
   notice: HTMLDivElement;
   status: HTMLDivElement;
@@ -335,12 +368,10 @@ interface Theatre {
   lastControls: string;
   lastHead: string;
   lastNotice: string;
+  /** The set's screen the picture is on while one is mounted. */
+  shownOn: TvScreenHandle | null;
+  /** The bar's keys (barKeys), removed on close. */
   onKey: (e: KeyboardEvent) => void;
-  /** What had focus when the theatre opened: focus goes back there on close. */
-  opener: HTMLElement | null;
-  /** The helm's flight stick stands aside while the theatre is up
-   *  (freeFlightStick.suspendStickKeys): its release, called on close. */
-  releaseStick: () => void;
   /** The mount key whose URL the redirect probe (tvConsent probeRedirect)
    *  is out for, '' when none: one probe per programme, and its answer is
    *  read from tvConsent on the tick after it lands. */
@@ -372,22 +403,29 @@ export function setTvTheatreDeps(provider: (itemId: string) => TheatreDeps): voi
   depsProvider = provider;
 }
 
-export function isTvTheatreOpen(itemId?: string): boolean {
-  return theatre !== null && (itemId === undefined || theatre.itemId === itemId);
+/** The set's in-world screen, by item id: World installs one lookup (its
+ *  furniture handles), and the picture goes there. */
+let screenProvider: (itemId: string) => TvScreenHandle | undefined = () => undefined;
+export function setTvScreenProvider(provider: (itemId: string) => TvScreenHandle | undefined): void {
+  screenProvider = provider;
 }
 
-/** Where focus goes back when the theatre closes: whatever had it as the
- *  theatre opened — unless that is a control inside the phone. The phone's
- *  WATCH hides the phone without blurring its button, and focus returned to
- *  an offscreen control would answer the next Enter or Space from a phone
- *  nobody can see (and reopen this). main.ts's phoneOpener refuses openers
- *  inside the phone for the same reason; the theatre applies the same rule
- *  and lets focus fall to the body, where the world's keys are its own. */
-function focusReturnTarget(): HTMLElement | null {
-  const active = document.activeElement;
-  if (!(active instanceof HTMLElement)) return null;
-  const phone = document.getElementById('spacephone-container');
-  return phone && phone.contains(active) ? null : active;
+/** Out of sight, for a <video> whose frames are on the set: kept in the
+ *  document so every browser keeps decoding it. */
+let parking: HTMLDivElement | null = null;
+function parkingLot(): HTMLDivElement {
+  if (!parking || !parking.isConnected) {
+    parking = document.createElement('div');
+    parking.id = 'tv-picture-parking';
+    parking.setAttribute('aria-hidden', 'true');
+    parking.style.cssText = 'position:fixed; left:0; top:0; width:2px; height:2px; overflow:hidden; opacity:0; pointer-events:none;';
+    document.body.appendChild(parking);
+  }
+  return parking;
+}
+
+export function isTvTheatreOpen(itemId?: string): boolean {
+  return theatre !== null && (itemId === undefined || theatre.itemId === itemId);
 }
 
 export function tvTheatreItemId(): string | null {
@@ -395,103 +433,45 @@ export function tvTheatreItemId(): string | null {
 }
 
 export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(itemId)): void {
+  // The phone's WATCH slides the phone away without blurring the button:
+  // a control left focused offscreen would take the next Space (WATCH
+  // again) or, a field, the world's keys. Only a phone already put away:
+  // an automatic open never takes focus from a phone in use.
+  const phone = document.getElementById('spacephone-container');
+  const focused = document.activeElement;
+  if (phone && !phone.classList.contains('active') && focused instanceof HTMLElement && phone.contains(focused)) focused.blur();
   if (theatre && theatre.itemId !== itemId) closeTvTheatre();
-  if (theatre) {
-    // Already up on this set — the phone's WATCH after a hand-over put the
-    // phone above it and is hiding the phone again: take focus back, or it
-    // stays on the phone's offscreen control and answers Enter there.
-    theatre.root.focus();
-    return;
-  }
+  if (theatre) return;
+  dismissed.delete(itemId); // a WATCH is this viewer asking again
+  // The bar: the set's name and programme, the notices (a consent ask,
+  // FETCH, TAP TO PLAY), where the room is and the controls. Not a dialog
+  // and not modal: the world goes on around it, keys and clicks included.
   const root = document.createElement('div');
   root.id = 'tv-theatre';
-  root.setAttribute('role', 'dialog');
-  root.setAttribute('aria-label', 'Television');
-  // Modal while it is the topmost overlay: Tab stays inside and clicks go
-  // nowhere else, and assistive technology is told the same. The phone
-  // opening above it (a hand-over pops it open on the remote) takes the
-  // top: theatreTick drops the modal claim while the phone is up, so the
-  // remote is not hidden from a screen reader behind a dialog that is no
-  // longer the one in front.
-  root.setAttribute('aria-modal', 'true');
+  root.setAttribute('role', 'region');
+  root.setAttribute('aria-label', 'Television (T: to the controls, Escape: back to the world)');
+  // A key typed on the bar is the bar's, past the helm's flight stick too
+  // (freeFlightStick): Space on a focused button presses it rather than
+  // braking the ship. barKeys keeps such keys from input.ts.
+  root.dataset.stickAside = '1';
   root.innerHTML = `
     <div class="tv-theatre-panel">
       <div class="tv-theatre-head"></div>
-      <div class="tv-theatre-screen"><div class="tv-theatre-notice" hidden></div></div>
+      <div class="tv-theatre-notice" hidden></div>
       <div class="tv-theatre-status"></div>
       <div class="tv-theatre-controls"></div>
     </div>`;
-  // Clicks inside the panel stay inside it — the world's click handler
-  // listens on window and would walk the player or wake a device behind the
-  // overlay — and a click on the dark surround closes.
-  root.addEventListener('click', (e) => {
-    e.stopPropagation();
-    if (e.target === root) closeTvTheatre();
-  });
+  // Clicks on the bar stay on it: the world's click handler listens on
+  // window and would walk the player or wake a device behind it.
+  root.addEventListener('click', (e) => e.stopPropagation());
   document.body.appendChild(root);
-  const onKey = (e: KeyboardEvent) => {
-    // The phone open above the theatre (a hand-over pops it open without
-    // closing this): a key typed INTO the phone is the phone's (its TV app
-    // holds its own flight keys), and Tab and Escape are its shortcuts
-    // wherever focus is — they close it or go home. Every other key with
-    // focus OUTSIDE the phone — a theatre button the player clicked, the
-    // body — is still a key pressed over this dialog: held, as below, so W
-    // does not walk the clone behind two overlays (the stick stands aside
-    // for the theatre and cannot hold it).
-    if (phoneIsUp()) {
-      const phone = document.getElementById('spacephone-container');
-      if (phone && e.target instanceof Node && phone.contains(e.target)) return;
-      if (e.key === 'Tab' || e.key === 'Escape') return;
-      e.stopPropagation();
-      return;
-    }
-    if (e.key === 'Escape') {
-      e.stopPropagation();
-      closeTvTheatre();
-      return;
-    }
-    // Tab stays inside the dialog (the phone's own Tab shortcut would
-    // otherwise swallow it): cycle through the theatre's controls.
-    if (e.key === 'Tab') {
-      const focusable = theatreFocusable(root);
-      if (focusable.length === 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      const at = focusable.indexOf(document.activeElement as HTMLElement);
-      const next = e.shiftKey
-        ? focusable[(at <= 0 ? focusable.length : at) - 1]!
-        : focusable[(at + 1) % focusable.length]!;
-      next.focus();
-      return;
-    }
-    // Every other key pressed while the theatre is topmost stays in it, like
-    // its clicks — WHATEVER has focus: the world listens on window, and
-    // Enter on a focused button would also open the quick chat, WASD walk
-    // the clone behind the overlay, Space and E wake whatever the player
-    // stands at. Focus is not always in the dialog: nothing (the body), or a
-    // button on the phone a hand-over opened above this and Tab then closed
-    // — the phone only slides offscreen and leaves its button focused, and
-    // a key on that hidden button is still a key pressed over this dialog.
-    // The key's own action (the button's click, the slider's step) is
-    // untouched, and keyup is never held back, so a key held across the
-    // open is still released to the world.
-    e.stopPropagation();
-  };
-  // What the capture listener above cannot block: the helm's flight stick,
-  // when taken (WATCH from the HUD chip while flying the ship by hand). Its
-  // own capture listener was registered before this one and swallows the
-  // flight keys — WASD, the arrows, Space, Q, E, X — before this one runs,
-  // so the ship would fly on behind the theatre, and Space or an arrow on a
-  // focused control here (the volume slider) would never reach it. The
-  // stick stands aside for as long as the theatre is up, keys held as it
-  // opened let go, and is itself again on close.
-  const releaseStick = suspendStickKeys();
+  const onKey = (e: KeyboardEvent) => barKeys(root, e, () => (theatre?.root === root ? embedControls(theatre) : []));
   window.addEventListener('keydown', onKey, true);
   theatre = {
     root,
     itemId,
     label: deps.label ?? 'TV',
-    screen: root.querySelector<HTMLDivElement>('.tv-theatre-screen')!,
+    screen: document.createElement('div'),
     notice: root.querySelector<HTMLDivElement>('.tv-theatre-notice')!,
     status: root.querySelector<HTMLDivElement>('.tv-theatre-status')!,
     controls: root.querySelector<HTMLDivElement>('.tv-theatre-controls')!,
@@ -506,46 +486,94 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     lastControls: '',
     lastHead: '',
     lastNotice: '',
+    shownOn: null,
     onKey,
-    opener: focusReturnTarget(),
     playerFor: -1,
-    releaseStick,
     probing: '',
     probeAbort: null,
     budgetedKey: '',
   };
-  // The dialog takes focus (Tab then reaches its controls); it goes back on close.
-  root.tabIndex = -1;
-  root.focus();
   const rtt = deps.rttMs ?? (() => 0);
   theatre.timer = window.setInterval(() => theatreTick(rtt), 400);
   theatreTick(rtt);
   updateTvChip([itemId]);
 }
 
-/** The SpacePhone is open above everything (a hand-over pops it open on the
- *  remote without closing the theatre): then IT is the topmost overlay. */
-function phoneIsUp(): boolean {
-  return document.getElementById('spacephone-container')?.classList.contains('active') ?? false;
+/** The bar's keyboard, without making it modal (capture phase on window,
+ *  ahead of the world's own listeners). T, from the world, puts focus on
+ *  the bar's first control: a consent ask, FETCH or TAP TO PLAY is reached
+ *  without a pointer. With focus on the bar, every key stays on it, so the
+ *  world's shortcuts (Tab's phone, Enter's quick chat, WASD) neither fire
+ *  nor eat a button's own Enter or Space; Tab and Shift+Tab move along the
+ *  bar, and Escape hands the keys back to the world. Keyups are never held,
+ *  so a key held as focus moved is still released to the world. */
+function barKeys(root: HTMLElement, e: KeyboardEvent, extra: () => HTMLElement[] = () => []): void {
+  const target = e.target instanceof Node ? e.target : null;
+  if (target && root.contains(target)) {
+    e.stopPropagation();
+    if (e.key === 'Escape') {
+      (document.activeElement as HTMLElement | null)?.blur?.();
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      const focusable = [...theatreFocusable(root), ...extra()];
+      if (focusable.length === 0) return;
+      const at = focusable.indexOf(document.activeElement as HTMLElement);
+      const next = e.shiftKey
+        ? focusable[(at <= 0 ? focusable.length : at) - 1]!
+        : focusable[(at + 1) % focusable.length]!;
+      next.focus();
+    }
+    return;
+  }
+  // T for TV, from the world only: never while typing, with a modifier, or
+  // with the phone open (its fields and its own keys).
+  if (e.key !== 't' && e.key !== 'T') return;
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  const el = target instanceof HTMLElement ? target : null;
+  if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+  if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
+  const first = theatreFocusable(root)[0];
+  if (!first) return;
+  e.preventDefault();
+  e.stopPropagation();
+  first.focus();
 }
 
-/** The theatre's controls in Tab order: its buttons, the volume slider and
- *  the embedded player itself (an iframe takes focus, and the archive
- *  embed's own controls — its volume among them — live inside it). */
+/** archive.org's own player, laid on the set: its volume and its controls
+ *  are inside its frame (the adapter has no API), so the frame takes the
+ *  pointer and comes last in the bar's Tab order. Nothing for other sources. */
+function embedControls(t: Theatre): HTMLElement[] {
+  return t.player instanceof ArchiveEmbedAdapter ? [...t.screen.querySelectorAll<HTMLElement>('iframe')] : [];
+}
+
+/** The bar's controls in order: its buttons and the volume slider. */
 function theatreFocusable(root: HTMLElement): HTMLElement[] {
-  return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), iframe')];
+  return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')];
 }
 
-export function closeTvTheatre(): void {
+/** The programme this viewer turned off with ✕ (the set, the record's
+ *  `started`, and the room's doc it was in — another room may reuse the item
+ *  id and the counter): the room tick does not turn it back on by itself. */
+const dismissed = new Map<string, { started: number; epoch: number }>();
+
+function isDismissed(itemId: string, started: number): boolean {
+  const d = dismissed.get(itemId);
+  return d !== undefined && d.started === started && d.epoch === tvDocEpoch();
+}
+
+/** Take the picture off the set and the bar down. `byViewer`: the ✕ on the
+ *  bar, which keeps this programme off until the next one or a WATCH. */
+export function closeTvTheatre(byViewer = false): void {
   if (!theatre) return;
   const t = theatre;
   theatre = null;
+  if (byViewer) dismissed.set(t.itemId, { started: readTv(t.itemId).started, epoch: tvDocEpoch() });
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
-  t.releaseStick();
+  const hadFocus = t.root.contains(document.activeElement);
   unmountPlayer(t);
   t.root.remove();
-  if (t.opener && t.opener.isConnected) t.opener.focus();
+  if (hadFocus) (document.activeElement as HTMLElement | null)?.blur?.();
 }
 
 function unmountPlayer(t: Theatre): void {
@@ -559,7 +587,12 @@ function unmountPlayer(t: Theatre): void {
   t.player?.destroy();
   t.player = null;
   t.mounted = '';
-  for (const child of [...t.screen.children]) if (child !== t.notice) child.remove();
+  // The picture comes off the set, and the host it was in goes.
+  t.shownOn?.showVideo(null);
+  t.shownOn = null;
+  detachScreenHost();
+  t.screen.remove();
+  t.screen = document.createElement('div');
 }
 
 /** What a mounted adapter is keyed by. A start-only embed can neither seek
@@ -611,6 +644,13 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
       t.mounted = '';
     });
   };
+  // Where the picture goes: an embed's frame is laid on the set's screen
+  // (tvScreenLayer); a <video> is parked out of sight and its frames put on
+  // the screen once it is adopted.
+  const set = screenProvider(t.itemId) ?? null;
+  const textured = asTexture(source);
+  if (set && !textured) attachScreenHost(t.screen, set.plane, set.planeW, set.planeH, source.kind === 'archive' && !sourceFileUrl(source));
+  else parkingLot().appendChild(t.screen);
   const adopt = (player: Adapter) => {
     if (!live()) {
       player.destroy();
@@ -618,6 +658,10 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     }
     hideNotice(t);
     t.player = player;
+    if (player instanceof HtmlVideoPlayerAdapter && textured && set) {
+      set.showVideo(player.video);
+      t.shownOn = set;
+    }
     const controller = new TvSyncController({ itemId: t.itemId, player, rttMs: rtt });
     t.controller = controller;
     // Only a player with a clock becomes the room's clock; the archive embed
@@ -637,6 +681,25 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
       });
     }
   };
+  // TAP TO PLAY: the browser refused to start the player without a gesture
+  // (a <video>'s play() rejected, YouTube's onAutoplayBlocked); the press is
+  // the gesture, and it asks the player again.
+  const blocked = () => {
+    if (!live()) return;
+    // The controller retries play() every tick while blocked: the notice
+    // (and the button under the finger) that is already up stays up.
+    if (!t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) return;
+    showNotice(t, `<button type="button" data-tv-tap="1">▶ TAP TO PLAY</button>
+      <div class="tv-theatre-lane">your browser wants a tap before sound</div>`);
+    t.notice.querySelector<HTMLButtonElement>('[data-tv-tap]')?.addEventListener('click', () => {
+      hideNotice(t);
+      t.player?.play();
+    });
+  };
+  const unblocked = () => {
+    // The browser let the sound through after all: the notice comes down.
+    if (live() && !t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) hideNotice(t);
+  };
   if (source.kind === 'youtube') {
     showNotice(t, `<div>REACHING YOUTUBE…</div><div class="tv-theatre-lane">CONVENIENCE LANE</div>`);
     loadYouTubeApi().then(
@@ -645,7 +708,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
         // loaded: build no iframe for it — adopt() would destroy one, but
         // the constructor had already inserted it and started its load.
         if (!live()) return;
-        adopt(new YouTubePlayerAdapter(t.screen, source.videoId, yt, fail));
+        adopt(new YouTubePlayerAdapter(t.screen, source.videoId, yt, fail, blocked, unblocked));
       },
       (err: Error) => fail(err.message || 'YouTube is unreachable'),
     );
@@ -653,21 +716,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
   }
   const url = source.kind === 'blob' ? blobUrl(source.hash) : sourceFileUrl(source);
   if (url) {
-    adopt(new HtmlVideoPlayerAdapter(t.screen, url, fail, () => {
-      if (!live()) return;
-      // The controller retries play() every tick while blocked: the notice
-      // (and the button under the finger) that is already up stays up.
-      if (!t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) return;
-      showNotice(t, `<button type="button" data-tv-tap="1">▶ TAP TO PLAY</button>
-        <div class="tv-theatre-lane">your browser wants a tap before sound</div>`);
-      t.notice.querySelector<HTMLButtonElement>('[data-tv-tap]')?.addEventListener('click', () => {
-        hideNotice(t);
-        t.player?.play();
-      });
-    }, () => {
-      // The browser let the sound through after all: the notice comes down.
-      if (live() && !t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) hideNotice(t);
-    }, source.kind === 'blob'));
+    adopt(new HtmlVideoPlayerAdapter(t.screen, url, fail, blocked, unblocked, textured));
     return;
   }
   if (source.kind === 'archive') {
@@ -677,20 +726,31 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
   fail('The TV cannot play this.');
 }
 
+/** Whether `source` plays as a <video> the set's screen can take as a
+ *  texture: one fetched in CORS mode from a host known to answer it — a blob
+ *  from the node, a link on this page's own origin, or a link on another host
+ *  whose CORS check (tvConsent probeRedirect) came through before it was
+ *  mounted. Anything else — an embed, archive.org's files, a link on the
+ *  node's media origin — is laid on the set in the DOM instead (a CORS-less
+ *  video would taint the texture and show nothing). */
+function asTexture(source: TvSource): boolean {
+  if (source.kind === 'blob') return true;
+  if (source.kind !== 'url') return false;
+  let sameOrigin = false;
+  try { sameOrigin = new URL(source.url, location.href).origin === location.origin; } catch { /* not a URL */ }
+  return sameOrigin || needsRedirectProbe(source);
+}
+
 function theatreTick(rtt: () => number): void {
   const t = theatre;
   if (!t) return;
-  // Modal only while topmost: the phone above it is what a screen reader
-  // must reach, and a modal dialog beneath would hide it (see openTvTheatre).
-  const modal = phoneIsUp() ? 'false' : 'true';
-  if (t.root.getAttribute('aria-modal') !== modal) t.root.setAttribute('aria-modal', modal);
   const rec = readTv(t.itemId);
   const on = rec.state !== 'off' && rec.state !== 'home' && rec.source !== null;
   if (!on) {
-    if (t.mounted) unmountPlayer(t);
-    showNotice(t, rec.state === 'off'
-      ? '<div>THE SET IS OFF</div><div class="tv-theatre-lane">press POWER on the TV, or pick up the remote</div>'
-      : '<div>FURLONG TV</div><div class="tv-theatre-lane">nothing on — the remote picks a programme</div>');
+    // Nothing on (the set off, or its home screen): no picture to show, and
+    // the set itself says so. The bar goes; the next programme opens it again.
+    closeTvTheatre();
+    return;
   } else if (isStartOnly(rec.source!) && readPlayback(t.itemId).state !== 'playing') {
     // archive.org's own player autoplays and can neither pause nor seek: it
     // goes up only while the room is playing. A countdown or a pause is
@@ -757,8 +817,10 @@ function theatreTick(rtt: () => number): void {
       // could rotate shape-valid sources on this viewer's own node — or
       // query strings on an accepted host — and have every open theatre
       // fetch each in turn without end. So every request this theatre makes
-      // on its own, a probe as much as a mount, is counted per set
-      // (tvConsent mayMountNow); a probe's unit covers the mount its
+      // on its own, a probe as much as a mount, is counted per set and
+      // across every set this viewer is shown — the theatre opens by itself
+      // on a set that comes on, so a new set is no new budget (tvConsent
+      // mayMountNow); a probe's unit covers the mount its
       // verdict allows (budgetedKey), and past the budget what is on is
       // shown with PLAY — the press is the consent that spends the next.
       if (verdict === null) {
@@ -780,6 +842,11 @@ function theatreTick(rtt: () => number): void {
       }
     }
   }
+  // A picture laid on the set in the DOM shows only while the programme
+  // plays or pauses, as the set's own video plane does (furniture.ts): a
+  // countdown stays the set's card.
+  const pbNow = readPlayback(t.itemId).state;
+  setScreenHostShown(pbNow === 'playing' || pbNow === 'paused');
   t.controller?.tick();
   renderTheatreChrome(t);
 }
@@ -889,15 +956,16 @@ function showRedirectNotice(t: Theatre, source: TvSource, key: string): void {
     <div class="tv-theatre-lane">${escapeHtml(host || 'this host')} answers this link with a redirect, and your browser would follow it without saying where — paste the link it redirects to instead</div>`);
 }
 
-/** PLAY? — the set's automatic mounts for the minute are spent
- *  (tvConsent mayMountNow): what is on is shown, and the press mounts it. */
+/** PLAY? — the automatic mounts for the minute are spent, the set's or the
+ *  viewer's (tvConsent mayMountNow): what is on is shown, and the press
+ *  mounts it. */
 function showMountNotice(t: Theatre, source: TvSource, key: string): void {
   // The button under the finger stays — the same ask every tick is one ask —
   // but only for the SAME programme: the next source gets its own.
   const asking = t.notice.hidden ? null : t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]');
   if (asking && asking.dataset.tvMount === key) return;
   showNotice(t, `<div>▶ PLAY ${escapeHtml(sourceLabel(source))}?</div>
-    <div class="tv-theatre-lane">the programme changed more than ${TV_MOUNT_BUDGET} times in a minute — your browser fetches no more on its own until you say so; whoever holds the remote cannot decide that for you</div>
+    <div class="tv-theatre-lane">the TVs here changed programme more than ${TV_MOUNT_BUDGET} times in a minute — your browser fetches no more on its own until you say so; whoever holds the remote cannot decide that for you</div>
     <button type="button" data-tv-mount="${escapeHtml(key)}">▶ PLAY</button>`);
   t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]')?.addEventListener('click', () => {
     // The press is consent for THE PROGRAMME THE BUTTON NAMED: a peer may
@@ -965,11 +1033,11 @@ function renderTheatreChrome(t: Theatre): void {
   const lane = rec.source ? sourceLane(rec.source) : '';
   const head = `<span class="tv-theatre-title">📺 ${escapeHtml(t.label)} · ${escapeHtml(title)}</span>
     ${lane ? `<span class="tv-lane-badge tv-lane-${lane.toLowerCase().replace(/[^a-z]/g, '-')}">${lane}</span>` : ''}
-    <button type="button" class="tv-theatre-close" data-tv-close="1" aria-label="Close">✕</button>`;
+    <button type="button" class="tv-theatre-close" data-tv-close="1" aria-label="Turn the picture off" title="Turn the picture off (WATCH brings it back)">✕</button>`;
   if (head !== t.lastHead) {
     t.head.innerHTML = head;
     t.lastHead = head;
-    t.head.querySelector<HTMLButtonElement>('[data-tv-close]')?.addEventListener('click', () => closeTvTheatre());
+    t.head.querySelector<HTMLButtonElement>('[data-tv-close]')?.addEventListener('click', () => closeTvTheatre(true));
   }
   const startOnly = rec.source ? isStartOnly(rec.source) : false;
   // A mounted player that cannot seek (a live stream, a host without usable
@@ -1063,22 +1131,31 @@ export function setTvChipOpener(fn: (itemId: string) => void): void {
   chipOpen = fn;
 }
 
-/** Driven at ~2 Hz by World with the room's TV ids: shows a WATCH chip while
- *  a TV has something on and the theatre is closed. */
+/** Driven at ~2 Hz by World with the room's TV ids: opens the theatre on a
+ *  set that has something on, or, when this viewer turned it off, shows a
+ *  WATCH chip while the theatre is closed. */
 export function updateTvChip(itemIds: readonly string[]): void {
   let label = '';
   let target = '';
   if (!theatre) {
+    // A set in the room with something on shows it: the theatre opens by
+    // itself on the first such set, putting the picture on it, unless this
+    // viewer turned that set's programme off (✕) — a dismissal per set,
+    // gone with the programme or a WATCH. Otherwise the chip offers WATCH.
     for (const id of itemIds) {
       const rec = readTv(id);
       if (!rec.source || rec.state === 'off' || rec.state === 'home') continue;
+      if (chipOpen && !isDismissed(id, rec.started)) {
+        chipOpen(id);
+        if (theatre) return;
+      }
+      if (target) continue;
       const pb = readPlayback(id);
       const what = sourceLabel(rec.source).toUpperCase();
       label = pb.state === 'scheduled'
         ? `📺 ${what} · ${countdownText(pb.countdownMs)} · WATCH`
         : pb.state === 'paused' ? `📺 ${what} · PAUSED · WATCH` : `📺 NOW ON: ${what} · WATCH`;
       target = id;
-      break;
     }
   }
   const key = label ? `${target}|${label}` : '';

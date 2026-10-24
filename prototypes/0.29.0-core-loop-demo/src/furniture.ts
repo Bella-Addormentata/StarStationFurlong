@@ -11119,9 +11119,10 @@ function buildPartySpeaker(ctx: BuildCtx) {
 // The screen draws the view World derives from the room record at ~2 Hz
 // (tvDoc.tvScreenView): the home screen with its source tiles, the
 // scheduled countdown, the now-playing card with its lane badge, or black.
-// The PICTURE is not on this plane in v1 (plan §3.4): a cross-origin iframe
-// cannot be sampled into a texture and a CORS-less <video> taints one, so
-// the theatre panel (tvTheatre.ts) plays it and this prop shows status.
+// The PICTURE is on this plane too: the theatre (tvTheatre.ts) hands its
+// <video> to the handle's showVideo, whose frames go on a plane just in front
+// of the card, fitted inside it; an embed's iframe, which no texture can
+// sample, is laid over the same plane in the DOM (tvScreenLayer.ts).
 // (Dimensions: TV_W … TV_TEX_H, declared beside the terminal's above.)
 
 /** The home screen's source tiles, in the remote's order (tvUI TILES): the
@@ -11168,7 +11169,35 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   screenTex.generateMipmaps = false;
   screenTex.colorSpace = THREE.SRGBColorSpace;
   const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 });
-  const screen = place(new THREE.PlaneGeometry(w - 2 * TV_BEZEL, h - 2 * TV_BEZEL), screenMat, 0, cy, zBack + TV_D + 0.002);
+  const screenW = w - 2 * TV_BEZEL;
+  const screenH = h - 2 * TV_BEZEL;
+  const screen = place(new THREE.PlaneGeometry(screenW, screenH), screenMat, 0, cy, zBack + TV_D + 0.002);
+  // The picture: a plane a hair in front of the card, carrying the theatre's
+  // <video> as a texture while one is handed in (showVideo below). Shown only
+  // while the set plays or pauses: a countdown or the home screen is the card.
+  let video: HTMLVideoElement | null = null;
+  let videoTex: THREE.VideoTexture | null = null;
+  let viewState: TvScreenView["state"] = "off";
+  const pictureMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
+  const picture = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), pictureMat);
+  picture.raycast = () => undefined; // clicks land on the set, as before
+  // Shown and hidden through a Group, not the mesh: World sets every
+  // furniture mesh's own `visible` on each frame (the zoom's interior pass),
+  // which would put an empty white plane over the card.
+  const pictureFrame = new THREE.Group();
+  pictureFrame.position.z = 0.001;
+  pictureFrame.visible = false;
+  pictureFrame.add(picture);
+  screen.add(pictureFrame);
+  /** Fit the video's own shape inside the screen (letterbox or pillarbox). */
+  const fitPicture = () => {
+    const vw = video?.videoWidth ?? 0;
+    const vh = video?.videoHeight ?? 0;
+    const aspect = vw > 0 && vh > 0 ? vw / vh : screenW / screenH;
+    const sw = aspect >= screenW / screenH ? screenW : screenH * aspect;
+    picture.scale.set(sw, sw / aspect, 1);
+  };
+  const pictureOn = () => video !== null && (viewState === "playing" || viewState === "paused");
   // The set's glow on the wall and floor while it is on: driven with the view.
   // Registered with World at target 0, so the room's morph pass (which
   // fades every furniture light toward its registered target) zeroes it on
@@ -11201,7 +11230,13 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   const draw = (view: TvScreenView): void => {
     c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
-    if (view.state === "off") {
+    viewState = view.state;
+    pictureFrame.visible = pictureOn();
+    if (pictureFrame.visible) {
+      // The picture is up: the card behind it is the black around it.
+      fill("#000000");
+      glowLevel = 1.1;
+    } else if (view.state === "off") {
       fill("#05070c");
       // A faint reflection so a dark set still reads as glass, not a hole.
       const g = c2d.createLinearGradient(0, 0, TV_TEX_W, TV_TEX_H);
@@ -11281,8 +11316,10 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   };
 
   let last = "";
+  let lastView: TvScreenView | null = null;
   const handle: TvScreenHandle = {
     draw: (view) => {
+      lastView = view;
       const key = JSON.stringify(view);
       if (key !== last) {
         last = key;
@@ -11290,6 +11327,32 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       }
       glow.intensity = glowLevel; // every tick, past the canvas dedupe: the morph pass may have zeroed it
     },
+    showVideo: (v) => {
+      if (v === video) return;
+      videoTex?.dispose();
+      videoTex = null;
+      video?.removeEventListener("loadedmetadata", fitPicture);
+      video = v;
+      if (v) {
+        videoTex = new THREE.VideoTexture(v);
+        videoTex.colorSpace = THREE.SRGBColorSpace;
+        videoTex.minFilter = THREE.LinearFilter;
+        videoTex.magFilter = THREE.LinearFilter;
+        videoTex.generateMipmaps = false;
+        v.addEventListener("loadedmetadata", fitPicture);
+      }
+      pictureMat.map = videoTex;
+      pictureMat.needsUpdate = true;
+      fitPicture();
+      // Redrawn now, not at the next tick: the card goes black (or comes
+      // back) with the picture.
+      last = "";
+      if (lastView) handle.draw(lastView);
+      else pictureFrame.visible = pictureOn();
+    },
+    plane: screen,
+    planeW: screenW,
+    planeH: screenH,
   };
   draw({ state: "off", title: "", detail: "", lane: "", clockText: "" }); // never a black rectangle before the first tick
   screen.userData.tvScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
