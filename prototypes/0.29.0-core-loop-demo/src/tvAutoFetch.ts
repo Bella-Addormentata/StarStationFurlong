@@ -144,6 +144,14 @@ export function noteAutoFetch(hash: string, size: number, now = Date.now()): voi
   }
 }
 
+/** A press took the ask for `hash` (FETCH): AUTO-FETCH makes none of its
+ *  own for it from this page, and charges the day nothing for it — the
+ *  press's answer may still be on its way, with the file's state reading
+ *  'none' until it lands. */
+export function notePressedFetch(hash: string): void {
+  asked.add(hash);
+}
+
 /** Tests: a fresh page. */
 export function resetAutoFetchForTest(): void {
   switchHere = null;

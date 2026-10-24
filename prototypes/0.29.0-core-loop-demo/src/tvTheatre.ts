@@ -44,7 +44,7 @@ import { escapeHtml } from './htmlEscape';
 import { attachScreenHost, detachScreenHost, setScreenHostShown } from './tvScreenLayer';
 import type { TvScreenHandle } from './devices';
 import {
-  autoFetchOn, autoFetchVerdict, noteAutoFetch, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX, TV_AUTO_FETCH_MIN_CHARGE,
+  autoFetchOn, autoFetchVerdict, noteAutoFetch, notePressedFetch, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX, TV_AUTO_FETCH_MIN_CHARGE,
 } from './tvAutoFetch';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
@@ -941,8 +941,12 @@ function autoFetch(source: Extract<TvSource, { kind: 'blob' }>, st: BlobState): 
   autoFetching = source.hash;
   autoFetchAsking = true;
   void fetchBlob(source.hash, source.size, source.provider, source.mime ?? '').then((refused) => {
-    // Kept for the notice the next tick draws: FETCH, with why.
+    // Kept for the notice the next tick draws: FETCH, with why. And the
+    // node asked again what it holds: an answer lost on its way back may
+    // hide a transfer the node did start, and the gate above waits for
+    // the node's word on it, not the 'none' read before the ask.
     blobAskRefused = refused ? { hash: source.hash, why: refused } : null;
+    if (refused) recheckBlob(source.hash);
   }).finally(() => { autoFetchAsking = false; });
 }
 
@@ -1006,6 +1010,7 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
     if (!now || now.kind !== 'blob' || now.hash !== btn.dataset.tvFetch
       || String(now.size) !== btn.dataset.tvFetchSize || now.provider !== btn.dataset.tvFetchFrom) return;
     btn.disabled = true;
+    notePressedFetch(now.hash); // AUTO-FETCH asks for it no more from here, whenever its WHERE lands
     void fetchBlob(now.hash, now.size, now.provider, now.mime ?? '').then((refused) => {
       // Kept for the notice the next tick draws (a button again, with why).
       blobAskRefused = refused ? { hash: now.hash, why: refused } : null;

@@ -4,7 +4,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  autoFetchOn, autoFetchSpent, autoFetchVerdict, noteAutoFetch, resetAutoFetchForTest, setAutoFetchOn,
+  autoFetchOn, autoFetchSpent, autoFetchVerdict, noteAutoFetch, notePressedFetch, resetAutoFetchForTest, setAutoFetchOn,
   TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX, TV_AUTO_FETCH_MIN_CHARGE, TV_AUTO_FETCH_WINDOW_MS,
 } from './tvAutoFetch';
 
@@ -166,5 +166,13 @@ describe('AUTO-FETCH', () => {
     const t1 = t0 + TV_AUTO_FETCH_WINDOW_MS + 1_000;
     for (let i = 0; i < 64; i++) noteAutoFetch(hash(i + 101), small, t1 + i);
     expect(autoFetchSpent(t1 + 64)).toBe(64 * small);
+  });
+
+  it('asks for nothing a press already asked for, and charges the day nothing for it', () => {
+    const t0 = 1_800_000_000_000;
+    notePressedFetch(hash(1));
+    expect(autoFetchVerdict(hash(1), GB, t0)).toBe('asked');
+    expect(autoFetchSpent(t0)).toBe(0);
+    expect(autoFetchVerdict(hash(2), GB, t0)).toBe('go');
   });
 });
