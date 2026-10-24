@@ -12,7 +12,7 @@ import { TV_HEARTBEAT_MS, TV_NUDGE_RATE } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, markTvPageAwake, pickUpRemote, readTv, setTvClock, setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvNoteEnd, tvPlay,
+  bindTvDoc, markTvPageAwake, pickUpRemote, readTv, setTvClock, setTvIdentity, setTvPageId, tvHeartbeat, tvNoteEnd, tvPlay,
   tvSetLoop,
 } from './tvDoc';
 
@@ -1164,7 +1164,6 @@ describe('the controller finds a sleep itself (the real record)', () => {
   it('a viewer whose theatre ticks before the room after a sleep never seeks to the sleep-extrapolated position', () => {
     let now = 1_000_000;
     setTvClock(() => now);
-    setTvHostPredicate(() => false);
     setTvPageId('A');
     bindTvDoc(new Y.Doc());
     setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
@@ -1232,7 +1231,6 @@ describe('🔁 LOOP, through the record', () => {
   it('the holder\'s player ending with LOOP on starts the programme over: the record replays it and the player goes back to 0 and plays; LOOP off, the next end is home', () => {
     let now = 200_000;
     setTvClock(() => now);
-    setTvHostPredicate(() => false);
     setTvPageId('A');
     bindTvDoc(new Y.Doc());
     setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
@@ -1273,7 +1271,6 @@ describe('🔁 LOOP, through the record', () => {
   it('a clip shorter than a tick still plays every lap from the top, never sent to its end unplayed', () => {
     let now = 300_000;
     setTvClock(() => now);
-    setTvHostPredicate(() => false);
     setTvPageId('A');
     bindTvDoc(new Y.Doc());
     setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
@@ -1303,7 +1300,6 @@ describe('🔁 LOOP, through the record', () => {
   it('a viewer of a clip shorter than its tick, ticking out of step with the holder, plays every lap: a room past the end is in the next lap', () => {
     let now = 400_000;
     setTvClock(() => now);
-    setTvHostPredicate(() => false);
     setTvPageId('A');
     bindTvDoc(new Y.Doc());
     setTvIdentity(() => ({ pub: 'AAAAalicepub', name: 'Alice' }));
