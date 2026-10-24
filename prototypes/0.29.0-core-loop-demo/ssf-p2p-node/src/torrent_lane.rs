@@ -1184,4 +1184,90 @@ mod tests {
         assert!(text.contains("not-global:224.0.0.0-255.255.255.255\n"));
         assert!(text.contains("not-global:8000::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff\n"));
     }
+
+    /// Live-swarm probe, not a check: ignored, and run by hand or by the
+    /// temporary `torrent-probe` workflow on a machine that reaches the DHT.
+    /// One session per run, shaped like the lane's (client-only DHT fork,
+    /// the non-global blocklist, LSD off), with `SSF_PROBE_LISTEN=1` adding a
+    /// TCP + uTP listener and `SSF_PROBE_TRACKERS` (comma-separated URLs)
+    /// adding trackers. For each `name=infohash` in `SSF_PROBE_HASHES` it
+    /// prints how long the file list took, the peers it was handed, and what
+    /// SSF_PROBE_SECS seconds of downloading the offered file brought.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_swarm_probe() {
+        let hashes = std::env::var("SSF_PROBE_HASHES").expect("SSF_PROBE_HASHES=name=infohash,…");
+        let listen = std::env::var("SSF_PROBE_LISTEN").is_ok_and(|v| v == "1");
+        let trackers: Vec<String> = std::env::var("SSF_PROBE_TRACKERS").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let secs = env_u64("SSF_PROBE_SECS").unwrap_or(90);
+        let tmp = TempDir::new("live_swarm_probe");
+        let list = tmp.0.join("not-global-unicast.p2p");
+        std::fs::write(&list, blocklist_text()).unwrap();
+        let session = Session::new_with_opts(tmp.0.clone(), SessionOptions {
+            dht: Some(DhtSessionConfig { bootstrap_addrs: None, port: None, persistence: None }),
+            disable_trackers: trackers.is_empty(),
+            fastresume: false,
+            persistence: None,
+            listen: listen.then(|| librqbit::ListenerOptions { mode: librqbit::ListenerMode::TcpAndUtp, ..Default::default() }),
+            blocklist_url: Some(url::Url::from_file_path(&list).unwrap().to_string()),
+            peer_limit: Some(PEER_LIMIT),
+            disable_local_service_discovery: true,
+            ratelimits: LimitsConfig { upload_bps: kbps(DEFAULT_UP_KBPS), download_bps: None },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let variant = format!("listen={listen} trackers={}", trackers.len());
+        let runs = hashes.split(',').filter(|s| !s.trim().is_empty()).map(|entry| {
+            let (name, hash) = entry.trim().split_once('=').expect("name=infohash");
+            let (name, hash) = (name.to_string(), hash.to_string());
+            let session = session.clone();
+            let trackers = trackers.clone();
+            let out = tmp.0.join(&hash);
+            let variant = variant.clone();
+            async move {
+                let opts = || AddTorrentOptions { overwrite: true, disable_trackers: trackers.is_empty(), trackers: (!trackers.is_empty()).then(|| trackers.clone()), ..Default::default() };
+                let t0 = std::time::Instant::now();
+                let listed = tokio::time::timeout(METADATA_TIMEOUT, session.add_torrent(AddTorrent::from_url(format!("magnet:?xt=urn:btih:{hash}")), Some(AddTorrentOptions { list_only: true, ..opts() }))).await;
+                let listed = match listed {
+                    Ok(Ok(AddTorrentResponse::ListOnly(l))) => l,
+                    Ok(Ok(_)) => return println!("PROBE {variant} {name}: answered out of turn"),
+                    Ok(Err(e)) => return println!("PROBE {variant} {name}: error {e:#}"),
+                    Err(_) => return println!("PROBE {variant} {name}: NO FILE LIST in {} s", METADATA_TIMEOUT.as_secs()),
+                };
+                let list_secs = t0.elapsed().as_secs_f32();
+                let seen = listed.seen_peers.len();
+                let files: Vec<(PathBuf, u64)> = listed.info.iter_file_details().map(|d| (d.filename.to_pathbuf(), d.len)).collect();
+                let Some((index, path, size, _)) = pick_file(&files) else {
+                    return println!("PROBE {variant} {name}: list in {list_secs:.1} s, {seen} peers seen, nothing playable");
+                };
+                let added = session
+                    .add_torrent(AddTorrent::from_bytes(listed.torrent_bytes.clone()), Some(AddTorrentOptions {
+                        only_files: Some(vec![index]),
+                        output_folder: Some(out.to_string_lossy().into_owned()),
+                        initial_peers: Some(listed.seen_peers.clone()),
+                        ..opts()
+                    }))
+                    .await
+                    .unwrap();
+                let (id, handle) = match added {
+                    AddTorrentResponse::Added(id, h) | AddTorrentResponse::AlreadyManaged(id, h) => (id, h),
+                    AddTorrentResponse::ListOnly(_) => unreachable!(),
+                };
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                let st = handle.stats();
+                let peers = st.live.as_ref().map(|l| serde_json::to_string(&l.snapshot.peer_stats).unwrap_or_default()).unwrap_or_default();
+                println!(
+                    "PROBE {variant} {name}: list in {list_secs:.1} s, {seen} peers seen; {} of {} MB of {} in {secs} s; peers {peers}",
+                    st.progress_bytes / 1_000_000, size / 1_000_000, path.display()
+                );
+                let _ = session.delete(TorrentIdOrHash::Id(id), true).await;
+            }
+        });
+        let mut set = tokio::task::JoinSet::new();
+        for run in runs {
+            set.spawn(run);
+        }
+        while set.join_next().await.is_some() {}
+    }
 }

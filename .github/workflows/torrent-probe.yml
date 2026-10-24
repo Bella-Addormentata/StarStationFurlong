@@ -1,0 +1,60 @@
+# TEMPORARY diagnostic (smart TV torrent finding no peers): runs the ignored
+# `live_swarm_probe` test against the public swarm, once per variant, on a
+# runner that reaches the DHT. Lives only on the probe branch; never merged.
+name: torrent probe
+
+on:
+  push:
+    branches: [claude/torrent-swarm-probe]
+  workflow_dispatch:
+
+env:
+  RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
+
+jobs:
+  probe:
+    name: 🧲 probe (listen=${{ matrix.listen }}, trackers=${{ matrix.trackers != '' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        listen: ['0', '1']
+        trackers: ['', 'udp://tracker.opentrackr.org:1337/announce,udp://explodie.org:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.demonii.com:1337/announce']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
+          key: probe-ubuntu-22.04
+      - name: 🔨 build the probe
+        run: cargo test --features torrent --no-run --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+      - name: 🐧 control swarm (an Ubuntu ISO's info hash, metadata only)
+        run: |
+          name=$(curl -fsSL https://releases.ubuntu.com/24.04/ | grep -o 'ubuntu-24\.04[.0-9]*-desktop-amd64\.iso\.torrent' | head -1)
+          curl -fsSL "https://releases.ubuntu.com/24.04/$name" -o /tmp/ubuntu.torrent
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import hashlib
+          b = open('/tmp/ubuntu.torrent', 'rb').read()
+          def end(i):
+              c = b[i:i+1]
+              if c == b'i': return b.index(b'e', i) + 1
+              if c in (b'l', b'd'):
+                  i += 1
+                  while b[i:i+1] != b'e': i = end(i)
+                  return i + 1
+              n = b.index(b':', i); return n + 1 + int(b[i:n])
+          k = b.index(b'4:info') + 6
+          print('UBUNTU_HASH=' + hashlib.sha1(b[k:end(k)]).hexdigest())
+          PY
+      - name: 🧲 probe
+        env:
+          SSF_PROBE_LISTEN: ${{ matrix.listen }}
+          SSF_PROBE_TRACKERS: ${{ matrix.trackers }}
+          SSF_PROBE_SECS: '90'
+        run: |
+          export SSF_PROBE_HASHES="sintel=08ada5a7a6183aae1e09d831df6748d566095a10,bigbuckbunny=dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c,tearsofsteel=209c8226b299b308beaf2b9cd3fb49212dbd13ec,cosmoslaundromat=c9e15763f722f23e98a29decdfae341b98d53056,ubuntu=$UBUNTU_HASH"
+          cargo test --features torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml live_swarm_probe -- --ignored --nocapture 2>&1 | tee probe.log
+          echo '### probe listen=${{ matrix.listen }} trackers=${{ matrix.trackers != '' }}' >> "$GITHUB_STEP_SUMMARY"
+          grep '^PROBE' probe.log | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
