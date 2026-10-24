@@ -188,13 +188,10 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
     expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
   });
 
-  it('the TV\'s spare remote registers the deed predicate, not the edit gate', () => {
-    // Taking the remote from its holder (TAKE BACK), or handing theirs on,
-    // unseats them: the same class as the four surfaces above. The TV module
-    // takes its predicate through a seam, so the scan pins the registration.
-    expect(main).toContain('setTvHostPredicate(() => currentRoomDeedIsMine())');
-    expect(main).not.toMatch(/setTvHostPredicate\(\(\) => canEditRoom/);
-    expect(main).not.toMatch(/setTvHostPredicate\(\(\) => isLocalPlayerRoomOwner/);
+  it('the TV has no spare remote to register: any SpacePhone\'s press controls the set (#258)', () => {
+    // There is no remote to take from anyone, so nobody is unseated and no
+    // owner predicate is owed: the seam is gone, not left open to a gate.
+    expect(main).not.toContain('setTvHostPredicate');
   });
 
   it('the arcade cabinet ejects P1 on the deed predicate and curates on the edit gate', () => {

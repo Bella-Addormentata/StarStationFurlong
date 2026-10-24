@@ -1,16 +1,16 @@
 /**
- * 📺 tvDoc — the TV's records against a real Y.Doc: the remote as
- * possession (pick up, hand over, put down, lapse, the owner's spare), the
- * holder-gated programme writes, the shape-checked reads that survive a
+ * 📺 tvDoc — the TV's records against a real Y.Doc: the room's clock
+ * (whoever pressed last: any press takes it, it lapses, it is let go), the
+ * clock page's own writes, the shape-checked reads that survive a
  * peer's garbage, and the sync maths that never compares two clocks.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, claimRemote, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, holderAnchorMs, iHoldRemote, isStartOnly,
-  markTvPageAwake, mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readPower, readProgramme,
+  bindTvDoc, countdownText, driftAction, expectedPositionMs, formatClock, holderAnchorMs, iHoldRemote, isStartOnly,
+  markTvPageAwake, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readPower, readProgramme,
   readRemote, readSample, readTv, remoteKey, remoteStatus, renewRemote, sanitizeSource, setTvClock,
-  setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, sourceLane, subscribeTvKey, tvHeartbeat,
+  setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, sourceLane, subscribeTvKey, tvHeartbeat,
   tvKey, tvNoteEnd, tvPause, tvPlay, tvProgrammeEnded, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetLoop, tvSetVolume, tvStop,
   tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
   TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey, libraryKey, readLibrary, TV_HOME_RECENT, TV_LIBRARY_MAX,
@@ -33,27 +33,87 @@ beforeEach(() => {
   doc = new Y.Doc();
   now = 1_000_000;
   setTvClock(() => now);
-  setTvHostPredicate(() => false);
   setTvPageId('A');
   bindTvDoc(doc);
   iAm(ALICE, 'Alice');
 });
 
-describe('the remote as possession', () => {
-  it('starts on the set, and anyone may pick it up', () => {
+describe('the room\'s clock: whoever pressed last', () => {
+  it('starts with nobody, and any press takes it for the presser\'s page', () => {
     expect(remoteStatus(TV)).toBe('free');
-    expect(mayPickUpRemote(TV)).toBe(true);
-    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    expect(tvPlay(TV, FILM)).toEqual({ ok: true });
     expect(iHoldRemote(TV)).toBe(true);
     expect(readRemote(TV)).toEqual({ holder: ALICE, name: 'Alice', leaseAt: now, by: ALICE, page: 'A' });
   });
 
-  it('is refused to a second player while the holder keeps renewing', () => {
-    pickUpRemote(TV);
+  it('a second player\'s press goes through while the first keeps the clock, and the clock is theirs from then on', () => {
+    tvPlay(TV, FILM);
     iAm(BOB, 'Bob');
+    setTvPageId('B');
     expect(remoteStatus(TV)).toBe('held');
-    expect(pickUpRemote(TV)).toEqual({ ok: false, error: 'Alice is holding the remote.' });
-    expect(tvPlay(TV, FILM)).toEqual({ ok: false, error: 'Alice has the remote.' });
+    expect(tvPause(TV, 5_000)).toEqual({ ok: true });
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 5_000 });
+    expect(readRemote(TV)).toMatchObject({ holder: BOB, name: 'Bob', page: 'B' });
+    expect(iHoldRemote(TV)).toBe(true);
+    // Alice's page keeps it no longer: nothing to renew, and her player's beat is refused.
+    iAm(ALICE, 'Alice');
+    setTvPageId('A');
+    expect(iHoldRemote(TV)).toBe(false);
+    const lease = readRemote(TV).leaseAt;
+    tick(1000);
+    renewRemote(TV);
+    expect(readRemote(TV).leaseAt).toBe(lease);
+    expect(tvHeartbeat(TV, 6_000)).toEqual({ ok: false, error: 'This page does not keep this TV\'s clock.' });
+    // Her next press takes it back.
+    expect(tvResume(TV)).toEqual({ ok: true });
+    expect(readRemote(TV).holder).toBe(ALICE);
+  });
+
+  it('every press on the programme goes through from anyone, each taking the clock', () => {
+    tvPlay(TV, CLIP);
+    const presses: Array<() => { ok: boolean }> = [
+      () => tvPause(TV, 1_000),
+      () => tvResume(TV),
+      () => tvSeek(TV, 2_000),
+      () => tvSetLoop(TV, true),
+      () => tvSchedule(TV, FILM, now + 60_000),
+      () => tvPlay(TV, FILM),
+      () => tvStop(TV),
+    ];
+    presses.forEach((go, n) => {
+      const who = `CCCC${n}pub`;
+      iAm(who);
+      setTvPageId(`P${n}`);
+      expect(go()).toEqual({ ok: true });
+      expect(readRemote(TV)).toMatchObject({ holder: who, page: `P${n}` });
+    });
+    expect(readTv(TV).state).toBe('home');
+  });
+
+  it('a press that changes nothing leaves the clock where it is', () => {
+    tvPlay(TV, CLIP);
+    iAm(BOB, 'Bob');
+    setTvPageId('B');
+    expect(tvResume(TV)).toEqual({ ok: false, error: 'Nothing is paused.' });
+    expect(tvSetLoop(TV, false)).toEqual({ ok: true }); // off already
+    expect(tvPlay(TV, { kind: 'url', url: 'ftp://x/y.mp4' }).ok).toBe(false);
+    expect(tvSchedule(TV, FILM, now - 1).ok).toBe(false);
+    expect(readRemote(TV).holder).toBe(ALICE);
+  });
+
+  it('what only the clock\'s page writes stays its own: the beat, the end, the close at the end', () => {
+    expect(tvHeartbeat(TV, 1_000)).toEqual({ ok: false, error: 'This page does not keep this TV\'s clock.' });
+    expect(tvNoteEnd(TV, 30_000).ok).toBe(false);
+    expect(tvProgrammeEnded(TV).ok).toBe(false);
+    tvPlay(TV, CLIP);
+    expect(tvHeartbeat(TV, 1_000)).toEqual({ ok: true });
+    expect(tvNoteEnd(TV, 30_000)).toEqual({ ok: true });
+    iAm(BOB, 'Bob');
+    setTvPageId('B');
+    expect(tvHeartbeat(TV, 2_000).ok).toBe(false);
+    expect(tvNoteEnd(TV, 40_000).ok).toBe(false);
+    expect(tvProgrammeEnded(TV).ok).toBe(false);
+    expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: 1_000, endMs: 30_000 });
   });
 
   it('lapses by the renewals THIS page saw, never by the holder\'s clock', () => {
@@ -84,39 +144,21 @@ describe('the remote as possession', () => {
     expect(remoteStatus(TV)).toBe('free');
   });
 
-  it('hands over without an accept step, and only the holder may', () => {
-    pickUpRemote(TV);
-    expect(handRemote(TV, BOB, 'Bob')).toEqual({ ok: true });
-    // `by` names the GIVER: Bob's phone can tell a hand-over from his own pick-up.
-    expect(readRemote(TV)).toEqual({ holder: BOB, name: 'Bob', leaseAt: now, by: ALICE, page: '' });
-    expect(iHoldRemote(TV)).toBe(false);
-    // Alice no longer holds it; she may not hand it on to a third player.
-    expect(handRemote(TV, 'CCCCcarolpub', 'Carol')).toEqual({ ok: false, error: 'You are not holding the remote.' });
-    // Bob may not hand it to himself.
+  it('is let go only by the page that keeps it: a press elsewhere since then is left with it', () => {
+    tvPlay(TV, FILM);
+    setTvPageId('B'); // Alice's other tab
+    expect(putDownRemote(TV)).toEqual({ ok: true });
+    expect(readRemote(TV).page).toBe('A'); // nothing written
     iAm(BOB, 'Bob');
-    expect(handRemote(TV, BOB, 'Bob')).toEqual({ ok: false, error: 'Pick someone else.' });
-  });
-
-  it('goes back on the set when put down, and only the holder may', () => {
-    pickUpRemote(TV);
-    iAm(BOB);
-    expect(putDownRemote(TV)).toEqual({ ok: false, error: 'Alice is holding the remote.' });
-    iAm(ALICE);
+    expect(putDownRemote(TV)).toEqual({ ok: true });
+    expect(readRemote(TV).holder).toBe(ALICE);
+    iAm(ALICE, 'Alice');
+    setTvPageId('A');
     expect(putDownRemote(TV)).toEqual({ ok: true });
     expect(remoteStatus(TV)).toBe('free');
   });
 
-  it('the owner has the spare: may take it from anyone, hand it, or put it down', () => {
-    pickUpRemote(TV);
-    iAm(BOB, 'Bob');
-    setTvHostPredicate(() => true);
-    expect(mayPickUpRemote(TV)).toBe(true);
-    expect(putDownRemote(TV)).toEqual({ ok: true });
-    expect(pickUpRemote(TV)).toEqual({ ok: true });
-    expect(readRemote(TV).holder).toBe(BOB);
-  });
-
-  it('a holder that slept past the lapse has let go by its own watch: not mine on waking, not renewed, picked up again like anyone', () => {
+  it('a holder that slept past the lapse has let go by its own watch: not its own on waking, not renewed, and its next press takes it afresh', () => {
     pickUpRemote(TV);
     tvPlay(TV, FILM);
     const lease = readRemote(TV).leaseAt;
@@ -125,12 +167,10 @@ describe('the remote as possession', () => {
     now += 1; // the tab slept through its renewals
     expect(remoteStatus(TV)).toBe('free');
     expect(iHoldRemote(TV)).toBe(false);
-    renewRemote(TV); // waking up renewing would race whoever took over meanwhile
+    renewRemote(TV); // waking up renewing would race whoever pressed meanwhile
     expect(readRemote(TV).leaseAt).toBe(lease);
-    expect(tvSeek(TV, 5_000)).toEqual({ ok: false, error: 'Pick up the remote first.' });
-    // Free to everyone, this page included: picked up again, a fresh lease.
-    expect(mayPickUpRemote(TV)).toBe(true);
-    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    expect(tvHeartbeat(TV, 5_000).ok).toBe(false);
+    expect(tvSeek(TV, 5_000)).toEqual({ ok: true }); // a press, like anyone's
     expect(readRemote(TV).leaseAt).toBe(now);
     expect(remoteStatus(TV)).toBe('mine');
   });
@@ -141,7 +181,7 @@ describe('the remote as possession', () => {
     expect(remoteStatus(TV)).toBe('free');
   });
 
-  it('is held by a PAGE, not a key: a second tab of the same identity is a viewer, and may take over', () => {
+  it('is kept by a PAGE, not a key: a second tab of the same identity is a viewer until it presses', () => {
     pickUpRemote(TV);
     tvPlay(TV, FILM);
     const lease = readRemote(TV).leaseAt;
@@ -151,76 +191,11 @@ describe('the remote as possession', () => {
     tick(1000);
     renewRemote(TV);
     expect(readRemote(TV).leaseAt).toBe(lease); // not this tab's to renew
-    expect(tvHeartbeat(TV, 5_000)).toEqual({ ok: false, error: 'You are holding the remote in another tab.' });
-    expect(mayPickUpRemote(TV)).toBe(true); // one person, one place: the newer tab takes it
-    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    expect(tvHeartbeat(TV, 5_000)).toEqual({ ok: false, error: 'Your other tab keeps this TV\'s clock.' });
+    expect(tvSeek(TV, 5_000)).toEqual({ ok: true });
     expect(readRemote(TV).page).toBe('B');
     setTvPageId('A');
     expect(iHoldRemote(TV)).toBe(false);
-  });
-
-  it('a handed remote belongs to the first of the receiver\'s pages to claim it', () => {
-    pickUpRemote(TV);
-    handRemote(TV, BOB, 'Bob');
-    expect(readRemote(TV).page).toBe('');
-    iAm(BOB, 'Bob');
-    setTvPageId('B1');
-    expect(iHoldRemote(TV)).toBe(false);
-    expect(claimRemote(TV)).toBe(true);
-    expect(iHoldRemote(TV)).toBe(true);
-    expect(readRemote(TV)).toMatchObject({ holder: BOB, page: 'B1', by: ALICE }); // the giver stays on it: the phone pops open
-    setTvPageId('B2');
-    expect(claimRemote(TV)).toBe(false); // claimed already
-    expect(iHoldRemote(TV)).toBe(false);
-  });
-
-  it('a hand-over the receiver\'s page slept through is not claimed on waking: lapsed by its own watch, the remote is free again', () => {
-    pickUpRemote(TV);
-    handRemote(TV, BOB, 'Bob');
-    const handed = readRemote(TV);
-    iAm(BOB, 'Bob');
-    setTvPageId('B1');
-    tick(TV_LEASE_LAPSE_MS); // a closed lid between the hand-over landing and the first tick
-    expect(claimRemote(TV)).toBe(false);
-    expect(readRemote(TV)).toEqual(handed); // nothing written: no lease revived under Bob's name
-    expect(iHoldRemote(TV)).toBe(false);
-    expect(remoteStatus(TV)).toBe('free'); // Bob picks it up again, like anyone — unless someone else did first
-    expect(pickUpRemote(TV)).toEqual({ ok: true });
-    expect(iHoldRemote(TV)).toBe(true);
-  });
-
-  it('a hand-over DELIVERED on waking — held by the network through the sleep — is not claimed either: stamped with the page\'s last waking moment, not the moment it landed', () => {
-    const handedTo = (pub: string, leaseAt: number) => {
-      const giver = new Y.Doc(); // Alice's doc, where the hand-over was written while Bob's page slept
-      giver.getMap('tv').set(remoteKey(TV), { holder: pub, name: 'Bob', leaseAt, by: ALICE, page: '' });
-      return Y.encodeStateAsUpdate(giver);
-    };
-    iAm(BOB, 'Bob');
-    setTvPageId('B1');
-    // The update applies before the first tick back.
-    markTvPageAwake(now); // Bob's room tick, running normally…
-    const a = handedTo(BOB, now);
-    tick(TV_LEASE_LAPSE_MS + 60_000); // …then a closed lid: no ticks, and the update waits in the network
-    Y.applyUpdate(doc, a); // delivered as the lid opens
-    expect(claimRemote(TV)).toBe(false);
-    expect(iHoldRemote(TV)).toBe(false);
-    expect(remoteStatus(TV)).toBe('free'); // lapsed by Bob's own watch: picked up again, like anyone
-    // The other order: the first tick back runs before the queued update applies.
-    bindTvDoc(doc = new Y.Doc());
-    markTvPageAwake(now);
-    const b = handedTo(BOB, now);
-    tick(TV_LEASE_LAPSE_MS + 60_000);
-    markTvPageAwake(now); // the tick back…
-    Y.applyUpdate(doc, b); // …and the update a moment later
-    expect(claimRemote(TV)).toBe(false);
-    expect(remoteStatus(TV)).toBe('free');
-    // A page that stayed awake sees the hand-over the moment it lands, and claims it.
-    bindTvDoc(doc = new Y.Doc());
-    const c = handedTo(BOB, now);
-    for (let i = 0; i < 20; i++) { tick(500); markTvPageAwake(now); } // ten seconds of ticks, no gap
-    Y.applyUpdate(doc, c);
-    expect(claimRemote(TV)).toBe(true);
-    expect(iHoldRemote(TV)).toBe(true);
   });
 });
 
@@ -378,7 +353,7 @@ describe('the programme', () => {
     expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_500 });
   });
 
-  it('whoever turns the set on has the remote placed in their hand, a live holder\'s included (#186 as written)', () => {
+  it('turning the set on is a press like any: the presser\'s page keeps the clock, a live keeper\'s included', () => {
     putDownRemote(TV);
     expect(remoteStatus(TV)).toBe('free');
     expect(tvTogglePower(TV)).toBe(true);
@@ -404,12 +379,12 @@ describe('the programme', () => {
   it('the body buttons need no remote: power keeps the programme, volume is the set\'s', () => {
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 60_000);
-    iAm(BOB, 'Bob'); // not the holder
+    iAm(BOB, 'Bob'); // not the clock's
     const revision = tvRevision(TV);
     expect(tvTogglePower(TV)).toBe(false);
     expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: 60_000 });
     expect(tvRevision(TV)).not.toBe(revision); // a lookup in flight is void
-    expect(tvHeartbeat(TV, 61_000)).toEqual({ ok: false, error: 'Alice has the remote.' });
+    expect(tvHeartbeat(TV, 61_000)).toEqual({ ok: false, error: 'This page does not keep this TV\'s clock.' }); // OFF took nothing
     expect(tvTogglePower(TV)).toBe(true);
     // The switch is its own key: the programme comes back as it was, and the
     // holder's tick parks it (tvSession); nothing of the programme's was written.
@@ -778,7 +753,7 @@ describe('the programme', () => {
     expect(readPlayback(TV)).toMatchObject({ stale: true, positionMs: 10_000 + 500 + 3_600_000 + 500 + 3_600_000 });
   });
 
-  it('a gap the wall clock alone finds (the monotonic clock stood still through a sleep, or stepped while awake: one tick\'s worth where an hour passed) is AMBIGUOUS — stale and lapsed as a sleep, never bridged as one — and a hand-over delivered on waking is stamped from before it', () => {
+  it('a gap the wall clock alone finds (the monotonic clock stood still through a sleep, or stepped while awake: one tick\'s worth where an hour passed) is AMBIGUOUS — stale and lapsed as a sleep, never bridged as one — and a lease delivered on waking is stamped from before it', () => {
     let wall = 1_700_000_000_000;
     setTvClock(() => now, () => wall);
     pickUpRemote(TV);
@@ -799,22 +774,21 @@ describe('the programme', () => {
     const woke = readPlayback(TV);
     expect(woke.stale).toBe(true);
     expect(woke.positionMs).toBe(10_000 + 1_000);
-    // A hand-over held by the network through that sleep, delivered on
-    // waking BEFORE the first tick back: stamped with the last mark before
-    // the gap, which the wall clock finds where the monotonic clock sees
-    // none — lapsed by this page's own watch, not claimed.
+    // A press elsewhere held by the network through that sleep, its lease
+    // delivered on waking BEFORE the first tick back: stamped with the last
+    // mark before the gap, which the wall clock finds where the monotonic
+    // clock sees none — lapsed by this page's own watch.
     tick(500);
     wall += 500;
     markTvPageAwake(now);
     iAm(BOB, 'Bob');
     setTvPageId('B1');
-    const giver = new Y.Doc();
-    giver.getMap('tv').set(remoteKey(TV), { holder: BOB, name: 'Bob', leaseAt: now, by: ALICE, page: '' });
-    const update = Y.encodeStateAsUpdate(giver);
+    const presser = new Y.Doc();
+    presser.getMap('tv').set(remoteKey(TV), { holder: 'CCCCcarolpub', name: 'Carol', leaseAt: now, by: 'CCCCcarolpub', page: 'C1' });
+    const update = Y.encodeStateAsUpdate(presser);
     tick(500);
     wall += TV_LEASE_LAPSE_MS + 60_000; // the second sleep: no tick yet
     Y.applyUpdate(doc, update);
-    expect(claimRemote(TV)).toBe(false);
     expect(remoteStatus(TV)).toBe('free');
     // The first tick back marks the gap; a hold taken up after it is seen
     // afresh, and the lease that lapsed stays lapsed by the bridged measure.
@@ -1213,8 +1187,11 @@ describe('sources', () => {
 });
 
 describe('🔁 LOOP', () => {
-  it('is the holder\'s to set, neither a sample nor a transport action, kept across programmes, and read as a boolean whatever a peer wrote', () => {
-    expect(tvSetLoop(TV, true).ok).toBe(false); // nobody holds the remote
+  it('is anyone\'s to set, neither a sample nor a transport action, kept across programmes, and read as a boolean whatever a peer wrote', () => {
+    iAm(BOB, 'Bob');
+    expect(tvSetLoop(TV, true)).toEqual({ ok: true }); // nothing on: the set's setting all the same
+    expect(tvSetLoop(TV, false)).toEqual({ ok: true });
+    iAm(ALICE, 'Alice');
     pickUpRemote(TV);
     tvPlay(TV, CLIP);
     const { seq, jump, started } = readTv(TV);
@@ -1225,7 +1202,9 @@ describe('🔁 LOOP', () => {
     expect(readTv(TV).loop).toBe(true); // the set's setting: the next film loops too
     iAm(BOB);
     setTvPageId('B');
-    expect(tvSetLoop(TV, false).ok).toBe(false); // not the holder
+    expect(tvSetLoop(TV, false)).toEqual({ ok: true }); // Bob's press, from his own page
+    expect(readTv(TV).loop).toBe(false);
+    expect(readRemote(TV).holder).toBe(BOB);
     doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), loop: 'yes' });
     expect(readProgramme(TV).loop).toBe(false);
   });
@@ -1307,21 +1286,21 @@ describe('🔁 LOOP', () => {
 describe('the in-world screen', () => {
   it('derives its view from the records alone', () => {
     expect(tvScreenView(TV)).toMatchObject({ state: 'off', title: '' });
-    tvTogglePower(TV); // turning the set on puts the remote in Alice's hand (#186)
-    expect(tvScreenView(TV)).toMatchObject({ state: 'home', title: 'FURLONG TV', detail: 'REMOTE · Alice' });
-    putDownRemote(TV);
-    expect(tvScreenView(TV).detail).toBe('REMOTE ON THE SET');
-    pickUpRemote(TV);
-    expect(tvScreenView(TV).detail).toBe('REMOTE · Alice');
+    tvTogglePower(TV); // turning the set on is a press: Alice's page keeps the clock
+    expect(tvScreenView(TV)).toMatchObject({ state: 'home', title: 'FURLONG TV', detail: 'ANY SPACEPHONE IS THE REMOTE' });
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 61_000);
-    expect(tvScreenView(TV)).toMatchObject({ state: 'playing', title: 'METROPOLIS', lane: 'CONVENIENCE', clockText: '1:01' });
+    expect(tvScreenView(TV)).toMatchObject({
+      state: 'playing', title: 'METROPOLIS', lane: 'CONVENIENCE', clockText: '1:01', detail: 'LAST PRESS · Alice',
+    });
     tvPause(TV, 61_000);
-    expect(tvScreenView(TV).detail).toBe('PAUSED · REMOTE · Alice');
+    expect(tvScreenView(TV).detail).toBe('PAUSED · LAST PRESS · Alice');
     tvSetLoop(TV, true);
-    expect(tvScreenView(TV).detail).toBe('PAUSED · LOOP · REMOTE · Alice');
+    expect(tvScreenView(TV).detail).toBe('PAUSED · LOOP · LAST PRESS · Alice');
     tvResume(TV);
-    expect(tvScreenView(TV).detail).toBe('LOOP · REMOTE · Alice');
+    expect(tvScreenView(TV).detail).toBe('LOOP · LAST PRESS · Alice');
+    putDownRemote(TV); // Alice's page leaves: the room runs on by itself
+    expect(tvScreenView(TV).detail).toBe('LOOP');
   });
 });
 
