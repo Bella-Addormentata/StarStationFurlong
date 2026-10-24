@@ -550,6 +550,7 @@ describe('what a table pays a player', () => {
     sync(docA, docB);
     for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(70);
     pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 0);
+    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, -20); // round 2 is paid: nothing
     pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 2 ** 52);
     pageA.creditTableOutcome(TABLE, 'inc1', 4, PLAYER, -(2 ** 52));
     pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 0.5);
@@ -557,6 +558,25 @@ describe('what a table pays a player', () => {
     pageA.creditTableOutcome(TABLE, 'inc1', 6, PLAYER, 45);
     expect(pageA.readChips(PLAYER)).toBe(115);
   });
+
+  for (const [winner, clientA, clientB, after] of [['nothing', 2, 1, 100], ['the loss', 1, 2, 80]] as const) {
+    it(`a round that moved nothing on one page and lost on the other pays one of the two (${winner} winning ties)`, async () => {
+      docA = new Y.Doc();
+      docB = new Y.Doc();
+      docA.clientID = clientA;
+      docB.clientID = clientB;
+      pageA = await loadPage(docA);
+      pageB = await loadPage(docB);
+      pageA.buyInChips(PLAYER, 100);
+      sync(docA, docB);
+      // Two pages settled one roll, each from its own view: on a, the place
+      // bet stood (paid nothing, held on); on b it lost.
+      pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 0);
+      pageB.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, -20);
+      sync(docA, docB);
+      for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(after);
+    });
+  }
 
   it('rides one record per table and player, however many rounds it pays', () => {
     for (let round = 1; round <= 50; round++) pageA.creditTableOutcome(TABLE, 'inc1', round, PLAYER, 2);

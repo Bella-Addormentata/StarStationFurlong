@@ -27,7 +27,7 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { canRunCroupier, timerOnThisClock } from './croupier';
+import { timerOnThisClock } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
@@ -471,25 +471,21 @@ export function tickAutoStickman(tableId: string): void {
 
 /**
  * Tear a craps table down cleanly on removal (mirrors croupier.closeTable).
- * Held stakes go back as their lists go. The REFUND of an earlier build's
- * standing bets (it took their chips) runs ONLY on the deed holder's pages,
- * and counts once however many of them run it (creditTableOutcome); every
- * client then wipes the table's casino keys (idempotent LWW delete). A manual
- * venture/legacy room has no operator, so those are not refunded (matches the
- * manual-mode limitation).
+ * Held stakes go back as their lists go. The REFUND of what an earlier build's
+ * standing bets took runs on every page that hears of the removal, and counts
+ * once however many run it (creditTableOutcome); every client then wipes the
+ * table's casino keys (idempotent LWW delete).
  */
 export function closeCrapsTable(tableId: string): void {
   // One transaction: no page sees the refunds without the table gone.
   transactCasino(() => {
-    if (canRunCroupier()) {
-      const inc = readCrapsTableState(tableId)?.inc ?? '';
-      for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
-        // A held stake goes back with its list. What an earlier build's list
-        // took, each of the deed holder's pages refunds, and the page driving
-        // the table may be settling a roll meanwhile: the table's one outcome
-        // per bettor pays one of them (croupier.closeTable).
-        if (taken > 0) creditTableOutcome(tableId, inc, 'end', pid, taken);
-      }
+    const inc = readCrapsTableState(tableId)?.inc ?? '';
+    for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
+      // A held stake goes back with its list. What an earlier build's list
+      // took, each page refunds, and the page driving the table may be
+      // settling a roll meanwhile: the table's one outcome per bettor pays
+      // one of them (croupier.closeTable).
+      if (taken > 0) creditTableOutcome(tableId, inc, 'end', pid, taken);
     }
     clearTableKeys(tableId);
   });

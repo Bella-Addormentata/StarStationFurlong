@@ -86,7 +86,9 @@
  * leaves `gone:<tableId>:<inc>` behind: a state of a removed incarnation
  * reads as no table and holds nothing, and a list belongs to the incarnation
  * it was put down on (its `inc`), so a table put back under the same id
- * starts clean.
+ * starts clean. A list this build put down on an earlier build's state
+ * carries none, and plays on until the table is first removed, which also
+ * leaves `gone:<tableId>:`.
  *
  * The HOUSE keeps no stored record at all — everything about the cage is
  * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
@@ -479,9 +481,11 @@ const MAX_TABLE_OUTCOME = Number.MAX_SAFE_INTEGER - TABLE_RECORD_FULL;
 /**
  * Move `amount` chips to `playerId` (negative: from them) for one outcome of
  * one table: a settled round (`outcome` its number: what it paid less what it
- * took off the felt) or the table's removal ('end': an earlier build's stakes
- * refunded). Two of the deed
- * holder's pages can each carry out the same outcome (both refund a removed
+ * took off the felt) or the table's removal ('end': what an earlier build's
+ * stakes took, refunded). A round writes its outcome for every bettor, even
+ * one that moves nothing, so it competes with another page's settle of the
+ * same round on the same record, as the state and the kept bets do. Two
+ * pages can each carry out the same outcome (both refund a removed
  * table), or two that exclude each other (one settles a round while the other
  * removes the table), before either hears of the other. So what a table pays a
  * player rides one record per table incarnation and player,
@@ -500,7 +504,7 @@ const MAX_TABLE_OUTCOME = Number.MAX_SAFE_INTEGER - TABLE_RECORD_FULL;
 export function creditTableOutcome(
   tableId: string, inc: string, outcome: number | 'end', playerId: string, amount: number,
 ): void {
-  if (!Number.isSafeInteger(amount) || amount === 0 || Math.abs(amount) > MAX_TABLE_OUTCOME) return;
+  if (!Number.isSafeInteger(amount) || Math.abs(amount) > MAX_TABLE_OUTCOME) return;
   if (playerId.length === 0 || playerId.length > 256) return;
   const map = ensureChips();
   const base = `tbl:${tableId}:${inc}:${playerId}`;
@@ -619,8 +623,15 @@ export function clearTableKeys(tableId: string): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
   boundDoc!.transact(() => {
+    // The incarnation removed, and any before it that had none: a list this
+    // build put down on one of those carries none either (ofIncarnation). No
+    // mark for a table this page never saw up (a page leaving a room for one
+    // without it reconciles the old room's tables away).
     const was = map.get(`table:${tableId}`);
-    if (isRouletteTableState(was) || isCrapsTableState(was)) map.set(goneKey(tableId, was.inc ?? ''), 1);
+    if (isRouletteTableState(was) || isCrapsTableState(was)) {
+      if (was.inc !== undefined) map.set(goneKey(tableId, was.inc), 1);
+      map.set(goneKey(tableId, ''), 1);
+    }
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
     // 🎲 The per-table config keys ride the same map — a removed table must
@@ -739,9 +750,10 @@ function storedList<B extends { amount: number }>(
 }
 
 /** The incarnation of a table its lists must carry to play there: the live
- *  state's (none: no table up), and whether lists carrying none still belong
- *  (`bare`: until a table with no incarnation, an earlier build's, has been
- *  removed under this id). */
+ *  state's (none: no table up), and whether this build's lists carrying none
+ *  still belong (`bare`: until the table has been removed under this id once,
+ *  the only time a state with no incarnation, an earlier build's, can have
+ *  been live while this build put lists down on it). */
 interface Incarnation {
   inc: string | undefined;
   bare: boolean;
@@ -752,11 +764,12 @@ function incarnationOf(map: Y.Map<unknown>, tableId: string, s: { inc?: string }
 }
 
 /** Whether a stored list was put down on the incarnation `at` of its table. A
- *  held list put down on a table that had one carries it; an earlier build's
- *  list, or one from before its table had one, carries none and goes with
- *  whichever is up, unless such a table was removed here. */
+ *  held list put down on a table that had one carries it, and one put down on
+ *  an earlier build's state, which had none, goes with whichever is up until
+ *  the table is removed. An earlier build's own list carries none and goes
+ *  with whichever is up: such a page may still be betting. */
 function ofIncarnation(t: { inc?: unknown }, held: boolean, at: Incarnation): boolean {
-  if (t.inc === undefined) return at.bare;
+  if (t.inc === undefined) return held ? at.bare : true;
   return held && isTableIncField(t.inc) && t.inc === at.inc;
 }
 

@@ -264,8 +264,10 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // takes what it held and pays what it won. What an earlier build's list
   // took isn't held: its win is paid in full, and a stake the round gives
   // back is refunded.
+  // Every bettor, and every list that hands back what an earlier build took
+  // (one taken all down holds below 0 and isn't among the live bets).
   const owed: Record<string, number> = {};
-  for (const pid of new Set([...Object.keys(live), ...rewritten])) {
+  for (const pid of new Set([...Object.keys(live), ...rewritten, ...Object.keys(readFeltStakes(tableId))])) {
     const held = heldAtClose(tableId, before, pid);
     let delta: number;
     // A bet that missed the freeze (it arrived just after "no more bets"),
@@ -277,7 +279,7 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     else if (rewritten.includes(pid)) delta = -held;
     // (A forfeit wins nothing.)
     else delta = (payouts[pid] ?? 0) - held;
-    if (delta !== 0) owed[pid] = delta;
+    owed[pid] = delta;
   }
   const now = Date.now();
   // One transaction: a page sees the settled round and what it paid together.
@@ -415,23 +417,21 @@ export function timerOnThisClock(
  * Tear a table down cleanly on removal from a room. Safe to call on any client.
  * Stakes held on the felt go back to their players as the lists go. The REFUND
  * of what an earlier build's lists took on an unresolved round (once the
- * records vanish there is no other credit-back path) runs ONLY on the deed
- * holder's pages (canRunCroupier), and counts once however many of them run
- * it (creditTableOutcome); every client then wipes the table's casino keys
- * (idempotent LWW delete) so no orphan records survive. In a manual
- * venture/legacy room there is no operator, so what they took is not
- * refunded (matches the manual-mode limitation); held stakes still go back.
+ * records vanish there is no other credit-back path) runs on every page that
+ * hears of the removal, manual rooms too, and counts once however many run it
+ * (creditTableOutcome); every client then wipes the table's casino keys
+ * (idempotent LWW delete) so no orphan records survive.
  */
 export function closeTable(tableId: string): void {
   // One transaction: no page sees the refunds without the table gone.
   transactCasino(() => {
     const s = readTableState(tableId);
-    if (canRunCroupier() && s && s.phase !== 'settled') {
+    if (s && s.phase !== 'settled') {
       for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
         // A held stake goes back with its list. What an earlier build's list
-        // took, each of the deed holder's pages refunds, whichever removed
-        // the table first, and the page driving it may be settling this very
-        // round: the table's one outcome per bettor pays one.
+        // took, each page refunds, whichever heard of the removal first, and
+        // the page driving it may be settling this very round: the table's
+        // one outcome per bettor pays one.
         if (taken > 0) creditTableOutcome(tableId, s.inc ?? '', 'end', pid, taken);
       }
     }

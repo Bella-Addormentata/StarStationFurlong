@@ -139,7 +139,7 @@ class LocalCrapsBackend implements CrapsBackend {
           settledRound(tableId, before);
           for (const pid of voided) {
             const held = heldAtClose(tableId, before, pid);
-            if (held !== 0) creditTableOutcome(tableId, before.inc ?? '', round, pid, -held);
+            creditTableOutcome(tableId, before.inc ?? '', round, pid, -held);
             pruneCrapsBets(tableId, pid, round, []);
           }
         });
@@ -204,7 +204,7 @@ class LocalCrapsBackend implements CrapsBackend {
     for (const [pid, left] of Object.entries(remaining)) {
       const stays = left.reduce((n, b) => n + b.amount, 0);
       const delta = (payouts[pid] ?? 0) - heldAtClose(tableId, before, pid) + stays;
-      if (delta !== 0) owed[pid] = delta;
+      owed[pid] = delta;
     }
     const now = Date.now();
     // One transaction: a page sees the settled roll, what it paid, and the
