@@ -17,7 +17,7 @@
  * same film shared again in that room plays at once.
  */
 import type { ShrinkAsk, ShrinkSay } from './tvShrinkWorker';
-import { blobLaneNodeId, blobLaneRoom, blobStateNow, blobUrl, importBlob } from './blobLane';
+import { blobLaneGeneration, blobLaneNodeId, blobLaneRoom, blobStateNow, blobUrl, importBlob } from './blobLane';
 import { sanitizeSource } from './tvDoc';
 import type { TvBlobSource } from './tvDoc';
 
@@ -46,6 +46,9 @@ export function shrinkSupported(): boolean {
 interface Job {
   hash: string;
   room: string;
+  /** The node it is made on (blobLaneGeneration): a node restarted or
+   *  switched meanwhile holds neither the film nor its copy. */
+  node: number;
   ready: Promise<Ready | null>;
   onProgress: (done: number) => void;
   stop: () => void;
@@ -58,7 +61,8 @@ let job: Job | null = null;
  *  or the room or node changed meanwhile: the share is void. */
 export function readyForRoom(original: TvBlobSource, onProgress: (done: number) => void = () => undefined): Promise<Ready | null> {
   const room = blobLaneRoom();
-  if (job && job.hash === original.hash && job.room === room) {
+  const node = blobLaneGeneration();
+  if (job && job.hash === original.hash && job.room === room && job.node === node) {
     job.onProgress = onProgress;
     return job.ready;
   }
@@ -68,6 +72,7 @@ export function readyForRoom(original: TvBlobSource, onProgress: (done: number) 
   const mine: Job = {
     hash: original.hash,
     room,
+    node,
     onProgress,
     stop: () => {
       stopped = true;
@@ -75,7 +80,10 @@ export function readyForRoom(original: TvBlobSource, onProgress: (done: number) 
     },
     ready: Promise.resolve(null),
   };
-  mine.ready = make(original, room, (done) => mine.onProgress(done), () => stopped, (stop) => { stopWorker = stop; })
+  // Void once stopped, or once the room or the node is another: the copy
+  // would be offered from a node that never had it, under the wrong note.
+  const voided = () => stopped || blobLaneRoom() !== room || blobLaneGeneration() !== node;
+  mine.ready = make(original, room, (done) => mine.onProgress(done), voided, (stop) => { stopWorker = stop; })
     .finally(() => { if (job === mine) job = null; });
   job = mine;
   return mine.ready;
@@ -91,7 +99,7 @@ async function make(
   original: TvBlobSource,
   room: string,
   progress: (done: number) => void,
-  stopped: () => boolean,
+  voided: () => boolean,
   onStop: (stop: () => void) => void,
 ): Promise<Ready | null> {
   const asIs: Ready = { source: original, drop: null };
@@ -100,7 +108,7 @@ async function make(
   if (!me || !url) return null;
   if (original.mime && !original.mime.startsWith('video/')) return asIs;
   const before = await madeBefore(me, room, original);
-  if (stopped() || blobLaneRoom() !== room) return null;
+  if (voided()) return null;
   if (before) return { source: before, drop: original.hash };
   if (!shrinkSupported()) return asIs;
 
@@ -112,7 +120,7 @@ async function make(
   } catch {
     return asIs;
   }
-  if (stopped() || blobLaneRoom() !== room) return null;
+  if (voided()) return null;
   const w = new Worker(new URL('./tvShrinkWorker.ts', import.meta.url), { type: 'module' });
   let said: Exclude<ShrinkSay, { kind: 'progress' }>;
   try {
@@ -134,7 +142,7 @@ async function make(
     w.terminate();
   }
   try {
-    if (stopped() || blobLaneRoom() !== room) return null;
+    if (voided()) return null;
     if (said.kind === 'asis') return asIs;
     if (said.kind === 'failed') {
       console.warn(`[tv] ${original.title ?? original.hash.slice(0, 8)} plays as it is: ${said.why}`);
@@ -143,11 +151,12 @@ async function make(
     const made = await (await root.getFileHandle(file)).getFile();
     // Not whole, or nothing saved: the film plays as it is.
     if (made.size !== said.size || made.size === 0 || made.size >= original.size) return asIs;
+    if (voided()) return null;
     const ext = said.mime === 'video/webm' ? 'webm' : 'mp4';
     const got = await importBlob(new File([made], `${original.title || 'film'} (${said.lines} lines).${ext}`, { type: said.mime }), (sent, total) => {
       progress(0.95 + 0.05 * (total > 0 ? sent / total : 0));
     });
-    if (stopped() || blobLaneRoom() !== room) return null;
+    if (voided()) return null;
     if ('error' in got) {
       console.warn(`[tv] ${original.title ?? original.hash.slice(0, 8)} plays as it is: ${got.error}`);
       return asIs;

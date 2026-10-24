@@ -885,7 +885,7 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
       ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
       : '';
     const forget = where === 'mine'
-      ? smallButton(`data-tv-lib-forget="${id}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
+      ? smallButton(`data-tv-lib-forget="${id}" data-tv-id="${esc(tvId)}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
       : '';
     return `<div style="display:flex; flex-direction:column; gap:2px; padding:4px 0; border-top:1px solid rgba(212,168,75,0.1);">
       <div class="phone-access-room-row">
@@ -1026,7 +1026,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const mine = waiting ?? { got, room: blobLaneRoom() };
       fileGettingReady = mine;
       try {
-        return await readied(got, gen);
+        return await readied(got, id, gen);
       } finally {
         if (fileGettingReady === mine && gen === resolveGen) fileGettingReady = null;
       }
@@ -1048,7 +1048,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       }
       // The library keeps where it came from, for GET AGAIN; the programme
       // names only the blob.
-      return readied({ source, text: '', torrent: torrentOrigin() ?? undefined }, gen);
+      return readied({ source, text: '', torrent: torrentOrigin() ?? undefined }, id, gen);
     }
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
@@ -1085,16 +1085,27 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   /** 🗜 A film from this page's node goes to the room as the copy this
    *  machine makes of it first (tvShrink.ts), or as it is where there is
    *  nothing to gain; the remote says only that it is getting it ready.
-   *  Voided by the next attempt from this remote, or a room change. */
-  const readied = async (got: Shared, gen: number): Promise<Shared | null> => {
+   *  Voided like an archive lookup: by the next attempt from this remote,
+   *  anything that moves the programme meanwhile (STOP, POWER, a library
+   *  replay, from any panel), or the room's doc going (a room left, even
+   *  one rejoined). The copy is still made, and the next share of the film
+   *  plays it at once. */
+  const readied = async (got: Shared, id: string, gen: number): Promise<Shared | null> => {
     if (got.source.kind !== 'blob') return got;
     const name = got.source.title || 'the film';
+    const epoch = tvDocEpoch();
+    const revision = tvRevision(id);
+    const current = () => gen === resolveGen && epoch === tvDocEpoch() && tvRevision(id) === revision;
     const say = (done: number) => {
-      if (gen === resolveGen) feedback(`Getting ${name} ready for the room… ${Math.floor(done * 100)}% · it plays once it is ready, while the station stays open`);
+      if (current()) feedback(`Getting ${name} ready for the room… ${Math.floor(done * 100)}% · it plays once it is ready, while the station stays open`);
     };
     say(0);
     const ready = await readyForRoom(got.source, say);
-    if (!ready || gen !== resolveGen) return null;
+    if (!current()) return null;
+    if (!ready) {
+      feedback(`${name} could not be got ready: this station's node changed or went away meanwhile. Press PLAY NOW again.`);
+      return null;
+    }
     return { ...got, source: ready.source, drop: ready.drop ?? undefined };
   };
   /** The room plays the copy now: its original leaves this node. */
@@ -1312,7 +1323,11 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       return;
     }
     forgetArmed = '';
-    const hash = key.startsWith('blob:') ? key.slice(5) : '';
+    // The file the entry plays now, not the one its key names: a smaller
+    // copy is filed under its original (sourceId), and it is the copy that
+    // is on this node.
+    const entry = libraryEntry(b.dataset.tvId!, key);
+    const hash = entry?.source.kind === 'blob' ? entry.source.hash : '';
     const why = await forgetBlob(hash);
     feedback(why ?? 'Your node let its copy go.');
     void refreshHeldBlobs();

@@ -7,14 +7,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TvBlobSource } from './tvDoc';
 
-const lane = vi.hoisted(() => ({ state: 'complete' as string, asked: [] as string[] }));
+const lane = vi.hoisted(() => ({ state: 'complete' as string, asked: [] as string[], gen: 1, restartOnAsk: false }));
 vi.mock('./blobLane', () => ({
   blobLaneNodeId: () => 'a'.repeat(64),
   blobLaneRoom: () => 'room-1',
+  blobLaneGeneration: () => lane.gen,
   blobUrl: (hash: string) => `http://127.0.0.1:1/blob/${hash}`,
   importBlob: async () => ({ error: 'not in tests' }),
   blobStateNow: async (hash: string) => {
     lane.asked.push(hash);
+    if (lane.restartOnAsk) lane.gen++; // the node restarts while it is asked
     return { state: lane.state, have: 1, size: 1 };
   },
 }));
@@ -36,6 +38,7 @@ beforeEach(() => {
   });
   lane.state = 'complete';
   lane.asked = [];
+  lane.restartOnAsk = false;
 });
 afterEach(() => {
   stopShrink();
@@ -95,6 +98,22 @@ describe('🗜 a film shared from this node', () => {
   it('asked twice for the same film while it is being got ready, gives one answer', () => {
     madeHere();
     expect(readyForRoom(FILM)).toBe(readyForRoom(FILM));
+  });
+
+  it('is void when the node restarts or changes while it is got ready, and asked again then, starts over', async () => {
+    madeHere();
+    lane.restartOnAsk = true;
+    const first = readyForRoom(FILM);
+    expect(await first).toBeNull(); // never offered from a node that may not hold it
+    lane.restartOnAsk = false;
+    const again = readyForRoom(FILM);
+    expect(again).not.toBe(first);
+    expect((await again)?.drop).toBe(FILM.hash);
+    // A job still running when the node changes is not joined either.
+    stopShrink();
+    const running = readyForRoom(FILM);
+    lane.gen++;
+    expect(readyForRoom(FILM)).not.toBe(running);
   });
 });
 
