@@ -12,7 +12,8 @@
  *
  * ELECTION = the room's DEED HOLDER (main.ts currentRoomDeedIsMine — the raw
  * at-most-one owner, NOT the shareholder-extended `isHouse`). A personal or solo
- * room has exactly one deed holder ⇒ one croupier ⇒ no double-settle. Venture
+ * room has exactly one deed holder, and of their open pages only the one holding
+ * the `table-operator` lease drives (takeTableTurn) ⇒ no double-settle. Venture
  * rooms (every shareholder is house) are NOT auto-driven — they keep the
  * manual SPIN button. Legacy 'Local-Clone' rooms are not auto-driven either,
  * but 🔒 #141 changed WHY: they used to make everyone the deed holder; now
@@ -35,10 +36,13 @@ import {
   creditChips,
   readAllBets,
   readCroupierBeat,
+  readTableOperatorLease,
   readTableState,
   writeCroupierBeat,
+  writeTableOperatorLease,
   writeTableState,
 } from './casinoDoc';
+import type { TableOperatorLease } from './casinoDoc';
 import { getPlayerId } from './identity';
 import { pocketColor, resolveRound } from './games/roulette';
 import type { RouletteTableState } from './games/roulette';
@@ -70,10 +74,92 @@ export function setSoleCroupierPredicate(fn: () => boolean): void {
   solePredicate = fn;
 }
 
-/** May THIS client drive the auto-croupier here? True on exactly one client in
- *  a personal/solo room; false in venture / legacy shared rooms (manual). */
+/** May THIS client drive the auto-croupier here? True on the deed holder's
+ *  pages in a personal/solo room; false in venture / legacy shared rooms
+ *  (manual). Of those pages, only the one taking the table turn
+ *  (takeTableTurn) drives the tables. */
 export function canRunCroupier(): boolean {
   return solePredicate();
+}
+
+// ── One page drives the tables (the `table-operator` lease) ──────────────────
+
+/** A lease not seen to change for this long has lapsed (its page is gone).
+ *  Timed on this page's clock from the last change it saw, so pages whose
+ *  clocks disagree still agree. */
+export const TABLE_LEASE_LAPSE_MS = 6_000;
+/** The holder rewrites the lease this often. */
+export const TABLE_LEASE_RENEW_MS = 2_000;
+/** A page that has just claimed the lease waits this long before it drives,
+ *  so a rival claim made at the same moment has arrived and one has won. */
+export const TABLE_LEASE_SETTLE_MS = 1_500;
+
+let leaseEpoch = -1;
+/** The lease as this page last saw it change, and when. */
+let leaseSeen: { page: string; beat: number; at: number } | null = null;
+/** When this page claimed the lease it holds (null: it holds none it claimed). */
+let leaseClaimedAt: number | null = null;
+let leaseRenewedAt = 0;
+
+function noteLease(lease: TableOperatorLease | null, now: number): void {
+  const epoch = casinoDocEpoch();
+  if (epoch !== leaseEpoch) {
+    leaseEpoch = epoch;
+    leaseSeen = null;
+    leaseClaimedAt = null;
+  }
+  if (!lease) leaseSeen = null;
+  else if (!leaseSeen || leaseSeen.page !== lease.page || leaseSeen.beat !== lease.beat) {
+    leaseSeen = { page: lease.page, beat: lease.beat, at: now };
+  }
+}
+
+/** Nobody of this player's is driving: no lease, a lapsed one, or one an
+ *  earlier deed holder's page left. */
+function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: string): boolean {
+  return !lease || lease.player !== playerId
+    || (leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
+}
+
+/**
+ * May this page drive the auto tables this frame? Call it every frame from a
+ * page that canRunCroupier(), and drive only on true. It claims a free lease,
+ * keeps renewing its own, and leaves one another of the deed holder's pages
+ * holds alone. A fresh claim drives only after TABLE_LEASE_SETTLE_MS.
+ */
+export function takeTableTurn(
+  now = Date.now(),
+  playerId = getPlayerId(),
+  pageId = ROULETTE_PAGE_ID,
+): boolean {
+  const lease = readTableOperatorLease();
+  noteLease(lease, now);
+  if (lease?.page !== pageId) {
+    if (!leaseIsFree(lease, now, playerId)) return false;
+    writeTableOperatorLease({ page: pageId, player: playerId, beat: 1 });
+    leaseClaimedAt = now;
+    leaseRenewedAt = now;
+    return false;
+  }
+  if (leaseClaimedAt === null) leaseClaimedAt = now;
+  if (now - leaseRenewedAt >= TABLE_LEASE_RENEW_MS) {
+    writeTableOperatorLease({ ...lease, beat: lease.beat + 1 });
+    leaseRenewedAt = now;
+  }
+  return now - leaseClaimedAt >= TABLE_LEASE_SETTLE_MS;
+}
+
+/** Is this page the one that settles for the tables now (it holds the lease,
+ *  or nobody of this player's does)? Read-only: a table's teardown refund
+ *  runs only here, so it is paid once. */
+export function holdsTableTurn(
+  now = Date.now(),
+  playerId = getPlayerId(),
+  pageId = ROULETTE_PAGE_ID,
+): boolean {
+  const lease = readTableOperatorLease();
+  noteLease(lease, now);
+  return lease?.page === pageId || leaseIsFree(lease, now, playerId);
 }
 
 // ── Random pocket (operator-side; an RNG table, or nobody revealed) ──────────
@@ -223,7 +309,8 @@ export function openBetting(tableId: string, round: number): void {
  * One operator tick for one table. Idempotent per frame — only writes on a real
  * transition. The window ARMS on the first bet (so an empty table stays quiet),
  * then betting → closing → settled → next round on the deadlines. Call ONLY when
- * canRunCroupier() (the caller gates), else two clients race the settle.
+ * canRunCroupier() and takeTableTurn() (the caller gates), else two clients
+ * race the settle.
  */
 export function tickAutoCroupier(tableId: string): void {
   const now = Date.now();
@@ -263,7 +350,7 @@ export function tickAutoCroupier(tableId: string): void {
  * still cleared.
  */
 export function closeTable(tableId: string): void {
-  if (canRunCroupier()) {
+  if (canRunCroupier() && holdsTableTurn()) {
     const s = readTableState(tableId);
     if (s && s.phase !== 'settled') {
       for (const [pid, bets] of Object.entries(readAllBets(tableId, s.round))) {

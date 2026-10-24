@@ -514,6 +514,42 @@ export function writeCroupierBeat(tableId: string, beatAt: number): void {
   });
 }
 
+// ── 🎰 The table operator lease ──────────────────────────────────────────────
+// The deed holder can have the room open on several pages (tabs, devices), and
+// every one of them may run the croupier. Only the page holding
+// `table-operator` drives the auto tables, so a round is settled and paid once
+// (chip records add up, so two settles would pay twice). Its holder rewrites it
+// every few seconds (`beat`); croupier.ts takeTableTurn has the rules.
+
+export interface TableOperatorLease {
+  /** the driving page (croupier.ts ROULETTE_PAGE_ID) */
+  page: string;
+  /** its player, the deed holder when it claimed */
+  player: string;
+  /** bumped on each renewal, so other pages see it is alive */
+  beat: number;
+}
+
+export const TABLE_OPERATOR_KEY = 'table-operator';
+
+export function readTableOperatorLease(): TableOperatorLease | null {
+  const v = ensureMap().get(TABLE_OPERATOR_KEY);
+  if (typeof v !== 'object' || v === null) return null;
+  const l = v as Partial<TableOperatorLease>;
+  return typeof l.page === 'string' && l.page.length > 0 && l.page.length <= 256
+    && typeof l.player === 'string' && l.player.length > 0 && l.player.length <= 128
+    && Number.isSafeInteger(l.beat)
+    ? { page: l.page, player: l.player, beat: l.beat as number }
+    : null;
+}
+
+export function writeTableOperatorLease(lease: TableOperatorLease): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(TABLE_OPERATOR_KEY, lease);
+  });
+}
+
 function isTableBets(value: unknown): value is TableBets {
   if (typeof value !== 'object' || value === null) return false;
   const t = value as Partial<TableBets>;
@@ -1950,7 +1986,7 @@ if (typeof window !== 'undefined') {
   (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
     readChips, buyInChips, cashOutChips, spendChips, creditChips, readChipRecords,
     readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
-    readCroupierBeat, writeCroupierBeat,
+    readCroupierBeat, writeCroupierBeat, readTableOperatorLease,
     readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
     readCrapsBackendPref, writeCrapsBackendPref,
     readCrapsFairnessPref, writeCrapsFairnessPref,

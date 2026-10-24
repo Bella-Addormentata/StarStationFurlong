@@ -34,6 +34,7 @@ import {
   croupierBeatLine,
   HEARTBEAT_MS,
   isCroupierLive,
+  takeTableTurn,
   tickAutoCroupier,
 } from "./croupier";
 // 🎲 #69 G3: the craps auto-stickman (parallel to the roulette croupier) +
@@ -6289,13 +6290,16 @@ export class World {
     // dt would wedge an accumulator forever while tickAutoCroupier kept running).
     const autoCroupier = canRunCroupier();
     if (tables.length && autoCroupier) {
-      const now = Date.now();
-      const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
-      if (beatNow) this.croupierLastBeatAt = now;
-      for (const t of tables) {
-        if (beatNow) beatCroupier(t.id);
-        if (t.kind === "craps-table") tickAutoStickman(t.id);
-        else tickAutoCroupier(t.id);
+      // Of the deed holder's open pages, one drives (the table-operator lease).
+      if (takeTableTurn()) {
+        const now = Date.now();
+        const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
+        if (beatNow) this.croupierLastBeatAt = now;
+        for (const t of tables) {
+          if (beatNow) beatCroupier(t.id);
+          if (t.kind === "craps-table") tickAutoStickman(t.id);
+          else tickAutoCroupier(t.id);
+        }
       }
     }
     // 🎲 #226: a manual craps table (no robot running it): the page whose

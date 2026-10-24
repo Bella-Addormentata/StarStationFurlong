@@ -27,7 +27,7 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { canRunCroupier } from './croupier';
+import { canRunCroupier, holdsTableTurn } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
@@ -420,7 +420,8 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
  * real transition. The window ARMS when there are live bets (so an empty come-out
  * table stays quiet, but a point cycle with standing bets keeps rolling), then
  * betting → closing → settled → next window on the deadlines. Call ONLY when
- * canRunCroupier() (the caller gates), else two clients race the settle.
+ * canRunCroupier() and takeTableTurn() (the caller gates), else two clients
+ * race the settle.
  */
 export function tickAutoStickman(tableId: string): void {
   const now = Date.now();
@@ -455,7 +456,7 @@ export function tickAutoStickman(tableId: string): void {
  * no operator, so stakes are not refunded (matches the manual-mode limitation).
  */
 export function closeCrapsTable(tableId: string): void {
-  if (canRunCroupier()) {
+  if (canRunCroupier() && holdsTableTurn()) {
     for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
       const staked = bets.reduce((sum, b) => sum + b.amount, 0);
       if (staked > 0) creditChips(pid, staked);
