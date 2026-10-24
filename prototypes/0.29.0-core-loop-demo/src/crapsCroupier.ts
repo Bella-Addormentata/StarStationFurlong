@@ -27,7 +27,7 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { tablesAwake, timerOnThisClock } from './croupier';
+import { RECONNECTING_NOTICE, tablesAwake, tablesWakeCount, timerOnThisClock } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
@@ -365,7 +365,7 @@ export const MANUAL_TAKEOVER_MS = CRAPS_SHOOTER_MS + 10_000;
  *  notes it every frame on every editor's page, so the watch starts as the
  *  turn does. */
 const closingSeen = new Map<string, {
-  epoch: number; inc: string | undefined; round: number; operator: string | undefined; at: number;
+  epoch: number; wake: number; inc: string | undefined; round: number; operator: string | undefined; at: number;
 }>();
 
 function noteClosing(tableId: string, s: CrapsTableState | null, now: number): number {
@@ -374,11 +374,13 @@ function noteClosing(tableId: string, s: CrapsTableState | null, now: number): n
     return now;
   }
   const epoch = casinoDocEpoch();
+  const wake = tablesWakeCount();
   const seen = closingSeen.get(tableId);
-  if (seen && seen.epoch === epoch && seen.inc === s.inc && seen.round === s.round && seen.operator === s.operator) {
+  if (seen && seen.epoch === epoch && seen.wake === wake && seen.inc === s.inc && seen.round === s.round
+    && seen.operator === s.operator) {
     return seen.at;
   }
-  closingSeen.set(tableId, { epoch, inc: s.inc, round: s.round, operator: s.operator, at: now });
+  closingSeen.set(tableId, { epoch, wake, inc: s.inc, round: s.round, operator: s.operator, at: now });
   return now;
 }
 const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
@@ -398,6 +400,8 @@ const tookOverAt = new Map<string, { at: number; inc: string | undefined; round:
  *    converged — never two settles from two shareholders' presses.
  */
 export function pressManualRoll(tableId: string, now = Date.now()): string | null {
+  // 💤 Just woken: the doc may not have heard the room yet (noteTablesRunning).
+  if (!tablesAwake(now)) return RECONNECTING_NOTICE;
   if (!readCrapsTableState(tableId)) {
     // The first press only opens the window: bets go down on an open table
     // (casinoDoc STAKES ON THE FELT), and on a Fair one the bettors need to

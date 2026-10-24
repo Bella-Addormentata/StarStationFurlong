@@ -137,6 +137,8 @@ function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: st
 let tablesEpoch = -1;
 let tablesRanAt: number | null = null;
 let tablesFrom = 0;
+/** How many times this page has woken from not running its tables. */
+let tablesWakes = 0;
 
 /**
  * This page is running its tables this frame (World calls it every frame the
@@ -156,8 +158,26 @@ export function noteTablesRunning(now = Date.now()): void {
     tablesRanAt = null;
     tablesFrom = 0;
   }
-  if (tablesRanAt !== null && now - tablesRanAt >= TABLE_LEASE_LAPSE_MS) tablesFrom = now + TABLE_LEASE_LAPSE_MS;
+  if (tablesRanAt !== null && now - tablesRanAt >= TABLE_LEASE_LAPSE_MS) {
+    tablesFrom = now + TABLE_LEASE_LAPSE_MS;
+    tablesWakes += 1;
+  } else if (tablesRanAt !== null && now < tablesRanAt) {
+    // The clock went back (a correction after a jump ahead, a manual
+    // change): the wait it set runs a lapse from now at most, not until the
+    // clock comes round again.
+    tablesFrom = Math.min(tablesFrom, now + TABLE_LEASE_LAPSE_MS);
+  }
   tablesRanAt = now;
+}
+
+/** What a house press says while this page waits out a wake (tablesAwake). */
+export const RECONNECTING_NOTICE = 'RECONNECTING — PRESS AGAIN IN A MOMENT';
+
+/** How many times this page has woken after not running its tables for a
+ *  lapse (noteTablesRunning). A watch over another page's turn started
+ *  before a wake starts again: the time asleep wasn't spent watching. */
+export function tablesWakeCount(): number {
+  return tablesWakes;
 }
 
 /** May this page act on its tables now (drive them, settle a round)? Not
@@ -380,16 +400,24 @@ export function openBetting(tableId: string, round: number): void {
 }
 
 /** When this page first saw each table's current SPIN lease (its epoch,
- *  incarnation, round and holder), by this page's clock. */
-const spinSeen = new Map<string, { epoch: number; inc: string | undefined; round: number; operator: string; at: number }>();
+ *  incarnation, round and holder, since this page last woke), by this page's
+ *  clock. */
+const spinSeen = new Map<string, {
+  epoch: number; wake: number; inc: string | undefined; round: number; operator: string; at: number;
+}>();
 
-function spinSeenAt(tableId: string, s: RouletteTableState, operator: string, now: number): number {
+/** Since when this page has watched the SPIN lease `operator` holds on round
+ *  `s`: the robot and this page's own SPIN take it over only after
+ *  SPIN_TAKEOVER_MS of it. */
+export function spinSeenAt(tableId: string, s: RouletteTableState, operator: string, now: number): number {
   const epoch = casinoDocEpoch();
+  const wake = tablesWakeCount();
   const seen = spinSeen.get(tableId);
-  if (seen && seen.epoch === epoch && seen.inc === s.inc && seen.round === s.round && seen.operator === operator) {
+  if (seen && seen.epoch === epoch && seen.wake === wake && seen.inc === s.inc && seen.round === s.round
+    && seen.operator === operator) {
     return seen.at;
   }
-  spinSeen.set(tableId, { epoch, inc: s.inc, round: s.round, operator, at: now });
+  spinSeen.set(tableId, { epoch, wake, inc: s.inc, round: s.round, operator, at: now });
   return now;
 }
 

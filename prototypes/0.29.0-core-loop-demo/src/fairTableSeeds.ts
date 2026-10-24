@@ -55,6 +55,7 @@ import {
   readPlayerKey,
   readSeedRecord,
   readTableState,
+  tableIncRemoved,
   writeMySeedRecord,
 } from './casinoDoc';
 import { HOUSE_PARTY } from './games/craps';
@@ -256,6 +257,8 @@ const authoredRounds = new Set<string>();
  *  check compares the settled record against it: an operator who rewrites the
  *  party set after the reveals (to drop or add a seed) is caught here. */
 interface FrozenSnapshot {
+  /** the table's incarnation it was taken on */
+  inc?: string;
   house: string;
   commits: Record<string, string>;
   wagers?: Record<string, string>;
@@ -268,13 +271,25 @@ const SNAPSHOTS_PER_TABLE = 4;
 
 // Keyed by round alone, NOT the house commit: that field is peer-writable
 // too, and a rewritten one must hit the snapshot (and fail the house
-// comparison) rather than miss it and read as merely unwitnessed.
+// comparison) rather than miss it and read as merely unwitnessed. Nor the
+// incarnation, for the same reason; but a snapshot of an incarnation since
+// removed is another table's: one put back under the same id starts again at
+// round 1, and a page can hear the removal and the new table together,
+// never seeing the id without a table (forgetMissingTables), so it is
+// dropped here.
 function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
-  return frozenSeen.get(`${casinoDocEpoch()}:${tableId}`)?.get(String(s.round));
+  const rounds = frozenSeen.get(`${casinoDocEpoch()}:${tableId}`);
+  const seen = rounds?.get(String(s.round));
+  if (seen && seen.inc !== s.inc && tableIncRemoved(tableId, seen.inc)) {
+    rounds!.delete(String(s.round));
+    return undefined;
+  }
+  return seen;
 }
 
 function snapshot(s: TableState): FrozenSnapshot {
   return {
+    ...(s.inc !== undefined ? { inc: s.inc } : {}),
     house: s.houseCommit ?? '',
     commits: { ...(s.commits ?? {}) },
     ...(s.wagers ? { wagers: { ...s.wagers } } : {}),

@@ -42,7 +42,10 @@ import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH, TAKE_DOWN_R } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
-import { closeBetting, isCroupierLive, openBetting, rollAndSettle, ROULETTE_PAGE_ID, SPIN_TAKEOVER_MS } from './croupier';
+import {
+  closeBetting, isCroupierLive, openBetting, RECONNECTING_NOTICE, rollAndSettle, ROULETTE_PAGE_ID, spinSeenAt,
+  SPIN_TAKEOVER_MS, tablesAwake,
+} from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -632,8 +635,6 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let seatTimer: number | null = null;
   /** The manual SPIN's settle poll: one per focused table. */
   let spinPoll: number | null = null;
-  /** When this page first saw another house member's lease on a round. */
-  let spinSeen: { key: string; at: number } | null = null;
   const stopSpinPoll = (): void => {
     if (spinPoll !== null) window.clearInterval(spinPoll);
     spinPoll = null;
@@ -1562,6 +1563,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       spinByHand();
     } else if (act === 'next') {
       if (phase() !== 'settled') return;
+      // 💤 Just woken: the doc may not have heard the room yet.
+      if (!tablesAwake()) {
+        say(RECONNECTING_NOTICE);
+        return;
+      }
       if (game === 'craps') {
         const s = crapsState();
         openCrapsBetting(itemId, round() + 1, s?.point ?? null, s);
@@ -1575,6 +1581,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   /** The house's manual SPIN: close the window (freezing the round's seed
    *  commitments), then settle as soon as the bettors have revealed. */
   const spinByHand = (): void => {
+    // 💤 Just woken: the doc may not have heard the room yet, and a SPIN
+    // written on it could take over a round another page has since settled.
+    if (!tablesAwake()) {
+      say(RECONNECTING_NOTICE);
+      return;
+    }
     const s = rouletteState();
     // A manual table nobody has run yet: this press opens round 1, so its
     // house commitment is out before a later press freezes the bets.
@@ -1588,9 +1600,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     else if (s.operator !== undefined && s.operator !== ROULETTE_PAGE_ID) {
       // Another house member's SPIN holds this round. Take it over only once
       // they've had time to settle it (they may have left mid-round).
-      const k = `${casinoDocEpoch()}:${s.inc ?? ''}:${s.round}:${s.operator}`;
-      if (spinSeen?.key !== k) spinSeen = { key: k, at: Date.now() };
-      if (Date.now() - spinSeen.at < SPIN_TAKEOVER_MS) {
+      if (Date.now() - spinSeenAt(itemId, s, s.operator, Date.now()) < SPIN_TAKEOVER_MS) {
         say('THE WHEEL IS SPINNING — ANOTHER HOUSE MEMBER IS RUNNING THIS ROUND');
         return;
       }
