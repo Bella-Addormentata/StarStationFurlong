@@ -169,6 +169,34 @@ describe('two pages of the deed holder', () => {
     expect(turn(a, 1_900 + 2 * TABLE_LEASE_LAPSE_MS)).toBe(true);
   });
 
+  it('a page not driving takes over a lapse after its clock went back an hour, not an hour later', () => {
+    const HOUR = 3_600_000;
+    turn(a, HOUR);
+    expect(turn(a, HOUR + 1_600)).toBe(true);
+    sync(a.doc, b.doc);
+    expect(turn(b, HOUR + 1_700)).toBe(false); // b watches a's lease...
+    // ...its clock goes back an hour, and page a closes.
+    const { TABLE_LEASE_LAPSE_MS, TABLE_LEASE_SETTLE_MS } = b.croupier;
+    let firstDrive = -1;
+    for (let t = 1_800; t <= 30_000 && firstDrive < 0; t += 100) if (turn(b, t)) firstDrive = t;
+    expect(firstDrive).toBeGreaterThan(0);
+    expect(firstDrive).toBeLessThanOrEqual(1_800 + TABLE_LEASE_LAPSE_MS + TABLE_LEASE_SETTLE_MS + 200);
+  });
+
+  it('and the driving page drives and renews again a lapse after its clock went back', () => {
+    const HOUR = 3_600_000;
+    turn(a, HOUR);
+    expect(turn(a, HOUR + 1_600)).toBe(true);
+    const { TABLE_LEASE_LAPSE_MS, TABLE_LEASE_SETTLE_MS } = a.croupier;
+    let firstDrive = -1;
+    for (let t = 2_000; t <= 30_000 && firstDrive < 0; t += 100) if (turn(a, t)) firstDrive = t;
+    expect(firstDrive).toBeGreaterThan(0);
+    expect(firstDrive).toBeLessThanOrEqual(2_000 + TABLE_LEASE_LAPSE_MS + TABLE_LEASE_SETTLE_MS + 200);
+    const beat = a.casino.readTableOperatorLease()!.beat;
+    for (let t = firstDrive; t <= firstDrive + 5_000; t += 100) turn(a, t);
+    expect(a.casino.readTableOperatorLease()!.beat).toBeGreaterThan(beat);
+  });
+
   it('a lease an earlier deed holder\'s page left is taken at once', () => {
     a.casino.writeTableOperatorLease({ page: 'old-page', player: EARLIER_OWNER, beat: 9 });
     expect(turn(a, 0)).toBe(false);
@@ -222,6 +250,47 @@ describe('a settle the computer slept through', () => {
     a.croupier.rollAndSettle(TABLE, 1);
     await flush();
     expect(a.casino.readTableState(TABLE)?.phase).toBe('closing');
+    tick(a.croupier.TABLE_LEASE_LAPSE_MS);
+    a.croupier.rollAndSettle(TABLE, 1);
+    await flush();
+    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', round: 1 });
+  });
+});
+
+describe('a settle under way as the clock goes back an hour', () => {
+  const bettor = 'player-Carol';
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('writes nothing before its first frame back nor after, and settles once it has waited a lapse', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    let now = 2_000_000_000;
+    const tick = (ms: number): void => {
+      for (let left = ms; left > 0; left -= 1_000) {
+        now += Math.min(left, 1_000);
+        vi.setSystemTime(now);
+        a.croupier.noteTablesRunning(now);
+      }
+    };
+    vi.setSystemTime(now);
+    a.casino.buyInChips(bettor, 100);
+    turn(a, now);
+    a.croupier.openBetting(TABLE, 1); // a Fair round: its settle hashes
+    a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
+    a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
+    tick(1_000);
+    a.croupier.rollAndSettle(TABLE, 1);
+    now -= 3_600_000; // the clock goes back an hour mid-hash
+    vi.setSystemTime(now);
+    await flush();
+    expect(a.casino.readTableState(TABLE)?.phase).toBe('closing');
+    tick(1_000); // its first frame back: a lapse to wait out
+    a.croupier.rollAndSettle(TABLE, 1);
+    await flush();
+    expect(a.casino.readTableState(TABLE)?.phase).toBe('closing');
+    expect(a.casino.readChips(bettor)).toBe(70);
     tick(a.croupier.TABLE_LEASE_LAPSE_MS);
     a.croupier.rollAndSettle(TABLE, 1);
     await flush();
@@ -981,6 +1050,215 @@ describe('a Fair roll one page voids while another rolls it', () => {
   }
 });
 
+/** One-way delivery. */
+function deliver(from: Y.Doc, to: Y.Doc): void {
+  Y.applyUpdate(to, Y.encodeStateAsUpdate(from, Y.encodeStateVector(to)));
+}
+
+describe('a bet taken down as betting closes, while two pages settle the round', () => {
+  const bettor = 'player-Carol';
+  const craps = 'craps-1';
+
+  function syncAll(...pages: Page[]): void {
+    for (const x of pages) for (const y of pages) if (x !== y) sync(x.doc, y.doc);
+  }
+
+  for (const [winner, clientA, clientB] of [['the page that heard it', 2, 1], ['the page that paid it', 1, 2]] as const) {
+    it(`roulette: pays it only as the round the doc keeps says (${winner} winning ties)`, async () => {
+      a = await loadPage(clientA);
+      b = await loadPage(clientB);
+      const c = await loadPage(3); // Carol's own page
+      a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+      a.casino.buyInChips(bettor, 100);
+      a.croupier.openBetting(TABLE, 1);
+      syncAll(a, b, c);
+      c.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 10 }]);
+      syncAll(a, b, c);
+      c.casino.writeMyBets(TABLE, bettor, 1, []); // Carol takes it down...
+      a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!); // ...as betting closes
+      deliver(a.doc, b.doc); // page b hears the close, not the take-down
+      deliver(c.doc, a.doc); // page a hears both
+      // Neither page holds the lease (a handover in flight).
+      spinTo(1); // red
+      a.croupier.rollAndSettle(TABLE, 1);
+      b.croupier.rollAndSettle(TABLE, 1);
+      await flush();
+      syncAll(a, b, c);
+      for (const page of [a, b, c]) {
+        const s = page.casino.readTableState(TABLE)!;
+        expect(s.phase).toBe('settled');
+        expect(page.casino.readChips(bettor)).toBe(s.payouts?.[bettor] ? 110 : 100);
+      }
+    });
+
+    it(`craps: pays it only as the roll the doc keeps says (${winner} winning ties)`, async () => {
+      a = await loadPage(clientA);
+      b = await loadPage(clientB);
+      const c = await loadPage(3);
+      a.casino.writeCrapsFairnessPref(craps, 'rng');
+      a.casino.buyInChips(bettor, 100);
+      a.craps.openCrapsBetting(craps, 1, null);
+      syncAll(a, b, c);
+      c.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+      syncAll(a, b, c);
+      c.casino.writeMyCrapsBets(craps, bettor, []);
+      a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+      deliver(a.doc, b.doc);
+      deliver(c.doc, a.doc);
+      diceTo(3, 4); // a seven on the come-out: the pass line wins
+      a.craps.rollAndSettleCraps(craps, 1, null);
+      b.craps.rollAndSettleCraps(craps, 1, null);
+      await flush();
+      syncAll(a, b, c);
+      for (const page of [a, b, c]) {
+        const s = page.casino.readCrapsTableState(craps)!;
+        expect(s.phase).toBe('settled');
+        expect(page.casino.readMyCrapsBets(craps, bettor)).toEqual([]);
+        expect(page.casino.readChips(bettor)).toBe(s.payouts?.[bettor] ? 110 : 100);
+      }
+    });
+  }
+});
+
+describe('a bet taken down as betting closes, while two pages close and settle the roll', () => {
+  const bettor = 'player-Carol';
+  const craps = 'craps-1';
+
+  for (const [winner, clientA, clientB] of [['the dice', 2, 1], ['the void', 1, 2]] as const) {
+    it(`Fair craps, one page voiding as it closes: pays it only as the roll the doc keeps says (${winner} winning ties)`, async () => {
+      a = await loadPage(clientA);
+      b = await loadPage(clientB);
+      const c = await loadPage(3); // Carol's own page
+      a.casino.buyInChips(bettor, 100);
+      diceTo(3, 4); // the house seed (the Fair dice come of it): a roll that resolves the pass line
+      a.craps.openCrapsBetting(craps, 1, null); // Fair: page a holds the house seed
+      for (const x of [b, c]) sync(a.doc, x.doc);
+      c.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+      for (const x of [a, b]) sync(c.doc, x.doc);
+      c.casino.writeMyCrapsBets(craps, bettor, []); // Carol takes it down
+      deliver(c.doc, b.doc); // page b hears it, page a doesn't
+      // Both close at once: a freezes Carol's pass; b, without the house
+      // seed, voids the roll as it closes.
+      a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+      b.craps.closeCrapsBetting(craps, b.casino.readCrapsTableState(craps)!);
+      expect(b.casino.readCrapsTableState(craps)?.voided).toBe(true);
+      a.craps.rollAndSettleCraps(craps, 1, null);
+      await flush();
+      expect(a.casino.readMyCrapsBets(craps, bettor)).toEqual([]); // resolved there, won or lost
+      for (const x of [a, b, c]) for (const y of [a, b, c]) if (x !== y) sync(x.doc, y.doc);
+      for (const page of [a, b, c]) {
+        const s = page.casino.readCrapsTableState(craps)!;
+        expect(s.voided === true).toBe(clientB > clientA);
+        // The void hands the 10 back; the dice paid or took it.
+        expect(page.casino.readChips(bettor)).toBe(s.voided ? 100 : 90 + (s.payouts?.[bettor] ?? 0));
+      }
+    });
+  }
+
+  it("an earlier build's take-down: is paid only as the roll the doc keeps says (the page that heard it winning ties)", async () => {
+    a = await loadPage(2);
+    b = await loadPage(1);
+    const c = await loadPage(3); // Carol's earlier-build page
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.craps.openCrapsBetting(craps, 1, null);
+    for (const x of [b, c]) sync(a.doc, x.doc);
+    c.doc.getMap('casino').set(`bal:${bettor}`, 90); // its pass line takes 10
+    c.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [{ type: 'pass', amount: 10 }] });
+    for (const x of [a, b]) sync(c.doc, x.doc);
+    c.doc.getMap('casino').set(`bal:${bettor}`, 100); // and its take-down hands it back
+    c.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [] });
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    deliver(a.doc, b.doc);
+    deliver(c.doc, a.doc);
+    diceTo(3, 4);
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    b.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    for (const x of [a, b, c]) for (const y of [a, b, c]) if (x !== y) sync(x.doc, y.doc);
+    for (const page of [a, b, c]) {
+      expect(page.casino.readCrapsTableState(craps)?.payouts?.[bettor]).toBeUndefined();
+      expect(page.casino.readChips(bettor)).toBe(100);
+    }
+  });
+});
+
+describe('a list taken all down, at the rounds after', () => {
+  const bettor = 'player-Carol';
+  const craps = 'craps-1';
+
+  /** The round of Carol's last outcome on the table. */
+  function lastOutcomeRound(page: Page, table: string): string | undefined {
+    let ev: string | undefined;
+    for (const [key, value] of page.doc.getMap('casinoChips').entries()) {
+      if (key.startsWith(`tbl:${table}:`) && (value as { p?: string }).p === bettor) ev = (value as { ev: string }).ev;
+    }
+    return ev;
+  }
+
+  it('roulette: is written up for its own round, and not for the next', async () => {
+    a = await loadPage();
+    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    a.casino.buyInChips(bettor, 100);
+    a.croupier.openBetting(TABLE, 1);
+    a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 10 }]);
+    a.casino.writeMyBets(TABLE, bettor, 1, []);
+    a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
+    a.croupier.rollAndSettle(TABLE, 1);
+    await flush();
+    expect(lastOutcomeRound(a, TABLE)).toBe('1');
+    a.croupier.openBetting(TABLE, 2);
+    a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
+    a.croupier.rollAndSettle(TABLE, 2);
+    await flush();
+    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', round: 2 });
+    expect(lastOutcomeRound(a, TABLE)).toBe('1');
+  });
+
+  it('craps: is written up for its own roll, and not for the next', async () => {
+    a = await loadPage();
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.casino.buyInChips(bettor, 100);
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    a.casino.writeMyCrapsBets(craps, bettor, []);
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    diceTo(3, 3);
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    expect(lastOutcomeRound(a, craps)).toBe('1');
+    a.craps.openCrapsBetting(craps, 2, 6);
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    diceTo(2, 2);
+    a.craps.rollAndSettleCraps(craps, 2, 6);
+    await flush();
+    expect(a.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'settled', round: 2 });
+    expect(lastOutcomeRound(a, craps)).toBe('1');
+    expect(a.casino.readChips(bettor)).toBe(100);
+  });
+
+  it("craps: an earlier build's list the stickman pruned to nothing is not written up again", async () => {
+    a = await loadPage();
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.doc.getMap('casino').set(`bal:${bettor}`, 90);
+    a.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [{ type: 'pass', amount: 10 }] });
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    diceTo(3, 4); // a seven: the pass line wins, and its list is pruned to nothing
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    expect(a.doc.getMap('casino').get(`bets:${craps}:${bettor}`)).toMatchObject({ bets: [], pruned: 1 });
+    expect(lastOutcomeRound(a, craps)).toBe('1');
+    a.craps.openCrapsBetting(craps, 2, null);
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    diceTo(3, 3);
+    a.craps.rollAndSettleCraps(craps, 2, null);
+    await flush();
+    expect(a.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'settled', round: 2 });
+    expect(lastOutcomeRound(a, craps)).toBe('1');
+    expect(a.casino.readChips(bettor)).toBe(110);
+  });
+});
+
 describe('a table two pages open at once, before either hears of the other', () => {
   const bettor = 'player-Carol';
   const craps = 'craps-1';
@@ -1342,6 +1620,22 @@ describe('a SPIN pressed on the owner\'s page that is not driving', () => {
     a.croupier.tickAutoCroupier(TABLE);
     expect(a.casino.readTableState(TABLE)?.operator).toBe(b.croupier.ROULETTE_PAGE_ID);
     later(a.croupier.SPIN_TAKEOVER_MS);
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)?.operator).toBe(a.croupier.ROULETTE_PAGE_ID);
+  });
+
+  it("is taken over by the robot a full watch after this page's clock went back, not an hour", () => {
+    spunByB();
+    a.croupier.tickAutoCroupier(TABLE); // the robot starts watching b's SPIN
+    now -= 3_600_000; // the clock goes back an hour, before the page's next frame
+    vi.setSystemTime(now);
+    a.croupier.tickAutoCroupier(TABLE);
+    now += a.croupier.SPIN_TAKEOVER_MS - 100;
+    vi.setSystemTime(now);
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)?.operator).toBe(b.croupier.ROULETTE_PAGE_ID);
+    now += 200;
+    vi.setSystemTime(now);
     a.croupier.tickAutoCroupier(TABLE);
     expect(a.casino.readTableState(TABLE)?.operator).toBe(a.croupier.ROULETTE_PAGE_ID);
   });

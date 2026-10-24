@@ -474,6 +474,38 @@ describe('a Fair roulette round', () => {
     expect(roundIsFair(t, 'roulette')).toBe(true);
   });
 
+  it('waits for a missing reveal a grace from when the clock went back, not an hour', async () => {
+    const t = freshTable();
+    at(T0 + 3_600_000);
+    rouletteToClosing(t);
+    playersLook(t, 'roulette', [AMY]); // Bob never reveals
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('closing'); // waiting on Bob
+    at(T0 + 10_000); // the clock goes back an hour
+    tickAutoCroupier(t); // the deadline comes back to this clock
+    later(CLOSING_MS);
+    tickAutoCroupier(t);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('closing'); // a grace from now
+    later(REVEAL_GRACE_MS);
+    tickAutoCroupier(t);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('settled');
+    expect(readTableState(t)?.payouts?.[BOB]).toBeUndefined();
+  });
+
+  it("a bettor's page whose clock went back still reveals at its next look", () => {
+    const t = freshTable();
+    at(T0 + 3_600_000);
+    rouletteToClosing(t); // both committed
+    at(T0 + 10_000); // the clock goes back an hour
+    for (const pid of [AMY, BOB]) tickFairSeeds(t, 'roulette', pid);
+    expect(readSeedRecord(t, AMY)?.seed).toBeTruthy();
+    expect(readSeedRecord(t, BOB)?.seed).toBeTruthy();
+  });
+
   it('joining another room right away still lets this room take a seed tick', () => {
     const t = freshTable();
     tickAutoCroupier(t);

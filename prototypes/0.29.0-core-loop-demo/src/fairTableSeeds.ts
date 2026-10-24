@@ -410,7 +410,8 @@ function sameCommits(a: Record<string, string>, b: Record<string, string>): bool
  */
 export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now(), force = false): void {
   const tickKey = `${casinoDocEpoch()}:${tableId}:${me}`;
-  if (!force && now - (lastTick.get(tickKey) ?? 0) < 200) return;
+  const last = lastTick.get(tickKey) ?? 0;
+  if (!force && now >= last && now - last < 200) return;
   lastTick.delete(tickKey);
   lastTick.set(tickKey, now);
   evictOldest(lastTick, 256);
@@ -580,7 +581,8 @@ export function gatherRound(tableId: string, live: TableState, now = Date.now())
   const fz = frozenFields(tableId, live);
   const s: TableState = { ...live, ...(fz.houseCommit ? { houseCommit: fz.houseCommit } : {}) };
   const key = roundKey(tableId, s.round, s.houseCommit);
-  if (!settleDueAt.has(key)) {
+  // (A clock gone back since the first try: the grace runs from now.)
+  if (!settleDueAt.has(key) || now < settleDueAt.get(key)!) {
     settleDueAt.set(key, now);
     evictOldest(settleDueAt, 256);
   }

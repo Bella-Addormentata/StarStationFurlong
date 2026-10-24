@@ -37,6 +37,7 @@ import {
   feltStake,
   readAllBets,
   readCroupierBeat,
+  readEmptiedLists,
   readFeltStakes,
   readTableOperatorLease,
   readTableState,
@@ -124,6 +125,10 @@ function noteLease(lease: TableOperatorLease | null, now: number): void {
   if (!lease) leaseSeen = null;
   else if (!leaseSeen || leaseSeen.page !== lease.page || leaseSeen.beat !== lease.beat) {
     leaseSeen = { page: lease.page, beat: lease.beat, at: now };
+  } else if (now < leaseSeen.at) {
+    // The clock went back: the watch runs from now, not from when the clock
+    // comes round to where it was.
+    leaseSeen.at = now;
   }
 }
 
@@ -160,14 +165,12 @@ export function noteTablesRunning(now = Date.now()): void {
     tablesRanAt = null;
     tablesFrom = 0;
   }
-  if (tablesRanAt !== null && now - tablesRanAt >= TABLE_LEASE_LAPSE_MS) {
+  // A clock gone back (a correction as the computer wakes, a manual change)
+  // says nothing of how long the page was away: it wakes as from a sleep,
+  // its wait a lapse from now, not until the clock comes round again.
+  if (tablesRanAt !== null && (now - tablesRanAt >= TABLE_LEASE_LAPSE_MS || now < tablesRanAt)) {
     tablesFrom = now + TABLE_LEASE_LAPSE_MS;
     tablesWakes += 1;
-  } else if (tablesRanAt !== null && now < tablesRanAt) {
-    // The clock went back (a correction after a jump ahead, a manual
-    // change): the wait it set runs a lapse from now at most, not until the
-    // clock comes round again.
-    tablesFrom = Math.min(tablesFrom, now + TABLE_LEASE_LAPSE_MS);
   }
   tablesRanAt = now;
 }
@@ -184,12 +187,12 @@ export function tablesWakeCount(): number {
 
 /** May this page act on its tables now (drive them, settle a round)? Not
  *  while it waits out a lapse after it stopped running them, nor once a
- *  lapse has gone by since it last ran them: a settle resuming from its
- *  awaits after a sleep, before the page's next frame. A page that hasn't
- *  run them in this doc yet may. */
+ *  lapse has gone by since it last ran them, or its clock has gone back
+ *  since: a settle resuming from its awaits after a sleep, before the
+ *  page's next frame. A page that hasn't run them in this doc yet may. */
 export function tablesAwake(now = Date.now()): boolean {
   if (tablesRanAt === null || casinoDocEpoch() !== tablesEpoch) return true;
-  return now >= tablesFrom && now - tablesRanAt < TABLE_LEASE_LAPSE_MS;
+  return now >= tablesFrom && now >= tablesRanAt && now - tablesRanAt < TABLE_LEASE_LAPSE_MS;
 }
 
 /**
@@ -210,6 +213,9 @@ export function takeTableTurn(
   noteLease(lease, now);
   noteTablesRunning(now);
   if (!tablesAwake(now)) return false;
+  // (Its clock gone back, its claim and renewal count from now.)
+  if (leaseClaimedAt !== null && now < leaseClaimedAt) leaseClaimedAt = now;
+  if (now < leaseRenewedAt) leaseRenewedAt = now - TABLE_LEASE_RENEW_MS;
   if (lease?.page !== pageId) {
     if (!leaseIsFree(lease, now, playerId)) return false;
     writeTableOperatorLease({ page: pageId, player: playerId, beat: 1 });
@@ -307,9 +313,12 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     result = spinPocket();
   }
   // The hashing yielded: settle only the very round this call was for, in the
-  // same room doc (a removed or recreated table, or a rival settle, is not).
+  // same room doc, on the same table (a table removed and put back, which
+  // can reach the same round meanwhile on a new incarnation, or a rival
+  // settle, is not).
   const before = readTableState(tableId);
   if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return;
+  if (tableIncOf(tableId, before) !== tableIncOf(tableId, live0)) return;
   // 🎡 A manual round settles only on the page holding its lease: two house
   // members pressing SPIN must not both publish and pay.
   if (before.operator !== undefined && before.operator !== ROULETTE_PAGE_ID) return;
@@ -333,9 +342,14 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // took isn't held: its win is paid in full, and a stake the round gives
   // back is refunded.
   // Every bettor, and every list that hands back what an earlier build took
-  // (one taken all down holds below 0 and isn't among the live bets).
+  // (one taken all down holds below 0 and isn't among the live bets), and
+  // every list taken all down this round (readEmptiedLists): its outcome,
+  // of nothing, meets a rival settle's that still saw its last bet.
   const owed: Record<string, number> = {};
-  for (const pid of new Set([...Object.keys(live), ...rewritten, ...Object.keys(readFeltStakes(tableId))])) {
+  const pids = [
+    ...Object.keys(live), ...rewritten, ...Object.keys(readFeltStakes(tableId)), ...readEmptiedLists(tableId, round),
+  ];
+  for (const pid of new Set(pids)) {
     const held = heldAtClose(tableId, before, pid);
     let delta: number;
     // A bet that missed the freeze (it arrived just after "no more bets"),
@@ -417,7 +431,7 @@ export function spinSeenAt(tableId: string, s: RouletteTableState, operator: str
   const wake = tablesWakeCount();
   const seen = spinSeen.get(tableId);
   if (seen && seen.epoch === epoch && seen.wake === wake && seen.inc === s.inc && seen.round === s.round
-    && seen.operator === operator) {
+    && seen.operator === operator && seen.at <= now) {
     return seen.at;
   }
   spinSeen.set(tableId, { epoch, wake, inc: s.inc, round: s.round, operator, at: now });

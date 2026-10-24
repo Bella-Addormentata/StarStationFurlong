@@ -169,7 +169,7 @@ export function markLocalSeat(tableId: string, playerId: string, on: boolean): v
 
 /** How long a newly seen seat may wait for its second heartbeat before a
  *  manual ROLL stops waiting for it (a little over one beat). */
-const SEAT_CONFIRM_MS = 7_000;
+export const SEAT_CONFIRM_MS = 7_000;
 
 /** Players standing at the table right now, judged on the operator's own clock:
  *  a seat counts once this client has watched its heartbeat move, and while it
@@ -186,6 +186,7 @@ export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[]
     const prev = seatSeen.get(key);
     if (!prev) seatSeen.set(key, { at: seat.at, seenAt: now, moved: false });
     else if (prev.at !== seat.at) seatSeen.set(key, { at: seat.at, seenAt: now, moved: true });
+    else if (now < prev.seenAt) prev.seenAt = now; // the clock went back: watch on from now
     const seen = seatSeen.get(key)!;
     // The seat is peer-written: only a real player stand counts, and its
     // place in the ring comes from the table's layout, not the stored angle.
@@ -273,7 +274,8 @@ const seatSampledAt = new Map<string, number>();
  *  scans the room doc), so the shooter pick at the close judges them on what
  *  this client actually saw move. */
 export function sampleSeats(tableId: string, now = Date.now()): void {
-  if (now - (seatSampledAt.get(tableId) ?? 0) < 1000) return;
+  const last = seatSampledAt.get(tableId) ?? 0;
+  if (now >= last && now - last < 1000) return;
   seatSampledAt.set(tableId, now);
   seatedPlayers(tableId, now);
 }
@@ -344,7 +346,8 @@ export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: 
   }
   // Just took the turn over: let the operator stamp converge first, so a
   // rival takeover's write wins or loses before either page settles.
-  if (took !== undefined && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
+  // (A clock gone back since makes the page wait out a wake instead.)
+  if (took !== undefined && now >= took && now - took < MANUAL_TAKEOVER_SETTLE_MS) return;
   // 💤 A page waking from a sleep holds this turn only in a doc that may not
   // have heard a takeover yet: it waits to be awake again (noteTablesRunning).
   if (!tablesAwake(now)) return;
@@ -376,7 +379,7 @@ function noteClosing(tableId: string, s: CrapsTableState | null, now: number): n
   const wake = tablesWakeCount();
   const seen = closingSeen.get(tableId);
   if (seen && seen.epoch === epoch && seen.wake === wake && seen.inc === s.inc && seen.round === s.round
-    && seen.operator === s.operator) {
+    && seen.operator === s.operator && seen.at <= now) {
     return seen.at;
   }
   closingSeen.set(tableId, { epoch, wake, inc: s.inc, round: s.round, operator: s.operator, at: now });

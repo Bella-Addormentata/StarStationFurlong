@@ -32,6 +32,7 @@ import {
   feltStake,
   readAllCrapsBets,
   readCrapsBackendPref,
+  readEmptiedLists,
   readCrapsFairnessPref,
   pruneCrapsBets,
   readCrapsTableState,
@@ -132,7 +133,7 @@ class LocalCrapsBackend implements CrapsBackend {
         const live = readAllCrapsBets(tableId);
         const { bets: standing, voided } = frozenWagers(tableId, before, live);
         const left: Record<string, CrapsBet[]> = { ...standing };
-        for (const pid of voided) left[pid] = [];
+        for (const pid of [...voided, ...readEmptiedLists(tableId, round)]) left[pid] ??= [];
         const held = heldBy(tableId, before, Object.keys(left));
         transactCasino(() => {
           writeCrapsTableState(tableId, {
@@ -175,6 +176,9 @@ class LocalCrapsBackend implements CrapsBackend {
     // caller closes the table first, so a table back in 'betting' at the same
     // round is a recreated one, not this roll's.
     if (casinoDocEpoch() !== epoch || before.round !== round || before.phase !== 'closing') return dice;
+    // Nor one removed and put back meanwhile, at the same roll on a new
+    // incarnation: these dice were for the table as it was.
+    if (!live0 || tableIncOf(tableId, before) !== tableIncOf(tableId, live0)) return dice;
     // 🎲 A manual roll settles only on the page still holding its lease: the
     // hashing can outlive it (a suspended tab another member took over from).
     if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return dice;
@@ -202,6 +206,9 @@ class LocalCrapsBackend implements CrapsBackend {
       pointBefore,
     );
     for (const pid of forfeited) remaining[pid] = [];
+    // A list taken all down for this roll is written up too, as nothing: a
+    // rival page settling the roll may have seen its last bet.
+    for (const pid of readEmptiedLists(tableId, round)) remaining[pid] ??= [];
     // A list rewritten (or emptied) since the close loses what it held then.
     const held = heldBy(tableId, before, Object.keys(remaining));
     const now = Date.now();

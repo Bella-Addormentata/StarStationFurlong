@@ -1193,3 +1193,80 @@ describe('tables whose ids begin with one another', () => {
     expect(b.casino.readChips(bettor)).toBe(100);
   });
 });
+
+describe("an earlier build's table both pages settle, then one opens the next window and removes it", () => {
+  const bettor = 'player-Carol';
+  const craps = 'craps-1';
+  const pass = { type: 'pass' as const, amount: 10 };
+
+  for (const [winner, clientA, clientB] of [['page a', 2, 1], ['page b', 1, 2]] as const) {
+    it(`hands Carol's 10 back once (${winner} winning ties)`, async () => {
+      a = await loadPage(clientA);
+      b = await loadPage(clientB);
+      a.casino.writeCrapsFairnessPref(craps, 'rng');
+      a.craps.openCrapsBetting(craps, 1, null);
+      const { inc: _inc, ...earlier } = a.casino.readCrapsTableState(craps)!;
+      a.casino.writeCrapsTableState(craps, earlier); // an earlier build's table
+      a.doc.getMap('casino').set(`bal:${bettor}`, 90);
+      a.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [pass] });
+      a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+      sync(a.doc, b.doc);
+      diceTo(3, 3); // a 6: the pass line rides, still taken
+      a.craps.rollAndSettleCraps(craps, 1, null);
+      b.craps.rollAndSettleCraps(craps, 1, null);
+      await flush();
+      expect(b.doc.getMap('casino').get(`kept:${craps}:${bettor}`)).toMatchObject({ taken: 10 });
+      a.craps.openCrapsBetting(craps, 2, 6);
+      a.craps.closeCrapsTable(craps, 'local');
+      expect(a.casino.readChips(bettor)).toBe(100);
+      sync(a.doc, b.doc);
+      b.craps.closeCrapsTable(craps); // b hears of it
+      sync(a.doc, b.doc);
+      expect([a, b].map((p) => p.casino.readChips(bettor))).toEqual([100, 100]);
+    });
+  }
+});
+
+describe('a table removed and put back while a settle of it is still under way', () => {
+  const bettor = 'player-Carol';
+
+  it('craps: the old roll settles nothing on the table put back, at the same roll', async () => {
+    a = await loadPage();
+    const craps = 'craps-1';
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.casino.buyInChips(bettor, 100);
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    diceTo(3, 4); // a seven: the pass line would win
+    a.craps.rollAndSettleCraps(craps, 1, null); // the dice still hashing...
+    a.craps.closeCrapsTable(craps, 'local'); // ...as the table goes
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.craps.openCrapsBetting(craps, 1, null); // and comes back, to its first roll
+    a.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 20 }]);
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    await flush();
+    expect(a.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'closing', round: 1 });
+    expect(a.casino.readMyCrapsBets(craps, bettor)).toEqual([{ type: 'pass', amount: 20 }]);
+    expect(a.casino.readChips(bettor)).toBe(80);
+  });
+
+  it('roulette: the old spin settles nothing on the table put back, at the same round', async () => {
+    a = await loadPage();
+    const table = 'roulette-1';
+    a.casino.buyInChips(bettor, 100);
+    a.croupier.openBetting(table, 1); // Fair: the settle hashes
+    expect(a.casino.readTableState(table)?.houseCommit).toBeTruthy();
+    a.casino.writeMyBets(table, bettor, 1, [{ type: 'red', amount: 10 }]);
+    a.croupier.closeBetting(table, a.casino.readTableState(table)!);
+    a.croupier.rollAndSettle(table, 1); // hashing...
+    a.croupier.closeTable(table, 'local');
+    a.croupier.openBetting(table, 1);
+    a.casino.writeMyBets(table, bettor, 1, [{ type: 'red', amount: 20 }]);
+    a.croupier.closeBetting(table, a.casino.readTableState(table)!);
+    await flush();
+    expect(a.casino.readTableState(table)).toMatchObject({ phase: 'closing', round: 1 });
+    expect(a.casino.readMyBets(table, bettor, 1)).toEqual([{ type: 'red', amount: 20 }]);
+    expect(a.casino.readChips(bettor)).toBe(80);
+  });
+});

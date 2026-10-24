@@ -1215,6 +1215,35 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
   return out;
 }
 
+/** The players who took every bet down for `round` of the table: their own
+ *  list for it (roulette's for the round, a craps list for that roll or an
+ *  earlier build's the stickman hasn't pruned) is there, on the table's
+ *  incarnation, and empty. A settle writes each an outcome all the same, of
+ *  nothing: a rival page settling the same round may have seen their last
+ *  bet, and the doc keeps one page's outcome per player
+ *  (creditTableOutcome), so this page's must meet it on that key. */
+export function readEmptiedLists(tableId: string, round: number): string[] {
+  const map = ensureMap();
+  const roulette = readTableState(tableId);
+  const craps = roulette ? null : readCrapsTableState(tableId);
+  const at = incarnationOf(tableId, roulette ?? craps);
+  const prefix = `bets:${tableId}:`;
+  const out: string[] = [];
+  for (const [key, value] of map.entries()) {
+    if (!key.startsWith(prefix)) continue;
+    const pid = key.slice(prefix.length);
+    if (roulette) {
+      const list = rouletteList(value, at);
+      if (list && list.round === round && list.bets.length === 0) out.push(pid);
+    } else if (craps) {
+      // (Such a list is the felt: the stickman's kept records are of rolls before.)
+      const own = crapsOwnList(value, at);
+      if (own && own.bets.length === 0 && (own.legacy ? !own.pruned : own.base === round)) out.push(pid);
+    }
+  }
+  return out;
+}
+
 // ── 🪙 Stakes on the felt (see STAKES ON THE FELT above) ─────────────────────
 
 /** Chips each player has held on felts, summed from the lists themselves
