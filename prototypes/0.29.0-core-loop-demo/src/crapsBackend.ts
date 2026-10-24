@@ -29,6 +29,7 @@
 import {
   casinoDocEpoch,
   creditTableOutcome,
+  feltStake,
   readAllCrapsBets,
   readCrapsBackendPref,
   readCrapsFairnessPref,
@@ -42,7 +43,7 @@ import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 // 🎲🔀 The dice-fairness mode drives HOW the roll is produced (rng / commit-reveal
 // / multiparty / block-beacon) — switchable per table; see games/diceFairness.ts.
 import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
-import type { FairnessTranscript } from './games/craps';
+import type { CrapsBet, CrapsTableState, FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
 import { frozenFields, frozenWagers, gatherRound, heldAtClose, roundSettleable, settledRound } from './fairTableSeeds';
 import { getPlayerId } from './identity';
@@ -122,9 +123,15 @@ class LocalCrapsBackend implements CrapsBackend {
         const now = Date.now();
         // Every bet stands — as frozen at "no more bets". A list rewritten
         // since can't be restored from its hash, so it's cleared like a
-        // forfeit (losing what it held then) rather than left to ride.
+        // forfeit (losing what it held then) rather than left to ride. Every
+        // frozen bettor's felt and outcome are written all the same, as a
+        // settle writes them: another page may be settling this very roll
+        // with dice, and the doc keeps one page's roll whole.
         const live = readAllCrapsBets(tableId);
-        const { voided } = frozenWagers(tableId, before, live);
+        const { bets: standing, voided } = frozenWagers(tableId, before, live);
+        const left: Record<string, CrapsBet[]> = { ...standing };
+        for (const pid of voided) left[pid] = [];
+        const held = heldBy(tableId, before, Object.keys(left));
         transactCasino(() => {
           writeCrapsTableState(tableId, {
             kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
@@ -137,11 +144,7 @@ class LocalCrapsBackend implements CrapsBackend {
             ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
           });
           settledRound(tableId, before);
-          for (const pid of voided) {
-            const held = heldAtClose(tableId, before, pid);
-            creditTableOutcome(tableId, before.inc ?? '', round, pid, -held);
-            pruneCrapsBets(tableId, pid, round, []);
-          }
+          feltAfterRoll(tableId, before, round, left, {}, held);
         });
         return null;
       }
@@ -194,18 +197,8 @@ class LocalCrapsBackend implements CrapsBackend {
       pointBefore,
     );
     for (const pid of forfeited) remaining[pid] = [];
-    // 🪙 What the roll does to each bettor's chips (casinoDoc STAKES ON THE
-    // FELT): the settle takes what the list held at the close, pays what the
-    // roll won, and the bets that stay up are held again, as kept. What an
-    // earlier build's list took isn't held, so its win comes in full and its
-    // standing bets' chips back to be held. A list rewritten (or emptied)
-    // since the close loses what it held then.
-    const owed: Record<string, number> = {};
-    for (const [pid, left] of Object.entries(remaining)) {
-      const stays = left.reduce((n, b) => n + b.amount, 0);
-      const delta = (payouts[pid] ?? 0) - heldAtClose(tableId, before, pid) + stays;
-      owed[pid] = delta;
-    }
+    // A list rewritten (or emptied) since the close loses what it held then.
+    const held = heldBy(tableId, before, Object.keys(remaining));
     const now = Date.now();
     // One transaction: a page sees the settled roll, what it paid, and the
     // pruned felts together.
@@ -236,16 +229,35 @@ class LocalCrapsBackend implements CrapsBackend {
         ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
       });
       settledRound(tableId, before);
-      // One change per bettor for the roll, counted once however many pages
-      // settle it (creditTableOutcome).
-      for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
-      // Prune the felt: what stays up of each player's list (standing
-      // pass/place), as the stickman's own record. Empty ⇒ their felt clears.
-      for (const [pid, bets] of Object.entries(remaining)) {
-        pruneCrapsBets(tableId, pid, round, bets);
-      }
+      feltAfterRoll(tableId, before, round, remaining, payouts, held);
     });
     return [d1, d2];
+  }
+}
+
+/** What each bettor's list held at the close (the settle takes it). */
+function heldBy(tableId: string, before: CrapsTableState, pids: string[]): Record<string, number> {
+  return Object.fromEntries(pids.map((pid) => [pid, heldAtClose(tableId, before, pid)]));
+}
+
+/**
+ * 🪙 What a settled roll does to each bettor's felt and chips (casinoDoc
+ * STAKES ON THE FELT), inside the settle's transaction: what stays up of
+ * each list is pruned onto the felt (empty: it clears), and the bettor's one
+ * outcome for the roll is what it won, less what the list held at the close,
+ * plus what the felt holds after it. So the bets that stay up hold their
+ * chips again, and what an earlier build's list took and still stands stays
+ * taken. Written for every bettor, a roll that moves nothing too, so a rival
+ * page's settle of the same roll meets it on every key (creditTableOutcome).
+ */
+function feltAfterRoll(
+  tableId: string, before: CrapsTableState, round: number,
+  left: Record<string, CrapsBet[]>, payouts: Record<string, number>, held: Record<string, number>,
+): void {
+  for (const [pid, bets] of Object.entries(left)) {
+    pruneCrapsBets(tableId, pid, round, bets);
+    const after = feltStake(tableId, pid).net;
+    creditTableOutcome(tableId, before.inc ?? '', round, pid, (payouts[pid] ?? 0) - (held[pid] ?? 0) + after);
   }
 }
 

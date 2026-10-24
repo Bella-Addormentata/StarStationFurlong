@@ -337,7 +337,8 @@ export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: 
   // A takeover marker counts only for the turn it took, in this room doc;
   // losing the turn (or it ending) drops it.
   const mark = tookOverAt.get(tableId);
-  const took = mark && s && mark.epoch === casinoDocEpoch() && mark.round === s.round ? mark.at : undefined;
+  const took = mark && s && mark.epoch === casinoDocEpoch() && mark.inc === s.inc && mark.round === s.round
+    ? mark.at : undefined;
   if (s?.phase !== 'closing' || s.operator !== PAGE_ID) {
     tookOverAt.delete(tableId);
     return;
@@ -357,9 +358,12 @@ export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: 
 export const MANUAL_TAKEOVER_MS = CRAPS_SHOOTER_MS + 10_000;
 
 /** When this page first saw each table's current closing turn (its epoch,
- *  round and operator), by this page's clock. tickManualCraps notes it every
- *  frame on every editor's page, so the watch starts as the turn does. */
-const closingSeen = new Map<string, { epoch: number; round: number; operator: string | undefined; at: number }>();
+ *  incarnation, round and operator), by this page's clock. tickManualCraps
+ *  notes it every frame on every editor's page, so the watch starts as the
+ *  turn does. */
+const closingSeen = new Map<string, {
+  epoch: number; inc: string | undefined; round: number; operator: string | undefined; at: number;
+}>();
 
 function noteClosing(tableId: string, s: CrapsTableState | null, now: number): number {
   if (s?.phase !== 'closing') {
@@ -368,13 +372,15 @@ function noteClosing(tableId: string, s: CrapsTableState | null, now: number): n
   }
   const epoch = casinoDocEpoch();
   const seen = closingSeen.get(tableId);
-  if (seen && seen.epoch === epoch && seen.round === s.round && seen.operator === s.operator) return seen.at;
-  closingSeen.set(tableId, { epoch, round: s.round, operator: s.operator, at: now });
+  if (seen && seen.epoch === epoch && seen.inc === s.inc && seen.round === s.round && seen.operator === s.operator) {
+    return seen.at;
+  }
+  closingSeen.set(tableId, { epoch, inc: s.inc, round: s.round, operator: s.operator, at: now });
   return now;
 }
 const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
 /** Turns this page took over: when (this page's own clock), and which. */
-const tookOverAt = new Map<string, { at: number; round: number; epoch: number }>();
+const tookOverAt = new Map<string, { at: number; inc: string | undefined; round: number; epoch: number }>();
 
 /**
  * The house's ROLL on a manual table. Returns a notice for the press, or
@@ -415,7 +421,7 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
     return 'THE DICE ARE OUT — ANOTHER HOUSE MEMBER IS RUNNING THIS ROLL';
   }
   writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
-  tookOverAt.set(tableId, { at: now, round: s.round, epoch: casinoDocEpoch() });
+  tookOverAt.set(tableId, { at: now, inc: s.inc, round: s.round, epoch: casinoDocEpoch() });
   return null;
 }
 

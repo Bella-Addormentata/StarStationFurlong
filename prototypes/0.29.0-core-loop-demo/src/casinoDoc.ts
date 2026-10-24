@@ -19,8 +19,9 @@
  *                                        (owner-written; craps: { kind, held,
  *                                        inc, base, taken? }; see STAKES ON
  *                                        THE FELT)
- *   kept:<tableId>:<playerId> → { round, kept: CrapsBet[], inc, of? } what a
- *                                        craps settle left up (stickman-written)
+ *   kept:<tableId>:<playerId> → { round, kept: CrapsBet[], inc, taken?, of? }
+ *                                        what a craps settle left up
+ *                                        (stickman-written)
  *   gone:<tableId>:<inc>      → 1        that incarnation of the table was
  *                                        removed (clearTableKeys)
  *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
@@ -71,7 +72,9 @@
  * writes their list: what a craps roll leaves up the stickman writes as
  * `kept`, which plays until the player writes a list after that roll, so a
  * list written before the roll settled never brings back bets it resolved
- * (crapsFelt). A list goes down only on a table that is up.
+ * (crapsFelt). An earlier build's list the stickman also prunes where it
+ * lies, as earlier builds did, so that page reads the felt as the roll left
+ * it. A list goes down only on a table that is up.
  *
  * A list an earlier build put down (under `bets`) took its chips as it went
  * down. What it took rides with it as `taken`, through the player's rewrites
@@ -103,8 +106,6 @@
  */
 
 import * as Y from 'yjs';
-import { sha256 } from '@noble/hashes/sha256';
-import { bytesToHex } from '@noble/hashes/utils';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { isCrapsBet, isCrapsTableState, isTableIncField, MAX_BET_AMOUNT, MAX_BETS_PER_PLAYER } from './games/craps';
@@ -771,10 +772,11 @@ function incarnationOf(map: Y.Map<unknown>, tableId: string, s: { inc?: string }
  *  held list put down on a table that had one carries it, and one put down on
  *  an earlier build's state, which had none, goes with whichever is up until
  *  the table is removed. An earlier build's own list carries none and goes
- *  with whichever is up: such a page may still be betting. */
+ *  with whichever is up: such a page may still be betting. One this build's
+ *  stickman pruned carries the incarnation it was pruned on. */
 function ofIncarnation(t: { inc?: unknown }, held: boolean, at: Incarnation): boolean {
   if (t.inc === undefined) return held ? at.bare : true;
-  return held && isTableIncField(t.inc) && t.inc === at.inc;
+  return isTableIncField(t.inc) && t.inc === at.inc;
 }
 
 const stakeOf = (l: { bets: readonly { amount: number }[]; taken: number }): FeltStake => ({
@@ -904,42 +906,53 @@ function crapsOwnList(value: unknown, at: Incarnation): ReturnType<typeof stored
   return storedList<CrapsBet>(value, isCrapsBet, at);
 }
 
-/** What the stickman's settle of `round` left up of a player's list, and the
- *  earlier build's list it settled, if it was one (`of`, its fingerprint). */
-function keptList(value: unknown, at: Incarnation): { round: number; bets: CrapsBet[]; of?: string } | null {
+/** What the stickman's settle of `round` left up of a player's list, what of
+ *  it an earlier build took (`taken`), and, when the list was an earlier
+ *  build's, the write the settle left it as (`of`, see writeIdOf). */
+function keptList(value: unknown, at: Incarnation): { round: number; bets: CrapsBet[]; taken: number; of?: string } | null {
   if (typeof value !== 'object' || value === null) return null;
-  const t = value as { round?: unknown; kept?: unknown; inc?: unknown; of?: unknown };
+  const t = value as { round?: unknown; kept?: unknown; inc?: unknown; taken?: unknown; of?: unknown };
   if (!Number.isSafeInteger(t.round) || (t.round as number) < 1) return null;
   if (!Array.isArray(t.kept) || t.kept.length > MAX_BETS_PER_PLAYER || !t.kept.every(isCrapsBet)) return null;
   if (t.inc === undefined ? !at.bare : t.inc !== at.inc) return null;
-  if (t.of !== undefined && (typeof t.of !== 'string' || t.of.length !== 64)) return null;
-  return { round: t.round as number, bets: t.kept as CrapsBet[], ...(typeof t.of === 'string' ? { of: t.of } : {}) };
+  if (t.taken !== undefined && !(Number.isSafeInteger(t.taken) && (t.taken as number) > 0 && (t.taken as number) <= MAX_LIST_STAKE)) {
+    return null;
+  }
+  if (t.of !== undefined && (typeof t.of !== 'string' || !/^\d{1,16}:\d{1,16}$/.test(t.of))) return null;
+  return {
+    round: t.round as number, bets: t.kept as CrapsBet[], taken: (t.taken as number | undefined) ?? 0,
+    ...(typeof t.of === 'string' ? { of: t.of } : {}),
+  };
 }
 
-/** An earlier build's list, hashed: how a settle names the one it took over. */
-function legacyFingerprint(bets: readonly CrapsBet[]): string {
-  return bytesToHex(sha256(new TextEncoder().encode(`ssf-legacy-craps-v1|${JSON.stringify(bets)}`)));
+/** The doc's own name for the write `key` holds now: its Yjs item id, the
+ *  same on every page. Two writes of the same bets are two names, so a list
+ *  an earlier build puts down again after a settle is a new list. */
+function writeIdOf(map: Y.Map<unknown>, key: string): string | undefined {
+  const item = (map as unknown as { _map: Map<string, { id: { client: number; clock: number } }> })._map.get(key);
+  return item ? `${item.id.client}:${item.id.clock}` : undefined;
 }
 
 /** 🎲 A player's craps bets as they play, of the two keys: their own list,
  *  unless the stickman has settled a roll since they wrote it, when what that
  *  settle left up (`kept`) plays instead. A list counts as written after the
  *  settle of roll `base - 1` (writeMyCrapsBets); an earlier build's list,
- *  which has no `base`, plays unless it is the very one a settle took over.
- *  So a list written before a roll settled (a take-down that crossed the
- *  dice) never brings back bets the roll resolved: the edit is dropped, the
- *  felt stays as the roll left it. Kept bets were taken nothing. */
+ *  which has no `base`, plays unless it is the very write the settle left
+ *  (pruneCrapsBets). So a list written before a roll settled (a take-down
+ *  that crossed the dice) never brings back bets the roll resolved: the edit
+ *  is dropped, the felt stays as the roll left it. */
 function crapsFelt(
   map: Y.Map<unknown>, tableId: string, playerId: string, inc: string | undefined,
 ): { bets: CrapsBet[]; taken: number } | null {
   const at = incarnationOf(map, tableId, { inc });
-  const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), at);
+  const key = `bets:${tableId}:${playerId}`;
+  const own = crapsOwnList(map.get(key), at);
   const kept = keptList(map.get(`kept:${tableId}:${playerId}`), at);
   if (!kept) return own;
-  const keep = { bets: kept.bets, taken: 0 };
+  const keep = { bets: kept.bets, taken: kept.taken };
   if (!own) return keep;
   if (!own.legacy) return own.base !== undefined && own.base > kept.round ? own : keep;
-  return kept.of === legacyFingerprint(own.bets) ? keep : own;
+  return kept.of !== undefined && kept.of === writeIdOf(map, key) ? keep : own;
 }
 
 export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
@@ -967,18 +980,25 @@ export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsB
 }
 
 /** The stickman's record, at the settle of `round`, of a player's bets that
- *  stay up (none: the roll resolved them all). Never the player's own key.
- *  Their chips are held as kept (taken nothing: the settle paid what an
- *  earlier build's list took). */
+ *  stay up (none: the roll resolved them all), held on the felt from then.
+ *  This build's player's own list is never written: what an earlier build's
+ *  list took is handed back, and the kept bets hold their chips. An earlier
+ *  build's list is pruned where it lies, as earlier builds did, so its page
+ *  reads the felt as the roll left it, and what it took of the bets that stay
+ *  stays taken (`taken`); its own next write plays as a new list. */
 export function pruneCrapsBets(tableId: string, playerId: string, round: number, bets: CrapsBet[]): void {
   const map = ensureMap();
   const inc = readCrapsTableState(tableId)?.inc;
-  const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, { inc }));
+  const key = `bets:${tableId}:${playerId}`;
+  const own = crapsOwnList(map.get(key), incarnationOf(map, tableId, { inc }));
+  const taken = own?.legacy ? bets.reduce((n, b) => n + b.amount, 0) : 0;
   boundDoc!.transact(() => {
+    if (own?.legacy) map.set(key, { kind: 'craps', bets, ...(inc !== undefined ? { inc } : {}) });
     map.set(`kept:${tableId}:${playerId}`, {
       round, kept: bets,
       ...(inc !== undefined ? { inc } : {}),
-      ...(own?.legacy ? { of: legacyFingerprint(own.bets) } : {}),
+      ...(taken > 0 ? { taken } : {}),
+      ...(own?.legacy ? { of: writeIdOf(map, key) } : {}),
     });
     heldDirty = true;
   });

@@ -351,15 +351,17 @@ export function openBetting(tableId: string, round: number): void {
   });
 }
 
-/** When this page first saw each table's current SPIN lease (its epoch, round
- *  and holder), by this page's clock. */
-const spinSeen = new Map<string, { epoch: number; round: number; operator: string; at: number }>();
+/** When this page first saw each table's current SPIN lease (its epoch,
+ *  incarnation, round and holder), by this page's clock. */
+const spinSeen = new Map<string, { epoch: number; inc: string | undefined; round: number; operator: string; at: number }>();
 
 function spinSeenAt(tableId: string, s: RouletteTableState, operator: string, now: number): number {
   const epoch = casinoDocEpoch();
   const seen = spinSeen.get(tableId);
-  if (seen && seen.epoch === epoch && seen.round === s.round && seen.operator === operator) return seen.at;
-  spinSeen.set(tableId, { epoch, round: s.round, operator, at: now });
+  if (seen && seen.epoch === epoch && seen.inc === s.inc && seen.round === s.round && seen.operator === operator) {
+    return seen.at;
+  }
+  spinSeen.set(tableId, { epoch, inc: s.inc, round: s.round, operator, at: now });
   return now;
 }
 
