@@ -326,6 +326,13 @@ interface Sample {
   own?: true;
 }
 const samples = new Map<string, Sample>();
+/** Samples this page has read with nobody running the laps from them — the
+ *  remote put down or gone quiet — so that LOOP runs on from them on its
+ *  own (readPlayback). Once found so, a sample stays so until a new write
+ *  replaces it: its writer is gone, and whoever picks the remote up takes
+ *  the lap the room is on, as everyone else reads it, until their own
+ *  first beat. */
+const lapsRunOn = new WeakSet<Sample>();
 /** The switch's revision this page last answered, per TV: the ON write
  *  anchors the resumed programme once (noteSamples), and a late joiner, or
  *  a later change to any other key, must not anchor the room at a reading
@@ -895,6 +902,11 @@ export function pickUpRemote(itemId: string, now = clock()): TvAction {
   if (!mayPickUpRemote(itemId, now)) {
     return { ok: false, error: `${rec.name || 'Someone'} is holding the remote.` };
   }
+  // Taken up in a room nobody held: LOOP's laps run on from the sample it
+  // had until this page's first beat, read or not while nobody held it
+  // (lapsRunOn).
+  const sample = samples.get(itemId);
+  if (sample && remoteLapsed(itemId, now)) lapsRunOn.add(sample);
   write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: pageId } satisfies RemoteRecord);
   return { ok: true };
 }
@@ -1362,6 +1374,12 @@ export interface PlaybackNow {
    *  since, un-bridged — the earlier of the two readings such a beat could
    *  mean, which is the safe one to take a room over from. */
   anchorMs?: number;
+  /** 'playing' with LOOP and nobody running the laps (readPlayback): the
+   *  lap of the anchor's run the room is on — 0 for the run the anchor is
+   *  in, 1 once past the media's end, and so on — with `positionMs` into
+   *  it. A lap no write names: a viewer replays when it changes (tvSync),
+   *  however short the film. Absent while a holder runs the laps. */
+  lap?: number;
 }
 
 /** The sample this page anchored the holder's last position to, or null
@@ -1424,17 +1442,32 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
   }
   if (rec.state === 'playing') {
     const sample = samples.get(itemId);
-    const pb: PlaybackNow = sample ? fromSample(sample, now, rttMs) : { state: 'playing', positionMs: rec.positionMs, running: true, countdownMs: 0 };
+    const unheld = !iHoldRemote(itemId) && remoteLapsed(itemId, now);
+    let pb: PlaybackNow = sample ? fromSample(sample, now, rttMs) : { state: 'playing', positionMs: rec.positionMs, running: true, countdownMs: 0 };
+    // A stale reading waits for the holder's next beat past the wake window
+    // (fromSample). With nobody holding the remote, no beat is coming: once
+    // the wake window and a lapse's worth of quiet have passed with none,
+    // the takeover anchor is where the room is — where this page would take
+    // it from if it picked the remote up — and a viewer follows it as it
+    // would a fresh reading.
+    if (pb.stale && unheld && now - lastGapAt >= TV_WAKE_WINDOW_MS + TV_LEASE_LAPSE_MS) {
+      pb = { state: 'playing', positionMs: holderAnchorMs(pb), running: true, countdownMs: 0 };
+    }
     // LOOP with no one to run the laps (the remote put down or gone quiet:
     // the room may be empty but for this page), or on a first sight run on
     // by the writer's clock: past the end is that far into a lap, and every
-    // page in the room works out the same one. The holder runs its own
+    // page in the room works out the same one (`lap` says which). A page
+    // that picks the remote up then takes the room from there, as does
+    // everyone watching, until its first beat replaces the sample
+    // (lapsRunOn). A holder that has beaten runs its own laps
     // (tvProgrammeEnded), and a viewer with a live holder follows those.
-    if (rec.loop && rec.endMs > 0 && !iHoldRemote(itemId) && (sample?.wall === true || remoteLapsed(itemId, now))) {
+    if (sample && unheld) lapsRunOn.add(sample);
+    if (rec.loop && rec.endMs > 0 && (unheld || sample?.wall === true || (sample !== undefined && lapsRunOn.has(sample)))) {
       return {
         ...pb,
         positionMs: intoLap(pb.positionMs, rec.endMs),
         ...(pb.anchorMs !== undefined ? { anchorMs: intoLap(pb.anchorMs, rec.endMs) } : {}),
+        lap: Math.floor(pb.positionMs / rec.endMs),
       };
     }
     return pb;
