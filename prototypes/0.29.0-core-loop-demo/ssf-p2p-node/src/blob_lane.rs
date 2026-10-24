@@ -280,6 +280,9 @@ struct Met {
     rooms: HashMap<String, HashMap<PublicKey, u64>>,
     /// A node is here that `library.json` does not name yet.
     unsaved: bool,
+    /// A later sight of a node it names is not written yet. Both stay set
+    /// until a write of `library.json` succeeds.
+    moved: bool,
 }
 
 impl Met {
@@ -322,6 +325,7 @@ impl Met {
                 }
             }
         }
+        self.moved |= moved;
         self.cap();
         moved
     }
@@ -362,7 +366,7 @@ impl Met {
             })
             .filter(|(_, nodes)| !nodes.is_empty())
             .collect();
-        let mut met = Self { rooms, unsaved: false };
+        let mut met = Self { rooms, unsaved: false, moved: false };
         met.cap();
         met
     }
@@ -612,15 +616,22 @@ impl BlobLane {
                 .collect();
             (h.rooms.clone(), spent)
         };
-        let met: HashMap<String, HashMap<String, u64>> = {
+        // The roster's flags go with the snapshot, and come back when the
+        // write fails: the next scan tries again.
+        let (met, unsaved, moved) = {
             let mut m = self.met.lock().unwrap();
-            m.unsaved = false;
-            m.rooms.iter().map(|(r, nodes)| (r.clone(), nodes.iter().map(|(k, at)| (k.to_string(), *at)).collect())).collect()
+            let flags = (std::mem::take(&mut m.unsaved), std::mem::take(&mut m.moved));
+            let rooms: HashMap<String, HashMap<String, u64>> =
+                m.rooms.iter().map(|(r, nodes)| (r.clone(), nodes.iter().map(|(k, at)| (k.to_string(), *at)).collect())).collect();
+            (rooms, flags.0, flags.1)
         };
         let body = serde_json::json!({ "v": 1, "files": files, "host": host, "hostSpent": spent, "met": met }).to_string();
         let tmp = self.dir.join(format!("{LIBRARY_FILE}.tmp"));
         if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.dir.join(LIBRARY_FILE))) {
             eprintln!("⚠️ blob-cache/{LIBRARY_FILE} could not be written: {e}");
+            let mut m = self.met.lock().unwrap();
+            m.unsaved |= unsaved;
+            m.moved |= moved;
         }
     }
 
@@ -850,12 +861,13 @@ impl BlobLane {
 
     /// Note who was seen where at `now`. `library.json` is written again
     /// for a node new to the roster once its last write is `MET_PERSIST`
-    /// old, and for a later sight once it is `USED_PERSIST` old.
+    /// old, and for a later sight once it is `USED_PERSIST` old — whether
+    /// or not that node is still here.
     fn note_met(&self, seen: Vec<(String, Vec<PublicKey>)>, now: u64) {
         let (moved, unsaved) = {
             let mut met = self.met.lock().unwrap();
-            let moved = met.note(seen, now);
-            (moved, met.unsaved)
+            met.note(seen, now);
+            (met.moved, met.unsaved)
         };
         let since = now.saturating_sub(self.saved.load(Ordering::Relaxed));
         if (unsaved && since >= MET_PERSIST.as_millis() as u64) || (moved && since >= USED_PERSIST.as_millis() as u64) {
@@ -2171,11 +2183,29 @@ mod tests {
         lane.saved.store(now - MET_PERSIST.as_millis() as u64, Ordering::Relaxed);
         lane.note_met(vec![("r".into(), vec![b])], now);
         assert!(listed().contains(&a.to_string()) && listed().contains(&old.to_string()));
+        // A later sight of a node that then left is still written once the
+        // last write is USED_PERSIST old.
+        lane.note_met(vec![("r".into(), vec![a])], now - 500);
+        lane.note_met(vec![], now);
+        assert!(!listed().contains(&(now - 500).to_string()), "not yet");
+        lane.saved.store(now - USED_PERSIST.as_millis() as u64, Ordering::Relaxed);
+        lane.note_met(vec![], now);
+        assert!(listed().contains(&(now - 500).to_string()), "the sight of a, though a has gone");
+        // A write that fails keeps the roster's news for the next one.
+        let c = key();
+        std::fs::create_dir(dir.join(format!("{LIBRARY_FILE}.tmp"))).unwrap(); // the write cannot land
+        lane.saved.store(0, Ordering::Relaxed);
+        lane.note_met(vec![("r".into(), vec![c])], now - 200);
+        assert!(!listed().contains(&c.to_string()));
+        std::fs::remove_dir(dir.join(format!("{LIBRARY_FILE}.tmp"))).unwrap();
+        lane.saved.store(0, Ordering::Relaxed);
+        lane.note_met(vec![], now);
+        assert!(listed().contains(&c.to_string()), "written once the disk takes it");
         lane.store.shutdown().await.unwrap();
         drop(lane);
 
         let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, quiet).await.unwrap();
-        assert_eq!(lane.met_elsewhere("r", &|_| false, now_ms()), vec![b, a, old]);
+        assert_eq!(lane.met_elsewhere("r", &|_| false, now_ms()), vec![b, c, a, old]);
         // At most MET_PER_ROOM a room: the ones seen longest ago go.
         let t0 = now_ms();
         let many: Vec<PublicKey> = (0..MET_PER_ROOM + 5).map(|_| key()).collect();
