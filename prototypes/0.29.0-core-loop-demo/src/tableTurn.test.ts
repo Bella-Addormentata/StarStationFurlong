@@ -862,11 +862,11 @@ describe('a write at the moment the table is removed, from a page that leaves be
     }
   });
 
-  it('leaves nothing behind for a table this page never saw up', () => {
+  it('leaves nothing behind for a table of the room this page left', () => {
     // A page leaving a room reconciles the last room's tables away against
     // the new room's doc.
-    expect(updatesDuring(a, () => a.croupier.closeTable('casino-roulette-elsewhere'))).toBe(0);
-    expect(updatesDuring(a, () => a.craps.closeCrapsTable('casino-craps-elsewhere'))).toBe(0);
+    expect(updatesDuring(a, () => a.croupier.closeTable('casino-roulette-elsewhere', 'elsewhere'))).toBe(0);
+    expect(updatesDuring(a, () => a.craps.closeCrapsTable('casino-craps-elsewhere', 'elsewhere'))).toBe(0);
   });
 
   it('nor does a table put back under the same id play the bets it left', () => {
@@ -1050,7 +1050,7 @@ describe('a table two pages open at once, before either hears of the other', () 
     const second = a.casino.readTableState(TABLE)!;
     const { inc: _inc, ...earlier } = second;
     a.casino.writeTableState(TABLE, earlier); // an earlier build's next round
-    a.croupier.closeTable(TABLE);
+    a.croupier.closeTable(TABLE, 'local'); // page a removes it
     a.croupier.openBetting(TABLE, 1);
     expect(a.casino.readTableState(TABLE)!.inc).not.toBe(second.inc);
   });
@@ -1502,6 +1502,29 @@ describe('a Fair table removed and put back under the same id, heard all at once
     b.craps.closeCrapsBetting(craps, b.casino.readCrapsTableState(craps)!);
     sync(a.doc, b.doc); // page a hears it all between two frames
     // Page a holds no house seed for the new roll: it voids it.
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) {
+      expect(page.casino.readCrapsTableState(craps)).toMatchObject({ round: 1, voided: true });
+      expect(page.casino.readMyCrapsBets(craps, bettor)).toEqual([{ type: 'pass', amount: 10 }]);
+      expect(page.casino.readChips(bettor)).toBe(90);
+    }
+  });
+
+  it("craps, on an earlier build's table: likewise", async () => {
+    a.casino.buyInChips(bettor, 100);
+    a.craps.openCrapsBetting(craps, 1, null);
+    const { inc: _inc, ...earlier } = a.casino.readCrapsTableState(craps)!;
+    a.casino.writeCrapsTableState(craps, earlier); // no incarnation
+    a.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 30 }]);
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    sync(a.doc, b.doc);
+    b.craps.closeCrapsTable(craps);
+    b.craps.openCrapsBetting(craps, 1, null);
+    b.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    b.craps.closeCrapsBetting(craps, b.casino.readCrapsTableState(craps)!);
+    sync(a.doc, b.doc);
     a.craps.rollAndSettleCraps(craps, 1, null);
     await flush();
     sync(a.doc, b.doc);

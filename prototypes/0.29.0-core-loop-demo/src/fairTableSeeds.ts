@@ -55,6 +55,7 @@ import {
   readPlayerKey,
   readSeedRecord,
   readTableState,
+  tableIncOf,
   tableIncRemoved,
   writeMySeedRecord,
 } from './casinoDoc';
@@ -257,8 +258,8 @@ const authoredRounds = new Set<string>();
  *  check compares the settled record against it: an operator who rewrites the
  *  party set after the reveals (to drop or add a seed) is caught here. */
 interface FrozenSnapshot {
-  /** the table's incarnation it was taken on */
-  inc?: string;
+  /** the table's incarnation it was taken on (tableIncOf) */
+  inc: string;
   house: string;
   commits: Record<string, string>;
   wagers?: Record<string, string>;
@@ -280,16 +281,16 @@ const SNAPSHOTS_PER_TABLE = 4;
 function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
   const rounds = frozenSeen.get(`${casinoDocEpoch()}:${tableId}`);
   const seen = rounds?.get(String(s.round));
-  if (seen && seen.inc !== s.inc && tableIncRemoved(tableId, seen.inc)) {
+  if (seen && seen.inc !== tableIncOf(tableId, s) && tableIncRemoved(tableId, seen.inc)) {
     rounds!.delete(String(s.round));
     return undefined;
   }
   return seen;
 }
 
-function snapshot(s: TableState): FrozenSnapshot {
+function snapshot(tableId: string, s: TableState): FrozenSnapshot {
   return {
-    ...(s.inc !== undefined ? { inc: s.inc } : {}),
+    inc: tableIncOf(tableId, s),
     house: s.houseCommit ?? '',
     commits: { ...(s.commits ?? {}) },
     ...(s.wagers ? { wagers: { ...s.wagers } } : {}),
@@ -360,7 +361,7 @@ function noteFrozen(tableId: string, s: TableState, overwrite: boolean): void {
     evictOldest(frozenSeen, 256);
   }
   rounds.delete(k); // re-insert as newest
-  rounds.set(k, snapshot(s));
+  rounds.set(k, snapshot(tableId, s));
   // Only this table's older rounds make way: other tables keep theirs.
   evictOldest(rounds, SNAPSHOTS_PER_TABLE);
 }

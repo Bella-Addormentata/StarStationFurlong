@@ -26,6 +26,7 @@ import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
 import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
+import type { TableClosing } from "./casinoDoc";
 import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
@@ -111,7 +112,7 @@ import {
   findPath,
   nearestWalkableCell,
 } from "./pathfinding";
-import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
+import { subscribeFurniture, readAllFurniture, layoutRemoved } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
@@ -3186,7 +3187,8 @@ export class World {
     for (const item of [...FURNITURE]) {
       if (records.has(item.id)) continue;
       this.evictAndDefocusForItem(item.id);
-      this.removeFurnitureVisuals(item.id);
+      // A removal this room's layout made, or a table of the room left behind.
+      this.removeFurnitureVisuals(item.id, layoutRemoved(item.id) ? "heard" : "elsewhere");
       const idx = FURNITURE.findIndex((i) => i.id === item.id);
       if (idx !== -1) FURNITURE.splice(idx, 1);
       changedIds.add(item.id);
@@ -3346,8 +3348,12 @@ export class World {
    * Deleting from wallScreens/trunkLids/holoSpinners is what stops update()
    * driving freed handles: the 1 Hz screen redraw, the per-frame lid ease
    * and the holo-ring spin all iterate those collections.
+   *
+   * `closing` says how this page comes to remove it (casinoDoc
+   * TableClosing): its own edit, a removal it heard from the room, or the
+   * room it left (the reconcile against the doc it joined).
    */
-  public removeFurnitureVisuals(itemId: string): boolean {
+  public removeFurnitureVisuals(itemId: string, closing: TableClosing = "local"): boolean {
     const group = this.furnitureGroups.get(itemId);
     if (!group) return false;
     this.platformGroup.remove(group);
@@ -3397,9 +3403,9 @@ export class World {
     // and table:/bets: records orphan. Runs pre-splice, so the kind is still known.
     const removedKind = FURNITURE.find((i) => i.id === itemId)?.kind;
     if (removedKind === "roulette-table") {
-      closeTable(itemId);
+      closeTable(itemId, closing);
     } else if (removedKind === "craps-table") {
-      closeCrapsTable(itemId);
+      closeCrapsTable(itemId, closing);
     } else if (removedKind === "slot-machine") {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);

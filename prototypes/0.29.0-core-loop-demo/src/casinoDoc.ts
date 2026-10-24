@@ -26,7 +26,8 @@
  *                                        (stickman-written)
  *   gone:<tableId>:<inc>      → 1        that incarnation of the table was
  *                                        removed (clearTableKeys); the bare
- *                                        `gone:<tableId>:` counts removals
+ *                                        `gone:<tableId>:`, that the table
+ *                                        has been removed under this id
  *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
  *   throw:<tableId>           → DiceThrow (the shooter's fling, or the
  *                                        stickman's when it throws for them)
@@ -88,21 +89,26 @@
  * down. What it took rides with it as `taken`, through the player's rewrites
  * too: the list holds only the rest (FeltStake `net`, below 0 when the
  * player took more down than it took), the settle pays its wins in full, and
- * a removal refunds what it took, in the table's outcome record. Nothing is
- * handed back on a rewrite, so two tabs, or a tab and a removal, can't hand
- * it back twice. A craps settle at the very moment of the removal can win
- * that record over the refund: what the bets it kept up had taken is then
- * owed back by the `kept` record it left (keptOwed), and paid as the
- * removal's outcome when that record goes.
+ * a removal refunds what it took, in the table's outcome record: every page
+ * that hears of it, from the table's state as the doc has it, one the
+ * removal ended too, since the page removing it may not have seen that round
+ * (tableEndingStakes). Nothing is handed back on a rewrite, so two tabs, or
+ * a tab and a removal, can't hand it back twice. A craps settle at the very
+ * moment of the removal can win that record over the refund: what the bets
+ * it kept up had taken is then owed back by the `kept` record it left
+ * (keptOwed), and paid as the removal's outcome when that record goes.
  *
  * A write at the very moment of a removal (a settle, a bet) outlives the
  * removal's delete, as a concurrent write does in the doc. So the removal
  * leaves `gone:<tableId>:<inc>` behind: a state of a removed incarnation
  * reads as no table and holds nothing, and a list belongs to the incarnation
  * it was put down on (its `inc`), so a table put back under the same id
- * starts clean. A list this build put down on an earlier build's state
- * carries none, and plays on until the table is first removed, which also
- * leaves `gone:<tableId>:`.
+ * starts clean. An earlier build's state carries none: it is the
+ * incarnation the table's first round takes (tableIncOf), so a page giving
+ * it its `inc` and a page removing it name it alike. A page that removes a
+ * table it saw no round on marks the incarnation a page that hasn't heard
+ * would open it on, and a table put back never reopens a name whose records
+ * a removal left unmarked (tableIncToOpen).
  *
  * The HOUSE keeps no stored record at all — everything about the cage is
  * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
@@ -552,21 +558,71 @@ function lastOutcome(
   return { base, link, was: isChipRecord(stored) && stored.p === playerId ? stored : null };
 }
 
-/** The incarnation a table takes when its first round opens (and a table
- *  from an earlier build at its next): it names the table's outcomes for
- *  creditTableOutcome and the lists put down on it. It is drawn from the
- *  table and the record of its removals (its `gone:` marks), not at random:
- *  two pages opening the same table at once, before either hears of the
- *  other, name it alike, so what each pays meets on one record, as their
- *  states meet on one key; a table put back after a removal is a new one. */
+/** The incarnation a table takes when its first round opens: it names the
+ *  table's outcomes for creditTableOutcome and the lists put down on it. It
+ *  is drawn from the table and the record of its removals (its `gone:`
+ *  marks), not at random: two pages opening the same table at once, before
+ *  either hears of the other, name it alike, so what each pays meets on one
+ *  record, as their states meet on one key; a table put back after a removal
+ *  is a new one. */
 export function tableIncFor(tableId: string): string {
   const map = ensureMap();
   const prefix = `gone:${tableId}:`;
   const removals = [...map.entries()].filter(([key]) => key.startsWith(prefix))
     .map(([key, value]): [string, unknown] => [key.slice(prefix.length), value])
     .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+  return incName(tableId, removals);
+}
+
+function incName(tableId: string, removals: [string, unknown][]): string {
   const named = `ssf-table-inc-v1|${tableId}|${JSON.stringify(removals)}`;
   return bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
+}
+
+const firstIncs = new Map<string, string>();
+
+/** The incarnation a table's state is of. An earlier build's state carries
+ *  none, and is the incarnation the table's first round takes (tableIncFor
+ *  before any removal): it can only be up until the table's first removal,
+ *  so every page names it alike, before and after this build gives it its
+ *  `inc` at its next round, and what it pays meets on one record. */
+export function tableIncOf(tableId: string, s: { inc?: string }): string {
+  if (s.inc !== undefined) return s.inc;
+  let first = firstIncs.get(tableId);
+  if (first === undefined) {
+    first = incName(tableId, []);
+    if (firstIncs.size >= 256) firstIncs.clear();
+    firstIncs.set(tableId, first);
+  }
+  return first;
+}
+
+/** The name the table's next first round takes (tableIncFor), once any
+ *  incarnation of that name that a removal left unmarked (an earlier
+ *  build's, which marks nothing) is marked ended: its outcome records, or
+ *  lists carrying it, are still in the doc. Every page reads the same doc,
+ *  so pages opening the table at once still name it alike. */
+function freshIncFor(map: Y.Map<unknown>, tableId: string): string {
+  const chips = ensureChips();
+  for (;;) {
+    const name = tableIncFor(tableId);
+    const records = `tbl:${tableId}:${name}:`;
+    const used = [...chips.keys()].some((key) => key.startsWith(records))
+      || [...map.entries()].some(([key, value]) =>
+        (key.startsWith(`bets:${tableId}:`) || key.startsWith(`kept:${tableId}:`))
+        && (value as { inc?: unknown } | null)?.inc === name);
+    if (!used) return name;
+    markRemoved(map, tableId, name);
+  }
+}
+
+/** The incarnation a table's next round opens on: the state's up there, or
+ *  a new one (freshIncFor). In the caller's transaction. */
+export function tableIncToOpen(tableId: string): string {
+  const map = ensureMap();
+  const raw = map.get(`table:${tableId}`);
+  const up = (isRouletteTableState(raw) || isCrapsTableState(raw)) && !removed(map, tableId, raw) ? raw : null;
+  return up ? tableIncOf(tableId, up) : freshIncFor(map, tableId);
 }
 
 /** Every chip record in the bound room (one per page per account), oldest
@@ -635,16 +691,23 @@ function goneKey(tableId: string, inc: string): string {
 
 /** A state of an incarnation the table's removal has ended (written at the
  *  moment of the removal, it outlived the delete). A state an earlier build
- *  wrote has no incarnation: its removal marks `gone:<tableId>:`, and a table
- *  put back after it starts an incarnation of its own (openBetting). */
+ *  wrote has no incarnation and is up only until the table's first removal
+ *  (`gone:<tableId>:`), which ended the incarnation it is (tableIncOf): one
+ *  written after that is an earlier build's page putting the table back,
+ *  and a round this build opens there starts an incarnation of its own. */
 function removed(map: Y.Map<unknown>, tableId: string, s: RouletteTableState | CrapsTableState): boolean {
   return map.has(goneKey(tableId, s.inc ?? ''));
 }
 
-/** Whether incarnation `inc` of a table (undefined: an earlier build's,
- *  which has none) has been removed. */
-export function tableIncRemoved(tableId: string, inc: string | undefined): boolean {
-  return ensureMap().has(goneKey(tableId, inc ?? ''));
+/** Whether incarnation `inc` of a table has been removed. */
+export function tableIncRemoved(tableId: string, inc: string): boolean {
+  return ensureMap().has(goneKey(tableId, inc));
+}
+
+/** Mark incarnation `inc` of a table ended, and the table removed once. */
+function markRemoved(map: Y.Map<unknown>, tableId: string, inc: string): void {
+  map.set(goneKey(tableId, inc), 1);
+  if (!map.has(goneKey(tableId, ''))) map.set(goneKey(tableId, ''), 1);
 }
 
 /** Croupier-only in practice (the UI gates on the house predicate). */
@@ -656,13 +719,19 @@ export function writeTableState(tableId: string, state: RouletteTableState): voi
   });
 }
 
+/** How a page comes to close a table: it removes the table itself
+ *  (`local`), hears another page remove it (`heard`), or reconciles away a
+ *  table of the room it left, which the doc it joined never had
+ *  (`elsewhere`). */
+export type TableClosing = 'local' | 'heard' | 'elsewhere';
+
 /** 🎰 Wipe every casino key for a table (its state, croupier heartbeat, and all
  *  per-player bets) — the removal teardown so a deleted table leaves no orphan
  *  records. Held stakes go back with their lists; refunding an earlier build's
  *  lists is the CALLER's job (croupier.closeTable), done before this so the
  *  bet records are still readable. Leaves the incarnation's `gone:` mark, so
  *  a state or list written at the same moment stays ended. One transact. */
-export function clearTableKeys(tableId: string): void {
+export function clearTableKeys(tableId: string, closing: TableClosing = 'heard'): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
   const keptPrefix = `kept:${tableId}:`;
@@ -672,26 +741,20 @@ export function clearTableKeys(tableId: string): void {
     for (const key of [...map.keys()]) {
       if (key.startsWith(keptPrefix)) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
     }
-    // The incarnation removed, and any before it that had none: a list this
-    // build put down on one of those carries none either (ofIncarnation). No
-    // mark for a table this page never saw up (a page leaving a room for one
-    // without it reconciles the old room's tables away), nor for a state of
-    // an incarnation a removal already ended (a write at its moment left it
-    // behind). An earlier build's state up has no incarnation, so the mark
-    // is the one a page that hasn't heard of the removal gives it at its next
-    // round (tableIncFor, alike on every page): that round, opened at the
-    // moment of the removal, is ended too. The bare mark counts the
-    // removals, an earlier build's state too though it reads as ended (that
-    // page may have rewritten it after a removal), so a table put back
-    // always names a new incarnation.
+    // The incarnation removed (an earlier build's state up is the one its
+    // next round takes, tableIncOf). With none up here, the one a page that
+    // hasn't heard would open the table on (tableIncFor, alike on every
+    // page), so a round opened at the moment of the removal is ended too:
+    // when this page removes the table, or hears of a removal that marked
+    // nothing (an earlier build's, of a table never removed before). Not when
+    // a removal this build made has marked it already: a page that hears of
+    // it late changes nothing a table put back is named by. Nor for a table
+    // of the room this page left.
     const was = map.get(`table:${tableId}`);
-    if (isRouletteTableState(was) || isCrapsTableState(was)) {
-      const up = !removed(map, tableId, was);
-      if (up) map.set(goneKey(tableId, was.inc ?? tableIncFor(tableId)), 1);
-      if (up || was.inc === undefined) {
-        const count = map.get(goneKey(tableId, ''));
-        map.set(goneKey(tableId, ''), (Number.isSafeInteger(count) ? count as number : 0) + 1);
-      }
+    const up = (isRouletteTableState(was) || isCrapsTableState(was)) && !removed(map, tableId, was) ? was : null;
+    if (up) markRemoved(map, tableId, tableIncOf(tableId, up));
+    else if (closing === 'local' || (closing === 'heard' && !map.has(goneKey(tableId, '')))) {
+      markRemoved(map, tableId, tableIncFor(tableId));
     }
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
@@ -817,29 +880,22 @@ function storedList<B extends { amount: number }>(
   };
 }
 
-/** The incarnation of a table its lists must carry to play there: the live
- *  state's (none: no table up), and whether this build's lists carrying none
- *  still belong (`bare`: until the table has been removed under this id once,
- *  the only time a state with no incarnation, an earlier build's, can have
- *  been live while this build put lists down on it). */
-interface Incarnation {
-  inc: string | undefined;
-  bare: boolean;
+/** The incarnation of a table its lists must carry to play there: the up
+ *  state's (tableIncOf), undefined with no table up. */
+type Incarnation = string | undefined;
+
+function incarnationOf(tableId: string, s: { inc?: string } | null): Incarnation {
+  return s ? tableIncOf(tableId, s) : undefined;
 }
 
-function incarnationOf(map: Y.Map<unknown>, tableId: string, s: { inc?: string } | null): Incarnation {
-  return { inc: s?.inc, bare: !map.has(goneKey(tableId, '')) };
-}
-
-/** Whether a stored list was put down on the incarnation `at` of its table. A
- *  held list put down on a table that had one carries it, and one put down on
- *  an earlier build's state, which had none, goes with whichever is up until
- *  the table is removed. An earlier build's own list carries none and goes
- *  with whichever is up: such a page may still be betting. One this build's
- *  stickman pruned carries the incarnation it was pruned on. */
+/** Whether a stored list was put down on the incarnation `at` of its table.
+ *  This build's lists carry the incarnation they were put down on (an
+ *  earlier build's state's too, tableIncOf), and so do the stickman's
+ *  prunes. An earlier build's own list carries none and goes with whichever
+ *  is up: such a page may still be betting. */
 function ofIncarnation(t: { inc?: unknown }, held: boolean, at: Incarnation): boolean {
-  if (t.inc === undefined) return held ? at.bare : true;
-  return isTableIncField(t.inc) && t.inc === at.inc;
+  if (t.inc === undefined) return !held;
+  return typeof t.inc === 'string' && isTableIncField(t.inc) && t.inc === at;
 }
 
 const stakeOf = (l: { bets: readonly { amount: number }[]; taken: number }): FeltStake => ({
@@ -862,13 +918,13 @@ function liveRouletteList(
   map: Y.Map<unknown>, tableId: string, playerId: string, s: RouletteTableState | null,
 ): { bets: RouletteBet[]; taken: number } | null {
   if (!s || s.phase === 'settled') return null;
-  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, s));
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s));
   return list && list.round === s.round ? list : null;
 }
 
 export function readMyBets(tableId: string, playerId: string, round: number): RouletteBet[] {
   const map = ensureMap();
-  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, readTableState(tableId)));
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, readTableState(tableId)));
   return list && list.round === round ? list.bets : [];
 }
 
@@ -880,12 +936,11 @@ export function writeMyBets(tableId: string, playerId: string, round: number, be
   const map = ensureMap();
   const s = readTableState(tableId);
   if (!s) return;
-  const was = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(map, tableId, s));
+  const was = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s));
   const taken = was && was.round === round ? was.taken : 0;
   boundDoc!.transact(() => {
     map.set(`bets:${tableId}:${playerId}`, {
-      round, held: bets,
-      ...(s.inc !== undefined ? { inc: s.inc } : {}),
+      round, held: bets, inc: tableIncOf(tableId, s),
       ...(taken > 0 ? { taken } : {}),
     });
     heldDirty = true;
@@ -898,7 +953,7 @@ export function readAllBets(tableId: string, round: number): Record<string, Roul
   const prefix = `bets:${tableId}:`;
   const out: Record<string, RouletteBet[]> = {};
   const map = ensureMap();
-  const at = incarnationOf(map, tableId, readTableState(tableId));
+  const at = incarnationOf(tableId, readTableState(tableId));
   for (const [key, value] of map.entries()) {
     if (!key.startsWith(prefix)) continue;
     const list = rouletteList(value, at);
@@ -919,7 +974,7 @@ export function feltStake(tableId: string, playerId: string): FeltStake {
     return list ? stakeOf(list) : NO_STAKE;
   }
   const craps = readCrapsTableState(tableId);
-  const list = craps ? crapsFelt(map, tableId, playerId, craps.inc) : null;
+  const list = craps ? crapsFelt(map, tableId, playerId, incarnationOf(tableId, craps)) : null;
   return list ? stakeOf(list) : NO_STAKE;
 }
 
@@ -938,6 +993,41 @@ export function readFeltStakes(tableId: string): Record<string, FeltStake> {
     }
   }
   return out;
+}
+
+/** What a removal hands back, of what an earlier build's lists on the table
+ *  took, and on which incarnation's outcome record: its state's as the doc
+ *  has it, even one a removal at the same moment ended already (the page
+ *  that removed it may not have seen this round, nor the bets on it). So
+ *  each page that hears of the removal refunds what it sees, and the
+ *  record pays one refund per bettor (creditTableOutcome). Null without a
+ *  state this build can name (an earlier build's put back after a
+ *  removal). */
+export function tableEndingStakes(tableId: string): { inc: string; taken: Record<string, number> } | null {
+  const map = ensureMap();
+  const raw = map.get(`table:${tableId}`);
+  if (!(isRouletteTableState(raw) || isCrapsTableState(raw))) return null;
+  if (raw.inc === undefined && removed(map, tableId, raw)) return null;
+  const inc = tableIncOf(tableId, raw);
+  const taken: Record<string, number> = {};
+  if (raw.kind === 'craps') {
+    for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
+      for (const key of map.keys()) {
+        if (!key.startsWith(prefix)) continue;
+        const pid = key.slice(prefix.length);
+        const list = taken[pid] === undefined ? crapsFelt(map, tableId, pid, inc) : null;
+        if (list && list.taken > 0) taken[pid] = list.taken;
+      }
+    }
+  } else if (raw.phase !== 'settled') {
+    const prefix = `bets:${tableId}:`;
+    for (const [key, value] of map.entries()) {
+      if (!key.startsWith(prefix)) continue;
+      const list = rouletteList(value, inc);
+      if (list && list.round === raw.round && list.taken > 0) taken[key.slice(prefix.length)] = list.taken;
+    }
+  }
+  return { inc, taken };
 }
 
 // ── 🎲 Craps table state + bets (#69 G3) ─────────────────────────────────────
@@ -976,7 +1066,7 @@ function keptList(value: unknown, at: Incarnation): { round: number; bets: Craps
   const t = value as { round?: unknown; kept?: unknown; inc?: unknown; taken?: unknown };
   if (!Number.isSafeInteger(t.round) || (t.round as number) < 1) return null;
   if (!Array.isArray(t.kept) || t.kept.length > MAX_BETS_PER_PLAYER || !t.kept.every(isCrapsBet)) return null;
-  if (t.inc === undefined ? !at.bare : t.inc !== at.inc) return null;
+  if (typeof t.inc !== 'string' || !isTableIncField(t.inc) || t.inc !== at) return null;
   if (t.taken !== undefined && !(Number.isSafeInteger(t.taken) && (t.taken as number) > 0 && (t.taken as number) <= MAX_LIST_STAKE)) {
     return null;
   }
@@ -993,13 +1083,12 @@ function keptOwed(
   map: Y.Map<unknown>, chips: Y.Map<unknown>, tableId: string, playerId: string, value: unknown,
 ): { inc: string; owed: number } | null {
   const inc = (value as { inc?: unknown } | null)?.inc;
-  if (inc !== undefined && (typeof inc !== 'string' || !isTableIncField(inc))) return null;
-  const kept = keptList(value, { inc, bare: inc === undefined });
+  if (typeof inc !== 'string') return null;
+  const kept = keptList(value, inc);
   if (!kept || kept.taken === 0) return null;
-  const at = inc ?? '';
-  if (!map.has(goneKey(tableId, at))) return null;
-  if (lastOutcome(chips, tableId, at, playerId).was?.ev === 'end') return null;
-  return { inc: at, owed: kept.taken };
+  if (!map.has(goneKey(tableId, inc))) return null;
+  if (lastOutcome(chips, tableId, inc, playerId).was?.ev === 'end') return null;
+  return { inc, owed: kept.taken };
 }
 
 /** Pay what a player's kept record owes (keptOwed) as the removal's outcome,
@@ -1021,9 +1110,8 @@ function payKeptOwed(map: Y.Map<unknown>, tableId: string, playerId: string): vo
  *  settled (a take-down that crossed the dice) never brings back bets the
  *  roll resolved: the edit is dropped, the felt stays as the roll left it. */
 function crapsFelt(
-  map: Y.Map<unknown>, tableId: string, playerId: string, inc: string | undefined,
+  map: Y.Map<unknown>, tableId: string, playerId: string, at: Incarnation,
 ): { bets: CrapsBet[]; taken: number } | null {
-  const at = incarnationOf(map, tableId, { inc });
   const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), at);
   const kept = keptList(map.get(`kept:${tableId}:${playerId}`), at);
   if (!kept) return own;
@@ -1034,7 +1122,7 @@ function crapsFelt(
 }
 
 export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
-  return crapsFelt(ensureMap(), tableId, playerId, readCrapsTableState(tableId)?.inc)?.bets ?? [];
+  return crapsFelt(ensureMap(), tableId, playerId, incarnationOf(tableId, readCrapsTableState(tableId)))?.bets ?? [];
 }
 
 /** The bettor's own write of their craps list, its chips held on the felt.
@@ -1045,12 +1133,12 @@ export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsB
   const map = ensureMap();
   const s = readCrapsTableState(tableId);
   if (!s) return;
-  const taken = crapsFelt(map, tableId, playerId, s.inc)?.taken ?? 0;
+  const inc = tableIncOf(tableId, s);
+  const taken = crapsFelt(map, tableId, playerId, inc)?.taken ?? 0;
   const base = s.phase === 'settled' ? s.round + 1 : s.round;
   boundDoc!.transact(() => {
     map.set(`bets:${tableId}:${playerId}`, {
-      kind: 'craps', held: bets, base,
-      ...(s.inc !== undefined ? { inc: s.inc } : {}),
+      kind: 'craps', held: bets, base, inc,
       ...(taken > 0 ? { taken } : {}),
     });
     heldDirty = true;
@@ -1067,16 +1155,17 @@ export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsB
  *  own next write, which never is, plays as a new list. */
 export function pruneCrapsBets(tableId: string, playerId: string, round: number, bets: CrapsBet[]): void {
   const map = ensureMap();
-  const inc = readCrapsTableState(tableId)?.inc;
+  const s = readCrapsTableState(tableId);
+  if (!s) return;
+  const inc = tableIncOf(tableId, s);
   const key = `bets:${tableId}:${playerId}`;
-  const own = crapsOwnList(map.get(key), incarnationOf(map, tableId, { inc }));
+  const own = crapsOwnList(map.get(key), inc);
   const taken = own?.legacy ? bets.reduce((n, b) => n + b.amount, 0) : 0;
   boundDoc!.transact(() => {
     payKeptOwed(map, tableId, playerId); // a record an earlier removal left
-    if (own?.legacy) map.set(key, { kind: 'craps', bets, ...(inc !== undefined ? { inc } : {}), pruned: round });
+    if (own?.legacy) map.set(key, { kind: 'craps', bets, inc, pruned: round });
     map.set(`kept:${tableId}:${playerId}`, {
-      round, kept: bets,
-      ...(inc !== undefined ? { inc } : {}),
+      round, kept: bets, inc,
       ...(taken > 0 ? { taken } : {}),
     });
     heldDirty = true;
@@ -1088,7 +1177,7 @@ export function pruneCrapsBets(tableId: string, playerId: string, round: number,
 export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
   const map = ensureMap();
   const out: Record<string, CrapsBet[]> = {};
-  const inc = readCrapsTableState(tableId)?.inc;
+  const inc = incarnationOf(tableId, readCrapsTableState(tableId));
   const pids = new Set<string>();
   for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
     for (const key of map.keys()) if (key.startsWith(prefix)) pids.add(key.slice(prefix.length));
@@ -1155,7 +1244,7 @@ function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string
     if (seen.has(`${tableId}:${pid}`)) continue;
     seen.add(`${tableId}:${pid}`);
     const s = tables.get(tableId)!;
-    const list = s.kind === 'craps' ? crapsFelt(map, tableId, pid, s.inc) : liveRouletteList(map, tableId, pid, s);
+    const list = s.kind === 'craps' ? crapsFelt(map, tableId, pid, tableIncOf(tableId, s)) : liveRouletteList(map, tableId, pid, s);
     if (!list) continue;
     const net = stakeOf(list).net;
     if (net !== 0) out.set(pid, (out.get(pid) ?? 0n) + BigInt(net));

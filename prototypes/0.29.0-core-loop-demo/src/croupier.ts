@@ -40,13 +40,15 @@ import {
   readFeltStakes,
   readTableOperatorLease,
   readTableState,
-  tableIncFor,
+  tableEndingStakes,
+  tableIncOf,
+  tableIncToOpen,
   transactCasino,
   writeCroupierBeat,
   writeTableOperatorLease,
   writeTableState,
 } from './casinoDoc';
-import type { TableOperatorLease } from './casinoDoc';
+import type { TableClosing, TableOperatorLease } from './casinoDoc';
 import { getPlayerId } from './identity';
 import { pocketColor, resolveRound } from './games/roulette';
 import type { RouletteTableState } from './games/roulette';
@@ -370,7 +372,7 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     settledRound(tableId, before);
     // One change per bettor for the round, counted once however many pages
     // settle it (creditTableOutcome).
-    for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
+    for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, tableIncOf(tableId, before), round, pid, amount);
   });
 }
 
@@ -387,7 +389,8 @@ export function closeBetting(tableId: string, s: RouletteTableState, deadlineMs?
 
 /** Open a fresh betting round (idle — no timer until a first bet arms it). */
 export function openBetting(tableId: string, round: number): void {
-  writeTableState(tableId, {
+  // One transaction: a name a removal left unmarked is marked as it opens.
+  transactCasino(() => writeTableState(tableId, {
     kind: 'roulette',
     phase: 'betting',
     round,
@@ -395,8 +398,8 @@ export function openBetting(tableId: string, round: number): void {
     resultAt: 0,
     payouts: null,
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
-    inc: readTableState(tableId)?.inc ?? tableIncFor(tableId),
-  });
+    inc: tableIncToOpen(tableId),
+  }));
 }
 
 /** When this page first saw each table's current SPIN lease (its epoch,
@@ -498,21 +501,20 @@ export function timerOnThisClock(
  * (creditTableOutcome); every client then wipes the table's casino keys
  * (idempotent LWW delete) so no orphan records survive.
  */
-export function closeTable(tableId: string): void {
+export function closeTable(tableId: string, closing: TableClosing = 'heard'): void {
   // One transaction: no page sees the refunds without the table gone.
-  transactCasino(() => {
-    const s = readTableState(tableId);
-    if (s && s.phase !== 'settled') {
-      for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
-        // A held stake goes back with its list. What an earlier build's list
-        // took, each page refunds, whichever heard of the removal first, and
-        // the page driving it may be settling this very round: the table's
-        // one outcome per bettor pays one.
-        if (taken > 0) creditTableOutcome(tableId, s.inc ?? '', 'end', pid, taken);
-      }
-    }
-    clearTableKeys(tableId);
-  });
+  transactCasino(() => refundAndClear(tableId, closing));
+}
+
+/** A table's removal: each list's held stake goes back with it, and what an
+ *  earlier build's list took, each page refunds (tableEndingStakes),
+ *  whichever heard of the removal first, while the page driving it may be
+ *  settling this very round: the table's one outcome per bettor pays one.
+ *  Then the keys go (clearTableKeys). */
+export function refundAndClear(tableId: string, closing: TableClosing): void {
+  const end = tableEndingStakes(tableId);
+  for (const [pid, taken] of Object.entries(end?.taken ?? {})) creditTableOutcome(tableId, end!.inc, 'end', pid, taken);
+  clearTableKeys(tableId, closing);
 }
 
 export function beatCroupier(tableId: string): void {

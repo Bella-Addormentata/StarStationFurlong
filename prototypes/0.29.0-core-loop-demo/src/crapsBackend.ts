@@ -35,6 +35,7 @@ import {
   readCrapsFairnessPref,
   pruneCrapsBets,
   readCrapsTableState,
+  tableIncOf,
   transactCasino,
   writeCrapsTableState,
 } from './casinoDoc';
@@ -261,7 +262,7 @@ function feltAfterRoll(
   for (const [pid, bets] of Object.entries(left)) {
     pruneCrapsBets(tableId, pid, round, bets);
     const after = feltStake(tableId, pid).net;
-    creditTableOutcome(tableId, before.inc ?? '', round, pid, (payouts[pid] ?? 0) - (held[pid] ?? 0) + after);
+    creditTableOutcome(tableId, tableIncOf(tableId, before), round, pid, (payouts[pid] ?? 0) - (held[pid] ?? 0) + after);
   }
 }
 

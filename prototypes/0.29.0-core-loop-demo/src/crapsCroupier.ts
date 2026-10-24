@@ -27,19 +27,16 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { RECONNECTING_NOTICE, tablesAwake, tablesWakeCount, timerOnThisClock } from './croupier';
+import { RECONNECTING_NOTICE, refundAndClear, tablesAwake, tablesWakeCount, timerOnThisClock } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
-  clearTableKeys,
-  creditTableOutcome,
   readAllCrapsBets,
   readCrapsFairnessPref,
   readCrapsTableState,
   readDiceThrow,
-  readFeltStakes,
   readSeats,
-  tableIncFor,
+  tableIncToOpen,
   transactCasino,
   writeCrapsTableState,
   writeDiceThrow,
@@ -47,6 +44,7 @@ import {
 import { CRAPS_DICE_SPOT } from './games/casinoLayout';
 import { hasLineBet, pickShooter } from './games/craps';
 import type { CrapsTableState, SeatedPlayer } from './games/craps';
+import type { TableClosing } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
 import { CRAPS_PAGE_ID, selectCrapsBackend } from './crapsBackend';
@@ -131,7 +129,8 @@ export function openCrapsBetting(
   const handOver = after?.sevenOut === true;
   const shooter = handOver ? undefined : after?.shooter;
   const lastShooter = handOver ? after?.shooter ?? after?.lastShooter : after?.lastShooter;
-  writeCrapsTableState(tableId, {
+  // One transaction: a name a removal left unmarked is marked as it opens.
+  transactCasino(() => writeCrapsTableState(tableId, {
     kind: 'craps',
     phase: 'betting',
     round,
@@ -144,8 +143,8 @@ export function openCrapsBetting(
     ...(lastShooter !== undefined ? { lastShooter } : {}),
     fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
-    inc: readCrapsTableState(tableId)?.inc ?? tableIncFor(tableId),
-  });
+    inc: tableIncToOpen(tableId),
+  }));
 }
 
 // ── 🎲 #226: the shooter ──────────────────────────────────────────────────────
@@ -489,19 +488,9 @@ export function tickAutoStickman(tableId: string): void {
  * once however many run it (creditTableOutcome); every client then wipes the
  * table's casino keys (idempotent LWW delete).
  */
-export function closeCrapsTable(tableId: string): void {
+export function closeCrapsTable(tableId: string, closing: TableClosing = 'heard'): void {
   // One transaction: no page sees the refunds without the table gone.
-  transactCasino(() => {
-    const inc = readCrapsTableState(tableId)?.inc ?? '';
-    for (const [pid, { taken }] of Object.entries(readFeltStakes(tableId))) {
-      // A held stake goes back with its list. What an earlier build's list
-      // took, each page refunds, and the page driving the table may be
-      // settling a roll meanwhile: the table's one outcome per bettor pays
-      // one of them (croupier.closeTable).
-      if (taken > 0) creditTableOutcome(tableId, inc, 'end', pid, taken);
-    }
-    clearTableKeys(tableId);
-  });
+  transactCasino(() => refundAndClear(tableId, closing));
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────
