@@ -357,11 +357,14 @@ function bindChipLedger(doc: Y.Doc): void {
     if (keys) for (const key of keys) if (key !== null) recountChipKey(ix, map, key);
   });
   map.observe(() => {
-    if (chipIndex !== ix || chipsTouched.size === 0) return;
+    if (chipIndex !== ix || (chipsTouched.size === 0 && heldTouched.size === 0)) return;
     const changed = new Set([...chipsTouched].map(
       (account) => (isBankrollAccount(account) ? account : `bal:${account}`),
     ));
+    // What a kept record owes can end with a transaction of this map alone.
+    for (const pid of heldTouched) changed.add(`bal:${pid}`);
     chipsTouched.clear();
+    heldTouched.clear();
     notify(changed);
   });
 }
@@ -617,12 +620,35 @@ function freshIncFor(map: Y.Map<unknown>, tableId: string): string {
 }
 
 /** The incarnation a table's next round opens on: the state's up there, or
- *  a new one (freshIncFor). In the caller's transaction. */
+ *  a new one (freshIncFor). A new one first clears what removed ones left
+ *  (sweepRemoved). In the caller's transaction. */
 export function tableIncToOpen(tableId: string): string {
   const map = ensureMap();
   const raw = map.get(`table:${tableId}`);
   const up = (isRouletteTableState(raw) || isCrapsTableState(raw)) && !removed(map, tableId, raw) ? raw : null;
-  return up ? tableIncOf(tableId, up) : freshIncFor(map, tableId);
+  if (up) return tableIncOf(tableId, up);
+  const inc = freshIncFor(map, tableId);
+  sweepRemoved(map, tableId);
+  return inc;
+}
+
+/** Delete the lists and kept records of a table's removed incarnations,
+ *  paying first what a kept record owes (payKeptOwed). Written at the
+ *  moment of the removal, they outlived its delete. They hold nothing here,
+ *  but an earlier build's page reads a list by its key alone: the
+ *  stickman's prune of its list left behind would stand on the table put
+ *  back there, and its take-down would hand back again what the kept record
+ *  owes. */
+function sweepRemoved(map: Y.Map<unknown>, tableId: string): void {
+  const keptPrefix = `kept:${tableId}:`;
+  for (const key of [...map.keys()]) {
+    const kept = key.startsWith(keptPrefix);
+    if (!kept && !key.startsWith(`bets:${tableId}:`)) continue;
+    const inc = (map.get(key) as { inc?: unknown } | null)?.inc;
+    if (typeof inc !== 'string' || !map.has(goneKey(tableId, inc))) continue;
+    if (kept) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
+    map.delete(key);
+  }
 }
 
 /** Every chip record in the bound room (one per page per account), oldest
@@ -1202,13 +1228,13 @@ let heldDirty = true;
 const heldTouched = new Set<string>();
 
 /** The table whose id a key carries after its prefix (the longest of `ids`
- *  that fits, should one id begin with another's). */
-function tableOf(ids: Iterable<string>, rest: string): string | null {
-  let tableId: string | null = null;
-  for (const id of ids) {
-    if (rest.startsWith(`${id}:`) && (tableId === null || id.length > tableId.length)) tableId = id;
+ *  that fits, should one id begin with another's), found at its colons, so
+ *  a room's removal history doesn't slow every recount. */
+function tableOf(ids: { has(id: string): boolean }, rest: string): string | null {
+  for (let at = rest.lastIndexOf(':'); at > 0; at = rest.lastIndexOf(':', at - 1)) {
+    if (ids.has(rest.slice(0, at))) return rest.slice(0, at);
   }
-  return tableId;
+  return null;
 }
 
 /** Chips each player has held on felts (and, below 0, what kept records left
@@ -1216,8 +1242,10 @@ function tableOf(ids: Iterable<string>, rest: string): string | null {
 function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string, bigint> {
   const tables = new Map<string, RouletteTableState | CrapsTableState>();
   const gone = new Set<string>();
+  let kept = false;
   for (const [key, value] of map.entries()) {
     if (key.startsWith('gone:') && key.endsWith(':')) gone.add(key.slice('gone:'.length, -1));
+    if (key.startsWith('kept:')) kept = true;
     if (!key.startsWith('table:')) continue;
     const tableId = key.slice('table:'.length);
     if ((isRouletteTableState(value) || isCrapsTableState(value)) && !removed(map, tableId, value)) {
@@ -1225,7 +1253,7 @@ function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string
     }
   }
   const out = new Map<string, bigint>();
-  if (tables.size === 0 && gone.size === 0) return out;
+  if (tables.size === 0 && (gone.size === 0 || !kept)) return out;
   const seen = new Set<string>();
   for (const [key, value] of map.entries()) {
     const prefix = key.startsWith('bets:') ? 'bets:' : key.startsWith('kept:') ? 'kept:' : null;
@@ -1237,7 +1265,7 @@ function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string
       const due = keptOwed(map, chips, removedId, pid, value);
       if (due) out.set(pid, (out.get(pid) ?? 0n) - BigInt(due.owed));
     }
-    const tableId = tableOf(tables.keys(), rest);
+    const tableId = tableOf(tables, rest);
     if (tableId === null) continue;
     const pid = rest.slice(tableId.length + 1);
     // A craps player's two keys make one felt: count it once.

@@ -1072,3 +1072,124 @@ describe('listeners hear what a kept record owes', () => {
   });
 });
 
+
+describe("an earlier build's page on the table put back, after a roll met the removal", () => {
+  const bettor = 'player-Carol';
+  const craps = 'craps-1';
+  const pass = { type: 'pass' as const, amount: 10 };
+
+  /** Carol's earlier build put 10 on the pass line (bal 90). Page a rolls a
+   *  6 (the pass line rides) as page b removes the table; page a is gone
+   *  before it hears. Page b puts the table back under the same id. */
+  async function rolledAsRemovedThenPutBack(): Promise<void> {
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.doc.getMap('casino').set(`bal:${bettor}`, 90);
+    a.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [pass] });
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    sync(a.doc, b.doc);
+    diceTo(3, 3);
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    b.craps.closeCrapsTable(craps, 'local');
+    sync(a.doc, b.doc);
+    expect(b.casino.readChips(bettor)).toBe(100);
+    b.casino.writeCrapsFairnessPref(craps, 'rng');
+    b.craps.openCrapsBetting(craps, 1, null); // put back
+  }
+
+  /** What Carol's earlier-build page reads as her list: any
+   *  `{kind:'craps', bets}` under her key, whatever else it carries. */
+  function earlierReads(page: Page): unknown[] {
+    const v = page.doc.getMap('casino').get(`bets:${craps}:${bettor}`) as { kind?: string; bets?: unknown[] } | undefined;
+    return v?.kind === 'craps' && Array.isArray(v.bets) ? v.bets : [];
+  }
+
+  for (const [winner, clientA, clientB] of [['the roll', 2, 1], ['the removal', 1, 2]] as const) {
+    it(`finds nothing of the old pass line there to take down, and Carol has her 10 back once (${winner} winning ties)`, async () => {
+      a = await loadPage(clientA);
+      b = await loadPage(clientB);
+      await rolledAsRemovedThenPutBack();
+      expect(earlierReads(b)).toEqual([]);
+      expect([...b.doc.getMap('casino').keys()].filter((k) => k.startsWith('kept:') || k.startsWith('bets:'))).toEqual([]);
+      expect(b.casino.readMyCrapsBets(craps, bettor)).toEqual([]);
+      expect(b.casino.readChips(bettor)).toBe(100);
+      b.craps.closeCrapsTable(craps, 'local');
+      expect(b.casino.readChips(bettor)).toBe(100);
+    });
+  }
+});
+
+describe('a held change heard through the chips map alone', () => {
+  const bettor = 'player-Carol';
+  const craps = 'craps-1';
+
+  it('is told once, and not again at the next casino write that has nothing to do with it', async () => {
+    a = await loadPage(2); // the roll wins ties
+    b = await loadPage(1);
+    const pass = { type: 'pass', amount: 10 };
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.doc.getMap('casino').set(`bal:${bettor}`, 90);
+    a.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [pass] });
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    sync(a.doc, b.doc);
+    diceTo(3, 3);
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    b.craps.closeCrapsTable(craps, 'local');
+    sync(a.doc, b.doc);
+    expect(a.casino.readChips(bettor)).toBe(100); // the kept record owes the 10
+    const inc = (a.doc.getMap('casino').get(`kept:${craps}:${bettor}`) as { inc: string }).inc;
+    let calls = 0;
+    let read: number | null = null;
+    a.casino.subscribeCasinoKey(`bal:${bettor}`, () => { calls += 1; read = a.casino.readChips(bettor); });
+    b.casino.creditTableOutcome(craps, inc, 'end', bettor, 10); // the refund, paid alone
+    sync(a.doc, b.doc);
+    expect({ calls, read }).toEqual({ calls: 1, read: 100 });
+    a.casino.writeCroupierBeat('roulette-9', 1);
+    expect(calls).toBe(1);
+  });
+});
+
+describe('tables whose ids begin with one another', () => {
+  const bettor = 'player-Carol';
+
+  it('count each list on its own table', async () => {
+    a = await loadPage();
+    for (const id of ['roulette-1', 'roulette-1:2']) {
+      a.casino.writeCrapsFairnessPref(id, 'rng');
+      a.croupier.openBetting(id, 1);
+    }
+    a.casino.buyInChips(bettor, 100);
+    a.casino.writeMyBets('roulette-1', bettor, 1, [{ type: 'red', amount: 20 }]);
+    a.casino.writeMyBets('roulette-1:2', bettor, 1, [{ type: 'red', amount: 10 }]);
+    expect(a.casino.readChips(bettor)).toBe(70);
+    a.croupier.closeTable('roulette-1:2', 'local');
+    expect(a.casino.readChips(bettor)).toBe(80);
+    expect(a.casino.readMyBets('roulette-1', bettor, 1)).toEqual([{ type: 'red', amount: 20 }]);
+  });
+
+  it("and a removed one's kept record on its own, when the shorter id was removed too", async () => {
+    a = await loadPage(2); // the roll wins ties
+    b = await loadPage(1);
+    const craps = 'craps-1:2';
+    a.casino.writeCrapsFairnessPref('craps-1', 'rng');
+    a.craps.openCrapsBetting('craps-1', 1, null);
+    a.craps.closeCrapsTable('craps-1', 'local'); // craps-1 has gone marks of its own
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.doc.getMap('casino').set(`bal:${bettor}`, 90);
+    a.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [{ type: 'pass', amount: 10 }] });
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    sync(a.doc, b.doc);
+    diceTo(3, 3);
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    b.craps.closeCrapsTable(craps, 'local');
+    sync(a.doc, b.doc);
+    expect(a.doc.getMap('casino').has(`kept:${craps}:${bettor}`)).toBe(true);
+    expect(a.casino.readChips(bettor)).toBe(100); // the kept record owes the 10
+    expect(b.casino.readChips(bettor)).toBe(100);
+  });
+});
