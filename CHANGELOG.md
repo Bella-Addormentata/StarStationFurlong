@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+## v0.45.0 — 2026-10-24
+
 - **📺 The smart TV shows the film on the TV itself, not in a popup ([#292](https://github.com/Bella-Addormentata/StarStationFurlong/pull/292)).** The picture now plays on the 3D set's screen in the room, fitted to it. A file, a torrent, or a link on a host that passes the browser's CORS check plays as the set's own picture. YouTube, archive.org and other links are laid exactly over the set's screen and move with it as the camera swings and zooms. Before T0 and on the home screen the set still shows its card (what is on, the countdown), and the picture is hidden from behind the set and when the room is zoomed out. The popup is gone. Its notices and controls (pause, volume, TAP TO PLAY, the PLAY? asks) are now in a slim bar at the bottom of the window, which doesn't stop you walking or flying. A set that comes on opens the bar by itself. ✕ turns the picture off for that programme on your screen and WATCH brings it back. T moves the keyboard to the bar, Tab steps through it and Escape returns to the world. YouTube gets TAP TO PLAY too when the browser holds back its sound. The limit on what your browser fetches by itself now also covers all the TVs you are shown together: twelve a minute, on top of six per set. Four Copilot review rounds found fifteen issues, all fixed. Checked in headless Chromium with a local node; YouTube and archive.org on the set haven't been seen in a real browser yet.
 
 ## v0.44.0 — 2026-10-23
