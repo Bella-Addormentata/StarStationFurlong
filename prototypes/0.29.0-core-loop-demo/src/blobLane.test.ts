@@ -5,7 +5,8 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  __test, blobLaneNodeId, blobNodeTag, blobLaneReady, blobState, blobUrl, forgetBlob, forgetBlobLane, formatBytes, recheckBlob, setBlobLaneNode, setBlobLaneRoom,
+  __test, blobLaneNodeId, blobNodeTag, blobLaneReady, blobState, blobUrl, forgetBlob, forgetBlobLane, formatBytes, freshNodeHolders, nodeHolders, recheckBlob,
+  refreshHolders, setBlobLaneNode, setBlobLaneRoom,
 } from './blobLane';
 import { setNodeMediaOrigin } from './tvConsent';
 import { tvNow, tvWallNow } from './tvDoc';
@@ -72,6 +73,19 @@ describe('blobLane', () => {
     expect(parseState({ state: 'failed', have: 1, size: 2, why: 'x'.repeat(500) })).toMatchObject({ state: 'failed', why: 'x'.repeat(200) });
     expect(parseState({ state: 'evil' })).toEqual({ state: 'unknown' });
     expect(parseState(null)).toEqual({ state: 'unknown' });
+  });
+
+  it('keeps WHERE\'s answer, and says it fresh only for as long as it is asked again after', async () => {
+    setNodeMediaOrigin(ORIGIN, tvNow(), tvWallNow());
+    setBlobLaneRoom('room-1');
+    setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ holders: { [HASH]: [ID] } }), { status: 200 })));
+    expect(freshNodeHolders(HASH, 1_000)).toBeNull(); // never asked
+    await refreshHolders([HASH], 1_000);
+    expect(nodeHolders(HASH)).toEqual([ID]);
+    expect(freshNodeHolders(HASH, 30_999)).toEqual([ID]);
+    expect(freshNodeHolders(HASH, 31_000)).toBeNull(); // due to be asked again: not an answer for now
+    expect(nodeHolders(HASH)).toEqual([ID]); // still what FETCH names meanwhile
   });
 
   it('formats sizes for the FETCH button', () => {
