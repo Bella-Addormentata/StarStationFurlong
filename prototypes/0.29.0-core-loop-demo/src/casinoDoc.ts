@@ -499,7 +499,11 @@ const MAX_TABLE_OUTCOME = Number.MAX_SAFE_INTEGER - TABLE_RECORD_FULL;
  * next record of the chain (`~1`, `~2`…). Full is read from the stored total
  * alone, never the amount, so two pages paying different amounts at once
  * still write the same record, and the last record is always where the last
- * outcome (and a removal) was paid.
+ * outcome (and a removal) was paid. Two pages that each go on settling
+ * rounds without hearing of the other (one cut off from the room) build two
+ * chains on one record, and the doc keeps one of them, with its table state:
+ * the one table lease keeps that to a page that never hears the room
+ * (croupier.takeTableTurn), and the computed tables end it.
  */
 export function creditTableOutcome(
   tableId: string, inc: string, outcome: number | 'end', playerId: string, amount: number,

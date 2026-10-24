@@ -121,6 +121,41 @@ describe('two pages of the deed holder', () => {
     }
   });
 
+  it('a page that slept wakes without driving, so a doc that missed the takeover catches up first', () => {
+    turn(a, 0);
+    expect(turn(a, 1_600)).toBe(true);
+    sync(a.doc, b.doc);
+    // Page a sleeps; page b sees its lease lapse and takes over.
+    const woke = 30_000;
+    let bDrives = false;
+    for (let t = 1_600; t < woke; t += 100) bDrives = turn(b, t);
+    expect(bDrives).toBe(true);
+    // Page a wakes on its own doc, before the room's updates reach it, and
+    // the doc catches up two seconds later.
+    const { TABLE_LEASE_LAPSE_MS } = a.croupier;
+    const aWrites = updatesDuring(a, () => {
+      for (let now = woke; now < woke + 2_000; now += 100) {
+        expect(turn(a, now)).toBe(false);
+        turn(b, now);
+      }
+    });
+    expect(aWrites).toBe(0);
+    for (let now = woke + 2_000; now <= woke + 3 * TABLE_LEASE_LAPSE_MS; now += 100) {
+      if (now % 1_000 === 0) sync(a.doc, b.doc);
+      expect(turn(a, now)).toBe(false);
+      expect(turn(b, now)).toBe(true);
+    }
+  });
+
+  it('and a page alone, after a sleep, drives again once it has waited a lapse', () => {
+    turn(a, 0);
+    expect(turn(a, 1_600)).toBe(true);
+    const { TABLE_LEASE_LAPSE_MS } = a.croupier;
+    expect(turn(a, 30_000)).toBe(false);
+    expect(turn(a, 30_000 + TABLE_LEASE_LAPSE_MS - 100)).toBe(false);
+    expect(turn(a, 30_000 + TABLE_LEASE_LAPSE_MS)).toBe(true);
+  });
+
   it('a lease an earlier deed holder\'s page left is taken at once', () => {
     a.casino.writeTableOperatorLease({ page: 'old-page', player: EARLIER_OWNER, beat: 9 });
     expect(turn(a, 0)).toBe(false);

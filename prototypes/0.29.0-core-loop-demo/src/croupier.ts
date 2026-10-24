@@ -111,6 +111,10 @@ let leaseSeen: { page: string; beat: number; at: number } | null = null;
 /** When this page claimed the lease it holds (null: it holds none it claimed). */
 let leaseClaimedAt: number | null = null;
 let leaseRenewedAt = 0;
+/** When this page last asked for its turn, and the earliest it may drive
+ *  again after it stopped asking for a lapse (see takeTableTurn). */
+let lastTurnAt: number | null = null;
+let driveFrom = 0;
 
 function noteLease(lease: TableOperatorLease | null, now: number): void {
   const epoch = casinoDocEpoch();
@@ -118,6 +122,8 @@ function noteLease(lease: TableOperatorLease | null, now: number): void {
     leaseEpoch = epoch;
     leaseSeen = null;
     leaseClaimedAt = null;
+    lastTurnAt = null;
+    driveFrom = 0;
   }
   if (!lease) leaseSeen = null;
   else if (!leaseSeen || leaseSeen.page !== lease.page || leaseSeen.beat !== lease.beat) {
@@ -137,6 +143,15 @@ function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: st
  * page that canRunCroupier(), and drive only on true. It claims a free lease,
  * keeps renewing its own, and leaves one another of the deed holder's pages
  * holds alone. A fresh claim drives only after TABLE_LEASE_SETTLE_MS.
+ *
+ * A page that stopped asking for a lapse or more (the computer slept, the
+ * tab froze) may wake on a doc that hasn't heard another page take over
+ * meanwhile, and a settle written on that doc would overwrite the other
+ * page's rounds when the two meet (creditTableOutcome keeps one running
+ * record per table and player). So it waits out a lapse again before it
+ * drives, for the doc to catch up: it then sees the other page's lease, or
+ * its own, writing nothing meanwhile. A page cut off from the room while it
+ * keeps running can't tell, and the computed tables are what end that case.
  */
 export function takeTableTurn(
   now = Date.now(),
@@ -145,6 +160,9 @@ export function takeTableTurn(
 ): boolean {
   const lease = readTableOperatorLease();
   noteLease(lease, now);
+  if (lastTurnAt !== null && now - lastTurnAt >= TABLE_LEASE_LAPSE_MS) driveFrom = now + TABLE_LEASE_LAPSE_MS;
+  lastTurnAt = now;
+  if (now < driveFrom) return false; // nor claims or renews on that doc
   if (lease?.page !== pageId) {
     if (!leaseIsFree(lease, now, playerId)) return false;
     writeTableOperatorLease({ page: pageId, player: playerId, beat: 1 });
