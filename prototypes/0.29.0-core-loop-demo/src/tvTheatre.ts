@@ -22,7 +22,7 @@
  * offers a retry, and nothing else in the room depends on them.
  */
 
-import { TvSyncController } from './tvSync';
+import { replayNeedsRemount, TvSyncController } from './tvSync';
 import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
@@ -356,6 +356,10 @@ interface Theatre {
    *  that programme alone, so a room tick between a source change and the
    *  remount cannot put the old player's length on the new programme. */
   playerFor: number;
+  /** The programme (`started`) the adapter was BUILT for: a seekable player
+   *  follows a replay and keeps this, one that cannot seek is rebuilt
+   *  (tvSync replayNeedsRemount). */
+  mountedFor: number;
   /** The mount key of what the adapter was built for ('' = nothing mounted):
    *  the sourceId, plus the programme's `started` for a start-only embed. */
   mounted: string;
@@ -489,6 +493,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     shownOn: null,
     onKey,
     playerFor: -1,
+    mountedFor: -1,
     probing: '',
     probeAbort: null,
     budgetedKey: '',
@@ -552,13 +557,14 @@ function theatreFocusable(root: HTMLElement): HTMLElement[] {
 }
 
 /** The programme this viewer turned off with ✕ (the set, the record's
- *  `started`, and the room's doc it was in — another room may reuse the item
- *  id and the counter): the room tick does not turn it back on by itself. */
-const dismissed = new Map<string, { started: number; epoch: number }>();
+ *  `showing` — every LOOP lap of it included — and the room's doc it was in:
+ *  another room may reuse the item id and the counter): the room tick does
+ *  not turn it back on by itself. */
+const dismissed = new Map<string, { showing: number; epoch: number }>();
 
-function isDismissed(itemId: string, started: number): boolean {
+function isDismissed(itemId: string, showing: number): boolean {
   const d = dismissed.get(itemId);
-  return d !== undefined && d.started === started && d.epoch === tvDocEpoch();
+  return d !== undefined && d.showing === showing && d.epoch === tvDocEpoch();
 }
 
 /** Take the picture off the set and the bar down. `byViewer`: the ✕ on the
@@ -567,7 +573,7 @@ export function closeTvTheatre(byViewer = false): void {
   if (!theatre) return;
   const t = theatre;
   theatre = null;
-  if (byViewer) dismissed.set(t.itemId, { started: readTv(t.itemId).started, epoch: tvDocEpoch() });
+  if (byViewer) dismissed.set(t.itemId, { showing: readTv(t.itemId).showing, epoch: tvDocEpoch() });
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
   const hadFocus = t.root.contains(document.activeElement);
@@ -628,6 +634,7 @@ function hideNotice(t: Theatre): void {
 function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => number): void {
   unmountPlayer(t);
   t.mounted = key;
+  t.mountedFor = t.playerFor; // this tick's programme (theatreTick notes it before mounting)
   const token = t.attempt;
   const live = () => theatre === t && t.attempt === token;
   const fail = (why: string) => {
@@ -782,7 +789,11 @@ function theatreTick(rtt: () => number): void {
     // files the player's last end report (tvSession), and filed under the
     // next programme's number a short film's length would stop the live
     // stream that followed it once the theatre closed.
-    const stale = t.mounted !== '' && (consent !== 'ok' || (t.mounted !== key && t.mounted !== `failed:${key}`));
+    // …and so does a player that ran out and cannot seek back to follow a
+    // new start of the same source (a replay, a LOOP lap): rebuilt, it
+    // plays from the top.
+    const stale = t.mounted !== '' && (consent !== 'ok' || (t.mounted !== key && t.mounted !== `failed:${key}`)
+      || (t.player !== null && replayNeedsRemount(t.player, t.mountedFor, rec.started)));
     if (stale) unmountPlayer(t);
     // The programme the player is (or is about to be) mounted for — noted
     // here, on the theatre's own tick, so between a source change and this
@@ -1151,7 +1162,7 @@ export function updateTvChip(itemIds: readonly string[]): void {
     for (const id of itemIds) {
       const rec = readTv(id);
       if (!rec.source || rec.state === 'off' || rec.state === 'home') continue;
-      if (chipOpen && !isDismissed(id, rec.started)) {
+      if (chipOpen && !isDismissed(id, rec.showing)) {
         chipOpen(id);
         if (theatre) return;
       }

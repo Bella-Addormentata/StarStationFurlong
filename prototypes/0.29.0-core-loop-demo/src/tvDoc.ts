@@ -150,6 +150,12 @@ export interface TvProgramme {
    *  it unmoved by the next start, and a same-source replay would read as
    *  ordinary drift. */
   started: number;
+  /** The `started` this showing began at: PLAY NOW and a schedule set it to
+   *  their own start, and a LOOP lap (tvProgrammeEnded) keeps it. What a
+   *  viewer's ✕ is kept against (tvTheatre), so a lap does not undo it,
+   *  while a player still sees each lap as the new start it is. Never
+   *  above `started`: a record that says otherwise reads as `started`. */
+  showing: number;
   /** The programme-ACTION revision: bumped by every transport write (play,
    *  schedule, pause, resume, seek, stop, power) and never by a heartbeat.
    *  The holder follows a new revision exactly once and otherwise only ever
@@ -204,6 +210,7 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   positionMs: 0,
   seq: 0,
   started: 0,
+  showing: 0,
   jump: 0,
   endMs: 0,
   loop: false,
@@ -720,6 +727,8 @@ export function readProgramme(itemId: string): TvProgramme {
         .filter((e): e is TvHistoryEntry => e !== null)
         .slice(0, TV_HISTORY_MAX)
     : [];
+  const started = counter(raw.started);
+  const shown = raw.showing;
   return {
     source,
     // A programme-less record cannot be playing: it shows the home screen.
@@ -727,7 +736,8 @@ export function readProgramme(itemId: string): TvProgramme {
     startAt: Math.max(0, num(raw.startAt)),
     positionMs: Math.max(0, num(raw.positionMs)),
     seq: counter(raw.seq),
-    started: counter(raw.started),
+    started,
+    showing: Number.isSafeInteger(shown) && (shown as number) >= 0 && (shown as number) <= started ? (shown as number) : started,
     jump: counter(raw.jump),
     endMs: Math.max(0, Math.floor(num(raw.endMs))),
     loop: raw.loop === true,
@@ -934,6 +944,7 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torr
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
   switchOn(itemId);
   const rec = readProgramme(itemId);
+  const started = bump(rec.started);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
@@ -941,7 +952,8 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torr
     startAt: 0,
     positionMs: 0,
     seq: bump(rec.seq),
-    started: bump(rec.started),
+    started,
+    showing: started,
     jump: bump(rec.jump),
     endMs: 0, // a new programme: its player says where it ends
     history: withHistory(rec, clean, now),
@@ -959,6 +971,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
   if (!Number.isFinite(startAt) || startAt <= now) return { ok: false, error: 'Pick a time that is still ahead.' };
   switchOn(itemId);
   const rec = readProgramme(itemId);
+  const started = bump(rec.started);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
@@ -966,7 +979,8 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     startAt: Math.floor(startAt),
     positionMs: 0,
     seq: bump(rec.seq),
-    started: bump(rec.started),
+    started,
+    showing: started,
     jump: bump(rec.jump),
     endMs: 0,
     history: withHistory(rec, clean, now),
@@ -1159,10 +1173,11 @@ export function tvSetLoop(itemId: string, on: boolean): TvAction {
  *  headless beat reached the end the record carries (tvSession). With LOOP
  *  on, the same programme starts over from the top: a new start, as PLAY
  *  NOW again is, so a player that can seek is sent back to 0 and one that
- *  cannot is rebuilt. The history and the library stay as they are (a loop
- *  is not another showing), and so does `endMs`: the same media ends in the
- *  same place, which is how a holder with no player of its own loops it
- *  again. Otherwise back to the home screen. */
+ *  cannot is rebuilt. The showing, the history and the library stay as they
+ *  are (a lap is not another showing: a viewer's ✕ holds across it), and so
+ *  does `endMs`: the same media ends in the same place, which is how a
+ *  holder with no player of its own loops it again. Otherwise back to the
+ *  home screen. */
 export function tvProgrammeEnded(itemId: string): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;

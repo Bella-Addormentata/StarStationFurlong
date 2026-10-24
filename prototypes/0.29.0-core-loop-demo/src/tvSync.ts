@@ -117,6 +117,17 @@ export const TV_SEEK_COOLDOWN_MS = 2_000;
  *  keeping no clock at all. */
 export const TV_SEEK_WAIT_MS = 10_000;
 
+/** A new start of the programme (a replay, a LOOP lap) that the player it
+ *  was mounted for cannot follow: it ran out and cannot seek back (a host
+ *  without range support). The theatre builds it again from the top; left
+ *  as it is, its controller would wait on a rewind it can never issue, and
+ *  the holder's would end the programme again once that wait ran out, lap
+ *  after lap with nothing played. `mountedFor` is the `started` the player
+ *  was built for. */
+export function replayNeedsRemount(player: TvPlayer, mountedFor: number, started: number): boolean {
+  return mountedFor !== started && player.isEnded() && !player.canSeek;
+}
+
 export class TvSyncController {
   private readonly now: () => number;
   private readonly rttMs: () => number;

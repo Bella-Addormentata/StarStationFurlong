@@ -1075,7 +1075,21 @@ describe('🔁 LOOP', () => {
     expect(after.seq).toBeGreaterThan(before.seq);
     expect(after.history).toEqual(before.history);
     expect(readLibrary()).toEqual(library);
+    // The same showing: a viewer's ✕ is kept against it, so a lap does not undo it.
+    expect(after.showing).toBe(before.showing);
+    expect(before.showing).toBe(before.started);
     expect(readPlayback(TV).positionMs).toBe(0);
+    tvPlay(TV, CLIP); // PLAY NOW again is another showing
+    expect(readTv(TV).showing).toBe(readTv(TV).started);
+    expect(readTv(TV).showing).toBeGreaterThan(after.showing);
+    tvSchedule(TV, CLIP, now + 60_000);
+    expect(readTv(TV).showing).toBe(readTv(TV).started);
+    // A peer's garbage, or a showing ahead of the start, reads as the start.
+    for (const bad of ['1', -1, 1.5, readTv(TV).started + 1]) {
+      doc.getMap('tv').set(tvKey(TV), { ...(doc.getMap('tv').get(tvKey(TV)) as object), showing: bad });
+      expect(readProgramme(TV).showing).toBe(readProgramme(TV).started);
+    }
+    tvPlay(TV, CLIP);
     tvSetLoop(TV, false);
     expect(tvProgrammeEnded(TV)).toEqual({ ok: true });
     expect(readTv(TV)).toMatchObject({ state: 'home', source: null });

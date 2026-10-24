@@ -5,7 +5,7 @@
  * scheduled programme parks at 0 and starts at T0; a paused one holds.
  */
 import { describe, expect, it } from 'vitest';
-import { TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync';
+import { replayNeedsRemount, TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync';
 import type { TvPlayer } from './tvSync';
 import { TV_HEARTBEAT_MS, TV_NUDGE_RATE } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -1262,5 +1262,17 @@ describe('🔁 LOOP, through the record', () => {
     p.playing = false;
     step();
     expect(readTv('tv-1')).toMatchObject({ state: 'home', source: null });
+  });
+
+  it('a player that ran out and cannot seek back is rebuilt for a new start; one that can seek, or has not run out, or is for this start, is kept', () => {
+    const stuck = new FakePlayer(true, false); // a host without range support
+    stuck.ended = true;
+    expect(replayNeedsRemount(stuck, 1, 2)).toBe(true); // a LOOP lap: nothing else would play it from the top
+    expect(replayNeedsRemount(stuck, 2, 2)).toBe(false); // the programme it is for has simply ended
+    const seekable = new FakePlayer(true, true);
+    seekable.ended = true;
+    expect(replayNeedsRemount(seekable, 1, 2)).toBe(false); // the controller seeks it back
+    const running = new FakePlayer(true, false);
+    expect(replayNeedsRemount(running, 1, 2)).toBe(false); // still playing: rebuilt once it runs out
   });
 });
