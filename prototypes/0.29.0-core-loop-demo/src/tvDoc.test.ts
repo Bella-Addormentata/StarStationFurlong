@@ -11,7 +11,8 @@ import {
   markTvPageAwake, mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readPower, readProgramme,
   readRemote, readSample, readTv, remoteKey, remoteStatus, renewRemote, sanitizeSource, setTvClock,
   setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, sourceLane, subscribeTvKey, tvHeartbeat,
-  tvKey, tvNoteEnd, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
+  tvKey, tvNoteEnd, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetCrt, tvSetVolume, tvStop,
+  lookKey, readCrt,
   tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
   TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey, libraryKey, readLibrary, TV_HOME_RECENT, TV_LIBRARY_MAX,
 } from './tvDoc';
@@ -1054,6 +1055,35 @@ describe('the in-world screen', () => {
     expect(tvScreenView(TV)).toMatchObject({ state: 'playing', title: 'METROPOLIS', lane: 'CONVENIENCE', clockText: '1:01' });
     tvPause(TV, 61_000);
     expect(tvScreenView(TV).detail).toBe('PAUSED · REMOTE · Alice');
+  });
+
+  it("carries the set's LOOK: the CRT look unless someone picked CLEAN", () => {
+    tvTogglePower(TV);
+    tvPlay(TV, FILM);
+    tvHeartbeat(TV, 61_000);
+    expect(readCrt(TV)).toBe(true); // the default, with no key at all
+    expect(tvScreenView(TV).clean).toBeUndefined();
+    // A body button like VOLUME: a viewer who does not hold the remote presses it.
+    iAm(BOB, 'Bob');
+    tvSetCrt(TV, false);
+    expect(readCrt(TV)).toBe(false);
+    expect(tvScreenView(TV)).toMatchObject({ state: 'playing', clean: true });
+    iAm(ALICE, 'Alice');
+    tvPause(TV, 62_000);
+    expect(tvScreenView(TV)).toMatchObject({ state: 'paused', clean: true });
+    // Its own key: the programme's writes leave it alone, and it them.
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 62_000 });
+    tvSetCrt(TV, true);
+    expect(tvScreenView(TV).clean).toBeUndefined();
+    // Only an explicit `crt: false` is CLEAN: a peer's garbage is the default.
+    for (const junk of [{ crt: 'no' }, { crt: 0 }, 'off', null, 7]) {
+      doc.getMap('tv').set(lookKey(TV), junk);
+      expect(readCrt(TV)).toBe(true);
+    }
+    // Nothing to draw it on: the home screen and an off set carry no LOOK.
+    tvSetCrt(TV, false);
+    tvStop(TV);
+    expect(tvScreenView(TV).clean).toBeUndefined();
   });
 });
 

@@ -64,7 +64,7 @@ import { SEAT_COLOURS } from "./lanternRoadPaint";
 import { CASHIER_SCREEN_H, CASHIER_SCREEN_W, paintCashierAttract, paintCashierMenu } from "./cashierScreen";
 import type { CashierScreenHandle } from "./cashierScreen";
 // 📺 The cabinets' curved CRT tube and its screen shader (#194).
-import { ARCADE_CRT_LOOK, crtFaceGeometry, crtScreenMaterial, crtTick } from "./arcadeCrt";
+import { applyCrtLook, ARCADE_CRT_LOOK, crtFaceGeometry, crtScreenMaterial, crtTick, TV_CRT_LINES, TV_CRT_LOOK } from "./arcadeCrt";
 // 🏒 #115: the table sculpt is sized by the SAME playfield constants the pure
 // engine simulates — one source of truth for rails, goals, puck and mallets.
 import {
@@ -11181,6 +11181,91 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   const pictureMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
   const picture = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), pictureMat);
   picture.raycast = () => undefined; // clicks land on the set, as before
+  picture.userData.tvPicture = true;
+  // 📺 The CRT look (the set's LOOK switch, on unless someone picks CLEAN):
+  // each new frame of the film drawn down to TV_CRT_LINES rows (fewer for a
+  // film that has fewer) on a small canvas, shown with hard pixel edges
+  // through the cabinets' tube pass (arcadeCrt.ts), one scanline a row. The
+  // browser's own downscale averages the frame, so the pixels hold still
+  // instead of sparkling; and a small canvas is less to upload per frame
+  // than the film's own.
+  const crtCanvas = document.createElement("canvas");
+  crtCanvas.width = TV_CRT_LOOK.lines[0];
+  crtCanvas.height = TV_CRT_LOOK.lines[1];
+  const crt2d = crtCanvas.getContext("2d")!;
+  const crtTex = new THREE.CanvasTexture(crtCanvas);
+  crtTex.colorSpace = THREE.SRGBColorSpace;
+  crtTex.magFilter = THREE.NearestFilter;
+  crtTex.minFilter = THREE.LinearFilter;
+  crtTex.generateMipmaps = false;
+  const crtLines = { value: new THREE.Vector2(...TV_CRT_LOOK.lines) };
+  const crtMat = new THREE.MeshBasicMaterial({ map: crtTex, color: 0xffffff, toneMapped: false });
+  applyCrtLook(crtMat, TV_CRT_LOOK, undefined, crtLines);
+  // Off the mesh while CLEAN or nothing plays, so the removal's traversal
+  // would not reach them: their own teardown hook (World runs every
+  // `dispose*` on userData).
+  picture.userData.disposeCrt = () => {
+    crtMat.dispose();
+    crtTex.dispose();
+  };
+  let crtOn = true;
+  /** A frame of the film not drawn down yet. Where the browser says when
+   *  one comes (requestVideoFrameCallback, as three's VideoTexture asks),
+   *  it is set then: a 24 fps film is drawn 24 times a second, not once a
+   *  render. Each new film or size sets it too (the first frame, paused or
+   *  not). */
+  let crtFresh = true;
+  /** Without that: the film time last drawn down (NaN: draw the next frame
+   *  whatever it is). */
+  let crtDrawn = NaN;
+  const framesSaid = (v: HTMLVideoElement): boolean => "requestVideoFrameCallback" in v;
+  /** Watch `v`'s frames while it is the one shown. */
+  const watchFrames = (v: HTMLVideoElement) => {
+    if (!framesSaid(v)) return;
+    const onFrame = () => {
+      if (video !== v) return; // another film since: this one is let go
+      crtFresh = true;
+      v.requestVideoFrameCallback(onFrame);
+    };
+    v.requestVideoFrameCallback(onFrame);
+  };
+  /** The canvas in the film's shape: its rows, and as many columns as keep
+   *  the pixels square. */
+  const sizeCrt = () => {
+    const vw = video?.videoWidth ?? 0;
+    const vh = video?.videoHeight ?? 0;
+    const rows = vh > 0 ? Math.min(TV_CRT_LINES, vh) : TV_CRT_LINES;
+    const cols = Math.max(2, Math.min(4 * TV_CRT_LINES, Math.round(rows * (vw > 0 && vh > 0 ? vw / vh : 16 / 9))));
+    if (crtCanvas.width !== cols || crtCanvas.height !== rows) {
+      crtCanvas.width = cols;
+      crtCanvas.height = rows;
+      crtTex.dispose(); // a texture keeps its first size on the GPU
+    }
+    crtLines.value.set(cols, rows);
+    // Black until the new film's first frame, never the last one's.
+    crt2d.fillStyle = "#000000";
+    crt2d.fillRect(0, 0, cols, rows);
+    crtTex.needsUpdate = true;
+    crtFresh = true;
+    crtDrawn = NaN;
+  };
+  const applyLook = () => {
+    const want = crtOn && video !== null ? crtMat : pictureMat;
+    if (picture.material !== want) picture.material = want;
+  };
+  picture.onBeforeRender = () => {
+    if (picture.material !== crtMat || !video) return;
+    crtTick(performance.now() / 1000);
+    // HAVE_CURRENT_DATA: a frame to draw. A paused film is drawn once.
+    if (video.readyState < 2) return;
+    if (framesSaid(video) ? !crtFresh : video.currentTime === crtDrawn) return;
+    crt2d.imageSmoothingEnabled = true;
+    crt2d.imageSmoothingQuality = "high";
+    crt2d.drawImage(video, 0, 0, crtCanvas.width, crtCanvas.height);
+    crtTex.needsUpdate = true;
+    crtFresh = false;
+    crtDrawn = video.currentTime;
+  };
   // Shown and hidden through a Group, not the mesh: World sets every
   // furniture mesh's own `visible` on each frame (the zoom's interior pass),
   // which would put an empty white plane over the card.
@@ -11196,6 +11281,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     const aspect = vw > 0 && vh > 0 ? vw / vh : screenW / screenH;
     const sw = aspect >= screenW / screenH ? screenW : screenH * aspect;
     picture.scale.set(sw, sw / aspect, 1);
+    sizeCrt();
   };
   const pictureOn = () => video !== null && (viewState === "playing" || viewState === "paused");
   // The set's glow on the wall and floor while it is on: driven with the view.
@@ -11231,6 +11317,8 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
     viewState = view.state;
+    crtOn = !view.clean;
+    applyLook();
     pictureFrame.visible = pictureOn();
     if (pictureFrame.visible) {
       // The picture is up: the card behind it is the black around it.
@@ -11342,8 +11430,10 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
         v.addEventListener("loadedmetadata", fitPicture);
       }
       pictureMat.map = videoTex;
+      if (v) watchFrames(v);
       pictureMat.needsUpdate = true;
       fitPicture();
+      applyLook();
       // Redrawn now, not at the next tick: the card goes black (or comes
       // back) with the picture.
       last = "";
