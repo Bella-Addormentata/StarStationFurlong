@@ -27,9 +27,10 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { canRunCroupier } from './croupier';
+import { canRunCroupier, timerOnThisClock } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
+  betsHeld,
   casinoDocEpoch,
   clearTableKeys,
   creditTableOutcome,
@@ -437,6 +438,23 @@ export function tickAutoStickman(tableId: string): void {
     openCrapsBetting(tableId, 1, null);
     return;
   }
+  if (s.phase === 'closing' && s.operator !== undefined && s.operator !== PAGE_ID) {
+    // A manual turn another page holds: it settles it (tickManualCraps).
+    // Only once it has sat for MANUAL_TAKEOVER_MS (that page is gone) does
+    // the robot take it over and finish it.
+    if (now - noteClosing(tableId, s, now) >= MANUAL_TAKEOVER_MS) {
+      writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
+    }
+    return;
+  }
+  const span = s.phase === 'betting' ? CRAPS_BET_WINDOW_MS
+    : s.phase === 'closing' ? (s.shooter !== undefined ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS)
+    : CRAPS_SHOW_MS;
+  const deadline = timerOnThisClock(s, span, now);
+  if (deadline !== s.phaseDeadline) {
+    writeCrapsTableState(tableId, { ...s, phaseDeadline: deadline });
+    return;
+  }
   if (s.phase === 'betting') {
     if (s.phaseDeadline == null) {
       if (hasLiveBets(tableId)) {
@@ -446,15 +464,6 @@ export function tickAutoStickman(tableId: string): void {
       closeCrapsBetting(tableId, s, now);
     }
   } else if (s.phase === 'closing') {
-    if (s.operator !== undefined && s.operator !== PAGE_ID) {
-      // A manual turn another page holds: it settles it (tickManualCraps).
-      // Only once it has sat for MANUAL_TAKEOVER_MS (that page is gone) does
-      // the robot take it over and finish it.
-      if (now - noteClosing(tableId, s, now) >= MANUAL_TAKEOVER_MS) {
-        writeCrapsTableState(tableId, { ...s, operator: PAGE_ID });
-      }
-      return;
-    }
     tickCrapsClosing(tableId, s, CRAPS_SHOW_MS, now);
   } else if (s.phase === 'settled') {
     if (s.phaseDeadline != null && now >= s.phaseDeadline) {
@@ -464,12 +473,13 @@ export function tickAutoStickman(tableId: string): void {
 }
 
 /**
- * Tear a craps table down cleanly on removal (mirrors croupier.closeTable). The
- * REFUND of every standing bet (stakes were debited at placement) runs ONLY on
- * the deed holder's pages, and counts once however many of them run it
- * (creditTableOutcome); every client then wipes the
- * table's casino keys (idempotent LWW delete). A manual venture/legacy room has
- * no operator, so stakes are not refunded (matches the manual-mode limitation).
+ * Tear a craps table down cleanly on removal (mirrors croupier.closeTable).
+ * Held stakes go back as their lists go. The REFUND of an earlier build's
+ * standing bets (it took their chips) runs ONLY on the deed holder's pages,
+ * and counts once however many of them run it (creditTableOutcome); every
+ * client then wipes the table's casino keys (idempotent LWW delete). A manual
+ * venture/legacy room has no operator, so those are not refunded (matches the
+ * manual-mode limitation).
  */
 export function closeCrapsTable(tableId: string): void {
   // One transaction: no page sees the refunds without the table gone.
@@ -477,11 +487,12 @@ export function closeCrapsTable(tableId: string): void {
     if (canRunCroupier()) {
       const inc = readCrapsTableState(tableId)?.inc ?? '';
       for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
-        const staked = bets.reduce((sum, b) => sum + b.amount, 0);
-        // Each of the deed holder's pages runs this, and the page driving the
-        // table may be settling a roll meanwhile: the table's one outcome per
-        // bettor pays one of them (croupier.closeTable).
-        creditTableOutcome(tableId, inc, 'end', pid, staked);
+        // A held stake goes back with its list. An earlier build's list took
+        // its chips: each of the deed holder's pages refunds it, and the page
+        // driving the table may be settling a roll meanwhile: the table's one
+        // outcome per bettor pays one of them (croupier.closeTable).
+        if (betsHeld(tableId, pid)) continue;
+        creditTableOutcome(tableId, inc, 'end', pid, bets.reduce((sum, b) => sum + b.amount, 0));
       }
     }
     clearTableKeys(tableId);

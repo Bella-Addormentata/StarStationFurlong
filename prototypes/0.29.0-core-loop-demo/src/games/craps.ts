@@ -122,6 +122,7 @@ export interface CrapsTableState {
   unseeded?: string[];
   wagers?: Record<string, string>;
   sigs?: Record<string, string>;
+  stakes?: Record<string, number>;
   /** ⚖️ The fairness mode locked in when this window opened; the settle uses
    *  it, so an owner's switch mid-window applies from the next one. */
   fairMode?: FairnessMode;
@@ -205,6 +206,10 @@ export interface SeedRoundFields {
   /** Each frozen bettor's signature over its commitment (its identity key,
    *  players[pid].keyB64): nobody else can put a seed in under its name. */
   sigs?: Record<string, string>;
+  /** 🪙 The chips each frozen bettor's list held on the felt at "no more
+   *  bets" (0 for an earlier build's list, whose chips were taken): what the
+   *  settle takes, whatever the list says by then. */
+  stakes?: Record<string, number>;
 }
 
 function isPidMap(v: unknown, max: number): boolean {
@@ -215,6 +220,13 @@ function isPidMap(v: unknown, max: number): boolean {
       && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
 }
 
+function isPidCountMap(v: unknown, max: number): boolean {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const entries = Object.entries(v);
+  return entries.length <= max
+    && entries.every(([pid, n]) => pid.length > 0 && pid.length <= 128 && Number.isSafeInteger(n) && (n as number) >= 0);
+}
+
 /** Shape guard for the peer-written seed fields (bounded like transcripts). */
 export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.houseCommit !== undefined
@@ -222,6 +234,7 @@ export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
   if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
   if (s.sigs !== undefined && !isPidMap(s.sigs, FAIRNESS_MAX_PARTIES - 1)) return false;
+  if (s.stakes !== undefined && !isPidCountMap(s.stakes, 2 * FAIRNESS_MAX_PARTIES)) return false;
   return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 

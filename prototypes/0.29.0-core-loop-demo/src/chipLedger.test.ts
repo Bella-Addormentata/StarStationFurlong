@@ -472,26 +472,90 @@ describe('what a table pays a player', () => {
     }
   });
 
-  it('past the safe range goes on in the next record of the chain, and an outcome there still counts once', () => {
-    const max = Number.MAX_SAFE_INTEGER;
+  it('a record whose total is full goes on in the next of the chain, and an outcome there still counts once', () => {
+    const full = 2 ** 52;
     const sum = (page: CasinoDoc): bigint =>
       page.readChipRecords(PLAYER).reduce((n, r) => n + BigInt(r.d), 0n);
-    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, max - 5);
+    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, full - 1);
+    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 1);
     sync(docA, docB);
-    // Round 2 on both pages at once, then again on one: the same next record.
-    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 10);
-    pageB.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 10);
+    expect(pageA.readChipRecords(PLAYER)).toHaveLength(1);
+    // Round 3 on both pages at once, each with its own amount: both go to the
+    // same next record, so one of the two counts; then again on one: nothing.
+    pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 10);
+    pageB.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 20);
     sync(docA, docB);
-    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 10);
+    pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 10);
     sync(docA, docB);
+    const paid = sum(pageA);
+    expect([BigInt(full) + 10n, BigInt(full) + 20n]).toContain(paid);
     for (const page of [pageA, pageB]) {
-      expect(sum(page)).toBe(BigInt(max) + 5n);
+      expect(sum(page)).toBe(paid);
       expect(page.readChipRecords(PLAYER)).toHaveLength(2);
     }
     pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 7);
-    pageB.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 7); // after the removal: nothing
+    pageB.creditTableOutcome(TABLE, 'inc1', 4, PLAYER, 7); // after the removal: nothing
     sync(docA, docB);
-    for (const page of [pageA, pageB]) expect(sum(page)).toBe(BigInt(max) + 12n);
+    pageA.creditTableOutcome(TABLE, 'inc1', 4, PLAYER, 7);
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) expect(sum(page)).toBe(paid + 7n);
+  });
+
+  it('a round and a removal at once on two pages, by a record nearly full or nearly past the safe range: one of the two counts, and a removal stays the last', async () => {
+    const full = 2 ** 52;
+    const sum = (page: CasinoDoc): bigint =>
+      page.readChipRecords(PLAYER).reduce((n, r) => n + BigInt(r.d), 0n);
+    // [what rounds 3 and 4 paid, records once round 5 or the removal lands]
+    const bases: [number[], number][] = [
+      [[full - 5], 1], // the round would fill the record, the removal would not
+      [[full - 1, full - 5], 2], // full, 5 short of the safe range: the round would pass it
+    ];
+    for (const [paidBefore, records] of bases) {
+      for (const [clientA, clientB] of [[1, 2], [2, 1]]) {
+        docA = new Y.Doc();
+        docB = new Y.Doc();
+        docA.clientID = clientA;
+        docB.clientID = clientB;
+        pageA = await loadPage(docA);
+        pageB = await loadPage(docB);
+        paidBefore.forEach((amount, i) => pageA.creditTableOutcome(TABLE, 'inc1', 3 + i, PLAYER, amount));
+        sync(docA, docB);
+        const base = sum(pageA);
+        pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 10);
+        pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 3);
+        sync(docA, docB);
+        const paid = sum(pageA);
+        expect([base + 10n, base + 3n]).toContain(paid);
+        for (const page of [pageA, pageB]) {
+          expect(sum(page)).toBe(paid);
+          expect(page.readChipRecords(PLAYER)).toHaveLength(records);
+        }
+        // Each page tries its own again: the round never counts twice, and
+        // once the removal has counted nothing comes after it.
+        pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 10);
+        pageA.creditTableOutcome(TABLE, 'inc1', 6, PLAYER, 10);
+        sync(docA, docB);
+        pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 3);
+        sync(docA, docB);
+        const ended = paid === base + 3n;
+        for (const page of [pageA, pageB]) expect(sum(page)).toBe(ended ? paid : paid + 10n + 3n);
+      }
+    }
+  });
+
+  it('takes a lost stake as a negative outcome, and turns away amounts it could not hold', () => {
+    pageA.buyInChips(PLAYER, 100);
+    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, -30);
+    pageB.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, -30);
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(70);
+    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 0);
+    pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 2 ** 52);
+    pageA.creditTableOutcome(TABLE, 'inc1', 4, PLAYER, -(2 ** 52));
+    pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 0.5);
+    expect(pageA.readChips(PLAYER)).toBe(70);
+    pageA.creditTableOutcome(TABLE, 'inc1', 6, PLAYER, 45);
+    expect(pageA.readChips(PLAYER)).toBe(115);
   });
 
   it('rides one record per table and player, however many rounds it pays', () => {

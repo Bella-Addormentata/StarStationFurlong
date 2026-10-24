@@ -32,10 +32,10 @@ import {
   readAllCrapsBets,
   readCrapsBackendPref,
   readCrapsFairnessPref,
+  pruneCrapsBets,
   readCrapsTableState,
   transactCasino,
   writeCrapsTableState,
-  writeMyCrapsBets,
 } from './casinoDoc';
 import type { CrapsBackendKind } from './casinoDoc';
 import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
@@ -44,7 +44,7 @@ import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 import { getCrapsFairnessMode, produceRoll, settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
-import { frozenFields, frozenWagers, gatherRound, roundSettleable, settledRound } from './fairTableSeeds';
+import { frozenFields, frozenWagers, gatherRound, heldAtClose, roundSettleable, settledRound } from './fairTableSeeds';
 import { getPlayerId } from './identity';
 import { stillDrivesTables } from './croupier';
 
@@ -118,23 +118,31 @@ class LocalCrapsBackend implements CrapsBackend {
         const before = readCrapsTableState(tableId);
         if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return null;
         if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return null;
+        if (before.operator === undefined && !stillDrivesTables()) return null;
         const now = Date.now();
-        writeCrapsTableState(tableId, {
-          kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
-          resultAt: now, payouts: {}, voided: true,
-          ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
-          ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
-          ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
-          ...frozenFields(tableId, before),
-          ...(before.inc !== undefined ? { inc: before.inc } : {}),
-          ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
-        });
-        settledRound(tableId, before);
         // Every bet stands — as frozen at "no more bets". A list rewritten
         // since can't be restored from its hash, so it's cleared like a
-        // forfeit rather than left to ride into the next roll.
-        const { voided } = frozenWagers(tableId, before, readAllCrapsBets(tableId));
-        for (const pid of voided) writeMyCrapsBets(tableId, pid, []);
+        // forfeit (losing what it held then) rather than left to ride.
+        const live = readAllCrapsBets(tableId);
+        const { voided } = frozenWagers(tableId, before, live);
+        transactCasino(() => {
+          writeCrapsTableState(tableId, {
+            kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
+            resultAt: now, payouts: {}, voided: true,
+            ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
+            ...(before.lastShooter !== undefined ? { lastShooter: before.lastShooter } : {}),
+            ...(before.houseCommit !== undefined ? { houseCommit: before.houseCommit } : {}),
+            ...frozenFields(tableId, before),
+            ...(before.inc !== undefined ? { inc: before.inc } : {}),
+            ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+          });
+          settledRound(tableId, before);
+          for (const pid of voided) {
+            const held = heldAtClose(tableId, before, pid, live[pid].reduce((n, b) => n + b.amount, 0));
+            if (held > 0) creditTableOutcome(tableId, before.inc ?? '', round, pid, -held);
+            pruneCrapsBets(tableId, pid, []);
+          }
+        });
         return null;
       }
       const gathered = gatherRound(tableId, closing);
@@ -175,7 +183,8 @@ class LocalCrapsBackend implements CrapsBackend {
     // felt this roll — withholding a seed to dodge a result must cost them.
     // Only wagers frozen at "no more bets" settle: the reveals made the dice
     // computable, so a list rewritten since is void and cleared like a forfeit.
-    const { bets: allBets, voided } = frozenWagers(tableId, before, readAllCrapsBets(tableId));
+    const live = readAllCrapsBets(tableId);
+    const { bets: allBets, voided } = frozenWagers(tableId, before, live);
     forfeited = [...forfeited, ...voided];
     for (const pid of forfeited) delete allBets[pid];
     const { payouts, remaining } = resolveCrapsRound(
@@ -185,6 +194,18 @@ class LocalCrapsBackend implements CrapsBackend {
       pointBefore,
     );
     for (const pid of forfeited) remaining[pid] = [];
+    // 🪙 What the roll does to each bettor's chips (casinoDoc STAKES ON THE
+    // FELT): a held list's bets that came down take what they held, and what
+    // they won is paid; the bets that stay up stay held. An earlier build's
+    // list took its chips when it went down: its win is paid in full. A list
+    // rewritten since the close loses what it held then.
+    const owed: Record<string, number> = {};
+    for (const [pid, left] of Object.entries(remaining)) {
+      const held = heldAtClose(tableId, before, pid, (live[pid] ?? []).reduce((n, b) => n + b.amount, 0));
+      const stays = left.reduce((n, b) => n + b.amount, 0);
+      const delta = (payouts[pid] ?? 0) - (held > 0 ? held - stays : 0);
+      if (delta !== 0) owed[pid] = delta;
+    }
     const now = Date.now();
     // One transaction: a page sees the settled roll, what it paid, and the
     // pruned felts together.
@@ -215,13 +236,13 @@ class LocalCrapsBackend implements CrapsBackend {
         ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
       });
       settledRound(tableId, before);
-      // A page that removed the table meanwhile refunds the felt instead, never
-      // as well: the table's one outcome per bettor (creditTableOutcome).
-      for (const [pid, amount] of Object.entries(payouts)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
+      // One change per bettor for the roll, counted once however many pages
+      // settle it (creditTableOutcome).
+      for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
       // Prune the felt: rewrite each player's list to only the bets that survived
       // (standing pass/place). Empty ⇒ their felt clears.
       for (const [pid, bets] of Object.entries(remaining)) {
-        writeMyCrapsBets(tableId, pid, bets);
+        pruneCrapsBets(tableId, pid, bets);
       }
     });
     return [d1, d2];

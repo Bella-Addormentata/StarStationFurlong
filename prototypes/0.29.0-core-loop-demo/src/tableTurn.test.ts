@@ -127,29 +127,89 @@ describe('two pages of the deed holder', () => {
   });
 });
 
-describe('a table torn down on both pages', () => {
+/** Every spin lands on `pocket` (crypto.getRandomValues stubbed). */
+function spinTo(pocket: number): void {
+  vi.spyOn(globalThis.crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView | null>(arr: T): T => {
+    (arr as unknown as Uint32Array)[0] = pocket;
+    return arr;
+  });
+}
+
+const sum = (bets: readonly { amount: number }[]): number => bets.reduce((n, b) => n + b.amount, 0);
+
+describe('stakes on the felt', () => {
   const bettor = 'player-Carol';
 
+  /** Carol has 100 chips and 30 on red, page a drives, both pages synced. */
   function betAndShare(): void {
+    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
     a.casino.buyInChips(bettor, 100);
     a.croupier.openBetting(TABLE, 1);
-    expect(a.casino.spendChips(bettor, 30)).toBe(true);
     a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
     turn(a, Date.now());
     sync(a.doc, b.doc);
     expect(turn(b, Date.now())).toBe(false); // a drives
   }
 
-  it('refunds the stakes on it once, removed on both before either hears of the other', () => {
+  it('a bet takes nothing: the list holds its chips, and they are back the moment it comes down', () => {
+    betAndShare();
+    expect(a.casino.readChips(bettor)).toBe(70);
+    expect(a.casino.readChipRecords(bettor).map((r) => r.d)).toEqual([100]); // only the buy-in
+    a.casino.writeMyBets(TABLE, bettor, 1, []);
+    expect(a.casino.readChips(bettor)).toBe(100);
+  });
+
+  it('two tabs of one player betting at once keep one list, and hold only its chips', () => {
+    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    a.casino.buyInChips(bettor, 100);
+    a.croupier.openBetting(TABLE, 1);
+    sync(a.doc, b.doc);
+    a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 10 }]);
+    b.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'black', amount: 25 }]);
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) {
+      const list = page.casino.readMyBets(TABLE, bettor, 1);
+      expect(list).toHaveLength(1);
+      expect(page.casino.readChips(bettor)).toBe(100 - sum(list)); // (debits for both kept 65)
+    }
+  });
+
+  it('a take-down at the moment the table is removed hands the chips back once', () => {
+    betAndShare();
+    b.casino.writeMyBets(TABLE, bettor, 1, []); // Carol's tab takes the 30 down
+    a.croupier.closeTable(TABLE); // the owner removes the table, before hearing
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
+  });
+
+  it('two tabs taking the same bet down at once hand it back once', () => {
+    betAndShare();
+    a.casino.writeMyBets(TABLE, bettor, 1, []);
+    b.casino.writeMyBets(TABLE, bettor, 1, []);
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
+  });
+
+  it('a table removed on both pages before either hears of the other hands the stakes back once', () => {
     betAndShare();
     a.croupier.closeTable(TABLE);
     b.croupier.closeTable(TABLE);
     sync(a.doc, b.doc);
-    expect(a.casino.readChips(bettor)).toBe(100);
-    expect(b.casino.readChips(bettor)).toBe(100);
+    for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
   });
 
-  it('sends the refunds and the removal as one update, so no page sees one without the other', () => {
+  it('and once whatever bets each page had seen', () => {
+    betAndShare();
+    // Carol's second chip reached page b only.
+    b.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }, { type: 'black', amount: 10 }]);
+    expect(b.casino.readChips(bettor)).toBe(60);
+    a.croupier.closeTable(TABLE);
+    b.croupier.closeTable(TABLE);
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
+  });
+
+  it('sends the removal as one update, so no page sees part of it', () => {
     betAndShare();
     expect(updatesDuring(b, () => b.croupier.closeTable(TABLE))).toBe(1);
     const craps = 'craps-1';
@@ -158,50 +218,74 @@ describe('a table torn down on both pages', () => {
     expect(updatesDuring(a, () => a.craps.closeCrapsTable(craps))).toBe(1);
   });
 
-  it('refunds them once when the page not driving removes it first and the driver hears after', () => {
-    betAndShare();
-    b.croupier.closeTable(TABLE); // refunds, then clears the bets
+  for (const [pocket, outcome, after] of [[1, 'win', 130], [2, 'loss', 70]] as const) {
+    it(`a round settled on the driver while the other page removed the table keeps its ${outcome}, paid once`, () => {
+      spinTo(pocket); // 1 is red, 2 black
+      betAndShare();
+      a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
+      sync(a.doc, b.doc);
+      // A plain RNG table settles at once, the round and its pay in one update.
+      expect(updatesDuring(a, () => a.croupier.rollAndSettle(TABLE, 1))).toBe(1);
+      expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', result: pocket });
+      expect(a.casino.readChips(bettor)).toBe(after);
+      b.croupier.closeTable(TABLE); // b still sees the round closing
+      sync(a.doc, b.doc);
+      a.croupier.closeTable(TABLE); // a hears of the removal
+      sync(a.doc, b.doc);
+      for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(after);
+    });
+  }
+});
+
+describe('a list an earlier build put down (its chips taken then)', () => {
+  const bettor = 'player-Carol';
+
+  /** What a room saved by an earlier build holds: 70 chips left after 30 on red. */
+  function earlierBet(): void {
+    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    a.croupier.openBetting(TABLE, 1);
+    a.doc.getMap('casino').set(`bal:${bettor}`, 70);
+    a.doc.getMap('casino').set(`bets:${TABLE}:${bettor}`, { round: 1, bets: [{ type: 'red', amount: 30 }] });
+    turn(a, Date.now());
     sync(a.doc, b.doc);
-    a.croupier.closeTable(TABLE); // finds no bets left
-    sync(a.doc, b.doc);
-    expect(a.casino.readChips(bettor)).toBe(100);
-    expect(b.casino.readChips(bettor)).toBe(100);
+  }
+
+  it('holds nothing more, and a win pays it in full', () => {
+    spinTo(1);
+    earlierBet();
+    expect(a.casino.betsHeld(TABLE, bettor)).toBe(false);
+    expect(a.casino.readChips(bettor)).toBe(70);
+    a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
+    a.croupier.rollAndSettle(TABLE, 1);
+    expect(a.casino.readChips(bettor)).toBe(130);
   });
 
-  it('refunds one page\'s view of the stakes, never both, when only one had heard of a late bet', () => {
-    betAndShare();
-    // The bettor's second chip reached page b only.
-    expect(b.casino.spendChips(bettor, 10)).toBe(true);
-    b.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }, { type: 'black', amount: 10 }]);
+  it('is refunded once when the table is removed on both pages', () => {
+    earlierBet();
     a.croupier.closeTable(TABLE);
     b.croupier.closeTable(TABLE);
     sync(a.doc, b.doc);
-    const chips = a.casino.readChips(bettor);
-    expect([90, 100]).toContain(chips); // 60 left + 30 or 40 back (digests per view paid 70)
-    expect(b.casino.readChips(bettor)).toBe(chips);
+    for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
   });
 
-  it('a round settled on the driver while the other page removed the table pays the win or the refund, never both', () => {
-    // A red pocket every spin, so the 30 on red pays 60.
-    vi.spyOn(globalThis.crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView | null>(arr: T): T => {
-      (arr as unknown as Uint32Array)[0] = 1;
-      return arr;
-    });
-    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
-    betAndShare();
-    a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
-    sync(a.doc, b.doc);
-    // A plain RNG table settles at once, the round and its pay in one update.
-    expect(updatesDuring(a, () => a.croupier.rollAndSettle(TABLE, 1))).toBe(1);
-    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', result: 1 });
-    expect(a.casino.readChips(bettor)).toBe(130);
-    b.croupier.closeTable(TABLE); // b still sees the round closing
-    sync(a.doc, b.doc);
-    a.croupier.closeTable(TABLE); // a hears of the removal
-    sync(a.doc, b.doc);
-    const chips = a.casino.readChips(bettor);
-    expect([130, 100]).toContain(chips);
-    expect(b.casino.readChips(bettor)).toBe(chips);
+  it('given back to its player when they bet again, so the new list holds it', () => {
+    earlierBet();
+    b.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }, { type: 'black', amount: 10 }]);
+    expect(b.casino.betsHeld(TABLE, bettor)).toBe(true);
+    expect(b.casino.readChips(bettor)).toBe(60);
+    b.casino.writeMyBets(TABLE, bettor, 1, []);
+    expect(b.casino.readChips(bettor)).toBe(100);
+  });
+
+  it('keeps its kind through a craps prune, as does a held list', () => {
+    const craps = 'craps-1';
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.doc.getMap('casino').set(`bets:${craps}:${bettor}`, { kind: 'craps', bets: [{ type: 'pass', amount: 10 }] });
+    a.casino.pruneCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    expect(a.casino.betsHeld(craps, bettor)).toBe(false);
+    a.casino.writeMyCrapsBets(craps, 'player-Dan', [{ type: 'pass', amount: 10 }]);
+    a.casino.pruneCrapsBets(craps, 'player-Dan', [{ type: 'pass', amount: 10 }]);
+    expect(a.casino.betsHeld(craps, 'player-Dan')).toBe(true);
   });
 });
 
@@ -212,20 +296,20 @@ describe('a table set up again under the same id', () => {
     a.casino.buyInChips(bettor, 100);
     for (let n = 0; n < 2; n++) {
       a.croupier.openBetting(TABLE, 1);
-      expect(a.casino.spendChips(bettor, 30)).toBe(true);
-      a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
+      a.doc.getMap('casino').set(`bal:${bettor}`, 70 - 30 * n); // an earlier build took the 30
+      a.doc.getMap('casino').set(`bets:${TABLE}:${bettor}`, { round: 1, bets: [{ type: 'red', amount: 30 }] });
       a.croupier.closeTable(TABLE);
-      expect(a.casino.readChips(bettor)).toBe(100);
+      // 100 bought, what is left of the opening, and every 30 taken comes back
+      expect(a.casino.readChips(bettor)).toBe(200);
     }
   });
 
   it('refunds craps stakes likewise', () => {
     const table = 'craps-1';
-    a.casino.buyInChips(bettor, 100);
     for (let n = 0; n < 2; n++) {
       a.craps.openCrapsBetting(table, 1, null);
-      expect(a.casino.spendChips(bettor, 30)).toBe(true);
-      a.casino.writeMyCrapsBets(table, bettor, [{ type: 'pass', amount: 30 }]);
+      a.doc.getMap('casino').set(`bal:${bettor}`, 70 - 30 * n);
+      a.doc.getMap('casino').set(`bets:${table}:${bettor}`, { kind: 'craps', bets: [{ type: 'pass', amount: 30 }] });
       a.craps.closeCrapsTable(table);
       expect(a.casino.readChips(bettor)).toBe(100);
     }
@@ -240,6 +324,73 @@ describe('a table set up again under the same id', () => {
     a.croupier.closeTable(TABLE);
     a.croupier.openBetting(TABLE, 1);
     expect(a.casino.readTableState(TABLE)!.inc).not.toBe(inc);
+  });
+});
+
+describe('a write at the moment the table is removed, from a page that leaves before it hears', () => {
+  const bettor = 'player-Carol';
+  const craps = 'craps-1';
+
+  /** Carol has 100 chips and 10 on the pass line; page a drives. */
+  function crapsBet(): void {
+    a.casino.writeCrapsFairnessPref(craps, 'rng');
+    a.casino.buyInChips(bettor, 100);
+    a.craps.openCrapsBetting(craps, 1, null);
+    a.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    sync(a.doc, b.doc);
+    expect(b.casino.readChips(bettor)).toBe(90);
+  }
+
+  it('a craps settle leaves no table behind, and holds none of its chips', () => {
+    crapsBet();
+    // Page a settles a roll that sets the point (the pass line stays up)
+    // while page b removes the table; page a is gone before it hears.
+    const s = a.casino.readCrapsTableState(craps)!;
+    a.casino.transactCasino(() => {
+      a.casino.writeCrapsTableState(craps, { ...s, phase: 'settled', point: 6 });
+      a.casino.pruneCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    });
+    b.craps.closeCrapsTable(craps);
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) {
+      expect(page.casino.readCrapsTableState(craps)).toBeNull();
+      expect(page.casino.readChips(bettor)).toBe(100);
+    }
+  });
+
+  it('nor does a table put back under the same id play the bets it left', () => {
+    crapsBet();
+    const s = a.casino.readCrapsTableState(craps)!;
+    a.casino.writeCrapsTableState(craps, { ...s, phase: 'settled', point: 6 });
+    a.casino.pruneCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+    b.craps.closeCrapsTable(craps);
+    sync(a.doc, b.doc);
+    turn(b, Date.now());
+    b.craps.tickAutoStickman(craps); // the table is back, page b drives it
+    const fresh = b.casino.readCrapsTableState(craps)!;
+    expect(fresh).toMatchObject({ phase: 'betting', round: 1 });
+    expect(fresh.inc).not.toBe(s.inc);
+    expect(b.casino.readAllCrapsBets(craps)).toEqual({});
+    expect(b.casino.readChips(bettor)).toBe(100);
+    b.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 25 }]);
+    expect(b.casino.readChips(bettor)).toBe(75);
+  });
+
+  it('a roulette bet put down as the table goes holds nothing, and a table put back on round 1 starts clean', () => {
+    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    a.casino.buyInChips(bettor, 100);
+    a.croupier.openBetting(TABLE, 1);
+    const inc = a.casino.readTableState(TABLE)!.inc;
+    sync(a.doc, b.doc);
+    b.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
+    a.croupier.closeTable(TABLE);
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
+    a.croupier.openBetting(TABLE, 1);
+    expect(a.casino.readTableState(TABLE)!.inc).not.toBe(inc);
+    expect(a.casino.readAllBets(TABLE, 1)).toEqual({});
+    expect(a.casino.readMyBets(TABLE, bettor, 1)).toEqual([]);
+    expect(a.casino.readChips(bettor)).toBe(100);
   });
 });
 
@@ -311,6 +462,138 @@ describe('a manual craps roll held by the owner\'s page that is not driving', ()
     a.craps.tickAutoStickman(table);
     await flush();
     expect(a.casino.readCrapsTableState(table)).toMatchObject({ phase: 'settled', round: 1 });
+  });
+});
+
+describe('a SPIN pressed on the owner\'s page that is not driving', () => {
+  let now = 2_000_000_000;
+  const later = (ms: number): void => {
+    now += ms;
+    vi.setSystemTime(now);
+  };
+
+  /** Page a drives; page b pressed SPIN before the robot's first beat, so b
+   *  holds this round. */
+  function spunByB(): void {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    later(0);
+    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    turn(a, now);
+    sync(a.doc, b.doc);
+    b.croupier.openBetting(TABLE, 1);
+    b.croupier.closeBetting(TABLE, b.casino.readTableState(TABLE)!, undefined, b.croupier.ROULETTE_PAGE_ID);
+    sync(a.doc, b.doc);
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('is settled there, and the robot gives it the show beat and opens the next round', async () => {
+    spunByB();
+    later(100);
+    a.croupier.tickAutoCroupier(TABLE); // the robot leaves b's round alone
+    await flush();
+    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'closing', operator: b.croupier.ROULETTE_PAGE_ID });
+    b.croupier.rollAndSettle(TABLE, 1); // the SPIN's settle: no show beat of its own
+    await flush();
+    sync(a.doc, b.doc);
+    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', round: 1 });
+    expect(a.casino.readTableState(TABLE)!.phaseDeadline).toBeUndefined();
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)!.phaseDeadline).toBe(now + a.croupier.SHOW_MS);
+    later(a.croupier.SHOW_MS);
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'betting', round: 2 });
+  });
+
+  it('is taken over by the robot once the page that spun it has gone quiet', async () => {
+    spunByB();
+    a.croupier.tickAutoCroupier(TABLE);
+    later(a.croupier.SPIN_TAKEOVER_MS - 100);
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)?.operator).toBe(b.croupier.ROULETTE_PAGE_ID);
+    later(200);
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)?.operator).toBe(a.croupier.ROULETTE_PAGE_ID);
+    a.croupier.tickAutoCroupier(TABLE);
+    await flush();
+    expect(a.casino.readTableState(TABLE)).toMatchObject({
+      phase: 'settled', round: 1, phaseDeadline: now + a.croupier.SHOW_MS,
+    });
+  });
+});
+
+describe('a driver whose clock runs an hour behind the page before it', () => {
+  const aNow = 2_000_000_000;
+  const bNow = aNow - 3_600_000;
+  const bettor = 'player-Carol';
+
+  /** Page a has gone; page b takes the tables over. b's clock when it drives. */
+  function bTakesOver(): number {
+    sync(a.doc, b.doc);
+    let t = bNow;
+    while (!turn(b, t)) t += 100;
+    vi.setSystemTime(t);
+    return t;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(aNow);
+    turn(a, aNow);
+    a.casino.buyInChips(bettor, 100);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('runs a roulette window it inherits for the window\'s length on its own clock, not an hour', () => {
+    const { BET_WINDOW_MS, CLOSING_MS } = a.croupier;
+    a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    a.croupier.openBetting(TABLE, 1);
+    a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)!.phaseDeadline).toBe(aNow + BET_WINDOW_MS);
+    const t = bTakesOver();
+    b.croupier.tickAutoCroupier(TABLE);
+    expect(b.casino.readTableState(TABLE)!.phaseDeadline).toBe(t + BET_WINDOW_MS);
+    vi.setSystemTime(t + BET_WINDOW_MS);
+    b.croupier.tickAutoCroupier(TABLE);
+    expect(b.casino.readTableState(TABLE)).toMatchObject({
+      phase: 'closing', phaseDeadline: t + BET_WINDOW_MS + CLOSING_MS,
+    });
+  });
+
+  it('and a result it inherits for the show beat, then opens the next round', () => {
+    const { SHOW_MS } = a.croupier;
+    a.casino.writeTableState(TABLE, {
+      kind: 'roulette', phase: 'settled', round: 4, result: 7, resultAt: aNow, payouts: {},
+      phaseDeadline: aNow + SHOW_MS, inc: 'inc1',
+    });
+    const t = bTakesOver();
+    b.croupier.tickAutoCroupier(TABLE);
+    expect(b.casino.readTableState(TABLE)!.phaseDeadline).toBe(t + SHOW_MS);
+    vi.setSystemTime(t + SHOW_MS);
+    b.croupier.tickAutoCroupier(TABLE);
+    expect(b.casino.readTableState(TABLE)).toMatchObject({ phase: 'betting', round: 5 });
+  });
+
+  it('and a craps window likewise', () => {
+    const table = 'craps-1';
+    const { CRAPS_BET_WINDOW_MS } = a.craps;
+    a.casino.writeCrapsFairnessPref(table, 'rng');
+    a.craps.openCrapsBetting(table, 1, null);
+    a.casino.writeMyCrapsBets(table, bettor, [{ type: 'pass', amount: 10 }]);
+    a.craps.tickAutoStickman(table);
+    expect(a.casino.readCrapsTableState(table)!.phaseDeadline).toBe(aNow + CRAPS_BET_WINDOW_MS);
+    const t = bTakesOver();
+    b.craps.tickAutoStickman(table);
+    expect(b.casino.readCrapsTableState(table)!.phaseDeadline).toBe(t + CRAPS_BET_WINDOW_MS);
+    vi.setSystemTime(t + CRAPS_BET_WINDOW_MS);
+    b.craps.tickAutoStickman(table);
+    expect(b.casino.readCrapsTableState(table)?.phase).toBe('closing');
   });
 });
 

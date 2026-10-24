@@ -21,9 +21,9 @@
  *    yours that may come down back at once; right-click puts the hand back. When the
  *    dice come to you, grab them and fling them across the table.
  *
- * THE RULES OF MONEY DO NOT CHANGE: a chip is spent (casinoDoc.spendChips)
- * the moment it lands on the felt, exactly as the popups did; the hand is a
- * local view of chips still in your balance. The settle, the payouts and the
+ * THE RULES OF MONEY: a chip on the felt stays yours, held there by your bet
+ * list, until the round settles (casinoDoc STAKES ON THE FELT); the hand is
+ * a local view of chips still in your balance. The settle, the payouts and the
  * shooter rotation stay with the elected operator (croupier.ts /
  * crapsCroupier.ts). The fling is cosmetic: the dice faces come from the
  * table's fairness mode, and every client animates the same throw from the
@@ -32,17 +32,17 @@
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
+  casinoDocEpoch, clearMySeat, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
-  spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
+  subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
   writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
 } from './casinoDoc';
 import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH, TAKE_DOWN_R } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
-import { closeBetting, isCroupierLive, openBetting, rollAndSettle, ROULETTE_PAGE_ID } from './croupier';
+import { closeBetting, isCroupierLive, openBetting, rollAndSettle, ROULETTE_PAGE_ID, SPIN_TAKEOVER_MS } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -79,9 +79,6 @@ export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { te
     : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F28B87', fair: false };
 }
 
-/** 🎡 A rival house member's SPIN lease is honoured this long before this
- *  page may take the round over (the reveal wait plus a margin). */
-const SPIN_TAKEOVER_MS = 15_000;
 /** How long a fresh lease write gets to converge before its page settles. */
 const LEASE_SETTLE_MS = 600;
 
@@ -861,7 +858,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         return;
       }
     }
-    if (!spendChips(me, sumOf(chips))) {
+    // 🪙 The chips stay yours, held on the felt by the list, until the round
+    // settles (casinoDoc STAKES ON THE FELT): nothing is taken here.
+    if (readChips(me) < sumOf(chips)) {
       say('NOT ENOUGH CHIPS — VISIT THE CASHIER');
       refreshRail();
       return;
@@ -913,8 +912,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       }
     }
     if (back.length === 0) return false;
+    // Off the list, the chips are no longer held: they're back on your rail.
     writeBets(keep);
-    creditChips(me, sumOf(back));
     added.delete(key);
     // An empty hand picks them up; a loaded hand is already the stake you're
     // betting with, so they just go back to the rail.
@@ -944,9 +943,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     // The chips slide back across the felt to your rail as they come off.
     if (railSplit) h?.sweepToRail({ x: railSplit.chips.x, z: railSplit.chips.z });
-    writeBets(keep);
+    writeBets(keep); // the list stops holding them: back on your rail
     const total = sumOf(back.map((b) => b.amount));
-    creditChips(me, total);
     for (const b of back) added.delete(spotKey(b));
     saveLedger();
     say(keep.length > 0

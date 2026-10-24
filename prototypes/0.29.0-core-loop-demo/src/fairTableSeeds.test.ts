@@ -408,7 +408,7 @@ describe('a Fair roulette round', () => {
     expect(s.houseCommit).toBeTruthy();
   });
 
-  it('a void round refunds only the frozen stake, not a list inflated after the close', async () => {
+  it('a void round gives back no list inflated after the close: it loses what it held then', async () => {
     const t = freshTable();
     tickAutoCroupier(t);
     writeTableState(t, { ...readTableState(t)!, houseCommit: 'f'.repeat(64) });
@@ -419,12 +419,13 @@ describe('a Fair roulette round', () => {
     tickAutoCroupier(t);
     playersLook(t, 'roulette', [AMY]);
     writeMyBets(t, AMY, 1, [{ type: 'red', amount: 90 }]); // rewritten after the close
-    const before = readChips(AMY);
+    expect(readChips(AMY)).toBe(10); // the 90 held on the felt
     later(CLOSING_MS);
     tickAutoCroupier(t);
     await flush();
     expect(readTableState(t)).toMatchObject({ phase: 'settled', voided: true });
-    expect(readChips(AMY)).toBe(before);
+    // The 10 frozen at the close are lost; the 80 it grew by were never taken.
+    expect(readChips(AMY)).toBe(90);
   });
 
   it("a void round refunds a bettor who never revealed, too", async () => {
@@ -651,6 +652,7 @@ describe('a Fair roulette round', () => {
   it('a bet that missed the freeze is returned, not lost', async () => {
     const t = freshTable();
     rouletteToClosing(t);
+    buyInChips('player-Late', 7);
     writeMyBets(t, 'player-Late', 1, [{ type: 'red', amount: 7 }]); // lands just after the close
     playersLook(t, 'roulette');
     const before = readChips('player-Late');

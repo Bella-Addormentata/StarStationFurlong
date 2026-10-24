@@ -31,6 +31,7 @@
  */
 
 import {
+  betsHeld,
   casinoDocEpoch,
   clearTableKeys,
   creditTableOutcome,
@@ -51,7 +52,10 @@ import type { RouletteTableState } from './games/roulette';
 import { settleParties } from './games/diceFairness';
 import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the house + bettors' seed exchange (fairTableSeeds.ts).
-import { freezeCommits, frozenFields, frozenPartiesSigned, frozenWagers, gatherRound, isFairTable, newHouseCommit, settledRound } from './fairTableSeeds';
+import {
+  freezeCommits, frozenFields, frozenPartiesSigned, frozenWagers, gatherRound, heldAtClose, isFairTable, newHouseCommit,
+  settledRound,
+} from './fairTableSeeds';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet table never spins nothing). */
@@ -61,6 +65,10 @@ export const CLOSING_MS = 3_000;
 /** How long the settled result + payouts stay up before the next round opens
  *  (≥ the 4 s local wheel animation, so the number lingers after it stops). */
 export const SHOW_MS = 9_000;
+/** 🎡 A house member's SPIN lease is honoured this long before another page
+ *  (a house member's SPIN, or the robot) may take the round over: the reveal
+ *  wait plus a margin. Measured on the taking page's own clock. */
+export const SPIN_TAKEOVER_MS = 15_000;
 /** Operator heartbeat cadence — how often the driver refreshes `croupier:<id>`. */
 export const HEARTBEAT_MS = 3_000;
 /** A beat older than this ⇒ the operator is gone; fall back to manual controls. */
@@ -246,19 +254,30 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // pocket computable; a rewritten list is void), and a bettor who committed
   // but never revealed forfeits this round's bets.
   const live = readAllBets(tableId, round);
-  const { bets, omitted } = frozenWagers(tableId, before, live);
+  const { bets, omitted, voided: rewritten } = frozenWagers(tableId, before, live);
   // (A void round produced no pocket, so nobody's reveal mattered: no forfeits.)
   if (!voided) for (const pid of forfeited) delete bets[pid];
-  // A void round returns every stake on it; otherwise a bet that missed the
-  // freeze (it arrived just after "no more bets") goes back to its bettor.
-  const refunds: Record<string, number> = {};
-  // (A list rewritten after the close is refunded by nobody: its frozen
-  // amounts can't be rebuilt from the hash, and the rewrite could inflate them.)
-  for (const pid of voided ? [...Object.keys(bets), ...omitted] : omitted) {
-    const sum = live[pid].reduce((n, b) => n + b.amount, 0);
-    if (sum > 0) refunds[pid] = sum;
-  }
   const payouts = result === null ? {} : resolveRound(bets, result);
+  // 🪙 What the round does to each bettor's chips (casinoDoc STAKES ON THE
+  // FELT). A held list hands its chips back as the round ends, so the settle
+  // takes what it held and pays what it won. An earlier build's list took
+  // its chips when it went down, so its win is paid in full, and a stake the
+  // round gives back is refunded.
+  const owed: Record<string, number> = {};
+  for (const [pid, list] of Object.entries(live)) {
+    const staked = list.reduce((n, b) => n + b.amount, 0);
+    const held = heldAtClose(tableId, before, pid, staked);
+    let delta: number;
+    // A bet that missed the freeze (it arrived just after "no more bets"),
+    // or any bet on a void round, goes back to its bettor.
+    if (omitted.includes(pid) || (voided && !rewritten.includes(pid))) delta = held > 0 ? 0 : staked;
+    // A list rewritten after the close is lost as it was frozen (the
+    // rewrite could shrink it), and never paid.
+    else if (rewritten.includes(pid)) delta = -held;
+    // (A forfeit wins nothing.)
+    else delta = (payouts[pid] ?? 0) - held;
+    if (delta !== 0) owed[pid] = delta;
+  }
   const now = Date.now();
   // One transaction: a page sees the settled round and what it paid together.
   transactCasino(() => {
@@ -280,11 +299,8 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
     settledRound(tableId, before);
-    // One credit per bettor for the round, its payout and refund together: a
-    // page that removed the table meanwhile refunds the same bettor instead,
-    // never as well (creditTableOutcome).
-    const owed: Record<string, number> = { ...payouts };
-    for (const [pid, amount] of Object.entries(refunds)) owed[pid] = (owed[pid] ?? 0) + amount;
+    // One change per bettor for the round, counted once however many pages
+    // settle it (creditTableOutcome).
     for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, before.inc ?? '', round, pid, amount);
   });
 }
@@ -314,6 +330,18 @@ export function openBetting(tableId: string, round: number): void {
   });
 }
 
+/** When this page first saw each table's current SPIN lease (its epoch, round
+ *  and holder), by this page's clock. */
+const spinSeen = new Map<string, { epoch: number; round: number; operator: string; at: number }>();
+
+function spinSeenAt(tableId: string, s: RouletteTableState, operator: string, now: number): number {
+  const epoch = casinoDocEpoch();
+  const seen = spinSeen.get(tableId);
+  if (seen && seen.epoch === epoch && seen.round === s.round && seen.operator === operator) return seen.at;
+  spinSeen.set(tableId, { epoch, round: s.round, operator, at: now });
+  return now;
+}
+
 /**
  * One operator tick for one table. Idempotent per frame — only writes on a real
  * transition. The window ARMS on the first bet (so an empty table stays quiet),
@@ -326,6 +354,21 @@ export function tickAutoCroupier(tableId: string): void {
   const s = readTableState(tableId);
   if (!s) {
     openBetting(tableId, 1);
+    return;
+  }
+  if (s.phase === 'closing' && s.operator !== undefined && s.operator !== ROULETTE_PAGE_ID) {
+    // A SPIN another page pressed: that page settles it. Only once the round
+    // has sat for SPIN_TAKEOVER_MS (that page is gone) does the robot take it
+    // over and finish it.
+    if (now - spinSeenAt(tableId, s, s.operator, now) >= SPIN_TAKEOVER_MS) {
+      writeTableState(tableId, { ...s, operator: ROULETTE_PAGE_ID });
+    }
+    return;
+  }
+  const span = s.phase === 'betting' ? BET_WINDOW_MS : s.phase === 'closing' ? CLOSING_MS : SHOW_MS;
+  const deadline = timerOnThisClock(s, span, now);
+  if (deadline !== s.phaseDeadline) {
+    writeTableState(tableId, { ...s, phaseDeadline: deadline });
     return;
   }
   if (s.phase === 'betting') {
@@ -346,17 +389,37 @@ export function tickAutoCroupier(tableId: string): void {
   }
 }
 
+/**
+ * ⏱ A phase deadline is the clock of the page that wrote it, and the page
+ * driving now may run far behind it (another of the owner's devices took the
+ * tables over): one further off than the whole phase is cut back to the
+ * phase's length on this clock, so no round waits on another clock. A round
+ * settled by hand (a SPIN on a page not driving, before the robot's first
+ * beat) gets its show beat, so the robot opens the next. Otherwise the
+ * deadline as it is (none on an idle betting window).
+ */
+export function timerOnThisClock(
+  s: { phase: 'betting' | 'closing' | 'settled'; phaseDeadline?: number },
+  spanMs: number,
+  now: number,
+): number | undefined {
+  if (s.phaseDeadline != null && s.phaseDeadline > now + spanMs) return now + spanMs;
+  if (s.phase === 'settled' && s.phaseDeadline == null) return now + spanMs;
+  return s.phaseDeadline;
+}
+
 // ── Heartbeat (operator liveness, for the UI + narration) ─────────────────────
 
 /**
- * Tear a table down cleanly on removal from a room. Safe to call on any client:
- * the REFUND of an unresolved round (stakes were debited at placement, and once
- * the records vanish there is no other credit-back path) runs ONLY on the deed
- * holder's pages (canRunCroupier), and counts once however many of them run it
- * (creditTableOutcome); every client then wipes the table's casino keys (idempotent LWW delete) so no
- * orphan records survive. In a manual venture/legacy room there is no operator,
- * so stakes are not refunded (matches the manual-mode limitation) — the keys are
- * still cleared.
+ * Tear a table down cleanly on removal from a room. Safe to call on any client.
+ * Stakes held on the felt go back to their players as the lists go. The REFUND
+ * of an earlier build's lists on an unresolved round (it took their chips, and
+ * once the records vanish there is no other credit-back path) runs ONLY on the
+ * deed holder's pages (canRunCroupier), and counts once however many of them
+ * run it (creditTableOutcome); every client then wipes the table's casino
+ * keys (idempotent LWW delete) so no orphan records survive. In a manual
+ * venture/legacy room there is no operator, so an earlier build's stakes are
+ * not refunded (matches the manual-mode limitation); held ones still go back.
  */
 export function closeTable(tableId: string): void {
   // One transaction: no page sees the refunds without the table gone.
@@ -364,11 +427,12 @@ export function closeTable(tableId: string): void {
     const s = readTableState(tableId);
     if (canRunCroupier() && s && s.phase !== 'settled') {
       for (const [pid, bets] of Object.entries(readAllBets(tableId, s.round))) {
-        const staked = bets.reduce((sum, b) => sum + b.amount, 0);
-        // Each of the deed holder's pages runs this, whichever removed the
-        // table first, and the page driving it may be settling this very
-        // round: the table's one outcome per bettor pays one of them.
-        creditTableOutcome(tableId, s.inc ?? '', 'end', pid, staked);
+        // A held stake goes back with its list. An earlier build's list took
+        // its chips: each of the deed holder's pages refunds it, whichever
+        // removed the table first, and the page driving it may be settling
+        // this very round: the table's one outcome per bettor pays one.
+        if (betsHeld(tableId, pid)) continue;
+        creditTableOutcome(tableId, s.inc ?? '', 'end', pid, bets.reduce((sum, b) => sum + b.amount, 0));
       }
     }
     clearTableKeys(tableId);
