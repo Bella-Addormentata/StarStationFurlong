@@ -280,6 +280,22 @@ export interface PowerRecord {
 
 export const POWER_DEFAULT: PowerRecord = { on: false, seq: 0, parkMs: null };
 
+/** The clock's beat, in a key of its own (`beat:`), never in the
+ *  programme's: anyone's press writes the programme (#258), and a beat
+ *  written there concurrently with a press could stand in its place (one
+ *  record, the last writer wins), a PAUSE undone by a sample from before
+ *  it. A beat counts only for the programme action it was taken under
+ *  (`started`, `jump`) and only while newer than the record's own sample
+ *  (`seq`); readProgramme lays it over the record, so a reader sees the
+ *  room as one record, as before. */
+export interface BeatRecord {
+  started: number;
+  jump: number;
+  seq: number;
+  positionMs: number;
+  at: number;
+}
+
 // ── Binding (the partyDoc shape) ─────────────────────────────────────────────
 
 let boundDoc: Y.Doc | null = null;
@@ -549,8 +565,9 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       }
       continue;
     }
-    if (!key.startsWith('tv:')) continue;
-    const itemId = key.slice(3);
+    // A beat is a new sample of its set's programme (readProgramme lays it over).
+    const itemId = key.startsWith('tv:') ? key.slice(3) : key.startsWith('beat:') ? key.slice(5) : null;
+    if (itemId === null) continue;
     const rec = readProgramme(itemId);
     const prev = samples.get(itemId);
     if (!prev || prev.seq !== rec.seq) {
@@ -658,6 +675,9 @@ export function volumeKey(itemId: string): string {
 export function powerKey(itemId: string): string {
   return `power:${itemId}`;
 }
+export function beatKey(itemId: string): string {
+  return `beat:${itemId}`;
+}
 
 // ── Identity and host seams (registered by main.ts, never asserted by a caller) ──
 
@@ -759,8 +779,42 @@ export function isHttpUrl(s: string): boolean {
 
 const STATES: ReadonlySet<string> = new Set(['off', 'home', 'scheduled', 'playing', 'paused']);
 
-/** The `tv:` key as a peer may have written it: the programme alone. */
+/** The programme as the room has it: the `tv:` key as a peer may have
+ *  written it, with the clock's latest beat for that programme action laid
+ *  over it (BeatRecord). */
 export function readProgramme(itemId: string): TvProgramme {
+  const rec = readRecord(itemId);
+  const beat = readBeat(itemId);
+  if (!beat || !rec.source || (rec.state !== 'playing' && rec.state !== 'scheduled')) return rec;
+  if (beat.started !== rec.started || beat.jump !== rec.jump || !seqAfter(beat.seq, rec.seq)) return rec;
+  // The first beat past T0 is also the schedule's flip to playing.
+  return { ...rec, state: 'playing', startAt: 0, positionMs: beat.positionMs, at: beat.at, seq: beat.seq };
+}
+
+/** `next` is a later revision than `prev`: at most half the counter's range
+ *  ahead, so a bump past the ceiling is still later (bump), and a record a
+ *  page without beat keys beat into since is not taken back to an older
+ *  beat. */
+function seqAfter(next: number, prev: number): boolean {
+  if (next === prev) return false;
+  const ahead = next - prev < 0 ? next - prev + TV_COUNTER_MAX + 1 : next - prev;
+  return ahead <= (TV_COUNTER_MAX + 1) / 2;
+}
+
+function readBeat(itemId: string): BeatRecord | null {
+  const raw = ensureMap().get(beatKey(itemId)) as Partial<BeatRecord> | undefined;
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    started: counter(raw.started),
+    jump: counter(raw.jump),
+    seq: counter(raw.seq),
+    positionMs: Math.max(0, num(raw.positionMs)),
+    at: Math.max(0, Math.floor(num(raw.at))),
+  };
+}
+
+/** The `tv:` key as a peer may have written it: the programme alone. */
+function readRecord(itemId: string): TvProgramme {
   const raw = ensureMap().get(tvKey(itemId)) as Partial<TvProgramme> | undefined;
   if (!raw || typeof raw !== 'object') return { ...TV_DEFAULT_PROGRAMME };
   const source = sanitizeSource(raw.source);
@@ -938,7 +992,19 @@ export function putDownRemote(itemId: string): TvAction {
  *  and before the programme's write, so the clock's page is the presser's
  *  as every page sees the change. */
 function press(itemId: string): TvAction {
+  if (!pressesOpen) return { ok: false, error: 'Leaving this room.' };
   return iHoldRemote(itemId) ? { ok: true } : pickUpRemote(itemId);
+}
+
+/** Presses belong to the room this page is in (tvSession: closed as the
+ *  room is left, open again once the next one is armed). A press needs
+ *  nothing held first, so an archive.org lookup or an upload that started
+ *  before a leave and lands during its flush would otherwise take the
+ *  departed room's clock and change its programme; landing after the next
+ *  room is bound, it is void already (tvDocEpoch). */
+let pressesOpen = true;
+export function setTvPressesOpen(open: boolean): void {
+  pressesOpen = open;
 }
 
 /** What only the clock's page writes — its player's beat, the media's end
@@ -1114,21 +1180,22 @@ function noteInLibrary(source: TvSource, now: number, torrent?: TvTorrentOrigin)
   for (const { key: k } of keys.slice(TV_LIBRARY_MAX)) map.delete(k);
 }
 
-/** The holder's heartbeat while playing, and the T0 flip from scheduled. */
+/** The clock page's heartbeat while playing, and the T0 flip from
+ *  scheduled: into the beat's own key (BeatRecord), under the programme
+ *  action it was taken under. */
 export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   if (!readPower(itemId).on) return { ok: false, error: 'The set is off.' };
   const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'scheduled') return { ok: false, error: 'Nothing is playing.' };
-  write(tvKey(itemId), {
-    ...rec,
-    state: 'playing',
-    startAt: 0,
+  write(beatKey(itemId), {
+    started: rec.started,
+    jump: rec.jump,
+    seq: bump(rec.seq),
     positionMs: Math.max(0, Math.floor(positionMs)),
     at: wallClock(),
-    seq: bump(rec.seq),
-  } satisfies TvProgramme);
+  } satisfies BeatRecord);
   return { ok: true };
 }
 
@@ -1249,6 +1316,7 @@ export function tvStop(itemId: string): TvAction {
  *  was, to resume from. */
 export function tvTogglePower(itemId: string, now = clock()): boolean {
   const power = readPower(itemId);
+  if (!pressesOpen) return power.on; // the room is being left (press)
   if (!power.on && !iHoldRemote(itemId)) pickUpRemote(itemId, now);
   // Going off: where the room is, by this page's own reading
   // (roomPositionMs: a programme playing, or a schedule past its T0 —
