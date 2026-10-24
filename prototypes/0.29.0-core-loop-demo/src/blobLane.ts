@@ -383,6 +383,15 @@ export function nodeHolders(hash: string): string[] | null {
   return known && known.room === room ? known.ids : null;
 }
 
+/** The same, only while the answer is fresh (asked within WHERE_POLL_MS),
+ *  else null: for an ask that names them once and for good (the theatre's
+ *  AUTO-FETCH), where an answer from long ago — nobody held it then, or
+ *  members since gone — would leave out the host that holds it now. */
+export function freshNodeHolders(hash: string, now = performance.now()): string[] | null {
+  const known = holdersHere.get(hash);
+  return known && known.room === room && now - known.at < WHERE_POLL_MS ? known.ids : null;
+}
+
 /** 🗑 Let a whole file go from this page's node (the room's library entry
  *  stays). Null when it went, else why not. */
 export async function forgetBlob(hash: string): Promise<string | null> {

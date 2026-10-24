@@ -37,7 +37,7 @@ import {
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
 import {
-  blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, nodeHolders, recheckBlob, refreshHolders,
+  blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, freshNodeHolders, recheckBlob, refreshHolders,
 } from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
@@ -918,8 +918,9 @@ const AUTO_FETCH_WHERE_WAIT_MS = 5_000;
  *
  *  One at a time: none while the last ask is out, nor while the file it
  *  asked for is anything but done with (complete, failed, or not taken).
- *  And not before WHERE has said which of the room's connected nodes hold
- *  it, or a few seconds have passed without an answer: the one ask names
+ *  And not before WHERE has said lately which of the room's connected nodes
+ *  hold it (an answer due to be asked again is no answer for now), or a few
+ *  seconds have passed without one: the one ask names
  *  them (fetchBlob), so a newcomer whose provider has left still takes the
  *  file from the room's host or a viewer who has it. */
 function autoFetch(source: Extract<TvSource, { kind: 'blob' }>, st: BlobState): void {
@@ -929,7 +930,7 @@ function autoFetch(source: Extract<TvSource, { kind: 'blob' }>, st: BlobState): 
     if (prev !== 'complete' && prev !== 'failed' && prev !== 'none') return;
   }
   if (autoFetchVerdict(source.hash, source.size) !== 'go') return;
-  if (nodeHolders(source.hash) === null) {
+  if (freshNodeHolders(source.hash) === null) {
     void refreshHolders([source.hash]);
     const now = tvNow();
     const epoch = tvDocEpoch();
