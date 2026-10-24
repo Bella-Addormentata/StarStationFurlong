@@ -36,7 +36,9 @@ import {
   redirectVerdict, TV_MOUNT_BUDGET,
 } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
-import { blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, recheckBlob, refreshHolders } from './blobLane';
+import {
+  blobLaneReady, blobNodeTag, blobState, blobUrl, fetchBlob, formatBytes, nodeHolders, recheckBlob, refreshHolders,
+} from './blobLane';
 import type { BlobState } from './blobLane';
 import { escapeHtml } from './htmlEscape';
 import { attachScreenHost, detachScreenHost, setScreenHostShown } from './tvScreenLayer';
@@ -900,25 +902,45 @@ let blobAskRefused: { hash: string; why: string } | null = null;
 /** The file AUTO-FETCH last asked for: no second is asked for while it is
  *  still on its way. */
 let autoFetching: string | null = null;
+/** Its ask is still out to the node (the transfer's state says nothing yet). */
+let autoFetchAsking = false;
+/** When this page began waiting for WHERE's answer on the file on the set. */
+let autoFetchWhere: { hash: string; since: number } | null = null;
+/** How long AUTO-FETCH waits for WHERE before asking the provider alone. */
+const AUTO_FETCH_WHERE_WAIT_MS = 5_000;
 
 /** 📦 AUTO-FETCH (tvAutoFetch): a file this viewer's node has never been
  *  asked for ('none') is asked for without a press, within the viewer's cap,
  *  budget and switch, once per file per page. A transfer that failed keeps
  *  its FETCH button and its reason, and one still unknown waits for the
- *  node's answer. */
+ *  node's answer.
+ *
+ *  One at a time: none while the last ask is out, nor while the file it
+ *  asked for is anything but done with (complete, failed, or not taken).
+ *  And not before WHERE has said which of the room's connected nodes hold
+ *  it, or a few seconds have passed without an answer: the one ask names
+ *  them (fetchBlob), so a newcomer whose provider has left still takes the
+ *  file from the room's host or a viewer who has it. */
 function autoFetch(source: Extract<TvSource, { kind: 'blob' }>, st: BlobState): void {
-  if (st.state !== 'none') return;
+  if (st.state !== 'none' || autoFetchAsking) return;
   if (autoFetching !== null && autoFetching !== source.hash) {
     const prev = blobState(autoFetching).state;
-    if (prev === 'queued' || prev === 'fetching') return;
+    if (prev !== 'complete' && prev !== 'failed' && prev !== 'none') return;
   }
   if (autoFetchVerdict(source.hash, source.size) !== 'go') return;
+  if (nodeHolders(source.hash) === null) {
+    void refreshHolders([source.hash]);
+    const now = tvNow();
+    if (autoFetchWhere?.hash !== source.hash) autoFetchWhere = { hash: source.hash, since: now };
+    if (now - autoFetchWhere.since < AUTO_FETCH_WHERE_WAIT_MS) return;
+  }
   noteAutoFetch(source.hash, source.size);
   autoFetching = source.hash;
+  autoFetchAsking = true;
   void fetchBlob(source.hash, source.size, source.provider, source.mime ?? '').then((refused) => {
     // Kept for the notice the next tick draws: FETCH, with why.
     blobAskRefused = refused ? { hash: source.hash, why: refused } : null;
-  });
+  }).finally(() => { autoFetchAsking = false; });
 }
 
 /** 📦 A blob this viewer's node does not hold whole yet: where it is, and

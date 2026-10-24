@@ -10,9 +10,11 @@ import {
 
 const store = new Map<string, string>();
 let throwing = false;
+/** Writes only: a full quota, reads still answering. */
+let full = false;
 (globalThis as { localStorage?: unknown }).localStorage = {
   getItem: (k: string) => { if (throwing) throw new Error('blocked'); return store.get(k) ?? null; },
-  setItem: (k: string, v: string) => { if (throwing) throw new Error('blocked'); store.set(k, v); },
+  setItem: (k: string, v: string) => { if (throwing || full) throw new Error('blocked'); store.set(k, v); },
   removeItem: (k: string) => { store.delete(k); },
 };
 
@@ -22,6 +24,7 @@ const hash = (n: number) => n.toString(16).padStart(64, '0');
 beforeEach(() => {
   store.clear();
   throwing = false;
+  full = false;
   resetAutoFetchForTest();
 });
 
@@ -89,5 +92,44 @@ describe('AUTO-FETCH', () => {
     const t0 = 1_800_000_000_000;
     noteAutoFetch(hash(1), 8 * GB, t0);
     expect(autoFetchVerdict(hash(2), 1, t0 + 1)).toBe('day');
+  });
+
+  it('holds where storage reads but will not write (its quota full): the switch turned off stays off, and the spend still counts', () => {
+    const t0 = 1_800_000_000_000;
+    noteAutoFetch(hash(1), 4 * GB, t0); // kept in storage
+    full = true;
+    setAutoFetchOn(false);
+    expect(autoFetchOn()).toBe(false); // storage still says on; this page said off
+    expect(autoFetchVerdict(hash(2), GB, t0 + 1)).toBe('off');
+    setAutoFetchOn(true);
+    noteAutoFetch(hash(2), 2 * GB, t0 + 1); // storage would not take it
+    noteAutoFetch(hash(3), 2 * GB, t0 + 2);
+    expect(autoFetchSpent(t0 + 3)).toBe(8 * GB);
+    expect(autoFetchVerdict(hash(4), 1, t0 + 3)).toBe('day');
+    full = false;
+    noteAutoFetch(hash(4), 0, t0 + 4); // the next write storage takes keeps all of it
+    resetAutoFetchForTest(); // another page
+    expect(autoFetchSpent(t0 + 5)).toBe(8 * GB);
+    setAutoFetchOn(false);
+    full = true;
+    setAutoFetchOn(true);
+    expect(autoFetchOn()).toBe(true);
+    full = false;
+    setAutoFetchOn(false);
+    expect(autoFetchOn()).toBe(false); // a write taken: storage speaks again
+  });
+
+  it('never forgets a spend to keep its record short: a hundred small files still add up to the day\'s budget', () => {
+    const t0 = 1_800_000_000_000;
+    const small = 100 * 2 ** 20;
+    let n = 0;
+    while (n < 200 && autoFetchVerdict(hash(n + 1), small, t0 + n) === 'go') {
+      noteAutoFetch(hash(n + 1), small, t0 + n);
+      n++;
+    }
+    expect(n).toBe(Math.floor(TV_AUTO_FETCH_DAY / small)); // 81 files, past the 64 entries kept
+    expect(autoFetchVerdict(hash(n + 1), small, t0 + n)).toBe('day');
+    expect(autoFetchSpent(t0 + n)).toBe(n * small);
+    expect((JSON.parse(store.get('ssf-tv-auto-fetch-spent')!) as unknown[]).length).toBeLessThanOrEqual(64);
   });
 });

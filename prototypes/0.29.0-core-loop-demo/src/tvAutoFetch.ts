@@ -28,46 +28,81 @@ export const TV_AUTO_FETCH_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const SWITCH_KEY = 'ssf-tv-auto-fetch';
 const SPENT_KEY = 'ssf-tv-auto-fetch-spent';
-/** Entries kept: well past what the budget allows in a day at any size. */
+/** Entries kept: the oldest are folded together past this (compact), never
+ *  dropped, so the record stays small and every byte still counts. */
 const SPENT_MAX = 64;
 
 interface Spend {
   at: number;
   size: number;
+  /** The file's first digits: two asks for the same file at the same
+   *  moment, read from storage and from this page, are one. */
+  h: string;
 }
 
-/** The session's copy, used only where this browser's storage throws (a
- *  private window, blocked site data): the switch and the day's spend
- *  still hold for this page. Otherwise storage is read every time, so two
- *  tabs share one budget and one switch. */
+/** What this page could not keep in storage — one that throws on every
+ *  call (a private window, blocked site data), or only on a write (its
+ *  quota full) — and that holds for this page all the same: its switch
+ *  over what storage says, its spend on top of what storage holds. Cleared
+ *  by the next write that storage takes. Otherwise storage is read every
+ *  time, so two tabs share one budget and one switch. */
 let switchHere: boolean | null = null;
 let spentHere: Spend[] | null = null;
 /** The files this page has asked for by itself. */
 const asked = new Set<string>();
 
 export function autoFetchOn(): boolean {
-  try { return localStorage.getItem(SWITCH_KEY) !== '0'; } catch { return switchHere ?? true; }
+  if (switchHere !== null) return switchHere;
+  try { return localStorage.getItem(SWITCH_KEY) !== '0'; } catch { return true; }
 }
 
 export function setAutoFetchOn(on: boolean): void {
-  try { localStorage.setItem(SWITCH_KEY, on ? '1' : '0'); } catch { switchHere = on; }
+  try {
+    localStorage.setItem(SWITCH_KEY, on ? '1' : '0');
+    switchHere = null;
+  } catch {
+    switchHere = on;
+  }
 }
 
-function readSpent(now: number): Spend[] {
-  let list: unknown;
-  try {
-    list = JSON.parse(localStorage.getItem(SPENT_KEY) ?? '[]');
-  } catch {
-    list = spentHere ?? []; // storage that throws, or a value that is not JSON (then nothing is known spent)
-  }
+function spends(list: unknown): Spend[] {
   if (!Array.isArray(list)) return [];
   return list
     .filter((e): e is Spend => !!e && typeof e === 'object'
       && Number.isFinite((e as Spend).at) && Number.isSafeInteger((e as Spend).size) && (e as Spend).size >= 0)
+    .map((e) => ({ at: e.at, size: e.size, h: typeof e.h === 'string' ? e.h.slice(0, 16) : '' }));
+}
+
+/** At most SPENT_MAX entries, oldest first: the two oldest are folded into
+ *  one stamped at the later of them, so a spend is never forgotten, only
+ *  counted a little longer than its day. */
+function compact(list: Spend[]): Spend[] {
+  const out = [...list].sort((a, b) => a.at - b.at);
+  while (out.length > SPENT_MAX) {
+    const [a, b] = out.splice(0, 2);
+    out.unshift({ at: b.at, size: Math.min(Number.MAX_SAFE_INTEGER, a.size + b.size), h: b.h });
+  }
+  return out;
+}
+
+function readSpent(now: number): Spend[] {
+  let stored: unknown = [];
+  try {
+    stored = JSON.parse(localStorage.getItem(SPENT_KEY) ?? '[]');
+  } catch {
+    stored = []; // storage that throws (then spentHere is all there is), or a value that is not JSON
+  }
+  const seen = new Set<string>();
+  return compact([...spends(stored), ...(spentHere ?? [])]
     // A spend stamped ahead of now (a clock set back) still counts until it
     // is a day old by the clock as it reads now: never forgotten early.
     .filter((e) => now - e.at < TV_AUTO_FETCH_WINDOW_MS)
-    .slice(-SPENT_MAX);
+    .filter((e) => {
+      const k = `${e.at}:${e.size}:${e.h}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    }));
 }
 
 /** What this browser has fetched by itself in the last day, in bytes. */
@@ -90,9 +125,13 @@ export function autoFetchVerdict(hash: string, size: number, now = Date.now()): 
  *  never asked for by itself again from this page. */
 export function noteAutoFetch(hash: string, size: number, now = Date.now()): void {
   asked.add(hash);
-  const list = [...readSpent(now), { at: now, size }].slice(-SPENT_MAX);
-  spentHere = list;
-  try { localStorage.setItem(SPENT_KEY, JSON.stringify(list)); } catch { /* session-only: spentHere */ }
+  const list = compact([...readSpent(now), { at: now, size, h: hash.slice(0, 16) }]);
+  try {
+    localStorage.setItem(SPENT_KEY, JSON.stringify(list));
+    spentHere = null;
+  } catch {
+    spentHere = list;
+  }
 }
 
 /** Tests: a fresh page. */
