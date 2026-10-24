@@ -32,8 +32,10 @@
 
 import {
   casinoDocEpoch,
+  chipEventDigest,
   clearTableKeys,
   creditChips,
+  creditChipsOnce,
   readAllBets,
   readCroupierBeat,
   readTableOperatorLease,
@@ -149,17 +151,12 @@ export function takeTableTurn(
   return now - leaseClaimedAt >= TABLE_LEASE_SETTLE_MS;
 }
 
-/** Is this page the one that settles for the tables now (it holds the lease,
- *  or nobody of this player's does)? Read-only: a table's teardown refund
- *  runs only here, so it is paid once. */
-export function holdsTableTurn(
-  now = Date.now(),
-  playerId = getPlayerId(),
-  pageId = ROULETTE_PAGE_ID,
-): boolean {
+/** Does this page still drive the auto tables (no lease at all, or its own)?
+ *  An auto settle checks it again after its awaits, so a page that lost the
+ *  lease meanwhile writes no result and pays nothing. */
+export function stillDrivesTables(pageId = ROULETTE_PAGE_ID): boolean {
   const lease = readTableOperatorLease();
-  noteLease(lease, now);
-  return lease?.page === pageId || leaseIsFree(lease, now, playerId);
+  return lease === null || lease.page === pageId;
 }
 
 // ── Random pocket (operator-side; an RNG table, or nobody revealed) ──────────
@@ -242,6 +239,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // 🎡 A manual round settles only on the page holding its lease: two house
   // members pressing SPIN must not both publish and pay.
   if (before.operator !== undefined && before.operator !== ROULETTE_PAGE_ID) return;
+  // 🤖 An auto round settles only on the page still driving the tables: the
+  // hashing can outlive its lease (another of the owner's pages took over).
+  if (before.operator === undefined && !stillDrivesTables()) return;
   // ⚖️ Only the wagers frozen at "no more bets" settle (the reveals made the
   // pocket computable; a rewritten list is void), and a bettor who committed
   // but never revealed forfeits this round's bets.
@@ -350,12 +350,14 @@ export function tickAutoCroupier(tableId: string): void {
  * still cleared.
  */
 export function closeTable(tableId: string): void {
-  if (canRunCroupier() && holdsTableTurn()) {
+  if (canRunCroupier()) {
     const s = readTableState(tableId);
     if (s && s.phase !== 'settled') {
       for (const [pid, bets] of Object.entries(readAllBets(tableId, s.round))) {
         const staked = bets.reduce((sum, b) => sum + b.amount, 0);
-        if (staked > 0) creditChips(pid, staked);
+        // Each of the deed holder's pages runs this, whichever removed the
+        // table first: the refund is keyed by the bets it returns, so it counts once.
+        if (staked > 0) creditChipsOnce(`teardown:${tableId}:${s.round}:${chipEventDigest(bets)}`, pid, staked);
       }
     }
   }

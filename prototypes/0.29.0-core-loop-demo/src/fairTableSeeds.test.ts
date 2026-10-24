@@ -13,7 +13,7 @@ vi.stubGlobal('window', { location: { search: '' } });
 const {
   bindCasinoDoc, buyInChips, readAllCrapsBets, readChips, readCrapsTableState, readDiceThrow, readSeedRecord,
   readTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyBets, writeMyCrapsBets,
-  writeMySeedRecord, writeTableState,
+  writeMySeedRecord, writeTableOperatorLease, writeTableState,
 } = await import('./casinoDoc');
 const {
   BET_WINDOW_MS, CLOSING_MS, rollAndSettle, ROULETTE_PAGE_ID, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier,
@@ -335,6 +335,21 @@ describe('a Fair roulette round', () => {
     await flush();
     expect(readTableState(t)?.phase).toBe('closing');
     writeTableState(t, { ...readTableState(t)!, operator: ROULETTE_PAGE_ID });
+    rollAndSettle(t, closing.round);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('settled');
+  });
+
+  it("an auto round isn't settled on a page another of the owner's pages took the tables from", async () => {
+    const t = freshTable();
+    const closing = rouletteToClosing(t);
+    playersLook(t, 'roulette');
+    later(CLOSING_MS);
+    writeTableOperatorLease({ page: 'owner-other-tab', player: 'owner', beat: 3 });
+    rollAndSettle(t, closing.round);
+    await flush();
+    expect(readTableState(t)?.phase).toBe('closing');
+    writeTableOperatorLease({ page: ROULETTE_PAGE_ID, player: 'owner', beat: 4 });
     rollAndSettle(t, closing.round);
     await flush();
     expect(readTableState(t)?.phase).toBe('settled');
@@ -986,6 +1001,22 @@ describe('a Fair craps roll', () => {
     playersLook(t, 'craps', [AMY]);
     const closing = readCrapsTableState(t)!;
     writeCrapsTableState(t, { ...closing, operator: 'player-Other:abc123' });
+    rollAndSettleCraps(t, closing.round, closing.point);
+    await flush();
+    expect(readCrapsTableState(t)?.phase).toBe('closing');
+  });
+
+  it("an auto craps roll isn't settled on a page another of the owner's pages took the tables from", async () => {
+    const t = freshTable();
+    tickAutoStickman(t);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    later(CRAPS_BET_WINDOW_MS);
+    tickAutoStickman(t);
+    playersLook(t, 'craps', [AMY]);
+    const closing = readCrapsTableState(t)!;
+    writeTableOperatorLease({ page: 'owner-other-tab', player: 'owner', beat: 3 });
     rollAndSettleCraps(t, closing.round, closing.point);
     await flush();
     expect(readCrapsTableState(t)?.phase).toBe('closing');

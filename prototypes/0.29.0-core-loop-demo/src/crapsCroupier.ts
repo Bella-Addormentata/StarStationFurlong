@@ -27,12 +27,13 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { canRunCroupier, holdsTableTurn } from './croupier';
+import { canRunCroupier } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
+  chipEventDigest,
   clearTableKeys,
-  creditChips,
+  creditChipsOnce,
   readAllCrapsBets,
   readCrapsFairnessPref,
   readCrapsTableState,
@@ -456,10 +457,13 @@ export function tickAutoStickman(tableId: string): void {
  * no operator, so stakes are not refunded (matches the manual-mode limitation).
  */
 export function closeCrapsTable(tableId: string): void {
-  if (canRunCroupier() && holdsTableTurn()) {
+  if (canRunCroupier()) {
+    const round = readCrapsTableState(tableId)?.round ?? 0;
     for (const [pid, bets] of Object.entries(readAllCrapsBets(tableId))) {
       const staked = bets.reduce((sum, b) => sum + b.amount, 0);
-      if (staked > 0) creditChips(pid, staked);
+      // Each of the deed holder's pages runs this: keyed by the bets it
+      // returns, the refund counts once (croupier.closeTable).
+      if (staked > 0) creditChipsOnce(`teardown:${tableId}:${round}:${chipEventDigest(bets)}`, pid, staked);
     }
   }
   clearTableKeys(tableId);

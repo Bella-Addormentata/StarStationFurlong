@@ -105,18 +105,32 @@ describe('two pages of the deed holder', () => {
 });
 
 describe('a table torn down on both pages', () => {
-  it('refunds the stakes on it once', () => {
-    const bettor = 'player-Carol';
+  const bettor = 'player-Carol';
+
+  function betAndShare(): void {
     a.casino.buyInChips(bettor, 100);
     a.croupier.openBetting(TABLE, 1);
     expect(a.casino.spendChips(bettor, 30)).toBe(true);
     a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
     turn(a, Date.now());
     sync(a.doc, b.doc);
-    expect(turn(b, Date.now())).toBe(false);
-    // Both pages remove the table (every client runs the teardown).
+    expect(turn(b, Date.now())).toBe(false); // a drives
+  }
+
+  it('refunds the stakes on it once, removed on both before either hears of the other', () => {
+    betAndShare();
     a.croupier.closeTable(TABLE);
     b.croupier.closeTable(TABLE);
+    sync(a.doc, b.doc);
+    expect(a.casino.readChips(bettor)).toBe(100);
+    expect(b.casino.readChips(bettor)).toBe(100);
+  });
+
+  it('refunds them once when the page not driving removes it first and the driver hears after', () => {
+    betAndShare();
+    b.croupier.closeTable(TABLE); // refunds, then clears the bets
+    sync(a.doc, b.doc);
+    a.croupier.closeTable(TABLE); // finds no bets left
     sync(a.doc, b.doc);
     expect(a.casino.readChips(bettor)).toBe(100);
     expect(b.casino.readChips(bettor)).toBe(100);

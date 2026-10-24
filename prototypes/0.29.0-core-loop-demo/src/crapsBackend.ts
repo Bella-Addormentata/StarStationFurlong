@@ -45,6 +45,7 @@ import type { FairnessTranscript } from './games/craps';
 // ⚖️ Fair by default: the live multiparty seed exchange (house + bettors).
 import { frozenFields, frozenWagers, gatherRound, roundSettleable, settledRound } from './fairTableSeeds';
 import { getPlayerId } from './identity';
+import { stillDrivesTables } from './croupier';
 
 /** This page, as a manual table's operator: player id plus a per-load nonce,
  *  so two tabs of one player are still two operators. */
@@ -162,6 +163,10 @@ class LocalCrapsBackend implements CrapsBackend {
     // 🎲 A manual roll settles only on the page still holding its lease: the
     // hashing can outlive it (a suspended tab another member took over from).
     if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return dice;
+    // 🤖 An auto roll settles only on the page still driving the tables
+    // (croupier.ts table-operator lease): another of the owner's pages may
+    // have taken over while this one hashed.
+    if (before.operator === undefined && !stillDrivesTables()) return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     // ⚖️ A bettor who committed but never revealed forfeits every bet on the

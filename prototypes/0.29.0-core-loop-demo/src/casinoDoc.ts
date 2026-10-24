@@ -405,6 +405,38 @@ export function creditChips(playerId: string, amount: number): void {
   addChips(playerId, amount);
 }
 
+/**
+ * Credit `amount` chips to `playerId` for one event that several pages may each
+ * carry out (every page of the deed holder's refunds a removed table). The
+ * record is keyed by the event, not the page, and holds the same value on
+ * every page, so doing it twice writes one record and it counts once. Build
+ * `eventKey` from what the credit is for, as every page sees it (chipEventDigest).
+ */
+export function creditChipsOnce(eventKey: string, playerId: string, amount: number): void {
+  if (!Number.isSafeInteger(amount) || amount <= 0 || playerId.length === 0 || playerId.length > 256) return;
+  const map = ensureChips();
+  const key = `once:${eventKey}:${playerId}`;
+  const stored = map.get(key);
+  if (isChipRecord(stored) && stored.p === playerId && stored.d === amount) return;
+  const rec: ChipRecord = { p: playerId, d: amount, b: 0, c: 0, at: 0 };
+  boundDoc!.transact(() => {
+    map.set(key, rec);
+    recountChipKey(chipIndex, map, key);
+  });
+}
+
+/** A short digest of a synced value (FNV-1a over its JSON), the same on every
+ *  page that holds it: names what a creditChipsOnce credit is for. */
+export function chipEventDigest(value: unknown): string {
+  const text = JSON.stringify(value) ?? '';
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36);
+}
+
 /** Every chip record in the bound room (one per page per account), oldest
  *  change first (the history behind a balance; debugging). */
 export function readChipRecords(account?: string): ChipRecord[] {
