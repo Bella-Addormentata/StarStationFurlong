@@ -9,7 +9,7 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- **🔭 The room editor's floor grid stops at the cupola glass ([#PRNUM](https://github.com/Bella-Addormentata/StarStationFurlong/pull/PRNUM), follow-up to [#222](https://github.com/Bella-Addormentata/StarStationFurlong/pull/222)).** In a room with a cupola end wall, the 1 m grid shown while editing the room ran out to the room's old square corners, past the window. Each grid line now stops at the floor's real edge, with the corners at each cupola end cut at 45° as the floor is. In an oblong room the grid also no longer runs past the shorter walls.
+- **🔭 The room editor's floor grid stops at the cupola glass ([#296](https://github.com/Bella-Addormentata/StarStationFurlong/pull/296), follow-up to [#222](https://github.com/Bella-Addormentata/StarStationFurlong/pull/222)).** In a room with a cupola end wall, the 1 m grid shown while editing the room ran out to the room's old square corners, past the window. Each grid line now stops at the floor's real edge, with the corners at each cupola end cut at 45° as the floor is. In an oblong room the grid also no longer runs past the shorter walls.
 
 ## v0.46.0 — 2026-10-24
 
