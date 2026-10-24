@@ -83,7 +83,10 @@
  * player took more down than it took), the settle pays its wins in full, and
  * a removal refunds what it took, in the table's outcome record. Nothing is
  * handed back on a rewrite, so two tabs, or a tab and a removal, can't hand
- * it back twice.
+ * it back twice. A craps settle at the very moment of the removal can win
+ * that record over the refund: what the bets it kept up had taken is then
+ * owed back by the `kept` record it left (keptOwed), and paid as the
+ * removal's outcome when that record goes.
  *
  * A write at the very moment of a removal (a settle, a bet) outlives the
  * removal's delete, as a concurrent write does in the doc. So the removal
@@ -515,22 +518,31 @@ export function creditTableOutcome(
   if (!Number.isSafeInteger(amount) || Math.abs(amount) > MAX_TABLE_OUTCOME) return;
   if (playerId.length === 0 || playerId.length > 256) return;
   const map = ensureChips();
-  const base = `tbl:${tableId}:${inc}:${playerId}`;
-  let link = 0;
-  while (map.has(`${base}~${link + 1}`)) link += 1;
-  const last = link === 0 ? base : `${base}~${link}`;
-  const stored = map.get(last);
-  const was = isChipRecord(stored) && stored.p === playerId ? stored : null;
+  const { base, link, was } = lastOutcome(map, tableId, inc, playerId);
   const ev = String(outcome);
   if (was?.ev === ev || was?.ev === 'end') return;
   const full = was !== null && Math.abs(was.d) >= TABLE_RECORD_FULL;
+  const last = link === 0 ? base : `${base}~${link}`;
   const key = full ? `${base}~${link + 1}` : last;
   const d = (full ? 0 : was?.d ?? 0) + amount;
   const rec: ChipRecord = { p: playerId, d, b: 0, c: 0, at: Date.now(), ev };
   boundDoc!.transact(() => {
     map.set(key, rec);
     recountChipKey(chipIndex, map, key);
+    heldDirty = true; // a removal's outcome ends what kept bets owe (keptOwed)
   });
+}
+
+/** The last record of a table's outcome chain for a player (see
+ *  creditTableOutcome): its base key, which link it is, and what it holds. */
+function lastOutcome(
+  chips: Y.Map<unknown>, tableId: string, inc: string, playerId: string,
+): { base: string; link: number; was: ChipRecord | null } {
+  const base = `tbl:${tableId}:${inc}:${playerId}`;
+  let link = 0;
+  while (chips.has(`${base}~${link + 1}`)) link += 1;
+  const stored = chips.get(link === 0 ? base : `${base}~${link}`);
+  return { base, link, was: isChipRecord(stored) && stored.p === playerId ? stored : null };
 }
 
 /** The incarnation a table takes when its first round opens (and a table
@@ -640,19 +652,33 @@ export function writeTableState(tableId: string, state: RouletteTableState): voi
 export function clearTableKeys(tableId: string): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
+  const keptPrefix = `kept:${tableId}:`;
   boundDoc!.transact(() => {
+    // What kept bets left by an earlier removal still owe is paid before
+    // they go (keptOwed).
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(keptPrefix)) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
+    }
     // The incarnation removed, and any before it that had none: a list this
     // build put down on one of those carries none either (ofIncarnation). No
     // mark for a table this page never saw up (a page leaving a room for one
-    // without it reconciles the old room's tables away).
-    // The bare mark counts the removals, so a table whose state an earlier
-    // build rewrote without one names a new incarnation once put back
-    // (tableIncFor).
+    // without it reconciles the old room's tables away), nor for a state of
+    // an incarnation a removal already ended (a write at its moment left it
+    // behind). An earlier build's state up has no incarnation, so the mark
+    // is the one a page that hasn't heard of the removal gives it at its next
+    // round (tableIncFor, alike on every page): that round, opened at the
+    // moment of the removal, is ended too. The bare mark counts the
+    // removals, an earlier build's state too though it reads as ended (that
+    // page may have rewritten it after a removal), so a table put back
+    // always names a new incarnation.
     const was = map.get(`table:${tableId}`);
     if (isRouletteTableState(was) || isCrapsTableState(was)) {
-      if (was.inc !== undefined) map.set(goneKey(tableId, was.inc), 1);
-      const count = map.get(goneKey(tableId, ''));
-      map.set(goneKey(tableId, ''), (Number.isSafeInteger(count) ? count as number : 0) + 1);
+      const up = !removed(map, tableId, was);
+      if (up) map.set(goneKey(tableId, was.inc ?? tableIncFor(tableId)), 1);
+      if (up || was.inc === undefined) {
+        const count = map.get(goneKey(tableId, ''));
+        map.set(goneKey(tableId, ''), (Number.isSafeInteger(count) ? count as number : 0) + 1);
+      }
     }
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
@@ -664,7 +690,6 @@ export function clearTableKeys(tableId: string): void {
     map.delete(`throw:${tableId}`);
     const seatPrefix = `seat:${tableId}:`;
     const seedPrefix = `fseed:${tableId}:`;
-    const keptPrefix = `kept:${tableId}:`;
     for (const key of [...map.keys()]) {
       if (key.startsWith(betPrefix) || key.startsWith(keptPrefix) || key.startsWith(seatPrefix)
         || key.startsWith(seedPrefix)) map.delete(key);
@@ -942,6 +967,33 @@ function keptList(value: unknown, at: Incarnation): { round: number; bets: Craps
   };
 }
 
+/** What a craps settle's `kept` record still owes its player back: what an
+ *  earlier build's bets it kept up had taken, once their table's removal
+ *  came at the same moment as the settle and the doc kept the settle's
+ *  outcome over the removal's (which refunded them). The record left behind
+ *  owes it, in the player's chips, until the table's outcome record pays it
+ *  as the removal would have (payKeptOwed), when the kept record goes. */
+function keptOwed(
+  map: Y.Map<unknown>, chips: Y.Map<unknown>, tableId: string, playerId: string, value: unknown,
+): { inc: string; owed: number } | null {
+  const inc = (value as { inc?: unknown } | null)?.inc;
+  if (inc !== undefined && (typeof inc !== 'string' || !isTableIncField(inc))) return null;
+  const kept = keptList(value, { inc, bare: inc === undefined });
+  if (!kept || kept.taken === 0) return null;
+  const at = inc ?? '';
+  if (!map.has(goneKey(tableId, at))) return null;
+  if (lastOutcome(chips, tableId, at, playerId).was?.ev === 'end') return null;
+  return { inc: at, owed: kept.taken };
+}
+
+/** Pay what a player's kept record owes (keptOwed) as the removal's outcome,
+ *  before the record is overwritten or deleted. Once paid, it owes nothing:
+ *  two pages paying it at once pay one outcome. */
+function payKeptOwed(map: Y.Map<unknown>, tableId: string, playerId: string): void {
+  const due = keptOwed(map, ensureChips(), tableId, playerId, map.get(`kept:${tableId}:${playerId}`));
+  if (due) creditTableOutcome(tableId, due.inc, 'end', playerId, due.owed);
+}
+
 /** The doc's own name for the write `key` holds now: its Yjs item id, the
  *  same on every page. Two writes of the same bets are two names, so a list
  *  an earlier build puts down again after a settle is a new list. */
@@ -1010,6 +1062,7 @@ export function pruneCrapsBets(tableId: string, playerId: string, round: number,
   const own = crapsOwnList(map.get(key), incarnationOf(map, tableId, { inc }));
   const taken = own?.legacy ? bets.reduce((n, b) => n + b.amount, 0) : 0;
   boundDoc!.transact(() => {
+    payKeptOwed(map, tableId, playerId); // a record an earlier removal left
     if (own?.legacy) map.set(key, { kind: 'craps', bets, ...(inc !== undefined ? { inc } : {}) });
     map.set(`kept:${tableId}:${playerId}`, {
       round, kept: bets,
@@ -1040,7 +1093,8 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
 
 // ── 🪙 Stakes on the felt (see STAKES ON THE FELT above) ─────────────────────
 
-/** Chips each player has held on felts, summed from the lists themselves. */
+/** Chips each player has held on felts, summed from the lists themselves
+ *  (countHeldStakes). */
 let heldStakes = new Map<string, bigint>();
 /** The sums as listeners last heard them (what a recount is compared with). */
 let heldHeard = new Map<string, bigint>();
@@ -1049,9 +1103,23 @@ let heldDirty = true;
 /** Players whose held chips changed since the last notify. */
 const heldTouched = new Set<string>();
 
-function countHeldStakes(map: Y.Map<unknown>): Map<string, bigint> {
+/** The table whose id a key carries after its prefix (the longest of `ids`
+ *  that fits, should one id begin with another's). */
+function tableOf(ids: Iterable<string>, rest: string): string | null {
+  let tableId: string | null = null;
+  for (const id of ids) {
+    if (rest.startsWith(`${id}:`) && (tableId === null || id.length > tableId.length)) tableId = id;
+  }
+  return tableId;
+}
+
+/** Chips each player has held on felts (and, below 0, what kept records left
+ *  by a removal owe them back: keptOwed). */
+function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string, bigint> {
   const tables = new Map<string, RouletteTableState | CrapsTableState>();
+  const gone = new Set<string>();
   for (const [key, value] of map.entries()) {
+    if (key.startsWith('gone:') && key.endsWith(':')) gone.add(key.slice('gone:'.length, -1));
     if (!key.startsWith('table:')) continue;
     const tableId = key.slice('table:'.length);
     if ((isRouletteTableState(value) || isCrapsTableState(value)) && !removed(map, tableId, value)) {
@@ -1059,18 +1127,19 @@ function countHeldStakes(map: Y.Map<unknown>): Map<string, bigint> {
     }
   }
   const out = new Map<string, bigint>();
-  if (tables.size === 0) return out;
+  if (tables.size === 0 && gone.size === 0) return out;
   const seen = new Set<string>();
-  for (const key of map.keys()) {
+  for (const [key, value] of map.entries()) {
     const prefix = key.startsWith('bets:') ? 'bets:' : key.startsWith('kept:') ? 'kept:' : null;
     if (prefix === null) continue;
     const rest = key.slice(prefix.length);
-    // The table whose id the key carries (the longest that fits, should one
-    // id begin with another's).
-    let tableId: string | null = null;
-    for (const id of tables.keys()) {
-      if (rest.startsWith(`${id}:`) && (tableId === null || id.length > tableId.length)) tableId = id;
+    const removedId = prefix === 'kept:' ? tableOf(gone, rest) : null;
+    if (removedId !== null) {
+      const pid = rest.slice(removedId.length + 1);
+      const due = keptOwed(map, chips, removedId, pid, value);
+      if (due) out.set(pid, (out.get(pid) ?? 0n) - BigInt(due.owed));
     }
+    const tableId = tableOf(tables.keys(), rest);
     if (tableId === null) continue;
     const pid = rest.slice(tableId.length + 1);
     // A craps player's two keys make one felt: count it once.
@@ -1087,7 +1156,7 @@ function countHeldStakes(map: Y.Map<unknown>): Map<string, bigint> {
 
 function heldStake(playerId: string): bigint {
   if (heldDirty) {
-    heldStakes = countHeldStakes(ensureMap());
+    heldStakes = countHeldStakes(ensureMap(), ensureChips());
     heldDirty = false;
   }
   return heldStakes.get(playerId) ?? 0n;
@@ -1096,7 +1165,8 @@ function heldStake(playerId: string): bigint {
 /** Recount the held chips before any observer runs whenever a transaction
  *  touched a table or a list, and note whose changed for their listeners. */
 function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
-  heldStakes = countHeldStakes(map);
+  const chips = doc.getMap<unknown>('casinoChips');
+  heldStakes = countHeldStakes(map, chips);
   heldHeard = heldStakes;
   heldDirty = false;
   heldTouched.clear();
@@ -1105,8 +1175,11 @@ function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
     const keys = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
     const counts = (k: string | null): boolean =>
       k !== null && (k.startsWith('table:') || k.startsWith('bets:') || k.startsWith('kept:') || k.startsWith('gone:'));
-    if (!keys || ![...keys].some(counts)) return;
-    const fresh = countHeldStakes(map);
+    // A table's outcome record too: a removal's ends what kept bets owe.
+    const outcomes = tr.changed.get(chips as unknown as Y.AbstractType<Y.YEvent<any>>);
+    const ends = (k: string | null): boolean => k !== null && k.startsWith('tbl:');
+    if (!(keys && [...keys].some(counts)) && !(outcomes && [...outcomes].some(ends))) return;
+    const fresh = countHeldStakes(map, chips);
     for (const pid of new Set([...fresh.keys(), ...heldHeard.keys()])) {
       if ((fresh.get(pid) ?? 0n) !== (heldHeard.get(pid) ?? 0n)) heldTouched.add(pid);
     }

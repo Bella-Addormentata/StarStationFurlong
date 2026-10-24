@@ -487,6 +487,96 @@ describe('a craps list an earlier build put down, as the table goes', () => {
     sync(a.doc, b.doc);
     for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(90);
   });
+
+  /** Page a rolls a 6 on the come-out (the pass line Carol's earlier build
+   *  put down rides the point) while page b, still seeing the roll closing,
+   *  removes the table; `earlierTable`: one an earlier build set up, which
+   *  has no incarnation. */
+  async function rolledAsRemoved(earlierTable = false): Promise<void> {
+    const pass = { type: 'pass', amount: 10 };
+    earlierCraps(1, null, [pass]);
+    if (earlierTable) {
+      const { inc: _inc, ...earlier } = a.casino.readCrapsTableState(craps)!;
+      a.casino.writeCrapsTableState(craps, earlier);
+    }
+    a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
+    sync(a.doc, b.doc);
+    diceTo(3, 3);
+    a.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    expect(a.casino.readMyCrapsBets(craps, bettor)).toEqual([pass]);
+    expect(a.casino.readChips(bettor)).toBe(90);
+    b.craps.closeCrapsTable(craps);
+    sync(a.doc, b.doc);
+  }
+
+  for (const [winner, clientA, clientB, earlierTable] of [
+    ['the roll', 2, 1, false], ['the removal', 1, 2, false],
+    ['the roll, on an earlier build\'s table', 2, 1, true], ['the removal, on an earlier build\'s table', 1, 2, true],
+  ] as const) {
+    it(`a roll that leaves it up, settled as the table is removed, gives it back once (${winner} winning ties)`, async () => {
+      a = await loadPage(clientA);
+      b = await loadPage(clientB);
+      await rolledAsRemoved(earlierTable);
+      expect(a.doc.getMap('casino').get(`kept:${craps}:${bettor}`)).toMatchObject({ taken: 10 });
+      for (const page of [a, b]) {
+        expect(page.casino.readCrapsTableState(craps)).toBeNull();
+        expect(page.casino.readChips(bettor)).toBe(100);
+      }
+      a.craps.closeCrapsTable(craps); // page a hears of the removal
+      sync(a.doc, b.doc);
+      for (const page of [a, b]) {
+        expect([...page.doc.getMap('casino').keys()].filter((k) => k.startsWith('kept:'))).toEqual([]);
+        expect(page.casino.readChips(bettor)).toBe(100);
+      }
+      a.craps.closeCrapsTable(craps); // and again, as a page leaving the room does
+      b.craps.closeCrapsTable(craps);
+      sync(a.doc, b.doc);
+      for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
+    });
+  }
+
+  it('what it owes follows the outcome record, heard on its own too', async () => {
+    a = await loadPage(2); // the roll wins ties
+    b = await loadPage(1);
+    await rolledAsRemoved();
+    const inc = (a.doc.getMap('casino').get(`kept:${craps}:${bettor}`) as { inc: string }).inc;
+    b.casino.creditTableOutcome(craps, inc, 'end', bettor, 10); // the refund, paid
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
+  });
+
+  it('a page that hears of the removal late changes nothing a table put back is named by', async () => {
+    a = await loadPage(2);
+    b = await loadPage(1);
+    await rolledAsRemoved();
+    a.craps.closeCrapsTable(craps); // page a hears of it, as page b puts the table back
+    for (const page of [a, b]) {
+      page.casino.writeCrapsFairnessPref(craps, 'rng');
+      page.craps.openCrapsBetting(craps, 1, null);
+    }
+    expect(a.casino.readCrapsTableState(craps)!.inc).toBe(b.casino.readCrapsTableState(craps)!.inc);
+  });
+
+  it('and through a table put back under the same id, its rolls and its removal', async () => {
+    a = await loadPage(2); // the roll wins ties
+    b = await loadPage(1);
+    await rolledAsRemoved();
+    // Page a is gone before it hears; page b puts the table back, and Carol,
+    // on this build now, bets 20 on the pass line that rides a roll.
+    b.casino.writeCrapsFairnessPref(craps, 'rng');
+    b.craps.openCrapsBetting(craps, 1, null);
+    b.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 20 }]);
+    expect(b.casino.readChips(bettor)).toBe(80);
+    b.craps.closeCrapsBetting(craps, b.casino.readCrapsTableState(craps)!);
+    diceTo(4, 4); // an 8: the point is set
+    b.craps.rollAndSettleCraps(craps, 1, null);
+    await flush();
+    expect(b.casino.readMyCrapsBets(craps, bettor)).toEqual([{ type: 'pass', amount: 20 }]);
+    expect(b.casino.readChips(bettor)).toBe(80);
+    b.craps.closeCrapsTable(craps);
+    expect(b.casino.readChips(bettor)).toBe(100);
+  });
 });
 
 describe("the stickman's record of a roll against the player's own list", () => {
@@ -671,6 +761,38 @@ describe('a write at the moment the table is removed, from a page that leaves be
     expect(b.casino.readCrapsTableState(craps)?.inc).toMatch(/^[a-z0-9]+$/);
     expect(b.casino.readAllCrapsBets(craps)).toEqual({});
   });
+
+  for (const [game, open] of [
+    ['craps', (p: Page, round: number) => p.craps.openCrapsBetting(craps, round, null, p.casino.readCrapsTableState(craps))],
+    ['roulette', (p: Page, round: number) => p.croupier.openBetting(TABLE, round)],
+  ] as const) {
+    it(`nor an earlier build's ${game} table given an incarnation of its own as it goes`, () => {
+      const table = game === 'craps' ? craps : TABLE;
+      const read = (p: Page) => (game === 'craps' ? p.casino.readCrapsTableState(craps) : p.casino.readTableState(TABLE));
+      a.casino.writeCrapsFairnessPref(table, 'rng');
+      a.casino.buyInChips(bettor, 100);
+      open(a, 1);
+      const { inc: _inc, ...earlier } = read(a)!;
+      if (game === 'craps') a.casino.writeCrapsTableState(craps, earlier as never);
+      else a.casino.writeTableState(TABLE, earlier as never);
+      sync(a.doc, b.doc);
+      // Page a opens the next round (the table takes an incarnation) and
+      // Carol bets there, while page b, still on the earlier state, removes
+      // the table; page a is gone before it hears.
+      open(a, 2);
+      expect(read(a)?.inc).toBeDefined();
+      if (game === 'craps') a.casino.writeMyCrapsBets(craps, bettor, [{ type: 'pass', amount: 10 }]);
+      else a.casino.writeMyBets(TABLE, bettor, 2, [{ type: 'red', amount: 10 }]);
+      expect(a.casino.readChips(bettor)).toBe(90);
+      if (game === 'craps') b.craps.closeCrapsTable(craps);
+      else b.croupier.closeTable(TABLE);
+      sync(a.doc, b.doc);
+      for (const page of [a, b]) {
+        expect(read(page)).toBeNull();
+        expect(page.casino.readChips(bettor)).toBe(100);
+      }
+    });
+  }
 
   it("nor a list put down on an earlier build's state as the table took an incarnation of its own", () => {
     a.casino.writeCrapsFairnessPref(craps, 'rng');
