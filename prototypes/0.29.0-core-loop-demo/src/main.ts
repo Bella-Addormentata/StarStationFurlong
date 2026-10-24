@@ -271,8 +271,9 @@ import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDo
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
 import { bindTvDoc, setTvIdentity, setTvPageId, tvNow, tvWallNow } from "./tvDoc";
-import { focusTvApp, renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
-import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
+import { aimTvRemote, focusTvApp, renderTvPhoneApp, resolveArchiveFile, tvHasSomethingOn } from "./tvUI";
+import { closeTvTheatre, openTvTheatre, setTvPictureOpener, setTvRemoteOpener, setTvTheatreDeps } from "./tvTheatre";
+import { irBlink, isAiming, startAiming, stopAiming } from "./irBlaster";
 import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
@@ -3384,13 +3385,14 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
   settleReqUnsub?.();
   settleReqUnsub = null;
-  // 📺 #186: the theatre, its chip and every remote I hold belong to THIS
-  // room. Tear them down now, synchronously and on every path (sync or
-  // not): nothing may keep a player, an interval or a clock registration
-  // pointed at the old set, or write under its item id to the next room's
-  // map once the doc rebinds. The put-downs go out with the flush below.
+  // 📺 #186: the picture and every set's clock this page keeps belong to
+  // THIS room. Tear them down now, synchronously and on every path (sync
+  // or not): nothing may keep a player, an interval or a clock
+  // registration pointed at the old set, or write under its item id to the
+  // next room's map once the doc rebinds. The put-downs go out with the
+  // flush below. The IR blaster comes down with them.
   closeTvTheatre();
-  updateTvChip([]);
+  stopAiming();
   leaveTvRoom(roomTvIds());
   // 🕹 #193: the same for the cabinet — the stage (its frame, its seat
   // renewals) is this room's; a P1 who leaves stands up before the doc goes.
@@ -6401,23 +6403,22 @@ function roomTvIds(): string[] {
 function tvLabelFor(itemId: string): string {
   return tvLabel(FURNITURE.find((i) => i.id === itemId)?.kind);
 }
-/** Installed on the theatre (setTvTheatreDeps) so every WATCH — the set's
- *  panel in world.ts, the phone, the HUD chip — opens it with the same label
- *  and the same round-trip lead. */
-function tvTheatreDeps(itemId: string) {
-  return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
+/** Installed on the theatre (setTvTheatreDeps) so every way the picture
+ *  goes up — the room tick, the IR blaster — applies the same round-trip
+ *  lead. */
+function tvTheatreDeps() {
+  return { rttMs: () => networkProvider.stats().rttMs };
 }
 // 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
 function roomArcadeIds(): string[] {
   return FURNITURE.filter((i) => ARCADE_CABINET_KINDS.has(i.kind)).map((i) => i.id);
 }
 
-/** WATCH from the phone or the HUD chip: only for a set still in THIS room,
- *  with the TV drive armed. A WATCH button can outlive its set by up to a
- *  second (the phone repaints on a timer; the chip on the room tick), and
- *  the callback stays reachable through a room leave's awaited flush after
- *  the teardown closed the theatre — opening then would make a theatre no
- *  room tick ever closes. */
+/** The picture up on a set: only for a set still in THIS room, with the
+ *  TV drive armed. The blaster's keys can outlive their set by up to a
+ *  second (the phone repaints on a timer), and the callbacks stay reachable
+ *  through a room leave's awaited flush after the teardown closed the
+ *  theatre — opening then would make a theatre no room tick ever closes. */
 function openTvTheatreIfPresent(itemId: string): boolean {
   if (!tvDriveArmed() || !roomTvIds().includes(itemId)) return false;
   openTvTheatre(itemId);
@@ -7864,6 +7865,7 @@ function setupSpacePhoneOverlay() {
     | "settings"
     | "setnet"
     | "setstats"
+    | "tools"
     | "tv";
   const phoneViewMeta: Record<
     PhoneViewId,
@@ -7919,10 +7921,16 @@ function setupSpacePhoneOverlay() {
       title: "📊 STATS",
       subtitle: "Settings · Live Readout",
     },
+    tools: {
+      elId: "phone-app-tools",
+      title: "🧰 TOOLS",
+      subtitle: "FurlongOS · Utilities",
+    },
+    // 📡 #258: the IR blaster, the remote of every TV in the room.
     tv: {
       elId: "phone-app-tv",
-      title: "📺 TV REMOTE",
-      subtitle: "Any TV in the room",
+      title: "📡 IR BLASTER",
+      subtitle: "Tools · Aim at a TV",
     },
   };
   /** Sub-views return to their parent on BACK instead of jumping home. */
@@ -7931,6 +7939,7 @@ function setupSpacePhoneOverlay() {
     setstats: "settings",
     // 🏦 The treasury opens from VENTURES (plan §11), so BACK returns there.
     treasury: "ventures",
+    tv: "tools",
   };
 
   // 📦 De-overlay (owner request): the Network Details, stats and room-info
@@ -8067,7 +8076,8 @@ function setupSpacePhoneOverlay() {
     }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
-    // 📺 #186: the remote. Repaints itself on tv-map changes while active.
+    // 📡 #258: the IR blaster, the remote of every set in the room. Repaints
+    // itself on tv-map changes while active.
     if (id === "tv") {
       const view = document.getElementById("phone-app-tv");
       if (view) {
@@ -8075,10 +8085,11 @@ function setupSpacePhoneOverlay() {
           tvs: () => roomTvIds().map((tvId) => ({ id: tvId, label: tvLabelFor(tvId) })),
           myPub: () => getIdentityPub(),
           myName: () => getPlayerName(),
-          openTheatre: (tvId) => {
-            if (!tvDriveArmed() || !roomTvIds().includes(tvId)) return; // the set is gone, or the room is: nothing to watch
-            container?.classList.remove("active");
-            openTvTheatre(tvId);
+          // The picture goes up on the set behind the phone, which stays open.
+          openTheatre: (tvId) => { openTvTheatreIfPresent(tvId); },
+          aim: () => {
+            phoneOpener = null; // the room is where aiming leaves focus
+            startAiming();
           },
           resolveArchive: resolveArchiveFile,
         });
@@ -8140,22 +8151,26 @@ function setupSpacePhoneOverlay() {
     container?.classList.add("active");
     showPhoneView("treasury");
   };
-  // 📺 #186: the set's panel opens the phone straight on the remote — same
-  // posture as __ssfOpenTreasury.
+  // 📡 #258: a TV clicked (onCanvasClick, or walked up to: world.ts) or T
+  // pressed while its picture is up aims the IR blaster at that set and
+  // opens the phone on it — same posture as __ssfOpenTreasury. A set with
+  // something on gets the picture (from another set, if that had it).
   (
-    window as unknown as { __ssfOpenTvRemote?: () => void }
-  ).__ssfOpenTvRemote = () => {
-    // Who gets focus back when the phone closes (releasePhoneOpener): the
-    // theatre when it is up (the phone opens above it; the dialog root is
-    // the stable target, and it refocuses its own control),
-    // else whatever outside the phone had focus — the set's panel. A
-    // control inside the phone is no opener: it is about to be hidden.
+    window as unknown as { __ssfAimTvBlaster?: (itemId: string) => void }
+  ).__ssfAimTvBlaster = (itemId) => {
+    if (!tvDriveArmed() || !roomTvIds().includes(itemId)) return;
+    stopAiming();
+    aimTvRemote(itemId);
+    if (tvHasSomethingOn(itemId)) openTvTheatreIfPresent(itemId);
+    // Who gets focus back when the phone closes (releasePhoneOpener):
+    // whatever outside the phone had it. A control inside the phone is no
+    // opener: it is about to be hidden.
     const active = document.activeElement as HTMLElement | null;
-    const theatreRoot = document.getElementById("tv-theatre");
-    phoneOpener = theatreRoot ?? (active && !phoneShell.contains(active) ? active : null);
+    phoneOpener = active && !phoneShell.contains(active) ? active : null;
     closeMiniChat();
     container?.classList.add("active");
     showPhoneView("tv");
+    irBlink();
   };
   phoneShell.addEventListener("click", (e) => routeFrom(e.target));
   phoneShell.addEventListener("keydown", (e) => {
@@ -8235,6 +8250,15 @@ function setupSpacePhoneOverlay() {
   const togglePhone = (): void => {
     if (tipIndicator) {
       removeTipIndicator();
+    }
+
+    // 📡 Aiming (#258): Tab or the phone's tip puts the blaster down and
+    // brings the phone back up on it, as it was.
+    if (isAiming() && container) {
+      stopAiming();
+      container.classList.add("active");
+      showPhoneView("tv");
+      return;
     }
 
     // 💬 QUICK CHAT: from the mini bar, EXPAND to the full phone on the CHAT
@@ -10542,9 +10566,9 @@ async function init() {
   // host) ask the same owner seam edit mode does.
   setPartyHostPredicate(() => canEditRoom().ok);
   setPartyIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
-  // 📺 #186: the TV's seams — the identity, and the chip that opens the
-  // theatre from anywhere in the room. Anyone's press controls a set
-  // (#258): there is no remote to hold, hand on or take back.
+  // 📺 #186: the TV's seams — the identity, and how the picture goes up.
+  // Anyone's press controls a set (#258): there is no remote to hold, hand
+  // on or take back; every phone's IR blaster is one.
   setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   // A set's clock is kept by a PAGE, not a key: two tabs share the identity
   // (the seed is in localStorage) and must not both renew, beat and release.
@@ -10564,7 +10588,10 @@ async function init() {
   setArcadeEjectPredicate(() => currentRoomDeedIsMine());
   setArcadeIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   setTvTheatreDeps(tvTheatreDeps);
-  setTvChipOpener((itemId) => { openTvTheatreIfPresent(itemId); });
+  setTvPictureOpener((itemId) => { openTvTheatreIfPresent(itemId); });
+  setTvRemoteOpener((itemId) => {
+    (window as unknown as { __ssfAimTvBlaster?: (id: string) => void }).__ssfAimTvBlaster?.(itemId);
+  });
   // The theatre fetches a peer-written URL only with this viewer's consent
   // (tvConsent.ts). The page's own origin is this viewer's own machine; the
   // node's origin joins it once the node has identified itself through the
@@ -10938,6 +10965,19 @@ function findArcadeControl(scene: THREE.Scene): { deviceId: string; control: "se
   return { deviceId: hit.object.userData.arcadeCabinetId as string, control: "settings" };
 }
 
+/** The TV whose set is the nearest device under the ray, if that device is
+ *  a TV: a TV behind another device is not aimed at. */
+function pickTvSet(scene: THREE.Scene, ray: THREE.Raycaster): string | null {
+  const deviceMeshes: THREE.Object3D[] = [];
+  scene.traverse((child) => {
+    if (child.userData && (child.userData.isDevice || child.userData.skipDeviceHit)) deviceMeshes.push(child);
+  });
+  const hit = ray.intersectObjects(deviceMeshes, false)[0];
+  const deviceId = hit?.object.userData.deviceId as string | undefined;
+  if (!deviceId || hit.object.userData.skipDeviceHit) return null;
+  return isTvKind(FURNITURE.find((i) => i.id === deviceId)?.kind) ? deviceId : null;
+}
+
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
   // 🚪🔒 Sealed in the airlock the room on screen is a stand-in: nothing to click.
@@ -10997,6 +11037,21 @@ function onCanvasClick(event: MouseEvent): void {
   mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
   raycaster.setFromCamera(mouse, camera);
+
+  // ── 📡 #258: a TV clicked is the SpacePhone's IR blaster aimed at it, in
+  //    first person too (no walk-over, no panel). With the blaster up and
+  //    a click on anything else, that click only puts it down.
+  if (!multiScaleZoom || multiScaleZoom.getLevel() <= 2) {
+    const tvId = pickTvSet(scene, raycaster);
+    if (tvId) {
+      (window as unknown as { __ssfAimTvBlaster?: (id: string) => void }).__ssfAimTvBlaster?.(tvId);
+      return;
+    }
+  }
+  if (isAiming()) {
+    stopAiming();
+    return;
+  }
 
   const gearItem = pickSettingsGear(scene, raycaster);
   if (gearItem && world.openSettingsCard(gearItem)) return;

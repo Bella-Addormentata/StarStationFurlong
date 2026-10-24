@@ -11312,6 +11312,17 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       }
       glowLevel = 1.1;
     }
+    // This page's own word (tvTheatreHint): what it waits on, across the
+    // middle of the card, one part a line. Under a picture it is not seen.
+    if (view.ask && !pictureFrame.visible && view.state !== "off") {
+      const lines = view.ask.split(" · ").slice(0, 3).map((l) => (l.length > 34 ? `${l.slice(0, 33)}…` : l));
+      const top = 112 - lines.length * 11;
+      c2d.fillStyle = "rgba(4,8,16,0.86)";
+      c2d.fillRect(12, top - 8, TV_TEX_W - 24, lines.length * 22 + 16);
+      c2d.strokeStyle = "rgba(0,229,255,0.55)";
+      c2d.strokeRect(12.5, top - 7.5, TV_TEX_W - 25, lines.length * 22 + 15);
+      lines.forEach((l, i) => text(l, TV_TEX_W / 2, top + 11 + i * 22, i === 0 ? "bold 14px monospace" : "11px monospace", i === 0 ? "#e8f4ff" : "#00e5ff", "center"));
+    }
     screenTex.needsUpdate = true;
   };
 

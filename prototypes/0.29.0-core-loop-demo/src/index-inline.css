@@ -515,6 +515,17 @@
         bottom: -386px; /* 500px shell − 386 = ~114px sliver: bezel+hint+field */
       }
 
+      /* 📡 Aiming the IR blaster (#258, irBlaster.ts): the tip, its status
+         bar and its title (AIMING · CLICK A TV) show; the room takes the
+         click, under a crosshair. */
+      #spacephone-container.aiming {
+        bottom: -402px;
+      }
+      body.ir-aiming,
+      body.ir-aiming canvas {
+        cursor: crosshair !important;
+      }
+
       /* Phone Bezel Notch */
       #phone-bezel {
         height: 38px;
@@ -1335,73 +1346,41 @@
       }
       #dm-overlay[hidden] { display: none; }
 
-      /* 📺 The TV theatre (#186, tvTheatre.ts): the picture is on the set in
-         the world; this is the slim bar at the foot of the window with the
-         set's notices and controls. Not modal, no backdrop. z-index 4800 —
-         above the focused device host (4500), below the SpacePhone (5000)
-         so the remote stays usable while watching. */
-      #tv-theatre {
-        position: fixed;
-        left: 50%;
-        bottom: 14px;
-        transform: translateX(-50%);
-        z-index: 4800;
-        width: min(92vw, 720px);
-        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-      }
-      .tv-theatre-panel {
-        max-height: 40vh;
-        box-sizing: border-box;
-        overflow-y: auto;
-        background: rgba(4, 8, 22, 0.9);
-        border: 1px solid rgba(212, 168, 75, 0.28);
-        border-radius: 12px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.7);
-        padding: 8px 12px 10px;
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-        color: #d4a84b;
-      }
-      .tv-theatre-head {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        min-width: 0;
-      }
-      .tv-theatre-title {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-size: 12px;
-        font-weight: 800;
-        letter-spacing: 1px;
-        color: #f0c060;
-      }
-      .tv-theatre-notice {
+      /* 📺 What the set asks this viewer (#258, tvTheatre.ts): a link to
+         allow, a file to fetch, a tap for sound. No bar and no popup: the
+         IR blaster shows it under the set it is aimed at. */
+      .tv-set-says {
         display: flex;
         flex-direction: column;
         align-items: center;
         gap: 6px;
         text-align: center;
-        font-size: 12px;
+        font-size: 11px;
         font-weight: 800;
         letter-spacing: 1px;
         color: #f0c060;
-        padding: 4px 0;
+        padding: 8px;
+        border: 1px solid rgba(0, 229, 255, 0.45);
+        border-radius: 8px;
+        background: rgba(0, 229, 255, 0.06);
       }
-      .tv-theatre-notice[hidden] { display: none; }
-      .tv-theatre-notice button {
+      .tv-set-says::before {
+        content: "📺 THE SET SAYS";
+        align-self: flex-start;
+        font-size: 8.5px;
+        letter-spacing: 1px;
+        color: rgba(0, 229, 255, 0.8);
+      }
+      .tv-set-says[hidden] { display: none; }
+      .tv-set-says button {
         background: rgba(47, 230, 160, 0.14);
         border: 1px solid rgba(47, 230, 160, 0.75);
         border-radius: 7px;
         color: #f0c060;
         font-family: inherit;
-        font-size: 12px;
+        font-size: 11px;
         font-weight: 800;
-        padding: 8px 14px;
+        padding: 7px 12px;
         cursor: pointer;
       }
       .tv-theatre-lane {
@@ -1411,37 +1390,6 @@
         color: rgba(224, 226, 238, 0.45);
         text-transform: uppercase;
       }
-      .tv-theatre-status {
-        font-size: 10px;
-        letter-spacing: 1px;
-        color: #8fa3b8;
-        text-transform: uppercase;
-      }
-      .tv-theatre-controls {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 8px;
-      }
-      .tv-theatre-controls button {
-        background: rgba(212, 168, 75, 0.12);
-        border: 1px solid rgba(212, 168, 75, 0.4);
-        border-radius: 6px;
-        color: #f0c060;
-        font-family: inherit;
-        font-size: 11px;
-        font-weight: 800;
-        padding: 6px 10px;
-        cursor: pointer;
-      }
-      .tv-theatre-volume {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 11px;
-        color: #d4a84b;
-      }
-
       /* 🕹 #193: the arcade stage — P1's emulator frame in a 4:3 panel, the
          CRT pass over it, and the notices (NOT PROVISIONED, bring your copy). */
       #arcade-stage {
@@ -1588,36 +1536,105 @@
       .tv-lane-badge.tv-lane-player-run { border-color: #00e5ff; color: #00e5ff; }
       .tv-lane-badge.tv-lane-public-swarm { border-color: #f0c060; color: #f0c060; }
 
-      /* 📺 "Something is on" chip (tvTheatre.ts updateTvChip): one tap to
-         the theatre from anywhere in the room. Below the phone (5000). */
-      #tv-chip {
-        position: fixed;
-        top: 14px;
-        left: 50%;
-        transform: translateX(-50%);
-        z-index: 4700;
-        background: rgba(4, 8, 22, 0.92);
-        border: 1px solid rgba(0, 229, 255, 0.55);
-        border-radius: 999px;
-        color: #e8f4ff;
-        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-        font-size: 10px;
-        font-weight: 800;
-        letter-spacing: 1px;
-        padding: 7px 14px;
-        cursor: pointer;
-        max-width: 70vw;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+      /* 🧰 Tools (#258): the settings grid's tiles. */
+      #phone-app-tools.active {
+        padding: 14px;
       }
-      #tv-chip:hover { border-color: #00e5ff; }
+      #phone-tools-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        padding: 12px;
+      }
 
-      /* 📺 The phone's TV app (tvUI.ts) shares the ACCESS/CONTACTS inset. */
+      /* 📡 The IR blaster (tvUI.ts) shares the ACCESS/CONTACTS inset. */
       #phone-app-tv.active {
         padding: 14px;
         gap: 12px;
+      }
+      .ir-keys {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 0;
+      }
+      .ir-row {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 6px;
+      }
+      .ir-pad {
+        display: grid;
+        grid-template-columns: repeat(3, 44px);
+        grid-template-rows: repeat(3, 36px);
+        gap: 4px;
+      }
+      .ir-pad .ir-up { grid-area: 1 / 2; }
+      .ir-pad .ir-left { grid-area: 2 / 1; }
+      .ir-pad .ir-ok { grid-area: 2 / 2; border-radius: 50%; }
+      .ir-pad .ir-right { grid-area: 2 / 3; }
+      .ir-pad .ir-down { grid-area: 3 / 2; }
+      .ir-key {
+        background: rgba(212, 168, 75, 0.12);
+        border: 1px solid rgba(212, 168, 75, 0.4);
+        border-radius: 6px;
+        color: #f0c060;
+        font-family: inherit;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        padding: 6px 9px;
+        cursor: pointer;
+      }
+      .ir-key:hover:not(:disabled),
+      .ir-key:focus-visible {
+        border-color: #00e5ff;
+        color: #e8f4ff;
+      }
+      .ir-key:active:not(:disabled) { background: rgba(0, 229, 255, 0.18); }
+      .ir-key:disabled {
+        opacity: 0.35;
+        cursor: default;
+      }
+      .ir-pad .ir-key { padding: 0; font-size: 12px; }
+      .ir-level {
+        min-width: 34px;
+        text-align: center;
+        font-size: 10px;
+        color: #e8d5a3;
+      }
+      .ir-note {
+        font-size: 8.5px;
+        letter-spacing: 1px;
+        color: rgba(224, 226, 238, 0.45);
+        text-transform: uppercase;
+      }
+
+      /* 📡 The emitter at the phone's tip (irBlaster.ts): a flash on each
+         press, and a steady glow while aiming. */
+      #phone-ir-emitter {
+        position: absolute;
+        top: 3px;
+        left: 50%;
+        width: 16px;
+        height: 4px;
+        margin-left: -8px;
+        border-radius: 2px;
+        background: #2a0a10;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        pointer-events: none;
+      }
+      #phone-ir-emitter.firing { animation: ir-fire 0.35s ease-out; }
+      @keyframes ir-fire {
+        0% { background: #ff4b6e; box-shadow: 0 0 6px 3px rgba(255, 75, 110, 0.9), 0 -6px 18px 6px rgba(255, 75, 110, 0.45); }
+        100% { background: #2a0a10; box-shadow: none; }
+      }
+      #spacephone-container.aiming #phone-ir-emitter {
+        background: #ff4b6e;
+        box-shadow: 0 0 6px 2px rgba(255, 75, 110, 0.75);
       }
       #phone-app-tv input[type="text"] {
         width: 100%;

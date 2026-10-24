@@ -233,7 +233,7 @@ function publishEnd(id: string, rec: { started: number; endMs: number }): void {
  *  World keeps ticking through the leave's awaited flush, with the old
  *  furniture and the old TV doc still here, and a tick in that window would
  *  renew a clock in a room being left, beat it, or put the departed room's
- *  WATCH chip back up with its theatre a click away. */
+ *  picture back up. */
 let driveArmed = true;
 export function armTvDrive(on: boolean): void {
   driveArmed = on;
