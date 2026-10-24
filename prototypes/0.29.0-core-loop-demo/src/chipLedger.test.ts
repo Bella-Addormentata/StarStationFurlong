@@ -148,6 +148,22 @@ describe('sums past the safe-integer range', () => {
     expect(pageB.readChips(PLAYER)).toBe(0);
   });
 
+  it('a payout past the range still lands: reads stop at the range, the ledger keeps the rest', () => {
+    pageA.buyInChips(PLAYER, MAX);
+    expect(pageA.spendChips(PLAYER, 1)).toBe(true);
+    pageA.creditChips(PLAYER, 2);
+    expect(pageA.readChips(PLAYER)).toBe(MAX);
+    expect(pageA.spendChips(PLAYER, 2)).toBe(true);
+    expect(pageA.readChips(PLAYER)).toBe(MAX - 1);
+  });
+
+  it('the cage counts every chip out, even two buy-ins past the range on two pages', () => {
+    pageA.buyInChips(PLAYER, MAX);
+    pageB.buyInChips(PLAYER, MAX);
+    sync(docA, docB);
+    expect(pageA.readCageLedger()).toMatchObject({ issued: MAX, outstanding: MAX, houseNet: 0 });
+  });
+
   it('so does one whose lifetime buy-ins would', () => {
     pageA.buyInChips(PLAYER, MAX);
     expect(pageA.cashOutChips(PLAYER, MAX)).toBe(MAX);
@@ -217,6 +233,30 @@ describe('a slot machine\'s own bankroll', () => {
     expect(pageA.slotMachineHoldsChips(MACHINE)).toBe(false);
     pageA.clearSlotMachineKeys(MACHINE);
     expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(0);
+  });
+
+  it('a teardown pays out nothing, and says so, when the bankroll holds more than the safe range', () => {
+    const MAX = Number.MAX_SAFE_INTEGER;
+    pageA.buyInChips(OTHER, MAX);
+    pageB.buyInChips(OTHER, MAX);
+    sync(docA, docB);
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, MAX)).toBe(true);
+    expect(pageB.depositSlotFunding(MACHINE, OTHER, MAX)).toBe(true);
+    sync(docA, docB);
+    const records = pageA.readChipRecords().length;
+    expect(pageA.drainSlotMachineFunding(MACHINE)).toBe(false);
+    expect(pageA.readChipRecords()).toHaveLength(records);
+    expect(pageA.slotMachineHoldsChips(MACHINE)).toBe(true);
+  });
+
+  it('an emptied bankroll an earlier build stored keeps its opening through a cleanup, so a refill owes nothing', () => {
+    docA.getMap('casino').set(`slot-bankroll:machine:${MACHINE}`, 100);
+    expect(pageA.withdrawSlotFunding(MACHINE, OTHER, 100)).toBe(true);
+    expect(pageA.slotMachineHoldsChips(MACHINE)).toBe(false);
+    pageA.clearSlotMachineKeys(MACHINE);
+    pageA.writeSlotFundingConfig(MACHINE, funding);
+    expect(pageA.depositSlotFunding(MACHINE, OTHER, 30)).toBe(true);
+    expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(30);
   });
 
   it('is not a player: the cage ledger leaves it out', () => {

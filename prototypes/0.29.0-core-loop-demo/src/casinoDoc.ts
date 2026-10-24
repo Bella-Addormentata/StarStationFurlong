@@ -293,12 +293,18 @@ function clampSafe(n: bigint): number {
   return Number(n > max ? max : n < -max ? -max : n);
 }
 
-/** An account's chips: its opening balance (what a build before the ledger
- *  stored under `bal:<pid>`, or under the bankroll's own key) + Σ records. */
-function readLedgerAccount(account: string): number {
+/** An account's chips, exactly: its opening balance (what a build before the
+ *  ledger stored under `bal:<pid>`, or under the bankroll's own key) + Σ
+ *  records. Below 0 when two pages spent the same chips at once. */
+function ledgerTotal(account: string): bigint {
   const map = ensureMap();
   const opening = safeCount(map, isBankrollAccount(account) ? account : `bal:${account}`);
-  return Math.max(0, clampSafe(BigInt(opening) + (chipIndex.byAccount.get(account) ?? 0n)));
+  return BigInt(opening) + (chipIndex.byAccount.get(account) ?? 0n);
+}
+
+/** An account's chips as a number: never below 0, never past the safe range. */
+function readLedgerAccount(account: string): number {
+  return Math.max(0, clampSafe(ledgerTotal(account)));
 }
 
 export function readChips(playerId: string): number {
@@ -363,7 +369,6 @@ function writeAccount(map: Y.Map<unknown>, key: string, before: number, after: n
 /** Cashier BUY-IN: the cage issues chips to the player. */
 export function buyInChips(playerId: string, amount: number): void {
   if (!Number.isSafeInteger(amount) || amount <= 0) return;
-  if (!Number.isSafeInteger(readChips(playerId) + amount)) return;
   addChips(playerId, amount, 'buy');
 }
 
@@ -385,10 +390,10 @@ export function spendChips(playerId: string, amount: number): boolean {
   return true;
 }
 
-/** Return chips to a player (bet refund by its owner, payout by the croupier). */
+/** Return chips to a player (bet refund by its owner, payout by the croupier).
+ *  Always lands: the ledger holds any total; reads stop at the safe range. */
 export function creditChips(playerId: string, amount: number): void {
-  if (!Number.isInteger(amount) || amount <= 0) return;
-  if (!Number.isSafeInteger(readChips(playerId) + amount)) return;
+  if (!Number.isSafeInteger(amount) || amount <= 0) return;
   addChips(playerId, amount);
 }
 
@@ -428,9 +433,10 @@ export function readCageLedger(): CageLedger {
   }
   const balances: Record<string, number> = {};
   for (const pid of players) {
-    const n = readChips(pid);
-    outstanding += BigInt(n);
-    if (n > 0) balances[pid] = n;
+    const total = ledgerTotal(pid);
+    if (total <= 0n) continue;
+    outstanding += total;
+    balances[pid] = clampSafe(total);
   }
   return {
     issued: clampSafe(issued),
@@ -1269,23 +1275,20 @@ export function refundSlotWager(
 }
 
 /** Return a removed machine's private bankroll to the configured owner.
- *  False when it holds chips that can't be paid out (no owner to pay, or
- *  the owner's balance can't take them): nothing is written then. */
+ *  False when it holds chips that can't be paid out (no owner to pay, more
+ *  than the safe range, or the owner's balance can't take them): nothing is
+ *  written then. */
 export function drainSlotMachineFunding(machineId: string): boolean {
-  const map = ensureMap();
-  const fundingKey = `slot-bankroll:machine:${machineId}`;
-  const amount = readAccount(map, fundingKey);
-  if (amount <= 0) return true;
+  const fundingKey = `${BANKROLL_PREFIX}${machineId}`;
+  const total = ledgerTotal(fundingKey);
+  if (total <= 0n) return true;
   const config = readSlotFundingConfig(machineId);
-  if (!config) return false;
+  if (!config || total > BigInt(Number.MAX_SAFE_INTEGER)) return false;
+  const amount = Number(total);
   const ownerBalance = readChips(config.ownerId);
   if (!Number.isSafeInteger(ownerBalance + amount)) return false;
-  // The bankroll's opening balance goes with its key (clearSlotMachineKeys
-  // deletes it too); the records take out the rest.
-  const opening = safeCount(map, fundingKey);
   boundDoc!.transact(() => {
-    map.delete(fundingKey);
-    addChips(fundingKey, opening - amount);
+    addChips(fundingKey, -amount);
     addChips(config.ownerId, amount);
   });
   return true;
@@ -1301,7 +1304,8 @@ export function clearSlotMachineKeys(machineId: string): void {
     map.delete(`slot-odds:${machineId}`);
     map.delete(`slot-funding:${machineId}`);
     map.delete(`slot-operator:${machineId}`);
-    map.delete(`slot-bankroll:machine:${machineId}`);
+    // The bankroll's stored value stays: it is its ledger account's opening
+    // balance, which the records already drawn against it assume.
     map.delete(`slot-escrow:${machineId}`);
     const sharedLease = readSlotSharedBankrollLease();
     if (sharedLease?.machineId === machineId) map.delete(SHARED_BANKROLL_LEASE_KEY);
