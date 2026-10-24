@@ -270,6 +270,49 @@ export function boxClearOfCupolaCorners(
   return true;
 }
 
+/** A floor grid line in world XZ; `axis` marks the line through the centre. */
+export interface FloorGridLine { x0: number; z0: number; x1: number; z1: number; axis: boolean }
+
+/** 🔭 The room editor's floor grid: a line every `step` metres across the
+ *  room in each direction, each trimmed to the floor (the rectangle, its
+ *  corners cut at 45° at each cupola end), so none runs past the glass. */
+export function floorGridLines(
+  halfX: number,
+  halfZ: number,
+  plans: readonly CupolaPlan[],
+  step = 1,
+): FloorGridLine[] {
+  const outline = plans.length
+    ? cupolaFloorOutline(plans)
+    : [{ x: -halfX, z: -halfZ }, { x: halfX, z: -halfZ }, { x: halfX, z: halfZ }, { x: -halfX, z: halfZ }];
+  const eps = 1e-6;
+  // The run of the convex outline along the line u = c, where u is x or z.
+  const run = (c: number, along: 'x' | 'z'): [number, number] | null => {
+    const u = along === 'x' ? 'z' : 'x';
+    const hits: number[] = [];
+    for (let i = 0; i < outline.length; i++) {
+      const a = outline[i], b = outline[(i + 1) % outline.length];
+      const lo = Math.min(a[u], b[u]), hi = Math.max(a[u], b[u]);
+      if (c < lo - eps || c > hi + eps) continue;
+      if (hi - lo < eps) hits.push(a[along], b[along]);
+      else hits.push(a[along] + ((c - a[u]) / (b[u] - a[u])) * (b[along] - a[along]));
+    }
+    if (hits.length < 2) return null;
+    const r: [number, number] = [Math.min(...hits), Math.max(...hits)];
+    return r[1] - r[0] > eps ? r : null;
+  };
+  const lines: FloorGridLine[] = [];
+  for (let x = -halfX; x <= halfX + eps; x += step) {
+    const r = run(x, 'z');
+    if (r) lines.push({ x0: x, z0: r[0], x1: x, z1: r[1], axis: Math.abs(x) < eps });
+  }
+  for (let z = -halfZ; z <= halfZ + eps; z += step) {
+    const r = run(z, 'x');
+    if (r) lines.push({ x0: r[0], z0: z, x1: r[1], z1: z, axis: Math.abs(z) < eps });
+  }
+  return lines;
+}
+
 /** The extrude-axis run [lo, hi] the barrel strips (and so windows) cover:
  *  the whole ±longHalf, or up to where a cupola starts tapering. */
 export function cupolaStripRun(input: CupolaPlan | readonly CupolaPlan[] | null, longHalf: number): [number, number] {
