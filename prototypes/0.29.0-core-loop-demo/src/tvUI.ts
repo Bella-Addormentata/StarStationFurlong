@@ -421,9 +421,11 @@ export function agoText(at: number, now: number): string {
 
 /** Where a library row's file would play from, for this holder now:
  *  'copy' — its sharer is gone, but a node here (the room's host, mostly)
- *  kept a copy. */
-type Whereabouts = 'mine' | 'lost' | 'theirs' | 'copy' | 'away' | 'unknown';
-function whereabouts(e: TvLibraryEntry): Whereabouts {
+ *  kept a copy; 'elsewhere' — no node here has it, but one met in this room
+ *  lately (its sharer, or one that kept a copy) said from wherever it is
+ *  online now that it does, and a FETCH reaches it there. */
+export type Whereabouts = 'mine' | 'lost' | 'theirs' | 'copy' | 'elsewhere' | 'away' | 'unknown';
+export function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (e.source.kind !== 'blob') return 'unknown';
   // Nothing is said before the node has answered (no node, or not yet).
   const reach = nodeReaches(e.source.provider);
@@ -432,17 +434,20 @@ function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (holds) return 'mine';
   const me = blobLaneNodeId();
   if (reach && e.source.provider !== me) return 'theirs';
-  if (copyHolder(e) !== null) return 'copy';
+  const copy = copyHolder(e);
+  if (copy !== null) return nodeReaches(copy) ? 'copy' : 'elsewhere';
   if (e.source.provider === me) return 'lost'; // names this node, which no longer holds it (let go, or made room)
   return 'away';
 }
 
-/** A connected node WHERE said holds the row's file whole, other than this
- *  one: the provider a PLAY from the library names when its sharer is gone. */
+/** A node WHERE said holds the row's file whole, other than this one, one
+ *  connected here first: the provider a PLAY from the library names when
+ *  its sharer is gone. */
 function copyHolder(e: TvLibraryEntry): string | null {
   if (e.source.kind !== 'blob') return null;
   const me = blobLaneNodeId();
-  return (nodeHolders(e.source.hash) ?? []).find((id) => id !== me) ?? null;
+  const ids = (nodeHolders(e.source.hash) ?? []).filter((id) => id !== me);
+  return ids.find((id) => nodeReaches(id) === true) ?? ids[0] ?? null;
 }
 
 /** The title a file's name gives the record: the name without its
@@ -857,10 +862,11 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     const whereText = where === 'mine' ? `<span style="color:${GREEN};">ON YOUR NODE</span>`
       : where === 'theirs' ? `<span style="color:${CYAN};">ITS NODE IS HERE</span>`
       : where === 'copy' ? `<span style="color:${CYAN};">A COPY IS ON A NODE HERE</span>`
+      : where === 'elsewhere' ? `<span style="color:${CYAN};">${e.source.kind === 'blob' && copyHolder(e) === e.source.provider ? 'ITS NODE IS ONLINE ELSEWHERE' : 'A COPY IS ONLINE ELSEWHERE'}</span>`
       : where === 'away' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'AWAY — GET IT AGAIN' : 'ITS NODE IS AWAY'}</span>`
       : where === 'lost' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'GONE FROM YOUR NODE — GET IT AGAIN' : 'GONE FROM YOUR NODE — CHOOSE IT AGAIN ON 📁 FILE'}</span>`
       : '';
-    const again = e.torrent && canAgain && where !== 'mine' && where !== 'copy'
+    const again = e.torrent && canAgain && where !== 'mine' && where !== 'copy' && where !== 'elsewhere'
       ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
       : '';
     const forget = where === 'mine'
@@ -1216,10 +1222,11 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     }
     // A file your node holds plays from your node: viewers fetch it from
     // you, whoever shared it first. One whose sharer is gone plays from the
-    // node here that kept a copy.
+    // node here that kept a copy, or from one met here lately that has it
+    // where it is online now.
     const where = whereabouts(entry);
     const me = blobLaneNodeId();
-    const copy = where === 'copy' ? copyHolder(entry) : null;
+    const copy = where === 'copy' || where === 'elsewhere' ? copyHolder(entry) : null;
     const source = entry.source.kind === 'blob' && where === 'mine' && me ? { ...entry.source, provider: me }
       : entry.source.kind === 'blob' && copy ? { ...entry.source, provider: copy }
       : entry.source;
@@ -1230,8 +1237,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     }
     feedback(where === 'copy'
       ? `Now on: ${entry.title}, from the copy a node here kept.`
+      : where === 'elsewhere'
+      ? `Now on: ${entry.title}, from a node that was in this room lately and has it where it is online now.`
       : where === 'away' || where === 'lost'
-      ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'The node that shared it is not connected to yours'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
+      ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'Your node cannot reach the node that shared it, here or elsewhere'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
       : `Now on: ${entry.title}`);
     deps.openTheatre(id);
   }));
