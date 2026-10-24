@@ -927,15 +927,97 @@ describe('the sync rule: anchor on receipt, never on the holder\'s clock', () =>
     expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 });
   });
 
-  it('a late joiner anchors the record it finds to its own now', () => {
+  it("a late joiner runs the record it finds on by its writer's clock, from its own now", () => {
     pickUpRemote(TV);
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 50_000);
+    expect(readProgramme(TV).at).toBe(now); // the writer's wall clock, with the position
     const late = new Y.Doc();
     Y.applyUpdate(late, Y.encodeStateAsUpdate(doc));
     now += 5_000;
+    setTvPageId('B');
+    iAm(BOB, 'Bob');
     bindTvDoc(late);
-    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 50_000, receivedAt: now });
+    // Written 5 s ago by the writer's clock: the room is 5 s on.
+    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 55_000, receivedAt: now, wall: true });
+    expect(readPlayback(TV).positionMs).toBe(55_000);
+    // The holder's next beat is fresh on arrival: anchored as any sample.
+    setTvPageId('A');
+    iAm(ALICE, 'Alice');
+    now += 1_000;
+    tvHeartbeat(TV, 56_000);
+    expect(readSample(TV)).toMatchObject({ positionMs: 56_000, receivedAt: now });
+    expect(readSample(TV)).not.toHaveProperty('wall');
+  });
+
+  it("never runs a record back, nor on from a clock it cannot read", () => {
+    let wall = now;
+    setTvClock(() => now, () => wall);
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    // The writer's clock a minute AHEAD of the joiner's: no time has passed
+    // by the joiner's reading, and it starts where the record says.
+    wall += 60_000;
+    tvHeartbeat(TV, 50_000);
+    wall -= 60_000;
+    const late = new Y.Doc();
+    Y.applyUpdate(late, Y.encodeStateAsUpdate(doc));
+    bindTvDoc(late);
+    expect(readSample(TV)).toMatchObject({ positionMs: 50_000 });
+    // A record from before the field (no `at`): anchored to now, as ever.
+    const old = new Y.Doc();
+    old.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), at: undefined });
+    wall += 3_600_000;
+    bindTvDoc(old);
+    expect(readSample(TV)).toEqual({ seq: readProgramme(TV).seq, positionMs: 50_000, receivedAt: now });
+  });
+
+  it('a looping film plays on in an empty room, and whoever walks in joins the lap it is on', () => {
+    pickUpRemote(TV);
+    tvSetLoop(TV, true);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV); // the holder leaves: nobody runs the laps
+    const later = Y.encodeStateAsUpdate(doc);
+    now += 100_000;
+    setTvPageId('B');
+    iAm(BOB, 'Bob');
+    const late = new Y.Doc();
+    Y.applyUpdate(late, later);
+    bindTvDoc(late);
+    // 150 s of a 60 s clip: 30 s into its third lap.
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 30_000 });
+    // And on, lap after lap, with no one writing a thing.
+    now += 40_000;
+    expect(readPlayback(TV).positionMs).toBe(10_000);
+    expect(tvScreenView(TV).clockText).toBe('0:10');
+    // Without LOOP, past the end is the end: nothing wraps it.
+    setTvPageId('A');
+    iAm(ALICE, 'Alice');
+    bindTvDoc(doc);
+    pickUpRemote(TV);
+    tvSetLoop(TV, false);
+    tvHeartbeat(TV, 50_000);
+    putDownRemote(TV);
+    now += 100_000;
+    expect(readPlayback(TV).positionMs).toBe(150_000);
+  });
+
+  it('a viewer follows a live holder\'s laps, and runs its own once the remote goes quiet', () => {
+    pickUpRemote(TV);
+    tvSetLoop(TV, true);
+    tvPlay(TV, CLIP);
+    tvNoteEnd(TV, 60_000);
+    tvHeartbeat(TV, 59_000);
+    iAm(BOB, 'Bob'); // a viewer on this page, the holder's lease live
+    now += 3_000;
+    // The holder's player is the room's clock: its lap comes as a write.
+    expect(readPlayback(TV).positionMs).toBe(62_000);
+    now += TV_LEASE_LAPSE_MS;
+    // Gone quiet: the viewer works the lap out for itself.
+    expect(remoteStatus(TV)).toBe('free');
+    expect(readPlayback(TV).positionMs).toBe(59_000 + 3_000 + TV_LEASE_LAPSE_MS - 60_000);
   });
 
   it('expectedPositionMs and driftAction', () => {

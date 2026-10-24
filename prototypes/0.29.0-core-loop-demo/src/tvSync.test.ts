@@ -1357,6 +1357,30 @@ describe('🔁 LOOP, through the record', () => {
     expect(p.playing).toBe(true);
   });
 
+  it('with nobody holding the remote, a viewer at the end of a LOOP film plays the lap the room works out for itself', () => {
+    // No holder writes the lap: the reading wraps into it (readPlayback),
+    // and nothing else moves — no new start, no transport write.
+    const p = new FakePlayer(true);
+    p.duration = 10_000;
+    const h = harness(p, { loopEnd: 10_000 });
+    h.set({ positionMs: 9_900 });
+    h.tick();
+    p.seek(10_000); // ran out
+    p.playing = false;
+    p.log.length = 0;
+    h.set({ positionMs: 300 });
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:300']);
+    expect(p.playing).toBe(true);
+    expect(p.ended).toBe(false);
+    // And a player still running past where the room wrapped is sent there too.
+    p.position = 9_950;
+    p.log.length = 0;
+    h.set({ positionMs: 150 });
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:150']);
+  });
+
   it('a lap\'s position comes from the media end the record carries, never from what this player can seek to', () => {
     expect(loopPosition(15_000, 60_000)).toBe(15_000); // a 60 s film, whatever prefix a host without ranges lets this player seek in
     expect(loopPosition(65_000, 60_000)).toBe(5_000);

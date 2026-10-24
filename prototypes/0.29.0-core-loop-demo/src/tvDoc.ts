@@ -61,6 +61,10 @@ export const TV_HEARTBEAT_MS = 3_000;
 export const TV_LEASE_RENEW_MS = 3_000;
 /** A remote not renewed for this long (as THIS page saw it) is free again. */
 export const TV_LEASE_LAPSE_MS = 8_000;
+/** The most a first sight of a programme runs it on by its writer's clock
+ *  (`at`): a week. Past that, a programme left playing is long over, or
+ *  that many laps in, and a clock that far out is not worth trusting. */
+export const TV_WALL_GAP_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 /** A viewer further than this from the holder's clock SEEKS… */
 export const TV_SEEK_OVER_MS = 1_500;
 /** …and nearer than that but further than this nudges the playback rate. */
@@ -180,6 +184,14 @@ export interface TvProgramme {
    *  setting, kept across programmes until it is turned off, and the
    *  holder's to set like the rest of this record (tvSetLoop). */
   loop: boolean;
+  /** UTC ms on the WRITER's clock when `positionMs` was written: where the
+   *  room was, and when. Read only by a page with nothing fresher — its
+   *  first sight of a programme playing (a newcomer, a page come back to
+   *  the room), when the holder's position is otherwise of unknown age —
+   *  so a film keeps playing in a room nobody is in, as a broadcast does,
+   *  and whoever walks in joins it where it would be now (noteSamples).
+   *  Every heartbeat restamps it; 0 on a record from before the field. */
+  at: number;
   /** The holder's name on the sample, for the screen's "with <name>" line. */
   history: TvHistoryEntry[];
 }
@@ -219,6 +231,7 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   showing: 0,
   jump: 0,
   laps: 0,
+  at: 0,
   endMs: 0,
   loop: false,
   history: [],
@@ -303,6 +316,10 @@ interface Sample {
    *  stamp says: the provenance the takeover anchor reads (fromSample). */
   arrivedAt: number;
   park?: true;
+  /** Anchored on the writer's wall clock (`at`), not on receipt: this
+   *  page's first sight of a programme playing. LOOP wraps such a reading
+   *  into the lap the room is on (readPlayback). */
+  wall?: true;
   /** This page's own write (the holder's beat): stamped as written, and
    *  the one stale sample whose bridged reading the switch may carry
    *  (roomPositionMs). */
@@ -521,9 +538,19 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       // A sample the network held through a sleep and delivers on waking
       // is stamped from before the gap (`stamp`), and stale with the rest
       // (readPlayback): not a fresh anchor this page can act on.
+      // This page's FIRST sight of a programme playing (a newcomer; a page
+      // back in the room) is of unknown age: the holder may have written
+      // it a heartbeat ago or left hours ago. Its writer's wall clock says
+      // which (`at`), and the room runs on from there — skewed by however
+      // far the two clocks disagree, and corrected by the holder's next
+      // beat if there is a holder. Later samples are fresh on arrival.
+      const elapsed = !prev && !local && rec.state === 'playing' && rec.at > 0
+        ? Math.min(TV_WALL_GAP_MAX_MS, Math.max(0, wallClock() - rec.at)) : 0;
       samples.set(itemId, local
         ? { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now, own: true }
-        : { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now });
+        : elapsed > 0
+          ? { seq: rec.seq, positionMs: rec.positionMs + elapsed, receivedAt: stamp, arrivedAt: now, wall: true }
+          : { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now });
     }
   }
 }
@@ -749,6 +776,7 @@ export function readProgramme(itemId: string): TvProgramme {
     laps: counter(raw.laps),
     endMs: Math.max(0, Math.floor(num(raw.endMs))),
     loop: raw.loop === true,
+    at: Math.max(0, Math.floor(num(raw.at))),
     history,
   };
 }
@@ -965,6 +993,7 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torr
     state: 'playing',
     startAt: 0,
     positionMs: 0,
+    at: now,
     seq: bump(rec.seq),
     started,
     showing: started,
@@ -1108,6 +1137,7 @@ export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
     state: 'playing',
     startAt: 0,
     positionMs: Math.max(0, Math.floor(positionMs)),
+    at: wallClock(),
     seq: bump(rec.seq),
   } satisfies TvProgramme);
   return { ok: true };
@@ -1139,7 +1169,7 @@ export function tvResume(itemId: string): TvAction {
   if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   if (rec.state !== 'paused' || !rec.source) return { ok: false, error: 'Nothing is paused.' };
-  write(tvKey(itemId), { ...rec, state: 'playing', seq: bump(rec.seq), jump: bump(rec.jump) } satisfies TvProgramme);
+  write(tvKey(itemId), { ...rec, state: 'playing', at: wallClock(), seq: bump(rec.seq), jump: bump(rec.jump) } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -1150,7 +1180,7 @@ export function tvSeek(itemId: string, positionMs: number): TvAction {
   const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'paused') return { ok: false, error: 'Nothing is playing.' };
   write(tvKey(itemId), {
-    ...rec, positionMs: Math.max(0, Math.floor(positionMs)), seq: bump(rec.seq), jump: bump(rec.jump),
+    ...rec, positionMs: Math.max(0, Math.floor(positionMs)), at: wallClock(), seq: bump(rec.seq), jump: bump(rec.jump),
   } satisfies TvProgramme);
   return { ok: true };
 }
@@ -1198,7 +1228,7 @@ export function tvProgrammeEnded(itemId: string): TvAction {
   const rec = readProgramme(itemId);
   if (!rec.loop || !rec.source) return tvStop(itemId);
   write(tvKey(itemId), {
-    ...rec, state: 'playing', startAt: 0, positionMs: 0, seq: bump(rec.seq), started: bump(rec.started), jump: bump(rec.jump),
+    ...rec, state: 'playing', startAt: 0, positionMs: 0, at: wallClock(), seq: bump(rec.seq), started: bump(rec.started), jump: bump(rec.jump),
     laps: bump(rec.laps),
   } satisfies TvProgramme);
   return { ok: true };
@@ -1394,7 +1424,20 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
   }
   if (rec.state === 'playing') {
     const sample = samples.get(itemId);
-    return sample ? fromSample(sample, now, rttMs) : { state: 'playing', positionMs: rec.positionMs, running: true, countdownMs: 0 };
+    const pb: PlaybackNow = sample ? fromSample(sample, now, rttMs) : { state: 'playing', positionMs: rec.positionMs, running: true, countdownMs: 0 };
+    // LOOP with no one to run the laps (the remote put down or gone quiet:
+    // the room may be empty but for this page), or on a first sight run on
+    // by the writer's clock: past the end is that far into a lap, and every
+    // page in the room works out the same one. The holder runs its own
+    // (tvProgrammeEnded), and a viewer with a live holder follows those.
+    if (rec.loop && rec.endMs > 0 && !iHoldRemote(itemId) && (sample?.wall === true || remoteLapsed(itemId, now))) {
+      return {
+        ...pb,
+        positionMs: intoLap(pb.positionMs, rec.endMs),
+        ...(pb.anchorMs !== undefined ? { anchorMs: intoLap(pb.anchorMs, rec.endMs) } : {}),
+      };
+    }
+    return pb;
   }
   if (rec.state === 'paused') return { state: 'paused', positionMs: rec.positionMs, running: false, countdownMs: 0 };
   return { state: rec.state, positionMs: 0, running: false, countdownMs: 0 };
@@ -1426,6 +1469,12 @@ function fromSample(sample: Sample, now: number, rttMs: number): PlaybackNow {
     return { state: 'playing', positionMs: bridged, running: true, countdownMs: 0, stale: true, anchorMs };
   }
   return { state: 'playing', positionMs, running: true, countdownMs: 0 };
+}
+
+/** A position past a looping programme's end, `lapMs`, as that far into
+ *  the lap it is on. */
+function intoLap(ms: number, lapMs: number): number {
+  return ms >= lapMs ? ms % lapMs : ms;
 }
 
 /** Where a HOLDER takes the room from: the takeover anchor of a stale
