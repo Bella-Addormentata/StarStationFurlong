@@ -298,8 +298,16 @@ function clampSafe(n: bigint): number {
  *  records. Below 0 when two pages spent the same chips at once. */
 function ledgerTotal(account: string): bigint {
   const map = ensureMap();
-  const opening = safeCount(map, isBankrollAccount(account) ? account : `bal:${account}`);
-  return BigInt(opening) + (chipIndex.byAccount.get(account) ?? 0n);
+  const opening = legacyCount(map, isBankrollAccount(account) ? account : `bal:${account}`);
+  return opening + (chipIndex.byAccount.get(account) ?? 0n);
+}
+
+/** A count an earlier build stored (`bal:`, `bought:`, `cashed:`, a
+ *  bankroll), exactly: those builds kept any non-negative integer, even past
+ *  the safe range. Anything else reads as 0. */
+function legacyCount(map: Y.Map<unknown>, key: string): bigint {
+  const value = map.get(key);
+  return Number.isInteger(value) && (value as number) >= 0 ? BigInt(value as number) : 0n;
 }
 
 /** An account's chips as a number: never below 0, never past the safe range. */
@@ -425,7 +433,7 @@ export function readCageLedger(): CageLedger {
     [...chipIndex.byAccount.keys()].filter((account) => !isBankrollAccount(account)),
   );
   for (const [key, value] of map.entries()) {
-    if (!Number.isSafeInteger(value) || (value as number) < 0) continue;
+    if (!Number.isInteger(value) || (value as number) < 0) continue;
     const n = BigInt(value as number);
     if (key.startsWith('bought:')) issued += n;
     else if (key.startsWith('cashed:')) cashed += n;
@@ -1185,6 +1193,10 @@ export function reserveSlotWager(
   const playerBalance = readChips(playerId);
   if (playerBalance < bet) return 'insufficient-player-funds';
   if (safeCount(map, escrowKey) > 0) return 'insufficient-bankroll';
+  // A bankroll in overdraft (two withdrawals of the same chips at once) takes
+  // no spin until it is refilled, whatever the paytable.
+  const fundingAccount = fundingKey.startsWith('bal:') ? fundingKey.slice(4) : fundingKey;
+  if (ledgerTotal(fundingAccount) < 0n) return 'insufficient-bankroll';
 
   const sameAccount = playerKey === fundingKey;
   const fundingBalance = readAccount(map, fundingKey);

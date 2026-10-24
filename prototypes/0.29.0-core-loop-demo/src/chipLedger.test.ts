@@ -204,6 +204,8 @@ describe('a slot machine\'s own bankroll', () => {
     expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(0);
     expect(pageA.withdrawSlotFunding(MACHINE, OTHER, 1)).toBe(false);
     expect(pageA.reserveSlotWager(MACHINE, PLAYER, 10, funding, 50)).toBe('insufficient-bankroll');
+    // Not even a spin its own stake could pay.
+    expect(pageA.reserveSlotWager(MACHINE, PLAYER, 10, funding, 10)).toBe('insufficient-bankroll');
     expect(pageA.depositSlotFunding(MACHINE, OTHER, 150)).toBe(true);
     expect(pageA.readSlotFundingBalance(MACHINE, funding)).toBe(50);
   });
@@ -292,6 +294,23 @@ describe('a room saved by an earlier build', () => {
     // The earlier build reads only `bal:` (40) and writes back 40 + 5 for a payout.
     map.set(`bal:${PLAYER}`, 45);
     expect(pageA.readChips(PLAYER)).toBe(35);
+  });
+
+  it('a stored balance past the safe range opens in full: reads stop at the range, the ledger keeps the rest', () => {
+    const map = docA.getMap('casino');
+    map.set(`bal:${PLAYER}`, 2 ** 55);
+    map.set(`bought:${PLAYER}`, 2 ** 56);
+    map.set(`cashed:${PLAYER}`, 2 ** 55);
+    expect(pageA.readChips(PLAYER)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(pageA.spendChips(PLAYER, 1)).toBe(true);
+    expect(pageA.readChips(PLAYER)).toBe(Number.MAX_SAFE_INTEGER);
+    pageA.creditChips(PLAYER, 1);
+    expect(pageA.readCageLedger()).toMatchObject({
+      issued: Number.MAX_SAFE_INTEGER,
+      cashed: Number.MAX_SAFE_INTEGER,
+      outstanding: Number.MAX_SAFE_INTEGER,
+      houseNet: 0,
+    });
   });
 
   it('a junk stored balance reads as none', () => {
