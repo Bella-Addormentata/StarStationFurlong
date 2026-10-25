@@ -57,19 +57,50 @@ export function plotMarkers(
 ): HoloMarker[] {
   return bodies.map((body) => {
     const o = plotOffset(bodies, body, nowMs, simTick);
+    const frame = frameOf(bodies, body, nowMs);
     const marker: HoloMarker = {
       id: body.id,
       name: body.name,
       type: body.type,
-      frame: frameOf(bodies, body, nowMs),
+      frame,
       x: o.dx * PLOT_SCALE,
       z: o.dy * PLOT_SCALE,
       here: body.type === 'station' && body.id === hereId,
     };
     const ring = orbitRing(bodies, body, nowMs, simTick);
     if (ring) marker.orbit = ring;
-    return marker;
+    return stretched(marker, bodies, nowMs, simTick);
   });
+}
+
+/**
+ * 🔭 The hologram spreads the planets apart: the panel's schematic radii
+ * (100, 180, the belt at 280) crowd the planets round the sun, so each
+ * planet's orbit is drawn STRETCH times wider here — its ring and the
+ * Lagrange pockets on it with it, and the stations round it carried
+ * along (their rings stay circles round the planet). The belt and the sun
+ * stay. Schematic, like the radii.
+ */
+const STRETCH: Record<string, number> = { 'planet-aris': 1.32, 'planet-sovereign': 1.14 };
+export function orbitStretch(frame: string): number {
+  return STRETCH[frame] ?? 1;
+}
+function stretched(mk: HoloMarker, bodies: readonly MapBody[], nowMs: number, simTick: number): HoloMarker {
+  const k = orbitStretch(mk.frame);
+  if (k === 1) return mk;
+  if (mk.type === 'planet' || mk.type === 'lagrange') {
+    const out: HoloMarker = { ...mk, x: mk.x * k, z: mk.z * k };
+    if (mk.orbit) out.orbit = { cx: mk.orbit.cx * k, cz: mk.orbit.cz * k, r: mk.orbit.r * k };
+    return out;
+  }
+  // A station: carried with its planet, which moved by (k − 1) × its place.
+  const planet = bodies.find((b) => b.id === mk.frame);
+  if (!planet) return mk;
+  const c = plotOffset(bodies, planet, nowMs, simTick);
+  const dx = c.dx * PLOT_SCALE * (k - 1), dz = c.dy * PLOT_SCALE * (k - 1);
+  const out: HoloMarker = { ...mk, x: mk.x + dx, z: mk.z + dz };
+  if (mk.orbit) out.orbit = { cx: mk.orbit.cx + dx, cz: mk.orbit.cz + dz, r: mk.orbit.r };
+  return out;
 }
 
 /** The orbit plane a body rides: its own for a planet or the belt, its

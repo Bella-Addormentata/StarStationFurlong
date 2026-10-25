@@ -81,21 +81,36 @@ function srgb(hex: number): THREE.Color {
 }
 
 // Palette: the plot is light, so colours are bright and additive-looking.
-const SUN_CORE = srgb(0xfff2c0);
-const SUN_CORONA = srgb(0xffb13a);
-const SUN_RIM = srgb(0xff6a22);
-/** Each planet: its two surface colours, and its atmosphere's. */
-const PLANET_COLORS: Record<string, [THREE.Color, THREE.Color, THREE.Color]> = {
-  'planet-aris': [srgb(0xff7a2a), srgb(0x3a0c04), srgb(0xff9a50)], // lava
-  'planet-sovereign': [srgb(0x2fb8ff), srgb(0x1d8a4a), srgb(0x5ac8ff)], // sea + land
+const SUN_CORE = srgb(0xfff6d5);
+const SUN_CORONA = srgb(0xffc24a);
+const SUN_RIM = srgb(0xff8a2a);
+/** Each planet: its two surface colours, its atmosphere's, and the colour
+ *  of its orbit and of the station rings round it (bodyColor). */
+interface PlanetLook { a: THREE.Color; b: THREE.Color; air: THREE.Color; ring: THREE.Color; hex: number }
+const PLANET_LOOKS: Record<string, PlanetLook> = {
+  'planet-aris': { a: srgb(0xff8a3c), b: srgb(0x4a1206), air: srgb(0xffb070), ring: srgb(0xff9a4a), hex: 0xffa060 }, // lava
+  'planet-sovereign': { a: srgb(0x4fd0ff), b: srgb(0x1e9a5a), air: srgb(0x8ae0ff), ring: srgb(0x5fd6ff), hex: 0x6fdcff }, // sea + land
 };
-const PLANET_DEFAULT: [THREE.Color, THREE.Color, THREE.Color] = [srgb(0x9ff6ff), srgb(0x2a6a8a), srgb(0x7fe9ff)];
-const ATMOSPHERE = srgb(0x7fe9ff);
+const PLANET_DEFAULT: PlanetLook = { a: srgb(0xc8b4ff), b: srgb(0x4a3a8a), air: srgb(0xd8ccff), ring: srgb(0xb8a4ff), hex: 0xc8b4ff };
+const lookOf = (id: string): PlanetLook => PLANET_LOOKS[id] ?? PLANET_DEFAULT;
+const ATMOSPHERE = srgb(0x9fe9ff);
 const DUST = srgb(0x66e6ff);
-const BELT = srgb(0xa9cfe0);
-const STATION = srgb(0xe6fbff);
-const HERE = srgb(0xffc46b);
-const LAGRANGE = srgb(0x8fd3ff);
+const BELT = srgb(0xc9d6e2);
+const STATION = srgb(0xfff2c8);
+const HERE = srgb(0x3dff9a);
+const LAGRANGE = srgb(0xc29bff);
+
+/** The colour a body is drawn in, for labels and cards to match: hex sRGB. */
+export function bodyColor(mk: Pick<HoloMarker, 'id' | 'type' | 'frame' | 'here'>): number {
+  if (mk.here) return 0x3dff9a;
+  switch (mk.type) {
+    case 'star': return 0xffd27a;
+    case 'planet': return lookOf(mk.id).hex;
+    case 'station': return 0xfff2c8;
+    case 'lagrange': return 0xc29bff;
+    default: return 0xc9d6e2;
+  }
+}
 
 const _nodeAxis = new THREE.Vector3();
 const _qTilt = new THREE.Quaternion();
@@ -241,9 +256,9 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
   // projection its volume.
   const sun = make('sun', (s) => {
     const rand = rng(7);
-    ball(s, N(1200), 0.03, Z(0.0055), 1, SUN_CORE, SUN_CORE, rand, 0.3);
-    ball(s, N(900), 0.07, Z(0.009), 0.18, SUN_CORONA, SUN_RIM, rand, 2.2);
-    rays(s, N(80), 0.15, Z(0.0025), 0.32, SUN_CORONA, rand);
+    ball(s, N(1200), 0.03, Z(0.0055), 1, SUN_CORE, SUN_CORONA, rand, 0.3);
+    ball(s, N(800), 0.065, Z(0.009), 0.16, SUN_CORONA, SUN_RIM, rand, 2.2);
+    rays(s, N(70), 0.14, Z(0.0025), 0.28, SUN_CORONA, rand);
   });
   sun.position.y = 0.02;
   const haze = make('haze', (s) => {
@@ -252,7 +267,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
       const a = rand() * Math.PI * 2, rr = HOLO_RADIUS * Math.sqrt(rand());
       V.set(Math.cos(a) * rr, 0.01 + rand() * 0.05, Math.sin(a) * rr);
       S.setScalar(Z(0.03 + rand() * 0.05));
-      s.pushSplat(V, S, Q, 0.02, DUST);
+      s.pushSplat(V, S, Q, 0.02 / detail, DUST);
     }
     // The dome: a hemisphere of soft light.
     for (let i = 0; i < N(700); i++) {
@@ -261,12 +276,12 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
       const r = HOLO_RADIUS * 1.02;
       V.set(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi) * 0.5, r * Math.sin(phi) * Math.sin(theta));
       S.setScalar(Z(0.02 + rand() * 0.03));
-      s.pushSplat(V, S, Q, 0.012, DUST);
+      s.pushSplat(V, S, Q, 0.012 / detail, DUST);
     }
   });
   // The belt: thousands of grains in an annulus, a little thickness to it.
   let belt: SplatMeshT | null = null;
-  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, N(5000), r, 0.06, 0.02, Z(0.0026), 0.7, BELT, rng(5)));
+  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, N(4200), r, 0.06, 0.018, Z(0.0022), 0.55, BELT, rng(5)));
   // The scan: a thin ring that climbs off the disc and fades, over and over.
   const sweep = make('sweep', (s) => ring(s, N(400), HOLO_RADIUS * 0.98, 0.004, 0.002, Z(0.003), 0.5, ATMOSPHERE, rng(31)));
 
@@ -280,13 +295,13 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     const g = new THREE.Group();
     g.name = `planet-${id}`;
     group.add(g);
-    const [a, b, air] = PLANET_COLORS[id] ?? PLANET_DEFAULT;
+    const { a, b, air } = lookOf(id);
     // The body and its air face the sun (place() turns `spin` toward it),
     // lit from that side; the rings and the foot stay put.
     const spin = new THREE.Group();
-    const body = new SplatMesh({ constructSplats: (s) => shell(s, N(900), 0.03, Z(0.0036), 1, a, b, rng(id.length * 31), 0.85) });
+    const body = new SplatMesh({ constructSplats: (s) => shell(s, N(1100), 0.033, Z(0.0034), 1, a, b, rng(id.length * 31), 0.85) });
     // The atmosphere: a thin halo just off the surface, not a fill.
-    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(300), 0.039, Z(0.009), 0.07, air, air, rng(id.length * 17), 0.5) });
+    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(300), 0.042, Z(0.008), 0.05, air, air, rng(id.length * 17), 0.5) });
     const foot = new SplatMesh({ constructSplats: (s) => pillar(s, N(90), 0.017 + SPLAT_LIFT / SPLAT_SCALE, 0.006, Z(0.004), 0.14, DUST, rng(id.length * 5)) });
     spin.add(body); spin.add(atmo); g.add(spin); g.add(foot);
     rig = { group: g, spin, rings: null, ringKey: '', orbit: null, orbitR: 0 };
@@ -299,13 +314,13 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     let m = sparks.get(id);
     if (m) return m;
     m = kind === 'station'
-      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(120), 0.011, Z(0.0038), 1, STATION, STATION, rand, 0.5); ball(s, N(60), 0.024, Z(0.006), 0.18, ATMOSPHERE, DUST, rand, 1.5); })
+      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(120), 0.011, Z(0.0038), 1, STATION, STATION, rand, 0.5); ball(s, N(60), 0.022, Z(0.006), 0.16, STATION, ATMOSPHERE, rand, 1.5); })
       : make(`lagrange-${id}`, (s) => ball(s, N(90), 0.016, Z(0.006), 0.4, LAGRANGE, DUST, rng(id.length * 29), 1.2));
     sparks.set(id, m);
     return m;
   };
   // "You are here": an amber halo that breathes.
-  const here = make('here', (s) => { const rand = rng(23); ring(s, N(320), 0.04, 0.006, 0.006, Z(0.0045), 1, HERE, rand); ball(s, N(160), 0.05, Z(0.009), 0.25, HERE, SUN_CORONA, rand, 1.5); });
+  const here = make('here', (s) => { const rand = rng(23); ring(s, N(320), 0.04, 0.006, 0.006, Z(0.0045), 1, HERE, rand); ball(s, N(160), 0.05, Z(0.009), 0.22, HERE, HERE, rand, 1.5); });
   here.visible = false;
 
   const all = (): SplatMeshT[] => {
@@ -345,7 +360,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
           if (mk.orbit && Math.abs(mk.orbit.r - rig.orbitR) > 1e-6) {
             rig.orbit?.removeFromParent(); rig.orbit?.dispose();
             const r = mk.orbit.r;
-            rig.orbit = make(`orbit-${mk.id}`, (s) => ring(s, N(1400), r, 0.005, 0.004, Z(0.0028), 0.5, DUST, rng(mk.id.length * 7)));
+            rig.orbit = make(`orbit-${mk.id}`, (s) => ring(s, N(1800), r, 0.003, 0.002, Z(0.0022), 0.6, lookOf(mk.id).ring, rng(mk.id.length * 7)));
             rig.orbit.position.set(mk.orbit.cx, 0.004, mk.orbit.cz);
             tiltTo(rig.orbit, inc);
             rig.orbitR = r;
@@ -372,7 +387,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
           rig.rings?.removeFromParent(); rig.rings?.dispose(); rig.rings = null;
           if (radii.length) {
             const rs = radii.map(Number);
-            rig.rings = new SplatMesh({ constructSplats: (s) => { const rand = rng(id.length * 3 + rs.length); for (const r of rs) ring(s, N(420), r, 0.003, 0.003, Z(0.0022), 0.55, DUST, rand); } });
+            rig.rings = new SplatMesh({ constructSplats: (s) => { const rand = rng(id.length * 3 + rs.length); for (const r of rs) ring(s, N(480), r, 0.002, 0.002, Z(0.0018), 0.5, lookOf(id).ring, rand); } });
             rig.rings.position.y = -0.013;
             tiltTo(rig.rings, inclinationOf(id));
             rig.group.add(rig.rings);

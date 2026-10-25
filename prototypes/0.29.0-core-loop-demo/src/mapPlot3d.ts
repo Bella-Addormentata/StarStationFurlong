@@ -15,7 +15,7 @@
 import * as THREE from 'three';
 import type { MapBody } from './map';
 import { HOLO_RADIUS, inclinationOf, inclinedPoint, plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
-import { SPLAT_SCALE, buildSplatPlot, sparkHost, type SplatPlotHandle } from './mapHologramSplats';
+import { SPLAT_SCALE, bodyColor, buildSplatPlot, sparkHost, type SplatPlotHandle } from './mapHologramSplats';
 
 export interface PlotFrameState {
   /** The station the player is in (map.ts playerLocationId). */
@@ -80,6 +80,23 @@ export function pickBody(
   return best;
 }
 
+/** A soft round glow, drawn once: the stars' and nebulae's sprite. */
+function softSpriteTexture(): THREE.Texture {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d')!;
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.25, 'rgba(255,255,255,0.55)');
+  grad.addColorStop(0.6, 'rgba(255,255,255,0.12)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
 /** How the plot is grown inside the panel: the layout's 0.5 m disc becomes
  *  a unit-ish radius, which the camera distances above are set for. */
 const PANEL_SCALE = 1.2;
@@ -117,7 +134,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
 
   const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setClearColor(0x020412, 1);
+  renderer.setClearColor(0x03040d, 1);
   const canvas = renderer.domElement;
   canvas.style.cssText = 'position:absolute; inset:0; width:100%; height:100%; display:block; cursor:grab;';
 
@@ -128,29 +145,60 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   /** Until the player zooms, the distance follows the panel's size. */
   let fitted = true;
 
-  // A still sky of stars, far out.
+  // The galaxy: stars of every brightness and warmth, a band of them
+  // across the sky like the Milky Way, and a few soft nebulae in it.
   {
-    const n = 1600;
-    const pos = new Float32Array(n * 3);
     let seed = 7;
     const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
-    for (let i = 0; i < n; i++) {
-      const u = rand(), v = rand();
-      const theta = 2 * Math.PI * u, phi = Math.acos(2 * v - 1), r = 40;
-      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
-      pos[i * 3 + 1] = r * Math.cos(phi);
-      pos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+    const soft = softSpriteTexture();
+    const R = 40;
+    // The band: a great circle tilted over, stars thick along it.
+    const bandTilt = 1.05, bandTurn = 0.6;
+    const onSky = (theta: number, phi: number) => {
+      const x = Math.sin(phi) * Math.cos(theta), y = Math.cos(phi), z = Math.sin(phi) * Math.sin(theta);
+      // Tilt the whole sky so the band leans across the view.
+      const y2 = y * Math.cos(bandTilt) - z * Math.sin(bandTilt), z2 = y * Math.sin(bandTilt) + z * Math.cos(bandTilt);
+      const x3 = x * Math.cos(bandTurn) - z2 * Math.sin(bandTurn), z3 = x * Math.sin(bandTurn) + z2 * Math.cos(bandTurn);
+      return [x3 * R, y2 * R, z3 * R] as const;
+    };
+    const warmth = (t: number): [number, number, number] => (t < 0.33 ? [0.78, 0.86, 1] : t < 0.8 ? [1, 1, 1] : [1, 0.9, 0.72]);
+    const layer = (n: number, size: number, opacity: number, band: boolean) => {
+      const pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) {
+        const theta = 2 * Math.PI * rand();
+        // Everywhere, or packed toward the band's plane (phi near π/2).
+        const phi = band ? Math.PI / 2 + (rand() + rand() + rand() - 1.5) * 0.22 : Math.acos(2 * rand() - 1);
+        const [x, y, z] = onSky(theta, phi);
+        pos.set([x, y, z], i * 3);
+        const w = warmth(rand()), b = 0.5 + 0.5 * rand();
+        col.set([w[0] * b, w[1] * b, w[2] * b], i * 3);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      const mat = new THREE.PointsMaterial({ size, map: soft, transparent: true, opacity, vertexColors: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true });
+      scene.add(new THREE.Points(geo, mat));
+    };
+    layer(3200, 0.42, 0.85, false); // the field
+    layer(400, 0.95, 1, false); // the bright few
+    layer(12000, 0.3, 0.6, true); // the band
+    // Nebulae along the band: soft, tinted, far.
+    const tints = [0x6a4cff, 0x2f7dff, 0x9b4cff, 0x2fb3c8, 0xff6aa8, 0x4c6aff];
+    for (let i = 0; i < 22; i++) {
+      const theta = 2 * Math.PI * rand(), phi = Math.PI / 2 + (rand() - 0.5) * 0.36;
+      const [x, y, z] = onSky(theta, phi);
+      const mat = new THREE.SpriteMaterial({ map: soft, color: tints[i % tints.length], transparent: true, opacity: 0.14 + rand() * 0.12, blending: THREE.AdditiveBlending, depthWrite: false });
+      const sp = new THREE.Sprite(mat);
+      sp.position.set(x * 0.9, y * 0.9, z * 0.9);
+      sp.scale.setScalar(22 + rand() * 20);
+      scene.add(sp);
     }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    const stars = new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xd4a84b, size: 0.06, transparent: true, opacity: 0.55, sizeAttenuation: true }));
-    scene.add(stars);
   }
   // A faint grid plane under the system, like the canvas had.
   {
-    const grid = new THREE.GridHelper(6, 24, 0x7a5f2a, 0x3a2e14);
+    const grid = new THREE.GridHelper(6, 24, 0x3a4a6a, 0x1c2438);
     (grid.material as THREE.Material).transparent = true;
-    (grid.material as THREE.Material).opacity = 0.18;
+    (grid.material as THREE.Material).opacity = 0.14;
     grid.position.y = -0.02;
     scene.add(grid);
   }
@@ -194,7 +242,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   // DOM: labels over the canvas, and the hint.
   const labelLayer = document.createElement('div');
   labelLayer.style.cssText = 'position:absolute; inset:0; pointer-events:none; overflow:hidden;';
-  const labels = new Map<string, HTMLSpanElement>();
+  const labels = new Map<string, { el: HTMLSpanElement; dot: HTMLElement; text: HTMLElement }>();
   const hint = document.createElement('div');
   hint.textContent = '🖱 DRAG to orbit · 🎡 SCROLL to zoom · CLICK body to select';
   hint.style.cssText = 'position:absolute; bottom:24px; left:24px; font-size:11px; color:rgba(212,168,75,0.55); background:rgba(4,8,22,0.85); padding:6px 12px; border-radius:6px; border:1px solid rgba(212,168,75,0.18); pointer-events:none;';
@@ -244,16 +292,24 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   };
   const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => resize()) : null;
 
-  const labelFor = (id: string): HTMLSpanElement => {
-    let el = labels.get(id);
-    if (!el) {
-      el = document.createElement('span');
-      el.style.cssText = 'position:absolute; transform:translate(-50%, 0); font-size:10px; font-family:"SF Mono", Monaco, Consolas, monospace; white-space:nowrap; text-shadow:0 0 6px rgba(0,0,0,0.9);';
+  interface Label { el: HTMLSpanElement; dot: HTMLElement; text: HTMLElement }
+  const labelFor = (id: string): Label => {
+    let l = labels.get(id);
+    if (!l) {
+      const el = document.createElement('span');
+      el.style.cssText = 'position:absolute; transform:translate(-50%, 0); display:inline-flex; align-items:center; gap:5px; padding:2px 7px 2px 5px; border-radius:9px; background:rgba(3,6,18,0.62); border:1px solid rgba(120,150,200,0.16); font-size:10px; letter-spacing:0.6px; text-transform:uppercase; font-family:"SF Mono", Monaco, Consolas, monospace; white-space:nowrap; color:rgba(222,234,255,0.9);';
+      const dot = document.createElement('i');
+      dot.style.cssText = 'display:inline-block; width:6px; height:6px; border-radius:50%; box-shadow:0 0 6px currentColor; background:currentColor;';
+      const text = document.createElement('b');
+      text.style.cssText = 'font-weight:600; max-width:150px; overflow:hidden; text-overflow:ellipsis;';
+      el.appendChild(dot); el.appendChild(text);
       labelLayer.appendChild(el);
-      labels.set(id, el);
+      l = { el, dot, text };
+      labels.set(id, l);
     }
-    return el;
+    return l;
   };
+  const css = (hex: number) => '#' + hex.toString(16).padStart(6, '0');
 
   const v = new THREE.Vector3();
   /** A marker's place in the panel's world: on its tilted orbit plane, as
@@ -300,6 +356,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
       const sel = state.selectedId ? byId.get(state.selectedId) : undefined;
       if (sel) {
         halo.visible = true;
+        (halo.material as THREE.MeshBasicMaterial).color.setHex(bodyColor({ ...sel, here: false }));
         halo.position.copy(place3(sel, 0.012));
         halo.scale.setScalar((sel.type === 'star' ? 0.12 : 0.07) * (1 + 0.12 * Math.sin(nowMs / 160)));
       } else halo.visible = false;
@@ -326,9 +383,12 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
         line.visible = n > 1;
       });
       renderer.render(scene, camera);
-      // Labels: projected after the render, with the same camera.
+      // Labels: projected after the render, with the same camera; laid out
+      // so none covers another (the sun, the planets, here and the
+      // selection first; a label with no clear spot nearby is left out).
       projected = [];
       const seen = new Set<string>();
+      const pending: Array<{ mk: HoloMarker; x: number; y: number; l: Label; rank: number }> = [];
       for (const mk of markers) {
         if (mk.type === 'asteroid-field') continue;
         const w = place3(mk, 0.02);
@@ -336,16 +396,39 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
         const behind = w.z > 1;
         const x = (w.x + 1) / 2 * width, y = (1 - w.y) / 2 * height;
         projected.push({ id: mk.id, x, y, behind });
-        const el = labelFor(mk.id);
+        const l = labelFor(mk.id);
         seen.add(mk.id);
         const here = mk.id === state.hereId;
-        el.textContent = here ? `🛸 [${mk.name}]` : mk.name;
-        el.style.color = here ? '#00e676' : mk.id === state.selectedId ? '#F0C060' : 'rgba(212,168,75,0.75)';
-        el.style.left = `${x}px`;
-        el.style.top = `${y + (mk.type === 'star' ? 26 : mk.type === 'planet' ? 16 : 10)}px`;
-        el.style.display = behind || mk.type === 'lagrange' && orbit.dist > 4 ? 'none' : '';
+        const selected = mk.id === state.selectedId;
+        const colour = css(bodyColor({ ...mk, here }));
+        l.text.textContent = here ? `🛸 ${mk.name}` : mk.name;
+        l.dot.style.color = colour;
+        l.el.style.color = here ? '#3dff9a' : selected ? '#ffffff' : 'rgba(222,234,255,0.88)';
+        l.el.style.borderColor = selected ? colour : here ? 'rgba(61,255,154,0.5)' : 'rgba(120,150,200,0.16)';
+        if (behind || (mk.type === 'lagrange' && orbit.dist > 4)) { l.el.style.display = 'none'; continue; }
+        const rank = mk.type === 'star' ? 0 : mk.type === 'planet' ? 1 : here ? 2 : selected ? 3 : mk.type === 'lagrange' ? 4 : 5;
+        pending.push({ mk, x, y: y + (mk.type === 'star' ? 26 : mk.type === 'planet' ? 18 : 11), l, rank });
       }
-      for (const [id, el] of labels) if (!seen.has(id)) { el.remove(); labels.delete(id); }
+      pending.sort((a, b) => a.rank - b.rank);
+      const placed: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+      for (const p of pending) {
+        p.l.el.style.display = '';
+        const w = p.l.el.offsetWidth || 80, h = p.l.el.offsetHeight || 18;
+        const fits = (cx: number, cy: number) => {
+          const r = { x0: cx - w / 2 - 2, y0: cy - 1, x1: cx + w / 2 + 2, y1: cy + h + 1 };
+          return placed.every((q) => r.x1 <= q.x0 || r.x0 >= q.x1 || r.y1 <= q.y0 || r.y0 >= q.y1) ? r : null;
+        };
+        let spot: { x0: number; y0: number; x1: number; y1: number } | null = null, lx = p.x, ly = p.y;
+        for (const [dx, dy] of [[0, 0], [0, 20], [0, 40], [0, -22], [0, 60], [w * 0.6, 20], [-w * 0.6, 20], [0, 80]]) {
+          spot = fits(p.x + dx, p.y + dy);
+          if (spot) { lx = p.x + dx; ly = p.y + dy; break; }
+        }
+        if (!spot) { p.l.el.style.display = 'none'; continue; }
+        placed.push(spot);
+        p.l.el.style.left = `${lx}px`;
+        p.l.el.style.top = `${ly}px`;
+      }
+      for (const [id, l] of labels) if (!seen.has(id)) { l.el.remove(); labels.delete(id); }
     },
   };
   return view;

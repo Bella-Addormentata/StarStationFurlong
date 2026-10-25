@@ -17,6 +17,7 @@ import {
   holoModeAt,
   inclinationOf,
   inclinedPoint,
+  orbitStretch,
   plotCourses,
   plotMarkers,
   stationLayout,
@@ -25,16 +26,31 @@ import {
 const T = ORBIT_EPOCH_MS + 5 * 3600 * 1000;
 
 describe('the plot on the disc', () => {
-  it('puts every body where the panel plots it, scaled to the disc', () => {
+  it('puts every body where the panel plots it, scaled to the disc, the planets spread apart', () => {
     const bodies = solarPlotBodies([DEFAULT_STATION_RECORD]);
     const markers = plotMarkers(bodies, T, DEFAULT_STATION_RECORD.id);
     expect(markers.map((m) => m.id)).toEqual(bodies.map((b) => b.id));
-    for (const [i, m] of markers.entries()) {
-      const o = plotOffset(bodies, bodies[i]!, T);
-      expect(m.x).toBeCloseTo(o.dx * PLOT_SCALE, 9);
-      expect(m.z).toBeCloseTo(o.dy * PLOT_SCALE, 9);
+    const at = (id: string) => { const b = bodies.find((x) => x.id === id)!; const o = plotOffset(bodies, b, T); return { x: o.dx * PLOT_SCALE, z: o.dy * PLOT_SCALE }; };
+    for (const m of markers) {
       expect(Math.hypot(m.x, m.z)).toBeLessThanOrEqual(HOLO_RADIUS);
+      const flat = at(m.id);
+      if (m.type === 'planet' || m.type === 'lagrange') {
+        // Its orbit, orbitStretch wider.
+        const k = orbitStretch(m.frame);
+        expect(m.x).toBeCloseTo(flat.x * k, 9);
+        expect(m.z).toBeCloseTo(flat.z * k, 9);
+      } else if (m.type === 'station') {
+        // Carried with its planet: the same offset from it as on the panel.
+        const planet = markers.find((p) => p.id === m.frame)!, pf = at(m.frame);
+        expect(m.x - planet.x).toBeCloseTo(flat.x - pf.x, 9);
+        expect(m.z - planet.z).toBeCloseTo(flat.z - pf.z, 9);
+      } else {
+        expect(m.x).toBeCloseTo(flat.x, 9);
+        expect(m.z).toBeCloseTo(flat.z, 9);
+      }
     }
+    expect(orbitStretch('planet-aris')).toBeGreaterThan(1);
+    expect(orbitStretch('belt-ring')).toBe(1);
   });
 
   it('marks only the station you are in as here', () => {
@@ -50,7 +66,7 @@ describe('the plot on the disc', () => {
     const bodies = solarPlotBodies([DEFAULT_STATION_RECORD]);
     const markers = plotMarkers(bodies, T);
     const sovereign = markers.find((m) => m.id === 'planet-sovereign')!;
-    expect(sovereign.orbit).toEqual({ cx: 0, cz: 0, r: 180 * PLOT_SCALE });
+    expect(sovereign.orbit).toEqual({ cx: 0, cz: 0, r: 180 * PLOT_SCALE * orbitStretch('planet-sovereign') });
     const [body] = stationBodies([DEFAULT_STATION_RECORD]);
     const station = markers.find((m) => m.id === body!.id)!;
     expect(station.orbit!.r).toBeCloseTo(body!.orbitRadius * PLOT_SCALE, 9);

@@ -14,6 +14,7 @@ import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
 import { describeMove, moveTransitPointAt, orbitChangePlanOf, stationPointWithMoveAt } from './stationMove';
 import type { StationMove } from './stations';
 import type { PlotView3D } from './mapPlot3d';
+import { bodyColor } from './mapHologramSplats';
 
 export interface MapBody {
   id: string;
@@ -447,7 +448,7 @@ export class SolarSystemMap {
 
     sidebar.innerHTML = `
       <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(212, 168, 75, 0.18); padding-bottom: 14px; margin-bottom: 20px;">
-        <span style="font-size: 14px; font-weight: 800; letter-spacing: 1px; color: #F0C060;">🌌 ORBITAL COOMMS</span>
+        <span style="font-size: 14px; font-weight: 800; letter-spacing: 1px; color: #F0C060;">🌌 ORBITAL COMMS</span>
         <button id="solarmap-close-btn" style="background: rgba(212,168,75,0.1); color: #d4a84b; border: 1px solid rgba(212,168,75,0.3); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size:11px;">CLOSE</button>
       </div>
 
@@ -620,6 +621,10 @@ export class SolarSystemMap {
     if (panel && nameEl && typeEl && descEl && resBox && resList && travelBtn) {
       panel.style.display = 'flex';
       nameEl.textContent = body.name;
+      // 🔮 In the body's own colour, as the plot in three dimensions draws it.
+      nameEl.style.color = this.plot3d
+        ? '#' + bodyColor({ id: body.id, type: body.type, frame: '', here: body.id === this.playerLocationId }).toString(16).padStart(6, '0')
+        : '';
       typeEl.textContent = body.type.toUpperCase();
       descEl.textContent = body.description;
 
