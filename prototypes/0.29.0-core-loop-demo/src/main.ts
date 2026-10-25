@@ -283,6 +283,8 @@ import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArca
 import { leaveArcadeRoom } from "./arcadeSession";
 import { closeArcadeStage } from "./arcadeStage";
 import { ARCADE_CABINET_KINDS, FURNITURE } from "./furniture";
+import { setMapHologramBuilder } from "./furniture";
+import { buildMapHologram } from "./mapHologram";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -590,6 +592,10 @@ import {
   subscribePeers,
   getPeer,
 } from "./peerStore";
+
+// 🔮 #251: the map table projects its hologram (furniture.ts builds the
+// table; the hologram reads the stations and the atlas, which read furniture).
+setMapHologramBuilder(buildMapHologram);
 
 type RendererModule = typeof import("./renderer");
 

@@ -20,6 +20,7 @@ function freshSinks(): FurnitureHandleSinks {
   return {
     wallScreens: new Map(),
     holoSpinners: [],
+    mapHolograms: new Map(),
     trunkLids: new Map(),
     gameTableTops: new Map(),
     cloneVats: new Map(),
@@ -66,9 +67,11 @@ describe('registerFurnitureHandles — filing', () => {
     const gators = handle('gators');
     const casino = handle('casino');
     const dish = handle('dish');
+    const holo = handle('holo');
     const ring = carrier({ holoSpin: 1.5 });
 
     registerFurnitureHandles(sinks, ITEM, carrier({ wallScreen: screen }));
+    registerFurnitureHandles(sinks, ITEM, carrier({ mapHologram: holo }));
     registerFurnitureHandles(sinks, ITEM, ring);
     registerFurnitureHandles(sinks, ITEM, carrier({ trunkLid: lid }));
     registerFurnitureHandles(sinks, ITEM, carrier({ gameTableTop: top }));
@@ -86,6 +89,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.holoSpinners).toHaveLength(1);
     expect(sinks.holoSpinners[0]!.mesh).toBe(ring);
     expect(sinks.holoSpinners[0]!.speed).toBe(1.5);
+    expect(sinks.mapHolograms.get(ITEM)).toBe(holo);
     expect(sinks.trunkLids.get(ITEM)).toBe(lid);
     expect(sinks.gameTableTops.get(ITEM)).toBe(top);
     expect(sinks.cloneVats.get(ITEM)).toBe(vat);
@@ -101,6 +105,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect([
       sinks.wallScreens.size,
       sinks.holoSpinners.length,
+      sinks.mapHolograms.size,
       sinks.trunkLids.size,
       sinks.gameTableTops.size,
       sinks.cloneVats.size,
@@ -112,7 +117,7 @@ describe('registerFurnitureHandles — filing', () => {
       sinks.alligatorsVisuals.size,
       sinks.casinoTableVisuals.size,
       sinks.faucetDishes.size,
-    ]).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+    ]).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
   });
 
   it('files every kind one carrier mesh carries', () => {
@@ -120,6 +125,7 @@ describe('registerFurnitureHandles — filing', () => {
     const all = carrier({
       wallScreen: handle('s'),
       holoSpin: 2,
+      mapHologram: handle('o'),
       trunkLid: handle('l'),
       gameTableTop: handle('t'),
       cloneVat: handle('v'),
@@ -135,6 +141,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.wallScreens.get(ITEM)).toBe(all.userData.wallScreen);
     expect(sinks.holoSpinners[0]!.mesh).toBe(all);
     expect(sinks.holoSpinners[0]!.speed).toBe(2);
+    expect(sinks.mapHolograms.get(ITEM)).toBe(all.userData.mapHologram);
     expect(sinks.trunkLids.get(ITEM)).toBe(all.userData.trunkLid);
     expect(sinks.gameTableTops.get(ITEM)).toBe(all.userData.gameTableTop);
     expect(sinks.cloneVats.get(ITEM)).toBe(all.userData.cloneVat);

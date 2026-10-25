@@ -188,6 +188,7 @@ import {
 } from "./pusherCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import { registerFurnitureHandles } from "./furnitureHandles";
+import type { MapHologramHandle } from './mapHologram';
 import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
@@ -522,6 +523,8 @@ export class World {
   private screenStatusTimer = 0;
   /** Holo-ring spinners (M4 map table) — meshes tagged userData.holoSpin. */
   private holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }> = [];
+  /** 🔮 Map-table holograms (#251), keyed by item id — driven every frame. */
+  private mapHolograms: Map<string, MapHologramHandle> = new Map();
   /** Animated trunk lids, keyed by item id (TR2 — driven every frame). */
   private trunkLids: Map<string, TrunkLidHandle> = new Map();
   /** 🧬 Clone-vat tanks, keyed by item id (driven every frame like the lids). */
@@ -1911,6 +1914,7 @@ export class World {
     return {
       wallScreens: this.wallScreens,
       holoSpinners: this.holoSpinners,
+      mapHolograms: this.mapHolograms,
       trunkLids: this.trunkLids,
       gameTableTops: this.gameTableTops,
       cloneVats: this.cloneVats,
@@ -3363,6 +3367,7 @@ export class World {
     this.arcadeCabinetVisuals.delete(itemId);
     closeGearCard(itemId);
     this.propAnims.delete(itemId);
+    this.mapHolograms.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.tvScreens.delete(itemId);
     this.arcadeScreens.delete(itemId);
@@ -4156,6 +4161,8 @@ export class World {
     // 💃 Dance floors run their travelling light wave (no-op while the room's
     // speaker is off — the handle reads that itself).
     for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
+    // 🔮 #251: the map table's hologram turns and keeps to the shared clock.
+    for (const holo of this.mapHolograms.values()) holo.update(deltaTime);
     this.updateSeatedSlotSession();
 
     // 🏒 #115: advance every air-hockey table — operator puck sim + doc

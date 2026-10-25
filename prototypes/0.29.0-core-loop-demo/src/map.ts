@@ -190,6 +190,140 @@ function yearReadout(planetId: string): string {
   return `One year every ${Math.floor(h / 24)}d ${String(h % 24).padStart(2, '0')}h.`;
 }
 
+/** 🌠 Every body the holotable plots — the sun, the planets on the shared
+ *  clock, the stations listed (stationBodies), the Lagrange pockets and
+ *  the belt — in the order they are drawn. The in-room hologram (#251)
+ *  plots the same list, so the table and its projection never disagree. */
+export function solarPlotBodies(stations: StationRecord[] = listStations()): MapBody[] {
+  const sovereignAngle = planetAngleAt('planet-sovereign');
+  return [
+    {
+      id: 'star-sol',
+      name: 'SOL PRIME',
+      type: 'star',
+      orbitRadius: 0,
+      orbitSpeed: 0,
+      angle: 0,
+      description: 'Spectral class G2V star. Core fusion power source for Furlong Sector.',
+    },
+    {
+      id: 'planet-aris',
+      name: 'ARIS PRIME',
+      type: 'planet',
+      orbitRadius: 100,
+      orbitSpeed: 0,
+      angle: 0.5,
+      angleAt: planetAngleAt('planet-aris'),
+      description: `Lava-rich dense inner planet. Rich in heavy iron ore pockets. ${yearReadout('planet-aris')}`,
+      resources: [{ type: 'Iron Ore', yield: 800 }],
+    },
+    {
+      id: 'planet-sovereign',
+      name: 'SOVEREIGN II',
+      type: 'planet',
+      orbitRadius: 180,
+      orbitSpeed: 0,
+      angle: 1.2,
+      angleAt: sovereignAngle,
+      description: `Carbon-silica rich terra planet holding Furlong System main station. ${yearReadout('planet-sovereign')}`,
+      resources: [{ type: 'Silica', yield: 1200 }],
+    },
+    ...stationBodies(stations),
+    {
+      id: 'lagrange-l4',
+      name: 'SOVEREIGN L4 APEX',
+      type: 'lagrange',
+      orbitRadius: 180, // On Sovereign's orbit around the sun
+      orbitSpeed: 0,
+      angle: 1.2 + (Math.PI / 3.0), // 60 degrees ahead (stable Lagrange L4)
+      angleAt: (nowMs: number) => sovereignAngle(nowMs) + Math.PI / 3,
+      lagrangePoint: 'L4',
+      description: 'Gravitationally stable Lagrange co-orbital pocket. Ideal for modular outposts.',
+    },
+    {
+      id: 'lagrange-l5',
+      name: 'SOVEREIGN L5 REFUGE',
+      type: 'lagrange',
+      orbitRadius: 180, // On Sovereign's orbit around the sun
+      orbitSpeed: 0,
+      angle: 1.2 - (Math.PI / 3.0), // 60 degrees behind (stable Lagrange L5)
+      angleAt: (nowMs: number) => sovereignAngle(nowMs) - Math.PI / 3,
+      lagrangePoint: 'L5',
+      description: 'Stable Lagrange refuge pocket. Uncharted asteroid debris.',
+      resources: [{ type: 'Rare Mineral', yield: 250 }],
+    },
+    {
+      id: 'belt-ring',
+      name: 'THE SILENT RING',
+      type: 'asteroid-field',
+      orbitRadius: 280,
+      orbitSpeed: 0.0006,
+      angle: 3.4,
+      description: 'Massive dense debris ring populated with minable node clusters.',
+      resources: [
+        { type: 'Iron Ore', yield: 2500 },
+        { type: 'Silica', yield: 1500 },
+        { type: 'Rare Mineral', yield: 450 },
+      ],
+    },
+  ];
+}
+
+/**
+ * Where a body sits on the plot at `nowMs`, in map units from the sun
+ * (screenOffset's frame: dx right, dy down the screen, the map at scale 1).
+ * The sun is the origin; a body on a parent (a station round its planet)
+ * is its parent's place plus its own offset; a body with a true orbit
+ * (angleAt / placeAt) is where the shared clock puts it, and one without
+ * (the belt) where `simTick` ticks of its own orbitSpeed have carried it.
+ * The canvas scales and centres this; the in-room hologram scales it to
+ * the table's disc.
+ */
+export function plotOffset(
+  bodies: readonly MapBody[],
+  body: MapBody,
+  nowMs: number,
+  simTick = 0,
+): { dx: number; dy: number } {
+  if (body.type === 'star') return { dx: 0, dy: 0 };
+
+  if (body.placeAt) {
+    const place = body.placeAt(nowMs);
+    const parent = place.parentId ? bodies.find((b) => b.id === place.parentId) : undefined;
+    const origin = parent ? plotOffset(bodies, parent, nowMs, simTick) : { dx: 0, dy: 0 };
+    const { dx, dy } = screenOffset(place.angle, place.radius);
+    return { dx: origin.dx + dx, dy: origin.dy + dy };
+  }
+
+  // Base orbit positions (derive-don't-tick, v006 §8.2 / Kepler orbits):
+  // the true angle on the shared orbital clock for planets, stations and
+  // Lagrange points; a tick of its own speed for a body without one.
+  const radius = body.orbitRadius;
+  const angle = body.angleAt ? body.angleAt(nowMs) : body.angle + body.orbitSpeed * simTick;
+
+  if (body.parentId) {
+    const parent = bodies.find((b) => b.id === body.parentId);
+    if (parent) {
+      const origin = plotOffset(bodies, parent, nowMs, simTick);
+      const { dx, dy } = screenOffset(angle, radius);
+      return { dx: origin.dx + dx, dy: origin.dy + dy };
+    }
+  }
+
+  // Elliptical adjustments if eccentricity is configured
+  if (body.eccentricity && body.semiMajorAxis) {
+    const a = body.semiMajorAxis;
+    const b = a * Math.sqrt(1.0 - Math.pow(body.eccentricity, 2.0));
+    // Ellipse focuses on Sol Prime center
+    return {
+      dx: Math.cos(angle) * a - a * body.eccentricity,
+      dy: -Math.sin(angle) * b, // north-up, as screenOffset
+    };
+  }
+
+  return screenOffset(angle, radius);
+}
+
 export class SolarSystemMap {
   private container: HTMLDivElement | null = null;
   private mapArea: HTMLDivElement | null = null;
@@ -226,78 +360,7 @@ export class SolarSystemMap {
   }
 
   private initializeBodies() {
-    const sovereignAngle = planetAngleAt('planet-sovereign');
-    this.bodies = [
-      {
-        id: 'star-sol',
-        name: 'SOL PRIME',
-        type: 'star',
-        orbitRadius: 0,
-        orbitSpeed: 0,
-        angle: 0,
-        description: 'Spectral class G2V star. Core fusion power source for Furlong Sector.',
-      },
-      {
-        id: 'planet-aris',
-        name: 'ARIS PRIME',
-        type: 'planet',
-        orbitRadius: 100,
-        orbitSpeed: 0,
-        angle: 0.5,
-        angleAt: planetAngleAt('planet-aris'),
-        description: `Lava-rich dense inner planet. Rich in heavy iron ore pockets. ${yearReadout('planet-aris')}`,
-        resources: [{ type: 'Iron Ore', yield: 800 }],
-      },
-      {
-        id: 'planet-sovereign',
-        name: 'SOVEREIGN II',
-        type: 'planet',
-        orbitRadius: 180,
-        orbitSpeed: 0,
-        angle: 1.2,
-        angleAt: sovereignAngle,
-        description: `Carbon-silica rich terra planet holding Furlong System main station. ${yearReadout('planet-sovereign')}`,
-        resources: [{ type: 'Silica', yield: 1200 }],
-      },
-      ...stationBodies(listStations()),
-      {
-        id: 'lagrange-l4',
-        name: 'SOVEREIGN L4 APEX',
-        type: 'lagrange',
-        orbitRadius: 180, // On Sovereign's orbit around the sun
-        orbitSpeed: 0,
-        angle: 1.2 + (Math.PI / 3.0), // 60 degrees ahead (stable Lagrange L4)
-        angleAt: (nowMs: number) => sovereignAngle(nowMs) + Math.PI / 3,
-        lagrangePoint: 'L4',
-        description: 'Gravitationally stable Lagrange co-orbital pocket. Ideal for modular outposts.',
-      },
-      {
-        id: 'lagrange-l5',
-        name: 'SOVEREIGN L5 REFUGE',
-        type: 'lagrange',
-        orbitRadius: 180, // On Sovereign's orbit around the sun
-        orbitSpeed: 0,
-        angle: 1.2 - (Math.PI / 3.0), // 60 degrees behind (stable Lagrange L5)
-        angleAt: (nowMs: number) => sovereignAngle(nowMs) - Math.PI / 3,
-        lagrangePoint: 'L5',
-        description: 'Stable Lagrange refuge pocket. Uncharted asteroid debris.',
-        resources: [{ type: 'Rare Mineral', yield: 250 }],
-      },
-      {
-        id: 'belt-ring',
-        name: 'THE SILENT RING',
-        type: 'asteroid-field',
-        orbitRadius: 280,
-        orbitSpeed: 0.0006,
-        angle: 3.4,
-        description: 'Massive dense debris ring populated with minable node clusters.',
-        resources: [
-          { type: 'Iron Ore', yield: 2500 },
-          { type: 'Silica', yield: 1500 },
-          { type: 'Rare Mineral', yield: 450 },
-        ],
-      },
-    ];
+    this.bodies = solarPlotBodies();
   }
 
   public mount(parentEl: HTMLElement) {
@@ -533,49 +596,8 @@ export class SolarSystemMap {
   }
 
   private getBodyCoordinates(body: MapBody, centerX: number, centerY: number): { x: number; y: number } {
-    if (body.type === 'star') {
-      return { x: centerX, y: centerY };
-    }
-
-    if (body.placeAt) {
-      const place = body.placeAt(this.clock());
-      const parent = place.parentId ? this.bodies.find((b) => b.id === place.parentId) : undefined;
-      const origin = parent ? this.getBodyCoordinates(parent, centerX, centerY) : { x: centerX, y: centerY };
-      const { dx, dy } = screenOffset(place.angle, place.radius * this.scale);
-      return { x: origin.x + dx, y: origin.y + dy };
-    }
-
-    // Base orbit positions (derive-don't-tick, v006 §8.2 / Kepler orbits)
-    let radius = body.orbitRadius * this.scale;
-    let angle = body.angle;
-
-    // Simulate orbital movement as a function of the simulation clock tick —
-    // or, for planets, stations and Lagrange points, the true angle on the
-    // shared orbital clock.
-    angle = body.angleAt ? body.angleAt(this.clock()) : angle + body.orbitSpeed * this.simTick;
-
-    if (body.parentId) {
-      const parent = this.bodies.find(b => b.id === body.parentId);
-      if (parent) {
-        const parentCoords = this.getBodyCoordinates(parent, centerX, centerY);
-        const { dx, dy } = screenOffset(angle, radius);
-        return { x: parentCoords.x + dx, y: parentCoords.y + dy };
-      }
-    }
-
-    // Elliptical adjustments if eccentricity is configured
-    if (body.eccentricity && body.semiMajorAxis) {
-      const a = body.semiMajorAxis * this.scale;
-      const b = a * Math.sqrt(1.0 - Math.pow(body.eccentricity, 2.0));
-      // Ellipse focuses on Sol Prime center
-      return {
-        x: centerX + Math.cos(angle) * a - (a * body.eccentricity),
-        y: centerY - Math.sin(angle) * b, // north-up, as screenOffset
-      };
-    }
-
-    const { dx, dy } = screenOffset(angle, radius);
-    return { x: centerX + dx, y: centerY + dy };
+    const { dx, dy } = plotOffset(this.bodies, body, this.clock(), this.simTick);
+    return { x: centerX + dx * this.scale, y: centerY + dy * this.scale };
   }
 
   private selectBody(body: MapBody) {
