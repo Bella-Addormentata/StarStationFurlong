@@ -14,8 +14,8 @@
 
 import * as THREE from 'three';
 import type { MapBody } from './map';
-import { plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
-import { buildSplatPlot, sparkHost, type SplatPlotHandle } from './mapHologramSplats';
+import { HOLO_RADIUS, inclinationOf, inclinedPoint, plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
+import { SPLAT_SCALE, buildSplatPlot, sparkHost, type SplatPlotHandle } from './mapHologramSplats';
 
 export interface PlotFrameState {
   /** The station the player is in (map.ts playerLocationId). */
@@ -36,7 +36,9 @@ export interface PlotView3D {
 
 /** The orbit camera: yaw round the sun, pitch above the plane, distance. */
 export interface OrbitState { yaw: number; pitch: number; dist: number }
-export const ORBIT_DEFAULT: OrbitState = { yaw: 0.6, pitch: 0.6, dist: 3.4 };
+export const ORBIT_DEFAULT: OrbitState = { yaw: 0.6, pitch: 0.42, dist: 3.4 };
+/** The view drifts round the sun on its own while nobody drags (rad/s). */
+export const IDLE_DRIFT = 0.06;
 export const PITCH_MIN = 0.12;
 export const PITCH_MAX = 1.45;
 export const DIST_MIN = 1.6;
@@ -81,6 +83,24 @@ export function pickBody(
 /** How the plot is grown inside the panel: the layout's 0.5 m disc becomes
  *  a unit-ish radius, which the camera distances above are set for. */
 const PANEL_SCALE = 1.2;
+/** The plot's outer radius in the panel: the belt, grown as the splat plot
+ *  and the panel grow it (HOLO_RADIUS × SPLAT_SCALE × PANEL_SCALE). */
+export const PLOT_RADIUS = HOLO_RADIUS * SPLAT_SCALE * PANEL_SCALE;
+const FOV_DEG = 42;
+
+/**
+ * The camera distance at which the plot fills the view: its full width
+ * across `fill` of the panel's width, and its depth (the ring seen from
+ * `pitch` above, foreshortened) across `fill` of the height — whichever
+ * is the tighter. Recomputed on every resize until the player zooms.
+ */
+export function fitDistance(aspect: number, pitch: number, fill = 0.88, fovDeg = FOV_DEG): number {
+  const tanHalf = Math.tan((fovDeg * Math.PI) / 360);
+  const halfW = PLOT_RADIUS, halfH = PLOT_RADIUS * Math.max(0.35, Math.sin(pitch));
+  const byWidth = halfW / (fill * tanHalf * Math.max(aspect, 0.2));
+  const byHeight = halfH / (fill * tanHalf);
+  return Math.max(DIST_MIN, Math.min(DIST_MAX, Math.max(byWidth, byHeight)));
+}
 /** Finer splats than the table's: the plot fills a panel here. */
 const PANEL_DETAIL = 2.5;
 const COURSE_POINTS = 65;
@@ -103,8 +123,10 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
 
   const scene = new THREE.Scene();
   scene.add(new spark.SparkRenderer({ renderer }));
-  const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 100);
+  const camera = new THREE.PerspectiveCamera(FOV_DEG, 1, 0.05, 100);
   let orbit: OrbitState = { ...ORBIT_DEFAULT };
+  /** Until the player zooms, the distance follows the panel's size. */
+  let fitted = true;
 
   // A still sky of stars, far out.
   {
@@ -192,6 +214,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     if (!down.moved && Math.hypot(dx, dy) < 4) return;
     down.moved = true;
     orbit = orbitDrag(orbit, e.movementX, e.movementY);
+    if (fitted) orbit = { ...orbit, dist: fitDistance(camera.aspect, orbit.pitch) };
   };
   const onUp = (e: PointerEvent) => {
     canvas.style.cursor = 'grab';
@@ -203,7 +226,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     const id = pickBody(projected, e.clientX - rect.left, e.clientY - rect.top);
     if (id) selectCb?.(id);
   };
-  const onWheel = (e: WheelEvent) => { e.preventDefault(); orbit = orbitZoom(orbit, Math.sign(e.deltaY)); };
+  const onWheel = (e: WheelEvent) => { e.preventDefault(); fitted = false; orbit = orbitZoom(orbit, Math.sign(e.deltaY)); };
   canvas.addEventListener('pointerdown', onDown);
   canvas.addEventListener('pointermove', onMove);
   canvas.addEventListener('pointerup', onUp);
@@ -217,6 +240,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     renderer.setSize(width, height, false);
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
+    if (fitted) orbit = { ...orbit, dist: fitDistance(camera.aspect, orbit.pitch) };
   };
   const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => resize()) : null;
 
@@ -232,7 +256,13 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   };
 
   const v = new THREE.Vector3();
-  const place3 = (mk: HoloMarker, y: number): THREE.Vector3 => v.set(mk.x, y, mk.z).multiplyScalar(PANEL_SCALE * (splats ? splats.group.scale.x : 1));
+  /** A marker's place in the panel's world: on its tilted orbit plane, as
+   *  the splats put it, grown as they are. */
+  const place3 = (mk: HoloMarker, y: number): THREE.Vector3 => {
+    const p = inclinedPoint(mk.x, mk.z, inclinationOf(mk.frame));
+    return v.set(p.x, y + p.y, p.z).multiplyScalar(PANEL_SCALE * (splats ? splats.group.scale.x : 1));
+  };
+  let lastFrameMs = 0;
 
   const view: PlotView3D = {
     mount(h) {
@@ -256,6 +286,10 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     frame(bodies, nowMs, state) {
       if (!host || disposed) return;
       if (host.clientWidth !== width || host.clientHeight !== height) resize();
+      // The idle drift: a slow turn round the sun while nobody drags.
+      const dt = lastFrameMs ? Math.min(0.1, (nowMs - lastFrameMs) / 1000) : 0;
+      lastFrameMs = nowMs;
+      if (!down) orbit = { ...orbit, yaw: orbit.yaw + IDLE_DRIFT * dt };
       const p = orbitPosition(orbit);
       camera.position.set(p.x, p.y, p.z);
       camera.lookAt(0, 0, 0);

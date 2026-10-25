@@ -4,7 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as THREE from 'three';
-import { HOLO_RADIUS, type HoloMarker } from './mapHologramLayout';
+import { HOLO_RADIUS, inclinationOf, inclinedPoint, type HoloMarker } from './mapHologramLayout';
 import { SPLAT_LIFT, SPLAT_SCALE, buildSplatPlot, setSparkProvider } from './mapHologramSplats';
 
 /** A stand-in SplatMesh: counts the splats pushed, keeps opacity, disposes. */
@@ -20,7 +20,7 @@ class FakeSplatMesh extends THREE.Object3D {
 }
 
 const marker = (id: string, type: HoloMarker['type'], x: number, z: number, extra: Partial<HoloMarker> = {}): HoloMarker =>
-  ({ id, name: id, type, x, z, here: false, ...extra });
+  ({ id, name: id, type, x, z, here: false, frame: type === 'planet' || type === 'asteroid-field' ? id : type === 'star' ? '' : 'planet-sovereign', ...extra });
 
 const sovereign = marker('planet-sovereign', 'planet', 0.3, 0, { orbit: { cx: 0, cz: 0, r: 0.3 } });
 const aris = marker('planet-aris', 'planet', 0, 0.17, { orbit: { cx: 0, cz: 0, r: 0.17 } });
@@ -71,17 +71,21 @@ describe('buildSplatPlot', () => {
     const rigs = h.group.children.filter((c) => c.name.startsWith('planet-'));
     expect(rigs.map((r) => r.name).sort()).toEqual(['planet-planet-aris', 'planet-planet-sovereign']);
     const sov = rigs.find((r) => r.name === 'planet-planet-sovereign')!;
-    expect(sov.position.x).toBeCloseTo(0.3, 9);
+    const tilted = inclinedPoint(0.3, 0, inclinationOf('planet-sovereign'));
+    expect(sov.position.x).toBeCloseTo(tilted.x, 9);
+    expect(sov.position.y).toBeCloseTo(0.017 + tilted.y, 9);
     // Its orbit dust, at the orbit's radius; its station's ring round it.
     const orbit = h.group.children.find((c) => c.name === 'orbit-planet-sovereign');
     expect(orbit).toBeDefined();
-    expect(sov.children.length).toBeGreaterThanOrEqual(4); // body, atmosphere, foot, station rings
+    // The spin (body + atmosphere, turned to face the sun), the foot, the station rings.
+    expect(sov.children.length).toBe(3);
+    expect(splats(sov).length).toBe(4);
     expect(h.group.children.some((c) => c.name === 'station-st-a')).toBe(true);
     expect(h.group.children.some((c) => c.name === 'lagrange-lagrange-l4')).toBe(true);
     expect(h.group.children.some((c) => c.name === 'belt')).toBe(true);
     const here = h.group.children.find((c) => c.name === 'here')!;
     expect(here.visible).toBe(true);
-    expect(here.position.x).toBeCloseTo(0.36, 9);
+    expect(here.position.x).toBeCloseTo(inclinedPoint(0.36, 0, inclinationOf('planet-sovereign')).x, 9);
     // Nothing reaches past the disc before the group's own growth.
     expect(Math.hypot(here.position.x, here.position.z)).toBeLessThanOrEqual(HOLO_RADIUS);
   });

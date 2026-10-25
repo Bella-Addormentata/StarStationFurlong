@@ -15,6 +15,8 @@ import {
   STATION_SECONDS,
   beltRadius,
   holoModeAt,
+  inclinationOf,
+  inclinedPoint,
   plotCourses,
   plotMarkers,
   stationLayout,
@@ -86,6 +88,29 @@ describe('the plot on the disc', () => {
     expect(courses[0]!.points[1]!.z).toBeCloseTo(m.z, 9);
     // Arrived: no course to draw.
     expect(plotCourses(bodies, until)).toEqual([]);
+  });
+
+  it('names the orbit plane each body rides', () => {
+    const bodies = solarPlotBodies([DEFAULT_STATION_RECORD]);
+    const frames = Object.fromEntries(plotMarkers(bodies, T).map((m) => [m.id, m.frame]));
+    expect(frames['star-sol']).toBe('');
+    expect(frames['planet-sovereign']).toBe('planet-sovereign');
+    expect(frames['belt-ring']).toBe('belt-ring');
+    expect(frames['lagrange-l4']).toBe('planet-sovereign');
+    expect(frames[DEFAULT_STATION_RECORD.id]).toBe('planet-sovereign');
+  });
+
+  it('tilts a point about the line of nodes, keeping its distance from the sun', () => {
+    expect(inclinedPoint(0.3, 0.1, { tilt: 0, node: 1 })).toEqual({ x: 0.3, y: 0, z: 0.1 });
+    const inc = inclinationOf('planet-aris');
+    expect(inc.tilt).not.toBe(0);
+    // On the nodes themselves nothing lifts; a quarter turn on lifts most.
+    const onNode = inclinedPoint(Math.cos(inc.node) * 0.2, Math.sin(inc.node) * 0.2, inc);
+    expect(onNode.y).toBeCloseTo(0, 9);
+    const across = inclinedPoint(-Math.sin(inc.node) * 0.2, Math.cos(inc.node) * 0.2, inc);
+    expect(Math.abs(across.y)).toBeCloseTo(0.2 * Math.abs(Math.sin(inc.tilt)), 9);
+    expect(Math.hypot(across.x, across.y, across.z)).toBeCloseTo(0.2, 9);
+    expect(inclinationOf('nothing')).toEqual({ tilt: 0, node: 0 });
   });
 
   it('has a belt just inside the rim', () => {

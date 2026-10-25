@@ -2,7 +2,7 @@
 // plot in three dimensions (#251). The renderer itself is browser-only.
 
 import { describe, expect, it } from 'vitest';
-import { DIST_MAX, DIST_MIN, ORBIT_DEFAULT, PITCH_MAX, PITCH_MIN, createPlotView3D, orbitDrag, orbitPosition, orbitZoom, pickBody } from './mapPlot3d';
+import { DIST_MAX, DIST_MIN, ORBIT_DEFAULT, PITCH_MAX, PITCH_MIN, PLOT_RADIUS, createPlotView3D, fitDistance, orbitDrag, orbitPosition, orbitZoom, pickBody } from './mapPlot3d';
 
 describe('the orbit camera', () => {
   it('sits dist away from the sun, pitch above the plane', () => {
@@ -26,6 +26,23 @@ describe('the orbit camera', () => {
     expect(orbitZoom(ORBIT_DEFAULT, -1).dist).toBeLessThan(ORBIT_DEFAULT.dist);
     expect(orbitZoom(ORBIT_DEFAULT, 100).dist).toBe(DIST_MAX);
     expect(orbitZoom(ORBIT_DEFAULT, -100).dist).toBe(DIST_MIN);
+  });
+});
+
+describe('the fit', () => {
+  it('fills a wide panel by height and a narrow one by width, within the zoom limits', () => {
+    const wide = fitDistance(2.0, 0.6), square = fitDistance(1.0, 0.6), tall = fitDistance(0.5, 0.6);
+    expect(tall).toBeGreaterThan(square);
+    expect(square).toBeGreaterThanOrEqual(wide);
+    // At the fitted distance the plot's half-width is 88% of the view's.
+    const tanHalf = Math.tan((42 * Math.PI) / 360);
+    expect(PLOT_RADIUS / (tall * tanHalf * 0.5)).toBeCloseTo(0.88, 9);
+    expect(fitDistance(0.01, 0.6)).toBe(DIST_MAX);
+    expect(fitDistance(50, 0.12)).toBeGreaterThanOrEqual(DIST_MIN);
+  });
+
+  it('comes closer as the view tips flatter, since the ring foreshortens', () => {
+    expect(fitDistance(1.0, 0.3)).toBeLessThanOrEqual(fitDistance(1.0, 1.2));
   });
 });
 

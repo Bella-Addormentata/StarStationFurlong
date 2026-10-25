@@ -28,6 +28,10 @@ export interface HoloMarker {
   id: string;
   name: string;
   type: MapBody['type'];
+  /** The orbit plane the body rides, for its tilt (inclinationOf): a
+   *  planet's own id, its planet's for a station or a Lagrange pocket, the
+   *  belt's own; '' for the sun. */
+  frame: string;
   /** Metres from the disc centre. */
   x: number;
   z: number;
@@ -57,6 +61,7 @@ export function plotMarkers(
       id: body.id,
       name: body.name,
       type: body.type,
+      frame: frameOf(bodies, body, nowMs),
       x: o.dx * PLOT_SCALE,
       z: o.dy * PLOT_SCALE,
       here: body.type === 'station' && body.id === hereId,
@@ -65,6 +70,46 @@ export function plotMarkers(
     if (ring) marker.orbit = ring;
     return marker;
   });
+}
+
+/** The orbit plane a body rides: its own for a planet or the belt, its
+ *  planet's for a station (round it) or a Lagrange pocket (on its orbit:
+ *  the planet whose schematic radius it shares), none for the sun. */
+function frameOf(bodies: readonly MapBody[], body: MapBody, nowMs: number): string {
+  if (body.type === 'planet' || body.type === 'asteroid-field') return body.id;
+  if (body.type === 'star') return '';
+  const parentId = body.placeAt ? body.placeAt(nowMs).parentId : body.parentId;
+  if (parentId) return parentId;
+  const planet = bodies.find((b) => b.type === 'planet' && Math.abs(b.orbitRadius - body.orbitRadius) < 1e-6);
+  return planet?.id ?? '';
+}
+
+/**
+ * 🔭 Orbit tilts, for the picture's depth: each planet's orbit plane is
+ * inclined a little, about its own line of nodes, so the rings cross in
+ * three dimensions instead of lying in one sheet. Schematic, like the
+ * radii — the data holds no inclinations. In radians.
+ */
+export interface Inclination { tilt: number; node: number }
+const INCLINATIONS: Record<string, Inclination> = {
+  'planet-aris': { tilt: 0.16, node: 0.7 },
+  'planet-sovereign': { tilt: -0.1, node: 2.3 },
+  'belt-ring': { tilt: 0.06, node: 1.1 },
+};
+export function inclinationOf(frame: string): Inclination {
+  return INCLINATIONS[frame] ?? { tilt: 0, node: 0 };
+}
+
+/** A point of the flat plot lifted onto its orbit's tilted plane: the
+ *  plane turned by `tilt` about the line of nodes at angle `node`. */
+export function inclinedPoint(x: number, z: number, inc: Inclination): { x: number; y: number; z: number } {
+  if (inc.tilt === 0) return { x, y: 0, z };
+  // Into the nodes' frame (u along the nodes, w across), tilt, back out.
+  const c = Math.cos(inc.node), s = Math.sin(inc.node);
+  const u = x * c + z * s, w = -x * s + z * c;
+  const ct = Math.cos(inc.tilt), st = Math.sin(inc.tilt);
+  const w2 = w * ct, y = w * st;
+  return { x: u * c - w2 * s, y, z: u * s + w2 * c };
 }
 
 function orbitRing(
