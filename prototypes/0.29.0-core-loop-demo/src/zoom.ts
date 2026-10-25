@@ -724,7 +724,16 @@ export class MultiScaleZoomView {
         firstPersonFovAt = now;
         perspectiveCamera.fov = firstPersonFov.step(fovDt);
 
-        // 🧭 Q / E turning, on the same frame clock as the zoom ease.
+        // 🧭 Q / E turning, on the same frame clock as the zoom ease. A turn
+        // held when chat, the phone or a device takes the keyboard is let go
+        // there: the keydown guards only stop new presses.
+        if (
+          isFormFieldTarget(document.activeElement as HTMLElement | null) ||
+          document.getElementById('spacephone-container')?.classList.contains('active') ||
+          isDeviceFocusActive()
+        ) {
+          turnKeysHeld.clear();
+        }
         yaw += turnYawStep(turnKeysHeld, fovDt);
 
         // Query the player's active position dynamically so we look FROM the player's head instead of at them.
