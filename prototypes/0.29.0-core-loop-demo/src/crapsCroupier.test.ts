@@ -173,7 +173,11 @@ describe("the house's ROLL", () => {
     pressManualRoll(t, at(T0 + 2_000));
     const s = readCrapsTableState(t)!;
     writeDiceThrow(t, { round: s.round, by: BOB, sx: 0, sz: 0, dx: 0, dz: 1, power: 0.5, seed: 7 });
-    tickManualCraps(t, at(T0 + 3_000));
+    // Not before the close's stamp has had time to converge: a rival
+    // press's close may still win.
+    tickManualCraps(t, at(T0 + 3_499));
+    expect((await settled(t))?.phase).toBe('closing');
+    tickManualCraps(t, at(T0 + 3_500));
     expect((await settled(t))?.phase).toBe('settled');
   });
 

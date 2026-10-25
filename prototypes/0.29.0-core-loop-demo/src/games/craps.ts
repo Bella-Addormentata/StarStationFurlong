@@ -123,6 +123,7 @@ export interface CrapsTableState {
   wagers?: Record<string, string>;
   sigs?: Record<string, string>;
   stakes?: Record<string, number>;
+  bettors?: string[];
   /** ⚖️ The fairness mode locked in when this window opened; the settle uses
    *  it, so an owner's switch mid-window applies from the next one. */
   fairMode?: FairnessMode;
@@ -210,6 +211,9 @@ export interface SeedRoundFields {
    *  bets" (0 for an earlier build's list, whose chips were taken): what the
    *  settle takes, whatever the list says by then. */
   stakes?: Record<string, number>;
+  /** A round without the exchange (RNG): the players with chips down at "no
+   *  more bets", the only ones its settle writes up. */
+  bettors?: string[];
 }
 
 function isPidMap(v: unknown, max: number): boolean {
@@ -238,6 +242,8 @@ export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
   if (s.sigs !== undefined && !isPidMap(s.sigs, FAIRNESS_MAX_PARTIES - 1)) return false;
   if (s.stakes !== undefined && !isPidStakeMap(s.stakes, 2 * FAIRNESS_MAX_PARTIES)) return false;
+  if (s.bettors !== undefined && !(Array.isArray(s.bettors) && s.bettors.length <= 2 * FAIRNESS_MAX_PARTIES
+    && s.bettors.every((pid) => typeof pid === 'string' && pid.length > 0 && pid.length <= 128))) return false;
   return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 

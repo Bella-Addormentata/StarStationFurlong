@@ -72,6 +72,7 @@ export interface RouletteTableState {
   wagers?: Record<string, string>;
   sigs?: Record<string, string>;
   stakes?: Record<string, number>;
+  bettors?: string[];
   /** 🎡 A manual SPIN's settlement lease: the page (player id + page nonce)
    *  that closed or took over this round. Only it publishes and pays. */
   operator?: string;

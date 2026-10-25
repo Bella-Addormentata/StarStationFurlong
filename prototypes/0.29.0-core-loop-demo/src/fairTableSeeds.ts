@@ -483,17 +483,22 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
 // ── The operator's side ───────────────────────────────────────────────────────
 
 /** "No more bets": the commitments that roll — staked players whose record
- *  answers this round's house commit. Spread into the closing write. */
+ *  answers this round's house commit — and their wagers. A round without
+ *  the exchange (RNG) freezes who is in it. Spread into the closing write. */
 export function freezeCommits(
   tableId: string,
   game: TableGame,
   s: TableState,
 ): {
   commits?: Record<string, string>; unseeded?: string[]; wagers?: Record<string, string>;
-  sigs?: Record<string, string>; stakes?: Record<string, number>;
+  sigs?: Record<string, string>; stakes?: Record<string, number>; bettors?: string[];
 } {
-  if (!s.houseCommit) return {};
   const staked = stakedPlayers(tableId, game, s.round);
+  // RNG: a bet first put down after "no more bets" sits the round out, and
+  // two pages settling it (a handover) write up the very bettors its close
+  // names, so each one's outcome meets the other page's. What they bet plays
+  // as it stands at the settle: nobody can know the result before it.
+  if (!s.houseCommit) return { bettors: [...staked].sort().slice(0, 2 * MAX_BETTOR_PARTIES + 1) };
   const commits: Record<string, string> = {};
   const sigs: Record<string, string> = {};
   // Read only the staked players' records: anyone can add fseed keys, so a
@@ -537,14 +542,26 @@ export function wagerFingerprint(bets: readonly unknown[]): string {
  *  bettors, and only lists unchanged since the close. A list rewritten after
  *  "no more bets" is `voided` (its bets are not paid — the settle clears them),
  *  and so is a frozen bettor's list emptied or gone since (not in `bets`).
- *  A round without frozen wagers (RNG) settles the bets as they stand. */
+ *  A round that froze only who is in it (RNG) settles their bets as they
+ *  stand; one that froze nothing (an earlier build's close), every bet. A
+ *  bettor the freeze left out is `omitted`. */
 export function frozenWagers<T>(
   tableId: string,
   s: TableState,
   bets: Record<string, T[]>,
 ): { bets: Record<string, T[]>; voided: string[]; omitted: string[] } {
   const { wagers } = frozenFields(tableId, s);
-  if (!wagers) return { bets, voided: [], omitted: [] };
+  if (!wagers) {
+    const inRound = s.bettors && new Set(s.bettors);
+    if (!inRound) return { bets, voided: [], omitted: [] };
+    const out: Record<string, T[]> = {};
+    const omitted: string[] = [];
+    for (const [pid, list] of Object.entries(bets)) {
+      if (inRound.has(pid)) out[pid] = list;
+      else omitted.push(pid);
+    }
+    return { bets: out, voided: [], omitted: omitted.sort() };
+  }
   const out: Record<string, T[]> = {};
   const voided: string[] = [];
   const omitted: string[] = [];

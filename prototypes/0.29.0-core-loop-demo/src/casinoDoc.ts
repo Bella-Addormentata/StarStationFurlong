@@ -15,6 +15,8 @@
  *   bought:<playerId>         → number   lifetime chips issued, ditto
  *   cashed:<playerId>         → number   lifetime chips returned, ditto
  *   table:<tableId>           → RouletteTableState (croupier-written)
+ *   settled:<tableId>         → the table's last settled state, a copy
+ *                                        only settles write (settledAlready)
  *   bets:<tableId>:<playerId> → { round, held: RouletteBet[], inc, taken? }
  *                                        (owner-written; craps: { kind, held,
  *                                        inc, base, taken? }; an earlier
@@ -741,8 +743,33 @@ export function writeTableState(tableId: string, state: RouletteTableState): voi
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`table:${tableId}`, state);
+    if (state.phase === 'settled') map.set(settledKey(tableId), state);
     heldDirty = true;
   });
+}
+
+/** Where each settled state of a table goes too, under a key only a settled
+ *  state is written to: a write of the round's closing state that isn't a
+ *  settle (a SPIN or ROLL takeover's stamp, a deadline cut back) can beat a
+ *  settle made at the same moment on `table:`, and the settle's outcomes
+ *  and felts would stand under a round the doc shows still to play. */
+function settledKey(tableId: string): string {
+  return `settled:${tableId}`;
+}
+
+/** The settled state of round `s.round` of the table, or of a later round,
+ *  on the incarnation `s` is of, when the doc's state `s` came back to an
+ *  earlier phase after that settle (see settledKey); null otherwise. A
+ *  settle puts it back instead of settling the round again. (One of a
+ *  removed incarnation is of no state `s` read: those read as no table.) */
+export function settledAlready<S extends RouletteTableState | CrapsTableState>(tableId: string, s: S): S | null {
+  const map = ensureMap();
+  const value = map.get(settledKey(tableId));
+  const done = (s.kind === 'craps' ? isCrapsTableState(value) : isRouletteTableState(value))
+    ? value as RouletteTableState | CrapsTableState : null;
+  if (!done || done.phase !== 'settled' || done.round < s.round) return null;
+  if (s.phase === 'settled' && s.round === done.round) return null;
+  return tableIncOf(tableId, done) === tableIncOf(tableId, s) ? done as S : null;
 }
 
 /** How a page comes to close a table: it removes the table itself
@@ -762,27 +789,29 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard')
   const betPrefix = `bets:${tableId}:`;
   const keptPrefix = `kept:${tableId}:`;
   boundDoc!.transact(() => {
-    // What kept bets left by an earlier removal still owe is paid before
-    // they go (keptOwed).
-    for (const key of [...map.keys()]) {
-      if (key.startsWith(keptPrefix)) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
-    }
     // The incarnation removed (an earlier build's state up is the one its
     // next round takes, tableIncOf). With none up here, the one a page that
-    // hasn't heard would open the table on (tableIncFor, alike on every
-    // page), so a round opened at the moment of the removal is ended too:
-    // when this page removes the table, or hears of a removal that marked
-    // nothing (an earlier build's, of a table never removed before). Not when
-    // a removal this build made has marked it already: a page that hears of
-    // it late changes nothing a table put back is named by. Nor for a table
-    // of the room this page left.
+    // hasn't heard would open the table on (freshIncFor, alike on every
+    // page: past any a removal left unmarked, which it marks), so a round
+    // opened at the moment of the removal is ended too: when this page
+    // removes the table, or hears of a removal that marked nothing (an
+    // earlier build's, of a table never removed before). Not when a removal
+    // this build made has marked it already: a page that hears of it late
+    // changes nothing a table put back is named by. Nor for a table of the
+    // room this page left.
     const was = map.get(`table:${tableId}`);
     const up = (isRouletteTableState(was) || isCrapsTableState(was)) && !removed(map, tableId, was) ? was : null;
     if (up) markRemoved(map, tableId, tableIncOf(tableId, up));
     else if (closing === 'local' || (closing === 'heard' && !map.has(goneKey(tableId, '')))) {
-      markRemoved(map, tableId, tableIncFor(tableId));
+      markRemoved(map, tableId, freshIncFor(map, tableId));
+    }
+    // What kept bets left by a removal still owe is paid before they go
+    // (keptOwed), their incarnations marked ended now.
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(keptPrefix)) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
     }
     map.delete(`table:${tableId}`);
+    map.delete(settledKey(tableId));
     map.delete(`croupier:${tableId}`);
     // 🎲 The per-table config keys ride the same map — a removed table must
     // not leave orphaned settings behind (harmless no-op for roulette, which
@@ -1075,6 +1104,7 @@ export function writeCrapsTableState(tableId: string, state: CrapsTableState): v
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`table:${tableId}`, state);
+    if (state.phase === 'settled') map.set(settledKey(tableId), state);
     heldDirty = true;
   });
 }

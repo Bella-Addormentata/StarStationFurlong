@@ -13,12 +13,14 @@ vi.stubGlobal('window', { location: { search: '' } });
 const {
   bindCasinoDoc, buyInChips, readAllCrapsBets, readChips, readCrapsTableState, readDiceThrow, readSeedRecord,
   readTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyBets, writeMyCrapsBets,
-  writeMySeedRecord, writeTableOperatorLease, writeTableState,
+  writeMySeat, writeMySeedRecord, writeTableOperatorLease, writeTableState,
 } = await import('./casinoDoc');
 const {
   BET_WINDOW_MS, CLOSING_MS, rollAndSettle, ROULETTE_PAGE_ID, SHOW_MS, setSoleCroupierPredicate, tickAutoCroupier,
 } = await import('./croupier');
-const { CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, CRAPS_SHOW_MS, pressManualRoll, rollAndSettleCraps, stickmanThrows, tickAutoStickman } = await import('./crapsCroupier');
+const {
+  CRAPS_BET_WINDOW_MS, CRAPS_CLOSING_MS, CRAPS_SHOW_MS, pressManualRoll, rollAndSettleCraps, stickmanThrows, tickAutoStickman, tickManualCraps,
+} = await import('./crapsCroupier');
 const {
   commitSeedSync, forgetMissingTables, keyFor, seedSigBytes, frozenWagers, isFairTable, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound,
   wagerFingerprint,
@@ -26,6 +28,7 @@ const {
 const { pocketFromMaterial } = await import('./games/fairDice');
 const { commitTableSeed } = await import('./games/diceFairness');
 const { getIdentityPub, signIdentity } = await import('./keypair');
+const { FURNITURE_DEFS } = await import('./furniture');
 
 const ed = await import('@noble/ed25519');
 const b64url = (b: Uint8Array): string => btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -1140,15 +1143,32 @@ describe('a Fair craps roll', () => {
     expect(readAllCrapsBets(t)[BOB]).toEqual([{ type: 'field', amount: 5 }]);
   });
 
-  it('a roll the house seed is gone for is void at the close, before any dice are thrown', async () => {
+  it("a roll the house seed is gone for is void at the stickman's beat, before any dice are thrown", async () => {
     const t = freshTable();
     tickAutoStickman(t);
     writeCrapsTableState(t, { ...readCrapsTableState(t)!, houseCommit: 'f'.repeat(64) });
     writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    // Amy stands at the rail with a line bet: a roll that plays hands her the dice.
+    const stand = FURNITURE_DEFS['craps-table'].stands!.findIndex((s) => !s.role);
+    writeMySeat(t, AMY, { stand, angle: 0, at: 1 });
     tickAutoStickman(t);
     playersLook(t, 'craps', [AMY]);
-    later(CRAPS_BET_WINDOW_MS);
-    tickAutoStickman(t); // closes, and voids at once
+    later(CRAPS_BET_WINDOW_MS / 2);
+    writeMySeat(t, AMY, { stand, angle: 0, at: 2 });
+    tickAutoStickman(t);
+    later(CRAPS_BET_WINDOW_MS / 2);
+    writeMySeat(t, AMY, { stand, angle: 0, at: 3 });
+    tickAutoStickman(t); // closes, with nobody to throw for a void roll
+    await flush();
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'closing', phaseDeadline: now + CRAPS_CLOSING_MS });
+    expect(readCrapsTableState(t)?.shooter).toBeUndefined();
+    // A close or roll from another page has the stickman's beat to meet it.
+    later(CRAPS_CLOSING_MS - 1);
+    tickAutoStickman(t);
+    await flush();
+    expect(readCrapsTableState(t)?.phase).toBe('closing');
+    later(1);
+    tickAutoStickman(t);
     await flush();
     expect(readCrapsTableState(t)).toMatchObject({ phase: 'settled', voided: true, dice: null });
     expect(readDiceThrow(t)).toBeNull();
@@ -1156,6 +1176,30 @@ describe('a Fair craps roll', () => {
     later(CRAPS_SHOW_MS);
     tickAutoStickman(t);
     expect(readCrapsTableState(t)).toMatchObject({ phase: 'betting', round: 2 });
+  });
+
+  it("a ROLL that has the stickman throw for the shooter settles as the reveals come in, not at the shooter's deadline", async () => {
+    setSoleCroupierPredicate(() => false); // a manual (venture) table
+    const t = freshTable();
+    const stand = FURNITURE_DEFS['craps-table'].stands!.findIndex((s) => !s.role);
+    expect(pressManualRoll(t, now)).toMatch(/PRESS AGAIN/);
+    writeMyCrapsBets(t, AMY, [{ type: 'pass', amount: 10 }]);
+    writeMySeat(t, AMY, { stand, angle: 0, at: 1 });
+    tickManualCraps(t, now);
+    playersLook(t, 'craps', [AMY]);
+    later(2_000);
+    writeMySeat(t, AMY, { stand, angle: 0, at: 2 });
+    expect(pressManualRoll(t, now)).toBeNull();
+    expect(readCrapsTableState(t)?.shooter).toBe(AMY);
+    later(2_000);
+    expect(pressManualRoll(t, now)).toBeNull(); // the house has the stickman throw for her
+    expect(readDiceThrow(t)?.by).toBe('stickman');
+    await flush();
+    expect(readCrapsTableState(t)?.phase).toBe('closing'); // Amy's reveal is still to come
+    playersLook(t, 'craps', [AMY]);
+    tickManualCraps(t, now);
+    await flush();
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'settled', round: 1 });
   });
 
   it('a played round stamped void fails the state guard', () => {

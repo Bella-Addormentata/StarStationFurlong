@@ -112,7 +112,7 @@ import {
   findPath,
   nearestWalkableCell,
 } from "./pathfinding";
-import { subscribeFurniture, readAllFurniture, layoutRemoved } from "./furnitureDoc";
+import { subscribeFurniture, readAllFurniture, layoutRemoved, layoutRemovedHere } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
@@ -3187,8 +3187,12 @@ export class World {
     for (const item of [...FURNITURE]) {
       if (records.has(item.id)) continue;
       this.evictAndDefocusForItem(item.id);
-      // A removal this room's layout made, or a table of the room left behind.
-      this.removeFurnitureVisuals(item.id, layoutRemoved(item.id) ? "heard" : "elsewhere");
+      // A removal this page made of the room's layout (a template it
+      // applied), one it heard, or a table of the room left behind.
+      this.removeFurnitureVisuals(
+        item.id,
+        layoutRemovedHere(item.id) ? "local" : layoutRemoved(item.id) ? "heard" : "elsewhere",
+      );
       const idx = FURNITURE.findIndex((i) => i.id === item.id);
       if (idx !== -1) FURNITURE.splice(idx, 1);
       changedIds.add(item.id);

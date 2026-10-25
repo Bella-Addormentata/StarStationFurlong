@@ -36,6 +36,7 @@ import {
   readCrapsFairnessPref,
   pruneCrapsBets,
   readCrapsTableState,
+  settledAlready,
   tableIncOf,
   transactCasino,
   writeCrapsTableState,
@@ -120,6 +121,9 @@ class LocalCrapsBackend implements CrapsBackend {
         // without its seed. The roll is void: no dice, every bet stands.
         const before = readCrapsTableState(tableId);
         if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return null;
+        // Settled already, and a takeover's stamp (or a deadline cut back)
+        // written as it settled came back over it: the roll stands as it was.
+        if (putBackSettled(tableId, before)) return null;
         if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return null;
         if (before.operator === undefined && !stillDrivesTables()) return null;
         if (!tablesAwake()) return null;
@@ -179,6 +183,8 @@ class LocalCrapsBackend implements CrapsBackend {
     // Nor one removed and put back meanwhile, at the same roll on a new
     // incarnation: these dice were for the table as it was.
     if (!live0 || tableIncOf(tableId, before) !== tableIncOf(tableId, live0)) return dice;
+    // Or settled already (see the void above).
+    if (putBackSettled(tableId, before)) return dice;
     // 🎲 A manual roll settles only on the page still holding its lease: the
     // hashing can outlive it (a suspended tab another member took over from).
     if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return dice;
@@ -206,9 +212,10 @@ class LocalCrapsBackend implements CrapsBackend {
       pointBefore,
     );
     for (const pid of forfeited) remaining[pid] = [];
-    // A list taken all down for this roll is written up too, as nothing: a
-    // rival page settling the roll may have seen its last bet.
-    for (const pid of readEmptiedLists(tableId, round)) remaining[pid] ??= [];
+    // A list taken all down for this roll is written up too, as nothing, and
+    // so is a bettor the close named whose list this page hasn't (an RNG
+    // roll's): a rival page settling the roll may have seen their last bet.
+    for (const pid of [...readEmptiedLists(tableId, round), ...(before.bettors ?? [])]) remaining[pid] ??= [];
     // A list rewritten (or emptied) since the close loses what it held then.
     const held = heldBy(tableId, before, Object.keys(remaining));
     const now = Date.now();
@@ -245,6 +252,15 @@ class LocalCrapsBackend implements CrapsBackend {
     });
     return [d1, d2];
   }
+}
+
+/** Put a roll settled already back as its settle left it (casinoDoc
+ *  settledAlready), when the doc's state came back to closing over it. True
+ *  when it did. */
+export function putBackSettled(tableId: string, s: CrapsTableState): boolean {
+  const done = settledAlready(tableId, s);
+  if (done) writeCrapsTableState(tableId, done);
+  return done !== null;
 }
 
 /** What each bettor's list held at the close (the settle takes it). */

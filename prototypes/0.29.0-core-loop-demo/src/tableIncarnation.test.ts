@@ -523,6 +523,31 @@ describe('removals that marked nothing', () => {
   });
 
   describe("a table an earlier build's page removed (no marks), put back under the same id", () => {
+    it('removed again by a page yet to hear the round the driver opened on it: that round is ended too', async () => {
+      spinTo(1); // red
+      a.casino.writeCrapsFairnessPref(TABLE, 'rng');
+      a.casino.buyInChips(bettor, 100);
+      a.croupier.openBetting(TABLE, 1);
+      a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 10 }]);
+      a.croupier.closeBetting(TABLE, a.casino.readTableState(TABLE)!);
+      a.croupier.rollAndSettle(TABLE, 1);
+      await flush();
+      expect(a.casino.readChips(bettor)).toBe(110);
+      // The owner's stale tab on the earlier build removed the table while no
+      // page of this build was in the room: its outcome records are all that's left.
+      earlierBuildTeardown(a, TABLE);
+      sync(a.doc, b.doc);
+      // Put back: the driver opens round 1 past the name those records hold,
+      // and Carol bets 30, as page b, yet to hear that round, removes it.
+      a.croupier.openBetting(TABLE, 1);
+      a.casino.writeMyBets(TABLE, bettor, 1, [{ type: 'red', amount: 30 }]);
+      expect(a.casino.readChips(bettor)).toBe(80);
+      b.croupier.closeTable(TABLE, 'local');
+      sync(a.doc, b.doc); // page a is gone before it hears
+      expect({ state: b.casino.readTableState(TABLE), chips: b.casino.readChips(bettor) })
+        .toEqual({ state: null, chips: 110 });
+    });
+
     it('takes a new incarnation, so its round 1 pays', async () => {
       spinTo(1); // red
       a.casino.writeCrapsFairnessPref(TABLE, 'rng');

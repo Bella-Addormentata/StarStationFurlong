@@ -41,6 +41,7 @@ import {
   readFeltStakes,
   readTableOperatorLease,
   readTableState,
+  settledAlready,
   tableEndingStakes,
   tableIncOf,
   tableIncToOpen,
@@ -319,6 +320,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   const before = readTableState(tableId);
   if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return;
   if (tableIncOf(tableId, before) !== tableIncOf(tableId, live0)) return;
+  // Settled already, and a takeover's stamp written as it settled came back
+  // over it: the round stands as that settle left it.
+  if (putBackSettled(tableId, before)) return;
   // 🎡 A manual round settles only on the page holding its lease: two house
   // members pressing SPIN must not both publish and pay.
   if (before.operator !== undefined && before.operator !== ROULETTE_PAGE_ID) return;
@@ -343,11 +347,13 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // back is refunded.
   // Every bettor, and every list that hands back what an earlier build took
   // (one taken all down holds below 0 and isn't among the live bets), and
-  // every list taken all down this round (readEmptiedLists): its outcome,
-  // of nothing, meets a rival settle's that still saw its last bet.
+  // every list taken all down this round (readEmptiedLists), and every
+  // bettor the close named (an RNG round's): its outcome, of nothing, meets
+  // a rival settle's that still saw its last bet.
   const owed: Record<string, number> = {};
   const pids = [
     ...Object.keys(live), ...rewritten, ...Object.keys(readFeltStakes(tableId)), ...readEmptiedLists(tableId, round),
+    ...(before.bettors ?? []),
   ];
   for (const pid of new Set(pids)) {
     const held = heldAtClose(tableId, before, pid);
@@ -388,6 +394,14 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     // settle it (creditTableOutcome).
     for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, tableIncOf(tableId, before), round, pid, amount);
   });
+}
+
+/** Put a round settled already back as its settle left it (settledAlready),
+ *  when the doc's state came back to closing over it. True when it did. */
+function putBackSettled(tableId: string, s: RouletteTableState): boolean {
+  const done = settledAlready(tableId, s);
+  if (done) writeTableState(tableId, done);
+  return done !== null;
 }
 
 /** "No more bets": close the window and freeze the round's commitments.
