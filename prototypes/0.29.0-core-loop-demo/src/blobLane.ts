@@ -20,12 +20,18 @@
  * finds it there — WHERE asks the room's connected nodes who holds a file,
  * and FETCH names them beside the provider.
  *
+ * 🔗 An SSF link (ssfLink.ts) is the one fetch from nodes outside the room:
+ * a link pasted on THIS page's blaster names them, and the node dials them
+ * for that paste alone (fetchFromLink). A file the page marks shareable
+ * (shareBlob) is served by the node to anyone who asks for it by hash.
+ *
  * The node's routes ask for this launch's capability token (`blob_cap` in
  * the fingerprint) and an allowed Origin; the token rides in the query so a
  * <video> can carry it.
  */
 
 import { trustedNodeMediaOrigin } from './tvConsent';
+import type { SsfFilmLink } from './ssfLink';
 
 export interface BlobNode {
   /** The node's HTTP origin, as the fingerprint probe found it. */
@@ -227,6 +233,62 @@ export async function fetchBlob(hash: string, size: number, provider: string, mi
   }
 }
 
+/** 🔗 FETCH from an SSF link pasted on this page: the node dials the nodes
+ *  the link names by id — this paste is the consent, as FETCH's press is —
+ *  besides the room's, takes the file under the size the link declares,
+ *  and checks every byte against its hash. It is then this room's, as any
+ *  fetch is. Null when the node took the ask, else why not. Never called
+ *  for a link read in a room record: a peer's word dials nobody. */
+export async function fetchFromLink(link: SsfFilmLink): Promise<string | null> {
+  const from = link.nodes.filter((id) => HEX_64.test(id)).slice(0, 4);
+  const url = HEX_64.test(link.hash) && from.length
+    ? route('/api/blob/fetch', { room, hash: link.hash, size: String(link.size), from: from.join(','), mime: link.mime, link: '1' })
+    : null;
+  if (!url) return 'An SSF link needs this station\'s node (the desktop app) running here.';
+  const gen = generation;
+  try {
+    const res = await fetch(url, { method: 'POST', redirect: 'error' });
+    if (gen !== generation) return 'Your node restarted — SEND the link again.';
+    if (res.ok) {
+      bumpStatus(link.hash);
+      statuses.delete(link.hash);
+      return null;
+    }
+    return `Your node: ${await errorOf(res, 'it did not take the link')}.`;
+  } catch {
+    return 'Your node did not answer.';
+  }
+}
+
+/** 🔗 Mark a whole file on this page's node shareable by its SSF link (`on`),
+ *  or not: while it is, the node serves it to any node that asks for it by
+ *  hash. The other holders the link it came from named, or why not. */
+export async function shareBlob(hash: string, on: boolean): Promise<{ via: string[] } | { error: string }> {
+  const url = HEX_64.test(hash) ? route('/api/blob/share', { hash, on: on ? '1' : '0' }) : null;
+  if (!url) return { error: 'That needs this station\'s node running here.' };
+  const gen = generation;
+  try {
+    const res = await fetch(url, { method: 'POST', redirect: 'error' });
+    if (!res.ok) return { error: `Your node: ${await errorOf(res, 'it did not take that')}.` };
+    const body = (await res.json()) as { via?: unknown };
+    const via = hexList(body.via, 3);
+    if (gen === generation) {
+      heldEpoch++; // a held answer asked before says the file as it was
+      if (heldHere && heldHere.gen === gen) {
+        if (on) heldHere.shared.set(hash, via);
+        else heldHere.shared.delete(hash);
+      }
+    }
+    return { via };
+  } catch {
+    return { error: 'Your node did not answer.' };
+  }
+}
+
+function hexList(v: unknown, max: number): string[] {
+  return (Array.isArray(v) ? v : []).filter((id): id is string => typeof id === 'string' && HEX_64.test(id)).slice(0, max);
+}
+
 // ── What this node holds, for the TV library ─────────────────────────────────
 
 /** The node's last answer to the held route: the whole blobs it serves to
@@ -238,6 +300,9 @@ let heldHere: {
   keep: boolean; kept: number; quota: number;
   /** Copies for this room, when its page said this machine hosts it. */
   host: HostCopies | null;
+  /** 🔗 The held files shared by their SSF link, each with the other
+   *  holders its link named. */
+  shared: Map<string, string[]>;
 } | null = null;
 
 /** What the room's host node copies (blob_lane.rs): on or off, its per-file
@@ -277,14 +342,23 @@ export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
   heldAsking = true;
   try {
     const res = await fetch(url, { redirect: 'error' });
-    const body = (res.ok ? await res.json() : null) as { held?: unknown; more?: unknown; reachable?: unknown; keep?: unknown; kept?: unknown; quota?: unknown; host?: unknown } | null;
+    const body = (res.ok ? await res.json() : null) as {
+      held?: unknown; more?: unknown; reachable?: unknown; keep?: unknown; kept?: unknown; quota?: unknown; host?: unknown; shared?: unknown;
+    } | null;
     const hexes = (v: unknown) => new Set((Array.isArray(v) ? v.slice(0, 1000) : []).filter((h): h is string => typeof h === 'string' && HEX_64.test(h)));
     const n = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0);
     const more = body?.more === true || (Array.isArray(body?.held) && body.held.length > 1000);
     if (gen === generation && asked === room && epoch === heldEpoch && body) {
+      const held = hexes(body.held);
+      const shared = new Map<string, string[]>();
+      if (body.shared && typeof body.shared === 'object' && !Array.isArray(body.shared)) {
+        for (const [h, via] of Object.entries(body.shared as Record<string, unknown>)) {
+          if (held.has(h)) shared.set(h, hexList(via, 3));
+        }
+      }
       heldHere = {
-        gen, room: asked, held: hexes(body.held), more, reachable: hexes(body.reachable), at: now,
-        keep: body.keep === true, kept: n(body.kept), quota: n(body.quota), host: parseHost(body.host),
+        gen, room: asked, held, more, reachable: hexes(body.reachable), at: now,
+        keep: body.keep === true, kept: n(body.kept), quota: n(body.quota), host: parseHost(body.host), shared,
       };
     }
   } catch { /* kept as it was; the next paint asks again */ } finally {
@@ -298,6 +372,14 @@ export async function refreshHeldBlobs(now = performance.now()): Promise<void> {
 export function nodeHolds(hash: string): boolean | null {
   if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
   return heldHere.held.has(hash) ? true : heldHere.more ? null : false;
+}
+
+/** 🔗 Whether this page's node shares `hash` by its SSF link, as it last
+ *  said: the other holders the link names after it, false when it does not,
+ *  null when it has not said. */
+export function nodeShares(hash: string): string[] | false | null {
+  if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
+  return heldHere.shared.get(hash) ?? (heldHere.held.has(hash) || !heldHere.more ? false : null);
 }
 
 /** Whether this page's node keeps its files across restarts, and how much
@@ -409,6 +491,7 @@ export async function forgetBlob(hash: string): Promise<string | null> {
       bumpStatus(hash);
       statuses.delete(hash);
       heldHere?.held.delete(hash);
+      heldHere?.shared.delete(hash);
       if (heldHere) heldHere.at = -Infinity; // ask again: the space changed
     }
     return null;
