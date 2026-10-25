@@ -72,6 +72,18 @@
 //!   serving rule answers only for a member of a room the file is shared
 //!   to, so a holder's word counts for itself alone, and the bytes are still
 //!   checked against the hash.
+//! - **SSF LINKS** (a film for anyone, from any room, after any time): the
+//!   page marks a whole file shareable (`POST /api/blob/share`), and from
+//!   then on this node serves it to ANY node that asks for it by hash —
+//!   nothing else changes for the files not marked. The page writes the
+//!   link (`ssf://film?h=…`: the hash, the size, the title, the type and a
+//!   few nodes that hold it). A FETCH with `link=1`, from a link pasted on
+//!   this node's own page, dials the nodes the link names by id (found the
+//!   way a room dial finds one) besides those of the room; a node reading a
+//!   link in a room record fetches nothing, as for any record. The bytes are
+//!   checked against the hash, and the file is then this room's like any
+//!   fetch. Nothing is announced and no port is opened: a stranger can ask
+//!   only for a file whose link reached them.
 
 use anyhow::{anyhow, Result};
 use iroh::endpoint::Connection;
@@ -173,6 +185,11 @@ pub fn storage_bound(size: u64) -> u64 {
 const MAX_ROOM_LEN: usize = 256;
 /// The most hashes the held route lists (the TV library holds at most 200).
 const MAX_HELD_LISTED: usize = 1000;
+/// 🔗 The other holders a fetched file keeps from its SSF link: a link made
+/// here names this node, then them (four nodes at most).
+const LINK_MAX_VIA: usize = 3;
+/// The most nodes one FETCH dials.
+const MAX_PROVIDERS: usize = 4;
 /// The longest request head the HTTP API reads before it gives up.
 pub const MAX_HEAD: usize = 16 * 1024;
 
@@ -209,6 +226,13 @@ struct Held {
     /// Reads of it running now (HTTP to the page, iroh to a member): a file
     /// being read is never let go to make room, however long the read.
     readers: u32,
+    /// 🔗 Marked shareable from this node's page (`share`): served whole to
+    /// any node that asks for it by hash, wherever it is, as an SSF link
+    /// promises — beside the room rule, never in place of it.
+    shared: bool,
+    /// The other nodes the SSF link it was fetched from named (at most
+    /// `LINK_MAX_VIA`): a link made here names them after this node.
+    via: Vec<PublicKey>,
 }
 
 /// A size the environment may set in MiB, in bytes.
@@ -258,6 +282,11 @@ struct KeptFile {
     mime: String,
     rooms: Vec<String>,
     used: u64,
+    /// 🔗 Shareable, and the link's other holders (absent before SSF links).
+    #[serde(default)]
+    shared: bool,
+    #[serde(default)]
+    via: Vec<String>,
 }
 
 /// 🏠 The rooms this node hosts, as their page said, and what it copied for them.
@@ -601,6 +630,7 @@ impl BlobLane {
             charged += storage_bound(k.size);
             self.held.lock().unwrap().insert(hash, Held {
                 rooms, size: k.size, have: k.size, mime: safe_mime(&k.mime), phase: Phase::Complete, charged: storage_bound(k.size), used: k.used, readers: 0,
+                shared: k.shared, via: k.via.iter().filter_map(|v| PublicKey::from_str(v).ok()).take(LINK_MAX_VIA).collect(),
             });
         }
         self.persist();
@@ -618,7 +648,10 @@ impl BlobLane {
             let held = self.held.lock().unwrap();
             held.iter()
                 .filter(|(_, h)| h.phase == Phase::Complete && !h.rooms.is_empty())
-                .map(|(hash, h)| KeptFile { hash: hash.to_hex().to_string(), size: h.size, mime: h.mime.clone(), rooms: h.rooms.iter().cloned().collect(), used: h.used })
+                .map(|(hash, h)| KeptFile {
+                    hash: hash.to_hex().to_string(), size: h.size, mime: h.mime.clone(), rooms: h.rooms.iter().cloned().collect(), used: h.used,
+                    shared: h.shared, via: h.via.iter().map(|p| p.to_string()).collect(),
+                })
                 .collect()
         };
         // The rooms hosted, and the day's copy charges: a restart neither
@@ -718,6 +751,27 @@ impl BlobLane {
         self.persist();
         println!("📦 blob {}: let go from this node's page", hash.fmt_short());
         Ok(())
+    }
+
+    /// 🔗 Mark a whole file shareable (`on`), or not: while it is, any node
+    /// that asks for it by hash is served it (`may_serve`), as its SSF link
+    /// promises. A transfer already running finishes. The other holders the
+    /// link it came from named, for the link the page writes.
+    pub(crate) fn share(&self, hash: &Hash, on: bool) -> std::result::Result<Vec<PublicKey>, &'static str> {
+        let via = {
+            let mut held = self.held.lock().unwrap();
+            match held.get_mut(hash) {
+                None => return Err("this node does not have that file"),
+                Some(h) if h.phase != Phase::Complete => return Err("that file is not whole on this node yet"),
+                Some(h) => {
+                    h.shared = on;
+                    h.via.clone()
+                }
+            }
+        };
+        self.persist();
+        println!("📦 blob {}: {}", hash.fmt_short(), if on { "shared by its SSF link" } else { "no longer shared by its link" });
+        Ok(via)
     }
 
     /// Note a read of `hash`: it is in use, and the last to go. The list on
@@ -826,7 +880,7 @@ impl BlobLane {
                     continue;
                 }
                 held.insert(e.hash, Held {
-                    rooms: HashSet::from([room.to_string()]), size: e.size, have: 0, mime: safe_mime(&e.mime), phase: Phase::Queued, charged, used: now, readers: 0,
+                    rooms: HashSet::from([room.to_string()]), size: e.size, have: 0, mime: safe_mime(&e.mime), phase: Phase::Queued, charged, used: now, readers: 0, shared: false, via: Vec::new(),
                 });
                 h.tried.insert(e.hash, now);
                 h.spent.entry(room.to_string()).or_default().push((now, charge));
@@ -990,18 +1044,19 @@ impl BlobLane {
 
     /// May `remote` be served `hash`: the blob is whole here, and `remote` is
     /// a connected member of a room it was imported or fetched for, or was
-    /// one within `MET_TTL`. A get served counts as a use (`touch`); an
-    /// observe (WHERE) does not.
+    /// one within `MET_TTL` — or the page marked it shareable (🔗, an SSF
+    /// link), when anyone who asks for it by hash is. A get served counts as
+    /// a use (`touch`); an observe (WHERE) does not.
     fn may_serve(&self, members: &Members, remote: &PublicKey, hash: &Hash, touch: bool) -> bool {
-        let rooms: Vec<String> = {
+        let (rooms, shared): (Vec<String>, bool) = {
             let held = self.held.lock().unwrap();
             match held.get(hash) {
-                Some(h) if h.phase == Phase::Complete => h.rooms.iter().cloned().collect(),
+                Some(h) if h.phase == Phase::Complete => (h.rooms.iter().cloned().collect(), h.shared),
                 _ => return false,
             }
         };
         let now = now_ms();
-        let ok = rooms.iter().any(|r| members(r, remote) || self.met_in(r, remote, now));
+        let ok = shared || rooms.iter().any(|r| members(r, remote) || self.met_in(r, remote, now));
         if ok && touch {
             self.touch(hash);
         }
@@ -1092,10 +1147,21 @@ impl BlobLane {
             whole.sort_unstable_by_key(|(_, h)| std::cmp::Reverse(h.used));
         }
         let hashes: Vec<String> = whole.iter().take(MAX_HELD_LISTED).map(|(hash, _)| hash.to_hex().to_string()).collect();
+        // 🔗 The listed ones the page marked shareable, each with the other
+        // holders its link named.
+        let shared: serde_json::Map<String, serde_json::Value> = whole
+            .iter()
+            .take(MAX_HELD_LISTED)
+            .filter(|(_, h)| h.shared)
+            .map(|(hash, h)| (hash.to_hex().to_string(), serde_json::Value::from(h.via.iter().map(|p| p.to_string()).collect::<Vec<_>>())))
+            .collect();
         let peers: Vec<String> = reachable.iter().take(MAX_HELD_LISTED).map(|p| p.to_string()).collect();
         let kept: u64 = held.values().filter(|h| h.phase == Phase::Complete).map(|h| h.charged).sum();
         drop(held);
-        serde_json::json!({ "held": hashes, "more": more, "reachable": peers, "keep": self.keep, "kept": kept, "quota": self.quota, "host": self.host_json(room) }).to_string()
+        serde_json::json!({
+            "held": hashes, "more": more, "reachable": peers, "keep": self.keep, "kept": kept, "quota": self.quota, "host": self.host_json(room), "shared": shared,
+        })
+        .to_string()
     }
 
     fn fail(&self, hash: &Hash, why: &str) {
@@ -1215,7 +1281,7 @@ impl BlobLane {
                 return None;
             }
             held.insert(placeholder, Held {
-                rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len), used: now, readers: 0,
+                rooms: HashSet::new(), size: len, have: 0, mime: mime.to_string(), phase: Phase::Importing, charged: storage_bound(len), used: now, readers: 0, shared: false, via: Vec::new(),
             });
             evicted
         };
@@ -1245,7 +1311,7 @@ impl BlobLane {
             let mut held = self.held.lock().unwrap();
             held.remove(&placeholder);
             let h = held.entry(hash).or_insert(Held {
-                rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len), used: 0, readers: 0,
+                rooms: HashSet::new(), size: len, have: len, mime: mime.clone(), phase: Phase::Complete, charged: storage_bound(len), used: 0, readers: 0, shared: false, via: Vec::new(),
             });
             h.rooms.insert(room);
             h.phase = Phase::Complete;
@@ -1406,6 +1472,33 @@ pub fn spawn_host_copier(lane: Arc<BlobLane>, hub: SharedHub, endpoint: iroh::En
     });
 }
 
+/// The nodes a FETCH dials, by id, at most `MAX_PROVIDERS`, never this node
+/// (`me`): those `connected` to it in the room first, then those `met` in it
+/// lately, then — for an SSF link pasted on this node's page (`link`) — the
+/// others the link names. Each tier keeps the order it was asked in.
+fn pick_providers(wanted: &[PublicKey], connected: &dyn Fn(&PublicKey) -> bool, met: &dyn Fn(&PublicKey) -> bool, link: bool, me: &PublicKey) -> Vec<PublicKey> {
+    let tier = |p: &PublicKey| {
+        if connected(p) {
+            Some(0)
+        } else if met(p) {
+            Some(1)
+        } else if link {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let mut ranked: Vec<(u8, usize, PublicKey)> = wanted.iter().enumerate().filter(|(_, p)| *p != me).filter_map(|(i, p)| tier(p).map(|t| (t, i, *p))).collect();
+    ranked.sort_by_key(|(t, i, _)| (*t, *i));
+    let mut out: Vec<PublicKey> = Vec::new();
+    for (_, _, p) in ranked {
+        if out.len() < MAX_PROVIDERS && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Is this request one of the lane's routes.
 pub fn is_blob_route(path: &str) -> bool {
     path.starts_with("/blob/") || path.starts_with("/api/blob/")
@@ -1491,18 +1584,18 @@ pub async fn handle_http(
                 .get("from")
                 .map(|f| f.split(',').filter_map(|id| PublicKey::from_str(id.trim()).ok()).collect())
                 .unwrap_or_default();
-            // Only a provider this node holds an authenticated connection
-            // with in THIS room, or met in it lately (`MET_TTL`), dialled by
-            // id: never an address the record or anyone else supplied. The
-            // connected ones first: they answer at once.
+            // 🔗 An SSF link pasted on this page: the nodes it names are
+            // dialled too (the paste is the consent, as FETCH's press is).
+            let link = head.query.get("link").is_some_and(|v| v == "1");
+            // A provider this node holds an authenticated connection with in
+            // THIS room, or met in it lately (`MET_TTL`), or one a pasted
+            // link names, dialled by id: never an address the record or
+            // anyone else supplied. The connected ones first: they answer at
+            // once.
             let connected: HashSet<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().collect()).unwrap_or_default();
             let now = now_ms();
-            let mut providers: Vec<PublicKey> = Vec::new();
-            for p in wanted.iter().filter(|p| connected.contains(*p)).chain(wanted.iter().filter(|p| !connected.contains(*p) && lane.met_in(&room, p, now))) {
-                if providers.len() < 4 && !providers.contains(p) {
-                    providers.push(*p);
-                }
-            }
+            let providers = pick_providers(&wanted, &|p| connected.contains(p), &|p| lane.met_in(&room, p, now), link, &endpoint.id());
+            let via: Vec<PublicKey> = if link { providers.iter().take(LINK_MAX_VIA).copied().collect() } else { Vec::new() };
             enum Verdict { Already, NotConnected, NoRoom, Start }
             let mut evicted = false;
             let verdict = {
@@ -1512,6 +1605,9 @@ pub async fn handle_http(
                     // shares it too.
                     Some(h) if !matches!(h.phase, Phase::Failed(_)) => {
                         h.rooms.insert(room.clone());
+                        if h.via.is_empty() {
+                            h.via = via.clone();
+                        }
                         true
                     }
                     _ => false,
@@ -1534,6 +1630,7 @@ pub async fn handle_http(
                         } else {
                             held.insert(hash, Held {
                                 rooms: HashSet::from([room]), size, have: 0, mime, phase: Phase::Queued, charged: storage_bound(size).max(failed_charge), used: now_ms(), readers: 0,
+                                shared: false, via,
                             });
                             Verdict::Start
                         }
@@ -1545,6 +1642,7 @@ pub async fn handle_http(
             }
             match verdict {
                 Verdict::Already => reply(socket, "200 OK", cors, &serde_json::json!({ "ok": true }).to_string()).await,
+                Verdict::NotConnected if link => reply(socket, "409 Conflict", cors, &err_json("the link names no other node that holds this file")).await,
                 Verdict::NotConnected => {
                     reply(socket, "409 Conflict", cors, &err_json("the node holding this file is not connected to yours, and has not been in this room with it lately")).await
                 }
@@ -1606,6 +1704,23 @@ pub async fn handle_http(
                 .map(|(h, ids)| (h.to_hex().to_string(), serde_json::Value::from(ids.iter().map(|p| p.to_string()).collect::<Vec<_>>())))
                 .collect();
             reply(socket, "200 OK", cors, &serde_json::json!({ "holders": holders }).to_string()).await;
+        }
+        ("POST", "/api/blob/share") => {
+            let Some(hash) = hash_param(&head) else {
+                return reply(socket, "400 Bad Request", cors, &err_json("no hash")).await;
+            };
+            let on = match head.query.get("on").map(String::as_str) {
+                Some("1") => true,
+                Some("0") => false,
+                _ => return reply(socket, "400 Bad Request", cors, &err_json("on is 0 or 1")).await,
+            };
+            match lane.share(&hash, on) {
+                Ok(via) => {
+                    let via: Vec<String> = via.iter().map(|p| p.to_string()).collect();
+                    reply(socket, "200 OK", cors, &serde_json::json!({ "shared": on, "via": via }).to_string()).await
+                }
+                Err(why) => reply(socket, "409 Conflict", cors, &err_json(why)).await,
+            }
         }
         ("POST", "/api/blob/forget") => {
             let Some(hash) = hash_param(&head) else {
@@ -1778,16 +1893,16 @@ mod tests {
         let tag = lane_a.store.blobs().add_slice(&data).await.unwrap();
         let size = data.len() as u64;
         lane_a.held.lock().unwrap().insert(tag.hash, Held {
-            rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size, used: 0, readers: 0,
+            rooms: HashSet::from(["r".to_string()]), size, have: size, mime: "video/mp4".into(), phase: Phase::Complete, charged: size, used: 0, readers: 0, shared: false, via: Vec::new(),
         });
         assert_eq!(
             lane_a.held_json("r", &[b_id]),
-            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "host": null, "keep": false, "kept": size, "more": false, "quota": 1u64 << 30, "reachable": [b_id.to_string()] }).to_string()
+            serde_json::json!({ "held": [tag.hash.to_hex().to_string()], "host": null, "keep": false, "kept": size, "more": false, "quota": 1u64 << 30, "reachable": [b_id.to_string()], "shared": {} }).to_string()
         );
         assert!(lane_a.held_json("elsewhere", &[]).starts_with(r#"{"held":[],"#));
         let queue = |lane: &Arc<BlobLane>, declared: u64| {
             lane.held.lock().unwrap().insert(tag.hash, Held {
-                rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared, used: 0, readers: 0,
+                rooms: HashSet::from(["r".to_string()]), size: declared, have: 0, mime: String::new(), phase: Phase::Queued, charged: declared, used: 0, readers: 0, shared: false, via: Vec::new(),
             });
         };
 
@@ -1850,6 +1965,135 @@ mod tests {
         lane_d.fail(&tag.hash, "a late failure");
         assert_eq!(lane_d.held.lock().unwrap()[&tag.hash].phase, Phase::Complete);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🔗 A file the page marked shareable is served to a node that is no
+    /// member of its room, by hash, until the page says no more; one not
+    /// marked never is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_file_is_served_to_anyone_who_asks_for_it() {
+        use iroh::address_lookup::memory::MemoryLookup;
+        let tmp = std::env::temp_dir().join(format!("ssf-blob-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let lane_a = BlobLane::open_at(tmp.join("a"), 1 << 30).await.unwrap();
+        let bind = || async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::endpoint::RelayMode::Disabled)
+                .alpns(vec![iroh_blobs::ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap()
+        };
+        let (ep_a, ep_s) = (bind().await, bind().await);
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(ep_a.addr());
+        ep_s.address_lookup().unwrap().add(lookup);
+        // Nobody is a member of A's room: S is a stranger, from another room.
+        let members: Members = Arc::new(|_, _| false);
+        {
+            let (lane, ep, members) = (lane_a.clone(), ep_a.clone(), members.clone());
+            tokio::spawn(async move {
+                while let Some(inc) = ep.accept().await {
+                    let Ok(conn) = inc.await else { continue };
+                    tokio::spawn(lane.clone().serve_with(members.clone(), conn));
+                }
+            });
+        }
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 11 % 251) as u8).collect();
+        let hash = import_bytes(&lane_a, &data, "film").await;
+        let (size, a_id) = (data.len() as u64, ep_a.id());
+        let fetch = |name: &str| {
+            let (dir, ep) = (tmp.join(name), ep_s.clone());
+            async move {
+                let lane = BlobLane::open_at(dir, 1 << 30).await.unwrap();
+                lane.held.lock().unwrap().insert(hash, Held {
+                    rooms: HashSet::from(["q".to_string()]), size, have: 0, mime: String::new(), phase: Phase::Queued, charged: size, used: 0, readers: 0,
+                    shared: false, via: Vec::new(),
+                });
+                lane.clone().run_fetch(ep, hash, size, vec![a_id]).await;
+                let phase = lane.held.lock().unwrap()[&hash].phase.clone();
+                (lane, phase)
+            }
+        };
+
+        // Not marked: refused, as before.
+        let (_, phase) = fetch("s1").await;
+        assert!(matches!(phase, Phase::Failed(_)), "{phase:?}");
+        assert!(lane_a.held_json("r", &[]).ends_with(r#""shared":{}}"#));
+
+        // Marked: the stranger takes it whole, checked by hash.
+        assert_eq!(lane_a.share(&hash, true), Ok(Vec::new()));
+        assert!(lane_a.held_json("r", &[]).ends_with(&format!(r#""shared":{{"{}":[]}}}}"#, hash.to_hex())), "{}", lane_a.held_json("r", &[]));
+        let (lane_s, phase) = fetch("s2").await;
+        assert_eq!(phase, Phase::Complete);
+        let mut got = Vec::new();
+        lane_s.store.blobs().reader(hash).read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, data);
+        // What the stranger fetched is its own room's, and not shared on by it.
+        assert!(!lane_s.held.lock().unwrap()[&hash].shared);
+
+        // No longer marked: refused again.
+        assert_eq!(lane_a.share(&hash, false), Ok(Vec::new()));
+        let (_, phase) = fetch("s3").await;
+        assert!(matches!(phase, Phase::Failed(_)), "{phase:?}");
+
+        // Only a whole file this node has.
+        assert_eq!(lane_a.share(&Hash::new(b"not here"), true), Err("this node does not have that file"));
+        lane_a.held.lock().unwrap().get_mut(&hash).unwrap().phase = Phase::Fetching;
+        assert_eq!(lane_a.share(&hash, true), Err("that file is not whole on this node yet"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The nodes a FETCH dials: the connected first, then those met lately,
+    /// then a pasted link's others; never this node; at most four.
+    #[test]
+    fn a_fetch_dials_the_room_first_and_a_links_nodes_only_for_a_link() {
+        let key = || iroh::SecretKey::generate().public();
+        let (me, c1, c2, m1, s1, s2, s3) = (key(), key(), key(), key(), key(), key(), key());
+        let connected = |p: &PublicKey| *p == c1 || *p == c2;
+        let met = |p: &PublicKey| *p == m1;
+        let wanted = vec![s1, m1, me, c2, s1, c1];
+        assert_eq!(pick_providers(&wanted, &connected, &met, false, &me), vec![c2, c1, m1]);
+        assert_eq!(pick_providers(&wanted, &connected, &met, true, &me), vec![c2, c1, m1, s1]);
+        assert_eq!(pick_providers(&[s1, s2, s3, me], &connected, &met, true, &me), vec![s1, s2, s3]);
+        assert_eq!(pick_providers(&[s1, s2, s3, c1, m1], &connected, &met, true, &me), vec![c1, m1, s1, s2]);
+        assert!(pick_providers(&[s1, me], &connected, &met, false, &me).is_empty());
+    }
+
+    /// A shareable file, and the other holders its link named, are still so
+    /// after a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_file_stays_shared_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-link-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quiet = Duration::from_secs(3600);
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i * 3 % 251) as u8).collect();
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, quiet).await.unwrap();
+        let hash = import_bytes(&lane, &data, "a").await;
+        let other = import_bytes(&lane, &data[..40_000], "b").await;
+        let holder = iroh::SecretKey::generate().public();
+        lane.held.lock().unwrap().get_mut(&hash).unwrap().via = vec![holder];
+        assert_eq!(lane.share(&hash, true), Ok(vec![holder]));
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, quiet).await.unwrap();
+        {
+            let held = lane.held.lock().unwrap();
+            assert!(held[&hash].shared && held[&hash].via == vec![holder]);
+            assert!(!held[&other].shared && held[&other].via.is_empty());
+        }
+        // A list written before SSF links reads as nothing shared.
+        let listed = std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap();
+        let old = listed.replace(r#","shared":true"#, "").replace(&format!(r#","via":["{holder}"]"#), "");
+        assert!(old != listed && !old.contains(r#""shared":true"#));
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+        std::fs::write(dir.join(LIBRARY_FILE), old).unwrap();
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, quiet).await.unwrap();
+        assert!(!lane.held.lock().unwrap()[&hash].shared);
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -2115,7 +2359,7 @@ mod tests {
         assert_eq!(found[&film_hash], vec![h_id]);
         // …and the visitor fetches from the host.
         visitor.held.lock().unwrap().insert(film_hash, Held {
-            rooms: HashSet::from(["r".to_string()]), size, have: 0, mime: String::new(), phase: Phase::Queued, charged: size, used: 0, readers: 0,
+            rooms: HashSet::from(["r".to_string()]), size, have: 0, mime: String::new(), phase: Phase::Queued, charged: size, used: 0, readers: 0, shared: false, via: Vec::new(),
         });
         visitor.clone().run_fetch(ep_v.clone(), film_hash, size, vec![h_id]).await;
         assert_eq!(visitor.held.lock().unwrap()[&film_hash].phase, Phase::Complete);
@@ -2186,7 +2430,7 @@ mod tests {
         assert_eq!(stranger.holders(&ep_x, "r", vec![], vec![s_id], vec![hash]).await[&hash], vec![], "an observe from a node never met in the room is refused");
         let queue = |lane: &Arc<BlobLane>| {
             lane.held.lock().unwrap().insert(hash, Held {
-                rooms: HashSet::from(["r".to_string()]), size, have: 0, mime: String::new(), phase: Phase::Queued, charged: size, used: 0, readers: 0,
+                rooms: HashSet::from(["r".to_string()]), size, have: 0, mime: String::new(), phase: Phase::Queued, charged: size, used: 0, readers: 0, shared: false, via: Vec::new(),
             });
         };
         queue(&viewer);
@@ -2394,7 +2638,7 @@ mod tests {
         let hash = |i: u64| Hash::new(i.to_le_bytes());
         for i in 0..=MAX_HELD_LISTED as u64 {
             lane.held.lock().unwrap().insert(hash(i), Held {
-                rooms: HashSet::from(["r".to_string()]), size: 1, have: 1, mime: String::new(), phase: Phase::Complete, charged: 1, used: i, readers: 0,
+                rooms: HashSet::from(["r".to_string()]), size: 1, have: 1, mime: String::new(), phase: Phase::Complete, charged: 1, used: i, readers: 0, shared: false, via: Vec::new(),
             });
         }
         let got: serde_json::Value = serde_json::from_str(&lane.held_json("r", &[])).unwrap();

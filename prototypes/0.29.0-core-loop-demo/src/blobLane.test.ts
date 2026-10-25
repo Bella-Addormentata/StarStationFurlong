@@ -5,8 +5,8 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  __test, blobLaneNodeId, blobNodeTag, blobLaneReady, blobState, blobUrl, forgetBlob, forgetBlobLane, formatBytes, freshNodeHolders, nodeHolders, recheckBlob,
-  refreshHolders, setBlobLaneNode, setBlobLaneRoom,
+  __test, blobLaneNodeId, blobNodeTag, blobLaneReady, blobState, blobUrl, fetchFromLink, forgetBlob, forgetBlobLane, formatBytes, freshNodeHolders, nodeHolders,
+  nodeShares, recheckBlob, refreshHeldBlobs, refreshHolders, setBlobLaneNode, setBlobLaneRoom, shareBlob,
 } from './blobLane';
 import { setNodeMediaOrigin } from './tvConsent';
 import { tvNow, tvWallNow } from './tvDoc';
@@ -94,6 +94,76 @@ describe('blobLane', () => {
     expect(formatBytes(5 * 1024 ** 2)).toBe('5.0 MB');
     expect(formatBytes(700 * 1024 ** 2)).toBe('700 MB');
     expect(formatBytes(1.5 * 1024 ** 3)).toBe('1.5 GB');
+  });
+
+  describe('🔗 SSF links', () => {
+    const [OTHER, FAR] = ['d', 'e'].map((c) => c.repeat(64)) as [string, string];
+    function withNode() {
+      setNodeMediaOrigin(ORIGIN, tvNow(), tvWallNow());
+      setBlobLaneRoom('room-1');
+      setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID });
+    }
+
+    it('a pasted link asks this node to dial the nodes it names, for this room, marked as a link', async () => {
+      const link = { hash: HASH, size: 42, title: 'Sintel', mime: 'video/webm', nodes: [OTHER, FAR] };
+      expect(await fetchFromLink(link)).toMatch(/node/); // no node here
+      withNode();
+      const urls: string[] = [];
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        urls.push(url);
+        return url.includes(FAR)
+          ? new Response(JSON.stringify({ error: 'the link names no other node that holds this file' }), { status: 409 })
+          : new Response(JSON.stringify({ ok: true }), { status: 202 });
+      }));
+      expect(await fetchFromLink(link)).toBe('Your node: the link names no other node that holds this file.');
+      expect(await fetchFromLink({ ...link, nodes: [OTHER] })).toBeNull();
+      const asked = new URL(urls[1]!);
+      expect(asked.pathname).toBe('/api/blob/fetch');
+      expect(Object.fromEntries(asked.searchParams)).toEqual({ cap: CAP, room: 'room-1', hash: HASH, size: '42', from: OTHER, mime: 'video/webm', link: '1' });
+      expect(await fetchFromLink({ ...link, nodes: [] })).toMatch(/node/);
+      expect(urls).toHaveLength(2);
+    });
+
+    it('a file marked shareable says so, with the other holders its link named, until it is let go', async () => {
+      withNode();
+      let shared: Record<string, string[]> = { [HASH]: [OTHER], [FAR]: [] };
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (url.includes('/api/blob/share')) {
+          const on = new URL(url).searchParams.get('on') === '1';
+          shared = on ? { ...shared, [OTHER]: [] } : {};
+          return new Response(JSON.stringify({ shared: on, via: on ? [FAR, 'nope'] : [] }), { status: 200 });
+        }
+        if (url.includes('/api/blob/forget')) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        // FAR is shared but not held for this room: not this room's to say.
+        return new Response(JSON.stringify({ held: [HASH, OTHER], reachable: [], shared }), { status: 200 });
+      }));
+      expect(nodeShares(HASH)).toBeNull(); // not said yet
+      await refreshHeldBlobs(1_000);
+      expect(nodeShares(HASH)).toEqual([OTHER]);
+      expect(nodeShares(OTHER)).toBe(false);
+      expect(nodeShares(FAR)).toBe(false);
+      expect(await shareBlob(OTHER, true)).toEqual({ via: [FAR] });
+      expect(nodeShares(OTHER)).toEqual([FAR]);
+      expect(await shareBlob(OTHER, false)).toEqual({ via: [] });
+      expect(nodeShares(OTHER)).toBe(false);
+      expect(await forgetBlob(HASH)).toBeNull();
+      expect(nodeShares(HASH)).toBe(false);
+      expect(await shareBlob('not a hash', true)).toEqual({ error: expect.stringMatching(/node/) });
+    });
+
+    it('a share answered by the node this page had before is no share here', async () => {
+      withNode();
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (url.includes('/api/blob/share')) {
+          setBlobLaneNode({ origin: ORIGIN, cap: 'f'.repeat(64), irohId: OTHER }); // the node restarted under the ask
+          return new Response(JSON.stringify({ shared: true, via: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ held: [HASH], reachable: [], shared: {} }), { status: 200 });
+      }));
+      await refreshHeldBlobs(1_000);
+      expect(await shareBlob(HASH, true)).toEqual({ error: expect.stringMatching(/restarted/) });
+      expect(nodeShares(HASH)).toBeNull(); // the new node has not said yet
+    });
   });
 
   describe('a whole file can go again', () => {

@@ -12,9 +12,12 @@
  *    and OK picks what is under it;
  *  - what the set asks of this viewer (tvTheatre's notice): a link to
  *    allow, a file to fetch, a tap for sound;
- *  - the link box and SEND: a web address or a magnet link;
+ *  - the link box and SEND: a web address, a magnet link, or an SSF link
+ *    (ssfLink.ts), which this page's node fetches from the nodes it names
+ *    before the film goes on;
  *  - a file from this computer, a torrent's download, the host's copies
- *    and the room's library.
+ *    and the room's library, where 🔗 SSF LINK shares a file on this
+ *    page's node by its link.
  *
  * Every press makes the little glow at the phone's tip (irBlaster.ts).
  * Every SpacePhone is a remote: nothing to pick up, hold or hand on, and
@@ -42,9 +45,10 @@ import { irBlink } from './irBlaster';
 import { tvMenu, tvMenuCellAt, tvMenuMove, tvMenuStep } from './tvMenu';
 import type { TvMenuDir, TvMenuView, TvPausedCell } from './tvMenu';
 import {
-  blobLaneNodeId, blobLaneReady, blobLaneRoom, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
-  refreshHeldBlobs, refreshHolders, setHostCopies, torrentLaneReady,
+  blobLaneGeneration, blobLaneNodeId, blobLaneReady, blobLaneRoom, blobStateNow, fetchFromLink, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds,
+  nodeHostCopies, nodeLibrarySpace, nodeReaches, nodeShares, refreshHeldBlobs, refreshHolders, setHostCopies, shareBlob, torrentLaneReady,
 } from './blobLane';
+import { formatSsfLink, isSsfFilmLink, parseSsfLink } from './ssfLink';
 import {
   confirmTorrent, MAX_TORRENT_FILE, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile, stopTorrent,
   torrentLine, torrentOrigin, torrentRunning, torrentSource, torrentState,
@@ -218,6 +222,10 @@ let libraryQuery = '';
 let libraryShown = LIBRARY_PAGE;
 /** The row whose 🗑 was pressed once: a second press lets the file go. */
 let forgetArmed = '';
+/** 🔗 The row whose SSF link is shown under it, and the link. */
+let linkShown: { key: string; text: string } | null = null;
+/** How often a SEND of an SSF link asks the node how its fetch goes. */
+const LINK_POLL_MS = 1_000;
 
 /** What a library row is: a file from a node, a torrent's file, or a link. */
 export function libraryKind(e: Pick<TvLibraryEntry, 'source' | 'torrent'>): Exclude<LibraryFilter, 'all'> {
@@ -614,8 +622,11 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
   // its highlight for the whole room, and OK picks what is under it.
   const menu = on ? tvMenu(tv.id) : null;
   const step = (dir: TvMenuDir) => menu !== null && tvMenuStep(menu, dir) !== null;
-  const takes = visibleTiles().filter((t) => t.live && t.key !== 'file')
-    .map((t) => `<span style="white-space:nowrap;">${t.icon} ${esc(t.label)} ${laneBadge(t.lane)}</span>`).join(' ');
+  const takes = [
+    ...visibleTiles().filter((t) => t.live && t.key !== 'file').map((t) => ({ icon: t.icon, label: t.label, lane: t.lane })),
+    // 🔗 An SSF link: fetched by this page's node, so only with one.
+    ...(blobLaneReady() ? [{ icon: '🔗', label: 'SSF LINK', lane: 'SOVEREIGN' }] : []),
+  ].map((t) => `<span style="white-space:nowrap;">${t.icon} ${esc(t.label)} ${laneBadge(t.lane)}</span>`).join(' ');
   return `<div class="phone-access-section ir-face">
     <div class="phone-access-header" style="display:flex; gap:6px; align-items:center;">
       <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📡 AIMED AT: ${esc(tv.label)}</span>
@@ -655,7 +666,7 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
       </div>
     </div>
     <div class="phone-access-header" style="margin-top:4px;">SEND TO THE SET</div>
-    <input type="text" data-tv-paste="1" placeholder="a web address or a magnet link" autocomplete="off" aria-label="A web address or a magnet link to send to the set">
+    <input type="text" data-tv-paste="1" placeholder="a web address, a magnet or an SSF link" autocomplete="off" aria-label="A web address, a magnet link or an SSF link to send to the set">
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
       ${irKey(`data-tv-send="${id}" title="Put it on the set now"`, '📡 SEND')}
       ${scheduleKeys(id, 'link')}
@@ -801,15 +812,33 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     const forget = where === 'mine'
       ? smallButton(`data-tv-lib-forget="${id}" data-tv-id="${esc(tvId)}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
       : '';
+    // 🔗 A file on this node can go out by an SSF link: whoever pastes it
+    // gets the file from this node, from any room.
+    const shares = e.source.kind === 'blob' && where === 'mine' ? nodeShares(e.source.hash) : null;
+    const link = e.source.kind === 'blob' && where === 'mine'
+      ? smallButton(`data-tv-lib-link="${id}" data-tv-id="${esc(tvId)}" title="${shares ? 'Show its SSF link again' : 'Share it by an SSF link: whoever pastes it gets the file from your node, in any room'}"`, '🔗 SSF LINK')
+      : '';
+    const sharedText = shares ? ` · <span style="color:${GREEN};">🔗 SHARED BY LINK</span>` : '';
+    const linkPanel = linkShown && linkShown.key === sourceId(e.source) && shares ? `<div style="display:flex; flex-direction:column; gap:3px; padding:2px 0;">
+        <input type="text" readonly data-tv-lib-link-text="1" value="${esc(linkShown.text)}" aria-label="The file's SSF link">
+        <div style="font-size:8.5px; color:${DIM};">Whoever pastes this in their IR blaster's box and presses 📡 SEND gets the file from your node, every byte checked against its hash, in any room, while your node is online. Until you stop sharing it, your node gives this file to any node that asks with the link, and that node sees your node's address, as a room's members do.</div>
+        <div style="display:flex; gap:4px; flex-wrap:wrap;">
+          ${smallButton('data-tv-lib-link-copy="1"', '📋 COPY')}
+          ${smallButton(`data-tv-lib-unshare="${id}" data-tv-id="${esc(tvId)}" title="Your node gives this file to no one by its link from now on"`, '⏹ STOP SHARING')}
+          ${smallButton('data-tv-lib-link-hide="1"', 'HIDE')}
+        </div>
+      </div>` : '';
     return `<div style="display:flex; flex-direction:column; gap:2px; padding:4px 0; border-top:1px solid rgba(212,168,75,0.1);">
       <div class="phone-access-room-row">
         <span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" title="${esc(e.title)}">${icon} ${esc(e.title)}</span>
         ${refused ? `<span style="font-size:7px; color:${DIM}; font-weight:800;" title="${esc(refused)}">OFF HERE</span>` : ''}
         ${again}
+        ${link}
         ${forget}
         ${smallButton(`data-tv-lib-play="${id}" data-tv-id="${esc(tvId)}"`, '▶')}
       </div>
-      <div style="font-size:8.5px; color:${DIM};">${esc(sourceLane(e.source))}${esc(size)} · ${e.plays > 1 ? `played ${e.plays}× · ` : ''}${esc(agoText(e.playedAt, wall))}${whereText ? ' · ' : ''}${whereText}</div>
+      <div style="font-size:8.5px; color:${DIM};">${esc(sourceLane(e.source))}${esc(size)} · ${e.plays > 1 ? `played ${e.plays}× · ` : ''}${esc(agoText(e.playedAt, wall))}${whereText ? ' · ' : ''}${whereText}${sharedText}</div>
+      ${linkPanel}
     </div>`;
   }).join('');
   const chips = LIBRARY_FILTERS.map((f) => {
@@ -1029,9 +1058,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
    *  link typed meanwhile and never submitted. */
   const sourceFromLink = async (id: string, gen: number): Promise<Shared | null> => {
     const text = liveBox()?.value ?? '';
+    if (isSsfFilmLink(text)) return sourceFromSsfLink(id, gen, text);
     const parsed = parseTvSource(text);
     if (!parsed) {
-      feedback(text.trim() ? 'That is not a link the TV can play.' : 'Paste a web address or a magnet link first.', 'link');
+      feedback(text.trim() ? 'That is not a link the TV can play.' : 'Paste a web address, a magnet or an SSF link first.', 'link');
       return null;
     }
     // What this build would refuse to play is refused here, with the
@@ -1058,6 +1088,71 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback('No playable file found — using their embed (start-time sync only).', 'link');
     }
     return { source: parsed, text };
+  };
+
+  /** 🔗 An SSF link: this page's node takes the file from the nodes the link
+   *  names (or has it already), every byte checked against its hash, and
+   *  the film goes on from this node, got ready for the room as a FILE is
+   *  (readied). Voided as an archive lookup is — by the next attempt from
+   *  this blaster, anything that moves the programme meanwhile, the room or
+   *  the node changing — while the fetch goes on: a SEND of the same link
+   *  then puts it on at once. */
+  const sourceFromSsfLink = async (id: string, gen: number, text: string): Promise<Shared | null> => {
+    const link = parseSsfLink(text);
+    if (!link) {
+      feedback('That SSF link is not whole: it needs the file\'s hash, its size and a node that holds it.', 'link');
+      return null;
+    }
+    const me = blobLaneNodeId();
+    if (!me) {
+      feedback('An SSF link needs this station\'s node (the desktop app) running here: your node takes the file for you.', 'link');
+      return null;
+    }
+    const name = link.title || 'the film';
+    const epoch = tvDocEpoch();
+    const revision = tvRevision(id);
+    const node = blobLaneGeneration();
+    const current = () => gen === resolveGen && epoch === tvDocEpoch() && tvRevision(id) === revision;
+    feedback(`Asking your node for ${name} (${formatBytes(link.size)}) from the nodes the link names…`, 'link');
+    const why = await fetchFromLink(link);
+    if (!current()) return null;
+    if (why) {
+      feedback(`${name}: ${why}`, 'link');
+      return null;
+    }
+    for (;;) {
+      const st = await blobStateNow(link.hash);
+      if (!current()) return null;
+      if (blobLaneGeneration() !== node || !blobLaneNodeId()) {
+        feedback(`Your node restarted or went away while it took ${name}. SEND the link again.`, 'link');
+        return null;
+      }
+      if (st.state === 'complete') {
+        // A file this node had already, or was taking for another ask, is
+        // not checked against the link's size by the fetch: it is here. Its
+        // own size goes to the room, never a link's wrong one (the room's
+        // viewers take no byte past it).
+        if (st.size !== link.size) {
+          feedback(`${name}: your node holds that file at ${formatBytes(st.size)}, not the ${formatBytes(link.size)} the link says. The link is wrong: ask for it again.`, 'link');
+          return null;
+        }
+        break;
+      }
+      if (st.state === 'failed' || st.state === 'none') {
+        feedback(`${name} did not come: ${st.state === 'failed' && st.why ? st.why : 'your node let it go'}. The nodes the link names may be offline, or no longer share it: try again later.`, 'link');
+        return null;
+      }
+      if (st.state === 'queued') feedback(`${name} waits its turn on your node…`, 'link');
+      else if (st.state === 'fetching') {
+        feedback(`Taking ${name} from the link's nodes… ${Math.floor((st.have / Math.max(1, link.size)) * 100)}% of ${formatBytes(link.size)}, each byte checked against its hash`, 'link');
+      }
+      await new Promise((r) => setTimeout(r, LINK_POLL_MS));
+      if (!current()) return null;
+    }
+    void refreshHeldBlobs();
+    const source = sanitizeSource({ kind: 'blob', hash: link.hash, size: link.size, provider: me, mime: link.mime, title: link.title });
+    if (source?.kind !== 'blob') return null;
+    return readied({ source, text }, id, gen, 'link');
   };
 
   /** 📁 The chosen file: handed to this page's node, then got ready for the
@@ -1383,6 +1478,57 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     const why = await forgetBlob(hash);
     feedback(why ?? 'Your node let its copy go.', 'library');
     void refreshHeldBlobs();
+    renderTvPhoneApp(host, deps);
+  }));
+  // 🔗 SSF LINK: the file is marked shareable on this page's node, and its
+  // link shown under the row (and copied, where the page may write the
+  // clipboard). It names this node, then the nodes the link this file came
+  // from named.
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-link]').forEach((b) => b.addEventListener('click', async () => {
+    const key = b.dataset.tvLibLink!;
+    const entry = libraryEntry(b.dataset.tvId!, key);
+    const me = blobLaneNodeId();
+    if (entry?.source.kind !== 'blob' || !me) return;
+    const { hash, size, mime } = entry.source;
+    const got = await shareBlob(hash, true);
+    if ('error' in got) {
+      feedback(got.error, 'library');
+      return;
+    }
+    const text = formatSsfLink({ hash, size, title: entry.title, mime: mime ?? '', nodes: [me, ...got.via] });
+    linkShown = { key, text };
+    const copied = await navigator.clipboard?.writeText(text).then(() => true, () => false) ?? false;
+    feedback(copied
+      ? `🔗 The SSF link to ${entry.title} is copied: send it to whoever you like. Your node shares the file with anyone who has it.`
+      : `🔗 The SSF link to ${entry.title} is below: select it and copy it. Your node shares the file with anyone who has it.`, 'library');
+    renderTvPhoneApp(host, deps);
+  }));
+  host.querySelector<HTMLButtonElement>('[data-tv-lib-link-copy]')?.addEventListener('click', async () => {
+    if (!linkShown) return;
+    const box = host.querySelector<HTMLInputElement>('[data-tv-lib-link-text]');
+    const copied = await navigator.clipboard?.writeText(linkShown.text).then(() => true, () => false) ?? false;
+    if (!copied) box?.select();
+    feedback(copied ? '🔗 Copied.' : '🔗 This page may not write the clipboard: the link is selected, copy it with the keys.', 'library');
+  });
+  const linkText = host.querySelector<HTMLInputElement>('[data-tv-lib-link-text]');
+  linkText?.addEventListener('focus', () => linkText.select());
+  linkText?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') e.stopPropagation(); // copy keys must not walk the fox (the paste box's rule)
+  });
+  host.querySelector<HTMLButtonElement>('[data-tv-lib-link-hide]')?.addEventListener('click', () => {
+    linkShown = null;
+    renderTvPhoneApp(host, deps);
+  });
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-unshare]').forEach((b) => b.addEventListener('click', async () => {
+    const entry = libraryEntry(b.dataset.tvId!, b.dataset.tvLibUnshare!);
+    if (entry?.source.kind !== 'blob') return;
+    const got = await shareBlob(entry.source.hash, false);
+    if ('error' in got) {
+      feedback(got.error, 'library');
+      return;
+    }
+    linkShown = null;
+    feedback(`🔗 ${entry.title} is shared by its link no more: your node gives it only to the members of the rooms it was played in, as before. A copy someone already took stays theirs.`, 'library');
     renderTvPhoneApp(host, deps);
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-again]').forEach((b) => b.addEventListener('click', async () => {
