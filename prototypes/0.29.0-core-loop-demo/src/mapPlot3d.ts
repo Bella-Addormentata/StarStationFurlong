@@ -297,7 +297,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     let l = labels.get(id);
     if (!l) {
       const el = document.createElement('span');
-      el.style.cssText = 'position:absolute; transform:translate(-50%, 0); display:inline-flex; align-items:center; gap:5px; padding:2px 7px 2px 5px; border-radius:9px; background:rgba(3,6,18,0.62); border:1px solid rgba(120,150,200,0.16); font-size:10px; letter-spacing:0.6px; text-transform:uppercase; font-family:"SF Mono", Monaco, Consolas, monospace; white-space:nowrap; color:rgba(222,234,255,0.9);';
+      el.style.cssText = 'position:absolute; transform:translate(-50%, -100%); display:inline-flex; align-items:center; gap:5px; padding:2px 7px 2px 5px; border-radius:9px; background:rgba(3,6,18,0.62); border:1px solid rgba(120,150,200,0.16); font-size:10px; letter-spacing:0.6px; text-transform:uppercase; font-family:"SF Mono", Monaco, Consolas, monospace; white-space:nowrap; color:rgba(222,234,255,0.9);';
       const dot = document.createElement('i');
       dot.style.cssText = 'display:inline-block; width:6px; height:6px; border-radius:50%; box-shadow:0 0 6px currentColor; background:currentColor;';
       const text = document.createElement('b');
@@ -407,7 +407,8 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
         l.el.style.borderColor = selected ? colour : here ? 'rgba(61,255,154,0.5)' : 'rgba(120,150,200,0.16)';
         if (behind || (mk.type === 'lagrange' && orbit.dist > 4)) { l.el.style.display = 'none'; continue; }
         const rank = mk.type === 'star' ? 0 : mk.type === 'planet' ? 1 : here ? 2 : selected ? 3 : mk.type === 'lagrange' ? 4 : 5;
-        pending.push({ mk, x, y: y + (mk.type === 'star' ? 26 : mk.type === 'planet' ? 18 : 11), l, rank });
+        // Floating over the body: the pill's foot clears its glow.
+        pending.push({ mk, x, y: y - (mk.type === 'star' ? 34 : mk.type === 'planet' ? 26 : 14), l, rank });
       }
       pending.sort((a, b) => a.rank - b.rank);
       const placed: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
@@ -415,11 +416,11 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
         p.l.el.style.display = '';
         const w = p.l.el.offsetWidth || 80, h = p.l.el.offsetHeight || 18;
         const fits = (cx: number, cy: number) => {
-          const r = { x0: cx - w / 2 - 2, y0: cy - 1, x1: cx + w / 2 + 2, y1: cy + h + 1 };
+          const r = { x0: cx - w / 2 - 2, y0: cy - h - 1, x1: cx + w / 2 + 2, y1: cy + 1 };
           return placed.every((q) => r.x1 <= q.x0 || r.x0 >= q.x1 || r.y1 <= q.y0 || r.y0 >= q.y1) ? r : null;
         };
         let spot: { x0: number; y0: number; x1: number; y1: number } | null = null, lx = p.x, ly = p.y;
-        for (const [dx, dy] of [[0, 0], [0, 20], [0, 40], [0, -22], [0, 60], [w * 0.6, 20], [-w * 0.6, 20], [0, 80]]) {
+        for (const [dx, dy] of [[0, 0], [0, -20], [0, -40], [w * 0.6, -14], [-w * 0.6, -14], [0, -60], [w * 0.6, -36], [-w * 0.6, -36], [0, 44]]) {
           spot = fits(p.x + dx, p.y + dy);
           if (spot) { lx = p.x + dx; ly = p.y + dy; break; }
         }

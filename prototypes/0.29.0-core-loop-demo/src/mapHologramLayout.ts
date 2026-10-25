@@ -85,21 +85,40 @@ const STRETCH: Record<string, number> = { 'planet-aris': 1.32, 'planet-sovereign
 export function orbitStretch(frame: string): number {
   return STRETCH[frame] ?? 1;
 }
+/**
+ * 🔭 …and turns them apart: each planet's whole orbit (the planet, the
+ * pockets on it, the stations round it) is turned by a fixed angle about
+ * the sun, so two planets that happen to share an angle on the clock are
+ * not drawn in a heap on one side. The planets still move on the clock;
+ * only where "angle zero" points differs per orbit. Radians.
+ */
+const TURN: Record<string, number> = { 'planet-aris': 2.3, 'planet-sovereign': 0 };
+export function orbitTurn(frame: string): number {
+  return TURN[frame] ?? 0;
+}
+function turned(x: number, z: number, a: number): { x: number; z: number } {
+  if (a === 0) return { x, z };
+  const c = Math.cos(a), s = Math.sin(a);
+  return { x: x * c - z * s, z: x * s + z * c };
+}
 function stretched(mk: HoloMarker, bodies: readonly MapBody[], nowMs: number, simTick: number): HoloMarker {
-  const k = orbitStretch(mk.frame);
-  if (k === 1) return mk;
+  const k = orbitStretch(mk.frame), a = orbitTurn(mk.frame);
+  if (k === 1 && a === 0) return mk;
   if (mk.type === 'planet' || mk.type === 'lagrange') {
-    const out: HoloMarker = { ...mk, x: mk.x * k, z: mk.z * k };
-    if (mk.orbit) out.orbit = { cx: mk.orbit.cx * k, cz: mk.orbit.cz * k, r: mk.orbit.r * k };
+    const p = turned(mk.x * k, mk.z * k, a);
+    const out: HoloMarker = { ...mk, x: p.x, z: p.z };
+    if (mk.orbit) { const c = turned(mk.orbit.cx * k, mk.orbit.cz * k, a); out.orbit = { cx: c.x, cz: c.z, r: mk.orbit.r * k }; }
     return out;
   }
-  // A station: carried with its planet, which moved by (k − 1) × its place.
+  // A station: carried with its planet, which moved by (k − 1) × its
+  // place, then the whole turned with the orbit.
   const planet = bodies.find((b) => b.id === mk.frame);
   if (!planet) return mk;
   const c = plotOffset(bodies, planet, nowMs, simTick);
   const dx = c.dx * PLOT_SCALE * (k - 1), dz = c.dy * PLOT_SCALE * (k - 1);
-  const out: HoloMarker = { ...mk, x: mk.x + dx, z: mk.z + dz };
-  if (mk.orbit) out.orbit = { cx: mk.orbit.cx + dx, cz: mk.orbit.cz + dz, r: mk.orbit.r };
+  const p = turned(mk.x + dx, mk.z + dz, a);
+  const out: HoloMarker = { ...mk, x: p.x, z: p.z };
+  if (mk.orbit) { const oc = turned(mk.orbit.cx + dx, mk.orbit.cz + dz, a); out.orbit = { cx: oc.x, cz: oc.z, r: mk.orbit.r }; }
   return out;
 }
 

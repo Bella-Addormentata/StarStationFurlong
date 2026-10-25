@@ -18,6 +18,7 @@ import {
   inclinationOf,
   inclinedPoint,
   orbitStretch,
+  orbitTurn,
   plotCourses,
   plotMarkers,
   stationLayout,
@@ -31,19 +32,21 @@ describe('the plot on the disc', () => {
     const markers = plotMarkers(bodies, T, DEFAULT_STATION_RECORD.id);
     expect(markers.map((m) => m.id)).toEqual(bodies.map((b) => b.id));
     const at = (id: string) => { const b = bodies.find((x) => x.id === id)!; const o = plotOffset(bodies, b, T); return { x: o.dx * PLOT_SCALE, z: o.dy * PLOT_SCALE }; };
+    const turn = (x: number, z: number, a: number) => ({ x: x * Math.cos(a) - z * Math.sin(a), z: x * Math.sin(a) + z * Math.cos(a) });
     for (const m of markers) {
       expect(Math.hypot(m.x, m.z)).toBeLessThanOrEqual(HOLO_RADIUS);
       const flat = at(m.id);
       if (m.type === 'planet' || m.type === 'lagrange') {
-        // Its orbit, orbitStretch wider.
-        const k = orbitStretch(m.frame);
-        expect(m.x).toBeCloseTo(flat.x * k, 9);
-        expect(m.z).toBeCloseTo(flat.z * k, 9);
+        // Its orbit, orbitStretch wider, turned by orbitTurn about the sun.
+        const k = orbitStretch(m.frame), e = turn(flat.x * k, flat.z * k, orbitTurn(m.frame));
+        expect(m.x).toBeCloseTo(e.x, 9);
+        expect(m.z).toBeCloseTo(e.z, 9);
       } else if (m.type === 'station') {
-        // Carried with its planet: the same offset from it as on the panel.
+        // Carried with its planet: the same offset from it as on the panel, turned with the orbit.
         const planet = markers.find((p) => p.id === m.frame)!, pf = at(m.frame);
-        expect(m.x - planet.x).toBeCloseTo(flat.x - pf.x, 9);
-        expect(m.z - planet.z).toBeCloseTo(flat.z - pf.z, 9);
+        const e = turn(flat.x - pf.x, flat.z - pf.z, orbitTurn(m.frame));
+        expect(m.x - planet.x).toBeCloseTo(e.x, 9);
+        expect(m.z - planet.z).toBeCloseTo(e.z, 9);
       } else {
         expect(m.x).toBeCloseTo(flat.x, 9);
         expect(m.z).toBeCloseTo(flat.z, 9);
@@ -51,6 +54,8 @@ describe('the plot on the disc', () => {
     }
     expect(orbitStretch('planet-aris')).toBeGreaterThan(1);
     expect(orbitStretch('belt-ring')).toBe(1);
+    expect(orbitTurn('planet-aris')).not.toBe(orbitTurn('planet-sovereign'));
+    expect(orbitTurn('belt-ring')).toBe(0);
   });
 
   it('marks only the station you are in as here', () => {

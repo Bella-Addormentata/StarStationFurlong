@@ -88,15 +88,16 @@ const SUN_RIM = srgb(0xff8a2a);
  *  of its orbit and of the station rings round it (bodyColor). */
 interface PlanetLook { a: THREE.Color; b: THREE.Color; air: THREE.Color; ring: THREE.Color; hex: number }
 const PLANET_LOOKS: Record<string, PlanetLook> = {
-  'planet-aris': { a: srgb(0xff8a3c), b: srgb(0x4a1206), air: srgb(0xffb070), ring: srgb(0xff9a4a), hex: 0xffa060 }, // lava
-  'planet-sovereign': { a: srgb(0x4fd0ff), b: srgb(0x1e9a5a), air: srgb(0x8ae0ff), ring: srgb(0x5fd6ff), hex: 0x6fdcff }, // sea + land
+  'planet-aris': { a: srgb(0xffb048), b: srgb(0x8a2208), air: srgb(0xffc080), ring: srgb(0xffa040), hex: 0xffb050 }, // lava
+  'planet-sovereign': { a: srgb(0x4ff0a0), b: srgb(0x1a6ac8), air: srgb(0xb0ffe0), ring: srgb(0x50e8a8), hex: 0x6ff0b0 }, // land + sea
 };
-const PLANET_DEFAULT: PlanetLook = { a: srgb(0xc8b4ff), b: srgb(0x4a3a8a), air: srgb(0xd8ccff), ring: srgb(0xb8a4ff), hex: 0xc8b4ff };
+const PLANET_DEFAULT: PlanetLook = { a: srgb(0xd8a8ff), b: srgb(0x5a3aa0), air: srgb(0xe8d0ff), ring: srgb(0xc0a0ff), hex: 0xd0a8ff };
 const lookOf = (id: string): PlanetLook => PLANET_LOOKS[id] ?? PLANET_DEFAULT;
 const ATMOSPHERE = srgb(0x9fe9ff);
 const DUST = srgb(0x66e6ff);
 const BELT = srgb(0xc9d6e2);
-const STATION = srgb(0xfff2c8);
+const STATION = srgb(0xfff0c0);
+const STATION_GLOW = srgb(0xffd27a);
 const HERE = srgb(0x3dff9a);
 const LAGRANGE = srgb(0xc29bff);
 
@@ -106,7 +107,7 @@ export function bodyColor(mk: Pick<HoloMarker, 'id' | 'type' | 'frame' | 'here'>
   switch (mk.type) {
     case 'star': return 0xffd27a;
     case 'planet': return lookOf(mk.id).hex;
-    case 'station': return 0xfff2c8;
+    case 'station': return 0xffd27a;
     case 'lagrange': return 0xc29bff;
     default: return 0xc9d6e2;
   }
@@ -181,7 +182,7 @@ function pillar(splats: PackedSplats, n: number, depth: number, radius: number, 
   }
 }
 
-const NIGHT = new THREE.Color(0x05080f);
+const NIGHT = new THREE.Color(0x0a1020);
 /** `n` splats on a sphere's surface (Fibonacci), colour by latitude bands,
  *  lit from local +x (`lit` > 0: the sun side bright, the far side dark —
  *  what makes a ball read as a ball). */
@@ -299,9 +300,9 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     // The body and its air face the sun (place() turns `spin` toward it),
     // lit from that side; the rings and the foot stay put.
     const spin = new THREE.Group();
-    const body = new SplatMesh({ constructSplats: (s) => shell(s, N(1100), 0.033, Z(0.0034), 1, a, b, rng(id.length * 31), 0.85) });
+    const body = new SplatMesh({ constructSplats: (s) => shell(s, N(1300), 0.038, Z(0.0036), 1, a, b, rng(id.length * 31), 0.7) });
     // The atmosphere: a thin halo just off the surface, not a fill.
-    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(300), 0.042, Z(0.008), 0.05, air, air, rng(id.length * 17), 0.5) });
+    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(320), 0.048, Z(0.008), 0.06, air, air, rng(id.length * 17), 0.4) });
     const foot = new SplatMesh({ constructSplats: (s) => pillar(s, N(90), 0.017 + SPLAT_LIFT / SPLAT_SCALE, 0.006, Z(0.004), 0.14, DUST, rng(id.length * 5)) });
     spin.add(body); spin.add(atmo); g.add(spin); g.add(foot);
     rig = { group: g, spin, rings: null, ringKey: '', orbit: null, orbitR: 0 };
@@ -314,7 +315,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     let m = sparks.get(id);
     if (m) return m;
     m = kind === 'station'
-      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(120), 0.011, Z(0.0038), 1, STATION, STATION, rand, 0.5); ball(s, N(60), 0.022, Z(0.006), 0.16, STATION, ATMOSPHERE, rand, 1.5); })
+      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(120), 0.011, Z(0.0038), 1, STATION, STATION, rand, 0.5); ball(s, N(60), 0.022, Z(0.006), 0.16, STATION_GLOW, STATION_GLOW, rand, 1.5); })
       : make(`lagrange-${id}`, (s) => ball(s, N(90), 0.016, Z(0.006), 0.4, LAGRANGE, DUST, rng(id.length * 29), 1.2));
     sparks.set(id, m);
     return m;
