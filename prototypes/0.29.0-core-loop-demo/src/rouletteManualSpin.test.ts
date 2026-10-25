@@ -1,7 +1,11 @@
 /**
- * ⏱ The house's manual SPIN (casinoTableSession spinByHand) when the clock
- * goes back mid-poll: the poll's times go back with it, so the round settles
- * once the page is awake again, not when the clock comes round.
+ * The house's manual SPIN (casinoTableSession spinByHand):
+ *  ⏱ when the clock goes back mid-poll, the poll's times go back with it, so
+ *    the round settles once the page is awake again, not when the clock
+ *    comes round;
+ *  📒 on a doc holding part of an update (casinoWhole), where a bet list
+ *    rewritten in the part still to come reads as gone, it closes nothing
+ *    until the rest comes, so the round takes that list.
  *
  * The UI needs a DOM: this file stubs just enough of one (createElement,
  * listeners, querySelector) to mount the focused table and press its card's
@@ -77,20 +81,25 @@ vi.stubGlobal('window', {
   clearTimeout: (id: number) => globalThis.clearTimeout(id),
 });
 
-const { bindCasinoDoc, buyInChips, readTableState, writeCrapsFairnessPref, writeMyBets } = await import('./casinoDoc');
+const {
+  bindCasinoDoc, buyInChips, casinoWhole, readChips, readMyBets, readTableState, writeCrapsFairnessPref, writeMyBets,
+} = await import('./casinoDoc');
 const { noteTablesRunning, openBetting, setSoleCroupierPredicate, TABLE_LEASE_LAPSE_MS } = await import('./croupier');
 const { createCasinoTableUI } = await import('./casinoTableSession');
 
 const T0 = 2_000_000_000;
 const HOUR = 3_600_000;
 const BOB = 'player-Bob';
+const red = [{ type: 'red' as const, amount: 10 }];
 let n = 0;
 const freshTable = (): string => `roulette-clock-${++n}`;
+let doc: Y.Doc;
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
   vi.setSystemTime(T0);
-  bindCasinoDoc(new Y.Doc());
+  doc = new Y.Doc();
+  bindCasinoDoc(doc);
   setSoleCroupierPredicate(() => false); // a manual (venture) room: no robot
   buyInChips(BOB, 100);
 });
@@ -132,7 +141,7 @@ describe("the house's manual SPIN", () => {
       const t = freshTable();
       writeCrapsFairnessPref(t, 'rng');
       openBetting(t, 1);
-      writeMyBets(t, BOB, 1, [{ type: 'red', amount: 10 }]);
+      writeMyBets(t, BOB, 1, red);
       noteTablesRunning(Date.now());
       const house = houseAtTable(t);
       house.spin();
@@ -149,4 +158,40 @@ describe("the house's manual SPIN", () => {
       expect({ afterPoll, afterPress }).toEqual({ afterPoll: 'settled', afterPress: 'settled' });
     });
   }
+});
+
+describe("the house's manual SPIN on a doc holding part of an update", () => {
+  it('closes nothing until the rest comes, then plays the list rewritten in it', async () => {
+    const t = freshTable();
+    writeCrapsFairnessPref(t, 'rng');
+    openBetting(t, 1);
+    writeMyBets(t, BOB, 1, red);
+    noteTablesRunning(Date.now());
+    // Bob's other page rewrites his list just after a write this page has
+    // yet to get. The rewrite comes first: its list waits for that write,
+    // but the old list's delete applies at once, so his bet reads as gone.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    const key = `bets:${t}:${BOB}`;
+    const list = other.getMap('casino').get(key) as object;
+    other.getMap('elsewhere').set('note', 1);
+    other.getMap('casino').set(key, { ...list });
+    Y.applyUpdate(doc, updates[1]);
+    expect(casinoWhole(t)).toBe(false);
+    expect(readMyBets(t, BOB, 1)).toEqual([]);
+    const house = houseAtTable(t);
+    house.spin();
+    await run(3 * TABLE_LEASE_LAPSE_MS);
+    expect(readTableState(t)?.phase).toBe('betting');
+    Y.applyUpdate(doc, updates[0]);
+    expect(readMyBets(t, BOB, 1)).toEqual(red);
+    house.spin();
+    expect(readTableState(t)).toMatchObject({ phase: 'closing', bettors: [BOB] });
+    await run(3 * TABLE_LEASE_LAPSE_MS);
+    house.unmount();
+    expect(readTableState(t)?.phase).toBe('settled');
+    expect(readChips(BOB)).not.toBe(100); // played, not handed back
+  });
 });

@@ -32,7 +32,7 @@
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, clearMySeat, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
+  casinoDocEpoch, casinoWhole, clearMySeat, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
@@ -1564,8 +1564,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       spinByHand();
     } else if (act === 'next') {
       if (phase() !== 'settled') return;
-      // 💤 Just woken: the doc may not have heard the room yet.
-      if (!tablesAwake()) {
+      // 💤 Just woken: the doc may not have heard the room yet. 📒 Nor while
+      // it holds part of an update: the table may read as gone (casinoWhole).
+      if (!tablesAwake() || !casinoWhole(itemId)) {
         say(RECONNECTING_NOTICE);
         return;
       }
@@ -1584,7 +1585,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const spinByHand = (): void => {
     // 💤 Just woken: the doc may not have heard the room yet, and a SPIN
     // written on it could take over a round another page has since settled.
-    if (!tablesAwake()) {
+    // 📒 Nor while it holds part of an update (casinoWhole): a bet list
+    // rewritten in the part still to come reads as gone, and "no more bets"
+    // would freeze the round without it.
+    if (!tablesAwake() || !casinoWhole(itemId)) {
       say(RECONNECTING_NOTICE);
       return;
     }
