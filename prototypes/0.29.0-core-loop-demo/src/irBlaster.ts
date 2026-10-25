@@ -58,9 +58,10 @@ export function startAiming(): void {
     subtitle.textContent = AIMING_LINE;
   }
   window.addEventListener('keydown', onKey, true);
-  // Opened again by any path (Tab, the bezel, a TV clicked): done aiming.
+  // Opened again by any path (Tab, the bezel, a TV clicked, Enter's quick
+  // chat raising it a sliver): done aiming.
   watcher ??= new MutationObserver(() => {
-    if (aiming && phone.classList.contains('active')) stopAiming();
+    if (aiming && (phone.classList.contains('active') || phone.classList.contains('peek'))) stopAiming();
   });
   watcher.observe(phone, { attributes: true, attributeFilter: ['class'] });
 }

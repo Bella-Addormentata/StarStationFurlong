@@ -8089,6 +8089,11 @@ function setupSpacePhoneOverlay() {
           openTheatre: (tvId) => { openTvTheatreIfPresent(tvId); },
           aim: () => {
             phoneOpener = null; // the room is where aiming leaves focus
+            // A device still focused would take the click meant for a TV
+            // (onCanvasClick releases it first). Let go now, with no ease:
+            // nothing waits on the release.
+            deviceFocus.forceRelease();
+            closeMiniChat();
             startAiming();
           },
           resolveArchive: resolveArchiveFile,
@@ -10966,16 +10971,25 @@ function findArcadeControl(scene: THREE.Scene): { deviceId: string; control: "se
 }
 
 /** The TV whose set is the nearest device under the ray, if that device is
- *  a TV: a TV behind another device is not aimed at. */
+ *  a TV: a TV behind another device, a door or a keypad is not aimed at
+ *  (the click is theirs, as the passes after this one route it). */
 function pickTvSet(scene: THREE.Scene, ray: THREE.Raycaster): string | null {
   const deviceMeshes: THREE.Object3D[] = [];
+  const doorBodies: THREE.Object3D[] = [];
+  const keypads: THREE.Object3D[] = [];
   scene.traverse((child) => {
-    if (child.userData && (child.userData.isDevice || child.userData.skipDeviceHit)) deviceMeshes.push(child);
+    if (!child.userData) return;
+    if (child.userData.isDevice || child.userData.skipDeviceHit) deviceMeshes.push(child);
+    if (child.userData.isDoorBody) doorBodies.push(child);
+    if (child.userData.isControlPanel) keypads.push(child);
   });
   const hit = ray.intersectObjects(deviceMeshes, false)[0];
   const deviceId = hit?.object.userData.deviceId as string | undefined;
   if (!deviceId || hit.object.userData.skipDeviceHit) return null;
-  return isTvKind(FURNITURE.find((i) => i.id === deviceId)?.kind) ? deviceId : null;
+  if (!isTvKind(FURNITURE.find((i) => i.id === deviceId)?.kind)) return null;
+  const nearer = (h: THREE.Intersection | undefined) => h !== undefined && h.distance < hit.distance;
+  if (nearer(ray.intersectObjects(doorBodies, false)[0]) || nearer(ray.intersectObjects(keypads, true)[0])) return null;
+  return deviceId;
 }
 
 function onCanvasClick(event: MouseEvent): void {

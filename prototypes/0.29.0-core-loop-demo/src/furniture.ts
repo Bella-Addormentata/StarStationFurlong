@@ -11231,7 +11231,9 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
     viewState = view.state;
-    pictureFrame.visible = pictureOn();
+    // A picture gives way to what this page asks (below): mostly TAP TO
+    // PLAY, whose picture is stalled until the press.
+    pictureFrame.visible = pictureOn() && !view.ask;
     if (pictureFrame.visible) {
       // The picture is up: the card behind it is the black around it.
       fill("#000000");
@@ -11313,7 +11315,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       glowLevel = 1.1;
     }
     // This page's own word (tvTheatreHint): what it waits on, across the
-    // middle of the card, one part a line. Under a picture it is not seen.
+    // middle of the card, one part a line. The picture is down while it is up.
     if (view.ask && !pictureFrame.visible && view.state !== "off") {
       const lines = view.ask.split(" · ").slice(0, 3).map((l) => (l.length > 34 ? `${l.slice(0, 33)}…` : l));
       const top = 112 - lines.length * 11;

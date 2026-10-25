@@ -177,6 +177,12 @@ describe('the smart TV as built', () => {
     expect(picture.scale.x).toBeLessThan(handle.planeW);
     handle.draw(view('paused', 'METROPOLIS'));
     expect(picture.visible).toBe(true);
+    // The browser wants a tap: the stalled picture gives way to the card,
+    // which says so, and is back once the tap is in.
+    handle.draw({ ...view('playing', 'METROPOLIS'), ask: 'TAP TO PLAY · SEE YOUR SPACEPHONE (T)' });
+    expect(picture.visible).toBe(false);
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(picture.visible).toBe(true);
     handle.draw(view('home'));
     expect(picture.visible).toBe(false);
     handle.draw(view('playing', 'METROPOLIS'));
