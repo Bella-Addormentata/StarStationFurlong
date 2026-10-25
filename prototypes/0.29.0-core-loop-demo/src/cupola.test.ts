@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import {
   cupolaEndWalls,
   cupolaWallSelections,
+  floorGridLines,
   cupolaWallsLabel,
   cupolaPlan,
   cupolaPlans,
@@ -322,5 +323,30 @@ describe('🔭 a peer\'s malformed cupola record (issue 219, review)', () => {
     testDoc.getMap('floorPlan').set('cupola', { wall: 'y+' }); // a peer's write that raced the resize
     expect(readCupolaWalls()).toEqual(['y+']);
     expect(endCupolaWalls()).toEqual([]);
+  });
+});
+
+describe('🔭 the floor grid (issue 219 follow-up)', () => {
+  it('runs edge to edge in a plain room, one line a metre', () => {
+    const lines = floorGridLines(6, 9, []);
+    expect(lines).toHaveLength(13 + 19);
+    expect(lines.filter((l) => l.axis)).toHaveLength(2);
+    for (const l of lines) {
+      expect(Math.max(Math.abs(l.x0), Math.abs(l.x1))).toBeLessThanOrEqual(6);
+      expect(Math.max(Math.abs(l.z0), Math.abs(l.z1))).toBeLessThanOrEqual(9);
+    }
+  });
+
+  it('stops every line at the corners a cupola end cuts off', () => {
+    const plans = cupolaPlans(SQUARE, ['y+']); // depth 2 at z = +6
+    const lines = floorGridLines(6, 6, plans);
+    const at = (x: number) => lines.find((l) => l.x0 === x && l.x1 === x)!;
+    expect(at(0).z1).toBeCloseTo(6);   // the middle reaches the tip window
+    expect(at(5).z1).toBeCloseTo(5);   // cut at 45° near the corner
+    expect(at(6).z1).toBeCloseTo(4);   // the side wall's line stops where the taper starts
+    expect(at(6).z0).toBeCloseTo(-6);  // the plain end keeps its corner
+    const end = lines.find((l) => l.z0 === 6 && l.z1 === 6)!;
+    expect(end.x0).toBeCloseTo(-4);
+    expect(end.x1).toBeCloseTo(4);
   });
 });

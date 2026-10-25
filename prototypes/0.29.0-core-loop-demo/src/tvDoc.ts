@@ -92,8 +92,18 @@ export type TvSource =
   /** 📦 A file one member's node holds (the blob lane, blobLane.ts): its
    *  BLAKE3 hash, its size in bytes (a declaration — the viewer's node takes
    *  no byte past it), the holding node's iroh id, and the type the file
-   *  said it was. Each viewer's node fetches it on that viewer's FETCH. */
-  | { kind: 'blob'; hash: string; size: number; provider: string; mime?: string; title?: string };
+   *  said it was. Each viewer's node fetches it on that viewer's FETCH.
+   *  `was`: 🗜 this file is the smaller copy its sharer's machine made of
+   *  that one before the room saw it (tvShrink.ts) — the same programme
+   *  (sourceId), and the same library entry. */
+  | { kind: 'blob'; hash: string; size: number; provider: string; mime?: string; title?: string; was?: TvBlobRef };
+
+/** A file by its BLAKE3 hash and size, as a blob source names one. */
+export interface TvBlobRef {
+  hash: string;
+  size: number;
+}
+export type TvBlobSource = Extract<TvSource, { kind: 'blob' }>;
 
 /** The largest file the blob lane carries in a record (1 TiB): a bound on
  *  the declaration, not a quota — each viewer's node sets its own. */
@@ -696,11 +706,21 @@ export function sanitizeSource(raw: unknown): TvSource | null {
     // The type is only ever a hint to the node, which re-checks it; one
     // that is not plainly video/* or audio/* is left out.
     const mime = str(r.mime, 64);
-    const blob: TvSource = { kind: 'blob', hash, size: size as number, provider };
+    const blob: TvBlobSource = { kind: 'blob', hash, size: size as number, provider };
     if (/^(video|audio)\/[a-z0-9.+-]+$/.test(mime)) blob.mime = mime;
+    const was = sanitizeBlobRef(r.was);
+    if (was && was.hash !== hash) blob.was = was;
     return withTitle(blob);
   }
   return null;
+}
+
+function sanitizeBlobRef(raw: unknown): TvBlobRef | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const hash = str(r.hash, 64);
+  if (!/^[0-9a-f]{64}$/.test(hash) || !Number.isSafeInteger(r.size) || (r.size as number) <= 0 || (r.size as number) > TV_MAX_BLOB) return null;
+  return { hash, size: r.size as number };
 }
 
 /** http(s) only, and never a URL carrying credentials: a source goes into
@@ -1476,7 +1496,8 @@ export function isStartOnly(s: TvSource): boolean {
 export function sourceId(s: TvSource): string {
   if (s.kind === 'youtube') return `youtube:${s.videoId}`;
   if (s.kind === 'archive') return `archive:${s.identifier}/${s.file}`;
-  if (s.kind === 'blob') return `blob:${s.hash}`;
+  // A smaller copy is the same programme as its original (`was`).
+  if (s.kind === 'blob') return `blob:${s.was?.hash ?? s.hash}`;
   return `url:${s.url}`;
 }
 

@@ -207,7 +207,8 @@ export function importBlob(
 export async function fetchBlob(hash: string, size: number, provider: string, mime = ''): Promise<string | null> {
   // The provider first, then the room's nodes WHERE said hold it (the host's
   // copy, once the provider has left): the node dials only those it is
-  // connected to in this room, and checks every byte against the hash.
+  // connected to in this room or met in it lately (online elsewhere now),
+  // and checks every byte against the hash.
   const from = [...new Set([provider, ...(nodeHolders(hash) ?? [])])].filter((id) => HEX_64.test(id)).slice(0, 4);
   const url = HEX_64.test(hash) && HEX_64.test(provider) ? route('/api/blob/fetch', { room, hash, size: String(size), from: from.join(','), mime }) : null;
   if (!url) return 'The FILE lane needs this station\'s node (the desktop app) running.';
@@ -335,9 +336,11 @@ export async function setHostCopies(on: boolean): Promise<string | null> {
   }
 }
 
-// ── WHERE: which of the room's connected nodes hold a file ──────────────────
+// ── WHERE: which of the room's nodes hold a file ────────────────────────────
 
-/** WHERE's answers: file → the connected room members holding it whole. */
+/** WHERE's answers: file → the room's nodes holding it whole: its connected
+ *  members, and the few nodes met in it lately that answered from wherever
+ *  they are online now. */
 const holdersHere = new Map<string, { room: string; at: number; ids: string[] }>();
 let whereAsking = false;
 /** An answer is asked again after this long (the node keeps its own for a minute). */
@@ -345,8 +348,8 @@ const WHERE_POLL_MS = 30_000;
 /** The most files one ask names (the node takes 16). */
 const WHERE_MAX = 16;
 
-/** Ask the node which connected room members hold these files, for those
- *  not asked lately. Resolves once the answer is in, or at once. */
+/** Ask the node which of the room's nodes hold these files, for those not
+ *  asked lately. Resolves once the answer is in, or at once. */
 export async function refreshHolders(hashes: string[], now = performance.now()): Promise<void> {
   const due = [...new Set(hashes)].filter((h) => {
     const known = holdersHere.get(h);
@@ -376,11 +379,20 @@ export async function refreshHolders(hashes: string[], now = performance.now()):
   }
 }
 
-/** The connected room members WHERE last said hold `hash` whole; null
- *  before it was asked. */
+/** The room's nodes WHERE last said hold `hash` whole; null before it was
+ *  asked. */
 export function nodeHolders(hash: string): string[] | null {
   const known = holdersHere.get(hash);
   return known && known.room === room ? known.ids : null;
+}
+
+/** The same, only while the answer is fresh (asked within WHERE_POLL_MS),
+ *  else null: for an ask that names them once and for good (the theatre's
+ *  AUTO-FETCH), where an answer from long ago — nobody held it then, or
+ *  members since gone — would leave out the host that holds it now. */
+export function freshNodeHolders(hash: string, now = performance.now()): string[] | null {
+  const known = holdersHere.get(hash);
+  return known && known.room === room && now - known.at < WHERE_POLL_MS ? known.ids : null;
 }
 
 /** 🗑 Let a whole file go from this page's node (the room's library entry
@@ -405,8 +417,10 @@ export async function forgetBlob(hash: string): Promise<string | null> {
   }
 }
 
-/** Whether a FETCH from this page's node could reach `provider` now: true,
- *  false, or null when the node has not said (no node, or not asked yet). */
+/** Whether `provider` is connected to this page's node in the room now:
+ *  true, false, or null when the node has not said (no node, or not asked
+ *  yet). One that is not may still be reached where it is online now, when
+ *  the two met in the room lately (WHERE finds it). */
 export function nodeReaches(provider: string): boolean | null {
   if (!heldHere || heldHere.gen !== generation || heldHere.room !== room) return null;
   return heldHere.reachable.has(provider);
@@ -472,6 +486,19 @@ export function blobState(hash: string, now = performance.now()): BlobState {
     }
   }
   return known;
+}
+
+/** What this page's node says about `hash`, asked now rather than read
+ *  from the polled answers blobState keeps. */
+export async function blobStateNow(hash: string): Promise<BlobState> {
+  const url = HEX_64.test(hash) ? route('/api/blob/status', { hash }) : null;
+  if (!url) return { state: 'unknown' };
+  try {
+    const res = await fetch(url, { redirect: 'error' });
+    return parseState(res.ok ? await res.json() : null);
+  } catch {
+    return { state: 'unknown' };
+  }
 }
 
 /** What identifies the node a blob is read from now — its origin and its

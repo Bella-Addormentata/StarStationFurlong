@@ -15,18 +15,29 @@
 //!   `autoFetchBudget` either: every transfer is one the viewer pressed FETCH
 //!   for, run to the size the record declared and the button showed, under a
 //!   disk quota the viewer's node sets.
-//! - **WHO IS DIALLED**: only a provider this node already holds an
-//!   authenticated room connection with (`remote_peers`), by its id alone —
-//!   no address from the record, no hint, no discovery for an id nobody is
-//!   connected to. A provider outside that set is not reachable from here,
-//!   and the status says so — but a FETCH names every connected member
-//!   WHERE said holds the file (below), so a copy on the room's host serves
-//!   a visitor after the one who shared it has left.
+//! - **WHO IS DIALLED**: only a provider this node holds an authenticated
+//!   connection with in the room (`remote_peers`), or met there lately
+//!   (below), by its id alone — no address from the record, no hint, and no
+//!   lookup for an id this node never met in the room. A provider outside
+//!   that set is not reachable from here, and the status says so — but a
+//!   FETCH names every member WHERE said holds the file (below), so a copy
+//!   on the room's host serves a visitor after the one who shared it has
+//!   left.
 //! - **WHO IS SERVED**: a peer is answered only for a blob it shares a room
 //!   with — the room the blob was imported or fetched for — and only while it
-//!   is a connected member of that room. Get-many and push are disabled; an
-//!   observe (which would tell a stranger what this node holds) is held to
-//!   the same rule as a get.
+//!   is a connected member of that room, or was one lately. Get-many and
+//!   push are disabled; an observe (which would tell a stranger what this
+//!   node holds) is held to the same rule as a get.
+//! - **MET HERE LATELY** (a film in an empty room): every few seconds the
+//!   node notes which nodes are connected members of each room a page on
+//!   this machine joined, and keeps each for `MET_TTL` after it was last
+//!   seen (in `library.json`, at most `MET_PER_ROOM` a room and `MET_ROOMS`
+//!   rooms). Two nodes that met in a room still count as its members to
+//!   each other for that room's files once either has gone to another room
+//!   or module: a FETCH or WHERE dials the other by its id (found the way a
+//!   room dial finds one, the DHT or the local network) wherever it is
+//!   online now, and it serves what it would serve in the room. A member
+//!   who left keeps what a member could take; nobody else gains anything.
 //! - **PLAYBACK** (`GET /blob/<hash>`): the node serves a COMPLETE blob to
 //!   its own webview with byte ranges, behind the per-launch capability token
 //!   and an allowed `Origin`. Nothing is served while a fetch is still
@@ -55,9 +66,10 @@
 //!   24 files), one copy per room at a time, and never shares a file with a
 //!   room it was not copied for. The room's page can switch it off.
 //! - **WHERE** (`GET /api/blob/where`, plan §4's `have`, asked rather than
-//!   announced): which connected members of the room hold a file whole —
-//!   asked of each over its own authenticated connection, with an observe
-//!   its serving rule answers only for a member of a room the file is shared
+//!   announced): which connected members of the room hold a file whole, and
+//!   which of the few nodes met in it most lately (`WHERE_MAX_MET`) — asked
+//!   of each over its own authenticated connection, with an observe its
+//!   serving rule answers only for a member of a room the file is shared
 //!   to, so a holder's word counts for itself alone, and the bytes are still
 //!   checked against the hash.
 
@@ -127,6 +139,19 @@ const WHERE_MAX_HASHES: usize = 16;
 const WHERE_MAX_PEERS: usize = 8;
 const WHERE_FRESH: Duration = Duration::from_secs(60);
 const WHERE_TIMEOUT: Duration = Duration::from_secs(4);
+/// 🤝 How long a node seen as a connected member of a room still counts as
+/// one for that room's files, wherever it is online now; the most nodes
+/// remembered a room, and rooms (the ones seen longest ago go first).
+const MET_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+const MET_PER_ROOM: usize = 32;
+const MET_ROOMS: usize = 128;
+/// A node new to the roster goes to `library.json` with the first look
+/// once the list was last written this long ago (a later sight of one it
+/// knows waits for `USED_PERSIST`).
+const MET_PERSIST: Duration = Duration::from_secs(60);
+/// WHERE asks at most this many nodes met in the room lately and not
+/// connected now, besides the connected ones.
+const WHERE_MAX_MET: usize = 4;
 /// Transfers this node runs at once; a FETCH past it waits for a slot.
 const MAX_FETCHES: usize = 2;
 /// A dial to a connected provider that has not completed in this long fails.
@@ -215,12 +240,14 @@ impl Drop for Reading {
 static RESTORE_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// What `library.json` holds: the kept files, the rooms this node hosts
-/// (copies on or off), and per hosted room the day's copies (unix ms, charge).
+/// (copies on or off), per hosted room the day's copies (unix ms, charge),
+/// and the nodes met per room (node id → unix ms last seen).
 #[derive(Default)]
 struct Saved {
     files: Vec<KeptFile>,
     host: HashMap<String, bool>,
     spent: HashMap<String, Vec<(u64, u64)>>,
+    met: HashMap<String, HashMap<String, u64>>,
 }
 
 /// One kept file in `library.json`.
@@ -246,6 +273,105 @@ struct Hosting {
     running: HashMap<String, Hash>,
 }
 
+/// 🤝 The nodes met as connected members of each room lately.
+#[derive(Default)]
+struct Met {
+    /// Room → node → unix ms it was last seen a connected member there.
+    rooms: HashMap<String, HashMap<PublicKey, u64>>,
+    /// A node is here that `library.json` does not name yet.
+    unsaved: bool,
+    /// A later sight of a node it names is not written yet. Both stay set
+    /// until a write of `library.json` succeeds.
+    moved: bool,
+}
+
+impl Met {
+    fn fresh(at: u64, now: u64) -> bool {
+        now.saturating_sub(at) < MET_TTL.as_millis() as u64
+    }
+
+    /// Whether `peer` was a connected member of `room` within `MET_TTL`.
+    fn knows(&self, room: &str, peer: &PublicKey, now: u64) -> bool {
+        self.rooms.get(room).and_then(|n| n.get(peer)).is_some_and(|at| Self::fresh(*at, now))
+    }
+
+    /// The nodes met in `room` within `MET_TTL` that `skip` leaves, the
+    /// most lately seen first.
+    fn lately(&self, room: &str, skip: &dyn Fn(&PublicKey) -> bool, now: u64) -> Vec<PublicKey> {
+        let Some(nodes) = self.rooms.get(room) else { return Vec::new() };
+        let mut list: Vec<(u64, PublicKey)> = nodes.iter().filter(|(k, at)| Self::fresh(**at, now) && !skip(k)).map(|(k, at)| (*at, *k)).collect();
+        list.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        list.into_iter().map(|(_, k)| k).collect()
+    }
+
+    /// Note who is a connected member of each room in `seen` at `now`, and
+    /// let go of who was last seen `MET_TTL` ago, then of the nodes and
+    /// rooms seen longest ago past the caps. Whether a sight moved.
+    fn note(&mut self, seen: Vec<(String, Vec<PublicKey>)>, now: u64) -> bool {
+        self.rooms.retain(|_, nodes| {
+            nodes.retain(|_, at| Self::fresh(*at, now));
+            !nodes.is_empty()
+        });
+        let mut moved = false;
+        for (room, nodes) in seen {
+            if nodes.is_empty() || !valid_room(&room) {
+                continue;
+            }
+            let known = self.rooms.entry(room).or_default();
+            for n in nodes {
+                match known.insert(n, now) {
+                    None => self.unsaved = true,
+                    Some(at) => moved |= at != now,
+                }
+            }
+        }
+        self.moved |= moved;
+        self.cap();
+        moved
+    }
+
+    fn cap(&mut self) {
+        for nodes in self.rooms.values_mut() {
+            if nodes.len() > MET_PER_ROOM {
+                let mut by_age: Vec<(u64, PublicKey)> = nodes.iter().map(|(k, at)| (*at, *k)).collect();
+                by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                for (_, k) in by_age.into_iter().skip(MET_PER_ROOM) {
+                    nodes.remove(&k);
+                }
+            }
+        }
+        if self.rooms.len() > MET_ROOMS {
+            let mut by_age: Vec<(u64, String)> = self.rooms.iter().map(|(r, n)| (n.values().copied().max().unwrap_or(0), r.clone())).collect();
+            by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            for (_, r) in by_age.into_iter().skip(MET_ROOMS) {
+                self.rooms.remove(&r);
+            }
+        }
+    }
+
+    /// The roster `library.json` named: valid rooms and ids, within
+    /// `MET_TTL` (a sight dated after `now`, a clock set back, counts as
+    /// now), under the caps.
+    fn restored(saved: HashMap<String, HashMap<String, u64>>, now: u64) -> Self {
+        let rooms = saved
+            .into_iter()
+            .filter(|(r, _)| valid_room(r))
+            .map(|(r, nodes)| {
+                let nodes: HashMap<PublicKey, u64> = nodes
+                    .into_iter()
+                    .filter_map(|(k, at)| Some((PublicKey::from_str(&k).ok()?, at.min(now))))
+                    .filter(|(_, at)| Self::fresh(*at, now))
+                    .collect();
+                (r, nodes)
+            })
+            .filter(|(_, nodes)| !nodes.is_empty())
+            .collect();
+        let mut met = Self { rooms, unsaved: false, moved: false };
+        met.cap();
+        met
+    }
+}
+
 /// A file the room's TV library names, as the host reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LibBlob {
@@ -258,9 +384,11 @@ pub(crate) struct LibBlob {
 }
 
 /// The files a room's TV library names: its `tv` map's `lib:blob:<hash>`
-/// entries, as tvDoc.ts writes them. Peer-written, so each is only a
-/// candidate: a copy still dials its provider by id, only while connected,
-/// under the cap and budget, and checks every byte against the hash.
+/// entries, as tvDoc.ts writes them — the file the key names, or the
+/// smaller copy its sharer's machine made of it (a source whose `was` is
+/// that file: tvShrink.ts). Peer-written, so each is only a candidate: a copy
+/// still dials its provider by id, only while connected, under the cap and
+/// budget, and checks every byte against the hash.
 pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
     use yrs::{Any, Map, Out, ReadTxn, Transact};
     let txn = doc.transact();
@@ -270,11 +398,13 @@ pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
         Some(Any::BigInt(n)) if *n >= 0 => Some(*n as u64),
         _ => None,
     };
+    let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let blob_size = |v: Option<&Any>| num(v).filter(|s| *s > 0 && *s <= 1 << 40);
     let mut out = Vec::new();
     // Every key looked at counts, kept or not: the map is anyone's to pad.
     for (key, value) in tv.iter(&txn).take(HOST_SCAN_KEYS) {
         let Some(id) = key.strip_prefix("lib:blob:") else { continue };
-        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !hex64(id) {
             continue;
         }
         let Out::Any(Any::Map(entry)) = value else { continue };
@@ -283,11 +413,25 @@ pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
             Some(Any::String(s)) => Some(s.to_string()),
             _ => None,
         };
-        if text("kind").as_deref() != Some("blob") || text("hash").as_deref() != Some(id) {
+        // The original a copy was made from, read as tvDoc.ts reads it
+        // (sanitizeBlobRef): a whole reference, or none at all.
+        let was = match source.get("was") {
+            Some(Any::Map(was)) => match (was.get("hash"), blob_size(was.get("size"))) {
+                (Some(Any::String(h)), Some(_)) if hex64(h) => Some(h.to_string()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(named) = text("hash").filter(|h| hex64(h)) else { continue };
+        // The entry's identity as the room's library reads it (tvDoc.ts
+        // sourceId): the original a copy `was`, else the file itself. Only
+        // an entry filed under it is one the library shows.
+        let identity = was.as_deref().filter(|w| *w != named).unwrap_or(&named);
+        if text("kind").as_deref() != Some("blob") || identity != id {
             continue;
         }
-        let Ok(hash) = Hash::from_str(id) else { continue };
-        let Some(size) = num(source.get("size")).filter(|s| *s > 0 && *s <= 1 << 40) else { continue };
+        let Ok(hash) = Hash::from_str(&named) else { continue };
+        let Some(size) = blob_size(source.get("size")) else { continue };
         let Some(provider) = text("provider").and_then(|p| PublicKey::from_str(&p).ok()) else { continue };
         out.push(LibBlob { hash, size, provider, mime: text("mime").unwrap_or_default(), played: num(entry.get("playedAt")).unwrap_or(0) });
         if out.len() >= HOST_SCAN_ENTRIES {
@@ -323,6 +467,8 @@ pub struct BlobLane {
     seen: Mutex<HashMap<(String, Hash), (u64, Vec<PublicKey>)>>,
     /// One WHERE ask out at a time; another answers from `seen`.
     asking: tokio::sync::Mutex<()>,
+    /// 🤝 Who this node met in each room lately (`MET_TTL`).
+    met: Mutex<Met>,
 }
 
 impl BlobLane {
@@ -398,6 +544,7 @@ impl BlobLane {
             host_day: env_mb("SSF_HOST_COPY_DAY_MB", HOST_COPY_DAY_MB),
             seen: Mutex::default(),
             asking: tokio::sync::Mutex::new(()),
+            met: Mutex::default(),
         });
         if keep {
             lane.restore(saved).await;
@@ -414,14 +561,16 @@ impl BlobLane {
             files: field("files").and_then(|f| serde_json::from_value(f).ok()).unwrap_or_default(),
             host: field("host").and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default(),
             spent: field("hostSpent").and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default(),
+            met: field("met").and_then(|m| serde_json::from_value(m).ok()).unwrap_or_default(),
         }
     }
 
     /// Bring back what `library.json` names and the store holds whole, the
-    /// most recently used first, as far as the quota goes; and the rooms
-    /// this node hosts, with the day's copy charges.
+    /// most recently used first, as far as the quota goes; the rooms this
+    /// node hosts, with the day's copy charges; and who it met where.
     async fn restore(&self, saved: Saved) {
-        let Saved { files: listed, host, spent } = saved;
+        let Saved { files: listed, host, spent, met } = saved;
+        *self.met.lock().unwrap() = Met::restored(met, now_ms());
         {
             let mut h = self.hosting.lock().unwrap();
             h.rooms = host.into_iter().filter(|(r, _)| valid_room(r)).take(MAX_HOST_ROOMS).collect();
@@ -485,10 +634,22 @@ impl BlobLane {
                 .collect();
             (h.rooms.clone(), spent)
         };
-        let body = serde_json::json!({ "v": 1, "files": files, "host": host, "hostSpent": spent }).to_string();
+        // The roster's flags go with the snapshot, and come back when the
+        // write fails: the next scan tries again.
+        let (met, unsaved, moved) = {
+            let mut m = self.met.lock().unwrap();
+            let flags = (std::mem::take(&mut m.unsaved), std::mem::take(&mut m.moved));
+            let rooms: HashMap<String, HashMap<String, u64>> =
+                m.rooms.iter().map(|(r, nodes)| (r.clone(), nodes.iter().map(|(k, at)| (k.to_string(), *at)).collect())).collect();
+            (rooms, flags.0, flags.1)
+        };
+        let body = serde_json::json!({ "v": 1, "files": files, "host": host, "hostSpent": spent, "met": met }).to_string();
         let tmp = self.dir.join(format!("{LIBRARY_FILE}.tmp"));
         if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.dir.join(LIBRARY_FILE))) {
             eprintln!("⚠️ blob-cache/{LIBRARY_FILE} could not be written: {e}");
+            let mut m = self.met.lock().unwrap();
+            m.unsaved |= unsaved;
+            m.moved |= moved;
         }
     }
 
@@ -700,12 +861,56 @@ impl BlobLane {
         }
     }
 
-    /// WHERE: which of `peers` (connected members of `room`) hold each of
-    /// `hashes` whole. Each is asked over its own connection, with an
-    /// observe its serving rule answers only for a member of a room the file
-    /// is shared to; answers are kept `WHERE_FRESH`, and while another ask
-    /// is out, this one answers from them.
-    pub(crate) async fn holders(&self, endpoint: &iroh::Endpoint, room: &str, peers: Vec<PublicKey>, hashes: Vec<Hash>) -> HashMap<Hash, Vec<PublicKey>> {
+    // ── 🤝 Met here lately ──────────────────────────────────────────────────
+
+    /// One look at who is a connected member of each room a page on this
+    /// machine joined (the hub's `served` rooms).
+    fn met_round(&self, hub: &SharedHub) {
+        let seen: Vec<(String, Vec<PublicKey>)> = hub
+            .rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.served)
+            .map(|(id, r)| (id.clone(), r.remote_peers.keys().copied().collect()))
+            .collect();
+        self.note_met(seen, now_ms());
+    }
+
+    /// Note who was seen where at `now`. `library.json` is written again
+    /// for a node new to the roster once its last write is `MET_PERSIST`
+    /// old, and for a later sight once it is `USED_PERSIST` old — whether
+    /// or not that node is still here.
+    fn note_met(&self, seen: Vec<(String, Vec<PublicKey>)>, now: u64) {
+        let (moved, unsaved) = {
+            let mut met = self.met.lock().unwrap();
+            met.note(seen, now);
+            (met.moved, met.unsaved)
+        };
+        let since = now.saturating_sub(self.saved.load(Ordering::Relaxed));
+        if (unsaved && since >= MET_PERSIST.as_millis() as u64) || (moved && since >= USED_PERSIST.as_millis() as u64) {
+            self.persist();
+        }
+    }
+
+    /// Whether `peer` was a connected member of `room` within `MET_TTL`.
+    fn met_in(&self, room: &str, peer: &PublicKey, now: u64) -> bool {
+        self.met.lock().unwrap().knows(room, peer, now)
+    }
+
+    /// The nodes met in `room` within `MET_TTL` and not `connected` now,
+    /// the most lately seen first.
+    fn met_elsewhere(&self, room: &str, connected: &dyn Fn(&PublicKey) -> bool, now: u64) -> Vec<PublicKey> {
+        self.met.lock().unwrap().lately(room, connected, now)
+    }
+
+    /// WHERE: which of `peers` (connected members of `room`) and `met`
+    /// (nodes met in it lately, not connected now) hold each of `hashes`
+    /// whole. Each is asked over its own connection, with an observe its
+    /// serving rule answers only for a member of a room the file is shared
+    /// to; answers are kept `WHERE_FRESH`, and while another ask is out,
+    /// this one answers from them.
+    pub(crate) async fn holders(&self, endpoint: &iroh::Endpoint, room: &str, peers: Vec<PublicKey>, met: Vec<PublicKey>, hashes: Vec<Hash>) -> HashMap<Hash, Vec<PublicKey>> {
         let now = now_ms();
         let fresh = |seen: &HashMap<(String, Hash), (u64, Vec<PublicKey>)>, h: &Hash| {
             seen.get(&(room.to_string(), *h)).filter(|(at, _)| now.saturating_sub(*at) < WHERE_FRESH.as_millis() as u64).map(|(_, ids)| ids.clone())
@@ -723,7 +928,7 @@ impl BlobLane {
                 }
             }
         }
-        if peers.is_empty() {
+        if peers.is_empty() && met.is_empty() {
             // Nobody to ask: nobody here holds it. (Not kept: a member may connect.)
             for h in ask.drain(..) {
                 out.insert(h, Vec::new());
@@ -736,7 +941,7 @@ impl BlobLane {
             // One deadline per member for the dial and all its answers: a
             // member that never answers costs `WHERE_TIMEOUT`, once, and
             // what it did answer still counts.
-            let asks = peers.iter().map(|peer| {
+            let asks = peers.iter().chain(met.iter()).map(|peer| {
                 let (store, endpoint, ask, peer) = (self.store.clone(), endpoint.clone(), ask.clone(), *peer);
                 async move {
                     let (mut has, mut answered) = (Vec::new(), Vec::new());
@@ -765,8 +970,10 @@ impl BlobLane {
             seen.retain(|_, (at, _)| done.saturating_sub(*at) < WHERE_FRESH.as_millis() as u64);
             for h in ask {
                 let ids: Vec<PublicKey> = answers.iter().filter(|(_, has, _)| has.contains(&h)).map(|(p, _, _)| *p).collect();
-                // Kept, and "nobody" said, only when every member answered.
-                if answers.iter().all(|(_, _, answered)| answered.contains(&h)) {
+                // Kept, and "nobody" said, only when every connected member
+                // answered: a node met here lately that does not is most
+                // likely offline, and is asked again once this is old.
+                if answers.iter().filter(|(p, _, _)| peers.contains(p)).all(|(_, _, answered)| answered.contains(&h)) {
                     seen.insert((room.to_string(), h), (done, ids.clone()));
                 } else if ids.is_empty() {
                     continue;
@@ -774,16 +981,17 @@ impl BlobLane {
                 out.insert(h, ids);
             }
         }
-        // Only members connected now (an answer may be older than a leave).
+        // Only the nodes asked now (an answer may be older than a leave).
         for ids in out.values_mut() {
-            ids.retain(|p| peers.contains(p));
+            ids.retain(|p| peers.contains(p) || met.contains(p));
         }
         out
     }
 
     /// May `remote` be served `hash`: the blob is whole here, and `remote` is
-    /// a connected member of a room it was imported or fetched for. A get
-    /// served counts as a use (`touch`); an observe (WHERE) does not.
+    /// a connected member of a room it was imported or fetched for, or was
+    /// one within `MET_TTL`. A get served counts as a use (`touch`); an
+    /// observe (WHERE) does not.
     fn may_serve(&self, members: &Members, remote: &PublicKey, hash: &Hash, touch: bool) -> bool {
         let rooms: Vec<String> = {
             let held = self.held.lock().unwrap();
@@ -792,7 +1000,8 @@ impl BlobLane {
                 _ => return false,
             }
         };
-        let ok = rooms.iter().any(|r| members(r, remote));
+        let now = now_ms();
+        let ok = rooms.iter().any(|r| members(r, remote) || self.met_in(r, remote, now));
         if ok && touch {
             self.touch(hash);
         }
@@ -868,11 +1077,12 @@ impl BlobLane {
     }
 
     /// The JSON the held route answers: every whole blob this node serves to
-    /// `room`'s members, and the members a FETCH from here could dial now
+    /// `room`'s members, and the members connected to it there now
     /// (`reachable`, each at most `MAX_HELD_LISTED`), so the TV library can
     /// say which entries play from this node, and whose node an entry names
-    /// is still here, without asking one by one. `more`: the held list was
-    /// cut, so a hash missing from it is not known to be missing.
+    /// is still here, without asking one by one (one met in the room lately
+    /// and online elsewhere, WHERE finds). `more`: the held list was cut, so
+    /// a hash missing from it is not known to be missing.
     pub(crate) fn held_json(&self, room: &str, reachable: &[PublicKey]) -> String {
         let held = self.held.lock().unwrap();
         let mut whole: Vec<(&Hash, &Held)> = held.iter().filter(|(_, h)| h.phase == Phase::Complete && h.rooms.contains(room)).collect();
@@ -908,8 +1118,9 @@ impl BlobLane {
         eprintln!("📦 blob {}: {why}", hash.fmt_short());
     }
 
-    /// Run one FETCH the local page asked for: dial a connected provider by
-    /// id, take the blob under its declared size, check what arrived.
+    /// Run one FETCH the local page asked for: dial a provider by id (one
+    /// connected in the room, or met there lately), take the blob under its
+    /// declared size, check what arrived.
     async fn run_fetch(self: Arc<Self>, endpoint: iroh::Endpoint, hash: Hash, size: u64, providers: Vec<PublicKey>) {
         let Ok(_slot) = self.slots.acquire().await else { return };
         {
@@ -1182,12 +1393,14 @@ pub(crate) fn valid_room(r: &str) -> bool {
     !r.is_empty() && r.len() <= MAX_ROOM_LEN && r.chars().all(|c| !c.is_control())
 }
 
-/// 🏠 The host's copier: every few seconds, the next copy for each room
-/// this node keeps copies for (`BlobLane::copy_round`).
+/// 🏠 The host's copier: every few seconds, who is connected in each room
+/// a page here joined (`BlobLane::met_round`), and the next copy for each
+/// room this node keeps copies for (`BlobLane::copy_round`).
 pub fn spawn_host_copier(lane: Arc<BlobLane>, hub: SharedHub, endpoint: iroh::Endpoint) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(HOST_SCAN).await;
+            lane.met_round(&hub);
             lane.copy_round(&hub, &endpoint);
         }
     });
@@ -1279,15 +1492,17 @@ pub async fn handle_http(
                 .map(|f| f.split(',').filter_map(|id| PublicKey::from_str(id.trim()).ok()).collect())
                 .unwrap_or_default();
             // Only a provider this node holds an authenticated connection
-            // with in THIS room, dialled by id: never an address the record
-            // or anyone else supplied.
-            let providers: Vec<PublicKey> = {
-                let rooms = hub.rooms.lock().unwrap();
-                match rooms.get(&room) {
-                    Some(r) => wanted.into_iter().filter(|p| r.remote_peers.contains_key(p)).take(4).collect(),
-                    None => Vec::new(),
+            // with in THIS room, or met in it lately (`MET_TTL`), dialled by
+            // id: never an address the record or anyone else supplied. The
+            // connected ones first: they answer at once.
+            let connected: HashSet<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().collect()).unwrap_or_default();
+            let now = now_ms();
+            let mut providers: Vec<PublicKey> = Vec::new();
+            for p in wanted.iter().filter(|p| connected.contains(*p)).chain(wanted.iter().filter(|p| !connected.contains(*p) && lane.met_in(&room, p, now))) {
+                if providers.len() < 4 && !providers.contains(p) {
+                    providers.push(*p);
                 }
-            };
+            }
             enum Verdict { Already, NotConnected, NoRoom, Start }
             let mut evicted = false;
             let verdict = {
@@ -1331,7 +1546,7 @@ pub async fn handle_http(
             match verdict {
                 Verdict::Already => reply(socket, "200 OK", cors, &serde_json::json!({ "ok": true }).to_string()).await,
                 Verdict::NotConnected => {
-                    reply(socket, "409 Conflict", cors, &err_json("the node holding this file is not connected to yours")).await
+                    reply(socket, "409 Conflict", cors, &err_json("the node holding this file is not connected to yours, and has not been in this room with it lately")).await
                 }
                 Verdict::NoRoom => reply(socket, "413 Payload Too Large", cors, &err_json("not enough room in this node's blob quota")).await,
                 Verdict::Start => {
@@ -1380,9 +1595,12 @@ pub async fn handle_http(
                 return reply(socket, "400 Bad Request", cors, &err_json("no hashes")).await;
             }
             // Asked only of the members this node holds an authenticated
-            // connection with in THIS room, by id.
-            let peers: Vec<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().take(WHERE_MAX_PEERS).collect()).unwrap_or_default();
-            let found = lane.holders(&endpoint, &room, peers, hashes).await;
+            // connection with in THIS room, and a few it met in it lately,
+            // by id.
+            let connected: Vec<PublicKey> = hub.rooms.lock().unwrap().get(&room).map(|r| r.remote_peers.keys().copied().collect()).unwrap_or_default();
+            let met: Vec<PublicKey> = lane.met_elsewhere(&room, &|p| connected.contains(p), now_ms()).into_iter().take(WHERE_MAX_MET).collect();
+            let peers: Vec<PublicKey> = connected.into_iter().take(WHERE_MAX_PEERS).collect();
+            let found = lane.holders(&endpoint, &room, peers, met, hashes).await;
             let holders: serde_json::Map<String, serde_json::Value> = found
                 .into_iter()
                 .map(|(h, ids)| (h.to_hex().to_string(), serde_json::Value::from(ids.iter().map(|p| p.to_string()).collect::<Vec<_>>())))
@@ -1764,6 +1982,15 @@ mod tests {
         let me = iroh::SecretKey::generate().public().to_string();
         let a = Hash::new(b"a").to_hex().to_string();
         let b = Hash::new(b"b").to_hex().to_string();
+        let f = Hash::new(b"f").to_hex().to_string();
+        let small = Hash::new(b"f small").to_hex().to_string();
+        let i = Hash::new(b"i").to_hex().to_string();
+        let by_size = |got: &[LibBlob], h: &str| got.iter().find(|g| g.hash.to_hex().to_string() == h).map(|g| g.size);
+        let shrunk = |hash: &str, size: f64, provider: &str, was: &str| {
+            let mut source = blob_source(hash, size, provider);
+            source.push(("was", yrs::Any::from(HashMap::from([("hash".to_string(), yrs::Any::from(was)), ("size".to_string(), yrs::Any::Number(5000.0))]))));
+            source
+        };
         let doc = library_doc(&[
             (format!("lib:blob:{a}"), blob_source(&a, 5000.0, &me), 2000.0),
             // A key that names another file than its source.
@@ -1773,11 +2000,33 @@ mod tests {
             (format!("lib:blob:{}", Hash::new(b"d").to_hex()), blob_source(&Hash::new(b"d").to_hex(), 1.5, &me), 1.0),
             (format!("lib:blob:{}", Hash::new(b"e").to_hex()), blob_source(&Hash::new(b"e").to_hex(), 10.0, "nobody"), 1.0),
             ("lib:url:https://example.org/a.mp4".to_string(), vec![("kind", yrs::Any::from("url"))], 1.0),
+            // 🗜 The smaller copy of the file the key names…
+            (format!("lib:blob:{f}"), shrunk(&small, 900.0, &me, &f), 4000.0),
+            // …and one that names another file as what it was.
+            (format!("lib:blob:{}", Hash::new(b"g").to_hex()), shrunk(&small, 900.0, &me, &f), 1.0),
+            // A copy whose `was` is no whole reference (no size) is no copy
+            // to the library, which files it under its own hash: not under
+            // the original's key.
+            (format!("lib:blob:{}", Hash::new(b"h").to_hex()), {
+                let mut source = blob_source(&small, 900.0, &me);
+                source.push(("was", yrs::Any::from(HashMap::from([
+                    ("hash".to_string(), yrs::Any::from(Hash::new(b"h").to_hex().to_string())),
+                    ("size".to_string(), yrs::Any::Number(0.0)),
+                ]))));
+                source
+            }, 1.0),
+            // A `was` that names the file itself is no copy: the file, under
+            // its own key, as the library reads it.
+            (format!("lib:blob:{i}"), shrunk(&i, 700.0, &me, &i), 5000.0),
+            // A hash in capitals is not one the library reads.
+            (format!("lib:blob:{}", Hash::new(b"j").to_hex()), blob_source(&Hash::new(b"j").to_hex().to_string().to_uppercase(), 900.0, &me), 1.0),
         ]);
         let got = library_blobs(&doc);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].hash.to_hex().to_string(), a);
-        assert_eq!((got[0].size, got[0].played, got[0].mime.as_str()), (5000, 2000, "video/webm"));
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(by_size(&got, &i), Some(700));
+        let by = |h: &str| got.iter().find(|g| g.hash.to_hex().to_string() == h).unwrap();
+        assert_eq!((by(&a).size, by(&a).played, by(&a).mime.as_str()), (5000, 2000, "video/webm"));
+        assert_eq!((by(&small).size, by(&small).played), (900, 4000), "the copy is what a host keeps");
         assert_eq!(library_blobs(&yrs::Doc::new()), vec![]);
     }
 
@@ -1857,12 +2106,12 @@ mod tests {
         assert_eq!(host.next_copy("r", library_blobs(&doc), &connected, &h_id, now), None);
 
         // A later visitor asks the room's connected members who has it: the host.
-        let found = visitor.holders(&ep_v, "r", vec![h_id, s_id], vec![film_hash, big_hash]).await;
+        let found = visitor.holders(&ep_v, "r", vec![h_id, s_id], vec![], vec![film_hash, big_hash]).await;
         assert_eq!(found[&film_hash].len(), 2, "the host and the sharer both hold the film");
         assert!(found[&film_hash].contains(&h_id));
         assert_eq!(found[&big_hash], vec![s_id], "the host never copied the big one");
         // Once the sharer has left, the answer names only those still connected.
-        let found = visitor.holders(&ep_v, "r", vec![h_id], vec![film_hash]).await;
+        let found = visitor.holders(&ep_v, "r", vec![h_id], vec![], vec![film_hash]).await;
         assert_eq!(found[&film_hash], vec![h_id]);
         // …and the visitor fetches from the host.
         visitor.held.lock().unwrap().insert(film_hash, Held {
@@ -1872,7 +2121,7 @@ mod tests {
         assert_eq!(visitor.held.lock().unwrap()[&film_hash].phase, Phase::Complete);
         // A room the file was not copied for learns nothing from the host.
         let other = BlobLane::open_at(tmp.join("other"), 1 << 30).await.unwrap();
-        let found = other.holders(&ep_v, "elsewhere", vec![h_id], vec![Hash::new(b"never held")]).await;
+        let found = other.holders(&ep_v, "elsewhere", vec![h_id], vec![], vec![Hash::new(b"never held")]).await;
         assert_eq!(found[&Hash::new(b"never held")], vec![]);
 
         // Switched off by the room's page: no more copies, and it lasts a restart.
@@ -1886,6 +2135,152 @@ mod tests {
         assert!(host.status_json(&film_hash).contains("complete"), "the copy is kept across the restart");
         host.store.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🤝 Two nodes that met in a room, one of them in another room or
+    /// module now: the one still there finds the other by WHERE and fetches
+    /// from it by id; a node never met in the room, or met longer ago than
+    /// `MET_TTL`, is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_met_in_the_room_is_served_from_elsewhere() {
+        use iroh::address_lookup::memory::MemoryLookup;
+        let tmp = std::env::temp_dir().join(format!("ssf-blob-met-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sharer = BlobLane::open_at(tmp.join("sharer"), 1 << 30).await.unwrap();
+        let viewer = BlobLane::open_at(tmp.join("viewer"), 1 << 30).await.unwrap();
+        let stranger = BlobLane::open_at(tmp.join("stranger"), 1 << 30).await.unwrap();
+        let bind = || async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::endpoint::RelayMode::Disabled)
+                .alpns(vec![iroh_blobs::ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap()
+        };
+        let (ep_s, ep_v, ep_x) = (bind().await, bind().await, bind().await);
+        // Found by id, as the DHT or the local network would find it.
+        for ep in [&ep_v, &ep_x] {
+            let lookup = MemoryLookup::new();
+            lookup.add_endpoint_info(ep_s.addr());
+            ep.address_lookup().unwrap().add(lookup);
+        }
+        // The sharer is a connected member of no room the film is in: it went elsewhere.
+        let nobody: Members = Arc::new(|_, _| false);
+        {
+            let (lane, ep) = (sharer.clone(), ep_s.clone());
+            tokio::spawn(async move {
+                while let Some(inc) = ep.accept().await {
+                    let Ok(conn) = inc.await else { continue };
+                    tokio::spawn(lane.clone().serve_with(nobody.clone(), conn));
+                }
+            });
+        }
+        let film: Vec<u8> = (0..200_000u32).map(|i| (i * 19 % 251) as u8).collect();
+        let hash = import_bytes(&sharer, &film, "film").await;
+        let size = film.len() as u64;
+        let (s_id, v_id, x_id) = (ep_s.id(), ep_v.id(), ep_x.id());
+        // An hour ago the viewer was in room "r" with the sharer; the stranger only met it in another room.
+        sharer.note_met(vec![("r".into(), vec![v_id]), ("elsewhere".into(), vec![x_id])], now_ms() - 3_600_000);
+
+        assert_eq!(viewer.holders(&ep_v, "r", vec![], vec![s_id], vec![hash]).await[&hash], vec![s_id]);
+        assert_eq!(stranger.holders(&ep_x, "r", vec![], vec![s_id], vec![hash]).await[&hash], vec![], "an observe from a node never met in the room is refused");
+        let queue = |lane: &Arc<BlobLane>| {
+            lane.held.lock().unwrap().insert(hash, Held {
+                rooms: HashSet::from(["r".to_string()]), size, have: 0, mime: String::new(), phase: Phase::Queued, charged: size, used: 0, readers: 0,
+            });
+        };
+        queue(&viewer);
+        viewer.clone().run_fetch(ep_v.clone(), hash, size, vec![s_id]).await;
+        assert_eq!(viewer.held.lock().unwrap()[&hash].phase, Phase::Complete);
+        let mut got = Vec::new();
+        viewer.store.blobs().reader(hash).read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, film);
+        queue(&stranger);
+        stranger.clone().run_fetch(ep_x.clone(), hash, size, vec![s_id]).await;
+        assert!(matches!(stranger.held.lock().unwrap()[&hash].phase, Phase::Failed(_)));
+
+        // Met longer ago than MET_TTL: a member no more.
+        let late = BlobLane::open_at(tmp.join("late"), 1 << 30).await.unwrap();
+        sharer.met.lock().unwrap().rooms.get_mut("r").unwrap().insert(v_id, now_ms() - MET_TTL.as_millis() as u64 - 1);
+        queue(&late);
+        late.clone().run_fetch(ep_v.clone(), hash, size, vec![s_id]).await;
+        assert!(matches!(late.held.lock().unwrap()[&hash].phase, Phase::Failed(_)));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_nodes_met_are_bounded_and_outlive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-met-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quiet = Duration::from_secs(3600);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, quiet).await.unwrap();
+        let key = || iroh::SecretKey::generate().public();
+        let (a, b, old) = (key(), key(), key());
+        let now = now_ms();
+        let ttl = MET_TTL.as_millis() as u64;
+        lane.note_met(vec![("r".into(), vec![old])], now - ttl + 60_000);
+        lane.note_met(vec![("r".into(), vec![a]), ("q".into(), vec![b])], now - 1_000);
+        lane.note_met(vec![("r".into(), vec![b])], now);
+        // The most lately seen first, the connected left out.
+        assert_eq!(lane.met_elsewhere("r", &|_| false, now), vec![b, a, old]);
+        assert_eq!(lane.met_elsewhere("r", &|p| *p == b, now), vec![a, old]);
+        assert!(lane.met_in("q", &b, now) && !lane.met_in("q", &a, now));
+        assert!(!lane.met_in("r", &old, now + 120_000), "gone once MET_TTL has passed");
+        // A node new to the roster goes to disk once the last write is MET_PERSIST old.
+        let listed = || std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap();
+        assert!(!listed().contains(&a.to_string()), "written just now at the start: not again yet");
+        lane.saved.store(now - MET_PERSIST.as_millis() as u64, Ordering::Relaxed);
+        lane.note_met(vec![("r".into(), vec![b])], now);
+        assert!(listed().contains(&a.to_string()) && listed().contains(&old.to_string()));
+        // A later sight of a node that then left is still written once the
+        // last write is USED_PERSIST old.
+        lane.note_met(vec![("r".into(), vec![a])], now - 500);
+        lane.note_met(vec![], now);
+        assert!(!listed().contains(&(now - 500).to_string()), "not yet");
+        lane.saved.store(now - USED_PERSIST.as_millis() as u64, Ordering::Relaxed);
+        lane.note_met(vec![], now);
+        assert!(listed().contains(&(now - 500).to_string()), "the sight of a, though a has gone");
+        // A write that fails keeps the roster's news for the next one.
+        let c = key();
+        std::fs::create_dir(dir.join(format!("{LIBRARY_FILE}.tmp"))).unwrap(); // the write cannot land
+        lane.saved.store(0, Ordering::Relaxed);
+        lane.note_met(vec![("r".into(), vec![c])], now - 200);
+        assert!(!listed().contains(&c.to_string()));
+        std::fs::remove_dir(dir.join(format!("{LIBRARY_FILE}.tmp"))).unwrap();
+        lane.saved.store(0, Ordering::Relaxed);
+        lane.note_met(vec![], now);
+        assert!(listed().contains(&c.to_string()), "written once the disk takes it");
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+
+        let lane = BlobLane::open_with(dir.clone(), 1 << 30, true, quiet).await.unwrap();
+        assert_eq!(lane.met_elsewhere("r", &|_| false, now_ms()), vec![b, c, a, old]);
+        // At most MET_PER_ROOM a room: the ones seen longest ago go.
+        let t0 = now_ms();
+        let many: Vec<PublicKey> = (0..MET_PER_ROOM + 5).map(|_| key()).collect();
+        for (i, k) in many.iter().enumerate() {
+            lane.note_met(vec![("r".into(), vec![*k])], t0 + i as u64);
+        }
+        assert_eq!(lane.met_elsewhere("r", &|_| false, t0 + 100), many.iter().rev().take(MET_PER_ROOM).copied().collect::<Vec<_>>());
+        // At most MET_ROOMS rooms: the ones whose last sight is oldest go.
+        for i in 0..MET_ROOMS {
+            lane.note_met(vec![(format!("room-{i}"), vec![a])], t0 + 1_000 + i as u64);
+        }
+        assert_eq!(lane.met.lock().unwrap().rooms.len(), MET_ROOMS);
+        assert!(!lane.met_in("r", &many[MET_PER_ROOM + 4], t0 + 5_000) && !lane.met_in("q", &b, t0 + 5_000));
+        assert!(lane.met_in("room-0", &a, t0 + 5_000));
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // What the list names is read with care: no id, no room, a sight
+        // dated after now (a clock set back) counts as now.
+        let saved = HashMap::from([
+            ("r".to_string(), HashMap::from([("not an id".to_string(), 5u64), (a.to_string(), u64::MAX)])),
+            ("bad\nroom".to_string(), HashMap::from([(b.to_string(), 900u64)])),
+        ]);
+        let met = Met::restored(saved, 1_000);
+        assert_eq!(met.rooms.len(), 1);
+        assert_eq!(met.rooms["r"], HashMap::from([(a, 1_000u64)]));
     }
 
     #[test]

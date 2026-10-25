@@ -26,8 +26,9 @@ import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
+import { readyForRoom } from './tvShrink';
 import {
-  blobLaneNodeId, blobLaneReady, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
+  blobLaneNodeId, blobLaneReady, blobLaneRoom, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
   refreshHeldBlobs, refreshHolders, setHostCopies, torrentLaneReady,
 } from './blobLane';
 import {
@@ -332,7 +333,7 @@ const TILES: Tile[] = [
   { key: 'youtube', icon: '▶️', label: 'YOUTUBE', lane: 'CONVENIENCE', hint: 'paste a watch / youtu.be / shorts link, or an 11-character id', live: true },
   { key: 'archive', icon: '🏛️', label: 'ARCHIVE.ORG', lane: 'CONVENIENCE', hint: 'paste a details/ or download/ link — public-domain films', live: true },
   { key: 'url', icon: '🔗', label: 'URL', lane: 'CONVENIENCE', hint: 'paste a direct link to an mp4 / webm', live: true },
-  { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'a video or audio file from this computer — your node hands it to the room, and each viewer presses FETCH (mp4 / webm play best)', live: true },
+  { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'a video or audio file from this computer — your node hands it to the room, and every viewer gets it by itself (AUTO-FETCH, up to 2 GB) or with FETCH (mp4 / webm play best)', live: true },
   { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'paste a magnet or choose a .torrent file — your node shows what is in it, downloads the video you pick from the public swarm, then hands it to the room like a FILE (viewers never join the swarm)', live: true },
   { key: 'karaoke', icon: '🎤', label: 'KARAOKE', lane: 'SOVEREIGN', hint: 'MP3+G, with the mic on the audio lane', live: false },
 ];
@@ -367,6 +368,20 @@ let feedbackNote = { text: '', at: 0 };
 function feedbackNow(): string {
   return feedbackNote.text && Date.now() - feedbackNote.at < FEEDBACK_MS ? feedbackNote.text : '';
 }
+
+/** What a PLAY or a schedule from the remote puts on: the source, the box
+ *  text it was read from, a torrent's origin for GET AGAIN, and the
+ *  original this node lets go once the room plays its copy (tvShrink.ts). */
+interface Shared {
+  source: TvSource;
+  text: string;
+  torrent?: TvTorrentOrigin;
+  drop?: string;
+}
+
+/** The chosen FILE being got ready for the room (tvShrink.ts): a PLAY
+ *  pressed again meanwhile waits for the same film. */
+let fileGettingReady: { got: Shared; room: string } | null = null;
 
 /** 🧲 The .torrent file the TORRENT tile has chosen, kept like pickedFile
  *  until a START takes it; and the file picked from the node's list. */
@@ -421,9 +436,11 @@ export function agoText(at: number, now: number): string {
 
 /** Where a library row's file would play from, for this holder now:
  *  'copy' — its sharer is gone, but a node here (the room's host, mostly)
- *  kept a copy. */
-type Whereabouts = 'mine' | 'lost' | 'theirs' | 'copy' | 'away' | 'unknown';
-function whereabouts(e: TvLibraryEntry): Whereabouts {
+ *  kept a copy; 'elsewhere' — no node here has it, but one met in this room
+ *  lately (its sharer, or one that kept a copy) said from wherever it is
+ *  online now that it does, and a FETCH reaches it there. */
+export type Whereabouts = 'mine' | 'lost' | 'theirs' | 'copy' | 'elsewhere' | 'away' | 'unknown';
+export function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (e.source.kind !== 'blob') return 'unknown';
   // Nothing is said before the node has answered (no node, or not yet).
   const reach = nodeReaches(e.source.provider);
@@ -432,17 +449,20 @@ function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (holds) return 'mine';
   const me = blobLaneNodeId();
   if (reach && e.source.provider !== me) return 'theirs';
-  if (copyHolder(e) !== null) return 'copy';
+  const copy = copyHolder(e);
+  if (copy !== null) return nodeReaches(copy) ? 'copy' : 'elsewhere';
   if (e.source.provider === me) return 'lost'; // names this node, which no longer holds it (let go, or made room)
   return 'away';
 }
 
-/** A connected node WHERE said holds the row's file whole, other than this
- *  one: the provider a PLAY from the library names when its sharer is gone. */
+/** A node WHERE said holds the row's file whole, other than this one, one
+ *  connected here first: the provider a PLAY from the library names when
+ *  its sharer is gone. */
 function copyHolder(e: TvLibraryEntry): string | null {
   if (e.source.kind !== 'blob') return null;
   const me = blobLaneNodeId();
-  return (nodeHolders(e.source.hash) ?? []).find((id) => id !== me) ?? null;
+  const ids = (nodeHolders(e.source.hash) ?? []).filter((id) => id !== me);
+  return ids.find((id) => nodeReaches(id) === true) ?? ids[0] ?? null;
 }
 
 /** The title a file's name gives the record: the name without its
@@ -858,14 +878,15 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     const whereText = where === 'mine' ? `<span style="color:${GREEN};">ON YOUR NODE</span>`
       : where === 'theirs' ? `<span style="color:${CYAN};">ITS NODE IS HERE</span>`
       : where === 'copy' ? `<span style="color:${CYAN};">A COPY IS ON A NODE HERE</span>`
+      : where === 'elsewhere' ? `<span style="color:${CYAN};">${e.source.kind === 'blob' && copyHolder(e) === e.source.provider ? 'ITS NODE IS ONLINE ELSEWHERE' : 'A COPY IS ONLINE ELSEWHERE'}</span>`
       : where === 'away' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'AWAY — GET IT AGAIN' : 'ITS NODE IS AWAY'}</span>`
       : where === 'lost' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'GONE FROM YOUR NODE — GET IT AGAIN' : 'GONE FROM YOUR NODE — CHOOSE IT AGAIN ON 📁 FILE'}</span>`
       : '';
-    const again = e.torrent && canAgain && where !== 'mine' && where !== 'copy'
+    const again = e.torrent && canAgain && where !== 'mine' && where !== 'copy' && where !== 'elsewhere'
       ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
       : '';
     const forget = where === 'mine'
-      ? smallButton(`data-tv-lib-forget="${id}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
+      ? smallButton(`data-tv-lib-forget="${id}" data-tv-id="${esc(tvId)}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
       : '';
     return `<div style="display:flex; flex-direction:column; gap:2px; padding:4px 0; border-top:1px solid rgba(212,168,75,0.1);">
       <div class="phone-access-room-row">
@@ -992,13 +1013,25 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   /** The box's link as a source, with the TEXT it was read from: an archive
    *  lookup can take seconds while the box stays editable, and the clear
    *  that follows a write must take only that text — not a newer link typed
-   *  meanwhile and never submitted. */
-  const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string; torrent?: TvTorrentOrigin } | null> => {
+   *  meanwhile and never submitted. A film from this page's node comes with
+   *  the original to `drop` once the room plays its copy. */
+  const sourceFromBox = async (id: string): Promise<Shared | null> => {
     // Every attempt supersedes the lookup before it, a refused or malformed
     // one included: a PLAY on a bad link must not let an older archive
     // lookup land its film after the refusal was shown.
     const gen = ++resolveGen;
-    if (activeTile === 'file') return sourceFromFile(id, gen);
+    if (activeTile === 'file') {
+      const waiting = !pickedFile && fileGettingReady?.room === blobLaneRoom() ? fileGettingReady : null;
+      const got = waiting?.got ?? (await sourceFromFile(id, gen));
+      if (!got) return null;
+      const mine = waiting ?? { got, room: blobLaneRoom() };
+      fileGettingReady = mine;
+      try {
+        return await readied(got, id, gen);
+      } finally {
+        if (fileGettingReady === mine && gen === resolveGen) fileGettingReady = null;
+      }
+    }
     if (activeTile === 'magnet') {
       // 🧲 PLAY takes the finished download, never the pasted magnet: the
       // room record only ever names the blob it became.
@@ -1016,7 +1049,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       }
       // The library keeps where it came from, for GET AGAIN; the programme
       // names only the blob.
-      return { source, text: '', torrent: torrentOrigin() ?? undefined };
+      return readied({ source, text: '', torrent: torrentOrigin() ?? undefined }, id, gen);
     }
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
@@ -1048,6 +1081,37 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback('No playable file found — using their embed (start-time sync only).');
     }
     return { source: parsed, text };
+  };
+
+  /** 🗜 A film from this page's node goes to the room as the copy this
+   *  machine makes of it first (tvShrink.ts), or as it is where there is
+   *  nothing to gain; the remote says only that it is getting it ready.
+   *  Voided like an archive lookup: by the next attempt from this remote,
+   *  anything that moves the programme meanwhile (STOP, POWER, a library
+   *  replay, from any panel), or the room's doc going (a room left, even
+   *  one rejoined). The copy is still made, and the next share of the film
+   *  plays it at once. */
+  const readied = async (got: Shared, id: string, gen: number): Promise<Shared | null> => {
+    if (got.source.kind !== 'blob') return got;
+    const name = got.source.title || 'the film';
+    const epoch = tvDocEpoch();
+    const revision = tvRevision(id);
+    const current = () => gen === resolveGen && epoch === tvDocEpoch() && tvRevision(id) === revision;
+    const say = (done: number) => {
+      if (current()) feedback(`Getting ${name} ready for the room… ${Math.floor(done * 100)}% · it plays once it is ready, while the station stays open`);
+    };
+    say(0);
+    const ready = await readyForRoom(got.source, say);
+    if (!current()) return null;
+    if (!ready) {
+      feedback(`${name} could not be got ready: this station's node changed or went away meanwhile. Press PLAY NOW again.`);
+      return null;
+    }
+    return { ...got, source: ready.source, drop: ready.drop ?? undefined };
+  };
+  /** The room plays the copy now: its original leaves this node. */
+  const dropOriginal = (got: Shared) => {
+    if (got.drop) void forgetBlob(got.drop).then(() => refreshHeldBlobs());
   };
 
   /** 📦 The chosen file, handed to this page's node first: the record can
@@ -1169,7 +1233,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const r = tvPlay(id, got.source, undefined, got.torrent);
       feedback(r.ok ? `Now on: ${sourceLabel(got.source)}` : r.error);
       if (!r.ok && taken) giveBack(got.text);
-      if (r.ok) deps.openTheatre(id);
+      if (r.ok) {
+        dropOriginal(got);
+        deps.openTheatre(id);
+      }
     });
   });
   host.querySelectorAll<HTMLButtonElement>('[data-tv-schedule]').forEach((b) => b.addEventListener('click', () => {
@@ -1181,6 +1248,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const r = tvSchedule(id, got.source, Date.now() + minutes * 60_000, undefined, got.torrent);
       feedback(r.ok ? `Scheduled: ${sourceLabel(got.source)} in ${minutes} min` : r.error);
       if (!r.ok && taken) giveBack(got.text);
+      if (r.ok) dropOriginal(got);
     });
   }));
   // 📚 The library: its filters, its search, and its rows.
@@ -1217,10 +1285,11 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     }
     // A file your node holds plays from your node: viewers fetch it from
     // you, whoever shared it first. One whose sharer is gone plays from the
-    // node here that kept a copy.
+    // node here that kept a copy, or from one met here lately that has it
+    // where it is online now.
     const where = whereabouts(entry);
     const me = blobLaneNodeId();
-    const copy = where === 'copy' ? copyHolder(entry) : null;
+    const copy = where === 'copy' || where === 'elsewhere' ? copyHolder(entry) : null;
     const source = entry.source.kind === 'blob' && where === 'mine' && me ? { ...entry.source, provider: me }
       : entry.source.kind === 'blob' && copy ? { ...entry.source, provider: copy }
       : entry.source;
@@ -1231,8 +1300,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     }
     feedback(where === 'copy'
       ? `Now on: ${entry.title}, from the copy a node here kept.`
+      : where === 'elsewhere'
+      ? `Now on: ${entry.title}, from a node that was in this room lately and has it where it is online now.`
       : where === 'away' || where === 'lost'
-      ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'The node that shared it is not connected to yours'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
+      ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'Your node cannot reach the node that shared it, here or elsewhere'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
       : `Now on: ${entry.title}`);
     deps.openTheatre(id);
   }));
@@ -1253,7 +1324,11 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       return;
     }
     forgetArmed = '';
-    const hash = key.startsWith('blob:') ? key.slice(5) : '';
+    // The file the entry plays now, not the one its key names: a smaller
+    // copy is filed under its original (sourceId), and it is the copy that
+    // is on this node.
+    const entry = libraryEntry(b.dataset.tvId!, key);
+    const hash = entry?.source.kind === 'blob' ? entry.source.hash : '';
     const why = await forgetBlob(hash);
     feedback(why ?? 'Your node let its copy go.');
     void refreshHeldBlobs();

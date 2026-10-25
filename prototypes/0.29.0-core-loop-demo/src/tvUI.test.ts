@@ -3,10 +3,11 @@
  * source this build would refuse to play is said no to with the reason, and
  * never written — from the paste box and from PREVIOUSLY ON alike.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { agoText, libraryKind, libraryView, playRefusal, tvNavIndex } from './tvUI';
-import type { TvLibraryEntry } from './tvDoc';
-import { forgetMediaConsent, setOwnMediaOrigins } from './tvConsent';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { agoText, libraryKind, libraryView, playRefusal, tvNavIndex, whereabouts } from './tvUI';
+import { tvNow, tvWallNow, type TvLibraryEntry } from './tvDoc';
+import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from './tvConsent';
+import { forgetBlobLane, refreshHeldBlobs, refreshHolders, setBlobLaneNode, setBlobLaneRoom } from './blobLane';
 import { setConvenienceLanesForTest } from './sovereignty';
 
 beforeEach(() => {
@@ -98,5 +99,42 @@ describe('📚 the library on the remote', () => {
     expect(agoText(now - 3 * 3_600_000, now)).toBe('3 h ago');
     expect(agoText(now - 2 * 86_400_000, now)).toBe('2 d ago');
     expect(agoText(now + 60_000, now)).toBe('just now'); // a peer's clock ahead
+  });
+});
+
+describe('📚 where a library file plays from', () => {
+  const ORIGIN = 'http://127.0.0.1:8080';
+  const [ME, SHARER, HOST, FAR, HASH] = ['a', 'e', 'd', 'f', 'b'].map((c) => c.repeat(64));
+  const entry: TvLibraryEntry = { source: { kind: 'blob', hash: HASH!, size: 9, provider: SHARER! }, title: 'Sintel', addedAt: 1, playedAt: 2, plays: 1 };
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    forgetBlobLane();
+  });
+
+  /** This page's node says who is connected in the room, and WHERE who holds the file. */
+  async function nodeSays(reachable: string[], holders: string[]): Promise<void> {
+    forgetBlobLane();
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(url.includes('/api/blob/where')
+      ? { holders: { [HASH!]: holders } }
+      : { held: [], reachable }), { status: 200 })));
+    setNodeMediaOrigin(ORIGIN, tvNow(), tvWallNow());
+    setBlobLaneRoom('room-1');
+    setBlobLaneNode({ origin: ORIGIN, cap: 'c'.repeat(64), irohId: ME!, torrent: false });
+    await refreshHeldBlobs(1_000);
+    await refreshHolders([HASH!], 1_000);
+  }
+
+  it('its sharer here, a copy here, or a node met in the room lately that has it where it is online now', async () => {
+    expect(whereabouts(entry)).toBe('unknown'); // the node has not said
+    await nodeSays([SHARER!], []);
+    expect(whereabouts(entry)).toBe('theirs');
+    await nodeSays([HOST!], [FAR!, HOST!]);
+    expect(whereabouts(entry)).toBe('copy'); // a node here before one elsewhere
+    await nodeSays([], [ME!, SHARER!]);
+    expect(whereabouts(entry)).toBe('elsewhere');
+    await nodeSays([], [FAR!]);
+    expect(whereabouts(entry)).toBe('elsewhere');
+    await nodeSays([], []);
+    expect(whereabouts(entry)).toBe('away');
   });
 });
