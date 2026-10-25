@@ -10,6 +10,10 @@ import { ORBIT_EPOCH_MS } from './orbits';
 import {
   FADE_SECONDS,
   HOLO_RADIUS,
+  HOLO_REACH,
+  STATION_SPREAD,
+  holoPoint,
+  ringInclination,
   PLOT_SCALE,
   PLOT_SECONDS,
   STATION_SECONDS,
@@ -34,17 +38,17 @@ describe('the plot on the disc', () => {
     const at = (id: string) => { const b = bodies.find((x) => x.id === id)!; const o = plotOffset(bodies, b, T); return { x: o.dx * PLOT_SCALE, z: o.dy * PLOT_SCALE }; };
     const turn = (x: number, z: number, a: number) => ({ x: x * Math.cos(a) - z * Math.sin(a), z: x * Math.sin(a) + z * Math.cos(a) });
     for (const m of markers) {
-      expect(Math.hypot(m.x, m.z)).toBeLessThanOrEqual(HOLO_RADIUS);
+      expect(Math.hypot(m.x, m.z)).toBeLessThanOrEqual(HOLO_RADIUS * HOLO_REACH);
       const flat = at(m.id);
-      if (m.type === 'planet' || m.type === 'lagrange') {
+      if (m.type === 'planet' || m.type === 'lagrange' || m.type === 'asteroid-field') {
         // Its orbit, orbitStretch wider, turned by orbitTurn about the sun.
         const k = orbitStretch(m.frame), e = turn(flat.x * k, flat.z * k, orbitTurn(m.frame));
         expect(m.x).toBeCloseTo(e.x, 9);
         expect(m.z).toBeCloseTo(e.z, 9);
       } else if (m.type === 'station') {
-        // Carried with its planet: the same offset from it as on the panel, turned with the orbit.
+        // Carried with its planet: its offset from it STATION_SPREAD wider, turned with the orbit.
         const planet = markers.find((p) => p.id === m.frame)!, pf = at(m.frame);
-        const e = turn(flat.x - pf.x, flat.z - pf.z, orbitTurn(m.frame));
+        const e = turn((flat.x - pf.x) * STATION_SPREAD, (flat.z - pf.z) * STATION_SPREAD, orbitTurn(m.frame));
         expect(m.x - planet.x).toBeCloseTo(e.x, 9);
         expect(m.z - planet.z).toBeCloseTo(e.z, 9);
       } else {
@@ -52,8 +56,8 @@ describe('the plot on the disc', () => {
         expect(m.z).toBeCloseTo(flat.z, 9);
       }
     }
-    expect(orbitStretch('planet-aris')).toBeGreaterThan(1);
-    expect(orbitStretch('belt-ring')).toBe(1);
+    expect(orbitStretch('planet-sovereign')).toBeGreaterThan(orbitStretch('planet-aris'));
+    expect(orbitStretch('nothing')).toBe(1);
     expect(orbitTurn('planet-aris')).not.toBe(orbitTurn('planet-sovereign'));
     expect(orbitTurn('belt-ring')).toBe(0);
   });
@@ -74,7 +78,7 @@ describe('the plot on the disc', () => {
     expect(sovereign.orbit).toEqual({ cx: 0, cz: 0, r: 180 * PLOT_SCALE * orbitStretch('planet-sovereign') });
     const [body] = stationBodies([DEFAULT_STATION_RECORD]);
     const station = markers.find((m) => m.id === body!.id)!;
-    expect(station.orbit!.r).toBeCloseTo(body!.orbitRadius * PLOT_SCALE, 9);
+    expect(station.orbit!.r).toBeCloseTo(body!.orbitRadius * PLOT_SCALE * STATION_SPREAD, 9);
     expect(station.orbit!.cx).toBeCloseTo(sovereign.x, 9);
     expect(station.orbit!.cz).toBeCloseTo(sovereign.z, 9);
     // The station sits on its ring.
@@ -134,12 +138,28 @@ describe('the plot on the disc', () => {
     expect(inclinationOf('nothing')).toEqual({ tilt: 0, node: 0 });
   });
 
-  it('has a belt just inside the rim', () => {
-    const r = beltRadius(solarPlotBodies([]));
+  it('has a belt at the rim, where its marker is', () => {
+    const bodies = solarPlotBodies([]);
+    const r = beltRadius(bodies);
     expect(r).not.toBeNull();
-    expect(r!).toBeLessThan(HOLO_RADIUS);
-    expect(r!).toBeGreaterThan(HOLO_RADIUS * 0.8);
+    expect(r!).toBeLessThanOrEqual(HOLO_RADIUS * HOLO_REACH);
+    expect(r!).toBeGreaterThan(HOLO_RADIUS * 0.9);
+    const belt = plotMarkers(bodies, T).find((m) => m.type === 'asteroid-field')!;
+    expect(Math.hypot(belt.x, belt.z)).toBeCloseTo(r!, 9);
     expect(beltRadius([])).toBeNull();
+  });
+
+  it('stands a station on its own tilted ring round its planet', () => {
+    const bodies = solarPlotBodies([DEFAULT_STATION_RECORD]);
+    const markers = plotMarkers(bodies, T);
+    const station = markers.find((m) => m.type === 'station')!;
+    const planet = markers.find((m) => m.id === station.frame)!;
+    const sp = holoPoint(station), pp = holoPoint(planet);
+    // As far from the planet as its ring's radius, in three dimensions.
+    expect(Math.hypot(sp.x - pp.x, sp.y - pp.y, sp.z - pp.z)).toBeCloseTo(station.orbit!.r, 9);
+    // Rings differ in tilt by radius; a planet's point is on its orbit plane.
+    expect(ringInclination(planet.id, 0.1).tilt).not.toBeCloseTo(ringInclination(planet.id, 0.14).tilt, 3);
+    expect(Math.abs(pp.y)).toBeGreaterThan(0);
   });
 });
 

@@ -16,7 +16,7 @@
 import * as THREE from 'three';
 import type { SplatMesh as SplatMeshT, SparkRenderer, PackedSplats } from '@sparkjsdev/spark';
 import type { HoloMarker } from './mapHologramLayout';
-import { HOLO_RADIUS, inclinationOf, inclinedPoint, type Inclination } from './mapHologramLayout';
+import { HOLO_RADIUS, holoPoint, inclinationOf, ringInclination, type Inclination } from './mapHologramLayout';
 
 type SparkModule = typeof import('@sparkjsdev/spark');
 
@@ -282,13 +282,13 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
   });
   // The belt: thousands of grains in an annulus, a little thickness to it.
   let belt: SplatMeshT | null = null;
-  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, N(4200), r, 0.06, 0.018, Z(0.0022), 0.55, BELT, rng(5)));
+  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, N(4600), r, 0.07, 0.04, Z(0.0022), 0.5, BELT, rng(5)));
   // The scan: a thin ring that climbs off the disc and fades, over and over.
   const sweep = make('sweep', (s) => ring(s, N(400), HOLO_RADIUS * 0.98, 0.004, 0.002, Z(0.003), 0.5, ATMOSPHERE, rng(31)));
 
   // One rig per planet: the body, its atmosphere, and the dust rings of the
   // stations round it (rebuilt when the set of ring radii changes).
-  interface PlanetRig { group: THREE.Group; spin: THREE.Group; rings: SplatMeshT | null; ringKey: string; orbit: SplatMeshT | null; orbitR: number }
+  interface PlanetRig { group: THREE.Group; spin: THREE.Group; rings: SplatMeshT[]; ringKey: string; orbit: SplatMeshT | null; orbitR: number }
   const planets = new Map<string, PlanetRig>();
   const planetRig = (id: string): PlanetRig => {
     let rig = planets.get(id);
@@ -300,12 +300,12 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     // The body and its air face the sun (place() turns `spin` toward it),
     // lit from that side; the rings and the foot stay put.
     const spin = new THREE.Group();
-    const body = new SplatMesh({ constructSplats: (s) => shell(s, N(1300), 0.038, Z(0.0036), 1, a, b, rng(id.length * 31), 0.7) });
-    // The atmosphere: a thin halo just off the surface, not a fill.
-    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(320), 0.048, Z(0.008), 0.06, air, air, rng(id.length * 17), 0.4) });
-    const foot = new SplatMesh({ constructSplats: (s) => pillar(s, N(90), 0.017 + SPLAT_LIFT / SPLAT_SCALE, 0.006, Z(0.004), 0.14, DUST, rng(id.length * 5)) });
+    const body = new SplatMesh({ constructSplats: (s) => shell(s, N(2000), 0.038, Z(0.0028), 1, a, b, rng(id.length * 31), 0.7) });
+    // The atmosphere: the faintest rim just off the surface, not a glow.
+    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(260), 0.045, Z(0.006), 0.03, air, air, rng(id.length * 17), 0.4) });
+    const foot = new SplatMesh({ constructSplats: (s) => pillar(s, N(90), 0.017 + SPLAT_LIFT / SPLAT_SCALE, 0.005, Z(0.0035), 0.08, DUST, rng(id.length * 5)) });
     spin.add(body); spin.add(atmo); g.add(spin); g.add(foot);
-    rig = { group: g, spin, rings: null, ringKey: '', orbit: null, orbitR: 0 };
+    rig = { group: g, spin, rings: [], ringKey: '', orbit: null, orbitR: 0 };
     planets.set(id, rig);
     return rig;
   };
@@ -315,8 +315,8 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     let m = sparks.get(id);
     if (m) return m;
     m = kind === 'station'
-      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(120), 0.011, Z(0.0038), 1, STATION, STATION, rand, 0.5); ball(s, N(60), 0.022, Z(0.006), 0.16, STATION_GLOW, STATION_GLOW, rand, 1.5); })
-      : make(`lagrange-${id}`, (s) => ball(s, N(90), 0.016, Z(0.006), 0.4, LAGRANGE, DUST, rng(id.length * 29), 1.2));
+      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(140), 0.008, Z(0.0028), 1, STATION, STATION, rand, 0.4); ball(s, N(50), 0.014, Z(0.004), 0.1, STATION_GLOW, STATION_GLOW, rand, 1.5); })
+      : make(`lagrange-${id}`, (s) => ball(s, N(110), 0.011, Z(0.004), 0.35, LAGRANGE, LAGRANGE, rng(id.length * 29), 1.0));
     sparks.set(id, m);
     return m;
   };
@@ -350,7 +350,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
       let hereAt: { x: number; y: number; z: number } | null = null;
       for (const mk of markers) {
         const inc = inclinationOf(mk.frame);
-        const p = inclinedPoint(mk.x, mk.z, inc);
+        const p = holoPoint(mk);
         if (mk.type === 'planet') {
           const rig = planetRig(mk.id);
           seenPlanets.add(mk.id);
@@ -385,13 +385,15 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
         const radii = (ringsByPlanet.get(id) ?? []).map((r) => r.toFixed(5)).sort();
         const ringKey = radii.join(',');
         if (ringKey !== rig.ringKey) {
-          rig.rings?.removeFromParent(); rig.rings?.dispose(); rig.rings = null;
-          if (radii.length) {
-            const rs = radii.map(Number);
-            rig.rings = new SplatMesh({ constructSplats: (s) => { const rand = rng(id.length * 3 + rs.length); for (const r of rs) ring(s, N(480), r, 0.002, 0.002, Z(0.0018), 0.5, lookOf(id).ring, rand); } });
-            rig.rings.position.y = -0.013;
-            tiltTo(rig.rings, inclinationOf(id));
-            rig.group.add(rig.rings);
+          for (const m of rig.rings) { m.removeFromParent(); m.dispose(); }
+          rig.rings = [];
+          // One ring each, on its own tilt (ringInclination), as the stations stand.
+          for (const r of radii.map(Number)) {
+            const m = new SplatMesh({ constructSplats: (s) => ring(s, N(480), r, 0.002, 0.002, Z(0.0018), 0.5, lookOf(id).ring, rng(id.length * 3 + Math.round(r * 1e4))) });
+            m.position.y = -0.013;
+            tiltTo(m, ringInclination(id, r));
+            rig.group.add(m);
+            rig.rings.push(m);
           }
           rig.ringKey = ringKey;
         }
@@ -421,7 +423,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     },
     dispose() {
       for (const m of all()) m.dispose();
-      for (const rig of planets.values()) { rig.rings?.dispose(); rig.orbit?.dispose(); }
+      for (const rig of planets.values()) { for (const m of rig.rings) m.dispose(); rig.orbit?.dispose(); }
       group.removeFromParent();
     },
   };

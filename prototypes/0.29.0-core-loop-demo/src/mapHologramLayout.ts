@@ -81,7 +81,10 @@ export function plotMarkers(
  * along (their rings stay circles round the planet). The belt and the sun
  * stay. Schematic, like the radii.
  */
-const STRETCH: Record<string, number> = { 'planet-aris': 1.32, 'planet-sovereign': 1.14 };
+const STRETCH: Record<string, number> = { 'planet-aris': 1.0, 'planet-sovereign': 1.22, 'belt-ring': 1.12 };
+/** The stations' rings round a planet, this much wider than the panel's,
+ *  so a planet's stations stand apart from it and each other. */
+export const STATION_SPREAD = 1.4;
 export function orbitStretch(frame: string): number {
   return STRETCH[frame] ?? 1;
 }
@@ -103,8 +106,8 @@ function turned(x: number, z: number, a: number): { x: number; z: number } {
 }
 function stretched(mk: HoloMarker, bodies: readonly MapBody[], nowMs: number, simTick: number): HoloMarker {
   const k = orbitStretch(mk.frame), a = orbitTurn(mk.frame);
-  if (k === 1 && a === 0) return mk;
-  if (mk.type === 'planet' || mk.type === 'lagrange') {
+  if (k === 1 && a === 0 && mk.type !== 'station') return mk;
+  if (mk.type === 'planet' || mk.type === 'lagrange' || mk.type === 'asteroid-field') {
     const p = turned(mk.x * k, mk.z * k, a);
     const out: HoloMarker = { ...mk, x: p.x, z: p.z };
     if (mk.orbit) { const c = turned(mk.orbit.cx * k, mk.orbit.cz * k, a); out.orbit = { cx: c.x, cz: c.z, r: mk.orbit.r * k }; }
@@ -115,11 +118,38 @@ function stretched(mk: HoloMarker, bodies: readonly MapBody[], nowMs: number, si
   const planet = bodies.find((b) => b.id === mk.frame);
   if (!planet) return mk;
   const c = plotOffset(bodies, planet, nowMs, simTick);
-  const dx = c.dx * PLOT_SCALE * (k - 1), dz = c.dy * PLOT_SCALE * (k - 1);
-  const p = turned(mk.x + dx, mk.z + dz, a);
+  const cx = c.dx * PLOT_SCALE, cz = c.dy * PLOT_SCALE;
+  // Its offset from the planet, STATION_SPREAD wider (in transit, none).
+  const sp = mk.orbit ? STATION_SPREAD : 1;
+  const ox = (mk.x - cx) * sp, oz = (mk.z - cz) * sp;
+  const p = turned(cx * k + ox, cz * k + oz, a);
   const out: HoloMarker = { ...mk, x: p.x, z: p.z };
-  if (mk.orbit) { const oc = turned(mk.orbit.cx + dx, mk.orbit.cz + dz, a); out.orbit = { cx: oc.x, cz: oc.z, r: mk.orbit.r }; }
+  if (mk.orbit) { const oc = turned(cx * k, cz * k, a); out.orbit = { cx: oc.x, cz: oc.z, r: mk.orbit.r * sp }; }
   return out;
+}
+
+/**
+ * 🔭 The tilt of a station's ring round its planet: each ring its own,
+ * by its radius, so a planet's stations stand above and below its plane
+ * like the shells of an atom rather than in one sheet. Radians.
+ */
+export function ringInclination(frame: string, r: number): Inclination {
+  const seed = r * 1000 + frame.length;
+  return { tilt: 0.3 * Math.sin(seed * 1.7), node: (seed * 0.61) % Math.PI };
+}
+
+/**
+ * Where a marker stands in the hologram's three dimensions: on its
+ * orbit's tilted plane (inclinationOf) — a station on its own tilted ring
+ * round its planet, which stands on the planet's plane.
+ */
+export function holoPoint(mk: HoloMarker): { x: number; y: number; z: number } {
+  if (mk.type === 'station' && mk.orbit) {
+    const c = inclinedPoint(mk.orbit.cx, mk.orbit.cz, inclinationOf(mk.frame));
+    const o = inclinedPoint(mk.x - mk.orbit.cx, mk.z - mk.orbit.cz, ringInclination(mk.frame, mk.orbit.r));
+    return { x: c.x + o.x, y: c.y + o.y, z: c.z + o.z };
+  }
+  return inclinedPoint(mk.x, mk.z, inclinationOf(mk.frame));
 }
 
 /** The orbit plane a body rides: its own for a planet or the belt, its
@@ -142,9 +172,9 @@ function frameOf(bodies: readonly MapBody[], body: MapBody, nowMs: number): stri
  */
 export interface Inclination { tilt: number; node: number }
 const INCLINATIONS: Record<string, Inclination> = {
-  'planet-aris': { tilt: 0.16, node: 0.7 },
-  'planet-sovereign': { tilt: -0.1, node: 2.3 },
-  'belt-ring': { tilt: 0.06, node: 1.1 },
+  'planet-aris': { tilt: 0.32, node: 0.7 },
+  'planet-sovereign': { tilt: -0.2, node: 2.3 },
+  'belt-ring': { tilt: 0.1, node: 1.1 },
 };
 export function inclinationOf(frame: string): Inclination {
   return INCLINATIONS[frame] ?? { tilt: 0, node: 0 };
@@ -188,8 +218,10 @@ function orbitRing(
 /** The belt's radius on the disc, when the plot has one. */
 export function beltRadius(bodies: readonly MapBody[]): number | null {
   const belt = bodies.find((b) => b.type === 'asteroid-field');
-  return belt ? belt.orbitRadius * PLOT_SCALE : null;
+  return belt ? belt.orbitRadius * PLOT_SCALE * orbitStretch(belt.id) : null;
 }
+/** How far past HOLO_RADIUS the picture may reach (the belt, stretched). */
+export const HOLO_REACH = 1.15;
 
 /** Each moving station's course on the disc (courseOnScreen at the disc's
  *  scale), burn to arrival; nothing once it has arrived. */

@@ -14,7 +14,7 @@
 
 import * as THREE from 'three';
 import type { MapBody } from './map';
-import { HOLO_RADIUS, inclinationOf, inclinedPoint, plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
+import { HOLO_RADIUS, HOLO_REACH, holoPoint, plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
 import { SPLAT_SCALE, bodyColor, buildSplatPlot, sparkHost, type SplatPlotHandle } from './mapHologramSplats';
 
 export interface PlotFrameState {
@@ -102,7 +102,7 @@ function softSpriteTexture(): THREE.Texture {
 const PANEL_SCALE = 1.2;
 /** The plot's outer radius in the panel: the belt, grown as the splat plot
  *  and the panel grow it (HOLO_RADIUS × SPLAT_SCALE × PANEL_SCALE). */
-export const PLOT_RADIUS = HOLO_RADIUS * SPLAT_SCALE * PANEL_SCALE;
+export const PLOT_RADIUS = HOLO_RADIUS * HOLO_REACH * SPLAT_SCALE * PANEL_SCALE;
 const FOV_DEG = 42;
 
 /**
@@ -315,7 +315,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   /** A marker's place in the panel's world: on its tilted orbit plane, as
    *  the splats put it, grown as they are. */
   const place3 = (mk: HoloMarker, y: number): THREE.Vector3 => {
-    const p = inclinedPoint(mk.x, mk.z, inclinationOf(mk.frame));
+    const p = holoPoint(mk);
     return v.set(p.x, y + p.y, p.z).multiplyScalar(PANEL_SCALE * (splats ? splats.group.scale.x : 1));
   };
   let lastFrameMs = 0;

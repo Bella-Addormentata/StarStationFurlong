@@ -4,7 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as THREE from 'three';
-import { HOLO_RADIUS, inclinationOf, inclinedPoint, type HoloMarker } from './mapHologramLayout';
+import { HOLO_RADIUS, holoPoint, inclinationOf, inclinedPoint, type HoloMarker } from './mapHologramLayout';
 import { SPLAT_LIFT, SPLAT_SCALE, buildSplatPlot, setSparkProvider } from './mapHologramSplats';
 
 /** A stand-in SplatMesh: counts the splats pushed, keeps opacity, disposes. */
@@ -85,7 +85,7 @@ describe('buildSplatPlot', () => {
     expect(h.group.children.some((c) => c.name === 'belt')).toBe(true);
     const here = h.group.children.find((c) => c.name === 'here')!;
     expect(here.visible).toBe(true);
-    expect(here.position.x).toBeCloseTo(inclinedPoint(0.36, 0, inclinationOf('planet-sovereign')).x, 9);
+    expect(here.position.x).toBeCloseTo(holoPoint({ ...station, here: true }).x, 9);
     // Nothing reaches past the disc before the group's own growth.
     expect(Math.hypot(here.position.x, here.position.z)).toBeLessThanOrEqual(HOLO_RADIUS);
   });
