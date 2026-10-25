@@ -122,7 +122,7 @@ import {
   type DoorRecord,
 } from "./doorsDoc";
 import { roomHalfExtents, roomWalkBounds, roomCupolas, readCupolaWalls } from "./floorPlanDoc";
-import { cupolaFloorOutline } from "./cupola";
+import { cupolaFloorOutline, floorGridLines } from "./cupola";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled, sharedRoomsNaming } from "./stationAtlas";
 // 🛰️ A helm bolted into a station flies the STATION (station keeping).
@@ -385,7 +385,7 @@ export class World {
   /** A standalone demo hole (`?octagon=1&hole=1`), merged with the pool hole by
    *  refreshOutdoorFloor so both survive its rebuilds. */
   private demoFloorHole: { x0: number; z0: number; x1: number; z1: number } | null = null;
-  private platformGrid: THREE.GridHelper | null = null;
+  private platformGrid: THREE.LineSegments | null = null;
   private platformElements: THREE.Object3D[] = [];
   private sideWalls: THREE.Mesh[] = [];
   /** 🚪 Glassy north wall backing the paired doors (no coverage rule). */
@@ -956,14 +956,11 @@ export class World {
     this.clickPlane.userData = { isTile: true };
     this.platformGroup.add(this.clickPlane);
 
-    // Grid helper (invisible by default; GridHelper is square-only, so size it
-    // to the larger dimension at 1 m divisions — default room stays 12/12).
-    const gridSpan = Math.max(platformW, platformD);
-    this.platformGrid = new THREE.GridHelper(
-      gridSpan,
-      gridSpan,
-      0x1e88e5,
-      0x0a1e3a,
+    // The 1 m floor grid (invisible by default; room edit shows it). Drawn
+    // over the floor's own shape, so a cupola end's cut corners have none.
+    this.platformGrid = new THREE.LineSegments(
+      this.makeGridGeometry(),
+      new THREE.LineBasicMaterial({ vertexColors: true, toneMapped: false }),
     );
     this.platformGrid.position.y = 0.01;
     this.platformGrid.visible = false;
@@ -1640,6 +1637,12 @@ export class World {
       this.platformFloor.geometry = this.makeFloorGeometry();
       old.dispose();
     }
+    // 🔭 …and the edit grid's lines, trimmed to the new floor.
+    if (this.platformGrid) {
+      const old = this.platformGrid.geometry;
+      this.platformGrid.geometry = this.makeGridGeometry();
+      old.dispose();
+    }
     if (OCTAGON_HULL && this.octagonHull) this.addOctagonHull();
   }
 
@@ -1672,6 +1675,26 @@ export class World {
     for (const [itemId, handle] of this.airHockeyVisuals) {
       handle.setTheme(airHockeyTheme(readAirHockeyTheme(itemId)));
     }
+  }
+
+  /** 🔭 The 1 m floor grid's lines (GridHelper's two colours: the centre
+   *  lines bright, the rest dim), each trimmed to the floor so none runs past
+   *  a cupola's glass or, in an oblong room, past the shorter walls. */
+  private makeGridGeometry(): THREE.BufferGeometry {
+    const { halfX, halfZ } = roomHalfExtents();
+    const lines = floorGridLines(halfX, halfZ, OCTAGON_HULL ? roomCupolas() : []);
+    const pos = new Float32Array(lines.length * 6);
+    const col = new Float32Array(lines.length * 6);
+    const centre = new THREE.Color(0x1e88e5), rest = new THREE.Color(0x0a1e3a);
+    lines.forEach((l, i) => {
+      pos.set([l.x0, 0, l.z0, l.x1, 0, l.z1], i * 6);
+      const c = l.axis ? centre : rest;
+      col.set([c.r, c.g, c.b, c.r, c.g, c.b], i * 6);
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    return geo;
   }
 
   /**
