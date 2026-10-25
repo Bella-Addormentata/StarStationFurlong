@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import type { TvScreenView } from './tvDoc';
-import { setConvenienceLanesForTest } from './sovereignty';
+import type { TvMenuCell, TvMenuView } from './tvMenu';
 
 let fills = 0;
 /** Every setTransform call, by the canvas it was made on. */
@@ -48,13 +48,28 @@ function sinks(): FurnitureHandleSinks {
   };
 }
 
+/** The card: the canvas-textured plane that is not the paused menu's. */
 function screenPlane(group: THREE.Group): THREE.Mesh | null {
   let found: THREE.Mesh | null = null;
   group.traverse((obj) => {
-    if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) found = obj;
+    if (obj instanceof THREE.Mesh && !obj.userData.tvMenu && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) found = obj;
   });
   return found;
 }
+
+function menuPlane(group: THREE.Group): THREE.Mesh | null {
+  let found: THREE.Mesh | null = null;
+  group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.tvMenu) found = obj; });
+  return found;
+}
+
+/** Drawn: it and every ancestor visible (World sets each mesh's own). */
+function shown(o: THREE.Object3D | null): boolean {
+  for (; o; o = o.parent) if (!o.visible) return false;
+  return true;
+}
+
+const tile = (kind: string, col: number, row: number, live = true): TvMenuCell => ({ id: `tile:${kind}`, label: kind.toUpperCase(), col, row, live });
 
 const view = (state: TvScreenView['state'], title = ''): TvScreenView =>
   ({ state, title, detail: 'REMOTE ON THE SET', lane: state === 'off' || state === 'home' ? '' : 'CONVENIENCE', clockText: '0:00' });
@@ -185,24 +200,64 @@ describe('the smart TV as built', () => {
     expect(pictures()).toHaveLength(0); // the texture is let go
   });
 
-  it('draws on the home screen only the tiles this build offers: YOUTUBE and ARCHIVE go with the convenience lanes', () => {
+  it('draws the home menu it is handed: one box per tile, and none without a menu', () => {
     const group = build('smart-tv');
     const s = sinks();
     group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
     const handle = s.tvScreens.get('smart-tv-1')!;
-    try {
-      setConvenienceLanesForTest(false); // the build default: serverless only
-      handle.draw(view('off'));
-      fills = 0;
-      handle.draw(view('home'));
-      const serverless = fills;
-      setConvenienceLanesForTest(true);
-      handle.draw(view('off'));
-      fills = 0;
-      handle.draw(view('home'));
-      expect(fills).toBe(serverless + 2); // one fillRect per tile: two more lanes drawn
-    } finally {
-      setConvenienceLanesForTest(null);
-    }
+    const home = (cells: TvMenuCell[]): TvScreenView => ({ ...view('home'), menu: { kind: 'home', cells, at: cells[0]!.id } });
+    handle.draw(view('off'));
+    fills = 0;
+    handle.draw(view('home'));
+    const bare = fills;
+    handle.draw(view('off'));
+    fills = 0;
+    handle.draw(home([tile('url', 0, 0), tile('file', 1, 0), tile('magnet', 2, 0)]));
+    const three = fills;
+    expect(three).toBe(bare + 3);
+    handle.draw(view('off'));
+    fills = 0;
+    handle.draw(home([tile('youtube', 0, 0), tile('archive', 1, 0), tile('url', 2, 0), tile('file', 0, 1), tile('magnet', 1, 1)]));
+    expect(fills).toBe(three + 2);
+    // A move of the highlight is a new view: drawn again.
+    fills = 0;
+    handle.draw({ ...home([tile('url', 0, 0), tile('file', 1, 0)]), menu: { kind: 'home', cells: [tile('url', 0, 0), tile('file', 1, 0)], at: 'tile:file' } });
+    expect(fills).toBeGreaterThan(0);
+  });
+
+  it('paused, the menu goes on a plane of its own in front of the picture, the still frame under it, and only then', () => {
+    const group = build('tv-stand');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'tv-stand-1', obj); });
+    const handle = s.tvScreens.get('tv-stand-1')!;
+    const plane = menuPlane(group)!;
+    expect(plane).not.toBeNull();
+    const canvas = (plane.material as THREE.MeshBasicMaterial).map!.image as { width: number; height: number };
+    expect([canvas.width, canvas.height]).toEqual([1, 1]); // never paused: no canvas to speak of
+    plane.visible = true; // World's interior pass: the gate is on the frame around it
+    expect(shown(plane)).toBe(false);
+    const video = { videoWidth: 640, videoHeight: 480, addEventListener: () => undefined, removeEventListener: () => undefined } as unknown as HTMLVideoElement;
+    handle.showVideo(video);
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(shown(plane)).toBe(false);
+    const paused: TvMenuView = { kind: 'paused', cells: [{ id: 'play', label: '▶ PLAY', col: 0, row: 0, live: true }], at: 'play' };
+    const transformsBefore = (transforms.get(canvas) ?? []).length;
+    handle.draw({ ...view('paused', 'METROPOLIS'), menu: paused });
+    expect(shown(plane)).toBe(true);
+    expect([canvas.width, canvas.height]).toEqual([384 * 2, 216 * 2]); // the card's own size
+    expect((transforms.get(canvas) ?? []).length).toBeGreaterThan(transformsBefore);
+    // The picture stays up under it.
+    let picture: THREE.Mesh | null = null;
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.VideoTexture) picture = obj; });
+    picture!.visible = true;
+    expect(shown(picture)).toBe(true);
+    // In front of it.
+    expect(plane.parent!.position.z).toBeGreaterThan(picture!.parent!.position.z);
+    // A pause with no menu handed in (a set drawn before the room's tick) has none on the plane.
+    handle.draw(view('paused', 'METROPOLIS'));
+    expect(shown(plane)).toBe(false);
+    handle.draw({ ...view('paused', 'METROPOLIS'), menu: paused });
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(shown(plane)).toBe(false);
   });
 });

@@ -2,12 +2,14 @@
  * 📺 tvDoc — the smart TV's shared records (#186): what is on, where the
  * playback is, and whose page keeps the room's clock.
  *
- * Three keys per TV in the room doc's `tv` map, plain JSON, whole-value
+ * Keys per TV in the room doc's `tv` map, plain JSON, whole-value
  * transacted writes, LWW per key (the partyDoc discipline):
  *   tv:<itemId>     → TvProgramme  the programme and the playback clock
+ *   beat:<itemId>   → BeatRecord   the clock's beat, laid over the programme
  *   remote:<itemId> → RemoteRecord the page keeping the clock (a lease)
  *   volume:<itemId> → { volume }   the set's volume, a body button
  *   power:<itemId>  → { on, seq }  the set's switch, a body button
+ *   menu:<itemId>   → { at }       the highlight on the set's own menu
  * and one room-wide key per thing the room has watched (the 📚 LIBRARY):
  *   lib:<sourceId>  → TvLibraryEntry  what it was, when it last played,
  *                                     and (a torrent's file) how to get it again
@@ -55,6 +57,7 @@
  */
 
 import * as Y from 'yjs';
+import type { TvMenuView } from './tvMenu';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -678,6 +681,9 @@ export function powerKey(itemId: string): string {
 export function beatKey(itemId: string): string {
   return `beat:${itemId}`;
 }
+export function menuKey(itemId: string): string {
+  return `menu:${itemId}`;
+}
 
 // ── Identity and host seams (registered by main.ts, never asserted by a caller) ──
 
@@ -867,6 +873,18 @@ export function readPower(itemId: string): PowerRecord {
   const park = raw.parkMs;
   const parkMs = typeof park === 'number' && Number.isFinite(park) && park >= 0 ? Math.floor(park) : null;
   return { on: raw.on === true, seq: counter(raw.seq), parkMs };
+}
+
+/** The longest cell id the `menu:` key keeps: a library title's is its
+ *  source's (tvMenu.ts), a URL's as long as TV_MAX_URL. */
+export const TV_MAX_MENU_AT = TV_MAX_URL + 64;
+
+/** Where the highlight stands on the set's own on-screen menu (tvMenu.ts),
+ *  shown while the set is stopped or paused: a cell's id, '' for none
+ *  (the menu's first cell). */
+export function readMenuAt(itemId: string): string {
+  const raw = ensureMap().get(menuKey(itemId)) as { at?: unknown } | undefined;
+  return raw && typeof raw === 'object' ? str(raw.at, TV_MAX_MENU_AT) : '';
 }
 
 /** What a screen, a phone or the theatre shows: the programme, the switch
@@ -1216,7 +1234,7 @@ export function tvPause(itemId: string, positionMs: number, now = wallClock()): 
     positionMs: Math.max(0, Math.floor(positionMs)),
     seq: bump(rec.seq),
     jump: bump(rec.jump),
-  } satisfies TvProgramme);
+  } satisfies TvProgramme, () => menuAnew(itemId));
   return { ok: true };
 }
 
@@ -1297,7 +1315,7 @@ export function tvStop(itemId: string): TvAction {
   const rec = readProgramme(itemId);
   write(tvKey(itemId), {
     ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: bump(rec.seq), jump: bump(rec.jump), endMs: 0,
-  } satisfies TvProgramme);
+  } satisfies TvProgramme, () => menuAnew(itemId));
   return { ok: true };
 }
 
@@ -1327,8 +1345,34 @@ export function tvTogglePower(itemId: string, now = clock()): boolean {
   // countdown still ahead, the home screen — carries no reading (null); a
   // programme switched off at its start carries 0, a reading.
   const parkMs = power.on ? roomPositionMs(itemId, now) : power.parkMs;
-  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord);
+  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord, () => menuAnew(itemId));
   return !power.on;
+}
+
+// ── The set's own menu ───────────────────────────────────────────────────────
+
+/** Move the highlight on the set's on-screen menu (tvMenu.ts works out to
+ *  which cell). The `menu:` key is its own, so a move never races a
+ *  programme write, and it names a cell, never a place, so a page whose
+ *  build draws another shelf (sovereignty.ts) finds it or shows its own
+ *  first cell. Anyone moves it, as anyone presses (#258): the set's screen
+ *  is one screen, seen by the whole room. Not a programme action, so it
+ *  takes no clock; and nothing while no menu is up, or while this page is
+ *  leaving the room (press). */
+export function tvSetMenuAt(itemId: string, at: string): TvAction {
+  if (!pressesOpen) return { ok: false, error: 'Leaving this room.' };
+  const state = readTv(itemId).state;
+  if (state !== 'home' && state !== 'paused') return { ok: false, error: 'The set shows no menu now.' };
+  const cell = at.slice(0, TV_MAX_MENU_AT);
+  if (readMenuAt(itemId) !== cell) write(menuKey(itemId), { at: cell });
+  return { ok: true };
+}
+
+/** The highlight back to the first cell, inside a write that brings a menu
+ *  up anew (PAUSE, STOP, the switch): a menu left on STOP last time must
+ *  not open on it. */
+function menuAnew(itemId: string): void {
+  ensureMap().delete(menuKey(itemId));
 }
 
 
@@ -1696,17 +1740,14 @@ export interface TvScreenView {
   /** 0–1 progress when known (a duration is a player fact, so usually 0). */
   lane: TvLane | '';
   clockText: string;
-  /** The home screen's RECENTLY ON shelf: the library's newest titles. */
-  recent?: string[];
+  /** The set's own menu, home or paused (tvMenu.ts): World adds it. */
+  menu?: TvMenuView;
   /** This page's own word on the set, never the room's: what its theatre
    *  waits on (a tap to play, a fetch, an allow), parts joined by ' · '.
    *  World adds it from tvTheatreHint; the set draws it where the picture
    *  is not up. */
   ask?: string;
 }
-
-/** How many library titles the home screen shows. */
-export const TV_HOME_RECENT = 4;
 
 /** Derive what the in-world screen shows from the records alone, so every
  *  client's prop agrees and the drawing code has nothing to decide. */
@@ -1718,8 +1759,7 @@ export function tvScreenView(itemId: string, now = clock()): TvScreenView {
   const holderLine = remote.holder && !remoteLapsed(itemId, now) ? `LAST PRESS · ${remote.name || 'a clone'}` : '';
   if (rec.state === 'off') return { state: 'off', title: '', detail: '', lane: '', clockText: '' };
   if (rec.state === 'home' || !rec.source) {
-    const recent = readLibrary().slice(0, TV_HOME_RECENT).map((e) => e.title);
-    return { state: 'home', title: 'FURLONG TV', detail: 'ANY SPACEPHONE IS THE REMOTE', lane: '', clockText: '', ...(recent.length ? { recent } : {}) };
+    return { state: 'home', title: 'FURLONG TV', detail: 'ANY SPACEPHONE IS THE REMOTE', lane: '', clockText: '' };
   }
   const label = sourceLabel(rec.source).toUpperCase();
   const lane = sourceLane(rec.source);

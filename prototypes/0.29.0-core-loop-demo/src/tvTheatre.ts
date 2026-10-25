@@ -865,10 +865,9 @@ function theatreTick(rtt: () => number): void {
     }
   }
   // A picture laid on the set in the DOM shows only while the programme
-  // plays or pauses, as the set's own video plane does (furniture.ts): a
-  // countdown stays the set's card.
-  const pbNow = readPlayback(t.itemId).state;
-  setScreenHostShown(pbNow === 'playing' || pbNow === 'paused');
+  // plays: a countdown stays the set's card, and a pause is the set's own
+  // menu (tvMenu.ts), drawn on the set, which the DOM layer would cover.
+  setScreenHostShown(readPlayback(t.itemId).state === 'playing');
   t.controller?.tick();
 }
 

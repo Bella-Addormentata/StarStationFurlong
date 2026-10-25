@@ -262,6 +262,7 @@ import { listContacts, getContact } from "./contacts";
 import { closeTvTheatre, isTvTheatreOpen, setTvScreenProvider, tvTheatreHint, updateTvPicture } from "./tvTheatre";
 import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
+import { tvMenu } from "./tvMenu";
 // 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
 // attract card the prop draws.
 import { createArcadeCabinetUI, type ArcadePanelView } from "./arcadeUI";
@@ -4262,10 +4263,13 @@ export class World {
       if (tvDriveArmed()) {
         const tvIds = FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
         // 📡 What the set asks of this viewer (a link to allow, a file to
-        // fetch), in its own few words: where to look, on the set itself.
+        // fetch), in its own few words: where to look, on the set itself;
+        // and the set's own menu while it is stopped or paused, the
+        // highlight where anyone's blaster moved it.
         for (const [id, screen] of this.tvScreens) {
           const ask = tvTheatreHint(id);
-          screen.draw(ask ? { ...tvScreenView(id), ask } : tvScreenView(id));
+          const menu = tvMenu(id);
+          screen.draw({ ...tvScreenView(id), ...(menu ? { menu } : {}), ...(ask ? { ask } : {}) });
         }
         tickTvRoom(tvIds);
         updateTvPicture(tvIds);
