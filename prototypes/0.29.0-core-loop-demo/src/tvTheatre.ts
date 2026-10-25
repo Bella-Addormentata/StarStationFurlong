@@ -1000,7 +1000,7 @@ function showBlobNotice(t: Theatre, source: Extract<TvSource, { kind: 'blob' }>,
     : verdict === 'day' ? `AUTO-FETCH has used today's ${formatBytes(TV_AUTO_FETCH_DAY)} (each file counts at least ${formatBytes(TV_AUTO_FETCH_MIN_CHARGE)}): nothing more is fetched until you press`
     : 'nothing more is fetched until you press';
   const html = `<div>📦 ${escapeHtml(sourceLabel(source))} · ${escapeHtml(size)}</div>
-    <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node over the room, never from a server; ${escapeHtml(size)} of your disk, kept until your node needs the room (the files used longest ago go first). ${escapeHtml(wait)}</div>
+    <div class="tv-theatre-lane">SOVEREIGN LANE — your node takes it from ${escapeHtml(from)}'s node or another that has it, here or met in this room lately, never from a server; ${escapeHtml(size)} of your disk, kept until your node needs the room (the files used longest ago go first). ${escapeHtml(wait)}</div>
     ${failed}
     <button type="button" data-tv-fetch="${escapeHtml(source.hash)}" data-tv-fetch-size="${source.size}" data-tv-fetch-from="${escapeHtml(source.provider)}">📦 FETCH ${escapeHtml(size)}</button>`;
   if (!t.notice.hidden && t.lastNotice === html) return;
