@@ -44,7 +44,7 @@ import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
 import {
   closeBetting, isCroupierLive, openBetting, RECONNECTING_NOTICE, rollAndSettle, ROULETTE_PAGE_ID, spinSeenAt,
-  SPIN_TAKEOVER_MS, tablesAwake,
+  SPIN_TAKEOVER_MS, TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake,
 } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
@@ -704,9 +704,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const deadline = (): number | undefined =>
     game === 'craps' ? crapsState()?.phaseDeadline : rouletteState()?.phaseDeadline;
   const myBets = (): AnyBet[] => (game === 'craps' ? readMyCrapsBets(itemId, me) : readMyBets(itemId, me, round()));
-  const writeBets = (bets: AnyBet[]): void => {
-    if (game === 'craps') writeMyCrapsBets(itemId, me, bets as CrapsBet[]);
-    else writeMyBets(itemId, me, round(), bets as RouletteBet[]);
+  /** Write my list; false (and the bettor told why) when it didn't go down:
+   *  the table full, or the doc holding part of an update (casinoWhole). */
+  const writeBets = (bets: AnyBet[]): boolean => {
+    const wrote = game === 'craps'
+      ? writeMyCrapsBets(itemId, me, bets as CrapsBet[])
+      : writeMyBets(itemId, me, round(), bets as RouletteBet[]);
+    if (!wrote) say(casinoWhole(itemId) ? 'THE TABLE IS FULL — WAIT FOR A PLACE' : RECONNECTING_NOTICE);
+    return wrote;
   };
   const animating = (): boolean => {
     if (!h) return false;
@@ -876,7 +881,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return;
     }
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
-    writeBets([...mine, ...placed]);
+    if (!writeBets([...mine, ...placed])) return;
     const warnKey = `${casinoDocEpoch()}:${itemId}`;
     // Commit this bet's seed now, not on the next tick: a quick close must
     // still find it.
@@ -923,7 +928,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     if (back.length === 0) return false;
     // Off the list, the chips are no longer held: they're back on your rail.
-    writeBets(keep);
+    if (!writeBets(keep)) return true;
     added.delete(key);
     // An empty hand picks them up; a loaded hand is already the stake you're
     // betting with, so they just go back to the rail.
@@ -951,9 +956,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say('LINE AND COME BETS WITH A POINT STAY UP UNTIL THEY WIN OR LOSE');
       return;
     }
-    // The chips slide back across the felt to your rail as they come off.
+    // The list stops holding them: back on your rail. The chips slide back
+    // across the felt as they come off.
+    if (!writeBets(keep)) return;
     if (railSplit) h?.sweepToRail({ x: railSplit.chips.x, z: railSplit.chips.z });
-    writeBets(keep); // the list stops holding them: back on your rail
     const total = sumOf(back.map((b) => b.amount));
     for (const b of back) added.delete(spotKey(b));
     saveLedger();
@@ -1622,11 +1628,16 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     let until = Date.now() + REVEAL_GRACE_MS + 6_000;
     let polledAt = Date.now();
     spinPoll = window.setInterval(() => {
-      // ⏱ A clock gone back mid-poll takes the poll's times back with it.
+      // ⏱ A clock gone back mid-poll by under a second (a time sync's step)
+      // takes the poll's times back with it. By more, the page waits out a
+      // wake (tablesAwake): the poll starts again from now, that wait in it.
       const t = Date.now();
-      if (t < polledAt) {
+      if (t < polledAt && polledAt - t < TABLE_CLOCK_SLACK_MS) {
         settleFrom -= polledAt - t;
         until -= polledAt - t;
+      } else if (t < polledAt) {
+        settleFrom = t + LEASE_SETTLE_MS;
+        until = t + REVEAL_GRACE_MS + 6_000 + TABLE_LEASE_LAPSE_MS;
       }
       polledAt = t;
       const now = rouletteState();

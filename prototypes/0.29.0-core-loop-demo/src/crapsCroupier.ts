@@ -15,8 +15,9 @@
  * CRAPS ≠ ROULETTE: a roulette settle clears the felt every spin. A craps roll
  * only settles the bets that GOT a decision — a pass line waiting on its point,
  * a working place bet, ride to the next roll. So the settle also PRUNES each
- * player's bets (casinoDoc pruneCrapsBets: the survivors, in the table's
- * book, never the player's `bets:` key) and carries the POINT
+ * player's bets (casinoDoc pruneCrapsBets: the survivors go in the table's
+ * book; only an earlier build's list is also rewritten in place) and carries
+ * the POINT
  * forward into the next betting window. The survivors play until the player
  * writes a list after that roll, so an edit that crossed the dice is dropped
  * rather than bringing back bets the roll resolved (casinoDoc crapsFelt).
@@ -28,7 +29,8 @@
  */
 
 import {
-  closeWhenWhole, RECONNECTING_NOTICE, refundAndClear, tablesAwake, tablesWakeCount, timerOnThisClock,
+  closeWhenWhole, RECONNECTING_NOTICE, refundAndClear, TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount,
+  timerOnThisClock,
 } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
@@ -357,9 +359,8 @@ export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: 
   }
   // Just stamped this page operator (it closed the window, or took the turn
   // over): let the stamp converge first, so a rival press's write wins or
-  // loses before either page settles. (A clock gone back since makes the
-  // page wait out a wake instead.)
-  if (stamp && now >= stamp.at && now - stamp.at < MANUAL_TAKEOVER_SETTLE_MS) return;
+  // loses before either page settles.
+  if (stamp && stampConverging(stamp, now)) return;
   // 💤 A page waking from a sleep holds this turn only in a doc that may not
   // have heard a takeover yet: it waits to be awake again (noteTablesRunning).
   if (!tablesAwake(now) || !casinoWhole(tableId)) return;
@@ -405,13 +406,22 @@ function noteClosing(tableId: string, s: CrapsTableState | null, now: number): n
   closingSeen.set(tableId, { epoch, wake, inc: s.inc, round: s.round, operator: s.operator, at: now });
   return now;
 }
-const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
+export const MANUAL_TAKEOVER_SETTLE_MS = 1_500;
 /** Turns this page stamped itself operator of, by its close or a takeover:
  *  when (this page's own clock), which, and whether the stickman throws as
  *  soon as the stamp has converged (a takeover, or a second press). */
 const stampedAt = new Map<string, {
   at: number; inc: string | undefined; round: number; epoch: number; throwNow: boolean;
 }>();
+
+/** Has the stamp `mark` had MANUAL_TAKEOVER_SETTLE_MS to converge by `now`?
+ *  This page's clock gone back by under TABLE_CLOCK_SLACK_MS since (a time
+ *  sync's step) takes the stamp back with it; by more, the page waits out a
+ *  wake instead (tablesAwake). */
+function stampConverging(mark: { at: number }, now: number): boolean {
+  if (now < mark.at && mark.at - now < TABLE_CLOCK_SLACK_MS) mark.at = now;
+  return now >= mark.at && now - mark.at < MANUAL_TAKEOVER_SETTLE_MS;
+}
 
 /**
  * The house's ROLL on a manual table. Returns a notice for the press, or
@@ -455,7 +465,7 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
     // once it has (tickManualCraps).
     const mark = stampedAt.get(tableId);
     if (mark && mark.epoch === casinoDocEpoch() && mark.inc === s.inc && mark.round === s.round
-      && now >= mark.at && now - mark.at < MANUAL_TAKEOVER_SETTLE_MS) {
+      && stampConverging(mark, now)) {
       mark.throwNow = true;
       return null;
     }

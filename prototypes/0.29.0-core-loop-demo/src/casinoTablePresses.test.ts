@@ -1,15 +1,19 @@
 /**
- * The house's manual SPIN (casinoTableSession spinByHand):
- *  ⏱ when the clock goes back mid-poll, the poll's times go back with it, so
- *    the round settles once the page is awake again, not when the clock
- *    comes round;
+ * Presses at the table (casinoTableSession). The house's manual SPIN
+ * (spinByHand):
+ *  ⏱ when the clock goes back mid-poll by under a second, the poll's times
+ *    go back with it; by more, the poll starts again with the page's wake in
+ *    it, so the round settles once the page is awake again, not when the
+ *    clock comes round, and not only on a second press;
  *  📒 on a doc holding part of an update (casinoWhole), where a bet list
  *    rewritten in the part still to come reads as gone, it closes nothing
  *    until the rest comes, so the round takes that list.
+ * And a bettor's ↶ take-down on such a doc: refused, and said so, not told
+ * TAKEN DOWN with the bets still riding.
  *
  * The UI needs a DOM: this file stubs just enough of one (createElement,
- * listeners, querySelector) to mount the focused table and press its card's
- * SPIN button.
+ * listeners, querySelector) to mount the focused table, press its keys and
+ * its card's SPIN button.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -82,10 +86,16 @@ vi.stubGlobal('window', {
 });
 
 const {
-  bindCasinoDoc, buyInChips, casinoWhole, readChips, readMyBets, readTableState, writeCrapsFairnessPref, writeMyBets,
+  bindCasinoDoc, buyInChips, casinoWhole, readChips, readMyBets, readMyCrapsBets, readTableState,
+  writeCrapsFairnessPref, writeMyBets, writeMyCrapsBets,
 } = await import('./casinoDoc');
-const { noteTablesRunning, openBetting, setSoleCroupierPredicate, TABLE_LEASE_LAPSE_MS } = await import('./croupier');
+const {
+  noteTablesRunning, openBetting, RECONNECTING_NOTICE, setSoleCroupierPredicate, TABLE_LEASE_LAPSE_MS,
+} = await import('./croupier');
+const { openCrapsBetting } = await import('./crapsCroupier');
+const { tickFairSeeds } = await import('./fairTableSeeds');
 const { createCasinoTableUI } = await import('./casinoTableSession');
+const { getPlayerId } = await import('./identity');
 
 const T0 = 2_000_000_000;
 const HOUR = 3_600_000;
@@ -160,6 +170,41 @@ describe("the house's manual SPIN", () => {
   }
 });
 
+describe("the house's manual SPIN on a Fair table whose bettor never reveals", () => {
+  /** Frames every 50 ms, real hashing (about a millisecond) landing inside
+   *  the frame it starts in, as in a browser. */
+  async function runReal(ms: number): Promise<void> {
+    for (let left = ms; left > 0; left -= 50) {
+      await vi.advanceTimersByTimeAsync(50);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+      noteTablesRunning(Date.now());
+    }
+  }
+
+  for (const [what, back] of [['a steady clock (control)', 0], ['a clock that goes back an hour 4.2 s after the press', HOUR]] as const) {
+    it(`(${what}) settles the round without a second press`, async () => {
+      const t = freshTable();
+      writeCrapsFairnessPref(t, 'multiparty');
+      openBetting(t, 1);
+      const me = getPlayerId();
+      buyInChips(me, 100);
+      writeMyBets(t, me, 1, red);
+      tickFairSeeds(t, 'roulette', me, Date.now(), true); // commits; never reveals
+      noteTablesRunning(Date.now());
+      const house = houseAtTable(t);
+      house.spin();
+      expect(Object.keys(readTableState(t)?.commits ?? {})).toEqual([me]);
+      await runReal(4_200);
+      expect(readTableState(t)?.phase).toBe('closing');
+      vi.setSystemTime(Date.now() - back);
+      for (let i = 0; i < 240 && readTableState(t)?.phase !== 'settled'; i++) await runReal(100);
+      const phase = readTableState(t)?.phase;
+      house.unmount();
+      expect(phase).toBe('settled');
+    });
+  }
+});
+
 describe("the house's manual SPIN on a doc holding part of an update", () => {
   it('closes nothing until the rest comes, then plays the list rewritten in it', async () => {
     const t = freshTable();
@@ -194,4 +239,52 @@ describe("the house's manual SPIN on a doc holding part of an update", () => {
     expect(readTableState(t)?.phase).toBe('settled');
     expect(readChips(BOB)).not.toBe(100); // played, not handed back
   });
+});
+
+/** Another page's two writes elsewhere, the second given to `doc` first:
+ *  the doc holds part of an update. Returns the rest. */
+function partOfAnUpdate(): Uint8Array {
+  const other = new Y.Doc();
+  const updates: Uint8Array[] = [];
+  other.on('update', (u: Uint8Array) => updates.push(u));
+  other.getMap('elsewhere').set('a', 1);
+  other.getMap('elsewhere').set('b', 2);
+  Y.applyUpdate(doc, updates[1]);
+  return updates[0];
+}
+
+describe('a take-down on a doc holding part of an update', () => {
+  for (const game of ['roulette', 'craps'] as const) {
+    it(`${game}: says the table is reconnecting, and the bets stay until a press once the rest has come`, () => {
+      const t = `${game}-takedown-partial`;
+      const me = getPlayerId();
+      buyInChips(me, 100);
+      writeCrapsFairnessPref(t, 'rng');
+      if (game === 'roulette') {
+        openBetting(t, 1);
+        writeMyBets(t, me, 1, red);
+      } else {
+        openCrapsBetting(t, 1, null);
+        writeMyCrapsBets(t, me, [{ type: 'field', amount: 10 }]);
+      }
+      const mine = (): unknown[] => (game === 'roulette' ? readMyBets(t, me, 1) : readMyCrapsBets(t, me));
+      const rest = partOfAnUpdate();
+      expect(casinoWhole(t)).toBe(false);
+      const ui = createCasinoTableUI({ itemId: t, game, isHouse: () => false, stand: null, visual: null });
+      const host = new FakeEl();
+      ui.mount(host as unknown as HTMLElement);
+      const takeDown = (): string => {
+        host.children[0].fire('keydown', { key: 'c', preventDefault() {}, stopPropagation() {} });
+        return host.children[1].querySelector('[data-live]').textContent;
+      };
+      expect(takeDown()).toContain(RECONNECTING_NOTICE);
+      expect(mine()).toHaveLength(1);
+      expect(readChips(me)).toBe(90);
+      Y.applyUpdate(doc, rest);
+      expect(takeDown()).toMatch(/^TAKEN DOWN/);
+      ui.unmount();
+      expect(mine()).toEqual([]);
+      expect(readChips(me)).toBe(100);
+    });
+  }
 });

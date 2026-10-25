@@ -508,8 +508,8 @@ export function freezeCommits(
   const staked = stakedPlayers(tableId, game, s.round);
   // RNG: a bet first put down after "no more bets" sits the round out, and
   // two pages settling it (a handover) write up the very bettors its close
-  // names, so each one's outcome meets the other page's. What they bet plays
-  // as it stands at the settle: nobody can know the result before it.
+  // names, whichever book the doc keeps. What they bet plays as it stands at
+  // the settle: nobody can know the result before it.
   if (!s.houseCommit) return { bettors: [...staked].sort().slice(0, MAX_TABLE_BETTORS) };
   const commits: Record<string, string> = {};
   const sigs: Record<string, string> = {};
@@ -526,16 +526,19 @@ export function freezeCommits(
     }
   }
   // Staked but no seed (offline with standing bets, too quick a close, or
-  // past the cap — a table's stands keep it far below 15): on the record, so
-  // the card can say who the result didn't take a seed from.
-  const unseeded = [...staked].filter((pid) => !(pid in commits)).sort().slice(0, MAX_BETTOR_PARTIES + 1);
+  // past the seed cap): in the round all the same, up to MAX_TABLE_BETTORS
+  // in all. The first of them go on the record, so the card can say who the
+  // result didn't take a seed from.
+  const inRound = [...staked].filter((pid) => !(pid in commits)).sort()
+    .slice(0, MAX_TABLE_BETTORS - Object.keys(commits).length);
+  const unseeded = inRound.slice(0, MAX_BETTOR_PARTIES + 1);
   // The wagers freeze too: the reveals make the result computable before the
   // settle, so a bet rewritten after "no more bets" must not be paid.
   // And what each list holds on the felt, so a rewrite can't shrink what the
   // round takes (casinoDoc STAKES ON THE FELT).
   const wagers: Record<string, string> = {};
   const stakes: Record<string, number> = {};
-  for (const pid of [...Object.keys(commits), ...unseeded]) {
+  for (const pid of [...Object.keys(commits), ...inRound]) {
     const list = game === 'craps' ? readMyCrapsBets(tableId, pid) : readMyBets(tableId, pid, s.round);
     wagers[pid] = wagerFingerprint(list);
     stakes[pid] = feltStake(tableId, pid).net;

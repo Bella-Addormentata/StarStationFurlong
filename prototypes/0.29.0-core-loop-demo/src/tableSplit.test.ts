@@ -80,6 +80,7 @@ afterEach(() => {
 const amy = 'player-Amy'; // at the table before the split: both sides know her bets
 const xena = 'player-Xena'; // plays at the cut-off page's copy of the room only
 const yuri = 'player-Yuri'; // plays at the other side only
+const eve = 'player-Eve'; // on an earlier build: her chips go when her list goes down
 const red = [{ type: 'red' as const, amount: 10 }];
 type Bets = Parameters<Page['casino']['writeMyBets']>[3];
 type Felt = Parameters<Page['casino']['writeMyCrapsBets']>[2];
@@ -144,7 +145,7 @@ describe('a page cut off from the room that keeps settling, and the page that to
         expect(page.casino.readTableState(TABLE)).toMatchObject({ phase: keptY ? 'settled' : 'betting', round: keptY ? 3 : 5 });
         expect(Object.keys(bookOf(page, TABLE, inc).recs).sort()).toEqual(keptY ? [amy, yuri] : [amy, xena]);
         expect(page.casino.readChips(amy)).toBe(keptY ? 100 : 120);
-        expect(page.casino.readChips(xena)).toBe(keptY ? 100 : 100); // (her 10 down on X's round 5)
+        expect(page.casino.readChips(xena)).toBe(100); // (her 10 down on X's round 5, either way)
         expect(page.casino.readChips(yuri)).toBe(keptY ? 80 : 100);
       }
       if (keptY) {
@@ -339,6 +340,64 @@ describe('a page cut off from the room that keeps settling, and the page that to
   });
 });
 
+describe('a take-down on each side of a split, the room meeting between the close and the roll', () => {
+  const big6 = { type: 'big6' as const, amount: 10 };
+  for (const mode of ['rng', 'fair-void'] as const) {
+    it(`craps (${mode}): the big 6 the doc keeps up stays up, and a removal hands it back`, async () => {
+      const y2 = await loadPage(1); // Amy's tab on the side that took over
+      const x = await loadPage(2); // cut off; Amy's tab there too
+      const y1 = await loadPage(3); // takes the table over
+      x.casino.writeCrapsFairnessPref(CRAPS, 'rng');
+      x.casino.buyInChips(amy, 100);
+      await roll(x, 3, 5, { [amy]: [big6] }); // an 8: the point, the big 6 stays up
+      sync(x, y1, y2);
+      // The split. Each side rolls a 5 (the big 6 stays), and Amy takes it
+      // down there: both lists are for roll 3.
+      await roll(x, 2, 3);
+      x.casino.writeMyCrapsBets(CRAPS, amy, []);
+      await roll(y1, 1, 4);
+      sync(y1, y2);
+      y2.casino.writeMyCrapsBets(CRAPS, amy, []);
+      sync(y1, y2);
+      // Y opens and closes roll 3. (Fair: y2 opens it, so y1, which closes
+      // and settles it, has no house seed: it voids it.)
+      const opener = mode === 'rng' ? y1 : y2;
+      if (mode === 'fair-void') {
+        y2.casino.writeCrapsFairnessPref(CRAPS, 'multiparty');
+        sync(y1, y2);
+      }
+      const was = opener.casino.readCrapsTableState(CRAPS)!;
+      opener.craps.openCrapsBetting(CRAPS, 3, was.point, was);
+      sync(y1, y2);
+      y1.craps.closeCrapsBetting(CRAPS, y1.casino.readCrapsTableState(CRAPS)!);
+      sync(y1, y2);
+      // The room meets: the doc keeps y1's book and state, and x's take-down,
+      // written over x's roll, which the doc drops: the big 6 is up again.
+      sync(x, y1, y2);
+      for (const p of [x, y1, y2]) {
+        expect(p.casino.readCrapsTableState(CRAPS)).toMatchObject({ phase: 'closing', round: 3 });
+        expect(p.casino.readMyCrapsBets(CRAPS, amy)).toEqual([big6]);
+        expect(p.casino.readChips(amy)).toBe(90);
+      }
+      // A 5 neither wins nor loses a big 6 (Fair: the void leaves every bet up).
+      diceTo(1, 4);
+      y1.craps.rollAndSettleCraps(CRAPS, 3, y1.casino.readCrapsTableState(CRAPS)!.point);
+      await flush();
+      sync(x, y1, y2);
+      for (const p of [x, y1, y2]) {
+        expect(p.casino.readCrapsTableState(CRAPS)).toMatchObject(
+          { phase: 'settled', round: 3, ...(mode === 'rng' ? { dice: [1, 4] } : { voided: true }) },
+        );
+        expect(p.casino.readMyCrapsBets(CRAPS, amy)).toEqual([big6]);
+        expect(p.casino.readChips(amy)).toBe(90);
+      }
+      y1.craps.closeCrapsTable(CRAPS, 'local');
+      sync(x, y1, y2);
+      for (const p of [x, y1, y2]) expect(p.casino.readChips(amy)).toBe(100);
+    });
+  }
+});
+
 describe('two pages that open a table at once, before either hears the other', () => {
   for (const [cx, cy] of [[1, 2], [2, 1]] as const) {
     it(`roulette: the bets put down on either opening play in the round the doc keeps (clients ${cx}, ${cy})`, async () => {
@@ -364,7 +423,9 @@ describe('two pages that open a table at once, before either hears the other', (
       }
     });
   }
+});
 
+describe("an earlier build's table state", () => {
   it("roulette: an earlier build's round past the book's goes on: the next round opens from it, not back at the book's", async () => {
     const x = await loadPage(1);
     x.casino.writeCrapsFairnessPref(TABLE, 'rng');
@@ -470,9 +531,10 @@ describe('a page holding part of another page\'s update', () => {
     return out;
   }
 
-  /** Page x drives a roulette table Amy has 30 down on; page p (a house
-   *  member) writes a seat, then closes the round with a SPIN. Page x is
-   *  given the close first. */
+  /** Page x drives a roulette table Amy has 30 down on, and Eve 10 from an
+   *  earlier build (whose chips it took); page p (a house member) writes a
+   *  seat, then closes the round with a SPIN. Page x is given the close
+   *  first. */
   async function closeArrivesFirst(): Promise<{ x: Page; p: Page; rest: Uint8Array[]; asked: () => number }> {
     const x = await loadPage(1);
     const p = await loadPage(2);
@@ -482,6 +544,8 @@ describe('a page holding part of another page\'s update', () => {
     x.casino.buyInChips(amy, 100);
     x.croupier.openBetting(TABLE, 1);
     x.casino.writeMyBets(TABLE, amy, 1, [{ type: 'red', amount: 30 }]);
+    x.doc.getMap('casino').set(`bal:${eve}`, 90);
+    x.doc.getMap('casino').set(`bets:${TABLE}:${eve}`, { round: 1, bets: red });
     sync(x, p);
     const [seat, close] = updatesOf(p, () => {
       p.casino.writeMySeat(TABLE, amy, { stand: 0, angle: 0, at: 1 });
@@ -490,6 +554,103 @@ describe('a page holding part of another page\'s update', () => {
     Y.applyUpdate(x.doc, close);
     return { x, p, rest: [seat], asked: () => asks };
   }
+
+  it('counts a chip record rewritten in the part of an update to come as it read before, until the rest comes', async () => {
+    const x = await loadPage(1);
+    const p = await loadPage(2);
+    p.casino.buyInChips(amy, 100);
+    sync(x, p);
+    const [first, second] = updatesOf(p, () => {
+      p.casino.writeMySeat(TABLE, amy, { stand: 0, angle: 0, at: 1 });
+      p.casino.spendChips(amy, 20);
+    });
+    Y.applyUpdate(x.doc, second); // its delete of p's record applies at once
+    expect(x.casino.readChips(amy)).toBe(100);
+    Y.applyUpdate(x.doc, first);
+    expect(x.casino.readChips(amy)).toBe(80);
+  });
+
+  it("tells a player's listeners of a hold that waited for the rest, when the rest comes in another map", async () => {
+    const x = await loadPage(1);
+    const p = await loadPage(2);
+    const q = await loadPage(3);
+    x.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    x.casino.buyInChips(amy, 100);
+    x.croupier.openBetting(TABLE, 1);
+    sync(x, p, q);
+    const [q1, q2] = updatesOf(q, () => {
+      q.doc.getMap('elsewhere').set('a', 1);
+      q.doc.getMap('elsewhere').set('b', 2);
+    });
+    Y.applyUpdate(x.doc, q2);
+    for (const u of updatesOf(p, () => p.casino.writeMyBets(TABLE, amy, 1, red))) Y.applyUpdate(x.doc, u);
+    const told: number[] = [];
+    x.casino.subscribeCasinoKey(`bal:${amy}`, () => told.push(x.casino.readChips(amy)));
+    Y.applyUpdate(x.doc, q1);
+    expect({ now: x.casino.readChips(amy), told }).toEqual({ now: 90, told: [90] });
+  });
+
+  it('spends nothing, though a bet heard whole meanwhile holds chips it has yet to count', async () => {
+    for (const partial of [true, false]) {
+      const driver = await loadPage(1);
+      const tabA = await loadPage(2); // Amy's tab that bets
+      const tabB = await loadPage(3); // her other tab, at the cage
+      const other = await loadPage(4);
+      driver.casino.writeCrapsFairnessPref(TABLE, 'rng');
+      driver.casino.buyInChips(amy, 100);
+      driver.croupier.openBetting(TABLE, 1);
+      sync(driver, tabA, tabB, other);
+      // Another page writes a seat twice elsewhere; tab B gets the second first.
+      const [first, second] = updatesOf(other, () => {
+        other.casino.writeMySeat(CRAPS, 'player-Zed', { stand: 0, angle: 0, at: 1 });
+        other.casino.writeMySeat(CRAPS, 'player-Zed', { stand: 0, angle: 0, at: 2 });
+      });
+      if (partial) Y.applyUpdate(tabB.doc, second);
+      for (const u of updatesOf(tabA, () => tabA.casino.writeMyBets(TABLE, amy, 1, [{ type: 'red', amount: 100 }]))) {
+        Y.applyUpdate(tabB.doc, u);
+      }
+      expect(tabB.casino.readMyBets(TABLE, amy, 1)).toEqual([{ type: 'red', amount: 100 }]);
+      expect(tabB.casino.spendChips(amy, 100)).toBe(false);
+      expect(tabB.casino.cashOutChips(amy, 100)).toBe(0);
+      if (partial) Y.applyUpdate(tabB.doc, first);
+      expect(tabB.casino.readChips(amy)).toBe(0);
+    }
+  });
+
+  it('bound on a snapshot of part of an update (the room cache), spends nothing until the rest comes', async () => {
+    const { x, rest } = await closeArrivesFirst();
+    expect(x.casino.readChips(amy)).toBe(70); // the 30 still held
+    const fresh = new Y.Doc();
+    Y.applyUpdate(fresh, Y.encodeStateAsUpdate(x.doc)); // the cache's copy
+    x.casino.bindCasinoDoc(fresh); // the table reads as gone: its 30 as free
+    expect(x.casino.casinoWhole()).toBe(false);
+    expect(x.casino.cashOutChips(amy, 100)).toBe(0);
+    expect(x.casino.spendChips(amy, 100)).toBe(false);
+    for (const u of rest) Y.applyUpdate(fresh, u);
+    expect(x.casino.casinoWhole()).toBe(true);
+    expect(x.casino.readChips(amy)).toBe(70);
+    expect(x.casino.cashOutChips(amy, 100)).toBe(70);
+  });
+
+  it('bound on a snapshot holding a chip record rewritten in the part to come, spends nothing until it comes', async () => {
+    const x = await loadPage(1);
+    const w = await loadPage(2); // Amy's other tab, spending at a slot
+    x.casino.buyInChips(amy, 100);
+    sync(x, w);
+    expect(w.casino.spendChips(amy, 50)).toBe(true);
+    sync(x, w);
+    const [seat, spend] = updatesOf(w, () => {
+      w.casino.writeMySeat(CRAPS, amy, { stand: 0, angle: 0, at: 1 });
+      w.casino.spendChips(amy, 10);
+    });
+    Y.applyUpdate(x.doc, spend);
+    const fresh = new Y.Doc();
+    Y.applyUpdate(fresh, Y.encodeStateAsUpdate(x.doc));
+    x.casino.bindCasinoDoc(fresh);
+    expect(x.casino.cashOutChips(amy, 100)).toBe(0);
+    Y.applyUpdate(fresh, seat);
+    expect(x.casino.readChips(amy)).toBe(40);
+  });
 
   it('reads the table as gone, and counts, opens, bets and settles nothing, until the rest comes', async () => {
     const { x, rest, asked } = await closeArrivesFirst();
@@ -508,17 +669,22 @@ describe('a page holding part of another page\'s update', () => {
   });
 
   it('a removal heard meanwhile waits for the rest, then hands back once', async () => {
-    const { x, rest } = await closeArrivesFirst();
-    const earlier = 'player-Eve';
-    // (An earlier build's list, which a removal refunds, put down before.)
-    expect(x.casino.readChips(earlier)).toBe(0);
+    const { x, p, rest } = await closeArrivesFirst();
     x.croupier.closeTable(TABLE, 'heard');
     expect(x.doc.getMap('casino').has(`bets:${TABLE}:${amy}`)).toBe(true); // nothing yet
+    expect(x.casino.readChips(eve)).toBe(90);
     for (const u of rest) Y.applyUpdate(x.doc, u);
     await flush();
     expect(x.doc.getMap('casino').has(`bets:${TABLE}:${amy}`)).toBe(false);
     expect(x.casino.readTableState(TABLE)).toBeNull();
     expect(x.casino.readChips(amy)).toBe(100);
+    expect(x.casino.readChips(eve)).toBe(100); // her earlier build's 10 back
+    // Another page hears the removal too: nothing comes back twice.
+    sync(x, p);
+    p.croupier.closeTable(TABLE, 'heard');
+    await flush();
+    sync(x, p);
+    for (const page of [x, p]) expect(page.casino.readChips(eve)).toBe(100);
   });
 
   it('a removal heard meanwhile is dropped when the table is back in the room by then', async () => {
@@ -531,18 +697,49 @@ describe('a page holding part of another page\'s update', () => {
     expect(x.casino.readChips(amy)).toBe(70);
   });
 
+  it("claims no lease while it holds part of an update: the driver's renewal parked there reads as none", async () => {
+    const y = await loadPage(1); // driving
+    const x = await loadPage(2); // another of the owner's pages
+    const { TABLE_LEASE_RENEW_MS, TABLE_LEASE_SETTLE_MS } = y.croupier;
+    let t = 0;
+    for (; t <= TABLE_LEASE_SETTLE_MS + 500; t += 100) y.croupier.takeTableTurn(t);
+    sync(x, y);
+    for (let u = 0; u <= t; u += 100) expect(x.croupier.takeTableTurn(u)).toBe(false);
+    const [seat, renewal] = updatesOf(y, () => {
+      y.casino.writeMySeat(TABLE, amy, { stand: 0, angle: 0, at: 1 });
+      y.croupier.takeTableTurn(t + TABLE_LEASE_RENEW_MS);
+    });
+    expect(renewal).toBeDefined();
+    Y.applyUpdate(x.doc, renewal);
+    expect(x.casino.readTableOperatorLease()).toBeNull();
+    for (let u = t; u <= t + 2_000; u += 100) expect(x.croupier.takeTableTurn(u)).toBe(false);
+    expect(x.casino.readTableOperatorLease()).toBeNull(); // no claim written
+    Y.applyUpdate(x.doc, seat);
+    sync(x, y);
+    expect(y.casino.readTableOperatorLease()?.page).toBe(y.croupier.ROULETTE_PAGE_ID);
+    expect(y.croupier.takeTableTurn(t + TABLE_LEASE_RENEW_MS + 100)).toBe(true);
+  });
+
   it('the page driving the tables lets them go after a lease\'s lapse', async () => {
-    const { x, rest } = await closeArrivesFirst();
+    const x = await loadPage(1);
+    const p = await loadPage(2);
     const { TABLE_LEASE_LAPSE_MS, TABLE_LEASE_SETTLE_MS } = x.croupier;
     expect(x.croupier.takeTableTurn(0)).toBe(false); // claims
     const beat = (): number => x.casino.readTableOperatorLease()!.beat;
-    // (Its claim counts while the doc is not whole: a page's first frames.)
+    // Driving, then given the second of p's two writes first.
     let driving = false;
     for (let t = 100; t <= TABLE_LEASE_SETTLE_MS + 500; t += 100) driving = x.croupier.takeTableTurn(t) || driving;
     expect(driving).toBe(true);
+    const rest = updatesOf(p, () => {
+      p.casino.writeMySeat(TABLE, amy, { stand: 0, angle: 0, at: 1 });
+      p.casino.writeMySeat(TABLE, amy, { stand: 0, angle: 0, at: 2 });
+    });
+    Y.applyUpdate(x.doc, rest.pop()!);
+    expect(x.casino.casinoWhole()).toBe(false);
     const before = beat();
-    for (let t = TABLE_LEASE_SETTLE_MS + 600; t <= 3 * TABLE_LEASE_LAPSE_MS; t += 100) {
-      expect(x.croupier.takeTableTurn(t) && t >= TABLE_LEASE_LAPSE_MS).toBe(false);
+    const from = TABLE_LEASE_SETTLE_MS + 600;
+    for (let t = from; t <= 3 * TABLE_LEASE_LAPSE_MS; t += 100) {
+      expect(x.croupier.takeTableTurn(t) && t >= from + TABLE_LEASE_LAPSE_MS).toBe(false);
     }
     const renewed = beat() - before;
     expect(renewed).toBeLessThanOrEqual(Math.ceil(TABLE_LEASE_LAPSE_MS / x.croupier.TABLE_LEASE_RENEW_MS));
@@ -652,6 +849,92 @@ describe('a page holding part of another page\'s update', () => {
     await flush();
     expect(x.casino.readTableState(TABLE)).toMatchObject({ phase: 'closing', round: 2 });
     expect(x.casino.readTableBook(TABLE, inc)).toBeNull();
+  });
+});
+
+describe("a page back in the room on the room cache's copy", () => {
+  /** Page x drives round 1 and closes round 2, then leaves (the cache keeps
+   *  its doc, its lease in it); page y takes the tables over and settles
+   *  rounds 2 to 4. Then x comes back, the same page load, on the cache's
+   *  copy, its doc winning ties, the room's state not in yet. */
+  async function backOnTheCache(): Promise<{ x: Page; y: Page; back: Y.Doc; at: number; arrived: { now: boolean } }> {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const t0 = 2_000_000_000;
+    vi.setSystemTime(t0);
+    const x = await loadPage(2);
+    const y = await loadPage(1);
+    x.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    x.casino.buyInChips(amy, 100);
+    for (let t = t0; t <= t0 + 2_000; t += 100) x.croupier.takeTableTurn(t);
+    vi.setSystemTime(t0 + 2_000);
+    await spin(x, 1, { [amy]: red }, 1); // red: 110
+    x.croupier.openBetting(TABLE, 2);
+    x.casino.writeMyBets(TABLE, amy, 2, red);
+    x.croupier.closeBetting(TABLE, x.casino.readTableState(TABLE)!);
+    sync(x, y);
+    const cached = Y.encodeStateAsUpdate(x.doc);
+    let t = t0 + 3_000;
+    for (; t <= t0 + 12_000; t += 100) y.croupier.takeTableTurn(t);
+    vi.setSystemTime(t);
+    expect(y.croupier.takeTableTurn(t)).toBe(true);
+    spinTo(2);
+    y.croupier.rollAndSettle(TABLE, 2);
+    await flush();
+    await spin(y, 3, { [amy]: red }, 2);
+    await spin(y, 4, { [amy]: red }, 2);
+    expect(y.casino.readChips(amy)).toBe(80);
+    const arrived = { now: false };
+    x.croupier.setRoomStateArrivedCheck(() => arrived.now);
+    const back = new Y.Doc();
+    back.clientID = 3;
+    Y.applyUpdate(back, cached);
+    x.casino.bindCasinoDoc(back);
+    return { x, y, back, at: t + 60_000, arrived };
+  }
+
+  /** x's frames from `from` for `ms`; when it drives. */
+  async function frames(x: Page, from: number, ms: number): Promise<number | null> {
+    for (let u = from; u <= from + ms; u += 100) {
+      vi.setSystemTime(u);
+      x.croupier.noteTablesRunning(u);
+      if (x.croupier.takeTableTurn(u)) {
+        spinTo(1);
+        x.croupier.tickAutoCroupier(TABLE);
+        await flush();
+        return u;
+      }
+    }
+    return null;
+  }
+
+  it("drives nothing until the room's state is in, then goes on from it", async () => {
+    try {
+      const { x, y, back, at, arrived } = await backOnTheCache();
+      expect(await frames(x, at, 10_000)).toBeNull();
+      expect(x.croupier.tablesAwake(at + 10_000)).toBe(false);
+      expect(x.casino.tableWritable(TABLE)).toBe(false);
+      // The room's state comes in.
+      Y.applyUpdate(back, Y.encodeStateAsUpdate(y.doc, Y.encodeStateVector(back)));
+      arrived.now = true;
+      expect(x.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', round: 4 });
+      Y.applyUpdate(y.doc, Y.encodeStateAsUpdate(back, Y.encodeStateVector(y.doc)));
+      for (const doc of [back, y.doc]) expect(doc.getMap('casino').get(`table:${TABLE}`)).toMatchObject({ round: 4 });
+      expect(y.casino.readChips(amy)).toBe(80);
+      expect(x.casino.readChips(amy)).toBe(80);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs its tables on the copy it has once it has waited for the room's state long enough", async () => {
+    try {
+      const { x, at } = await backOnTheCache();
+      const drove = await frames(x, at, x.croupier.ROOM_STATE_WAIT_MS + 3_000);
+      expect(drove).not.toBeNull();
+      expect(drove! - at).toBeGreaterThanOrEqual(x.croupier.ROOM_STATE_WAIT_MS);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

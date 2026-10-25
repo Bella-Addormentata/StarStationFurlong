@@ -420,6 +420,29 @@ describe('one operator for the room', () => {
 
 // ── Winding a round down ─────────────────────────────────────────────────────
 
+describe('a doc holding part of an update', () => {
+  it('takes no wager until the rest comes: chips on a felt may read as free there', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    // Another page's two writes elsewhere, the second given first.
+    const other = new Y.Doc();
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    other.getMap('elsewhere').set('a', 1);
+    other.getMap('elsewhere').set('b', 2);
+    Y.applyUpdate(doc, updates[1]);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    expect(spinning(M1)).toBe(false);
+    expect(readChips(PLAYER)).toBe(100);
+    Y.applyUpdate(doc, updates[0]);
+    tickSlotMachineRoom([M1], false, at(ready + 1_000));
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+});
+
 describe('a round on a machine this session no longer operates', () => {
   it('is refunded here when the bankroll changes hands, then the lease goes', async () => {
     fund(M1);

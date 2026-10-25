@@ -161,11 +161,28 @@ function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: st
 let tablesEpoch = -1;
 let tablesRanAt: number | null = null;
 let tablesFrom = 0;
+/** When this page first ran its tables in this room doc. */
+let tablesSince = 0;
 /** How many times this page has woken from not running its tables. */
 let tablesWakes = 0;
+
+/** Has the room's state come in since this page joined it (main.ts wires
+ *  routeRoomReady)? Until it has, the doc may be the room cache's copy from
+ *  before this page left, its own lease in it: tables driven on that copy
+ *  would undo the rounds another page settled meanwhile. Yes with no room
+ *  sync. */
+let roomStateArrived: () => boolean = () => true;
+/** How long a page waits for the room's state before it runs its tables on
+ *  the copy it has (a room whose host never answers): a split then, the doc
+ *  keeping one side's book (casinoDoc THE TABLE'S BOOK). */
+export const ROOM_STATE_WAIT_MS = 30_000;
+
+export function setRoomStateArrivedCheck(check: () => boolean): void {
+  roomStateArrived = check;
+}
 /** A clock gone back by less than this (a time sync's correction) is no
  *  sleep: what this page waits on moves back with it (noteTablesRunning). */
-const TABLE_CLOCK_SLACK_MS = 1_000;
+export const TABLE_CLOCK_SLACK_MS = 1_000;
 
 /**
  * This page is running its tables this frame (World calls it every frame the
@@ -184,7 +201,9 @@ export function noteTablesRunning(now = Date.now()): void {
     tablesEpoch = epoch;
     tablesRanAt = null;
     tablesFrom = 0;
+    tablesSince = now;
   }
+  if (now < tablesSince) tablesSince = now;
   // A clock gone back (a correction as the computer wakes, a manual change)
   // says nothing of how long the page was away: it wakes as from a sleep,
   // its wait a lapse from now, not until the clock comes round again. One
@@ -210,13 +229,17 @@ export function tablesWakeCount(): number {
 }
 
 /** May this page act on its tables now (drive them, settle a round)? Not
- *  while it waits out a lapse after it stopped running them, nor once a
- *  lapse has gone by since it last ran them, or its clock has gone back
- *  since: a settle resuming from its awaits after a sleep, before the
- *  page's next frame. A page that hasn't run them in this doc yet may. */
+ *  before the room's state has come in this visit (for ROOM_STATE_WAIT_MS
+ *  at most), nor while it waits out a lapse after it stopped running them,
+ *  nor once a lapse has gone by since it last ran them, or its clock has
+ *  gone back since: a settle resuming from its awaits after a sleep, before
+ *  the page's next frame. A page that hasn't run them in this doc yet may,
+ *  once the room's state is in. */
 export function tablesAwake(now = Date.now()): boolean {
-  if (tablesRanAt === null || casinoDocEpoch() !== tablesEpoch) return true;
-  return now >= tablesFrom && tablesRanAt - now < TABLE_CLOCK_SLACK_MS && now - tablesRanAt < TABLE_LEASE_LAPSE_MS;
+  const ran = casinoDocEpoch() === tablesEpoch ? tablesRanAt : null;
+  if (!roomStateArrived() && (ran === null || now - tablesSince < ROOM_STATE_WAIT_MS)) return false;
+  if (ran === null) return true;
+  return now >= tablesFrom && ran - now < TABLE_CLOCK_SLACK_MS && now - ran < TABLE_LEASE_LAPSE_MS;
 }
 // Nor does it write a table's book back up meanwhile (casinoDoc tableWritable).
 setTablesAwakeCheck(() => tablesAwake());
@@ -240,9 +263,9 @@ export function takeTableTurn(
   noteTablesRunning(now);
   if (!tablesAwake(now)) return false;
   // 📒 A page whose doc has held part of an update for a lease's lapse
-  // settles nothing (casinoWhole), so it claims and renews nothing either:
-  // another of the owner's pages takes the tables (the room is asked again
-  // meanwhile for what this one is missing).
+  // settles nothing (casinoWhole), so it renews nothing either: another of
+  // the owner's pages takes the tables (the room is asked again meanwhile
+  // for what this one is missing).
   if (casinoWhole()) wholeSince = null;
   else {
     if (wholeSince === null || now < wholeSince) wholeSince = now;
@@ -252,7 +275,9 @@ export function takeTableTurn(
   if (leaseClaimedAt !== null && now < leaseClaimedAt) leaseClaimedAt = now;
   if (now < leaseRenewedAt) leaseRenewedAt = now - TABLE_LEASE_RENEW_MS;
   if (lease?.page !== pageId) {
-    if (!leaseIsFree(lease, now, playerId)) return false;
+    // Nor a fresh claim on a doc holding part of an update at all: the
+    // driver's renewal parked there reads as no lease.
+    if (!casinoWhole() || !leaseIsFree(lease, now, playerId)) return false;
     writeTableOperatorLease({ page: pageId, player: playerId, beat: 1 });
     leaseClaimedAt = now;
     leaseRenewedAt = now;
@@ -389,8 +414,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // Every bettor, and every list that hands back what an earlier build took
   // (one taken all down holds below 0 and isn't among the live bets), and
   // every list taken all down this round (readEmptiedLists), and every
-  // bettor the close named (an RNG round's): its outcome, of nothing, meets
-  // a rival settle's that still saw its last bet.
+  // bettor the close named (an RNG round's): a record of nothing all the
+  // same, so the settle's book names every bettor whose list it saw (the
+  // removal refunds skip what it settled: endCounts, tableEndingStakes).
   const owed: Record<string, number> = {};
   const pids = [
     ...Object.keys(live), ...rewritten, ...Object.keys(readFeltStakes(tableId)), ...readEmptiedLists(tableId, round),

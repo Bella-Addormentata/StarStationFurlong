@@ -12,9 +12,9 @@ vi.stubGlobal('window', { location: { search: '' } });
 
 const {
   bindCasinoDoc, buyInChips, MAX_TABLE_BETTORS, readAllBets, readAllCrapsBets, readChips, readCrapsTableState,
-  readMyBets, readMyCrapsBets, writeCrapsFairnessPref, writeMyBets, writeMyCrapsBets,
+  readMyBets, readMyCrapsBets, readTableBook, readTableState, writeCrapsFairnessPref, writeMyBets, writeMyCrapsBets,
 } = await import('./casinoDoc');
-const { openBetting } = await import('./croupier');
+const { closeBetting, openBetting, rollAndSettle } = await import('./croupier');
 const { closeCrapsBetting, openCrapsBetting, rollAndSettleCraps } = await import('./crapsCroupier');
 
 const players = Array.from({ length: MAX_TABLE_BETTORS + 1 }, (_, i) => `player-${String(i).padStart(2, '0')}`);
@@ -85,5 +85,41 @@ describe('a full table', () => {
     writeMyCrapsBets(t, newcomer, [{ type: 'field', amount: 10 }]);
     expect(readMyCrapsBets(t, newcomer)).toEqual([]);
     expect(readChips(newcomer)).toBe(100);
+  });
+
+  it('a Fair round with no bettor seeds plays every bettor the table took', async () => {
+    const t = 'roulette-full-fair-unseeded';
+    writeCrapsFairnessPref(t, 'multiparty');
+    openBetting(t, 1);
+    for (const pid of players.slice(0, MAX_TABLE_BETTORS)) writeMyBets(t, pid, 1, red);
+    closeBetting(t, readTableState(t)!);
+    rollAndSettle(t, 1);
+    for (let i = 0; i < 40 && readTableState(t)?.phase !== 'settled'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const s = readTableState(t)!;
+    expect(s.phase).toBe('settled');
+    const recs = readTableBook(t, s.inc!)?.recs ?? {};
+    expect(players.slice(0, MAX_TABLE_BETTORS).filter((pid) => !(pid in recs))).toEqual([]);
+    expect(players.slice(0, MAX_TABLE_BETTORS).filter((pid) => readChips(pid) === 100)).toEqual([]);
+  });
+
+  it('craps: a Fair roll with no bettor seeds decides every bettor the table took', async () => {
+    const t = 'craps-full-fair-unseeded';
+    writeCrapsFairnessPref(t, 'multiparty');
+    openCrapsBetting(t, 1, null);
+    for (const pid of players.slice(0, MAX_TABLE_BETTORS)) writeMyCrapsBets(t, pid, [{ type: 'field', amount: 10 }]);
+    closeCrapsBetting(t, readCrapsTableState(t)!);
+    rollAndSettleCraps(t, 1, null);
+    for (let i = 0; i < 40 && readCrapsTableState(t)?.phase !== 'settled'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const s = readCrapsTableState(t)!;
+    expect(s.phase).toBe('settled');
+    expect(s.voided).toBeFalsy();
+    const recs = readTableBook(t, s.inc!)?.recs ?? {};
+    expect(players.slice(0, MAX_TABLE_BETTORS).filter((pid) => !(pid in recs))).toEqual([]);
+    // A field bet is decided by any roll: nobody still has it up.
+    expect(Object.keys(readAllCrapsBets(t))).toEqual([]);
   });
 });

@@ -69,6 +69,15 @@ describe('a lone driving page', () => {
   });
 });
 
+describe('a settle resuming between frames', () => {
+  it('may act after a step back of under a second: a time sync is no sleep', async () => {
+    const a = await loadPage();
+    for (let t = BASE; t <= BASE + 2_000; t += 100) a.croupier.noteTablesRunning(t);
+    expect(a.croupier.tablesAwake(BASE + 1_700)).toBe(true);
+    expect(a.croupier.tablesAwake(BASE + 900)).toBe(false); // a second or more: a wake
+  });
+});
+
 describe("a robot watching another page's SPIN", () => {
   it('takes the abandoned round over though its clock steps back 1 ms every 10 s', async () => {
     const a = await loadPage(1);

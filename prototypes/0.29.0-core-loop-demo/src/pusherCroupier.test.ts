@@ -188,6 +188,29 @@ describe('operateCoinPusher', () => {
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
   });
 
+  it('settles nothing while the doc holds part of an update: the drop waits for the rest', () => {
+    const base = machineWith(60);
+    writeCoinPusherState(MACHINE, base);
+    buyInChips(PLAYER, 3);
+    const seen = currentPusherPhase(base, NOW - 300);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', seen, NOW - 300));
+    // Another page's two writes elsewhere, the second given first.
+    const other = new Y.Doc();
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    other.getMap('elsewhere').set('a', 1);
+    other.getMap('elsewhere').set('b', 2);
+    Y.applyUpdate(doc, updates[1]);
+    operateCoinPusher(MACHINE, OPERATOR, NOW, () => 1234);
+    expect(readCoinPusherState(MACHINE)!.totalInserted).toBe(base.totalInserted);
+    expect(readChips(PLAYER)).toBe(3);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('req-1');
+    Y.applyUpdate(doc, updates[0]);
+    operateCoinPusher(MACHINE, OPERATOR, NOW, () => 1234);
+    expect(readCoinPusherState(MACHINE)!.lastDrop!.requestId).toBe('req-1');
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
+  });
+
   it('a late drop falls at the pusher\'s current phase instead', () => {
     const base = machineWith(20);
     writeCoinPusherState(MACHINE, base);

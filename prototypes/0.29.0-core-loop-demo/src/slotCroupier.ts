@@ -92,6 +92,7 @@ import {
   casinoDocEpoch,
   clearLegacySlotOperatorLease,
   clearSlotMachineKeys,
+  casinoWhole,
   clearSlotOperatorLease,
   clearSlotPlayRequest,
   clearSlotReveal,
@@ -958,6 +959,9 @@ async function accept(
     });
     return;
   }
+  // 📒 Not on a doc holding part of an update: chips on a felt may read as
+  // free there (casinoDoc spendableChips). The request waits for the rest.
+  if (!casinoWhole()) return;
   clearSlotPlayRequest(machineId, request.player);
   requestFirstSeen.delete(machineId);
   const acceptedAt = Date.now();

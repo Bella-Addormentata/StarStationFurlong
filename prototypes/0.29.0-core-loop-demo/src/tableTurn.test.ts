@@ -663,7 +663,7 @@ describe('a craps list an earlier build put down, as the table goes', () => {
     });
   }
 
-  it('what it owes follows the outcome record, heard on its own too', async () => {
+  it("what it owes follows the book's record, heard on its own too", async () => {
     a = await loadPage(2); // the roll wins ties
     b = await loadPage(1);
     await rolledAsRemoved();

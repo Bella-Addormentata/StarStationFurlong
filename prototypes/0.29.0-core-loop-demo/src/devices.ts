@@ -182,7 +182,7 @@ import {
   readSlotMachineState, readSlotOddsConfig, readSlotReveal,
   writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
-  depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
+  depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig, casinoWhole,
   // 🪙 Coin pusher (#135) — the player's and owner's request keys; the
   // operator (pusherCroupier.ts) moves the chips.
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
@@ -5653,8 +5653,10 @@ export function createSlotMachineUI(
       ? depositSlotFunding(deps.itemId, myId, 100)
       : withdrawSlotFunding(deps.itemId, myId, 100);
     if (!ok) {
+      // (A deposit waits for a doc holding every update whole: casinoDoc
+      // spendableChips.)
       flash = direction === 'deposit'
-        ? 'DEPOSIT NEEDS 100 OWNER CHIPS'
+        ? (casinoWhole() ? 'DEPOSIT NEEDS 100 OWNER CHIPS' : 'RECONNECTING — PRESS AGAIN IN A MOMENT')
         : 'WITHDRAW NEEDS 100 BANKROLL CHIPS';
       render();
     }

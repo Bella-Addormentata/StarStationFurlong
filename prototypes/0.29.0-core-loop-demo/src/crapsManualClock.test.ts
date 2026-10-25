@@ -4,7 +4,9 @@
  * does once the turn's deadline comes, a deadline this page wrote on its own
  * clock: one further off than the whole turn is cut back to it
  * (timerOnThisClock), so the throw comes a window (and a wake) after the
- * step, not when the clock comes round.
+ * step, not when the clock comes round. And the wait for this page's stamp
+ * as operator to reach the room: a step back of under a second (no wake)
+ * takes the stamp back with it, so the wait runs its whole length.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -16,7 +18,7 @@ const {
   bindCasinoDoc, buyInChips, readCrapsTableState, readDiceThrow, writeMyCrapsBets, writeMySeat,
 } = await import('./casinoDoc');
 const { setSoleCroupierPredicate, noteTablesRunning, TABLE_LEASE_LAPSE_MS } = await import('./croupier');
-const { CRAPS_SHOOTER_MS, pressManualRoll, tickManualCraps } = await import('./crapsCroupier');
+const { CRAPS_SHOOTER_MS, MANUAL_TAKEOVER_SETTLE_MS, pressManualRoll, tickManualCraps } = await import('./crapsCroupier');
 const { FURNITURE_DEFS } = await import('./furniture');
 
 const T0 = 2_000_000_000;
@@ -103,4 +105,24 @@ describe("a manual shooter's window on the operator page", () => {
     expect(threwAt).toBeGreaterThan(0);
     expect(threwAt).toBeLessThanOrEqual(CRAPS_SHOOTER_MS + TABLE_LEASE_LAPSE_MS + 200);
   });
+});
+
+describe('ROLL pressed again while the stamp reaches the room (the stickman throws once it has)', () => {
+  for (const [what, step] of [['a steady clock (control)', 0], ['a clock that steps back 300 ms', 300]] as const) {
+    it(`(${what}) waits the stamp's whole wait before the throw`, () => {
+      const t = freshTable();
+      expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/);
+      writeMyCrapsBets(t, BOB, [{ type: 'field', amount: 5 }]);
+      frame(t, T0 + 100);
+      expect(pressManualRoll(t, at(T0 + 200))).toBeNull(); // closes, stamps this page
+      expect(readCrapsTableState(t)?.phase).toBe('closing');
+      expect(pressManualRoll(t, at(T0 + 250))).toBeNull(); // again: throw once converged
+      let threwAfter = -1;
+      for (let real = T0 + 300; real <= T0 + 5_000 && threwAfter < 0; real += 50) {
+        frame(t, real - step); // the step comes 100 ms after the close
+        if (readDiceThrow(t)?.by === 'stickman') threwAfter = real - (T0 + 200);
+      }
+      expect(threwAfter).toBeGreaterThanOrEqual(MANUAL_TAKEOVER_SETTLE_MS);
+    });
+  }
 });

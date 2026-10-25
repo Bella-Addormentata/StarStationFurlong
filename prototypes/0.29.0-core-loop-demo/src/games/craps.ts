@@ -16,12 +16,13 @@
  * (pass waiting on its point, place bets working) ride to the next roll. The
  * stickman prunes each player's list at settle using resolveCrapsRound.
  *
- * Payout convention (stakes are DEDUCTED at placement, like roulette):
+ * Payout convention (stakes held on the felt until the settle, which sets
+ * what is returned against them, like roulette):
  *   `credited` = chips RETURNED to the player for this bet right now.
  *   - A one-and-done win returns stake + winnings (e.g. even money → amount*2).
  *   - A PLACE bet that hits stays working, so only the WINNINGS are credited
  *     (the stake is still on the felt) and keep=true.
- *   - A loss credits 0 (the chips are already gone) and keep=false.
+ *   - A loss credits 0 (the settle charges what the bet held) and keep=false.
  *   - A standing bet with no decision credits 0 and keep=true.
  */
 
@@ -59,7 +60,7 @@ export interface CrapsBet {
    *  comeodds / dontcomeodds: the come point they back (required). Absent for
    *  every other bet — passodds / dontpassodds always back the table's point. */
   pick?: number;
-  /** Chips staked (already deducted from the bettor's balance). */
+  /** Chips staked (held on the felt by the bettor's list until a decision). */
   amount: number;
 }
 

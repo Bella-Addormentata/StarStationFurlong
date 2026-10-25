@@ -126,11 +126,10 @@ class LocalCrapsBackend implements CrapsBackend {
         // written as it settled came back over it, or the doc kept another
         // page's book: the roll stands as the book has it, put back up.
         if (putTableBack(tableId)) return null;
+        // (Nothing here waits: the state is the one this settle started on,
+        // the roll path's swap check below has no part here.)
         const before = readCrapsTableState(tableId);
         if (before?.phase !== 'closing' || before.round !== round) return null;
-        // Only the very opening it started on (not the other side's of that
-        // roll, which the doc kept while this one waited).
-        if (before.bk !== closing.bk) return null;
         if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return null;
         if (before.operator === undefined && !stillDrivesTables()) return null;
         if (!tablesAwake()) return null;
@@ -225,7 +224,8 @@ class LocalCrapsBackend implements CrapsBackend {
     for (const pid of forfeited) remaining[pid] = [];
     // A list taken all down for this roll is written up too, as nothing, and
     // so is a bettor the close named whose list this page hasn't (an RNG
-    // roll's): a rival page settling the roll may have seen their last bet.
+    // roll's): the settle's book names every bettor whose list it saw (the
+    // removal refunds skip what it settled: endCounts, tableEndingStakes).
     for (const pid of [...readEmptiedLists(tableId, round), ...(before.bettors ?? [])]) remaining[pid] ??= [];
     // A list rewritten (or emptied) since the close loses what it held then.
     const held = heldBy(tableId, before, Object.keys(remaining));

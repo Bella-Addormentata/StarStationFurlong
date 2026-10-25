@@ -8,9 +8,9 @@
  * and the G5 commit-reveal fairness upgrade slots in around it untouched.
  *
  * Payout convention: payoutFor returns the TOTAL RETURNED for a winning bet
- * (stake included), because stakes are DEDUCTED at placement time (the
- * player's client spends chips when the chip hits the felt). A losing bet
- * returns 0 — the chips are already gone.
+ * (stake included). The stake is held on the felt by the bettor's list until
+ * the settle (casinoDoc STAKES ON THE FELT), which sets what is returned
+ * against it: a losing bet returns 0, and the settle charges what it held.
  */
 
 import { isFairnessTranscript, isSeedRoundFields, isTableBookField, isTableIncField, MAX_BET_AMOUNT } from './craps';
@@ -38,7 +38,7 @@ export interface RouletteBet {
   type: RouletteBetType;
   /** straight: the number 0–36; dozen/column: 0/1/2; others: absent. */
   pick?: number;
-  /** Chips staked (already deducted from the bettor's balance). */
+  /** Chips staked (held on the felt by the bettor's list until the settle). */
   amount: number;
 }
 

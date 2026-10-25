@@ -3,8 +3,8 @@
  * tableIncOf, clearTableKeys): an earlier build's table, which has none,
  * taking one as this build drives it while another page removes it; a page
  * that hears of a removal late; removals that marked nothing (an earlier
- * build's teardown, or a page that saw no round); and what a kept record
- * left by a removal owes, heard by listeners. Each page is its own copy of
+ * build's teardown, or a page that saw no round); and what the book's kept
+ * bets left by a removal owe, heard by listeners. Each page is its own copy of
  * the modules over its own doc, synced by hand like two peers.
  */
 
@@ -542,7 +542,7 @@ describe('removals that marked nothing', () => {
       await flush();
       expect(a.casino.readChips(bettor)).toBe(110);
       // The owner's stale tab on the earlier build removed the table while no
-      // page of this build was in the room: its outcome records are all that's left.
+      // page of this build was in the room: its book is all that's left.
       earlierBuildTeardown(a, TABLE);
       sync(a.doc, b.doc);
       // Put back: the driver opens round 1 past the name those records hold,
@@ -654,7 +654,7 @@ describe('removals that marked nothing', () => {
       expect(b.casino.readChips(bettor)).toBe(100);
     });
 
-    it('names a table put back anew when only its outcome records are left (no page of this build heard it go)', async () => {
+    it('names a table put back anew when only its book is left (no page of this build heard it go)', async () => {
       spinTo(1); // red
       a.casino.writeCrapsFairnessPref(TABLE, 'rng');
       a.casino.buyInChips(bettor, 100);
@@ -839,7 +839,7 @@ describe('what a removal leaves owed', () => {
     }
   });
 
-  describe('an outcome record past what a number holds exactly', () => {
+  describe('a book record past what a number holds exactly', () => {
     for (const [winner, clientA, clientB] of [['the roll', 2, 1], ['the removal', 1, 2]] as const) {
       it(`a roll settled as the table goes still hands back once (${winner} winning ties)`, async () => {
         a = await loadPage(clientA);
@@ -966,7 +966,7 @@ describe('what a removal leaves owed', () => {
   });
 });
 
-describe('listeners hear what a kept record owes', () => {
+describe("listeners hear what the book's kept bets owe", () => {
   const bettor = 'player-Carol';
   const craps = 'craps-1';
 
@@ -1017,7 +1017,7 @@ describe('listeners hear what a kept record owes', () => {
     b.craps.closeCrapsTable(craps);
   }
 
-  describe('recount: listeners hear what a kept record owes', () => {
+  describe("recount: listeners hear what the book's kept bets owe", () => {
     for (const [winner, clientA, clientB, earlierTable] of [
       ['the roll', 2, 1, false], ['the removal', 1, 2, false],
       ['the roll, earlier table', 2, 1, true], ['the removal, earlier table', 1, 2, true],
@@ -1066,7 +1066,7 @@ describe('listeners hear what a kept record owes', () => {
       expect(wa.calls).toBeGreaterThanOrEqual(callsBefore);
     });
 
-    it('a page rebound to a doc that holds a kept record owing reads it and repaints', async () => {
+    it("a page rebound to a doc whose book's kept bets owe reads it and repaints", async () => {
       a = await loadPage(2);
       b = await loadPage(1);
       await rolledAsRemoved();
@@ -1179,7 +1179,7 @@ describe('a held change heard through the chips map alone', () => {
     await flush();
     b.craps.closeCrapsTable(craps, 'local');
     sync(a.doc, b.doc);
-    expect(a.casino.readChips(bettor)).toBe(100); // the kept record owes the 10
+    expect(a.casino.readChips(bettor)).toBe(100); // the book's kept bets owe the 10
     const { inc } = onlyBook(a, craps);
     let calls = 0;
     let read: number | null = null;
@@ -1210,7 +1210,7 @@ describe('tables whose ids begin with one another', () => {
     expect(a.casino.readMyBets('roulette-1', bettor, 1)).toEqual([{ type: 'red', amount: 20 }]);
   });
 
-  it("and a removed one's kept record on its own, when the shorter id was removed too", async () => {
+  it("and a removed one's book's kept bets on their own, when the shorter id was removed too", async () => {
     a = await loadPage(2); // the roll wins ties
     b = await loadPage(1);
     const craps = 'craps-1:2';
@@ -1229,7 +1229,7 @@ describe('tables whose ids begin with one another', () => {
     b.craps.closeCrapsTable(craps, 'local');
     sync(a.doc, b.doc);
     expect(onlyBook(a, craps).book.kept[bettor]).toMatchObject({ taken: 10 });
-    expect(a.casino.readChips(bettor)).toBe(100); // the kept record owes the 10
+    expect(a.casino.readChips(bettor)).toBe(100); // the book's kept bets owe the 10
     expect(b.casino.readChips(bettor)).toBe(100);
   });
 });

@@ -92,6 +92,7 @@ import {
   drainAndClearCoinPusher,
   isCoinPusherRecordUnreadable,
   readChips,
+  casinoWhole,
   readCoinPusherEmptyRequest,
   readCoinPusherOperatorLease,
   readCoinPusherRequestArrival,
@@ -438,6 +439,9 @@ export function operateCoinPusher(
     if (!state) return;
   }
 
+  // 📒 Not on a doc holding part of an update: chips on a felt may read as
+  // free there (casinoDoc spendableChips). The requests wait for the rest.
+  if (!casinoWhole()) return;
   // A batch of the first to arrive is settled or refused, each aged from its
   // arrival in this page's doc (CLOCKS): the index stamps every request as it
   // arrives, so one deep in a flood's queue is aged from then too, not from

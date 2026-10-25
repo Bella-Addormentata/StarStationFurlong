@@ -197,8 +197,12 @@ describe('rebinding', () => {
     fresh.getMap('casino').delete(`bets:${TABLE}:${bettor}`);
     a.casino.bindCasinoDoc(fresh);
     expect(seen.reads.at(-1)).toBe(100);
-    // the old doc changing a list must not change what the bound doc reads
-    a.doc.getMap('casino').set(`bets:${TABLE}:${bettor}`, { round: 1, held: [{ type: 'red', amount: 50 }], inc: a.doc.getMap('casino').get(`table:${TABLE}`) && (a.doc.getMap('casino').get(`table:${TABLE}`) as { inc: string }).inc });
+    // the old doc changing a list (as writeMyBets writes one, so it would
+    // hold there) must not change what the bound doc reads
+    const state = a.doc.getMap('casino').get(`table:${TABLE}`) as { inc: string; bk: string };
+    a.doc.getMap('casino').set(`bets:${TABLE}:${bettor}`, {
+      round: 1, held: [{ type: 'red', amount: 50 }], inc: state.inc, bk: state.bk,
+    });
     expect(a.casino.readChips(bettor)).toBe(100);
   });
 });
