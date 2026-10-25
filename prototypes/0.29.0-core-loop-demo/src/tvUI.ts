@@ -28,9 +28,9 @@
  */
 
 import {
-  formatClock, isStartOnly, parseTvSource, readLibrary, readPlayback, readRemote, readTv, remoteLapsed, sanitizeSource, sourceId, TV_MAX_TITLE,
+  formatClock, isStartOnly, parseTvSource, readCrt, readLibrary, readPlayback, readRemote, readTv, remoteLapsed, sanitizeSource, sourceId, TV_MAX_TITLE,
   sourceLabel, sourceLane, subscribeTv, tvDocEpoch, tvPause, tvPlay,
-  tvResume, tvRevision, tvSchedule, tvSeek, tvSetLoop, tvSetVolume, tvStop, tvTogglePower,
+  tvResume, tvRevision, tvSchedule, tvSeek, tvSetCrt, tvSetLoop, tvSetVolume, tvStop, tvTogglePower,
 } from './tvDoc';
 import type { TvHistoryEntry, TvLibraryEntry, TvSource, TvTorrentOrigin } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
@@ -40,7 +40,7 @@ import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './s
 import { isFlightKey } from './freeFlightStick';
 import { readyForRoom } from './tvShrink';
 import { autoFetchOn, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX } from './tvAutoFetch';
-import { focusTvEmbed, reloadTvPicture, subscribeTvTheatre, tvTheatreNotice } from './tvTheatre';
+import { focusTvEmbed, playsAsTexture, reloadTvPicture, subscribeTvTheatre, tvTheatreNotice } from './tvTheatre';
 import { irBlink } from './irBlaster';
 import { tvMenu, tvMenuCellAt, tvMenuMove, tvMenuStep } from './tvMenu';
 import type { TvMenuDir, TvMenuView, TvPausedCell } from './tvMenu';
@@ -618,6 +618,9 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
   const canPause = showing && !startOnly && moving;
   const canVolume = on && !startOnly;
   const lane = showing && rec.source ? laneBadge(sourceLane(rec.source)) : '';
+  // 📺 LOOK: only a film the set's own screen draws (a picture laid over
+  // the set in the DOM is out of the CRT pass's reach).
+  const looks = showing && rec.source !== null && playsAsTexture(rec.source);
   // The set's own menu, when it is up (stopped or paused): the arrows move
   // its highlight for the whole room, and OK picks what is under it.
   const menu = on ? tvMenu(tv.id) : null;
@@ -660,6 +663,7 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
         ${irKey(`data-tv-play-pause="${id}" title="${pb.state === 'paused' ? 'Play' : 'Pause'}"`, pb.state === 'paused' ? '▶ PLAY' : '⏸ PAUSE', canPause)}
         ${irKey(`data-tv-stop="${id}" title="Back to the home screen"`, '⏹ STOP', showing)}
         ${startOnly ? '' : irKey(`data-tv-loop="${id}" aria-pressed="${rec.loop}" title="At the end, start the film over (stays on for the next one)"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF')}
+        ${looks ? irKey(`data-tv-look="${id}" aria-pressed="${readCrt(tv.id)}" title="The set's picture for the room: the arcade's CRT look, or the film as it is"`, readCrt(tv.id) ? '📺 LOOK: CRT' : '📺 LOOK: CLEAN') : ''}
         ${showing && rec.source?.kind === 'blob' ? irKey(`data-tv-autofetch="1" aria-pressed="${autoFetchOn()}" title="Your own switch: take a file shown on a TV without a press, up to ${esc(formatBytes(TV_AUTO_FETCH_MAX))} a file and ${esc(formatBytes(TV_AUTO_FETCH_DAY))} a day"`, autoFetchOn() ? '📦 AUTO-FETCH: ON' : '📦 AUTO-FETCH: OFF') : ''}
         ${startOnly && showing ? irKey(`data-tv-reload="${id}" title="archive.org's player did not load? Reload it"`, '↻ RELOAD') : ''}
         ${startOnly && showing ? irKey(`data-tv-embed-keys="${id}" title="Into archive.org's player, for its volume and controls: Tab moves through them, and Tab past the last comes back here"`, '🎛 ITS CONTROLS') : ''}
@@ -1022,6 +1026,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-loop]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvLoop!;
     tvSetLoop(id, !readTv(id).loop);
+  }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-look]').forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.tvLook!;
+    tvSetCrt(id, !readCrt(id));
   }));
   // Every viewer's own switch, for a file from a member's node: no write.
   host.querySelector<HTMLButtonElement>('[data-tv-autofetch]')?.addEventListener('click', () => {

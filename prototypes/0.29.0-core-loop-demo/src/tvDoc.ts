@@ -678,6 +678,9 @@ export function volumeKey(itemId: string): string {
 export function powerKey(itemId: string): string {
   return `power:${itemId}`;
 }
+export function lookKey(itemId: string): string {
+  return `look:${itemId}`;
+}
 export function beatKey(itemId: string): string {
   return `beat:${itemId}`;
 }
@@ -862,6 +865,14 @@ export function readVolume(itemId: string): number {
   const raw = ensureMap().get(volumeKey(itemId)) as { volume?: unknown } | undefined;
   const v = raw && typeof raw === 'object' ? num(raw.volume, TV_DEFAULT.volume) : TV_DEFAULT.volume;
   return Math.min(100, Math.max(0, Math.round(v)));
+}
+
+/** 📺 The set's LOOK switch, from its own key: the CRT look (arcadeCrt.ts)
+ *  unless someone picked CLEAN. Anything but an explicit `crt: false` —
+ *  absent, a peer's garbage — is the CRT look, the set's default. */
+export function readCrt(itemId: string): boolean {
+  const raw = ensureMap().get(lookKey(itemId)) as { crt?: unknown } | undefined;
+  return !(raw && typeof raw === 'object' && raw.crt === false);
 }
 
 /** The set's switch, from its own key; off until someone turns it on. */
@@ -1424,6 +1435,12 @@ export function tvSetVolume(itemId: string, volume: number): void {
   write(volumeKey(itemId), { volume: Math.min(100, Math.max(0, v)) });
 }
 
+/** LOOK on the set: the CRT look or CLEAN. A body button anyone in the room
+ *  may press, like VOLUME, on its own key for the same reason. */
+export function tvSetCrt(itemId: string, crt: boolean): void {
+  write(lookKey(itemId), { crt });
+}
+
 // ── Sync maths (pure) ────────────────────────────────────────────────────────
 
 export interface PlaybackNow {
@@ -1747,6 +1764,9 @@ export interface TvScreenView {
    *  World adds it from tvTheatreHint; the set draws it where the picture
    *  is not up. */
   ask?: string;
+  /** Playing or paused with the set's LOOK on CLEAN: the film as it is,
+   *  without the CRT look (readCrt). */
+  clean?: true;
 }
 
 /** Derive what the in-world screen shows from the records alone, so every
@@ -1767,10 +1787,11 @@ export function tvScreenView(itemId: string, now = clock()): TvScreenView {
   if (pb.state === 'scheduled') {
     return { state: 'scheduled', title: label, detail: countdownText(pb.countdownMs), lane, clockText: '' };
   }
+  const clean = readCrt(itemId) ? {} : { clean: true as const };
   const detail = (parts: string[]) => parts.filter(Boolean).join(' · ');
   const loop = rec.loop ? 'LOOP' : '';
   if (pb.state === 'paused') {
-    return { state: 'paused', title: label, detail: detail(['PAUSED', loop, holderLine]), lane, clockText: formatClock(pb.positionMs) };
+    return { state: 'paused', title: label, detail: detail(['PAUSED', loop, holderLine]), lane, clockText: formatClock(pb.positionMs), ...clean };
   }
-  return { state: 'playing', title: label, detail: detail([loop, holderLine]), lane, clockText: formatClock(pb.positionMs) };
+  return { state: 'playing', title: label, detail: detail([loop, holderLine]), lane, clockText: formatClock(pb.positionMs), ...clean };
 }
