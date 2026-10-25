@@ -16,12 +16,13 @@
  * (pass waiting on its point, place bets working) ride to the next roll. The
  * stickman prunes each player's list at settle using resolveCrapsRound.
  *
- * Payout convention (stakes are DEDUCTED at placement, like roulette):
+ * Payout convention (stakes held on the felt until the settle, which sets
+ * what is returned against them, like roulette):
  *   `credited` = chips RETURNED to the player for this bet right now.
  *   - A one-and-done win returns stake + winnings (e.g. even money → amount*2).
  *   - A PLACE bet that hits stays working, so only the WINNINGS are credited
  *     (the stake is still on the felt) and keep=true.
- *   - A loss credits 0 (the chips are already gone) and keep=false.
+ *   - A loss credits 0 (the settle charges what the bet held) and keep=false.
  *   - A standing bet with no decision credits 0 and keep=true.
  */
 
@@ -59,7 +60,7 @@ export interface CrapsBet {
    *  comeodds / dontcomeodds: the come point they back (required). Absent for
    *  every other bet — passodds / dontpassodds always back the table's point. */
   pick?: number;
-  /** Chips staked (already deducted from the bettor's balance). */
+  /** Chips staked (held on the felt by the bettor's list until a decision). */
   amount: number;
 }
 
@@ -113,12 +114,20 @@ export interface CrapsTableState {
   /** 🎲 #226: who shot the hand that just ended (a seven-out) — the dice go
    *  clockwise from them to the next shooter. Absent ⇒ start anywhere. */
   lastShooter?: string;
+  /** 🧾 This table's incarnation (casinoDoc tableIncFor), kept roll to roll:
+   *  a table set up again under the same id pays its own rolls. */
+  inc?: string;
+  /** 📒 The write of the table's book this state goes on from (casinoDoc
+   *  writeSettledState), kept roll to roll. */
+  bk?: string;
   /** ⚖️ This round's seed commitments (see SeedRoundFields). */
   houseCommit?: string;
   commits?: Record<string, string>;
   unseeded?: string[];
   wagers?: Record<string, string>;
   sigs?: Record<string, string>;
+  stakes?: Record<string, number>;
+  bettors?: string[];
   /** ⚖️ The fairness mode locked in when this window opened; the settle uses
    *  it, so an owner's switch mid-window applies from the next one. */
   fairMode?: FairnessMode;
@@ -202,6 +211,13 @@ export interface SeedRoundFields {
   /** Each frozen bettor's signature over its commitment (its identity key,
    *  players[pid].keyB64): nobody else can put a seed in under its name. */
   sigs?: Record<string, string>;
+  /** 🪙 The chips each frozen bettor's list held on the felt at "no more
+   *  bets" (0 for an earlier build's list, whose chips were taken): what the
+   *  settle takes, whatever the list says by then. */
+  stakes?: Record<string, number>;
+  /** A round without the exchange (RNG): the players with chips down at "no
+   *  more bets", the only ones its settle writes up. */
+  bettors?: string[];
 }
 
 function isPidMap(v: unknown, max: number): boolean {
@@ -212,6 +228,16 @@ function isPidMap(v: unknown, max: number): boolean {
       && typeof c === 'string' && c.length <= FAIRNESS_MAX_STRING);
 }
 
+/** Chips per player, either sign (a stake held on the felt can be below 0:
+ *  casinoDoc FeltStake), never past what one list can hold. */
+function isPidStakeMap(v: unknown, max: number): boolean {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const entries = Object.entries(v);
+  return entries.length <= max
+    && entries.every(([pid, n]) => pid.length > 0 && pid.length <= 128 && Number.isSafeInteger(n)
+      && Math.abs(n as number) <= MAX_BETS_PER_PLAYER * MAX_BET_AMOUNT);
+}
+
 /** Shape guard for the peer-written seed fields (bounded like transcripts). */
 export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.houseCommit !== undefined
@@ -219,6 +245,9 @@ export function isSeedRoundFields(s: SeedRoundFields): boolean {
   if (s.unseeded !== undefined && !(isBoundedStringArray(s.unseeded) && s.unseeded.length <= FAIRNESS_MAX_PARTIES)) return false;
   if (s.wagers !== undefined && !isPidMap(s.wagers, 2 * FAIRNESS_MAX_PARTIES)) return false;
   if (s.sigs !== undefined && !isPidMap(s.sigs, FAIRNESS_MAX_PARTIES - 1)) return false;
+  if (s.stakes !== undefined && !isPidStakeMap(s.stakes, 2 * FAIRNESS_MAX_PARTIES)) return false;
+  if (s.bettors !== undefined && !(Array.isArray(s.bettors) && s.bettors.length <= 2 * FAIRNESS_MAX_PARTIES
+    && s.bettors.every((pid) => typeof pid === 'string' && pid.length > 0 && pid.length <= 128))) return false;
   return s.commits === undefined || isPidMap(s.commits, FAIRNESS_MAX_PARTIES - 1);
 }
 
@@ -236,11 +265,19 @@ const BET_TYPES: readonly string[] = [
 ];
 
 /** Shape guard — bets cross the room-doc trust boundary (peer writes). */
+/** The most chips one bet record holds, and the most records one player's
+ *  list holds (the felt puts down one chip a record, 1000 at most, and 400
+ *  records a player). At the best odds on either table (36 for 1) a list's
+ *  return stays far inside the safe-integer range, so no funded wager can
+ *  win more than the chip ledger can pay. A list past either reads as no bets. */
+export const MAX_BET_AMOUNT = 1_000_000_000;
+export const MAX_BETS_PER_PLAYER = 1_000;
+
 export function isCrapsBet(value: unknown): value is CrapsBet {
   if (typeof value !== 'object' || value === null) return false;
   const b = value as Partial<CrapsBet>;
   if (typeof b.type !== 'string' || !BET_TYPES.includes(b.type)) return false;
-  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0) return false;
+  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0 || (b.amount as number) > MAX_BET_AMOUNT) return false;
   if (b.type === 'place') {
     return Number.isInteger(b.pick) && POINT_NUMBERS.has(b.pick as number);
   }
@@ -260,6 +297,16 @@ export function isCrapsBet(value: unknown): value is CrapsBet {
 /** A player id as it may appear in a peer-written table record. */
 function isPlayerIdField(v: unknown): boolean {
   return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 128);
+}
+
+/** A table state's incarnation (`inc`), when it has one. */
+export function isTableIncField(v: unknown): boolean {
+  return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 32);
+}
+
+/** A table state's `bk` (casinoDoc writeSettledState): none, or a book write's id. */
+export function isTableBookField(v: unknown): boolean {
+  return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 64);
 }
 
 function isDicePair(value: unknown): value is [number, number] {
@@ -297,6 +344,8 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && isPlayerIdField(s.shooter)
     && isPlayerIdField(s.lastShooter)
     && isPlayerIdField(s.operator)
+    && isTableIncField(s.inc)
+    && isTableBookField(s.bk)
     && isSeedRoundFields(s)
     && (s.fairMode === undefined || FAIRNESS_MODES.includes(s.fairMode));
 }

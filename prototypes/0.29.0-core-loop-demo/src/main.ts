@@ -261,7 +261,7 @@ import {
   towHoldsDock,
 } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
-import { setSoleCroupierPredicate } from "./croupier";
+import { setRoomStateArrivedCheck, setSoleCroupierPredicate, setTableInRoomPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
@@ -2135,7 +2135,7 @@ async function joinRoomAtEpoch(
 
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
   // table state. Rebinds per join like games/furniture (T0 seam).
-  bindCasinoDoc(sync.doc, boot.roomId);
+  bindCasinoDoc(sync.doc, boot.roomId, () => sync.resync());
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);
@@ -10655,6 +10655,13 @@ async function init() {
     if (owner === "Local-Clone") return false;
     return currentRoomDeedIsMine();
   });
+  // 📒 A table removal heard while the casino doc holds part of an update
+  // waits for the rest, unless the table is back in the room by then.
+  setTableInRoomPredicate((tableId) => FURNITURE.some((item) => item.id === tableId));
+  // 🛰️ Nor are the tables run on a doc the room's state hasn't reached this
+  // visit: it may be the room cache's copy from before this page left, its
+  // own table lease in it (croupier tablesAwake).
+  setRoomStateArrivedCheck(() => !yjsSync || roomStateArrivedNow());
 
   // 🔧 #192: the same one deed holder takes a module apart (its Disassemble
   // job's pick and its end), since a module off the station can't be put back.

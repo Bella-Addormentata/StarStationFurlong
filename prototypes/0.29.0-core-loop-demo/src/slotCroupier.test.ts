@@ -14,11 +14,14 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  creditChips,
   depositSlotFunding,
+  drainSlotMachineFunding,
   hasSlotEscrow,
   LEGACY_SLOT_LEASE_READ_CAP,
   readChips,
   readLegacySlotOperatorMachineIds,
+  readSlotFundingBalance,
   readSlotFundingConfig,
   readSlotMachineState,
   readSlotOperatorLease,
@@ -30,12 +33,13 @@ import {
   SLOT_OPERATOR_KEY,
   writeSlotFundingConfig,
   writeSlotMachineState,
+  writeSlotOddsConfig,
   writeSlotOperatorLease,
   writeSlotPlayRequest,
   writeSlotReveal,
 } from './casinoDoc';
 import type { SlotOperatorLease } from './casinoDoc';
-import { setSoleCroupierPredicate } from './croupier';
+import { ROOM_STATE_WAIT_MS, setRoomStateArrivedCheck, setSoleCroupierPredicate } from './croupier';
 import {
   commitSlotSeed,
   DEFAULT_PAYTABLE,
@@ -45,7 +49,7 @@ import {
   randomSlotSeed,
   SLOT_SPIN_MS,
 } from './games/slots';
-import type { SlotFundingConfig } from './games/slots';
+import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
 import { getPlayerId } from './identity';
 import {
   closeSlotMachine,
@@ -94,7 +98,12 @@ function fund(machineId: string, owner = OPERATOR): void {
 
 /** The player's spin request, as their panel writes it; returns the seed the
  *  panel will reveal. */
-async function requestSpin(machineId: string, player = PLAYER, requestId = `req-${machineId}`): Promise<string> {
+async function requestSpin(
+  machineId: string,
+  player = PLAYER,
+  requestId = `req-${machineId}`,
+  paytable: readonly SlotPayEntry[] = DEFAULT_PAYTABLE,
+): Promise<string> {
   const seed = randomSlotSeed();
   writeSlotPlayRequest(machineId, {
     requestId,
@@ -102,7 +111,7 @@ async function requestSpin(machineId: string, player = PLAYER, requestId = `req-
     bet: BET,
     requestedAt: Date.now(),
     playerCommit: await commitSlotSeed(seed),
-    paytableHash: await hashSlotPaytable(DEFAULT_PAYTABLE),
+    paytableHash: await hashSlotPaytable(paytable),
   });
   return seed;
 }
@@ -417,6 +426,200 @@ describe('one operator for the room', () => {
 
 // ── Winding a round down ─────────────────────────────────────────────────────
 
+describe('a doc holding part of an update', () => {
+  /** Another page's two writes elsewhere, the second given to the doc first.
+   *  Returns the rest. */
+  function partOfAnUpdate(): Uint8Array {
+    const other = new Y.Doc();
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    other.getMap('elsewhere').set('a', 1);
+    other.getMap('elsewhere').set('b', 2);
+    Y.applyUpdate(doc, updates[1]);
+    return updates[0];
+  }
+
+  it('takes no lease until the rest comes: a renewal parked there would read as none', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const rest = partOfAnUpdate();
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(spinning(M1)).toBe(false);
+    Y.applyUpdate(doc, rest);
+    becomeOperator([M1], ready + 1_000);
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
+  it('tears down no machine whose stake reads as gone there, and refunds the stake once the rest comes', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    expect(readChips(PLAYER)).toBe(100 - BET);
+    // Another page rewrites the stake just after a write this page has yet
+    // to get, and this page gets the rewrite first.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    other.getMap('elsewhere').set('a', 1);
+    const key = `slot-escrow:${M1}`;
+    other.getMap('casino').set(key, other.getMap('casino').get(key));
+    Y.applyUpdate(doc, updates[1]);
+    expect(hasSlotEscrow(M1)).toBe(false);
+    closeSlotMachine(M1, true);
+    tickSlotMachineRoom([], false, at(ready + 100));
+    await acceptsDone();
+    Y.applyUpdate(doc, updates[0]);
+    tickSlotMachineRoom([], false, at(ready + 200));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toBeNull();
+    expect(hasSlotEscrow(M1)).toBe(false);
+    expect(readChips(PLAYER)).toBe(100);
+  });
+
+  it('refunds the stake of a machine whose teardown was under way when its stake read as gone, once the rest comes', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    expect(readChips(PLAYER)).toBe(100 - BET);
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    other.getMap('elsewhere').set('a', 1);
+    const key = `slot-escrow:${M1}`;
+    other.getMap('casino').set(key, other.getMap('casino').get(key));
+    closeSlotMachine(M1, true);
+    // The rewrite comes in while the teardown awaits, after its start saw a
+    // whole doc.
+    queueMicrotask(() => Y.applyUpdate(doc, updates[1]));
+    tickSlotMachineRoom([], false, at(ready + 100));
+    await acceptsDone();
+    expect(hasSlotEscrow(M1)).toBe(false);
+    Y.applyUpdate(doc, updates[0]);
+    expect(hasSlotEscrow(M1)).toBe(true);
+    tickSlotMachineRoom([], false, at(ready + 200));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toBeNull();
+    expect(hasSlotEscrow(M1)).toBe(false);
+    expect(readChips(PLAYER)).toBe(100);
+  });
+
+  // A wind-down's refund that finds the doc holding part of an update (it
+  // came in while the refund awaited) is tried again once the rest comes.
+  for (const [why, windDown] of [
+    ['the bankroll changes hands, this session still operating another machine', () => fund(M1, OTHER)],
+    ['this client may no longer run the croupier', () => setSoleCroupierPredicate(() => false)],
+  ] as const) {
+    it(`refunds a round it winds down once the rest comes (${why})`, async () => {
+      fund(M1);
+      fund(M2);
+      await requestSpin(M1);
+      const ready = becomeOperator([M1, M2]);
+      await acceptsDone();
+      expect(spinning(M1)).toBe(true);
+      expect(readChips(PLAYER)).toBe(100 - BET);
+      windDown();
+      const other = new Y.Doc();
+      const updates: Uint8Array[] = [];
+      other.on('update', (u: Uint8Array) => updates.push(u));
+      other.getMap('elsewhere').set('a', 1);
+      other.getMap('elsewhere').set('b', 2);
+      queueMicrotask(() => Y.applyUpdate(doc, updates[1]));
+      tickSlotMachineRoom([M1, M2], false, at(ready + 100));
+      await acceptsDone();
+      expect(spinning(M1)).toBe(true); // nothing written on the partial doc
+      Y.applyUpdate(doc, updates[0]);
+      tickSlotMachineRoom([M1, M2], false, at(ready + 200));
+      await acceptsDone();
+      expect(readSlotMachineState(M1)?.phase).toBe('settled');
+      expect(hasSlotEscrow(M1)).toBe(false);
+      expect(readChips(PLAYER)).toBe(100);
+    });
+  }
+
+  it('the operator takes no wager until the rest comes: chips on a felt may read as free there', async () => {
+    fund(M1);
+    const ready = becomeOperator([M1]);
+    await requestSpin(M1);
+    const rest = partOfAnUpdate();
+    tickSlotMachineRoom([M1], false, at(ready + 1_000));
+    await acceptsDone();
+    expect(spinning(M1)).toBe(false);
+    expect(readChips(PLAYER)).toBe(100);
+    Y.applyUpdate(doc, rest);
+    tickSlotMachineRoom([M1], false, at(ready + 2_000));
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
+  // The accept hashes three times (its house seed, then the odds before and
+  // after); the room's updates come in while each one runs.
+  for (const [during, hash] of [[1, 'house seed'], [2, 'odds'], [3, 'odds read again']] as const) {
+    it(`takes a spin on the owner's odds once the rest comes, their rewrite in part during its ${hash} hash`, async () => {
+      fund(M1);
+      const paytable = DEFAULT_PAYTABLE.slice(1); // the owner's odds: no jackpot
+      writeSlotOddsConfig(M1, { paytable });
+      const ready = becomeOperator([M1]);
+      await requestSpin(M1, PLAYER, 'req-odds', paytable);
+      // Another page writes the same odds again just after a write this page
+      // has yet to get, and this page gets the rewrite first; the rest comes
+      // with the next hash, or after the accept.
+      const other = new Y.Doc();
+      Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+      const updates: Uint8Array[] = [];
+      other.on('update', (u: Uint8Array) => updates.push(u));
+      other.getMap('elsewhere').set('a', 1);
+      other.getMap('casino').set(`slot-odds:${M1}`, { paytable });
+      let rested = false;
+      const rest = (): void => {
+        if (!rested) Y.applyUpdate(doc, updates[0]);
+        rested = true;
+      };
+      const digest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle);
+      let hashes = 0;
+      const spy = vi.spyOn(globalThis.crypto.subtle, 'digest').mockImplementation((...args) => {
+        hashes += 1;
+        if (hashes === during) Y.applyUpdate(doc, updates[1]);
+        if (hashes === during + 1) rest();
+        return digest(...args);
+      });
+      try {
+        tickSlotMachineRoom([M1], false, at(ready + 1_000));
+        await acceptsDone();
+      } finally {
+        spy.mockRestore();
+      }
+      expect(hashes).toBeGreaterThanOrEqual(during);
+      expect(readSlotMachineState(M1)?.failure).toBeUndefined();
+      expect(readSlotPlayRequests(M1).map((r) => r.requestId)).toEqual(['req-odds']);
+      rest();
+      tickSlotMachineRoom([M1], false, at(ready + 2_000));
+      await acceptsDone();
+      expect(spinning(M1)).toBe(true);
+      expect(readChips(PLAYER)).toBe(100 - BET);
+    });
+  }
+
+  it('RUN takes no lease until the rest comes', () => {
+    setSoleCroupierPredicate(() => false);
+    fund(M1);
+    const rest = partOfAnUpdate();
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0))).toBe(false);
+    expect(readSlotOperatorLease()).toBeNull();
+    Y.applyUpdate(doc, rest);
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0 + 100))).toBe(true);
+    expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+  });
+});
+
 describe('a round on a machine this session no longer operates', () => {
   it('is refunded here when the bankroll changes hands, then the lease goes', async () => {
     fund(M1);
@@ -480,8 +683,8 @@ describe('a round on a machine this session no longer operates', () => {
     const map = doc.getMap('casino');
     doc.transact(() => {
       map.delete(`slot-escrow:${M1}`);
-      map.set(`bal:${PLAYER}`, 100);
-      map.set(`bal:${OPERATOR}`, 10_000);
+      creditChips(PLAYER, 100 - readChips(PLAYER));
+      creditChips(OPERATOR, 10_000 - readChips(OPERATOR));
     });
     writeSlotMachineState(M1, { ...readSlotMachineState(M1)!, phase: 'settled', credited: 0 });
     fund(M1, OTHER);
@@ -947,7 +1150,7 @@ describe('a removed machine', () => {
     expect(slotOperatorWatchCount()).toBe(2); // the lease, and the teardown waiting
     // The operator tears it down (its stake refunded, its bankroll paid out).
     expect(refundSlotWager(M1, PLAYER, BET, { mode: 'machine', ownerId: OPERATOR })).toBe(true);
-    doc.getMap('casino').delete(`slot-bankroll:machine:${M1}`);
+    expect(drainSlotMachineFunding(M1)).toBe(true);
     tickSlotMachineRoom([], false, at(T0 + 200));
     expect(slotOperatorWatchCount()).toBe(1);
     expect(readSlotMachineState(M1)).toBeNull();
@@ -1056,7 +1259,7 @@ describe('a removed machine', () => {
     closeSlotMachine(M1, true);
     const ready = becomeOperator([]);
     await acceptsDone();
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000);
+    expect(readSlotFundingBalance(M1, funding)).toBe(1_000);
     expect(readSlotFundingConfig(M1)).not.toBeNull();
     tickSlotMachineRoom([], false, at(ready + 100));
     expect(readSlotOperatorLease()).toBeNull();
@@ -1070,7 +1273,7 @@ describe('a removed machine', () => {
     closeSlotMachine(M1, true);
     becomeOperator([]);
     await acceptsDone();
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000);
+    expect(readSlotFundingBalance(M1, funding)).toBe(1_000);
   });
 
   it('with a stake locked but no round to refund it by, keeps the stake and the machine', async () => {
@@ -1083,7 +1286,7 @@ describe('a removed machine', () => {
     const ready = becomeOperator([]);
     await acceptsDone();
     expect(hasSlotEscrow(M1)).toBe(true);
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000 + BET - RESERVE);
+    expect(readSlotFundingBalance(M1, funding)).toBe(1_000 + BET - RESERVE);
     expect(readChips(PLAYER)).toBe(100 - BET);
     tickSlotMachineRoom([], false, at(ready + 100));
     expect(readSlotOperatorLease()).toBeNull();
@@ -1098,7 +1301,7 @@ describe('a removed machine', () => {
     expect(slotOperatorWatchCount()).toBe(0);
     expect(readSlotOperatorLease()).toBeNull();
     expect(hasSlotEscrow(M1)).toBe(true);
-    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).not.toBeUndefined();
+    expect(readSlotFundingBalance(M1, { mode: 'machine', ownerId: OPERATOR })).toBeGreaterThan(0);
   });
 
   it('takes no wager from an accept paused at an await when it is removed', async () => {
@@ -1153,6 +1356,20 @@ describe('running machines by hand', () => {
     await acceptsDone();
     expect(spinning(M1)).toBe(true);
     expect(spinning(M2)).toBe(false);
+  });
+
+  it("RUN takes no lease until the room's state is in, or it has waited long enough for it", () => {
+    setRoomStateArrivedCheck(() => false);
+    try {
+      fund(M1);
+      expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0))).toBe(false);
+      expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0 + ROOM_STATE_WAIT_MS - 1))).toBe(false);
+      expect(readSlotOperatorLease()).toBeNull();
+      expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0 + ROOM_STATE_WAIT_MS))).toBe(true);
+      expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+    } finally {
+      setRoomStateArrivedCheck(() => true);
+    }
   });
 
   it('keeps running a machine by hand across a lapse of its own lease, and takes the lease again', () => {

@@ -54,11 +54,42 @@ function notify(): void {
   }
 }
 
+/** Items the bound layout held until a change removed them, and those of
+ *  them this page's own change removed. */
+let removedIds = new Set<string>();
+let removedLocallyIds = new Set<string>();
+
 export function bindFurnitureDoc(doc: Y.Doc): void {
   boundDoc = doc;
-  furnitureMap = doc.getMap('furniture');
-  furnitureMap.observe(() => notify());
+  const map = doc.getMap('furniture');
+  furnitureMap = map;
+  removedIds = new Set();
+  removedLocallyIds = new Set();
+  const removedHere = removedIds;
+  const removedLocally = removedLocallyIds;
+  map.observe((event) => {
+    event.changes.keys.forEach((change, id) => {
+      if (change.action === 'delete') removedHere.add(id);
+      else removedHere.delete(id);
+      if (change.action === 'delete' && event.transaction.local) removedLocally.add(id);
+      else removedLocally.delete(id);
+    });
+    notify();
+  });
   notify(); // reconcile from the fresh doc (mirror of rebuildChatLog / bindGamesDoc)
+}
+
+/** Whether the bound room's layout held `id` and a change took it out, as
+ *  opposed to an item of the room this page left, which the doc it joined
+ *  never had (World.reconcileFurniture tells the two apart). */
+export function layoutRemoved(id: string): boolean {
+  return removedIds.has(id);
+}
+
+/** Whether that change was this page's own (a room template it applied, a
+ *  doubled batch it cleared), not one it heard from another page. */
+export function layoutRemovedHere(id: string): boolean {
+  return removedLocallyIds.has(id);
 }
 
 export function subscribeFurniture(listener: () => void): () => void {

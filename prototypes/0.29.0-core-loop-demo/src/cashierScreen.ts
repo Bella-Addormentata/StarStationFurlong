@@ -13,7 +13,7 @@
  */
 
 import type * as THREE from 'three';
-import { buyInChips, cashOutChips, readChips } from './casinoDoc';
+import { buyInChips, cashOutChips, casinoWhole, readChips } from './casinoDoc';
 import { chipsFor, drawChips } from './chipDisplay';
 
 /** Canvas size: the screen plane is 0.58 × 0.42 m, so ~1.38 : 1. */
@@ -106,6 +106,9 @@ export function cashierNav(
   return isBuy(live[here].act) ? live[here].act : 'buy-100';
 }
 
+/** The flash line for a CASH OUT while the room is still coming in. */
+export const CASHIER_RECONNECTING = 'RECONNECTING — PRESS AGAIN IN A MOMENT';
+
 /** Words for the flash line after a press. */
 export function cashierFlash(act: CashierAct, returned: number): string {
   if (act === 'cashout') return returned > 0 ? `${returned} CHIPS BACK TO THE CAGE` : 'NO CHIPS TO RETURN';
@@ -116,6 +119,9 @@ export function cashierFlash(act: CashierAct, returned: number): string {
 export function pressCashier(act: CashierAct, playerId: string): string | null {
   const button = cashierButtons(readChips(playerId)).find((b) => b.act === act);
   if (!button?.enabled) return null;
+  // 📒 Nothing goes back to the cage while the doc holds part of an update:
+  // chips on a felt may read as free there (casinoDoc spendableChips).
+  if (act === 'cashout' && !casinoWhole()) return CASHIER_RECONNECTING;
   if (act === 'cashout') return cashierFlash(act, cashOutChips(playerId, readChips(playerId)));
   buyInChips(playerId, Number(act.slice(4)));
   return cashierFlash(act, 0);

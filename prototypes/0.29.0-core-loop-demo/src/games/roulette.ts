@@ -8,12 +8,12 @@
  * and the G5 commit-reveal fairness upgrade slots in around it untouched.
  *
  * Payout convention: payoutFor returns the TOTAL RETURNED for a winning bet
- * (stake included), because stakes are DEDUCTED at placement time (the
- * player's client spends chips when the chip hits the felt). A losing bet
- * returns 0 — the chips are already gone.
+ * (stake included). The stake is held on the felt by the bettor's list until
+ * the settle (casinoDoc STAKES ON THE FELT), which sets what is returned
+ * against it: a losing bet returns 0, and the settle charges what it held.
  */
 
-import { isFairnessTranscript, isSeedRoundFields } from './craps';
+import { isFairnessTranscript, isSeedRoundFields, isTableBookField, isTableIncField, MAX_BET_AMOUNT } from './craps';
 import type { FairnessTranscript } from './craps';
 
 /** Numbers that pay RED (standard wheel). Everything 1–36 not here is black. */
@@ -38,7 +38,7 @@ export interface RouletteBet {
   type: RouletteBetType;
   /** straight: the number 0–36; dozen/column: 0/1/2; others: absent. */
   pick?: number;
-  /** Chips staked (already deducted from the bettor's balance). */
+  /** Chips staked (held on the felt by the bettor's list until the settle). */
   amount: number;
 }
 
@@ -71,12 +71,20 @@ export interface RouletteTableState {
   unseeded?: string[];
   wagers?: Record<string, string>;
   sigs?: Record<string, string>;
+  stakes?: Record<string, number>;
+  bettors?: string[];
   /** 🎡 A manual SPIN's settlement lease: the page (player id + page nonce)
    *  that closed or took over this round. Only it publishes and pays. */
   operator?: string;
   /** ⚖️ Voided: the house seed couldn't be revealed, so no pocket and every
    *  stake was returned. */
   voided?: boolean;
+  /** 🧾 This table's incarnation (casinoDoc tableIncFor), kept round to round:
+   *  a table set up again under the same id pays its own rounds. */
+  inc?: string;
+  /** 📒 The write of the table's book this state goes on from (casinoDoc
+   *  writeSettledState), kept round to round. */
+  bk?: string;
 }
 
 export function initialRouletteState(): RouletteTableState {
@@ -92,7 +100,7 @@ export function isRouletteBet(value: unknown): value is RouletteBet {
   if (typeof value !== 'object' || value === null) return false;
   const b = value as Partial<RouletteBet>;
   if (typeof b.type !== 'string' || !BET_TYPES.includes(b.type)) return false;
-  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0) return false;
+  if (!Number.isInteger(b.amount) || (b.amount as number) <= 0 || (b.amount as number) > MAX_BET_AMOUNT) return false;
   if (b.type === 'straight') {
     return Number.isInteger(b.pick) && (b.pick as number) >= 0 && (b.pick as number) <= 36;
   }
@@ -115,6 +123,8 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.operator === undefined || (typeof s.operator === 'string' && s.operator.length <= 192))
+    && isTableIncField(s.inc)
+    && isTableBookField(s.bk)
     // A void is the canonical no-outcome shape: no pocket, no transcript.
     && (s.voided === undefined || (typeof s.voided === 'boolean'
       && (!s.voided || (s.phase === 'settled' && s.result === null && s.fairness === undefined

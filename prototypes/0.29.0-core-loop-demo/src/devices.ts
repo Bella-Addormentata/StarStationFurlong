@@ -183,7 +183,7 @@ import {
   readSlotMachineState, readSlotOddsConfig, readSlotReveal,
   writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
-  depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
+  depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig, casinoWhole,
   // 🪙 Coin pusher (#135) — the player's and owner's request keys; the
   // operator (pusherCroupier.ts) moves the chips.
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
@@ -216,7 +216,7 @@ const COIN_PUSHER_HOLE_NAMES = ['LEFT', 'MIDDLE', 'RIGHT'] as const;
 import type { ArcadeScreenPainter } from './arcadeScreen';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
-import { canRunCroupier } from './croupier';
+import { canRunCroupier, RECONNECTING_NOTICE } from './croupier';
 import {
   isManualSlotMachineRunning,
   setManualSlotMachineRunning,
@@ -5661,8 +5661,10 @@ export function createSlotMachineUI(
       ? depositSlotFunding(deps.itemId, myId, 100)
       : withdrawSlotFunding(deps.itemId, myId, 100);
     if (!ok) {
+      // (A deposit is refused on a doc holding part of an update: casinoDoc
+      // spendableChips.)
       flash = direction === 'deposit'
-        ? 'DEPOSIT NEEDS 100 OWNER CHIPS'
+        ? (casinoWhole() ? 'DEPOSIT NEEDS 100 OWNER CHIPS' : RECONNECTING_NOTICE)
         : 'WITHDRAW NEEDS 100 BANKROLL CHIPS';
       render();
     }

@@ -26,6 +26,7 @@ import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
 import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
+import type { TableClosing } from "./casinoDoc";
 import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
@@ -34,12 +35,15 @@ import {
   croupierBeatLine,
   HEARTBEAT_MS,
   isCroupierLive,
+  noteTablesRunning,
+  takeTableTurn,
   tickAutoCroupier,
 } from "./croupier";
 // 🎲 #69 G3: the craps auto-stickman (parallel to the roulette croupier) +
 // its narration + teardown refund.
 import {
   closeCrapsTable,
+  CRAPS_SHOW_MS,
   crapsBeatLine,
   tickAutoStickman,
   tickManualCraps,
@@ -108,7 +112,7 @@ import {
   findPath,
   nearestWalkableCell,
 } from "./pathfinding";
-import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
+import { subscribeFurniture, readAllFurniture, layoutRemoved, layoutRemovedHere } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
@@ -3187,7 +3191,12 @@ export class World {
     for (const item of [...FURNITURE]) {
       if (records.has(item.id)) continue;
       this.evictAndDefocusForItem(item.id);
-      this.removeFurnitureVisuals(item.id);
+      // A removal this page made of the room's layout (a template it
+      // applied), one it heard, or a table of the room left behind.
+      this.removeFurnitureVisuals(
+        item.id,
+        layoutRemovedHere(item.id) ? "local" : layoutRemoved(item.id) ? "heard" : "elsewhere",
+      );
       const idx = FURNITURE.findIndex((i) => i.id === item.id);
       if (idx !== -1) FURNITURE.splice(idx, 1);
       changedIds.add(item.id);
@@ -3347,8 +3356,12 @@ export class World {
    * Deleting from wallScreens/trunkLids/holoSpinners is what stops update()
    * driving freed handles: the 1 Hz screen redraw, the per-frame lid ease
    * and the holo-ring spin all iterate those collections.
+   *
+   * `closing` says how this page comes to remove it (casinoDoc
+   * TableClosing): its own edit, a removal it heard from the room, or the
+   * room it left (the reconcile against the doc it joined).
    */
-  public removeFurnitureVisuals(itemId: string): boolean {
+  public removeFurnitureVisuals(itemId: string, closing: TableClosing = "local"): boolean {
     const group = this.furnitureGroups.get(itemId);
     if (!group) return false;
     this.platformGroup.remove(group);
@@ -3398,9 +3411,9 @@ export class World {
     // and table:/bets: records orphan. Runs pre-splice, so the kind is still known.
     const removedKind = FURNITURE.find((i) => i.id === itemId)?.kind;
     if (removedKind === "roulette-table") {
-      closeTable(itemId);
+      closeTable(itemId, closing);
     } else if (removedKind === "craps-table") {
-      closeCrapsTable(itemId);
+      closeCrapsTable(itemId, closing);
     } else if (removedKind === "slot-machine") {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
@@ -6296,13 +6309,17 @@ export class World {
     // headless), only the room's elected operator session (below).
     const coinPushers = FURNITURE.filter((i) => i.kind === "coin-pusher");
     const tables = [...rouletteTables, ...crapsTables];
+    // 💤 Every page running tables marks the frame, so one waking from a
+    // sleep acts on none until its doc has caught up (croupier.ts).
+    if (tables.length) noteTablesRunning();
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.
     // Throttle the heartbeat off wall-clock (not a dt accumulator — a single NaN
     // dt would wedge an accumulator forever while tickAutoCroupier kept running).
     const autoCroupier = canRunCroupier();
-    if (tables.length && autoCroupier) {
+    // Of the deed holder's open pages, one drives (the table-operator lease).
+    if (tables.length && autoCroupier && takeTableTurn()) {
       const now = Date.now();
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
@@ -6312,11 +6329,17 @@ export class World {
         else tickAutoCroupier(t.id);
       }
     }
-    // 🎲 #226: a manual craps table (no robot running it): the page whose
-    // manual ROLL slid the dice out carries that shooter's turn, focused or
-    // not (tickManualCraps returns at once on every other editor's page).
-    else if (crapsTables.length && canEditRoom().ok) {
-      for (const t of crapsTables) if (!isCroupierLive(t.id)) tickManualCraps(t.id);
+    // 🎲 #226: a manual craps turn: the page whose manual ROLL slid the dice
+    // out carries that shooter's turn, focused or not (tickManualCraps
+    // returns at once on every other page). On a table a robot runs (ROLL
+    // was pressed here before its first beat, or on one of the owner's pages
+    // not driving it) the settle takes the robot's show beat, so the robot
+    // opens the next window as usual.
+    else if (crapsTables.length && (autoCroupier || canEditRoom().ok)) {
+      for (const t of crapsTables) {
+        const robot = autoCroupier || isCroupierLive(t.id);
+        tickManualCraps(t.id, Date.now(), robot ? CRAPS_SHOW_MS : undefined);
+      }
     }
     // ⚖️ Fair tables: every client with chips down commits its seed while the
     // window is open and reveals it at "no more bets" (fairTableSeeds.ts).

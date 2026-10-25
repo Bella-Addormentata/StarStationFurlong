@@ -44,16 +44,20 @@ import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import {
   casinoDocEpoch,
+  feltStake,
   casinoRoomId,
   readAllBets,
   readAllCrapsBets,
   readCrapsFairnessPref,
   readMyBets,
+  MAX_TABLE_BETTORS,
   readMyCrapsBets,
   readCrapsTableState,
   readPlayerKey,
   readSeedRecord,
   readTableState,
+  tableIncOf,
+  tableIncRemoved,
   writeMySeedRecord,
 } from './casinoDoc';
 import { HOUSE_PARTY } from './games/craps';
@@ -70,9 +74,10 @@ export const REVEAL_GRACE_MS = 4_000;
 /** At most this many bettors per round (the transcript bound is 16 with the
  *  house). More than that and the extras simply aren't parties that roll. */
 const MAX_BETTOR_PARTIES = 15;
-/** Most distinct bettors a Fair round can carry (15 seeded + 16 unseeded, the
- *  transcript's bounds): the table refuses a new bettor past it. */
-export const MAX_TABLE_BETTORS = 2 * MAX_BETTOR_PARTIES + 1;
+/** Most distinct bettors a round can carry (casinoDoc MAX_TABLE_BETTORS): a
+ *  Fair round's 15 seeded + 16 unseeded, the transcript's bounds. The table
+ *  refuses a new bettor past it, Fair or not. */
+export { MAX_TABLE_BETTORS };
 
 type TableState = CrapsTableState | RouletteTableState;
 
@@ -255,10 +260,15 @@ const authoredRounds = new Set<string>();
  *  check compares the settled record against it: an operator who rewrites the
  *  party set after the reveals (to drop or add a seed) is caught here. */
 interface FrozenSnapshot {
+  /** the table's incarnation it was taken on (tableIncOf) */
+  inc: string;
+  /** the write of the table's book its round went on from (the state's `bk`) */
+  bk?: string;
   house: string;
   commits: Record<string, string>;
   wagers?: Record<string, string>;
   sigs?: Record<string, string>;
+  stakes?: Record<string, number>;
 }
 /** Per table (epoch:table), its last few rounds' snapshots, oldest first. */
 const frozenSeen = new Map<string, Map<string, FrozenSnapshot>>();
@@ -266,17 +276,38 @@ const SNAPSHOTS_PER_TABLE = 4;
 
 // Keyed by round alone, NOT the house commit: that field is peer-writable
 // too, and a rewritten one must hit the snapshot (and fail the house
-// comparison) rather than miss it and read as merely unwitnessed.
+// comparison) rather than miss it and read as merely unwitnessed. Nor the
+// incarnation, for the same reason; but a snapshot of an incarnation since
+// removed is another table's: one put back under the same id starts again at
+// round 1, and a page can hear the removal and the new table together,
+// never seeing the id without a table (forgetMissingTables), so it is
+// dropped here. And one of a round another run of the table's rounds opened
+// (this page froze it cut off from the room, and the doc kept the other
+// side's: casinoDoc THE TABLE'S BOOK) is no snapshot of the round up now,
+// whose state names the write of the book it went on from: the settle of
+// it goes by its own state's frozen fields. (A settled state names its own
+// write: the check of it goes by round, as above. A page whose side the doc
+// dropped may show that round failed.)
 function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
-  return frozenSeen.get(`${casinoDocEpoch()}:${tableId}`)?.get(String(s.round));
+  const rounds = frozenSeen.get(`${casinoDocEpoch()}:${tableId}`);
+  const seen = rounds?.get(String(s.round));
+  if (seen && seen.inc !== tableIncOf(tableId, s) && tableIncRemoved(tableId, seen.inc)) {
+    rounds!.delete(String(s.round));
+    return undefined;
+  }
+  if (seen && s.phase !== 'settled' && seen.bk !== s.bk) return undefined;
+  return seen;
 }
 
-function snapshot(s: TableState): FrozenSnapshot {
+function snapshot(tableId: string, s: TableState): FrozenSnapshot {
   return {
+    inc: tableIncOf(tableId, s),
+    ...(s.bk !== undefined ? { bk: s.bk } : {}),
     house: s.houseCommit ?? '',
     commits: { ...(s.commits ?? {}) },
     ...(s.wagers ? { wagers: { ...s.wagers } } : {}),
     ...(s.sigs ? { sigs: { ...s.sigs } } : {}),
+    ...(s.stakes ? { stakes: { ...s.stakes } } : {}),
   };
 }
 
@@ -286,13 +317,17 @@ function snapshot(s: TableState): FrozenSnapshot {
 export function frozenFields(
   tableId: string,
   s: TableState,
-): { houseCommit?: string; commits?: Record<string, string>; wagers?: Record<string, string>; sigs?: Record<string, string> } {
+): {
+  houseCommit?: string; commits?: Record<string, string>; wagers?: Record<string, string>;
+  sigs?: Record<string, string>; stakes?: Record<string, number>;
+} {
   const seen = seenFor(tableId, s);
   if (!seen) {
     return {
       ...(s.commits ? { commits: s.commits } : {}),
       ...(s.wagers ? { wagers: s.wagers } : {}),
       ...(s.sigs ? { sigs: s.sigs } : {}),
+      ...(s.stakes ? { stakes: s.stakes } : {}),
     };
   }
   return {
@@ -300,7 +335,19 @@ export function frozenFields(
     commits: seen.commits,
     ...(seen.wagers ? { wagers: seen.wagers } : {}),
     ...(seen.sigs ? { sigs: seen.sigs } : {}),
+    ...(seen.stakes ? { stakes: seen.stakes } : {}),
   };
+}
+
+/** The chips a bettor's list held on the felt as round `s` closed: what the
+ *  freeze recorded, so a list rewritten (or emptied) since can't change what
+ *  the round takes, or on a round that froze none (RNG, or a bettor who missed
+ *  the freeze) what it holds now. Only what wasn't taken already: 0 for an
+ *  earlier build's list (casinoDoc FeltStake). */
+export function heldAtClose(tableId: string, s: TableState, pid: string): number {
+  const frozen = frozenFields(tableId, s).stakes;
+  if (frozen && Object.prototype.hasOwnProperty.call(frozen, pid)) return frozen[pid];
+  return feltStake(tableId, pid).net;
 }
 
 /** Forget the snapshots of every table no longer in the room (`live` is the
@@ -326,7 +373,7 @@ function noteFrozen(tableId: string, s: TableState, overwrite: boolean): void {
     evictOldest(frozenSeen, 256);
   }
   rounds.delete(k); // re-insert as newest
-  rounds.set(k, snapshot(s));
+  rounds.set(k, snapshot(tableId, s));
   // Only this table's older rounds make way: other tables keep theirs.
   evictOldest(rounds, SNAPSHOTS_PER_TABLE);
 }
@@ -375,7 +422,8 @@ function sameCommits(a: Record<string, string>, b: Record<string, string>): bool
  */
 export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now(), force = false): void {
   const tickKey = `${casinoDocEpoch()}:${tableId}:${me}`;
-  if (!force && now - (lastTick.get(tickKey) ?? 0) < 200) return;
+  const last = lastTick.get(tickKey) ?? 0;
+  if (!force && now >= last && now - last < 200) return;
   lastTick.delete(tickKey);
   lastTick.set(tickKey, now);
   evictOldest(lastTick, 256);
@@ -447,14 +495,22 @@ export function tickFairSeeds(tableId: string, game: TableGame, me: string, now 
 // ── The operator's side ───────────────────────────────────────────────────────
 
 /** "No more bets": the commitments that roll — staked players whose record
- *  answers this round's house commit. Spread into the closing write. */
+ *  answers this round's house commit — and their wagers. A round without
+ *  the exchange (RNG) freezes who is in it. Spread into the closing write. */
 export function freezeCommits(
   tableId: string,
   game: TableGame,
   s: TableState,
-): { commits?: Record<string, string>; unseeded?: string[]; wagers?: Record<string, string>; sigs?: Record<string, string> } {
-  if (!s.houseCommit) return {};
+): {
+  commits?: Record<string, string>; unseeded?: string[]; wagers?: Record<string, string>;
+  sigs?: Record<string, string>; stakes?: Record<string, number>; bettors?: string[];
+} {
   const staked = stakedPlayers(tableId, game, s.round);
+  // RNG: a bet first put down after "no more bets" sits the round out, and
+  // two pages settling it (a handover) write up the very bettors its close
+  // names, whichever book the doc keeps. What they bet plays as it stands at
+  // the settle: nobody can know the result before it.
+  if (!s.houseCommit) return { bettors: [...staked].sort().slice(0, MAX_TABLE_BETTORS) };
   const commits: Record<string, string> = {};
   const sigs: Record<string, string> = {};
   // Read only the staked players' records: anyone can add fseed keys, so a
@@ -470,18 +526,26 @@ export function freezeCommits(
     }
   }
   // Staked but no seed (offline with standing bets, too quick a close, or
-  // past the cap — a table's stands keep it far below 15): on the record, so
-  // the card can say who the result didn't take a seed from.
-  const unseeded = [...staked].filter((pid) => !(pid in commits)).sort().slice(0, MAX_BETTOR_PARTIES + 1);
+  // past the seed cap): in the round all the same, up to MAX_TABLE_BETTORS
+  // in all. The first of them go on the record, so the card can say who the
+  // result didn't take a seed from.
+  const inRound = [...staked].filter((pid) => !(pid in commits)).sort()
+    .slice(0, MAX_TABLE_BETTORS - Object.keys(commits).length);
+  const unseeded = inRound.slice(0, MAX_BETTOR_PARTIES + 1);
   // The wagers freeze too: the reveals make the result computable before the
   // settle, so a bet rewritten after "no more bets" must not be paid.
+  // And what each list holds on the felt, so a rewrite can't shrink what the
+  // round takes (casinoDoc STAKES ON THE FELT).
   const wagers: Record<string, string> = {};
-  for (const pid of [...Object.keys(commits), ...unseeded]) {
-    wagers[pid] = wagerFingerprint(game === 'craps' ? readMyCrapsBets(tableId, pid) : readMyBets(tableId, pid, s.round));
+  const stakes: Record<string, number> = {};
+  for (const pid of [...Object.keys(commits), ...inRound]) {
+    const list = game === 'craps' ? readMyCrapsBets(tableId, pid) : readMyBets(tableId, pid, s.round);
+    wagers[pid] = wagerFingerprint(list);
+    stakes[pid] = feltStake(tableId, pid).net;
   }
   // The operator's own copy of what it froze: its settle goes by this.
-  noteFrozen(tableId, { ...s, commits, wagers, sigs }, true);
-  return unseeded.length > 0 ? { commits, unseeded, wagers, sigs } : { commits, wagers, sigs };
+  noteFrozen(tableId, { ...s, commits, wagers, sigs, stakes }, true);
+  return unseeded.length > 0 ? { commits, unseeded, wagers, sigs, stakes } : { commits, wagers, sigs, stakes };
 }
 
 /** A bettor's wager list, hashed: what "no more bets" froze for them. */
@@ -491,15 +555,28 @@ export function wagerFingerprint(bets: readonly unknown[]): string {
 
 /** The settle's bets on a round that froze its wagers: only the frozen
  *  bettors, and only lists unchanged since the close. A list rewritten after
- *  "no more bets" is `voided` (its bets are not paid — the settle clears them).
- *  A round without frozen wagers (RNG) settles the bets as they stand. */
+ *  "no more bets" is `voided` (its bets are not paid — the settle clears them),
+ *  and so is a frozen bettor's list emptied or gone since (not in `bets`).
+ *  A round that froze only who is in it (RNG) settles their bets as they
+ *  stand; one that froze nothing (an earlier build's close), every bet. A
+ *  bettor the freeze left out is `omitted`. */
 export function frozenWagers<T>(
   tableId: string,
   s: TableState,
   bets: Record<string, T[]>,
 ): { bets: Record<string, T[]>; voided: string[]; omitted: string[] } {
   const { wagers } = frozenFields(tableId, s);
-  if (!wagers) return { bets, voided: [], omitted: [] };
+  if (!wagers) {
+    const inRound = s.bettors && new Set(s.bettors);
+    if (!inRound) return { bets, voided: [], omitted: [] };
+    const out: Record<string, T[]> = {};
+    const omitted: string[] = [];
+    for (const [pid, list] of Object.entries(bets)) {
+      if (inRound.has(pid)) out[pid] = list;
+      else omitted.push(pid);
+    }
+    return { bets: out, voided: [], omitted: omitted.sort() };
+  }
   const out: Record<string, T[]> = {};
   const voided: string[] = [];
   const omitted: string[] = [];
@@ -512,6 +589,7 @@ export function frozenWagers<T>(
     if (wagerFingerprint(list) === want) out[pid] = list;
     else voided.push(pid);
   }
+  for (const pid of Object.keys(wagers)) if (!Object.prototype.hasOwnProperty.call(bets, pid)) voided.push(pid);
   return { bets: out, voided: voided.sort(), omitted: omitted.sort() };
 }
 
@@ -535,7 +613,8 @@ export function gatherRound(tableId: string, live: TableState, now = Date.now())
   const fz = frozenFields(tableId, live);
   const s: TableState = { ...live, ...(fz.houseCommit ? { houseCommit: fz.houseCommit } : {}) };
   const key = roundKey(tableId, s.round, s.houseCommit);
-  if (!settleDueAt.has(key)) {
+  // (A clock gone back since the first try: the grace runs from now.)
+  if (!settleDueAt.has(key) || now < settleDueAt.get(key)!) {
     settleDueAt.set(key, now);
     evictOldest(settleDueAt, 256);
   }

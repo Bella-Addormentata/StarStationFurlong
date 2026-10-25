@@ -21,9 +21,9 @@
  *    yours that may come down back at once; right-click puts the hand back. When the
  *    dice come to you, grab them and fling them across the table.
  *
- * THE RULES OF MONEY DO NOT CHANGE: a chip is spent (casinoDoc.spendChips)
- * the moment it lands on the felt, exactly as the popups did; the hand is a
- * local view of chips still in your balance. The settle, the payouts and the
+ * THE RULES OF MONEY: a chip on the felt stays yours, held there by your bet
+ * list, until the round settles (casinoDoc STAKES ON THE FELT); the hand is
+ * a local view of chips still in your balance. The settle, the payouts and the
  * shooter rotation stay with the elected operator (croupier.ts /
  * crapsCroupier.ts). The fling is cosmetic: the dice faces come from the
  * table's fairness mode, and every client animates the same throw from the
@@ -32,17 +32,20 @@
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, clearMySeat, creditChips, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
+  casinoDocEpoch, casinoWhole, clearMySeat, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
   readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
-  spendChips, subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
+  subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
   writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
 } from './casinoDoc';
 import type { TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH, TAKE_DOWN_R } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
-import { closeBetting, isCroupierLive, openBetting, rollAndSettle, ROULETTE_PAGE_ID } from './croupier';
+import {
+  closeBetting, isCroupierLive, openBetting, RECONNECTING_NOTICE, rollAndSettle, ROULETTE_PAGE_ID, spinSeenAt,
+  SPIN_TAKEOVER_MS, tablesAwake,
+} from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -79,9 +82,6 @@ export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { te
     : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F28B87', fair: false };
 }
 
-/** 🎡 A rival house member's SPIN lease is honoured this long before this
- *  page may take the round over (the reveal wait plus a margin). */
-const SPIN_TAKEOVER_MS = 15_000;
 /** How long a fresh lease write gets to converge before its page settles. */
 const LEASE_SETTLE_MS = 600;
 
@@ -635,14 +635,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let seatTimer: number | null = null;
   /** The manual SPIN's settle poll: one per focused table. */
   let spinPoll: number | null = null;
-  /** When this page first saw another house member's lease on a round. */
-  let spinSeen: { key: string; at: number } | null = null;
   const stopSpinPoll = (): void => {
     if (spinPoll !== null) window.clearInterval(spinPoll);
     spinPoll = null;
   };
 
-  /** Chips in hand (denominations). Spent only when they land on the felt. */
+  /** Chips in hand (denominations). Held on the felt by my list once they
+   *  land; nothing is taken. */
   let hand: number[] = [];
   /** The rail as laid out right now (frozen while a pickup drag runs). */
   let railView: RailStack[] = [];
@@ -706,9 +705,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const deadline = (): number | undefined =>
     game === 'craps' ? crapsState()?.phaseDeadline : rouletteState()?.phaseDeadline;
   const myBets = (): AnyBet[] => (game === 'craps' ? readMyCrapsBets(itemId, me) : readMyBets(itemId, me, round()));
-  const writeBets = (bets: AnyBet[]): void => {
-    if (game === 'craps') writeMyCrapsBets(itemId, me, bets as CrapsBet[]);
-    else writeMyBets(itemId, me, round(), bets as RouletteBet[]);
+  /** Write my list; false (and the bettor told why) when it didn't go down:
+   *  the table full, or the doc holding part of an update (casinoWhole). */
+  const writeBets = (bets: AnyBet[]): boolean => {
+    const wrote = game === 'craps'
+      ? writeMyCrapsBets(itemId, me, bets as CrapsBet[])
+      : writeMyBets(itemId, me, round(), bets as RouletteBet[]);
+    if (!wrote) say(casinoWhole(itemId) ? 'THE TABLE IS FULL — WAIT FOR A PLACE' : RECONNECTING_NOTICE);
+    return wrote;
   };
   const animating = (): boolean => {
     if (!h) return false;
@@ -731,6 +735,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const syncWindow = (): void => {
     syncEpoch();
+    // (Not on a doc holding part of an update, where the table may read as
+    // gone and its round as 1: this window's chips would be forgotten.)
+    if (!casinoWhole(itemId)) return;
     const r = round();
     if (r !== windowRound) {
       windowRound = r;
@@ -813,6 +820,20 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const placeHand = (rg: FeltRegion<Spot>): void => {
     syncWindow();
+    // 📒 Not on a doc holding part of an update (casinoWhole): the table may
+    // read as gone there, or a list as empty, and no bet goes down anyway.
+    if (!casinoWhole(itemId)) {
+      say(RECONNECTING_NOTICE);
+      return;
+    }
+    // 🪙 Bets hold their chips on a table that is up (casinoDoc STAKES ON THE
+    // FELT): until the house (or its robot) opens this one, nothing goes down.
+    if (!(game === 'craps' ? crapsState() : rouletteState())) {
+      say(deps.isHouse()
+        ? `PRESS ${game === 'craps' ? 'ROLL' : 'SPIN'} ON ⚙ TO OPEN THE TABLE`
+        : "THE TABLE ISN'T OPEN YET — WAIT FOR THE HOUSE");
+      return;
+    }
     if (!bettingOpen()) {
       say(phase() === 'settled' ? 'WAIT FOR THE NEXT ROUND' : 'NO MORE BETS');
       return;
@@ -852,22 +873,25 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say(`YOU HAVE ${MAX_BETS_DRAWN_PER_PLAYER} CHIPS DOWN — THE TABLE LIMIT`);
       return;
     }
-    // ⚖️ A Fair round's transcript carries at most MAX_TABLE_BETTORS bettors:
-    // a newcomer past that would be left out of the settle, so they wait.
-    if (mine.length === 0 && roundIsFair(itemId, game)) {
+    // ⚖️ A round carries at most MAX_TABLE_BETTORS bettors (a Fair round's
+    // transcript, and the close's freeze of who is in it): a newcomer past
+    // that would be left out of the settle, so they wait.
+    if (mine.length === 0) {
       const all = game === 'craps' ? readAllCrapsBets(itemId) : readAllBets(itemId, round());
       if (Object.keys(all).filter((pid) => pid !== me).length >= MAX_TABLE_BETTORS) {
         say('THE TABLE IS FULL — WAIT FOR A PLACE');
         return;
       }
     }
-    if (!spendChips(me, sumOf(chips))) {
+    // 🪙 The chips stay yours, held on the felt by the list, until the round
+    // settles (casinoDoc STAKES ON THE FELT): nothing is taken here.
+    if (readChips(me) < sumOf(chips)) {
       say('NOT ENOUGH CHIPS — VISIT THE CASHIER');
       refreshRail();
       return;
     }
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
-    writeBets([...mine, ...placed]);
+    if (!writeBets([...mine, ...placed])) return;
     const warnKey = `${casinoDocEpoch()}:${itemId}`;
     // Commit this bet's seed now, not on the next tick: a quick close must
     // still find it.
@@ -882,10 +906,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     refreshRail();
   };
 
-  /** Pick my chips put down this window back off a box (refunded; into the
-   *  hand when it is empty). */
+  /** Pick my chips put down this window back off a box (back to my rail: the
+   *  list stops holding them; into the hand when it is empty). */
   const takeBack = (rg: FeltRegion<Spot>): boolean => {
     syncWindow();
+    if (!casinoWhole(itemId)) { // (as placeHand)
+      say(RECONNECTING_NOTICE);
+      return true;
+    }
     const key = spotKey(rg.bet);
     // Odds, place, big 6 / 8 and hardways may come down any time the betting
     // is open, not only this window's chips (the flat bet under odds stays).
@@ -913,8 +941,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       }
     }
     if (back.length === 0) return false;
-    writeBets(keep);
-    creditChips(me, sumOf(back));
+    // Off the list, the chips are no longer held: they're back on your rail.
+    if (!writeBets(keep)) return true;
     added.delete(key);
     // An empty hand picks them up; a loaded hand is already the stake you're
     // betting with, so they just go back to the rail.
@@ -928,6 +956,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const takeDownAll = (): void => {
     syncWindow();
     h?.pressTakeDown();
+    if (!casinoWhole(itemId)) { // (as placeHand)
+      say(RECONNECTING_NOTICE);
+      return;
+    }
     const bets = myBets();
     if (bets.length === 0) {
       say('NO BETS OF YOURS ON THE TABLE');
@@ -942,11 +974,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say('LINE AND COME BETS WITH A POINT STAY UP UNTIL THEY WIN OR LOSE');
       return;
     }
-    // The chips slide back across the felt to your rail as they come off.
+    // The list stops holding them: back on your rail. The chips slide back
+    // across the felt as they come off.
+    if (!writeBets(keep)) return;
     if (railSplit) h?.sweepToRail({ x: railSplit.chips.x, z: railSplit.chips.z });
-    writeBets(keep);
     const total = sumOf(back.map((b) => b.amount));
-    creditChips(me, total);
     for (const b of back) added.delete(spotKey(b));
     saveLedger();
     say(keep.length > 0
@@ -1555,6 +1587,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     } else if (act === 'spin') {
       spinByHand();
     } else if (act === 'next') {
+      // 💤 Just woken: the doc may not have heard the room yet. 📒 Nor while
+      // it holds part of an update: the table may read as gone (casinoWhole),
+      // its round as not settled.
+      if (!tablesAwake() || !casinoWhole(itemId)) {
+        say(RECONNECTING_NOTICE);
+        return;
+      }
       if (phase() !== 'settled') return;
       if (game === 'craps') {
         const s = crapsState();
@@ -1569,6 +1608,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   /** The house's manual SPIN: close the window (freezing the round's seed
    *  commitments), then settle as soon as the bettors have revealed. */
   const spinByHand = (): void => {
+    // 💤 Just woken: the doc may not have heard the room yet, and a SPIN
+    // written on it could take over a round another page has since settled.
+    // 📒 Nor while it holds part of an update (casinoWhole): a bet list
+    // rewritten in the part still to come reads as gone, and "no more bets"
+    // would freeze the round without it.
+    if (!tablesAwake() || !casinoWhole(itemId)) {
+      say(RECONNECTING_NOTICE);
+      return;
+    }
     const s = rouletteState();
     // A manual table nobody has run yet: this press opens round 1, so its
     // house commitment is out before a later press freezes the bets.
@@ -1582,9 +1630,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     else if (s.operator !== undefined && s.operator !== ROULETTE_PAGE_ID) {
       // Another house member's SPIN holds this round. Take it over only once
       // they've had time to settle it (they may have left mid-round).
-      const k = `${casinoDocEpoch()}:${s.round}:${s.operator}`;
-      if (spinSeen?.key !== k) spinSeen = { key: k, at: Date.now() };
-      if (Date.now() - spinSeen.at < SPIN_TAKEOVER_MS) {
+      if (Date.now() - spinSeenAt(itemId, s, s.operator, Date.now()) < SPIN_TAKEOVER_MS) {
         say('THE WHEEL IS SPINNING — ANOTHER HOUSE MEMBER IS RUNNING THIS ROUND');
         return;
       }
@@ -1596,18 +1642,41 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     const r = s.round;
     // Let a rival's lease write converge before this page may publish.
-    const settleFrom = Date.now() + LEASE_SETTLE_MS;
+    let settleFrom = Date.now() + LEASE_SETTLE_MS;
     const epoch = casinoDocEpoch();
-    const until = Date.now() + REVEAL_GRACE_MS + 6_000;
+    let until = Date.now() + REVEAL_GRACE_MS + 6_000;
+    let polledAt = Date.now();
     spinPoll = window.setInterval(() => {
-      const now = rouletteState();
+      // ⏱ The poll's window counts only time this page could settle in:
+      // asleep, frozen, waiting out a wake (tablesAwake) or holding part of
+      // an update (casinoWhole), it waits on, or a wait longer than its
+      // window would leave the round closing until a second press. A clock
+      // gone back mid-poll takes the window back with it, the time left
+      // kept: by under a second (a time sync's step) the page runs on, by
+      // more it waits out a wake.
+      const t = Date.now();
+      const step = t - polledAt;
+      const whole = casinoWhole(itemId);
+      if (step < 0 || !tablesAwake() || !whole) {
+        settleFrom += step;
+        until += step;
+      }
+      polledAt = t;
       // Another room's table can share this id and round: stop on a rebind.
-      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || Date.now() > until
+      if (casinoDocEpoch() !== epoch) {
+        stopSpinPoll();
+        return;
+      }
+      // 📒 The table's own state may be in the part still to come, reading
+      // as gone or as the book's: the round is read again once it comes.
+      if (!whole) return;
+      const now = rouletteState();
+      if (now?.phase !== 'closing' || now.round !== r || t > until
         || (now.operator !== undefined && now.operator !== ROULETTE_PAGE_ID)) {
         stopSpinPoll();
         return;
       }
-      if (Date.now() >= settleFrom) rollAndSettle(itemId, r);
+      if (t >= settleFrom) rollAndSettle(itemId, r);
     }, 150);
   };
 

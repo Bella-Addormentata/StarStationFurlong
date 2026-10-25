@@ -10,6 +10,7 @@ import * as THREE from 'three';
 import * as Y from 'yjs';
 import { bindCasinoDoc, readCageLedger, readChips } from './casinoDoc';
 import {
+  CASHIER_RECONNECTING,
   CASHIER_SCREEN_H,
   CASHIER_SCREEN_W,
   cashierButtonAt,
@@ -74,6 +75,25 @@ describe('cashier presses', () => {
     const cage = readCageLedger();
     expect(cage.issued).toBe(125);
     expect(cage.cashed).toBe(125);
+  });
+
+  it('says RECONNECTING to a CASH OUT while the doc holds part of an update, and cashes out once it is whole', () => {
+    const doc = new Y.Doc();
+    bindCasinoDoc(doc);
+    const me = 'player-Bob';
+    pressCashier('buy-100', me);
+    // Another page's two writes elsewhere, the second given first.
+    const other = new Y.Doc();
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    other.getMap('elsewhere').set('a', 1);
+    other.getMap('elsewhere').set('b', 2);
+    Y.applyUpdate(doc, updates[1]);
+    expect(pressCashier('cashout', me)).toBe(CASHIER_RECONNECTING);
+    expect(readChips(me)).toBe(100);
+    Y.applyUpdate(doc, updates[0]);
+    expect(pressCashier('cashout', me)).toBe('100 CHIPS BACK TO THE CAGE');
+    expect(readChips(me)).toBe(0);
   });
 });
 

@@ -8,17 +8,17 @@
  * lease is written for the room, the session waits OPERATOR_LEASE_SETTLE_MS
  * for the doc to converge, then works while it keeps the lease (renewed every
  * OPERATOR_LEASE_RENEW_MS, lapsing after OPERATOR_LEASE_MS). One operator for
- * the room, not one per cabinet: a player's `bal:` is a whole value, so two
- * sessions settling that player's drops on two cabinets at once would each
- * write it, and the merge would keep only one of the two writes. World ticks
+ * the room, not one per cabinet: that dates from when a player's chips were one
+ * whole value, which two sessions settling that player's drops on two cabinets
+ * at once would each write, the merge keeping only one. Chips are now records
+ * that add up in any order (casinoDoc's CHIP LEDGER). World ticks
  * the room every frame (tickCoinPusherRoom); there is no start/stop control to
  * fight the tick, and a session whose room has no cabinet left lets the lease
  * go.
  *
  * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
  * could each take it and settle drops; when the docs merge only one machine
- * value survives while both players' balance writes do (or one balance write
- * survives where both debited it). Settling can't be made partition-safe
+ * value survives while both players' chip records do. Settling can't be made partition-safe
  * without an authoritative ledger (the Registry-anchored chips), so a session
  * on ANOTHER device takes over a lease it has seen lapse only
  * OPERATOR_UNCLEAN_TAKEOVER_MS later, in case its holder is only cut off.
@@ -28,12 +28,14 @@
  * take over as soon as the lease lapses (a reload, a closed tab); a session
  * that stops operating releases its lease so a successor needn't wait. That
  * window guards only a lease this page has seen. One that sees no lease at all
- * (cut off from the operator, or joining from a cached copy of the room before
- * its live state arrives) takes it at once and operates after the settling
+ * (cut off from the operator) takes it at once and operates after the settling
  * wait, which is enough only where the two are connected: each sees the
  * other's take, and the merge keeps one. So a split of any length that begins
  * before a device has seen the other's lease can put two operators in one
  * room; once it has, only a split outlasting the window can.
+ * A page back in the room on the room cache's copy takes no lease until the
+ * room's state is in (croupier roomStateIn), nor does one whose doc holds part
+ * of an update (casinoWhole), where a renewal parked there reads as none.
  *
  * CLOCKS: devices' clocks aren't synchronised, so a lease written on another
  * device is never judged by the expiry it claims: it lapses one
@@ -86,6 +88,7 @@
  */
 import {
   casinoDocEpoch,
+  casinoWhole,
   clearCoinPusherOperatorLease,
   commitCoinPusherEmpty,
   continueCoinPusherKeySweep,
@@ -105,7 +108,7 @@ import {
   writeCoinPusherState,
 } from './casinoDoc';
 import type { CoinPusherKeySweep, CoinPusherOperatorLease } from './casinoDoc';
-import { canRunCroupier } from './croupier';
+import { canRunCroupier, roomStateIn } from './croupier';
 import {
   chipsInMachine,
   emptyMachine,
@@ -361,6 +364,11 @@ function electCoinPusherOperator(lease: CoinPusherOperatorLease | null, now: num
     || operator.playerId !== playerId) {
     if (lease && lease.sessionId !== operatorSessionId
       && now < takeoverAt(lease, now)) return null;
+    // 📒 No take on a doc holding part of an update, where another session's
+    // renewal parked there reads as no lease, nor on the room cache's copy
+    // before the room's state is in (roomStateIn): its requests may be ones
+    // another session has since settled.
+    if (!casinoWhole() || !roomStateIn(now)) return null;
     const tenure = crypto.randomUUID();
     writeCoinPusherOperatorLease({
       playerId,
@@ -411,6 +419,11 @@ export function operateCoinPusher(
   now: number,
   drawSeed: () => number = randomPusherSeed,
 ): void {
+  // 📒 Not on a doc holding part of an update. A machine rewritten in the
+  // part still to come reads as gone there, and a fresh one written over it
+  // would drop the chips inside; chips on a felt may read as free there too
+  // (casinoDoc spendableChips). The requests wait for the rest.
+  if (!casinoWhole()) return;
   let state = readCoinPusherState(machineId);
   if (!state) {
     // Created only where there is no record at all. One that is there but
@@ -582,6 +595,9 @@ function hasTeardownsHere(): boolean {
  *  nothing is written and the teardown stays pending: the operator tries
  *  again on its next pass. */
 function tearDown(machineId: string, recipient: string): void {
+  // (Nor drained on a doc holding part of an update, where the machine may
+  // read as empty: the teardown waits for the rest.)
+  if (!casinoWhole()) return;
   if (drainAndClearCoinPusher(machineId, recipient) === null) return;
   pendingTeardowns.delete(machineId);
   sweeps.set(machineId, startCoinPusherKeySweep(machineId));
