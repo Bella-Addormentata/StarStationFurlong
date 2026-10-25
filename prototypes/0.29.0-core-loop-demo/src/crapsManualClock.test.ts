@@ -125,4 +125,21 @@ describe('ROLL pressed again while the stamp reaches the room (the stickman thro
       expect(threwAfter).toBeGreaterThanOrEqual(MANUAL_TAKEOVER_SETTLE_MS);
     });
   }
+
+  it('(pressed again just after the clock steps back 300 ms, before the next frame) waits the stamp out before the throw', () => {
+    const t = freshTable();
+    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/);
+    writeMyCrapsBets(t, BOB, [{ type: 'field', amount: 5 }]);
+    frame(t, T0 + 100);
+    expect(pressManualRoll(t, at(T0 + 200))).toBeNull(); // closes, stamps this page
+    expect(readCrapsTableState(t)?.phase).toBe('closing');
+    expect(pressManualRoll(t, at(T0 + 250 - 300))).toBeNull(); // the press lands first
+    expect(readDiceThrow(t)).toBeNull();
+    let threwAfter = -1;
+    for (let real = T0 + 300; real <= T0 + 5_000 && threwAfter < 0; real += 50) {
+      frame(t, real - 300);
+      if (readDiceThrow(t)?.by === 'stickman') threwAfter = real - (T0 + 200);
+    }
+    expect(threwAfter).toBeGreaterThanOrEqual(MANUAL_TAKEOVER_SETTLE_MS - 300);
+  });
 });

@@ -50,8 +50,9 @@
  * down at once by whoever queued it: deleting its keys writes no balance.
  *
  * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
- * could each take it and settle spins; when the docs merge, only one of each
- * balance write survives. Settling can't be made split-safe without an
+ * could each take it and settle spins; when the docs merge, only one machine
+ * value survives while both sessions' chip records do (a spin refunded or
+ * paid on each side counts twice). Settling can't be made split-safe without an
  * authoritative ledger (the Registry-anchored chips), so a session on ANOTHER
  * device takes over a lease it has seen lapse only
  * OPERATOR_UNCLEAN_TAKEOVER_MS later, in case its holder is only cut off.
@@ -60,12 +61,14 @@
  * releases its lease, so a successor needn't wait; so does one leaving the
  * room, or the page (best effort on close). That window guards only a lease
  * this page has seen. One that sees no lease at all (cut off from the
- * operator, or joining from a cached copy of the room before its live state
- * arrives) takes it at once and operates after the settling wait, which is
+ * operator) takes it at once and operates after the settling wait, which is
  * enough only where the two are connected: each sees the other's take, and
  * the merge keeps one. So a split of any length that begins before a device
  * has seen the other's lease can put two operators in one room; once it has,
  * only a split outlasting the window can.
+ * A page back in the room on the room cache's copy takes no lease until the
+ * room's state is in (croupier roomStateIn), nor does one whose doc holds part
+ * of an update (casinoWhole), where a renewal parked there reads as none.
  *
  * CLOCKS: devices' clocks aren't synchronised, so a lease written on another
  * device is never judged by the expiry it claims: it lapses one
@@ -90,9 +93,9 @@
  */
 import {
   casinoDocEpoch,
+  casinoWhole,
   clearLegacySlotOperatorLease,
   clearSlotMachineKeys,
-  casinoWhole,
   clearSlotOperatorLease,
   clearSlotPlayRequest,
   clearSlotReveal,
@@ -117,7 +120,7 @@ import {
   writeSlotOperatorLease,
 } from './casinoDoc';
 import type { SlotOperatorLease } from './casinoDoc';
-import { canRunCroupier } from './croupier';
+import { canRunCroupier, roomStateIn } from './croupier';
 import {
   commitSlotSeed,
   DEFAULT_PAYTABLE,
@@ -419,6 +422,11 @@ function electSlotOperator(lease: SlotOperatorLease | null, playerId: string, no
       manualMachines.clear();
       return null;
     }
+    // 📒 No take on a doc holding part of an update, where another session's
+    // renewal parked there reads as no lease, nor on the room cache's copy
+    // before the room's state is in (roomStateIn): a spin on it may be one
+    // another session has since refunded or settled.
+    if (!casinoWhole() || !roomStateIn(now)) return null;
     takeOperatorLease(playerId, now);
     return null;
   }
@@ -514,10 +522,11 @@ export function tickSlotMachineRoom(
   }
   // A removed machine holding no chips is torn down at once: deleting its keys
   // writes no balance. One still holding chips waits for the room's operator
-  // (TEARDOWN).
+  // (TEARDOWN), and so does any while the doc holds part of an update, where
+  // a machine rewritten in the part still to come reads as holding nothing.
   const teardowns: string[] = [];
   for (const machineId of [...pendingTeardowns.keys()]) {
-    if (slotMachineHoldsChips(machineId)) {
+    if (!casinoWhole() || slotMachineHoldsChips(machineId)) {
       teardowns.push(machineId);
     } else {
       clearSlotMachineKeys(machineId);
@@ -548,6 +557,10 @@ export function tickSlotMachineRoom(
   }
   const operatorId = electSlotOperator(lease, playerId, now);
   if (operatorId === null || !operator) return;
+  // 📒 No work on a doc holding part of an update: a machine or a stake
+  // rewritten in the part still to come reads as gone there, and chips on a
+  // felt may read as free (casinoDoc spendableChips). It waits for the rest.
+  if (!casinoWhole()) return;
   operatedNow = { docEpoch, ids: new Set(operated) };
   // Work started now belongs to this take of the lease (stillOperates).
   const { tenure } = operator;
@@ -603,7 +616,8 @@ export function setManualSlotMachineRunning(
   if (isLeavingRoom()
     || readSlotFundingConfig(machineId)?.ownerId !== playerId
     || isEarlierBuildOperatingNow(now)
-    || heldElsewhere(readSlotOperatorLease(), now)) return false;
+    || heldElsewhere(readSlotOperatorLease(), now)
+    || !casinoWhole() || !roomStateIn(now)) return false;
   manualMachines.set(machineId, { docEpoch: casinoDocEpoch(), playerId });
   if (!ownsOperatorLease(playerId, now)) takeOperatorLease(playerId, now);
   return true;

@@ -617,6 +617,35 @@ describe('a page holding part of another page\'s update', () => {
     }
   });
 
+  it('takes no bankroll deposit from chips a bet heard whole meanwhile holds', async () => {
+    for (const partial of [true, false]) {
+      const driver = await loadPage(1);
+      const tabA = await loadPage(2); // Amy's tab that bets
+      const tabB = await loadPage(3); // her other tab, at her slot machine
+      const other = await loadPage(4);
+      const machine = 'slot-9';
+      const funding = { mode: 'machine' as const, ownerId: amy };
+      driver.casino.writeCrapsFairnessPref(TABLE, 'rng');
+      driver.casino.buyInChips(amy, 50);
+      driver.casino.writeSlotFundingConfig(machine, funding);
+      driver.croupier.openBetting(TABLE, 1);
+      sync(driver, tabA, tabB, other);
+      const [first, second] = updatesOf(other, () => {
+        other.casino.writeMySeat(CRAPS, 'player-Zed', { stand: 0, angle: 0, at: 1 });
+        other.casino.writeMySeat(CRAPS, 'player-Zed', { stand: 0, angle: 0, at: 2 });
+      });
+      if (partial) Y.applyUpdate(tabB.doc, second);
+      for (const u of updatesOf(tabA, () => tabA.casino.writeMyBets(TABLE, amy, 1, [{ type: 'odd', amount: 50 }]))) {
+        Y.applyUpdate(tabB.doc, u);
+      }
+      expect(tabB.casino.depositSlotFunding(machine, amy, 50)).toBe(false);
+      if (partial) Y.applyUpdate(tabB.doc, first);
+      sync(driver, tabA, tabB, other);
+      expect({ chips: tabB.casino.readChips(amy), bankroll: tabB.casino.readSlotFundingBalance(machine, funding) })
+        .toEqual({ chips: 0, bankroll: 0 });
+    }
+  });
+
   it('bound on a snapshot of part of an update (the room cache), spends nothing until the rest comes', async () => {
     const { x, rest } = await closeArrivesFirst();
     expect(x.casino.readChips(amy)).toBe(70); // the 30 still held
@@ -1048,4 +1077,86 @@ describe('a Fair round frozen on the side the doc dropped', () => {
     // (The check of a settled round goes by round, as ever.)
     expect(x.fair.frozenFields(CRAPS, { ...closing, phase: 'settled', bk: 'mine.2' }).stakes).toEqual({ [amy]: 10 });
   });
+});
+
+describe("a bettor whose list the doc lost in the split, frozen by the close on the side it keeps", () => {
+  const big6 = { type: 'big6' as const, amount: 10 };
+  const place9 = { type: 'place' as const, pick: 9, amount: 10 };
+  for (const mode of ['rng', 'fair-roll', 'fair-void'] as const) {
+    it(`craps (${mode}): the big 6 the doc keeps up plays as the doc has it, nothing is charged for the bets it lost, and a removal hands back the rest`, async () => {
+      const y2 = await loadPage(1); // Amy's tab on the side that took over
+      const x = await loadPage(2); // cut off; Amy's tab there too
+      const y1 = await loadPage(3); // takes the table over
+      x.casino.writeCrapsFairnessPref(CRAPS, 'rng');
+      x.casino.buyInChips(amy, 100);
+      await roll(x, 3, 5, { [amy]: [big6] }); // an 8: the point, the big 6 stays up
+      sync(x, y1, y2);
+      await roll(x, 2, 3);
+      x.casino.writeMyCrapsBets(CRAPS, amy, []); // the cut-off side: Amy takes it down
+      await roll(y1, 1, 4);
+      sync(y1, y2);
+      // The other side: Amy adds a place 9 to her big 6.
+      expect(y2.casino.writeMyCrapsBets(CRAPS, amy, [big6, place9])).toBe(true);
+      sync(y1, y2);
+      expect(y1.casino.readChips(amy)).toBe(80);
+      // (Fair, the void: y1 holds no house seed for the round y2 opened.)
+      const opener = mode === 'fair-void' ? y2 : y1;
+      if (mode !== 'rng') {
+        y2.casino.writeCrapsFairnessPref(CRAPS, 'multiparty');
+        sync(y1, y2);
+      }
+      const was = opener.casino.readCrapsTableState(CRAPS)!;
+      opener.craps.openCrapsBetting(CRAPS, 3, was.point, was);
+      sync(y1, y2);
+      y1.craps.closeCrapsBetting(CRAPS, y1.casino.readCrapsTableState(CRAPS)!);
+      sync(y1, y2);
+      // The room meets: the doc keeps y1's book and state, and x's list for Amy
+      // (x's client id beats y2's), written over x's roll: her big 6 is up again.
+      sync(x, y1, y2);
+      expect(y1.casino.readMyCrapsBets(CRAPS, amy)).toEqual([big6]);
+      diceTo(1, 4); // a 5 leaves a big 6 up
+      y1.craps.rollAndSettleCraps(CRAPS, 3, y1.casino.readCrapsTableState(CRAPS)!.point);
+      await flush();
+      sync(x, y1, y2);
+      expect(y1.casino.readCrapsTableState(CRAPS)).toMatchObject({ phase: 'settled', round: 3 });
+      expect([x, y1, y2].map((p) => p.casino.readMyCrapsBets(CRAPS, amy))).toEqual([[big6], [big6], [big6]]);
+      expect([x, y1, y2].map((p) => p.casino.readChips(amy))).toEqual([90, 90, 90]);
+      y1.craps.closeCrapsTable(CRAPS, 'local');
+      sync(x, y1, y2);
+      expect([x, y1, y2].map((p) => p.casino.readChips(amy))).toEqual([100, 100, 100]);
+    });
+  }
+
+  for (const mode of ['rng', 'multiparty'] as const) {
+    it(`roulette (${mode}): a list the doc lost is handed back, not charged as a rewrite`, async () => {
+      const y2 = await loadPage(1); // Amy's tab on the side that took over
+      const x = await loadPage(2); // cut off; Amy's tab there too
+      const y1 = await loadPage(3); // takes the table over
+      x.casino.writeCrapsFairnessPref(TABLE, 'rng');
+      x.casino.buyInChips(amy, 100);
+      await spin(x, 1, {}, 1);
+      sync(x, y1, y2);
+      // The split: each side spins round 2, then opens round 3, Amy betting 10 there.
+      await spin(x, 2, {}, 1);
+      x.casino.writeCrapsFairnessPref(TABLE, mode);
+      x.croupier.openBetting(TABLE, 3);
+      x.casino.writeMyBets(TABLE, amy, 3, red);
+      await spin(y1, 2, {}, 2);
+      y1.casino.writeCrapsFairnessPref(TABLE, mode);
+      y1.croupier.openBetting(TABLE, 3);
+      sync(y1, y2);
+      y2.casino.writeMyBets(TABLE, amy, 3, red);
+      sync(y1, y2);
+      y1.croupier.closeBetting(TABLE, y1.casino.readTableState(TABLE)!);
+      sync(y1, y2);
+      sync(x, y1, y2); // the doc keeps y1's book and close, x's list for Amy
+      expect(y1.casino.readMyBets(TABLE, amy, 3)).toEqual([]);
+      spinTo(1);
+      y1.croupier.rollAndSettle(TABLE, 3);
+      await flush();
+      sync(x, y1, y2);
+      expect(y1.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', round: 3 });
+      expect([x, y1, y2].map((p) => p.casino.readChips(amy))).toEqual([100, 100, 100]);
+    });
+  }
 });

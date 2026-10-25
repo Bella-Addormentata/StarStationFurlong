@@ -1,13 +1,14 @@
 /**
  * Presses at the table (casinoTableSession). The house's manual SPIN
  * (spinByHand):
- *  ⏱ when the clock goes back mid-poll by under a second, the poll's times
- *    go back with it; by more, the poll starts again with the page's wake in
- *    it, so the round settles once the page is awake again, not when the
- *    clock comes round, and not only on a second press;
+ *  ⏱ its poll counts only the time the page could settle in: after the
+ *    clock goes back, or the page was suspended just after the press, the
+ *    round settles once the page is awake again, not when the clock comes
+ *    round, and not only on a second press;
  *  📒 on a doc holding part of an update (casinoWhole), where a bet list
  *    rewritten in the part still to come reads as gone, it closes nothing
- *    until the rest comes, so the round takes that list.
+ *    until the rest comes, so the round takes that list; pressed before
+ *    such a wait, it settles once the rest comes.
  * And a bettor's ↶ take-down on such a doc: refused, and said so, not told
  * TAKEN DOWN with the bets still riding.
  *
@@ -117,6 +118,7 @@ beforeEach(() => {
 afterEach(() => {
   setSoleCroupierPredicate(() => true);
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 /** Mount the focused roulette table as a house member and open its card;
@@ -170,6 +172,27 @@ describe("the house's manual SPIN", () => {
   }
 });
 
+describe("the house's manual SPIN on a page suspended just after the press (frames and timers stopped, the clock steady)", () => {
+  for (const [what, away] of [['for 6.5 s', 6_500], ['for 30 s', 30_000]] as const) {
+    it(`(${what}) settles the round once awake, without a second press`, async () => {
+      const t = freshTable();
+      writeCrapsFairnessPref(t, 'rng');
+      openBetting(t, 1);
+      writeMyBets(t, BOB, 1, red);
+      noteTablesRunning(Date.now());
+      const house = houseAtTable(t);
+      house.spin();
+      await run(300); // before the settle's wait for a rival's lease ends
+      expect(readTableState(t)?.phase).toBe('closing');
+      vi.setSystemTime(Date.now() + away); // nothing ran meanwhile
+      await run(3 * TABLE_LEASE_LAPSE_MS);
+      const phase = readTableState(t)?.phase;
+      house.unmount();
+      expect(phase).toBe('settled');
+    });
+  }
+});
+
 describe("the house's manual SPIN on a Fair table whose bettor never reveals", () => {
   /** Frames every 50 ms, real hashing (about a millisecond) landing inside
    *  the frame it starts in, as in a browser. */
@@ -198,6 +221,44 @@ describe("the house's manual SPIN on a Fair table whose bettor never reveals", (
       expect(readTableState(t)?.phase).toBe('closing');
       vi.setSystemTime(Date.now() - back);
       for (let i = 0; i < 240 && readTableState(t)?.phase !== 'settled'; i++) await runReal(100);
+      const phase = readTableState(t)?.phase;
+      house.unmount();
+      expect(phase).toBe('settled');
+    });
+  }
+});
+
+describe("the house's manual SPIN on a Fair table whose bettor never reveals, the clock stepping back about a second", () => {
+  /** Frames every 20 ms, the hash resolved at once (a browser's takes about
+   *  a millisecond), so the step lands where it is meant to. A step of just
+   *  over a second is a wake to the frames but under a second to the poll,
+   *  which samples the clock less often. */
+  async function frames(ms: number): Promise<void> {
+    for (let left = ms; left > 0; left -= 20) {
+      await vi.advanceTimersByTimeAsync(20);
+      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+      noteTablesRunning(Date.now());
+    }
+  }
+  for (const back of [0, 300, 990, 1_060, 1_120, 1_300]) {
+    it(`(a step back of ${back} ms, 4.3 s after the press) settles the round without a second press`, async () => {
+      const { sha256 } = await import('@noble/hashes/sha256');
+      vi.spyOn(globalThis.crypto.subtle, 'digest').mockImplementation(
+        async (_alg: unknown, data: unknown) => sha256(new Uint8Array(data as ArrayBuffer)).buffer as ArrayBuffer);
+      const t = freshTable();
+      writeCrapsFairnessPref(t, 'multiparty');
+      openBetting(t, 1);
+      const me = getPlayerId();
+      buyInChips(me, 100);
+      writeMyBets(t, me, 1, red);
+      tickFairSeeds(t, 'roulette', me, Date.now(), true); // commits; never reveals
+      noteTablesRunning(Date.now());
+      const house = houseAtTable(t);
+      house.spin();
+      await frames(4_300);
+      expect(readTableState(t)?.phase).toBe('closing');
+      vi.setSystemTime(Date.now() - back);
+      await frames(20_000);
       const phase = readTableState(t)?.phase;
       house.unmount();
       expect(phase).toBe('settled');
@@ -238,6 +299,25 @@ describe("the house's manual SPIN on a doc holding part of an update", () => {
     house.unmount();
     expect(readTableState(t)?.phase).toBe('settled');
     expect(readChips(BOB)).not.toBe(100); // played, not handed back
+  });
+
+  it('pressed on a whole doc that then waits longer than the poll for the rest, settles once it comes, without a second press', async () => {
+    const t = freshTable();
+    writeCrapsFairnessPref(t, 'rng');
+    openBetting(t, 1);
+    writeMyBets(t, BOB, 1, red);
+    noteTablesRunning(Date.now());
+    const house = houseAtTable(t);
+    house.spin();
+    await run(300);
+    const rest = partOfAnUpdate();
+    await run(15_000);
+    expect(readTableState(t)?.phase).toBe('closing');
+    Y.applyUpdate(doc, rest);
+    await run(2_000);
+    const phase = readTableState(t)?.phase;
+    house.unmount();
+    expect(phase).toBe('settled');
   });
 });
 
@@ -287,4 +367,76 @@ describe('a take-down on a doc holding part of an update', () => {
       expect(readChips(me)).toBe(100);
     });
   }
+});
+
+/** Another page rewrites the table's state just after a write this page has
+ *  yet to get, and this page gets the rewrite first: the state's old value
+ *  is deleted at once and the new one parked, so the table reads as gone.
+ *  Returns the rest. */
+function tableStateParked(t: string): Uint8Array {
+  const other = new Y.Doc();
+  Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+  const updates: Uint8Array[] = [];
+  other.on('update', (u: Uint8Array) => updates.push(u));
+  other.getMap('elsewhere').set('note', 1);
+  const s = other.getMap('casino').get(`table:${t}`) as object;
+  other.getMap('casino').set(`table:${t}`, { ...s, phaseDeadline: Date.now() + 10_000 });
+  Y.applyUpdate(doc, updates[1]);
+  return updates[0];
+}
+
+describe("presses while the table's own state is in the part of an update still to come", () => {
+  for (const game of ['roulette', 'craps'] as const) {
+    it(`${game}: a take-down says RECONNECTING, not that you have no bets, and the bets stay`, () => {
+      const t = `${game}-parked-state`;
+      const me = getPlayerId();
+      buyInChips(me, 100);
+      writeCrapsFairnessPref(t, 'rng');
+      if (game === 'roulette') {
+        openBetting(t, 1);
+        writeMyBets(t, me, 1, red);
+      } else {
+        openCrapsBetting(t, 1, null);
+        writeMyCrapsBets(t, me, [{ type: 'field', amount: 10 }]);
+      }
+      const rest = tableStateParked(t);
+      expect(casinoWhole(t)).toBe(false);
+      const ui = createCasinoTableUI({ itemId: t, game, isHouse: () => false, stand: null, visual: null });
+      const host = new FakeEl();
+      ui.mount(host as unknown as HTMLElement);
+      host.children[0].fire('keydown', { key: 'c', preventDefault() {}, stopPropagation() {} });
+      const said = host.children[1].querySelector('[data-live]').textContent;
+      ui.unmount();
+      Y.applyUpdate(doc, rest);
+      expect(said).toContain(RECONNECTING_NOTICE);
+      expect(game === 'roulette' ? readMyBets(t, me, 1) : readMyCrapsBets(t, me)).toHaveLength(1);
+    });
+  }
+
+  it("the house's NEXT on a settled table says RECONNECTING", async () => {
+    const t = 'roulette-parked-next';
+    writeCrapsFairnessPref(t, 'rng');
+    openBetting(t, 1);
+    writeMyBets(t, BOB, 1, red);
+    noteTablesRunning(Date.now());
+    const ui = createCasinoTableUI({ itemId: t, game: 'roulette', isHouse: () => true, stand: null, visual: null });
+    const host = new FakeEl();
+    ui.mount(host as unknown as HTMLElement);
+    const capture = host.children[0];
+    capture.fire('keydown', { key: 's', preventDefault() {}, stopPropagation() {} });
+    const card = host.children.find((c) => c !== capture && c.listeners.has('click'))!;
+    const press = (act: string): void => card.fire('click', {
+      target: { closest: () => ({ dataset: { act } }) }, preventDefault() {}, stopPropagation() {},
+    });
+    press('spin');
+    for (let i = 0; i < 30 && readTableState(t)?.phase !== 'settled'; i++) await run(100);
+    expect(readTableState(t)?.phase).toBe('settled');
+    const rest = tableStateParked(t);
+    expect(casinoWhole(t)).toBe(false);
+    press('next');
+    const said = host.children[1].querySelector('[data-live]').textContent;
+    ui.unmount();
+    Y.applyUpdate(doc, rest);
+    expect(said).toContain(RECONNECTING_NOTICE);
+  });
 });

@@ -43,6 +43,7 @@ import {
   readFeltStakes,
   readTableOperatorLease,
   readTableState,
+  rouletteListLost,
   setTablesAwakeCheck,
   tableEndingStakes,
   tableIncOf,
@@ -161,24 +162,40 @@ function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: st
 let tablesEpoch = -1;
 let tablesRanAt: number | null = null;
 let tablesFrom = 0;
-/** When this page first ran its tables in this room doc. */
-let tablesSince = 0;
 /** How many times this page has woken from not running its tables. */
 let tablesWakes = 0;
 
 /** Has the room's state come in since this page joined it (main.ts wires
  *  routeRoomReady)? Until it has, the doc may be the room cache's copy from
  *  before this page left, its own lease in it: tables driven on that copy
- *  would undo the rounds another page settled meanwhile. Yes with no room
- *  sync. */
+ *  would undo the rounds another page settled meanwhile, and slots or a coin
+ *  pusher run on it would refund or settle again what another page has.
+ *  Yes with no room sync. */
 let roomStateArrived: () => boolean = () => true;
-/** How long a page waits for the room's state before it runs its tables on
- *  the copy it has (a room whose host never answers): a split then, the doc
- *  keeping one side's book (casinoDoc THE TABLE'S BOOK). */
+/** How long a page waits for the room's state before it runs its tables, slots
+ *  and coin pushers on the copy it has (a room whose host never answers): a
+ *  split then, the doc keeping one side's book (casinoDoc THE TABLE'S BOOK). */
 export const ROOM_STATE_WAIT_MS = 30_000;
 
 export function setRoomStateArrivedCheck(check: () => boolean): void {
   roomStateArrived = check;
+}
+
+/** When this page first looked for the room's state in this room doc. */
+let roomEpoch = -1;
+let roomSince = 0;
+
+/** May this page act on the room's casino on the doc it has: has the room's
+ *  state come in this visit, or has it waited ROOM_STATE_WAIT_MS for it? A
+ *  clock gone back counts the wait from then. The tables ask (tablesAwake),
+ *  and so do the slots' and the coin pusher's elections before a take. */
+export function roomStateIn(now = Date.now()): boolean {
+  if (casinoDocEpoch() !== roomEpoch) {
+    roomEpoch = casinoDocEpoch();
+    roomSince = now;
+  }
+  if (now < roomSince) roomSince = now;
+  return roomStateArrived() || now - roomSince >= ROOM_STATE_WAIT_MS;
 }
 /** A clock gone back by less than this (a time sync's correction) is no
  *  sleep: what this page waits on moves back with it (noteTablesRunning). */
@@ -201,9 +218,7 @@ export function noteTablesRunning(now = Date.now()): void {
     tablesEpoch = epoch;
     tablesRanAt = null;
     tablesFrom = 0;
-    tablesSince = now;
   }
-  if (now < tablesSince) tablesSince = now;
   // A clock gone back (a correction as the computer wakes, a manual change)
   // says nothing of how long the page was away: it wakes as from a sleep,
   // its wait a lapse from now, not until the clock comes round again. One
@@ -236,8 +251,8 @@ export function tablesWakeCount(): number {
  *  the page's next frame. A page that hasn't run them in this doc yet may,
  *  once the room's state is in. */
 export function tablesAwake(now = Date.now()): boolean {
+  if (!roomStateIn(now)) return false;
   const ran = casinoDocEpoch() === tablesEpoch ? tablesRanAt : null;
-  if (!roomStateArrived() && (ran === null || now - tablesSince < ROOM_STATE_WAIT_MS)) return false;
   if (ran === null) return true;
   return now >= tablesFrom && ran - now < TABLE_CLOCK_SLACK_MS && now - ran < TABLE_LEASE_LAPSE_MS;
 }
@@ -403,6 +418,9 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   // but never revealed forfeits this round's bets.
   const live = readAllBets(tableId, round);
   const { bets, omitted, voided: rewritten } = frozenWagers(tableId, before, live);
+  // (Nor is a bettor whose list the doc kept from the other side of a split
+  // one who rewrote it: it plays nothing here. rouletteListLost)
+  const lost = new Set(rewritten.filter((pid) => rouletteListLost(tableId, pid, round)));
   // (A void round produced no pocket, so nobody's reveal mattered: no forfeits.)
   if (!voided) for (const pid of forfeited) delete bets[pid];
   const payouts = result === null ? {} : resolveRound(bets, result);
@@ -426,9 +444,12 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
     const held = heldAtClose(tableId, before, pid);
     let delta: number;
     // A bet that missed the freeze (it arrived just after "no more bets"),
-    // or any bet on a void round, goes back to its bettor: what it held is
-    // released as the round ends, and what was taken of it is refunded.
-    if (omitted.includes(pid) || (voided && !rewritten.includes(pid))) delta = feltStake(tableId, pid).taken;
+    // one the doc lost in a split, or any bet on a void round, goes back to
+    // its bettor: what it held is released as the round ends, and what was
+    // taken of it is refunded.
+    if (omitted.includes(pid) || lost.has(pid) || (voided && !rewritten.includes(pid))) {
+      delta = feltStake(tableId, pid).taken;
+    }
     // A list rewritten (or emptied) after the close is lost as it was
     // frozen (the rewrite could shrink it), and never paid.
     else if (rewritten.includes(pid)) delta = -held;

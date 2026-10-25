@@ -16,7 +16,7 @@
  *   cashed:<playerId>         → number   lifetime chips returned, ditto
  *   table:<tableId>           → RouletteTableState (croupier-written;
  *                                        `bk`: the book it goes on from)
- *   bets:<tableId>:<playerId> → { round, held: RouletteBet[], inc, taken? }
+ *   bets:<tableId>:<playerId> → { round, held: RouletteBet[], inc, bk?, taken? }
  *                                        (owner-written; craps: { kind, held,
  *                                        inc, base, taken?, over? }; an
  *                                        earlier build's: { round?, kind?,
@@ -1438,6 +1438,18 @@ export function readMyBets(tableId: string, playerId: string, round: number): Ro
   return list && list.round === round ? list.bets : [];
 }
 
+/** ⚖️ Whether no list of a bettor's reads for round `round` of the opening
+ *  the table's state goes on from: the doc kept the write of it from the
+ *  other side of a split (another opening, or another round). A Fair settle
+ *  hands back what such a bettor put down, as an RNG one does, rather than
+ *  take the list for one rewritten after the close: a write that crossed the
+ *  close names the very opening and round it read, so it reads here. */
+export function rouletteListLost(tableId: string, playerId: string, round: number): boolean {
+  const map = ensureMap();
+  const s = readTableState(tableId);
+  return rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s), s?.bk)?.round !== round;
+}
+
 /** The bettor's own write of their list for `round`, its chips held on the
  *  felt. What an earlier build's list (or one rewritten from it) took goes on
  *  with the rewrite, so nothing is handed back twice. Only while the table
@@ -1620,6 +1632,19 @@ function payKeptOwed(map: Y.Map<unknown>, tableId: string, inc: string, playerId
   if (owed > 0) creditTableOutcome(tableId, inc, 'end', playerId, owed);
 }
 
+/** What the book of a table's incarnation `at` kept up of a player's bets. */
+function keptEntry(chips: Y.Map<unknown>, tableId: string, playerId: string, at: Incarnation) {
+  return at === undefined ? undefined : entryOf(bookAt(chips, `${tableId}:${at}`)?.kept, playerId);
+}
+
+/** Whether this build's list of a player's plays over what the book kept up
+ *  of their bets (crapsFelt): written after the settle that kept them, over
+ *  that very write of them, or over none where the book kept none. */
+function ownListPlays(own: { base?: number; over?: string }, kept: { round: number; w: string } | undefined): boolean {
+  if (!kept) return own.over === undefined;
+  return own.base !== undefined && own.base > kept.round && own.over === kept.w;
+}
+
 /** 🎲 A player's craps bets as they play, of the two keys: their own list,
  *  unless the stickman has settled a roll since they wrote it, when what that
  *  settle left up (the book's `kept`) plays instead. A list counts as
@@ -1637,13 +1662,13 @@ function crapsFelt(
   map: Y.Map<unknown>, tableId: string, playerId: string, at: Incarnation, chips = ensureChips(),
 ): { bets: CrapsBet[]; taken: number; over?: string } | null {
   const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), at);
-  const kept = at === undefined ? undefined : entryOf(bookAt(chips, `${tableId}:${at}`)?.kept, playerId);
+  const kept = keptEntry(chips, tableId, playerId, at);
   // (A list written over kept bets the doc's book doesn't have at all was
   // written over a roll it doesn't keep.)
-  if (!kept) return own?.over !== undefined ? null : own;
+  if (!kept) return own && !ownListPlays(own, kept) ? null : own;
   const keep = { bets: kept.kept, taken: kept.taken ?? 0, over: kept.w };
   if (!own) return keep;
-  if (!own.legacy) return own.base !== undefined && own.base > kept.round && own.over === kept.w ? own : keep;
+  if (!own.legacy) return ownListPlays(own, kept) ? own : keep;
   // (An earlier build's list newer than the kept bets: a list written over
   // it is over them too.)
   return own.pruned ? keep : { ...own, over: kept.w };
@@ -1651,6 +1676,18 @@ function crapsFelt(
 
 export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
   return crapsFelt(ensureMap(), tableId, playerId, incarnationOf(tableId, readCrapsTableState(tableId)))?.bets ?? [];
+}
+
+/** ⚖️ Whether a bettor's own craps list is in the doc but doesn't play
+ *  (crapsFelt): it was written over a roll the doc doesn't keep, on the other
+ *  side of a split, and the book's kept bets (or none) play instead. A Fair
+ *  settle then plays the felt as the doc has it, as an RNG roll does, rather
+ *  than take the list for one rewritten after the close: a write that crossed
+ *  the close was written over the felt it read, so it plays. */
+export function crapsListLost(tableId: string, playerId: string): boolean {
+  const at = incarnationOf(tableId, readCrapsTableState(tableId));
+  const own = crapsOwnList(ensureMap().get(`bets:${tableId}:${playerId}`), at);
+  return !!own && !own.legacy && !ownListPlays(own, keptEntry(ensureChips(), tableId, playerId, at));
 }
 
 /** The bettor's own write of their craps list, its chips held on the felt.
@@ -1773,8 +1810,8 @@ function tableOf(ids: { has(id: string): boolean }, rest: string): string | null
   return null;
 }
 
-/** Chips each player has held on felts (and, below 0, what kept records left
- *  by a removal owe them back: keptOwed). */
+/** Chips each player has held on felts (and, below 0, what the kept bets in
+ *  a removed incarnation's book owe them back: keptOwed). */
 function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string, bigint> {
   const tables = new Map<string, RouletteTableState | CrapsTableState>();
   let gone = false;

@@ -51,6 +51,23 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("a page waiting for the room's state", () => {
+  it('whose clock goes back an hour runs its tables on the copy it has within the wait, not an hour later', async () => {
+    const page = await loadPage();
+    const t0 = 2_000_000_000;
+    page.croupier.setRoomStateArrivedCheck(() => false);
+    for (let t = t0; t <= t0 + 5_000; t += 100) page.croupier.noteTablesRunning(t);
+    const back = t0 + 5_100 - 3_600_000;
+    let awakeAfter = -1;
+    for (let t = back; t <= back + 60_000 && awakeAfter < 0; t += 100) {
+      page.croupier.noteTablesRunning(t);
+      if (page.croupier.tablesAwake(t)) awakeAfter = t - back;
+    }
+    expect(awakeAfter).toBeGreaterThan(0);
+    expect(awakeAfter).toBeLessThanOrEqual(page.croupier.ROOM_STATE_WAIT_MS + 1_000);
+  });
+});
+
 describe('a lone driving page', () => {
   it('whose clock steps back 1 ms every 5 s drives again within a minute', async () => {
     const a = await loadPage();

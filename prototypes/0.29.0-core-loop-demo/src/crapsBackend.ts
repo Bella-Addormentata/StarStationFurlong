@@ -29,6 +29,7 @@
 import {
   casinoDocEpoch,
   casinoWhole,
+  crapsListLost,
   creditTableOutcome,
   feltStake,
   readAllCrapsBets,
@@ -141,10 +142,10 @@ class LocalCrapsBackend implements CrapsBackend {
         // settle writes them: another page may be settling this very roll
         // with dice, and the doc keeps one page's roll whole.
         const live = readAllCrapsBets(tableId);
-        const { bets: standing, voided } = frozenWagers(tableId, before, live);
+        const { bets: standing, voided, lost } = frozenFelt(tableId, before, live);
         const left: Record<string, CrapsBet[]> = { ...standing };
-        for (const pid of [...voided, ...readEmptiedLists(tableId, round)]) left[pid] ??= [];
-        const held = heldBy(tableId, before, Object.keys(left));
+        for (const pid of [...voided, ...lost, ...readEmptiedLists(tableId, round)]) left[pid] ??= [];
+        const held = heldBy(tableId, before, Object.keys(left), lost);
         transactCasino(() => {
           writeSettledState(tableId, {
             kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
@@ -212,7 +213,7 @@ class LocalCrapsBackend implements CrapsBackend {
     // Only wagers frozen at "no more bets" settle: the reveals made the dice
     // computable, so a list rewritten since is void and cleared like a forfeit.
     const live = readAllCrapsBets(tableId);
-    const { bets: allBets, voided } = frozenWagers(tableId, before, live);
+    const { bets: allBets, voided, lost } = frozenFelt(tableId, before, live);
     forfeited = [...forfeited, ...voided];
     for (const pid of forfeited) delete allBets[pid];
     const { payouts, remaining } = resolveCrapsRound(
@@ -226,9 +227,9 @@ class LocalCrapsBackend implements CrapsBackend {
     // so is a bettor the close named whose list this page hasn't (an RNG
     // roll's): the settle's book names every bettor whose list it saw (the
     // removal refunds skip what it settled: endCounts, tableEndingStakes).
-    for (const pid of [...readEmptiedLists(tableId, round), ...(before.bettors ?? [])]) remaining[pid] ??= [];
+    for (const pid of [...readEmptiedLists(tableId, round), ...(before.bettors ?? []), ...lost]) remaining[pid] ??= [];
     // A list rewritten (or emptied) since the close loses what it held then.
-    const held = heldBy(tableId, before, Object.keys(remaining));
+    const held = heldBy(tableId, before, Object.keys(remaining), lost);
     const now = Date.now();
     // One transaction: a page sees the settled roll, what it paid, and the
     // pruned felts together.
@@ -265,9 +266,27 @@ class LocalCrapsBackend implements CrapsBackend {
   }
 }
 
-/** What each bettor's list held at the close (the settle takes it). */
-function heldBy(tableId: string, before: CrapsTableState, pids: string[]): Record<string, number> {
-  return Object.fromEntries(pids.map((pid) => [pid, heldAtClose(tableId, before, pid)]));
+/** The wagers frozen at "no more bets" that settle (frozenWagers), less the
+ *  bettors whose own list the doc kept from the other side of a split
+ *  (crapsListLost): they aren't taken for bettors who rewrote theirs since
+ *  the close, and their felt plays as the doc has it, as on an RNG roll. */
+function frozenFelt(
+  tableId: string, before: CrapsTableState, live: Record<string, CrapsBet[]>,
+): { bets: Record<string, CrapsBet[]>; voided: string[]; lost: string[] } {
+  const { bets, voided } = frozenWagers(tableId, before, live);
+  const lost = voided.filter((pid) => crapsListLost(tableId, pid));
+  for (const pid of lost) if (live[pid]) bets[pid] = live[pid];
+  return { bets, voided: voided.filter((pid) => !lost.includes(pid)), lost };
+}
+
+/** What each bettor's list held at the close (the settle takes it): what
+ *  its felt holds now for a bettor whose list the doc lost (frozenFelt). */
+function heldBy(
+  tableId: string, before: CrapsTableState, pids: string[], lost: readonly string[],
+): Record<string, number> {
+  return Object.fromEntries(pids.map((pid) => [
+    pid, lost.includes(pid) ? feltStake(tableId, pid).net : heldAtClose(tableId, before, pid),
+  ]));
 }
 
 /**

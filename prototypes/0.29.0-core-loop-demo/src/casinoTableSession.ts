@@ -44,7 +44,7 @@ import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
 import {
   closeBetting, isCroupierLive, openBetting, RECONNECTING_NOTICE, rollAndSettle, ROULETTE_PAGE_ID, spinSeenAt,
-  SPIN_TAKEOVER_MS, TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake,
+  SPIN_TAKEOVER_MS, tablesAwake,
 } from './croupier';
 import { crapsBackend } from './crapsBackend';
 import {
@@ -640,7 +640,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     spinPoll = null;
   };
 
-  /** Chips in hand (denominations). Spent only when they land on the felt. */
+  /** Chips in hand (denominations). Held on the felt by my list once they
+   *  land; nothing is taken. */
   let hand: number[] = [];
   /** The rail as laid out right now (frozen while a pickup drag runs). */
   let railView: RailStack[] = [];
@@ -734,6 +735,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const syncWindow = (): void => {
     syncEpoch();
+    // (Not on a doc holding part of an update, where the table may read as
+    // gone and its round as 1: this window's chips would be forgotten.)
+    if (!casinoWhole(itemId)) return;
     const r = round();
     if (r !== windowRound) {
       windowRound = r;
@@ -816,6 +820,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   const placeHand = (rg: FeltRegion<Spot>): void => {
     syncWindow();
+    // 📒 Not on a doc holding part of an update (casinoWhole): the table may
+    // read as gone there, or a list as empty, and no bet goes down anyway.
+    if (!casinoWhole(itemId)) {
+      say(RECONNECTING_NOTICE);
+      return;
+    }
     // 🪙 Bets hold their chips on a table that is up (casinoDoc STAKES ON THE
     // FELT): until the house (or its robot) opens this one, nothing goes down.
     if (!(game === 'craps' ? crapsState() : rouletteState())) {
@@ -896,10 +906,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     refreshRail();
   };
 
-  /** Pick my chips put down this window back off a box (refunded; into the
-   *  hand when it is empty). */
+  /** Pick my chips put down this window back off a box (back to my rail: the
+   *  list stops holding them; into the hand when it is empty). */
   const takeBack = (rg: FeltRegion<Spot>): boolean => {
     syncWindow();
+    if (!casinoWhole(itemId)) { // (as placeHand)
+      say(RECONNECTING_NOTICE);
+      return true;
+    }
     const key = spotKey(rg.bet);
     // Odds, place, big 6 / 8 and hardways may come down any time the betting
     // is open, not only this window's chips (the flat bet under odds stays).
@@ -942,6 +956,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const takeDownAll = (): void => {
     syncWindow();
     h?.pressTakeDown();
+    if (!casinoWhole(itemId)) { // (as placeHand)
+      say(RECONNECTING_NOTICE);
+      return;
+    }
     const bets = myBets();
     if (bets.length === 0) {
       say('NO BETS OF YOURS ON THE TABLE');
@@ -1569,13 +1587,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     } else if (act === 'spin') {
       spinByHand();
     } else if (act === 'next') {
-      if (phase() !== 'settled') return;
       // 💤 Just woken: the doc may not have heard the room yet. 📒 Nor while
-      // it holds part of an update: the table may read as gone (casinoWhole).
+      // it holds part of an update: the table may read as gone (casinoWhole),
+      // its round as not settled.
       if (!tablesAwake() || !casinoWhole(itemId)) {
         say(RECONNECTING_NOTICE);
         return;
       }
+      if (phase() !== 'settled') return;
       if (game === 'craps') {
         const s = crapsState();
         openCrapsBetting(itemId, round() + 1, s?.point ?? null, s);
@@ -1628,16 +1647,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     let until = Date.now() + REVEAL_GRACE_MS + 6_000;
     let polledAt = Date.now();
     spinPoll = window.setInterval(() => {
-      // ⏱ A clock gone back mid-poll by under a second (a time sync's step)
-      // takes the poll's times back with it. By more, the page waits out a
-      // wake (tablesAwake): the poll starts again from now, that wait in it.
+      // ⏱ The poll's window counts only time this page could settle in:
+      // asleep, frozen, waiting out a wake (tablesAwake) or holding part of
+      // an update (casinoWhole), it waits on, or a wait longer than its
+      // window would leave the round closing until a second press. A clock
+      // gone back mid-poll takes the window back with it, the time left
+      // kept: by under a second (a time sync's step) the page runs on, by
+      // more it waits out a wake.
       const t = Date.now();
-      if (t < polledAt && polledAt - t < TABLE_CLOCK_SLACK_MS) {
-        settleFrom -= polledAt - t;
-        until -= polledAt - t;
-      } else if (t < polledAt) {
-        settleFrom = t + LEASE_SETTLE_MS;
-        until = t + REVEAL_GRACE_MS + 6_000 + TABLE_LEASE_LAPSE_MS;
+      const step = t - polledAt;
+      if (step < 0 || !tablesAwake() || !casinoWhole(itemId)) {
+        settleFrom += step;
+        until += step;
       }
       polledAt = t;
       const now = rouletteState();

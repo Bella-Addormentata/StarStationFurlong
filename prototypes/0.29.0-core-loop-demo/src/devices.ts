@@ -215,7 +215,7 @@ const COIN_PUSHER_HOLE_NAMES = ['LEFT', 'MIDDLE', 'RIGHT'] as const;
 import type { ArcadeScreenPainter } from './arcadeScreen';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
-import { canRunCroupier } from './croupier';
+import { canRunCroupier, RECONNECTING_NOTICE } from './croupier';
 import {
   isManualSlotMachineRunning,
   setManualSlotMachineRunning,
@@ -5653,10 +5653,10 @@ export function createSlotMachineUI(
       ? depositSlotFunding(deps.itemId, myId, 100)
       : withdrawSlotFunding(deps.itemId, myId, 100);
     if (!ok) {
-      // (A deposit waits for a doc holding every update whole: casinoDoc
+      // (A deposit is refused on a doc holding part of an update: casinoDoc
       // spendableChips.)
       flash = direction === 'deposit'
-        ? (casinoWhole() ? 'DEPOSIT NEEDS 100 OWNER CHIPS' : 'RECONNECTING — PRESS AGAIN IN A MOMENT')
+        ? (casinoWhole() ? 'DEPOSIT NEEDS 100 OWNER CHIPS' : RECONNECTING_NOTICE)
         : 'WITHDRAW NEEDS 100 BANKROLL CHIPS';
       render();
     }
