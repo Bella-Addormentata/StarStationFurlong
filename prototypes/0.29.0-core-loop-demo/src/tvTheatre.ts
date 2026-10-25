@@ -14,8 +14,9 @@
  * laid over the set's screen plane in the DOM (tvScreenLayer.ts).
  *
  * A set in the room that is playing opens the theatre on its own (the room
- * tick, updateTvChip); ✕ on the bar turns the picture off for this viewer
- * until the next programme, and the chip's WATCH brings it back.
+ * tick, updateTvChip), and the picture stays on the set while it plays
+ * (#258: no ✕ to turn it off; the set itself shows its menu only when
+ * stopped or paused). The chip's WATCH moves the picture to another set.
  *
  * Sovereignty (plan §3.3): YouTube and archive.org are CONVENIENCE lanes.
  * They are labelled as such on the panel, an unreachable one says so and
@@ -25,8 +26,8 @@
 import { lapRemountIsFree, replayNeedsRemount, TvSyncController } from './tvSync';
 import type { SeekableRange, TvPlayer } from './tvSync';
 import {
-  countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
-  readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
+  countdownText, formatClock, isStartOnly,
+  readPlayback, readTv, sourceFileUrl, sourceId, sourceLabel,
   sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetLoop, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
@@ -454,7 +455,6 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
   if (phone && !phone.classList.contains('active') && focused instanceof HTMLElement && phone.contains(focused)) focused.blur();
   if (theatre && theatre.itemId !== itemId) closeTvTheatre();
   if (theatre) return;
-  dismissed.delete(itemId); // a WATCH is this viewer asking again
   // The bar: the set's name and programme, the notices (a consent ask,
   // FETCH, TAP TO PLAY), where the room is and the controls. Not a dialog
   // and not modal: the world goes on around it, keys and clicks included.
@@ -565,24 +565,12 @@ function theatreFocusable(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')];
 }
 
-/** The programme this viewer turned off with ✕ (the set, the record's
- *  `showing` — every LOOP lap of it included — and the room's doc it was in:
- *  another room may reuse the item id and the counter): the room tick does
- *  not turn it back on by itself. */
-const dismissed = new Map<string, { showing: number; epoch: number }>();
-
-function isDismissed(itemId: string, showing: number): boolean {
-  const d = dismissed.get(itemId);
-  return d !== undefined && d.showing === showing && d.epoch === tvDocEpoch();
-}
-
-/** Take the picture off the set and the bar down. `byViewer`: the ✕ on the
- *  bar, which keeps this programme off until the next one or a WATCH. */
-export function closeTvTheatre(byViewer = false): void {
+/** Take the picture off the set and the bar down: the programme is over,
+ *  another set's WATCH, the set gone, or the room left. */
+export function closeTvTheatre(): void {
   if (!theatre) return;
   const t = theatre;
   theatre = null;
-  if (byViewer) dismissed.set(t.itemId, { showing: readTv(t.itemId).showing, epoch: tvDocEpoch() });
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
   const hadFocus = t.root.contains(document.activeElement);
@@ -1130,33 +1118,26 @@ function showConsentNotice(t: Theatre, source: TvSource, consent: 'ask' | 'refus
 
 function renderTheatreChrome(t: Theatre): void {
   const rec = readTv(t.itemId);
-  const remote = readRemote(t.itemId);
-  const held = remote.holder !== '' && !remoteLapsed(t.itemId);
-  const mine = iHoldRemote(t.itemId);
   const pb = readPlayback(t.itemId);
   const title = rec.source ? sourceLabel(rec.source) : 'FURLONG TV';
   const lane = rec.source ? sourceLane(rec.source) : '';
   const head = `<span class="tv-theatre-title">📺 ${escapeHtml(t.label)} · ${escapeHtml(title)}</span>
-    ${lane ? `<span class="tv-lane-badge tv-lane-${lane.toLowerCase().replace(/[^a-z]/g, '-')}">${lane}</span>` : ''}
-    <button type="button" class="tv-theatre-close" data-tv-close="1" aria-label="Turn the picture off" title="Turn the picture off (WATCH brings it back)">✕</button>`;
+    ${lane ? `<span class="tv-lane-badge tv-lane-${lane.toLowerCase().replace(/[^a-z]/g, '-')}">${lane}</span>` : ''}`;
   if (head !== t.lastHead) {
     t.head.innerHTML = head;
     t.lastHead = head;
-    t.head.querySelector<HTMLButtonElement>('[data-tv-close]')?.addEventListener('click', () => closeTvTheatre(true));
   }
   const startOnly = rec.source ? isStartOnly(rec.source) : false;
   // A mounted player that cannot seek (a live stream, a host without usable
   // ranges) is start-only too, whatever the source kind promised.
   const seekable = !startOnly && (t.player ? t.player.canSeek : true);
   const sync = startOnly || !seekable ? ' · start-time sync only' : '';
-  // Plain text, set with textContent below: the raw shape-checked name, never
-  // an escaped one (an escaped `&` would show as `&amp;`).
-  const who = held ? `REMOTE · ${remote.name || 'a clone'}` : 'REMOTE ON THE SET';
+  // Plain text, set with textContent below.
   const where = pb.state === 'scheduled' ? countdownText(pb.countdownMs)
     : pb.state === 'paused' ? `PAUSED · ${formatClock(pb.positionMs)}`
     : pb.state === 'playing' ? `● ${formatClock(pb.positionMs)}` : '';
   const loop = rec.loop && !startOnly ? ' · 🔁 LOOP' : '';
-  const status = `${who}${where ? ` · ${where}` : ''}${loop}${sync}`;
+  const status = `${where}${loop}${sync}`.replace(/^ · /, '');
   if (status !== t.lastStatus) {
     t.status.textContent = status;
     t.lastStatus = status;
@@ -1164,13 +1145,14 @@ function renderTheatreChrome(t: Theatre): void {
   const btn = (attr: string, label: string, title = '') =>
     `<button type="button" ${attr} ${title ? `title="${escapeHtml(title)}"` : ''}>${label}</button>`;
   // A start-only source offers no transport: the embed cannot pause or seek.
+  // Anyone's press goes through (#258).
   const controls = [
-    mine && !startOnly && pb.state === 'playing' ? btn('data-tv-pause="1"', '⏸') : '',
-    mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
-    mine && seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
-    mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
+    !startOnly && pb.state === 'playing' ? btn('data-tv-pause="1"', '⏸') : '',
+    !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
+    seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
+    rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
     // archive.org's own player never says it ended, so it has nothing to loop.
-    mine && rec.source && !startOnly
+    rec.source && !startOnly
       ? btn(`data-tv-loop="1" aria-pressed="${rec.loop}"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF', 'At the end, start the film over')
       : '',
     // Every viewer's own switch, for a file from a member's node.
@@ -1185,8 +1167,6 @@ function renderTheatreChrome(t: Theatre): void {
       ? '<span class="tv-theatre-lane">volume: in archive.org\'s player</span>'
       : '<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" data-tv-volume="1" aria-label="Set volume"></label>',
     startOnly && t.player ? btn('data-tv-reload="1"', '↻ RELOAD PLAYER', "archive.org's player did not load? Reload it") : '',
-    !mine && mayPickUpRemote(t.itemId) ? btn('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE') : '',
-    !mine && held ? `<span class="tv-theatre-lane">${escapeHtml(remote.name || 'someone')} has the remote</span>` : '',
   ].join('');
   if (controls !== t.lastControls) {
     // A control row rebuilt under the keyboard keeps its place: ⏸ pressed
@@ -1217,7 +1197,6 @@ function renderTheatreChrome(t: Theatre): void {
       setAutoFetchOn(!autoFetchOn());
       renderTheatreChrome(t);
     });
-    c.querySelector<HTMLButtonElement>('[data-tv-pickup]')?.addEventListener('click', () => { pickUpRemote(t.itemId); });
     c.querySelector<HTMLInputElement>('[data-tv-volume]')?.addEventListener('change', (e) => {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));
     });
@@ -1252,20 +1231,19 @@ export function setTvChipOpener(fn: (itemId: string) => void): void {
 }
 
 /** Driven at ~2 Hz by World with the room's TV ids: opens the theatre on a
- *  set that has something on, or, when this viewer turned it off, shows a
- *  WATCH chip while the theatre is closed. */
+ *  set that has something on, so its picture is on the set; a WATCH chip
+ *  stands in only where the theatre could not open (no opener yet). */
 export function updateTvChip(itemIds: readonly string[]): void {
   let label = '';
   let target = '';
   if (!theatre) {
     // A set in the room with something on shows it: the theatre opens by
-    // itself on the first such set, putting the picture on it, unless this
-    // viewer turned that set's programme off (✕) — a dismissal per set,
-    // gone with the programme or a WATCH. Otherwise the chip offers WATCH.
+    // itself on the first such set, putting the picture on it. The chip
+    // offers WATCH only where it could not.
     for (const id of itemIds) {
       const rec = readTv(id);
       if (!rec.source || rec.state === 'off' || rec.state === 'home') continue;
-      if (chipOpen && !isDismissed(id, rec.showing)) {
+      if (chipOpen) {
         chipOpen(id);
         if (theatre) return;
       }

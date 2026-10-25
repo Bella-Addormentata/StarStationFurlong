@@ -1,21 +1,21 @@
 /**
- * 📺 tvSession — the room tick: a holder renews on cadence, keeps the clock
- * alive headlessly only while no theatre drives it, and hands every remote
- * back when leaving.
+ * 📺 tvSession — the room tick: the clock's page renews on cadence, keeps
+ * the clock alive headlessly only while no theatre drives it, and lets
+ * every clock go when leaving.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { isTvKind, tvLabel } from './tvSession';
 import {
-  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, remoteKey,
+  bindTvDoc, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, remoteKey,
   setTvClock,
-  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvSetLoop, tvTogglePower, TV_HEARTBEAT_MS,
+  setTvIdentity, setTvPageId, tvHeartbeat, tvKey, tvNoteEnd, tvPlay, tvSchedule, tvSetLoop, tvTogglePower, TV_HEARTBEAT_MS,
   TV_LEASE_LAPSE_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import { TvSyncController, type TvPlayer } from './tvSync';
 import {
-  armTvDrive, forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvDriveArmed,
-  tvPlayerCanSeek, tvPlayerPositionMs, tvRoomPlayers,
+  armTvDrive, forgetTv, leaveTvRoom, registerTvPlayerOfRecord, tickTvRoom, tvDriveArmed,
+  tvPlayerCanSeek, tvPlayerPositionMs,
 } from './tvSession';
 
 const TV = 'tv-stand-1';
@@ -36,7 +36,6 @@ const doc0 = () => bound;
 beforeEach(() => {
   now = 5_000_000;
   setTvClock(() => now);
-  setTvHostPredicate(() => false);
   setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
   bindTvDoc(bound = new Y.Doc());
   leaveTvRoom([]); // the room's cadences (renewals, beats, known ends) start over with the doc
@@ -161,6 +160,22 @@ describe('tickTvRoom', () => {
     expect(readRemote('tv-2').holder).toBe('');
   });
 
+  it('a press that lands while the room is being left is refused: the room left keeps its programme and its clock', () => {
+    const A = { kind: 'url', url: 'https://example.org/a.mp4' } as const;
+    const B = { kind: 'url', url: 'https://example.org/b.mp4' } as const;
+    expect(tvPlay(TV, A)).toEqual({ ok: true });
+    leaveTvRoom([TV]);
+    const left = readTv(TV);
+    // An archive.org lookup or an upload started before the leave lands in
+    // its flush: no press takes the clock or changes the programme now.
+    expect(tvPlay(TV, B)).toEqual({ ok: false, error: 'Leaving this room.' });
+    expect(tvTogglePower(TV)).toBe(true); // still on
+    expect(readTv(TV)).toEqual(left);
+    expect(readRemote(TV).holder).toBe('');
+    armTvDrive(true); // the next room's docs are bound
+    expect(tvPlay(TV, B)).toEqual({ ok: true });
+  });
+
   it('a removed set takes this client\'s hold on its remote with it', () => {
     pickUpRemote(TV);
     pickUpRemote('tv-2');
@@ -182,19 +197,6 @@ describe('tickTvRoom', () => {
     leaveTvRoom([TV]);
     forgetTv(TV);
     expect(readRemote(TV)).toMatchObject({ holder: 'AAAAme', page: 'A' });
-  });
-
-  it('a remote handed to my identity is claimed by the page that ticks first', () => {
-    setTvIdentity(() => ({ pub: 'BBBBgiver', name: 'Giver' }));
-    setTvPageId('G');
-    pickUpRemote(TV);
-    handRemote(TV, 'AAAAme', 'Me');
-    setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
-    setTvPageId('A');
-    expect(iHoldRemote(TV)).toBe(false);
-    tickTvRoom([TV], now);
-    expect(iHoldRemote(TV)).toBe(true);
-    expect(readRemote(TV)).toMatchObject({ holder: 'AAAAme', page: 'A', by: 'BBBBgiver', leaseAt: now });
   });
 
   it('tells the phone where the live player is and whether it can seek, and nothing when none is mounted', () => {
@@ -536,7 +538,7 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
   });
 
-  it('the end the holder\'s player learned travels with the remote: handed to a page that never watched, with no theatre open, the new holder still ends the programme where the media does', () => {
+  it('the end the clock page\'s player learned travels with the record: taken by a press on a page that never watched, with no theatre open, the new clock page still ends the programme where the media does', () => {
     setTvPageId('A');
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
@@ -546,14 +548,14 @@ describe('tickTvRoom', () => {
     expect(readTv(TV).endMs).toBe(30_000);
     tvHeartbeat(TV, 25_000);
     unregister();
-    handRemote(TV, 'BBBBbob', 'Bob');
     // Bob's page: another identity, another page, no player of record, and
     // nothing remembered of this film — forgetTv clears what this test's
     // shared module memory knows for the set, as a fresh page knows nothing.
     setTvIdentity(() => ({ pub: 'BBBBbob', name: 'Bob' }));
     setTvPageId('B');
     forgetTv(TV);
-    run(500); // Bob's first tick claims the hand-over and beats headlessly
+    pickUpRemote(TV); // Bob presses on his phone: the clock is his page's
+    run(500); // and his tick beats headlessly
     expect(iHoldRemote(TV)).toBe(true);
     expect(readTv(TV).state).toBe('playing'); // 25.5 s
     run(3_000);
@@ -562,22 +564,22 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'home', source: null }); // past 30 s: over, from the end the record carried
   });
 
-  it('an end the player learned just before the holder closed the theatre is filed in the record at once: a hand-over before the next tick still carries it', () => {
+  it('an end the player learned just before its theatre went is filed in the record at once: a press elsewhere before the next tick still carries it', () => {
     setTvPageId('A');
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
     const started = readTv(TV).started;
     run(500); // a tick with no player yet: nothing known of the end
     expect(readTv(TV).endMs).toBe(0);
-    // The metadata lands and the theatre is closed in the same breath, with
-    // no room tick between — then the remote is handed on before the next.
+    // The metadata lands and the player goes in the same breath, with no
+    // room tick between — then someone else presses before the next.
     const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 5_000, canSeek: () => true, started: () => started, endMs: () => 30_000 });
     unregister();
-    expect(readTv(TV).endMs).toBe(30_000); // filed as it went, while this page still held the remote
-    handRemote(TV, 'BBBBbob', 'Bob');
+    expect(readTv(TV).endMs).toBe(30_000); // filed as it went, while this page still kept the clock
     setTvIdentity(() => ({ pub: 'BBBBbob', name: 'Bob' }));
     setTvPageId('B');
     forgetTv(TV); // Bob's page knows nothing of the film…
+    pickUpRemote(TV); // …and presses
     run(500);
     expect(iHoldRemote(TV)).toBe(true);
     run(30_000); // …and still ends it where the record says
@@ -656,7 +658,7 @@ describe('tickTvRoom', () => {
     expect(readTv(TV).source).toMatchObject({ url: 'https://example.org/b.mp4' });
   });
 
-  it('a remote picked up on waking takes the room from a peer\'s wake-window beat as it landed, never bridged across the sleep: no beat an hour ahead, no programme closed on the spot', () => {
+  it('a press on waking takes the room from a peer\'s wake-window beat as it landed, never bridged across the sleep: no beat an hour ahead, no programme closed on the spot', () => {
     let wall = 1_700_000_000_000;
     setTvClock(() => now, () => wall);
     const step = (ms: number) => { now += ms; wall += ms; };
@@ -664,7 +666,11 @@ describe('tickTvRoom', () => {
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
     expect(tvNoteEnd(TV, 30_000)).toEqual({ ok: true }); // the film is 30 s long, says the record
-    handRemote(TV, 'BBBBbob', 'Bob'); // Bob holds and beats from his own page
+    setTvIdentity(() => ({ pub: 'BBBBbob', name: 'Bob' }));
+    setTvPageId('B');
+    pickUpRemote(TV); // Bob presses, and beats from his own page
+    setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
+    setTvPageId('A');
     tickTvRoom([TV], now); // this page: a viewer, awake
     const other = new Y.Doc();
     Y.applyUpdate(other, Y.encodeStateAsUpdate(doc0()));
@@ -699,18 +705,23 @@ describe('tickTvRoom', () => {
     expect(readTv(TV).positionMs).toBeLessThan(13_500); // the beat from the anchor, not from an hour ahead
   });
 
-  it('leaving disarms the drive at once: a tick during the leave\'s flush claims and beats nothing until the next room arms it', () => {
-    setTvIdentity(() => ({ pub: 'BBBBgiver', name: 'Giver' }));
-    pickUpRemote(TV);
-    handRemote(TV, 'AAAAme', 'Me');
-    setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
-    leaveTvRoom([TV]);
+  it('leaving disarms the drive at once: a tick during the leave\'s flush renews and beats nothing until the next room arms it', () => {
+    const SET = 'tv-left-behind'; // a set no other test mounted a player on
+    pickUpRemote(SET);
+    tvPlay(SET, { kind: 'url', url: 'https://example.org/a.mp4' });
+    leaveTvRoom([SET]);
     expect(tvDriveArmed()).toBe(false);
-    tickTvRoom([TV], now); // World keeps ticking through the awaited flush
-    expect(iHoldRemote(TV)).toBe(false); // the hand-over is not claimed into a room being left
+    expect(readRemote(SET).holder).toBe(''); // the clock let go
+    pickUpRemote(SET); // a press on the phone mid-leave
+    const lease = readRemote(SET).leaseAt;
+    const seq = readTv(SET).seq;
+    run(TV_LEASE_RENEW_MS, [SET]); // World keeps ticking through the awaited flush
+    expect(readRemote(SET).leaseAt).toBe(lease);
+    expect(readTv(SET).seq).toBe(seq); // no renewal, and no beat into a room being left
     armTvDrive(true); // the next room's docs are bound
-    tickTvRoom([TV], now);
-    expect(iHoldRemote(TV)).toBe(true);
+    run(500, [SET]);
+    expect(readRemote(SET).leaseAt).toBe(now);
+    expect(readTv(SET).seq).not.toBe(seq);
   });
 
   it('a holder tab suspended past the lapse does not renew on waking: the room tick finds no remote of its own', () => {
@@ -724,13 +735,6 @@ describe('tickTvRoom', () => {
     expect(readRemote(TV).leaseAt).toBe(lease); // the expired claim is not renewed…
     expect(readTv(TV).seq).toBe(seq); // …and the headless beat stays silent: not this page's clock any more
     expect(iHoldRemote(TV)).toBe(false);
-  });
-
-  it('lists the room\'s other keyed players for HAND TO', () => {
-    setTvRoomPlayersProvider(() => [
-      { pub: 'AAAAme', name: 'Me' }, { pub: 'BBBB', name: 'Bob' }, { pub: '', name: 'legacy' },
-    ]);
-    expect(tvRoomPlayers('AAAAme')).toEqual([{ pub: 'BBBB', name: 'Bob' }]);
   });
 });
 

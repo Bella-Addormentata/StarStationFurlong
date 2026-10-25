@@ -261,7 +261,7 @@ import { listContacts, getContact } from "./contacts";
 // screen view the prop draws.
 import { createSmartTvUI } from "./tvUI";
 import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, setTvScreenProvider, updateTvChip } from "./tvTheatre";
-import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
+import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
 // 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
 // attract card the prop draws.
@@ -7088,7 +7088,6 @@ export class World {
         label,
         myPub: () => getIdentityPub(),
         myName: () => getPlayerName(),
-        roomPlayers: () => tvRoomPlayers(getIdentityPub()),
         // The deps main.ts installed (setTvTheatreDeps): the same label and
         // round-trip lead as the chip's and the phone's WATCH.
         // Opened in the continuation, which runs after the focus eases out:

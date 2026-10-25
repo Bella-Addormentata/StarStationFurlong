@@ -277,10 +277,11 @@ export class TvSyncController {
    *  them); then the target a jump is still carrying the player to (the
    *  player reads where it WAS until the seek lands, and a pause written
    *  from that would park the room there, footage unplayed); then the
-   *  player's clock, once in step. A viewer's player is only ever where it
-   *  is. */
+   *  player's clock, once in step. A viewer's press (#258: anyone's goes
+   *  through) acts where the room is by the record: its own player may
+   *  still be on the last film, loading, or catching up. */
   positionMs(): number {
-    if (!this.iHold()) return this.deps.player.currentMs();
+    if (!this.iHold()) return this.current().positionMs;
     const jump = this.jump();
     if (jump !== this.appliedJump || jump === this.countdownJump) return this.current().positionMs;
     if (this.pendingTarget !== null) return this.pendingTarget;

@@ -270,14 +270,14 @@ import { leaveCoinPusherRoom } from "./pusherCroupier";
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
-import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv, tvNow, tvWallNow } from "./tvDoc";
-import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
+import { bindTvDoc, setTvIdentity, setTvPageId, tvNow, tvWallNow } from "./tvDoc";
+import { focusTvApp, renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, setTvTheatreDeps, updateTvChip } from "./tvTheatre";
 import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
-import { armTvDrive, isTvKind, leaveTvRoom, setTvRoomPlayersProvider, tvDriveArmed, tvLabel, tvRoomPlayers } from "./tvSession";
+import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
 import { leaveArcadeRoom } from "./arcadeSession";
@@ -4483,8 +4483,6 @@ function resolveOwnerLabel(owner: string): string {
  *    · the room ACCESS MODE        · co-host accept/deny/revoke
  *    · 🔧 #192 taking a module apart (a Disassemble job's pick and its end:
  *      a module off the station can't be put back) — setRoomDeedCheck
- *    · the TV's spare remote (#186: taking the remote from its holder, or
- *      handing theirs on — setTvHostPredicate; the panels paint from it)
  *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
  *      (#193 — setArcadeEjectPredicate; the panel paints from it). The
  *      cabinet's CURATION (its game, emulator files) stays with the
@@ -7924,7 +7922,7 @@ function setupSpacePhoneOverlay() {
     tv: {
       elId: "phone-app-tv",
       title: "📺 TV REMOTE",
-      subtitle: "The set whose remote you hold",
+      subtitle: "Any TV in the room",
     },
   };
   /** Sub-views return to their parent on BACK instead of jumping home. */
@@ -8077,7 +8075,6 @@ function setupSpacePhoneOverlay() {
           tvs: () => roomTvIds().map((tvId) => ({ id: tvId, label: tvLabelFor(tvId) })),
           myPub: () => getIdentityPub(),
           myName: () => getPlayerName(),
-          roomPlayers: () => tvRoomPlayers(getIdentityPub()),
           openTheatre: (tvId) => {
             if (!tvDriveArmed() || !roomTvIds().includes(tvId)) return; // the set is gone, or the room is: nothing to watch
             container?.classList.remove("active");
@@ -8143,14 +8140,14 @@ function setupSpacePhoneOverlay() {
     container?.classList.add("active");
     showPhoneView("treasury");
   };
-  // 📺 #186: the set's panel and a hand-over open the phone straight on the
-  // remote — same posture as __ssfOpenTreasury.
+  // 📺 #186: the set's panel opens the phone straight on the remote — same
+  // posture as __ssfOpenTreasury.
   (
     window as unknown as { __ssfOpenTvRemote?: () => void }
   ).__ssfOpenTvRemote = () => {
     // Who gets focus back when the phone closes (releasePhoneOpener): the
-    // theatre when it is up (a hand-over pops the phone open above it; the
-    // dialog root is the stable target, and it refocuses its own control),
+    // theatre when it is up (the phone opens above it; the dialog root is
+    // the stable target, and it refocuses its own control),
     // else whatever outside the phone had focus — the set's panel. A
     // control inside the phone is no opener: it is about to be hidden.
     const active = document.activeElement as HTMLElement | null;
@@ -10545,16 +10542,11 @@ async function init() {
   // host) ask the same owner seam edit mode does.
   setPartyHostPredicate(() => canEditRoom().ok);
   setPartyIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
-  // 📺 #186: the TV's seams — the spare remote, the identity, the room roster
-  // for HAND TO…, and the chip that opens the theatre from anywhere in the
-  // room. 🔒 The spare remote is the DEED holder's (#142's split, in the
-  // isLocalPlayerRoomOwner docblock): taking the remote from a holder, or
-  // handing theirs on, unseats them, and the shareholder-extended edit gate
-  // can be satisfied by a peer-written venture record. The panels paint
-  // TAKE BACK from the same predicate (tvDoc.holdsSpareRemote).
-  setTvHostPredicate(() => currentRoomDeedIsMine());
+  // 📺 #186: the TV's seams — the identity, and the chip that opens the
+  // theatre from anywhere in the room. Anyone's press controls a set
+  // (#258): there is no remote to hold, hand on or take back.
   setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
-  // The remote is held by a PAGE, not a key: two tabs share the identity
+  // A set's clock is kept by a PAGE, not a key: two tabs share the identity
   // (the seed is in localStorage) and must not both renew, beat and release.
   setTvPageId(
     typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -10571,18 +10563,6 @@ async function init() {
   setArcadeHostPredicate(() => canEditRoom().ok);
   setArcadeEjectPredicate(() => currentRoomDeedIsMine());
   setArcadeIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
-  setTvRoomPlayersProvider(() => {
-    const out: Array<{ pub: string; name: string }> = [];
-    const map = yjsSync?.doc.getMap("players");
-    if (!map) return out;
-    for (const [, raw] of map.entries()) {
-      const p = raw as Partial<PlayerEntry> | undefined;
-      if (p && typeof p.keyB64 === "string" && p.keyB64) {
-        out.push({ pub: p.keyB64, name: typeof p.name === "string" ? p.name.slice(0, PLAYER_NAME_MAX_LENGTH) : "" });
-      }
-    }
-    return out;
-  });
   setTvTheatreDeps(tvTheatreDeps);
   setTvChipOpener((itemId) => { openTvTheatreIfPresent(itemId); });
   // The theatre fetches a peer-written URL only with this viewer's consent
@@ -10592,24 +10572,6 @@ async function init() {
   // trusted for merely answering, since 8080 may be someone else's service
   // the day the node fell back to 8081.
   setOwnMediaOrigins([window.location.origin]);
-  // A remote handed to me pops the phone open on it (plan §3.2: the
-  // receiver's phone opens on the remote; no accept step). A pick-up of my
-  // own is not announced — `by` names the giver.
-  let tvHeldBefore = new Set<string>();
-  subscribeTv(() => {
-    const me = getIdentityPub();
-    const held = new Set(roomTvIds().filter((id) => iHoldRemote(id)));
-    for (const id of held) {
-      if (tvHeldBefore.has(id)) continue;
-      const rec = readRemote(id);
-      if (rec.by && rec.by !== me) {
-        selectTvRemote(id); // the phone shows the remote just received, not an earlier one
-        showHint("📺 Someone handed you the TV remote.");
-        (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
-      }
-    }
-    tvHeldBefore = held;
-  });
   setRoomEditPermission(() => {
     // Leaving: the old room's doc is still bound and its writes still go out,
     // but it isn't this client's room any more (roomLeavesUnderWay).

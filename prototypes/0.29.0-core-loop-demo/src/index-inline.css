@@ -1380,16 +1380,6 @@
         letter-spacing: 1px;
         color: #f0c060;
       }
-      .tv-theatre-close {
-        background: rgba(212, 168, 75, 0.12);
-        border: 1px solid rgba(212, 168, 75, 0.4);
-        border-radius: 6px;
-        color: #d4a84b;
-        font-family: inherit;
-        font-size: 12px;
-        padding: 4px 9px;
-        cursor: pointer;
-      }
       .tv-theatre-notice {
         display: flex;
         flex-direction: column;
