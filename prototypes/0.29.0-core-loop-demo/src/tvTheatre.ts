@@ -548,6 +548,37 @@ export function reloadTvPicture(itemId: string): boolean {
   return true;
 }
 
+/** 🎛 Into archive.org's player on `itemId`, for its volume and its other
+ *  controls, which are only inside its frame: focus goes into the frame,
+ *  and its own Tab order runs there. A frame from another origin keeps its
+ *  keys, Escape included, so the way back is an edge on either side of it:
+ *  Tab past its last control, or Shift+Tab past its first, lands on one,
+ *  which calls `back` (the blaster puts focus on its key). False with no
+ *  archive.org player up on that set. */
+export function focusTvEmbed(itemId: string, back: () => void): boolean {
+  const t = theatre;
+  if (!t || t.itemId !== itemId || !(t.player instanceof ArchiveEmbedAdapter)) return false;
+  const frame = t.screen.querySelector('iframe');
+  if (!frame) return false;
+  embedBack = back;
+  // Made once per mount: the host, edges and all, goes with the player.
+  if (!t.screen.querySelector('[data-tv-embed-edge]')) {
+    for (const where of ['beforebegin', 'afterend'] as const) {
+      const edge = document.createElement('span');
+      edge.tabIndex = 0;
+      edge.dataset.tvEmbedEdge = where;
+      edge.setAttribute('aria-label', 'Back to the IR blaster');
+      edge.style.cssText = 'position:absolute; width:1px; height:1px; overflow:hidden; opacity:0;';
+      edge.addEventListener('focus', () => { embedBack?.(); });
+      frame.insertAdjacentElement(where, edge);
+    }
+  }
+  frame.focus();
+  return true;
+}
+/** Where focus goes from an edge of archive.org's frame (focusTvEmbed). */
+let embedBack: (() => void) | null = null;
+
 /** Take the picture off the set: the programme is over, the blaster aimed
  *  at another set that is on, the set gone, or the room left. */
 export function closeTvTheatre(): void {
@@ -866,8 +897,10 @@ function theatreTick(rtt: () => number): void {
   }
   // A picture laid on the set in the DOM shows only while the programme
   // plays: a countdown stays the set's card, and a pause is the set's own
-  // menu (tvMenu.ts), drawn on the set, which the DOM layer would cover.
-  setScreenHostShown(readPlayback(t.itemId).state === 'playing');
+  // menu (tvMenu.ts), drawn on the set, which the DOM layer would cover. A
+  // notice up (TAP TO PLAY) takes it down too, so the card shows the set's
+  // word for it.
+  setScreenHostShown(readPlayback(t.itemId).state === 'playing' && t.notice.hidden);
   t.controller?.tick();
 }
 

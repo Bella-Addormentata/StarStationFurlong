@@ -11291,8 +11291,11 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
     viewState = view.state;
-    pictureFrame.visible = pictureOn();
     const pausedMenu = view.state === "paused" && view.menu?.kind === "paused" ? view.menu : null;
+    // A picture gives way to what this page asks (below): mostly TAP TO
+    // PLAY, whose picture is stalled until the press. Paused, the menu's
+    // plane says it over the still frame.
+    pictureFrame.visible = pictureOn() && (!view.ask || pausedMenu !== null);
     if (pausedMenu) drawPausedMenu(view, pausedMenu);
     menuFrame.visible = pausedMenu !== null;
     if (pictureFrame.visible) {
@@ -11385,7 +11388,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       glowLevel = 1.1;
     }
     // This page's own word (tvTheatreHint): what it waits on, across the
-    // middle of the card, one part a line. Under a picture it is not seen.
+    // middle of the card, one part a line. The picture is down while it is up.
     // Paused, the menu's plane says it in its own column.
     if (view.ask && !pictureFrame.visible && view.state !== "off" && !pausedMenu) {
       const lines = askLines(view.ask, 34);
