@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as THREE from 'three';
 import { HOLO_RADIUS, holoPoint, inclinationOf, inclinedPoint, type HoloMarker } from './mapHologramLayout';
-import { SPLAT_LIFT, SPLAT_SCALE, buildSplatPlot, setSparkProvider } from './mapHologramSplats';
+import { RAINBOW, SPLAT_LIFT, SPLAT_SCALE, bodyColor, buildSplatPlot, setSparkProvider, stationHue } from './mapHologramSplats';
 
 /** A stand-in SplatMesh: counts the splats pushed, keeps opacity, disposes. */
 class FakeSplatMesh extends THREE.Object3D {
@@ -39,6 +39,18 @@ const splats = (o: THREE.Object3D): FakeSplatMesh[] => {
   o.traverse((c) => { if (c instanceof FakeSplatMesh) out.push(c); });
   return out;
 };
+
+describe('bodyColor', () => {
+  it('gives every station one of the rainbow, by its id, and here its green', () => {
+    const hues = new Set(['st-a', 'st-b', 'st-c', 'module-1a8178', 'home-0407c42dc7e4', 'home-ad655cfa8b47', 'SSF-Welcome', 'x'].map(stationHue));
+    for (const h of hues) expect(RAINBOW).toContain(h);
+    expect(hues.size).toBeGreaterThan(3);
+    expect(stationHue('st-a')).toBe(stationHue('st-a'));
+    expect(bodyColor({ id: 'st-a', type: 'station', frame: 'planet-sovereign', here: false })).toBe(stationHue('st-a'));
+    expect(bodyColor({ id: 'st-a', type: 'station', frame: 'planet-sovereign', here: true })).toBe(0x3dff9a);
+    expect(bodyColor({ id: 'planet-aris', type: 'planet', frame: 'planet-aris', here: false })).not.toBe(bodyColor({ id: 'planet-sovereign', type: 'planet', frame: 'planet-sovereign', here: false }));
+  });
+});
 
 describe('buildSplatPlot', () => {
   it('is nothing without a provider, and the mesh plot stays', async () => {

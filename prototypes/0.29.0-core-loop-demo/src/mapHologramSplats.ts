@@ -96,10 +96,26 @@ const lookOf = (id: string): PlanetLook => PLANET_LOOKS[id] ?? PLANET_DEFAULT;
 const ATMOSPHERE = srgb(0x9fe9ff);
 const DUST = srgb(0x66e6ff);
 const BELT = srgb(0xc9d6e2);
-const STATION = srgb(0xfff0c0);
-const STATION_GLOW = srgb(0xffd27a);
 const HERE = srgb(0x3dff9a);
-const LAGRANGE = srgb(0xc29bff);
+const LAGRANGE = srgb(0xe08cff);
+/** Every station in its own bright colour, one of these by its id, and
+ *  its ring round its planet and its label dot in the same. */
+export const RAINBOW = [0xff5252, 0xff9a2e, 0xffe14a, 0x6cff6c, 0x3ef0ff, 0x6a86ff, 0xc77dff, 0xff6fd8] as const;
+export function stationHue(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return RAINBOW[h % RAINBOW.length]!;
+}
+const stationColors = new Map<number, { core: THREE.Color; glow: THREE.Color }>();
+function stationLook(hex: number): { core: THREE.Color; glow: THREE.Color } {
+  let l = stationColors.get(hex);
+  if (!l) {
+    const glow = srgb(hex);
+    l = { core: glow.clone().lerp(new THREE.Color(1, 1, 1), 0.45), glow };
+    stationColors.set(hex, l);
+  }
+  return l;
+}
 
 /** The colour a body is drawn in, for labels and cards to match: hex sRGB. */
 export function bodyColor(mk: Pick<HoloMarker, 'id' | 'type' | 'frame' | 'here'>): number {
@@ -107,8 +123,8 @@ export function bodyColor(mk: Pick<HoloMarker, 'id' | 'type' | 'frame' | 'here'>
   switch (mk.type) {
     case 'star': return 0xffd27a;
     case 'planet': return lookOf(mk.id).hex;
-    case 'station': return 0xffd27a;
-    case 'lagrange': return 0xc29bff;
+    case 'station': return stationHue(mk.id);
+    case 'lagrange': return 0xe08cff;
     default: return 0xc9d6e2;
   }
 }
@@ -315,7 +331,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     let m = sparks.get(id);
     if (m) return m;
     m = kind === 'station'
-      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(140), 0.008, Z(0.0028), 1, STATION, STATION, rand, 0.4); ball(s, N(50), 0.014, Z(0.004), 0.1, STATION_GLOW, STATION_GLOW, rand, 1.5); })
+      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); const { core, glow } = stationLook(stationHue(id)); ball(s, N(140), 0.008, Z(0.0028), 1, core, glow, rand, 0.4); ball(s, N(50), 0.014, Z(0.004), 0.12, glow, glow, rand, 1.5); })
       : make(`lagrange-${id}`, (s) => ball(s, N(110), 0.011, Z(0.004), 0.35, LAGRANGE, LAGRANGE, rng(id.length * 29), 1.0));
     sparks.set(id, m);
     return m;
@@ -373,23 +389,24 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
           if (mk.here) hereAt = p;
         }
       }
-      // Station rings: dust round each planet at the stations' radii.
-      const ringsByPlanet = new Map<string, number[]>();
+      // Station rings: dust round each planet at the stations' radii, each
+      // in its station's colour.
+      const ringsByPlanet = new Map<string, Array<{ r: number; hex: number }>>();
       for (const mk of markers) {
         if (mk.type !== 'station' || !mk.orbit || !planets.has(mk.frame)) continue;
-        (ringsByPlanet.get(mk.frame) ?? ringsByPlanet.set(mk.frame, []).get(mk.frame)!).push(mk.orbit.r);
+        (ringsByPlanet.get(mk.frame) ?? ringsByPlanet.set(mk.frame, []).get(mk.frame)!).push({ r: mk.orbit.r, hex: stationHue(mk.id) });
       }
       for (const [id, rig] of planets) {
         if (!seenPlanets.has(id)) { rig.group.visible = false; continue; }
         rig.group.visible = true;
-        const radii = (ringsByPlanet.get(id) ?? []).map((r) => r.toFixed(5)).sort();
-        const ringKey = radii.join(',');
+        const rings = (ringsByPlanet.get(id) ?? []).map((x) => ({ key: `${x.r.toFixed(5)}:${x.hex}`, ...x })).sort((a, b) => (a.key < b.key ? -1 : 1));
+        const ringKey = rings.map((x) => x.key).join(',');
         if (ringKey !== rig.ringKey) {
           for (const m of rig.rings) { m.removeFromParent(); m.dispose(); }
           rig.rings = [];
           // One ring each, on its own tilt (ringInclination), as the stations stand.
-          for (const r of radii.map(Number)) {
-            const m = new SplatMesh({ constructSplats: (s) => ring(s, N(480), r, 0.002, 0.002, Z(0.0018), 0.5, lookOf(id).ring, rng(id.length * 3 + Math.round(r * 1e4))) });
+          for (const { r, hex } of rings) {
+            const m = new SplatMesh({ constructSplats: (s) => ring(s, N(480), r, 0.002, 0.002, Z(0.0018), 0.5, stationLook(hex).glow, rng(id.length * 3 + Math.round(r * 1e4))) });
             m.position.y = -0.013;
             tiltTo(m, ringInclination(id, r));
             rig.group.add(m);
