@@ -512,13 +512,19 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const pasteAgain = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
       if (draft && pasteAgain) pasteAgain.value = draft.value;
       if (inside) {
+        // A greyed-out key takes no focus (the browser would drop it to the
+        // page, and ↑/↓ would stop here). An arrow greyed out by its own
+        // move, at the edge of the set's menu, hands it to OK beside it;
+        // anything else gone or greyed out, to the view.
+        const live = (el: HTMLElement | null) => (el && !el.matches(':disabled') ? el : null);
         const again = focusKey ? host.querySelector<HTMLElement>(focusKey) : null;
-        (again ?? host).focus({ preventScroll: true });
-        if (draft?.focused && again === pasteAgain && pasteAgain) {
+        const target = live(again) ?? (again?.closest('.ir-pad') ? live(host.querySelector<HTMLElement>('.ir-pad .ir-ok')) : null) ?? host;
+        target.focus({ preventScroll: true });
+        if (draft?.focused && target === pasteAgain && pasteAgain) {
           try { pasteAgain.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
         }
-        if (searching && again instanceof HTMLInputElement) {
-          try { again.setSelectionRange(searching.start, searching.end); } catch { /* not selectable */ }
+        if (searching && target instanceof HTMLInputElement) {
+          try { target.setSelectionRange(searching.start, searching.end); } catch { /* not selectable */ }
         }
       }
     }
@@ -640,7 +646,7 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
       </div>
       <div class="ir-note">${menu ? '▲ ▼ ◀ ▶ MOVE ON THE SET · OK PICKS' : '◀ ▶ 10 S · ▲ ▼ VOLUME · OK PLAY / PAUSE'}</div>
       <div class="ir-row">
-        ${irKey(`data-tv-pad="ok" data-tv-id="${id}" title="${pb.state === 'paused' ? 'Play' : 'Pause'}"`, pb.state === 'paused' ? '▶ PLAY' : '⏸ PAUSE', canPause)}
+        ${irKey(`data-tv-play-pause="${id}" title="${pb.state === 'paused' ? 'Play' : 'Pause'}"`, pb.state === 'paused' ? '▶ PLAY' : '⏸ PAUSE', canPause)}
         ${irKey(`data-tv-stop="${id}" title="Back to the home screen"`, '⏹ STOP', showing)}
         ${startOnly ? '' : irKey(`data-tv-loop="${id}" aria-pressed="${rec.loop}" title="At the end, start the film over (stays on for the next one)"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF')}
         ${showing && rec.source?.kind === 'blob' ? irKey(`data-tv-autofetch="1" aria-pressed="${autoFetchOn()}" title="Your own switch: take a file shown on a TV without a press, up to ${esc(formatBytes(TV_AUTO_FETCH_MAX))} a file and ${esc(formatBytes(TV_AUTO_FETCH_DAY))} a day"`, autoFetchOn() ? '📦 AUTO-FETCH: ON' : '📦 AUTO-FETCH: OFF') : ''}
@@ -933,6 +939,9 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       case 'ok': playPause(id); break;
     }
   }));
+  // ▶ PLAY / ⏸ PAUSE under the pad: that, with a menu up or not (OK picks
+  // the lit cell, which may be STOP).
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-play-pause]').forEach((b) => b.addEventListener('click', () => { playPause(b.dataset.tvPlayPause!); }));
   /** OK on the set's menu: what the highlighted cell stands for. */
   const pickOnSet = (id: string, menu: TvMenuView) => {
     const at = menu.at;
@@ -953,7 +962,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
         if (tvPlayerCanSeek(id) === false) feedback('This stream cannot go back or on.', 'link');
         else tvSeek(id, at === 'back' ? Math.max(0, pos(id) - 10_000) : pos(id) + 10_000);
         break;
-      case 'start': if (tvSeek(id, 0).ok) tvResume(id); break;
+      case 'start':
+        if (tvPlayerCanSeek(id) === false) feedback('This stream cannot go back to its start.', 'link');
+        else if (tvSeek(id, 0).ok) tvResume(id);
+        break;
       case 'loop': tvSetLoop(id, !readTv(id).loop); break;
     }
   };
