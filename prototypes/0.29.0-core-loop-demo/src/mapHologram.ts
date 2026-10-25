@@ -17,7 +17,7 @@ import * as THREE from 'three';
 import type { MapBody } from './map';
 import { solarPlotBodies } from './map';
 import { currentRoomId, listStations } from './stations';
-import { readAtlas } from './stationAtlas';
+import { MAX_ENTRIES, readAtlas } from './stationAtlas';
 import { stationPlan } from './stationPlan';
 import { holotableStation } from './devices';
 import { buildSplatPlot, type SplatPlotHandle } from './mapHologramSplats';
@@ -50,7 +50,10 @@ export const REFRESH_MS = 2000;
 /** The hologram's slow turn (rad/s). */
 const SPIN = 0.12;
 const COURSE_POINTS = 65;
-const POOL = { planets: 4, lagrange: 4, stations: 16, courses: 4, modules: 24, links: 32 };
+/** Pool sizes. Modules and ships together are at most the atlas's
+ *  MAX_ENTRIES rooms (stationPlan walks the whole component); gangways are
+ *  one per pairing between two of them, so at most two per room. */
+const POOL = { planets: 4, lagrange: 4, stations: 16, courses: 4, modules: MAX_ENTRIES, links: MAX_ENTRIES * 2 };
 /** Module block heights on the disc (metres). */
 const MODULE_H = 0.03;
 const SHIP_H = 0.02;
@@ -197,6 +200,12 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
     else splatPlot = h;
   });
   root.userData.disposeSplatPlot = () => { splatsWanted = false; splatPlot?.dispose(); splatPlot = null; };
+  // The course lines are not meshes, so World's removal (which disposes
+  // every mesh's geometry and material) never reaches them: freed here.
+  root.userData.disposeCourses = () => {
+    for (const line of courses) line.geometry.dispose();
+    courseMat.dispose();
+  };
 
   // ── The station ─────────────────────────────────────────────────────────
   const stationGroup = new THREE.Group();
@@ -311,7 +320,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
       }
       const pos = line.geometry.getAttribute('position') as THREE.BufferAttribute;
       const n = Math.min(c.points.length, COURSE_POINTS);
-      for (let k = 0; k < n; k++) pos.setXYZ(k, c.points[k]!.x, 0.006, c.points[k]!.z);
+      for (let k = 0; k < n; k++) pos.setXYZ(k, c.points[k]!.x, 0.006 + c.points[k]!.y, c.points[k]!.z);
       pos.needsUpdate = true;
       line.geometry.setDrawRange(0, n);
       line.visible = sun.visible && n > 1;

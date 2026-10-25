@@ -14,7 +14,7 @@
 
 import * as THREE from 'three';
 import type { MapBody } from './map';
-import { HOLO_RADIUS, HOLO_REACH, holoPoint, plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
+import { HOLO_RADIUS, HOLO_REACH, holoPoint, inclinationOf, inclinedPoint, plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
 import { SPLAT_SCALE, bodyColor, buildSplatPlot, sparkHost, type SplatPlotHandle } from './mapHologramSplats';
 
 export interface PlotFrameState {
@@ -108,18 +108,70 @@ const PANEL_SCALE = 1.2;
 export const PLOT_RADIUS = HOLO_RADIUS * HOLO_REACH * SPLAT_SCALE * PANEL_SCALE;
 const FOV_DEG = 42;
 
-/**
- * The camera distance at which the plot fills the view: its full width
- * across `fill` of the panel's width, and its depth (the ring seen from
- * `pitch` above, foreshortened) across `fill` of the height — whichever
- * is the tighter. Recomputed on every resize until the player zooms.
- */
-export function fitDistance(aspect: number, pitch: number, fill = 0.88, fovDeg = FOV_DEG): number {
+/** The points the fit must keep in view: the belt (tilted, with its
+ *  thickness) and the haze dome's top, in the panel's world units. */
+export function fitPoints(): Array<{ x: number; y: number; z: number }> {
+  const pts: Array<{ x: number; y: number; z: number }> = [];
+  const belt = inclinationOf('belt-ring');
+  const r = PLOT_RADIUS, thick = 0.04 * SPLAT_SCALE * PANEL_SCALE;
+  for (let i = 0; i < 48; i++) {
+    const a = (i / 48) * Math.PI * 2;
+    const p = inclinedPoint(Math.cos(a) * r, Math.sin(a) * r, belt);
+    pts.push({ x: p.x, y: p.y + thick, z: p.z }, { x: p.x, y: p.y - thick, z: p.z });
+  }
+  pts.push({ x: 0, y: HOLO_RADIUS * 1.02 * 0.85 * SPLAT_SCALE * PANEL_SCALE, z: 0 });
+  return pts;
+}
+
+/** Where a world point lands in the view, as a fraction of the half-width
+ *  and half-height, for the orbit camera (looking at the origin). */
+export function projectNdc(p: { x: number; y: number; z: number }, o: OrbitState, aspect: number, fovDeg = FOV_DEG): { x: number; y: number; behind: boolean } {
+  const c = orbitPosition(o);
+  // Camera basis: forward to the origin, right, up.
+  const fl = Math.hypot(c.x, c.y, c.z) || 1;
+  const f = { x: -c.x / fl, y: -c.y / fl, z: -c.z / fl };
+  const rl = Math.hypot(f.z, f.x) || 1;
+  const r = { x: -f.z / rl, y: 0, z: f.x / rl }; // right = forward × up, in the XZ plane
+  const u = { x: r.y * f.z - r.z * f.y, y: r.z * f.x - r.x * f.z, z: r.x * f.y - r.y * f.x }; // up = right × forward
+  const dx = p.x - c.x, dy = p.y - c.y, dz = p.z - c.z;
+  const depth = dx * f.x + dy * f.y + dz * f.z;
+  if (depth <= 1e-6) return { x: Infinity, y: Infinity, behind: true };
+  const sx = dx * r.x + dy * r.y + dz * r.z, sy = dx * u.x + dy * u.y + dz * u.z;
   const tanHalf = Math.tan((fovDeg * Math.PI) / 360);
-  const halfW = PLOT_RADIUS, halfH = PLOT_RADIUS * Math.max(0.35, Math.sin(pitch));
-  const byWidth = halfW / (fill * tanHalf * Math.max(aspect, 0.2));
-  const byHeight = halfH / (fill * tanHalf);
-  return Math.max(DIST_MIN, Math.min(DIST_MAX, Math.max(byWidth, byHeight)));
+  return { x: sx / (depth * tanHalf * aspect), y: sy / (depth * tanHalf), behind: false };
+}
+
+/**
+ * The camera distance at which the plot fills the view: the nearest
+ * distance at which every fit point, projected through the camera at
+ * `pitch` from any yaw, lands within `fill` of the view's half-extents —
+ * perspective, the tilts and the belt's near side included. Recomputed
+ * on every resize until the player zooms.
+ */
+/** The yaws the fit is checked from (the view drifts round). */
+export const FIT_YAWS = 24;
+export function fitDistance(aspect: number, pitch: number, fill = 0.88, fovDeg = FOV_DEG): number {
+  const pts = fitPoints();
+  const worst = (dist: number): number => {
+    let m = 0;
+    for (let k = 0; k < FIT_YAWS; k++) {
+      const o: OrbitState = { yaw: (k / FIT_YAWS) * Math.PI * 2, pitch, dist };
+      for (const p of pts) {
+        const q = projectNdc(p, o, aspect, fovDeg);
+        if (q.behind) return Infinity;
+        m = Math.max(m, Math.abs(q.x), Math.abs(q.y));
+      }
+    }
+    return m;
+  };
+  let lo = DIST_MIN, hi = DIST_MAX;
+  if (worst(hi) > fill) return hi;
+  if (worst(lo) <= fill) return lo;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (worst(mid) <= fill) hi = mid; else lo = mid;
+  }
+  return hi;
 }
 /** Finer splats than the table's: the plot fills a panel here. */
 const PANEL_DETAIL = 2.5;
@@ -142,7 +194,11 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   canvas.style.cssText = 'position:absolute; inset:0; width:100%; height:100%; display:block; cursor:grab;';
 
   const scene = new THREE.Scene();
-  scene.add(new spark.SparkRenderer({ renderer }));
+  // Last in the transparent pass, as in the room: the stars and nebulae
+  // are transparent and sort by distance, and splats write no depth.
+  const sparkRenderer = new spark.SparkRenderer({ renderer });
+  sparkRenderer.renderOrder = 10_000;
+  scene.add(sparkRenderer);
   const camera = new THREE.PerspectiveCamera(FOV_DEG, 1, 0.05, 100);
   let orbit: OrbitState = { ...ORBIT_DEFAULT };
   /** Until the player zooms, the distance follows the panel's size. */
@@ -383,7 +439,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
         if (!c) { line.visible = false; return; }
         const pos = line.geometry.getAttribute('position') as THREE.BufferAttribute;
         const n = Math.min(c.points.length, COURSE_POINTS);
-        for (let j = 0; j < n; j++) pos.setXYZ(j, c.points[j]!.x * k, 0.01 * k, c.points[j]!.z * k);
+        for (let j = 0; j < n; j++) pos.setXYZ(j, c.points[j]!.x * k, (0.01 + c.points[j]!.y) * k, c.points[j]!.z * k);
         pos.needsUpdate = true;
         line.geometry.setDrawRange(0, n);
         line.visible = n > 1;
@@ -396,7 +452,6 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
       const seen = new Set<string>();
       const pending: Array<{ mk: HoloMarker; x: number; y: number; l: Label; rank: number }> = [];
       for (const mk of markers) {
-        if (mk.type === 'asteroid-field') continue;
         const w = place3(mk, 0.02);
         w.project(camera);
         const behind = w.z > 1;
@@ -412,7 +467,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
         l.el.style.color = here ? '#3dff9a' : selected ? '#ffffff' : 'rgba(222,234,255,0.88)';
         l.el.style.borderColor = selected ? colour : here ? 'rgba(61,255,154,0.5)' : 'rgba(120,150,200,0.16)';
         if (behind || (mk.type === 'lagrange' && orbit.dist > 4)) { l.el.style.display = 'none'; continue; }
-        const rank = mk.type === 'star' ? 0 : mk.type === 'planet' ? 1 : here ? 2 : selected ? 3 : mk.type === 'lagrange' ? 4 : 5;
+        const rank = mk.type === 'star' ? 0 : mk.type === 'planet' ? 1 : here ? 2 : selected ? 3 : mk.type === 'lagrange' ? 4 : mk.type === 'asteroid-field' ? 6 : 5;
         // Floating over the body: the pill's foot clears its glow.
         pending.push({ mk, x, y: y - (mk.type === 'star' ? 34 : mk.type === 'planet' ? 26 : 14), l, rank });
       }

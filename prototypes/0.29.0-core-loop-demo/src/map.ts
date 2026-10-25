@@ -7,7 +7,7 @@
  * long-distance travel system (v006 §8.2 / Phase 2 Feature 1 & 2).
  */
 
-import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
+import { DEFAULT_STATION_ID, currentStation, listStations, planetById } from './stations';
 import type { StationRecord } from './stations';
 import { angleAt, baseOrbit, realMsFor, slotPosition, stationOrbit } from './orbits';
 import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
@@ -37,6 +37,10 @@ export interface MapBody {
    *  where placeAt puts it on the way (sun-centred, like placeAt's), drawn
    *  until `until` (its arrival). */
   course?: { until: number; points: Array<{ angle: number; radius: number }> };
+  /** 🚚 A station crossing to another planet: the planet it leaves and the
+   *  one it is bound for, so a view that draws each planet's orbit its own
+   *  way (the hologram) can carry the crossing from the one to the other. */
+  transit?: { from: string; to: string };
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
@@ -89,6 +93,9 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
       angleAt: (nowMs: number) => angleAt(orbit, nowMs),
       ...(s.move ? { placeAt: movingPlace(s, s.move) } : {}),
       ...(s.move && nowMs < s.move.arriveAt ? moveCourse(s.move) : {}),
+      ...(s.move && !orbitChangePlanOf(s.move) && planetById(s.move.fromPlanetId).id !== planetById(s.move.toPlanetId).id
+        ? { transit: { from: planetById(s.move.fromPlanetId).id, to: planetById(s.move.toPlanetId).id } }
+        : {}),
       description: (s.id === DEFAULT_STATION_ID
         ? `Sovereign-serverless terminal, lounge, and trade hub for all clones. ${readout}`
         : `Station around ${orbit.planet.name}: ${readout}`) + moving,

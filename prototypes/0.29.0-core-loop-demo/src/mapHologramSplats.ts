@@ -130,6 +130,8 @@ export function bodyColor(mk: Pick<HoloMarker, 'id' | 'type' | 'frame' | 'here'>
 }
 
 const _nodeAxis = new THREE.Vector3();
+const _toSun = new THREE.Vector3();
+const _xAxis = new THREE.Vector3(1, 0, 0);
 const _qTilt = new THREE.Quaternion();
 const _qSpin = new THREE.Quaternion();
 /** Turn a flat ring onto its tilted orbit plane (inclinedPoint's), spun
@@ -393,8 +395,9 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
           const rig = planetRig(mk.id);
           seenPlanets.add(mk.id);
           rig.group.position.set(p.x, 0.017 + p.y, p.z);
-          // Day side toward the sun (local +x), and a slow turn on top.
-          rig.spin.rotation.y = Math.atan2(p.z, p.x) + Math.PI;
+          // Day side (lit from local +x) toward the sun, height and all.
+          _toSun.copy(rig.group.position).negate();
+          if (_toSun.lengthSq() > 1e-12) rig.spin.quaternion.setFromUnitVectors(_xAxis, _toSun.normalize());
           // Its own orbit, as dust round the sun, on its tilted plane.
           if (mk.orbit && Math.abs(mk.orbit.r - rig.orbitR) > 1e-6) {
             rig.orbit?.removeFromParent(); rig.orbit?.dispose();
@@ -412,10 +415,15 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
           if (mk.type === 'station' && mk.orbit) {
             const f = holoFoot(mk);
             const line = footFor(mk.id);
+            line.visible = true;
             const pos = line.geometry.getAttribute('position') as THREE.BufferAttribute;
             pos.setXYZ(0, p.x, 0.012 + p.y, p.z);
             pos.setXYZ(1, f.x, 0.012 + f.y, f.z);
             pos.needsUpdate = true;
+          } else {
+            // Between orbits (or a pocket): no plane to stand on, no thread.
+            const line = feet.get(mk.id);
+            if (line) line.visible = false;
           }
         }
       }

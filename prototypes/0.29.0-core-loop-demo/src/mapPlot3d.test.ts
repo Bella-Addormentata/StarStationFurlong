@@ -2,7 +2,7 @@
 // plot in three dimensions (#251). The renderer itself is browser-only.
 
 import { describe, expect, it } from 'vitest';
-import { DIST_MAX, DIST_MIN, ORBIT_DEFAULT, PITCH_MAX, PITCH_MIN, PLOT_RADIUS, createPlotView3D, fitDistance, orbitDrag, orbitPosition, orbitZoom, pickBody } from './mapPlot3d';
+import { DIST_MAX, DIST_MIN, FIT_YAWS, ORBIT_DEFAULT, PITCH_MAX, PITCH_MIN, createPlotView3D, fitDistance, fitPoints, orbitDrag, orbitPosition, orbitZoom, pickBody, projectNdc } from './mapPlot3d';
 
 describe('the orbit camera', () => {
   it('sits dist away from the sun, pitch above the plane', () => {
@@ -31,19 +31,46 @@ describe('the orbit camera', () => {
 });
 
 describe('the fit', () => {
-  it('fills a wide panel by height and a narrow one by width, within the zoom limits', () => {
+  /** The farthest any fit point lands from the view's centre, as a fraction
+   *  of the half-extents, over a turn of the view. */
+  const reach = (aspect: number, pitch: number, dist: number): number => {
+    let m = 0;
+    for (let k = 0; k < FIT_YAWS; k++) {
+      for (const p of fitPoints()) {
+        const q = projectNdc(p, { yaw: (k / FIT_YAWS) * Math.PI * 2, pitch, dist }, aspect);
+        m = Math.max(m, q.behind ? Infinity : Math.abs(q.x), q.behind ? Infinity : Math.abs(q.y));
+      }
+    }
+    return m;
+  };
+
+  it('keeps the whole plot in view through the camera, belt, tilts and near side included, and no further than it must', () => {
+    for (const [aspect, pitch] of [[2.0, ORBIT_DEFAULT.pitch], [1.33, ORBIT_DEFAULT.pitch], [1.0, 0.6], [0.6, 0.9], [2.0, PITCH_MIN]] as const) {
+      const d = fitDistance(aspect, pitch);
+      expect(reach(aspect, pitch, d)).toBeLessThanOrEqual(0.88 + 1e-6);
+      // Tight: a step nearer would spill, unless the zoom limit binds.
+      if (d > DIST_MIN + 1e-6 && d < DIST_MAX - 1e-6) expect(reach(aspect, pitch, d * 0.97)).toBeGreaterThan(0.88);
+    }
+  });
+
+  it('is farther for a narrow panel than a wide one, within the zoom limits', () => {
     const wide = fitDistance(2.0, 0.6), square = fitDistance(1.0, 0.6), tall = fitDistance(0.5, 0.6);
     expect(tall).toBeGreaterThan(square);
     expect(square).toBeGreaterThanOrEqual(wide);
-    // At the fitted distance the plot's half-width is 88% of the view's.
-    const tanHalf = Math.tan((42 * Math.PI) / 360);
-    expect(PLOT_RADIUS / (tall * tanHalf * 0.5)).toBeCloseTo(0.88, 9);
     expect(fitDistance(0.01, 0.6)).toBe(DIST_MAX);
-    expect(fitDistance(50, 0.12)).toBeGreaterThanOrEqual(DIST_MIN);
+    expect(fitDistance(50, PITCH_MIN)).toBeGreaterThanOrEqual(DIST_MIN);
   });
 
-  it('comes closer as the view tips flatter, since the ring foreshortens', () => {
-    expect(fitDistance(1.0, 0.3)).toBeLessThanOrEqual(fitDistance(1.0, 1.2));
+  it('projects a point ahead of the camera to the centre, and one behind as behind', () => {
+    const o = { yaw: 0.3, pitch: 0.5, dist: 3 };
+    const centre = projectNdc({ x: 0, y: 0, z: 0 }, o, 1.5);
+    expect(centre.behind).toBe(false);
+    expect(centre.x).toBeCloseTo(0, 9);
+    expect(centre.y).toBeCloseTo(0, 9);
+    const c = orbitPosition(o);
+    expect(projectNdc({ x: c.x * 2, y: c.y * 2, z: c.z * 2 }, o, 1.5).behind).toBe(true);
+    // Up is up: a point above the origin lands above the centre.
+    expect(projectNdc({ x: 0, y: 0.5, z: 0 }, o, 1.5).y).toBeGreaterThan(0);
   });
 });
 

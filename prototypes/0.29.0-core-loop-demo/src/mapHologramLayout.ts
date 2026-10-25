@@ -37,6 +37,10 @@ export interface HoloMarker {
   z: number;
   /** The station the holotable marks "you are here". */
   here: boolean;
+  /** Set for a body between orbits (a station crossing to another planet):
+   *  its height, already worked out between the two orbits' tilts — the
+   *  body rides neither plane. holoPoint takes it as it is. */
+  y?: number;
   /** The orbit the body rides, when it rides one: its centre and radius on
    *  the disc (a planet's round the sun, a station's round its planet). */
   orbit?: { cx: number; cz: number; r: number };
@@ -69,8 +73,48 @@ export function plotMarkers(
     };
     const ring = orbitRing(bodies, body, nowMs, simTick);
     if (ring) marker.orbit = ring;
+    if (body.transit && !ring && body.type === 'station') return inTransit(marker, bodies, body.transit);
     return stretched(marker, bodies, nowMs, simTick);
   });
+}
+
+/**
+ * 🚚 A body crossing between two planets' orbits: each orbit is drawn its
+ * own way here (stretched, turned, tilted), so the crossing is carried
+ * from the one orbit's transform to the other's by how far along it is —
+ * by its distance from the sun between the two orbits' radii. At the
+ * departure orbit it is where that planet's orbit is drawn, at arrival
+ * where the other's is, and the course it flies runs between the two.
+ */
+function transitFrames(bodies: readonly MapBody[], transit: { from: string; to: string }) {
+  const planet = (id: string) => bodies.find((b) => b.id === id && b.type === 'planet');
+  const from = planet(transit.from), to = planet(transit.to);
+  if (!from || !to) return null;
+  return { from, to, rFrom: from.orbitRadius * PLOT_SCALE, rTo: to.orbitRadius * PLOT_SCALE };
+}
+export function transitPoint(
+  x: number,
+  z: number,
+  bodies: readonly MapBody[],
+  transit: { from: string; to: string },
+): { x: number; y: number; z: number } {
+  const f = transitFrames(bodies, transit);
+  if (!f) return { x, y: 0, z };
+  const r = Math.hypot(x, z);
+  const span = f.rTo - f.rFrom;
+  const t = Math.abs(span) < 1e-9 ? 1 : Math.max(0, Math.min(1, (r - f.rFrom) / span));
+  const a = turned(x * orbitStretch(f.from.id), z * orbitStretch(f.from.id), orbitTurn(f.from.id));
+  const b = turned(x * orbitStretch(f.to.id), z * orbitStretch(f.to.id), orbitTurn(f.to.id));
+  const ya = inclinedPoint(a.x, a.z, inclinationOf(f.from.id)), yb = inclinedPoint(b.x, b.z, inclinationOf(f.to.id));
+  return {
+    x: ya.x + (yb.x - ya.x) * t,
+    y: ya.y + (yb.y - ya.y) * t,
+    z: ya.z + (yb.z - ya.z) * t,
+  };
+}
+function inTransit(mk: HoloMarker, bodies: readonly MapBody[], transit: { from: string; to: string }): HoloMarker {
+  const p = transitPoint(mk.x, mk.z, bodies, transit);
+  return { ...mk, x: p.x, z: p.z, y: p.y, frame: transit.to };
 }
 
 /**
@@ -150,6 +194,7 @@ export function holoFoot(mk: HoloMarker): { x: number; y: number; z: number } {
 }
 
 export function holoPoint(mk: HoloMarker): { x: number; y: number; z: number } {
+  if (mk.y !== undefined) return { x: mk.x, y: mk.y, z: mk.z };
   if (mk.type === 'station' && mk.orbit) {
     const c = inclinedPoint(mk.orbit.cx, mk.orbit.cz, inclinationOf(mk.frame));
     const o = inclinedPoint(mk.x - mk.orbit.cx, mk.z - mk.orbit.cz, ringInclination(mk.frame, mk.orbit.r));
@@ -234,11 +279,17 @@ export const HOLO_REACH = 1.15;
 export function plotCourses(
   bodies: readonly MapBody[],
   nowMs: number,
-): Array<{ id: string; points: Array<{ x: number; z: number }> }> {
-  const out: Array<{ id: string; points: Array<{ x: number; z: number }> }> = [];
+): Array<{ id: string; points: Array<{ x: number; y: number; z: number }> }> {
+  const out: Array<{ id: string; points: Array<{ x: number; y: number; z: number }> }> = [];
   for (const body of bodies) {
     const pts = courseOnScreen(body, nowMs, 0, 0, PLOT_SCALE);
-    if (pts.length > 1) out.push({ id: body.id, points: pts.map((p) => ({ x: p.x, z: p.y })) });
+    if (pts.length < 2) continue;
+    // Carried between the two orbits as the body itself is (transitPoint),
+    // so the course meets the planets where they are drawn.
+    const points = body.transit
+      ? pts.map((p) => transitPoint(p.x, p.y, bodies, body.transit!))
+      : pts.map((p) => ({ x: p.x, y: 0, z: p.y }));
+    out.push({ id: body.id, points });
   }
   return out;
 }

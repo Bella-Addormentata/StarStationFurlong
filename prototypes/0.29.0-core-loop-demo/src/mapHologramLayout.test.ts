@@ -139,6 +139,48 @@ describe('the plot on the disc', () => {
     expect(inclinationOf('nothing')).toEqual({ tilt: 0, node: 0 });
   });
 
+  it('carries a station crossing from Aris to Sovereign between the two orbits as they are drawn, with its course', () => {
+    const base = solarPlotBodies([]);
+    const aris = base.find((b) => b.id === 'planet-aris')!, sov = base.find((b) => b.id === 'planet-sovereign')!;
+    const dep = T + 1000, arr = T + 61_000;
+    const angle = 1.1;
+    // Round Aris until departure, out between the orbits, round Sovereign from arrival.
+    const mover: MapBody = {
+      id: 'mover', name: 'MOVER', type: 'station', orbitRadius: 35, orbitSpeed: 0, angle, description: '',
+      parentId: aris.id,
+      // Out between the orbits it flies from where Aris is at departure to
+      // where Sovereign will be at arrival (as a real transfer does).
+      placeAt: (ms) => ms < dep ? { parentId: aris.id, angle, radius: 35 }
+        : ms >= arr ? { parentId: sov.id, angle, radius: 35 }
+        : { angle: aris.angleAt!(dep) + (sov.angleAt!(arr) - aris.angleAt!(dep)) * ((ms - dep) / (arr - dep)), radius: aris.orbitRadius + (sov.orbitRadius - aris.orbitRadius) * ((ms - dep) / (arr - dep)) },
+      course: { until: arr, points: [0, 0.5, 1].map((f) => ({ angle: aris.angleAt!(dep) + (sov.angleAt!(arr) - aris.angleAt!(dep)) * f, radius: aris.orbitRadius + (sov.orbitRadius - aris.orbitRadius) * f })) },
+      transit: { from: aris.id, to: sov.id },
+    };
+    const bodies = [...base, mover];
+    const at = (ms: number) => plotMarkers(bodies, ms).find((m) => m.id === 'mover')!;
+    const planet = (id: string, ms: number) => plotMarkers(bodies, ms).find((m) => m.id === id)!;
+    // Just departed: at Aris's drawn orbit, next to Aris as drawn — not on Aris's untransformed place.
+    const len = (p: { x: number; y: number; z: number }) => Math.hypot(p.x, p.y, p.z);
+    const gap = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+    const d0 = at(dep), a0 = planet(aris.id, dep);
+    expect(d0.y).toBeDefined();
+    expect(gap(holoPoint(d0), holoPoint(a0))).toBeLessThan(0.02);
+    expect(len(holoPoint(d0))).toBeCloseTo(aris.orbitRadius * PLOT_SCALE * orbitStretch(aris.id), 6);
+    // About to arrive: on Sovereign's drawn orbit, Sovereign's way round.
+    const d1 = at(arr - 1);
+    expect(len(holoPoint(d1))).toBeCloseTo(sov.orbitRadius * PLOT_SCALE * orbitStretch(sov.id), 3);
+    // The jump at departure and at arrival is no more than the station's own ring round the planet.
+    const ring = 35 * PLOT_SCALE * STATION_SPREAD;
+    expect(gap(holoPoint(at(dep - 1)), holoPoint(d0))).toBeLessThan(ring + 0.01);
+    expect(gap(holoPoint(at(arr)), holoPoint(d1))).toBeLessThan(ring + 0.01);
+    // The course runs from the one drawn orbit to the other.
+    const course = plotCourses(bodies, dep + 10).find((c) => c.id === 'mover')!;
+    expect(course.points).toHaveLength(3);
+    expect(len(course.points[0]!)).toBeCloseTo(aris.orbitRadius * PLOT_SCALE * orbitStretch(aris.id), 6);
+    expect(len(course.points[2]!)).toBeCloseTo(sov.orbitRadius * PLOT_SCALE * orbitStretch(sov.id), 6);
+    expect(gap(course.points[0]!, holoPoint(d0))).toBeLessThan(0.02);
+  });
+
   it('has a belt at the rim, where its marker is', () => {
     const bodies = solarPlotBodies([]);
     const r = beltRadius(bodies);

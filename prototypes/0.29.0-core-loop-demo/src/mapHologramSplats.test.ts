@@ -52,6 +52,32 @@ describe('bodyColor', () => {
   });
 });
 
+describe('a planet in the splat plot', () => {
+  it('keeps its day side toward the sun, height and all', async () => {
+    const h = (await buildSplatPlot(new THREE.Group()))!;
+    for (const [x, z] of [[0.3, 0], [0, 0.3], [-0.2, 0.2], [0.1, -0.3]] as const) {
+      h.place([sun, marker('planet-sovereign', 'planet', x, z)], 0, 1, true);
+      const rig = h.group.getObjectByName('planet-planet-sovereign')!;
+      const spin = rig.children.find((c) => c.type === 'Group')!;
+      const lit = new THREE.Vector3(1, 0, 0).applyQuaternion(spin.quaternion);
+      const toSun = rig.position.clone().negate().normalize();
+      expect(lit.dot(toSun)).toBeCloseTo(1, 5);
+    }
+  });
+
+  it("hides a station's thread while it crosses between orbits, and shows it again on arrival", async () => {
+    const h = (await buildSplatPlot(new THREE.Group()))!;
+    h.place([sun, sovereign, station], 0, 1, true);
+    const foot = h.group.getObjectByName('foot-st-a')!;
+    expect(foot.visible).toBe(true);
+    const crossing: HoloMarker = { ...station, orbit: undefined, y: 0.02, x: 0.2, z: 0.1 };
+    h.place([sun, sovereign, crossing], 0, 1, true);
+    expect(foot.visible).toBe(false);
+    h.place([sun, sovereign, station], 0, 1, true);
+    expect(foot.visible).toBe(true);
+  });
+});
+
 describe('buildSplatPlot', () => {
   it('is nothing without a provider, and the mesh plot stays', async () => {
     setSparkProvider(null);

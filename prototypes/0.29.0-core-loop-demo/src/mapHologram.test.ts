@@ -138,6 +138,19 @@ describe('buildMapHologram', () => {
     expect(stationLayer.visible).toBe(false);
   });
 
+  it('frees its course lines with the table, which World cannot reach (they are not meshes)', () => {
+    const { root } = build();
+    const lines: THREE.Line[] = [];
+    root.traverse((o) => { if (o instanceof THREE.Line) lines.push(o); });
+    expect(lines.length).toBeGreaterThan(0);
+    const geoSpies = lines.map((l) => vi.spyOn(l.geometry, 'dispose'));
+    const matSpy = vi.spyOn(lines[0]!.material as THREE.Material, 'dispose');
+    expect(typeof root.userData.disposeCourses).toBe('function');
+    (root.userData.disposeCourses as () => void)();
+    for (const sp of geoSpies) expect(sp).toHaveBeenCalled();
+    expect(matSpy).toHaveBeenCalled();
+  });
+
   it('re-reads the station every REFRESH_MS, so a table kept across a room swap follows', () => {
     const { handle, plot, stationLayer, shown } = build();
     handle.update(0.1);
