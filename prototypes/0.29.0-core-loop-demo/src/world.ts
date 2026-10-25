@@ -259,9 +259,8 @@ import { getPlayerId, getPlayerName } from "./identity";
 import { listContacts, getContact } from "./contacts";
 // 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
 // screen view the prop draws.
-import { createSmartTvUI } from "./tvUI";
-import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, setTvScreenProvider, updateTvChip } from "./tvTheatre";
-import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
+import { closeTvTheatre, isTvTheatreOpen, setTvScreenProvider, tvTheatreHint, updateTvPicture } from "./tvTheatre";
+import { forgetTv, isTvKind, tickTvRoom, tvDriveArmed } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
 // 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
 // attract card the prop draws.
@@ -542,7 +541,7 @@ export class World {
   /** 📺 Smart-TV screens (#186), keyed by item id — redrawn at ~2 Hz from
    *  the room record (tvDoc.tvScreenView); the handle dedupes identical views. */
   private tvScreens: Map<string, TvScreenHandle> = new Map();
-  /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the chip). */
+  /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the picture). */
   private tvTimer = 0;
   /** 🕹 Arcade cabinet screens (#193), keyed by item id — redrawn at ~2 Hz
    *  from the room record (arcadeDoc.arcadeScreenView), on the TV's timer. */
@@ -3371,13 +3370,12 @@ export class World {
     // whose set is gone (no-ops for every other kind).
     if (isTvTheatreOpen(itemId)) closeTvTheatre();
     forgetTv(itemId);
-    // And its WATCH chip, now, not at the next half-second tick: a chip
-    // left clickable in that gap would reopen the removed set's theatre,
-    // which later ticks would never close. Runs pre-splice, so the removed
-    // id is excluded by hand; under the same drive flag as the tick, so a
-    // teardown cannot put a departed room's chip back up.
+    // And the picture to another set that is on, now, not at the next
+    // half-second tick. Runs pre-splice, so the removed id is excluded by
+    // hand; under the same drive flag as the tick, so a teardown cannot put
+    // a departed room's picture back up.
     if (tvDriveArmed()) {
-      updateTvChip(FURNITURE.filter((i) => isTvKind(i.kind) && i.id !== itemId).map((i) => i.id));
+      updateTvPicture(FURNITURE.filter((i) => isTvKind(i.kind) && i.id !== itemId).map((i) => i.id));
     }
     // 🕹 #193: likewise a removed cabinet takes its stage (which swallows
     // the world's keys while it is up) and this page's seat with it.
@@ -4270,8 +4268,8 @@ export class World {
     }
 
     // 📺 #186: the TVs at 2 Hz — each screen draws the view the room record
-    // implies (the handle skips unchanged views), a holder renews its remote
-    // and keeps the room's clock alive, and the HUD chip says what is on.
+    // implies (the handle skips unchanged views), the page that keeps a
+    // set's clock renews it, and a set with something on gets its picture.
     // Driven here, not by timers of their own, so a removed set stops dead.
     this.tvTimer += deltaTime;
     if (this.tvTimer >= 0.5) {
@@ -4280,15 +4278,20 @@ export class World {
       // synchronously by leaveRoomNow and armed again once the next room's
       // docs and layout are bound): this loop keeps running through the
       // leave's awaited flush, with the old furniture and the old TV doc
-      // still here — a tick then would put the departed room's WATCH chip
-      // back up, with its theatre a click away. Otherwise unconditionally:
-      // with the last set gone, an empty list is what takes a stale chip
-      // down and clears the session's bookkeeping.
+      // still here — a tick then would put the departed room's picture back
+      // up. Otherwise unconditionally: with the last set gone, an empty list
+      // is what takes a stale picture down and clears the session's
+      // bookkeeping.
       if (tvDriveArmed()) {
         const tvIds = FURNITURE.filter((i) => isTvKind(i.kind)).map((i) => i.id);
-        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+        // 📡 What the set asks of this viewer (a link to allow, a file to
+        // fetch), in its own few words: where to look, on the set itself.
+        for (const [id, screen] of this.tvScreens) {
+          const ask = tvTheatreHint(id);
+          screen.draw(ask ? { ...tvScreenView(id), ask } : tvScreenView(id));
+        }
         tickTvRoom(tvIds);
-        updateTvChip(tvIds);
+        updateTvPicture(tvIds);
         // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
         // P1 page renews its seat — with an empty list too, and under the
         // same flag: a seat is not renewed into a room being left either.
@@ -7079,38 +7082,14 @@ export class World {
       return;
     }
 
-    // 📺 #186: the set's body buttons, WATCH, and the remote. The programme
-    // itself is chosen on the remote (the phone's TV app), as on a real set.
+    // 📡 #258: no panel at the set. Its buttons are the SpacePhone's IR
+    // BLASTER: a click on the set (or a walk-up press) aims the blaster at
+    // it and opens the phone on its remote (main.ts), from a room still
+    // being driven, on a set still in it.
     if (device.kind === "smartTv") {
-      const label = tvLabel(FURNITURE.find((i) => i.id === deviceId)?.kind);
-      const ui = createSmartTvUI({
-        itemId: deviceId,
-        label,
-        myPub: () => getIdentityPub(),
-        myName: () => getPlayerName(),
-        // The deps main.ts installed (setTvTheatreDeps): the same label and
-        // round-trip lead as the chip's and the phone's WATCH.
-        // Opened in the continuation, which runs after the focus eases out:
-        // a room leave may have begun meanwhile (leaveRoomNow closes the
-        // theatre, then awaits the flush while World keeps updating), so the
-        // drive and the set are checked again THERE, as the phone's and the
-        // chip's WATCH check them — else this reopened a theatre no room
-        // tick would close.
-        openTheatre: () =>
-          deviceFocus.releaseThen(() => {
-            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) openTvTheatre(deviceId);
-          }),
-        // The same guard in the remote's continuation: a phone reopened on a
-        // set that left with its room, after the drive was disarmed, would
-        // show a remote nothing ticks for.
-        openRemote: () =>
-          deviceFocus.releaseThen(() => {
-            if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) {
-              (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
-            }
-          }),
-      });
-      deviceFocus.beginFocus(this.player, device, ui);
+      if (tvDriveArmed() && FURNITURE.some((i) => i.id === deviceId)) {
+        (window as unknown as { __ssfAimTvBlaster?: (id: string) => void }).__ssfAimTvBlaster?.(deviceId);
+      }
       return;
     }
 

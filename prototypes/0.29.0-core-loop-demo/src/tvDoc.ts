@@ -1698,6 +1698,11 @@ export interface TvScreenView {
   clockText: string;
   /** The home screen's RECENTLY ON shelf: the library's newest titles. */
   recent?: string[];
+  /** This page's own word on the set, never the room's: what its theatre
+   *  waits on (a tap to play, a fetch, an allow), parts joined by ' · '.
+   *  World adds it from tvTheatreHint; the set draws it where the picture
+   *  is not up. */
+  ask?: string;
 }
 
 /** How many library titles the home screen shows. */

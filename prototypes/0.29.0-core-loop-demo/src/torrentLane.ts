@@ -3,17 +3,17 @@
  * brainstorming/smart-tv-arcade-media-plan.md; the node's half is
  * ssf-p2p-node/src/torrent_lane.rs, built with `--features torrent`).
  *
- * The remote's holder pastes a magnet or chooses a .torrent file; THEIR
- * node reads the torrent's file list (from the swarm for a magnet: no
+ * A player SENDs a magnet from the IR blaster's link box, or chooses a
+ * .torrent file (#258: anyone's SpacePhone is the remote); THEIR node reads the torrent's file list (from the swarm for a magnet: no
  * trackers, a client-only DHT, public peers only) and shows it: nothing
- * downloads until the holder picks a file and presses ⬇ DOWNLOAD. The file
+ * downloads until that player picks a file and presses ⬇ DOWNLOAD. The file
  * then goes into the blob lane (blobLane.ts), and when it is whole the
- * remote plays it as an ordinary `{ kind: 'blob' }` source, so viewers press
- * FETCH and take it from the holder's node: nobody else joins the swarm.
+ * blaster plays it as an ordinary `{ kind: 'blob' }` source, so viewers
+ * take it from that player's node: nobody else joins the swarm.
  * The programme names only the blob; the room's library (tvDoc) keeps the
  * torrent's info hash and file number beside it, for 🧲 GET AGAIN.
  *
- * Only this page starts a torrent, on the holder's START or GET AGAIN press:
+ * Only this page starts a torrent, on its player's SEND, START or GET AGAIN press:
  * the routes sit behind the blob lane's gate (an allowed Origin and this
  * launch's token).
  */
@@ -160,7 +160,7 @@ async function post(path: string, params: Record<string, string>, body?: string 
   }
 }
 
-/** START: hand the pasted magnet to this page's node. Null when it took it.
+/** SEND or START: hand the magnet to this page's node. Null when it took it.
  *  `file` is the file the list offers first (a library entry's). */
 export async function startTorrent(magnet: string, file?: number): Promise<string | null> {
   const text = magnet.trim();
@@ -245,7 +245,7 @@ export function torrentSource(st: TorrentState = torrentState()): TvSource | nul
 export function torrentLine(st: TorrentState, fmt: (n: number) => string): string {
   switch (st.state) {
     case 'unknown': return '';
-    case 'none': return 'No torrent yet: paste a magnet and press 🧲 START.';
+    case 'none': return 'No torrent yet: SEND a magnet link from the box above, or choose a .torrent file.';
     case 'metadata': return `🧲 Asking the swarm for ${st.name || 'the file list'}…`;
     case 'ready': {
       const n = st.files.length;
