@@ -1127,7 +1127,17 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
         feedback(`Your node restarted or went away while it took ${name}. SEND the link again.`, 'link');
         return null;
       }
-      if (st.state === 'complete') break;
+      if (st.state === 'complete') {
+        // A file this node had already, or was taking for another ask, is
+        // not checked against the link's size by the fetch: it is here. Its
+        // own size goes to the room, never a link's wrong one (the room's
+        // viewers take no byte past it).
+        if (st.size !== link.size) {
+          feedback(`${name}: your node holds that file at ${formatBytes(st.size)}, not the ${formatBytes(link.size)} the link says. The link is wrong: ask for it again.`, 'link');
+          return null;
+        }
+        break;
+      }
       if (st.state === 'failed' || st.state === 'none') {
         feedback(`${name} did not come: ${st.state === 'failed' && st.why ? st.why : 'your node let it go'}. The nodes the link names may be offline, or no longer share it: try again later.`, 'link');
         return null;

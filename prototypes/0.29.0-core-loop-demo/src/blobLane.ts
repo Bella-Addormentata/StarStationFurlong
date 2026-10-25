@@ -267,17 +267,20 @@ export async function shareBlob(hash: string, on: boolean): Promise<{ via: strin
   const url = HEX_64.test(hash) ? route('/api/blob/share', { hash, on: on ? '1' : '0' }) : null;
   if (!url) return { error: 'That needs this station\'s node running here.' };
   const gen = generation;
+  // An answer from the node this page had before: what it marked is not
+  // the node here now (a link copied from it would name the wrong node).
+  const restarted = { error: 'Your node restarted meanwhile: press it again.' };
   try {
     const res = await fetch(url, { method: 'POST', redirect: 'error' });
+    if (gen !== generation) return restarted;
     if (!res.ok) return { error: `Your node: ${await errorOf(res, 'it did not take that')}.` };
     const body = (await res.json()) as { via?: unknown };
+    if (gen !== generation) return restarted;
     const via = hexList(body.via, 3);
-    if (gen === generation) {
-      heldEpoch++; // a held answer asked before says the file as it was
-      if (heldHere && heldHere.gen === gen) {
-        if (on) heldHere.shared.set(hash, via);
-        else heldHere.shared.delete(hash);
-      }
+    heldEpoch++; // a held answer asked before says the file as it was
+    if (heldHere && heldHere.gen === gen) {
+      if (on) heldHere.shared.set(hash, via);
+      else heldHere.shared.delete(hash);
     }
     return { via };
   } catch {

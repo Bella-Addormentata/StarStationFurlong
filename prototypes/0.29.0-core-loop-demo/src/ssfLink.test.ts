@@ -32,6 +32,8 @@ describe('🔗 an SSF link', () => {
     expect(parseSsfLink(ok)).toMatchObject({ hash: HASH, size: 9, title: '', mime: '', nodes: [A] });
     expect(parseSsfLink(`ssf://film?s=9&n=${A}`)).toBeNull();
     expect(parseSsfLink(`ssf://film?h=${HASH.slice(1)}&s=9&n=${A}`)).toBeNull();
+    expect(parseSsfLink(`ssf://film?h=${HASH}0&s=9&n=${A}`)).toBeNull(); // not cut down to a hash
+    expect(parseSsfLink(`ssf://film?h=${HASH}zz&s=9&n=${A}`)).toBeNull();
     expect(parseSsfLink(`ssf://film?h=${HASH}&n=${A}`)).toBeNull();
     for (const s of ['0', '-1', '1.5', '1e3', '09', String(TV_MAX_BLOB + 1)]) expect(parseSsfLink(`ssf://film?h=${HASH}&s=${s}&n=${A}`)).toBeNull();
     expect(parseSsfLink(`ssf://film?h=${HASH}&s=9`)).toBeNull();

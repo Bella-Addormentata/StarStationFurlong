@@ -150,6 +150,20 @@ describe('blobLane', () => {
       expect(nodeShares(HASH)).toBe(false);
       expect(await shareBlob('not a hash', true)).toEqual({ error: expect.stringMatching(/node/) });
     });
+
+    it('a share answered by the node this page had before is no share here', async () => {
+      withNode();
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (url.includes('/api/blob/share')) {
+          setBlobLaneNode({ origin: ORIGIN, cap: 'f'.repeat(64), irohId: OTHER }); // the node restarted under the ask
+          return new Response(JSON.stringify({ shared: true, via: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ held: [HASH], reachable: [], shared: {} }), { status: 200 });
+      }));
+      await refreshHeldBlobs(1_000);
+      expect(await shareBlob(HASH, true)).toEqual({ error: expect.stringMatching(/restarted/) });
+      expect(nodeShares(HASH)).toBeNull(); // the new node has not said yet
+    });
   });
 
   describe('a whole file can go again', () => {

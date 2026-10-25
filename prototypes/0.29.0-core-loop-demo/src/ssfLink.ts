@@ -52,9 +52,12 @@ export function parseSsfLink(text: string): SsfFilmLink | null {
     .filter((id) => HEX_64.test(id))
     .slice(0, SSF_LINK_NODES);
   const s = q.get('s') ?? '';
-  if (!nodes.length || !/^[1-9]\d{0,15}$/.test(s)) return null;
+  // The hash whole, before the record's own check (which cuts a field to
+  // its length first): 64 digits and anything after them is no hash.
+  const hash = (q.get('h') ?? '').trim().toLowerCase();
+  if (!nodes.length || !HEX_64.test(hash) || !/^[1-9]\d{0,15}$/.test(s)) return null;
   const source = sanitizeSource({
-    kind: 'blob', hash: (q.get('h') ?? '').trim().toLowerCase(), size: Number(s), provider: nodes[0], mime: q.get('m') ?? '', title: q.get('t') ?? '',
+    kind: 'blob', hash, size: Number(s), provider: nodes[0], mime: q.get('m') ?? '', title: q.get('t') ?? '',
   });
   if (source?.kind !== 'blob') return null;
   return { hash: source.hash, size: source.size, title: source.title ?? '', mime: source.mime ?? '', nodes };
