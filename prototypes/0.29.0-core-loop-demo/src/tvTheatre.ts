@@ -22,12 +22,12 @@
  * offers a retry, and nothing else in the room depends on them.
  */
 
-import { TvSyncController } from './tvSync';
+import { lapRemountIsFree, replayNeedsRemount, TvSyncController } from './tvSync';
 import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
   readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
-  sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
+  sourceLane, tvDocEpoch, tvNow, tvPause, tvResume, tvSeek, tvSetLoop, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
@@ -361,6 +361,13 @@ interface Theatre {
    *  that programme alone, so a room tick between a source change and the
    *  remount cannot put the old player's length on the new programme. */
   playerFor: number;
+  /** The programme (`started`) the adapter was BUILT for: a seekable player
+   *  follows a replay and keeps this, one that cannot seek is rebuilt
+   *  (tvSync replayNeedsRemount). */
+  mountedFor: number;
+  /** When the adapter was built (tvNow): a LOOP lap's rebuild of a player
+   *  that ran for at least TV_LAP_REMOUNT_MIN_MS is not counted (tvSync). */
+  mountedAt: number;
   /** The mount key of what the adapter was built for ('' = nothing mounted):
    *  the sourceId, plus the programme's `started` for a start-only embed. */
   mounted: string;
@@ -494,6 +501,8 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = depsProvider(i
     shownOn: null,
     onKey,
     playerFor: -1,
+    mountedFor: -1,
+    mountedAt: 0,
     probing: '',
     probeAbort: null,
     budgetedKey: '',
@@ -557,13 +566,14 @@ function theatreFocusable(root: HTMLElement): HTMLElement[] {
 }
 
 /** The programme this viewer turned off with ✕ (the set, the record's
- *  `started`, and the room's doc it was in — another room may reuse the item
- *  id and the counter): the room tick does not turn it back on by itself. */
-const dismissed = new Map<string, { started: number; epoch: number }>();
+ *  `showing` — every LOOP lap of it included — and the room's doc it was in:
+ *  another room may reuse the item id and the counter): the room tick does
+ *  not turn it back on by itself. */
+const dismissed = new Map<string, { showing: number; epoch: number }>();
 
-function isDismissed(itemId: string, started: number): boolean {
+function isDismissed(itemId: string, showing: number): boolean {
   const d = dismissed.get(itemId);
-  return d !== undefined && d.started === started && d.epoch === tvDocEpoch();
+  return d !== undefined && d.showing === showing && d.epoch === tvDocEpoch();
 }
 
 /** Take the picture off the set and the bar down. `byViewer`: the ✕ on the
@@ -572,7 +582,7 @@ export function closeTvTheatre(byViewer = false): void {
   if (!theatre) return;
   const t = theatre;
   theatre = null;
-  if (byViewer) dismissed.set(t.itemId, { started: readTv(t.itemId).started, epoch: tvDocEpoch() });
+  if (byViewer) dismissed.set(t.itemId, { showing: readTv(t.itemId).showing, epoch: tvDocEpoch() });
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
   const hadFocus = t.root.contains(document.activeElement);
@@ -635,6 +645,8 @@ function hideNotice(t: Theatre): void {
 function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => number): void {
   unmountPlayer(t);
   t.mounted = key;
+  t.mountedFor = t.playerFor; // this tick's programme (theatreTick notes it before mounting)
+  t.mountedAt = tvNow();
   const token = t.attempt;
   const live = () => theatre === t && t.attempt === token;
   const fail = (why: string) => {
@@ -669,7 +681,12 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
       set.showVideo(player.video);
       t.shownOn = set;
     }
-    const controller = new TvSyncController({ itemId: t.itemId, player, rttMs: rtt });
+    const controller = new TvSyncController({
+      itemId: t.itemId, player, rttMs: rtt,
+      // A LOOP lap this player followed as it ended (tvSync followLap): the
+      // registration below names the lap at once, not at the next tick.
+      onLapFollowed: (started) => { if (live() && t.controller === controller) t.playerFor = started; },
+    });
     t.controller = controller;
     // Only a player with a clock becomes the room's clock; the archive embed
     // reports nothing, so the headless heartbeat (tvSession) keeps beating.
@@ -789,8 +806,15 @@ function theatreTick(rtt: () => number): void {
     // files the player's last end report (tvSession), and filed under the
     // next programme's number a short film's length would stop the live
     // stream that followed it once the theatre closed.
-    const stale = t.mounted !== '' && (consent !== 'ok' || (t.mounted !== key && t.mounted !== `failed:${key}`));
+    // …and so does a player that ran out and cannot seek back to follow a
+    // new start of the same source (a replay, a LOOP lap): rebuilt, it
+    // plays from the top.
+    const lap = t.mounted === key && t.player !== null && replayNeedsRemount(t.player, t.mountedFor, rec.started);
+    const stale = t.mounted !== '' && (consent !== 'ok' || (t.mounted !== key && t.mounted !== `failed:${key}`) || lap);
     if (stale) unmountPlayer(t);
+    // That rebuild comes no faster than the clip runs here, so it is not
+    // the churn the mount budget counts (tvSync lapRemountIsFree).
+    if (lap && consent === 'ok' && lapRemountIsFree(t.mountedAt, tvNow())) t.budgetedKey = key;
     // The programme the player is (or is about to be) mounted for — noted
     // here, on the theatre's own tick, so between a source change and this
     // tick the registration still names the OLD programme and tvSession
@@ -1131,7 +1155,8 @@ function renderTheatreChrome(t: Theatre): void {
   const where = pb.state === 'scheduled' ? countdownText(pb.countdownMs)
     : pb.state === 'paused' ? `PAUSED · ${formatClock(pb.positionMs)}`
     : pb.state === 'playing' ? `● ${formatClock(pb.positionMs)}` : '';
-  const status = `${who}${where ? ` · ${where}` : ''}${sync}`;
+  const loop = rec.loop && !startOnly ? ' · 🔁 LOOP' : '';
+  const status = `${who}${where ? ` · ${where}` : ''}${loop}${sync}`;
   if (status !== t.lastStatus) {
     t.status.textContent = status;
     t.lastStatus = status;
@@ -1144,6 +1169,10 @@ function renderTheatreChrome(t: Theatre): void {
     mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
     mine && seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
     mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
+    // archive.org's own player never says it ended, so it has nothing to loop.
+    mine && rec.source && !startOnly
+      ? btn(`data-tv-loop="1" aria-pressed="${rec.loop}"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF', 'At the end, start the film over')
+      : '',
     // Every viewer's own switch, for a file from a member's node.
     rec.source?.kind === 'blob'
       ? btn(`data-tv-autofetch="1" aria-pressed="${autoFetchOn()}"`, autoFetchOn() ? '📦 AUTO-FETCH: ON' : '📦 AUTO-FETCH: OFF',
@@ -1183,6 +1212,7 @@ function renderTheatreChrome(t: Theatre): void {
     c.querySelector<HTMLButtonElement>('[data-tv-back]')?.addEventListener('click', () => { tvSeek(t.itemId, Math.max(0, pos() - 10_000)); });
     c.querySelector<HTMLButtonElement>('[data-tv-fwd]')?.addEventListener('click', () => { tvSeek(t.itemId, pos() + 10_000); });
     c.querySelector<HTMLButtonElement>('[data-tv-stop]')?.addEventListener('click', () => { tvStop(t.itemId); });
+    c.querySelector<HTMLButtonElement>('[data-tv-loop]')?.addEventListener('click', () => { tvSetLoop(t.itemId, !readTv(t.itemId).loop); });
     c.querySelector<HTMLButtonElement>('[data-tv-autofetch]')?.addEventListener('click', () => {
       setAutoFetchOn(!autoFetchOn());
       renderTheatreChrome(t);
@@ -1235,7 +1265,7 @@ export function updateTvChip(itemIds: readonly string[]): void {
     for (const id of itemIds) {
       const rec = readTv(id);
       if (!rec.source || rec.state === 'off' || rec.state === 'home') continue;
-      if (chipOpen && !isDismissed(id, rec.started)) {
+      if (chipOpen && !isDismissed(id, rec.showing)) {
         chipOpen(id);
         if (theatre) return;
       }

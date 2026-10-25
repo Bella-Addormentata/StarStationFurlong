@@ -160,12 +160,24 @@ export interface TvProgramme {
    *  it unmoved by the next start, and a same-source replay would read as
    *  ordinary drift. */
   started: number;
+  /** The `started` this showing began at: PLAY NOW and a schedule set it to
+   *  their own start, and a LOOP lap (tvProgrammeEnded) keeps it. What a
+   *  viewer's ✕ is kept against (tvTheatre), so a lap does not undo it,
+   *  while a player still sees each lap as the new start it is. Never
+   *  above `started`: a record that says otherwise reads as `started`. */
+  showing: number;
   /** The programme-ACTION revision: bumped by every transport write (play,
    *  schedule, pause, resume, seek, stop, power) and never by a heartbeat.
    *  The holder follows a new revision exactly once and otherwise only ever
    *  publishes where its own player is; a lookup started under an older
    *  revision is void. */
   jump: number;
+  /** The LOOP laps this record has run (tvProgrammeEnded), each bumped
+   *  with `jump`: a lap is a transport write the players follow, but no
+   *  one's programme action, so a lookup in flight (an upload, an
+   *  archive.org lookup, for PLAY NOW over a looping film) reads past it
+   *  (tvRevision). */
+  laps: number;
   /** Where the media ends, in ms, as the holder's player reported it for
    *  THIS programme (tvNoteEnd) — 0 until a player knows, and for a live
    *  stream. It travels with the record so that a holder handed the remote
@@ -173,6 +185,11 @@ export interface TvProgramme {
    *  the programme where the media does (tvSession's headless beat). Never
    *  a sample: writing it bumps neither `seq` nor `jump`. */
   endMs: number;
+  /** LOOP: at the media's end the programme starts over from the top
+   *  (tvProgrammeEnded) instead of going back to the home screen. The set's
+   *  setting, kept across programmes until it is turned off, and the
+   *  holder's to set like the rest of this record (tvSetLoop). */
+  loop: boolean;
   /** The holder's name on the sample, for the screen's "with <name>" line. */
   history: TvHistoryEntry[];
 }
@@ -209,8 +226,11 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   positionMs: 0,
   seq: 0,
   started: 0,
+  showing: 0,
   jump: 0,
+  laps: 0,
   endMs: 0,
+  loop: false,
   history: [],
 };
 
@@ -638,7 +658,7 @@ export function tvPageId(): string {
 const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
 const num = (v: unknown, fallback = 0): number =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-/** One rule for every revision counter (`seq`, `started`, `jump`, the
+/** One rule for every revision counter (`seq`, `started`, `jump`, `laps`, the
  *  switch's `seq`): a reader compares it for CHANGE, never for order, and a
  *  writer moves it by one, so it must be a whole number that one more still
  *  moves. A peer's `Number.MAX_VALUE` passes as a finite number, yet adding
@@ -734,6 +754,8 @@ export function readProgramme(itemId: string): TvProgramme {
         .filter((e): e is TvHistoryEntry => e !== null)
         .slice(0, TV_HISTORY_MAX)
     : [];
+  const started = counter(raw.started);
+  const shown = raw.showing;
   return {
     source,
     // A programme-less record cannot be playing: it shows the home screen.
@@ -741,9 +763,12 @@ export function readProgramme(itemId: string): TvProgramme {
     startAt: Math.max(0, num(raw.startAt)),
     positionMs: Math.max(0, num(raw.positionMs)),
     seq: counter(raw.seq),
-    started: counter(raw.started),
+    started,
+    showing: Number.isSafeInteger(shown) && (shown as number) >= 0 && (shown as number) <= started ? (shown as number) : started,
     jump: counter(raw.jump),
+    laps: counter(raw.laps),
     endMs: Math.max(0, Math.floor(num(raw.endMs))),
+    loop: raw.loop === true,
     history,
   };
 }
@@ -778,9 +803,15 @@ export function readTv(itemId: string): TvRecord {
 }
 
 /** The revision a lookup in flight is checked against: any programme action
- *  (`jump`) or power press (`seq`) meanwhile voids it. */
+ *  (`jump`) or power press (`seq`) meanwhile voids it. A LOOP lap moves
+ *  `jump` and `laps` together, so it does not: a film that loops while an
+ *  upload runs is the film that upload is to replace. */
 export function tvRevision(itemId: string): string {
-  return `${readProgramme(itemId).jump}:${readPower(itemId).seq}`;
+  const rec = readProgramme(itemId);
+  // Modulo the counters' range (0…TV_COUNTER_MAX): each wraps on its own
+  // (bump), and a lap that wraps one and not the other is still no action.
+  const d = rec.jump - rec.laps;
+  return `${d < 0 ? d + TV_COUNTER_MAX + 1 : d}:${readPower(itemId).seq}`;
 }
 
 export function readRemote(itemId: string): RemoteRecord {
@@ -947,6 +978,7 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torr
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
   switchOn(itemId);
   const rec = readProgramme(itemId);
+  const started = bump(rec.started);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
@@ -954,7 +986,8 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torr
     startAt: 0,
     positionMs: 0,
     seq: bump(rec.seq),
-    started: bump(rec.started),
+    started,
+    showing: started,
     jump: bump(rec.jump),
     endMs: 0, // a new programme: its player says where it ends
     history: withHistory(rec, clean, now),
@@ -972,6 +1005,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
   if (!Number.isFinite(startAt) || startAt <= now) return { ok: false, error: 'Pick a time that is still ahead.' };
   switchOn(itemId);
   const rec = readProgramme(itemId);
+  const started = bump(rec.started);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
@@ -979,7 +1013,8 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     startAt: Math.floor(startAt),
     positionMs: 0,
     seq: bump(rec.seq),
-    started: bump(rec.started),
+    started,
+    showing: started,
     jump: bump(rec.jump),
     endMs: 0,
     history: withHistory(rec, clean, now),
@@ -1154,6 +1189,38 @@ export function tvNoteEnd(itemId: string, endMs: number | null): TvAction {
   const wire = endMs === null || !Number.isFinite(endMs) ? 0 : Math.max(0, Math.floor(endMs));
   if (rec.endMs === wire) return { ok: true };
   write(tvKey(itemId), { ...rec, endMs: wire } satisfies TvProgramme);
+  return { ok: true };
+}
+
+/** LOOP on or off. Neither a sample nor a transport action — `seq` and
+ *  `jump` stay — and kept across programmes: the next film loops too. */
+export function tvSetLoop(itemId: string, on: boolean): TvAction {
+  const gate = mayControl(itemId);
+  if (!gate.ok) return gate;
+  const rec = readProgramme(itemId);
+  if (rec.loop === on) return { ok: true };
+  write(tvKey(itemId), { ...rec, loop: on } satisfies TvProgramme);
+  return { ok: true };
+}
+
+/** The media ran to its end — the holder's player said so (tvSync), or the
+ *  headless beat reached the end the record carries (tvSession). With LOOP
+ *  on, the same programme starts over from the top: a new start, as PLAY
+ *  NOW again is, so a player that can seek is sent back to 0 and one that
+ *  cannot is rebuilt. The showing, the history and the library stay as they
+ *  are (a lap is not another showing: a viewer's ✕ holds across it), and so
+ *  does `endMs`: the same media ends in the same place, which is how a
+ *  holder with no player of its own loops it again. Otherwise back to the
+ *  home screen. */
+export function tvProgrammeEnded(itemId: string): TvAction {
+  const gate = mayControl(itemId);
+  if (!gate.ok) return gate;
+  const rec = readProgramme(itemId);
+  if (!rec.loop || !rec.source) return tvStop(itemId);
+  write(tvKey(itemId), {
+    ...rec, state: 'playing', startAt: 0, positionMs: 0, seq: bump(rec.seq), started: bump(rec.started), jump: bump(rec.jump),
+    laps: bump(rec.laps),
+  } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -1560,8 +1627,9 @@ export function tvScreenView(itemId: string, now = clock()): TvScreenView {
   if (pb.state === 'scheduled') {
     return { state: 'scheduled', title: label, detail: countdownText(pb.countdownMs), lane, clockText: '' };
   }
+  const loop = rec.loop ? 'LOOP · ' : '';
   if (pb.state === 'paused') {
-    return { state: 'paused', title: label, detail: `PAUSED · ${holderLine}`, lane, clockText: formatClock(pb.positionMs) };
+    return { state: 'paused', title: label, detail: `PAUSED · ${loop}${holderLine}`, lane, clockText: formatClock(pb.positionMs) };
   }
-  return { state: 'playing', title: label, detail: holderLine, lane, clockText: formatClock(pb.positionMs) };
+  return { state: 'playing', title: label, detail: `${loop}${holderLine}`, lane, clockText: formatClock(pb.positionMs) };
 }

@@ -18,7 +18,7 @@
 import {
   claimRemote, holderAnchorMs, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv,
   renewRemote, scheduleStarted,
-  subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvProgrammeEnded, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
 /** The furniture kinds that are a TV set, and what each is called in the
@@ -338,7 +338,7 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     // across the sleep as though it predated it.
     const at = holderAnchorMs(pb);
     if (end !== null && at >= end) {
-      tvStop(id);
+      tvProgrammeEnded(id); // LOOP starts it over; otherwise the home screen
       lastHeadlessBeat.delete(id);
       knownEnds.delete(id);
       continue;
