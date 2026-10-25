@@ -384,9 +384,11 @@ pub(crate) struct LibBlob {
 }
 
 /// The files a room's TV library names: its `tv` map's `lib:blob:<hash>`
-/// entries, as tvDoc.ts writes them. Peer-written, so each is only a
-/// candidate: a copy still dials its provider by id, only while connected,
-/// under the cap and budget, and checks every byte against the hash.
+/// entries, as tvDoc.ts writes them — the file the key names, or the
+/// smaller copy its sharer's machine made of it (a source whose `was` is
+/// that file: tvShrink.ts). Peer-written, so each is only a candidate: a copy
+/// still dials its provider by id, only while connected, under the cap and
+/// budget, and checks every byte against the hash.
 pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
     use yrs::{Any, Map, Out, ReadTxn, Transact};
     let txn = doc.transact();
@@ -396,11 +398,13 @@ pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
         Some(Any::BigInt(n)) if *n >= 0 => Some(*n as u64),
         _ => None,
     };
+    let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let blob_size = |v: Option<&Any>| num(v).filter(|s| *s > 0 && *s <= 1 << 40);
     let mut out = Vec::new();
     // Every key looked at counts, kept or not: the map is anyone's to pad.
     for (key, value) in tv.iter(&txn).take(HOST_SCAN_KEYS) {
         let Some(id) = key.strip_prefix("lib:blob:") else { continue };
-        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !hex64(id) {
             continue;
         }
         let Out::Any(Any::Map(entry)) = value else { continue };
@@ -409,11 +413,25 @@ pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
             Some(Any::String(s)) => Some(s.to_string()),
             _ => None,
         };
-        if text("kind").as_deref() != Some("blob") || text("hash").as_deref() != Some(id) {
+        // The original a copy was made from, read as tvDoc.ts reads it
+        // (sanitizeBlobRef): a whole reference, or none at all.
+        let was = match source.get("was") {
+            Some(Any::Map(was)) => match (was.get("hash"), blob_size(was.get("size"))) {
+                (Some(Any::String(h)), Some(_)) if hex64(h) => Some(h.to_string()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(named) = text("hash").filter(|h| hex64(h)) else { continue };
+        // The entry's identity as the room's library reads it (tvDoc.ts
+        // sourceId): the original a copy `was`, else the file itself. Only
+        // an entry filed under it is one the library shows.
+        let identity = was.as_deref().filter(|w| *w != named).unwrap_or(&named);
+        if text("kind").as_deref() != Some("blob") || identity != id {
             continue;
         }
-        let Ok(hash) = Hash::from_str(id) else { continue };
-        let Some(size) = num(source.get("size")).filter(|s| *s > 0 && *s <= 1 << 40) else { continue };
+        let Ok(hash) = Hash::from_str(&named) else { continue };
+        let Some(size) = blob_size(source.get("size")) else { continue };
         let Some(provider) = text("provider").and_then(|p| PublicKey::from_str(&p).ok()) else { continue };
         out.push(LibBlob { hash, size, provider, mime: text("mime").unwrap_or_default(), played: num(entry.get("playedAt")).unwrap_or(0) });
         if out.len() >= HOST_SCAN_ENTRIES {
@@ -1964,6 +1982,15 @@ mod tests {
         let me = iroh::SecretKey::generate().public().to_string();
         let a = Hash::new(b"a").to_hex().to_string();
         let b = Hash::new(b"b").to_hex().to_string();
+        let f = Hash::new(b"f").to_hex().to_string();
+        let small = Hash::new(b"f small").to_hex().to_string();
+        let i = Hash::new(b"i").to_hex().to_string();
+        let by_size = |got: &[LibBlob], h: &str| got.iter().find(|g| g.hash.to_hex().to_string() == h).map(|g| g.size);
+        let shrunk = |hash: &str, size: f64, provider: &str, was: &str| {
+            let mut source = blob_source(hash, size, provider);
+            source.push(("was", yrs::Any::from(HashMap::from([("hash".to_string(), yrs::Any::from(was)), ("size".to_string(), yrs::Any::Number(5000.0))]))));
+            source
+        };
         let doc = library_doc(&[
             (format!("lib:blob:{a}"), blob_source(&a, 5000.0, &me), 2000.0),
             // A key that names another file than its source.
@@ -1973,11 +2000,33 @@ mod tests {
             (format!("lib:blob:{}", Hash::new(b"d").to_hex()), blob_source(&Hash::new(b"d").to_hex(), 1.5, &me), 1.0),
             (format!("lib:blob:{}", Hash::new(b"e").to_hex()), blob_source(&Hash::new(b"e").to_hex(), 10.0, "nobody"), 1.0),
             ("lib:url:https://example.org/a.mp4".to_string(), vec![("kind", yrs::Any::from("url"))], 1.0),
+            // 🗜 The smaller copy of the file the key names…
+            (format!("lib:blob:{f}"), shrunk(&small, 900.0, &me, &f), 4000.0),
+            // …and one that names another file as what it was.
+            (format!("lib:blob:{}", Hash::new(b"g").to_hex()), shrunk(&small, 900.0, &me, &f), 1.0),
+            // A copy whose `was` is no whole reference (no size) is no copy
+            // to the library, which files it under its own hash: not under
+            // the original's key.
+            (format!("lib:blob:{}", Hash::new(b"h").to_hex()), {
+                let mut source = blob_source(&small, 900.0, &me);
+                source.push(("was", yrs::Any::from(HashMap::from([
+                    ("hash".to_string(), yrs::Any::from(Hash::new(b"h").to_hex().to_string())),
+                    ("size".to_string(), yrs::Any::Number(0.0)),
+                ]))));
+                source
+            }, 1.0),
+            // A `was` that names the file itself is no copy: the file, under
+            // its own key, as the library reads it.
+            (format!("lib:blob:{i}"), shrunk(&i, 700.0, &me, &i), 5000.0),
+            // A hash in capitals is not one the library reads.
+            (format!("lib:blob:{}", Hash::new(b"j").to_hex()), blob_source(&Hash::new(b"j").to_hex().to_string().to_uppercase(), 900.0, &me), 1.0),
         ]);
         let got = library_blobs(&doc);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].hash.to_hex().to_string(), a);
-        assert_eq!((got[0].size, got[0].played, got[0].mime.as_str()), (5000, 2000, "video/webm"));
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(by_size(&got, &i), Some(700));
+        let by = |h: &str| got.iter().find(|g| g.hash.to_hex().to_string() == h).unwrap();
+        assert_eq!((by(&a).size, by(&a).played, by(&a).mime.as_str()), (5000, 2000, "video/webm"));
+        assert_eq!((by(&small).size, by(&small).played), (900, 4000), "the copy is what a host keeps");
         assert_eq!(library_blobs(&yrs::Doc::new()), vec![]);
     }
 

@@ -14,6 +14,7 @@ import {
   tvKey, tvNoteEnd, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
   tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
   TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey, libraryKey, readLibrary, TV_HOME_RECENT, TV_LIBRARY_MAX,
+  sourceId,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 
@@ -1172,5 +1173,31 @@ describe('📚 the room\'s library', () => {
     tvStop(TV);
     expect(tvScreenView(TV)).toMatchObject({ state: 'home', recent: ['E', 'D', 'C', 'B'] });
     expect(TV_HOME_RECENT).toBe(4);
+  });
+});
+
+describe('🗜 a smaller copy, as the room sees it', () => {
+  const ORIGINAL = { kind: 'blob' as const, hash: 'b'.repeat(64), size: 2_000_000_000, provider: 'c'.repeat(64), mime: 'video/mp4', title: 'Sintel' };
+  const SMALL = { kind: 'blob' as const, hash: 'e'.repeat(64), size: 550_000_000, provider: 'c'.repeat(64), mime: 'video/mp4', title: 'Sintel' };
+
+  it('is the same programme and library entry as its original, and reads with care', () => {
+    const copy = sanitizeSource({ ...SMALL, was: { hash: ORIGINAL.hash, size: ORIGINAL.size } });
+    expect(copy).toMatchObject({ hash: SMALL.hash, was: { hash: ORIGINAL.hash, size: ORIGINAL.size } });
+    expect(sourceId(copy!)).toBe(sourceId(ORIGINAL));
+    expect(libraryKey(copy!)).toBe(libraryKey(ORIGINAL));
+    // A `was` that is no file, or the copy itself, is left off.
+    expect(sanitizeSource({ ...SMALL, was: { hash: 'nope', size: 5 } })).not.toHaveProperty('was');
+    expect(sanitizeSource({ ...SMALL, was: { hash: ORIGINAL.hash, size: 0 } })).not.toHaveProperty('was');
+    expect(sanitizeSource({ ...SMALL, was: { hash: SMALL.hash, size: 5 } })).not.toHaveProperty('was');
+  });
+
+  it('takes the place of its original in the library, keeping the count', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, ORIGINAL, now);
+    tick(1_000);
+    tvPlay(TV, { ...SMALL, was: { hash: ORIGINAL.hash, size: ORIGINAL.size } }, now);
+    const lib = readLibrary();
+    expect(lib).toHaveLength(1);
+    expect(lib[0]).toMatchObject({ plays: 2, source: { hash: SMALL.hash, was: { hash: ORIGINAL.hash } } });
   });
 });
