@@ -772,8 +772,8 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
  *  whose CORS check (tvConsent probeRedirect) came through before it was
  *  mounted. Anything else — an embed, archive.org's files, a link on the
  *  node's media origin — is laid on the set in the DOM instead (a CORS-less
- *  video would taint the texture and show nothing). The blaster offers
- *  📺 LOOK only for these: the CRT pass cannot reach a picture in the DOM. */
+ *  video would taint the texture and show nothing). Only these get the CRT
+ *  look: the pass cannot reach a picture in the DOM. */
 export function playsAsTexture(source: TvSource): boolean {
   if (source.kind === 'blob') return true;
   if (source.kind !== 'url') return false;
