@@ -40,7 +40,7 @@ import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './s
 import { isFlightKey } from './freeFlightStick';
 import { readyForRoom } from './tvShrink';
 import { autoFetchOn, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX } from './tvAutoFetch';
-import { focusTvEmbed, reloadTvPicture, subscribeTvTheatre, tvTheatreNotice } from './tvTheatre';
+import { focusTvEmbed, playsAsTexture, reloadTvPicture, subscribeTvTheatre, tvTheatreNotice } from './tvTheatre';
 import { irBlink } from './irBlaster';
 import { tvMenu, tvMenuCellAt, tvMenuMove, tvMenuStep } from './tvMenu';
 import type { TvMenuDir, TvMenuView, TvPausedCell } from './tvMenu';
@@ -618,9 +618,9 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
   const canPause = showing && !startOnly && moving;
   const canVolume = on && !startOnly;
   const lane = showing && rec.source ? laneBadge(sourceLane(rec.source)) : '';
-  // 📺 LOOK: only a film the set's own screen draws (an embed's frame lies
-  // over the set, out of the CRT pass's reach).
-  const looks = showing && rec.source !== null && rec.source.kind !== 'youtube' && !startOnly;
+  // 📺 LOOK: only a film the set's own screen draws (a picture laid over
+  // the set in the DOM is out of the CRT pass's reach).
+  const looks = showing && rec.source !== null && playsAsTexture(rec.source);
   // The set's own menu, when it is up (stopped or paused): the arrows move
   // its highlight for the whole room, and OK picks what is under it.
   const menu = on ? tvMenu(tv.id) : null;
