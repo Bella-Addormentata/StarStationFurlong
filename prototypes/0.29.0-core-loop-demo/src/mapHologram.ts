@@ -50,12 +50,13 @@ export const REFRESH_MS = 2000;
 /** The hologram's slow turn (rad/s). */
 const SPIN = 0.12;
 const COURSE_POINTS = 65;
-/** Pool sizes. Stations: listStations seats at most MAX_ORBIT_SLOTS per
- *  planet, a moving one still in its slot, so that bounds the stations and
- *  the courses (one per moving station). Modules and ships: the atlas
- *  holds MAX_ENTRIES rooms, but stationPlan also places rooms known only
- *  as a door's far side, so those pools start at the atlas's bound and
- *  grow past it (Pool, `grow`). */
+/** Pool sizes — starting sizes: every pool but the planets' grows past
+ *  them (Pool, `grow`). Stations: listStations seats MAX_ORBIT_SLOTS per
+ *  planet, but a station in transit holds no slot and a bounced arrival
+ *  can share a full one, so the list can run past that; the courses (one
+ *  per moving station) likewise. Modules and ships: the atlas holds
+ *  MAX_ENTRIES rooms, but stationPlan also places rooms known only as a
+ *  door's far side. */
 const MAX_STATIONS = MAX_ORBIT_SLOTS * PLANETS.length;
 const POOL = { planets: PLANETS.length + 2, lagrange: 4, stations: MAX_STATIONS, courses: MAX_STATIONS, modules: MAX_ENTRIES, links: MAX_ENTRIES * 2 };
 /** The layer parked pool meshes sit on: one the camera never renders, so a
@@ -167,7 +168,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   const stationMat = holoMat(PALE, 0.9);
   const stationGeo = new THREE.OctahedronGeometry(0.011);
   stationGeo.scale(1, 1.5, 1);
-  const stations = new Pool(plotGroup, POOL.stations, stationGeo, stationMat);
+  const stations = new Pool(plotGroup, POOL.stations, stationGeo, stationMat, true);
   // Orbit rings: unit tori scaled to each orbit (the tube scales with them,
   // so a station's small ring gets the fatter tube).
   const ringMat = holoMat(CYAN, 0.22);
@@ -176,7 +177,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   const planetRings = new Pool(plotGroup, POOL.planets, planetRingGeo, ringMat);
   const stationRingGeo = new THREE.TorusGeometry(1, 0.05, 6, 48);
   stationRingGeo.rotateX(Math.PI / 2);
-  const stationRings = new Pool(plotGroup, POOL.stations, stationRingGeo, ringMat);
+  const stationRings = new Pool(plotGroup, POOL.stations, stationRingGeo, ringMat, true);
   // The belt: its radius is the plot's own, so it is built once here.
   const beltR = beltRadius(solarPlotBodies([]));
   const beltMat = holoMat(CYAN, 0.12);
@@ -208,7 +209,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   // when that is what shows, and stays put over the mesh plot otherwise.
   const courseGroup = new THREE.Group();
   plotGroup.add(courseGroup);
-  for (let i = 0; i < POOL.courses; i++) {
+  const makeCourse = (): THREE.Line => {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(COURSE_POINTS * 3), 3));
     geo.setDrawRange(0, 0);
@@ -217,7 +218,9 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
     line.frustumCulled = false; // its bounds are never recomputed as its points change
     courseGroup.add(line);
     courses.push(line);
-  }
+    return line;
+  };
+  for (let i = 0; i < POOL.courses; i++) makeCourse();
   const plot: Layer = {
     group: plotGroup,
     mats: [sunMat, planetMat, lagrangeMat, stationMat, ringMat, beltMat, hereMat],
@@ -292,7 +295,9 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
     const sunBase = (sunMat.userData.baseOpacity as number) || 1;
     if (splatPlot) {
       // The splats take the sun's fade (World's) and the plot's own.
-      splatPlot.place(markers, now, (sunMat.opacity / sunBase) * fade, sun.visible);
+      // The sun's opacity already carries the plot's own fade (setLayer ran
+      // before this) on top of World's: pass it through once, not squared.
+      splatPlot.place(markers, now, sunMat.opacity / sunBase, sun.visible);
       courseGroup.position.copy(splatPlot.group.position);
       courseGroup.scale.copy(splatPlot.group.scale);
       planets.reset(); lagrange.reset(); stations.reset(); planetRings.reset(); stationRings.reset();
@@ -345,6 +350,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   const layoutCourses = (now: number, fade: number, sunBase: number, lifted: boolean): void => {
     courseMat.opacity = (sunMat.opacity / sunBase) * COURSE_OPACITY;
     const drawn = plotCourses(bodies, now);
+    while (courses.length < drawn.length) makeCourse(); // one per moving station, however many
     courses.forEach((line, i) => {
       const c = drawn[i];
       if (!c || fade <= 0) {
@@ -404,8 +410,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
       setLayer(plot, plotFade);
       setLayer(station, stationFade);
       // Meshes made after the table was registered take the sun's zoom hide.
-      for (const m of modules.grown) m.visible = sun.visible;
-      for (const m of links.grown) m.visible = sun.visible;
+      for (const pool of [stations, stationRings, modules, links]) for (const m of pool.grown) m.visible = sun.visible;
       if (plotFade > 0) layoutPlot(now, plotFade);
       else for (const line of courses) line.visible = false;
       if (stationFade > 0) layoutStation();

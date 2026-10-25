@@ -9,13 +9,14 @@ import type { PlanModule, StationPlan } from './stationPlan';
 
 const here: StationRecord = { id: 'st-a', name: 'ALPHA', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'room-a' };
 let station: StationRecord | null = here;
+let stationList: StationRecord[] | null = null;
 let plan: StationPlan | null = null;
 
 // devices.ts hangs on window as it loads: the hologram needs one export of it.
 vi.mock('./devices', () => ({ holotableStation: () => station }));
 vi.mock('./stations', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./stations')>()),
-  listStations: () => (station ? [station] : []),
+  listStations: () => stationList ?? (station ? [station] : []),
   currentRoomId: () => 'room-a',
 }));
 vi.mock('./stationAtlas', async (importOriginal) => ({
@@ -28,6 +29,7 @@ vi.mock('./stationPlan', async (importOriginal) => ({
 }));
 
 const { buildMapHologram, REFRESH_MS } = await import('./mapHologram');
+const { setSparkProvider } = await import('./mapHologramSplats');
 const { FADE_SECONDS, PLOT_SECONDS, STATION_SECONDS } = await import('./mapHologramLayout');
 
 function module(roomId: string, x: number, z: number, opts: Partial<PlanModule> = {}): PlanModule {
@@ -64,6 +66,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(Date.UTC(2026, 0, 2));
   station = here;
+  stationList = null;
   plan = null;
 });
 afterEach(() => { vi.useRealTimers(); });
@@ -172,6 +175,40 @@ describe('buildMapHologram', () => {
     sun.visible = true;
     handle.update(0.05);
     expect(stationLayer.children.every((o) => !(o instanceof THREE.Mesh) || o.visible)).toBe(true);
+  });
+
+  it('grows the station pools past the slot count, which stations in transit and bounced arrivals exceed', () => {
+    const many: StationRecord[] = [];
+    for (let i = 0; i < 40; i++) many.push({ id: `st-${i}`, name: `S${i}`, planetId: 'planet-sovereign', orbitSlot: i % 16, welcomeRoomId: `room-${i}` });
+    stationList = many;
+    const { handle, plot, shown } = build();
+    handle.update(0.1);
+    // sun + belt + 2 planets + 2 planet rings + 2 pockets, and a marker and a ring for each of the 40.
+    expect(shown(plot)).toBe(8 + 40 * 2);
+  });
+
+  it('hands the splats the sun\'s opacity once, not with the plot fade squared', async () => {
+    class FakeSplatMesh extends THREE.Object3D { packedSplats = { numSplats: 0 }; opacity = 1; constructor(o: { constructSplats?: (s: { pushSplat: () => void }) => void } = {}) { super(); o.constructSplats?.({ pushSplat: () => { this.packedSplats.numSplats++; } }); } dispose() {} }
+    setSparkProvider(async () => ({ spark: { SplatMesh: FakeSplatMesh } as never, renderer: {} as never }));
+    // A station to cycle to, so the plot fades at all.
+    plan = { rootRoomId: 'room-a', modules: [module('room-a', 0, 0, { here: true })], ships: [], bounds: { minX: -1, maxX: 1, minZ: -1, maxZ: 1 } };
+    try {
+      const { handle, root, sun } = build();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      const splatGroup = root.getObjectByName('map-hologram-splats');
+      expect(splatGroup).toBeDefined();
+      // Mid-transition: the plot fade is 0.5; the sun carries it; the splats get the same, once.
+      const mat = sun.material as THREE.MeshBasicMaterial;
+      // The cycle starts FADE_SECONDS in; stop half a fade before the plot goes.
+      run(handle, PLOT_SECONDS - 1.5 * FADE_SECONDS);
+      const base = mat.userData.baseOpacity as number;
+      expect(mat.opacity / base).toBeCloseTo(0.5, 1);
+      let splatOpacity = -1;
+      splatGroup!.traverse((o) => { if (o instanceof FakeSplatMesh && o.name === 'sun') splatOpacity = o.opacity; });
+      expect(splatOpacity).toBeCloseTo(mat.opacity / base, 6);
+    } finally {
+      setSparkProvider(null);
+    }
   });
 
   it('never frustum-culls a course line, whose points change under it', () => {

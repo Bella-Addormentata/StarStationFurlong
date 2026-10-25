@@ -186,14 +186,35 @@ export function projectNdc(p: { x: number; y: number; z: number }, o: OrbitState
 /** The yaws the fit is checked from (the view drifts round). */
 export const FIT_YAWS = 24;
 export function fitDistance(aspect: number, pitch: number, pts: readonly Pt[] = fitPoints(), fill = 0.88, fovDeg = FOV_DEG): number {
+  // The camera bases for each yaw depend on yaw and pitch only: made once;
+  // a distance then costs one multiply-add per point and axis.
+  const tanHalf = Math.tan((fovDeg * Math.PI) / 360);
+  const bases: Array<{ along: Float64Array; right: Float64Array; up: Float64Array }> = [];
+  for (let k = 0; k < FIT_YAWS; k++) {
+    const d = orbitPosition({ yaw: (k / FIT_YAWS) * Math.PI * 2, pitch, dist: 1 }); // the camera's direction from the sun
+    const f = { x: -d.x, y: -d.y, z: -d.z };
+    const rl = Math.hypot(f.z, f.x) || 1;
+    const r = { x: -f.z / rl, y: 0, z: f.x / rl };
+    const u = { x: r.y * f.z - r.z * f.y, y: r.z * f.x - r.x * f.z, z: r.x * f.y - r.y * f.x };
+    // Each point's parts along forward, right and up, from the sun.
+    const along = new Float64Array(pts.length), right = new Float64Array(pts.length), up = new Float64Array(pts.length);
+    pts.forEach((p, i) => {
+      along[i] = p.x * f.x + p.y * f.y + p.z * f.z;
+      right[i] = p.x * r.x + p.y * r.y + p.z * r.z;
+      up[i] = p.x * u.x + p.y * u.y + p.z * u.z;
+    });
+    bases.push({ along, right, up });
+  }
+  // From `dist` away, a point's depth is dist + its part along forward.
   const worst = (dist: number): number => {
     let m = 0;
-    for (let k = 0; k < FIT_YAWS; k++) {
-      const o: OrbitState = { yaw: (k / FIT_YAWS) * Math.PI * 2, pitch, dist };
-      for (const p of pts) {
-        const q = projectNdc(p, o, aspect, fovDeg);
-        if (q.behind) return Infinity;
-        m = Math.max(m, Math.abs(q.x), Math.abs(q.y));
+    for (const b of bases) {
+      for (let i = 0; i < pts.length; i++) {
+        const depth = dist + b.along[i]!;
+        if (depth <= 1e-6) return Infinity;
+        const sx = Math.abs(b.right[i]!) / (depth * tanHalf * aspect), sy = Math.abs(b.up[i]!) / (depth * tanHalf);
+        if (sx > m) m = sx;
+        if (sy > m) m = sy;
       }
     }
     return m;
@@ -201,7 +222,7 @@ export function fitDistance(aspect: number, pitch: number, pts: readonly Pt[] = 
   let lo = DIST_MIN, hi = DIST_MAX;
   if (worst(hi) > fill) return hi;
   if (worst(lo) <= fill) return lo;
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < 20; i++) {
     const mid = (lo + hi) / 2;
     if (worst(mid) <= fill) hi = mid; else lo = mid;
   }
@@ -242,12 +263,17 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   let fitPts: Pt[] = fitPoints();
   let fitSig = '';
   const fitFor = { aspect: NaN, pitch: NaN, sig: '' };
-  const refit = (): void => {
+  /** Fit now if the inputs changed. Called from the frame, never from a
+   *  pointer event: a drag asks for it (refit) and the next frame does it
+   *  once, however many moves came in between. */
+  const fitNow = (): void => {
     if (!fitted) return;
     if (fitFor.aspect === camera.aspect && fitFor.pitch === orbit.pitch && fitFor.sig === fitSig) return;
     fitFor.aspect = camera.aspect; fitFor.pitch = orbit.pitch; fitFor.sig = fitSig;
     orbit = { ...orbit, dist: fitDistance(camera.aspect, orbit.pitch, fitPts) };
   };
+  let fitAsked = false;
+  const refit = (): void => { fitAsked = true; };
 
   // The galaxy: stars of every brightness and warmth, a band of them
   // across the sky like the Milky Way, and a few soft nebulae in it.
@@ -335,7 +361,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   scene.add(travelLine);
   const courseMat = new THREE.LineBasicMaterial({ color: 0x00d4ff, transparent: true, opacity: 0.5 });
   const courses: THREE.Line[] = [];
-  for (let i = 0; i < MAX_ORBIT_SLOTS * PLANETS.length; i++) {
+  const makeCourse = (): THREE.Line => {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(COURSE_POINTS * 3), 3));
     geo.setDrawRange(0, 0);
@@ -344,7 +370,9 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     line.frustumCulled = false;
     scene.add(line);
     courses.push(line);
-  }
+    return line;
+  };
+  for (let i = 0; i < MAX_ORBIT_SLOTS * PLANETS.length; i++) makeCourse();
 
   // DOM: labels over the canvas, and the hint.
   const labelLayer = document.createElement('div');
@@ -463,6 +491,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
       // reaches past the belt): refit to the picture then.
       const sig = fitSignature(markers);
       if (sig !== fitSig) { fitSig = sig; fitPts = fitPointsFor(markers); refit(); }
+      if (fitAsked) { fitAsked = false; fitNow(); }
       splats?.place(markers, nowMs, 1, true);
       const byId = new Map(markers.map((m) => [m.id, m]));
       // The halo on the selection, the line of a transit, the courses.
@@ -485,6 +514,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
       } else travelLine.visible = false;
       const drawn = plotCourses(bodies, nowMs);
       const k = PANEL_SCALE * (splats ? splats.group.scale.x : 1);
+      while (courses.length < drawn.length) makeCourse(); // one per moving station, however many
       courses.forEach((line, i) => {
         const c = drawn[i];
         if (!c) { line.visible = false; return; }
