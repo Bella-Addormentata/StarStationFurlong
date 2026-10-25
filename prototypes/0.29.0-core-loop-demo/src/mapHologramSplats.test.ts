@@ -128,6 +128,25 @@ describe('buildSplatPlot', () => {
     expect(Math.hypot(here.position.x, here.position.z)).toBeLessThanOrEqual(HOLO_RADIUS);
   });
 
+  it('keeps a station\'s ring while another station changes altitude, and rebuilds only the one that did', async () => {
+    const h = (await buildSplatPlot(new THREE.Group()))!;
+    const other = marker('st-b', 'station', 0.4, 0.05, { orbit: { cx: 0.3, cz: 0, r: 0.11 } });
+    h.place([sun, sovereign, station, other], 0, 1, true);
+    const sov = h.group.children.find((c) => c.name === 'planet-planet-sovereign')!;
+    const isRing = (c: THREE.Object3D) => c instanceof FakeSplatMesh && c.position.y === -0.013; // the rings sit just under the planet; the foot does not
+    const ringsBefore = sov.children.filter(isRing) as FakeSplatMesh[];
+    expect(ringsBefore).toHaveLength(2);
+    const [keep, change] = ringsBefore;
+    // st-b climbs: its ring is rebuilt, st-a's is the same object.
+    h.place([sun, sovereign, station, { ...other, orbit: { cx: 0.3, cz: 0, r: 0.14 } }], 0, 1, true);
+    const ringsAfter = sov.children.filter(isRing) as FakeSplatMesh[];
+    expect(ringsAfter).toHaveLength(2);
+    expect(ringsAfter).toContain(keep);
+    expect(ringsAfter).not.toContain(change);
+    expect(change!.disposed).toBe(true);
+    expect(keep!.disposed).toBe(false);
+  });
+
   it('takes the plot fade as its opacity, hides with the sun, and drops a station that left', async () => {
     const h = (await buildSplatPlot(new THREE.Group()))!;
     h.place([sun, sovereign, station], 0, 0.4, true);

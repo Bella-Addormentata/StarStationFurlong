@@ -306,7 +306,8 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
 
   // One rig per planet: the body, its atmosphere, and the dust rings of the
   // stations round it (rebuilt when the set of ring radii changes).
-  interface PlanetRig { group: THREE.Group; spin: THREE.Group; rings: SplatMeshT[]; ringKey: string; orbit: SplatMeshT | null; orbitR: number }
+  interface StationRing { mesh: SplatMeshT; r: number; hex: number }
+  interface PlanetRig { group: THREE.Group; spin: THREE.Group; rings: Map<string, StationRing>; orbit: SplatMeshT | null; orbitR: number }
   const planets = new Map<string, PlanetRig>();
   const planetRig = (id: string): PlanetRig => {
     let rig = planets.get(id);
@@ -323,7 +324,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(260), 0.045, Z(0.006), 0.03, air, air, rng(id.length * 17), 0.4) });
     const foot = new SplatMesh({ constructSplats: (s) => pillar(s, N(90), 0.017 + SPLAT_LIFT / SPLAT_SCALE, 0.005, Z(0.0035), 0.08, DUST, rng(id.length * 5)) });
     spin.add(body); spin.add(atmo); g.add(spin); g.add(foot);
-    rig = { group: g, spin, rings: [], ringKey: '', orbit: null, orbitR: 0 };
+    rig = { group: g, spin, rings: new Map(), orbit: null, orbitR: 0 };
     planets.set(id, rig);
     return rig;
   };
@@ -427,30 +428,31 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
           }
         }
       }
-      // Station rings: dust round each planet at the stations' radii, each
-      // in its station's colour.
-      const ringsByPlanet = new Map<string, Array<{ r: number; hex: number }>>();
+      // Station rings: dust round each planet at each station's radius, in
+      // the station's colour — one ring per station, kept while its radius
+      // and colour hold; only a ring whose station changed (an altitude
+      // change) is rebuilt, the others stay.
+      const ringsWanted = new Map<string, Map<string, { r: number; hex: number }>>();
       for (const mk of markers) {
         if (mk.type !== 'station' || !mk.orbit || !planets.has(mk.frame)) continue;
-        (ringsByPlanet.get(mk.frame) ?? ringsByPlanet.set(mk.frame, []).get(mk.frame)!).push({ r: mk.orbit.r, hex: stationHue(mk.id) });
+        (ringsWanted.get(mk.frame) ?? ringsWanted.set(mk.frame, new Map()).get(mk.frame)!).set(mk.id, { r: mk.orbit.r, hex: stationHue(mk.id) });
       }
       for (const [id, rig] of planets) {
         if (!seenPlanets.has(id)) { rig.group.visible = false; continue; }
         rig.group.visible = true;
-        const rings = (ringsByPlanet.get(id) ?? []).map((x) => ({ key: `${x.r.toFixed(5)}:${x.hex}`, ...x })).sort((a, b) => (a.key < b.key ? -1 : 1));
-        const ringKey = rings.map((x) => x.key).join(',');
-        if (ringKey !== rig.ringKey) {
-          for (const m of rig.rings) { m.removeFromParent(); m.dispose(); }
-          rig.rings = [];
-          // One ring each, on its own tilt (ringInclination), as the stations stand.
-          for (const { r, hex } of rings) {
-            const m = new SplatMesh({ constructSplats: (s) => ring(s, N(480), r, 0.002, 0.002, Z(0.0018), 0.5, stationLook(hex).glow, rng(id.length * 3 + Math.round(r * 1e4))) });
-            m.position.y = -0.013;
-            tiltTo(m, ringInclination(id, r));
-            rig.group.add(m);
-            rig.rings.push(m);
-          }
-          rig.ringKey = ringKey;
+        const wanted = ringsWanted.get(id) ?? new Map<string, { r: number; hex: number }>();
+        for (const [stationId, ring0] of rig.rings) {
+          const w = wanted.get(stationId);
+          if (w && Math.abs(w.r - ring0.r) < 1e-6 && w.hex === ring0.hex) continue;
+          ring0.mesh.removeFromParent(); ring0.mesh.dispose(); rig.rings.delete(stationId);
+        }
+        for (const [stationId, { r, hex }] of wanted) {
+          if (rig.rings.has(stationId)) continue;
+          const m = new SplatMesh({ constructSplats: (s) => ring(s, N(480), r, 0.002, 0.002, Z(0.0018), 0.5, stationLook(hex).glow, rng(id.length * 3 + Math.round(r * 1e4))) });
+          m.position.y = -0.013;
+          tiltTo(m, ringInclination(id, r));
+          rig.group.add(m);
+          rig.rings.set(stationId, { mesh: m, r, hex });
         }
       }
       for (const [id, m] of sparks) {
@@ -482,7 +484,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
       for (const m of all()) m.dispose();
       for (const f of feet.values()) f.geometry.dispose();
       for (const mat of footMats.values()) mat.dispose();
-      for (const rig of planets.values()) { for (const m of rig.rings) m.dispose(); rig.orbit?.dispose(); }
+      for (const rig of planets.values()) { for (const r of rig.rings.values()) r.mesh.dispose(); rig.orbit?.dispose(); }
       group.removeFromParent();
     },
   };

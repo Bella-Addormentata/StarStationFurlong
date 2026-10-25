@@ -156,6 +156,29 @@ describe('buildMapHologram', () => {
     expect(parked.visible).toBe(true);
   });
 
+  it('grows its block and gangway pools past the atlas bound, the extra meshes taking the sun\'s zoom hide', () => {
+    const many: PlanModule[] = [];
+    for (let i = 0; i < 90; i++) many.push(module(`room-${i}`, (i % 10) * 4, Math.floor(i / 10) * 4, { here: i === 0, links: i > 0 ? [{ doorId: 'd', toRoomId: `room-${i - 1}`, berth: false }] : [] }));
+    plan = { rootRoomId: 'room-0', modules: many, ships: [], bounds: { minX: -1, maxX: 37, minZ: -1, maxZ: 33 } };
+    const { handle, stationLayer, shown, sun } = build();
+    handle.update(0.1);
+    run(handle, PLOT_SECONDS + FADE_SECONDS + 1);
+    // 90 blocks and 89 gangways: every module and every link, none dropped.
+    expect(shown(stationLayer)).toBe(90 + 89);
+    sun.visible = false;
+    handle.update(0.05);
+    const grown = stationLayer.children.filter((o) => o instanceof THREE.Mesh && !o.visible);
+    expect(grown.length).toBeGreaterThan(0);
+    sun.visible = true;
+    handle.update(0.05);
+    expect(stationLayer.children.every((o) => !(o instanceof THREE.Mesh) || o.visible)).toBe(true);
+  });
+
+  it('never frustum-culls a course line, whose points change under it', () => {
+    const { root } = build();
+    root.traverse((o) => { if (o instanceof THREE.Line) expect(o.frustumCulled).toBe(false); });
+  });
+
   it('frees its course lines with the table, which World cannot reach (they are not meshes)', () => {
     const { root } = build();
     const lines: THREE.Line[] = [];

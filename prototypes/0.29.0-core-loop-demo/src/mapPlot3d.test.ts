@@ -64,6 +64,9 @@ describe('the fit', () => {
     ];
     expect(sov.x + r).toBeGreaterThan(DEFAULT_REACH);
     expect(fitSignature(markers)).toContain('planet-sovereign:');
+    // The signature follows the planet round its orbit (coarsely), so the fit is redone as it moves.
+    const moved: HoloMarker[] = markers.map((m) => (m.type === 'station' ? { ...m, x: m.x - 0.1, orbit: { ...m.orbit!, cx: m.orbit!.cx - 0.1 } } : m));
+    expect(fitSignature(moved)).not.toBe(fitSignature(markers));
     const pts = fitPointsFor(markers);
     expect(pts.length).toBeGreaterThan(fitPoints().length);
     // In a square panel the ring's width binds; the belt-only fit would clip it.

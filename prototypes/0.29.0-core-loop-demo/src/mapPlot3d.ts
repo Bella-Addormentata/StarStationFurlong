@@ -147,9 +147,15 @@ export function fitPointsFor(markers: readonly HoloMarker[]): Pt[] {
   }
   return pts;
 }
-/** What a picture's fit depends on besides the view: the rings in it. */
+/** What a picture's fit depends on besides the view: the rings in it, and
+ *  where their planets are — coarsely (a fiftieth of the disc), so the fit
+ *  follows a planet round its orbit in steps, not every frame. */
 export function fitSignature(markers: readonly HoloMarker[]): string {
-  return markers.filter((m) => m.type === 'station' && m.orbit).map((m) => `${m.frame}:${m.orbit!.r.toFixed(4)}`).sort().join(',');
+  return markers
+    .filter((m) => m.type === 'station' && m.orbit)
+    .map((m) => `${m.frame}:${m.orbit!.r.toFixed(4)}@${(m.orbit!.cx * 50).toFixed(0)},${(m.orbit!.cz * 50).toFixed(0)}`)
+    .sort()
+    .join(',');
 }
 
 /** Where a world point lands in the view, as a fraction of the half-width
@@ -359,6 +365,8 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   const onDown = (e: PointerEvent) => { down = { x: e.clientX, y: e.clientY, moved: false }; canvas.setPointerCapture(e.pointerId); canvas.style.cursor = 'grabbing'; };
   const onMove = (e: PointerEvent) => {
     if (!down) return;
+    // A release the canvas missed (the panel closed mid-drag): the gesture is over.
+    if (e.buttons === 0) { down = null; canvas.style.cursor = 'grab'; return; }
     const dx = e.clientX - down.x, dy = e.clientY - down.y;
     if (!down.moved && Math.hypot(dx, dy) < 4) return;
     down.moved = true;
@@ -515,10 +523,13 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
         pending.push({ mk, x, y: y - (mk.type === 'star' ? 34 : mk.type === 'planet' ? 26 : 14), l, rank });
       }
       pending.sort((a, b) => a.rank - b.rank);
+      // Show every candidate, then measure them all in one layout, then
+      // place them: no read after a write in the loop, so one reflow a frame.
+      for (const p of pending) p.l.el.style.display = '';
+      const sizes = pending.map((p) => ({ w: p.l.el.offsetWidth || 80, h: p.l.el.offsetHeight || 18 }));
       const placed: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
-      for (const p of pending) {
-        p.l.el.style.display = '';
-        const w = p.l.el.offsetWidth || 80, h = p.l.el.offsetHeight || 18;
+      pending.forEach((p, i) => {
+        const { w, h } = sizes[i]!;
         const fits = (cx: number, cy: number) => {
           const r = { x0: cx - w / 2 - 2, y0: cy - h - 1, x1: cx + w / 2 + 2, y1: cy + 1 };
           return placed.every((q) => r.x1 <= q.x0 || r.x0 >= q.x1 || r.y1 <= q.y0 || r.y0 >= q.y1) ? r : null;
@@ -528,11 +539,11 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
           spot = fits(p.x + dx, p.y + dy);
           if (spot) { lx = p.x + dx; ly = p.y + dy; break; }
         }
-        if (!spot) { p.l.el.style.display = 'none'; continue; }
+        if (!spot) { p.l.el.style.display = 'none'; return; }
         placed.push(spot);
         p.l.el.style.left = `${lx}px`;
         p.l.el.style.top = `${ly}px`;
-      }
+      });
       for (const [id, l] of labels) if (!seen.has(id)) { l.el.remove(); labels.delete(id); }
     },
   };

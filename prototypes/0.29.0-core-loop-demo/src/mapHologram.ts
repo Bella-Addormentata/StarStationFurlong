@@ -52,10 +52,10 @@ const SPIN = 0.12;
 const COURSE_POINTS = 65;
 /** Pool sizes. Stations: listStations seats at most MAX_ORBIT_SLOTS per
  *  planet, a moving one still in its slot, so that bounds the stations and
- *  the courses (one per moving station). Modules and ships together are at
- *  most the atlas's MAX_ENTRIES rooms (stationPlan walks the whole
- *  component); gangways are one per pairing between two of them, so at
- *  most two per room. */
+ *  the courses (one per moving station). Modules and ships: the atlas
+ *  holds MAX_ENTRIES rooms, but stationPlan also places rooms known only
+ *  as a door's far side, so those pools start at the atlas's bound and
+ *  grow past it (Pool, `grow`). */
 const MAX_STATIONS = MAX_ORBIT_SLOTS * PLANETS.length;
 const POOL = { planets: PLANETS.length + 2, lagrange: 4, stations: MAX_STATIONS, courses: MAX_STATIONS, modules: MAX_ENTRIES, links: MAX_ENTRIES * 2 };
 /** The layer parked pool meshes sit on: one the camera never renders, so a
@@ -83,23 +83,41 @@ function holoMat(color: number, baseOpacity: number): THREE.MeshBasicMaterial {
 }
 
 /** A pool of parked meshes sharing one geometry; `take` hands out the next
- *  (on the camera's layer); `park` puts the rest back off it. */
+ *  (on the camera's layer); `park` puts the rest back off it. A pool that
+ *  may `grow` makes more when it runs out: those are not in World's mesh
+ *  list (built after the table was registered), so the owner mirrors the
+ *  sun mesh's `visible` onto them each frame (World's zoom hide), and they
+ *  share the pool's material, so the room's fade reaches them too. */
 class Pool {
   readonly meshes: THREE.Mesh[] = [];
+  /** The meshes made after registration (see above). */
+  readonly grown: THREE.Mesh[] = [];
   private used = 0;
-  constructor(parent: THREE.Object3D, n: number, geo: THREE.BufferGeometry, mat: THREE.Material) {
-    for (let i = 0; i < n; i++) {
-      const mesh = new THREE.Mesh(geo, mat);
-      park(mesh);
-      parent.add(mesh);
-      this.meshes.push(mesh);
-    }
+  constructor(
+    private readonly parent: THREE.Object3D,
+    n: number,
+    private readonly geo: THREE.BufferGeometry,
+    private readonly mat: THREE.Material,
+    private readonly grow = false,
+  ) {
+    for (let i = 0; i < n; i++) this.meshes.push(this.make());
+  }
+  private make(): THREE.Mesh {
+    const mesh = new THREE.Mesh(this.geo, this.mat);
+    park(mesh);
+    this.parent.add(mesh);
+    return mesh;
   }
   reset(): void {
     this.used = 0;
   }
   take(): THREE.Mesh | null {
-    if (this.used >= this.meshes.length) return null;
+    if (this.used >= this.meshes.length) {
+      if (!this.grow) return null;
+      const mesh = this.make();
+      this.meshes.push(mesh);
+      this.grown.push(mesh);
+    }
     const mesh = this.meshes[this.used++]!;
     show(mesh);
     return mesh;
@@ -196,6 +214,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
     geo.setDrawRange(0, 0);
     const line = new THREE.Line(geo, courseMat);
     line.visible = false;
+    line.frustumCulled = false; // its bounds are never recomputed as its points change
     courseGroup.add(line);
     courses.push(line);
   }
@@ -230,9 +249,9 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   const moduleMat = holoMat(CYAN, 0.35);
   const hereModuleMat = holoMat(PALE, 0.6);
   const shipMat = holoMat(AMBER, 0.4);
-  const modules = new Pool(stationGroup, POOL.modules, blockGeo, moduleMat);
+  const modules = new Pool(stationGroup, POOL.modules, blockGeo, moduleMat, true);
   const linkMat = holoMat(CYAN, 0.5);
-  const links = new Pool(stationGroup, POOL.links, new THREE.BoxGeometry(1, 1, 1), linkMat);
+  const links = new Pool(stationGroup, POOL.links, new THREE.BoxGeometry(1, 1, 1), linkMat, true);
   const station: Layer = {
     group: stationGroup,
     mats: [moduleMat, hereModuleMat, shipMat, linkMat],
@@ -384,6 +403,9 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
       const stationFade = mode === 'station' ? fade : 0;
       setLayer(plot, plotFade);
       setLayer(station, stationFade);
+      // Meshes made after the table was registered take the sun's zoom hide.
+      for (const m of modules.grown) m.visible = sun.visible;
+      for (const m of links.grown) m.visible = sun.visible;
       if (plotFade > 0) layoutPlot(now, plotFade);
       else for (const line of courses) line.visible = false;
       if (stationFade > 0) layoutStation();
