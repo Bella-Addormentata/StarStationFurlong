@@ -4,9 +4,12 @@
  * the screen: clicking a TV, or 🎯 AIM and then a click, points the blaster
  * at it, and the phone shows that set's remote —
  *
- *  - the keys: POWER, VOLUME, the D-pad (◀ ▶ ten seconds, ▲ ▼ volume, OK
- *    play / pause), STOP, LOOP, the viewer's own AUTO-FETCH switch, and
- *    RELOAD for archive.org's player;
+ *  - the keys: POWER, VOLUME, the D-pad, STOP, LOOP, the viewer's own
+ *    AUTO-FETCH switch, and RELOAD for archive.org's player. While a
+ *    programme plays, the D-pad's ◀ ▶ go ten seconds back and on, ▲ ▼ set
+ *    the volume and OK pauses; while the set is stopped or paused, its own
+ *    menu is up (tvMenu.ts), and the arrows move the highlight on the set
+ *    and OK picks what is under it;
  *  - what the set asks of this viewer (tvTheatre's notice): a link to
  *    allow, a file to fetch, a tap for sound;
  *  - the link box and SEND: a web address or a magnet link;
@@ -36,6 +39,8 @@ import { readyForRoom } from './tvShrink';
 import { autoFetchOn, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX } from './tvAutoFetch';
 import { focusTvEmbed, reloadTvPicture, subscribeTvTheatre, tvTheatreNotice } from './tvTheatre';
 import { irBlink } from './irBlaster';
+import { tvMenu, tvMenuCellAt, tvMenuMove, tvMenuStep } from './tvMenu';
+import type { TvMenuDir, TvMenuView, TvPausedCell } from './tvMenu';
 import {
   blobLaneNodeId, blobLaneReady, blobLaneRoom, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
   refreshHeldBlobs, refreshHolders, setHostCopies, torrentLaneReady,
@@ -507,13 +512,19 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       const pasteAgain = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
       if (draft && pasteAgain) pasteAgain.value = draft.value;
       if (inside) {
+        // A greyed-out key takes no focus (the browser would drop it to the
+        // page, and ↑/↓ would stop here). An arrow greyed out by its own
+        // move, at the edge of the set's menu, hands it to OK beside it;
+        // anything else gone or greyed out, to the view.
+        const live = (el: HTMLElement | null) => (el && !el.matches(':disabled') ? el : null);
         const again = focusKey ? host.querySelector<HTMLElement>(focusKey) : null;
-        (again ?? host).focus({ preventScroll: true });
-        if (draft?.focused && again === pasteAgain && pasteAgain) {
+        const target = live(again) ?? (again?.closest('.ir-pad') ? live(host.querySelector<HTMLElement>('.ir-pad .ir-ok')) : null) ?? host;
+        target.focus({ preventScroll: true });
+        if (draft?.focused && target === pasteAgain && pasteAgain) {
           try { pasteAgain.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
         }
-        if (searching && again instanceof HTMLInputElement) {
-          try { again.setSelectionRange(searching.start, searching.end); } catch { /* not selectable */ }
+        if (searching && target instanceof HTMLInputElement) {
+          try { target.setSelectionRange(searching.start, searching.end); } catch { /* not selectable */ }
         }
       }
     }
@@ -599,6 +610,10 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
   const canPause = showing && !startOnly && moving;
   const canVolume = on && !startOnly;
   const lane = showing && rec.source ? laneBadge(sourceLane(rec.source)) : '';
+  // The set's own menu, when it is up (stopped or paused): the arrows move
+  // its highlight for the whole room, and OK picks what is under it.
+  const menu = on ? tvMenu(tv.id) : null;
+  const step = (dir: TvMenuDir) => menu !== null && tvMenuStep(menu, dir) !== null;
   const takes = visibleTiles().filter((t) => t.live && t.key !== 'file')
     .map((t) => `<span style="white-space:nowrap;">${t.icon} ${esc(t.label)} ${laneBadge(t.lane)}</span>`).join(' ');
   return `<div class="phone-access-section ir-face">
@@ -616,16 +631,22 @@ function blasterFace(tv: { id: string; label: string }, me: string): string {
           <span class="ir-level">${rec.volume}%</span>
           ${irKey(`data-tv-vol="10" data-tv-id="${id}" title="Volume up"`, '🔊', canVolume)}`}
       </div>
+      ${menu ? `<div class="ir-note" aria-live="polite">ON THE SET: <b style="color:${GOLD_BRIGHT};">${esc(tvMenuCellAt(menu).label)}</b></div>` : ''}
       <div class="ir-pad" role="group" aria-label="D-pad">
-        ${irKey(`data-tv-pad="up" data-tv-id="${id}" title="Volume up"`, '▲', canVolume, 'ir-up')}
+        ${menu ? `${irKey(`data-tv-pad="up" data-tv-id="${id}" title="Up on the set's menu"`, '▲', step('up'), 'ir-up')}
+        ${irKey(`data-tv-pad="left" data-tv-id="${id}" title="Left on the set's menu"`, '◀', step('left'), 'ir-left')}
+        ${irKey(`data-tv-pad="ok" data-tv-id="${id}" title="Pick ${esc(tvMenuCellAt(menu).label)}"`, 'OK', true, 'ir-ok')}
+        ${irKey(`data-tv-pad="right" data-tv-id="${id}" title="Right on the set's menu"`, '▶', step('right'), 'ir-right')}
+        ${irKey(`data-tv-pad="down" data-tv-id="${id}" title="Down on the set's menu"`, '▼', step('down'), 'ir-down')}`
+        : `${irKey(`data-tv-pad="up" data-tv-id="${id}" title="Volume up"`, '▲', canVolume, 'ir-up')}
         ${irKey(`data-tv-pad="left" data-tv-id="${id}" title="Back 10 seconds"`, '◀', canSeek, 'ir-left')}
         ${irKey(`data-tv-pad="ok" data-tv-id="${id}" title="Play or pause"`, 'OK', canPause, 'ir-ok')}
         ${irKey(`data-tv-pad="right" data-tv-id="${id}" title="On 10 seconds"`, '▶', canSeek, 'ir-right')}
-        ${irKey(`data-tv-pad="down" data-tv-id="${id}" title="Volume down"`, '▼', canVolume, 'ir-down')}
+        ${irKey(`data-tv-pad="down" data-tv-id="${id}" title="Volume down"`, '▼', canVolume, 'ir-down')}`}
       </div>
-      <div class="ir-note">◀ ▶ 10 S · ▲ ▼ VOLUME · OK PLAY / PAUSE</div>
+      <div class="ir-note">${menu ? '▲ ▼ ◀ ▶ MOVE ON THE SET · OK PICKS' : '◀ ▶ 10 S · ▲ ▼ VOLUME · OK PLAY / PAUSE'}</div>
       <div class="ir-row">
-        ${irKey(`data-tv-pad="ok" data-tv-id="${id}" title="${pb.state === 'paused' ? 'Play' : 'Pause'}"`, pb.state === 'paused' ? '▶ PLAY' : '⏸ PAUSE', canPause)}
+        ${irKey(`data-tv-play-pause="${id}" title="${pb.state === 'paused' ? 'Play' : 'Pause'}"`, pb.state === 'paused' ? '▶ PLAY' : '⏸ PAUSE', canPause)}
         ${irKey(`data-tv-stop="${id}" title="Back to the home screen"`, '⏹ STOP', showing)}
         ${startOnly ? '' : irKey(`data-tv-loop="${id}" aria-pressed="${rec.loop}" title="At the end, start the film over (stays on for the next one)"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF')}
         ${showing && rec.source?.kind === 'blob' ? irKey(`data-tv-autofetch="1" aria-pressed="${autoFetchOn()}" title="Your own switch: take a file shown on a TV without a press, up to ${esc(formatBytes(TV_AUTO_FETCH_MAX))} a file and ${esc(formatBytes(TV_AUTO_FETCH_DAY))} a day"`, autoFetchOn() ? '📦 AUTO-FETCH: ON' : '📦 AUTO-FETCH: OFF') : ''}
@@ -902,6 +923,14 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-vol]').forEach((b) => b.addEventListener('click', () => { volume(b.dataset.tvId!, Number(b.dataset.tvVol)); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-pad]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
+    // As the set is now, not as the face was drawn: a press elsewhere may
+    // have put a menu up, or taken it down, since.
+    const menu = tvMenu(id);
+    if (menu) {
+      if (b.dataset.tvPad === 'ok') pickOnSet(id, menu);
+      else tvMenuMove(id, b.dataset.tvPad as TvMenuDir);
+      return;
+    }
     switch (b.dataset.tvPad) {
       case 'up': volume(id, 10); break;
       case 'down': volume(id, -10); break;
@@ -910,6 +939,56 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       case 'ok': playPause(id); break;
     }
   }));
+  // ▶ PLAY / ⏸ PAUSE under the pad: that, with a menu up or not (OK picks
+  // the lit cell, which may be STOP).
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-play-pause]').forEach((b) => b.addEventListener('click', () => { playPause(b.dataset.tvPlayPause!); }));
+  /** OK on the set's menu: what the highlighted cell stands for. */
+  const pickOnSet = (id: string, menu: TvMenuView) => {
+    const at = menu.at;
+    if (at.startsWith('lib:')) {
+      const entry = libraryEntry(id, at.slice(4));
+      if (entry) playEntry(id, entry, 'link');
+      return;
+    }
+    if (at.startsWith('tile:')) {
+      readyFor(at.slice(5));
+      return;
+    }
+    switch (at as TvPausedCell) {
+      case 'play': tvResume(id); break;
+      case 'stop': tvStop(id); break;
+      case 'back':
+      case 'on':
+        if (tvPlayerCanSeek(id) === false) feedback('This stream cannot go back or on.', 'link');
+        else tvSeek(id, at === 'back' ? Math.max(0, pos(id) - 10_000) : pos(id) + 10_000);
+        break;
+      case 'start':
+        if (tvPlayerCanSeek(id) === false) feedback('This stream cannot go back to its start.', 'link');
+        else if (tvSeek(id, 0).ok) tvResume(id);
+        break;
+      case 'loop': tvSetLoop(id, !readTv(id).loop); break;
+    }
+  };
+  /** OK on a source tile: this blaster made ready for it, the link box (or
+   *  the file chooser, for FILE) and what it takes. Nothing is written: the
+   *  set stays as it is until a SEND. */
+  const readyFor = (kind: string) => {
+    const tile = visibleTiles().find((t) => t.key === kind);
+    if (!tile) return;
+    const chooser = kind === 'file' ? host.querySelector<HTMLInputElement>('[data-tv-file]') : null;
+    if (chooser) {
+      chooser.click();
+      return;
+    }
+    if (!tile.live || kind === 'file') {
+      feedback(`${tile.icon} ${tile.label} ${tile.hint}.`, 'link');
+      return;
+    }
+    const box = liveBox();
+    box?.focus({ preventScroll: true });
+    box?.scrollIntoView({ block: 'nearest' });
+    feedback(`${tile.icon} ${tile.label}: paste it in the box, then 📡 SEND (${kind === 'magnet' ? 'a magnet link' : tile.hint}).`, 'link');
+  };
   host.querySelectorAll<HTMLButtonElement>('[data-tv-stop]').forEach((b) => b.addEventListener('click', () => { tvStop(b.dataset.tvStop!); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-loop]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvLoop!;
@@ -1242,13 +1321,17 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-play]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
     const entry = libraryEntry(id, b.dataset.tvLibPlay!);
-    if (!entry) return;
+    if (entry) playEntry(id, entry, 'library');
+  }));
+  /** ▶ on a library row, or OK on its title on the set's menu: said on the
+   *  line beside the press (`where`). */
+  const playEntry = (id: string, entry: TvLibraryEntry, line: Feedback) => {
     // The link box's gate: the library is written by peers and by builds
     // with the convenience lanes on, and an entry this build would refuse
     // to play is said no to here — the programme on stays as it is.
     const refused = playRefusal(entry.source);
     if (refused) {
-      feedback(refused, 'library');
+      feedback(refused, line);
       return;
     }
     // A file your node holds plays from your node: viewers fetch it from
@@ -1263,7 +1346,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       : entry.source;
     const r = tvPlay(id, source);
     if (!r.ok) {
-      feedback(r.error, 'library');
+      feedback(r.error, line);
       return;
     }
     feedback(where === 'copy'
@@ -1272,9 +1355,9 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       ? `Now on: ${entry.title}, from a node that was in this room lately and has it where it is online now.`
       : where === 'away' || where === 'lost'
       ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'Your node cannot reach the node that shared it, here or elsewhere'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
-      : `Now on: ${entry.title}`, 'library');
+      : `Now on: ${entry.title}`, line);
     deps.openTheatre(id);
-  }));
+  };
   host.querySelectorAll<HTMLButtonElement>('[data-tv-host-copies]').forEach((b) => b.addEventListener('click', async () => {
     const on = b.dataset.tvHostCopies === '1';
     const why = await setHostCopies(on);

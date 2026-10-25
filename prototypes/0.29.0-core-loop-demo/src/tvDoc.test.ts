@@ -13,7 +13,7 @@ import {
   setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, sourceLane, subscribeTvKey, tvHeartbeat,
   tvKey, tvNoteEnd, tvPause, tvPlay, tvProgrammeEnded, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetLoop, tvSetVolume, tvStop,
   tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
-  TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey, libraryKey, readLibrary, TV_HOME_RECENT, TV_LIBRARY_MAX,
+  TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey, libraryKey, readLibrary, TV_LIBRARY_MAX,
   sourceId,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
@@ -1459,16 +1459,7 @@ describe('📚 the room\'s library', () => {
     expect(lib[1]!.torrent).toBeUndefined();
   });
 
-  it('puts its newest titles on the home screen', () => {
-    expect(tvScreenView(TV).recent).toBeUndefined();
-    for (const [i, t] of ['A', 'B', 'C', 'D', 'E'].entries()) {
-      tick(1);
-      tvPlay(TV, { kind: 'url', url: `https://example.org/${i}.mp4`, title: t }, now);
-    }
-    tvStop(TV);
-    expect(tvScreenView(TV)).toMatchObject({ state: 'home', recent: ['E', 'D', 'C', 'B'] });
-    expect(TV_HOME_RECENT).toBe(4);
-  });
+  // Its newest titles on the home screen: the set's own menu (tvMenu.test.ts).
 });
 
 describe('🗜 a smaller copy, as the room sees it', () => {

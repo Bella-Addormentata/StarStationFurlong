@@ -115,8 +115,11 @@ import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
 import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 // 📺 #186: the TV screen draws the view World derives from the room record.
 import type { TvScreenView } from "./tvDoc";
+// …and its own menu while stopped or paused (#258): the cells and the
+// highlight come in the view; the page of library titles is worked out here.
+import { tvHomeShelf } from "./tvMenu";
+import type { TvMenuCell, TvMenuView } from "./tvMenu";
 import type { ArcadeScreenView } from "./arcadeDoc";
-import { sourceKindAllowed } from "./sovereignty";
 // 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
@@ -11117,27 +11120,14 @@ function buildPartySpeaker(ctx: BuildCtx) {
 // A flat set with a live CanvasTexture screen, in two mountings: on the wall
 // (the terminal's flush-mount idiom) and on a low stand (a 2×1 floor item).
 // The screen draws the view World derives from the room record at ~2 Hz
-// (tvDoc.tvScreenView): the home screen with its source tiles, the
-// scheduled countdown, the now-playing card with its lane badge, or black.
+// (tvDoc.tvScreenView, with tvMenu.ts's menu): the home screen's menu (its
+// source tiles and the room's newest titles), the scheduled countdown, the
+// now-playing card with its lane badge, the paused menu, or black.
 // The PICTURE is on this plane too: the theatre (tvTheatre.ts) hands its
 // <video> to the handle's showVideo, whose frames go on a plane just in front
 // of the card, fitted inside it; an embed's iframe, which no texture can
 // sample, is laid over the same plane in the DOM (tvScreenLayer.ts).
 // (Dimensions: TV_W … TV_TEX_H, declared beside the terminal's above.)
-
-/** The home screen's source tiles, in the remote's order (tvUI TILES): the
- *  source kind each stands for (sovereignty.ts decides which this build
- *  offers) and whether its lane exists yet (`live`; KARAOKE is plan §3.3's
- *  later tile, drawn dimmed — FILE arrived with the blob lane, blobLane.ts,
- *  and TORRENT with the torrent lane, torrentLane.ts). */
-const TV_HOME_TILES: ReadonlyArray<{ label: string; kind: string; live: boolean }> = [
-  { label: "▶ YOUTUBE", kind: "youtube", live: true },
-  { label: "ARCHIVE", kind: "archive", live: true },
-  { label: "URL", kind: "url", live: true },
-  { label: "FILE", kind: "file", live: true },
-  { label: "TORRENT", kind: "magnet", live: true },
-  { label: "KARAOKE", kind: "karaoke", live: false },
-];
 
 /**
  * The set itself, `w` × `h`, centred on (0, cy) with its back at zBack and
@@ -11189,6 +11179,27 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   pictureFrame.visible = false;
   pictureFrame.add(picture);
   screen.add(pictureFrame);
+  // The set's own menu while it is paused (tvMenu.ts): a canvas of its own
+  // on a plane just in front of the picture, so the still frame shows under
+  // it, dimmed. Shown and hidden through a Group, as the picture is. The
+  // canvas is sized on the first pause: a set never paused holds none.
+  const menuCv = document.createElement("canvas");
+  menuCv.width = 1;
+  menuCv.height = 1;
+  const menu2d = menuCv.getContext("2d")!;
+  const menuTex = new THREE.CanvasTexture(menuCv);
+  menuTex.minFilter = THREE.LinearFilter;
+  menuTex.magFilter = THREE.LinearFilter;
+  menuTex.generateMipmaps = false;
+  menuTex.colorSpace = THREE.SRGBColorSpace;
+  const menuPlane = new THREE.Mesh(new THREE.PlaneGeometry(screenW, screenH), new THREE.MeshBasicMaterial({ map: menuTex, transparent: true, toneMapped: false }));
+  menuPlane.raycast = () => undefined; // clicks land on the set
+  menuPlane.userData.tvMenu = true;
+  const menuFrame = new THREE.Group();
+  menuFrame.position.z = 0.002;
+  menuFrame.visible = false;
+  menuFrame.add(menuPlane);
+  screen.add(menuFrame);
   /** Fit the video's own shape inside the screen (letterbox or pillarbox). */
   const fitPicture = () => {
     const vw = video?.videoWidth ?? 0;
@@ -11212,28 +11223,81 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     c2d.fillStyle = color;
     c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
   };
-  const text = (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
-    c2d.font = font;
-    c2d.fillStyle = color;
-    c2d.textAlign = align;
-    c2d.textBaseline = "middle";
-    c2d.fillText(s, x, y);
+  const textOn = (g: CanvasRenderingContext2D) => (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
+    g.font = font;
+    g.fillStyle = color;
+    g.textAlign = align;
+    g.textBaseline = "middle";
+    g.fillText(s, x, y);
   };
-  const badge = (lane: string) => {
+  const text = textOn(c2d);
+  const badgeOn = (g: CanvasRenderingContext2D) => (lane: string) => {
     if (!lane) return;
-    c2d.font = "bold 10px monospace";
-    const w = c2d.measureText(lane).width + 12;
-    c2d.strokeStyle = lane === "SOVEREIGN" ? "#2fe6a0" : lane === "PLAYER-RUN" ? "#00e5ff" : lane === "PUBLIC SWARM" ? "#f0c060" : "#ff8a50";
-    c2d.strokeRect(TV_TEX_W - w - 12.5, 12.5, w, 18);
-    text(lane, TV_TEX_W - 12 - w / 2, 22, "bold 10px monospace", c2d.strokeStyle, "center");
+    g.font = "bold 10px monospace";
+    const w = g.measureText(lane).width + 12;
+    g.strokeStyle = lane === "SOVEREIGN" ? "#2fe6a0" : lane === "PLAYER-RUN" ? "#00e5ff" : lane === "PUBLIC SWARM" ? "#f0c060" : "#ff8a50";
+    g.strokeRect(TV_TEX_W - w - 12.5, 12.5, w, 18);
+    textOn(g)(lane, TV_TEX_W - 12 - w / 2, 22, "bold 10px monospace", g.strokeStyle as string, "center");
+  };
+  const badge = badgeOn(c2d);
+  /** A menu cell: lit (gold) under the highlight, dimmed for a lane still
+   *  to come. */
+  const cellOn = (g: CanvasRenderingContext2D) => (c: TvMenuCell, lit: boolean, x: number, y: number, w: number, h: number, font: string) => {
+    g.fillStyle = lit ? "rgba(240,192,96,0.30)" : c.live ? "rgba(0,229,255,0.10)" : "rgba(255,255,255,0.04)";
+    g.fillRect(x, y, w, h);
+    g.lineWidth = lit ? 2 : 1;
+    g.strokeStyle = lit ? "#f0c060" : c.live ? "rgba(0,229,255,0.6)" : "rgba(255,255,255,0.12)";
+    if (lit) g.strokeRect(x + 1, y + 1, w - 2, h - 2);
+    else g.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+    g.lineWidth = 1;
+    textOn(g)(c.label, x + w / 2, y + h / 2, font, lit ? "#ffffff" : c.live ? "#e8f4ff" : "#4a5560", "center");
+  };
+  const cell = cellOn(c2d);
+  const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+  /** This page's own word (tvTheatreHint), one part a line: the parts. */
+  const askLines = (ask: string, n: number) => ask.split(" · ").slice(0, 3).map((l) => cut(l, n));
+  /** The paused menu, over the still picture (or over the card's black,
+   *  for a picture laid in the DOM or none yet): the title, PAUSED, what
+   *  this page waits on, and the six cells. */
+  const drawPausedMenu = (view: TvScreenView, menu: TvMenuView) => {
+    if (menuCv.width !== cv.width || menuCv.height !== cv.height) {
+      menuCv.width = cv.width;
+      menuCv.height = cv.height;
+      menuTex.dispose(); // a texture keeps its first size on the GPU
+    }
+    const g = menu2d;
+    const t = textOn(g);
+    g.setTransform(texScale, 0, 0, texScale, 0, 0);
+    g.imageSmoothingEnabled = false;
+    g.clearRect(0, 0, TV_TEX_W, TV_TEX_H);
+    g.fillStyle = "rgba(0,0,0,0.55)";
+    g.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
+    // Darker under the words and the cells: a bright frame stays a frame.
+    g.fillStyle = "rgba(4,8,16,0.6)";
+    g.fillRect(0, 0, TV_TEX_W, 42);
+    g.fillRect(192, 44, 186, 140);
+    badgeOn(g)(view.lane);
+    t(cut(view.title, 25), 16, 24, "bold 16px monospace", "#f0f4ff");
+    t("❚❚  PAUSED", 16, 76, "bold 20px monospace", "#f0c060");
+    if (view.ask) askLines(view.ask, 26).forEach((l, i) => t(l, 16, 108 + i * 16, i === 0 ? "bold 11px monospace" : "10px monospace", i === 0 ? "#e8f4ff" : "#00e5ff"));
+    for (const c of menu.cells) cellOn(g)(c, c.id === menu.at, 200 + c.col * 90, 52 + c.row * 40, 84, 32, "bold 10px monospace");
+    t("▲ ▼ ◀ ▶  OK", 287, 175, "bold 9px monospace", "#8fa3b8", "center");
+    // PAUSED is said above, in big: the line keeps LOOP and the last press.
+    t(cut(view.detail.replace(/^PAUSED( · )?/, ""), 30), 16, 196, "11px monospace", "#8fa3b8");
+    t(view.clockText, TV_TEX_W - 16, 196, "bold 14px monospace", "#f0f4ff", "right");
+    menuTex.needsUpdate = true;
   };
   const draw = (view: TvScreenView): void => {
     c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
     viewState = view.state;
+    const pausedMenu = view.state === "paused" && view.menu?.kind === "paused" ? view.menu : null;
     // A picture gives way to what this page asks (below): mostly TAP TO
-    // PLAY, whose picture is stalled until the press.
-    pictureFrame.visible = pictureOn() && !view.ask;
+    // PLAY, whose picture is stalled until the press. Paused, the menu's
+    // plane says it over the still frame.
+    pictureFrame.visible = pictureOn() && (!view.ask || pausedMenu !== null);
+    if (pausedMenu) drawPausedMenu(view, pausedMenu);
+    menuFrame.visible = pausedMenu !== null;
     if (pictureFrame.visible) {
       // The picture is up: the card behind it is the black around it.
       fill("#000000");
@@ -11254,34 +11318,39 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       g.addColorStop(1, "#06101f");
       c2d.fillStyle = g;
       c2d.fillRect(0, 0, TV_TEX_W, TV_TEX_H);
-      // The same shelf the phone's remote offers (tvUI visibleTiles): a lane
-      // this build does not offer (sovereignty.ts — YouTube and archive.org
-      // without the convenience lanes) is not drawn, and a tile for a lane
-      // still to come is drawn dimmed. The screen must not show as live
-      // what the remote refuses.
-      const tiles = TV_HOME_TILES.filter((tile) => sourceKindAllowed(tile.kind));
-      const tile = (label: string, live: boolean, x: number, y: number, w: number, h: number, font: string) => {
-        c2d.fillStyle = live ? "rgba(0,229,255,0.10)" : "rgba(255,255,255,0.04)";
-        c2d.fillRect(x, y, w, h);
-        c2d.strokeStyle = live ? "rgba(0,229,255,0.6)" : "rgba(255,255,255,0.12)";
-        c2d.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-        text(label, x + w / 2, y + h / 2, font, live ? "#e8f4ff" : "#4a5560", "center");
-      };
-      if (view.recent?.length) {
-        // 📚 The room's library has something: the tiles move left, and its
-        // newest titles take the right (tvDoc readLibrary).
+      // The set's own menu (tvMenu.ts): the source tiles — the shelf the
+      // blaster's link box takes, as this build offers it (sovereignty.ts:
+      // YouTube and archive.org only with the convenience lanes), a lane
+      // still to come dimmed — and, with a library, its newest titles
+      // beside them (RECENTLY ON), a page at a time. The highlight is the
+      // room's: every page draws it where anyone's blaster moved it.
+      const menu = view.menu?.kind === "home" ? view.menu : null;
+      const tiles = menu?.cells.filter((c) => c.id.startsWith("tile:")) ?? [];
+      const shelf = menu ? tvHomeShelf(menu) : null;
+      if (menu && menu.cells.some((c) => c.id.startsWith("lib:"))) {
         text("FURLONG TV", TV_TEX_W / 2, 36, "bold 22px monospace", "#f0c060", "center");
-        tiles.forEach((t, i) => tile(t.label, t.live, 16 + (i % 2) * 92, 62 + Math.floor(i / 2) * 40, 86, 32, "bold 10px monospace"));
+        for (const t of tiles) cell(t, t.id === menu.at, 16 + t.col * 92, 62 + t.row * 40, 86, 32, "bold 10px monospace");
         c2d.fillStyle = "rgba(240,192,96,0.25)";
         c2d.fillRect(204, 62, 1, 112);
         text("RECENTLY ON", 216, 72, "bold 11px monospace", "#f0c060");
-        view.recent.forEach((t, i) => {
-          const line = t.length > 23 ? `${t.slice(0, 22)}…` : t;
-          text(line, 216, 98 + i * 22, "11px monospace", "#e8f4ff");
+        if (shelf!.above) text("▲", TV_TEX_W - 12, 72, "bold 10px monospace", "#f0c060", "right");
+        shelf!.cells.forEach((c, i) => {
+          const y = 98 + i * 22;
+          const lit = c.id === menu.at;
+          if (lit) {
+            c2d.fillStyle = "rgba(240,192,96,0.30)";
+            c2d.fillRect(210, y - 10, TV_TEX_W - 220, 20);
+            c2d.lineWidth = 2;
+            c2d.strokeStyle = "#f0c060";
+            c2d.strokeRect(211, y - 9, TV_TEX_W - 222, 18);
+            c2d.lineWidth = 1;
+          }
+          text(cut(c.label, 23), 216, y, lit ? "bold 11px monospace" : "11px monospace", lit ? "#ffffff" : "#e8f4ff");
         });
+        if (shelf!.below) text("▼", TV_TEX_W - 12, 182, "bold 10px monospace", "#f0c060", "right");
       } else {
         text("FURLONG TV", TV_TEX_W / 2, 48, "bold 26px monospace", "#f0c060", "center");
-        tiles.forEach((t, i) => tile(t.label, t.live, 24 + (i % 3) * 116, 84 + Math.floor(i / 3) * 50, 104, 38, "bold 11px monospace"));
+        for (const t of tiles) cell(t, t.id === menu?.at, 24 + t.col * 116, 84 + t.row * 50, 104, 38, "bold 11px monospace");
       }
       text(view.detail, TV_TEX_W / 2, 196, "11px monospace", "#8fa3b8", "center");
       glowLevel = 0.5;
@@ -11293,6 +11362,10 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
       if (view.state === "scheduled") {
         text("MOVIE NIGHT", 16, 100, "bold 12px monospace", "#f0c060");
         text(view.detail, 16, 140, "bold 30px monospace", "#2fe6a0");
+      } else if (pausedMenu) {
+        // The menu's own plane in front says it all (drawPausedMenu): the
+        // card behind is the black under it.
+        fill("#000000");
       } else if (view.state === "paused") {
         text("❚❚  PAUSED", 16, 120, "bold 22px monospace", "#f0c060");
         text(view.clockText, TV_TEX_W - 16, 196, "bold 14px monospace", "#8fa3b8", "right");
@@ -11316,8 +11389,9 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     }
     // This page's own word (tvTheatreHint): what it waits on, across the
     // middle of the card, one part a line. The picture is down while it is up.
-    if (view.ask && !pictureFrame.visible && view.state !== "off") {
-      const lines = view.ask.split(" · ").slice(0, 3).map((l) => (l.length > 34 ? `${l.slice(0, 33)}…` : l));
+    // Paused, the menu's plane says it in its own column.
+    if (view.ask && !pictureFrame.visible && view.state !== "off" && !pausedMenu) {
+      const lines = askLines(view.ask, 34);
       const top = 112 - lines.length * 11;
       c2d.fillStyle = "rgba(4,8,16,0.86)";
       c2d.fillRect(12, top - 8, TV_TEX_W - 24, lines.length * 22 + 16);
