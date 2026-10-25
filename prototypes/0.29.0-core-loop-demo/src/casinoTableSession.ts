@@ -1656,14 +1656,22 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       // more it waits out a wake.
       const t = Date.now();
       const step = t - polledAt;
-      if (step < 0 || !tablesAwake() || !casinoWhole(itemId)) {
+      const whole = casinoWhole(itemId);
+      if (step < 0 || !tablesAwake() || !whole) {
         settleFrom += step;
         until += step;
       }
       polledAt = t;
-      const now = rouletteState();
       // Another room's table can share this id and round: stop on a rebind.
-      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || t > until
+      if (casinoDocEpoch() !== epoch) {
+        stopSpinPoll();
+        return;
+      }
+      // 📒 The table's own state may be in the part still to come, reading
+      // as gone or as the book's: the round is read again once it comes.
+      if (!whole) return;
+      const now = rouletteState();
+      if (now?.phase !== 'closing' || now.round !== r || t > until
         || (now.operator !== undefined && now.operator !== ROULETTE_PAGE_ID)) {
         stopSpinPoll();
         return;

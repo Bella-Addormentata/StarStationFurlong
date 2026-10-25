@@ -8,7 +8,8 @@
  *  📒 on a doc holding part of an update (casinoWhole), where a bet list
  *    rewritten in the part still to come reads as gone, it closes nothing
  *    until the rest comes, so the round takes that list; pressed before
- *    such a wait, it settles once the rest comes.
+ *    such a wait (the round's own state in the part still to come too), it
+ *    settles once the rest comes.
  * And a bettor's ↶ take-down on such a doc: refused, and said so, not told
  * TAKEN DOWN with the bets still riding.
  *
@@ -314,6 +315,27 @@ describe("the house's manual SPIN on a doc holding part of an update", () => {
     await run(15_000);
     expect(readTableState(t)?.phase).toBe('closing');
     Y.applyUpdate(doc, rest);
+    await run(2_000);
+    const phase = readTableState(t)?.phase;
+    house.unmount();
+    expect(phase).toBe('settled');
+  });
+
+  it("whose closing state is rewritten in the part still to come, polls on and settles once it comes, without a second press", async () => {
+    const t = freshTable();
+    writeCrapsFairnessPref(t, 'rng');
+    openBetting(t, 1);
+    writeMyBets(t, BOB, 1, red);
+    noteTablesRunning(Date.now());
+    const house = houseAtTable(t);
+    house.spin();
+    await run(300);
+    expect(readTableState(t)?.phase).toBe('closing');
+    const rest = tableStateParked(t);
+    expect(readTableState(t)?.phase).not.toBe('closing');
+    await run(2_000);
+    Y.applyUpdate(doc, rest);
+    expect(readTableState(t)?.phase).toBe('closing');
     await run(2_000);
     const phase = readTableState(t)?.phase;
     house.unmount();
