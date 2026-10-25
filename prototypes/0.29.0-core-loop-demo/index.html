@@ -181,6 +181,9 @@
       <div id="phone-bezel">
         <div id="notch-speaker"></div>
         <div id="notch-camera"></div>
+        <!-- 📡 The IR blaster's emitter (#258): glows at the phone's tip on
+             every press of the remote, and steadily while aiming. -->
+        <div id="phone-ir-emitter" aria-hidden="true"></div>
       </div>
       
       <!-- Inside Simulated Mobile Display -->
@@ -242,11 +245,10 @@
               <span class="phone-app-tile-icon">⚙️</span>
               <span class="phone-app-tile-label">SETTINGS</span>
             </button>
-            <!-- 📺 The TV remote (#186): the phone IS the remote for the set
-                 whose remote you hold — sources, play/schedule, hand over. -->
-            <button type="button" class="phone-app-tile" data-phone-app="tv" aria-label="Open the TV remote">
-              <span class="phone-app-tile-icon">📺</span>
-              <span class="phone-app-tile-label">TV</span>
+            <!-- 🧰 Tools (#258): the phone's utilities, the IR blaster first. -->
+            <button type="button" class="phone-app-tile" data-phone-app="tools" aria-label="Open Tools">
+              <span class="phone-app-tile-icon">🧰</span>
+              <span class="phone-app-tile-label">TOOLS</span>
             </button>
           </div>
 
@@ -411,8 +413,19 @@
         <!-- ⚙️→📊 Stats view (receives #debug-hud) -->
         <div id="phone-app-settings-stats" class="phone-app-view"></div>
 
-        <!-- 📺 TV remote (#186) — rendered by tvUI.ts renderTvPhoneApp on open
-             and on every tv-map change while the view is active. -->
+        <!-- 🧰 Tools (#258) -->
+        <div id="phone-app-tools" class="phone-app-view">
+          <div id="phone-tools-grid">
+            <button type="button" class="phone-app-tile" data-phone-app="tv" aria-label="Open the IR blaster, the remote of every TV in the room">
+              <span class="phone-app-tile-icon">📡</span>
+              <span class="phone-app-tile-label">IR BLASTER</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 🧰→📡 IR blaster (#258), every TV's remote — rendered by tvUI.ts
+             renderTvPhoneApp on open and on every tv-map change while the
+             view is active. -->
         <div id="phone-app-tv" class="phone-app-view"></div>
       </div>
     </div>

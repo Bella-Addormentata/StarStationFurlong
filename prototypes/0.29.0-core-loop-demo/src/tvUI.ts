@@ -1,35 +1,54 @@
 /**
- * 📺 tvUI — the two panels around the smart TV (#186):
+ * 📡 tvUI — the SpacePhone's IR BLASTER (🧰 TOOLS → 📡 IR BLASTER, #258),
+ * the one place the TV is driven from. No panel at the set and no bar on
+ * the screen: clicking a TV, or 🎯 AIM and then a click, points the blaster
+ * at it, and the phone shows that set's remote —
  *
- *  - the FOCUSED panel at the set (a DeviceUI, the party props' shell): the
- *    body buttons anyone may press (POWER, VOLUME), WATCH, and the remote —
- *    pick it up, put it down, hand it to someone, or open it on the phone;
- *  - the REMOTE itself, the phone's 📺 TV app: the start screen's source
- *    tiles with their lane badges, the paste box, PLAY NOW / SCHEDULE, the
- *    transport, the history, and HAND TO… — for the TV you hold.
+ *  - the keys: POWER, VOLUME, the D-pad, STOP, LOOP, the viewer's own
+ *    AUTO-FETCH switch, and RELOAD for archive.org's player. While a
+ *    programme plays, the D-pad's ◀ ▶ go ten seconds back and on, ▲ ▼ set
+ *    the volume and OK pauses; while the set is stopped or paused, its own
+ *    menu is up (tvMenu.ts), and the arrows move the highlight on the set
+ *    and OK picks what is under it;
+ *  - what the set asks of this viewer (tvTheatre's notice): a link to
+ *    allow, a file to fetch, a tap for sound;
+ *  - the link box and SEND: a web address, a magnet link, or an SSF link
+ *    (ssfLink.ts), which this page's node fetches from the nodes it names
+ *    before the film goes on;
+ *  - a file from this computer, a torrent's download, the host's copies
+ *    and the room's library, where 🔗 SSF LINK shares a file on this
+ *    page's node by its link.
+ *
+ * Every press makes the little glow at the phone's tip (irBlaster.ts).
+ * Every SpacePhone is a remote: nothing to pick up, hold or hand on, and
+ * anyone's press controls the set (tvDoc).
  *
  * Every state change goes through tvDoc; this module renders and asks. Peer
  * strings are escaped before they reach innerHTML (the #116 XSS lesson).
  */
 
-import type { DeviceUI } from './devices';
 import {
-  formatClock, handRemote, holdsSpareRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
-  putDownRemote, readLibrary, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource, sourceId, TV_MAX_TITLE,
-  sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
-  tvResume, tvRevision, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, powerKey, volumeKey,
+  formatClock, isStartOnly, parseTvSource, readCrt, readLibrary, readPlayback, readRemote, readTv, remoteLapsed, sanitizeSource, sourceId, TV_MAX_TITLE,
+  sourceLabel, sourceLane, subscribeTv, tvDocEpoch, tvPause, tvPlay,
+  tvResume, tvRevision, tvSchedule, tvSeek, tvSetCrt, tvSetLoop, tvSetVolume, tvStop, tvTogglePower,
 } from './tvDoc';
 import type { TvHistoryEntry, TvLibraryEntry, TvSource, TvTorrentOrigin } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
 import { tvPlayerCanSeek, tvPlayerPositionMs } from './tvSession';
-import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 import { isFlightKey } from './freeFlightStick';
+import { readyForRoom } from './tvShrink';
+import { autoFetchOn, setAutoFetchOn, TV_AUTO_FETCH_DAY, TV_AUTO_FETCH_MAX } from './tvAutoFetch';
+import { focusTvEmbed, reloadTvPicture, subscribeTvTheatre, tvTheatreNotice } from './tvTheatre';
+import { irBlink } from './irBlaster';
+import { tvMenu, tvMenuCellAt, tvMenuMove, tvMenuStep } from './tvMenu';
+import type { TvMenuDir, TvMenuView, TvPausedCell } from './tvMenu';
 import {
-  blobLaneNodeId, blobLaneReady, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds, nodeHostCopies, nodeLibrarySpace, nodeReaches,
-  refreshHeldBlobs, refreshHolders, setHostCopies, torrentLaneReady,
+  blobLaneGeneration, blobLaneNodeId, blobLaneReady, blobLaneRoom, blobStateNow, fetchFromLink, forgetBlob, formatBytes, importBlob, nodeHolders, nodeHolds,
+  nodeHostCopies, nodeLibrarySpace, nodeReaches, nodeShares, refreshHeldBlobs, refreshHolders, setHostCopies, shareBlob, torrentLaneReady,
 } from './blobLane';
+import { formatSsfLink, isSsfFilmLink, parseSsfLink } from './ssfLink';
 import {
   confirmTorrent, MAX_TORRENT_FILE, refreshTorrentState, startTorrent, startTorrentAgain, startTorrentFile, stopTorrent,
   torrentLine, torrentOrigin, torrentRunning, torrentSource, torrentState,
@@ -44,40 +63,6 @@ const CYAN = '#00E5FF';
 
 const esc = escapeHtml;
 
-export interface TvDeviceDeps {
-  itemId: string;
-  /** "WALL TV" / "TV ON THE STAND" — the kind's label. */
-  label: string;
-  myPub: () => string;
-  myName: () => string;
-  roomPlayers: () => RoomPlayer[];
-  openTheatre: () => void;
-  /** Open the phone on the 📺 TV app (the remote). */
-  openRemote: () => void;
-}
-
-const PANEL_CSS = `
-  position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
-  width: 320px; max-height: 90vh; overflow-y: auto;
-  background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
-  border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
-  padding: 18px; display: flex; flex-direction: column; gap: 12px;
-  color: ${GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-  box-sizing: border-box; pointer-events: auto;
-`;
-
-function bigButton(attr: string, label: string, tone: string, enabled = true): string {
-  return `<button type="button" ${attr} ${enabled ? '' : 'disabled'} style="
-    display:flex; justify-content:center; align-items:center;
-    padding:10px 12px; width:100%;
-    background:${enabled ? `rgba(${tone},0.14)` : 'rgba(212,168,75,0.05)'};
-    border:1px solid ${enabled ? `rgba(${tone},0.75)` : 'rgba(212,168,75,0.2)'};
-    border-radius:7px; color:${enabled ? GOLD_BRIGHT : DIM};
-    font-family:inherit; font-size:12px; font-weight:800; letter-spacing:0.5px;
-    cursor:${enabled ? 'pointer' : 'default'};
-  ">${label}</button>`;
-}
-
 function smallButton(attr: string, label: string, enabled = true): string {
   return `<button type="button" ${attr} ${enabled ? '' : 'disabled'} style="
     padding:6px 9px; background:rgba(212,168,75,0.12); border:1px solid rgba(212,168,75,${enabled ? 0.4 : 0.15});
@@ -90,15 +75,8 @@ function laneBadge(lane: string): string {
   return `<span style="font-size:8px; letter-spacing:1px; padding:1px 5px; border:1px solid ${tone}; color:${tone}; border-radius:3px; white-space:nowrap;">${esc(lane)}</span>`;
 }
 
-function title(text: string, sub: string): string {
-  return `<div>
-    <div style="font-size:13px; font-weight:800; letter-spacing:1px; color:${GOLD_BRIGHT};">${text}</div>
-    <div style="font-size:10px; color:${DIM}; margin-top:3px;">${sub}</div>
-  </div>`;
-}
-
-/** What the set is doing, in one line, for both panels (plain text: it is
- *  set with textContent, never innerHTML). */
+/** What the set is doing, in one line (plain text: it is set with
+ *  textContent, never innerHTML). */
 function statusText(itemId: string): string {
   const rec = readTv(itemId);
   const pb = readPlayback(itemId);
@@ -113,9 +91,8 @@ function statusText(itemId: string): string {
 const STATUS_ROW_STYLE = `color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis;`;
 
 /** The status gets a span of its own, filled by refreshStatus: the clock and
- *  the countdown tick without rebuilding the panel around them, so buttons
- *  stay where a finger is heading, a name chosen in HAND TO stays chosen, a
- *  volume drag is not cut short and a note stays readable. */
+ *  the countdown tick without rebuilding the blaster around them, so keys
+ *  stay where a finger is heading and a note stays readable. */
 function statusSpan(itemId: string, style = ''): string {
   return `<span data-tv-status="${esc(itemId)}"${style ? ` style="${style}"` : ''}></span>`;
 }
@@ -127,192 +104,28 @@ function refreshStatus(root: HTMLElement): void {
   });
 }
 
-/** The volume sliders' level, set as a property rather than written into
- *  the panel's HTML: a peer's VOLUME press on the set then moves the knob
- *  without rebuilding the panel under a pointer mid-drag, and a slider the
- *  player is on keeps its own reading until its change lands. */
-function syncVolumeSliders(root: HTMLElement): void {
-  root.querySelectorAll<HTMLInputElement>('input[data-tv-volume]').forEach((i) => {
-    if (document.activeElement === i) return;
-    const level = String(readTv(i.dataset.tvVolume!).volume);
-    if (i.value !== level) i.value = level;
-  });
-}
-
-function remoteLine(itemId: string, myPub: string): string {
+/** Who pressed last, while their page keeps the set's clock: whose press
+ *  put the room where it is. Escaped for innerHTML. */
+function lastPressLine(itemId: string, myPub: string): string {
   const r = readRemote(itemId);
-  if (!r.holder || remoteLapsed(itemId)) return 'The remote is on the set.';
-  if (r.holder === myPub) return 'You are holding the remote.';
-  return `${esc(r.name || 'A clone')} is holding the remote.`;
+  if (!r.holder || remoteLapsed(itemId)) return 'Any SpacePhone in the room is its remote.';
+  if (r.holder === myPub) return 'You pressed last. Any SpacePhone in the room is its remote.';
+  return `${esc(r.name || 'A clone')} pressed last. Any SpacePhone in the room is its remote.`;
 }
 
-/** HAND TO… for ONE set: the select and the button carry its id, so a phone
- *  showing one remote while holding two hands over only the one on show. */
-function handToBlock(deps: { myPub: () => string; roomPlayers: () => RoomPlayer[] }, itemId: string): string {
-  const others = deps.roomPlayers().filter((p) => p.pub && p.pub !== deps.myPub());
-  if (others.length === 0) {
-    return `<div style="font-size:9px; color:${DIM};">Nobody else in the room to hand it to.</div>`;
-  }
-  const options = others
-    .map((p) => `<option value="${esc(p.pub)}">${esc(p.name || p.pub.slice(0, 8))}</option>`)
-    .join('');
-  return `<div style="display:flex; gap:6px; align-items:center;">
-    <select data-tv-hand-to="${esc(itemId)}" aria-label="Hand the remote to" title="↑/↓ choose · Tab moves on to HAND TO · Escape leaves the list" style="flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:5px 6px;">${options}</select>
-    ${smallButton(`data-tv-hand="${esc(itemId)}"`, '🤝 HAND TO')}
-  </div>
-  <div style="font-size:9px; color:${DIM}; line-height:1.4;">Everyone this room has seen. A remote handed to someone who has left comes back to the set on its own after 8 s.</div>`;
-}
-
-/** Wire every HAND TO block in `root` to the set its button names. */
-function wireHandOver(root: HTMLElement, note: (text: string) => void): void {
-  root.querySelectorAll<HTMLButtonElement>('[data-tv-hand]').forEach((b) => b.addEventListener('click', () => {
-    const itemId = b.dataset.tvHand!;
-    const sel = root.querySelector<HTMLSelectElement>(`[data-tv-hand-to="${CSS.escape(itemId)}"]`);
-    if (!sel) return;
-    const name = sel.options[sel.selectedIndex]?.textContent ?? '';
-    const r = handRemote(itemId, sel.value, name);
-    if (!r.ok) note(r.error);
-  }));
-}
-
-/** The focused panel's remote buttons (one set: the buttons are unqualified). */
-function wireRemoteActions(panel: HTMLElement, itemId: string, note: (text: string) => void): void {
-  panel.querySelector<HTMLButtonElement>('[data-tv-pickup]')?.addEventListener('click', () => {
-    const r = pickUpRemote(itemId);
-    if (!r.ok) note(r.error);
-  });
-  panel.querySelector<HTMLButtonElement>('[data-tv-putdown]')?.addEventListener('click', () => {
-    const r = putDownRemote(itemId);
-    if (!r.ok) note(r.error);
-  });
-  wireHandOver(panel, note);
-}
-
-function showNote(panel: HTMLElement, text: string): void {
-  let note = panel.querySelector<HTMLDivElement>('.tv-note');
-  if (!note) {
-    note = document.createElement('div');
-    note.className = 'tv-note';
-    note.style.cssText = `font-size:10px; color:${WARN}; line-height:1.4;`;
-    panel.appendChild(note);
-  }
-  note.textContent = text;
-}
-
-// ── The focused panel at the set ─────────────────────────────────────────────
-
-export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
-  let panel: HTMLDivElement | null = null;
-  let unsubscribe: (() => void) | null = null;
-  let clockTimer = 0;
-  let lastHtml = '';
-
-  const render = (): void => {
-    if (!panel) return;
-    const rec = readTv(deps.itemId);
-    const me = deps.myPub();
-    const mine = iHoldRemote(deps.itemId);
-    const mayPick = !mine && mayPickUpRemote(deps.itemId);
-    const owner = holdsSpareRemote(); // the deed holder: the predicate the write itself checks
-    const lane = rec.source ? laneBadge(sourceLane(rec.source)) : '';
-    // archive.org's own player takes no volume from the set: its buttons
-    // would change the room's number and not the sound.
-    const volumeless = rec.source ? isStartOnly(rec.source) : false;
-    const html = `
-      ${title(`📺 ${esc(deps.label)}`, statusSpan(deps.itemId))}
-      <div style="display:flex; gap:6px; align-items:center;">
-        ${smallButton('data-tv-power="1"', rec.state === 'off' ? '⏻ POWER ON' : '⏻ POWER OFF')}
-        ${volumeless ? `<span style="font-size:9px; color:${DIM};">volume: in archive.org's player</span>` : `${smallButton('data-tv-vol-down="1"', '🔉 −', rec.state !== 'off')}
-        <span style="font-size:10px; color:${GOLD_BRIGHT}; min-width:30px; text-align:center;">${rec.volume}%</span>
-        ${smallButton('data-tv-vol-up="1"', '🔊 +', rec.state !== 'off')}`}
-        ${lane}
-      </div>
-      <div style="font-size:9px; color:${DIM}; line-height:1.4;">The set's own buttons — no remote needed.</div>
-      ${bigButton('data-tv-watch="1"', '▶ WATCH', '47,230,160', rec.state !== 'off')}
-      <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:10px; display:flex; flex-direction:column; gap:8px;">
-        <div style="font-size:9px; color:${DIM}; letter-spacing:1.5px;">THE REMOTE</div>
-        <div style="font-size:11px; color:${GOLD_BRIGHT}; line-height:1.4;">${remoteLine(deps.itemId, me)}</div>
-        ${mine ? bigButton('data-tv-open-remote="1"', '📱 OPEN THE REMOTE', '0,229,255') : ''}
-        ${mayPick ? bigButton('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE', '212,168,75') : ''}
-        ${mine || (owner && readRemote(deps.itemId).holder) ? bigButton('data-tv-putdown="1"', mine ? '🪑 PUT IT DOWN' : '🪑 TAKE IT BACK (OWNER)', '212,168,75') : ''}
-        ${mine || owner ? handToBlock(deps, deps.itemId) : ''}
-      </div>
-    `;
-    // Rebuild only when something other than the clock changed — and keep
-    // the keyboard player's place across it (the phone app's rule): the
-    // control they were on, by its data-tv-* identity, else the panel.
-    if (html !== lastHtml) {
-      const active = document.activeElement;
-      const inside = active instanceof HTMLElement && panel.contains(active) ? active : null;
-      const focusKey = focusKeyOf(inside);
-      panel.innerHTML = html;
-      lastHtml = html;
-      if (inside) {
-        const again = focusKey ? panel.querySelector<HTMLElement>(focusKey) : null;
-        (again ?? panel).focus({ preventScroll: true });
-      }
-      const note = (text: string) => showNote(panel!, text);
-      panel.querySelector<HTMLButtonElement>('[data-tv-power]')?.addEventListener('click', () => { tvTogglePower(deps.itemId); });
-      panel.querySelector<HTMLButtonElement>('[data-tv-vol-down]')?.addEventListener('click', () => { tvSetVolume(deps.itemId, readTv(deps.itemId).volume - 10); });
-      panel.querySelector<HTMLButtonElement>('[data-tv-vol-up]')?.addEventListener('click', () => { tvSetVolume(deps.itemId, readTv(deps.itemId).volume + 10); });
-      panel.querySelector<HTMLButtonElement>('[data-tv-watch]')?.addEventListener('click', () => deps.openTheatre());
-      panel.querySelector<HTMLButtonElement>('[data-tv-open-remote]')?.addEventListener('click', () => {
-        selectTvRemote(deps.itemId); // this set's remote, not an earlier held one
-        deps.openRemote();
-      });
-      wireRemoteActions(panel, deps.itemId, note);
-    }
-    refreshStatus(panel);
-  };
-
-  return {
-    mount(host: HTMLElement): void {
-      panel = document.createElement('div');
-      panel.id = `device-tv-${deps.itemId}`;
-      panel.style.cssText = PANEL_CSS;
-      lastHtml = '';
-      panel.addEventListener('click', (e) => e.stopPropagation());
-      host.appendChild(panel);
-      const subs = [
-        subscribeTvKey(tvKey(deps.itemId), render),
-        subscribeTvKey(remoteKey(deps.itemId), render),
-        subscribeTvKey(volumeKey(deps.itemId), render),
-        subscribeTvKey(powerKey(deps.itemId), render),
-      ];
-      unsubscribe = () => { for (const s of subs) s(); };
-      // The clock and countdown move without a doc write.
-      clockTimer = window.setInterval(render, 1000);
-      render();
-      // By keyboard (the phone app's traversal, wireTvNav): Tab is the
-      // phone's toggle and never reaches this panel, so ↑/↓ step through
-      // POWER, VOLUME, WATCH and the remote's buttons, Enter and Space press
-      // them, and focus lands on the first control as the panel opens —
-      // Escape steps back from the set as before (deviceFocus). Mounted is
-      // on screen: the overlay is in front of the player while it exists.
-      wireTvNav(panel, () => true);
-      const first = [...panel.querySelectorAll<HTMLElement>(NAV_STOPS)].find((el) => el.offsetParent !== null);
-      (first ?? panel).focus({ preventScroll: true });
-    },
-    unmount(): void {
-      unsubscribe?.();
-      unsubscribe = null;
-      window.clearInterval(clockTimer);
-      panel?.remove();
-      panel = null;
-    },
-    update(): void { /* doc-driven */ },
-  };
-}
-
-// ── The remote: the phone's 📺 TV app ────────────────────────────────────────
+// ── The blaster: the phone's 📡 IR BLASTER ─────────────────────────────────
 
 export interface TvPhoneDeps {
   /** The room's TVs (smart-tv / tv-stand items) with a label each. */
   tvs: () => Array<{ id: string; label: string }>;
   myPub: () => string;
   myName: () => string;
-  roomPlayers: () => RoomPlayer[];
+  /** Put the set's picture up on it (one set's at a time per page). The
+   *  phone stays where it is. */
   openTheatre: (itemId: string) => void;
+  /** 🎯 AIM: the phone slides down to its tip and the next TV clicked is
+   *  the one the blaster drives (irBlaster.ts, main.ts). */
+  aim: () => void;
   /** Resolve an archive.org item to a playable file + title (the metadata
    *  API), or null when that is not possible here — the embed then plays. */
   resolveArchive?: (identifier: string) => Promise<{ file: string; title: string } | null>;
@@ -328,18 +141,22 @@ interface Tile {
   live: boolean;
 }
 
+/** What the blaster sends, lane by lane: what the link box takes (a
+ *  YouTube or archive.org link, a link to a file, a magnet), a FILE from
+ *  this computer, and KARAOKE to come. The set's home screen draws the
+ *  same shelf (furniture.ts TV_HOME_TILES). */
 const TILES: Tile[] = [
-  { key: 'youtube', icon: '▶️', label: 'YOUTUBE', lane: 'CONVENIENCE', hint: 'paste a watch / youtu.be / shorts link, or an 11-character id', live: true },
-  { key: 'archive', icon: '🏛️', label: 'ARCHIVE.ORG', lane: 'CONVENIENCE', hint: 'paste a details/ or download/ link — public-domain films', live: true },
-  { key: 'url', icon: '🔗', label: 'URL', lane: 'CONVENIENCE', hint: 'paste a direct link to an mp4 / webm', live: true },
-  { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'a video or audio file from this computer — your node hands it to the room, and each viewer presses FETCH (mp4 / webm play best)', live: true },
-  { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'paste a magnet or choose a .torrent file — your node shows what is in it, downloads the video you pick from the public swarm, then hands it to the room like a FILE (viewers never join the swarm)', live: true },
+  { key: 'youtube', icon: '▶️', label: 'YOUTUBE', lane: 'CONVENIENCE', hint: 'a watch / youtu.be / shorts link, or an 11-character id', live: true },
+  { key: 'archive', icon: '🏛️', label: 'ARCHIVE.ORG', lane: 'CONVENIENCE', hint: 'a details/ or download/ link — public-domain films', live: true },
+  { key: 'url', icon: '🔗', label: 'URL', lane: 'CONVENIENCE', hint: 'a direct link to an mp4 / webm', live: true },
+  { key: 'file', icon: '📁', label: 'FILE', lane: 'SOVEREIGN', hint: 'a video or audio file from this computer — your node hands it to the room, and every viewer gets it by itself (AUTO-FETCH, up to 2 GB) or with FETCH (mp4 / webm play best)', live: true },
+  { key: 'magnet', icon: '🧲', label: 'TORRENT', lane: 'PUBLIC SWARM', hint: 'SEND a magnet link above, or choose a .torrent file here — your node shows what is in it, downloads the video you pick from the public swarm, then hands it to the room like a FILE (viewers never join the swarm)', live: true },
   { key: 'karaoke', icon: '🎤', label: 'KARAOKE', lane: 'SOVEREIGN', hint: 'MP3+G, with the mic on the audio lane', live: false },
 ];
 
-/** The tiles this build offers (sovereignty.ts): the centralized lanes only
- *  with the convenience lanes on — and without them the URL tile is labelled
- *  for what it plays here, a file on the viewer's own origins. */
+/** What this build offers (sovereignty.ts): the centralized lanes only with
+ *  the convenience lanes on — and without them a URL is labelled for what
+ *  it plays here, a file on the viewer's own origins. */
 function visibleTiles(): Tile[] {
   // 📦 FILE needs the node's blob lane (blobLane.ts): a browser alone has
   // nowhere to put the file for the room to take it from.
@@ -351,25 +168,44 @@ function visibleTiles(): Tile[] {
       : t);
   if (convenienceLanesEnabled()) return tiles;
   return tiles.filter((t) => sourceKindAllowed(t.key)).map((t) => t.key === 'url'
-    ? { ...t, lane: 'SOVEREIGN', hint: `paste a link to an mp4 / webm on this station's node or your own origin — ${SERVERLESS_ONLY}` }
+    ? { ...t, lane: 'SOVEREIGN', hint: `a link to an mp4 / webm on this station's node or your own origin — ${SERVERLESS_ONLY}` }
     : t);
 }
 
-/** 📦 The file the FILE tile has chosen, kept across repaints (a file input
- *  cannot be given its selection back), until a PLAY or SCHEDULE takes it. */
+/** 📦 The file chosen to send, kept across repaints (a file input cannot be
+ *  given its selection back), until a SEND or a schedule takes it. */
 let pickedFile: File | null = null;
 
-/** The remote's last word (feedback), kept across repaints for a while: a
+/** The blaster's last word (feedback), kept across repaints for a while: a
  *  repaint rebuilds the line, and a press that also repaints (GET AGAIN, 🗑)
- *  must not lose what it said. */
+ *  must not lose what it said. Said on the line beside the press: under
+ *  the link box, the file, the torrent, the host's copies or the library. */
+type Feedback = 'link' | 'file' | 'torrent' | 'host' | 'library';
 const FEEDBACK_MS = 20_000;
-let feedbackNote = { text: '', at: 0 };
-function feedbackNow(): string {
-  return feedbackNote.text && Date.now() - feedbackNote.at < FEEDBACK_MS ? feedbackNote.text : '';
+let feedbackNote: { text: string; at: number; where: Feedback } = { text: '', at: 0, where: 'link' };
+function feedbackNow(where: Feedback): string {
+  return feedbackNote.where === where && feedbackNote.text && Date.now() - feedbackNote.at < FEEDBACK_MS ? feedbackNote.text : '';
+}
+function feedbackLine(where: Feedback): string {
+  return `<div data-tv-feedback="${where}" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;">${esc(feedbackNow(where))}</div>`;
 }
 
-/** 🧲 The .torrent file the TORRENT tile has chosen, kept like pickedFile
- *  until a START takes it; and the file picked from the node's list. */
+/** What a SEND or a schedule from the blaster puts on: the source, the box
+ *  text it was read from, a torrent's origin for GET AGAIN, and the
+ *  original this node lets go once the room plays its copy (tvShrink.ts). */
+interface Shared {
+  source: TvSource;
+  text: string;
+  torrent?: TvTorrentOrigin;
+  drop?: string;
+}
+
+/** The chosen FILE being got ready for the room (tvShrink.ts): a SEND
+ *  pressed again meanwhile waits for the same film. */
+let fileGettingReady: { got: Shared; room: string } | null = null;
+
+/** 🧲 The .torrent file chosen, kept like pickedFile until a START takes
+ *  it; and the file picked from the node's list. */
 let pickedTorrent: File | null = null;
 let torrentPick: { job: number; index: number } | null = null;
 
@@ -386,6 +222,10 @@ let libraryQuery = '';
 let libraryShown = LIBRARY_PAGE;
 /** The row whose 🗑 was pressed once: a second press lets the file go. */
 let forgetArmed = '';
+/** 🔗 The row whose SSF link is shown under it, and the link. */
+let linkShown: { key: string; text: string } | null = null;
+/** How often a SEND of an SSF link asks the node how its fetch goes. */
+const LINK_POLL_MS = 1_000;
 
 /** What a library row is: a file from a node, a torrent's file, or a link. */
 export function libraryKind(e: Pick<TvLibraryEntry, 'source' | 'torrent'>): Exclude<LibraryFilter, 'all'> {
@@ -419,11 +259,13 @@ export function agoText(at: number, now: number): string {
   return `${Math.floor(s / 86_400)} d ago`;
 }
 
-/** Where a library row's file would play from, for this holder now:
+/** Where a library row's file would play from, for this page now:
  *  'copy' — its sharer is gone, but a node here (the room's host, mostly)
- *  kept a copy. */
-type Whereabouts = 'mine' | 'lost' | 'theirs' | 'copy' | 'away' | 'unknown';
-function whereabouts(e: TvLibraryEntry): Whereabouts {
+ *  kept a copy; 'elsewhere' — no node here has it, but one met in this room
+ *  lately (its sharer, or one that kept a copy) said from wherever it is
+ *  online now that it does, and a FETCH reaches it there. */
+export type Whereabouts = 'mine' | 'lost' | 'theirs' | 'copy' | 'elsewhere' | 'away' | 'unknown';
+export function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (e.source.kind !== 'blob') return 'unknown';
   // Nothing is said before the node has answered (no node, or not yet).
   const reach = nodeReaches(e.source.provider);
@@ -432,17 +274,20 @@ function whereabouts(e: TvLibraryEntry): Whereabouts {
   if (holds) return 'mine';
   const me = blobLaneNodeId();
   if (reach && e.source.provider !== me) return 'theirs';
-  if (copyHolder(e) !== null) return 'copy';
+  const copy = copyHolder(e);
+  if (copy !== null) return nodeReaches(copy) ? 'copy' : 'elsewhere';
   if (e.source.provider === me) return 'lost'; // names this node, which no longer holds it (let go, or made room)
   return 'away';
 }
 
-/** A connected node WHERE said holds the row's file whole, other than this
- *  one: the provider a PLAY from the library names when its sharer is gone. */
+/** A node WHERE said holds the row's file whole, other than this one, one
+ *  connected here first: the provider a PLAY from the library names when
+ *  its sharer is gone. */
 function copyHolder(e: TvLibraryEntry): string | null {
   if (e.source.kind !== 'blob') return null;
   const me = blobLaneNodeId();
-  return (nodeHolders(e.source.hash) ?? []).find((id) => id !== me) ?? null;
+  const ids = (nodeHolders(e.source.hash) ?? []).filter((id) => id !== me);
+  return ids.find((id) => nodeReaches(id) === true) ?? ids[0] ?? null;
 }
 
 /** The title a file's name gives the record: the name without its
@@ -456,7 +301,6 @@ const SCHEDULE_CHOICES: Array<{ label: string; minutes: number }> = [
 ];
 
 let phoneSubscribed = false;
-let activeTile = '';
 let phoneHtml = '';
 /** The deps of the latest renderTvPhoneApp call: the one subscribed paint
  *  reads these, so a view reopened with fresh deps repaints with them, not
@@ -592,7 +436,7 @@ function wireTvStick(host: HTMLElement): void {
 }
 
 /** Land keyboard focus in the app as it opens (main.ts): Tab cannot reach
- *  it, so the paste box when the remote is held, else the first control,
+ *  it, so the paste box, else the first control,
  *  takes focus here — or the view itself when there is none to take it. */
 export function focusTvApp(host: HTMLElement): void {
   wireTvNav(host);
@@ -601,12 +445,45 @@ export function focusTvApp(host: HTMLElement): void {
   (first ?? host).focus({ preventScroll: true });
 }
 
-/** Render (and keep rendering) the TV app into its phone view. Called by
- *  main.ts when the view opens; the subscription repaints it while it is the
- *  active view. */
+/** The glow at the phone's tip on every press of a blaster key (data-ir),
+ *  by pointer or by Enter / Space alike. Wired once per host. */
+function wireIrGlow(host: HTMLElement): void {
+  if (host.dataset.tvIr) return;
+  host.dataset.tvIr = '1';
+  host.addEventListener('click', (e) => {
+    const key = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('[data-ir]');
+    if (key && !key.disabled) irBlink();
+  });
+}
+
+/** What the set asks of this viewer (tvTheatre's notice) in its slot on the
+ *  face aimed at that set: the theatre's own element, its buttons wired,
+ *  moved in after every rebuild and kept current by the theatre's tick. */
+let noticeUp = false;
+function placeNotice(host: HTMLElement): void {
+  const slot = host.querySelector<HTMLElement>('[data-tv-set-says]');
+  if (!slot) return;
+  const notice = tvTheatreNotice(slot.dataset.tvSetSays!);
+  if (notice && notice.parentElement !== slot) slot.replaceChildren(notice);
+  else if (!notice && slot.childElementCount) slot.replaceChildren();
+  // Newly asked, it is brought into view: the player may have scrolled
+  // down to the library. Only then: a rebuild that moves it back in, or a
+  // fetch's progress, leaves the scroll where the player put it. Never on
+  // a phone put away (the view stays active there): scrolling an element
+  // off screen would scroll the page under the game. One asked while the
+  // phone is away is brought into view when it opens.
+  const onScreen = tvAppOnScreen(host);
+  if (notice && !noticeUp && onScreen) notice.scrollIntoView({ block: 'nearest' });
+  noticeUp = notice !== null && (noticeUp || onScreen);
+}
+
+/** Render (and keep rendering) the blaster into its phone view. Called by
+ *  main.ts when the view opens; the subscriptions repaint it while it is
+ *  the active view. */
 export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
   wireTvNav(host);
   wireTvStick(host);
+  wireIrGlow(host);
   phoneDeps = deps;
   const paint = () => {
     if (!host.classList.contains('active')) return;
@@ -621,8 +498,8 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       // heartbeat — and when that control is gone, the view itself keeps
       // the focus, so ↑/↓ still work), and what they have PASTED — whether
       // or not the box has focus: a link pasted, then the finger moved to
-      // PLAY or a tile, must not be wiped by a heartbeat or a power write
-      // in between (it is cleared by a PLAY or SCHEDULE that took it). The
+      // SEND, must not be wiped by a heartbeat or a power write in between
+      // (it is cleared by a SEND or a schedule that took it). The
       // caret is restored only when the box itself had the focus.
       const active = document.activeElement;
       const inside = active instanceof HTMLElement && host.contains(active) ? active : null;
@@ -639,148 +516,219 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
       host.innerHTML = html;
       phoneHtml = html;
       wireTvApp(host, d);
+      placeNotice(host);
       const pasteAgain = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
       if (draft && pasteAgain) pasteAgain.value = draft.value;
       if (inside) {
+        // A greyed-out key takes no focus (the browser would drop it to the
+        // page, and ↑/↓ would stop here). An arrow greyed out by its own
+        // move, at the edge of the set's menu, hands it to OK beside it;
+        // anything else gone or greyed out, to the view.
+        const live = (el: HTMLElement | null) => (el && !el.matches(':disabled') ? el : null);
         const again = focusKey ? host.querySelector<HTMLElement>(focusKey) : null;
-        (again ?? host).focus({ preventScroll: true });
-        if (draft?.focused && again === pasteAgain && pasteAgain) {
+        const target = live(again) ?? (again?.closest('.ir-pad') ? live(host.querySelector<HTMLElement>('.ir-pad .ir-ok')) : null) ?? host;
+        target.focus({ preventScroll: true });
+        if (draft?.focused && target === pasteAgain && pasteAgain) {
           try { pasteAgain.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
         }
-        if (searching && again instanceof HTMLInputElement) {
-          try { again.setSelectionRange(searching.start, searching.end); } catch { /* not selectable */ }
+        if (searching && target instanceof HTMLInputElement) {
+          try { target.setSelectionRange(searching.start, searching.end); } catch { /* not selectable */ }
         }
       }
     }
+    placeNotice(host);
     refreshStatus(host);
-    syncVolumeSliders(host);
   };
-  // One subscription and one clock for the life of the page: the view
-  // element is the same on every open (main.ts's #phone-app-tv), and the
-  // paint reads the latest deps through phoneDeps.
+  // One set of subscriptions and one clock for the life of the page: the
+  // view element is the same on every open (main.ts's #phone-app-tv), and
+  // the paint reads the latest deps through phoneDeps. The theatre's: its
+  // notice comes and goes, and the picture moves between sets.
   if (!phoneSubscribed) {
     phoneSubscribed = true;
     subscribeTv(paint);
+    subscribeTvTheatre(paint);
     window.setInterval(paint, 1000);
   }
   paint();
 }
 
-/** The set whose remote the phone shows when it holds more than one (a
- *  pick-up, a hand-over received, USE THIS REMOTE on another held set). */
-let selectedTvId = '';
-export function selectTvRemote(itemId: string): void {
-  selectedTvId = itemId;
+/** The set the blaster is aimed at, of the room's (a TV clicked, 📡 AIM on
+ *  a row); with one set in the room, that one, aimed or not. */
+let aimedTvId = '';
+export function aimTvRemote(itemId: string): void {
+  aimedTvId = itemId;
+}
+
+/** Whether the set has something on: aiming at it puts its picture up. */
+export function tvHasSomethingOn(itemId: string): boolean {
+  const rec = readTv(itemId);
+  return rec.source !== null && rec.state !== 'off' && rec.state !== 'home';
 }
 
 function renderTvApp(deps: TvPhoneDeps): string {
   const tvs = deps.tvs();
   if (tvs.length === 0) {
     return `<div class="phone-access-section">
-      <div class="phone-access-header">📺 TV REMOTE</div>
-      <div class="phone-access-note">No TV in this room. The DEV menu's FURNITURE list spawns a wall TV or a TV on a stand.</div>
+      <div class="phone-access-header">📡 IR BLASTER</div>
+      <div class="phone-access-note">No TV in this room to aim at. The DEV menu's FURNITURE list spawns a wall TV or a TV on a stand.</div>
     </div>`;
   }
   const me = deps.myPub();
-  // The remote on show: the one this phone chose, else the first held, else
-  // the first set. A second held remote is a row below with USE.
-  const heldAll = tvs.filter((t) => iHoldRemote(t.id));
-  const current = heldAll.find((t) => t.id === selectedTvId) ?? heldAll[0]
-    ?? tvs.find((t) => t.id === selectedTvId) ?? tvs[0]!;
-  const others = tvs.filter((t) => t.id !== current.id);
-  return `
-    ${renderRemoteSection(current, deps, me)}
-    ${others.length ? `<div class="phone-access-section">
-      <div class="phone-access-header">OTHER TVS IN THE ROOM</div>
-      ${others.map((t) => `<div class="phone-access-room-row"><span class="phone-access-room-label">${esc(t.label)}:</span>${statusSpan(t.id, STATUS_ROW_STYLE)}${smallButton(`data-tv-watch="${esc(t.id)}"`, '▶')}${iHoldRemote(t.id) ? smallButton(`data-tv-select="${esc(t.id)}"`, '🎛 USE') : mayPickUpRemote(t.id) ? smallButton(`data-tv-pickup="${esc(t.id)}"`, '🎛') : ''}</div>`).join('')}
-    </div>` : ''}
-  `;
+  const aimed = tvs.find((t) => t.id === aimedTvId) ?? (tvs.length === 1 ? tvs[0]! : null);
+  const others = tvs.filter((t) => t.id !== aimed?.id);
+  const rows = others.length ? `<div class="phone-access-section">
+      <div class="phone-access-header">${aimed ? 'OTHER TVS IN THE ROOM' : 'TVS IN THE ROOM'}</div>
+      ${others.map((t) => `<div class="phone-access-room-row"><span class="phone-access-room-label">${esc(t.label)}:</span>${statusSpan(t.id, STATUS_ROW_STYLE)}${smallButton(`data-tv-point="${esc(t.id)}" data-ir="1" title="Aim the blaster at ${esc(t.label)}"`, '📡 AIM')}</div>`).join('')}
+    </div>` : '';
+  if (!aimed) {
+    return `<div class="phone-access-section">
+      <div class="phone-access-header">📡 IR BLASTER · NOT AIMED</div>
+      <div class="phone-access-note">Press 🎯 AIM, then click a TV in the room, or aim at one below.</div>
+      <div style="display:flex; gap:6px;">${smallButton('data-tv-aim="1" title="The phone slides down: click a TV"', '🎯 AIM')}</div>
+    </div>${rows}`;
+  }
+  return `${blasterFace(aimed, me)}${rows}${fileBlock(aimed.id)}${torrentSection(aimed.id)}${hostCopiesBlock()}${libraryBlock(aimed.id, readTv(aimed.id).history)}`;
 }
 
-function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDeps, me: string): string {
+/** A key on the blaster: every press glows at the phone's tip (data-ir). */
+function irKey(attr: string, label: string, enabled = true, place = ''): string {
+  return `<button type="button" class="ir-key${place ? ` ${place}` : ''}" ${attr} data-ir="1" ${enabled ? '' : 'disabled'}>${label}</button>`;
+}
+
+/** The schedule chips for what `from` sends: a movie night N minutes out. */
+function scheduleKeys(id: string, from: Feedback, enabled = true): string {
+  return SCHEDULE_CHOICES.map((c) => irKey(`data-tv-schedule="${c.minutes}" data-tv-from="${from}" data-tv-id="${id}" title="Put it on in ${c.minutes} minutes, with a countdown on the set"`, `🕒 ${c.label}`, enabled)).join('');
+}
+
+/** The blaster aimed at a set: what is on, what the set asks, the keys, and
+ *  the link box. A start-only source (archive.org's own player) offers no
+ *  transport, and a mounted player that cannot seek (a live stream) no
+ *  ±10 s: a target the clock's page cannot apply would only be beaten back
+ *  over. */
+function blasterFace(tv: { id: string; label: string }, me: string): string {
   const rec = readTv(tv.id);
-  const mine = iHoldRemote(tv.id);
-  const owner = holdsSpareRemote();
   const pb = readPlayback(tv.id);
-  const head = `<div class="phone-access-section">
-    <div class="phone-access-header">📺 ${esc(tv.label)} — REMOTE</div>
-    <div class="phone-access-room-row"><span class="phone-access-room-label">ON:</span>${statusSpan(tv.id, STATUS_ROW_STYLE)}</div>
-    <div style="font-size:10px; color:${GOLD_BRIGHT};">${remoteLine(tv.id, me)}</div>
-    <div style="display:flex; gap:6px; flex-wrap:wrap;">
-      ${smallButton(`data-tv-watch="${esc(tv.id)}"`, '▶ WATCH', rec.state !== 'off')}
-      ${smallButton(`data-tv-power="${esc(tv.id)}"`, rec.state === 'off' ? '⏻ ON' : '⏻ OFF')}
-      ${!mine && mayPickUpRemote(tv.id) ? smallButton(`data-tv-pickup="${esc(tv.id)}"`, '🎛 PICK UP') : ''}
-      ${mine ? smallButton(`data-tv-putdown="${esc(tv.id)}"`, '🪑 PUT DOWN') : ''}
-      ${!mine && owner && readRemote(tv.id).holder ? smallButton(`data-tv-putdown="${esc(tv.id)}"`, '🪑 TAKE BACK (OWNER)') : ''}
-    </div>
-  </div>`;
-  const hostBlock = hostCopiesBlock();
-  if (!mine) {
-    return `${head}${hostBlock}<div class="phone-access-section">
-      <div class="phone-access-note">Pick up the remote to choose what plays. Anyone standing at the set can press its power and volume buttons.</div>
-    </div>`;
-  }
-  const offered = visibleTiles();
-  if (!offered.some((t) => t.key === activeTile)) activeTile = offered[0]!.key;
-  const tiles = offered.map((t) => {
-    const on = t.key === activeTile;
-    return `<button type="button" data-tv-tile="${t.key}" ${t.live ? '' : 'disabled'} title="${esc(t.hint)}" style="
-      display:flex; flex-direction:column; align-items:center; gap:3px; padding:8px 4px;
-      background:${on ? 'rgba(0,229,255,0.12)' : 'rgba(10,14,34,0.9)'}; border:1px solid ${on ? CYAN : 'rgba(212,168,75,0.18)'};
-      border-radius:10px; color:${t.live ? GOLD_BRIGHT : DIM}; font-family:inherit; font-size:8.5px; font-weight:800; cursor:${t.live ? 'pointer' : 'default'};">
-      <span style="font-size:16px;">${t.icon}</span><span>${t.label}</span>${laneBadge(t.lane)}${t.live ? '' : `<span style="font-size:7px; color:${DIM};">${t.key === 'file' || t.key === 'magnet' ? 'NEEDS YOUR NODE' : 'NOT YET PROVISIONED'}</span>`}
-    </button>`;
-  }).join('');
-  const tile = offered.find((t) => t.key === activeTile) ?? offered[0]!;
-  // A start-only source (archive.org's own player) offers no transport, and
-  // a mounted player that cannot seek (a live stream) offers no ±10 s: a
-  // target the holder cannot apply would only be beaten back over.
+  const id = esc(tv.id);
+  const on = rec.state !== 'off';
+  const showing = tvHasSomethingOn(tv.id);
   const startOnly = rec.source ? isStartOnly(rec.source) : false;
   const seekable = !startOnly && (tvPlayerCanSeek(tv.id) ?? true);
-  const transport = rec.source && rec.state !== 'off' && rec.state !== 'home'
-    ? `<div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-        ${!startOnly && pb.state === 'playing' ? smallButton(`data-tv-pause="${esc(tv.id)}"`, '⏸') : ''}
-        ${!startOnly && pb.state === 'paused' ? smallButton(`data-tv-resume="${esc(tv.id)}"`, '▶') : ''}
-        ${seekable && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
-        ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek or volume from here</span>` : ''}
-        ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
-        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
-      </div>`
-    : '';
-  const library = libraryBlock(tv.id, rec.history);
-  return `${head}
-    <div class="phone-access-section">
-      <div class="phone-access-header">SOURCES</div>
-      <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px;">${tiles}</div>
-      <div class="phone-access-note">${esc(tile.hint)}</div>
-      ${tile.key === 'file'
-        ? `<input type="file" data-tv-file="1" accept="video/*,audio/*" aria-label="Choose a file">
-           <div style="font-size:9.5px; color:${GOLD_BRIGHT};">${pickedFile ? `CHOSEN: ${esc(pickedFile.name)} · ${esc(formatBytes(pickedFile.size))}` : 'no file chosen yet'}</div>`
-        : `<input type="text" data-tv-paste="1" placeholder="${esc(tile.key === 'youtube' ? 'https://www.youtube.com/watch?v=…' : tile.key === 'archive' ? 'https://archive.org/details/…' : tile.key === 'magnet' ? 'magnet:?xt=urn:btih:…' : 'https://…/film.mp4')}" autocomplete="off" aria-label="${tile.key === 'magnet' ? 'Paste a magnet link' : 'Paste a link'}">`}
-      ${tile.key === 'magnet' ? torrentBlock() : ''}
-      <div style="display:flex; gap:6px; flex-wrap:wrap;">
-        ${smallButton(`data-tv-play="${esc(tv.id)}"`, '▶ PLAY NOW')}
-        ${SCHEDULE_CHOICES.map((c) => smallButton(`data-tv-schedule="${c.minutes}" data-tv-id="${esc(tv.id)}"`, `🕒 ${c.label}`)).join('')}
-      </div>
-      <div id="tv-app-feedback" style="font-size:9.5px; color:rgba(212,168,75,0.8); min-height:12px; line-height:1.4;">${esc(feedbackNow())}</div>
-      ${transport}
+  const moving = pb.state === 'playing' || pb.state === 'paused';
+  const canSeek = showing && seekable && moving;
+  const canPause = showing && !startOnly && moving;
+  const canVolume = on && !startOnly;
+  const lane = showing && rec.source ? laneBadge(sourceLane(rec.source)) : '';
+  // 📺 LOOK: only a film the set's own screen draws (an embed's frame lies
+  // over the set, out of the CRT pass's reach).
+  const looks = showing && rec.source !== null && rec.source.kind !== 'youtube' && !startOnly;
+  // The set's own menu, when it is up (stopped or paused): the arrows move
+  // its highlight for the whole room, and OK picks what is under it.
+  const menu = on ? tvMenu(tv.id) : null;
+  const step = (dir: TvMenuDir) => menu !== null && tvMenuStep(menu, dir) !== null;
+  const takes = [
+    ...visibleTiles().filter((t) => t.live && t.key !== 'file').map((t) => ({ icon: t.icon, label: t.label, lane: t.lane })),
+    // 🔗 An SSF link: fetched by this page's node, so only with one.
+    ...(blobLaneReady() ? [{ icon: '🔗', label: 'SSF LINK', lane: 'SOVEREIGN' }] : []),
+  ].map((t) => `<span style="white-space:nowrap;">${t.icon} ${esc(t.label)} ${laneBadge(t.lane)}</span>`).join(' ');
+  return `<div class="phone-access-section ir-face">
+    <div class="phone-access-header" style="display:flex; gap:6px; align-items:center;">
+      <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📡 AIMED AT: ${esc(tv.label)}</span>
+      ${smallButton('data-tv-aim="1" title="Aim at another TV: the phone slides down, then click one"', '🎯 AIM')}
     </div>
-    ${hostBlock}
-    ${library}
-    <div class="phone-access-section">
-      <div class="phone-access-header">HAND THE REMOTE TO…</div>
-      ${handToBlock(deps, tv.id)}
-    </div>`;
+    <div class="phone-access-room-row"><span class="phone-access-room-label">ON:</span>${statusSpan(tv.id, STATUS_ROW_STYLE)}${lane}</div>
+    <div style="font-size:10px; color:${GOLD_BRIGHT};">${lastPressLine(tv.id, me)}</div>
+    <div data-tv-set-says="${id}"></div>
+    <div class="ir-keys">
+      <div class="ir-row">
+        ${irKey(`data-tv-power="${id}" title="${on ? 'Turn the set off' : 'Turn the set on'}"`, on ? '⏻ OFF' : '⏻ ON')}
+        ${startOnly ? '<span class="ir-note">volume: in archive.org\'s player</span>' : `${irKey(`data-tv-vol="-10" data-tv-id="${id}" title="Volume down"`, '🔉', canVolume)}
+          <span class="ir-level">${rec.volume}%</span>
+          ${irKey(`data-tv-vol="10" data-tv-id="${id}" title="Volume up"`, '🔊', canVolume)}`}
+      </div>
+      ${menu ? `<div class="ir-note" aria-live="polite">ON THE SET: <b style="color:${GOLD_BRIGHT};">${esc(tvMenuCellAt(menu).label)}</b></div>` : ''}
+      <div class="ir-pad" role="group" aria-label="D-pad">
+        ${menu ? `${irKey(`data-tv-pad="up" data-tv-id="${id}" title="Up on the set's menu"`, '▲', step('up'), 'ir-up')}
+        ${irKey(`data-tv-pad="left" data-tv-id="${id}" title="Left on the set's menu"`, '◀', step('left'), 'ir-left')}
+        ${irKey(`data-tv-pad="ok" data-tv-id="${id}" title="Pick ${esc(tvMenuCellAt(menu).label)}"`, 'OK', true, 'ir-ok')}
+        ${irKey(`data-tv-pad="right" data-tv-id="${id}" title="Right on the set's menu"`, '▶', step('right'), 'ir-right')}
+        ${irKey(`data-tv-pad="down" data-tv-id="${id}" title="Down on the set's menu"`, '▼', step('down'), 'ir-down')}`
+        : `${irKey(`data-tv-pad="up" data-tv-id="${id}" title="Volume up"`, '▲', canVolume, 'ir-up')}
+        ${irKey(`data-tv-pad="left" data-tv-id="${id}" title="Back 10 seconds"`, '◀', canSeek, 'ir-left')}
+        ${irKey(`data-tv-pad="ok" data-tv-id="${id}" title="Play or pause"`, 'OK', canPause, 'ir-ok')}
+        ${irKey(`data-tv-pad="right" data-tv-id="${id}" title="On 10 seconds"`, '▶', canSeek, 'ir-right')}
+        ${irKey(`data-tv-pad="down" data-tv-id="${id}" title="Volume down"`, '▼', canVolume, 'ir-down')}`}
+      </div>
+      <div class="ir-note">${menu ? '▲ ▼ ◀ ▶ MOVE ON THE SET · OK PICKS' : '◀ ▶ 10 S · ▲ ▼ VOLUME · OK PLAY / PAUSE'}</div>
+      <div class="ir-row">
+        ${irKey(`data-tv-play-pause="${id}" title="${pb.state === 'paused' ? 'Play' : 'Pause'}"`, pb.state === 'paused' ? '▶ PLAY' : '⏸ PAUSE', canPause)}
+        ${irKey(`data-tv-stop="${id}" title="Back to the home screen"`, '⏹ STOP', showing)}
+        ${startOnly ? '' : irKey(`data-tv-loop="${id}" aria-pressed="${rec.loop}" title="At the end, start the film over (stays on for the next one)"`, rec.loop ? '🔁 LOOP: ON' : '🔁 LOOP: OFF')}
+        ${looks ? irKey(`data-tv-look="${id}" aria-pressed="${readCrt(tv.id)}" title="The set's picture for the room: the arcade's CRT look, or the film as it is"`, readCrt(tv.id) ? '📺 LOOK: CRT' : '📺 LOOK: CLEAN') : ''}
+        ${showing && rec.source?.kind === 'blob' ? irKey(`data-tv-autofetch="1" aria-pressed="${autoFetchOn()}" title="Your own switch: take a file shown on a TV without a press, up to ${esc(formatBytes(TV_AUTO_FETCH_MAX))} a file and ${esc(formatBytes(TV_AUTO_FETCH_DAY))} a day"`, autoFetchOn() ? '📦 AUTO-FETCH: ON' : '📦 AUTO-FETCH: OFF') : ''}
+        ${startOnly && showing ? irKey(`data-tv-reload="${id}" title="archive.org's player did not load? Reload it"`, '↻ RELOAD') : ''}
+        ${startOnly && showing ? irKey(`data-tv-embed-keys="${id}" title="Into archive.org's player, for its volume and controls: Tab moves through them, and Tab past the last comes back here"`, '🎛 ITS CONTROLS') : ''}
+      </div>
+    </div>
+    <div class="phone-access-header" style="margin-top:4px;">SEND TO THE SET</div>
+    <input type="text" data-tv-paste="1" placeholder="a web address, a magnet or an SSF link" autocomplete="off" aria-label="A web address, a magnet link or an SSF link to send to the set">
+    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+      ${irKey(`data-tv-send="${id}" title="Put it on the set now"`, '📡 SEND')}
+      ${scheduleKeys(id, 'link')}
+    </div>
+    <div class="phone-access-note">${takes}</div>
+    ${feedbackLine('link')}
+  </div>`;
 }
 
-/** 🧲 The TORRENT tile's own controls: the notice, a .torrent picker, START
- *  / STOP, the file list to confirm, and the node's progress (kept current
- *  by `pollTorrent` without a repaint). */
+/** 📁 A file from this computer, through this station's node. */
+function fileBlock(tvId: string): string {
+  const tile = visibleTiles().find((t) => t.key === 'file');
+  if (!tile) return '';
+  const id = esc(tvId);
+  return `<div class="phone-access-section">
+    <div class="phone-access-header">📁 A FILE FROM THIS COMPUTER ${laneBadge(tile.lane)}</div>
+    <div class="phone-access-note">${esc(tile.hint)}</div>
+    ${tile.live ? `<input type="file" data-tv-file="1" accept="video/*,audio/*" aria-label="Choose a file">
+      <div style="font-size:9.5px; color:${GOLD_BRIGHT};">${pickedFile ? `CHOSEN: ${esc(pickedFile.name)} · ${esc(formatBytes(pickedFile.size))}` : 'no file chosen yet'}</div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        ${irKey(`data-tv-send-file="${id}" title="Put it on the set now"`, '📡 SEND FILE')}
+        ${scheduleKeys(id, 'file')}
+      </div>
+      ${feedbackLine('file')}` : ''}
+  </div>`;
+}
+
+/** 🧲 A torrent: SEND a magnet above, or a .torrent file here; its list, its
+ *  download, and SEND DOWNLOAD once the file is whole. */
+function torrentSection(tvId: string): string {
+  const tile = visibleTiles().find((t) => t.key === 'magnet');
+  if (!tile) return '';
+  const head = `<div class="phone-access-header">🧲 TORRENT ${laneBadge(tile.lane)}</div>
+    <div class="phone-access-note">${esc(tile.hint)}</div>`;
+  if (!tile.live) return `<div class="phone-access-section">${head}</div>`;
+  const id = esc(tvId);
+  const done = torrentSource() !== null;
+  return `<div class="phone-access-section">
+    ${head}
+    ${torrentBlock()}
+    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+      ${irKey(`data-tv-send-torrent="${id}" title="Put the downloaded file on the set now"`, '📡 SEND DOWNLOAD', done)}
+      ${scheduleKeys(id, 'torrent', done)}
+    </div>
+    ${feedbackLine('torrent')}
+  </div>`;
+}
+
+/** 🧲 The torrent's own controls: the notice, a .torrent picker, START /
+ *  STOP, the file list to confirm, and the node's progress (kept current
+ *  by `pollTorrent` without a repaint, while the node is at it). */
 function torrentBlock(): string {
   const st = torrentState();
   const running = torrentRunning(st);
   const notice = `<div class="phone-access-note" style="color:${GOLD};">⚠️ BitTorrent shares pieces of the file with other people while it downloads, from this computer's internet address, and stops when the file is whole. Use only what you may share — openly licensed films like Sintel or Big Buck Bunny.</div>`;
-  const status = `<div data-tv-torrent-status="1" style="font-size:9.5px; color:${GOLD_BRIGHT}; min-height:12px; line-height:1.4;">${esc(torrentLine(st, formatBytes))}</div>`;
+  // Polled while the node is at it (or not asked yet), else said once.
+  const watched = running || st.state === 'unknown';
+  const status = `<div ${watched ? 'data-tv-torrent-status="1"' : ''} style="font-size:9.5px; color:${GOLD_BRIGHT}; min-height:12px; line-height:1.4;">${esc(torrentLine(st, formatBytes))}</div>`;
   if (st.state === 'ready') {
     // LOOK BEFORE YOU DOWNLOAD: the torrent's own names and sizes.
     const chosen = torrentPick?.job === st.job && st.files.some((f) => f.index === torrentPick!.index) ? torrentPick.index : st.pick;
@@ -801,18 +749,18 @@ function torrentBlock(): string {
   }
   return `${notice}
     ${running ? '' : `<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; font-size:9.5px; color:${GOLD};">
-      <span>or a .torrent file:</span>
+      <span>a .torrent file:</span>
       <input type="file" data-tv-torrent-file="1" accept=".torrent,application/x-bittorrent" aria-label="Choose a .torrent file" style="max-width:170px;">
     </div>
     ${pickedTorrent ? `<div style="font-size:9.5px; color:${GOLD_BRIGHT};">CHOSEN: ${esc(pickedTorrent.name)} — 🧲 START reads it (its tracker list is dropped)</div>` : ''}`}
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
-      ${running ? smallButton('data-tv-torrent-stop="1"', '⏹ STOP DOWNLOAD') : smallButton('data-tv-torrent-start="1"', '🧲 START')}
+      ${running ? smallButton('data-tv-torrent-stop="1"', '⏹ STOP DOWNLOAD') : pickedTorrent ? smallButton('data-tv-torrent-start="1"', '🧲 START') : ''}
     </div>
     ${status}`;
 }
 
 /** 🏠 This node hosts the room: whether it keeps copies of what is played
- *  here, and the switch. Shown whoever holds the remote, and before the
+ *  here, and the switch. Shown to anyone aiming here, and before the
  *  library has its first row (copies are on from the moment the room is). */
 function hostCopiesBlock(): string {
   void refreshHeldBlobs(); // at most every few seconds; the next paint shows it
@@ -825,6 +773,7 @@ function hostCopiesBlock(): string {
         : '🏠 You host this room. Your node keeps no copies of what is played here, so a file goes when whoever shared it leaves.'}</span>
       ${smallButton(`data-tv-host-copies="${hostCopies.on ? '0' : '1'}" title="${hostCopies.on ? 'Stop keeping copies' : 'Keep copies of what is played here'}"`, hostCopies.on ? '🏠 COPIES ON' : '🏠 COPIES OFF')}
     </div>
+    ${feedbackLine('host')}
   </div>`;
 }
 
@@ -857,24 +806,43 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     const whereText = where === 'mine' ? `<span style="color:${GREEN};">ON YOUR NODE</span>`
       : where === 'theirs' ? `<span style="color:${CYAN};">ITS NODE IS HERE</span>`
       : where === 'copy' ? `<span style="color:${CYAN};">A COPY IS ON A NODE HERE</span>`
+      : where === 'elsewhere' ? `<span style="color:${CYAN};">${e.source.kind === 'blob' && copyHolder(e) === e.source.provider ? 'ITS NODE IS ONLINE ELSEWHERE' : 'A COPY IS ONLINE ELSEWHERE'}</span>`
       : where === 'away' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'AWAY — GET IT AGAIN' : 'ITS NODE IS AWAY'}</span>`
-      : where === 'lost' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'GONE FROM YOUR NODE — GET IT AGAIN' : 'GONE FROM YOUR NODE — CHOOSE IT AGAIN ON 📁 FILE'}</span>`
+      : where === 'lost' ? `<span style="color:${WARN};">${kind === 'torrents' ? 'GONE FROM YOUR NODE — GET IT AGAIN' : 'GONE FROM YOUR NODE — SEND IT AGAIN FROM 📁 A FILE'}</span>`
       : '';
-    const again = e.torrent && canAgain && where !== 'mine' && where !== 'copy'
+    const again = e.torrent && canAgain && where !== 'mine' && where !== 'copy' && where !== 'elsewhere'
       ? smallButton(`data-tv-lib-again="${id}" data-tv-id="${esc(tvId)}"`, '🧲 GET AGAIN')
       : '';
     const forget = where === 'mine'
-      ? smallButton(`data-tv-lib-forget="${id}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
+      ? smallButton(`data-tv-lib-forget="${id}" data-tv-id="${esc(tvId)}" title="Let your node's copy go (the library keeps the entry)"`, forgetArmed === sourceId(e.source) ? '🗑 REMOVE?' : '🗑')
       : '';
+    // 🔗 A file on this node can go out by an SSF link: whoever pastes it
+    // gets the file from this node, from any room.
+    const shares = e.source.kind === 'blob' && where === 'mine' ? nodeShares(e.source.hash) : null;
+    const link = e.source.kind === 'blob' && where === 'mine'
+      ? smallButton(`data-tv-lib-link="${id}" data-tv-id="${esc(tvId)}" title="${shares ? 'Show its SSF link again' : 'Share it by an SSF link: whoever pastes it gets the file from your node, in any room'}"`, '🔗 SSF LINK')
+      : '';
+    const sharedText = shares ? ` · <span style="color:${GREEN};">🔗 SHARED BY LINK</span>` : '';
+    const linkPanel = linkShown && linkShown.key === sourceId(e.source) && shares ? `<div style="display:flex; flex-direction:column; gap:3px; padding:2px 0;">
+        <input type="text" readonly data-tv-lib-link-text="1" value="${esc(linkShown.text)}" aria-label="The file's SSF link">
+        <div style="font-size:8.5px; color:${DIM};">Whoever pastes this in their IR blaster's box and presses 📡 SEND gets the file from your node, every byte checked against its hash, in any room, while your node is online. Until you stop sharing it, your node gives this file to any node that asks with the link, and that node sees your node's address, as a room's members do.</div>
+        <div style="display:flex; gap:4px; flex-wrap:wrap;">
+          ${smallButton('data-tv-lib-link-copy="1"', '📋 COPY')}
+          ${smallButton(`data-tv-lib-unshare="${id}" data-tv-id="${esc(tvId)}" title="Your node gives this file to no one by its link from now on"`, '⏹ STOP SHARING')}
+          ${smallButton('data-tv-lib-link-hide="1"', 'HIDE')}
+        </div>
+      </div>` : '';
     return `<div style="display:flex; flex-direction:column; gap:2px; padding:4px 0; border-top:1px solid rgba(212,168,75,0.1);">
       <div class="phone-access-room-row">
         <span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" title="${esc(e.title)}">${icon} ${esc(e.title)}</span>
         ${refused ? `<span style="font-size:7px; color:${DIM}; font-weight:800;" title="${esc(refused)}">OFF HERE</span>` : ''}
         ${again}
+        ${link}
         ${forget}
         ${smallButton(`data-tv-lib-play="${id}" data-tv-id="${esc(tvId)}"`, '▶')}
       </div>
-      <div style="font-size:8.5px; color:${DIM};">${esc(sourceLane(e.source))}${esc(size)} · ${e.plays > 1 ? `played ${e.plays}× · ` : ''}${esc(agoText(e.playedAt, wall))}${whereText ? ' · ' : ''}${whereText}</div>
+      <div style="font-size:8.5px; color:${DIM};">${esc(sourceLane(e.source))}${esc(size)} · ${e.plays > 1 ? `played ${e.plays}× · ` : ''}${esc(agoText(e.playedAt, wall))}${whereText ? ' · ' : ''}${whereText}${sharedText}</div>
+      ${linkPanel}
     </div>`;
   }).join('');
   const chips = LIBRARY_FILTERS.map((f) => {
@@ -892,15 +860,16 @@ function libraryBlock(tvId: string, history: TvHistoryEntry[]): string {
     ${spaceLine}
     <div style="display:flex; gap:4px; flex-wrap:wrap;">${chips}</div>
     <input type="text" data-tv-lib-search="1" value="${esc(libraryQuery)}" placeholder="find in the library" autocomplete="off" aria-label="Find in the library">
+    ${feedbackLine('library')}
     ${list || `<div class="phone-access-note">Nothing here matches.</div>`}
     ${rows.length > shown.length ? smallButton('data-tv-lib-more="1"', `SHOW MORE (${rows.length - shown.length})`) : ''}
   </div>`;
 }
 
-/** While a TORRENT tile is on screen, ask the node once a second and write
- *  the line in place; repaint when the torrent moves to another state (the
- *  file list arrives, the download starts, the file is whole). Stops
- *  itself once no tile is showing. */
+/** While the node is at a torrent (or has not said yet), ask it once a
+ *  second and write the line in place; repaint when the torrent moves to
+ *  another state (the file list arrives, the download starts, the file is
+ *  whole). Stops itself once no line is watched. */
 let torrentPoll: ReturnType<typeof setInterval> | null = null;
 function pollTorrent(host: HTMLElement, deps: TvPhoneDeps): void {
   if (torrentPoll) return;
@@ -952,75 +921,155 @@ export function playRefusal(source: TvSource): string | null {
 let resolveGen = 0;
 
 function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
-  const feedback = (text: string) => {
-    feedbackNote = { text, at: Date.now() };
-    const el = host.querySelector<HTMLElement>('#tv-app-feedback');
-    if (el) el.textContent = text;
+  const feedback = (text: string, where: Feedback) => {
+    feedbackNote = { text, at: Date.now(), where };
+    host.querySelectorAll<HTMLElement>('[data-tv-feedback]').forEach((el) => {
+      el.textContent = el.dataset.tvFeedback === where ? text : '';
+    });
   };
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-watch]').forEach((b) => b.addEventListener('click', () => deps.openTheatre(b.dataset.tvWatch!)));
+  // 🎯 Aiming: by a click on the set (AIM, main.ts), or at a row here. A set
+  // that is on gets the picture as the blaster turns to it.
+  // Kept from the phone's own click handler (main.ts), which would read the
+  // phone slid away under the press as put away and bring it back up.
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-aim]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    deps.aim();
+  }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-point]').forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.tvPoint!;
+    aimTvRemote(id);
+    if (tvHasSomethingOn(id)) deps.openTheatre(id);
+    renderTvPhoneApp(host, deps);
+  }));
+
+  // ── The keys ──
+  // Where the clock's own player is, when one is mounted here: the record's
+  // estimate runs on while a player buffers, and a pause written from it
+  // would park the room past unplayed footage.
+  const pos = (id: string) => tvPlayerPositionMs(id) ?? readPlayback(id).positionMs;
+  const volume = (id: string, by: number) => { tvSetVolume(id, readTv(id).volume + by); };
+  const playPause = (id: string) => {
+    if (readPlayback(id).state === 'paused') tvResume(id);
+    else tvPause(id, pos(id));
+  };
   host.querySelectorAll<HTMLButtonElement>('[data-tv-power]').forEach((b) => b.addEventListener('click', () => { tvTogglePower(b.dataset.tvPower!); }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-pickup]').forEach((b) => b.addEventListener('click', () => {
-    const r = pickUpRemote(b.dataset.tvPickup!);
-    if (r.ok) selectedTvId = b.dataset.tvPickup!;
-    else feedback(r.error);
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-vol]').forEach((b) => b.addEventListener('click', () => { volume(b.dataset.tvId!, Number(b.dataset.tvVol)); }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-pad]').forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.tvId!;
+    // As the set is now, not as the face was drawn: a press elsewhere may
+    // have put a menu up, or taken it down, since.
+    const menu = tvMenu(id);
+    if (menu) {
+      if (b.dataset.tvPad === 'ok') pickOnSet(id, menu);
+      else tvMenuMove(id, b.dataset.tvPad as TvMenuDir);
+      return;
+    }
+    switch (b.dataset.tvPad) {
+      case 'up': volume(id, 10); break;
+      case 'down': volume(id, -10); break;
+      case 'left': tvSeek(id, Math.max(0, pos(id) - 10_000)); break;
+      case 'right': tvSeek(id, pos(id) + 10_000); break;
+      case 'ok': playPause(id); break;
+    }
   }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-select]').forEach((b) => b.addEventListener('click', () => {
-    selectedTvId = b.dataset.tvSelect!;
+  // ▶ PLAY / ⏸ PAUSE under the pad: that, with a menu up or not (OK picks
+  // the lit cell, which may be STOP).
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-play-pause]').forEach((b) => b.addEventListener('click', () => { playPause(b.dataset.tvPlayPause!); }));
+  /** OK on the set's menu: what the highlighted cell stands for. */
+  const pickOnSet = (id: string, menu: TvMenuView) => {
+    const at = menu.at;
+    if (at.startsWith('lib:')) {
+      const entry = libraryEntry(id, at.slice(4));
+      if (entry) playEntry(id, entry, 'link');
+      return;
+    }
+    if (at.startsWith('tile:')) {
+      readyFor(at.slice(5));
+      return;
+    }
+    switch (at as TvPausedCell) {
+      case 'play': tvResume(id); break;
+      case 'stop': tvStop(id); break;
+      case 'back':
+      case 'on':
+        if (tvPlayerCanSeek(id) === false) feedback('This stream cannot go back or on.', 'link');
+        else tvSeek(id, at === 'back' ? Math.max(0, pos(id) - 10_000) : pos(id) + 10_000);
+        break;
+      case 'start':
+        if (tvPlayerCanSeek(id) === false) feedback('This stream cannot go back to its start.', 'link');
+        else if (tvSeek(id, 0).ok) tvResume(id);
+        break;
+      case 'loop': tvSetLoop(id, !readTv(id).loop); break;
+    }
+  };
+  /** OK on a source tile: this blaster made ready for it, the link box (or
+   *  the file chooser, for FILE) and what it takes. Nothing is written: the
+   *  set stays as it is until a SEND. */
+  const readyFor = (kind: string) => {
+    const tile = visibleTiles().find((t) => t.key === kind);
+    if (!tile) return;
+    const chooser = kind === 'file' ? host.querySelector<HTMLInputElement>('[data-tv-file]') : null;
+    if (chooser) {
+      chooser.click();
+      return;
+    }
+    if (!tile.live || kind === 'file') {
+      feedback(`${tile.icon} ${tile.label} ${tile.hint}.`, 'link');
+      return;
+    }
+    const box = liveBox();
+    box?.focus({ preventScroll: true });
+    box?.scrollIntoView({ block: 'nearest' });
+    feedback(`${tile.icon} ${tile.label}: paste it in the box, then 📡 SEND (${kind === 'magnet' ? 'a magnet link' : tile.hint}).`, 'link');
+  };
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-stop]').forEach((b) => b.addEventListener('click', () => { tvStop(b.dataset.tvStop!); }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-loop]').forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.tvLoop!;
+    tvSetLoop(id, !readTv(id).loop);
+  }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-look]').forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.tvLook!;
+    tvSetCrt(id, !readCrt(id));
+  }));
+  // Every viewer's own switch, for a file from a member's node: no write.
+  host.querySelector<HTMLButtonElement>('[data-tv-autofetch]')?.addEventListener('click', () => {
+    setAutoFetchOn(!autoFetchOn());
     renderTvPhoneApp(host, deps);
+  });
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-reload]').forEach((b) => b.addEventListener('click', () => {
+    if (!reloadTvPicture(b.dataset.tvReload!)) feedback('The picture is on another TV here: aim at this one first.', 'link');
   }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-putdown]').forEach((b) => b.addEventListener('click', () => {
-    const r = putDownRemote(b.dataset.tvPutdown!);
-    if (!r.ok) feedback(r.error);
+  // A keyboard into archive.org's own frame, and back to this key (the view
+  // may have been rebuilt meanwhile: the key as it is then).
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-embed-keys]').forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.tvEmbedKeys!;
+    const back = () => { (host.querySelector<HTMLElement>(`[data-tv-embed-keys="${id}"]`) ?? host).focus({ preventScroll: true }); };
+    if (!focusTvEmbed(id, back)) feedback('archive.org\'s player is not up on this TV for you yet.', 'link');
   }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-tile]').forEach((b) => b.addEventListener('click', () => {
-    activeTile = b.dataset.tvTile!;
-    renderTvPhoneApp(host, deps);
-  }));
+
+  // ── SEND ──
   const paste = host.querySelector<HTMLInputElement>('[data-tv-paste]');
   paste?.addEventListener('keydown', (e) => {
     // Typing must not walk the fox: a typed key stays here. Tab is the
     // phone's own toggle and goes on to it (every other control in the
     // phone lets it), and keyups are never held back — a W held as the
-    // remote opened and released in this box must reach InputManager, or
+    // blaster opened and released in this box must reach InputManager, or
     // the clone walks on until the key is pressed again.
     if (e.key === 'Tab') return;
     e.stopPropagation();
-    if (e.key === 'Enter') host.querySelector<HTMLButtonElement>(activeTile === 'magnet' ? '[data-tv-torrent-start]' : '[data-tv-play]')?.click();
+    if (e.key === 'Enter') host.querySelector<HTMLButtonElement>('[data-tv-send]')?.click();
   });
 
-  /** The box's link as a source, with the TEXT it was read from: an archive
-   *  lookup can take seconds while the box stays editable, and the clear
-   *  that follows a write must take only that text — not a newer link typed
-   *  meanwhile and never submitted. */
-  const sourceFromBox = async (id: string): Promise<{ source: TvSource; text: string; torrent?: TvTorrentOrigin } | null> => {
-    // Every attempt supersedes the lookup before it, a refused or malformed
-    // one included: a PLAY on a bad link must not let an older archive
-    // lookup land its film after the refusal was shown.
-    const gen = ++resolveGen;
-    if (activeTile === 'file') return sourceFromFile(id, gen);
-    if (activeTile === 'magnet') {
-      // 🧲 PLAY takes the finished download, never the pasted magnet: the
-      // room record only ever names the blob it became.
-      const source = torrentSource();
-      if (!source) {
-        const st = torrentState();
-        feedback(st.state === 'complete'
-          ? 'That download was for another room — paste the magnet again here.'
-          : st.state === 'ready'
-          ? 'Pick a file from the list and press ⬇ DOWNLOAD first; PLAY NOW takes it once it is downloaded.'
-          : torrentRunning(st)
-          ? 'The download is not finished yet — PLAY NOW puts it on the TV once it is.'
-          : 'Paste a magnet (or choose a .torrent file) and press 🧲 START first; PLAY NOW takes the file once it is downloaded.');
-        return null;
-      }
-      // The library keeps where it came from, for GET AGAIN; the programme
-      // names only the blob.
-      return { source, text: '', torrent: torrentOrigin() ?? undefined };
-    }
-    const text = paste?.value ?? '';
+  /** The link box's link as a source, with the TEXT it was read from: an
+   *  archive lookup can take seconds while the box stays editable, and the
+   *  clear that follows a write must take only that text — not a newer
+   *  link typed meanwhile and never submitted. */
+  const sourceFromLink = async (id: string, gen: number): Promise<Shared | null> => {
+    const text = liveBox()?.value ?? '';
+    if (isSsfFilmLink(text)) return sourceFromSsfLink(id, gen, text);
     const parsed = parseTvSource(text);
     if (!parsed) {
-      feedback(text.trim() ? 'That is not a link the TV can play.' : 'Paste a link first.');
+      feedback(text.trim() ? 'That is not a link the TV can play.' : 'Paste a web address, a magnet or an SSF link first.', 'link');
       return null;
     }
     // What this build would refuse to play is refused here, with the
@@ -1028,15 +1077,15 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     // refuse (playRefusal).
     const refused = playRefusal(parsed);
     if (refused) {
-      feedback(refused);
+      feedback(refused, 'link');
       return null;
     }
     if (parsed.kind === 'archive' && !parsed.file && deps.resolveArchive) {
-      feedback('Asking archive.org which file to play…');
+      feedback('Asking archive.org which file to play…', 'link');
       const epoch = tvDocEpoch();
-      // Any programme action meanwhile — PREVIOUSLY ON, STOP or POWER from
-      // this panel, the set's panel or the theatre — moves the record's
-      // revision (`jump`, or the switch's `seq`) and voids this lookup.
+      // Any programme action meanwhile — the library, STOP or POWER from
+      // any blaster — moves the record's revision (`jump`, or the
+      // switch's `seq`) and voids this lookup.
       const revision = tvRevision(id);
       let found: { file: string; title: string } | null = null;
       try {
@@ -1044,66 +1093,216 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       } catch { /* fall through to the embed */ }
       if (gen !== resolveGen || epoch !== tvDocEpoch() || tvRevision(id) !== revision) return null; // overtaken
       if (found) return { source: sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed, text };
-      feedback('No playable file found — using their embed (start-time sync only).');
+      feedback('No playable file found — using their embed (start-time sync only).', 'link');
     }
     return { source: parsed, text };
   };
 
+  /** 🔗 An SSF link: this page's node takes the file from the nodes the link
+   *  names (or has it already), every byte checked against its hash, and
+   *  the film goes on from this node, got ready for the room as a FILE is
+   *  (readied). Voided as an archive lookup is — by the next attempt from
+   *  this blaster, anything that moves the programme meanwhile, the room or
+   *  the node changing — while the fetch goes on: a SEND of the same link
+   *  then puts it on at once. */
+  const sourceFromSsfLink = async (id: string, gen: number, text: string): Promise<Shared | null> => {
+    const link = parseSsfLink(text);
+    if (!link) {
+      feedback('That SSF link is not whole: it needs the file\'s hash, its size and a node that holds it.', 'link');
+      return null;
+    }
+    const me = blobLaneNodeId();
+    if (!me) {
+      feedback('An SSF link needs this station\'s node (the desktop app) running here: your node takes the file for you.', 'link');
+      return null;
+    }
+    const name = link.title || 'the film';
+    const epoch = tvDocEpoch();
+    const revision = tvRevision(id);
+    const node = blobLaneGeneration();
+    const current = () => gen === resolveGen && epoch === tvDocEpoch() && tvRevision(id) === revision;
+    feedback(`Asking your node for ${name} (${formatBytes(link.size)}) from the nodes the link names…`, 'link');
+    const why = await fetchFromLink(link);
+    if (!current()) return null;
+    if (why) {
+      feedback(`${name}: ${why}`, 'link');
+      return null;
+    }
+    for (;;) {
+      const st = await blobStateNow(link.hash);
+      if (!current()) return null;
+      if (blobLaneGeneration() !== node || !blobLaneNodeId()) {
+        feedback(`Your node restarted or went away while it took ${name}. SEND the link again.`, 'link');
+        return null;
+      }
+      if (st.state === 'complete') {
+        // A file this node had already, or was taking for another ask, is
+        // not checked against the link's size by the fetch: it is here. Its
+        // own size goes to the room, never a link's wrong one (the room's
+        // viewers take no byte past it).
+        if (st.size !== link.size) {
+          feedback(`${name}: your node holds that file at ${formatBytes(st.size)}, not the ${formatBytes(link.size)} the link says. The link is wrong: ask for it again.`, 'link');
+          return null;
+        }
+        break;
+      }
+      if (st.state === 'failed' || st.state === 'none') {
+        feedback(`${name} did not come: ${st.state === 'failed' && st.why ? st.why : 'your node let it go'}. The nodes the link names may be offline, or no longer share it: try again later.`, 'link');
+        return null;
+      }
+      if (st.state === 'queued') feedback(`${name} waits its turn on your node…`, 'link');
+      else if (st.state === 'fetching') {
+        feedback(`Taking ${name} from the link's nodes… ${Math.floor((st.have / Math.max(1, link.size)) * 100)}% of ${formatBytes(link.size)}, each byte checked against its hash`, 'link');
+      }
+      await new Promise((r) => setTimeout(r, LINK_POLL_MS));
+      if (!current()) return null;
+    }
+    void refreshHeldBlobs();
+    const source = sanitizeSource({ kind: 'blob', hash: link.hash, size: link.size, provider: me, mime: link.mime, title: link.title });
+    if (source?.kind !== 'blob') return null;
+    return readied({ source, text }, id, gen, 'link');
+  };
+
+  /** 📁 The chosen file: handed to this page's node, then got ready for the
+   *  room (readied). A SEND pressed again while it is being got ready waits
+   *  for the same film. */
+  const sourceFromChosenFile = async (id: string, gen: number): Promise<Shared | null> => {
+    const waiting = !pickedFile && fileGettingReady?.room === blobLaneRoom() ? fileGettingReady : null;
+    const got = waiting?.got ?? (await sourceFromFile(id, gen));
+    if (!got) return null;
+    const mine = waiting ?? { got, room: blobLaneRoom() };
+    fileGettingReady = mine;
+    try {
+      return await readied(got, id, gen, 'file');
+    } finally {
+      if (fileGettingReady === mine && gen === resolveGen) fileGettingReady = null;
+    }
+  };
+
+  /** 🧲 SEND DOWNLOAD takes the finished download, never the magnet: the
+   *  room record only ever names the blob it became. The library keeps
+   *  where it came from, for GET AGAIN; the programme names only the blob. */
+  const sourceFromTorrent = async (id: string, gen: number): Promise<Shared | null> => {
+    const source = torrentSource();
+    if (!source) {
+      const st = torrentState();
+      feedback(st.state === 'complete'
+        ? 'That download was for another room — SEND the magnet again here.'
+        : st.state === 'ready'
+        ? 'Pick a file from the list and press ⬇ DOWNLOAD first; SEND DOWNLOAD takes it once it is downloaded.'
+        : torrentRunning(st)
+        ? 'The download is not finished yet — SEND DOWNLOAD puts it on the TV once it is.'
+        : 'SEND a magnet link (or choose a .torrent file and press 🧲 START) first.', 'torrent');
+      return null;
+    }
+    return readied({ source, text: '', torrent: torrentOrigin() ?? undefined }, id, gen, 'torrent');
+  };
+
+  /** What `from` sends. Every attempt supersedes the lookup before it, a
+   *  refused or malformed one included: a SEND of a bad link must not let
+   *  an older archive lookup land its film after the refusal was shown. */
+  const sourceFrom = (from: Feedback, id: string): Promise<Shared | null> => {
+    const gen = ++resolveGen;
+    return from === 'file' ? sourceFromChosenFile(id, gen) : from === 'torrent' ? sourceFromTorrent(id, gen) : sourceFromLink(id, gen);
+  };
+
+  /** 🗜 A film from this page's node goes to the room as the copy this
+   *  machine makes of it first (tvShrink.ts), or as it is where there is
+   *  nothing to gain; the blaster says only that it is getting it ready.
+   *  Voided like an archive lookup: by the next attempt from this blaster,
+   *  anything that moves the programme meanwhile (STOP, POWER, a library
+   *  replay, from any blaster), or the room's doc going (a room left, even
+   *  one rejoined). The copy is still made, and the next share of the film
+   *  plays it at once. */
+  const readied = async (got: Shared, id: string, gen: number, where: Feedback): Promise<Shared | null> => {
+    if (got.source.kind !== 'blob') return got;
+    const name = got.source.title || 'the film';
+    const epoch = tvDocEpoch();
+    const revision = tvRevision(id);
+    const current = () => gen === resolveGen && epoch === tvDocEpoch() && tvRevision(id) === revision;
+    const say = (done: number) => {
+      if (current()) feedback(`Getting ${name} ready for the room… ${Math.floor(done * 100)}% · it plays once it is ready, while the station stays open`, where);
+    };
+    say(0);
+    const ready = await readyForRoom(got.source, say);
+    if (!current()) return null;
+    if (!ready) {
+      feedback(`${name} could not be got ready: this station's node changed or went away meanwhile. Press SEND again.`, where);
+      return null;
+    }
+    return { ...got, source: ready.source, drop: ready.drop ?? undefined };
+  };
+  /** The room plays the copy now: its original leaves this node. */
+  const dropOriginal = (got: Shared) => {
+    if (got.drop) void forgetBlob(got.drop).then(() => refreshHeldBlobs());
+  };
+
   /** 📦 The chosen file, handed to this page's node first: the record can
-   *  only name a blob the holder's node already holds. Voided like an
+   *  only name a blob the clock's node already holds. Voided like an
    *  archive lookup by anything that moves the programme meanwhile. */
   const sourceFromFile = async (id: string, gen: number): Promise<{ source: TvSource; text: string } | null> => {
     const file = pickedFile;
     const provider = blobLaneNodeId();
     if (!file) {
-      feedback('Choose a file first.');
+      feedback('Choose a file first.', 'file');
       return null;
     }
     if (!provider) {
-      feedback('The FILE tile needs this station\'s node (the desktop app) running here.');
+      feedback('A file needs this station\'s node (the desktop app) running here.', 'file');
       return null;
     }
     const epoch = tvDocEpoch();
     const revision = tvRevision(id);
-    feedback(`Handing ${file.name} to your node…`);
+    feedback(`Handing ${file.name} to your node…`, 'file');
     const got = await importBlob(file, (sent, total) => {
-      if (gen === resolveGen) feedback(`Handing ${file.name} to your node… ${total ? Math.floor((sent / total) * 100) : 0}%`);
+      if (gen === resolveGen) feedback(`Handing ${file.name} to your node… ${total ? Math.floor((sent / total) * 100) : 0}%`, 'file');
     });
     if (gen !== resolveGen || epoch !== tvDocEpoch() || tvRevision(id) !== revision) return null; // overtaken
     if ('error' in got) {
-      feedback(got.error);
+      feedback(got.error, 'file');
       return null;
     }
     const source = sanitizeSource({ kind: 'blob', hash: got.hash, size: got.size, provider, mime: file.type, title: fileTitle(file.name) });
     if (!source) {
-      feedback('That file cannot go on the TV.');
+      feedback('That file cannot go on the TV.', 'file');
       return null;
     }
     if (pickedFile === file) pickedFile = null;
     return { source, text: '' };
   };
-  host.querySelector<HTMLButtonElement>('[data-tv-torrent-start]')?.addEventListener('click', async () => {
-    const box = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
-    const text = box?.value ?? '';
-    // A chosen .torrent goes first; else the paste.
-    const file = text.trim() ? null : pickedTorrent;
-    feedback(file ? `Handing ${file.name} to your node…` : 'Handing the magnet to your node…');
-    const why = file ? await startTorrentFile(file) : await startTorrent(text);
+
+  // 🧲 A magnet in the link box: SEND hands it to the node, which shows the
+  // torrent's list under 🧲 TORRENT; nothing downloads before ⬇ DOWNLOAD.
+  const sendMagnet = async (text: string) => {
+    feedback('Handing the magnet to your node…', 'link');
+    const why = await startTorrent(text);
     if (why) {
-      feedback(why);
+      feedback(why, 'link');
       return;
     }
-    feedback('');
-    if (file && pickedTorrent === file) pickedTorrent = null;
+    feedback('🧲 Its file list shows under 🧲 TORRENT below, and nothing downloads until you press ⬇ DOWNLOAD.', 'link');
     torrentPick = null;
-    const live = host.querySelector<HTMLInputElement>('input[data-tv-paste]');
-    if (!file && live && live.value === text) live.value = '';
+    takeDraft(text);
+    renderTvPhoneApp(host, deps);
+  };
+  host.querySelector<HTMLButtonElement>('[data-tv-torrent-start]')?.addEventListener('click', async () => {
+    const file = pickedTorrent;
+    if (!file) return;
+    feedback(`Handing ${file.name} to your node…`, 'torrent');
+    const why = await startTorrentFile(file);
+    if (why) {
+      feedback(why, 'torrent');
+      return;
+    }
+    feedback('', 'torrent');
+    if (pickedTorrent === file) pickedTorrent = null;
+    torrentPick = null;
     renderTvPhoneApp(host, deps);
   });
   host.querySelector<HTMLInputElement>('[data-tv-torrent-file]')?.addEventListener('change', (e) => {
     const f = (e.target as HTMLInputElement).files?.[0] ?? null;
     if (f && f.size > MAX_TORRENT_FILE) {
-      feedback('That is too big for a .torrent file (over 4 MB).');
+      feedback('That is too big for a .torrent file (over 4 MB).', 'torrent');
       return;
     }
     pickedTorrent = f;
@@ -1121,17 +1320,17 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     const job = Number(button.dataset.tvTorrentConfirm);
     const index = button.dataset.tvTorrentFileIndex ? Number(button.dataset.tvTorrentFileIndex) : null;
     if (index === null) {
-      feedback('Pick a file first.');
+      feedback('Pick a file first.', 'torrent');
       return;
     }
-    feedback('Asking your node to download it…');
+    feedback('Asking your node to download it…', 'torrent');
     const why = await confirmTorrent(job, index);
-    feedback(why ?? '');
+    feedback(why ?? '', 'torrent');
     renderTvPhoneApp(host, deps);
   });
   host.querySelector<HTMLButtonElement>('[data-tv-torrent-stop]')?.addEventListener('click', async () => {
     const why = await stopTorrent();
-    if (why) feedback(why);
+    if (why) feedback(why, 'torrent');
     renderTvPhoneApp(host, deps);
   });
   if (host.querySelector('[data-tv-torrent-status]')) pollTorrent(host, deps);
@@ -1152,34 +1351,54 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
    *  link typed during the lookup stays. Says whether it was taken. */
   const takeDraft = (text: string): boolean => {
     const box = liveBox();
-    if (!box || box.value !== text) return false;
+    if (!text || !box || box.value !== text) return false;
     box.value = '';
     return true;
   };
   const giveBack = (text: string) => {
     const box = liveBox();
-    if (box && !box.value) box.value = text;
+    if (text && box && !box.value) box.value = text;
   };
-  host.querySelector<HTMLButtonElement>('[data-tv-play]')?.addEventListener('click', () => {
-    const id = host.querySelector<HTMLButtonElement>('[data-tv-play]')!.dataset.tvPlay!;
-    void sourceFromBox(id).then((got) => {
+  const send = (from: Feedback, id: string) => {
+    void sourceFrom(from, id).then((got) => {
       if (!got) return;
       const taken = takeDraft(got.text);
       const r = tvPlay(id, got.source, undefined, got.torrent);
-      feedback(r.ok ? `Now on: ${sourceLabel(got.source)}` : r.error);
+      feedback(r.ok ? `Now on: ${sourceLabel(got.source)}` : r.error, from);
       if (!r.ok && taken) giveBack(got.text);
-      if (r.ok) deps.openTheatre(id);
+      if (r.ok) {
+        dropOriginal(got);
+        deps.openTheatre(id);
+      }
     });
+  };
+  host.querySelector<HTMLButtonElement>('[data-tv-send]')?.addEventListener('click', (e) => {
+    const id = (e.currentTarget as HTMLButtonElement).dataset.tvSend!;
+    const text = liveBox()?.value.trim() ?? '';
+    if (text.startsWith('magnet:')) void sendMagnet(text);
+    else send('link', id);
+  });
+  host.querySelector<HTMLButtonElement>('[data-tv-send-file]')?.addEventListener('click', (e) => {
+    send('file', (e.currentTarget as HTMLButtonElement).dataset.tvSendFile!);
+  });
+  host.querySelector<HTMLButtonElement>('[data-tv-send-torrent]')?.addEventListener('click', (e) => {
+    send('torrent', (e.currentTarget as HTMLButtonElement).dataset.tvSendTorrent!);
   });
   host.querySelectorAll<HTMLButtonElement>('[data-tv-schedule]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
+    const from = b.dataset.tvFrom as Feedback;
     const minutes = Number(b.dataset.tvSchedule);
-    void sourceFromBox(id).then((got) => {
+    if (from === 'link' && (liveBox()?.value.trim() ?? '').startsWith('magnet:')) {
+      feedback('A magnet downloads first: SEND it, then schedule the download under 🧲 TORRENT.', 'link');
+      return;
+    }
+    void sourceFrom(from, id).then((got) => {
       if (!got) return;
       const taken = takeDraft(got.text);
       const r = tvSchedule(id, got.source, Date.now() + minutes * 60_000, undefined, got.torrent);
-      feedback(r.ok ? `Scheduled: ${sourceLabel(got.source)} in ${minutes} min` : r.error);
+      feedback(r.ok ? `Scheduled: ${sourceLabel(got.source)} in ${minutes} min` : r.error, from);
       if (!r.ok && taken) giveBack(got.text);
+      if (r.ok) dropOriginal(got);
     });
   }));
   // 📚 The library: its filters, its search, and its rows.
@@ -1205,86 +1424,135 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-play]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
     const entry = libraryEntry(id, b.dataset.tvLibPlay!);
-    if (!entry) return;
-    // The paste box's gate: the library is written by peers and by builds
+    if (entry) playEntry(id, entry, 'library');
+  }));
+  /** ▶ on a library row, or OK on its title on the set's menu: said on the
+   *  line beside the press (`where`). */
+  const playEntry = (id: string, entry: TvLibraryEntry, line: Feedback) => {
+    // The link box's gate: the library is written by peers and by builds
     // with the convenience lanes on, and an entry this build would refuse
     // to play is said no to here — the programme on stays as it is.
     const refused = playRefusal(entry.source);
     if (refused) {
-      feedback(refused);
+      feedback(refused, line);
       return;
     }
     // A file your node holds plays from your node: viewers fetch it from
     // you, whoever shared it first. One whose sharer is gone plays from the
-    // node here that kept a copy.
+    // node here that kept a copy, or from one met here lately that has it
+    // where it is online now.
     const where = whereabouts(entry);
     const me = blobLaneNodeId();
-    const copy = where === 'copy' ? copyHolder(entry) : null;
+    const copy = where === 'copy' || where === 'elsewhere' ? copyHolder(entry) : null;
     const source = entry.source.kind === 'blob' && where === 'mine' && me ? { ...entry.source, provider: me }
       : entry.source.kind === 'blob' && copy ? { ...entry.source, provider: copy }
       : entry.source;
     const r = tvPlay(id, source);
     if (!r.ok) {
-      feedback(r.error);
+      feedback(r.error, line);
       return;
     }
     feedback(where === 'copy'
       ? `Now on: ${entry.title}, from the copy a node here kept.`
+      : where === 'elsewhere'
+      ? `Now on: ${entry.title}, from a node that was in this room lately and has it where it is online now.`
       : where === 'away' || where === 'lost'
-      ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'The node that shared it is not connected to yours'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
-      : `Now on: ${entry.title}`);
+      ? `Now on: ${entry.title}. ${where === 'lost' ? 'Your node no longer has it' : 'Your node cannot reach the node that shared it, here or elsewhere'}: whoever still has it plays it${entry.torrent ? ', and 🧲 GET AGAIN downloads it once more' : ''}.`
+      : `Now on: ${entry.title}`, line);
     deps.openTheatre(id);
-  }));
+  };
   host.querySelectorAll<HTMLButtonElement>('[data-tv-host-copies]').forEach((b) => b.addEventListener('click', async () => {
     const on = b.dataset.tvHostCopies === '1';
     const why = await setHostCopies(on);
     feedback(why ?? (on
       ? 'Your node keeps a copy of each file played in this room from now on, while whoever shared it is connected.'
-      : 'Your node keeps no more copies for this room. The ones it has stay until you 🗑 them or it needs the room.'));
+      : 'Your node keeps no more copies for this room. The ones it has stay until you 🗑 them or it needs the room.'), 'host');
     renderTvPhoneApp(host, deps);
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-forget]').forEach((b) => b.addEventListener('click', async () => {
     const key = b.dataset.tvLibForget!;
     if (forgetArmed !== key) {
       forgetArmed = key;
-      feedback('Press 🗑 again to let your node\'s copy go. The library keeps the entry: ▶ then fetches it from whoever has it.');
+      feedback('Press 🗑 again to let your node\'s copy go. The library keeps the entry: ▶ then fetches it from whoever has it.', 'library');
       renderTvPhoneApp(host, deps);
       return;
     }
     forgetArmed = '';
-    const hash = key.startsWith('blob:') ? key.slice(5) : '';
+    // The file the entry plays now, not the one its key names: a smaller
+    // copy is filed under its original (sourceId), and it is the copy that
+    // is on this node.
+    const entry = libraryEntry(b.dataset.tvId!, key);
+    const hash = entry?.source.kind === 'blob' ? entry.source.hash : '';
     const why = await forgetBlob(hash);
-    feedback(why ?? 'Your node let its copy go.');
+    feedback(why ?? 'Your node let its copy go.', 'library');
     void refreshHeldBlobs();
+    renderTvPhoneApp(host, deps);
+  }));
+  // 🔗 SSF LINK: the file is marked shareable on this page's node, and its
+  // link shown under the row (and copied, where the page may write the
+  // clipboard). It names this node, then the nodes the link this file came
+  // from named.
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-link]').forEach((b) => b.addEventListener('click', async () => {
+    const key = b.dataset.tvLibLink!;
+    const entry = libraryEntry(b.dataset.tvId!, key);
+    const me = blobLaneNodeId();
+    if (entry?.source.kind !== 'blob' || !me) return;
+    const { hash, size, mime } = entry.source;
+    const got = await shareBlob(hash, true);
+    if ('error' in got) {
+      feedback(got.error, 'library');
+      return;
+    }
+    const text = formatSsfLink({ hash, size, title: entry.title, mime: mime ?? '', nodes: [me, ...got.via] });
+    linkShown = { key, text };
+    const copied = await navigator.clipboard?.writeText(text).then(() => true, () => false) ?? false;
+    feedback(copied
+      ? `🔗 The SSF link to ${entry.title} is copied: send it to whoever you like. Your node shares the file with anyone who has it.`
+      : `🔗 The SSF link to ${entry.title} is below: select it and copy it. Your node shares the file with anyone who has it.`, 'library');
+    renderTvPhoneApp(host, deps);
+  }));
+  host.querySelector<HTMLButtonElement>('[data-tv-lib-link-copy]')?.addEventListener('click', async () => {
+    if (!linkShown) return;
+    const box = host.querySelector<HTMLInputElement>('[data-tv-lib-link-text]');
+    const copied = await navigator.clipboard?.writeText(linkShown.text).then(() => true, () => false) ?? false;
+    if (!copied) box?.select();
+    feedback(copied ? '🔗 Copied.' : '🔗 This page may not write the clipboard: the link is selected, copy it with the keys.', 'library');
+  });
+  const linkText = host.querySelector<HTMLInputElement>('[data-tv-lib-link-text]');
+  linkText?.addEventListener('focus', () => linkText.select());
+  linkText?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') e.stopPropagation(); // copy keys must not walk the fox (the paste box's rule)
+  });
+  host.querySelector<HTMLButtonElement>('[data-tv-lib-link-hide]')?.addEventListener('click', () => {
+    linkShown = null;
+    renderTvPhoneApp(host, deps);
+  });
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-unshare]').forEach((b) => b.addEventListener('click', async () => {
+    const entry = libraryEntry(b.dataset.tvId!, b.dataset.tvLibUnshare!);
+    if (entry?.source.kind !== 'blob') return;
+    const got = await shareBlob(entry.source.hash, false);
+    if ('error' in got) {
+      feedback(got.error, 'library');
+      return;
+    }
+    linkShown = null;
+    feedback(`🔗 ${entry.title} is shared by its link no more: your node gives it only to the members of the rooms it was played in, as before. A copy someone already took stays theirs.`, 'library');
     renderTvPhoneApp(host, deps);
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-lib-again]').forEach((b) => b.addEventListener('click', async () => {
     const entry = libraryEntry(b.dataset.tvId!, b.dataset.tvLibAgain!);
     if (!entry?.torrent) return;
-    feedback(`Asking your node for ${entry.title} again…`);
+    feedback(`Asking your node for ${entry.title} again…`, 'library');
     const why = await startTorrentAgain(entry.torrent);
     if (why) {
-      feedback(why);
+      feedback(why, 'library');
       return;
     }
-    // The TORRENT tile shows its file list: nothing downloads before ⬇ DOWNLOAD.
+    // 🧲 TORRENT shows its file list: nothing downloads before ⬇ DOWNLOAD.
     torrentPick = null;
-    activeTile = 'magnet';
-    feedback(`🧲 Looking up ${entry.title}: its file list shows on the TORRENT tile, and nothing downloads until you press ⬇ DOWNLOAD.`);
+    feedback(`🧲 Looking up ${entry.title}: its file list shows under 🧲 TORRENT, and nothing downloads until you press ⬇ DOWNLOAD.`, 'library');
     renderTvPhoneApp(host, deps);
   }));
-  // Where the holder's own player is, when one is mounted here: the record's
-  // estimate runs on while a player buffers, and a pause written from it
-  // would park the room past unplayed footage.
-  const pos = (id: string) => tvPlayerPositionMs(id) ?? readPlayback(id).positionMs;
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-pause]').forEach((b) => b.addEventListener('click', () => { tvPause(b.dataset.tvPause!, pos(b.dataset.tvPause!)); }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-resume]').forEach((b) => b.addEventListener('click', () => { tvResume(b.dataset.tvResume!); }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-back]').forEach((b) => b.addEventListener('click', () => { tvSeek(b.dataset.tvBack!, Math.max(0, pos(b.dataset.tvBack!) - 10_000)); }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-fwd]').forEach((b) => b.addEventListener('click', () => { tvSeek(b.dataset.tvFwd!, pos(b.dataset.tvFwd!) + 10_000); }));
-  host.querySelectorAll<HTMLButtonElement>('[data-tv-stop]').forEach((b) => b.addEventListener('click', () => { tvStop(b.dataset.tvStop!); }));
-  host.querySelectorAll<HTMLInputElement>('[data-tv-volume]').forEach((i) => i.addEventListener('change', () => { tvSetVolume(i.dataset.tvVolume!, Number(i.value)); }));
-  // PICK UP / PUT DOWN are wired by set id above; HAND TO… names its set too.
-  wireHandOver(host, feedback);
 }
 
 /**
