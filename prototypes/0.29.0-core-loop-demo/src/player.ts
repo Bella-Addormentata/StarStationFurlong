@@ -1109,6 +1109,16 @@ export class Player {
     this.logicalAngle = snapTo8Ways(Math.atan2(x - p.x, z - p.z));
   }
 
+  /** 🧭 Q / E in the room view: turn the standing fox one 8-way facing in
+   *  place, left (dir 1) or right (dir -1). Only while simply standing, so a
+   *  walk, a seat or a door in progress keeps its own facing. Returns whether
+   *  it turned. */
+  public turnInPlace(dir: 1 | -1): boolean {
+    if (!this.isStandingIdle()) return false;
+    this.logicalAngle = snapTo8Ways(this.logicalAngle + dir * SNAP_INCREMENT);
+    return true;
+  }
+
   /** 🏋️ Follow-the-coach pose passthrough (see VoxelCharacter.setWorkoutPose). */
   public setWorkoutPose(pose: WorkoutPose | null): void {
     this.character.setWorkoutPose(pose);

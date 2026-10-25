@@ -24,7 +24,7 @@ import { rotateIsoOffset } from './cameraRig';
 import { STAND_EYE_OFFSET } from './player';
 import { isFormFieldTarget } from './typingFocus';
 import { FovZoom } from './firstPersonZoom';
-import { isTurnKey, turnYawStep } from './firstPersonTurn';
+import { isTurnKey, turnKeyDirection, turnYawStep } from './firstPersonTurn';
 
 // Base (yaw-0) isometric offsets for the ortho levels — the camera rig
 // (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
@@ -375,9 +375,14 @@ export class MultiScaleZoomView {
       }
 
       // 🧭 Q / E turn the first-person view while held (the helm's stick
-      // takes them first, in the capture phase, for strafing).
+      // takes them first, in the capture phase, for strafing). In the room
+      // view they turn the standing avatar in place, one facing per press.
       if (isTurnKey(e.code)) {
         turnKeysHeld.add(e.code);
+        const dir = turnKeyDirection(e.code);
+        if (this.currentLevel === 2 && !e.repeat && dir !== 0) {
+          (window as any).world?.getPlayer()?.turnInPlace(dir);
+        }
         return;
       }
 
