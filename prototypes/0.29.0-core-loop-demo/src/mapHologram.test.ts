@@ -37,6 +37,10 @@ function module(roomId: string, x: number, z: number, opts: Partial<PlanModule> 
   };
 }
 
+/** Meshes the camera renders: on the default layer (parked ones sit on a
+ *  layer the camera never renders, so they cost no draw call). */
+const onCamera = (o: THREE.Object3D) => (o.layers.mask & 1) !== 0;
+
 function build() {
   const group = new THREE.Group();
   const handle = buildMapHologram({ attach: (o) => group.add(o) }, 1.2, 0.9);
@@ -44,7 +48,7 @@ function build() {
   const [plot, stationLayer] = root.children.filter((c) => c.type === 'Group') as THREE.Group[];
   const shown = (g: THREE.Object3D) => {
     let n = 0;
-    g.traverse((o) => { if (o instanceof THREE.Mesh && o.scale.x > 0) n++; });
+    g.traverse((o) => { if (o instanceof THREE.Mesh && onCamera(o)) n++; });
     return n;
   };
   const sun = (() => { let s: THREE.Mesh | null = null; root.traverse((o) => { if (o instanceof THREE.Mesh && o.userData.mapHologram) s = o; }); return s!; })();
@@ -123,19 +127,33 @@ describe('buildMapHologram', () => {
     expect(stationLayer.visible).toBe(true);
     // 3 blocks + 2 gangways (the ship's berth is one).
     expect(shown(stationLayer)).toBe(5);
-    const blocks = stationLayer.children.filter((o) => o instanceof THREE.Mesh && o.scale.x > 0 && o.scale.y > 0.015) as THREE.Mesh[];
+    const blocks = stationLayer.children.filter((o) => o instanceof THREE.Mesh && onCamera(o) && o.scale.y > 0.015) as THREE.Mesh[];
     expect(blocks).toHaveLength(3);
     const mats = new Set(blocks.map((b) => b.material));
     expect(mats.size).toBe(3); // here, module and ship each in their own light
     const turned = blocks.find((b) => Math.abs(b.rotation.y - Math.PI / 2) < 1e-9);
     expect(turned).toBeDefined();
     for (const m of stationLayer.children) {
-      if (m instanceof THREE.Mesh && m.scale.x > 0) expect((m.material as THREE.Material).opacity).toBeCloseTo((m.material as THREE.Material).userData.baseOpacity as number, 9);
+      if (m instanceof THREE.Mesh && onCamera(m)) expect((m.material as THREE.Material).opacity).toBeCloseTo((m.material as THREE.Material).userData.baseOpacity as number, 9);
     }
     // And back to the plot.
     run(handle, STATION_SECONDS);
     expect(plot.visible).toBe(true);
     expect(stationLayer.visible).toBe(false);
+  });
+
+  it('parks every unused pool mesh off the camera, so a small plot costs no draw calls for its pools', () => {
+    const { handle, root, plot, stationLayer, shown } = build();
+    handle.update(0.1);
+    let total = 0;
+    root.traverse((o) => { if (o instanceof THREE.Mesh) total++; });
+    // The pools are sized for the atlas's bounds; only the bodies in view are on the camera's layer.
+    expect(total).toBeGreaterThan(100);
+    expect(shown(plot)).toBe(11);
+    expect(shown(stationLayer)).toBe(0);
+    // A parked mesh keeps `visible` (World's zoom hide owns that) and sits on the parked layer.
+    const parked = plot.children.find((o) => o instanceof THREE.Mesh && (o.layers.mask & 1) === 0)!;
+    expect(parked.visible).toBe(true);
   });
 
   it('frees its course lines with the table, which World cannot reach (they are not meshes)', () => {

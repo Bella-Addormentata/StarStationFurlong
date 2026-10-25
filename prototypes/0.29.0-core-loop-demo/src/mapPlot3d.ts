@@ -14,7 +14,8 @@
 
 import * as THREE from 'three';
 import type { MapBody } from './map';
-import { HOLO_RADIUS, HOLO_REACH, holoPoint, inclinationOf, inclinedPoint, plotCourses, plotMarkers, type HoloMarker } from './mapHologramLayout';
+import { MAX_ORBIT_SLOTS, PLANETS } from './stations';
+import { HOLO_RADIUS, HOLO_REACH, holoPoint, inclinationOf, inclinedPoint, plotCourses, plotMarkers, ringInclination, type HoloMarker } from './mapHologramLayout';
 import { SPLAT_SCALE, bodyColor, buildSplatPlot, sparkHost, type SplatPlotHandle } from './mapHologramSplats';
 
 export interface PlotFrameState {
@@ -110,17 +111,45 @@ const FOV_DEG = 42;
 
 /** The points the fit must keep in view: the belt (tilted, with its
  *  thickness) and the haze dome's top, in the panel's world units. */
-export function fitPoints(): Array<{ x: number; y: number; z: number }> {
-  const pts: Array<{ x: number; y: number; z: number }> = [];
-  const belt = inclinationOf('belt-ring');
-  const r = PLOT_RADIUS, thick = 0.04 * SPLAT_SCALE * PANEL_SCALE;
-  for (let i = 0; i < 48; i++) {
-    const a = (i / 48) * Math.PI * 2;
-    const p = inclinedPoint(Math.cos(a) * r, Math.sin(a) * r, belt);
-    pts.push({ x: p.x, y: p.y + thick, z: p.z }, { x: p.x, y: p.y - thick, z: p.z });
+/** The picture's default reach: the belt. */
+export const DEFAULT_REACH = HOLO_RADIUS * HOLO_REACH;
+type Pt = { x: number; y: number; z: number };
+const K = SPLAT_SCALE * PANEL_SCALE;
+/** A circle's rim, tilted as given, in the panel's world units. */
+function circle(cx: number, cy: number, cz: number, r: number, inc: { tilt: number; node: number }, n: number, out: Pt[], thick = 0): void {
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const p = inclinedPoint(Math.cos(a) * r, Math.sin(a) * r, inc);
+    out.push({ x: (cx + p.x) * K, y: (cy + p.y + thick) * K, z: (cz + p.z) * K });
+    if (thick) out.push({ x: (cx + p.x) * K, y: (cy + p.y - thick) * K, z: (cz + p.z) * K });
   }
-  pts.push({ x: 0, y: HOLO_RADIUS * 1.02 * 0.85 * SPLAT_SCALE * PANEL_SCALE, z: 0 });
+}
+/** The points the fit must keep in view with nothing but the belt and the
+ *  dome: the belt (tilted, with its thickness) and the dome's top. */
+export function fitPoints(reach = DEFAULT_REACH): Pt[] {
+  const pts: Pt[] = [];
+  circle(0, 0, 0, reach, inclinationOf('belt-ring'), 48, pts, 0.04);
+  pts.push({ x: 0, y: HOLO_RADIUS * 1.02 * 0.85 * K, z: 0 });
   return pts;
+}
+/** The points the fit must keep in view for THIS picture: the belt and the
+ *  dome, every planet, and every station's whole ring round its planet
+ *  (a high slot's ring reaches past the belt), on the ring's own tilt. */
+export function fitPointsFor(markers: readonly HoloMarker[]): Pt[] {
+  const pts = fitPoints();
+  for (const mk of markers) {
+    const p = holoPoint(mk);
+    pts.push({ x: p.x * K, y: p.y * K, z: p.z * K });
+    if (mk.type === 'station' && mk.orbit) {
+      const c = inclinedPoint(mk.orbit.cx, mk.orbit.cz, inclinationOf(mk.frame));
+      circle(c.x, c.y, c.z, mk.orbit.r, ringInclination(mk.frame, mk.orbit.r), 16, pts);
+    }
+  }
+  return pts;
+}
+/** What a picture's fit depends on besides the view: the rings in it. */
+export function fitSignature(markers: readonly HoloMarker[]): string {
+  return markers.filter((m) => m.type === 'station' && m.orbit).map((m) => `${m.frame}:${m.orbit!.r.toFixed(4)}`).sort().join(',');
 }
 
 /** Where a world point lands in the view, as a fraction of the half-width
@@ -150,8 +179,7 @@ export function projectNdc(p: { x: number; y: number; z: number }, o: OrbitState
  */
 /** The yaws the fit is checked from (the view drifts round). */
 export const FIT_YAWS = 24;
-export function fitDistance(aspect: number, pitch: number, fill = 0.88, fovDeg = FOV_DEG): number {
-  const pts = fitPoints();
+export function fitDistance(aspect: number, pitch: number, pts: readonly Pt[] = fitPoints(), fill = 0.88, fovDeg = FOV_DEG): number {
   const worst = (dist: number): number => {
     let m = 0;
     for (let k = 0; k < FIT_YAWS; k++) {
@@ -201,8 +229,19 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   scene.add(sparkRenderer);
   const camera = new THREE.PerspectiveCamera(FOV_DEG, 1, 0.05, 100);
   let orbit: OrbitState = { ...ORBIT_DEFAULT };
-  /** Until the player zooms, the distance follows the panel's size. */
+  /** Until the player zooms, the distance follows the panel's size, the
+   *  pitch and the picture's reach — recomputed only when one of them
+   *  changes (the fit projects ~100 points from 24 yaws and bisects). */
   let fitted = true;
+  let fitPts: Pt[] = fitPoints();
+  let fitSig = '';
+  const fitFor = { aspect: NaN, pitch: NaN, sig: '' };
+  const refit = (): void => {
+    if (!fitted) return;
+    if (fitFor.aspect === camera.aspect && fitFor.pitch === orbit.pitch && fitFor.sig === fitSig) return;
+    fitFor.aspect = camera.aspect; fitFor.pitch = orbit.pitch; fitFor.sig = fitSig;
+    orbit = { ...orbit, dist: fitDistance(camera.aspect, orbit.pitch, fitPts) };
+  };
 
   // The galaxy: stars of every brightness and warmth, a band of them
   // across the sky like the Milky Way, and a few soft nebulae in it.
@@ -290,7 +329,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   scene.add(travelLine);
   const courseMat = new THREE.LineBasicMaterial({ color: 0x00d4ff, transparent: true, opacity: 0.5 });
   const courses: THREE.Line[] = [];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < MAX_ORBIT_SLOTS * PLANETS.length; i++) {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(COURSE_POINTS * 3), 3));
     geo.setDrawRange(0, 0);
@@ -324,7 +363,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     if (!down.moved && Math.hypot(dx, dy) < 4) return;
     down.moved = true;
     orbit = orbitDrag(orbit, e.movementX, e.movementY);
-    if (fitted) orbit = { ...orbit, dist: fitDistance(camera.aspect, orbit.pitch) };
+    refit();
   };
   const onUp = (e: PointerEvent) => {
     canvas.style.cursor = 'grab';
@@ -350,7 +389,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     renderer.setSize(width, height, false);
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
-    if (fitted) orbit = { ...orbit, dist: fitDistance(camera.aspect, orbit.pitch) };
+    refit();
   };
   const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => resize()) : null;
 
@@ -412,6 +451,10 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
       camera.position.set(p.x, p.y, p.z);
       camera.lookAt(0, 0, 0);
       const markers = plotMarkers(bodies, nowMs, state.hereId);
+      // The rings in the picture can change (a station on a high slot
+      // reaches past the belt): refit to the picture then.
+      const sig = fitSignature(markers);
+      if (sig !== fitSig) { fitSig = sig; fitPts = fitPointsFor(markers); refit(); }
       splats?.place(markers, nowMs, 1, true);
       const byId = new Map(markers.map((m) => [m.id, m]));
       // The halo on the selection, the line of a transit, the courses.

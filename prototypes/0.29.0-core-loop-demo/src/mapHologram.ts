@@ -16,7 +16,7 @@
 import * as THREE from 'three';
 import type { MapBody } from './map';
 import { solarPlotBodies } from './map';
-import { currentRoomId, listStations } from './stations';
+import { MAX_ORBIT_SLOTS, PLANETS, currentRoomId, listStations } from './stations';
 import { MAX_ENTRIES, readAtlas } from './stationAtlas';
 import { stationPlan } from './stationPlan';
 import { holotableStation } from './devices';
@@ -50,10 +50,20 @@ export const REFRESH_MS = 2000;
 /** The hologram's slow turn (rad/s). */
 const SPIN = 0.12;
 const COURSE_POINTS = 65;
-/** Pool sizes. Modules and ships together are at most the atlas's
- *  MAX_ENTRIES rooms (stationPlan walks the whole component); gangways are
- *  one per pairing between two of them, so at most two per room. */
-const POOL = { planets: 4, lagrange: 4, stations: 16, courses: 4, modules: MAX_ENTRIES, links: MAX_ENTRIES * 2 };
+/** Pool sizes. Stations: listStations seats at most MAX_ORBIT_SLOTS per
+ *  planet, a moving one still in its slot, so that bounds the stations and
+ *  the courses (one per moving station). Modules and ships together are at
+ *  most the atlas's MAX_ENTRIES rooms (stationPlan walks the whole
+ *  component); gangways are one per pairing between two of them, so at
+ *  most two per room. */
+const MAX_STATIONS = MAX_ORBIT_SLOTS * PLANETS.length;
+const POOL = { planets: PLANETS.length + 2, lagrange: 4, stations: MAX_STATIONS, courses: MAX_STATIONS, modules: MAX_ENTRIES, links: MAX_ENTRIES * 2 };
+/** The layer parked pool meshes sit on: one the camera never renders, so a
+ *  parked slot costs no draw call. World's zoom hide works on `visible`,
+ *  which this leaves alone. Taken, a mesh is back on the default layer. */
+const PARKED_LAYER = 31;
+function park(mesh: THREE.Object3D): void { mesh.layers.set(PARKED_LAYER); }
+function show(mesh: THREE.Object3D): void { mesh.layers.set(0); }
 /** Module block heights on the disc (metres). */
 const MODULE_H = 0.03;
 const SHIP_H = 0.02;
@@ -72,14 +82,15 @@ function holoMat(color: number, baseOpacity: number): THREE.MeshBasicMaterial {
   return m;
 }
 
-/** A pool of parked meshes sharing one geometry; `take` hands out the next. */
+/** A pool of parked meshes sharing one geometry; `take` hands out the next
+ *  (on the camera's layer); `park` puts the rest back off it. */
 class Pool {
   readonly meshes: THREE.Mesh[] = [];
   private used = 0;
   constructor(parent: THREE.Object3D, n: number, geo: THREE.BufferGeometry, mat: THREE.Material) {
     for (let i = 0; i < n; i++) {
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.scale.setScalar(0);
+      park(mesh);
       parent.add(mesh);
       this.meshes.push(mesh);
     }
@@ -88,11 +99,14 @@ class Pool {
     this.used = 0;
   }
   take(): THREE.Mesh | null {
-    return this.used < this.meshes.length ? this.meshes[this.used++]! : null;
+    if (this.used >= this.meshes.length) return null;
+    const mesh = this.meshes[this.used++]!;
+    show(mesh);
+    return mesh;
   }
   /** Park every mesh not taken since reset(). */
   park(): void {
-    for (let i = this.used; i < this.meshes.length; i++) this.meshes[i]!.scale.setScalar(0);
+    for (let i = this.used; i < this.meshes.length; i++) park(this.meshes[i]!);
   }
 }
 
@@ -160,7 +174,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   const hereGeo = new THREE.TorusGeometry(1, 0.1, 6, 32);
   hereGeo.rotateX(Math.PI / 2);
   const hereRing = new THREE.Mesh(hereGeo, hereMat);
-  hereRing.scale.setScalar(0);
+  park(hereRing);
   plotGroup.add(hereRing);
   // Courses of stations on their way to another planet.
   const courseMat = new THREE.LineBasicMaterial({
@@ -264,17 +278,19 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
       courseGroup.scale.copy(splatPlot.group.scale);
       planets.reset(); lagrange.reset(); stations.reset(); planetRings.reset(); stationRings.reset();
       planets.park(); lagrange.park(); stations.park(); planetRings.park(); stationRings.park();
-      hereRing.scale.setScalar(0);
-      sun.scale.setScalar(0);
-      beltMesh?.scale.setScalar(0);
+      park(hereRing);
+      park(sun);
+      if (beltMesh) park(beltMesh);
     } else {
-      sun.scale.setScalar(1);
-      beltMesh?.scale.setScalar(1);
+      show(sun);
+      if (beltMesh) show(beltMesh);
       courseGroup.position.set(0, 0, 0);
       courseGroup.scale.setScalar(1);
       layoutMeshPlot(markers, now);
     }
-    layoutCourses(now, fade, sunBase);
+    // The splat plot stands its bodies at their tilted heights, so its
+    // courses carry theirs; the mesh plot is flat, and so are its courses.
+    layoutCourses(now, fade, sunBase, splatPlot !== null);
   };
 
   const layoutMeshPlot = (markers: readonly ReturnType<typeof plotMarkers>[number][], now: number): void => {
@@ -286,30 +302,28 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
       if (mk.type === 'planet') { mesh = planets.take(); ring = planetRings.take(); }
       else if (mk.type === 'station') { mesh = stations.take(); ring = stationRings.take(); }
       else if (mk.type === 'lagrange') mesh = lagrange.take();
-      if (mesh) {
-        mesh.position.set(mk.x, 0.012, mk.z);
-        mesh.scale.setScalar(1);
-      }
+      if (mesh) mesh.position.set(mk.x, 0.012, mk.z);
       if (ring && mk.orbit) {
         ring.position.set(mk.orbit.cx, 0.002, mk.orbit.cz);
         ring.scale.setScalar(mk.orbit.r);
       } else if (ring) {
-        ring.scale.setScalar(0);
+        park(ring);
       }
       if (mk.here) here = mk;
     }
     planets.park(); lagrange.park(); stations.park(); planetRings.park(); stationRings.park();
     if (here) {
+      show(hereRing);
       hereRing.position.set(here.x, 0.012, here.z);
       hereRing.scale.setScalar(HERE_RING * (1 + 0.25 * Math.sin(now / 250)));
     } else {
-      hereRing.scale.setScalar(0);
+      park(hereRing);
     }
   };
 
   /** Courses: the lines follow the sun's opacity (World fades the sun; the
    *  lines are not meshes, so it never touches them). */
-  const layoutCourses = (now: number, fade: number, sunBase: number): void => {
+  const layoutCourses = (now: number, fade: number, sunBase: number, lifted: boolean): void => {
     courseMat.opacity = (sunMat.opacity / sunBase) * COURSE_OPACITY;
     const drawn = plotCourses(bodies, now);
     courses.forEach((line, i) => {
@@ -320,7 +334,7 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
       }
       const pos = line.geometry.getAttribute('position') as THREE.BufferAttribute;
       const n = Math.min(c.points.length, COURSE_POINTS);
-      for (let k = 0; k < n; k++) pos.setXYZ(k, c.points[k]!.x, 0.006 + c.points[k]!.y, c.points[k]!.z);
+      for (let k = 0; k < n; k++) pos.setXYZ(k, c.points[k]!.x, 0.006 + (lifted ? c.points[k]!.y : 0), c.points[k]!.z);
       pos.needsUpdate = true;
       line.geometry.setDrawRange(0, n);
       line.visible = sun.visible && n > 1;

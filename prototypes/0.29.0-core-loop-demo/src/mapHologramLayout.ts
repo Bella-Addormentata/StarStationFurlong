@@ -274,6 +274,20 @@ export function beltRadius(bodies: readonly MapBody[]): number | null {
 /** How far past HOLO_RADIUS the picture may reach (the belt, stretched). */
 export const HOLO_REACH = 1.15;
 
+/** How far from the sun the picture reaches right now, in disc metres:
+ *  the belt, every planet, and every station's whole ring round its
+ *  planet (a high slot's ring reaches past the belt). What a view that
+ *  fits the picture must keep in frame. */
+export function plotReach(markers: readonly HoloMarker[]): number {
+  let reach = 0;
+  for (const mk of markers) {
+    const own = Math.hypot(mk.x, mk.z);
+    const ring = mk.orbit && mk.type === 'station' ? Math.hypot(mk.orbit.cx, mk.orbit.cz) + mk.orbit.r : 0;
+    reach = Math.max(reach, own, ring);
+  }
+  return reach;
+}
+
 /** Each moving station's course on the disc (courseOnScreen at the disc's
  *  scale), burn to arrival; nothing once it has arrived. */
 export function plotCourses(

@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { solarPlotBodies, stationBodies, plotOffset, screenOffset } from './map';
 import type { MapBody } from './map';
 import type { PlanModule, StationPlan } from './stationPlan';
+import type { HoloMarker } from './mapHologramLayout';
 import { DEFAULT_STATION_RECORD } from './stations';
 import { ORBIT_EPOCH_MS } from './orbits';
 import {
@@ -14,6 +15,7 @@ import {
   STATION_SPREAD,
   holoFoot,
   holoPoint,
+  plotReach,
   ringInclination,
   PLOT_SCALE,
   PLOT_SECONDS,
@@ -179,6 +181,15 @@ describe('the plot on the disc', () => {
     expect(len(course.points[0]!)).toBeCloseTo(aris.orbitRadius * PLOT_SCALE * orbitStretch(aris.id), 6);
     expect(len(course.points[2]!)).toBeCloseTo(sov.orbitRadius * PLOT_SCALE * orbitStretch(sov.id), 6);
     expect(gap(course.points[0]!, holoPoint(d0))).toBeLessThan(0.02);
+  });
+
+  it('reaches to the belt, or to the farthest station ring when one reaches past it', () => {
+    const bodies = solarPlotBodies([DEFAULT_STATION_RECORD]);
+    const markers = plotMarkers(bodies, T);
+    expect(plotReach(markers)).toBeCloseTo(beltRadius(bodies)!, 9);
+    const far: HoloMarker = { id: 'far', name: 'FAR', type: 'station', frame: 'planet-sovereign', x: 0.4, z: 0, here: false, orbit: { cx: 0.3, cz: 0, r: 0.4 } };
+    expect(plotReach([...markers, far])).toBeCloseTo(0.7, 9);
+    expect(plotReach([])).toBe(0);
   });
 
   it('has a belt at the rim, where its marker is', () => {
