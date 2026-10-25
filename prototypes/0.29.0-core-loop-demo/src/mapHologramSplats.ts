@@ -35,7 +35,8 @@ export function setSparkProvider(p: (() => Promise<SparkHost | null>) | null): v
   hostPromise = null;
 }
 
-function sparkHost(): Promise<SparkHost | null> {
+/** Spark and the scene's SparkRenderer, once; null where there is none. */
+export function sparkHost(): Promise<SparkHost | null> {
   if (!provider) return Promise.resolve(null);
   if (!hostPromise) {
     hostPromise = provider().catch((err) => {
@@ -183,10 +184,21 @@ function ring(splats: PackedSplats, n: number, r: number, spread: number, lift: 
  * turns with the rest). Resolves to null where Spark is not to be had;
  * mapHologram.ts keeps the mesh plot then.
  */
-export async function buildSplatPlot(parent: THREE.Object3D): Promise<SplatPlotHandle | null> {
+export interface SplatPlotOptions {
+  /** Grain: 1 for the table (the plot a few hundred pixels across), more
+   *  for a close view — splats `detail` times smaller and as many times
+   *  more numerous, so the picture stays crisp when it fills a panel. */
+  detail?: number;
+}
+
+export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOptions = {}): Promise<SplatPlotHandle | null> {
   const host = await sparkHost();
   if (!host) return null;
   const { SplatMesh } = host.spark;
+  const detail = Math.max(1, Math.min(4, opts.detail ?? 1));
+  /** Counts grow with the detail, sizes shrink with it. */
+  const N = (n: number): number => Math.round(n * detail);
+  const Z = (size: number): number => size / detail;
   const group = new THREE.Group();
   group.name = 'map-hologram-splats';
   group.scale.setScalar(SPLAT_SCALE);
@@ -205,34 +217,34 @@ export async function buildSplatPlot(parent: THREE.Object3D): Promise<SplatPlotH
   // projection its volume.
   const sun = make('sun', (s) => {
     const rand = rng(7);
-    ball(s, 1200, 0.03, 0.0055, 1, SUN_CORE, SUN_CORE, rand, 0.3);
-    ball(s, 900, 0.07, 0.009, 0.18, SUN_CORONA, SUN_RIM, rand, 2.2);
-    rays(s, 90, 0.2, 0.0025, 0.4, SUN_CORONA, rand);
+    ball(s, N(1200), 0.03, Z(0.0055), 1, SUN_CORE, SUN_CORE, rand, 0.3);
+    ball(s, N(900), 0.07, Z(0.009), 0.18, SUN_CORONA, SUN_RIM, rand, 2.2);
+    rays(s, N(90), 0.2, Z(0.0025), 0.4, SUN_CORONA, rand);
   });
   sun.position.y = 0.02;
   const haze = make('haze', (s) => {
     const rand = rng(11);
-    for (let i = 0; i < 500; i++) {
+    for (let i = 0; i < N(500); i++) {
       const a = rand() * Math.PI * 2, rr = HOLO_RADIUS * Math.sqrt(rand());
       V.set(Math.cos(a) * rr, 0.01 + rand() * 0.05, Math.sin(a) * rr);
-      S.setScalar(0.03 + rand() * 0.05);
+      S.setScalar(Z(0.03 + rand() * 0.05));
       s.pushSplat(V, S, Q, 0.02, DUST);
     }
     // The dome: a hemisphere of soft light.
-    for (let i = 0; i < 700; i++) {
+    for (let i = 0; i < N(700); i++) {
       const u = rand(), v = rand();
       const theta = 2 * Math.PI * u, phi = Math.acos(1 - v); // upper half
       const r = HOLO_RADIUS * 1.02;
       V.set(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi) * 0.5, r * Math.sin(phi) * Math.sin(theta));
-      S.setScalar(0.02 + rand() * 0.03);
+      S.setScalar(Z(0.02 + rand() * 0.03));
       s.pushSplat(V, S, Q, 0.012, DUST);
     }
   });
   // The belt: thousands of grains in an annulus, a little thickness to it.
   let belt: SplatMeshT | null = null;
-  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, 5000, r, 0.06, 0.02, 0.0026, 0.7, BELT, rng(5)));
+  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, N(5000), r, 0.06, 0.02, Z(0.0026), 0.7, BELT, rng(5)));
   // The scan: a thin ring that climbs off the disc and fades, over and over.
-  const sweep = make('sweep', (s) => ring(s, 400, HOLO_RADIUS * 0.98, 0.004, 0.002, 0.003, 0.5, ATMOSPHERE, rng(31)));
+  const sweep = make('sweep', (s) => ring(s, N(400), HOLO_RADIUS * 0.98, 0.004, 0.002, Z(0.003), 0.5, ATMOSPHERE, rng(31)));
 
   // One rig per planet: the body, its atmosphere, and the dust rings of the
   // stations round it (rebuilt when the set of ring radii changes).
@@ -245,10 +257,10 @@ export async function buildSplatPlot(parent: THREE.Object3D): Promise<SplatPlotH
     g.name = `planet-${id}`;
     group.add(g);
     const [a, b, air] = PLANET_COLORS[id] ?? PLANET_DEFAULT;
-    const body = new SplatMesh({ constructSplats: (s) => shell(s, 700, 0.027, 0.0036, 1, a, b, rng(id.length * 31)) });
+    const body = new SplatMesh({ constructSplats: (s) => shell(s, N(700), 0.027, Z(0.0036), 1, a, b, rng(id.length * 31)) });
     // The atmosphere: a thin halo just off the surface, not a fill.
-    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, 260, 0.036, 0.009, 0.07, air, air, rng(id.length * 17)) });
-    const foot = new SplatMesh({ constructSplats: (s) => pillar(s, 90, 0.017 + SPLAT_LIFT / SPLAT_SCALE, 0.006, 0.004, 0.14, DUST, rng(id.length * 5)) });
+    const atmo = new SplatMesh({ constructSplats: (s) => shell(s, N(260), 0.036, Z(0.009), 0.07, air, air, rng(id.length * 17)) });
+    const foot = new SplatMesh({ constructSplats: (s) => pillar(s, N(90), 0.017 + SPLAT_LIFT / SPLAT_SCALE, 0.006, Z(0.004), 0.14, DUST, rng(id.length * 5)) });
     g.add(body); g.add(atmo); g.add(foot);
     rig = { group: g, rings: null, ringKey: '', orbit: null, orbitR: 0 };
     planets.set(id, rig);
@@ -260,13 +272,13 @@ export async function buildSplatPlot(parent: THREE.Object3D): Promise<SplatPlotH
     let m = sparks.get(id);
     if (m) return m;
     m = kind === 'station'
-      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, 120, 0.011, 0.0038, 1, STATION, STATION, rand, 0.5); ball(s, 60, 0.024, 0.006, 0.18, ATMOSPHERE, DUST, rand, 1.5); })
-      : make(`lagrange-${id}`, (s) => ball(s, 90, 0.016, 0.006, 0.4, LAGRANGE, DUST, rng(id.length * 29), 1.2));
+      ? make(`station-${id}`, (s) => { const rand = rng(id.length * 13 + 3); ball(s, N(120), 0.011, Z(0.0038), 1, STATION, STATION, rand, 0.5); ball(s, N(60), 0.024, Z(0.006), 0.18, ATMOSPHERE, DUST, rand, 1.5); })
+      : make(`lagrange-${id}`, (s) => ball(s, N(90), 0.016, Z(0.006), 0.4, LAGRANGE, DUST, rng(id.length * 29), 1.2));
     sparks.set(id, m);
     return m;
   };
   // "You are here": an amber halo that breathes.
-  const here = make('here', (s) => { const rand = rng(23); ring(s, 320, 0.04, 0.006, 0.006, 0.0045, 1, HERE, rand); ball(s, 160, 0.05, 0.009, 0.25, HERE, SUN_CORONA, rand, 1.5); });
+  const here = make('here', (s) => { const rand = rng(23); ring(s, N(320), 0.04, 0.006, 0.006, Z(0.0045), 1, HERE, rand); ball(s, N(160), 0.05, Z(0.009), 0.25, HERE, SUN_CORONA, rand, 1.5); });
   here.visible = false;
 
   const all = (): SplatMeshT[] => {
@@ -303,7 +315,7 @@ export async function buildSplatPlot(parent: THREE.Object3D): Promise<SplatPlotH
           if (mk.orbit && Math.abs(mk.orbit.r - rig.orbitR) > 1e-6) {
             rig.orbit?.removeFromParent(); rig.orbit?.dispose();
             const r = mk.orbit.r;
-            rig.orbit = make(`orbit-${mk.id}`, (s) => ring(s, 1400, r, 0.005, 0.004, 0.0028, 0.5, DUST, rng(mk.id.length * 7)));
+            rig.orbit = make(`orbit-${mk.id}`, (s) => ring(s, N(1400), r, 0.005, 0.004, Z(0.0028), 0.5, DUST, rng(mk.id.length * 7)));
             rig.orbit.position.set(mk.orbit.cx, 0.004, mk.orbit.cz);
             rig.orbitR = r;
           }
@@ -331,7 +343,7 @@ export async function buildSplatPlot(parent: THREE.Object3D): Promise<SplatPlotH
           rig.rings?.removeFromParent(); rig.rings?.dispose(); rig.rings = null;
           if (radii.length) {
             const rs = radii.map(Number);
-            rig.rings = new SplatMesh({ constructSplats: (s) => { const rand = rng(id.length * 3 + rs.length); for (const r of rs) ring(s, 420, r, 0.003, 0.003, 0.0022, 0.55, DUST, rand); } });
+            rig.rings = new SplatMesh({ constructSplats: (s) => { const rand = rng(id.length * 3 + rs.length); for (const r of rs) ring(s, N(420), r, 0.003, 0.003, Z(0.0022), 0.55, DUST, rand); } });
             rig.rings.position.y = -0.013;
             rig.group.add(rig.rings);
           }

@@ -13,6 +13,7 @@ import { angleAt, baseOrbit, realMsFor, slotPosition, stationOrbit } from './orb
 import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
 import { describeMove, moveTransitPointAt, orbitChangePlanOf, stationPointWithMoveAt } from './stationMove';
 import type { StationMove } from './stations';
+import type { PlotView3D } from './mapPlot3d';
 
 export interface MapBody {
   id: string;
@@ -354,6 +355,10 @@ export class SolarSystemMap {
   // Callbacks
   private onTravelCompleteCallback: ((destinationId: string) => void) | null = null;
   private onStationAtlasCallback: ((stationId: string) => void) | null = null;
+  /** 🔮 #251: the plot in three dimensions (mapPlot3d.ts), in place of the
+   *  canvas, where Spark runs. The canvas and its hint hide behind it. */
+  private plot3d: PlotView3D | null = null;
+  private hint2d: HTMLDivElement | null = null;
 
   constructor() {
     this.initializeBodies();
@@ -423,6 +428,7 @@ export class SolarSystemMap {
       border: 1px solid rgba(212, 168, 75, 0.18);
     `;
     mapArea.appendChild(hint);
+    this.hint2d = hint;
 
     // 2. Info Sidebar
     const sidebar = document.createElement('div');
@@ -687,8 +693,39 @@ export class SolarSystemMap {
 
   public tick() {
     this.simTick++;
-    this.render();
+    if (this.plot3d) {
+      this.plot3d.frame(this.bodies, this.clock(), {
+        hereId: this.playerLocationId,
+        selectedId: this.selectedBody?.id ?? null,
+        ...(this.travelDestination ? { travel: { fromId: this.playerLocationId, toId: this.travelDestination.id } } : {}),
+      });
+    } else {
+      this.render();
+    }
     this.updateTravelProgress();
+  }
+
+  /**
+   * 🔮 Show the plot in three dimensions: the view takes the canvas's place
+   * in the map area, and a body picked in it is selected here, so the
+   * sidebar (card, atlas, travel) works as it does for a canvas click.
+   */
+  public attachPlot3D(view: PlotView3D): void {
+    if (!this.mapArea || this.plot3d) return;
+    this.plot3d = view;
+    if (this.canvas) this.canvas.style.display = 'none';
+    if (this.hint2d) this.hint2d.style.display = 'none';
+    view.mount(this.mapArea);
+    view.onSelect((id) => {
+      const body = this.bodies.find((b) => b.id === id);
+      if (body) this.selectBody(body);
+    });
+    if (this.isOpen()) view.resize();
+  }
+
+  /** Is the plot shown in three dimensions? */
+  public hasPlot3D(): boolean {
+    return this.plot3d !== null;
   }
 
   private updateTravelProgress() {
@@ -928,7 +965,8 @@ export class SolarSystemMap {
       this.container.style.display = 'flex';
       // Measure AFTER display:flex — a hidden container has zero layout.
       this.resizeCanvas();
-      this.render();
+      if (this.plot3d) this.plot3d.resize();
+      else this.render();
     }
   }
 

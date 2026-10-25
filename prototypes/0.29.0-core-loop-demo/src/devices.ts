@@ -80,6 +80,7 @@ import {
 } from './stationDirectory';
 import { atlasComponent, dismantledRoomIds, readAtlas as readStationAtlas, subscribeSharedAtlas } from './stationAtlas';
 import { StationPlanView } from './stationPlanView';
+import { createPlotView3D } from './mapPlot3d';
 import {
   TUG_MIN_ENGINES,
   describeMove,
@@ -1390,6 +1391,13 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       if (!mapTableMap) {
         mapTableMap = new SolarSystemMap();
         mapTableMap.mount(body); // panel is in the document — listeners bind live
+        // 🔮 #251: the plot in three dimensions where Spark runs (the canvas
+        // shows until it has loaded, and stays where it never does).
+        const map = mapTableMap;
+        void createPlotView3D().then((view) => {
+          if (view && mapTableMap === map) map.attachPlot3D(view);
+          else view?.unmount();
+        });
         mapTableMap.onTravelComplete((destinationId) => {
           // Zone-shard swap stays a console note (the overlay-era phone-chat
           // log lived in main.ts and is retired with the overlay wiring).
