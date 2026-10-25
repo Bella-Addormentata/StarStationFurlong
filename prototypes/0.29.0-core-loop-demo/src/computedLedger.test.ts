@@ -436,7 +436,8 @@ describe('an incarnation ended by its checkpoint', () => {
     });
     const late = kit.slip(AMY, 2, [black(40)]);
     after.set(late.key, late.rec);
-    expect(a.casino.computedFoldOf(TABLE)!.held.get(AMY.pid)).toBe(40n); // the fold reads it
+    expect(a.casino.computedFoldOf(TABLE)!.held.size).toBe(0); // the fold reads none of it either
+    expect(a.casino.computedFoldOf(TABLE)!.felts.size).toBe(0);
     expect(a.casino.readChips(AMY.pid)).toBe(100); // the felt holds none of it
   });
 });

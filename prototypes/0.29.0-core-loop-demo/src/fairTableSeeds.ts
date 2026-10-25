@@ -133,7 +133,7 @@ function readSeedIndex(): string[] {
   }
 }
 
-function keepSeed(commit: string, seed: string): void {
+export function keepSeed(commit: string, seed: string): void {
   memSeeds.set(commit, seed);
   evictOldest(memSeeds, 256);
   try {
@@ -149,7 +149,7 @@ function keepSeed(commit: string, seed: string): void {
 
 /** The secret behind `commit`, if THIS device made it (checked against the
  *  commitment, so a stale or edited store entry is never revealed). */
-function seedFor(commit: string, ctx: TableSeedContext): string | null {
+export function seedFor(commit: string, ctx: TableSeedContext): string | null {
   // Commitments are public, so a peer can copy one from another open round
   // into this one: the seed must open it in THIS context, memory copy too.
   const mem = memSeeds.get(commit);
@@ -165,7 +165,7 @@ function seedFor(commit: string, ctx: TableSeedContext): string | null {
 
 /** Drop the secret behind `commit` — only if it belongs to `ctx`, so a
  *  commitment copied in from another open round can't erase that round's. */
-function forgetSeed(commit: string, ctx: TableSeedContext): void {
+export function forgetSeed(commit: string, ctx: TableSeedContext): void {
   if (!seedFor(commit, ctx)) return;
   memSeeds.delete(commit);
   try {

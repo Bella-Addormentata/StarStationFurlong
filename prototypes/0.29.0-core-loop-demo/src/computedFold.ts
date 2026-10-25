@@ -444,7 +444,8 @@ export interface FoldBase {
   /** Last round the checkpoint covers (0 with no checkpoint). */ u: number;
   /** Close hash of round u (null with no checkpoint). */ l: string | null;
   /** Checkpoint nets (empty with no checkpoint). */ n: Map<string, bigint>;
-  /** The checkpoint says the incarnation ended. */ ended: boolean;
+  /** The checkpoint says the incarnation ended: the session counts nothing
+   *  (no rounds, no felts, nothing held; the nets are the checkpoint's). */ ended: boolean;
 }
 
 export interface FoldResult {
@@ -1036,6 +1037,17 @@ export class TableFold {
   private compute(): FoldResult {
     this.sawPending = false;
     const { sid, u } = this.base;
+    // An ended incarnation plays no more rounds: a session map under the sid
+    // its final checkpoint names is junk someone wrote after the end (no
+    // build opens one), and counts nothing. The checkpoint's nets are all
+    // there is. (It still weighs what it weighs: rawBytes.)
+    if (this.base.ended) {
+      return {
+        base: this.base, rounds: [], tip: null, open: u + 1, parent: sid, openCloses: [], felts: new Map(),
+        nets: new Map(this.base.n), held: new Map(), revealedCommits: new Set(),
+        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, records: this.entries.size,
+      };
+    }
 
     // 1. Round by round from the base: which closes are eligible, and which
     //    of those are decided. A close is eligible only under an eligible,

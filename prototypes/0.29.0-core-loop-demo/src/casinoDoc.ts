@@ -169,14 +169,18 @@
  * ended; so a forged or deleted switch moves no decided chip, it only hands
  * open stakes back). Both come from one fold result in one recount, before
  * any observer runs, so a decided round moves its stake from held to paid at
- * once, as a settle does. A page holding part of an update keeps what it
- * last counted of a table it can't read whole (casinoWhole, which also reads
- * the table as not whole when a session or checkpoint it counted is gone
- * with nothing naming it: frozen, as a table whose book is lost, while the
- * rest of the casino goes on), and spends nothing while any table waits for
- * the rest, or for its signatures to be checked (computedSettled): the
- * checks run 40 ms a pass at most, the rest in empty transactions after,
- * which send nothing to the room.
+ * once, as a settle does. A trim swaps a session for its checkpoint and the
+ * open round's felts in one transaction (writeCheckpointAndTrim), so on a
+ * page whose fold agreed nothing moves; an ended incarnation's sessions go
+ * later, under a checkpoint saying it ended (finalizeComputed), after which
+ * no session of it counts, and its nets count on. A page holding part of
+ * an update keeps what it last counted of a table it can't read whole
+ * (casinoWhole, which also reads the table as not whole when a session or
+ * checkpoint it counted is gone with nothing naming it: frozen, as a table
+ * whose book is lost, while the rest of the casino goes on), and spends
+ * nothing while any table waits for the rest, or for its signatures to be
+ * checked (computedSettled): the checks run 40 ms a pass at most, the rest
+ * in empty transactions after, which send nothing to the room.
  *
  * The HOUSE keeps no stored record at all — everything about the cage is
  * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
@@ -2118,6 +2122,15 @@ export function isComputedTable(tableId: string): boolean {
   return inc !== null && !casinoMap!.has(goneKey(tableId, inc)) && checkpointAt(computedMap!, tableId, inc)?.e !== 1;
 }
 
+/** Whether incarnation `inc` of table `tableId` is over for good: a removal
+ *  marked it (`gone:`), or its checkpoint says it ended (finalizeComputed
+ *  writes both). A switch that is missing, or junk, ends nothing yet: a
+ *  peer's delete the house puts back, and the incarnation goes on. */
+export function computedIncEnded(tableId: string, inc: string): boolean {
+  const casino = ensureMap();
+  return casino.has(goneKey(tableId, inc)) || checkpointAt(computedMap!, tableId, inc)?.e === 1;
+}
+
 // ⚖️ Signatures: strict noble, about 2 ms a check, so a page joining a busy
 // table can't check a session's records in one go without a stall. Each
 // recount spends at most COMPUTED_VERIFY_MS on them, shared by every table;
@@ -2214,6 +2227,14 @@ function queueVerifySlice(): void {
 export function markComputedVerdict(tableId: string, hash: string): void {
   const inc = computedIncOf(tableId);
   if (inc !== null) verdictsOf(`${tableId}:${inc}`).set(hash, true);
+}
+
+/** What this page knows of record `hash`'s signature in incarnation `inc` of
+ *  table `tableId`: true (checked, or its own), false (checked and forged),
+ *  undefined (never asked: the fold checks only what it counts). Read-only:
+ *  nothing is checked here, so no read spends a recount's budget. */
+export function computedVerdictOf(tableId: string, inc: string, hash: string): boolean | undefined {
+  return computedVerdicts.get(`${tableId}:${inc}`)?.get(hash);
 }
 
 /** The key a computed felt must be signed with to count (TableFold's
@@ -2537,6 +2558,137 @@ export function computedSessionForWrite(tableId: string): Y.Map<unknown> | null 
  *  it (a phase its clock ran out), as `computed:<tableId>`. */
 export function notifyCasinoView(tableId: string): void {
   notify(new Set([`computed:${tableId}`]));
+}
+
+/** Every session map the doc holds of incarnation `inc` of table `tableId`
+ *  (the live one, and any a rival trim left: two sides of a split each open
+ *  their own), by key. Parsed, so another table whose id runs on past this
+ *  one's (`<tableId>:<inc>…`) keeps its own. */
+function sessionKeysOf(map: Y.Map<unknown>, tableId: string, inc: string): string[] {
+  const out: string[] = [];
+  for (const key of map.keys()) {
+    const at = computedKeyParts(key);
+    if (at && at.sid !== undefined && at.t === tableId && at.inc === inc) out.push(key);
+  }
+  return out;
+}
+
+/**
+ * 🧹 Trim computed table `tableId`'s live session to checkpoint `cp`, in ONE
+ * transaction: `cp` becomes the incarnation's checkpoint, every session map
+ * of it goes (deleting the whole map is what frees the doc's space; deleting
+ * its keys one by one leaves most of it), and the session `cp` opens
+ * (nextSid) is created holding `copies`, byte for byte under their keys (the
+ * open round's felts: they hold as they did). On a page whose fold agreed,
+ * the recount reads the checkpoint's nets for the rounds it took away and
+ * the copies' stakes for what they held: no balance moves, and listeners are
+ * told once (the view moved). A write into the old session at the same
+ * moment, through any reference to it, vanishes everywhere; its author puts
+ * it back (computedTable's re-put).
+ *
+ * Refused (false) unless `inc` is the table's live incarnation, the doc holds
+ * the table whole, and `cp` is a checkpoint (not an end: finalizeComputed)
+ * closing the session live now: a caller holding a fold from before another
+ * page's trim reached it trims nothing.
+ */
+export function writeCheckpointAndTrim(
+  tableId: string, inc: string, cp: Checkpoint, copies: readonly (readonly [key: string, value: unknown])[],
+): boolean {
+  ensureMap();
+  const map = computedMap!;
+  if (!isComputedTable(tableId) || computedIncOf(tableId) !== inc || !casinoWhole(tableId)) return false;
+  const ok = asCheckpoint(cp);
+  const ctx: FoldCtx = { room: boundRoomId, t: tableId, inc };
+  if (!ok || ok.e === 1 || ok.b !== nextSid(ctx, checkpointAt(map, tableId, inc))) return false;
+  const next = nextSid(ctx, ok);
+  boundDoc!.transact(() => {
+    map.set(`sum:${tableId}:${inc}`, cp);
+    for (const key of sessionKeysOf(map, tableId, inc)) map.delete(key);
+    const ses = new Y.Map<unknown>();
+    map.set(sessionKey(tableId, inc, next), ses);
+    for (const [key, value] of copies) ses.set(key, value);
+  });
+  return true;
+}
+
+/**
+ * 🧹 Finalise incarnation `inc` of computed table `tableId`, in ONE
+ * transaction: its final checkpoint `cp` (`e: 1`, the fold's nets: they go
+ * on counting, as a removed table's book does), every session map of it
+ * gone, and `gone:<tableId>:<inc>` marked if it isn't. A session map anyone
+ * writes after that counts nothing (an ended checkpoint's session is junk to
+ * the fold). `cp` null keeps the checkpoint already there, which must say the
+ * incarnation ended (a stray session after the end: only the maps go).
+ *
+ * Refused (false) unless the doc holds the table whole, this page tracks the
+ * incarnation, and `cp` ends the session live now. The caller decides when:
+ * an ended incarnation (computedEndedIncs) is compacted by the room's pages
+ * in turn; a switch-off ends a live one (and deletes the switch).
+ */
+export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | null): boolean {
+  const casino = ensureMap();
+  const map = computedMap!;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!c || !casinoWhole(tableId)) return false;
+  const was = checkpointAt(map, tableId, inc);
+  if (cp !== null) {
+    const ok = asCheckpoint(cp);
+    if (!ok || ok.e !== 1 || ok.b !== liveSidOf(c, was)) return false;
+  } else if (was?.e !== 1) {
+    return false;
+  }
+  boundDoc!.transact(() => {
+    if (cp !== null) map.set(`sum:${tableId}:${inc}`, cp);
+    for (const key of sessionKeysOf(map, tableId, inc)) map.delete(key);
+    if (!casino.has(goneKey(tableId, inc))) casino.set(goneKey(tableId, inc), 1);
+  });
+  return true;
+}
+
+/** What the room's computed sessions weigh: Σ rawBytes (computedFold: every
+ *  key, junk included) over each incarnation's live session as last counted,
+ *  ended ones too until they are compacted. A session past ROOM_MIN_BYTES is
+ *  trimmed for the room's sake once this passes ROOM_BYTES (computedTable). */
+export function computedRoomBytes(): number {
+  let total = 0;
+  for (const c of computedIncs.values()) if (c.live && c.last) total += c.last.rawBytes;
+  return total;
+}
+
+/** A computed incarnation that has ended and whose sessions are still in
+ *  the doc: what compaction finalises (computedTable). */
+export interface EndedComputed {
+  t: string;
+  inc: string;
+  /** Its fold as last counted (its decided nets: the final checkpoint's). */
+  res: FoldResult;
+  /** The session map its checkpoint opens, to read its records by (null:
+   *  only another of its session maps is left). Read-only. */
+  session: Y.Map<unknown> | null;
+}
+
+/** Every incarnation this page counts that has ended (a `gone:` mark, a
+ *  switch that is missing or names another incarnation, or a checkpoint
+ *  saying it ended) and still has a session map in the doc, by key. A table
+ *  a removal took out isn't among the room's tables any more, so this, not
+ *  the tables passed in, is what compaction goes by. */
+export function computedEndedIncs(): EndedComputed[] {
+  const casino = ensureMap();
+  const map = computedMap!;
+  const withSession = new Set<string>();
+  for (const key of map.keys()) {
+    const at = computedKeyParts(key);
+    if (at && at.sid !== undefined && map.get(key) instanceof Y.Map) withSession.add(`${at.t}:${at.inc}`);
+  }
+  const out: EndedComputed[] = [];
+  for (const key of [...withSession].sort()) {
+    const c = computedIncs.get(key);
+    if (!c?.last) continue;
+    const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
+      && !casino.has(goneKey(c.t, c.inc)) && checkpointAt(map, c.t, c.inc)?.e !== 1;
+    if (!live) out.push({ t: c.t, inc: c.inc, res: c.last, session: c.live });
+  }
+  return out;
 }
 
 // ── 🎲🎡 #226: who stands where, and the shooter's throw ─────────────────────

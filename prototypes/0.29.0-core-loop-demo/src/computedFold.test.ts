@@ -607,6 +607,40 @@ describe('a session after a checkpoint', () => {
     expect(f.result().base).toMatchObject({ sid: 'g', u: 0, ended: false });
   });
 
+  it('counts nothing of a session after a checkpoint saying the incarnation ended: its nets only', () => {
+    const end = kit.checkpoint(A, 'g', 3, 'c'.repeat(32), { alice: 100n, bob: -40n }, 1);
+    const esid = nextSid(TEST_CTX, end);
+    // A whole round, decided, and an open felt, under the sid the end names.
+    const bets = [red(50)];
+    const s4 = kit.slip(A, 4, bets);
+    const b5 = kit.slip(B, 5, [black(30)]);
+    const session = new TestSession().put(s4, kit.close(A, 4, esid, [s4]), kit.reveal(4, 'alice'), b5);
+    const res = fold(session, end);
+    expect(res.base).toMatchObject({ sid: esid, u: 3, ended: true });
+    expect(res.rounds).toEqual([]);
+    expect(res.tip).toBeNull();
+    expect(res.openCloses).toEqual([]);
+    expect(res.felts.size).toBe(0);
+    expect(res.held.size).toBe(0);
+    expect(res.revealedCommits.size).toBe(0);
+    expect(res.pending).toBe(false);
+    expect(res.nets).toEqual(new Map([['alice', 100n], ['bob', -40n]]));
+    // It still weighs what the doc holds.
+    expect(res.records).toBe(4);
+    expect(res.rawBytes).toBeGreaterThan(0);
+    // The same records under an end that isn't one count as a round.
+    const notEnded = kit.checkpoint(A, 'g', 3, 'c'.repeat(32), { alice: 100n, bob: -40n });
+    const sid = nextSid(TEST_CTX, notEnded);
+    const counted = fold(new TestSession().put(s4, kit.close(A, 4, sid, [s4]), kit.reveal(4, 'alice'), b5), notEnded);
+    expect(counted.rounds).toHaveLength(1);
+    expect(counted.nets.get('alice')).toBe(100n + deltaOf(bets, counted.rounds[0].pocket!));
+    // An incremental fold ending on the same records reads the same.
+    const f = new TableFold(TEST_CTX, sigs.check);
+    f.setBase(end);
+    f.apply(session.records.entries());
+    expect(snapshot(f.result())).toBe(snapshot(res));
+  });
+
   it('keeps bigint nets exact past 2^53', () => {
     const big = kit.checkpoint(A, 'g', 1, 'c'.repeat(32), { alice: 2n ** 53n + 1n, bob: -(10n ** 30n) });
     const bsid = nextSid(TEST_CTX, big);
