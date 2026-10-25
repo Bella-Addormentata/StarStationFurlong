@@ -16,7 +16,7 @@
 import * as THREE from 'three';
 import type { SplatMesh as SplatMeshT, SparkRenderer, PackedSplats } from '@sparkjsdev/spark';
 import type { HoloMarker } from './mapHologramLayout';
-import { HOLO_RADIUS, holoPoint, inclinationOf, ringInclination, type Inclination } from './mapHologramLayout';
+import { HOLO_RADIUS, holoFoot, holoPoint, inclinationOf, ringInclination, type Inclination } from './mapHologramLayout';
 
 type SparkModule = typeof import('@sparkjsdev/spark');
 
@@ -178,9 +178,9 @@ function rays(splats: PackedSplats, n: number, len: number, thick: number, opaci
     const u = rand(), v = rand();
     const theta = 2 * Math.PI * u, phi = Math.acos(2 * v - 1);
     dir.set(Math.sin(phi) * Math.cos(theta), Math.cos(phi) * 0.6, Math.sin(phi) * Math.sin(theta)).normalize();
-    const l = len * (0.5 + rand());
+    const l = len * (0.6 + 0.5 * rand());
     V.copy(dir).multiplyScalar(l * 0.55);
-    S.set(l * 0.5, thick, thick);
+    S.set(l * 0.45, thick, thick);
     Q.setFromUnitVectors(xAxis, dir);
     splats.pushSplat(V, S, Q, opacity * (0.5 + 0.5 * rand()), color);
   }
@@ -291,14 +291,14 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
       const u = rand(), v = rand();
       const theta = 2 * Math.PI * u, phi = Math.acos(1 - v); // upper half
       const r = HOLO_RADIUS * 1.02;
-      V.set(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi) * 0.5, r * Math.sin(phi) * Math.sin(theta));
+      V.set(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi) * 0.85, r * Math.sin(phi) * Math.sin(theta));
       S.setScalar(Z(0.02 + rand() * 0.03));
       s.pushSplat(V, S, Q, 0.012 / detail, DUST);
     }
   });
   // The belt: thousands of grains in an annulus, a little thickness to it.
   let belt: SplatMeshT | null = null;
-  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, N(4600), r, 0.07, 0.04, Z(0.0022), 0.5, BELT, rng(5)));
+  const beltFor = (r: number): SplatMeshT => make('belt', (s) => ring(s, N(5000), r, 0.07, 0.07, Z(0.0022), 0.5, BELT, rng(5)));
   // The scan: a thin ring that climbs off the disc and fades, over and over.
   const sweep = make('sweep', (s) => ring(s, N(400), HOLO_RADIUS * 0.98, 0.004, 0.002, Z(0.003), 0.5, ATMOSPHERE, rng(31)));
 
@@ -325,8 +325,29 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     planets.set(id, rig);
     return rig;
   };
-  // A spark per station, a glow per Lagrange pocket.
+  // A spark per station, a glow per Lagrange pocket — and under each
+  // station a thread down (or up) to its planet's plane, for its height.
   const sparks = new Map<string, SplatMeshT>();
+  const feet = new Map<string, THREE.Line>();
+  const footMats = new Map<number, THREE.LineBasicMaterial>();
+  const footFor = (id: string): THREE.Line => {
+    let line = feet.get(id);
+    if (line) return line;
+    const hex = stationHue(id);
+    let mat = footMats.get(hex);
+    if (!mat) {
+      mat = new THREE.LineBasicMaterial({ color: srgb(hex), transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false });
+      footMats.set(hex, mat);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+    line = new THREE.Line(geo, mat);
+    line.name = `foot-${id}`;
+    line.frustumCulled = false; // its bounds are never recomputed as it moves
+    group.add(line);
+    feet.set(id, line);
+    return line;
+  };
   const sparkFor = (id: string, kind: 'station' | 'lagrange'): SplatMeshT => {
     let m = sparks.get(id);
     if (m) return m;
@@ -352,6 +373,7 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
   };
   const setAlpha = (alpha: number, nowMs: number): void => {
     for (const m of all()) m.opacity = alpha;
+    for (const mat of footMats.values()) mat.opacity = 0.35 * alpha;
     const sweepT = ((nowMs / 1000) % SWEEP_PERIOD_S) / SWEEP_PERIOD_S;
     sweep.opacity = alpha * (1 - sweepT) * (1 - sweepT);
   };
@@ -387,6 +409,14 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
           seenSparks.add(mk.id);
           m.position.set(p.x, 0.012 + p.y, p.z);
           if (mk.here) hereAt = p;
+          if (mk.type === 'station' && mk.orbit) {
+            const f = holoFoot(mk);
+            const line = footFor(mk.id);
+            const pos = line.geometry.getAttribute('position') as THREE.BufferAttribute;
+            pos.setXYZ(0, p.x, 0.012 + p.y, p.z);
+            pos.setXYZ(1, f.x, 0.012 + f.y, f.z);
+            pos.needsUpdate = true;
+          }
         }
       }
       // Station rings: dust round each planet at the stations' radii, each
@@ -418,6 +448,8 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
       for (const [id, m] of sparks) {
         if (seenSparks.has(id)) continue;
         m.removeFromParent(); m.dispose(); sparks.delete(id);
+        const f = feet.get(id);
+        if (f) { f.removeFromParent(); f.geometry.dispose(); feet.delete(id); }
       }
       if (!belt) {
         const b = markers.find((m) => m.type === 'asteroid-field');
@@ -440,6 +472,8 @@ export async function buildSplatPlot(parent: THREE.Object3D, opts: SplatPlotOpti
     },
     dispose() {
       for (const m of all()) m.dispose();
+      for (const f of feet.values()) f.geometry.dispose();
+      for (const mat of footMats.values()) mat.dispose();
       for (const rig of planets.values()) { for (const m of rig.rings) m.dispose(); rig.orbit?.dispose(); }
       group.removeFromParent();
     },

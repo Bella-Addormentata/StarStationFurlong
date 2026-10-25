@@ -36,10 +36,13 @@ export interface PlotView3D {
 
 /** The orbit camera: yaw round the sun, pitch above the plane, distance. */
 export interface OrbitState { yaw: number; pitch: number; dist: number }
-export const ORBIT_DEFAULT: OrbitState = { yaw: 0.6, pitch: 0.42, dist: 3.4 };
+/** The view starts, and stays, above the steepest orbit's tilt (0.48 rad):
+ *  a tilted ring seen from exactly its own plane collapses to a line
+ *  through the sun, which read as a stray streak. */
+export const ORBIT_DEFAULT: OrbitState = { yaw: 0.6, pitch: 0.56, dist: 3.4 };
 /** The view drifts round the sun on its own while nobody drags (rad/s). */
 export const IDLE_DRIFT = 0.06;
-export const PITCH_MIN = 0.12;
+export const PITCH_MIN = 0.52;
 export const PITCH_MAX = 1.45;
 export const DIST_MIN = 1.6;
 export const DIST_MAX = 7;
@@ -206,6 +209,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   const plot = new THREE.Group();
   plot.scale.setScalar(PANEL_SCALE);
   scene.add(plot);
+  if (import.meta.env.DEV) (window as unknown as { __plot3d?: unknown }).__plot3d = { scene, camera, plot }; // dev console poking
   let splats: SplatPlotHandle | null = null;
   void buildSplatPlot(plot, { detail: PANEL_DETAIL }).then((h) => {
     if (!h) return;
@@ -226,6 +230,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
   travelGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
   const travelLine = new THREE.Line(travelGeo, lineMat);
   travelLine.visible = false;
+  travelLine.frustumCulled = false;
   scene.add(travelLine);
   const courseMat = new THREE.LineBasicMaterial({ color: 0x00d4ff, transparent: true, opacity: 0.5 });
   const courses: THREE.Line[] = [];
@@ -235,6 +240,7 @@ export async function createPlotView3D(): Promise<PlotView3D | null> {
     geo.setDrawRange(0, 0);
     const line = new THREE.Line(geo, courseMat);
     line.visible = false;
+    line.frustumCulled = false;
     scene.add(line);
     courses.push(line);
   }

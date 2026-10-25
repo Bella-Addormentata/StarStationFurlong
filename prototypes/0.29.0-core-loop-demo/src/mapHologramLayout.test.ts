@@ -12,6 +12,7 @@ import {
   HOLO_RADIUS,
   HOLO_REACH,
   STATION_SPREAD,
+  holoFoot,
   holoPoint,
   ringInclination,
   PLOT_SCALE,
@@ -160,6 +161,10 @@ describe('the plot on the disc', () => {
     // Rings differ in tilt by radius; a planet's point is on its orbit plane.
     expect(ringInclination(planet.id, 0.1).tilt).not.toBeCloseTo(ringInclination(planet.id, 0.14).tilt, 3);
     expect(Math.abs(pp.y)).toBeGreaterThan(0);
+    // Its foot: on the planet's plane, under its flat place.
+    const foot = holoFoot(station);
+    expect(Math.hypot(foot.x, foot.y, foot.z)).toBeCloseTo(Math.hypot(station.x, station.z), 9);
+    expect(foot).toEqual(inclinedPoint(station.x, station.z, inclinationOf(station.frame)));
   });
 });
 

@@ -18,6 +18,7 @@ describe('the orbit camera', () => {
     expect(o.yaw).not.toBe(ORBIT_DEFAULT.yaw);
     expect(o.pitch).toBe(ORBIT_DEFAULT.pitch);
     expect(orbitDrag(ORBIT_DEFAULT, 0, -10_000).pitch).toBe(PITCH_MIN);
+    expect(PITCH_MIN).toBeGreaterThan(0.48); // above the steepest orbit tilt
     expect(orbitDrag(ORBIT_DEFAULT, 0, 10_000).pitch).toBe(PITCH_MAX);
   });
 

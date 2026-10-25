@@ -135,7 +135,7 @@ function stretched(mk: HoloMarker, bodies: readonly MapBody[], nowMs: number, si
  */
 export function ringInclination(frame: string, r: number): Inclination {
   const seed = r * 1000 + frame.length;
-  return { tilt: 0.3 * Math.sin(seed * 1.7), node: (seed * 0.61) % Math.PI };
+  return { tilt: 0.55 * Math.sin(seed * 1.7), node: (seed * 0.61) % Math.PI };
 }
 
 /**
@@ -143,6 +143,12 @@ export function ringInclination(frame: string, r: number): Inclination {
  * orbit's tilted plane (inclinationOf) — a station on its own tilted ring
  * round its planet, which stands on the planet's plane.
  */
+/** Where a station's foot stands on its planet's orbit plane — straight
+ *  under (or over) the station, for the line that shows its height. */
+export function holoFoot(mk: HoloMarker): { x: number; y: number; z: number } {
+  return inclinedPoint(mk.x, mk.z, inclinationOf(mk.frame));
+}
+
 export function holoPoint(mk: HoloMarker): { x: number; y: number; z: number } {
   if (mk.type === 'station' && mk.orbit) {
     const c = inclinedPoint(mk.orbit.cx, mk.orbit.cz, inclinationOf(mk.frame));
@@ -172,9 +178,9 @@ function frameOf(bodies: readonly MapBody[], body: MapBody, nowMs: number): stri
  */
 export interface Inclination { tilt: number; node: number }
 const INCLINATIONS: Record<string, Inclination> = {
-  'planet-aris': { tilt: 0.32, node: 0.7 },
-  'planet-sovereign': { tilt: -0.2, node: 2.3 },
-  'belt-ring': { tilt: 0.1, node: 1.1 },
+  'planet-aris': { tilt: 0.48, node: 0.7 },
+  'planet-sovereign': { tilt: -0.36, node: 2.3 },
+  'belt-ring': { tilt: 0.16, node: 1.1 },
 };
 export function inclinationOf(frame: string): Inclination {
   return INCLINATIONS[frame] ?? { tilt: 0, node: 0 };
