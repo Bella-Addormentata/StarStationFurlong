@@ -24,6 +24,7 @@ import { rotateIsoOffset } from './cameraRig';
 import { STAND_EYE_OFFSET } from './player';
 import { isFormFieldTarget } from './typingFocus';
 import { FovZoom } from './firstPersonZoom';
+import { isTurnKey, turnYawStep } from './firstPersonTurn';
 
 // Base (yaw-0) isometric offsets for the ortho levels — the camera rig
 // (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
@@ -137,6 +138,8 @@ const FIRST_PERSON_FOV = 65;
  *  the view leaves first person. */
 const firstPersonFov = new FovZoom(FIRST_PERSON_FOV);
 let firstPersonFovAt = 0;
+/** 🧭 Q / E held down for keyboard turning in first person (firstPersonTurn.ts). */
+const turnKeysHeld = new Set<string>();
 let orthographicCamera: THREE.OrthographicCamera | null = null;
 
 // 🟢 Transition / Animation states
@@ -371,12 +374,25 @@ export class MultiScaleZoomView {
         return;
       }
 
+      // 🧭 Q / E turn the first-person view while held (the helm's stick
+      // takes them first, in the capture phase, for strafing).
+      if (isTurnKey(e.code)) {
+        turnKeysHeld.add(e.code);
+        return;
+      }
+
       if (e.key === '-' || e.key === 'Subtract') {
         this.zoomOut();
       } else if (e.key === '+' || e.key === '=' || e.key === 'Add') {
         this.zoomIn();
       }
     });
+
+    // Unguarded, like input.ts's keyup: a key let go anywhere stops the turn.
+    window.addEventListener('keyup', (e) => {
+      turnKeysHeld.delete(e.code);
+    });
+    window.addEventListener('blur', () => turnKeysHeld.clear());
 
     window.addEventListener('resize', () => {
       if (this.canvas) {
@@ -707,6 +723,9 @@ export class MultiScaleZoomView {
         const fovDt = firstPersonFovAt > 0 ? Math.min(0.1, (now - firstPersonFovAt) / 1000) : 0;
         firstPersonFovAt = now;
         perspectiveCamera.fov = firstPersonFov.step(fovDt);
+
+        // 🧭 Q / E turning, on the same frame clock as the zoom ease.
+        yaw += turnYawStep(turnKeysHeld, fovDt);
 
         // Query the player's active position dynamically so we look FROM the player's head instead of at them.
         const playerPos = (window as any).world?.getPlayer()?.getPosition() || new THREE.Vector3(0, 0, 1.5);
