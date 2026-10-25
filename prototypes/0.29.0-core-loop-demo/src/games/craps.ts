@@ -116,6 +116,9 @@ export interface CrapsTableState {
   /** 🧾 This table's incarnation (casinoDoc tableIncFor), kept roll to roll:
    *  a table set up again under the same id pays its own rolls. */
   inc?: string;
+  /** 📒 The write of the table's book this state goes on from (casinoDoc
+   *  writeSettledState), kept roll to roll. */
+  bk?: string;
   /** ⚖️ This round's seed commitments (see SeedRoundFields). */
   houseCommit?: string;
   commits?: Record<string, string>;
@@ -300,6 +303,11 @@ export function isTableIncField(v: unknown): boolean {
   return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 32);
 }
 
+/** A table state's `bk` (casinoDoc writeSettledState): none, or a book write's id. */
+export function isTableBookField(v: unknown): boolean {
+  return v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 64);
+}
+
 function isDicePair(value: unknown): value is [number, number] {
   return Array.isArray(value)
     && value.length === 2
@@ -336,6 +344,7 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && isPlayerIdField(s.lastShooter)
     && isPlayerIdField(s.operator)
     && isTableIncField(s.inc)
+    && isTableBookField(s.bk)
     && isSeedRoundFields(s)
     && (s.fairMode === undefined || FAIRNESS_MODES.includes(s.fairMode));
 }

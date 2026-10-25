@@ -63,6 +63,14 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** The incarnation and book of a table's one book in the page's doc. */
+function onlyBook(page: Page, table: string): { inc: string; book: import('./casinoDoc').TableBook } {
+  const keys = [...page.doc.getMap('casinoChips').keys()].filter((k) => k.startsWith(`book:${table}:`));
+  expect(keys).toHaveLength(1);
+  const inc = keys[0].slice(`book:${table}:`.length);
+  return { inc, book: page.casino.readTableBook(table, inc)! };
+}
+
 /** Count the updates a page's doc sends while `act` runs. */
 function updatesDuring(page: Page, act: () => void): number {
   let n = 0;
@@ -600,7 +608,8 @@ describe('a craps list an earlier build put down, as the table goes', () => {
       a = await loadPage(clientA);
       b = await loadPage(clientB);
       await rolledAsRemoved(earlierTable);
-      expect(a.doc.getMap('casino').get(`kept:${craps}:${bettor}`)).toMatchObject({ taken: 10 });
+      const { inc, book } = onlyBook(a, craps);
+      expect(book.kept[bettor]).toMatchObject({ taken: 10 }); // what the earlier build took, kept up
       for (const page of [a, b]) {
         expect(page.casino.readCrapsTableState(craps)).toBeNull();
         expect(page.casino.readChips(bettor)).toBe(100);
@@ -608,7 +617,9 @@ describe('a craps list an earlier build put down, as the table goes', () => {
       a.craps.closeCrapsTable(craps); // page a hears of the removal
       sync(a.doc, b.doc);
       for (const page of [a, b]) {
-        expect([...page.doc.getMap('casino').keys()].filter((k) => k.startsWith('kept:'))).toEqual([]);
+        // refunded as the removal would have, against the book's record of the roll
+        expect(page.doc.getMap('casinoChips').get(`end:${craps}:${inc}:${bettor}`))
+          .toMatchObject({ d: 10, seen: book.recs[bettor].w });
         expect(page.casino.readChips(bettor)).toBe(100);
       }
       a.craps.closeCrapsTable(craps); // and again, as a page leaving the room does
@@ -630,7 +641,9 @@ describe('a craps list an earlier build put down, as the table goes', () => {
       await flush();
       b.craps.closeCrapsTable(craps);
       sync(a.doc, b.doc);
-      for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(clientA > clientB ? 95 : 100);
+      // The roll stands either way (the removal writes no book): the field's
+      // 5 is lost, and the 10 the pass line kept up comes back.
+      for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(95);
     });
 
     it(`a Fair roll voided as the table is removed hands it back once (${winner === 'the roll' ? 'the void' : winner} winning ties)`, async () => {
@@ -654,7 +667,7 @@ describe('a craps list an earlier build put down, as the table goes', () => {
     a = await loadPage(2); // the roll wins ties
     b = await loadPage(1);
     await rolledAsRemoved();
-    const inc = (a.doc.getMap('casino').get(`kept:${craps}:${bettor}`) as { inc: string }).inc;
+    const { inc } = onlyBook(a, craps);
     b.casino.creditTableOutcome(craps, inc, 'end', bettor, 10); // the refund, paid
     sync(a.doc, b.doc);
     for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
@@ -715,7 +728,7 @@ describe("the stickman's record of a roll against the player's own list", () => 
   function sevenOut(): void {
     const s = a.casino.readCrapsTableState(craps)!;
     a.casino.transactCasino(() => {
-      a.casino.writeCrapsTableState(craps, { ...s, phase: 'settled', point: null });
+      a.casino.writeSettledState(craps, { ...s, phase: 'settled', point: null });
       a.casino.creditTableOutcome(craps, s.inc!, 2, bettor, -20);
       a.casino.pruneCrapsBets(craps, bettor, 2, []);
     });
@@ -753,7 +766,7 @@ describe("the stickman's record of a roll against the player's own list", () => 
     const s = a.casino.readCrapsTableState(craps)!;
     // Roll 2 is a 4: nothing resolves, both bets stay up.
     a.casino.transactCasino(() => {
-      a.casino.writeCrapsTableState(craps, { ...s, phase: 'settled' });
+      a.casino.writeSettledState(craps, { ...s, phase: 'settled' });
       a.casino.pruneCrapsBets(craps, bettor, 2, [pass, place6]);
     });
     a.craps.openCrapsBetting(craps, 3, 6, a.casino.readCrapsTableState(craps));
@@ -839,7 +852,7 @@ describe('a write at the moment the table is removed, from a page that leaves be
     // while page b removes the table; page a is gone before it hears.
     const s = a.casino.readCrapsTableState(craps)!;
     a.casino.transactCasino(() => {
-      a.casino.writeCrapsTableState(craps, { ...s, phase: 'settled', point: 6 });
+      a.casino.writeSettledState(craps, { ...s, phase: 'settled', point: 6 });
       a.casino.pruneCrapsBets(craps, bettor, s.round, [{ type: 'pass', amount: 10 }]);
     });
     b.craps.closeCrapsTable(craps);
@@ -861,7 +874,7 @@ describe('a write at the moment the table is removed, from a page that leaves be
     expect(b.casino.readChips(bettor)).toBe(90);
     const s = a.casino.readCrapsTableState(craps)!;
     a.casino.transactCasino(() => {
-      a.casino.writeCrapsTableState(craps, { ...s, phase: 'settled', point: 6 });
+      a.casino.writeSettledState(craps, { ...s, phase: 'settled', point: 6 });
       a.casino.pruneCrapsBets(craps, bettor, s.round, [{ type: 'pass', amount: 10 }]);
     });
     b.craps.closeCrapsTable(craps);
@@ -941,7 +954,7 @@ describe('a write at the moment the table is removed, from a page that leaves be
   it('nor does a table put back under the same id play the bets it left', () => {
     crapsBet();
     const s = a.casino.readCrapsTableState(craps)!;
-    a.casino.writeCrapsTableState(craps, { ...s, phase: 'settled', point: 6 });
+    a.casino.writeSettledState(craps, { ...s, phase: 'settled', point: 6 });
     a.casino.pruneCrapsBets(craps, bettor, s.round, [{ type: 'pass', amount: 10 }]);
     b.craps.closeCrapsTable(craps);
     sync(a.doc, b.doc);
@@ -1381,13 +1394,10 @@ describe('a list taken all down, at the rounds after', () => {
   const bettor = 'player-Carol';
   const craps = 'craps-1';
 
-  /** The round of Carol's last outcome on the table. */
+  /** The round of Carol's last outcome on the table (its book's record of her). */
   function lastOutcomeRound(page: Page, table: string): string | undefined {
-    let ev: string | undefined;
-    for (const [key, value] of page.doc.getMap('casinoChips').entries()) {
-      if (key.startsWith(`tbl:${table}:`) && (value as { p?: string }).p === bettor) ev = (value as { ev: string }).ev;
-    }
-    return ev;
+    const r = onlyBook(page, table).book.recs[bettor]?.r;
+    return r === undefined ? undefined : String(r);
   }
 
   it('roulette: is written up for its own round, and not for the next', async () => {
@@ -1903,6 +1913,9 @@ describe('a driver whose clock runs an hour behind the page before it', () => {
     const t = bTakesOver();
     b.croupier.tickAutoCroupier(TABLE);
     expect(b.casino.readTableState(TABLE)!.phaseDeadline).toBe(t + SHOW_MS);
+    // (World's frames run meanwhile: a page that ran none for a lapse would
+    // wait out a wake before it opens a round.)
+    for (let ms = 100; ms <= SHOW_MS; ms += 100) b.croupier.noteTablesRunning(t + ms);
     vi.setSystemTime(t + SHOW_MS);
     b.croupier.tickAutoCroupier(TABLE);
     expect(b.casino.readTableState(TABLE)).toMatchObject({ phase: 'betting', round: 5 });
@@ -2116,7 +2129,9 @@ describe('a takeover written at the very moment the round settles', () => {
       expect(x.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'settled', dice: [3, 3] });
       const thrown = x.casino.readDiceThrow(craps);
       sync(x.doc, y.doc);
-      expect(y.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'closing', operator: y.backend.CRAPS_PAGE_ID });
+      // The doc keeps Y's stamp, and the table reads as the book has it.
+      expect(y.doc.getMap('casino').get(`table:${craps}`)).toMatchObject({ phase: 'closing', operator: y.backend.CRAPS_PAGE_ID });
+      expect(y.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'settled', dice: [3, 3] });
       diceTo(second[0], second[1]);
       for (let t = T + 31_000; t <= T + 33_000; t += 500) { frame(x, t); frame(y, t); await flush(); }
       sync(x.doc, y.doc);
@@ -2149,13 +2164,19 @@ describe('a takeover written at the very moment the round settles', () => {
       expect(left).toMatchObject({ phase: 'settled', round: 1 });
       const chips = x.casino.readChips(bettor);
       sync(x.doc, y.doc);
-      expect(y.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'closing', operator: y.backend.CRAPS_PAGE_ID });
+      expect(y.doc.getMap('casino').get(`table:${craps}`)).toMatchObject({ phase: 'closing', operator: y.backend.CRAPS_PAGE_ID });
+      expect(y.casino.readCrapsTableState(craps)).toEqual(left); // as the book has it
       diceTo(3, 4);
       y.craps.rollAndSettleCraps(craps, 1, null); // straight to the settle, as an earlier check let it through
       await flush();
+      expect(y.casino.readCrapsTableState(craps)).toEqual(left); // it settled nothing
+      // Y's next write of the table's state (here a deadline stamp over the
+      // doc's) puts the book's back up instead, in a fresh write of the book.
+      y.casino.writeCrapsTableState(craps, { ...(y.doc.getMap('casino').get(`table:${craps}`) as import('./games/craps').CrapsTableState), phaseDeadline: T });
       sync(x.doc, y.doc);
       for (const page of [x, y]) {
-        expect(page.casino.readCrapsTableState(craps)).toEqual(left);
+        expect(page.casino.readCrapsTableState(craps)).toEqual({ ...left, bk: page.casino.readTableBook(craps, left.inc!)!.id });
+        expect(page.casino.readTableBook(craps, left.inc!)!.id).not.toBe(left.bk);
         expect(page.casino.readChips(bettor)).toBe(chips);
       }
     });
@@ -2177,13 +2198,13 @@ describe('a takeover written at the very moment the round settles', () => {
     expect(left).toMatchObject({ phase: 'settled', voided: true });
     y.casino.writeCrapsTableState(craps, { ...y.casino.readCrapsTableState(craps)!, operator: y.backend.CRAPS_PAGE_ID });
     sync(x.doc, y.doc);
-    const s = y.casino.readCrapsTableState(craps)!;
+    const s = y.doc.getMap('casino').get(`table:${craps}`) as import('./games/craps').CrapsTableState;
     expect(s).toMatchObject({ phase: 'closing', operator: y.backend.CRAPS_PAGE_ID });
     y.craps.tickCrapsClosing(craps, s, undefined, Infinity); // the takeover's stickman, at once
     await flush();
     sync(x.doc, y.doc);
     for (const page of [x, y]) {
-      expect(page.casino.readCrapsTableState(craps)).toEqual(left);
+      expect(page.casino.readCrapsTableState(craps)).toEqual({ ...left, bk: page.casino.readTableBook(craps, left.inc!)!.id });
       expect(page.casino.readDiceThrow(craps)).toBeNull();
       expect(page.casino.readMyCrapsBets(craps, bettor)).toEqual([{ type: 'field', amount: 10 }]);
     }
@@ -2205,7 +2226,8 @@ describe('a takeover written at the very moment the round settles', () => {
     x.croupier.rollAndSettle(TABLE, 1);
     await flush();
     sync(x.doc, y.doc);
-    expect(y.casino.readTableState(TABLE)).toMatchObject({ phase: 'closing', operator: y.croupier.ROULETTE_PAGE_ID });
+    expect(y.doc.getMap('casino').get(`table:${TABLE}`)).toMatchObject({ phase: 'closing', operator: y.croupier.ROULETTE_PAGE_ID });
+    expect(y.casino.readTableState(TABLE)).toMatchObject({ phase: 'settled', result: 1 }); // as the book has it
     spinTo(2); // what the robot would spin: black
     y.croupier.rollAndSettle(TABLE, 1, y.croupier.SHOW_MS);
     await flush();
@@ -2217,7 +2239,7 @@ describe('a takeover written at the very moment the round settles', () => {
   });
 });
 
-describe("a round's settled copy (casinoDoc settledKey) and the table's removal", () => {
+describe("a table's book (casinoDoc THE TABLE'S BOOK) and the table's removal", () => {
   const bettor = 'player-Carol';
 
   async function settleRound1(page: Page): Promise<void> {
@@ -2230,14 +2252,27 @@ describe("a round's settled copy (casinoDoc settledKey) and the table's removal"
     await flush();
   }
 
-  it('goes with the table when the removal comes after the settle', async () => {
+  it('stays when the table is removed after the settle, holding what it paid; the table put back keeps a book of its own', async () => {
     a.casino.buyInChips(bettor, 100);
     await settleRound1(a);
-    expect(a.doc.getMap('casino').has(`settled:${TABLE}`)).toBe(true);
+    const { inc, book } = onlyBook(a, TABLE);
+    expect(book).toMatchObject({ round: 1, recs: { [bettor]: { d: '10', r: 1 } }, st: { phase: 'settled', round: 1 } });
+    expect(a.casino.readTableState(TABLE)?.bk).toBe(book.id);
     sync(a.doc, b.doc);
     b.croupier.closeTable(TABLE, 'local');
     sync(a.doc, b.doc);
-    for (const page of [a, b]) expect(page.doc.getMap('casino').has(`settled:${TABLE}`)).toBe(false);
+    for (const page of [a, b]) {
+      expect(page.casino.readTableBook(TABLE, inc)).toEqual(book);
+      expect(page.casino.readTableState(TABLE)).toBeNull();
+      expect(page.casino.readChips(bettor)).toBe(110);
+    }
+    await settleRound1(b); // put back, its first round won
+    sync(a.doc, b.doc);
+    for (const page of [a, b]) {
+      expect(page.casino.readTableState(TABLE)!.inc).not.toBe(inc);
+      expect(page.casino.readTableBook(TABLE, page.casino.readTableState(TABLE)!.inc!)).toMatchObject({ round: 1 });
+      expect(page.casino.readChips(bettor)).toBe(120);
+    }
   });
 
   it('left by a removal at the very moment of the settle, never stands for the table put back', async () => {
@@ -2255,7 +2290,8 @@ describe("a round's settled copy (casinoDoc settledKey) and the table's removal"
     b.croupier.closeTable(TABLE, 'local');
     sync(a.doc, b.doc);
     // The settle's writes outlive the removal's deletes; its marks end them.
-    expect(a.doc.getMap('casino').has(`settled:${TABLE}`)).toBe(true);
+    const { inc } = onlyBook(a, TABLE);
+    expect(a.doc.getMap('casino').get(`table:${TABLE}`)).toMatchObject({ phase: 'settled', inc });
     expect(a.casino.readTableState(TABLE)).toBeNull();
     const chips = a.casino.readChips(bettor);
     // The table is put back, and its first round plays.

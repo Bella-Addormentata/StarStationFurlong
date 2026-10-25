@@ -50,6 +50,7 @@ import {
   readAllCrapsBets,
   readCrapsFairnessPref,
   readMyBets,
+  MAX_TABLE_BETTORS,
   readMyCrapsBets,
   readCrapsTableState,
   readPlayerKey,
@@ -73,9 +74,10 @@ export const REVEAL_GRACE_MS = 4_000;
 /** At most this many bettors per round (the transcript bound is 16 with the
  *  house). More than that and the extras simply aren't parties that roll. */
 const MAX_BETTOR_PARTIES = 15;
-/** Most distinct bettors a Fair round can carry (15 seeded + 16 unseeded, the
- *  transcript's bounds): the table refuses a new bettor past it. */
-export const MAX_TABLE_BETTORS = 2 * MAX_BETTOR_PARTIES + 1;
+/** Most distinct bettors a round can carry (casinoDoc MAX_TABLE_BETTORS): a
+ *  Fair round's 15 seeded + 16 unseeded, the transcript's bounds. The table
+ *  refuses a new bettor past it, Fair or not. */
+export { MAX_TABLE_BETTORS };
 
 type TableState = CrapsTableState | RouletteTableState;
 
@@ -260,6 +262,8 @@ const authoredRounds = new Set<string>();
 interface FrozenSnapshot {
   /** the table's incarnation it was taken on (tableIncOf) */
   inc: string;
+  /** the write of the table's book its round went on from (the state's `bk`) */
+  bk?: string;
   house: string;
   commits: Record<string, string>;
   wagers?: Record<string, string>;
@@ -277,7 +281,13 @@ const SNAPSHOTS_PER_TABLE = 4;
 // removed is another table's: one put back under the same id starts again at
 // round 1, and a page can hear the removal and the new table together,
 // never seeing the id without a table (forgetMissingTables), so it is
-// dropped here.
+// dropped here. And one of a round another run of the table's rounds opened
+// (this page froze it cut off from the room, and the doc kept the other
+// side's: casinoDoc THE TABLE'S BOOK) is no snapshot of the round up now,
+// whose state names the write of the book it went on from: the settle of
+// it goes by its own state's frozen fields. (A settled state names its own
+// write: the check of it goes by round, as above. A page whose side the doc
+// dropped may show that round failed.)
 function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
   const rounds = frozenSeen.get(`${casinoDocEpoch()}:${tableId}`);
   const seen = rounds?.get(String(s.round));
@@ -285,12 +295,14 @@ function seenFor(tableId: string, s: TableState): FrozenSnapshot | undefined {
     rounds!.delete(String(s.round));
     return undefined;
   }
+  if (seen && s.phase !== 'settled' && seen.bk !== s.bk) return undefined;
   return seen;
 }
 
 function snapshot(tableId: string, s: TableState): FrozenSnapshot {
   return {
     inc: tableIncOf(tableId, s),
+    ...(s.bk !== undefined ? { bk: s.bk } : {}),
     house: s.houseCommit ?? '',
     commits: { ...(s.commits ?? {}) },
     ...(s.wagers ? { wagers: { ...s.wagers } } : {}),
@@ -498,7 +510,7 @@ export function freezeCommits(
   // two pages settling it (a handover) write up the very bettors its close
   // names, so each one's outcome meets the other page's. What they bet plays
   // as it stands at the settle: nobody can know the result before it.
-  if (!s.houseCommit) return { bettors: [...staked].sort().slice(0, 2 * MAX_BETTOR_PARTIES + 1) };
+  if (!s.houseCommit) return { bettors: [...staked].sort().slice(0, MAX_TABLE_BETTORS) };
   const commits: Record<string, string> = {};
   const sigs: Record<string, string> = {};
   // Read only the staked players' records: anyone can add fseed keys, so a

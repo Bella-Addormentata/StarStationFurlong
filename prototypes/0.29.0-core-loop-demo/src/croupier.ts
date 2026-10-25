@@ -32,23 +32,28 @@
 
 import {
   casinoDocEpoch,
+  casinoWhole,
   clearTableKeys,
   creditTableOutcome,
   feltStake,
+  putTableBack,
   readAllBets,
   readCroupierBeat,
   readEmptiedLists,
   readFeltStakes,
   readTableOperatorLease,
   readTableState,
-  settledAlready,
+  setTablesAwakeCheck,
   tableEndingStakes,
   tableIncOf,
-  tableIncToOpen,
+  tableOpening,
+  tableWritable,
   transactCasino,
   writeCroupierBeat,
+  writeSettledState,
   writeTableOperatorLease,
   writeTableState,
+  whenCasinoWhole,
 } from './casinoDoc';
 import type { TableClosing, TableOperatorLease } from './casinoDoc';
 import { getPlayerId } from './identity';
@@ -89,6 +94,15 @@ export function setSoleCroupierPredicate(fn: () => boolean): void {
   solePredicate = fn;
 }
 
+/** Is a table of this id in the room's furniture? main.ts registers the
+ *  real check at boot (a removal heard on a doc not yet whole waits, and is
+ *  dropped if the table is back by then: closeWhenWhole). */
+let tableInRoom: (tableId: string) => boolean = () => false;
+
+export function setTableInRoomPredicate(fn: (tableId: string) => boolean): void {
+  tableInRoom = fn;
+}
+
 /** May THIS client drive the auto-croupier here? True on the deed holder's
  *  pages in a personal/solo room; false in venture / legacy shared rooms
  *  (manual). Of those pages, only the one taking the table turn
@@ -114,6 +128,8 @@ let leaseEpoch = -1;
 let leaseSeen: { page: string; beat: number; at: number } | null = null;
 /** When this page claimed the lease it holds (null: it holds none it claimed). */
 let leaseClaimedAt: number | null = null;
+/** Since when, by this page's clock, its doc has held part of an update (null: whole). */
+let wholeSince: number | null = null;
 let leaseRenewedAt = 0;
 
 function noteLease(lease: TableOperatorLease | null, now: number): void {
@@ -147,17 +163,20 @@ let tablesRanAt: number | null = null;
 let tablesFrom = 0;
 /** How many times this page has woken from not running its tables. */
 let tablesWakes = 0;
+/** A clock gone back by less than this (a time sync's correction) is no
+ *  sleep: what this page waits on moves back with it (noteTablesRunning). */
+const TABLE_CLOCK_SLACK_MS = 1_000;
 
 /**
  * This page is running its tables this frame (World calls it every frame the
  * room has tables, whoever drives them; takeTableTurn calls it too). A page
  * that stopped for a lapse or more (the computer slept, the tab froze) may
  * wake on a doc that hasn't heard another page take its tables over
- * meanwhile, and a settle written on that doc would overwrite the other
- * page's rounds when the two meet (creditTableOutcome keeps one running
- * record per table and player). So it waits out a lapse again, acting on no
- * table, for the doc to catch up (tablesAwake). A page cut off from the room
- * while it keeps running can't tell, and the computed tables end that case.
+ * meanwhile, and a settle written on that doc would undo the other page's
+ * rounds when the two meet (the doc keeps one write of a table's book). So
+ * it waits out a lapse again, acting on no table, for the doc to catch up
+ * (tablesAwake). A page cut off from the room while it keeps running can't
+ * tell: the doc keeps one side's book whole (casinoDoc THE TABLE'S BOOK).
  */
 export function noteTablesRunning(now = Date.now()): void {
   const epoch = casinoDocEpoch();
@@ -168,8 +187,12 @@ export function noteTablesRunning(now = Date.now()): void {
   }
   // A clock gone back (a correction as the computer wakes, a manual change)
   // says nothing of how long the page was away: it wakes as from a sleep,
-  // its wait a lapse from now, not until the clock comes round again.
-  if (tablesRanAt !== null && (now - tablesRanAt >= TABLE_LEASE_LAPSE_MS || now < tablesRanAt)) {
+  // its wait a lapse from now, not until the clock comes round again. One
+  // gone back by under a second is a time sync's step: a wait under way
+  // moves back with it, and the page runs on.
+  if (tablesRanAt !== null && now < tablesRanAt && tablesRanAt - now < TABLE_CLOCK_SLACK_MS) {
+    tablesFrom -= tablesRanAt - now;
+  } else if (tablesRanAt !== null && (now - tablesRanAt >= TABLE_LEASE_LAPSE_MS || now < tablesRanAt)) {
     tablesFrom = now + TABLE_LEASE_LAPSE_MS;
     tablesWakes += 1;
   }
@@ -193,8 +216,10 @@ export function tablesWakeCount(): number {
  *  page's next frame. A page that hasn't run them in this doc yet may. */
 export function tablesAwake(now = Date.now()): boolean {
   if (tablesRanAt === null || casinoDocEpoch() !== tablesEpoch) return true;
-  return now >= tablesFrom && now >= tablesRanAt && now - tablesRanAt < TABLE_LEASE_LAPSE_MS;
+  return now >= tablesFrom && tablesRanAt - now < TABLE_CLOCK_SLACK_MS && now - tablesRanAt < TABLE_LEASE_LAPSE_MS;
 }
+// Nor does it write a table's book back up meanwhile (casinoDoc tableWritable).
+setTablesAwakeCheck(() => tablesAwake());
 
 /**
  * May this page drive the auto tables this frame? Call it every frame from a
@@ -214,6 +239,15 @@ export function takeTableTurn(
   noteLease(lease, now);
   noteTablesRunning(now);
   if (!tablesAwake(now)) return false;
+  // 📒 A page whose doc has held part of an update for a lease's lapse
+  // settles nothing (casinoWhole), so it claims and renews nothing either:
+  // another of the owner's pages takes the tables (the room is asked again
+  // meanwhile for what this one is missing).
+  if (casinoWhole()) wholeSince = null;
+  else {
+    if (wholeSince === null || now < wholeSince) wholeSince = now;
+    if (now - wholeSince >= TABLE_LEASE_LAPSE_MS) return false;
+  }
   // (Its clock gone back, its claim and renewal count from now.)
   if (leaseClaimedAt !== null && now < leaseClaimedAt) leaseClaimedAt = now;
   if (now < leaseRenewedAt) leaseRenewedAt = now - TABLE_LEASE_RENEW_MS;
@@ -313,16 +347,23 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   } else {
     result = spinPocket();
   }
-  // The hashing yielded: settle only the very round this call was for, in the
-  // same room doc, on the same table (a table removed and put back, which
-  // can reach the same round meanwhile on a new incarnation, or a rival
-  // settle, is not).
-  const before = readTableState(tableId);
-  if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return;
-  if (tableIncOf(tableId, before) !== tableIncOf(tableId, live0)) return;
+  // The hashing yielded: settle only in the same room doc, and 📒 not on a
+  // doc holding part of another page's update: what it rewrote reads as
+  // gone until the rest comes (casinoWhole). The caller calls again.
+  if (casinoDocEpoch() !== epoch || !casinoWhole(tableId)) return;
   // Settled already, and a takeover's stamp written as it settled came back
-  // over it: the round stands as that settle left it.
-  if (putBackSettled(tableId, before)) return;
+  // over it, or the doc kept another page's book: the round stands as the
+  // book has it, put back up (putTableBack).
+  if (putTableBack(tableId)) return;
+  // Only the very round this call was for, on the same table (a table
+  // removed and put back, which can reach the same round meanwhile on a new
+  // incarnation, or a rival settle, is not).
+  const before = readTableState(tableId);
+  if (before?.phase !== 'closing' || before.round !== round) return;
+  if (tableIncOf(tableId, before) !== tableIncOf(tableId, live0)) return;
+  // Nor another write of its book's (the other side's round of that number,
+  // which the doc kept while this one hashed): this one's spin was for it.
+  if (before.bk !== live0.bk) return;
   // 🎡 A manual round settles only on the page holding its lease: two house
   // members pressing SPIN must not both publish and pay.
   if (before.operator !== undefined && before.operator !== ROULETTE_PAGE_ID) return;
@@ -372,7 +413,7 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
   const now = Date.now();
   // One transaction: a page sees the settled round and what it paid together.
   transactCasino(() => {
-    writeTableState(tableId, {
+    writeSettledState(tableId, {
       kind: 'roulette',
       phase: 'settled',
       round,
@@ -390,18 +431,10 @@ async function settleRoulette(tableId: string, round: number, autoShowMs?: numbe
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
     settledRound(tableId, before);
-    // One change per bettor for the round, counted once however many pages
-    // settle it (creditTableOutcome).
+    // One change per bettor for the round, in this settle's write of the
+    // table's book (creditTableOutcome).
     for (const [pid, amount] of Object.entries(owed)) creditTableOutcome(tableId, tableIncOf(tableId, before), round, pid, amount);
   });
-}
-
-/** Put a round settled already back as its settle left it (settledAlready),
- *  when the doc's state came back to closing over it. True when it did. */
-function putBackSettled(tableId: string, s: RouletteTableState): boolean {
-  const done = settledAlready(tableId, s);
-  if (done) writeTableState(tableId, done);
-  return done !== null;
 }
 
 /** "No more bets": close the window and freeze the round's commitments.
@@ -417,6 +450,9 @@ export function closeBetting(tableId: string, s: RouletteTableState, deadlineMs?
 
 /** Open a fresh betting round (idle — no timer until a first bet arms it). */
 export function openBetting(tableId: string, round: number): void {
+  // 📒 Not on a doc holding part of an update, where a table read as gone
+  // would open anew, nor on a page just woken (tableWritable).
+  if (!tableWritable(tableId)) return;
   // One transaction: a name a removal left unmarked is marked as it opens.
   transactCasino(() => writeTableState(tableId, {
     kind: 'roulette',
@@ -426,7 +462,7 @@ export function openBetting(tableId: string, round: number): void {
     resultAt: 0,
     payouts: null,
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
-    inc: tableIncToOpen(tableId),
+    ...tableOpening(tableId),
   }));
 }
 
@@ -460,6 +496,12 @@ export function spinSeenAt(tableId: string, s: RouletteTableState, operator: str
  * race the settle.
  */
 export function tickAutoCroupier(tableId: string): void {
+  // 📒 Not on a doc holding part of another page's update (casinoWhole): a
+  // state it rewrote reads as gone, and a table read as gone opens anew.
+  if (!casinoWhole(tableId)) return;
+  // A state that doesn't go on from the table's book: the book's goes back
+  // up first (putTableBack).
+  if (putTableBack(tableId)) return;
   const now = Date.now();
   const s = readTableState(tableId);
   if (!s) {
@@ -531,14 +573,28 @@ export function timerOnThisClock(
  */
 export function closeTable(tableId: string, closing: TableClosing = 'heard'): void {
   // One transaction: no page sees the refunds without the table gone.
-  transactCasino(() => refundAndClear(tableId, closing));
+  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing)));
+}
+
+/** 📒 A table's removal, on a doc holding every update whole (casinoWhole):
+ *  its refunds read the table's lists and book, and a table read as gone
+ *  there would end an incarnation that isn't up. One heard meanwhile waits
+ *  for the rest, and is dropped if the table is back in the room by then
+ *  (put back: its opening clears what the removal left, tableOpening). */
+export function closeWhenWhole(tableId: string, close: () => void): void {
+  let now = true;
+  whenCasinoWhole(`close:${tableId}`, () => {
+    if (now || !tableInRoom(tableId)) close();
+  }, tableId);
+  now = false;
 }
 
 /** A table's removal: each list's held stake goes back with it, and what an
  *  earlier build's list took, each page refunds (tableEndingStakes),
  *  whichever heard of the removal first, while the page driving it may be
- *  settling this very round: the table's one outcome per bettor pays one.
- *  Then the keys go (clearTableKeys). */
+ *  settling this very round: a bettor's refund counts unless the doc kept
+ *  that settle's book, which settled their list (creditTableOutcome). Then
+ *  the keys go (clearTableKeys). */
 export function refundAndClear(tableId: string, closing: TableClosing): void {
   const end = tableEndingStakes(tableId);
   for (const [pid, taken] of Object.entries(end?.taken ?? {})) creditTableOutcome(tableId, end!.inc, 'end', pid, taken);

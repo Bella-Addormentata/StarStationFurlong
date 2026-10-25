@@ -404,10 +404,28 @@ describe('chip records', () => {
   });
 });
 
-describe('what a table pays a player', () => {
+describe("what a table pays a player (casinoDoc THE TABLE'S BOOK)", () => {
   const TABLE = 'roulette-1';
 
-  it('one outcome paid on two pages counts once, whichever hears of the other first', () => {
+  /** A settle of `round` on `page`: its write of the table's book, with each
+   *  bettor's outcome. */
+  function settle(page: CasinoDoc, inc: string, round: number, outcomes: Record<string, number>, table = TABLE): void {
+    page.transactCasino(() => {
+      page.writeSettledState(table, { kind: 'roulette', phase: 'settled', round, result: 0, resultAt: 0, payouts: {}, inc });
+      for (const [pid, amount] of Object.entries(outcomes)) page.creditTableOutcome(table, inc, round, pid, amount);
+    });
+  }
+
+  async function pages(clientA: number, clientB: number): Promise<void> {
+    docA = new Y.Doc();
+    docB = new Y.Doc();
+    docA.clientID = clientA;
+    docB.clientID = clientB;
+    pageA = await loadPage(docA);
+    pageB = await loadPage(docB);
+  }
+
+  it('one refund paid on two pages counts once, whichever hears of the other first', () => {
     pageA.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
     pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
     sync(docA, docB);
@@ -416,21 +434,23 @@ describe('what a table pays a player', () => {
     for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(30);
   });
 
-  it('a round settled on one page while the other removed the table pays one of the two, never both', () => {
-    pageA.creditTableOutcome(TABLE, 'inc1', 7, PLAYER, 60); // the payout
-    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30); // the refund
+  it('a round settled on one page while the other removed the table: the refund of a bettor the settle settled never counts, of one it didn\'t it does', () => {
+    settle(pageA, 'inc1', 7, { [PLAYER]: 60 }); // the payout
+    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30); // the refunds
+    pageB.creditTableOutcome(TABLE, 'inc1', 'end', OTHER, 10);
     sync(docA, docB);
-    const chips = pageA.readChips(PLAYER);
-    expect([60, 30]).toContain(chips);
-    expect(pageB.readChips(PLAYER)).toBe(chips);
+    for (const page of [pageA, pageB]) {
+      expect(page.readChips(PLAYER)).toBe(60);
+      expect(page.readChips(OTHER)).toBe(10);
+    }
   });
 
   it('outcomes one after another all count, round after round and then the removal', () => {
-    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, 20);
-    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 40);
+    settle(pageA, 'inc1', 1, { [PLAYER]: 20 });
+    settle(pageA, 'inc1', 2, { [PLAYER]: 40 });
     sync(docA, docB);
+    settle(pageB, 'inc1', 3, { [OTHER]: 5 });
     pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 10); // standing bets
-    pageB.creditTableOutcome(TABLE, 'inc1', 2, OTHER, 5);
     sync(docA, docB);
     for (const page of [pageA, pageB]) {
       expect(page.readChips(PLAYER)).toBe(70);
@@ -439,9 +459,9 @@ describe('what a table pays a player', () => {
   });
 
   it('a table set up again under the same id pays its own rounds and its own removal', () => {
-    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, 20);
+    settle(pageA, 'inc1', 1, { [PLAYER]: 20 });
     pageA.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 10);
-    pageA.creditTableOutcome(TABLE, 'inc2', 1, PLAYER, 20);
+    settle(pageA, 'inc2', 1, { [PLAYER]: 20 });
     pageA.creditTableOutcome(TABLE, 'inc2', 'end', PLAYER, 10);
     expect(pageA.readChips(PLAYER)).toBe(60);
   });
@@ -449,140 +469,88 @@ describe('what a table pays a player', () => {
   it('a removal is the last outcome: a round settled after it hears of the refund pays nothing', () => {
     pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
     sync(docA, docB);
-    pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 60);
+    settle(pageA, 'inc1', 5, { [PLAYER]: 60 });
     sync(docA, docB);
     for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(30);
   });
 
   it('a late removal of the table before never touches what its replacement paid, whichever page wins', async () => {
     for (const [clientA, clientB] of [[1, 2], [2, 1]]) {
-      docA = new Y.Doc();
-      docB = new Y.Doc();
-      docA.clientID = clientA;
-      docB.clientID = clientB;
-      pageA = await loadPage(docA);
-      pageB = await loadPage(docB);
+      await pages(clientA, clientB);
       // Page a refunds the old table, then pays the new one's round 1; page b
       // refunds the old table too, before hearing any of it.
       pageA.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
-      pageA.creditTableOutcome(TABLE, 'inc2', 1, PLAYER, 60);
+      settle(pageA, 'inc2', 1, { [PLAYER]: 60 });
       pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 30);
       sync(docA, docB);
       for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(90);
     }
   });
 
-  it('a record whose total is full goes on in the next of the chain, and an outcome there still counts once', () => {
-    const full = 2 ** 52;
-    const sum = (page: CasinoDoc): bigint =>
-      page.readChipRecords(PLAYER).reduce((n, r) => n + BigInt(r.d), 0n);
-    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, full - 1);
-    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 1);
+  it('a total past the safe range is kept exactly: reads stop at the range, and come back under it to the chip', () => {
+    settle(pageA, 'inc1', 1, { [PLAYER]: Number.MAX_SAFE_INTEGER });
+    settle(pageA, 'inc1', 2, { [PLAYER]: 10 });
     sync(docA, docB);
-    expect(pageA.readChipRecords(PLAYER)).toHaveLength(1);
-    // Round 3 on both pages at once, each with its own amount: both go to the
-    // same next record, so one of the two counts; then again on one: nothing.
-    pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 10);
-    pageB.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 20);
+    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(Number.MAX_SAFE_INTEGER);
+    settle(pageB, 'inc1', 3, { [PLAYER]: -20 });
     sync(docA, docB);
-    pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 10);
-    sync(docA, docB);
-    const paid = sum(pageA);
-    expect([BigInt(full) + 10n, BigInt(full) + 20n]).toContain(paid);
-    for (const page of [pageA, pageB]) {
-      expect(sum(page)).toBe(paid);
-      expect(page.readChipRecords(PLAYER)).toHaveLength(2);
-    }
-    pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 7);
-    pageB.creditTableOutcome(TABLE, 'inc1', 4, PLAYER, 7); // after the removal: nothing
-    sync(docA, docB);
-    pageA.creditTableOutcome(TABLE, 'inc1', 4, PLAYER, 7);
-    sync(docA, docB);
-    for (const page of [pageA, pageB]) expect(sum(page)).toBe(paid + 7n);
+    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(Number.MAX_SAFE_INTEGER - 10);
   });
 
-  it('a round and a removal at once on two pages, by a record nearly full or nearly past the safe range: one of the two counts, and a removal stays the last', async () => {
-    const full = 2 ** 52;
-    const sum = (page: CasinoDoc): bigint =>
-      page.readChipRecords(PLAYER).reduce((n, r) => n + BigInt(r.d), 0n);
-    // [what rounds 3 and 4 paid, records once round 5 or the removal lands]
-    const bases: [number[], number][] = [
-      [[full - 5], 1], // the round would fill the record, the removal would not
-      [[full - 1, full - 5], 2], // full, 5 short of the safe range: the round would pass it
-    ];
-    for (const [paidBefore, records] of bases) {
-      for (const [clientA, clientB] of [[1, 2], [2, 1]]) {
-        docA = new Y.Doc();
-        docB = new Y.Doc();
-        docA.clientID = clientA;
-        docB.clientID = clientB;
-        pageA = await loadPage(docA);
-        pageB = await loadPage(docB);
-        paidBefore.forEach((amount, i) => pageA.creditTableOutcome(TABLE, 'inc1', 3 + i, PLAYER, amount));
-        sync(docA, docB);
-        const base = sum(pageA);
-        pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 10);
-        pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 3);
-        sync(docA, docB);
-        const paid = sum(pageA);
-        expect([base + 10n, base + 3n]).toContain(paid);
-        for (const page of [pageA, pageB]) {
-          expect(sum(page)).toBe(paid);
-          expect(page.readChipRecords(PLAYER)).toHaveLength(records);
-        }
-        // Each page tries its own again: the round never counts twice, and
-        // once the removal has counted nothing comes after it.
-        pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 10);
-        pageA.creditTableOutcome(TABLE, 'inc1', 6, PLAYER, 10);
-        sync(docA, docB);
-        pageB.creditTableOutcome(TABLE, 'inc1', 'end', PLAYER, 3);
-        sync(docA, docB);
-        const ended = paid === base + 3n;
-        for (const page of [pageA, pageB]) expect(sum(page)).toBe(ended ? paid : paid + 10n + 3n);
-      }
-    }
-  });
-
-  it('takes a lost stake as a negative outcome, and turns away amounts it could not hold', () => {
-    pageA.buyInChips(PLAYER, 100);
-    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, -30);
-    pageB.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, -30);
-    sync(docA, docB);
-    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(70);
-    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 0);
-    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, -20); // round 2 is paid: nothing
-    pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 2 ** 52);
-    pageA.creditTableOutcome(TABLE, 'inc1', 4, PLAYER, -(2 ** 52));
-    pageA.creditTableOutcome(TABLE, 'inc1', 5, PLAYER, 0.5);
-    expect(pageA.readChips(PLAYER)).toBe(70);
-    pageA.creditTableOutcome(TABLE, 'inc1', 6, PLAYER, 45);
-    expect(pageA.readChips(PLAYER)).toBe(115);
-  });
-
-  for (const [winner, clientA, clientB, after] of [['nothing', 2, 1, 100], ['the loss', 1, 2, 80]] as const) {
-    it(`a round that moved nothing on one page and lost on the other pays one of the two (${winner} winning ties)`, async () => {
-      docA = new Y.Doc();
-      docB = new Y.Doc();
-      docA.clientID = clientA;
-      docB.clientID = clientB;
-      pageA = await loadPage(docA);
-      pageB = await loadPage(docB);
+  for (const [winner, clientA, clientB] of [['a', 2, 1], ['b', 1, 2]] as const) {
+    it(`two pages settling one round at once: the doc keeps one page's book, whole, for every bettor (page ${winner} winning ties)`, async () => {
+      await pages(clientA, clientB);
       pageA.buyInChips(PLAYER, 100);
+      pageA.buyInChips(OTHER, 100);
+      settle(pageA, 'inc1', 1, { [PLAYER]: 1, [OTHER]: 1 });
       sync(docA, docB);
-      // Two pages settled one roll, each from its own view: on a, the place
-      // bet stood (paid nothing, held on); on b it lost.
-      pageA.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, 0);
-      pageB.creditTableOutcome(TABLE, 'inc1', 3, PLAYER, -20);
+      settle(pageA, 'inc1', 2, { [PLAYER]: 10, [OTHER]: -5 });
+      settle(pageA, 'inc1', 3, { [PLAYER]: 10 });
+      settle(pageB, 'inc1', 2, { [PLAYER]: 3 });
+      settle(pageB, 'inc1', 3, { [OTHER]: 7 });
       sync(docA, docB);
-      for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(after);
+      const want = winner === 'a' ? [121, 96] : [104, 108];
+      for (const page of [pageA, pageB]) expect([page.readChips(PLAYER), page.readChips(OTHER)]).toEqual(want);
+      // Either page goes on from the book the doc kept.
+      settle(pageB, 'inc1', 4, { [PLAYER]: 1 });
+      sync(docA, docB);
+      for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(want[0] + 1);
     });
   }
 
-  it('rides one record per table and player, however many rounds it pays', () => {
-    for (let round = 1; round <= 50; round++) pageA.creditTableOutcome(TABLE, 'inc1', round, PLAYER, 2);
-    pageA.creditTableOutcome('craps-1', 'inc9', 1, PLAYER, 3);
+  it('takes a lost stake as a negative outcome, once a round, and turns away amounts it could not hold', () => {
+    pageA.buyInChips(PLAYER, 100);
+    sync(docA, docB);
+    settle(pageA, 'inc1', 1, { [PLAYER]: -30 });
+    settle(pageB, 'inc1', 1, { [PLAYER]: -30 });
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(70);
+    settle(pageA, 'inc1', 2, { [PLAYER]: 0 });
+    pageA.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, -20); // round 2 is paid: nothing
+    pageA.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, -20); // nor an earlier one
+    settle(pageA, 'inc1', 3, { [PLAYER]: 0.5 });
+    settle(pageA, 'inc1', 4, { [PLAYER]: Number.NaN });
+    expect(pageA.readChips(PLAYER)).toBe(70);
+    settle(pageA, 'inc1', 6, { [PLAYER]: 45 });
+    expect(pageA.readChips(PLAYER)).toBe(115);
+  });
+
+  it('pays nothing outside a settle\'s own write of the book', () => {
+    settle(pageA, 'inc1', 1, { [PLAYER]: 5 });
+    sync(docA, docB);
+    pageB.creditTableOutcome(TABLE, 'inc1', 1, PLAYER, 5); // page a's book
+    pageB.creditTableOutcome(TABLE, 'inc1', 2, PLAYER, 5); // no settle of round 2 here
+    pageB.creditTableOutcome(TABLE, 'inc9', 1, PLAYER, 5); // no book at all
+    sync(docA, docB);
+    for (const page of [pageA, pageB]) expect(page.readChips(PLAYER)).toBe(5);
+  });
+
+  it('rides one book per table incarnation, however many rounds and bettors it pays', () => {
+    for (let round = 1; round <= 50; round++) settle(pageA, 'inc1', round, { [PLAYER]: 2, [OTHER]: 1 });
+    settle(pageA, 'inc9', 1, { [PLAYER]: 3 }, 'craps-1');
     expect(pageA.readChips(PLAYER)).toBe(103);
-    expect(pageA.readChipRecords(PLAYER)).toHaveLength(2);
+    expect(pageA.readChips(OTHER)).toBe(50);
+    expect([...docA.getMap('casinoChips').keys()].filter((k) => k.startsWith('book:'))).toHaveLength(2);
   });
 });
 

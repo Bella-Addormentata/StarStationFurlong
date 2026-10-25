@@ -858,9 +858,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say(`YOU HAVE ${MAX_BETS_DRAWN_PER_PLAYER} CHIPS DOWN — THE TABLE LIMIT`);
       return;
     }
-    // ⚖️ A Fair round's transcript carries at most MAX_TABLE_BETTORS bettors:
-    // a newcomer past that would be left out of the settle, so they wait.
-    if (mine.length === 0 && roundIsFair(itemId, game)) {
+    // ⚖️ A round carries at most MAX_TABLE_BETTORS bettors (a Fair round's
+    // transcript, and the close's freeze of who is in it): a newcomer past
+    // that would be left out of the settle, so they wait.
+    if (mine.length === 0) {
       const all = game === 'craps' ? readAllCrapsBets(itemId) : readAllBets(itemId, round());
       if (Object.keys(all).filter((pid) => pid !== me).length >= MAX_TABLE_BETTORS) {
         say('THE TABLE IS FULL — WAIT FOR A PLACE');
@@ -1612,18 +1613,26 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     const r = s.round;
     // Let a rival's lease write converge before this page may publish.
-    const settleFrom = Date.now() + LEASE_SETTLE_MS;
+    let settleFrom = Date.now() + LEASE_SETTLE_MS;
     const epoch = casinoDocEpoch();
-    const until = Date.now() + REVEAL_GRACE_MS + 6_000;
+    let until = Date.now() + REVEAL_GRACE_MS + 6_000;
+    let polledAt = Date.now();
     spinPoll = window.setInterval(() => {
+      // ⏱ A clock gone back mid-poll takes the poll's times back with it.
+      const t = Date.now();
+      if (t < polledAt) {
+        settleFrom -= polledAt - t;
+        until -= polledAt - t;
+      }
+      polledAt = t;
       const now = rouletteState();
       // Another room's table can share this id and round: stop on a rebind.
-      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || Date.now() > until
+      if (casinoDocEpoch() !== epoch || now?.phase !== 'closing' || now.round !== r || t > until
         || (now.operator !== undefined && now.operator !== ROULETTE_PAGE_ID)) {
         stopSpinPoll();
         return;
       }
-      if (Date.now() >= settleFrom) rollAndSettle(itemId, r);
+      if (t >= settleFrom) rollAndSettle(itemId, r);
     }, 150);
   };
 

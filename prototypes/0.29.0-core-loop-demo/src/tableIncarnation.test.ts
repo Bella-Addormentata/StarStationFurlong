@@ -45,6 +45,14 @@ function sync(x: Y.Doc, y: Y.Doc): void {
   Y.applyUpdate(x, Y.encodeStateAsUpdate(y, Y.encodeStateVector(x)));
 }
 
+/** The incarnation and book of a table's one book in the page's doc. */
+function onlyBook(page: Page, table: string): { inc: string; book: import('./casinoDoc').TableBook } {
+  const keys = [...page.doc.getMap('casinoChips').keys()].filter((k) => k.startsWith(`book:${table}:`));
+  expect(keys).toHaveLength(1);
+  const inc = keys[0].slice(`book:${table}:`.length);
+  return { inc, book: page.casino.readTableBook(table, inc)! };
+}
+
 /** One-way delivery. */
 function deliver(from: Y.Doc, to: Y.Doc): void {
   Y.applyUpdate(to, Y.encodeStateAsUpdate(from, Y.encodeStateVector(to)));
@@ -293,7 +301,7 @@ describe("an earlier build's table rolled on its new incarnation as it is remove
         a.craps.rollAndSettleCraps(craps, 2, 6);
         await flush();
         expect(a.casino.readCrapsTableState(craps)).toMatchObject({ phase: 'settled', round: 2 });
-        expect(a.doc.getMap('casino').get(`kept:${craps}:${bettor}`)).toMatchObject({ inc, taken: 10 });
+        expect(a.casino.readTableBook(craps, inc)?.kept[bettor]).toMatchObject({ taken: 10 });
         expect(a.casino.readChips(bettor)).toBe(90);
         // Page b, still on the earlier build's state, removes the table: it
         // refunds the 10 on the record of the incarnation that state is,
@@ -463,7 +471,7 @@ describe('removals that marked nothing', () => {
   const bettor = 'player-Carol';
 
   /** What an earlier build's (main's) teardown does to a table's keys: wipes
-   *  them, leaves no gone: mark, and knows nothing of kept:. */
+   *  them, leaves no gone: mark, and knows nothing of the table's book. */
   function earlierBuildTeardown(page: Page, tableId: string): void {
     const map = page.doc.getMap('casino');
     page.doc.transact(() => {
@@ -604,7 +612,7 @@ describe('removals that marked nothing', () => {
       expect(a.casino.readChips(bettor)).toBe(120);
     });
 
-    it("craps: the bets the earlier build's teardown left behind (kept:) do not come back on the put-back table", async () => {
+    it("craps: the bets the earlier build's teardown left behind (its book's kept bets) do not come back on the put-back table", async () => {
       const pass = { type: 'pass' as const, amount: 10 };
       a.casino.writeCrapsFairnessPref(CRAPS, 'rng');
       a.casino.buyInChips(bettor, 100);
@@ -792,10 +800,10 @@ describe('what a removal leaves owed', () => {
         await flush();
         b.craps.closeCrapsTable(craps);
         syncAll(a, b, c);
-        const tbl = [...a.doc.getMap('casinoChips').values()].find((r) => (r as { ev?: string }).ev !== undefined) as { ev: string };
-        const kept = a.doc.getMap('casino').get(`table:${craps}`) as { result?: number } | undefined;
-        // The removal's refund, or the 8 (then the refund owed): 100; the seven: 90.
-        const want = tbl.ev === 'end' ? 100 : kept?.result === 7 ? 90 : 100;
+        // The doc keeps one settle's book, whole: the 8's (the pass line rides,
+        // and its 10 is owed back): 100; the seven's: 90. The removal's refund
+        // was of a list the roll resolved.
+        const want = onlyBook(a, craps).book.st.result === 7 ? 90 : 100;
         const now = [a, b, c].map((p) => p.casino.readChips(bettor));
         for (const p of [a, c]) p.craps.closeCrapsTable(craps); // the rollers hear of it
         syncAll(a, b, c);
@@ -819,7 +827,7 @@ describe('what a removal leaves owed', () => {
         b.craps.rollAndSettleCraps(craps, 2, 6); // b has no house seed: void
         await flush();
         expect(b.casino.readCrapsTableState(craps)?.voided).toBe(true);
-        expect(b.doc.getMap('casino').get(`kept:${craps}:${bettor}`)).toMatchObject({ taken: 10 });
+        expect(onlyBook(b, craps).book.kept[bettor]).toMatchObject({ taken: 10 });
         a.craps.closeCrapsTable(craps);
         sync(a.doc, b.doc);
         const now = [a, b].map((p) => p.casino.readChips(bettor));
@@ -831,22 +839,29 @@ describe('what a removal leaves owed', () => {
     }
   });
 
-  describe('an outcome record already full (the chain goes on at ~1)', () => {
+  describe('an outcome record past what a number holds exactly', () => {
     for (const [winner, clientA, clientB] of [['the roll', 2, 1], ['the removal', 1, 2]] as const) {
       it(`a roll settled as the table goes still hands back once (${winner} winning ties)`, async () => {
         a = await loadPage(clientA);
         b = await loadPage(clientB);
-        earlierCraps(a, 1, null, [pass]);
+        a.casino.writeCrapsFairnessPref(craps, 'rng');
+        a.craps.openCrapsBetting(craps, 1, null);
         const inc = a.casino.readCrapsTableState(craps)!.inc!;
         const big = 2 ** 52;
-        a.casino.creditTableOutcome(craps, inc, 98, bettor, big - 1); // past rounds' wins fill link 0
-        a.casino.creditTableOutcome(craps, inc, 99, bettor, 1);
+        for (const [round, won] of [[1, big - 1], [2, 1]]) { // past rolls' wins
+          const s = a.casino.readCrapsTableState(craps)!;
+          a.casino.transactCasino(() => {
+            a.casino.writeSettledState(craps, { ...s, round, phase: 'settled' });
+            a.casino.creditTableOutcome(craps, inc, round, bettor, won);
+          });
+        }
+        earlierCraps(a, 3, null, [pass]);
         a.craps.closeCrapsBetting(craps, a.casino.readCrapsTableState(craps)!);
         sync(a.doc, b.doc);
         await rollOn(a, 3, 3); // a 6: the pass line rides the point
         b.craps.closeCrapsTable(craps);
         sync(a.doc, b.doc);
-        expect(a.doc.getMap('casinoChips').has(`tbl:${craps}:${inc}:${bettor}~1`)).toBe(true);
+        expect(a.casino.readTableBook(craps, inc)?.recs[bettor].d).toBe(String(big));
         const now = [a, b].map((p) => p.casino.readChips(bettor));
         a.craps.closeCrapsTable(craps);
         sync(a.doc, b.doc);
@@ -1041,7 +1056,7 @@ describe('listeners hear what a kept record owes', () => {
       await rolledAsRemoved();
       sync(a.doc, b.doc);
       for (const page of [a, b]) expect(page.casino.readChips(bettor)).toBe(100);
-      const inc = (a.doc.getMap('casino').get(`kept:${craps}:${bettor}`) as { inc: string }).inc;
+      const { inc } = onlyBook(a, craps);
       const callsBefore = wa.calls;
       b.casino.creditTableOutcome(craps, inc, 'end', bettor, 10);
       heard(b, wb, 'b pays the refund');
@@ -1136,7 +1151,7 @@ describe("an earlier build's page on the table put back, after a roll met the re
       b = await loadPage(clientB);
       await rolledAsRemovedThenPutBack();
       expect(earlierReads(b)).toEqual([]);
-      expect([...b.doc.getMap('casino').keys()].filter((k) => k.startsWith('kept:') || k.startsWith('bets:'))).toEqual([]);
+      expect([...b.doc.getMap('casino').keys()].filter((k) => k.startsWith('bets:'))).toEqual([]);
       expect(b.casino.readMyCrapsBets(craps, bettor)).toEqual([]);
       expect(b.casino.readChips(bettor)).toBe(100);
       b.craps.closeCrapsTable(craps, 'local');
@@ -1165,7 +1180,7 @@ describe('a held change heard through the chips map alone', () => {
     b.craps.closeCrapsTable(craps, 'local');
     sync(a.doc, b.doc);
     expect(a.casino.readChips(bettor)).toBe(100); // the kept record owes the 10
-    const inc = (a.doc.getMap('casino').get(`kept:${craps}:${bettor}`) as { inc: string }).inc;
+    const { inc } = onlyBook(a, craps);
     let calls = 0;
     let read: number | null = null;
     a.casino.subscribeCasinoKey(`bal:${bettor}`, () => { calls += 1; read = a.casino.readChips(bettor); });
@@ -1213,7 +1228,7 @@ describe('tables whose ids begin with one another', () => {
     await flush();
     b.craps.closeCrapsTable(craps, 'local');
     sync(a.doc, b.doc);
-    expect(a.doc.getMap('casino').has(`kept:${craps}:${bettor}`)).toBe(true);
+    expect(onlyBook(a, craps).book.kept[bettor]).toMatchObject({ taken: 10 });
     expect(a.casino.readChips(bettor)).toBe(100); // the kept record owes the 10
     expect(b.casino.readChips(bettor)).toBe(100);
   });
@@ -1240,7 +1255,7 @@ describe("an earlier build's table both pages settle, then one opens the next wi
       a.craps.rollAndSettleCraps(craps, 1, null);
       b.craps.rollAndSettleCraps(craps, 1, null);
       await flush();
-      expect(b.doc.getMap('casino').get(`kept:${craps}:${bettor}`)).toMatchObject({ taken: 10 });
+      expect(onlyBook(b, craps).book.kept[bettor]).toMatchObject({ taken: 10 });
       a.craps.openCrapsBetting(craps, 2, 6);
       a.craps.closeCrapsTable(craps, 'local');
       expect(a.casino.readChips(bettor)).toBe(100);

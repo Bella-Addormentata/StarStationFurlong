@@ -28,6 +28,7 @@
 
 import {
   casinoDocEpoch,
+  casinoWhole,
   creditTableOutcome,
   feltStake,
   readAllCrapsBets,
@@ -35,11 +36,11 @@ import {
   readEmptiedLists,
   readCrapsFairnessPref,
   pruneCrapsBets,
+  putTableBack,
   readCrapsTableState,
-  settledAlready,
   tableIncOf,
   transactCasino,
-  writeCrapsTableState,
+  writeSettledState,
 } from './casinoDoc';
 import type { CrapsBackendKind } from './casinoDoc';
 import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
@@ -119,11 +120,17 @@ class LocalCrapsBackend implements CrapsBackend {
         // ⚖️ No house seed to reveal (this page lost it): having seen every
         // bettor's reveal, the house could pick between outcomes by settling
         // without its seed. The roll is void: no dice, every bet stands.
-        const before = readCrapsTableState(tableId);
-        if (casinoDocEpoch() !== epoch || before?.phase !== 'closing' || before.round !== round) return null;
+        // 📒 Not on a doc holding part of another page's update (casinoWhole).
+        if (casinoDocEpoch() !== epoch || !casinoWhole(tableId)) return null;
         // Settled already, and a takeover's stamp (or a deadline cut back)
-        // written as it settled came back over it: the roll stands as it was.
-        if (putBackSettled(tableId, before)) return null;
+        // written as it settled came back over it, or the doc kept another
+        // page's book: the roll stands as the book has it, put back up.
+        if (putTableBack(tableId)) return null;
+        const before = readCrapsTableState(tableId);
+        if (before?.phase !== 'closing' || before.round !== round) return null;
+        // Only the very opening it started on (not the other side's of that
+        // roll, which the doc kept while this one waited).
+        if (before.bk !== closing.bk) return null;
         if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return null;
         if (before.operator === undefined && !stillDrivesTables()) return null;
         if (!tablesAwake()) return null;
@@ -140,7 +147,7 @@ class LocalCrapsBackend implements CrapsBackend {
         for (const pid of [...voided, ...readEmptiedLists(tableId, round)]) left[pid] ??= [];
         const held = heldBy(tableId, before, Object.keys(left));
         transactCasino(() => {
-          writeCrapsTableState(tableId, {
+          writeSettledState(tableId, {
             kind: 'craps', phase: 'settled', round, point: pointBefore, dice: null, result: null,
             resultAt: now, payouts: {}, voided: true,
             ...(before.shooter !== undefined ? { shooter: before.shooter } : {}),
@@ -183,8 +190,12 @@ class LocalCrapsBackend implements CrapsBackend {
     // Nor one removed and put back meanwhile, at the same roll on a new
     // incarnation: these dice were for the table as it was.
     if (!live0 || tableIncOf(tableId, before) !== tableIncOf(tableId, live0)) return dice;
-    // Or settled already (see the void above).
-    if (putBackSettled(tableId, before)) return dice;
+    // Nor another write of its book's: the other side's roll of that number,
+    // kept while this one hashed, with its own point and bets left up.
+    if (before.bk !== live0.bk) return dice;
+    // Nor on a doc holding part of an update, and not one settled already
+    // (see the void above).
+    if (!casinoWhole(tableId) || putTableBack(tableId)) return dice;
     // 🎲 A manual roll settles only on the page still holding its lease: the
     // hashing can outlive it (a suspended tab another member took over from).
     if (before.operator !== undefined && before.operator !== CRAPS_PAGE_ID) return dice;
@@ -222,7 +233,7 @@ class LocalCrapsBackend implements CrapsBackend {
     // One transaction: a page sees the settled roll, what it paid, and the
     // pruned felts together.
     transactCasino(() => {
-      writeCrapsTableState(tableId, {
+      writeSettledState(tableId, {
         kind: 'craps',
         phase: 'settled',
         round,
@@ -254,15 +265,6 @@ class LocalCrapsBackend implements CrapsBackend {
   }
 }
 
-/** Put a roll settled already back as its settle left it (casinoDoc
- *  settledAlready), when the doc's state came back to closing over it. True
- *  when it did. */
-export function putBackSettled(tableId: string, s: CrapsTableState): boolean {
-  const done = settledAlready(tableId, s);
-  if (done) writeCrapsTableState(tableId, done);
-  return done !== null;
-}
-
 /** What each bettor's list held at the close (the settle takes it). */
 function heldBy(tableId: string, before: CrapsTableState, pids: string[]): Record<string, number> {
   return Object.fromEntries(pids.map((pid) => [pid, heldAtClose(tableId, before, pid)]));
@@ -275,8 +277,8 @@ function heldBy(tableId: string, before: CrapsTableState, pids: string[]): Recor
  * outcome for the roll is what it won, less what the list held at the close,
  * plus what the felt holds after it. So the bets that stay up hold their
  * chips again, and what an earlier build's list took and still stands stays
- * taken. Written for every bettor, a roll that moves nothing too, so a rival
- * page's settle of the same roll meets it on every key (creditTableOutcome).
+ * taken. Written for every bettor, a roll that moves nothing too, in this
+ * settle's write of the table's book (creditTableOutcome, pruneCrapsBets).
  */
 function feltAfterRoll(
   tableId: string, before: CrapsTableState, round: number,

@@ -14,18 +14,15 @@
  *                                        the opening balance, see CHIP LEDGER)
  *   bought:<playerId>         → number   lifetime chips issued, ditto
  *   cashed:<playerId>         → number   lifetime chips returned, ditto
- *   table:<tableId>           → RouletteTableState (croupier-written)
- *   settled:<tableId>         → the table's last settled state, a copy
- *                                        only settles write (settledAlready)
+ *   table:<tableId>           → RouletteTableState (croupier-written;
+ *                                        `bk`: the book it goes on from)
  *   bets:<tableId>:<playerId> → { round, held: RouletteBet[], inc, taken? }
  *                                        (owner-written; craps: { kind, held,
- *                                        inc, base, taken? }; an earlier
- *                                        build's: { round?, kind?, bets },
- *                                        and the stickman's prune of one adds
- *                                        inc, pruned; see STAKES ON THE FELT)
- *   kept:<tableId>:<playerId> → { round, kept: CrapsBet[], inc, taken? }
- *                                        what a craps settle left up
- *                                        (stickman-written)
+ *                                        inc, base, taken?, over? }; an
+ *                                        earlier build's: { round?, kind?,
+ *                                        bets }, and the stickman's prune of
+ *                                        one adds inc, pruned; see STAKES ON
+ *                                        THE FELT)
  *   gone:<tableId>:<inc>      → 1        that incarnation of the table was
  *                                        removed (clearTableKeys); the bare
  *                                        `gone:<tableId>:`, that the table
@@ -53,17 +50,58 @@
  * at once both count, on every page. One writer per record means a record is
  * only ever overwritten by the binding that holds its last value (a fresh
  * writer id each bind), so no change is lost, and the doc grows by a record
- * per page per player, not per bet. What a roulette or craps table pays a
- * player is the one exception: it rides one record per table (each time it
- * is set up) and player, which names the outcome it paid last, so a round
- * settled on one page while another removed the table pays one of the two
- * (creditTableOutcome). Sums
- * are exact (bigint), so every page gets the same one whatever order records
- * arrive in. A slot machine's own bankroll is an account in the same ledger,
+ * per page per player, not per bet. What a roulette or craps table pays is
+ * the one exception: it is in the table's book (below). Sums are exact
+ * (bigint), so every page gets the same one whatever order records arrive
+ * in. A slot machine's own bankroll is an account in the same ledger,
  * named by its `slot-bankroll:` key, whose stored value is its opening
  * balance. It is the first step of the computed tables (see the "Computed
  * casino tables" design). Trust is unchanged: honest clients, as before;
  * signed records come with the computed tables.
+ *
+ * 📒 THE TABLE'S BOOK: one page settles a table's rounds at a time (the
+ * lease, or a manual SPIN or ROLL's operator), but a page cut off from the
+ * room keeps settling them as it runs while another takes over, and when
+ * the two meet the doc keeps one write of each key. So everything a settle
+ * decides about the table (each time it is set up: its incarnation) is one
+ * value under one key, `book:<tableId>:<inc>` in `casinoChips`, which every
+ * settle writes whole: the round, what the table has paid each bettor in all
+ * and the round it last settled for them (`recs`), what a craps roll left up
+ * of each bettor's bets (`kept`), and the settled state (`st`). The doc keeps
+ * one write of the key, so it holds one settle's book, whole: the chips of
+ * every bettor follow one run of rounds, however many pages settled on
+ * either side, never some of one and some of the other.
+ *
+ * A table state names the write of the book it goes on from (`bk`): a
+ * settle's state its own, and every state made from one (the next opening,
+ * the close, a takeover's stamp) carries it on; a round that goes on from
+ * no settle (a first round) names FIRST_OPENING, alike on every page. A
+ * state that doesn't go on from the book (the doc kept the other side's, a
+ * takeover's stamp written as a settle wrote, or a cut-off page's state of
+ * an incarnation the room removed) reads as the book's settled state at
+ * once (tableStateOf), and the next write of the table's state puts that up
+ * first, in a fresh write of the book (putTableBack), so no round settles
+ * twice and none is renumbered. A roulette list names the opening it was
+ * put down on (`bk`) and plays only there, so one put down on the side the
+ * doc dropped never plays, nor holds chips; a craps list plays over the
+ * book's `kept` only if it was written over that very write of it (`over`).
+ * No round number is compared across the two sides.
+ *
+ * What a removal refunds is apart, one record per bettor (`end:<tableId>:
+ * <inc>:<pid>`), which counts only while the book still has the bettor's
+ * record as its writer saw it: a settle at the very moment of the removal
+ * resolved the list the refund was for (creditTableOutcome). No list is
+ * refunded for a round the book has settled for its bettor.
+ *
+ * A page holding part of another page's update (Yjs parks what it can't
+ * apply yet, and applies its deletes at once, so a rewritten key reads as
+ * gone) settles, opens, takes bets on and refunds the removal of no table
+ * until the rest comes, keeps the held chips it last counted, and asks the
+ * room again for what it is missing (casinoWhole, whenCasinoWhole); after a
+ * lapse of it the page lets the tables' lease go, so one that holds it all
+ * can drive. Nor does a page waiting out a wake (croupier tablesAwake) put
+ * a table's state or book back up (tableWritable). Not covered: what an
+ * earlier build's page settles (it pays as it always did).
  *
  * 🪙 STAKES ON THE FELT: chips bet at roulette or craps are not taken from
  * the player when they go down. They stay the player's, held on the felt by
@@ -71,34 +109,33 @@
  * list on a live round (a roulette list of the table's current round before
  * it settles, any craps list on a table that is up). The settle turns a
  * round's stakes into one ledger change per bettor (won − staked, in the
- * table's outcome record) in the same transaction that ends the round, so
+ * table's book) in the same transaction that ends the round, so
  * no page ever counts a stake both held and paid. Taking a bet down,
  * removing the table, or a round that leaves a list behind (a late bet)
  * hands its chips back with no credit at all: the list stops holding them.
  * The bet list is one whole value per player, and so is what it holds: two
  * tabs of one player placing at once keep one list and its chips, a
  * take-down and a removal at once hand them back once. Only the player
- * writes their list: what a craps roll leaves up the stickman writes as
- * `kept`, which plays until the player writes a list after that roll, so a
+ * writes their list: what a craps roll leaves up the stickman writes in the
+ * book (`kept`), which plays until the player writes a list over it, so a
  * list written before the roll settled never brings back bets it resolved
  * (crapsFelt). An earlier build's list the stickman also prunes where it
  * lies, as earlier builds did, so that page reads the felt as the roll left
  * it; the prune is marked as the stickman's (`pruned`), so it plays only as
- * the `kept` record of the settle the doc kept. A list goes down only on a
- * table that is up.
+ * the book's `kept`. A list goes down only on a table that is up.
  *
  * A list an earlier build put down (under `bets`) took its chips as it went
  * down. What it took rides with it as `taken`, through the player's rewrites
  * too: the list holds only the rest (FeltStake `net`, below 0 when the
  * player took more down than it took), the settle pays its wins in full, and
- * a removal refunds what it took, in the table's outcome record: every page
+ * a removal refunds what it took, in the bettor's `end:` record: every page
  * that hears of it, from the table's state as the doc has it, one the
  * removal ended too, since the page removing it may not have seen that round
  * (tableEndingStakes). Nothing is handed back on a rewrite, so two tabs, or
  * a tab and a removal, can't hand it back twice. A craps settle at the very
- * moment of the removal can win that record over the refund: what the bets
- * it kept up had taken is then owed back by the `kept` record it left
- * (keptOwed), and paid as the removal's outcome when that record goes.
+ * moment of the removal voids the refund of a bettor it settled: what the
+ * bets it kept up had taken is then owed back by the book's `kept` (keptOwed),
+ * and paid as the bettor's refund when the table's leftovers are swept.
  *
  * A write at the very moment of a removal (a settle, a bet) outlives the
  * removal's delete, as a concurrent write does in the doc. So the removal
@@ -110,7 +147,7 @@
  * it its `inc` and a page removing it name it alike. A page that removes a
  * table it saw no round on marks the incarnation a page that hasn't heard
  * would open it on, and a table put back never reopens a name whose records
- * a removal left unmarked (tableIncToOpen).
+ * a removal left unmarked (tableOpening).
  *
  * The HOUSE keeps no stored record at all — everything about the cage is
  * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
@@ -154,7 +191,7 @@ import type {
  *  the felt, until the round settles (see STAKES ON THE FELT). A list under
  *  `bets` is an earlier build's, whose chips were taken when it went down. */
 export type TableBets =
-  | { round: number; held: RouletteBet[]; inc?: string }
+  | { round: number; held: RouletteBet[]; inc?: string; bk?: string }
   | { round: number; bets: RouletteBet[] };
 
 /** 🎲 One player's craps bets. Unlike roulette these PERSIST across rolls (a
@@ -203,26 +240,32 @@ function docAlive(): boolean {
  *  fair tables bind their seed commitments to it. */
 let boundRoomId = '';
 
-export function bindCasinoDoc(doc: Y.Doc, roomId = ''): void {
+export function bindCasinoDoc(doc: Y.Doc, roomId = '', resync?: () => void): void {
   bindingEpoch += 1;
   boundRoomId = roomId;
   boundDoc = doc;
+  askResync = resync ?? null;
+  askedResyncAt = -Infinity;
   pinPlayerKeys(doc);
   casinoMap = doc.getMap('casino');
+  waitingWhole.clear();
+  // (After the transaction, so what waits writes in one of its own.)
+  doc.on('afterTransaction', () => {
+    if (boundDoc !== doc || waitingWhole.size === 0 || drainQueued) return;
+    drainQueued = true;
+    queueMicrotask(drainWaitingWhole);
+  });
   bindChipLedger(doc);
   bindHeldStakes(doc, casinoMap);
   // 🪙 Index the coin pushers' requests now, outside any operator poll, and
   // observe ahead of notify() so listeners never see a stale index.
   pusherRequestIndex(casinoMap);
   casinoMap.observe((event) => {
-    if (heldTouched.size === 0) {
+    if (heldTouched.size === 0 && chipsTouched.size === 0) {
       notify(event.keysChanged);
       return;
     }
-    const keys = new Set(event.keysChanged);
-    for (const pid of heldTouched) keys.add(`bal:${pid}`);
-    heldTouched.clear();
-    notify(keys);
+    notify(takeTouched(new Set(event.keysChanged)));
   });
   indexLegacySlotLeases(casinoMap);
   notify(); // repaint subscribers from the fresh doc
@@ -276,8 +319,6 @@ export interface ChipRecord {
   c: number;
   /** writer-clock ms of the last change, for reading the history only */
   at: number;
-  /** a table's record only (creditTableOutcome): the last outcome it paid */
-  ev?: string;
 }
 
 /** A slot machine's own bankroll is a ledger account too, named by its key
@@ -297,8 +338,7 @@ export function isChipRecord(value: unknown): value is ChipRecord {
     && Number.isSafeInteger(r.d)
     && Number.isSafeInteger(r.b) && (r.b as number) >= 0
     && Number.isSafeInteger(r.c) && (r.c as number) >= 0
-    && typeof r.at === 'number' && Number.isFinite(r.at)
-    && (r.ev === undefined || (typeof r.ev === 'string' && r.ev.length <= 64));
+    && typeof r.at === 'number' && Number.isFinite(r.at);
 }
 
 let chipsMap: Y.Map<unknown> | null = null;
@@ -316,22 +356,58 @@ interface ChipIndex {
   byAccount: Map<string, bigint>;
   /** each counted record as counted (so an overwrite or delete is undone exactly) */
   counted: Map<string, ChipRecord>;
+  /** each table book as counted: bettor → chips */
+  books: Map<string, Map<string, bigint>>;
+  /** each removal refund as counted (none while it doesn't count) */
+  ends: Map<string, { p: string; d: bigint }>;
+  /** the refunds of each table incarnation (`<tableId>:<inc>`), recounted with its book */
+  endsOf: Map<string, Set<string>>;
+  /** keys read as gone while the doc held part of an update (casinoWhole), still counted */
+  parked: Set<string>;
+  /** each table's incarnations with a book (no build deletes one) */
+  booksOf: Map<string, Set<string>>;
   bought: bigint;
   cashed: bigint;
 }
-let chipIndex: ChipIndex = { byAccount: new Map(), counted: new Map(), bought: 0n, cashed: 0n };
+function newChipIndex(): ChipIndex {
+  return {
+    byAccount: new Map(), counted: new Map(), books: new Map(), ends: new Map(), endsOf: new Map(),
+    parked: new Set(), booksOf: new Map(), bought: 0n, cashed: 0n,
+  };
+}
+let chipIndex: ChipIndex = newChipIndex();
 /** Accounts whose chips changed since the last notify. */
 const chipsTouched = new Set<string>();
 
+function addToAccount(ix: ChipIndex, account: string, delta: bigint): void {
+  if (delta === 0n) return;
+  ix.byAccount.set(account, (ix.byAccount.get(account) ?? 0n) + delta);
+  chipsTouched.add(account);
+}
+
 function countChipRecord(ix: ChipIndex, rec: ChipRecord, sign: 1n | -1n): void {
-  ix.byAccount.set(rec.p, (ix.byAccount.get(rec.p) ?? 0n) + sign * BigInt(rec.d));
+  addToAccount(ix, rec.p, sign * BigInt(rec.d));
   ix.bought += sign * BigInt(rec.b);
   ix.cashed += sign * BigInt(rec.c);
   chipsTouched.add(rec.p);
 }
 
-/** Bring one key's record in the index in line with the map. */
+/** Bring one key's record in the index in line with the map. A key that
+ *  reads as gone while the doc holds part of an update stays counted as it
+ *  was: Yjs applies the update's deletes at once and the writes they make
+ *  room for once the rest comes, and no chip key is ever deleted otherwise. */
 function recountChipKey(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
+  if (!map.has(key) && !casinoWhole()) {
+    ix.parked.add(key);
+    return;
+  }
+  ix.parked.delete(key);
+  if (key.startsWith('book:')) recountBook(ix, map, key);
+  else if (key.startsWith('end:')) recountEnd(ix, map, key);
+  else recountRecord(ix, map, key);
+}
+
+function recountRecord(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
   const before = ix.counted.get(key);
   const value = map.get(key);
   const now = isChipRecord(value) ? value : undefined;
@@ -340,15 +416,126 @@ function recountChipKey(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
   if (now) { countChipRecord(ix, now, 1n); ix.counted.set(key, now); }
 }
 
+/** A table book's bettors in the index, as the book now reads; and its
+ *  incarnation's refunds, which count by it. */
+function recountBook(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
+  const at = key.slice('book:'.length);
+  const book = bookAt(map, at);
+  const before = ix.books.get(key);
+  const cut = at.lastIndexOf(':');
+  if (map.has(key) && cut > 0) {
+    const tableId = at.slice(0, cut);
+    let incs = ix.booksOf.get(tableId);
+    if (!incs) ix.booksOf.set(tableId, incs = new Set());
+    incs.add(at.slice(cut + 1));
+  }
+  const now = new Map<string, bigint>();
+  if (book) for (const [pid, rec] of Object.entries(book.recs)) now.set(pid, BigInt(rec.d));
+  for (const pid of new Set([...(before?.keys() ?? []), ...now.keys()])) {
+    addToAccount(ix, pid, (now.get(pid) ?? 0n) - (before?.get(pid) ?? 0n));
+  }
+  if (now.size > 0) ix.books.set(key, now);
+  else ix.books.delete(key);
+  for (const end of ix.endsOf.get(at) ?? []) recountEnd(ix, map, end);
+}
+
+/** A removal refund in the index: what it refunds while it counts (isEnd). */
+function recountEnd(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
+  const value = map.get(key);
+  const rec = isEndRecord(value) && key.endsWith(`:${value.p}`) ? value : null;
+  const at = rec ? key.slice('end:'.length, key.length - rec.p.length - 1) : null;
+  if (rec && at) {
+    let ends = ix.endsOf.get(at);
+    if (!ends) ix.endsOf.set(at, ends = new Set());
+    ends.add(key);
+  }
+  const d = rec && at && endCounts(bookAt(map, at), rec) ? BigInt(rec.d) : 0n;
+  const before = ix.ends.get(key);
+  if (before?.p === rec?.p && (before?.d ?? 0n) === d) return;
+  if (before) addToAccount(ix, before.p, -before.d);
+  ix.ends.delete(key);
+  if (rec && d !== 0n) {
+    addToAccount(ix, rec.p, d);
+    ix.ends.set(key, { p: rec.p, d });
+  }
+}
+
+/** Calls back to ask the room for what this page is missing (YjsSync
+ *  resync), at most every few seconds; none for a page-local doc. */
+let askResync: (() => void) | null = null;
+let askedResyncAt = -Infinity;
+
+/** Whether the bound doc holds every update it has been given whole (and,
+ *  for table `tableId`, every book of it this page has read): Yjs parks the
+ *  part of an update it can't apply yet (what it builds on hasn't come),
+ *  and applies its deletes at once, so a key it rewrites reads as gone
+ *  until the rest comes. A settle, a refund, or a count of held chips made
+ *  then would build on that: nothing that reads the doc to write chips does
+ *  it before then (and the room is asked again for what this page is
+ *  missing). The room hands on each page's own updates and state-vector
+ *  diffs, never an update re-encoded on the way (one can carry another
+ *  page's write and its overwrite without the write that won, and the doc
+ *  reads whole); a table's book this page has read and the doc no longer
+ *  has is such a key too, whatever the doc's own record says (no build
+ *  deletes one), so nothing of that table builds on its absence either. */
+export function casinoWhole(tableId?: string): boolean {
+  // (Deletes Yjs holds back, store.pendingDs, are of writes this page hasn't
+  // got at all, which read as not here yet whatever comes: no part read.)
+  const store = boundDoc?.store as { pendingStructs: unknown } | undefined;
+  const pending = store !== undefined && store.pendingStructs !== null;
+  const lost = tableId !== undefined && chipsMap !== null
+    && [...(chipIndex.booksOf.get(tableId) ?? [])].some((inc) => !chipsMap!.has(`book:${tableId}:${inc}`));
+  if (!pending && !lost) return true;
+  const now = Date.now();
+  if (askResync && !(now - askedResyncAt < 5_000 && now >= askedResyncAt)) {
+    askedResyncAt = now;
+    try { askResync(); } catch (err) { console.warn('[casino] resync failed:', err); }
+  }
+  return false;
+}
+
+/** What waits for the doc to hold every update whole (casinoWhole), by key:
+ *  one per key (the last), on the binding it was asked on. */
+const waitingWhole = new Map<string, { epoch: number; tableId?: string; run: () => void }>();
+let drainQueued = false;
+
+/** Run `run` now if the doc holds every update whole (casinoWhole, of table
+ *  `tableId` when named), else once it does, if the room doc is the same
+ *  one then. */
+export function whenCasinoWhole(key: string, run: () => void, tableId?: string): void {
+  if (casinoWhole(tableId)) {
+    waitingWhole.delete(key);
+    run();
+    return;
+  }
+  waitingWhole.set(key, { epoch: bindingEpoch, tableId, run });
+}
+
+function drainWaitingWhole(): void {
+  drainQueued = false;
+  for (const [key, wait] of [...waitingWhole]) {
+    if (wait.epoch !== bindingEpoch) waitingWhole.delete(key);
+    else if (casinoWhole(wait.tableId)) {
+      waitingWhole.delete(key);
+      try {
+        wait.run();
+      } catch (err) {
+        console.error('[casino] a write waiting for the whole doc failed:', err);
+      }
+    }
+  }
+}
+
 function bindChipLedger(doc: Y.Doc): void {
   const map = doc.getMap<unknown>('casinoChips');
-  const ix: ChipIndex = { byAccount: new Map(), counted: new Map(), bought: 0n, cashed: 0n };
-  for (const key of map.keys()) recountChipKey(ix, map, key);
+  const ix = newChipIndex();
   chipsMap = map;
   chipIndex = ix;
+  for (const key of map.keys()) recountChipKey(ix, map, key);
   chipWriter = `${doc.clientID.toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   chipKeys = new Map();
   chipRolls = 0;
+  bookWrites = 0;
   chipsTouched.clear();
   // Recount BEFORE any observer runs, so a casino-map listener firing in the
   // same transaction (a settle that writes a machine and a payout together)
@@ -357,18 +544,31 @@ function bindChipLedger(doc: Y.Doc): void {
     if (chipIndex !== ix) return; // a binding we've moved off
     const keys = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
     if (keys) for (const key of keys) if (key !== null) recountChipKey(ix, map, key);
+    // The rest of an update came: what read as gone meanwhile reads as it is.
+    if (ix.parked.size > 0 && casinoWhole()) for (const key of [...ix.parked]) recountChipKey(ix, map, key);
   });
+  // What kept bets owe can end with a transaction of this map alone.
   map.observe(() => {
     if (chipIndex !== ix || (chipsTouched.size === 0 && heldTouched.size === 0)) return;
-    const changed = new Set([...chipsTouched].map(
-      (account) => (isBankrollAccount(account) ? account : `bal:${account}`),
-    ));
-    // What a kept record owes can end with a transaction of this map alone.
-    for (const pid of heldTouched) changed.add(`bal:${pid}`);
-    chipsTouched.clear();
-    heldTouched.clear();
-    notify(changed);
+    notify(takeTouched(new Set()));
   });
+  // Chips a transaction of neither map moved (what read as gone, counted
+  // again as the rest of an update comes in another map's write).
+  doc.on('afterTransaction', () => {
+    if (chipIndex !== ix || (chipsTouched.size === 0 && heldTouched.size === 0)) return;
+    notify(takeTouched(new Set()));
+  });
+}
+
+/** `keys` with the chip keys of what this transaction's recounts moved
+ *  (chipsTouched, heldTouched), which are then told: once, by whichever of
+ *  the casino maps' observers runs first (or after the transaction). */
+function takeTouched(keys: Set<string>): Set<string> {
+  for (const account of chipsTouched) keys.add(isBankrollAccount(account) ? account : `bal:${account}`);
+  for (const pid of heldTouched) keys.add(`bal:${pid}`);
+  chipsTouched.clear();
+  heldTouched.clear();
+  return keys;
 }
 
 function ensureChips(): Y.Map<unknown> {
@@ -496,80 +696,226 @@ export function creditChips(playerId: string, amount: number): void {
   addChips(playerId, amount);
 }
 
-/** A table's chip record past this total (either way) takes no more
- *  (creditTableOutcome), and one outcome moves at most the rest of the safe
- *  range, so a record never leaves it. No table comes near either: a bet
- *  list returns at most 3.6e13 (games/craps MAX_BET_AMOUNT). */
-const TABLE_RECORD_FULL = 2 ** 52;
-const MAX_TABLE_OUTCOME = Number.MAX_SAFE_INTEGER - TABLE_RECORD_FULL;
+// ── 📒 The table's book (see THE TABLE'S BOOK above) ────────────────────────
+
+/** What a table has paid one bettor in all, on one incarnation of it. */
+interface BookRec {
+  /** chips, exactly (a bigint in decimal): won − staked, round after round */
+  d: string;
+  /** the last round that wrote it */
+  r: number;
+  /** the write of the book that last wrote it (a refund names it: EndRecord) */
+  w: string;
+  /** writer-clock ms of that write, for reading the history only */
+  at: number;
+}
+
+/** What a craps roll left up of one bettor's bets, and what of them an
+ *  earlier build took (`taken`). */
+interface BookKept {
+  round: number;
+  kept: CrapsBet[];
+  taken?: number;
+  /** the write of the book that left it: a list written over it names it (`over`) */
+  w: string;
+}
+
+/** A table incarnation's book, as its last settle wrote it, whole. */
+export interface TableBook {
+  /** this write of it (`<writer>.<n>`): no two alike */
+  id: string;
+  /** the round it settled */
+  round: number;
+  recs: Record<string, BookRec>;
+  kept: Record<string, BookKept>;
+  /** the state that round settled in */
+  st: RouletteTableState | CrapsTableState;
+}
+
+/** A removal's refund to one bettor of a table incarnation
+ *  (`end:<tableId>:<inc>:<pid>`). */
+interface EndRecord {
+  p: string;
+  d: number;
+  /** the bettor's record in the book as the refund's writer saw it (its
+   *  `w`; '' for none) */
+  seen: string;
+}
+
+const BOOK_TOTAL = /^-?(0|[1-9]\d{0,39})$/;
+
+function isBookId(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && v.length <= 64;
+}
+
+function isPlayerKey(pid: string): boolean {
+  return pid.length > 0 && pid.length <= 256 && pid !== '__proto__';
+}
+
+/** An entry of a book's map, its own (never one an object has from its prototype). */
+function entryOf<T>(entries: Record<string, T> | undefined, pid: string): T | undefined {
+  return entries && Object.prototype.hasOwnProperty.call(entries, pid) ? entries[pid] : undefined;
+}
+
+function isBookRec(v: unknown): v is BookRec {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<BookRec>;
+  return typeof r.d === 'string' && BOOK_TOTAL.test(r.d)
+    && Number.isSafeInteger(r.r) && (r.r as number) >= 1
+    && isBookId(r.w) && typeof r.at === 'number' && Number.isFinite(r.at);
+}
+
+function isBookKept(v: unknown): v is BookKept {
+  if (typeof v !== 'object' || v === null) return false;
+  const k = v as Partial<BookKept>;
+  return Number.isSafeInteger(k.round) && (k.round as number) >= 1
+    && Array.isArray(k.kept) && k.kept.length <= MAX_BETS_PER_PLAYER && k.kept.every(isCrapsBet)
+    && (k.taken === undefined
+      || (Number.isSafeInteger(k.taken) && (k.taken as number) > 0 && (k.taken as number) <= MAX_LIST_STAKE))
+    && isBookId(k.w);
+}
+
+function isEndRecord(v: unknown): v is EndRecord {
+  if (typeof v !== 'object' || v === null) return false;
+  const e = v as Partial<EndRecord>;
+  return typeof e.p === 'string' && e.p.length > 0 && e.p.length <= 256
+    && Number.isSafeInteger(e.d) && (e.d as number) > 0
+    && typeof e.seen === 'string' && e.seen.length <= 64;
+}
+
+/** Whether a refund counts: the book still has the bettor's record as the
+ *  refund's writer saw it. A settle it hadn't heard of (one at the very
+ *  moment of the removal) wrote the bettor's record afresh: it resolved the
+ *  list the refund was for. */
+function endCounts(book: TableBook | null, end: EndRecord): boolean {
+  return (entryOf(book?.recs, end.p)?.w ?? '') === end.seen;
+}
+
+const bookCache = new WeakMap<object, TableBook | null>();
+
+/** The book of a table incarnation (`<tableId>:<inc>`) as stored; null for
+ *  none, or junk. A bettor's junk entry reads as no entry. */
+function bookAt(chips: Y.Map<unknown>, at: string): TableBook | null {
+  const value = chips.get(`book:${at}`);
+  if (typeof value !== 'object' || value === null) return null;
+  let book = bookCache.get(value);
+  if (book === undefined) {
+    book = parseBook(value, at);
+    bookCache.set(value, book);
+  }
+  return book;
+}
+
+function parseBook(value: object, at: string): TableBook | null {
+  const v = value as { id?: unknown; round?: unknown; recs?: unknown; kept?: unknown; st?: unknown };
+  if (!isBookId(v.id) || !Number.isSafeInteger(v.round) || (v.round as number) < 1) return null;
+  const st = v.st;
+  if (!(isRouletteTableState(st) || isCrapsTableState(st)) || st.phase !== 'settled' || st.round !== v.round) return null;
+  const cut = at.lastIndexOf(':');
+  if (cut <= 0 || tableIncOf(at.slice(0, cut), st) !== at.slice(cut + 1)) return null;
+  const isMap = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+  if (!isMap(v.recs) || (v.kept !== undefined && !isMap(v.kept))) return null;
+  const recs: Record<string, BookRec> = {};
+  for (const [pid, rec] of Object.entries(v.recs)) if (isPlayerKey(pid) && isBookRec(rec)) recs[pid] = rec;
+  const kept: Record<string, BookKept> = {};
+  if (st.kind === 'craps' && v.kept) {
+    for (const [pid, k] of Object.entries(v.kept)) if (isPlayerKey(pid) && isBookKept(k)) kept[pid] = k;
+  }
+  return { id: v.id, round: v.round as number, recs, kept, st };
+}
+
+/** The book of incarnation `inc` of a table (null: no round settled on it yet). */
+export function readTableBook(tableId: string, inc: string): TableBook | null {
+  return bookAt(ensureChips(), `${tableId}:${inc}`);
+}
+
+/** How many writes of a book this binding has made (their ids). */
+let bookWrites = 0;
+
+function writeBook(chips: Y.Map<unknown>, at: string, book: TableBook): void {
+  boundDoc!.transact(() => {
+    chips.set(`book:${at}`, book);
+    recountChipKey(chipIndex, chips, `book:${at}`);
+    heldDirty = true;
+  });
+}
+
+/**
+ * A settle's write of its round's settled state: the table's state, and a
+ * fresh write of its book with it, which each bettor's outcome
+ * (creditTableOutcome) and craps felt (pruneCrapsBets) then go on. Call it
+ * first in the settle's transaction. The state names the write (`bk`), so a
+ * state that goes on from it says so.
+ */
+export function writeSettledState(tableId: string, state: RouletteTableState | CrapsTableState): void {
+  if (state.phase !== 'settled') return;
+  const chips = ensureChips();
+  const map = ensureMap();
+  const at = `${tableId}:${tableIncOf(tableId, state)}`;
+  const was = bookAt(chips, at);
+  bookWrites += 1;
+  const id = `${chipWriter}.${bookWrites}`;
+  const st = { ...state, bk: id };
+  boundDoc!.transact(() => {
+    writeBook(chips, at, { id, round: state.round, recs: was?.recs ?? {}, kept: was?.kept ?? {}, st });
+    map.set(`table:${tableId}`, st);
+  });
+}
+
+/** This page's write of a table incarnation's book for the settle of
+ *  `round` (writeSettledState), when it is the book the doc has. */
+function openBook(chips: Y.Map<unknown>, tableId: string, inc: string, round: number): TableBook | null {
+  const book = bookAt(chips, `${tableId}:${inc}`);
+  return book && book.round === round && book.id.startsWith(`${chipWriter}.`) ? book : null;
+}
 
 /**
  * Move `amount` chips to `playerId` (negative: from them) for one outcome of
- * one table: a settled round (`outcome` its number: what it paid less what it
- * took off the felt) or the table's removal ('end': what an earlier build's
- * stakes took, refunded). A round writes its outcome for every bettor, even
- * one that moves nothing, so it competes with another page's settle of the
- * same round on the same record, as the state and the kept bets do. Two
- * pages can each carry out the same outcome (both refund a removed
- * table), or two that exclude each other (one settles a round while the other
- * removes the table), before either hears of the other. So what a table pays a
- * player rides one record per table incarnation and player,
- * `tbl:<tableId>:<inc>:<pid>`, naming the outcome it paid last: a write adds
- * to it unless it already names this outcome, and of two written at once the
- * doc keeps one, so the player is paid for one outcome, never both. The
- * removal is the last outcome: once paid, nothing more from that table is.
- * `inc` is the table's incarnation (tableIncFor), so a table set up again
- * under the same id has a record of its own. A record whose stored total has
- * reached TABLE_RECORD_FULL takes no more: the next outcome goes on in the
- * next record of the chain (`~1`, `~2`…). Full is read from the stored total
- * alone, never the amount, so two pages paying different amounts at once
- * still write the same record, and the last record is always where the last
- * outcome (and a removal) was paid. Two pages that each go on settling
- * rounds without hearing of the other (one cut off from the room) build two
- * chains on one record, and the doc keeps one of them, with its table state:
- * the one table lease keeps that to a page that never hears the room
- * (croupier.takeTableTurn), and the computed tables end it.
+ * one table incarnation (`inc`, tableIncFor: a table set up again under the
+ * same id is a new one). A settled round (`outcome` its number: what it paid
+ * less what it took off the felt) goes on the bettor's record in this
+ * page's write of the book (writeSettledState), once: a round writes its
+ * outcome for every bettor, even one that moves nothing, so its write of
+ * the book holds every bettor it saw. The table's removal (`end`: what an
+ * earlier build's stakes took, refunded) is the bettor's refund record,
+ * which every page hearing of the removal writes (the doc keeps one): it
+ * counts while the book's record of the bettor is the one its writer saw
+ * (endCounts), and once it counts, nothing more is paid them from that
+ * table.
  */
 export function creditTableOutcome(
   tableId: string, inc: string, outcome: number | 'end', playerId: string, amount: number,
 ): void {
-  if (!Number.isSafeInteger(amount) || Math.abs(amount) > MAX_TABLE_OUTCOME) return;
-  if (playerId.length === 0 || playerId.length > 256) return;
-  const map = ensureChips();
-  const { base, link, was } = lastOutcome(map, tableId, inc, playerId);
-  const ev = String(outcome);
-  if (was?.ev === ev || was?.ev === 'end') return;
-  const full = was !== null && Math.abs(was.d) >= TABLE_RECORD_FULL;
-  const last = link === 0 ? base : `${base}~${link}`;
-  const key = full ? `${base}~${link + 1}` : last;
-  const d = (full ? 0 : was?.d ?? 0) + amount;
-  const rec: ChipRecord = { p: playerId, d, b: 0, c: 0, at: Date.now(), ev };
-  boundDoc!.transact(() => {
-    map.set(key, rec);
-    recountChipKey(chipIndex, map, key);
-    heldDirty = true; // a removal's outcome ends what kept bets owe (keptOwed)
-  });
-}
-
-/** The last record of a table's outcome chain for a player (see
- *  creditTableOutcome): its base key, which link it is, and what it holds. */
-function lastOutcome(
-  chips: Y.Map<unknown>, tableId: string, inc: string, playerId: string,
-): { base: string; link: number; was: ChipRecord | null } {
-  const base = `tbl:${tableId}:${inc}:${playerId}`;
-  let link = 0;
-  while (chips.has(`${base}~${link + 1}`)) link += 1;
-  const stored = chips.get(link === 0 ? base : `${base}~${link}`);
-  return { base, link, was: isChipRecord(stored) && stored.p === playerId ? stored : null };
+  if (!Number.isSafeInteger(amount) || !isPlayerKey(playerId)) return;
+  const chips = ensureChips();
+  const at = `${tableId}:${inc}`;
+  const endKey = `end:${at}:${playerId}`;
+  const end = chips.get(endKey);
+  const refunded = isEndRecord(end) && end.p === playerId && endCounts(bookAt(chips, at), end);
+  if (outcome === 'end') {
+    if (amount <= 0 || refunded) return;
+    const seen = entryOf(bookAt(chips, at)?.recs, playerId)?.w ?? '';
+    boundDoc!.transact(() => {
+      chips.set(endKey, { p: playerId, d: amount, seen });
+      recountChipKey(chipIndex, chips, endKey);
+      heldDirty = true; // a refund ends what kept bets owe (keptOwed)
+    });
+    return;
+  }
+  const book = openBook(chips, tableId, inc, outcome);
+  if (!book || refunded) return;
+  const was = entryOf(book.recs, playerId);
+  if (was && was.r >= outcome) return; // (paid already)
+  const rec: BookRec = { d: (BigInt(was?.d ?? '0') + BigInt(amount)).toString(), r: outcome, w: book.id, at: Date.now() };
+  writeBook(chips, at, { ...book, recs: { ...book.recs, [playerId]: rec } });
 }
 
 /** The incarnation a table takes when its first round opens: it names the
- *  table's outcomes for creditTableOutcome and the lists put down on it. It
- *  is drawn from the table and the record of its removals (its `gone:`
- *  marks), not at random: two pages opening the same table at once, before
- *  either hears of the other, name it alike, so what each pays meets on one
- *  record, as their states meet on one key; a table put back after a removal
- *  is a new one. */
+ *  table's book and the lists put down on it. It is drawn from the table and
+ *  the record of its removals (its `gone:` marks), not at random: two pages
+ *  opening the same table at once, before either hears of the other, name it
+ *  alike, so what each settles meets on one book, as their states meet on
+ *  one key; a table put back after a removal is a new one. */
 export function tableIncFor(tableId: string): string {
   const map = ensureMap();
   const prefix = `gone:${tableId}:`;
@@ -590,7 +936,7 @@ const firstIncs = new Map<string, string>();
  *  none, and is the incarnation the table's first round takes (tableIncFor
  *  before any removal): it can only be up until the table's first removal,
  *  so every page names it alike, before and after this build gives it its
- *  `inc` at its next round, and what it pays meets on one record. */
+ *  `inc` at its next round, and what it settles meets on one book. */
 export function tableIncOf(tableId: string, s: { inc?: string }): string {
   if (s.inc !== undefined) return s.inc;
   let first = firstIncs.get(tableId);
@@ -604,60 +950,90 @@ export function tableIncOf(tableId: string, s: { inc?: string }): string {
 
 /** The name the table's next first round takes (tableIncFor), once any
  *  incarnation of that name that a removal left unmarked (an earlier
- *  build's, which marks nothing) is marked ended: its outcome records, or
+ *  build's, which marks nothing) is marked ended: its book or refunds, or
  *  lists carrying it, are still in the doc. Every page reads the same doc,
  *  so pages opening the table at once still name it alike. */
 function freshIncFor(map: Y.Map<unknown>, tableId: string): string {
   const chips = ensureChips();
   for (;;) {
     const name = tableIncFor(tableId);
-    const records = `tbl:${tableId}:${name}:`;
-    const used = [...chips.keys()].some((key) => key.startsWith(records))
+    const refunds = `end:${tableId}:${name}:`;
+    const used = chips.has(`book:${tableId}:${name}`) || [...chips.keys()].some((key) => key.startsWith(refunds))
       || [...map.entries()].some(([key, value]) =>
-        (key.startsWith(`bets:${tableId}:`) || key.startsWith(`kept:${tableId}:`))
-        && (value as { inc?: unknown } | null)?.inc === name);
+        key.startsWith(`bets:${tableId}:`) && (value as { inc?: unknown } | null)?.inc === name);
     if (!used) return name;
     markRemoved(map, tableId, name);
   }
 }
 
-/** The incarnation a table's next round opens on: the state's up there, or
- *  a new one (freshIncFor). A new one first clears what removed ones left
- *  (sweepRemoved). In the caller's transaction. */
-export function tableIncToOpen(tableId: string): string {
+/** Where a table's next round opens: on the incarnation of the state up
+ *  there (the book's put back first when that state doesn't go on from it:
+ *  putTableBack), going on from the write of the book that state goes on
+ *  from (its `bk`); or on a new one (freshIncFor), which first clears what
+ *  removed ones left (sweepRemoved). A first round names a write of its
+ *  own. In the caller's transaction. */
+export function tableOpening(tableId: string): { inc: string; bk: string } {
   const map = ensureMap();
+  putTableBack(tableId);
   const raw = map.get(`table:${tableId}`);
   const up = (isRouletteTableState(raw) || isCrapsTableState(raw)) && !removed(map, tableId, raw) ? raw : null;
-  if (up) return tableIncOf(tableId, up);
+  if (up) {
+    // An earlier build's state names no book: it goes on from the table's
+    // book, if it has one (a state that didn't was put back just now).
+    const inc = tableIncOf(tableId, up);
+    return { inc, bk: up.bk ?? bookAt(ensureChips(), `${tableId}:${inc}`)?.id ?? FIRST_OPENING };
+  }
   const inc = freshIncFor(map, tableId);
   sweepRemoved(map, tableId);
-  return inc;
+  return { inc, bk: FIRST_OPENING };
 }
 
-/** Delete the lists and kept records of a table's removed incarnations,
- *  paying first what a kept record owes (payKeptOwed). Written at the
- *  moment of the removal, they outlived its delete. They hold nothing here,
- *  but an earlier build's page reads a list by its key alone: the
+/** The `bk` of a round that goes on from no settle of its table (its first),
+ *  alike on every page, as two pages' openings of a later round from one
+ *  settle are: the bets put down on either play in the one the doc keeps.
+ *  (No write of a book is named so: those are `<writer>.<n>`.) */
+export const FIRST_OPENING = '-';
+
+/** Delete the lists of a table's removed incarnations, and refund what the
+ *  kept bets of their books still owe (payRemovedOwed). Written at the
+ *  moment of the removal, the lists outlived its delete. They hold nothing
+ *  here, but an earlier build's page reads a list by its key alone: the
  *  stickman's prune of its list left behind would stand on the table put
- *  back there, and its take-down would hand back again what the kept record
- *  owes. */
+ *  back there, and its take-down would hand back again what the kept bets
+ *  owe. */
 function sweepRemoved(map: Y.Map<unknown>, tableId: string): void {
-  const keptPrefix = `kept:${tableId}:`;
   for (const key of [...map.keys()]) {
-    const kept = key.startsWith(keptPrefix);
-    if (!kept && !key.startsWith(`bets:${tableId}:`)) continue;
+    if (!key.startsWith(`bets:${tableId}:`)) continue;
     const inc = (map.get(key) as { inc?: unknown } | null)?.inc;
-    if (typeof inc !== 'string' || !map.has(goneKey(tableId, inc))) continue;
-    if (kept) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
-    map.delete(key);
+    if (typeof inc === 'string' && map.has(goneKey(tableId, inc))) map.delete(key);
+  }
+  payRemovedOwed(map, tableId);
+}
+
+/** Refund, as the removal would have, what the kept bets in the books of a
+ *  table's removed incarnations still owe (keptOwed). */
+function payRemovedOwed(map: Y.Map<unknown>, tableId: string): void {
+  const chips = ensureChips();
+  const prefix = `book:${tableId}:`;
+  for (const key of [...chips.keys()]) {
+    if (!key.startsWith(prefix)) continue;
+    const inc = key.slice(prefix.length);
+    if (inc.includes(':') || !map.has(goneKey(tableId, inc))) continue;
+    for (const pid of Object.keys(bookAt(chips, `${tableId}:${inc}`)?.kept ?? {})) payKeptOwed(map, tableId, inc, pid);
   }
 }
 
-/** Every chip record in the bound room (one per page per account), oldest
- *  change first (the history behind a balance; debugging). */
+/** Every chip record in the bound room (one per page per account, and what
+ *  each table's book has paid each bettor), oldest change first (the
+ *  history behind a balance; debugging). */
 export function readChipRecords(account?: string): ChipRecord[] {
-  ensureChips();
+  const chips = ensureChips();
   const out = [...chipIndex.counted.values()].filter((r) => account === undefined || r.p === account);
+  for (const key of chipIndex.books.keys()) {
+    for (const [p, rec] of Object.entries(bookAt(chips, key.slice('book:'.length))?.recs ?? {})) {
+      if (account === undefined || p === account) out.push({ p, d: clampSafe(BigInt(rec.d)), b: 0, c: 0, at: rec.at });
+    }
+  }
   return out.sort((a, b) => a.at - b.at);
 }
 
@@ -707,9 +1083,8 @@ export function readCageLedger(): CageLedger {
 // ── Roulette table state + bets ──────────────────────────────────────────────
 
 export function readTableState(tableId: string): RouletteTableState | null {
-  const map = ensureMap();
-  const value = map.get(`table:${tableId}`);
-  return isRouletteTableState(value) && !removed(map, tableId, value) ? value : null;
+  const s = tableStateOf(ensureMap(), tableId);
+  return s?.kind === 'roulette' ? s : null;
 }
 
 /** `gone:` key of a table's incarnation (see STAKES ON THE FELT). */
@@ -738,38 +1113,110 @@ function markRemoved(map: Y.Map<unknown>, tableId: string, inc: string): void {
   if (!map.has(goneKey(tableId, ''))) map.set(goneKey(tableId, ''), 1);
 }
 
-/** Croupier-only in practice (the UI gates on the house predicate). */
+/** Croupier-only in practice (the UI gates on the house predicate). A
+ *  settle writes its settled state with writeSettledState. */
 export function writeTableState(tableId: string, state: RouletteTableState): void {
   const map = ensureMap();
+  // 📒 Not over a state that doesn't go on from the table's book: that goes
+  // back up instead, and the caller writes again from it (putTableBack).
+  if (putTableBack(tableId)) return;
   boundDoc!.transact(() => {
     map.set(`table:${tableId}`, state);
-    if (state.phase === 'settled') map.set(settledKey(tableId), state);
     heldDirty = true;
   });
 }
 
-/** Where each settled state of a table goes too, under a key only a settled
- *  state is written to: a write of the round's closing state that isn't a
- *  settle (a SPIN or ROLL takeover's stamp, a deadline cut back) can beat a
- *  settle made at the same moment on `table:`, and the settle's outcomes
- *  and felts would stand under a round the doc shows still to play. */
-function settledKey(tableId: string): string {
-  return `settled:${tableId}`;
+/** The settled state in the table's book, to put back over the doc's state
+ *  `s` when `s` doesn't go on from the book (THE TABLE'S BOOK): a write of
+ *  the round's closing state that isn't a settle (a SPIN or ROLL takeover's
+ *  stamp, a deadline cut back) beat a settle made at the same moment on
+ *  `table:`, or a page cut off from the room and one that took over both
+ *  settled, and the doc kept the state of one and the book of the other.
+ *  The table reads as that state at once (tableStateOf), its own round, and
+ *  goes up in a fresh write of the book (putTableBack), so no list put down
+ *  on an earlier opening of the next round from that book plays on the one
+ *  opened from it now. A state an earlier build wrote names no book: it goes on
+ *  from the book unless the book has settled its round. Null when `s` goes
+ *  on from the book, or there is none. (One of a removed incarnation is of
+ *  no state `s` read: those read as no table.) */
+export function settledAlready<S extends RouletteTableState | CrapsTableState>(tableId: string, s: S): S | null {
+  const book = bookAt(ensureChips(), `${tableId}:${tableIncOf(tableId, s)}`);
+  if (!book || book.st.kind !== s.kind) return null;
+  if (s.bk !== undefined ? s.bk === book.id : book.round < s.round) return null;
+  return { ...book.st, bk: book.id } as S;
 }
 
-/** The settled state of round `s.round` of the table, or of a later round,
- *  on the incarnation `s` is of, when the doc's state `s` came back to an
- *  earlier phase after that settle (see settledKey); null otherwise. A
- *  settle puts it back instead of settling the round again. (One of a
- *  removed incarnation is of no state `s` read: those read as no table.) */
-export function settledAlready<S extends RouletteTableState | CrapsTableState>(tableId: string, s: S): S | null {
+/** The book of a table's incarnation no removal has ended, when the doc's
+ *  state is of one a removal ended: a page cut off from the room wrote its
+ *  state of the incarnation removed over that of the one the table was put
+ *  back on (tableStateOf). */
+function liveBook(map: Y.Map<unknown>, tableId: string, kind: 'roulette' | 'craps'): TableBook | null {
+  const chips = ensureChips();
+  for (const inc of chipIndex.booksOf.get(tableId) ?? []) {
+    if (map.has(goneKey(tableId, inc))) continue;
+    const book = bookAt(chips, `${tableId}:${inc}`);
+    if (book?.st.kind === kind) return book;
+  }
+  return null;
+}
+
+/** The state to put back over the doc's state `raw` of a table (null when
+ *  it goes on from the table's book): the book's settled state when `raw`
+ *  doesn't go on from it (settledAlready), or the book of the incarnation
+ *  the table was put back on when `raw` is of one a removal ended
+ *  (liveBook). */
+function putBackOver(
+  map: Y.Map<unknown>, tableId: string, raw: RouletteTableState | CrapsTableState,
+): RouletteTableState | CrapsTableState | null {
+  if (!removed(map, tableId, raw)) return settledAlready(tableId, raw);
+  const book = liveBook(map, tableId, raw.kind);
+  return book ? { ...book.st, bk: book.id } : null;
+}
+
+/** 📒 A table's state as it plays: the doc's (`table:`), or the one to put
+ *  back over it (putBackOver), which the next write of the table's state
+ *  writes (putTableBack). Null for none, or a removed table's. So no round
+ *  the book has settled plays again meanwhile, nor holds its lists' chips,
+ *  nor is refunded by a removal. */
+function tableStateOf(map: Y.Map<unknown>, tableId: string): RouletteTableState | CrapsTableState | null {
+  const raw = map.get(`table:${tableId}`);
+  if (!(isRouletteTableState(raw) || isCrapsTableState(raw))) return null;
+  const back = putBackOver(map, tableId, raw);
+  return back ?? (removed(map, tableId, raw) ? null : raw);
+}
+
+/** Put the state to put back over the doc's (putBackOver) up as the
+ *  table's, in a fresh write of the book (writeSettledState), so a round
+ *  opened from it goes on from a write no list was put down on. True when
+ *  it did. Every write of a table's state does it first (and is made again,
+ *  if need be, from what went up), and so does a settle, instead of
+ *  settling. */
+export function putTableBack(tableId: string): boolean {
   const map = ensureMap();
-  const value = map.get(settledKey(tableId));
-  const done = (s.kind === 'craps' ? isCrapsTableState(value) : isRouletteTableState(value))
-    ? value as RouletteTableState | CrapsTableState : null;
-  if (!done || done.phase !== 'settled' || done.round < s.round) return null;
-  if (s.phase === 'settled' && s.round === done.round) return null;
-  return tableIncOf(tableId, done) === tableIncOf(tableId, s) ? done as S : null;
+  const raw = map.get(`table:${tableId}`);
+  if (!(isRouletteTableState(raw) || isCrapsTableState(raw))) return false;
+  const back = putBackOver(map, tableId, raw);
+  if (!back) return false;
+  // (Not written, and nothing goes on from the state up there either, on a
+  // page that may not write the table now: tableWritable.)
+  if (tableWritable(tableId)) writeSettledState(tableId, back);
+  return true;
+}
+
+/** What says this page may write its tables now (croupier's tablesAwake:
+ *  not while it waits out a wake). */
+let tablesAwakeNow: () => boolean = () => true;
+export function setTablesAwakeCheck(check: () => boolean): void {
+  tablesAwakeNow = check;
+}
+
+/** May this page write table `tableId`'s state and book now? Not on a page
+ *  just woken from a sleep (its doc may not have heard the page that took
+ *  its tables over meanwhile), nor on one holding part of another page's
+ *  update (casinoWhole): a book it wrote then, from what it holds, would
+ *  meet the room's as a cut-off page's does, and the doc might keep it. */
+export function tableWritable(tableId: string): boolean {
+  return tablesAwakeNow() && casinoWhole(tableId);
 }
 
 /** How a page comes to close a table: it removes the table itself
@@ -787,7 +1234,6 @@ export type TableClosing = 'local' | 'heard' | 'elsewhere';
 export function clearTableKeys(tableId: string, closing: TableClosing = 'heard'): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
-  const keptPrefix = `kept:${tableId}:`;
   boundDoc!.transact(() => {
     // The incarnation removed (an earlier build's state up is the one its
     // next round takes, tableIncOf). With none up here, the one a page that
@@ -805,13 +1251,11 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard')
     else if (closing === 'local' || (closing === 'heard' && !map.has(goneKey(tableId, '')))) {
       markRemoved(map, tableId, freshIncFor(map, tableId));
     }
-    // What kept bets left by a removal still owe is paid before they go
-    // (keptOwed), their incarnations marked ended now.
-    for (const key of [...map.keys()]) {
-      if (key.startsWith(keptPrefix)) payKeptOwed(map, tableId, key.slice(keptPrefix.length));
-    }
+    // What kept bets in the books of removed incarnations still owe is
+    // refunded (keptOwed), this one's marked ended now. (The books stay:
+    // they hold what the table paid.)
+    payRemovedOwed(map, tableId);
     map.delete(`table:${tableId}`);
-    map.delete(settledKey(tableId));
     map.delete(`croupier:${tableId}`);
     // 🎲 The per-table config keys ride the same map — a removed table must
     // not leave orphaned settings behind (harmless no-op for roulette, which
@@ -822,8 +1266,7 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard')
     const seatPrefix = `seat:${tableId}:`;
     const seedPrefix = `fseed:${tableId}:`;
     for (const key of [...map.keys()]) {
-      if (key.startsWith(betPrefix) || key.startsWith(keptPrefix) || key.startsWith(seatPrefix)
-        || key.startsWith(seedPrefix)) map.delete(key);
+      if (key.startsWith(betPrefix) || key.startsWith(seatPrefix) || key.startsWith(seedPrefix)) map.delete(key);
     }
     heldDirty = true;
   });
@@ -903,13 +1346,17 @@ const MAX_LIST_STAKE = MAX_BETS_PER_PLAYER * MAX_BET_AMOUNT;
 
 /** A stored list's bets and what of them was taken, either shape: this
  *  build's `held` (with `taken` when rewritten from an earlier build's list,
- *  and craps' `base`), or an earlier build's `bets`, all taken. Null for junk,
- *  or a list put down on another incarnation of the table than `inc`. */
+ *  and craps' `base` and `over`), or an earlier build's `bets`, all taken.
+ *  Null for junk, or a list put down on another incarnation of the table
+ *  than `inc`. */
 function storedList<B extends { amount: number }>(
   value: unknown, isBet: (b: unknown) => boolean, at: Incarnation,
-): { bets: B[]; taken: number; legacy: boolean; base?: number; pruned?: boolean } | null {
+): { bets: B[]; taken: number; legacy: boolean; base?: number; pruned?: boolean; over?: string; bk?: string } | null {
   if (typeof value !== 'object' || value === null) return null;
-  const t = value as { held?: unknown; bets?: unknown; inc?: unknown; taken?: unknown; base?: unknown; pruned?: unknown };
+  const t = value as {
+    held?: unknown; bets?: unknown; inc?: unknown; taken?: unknown; base?: unknown; pruned?: unknown; over?: unknown;
+    bk?: unknown;
+  };
   const held = t.held !== undefined;
   const list = held ? t.held : t.bets;
   if (held && t.bets !== undefined) return null;
@@ -929,9 +1376,12 @@ function storedList<B extends { amount: number }>(
     return null;
   }
   if (t.base !== undefined && !(Number.isSafeInteger(t.base) && (t.base as number) >= 0)) return null;
+  if ((t.over !== undefined && !isBookId(t.over)) || (t.bk !== undefined && !isBookId(t.bk))) return null;
   return {
     bets, taken: (t.taken as number | undefined) ?? 0, legacy: false,
     ...(t.base !== undefined ? { base: t.base as number } : {}),
+    ...(t.over !== undefined ? { over: t.over as string } : {}),
+    ...(t.bk !== undefined ? { bk: t.bk as string } : {}),
   };
 }
 
@@ -958,12 +1408,19 @@ const stakeOf = (l: { bets: readonly { amount: number }[]; taken: number }): Fel
   taken: l.taken,
 });
 
-/** A stored roulette list for its round (see storedList). */
-function rouletteList(value: unknown, at: Incarnation): { round: number; bets: RouletteBet[]; taken: number } | null {
+/** A stored roulette list for its round (see storedList), of the round the
+ *  table's state `bk` goes on from: this build's list names the book its
+ *  round went on from (`bk`), so a list put down at a round the doc doesn't
+ *  keep (on a page cut off from the room, over a run of rounds the doc
+ *  dropped) never plays a round of the same number here. An earlier build's
+ *  names none, and goes with whichever is up. */
+function rouletteList(
+  value: unknown, at: Incarnation, bk: string | undefined,
+): { round: number; bets: RouletteBet[]; taken: number } | null {
   const round = (value as { round?: unknown } | null)?.round;
   if (!Number.isInteger(round) || (round as number) < 1) return null;
   const list = storedList<RouletteBet>(value, isRouletteBet, at);
-  if (!list || list.base !== undefined) return null;
+  if (!list || list.base !== undefined || (!list.legacy && list.bk !== bk)) return null;
   return { round: round as number, bets: list.bets, taken: list.taken };
 }
 
@@ -973,13 +1430,14 @@ function liveRouletteList(
   map: Y.Map<unknown>, tableId: string, playerId: string, s: RouletteTableState | null,
 ): { bets: RouletteBet[]; taken: number } | null {
   if (!s || s.phase === 'settled') return null;
-  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s));
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s), s.bk);
   return list && list.round === s.round ? list : null;
 }
 
 export function readMyBets(tableId: string, playerId: string, round: number): RouletteBet[] {
   const map = ensureMap();
-  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, readTableState(tableId)));
+  const s = readTableState(tableId);
+  const list = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s), s?.bk);
   return list && list.round === round ? list.bets : [];
 }
 
@@ -990,16 +1448,32 @@ export function readMyBets(tableId: string, playerId: string, round: number): Ro
 export function writeMyBets(tableId: string, playerId: string, round: number, bets: RouletteBet[]): void {
   const map = ensureMap();
   const s = readTableState(tableId);
-  if (!s) return;
-  const was = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s));
+  // (Nor on a doc holding part of an update: the list it rewrites may read
+  // as gone. casinoWhole)
+  if (!s || !casinoWhole(tableId)) return;
+  if (bets.length > 0 && tableFullFor(readAllBets(tableId, round), playerId)) return;
+  const was = rouletteList(map.get(`bets:${tableId}:${playerId}`), incarnationOf(tableId, s), s.bk);
   const taken = was && was.round === round ? was.taken : 0;
   boundDoc!.transact(() => {
     map.set(`bets:${tableId}:${playerId}`, {
       round, held: bets, inc: tableIncOf(tableId, s),
+      ...(s.bk !== undefined ? { bk: s.bk } : {}),
       ...(taken > 0 ? { taken } : {}),
     });
     heldDirty = true;
   });
+}
+
+/** Most distinct bettors one round of a table takes (what a Fair round's
+ *  transcript carries: fairTableSeeds), Fair or not: the close freezes who
+ *  is in a round, and a bettor past it would sit the round out. */
+export const MAX_TABLE_BETTORS = 31;
+
+/** Is the table full for a newcomer `playerId`, its bets now `all`? (A
+ *  bettor already on the felt may go on.) */
+function tableFullFor(all: Record<string, unknown>, playerId: string): boolean {
+  if (Object.prototype.hasOwnProperty.call(all, playerId)) return false;
+  return Object.keys(all).length >= MAX_TABLE_BETTORS;
 }
 
 /** Every player's bets for THIS round of one table (the croupier's settle
@@ -1008,10 +1482,11 @@ export function readAllBets(tableId: string, round: number): Record<string, Roul
   const prefix = `bets:${tableId}:`;
   const out: Record<string, RouletteBet[]> = {};
   const map = ensureMap();
-  const at = incarnationOf(tableId, readTableState(tableId));
+  const s = readTableState(tableId);
+  const at = incarnationOf(tableId, s);
   for (const [key, value] of map.entries()) {
     if (!key.startsWith(prefix)) continue;
-    const list = rouletteList(value, at);
+    const list = rouletteList(value, at, s?.bk);
     if (!list || list.round !== round || list.bets.length === 0) continue;
     out[key.slice(prefix.length)] = list.bets;
   }
@@ -1038,26 +1513,34 @@ export function feltStake(tableId: string, playerId: string): FeltStake {
 export function readFeltStakes(tableId: string): Record<string, FeltStake> {
   const map = ensureMap();
   const out: Record<string, FeltStake> = {};
-  for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
-    for (const key of map.keys()) {
-      if (!key.startsWith(prefix)) continue;
-      const pid = key.slice(prefix.length);
-      if (out[pid]) continue;
-      const stake = feltStake(tableId, pid);
-      if (stake.net !== 0 || stake.taken !== 0) out[pid] = stake;
-    }
+  const s = readTableState(tableId) ?? readCrapsTableState(tableId);
+  for (const pid of feltPlayers(map, tableId, incarnationOf(tableId, s))) {
+    const stake = feltStake(tableId, pid);
+    if (stake.net !== 0 || stake.taken !== 0) out[pid] = stake;
   }
   return out;
 }
 
+/** Every player with a list on a table, or craps bets the book of its
+ *  incarnation `at` keeps up. */
+function feltPlayers(map: Y.Map<unknown>, tableId: string, at: Incarnation): Set<string> {
+  const prefix = `bets:${tableId}:`;
+  const pids = new Set<string>();
+  for (const key of map.keys()) if (key.startsWith(prefix)) pids.add(key.slice(prefix.length));
+  if (at !== undefined) for (const pid of Object.keys(bookAt(ensureChips(), `${tableId}:${at}`)?.kept ?? {})) pids.add(pid);
+  return pids;
+}
+
 /** What a removal hands back, of what an earlier build's lists on the table
- *  took, and on which incarnation's outcome record: its state's as the doc
- *  has it, even one a removal at the same moment ended already (the page
- *  that removed it may not have seen this round, nor the bets on it). So
- *  each page that hears of the removal refunds what it sees, and the
- *  record pays one refund per bettor (creditTableOutcome). Null without a
- *  state this build can name (an earlier build's put back after a
- *  removal). */
+ *  took, and on which incarnation: its state's as the doc has it, even one a
+ *  removal at the same moment ended already (the page that removed it may
+ *  not have seen this round, nor the bets on it). So each page that hears
+ *  of the removal refunds what it sees, and each bettor's refund record
+ *  pays one refund (creditTableOutcome). Not a roulette list of a round the
+ *  incarnation's book has settled for its bettor: a settle the doc's state
+ *  doesn't show (a takeover's stamp written as it settled, or the other
+ *  side's state after a split) resolved it. Null without a state this build
+ *  can name (an earlier build's put back after a removal). */
 export function tableEndingStakes(tableId: string): { inc: string; taken: Record<string, number> } | null {
   const map = ensureMap();
   const raw = map.get(`table:${tableId}`);
@@ -1066,20 +1549,20 @@ export function tableEndingStakes(tableId: string): { inc: string; taken: Record
   const inc = tableIncOf(tableId, raw);
   const taken: Record<string, number> = {};
   if (raw.kind === 'craps') {
-    for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
-      for (const key of map.keys()) {
-        if (!key.startsWith(prefix)) continue;
-        const pid = key.slice(prefix.length);
-        const list = taken[pid] === undefined ? crapsFelt(map, tableId, pid, inc) : null;
-        if (list && list.taken > 0) taken[pid] = list.taken;
-      }
+    for (const pid of feltPlayers(map, tableId, inc)) {
+      const list = crapsFelt(map, tableId, pid, inc);
+      if (list && list.taken > 0) taken[pid] = list.taken;
     }
   } else if (raw.phase !== 'settled') {
+    const book = bookAt(ensureChips(), `${tableId}:${inc}`);
     const prefix = `bets:${tableId}:`;
     for (const [key, value] of map.entries()) {
       if (!key.startsWith(prefix)) continue;
-      const list = rouletteList(value, inc);
-      if (list && list.round === raw.round && list.taken > 0) taken[key.slice(prefix.length)] = list.taken;
+      const pid = key.slice(prefix.length);
+      const list = rouletteList(value, inc, raw.bk);
+      if (!list || list.round !== raw.round || list.taken <= 0) continue;
+      if ((entryOf(book?.recs, pid)?.r ?? 0) >= list.round) continue;
+      taken[pid] = list.taken;
     }
   }
   return { inc, taken };
@@ -1090,21 +1573,20 @@ export function tableEndingStakes(tableId: string): { inc: string; taken: Record
 // table is one game, so the shapes never collide, and clearTableKeys /
 // creditChips / the croupier heartbeat are already game-agnostic. Craps bets are
 // NOT round-stamped: they carry across rolls. The player writes `bets:`; at
-// each settle the stickman writes what stays up as `kept:<id>:<pid>`, so the
-// two never write one key (see crapsFelt).
+// each settle the stickman writes what stays up in the table's book (`kept`),
+// so the two never write one key (see crapsFelt).
 
 export function readCrapsTableState(tableId: string): CrapsTableState | null {
-  const map = ensureMap();
-  const value = map.get(`table:${tableId}`);
-  return isCrapsTableState(value) && !removed(map, tableId, value) ? value : null;
+  const s = tableStateOf(ensureMap(), tableId);
+  return s?.kind === 'craps' ? s : null;
 }
 
 /** Stickman-only in practice (the UI gates on the house predicate). */
 export function writeCrapsTableState(tableId: string, state: CrapsTableState): void {
   const map = ensureMap();
+  if (putTableBack(tableId)) return; // (see writeTableState)
   boundDoc!.transact(() => {
     map.set(`table:${tableId}`, state);
-    if (state.phase === 'settled') map.set(settledKey(tableId), state);
     heldDirty = true;
   });
 }
@@ -1115,66 +1597,56 @@ function crapsOwnList(value: unknown, at: Incarnation): ReturnType<typeof stored
   return storedList<CrapsBet>(value, isCrapsBet, at);
 }
 
-/** What the stickman's settle of `round` left up of a player's list, and what
- *  of it an earlier build took (`taken`). */
-function keptList(value: unknown, at: Incarnation): { round: number; bets: CrapsBet[]; taken: number } | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const t = value as { round?: unknown; kept?: unknown; inc?: unknown; taken?: unknown };
-  if (!Number.isSafeInteger(t.round) || (t.round as number) < 1) return null;
-  if (!Array.isArray(t.kept) || t.kept.length > MAX_BETS_PER_PLAYER || !t.kept.every(isCrapsBet)) return null;
-  if (typeof t.inc !== 'string' || !isTableIncField(t.inc) || t.inc !== at) return null;
-  if (t.taken !== undefined && !(Number.isSafeInteger(t.taken) && (t.taken as number) > 0 && (t.taken as number) <= MAX_LIST_STAKE)) {
-    return null;
-  }
-  return { round: t.round as number, bets: t.kept as CrapsBet[], taken: (t.taken as number | undefined) ?? 0 };
+/** What the kept bets in the book of a removed table incarnation still owe a
+ *  player back: what an earlier build took of them, when the settle that
+ *  kept them up came at the very moment of the removal and the doc kept it,
+ *  so the removal's refund of them doesn't count (endCounts). Owed, in the
+ *  player's chips, until it is refunded as the removal would have
+ *  (payKeptOwed). */
+function keptOwed(map: Y.Map<unknown>, chips: Y.Map<unknown>, tableId: string, inc: string, playerId: string): number {
+  if (!map.has(goneKey(tableId, inc))) return 0;
+  const book = bookAt(chips, `${tableId}:${inc}`);
+  const taken = entryOf(book?.kept, playerId)?.taken ?? 0;
+  if (taken === 0) return 0;
+  const end = chips.get(`end:${tableId}:${inc}:${playerId}`);
+  return isEndRecord(end) && end.p === playerId && endCounts(book, end) ? 0 : taken;
 }
 
-/** What a craps settle's `kept` record still owes its player back: what an
- *  earlier build's bets it kept up had taken, once their table's removal
- *  came at the same moment as the settle and the doc kept the settle's
- *  outcome over the removal's (which refunded them). The record left behind
- *  owes it, in the player's chips, until the table's outcome record pays it
- *  as the removal would have (payKeptOwed), when the kept record goes. */
-function keptOwed(
-  map: Y.Map<unknown>, chips: Y.Map<unknown>, tableId: string, playerId: string, value: unknown,
-): { inc: string; owed: number } | null {
-  const inc = (value as { inc?: unknown } | null)?.inc;
-  if (typeof inc !== 'string') return null;
-  const kept = keptList(value, inc);
-  if (!kept || kept.taken === 0) return null;
-  if (!map.has(goneKey(tableId, inc))) return null;
-  if (lastOutcome(chips, tableId, inc, playerId).was?.ev === 'end') return null;
-  return { inc, owed: kept.taken };
-}
-
-/** Pay what a player's kept record owes (keptOwed) as the removal's outcome,
- *  before the record is overwritten or deleted. Once paid, it owes nothing:
- *  two pages paying it at once pay one outcome. */
-function payKeptOwed(map: Y.Map<unknown>, tableId: string, playerId: string): void {
-  const due = keptOwed(map, ensureChips(), tableId, playerId, map.get(`kept:${tableId}:${playerId}`));
-  if (due) creditTableOutcome(tableId, due.inc, 'end', playerId, due.owed);
+/** Refund what a player's kept bets on a removed incarnation owe (keptOwed).
+ *  Once refunded, they owe nothing: two pages refunding at once write one
+ *  record. */
+function payKeptOwed(map: Y.Map<unknown>, tableId: string, inc: string, playerId: string): void {
+  const owed = keptOwed(map, ensureChips(), tableId, inc, playerId);
+  if (owed > 0) creditTableOutcome(tableId, inc, 'end', playerId, owed);
 }
 
 /** 🎲 A player's craps bets as they play, of the two keys: their own list,
  *  unless the stickman has settled a roll since they wrote it, when what that
- *  settle left up (`kept`) plays instead. A list counts as written after the
- *  settle of roll `base - 1` (writeMyCrapsBets); an earlier build's list,
- *  which has no `base`, plays unless it is the stickman's prune of it
- *  (pruneCrapsBets), which plays only as the kept record: two pages settling
- *  one roll can each prune it, and the doc may keep one page's prune with
- *  the other's kept record and outcome. So a list written before a roll
- *  settled (a take-down that crossed the dice) never brings back bets the
- *  roll resolved: the edit is dropped, the felt stays as the roll left it. */
+ *  settle left up (the book's `kept`) plays instead. A list counts as
+ *  written after the settle of roll `base - 1` (writeMyCrapsBets), over the
+ *  kept bets it names (`over`): it plays only over those very ones, so a
+ *  list written before a roll settled (a take-down that crossed the dice),
+ *  or on a page cut off from the room over a roll the doc doesn't keep,
+ *  never brings back bets the doc's roll resolved: the edit is dropped, the
+ *  felt stays as the roll left it. An earlier build's list, which has
+ *  neither, plays unless it is the stickman's prune of it (pruneCrapsBets),
+ *  which plays only as the book's kept bets: two pages settling one roll can
+ *  each prune it, and the doc may keep one page's prune with the other's
+ *  book. */
 function crapsFelt(
-  map: Y.Map<unknown>, tableId: string, playerId: string, at: Incarnation,
-): { bets: CrapsBet[]; taken: number } | null {
+  map: Y.Map<unknown>, tableId: string, playerId: string, at: Incarnation, chips = ensureChips(),
+): { bets: CrapsBet[]; taken: number; over?: string } | null {
   const own = crapsOwnList(map.get(`bets:${tableId}:${playerId}`), at);
-  const kept = keptList(map.get(`kept:${tableId}:${playerId}`), at);
-  if (!kept) return own;
-  const keep = { bets: kept.bets, taken: kept.taken };
+  const kept = at === undefined ? undefined : entryOf(bookAt(chips, `${tableId}:${at}`)?.kept, playerId);
+  // (A list written over kept bets the doc's book doesn't have at all was
+  // written over a roll it doesn't keep.)
+  if (!kept) return own?.over !== undefined ? null : own;
+  const keep = { bets: kept.kept, taken: kept.taken ?? 0, over: kept.w };
   if (!own) return keep;
-  if (!own.legacy) return own.base !== undefined && own.base > kept.round ? own : keep;
-  return own.pruned ? keep : own;
+  if (!own.legacy) return own.base !== undefined && own.base > kept.round && own.over === kept.w ? own : keep;
+  // (An earlier build's list newer than the kept bets: a list written over
+  // it is over them too.)
+  return own.pruned ? keep : { ...own, over: kept.w };
 }
 
 export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
@@ -1183,48 +1655,53 @@ export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
 
 /** The bettor's own write of their craps list, its chips held on the felt.
  *  `base` is the roll it is for (the next one once a roll has settled), and
- *  what an earlier build's list took goes on with it, as for writeMyBets.
- *  Only while the table is up. */
+ *  `over` the kept bets it was written over (crapsFelt); what an earlier
+ *  build's list took goes on with it, as for writeMyBets. Only while the
+ *  table is up. */
 export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsBet[]): void {
   const map = ensureMap();
   const s = readCrapsTableState(tableId);
-  if (!s) return;
+  if (!s || !casinoWhole(tableId)) return; // (see writeMyBets)
+  if (bets.length > 0 && tableFullFor(readAllCrapsBets(tableId), playerId)) return;
   const inc = tableIncOf(tableId, s);
-  const taken = crapsFelt(map, tableId, playerId, inc)?.taken ?? 0;
+  const felt = crapsFelt(map, tableId, playerId, inc);
+  const taken = felt?.taken ?? 0;
   const base = s.phase === 'settled' ? s.round + 1 : s.round;
   boundDoc!.transact(() => {
     map.set(`bets:${tableId}:${playerId}`, {
       kind: 'craps', held: bets, base, inc,
       ...(taken > 0 ? { taken } : {}),
+      ...(felt?.over !== undefined ? { over: felt.over } : {}),
     });
     heldDirty = true;
   });
 }
 
 /** The stickman's record, at the settle of `round`, of a player's bets that
- *  stay up (none: the roll resolved them all), held on the felt from then.
- *  This build's player's own list is never written: what an earlier build's
- *  list took is handed back, and the kept bets hold their chips. An earlier
- *  build's list is pruned where it lies, as earlier builds did, so its page
- *  reads the felt as the roll left it, and what it took of the bets that stay
- *  stays taken (`taken`); the prune is marked (`pruned`), and that page's
- *  own next write, which never is, plays as a new list. */
+ *  stay up (none: the roll resolved them all), held on the felt from then:
+ *  in this page's write of the book (writeSettledState). This build's
+ *  player's own list is never written: what an earlier build's list took is
+ *  handed back, and the kept bets hold their chips. An earlier build's list
+ *  is pruned where it lies, as earlier builds did, so its page reads the
+ *  felt as the roll left it, and what it took of the bets that stay stays
+ *  taken (`taken`); the prune is marked (`pruned`), and that page's own next
+ *  write, which never is, plays as a new list. */
 export function pruneCrapsBets(tableId: string, playerId: string, round: number, bets: CrapsBet[]): void {
+  if (!isPlayerKey(playerId)) return;
   const map = ensureMap();
+  const chips = ensureChips();
   const s = readCrapsTableState(tableId);
   if (!s) return;
   const inc = tableIncOf(tableId, s);
+  const book = openBook(chips, tableId, inc, round);
+  if (!book) return;
   const key = `bets:${tableId}:${playerId}`;
   const own = crapsOwnList(map.get(key), inc);
   const taken = own?.legacy ? bets.reduce((n, b) => n + b.amount, 0) : 0;
+  const kept: BookKept = { round, kept: bets, ...(taken > 0 ? { taken } : {}), w: book.id };
   boundDoc!.transact(() => {
-    payKeptOwed(map, tableId, playerId); // a record an earlier removal left
     if (own?.legacy) map.set(key, { kind: 'craps', bets, inc, pruned: round });
-    map.set(`kept:${tableId}:${playerId}`, {
-      round, kept: bets, inc,
-      ...(taken > 0 ? { taken } : {}),
-    });
-    heldDirty = true;
+    writeBook(chips, `${tableId}:${inc}`, { ...book, kept: { ...book.kept, [playerId]: kept } });
   });
 }
 
@@ -1234,11 +1711,7 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
   const map = ensureMap();
   const out: Record<string, CrapsBet[]> = {};
   const inc = incarnationOf(tableId, readCrapsTableState(tableId));
-  const pids = new Set<string>();
-  for (const prefix of [`bets:${tableId}:`, `kept:${tableId}:`]) {
-    for (const key of map.keys()) if (key.startsWith(prefix)) pids.add(key.slice(prefix.length));
-  }
-  for (const pid of pids) {
+  for (const pid of feltPlayers(map, tableId, inc)) {
     const list = crapsFelt(map, tableId, pid, inc);
     if (list && list.bets.length > 0) out[pid] = list.bets;
   }
@@ -1249,9 +1722,7 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
  *  list for it (roulette's for the round, a craps list for that roll or an
  *  earlier build's the stickman hasn't pruned) is there, on the table's
  *  incarnation, and empty. A settle writes each an outcome all the same, of
- *  nothing: a rival page settling the same round may have seen their last
- *  bet, and the doc keeps one page's outcome per player
- *  (creditTableOutcome), so this page's must meet it on that key. */
+ *  nothing, so its book names every bettor whose list it saw. */
 export function readEmptiedLists(tableId: string, round: number): string[] {
   const map = ensureMap();
   const roulette = readTableState(tableId);
@@ -1263,10 +1734,10 @@ export function readEmptiedLists(tableId: string, round: number): string[] {
     if (!key.startsWith(prefix)) continue;
     const pid = key.slice(prefix.length);
     if (roulette) {
-      const list = rouletteList(value, at);
+      const list = rouletteList(value, at, roulette.bk);
       if (list && list.round === round && list.bets.length === 0) out.push(pid);
     } else if (craps) {
-      // (Such a list is the felt: the stickman's kept records are of rolls before.)
+      // (Such a list is the felt: the book's kept bets are of rolls before.)
       const own = crapsOwnList(value, at);
       if (own && own.bets.length === 0 && (own.legacy ? !own.pruned : own.base === round)) out.push(pid);
     }
@@ -1300,47 +1771,57 @@ function tableOf(ids: { has(id: string): boolean }, rest: string): string | null
  *  by a removal owe them back: keptOwed). */
 function countHeldStakes(map: Y.Map<unknown>, chips: Y.Map<unknown>): Map<string, bigint> {
   const tables = new Map<string, RouletteTableState | CrapsTableState>();
-  const gone = new Set<string>();
-  let kept = false;
+  let gone = false;
   for (const [key, value] of map.entries()) {
-    if (key.startsWith('gone:') && key.endsWith(':')) gone.add(key.slice('gone:'.length, -1));
-    if (key.startsWith('kept:')) kept = true;
+    if (key.startsWith('gone:')) gone = true;
     if (!key.startsWith('table:')) continue;
+    if (!(isRouletteTableState(value) || isCrapsTableState(value))) continue;
     const tableId = key.slice('table:'.length);
-    if ((isRouletteTableState(value) || isCrapsTableState(value)) && !removed(map, tableId, value)) {
-      tables.set(tableId, value);
-    }
+    const s = tableStateOf(map, tableId);
+    if (s) tables.set(tableId, s);
   }
   const out = new Map<string, bigint>();
-  if (tables.size === 0 && (gone.size === 0 || !kept)) return out;
-  const seen = new Set<string>();
-  for (const [key, value] of map.entries()) {
-    const prefix = key.startsWith('bets:') ? 'bets:' : key.startsWith('kept:') ? 'kept:' : null;
-    if (prefix === null) continue;
-    const rest = key.slice(prefix.length);
-    const removedId = prefix === 'kept:' ? tableOf(gone, rest) : null;
-    if (removedId !== null) {
-      const pid = rest.slice(removedId.length + 1);
-      const due = keptOwed(map, chips, removedId, pid, value);
-      if (due) out.set(pid, (out.get(pid) ?? 0n) - BigInt(due.owed));
+  const add = (pid: string, n: bigint): void => { if (n !== 0n) out.set(pid, (out.get(pid) ?? 0n) + n); };
+  if (gone) {
+    for (const key of chips.keys()) {
+      if (!key.startsWith('book:')) continue;
+      const at = key.slice('book:'.length);
+      const cut = at.lastIndexOf(':');
+      if (cut <= 0 || !map.has(goneKey(at.slice(0, cut), at.slice(cut + 1)))) continue;
+      for (const pid of Object.keys(bookAt(chips, at)?.kept ?? {})) {
+        add(pid, -BigInt(keptOwed(map, chips, at.slice(0, cut), at.slice(cut + 1), pid)));
+      }
     }
-    const tableId = tableOf(tables, rest);
-    if (tableId === null) continue;
-    const pid = rest.slice(tableId.length + 1);
-    // A craps player's two keys make one felt: count it once.
-    if (seen.has(`${tableId}:${pid}`)) continue;
+  }
+  if (tables.size === 0) return out;
+  // A craps player's list and kept bets make one felt: count it once.
+  const seen = new Set<string>();
+  const count = (tableId: string, pid: string): void => {
+    if (seen.has(`${tableId}:${pid}`)) return;
     seen.add(`${tableId}:${pid}`);
     const s = tables.get(tableId)!;
-    const list = s.kind === 'craps' ? crapsFelt(map, tableId, pid, tableIncOf(tableId, s)) : liveRouletteList(map, tableId, pid, s);
-    if (!list) continue;
-    const net = stakeOf(list).net;
-    if (net !== 0) out.set(pid, (out.get(pid) ?? 0n) + BigInt(net));
+    const list = s.kind === 'craps'
+      ? crapsFelt(map, tableId, pid, tableIncOf(tableId, s), chips) : liveRouletteList(map, tableId, pid, s);
+    if (list) add(pid, BigInt(stakeOf(list).net));
+  };
+  for (const key of map.keys()) {
+    if (!key.startsWith('bets:')) continue;
+    const rest = key.slice('bets:'.length);
+    const tableId = tableOf(tables, rest);
+    if (tableId !== null) count(tableId, rest.slice(tableId.length + 1));
+  }
+  for (const [tableId, s] of tables) {
+    if (s.kind !== 'craps') continue;
+    for (const pid of Object.keys(bookAt(chips, `${tableId}:${tableIncOf(tableId, s)}`)?.kept ?? {})) count(tableId, pid);
   }
   return out;
 }
 
 function heldStake(playerId: string): bigint {
-  if (heldDirty) {
+  // (Counted again only on a doc holding every update whole: a table read
+  // as gone there holds nothing, and its bettors' chips would read as free.
+  // casinoWhole)
+  if (heldDirty && casinoWhole()) {
     heldStakes = countHeldStakes(ensureMap(), ensureChips());
     heldDirty = false;
   }
@@ -1359,11 +1840,15 @@ function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
     if (casinoMap !== map) return; // a binding we've moved off
     const keys = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
     const counts = (k: string | null): boolean =>
-      k !== null && (k.startsWith('table:') || k.startsWith('bets:') || k.startsWith('kept:') || k.startsWith('gone:'));
-    // A table's outcome record too: a removal's ends what kept bets owe.
-    const outcomes = tr.changed.get(chips as unknown as Y.AbstractType<Y.YEvent<any>>);
-    const ends = (k: string | null): boolean => k !== null && k.startsWith('tbl:');
-    if (!(keys && [...keys].some(counts)) && !(outcomes && [...outcomes].some(ends))) return;
+      k !== null && (k.startsWith('table:') || k.startsWith('bets:') || k.startsWith('gone:'));
+    // A table's book too (its kept bets), and a refund: one ends what kept
+    // bets owe.
+    const books = tr.changed.get(chips as unknown as Y.AbstractType<Y.YEvent<any>>);
+    const felts = (k: string | null): boolean => k !== null && (k.startsWith('book:') || k.startsWith('end:'));
+    if ((keys && [...keys].some(counts)) || (books && [...books].some(felts))) heldDirty = true;
+    // (Not on a doc holding part of an update: the count waits for the rest,
+    // and the transaction it comes in counts it. casinoWhole)
+    if (!heldDirty || !casinoWhole()) return;
     const fresh = countHeldStakes(map, chips);
     for (const pid of new Set([...fresh.keys(), ...heldHeard.keys()])) {
       if ((fresh.get(pid) ?? 0n) !== (heldHeard.get(pid) ?? 0n)) heldTouched.add(pid);

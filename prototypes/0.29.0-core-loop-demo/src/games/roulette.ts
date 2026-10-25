@@ -13,7 +13,7 @@
  * returns 0 — the chips are already gone.
  */
 
-import { isFairnessTranscript, isSeedRoundFields, isTableIncField, MAX_BET_AMOUNT } from './craps';
+import { isFairnessTranscript, isSeedRoundFields, isTableBookField, isTableIncField, MAX_BET_AMOUNT } from './craps';
 import type { FairnessTranscript } from './craps';
 
 /** Numbers that pay RED (standard wheel). Everything 1–36 not here is black. */
@@ -82,6 +82,9 @@ export interface RouletteTableState {
   /** 🧾 This table's incarnation (casinoDoc tableIncFor), kept round to round:
    *  a table set up again under the same id pays its own rounds. */
   inc?: string;
+  /** 📒 The write of the table's book this state goes on from (casinoDoc
+   *  writeSettledState), kept round to round. */
+  bk?: string;
 }
 
 export function initialRouletteState(): RouletteTableState {
@@ -121,6 +124,7 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.operator === undefined || (typeof s.operator === 'string' && s.operator.length <= 192))
     && isTableIncField(s.inc)
+    && isTableBookField(s.bk)
     // A void is the canonical no-outcome shape: no pocket, no transcript.
     && (s.voided === undefined || (typeof s.voided === 'boolean'
       && (!s.voided || (s.phase === 'settled' && s.result === null && s.fairness === undefined

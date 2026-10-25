@@ -15,8 +15,8 @@
  * CRAPS ≠ ROULETTE: a roulette settle clears the felt every spin. A craps roll
  * only settles the bets that GOT a decision — a pass line waiting on its point,
  * a working place bet, ride to the next roll. So the settle also PRUNES each
- * player's bets (casinoDoc pruneCrapsBets: the survivors, as the stickman's
- * own `kept:<id>:<pid>`, never the player's `bets:` key) and carries the POINT
+ * player's bets (casinoDoc pruneCrapsBets: the survivors, in the table's
+ * book, never the player's `bets:` key) and carries the POINT
  * forward into the next betting window. The survivors play until the player
  * writes a list after that roll, so an edit that crossed the dice is dropped
  * rather than bringing back bets the roll resolved (casinoDoc crapsFelt).
@@ -27,16 +27,21 @@
  * more bets", revealed at the settle — so the operator can't pick the roll.
  */
 
-import { RECONNECTING_NOTICE, refundAndClear, tablesAwake, tablesWakeCount, timerOnThisClock } from './croupier';
+import {
+  closeWhenWhole, RECONNECTING_NOTICE, refundAndClear, tablesAwake, tablesWakeCount, timerOnThisClock,
+} from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import {
   casinoDocEpoch,
+  casinoWhole,
+  putTableBack,
   readAllCrapsBets,
   readCrapsFairnessPref,
   readCrapsTableState,
   readDiceThrow,
   readSeats,
-  tableIncToOpen,
+  tableOpening,
+  tableWritable,
   transactCasino,
   writeCrapsTableState,
   writeDiceThrow,
@@ -47,7 +52,7 @@ import type { CrapsTableState, SeatedPlayer } from './games/craps';
 import type { TableClosing } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
-import { CRAPS_PAGE_ID, putBackSettled, selectCrapsBackend } from './crapsBackend';
+import { CRAPS_PAGE_ID, selectCrapsBackend } from './crapsBackend';
 import { getCrapsFairnessMode } from './games/diceFairness';
 // ⚖️ Fair by default: the house commits at open, the bettors' commits freeze
 // at "no more bets" (fairTableSeeds.ts).
@@ -129,6 +134,9 @@ export function openCrapsBetting(
   const handOver = after?.sevenOut === true;
   const shooter = handOver ? undefined : after?.shooter;
   const lastShooter = handOver ? after?.shooter ?? after?.lastShooter : after?.lastShooter;
+  // 📒 Not on a doc holding part of an update, where a table read as gone
+  // would open anew, nor on a page just woken (tableWritable).
+  if (!tableWritable(tableId)) return;
   // One transaction: a name a removal left unmarked is marked as it opens.
   transactCasino(() => writeCrapsTableState(tableId, {
     kind: 'craps',
@@ -143,7 +151,7 @@ export function openCrapsBetting(
     ...(lastShooter !== undefined ? { lastShooter } : {}),
     fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
     ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
-    inc: tableIncToOpen(tableId),
+    ...tableOpening(tableId),
   }));
 }
 
@@ -301,8 +309,9 @@ export function closeCrapsBetting(tableId: string, s: CrapsTableState, now = Dat
 /** While the dice are with the shooter: settle their throw when it lands in
  *  the doc, or have the stickman throw at the deadline. */
 export function tickCrapsClosing(tableId: string, s: CrapsTableState, autoShowMs?: number, now = Date.now()): void {
+  if (!casinoWhole(tableId)) return;
   // A roll settled already comes back as it was, and nobody throws for it.
-  if (putBackSettled(tableId, s)) return;
+  if (putTableBack(tableId)) return;
   const t = readDiceThrow(tableId);
   if (t && t.round === s.round) {
     if (s.shooter !== undefined && t.by === s.shooter) {
@@ -353,7 +362,15 @@ export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: 
   if (stamp && now >= stamp.at && now - stamp.at < MANUAL_TAKEOVER_SETTLE_MS) return;
   // 💤 A page waking from a sleep holds this turn only in a doc that may not
   // have heard a takeover yet: it waits to be awake again (noteTablesRunning).
-  if (!tablesAwake(now)) return;
+  if (!tablesAwake(now) || !casinoWhole(tableId)) return;
+  // ⏱ A deadline further off than the whole turn (this page's clock went
+  // back since it wrote it) is cut back to the turn on this clock. (A turn
+  // taken over throws at once.)
+  const deadline = timerOnThisClock(s, s.shooter !== undefined ? CRAPS_SHOOTER_MS : CRAPS_CLOSING_MS, now);
+  if (!stamp?.throwNow && deadline !== s.phaseDeadline) {
+    writeCrapsTableState(tableId, { ...s, phaseDeadline: deadline });
+    return;
+  }
   tickCrapsClosing(tableId, s, autoShowMs, stamp?.throwNow ? Infinity : now);
   stampedAt.delete(tableId);
 }
@@ -413,7 +430,9 @@ const stampedAt = new Map<string, {
  */
 export function pressManualRoll(tableId: string, now = Date.now()): string | null {
   // 💤 Just woken: the doc may not have heard the room yet (noteTablesRunning).
-  if (!tablesAwake(now)) return RECONNECTING_NOTICE;
+  // 📒 Nor while it holds part of an update: the table may read as gone
+  // (casinoWhole).
+  if (!tablesAwake(now) || !casinoWhole(tableId)) return RECONNECTING_NOTICE;
   if (!readCrapsTableState(tableId)) {
     // The first press only opens the window: bets go down on an open table
     // (casinoDoc STAKES ON THE FELT), and on a Fair one the bettors need to
@@ -461,6 +480,11 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
  * race the settle.
  */
 export function tickAutoStickman(tableId: string): void {
+  // 📒 Not on a doc holding part of another page's update (casinoWhole).
+  if (!casinoWhole(tableId)) return;
+  // A state that doesn't go on from the table's book: the book's goes back
+  // up first (casinoDoc putTableBack).
+  if (putTableBack(tableId)) return;
   const now = Date.now();
   sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
@@ -510,8 +534,9 @@ export function tickAutoStickman(tableId: string): void {
  * table's casino keys (idempotent LWW delete).
  */
 export function closeCrapsTable(tableId: string, closing: TableClosing = 'heard'): void {
-  // One transaction: no page sees the refunds without the table gone.
-  transactCasino(() => refundAndClear(tableId, closing));
+  // One transaction: no page sees the refunds without the table gone. (On a
+  // doc holding every update whole: croupier.closeWhenWhole.)
+  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing)));
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────
