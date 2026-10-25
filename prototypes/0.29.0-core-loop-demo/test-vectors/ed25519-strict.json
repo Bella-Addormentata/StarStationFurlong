@@ -1,0 +1,68 @@
+{
+  "note": "Ed25519 verdicts pinned for keypair.verifyIdentityStrict (strict: its byte checks, then @noble/ed25519 2.3.0 verify with zip215:false), for that noble call alone (noble) and for noble's default (loose: zip215:true, what keypair.verifyIdentity uses). Deterministic: fixed seeds sha256(\"ssf-ed25519-strict-vector-v1|<name>\") and fixed scalars. pub and sig are base64url, msg is hex. honest: an ordinary signature. torsion-r: R = 123456789·B + T8 (T8 of order 8), S = r + k·a; the cofactored equation accepts it in both modes. s-plus-l: an honest signature with S + L in place of S. noncanonical-r: R is the order-4 point T4 = 2·T8 (y = 0) spelled with y = p, S = k·a; its canonical spelling passes strict. small-order-key: the key is T8 and (42·B, 42) verifies every message under it. identity-r: R is the identity point (01 00…00) and S = SHA-512(\"\")·a; noble 2.3.0 drops the message from k when R is the identity (R.toBytes() throws inside its try), so under an ordinary key this one signature verifies every message in both noble modes, and verifyIdentityStrict refuses any identity R before calling noble. identity-r-rfc: the same R with S = SHA-512(R‖A‖M)·a, valid under RFC 8032 and in the WebCrypto of Node 22 but refused by noble and by verifyIdentityStrict. strict is the verdict of verifyIdentityStrict, noble is @noble/ed25519 2.3.0 with zip215:false on its own (they differ only for identity-r), loose is the noble default. A change to any verdict means the verifier changed: pages on different versions would fold different rounds.",
+  "vectors": [
+    {
+      "name": "honest",
+      "pub": "c_ljp3JbgfA2sZ7Z1OS4slb1KSpeWXXUt0hCnXyEVxw",
+      "msg": "bab63a48f777e831e8db0238d06173c5f7a438aeafd397e4659dbc39e7c99f18",
+      "sig": "RO1JJZhFeZt2s0g7C0p12y_5EO9oSd6Rv6rzTGHUsYUIi6K1Me0BglbQmbJByCceiXZ4bEaQr84Fw4nWEGbRBw",
+      "strict": true,
+      "noble": true,
+      "loose": true
+    },
+    {
+      "name": "torsion-r",
+      "pub": "mzziRcC9NftLlx2-CJMuvV6Etl22S4VoxGrCdADPk-s",
+      "msg": "6bffe48ca97c2f53574724e204851dbe7d24f1c18122d819a6f136d1c2ef5ec8",
+      "sig": "1jwBIjFHVB304XB2Pp4niKi_WXH1KpPFgp2-b1_2u6kZg-xxScdxbWH7RugEudue_QV5CZInveQU8I86aAcQCg",
+      "strict": true,
+      "noble": true,
+      "loose": true
+    },
+    {
+      "name": "s-plus-l",
+      "pub": "9xUi_YMSF1AH1ISsi1o85sCMfIr4n0ZIeOfu4wbiXQw",
+      "msg": "dad992a5461d4af6463506f385cffd10401e28eeb7a4e58690266232b7a5a3e5",
+      "sig": "EFPP_kDWySUoNscyiZTceEFooJgBdePM6yjuiRRBRytnyjVUdIXglGX60w0090EO-t4BL7X9I2R7k_cPtfLREg",
+      "strict": false,
+      "noble": false,
+      "loose": false
+    },
+    {
+      "name": "noncanonical-r",
+      "pub": "Hu4vXxrn1Ax6D5yYlaPscgxravDflZJWTJUdnHwx_To",
+      "msg": "d3faf87e1c3fc7af77227b58daea4c9909d49ae443c86927bfec758a2927d545",
+      "sig": "7f________________________________________9U2do19Svrt2UUGaNKRo5dpS4mzoDGk-AOObc-iavhBg",
+      "strict": false,
+      "noble": false,
+      "loose": true
+    },
+    {
+      "name": "small-order-key",
+      "pub": "xxdqcD1N2E-6PAt2DRBnDyogU_osOczGTsf9d5KsA3o",
+      "msg": "7ba75cc86dd3fc914a052cc0717e553c1f6ae619ce000cb96898d69838a3d1f7",
+      "sig": "zhoymU6DXBk-K_M5CfRDc64s-U3e8P2SIDXEg2cGN8IqAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "strict": false,
+      "noble": false,
+      "loose": true
+    },
+    {
+      "name": "identity-r",
+      "pub": "UwG4kwoIBgsMLjeqpSLo3-jm4L8SkXcMqtgRZPIYVUk",
+      "msg": "4359925ba74a5550f1df07475b78e58b9beb2924b40bf6945a8de6a5b1daf76b",
+      "sig": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADgrSIoltzw9VMkLjPxDuZYEr0IucxEumOKnXBWGYFRCA",
+      "strict": false,
+      "noble": true,
+      "loose": true
+    },
+    {
+      "name": "identity-r-rfc",
+      "pub": "xFy2DpiY92_J_ZtJHb_gLdaUQlkTs9p3cr77VI9rOSU",
+      "msg": "ee9551a3eed59387ccac2303122e6a7d73911fa58a57746d7da0ec325d62d7ad",
+      "sig": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD1gS1icpHiMcPvJFvuM_ptmnPTnoma9VMvQ2q9Gqv6BQ",
+      "strict": false,
+      "noble": false,
+      "loose": false
+    }
+  ]
+}

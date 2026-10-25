@@ -34,6 +34,8 @@
  * beacon is the chosen bar.
  */
 
+import { sha256 } from '@noble/hashes/sha256';
+
 /** SHA-256 of a UTF-8 string → raw bytes. Uses the platform SubtleCrypto (browser
  *  window.crypto.subtle; Node ≥ 20 globalThis.crypto.subtle), so it is async. */
 async function sha256Bytes(message: string): Promise<Uint8Array> {
@@ -114,6 +116,20 @@ export async function diceFromMaterial(base: string): Promise<[number, number]> 
 export async function pocketFromMaterial(base: string): Promise<number> {
   for (let block = 0; ; block++) {
     for (const b of await sha256Bytes(`${base}|${block}`)) {
+      if (b < 222) return b % 37;
+    }
+  }
+}
+
+/**
+ * `pocketFromMaterial`, synchronously: the same SHA-256 blocks (@noble/hashes
+ * instead of SubtleCrypto) and the same byte-≥-222 rejection, so it returns
+ * the same pocket for every `base`. The computed-table fold
+ * (computedFold.ts) is one synchronous pass and can't await a digest.
+ */
+export function pocketFromMaterialSync(base: string): number {
+  for (let block = 0; ; block++) {
+    for (const b of sha256(new TextEncoder().encode(`${base}|${block}`))) {
       if (b < 222) return b % 37;
     }
   }
