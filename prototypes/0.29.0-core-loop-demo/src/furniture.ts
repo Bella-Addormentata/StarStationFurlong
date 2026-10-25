@@ -11210,14 +11210,13 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
   const crtLines = { value: new THREE.Vector2(...TV_CRT_LOOK.lines) };
   const crtMat = new THREE.MeshBasicMaterial({ map: crtTex, color: 0xffffff, toneMapped: false });
   applyCrtLook(crtMat, TV_CRT_LOOK, undefined, crtLines);
-  // Off the mesh while CLEAN or nothing plays, so the removal's traversal
-  // would not reach them: their own teardown hook (World runs every
+  // Off the mesh while nothing plays, so the removal's traversal would not
+  // reach them: their own teardown hook (World runs every
   // `dispose*` on userData).
   picture.userData.disposeCrt = () => {
     crtMat.dispose();
     crtTex.dispose();
   };
-  let crtOn = true;
   /** A frame of the film not drawn down yet. Where the browser says when
    *  one comes (requestVideoFrameCallback, as three's VideoTexture asks),
    *  it is set then: a 24 fps film is drawn 24 times a second, not once a
@@ -11259,7 +11258,7 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     crtDrawn = NaN;
   };
   const applyLook = () => {
-    const want = crtOn && video !== null ? crtMat : pictureMat;
+    const want = video !== null ? crtMat : pictureMat;
     if (picture.material !== want) picture.material = want;
   };
   picture.onBeforeRender = () => {
@@ -11396,8 +11395,6 @@ function attachTvSet(ctx: BuildCtx, cy: number, zBack: number, w: number, h: num
     c2d.setTransform(texScale, 0, 0, texScale, 0, 0);
     c2d.imageSmoothingEnabled = false;
     viewState = view.state;
-    crtOn = !view.clean;
-    applyLook();
     const pausedMenu = view.state === "paused" && view.menu?.kind === "paused" ? view.menu : null;
     // A picture gives way to what this page asks (below): mostly TAP TO
     // PLAY, whose picture is stalled until the press. Paused, the menu's

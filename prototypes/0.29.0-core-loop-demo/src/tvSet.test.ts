@@ -214,7 +214,7 @@ describe('the smart TV as built', () => {
     expect(pictures()).toHaveLength(0); // the texture is let go
   });
 
-  it("shows the film through the CRT look, cut down to 360 rows, unless the set's LOOK is CLEAN", () => {
+  it('shows the film through the CRT look, cut down to 360 rows', () => {
     const group = build('smart-tv');
     const s = sinks();
     group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
@@ -231,11 +231,8 @@ describe('the smart TV as built', () => {
     expect(material().userData.crtLook).toBeDefined();
     const canvas = material().map!.image as { width: number; height: number };
     expect([canvas.width, canvas.height]).toEqual([640, 360]);
-    // CLEAN: the film itself, as before the look.
-    handle.draw({ ...view('playing', 'METROPOLIS'), clean: true });
-    expect(material().map).toBeInstanceOf(THREE.VideoTexture);
-    expect(material().userData.crtLook).toBeUndefined();
-    handle.draw(view('playing', 'METROPOLIS'));
+    // Paused and played again: still the look (there is no switch).
+    handle.draw(view('paused', 'METROPOLIS'));
     expect(material().userData.crtLook).toBeDefined();
     // A 4:3 film keeps square pixels; one of fewer rows than 360 keeps its own.
     handle.showVideo(film(640, 480));
