@@ -1,13 +1,15 @@
 /**
  * 📺 tvDoc — the smart TV's shared records (#186): what is on, where the
- * playback is, and who holds the remote.
+ * playback is, and whose page keeps the room's clock.
  *
- * Three keys per TV in the room doc's `tv` map, plain JSON, whole-value
+ * Keys per TV in the room doc's `tv` map, plain JSON, whole-value
  * transacted writes, LWW per key (the partyDoc discipline):
  *   tv:<itemId>     → TvProgramme  the programme and the playback clock
- *   remote:<itemId> → RemoteRecord the remote control's holder (a lease)
+ *   beat:<itemId>   → BeatRecord   the clock's beat, laid over the programme
+ *   remote:<itemId> → RemoteRecord the page keeping the clock (a lease)
  *   volume:<itemId> → { volume }   the set's volume, a body button
  *   power:<itemId>  → { on, seq }  the set's switch, a body button
+ *   menu:<itemId>   → { at }       the highlight on the set's own menu
  * and one room-wide key per thing the room has watched (the 📚 LIBRARY):
  *   lib:<sourceId>  → TvLibraryEntry  what it was, when it last played,
  *                                     and (a torrent's file) how to get it again
@@ -30,17 +32,20 @@
  * display and the first second after T0, until the holder's first
  * heartbeat lands; the lease and history stamps are wall time too.
  *
- * THE REMOTE IS POSSESSION, NOT A ROLE (owner ruling 2026-10-03): whoever
- * holds it controls the TV. Anyone may pick a free remote up, hand it to
- * another player, or put it down; a holder renews it every
- * TV_LEASE_RENEW_MS, and it lapses TV_LEASE_LAPSE_MS after the last renewal
- * THIS PAGE SAW (never by the holder's clock — the pusherCroupier.ts
- * CLOCKS rule); the room owner (the registered host predicate) may take it
- * from anyone. The set's body buttons — power and volume — need no remote,
- * like a real one. A remote is held by a PAGE, never a key: two tabs of one
- * browser share the key (the seed lives in localStorage), and only the page
- * that picked the remote up renews it, beats the clock and lets go on leave;
- * the other tab is a viewer that may take it over, as the same person.
+ * ANYONE'S PRESS CONTROLS THE SET (owner ruling 2026-10-24, #258, over the
+ * 2026-10-03 possession rule): every SpacePhone is a remote, and there is
+ * nothing to pick up, put down or hand over. A press — PLAY, SCHEDULE,
+ * PAUSE, RESUME, a seek, LOOP, STOP, the switch — goes through from anyone,
+ * and makes the presser's page the room's CLOCK (`remote:<itemId>`, still
+ * called the remote in code): the page whose player beats the playback for
+ * everyone (THE SYNC RULE) and closes the programme at its end. The last
+ * press takes it, LWW. The clock's page renews it every TV_LEASE_RENEW_MS;
+ * it lapses TV_LEASE_LAPSE_MS after the last renewal THIS PAGE SAW (never
+ * by the holder's clock — the pusherCroupier.ts CLOCKS rule), and a room
+ * whose clock went quiet runs on by itself (readPlayback) until the next
+ * press. The clock is kept by a PAGE, never a key: two tabs of one browser
+ * share the key (the seed lives in localStorage), and only the page that
+ * pressed renews it, beats and lets go on leave.
  *
  * ENFORCEMENT POSTURE (dev phase, the doorPolicy.ts rule): every write is
  * gated here and every read is shape-checked, so a peer running edited code
@@ -52,6 +57,7 @@
  */
 
 import * as Y from 'yjs';
+import type { TvMenuView } from './tvMenu';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -61,6 +67,10 @@ export const TV_HEARTBEAT_MS = 3_000;
 export const TV_LEASE_RENEW_MS = 3_000;
 /** A remote not renewed for this long (as THIS page saw it) is free again. */
 export const TV_LEASE_LAPSE_MS = 8_000;
+/** The most a first sight of a programme runs it on by its writer's clock
+ *  (`at`): a week. Past that, a programme left playing is long over, or
+ *  that many laps in, and a clock that far out is not worth trusting. */
+export const TV_WALL_GAP_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 /** A viewer further than this from the holder's clock SEEKS… */
 export const TV_SEEK_OVER_MS = 1_500;
 /** …and nearer than that but further than this nudges the playback rate. */
@@ -92,8 +102,18 @@ export type TvSource =
   /** 📦 A file one member's node holds (the blob lane, blobLane.ts): its
    *  BLAKE3 hash, its size in bytes (a declaration — the viewer's node takes
    *  no byte past it), the holding node's iroh id, and the type the file
-   *  said it was. Each viewer's node fetches it on that viewer's FETCH. */
-  | { kind: 'blob'; hash: string; size: number; provider: string; mime?: string; title?: string };
+   *  said it was. Each viewer's node fetches it on that viewer's FETCH.
+   *  `was`: 🗜 this file is the smaller copy its sharer's machine made of
+   *  that one before the room saw it (tvShrink.ts) — the same programme
+   *  (sourceId), and the same library entry. */
+  | { kind: 'blob'; hash: string; size: number; provider: string; mime?: string; title?: string; was?: TvBlobRef };
+
+/** A file by its BLAKE3 hash and size, as a blob source names one. */
+export interface TvBlobRef {
+  hash: string;
+  size: number;
+}
+export type TvBlobSource = Extract<TvSource, { kind: 'blob' }>;
 
 /** The largest file the blob lane carries in a record (1 TiB): a bound on
  *  the declaration, not a quota — each viewer's node sets its own. */
@@ -150,12 +170,24 @@ export interface TvProgramme {
    *  it unmoved by the next start, and a same-source replay would read as
    *  ordinary drift. */
   started: number;
+  /** The `started` this showing began at: PLAY NOW and a schedule set it to
+   *  their own start, and a LOOP lap (tvProgrammeEnded) keeps it. What a
+   *  viewer's ✕ is kept against (tvTheatre), so a lap does not undo it,
+   *  while a player still sees each lap as the new start it is. Never
+   *  above `started`: a record that says otherwise reads as `started`. */
+  showing: number;
   /** The programme-ACTION revision: bumped by every transport write (play,
    *  schedule, pause, resume, seek, stop, power) and never by a heartbeat.
    *  The holder follows a new revision exactly once and otherwise only ever
    *  publishes where its own player is; a lookup started under an older
    *  revision is void. */
   jump: number;
+  /** The LOOP laps this record has run (tvProgrammeEnded), each bumped
+   *  with `jump`: a lap is a transport write the players follow, but no
+   *  one's programme action, so a lookup in flight (an upload, an
+   *  archive.org lookup, for PLAY NOW over a looping film) reads past it
+   *  (tvRevision). */
+  laps: number;
   /** Where the media ends, in ms, as the holder's player reported it for
    *  THIS programme (tvNoteEnd) — 0 until a player knows, and for a live
    *  stream. It travels with the record so that a holder handed the remote
@@ -163,6 +195,19 @@ export interface TvProgramme {
    *  the programme where the media does (tvSession's headless beat). Never
    *  a sample: writing it bumps neither `seq` nor `jump`. */
   endMs: number;
+  /** LOOP: at the media's end the programme starts over from the top
+   *  (tvProgrammeEnded) instead of going back to the home screen. The set's
+   *  setting, kept across programmes until it is turned off, and the
+   *  holder's to set like the rest of this record (tvSetLoop). */
+  loop: boolean;
+  /** UTC ms on the WRITER's clock when `positionMs` was written: where the
+   *  room was, and when. Read only by a page with nothing fresher — its
+   *  first sight of a programme playing (a newcomer, a page come back to
+   *  the room), when the holder's position is otherwise of unknown age —
+   *  so a film keeps playing in a room nobody is in, as a broadcast does,
+   *  and whoever walks in joins it where it would be now (noteSamples).
+   *  Every heartbeat restamps it; 0 on a record from before the field. */
+  at: number;
   /** The holder's name on the sample, for the screen's "with <name>" line. */
   history: TvHistoryEntry[];
 }
@@ -182,13 +227,12 @@ export interface RemoteRecord {
   /** The holder's own clock at the last renewal: compared ONLY against earlier
    *  values from the same holder to detect a renewal — never against ours. */
   leaseAt: number;
-  /** Who wrote the record: the holder on a pick-up or renewal, the GIVER on
-   *  a hand-over — which is how a phone knows to pop open on receipt. */
+  /** Who wrote the record: the holder, or the page letting it go. (A
+   *  hand-over's giver, before #258 took the hand-over away.) */
   by: string;
   /** The holder's PAGE — a per-page-load id, never the identity: two tabs
-   *  with one key are two pages, and only the one that picked the remote up
-   *  renews it, beats the clock and lets go on leave. '' on a hand-over,
-   *  until the first of the receiver's pages claims it (claimRemote). */
+   *  with one key are two pages, and only the one that pressed renews it,
+   *  beats the clock and lets go on leave. */
   page: string;
 }
 
@@ -199,8 +243,12 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   positionMs: 0,
   seq: 0,
   started: 0,
+  showing: 0,
   jump: 0,
+  laps: 0,
+  at: 0,
   endMs: 0,
+  loop: false,
   history: [],
 };
 
@@ -234,6 +282,22 @@ export interface PowerRecord {
 }
 
 export const POWER_DEFAULT: PowerRecord = { on: false, seq: 0, parkMs: null };
+
+/** The clock's beat, in a key of its own (`beat:`), never in the
+ *  programme's: anyone's press writes the programme (#258), and a beat
+ *  written there concurrently with a press could stand in its place (one
+ *  record, the last writer wins), a PAUSE undone by a sample from before
+ *  it. A beat counts only for the programme action it was taken under
+ *  (`started`, `jump`) and only while newer than the record's own sample
+ *  (`seq`); readProgramme lays it over the record, so a reader sees the
+ *  room as one record, as before. */
+export interface BeatRecord {
+  started: number;
+  jump: number;
+  seq: number;
+  positionMs: number;
+  at: number;
+}
 
 // ── Binding (the partyDoc shape) ─────────────────────────────────────────────
 
@@ -283,12 +347,23 @@ interface Sample {
    *  stamp says: the provenance the takeover anchor reads (fromSample). */
   arrivedAt: number;
   park?: true;
+  /** Anchored on the writer's wall clock (`at`), not on receipt: this
+   *  page's first sight of a programme playing. LOOP wraps such a reading
+   *  into the lap the room is on (readPlayback). */
+  wall?: true;
   /** This page's own write (the holder's beat): stamped as written, and
    *  the one stale sample whose bridged reading the switch may carry
    *  (roomPositionMs). */
   own?: true;
 }
 const samples = new Map<string, Sample>();
+/** Samples this page has read with nobody running the laps from them — the
+ *  remote put down or gone quiet — so that LOOP runs on from them on its
+ *  own (readPlayback). Once found so, a sample stays so until a new write
+ *  replaces it: its writer is gone, and whoever picks the remote up takes
+ *  the lap the room is on, as everyone else reads it, until their own
+ *  first beat. */
+const lapsRunOn = new WeakSet<Sample>();
 /** The switch's revision this page last answered, per TV: the ON write
  *  anchors the resumed programme once (noteSamples), and a late joiner, or
  *  a later change to any other key, must not anchor the room at a reading
@@ -493,17 +568,28 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       }
       continue;
     }
-    if (!key.startsWith('tv:')) continue;
-    const itemId = key.slice(3);
+    // A beat is a new sample of its set's programme (readProgramme lays it over).
+    const itemId = key.startsWith('tv:') ? key.slice(3) : key.startsWith('beat:') ? key.slice(5) : null;
+    if (itemId === null) continue;
     const rec = readProgramme(itemId);
     const prev = samples.get(itemId);
     if (!prev || prev.seq !== rec.seq) {
       // A sample the network held through a sleep and delivers on waking
       // is stamped from before the gap (`stamp`), and stale with the rest
       // (readPlayback): not a fresh anchor this page can act on.
+      // This page's FIRST sight of a programme playing (a newcomer; a page
+      // back in the room) is of unknown age: the holder may have written
+      // it a heartbeat ago or left hours ago. Its writer's wall clock says
+      // which (`at`), and the room runs on from there — skewed by however
+      // far the two clocks disagree, and corrected by the holder's next
+      // beat if there is a holder. Later samples are fresh on arrival.
+      const elapsed = !prev && !local && rec.state === 'playing' && rec.at > 0
+        ? Math.min(TV_WALL_GAP_MAX_MS, Math.max(0, wallClock() - rec.at)) : 0;
       samples.set(itemId, local
         ? { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now, own: true }
-        : { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now });
+        : elapsed > 0
+          ? { seq: rec.seq, positionMs: rec.positionMs + elapsed, receivedAt: stamp, arrivedAt: now, wall: true }
+          : { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, arrivedAt: now });
     }
   }
 }
@@ -592,26 +678,21 @@ export function volumeKey(itemId: string): string {
 export function powerKey(itemId: string): string {
   return `power:${itemId}`;
 }
+export function lookKey(itemId: string): string {
+  return `look:${itemId}`;
+}
+export function beatKey(itemId: string): string {
+  return `beat:${itemId}`;
+}
+export function menuKey(itemId: string): string {
+  return `menu:${itemId}`;
+}
 
 // ── Identity and host seams (registered by main.ts, never asserted by a caller) ──
 
 let identityProvider: () => { pub: string; name: string } = () => ({ pub: '', name: '' });
 export function setTvIdentity(provider: () => { pub: string; name: string }): void {
   identityProvider = provider;
-}
-/** The spare remote's holder: the room's DEED holder, as main.ts registers
- *  it (#142's split: taking the remote from someone, or handing theirs on,
- *  unseats them, so this is the raw deed predicate, never the shareholder-
- *  extended edit gate a peer-written venture record can satisfy). */
-let hostPredicate: () => boolean = () => false;
-export function setTvHostPredicate(predicate: () => boolean): void {
-  hostPredicate = predicate;
-}
-/** Whether this client holds the spare remote. The panels paint TAKE BACK
- *  and the owner's HAND TO from here — the same predicate that gates the
- *  write, so no button is offered that the write then refuses. */
-export function holdsSpareRemote(): boolean {
-  return hostPredicate();
 }
 /** This page's id for the lease: a page LOAD, not a device and not a key
  *  (the pusherCroupier sessionId idea). main.ts sets a fresh one per load. */
@@ -628,7 +709,7 @@ export function tvPageId(): string {
 const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
 const num = (v: unknown, fallback = 0): number =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-/** One rule for every revision counter (`seq`, `started`, `jump`, the
+/** One rule for every revision counter (`seq`, `started`, `jump`, `laps`, the
  *  switch's `seq`): a reader compares it for CHANGE, never for order, and a
  *  writer moves it by one, so it must be a whole number that one more still
  *  moves. A peer's `Number.MAX_VALUE` passes as a finite number, yet adding
@@ -676,11 +757,21 @@ export function sanitizeSource(raw: unknown): TvSource | null {
     // The type is only ever a hint to the node, which re-checks it; one
     // that is not plainly video/* or audio/* is left out.
     const mime = str(r.mime, 64);
-    const blob: TvSource = { kind: 'blob', hash, size: size as number, provider };
+    const blob: TvBlobSource = { kind: 'blob', hash, size: size as number, provider };
     if (/^(video|audio)\/[a-z0-9.+-]+$/.test(mime)) blob.mime = mime;
+    const was = sanitizeBlobRef(r.was);
+    if (was && was.hash !== hash) blob.was = was;
     return withTitle(blob);
   }
   return null;
+}
+
+function sanitizeBlobRef(raw: unknown): TvBlobRef | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const hash = str(r.hash, 64);
+  if (!/^[0-9a-f]{64}$/.test(hash) || !Number.isSafeInteger(r.size) || (r.size as number) <= 0 || (r.size as number) > TV_MAX_BLOB) return null;
+  return { hash, size: r.size as number };
 }
 
 /** http(s) only, and never a URL carrying credentials: a source goes into
@@ -697,8 +788,42 @@ export function isHttpUrl(s: string): boolean {
 
 const STATES: ReadonlySet<string> = new Set(['off', 'home', 'scheduled', 'playing', 'paused']);
 
-/** The `tv:` key as a peer may have written it: the programme alone. */
+/** The programme as the room has it: the `tv:` key as a peer may have
+ *  written it, with the clock's latest beat for that programme action laid
+ *  over it (BeatRecord). */
 export function readProgramme(itemId: string): TvProgramme {
+  const rec = readRecord(itemId);
+  const beat = readBeat(itemId);
+  if (!beat || !rec.source || (rec.state !== 'playing' && rec.state !== 'scheduled')) return rec;
+  if (beat.started !== rec.started || beat.jump !== rec.jump || !seqAfter(beat.seq, rec.seq)) return rec;
+  // The first beat past T0 is also the schedule's flip to playing.
+  return { ...rec, state: 'playing', startAt: 0, positionMs: beat.positionMs, at: beat.at, seq: beat.seq };
+}
+
+/** `next` is a later revision than `prev`: at most half the counter's range
+ *  ahead, so a bump past the ceiling is still later (bump), and a record a
+ *  page without beat keys beat into since is not taken back to an older
+ *  beat. */
+function seqAfter(next: number, prev: number): boolean {
+  if (next === prev) return false;
+  const ahead = next - prev < 0 ? next - prev + TV_COUNTER_MAX + 1 : next - prev;
+  return ahead <= (TV_COUNTER_MAX + 1) / 2;
+}
+
+function readBeat(itemId: string): BeatRecord | null {
+  const raw = ensureMap().get(beatKey(itemId)) as Partial<BeatRecord> | undefined;
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    started: counter(raw.started),
+    jump: counter(raw.jump),
+    seq: counter(raw.seq),
+    positionMs: Math.max(0, num(raw.positionMs)),
+    at: Math.max(0, Math.floor(num(raw.at))),
+  };
+}
+
+/** The `tv:` key as a peer may have written it: the programme alone. */
+function readRecord(itemId: string): TvProgramme {
   const raw = ensureMap().get(tvKey(itemId)) as Partial<TvProgramme> | undefined;
   if (!raw || typeof raw !== 'object') return { ...TV_DEFAULT_PROGRAMME };
   const source = sanitizeSource(raw.source);
@@ -714,6 +839,8 @@ export function readProgramme(itemId: string): TvProgramme {
         .filter((e): e is TvHistoryEntry => e !== null)
         .slice(0, TV_HISTORY_MAX)
     : [];
+  const started = counter(raw.started);
+  const shown = raw.showing;
   return {
     source,
     // A programme-less record cannot be playing: it shows the home screen.
@@ -721,9 +848,13 @@ export function readProgramme(itemId: string): TvProgramme {
     startAt: Math.max(0, num(raw.startAt)),
     positionMs: Math.max(0, num(raw.positionMs)),
     seq: counter(raw.seq),
-    started: counter(raw.started),
+    started,
+    showing: Number.isSafeInteger(shown) && (shown as number) >= 0 && (shown as number) <= started ? (shown as number) : started,
     jump: counter(raw.jump),
+    laps: counter(raw.laps),
     endMs: Math.max(0, Math.floor(num(raw.endMs))),
+    loop: raw.loop === true,
+    at: Math.max(0, Math.floor(num(raw.at))),
     history,
   };
 }
@@ -734,6 +865,14 @@ export function readVolume(itemId: string): number {
   const raw = ensureMap().get(volumeKey(itemId)) as { volume?: unknown } | undefined;
   const v = raw && typeof raw === 'object' ? num(raw.volume, TV_DEFAULT.volume) : TV_DEFAULT.volume;
   return Math.min(100, Math.max(0, Math.round(v)));
+}
+
+/** 📺 The set's LOOK switch, from its own key: the CRT look (arcadeCrt.ts)
+ *  unless someone picked CLEAN. Anything but an explicit `crt: false` —
+ *  absent, a peer's garbage — is the CRT look, the set's default. */
+export function readCrt(itemId: string): boolean {
+  const raw = ensureMap().get(lookKey(itemId)) as { crt?: unknown } | undefined;
+  return !(raw && typeof raw === 'object' && raw.crt === false);
 }
 
 /** The set's switch, from its own key; off until someone turns it on. */
@@ -747,6 +886,18 @@ export function readPower(itemId: string): PowerRecord {
   return { on: raw.on === true, seq: counter(raw.seq), parkMs };
 }
 
+/** The longest cell id the `menu:` key keeps: a library title's is its
+ *  source's (tvMenu.ts), a URL's as long as TV_MAX_URL. */
+export const TV_MAX_MENU_AT = TV_MAX_URL + 64;
+
+/** Where the highlight stands on the set's own on-screen menu (tvMenu.ts),
+ *  shown while the set is stopped or paused: a cell's id, '' for none
+ *  (the menu's first cell). */
+export function readMenuAt(itemId: string): string {
+  const raw = ensureMap().get(menuKey(itemId)) as { at?: unknown } | undefined;
+  return raw && typeof raw === 'object' ? str(raw.at, TV_MAX_MENU_AT) : '';
+}
+
 /** What a screen, a phone or the theatre shows: the programme, the switch
  *  and the volume, joined from their keys. Off is off whatever the programme
  *  says; on with nothing on (or a legacy 'off' written into the programme)
@@ -758,9 +909,15 @@ export function readTv(itemId: string): TvRecord {
 }
 
 /** The revision a lookup in flight is checked against: any programme action
- *  (`jump`) or power press (`seq`) meanwhile voids it. */
+ *  (`jump`) or power press (`seq`) meanwhile voids it. A LOOP lap moves
+ *  `jump` and `laps` together, so it does not: a film that loops while an
+ *  upload runs is the film that upload is to replace. */
 export function tvRevision(itemId: string): string {
-  return `${readProgramme(itemId).jump}:${readPower(itemId).seq}`;
+  const rec = readProgramme(itemId);
+  // Modulo the counters' range (0…TV_COUNTER_MAX): each wraps on its own
+  // (bump), and a lap that wraps one and not the other is still no action.
+  const d = rec.jump - rec.laps;
+  return `${d < 0 ? d + TV_COUNTER_MAX + 1 : d}:${readPower(itemId).seq}`;
 }
 
 export function readRemote(itemId: string): RemoteRecord {
@@ -776,7 +933,7 @@ export function readRemote(itemId: string): RemoteRecord {
   };
 }
 
-// ── The remote: possession ───────────────────────────────────────────────────
+// ── The room's clock: whoever pressed last ───────────────────────────────────
 
 export type RemoteStatus = 'free' | 'mine' | 'held';
 
@@ -805,12 +962,12 @@ export function remoteStatus(itemId: string, now = clock()): RemoteStatus {
   if (!rec.holder) return 'free';
   const lapsed = remoteLapsed(itemId, now);
   // Mine only on the page that holds it: the same key in another tab reads
-  // "held" (by me, elsewhere), and so does a hand-over not yet claimed. And
-  // only while the lease is live BY THIS PAGE'S OWN WATCH: a holder tab
-  // that slept past the lapse (a closed lid, a suspended tab) has let the
-  // remote go as far as the room is concerned, and must not wake up
-  // renewing a claim that someone else may already have taken over —
-  // it reads the set as free and picks the remote up again, like anyone.
+  // "held" (by me, elsewhere). And only while the lease is live BY THIS
+  // PAGE'S OWN WATCH: a holder tab that slept past the lapse (a closed lid,
+  // a suspended tab) has let the clock go as far as the room is concerned,
+  // and must not wake up renewing a claim someone else's press may already
+  // have taken over — it reads the set as free, and its next press takes
+  // the clock again, like anyone's.
   if (rec.holder === identityProvider().pub && rec.holder !== '' && rec.page === pageId) return lapsed ? 'free' : 'mine';
   return lapsed ? 'free' : 'held';
 }
@@ -821,21 +978,17 @@ export function iHoldRemote(itemId: string): boolean {
 
 export type TvAction = { ok: true } | { ok: false; error: string };
 
-/** May this client take the remote right now: it is free, it lapsed, I am
- *  the room's owner (the spare remote), I already hold it, or it is in my
- *  own other tab (one person, one place: the newer tab takes it). */
-export function mayPickUpRemote(itemId: string, now = clock()): boolean {
-  const status = remoteStatus(itemId, now);
-  return status !== 'held' || hostPredicate() || readRemote(itemId).holder === identityProvider().pub;
-}
-
+/** Take the room's clock for this page: its player beats the playback for
+ *  everyone from now on. Every press does (press), from anyone, whoever
+ *  had it; nothing asks first. */
 export function pickUpRemote(itemId: string, now = clock()): TvAction {
   const { pub, name } = identityProvider();
   if (!pub) return { ok: false, error: 'No identity on this device yet.' };
-  const rec = readRemote(itemId);
-  if (!mayPickUpRemote(itemId, now)) {
-    return { ok: false, error: `${rec.name || 'Someone'} is holding the remote.` };
-  }
+  // Taken up in a room nobody held: LOOP's laps run on from the sample it
+  // had until this page's first beat, read or not while nobody held it
+  // (lapsRunOn).
+  const sample = samples.get(itemId);
+  if (sample && remoteLapsed(itemId, now)) lapsRunOn.add(sample);
   write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: pageId } satisfies RemoteRecord);
   return { ok: true };
 }
@@ -850,59 +1003,49 @@ export function renewRemote(itemId: string, now = clock()): void {
   write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: pageId } satisfies RemoteRecord);
 }
 
-/** A remote handed to my identity is nobody's page yet: the first of my
- *  pages to see it takes it (two tabs, one key — the loser of the race sees
- *  another page on it and stays a viewer). False when there is nothing to
- *  claim, or when the hand-over has lapsed by this page's own watch. The
- *  giver stays in `by`, so the phone still pops open on receipt. */
-export function claimRemote(itemId: string, now = clock()): boolean {
-  const { pub, name } = identityProvider();
-  const rec = readRemote(itemId);
-  if (!pub || rec.holder !== pub || rec.page !== '') return false;
-  // A hand-over this page slept through: by its own watch the lease has
-  // lapsed, and the room counts the remote as free — someone else's pick-up
-  // may be in flight or landed. Claiming it now would revive a hold the room
-  // has let go of; the receiver picks the remote up again, like anyone.
-  if (remoteLapsed(itemId, now)) return false;
-  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: rec.by, page: pageId } satisfies RemoteRecord);
-  return true;
-}
-
-/** Put it back on the TV. The holder may; so may the owner (taking it away). */
+/** Let the room's clock go (this page leaving the room): the room runs on
+ *  by itself until the next press. Only the page's own: a press elsewhere
+ *  since then has the clock, and is left with it. */
 export function putDownRemote(itemId: string): TvAction {
   const { pub } = identityProvider();
   const rec = readRemote(itemId);
-  if (!rec.holder) return { ok: true };
-  if (rec.holder !== pub && !hostPredicate()) {
-    return { ok: false, error: `${rec.name || 'Someone'} is holding the remote.` };
-  }
+  if (!rec.holder || rec.holder !== pub || rec.page !== pageId) return { ok: true };
   write(remoteKey(itemId), { holder: '', name: '', leaseAt: wallClock(), by: pub, page: '' } satisfies RemoteRecord);
   return { ok: true };
 }
 
-/** Hand the remote to another player. No accept step, as in life. The
- *  receiver's page is unknown here: `page` is '' until one of theirs claims it. */
-export function handRemote(itemId: string, toPub: string, toName: string, now = clock()): TvAction {
-  const { pub } = identityProvider();
-  if (!toPub || toPub === pub) return { ok: false, error: 'Pick someone else.' };
-  if (remoteStatus(itemId, now) !== 'mine' && !hostPredicate()) {
-    return { ok: false, error: 'You are not holding the remote.' };
-  }
-  write(remoteKey(itemId), { holder: toPub, name: toName.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: '' } satisfies RemoteRecord);
-  return { ok: true };
+/** A press on any SpacePhone's remote: it goes through, from anyone, and
+ *  this page keeps the room's clock from it on (pickUpRemote). Called once
+ *  the press is known to do something, so one that changes nothing (a
+ *  RESUME a moment after someone else's) leaves the clock where it is;
+ *  and before the programme's write, so the clock's page is the presser's
+ *  as every page sees the change. */
+function press(itemId: string): TvAction {
+  if (!pressesOpen) return { ok: false, error: 'Leaving this room.' };
+  return iHoldRemote(itemId) ? { ok: true } : pickUpRemote(itemId);
 }
 
-/** Writes to the programme need the remote in hand. */
+/** Presses belong to the room this page is in (tvSession: closed as the
+ *  room is left, open again once the next one is armed). A press needs
+ *  nothing held first, so an archive.org lookup or an upload that started
+ *  before a leave and lands during its flush would otherwise take the
+ *  departed room's clock and change its programme; landing after the next
+ *  room is bound, it is void already (tvDocEpoch). */
+let pressesOpen = true;
+export function setTvPressesOpen(open: boolean): void {
+  pressesOpen = open;
+}
+
+/** What only the clock's page writes — its player's beat, the media's end
+ *  as that player knows it, the programme's close at that end: from any
+ *  other page, a second clock fighting the first. */
 function mayControl(itemId: string): TvAction {
-  const status = remoteStatus(itemId);
-  if (status === 'mine') return { ok: true };
+  if (remoteStatus(itemId) === 'mine') return { ok: true };
   const rec = readRemote(itemId);
   const elsewhere = rec.holder !== '' && rec.holder === identityProvider().pub;
   return {
     ok: false,
-    error: status === 'held'
-      ? (elsewhere ? 'You are holding the remote in another tab.' : `${rec.name || 'Someone'} has the remote.`)
-      : 'Pick up the remote first.',
+    error: elsewhere ? 'Your other tab keeps this TV\'s clock.' : 'This page does not keep this TV\'s clock.',
   };
 }
 
@@ -921,20 +1064,23 @@ function withHistory(rec: TvProgramme, source: TvSource, now: number): TvHistory
 /** Play `source` now, from the top. `now` is wall time: the history stamp.
  *  `torrent` is where a blob came from (torrentLane.ts), for the library. */
 export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torrent?: TvTorrentOrigin): TvAction {
-  const gate = mayControl(itemId);
-  if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
+  const gate = press(itemId);
+  if (!gate.ok) return gate;
   switchOn(itemId);
   const rec = readProgramme(itemId);
+  const started = bump(rec.started);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
     state: 'playing',
     startAt: 0,
     positionMs: 0,
+    at: now,
     seq: bump(rec.seq),
-    started: bump(rec.started),
+    started,
+    showing: started,
     jump: bump(rec.jump),
     endMs: 0, // a new programme: its player says where it ends
     history: withHistory(rec, clean, now),
@@ -945,13 +1091,14 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock(), torr
 /** Schedule `source` for a UTC start — the countdown everyone sees. `now`
  *  is wall time, as `startAt` is. */
 export function tvSchedule(itemId: string, source: TvSource, startAt: number, now = wallClock(), torrent?: TvTorrentOrigin): TvAction {
-  const gate = mayControl(itemId);
-  if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
   if (!Number.isFinite(startAt) || startAt <= now) return { ok: false, error: 'Pick a time that is still ahead.' };
+  const gate = press(itemId);
+  if (!gate.ok) return gate;
   switchOn(itemId);
   const rec = readProgramme(itemId);
+  const started = bump(rec.started);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
@@ -959,7 +1106,8 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     startAt: Math.floor(startAt),
     positionMs: 0,
     seq: bump(rec.seq),
-    started: bump(rec.started),
+    started,
+    showing: started,
     jump: bump(rec.jump),
     endMs: 0,
     history: withHistory(rec, clean, now),
@@ -1061,20 +1209,22 @@ function noteInLibrary(source: TvSource, now: number, torrent?: TvTorrentOrigin)
   for (const { key: k } of keys.slice(TV_LIBRARY_MAX)) map.delete(k);
 }
 
-/** The holder's heartbeat while playing, and the T0 flip from scheduled. */
+/** The clock page's heartbeat while playing, and the T0 flip from
+ *  scheduled: into the beat's own key (BeatRecord), under the programme
+ *  action it was taken under. */
 export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   if (!readPower(itemId).on) return { ok: false, error: 'The set is off.' };
   const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'scheduled') return { ok: false, error: 'Nothing is playing.' };
-  write(tvKey(itemId), {
-    ...rec,
-    state: 'playing',
-    startAt: 0,
-    positionMs: Math.max(0, Math.floor(positionMs)),
+  write(beatKey(itemId), {
+    started: rec.started,
+    jump: rec.jump,
     seq: bump(rec.seq),
-  } satisfies TvProgramme);
+    positionMs: Math.max(0, Math.floor(positionMs)),
+    at: wallClock(),
+  } satisfies BeatRecord);
   return { ok: true };
 }
 
@@ -1084,10 +1234,10 @@ export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
  *  flipped by the holder's first beat: paused like any programme, the
  *  schedule spent (startAt 0); a countdown still ahead is nothing to pause. */
 export function tvPause(itemId: string, positionMs: number, now = wallClock()): TvAction {
-  const gate = mayControl(itemId);
-  if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && !scheduleStarted(rec, now)) return { ok: false, error: 'Nothing is playing.' };
+  const gate = press(itemId);
+  if (!gate.ok) return gate;
   write(tvKey(itemId), {
     ...rec,
     state: 'paused',
@@ -1095,27 +1245,27 @@ export function tvPause(itemId: string, positionMs: number, now = wallClock()): 
     positionMs: Math.max(0, Math.floor(positionMs)),
     seq: bump(rec.seq),
     jump: bump(rec.jump),
-  } satisfies TvProgramme);
+  } satisfies TvProgramme, () => menuAnew(itemId));
   return { ok: true };
 }
 
 export function tvResume(itemId: string): TvAction {
-  const gate = mayControl(itemId);
-  if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   if (rec.state !== 'paused' || !rec.source) return { ok: false, error: 'Nothing is paused.' };
-  write(tvKey(itemId), { ...rec, state: 'playing', seq: bump(rec.seq), jump: bump(rec.jump) } satisfies TvProgramme);
+  const gate = press(itemId);
+  if (!gate.ok) return gate;
+  write(tvKey(itemId), { ...rec, state: 'playing', at: wallClock(), seq: bump(rec.seq), jump: bump(rec.jump) } satisfies TvProgramme);
   return { ok: true };
 }
 
 /** Jump to a position (the remote's ±10 s, or the scrubber). */
 export function tvSeek(itemId: string, positionMs: number): TvAction {
-  const gate = mayControl(itemId);
-  if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'paused') return { ok: false, error: 'Nothing is playing.' };
+  const gate = press(itemId);
+  if (!gate.ok) return gate;
   write(tvKey(itemId), {
-    ...rec, positionMs: Math.max(0, Math.floor(positionMs)), seq: bump(rec.seq), jump: bump(rec.jump),
+    ...rec, positionMs: Math.max(0, Math.floor(positionMs)), at: wallClock(), seq: bump(rec.seq), jump: bump(rec.jump),
   } satisfies TvProgramme);
   return { ok: true };
 }
@@ -1137,14 +1287,46 @@ export function tvNoteEnd(itemId: string, endMs: number | null): TvAction {
   return { ok: true };
 }
 
+/** LOOP on or off. Neither a sample nor a transport action — `seq` and
+ *  `jump` stay — and kept across programmes: the next film loops too. */
+export function tvSetLoop(itemId: string, on: boolean): TvAction {
+  const rec = readProgramme(itemId);
+  if (rec.loop === on) return { ok: true };
+  const gate = press(itemId);
+  if (!gate.ok) return gate;
+  write(tvKey(itemId), { ...rec, loop: on } satisfies TvProgramme);
+  return { ok: true };
+}
+
+/** The media ran to its end — the holder's player said so (tvSync), or the
+ *  headless beat reached the end the record carries (tvSession). With LOOP
+ *  on, the same programme starts over from the top: a new start, as PLAY
+ *  NOW again is, so a player that can seek is sent back to 0 and one that
+ *  cannot is rebuilt. The showing, the history and the library stay as they
+ *  are (a lap is not another showing: a viewer's ✕ holds across it), and so
+ *  does `endMs`: the same media ends in the same place, which is how a
+ *  holder with no player of its own loops it again. Otherwise back to the
+ *  home screen. */
+export function tvProgrammeEnded(itemId: string): TvAction {
+  const gate = mayControl(itemId);
+  if (!gate.ok) return gate;
+  const rec = readProgramme(itemId);
+  if (!rec.loop || !rec.source) return tvStop(itemId);
+  write(tvKey(itemId), {
+    ...rec, state: 'playing', startAt: 0, positionMs: 0, at: wallClock(), seq: bump(rec.seq), started: bump(rec.started), jump: bump(rec.jump),
+    laps: bump(rec.laps),
+  } satisfies TvProgramme);
+  return { ok: true };
+}
+
 /** Back to the home screen (the programme stays in history). */
 export function tvStop(itemId: string): TvAction {
-  const gate = mayControl(itemId);
+  const gate = press(itemId);
   if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   write(tvKey(itemId), {
     ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: bump(rec.seq), jump: bump(rec.jump), endMs: 0,
-  } satisfies TvProgramme);
+  } satisfies TvProgramme, () => menuAnew(itemId));
   return { ok: true };
 }
 
@@ -1156,18 +1338,15 @@ export function tvStop(itemId: string): TvAction {
  *  programme, like a real TV; on brings it back: the holder's tick parks a
  *  programme that was playing where it was (tvSession), and a set with
  *  nothing on shows the home screen. Returns the new state of the switch.
- *  Whoever turns the set ON has the remote placed in their hand (#186, as
- *  written) — on every OFF→ON, a remote on the set, lapsed, or in a live
- *  hand alike: the previous holder sees the switch take it, and takes it
- *  back by pressing ON themselves or asking. (The alternative, a live
- *  holder keeping the remote across a body press, is an open option for
- *  the owner in the plan's §10: `takeRemoteBySwitch` only when the remote
- *  is free or lapsed.) The pickup lands BEFORE the switch's write, so the
- *  page that parks the programme as the switch is seen (tvSession) is
- *  already the holder. */
+ *  Turning the set ON is a press like any (press): the presser's page
+ *  keeps the room's clock from it, and does so BEFORE the switch's write,
+ *  so the page that parks the programme as the switch is seen (tvSession)
+ *  is already the clock's. OFF takes nothing: the clock stays where it
+ *  was, to resume from. */
 export function tvTogglePower(itemId: string, now = clock()): boolean {
   const power = readPower(itemId);
-  if (!power.on) takeRemoteBySwitch(itemId);
+  if (!pressesOpen) return power.on; // the room is being left (press)
+  if (!power.on && !iHoldRemote(itemId)) pickUpRemote(itemId, now);
   // Going off: where the room is, by this page's own reading
   // (roomPositionMs: a programme playing, or a schedule past its T0 —
   // playing by the clock, its record not yet flipped), carried by the
@@ -1177,18 +1356,36 @@ export function tvTogglePower(itemId: string, now = clock()): boolean {
   // countdown still ahead, the home screen — carries no reading (null); a
   // programme switched off at its start carries 0, a reading.
   const parkMs = power.on ? roomPositionMs(itemId, now) : power.parkMs;
-  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord);
+  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord, () => menuAnew(itemId));
   return !power.on;
 }
 
-/** The switch's pickup: the presser's, whoever held the remote — written
- *  as any pickup is (pickUpRemote), the gate skipped, since the rule is
- *  the switch's and not the hand's. A page with no identity takes nothing. */
-function takeRemoteBySwitch(itemId: string): void {
-  const { pub, name } = identityProvider();
-  if (!pub) return;
-  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: pageId } satisfies RemoteRecord);
+// ── The set's own menu ───────────────────────────────────────────────────────
+
+/** Move the highlight on the set's on-screen menu (tvMenu.ts works out to
+ *  which cell). The `menu:` key is its own, so a move never races a
+ *  programme write, and it names a cell, never a place, so a page whose
+ *  build draws another shelf (sovereignty.ts) finds it or shows its own
+ *  first cell. Anyone moves it, as anyone presses (#258): the set's screen
+ *  is one screen, seen by the whole room. Not a programme action, so it
+ *  takes no clock; and nothing while no menu is up, or while this page is
+ *  leaving the room (press). */
+export function tvSetMenuAt(itemId: string, at: string): TvAction {
+  if (!pressesOpen) return { ok: false, error: 'Leaving this room.' };
+  const state = readTv(itemId).state;
+  if (state !== 'home' && state !== 'paused') return { ok: false, error: 'The set shows no menu now.' };
+  const cell = at.slice(0, TV_MAX_MENU_AT);
+  if (readMenuAt(itemId) !== cell) write(menuKey(itemId), { at: cell });
+  return { ok: true };
 }
+
+/** The highlight back to the first cell, inside a write that brings a menu
+ *  up anew (PAUSE, STOP, the switch): a menu left on STOP last time must
+ *  not open on it. */
+function menuAnew(itemId: string): void {
+  ensureMap().delete(menuKey(itemId));
+}
+
 
 /** A schedule past its T0: playing by the clock (readPlayback), whoever
  *  holds the remote, until the holder's first beat flips the record. */
@@ -1238,6 +1435,12 @@ export function tvSetVolume(itemId: string, volume: number): void {
   write(volumeKey(itemId), { volume: Math.min(100, Math.max(0, v)) });
 }
 
+/** LOOK on the set: the CRT look or CLEAN. A body button anyone in the room
+ *  may press, like VOLUME, on its own key for the same reason. */
+export function tvSetCrt(itemId: string, crt: boolean): void {
+  write(lookKey(itemId), { crt });
+}
+
 // ── Sync maths (pure) ────────────────────────────────────────────────────────
 
 export interface PlaybackNow {
@@ -1265,6 +1468,12 @@ export interface PlaybackNow {
    *  since, un-bridged — the earlier of the two readings such a beat could
    *  mean, which is the safe one to take a room over from. */
   anchorMs?: number;
+  /** 'playing' with LOOP and nobody running the laps (readPlayback): the
+   *  lap of the anchor's run the room is on — 0 for the run the anchor is
+   *  in, 1 once past the media's end, and so on — with `positionMs` into
+   *  it. A lap no write names: a viewer replays when it changes (tvSync),
+   *  however short the film. Absent while a holder runs the laps. */
+  lap?: number;
 }
 
 /** The sample this page anchored the holder's last position to, or null
@@ -1327,7 +1536,35 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
   }
   if (rec.state === 'playing') {
     const sample = samples.get(itemId);
-    return sample ? fromSample(sample, now, rttMs) : { state: 'playing', positionMs: rec.positionMs, running: true, countdownMs: 0 };
+    const unheld = !iHoldRemote(itemId) && remoteLapsed(itemId, now);
+    let pb: PlaybackNow = sample ? fromSample(sample, now, rttMs) : { state: 'playing', positionMs: rec.positionMs, running: true, countdownMs: 0 };
+    // A stale reading waits for the holder's next beat past the wake window
+    // (fromSample). With nobody holding the remote, no beat is coming: once
+    // the wake window and a lapse's worth of quiet have passed with none,
+    // the takeover anchor is where the room is — where this page would take
+    // it from if it picked the remote up — and a viewer follows it as it
+    // would a fresh reading.
+    if (pb.stale && unheld && now - lastGapAt >= TV_WAKE_WINDOW_MS + TV_LEASE_LAPSE_MS) {
+      pb = { state: 'playing', positionMs: holderAnchorMs(pb), running: true, countdownMs: 0 };
+    }
+    // LOOP with no one to run the laps (the remote put down or gone quiet:
+    // the room may be empty but for this page), or on a first sight run on
+    // by the writer's clock: past the end is that far into a lap, and every
+    // page in the room works out the same one (`lap` says which). A page
+    // that picks the remote up then takes the room from there, as does
+    // everyone watching, until its first beat replaces the sample
+    // (lapsRunOn). A holder that has beaten runs its own laps
+    // (tvProgrammeEnded), and a viewer with a live holder follows those.
+    if (sample && unheld) lapsRunOn.add(sample);
+    if (rec.loop && rec.endMs > 0 && (unheld || sample?.wall === true || (sample !== undefined && lapsRunOn.has(sample)))) {
+      return {
+        ...pb,
+        positionMs: intoLap(pb.positionMs, rec.endMs),
+        ...(pb.anchorMs !== undefined ? { anchorMs: intoLap(pb.anchorMs, rec.endMs) } : {}),
+        lap: Math.floor(pb.positionMs / rec.endMs),
+      };
+    }
+    return pb;
   }
   if (rec.state === 'paused') return { state: 'paused', positionMs: rec.positionMs, running: false, countdownMs: 0 };
   return { state: rec.state, positionMs: 0, running: false, countdownMs: 0 };
@@ -1359,6 +1596,12 @@ function fromSample(sample: Sample, now: number, rttMs: number): PlaybackNow {
     return { state: 'playing', positionMs: bridged, running: true, countdownMs: 0, stale: true, anchorMs };
   }
   return { state: 'playing', positionMs, running: true, countdownMs: 0 };
+}
+
+/** A position past a looping programme's end, `lapMs`, as that far into
+ *  the lap it is on. */
+function intoLap(ms: number, lapMs: number): number {
+  return ms >= lapMs ? ms % lapMs : ms;
 }
 
 /** Where a HOLDER takes the room from: the takeover anchor of a stale
@@ -1409,7 +1652,8 @@ export function isStartOnly(s: TvSource): boolean {
 export function sourceId(s: TvSource): string {
   if (s.kind === 'youtube') return `youtube:${s.videoId}`;
   if (s.kind === 'archive') return `archive:${s.identifier}/${s.file}`;
-  if (s.kind === 'blob') return `blob:${s.hash}`;
+  // A smaller copy is the same programme as its original (`was`).
+  if (s.kind === 'blob') return `blob:${s.was?.hash ?? s.hash}`;
   return `url:${s.url}`;
 }
 
@@ -1508,30 +1752,34 @@ export interface TvScreenView {
   state: TvState;
   /** Big line: the programme's title, or the home screen's heading. */
   title: string;
-  /** Small line under it: who holds the remote, the countdown, the clock. */
+  /** Small line under it: who pressed last, the countdown, LOOP. */
   detail: string;
   /** 0–1 progress when known (a duration is a player fact, so usually 0). */
   lane: TvLane | '';
   clockText: string;
-  /** The home screen's RECENTLY ON shelf: the library's newest titles. */
-  recent?: string[];
+  /** The set's own menu, home or paused (tvMenu.ts): World adds it. */
+  menu?: TvMenuView;
+  /** This page's own word on the set, never the room's: what its theatre
+   *  waits on (a tap to play, a fetch, an allow), parts joined by ' · '.
+   *  World adds it from tvTheatreHint; the set draws it where the picture
+   *  is not up. */
+  ask?: string;
+  /** Playing or paused with the set's LOOK on CLEAN: the film as it is,
+   *  without the CRT look (readCrt). */
+  clean?: true;
 }
-
-/** How many library titles the home screen shows. */
-export const TV_HOME_RECENT = 4;
 
 /** Derive what the in-world screen shows from the records alone, so every
  *  client's prop agrees and the drawing code has nothing to decide. */
 export function tvScreenView(itemId: string, now = clock()): TvScreenView {
   const rec = readTv(itemId);
   const remote = readRemote(itemId);
-  const holderLine = remote.holder && !remoteLapsed(itemId, now)
-    ? `REMOTE · ${remote.name || 'a clone'}`
-    : 'REMOTE ON THE SET';
+  // Who pressed last, while their page keeps the clock: the press that put
+  // the room where it is. Nothing when nobody's does.
+  const holderLine = remote.holder && !remoteLapsed(itemId, now) ? `LAST PRESS · ${remote.name || 'a clone'}` : '';
   if (rec.state === 'off') return { state: 'off', title: '', detail: '', lane: '', clockText: '' };
   if (rec.state === 'home' || !rec.source) {
-    const recent = readLibrary().slice(0, TV_HOME_RECENT).map((e) => e.title);
-    return { state: 'home', title: 'FURLONG TV', detail: holderLine, lane: '', clockText: '', ...(recent.length ? { recent } : {}) };
+    return { state: 'home', title: 'FURLONG TV', detail: 'ANY SPACEPHONE IS THE REMOTE', lane: '', clockText: '' };
   }
   const label = sourceLabel(rec.source).toUpperCase();
   const lane = sourceLane(rec.source);
@@ -1539,8 +1787,11 @@ export function tvScreenView(itemId: string, now = clock()): TvScreenView {
   if (pb.state === 'scheduled') {
     return { state: 'scheduled', title: label, detail: countdownText(pb.countdownMs), lane, clockText: '' };
   }
+  const clean = readCrt(itemId) ? {} : { clean: true as const };
+  const detail = (parts: string[]) => parts.filter(Boolean).join(' · ');
+  const loop = rec.loop ? 'LOOP' : '';
   if (pb.state === 'paused') {
-    return { state: 'paused', title: label, detail: `PAUSED · ${holderLine}`, lane, clockText: formatClock(pb.positionMs) };
+    return { state: 'paused', title: label, detail: detail(['PAUSED', loop, holderLine]), lane, clockText: formatClock(pb.positionMs), ...clean };
   }
-  return { state: 'playing', title: label, detail: holderLine, lane, clockText: formatClock(pb.positionMs) };
+  return { state: 'playing', title: label, detail: detail([loop, holderLine]), lane, clockText: formatClock(pb.positionMs), ...clean };
 }

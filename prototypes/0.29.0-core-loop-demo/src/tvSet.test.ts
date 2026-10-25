@@ -8,9 +8,10 @@ import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import type { TvScreenView } from './tvDoc';
-import { setConvenienceLanesForTest } from './sovereignty';
+import type { TvMenuCell, TvMenuView } from './tvMenu';
 
 let fills = 0;
+let drawnFrames = 0;
 /** Every setTransform call, by the canvas it was made on. */
 const transforms = new Map<object, number[][]>();
 function fakeCanvas() {
@@ -19,6 +20,7 @@ function fakeCanvas() {
     get: (target, key) => {
       if (key in target) return target[key];
       if (key === 'fillRect') return () => { fills++; };
+      if (key === 'drawImage') return () => { drawnFrames++; };
       if (key === 'setTransform') return (...m: number[]) => { transforms.set(canvas, [...(transforms.get(canvas) ?? []), m]); };
       if (key === 'measureText') return () => ({ width: 40 });
       if (key === 'createLinearGradient') return () => ({ addColorStop: () => undefined });
@@ -48,13 +50,28 @@ function sinks(): FurnitureHandleSinks {
   };
 }
 
+/** The card: the canvas-textured plane that is not the paused menu's. */
 function screenPlane(group: THREE.Group): THREE.Mesh | null {
   let found: THREE.Mesh | null = null;
   group.traverse((obj) => {
-    if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) found = obj;
+    if (obj instanceof THREE.Mesh && !obj.userData.tvMenu && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.CanvasTexture) found = obj;
   });
   return found;
 }
+
+function menuPlane(group: THREE.Group): THREE.Mesh | null {
+  let found: THREE.Mesh | null = null;
+  group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.tvMenu) found = obj; });
+  return found;
+}
+
+/** Drawn: it and every ancestor visible (World sets each mesh's own). */
+function shown(o: THREE.Object3D | null): boolean {
+  for (; o; o = o.parent) if (!o.visible) return false;
+  return true;
+}
+
+const tile = (kind: string, col: number, row: number, live = true): TvMenuCell => ({ id: `tile:${kind}`, label: kind.toUpperCase(), col, row, live });
 
 const view = (state: TvScreenView['state'], title = ''): TvScreenView =>
   ({ state, title, detail: 'REMOTE ON THE SET', lane: state === 'off' || state === 'home' ? '' : 'CONVENIENCE', clockText: '0:00' });
@@ -153,9 +170,15 @@ describe('the smart TV as built', () => {
     const s = sinks();
     group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'tv-stand-1', obj); });
     const handle = s.tvScreens.get('tv-stand-1')!;
+    // The picture shows the film itself (CLEAN) or drawn down through the
+    // CRT pass (the default look): either way, a film is on it.
     const pictures = () => {
       const out: THREE.Mesh[] = [];
-      group.traverse((obj) => { if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshBasicMaterial).map instanceof THREE.VideoTexture) out.push(obj); });
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh) || !obj.userData.tvPicture) return;
+        const m = obj.material as THREE.MeshBasicMaterial;
+        if (m.map instanceof THREE.VideoTexture || (m.userData.crtLook && m.map)) out.push(obj);
+      });
       return out;
     };
     expect(pictures()).toHaveLength(0);
@@ -177,6 +200,12 @@ describe('the smart TV as built', () => {
     expect(picture.scale.x).toBeLessThan(handle.planeW);
     handle.draw(view('paused', 'METROPOLIS'));
     expect(picture.visible).toBe(true);
+    // The browser wants a tap: the stalled picture gives way to the card,
+    // which says so, and is back once the tap is in.
+    handle.draw({ ...view('playing', 'METROPOLIS'), ask: 'TAP TO PLAY · SEE YOUR SPACEPHONE (T)' });
+    expect(picture.visible).toBe(false);
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(picture.visible).toBe(true);
     handle.draw(view('home'));
     expect(picture.visible).toBe(false);
     handle.draw(view('playing', 'METROPOLIS'));
@@ -185,24 +214,143 @@ describe('the smart TV as built', () => {
     expect(pictures()).toHaveLength(0); // the texture is let go
   });
 
-  it('draws on the home screen only the tiles this build offers: YOUTUBE and ARCHIVE go with the convenience lanes', () => {
+  it("shows the film through the CRT look, cut down to 360 rows, unless the set's LOOK is CLEAN", () => {
     const group = build('smart-tv');
     const s = sinks();
     group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
     const handle = s.tvScreens.get('smart-tv-1')!;
-    try {
-      setConvenienceLanesForTest(false); // the build default: serverless only
-      handle.draw(view('off'));
-      fills = 0;
-      handle.draw(view('home'));
-      const serverless = fills;
-      setConvenienceLanesForTest(true);
-      handle.draw(view('off'));
-      fills = 0;
-      handle.draw(view('home'));
-      expect(fills).toBe(serverless + 2); // one fillRect per tile: two more lanes drawn
-    } finally {
-      setConvenienceLanesForTest(null);
-    }
+    let mesh: THREE.Mesh | null = null;
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.tvPicture) mesh = obj; });
+    const material = () => mesh!.material as THREE.MeshBasicMaterial;
+    expect(material().map).toBeNull(); // no film: nothing on the picture
+    const film = (w: number, h: number) =>
+      ({ videoWidth: w, videoHeight: h, addEventListener: () => undefined, removeEventListener: () => undefined }) as unknown as HTMLVideoElement;
+    handle.draw(view('playing', 'METROPOLIS'));
+    handle.showVideo(film(1920, 1080));
+    // The default: the CRT pass, on a canvas of the film's shape in 360 rows.
+    expect(material().userData.crtLook).toBeDefined();
+    const canvas = material().map!.image as { width: number; height: number };
+    expect([canvas.width, canvas.height]).toEqual([640, 360]);
+    // CLEAN: the film itself, as before the look.
+    handle.draw({ ...view('playing', 'METROPOLIS'), clean: true });
+    expect(material().map).toBeInstanceOf(THREE.VideoTexture);
+    expect(material().userData.crtLook).toBeUndefined();
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(material().userData.crtLook).toBeDefined();
+    // A 4:3 film keeps square pixels; one of fewer rows than 360 keeps its own.
+    handle.showVideo(film(640, 480));
+    expect([(material().map!.image as { width: number }).width, (material().map!.image as { height: number }).height]).toEqual([480, 360]);
+    handle.showVideo(film(320, 240));
+    expect([(material().map!.image as { width: number }).width, (material().map!.image as { height: number }).height]).toEqual([320, 240]);
+    // The film taken off: the plain picture, empty.
+    handle.showVideo(null);
+    expect(material().userData.crtLook).toBeUndefined();
+    expect(material().map).toBeNull();
+  });
+
+  it('draws a film down once a new frame, as the browser says one came, and lets the look go with the set', () => {
+    const group = build('smart-tv');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
+    const handle = s.tvScreens.get('smart-tv-1')!;
+    let mesh: THREE.Mesh | null = null;
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.tvPicture) mesh = obj; });
+    const render = () => mesh!.onBeforeRender(null as never, null as never, null as never, null as never, null as never, null as never);
+    let frame: (() => void) | null = null;
+    const film = {
+      videoWidth: 1920, videoHeight: 1080, readyState: 4, currentTime: 0,
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      requestVideoFrameCallback: (cb: () => void) => { frame = cb; return 1; },
+    } as unknown as HTMLVideoElement & { currentTime: number };
+    handle.draw(view('playing', 'METROPOLIS'));
+    handle.showVideo(film);
+    drawnFrames = 0;
+    render();
+    expect(drawnFrames).toBe(1); // the first frame
+    // Renders with no new frame draw nothing, though the clock moves on.
+    film.currentTime = 0.01;
+    render();
+    film.currentTime = 0.02;
+    render();
+    expect(drawnFrames).toBe(1);
+    frame!();
+    render();
+    render();
+    expect(drawnFrames).toBe(2);
+    // The set removed (World closes the theatre first, which takes the film
+    // off, then runs every `dispose*` hook): the CRT material and canvas
+    // go too, though they are off the mesh by then.
+    const crt = mesh!.material as THREE.MeshBasicMaterial;
+    const gone: string[] = [];
+    crt.addEventListener('dispose', () => gone.push('material'));
+    crt.map!.addEventListener('dispose', () => gone.push('canvas'));
+    handle.showVideo(null);
+    expect(mesh!.material).not.toBe(crt);
+    group.traverse((obj) => {
+      for (const [key, hook] of Object.entries(obj.userData)) if (key.startsWith('dispose') && typeof hook === 'function') hook();
+    });
+    expect(gone.sort()).toEqual(['canvas', 'material']);
+  });
+
+  it('draws the home menu it is handed: one box per tile, and none without a menu', () => {
+    const group = build('smart-tv');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'smart-tv-1', obj); });
+    const handle = s.tvScreens.get('smart-tv-1')!;
+    const home = (cells: TvMenuCell[]): TvScreenView => ({ ...view('home'), menu: { kind: 'home', cells, at: cells[0]!.id } });
+    handle.draw(view('off'));
+    fills = 0;
+    handle.draw(view('home'));
+    const bare = fills;
+    handle.draw(view('off'));
+    fills = 0;
+    handle.draw(home([tile('url', 0, 0), tile('file', 1, 0), tile('magnet', 2, 0)]));
+    const three = fills;
+    expect(three).toBe(bare + 3);
+    handle.draw(view('off'));
+    fills = 0;
+    handle.draw(home([tile('youtube', 0, 0), tile('archive', 1, 0), tile('url', 2, 0), tile('file', 0, 1), tile('magnet', 1, 1)]));
+    expect(fills).toBe(three + 2);
+    // A move of the highlight is a new view: drawn again.
+    fills = 0;
+    handle.draw({ ...home([tile('url', 0, 0), tile('file', 1, 0)]), menu: { kind: 'home', cells: [tile('url', 0, 0), tile('file', 1, 0)], at: 'tile:file' } });
+    expect(fills).toBeGreaterThan(0);
+  });
+
+  it('paused, the menu goes on a plane of its own in front of the picture, the still frame under it, and only then', () => {
+    const group = build('tv-stand');
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, 'tv-stand-1', obj); });
+    const handle = s.tvScreens.get('tv-stand-1')!;
+    const plane = menuPlane(group)!;
+    expect(plane).not.toBeNull();
+    const canvas = (plane.material as THREE.MeshBasicMaterial).map!.image as { width: number; height: number };
+    expect([canvas.width, canvas.height]).toEqual([1, 1]); // never paused: no canvas to speak of
+    plane.visible = true; // World's interior pass: the gate is on the frame around it
+    expect(shown(plane)).toBe(false);
+    const video = { videoWidth: 640, videoHeight: 480, addEventListener: () => undefined, removeEventListener: () => undefined } as unknown as HTMLVideoElement;
+    handle.showVideo(video);
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(shown(plane)).toBe(false);
+    const paused: TvMenuView = { kind: 'paused', cells: [{ id: 'play', label: '▶ PLAY', col: 0, row: 0, live: true }], at: 'play' };
+    const transformsBefore = (transforms.get(canvas) ?? []).length;
+    handle.draw({ ...view('paused', 'METROPOLIS'), menu: paused });
+    expect(shown(plane)).toBe(true);
+    expect([canvas.width, canvas.height]).toEqual([384 * 2, 216 * 2]); // the card's own size
+    expect((transforms.get(canvas) ?? []).length).toBeGreaterThan(transformsBefore);
+    // The picture stays up under it (through the CRT look, the default).
+    let picture: THREE.Mesh | null = null;
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh && obj.userData.tvPicture) picture = obj; });
+    expect((picture!.material as THREE.MeshBasicMaterial).userData.crtLook).toBeDefined();
+    picture!.visible = true;
+    expect(shown(picture)).toBe(true);
+    // In front of it.
+    expect(plane.parent!.position.z).toBeGreaterThan(picture!.parent!.position.z);
+    // A pause with no menu handed in (a set drawn before the room's tick) has none on the plane.
+    handle.draw(view('paused', 'METROPOLIS'));
+    expect(shown(plane)).toBe(false);
+    handle.draw({ ...view('paused', 'METROPOLIS'), menu: paused });
+    handle.draw(view('playing', 'METROPOLIS'));
+    expect(shown(plane)).toBe(false);
   });
 });

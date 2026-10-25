@@ -3,22 +3,20 @@
  * every half second (the coin pusher's tickCoinPusherRoom idiom) and
  * DOM-free so they can be tested:
  *
- *  - a holder renews its remote lease every TV_LEASE_RENEW_MS;
- *  - a holder whose theatre is closed still keeps the room's clock alive:
- *    a HEADLESS heartbeat free-runs the record's own position, so viewers
+ *  - the page keeping a set's clock (the last to press, tvDoc) renews its
+ *    lease every TV_LEASE_RENEW_MS;
+ *  - one whose theatre is closed still keeps the room's clock alive: a
+ *    HEADLESS heartbeat free-runs the record's own position, so viewers
  *    never lose the sample they anchor to (the theatre, when open, registers
  *    its controller as the player of record and takes over);
- *  - leaving the room puts every remote this client holds back on the set
- *    (the coin pusher's lease hand-back on leave).
- *
- * Also the seam for "who is in the room" (HAND TO… needs names and pubs):
- * main.ts registers the players-map reader; the panels never touch the doc.
+ *  - leaving the room lets every clock this page keeps go (the coin
+ *    pusher's lease hand-back on leave).
  */
 
 import {
-  claimRemote, holderAnchorMs, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv,
-  renewRemote, scheduleStarted,
-  subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  holderAnchorMs, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv,
+  renewRemote, scheduleStarted, setTvPressesOpen,
+  subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvProgrammeEnded, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
 /** The furniture kinds that are a TV set, and what each is called in the
@@ -31,20 +29,6 @@ export function isTvKind(kind: string | undefined): boolean {
 }
 export function tvLabel(kind: string | undefined): string {
   return kind === 'tv-stand' ? 'TV ON THE STAND' : 'WALL TV';
-}
-
-export interface RoomPlayer {
-  pub: string;
-  name: string;
-}
-
-let roomPlayersProvider: () => RoomPlayer[] = () => [];
-export function setTvRoomPlayersProvider(fn: () => RoomPlayer[]): void {
-  roomPlayersProvider = fn;
-}
-/** Everyone the room's players map names with a key, except me. */
-export function tvRoomPlayers(myPub: string): RoomPlayer[] {
-  return roomPlayersProvider().filter((p) => p.pub && p.pub !== myPub);
 }
 
 /** What the phone's transport asks a live player: where it is (the record's
@@ -233,9 +217,9 @@ function noteKnownEnd(id: string, live: LivePlayer, rec: { started: number }): v
 }
 
 /** The end this page knows for the programme, filed in the record for the
- *  next holder (tvNoteEnd): a remote handed to a page with no theatre open,
- *  one that never watched the file, would otherwise beat on past the
- *  media's end for good, with nobody left who could close the programme.
+ *  next clock (tvNoteEnd): a press from a page with no theatre open, one
+ *  that never watched the file, would otherwise beat on past the media's
+ *  end for good, with nobody left who could close the programme.
  *  Idempotent: written when the record does not carry it yet. */
 function publishEnd(id: string, rec: { started: number; endMs: number }): void {
   const known = knownEndFor(id, rec.started);
@@ -248,11 +232,12 @@ function publishEnd(id: string, rec: { started: number; endMs: number }): void {
  *  only once the next room's docs and layout are bound (main.ts joinRoom):
  *  World keeps ticking through the leave's awaited flush, with the old
  *  furniture and the old TV doc still here, and a tick in that window would
- *  claim a hand-over into a room being left, beat its clock, or put the
- *  departed room's WATCH chip back up with its theatre a click away. */
+ *  renew a clock in a room being left, beat it, or put the departed room's
+ *  picture back up. */
 let driveArmed = true;
 export function armTvDrive(on: boolean): void {
   driveArmed = on;
+  setTvPressesOpen(on);
 }
 export function tvDriveArmed(): boolean {
   return driveArmed;
@@ -269,8 +254,8 @@ subscribeTv(() => {
 export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
   // This page is awake: a lease landing now is seen now. A gap in these
   // marks is a sleep, and what lands on waking is stamped from before it
-  // (tvDoc markTvPageAwake) — a hand-over the network held through a closed
-  // lid is not claimed on waking as if it had just been written.
+  // (tvDoc markTvPageAwake) — a renewal the network held through a closed
+  // lid does not read on waking as a clock kept a moment ago.
   markTvPageAwake(now);
   if (!driveArmed) return;
   liveIds = itemIds;
@@ -280,11 +265,6 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
   for (const id of [...lastPower.keys()]) if (!live.has(id)) lastPower.delete(id);
   for (const id of [...knownEnds.keys()]) if (!live.has(id)) knownEnds.delete(id);
   for (const id of itemIds) {
-    // A remote handed to my identity is nobody's page yet: this page takes
-    // it (two tabs, one key — the first to tick wins, the other stays a
-    // viewer). The claim refreshes the lease, so it is this tick's renewal
-    // too, and `by` stays the giver until the next one: the phone's cue.
-    if (claimRemote(id, now)) lastRenew.set(id, now);
     // The switch, for a flip the doc listener did not see (this page's
     // first tick on the set; a listener call before the tick named it).
     parkIfPowerReturned(id);
@@ -338,7 +318,7 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     // across the sleep as though it predated it.
     const at = holderAnchorMs(pb);
     if (end !== null && at >= end) {
-      tvStop(id);
+      tvProgrammeEnded(id); // LOOP starts it over; otherwise the home screen
       lastHeadlessBeat.delete(id);
       knownEnds.delete(id);
       continue;
@@ -350,10 +330,11 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
   }
 }
 
-/** Put down every remote this client holds — called as the room is left,
+/** Let go of every TV clock this page keeps — called as the room is left,
  *  before its doc goes (main.ts leaveRoomNow). */
 export function leaveTvRoom(itemIds: readonly string[]): void {
   driveArmed = false; // synchronously: the next tick, mid-leave, does nothing
+  setTvPressesOpen(false); // nor a press that lands meanwhile (tvDoc press)
   liveIds = [];
   for (const id of itemIds) {
     if (iHoldRemote(id)) putDownRemote(id);

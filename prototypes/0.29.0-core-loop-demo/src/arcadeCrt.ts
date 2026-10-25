@@ -107,6 +107,26 @@ export const ARCADE_CRT_LOOK: CrtLook = {
   rest: [0.004, 0.006, 0.005],
 };
 
+/** How many lines a smart TV's picture is drawn in with its CRT look on:
+ *  the film is cut down to this many rows (fewer if it has fewer), each
+ *  with its scanline. More than the cabinets' 240, since the wall set is
+ *  watched from two and a half metres, not three quarters of one. */
+export const TV_CRT_LINES = 360;
+
+/** The smart TV's look: the cabinets' tube on a flat panel. No bend and no
+ *  margin of unlit glass (the picture fills the panel), lighter scanlines
+ *  for a picture of more lines, the same glow and colour push. `lines` is
+ *  where it starts; the set sets the film's own (attachTvSet). */
+export const TV_CRT_LOOK: CrtLook = {
+  inset: [1, 1],
+  lines: [Math.round((TV_CRT_LINES * 16) / 9), TV_CRT_LINES],
+  warp: 0,
+  scan: 0.26,
+  glow: 0.3,
+  saturation: 1.12,
+  rest: [0.004, 0.006, 0.005],
+};
+
 /** One clock for every tube: each tube's render ticks it (crtScreenMaterial). */
 const crtTime = { value: 0 };
 
@@ -193,6 +213,22 @@ export function crtScreenMaterial(
 ): THREE.MeshBasicMaterial {
   const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0, toneMapped: false });
   material.userData.baseOpacity = 1;
+  applyCrtLook(material, look, span, lines);
+  return material;
+}
+
+/**
+ * Patch the CRT pass into `material`'s map lookup, whatever map it is given
+ * later (crtScreenMaterial's tubes; the smart TV's picture, attachTvSet in
+ * furniture.ts). The pass runs only while the material has a map. Whoever
+ * renders it ticks the clock (crtTick).
+ */
+export function applyCrtLook(
+  material: THREE.MeshBasicMaterial,
+  look: CrtLook,
+  span: { index: number; count: number } = { index: 0, count: 1 },
+  lines: { value: THREE.Vector2 } = { value: new THREE.Vector2(...look.lines) },
+): void {
   material.userData.crtLook = look;
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uCrtTime = crtTime;
@@ -209,7 +245,6 @@ export function crtScreenMaterial(
       .replace('#include <common>', `#include <common>\n${CRT_UNIFORMS}`)
       .replace('#include <map_fragment>', CRT_MAP_FRAGMENT);
   };
-  return material;
 }
 
 /** Advance every tube's flicker clock (seconds). */

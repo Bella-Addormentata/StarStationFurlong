@@ -8,7 +8,8 @@
  * CSS3DObject that copies the plane's world matrix every frame, so the
  * picture sits on the set as the camera swings and zooms, and is shown only
  * while the set's screen is (World hides the furniture outside the room
- * view) and the theatre says the programme is playing or paused — hidden by
+ * view) and the theatre says the programme is playing (paused, the set
+ * shows its own menu, which this layer would cover) — hidden by
  * CSS visibility, never taken out of the document, so an iframe laid during
  * a countdown loads and is ready at T0. The layer
  * takes no pointer events (the world under it keeps its clicks; the remote
@@ -35,8 +36,8 @@ interface Layer {
 }
 
 let layer: Layer | null = null;
-/** The theatre's word: the programme is playing or paused (a countdown and
- *  a home screen are the set's own card). */
+/** The theatre's word: the programme is playing (a countdown is the set's
+ *  own card, and a pause or a home screen its own menu). */
 let shown = false;
 
 /** Whether the laid picture may show (tvTheatre, every tick). */
