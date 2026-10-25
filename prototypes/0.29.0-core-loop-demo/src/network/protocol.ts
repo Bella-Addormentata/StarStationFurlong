@@ -236,6 +236,24 @@ export function unpackTick(buf: Uint8Array): MovementTick {
   };
 }
 
+// 🧭 A standing avatar's facing in the yaw field. Pre-Q/E senders always put
+// 0 there for a standing avatar, so 0 must keep meaning "no facing, take it
+// from motion": a real facing of 0 goes out a hair off zero instead, which the
+// receiver's 8-way snap folds back to 0. Old receivers ignore yaw unless the
+// avatar is seated or diving.
+const STANDING_YAW_NONZERO = 1e-3;
+
+export function encodeStandingYaw(facing: number): number {
+  if (!Number.isFinite(facing)) return 0;
+  const wrapped = ((facing % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  return Math.round(wrapped * YAW_SCALE) % 65536 === 0 ? STANDING_YAW_NONZERO : wrapped;
+}
+
+/** The standing facing a tick's yaw carries, or null for an old sender's 0. */
+export function decodeStandingYaw(yaw: number): number | null {
+  return yaw === 0 ? null : yaw;
+}
+
 // ---------------------------------------------------------------------------
 // Tick lane kinds — flags bits 6–7 (#115: air hockey).
 //
