@@ -482,6 +482,68 @@ describe('a doc holding part of an update', () => {
     expect(readChips(PLAYER)).toBe(100);
   });
 
+  it('refunds the stake of a machine whose teardown was under way when its stake read as gone, once the rest comes', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    expect(readChips(PLAYER)).toBe(100 - BET);
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const updates: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => updates.push(u));
+    other.getMap('elsewhere').set('a', 1);
+    const key = `slot-escrow:${M1}`;
+    other.getMap('casino').set(key, other.getMap('casino').get(key));
+    closeSlotMachine(M1, true);
+    // The rewrite comes in while the teardown awaits, after its start saw a
+    // whole doc.
+    queueMicrotask(() => Y.applyUpdate(doc, updates[1]));
+    tickSlotMachineRoom([], false, at(ready + 100));
+    await acceptsDone();
+    expect(hasSlotEscrow(M1)).toBe(false);
+    Y.applyUpdate(doc, updates[0]);
+    expect(hasSlotEscrow(M1)).toBe(true);
+    tickSlotMachineRoom([], false, at(ready + 200));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toBeNull();
+    expect(hasSlotEscrow(M1)).toBe(false);
+    expect(readChips(PLAYER)).toBe(100);
+  });
+
+  // A wind-down's refund that finds the doc holding part of an update (it
+  // came in while the refund awaited) is tried again once the rest comes.
+  for (const [why, windDown] of [
+    ['the bankroll changes hands, this session still operating another machine', () => fund(M1, OTHER)],
+    ['this client may no longer run the croupier', () => setSoleCroupierPredicate(() => false)],
+  ] as const) {
+    it(`refunds a round it winds down once the rest comes (${why})`, async () => {
+      fund(M1);
+      fund(M2);
+      await requestSpin(M1);
+      const ready = becomeOperator([M1, M2]);
+      await acceptsDone();
+      expect(spinning(M1)).toBe(true);
+      expect(readChips(PLAYER)).toBe(100 - BET);
+      windDown();
+      const other = new Y.Doc();
+      const updates: Uint8Array[] = [];
+      other.on('update', (u: Uint8Array) => updates.push(u));
+      other.getMap('elsewhere').set('a', 1);
+      other.getMap('elsewhere').set('b', 2);
+      queueMicrotask(() => Y.applyUpdate(doc, updates[1]));
+      tickSlotMachineRoom([M1, M2], false, at(ready + 100));
+      await acceptsDone();
+      expect(spinning(M1)).toBe(true); // nothing written on the partial doc
+      Y.applyUpdate(doc, updates[0]);
+      tickSlotMachineRoom([M1, M2], false, at(ready + 200));
+      await acceptsDone();
+      expect(readSlotMachineState(M1)?.phase).toBe('settled');
+      expect(hasSlotEscrow(M1)).toBe(false);
+      expect(readChips(PLAYER)).toBe(100);
+    });
+  }
+
   it('the operator takes no wager until the rest comes: chips on a felt may read as free there', async () => {
     fund(M1);
     const ready = becomeOperator([M1]);

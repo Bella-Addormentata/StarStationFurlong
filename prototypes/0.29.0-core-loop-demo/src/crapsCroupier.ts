@@ -341,7 +341,9 @@ const PAGE_ID = CRAPS_PAGE_ID;
  *  goes away, any editor's next ROLL press finishes the turn. On a robot
  *  table (one of the owner's pages not driving it pressed ROLL before the
  *  robot's first beat) `autoShowMs` gives the settle its show beat, so the
- *  driving page opens the next window as usual. */
+ *  driving page opens the next window as usual; and a page that starts
+ *  driving while it holds such a turn goes on with it here
+ *  (tickAutoStickman). */
 export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: number): void {
   // Every editor samples (throttled), so whoever presses ROLL has already
   // seen the seated players' heartbeats move and can slide them the dice.
@@ -500,6 +502,13 @@ export function tickAutoStickman(tableId: string): void {
   const s = readCrapsTableState(tableId);
   if (!s) {
     openCrapsBetting(tableId, 1, null);
+    return;
+  }
+  if (s.phase === 'closing' && s.operator === PAGE_ID) {
+    // A manual turn this page holds (its ROLL, pressed here before it drove
+    // too): it runs as one, the stamp's wait and a second press's throw
+    // included, with the robot's show beat.
+    tickManualCraps(tableId, now, CRAPS_SHOW_MS);
     return;
   }
   if (s.phase === 'closing' && s.operator !== undefined && s.operator !== PAGE_ID) {

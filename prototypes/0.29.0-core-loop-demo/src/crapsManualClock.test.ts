@@ -17,8 +17,12 @@ vi.stubGlobal('window', { location: { search: '' } });
 const {
   bindCasinoDoc, buyInChips, readCrapsTableState, readDiceThrow, writeMyCrapsBets, writeMySeat,
 } = await import('./casinoDoc');
-const { setSoleCroupierPredicate, noteTablesRunning, TABLE_LEASE_LAPSE_MS } = await import('./croupier');
-const { CRAPS_SHOOTER_MS, MANUAL_TAKEOVER_SETTLE_MS, pressManualRoll, tickManualCraps } = await import('./crapsCroupier');
+const {
+  setSoleCroupierPredicate, noteTablesRunning, takeTableTurn, TABLE_LEASE_LAPSE_MS, TABLE_LEASE_SETTLE_MS,
+} = await import('./croupier');
+const {
+  CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, MANUAL_TAKEOVER_SETTLE_MS, pressManualRoll, tickAutoStickman, tickManualCraps,
+} = await import('./crapsCroupier');
 const { FURNITURE_DEFS } = await import('./furniture');
 
 const T0 = 2_000_000_000;
@@ -141,5 +145,39 @@ describe('ROLL pressed again while the stamp reaches the room (the stickman thro
       if (readDiceThrow(t)?.by === 'stickman') threwAfter = real - (T0 + 200);
     }
     expect(threwAfter).toBeGreaterThanOrEqual(MANUAL_TAKEOVER_SETTLE_MS - 300);
+  });
+});
+
+describe('ROLL pressed again on one of the owner\'s pages just before it starts driving the tables', () => {
+  /** One World frame on a page of the deed holder's: the driver ticks the
+   *  robot, any other page the manual turn. */
+  function ownerFrame(tableId: string, t: number): void {
+    at(t);
+    noteTablesRunning(t);
+    if (takeTableTurn(t)) tickAutoStickman(tableId);
+    else tickManualCraps(tableId, t, CRAPS_SHOW_MS);
+  }
+
+  it('throws once the stamp has reached the room, not at the end of the shooter\'s window', () => {
+    setSoleCroupierPredicate(() => true); // the robot's room
+    const t = freshTable();
+    expect(pressManualRoll(t, at(T0))).toMatch(/PRESS AGAIN/); // window opens
+    writeMyCrapsBets(t, BOB, [{ type: 'pass', amount: 5 }]);
+    writeMySeat(t, BOB, { stand: STAND, angle: 0, at: 1 });
+    ownerFrame(t, T0); // claims the tables' lease: drives once it settles
+    writeMySeat(t, BOB, { stand: STAND, angle: 0, at: 2 });
+    ownerFrame(t, T0 + 1_200);
+    expect(pressManualRoll(t, at(T0 + 1_300))).toBeNull(); // closes, stamps this page
+    expect(readCrapsTableState(t)).toMatchObject({ phase: 'closing', shooter: BOB });
+    expect(pressManualRoll(t, at(T0 + 1_400))).toBeNull(); // again: throw once converged
+    expect(T0 + TABLE_LEASE_SETTLE_MS).toBeLessThan(T0 + 1_300 + MANUAL_TAKEOVER_SETTLE_MS);
+    let threwAfter = -1;
+    for (let now = T0 + 1_450; now <= T0 + 1_300 + CRAPS_SHOOTER_MS + 1_000 && threwAfter < 0; now += 50) {
+      writeMySeat(t, BOB, { stand: STAND, angle: 0, at: now });
+      ownerFrame(t, now);
+      if (readDiceThrow(t)?.by === 'stickman') threwAfter = now - (T0 + 1_300);
+    }
+    expect(threwAfter).toBeGreaterThanOrEqual(MANUAL_TAKEOVER_SETTLE_MS);
+    expect(threwAfter).toBeLessThan(MANUAL_TAKEOVER_SETTLE_MS + 500);
   });
 });

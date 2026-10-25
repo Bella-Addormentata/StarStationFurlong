@@ -364,7 +364,10 @@ export function isSlotOperator(now = Date.now()): boolean {
  * wait. The earlier builds' leases are read afresh too, so a renewal that
  * arrived while the work was paused stops it before the next frame does
  * (EARLIER BUILDS). The round stays on its machine, and that machine's next
- * operator finishes it.
+ * operator finishes it. 📒 Nor does it write on a doc holding part of an
+ * update that came in meanwhile (casinoWhole): a machine, its odds or a
+ * stake rewritten in the part still to come reads as gone there, and chips
+ * on a felt as free. The work is done again once the rest has come.
  */
 function stillOperates(docEpoch: number, tenure: string): boolean {
   return operator !== null
@@ -372,7 +375,8 @@ function stillOperates(docEpoch: number, tenure: string): boolean {
     && docEpoch === casinoDocEpoch()
     && operator.tenure === tenure
     && ownsOperatorLease(operator.playerId)
-    && !isEarlierBuildOperatingNow(Date.now());
+    && !isEarlierBuildOperatingNow(Date.now())
+    && casinoWhole();
 }
 
 function takeOperatorLease(playerId: string, now: number): void {
@@ -579,16 +583,19 @@ export function tickSlotMachineRoom(
 /** Refund a round this session accepted on a machine it no longer operates
  *  (WIND-DOWN above). One attempt: a round whose refund can't be made (its
  *  escrow is already gone) isn't held here, and the machine's next operator
- *  finds its spin like any other it didn't accept. */
+ *  finds its spin like any other it didn't accept. A refund put off for the
+ *  rest of an update is still this session's: the next tick on a whole doc
+ *  tries again, the lease held meanwhile. */
 async function windDownRound(
   machineId: string,
   accepted: AcceptedSlotRound,
   tenure: string,
 ): Promise<void> {
+  let waits = false;
   try {
-    await cancelForHouseCommit(machineId, readSlotMachineState(machineId), tenure);
+    waits = await cancelForHouseCommit(machineId, readSlotMachineState(machineId), tenure);
   } finally {
-    if (acceptedRounds.get(machineId) === accepted) acceptedRounds.delete(machineId);
+    if (!waits && acceptedRounds.get(machineId) === accepted) acceptedRounds.delete(machineId);
   }
 }
 
@@ -677,7 +684,7 @@ async function ensureTerminalFundingLease(
 function runTerminal(
   machineId: string,
   label: string,
-  action: () => Promise<void>,
+  action: () => Promise<unknown>,
 ): void {
   if (settling.has(machineId)) return;
   settling.add(machineId);
@@ -822,11 +829,14 @@ async function settleRevealTimeout(
   acceptedRounds.delete(machineId);
 }
 
+/** End a spin with its stake refunded (a round this session didn't accept,
+ *  or whose house commit doesn't match). True when it wrote nothing because
+ *  the doc holds part of an update: it is to be tried again once whole. */
 async function cancelForHouseCommit(
   machineId: string,
   state: SlotMachineState | null,
   tenure: string,
-): Promise<void> {
+): Promise<boolean> {
   const docEpoch = casinoDocEpoch();
   const accepted = currentAcceptedRound(machineId);
   const player = accepted?.player ?? state?.player;
@@ -841,8 +851,10 @@ async function cancelForHouseCommit(
   const refund = player && bet && funding ? { player, bet, funding } : null;
   const fundingReady = !refund
     || await ensureTerminalFundingLease(machineId, refund.funding, sharedLeaseToken);
-  // Nothing is written once this session no longer operates the room.
-  if (!stillOperates(docEpoch, tenure)) return;
+  // Nothing is written once this session no longer operates the room, nor
+  // on a doc holding part of an update (stillOperates), which waits for the
+  // rest: the one case the caller is told of.
+  if (!stillOperates(docEpoch, tenure)) return !casinoWhole();
   // The refund and the settled state go out in one transaction (TERMINAL
   // WRITES above).
   const ended = transactCasino(() => {
@@ -876,9 +888,10 @@ async function cancelForHouseCommit(
     });
     return true;
   });
-  if (!ended) return;
+  if (!ended) return false;
   if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
   acceptedRounds.delete(machineId);
+  return false;
 }
 
 async function accept(
@@ -891,12 +904,7 @@ async function accept(
   const docEpoch = casinoDocEpoch();
   const houseSeed = randomSlotSeed();
   const houseCommit = await commitSlotSeed(houseSeed);
-  // 📒 Not on a doc holding part of an update (after each hash: the room's
-  // updates come in while it runs). A machine, its odds or a stake rewritten
-  // in the part still to come reads as gone there, the odds as the default
-  // paytable, and chips on a felt as free (casinoDoc spendableChips). The
-  // request waits for the rest.
-  if (docEpoch !== casinoDocEpoch() || !casinoWhole()) return;
+  if (docEpoch !== casinoDocEpoch()) return;
   const queued = readSlotPlayRequests(machineId)
     .find((candidate) => candidate.player === request.player);
   const current = readSlotMachineState(machineId);
@@ -941,10 +949,13 @@ async function accept(
   const paytable = (readSlotOddsConfig(machineId)?.paytable ?? DEFAULT_PAYTABLE)
     .map((entry) => ({ ...entry, symbols: [...entry.symbols] as typeof entry.symbols }));
   const paytableHash = await hashSlotPaytable(paytable);
+  // 📒 The odds read again only on a whole doc (stillOperates below checks
+  // after this hash too): a rewrite of them in the part still to come reads
+  // as the default paytable, and the request would be refused as odds
+  // changed. It waits for the rest.
   if (!casinoWhole()) return;
   const latestPaytable = readSlotOddsConfig(machineId)?.paytable ?? DEFAULT_PAYTABLE;
   const latestPaytableHash = await hashSlotPaytable(latestPaytable);
-  if (!casinoWhole()) return;
   const postHashQueued = readSlotPlayRequests(machineId)
     .find((candidate) => candidate.player === request.player);
   const postHashState = readSlotMachineState(machineId);
@@ -1210,7 +1221,8 @@ async function closeSlotMachineManaged(machineId: string, tenure: string): Promi
     refund = { player: state.player, bet: state.bet, funding: state.funding, token };
   }
   // Paying out rewrites balances: only this session's take of the room's
-  // lease may, and only while it lasts.
+  // lease may, and only while it lasts (and on a whole doc: the teardown
+  // stays pending until the rest comes).
   if (!stillOperates(docEpoch, tenure)) return;
   forget();
   // The refund and the machine's removal go out in one transaction (TERMINAL
