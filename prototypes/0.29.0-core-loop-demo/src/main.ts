@@ -285,6 +285,7 @@ import { closeArcadeStage } from "./arcadeStage";
 import { ARCADE_CABINET_KINDS, FURNITURE } from "./furniture";
 import { setMapHologramBuilder } from "./furniture";
 import { buildMapHologram } from "./mapHologram";
+import { setSparkProvider } from "./mapHologramSplats";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -10503,6 +10504,21 @@ async function init() {
 
   // Initialize renderer
   const { scene } = rendererModule.initRenderer();
+  // ✨ #251 v2: the map table's hologram as Gaussian splats. Spark is a
+  // separate chunk, fetched the first time a table asks for it, and the one
+  // SparkRenderer the scene needs is made then.
+  if (!location.search.includes('nospark')) setSparkProvider(async () => {
+    const spark = await import("@sparkjsdev/spark");
+    if (import.meta.env.DEV) (window as unknown as { __spark?: unknown }).__spark = spark; // dev console poking
+    const sparkRenderer = new spark.SparkRenderer({ renderer: window.gameRenderer.renderer });
+    // Splats write no depth. The room's walls, floor and furniture are all
+    // transparent materials (the fade-in), sorted by distance in the same
+    // pass — whatever sorted after the splats painted over them. Drawn last,
+    // the splats depth-test against everything already there instead.
+    sparkRenderer.renderOrder = 10_000;
+    scene.add(sparkRenderer);
+    return { spark, renderer: sparkRenderer };
+  });
 
   // Create world
   world = new worldModule.World(scene);

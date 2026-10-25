@@ -20,6 +20,7 @@ import { currentRoomId, listStations } from './stations';
 import { readAtlas } from './stationAtlas';
 import { stationPlan } from './stationPlan';
 import { holotableStation } from './devices';
+import { buildSplatPlot, type SplatPlotHandle } from './mapHologramSplats';
 import {
   FADE_SECONDS,
   HOLO_RADIUS,
@@ -144,10 +145,12 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   // The belt: its radius is the plot's own, so it is built once here.
   const beltR = beltRadius(solarPlotBodies([]));
   const beltMat = holoMat(CYAN, 0.12);
+  let beltMesh: THREE.Mesh | null = null;
   if (beltR) {
     const beltGeo = new THREE.TorusGeometry(beltR, 0.006, 6, 96);
     beltGeo.rotateX(Math.PI / 2);
-    plotGroup.add(new THREE.Mesh(beltGeo, beltMat));
+    beltMesh = new THREE.Mesh(beltGeo, beltMat);
+    plotGroup.add(beltMesh);
   }
   // "You are here": a pulsing amber ring round the station you are in.
   const hereMat = holoMat(AMBER, 0.9);
@@ -166,13 +169,17 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   });
   const COURSE_OPACITY = 0.6;
   const courses: THREE.Line[] = [];
+  // Their own group: it rides along with the splat plot (lifted and grown)
+  // when that is what shows, and stays put over the mesh plot otherwise.
+  const courseGroup = new THREE.Group();
+  plotGroup.add(courseGroup);
   for (let i = 0; i < POOL.courses; i++) {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(COURSE_POINTS * 3), 3));
     geo.setDrawRange(0, 0);
     const line = new THREE.Line(geo, courseMat);
     line.visible = false;
-    plotGroup.add(line);
+    courseGroup.add(line);
     courses.push(line);
   }
   const plot: Layer = {
@@ -180,6 +187,16 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
     mats: [sunMat, planetMat, lagrangeMat, stationMat, ringMat, beltMat, hereMat],
     lastFade: 1,
   };
+  // ✨ v2: the plot as Gaussian splats (mapHologramSplats.ts) where Spark
+  // loads; the mesh plot above is parked then and keeps the sun as the
+  // carrier of World's fade and zoom hide. Lines (the courses) stay.
+  let splatPlot: SplatPlotHandle | null = null;
+  let splatsWanted = true;
+  void buildSplatPlot(plotGroup).then((h) => {
+    if (!splatsWanted) h?.dispose();
+    else splatPlot = h;
+  });
+  root.userData.disposeSplatPlot = () => { splatsWanted = false; splatPlot?.dispose(); splatPlot = null; };
 
   // ── The station ─────────────────────────────────────────────────────────
   const stationGroup = new THREE.Group();
@@ -229,9 +246,32 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
   };
 
   const layoutPlot = (now: number, fade: number): void => {
+    const markers = plotMarkers(bodies, now, hereId);
+    const sunBase = (sunMat.userData.baseOpacity as number) || 1;
+    if (splatPlot) {
+      // The splats take the sun's fade (World's) and the plot's own.
+      splatPlot.place(markers, now, (sunMat.opacity / sunBase) * fade, sun.visible);
+      courseGroup.position.copy(splatPlot.group.position);
+      courseGroup.scale.copy(splatPlot.group.scale);
+      planets.reset(); lagrange.reset(); stations.reset(); planetRings.reset(); stationRings.reset();
+      planets.park(); lagrange.park(); stations.park(); planetRings.park(); stationRings.park();
+      hereRing.scale.setScalar(0);
+      sun.scale.setScalar(0);
+      beltMesh?.scale.setScalar(0);
+    } else {
+      sun.scale.setScalar(1);
+      beltMesh?.scale.setScalar(1);
+      courseGroup.position.set(0, 0, 0);
+      courseGroup.scale.setScalar(1);
+      layoutMeshPlot(markers, now);
+    }
+    layoutCourses(now, fade, sunBase);
+  };
+
+  const layoutMeshPlot = (markers: readonly ReturnType<typeof plotMarkers>[number][], now: number): void => {
     planets.reset(); lagrange.reset(); stations.reset(); planetRings.reset(); stationRings.reset();
     let here: { x: number; z: number } | null = null;
-    for (const mk of plotMarkers(bodies, now, hereId)) {
+    for (const mk of markers) {
       let mesh: THREE.Mesh | null = null;
       let ring: THREE.Mesh | null = null;
       if (mk.type === 'planet') { mesh = planets.take(); ring = planetRings.take(); }
@@ -256,9 +296,11 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
     } else {
       hereRing.scale.setScalar(0);
     }
-    // Courses: the lines follow the sun's opacity (World fades the sun;
-    // the lines are not meshes, so it never touches them).
-    const sunBase = (sunMat.userData.baseOpacity as number) || 1;
+  };
+
+  /** Courses: the lines follow the sun's opacity (World fades the sun; the
+   *  lines are not meshes, so it never touches them). */
+  const layoutCourses = (now: number, fade: number, sunBase: number): void => {
     courseMat.opacity = (sunMat.opacity / sunBase) * COURSE_OPACITY;
     const drawn = plotCourses(bodies, now);
     courses.forEach((line, i) => {
