@@ -891,7 +891,12 @@ async function accept(
   const docEpoch = casinoDocEpoch();
   const houseSeed = randomSlotSeed();
   const houseCommit = await commitSlotSeed(houseSeed);
-  if (docEpoch !== casinoDocEpoch()) return;
+  // 📒 Not on a doc holding part of an update (after each hash: the room's
+  // updates come in while it runs). A machine, its odds or a stake rewritten
+  // in the part still to come reads as gone there, the odds as the default
+  // paytable, and chips on a felt as free (casinoDoc spendableChips). The
+  // request waits for the rest.
+  if (docEpoch !== casinoDocEpoch() || !casinoWhole()) return;
   const queued = readSlotPlayRequests(machineId)
     .find((candidate) => candidate.player === request.player);
   const current = readSlotMachineState(machineId);
@@ -936,8 +941,10 @@ async function accept(
   const paytable = (readSlotOddsConfig(machineId)?.paytable ?? DEFAULT_PAYTABLE)
     .map((entry) => ({ ...entry, symbols: [...entry.symbols] as typeof entry.symbols }));
   const paytableHash = await hashSlotPaytable(paytable);
+  if (!casinoWhole()) return;
   const latestPaytable = readSlotOddsConfig(machineId)?.paytable ?? DEFAULT_PAYTABLE;
   const latestPaytableHash = await hashSlotPaytable(latestPaytable);
+  if (!casinoWhole()) return;
   const postHashQueued = readSlotPlayRequests(machineId)
     .find((candidate) => candidate.player === request.player);
   const postHashState = readSlotMachineState(machineId);
@@ -973,9 +980,6 @@ async function accept(
     });
     return;
   }
-  // 📒 Not on a doc holding part of an update: chips on a felt may read as
-  // free there (casinoDoc spendableChips). The request waits for the rest.
-  if (!casinoWhole()) return;
   clearSlotPlayRequest(machineId, request.player);
   requestFirstSeen.delete(machineId);
   const acceptedAt = Date.now();

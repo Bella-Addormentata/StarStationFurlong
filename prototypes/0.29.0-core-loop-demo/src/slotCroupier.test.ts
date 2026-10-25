@@ -33,6 +33,7 @@ import {
   SLOT_OPERATOR_KEY,
   writeSlotFundingConfig,
   writeSlotMachineState,
+  writeSlotOddsConfig,
   writeSlotOperatorLease,
   writeSlotPlayRequest,
   writeSlotReveal,
@@ -48,7 +49,7 @@ import {
   randomSlotSeed,
   SLOT_SPIN_MS,
 } from './games/slots';
-import type { SlotFundingConfig } from './games/slots';
+import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
 import { getPlayerId } from './identity';
 import {
   closeSlotMachine,
@@ -97,7 +98,12 @@ function fund(machineId: string, owner = OPERATOR): void {
 
 /** The player's spin request, as their panel writes it; returns the seed the
  *  panel will reveal. */
-async function requestSpin(machineId: string, player = PLAYER, requestId = `req-${machineId}`): Promise<string> {
+async function requestSpin(
+  machineId: string,
+  player = PLAYER,
+  requestId = `req-${machineId}`,
+  paytable: readonly SlotPayEntry[] = DEFAULT_PAYTABLE,
+): Promise<string> {
   const seed = randomSlotSeed();
   writeSlotPlayRequest(machineId, {
     requestId,
@@ -105,7 +111,7 @@ async function requestSpin(machineId: string, player = PLAYER, requestId = `req-
     bet: BET,
     requestedAt: Date.now(),
     playerCommit: await commitSlotSeed(seed),
-    paytableHash: await hashSlotPaytable(DEFAULT_PAYTABLE),
+    paytableHash: await hashSlotPaytable(paytable),
   });
   return seed;
 }
@@ -491,6 +497,54 @@ describe('a doc holding part of an update', () => {
     expect(spinning(M1)).toBe(true);
     expect(readChips(PLAYER)).toBe(100 - BET);
   });
+
+  // The accept hashes three times (its house seed, then the odds before and
+  // after); the room's updates come in while each one runs.
+  for (const [during, hash] of [[1, 'house seed'], [2, 'odds'], [3, 'odds read again']] as const) {
+    it(`takes a spin on the owner's odds once the rest comes, their rewrite in part during its ${hash} hash`, async () => {
+      fund(M1);
+      const paytable = DEFAULT_PAYTABLE.slice(1); // the owner's odds: no jackpot
+      writeSlotOddsConfig(M1, { paytable });
+      const ready = becomeOperator([M1]);
+      await requestSpin(M1, PLAYER, 'req-odds', paytable);
+      // Another page writes the same odds again just after a write this page
+      // has yet to get, and this page gets the rewrite first; the rest comes
+      // with the next hash, or after the accept.
+      const other = new Y.Doc();
+      Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+      const updates: Uint8Array[] = [];
+      other.on('update', (u: Uint8Array) => updates.push(u));
+      other.getMap('elsewhere').set('a', 1);
+      other.getMap('casino').set(`slot-odds:${M1}`, { paytable });
+      let rested = false;
+      const rest = (): void => {
+        if (!rested) Y.applyUpdate(doc, updates[0]);
+        rested = true;
+      };
+      const digest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle);
+      let hashes = 0;
+      const spy = vi.spyOn(globalThis.crypto.subtle, 'digest').mockImplementation((...args) => {
+        hashes += 1;
+        if (hashes === during) Y.applyUpdate(doc, updates[1]);
+        if (hashes === during + 1) rest();
+        return digest(...args);
+      });
+      try {
+        tickSlotMachineRoom([M1], false, at(ready + 1_000));
+        await acceptsDone();
+      } finally {
+        spy.mockRestore();
+      }
+      expect(hashes).toBeGreaterThanOrEqual(during);
+      expect(readSlotMachineState(M1)?.failure).toBeUndefined();
+      expect(readSlotPlayRequests(M1).map((r) => r.requestId)).toEqual(['req-odds']);
+      rest();
+      tickSlotMachineRoom([M1], false, at(ready + 2_000));
+      await acceptsDone();
+      expect(spinning(M1)).toBe(true);
+      expect(readChips(PLAYER)).toBe(100 - BET);
+    });
+  }
 
   it('RUN takes no lease until the rest comes', () => {
     setSoleCroupierPredicate(() => false);
