@@ -475,6 +475,78 @@ describe('held stakes', () => {
   });
 });
 
+// ── Pinned keys ──────────────────────────────────────────────────────────────
+
+describe('felts pinned to each player\'s key (keyOf)', () => {
+  const a1 = kit.slip(A, 1, [red(10)]);
+  const b1 = kit.slip(B, 1, [black(7)]);
+  // Carol signs a version of alice's felt with her own key: a valid signature,
+  // a higher v, and far more on it.
+  const forged = kit.slip(C, 1, [red(999)], { p: 'alice', v: 9 });
+  const pins = new Map([['alice', A.pub], ['bob', B.pub], ['carol', C.pub]]);
+  const pinned = (session: TestSession, keys: Map<string, string> = pins): TableFold => {
+    const f = new TableFold(TEST_CTX, sigs.check, (pid) => keys.get(pid));
+    f.setBase(null);
+    f.reset(session.records.entries());
+    return f;
+  };
+
+  it('without keyOf, a version under another key holds that player\'s felt', () => {
+    const res = fold(new TestSession().put(a1, forged, b1));
+    expect(res.felts.get('alice')?.hash).toBe(forged.hash);
+    expect(res.held.get('alice')).toBe(999n);
+  });
+
+  it('with keyOf, only versions signed by the pinned key are the felt', () => {
+    const res = pinned(new TestSession().put(a1, forged, b1)).result();
+    expect(res.felts.get('alice')?.hash).toBe(a1.hash);
+    expect(res.held).toEqual(new Map([['alice', 10n], ['bob', 7n]]));
+  });
+
+  it('a version under the wrong key is never verified', () => {
+    const chk = cachingCheck();
+    const f = new TableFold(TEST_CTX, chk.check, (pid) => pins.get(pid));
+    f.reset(new TestSession().put(a1, forged).records.entries());
+    f.result();
+    expect(chk.cache.has(forged.hash)).toBe(false);
+    expect(chk.cache.get(a1.hash)).toBe(true);
+  });
+
+  it('a player whose key is unknown has no felt and holds nothing, until keysChanged reads it again', () => {
+    const keys = new Map([['bob', B.pub]]);
+    const f = pinned(new TestSession().put(a1, b1), keys);
+    let res = f.result();
+    expect(res.felts.has('alice')).toBe(false);
+    expect(res.held).toEqual(new Map([['bob', 7n]]));
+    keys.set('alice', A.pub);
+    expect(f.result()).toBe(res); // cached: keyOf is read again only when told
+    f.keysChanged();
+    res = f.result();
+    expect(res.felts.get('alice')?.hash).toBe(a1.hash);
+    expect(res.held).toEqual(new Map([['alice', 10n], ['bob', 7n]]));
+  });
+
+  it('a close still freezes what its signer pinned, and decisions and nets don\'t read keyOf', () => {
+    const close = kit.close(C, 1, SID, [forged, kit.slip(C, 1, [red(1)])]);
+    const session = new TestSession().put(a1, forged, b1, close, kit.slip(C, 1, [red(1)]));
+    const res = pinned(session).result();
+    expect(res.tip?.close).toBe(close.hash);
+    expect(res.held).toEqual(new Map([['alice', 999n], ['carol', 1n]]));
+    session.put(kit.reveal(1, 'alice'), kit.reveal(1, 'carol'));
+    const decided = pinned(session).result();
+    expect(snapshot(decided)).toBe(snapshot(fold(session)));
+    expect(decided.rounds[0].decided).toBe('reveals');
+    expect(decided.nets.has('alice')).toBe(true);
+  });
+
+  it('pins only the felt on the open round: an empty version under the pinned key takes it down', () => {
+    const down = kit.slip(A, 1, [], { v: 2 });
+    const res = pinned(new TestSession().put(a1, down, forged)).result();
+    expect(res.felts.get('alice')?.hash).toBe(down.hash);
+    expect(res.held.has('alice')).toBe(false);
+  });
+});
+
 // ── The checkpoint ───────────────────────────────────────────────────────────
 
 describe('a session after a checkpoint', () => {
@@ -1080,5 +1152,79 @@ describe('the output depends on the record set only', () => {
       if (rand() < 0.8) expect(snapshot(f.result()), `step ${step}`).toBe(cold(live.entries()));
     }
     expect(snapshot(f.result())).toBe(cold(live.entries()));
+  });
+});
+
+// ── The raw session size ─────────────────────────────────────────────────────
+
+describe('rawBytes: what the live session weighs, junk included', () => {
+  const a1 = kit.slip(A, 1, [red(10)]);
+  const close = kit.close(A, 1, SID, [a1]);
+  const weight = (key: string, value: unknown): number => key.length + canon(value)!.length;
+
+  it('counts a record as bytes does, and every junk key beside it', () => {
+    const f = new TableFold(TEST_CTX, sigs.check);
+    f.apply([[a1.key, a1.rec], [close.key, close.rec]]);
+    const records = weight(a1.key, a1.rec) + weight(close.key, close.rec);
+    expect(f.result()).toMatchObject({ bytes: records, rawBytes: records });
+    const junk: [string, unknown][] = [
+      ['note', 'hello'], // canonical, but no record
+      [`c:1:${NOBODY}`, { ...close.rec, r: 1.5 }], // not canonical: its JSON
+      ['big', 2n ** 70n], // neither: a flat 64
+      ['fn', () => 1],
+    ];
+    f.apply(junk);
+    const res = f.result();
+    expect(res.bytes).toBe(records);
+    expect(res.records).toBe(2);
+    expect(res.rawBytes).toBe(records + 'note'.length + '"hello"'.length
+      + `c:1:${NOBODY}`.length + JSON.stringify({ ...close.rec, r: 1.5 }).length + 'big'.length + 64 + 'fn'.length + 64);
+  });
+
+  it('a junk key overwritten, then deleted, weighs what it holds now, then nothing', () => {
+    const f = new TableFold(TEST_CTX, sigs.check);
+    f.apply([['note', 'hello']]);
+    const first = f.result();
+    expect(first.rawBytes).toBe(4 + 7);
+    f.apply([['note', 'hello']]); // the same weight again: nothing changed
+    expect(f.result()).toBe(first);
+    f.apply([['note', 'hello, world']]);
+    expect(f.result().rawBytes).toBe(4 + 14);
+    f.apply([['note', undefined]]);
+    expect(f.result().rawBytes).toBe(0);
+  });
+
+  it('reset and a new session start it afresh; the same sid keeps it', () => {
+    const f = new TableFold(TEST_CTX, sigs.check);
+    f.apply([['note', 'hello'], [a1.key, a1.rec]]);
+    f.reset([['x', 'y']]);
+    expect(f.result().rawBytes).toBe(1 + 3);
+    f.setBase(null); // 'g' again
+    expect(f.result().rawBytes).toBe(1 + 3);
+    f.setBase(kit.checkpoint(A, 'g', 1, close.hash, { alice: 5n }));
+    expect(f.result()).toMatchObject({ rawBytes: 0, bytes: 0, records: 0 });
+  });
+
+  it('an incremental fold weighs what a cold one does after every random insert, delete and junk write', () => {
+    const { records } = universe();
+    const rand = rng(91);
+    const live = new Map<string, unknown>();
+    const f = new TableFold(TEST_CTX, sigs.check);
+    const junkValues: unknown[] = [{ r: 1 }, 'x', 1.5, null, [1, [2, 'three']], 7n];
+    const coldWeight = (): number => {
+      const c = new TableFold(TEST_CTX, sigs.check);
+      c.reset(live.entries());
+      return c.result().rawBytes;
+    };
+    for (let step = 0; step < 300; step++) {
+      const roll = rand();
+      const [key, value] = records[Math.floor(rand() * records.length)];
+      const write = roll < 0.5 ? value : roll < 0.8 ? undefined : junkValues[Math.floor(rand() * junkValues.length)];
+      if (write === undefined) live.delete(key);
+      else live.set(key, write);
+      f.apply([[key, write]]);
+      if (rand() < 0.5) expect(f.result().rawBytes, `step ${step}`).toBe(coldWeight());
+    }
+    expect(f.result().rawBytes).toBe(coldWeight());
   });
 });

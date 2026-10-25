@@ -27,7 +27,9 @@
  *
  * ONE ROUND, AS THE FOLD SEES IT:
  *   1. Players write slips: each version is the player's whole felt, and the
- *      latest verified one per player is what the felt holds (`held`).
+ *      latest verified one per player is what the felt holds (`held`) —
+ *      given a keyOf, only a version signed by the key the page pinned for
+ *      that player, so no page can hold chips on someone else's felt.
  *   2. A close freezes one slip version per player. Rival closes are all
  *      kept; the chain rule below picks one. A version the chosen close left
  *      out holds nothing.
@@ -395,6 +397,13 @@ export function abandonKey(rec: AbandonRec): string | null {
 // ── Verification (injected) ──────────────────────────────────────────────────
 
 /**
+ * The key a page pinned for a player (casinoDoc readPlayerKey, or its own),
+ * undefined while none has shown up. The caller's: it may change as keys
+ * show up (TableFold.keysChanged).
+ */
+export type KeyOf = (pid: string) => string | undefined;
+
+/**
  * The verdict for one signed record, by its recHash. true/false = checked;
  * undefined = not checked yet (the caller ran out of this pass's time budget
  * and will re-run the fold once it has). The caller owns caching and the
@@ -449,7 +458,9 @@ export interface FoldResult {
   /** Every indexed close for `open` naming `parent`, with its standing
    *  (by dutyRank('close'), then hash). */
   openCloses: { hash: string; rec: CloseRec; state: 'valid' | 'pending' | 'invalid' }[];
-  /** pid → latest verified slip version on `open` by (v, hash), including empty ones. */
+  /** pid → latest verified slip version on `open` by (v, hash), including empty
+   *  ones; given a keyOf, only versions signed by keyOf(pid) (none while it is
+   *  undefined). */
   felts: Map<string, SlipInfo>;
   /** base.n + Σ deltas of the decided rounds. Zero entries dropped. */ nets: Map<string, bigint>;
   /** pid → chips on the felt now: P's stakes if `tip`, else each felt's stake.
@@ -458,6 +469,9 @@ export interface FoldResult {
   /** Commitments a reveal in this session has opened (any slip, any round). */ revealedCommits: Set<string>;
   /** Some verdict was undefined: run again once the caller has checked more. */ pending: boolean;
   /** Σ (key.length + canon(value).length) over indexed records. */ bytes: number;
+  /** Σ (key.length + an estimate of the value's size) over EVERY key of the
+   *  live session, junk included (rawSize): what the session weighs in the
+   *  doc, which junk grows as much as records do. */ rawBytes: number;
   /** Indexed record count. */ records: number;
 }
 
@@ -512,6 +526,21 @@ type Outcome = Omit<RoundView, 'r' | 'close' | 'closeRec' | 'frozen'>;
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
+/** About what a stored value weighs: its canonical length when it has one,
+ *  else its JSON length, else a flat 64 (a bigint, a function, a cycle, a
+ *  walk too deep). Never throws: it sizes junk too. */
+function rawSize(value: unknown): number {
+  try {
+    const c = canon(value);
+    if (c !== null) return c.length;
+  } catch { /* too deep to walk: try JSON, then the flat size */ }
+  try {
+    const j = JSON.stringify(value);
+    if (typeof j === 'string') return j.length;
+  } catch { /* unserializable */ }
+  return 64;
+}
+
 /** Two-level map helpers: inner maps are created on demand and dropped once
  *  empty, so nothing grows past what is indexed. */
 function addIn<K1, K2, V>(m: Map<K1, Map<K2, V>>, k1: K1, k2: K2, v: V): void {
@@ -556,6 +585,7 @@ function countIn<K>(m: Map<K, number>, k: K, d: 1 | -1): void {
 export class TableFold {
   readonly ctx: FoldCtx;
   private readonly check: SigCheck;
+  private readonly keyOf: KeyOf | undefined;
   private base: FoldBase = { sid: 'g', u: 0, l: null, n: new Map(), ended: false };
 
   private entries = new Map<string, Entry>();
@@ -581,14 +611,24 @@ export class TableFold {
   private ffaVer = new Map<string, number>();
 
   private bytes = 0;
+  /** key → rawSize-based weight of every key of the live session, junk too. */
+  private raw = new Map<string, number>();
+  private rawBytes = 0;
   private dirty = true;
   private last: FoldResult | null = null;
   /** Set by ask() when a verdict comes back undefined. */
   private sawPending = false;
 
-  constructor(ctx: FoldCtx, check: SigCheck) {
+  /** `keyOf`, when given, pins each player's felt to one key: a slip
+   *  version counts for `felts` (and so for `held` while betting) only if
+   *  `k === keyOf(p)`. Without it, any verified version does — and a page
+   *  could sign a version under someone else's pid with a high `v` and hold
+   *  their chips until a close froze the real one. Closes, decisions and
+   *  nets don't read it: a close froze what its signer pinned. */
+  constructor(ctx: FoldCtx, check: SigCheck, keyOf?: KeyOf) {
     this.ctx = ctx;
     this.check = check;
+    this.keyOf = keyOf;
   }
 
   /** Point at the incarnation's checkpoint (null = none) — the live session id
@@ -619,6 +659,12 @@ export class TableFold {
     this.apply(entries);
   }
 
+  /** keyOf may answer differently now (a player's key showed up): the next
+   *  result() reads it again. */
+  keysChanged(): void {
+    this.dirty = true;
+  }
+
   /** The fold's output (cached until the next setBase/apply/reset, or until a
    *  pending verdict may have changed — always recompute when the last result
    *  was pending). Read-only: the maps and sets are the fold's own. */
@@ -645,12 +691,15 @@ export class TableFold {
     this.revealVer.clear();
     this.ffaVer.clear();
     this.bytes = 0;
+    this.raw.clear();
+    this.rawBytes = 0;
     this.dirty = true;
   }
 
   private put(key: string, value: unknown): void {
     const old = this.entries.get(key);
     const next = value === undefined ? null : this.entryFor(key, value);
+    this.weigh(key, value === undefined ? undefined : next ? next.size : key.length + rawSize(value));
     // The same record again (a re-put, or a fresh copy of the same bytes):
     // keep the old entry, its verdict and its memos.
     if (old && next && old.hash === next.hash) return;
@@ -694,6 +743,20 @@ export class TableFold {
       case 'z':
         return { kind: 'z', key, hash, rec: rec as AbandonRec, size };
     }
+  }
+
+  /** Keep `rawBytes` in line with one key's weight (undefined: gone). A
+   *  change of weight is a change of output; the same weight again is none. */
+  private weigh(key: string, size: number | undefined): void {
+    const was = this.raw.get(key);
+    if (was === size) return;
+    if (was !== undefined) this.rawBytes -= was;
+    if (size === undefined) this.raw.delete(key);
+    else {
+      this.raw.set(key, size);
+      this.rawBytes += size;
+    }
+    this.dirty = true;
   }
 
   private index(e: Entry): void {
@@ -1054,13 +1117,18 @@ export class TableFold {
       for (const c of naming) openCloses.push({ hash: c.hash, rec: c.rec, state: states.get(c.hash) ?? 'invalid' });
     }
 
-    // 4. The felt now: each player's latest verified version on the open round.
+    // 4. The felt now: each player's latest verified version on the open
+    //    round — given keyOf, of those signed by the player's pinned key
+    //    (checked first: a version under the wrong key is never verified).
     const felts = new Map<string, SlipInfo>();
     const atOpenSlips = this.slipsAt.get(open);
     if (atOpenSlips) {
       for (const pid of [...atOpenSlips.keys()].sort()) {
+        const pinned = this.keyOf?.(pid);
+        if (this.keyOf && pinned === undefined) continue; // no key yet: no felt
         const versions = [...atOpenSlips.get(pid)!.values()].sort((a, b) => (b.rec.v - a.rec.v) || cmp(b.hash, a.hash));
         for (const s of versions) {
+          if (this.keyOf && s.rec.k !== pinned) continue;
           if (this.ask(s, 'slip')) {
             felts.set(pid, { key: s.key, hash: s.hash, rec: s.rec });
             break;
@@ -1106,6 +1174,7 @@ export class TableFold {
       revealedCommits,
       pending: this.sawPending,
       bytes: this.bytes,
+      rawBytes: this.rawBytes,
       records: this.entries.size,
     };
   }
