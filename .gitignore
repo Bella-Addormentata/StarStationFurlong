@@ -31,6 +31,12 @@ ssf_log_test.db
 # Node identity secrets — NEVER commit (written to cwd by ssf-p2p-node; see review §10.4 nit)
 iroh_node_id.key
 **/iroh_node_id.key
+# ⛓️ #231 P6a: the node's ChiaHub contact key, written next to it (32 bytes, mode 600)
+contact.key
+**/contact.key
+# ⛓️ The node's Chia peer cache, written next to it too
+chia_peers.json
+**/chia_peers.json
 
 # Editor directories and files
 .vscode/*

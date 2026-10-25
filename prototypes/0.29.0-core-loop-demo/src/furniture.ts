@@ -2154,6 +2154,19 @@ const MT_TOP_Y = 0.84; // table-top surface height
 const MT_HOLO_Y = 1.18; // holo disc plane height
 const HOLO_CYAN = 0x00e5ff;
 
+/**
+ * 🔮 #251: who builds the hologram over the map table. mapHologram.ts reads
+ * the stations, the atlas and the holotable's "here" (devices.ts), which
+ * all reach back into this module — so it is not imported here but handed
+ * in by main.ts at start-up (setMapHologramBuilder); a table built before
+ * that (none in the app; tests, which never set one) has the disc alone.
+ */
+export type MapHologramBuilder = (ctx: Pick<BuildCtx, "attach">, planeY: number, apexY: number) => void;
+let mapHologramBuilder: MapHologramBuilder | null = null;
+export function setMapHologramBuilder(builder: MapHologramBuilder | null): void {
+  mapHologramBuilder = builder;
+}
+
 const buildMapTable = (ctx: BuildCtx) => {
   const { m, flat, place, addLight } = ctx;
   const BODY = 0x232b36; // dark gunmetal (wall-computer housing family)
@@ -2248,6 +2261,12 @@ const buildMapTable = (ctx: BuildCtx) => {
   ringGeo.rotateX(Math.PI / 2); // lie flat in the XZ plane
   const ring = place(ringGeo, ringMat, 0, MT_HOLO_Y + 0.05, 0);
   ring.userData.holoSpin = 0.6; // rad/s — collected by registerFurnitureHandles (furnitureHandles.ts)
+
+  // 🔮 #251: the hologram itself — the solar plot and the station you are
+  // in, over the disc (mapHologram.ts, via the builder main.ts sets). Its
+  // handle rides the sun mesh as userData.mapHologram
+  // (registerFurnitureHandles), and World drives it every frame.
+  mapHologramBuilder?.(ctx, MT_HOLO_Y + 0.02, MT_TOP_Y + 0.07);
 
   // Faint cyan wash over the table surface
   addLight(new THREE.PointLight(HOLO_CYAN, 0, 3.5), 0, MT_HOLO_Y + 0.4, 0, 0.9);

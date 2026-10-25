@@ -28,6 +28,7 @@ function freshSinks(): FurnitureHandleSinks {
   return {
     wallScreens: new Map(),
     holoSpinners: [],
+    mapHolograms: new Map(),
     trunkLids: new Map(),
     gameTableTops: new Map(),
     cloneVats: new Map(),

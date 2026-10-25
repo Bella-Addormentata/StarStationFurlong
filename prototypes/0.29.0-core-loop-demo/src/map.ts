@@ -7,12 +7,14 @@
  * long-distance travel system (v006 §8.2 / Phase 2 Feature 1 & 2).
  */
 
-import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
+import { DEFAULT_STATION_ID, currentStation, listStations, planetById } from './stations';
 import type { StationRecord } from './stations';
 import { angleAt, baseOrbit, realMsFor, slotPosition, stationOrbit } from './orbits';
 import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
 import { describeMove, moveTransitPointAt, orbitChangePlanOf, stationPointWithMoveAt } from './stationMove';
 import type { StationMove } from './stations';
+import type { PlotView3D } from './mapPlot3d';
+import { bodyColor } from './mapHologramSplats';
 
 export interface MapBody {
   id: string;
@@ -35,6 +37,10 @@ export interface MapBody {
    *  where placeAt puts it on the way (sun-centred, like placeAt's), drawn
    *  until `until` (its arrival). */
   course?: { until: number; points: Array<{ angle: number; radius: number }> };
+  /** 🚚 A station crossing to another planet: the planet it leaves and the
+   *  one it is bound for, so a view that draws each planet's orbit its own
+   *  way (the hologram) can carry the crossing from the one to the other. */
+  transit?: { from: string; to: string };
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
@@ -87,6 +93,9 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
       angleAt: (nowMs: number) => angleAt(orbit, nowMs),
       ...(s.move ? { placeAt: movingPlace(s, s.move) } : {}),
       ...(s.move && nowMs < s.move.arriveAt ? moveCourse(s.move) : {}),
+      ...(s.move && !orbitChangePlanOf(s.move) && planetById(s.move.fromPlanetId).id !== planetById(s.move.toPlanetId).id
+        ? { transit: { from: planetById(s.move.fromPlanetId).id, to: planetById(s.move.toPlanetId).id } }
+        : {}),
       description: (s.id === DEFAULT_STATION_ID
         ? `Sovereign-serverless terminal, lounge, and trade hub for all clones. ${readout}`
         : `Station around ${orbit.planet.name}: ${readout}`) + moving,
@@ -190,6 +199,140 @@ function yearReadout(planetId: string): string {
   return `One year every ${Math.floor(h / 24)}d ${String(h % 24).padStart(2, '0')}h.`;
 }
 
+/** 🌠 Every body the holotable plots — the sun, the planets on the shared
+ *  clock, the stations listed (stationBodies), the Lagrange pockets and
+ *  the belt — in the order they are drawn. The in-room hologram (#251)
+ *  plots the same list, so the table and its projection never disagree. */
+export function solarPlotBodies(stations: StationRecord[] = listStations()): MapBody[] {
+  const sovereignAngle = planetAngleAt('planet-sovereign');
+  return [
+    {
+      id: 'star-sol',
+      name: 'SOL PRIME',
+      type: 'star',
+      orbitRadius: 0,
+      orbitSpeed: 0,
+      angle: 0,
+      description: 'Spectral class G2V star. Core fusion power source for Furlong Sector.',
+    },
+    {
+      id: 'planet-aris',
+      name: 'ARIS PRIME',
+      type: 'planet',
+      orbitRadius: 100,
+      orbitSpeed: 0,
+      angle: 0.5,
+      angleAt: planetAngleAt('planet-aris'),
+      description: `Lava-rich dense inner planet. Rich in heavy iron ore pockets. ${yearReadout('planet-aris')}`,
+      resources: [{ type: 'Iron Ore', yield: 800 }],
+    },
+    {
+      id: 'planet-sovereign',
+      name: 'SOVEREIGN II',
+      type: 'planet',
+      orbitRadius: 180,
+      orbitSpeed: 0,
+      angle: 1.2,
+      angleAt: sovereignAngle,
+      description: `Carbon-silica rich terra planet holding Furlong System main station. ${yearReadout('planet-sovereign')}`,
+      resources: [{ type: 'Silica', yield: 1200 }],
+    },
+    ...stationBodies(stations),
+    {
+      id: 'lagrange-l4',
+      name: 'SOVEREIGN L4 APEX',
+      type: 'lagrange',
+      orbitRadius: 180, // On Sovereign's orbit around the sun
+      orbitSpeed: 0,
+      angle: 1.2 + (Math.PI / 3.0), // 60 degrees ahead (stable Lagrange L4)
+      angleAt: (nowMs: number) => sovereignAngle(nowMs) + Math.PI / 3,
+      lagrangePoint: 'L4',
+      description: 'Gravitationally stable Lagrange co-orbital pocket. Ideal for modular outposts.',
+    },
+    {
+      id: 'lagrange-l5',
+      name: 'SOVEREIGN L5 REFUGE',
+      type: 'lagrange',
+      orbitRadius: 180, // On Sovereign's orbit around the sun
+      orbitSpeed: 0,
+      angle: 1.2 - (Math.PI / 3.0), // 60 degrees behind (stable Lagrange L5)
+      angleAt: (nowMs: number) => sovereignAngle(nowMs) - Math.PI / 3,
+      lagrangePoint: 'L5',
+      description: 'Stable Lagrange refuge pocket. Uncharted asteroid debris.',
+      resources: [{ type: 'Rare Mineral', yield: 250 }],
+    },
+    {
+      id: 'belt-ring',
+      name: 'THE SILENT RING',
+      type: 'asteroid-field',
+      orbitRadius: 280,
+      orbitSpeed: 0.0006,
+      angle: 3.4,
+      description: 'Massive dense debris ring populated with minable node clusters.',
+      resources: [
+        { type: 'Iron Ore', yield: 2500 },
+        { type: 'Silica', yield: 1500 },
+        { type: 'Rare Mineral', yield: 450 },
+      ],
+    },
+  ];
+}
+
+/**
+ * Where a body sits on the plot at `nowMs`, in map units from the sun
+ * (screenOffset's frame: dx right, dy down the screen, the map at scale 1).
+ * The sun is the origin; a body on a parent (a station round its planet)
+ * is its parent's place plus its own offset; a body with a true orbit
+ * (angleAt / placeAt) is where the shared clock puts it, and one without
+ * (the belt) where `simTick` ticks of its own orbitSpeed have carried it.
+ * The canvas scales and centres this; the in-room hologram scales it to
+ * the table's disc.
+ */
+export function plotOffset(
+  bodies: readonly MapBody[],
+  body: MapBody,
+  nowMs: number,
+  simTick = 0,
+): { dx: number; dy: number } {
+  if (body.type === 'star') return { dx: 0, dy: 0 };
+
+  if (body.placeAt) {
+    const place = body.placeAt(nowMs);
+    const parent = place.parentId ? bodies.find((b) => b.id === place.parentId) : undefined;
+    const origin = parent ? plotOffset(bodies, parent, nowMs, simTick) : { dx: 0, dy: 0 };
+    const { dx, dy } = screenOffset(place.angle, place.radius);
+    return { dx: origin.dx + dx, dy: origin.dy + dy };
+  }
+
+  // Base orbit positions (derive-don't-tick, v006 §8.2 / Kepler orbits):
+  // the true angle on the shared orbital clock for planets, stations and
+  // Lagrange points; a tick of its own speed for a body without one.
+  const radius = body.orbitRadius;
+  const angle = body.angleAt ? body.angleAt(nowMs) : body.angle + body.orbitSpeed * simTick;
+
+  if (body.parentId) {
+    const parent = bodies.find((b) => b.id === body.parentId);
+    if (parent) {
+      const origin = plotOffset(bodies, parent, nowMs, simTick);
+      const { dx, dy } = screenOffset(angle, radius);
+      return { dx: origin.dx + dx, dy: origin.dy + dy };
+    }
+  }
+
+  // Elliptical adjustments if eccentricity is configured
+  if (body.eccentricity && body.semiMajorAxis) {
+    const a = body.semiMajorAxis;
+    const b = a * Math.sqrt(1.0 - Math.pow(body.eccentricity, 2.0));
+    // Ellipse focuses on Sol Prime center
+    return {
+      dx: Math.cos(angle) * a - a * body.eccentricity,
+      dy: -Math.sin(angle) * b, // north-up, as screenOffset
+    };
+  }
+
+  return screenOffset(angle, radius);
+}
+
 export class SolarSystemMap {
   private container: HTMLDivElement | null = null;
   private mapArea: HTMLDivElement | null = null;
@@ -220,84 +363,17 @@ export class SolarSystemMap {
   // Callbacks
   private onTravelCompleteCallback: ((destinationId: string) => void) | null = null;
   private onStationAtlasCallback: ((stationId: string) => void) | null = null;
+  /** 🔮 #251: the plot in three dimensions (mapPlot3d.ts), in place of the
+   *  canvas, where Spark runs. The canvas and its hint hide behind it. */
+  private plot3d: PlotView3D | null = null;
+  private hint2d: HTMLDivElement | null = null;
 
   constructor() {
     this.initializeBodies();
   }
 
   private initializeBodies() {
-    const sovereignAngle = planetAngleAt('planet-sovereign');
-    this.bodies = [
-      {
-        id: 'star-sol',
-        name: 'SOL PRIME',
-        type: 'star',
-        orbitRadius: 0,
-        orbitSpeed: 0,
-        angle: 0,
-        description: 'Spectral class G2V star. Core fusion power source for Furlong Sector.',
-      },
-      {
-        id: 'planet-aris',
-        name: 'ARIS PRIME',
-        type: 'planet',
-        orbitRadius: 100,
-        orbitSpeed: 0,
-        angle: 0.5,
-        angleAt: planetAngleAt('planet-aris'),
-        description: `Lava-rich dense inner planet. Rich in heavy iron ore pockets. ${yearReadout('planet-aris')}`,
-        resources: [{ type: 'Iron Ore', yield: 800 }],
-      },
-      {
-        id: 'planet-sovereign',
-        name: 'SOVEREIGN II',
-        type: 'planet',
-        orbitRadius: 180,
-        orbitSpeed: 0,
-        angle: 1.2,
-        angleAt: sovereignAngle,
-        description: `Carbon-silica rich terra planet holding Furlong System main station. ${yearReadout('planet-sovereign')}`,
-        resources: [{ type: 'Silica', yield: 1200 }],
-      },
-      ...stationBodies(listStations()),
-      {
-        id: 'lagrange-l4',
-        name: 'SOVEREIGN L4 APEX',
-        type: 'lagrange',
-        orbitRadius: 180, // On Sovereign's orbit around the sun
-        orbitSpeed: 0,
-        angle: 1.2 + (Math.PI / 3.0), // 60 degrees ahead (stable Lagrange L4)
-        angleAt: (nowMs: number) => sovereignAngle(nowMs) + Math.PI / 3,
-        lagrangePoint: 'L4',
-        description: 'Gravitationally stable Lagrange co-orbital pocket. Ideal for modular outposts.',
-      },
-      {
-        id: 'lagrange-l5',
-        name: 'SOVEREIGN L5 REFUGE',
-        type: 'lagrange',
-        orbitRadius: 180, // On Sovereign's orbit around the sun
-        orbitSpeed: 0,
-        angle: 1.2 - (Math.PI / 3.0), // 60 degrees behind (stable Lagrange L5)
-        angleAt: (nowMs: number) => sovereignAngle(nowMs) - Math.PI / 3,
-        lagrangePoint: 'L5',
-        description: 'Stable Lagrange refuge pocket. Uncharted asteroid debris.',
-        resources: [{ type: 'Rare Mineral', yield: 250 }],
-      },
-      {
-        id: 'belt-ring',
-        name: 'THE SILENT RING',
-        type: 'asteroid-field',
-        orbitRadius: 280,
-        orbitSpeed: 0.0006,
-        angle: 3.4,
-        description: 'Massive dense debris ring populated with minable node clusters.',
-        resources: [
-          { type: 'Iron Ore', yield: 2500 },
-          { type: 'Silica', yield: 1500 },
-          { type: 'Rare Mineral', yield: 450 },
-        ],
-      },
-    ];
+    this.bodies = solarPlotBodies();
   }
 
   public mount(parentEl: HTMLElement) {
@@ -360,6 +436,7 @@ export class SolarSystemMap {
       border: 1px solid rgba(212, 168, 75, 0.18);
     `;
     mapArea.appendChild(hint);
+    this.hint2d = hint;
 
     // 2. Info Sidebar
     const sidebar = document.createElement('div');
@@ -378,7 +455,7 @@ export class SolarSystemMap {
 
     sidebar.innerHTML = `
       <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(212, 168, 75, 0.18); padding-bottom: 14px; margin-bottom: 20px;">
-        <span style="font-size: 14px; font-weight: 800; letter-spacing: 1px; color: #F0C060;">🌌 ORBITAL COOMMS</span>
+        <span style="font-size: 14px; font-weight: 800; letter-spacing: 1px; color: #F0C060;">🌌 ORBITAL COMMS</span>
         <button id="solarmap-close-btn" style="background: rgba(212,168,75,0.1); color: #d4a84b; border: 1px solid rgba(212,168,75,0.3); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size:11px;">CLOSE</button>
       </div>
 
@@ -533,49 +610,8 @@ export class SolarSystemMap {
   }
 
   private getBodyCoordinates(body: MapBody, centerX: number, centerY: number): { x: number; y: number } {
-    if (body.type === 'star') {
-      return { x: centerX, y: centerY };
-    }
-
-    if (body.placeAt) {
-      const place = body.placeAt(this.clock());
-      const parent = place.parentId ? this.bodies.find((b) => b.id === place.parentId) : undefined;
-      const origin = parent ? this.getBodyCoordinates(parent, centerX, centerY) : { x: centerX, y: centerY };
-      const { dx, dy } = screenOffset(place.angle, place.radius * this.scale);
-      return { x: origin.x + dx, y: origin.y + dy };
-    }
-
-    // Base orbit positions (derive-don't-tick, v006 §8.2 / Kepler orbits)
-    let radius = body.orbitRadius * this.scale;
-    let angle = body.angle;
-
-    // Simulate orbital movement as a function of the simulation clock tick —
-    // or, for planets, stations and Lagrange points, the true angle on the
-    // shared orbital clock.
-    angle = body.angleAt ? body.angleAt(this.clock()) : angle + body.orbitSpeed * this.simTick;
-
-    if (body.parentId) {
-      const parent = this.bodies.find(b => b.id === body.parentId);
-      if (parent) {
-        const parentCoords = this.getBodyCoordinates(parent, centerX, centerY);
-        const { dx, dy } = screenOffset(angle, radius);
-        return { x: parentCoords.x + dx, y: parentCoords.y + dy };
-      }
-    }
-
-    // Elliptical adjustments if eccentricity is configured
-    if (body.eccentricity && body.semiMajorAxis) {
-      const a = body.semiMajorAxis * this.scale;
-      const b = a * Math.sqrt(1.0 - Math.pow(body.eccentricity, 2.0));
-      // Ellipse focuses on Sol Prime center
-      return {
-        x: centerX + Math.cos(angle) * a - (a * body.eccentricity),
-        y: centerY - Math.sin(angle) * b, // north-up, as screenOffset
-      };
-    }
-
-    const { dx, dy } = screenOffset(angle, radius);
-    return { x: centerX + dx, y: centerY + dy };
+    const { dx, dy } = plotOffset(this.bodies, body, this.clock(), this.simTick);
+    return { x: centerX + dx * this.scale, y: centerY + dy * this.scale };
   }
 
   private selectBody(body: MapBody) {
@@ -592,6 +628,10 @@ export class SolarSystemMap {
     if (panel && nameEl && typeEl && descEl && resBox && resList && travelBtn) {
       panel.style.display = 'flex';
       nameEl.textContent = body.name;
+      // 🔮 In the body's own colour, as the plot in three dimensions draws it.
+      nameEl.style.color = this.plot3d
+        ? '#' + bodyColor({ id: body.id, type: body.type, frame: '', here: body.id === this.playerLocationId }).toString(16).padStart(6, '0')
+        : '';
       typeEl.textContent = body.type.toUpperCase();
       descEl.textContent = body.description;
 
@@ -665,8 +705,39 @@ export class SolarSystemMap {
 
   public tick() {
     this.simTick++;
-    this.render();
+    if (this.plot3d) {
+      this.plot3d.frame(this.bodies, this.clock(), {
+        hereId: this.playerLocationId,
+        selectedId: this.selectedBody?.id ?? null,
+        ...(this.travelDestination ? { travel: { fromId: this.playerLocationId, toId: this.travelDestination.id } } : {}),
+      });
+    } else {
+      this.render();
+    }
     this.updateTravelProgress();
+  }
+
+  /**
+   * 🔮 Show the plot in three dimensions: the view takes the canvas's place
+   * in the map area, and a body picked in it is selected here, so the
+   * sidebar (card, atlas, travel) works as it does for a canvas click.
+   */
+  public attachPlot3D(view: PlotView3D): void {
+    if (!this.mapArea || this.plot3d) return;
+    this.plot3d = view;
+    if (this.canvas) this.canvas.style.display = 'none';
+    if (this.hint2d) this.hint2d.style.display = 'none';
+    view.mount(this.mapArea);
+    view.onSelect((id) => {
+      const body = this.bodies.find((b) => b.id === id);
+      if (body) this.selectBody(body);
+    });
+    if (this.isOpen()) view.resize();
+  }
+
+  /** Is the plot shown in three dimensions? */
+  public hasPlot3D(): boolean {
+    return this.plot3d !== null;
   }
 
   private updateTravelProgress() {
@@ -906,7 +977,8 @@ export class SolarSystemMap {
       this.container.style.display = 'flex';
       // Measure AFTER display:flex — a hidden container has zero layout.
       this.resizeCanvas();
-      this.render();
+      if (this.plot3d) this.plot3d.resize();
+      else this.render();
     }
   }
 

@@ -41,6 +41,7 @@ import type {
   AlligatorsVisualHandle,
 } from './devices';
 import type { CasinoTableVisualHandle } from './casinoTable3d';
+import type { MapHologramHandle } from './mapHologram';
 
 /**
  * The per-item drive collections World owns, seen as the sinks the handle
@@ -55,6 +56,8 @@ export interface FurnitureHandleSinks {
   /** Holo-ring spinners (M4 map table) — one entry PER MESH tagged
    *  `userData.holoSpin` (a table may carry several rings), not per item. */
   holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }>;
+  /** 🔮 Map-table holograms (#251), keyed by item id — driven every frame. */
+  mapHolograms: Map<string, MapHologramHandle>;
   /** Animated trunk lids, keyed by item id (TR2 — driven every frame). */
   trunkLids: Map<string, TrunkLidHandle>;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
@@ -107,6 +110,7 @@ export function registerFurnitureHandles(
   const d = mesh.userData;
   if (d.wallScreen) sinks.wallScreens.set(itemId, d.wallScreen as WallScreenHandle);
   if (typeof d.holoSpin === 'number') sinks.holoSpinners.push({ mesh, speed: d.holoSpin });
+  if (d.mapHologram) sinks.mapHolograms.set(itemId, d.mapHologram as MapHologramHandle);
   if (d.trunkLid) sinks.trunkLids.set(itemId, d.trunkLid as TrunkLidHandle);
   if (d.gameTableTop) sinks.gameTableTops.set(itemId, d.gameTableTop as GameTableTopHandle);
   if (d.cloneVat) sinks.cloneVats.set(itemId, d.cloneVat as CloneVatHandle);

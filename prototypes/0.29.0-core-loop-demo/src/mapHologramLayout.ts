@@ -1,0 +1,415 @@
+/**
+ * 🔮 The map table's hologram, laid out (#251, follow-up to #33).
+ *
+ * The holotable's 2D panel plots the solar system (map.ts) and, from a
+ * station's card, the station's own plan (stationPlan.ts). The hologram
+ * floating over the table shows the same two pictures in the room, to
+ * everyone standing there, in turn: the plot, then the station you are
+ * in, each faded in and out. This module is the pure part — where every
+ * marker, ring, course, module block and gangway sits on the disc, in
+ * metres from the disc's centre — so it tests without three.js. The map's
+ * frame (screenOffset: +x right, +y down the screen, looking down from the
+ * north) lands on the table as +x, +z: the picture reads from the table's
+ * player side exactly as the panel does.
+ */
+
+import type { MapBody } from './map';
+import { courseOnScreen, plotOffset } from './map';
+import type { PlanModule, StationPlan } from './stationPlan';
+
+/** Radius of the picture on the disc (metres) — inside the disc's 0.62. */
+export const HOLO_RADIUS = 0.5;
+/** Map units that reach the picture's edge: the belt (280) just inside it. */
+export const PLOT_EXTENT = 300;
+/** Metres per map unit. */
+export const PLOT_SCALE = HOLO_RADIUS / PLOT_EXTENT;
+
+export interface HoloMarker {
+  id: string;
+  name: string;
+  type: MapBody['type'];
+  /** The orbit plane the body rides, for its tilt (inclinationOf): a
+   *  planet's own id, its planet's for a station or a Lagrange pocket, the
+   *  belt's own; '' for the sun. */
+  frame: string;
+  /** Metres from the disc centre. */
+  x: number;
+  z: number;
+  /** The station the holotable marks "you are here". */
+  here: boolean;
+  /** Set for a body between orbits (a station crossing to another planet):
+   *  its height, already worked out between the two orbits' tilts — the
+   *  body rides neither plane. holoPoint takes it as it is. */
+  y?: number;
+  /** The orbit the body rides, when it rides one: its centre and radius on
+   *  the disc (a planet's round the sun, a station's round its planet). */
+  orbit?: { cx: number; cz: number; r: number };
+}
+
+/**
+ * Every body of the plot at `nowMs`, on the disc. A body's orbit ring is
+ * its own (a planet's round the sun at its schematic radius; a station's
+ * round its planet, where its altitude puts it); a station crossing to
+ * another planet rides none until it arrives; the sun, the Lagrange
+ * pockets and the belt ride their parents' rings or none.
+ */
+export function plotMarkers(
+  bodies: readonly MapBody[],
+  nowMs: number,
+  hereId = '',
+  simTick = 0,
+): HoloMarker[] {
+  return bodies.map((body) => {
+    const o = plotOffset(bodies, body, nowMs, simTick);
+    const frame = frameOf(bodies, body, nowMs);
+    const marker: HoloMarker = {
+      id: body.id,
+      name: body.name,
+      type: body.type,
+      frame,
+      x: o.dx * PLOT_SCALE,
+      z: o.dy * PLOT_SCALE,
+      here: body.type === 'station' && body.id === hereId,
+    };
+    const ring = orbitRing(bodies, body, nowMs, simTick);
+    if (ring) marker.orbit = ring;
+    if (body.transit && !ring && body.type === 'station') return inTransit(marker, bodies, body.transit);
+    return stretched(marker, bodies, nowMs, simTick);
+  });
+}
+
+/**
+ * 🚚 A body crossing between two planets' orbits: each orbit is drawn its
+ * own way here (stretched, turned, tilted), so the crossing is carried
+ * from the one orbit's transform to the other's by how far along it is —
+ * by its distance from the sun between the two orbits' radii. At the
+ * departure orbit it is where that planet's orbit is drawn, at arrival
+ * where the other's is, and the course it flies runs between the two.
+ */
+function transitFrames(bodies: readonly MapBody[], transit: { from: string; to: string }) {
+  const planet = (id: string) => bodies.find((b) => b.id === id && b.type === 'planet');
+  const from = planet(transit.from), to = planet(transit.to);
+  if (!from || !to) return null;
+  return { from, to, rFrom: from.orbitRadius * PLOT_SCALE, rTo: to.orbitRadius * PLOT_SCALE };
+}
+export function transitPoint(
+  x: number,
+  z: number,
+  bodies: readonly MapBody[],
+  transit: { from: string; to: string },
+): { x: number; y: number; z: number } {
+  const f = transitFrames(bodies, transit);
+  if (!f) return { x, y: 0, z };
+  const r = Math.hypot(x, z);
+  const span = f.rTo - f.rFrom;
+  const t = Math.abs(span) < 1e-9 ? 1 : Math.max(0, Math.min(1, (r - f.rFrom) / span));
+  const a = turned(x * orbitStretch(f.from.id), z * orbitStretch(f.from.id), orbitTurn(f.from.id));
+  const b = turned(x * orbitStretch(f.to.id), z * orbitStretch(f.to.id), orbitTurn(f.to.id));
+  const ya = inclinedPoint(a.x, a.z, inclinationOf(f.from.id)), yb = inclinedPoint(b.x, b.z, inclinationOf(f.to.id));
+  return {
+    x: ya.x + (yb.x - ya.x) * t,
+    y: ya.y + (yb.y - ya.y) * t,
+    z: ya.z + (yb.z - ya.z) * t,
+  };
+}
+function inTransit(mk: HoloMarker, bodies: readonly MapBody[], transit: { from: string; to: string }): HoloMarker {
+  const p = transitPoint(mk.x, mk.z, bodies, transit);
+  return { ...mk, x: p.x, z: p.z, y: p.y, frame: transit.to };
+}
+
+/**
+ * 🔭 The hologram spreads the planets apart: the panel's schematic radii
+ * (100, 180, the belt at 280) crowd the planets round the sun, so each
+ * planet's orbit is drawn STRETCH times wider here — its ring and the
+ * Lagrange pockets on it with it, and the stations round it carried
+ * along (their rings stay circles round the planet). The belt and the sun
+ * stay. Schematic, like the radii.
+ */
+const STRETCH: Record<string, number> = { 'planet-aris': 1.0, 'planet-sovereign': 1.22, 'belt-ring': 1.12 };
+/** The stations' rings round a planet, this much wider than the panel's,
+ *  so a planet's stations stand apart from it and each other. */
+export const STATION_SPREAD = 1.4;
+export function orbitStretch(frame: string): number {
+  return STRETCH[frame] ?? 1;
+}
+/**
+ * 🔭 …and turns them apart: each planet's whole orbit (the planet, the
+ * pockets on it, the stations round it) is turned by a fixed angle about
+ * the sun, so two planets that happen to share an angle on the clock are
+ * not drawn in a heap on one side. The planets still move on the clock;
+ * only where "angle zero" points differs per orbit. Radians.
+ */
+const TURN: Record<string, number> = { 'planet-aris': 2.3, 'planet-sovereign': 0 };
+export function orbitTurn(frame: string): number {
+  return TURN[frame] ?? 0;
+}
+function turned(x: number, z: number, a: number): { x: number; z: number } {
+  if (a === 0) return { x, z };
+  const c = Math.cos(a), s = Math.sin(a);
+  return { x: x * c - z * s, z: x * s + z * c };
+}
+function stretched(mk: HoloMarker, bodies: readonly MapBody[], nowMs: number, simTick: number): HoloMarker {
+  const k = orbitStretch(mk.frame), a = orbitTurn(mk.frame);
+  if (k === 1 && a === 0 && mk.type !== 'station') return mk;
+  if (mk.type === 'planet' || mk.type === 'lagrange' || mk.type === 'asteroid-field') {
+    const p = turned(mk.x * k, mk.z * k, a);
+    const out: HoloMarker = { ...mk, x: p.x, z: p.z };
+    if (mk.orbit) { const c = turned(mk.orbit.cx * k, mk.orbit.cz * k, a); out.orbit = { cx: c.x, cz: c.z, r: mk.orbit.r * k }; }
+    return out;
+  }
+  // A station: carried with its planet, which moved by (k − 1) × its
+  // place, then the whole turned with the orbit.
+  const planet = bodies.find((b) => b.id === mk.frame);
+  if (!planet) return mk;
+  const c = plotOffset(bodies, planet, nowMs, simTick);
+  const cx = c.dx * PLOT_SCALE, cz = c.dy * PLOT_SCALE;
+  // Its offset from the planet, STATION_SPREAD wider (in transit, none).
+  const sp = mk.orbit ? STATION_SPREAD : 1;
+  const ox = (mk.x - cx) * sp, oz = (mk.z - cz) * sp;
+  const p = turned(cx * k + ox, cz * k + oz, a);
+  const out: HoloMarker = { ...mk, x: p.x, z: p.z };
+  if (mk.orbit) { const oc = turned(cx * k, cz * k, a); out.orbit = { cx: oc.x, cz: oc.z, r: mk.orbit.r * sp }; }
+  return out;
+}
+
+/**
+ * 🔭 The tilt of a station's ring round its planet: each ring its own,
+ * by its radius, so a planet's stations stand above and below its plane
+ * like the shells of an atom rather than in one sheet. Radians.
+ */
+export function ringInclination(frame: string, r: number): Inclination {
+  const seed = r * 1000 + frame.length;
+  return { tilt: 0.55 * Math.sin(seed * 1.7), node: (seed * 0.61) % Math.PI };
+}
+
+/**
+ * Where a marker stands in the hologram's three dimensions: on its
+ * orbit's tilted plane (inclinationOf) — a station on its own tilted ring
+ * round its planet, which stands on the planet's plane.
+ */
+/** Where a station's foot stands on its planet's orbit plane — straight
+ *  under (or over) the station, for the line that shows its height. */
+export function holoFoot(mk: HoloMarker): { x: number; y: number; z: number } {
+  return inclinedPoint(mk.x, mk.z, inclinationOf(mk.frame));
+}
+
+export function holoPoint(mk: HoloMarker): { x: number; y: number; z: number } {
+  if (mk.y !== undefined) return { x: mk.x, y: mk.y, z: mk.z };
+  if (mk.type === 'station' && mk.orbit) {
+    const c = inclinedPoint(mk.orbit.cx, mk.orbit.cz, inclinationOf(mk.frame));
+    const o = inclinedPoint(mk.x - mk.orbit.cx, mk.z - mk.orbit.cz, ringInclination(mk.frame, mk.orbit.r));
+    return { x: c.x + o.x, y: c.y + o.y, z: c.z + o.z };
+  }
+  return inclinedPoint(mk.x, mk.z, inclinationOf(mk.frame));
+}
+
+/** The orbit plane a body rides: its own for a planet or the belt, its
+ *  planet's for a station (round it) or a Lagrange pocket (on its orbit:
+ *  the planet whose schematic radius it shares), none for the sun. */
+function frameOf(bodies: readonly MapBody[], body: MapBody, nowMs: number): string {
+  if (body.type === 'planet' || body.type === 'asteroid-field') return body.id;
+  if (body.type === 'star') return '';
+  const parentId = body.placeAt ? body.placeAt(nowMs).parentId : body.parentId;
+  if (parentId) return parentId;
+  const planet = bodies.find((b) => b.type === 'planet' && Math.abs(b.orbitRadius - body.orbitRadius) < 1e-6);
+  return planet?.id ?? '';
+}
+
+/**
+ * 🔭 Orbit tilts, for the picture's depth: each planet's orbit plane is
+ * inclined a little, about its own line of nodes, so the rings cross in
+ * three dimensions instead of lying in one sheet. Schematic, like the
+ * radii — the data holds no inclinations. In radians.
+ */
+export interface Inclination { tilt: number; node: number }
+const INCLINATIONS: Record<string, Inclination> = {
+  'planet-aris': { tilt: 0.48, node: 0.7 },
+  'planet-sovereign': { tilt: -0.36, node: 2.3 },
+  'belt-ring': { tilt: 0.16, node: 1.1 },
+};
+export function inclinationOf(frame: string): Inclination {
+  return INCLINATIONS[frame] ?? { tilt: 0, node: 0 };
+}
+
+/** A point of the flat plot lifted onto its orbit's tilted plane: the
+ *  plane turned by `tilt` about the line of nodes at angle `node`. */
+export function inclinedPoint(x: number, z: number, inc: Inclination): { x: number; y: number; z: number } {
+  if (inc.tilt === 0) return { x, y: 0, z };
+  // Into the nodes' frame (u along the nodes, w across), tilt, back out.
+  const c = Math.cos(inc.node), s = Math.sin(inc.node);
+  const u = x * c + z * s, w = -x * s + z * c;
+  const ct = Math.cos(inc.tilt), st = Math.sin(inc.tilt);
+  const w2 = w * ct, y = w * st;
+  return { x: u * c - w2 * s, y, z: u * s + w2 * c };
+}
+
+function orbitRing(
+  bodies: readonly MapBody[],
+  body: MapBody,
+  nowMs: number,
+  simTick: number,
+): HoloMarker['orbit'] | null {
+  if (body.type === 'star' || body.type === 'lagrange' || body.type === 'asteroid-field') return null;
+  let parentId = body.parentId;
+  let radius = body.orbitRadius;
+  if (body.placeAt) {
+    const place = body.placeAt(nowMs);
+    // In transit between planets (no parent): no ring to ride.
+    if (!place.parentId) return null;
+    parentId = place.parentId;
+    radius = place.radius;
+  }
+  if (body.eccentricity && body.semiMajorAxis) return null;
+  const parent = parentId ? bodies.find((b) => b.id === parentId) : undefined;
+  if (parentId && !parent) return null;
+  const c = parent ? plotOffset(bodies, parent, nowMs, simTick) : { dx: 0, dy: 0 };
+  return { cx: c.dx * PLOT_SCALE, cz: c.dy * PLOT_SCALE, r: radius * PLOT_SCALE };
+}
+
+/** The belt's radius on the disc, when the plot has one. */
+export function beltRadius(bodies: readonly MapBody[]): number | null {
+  const belt = bodies.find((b) => b.type === 'asteroid-field');
+  return belt ? belt.orbitRadius * PLOT_SCALE * orbitStretch(belt.id) : null;
+}
+/** How far past HOLO_RADIUS the picture may reach (the belt, stretched). */
+export const HOLO_REACH = 1.15;
+
+/** How far from the sun the picture reaches right now, in disc metres:
+ *  the belt, every planet, and every station's whole ring round its
+ *  planet (a high slot's ring reaches past the belt). What a view that
+ *  fits the picture must keep in frame. */
+export function plotReach(markers: readonly HoloMarker[]): number {
+  let reach = 0;
+  for (const mk of markers) {
+    const own = Math.hypot(mk.x, mk.z);
+    const ring = mk.orbit && mk.type === 'station' ? Math.hypot(mk.orbit.cx, mk.orbit.cz) + mk.orbit.r : 0;
+    reach = Math.max(reach, own, ring);
+  }
+  return reach;
+}
+
+/** Each moving station's course on the disc (courseOnScreen at the disc's
+ *  scale), burn to arrival; nothing once it has arrived. */
+export function plotCourses(
+  bodies: readonly MapBody[],
+  nowMs: number,
+): Array<{ id: string; points: Array<{ x: number; y: number; z: number }> }> {
+  const out: Array<{ id: string; points: Array<{ x: number; y: number; z: number }> }> = [];
+  for (const body of bodies) {
+    const pts = courseOnScreen(body, nowMs, 0, 0, PLOT_SCALE);
+    if (pts.length < 2) continue;
+    // Carried between the two orbits as the body itself is (transitPoint),
+    // so the course meets the planets where they are drawn.
+    const points = body.transit
+      ? pts.map((p) => transitPoint(p.x, p.y, bodies, body.transit!))
+      : pts.map((p) => ({ x: p.x, y: 0, z: p.y }));
+    out.push({ id: body.id, points });
+  }
+  return out;
+}
+
+export interface HoloModule {
+  roomId: string;
+  name: string;
+  /** Centre on the disc (metres) and heading. */
+  x: number;
+  z: number;
+  rotY: number;
+  /** Half extents on the disc (metres). */
+  halfX: number;
+  halfZ: number;
+  /** The room this client stands in. */
+  here: boolean;
+  ship: boolean;
+}
+
+export interface HoloLink {
+  ax: number;
+  az: number;
+  bx: number;
+  bz: number;
+  /** A visiting ship's berth, not station structure. */
+  berth: boolean;
+}
+
+export interface StationHologram {
+  /** Metres per plan unit. */
+  scale: number;
+  modules: HoloModule[];
+  links: HoloLink[];
+}
+
+/** The most of the disc a station fills, so its gangways keep clear of the rim. */
+const STATION_FILL = 0.9;
+/** The most of the disc's radius one module may span, so a lone 2 × 2
+ *  room is a block on the table, not a slab across it. */
+const MODULE_FILL = 0.5;
+
+/**
+ * The station's plan on the disc: centred on the plan's bounds, scaled so
+ * the whole station fits inside `radius` (and no single module spans more
+ * than MODULE_FILL of it), each gangway a line between the two modules it
+ * joins, drawn once however many doors name it.
+ */
+export function stationLayout(plan: StationPlan, radius = HOLO_RADIUS): StationHologram {
+  const all = [...plan.modules, ...plan.ships];
+  if (all.length === 0) return { scale: 0, modules: [], links: [] };
+  const b = plan.bounds;
+  const cx = (b.minX + b.maxX) / 2, cz = (b.minZ + b.maxZ) / 2;
+  // The bounds' corner is the farthest any module reaches.
+  const reach = Math.max(Math.hypot(b.maxX - cx, b.maxZ - cz), 1e-6);
+  const largest = Math.max(...all.map((m) => 2 * Math.max(m.halfX, m.halfZ)), 1e-6);
+  const scale = Math.min((radius * STATION_FILL) / reach, (radius * MODULE_FILL) / largest);
+  const at = (m: PlanModule) => ({ x: (m.x - cx) * scale, z: (m.z - cz) * scale });
+  const modules = all.map((m): HoloModule => ({
+    roomId: m.roomId,
+    name: m.name,
+    ...at(m),
+    rotY: m.rotY,
+    halfX: m.halfX * scale,
+    halfZ: m.halfZ * scale,
+    here: m.here,
+    ship: m.kind === 'ship',
+  }));
+  const byId = new Map(all.map((m) => [m.roomId, m]));
+  const seen = new Set<string>();
+  const links: HoloLink[] = [];
+  for (const m of all) {
+    for (const l of m.links) {
+      const other = byId.get(l.toRoomId);
+      if (!other || other === m) continue;
+      const key = [m.roomId, other.roomId].sort().join('\u0000');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const a = at(m), c = at(other);
+      links.push({ ax: a.x, az: a.z, bx: c.x, bz: c.z, berth: l.berth });
+    }
+  }
+  return { scale, modules, links };
+}
+
+/** Seconds the plot shows, then the station, and the fade between. */
+export const PLOT_SECONDS = 16;
+export const STATION_SECONDS = 10;
+export const FADE_SECONDS = 1;
+
+export type HoloMode = 'plot' | 'station';
+
+/**
+ * Which picture the hologram shows `t` seconds into its cycle, and how far
+ * in it is (0 = just gone, 1 = fully shown): the plot for PLOT_SECONDS,
+ * the station for STATION_SECONDS, each fading in and out over
+ * FADE_SECONDS. With no station to show (`withStation` false) the plot
+ * stays, fully shown.
+ */
+export function holoModeAt(t: number, withStation = true): { mode: HoloMode; fade: number } {
+  if (!withStation) return { mode: 'plot', fade: 1 };
+  const cycle = PLOT_SECONDS + STATION_SECONDS;
+  const u = ((t % cycle) + cycle) % cycle;
+  const [mode, start, span]: [HoloMode, number, number] = u < PLOT_SECONDS
+    ? ['plot', 0, PLOT_SECONDS]
+    : ['station', PLOT_SECONDS, STATION_SECONDS];
+  const into = u - start;
+  const fade = Math.max(0, Math.min(1, into / FADE_SECONDS, (span - into) / FADE_SECONDS));
+  return { mode, fade };
+}
