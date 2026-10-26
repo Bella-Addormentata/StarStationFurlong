@@ -154,6 +154,105 @@ describe('hearing the room (roomHearing.ts)', () => {
     expect(h.heardThrough(2_400, 2_500)).toBe(true);
   });
 
+  it('a clock gone back stays deaf as it comes round again, with no note between: seen by a look at the hearing, by a read of the clock, or landing inside the gap', async () => {
+    vi.resetModules();
+    const h = await import('./roomHearing');
+    h.listenToRoom();
+    for (let t = 1_000; t <= 5_000; t += 50) h.noteRoomHeard(t);
+    expect(h.heardThrough(1_000, 5_100)).toBe(true);
+    // Back 3 s, the hearing looked at then; the clock round to 5,100 again,
+    // no note since: deaf.
+    expect(h.heardThrough(1_000, 2_100)).toBe(false);
+    expect(h.heardThrough(1_000, 5_100)).toBe(false);
+    expect(h.heardThrough(5_100, 5_200)).toBe(false);
+    // Hearing from the next note on.
+    h.noteRoomHeard(5_300);
+    expect(h.heardThrough(5_300, 5_400)).toBe(true);
+    expect(h.heardThrough(5_200, 5_400)).toBe(false);
+    // Back again, seen only by a frame's read of the clock: deaf as it comes round.
+    h.noteClockRead(2_000);
+    expect(h.heardThrough(5_300, 5_400)).toBe(false);
+    // Deaf since a note at 6,000 (looked at 9,000), the clock back to 7,500:
+    // within HEARD_GAP_MS of that note, but after the room went quiet.
+    h.noteRoomHeard(6_000);
+    expect(h.heardThrough(6_000, 9_000)).toBe(false);
+    expect(h.heardThrough(6_000, 7_500)).toBe(false);
+    // A read at the same time as the last is no step.
+    h.noteRoomHeard(7_600);
+    h.noteClockRead(7_600);
+    expect(h.heardThrough(7_600, 7_600)).toBe(true);
+  });
+
+  it('a note is a read of the clock too: a step a note is the first to see, or one after notes alone, wipes what was heard; one under HEARING_CLOCK_SLACK_MS is none, but a silence under way counts on through it', async () => {
+    vi.resetModules();
+    const h = await import('./roomHearing');
+    h.listenToRoom();
+    for (let t = 1_000; t <= 5_000; t += 50) h.noteRoomHeard(t);
+    // Back 2 s, a note the first to see it: hearing from that note only.
+    h.noteRoomHeard(3_000);
+    expect(h.heardThrough(1_000, 3_000)).toBe(false);
+    expect(h.heardThrough(3_000, 3_000)).toBe(true);
+    for (let t = 3_050; t <= 5_000; t += 50) h.noteRoomHeard(t);
+    expect(h.heardThrough(3_000, 6_900)).toBe(true);
+    // Back 1.9 s from that look, the next note a second on, at 6,000 (after
+    // the last note, within HEARD_GAP_MS of it): the 2.9 s silence was a
+    // deaf spell.
+    h.noteRoomHeard(6_000);
+    expect(h.heardThrough(3_000, 6_100)).toBe(false);
+    expect(h.heardThrough(6_000, 6_100)).toBe(true);
+    // Notes alone for a minute (a hidden tab, still hearing), then back 30 s
+    // and cut off: deaf, and still as the clock comes round.
+    for (let t = 6_050; t <= 66_000; t += 50) h.noteRoomHeard(t);
+    expect(h.heardThrough(6_000, 36_500)).toBe(false);
+    expect(h.heardThrough(6_000, 66_900)).toBe(false);
+    // A step back of a few ms between a read and the next tick (a time
+    // sync's correction) is none: a minute's hearing stands.
+    for (let t = 67_000; t <= 130_000; t += 50) h.noteRoomHeard(t);
+    const latest = 130_010;
+    h.noteClockRead(latest);
+    h.noteRoomHeard(latest - 5);
+    expect(h.heardThrough(latest - 60_000, latest)).toBe(true);
+    // But a silence under way counts on through such corrections: the last
+    // time heard moves back with each. Cut off from here, the clock read
+    // every 10 ms and put back to 249 ms behind its last read each time it
+    // passes latest + 2,000, for a minute: deaf once 2 s and a few frames
+    // have gone, and from then on.
+    const SLACK = h.HEARING_CLOCK_SLACK_MS;
+    let clock = latest;
+    for (let real = 10; real <= 60_000; real += 10) {
+      clock += 10;
+      if (clock > latest + 2_000) clock -= 10 + SLACK - 1;
+      const heard = h.heardThrough(latest - 60_000, clock);
+      if (real <= 2_000 - 5) expect(heard).toBe(true);
+      if (real >= 2_200) expect(heard).toBe(false);
+    }
+    // One step, seen at the next read: hearing overstated by that moment only.
+    h.noteRoomHeard(200_000);
+    expect(h.heardThrough(200_000, 202_000)).toBe(true);
+    expect(h.heardThrough(200_000, 202_000 - SLACK + 1)).toBe(true);
+    expect(h.heardThrough(200_000, 202_000 + 1)).toBe(false);
+    // HEARING_CLOCK_SLACK_MS back is a step.
+    h.noteRoomHeard(300_000);
+    h.noteClockRead(300_000 - SLACK + 1);
+    expect(h.heardThrough(300_000, 300_000)).toBe(true);
+    h.noteClockRead(300_000 - SLACK);
+    expect(h.heardThrough(300_000, 300_000)).toBe(false);
+  });
+
+  it("is told of every frame's read of the clock (computedTable tickComputedTables): a step back seen there, though no duty looks at the hearing", async () => {
+    const [a] = await room(['A'], { hears: true });
+    // (The page's own load of the module: nothing was loaded since.)
+    const h = await import('./roomHearing');
+    const T = T0 + 10_000;
+    for (let t = T - 3_000; t <= T; t += STEP) hear(a, t);
+    expect(h.heardThrough(T - 3_000, clockOf(a, T))).toBe(true);
+    // Cut off, a frame with no tables (no duty looks) as the clock goes 5 s
+    // back, and the clock round again past the last note: deaf.
+    a.skew -= 5_000;
+    frame(T + STEP, a, []);
+    expect(h.heardThrough(T - 3_000, clockOf(a, T + 5_000 + STEP))).toBe(false);
+  });
+
   it("is told of every update the bound doc applies from the room, not of this page's own writes", async () => {
     const [a] = await room(['A'], { hears: true });
     // (The page's own load of the module: nothing was loaded since.)
@@ -553,6 +652,25 @@ describe('the idle trim, on a page that may not hear the room', () => {
     const back = deafFrom + 4 * 60_000;
     expect(back - last).toBeGreaterThan(a.table.TRIM_FALLBACK_MS);
     expect(trimmedAt(a, T, back - STEP, (t) => t < deafFrom)).toBe(-1);
+    // Hearing again: the room's quiet counts from then.
+    const at = trimmedAt(a, back, back + 3 * a.table.IDLE_MS, () => true);
+    expect(at).toBeGreaterThanOrEqual(back + a.table.IDLE_MS);
+    expect(at).toBeLessThan(back + a.table.IDLE_MS + 2 * a.table.STAGGER_MS);
+  });
+
+  it('trims nothing on idle as its clock comes round again after going back, cut off since just before the step (what it heard before is no hearing now); once it has heard the room for a minute, it does', async () => {
+    const { a, T, last } = await decided();
+    // 50 s idle hearing the room (a trim 10 s off, hearing a minute and
+    // more), cut off, and a second on its clock goes back 70 s.
+    const deafFrom = last + 50_000;
+    expect(deafFrom - a.table.IDLE_MS).toBeGreaterThan(T0 + STEP);
+    const stepAt = deafFrom + 1_000;
+    expect(trimmedAt(a, T, stepAt, (t) => t < deafFrom)).toBe(-1);
+    a.skew -= 70_000;
+    // Its clock comes round to the last time it heard the room 70 s on, and
+    // passes it, the page cut off all the while.
+    const back = deafFrom + 4 * 60_000;
+    expect(trimmedAt(a, stepAt + STEP, back - STEP, () => false)).toBe(-1);
     // Hearing again: the room's quiet counts from then.
     const at = trimmedAt(a, back, back + 3 * a.table.IDLE_MS, () => true);
     expect(at).toBeGreaterThanOrEqual(back + a.table.IDLE_MS);

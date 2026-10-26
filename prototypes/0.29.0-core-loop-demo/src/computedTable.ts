@@ -179,7 +179,7 @@ import { isRouletteBet } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 import { getIdentityPub, signIdentity } from './keypair';
-import { heardThrough } from './roomHearing';
+import { heardThrough, noteClockRead } from './roomHearing';
 
 // ── ⏱ Timing ─────────────────────────────────────────────────────────────────
 
@@ -1383,6 +1383,9 @@ export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now =
  */
 export function tickComputedTables(tableIds: Iterable<string>, now = Date.now()): void {
   lookAtClock(now);
+  // (The hearing's read too: a clock gone back is a deaf spell, seen though
+  // no duty asks before the clock comes round again.)
+  noteClockRead(now);
   const inRoom = new Set<string>();
   for (const t of tableIds) {
     inRoom.add(t);
