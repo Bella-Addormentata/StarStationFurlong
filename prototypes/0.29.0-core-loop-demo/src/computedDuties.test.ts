@@ -16,7 +16,7 @@ import * as Y from 'yjs';
 import { asClose, asForfeit, asSlip, seedTable, slipCommit } from './computedFold';
 import type { CloseRec, ForfeitRec, SlipRec } from './computedFold';
 import {
-  byRank, deleteIn, deliver, frame, keysIn, loadPage, openRoom, PAGE_CTX as CTX, PAGE_TABLE as TABLE, putIn, run, signAs,
+  byRank, clockOf, deleteIn, deliver, frame, keysIn, loadPage, openRoom, PAGE_CTX as CTX, PAGE_TABLE as TABLE, putIn, run, signAs,
   sync, trimByHand, updatesOf,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
@@ -208,6 +208,106 @@ describe('the close', () => {
     expect(foldOf(a).felts.get(E.pid)!.rec.b).toEqual([]);
     const at = run([a], T0 + STEP, T0 + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
     expect(at).toBe(T0 + 18_000);
+  });
+
+  it('gives its turn away with a felt put back at the deadline: the page that never heard it closes, alone, and nothing it showed is rewritten', async () => {
+    // (computedSim's sweeps found it: a page first in turn takes its felt
+    // down, then puts one back at the deadline, after its turn, and closes at
+    // once; the next, which hasn't heard the felt come back, closes as first
+    // among the felts it sees. Two closes of the round, each decided as its
+    // seeds come: the lone one first, shown, then rewritten by the other.)
+    const pages = await room(['A', 'B']);
+    const [first, next] = byRank(pages, 'close', 1);
+    expect(first.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    expect(next.table.writeComputedSlip(TABLE, [red(20)], T0)).toBe('ok');
+    run(pages, T0 + STEP, T0 + 16_000, { step: STEP });
+    vi.setSystemTime(T0 + 16_200);
+    expect(first.table.writeComputedSlip(TABLE, [], T0 + 16_200)).toBe('ok');
+    run(pages, T0 + 16_400, T0 + 17_800, { step: STEP });
+    const deadline = phaseOf(first, T0 + 17_800)!.phaseDeadline!;
+    expect(deadline).toBe(T0 + first.table.BET_WINDOW_MS);
+    // At the deadline the first puts a felt down again and runs its frame;
+    // the next, which hasn't heard it, runs its own.
+    vi.setSystemTime(deadline);
+    expect(first.table.writeComputedSlip(TABLE, [red(10)], deadline)).toBe('ok');
+    frame(deadline, first);
+    frame(deadline, next);
+    expect(keysIn(first, 'c', 1)).toEqual([]);
+    expect(closesOf(next, 1).map((c) => signer(pages, c.k))).toEqual([next.name]);
+    frame(deadline + STEP, next);
+    const shown = phaseOf(next, deadline + STEP)!.spinKey;
+    expect(shown).toBe(`1:${foldOf(next).rounds[0].pocket}`);
+    run(pages, deadline + 2 * STEP, deadline + 12_000, { step: STEP });
+    for (const p of pages) {
+      expect(closesOf(p, 1).map((c) => signer(pages, c.k))).toEqual([next.name]);
+      expect(phaseOf(p, deadline + 12_000)!.spinKey).toBe(shown);
+      // The felt put back missed the close: it holds nothing.
+      expect(foldOf(p).rounds[0].present).toEqual([next.pid]);
+      expect(p.casino.readChips(first.pid)).toBe(1_000);
+    }
+  });
+
+  it('closes a felt put back after its turn itself when no other close comes: after every other turn', async () => {
+    const pages = await room(['A', 'B']);
+    const [first, next] = byRank(pages, 'close', 1);
+    expect(first.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    expect(next.table.writeComputedSlip(TABLE, [red(20)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    vi.setSystemTime(T0 + 16_200);
+    expect(first.table.writeComputedSlip(TABLE, [], T0 + 16_200)).toBe('ok');
+    const deadline = T0 + first.table.BET_WINDOW_MS;
+    run([first], T0 + 16_400, deadline - STEP, { step: STEP });
+    vi.setSystemTime(deadline);
+    expect(first.table.writeComputedSlip(TABLE, [red(10)], deadline)).toBe('ok');
+    // The other page is gone: two felts with chips, so two turns go by.
+    const at = run([first], deadline, deadline + 10_000, { step: STEP, until: () => keysIn(first, 'c', 1).length > 0 });
+    expectAt(at, deadline + 2 * first.table.STAGGER_MS);
+    expect(Object.keys(closesOf(first, 1)[0].f).sort()).toEqual([first.pid, next.pid].sort());
+  });
+
+  it("leaves a felt its player's other tab wrote to that tab: one close, of the felt as that tab has it", async () => {
+    // (computedSim's overspend scenario found it: two tabs of one player,
+    // one key, so one turn; the tab that never wrote the felt closed it at
+    // the deadline from a stale view, the other with the felt as it is, and
+    // the tie went to the hash, half the time to a felt the player had
+    // taken down.)
+    const [p] = await room(['P']);
+    const q = await loadPage('Q', 9, { reloadOf: p });
+    sync(T0, p, q);
+    expect(q.pid).toBe(p.pid);
+    expect(q.pub).toBe(p.pub);
+    expect(p.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    run([p, q], T0, T0 + 14_800, { step: STEP });
+    // The writing tab changes the felt; the other, its link slow, hears it
+    // only 3 s on.
+    vi.setSystemTime(T0 + 15_000);
+    expect(p.table.writeComputedSlip(TABLE, [red(10), black(30)], T0 + 15_000)).toBe('ok');
+    const latest = foldOf(p).felts.get(p.pid)!.hash;
+    const deadline = T0 + p.table.BET_WINDOW_MS;
+    for (let T = T0 + 15_000; T <= deadline + 3_000; T += STEP) {
+      frame(T, p);
+      frame(T, q);
+    }
+    expect(closesOf(p, 1).map((c) => c.f[p.pid])).toEqual([latest]);
+    expect(keysIn(q, 'c', 1)).toEqual([]);
+    sync(deadline + 3_000, p, q);
+    run([p, q], deadline + 3_200, deadline + 20_000, { step: STEP });
+    for (const t of [p, q]) {
+      expect(keysIn(t, 'c', 1)).toHaveLength(1);
+      const D = foldOf(t).rounds[0];
+      expect(D.decided).toBe('reveals');
+      expect(D.stakes.get(p.pid)).toBe(40n);
+    }
+  });
+
+  it("closes a felt its player's other tab wrote itself when that tab's close never comes: after every turn and GRACE_MAX_MS more", async () => {
+    const [p] = await room(['P']);
+    const q = await loadPage('Q', 9, { reloadOf: p });
+    expect(p.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    sync(T0, p, q);
+    // The writing tab is gone.
+    const at = run([q], T0 + STEP, T0 + 60_000, { step: STEP, until: () => keysIn(q, 'c', 1).length > 0 });
+    expectAt(at, T0 + q.table.BET_WINDOW_MS + q.table.STAGGER_MS + q.table.GRACE_MAX_MS);
   });
 
   it('stands down for a close that came in first: one close only', async () => {
@@ -806,6 +906,83 @@ describe('answering a forfeit', () => {
     const { better, worse } = await forfeitBy('worse', (b, w) => [b.pid, w.pid]);
     expect(forfeitsOf(better, 1).map((f) => f.k)).toEqual([worse.pub]);
   });
+
+  it('not from a page whose doc slept through the close: what the catch-up after its wake brings came all at once', async () => {
+    // (computedSim's clock-steps scenario found it: a round every page showed
+    // decided by forfeit, rewritten by the answer of a page back from a sleep
+    // offline, counting its own seed that came 7 s after the close.)
+    const pages = await room(['A', 'B', 'C']);
+    const [away, second, third] = byRank(pages, 'forfeit', 1);
+    for (const [i, p] of pages.entries()) expect(p.table.writeComputedSlip(TABLE, [red(10 + i)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    frame(T0, away);
+    // The best-ranked forfeiter's page sleeps from here, its doc offline too.
+    // The others close and reveal; then, its grace over, the next forfeits
+    // its seed.
+    const live = [second, third];
+    let backlog: Uint8Array | null = null;
+    const decidedAt = run(live, T0 + STEP, T0 + 70_000, {
+      step: STEP,
+      until: () => {
+        const tip = foldOf(second).tip;
+        if (!backlog && tip && tip.revealed.length === 2) backlog = Y.encodeStateAsUpdate(second.doc);
+        return foldOf(second).rounds[0]?.decided === 'forfeit';
+      },
+    });
+    expect(foldOf(second).rounds[0].counted).toEqual([second.pid, third.pid].sort());
+    // It wakes; the catch-up brings the close and the seeds, then the
+    // forfeit: it reveals, its seed late.
+    const W = decidedAt + STEP;
+    frame(W, away);
+    expect(away.croupier.tablesWakeCount()).toBe(1);
+    vi.setSystemTime(W + STEP + away.skew);
+    Y.applyUpdate(away.doc, backlog!);
+    frame(W + STEP, away);
+    expect(keysIn(away, 'x', 1).filter((k) => k.includes(away.pid))).toHaveLength(1);
+    sync(W + 2 * STEP, ...pages);
+    expect(stampOf(away, closeKeyOn(away))).toBeLessThan(stampOf(away, keysIn(away, 'f', 1)[0]));
+    run(pages, W + 3 * STEP, W + 20_000, { step: STEP });
+    // No answer: the round stands as every page showed it.
+    expect(forfeitsOf(away, 1).map((f) => signer(pages, f.k))).toEqual([second.name]);
+    for (const p of pages) expect(foldOf(p).rounds[0].counted).toEqual([second.pid, third.pid].sort());
+  });
+
+  it('not from a page whose clock went back by more than a lapse as the close came, its view read before its frame ran its tables', async () => {
+    // (computedSim's clock-steps, its clock events aimed at closes, found it:
+    // one step back seen twice in a frame — by the view's read, then as the
+    // wake it counts once the frame runs its tables — took stamps from before
+    // the step for ones the page watched come in. It answered a forfeit with
+    // a seed that came 8 s after the close, and rewrote a round every page
+    // had shown.)
+    const X = testIdentity('x', 'player-X'); // its seed comes late
+    const { pages, closedAt } = await closed(['A', 'B'], [X]);
+    const [better, worse] = byRank(pages, 'forfeit', 1);
+    // The better page's clock goes back 7.5 s; the felt's read comes first.
+    better.skew -= 7_500;
+    const T = closedAt + STEP;
+    better.table.readComputedRoulette(TABLE, clockOf(better, T));
+    frame(T, better);
+    expect(better.croupier.tablesWakeCount()).toBe(1);
+    frame(T, worse);
+    sync(T, ...pages);
+    expect(foldOf(better).tip!.revealed).toEqual([better.pid, worse.pid].sort());
+    // It waits out the lapse, then the forfeit duty asks when it saw the close.
+    for (let t = T + STEP; t < closedAt + 7_000; t += STEP) {
+      sync(t, ...pages);
+      frame(t, better);
+    }
+    // The worse page's forfeit (X's seed hadn't come), then X's seed, 8 s
+    // after the close: late for every page that watched the close come in.
+    const f = signAs(worse, 'forfeit', { r: 1, x: foldOf(worse).tip!.close, n: [better.pid, worse.pid].sort() });
+    vi.setSystemTime(closedAt + 7_000 + worse.skew);
+    putIn(worse, [[worse.fold.forfeitKey(f)!, f]]);
+    sync(closedAt + 7_000, ...pages);
+    for (const p of pages) revealFake(p, X, closedAt + 8_000);
+    run(pages, closedAt + 8_200, closedAt + 30_000, { step: STEP });
+    // No answer: the round stands as every page showed it.
+    expect(forfeitsOf(better, 1).map((r) => signer(pages, r.k))).toEqual([worse.name]);
+    for (const p of pages) expect(foldOf(p).rounds[0].counted).toEqual([better.pid, worse.pid].sort());
+  });
 });
 
 describe('the abandon', () => {
@@ -866,6 +1043,37 @@ describe('the abandon', () => {
         expect(q.casino.readChips(b.pid)).toBe(1_000);
         expect(phaseOf(q, at)).toMatchObject({ phase: 'settled', round: 1, voided: true, result: null, payouts: {} });
       }
+    }
+  });
+
+  it('stands as all its bettors come back from a sleep through it at once: the seed that would make the set whole stays in', async () => {
+    // (computedSim's abandoned scenario found it: every bettor a close froze
+    // gone before its reveal, the round voided 30 s on, and each, back, put
+    // its seed out for it: every seed in, the reveals beat the void every
+    // page had shown, and the round paid out a minute late.)
+    const pages = await room(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
+    c.casino.writeMySeat(TABLE, c.pid, { stand: 2, angle: 1, at: 1 });
+    sync(T0, ...pages);
+    // The bettors close and sleep before their next tick, their docs too.
+    const closedAt = run([a, b], T0 + STEP, T0 + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    sync(closedAt, ...pages);
+    const at = run([c], closedAt + STEP, closedAt + 60_000, { step: STEP, until: () => keysIn(c, 'z', 1).length > 0 });
+    sync(at, ...pages);
+    for (const p of pages) expect(foldOf(p).rounds[0].decided).toBe('void');
+    // Back together (a wake: a lapse since their last frame), each holding
+    // its seed: the first in turn puts its seed out; the other, seeing it,
+    // holds its own.
+    for (const p of [a, b]) expect(p.fair.seedFor(slipsOf(p, 1, p.pid)[0].c, { room: CTX.room, table: seedTable(CTX), round: 1, party: p.pid, house: '' })).not.toBeNull();
+    const [first] = byRank([a, b], 'forfeit', 1);
+    run(pages, at + STEP, at + 20_000, { step: STEP });
+    for (const p of pages) {
+      expect(keysIn(p, 'x', 1).map((k) => k.split(':')[2])).toEqual([first.pid]);
+      expect(foldOf(p).rounds[0].decided).toBe('void');
+      expect(p.casino.readChips(a.pid)).toBe(1_000);
+      expect(p.casino.readChips(b.pid)).toBe(1_000);
     }
   });
 

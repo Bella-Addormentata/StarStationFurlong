@@ -136,7 +136,8 @@ import type {
   SlipRec,
 } from './computedFold';
 import {
-  BET_WINDOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS, TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount,
+  BET_WINDOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS, TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake,
+  tablesWakeCount,
 } from './croupier';
 import { forgetSeed, keepSeed, keyFor, REVEAL_GRACE_MS, seedFor } from './fairTableSeeds';
 import type { TableSeedContext } from './games/diceFairness';
@@ -369,8 +370,10 @@ interface TableState {
  *  generation every cached view and scan carries (bumped on a wake). And
  *  from when casinoDoc's arrival stamps are arrivals this page watched: the
  *  first look with the room's state in on this binding (null before; what
- *  the doc held by then came all at once), and the last wake or clock gone
- *  back (the latest time stamped before it). */
+ *  the doc held by then came all at once), and the end of the lapse the
+ *  page waits out after its last wake or clock gone back (croupier
+ *  tablesAwake: its doc catching up; what came by then came all at once,
+ *  and stamps up to the latest time read before it were taken before it). */
 const clock = {
   epoch: -1, wakes: 0, last: null as number | null, wakeAt: 0, gen: 0, inAt: null as number | null, realFrom: 0,
 };
@@ -399,8 +402,16 @@ function lookAtClock(now: number): void {
   }
   if (wakes !== clock.wakes || (clock.last !== null && clock.last - now >= TABLE_CLOCK_SLACK_MS)) {
     clock.wakeAt = now;
-    // (Gone back: stamps up to the last time read were taken before it.)
-    clock.realFrom = Math.max(now, clock.last ?? now);
+    // (Gone back: stamps up to the last time read were taken before it. And
+    // a doc that slept too hears what the room wrote meanwhile only now, as
+    // it catches up: stamped after the wake, a close and its seeds minutes
+    // old read as just in. What comes while the page waits out the lapse
+    // came all at once. Never earlier than it was: one step back can come
+    // here twice — a read sees the clock gone back, then the frame's run of
+    // its tables counts the wake — and the second look, its last time read
+    // already the step's, would take stamps from before the step for ones
+    // this page watched come in.)
+    clock.realFrom = Math.max(clock.realFrom, now + TABLE_LEASE_LAPSE_MS, clock.last ?? now);
     clock.gen += 1;
     for (const st of tables.values()) {
       st.seen.clear();
@@ -423,13 +434,14 @@ function lookAtClock(now: number): void {
 }
 
 /** Whether this page watched round's close come in: casinoDoc stamped it
- *  after the room's state was in on this binding, and after this page last
- *  woke or saw its clock go back. Only then are its first-seen times of the
- *  round's seeds the times they came. A page that slept through the close,
- *  or loaded after it, reads every record it found as seen at once, a seed
- *  that came minutes late as in time: from it, a forfeit counting that seed
- *  would rewrite a round every page has shown (and its own seed's lateness
- *  would choose, the result known, whether it counts). */
+ *  after the room's state was in on this binding, and after the lapse this
+ *  page waited out when it last woke or saw its clock go back (its doc
+ *  catching up). Only then are its first-seen times of the round's seeds the
+ *  times they came. A page that slept through the close (its doc too, or
+ *  not), or loaded after it, reads every record it found as seen at once, a
+ *  seed that came minutes late as in time: from it, a forfeit counting that
+ *  seed would rewrite a round every page has shown (and its own seed's
+ *  lateness would choose, the result known, whether it counts). */
 function watchedClose(st: TableState, round: RoundView): boolean {
   const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`);
   return raw !== undefined && clock.inAt !== null && raw > Math.max(clock.realFrom, clock.inAt);
@@ -1355,7 +1367,7 @@ function tickTable(st: TableState, now: number): void {
   if (!roomStateIn(now)) return;
   const me = getPlayerId();
   const pub = getIdentityPub();
-  revealDuty(st, me);
+  revealDuty(st, me, pub, now);
   noteMissing(st, now);
   if (!casinoWhole(st.t) || !tablesAwake(now) || !computedSettled(st.t)) return;
   // (First: what a round rests on is kept before any duty reads it lost.)
@@ -1392,14 +1404,17 @@ function tellPhase(st: TableState, now: number): void {
  *  can't be counted without it, and a page that holds it back forfeits. The
  *  commitment is burned from then on. Runs on a partial doc too (the record
  *  is looked for in the session itself, so a stale count writes it once),
- *  and again whenever the session lacks it, deleted or written over. */
-function revealDuty(st: TableState, me: string): void {
+ *  and again whenever the session lacks it, deleted or written over. For a
+ *  round an abandon voided whose close this page didn't watch come in, not
+ *  while the void holds it (voidHolds). */
+function revealDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
   const ses = computedSessionForWrite(st.t);
   if (!res || !ses) return;
   const sc = scanOf(st, res);
   for (const round of res.rounds) {
     if (!round.present.includes(me)) continue;
+    if (round.decided === 'void' && !watchedClose(st, round) && voidHolds(st, sc, round, me, pub, now)) continue;
     const slip = frozenSlip(sc, round, me);
     const seed = slip && seedFor(slip.c, seedCtx(st, round.r, me));
     if (!slip || !seed) continue;
@@ -1412,6 +1427,26 @@ function revealDuty(st: TableState, me: string): void {
     if (!key || holds(ses, key, { rec, bytes: canon(rec)! })) continue;
     put(st, key, rec, round.r, false);
   }
+}
+
+/**
+ * Whether the void of `round` holds this page's seed back, the round's close
+ * one this page didn't watch come in (watchedClose: back from a sleep or a
+ * load, as no forfeit of its own goes for it: forfeitDuty). Its seed comes
+ * minutes late, and with every other frozen bettor's in (each gone before
+ * its reveal, all back now), the reveals would beat the void every page has
+ * shown, and the round would pay out long after its stakes went back. So
+ * not the seed that would make the set whole; and each in its turn among
+ * the frozen bettors' pubs (dutyRank 'forfeit', STAGGER_MS each) from when
+ * this page saw the void, so that bettors back at once see each other's
+ * seeds before theirs goes. A seed that leaves the set short still goes:
+ * the round stays void without it, and voided at once by a griefer's
+ * abandon, a forfeit from a page that watched the close may count it.
+ */
+function voidHolds(st: TableState, sc: Scan, round: RoundView, me: string, pub: string, now: number): boolean {
+  if (round.missing.length === 0 && round.present.every((pid) => pid === me || round.revealed.includes(pid))) return true;
+  const from = seen(st, `z:${round.r}:${round.abandon!.hash}`, now);
+  return now < from + placeOf('forfeit', st.ctx, round.r, frozenPubs(sc, round), pub) * STAGGER_MS;
 }
 
 /** Whether table st reads betting on its open round now (the view: a show
@@ -1500,7 +1535,8 @@ function noteSeedOut(st: TableState, now: number): void {
  * rule, and chips may move once: the split a delete makes, as a cut-off
  * room's. Freezes each player's latest felt with chips on it, but no burned
  * commitment, at most MAX_FROZEN, its own always, the rest earliest seen
- * first.
+ * first. Its turn moves back for a felt of its own that changed late, or
+ * that its player's other tab wrote (closeDue).
  */
 function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -1513,8 +1549,9 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const sc = scanOf(st, res);
   if (signedIn<CloseRec>(st, sc, 'close', asClose, sc.closes, o, pub, (c) => c.q === res.parent)) return;
   const staked = [...res.felts.values()].filter((s) => s.rec.b.length > 0);
-  const idx = placeOf('close', st.ctx, o, staked.map((s) => s.rec.k), pub);
-  if (now < e.view.phaseDeadline + idx * STAGGER_MS) return;
+  const pubs = staked.map((s) => s.rec.k);
+  const idx = placeOf('close', st.ctx, o, pubs, pub);
+  if (now < closeDue(st, own, e.view.phaseDeadline, idx, new Set(pubs).size, now)) return;
   // (Seen just now, as this tick noted it: noteSeedOut.)
   if (seedOut(st, sc, o) && now < (st.seedOutAt?.at ?? now) + ABANDON_MS + idx * STAGGER_MS) return;
   const others = staked
@@ -1526,6 +1563,36 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const rec = signed(st.ctx, 'close', { r: o, q: res.parent, f, k: pub });
   const key = closeKey(rec);
   if (key) put(st, key, rec, o, true);
+}
+
+/**
+ * When this page's close of the open round falls due: in its turn among the
+ * felts with chips on (`idx` of `n` pubs), STAGGER_MS apart from the
+ * window's deadline — unless the felt it would freeze for its player (`own`)
+ * came late, or isn't its own. Every page ranks the felts it sees, so a peer
+ * that hadn't heard a felt come (or change) by its own turn reads the table
+ * without it, and may be first in that view; two closes of one round then
+ * freeze two felts, each decided as its seeds come in, and the one shown
+ * first is rewritten when the other, better ranked, decides too. So:
+ * - a felt this page saw last change STAGGER_MS or less before its turn, or
+ *   after it (taken down and put back at the deadline: the view reads
+ *   betting until a close comes), gives its turn away: after every other
+ *   page's turn, and STAGGER_MS past the change at least. A close a peer
+ *   wrote meanwhile from the felts as they were reaches this page first, and
+ *   it stands down; the felt missed the close, and holds nothing.
+ * - a felt this page didn't write (its player's other tab did: one key, so
+ *   one turn, and each tab freezes the felt as it last heard it) is that
+ *   tab's to close, from the newest view of it: this page closes only once
+ *   GRACE_MAX_MS more have passed with no close in (that tab gone, or a link
+ *   slower than any grace waits for).
+ */
+function closeDue(st: TableState, own: { key: string }, deadline: number, idx: number, n: number, now: number): number {
+  const turn = deadline + idx * STAGGER_MS;
+  const changed = seen(st, own.key, now);
+  const mine = st.mine.has(own.key);
+  if (mine && changed <= turn - STAGGER_MS) return turn;
+  const after = Math.max(deadline + (n + idx) * STAGGER_MS, changed + STAGGER_MS);
+  return mine ? after : after + GRACE_MAX_MS;
 }
 
 /** This page's forfeit of `round`'s close, written now: n the bettors whose
@@ -1618,7 +1685,10 @@ function answerDuty(st: TableState, me: string, pub: string, now: number): void 
  * undecided only because a peer deleted what it rests on, or a tip whose
  * frozen slip went): the copy goes back in a few seconds, and voided
  * meanwhile, the result shown would read void and back, and the abandon
- * would stay in the session to void the round at the next delete.
+ * would stay in the session to void the round at the next delete. Nor, on
+ * a page that keeps no copy of it (it only watched the round), while the
+ * chain falls short of a round it saw decided (noteChain), MISSING_WAIT_MS
+ * at most, as the trim waits: the round's witnesses put it back meanwhile.
  */
 function abandonDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -1630,6 +1700,7 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
   for (const m of st.mine.values()) if (m.r > res.base.u) wrote = true;
   if (!wrote && readSeat(st.t, me) === null) return;
   if (heldBack(st, res, tip.close, now)) return;
+  if (st.shortAt !== null && now - st.shortAt < MISSING_WAIT_MS) return;
   const sc = scanOf(st, res);
   if (signedIn<AbandonRec>(st, sc, 'abandon', asAbandon, sc.abandons, tip.r, pub, (z) => z.x === tip.close)) return;
   const pubs = new Set(checkedSlipPubs(st, sc));

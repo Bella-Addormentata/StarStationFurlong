@@ -41,11 +41,14 @@ export const PAGE_INC = 'c' + '5a'.repeat(12);
 export const PAGE_CTX: FoldCtx = { room: PAGE_ROOM, t: PAGE_TABLE, inc: PAGE_INC };
 
 /** A page for player `pid` (Yjs client `clientID`), its key shown in the
- *  room's players map as main.ts shows it. Its checks never run out of time. */
+ *  room's players map as main.ts shows it. Its checks never run out of time
+ *  unless `verify` gives them a clock and a budget (casinoDoc
+ *  setComputedVerifyForTests); `resync` is what its doc calls to ask the room
+ *  for what it is missing (bindCasinoDoc's, YjsSync's resync in the app). */
 export async function loadPage(
   name: string,
   clientID: number,
-  opts: { skew?: number; pid?: string; reloadOf?: Page } = {},
+  opts: { skew?: number; pid?: string; reloadOf?: Page; resync?: () => void; verify?: { now: () => number; budgetMs: number } } = {},
 ): Promise<Page> {
   const pid = opts.reloadOf?.pid ?? opts.pid ?? `player-${name}`;
   vi.resetModules();
@@ -66,8 +69,8 @@ export async function loadPage(
   const keypair = await import('./keypair');
   const doc = new Y.Doc();
   doc.clientID = clientID;
-  casino.setComputedVerifyForTests({ now: () => 0 });
-  casino.bindCasinoDoc(doc, PAGE_ROOM);
+  casino.setComputedVerifyForTests(opts.verify ?? { now: () => 0 });
+  casino.bindCasinoDoc(doc, PAGE_ROOM, opts.resync);
   const pub = keypair.getIdentityPub();
   doc.transact(() => doc.getMap('players').set(pid, { keyB64: pub, name: pid }));
   return { name, pid, pub, skew: opts.skew ?? 0, doc, casino, croupier, table, fair, fold, keypair };

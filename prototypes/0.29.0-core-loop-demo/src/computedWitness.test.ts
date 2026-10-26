@@ -1013,6 +1013,47 @@ describe('a round a delete took off the chain, seen played', () => {
     }
   });
 
+  it('is voided by no page that only watched it while a seed it rests on is gone, its abandon long due: its witnesses put the seed back', async () => {
+    // (computedSim's cheats scenario found it: a page that didn't play a
+    // round voided it at once when a peer deleted one of its seeds, ABANDON_MS
+    // past its close; it read void and back on every page, and the abandon
+    // stayed in the session to void it again at the next delete.)
+    const pages = await room(['A', 'B', 'W']);
+    const [a, b, w] = pages;
+    for (const [i, p] of pages.entries()) expect(p.table.writeComputedSlip(TABLE, [red(10 + i)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const open2 = run(pages, T0 + STEP, T0 + 60_000, {
+      step: STEP, until: () => pages.every((p) => foldOf(p).open === 2 && phaseOf(p)?.phase === 'betting'),
+    });
+    expect(a.table.writeComputedSlip(TABLE, [black(20)], open2)).toBe('ok');
+    expect(b.table.writeComputedSlip(TABLE, [black(21)], open2)).toBe('ok');
+    sync(open2, ...pages);
+    const at = settle(pages, open2 + STEP);
+    const r2 = foldOf(w).rounds[1];
+    expect(r2.decided).toBe('reveals');
+    const pids = pages.map((p) => p.pid);
+    const chips = chipsOf(w, pids);
+    // ABANDON_MS on (before any idle trim) a griefer deletes A's seed of
+    // round 2, A and B away for 5 s: to W the round reads undecided again.
+    const T = at + w.table.ABANDON_MS;
+    run(pages, at + STEP, T - STEP, { step: STEP });
+    expect(foldOf(w).base.u).toBe(0);
+    const key = revealOf(w, 2, a.pid);
+    vi.setSystemTime(T);
+    deleteIn(w, [key]);
+    sync(T, ...pages);
+    expect(foldOf(w).tip?.r).toBe(2);
+    run([w], T + STEP, T + 5_000, { step: STEP });
+    expect(keysIn(w, 'z', 2)).toEqual([]);
+    // Back, A puts its seed back: round 2 as every page showed it.
+    run(pages, T + 5_000 + STEP, T + 15_000, { step: STEP });
+    for (const p of pages) {
+      expect(keysIn(p, 'z', 2)).toEqual([]);
+      expect(foldOf(p).rounds[1]).toMatchObject({ close: r2.close, decided: 'reveals', pocket: r2.pocket });
+      expect(chipsOf(p, pids)).toEqual(chips);
+    }
+  });
+
   it("a wake starts a watcher's wait again", async () => {
     const { w, live, T } = await cut();
     run(live, T + STEP, T + STEP, { step: STEP });

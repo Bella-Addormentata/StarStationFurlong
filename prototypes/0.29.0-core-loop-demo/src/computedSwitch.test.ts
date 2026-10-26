@@ -453,7 +453,11 @@ describe('Fair seeds at a computed table', () => {
     later(craps.CRAPS_SHOW_MS + 1_000);
     craps.tickAutoStickman(C);
     expect(a.casino.readCrapsTableState(C)).toMatchObject({ round: 2, houseCommit: expect.any(String) });
-  });
+    // (Its own timeout: the craps modules load inside the spec, a fresh copy
+    // for this page — 2.6 s on a quiet machine, near the default 5 s on a
+    // busy one, the rest of the suite running beside it. It waits on no
+    // clock but the faked one.)
+  }, 30_000);
 });
 
 // ── 🕰 An earlier build on a computed table ─────────────────────────────────
