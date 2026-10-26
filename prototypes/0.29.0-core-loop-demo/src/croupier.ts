@@ -31,7 +31,8 @@
  *
  * 🧮 COMPUTED TABLES (computedTable.ts) have no operator: the robot opens no
  * round there and posts no heartbeat. It only sweeps away an owner-run round
- * an earlier build's lease holder opened on one (sweepLegacyRound), and the
+ * an earlier build's lease holder opened on one (sweepLegacyRound), and drops
+ * a switch nothing stands behind, a peer's forgery (dropBareSwitch); and the
  * lease says which build drives (`build`), so the house can't switch a table
  * to computed while an earlier build runs the room's tables.
  */
@@ -40,6 +41,8 @@ import {
   casinoDocEpoch,
   casinoWhole,
   clearTableKeys,
+  computedIncOf,
+  computedSwitchBare,
   computedSwitchLost,
   creditTableOutcome,
   feltStake,
@@ -59,6 +62,7 @@ import {
   tableOpening,
   tableWritable,
   transactCasino,
+  writeComputedOff,
   writeCroupierBeat,
   writeSettledState,
   writeTableOperatorLease,
@@ -600,6 +604,47 @@ function sweepLegacyRound(tableId: string, now: number): void {
   transactCasino(() => refundAndClear(tableId, 'local', { keepComputed: true }));
 }
 
+/** When this page first saw each table's switch bare (its epoch, the
+ *  incarnation named, since this page last woke), by this page's clock. */
+const bareSeen = new Map<string, { epoch: number; wake: number; inc: string; at: number }>();
+
+/**
+ * 🧮 A switch nothing stands behind (casinoDoc computedSwitchBare: it names
+ * an incarnation the doc holds no session and no checkpoint of) is a peer's
+ * forgery: no build writes one so. Yet every page of this build reads the
+ * table as computed: the robot runs no round there (an owner-run one under
+ * way is swept a lapse on), and no felt can go down, there being no session
+ * to write into. Once this build holds the lease and has watched the switch
+ * stay bare for a lapse, on a whole doc (the caller), it drops it as the
+ * house's switch-off drops a forged one (writeComputedOff: its incarnation
+ * marked ended, so a session of it turning up later is compacted, its nets
+ * counted, nothing held), and the table is owner-run again: the round under
+ * way goes on, as before the forgery. Before the sweep, whose lapse is the
+ * same: the round under way is this build's own, not an earlier build's.
+ * True when it dropped it (the caller's tick is over).
+ */
+function dropBareSwitch(tableId: string, now: number): boolean {
+  const inc = computedSwitchBare(tableId) ? computedIncOf(tableId) : null;
+  if (inc === null) {
+    bareSeen.delete(tableId);
+    return false;
+  }
+  const epoch = casinoDocEpoch();
+  const wake = tablesWakeCount();
+  let seen = bareSeen.get(tableId);
+  // (A wake, or a clock gone back, starts the watch again.)
+  if (!seen || seen.epoch !== epoch || seen.wake !== wake || seen.inc !== inc || seen.at > now) {
+    bareSeen.set(tableId, seen = { epoch, wake, inc, at: now });
+  }
+  if (now - seen.at < TABLE_LEASE_LAPSE_MS) return false;
+  bareSeen.delete(tableId);
+  // (The sweep's watch of the round under way, started as the forgery came,
+  // goes too: a forgery again in the same round is watched afresh.)
+  legacySeen.delete(tableId);
+  transactCasino(() => writeComputedOff(tableId));
+  return true;
+}
+
 /**
  * One operator tick for one table. Idempotent per frame — only writes on a real
  * transition. The window ARMS on the first bet (so an empty table stays quiet),
@@ -614,9 +659,10 @@ export function tickAutoCroupier(tableId: string): void {
   const now = Date.now();
   // 🧮 A computed table runs itself: the robot only clears away an owner-run
   // round an earlier build opened there (sweepLegacyRound). So too while its
-  // switch is lost, until the room puts it back (or compaction ends it).
+  // switch is lost, until the room puts it back (or compaction ends it). A
+  // switch nothing stands behind it drops (dropBareSwitch).
   if (isComputedTable(tableId) || computedSwitchLost(tableId)) {
-    sweepLegacyRound(tableId, now);
+    if (!dropBareSwitch(tableId, now)) sweepLegacyRound(tableId, now);
     return;
   }
   // A state that doesn't go on from the table's book: the book's goes back

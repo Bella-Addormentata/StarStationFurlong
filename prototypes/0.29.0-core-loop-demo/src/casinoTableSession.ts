@@ -1798,9 +1798,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return out;
   };
 
-  /** 🔀 The house's switch row (computedSwitchState: the house, with the dev
-   *  flag, at a roulette table), owner-run or computed: the press, or why
-   *  it can't go now; a switch-on asks first. */
+  /** 🔀 The house's switch row (computedSwitchState: the house, at a
+   *  roulette table, with the dev flag, or without it on a computed one),
+   *  owner-run or computed: the press, or why it can't go now; a switch-on
+   *  asks first. */
   const switchRows = (house: boolean): string[] => {
     const sw = computedSwitchState(itemId, game, house);
     if (!sw.show) return [];
@@ -1872,7 +1873,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     } else {
       rows.push(`<div style="font-size:9.5px;color:${DIM};">THE HOUSE ${game === 'craps' ? 'THROWS' : 'SPINS'} WHEN THE BETS ARE DOWN</div>`);
     }
-    // 🔀 The house's switch to a computed table (the dev flag only).
+    // 🔀 The house's switch to a computed table (the dev flag only; the way
+    // back shows on a computed table without it).
     rows.push(...switchRows(house));
     pushHelp(rows);
   };

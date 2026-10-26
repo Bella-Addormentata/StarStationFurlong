@@ -464,6 +464,17 @@ describe("the spike's eight", () => {
         const v = ses.get(key);
         if (v === undefined || canon(v) !== e.bytes) {
           e.missing ??= sim.T;
+          // (A slip goes back once a close on its author's chain, or one
+          // open there, froze it: computedTable reputDuty. While its round
+          // is off that chain, a record before it gone too, and no open
+          // close names the round, a burned felt is let go of for the
+          // while, by design; its beat counts from when the chain is back.
+          // SIM_SEED=3000: D's round-2 slip taken at 149 s, B's round-1
+          // close at 149.25 s, D's beat at 150 s found no chain at all, and
+          // the slip went back at 151 s, once B had put its close back.)
+          if (key.startsWith('s:') && !res.rounds.some((round) => round.r === e.r) && !res.openCloses.some((c) => c.rec.r === e.r)) {
+            e.missing = sim.T;
+          }
           continue;
         }
         // (Never seen gone there: put back as the delete came, or the delete

@@ -835,36 +835,82 @@ describe('switch-off', () => {
     expect(incOf(a)).not.toBe(forged);
   });
 
-  it("the same on an owner-run table the robot drives: a minute on, the page awake, whole and settled, the house switches it back, and the robot opens round 1 on a fresh incarnation", async () => {
-    const [a] = await room(['A']);
+  it("the same on an owner-run table the robot drives, in a room where nobody has the dev flag: the robot drops it a lapse on, and the round under way goes on", async () => {
+    const pages = await room(['A', 'B', 'G']);
+    const [a, b, g] = pages;
+    for (const p of pages) p.table.setComputedTablesEnabledForTests(false);
     a.croupier.setSoleCroupierPredicate(() => true);
-    // World's frame on the house's page: it drives the room's tables.
+    // World's frame on every page; the house's drives the room's tables.
     const worldFrame = (T: number): void => {
+      sync(T, ...pages);
       const now = at(a, T);
       if (a.croupier.takeTableTurn(now)) a.croupier.tickAutoCroupier(TABLE);
-      a.table.tickComputedTables([TABLE], now);
+      for (const p of pages) p.table.tickComputedTables([TABLE], at(p, T));
+      sync(T, ...pages);
     };
     let T = T0;
     for (; T <= T0 + 2_000; T += STEP) worldFrame(T);
     const ownerInc = a.casino.readTableState(TABLE)!.inc!;
     expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'betting', round: 1 });
+    at(b, T);
+    expect(b.casino.writeMyBets(TABLE, b.pid, 1, [red(10)])).toBe(true);
+    sync(T, ...pages);
+    expect(chipsOf(a, b)).toEqual([990]);
     // A peer's one write: a well-formed switch, nothing behind it.
-    a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: 'c' + '77'.repeat(12) });
-    for (; T <= T0 + 62_000; T += STEP) worldFrame(T);
-    expect(a.croupier.tablesAwake(T)).toBe(true);
-    expect(a.casino.casinoWhole(TABLE)).toBe(true);
-    expect(a.casino.computedSettled()).toBe(true);
-    // The table dead meanwhile: no owner-run round, and no felt goes down.
-    expect(a.casino.readTableState(TABLE)).toBeNull();
-    expect(a.table.writeComputedSlip(TABLE, [red(1)], T)).toBe('reconnecting');
-    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T)).toEqual({ show: true, on: true, can: true });
-    expect(a.table.switchComputedOff(TABLE, T)).toBe('ok');
+    const forged = 'c' + '77'.repeat(12);
+    at(g, T);
+    g.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: forged });
+    sync(T, ...pages);
+    for (const p of pages) expect(p.casino.isComputedTable(TABLE)).toBe(true);
+    const forgedAt = T;
+    for (; T <= forgedAt + 60_000 && a.casino.isComputedTable(TABLE); T += STEP) worldFrame(T);
+    // Dropped a lapse on (the robot's watch starts on its first frame after).
+    expect(T - forgedAt).toBeLessThanOrEqual(LAPSE + 3 * STEP);
+    sync(T, ...pages);
+    for (const p of pages) {
+      expect(p.casino.isComputedTable(TABLE)).toBe(false);
+      expect(cfgOf(p)).toBeUndefined();
+      expect(p.casino.computedIncEnded(TABLE, forged)).toBe(true);
+      // The round under way is as it was: B's list on it, its chips held.
+      expect(p.casino.readTableState(TABLE)).toMatchObject({ round: 1, inc: ownerInc });
+      expect(chipsOf(p, b)).toEqual([990]);
+    }
+    // And it plays on: closed, spun and settled with B's list in it, then
+    // round 2 opened.
+    for (const end = T + 60_000; T <= end && a.casino.readTableState(TABLE)?.phase !== 'settled'; T += STEP) worldFrame(T);
+    const settled = a.casino.readTableState(TABLE)!;
+    expect(settled).toMatchObject({ phase: 'settled', round: 1, inc: ownerInc });
+    expect(settled.result).not.toBeNull();
+    expect(chipsOf(a, b)).toEqual([990 + (settled.payouts?.[b.pid] ?? 0)]);
+    for (const end = T + 60_000; T <= end && (a.casino.readTableState(TABLE)?.round ?? 0) < 2; T += STEP) worldFrame(T);
+    expect(a.casino.readTableState(TABLE)).toMatchObject({ phase: 'betting', round: 2, inc: ownerInc });
+  });
+
+  it("shows the house the way back on a computed table without the dev flag (never the way on); a forged switch goes at once", async () => {
+    const [a, b] = await room(['A', 'B']);
+    for (const p of [a, b]) p.table.setComputedTablesEnabledForTests(false);
+    at(a, T0);
+    // No flag: no row on an owner-run table.
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toEqual({ show: false, on: false, can: false });
+    // A peer's one write: the house, flag or not, has the way back.
+    const forged = 'c' + '12'.repeat(12);
+    b.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: forged });
+    sync(T0, a, b);
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toEqual({ show: true, on: true, can: true });
+    // (A player never.)
+    expect(b.table.computedSwitchState(TABLE, 'roulette', false, T0).show).toBe(false);
+    expect(a.table.switchComputedOff(TABLE, T0)).toBe('ok');
+    sync(T0, a, b);
+    for (const p of [a, b]) expect(p.casino.isComputedTable(TABLE)).toBe(false);
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toEqual({ show: false, on: false, can: false });
+    // A table a flagged page switched on: the way back on a flagless one too.
+    a.table.setComputedTablesEnabledForTests(true);
+    expect(a.table.switchComputedOn(TABLE, 'roulette', T0)).toBe('ok');
+    a.table.setComputedTablesEnabledForTests(false);
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toEqual({ show: true, on: true, can: true });
+    expect(a.table.switchComputedOff(TABLE, T0)).toBe('ok');
     expect(a.casino.isComputedTable(TABLE)).toBe(false);
-    for (const end = T + 5_000; T <= end && a.casino.readTableState(TABLE) === null; T += STEP) worldFrame(T);
-    const s = a.casino.readTableState(TABLE)!;
-    expect(s).toMatchObject({ phase: 'betting', round: 1 });
-    expect(s.inc).not.toBe(ownerInc);
-    expect(a.casino.tableIncRemoved(TABLE, s.inc!)).toBe(false);
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0).show).toBe(false);
   });
 
   it("'ok' for a table that isn't computed, nothing written; refused on a page not whole", async () => {
@@ -899,13 +945,17 @@ describe('the switch deleted by hand (no checkpoint, no mark)', () => {
   });
 
   /** A cheat who ranks after page p for round 1's forfeit at ctx: p's
-   *  answer outranks the cheat's forfeit (levers 2 and 7 out of play). */
-  function cheatAfter(p: Page, ctx: FoldCtx): TestIdentity {
+   *  answer outranks the cheat's forfeit (levers 2 and 7 out of play). Among
+   *  the first 64 test cheats, or null: the caller draws p again (its key
+   *  is fresh each run, and one ranked near the end would leave a walk with
+   *  no bound running far past the spec's timeout). */
+  function cheatAfter(p: Page, ctx: FoldCtx): TestIdentity | null {
     const mine = p.fold.dutyRank('forfeit', ctx, 1, p.pub);
-    for (let i = 0; ; i++) {
+    for (let i = 0; i < 64; i++) {
       const h = testIdentity(`cheat-${i}`, `player-Cheat${i}`);
       if (p.fold.dutyRank('forfeit', ctx, 1, h.pub) > mine) return h;
     }
+    return null;
   }
 
   /** Page A alone at the computed table, red 10 on its felt; a cheat ranked
@@ -913,14 +963,19 @@ describe('the switch deleted by hand (no checkpoint, no mark)', () => {
    *  and the cheat's close freezing both at T0 + 1 s (the switch deleted in
    *  the same transaction when `deleteSwitch`). */
   async function cheatsClose(deleteSwitch: boolean) {
-    const [a] = await room(['A']);
-    at(a, T0);
-    expect(a.table.switchComputedOn(TABLE, 'roulette', T0)).toBe('ok');
-    const inc = incOf(a);
-    const ctx = { room: ROOM, t: TABLE, inc };
+    let a: Page;
+    let ctx: FoldCtx;
+    let H: TestIdentity | null;
+    do {
+      [a] = await room(['A']);
+      at(a, T0);
+      expect(a.table.switchComputedOn(TABLE, 'roulette', T0)).toBe('ok');
+      ctx = { room: ROOM, t: TABLE, inc: incOf(a) };
+      H = cheatAfter(a, ctx);
+    } while (!H);
+    const { inc } = ctx;
     const kit = new ComputedKit(ctx);
     const ses = a.doc.getMap('casinoComputed').get(`ses:${TABLE}:${inc}:g`) as Y.Map<unknown>;
-    const H = cheatAfter(a, ctx);
     a.doc.transact(() => a.doc.getMap('players').set(H.pid, { keyB64: H.pub, name: H.pid }));
     a.casino.buyInChips(H.pid, 1_000);
     frame(T0, a);
@@ -1108,6 +1163,77 @@ describe('a computed table removed mid-session (closeTable)', () => {
       expect(chipsOf(p, a, b)).toEqual(won);
       expect(p.table.computedCompactionPending()).toBe(false);
     }
+  });
+
+  it("removed where no page of this build ran the removal (an earlier build's, which leaves the switch): ended a minute after a page finds it out of the room, its open felt let go, its nets counted, then compacted", async () => {
+    // (computedTable AWAY_MS.)
+    const AWAY_MS = 60_000;
+    const pages = await computedRoom();
+    const [a, b] = pages;
+    const decidedAt = playRoundOne(pages);
+    const won = chipsOf(a, a, b);
+    const openedAt = run(pages, decidedAt + STEP, decidedAt + 20_000, {
+      step: STEP, until: () => pages.every((p) => phaseOf(p)?.phase === 'betting'),
+    });
+    at(b, openedAt);
+    expect(b.table.writeComputedSlip(TABLE, [red(40)], openedAt)).toBe('ok');
+    sync(openedAt, ...pages);
+    expect(chipsOf(a, b)).toEqual([won[1] - 40]);
+    const cinc = incOf(a);
+    // Both pages leave, B's felt still down (its take-down never got out).
+    // An earlier build's house page then removes the table, as #297's
+    // clearTableKeys does: the table's keys go, and the incarnation it
+    // knows of (its own kind of name) is marked. The switch it knows
+    // nothing of stays.
+    at(a, openedAt + 500);
+    a.doc.transact(() => {
+      const m = a.doc.getMap('casino');
+      m.set(`gone:${TABLE}:${a.casino.tableIncFor(TABLE)}`, 1);
+      m.set(`gone:${TABLE}:`, 1);
+      for (const k of [...m.keys()]) {
+        if ([`table:${TABLE}`, `croupier:${TABLE}`, `cfg:backend:${TABLE}`, `cfg:fairness:${TABLE}`, `throw:${TABLE}`].includes(k)
+          || ['bets', 'seat', 'fseed'].some((x) => k.startsWith(`${x}:${TABLE}:`))) m.delete(k);
+      }
+    });
+    // A page of this build joins afterwards.
+    const c = await loadPage('C', 3);
+    let T = openedAt + 1_000;
+    sync(T, a, c);
+    expect(c.casino.isComputedTable(TABLE)).toBe(true);
+    expect(chipsOf(c, b)).toEqual([won[1] - 40]);
+    // While its layout still lists the table (a stale copy, catching up),
+    // nothing ends, however long.
+    for (const end = T + 2 * AWAY_MS; T <= end; T += STEP) frame(T, c, [TABLE]);
+    expect(c.casino.isComputedTable(TABLE)).toBe(true);
+    expect(chipsOf(c, b)).toEqual([won[1] - 40]);
+    // World's frame with the table out of the room, and no other table:
+    // `if (tables.length || computedCompactionPending()) noteTablesRunning();`
+    const worldFrame = (now: number): void => {
+      clockOf(c, now);
+      if (c.table.computedCompactionPending()) c.croupier.noteTablesRunning(now);
+      c.table.tickComputedTables([], now);
+    };
+    const from = T;
+    for (; T <= from + 3 * AWAY_MS && c.casino.isComputedTable(TABLE); T += STEP) worldFrame(T);
+    // A minute on, and not before.
+    expect(T - STEP - from).toBeGreaterThanOrEqual(AWAY_MS);
+    expect(T - STEP - from).toBeLessThanOrEqual(AWAY_MS + STEP);
+    expect(c.croupier.tablesAwake(T)).toBe(true);
+    // Ended as a removal ends it: the felt holds nothing, the nets count on.
+    expect(cfgOf(c)).toBeUndefined();
+    expect(c.casino.computedIncEnded(TABLE, cinc)).toBe(true);
+    expect(chipsOf(c, a, b)).toEqual(won);
+    // Then compacted (C signed none of its slips: the fallback's turn).
+    for (const end = T + 2 * AWAY_MS; T <= end && sessionKeys(c).length > 0; T += STEP) worldFrame(T);
+    expect(sessionKeys(c)).toEqual([]);
+    expect(c.doc.getMap('casinoComputed').get(`sum:${TABLE}:${cinc}`)).toMatchObject({ v: 1, e: 1, u: 1 });
+    expect(c.table.computedCompactionPending()).toBe(false);
+    expect(chipsOf(c, a, b)).toEqual(won);
+    // B back: its felt is free.
+    sync(T, b, c);
+    expect(b.casino.isComputedTable(TABLE)).toBe(false);
+    expect(chipsOf(b, a, b)).toEqual(won);
+    expect(c.table.AWAY_MS).toBe(AWAY_MS);
   });
 });
 

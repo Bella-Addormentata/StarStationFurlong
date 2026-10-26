@@ -78,6 +78,20 @@ function pinOn(p: Page, ...ids: TestIdentity[]): void {
   });
 }
 
+/** The first of test players `<name>0` … `<name>63` (player `pid`) that
+ *  `fits`, or null. A spec that needs a test player ranked just so against
+ *  its pages' keys draws its room again on null: the keys are fresh each
+ *  run, and when a page ranks near the end, a walk with no bound can take
+ *  tens of thousands of key derivations (seconds past the spec's timeout,
+ *  in a loop vitest can't interrupt) before one fits. */
+function firstFit(name: string, pid: string, fits: (id: TestIdentity) => boolean): TestIdentity | null {
+  for (let i = 0; i < 64; i++) {
+    const id = testIdentity(`${name}${i}`, pid);
+    if (fits(id)) return id;
+  }
+  return null;
+}
+
 /** Key `pub`'s place among `pubs` for `duty` on round r, as the duties count it. */
 function placeOf(p: Page, duty: 'close' | 'forfeit' | 'abandon' | 'trim', r: number, pubs: string[], pub: string): number {
   const ranks = [...new Set(pubs)].map((k) => p.fold.dutyRank(duty, CTX, r, k)).sort();
@@ -570,14 +584,17 @@ describe('a witness', () => {
   });
 
   it('forfeits nothing and answers nothing of a round it showed while what decided it is gone', async () => {
-    const [b] = await room(['B']);
     // Test players: A wrote the deciding forfeit and has left; W wrote a
     // forfeit that dropped seeds, ranked after A and B (B would answer it);
-    // X never reveals.
-    const rank = (k: string): string => b.fold.dutyRank('forfeit', CTX, 1, k);
+    // X never reveals. (B's page drawn again while no W fits.)
     const A = testIdentity('a', 'player-A');
-    let W = testIdentity('w0', 'player-W');
-    for (let i = 1; rank(W.pub) < rank(A.pub) || rank(W.pub) < rank(b.pub); i++) W = testIdentity(`w${i}`, 'player-W');
+    let b: Page;
+    let W: TestIdentity | null;
+    do {
+      [b] = await room(['B']);
+      const rank = (k: string): string => b.fold.dutyRank('forfeit', CTX, 1, k);
+      W = firstFit('w', 'player-W', (id) => rank(id.pub) > rank(A.pub) && rank(id.pub) > rank(b.pub));
+    } while (!W);
     const X = testIdentity('x', 'player-X');
     pinOn(b, A, W, X);
     for (const id of [A, W, X]) b.casino.buyInChips(id.pid, 1_000);
@@ -753,17 +770,22 @@ describe("a witness's copies", () => {
   });
 
   it('put a record two rival rounds rest on back once', async () => {
-    const { pages, round, at } = await shown(['A', 'B']);
-    const w = pages.find((p) => p.pub !== round.closeRec.k)!;
-    const gone = pages.find((p) => p !== w)!;
     // A rival close of round 1 by test player Y, ranked ahead, freezing the
     // same two slips and its own: decided on the same seeds and Y's, it takes
-    // the chain. Y in turn after w, so w's turn is one for both rounds.
-    const rank = (duty: 'close' | 'forfeit', k: string): string => w.fold.dutyRank(duty, CTX, 1, k);
-    let Y = testIdentity('y0', 'player-Y');
-    for (let i = 1; rank('close', Y.pub) > rank('close', round.closeRec.k) || rank('forfeit', Y.pub) < rank('forfeit', w.pub); i++) {
-      Y = testIdentity(`y${i}`, 'player-Y');
-    }
+    // the chain. Y in turn after w, so w's turn is one for both rounds. (The
+    // room drawn again while no Y fits.)
+    let drawn: Awaited<ReturnType<typeof shown>>;
+    let w: Page;
+    let Y: TestIdentity | null;
+    do {
+      drawn = await shown(['A', 'B']);
+      const { pages, round } = drawn;
+      w = pages.find((p) => p.pub !== round.closeRec.k)!;
+      const rank = (duty: 'close' | 'forfeit', k: string): string => w.fold.dutyRank(duty, CTX, 1, k);
+      Y = firstFit('y', 'player-Y', (id) => rank('close', id.pub) < rank('close', round.closeRec.k) && rank('forfeit', id.pub) > rank('forfeit', w.pub));
+    } while (!Y);
+    const { pages, round, at } = drawn;
+    const gone = pages.find((p) => p !== w)!;
     pinOn(w, Y);
     w.casino.buyInChips(Y.pid, 1_000);
     const y1 = kit.slip(Y, 1, [red(3)]);
@@ -824,14 +846,17 @@ describe("a witness's copies", () => {
   });
 
   it('stay while anything it keeps is missing: a round off the chain because of a delete comes back whole', async () => {
-    // A closes both rounds and leaves; W plays both.
+    // A closes both rounds and leaves; W plays both. A rival close of round
+    // 1 by test player Y, ranked ahead of A's. (Drawn again till both hold.)
     let pages: Page[];
-    do pages = await room(['A', 'W']);
-    while (byRank(pages, 'close', 1)[0] !== pages[0] || byRank(pages, 'close', 2)[0] !== pages[0]);
+    let Y: TestIdentity | null = null;
+    do {
+      pages = await room(['A', 'W']);
+      if (byRank(pages, 'close', 1)[0] !== pages[0] || byRank(pages, 'close', 2)[0] !== pages[0]) continue;
+      const rank = (k: string): string => pages[1].fold.dutyRank('close', CTX, 1, k);
+      Y = firstFit('y', 'player-Y', (id) => rank(id.pub) < rank(pages[0].pub));
+    } while (!Y);
     const [a, w] = pages;
-    // A rival close of round 1 by test player Y, ranked ahead of A's.
-    let Y = testIdentity('y0', 'player-Y');
-    for (let i = 1; w.fold.dutyRank('close', CTX, 1, Y.pub) > w.fold.dutyRank('close', CTX, 1, a.pub); i++) Y = testIdentity(`y${i}`, 'player-Y');
     for (const p of pages) pinOn(p, Y);
     a.casino.buyInChips(Y.pid, 1_000);
     for (const [i, p] of pages.entries()) expect(p.table.writeComputedSlip(TABLE, [red(10 + i)], T0)).toBe('ok');

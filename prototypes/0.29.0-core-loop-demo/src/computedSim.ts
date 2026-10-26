@@ -343,6 +343,9 @@ export class SimPage {
   earlyWrites = 0;
   /** Of its bot's presses: writeComputedSlip's answers. */
   readonly writes: Record<string, number> = {};
+  /** Its bot has tried a felt of more chips than its player has, and been
+   *  answered (bot: once a page, for certain). */
+  overTried = false;
   /** Of this load: the timers its modules set (the signature-check slices),
    *  run before its next frames; and how many ran, every load. */
   timers: (() => void)[] = [];
@@ -1333,6 +1336,22 @@ export class Sim {
         const held = Number(casino.computedFoldOf(t)?.held.get(sp.pid) ?? 0n);
         felt = [{ type: 'red', amount: casino.readChips(sp.pid) + held + 1 + between(r, 0, 50) }];
         over = true;
+      }
+      // And for certain once a page: its first felt with chips on it is
+      // tried first at more than its player has, past what its felt holds
+      // (the 5% above can miss a whole run: SIM_SEED=700's baseline drew no
+      // over felt in 81). No draw is taken for it, and a felt refused writes
+      // nothing, so the run goes on as drawn; an answer that isn't the chip
+      // check's ('closed', 'reconnecting') leaves it for the next felt.
+      if (!sp.overTried && !bot.allIn && felt.some((b) => b.amount > 0)) {
+        const held = Number(casino.computedFoldOf(t)?.held.get(sp.pid) ?? 0n);
+        const big: RouletteBet[] = [{ type: 'red', amount: casino.readChips(sp.pid) + held + 1 }];
+        const tried = table.writeComputedSlip(t, big, now);
+        if (tried === 'chips' || tried === 'ok') {
+          sp.overTried = true;
+          sp.writes[tried] = (sp.writes[tried] ?? 0) + 1;
+        }
+        if (tried === 'ok') this.violate(`${sp.name}'s felt of ${big[0].amount} chips at ${t} went down at ${this.elapsed} ms (it has ${casino.readChips(sp.pid)})`);
       }
       const res = table.writeComputedSlip(t, felt, now);
       sp.writes[res] = (sp.writes[res] ?? 0) + 1;

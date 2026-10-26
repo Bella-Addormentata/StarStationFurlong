@@ -118,7 +118,12 @@
  * (leaveComputedTables): a felt left behind is frozen, and forfeited. Only
  * those two (and a removal) end an incarnation: a switch a peer takes away
  * the pages running the table put back (putSwitchBack), and one a peer
- * writes alone, naming nothing the doc holds, the house switches off.
+ * writes alone, naming nothing the doc holds, the house's robot drops a
+ * lapse on (croupier dropBareSwitch), or the house switches off at once
+ * (the way back shows on its ⚙ card with or without the flag). A removal
+ * ends the incarnation on the pages that run it; a table out of the room
+ * whose switch is still on (an earlier build removed it, or no page of this
+ * build heard the removal) every page ends a minute on (awayDuty).
  */
 
 import {
@@ -131,6 +136,7 @@ import {
   computedIncEnded,
   computedIncFor,
   computedIncOf,
+  computedLiveTables,
   computedRoomBytes,
   computedSeenAt,
   computedSessionForWrite,
@@ -149,6 +155,7 @@ import {
   readTableState,
   transactCasino,
   writeCheckpointAndTrim,
+  writeComputedGone,
   writeComputedOff,
   writeComputedOn,
 } from './casinoDoc';
@@ -225,6 +232,10 @@ export const MISSING_WAIT_MS = 30_000;
  *  seen, or after the fallback on a page with no slip in them. */
 export const COMPACT_MS = 10_000;
 export const COMPACT_FALLBACK_MS = 60_000;
+/** A table whose switch is on, out of the room's tables this long on this
+ *  page (awake, its doc whole and checked), is ended as its removal would
+ *  have ended it (awayDuty). */
+export const AWAY_MS = 60_000;
 
 /** A round a forfeit decided shows its result this long after the grace on
  *  this page ran out: every page has seen the seeds it was going to see. */
@@ -420,6 +431,11 @@ const tables = new Map<string, TableState>();
 const endedAt = new Map<string, number>();
 /** When compaction last looked (at most every TICK_MS). */
 let compactedAt: number | null = null;
+/** By `<tableId>:<inc>`: the live incarnations whose table was out of the
+ *  room's tables at this page's last tick (awayDuty), and when this page
+ *  first saw each so, awake, its doc whole and checked, on its clock. */
+const away = new Set<string>();
+const awayAt = new Map<string, number>();
 
 /** Look at this page's clock: a new binding starts every table afresh; a
  *  wake, or a clock gone back by TABLE_CLOCK_SLACK_MS or more, forgets every
@@ -434,6 +450,8 @@ function lookAtClock(now: number): void {
     tables.clear();
     endedAt.clear();
     compactedAt = null;
+    away.clear();
+    awayAt.clear();
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -463,6 +481,7 @@ function lookAtClock(now: number): void {
       for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
     }
     endedAt.clear();
+    awayAt.clear();
   }
   // What came with the room's state, or from the cache before it, came at
   // once; what comes from the first look with it in, as it happens.
@@ -1356,13 +1375,17 @@ export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now =
  * reveals as soon as the room's state is in, then, on a whole doc, awake and
  * with every signature checked, the held felt, a burned commitment renewed,
  * the close, an ask for a seed still missing, a forfeit, an answer to a
- * forfeit, an abandon, the re-put and the trim, each in its turn; and the
- * compaction of any ended incarnation, of these tables or not. A phase this
- * page's clock alone moved on tells the table's listeners once.
+ * forfeit, an abandon, the re-put and the trim, each in its turn; the end of
+ * a computed table no longer among them (awayDuty: `tableIds` are all the
+ * room's roulette tables, as World passes them); and the compaction of any
+ * ended incarnation, of these tables or not. A phase this page's clock alone
+ * moved on tells the table's listeners once.
  */
 export function tickComputedTables(tableIds: Iterable<string>, now = Date.now()): void {
   lookAtClock(now);
+  const inRoom = new Set<string>();
   for (const t of tableIds) {
+    inRoom.add(t);
     putSwitchBack(t, now);
     const at = tableOf(t);
     if (!at) continue;
@@ -1372,8 +1395,50 @@ export function tickComputedTables(tableIds: Iterable<string>, now = Date.now())
     tickTable(st, now);
     tellPhase(st, now);
   }
-  // Ended incarnations, whatever tables were passed (a removed one isn't).
+  // A live table out of the room ends; ended incarnations, whatever tables
+  // were passed (a removed one isn't), are compacted.
+  awayDuty(inRoom, now);
   compactDuty(getIdentityPub(), now);
+}
+
+/**
+ * 🚪 End a computed table that is out of the room's tables (`inRoom`) while
+ * its switch is still on, as its removal would have ended it (casinoDoc
+ * writeComputedGone: its `gone:` mark, its switch deleted), once this page
+ * has seen it so for AWAY_MS, awake, its room's state in, its doc whole and
+ * checked all the while (a wake, a frame that isn't, or the table back in
+ * the room starts the wait again). A removal ends the table on every page
+ * that runs it (clearTableKeys), but only there: a page that wasn't in the
+ * room then, or joined after, never does, and an earlier build's removal
+ * leaves the switch (it knows nothing of it), as does a switch-on at the
+ * moment of a removal, the removal's delete reaching a key not written yet.
+ * Left so, the incarnation would read live for good on every page that came
+ * later: its open felts holding their players' chips, casino-wide, with no
+ * table left to take them down at, nor anything for compaction to end. Once
+ * it ends, they hold nothing, its decided nets count on, and compaction
+ * finalises its sessions in turn. The wait covers the room's layout
+ * catching up after a join (World's tables are the layout's), and the
+ * moment between a removal and its teardown on the page removing it. Every
+ * page writes the same few keys, and only until one of them lands. Not on a
+ * frame whose doc was bound afresh since this page looked at its clock.
+ */
+function awayDuty(inRoom: ReadonlySet<string>, now: number): void {
+  if (casinoDocEpoch() !== clock.epoch) return;
+  away.clear();
+  const watching = new Set<string>();
+  const ready = tablesAwake(now);
+  for (const { t, inc } of computedLiveTables()) {
+    if (inRoom.has(t)) continue;
+    const key = `${t}:${inc}`;
+    away.add(key);
+    if (!ready || !casinoWhole(t) || !computedSettled(t)) continue;
+    watching.add(key);
+    let at = awayAt.get(key);
+    if (at === undefined || at > now) awayAt.set(key, at = now);
+    if (now - at < AWAY_MS) continue;
+    if (transactCasino(() => writeComputedGone(t, inc))) away.delete(key);
+  }
+  for (const key of [...awayAt.keys()]) if (!watching.has(key)) awayAt.delete(key);
 }
 
 /**
@@ -1862,12 +1927,15 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
  * for a round past the checkpoint that the live session has lost (a peer's
  * delete or junk written over it, a write at the moment of a trim). Of its
  * slips, only the ones that still matter: its latest version of the round,
- * or one a close in the session froze; a latest version whose seed is out
- * goes again under a fresh seed instead (as the re-commit writes it), while
- * its round takes bets: put back as it was, a close that never saw the seed
- * could freeze it (a trim leaves its reveal behind). But not of a round
- * this page saw decided (the re-commit's rule: it was played). What a
- * checkpoint covers was let go of as it came (noteResult), seeds and all.
+ * or one frozen by a close on the chain as the fold reads it now, or open
+ * there (of a round off the chain because a record before it is gone too,
+ * the slip waits for the chain to come back, then goes at the next beat); a
+ * latest version whose seed is out goes again under a fresh seed instead
+ * (as the re-commit writes it), while its round takes bets: put back as it
+ * was, a close that never saw the seed could freeze it (a trim leaves its
+ * reveal behind). But not of a round this page saw decided (the
+ * re-commit's rule: it was played). What a checkpoint covers was let go of
+ * as it came (noteResult), seeds and all.
  */
 function reputDuty(st: TableState, me: string, now: number): void {
   if (st.reputAt !== null && now >= st.reputAt && now - st.reputAt < REPUT_MS) return;
@@ -2147,7 +2215,15 @@ function witnessDuty(st: TableState, pub: string, now: number): void {
  * decided (noteChain), copies or none: a page that only watched the round
  * keeps none, and trimmed by it the round would be void for good while its
  * witnesses wait their turns; if none of them is left by then, nobody can
- * put it back.
+ * put it back. And "idle" only from a page that has heard the room for all
+ * of IDLE_MS (roomHearing heardThrough), the fallback's turn too: no record
+ * in for a minute on a page whose link stalled, or that runs on the room
+ * cache's copy with the room not answering (croupier ROOM_STATE_WAIT_MS),
+ * is its own silence, not the table's. Its checkpoint would be the only one
+ * (the room, busy, trims nothing on idle), so it would win the split, and
+ * every round the room decided meanwhile would void as the link came back.
+ * The rounds and the bytes are pressure of records this page holds, deaf or
+ * not (a room of one hears nobody, and still trims on them).
  */
 function trimDuty(st: TableState, pub: string, now: number): void {
   // (Again: a round this tick's duties decided is seen missing now.)
@@ -2167,17 +2243,18 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   // last record, and D's show starts at most a grace after its close.)
   const show = showStart(st, sc, D, true, now);
   const last = lastSeenOf(st, sc, now) ?? now;
+  const heard = heardThrough(now - IDLE_MS, now);
   const pressed = D.r - res.base.u >= TRIM_ROUNDS
     || res.rawBytes >= TRIM_BYTES
     || (res.rawBytes >= ROOM_MIN_BYTES && computedRoomBytes() >= ROOM_BYTES)
-    || now - last >= IDLE_MS;
+    || (now - last >= IDLE_MS && heard);
   if (!pressed) return;
   const pubs = frozenPubs(sc, D);
   if (pubs.includes(pub)) {
     const seenDecided = st.decided.get(`${D.close}|${D.decided}`)!.at;
     const idx = placeOf('trim', st.ctx, D.r, pubs, pub);
     if (now < Math.max(show, seenDecided + TRIM_AFTER_DECIDED_MS) + idx * STAGGER_MS) return;
-  } else if (now - last < TRIM_FALLBACK_MS) {
+  } else if (now - last < TRIM_FALLBACK_MS || !heard) {
     return;
   }
   const n = netsOf(res);
@@ -2291,16 +2368,17 @@ function compactDuty(pub: string, now: number): void {
 
 /** Whether compaction has an ended incarnation to finalise (computedEndedIncs:
  *  its sessions still in the doc), the room's tables or none: a removed
- *  table's is, after the room's last table goes. World marks its frames as
- *  running tables while there is one (croupier noteTablesRunning), as it
- *  does while the room has a table: a page that stops marking them reads as
- *  asleep a lapse later (tablesAwake), for good, and compaction waits for an
- *  awake page. Only asked in a room with no table (World's frame), and never
- *  throws out of it (a throw is the computed tick's to tell: it reads the
- *  same). */
+ *  table's is, after the room's last table goes; or one still to end, its
+ *  table out of the room at this page's last tick (awayDuty), compacted
+ *  after. World marks its frames as running tables while there is one
+ *  (croupier noteTablesRunning), as it does while the room has a table: a
+ *  page that stops marking them reads as asleep a lapse later (tablesAwake),
+ *  for good, and both duties wait for an awake page. Only asked in a room
+ *  with no table (World's frame), and never throws out of it (a throw is the
+ *  computed tick's to tell: it reads the same). */
 export function computedCompactionPending(): boolean {
   try {
-    return computedEndedIncs().length > 0;
+    return away.size > 0 || computedEndedIncs().length > 0;
   } catch {
     return false;
   }
@@ -2469,9 +2547,9 @@ export function switchComputedOff(t: string, now = Date.now()): ComputedSwitchRe
 }
 
 /** What the ⚙ card shows of the switch: the row at all (`show`: the house,
- *  with the dev flag, at a roulette table), which way it is (`on`), whether
- *  a press would go now (`can`), and if not, why (`reason`, the card's
- *  words). */
+ *  at a roulette table, with the dev flag, or without it on a table that is
+ *  computed now), which way it is (`on`), whether a press would go now
+ *  (`can`), and if not, why (`reason`, the card's words). */
 export interface ComputedSwitchState {
   show: boolean;
   on: boolean;
@@ -2479,9 +2557,16 @@ export interface ComputedSwitchState {
   reason?: string;
 }
 
+/** The ⚙ card's switch row (ComputedSwitchState). The dev flag gates only
+ *  the way on: a table that is computed shows the house the way back flag
+ *  or not. A table runs computed on every page of this build once its
+ *  switch is on, whoever wrote it, and a peer can write one (a forgery
+ *  naming nothing the doc holds: the robot stands down, and no felt goes
+ *  down); a house without the flag, shown no row, could only take the table
+ *  out of the room and put it back. */
 export function computedSwitchState(t: string, game: 'craps' | 'roulette', house: boolean, now = Date.now()): ComputedSwitchState {
   const on = game === 'roulette' && isComputedTable(t);
-  const show = game === 'roulette' && house && computedTablesEnabled();
+  const show = game === 'roulette' && house && (on || computedTablesEnabled());
   if (!show) return { show, on, can: false };
   lookAtClock(now);
   const refused = on ? offRefusal(t, now) : onRefusal(t, game, now);

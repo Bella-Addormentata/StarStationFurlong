@@ -2288,6 +2288,45 @@ export function writeComputedOff(tableId: string): void {
   });
 }
 
+/** Whether table `tableId`'s switch is bare: it names an incarnation nothing
+ *  has ended, of which the doc holds no session map and no checkpoint. No
+ *  build writes one so (the switch-on writes the first session with it, in
+ *  one update, a trim writes the checkpoint with the next session, and only
+ *  an end deletes the last one: a doc holding part of an update isn't
+ *  whole), so on a whole doc it is a peer's forgery, or what is left after a
+ *  peer deleted the only session (no checkpoint yet) on a doc that never
+ *  held it. Nobody can run such a table: no felt goes down (there is no
+ *  session to write into) and the robot stands down. The lease holder drops
+ *  it a lapse on (croupier), and the house's switch-off drops it at once
+ *  (computedTable). */
+export function computedSwitchBare(tableId: string): boolean {
+  const inc = computedIncOf(tableId);
+  if (inc === null || computedIncEnded(tableId, inc)) return false;
+  const map = computedMap!;
+  return checkpointAt(map, tableId, inc) === null && !sessionKeysOf(map, tableId, inc).some((key) => map.get(key) instanceof Y.Map);
+}
+
+/** 🧮 End computed incarnation `inc` of table `tableId` as a removal of the
+ *  table ends it (clearTableKeys' computed branch), in one transaction: its
+ *  `gone:` mark, and its switch deleted. Its decided nets count on, its open
+ *  felts stop holding (nothing to refund: they took nothing), and its
+ *  sessions stay until a page compacts them (computedTable). For a table no
+ *  longer in the room whose removal this page never ran (computedTable
+ *  awayDuty): an earlier build's removal deletes the table's keys but not the
+ *  switch, which it knows nothing of, and a switch written at the moment of
+ *  a removal outlives the removal's delete of a key that wasn't there yet.
+ *  Only while the switch names `inc` and nothing has ended it; false (nothing
+ *  written) otherwise. */
+export function writeComputedGone(tableId: string, inc: string): boolean {
+  const casino = ensureMap();
+  if (computedIncOf(tableId) !== inc || computedIncEnded(tableId, inc)) return false;
+  boundDoc!.transact(() => {
+    markRemoved(casino, tableId, inc);
+    casino.delete(`cfg:computed:${tableId}`);
+  });
+  return true;
+}
+
 // ⚖️ Signatures: strict noble, about 2 ms a check, so a page joining a busy
 // table can't check a session's records in one go without a stall. Each
 // recount spends at most COMPUTED_VERIFY_MS on them, shared by every table;
@@ -2844,6 +2883,21 @@ export function computedEndedIncs(): EndedComputed[] {
     const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
       && !casino.has(goneKey(c.t, c.inc)) && checkpointAt(map, c.t, c.inc)?.e !== 1;
     if (!live) out.push({ t: c.t, inc: c.inc, res: c.last, session: c.live });
+  }
+  return out;
+}
+
+/** Every table whose switch names an incarnation this page counts (it has
+ *  a session or a checkpoint in the doc) that nothing has ended
+ *  (isComputedTable), with that incarnation: what computedTable's awayDuty
+ *  looks for among the room's tables. A table a removal took out ends here,
+ *  but only on a page that ran the removal (clearTableKeys); this is how a
+ *  page finds one whose removal it never ran. */
+export function computedLiveTables(): { t: string; inc: string }[] {
+  const out: { t: string; inc: string }[] = [];
+  for (const [t, incs] of computedIncsOf) {
+    const inc = computedIncOf(t);
+    if (inc !== null && incs.has(inc) && isComputedTable(t)) out.push({ t, inc });
   }
   return out;
 }

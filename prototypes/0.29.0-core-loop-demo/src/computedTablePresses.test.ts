@@ -1066,17 +1066,26 @@ describe("the house's switch row, pressed the wrong way round (a stale card)", (
 });
 
 describe("the house's switch row, without the dev flag", () => {
-  it('does nothing on a press', () => {
+  it('switches nothing on: no row, and a press does nothing; a computed table shows the way back, and it goes', () => {
     a.table.setComputedTablesEnabledForTests(false);
     const t = atTable(a, { house: true, t: 'roulette-legacy' });
+    expect(t.card()).not.toContain('computed-');
     t.press('computed-on');
     t.press('computed-confirm');
     expect(a.casino.isComputedTable('roulette-legacy')).toBe(false);
+    // A table computed already (a flagged page's switch, or a peer's
+    // forgery): the house has the way back, flag or not.
     switchOn(a);
     at(a, T0);
     const c = atTable(a, { house: true });
+    const card = c.card();
+    expect(card).toContain("PLAYERS' TABLE · ON");
+    expect(card).toContain('data-act="computed-off"');
+    expect(card).not.toContain('data-act="computed-on"');
     c.press('computed-off');
-    expect(a.casino.isComputedTable(TABLE)).toBe(true);
+    expect(c.flash()).toBe('THE OWNER RUNS THIS TABLE AGAIN FROM ITS NEXT ROUND');
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    expect(c.card()).not.toContain('computed-');
     t.unmount();
     c.unmount();
     a.table.setComputedTablesEnabledForTests(null);

@@ -507,6 +507,69 @@ describe('the seed of a page back from a sleep', () => {
   });
 });
 
+describe('the idle trim, on a page that may not hear the room', () => {
+  const X = testIdentity('x', 'player-X'); // reveals in time
+
+  /** Round 1 decided on A by every seed (X's put in a step after the close),
+   *  A hearing the room all the while; the time of X's seed, the last record. */
+  async function decided() {
+    const { pages, closedAt } = await closed(['A'], [X], { hears: true });
+    const [a] = pages;
+    const last = closedAt + STEP;
+    revealFake(a, X, last);
+    let T = last;
+    for (; T <= closedAt + 10_000 && !foldOf(a).rounds[0]?.decided; T += STEP) {
+      hear(a, T);
+      frame(T, a);
+    }
+    expect(foldOf(a).rounds[0].decided).toBe('reveals');
+    expect(foldOf(a).base.u).toBe(0);
+    return { a, T, last };
+  }
+
+  /** The first time A's session reads trimmed to round 1, framing from T to
+   *  `to`, hearing the room where `hears` says so; -1 if never. */
+  function trimmedAt(a: Page, T: number, to: number, hears: (T: number) => boolean): number {
+    for (; T <= to; T += STEP) {
+      if (hears(T)) hear(a, T);
+      frame(T, a);
+      if (foldOf(a).base.u >= 1) return T;
+    }
+    return -1;
+  }
+
+  it('trims a minute idle hearing the room throughout, as before', async () => {
+    const { a, T, last } = await decided();
+    const at = trimmedAt(a, T, last + 3 * a.table.IDLE_MS, () => true);
+    expect(at).toBeGreaterThanOrEqual(last + a.table.IDLE_MS);
+    expect(at).toBeLessThan(last + a.table.IDLE_MS + 2 * a.table.STAGGER_MS);
+  });
+
+  it("trims nothing on idle while it hears nobody (its link stalled: the quiet is its own, and its checkpoint, the only one, would void every round the room decided meanwhile); once it has heard the room for a minute, it does", async () => {
+    const { a, T, last } = await decided();
+    // Deaf from a second after the round decided, for four minutes: past
+    // IDLE_MS and the fallback's TRIM_FALLBACK_MS both.
+    const deafFrom = T + 1_000;
+    const back = deafFrom + 4 * 60_000;
+    expect(back - last).toBeGreaterThan(a.table.TRIM_FALLBACK_MS);
+    expect(trimmedAt(a, T, back - STEP, (t) => t < deafFrom)).toBe(-1);
+    // Hearing again: the room's quiet counts from then.
+    const at = trimmedAt(a, back, back + 3 * a.table.IDLE_MS, () => true);
+    expect(at).toBeGreaterThanOrEqual(back + a.table.IDLE_MS);
+    expect(at).toBeLessThan(back + a.table.IDLE_MS + 2 * a.table.STAGGER_MS);
+  });
+
+  it('a page nothing wired trims a minute idle as before, hearing nothing', async () => {
+    const { pages, closedAt } = await closed(['A'], [X]);
+    const [a] = pages;
+    const last = closedAt + STEP;
+    revealFake(a, X, last);
+    const at = trimmedAt(a, last, last + 3 * a.table.IDLE_MS, () => false);
+    expect(at).toBeGreaterThanOrEqual(last + a.table.IDLE_MS);
+    expect(at).toBeLessThan(last + a.table.IDLE_MS + 2 * a.table.STAGGER_MS);
+  });
+});
+
 describe('asking the room for a missing seed', () => {
   const X = testIdentity('x', 'player-X'); // never reveals
   const ASK_AT = 4_000 - 1_500;
