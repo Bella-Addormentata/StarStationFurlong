@@ -6,11 +6,12 @@
  * does its share of moving the table along, on its own clock, from what it
  * has seen: it writes its player's slips, closes betting in its turn,
  * reveals its seeds, forfeits seeds that came too late, voids a round nobody
- * can finish, and puts back its own records when they go missing
- * (tickComputedTables). It also reads the table's phase off the fold and its
- * own clock, in the shape the felt already draws (readComputedRoulette): no
- * page writes a phase, so no two pages can disagree about one for long, and
- * none can stall the table by leaving.
+ * can finish, and puts back its own records when they go missing, and those
+ * of rounds it played whose authors may have left (tickComputedTables). It
+ * also reads the table's phase off the fold and its own clock, in the shape
+ * the felt already draws (readComputedRoulette): no page writes a phase, so
+ * no two pages can disagree about one for long, and none can stall the table
+ * by leaving.
  *
  * THIS PAGE'S CLOCK. Every timer here runs from when this page first saw
  * something (seen): casinoDoc stamps each record as it arrives, and the first
@@ -45,6 +46,30 @@
  * signatures (casinoWhole, tablesAwake, computedSettled), as a PR 1 settle
  * does. Every record this page signs is marked checked before it is written
  * (markComputedVerdict), so the recount never spends time on it.
+ *
+ * WHEN THE AUTHOR HAS LEFT. Any page can delete any record (the honest-client
+ * model), and on a table players come and go, the author of a record is
+ * often gone. Two things follow, and each has its answer. A round's close
+ * deleted after its seeds went out leaves no page able to close the round
+ * again (a seed out stands the close down): the stand-down lasts ABANDON_MS
+ * from when this page first saw it (seedOutAt), then the round closes
+ * afresh in turn, on fresh seeds (no commitment out is frozen again; the old
+ * reveals open nothing the new close froze). And a record a decided round's
+ * count rests on deleted after its result showed would undo the round, or
+ * decide it otherwise, chips moving after the result was shown: so a page
+ * whose player played the round keeps a copy of what it rests on (a WITNESS
+ * copy), puts it back in its turn after the author's, and decides nothing
+ * of the round again meanwhile (no forfeit, no answer, no abandon, nor a
+ * trim past it); a page that only watched it trims nothing short of it for
+ * MISSING_WAIT_MS, its witnesses' turns. Of a round still closing, or one
+ * whose result waits (a forfeit's hold), only the frozen slips: nothing the
+ * table decides moves past a slip its close froze, and one lost takes its
+ * bettor out of the round, or undoes a forfeit that counted it (none comes
+ * twice: the abandon would void it). The rest is the table's to decide
+ * until the result shows, deletes and all (the seed-out stand-down, the
+ * forfeit, the answer), and a copy taken then could only bring back what
+ * the table has moved past. A trim makes what it covers final, copies and
+ * all, and what a page saw played that the room didn't keep, it lets go of.
  *
  * TRIMS keep the doc small: once the last decided round shows, a page that
  * played it swaps the session (when it is long, heavy, or idle) for a
@@ -134,7 +159,9 @@ export const ROOM_MIN_BYTES = 24 * 1024;
 export const IDLE_MS = 60_000;
 /** A page none of the last round's bettors is on trims after this idle. */
 export const TRIM_FALLBACK_MS = 240_000;
-/** A frozen slip missing this long no longer holds a trim back. */
+/** A frozen slip missing this long no longer holds a trim back, nor does a
+ *  round this page saw decided that a delete took off the chain (its
+ *  witnesses, if any are left, have put it back by then). */
 export const MISSING_WAIT_MS = 30_000;
 /** An ended incarnation's sessions are compacted this long after the end is
  *  seen, or after the fallback on a page with no slip in them. */
@@ -208,6 +235,31 @@ interface Scan {
   slipPubs?: Set<string>;
 }
 
+/** A copy this page keeps of a record a round's count rests on (a witness
+ *  copy): the value as the session held it, its bytes once asked for, and
+ *  when this page first saw the session lose it (null while it holds it). */
+interface Copy {
+  v: object;
+  bytes?: string;
+  missingAt: number | null;
+}
+
+/** A round this page's player is frozen in (noteWitness): the records its
+ *  count rests on, to put back. */
+interface Witnessed {
+  r: number;
+  /** The pubs that signed its present frozen slips: the turn order. */
+  pubs: Set<string>;
+  /** key → copy: each present bettor's frozen slip, and once its result has
+   *  shown, the close, the seed counted for each revealed one, the deciding
+   *  forfeit or abandon; at most 2 × MAX_FROZEN + 2. */
+  copies: Map<string, Copy>;
+  /** Which copy is the deciding forfeit's or abandon's (one at a time). */
+  decider: string | null;
+  /** The round as last noted whole: nothing new while it reads the same. */
+  noted: string;
+}
+
 /** For one close: when this page first saw, for each frozen bettor, the
  *  reveal that opens their frozen slip (revealsSeen), kept once seen — a
  *  peer's delete at the moment a forfeit falls due doesn't make a seed seen
@@ -262,6 +314,21 @@ interface TableState {
   missingAt: Map<string, number>;
   /** By close hash: the seeds seen opening its frozen slips (revealsSeen). */
   opened: Map<string, Opened>;
+  /** When this page first saw round r's close stand down for a seed out
+   *  (seedOut, with no tip and no close in): it closes ABANDON_MS on. */
+  seedOutAt: { r: number; at: number } | null;
+  /** By close hash: the rounds this page witnesses (noteWitness), and a
+   *  count bumped whenever a copy comes or goes. */
+  witness: Map<string, Witnessed>;
+  witnessVer: number;
+  /** By close: the keys of the copies the live session has lost, as of one
+   *  fold result (witnessLost). */
+  lost: { res: FoldResult; gen: number; ver: number; out: Map<string, string[]> } | null;
+  /** The last round this page saw decided on the chain of session `sid`,
+   *  and when it first saw the chain fall short of it since (noteChain): a
+   *  delete took a round it saw played off the chain, and a trim waits. */
+  decidedTo: { sid: string; r: number } | null;
+  shortAt: number | null;
 }
 
 /** The binding the per-table state belongs to, the wake count and clock
@@ -308,6 +375,10 @@ function lookAtClock(now: number): void {
       st.rearm = null;
       st.missingAt.clear();
       st.opened.clear();
+      st.seedOutAt = null;
+      st.shortAt = null;
+      // (A copy keeps its value: only when it went missing starts again.)
+      for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
     }
     endedAt.clear();
   }
@@ -350,7 +421,8 @@ function newTable(t: string, inc: string): TableState {
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
     pending: null, lastSlip: null, rearm: null, tickedAt: null, reputAt: null,
     lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, lastCheck: null,
-    missingAt: new Map(), opened: new Map(),
+    missingAt: new Map(), opened: new Map(), seedOutAt: null, witness: new Map(), witnessVer: 0, lost: null,
+    decidedTo: null, shortAt: null,
   };
 }
 
@@ -399,14 +471,25 @@ function noteResult(st: TableState, res: FoldResult): void {
     for (const [h, e] of [...st.opened]) if (e.r <= u) st.opened.delete(h);
     if (st.pending && st.pending.r <= u) st.pending = null;
     st.missingAt.clear();
+    st.seedOutAt = null;
+    // What a checkpoint covers is final, and what the next session doesn't
+    // hold of the rounds it saw past it is void (below): no copy of any of
+    // it goes into the next session, nor is a stand-down timed from it.
+    if (st.witness.size > 0) {
+      st.witness.clear();
+      st.witnessVer += 1;
+    }
     // Of what this page wrote, only its felt for the round after the
     // checkpoint goes on, and only if this page never saw that round closed
     // or the session holds it (the trim's copy): anything else is of a round
     // the checkpoint covers, or of one this page saw played past it that the
     // room didn't keep (the other side of a split, or a trim that hadn't
     // heard of it: void, its stakes back), and put back it would only be
-    // played again.
-    const lastClosed = was.rounds.length > 0 ? was.rounds[was.rounds.length - 1].r : was.base.u;
+    // played again. Closed: on the chain as this page last read it, or
+    // decided on it at any time since the last checkpoint (playedTo) — a
+    // peer's delete may have taken the round off the chain before the trim
+    // came, and its seeds are out all the same.
+    const lastClosed = Math.max(was.rounds.length > 0 ? was.rounds[was.rounds.length - 1].r : was.base.u, playedTo(st, was));
     const ses = computedSessionForWrite(st.t);
     letGo(st, (m, key) => m.r === u + 1 && (m.r > lastClosed || ses?.has(key) === true));
   }
@@ -1172,13 +1255,18 @@ function tickTable(st: TableState, now: number): void {
   revealDuty(st, me);
   noteMissing(st, now);
   if (!casinoWhole(st.t) || !tablesAwake(now) || !computedSettled(st.t)) return;
+  // (First: what a round rests on is kept before any duty reads it lost.)
+  noteChain(st, now);
+  noteWitness(st, me, now);
   flushDuty(st, me, now);
   recommitDuty(st, me, now);
+  noteSeedOut(st, now);
   closeDuty(st, me, pub, now);
   forfeitDuty(st, me, pub, now);
   answerDuty(st, me, pub, now);
   abandonDuty(st, me, pub, now);
   reputDuty(st, me, now);
+  witnessDuty(st, pub, now);
   // (The incarnation is live, and the table among those passed: tableOf.)
   trimDuty(st, pub, now);
 }
@@ -1252,24 +1340,55 @@ function flushDuty(st: TableState, me: string, now: number): void {
 
 /** 2. A felt of this page's player on the open round whose commitment is out
  *  (revealed for a close that didn't stand) goes again under a fresh seed:
- *  frozen again, its seed would be known before betting ends. */
+ *  frozen again, its seed would be known before betting ends. Not on a
+ *  round this page saw decided (noteChain), open again only because a
+ *  peer's delete took a record it rests on: that felt was played, and goes
+ *  back with the round (its witnesses' put-back) or nowhere (a trim past
+ *  it voids it, and this page lets go of it: noteResult); under a fresh
+ *  seed it would only be played again, by the re-close, or by the next
+ *  session it was copied into. */
 function recommitDuty(st: TableState, me: string, now: number): void {
   const res = resultOf(st);
-  if (!res || !bettingOn(st, res, now)) return;
+  if (!res || res.open <= playedTo(st, res) || !bettingOn(st, res, now)) return;
   const cur = res.felts.get(me);
   if (!cur || cur.rec.b.length === 0 || !burnedCommit(st, res, cur.rec.c)) return;
   writeSlip(st, res, res.open, cur.rec.b, true, now);
+}
+
+/** When this page first saw the open round's close stand down for a seed
+ *  out (seedOut, no tip, no close of the round in), on its clock: the
+ *  stand-down's start, kept for that round (a close put back and deleted
+ *  again doesn't start it over), and gone with every first-seen time on a
+ *  wake or a clock gone back, and on a session change. Only while this page
+ *  could close (the close duty's gates): its wait is a wait it watched. */
+function noteSeedOut(st: TableState, now: number): void {
+  const res = resultOf(st);
+  if (!res) return;
+  const o = res.open;
+  if (st.seedOutAt && st.seedOutAt.r !== o) st.seedOutAt = null;
+  if (st.seedOutAt || res.tip || res.openCloses.some((c) => c.state !== 'invalid')) return;
+  if (seedOut(st, scanOf(st, res), o)) st.seedOutAt = { r: o, at: now };
 }
 
 /**
  * 4. Close the open round's betting, in this page's turn among the players
  * with chips on it (dutyRank), BET_WINDOW_MS after the window started.
  * Stands down for a close of the round already in (valid, or still being
- * checked), a seed of the round already out (some close this page hasn't
- * seen froze it: seedOut), or a close this page's key already signed on
- * this parent (in the doc, so a reload knows: signedIn). Freezes each
- * player's latest felt with chips on it, but no burned commitment, at most
- * MAX_FROZEN, its own always, the rest earliest seen first.
+ * checked), or a close this page's key already signed on this parent (in
+ * the doc, so a reload knows: signedIn); and for a seed of the round
+ * already out (some close this page hasn't seen froze it: seedOut), until
+ * ABANDON_MS after this page first saw it so (seedOutAt): a close deleted
+ * after its seeds went out, by a peer, with its author gone, would else
+ * hold the round and every felt on it for good. The round then closes
+ * afresh, in the same turns: no commitment that is out is frozen again (its
+ * player's felt goes under a fresh seed first: the re-commit), so the seeds
+ * that came for the deleted close open nothing this one froze, and it
+ * decides on fresh ones. Should the deleted close come back (its author
+ * back, or a witness's copy), the fold picks one of the two by its chain
+ * rule, and chips may move once: the split a delete makes, as a cut-off
+ * room's. Freezes each player's latest felt with chips on it, but no burned
+ * commitment, at most MAX_FROZEN, its own always, the rest earliest seen
+ * first.
  */
 function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -1280,11 +1399,12 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   if (!own || own.rec.b.length === 0 || burnedCommit(st, res, own.rec.c)) return;
   if (res.openCloses.some((c) => c.state !== 'invalid')) return;
   const sc = scanOf(st, res);
-  if (seedOut(st, sc, o)) return;
   if (signedIn<CloseRec>(st, sc, 'close', asClose, sc.closes, o, pub, (c) => c.q === res.parent)) return;
   const staked = [...res.felts.values()].filter((s) => s.rec.b.length > 0);
   const idx = placeOf('close', st.ctx, o, staked.map((s) => s.rec.k), pub);
   if (now < e.view.phaseDeadline + idx * STAGGER_MS) return;
+  // (Seen just now, as this tick noted it: noteSeedOut.)
+  if (seedOut(st, sc, o) && now < (st.seedOutAt?.at ?? now) + ABANDON_MS + idx * STAGGER_MS) return;
   const others = staked
     .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c))
     .map((s) => ({ s, at: seen(st, s.key, now) }))
@@ -1314,7 +1434,10 @@ function writeForfeit(st: TableState, round: RoundView, n: string[], pub: string
  * of the grace on this page's clock plus its turn among the frozen bettors
  * (dutyRank); counts the seeds this page saw by then, there now or not.
  * Not when every seed is in with nothing missing (the reveals decide it),
- * nor twice for one close.
+ * nor twice for one close, nor for a round whose result this page showed
+ * that reads otherwise only because a peer deleted what it rests on
+ * (heldBack): decided again, it might count fewer seeds than it did, and a
+ * forfeit outlives the put-back (it beats the reveals).
  */
 function forfeitDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -1325,6 +1448,7 @@ function forfeitDuty(st: TableState, me: string, pub: string, now: number): void
     if (!round.present.includes(me) || !round.revealed.includes(me)) continue;
     if (round.missing.length === 0 && round.revealed.length === round.present.length) continue;
     if (round.decided === 'void' && !watchedClose(st, round)) continue;
+    if (heldBack(st, res, round.close, now)) continue;
     if (signedIn<ForfeitRec>(st, sc, 'forfeit', asForfeit, sc.forfeits, round.r, pub, (f) => f.x === round.close)) continue;
     const closeSeen = seen(st, `c:${round.r}:${round.close}`, now);
     const times = revealsSeen(st, sc, round, now);
@@ -1345,7 +1469,9 @@ function forfeitDuty(st: TableState, me: string, pub: string, now: number): void
  *  page back from a sleep or a load, or one that heard the close, its seeds
  *  and the forfeit all at once, can't tell a seed in time from one minutes
  *  late. Once the grace on this page's clock is over (its count is final),
- *  once per close. */
+ *  once per close. Not to a forfeit that decides a round this page showed
+ *  only because a peer deleted the one that decided it (heldBack): that one
+ *  goes back, and an answer to the other could outrank it. */
 function answerDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
   if (!res) return;
@@ -1354,6 +1480,7 @@ function answerDuty(st: TableState, me: string, pub: string, now: number): void 
     const F = round.decided === 'forfeit' ? round.forfeit?.rec : undefined;
     if (!F || F.k === pub) continue;
     if (dutyRank('forfeit', st.ctx, round.r, F.k) <= dutyRank('forfeit', st.ctx, round.r, pub)) continue;
+    if (heldBack(st, res, round.close, now)) continue;
     if (signedIn<ForfeitRec>(st, sc, 'forfeit', asForfeit, sc.forfeits, round.r, pub, (f) => f.x === round.close)) continue;
     if (!watchedClose(st, round)) continue;
     const closeSeen = seen(st, `c:${round.r}:${round.close}`, now);
@@ -1374,7 +1501,12 @@ function answerDuty(st: TableState, me: string, pub: string, now: number): void 
  * a record in the session or a seat at the table, in its turn among the
  * pubs of the session's checked slips (any round, any version: one a close
  * left out too) and the seated players' pinned keys (last when it is among
- * neither). Once per close.
+ * neither). Once per close. Not while a record the round rests on that this
+ * page keeps a copy of is gone (heldBack: a round it showed that reads
+ * undecided only because a peer deleted what it rests on, or a tip whose
+ * frozen slip went): the copy goes back in a few seconds, and voided
+ * meanwhile, the result shown would read void and back, and the abandon
+ * would stay in the session to void the round at the next delete.
  */
 function abandonDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -1385,6 +1517,7 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
   let wrote = false;
   for (const m of st.mine.values()) if (m.r > res.base.u) wrote = true;
   if (!wrote && readSeat(st.t, me) === null) return;
+  if (heldBack(st, res, tip.close, now)) return;
   const sc = scanOf(st, res);
   if (signedIn<AbandonRec>(st, sc, 'abandon', asAbandon, sc.abandons, tip.r, pub, (z) => z.x === tip.close)) return;
   const pubs = new Set(checkedSlipPubs(st, sc));
@@ -1407,8 +1540,9 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
  * or one a close in the session froze; a latest version whose seed is out
  * goes again under a fresh seed instead (as the re-commit writes it), while
  * its round takes bets: put back as it was, a close that never saw the seed
- * could freeze it (a trim leaves its reveal behind). What a checkpoint
- * covers was let go of as it came (noteResult), seeds and all.
+ * could freeze it (a trim leaves its reveal behind). But not of a round
+ * this page saw decided (the re-commit's rule: it was played). What a
+ * checkpoint covers was let go of as it came (noteResult), seeds and all.
  */
 function reputDuty(st: TableState, me: string, now: number): void {
   if (st.reputAt !== null && now >= st.reputAt && now - st.reputAt < REPUT_MS) return;
@@ -1435,11 +1569,231 @@ function reputDuty(st: TableState, me: string, now: number): void {
       if (latest.get(m.r)?.key !== key) continue;
       const slip = m.rec as SlipRec;
       if (burnedCommit(st, res, slip.c)) {
-        if (m.r === res.open && bettingOn(st, res, now)) writeSlip(st, res, m.r, slip.b, true, now);
+        if (m.r === res.open && m.r > playedTo(st, res) && bettingOn(st, res, now)) writeSlip(st, res, m.r, slip.b, true, now);
         continue;
       }
     }
     put(st, key, m.rec, m.r, m.kind !== 'x');
+  }
+}
+
+// ── 👁 Witnesses ─────────────────────────────────────────────────────────────
+
+/** Whether `ses` holds `copy` under `key`, byte for byte. The same bytes
+ *  in a fresh value (another page's put-back, decoded here) are the record
+ *  too: the copy takes that value, so the next look is a reference's. */
+function heldIn(ses: Session, key: string, copy: Copy): boolean {
+  const v = ses.get(key);
+  if (v === copy.v) return true;
+  if (v === undefined) return false;
+  copy.bytes ??= canon(copy.v)!;
+  if (canon(v) !== copy.bytes) return false;
+  copy.v = v as object;
+  return true;
+}
+
+/** Copy into `w` the value under `key` when it is the record the key names
+ *  (`rec`: its kind's shape, under its own key). Inside the duties' gates
+ *  the count is the doc as it is, so a counted key holds what was counted;
+ *  looked at all the same, as junk is no record to put back, nor to mark
+ *  checked. Whether `w` has it now. */
+function keepCopy(w: Witnessed, ses: Session, key: string, rec: (v: unknown) => string | null): boolean {
+  if (w.copies.has(key)) return true;
+  const v = ses.get(key);
+  if (rec(v) !== key) return false;
+  w.copies.set(key, { v: v as object, missingAt: null });
+  return true;
+}
+
+const closeOf = (v: unknown): string | null => { const c = asClose(v); return c && closeKey(c); };
+const slipOf = (v: unknown): string | null => { const s = asSlip(v); return s && slipKey(s); };
+const forfeitOf = (v: unknown): string | null => { const f = asForfeit(v); return f && forfeitKey(f); };
+const abandonOf = (v: unknown): string | null => { const z = asAbandon(v); return z && abandonKey(z); };
+
+/**
+ * Keep a witness copy of what each round this page's player is frozen in
+ * rests on, as the session held it (so only what the fold counted): each
+ * present bettor's frozen slip from the round's close on, decided or not —
+ * the close fixed it, and nothing the table decides moves past it, while
+ * lost it takes its bettor out of the round (unstaked, its seed uncounted)
+ * or undoes a forfeit that counted it, which no page writes twice (the
+ * abandon would void it); and once the round's result has shown here
+ * (showStart), the rest: the close, the seed the fold counts for each
+ * revealed bettor (the one revealsSeen finds: under its own key, opening the
+ * frozen slip), and the forfeit or abandon that decided it. Its own records
+ * among them too: what goes back of those is its own re-put's (witnessDuty
+ * skips them), but a round missing one is a round a delete moved all the
+ * same (heldBack). Copies only gather: a record the round rested on that a
+ * delete took away still goes back, though the round reads otherwise
+ * without it. Only the decider changes hands, and only from one still in
+ * the session (a better forfeit came, or a forfeit beat the void): one gone
+ * is why the round reads otherwise, and it stays to go back. Not the close
+ * of a round still closing, nor a seed or a decider before its result shows
+ * (a forfeit's hold): until then the table decides it, deletes and all (a
+ * close deleted with its seeds out closes afresh; a seed gone moves the
+ * forfeit, and an answer may follow), and a copy would bring back what it
+ * moved past.
+ */
+function noteWitness(st: TableState, me: string, now: number): void {
+  const res = resultOf(st);
+  if (!res) return;
+  let sc: Scan | null = null;
+  for (const round of res.rounds) {
+    if (!round.present.includes(me)) continue;
+    sc ??= scanOf(st, res);
+    const ses = sc.ses;
+    if (!ses) return;
+    let w = st.witness.get(round.close);
+    const shown = round.decided !== null && now >= showStart(st, sc, round, true, now);
+    const decider = !shown ? null
+      : round.forfeit ? `f:${round.r}:${round.forfeit.hash}` : round.abandon ? `z:${round.r}:${round.abandon.hash}` : null;
+    const noted = shown ? `${round.decided}|${round.present.length}|${round.revealed.length}|${decider ?? ''}` : `-|${round.present.length}`;
+    if (w && w.noted === noted) continue;
+    if (!w) st.witness.set(round.close, w = { r: round.r, pubs: new Set(), copies: new Map(), decider: null, noted: '' });
+    const had = { size: w.copies.size, decider: w.decider };
+    let whole = true;
+    for (const pid of round.present) {
+      const key = `s:${round.r}:${pid}:${round.frozen[pid]}`;
+      if (keepCopy(w, ses, key, slipOf)) w.pubs.add((w.copies.get(key)!.v as SlipRec).k);
+      else whole = false;
+    }
+    if (shown) {
+      if (!keepCopy(w, ses, `c:${round.r}:${round.close}`, closeOf)) whole = false;
+      for (const pid of round.revealed) {
+        const keys = sc.reveals.get(round.r)?.get(pid) ?? [];
+        if (keys.some((key) => w!.copies.has(key))) continue;
+        const slip = w.copies.get(`s:${round.r}:${pid}:${round.frozen[pid]}`)?.v as SlipRec | undefined;
+        const key = slip && keys.find((k) => {
+          const x = asReveal(ses.get(k));
+          return x !== null && revealKey(x) === k && slipCommit(st.ctx, x.r, x.p, x.s) === slip.c;
+        });
+        if (!key || !keepCopy(w, ses, key, (v) => { const x = asReveal(v); return x && revealKey(x); })) whole = false;
+      }
+      if (decider !== null && decider !== w.decider) {
+        const old = w.decider === null ? undefined : w.copies.get(w.decider);
+        if (!old || heldIn(ses, w.decider!, old)) {
+          if (keepCopy(w, ses, decider, decider[0] === 'f' ? forfeitOf : abandonOf)) {
+            if (w.decider !== null) w.copies.delete(w.decider);
+            w.decider = decider;
+          } else {
+            whole = false;
+          }
+        }
+      }
+    }
+    if (w.copies.size !== had.size || w.decider !== had.decider) st.witnessVer += 1;
+    // (A record not found as counted is looked for again next time.)
+    if (whole) w.noted = noted;
+  }
+}
+
+/** Note the last round this page has seen decided on the live session's
+ *  chain (inside the duties' gates: the doc whole, every signature checked),
+ *  and when it first saw the chain fall short of it since. Without a delete
+ *  it never does — records only come, and a rival chain takes the table only
+ *  by outgrowing this one — so a round this page saw played has lost a
+ *  record it rests on, and its witnesses put it back in their turns: until
+ *  then no trim makes the shorter chain final (trimDuty), MISSING_WAIT_MS at
+ *  most, and no felt of the round goes again (the re-commit). Timed on this
+ *  page's clock (a wake starts it again); a session of its own (the next
+ *  one starts from its checkpoint's round). */
+function noteChain(st: TableState, now: number): void {
+  const res = resultOf(st);
+  if (!res) return;
+  const to = lastDecided(res)?.r ?? res.base.u;
+  if (to >= playedTo(st, res)) {
+    st.decidedTo = { sid: res.base.sid, r: to };
+    st.shortAt = null;
+  } else {
+    st.shortAt ??= now;
+  }
+}
+
+/** The last round this page saw decided on the chain of the session `res`
+ *  reads (noteChain), or its checkpoint's. */
+function playedTo(st: TableState, res: FoldResult): number {
+  return st.decidedTo !== null && st.decidedTo.sid === res.base.sid ? st.decidedTo.r : res.base.u;
+}
+
+/** By close: the keys of the witness copies the live session has lost, or
+ *  holds junk in the place of, each timed from when this page first saw it
+ *  so (on its clock; a wake starts it again). Once per fold result: inside
+ *  the duties' gates the session can't lose or regain a record without the
+ *  fold moving. */
+function witnessLost(st: TableState, res: FoldResult, now: number): Map<string, string[]> {
+  const was = st.lost;
+  if (was && was.res === res && was.gen === clock.gen && was.ver === st.witnessVer) return was.out;
+  const ses = computedSessionForWrite(st.t);
+  const out = new Map<string, string[]>();
+  for (const [close, w] of st.witness) {
+    for (const [key, copy] of w.copies) {
+      if (ses && heldIn(ses, key, copy)) {
+        copy.missingAt = null;
+        continue;
+      }
+      copy.missingAt ??= now;
+      pushIn(out, close, key);
+    }
+  }
+  st.lost = { res, gen: clock.gen, ver: st.witnessVer, out };
+  return out;
+}
+
+/** Whether this page holds back from deciding `close`'s round again: it
+ *  showed its result, and the session has lost a record it rests on, which
+ *  goes back (its author's re-put, or a witness's). */
+function heldBack(st: TableState, res: FoldResult, close: string, now: number): boolean {
+  return witnessLost(st, res, now).has(close);
+}
+
+/**
+ * 7b. Put back, byte for byte, each witness copy the live session has lost
+ * (a peer's delete, or junk over it), in this page's turn: REPUT_MS and
+ * (1 + its place) × STAGGER_MS after it first saw it missing, its place
+ * among the round's bettors by dutyRank('forfeit') — so the author, who
+ * puts back its own within REPUT_MS, goes first, and the witnesses take
+ * turns after (each stands down once one's write is in: it is held again).
+ * Marked checked first, as the fold checked it when it counted it. Not a
+ * record of its own (its re-put's), and only into the session it saw the
+ * record in (a session change lets every copy go: noteResult). Every tick,
+ * not on the re-put's beat: a turn is a tick late at most. With nothing
+ * lost, a round off the chain that the chain has run past lost to a rival
+ * chain outright (no delete moved it: none of what this page keeps is
+ * missing), or to a close of its round made afresh (its own close, never
+ * kept while it was closing, deleted with its seeds out), and its copies
+ * go; a round off the chain because one before it
+ * is gone, or for as long as anything this page keeps is, keeps them. Its
+ * own records aside, there: they go back by its re-put, which lets go of
+ * one the chain has stopped resting on (a burned felt off it), and copies
+ * kept for one that never comes back would hold every trim back for good.
+ */
+function witnessDuty(st: TableState, pub: string, now: number): void {
+  const res = resultOf(st);
+  const ses = computedSessionForWrite(st.t);
+  if (!res || !ses || st.witness.size === 0) return;
+  const lost = witnessLost(st, res, now);
+  if (![...lost.values()].some((keys) => keys.some((key) => !st.mine.has(key)))) {
+    const on = new Set(res.rounds.map((v) => v.close));
+    for (const [close, w] of [...st.witness]) {
+      if (on.has(close) || res.open <= w.r) continue;
+      st.witness.delete(close);
+      st.witnessVer += 1;
+    }
+    return;
+  }
+  // (A record two rival rounds rest on goes once.)
+  const done = new Set<string>();
+  for (const [close, keys] of lost) {
+    const w = st.witness.get(close)!;
+    const turn = REPUT_MS + (1 + placeOf('forfeit', st.ctx, w.r, w.pubs, pub)) * STAGGER_MS;
+    for (const key of keys) {
+      const copy = w.copies.get(key)!;
+      if (done.has(key) || st.mine.has(key) || now < copy.missingAt! + turn) continue;
+      const pk = parseKey(key)!;
+      if (pk.kind !== 'x') markComputedVerdict(st.t, pk.h);
+      transactCasino(() => ses.set(key, copy.v));
+      done.add(key);
+    }
   }
 }
 
@@ -1459,13 +1813,24 @@ function reputDuty(st: TableState, me: string, now: number): void {
  * session its reveal is gone, and a page that never saw it would freeze it
  * (its player puts the felt back under a fresh seed: the re-put). Two pages
  * trimming the same rounds write the same checkpoint but for its signer, so
- * they open the same session (nextSid leaves k and g out).
+ * they open the same session (nextSid leaves k and g out). Not while a
+ * record a round rests on whose result this page showed is gone from the
+ * session (witnessLost): trimmed then, the round would be final without it
+ * (a close deleted, the round before it trimmed to, and the round itself
+ * void), where its witness puts it back in a few seconds. Nor, for
+ * MISSING_WAIT_MS, while the chain reads short of a round this page saw
+ * decided (noteChain), copies or none: a page that only watched the round
+ * keeps none, and trimmed by it the round would be void for good while its
+ * witnesses wait their turns; if none of them is left by then, nobody can
+ * put it back.
  */
 function trimDuty(st: TableState, pub: string, now: number): void {
   // (Again: a round this tick's duties decided is seen missing now.)
   noteMissing(st, now);
   const res = resultOf(st);
   if (!res || res.tip) return;
+  if (witnessLost(st, res, now).size > 0) return;
+  if (st.shortAt !== null && now - st.shortAt < MISSING_WAIT_MS) return;
   for (const round of res.rounds) {
     const at = st.missingAt.get(round.close);
     if (round.missing.length > 0 && (at === undefined || now - at < MISSING_WAIT_MS)) return;
