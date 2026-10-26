@@ -38,7 +38,9 @@
  *      (its seeds count, the other frozen players forfeit); every reveal in;
  *      an abandon (void: every stake back). Otherwise it is still open.
  *   5. The pocket mixes the counted seeds; each frozen player's delta is
- *      what the felt returned minus its stake.
+ *      what the felt returned minus its stake. This step is the game's
+ *      (FoldGame: roulette here; a game may carry state, such as a craps
+ *      point and the bets riding on it, from one round into the next).
  *
  * THE CHAIN: each close names its parent (the session id for the first
  * round, else a decided close of the round before). The longest decided
@@ -214,11 +216,13 @@ export function slipCommit(ctx: FoldCtx, r: number, pid: string, seed: string): 
 }
 
 /** Session id after `cp`: first 24 hex of sha256(utf8('ssf-ct-sid-v1|' +
- *  canon({t, inc, b, u, l, n, e}))) — `k` and `g` left out, so two pages
- *  that trim the same history open the same session. 'g' when cp is null. */
-export function nextSid(ctx: FoldCtx, cp: Pick<Checkpoint, 'b' | 'u' | 'l' | 'n' | 'e'> | null): string {
+ *  canon({t, inc, b, u, l, n, e, s}))) — `k` and `g` left out, so two pages
+ *  that trim the same history open the same session. 'g' when cp is null.
+ *  `s` is a game's carried state (craps): absent, canon skips it, so a
+ *  roulette sid is what it always was. */
+export function nextSid(ctx: FoldCtx, cp: (Pick<Checkpoint, 'b' | 'u' | 'l' | 'n' | 'e'> & { s?: unknown }) | null): string {
   if (!cp) return 'g';
-  const c = canon({ t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, l: cp.l, n: cp.n, e: cp.e });
+  const c = canon({ t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, l: cp.l, n: cp.n, e: cp.e, s: cp.s });
   if (c === null) throw new TypeError('nextSid: the checkpoint must be canonical');
   return bytesToHex(sha256(utf8ToBytes(`ssf-ct-sid-v1|${c}`))).slice(0, 24);
 }
@@ -446,6 +450,7 @@ export interface FoldBase {
   /** Checkpoint nets (empty with no checkpoint). */ n: Map<string, bigint>;
   /** The checkpoint says the incarnation ended: the session counts nothing
    *  (no rounds, no felts, nothing held; the nets are the checkpoint's). */ ended: boolean;
+  /** The game's carried state at the base (FoldGame.start): null at roulette. */ state: unknown;
 }
 
 export interface FoldResult {
@@ -464,9 +469,13 @@ export interface FoldResult {
    *  undefined). */
   felts: Map<string, SlipInfo>;
   /** base.n + Σ deltas of the decided rounds. Zero entries dropped. */ nets: Map<string, bigint>;
-  /** pid → chips on the felt now: P's stakes if `tip`, else each felt's stake.
+  /** pid → chips on the felt now: P's stakes if `tip`, else what the game
+   *  says the felts hold (FoldGame.standing: at roulette each felt's stake).
    *  Zero entries dropped. (casinoDoc counts it only while the incarnation is live.) */
   held: Map<string, bigint>;
+  /** The game's carried state after the last decided round on the chain
+   *  (the base's with none): what the open round plays from. Null at roulette. */
+  carry: unknown;
   /** Commitments a reveal in this session has opened (any slip, any round). */ revealedCommits: Set<string>;
   /** Some verdict was undefined: run again once the caller has checked more. */ pending: boolean;
   /** Σ (key.length + canon(value).length) over indexed records. */ bytes: number;
@@ -476,9 +485,101 @@ export interface FoldResult {
   /** Indexed record count. */ records: number;
 }
 
+// ── Games ────────────────────────────────────────────────────────────────────
+
+/** A frozen or felt slip as the fold indexed it. */
+export interface SlipEntry extends EntryBase<'s', SlipRec>, Signed {
+  /** Σ amounts — at most 400 × MAX_BET_AMOUNT, so exact as a number first. */
+  stake: bigint;
+}
+
+/** How one close was decided, before the game plays it: a RoundView's
+ *  decision fields, plus the seeds that opened P's slips. */
+export type Outcome = Pick<RoundView, 'present' | 'missing' | 'revealed' | 'decided' | 'counted' | 'forfeit' | 'abandon'> & {
+  /** pid (P) → the seed its reveal gave, for every revealed pid. */
+  seeds: ReadonlyMap<string, string>;
+};
+
+/** What a game made of one decided (or undecided) close. */
+export interface Play<S> {
+  /** 0–36 at roulette when decided by reveals or a forfeit; else null. */ pocket: number | null;
+  /** As RoundView's: while undecided only `stakes` is filled. */
+  stakes: Map<string, bigint>;
+  payouts: Map<string, bigint>;
+  deltas: Map<string, bigint>;
+  /** The carried state the next round plays from (unused while undecided). */ sOut: S;
+}
+
+/**
+ * The rules one game plays a round by. Everything else in the fold — which
+ * closes count, how a round is decided, which chain wins — is the same for
+ * every game and never reads the carried state, so a round is decided the
+ * same way whatever came before it; only what it pays can depend on that.
+ * Pure, like the fold.
+ */
+export interface FoldGame<S> {
+  /** The slip shape this game's records use (the session keys are the same). */
+  asSlip(v: unknown): SlipRec | null;
+  /** The checkpoint shape (a game with carried state stores it as `s`). */
+  asCheckpoint(v: unknown): Checkpoint | null;
+  /** Whether a close may freeze this slip so that it counts: roulette needs
+   *  a felt with something on it. */
+  frozenOk(s: SlipEntry): boolean;
+  /** The carried state a session starts from (null cp: a new incarnation). */
+  start(cp: Checkpoint | null): S;
+  /** A short string that changes whenever `s` does (a memo key). */
+  key(s: S): string;
+  /** Play round r of close `out` (P: the frozen slips present, by pid; M: the
+   *  frozen pids missing) from carried state `sIn`. */
+  play(ctx: FoldCtx, r: number, out: Outcome, P: ReadonlyMap<string, SlipEntry>, M: readonly string[], sIn: S): Play<S>;
+  /** What each player holds on the felt while no close is in (the open
+   *  round's latest versions, `felts`), from carried state `sIn`. */
+  standing(sIn: S, felts: ReadonlyMap<string, SlipInfo>, stakeOf: (hash: string) => bigint): Map<string, bigint>;
+}
+
+/** Roulette: every round stands alone. A counted player is paid what the
+ *  pocket pays its felt; nothing carries from one spin to the next. */
+export const rouletteGame: FoldGame<null> = {
+  asSlip,
+  asCheckpoint,
+  frozenOk: (s) => s.rec.b.length > 0,
+  start: () => null,
+  key: () => '',
+  play(ctx, r, out, P) {
+    const pocket = out.decided === 'reveals' || out.decided === 'forfeit'
+      ? pocketOf(ctx, r, out.counted.map((pid) => out.seeds.get(pid)!))
+      : null;
+    const stakes = new Map<string, bigint>();
+    const payouts = new Map<string, bigint>();
+    const deltas = new Map<string, bigint>();
+    const inPocket = new Set(out.counted);
+    for (const [pid, s] of P) {
+      stakes.set(pid, s.stake);
+      if (!out.decided) continue;
+      // Only a counted pid is paid, and nobody is counted on a void. resolveRound
+      // under a fixed key: a pid like 'constructor' must not read the result
+      // object's prototype.
+      const won = pocket !== null && inPocket.has(pid) ? resolveRound({ bettor: s.rec.b }, pocket).bettor ?? 0 : 0;
+      const payout = BigInt(won);
+      payouts.set(pid, payout);
+      // A void moves nothing: the stake was only ever held, and stops being held.
+      deltas.set(pid, out.decided === 'void' ? 0n : payout - s.stake);
+    }
+    return { pocket, stakes, payouts, deltas, sOut: null };
+  },
+  standing(_sIn, felts, stakeOf) {
+    const held = new Map<string, bigint>();
+    for (const [pid, f] of felts) {
+      const stake = stakeOf(f.hash);
+      if (stake) held.set(pid, stake);
+    }
+    return held;
+  },
+};
+
 // ── The index ────────────────────────────────────────────────────────────────
 
-interface EntryBase<K extends RecKind, R> {
+export interface EntryBase<K extends RecKind, R> {
   kind: K;
   key: string;
   hash: string;
@@ -486,15 +587,11 @@ interface EntryBase<K extends RecKind, R> {
   /** key.length + canon(rec).length */
   size: number;
 }
-interface Signed {
+export interface Signed {
   /** The final verdict, once the SigCheck gave one. */
   verdict?: boolean;
   /** dutyRank for this record's duty, computed on first use. */
   rank?: string;
-}
-interface SlipEntry extends EntryBase<'s', SlipRec>, Signed {
-  /** Σ amounts — at most 400 × MAX_BET_AMOUNT, so exact as a number first. */
-  stake: bigint;
 }
 interface CloseEntry extends EntryBase<'c', CloseRec>, Signed {
   /** Memo of closeInfo, valid while this round's slip set is unchanged. */
@@ -504,6 +601,9 @@ interface CloseEntry extends EntryBase<'c', CloseRec>, Signed {
   /** Memo of decide, valid while this round's slips and reveals and this
    *  close's forfeits and abandons are unchanged. */
   decision?: { key: string; d: Outcome };
+  /** Memo of the game's play: valid for that very decision (the same
+   *  object decide's memo hands back) from the same carried state. */
+  play?: { d: Outcome; sKey: string; p: Play<unknown> };
 }
 interface RevealEntry extends EntryBase<'x', RevealRec> {
   /** The commitment this seed opens (slipCommit of the reveal's own r, p, s). */
@@ -521,9 +621,6 @@ interface CloseInfo {
   /** M, sorted. */
   M: string[];
 }
-
-/** decide()'s answer: a RoundView without the close's own fields. */
-type Outcome = Omit<RoundView, 'r' | 'close' | 'closeRec' | 'frozen'>;
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -587,7 +684,8 @@ export class TableFold {
   readonly ctx: FoldCtx;
   private readonly check: SigCheck;
   private readonly keyOf: KeyOf | undefined;
-  private base: FoldBase = { sid: 'g', u: 0, l: null, n: new Map(), ended: false };
+  private readonly game: FoldGame<unknown>;
+  private base: FoldBase = { sid: 'g', u: 0, l: null, n: new Map(), ended: false, state: null };
 
   private entries = new Map<string, Entry>();
   private slipsByHash = new Map<string, SlipEntry>();
@@ -625,18 +723,21 @@ export class TableFold {
    *  `k === keyOf(p)`. Without it, any verified version does — and a page
    *  could sign a version under someone else's pid with a high `v` and hold
    *  their chips until a close froze the real one. Closes, decisions and
-   *  nets don't read it: a close froze what its signer pinned. */
-  constructor(ctx: FoldCtx, check: SigCheck, keyOf?: KeyOf) {
+   *  nets don't read it: a close froze what its signer pinned.
+   *  `game` is the rules the rounds are played by (roulette by default). */
+  constructor(ctx: FoldCtx, check: SigCheck, keyOf?: KeyOf, game: FoldGame<unknown> = rouletteGame as FoldGame<unknown>) {
     this.ctx = ctx;
     this.check = check;
     this.keyOf = keyOf;
+    this.game = game;
+    this.base = { ...this.base, state: game.start(null) };
   }
 
   /** Point at the incarnation's checkpoint (null = none) — the live session id
    *  follows from it (nextSid). A changed sid clears the index. A checkpoint
-   *  that fails asCheckpoint counts as none. */
+   *  that fails the game's asCheckpoint counts as none. */
   setBase(cp: Checkpoint | null): void {
-    const ok = cp === null ? null : asCheckpoint(cp);
+    const ok = cp === null ? null : this.game.asCheckpoint(cp);
     const sid = nextSid(this.ctx, ok);
     // The sid hashes everything the base holds (all but k and g), so the
     // same sid is the same base: nothing to redo.
@@ -644,7 +745,7 @@ export class TableFold {
     this.clearIndex();
     const n = new Map<string, bigint>();
     if (ok) for (const pid of Object.keys(ok.n).sort()) n.set(pid, BigInt(ok.n[pid]));
-    this.base = { sid, u: ok ? ok.u : 0, l: ok ? ok.l : null, n, ended: ok?.e === 1 };
+    this.base = { sid, u: ok ? ok.u : 0, l: ok ? ok.l : null, n, ended: ok?.e === 1, state: this.game.start(ok) };
     this.dirty = true;
   }
 
@@ -716,7 +817,7 @@ export class TableFold {
   private entryFor(key: string, value: unknown): Entry | null {
     const pk = parseKey(key);
     if (!pk) return null;
-    const rec = pk.kind === 's' ? asSlip(value)
+    const rec = pk.kind === 's' ? this.game.asSlip(value)
       : pk.kind === 'c' ? asClose(value)
       : pk.kind === 'x' ? asReveal(value)
       : pk.kind === 'f' ? asForfeit(value)
@@ -866,23 +967,25 @@ export class TableFold {
   // ── One close ─────────────────────────────────────────────────────────────
 
   /** The slip `c` froze for `pid`, if it is present and could be staked:
-   *  this round, this pid, and a felt with something on it. Its signature is
-   *  the caller's to check. */
+   *  this round, this pid, and one the game lets a close freeze (at roulette
+   *  a felt with something on it). Its signature is the caller's to check. */
   private frozenSlip(c: CloseEntry, pid: string): SlipEntry | null {
     const s = this.slipsByHash.get(c.rec.f[pid]);
-    return s && s.rec.r === c.rec.r && s.rec.p === pid && s.rec.b.length > 0 ? s : null;
+    return s && s.rec.r === c.rec.r && s.rec.p === pid && this.game.frozenOk(s) ? s : null;
   }
 
-  /** The cheap half of "k is the pub of a present, valid slip it freezes":
-   *  everything but the signatures. A close that fails it is never even
-   *  checked; one that passes still needs closeInfo before it takes a place
-   *  in its round's cap. */
+  /** The cheap half of "k is the pub of a present, valid slip it freezes,
+   *  with something on it": everything but the signatures. A close that
+   *  fails it is never even checked; one that passes still needs closeInfo
+   *  before it takes a place in its round's cap. (A game may let a close
+   *  freeze an empty felt, never sign over one.) */
   private signerPresent(c: CloseEntry): boolean {
     const ver = this.slipVer.get(c.rec.r) ?? 0;
     if (c.signer && c.signer.ver === ver) return c.signer.ok;
     let ok = false;
     for (const pid of Object.keys(c.rec.f)) {
-      if (this.frozenSlip(c, pid)?.rec.k === c.rec.k) { ok = true; break; }
+      const s = this.frozenSlip(c, pid);
+      if (s && s.rec.k === c.rec.k && s.rec.b.length > 0) { ok = true; break; }
     }
     c.signer = { ver, ok };
     return ok;
@@ -913,7 +1016,7 @@ export class TableFold {
       if (own === undefined || slipPending) state = 'pending';
       else {
         let signer = false;
-        for (const s of P.values()) if (s.rec.k === c.rec.k) signer = true;
+        for (const s of P.values()) if (s.rec.k === c.rec.k && s.rec.b.length > 0) signer = true;
         state = signer ? 'valid' : 'invalid';
       }
     }
@@ -948,7 +1051,8 @@ export class TableFold {
   }
 
   /** Decide a valid close: (a) the best valid forfeit, (b) every reveal in
-   *  with nothing missing, (c) a verified abandon (void), (d) undecided. */
+   *  with nothing missing, (c) a verified abandon (void), (d) undecided.
+   *  What it pays is the game's (playOf), not this. */
   private decide(c: CloseEntry, info: CloseInfo): Outcome {
     const r = c.rec.r;
     const key = `${this.slipVer.get(r) ?? 0}|${this.revealVer.get(r) ?? 0}|${this.ffaVer.get(c.hash) ?? 0}`;
@@ -1002,34 +1106,25 @@ export class TableFold {
       }
     }
 
-    const pocket = decided === 'reveals' || decided === 'forfeit'
-      ? pocketOf(this.ctx, r, counted.map((pid) => seeds.get(pid)!))
-      : null;
-    const stakes = new Map<string, bigint>();
-    const payouts = new Map<string, bigint>();
-    const deltas = new Map<string, bigint>();
-    const inPocket = new Set(counted);
-    for (const [pid, s] of P) {
-      stakes.set(pid, s.stake);
-      if (!decided) continue;
-      // Only a counted pid is paid, and nobody is counted on a void. resolveRound
-      // under a fixed key: a pid like 'constructor' must not read the result
-      // object's prototype.
-      const won = pocket !== null && inPocket.has(pid) ? resolveRound({ bettor: s.rec.b }, pocket).bettor ?? 0 : 0;
-      const payout = BigInt(won);
-      payouts.set(pid, payout);
-      // A void moves nothing: the stake was only ever held, and stops being held.
-      deltas.set(pid, decided === 'void' ? 0n : payout - s.stake);
-    }
-
     const d: Outcome = {
       present, missing: M, revealed, decided, counted,
       ...(forfeit ? { forfeit } : {}), ...(abandon ? { abandon } : {}),
-      pocket, stakes, payouts, deltas,
+      seeds,
     };
     if (!this.sawPending) c.decision = { key, d };
     this.sawPending = outer || this.sawPending;
     return d;
+  }
+
+  /** The game's play of close `c`, decided as `d`, from carried state `sIn`. */
+  private playOf(c: CloseEntry, info: CloseInfo, d: Outcome, sIn: unknown): Play<unknown> {
+    const sKey = this.game.key(sIn);
+    if (c.play && c.play.d === d && c.play.sKey === sKey) return c.play.p;
+    const p = this.game.play(this.ctx, c.rec.r, d, info.P, info.M, sIn);
+    // Only for a decision decide kept: one made over a pending verdict is
+    // made again next pass, and its play with it.
+    if (c.decision?.d === d) c.play = { d, sKey, p };
+    return p;
   }
 
   // ── The whole session ─────────────────────────────────────────────────────
@@ -1044,7 +1139,7 @@ export class TableFold {
     if (this.base.ended) {
       return {
         base: this.base, rounds: [], tip: null, open: u + 1, parent: sid, openCloses: [], felts: new Map(),
-        nets: new Map(this.base.n), held: new Map(), revealedCommits: new Set(),
+        nets: new Map(this.base.n), held: new Map(), carry: this.base.state, revealedCommits: new Set(),
         pending: false, bytes: this.bytes, rawBytes: this.rawBytes, records: this.entries.size,
       };
     }
@@ -1053,6 +1148,7 @@ export class TableFold {
     //    of those are decided. A close is eligible only under an eligible,
     //    decided parent, so the first round with nothing decided ends it.
     const states = new Map<string, 'valid' | 'pending' | 'invalid'>();
+    const infos = new Map<string, CloseInfo>();
     const outcomes = new Map<string, Outcome>();
     const eligible: CloseEntry[][] = [];
     let decidedBefore = new Set<string>();
@@ -1081,6 +1177,7 @@ export class TableFold {
         considered++;
         if (info.state !== 'valid') continue;
         ok.push(c);
+        infos.set(c.hash, info);
         const d = this.decide(c, info);
         outcomes.set(c.hash, d);
         if (d.decided) decidedHere.add(c.hash);
@@ -1103,9 +1200,12 @@ export class TableFold {
 
     // 3. Walk from the base: the highest score, then the lowest closeRank,
     //    then the lowest hash. Stop on the first undecided pick (the tip).
+    //    Each pick is played by the game from the state the rounds before it
+    //    left; rival branches are decided (step 2 needs that) but never played.
     const rounds: RoundView[] = [];
     let tip: RoundView | null = null;
     let parent = sid;
+    let state = this.base.state;
     for (let i = 0; i < eligible.length; i++) {
       let best: CloseEntry | null = null;
       for (const c of eligible[i]) {
@@ -1115,10 +1215,16 @@ export class TableFold {
         if (ds > 0 || (ds === 0 && this.byRank(c, best) < 0)) best = c;
       }
       if (!best) break;
-      const view: RoundView = { r: best.rec.r, close: best.hash, closeRec: best.rec, frozen: best.rec.f, ...outcomes.get(best.hash)! };
+      const { seeds: _seeds, ...d } = outcomes.get(best.hash)!;
+      const play = this.playOf(best, infos.get(best.hash)!, outcomes.get(best.hash)!, state);
+      const view: RoundView = {
+        r: best.rec.r, close: best.hash, closeRec: best.rec, frozen: best.rec.f, ...d,
+        pocket: play.pocket, stakes: play.stakes, payouts: play.payouts, deltas: play.deltas,
+      };
       rounds.push(view);
       if (!view.decided) { tip = view; break; }
       parent = best.hash;
+      state = play.sOut;
     }
     const open = tip ? tip.r : u + rounds.length + 1;
 
@@ -1149,14 +1255,11 @@ export class TableFold {
       }
     }
 
-    const held = new Map<string, bigint>();
+    let held = new Map<string, bigint>();
     if (tip) {
       for (const [pid, stake] of tip.stakes) if (stake) held.set(pid, stake);
     } else {
-      for (const [pid, f] of felts) {
-        const stake = this.slipsByHash.get(f.hash)!.stake;
-        if (stake) held.set(pid, stake);
-      }
+      held = this.game.standing(state, felts, (hash) => this.slipsByHash.get(hash)!.stake);
     }
 
     const sums = new Map(this.base.n);
@@ -1183,6 +1286,7 @@ export class TableFold {
       felts,
       nets,
       held,
+      carry: state,
       revealedCommits,
       pending: this.sawPending,
       bytes: this.bytes,
