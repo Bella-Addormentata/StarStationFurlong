@@ -28,12 +28,18 @@
  * crapsCroupier.ts). The fling is cosmetic: the dice faces come from the
  * table's fairness mode, and every client animates the same throw from the
  * synced `throw:<tableId>` record.
+ *
+ * 🧮 A COMPUTED roulette table (computedTable.ts) has no operator: its
+ * state, felt and verdict come from the fold of the players' records on
+ * this page's clock, a felt goes down as a signed slip, and the wheel spins
+ * once per result (its spin key). Every branch asks isComputedTable live,
+ * so a switch mid-visit turns the table under the player's hands.
  */
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, casinoWhole, clearMySeat, readAllBets, readAllCrapsBets, readChips, readSeedRecord,
-  readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
+  casinoDocEpoch, casinoWhole, clearMySeat, computedIncEnded, computedSettled, isComputedTable, readAllBets, readAllCrapsBets,
+  readChips, readSeedRecord, readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
   writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
@@ -46,6 +52,12 @@ import {
   closeBetting, isCroupierLive, openBetting, RECONNECTING_NOTICE, rollAndSettle, ROULETTE_PAGE_ID, spinSeenAt,
   SPIN_TAKEOVER_MS, tablesAwake,
 } from './croupier';
+import {
+  computedDecidedTo, computedMine, computedOldBuildDriving, computedRoundCheck, computedSwitchState, readComputedBets,
+  readComputedRoulette, readMyComputedBets, SWITCH_OFF_REFUSED, SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff,
+  switchComputedOn, writeComputedSlip,
+} from './computedTable';
+import type { ComputedRouletteState, ComputedSlipWrite } from './computedTable';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -67,6 +79,7 @@ import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/
 import { isFairTable, MAX_TABLE_BETTORS, REVEAL_GRACE_MS, roundIsFair, tickFairSeeds, verifySettledRound } from './fairTableSeeds';
 import { readPlayerDisplayName } from './games/gamesDoc';
 import { betLabel, payoutFor, pocketColor } from './games/roulette';
+import { escapeHtml } from './htmlEscape';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 
@@ -77,13 +90,23 @@ import { getPlayerId } from './identity';
  *  the mode, not the outcome: whether a given result really took bettors'
  *  seeds is the ⚙ card's verdict line, which warns on house-seed-only. */
 export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { text: string; color: string; fair: boolean } {
+  // 🧮 A computed table has no owner to trust, and no house seed either.
+  if (game === 'roulette' && isComputedTable(tableId)) {
+    return { text: "PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS", color: FRIENDLY_RED, fair: false };
+  }
   return roundIsFair(tableId, game)
     ? { text: '✔ FAIR TABLE · EVERY BETTOR ADDS A SEED · CHECK EACH RESULT ON ⚙', color: '#7CF5B0', fair: true }
-    : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: '#F28B87', fair: false };
+    : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: FRIENDLY_RED, fair: false };
 }
+
+/** The Friendly plaque's red. */
+const FRIENDLY_RED = '#F28B87';
 
 /** How long a fresh lease write gets to converge before its page settles. */
 const LEASE_SETTLE_MS = 600;
+
+/** 🧮 What a press that runs a round says at a computed table. */
+const NO_HAND_SPIN = "NOBODY SPINS THIS TABLE BY HAND — IT SPINS ONCE THE BETTORS' SEEDS ARE IN";
 
 /** Friendly tables this page has already warned about (once per table). */
 const friendlyWarned = new Set<string>();
@@ -200,6 +223,14 @@ interface TableRuntime {
   landedRound: number;
   /** Roulette: the settled round whose spin was started. */
   spunRound: number;
+  /** 🧮 A computed table: the incarnation the runtime was primed on (null
+   *  while the table is owner-run); whether it has seen the table counted
+   *  and checked yet (`counted`: what showed by then showed before it
+   *  looked); and by round, the pocket whose spin it last started, or found
+   *  showing then: a round's pocket changes only with a rewrite. */
+  computed: string | null;
+  counted: boolean;
+  spun: Map<number, number>;
   /** Doc changed since the felt was last laid out. */
   dirty: boolean;
 }
@@ -210,7 +241,10 @@ let unsubscribeDoc: (() => void) | null = null;
 function runtime(tableId: string): TableRuntime {
   let rt = runtimes.get(tableId);
   if (!rt || rt.epoch !== casinoDocEpoch()) {
-    rt = { epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, dirty: true };
+    rt = {
+      epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
+      spun: new Map(), dirty: true,
+    };
     runtimes.set(tableId, rt);
   }
   return rt;
@@ -218,6 +252,61 @@ function runtime(tableId: string): TableRuntime {
 
 function markAllDirty(): void {
   for (const rt of runtimes.values()) rt.dirty = true;
+}
+
+/** Lay the table's felt out again on its next frame: a computed felt held
+ *  back to write (the coalescing) shows at once, with no transaction to say
+ *  so. */
+function markDirty(tableId: string): void {
+  const rt = runtimes.get(tableId);
+  if (rt) rt.dirty = true;
+}
+
+/** 🧮 What this page has shown of a computed table's results: the pocket of
+ *  each round whose spin key it saw (a later key for one of those rounds
+ *  with another pocket is a rewrite: counted, for the focused table's
+ *  notice), and the last round it showed decided (one no longer on the
+ *  chain is undone). Per table, for one room doc and incarnation. */
+interface ComputedShown {
+  epoch: number;
+  inc: string;
+  pockets: Map<number, number>;
+  shown: number;
+  rewrites: number;
+  rewrittenRound: number;
+}
+
+const computedShown = new Map<string, ComputedShown>();
+/** Rounds of a table's pockets kept (a rewrite reaches back no further
+ *  than the session, TRIM_ROUNDS). */
+const SHOWN_ROUNDS = 64;
+
+/** The round and pocket of a spin key (`<round>:<pocket>`), or null. */
+function spinKeyParts(key: string): { round: number; pocket: number } | null {
+  const m = /^(\d+):(\d+)$/.exec(key);
+  return m ? { round: Number(m[1]), pocket: Number(m[2]) } : null;
+}
+
+/** Note what computed table `tableId` shows now (its view `s`). */
+function seeComputed(tableId: string, s: ComputedRouletteState): ComputedShown {
+  let c = computedShown.get(tableId);
+  if (!c || c.epoch !== casinoDocEpoch() || c.inc !== s.inc) {
+    c = { epoch: casinoDocEpoch(), inc: s.inc, pockets: new Map(), shown: 0, rewrites: 0, rewrittenRound: 0 };
+    computedShown.set(tableId, c);
+  }
+  const k = spinKeyParts(s.spinKey);
+  if (k) {
+    const was = c.pockets.get(k.round);
+    if (was !== undefined && was !== k.pocket) {
+      c.rewrites += 1;
+      c.rewrittenRound = k.round;
+    }
+    c.pockets.delete(k.round);
+    c.pockets.set(k.round, k.pocket);
+    while (c.pockets.size > SHOWN_ROUNDS) c.pockets.delete(c.pockets.keys().next().value as number);
+    if (k.round > c.shown) c.shown = k.round;
+  }
+  return c;
 }
 
 /** Tables whose dice the LOCAL shooter is holding — the frame driver leaves
@@ -492,6 +581,18 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
 }
 
 function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
+  if (isComputedTable(id)) {
+    driveComputedRoulette(id, h, rt, me);
+    return;
+  }
+  if (rt.computed !== null) {
+    // Switched back to owner-run: start afresh, as on walking up (its rounds
+    // count from 1 again, on a fresh incarnation: a round 1 spun before the
+    // switch is not this one).
+    rt.computed = null;
+    rt.primed = false;
+    rt.spunRound = 0;
+  }
   const s = readTableState(id);
   h.setFairBadge(roundIsFair(id, 'roulette'));
   if (!rt.primed) {
@@ -509,25 +610,84 @@ function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime,
     h.wheelRest(s.phase === 'settled' ? s.result : null);
     if (rt.dirty) {
       rt.dirty = false;
-      const seats = readSeats(id);
-      const anchors = seatAnchors('roulette-table', seats);
-      const regionFor = new Map(ROULETTE_LAYOUT.regions.map((r) => [spotKey(r.bet), r.chipRect]));
-      const colors = rouletteChipColors(seats);
-      // Roulette players set their own chips, often in the same box, so each
-      // plays chips of their stand's own colour rather than a dealer's spot.
-      h.setFeltChips(layoutStacks(
-        readAllBets(id, s.round),
-        anchors,
-        (b: RouletteBet) => {
-          const rect = regionFor.get(spotKey(b));
-          return rect ? { rect } : null;
-        },
-        me,
-        (pid) => colors.get(pid),
-      ));
-      // Your rail and hand are your colour chips, the colour your bets show.
-      h.setOwnChipColor(colors.get(me) ?? null);
-      h.setHighlight(s.phase === 'settled' && s.result !== null ? rouletteWinners(s.result) : NO_HIGHLIGHT);
+      layRouletteFelt(id, h, me, readAllBets(id, s.round), s.phase === 'settled' ? s.result : null);
+    }
+  }
+}
+
+/** Every bettor's chips on a roulette felt, and the winning boxes lit
+ *  (`result`: the settled pocket, null for none). */
+function layRouletteFelt(
+  id: string, h: CasinoTableVisualHandle, me: string, bets: Record<string, RouletteBet[]>, result: number | null,
+): void {
+  const seats = readSeats(id);
+  const anchors = seatAnchors('roulette-table', seats);
+  const regionFor = new Map(ROULETTE_LAYOUT.regions.map((r) => [spotKey(r.bet), r.chipRect]));
+  const colors = rouletteChipColors(seats);
+  // Roulette players set their own chips, often in the same box, so each
+  // plays chips of their stand's own colour rather than a dealer's spot.
+  h.setFeltChips(layoutStacks(
+    bets,
+    anchors,
+    (b: RouletteBet) => {
+      const rect = regionFor.get(spotKey(b));
+      return rect ? { rect } : null;
+    },
+    me,
+    (pid) => colors.get(pid),
+  ));
+  // Your rail and hand are your colour chips, the colour your bets show.
+  h.setOwnChipColor(colors.get(me) ?? null);
+  h.setHighlight(result !== null ? rouletteWinners(result) : NO_HIGHLIGHT);
+}
+
+/** 🧮 A computed roulette table's frame: the view off the fold (on this
+ *  page's clock), the felt as this page shows it (its own held-back felt
+ *  laid over its written one), and the wheel spun once per result: when the
+ *  spin key names a round this runtime hasn't spun, or one it spun with
+ *  another pocket (a rewrite, which ROUND n WAS REWRITTEN tells: back to a
+ *  pocket it showed before too). Not for a round whose result is showing
+ *  again only because a later one was undone: its pocket is the one spun.
+ *  Primed like an owner-run table's, so a page walking up mid-show spins
+ *  nothing old: on the first view counted whole and checked (computedSettled),
+ *  since one read before the checks are done shows none of what is decided
+ *  (they run in slices: casinoDoc), and the result they find would read as
+ *  new. */
+function driveComputedRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
+  const s = readComputedRoulette(id);
+  h.setFairBadge(false);
+  if (!rt.primed || rt.computed !== (s?.inc ?? '')) {
+    rt.primed = true;
+    rt.computed = s?.inc ?? '';
+    rt.counted = false;
+    rt.spun = new Map();
+    rt.dirty = true;
+    h.reset();
+  }
+  if (!s) return;
+  seeComputed(id, s);
+  const k = spinKeyParts(s.spinKey);
+  if (!rt.counted) {
+    if (casinoWhole(id) && computedSettled(id)) {
+      rt.counted = true;
+      if (k) rt.spun.set(k.round, k.pocket);
+    }
+  } else if (k && rt.spun.get(k.round) !== k.pocket) {
+    rt.spun.delete(k.round);
+    rt.spun.set(k.round, k.pocket);
+    if (rt.spun.size > SHOWN_ROUNDS) rt.spun.delete(rt.spun.keys().next().value as number);
+    h.wheelSpin(k.pocket, k.round * 7919 + 13);
+  }
+  const animating = h.wheelSpinning();
+  if (!animating) {
+    h.wheelRest(s.phase === 'settled' ? s.result : null);
+    if (rt.dirty) {
+      rt.dirty = false;
+      const bets = { ...readComputedBets(id, s.round) };
+      const mine = readMyComputedBets(id, me, s.round);
+      if (mine.length > 0) bets[me] = mine;
+      else delete bets[me];
+      layRouletteFelt(id, h, me, bets, s.phase === 'settled' ? s.result : null);
     }
   }
 }
@@ -553,6 +713,7 @@ export function casinoTablesFrame(dt: number, visuals: ReadonlyMap<string, Casin
 export function forgetCasinoTable(tableId: string): void {
   runtimes.delete(tableId);
   localHold.delete(tableId);
+  computedShown.delete(tableId);
 }
 
 // ── The focused table (the local player) ─────────────────────────────────────
@@ -679,6 +840,40 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const verdicts = new Map<string, { text: string; color: string }>();
   /** `epoch:round` checks in flight, so re-renders don't start them again. */
   const verifying = new Set<string>();
+  /** 🔀 The card asks the house to confirm a switch-on. */
+  let confirming = false;
+  /** 🧮 The computed incarnation this table was last seen on here (null:
+   *  owner-run), whether my felt held chips on it then, and the rewrites of
+   *  its results told (ComputedShown.rewrites; −1: none counted yet). */
+  let watchedInc: string | null = null;
+  let watchedStake = false;
+  let rewritesTold = -1;
+  /** Tell the player what the table did that no status line says: a round
+   *  it showed rewritten, and a switch-off handing their felt back. On a
+   *  whole doc only (one holding part of an update can read the switch as
+   *  gone). Nor while the incarnation watched goes on, its switch lost (a
+   *  peer took it away, and the room's pages put it back on their next
+   *  frame: computedTable putSwitchBack): the felt is back in play then. */
+  const noteComputed = (): void => {
+    if (game !== 'roulette' || !casinoWhole(itemId)) return;
+    const s = computed() ? readComputedRoulette(itemId) : null;
+    if (s) {
+      const seen = seeComputed(itemId, s);
+      if (watchedInc !== s.inc) rewritesTold = seen.rewrites;
+      else if (seen.rewrites > rewritesTold) {
+        rewritesTold = seen.rewrites;
+        say(`ROUND ${seen.rewrittenRound} WAS REWRITTEN`);
+      }
+      watchedInc = s.inc;
+      watchedStake = readMyComputedBets(itemId, me, s.round).length > 0;
+      return;
+    }
+    if (watchedInc !== null && !computedIncEnded(itemId, watchedInc)) return;
+    if (watchedInc !== null && watchedStake) say('TABLE SWITCHED — YOUR BETS ARE BACK');
+    watchedInc = null;
+    watchedStake = false;
+    rewritesTold = -1;
+  };
   /** The room doc this focus began in: rounds and bets from another room's
    *  table with the same id must not count as this window's. */
   let mountEpoch = casinoDocEpoch();
@@ -697,17 +892,44 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   // ── Reads ─────────────────────────────────────────────────────────────────
 
+  /** 🧮 Is this a computed roulette table now (asked live: the house may
+   *  switch it while the player stands here)? */
+  const computed = (): boolean => game === 'roulette' && isComputedTable(itemId);
   const crapsState = (): CrapsTableState | null => readCrapsTableState(itemId);
-  const rouletteState = (): RouletteTableState | null => readTableState(itemId);
+  const rouletteState = (): RouletteTableState | null => (computed() ? readComputedRoulette(itemId) : readTableState(itemId));
   const round = (): number => (game === 'craps' ? crapsState()?.round : rouletteState()?.round) ?? 1;
   const phase = (): 'betting' | 'closing' | 'settled' =>
     (game === 'craps' ? crapsState()?.phase : rouletteState()?.phase) ?? 'betting';
   const deadline = (): number | undefined =>
     game === 'craps' ? crapsState()?.phaseDeadline : rouletteState()?.phaseDeadline;
-  const myBets = (): AnyBet[] => (game === 'craps' ? readMyCrapsBets(itemId, me) : readMyBets(itemId, me, round()));
+  // (A computed felt this page holds back to write shows as mine at once.)
+  const myBets = (): AnyBet[] => (game === 'craps'
+    ? readMyCrapsBets(itemId, me)
+    : computed() ? readMyComputedBets(itemId, me, round()) : readMyBets(itemId, me, round()));
+  /** 🧮 Put my felt down on a computed table as a slip; false (and the
+   *  bettor told why) when it didn't go down. */
+  const writeSlip = (bets: RouletteBet[]): boolean => {
+    let wrote: ComputedSlipWrite;
+    try {
+      wrote = writeComputedSlip(itemId, bets);
+    } catch {
+      // (A felt a slip can't carry: never one this table built. Nothing goes.)
+      wrote = 'reconnecting';
+    }
+    if (wrote === 'ok') {
+      markDirty(itemId);
+      return true;
+    }
+    say(wrote === 'closed' ? 'NO MORE BETS'
+      : wrote === 'full' ? 'THE TABLE IS FULL — WAIT FOR A PLACE'
+        : wrote === 'chips' ? 'NOT ENOUGH CHIPS — VISIT THE CASHIER'
+          : RECONNECTING_NOTICE);
+    return false;
+  };
   /** Write my list; false (and the bettor told why) when it didn't go down:
    *  the table full, or the doc holding part of an update (casinoWhole). */
   const writeBets = (bets: AnyBet[]): boolean => {
+    if (computed()) return writeSlip(bets as RouletteBet[]);
     const wrote = game === 'craps'
       ? writeMyCrapsBets(itemId, me, bets as CrapsBet[])
       : writeMyBets(itemId, me, round(), bets as RouletteBet[]);
@@ -828,7 +1050,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     // 🪙 Bets hold their chips on a table that is up (casinoDoc STAKES ON THE
     // FELT): until the house (or its robot) opens this one, nothing goes down.
-    if (!(game === 'craps' ? crapsState() : rouletteState())) {
+    // (A computed table is always open: nobody opens its rounds.)
+    const comp = computed();
+    if (!comp && !(game === 'craps' ? crapsState() : rouletteState())) {
       say(deps.isHouse()
         ? `PRESS ${game === 'craps' ? 'ROLL' : 'SPIN'} ON ⚙ TO OPEN THE TABLE`
         : "THE TABLE ISN'T OPEN YET — WAIT FOR THE HOUSE");
@@ -877,7 +1101,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     // transcript, and the close's freeze of who is in it): a newcomer past
     // that would be left out of the settle, so they wait.
     if (mine.length === 0) {
-      const all = game === 'craps' ? readAllCrapsBets(itemId) : readAllBets(itemId, round());
+      const all = game === 'craps' ? readAllCrapsBets(itemId) : comp ? readComputedBets(itemId, round()) : readAllBets(itemId, round());
       if (Object.keys(all).filter((pid) => pid !== me).length >= MAX_TABLE_BETTORS) {
         say('THE TABLE IS FULL — WAIT FOR A PLACE');
         return;
@@ -892,13 +1116,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
     if (!writeBets([...mine, ...placed])) return;
-    const warnKey = `${casinoDocEpoch()}:${itemId}`;
+    const warnKey = `${casinoDocEpoch()}:${itemId}${comp ? ':computed' : ''}`;
     // Commit this bet's seed now, not on the next tick: a quick close must
-    // still find it.
-    tickFairSeeds(itemId, game, me, Date.now(), true);
+    // still find it. (A computed slip carries its own commitment.)
+    if (!comp) tickFairSeeds(itemId, game, me, Date.now(), true);
     if (!roundIsFair(itemId, game) && !friendlyWarned.has(warnKey)) {
       friendlyWarned.add(warnKey);
-      say("🤝 FRIENDLY TABLE — THE OWNER COULD STEER RESULTS · BET WITH PEOPLE YOU TRUST");
+      say(comp
+        ? '🤝 FRIENDLY TABLE — SEEDS COME FROM THE PLAYERS ONLY · A MODIFIED GAME CAN STEER OR REWRITE A ROUND'
+        : "🤝 FRIENDLY TABLE — THE OWNER COULD STEER RESULTS · BET WITH PEOPLE YOU TRUST");
     }
     const key = spotKey(rg.bet);
     added.set(key, [...(added.get(key) ?? []), ...chips]);
@@ -1365,6 +1591,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     const s = rouletteState();
     if (animating()) return { line: '🎡 NO MORE BETS — THE BALL IS ROLLING…', color: PINK };
+    if (computed()) {
+      const c = computedStatus(s as ComputedRouletteState | null, remain);
+      if (c) return c;
+    }
     if (s?.phase === 'closing') return { line: '✋ NO MORE BETS', color: PINK };
     if (s?.phase === 'settled' && s.voided) {
       return { line: '⚠ SPIN VOID — IT COULD NOT BE SETTLED FAIRLY · STAKES RETURNED', color: GOLD_BRIGHT };
@@ -1374,6 +1604,38 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''}`, color: won ? WIN : GOLD_BRIGHT };
     }
     return { line: `🎡 ROUND ${round()} — PLACE YOUR BETS${remain()}${readChips(me) <= 0 && !staked ? ' · VISIT THE CASHIER FOR CHIPS' : ''}`, color: GOLD_BRIGHT };
+  };
+
+  /** 🧮 The status lines only a computed table has (null: the owner-run
+   *  table's line says it): a round undone, the seeds awaited, and what
+   *  became of my felt in the round closing or shown. */
+  const computedStatus = (s: ComputedRouletteState | null, remain: () => string): { line: string; color: string } | null => {
+    if (!s) return null;
+    const shown = seeComputed(itemId, s).shown;
+    const to = computedDecidedTo(itemId);
+    if (to !== null && shown > to) return { line: `⚠ ROUND ${shown} UNDONE — BETS BACK${remain()}`, color: GOLD_BRIGHT };
+    const mine = computedMine(itemId);
+    if (s.phase === 'closing') {
+      if (mine?.tooLate) return { line: '✋ TOO LATE — THE CLOSE HAD YOUR EARLIER BETS', color: PINK };
+      if (mine?.leftOut) return { line: '✋ YOUR BET MISSED THE CLOSE — CHIPS BACK', color: GOLD_BRIGHT };
+      if (mine?.frozen && !mine.revealed) return { line: '✋ NO MORE BETS — STAY UNTIL THE SPIN', color: PINK };
+      return { line: '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
+    }
+    if (s.phase === 'settled' && s.voided) return { line: '⚠ SPIN VOID — NOBODY COULD FINISH IT · STAKES RETURNED', color: GOLD_BRIGHT };
+    if (s.phase === 'settled' && s.result !== null) {
+      const check = computedRoundCheck(itemId);
+      const fate = check?.round === s.round ? check.mine : null;
+      const note = mine?.tooLate ? 'TOO LATE — THE CLOSE HAD YOUR EARLIER BETS'
+        : fate === 'left-out' ? 'YOUR BET MISSED THE CLOSE — CHIPS BACK'
+          : fate === 'late' ? 'YOUR SEED CAME IN LATE — BETS FORFEITED'
+            : fate === 'forfeited' ? 'YOUR SEED NEVER CAME — BETS FORFEITED'
+              : '';
+      if (note) {
+        const won = (s.payouts?.[me] ?? 0) > 0;
+        return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''} · ${note}`, color: GOLD_BRIGHT };
+      }
+    }
+    return null;
   };
 
   const renderBar = (): void => {
@@ -1501,27 +1763,94 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return { text: `🔒 ${what} · verifying…`, color: '#7CF5B0' };
   };
 
+  /** 🧮 The ⚙ card's lines for a computed table's last decided round: how
+   *  it was decided (the fold's own verdict, no transcript to re-hash), what
+   *  became of my slip, and what this page saw that the room should know. */
+  const computedCheckLines = (): { text: string; color: string }[] => {
+    const out: { text: string; color: string }[] = [];
+    const c = computedRoundCheck(itemId);
+    if (c) {
+      const parts = [`🔓 LAST SPIN · ROUND ${c.round}`];
+      if (c.decided === 'void') parts.push('VOID — NOBODY COULD FINISH IT · STAKES RETURNED');
+      else {
+        parts.push(`${c.counted} OF ${c.of} SEED${c.of === 1 ? '' : 'S'} COUNTED`);
+        // (Named by the key this page pins for the player: display only. A
+        // name is the player's own to set, and any peer's to rewrite: it goes
+        // into the card's markup escaped, as text.)
+        parts.push(c.decided === 'reveals' ? 'DECIDED BY ALL REVEALS'
+          : `DECIDED BY A FORFEIT BY ${c.forfeitBy ? escapeHtml(readPlayerDisplayName(c.forfeitBy).toUpperCase()) : 'A KEY THIS PAGE DOESN\'T KNOW'}`);
+      }
+      if (c.missing.length > 0) parts.push(`${c.missing.length} FROZEN SLIP${c.missing.length === 1 ? '' : 'S'} NEVER CAME (NOT STAKED)`);
+      if (c.mine === 'frozen') parts.push('✓ YOUR SLIP WAS FROZEN');
+      if (c.mine === 'left-out') parts.push('YOUR SLIP WAS LEFT OUT — CHIPS BACK');
+      if (c.mine === 'late') parts.push('✗ YOUR SEED CAME IN LATE — BETS FORFEITED');
+      if (c.mine === 'forfeited') parts.push('✗ YOUR SEED NEVER CAME — BETS FORFEITED');
+      const bad = c.mine === 'late' || c.mine === 'forfeited';
+      out.push({ text: parts.join(' · '), color: bad ? '#FF8A80' : c.decided === 'reveals' ? '#7CF5B0' : '#F5C26B' });
+      if (c.dropped.length > 0) out.push({ text: '🚩 A FORFEIT DROPPED A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
+      if (c.checkpointDiff > 0) {
+        out.push({ text: `🚩 THE CHECKPOINT DIFFERS FROM THIS PAGE BY ${c.checkpointDiff} CHIP${c.checkpointDiff === 1 ? '' : 'S'}`, color: '#FF8A80' });
+      }
+      if (c.pinMismatch.length > 0) out.push({ text: "🚩 A FROZEN SLIP'S KEY ISN'T ITS PLAYER'S", color: '#FF8A80' });
+      if (c.replaced !== undefined) out.push({ text: `🚩 ROUND ${c.replaced} REPLACED AFTER ITS SEEDS WERE OUT`, color: '#FF8A80' });
+    }
+    if (computedOldBuildDriving(itemId)) out.push({ text: '⚠ AN OLDER GAME VERSION IS ALSO RUNNING THIS TABLE', color: '#F5C26B' });
+    return out;
+  };
+
+  /** 🔀 The house's switch row (computedSwitchState: the house, at a
+   *  roulette table, with the dev flag, or without it on a computed one),
+   *  owner-run or computed: the press, or why it can't go now; a switch-on
+   *  asks first. */
+  const switchRows = (house: boolean): string[] => {
+    const sw = computedSwitchState(itemId, game, house);
+    if (!sw.show) return [];
+    const rows: string[] = [];
+    if (confirming && !sw.on) {
+      rows.push(`<div style="font-size:9.5px;font-weight:800;color:${FRIENDLY_RED};">${SWITCH_ON_CONFIRM}</div>`);
+      rows.push(`<div style="display:flex;gap:8px;justify-content:flex-end;">${btn('computed-cancel', 'CANCEL', true)}${btn('computed-confirm', 'CONFIRM', sw.can)}</div>`);
+    } else {
+      rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <span style="font-size:9px;color:${DIM};letter-spacing:1.2px;">${sw.on ? "PLAYERS' TABLE · ON" : "PLAYERS' TABLE · OFF"}</span>
+        ${sw.on ? btn('computed-off', 'BACK TO THE OWNER', sw.can) : btn('computed-on', 'RUN WITHOUT THE OWNER (FRIENDLY)', sw.can)}</div>`);
+    }
+    if (sw.reason) rows.push(`<div style="font-size:9px;color:#F5C26B;">${sw.reason}</div>`);
+    return rows;
+  };
+
   const renderCard = (): void => {
     if (!card) return;
     const house = deps.isHouse();
     const live = isCroupierLive(itemId);
     const p = phase();
+    const comp = computed();
     const rows: string[] = [];
     rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;">
       <span style="font-size:12px;font-weight:900;letter-spacing:1px;color:${GOLD_BRIGHT};">⚙️ ${game === 'craps' ? 'CRAPS' : 'ROULETTE'} TABLE</span>
       <button data-act="close" aria-label="Close the table card" style="background:none;border:none;color:${GOLD};font-size:16px;cursor:pointer;">✕</button></div>`);
-    rows.push(`<div style="font-size:9px;color:${DIM};letter-spacing:1px;">${house ? 'YOU RUN THIS TABLE' : 'THE OWNER SETS THIS TABLE · ANYONE CAN LOOK'}</div>`);
+    rows.push(`<div style="font-size:9px;color:${DIM};letter-spacing:1px;">${comp
+      ? "NOBODY RUNS THIS TABLE · THE PLAYERS' PAGES MOVE IT ALONG · ANYONE CAN LOOK"
+      : house ? 'YOU RUN THIS TABLE' : 'THE OWNER SETS THIS TABLE · ANYONE CAN LOOK'}</div>`);
     rows.push(`<div style="font-size:10px;line-height:1.7;color:${GOLD};border-top:1px solid rgba(212,168,75,0.18);padding-top:8px;">${rulesHtml()}</div>`);
     // ⚖️ Fair / Friendly, how the result is made, and the last result's check.
     const badge = fairnessBadge(itemId, game);
     rows.push(`<div style="font-size:10px;font-weight:900;letter-spacing:1px;color:${badge.color};">${badge.text}</div>`);
+    if (comp) {
+      // 🧮 No fairness to set, no robot, nothing to press: the fold's verdict,
+      // the house's switch, and how the round goes on.
+      for (const line of computedCheckLines()) rows.push(`<div style="font-size:9px;color:${line.color};">${line.text}</div>`);
+      rows.push(...switchRows(house));
+      rows.push(`<div style="font-size:9.5px;color:${DIM};">BETS CLOSE ON THE TIMER · THE WHEEL SPINS ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE SPIN</div>`);
+      pushHelp(rows);
+      return;
+    }
     const mode = readCrapsFairnessPref(itemId) ?? getCrapsFairnessMode();
     const info = game === 'craps' || mode === 'multiparty' ? FAIRNESS_MODES[mode] : FAIRNESS_MODES.rng;
     rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
       <span style="font-size:9px;color:${DIM};letter-spacing:1.2px;">${game === 'craps' ? 'DICE' : 'WHEEL'} FAIRNESS</span>
       ${house ? btn('fairness', info.label.toUpperCase(), true) : `<span style="font-size:10px;color:${GOLD_BRIGHT};">${info.label.toUpperCase()}</span>`}</div>`);
     rows.push(`<div style="font-size:9px;color:${DIM};">${info.blurb}${game === 'craps' && (mode === 'commit-reveal' || mode === 'block-beacon') ? ' (dev-simulated, so not Fair yet)' : ''}</div>`);
-    if (isFairTable(itemId) !== badge.fair) {
+    if (isFairTable(itemId, game) !== badge.fair) {
       rows.push(`<div style="font-size:9px;color:${DIM};">THE NEW SETTING STARTS WITH THE NEXT ${game === 'craps' ? 'ROLL' : 'ROUND'}</div>`);
     }
     if (game === 'craps') {
@@ -1544,6 +1873,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     } else {
       rows.push(`<div style="font-size:9.5px;color:${DIM};">THE HOUSE ${game === 'craps' ? 'THROWS' : 'SPINS'} WHEN THE BETS ARE DOWN</div>`);
     }
+    // 🔀 The house's switch to a computed table (the dev flag only; the way
+    // back shows on a computed table without it).
+    rows.push(...switchRows(house));
+    pushHelp(rows);
+  };
+
+  /** The card's help lines, then the card drawn. */
+  const pushHelp = (rows: string[]): void => {
+    if (!card) return;
     rows.push(`<div style="font-size:9px;color:#56606C;border-top:1px solid rgba(212,168,75,0.12);padding-top:8px;line-height:1.6;">
       DRAG ACROSS THE CHIPS IN YOUR RAIL TO PICK THEM UP · CLICK A BOX TO BET THEM · CLICK AGAIN ELSEWHERE TO BET THE SAME ·
       CLICK YOUR OWN CHIPS TO TAKE THEM BACK · RIGHT-CLICK PUTS YOUR HAND BACK · ESC STEPS AWAY<br>
@@ -1567,6 +1905,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return;
     }
     if (!house) return;
+    if (act === 'computed-on' || act === 'computed-cancel' || act === 'computed-confirm' || act === 'computed-off') {
+      pressSwitch(act);
+      renderCard();
+      return;
+    }
+    // 🧮 Nothing to set or press on a computed table (none of it is shown):
+    // nobody runs its rounds. (SPIN says so itself: spinByHand.)
+    if (computed() && (act === 'fairness' || act === 'next')) {
+      say(NO_HAND_SPIN);
+      renderCard();
+      return;
+    }
     if (act === 'fairness') {
       // Roulette is Fair or plain RNG; craps also has its two dev modes. The
       // change applies from the next window the house opens.
@@ -1605,9 +1955,38 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     renderCard();
   };
 
+  /** 🔀 The house's switch row pressed: a switch-on asks first (the room's
+   *  default is Fair, a computed table Friendly), then goes or says why not;
+   *  a switch-off goes or says why not. Only where the row shows. */
+  const pressSwitch = (act: string): void => {
+    const sw = computedSwitchState(itemId, game, deps.isHouse());
+    if (!sw.show) {
+      confirming = false;
+      return;
+    }
+    if (act === 'computed-on') confirming = !sw.on;
+    else if (act === 'computed-cancel') confirming = false;
+    else if (act === 'computed-confirm') {
+      confirming = false;
+      if (sw.on) return;
+      const r = switchComputedOn(itemId, game);
+      say(r === 'ok' ? "THE PLAYERS RUN THIS TABLE NOW — NO OPERATOR · FRIENDLY" : SWITCH_ON_REFUSED[r]);
+    } else if (act === 'computed-off') {
+      confirming = false;
+      if (!sw.on) return;
+      const r = switchComputedOff(itemId);
+      say(r === 'ok' ? 'THE OWNER RUNS THIS TABLE AGAIN FROM ITS NEXT ROUND' : SWITCH_OFF_REFUSED[r]);
+    }
+  };
+
   /** The house's manual SPIN: close the window (freezing the round's seed
    *  commitments), then settle as soon as the bettors have revealed. */
   const spinByHand = (): void => {
+    // 🧮 Never on a computed table: it spins once the bettors' seeds are in.
+    if (computed()) {
+      say(NO_HAND_SPIN);
+      return;
+    }
     // 💤 Just woken: the doc may not have heard the room yet, and a SPIN
     // written on it could take over a round another page has since settled.
     // 📒 Nor while it holds part of an update (casinoWhole): a bet list
@@ -1684,6 +2063,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (card) {
       card.remove();
       card = null;
+      confirming = false;
       return;
     }
     const host = bar?.parentElement;
@@ -1775,10 +2155,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       seatTimer = window.setInterval(beatSeat, SEAT_BEAT_MS);
       unsubscribe = subscribeCasino(() => {
         syncWindow();
+        noteComputed();
         refreshRail();
         renderBar();
         if (card) renderCard();
       });
+      noteComputed();
       refreshRail();
       renderBar();
     },
@@ -1819,6 +2201,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         pickup.interval = Math.max(PICKUP_REPEAT_MIN_MS, pickup.interval * 0.8);
         pickup.nextAt = performance.now() + pickup.interval;
       }
+      noteComputed();
       syncTakeDown();
       renderBar();
     },

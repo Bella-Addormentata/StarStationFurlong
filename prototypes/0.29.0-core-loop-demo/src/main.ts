@@ -267,6 +267,8 @@ import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
+import { leaveComputedTables } from "./computedTable";
+import { listenToRoom, noteRoomHeard } from "./roomHearing";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
@@ -701,6 +703,13 @@ setAirHockeySender((buf) => networkProvider.sendTick(buf));
 setAlligatorsSender((buf) => networkProvider.sendTick(buf));
 setArcadeSender((buf) => networkProvider.sendTick(buf));
 setNativeArcadeSender((buf) => networkProvider.sendTick(buf));
+// 🎡👂 A computed table forfeits a missing seed only from a page that has
+// heard the room since the close came (computedTable heardThrough): from
+// now on this page hears it by the ticks onTick hands it (below) and by
+// the updates its casino doc applies from the room (casinoDoc). One wiring
+// here covers every room join; a page that never heard anyone forfeits
+// nothing, and its rounds void as ABANDON_MS runs out.
+listenToRoom();
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -3263,6 +3272,12 @@ async function joinRoomAtEpoch(
       } else {
         return; // unknown datagram framing — ignore
       }
+      // 🎡👂 Another page's tick on any lane is the room heard (roomHearing
+      // noteRoomHeard): O(1), no allocation, 20 times a second per peer. The
+      // node never hands a page its own ticks back (ssf-p2p-node: the local
+      // fan-out skips the sender, and a tick it sent is in its seen-cache
+      // before any relay brings it round), so only another page counts.
+      noteRoomHeard();
       // 🕹️ Arcade ticks ride the kind-1 lane with flags bit 5 set and a NaN
       // where a mallet keeps its x (arcadeNet.ts): route them on the raw
       // bytes, before anything reads that x as a position.
@@ -3434,6 +3449,10 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     // first (bounded: a stalled transport must not hold the swap).
     leaveSlotMachineRoom();
     leaveCoinPusherRoom();
+    // 🧮 And this player's chips come down from every computed table they
+    // have some on, with the same flush: a felt left behind would be frozen
+    // by the next close, with nobody here to reveal its seed (forfeited).
+    leaveComputedTables();
     await Promise.race([
       sync.flush(),
       new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),

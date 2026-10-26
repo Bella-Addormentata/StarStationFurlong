@@ -25,8 +25,9 @@ import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
 import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
-import { readTableState, readCrapsTableState } from "./casinoDoc";
+import { isComputedTable, readTableState, readCrapsTableState } from "./casinoDoc";
 import type { TableClosing } from "./casinoDoc";
+import { computedCompactionPending, tickComputedTables } from "./computedTable";
 import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
@@ -424,6 +425,8 @@ export class World {
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
   private croupierNarrated = new Map<string, string>();
+  /** 🧮 The computed tables' tick has thrown, and been told (once a session). */
+  private computedTickWarned = false;
   /** 🤖 #77C / #69 G3: robot (dock key) → the table id it is currently
    *  operating. One robot per table, sticky (a bot keeps its table so bots don't
    *  swap frame to frame). The owner adds a charging dock per table game, so a
@@ -6316,8 +6319,12 @@ export class World {
     const coinPushers = FURNITURE.filter((i) => i.kind === "coin-pusher");
     const tables = [...rouletteTables, ...crapsTables];
     // 💤 Every page running tables marks the frame, so one waking from a
-    // sleep acts on none until its doc has caught up (croupier.ts).
-    if (tables.length) noteTablesRunning();
+    // sleep acts on none until its doc has caught up (croupier.ts). 🧮 So
+    // too while a computed table removed from the room waits to be compacted
+    // (its incarnation ended, its sessions still in the doc): with no table
+    // left, unmarked frames would read as asleep a lapse on, and compaction
+    // runs only on an awake page.
+    if (tables.length || computedCompactionPending()) noteTablesRunning();
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.
@@ -6330,7 +6337,11 @@ export class World {
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
       for (const t of tables) {
-        if (beatNow) beatCroupier(t.id);
+        // 🧮 A computed table has no operator: no heartbeat (so no robot is
+        // posted there, nor narrates), and the robot only sweeps an
+        // owner-run round an earlier build opened on it (tickAutoCroupier).
+        const computed = t.kind === "roulette-table" && isComputedTable(t.id);
+        if (beatNow && !computed) beatCroupier(t.id);
         if (t.kind === "craps-table") tickAutoStickman(t.id);
         else tickAutoCroupier(t.id);
       }
@@ -6352,6 +6363,19 @@ export class World {
     if (tables.length) {
       const me = getPlayerId();
       for (const t of tables) tickFairSeeds(t.id, t.kind === "craps-table" ? "craps" : "roulette", me);
+    }
+    // 🧮 Computed roulette: every client, every frame, moves its computed
+    // tables along (its slips, closes, seeds, forfeits, trims: each table at
+    // most every 200 ms), and compacts any ended incarnation, a removed
+    // table's too (so it runs with no table in the room as well). Never out
+    // of the frame: a throw there is told once and the frame goes on.
+    try {
+      tickComputedTables(rouletteTables.map((t) => t.id), Date.now());
+    } catch (err) {
+      if (!this.computedTickWarned) {
+        this.computedTickWarned = true;
+        console.warn("[computed] table tick failed:", err);
+      }
     }
     forgetMissingTables(new Set(tables.map((t) => t.id)));
 

@@ -46,6 +46,7 @@ import {
   casinoDocEpoch,
   feltStake,
   casinoRoomId,
+  isComputedTable,
   readAllBets,
   readAllCrapsBets,
   readCrapsFairnessPref,
@@ -87,18 +88,31 @@ type TableState = CrapsTableState | RouletteTableState;
  *  window opens (a house commit), so this reads the round itself, and the
  *  owner's setting only before any round exists. */
 export function roundIsFair(tableId: string, game: TableGame): boolean {
+  // 🧮 A computed table is Friendly (its seeds come from the players alone):
+  // an owner-run round an earlier build opened there doesn't make it Fair.
+  if (computedRoulette(tableId, game)) return false;
   const s = readState(tableId, game);
   // A house commit this page froze keeps the round Fair even if the live
   // field is erased after the close.
-  return s ? !!(s.houseCommit || frozenFields(tableId, s).houseCommit) : isFairTable(tableId);
+  return s ? !!(s.houseCommit || frozenFields(tableId, s).houseCommit) : isFairTable(tableId, game);
 }
 
 /** Is this table settled by the live multiparty scheme (Fair)? The owner's
  *  fairness setting, else the global default (multiparty). Roulette knows only
  *  Fair and plain RNG; craps' other two modes are still dev-simulated, so they
- *  read as Friendly. */
-export function isFairTable(tableId: string): boolean {
+ *  read as Friendly. `game`: the table's (a craps caller says so). */
+export function isFairTable(tableId: string, game: TableGame = 'roulette'): boolean {
+  // 🧮 Computed tables are Friendly in this build: no house seed to mix in.
+  if (computedRoulette(tableId, game)) return false;
   return (readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode()) === 'multiparty';
+}
+
+/** 🧮 Is this a computed roulette table? Only a roulette table can be one: a
+ *  switch under a craps table's id (any peer can write one) is junk there,
+ *  and the craps table keeps its Fair seeds, its plaque and its house
+ *  commit. */
+function computedRoulette(tableId: string, game: TableGame): boolean {
+  return game === 'roulette' && isComputedTable(tableId);
 }
 
 // ── Commitments + local seed keeping ─────────────────────────────────────────
@@ -133,7 +147,7 @@ function readSeedIndex(): string[] {
   }
 }
 
-function keepSeed(commit: string, seed: string): void {
+export function keepSeed(commit: string, seed: string): void {
   memSeeds.set(commit, seed);
   evictOldest(memSeeds, 256);
   try {
@@ -149,7 +163,7 @@ function keepSeed(commit: string, seed: string): void {
 
 /** The secret behind `commit`, if THIS device made it (checked against the
  *  commitment, so a stale or edited store entry is never revealed). */
-function seedFor(commit: string, ctx: TableSeedContext): string | null {
+export function seedFor(commit: string, ctx: TableSeedContext): string | null {
   // Commitments are public, so a peer can copy one from another open round
   // into this one: the seed must open it in THIS context, memory copy too.
   const mem = memSeeds.get(commit);
@@ -165,7 +179,7 @@ function seedFor(commit: string, ctx: TableSeedContext): string | null {
 
 /** Drop the secret behind `commit` — only if it belongs to `ctx`, so a
  *  commitment copied in from another open round can't erase that round's. */
-function forgetSeed(commit: string, ctx: TableSeedContext): void {
+export function forgetSeed(commit: string, ctx: TableSeedContext): void {
   if (!seedFor(commit, ctx)) return;
   memSeeds.delete(commit);
   try {
@@ -421,6 +435,8 @@ function sameCommits(a: Record<string, string>, b: Record<string, string>): bool
  * writes only on a real change, looks at most every 200 ms per table.
  */
 export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now(), force = false): void {
+  // 🧮 A computed table's seeds go in its own records (computedTable).
+  if (computedRoulette(tableId, game)) return;
   const tickKey = `${casinoDocEpoch()}:${tableId}:${me}`;
   const last = lastTick.get(tickKey) ?? 0;
   if (!force && now >= last && now - last < 200) return;

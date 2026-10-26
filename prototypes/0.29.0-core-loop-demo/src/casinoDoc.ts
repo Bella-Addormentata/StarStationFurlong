@@ -30,6 +30,10 @@
  *   seat:<tableId>:<playerId> → TableSeat (owner-written while at the table)
  *   throw:<tableId>           → DiceThrow (the shooter's fling, or the
  *                                        stickman's when it throws for them)
+ *   cfg:computed:<tableId>    → { v: 1, inc } the table is a computed one,
+ *                                        on incarnation `inc` (`c` + 24 hex);
+ *                                        anything else there reads as none
+ *                                        (see COMPUTED TABLES)
  *
  * Every player-scoped key is written by exactly one writer in normal play, so
  * per-key LWW is safe. The one exception is an earlier build's craps list,
@@ -150,6 +154,34 @@
  * would open it on, and a table put back never reopens a name whose records
  * a removal left unmarked (tableOpening).
  *
+ * 🧮 COMPUTED TABLES: a computed roulette table has no operator. Its players
+ * write signed, write-once records (computedFold.ts) into the doc's
+ * `casinoComputed` map: `ses:<tableId>:<inc>:<sid>`, a nested map holding
+ * one session's records, and `sum:<tableId>:<inc>`, the checkpoint a trim
+ * leaves of the sessions before it. Every page folds the same records into
+ * the same rounds (one TableFold per incarnation, over the session the
+ * checkpoint names), and what they decide is two more terms of the chip sum,
+ * which nobody writes: each bettor's decided net, in the ledger beside the
+ * books (counted for every incarnation with a session or a checkpoint, live
+ * or ended, as a book is), and what their felt holds now, beside the lists'
+ * (only while the incarnation is live: the switch `cfg:computed:<tableId>`
+ * names it, no `gone:` mark ends it, and its checkpoint doesn't say it
+ * ended; so a forged or deleted switch moves no decided chip, it only hands
+ * open stakes back). Both come from one fold result in one recount, before
+ * any observer runs, so a decided round moves its stake from held to paid at
+ * once, as a settle does. A trim swaps a session for its checkpoint and the
+ * open round's felts in one transaction (writeCheckpointAndTrim), so on a
+ * page whose fold agreed nothing moves; an ended incarnation's sessions go
+ * later, under a checkpoint saying it ended (finalizeComputed), after which
+ * no session of it counts, and its nets count on. A page holding part of
+ * an update keeps what it last counted of a table it can't read whole
+ * (casinoWhole, which also reads the table as not whole when a session or
+ * checkpoint it counted is gone with nothing naming it: frozen, as a table
+ * whose book is lost, while the rest of the casino goes on), and spends
+ * nothing while any table waits for the rest, or for its signatures to be
+ * checked (computedSettled): the checks run 40 ms a pass at most, the rest
+ * in empty transactions after, which send nothing to the room.
+ *
  * The HOUSE keeps no stored record at all — everything about the cage is
  * DERIVED: issued = Σ buy-ins, outstanding = Σ chips, house net = issued −
  * cashed − outstanding. Nothing to inflate, nothing to desync; issuance is
@@ -186,6 +218,11 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
+import { asCheckpoint, nextSid, parseKey, TableFold } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, SigCheck } from './computedFold';
+import { getPlayerId } from './identity';
+import { getIdentityPub, verifyIdentityStrict } from './keypair';
+import { forgetRoomHeard, noteRoomHeard } from './roomHearing';
 
 let boundDoc: Y.Doc | null = null;
 let casinoMap: Y.Map<unknown> | null = null;
@@ -231,6 +268,14 @@ export function bindCasinoDoc(doc: Y.Doc, roomId = '', resync?: () => void): voi
   boundDoc = doc;
   askResync = resync ?? null;
   askedResyncAt = -Infinity;
+  // 👂 Every update this doc applies from the room (not this page's own
+  // writes) is the room heard, for the computed tables' forfeits
+  // (roomHearing.ts); Yjs tells of one only when it changed something. A doc
+  // bound afresh has heard nothing yet.
+  forgetRoomHeard();
+  doc.on('update', (_u: Uint8Array, _origin: unknown, _doc: Y.Doc, tr: Y.Transaction) => {
+    if (boundDoc === doc && !tr.local) noteRoomHeard();
+  });
   pinPlayerKeys(doc);
   casinoMap = doc.getMap('casino');
   waitingWhole.clear();
@@ -242,11 +287,12 @@ export function bindCasinoDoc(doc: Y.Doc, roomId = '', resync?: () => void): voi
   });
   bindChipLedger(doc);
   bindHeldStakes(doc, casinoMap);
+  bindComputed(doc, casinoMap);
   // 🪙 Index the coin pushers' requests now, outside any operator poll, and
   // observe ahead of notify() so listeners never see a stale index.
   pusherRequestIndex(casinoMap);
   casinoMap.observe((event) => {
-    if (heldTouched.size === 0 && chipsTouched.size === 0) {
+    if (!touchedAny()) {
       notify(event.keysChanged);
       return;
     }
@@ -351,23 +397,25 @@ interface ChipIndex {
   parked: Set<string>;
   /** each table's incarnations with a book (no build deletes one) */
   booksOf: Map<string, Set<string>>;
+  /** each computed incarnation's (`<tableId>:<inc>`) decided nets as counted: bettor → chips */
+  computed: Map<string, Map<string, bigint>>;
   bought: bigint;
   cashed: bigint;
 }
 function newChipIndex(): ChipIndex {
   return {
     byAccount: new Map(), counted: new Map(), books: new Map(), ends: new Map(), endsOf: new Map(),
-    parked: new Set(), booksOf: new Map(), bought: 0n, cashed: 0n,
+    parked: new Set(), booksOf: new Map(), computed: new Map(), bought: 0n, cashed: 0n,
   };
 }
 let chipIndex: ChipIndex = newChipIndex();
 /** Accounts whose chips changed since the last notify. */
 const chipsTouched = new Set<string>();
 
-function addToAccount(ix: ChipIndex, account: string, delta: bigint): void {
+function addToAccount(ix: ChipIndex, account: string, delta: bigint, touched = chipsTouched): void {
   if (delta === 0n) return;
   ix.byAccount.set(account, (ix.byAccount.get(account) ?? 0n) + delta);
-  chipsTouched.add(account);
+  touched.add(account);
 }
 
 function countChipRecord(ix: ChipIndex, rec: ChipRecord, sign: 1n | -1n): void {
@@ -446,9 +494,40 @@ function recountEnd(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
 }
 
 /** Calls back to ask the room for what this page is missing (YjsSync
- *  resync), at most every few seconds; none for a page-local doc. */
+ *  resync), at most every RESYNC_ASK_MS whoever asks; none for a page-local
+ *  doc. */
 let askResync: (() => void) | null = null;
 let askedResyncAt = -Infinity;
+const RESYNC_ASK_MS = 5_000;
+
+/** Ask the room for what this page is missing, unless it was asked less than
+ *  RESYNC_ASK_MS ago, by anyone: one ask brings everything the room has
+ *  that this page lacks, so it serves every reason to ask (a part held here,
+ *  a seed a computed table waits for), and none starves another — a reason
+ *  held back asks once that lapses. Only an ask at `since` or later holds
+ *  this one back (every ask so held when left out): one from before brought
+ *  nothing written since. Whether it asked now. */
+function askRoom(now: number, since = -Infinity): boolean {
+  if (!askResync) return false;
+  if (now - askedResyncAt < RESYNC_ASK_MS && now >= askedResyncAt && askedResyncAt >= since) return false;
+  askedResyncAt = now;
+  try { askResync(); } catch (err) { console.warn('[casino] resync failed:', err); }
+  return true;
+}
+
+/** Ask the room for what this page is missing (computedTable askDuty: a seed
+ *  still missing near the end of its grace), under casinoWhole's rate limit
+ *  (askRoom), held back only by an ask at `since` or later (the close the
+ *  seed is for came in then: an ask from before it, casinoWhole's for a part
+ *  it held, brought no seed for it, and waiting out its 5 s would let the
+ *  forfeit fall due first). Whether that is done with: asked now, or no
+ *  room to ask (a page-local doc); false while a recent ask holds it back
+ *  (ask again). The duty asks once per close, so this adds one ask a round
+ *  at most to casinoWhole's, and casinoWhole's next waits RESYNC_ASK_MS
+ *  from it. */
+export function askRoomForMissing(now = Date.now(), since = -Infinity): boolean {
+  return askRoom(now, since) || !askResync;
+}
 
 /** Whether the bound doc holds every update it has been given whole (and,
  *  for table `tableId`, every book of it this page has read): Yjs parks the
@@ -462,21 +541,31 @@ let askedResyncAt = -Infinity;
  *  page's write and its overwrite without the write that won, and the doc
  *  reads whole); a table's book this page has read and the doc no longer
  *  has is such a key too, whatever the doc's own record says (no build
- *  deletes one), so nothing of that table builds on its absence either. */
+ *  deletes one), so nothing of that table builds on its absence either. So
+ *  is a computed table's session or checkpoint this page counted and the
+ *  doc no longer has (computedLost). */
 export function casinoWhole(tableId?: string): boolean {
+  if (!docHoldsPart() && (tableId === undefined || !tableLost(tableId))) return true;
+  askRoom(Date.now());
+  return false;
+}
+
+/** Whether the bound doc holds part of an update it can't apply yet. */
+function docHoldsPart(): boolean {
   // (Deletes Yjs holds back, store.pendingDs, are of writes this page hasn't
   // got at all, which read as not here yet whatever comes: no part read.)
   const store = boundDoc?.store as { pendingStructs: unknown } | undefined;
-  const pending = store !== undefined && store.pendingStructs !== null;
-  const lost = tableId !== undefined && chipsMap !== null
-    && [...(chipIndex.booksOf.get(tableId) ?? [])].some((inc) => !chipsMap!.has(`book:${tableId}:${inc}`));
-  if (!pending && !lost) return true;
-  const now = Date.now();
-  if (askResync && !(now - askedResyncAt < 5_000 && now >= askedResyncAt)) {
-    askedResyncAt = now;
-    try { askResync(); } catch (err) { console.warn('[casino] resync failed:', err); }
-  }
-  return false;
+  return store !== undefined && store.pendingStructs !== null;
+}
+
+/** Whether something of table `tableId` this page read is gone from the doc
+ *  with nothing in its place: a book, or a computed table's session or
+ *  checkpoint (computedLost). The table then reads as not whole for good
+ *  (casinoWhole), and only that table. */
+function tableLost(tableId: string): boolean {
+  return (chipsMap !== null
+    && [...(chipIndex.booksOf.get(tableId) ?? [])].some((inc) => !chipsMap!.has(`book:${tableId}:${inc}`)))
+    || computedLost(tableId);
 }
 
 /** What waits for the doc to hold every update whole (casinoWhole), by key:
@@ -532,28 +621,48 @@ function bindChipLedger(doc: Y.Doc): void {
     // The rest of an update came: what read as gone meanwhile reads as it is.
     if (ix.parked.size > 0 && casinoWhole()) for (const key of [...ix.parked]) recountChipKey(ix, map, key);
   });
-  // What kept bets owe can end with a transaction of this map alone.
-  map.observe(() => {
-    if (chipIndex !== ix || (chipsTouched.size === 0 && heldTouched.size === 0)) return;
+  // What kept bets owe can end with a transaction of this map alone. When
+  // only a computed table moved anything and the transaction changed the
+  // casino map too, that map's observer tells it all instead: PR 1 tells
+  // such a transaction once, from there (a settle nobody bet on writes a
+  // book that moves no chip), and computed records beside it add no notify.
+  const casino = doc.getMap<unknown>('casino') as unknown as Y.AbstractType<Y.YEvent<any>>;
+  map.observe((_event, tr) => {
+    if (chipIndex !== ix || !touchedAny()) return;
+    if (chipsTouched.size === 0 && heldTouched.size === 0 && tr.changed.has(casino)) return;
     notify(takeTouched(new Set()));
   });
   // Chips a transaction of neither map moved (what read as gone, counted
-  // again as the rest of an update comes in another map's write).
+  // again as the rest of an update comes in another map's write), and all a
+  // transaction of casinoComputed alone moved (bindComputed).
   doc.on('afterTransaction', () => {
-    if (chipIndex !== ix || (chipsTouched.size === 0 && heldTouched.size === 0)) return;
+    if (chipIndex !== ix || !touchedAny()) return;
     notify(takeTouched(new Set()));
   });
 }
 
 /** `keys` with the chip keys of what this transaction's recounts moved
- *  (chipsTouched, heldTouched), which are then told: once, by whichever of
- *  the casino maps' observers runs first (or after the transaction). */
+ *  (chipsTouched, heldTouched; computedTouched, the bettors a computed
+ *  table's recount moved) and the computed tables whose fold it moved
+ *  (viewTouched, `computed:<tableId>`), which are then told: once, by
+ *  whichever of the casino maps' observers runs first (the casino map's
+ *  when only a computed table moved anything and it changed too), or after
+ *  the transaction. */
 function takeTouched(keys: Set<string>): Set<string> {
   for (const account of chipsTouched) keys.add(isBankrollAccount(account) ? account : `bal:${account}`);
   for (const pid of heldTouched) keys.add(`bal:${pid}`);
+  for (const pid of computedTouched) keys.add(`bal:${pid}`);
+  for (const key of viewTouched) keys.add(key);
   chipsTouched.clear();
   heldTouched.clear();
+  computedTouched.clear();
+  viewTouched.clear();
   return keys;
+}
+
+/** Whether this transaction's recounts moved anything to tell (takeTouched). */
+function touchedAny(): boolean {
+  return chipsTouched.size > 0 || heldTouched.size > 0 || computedTouched.size > 0 || viewTouched.size > 0;
 }
 
 function ensureChips(): Y.Map<unknown> {
@@ -597,9 +706,11 @@ export function readChips(playerId: string): number {
 /** The chips a player may spend now: readChips, or none while the doc holds
  *  part of an update (casinoWhole). A list held on a felt may read as gone
  *  there, and a hold heard whole meanwhile isn't counted until the rest
- *  comes (heldStake), so chips on a felt would read as free. */
+ *  comes (heldStake), so chips on a felt would read as free. Nor while a
+ *  computed table waits for the rest, or for its signatures to be checked
+ *  (computedSettled): a slip not checked yet holds nothing so far. */
 function spendableChips(playerId: string): number {
-  return casinoWhole() ? readChips(playerId) : 0;
+  return casinoWhole() && computedSettled() ? readChips(playerId) : 0;
 }
 
 function nextChipRecord(was: ChipRecord | null, account: string, delta: number, cage?: 'buy' | 'cashout'): ChipRecord {
@@ -1227,8 +1338,12 @@ export type TableClosing = 'local' | 'heard' | 'elsewhere';
  *  records. Held stakes go back with their lists; refunding an earlier build's
  *  lists is the CALLER's job (croupier.closeTable), done before this so the
  *  bet records are still readable. Leaves the incarnation's `gone:` mark, so
- *  a state or list written at the same moment stays ended. One transact. */
-export function clearTableKeys(tableId: string, closing: TableClosing = 'heard'): void {
+ *  a state or list written at the same moment stays ended. One transact.
+ *  🧮 A computed table's incarnation ends with it (its switch goes, a
+ *  `gone:` mark ends it: COMPUTED TABLES), unless `keepComputed`: the sweep
+ *  of an owner-run round an earlier build opened on a computed table ends
+ *  only that round's incarnation. */
+export function clearTableKeys(tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean } = {}): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
   boundDoc!.transact(() => {
@@ -1259,6 +1374,18 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard')
     // never writes them).
     map.delete(`cfg:backend:${tableId}`);
     map.delete(`cfg:fairness:${tableId}`);
+    // 🧮 And a computed table's incarnation is over (marked as a removed
+    // one is, so a switch written at the same moment stays ended): its
+    // decided nets count on, its open felts stop holding (nothing to
+    // refund: they took nothing), and its sessions stay until a page
+    // compacts them (computedTable). A table put back is owner-run, on a
+    // fresh incarnation (tableIncFor counts the mark). (A switch that is
+    // junk names nothing to end: it goes as any orphan setting does.)
+    if (!opts.keepComputed) {
+      const cinc = computedIncOf(tableId);
+      if (cinc !== null) markRemoved(map, tableId, cinc);
+      map.delete(`cfg:computed:${tableId}`);
+    }
     map.delete(`throw:${tableId}`);
     const seatPrefix = `seat:${tableId}:`;
     const seedPrefix = `fseed:${tableId}:`;
@@ -1295,6 +1422,16 @@ export function writeCroupierBeat(tableId: string, beatAt: number): void {
 // `table-operator` drives the auto tables, so a round is settled and paid once
 // (chip records add up, so two settles would pay twice). Its holder rewrites it
 // every few seconds (`beat`); croupier.ts takeTableTurn has the rules.
+//
+// 🧮 The lease also says which build drives (`build`): this one writes
+// TABLE_BUILD on every claim and renewal, and a build before it renews only
+// what it read (page, player, beat), so a lease without one is an earlier
+// build's. A computed table can't be switched on while one drives
+// (computedTable switchComputedOn): it would go on opening owner-run rounds
+// on the table, reading none of the computed records.
+
+/** The build this page's lease carries: 2 knows computed tables. */
+export const TABLE_BUILD = 2;
 
 export interface TableOperatorLease {
   /** the driving page (croupier.ts ROULETTE_PAGE_ID) */
@@ -1303,6 +1440,8 @@ export interface TableOperatorLease {
   player: string;
   /** bumped on each renewal, so other pages see it is alive */
   beat: number;
+  /** the driving page's build (TABLE_BUILD), absent on an earlier build's */
+  build?: number;
 }
 
 export const TABLE_OPERATOR_KEY = 'table-operator';
@@ -1311,11 +1450,12 @@ export function readTableOperatorLease(): TableOperatorLease | null {
   const v = ensureMap().get(TABLE_OPERATOR_KEY);
   if (typeof v !== 'object' || v === null) return null;
   const l = v as Partial<TableOperatorLease>;
-  return typeof l.page === 'string' && l.page.length > 0 && l.page.length <= 256
+  if (!(typeof l.page === 'string' && l.page.length > 0 && l.page.length <= 256
     && typeof l.player === 'string' && l.player.length > 0 && l.player.length <= 128
-    && Number.isSafeInteger(l.beat)
-    ? { page: l.page, player: l.player, beat: l.beat as number }
-    : null;
+    && Number.isSafeInteger(l.beat))) return null;
+  // (A build that is no small whole number reads as none: an earlier build's.)
+  const build = Number.isSafeInteger(l.build) && l.build! >= 1 && l.build! <= 1000 ? l.build : undefined;
+  return { page: l.page, player: l.player, beat: l.beat as number, ...(build !== undefined ? { build } : {}) };
 }
 
 export function writeTableOperatorLease(lease: TableOperatorLease): void {
@@ -1868,7 +2008,8 @@ function heldStake(playerId: string): bigint {
     heldStakes = countHeldStakes(ensureMap(), ensureChips());
     heldDirty = false;
   }
-  return heldStakes.get(playerId) ?? 0n;
+  // 🧮 And what computed felts hold: a running total (recountComputedHeld).
+  return (heldStakes.get(playerId) ?? 0n) + (computedHeldBy.get(playerId) ?? 0n);
 }
 
 /** Recount the held chips before any observer runs whenever a transaction
@@ -1903,6 +2044,862 @@ function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
     heldHeard = fresh;
     heldDirty = false;
   });
+}
+
+// ── 🧮 Computed tables (see COMPUTED TABLES above) ───────────────────────────
+
+/** The bound doc's computed records (`casinoComputed`): `ses:<tableId>:<inc>:
+ *  <sid>` → one session's records, a nested map; `sum:<tableId>:<inc>` → the
+ *  checkpoint of the sessions before it. */
+let computedMap: Y.Map<unknown> | null = null;
+
+/** A computed incarnation's name: `c` + 24 hex, never one a PR 1 table takes
+ *  (tableIncFor's 24 hex), so an earlier build opening a round on the table
+ *  can't end the computed one by removing its own. */
+const COMPUTED_INC = /^c[0-9a-f]{24}$/;
+/** A session's id: `g` for an incarnation's first, else nextSid's 24 hex. */
+const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
+
+/** One computed incarnation (`<tableId>:<inc>`) the doc has a session or a
+ *  checkpoint of, and what this page counted of it. Kept while the binding
+ *  lasts, as a table's books are (booksOf). */
+interface ComputedInc {
+  t: string;
+  inc: string;
+  /** `<t>:<inc>` */
+  key: string;
+  ctx: FoldCtx;
+  fold: TableFold;
+  /** As last read whole: the checkpoint, the sid it opens, and that
+   *  session's map (null for none: no other map of the incarnation counts). */
+  cp: Checkpoint | null;
+  sid: string;
+  live: Y.Map<unknown> | null;
+  /** nextSid of the last checkpoint asked about (liveSidOf). */
+  sidOf: { cp: Checkpoint | null; sid: string };
+  /** Read it whole at its next count: it was parked meanwhile, and what
+   *  changed then wasn't applied. */
+  stale: boolean;
+  /** What computedLost goes by: the session this page last counted from
+   *  (null for none), and whether it has counted a checkpoint. */
+  countedSid: string | null;
+  countedCp: boolean;
+  /** The result last counted (null: none yet), and whether its felts held
+   *  then (the incarnation was live). */
+  last: FoldResult | null;
+  liveHeld: boolean;
+  /** When this page first saw each record key in the live session
+   *  (Date.now()): computedSeenAt. */
+  seen: Map<string, number>;
+}
+
+let computedIncs = new Map<string, ComputedInc>();
+/** tableId → the incarnations of it tracked. */
+let computedIncsOf = new Map<string, Set<string>>();
+/** What each incarnation's felts hold, as counted (none while it isn't
+ *  live): bettor → chips. */
+let computedHeld = new Map<string, Map<string, bigint>>();
+/** Σ computedHeld per bettor, what heldStake adds: a running total, so no
+ *  read walks the tables. */
+let computedHeldBy = new Map<string, bigint>();
+/** Incarnations whose last counted values stand until the doc holds them
+ *  whole again (casinoWhole), as parked chip keys do. */
+const computedParked = new Set<string>();
+/** Each incarnation's signature verdicts, by record hash. */
+let computedVerdicts = new Map<string, Map<string, boolean>>();
+/** The computed tables (`computed:<tableId>`) whose fold moved since the
+ *  last notify (takeTouched). */
+const viewTouched = new Set<string>();
+/** The bettors whose chips a computed recount moved since the last notify
+ *  (nets or felts): apart from PR 1's chipsTouched and heldTouched, so the
+ *  chips map's observer can tell what PR 1 would have told from there. */
+const computedTouched = new Set<string>();
+/** A player's key was pinned since the last recount: every felt is read
+ *  again (pinPlayerKeys). */
+let computedKeysMoved = false;
+const NO_COMPUTED_HELD: ReadonlyMap<string, bigint> = new Map();
+
+/** The incarnation a casinoComputed key is of: `ses:<t>:<inc>:<sid>` (with
+ *  its sid) or `sum:<t>:<inc>`, parsed from the right (an incarnation and a
+ *  sid hold no ':', a table id may). Null for any other key. */
+function computedKeyParts(key: string): { t: string; inc: string; sid?: string } | null {
+  let rest: string;
+  let sid: string | undefined;
+  if (key.startsWith('ses:')) {
+    const cut = key.lastIndexOf(':');
+    sid = key.slice(cut + 1);
+    if (cut <= 'ses:'.length || !COMPUTED_SID.test(sid)) return null;
+    rest = key.slice('ses:'.length, cut);
+  } else if (key.startsWith('sum:')) {
+    rest = key.slice('sum:'.length);
+  } else {
+    return null;
+  }
+  const cut = rest.lastIndexOf(':');
+  const inc = rest.slice(cut + 1);
+  return cut > 0 && COMPUTED_INC.test(inc) ? { t: rest.slice(0, cut), inc, ...(sid !== undefined ? { sid } : {}) } : null;
+}
+
+const sessionKey = (t: string, inc: string, sid: string): string => `ses:${t}:${inc}:${sid}`;
+
+const checkpointCache = new WeakMap<object, Checkpoint | null>();
+
+/** An incarnation's checkpoint as stored (asCheckpoint, once per value: up
+ *  to 4,096 nets to check); null for none, or junk. */
+function checkpointAt(map: Y.Map<unknown>, t: string, inc: string): Checkpoint | null {
+  const value = map.get(`sum:${t}:${inc}`);
+  if (typeof value !== 'object' || value === null) return null;
+  let cp = checkpointCache.get(value);
+  if (cp === undefined) {
+    cp = asCheckpoint(value);
+    checkpointCache.set(value, cp);
+  }
+  return cp;
+}
+
+/** The sid of the session checkpoint `cp` opens (nextSid, hashed once per
+ *  checkpoint: casinoWhole asks every frame). */
+function liveSidOf(c: ComputedInc, cp: Checkpoint | null): string {
+  if (cp !== c.sidOf.cp) c.sidOf = { cp, sid: nextSid(c.ctx, cp) };
+  return c.sidOf.sid;
+}
+
+/** The incarnation a switch names: exactly {v: 1, inc}, `inc` a computed
+ *  one's name. Null for none, or anything else (no timestamp: identical
+ *  switches written at once merge). */
+function computedCfgInc(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const cfg = value as { v?: unknown; inc?: unknown };
+  return Object.keys(cfg).length === 2 && cfg.v === 1 && typeof cfg.inc === 'string' && COMPUTED_INC.test(cfg.inc)
+    ? cfg.inc : null;
+}
+
+/** The computed incarnation table `tableId`'s switch names, or null. */
+export function computedIncOf(tableId: string): string | null {
+  return computedCfgInc(ensureMap().get(`cfg:computed:${tableId}`));
+}
+
+/** Whether table `tableId` is a computed one now: its switch names an
+ *  incarnation no removal has ended (`gone:`) and whose checkpoint doesn't
+ *  say it ended. (Its decided nets count either way: the ledger.) */
+export function isComputedTable(tableId: string): boolean {
+  const inc = computedIncOf(tableId);
+  return inc !== null && !casinoMap!.has(goneKey(tableId, inc)) && checkpointAt(computedMap!, tableId, inc)?.e !== 1;
+}
+
+/** Whether incarnation `inc` of table `tableId` is over for good: a removal
+ *  marked it (`gone:`), or its checkpoint says it ended (finalizeComputed
+ *  writes both). A switch that is missing, or junk, ends nothing yet: a
+ *  peer's delete the room's pages put back (computedTable), and the
+ *  incarnation goes on. */
+export function computedIncEnded(tableId: string, inc: string): boolean {
+  const casino = ensureMap();
+  return casino.has(goneKey(tableId, inc)) || checkpointAt(computedMap!, tableId, inc)?.e === 1;
+}
+
+/** The name a table's next computed incarnation takes: `c` + 24 hex of the
+ *  table's removals (its `gone:` marks), as tableIncFor names an owner-run
+ *  one, under a domain of its own, so the two never meet. Not at random:
+ *  two of the house's pages switching the table on at once name it alike,
+ *  and their sessions meet on one key. Past any name the doc already holds
+ *  a session or a checkpoint of (a switch-off that ended it on a page whose
+ *  mark the doc didn't keep): that one is marked ended, and the next tried,
+ *  as freshIncFor does. In the caller's transaction. */
+export function computedIncFor(tableId: string): string {
+  const casino = ensureMap();
+  const map = computedMap!;
+  const prefix = `gone:${tableId}:`;
+  for (;;) {
+    const removals = [...casino.entries()].filter(([key]) => key.startsWith(prefix))
+      .map(([key, value]): [string, unknown] => [key.slice(prefix.length), value])
+      .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+    const named = `ssf-computed-inc-v1|${tableId}|${JSON.stringify(removals)}`;
+    const inc = 'c' + bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
+    const used = map.has(`sum:${tableId}:${inc}`) || [...map.keys()].some((key) => {
+      const at = computedKeyParts(key);
+      return at?.sid !== undefined && at.t === tableId && at.inc === inc;
+    });
+    if (!used) return inc;
+    markRemoved(casino, tableId, inc);
+  }
+}
+
+/** 🔀 Switch table `tableId` on as computed incarnation `inc`, in the
+ *  caller's transaction (the house's switch: computedTable
+ *  switchComputedOn): its switch, and the incarnation's first session, unless
+ *  the doc holds a session of it already (one written at the same moment by
+ *  another of the house's pages is the same session: the doc keeps one map,
+ *  and the records lost with the other are put back by their authors). */
+export function writeComputedOn(tableId: string, inc: string): void {
+  const casino = ensureMap();
+  const map = computedMap!;
+  boundDoc!.transact(() => {
+    casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
+    if (sessionKeysOf(map, tableId, inc).some((key) => map.get(key) instanceof Y.Map)) return;
+    map.set(sessionKey(tableId, inc, 'g'), new Y.Map<unknown>());
+  });
+}
+
+/** 🔀 Put table `tableId`'s switch back on incarnation `inc` (computedTable,
+ *  the page that runs it): when a peer took it away, or wrote junk or a
+ *  name the doc holds nothing of in its place. No build takes a switch away
+ *  but in the transaction that ends its incarnation (the house's switch-off,
+ *  a removal: both mark it), so one gone with its incarnation unended is a
+ *  peer's doing. Only while the doc holds the incarnation's live session,
+ *  and nothing has ended it; false (nothing written) otherwise. The same
+ *  bytes from every page: whichever write the doc keeps, it is the same. */
+export function putComputedSwitchBack(tableId: string, inc: string): boolean {
+  const casino = ensureMap();
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!c?.live || computedIncEnded(tableId, inc) || computedIncOf(tableId) === inc) return false;
+  const now = computedIncOf(tableId);
+  if (now !== null && computedIncs.has(`${tableId}:${now}`)) return false;
+  boundDoc!.transact(() => {
+    casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
+  });
+  return true;
+}
+
+/** Whether table `tableId`'s switch is lost: it names no incarnation (gone,
+ *  or junk) while the doc holds the live session of one nothing has ended
+ *  (putComputedSwitchBack: a peer's doing, put back by the room's pages).
+ *  The robot runs no owner-run round there meanwhile (croupier): the table's
+ *  players are mid-round on the computed one. */
+export function computedSwitchLost(tableId: string): boolean {
+  if (computedIncOf(tableId) !== null) return false;
+  for (const inc of computedIncsOf.get(tableId) ?? []) {
+    if (computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) return true;
+  }
+  return false;
+}
+
+/** 🔀 Take table `tableId`'s switch away (the house's switch-off, in the
+ *  transaction that finalises the incarnation: computedTable
+ *  switchComputedOff), the incarnation it names marked ended if it isn't
+ *  (one the doc holds nothing of, no session and no checkpoint, has nothing
+ *  to finalise: a switch a peer wrote alone). The table is owner-run again
+ *  from its next round. */
+export function writeComputedOff(tableId: string): void {
+  const casino = ensureMap();
+  boundDoc!.transact(() => {
+    const inc = computedIncOf(tableId);
+    if (inc !== null && !casino.has(goneKey(tableId, inc))) casino.set(goneKey(tableId, inc), 1);
+    casino.delete(`cfg:computed:${tableId}`);
+  });
+}
+
+/** Whether table `tableId`'s switch is bare: it names an incarnation nothing
+ *  has ended, of which the doc holds no session map and no checkpoint. No
+ *  build writes one so (the switch-on writes the first session with it, in
+ *  one update, a trim writes the checkpoint with the next session, and only
+ *  an end deletes the last one: a doc holding part of an update isn't
+ *  whole), so on a whole doc it is a peer's forgery, or what is left after a
+ *  peer deleted the only session (no checkpoint yet) on a doc that never
+ *  held it. Nobody can run such a table: no felt goes down (there is no
+ *  session to write into) and the robot stands down. The lease holder drops
+ *  it a lapse on (croupier), and the house's switch-off drops it at once
+ *  (computedTable). */
+export function computedSwitchBare(tableId: string): boolean {
+  const inc = computedIncOf(tableId);
+  if (inc === null || computedIncEnded(tableId, inc)) return false;
+  const map = computedMap!;
+  return checkpointAt(map, tableId, inc) === null && !sessionKeysOf(map, tableId, inc).some((key) => map.get(key) instanceof Y.Map);
+}
+
+/** 🧮 End computed incarnation `inc` of table `tableId` as a removal of the
+ *  table ends it (clearTableKeys' computed branch), in one transaction: its
+ *  `gone:` mark, and its switch deleted. Its decided nets count on, its open
+ *  felts stop holding (nothing to refund: they took nothing), and its
+ *  sessions stay until a page compacts them (computedTable). For a table no
+ *  longer in the room whose removal this page never ran (computedTable
+ *  awayDuty): an earlier build's removal deletes the table's keys but not the
+ *  switch, which it knows nothing of, and a switch written at the moment of
+ *  a removal outlives the removal's delete of a key that wasn't there yet.
+ *  Only while the switch names `inc` and nothing has ended it; false (nothing
+ *  written) otherwise. */
+export function writeComputedGone(tableId: string, inc: string): boolean {
+  const casino = ensureMap();
+  if (computedIncOf(tableId) !== inc || computedIncEnded(tableId, inc)) return false;
+  boundDoc!.transact(() => {
+    markRemoved(casino, tableId, inc);
+    casino.delete(`cfg:computed:${tableId}`);
+  });
+  return true;
+}
+
+// ⚖️ Signatures: strict noble, about 2 ms a check, so a page joining a busy
+// table can't check a session's records in one go without a stall. Each
+// recount spends at most COMPUTED_VERIFY_MS on them, shared by every table;
+// what is left reads as not checked yet (the fold's result is pending, and
+// nobody spends meanwhile: computedSettled), and an empty transaction of its
+// own (CT_VERIFY) checks on: Yjs emits no update for a transaction with
+// nothing in it, so nothing goes to the room, and its listeners are told
+// once, as for any transaction. A verdict is kept per incarnation by record
+// hash, so a record copied into the next session is never checked again.
+
+const COMPUTED_VERIFY_MS = 40;
+const CT_VERIFY = Symbol('casino-computed-verify');
+
+function defaultVerifyNow(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+}
+
+/** The check (null: keypair.verifyIdentityStrict, read at call time), the
+ *  budget and its clock: tests may swap them (setComputedVerifyForTests). */
+let verifyWith: ((pub: string, bytes: Uint8Array, sig: string) => boolean) | null = null;
+let verifyBudgetMs = COMPUTED_VERIFY_MS;
+let verifyNow: () => number = defaultVerifyNow;
+/** ms of checks this recount has spent. */
+let verifySpent = 0;
+/** A slice is queued on this binding. */
+let verifyQueued = false;
+
+/** 🧪 Swap the signature check, the budget per recount or its clock (any
+ *  left out, and all with no argument, go back to the real ones). A budget
+ *  of 0 checks nothing and so queues nothing: the next call queues the slice
+ *  that checks what waited. */
+export function setComputedVerifyForTests(opts: {
+  verify?: (pub: string, bytes: Uint8Array, sig: string) => boolean;
+  budgetMs?: number;
+  now?: () => number;
+} = {}): void {
+  verifyWith = opts.verify ?? null;
+  verifyBudgetMs = opts.budgetMs ?? COMPUTED_VERIFY_MS;
+  verifyNow = opts.now ?? defaultVerifyNow;
+  for (const c of computedIncs.values()) {
+    if (c.last?.pending) {
+      queueVerifySlice();
+      break;
+    }
+  }
+}
+
+function verdictsOf(incKey: string): Map<string, boolean> {
+  let verdicts = computedVerdicts.get(incKey);
+  if (!verdicts) computedVerdicts.set(incKey, verdicts = new Map());
+  return verdicts;
+}
+
+/** The SigCheck of one incarnation's fold: a cached verdict, else a check
+ *  while this recount's budget lasts, else "not checked yet" and a slice. */
+function computedCheck(incKey: string): SigCheck {
+  return (hash, _kind, pub, bytes, sig) => {
+    const verdicts = verdictsOf(incKey);
+    const known = verdicts.get(hash);
+    if (known !== undefined) return known;
+    if (verifySpent >= verifyBudgetMs) {
+      queueVerifySlice();
+      return undefined;
+    }
+    const from = verifyNow();
+    let ok: boolean;
+    try {
+      ok = (verifyWith ?? verifyIdentityStrict)(pub, bytes(), sig) === true;
+    } catch {
+      ok = false;
+    }
+    verifySpent += Math.max(0, verifyNow() - from);
+    verdicts.set(hash, ok);
+    return ok;
+  };
+}
+
+/** Run the next recount's checks in an empty transaction, once the page has
+ *  drawn a frame, on the binding that queued it if it is bound still (a
+ *  binding since queues its own: bindComputed clears the flag). */
+function queueVerifySlice(): void {
+  if (verifyQueued || verifyBudgetMs <= 0) return;
+  verifyQueued = true;
+  const epoch = bindingEpoch;
+  setTimeout(() => {
+    if (bindingEpoch !== epoch) return; // a binding we've moved off
+    verifyQueued = false;
+    boundDoc!.transact(() => {}, CT_VERIFY);
+  }, 0);
+}
+
+/** The writing page's own record checks out: it signed it (it never checks
+ *  its own records). Of table `tableId`'s live incarnation. */
+export function markComputedVerdict(tableId: string, hash: string): void {
+  const inc = computedIncOf(tableId);
+  if (inc !== null) verdictsOf(`${tableId}:${inc}`).set(hash, true);
+}
+
+/** What this page knows of record `hash`'s signature in incarnation `inc` of
+ *  table `tableId`: true (checked, or its own), false (checked and forged),
+ *  undefined (never asked: the fold checks only what it counts). Read-only:
+ *  nothing is checked here, so no read spends a recount's budget. */
+export function computedVerdictOf(tableId: string, inc: string, hash: string): boolean | undefined {
+  return computedVerdicts.get(`${tableId}:${inc}`)?.get(hash);
+}
+
+/** The key a computed felt must be signed with to count (TableFold's
+ *  keyOf): this page's own for its own player, else the one pinned when this
+ *  page first saw the player in the room (as fairTableSeeds keyFor reads). */
+function computedPinOf(pid: string): string | undefined {
+  return pid === getPlayerId() ? getIdentityPub() : readPlayerKey(pid);
+}
+
+function trackComputed(t: string, inc: string): ComputedInc {
+  const key = `${t}:${inc}`;
+  let c = computedIncs.get(key);
+  if (c) return c;
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  c = {
+    t, inc, key, ctx, fold: new TableFold(ctx, computedCheck(key), computedPinOf),
+    cp: null, sid: 'g', live: null, sidOf: { cp: null, sid: 'g' }, stale: true,
+    countedSid: null, countedCp: false, last: null, liveHeld: false, seen: new Map(),
+  };
+  computedIncs.set(key, c);
+  let incs = computedIncsOf.get(t);
+  if (!incs) computedIncsOf.set(t, incs = new Set());
+  incs.add(inc);
+  return c;
+}
+
+/** Whether something of table `tableId` this page counted is gone from the
+ *  doc, nothing having closed it (casinoWhole): a checkpoint (the doc holds
+ *  one per incarnation once one is written, and no build deletes it), or the
+ *  live session's map while the checkpoint still opens it. A trim deletes
+ *  the session in the transaction that writes the checkpoint closing it, so
+ *  the session reads as lost only on a doc holding part of that (whose
+ *  deletes Yjs applies first), or after a page deleted it with nothing in
+ *  its place: its decided rounds would read as never played. */
+function computedLost(tableId: string): boolean {
+  const incs = computedIncsOf.get(tableId);
+  const map = computedMap;
+  if (!incs || !map) return false;
+  for (const inc of incs) {
+    const c = computedIncs.get(`${tableId}:${inc}`)!;
+    const cp = checkpointAt(map, tableId, inc);
+    if (c.countedCp && !cp) return true;
+    if (c.countedSid !== null && liveSidOf(c, cp) === c.countedSid
+      && !(map.get(sessionKey(tableId, inc, c.countedSid)) instanceof Y.Map)) return true;
+  }
+  return false;
+}
+
+/** Stamp the record keys this page sees in an incarnation's live session
+ *  for the first time. */
+function stampArrivals(c: ComputedInc, keys: Iterable<string>): void {
+  let now: number | undefined;
+  for (const key of keys) {
+    if (c.seen.has(key) || !parseKey(key)) continue;
+    c.seen.set(key, now ??= Date.now());
+  }
+}
+
+/** What a key the live session holds holds, as the fold reads it. Yjs keeps
+ *  a key set to undefined (the doc grows by it, as by any junk), which the
+ *  fold would read as gone, never weighing it (rawBytes): it goes as null,
+ *  junk like any other. */
+const heldValue = (value: unknown): unknown => (value === undefined ? null : value);
+
+/** Read an incarnation whole: its checkpoint, and every record of the
+ *  session that opens (a session map made in this very transaction reports
+ *  nothing of its own). The stamps of keys it no longer holds go (a record
+ *  copied into the next session keeps its stamp: same key), and once it is
+ *  another session, the verdicts of records it doesn't hold. */
+function readComputedWhole(c: ComputedInc, map: Y.Map<unknown>): void {
+  const cp = checkpointAt(map, c.t, c.inc);
+  const sid = liveSidOf(c, cp);
+  const raw = map.get(sessionKey(c.t, c.inc, sid));
+  const live = raw instanceof Y.Map ? (raw as Y.Map<unknown>) : null;
+  const entries = live ? [...live.entries()].map(([key, value]): [string, unknown] => [key, heldValue(value)]) : [];
+  c.fold.setBase(cp);
+  c.fold.reset(entries);
+  const keys = new Set(entries.map(([key]) => key));
+  for (const key of [...c.seen.keys()]) if (!keys.has(key)) c.seen.delete(key);
+  stampArrivals(c, keys);
+  if (live !== c.live) {
+    const hashes = new Set<string>();
+    for (const key of keys) {
+      const h = parseKey(key)?.h;
+      if (h) hashes.add(h);
+    }
+    const verdicts = verdictsOf(c.key);
+    for (const h of [...verdicts.keys()]) if (!hashes.has(h)) verdicts.delete(h);
+  }
+  c.cp = cp;
+  c.sid = sid;
+  c.live = live;
+}
+
+/** Index the keys a transaction changed in an incarnation's live session.
+ *  A key deleted loses its stamp at once: put back, it arrives anew. */
+function applyComputed(c: ComputedInc, keys: Iterable<string>): void {
+  const live = c.live!;
+  const changes: [string, unknown][] = [];
+  for (const key of keys) changes.push([key, live.has(key) ? heldValue(live.get(key)) : undefined]);
+  c.fold.apply(changes);
+  const arrived: string[] = [];
+  for (const [key, value] of changes) {
+    if (value === undefined) c.seen.delete(key);
+    else arrived.push(key);
+  }
+  stampArrivals(c, arrived);
+}
+
+/** An incarnation's decided nets in the ledger, as its fold reads them now
+ *  (recountBook's diff). A slot bankroll's account is never a bettor. */
+function recountComputed(ix: ChipIndex, incKey: string, nets: ReadonlyMap<string, bigint>): void {
+  const before = ix.computed.get(incKey);
+  for (const pid of new Set([...(before?.keys() ?? []), ...nets.keys()])) {
+    if (!isBankrollAccount(pid)) addToAccount(ix, pid, (nets.get(pid) ?? 0n) - (before?.get(pid) ?? 0n), computedTouched);
+  }
+  if (nets.size > 0) ix.computed.set(incKey, new Map(nets));
+  else ix.computed.delete(incKey);
+}
+
+/** What an incarnation's felts hold, in the running total heldStake adds,
+ *  noting whose changed for their listeners. */
+function recountComputedHeld(incKey: string, held: ReadonlyMap<string, bigint>): void {
+  const before = computedHeld.get(incKey);
+  for (const pid of new Set([...(before?.keys() ?? []), ...held.keys()])) {
+    const d = (held.get(pid) ?? 0n) - (before?.get(pid) ?? 0n);
+    if (d === 0n || isBankrollAccount(pid)) continue;
+    const total = (computedHeldBy.get(pid) ?? 0n) + d;
+    if (total === 0n) computedHeldBy.delete(pid);
+    else computedHeldBy.set(pid, total);
+    computedTouched.add(pid);
+  }
+  if (held.size > 0) computedHeld.set(incKey, new Map(held));
+  else computedHeld.delete(incKey);
+}
+
+/** Count one incarnation as its fold reads now: its nets in the ledger, and
+ *  what its felts hold while it is live, both from one result. On a doc
+ *  holding part of an update, or missing what this page counted of the
+ *  table (casinoWhole), its last values stand instead (parked) until it is
+ *  whole, when it is read whole again. */
+function countComputed(c: ComputedInc, map: Y.Map<unknown>, casino: Y.Map<unknown>, whole: boolean, keys?: Set<string>): void {
+  if (!casinoWhole(c.t)) {
+    computedParked.add(c.key);
+    c.stale = true;
+    return;
+  }
+  if (whole || c.stale) readComputedWhole(c, map);
+  else if (keys) applyComputed(c, keys);
+  computedParked.delete(c.key);
+  c.stale = false;
+  const res = c.fold.result();
+  const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
+    && !casino.has(goneKey(c.t, c.inc)) && !res.base.ended;
+  recountComputed(chipIndex, c.key, res.nets);
+  recountComputedHeld(c.key, live ? res.held : NO_COMPUTED_HELD);
+  if (res !== c.last || live !== c.liveHeld) viewTouched.add(`computed:${c.t}`);
+  c.last = res;
+  c.liveHeld = live;
+  c.countedSid = c.live ? c.sid : null;
+  c.countedCp ||= c.cp !== null;
+}
+
+/** Track every computed incarnation the doc holds, count each, and recount
+ *  before any observer runs whenever a transaction touches one: a listener
+ *  of a casino key changed in the same transaction reads the new chips, and
+ *  a decided round's stake moves from held to paid in one recount. */
+function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
+  const map = doc.getMap<unknown>('casinoComputed');
+  computedMap = map;
+  computedIncs = new Map();
+  computedIncsOf = new Map();
+  computedHeld = new Map();
+  computedHeldBy = new Map();
+  computedParked.clear();
+  computedVerdicts = new Map();
+  computedKeysMoved = false;
+  verifyQueued = false;
+  verifySpent = 0;
+  for (const key of map.keys()) {
+    const at = computedKeyParts(key);
+    if (at) trackComputed(at.t, at.inc);
+  }
+  for (const c of computedIncs.values()) countComputed(c, map, casino, true);
+  // (bindCasinoDoc's own notify repaints every listener from the fresh doc.)
+  chipsTouched.clear();
+  heldTouched.clear();
+  computedTouched.clear();
+  viewTouched.clear();
+  doc.on('beforeObserverCalls', (tr: Y.Transaction) => {
+    if (computedMap !== map) return; // a binding we've moved off
+    onComputedTransaction(tr, map, casino);
+  });
+}
+
+function onComputedTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<unknown>): void {
+  verifySpent = 0;
+  const dirty = new Set<ComputedInc>();
+  const whole = new Set<ComputedInc>();
+  const changed = new Map<ComputedInc, Set<string>>();
+  // A session or checkpoint key moved (one added, replaced or deleted): its
+  // incarnation is read whole.
+  const top = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
+  if (top) {
+    for (const key of top) {
+      const at = key === null ? null : computedKeyParts(key);
+      if (!at) continue;
+      const c = computedIncs.get(`${at.t}:${at.inc}`) ?? (map.has(key!) ? trackComputed(at.t, at.inc) : undefined);
+      if (!c) continue;
+      whole.add(c);
+      dirty.add(c);
+    }
+  }
+  if (computedIncs.size === 0) return;
+  // A key pinned in this transaction counts for its player's felt in it.
+  const players = playersMap ? tr.changed.get(playersMap as unknown as Y.AbstractType<Y.YEvent<any>>) : undefined;
+  if (players && pinPlayer) for (const pid of players) if (pid !== null) pinPlayer(pid, playersMap!.get(pid));
+  if (computedKeysMoved) {
+    computedKeysMoved = false;
+    for (const c of computedIncs.values()) dirty.add(c);
+  }
+  // Records written into an incarnation's live session: only those keys.
+  // (Another session map of it counts nothing.) And junk growing inside a
+  // Y type stored in the live session, at any depth: the key it is stored
+  // under there weighs more (rawBytes), and only a read of that key again
+  // sees it, the session's own keys being as they were.
+  for (const [type, keys] of tr.changed) {
+    // Up from the changed type to the session map it is, or is stored in.
+    let session: Y.AbstractType<any> = type;
+    let inner: Y.AbstractType<any> | null = null;
+    while (session._item && session._item.parent !== map && session._item.parent instanceof Y.AbstractType) {
+      inner = session;
+      session = session._item.parent;
+    }
+    const item = session._item;
+    if (!item || item.parent !== map || typeof item.parentSub !== 'string') continue;
+    const at = computedKeyParts(item.parentSub);
+    const c = at ? computedIncs.get(`${at.t}:${at.inc}`) : undefined;
+    if (!c || whole.has(c) || c.live !== (session as unknown as Y.Map<unknown>)) continue;
+    let ks = changed.get(c);
+    if (!ks) changed.set(c, ks = new Set());
+    if (inner === null) {
+      for (const key of keys) if (key !== null) ks.add(key);
+    } else if (typeof inner._item?.parentSub === 'string') {
+      ks.add(inner._item.parentSub);
+    }
+    dirty.add(c);
+  }
+  // A switch, or a removal: whether the felts hold.
+  const switched = tr.changed.get(casino as unknown as Y.AbstractType<Y.YEvent<any>>);
+  if (switched) {
+    for (const key of switched) {
+      if (key === null) continue;
+      if (key.startsWith('cfg:computed:')) {
+        const t = key.slice('cfg:computed:'.length);
+        for (const inc of computedIncsOf.get(t) ?? []) dirty.add(computedIncs.get(`${t}:${inc}`)!);
+      } else if (key.startsWith('gone:')) {
+        const c = computedIncs.get(key.slice('gone:'.length));
+        if (c) dirty.add(c);
+      }
+    }
+  }
+  // A slice: what waited for its checks.
+  if (tr.origin === CT_VERIFY) for (const c of computedIncs.values()) if (c.last?.pending) dirty.add(c);
+  for (const c of dirty) countComputed(c, map, casino, whole.has(c), changed.get(c));
+  // The rest of an update came: what waited reads as it is.
+  if (computedParked.size > 0 && casinoWhole()) {
+    for (const key of [...computedParked]) {
+      const c = computedIncs.get(key)!;
+      if (!dirty.has(c)) countComputed(c, map, casino, true);
+    }
+  }
+}
+
+/** False while a computed table (table `tableId`'s, when named) waits: for
+ *  the rest of an update, or for the doc to hold what it counted (parked),
+ *  or for its records' signatures to be checked (its result pending: a slip
+ *  not checked yet holds nothing so far). Nothing is spent meanwhile
+ *  (spendableChips). Asked of every table, one frozen for good doesn't
+ *  count: on a doc holding every update whole, a table missing something
+ *  this page counted of it (tableLost) waits for nothing that will come.
+ *  Its last counts stand, and it stops only itself, as a table whose book
+ *  is lost does, or any peer could stop every spend in the casino by
+ *  making a session map and deleting it. */
+export function computedSettled(tableId?: string): boolean {
+  const settled = (key: string): boolean => !computedParked.has(key) && computedIncs.get(key)?.last?.pending !== true;
+  if (tableId !== undefined) return [...(computedIncsOf.get(tableId) ?? [])].every((inc) => settled(`${tableId}:${inc}`));
+  const whole = !docHoldsPart();
+  for (const c of computedIncs.values()) if (!settled(c.key) && !(whole && tableLost(c.t))) return false;
+  return true;
+}
+
+/** The fold of table `tableId`'s switched-on incarnation as last counted
+ *  (null for none, or one parked before it was ever counted). Read-only. */
+export function computedFoldOf(tableId: string): FoldResult | null {
+  const inc = computedIncOf(tableId);
+  return inc === null ? null : computedIncs.get(`${tableId}:${inc}`)?.last ?? null;
+}
+
+/** When this page first saw record `key` in the live session of table
+ *  `tableId`'s switched-on incarnation (its own Date.now(), raw: a duty
+ *  clamps it to its own clock), or undefined. */
+export function computedSeenAt(tableId: string, key: string): number | undefined {
+  const inc = computedIncOf(tableId);
+  return inc === null ? undefined : computedIncs.get(`${tableId}:${inc}`)?.seen.get(key);
+}
+
+/** The live session map of a computed table to write records into, read
+ *  afresh on every call (a trim replaces it, and a write through an old one
+ *  vanishes), or null when the table isn't computed or has none. */
+export function computedSessionForWrite(tableId: string): Y.Map<unknown> | null {
+  if (!isComputedTable(tableId)) return null;
+  const inc = computedIncOf(tableId)!;
+  const map = computedMap!;
+  const sid = nextSid({ room: boundRoomId, t: tableId, inc }, checkpointAt(map, tableId, inc));
+  const live = map.get(sessionKey(tableId, inc, sid));
+  return live instanceof Y.Map ? (live as Y.Map<unknown>) : null;
+}
+
+/** Tell listeners a computed table's view moved with no transaction behind
+ *  it (a phase its clock ran out), as `computed:<tableId>`. */
+export function notifyCasinoView(tableId: string): void {
+  notify(new Set([`computed:${tableId}`]));
+}
+
+/** Every session map the doc holds of incarnation `inc` of table `tableId`
+ *  (the live one, and any a rival trim left: two sides of a split each open
+ *  their own), by key. Parsed, so another table whose id runs on past this
+ *  one's (`<tableId>:<inc>…`) keeps its own. */
+function sessionKeysOf(map: Y.Map<unknown>, tableId: string, inc: string): string[] {
+  const out: string[] = [];
+  for (const key of map.keys()) {
+    const at = computedKeyParts(key);
+    if (at && at.sid !== undefined && at.t === tableId && at.inc === inc) out.push(key);
+  }
+  return out;
+}
+
+/**
+ * 🧹 Trim computed table `tableId`'s live session to checkpoint `cp`, in ONE
+ * transaction: `cp` becomes the incarnation's checkpoint, every session map
+ * of it goes (deleting the whole map is what frees the doc's space; deleting
+ * its keys one by one leaves most of it), and the session `cp` opens
+ * (nextSid) is created holding `copies`, byte for byte under their keys (the
+ * open round's felts: they hold as they did). On a page whose fold agreed,
+ * the recount reads the checkpoint's nets for the rounds it took away and
+ * the copies' stakes for what they held: no balance moves, and listeners are
+ * told once (the view moved). A write into the old session at the same
+ * moment, through any reference to it, vanishes everywhere; its author puts
+ * it back (computedTable's re-put).
+ *
+ * Refused (false) unless `inc` is the table's live incarnation, the doc holds
+ * the table whole, and `cp` is a checkpoint (not an end: finalizeComputed)
+ * closing the session live now: a caller holding a fold from before another
+ * page's trim reached it trims nothing.
+ */
+export function writeCheckpointAndTrim(
+  tableId: string, inc: string, cp: Checkpoint, copies: readonly (readonly [key: string, value: unknown])[],
+): boolean {
+  ensureMap();
+  const map = computedMap!;
+  if (!isComputedTable(tableId) || computedIncOf(tableId) !== inc || !casinoWhole(tableId)) return false;
+  const ok = asCheckpoint(cp);
+  const ctx: FoldCtx = { room: boundRoomId, t: tableId, inc };
+  if (!ok || ok.e === 1 || ok.b !== nextSid(ctx, checkpointAt(map, tableId, inc))) return false;
+  const next = nextSid(ctx, ok);
+  boundDoc!.transact(() => {
+    map.set(`sum:${tableId}:${inc}`, cp);
+    for (const key of sessionKeysOf(map, tableId, inc)) map.delete(key);
+    const ses = new Y.Map<unknown>();
+    map.set(sessionKey(tableId, inc, next), ses);
+    for (const [key, value] of copies) ses.set(key, value);
+  });
+  return true;
+}
+
+/**
+ * 🧹 Finalise incarnation `inc` of computed table `tableId`, in ONE
+ * transaction: its final checkpoint `cp` (`e: 1`, the fold's nets: they go
+ * on counting, as a removed table's book does), every session map of it
+ * gone, and `gone:<tableId>:<inc>` marked if it isn't. A session map anyone
+ * writes after that counts nothing (an ended checkpoint's session is junk to
+ * the fold). `cp` null keeps the checkpoint already there, which must say the
+ * incarnation ended (a stray session after the end: only the maps go).
+ *
+ * Refused (false) unless the doc holds the table whole, this page tracks the
+ * incarnation, and `cp` ends the session live now. The caller decides when:
+ * an ended incarnation (computedEndedIncs) is compacted by the room's pages
+ * in turn; a switch-off ends a live one (and deletes the switch).
+ */
+export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | null): boolean {
+  const casino = ensureMap();
+  const map = computedMap!;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!c || !casinoWhole(tableId)) return false;
+  const was = checkpointAt(map, tableId, inc);
+  if (cp !== null) {
+    const ok = asCheckpoint(cp);
+    if (!ok || ok.e !== 1 || ok.b !== liveSidOf(c, was)) return false;
+  } else if (was?.e !== 1) {
+    return false;
+  }
+  boundDoc!.transact(() => {
+    if (cp !== null) map.set(`sum:${tableId}:${inc}`, cp);
+    for (const key of sessionKeysOf(map, tableId, inc)) map.delete(key);
+    if (!casino.has(goneKey(tableId, inc))) casino.set(goneKey(tableId, inc), 1);
+  });
+  return true;
+}
+
+/** What the room's computed sessions weigh: Σ rawBytes (computedFold: every
+ *  key, junk included) over each incarnation's live session as last counted,
+ *  ended ones too until they are compacted. A session past ROOM_MIN_BYTES is
+ *  trimmed for the room's sake once this passes ROOM_BYTES (computedTable). */
+export function computedRoomBytes(): number {
+  let total = 0;
+  for (const c of computedIncs.values()) if (c.live && c.last) total += c.last.rawBytes;
+  return total;
+}
+
+/** A computed incarnation that has ended and whose sessions are still in
+ *  the doc: what compaction finalises (computedTable). */
+export interface EndedComputed {
+  t: string;
+  inc: string;
+  /** Its fold as last counted (its decided nets: the final checkpoint's). */
+  res: FoldResult;
+  /** The session map its checkpoint opens, to read its records by (null:
+   *  only another of its session maps is left). Read-only. */
+  session: Y.Map<unknown> | null;
+}
+
+/** Every incarnation this page counts that has ended (a `gone:` mark, a
+ *  switch that is missing or names another incarnation, or a checkpoint
+ *  saying it ended) and still has a session map in the doc, by key. A table
+ *  a removal took out isn't among the room's tables any more, so this, not
+ *  the tables passed in, is what compaction goes by. */
+export function computedEndedIncs(): EndedComputed[] {
+  const casino = ensureMap();
+  const map = computedMap!;
+  const withSession = new Set<string>();
+  for (const key of map.keys()) {
+    const at = computedKeyParts(key);
+    if (at && at.sid !== undefined && map.get(key) instanceof Y.Map) withSession.add(`${at.t}:${at.inc}`);
+  }
+  const out: EndedComputed[] = [];
+  for (const key of [...withSession].sort()) {
+    const c = computedIncs.get(key);
+    if (!c?.last) continue;
+    const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
+      && !casino.has(goneKey(c.t, c.inc)) && checkpointAt(map, c.t, c.inc)?.e !== 1;
+    if (!live) out.push({ t: c.t, inc: c.inc, res: c.last, session: c.live });
+  }
+  return out;
+}
+
+/** Every table whose switch names an incarnation this page counts (it has
+ *  a session or a checkpoint in the doc) that nothing has ended
+ *  (isComputedTable), with that incarnation: what computedTable's awayDuty
+ *  looks for among the room's tables. A table a removal took out ends here,
+ *  but only on a page that ran the removal (clearTableKeys); this is how a
+ *  page finds one whose removal it never ran. */
+export function computedLiveTables(): { t: string; inc: string }[] {
+  const out: { t: string; inc: string }[] = [];
+  for (const [t, incs] of computedIncsOf) {
+    const inc = computedIncOf(t);
+    if (inc !== null && incs.has(inc) && isComputedTable(t)) out.push({ t, inc });
+  }
+  return out;
 }
 
 // ── 🎲🎡 #226: who stands where, and the shooter's throw ─────────────────────
@@ -2091,6 +3088,9 @@ export function readSeedRecord(tableId: string, playerId: string): TableSeedReco
 // (and so can't add a signed seed) rather than unseat anyone.
 const MAX_PINNED_KEYS = 4096;
 let pinnedKeys = new Map<string, string>();
+/** The bound room's players map, and the binding's pin (pinPlayerKeys). */
+let playersMap: Y.Map<unknown> | null = null;
+let pinPlayer: ((pid: string, v: unknown) => void) | null = null;
 
 function entryKey(v: unknown): string | undefined {
   const k = (v as { keyB64?: unknown } | undefined)?.keyB64;
@@ -2101,11 +3101,21 @@ function pinPlayerKeys(doc: Y.Doc): void {
   const pins = new Map<string, string>();
   pinnedKeys = pins;
   const players = doc.getMap('players');
+  // 🧮 A computed felt counts only under its player's pinned key, so a new
+  // pin can make one count (TableFold keysChanged). The computed recount
+  // pins a transaction's players itself first, so the felt counts in that
+  // very transaction (onComputedTransaction); here it is pinned already.
   const pin = (pid: string, v: unknown): void => {
     if (pins.has(pid) || pins.size >= MAX_PINNED_KEYS || pid.length === 0 || pid.length > 128) return;
     const k = entryKey(v);
-    if (k) pins.set(pid, k);
+    if (!k) return;
+    pins.set(pid, k);
+    if (pinnedKeys !== pins || computedIncs.size === 0) return;
+    for (const c of computedIncs.values()) c.fold.keysChanged();
+    computedKeysMoved = true;
   };
+  playersMap = players;
+  pinPlayer = pin;
   players.forEach((v, pid) => pin(pid, v));
   players.observe((e) => {
     for (const pid of e.keysChanged) pin(pid, players.get(pid));

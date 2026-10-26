@@ -107,6 +107,70 @@ export function verifyIdentity(pubB64: string, bytes: Uint8Array, sigB64: string
   }
 }
 
+/** Public keys verifyIdentityStrict has decoded, by their base64url string:
+ *  the 32 bytes, or null for a string that isn't a key's one encoding. Kept
+ *  to MAX_STRICT_PUBS, oldest dropped first: a room holds a few dozen keys,
+ *  and a page fed junk keys must not grow without bound. */
+const strictPubs = new Map<string, Uint8Array | null>();
+const MAX_STRICT_PUBS = 1_024;
+
+/** The bytes `s` encodes, only if `s` is exactly how b64urlEncode writes
+ *  `len` bytes. atob forgives a lot (padding, whitespace, the +/ alphabet
+ *  after the swap, stray low bits in the last character), so one key or
+ *  signature could be spelled several ways; computed tables hash the
+ *  spelling into the record, so only one spelling may verify. */
+function strictB64(s: string, len: number): Uint8Array | null {
+  try {
+    const bytes = b64urlDecode(s);
+    return bytes.length === len && b64urlEncode(bytes) === s ? bytes : null;
+  } catch {
+    return null; // not base64 at all
+  }
+}
+
+/** True when a signature's R (its first 32 bytes) is the identity point,
+ *  01 00…00: the one spelling of it that strict decoding accepts. noble
+ *  2.3.0's verify hashes R‖A‖M inside a try that R.toBytes() escapes on the
+ *  identity, leaving k = SHA-512("") with no message in it, so a key's owner
+ *  could make ONE signature that verifies every message (any record, room,
+ *  table or incarnation). No honest signer ever produces this R. */
+function identityR(sig: Uint8Array): boolean {
+  if (sig[0] !== 1) return false;
+  for (let i = 1; i < 32; i++) if (sig[i] !== 0) return false;
+  return true;
+}
+
+/**
+ * 🧮 verifyIdentity, but with ONE answer for every page
+ * and every encoding — what the computed-table fold (computedFold.ts) uses.
+ * The key and the signature must be the canonical base64url of 32 and 64
+ * bytes, R may not be the identity point (identityR), and noble checks with
+ * `zip215: false`: a strict point decoding, no small-order public key (whose
+ * "signatures" verify any message), S < L, and the cofactored equation.
+ * That last part means a signature whose R carries a torsion component
+ * still passes; it does so on every page that runs this pinned noble
+ * version (package.json), so pages agree. A later fast path (WebCrypto) must
+ * make the same byte checks first: it accepts an identity R whose S fits the
+ * real k, which noble and this refuse.
+ * Any throw is a false. verifyIdentity keeps noble's defaults (zip215: true).
+ */
+export function verifyIdentityStrict(pubB64: string, bytes: Uint8Array, sigB64: string): boolean {
+  try {
+    if (typeof pubB64 !== 'string' || typeof sigB64 !== 'string') return false;
+    let pub = strictPubs.get(pubB64);
+    if (pub === undefined) {
+      pub = strictB64(pubB64, 32);
+      strictPubs.set(pubB64, pub);
+      while (strictPubs.size > MAX_STRICT_PUBS) strictPubs.delete(strictPubs.keys().next().value as string);
+    }
+    const sig = strictB64(sigB64, 64);
+    if (!pub || !sig || identityR(sig)) return false;
+    return ed.verify(sig, bytes, pub, { zip215: false });
+  } catch {
+    return false;
+  }
+}
+
 /** Canonical bytes binding a display name to our key — what the self-cert signs
  *  (`ssf-id-cert:v1:<name>:<pubB64>`). Domain-tagged + versioned so it can't be
  *  replayed as a different message kind. */
