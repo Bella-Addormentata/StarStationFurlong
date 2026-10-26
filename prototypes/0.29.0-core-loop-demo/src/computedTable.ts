@@ -47,6 +47,31 @@
  * does. Every record this page signs is marked checked before it is written
  * (markComputedVerdict), so the recount never spends time on it.
  *
+ * A PAGE THAT CAN'T HEAR THE ROOM doesn't forfeit for it. A forfeit beats a
+ * full set of reveals, so one from a page that missed seeds only because its
+ * own link stalled after a close (a wifi blip, the node's link to the host)
+ * rewrites, as the link comes back, a round every other page showed. Such a
+ * page hears nobody: no tick from any page, no update into its doc
+ * (roomHearing.ts, which main.ts and casinoDoc tell). So a forfeit, and an
+ * answer to one, goes only from a page that has heard the room all the way
+ * from a lapse before the close to its write (heardAround: a close that
+ * came in the burst as its link came back was not heard live, even if its
+ * stamp is fresh); the rest is the others' to forfeit, or the abandon's to
+ * void. And a page still missing a seed near the end of its grace asks the
+ * room once for what it lacks (askDuty): an update lost on its way comes
+ * back before the forfeit would drop it. In a room of two, a page whose
+ * only peer sleeps hears nobody, so the round waits for the sleeper's seed
+ * or the abandon. The seed is the other side of it: a full set of reveals
+ * beats a void, so a seed that lands after the room voided the round
+ * undoes a void every other page showed. So a page reveals for a void round
+ * only when it watched that round's close live, hearing the room around it
+ * (voidHolds, watchedLive); and a page back from a sleep, or from a spell
+ * hearing nobody, holds its seed for a round it slept through with another
+ * player's stake in it until it has heard the room again (wakeHolds), so
+ * that a void it hadn't heard of yet stands. A round only its own player
+ * bets in is a room of one: nobody else is there to void it, and its seed
+ * goes at once.
+ *
  * WHEN THE AUTHOR HAS LEFT. Any page can delete any record (the honest-client
  * model), and on a table players come and go, the author of a record is
  * often gone. Two things follow, and each has its answer. A round's close
@@ -97,6 +122,7 @@
  */
 
 import {
+  askRoomForMissing,
   casinoDocEpoch,
   casinoRoomId,
   casinoWhole,
@@ -146,6 +172,7 @@ import { isRouletteBet } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 import { getIdentityPub, signIdentity } from './keypair';
+import { heardThrough } from './roomHearing';
 
 // ── ⏱ Timing ─────────────────────────────────────────────────────────────────
 
@@ -154,12 +181,20 @@ import { getIdentityPub, signIdentity } from './keypair';
 export { BET_WINDOW_MS, SHOW_MS };
 /** The least a frozen bettor's seed is waited for (fairTableSeeds.ts). */
 export { REVEAL_GRACE_MS };
+/** Whether this page hears the room (roomHearing.ts: main.ts turns it on and
+ *  tells it of each tick it hears; the specs reach it here, in each page's
+ *  own load of the modules). */
+export { HEARD_GAP_MS, listenToRoom, noteRoomHeard } from './roomHearing';
 /** The most it is waited for, however late the seeds before it came. */
 export const GRACE_MAX_MS = 10_000;
 /** A seed seen inside the grace stretches it to this long after that seed. */
 export const GRACE_PAD_MS = 1_500;
 /** Each page ranked ahead for a duty puts this much on this page's turn. */
 export const STAGGER_MS = 1_500;
+/** A seed still missing this long before the least grace runs out is asked
+ *  of the room (askDuty): the room's answer is in before the forfeit falls
+ *  due. */
+export const ASK_AHEAD_MS = 1_500;
 /** A close nothing has decided for this long is voided (an abandon). */
 export const ABANDON_MS = 30_000;
 /** Felt changes within this of the last slip written are held, then one
@@ -345,6 +380,8 @@ interface TableState {
   /** When this page first saw round r's close stand down for a seed out
    *  (seedOut, with no tip and no close in): it closes ABANDON_MS on. */
   seedOutAt: { r: number; at: number } | null;
+  /** The close this page last asked the room about (askDuty: once per close). */
+  askedFor: string | null;
   /** By close hash: the rounds this page witnesses (noteWitness), and a
    *  count bumped whenever a copy comes or goes. */
   witness: Map<string, Witnessed>;
@@ -420,6 +457,7 @@ function lookAtClock(now: number): void {
       st.missingAt.clear();
       st.opened.clear();
       st.seedOutAt = null;
+      st.askedFor = null;
       st.shortAt = null;
       // (A copy keeps its value: only when it went missing starts again.)
       for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
@@ -466,7 +504,7 @@ function newTable(t: string, inc: string): TableState {
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
     pending: null, lateFelt: null, lastSlip: null, rearm: null, tickedAt: null, reputAt: null,
     lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, lastCheck: null,
-    missingAt: new Map(), opened: new Map(), seedOutAt: null, witness: new Map(), witnessVer: 0, lost: null,
+    missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
   };
 }
@@ -517,6 +555,7 @@ function noteResult(st: TableState, res: FoldResult): void {
     if (st.pending && st.pending.r <= u) st.pending = null;
     st.missingAt.clear();
     st.seedOutAt = null;
+    st.askedFor = null;
     // What a checkpoint covers is final, and what the next session doesn't
     // hold of the rounds it saw past it is void (below): no copy of any of
     // it goes into the next session, nor is a stand-down timed from it.
@@ -1316,10 +1355,10 @@ export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now =
  * TICK_MS): a switch a peer took away put back first (every frame), then its
  * reveals as soon as the room's state is in, then, on a whole doc, awake and
  * with every signature checked, the held felt, a burned commitment renewed,
- * the close, a forfeit, an answer to a forfeit, an abandon, the re-put and
- * the trim, each in its turn; and the compaction of any ended incarnation,
- * of these tables or not. A phase this page's clock alone moved on tells the
- * table's listeners once.
+ * the close, an ask for a seed still missing, a forfeit, an answer to a
+ * forfeit, an abandon, the re-put and the trim, each in its turn; and the
+ * compaction of any ended incarnation, of these tables or not. A phase this
+ * page's clock alone moved on tells the table's listeners once.
  */
 export function tickComputedTables(tableIds: Iterable<string>, now = Date.now()): void {
   lookAtClock(now);
@@ -1367,7 +1406,7 @@ function tickTable(st: TableState, now: number): void {
   if (!roomStateIn(now)) return;
   const me = getPlayerId();
   const pub = getIdentityPub();
-  revealDuty(st, me, pub, now);
+  revealDuty(st, me, now);
   noteMissing(st, now);
   if (!casinoWhole(st.t) || !tablesAwake(now) || !computedSettled(st.t)) return;
   // (First: what a round rests on is kept before any duty reads it lost.)
@@ -1377,6 +1416,7 @@ function tickTable(st: TableState, now: number): void {
   recommitDuty(st, me, now);
   noteSeedOut(st, now);
   closeDuty(st, me, pub, now);
+  askDuty(st, me, now);
   forfeitDuty(st, me, pub, now);
   answerDuty(st, me, pub, now);
   abandonDuty(st, me, pub, now);
@@ -1404,17 +1444,19 @@ function tellPhase(st: TableState, now: number): void {
  *  can't be counted without it, and a page that holds it back forfeits. The
  *  commitment is burned from then on. Runs on a partial doc too (the record
  *  is looked for in the session itself, so a stale count writes it once),
- *  and again whenever the session lacks it, deleted or written over. For a
- *  round an abandon voided whose close this page didn't watch come in, not
- *  while the void holds it (voidHolds). */
-function revealDuty(st: TableState, me: string, pub: string, now: number): void {
+ *  and again whenever the session lacks it, deleted or written over. Not
+ *  for a round an abandon voided whose close this page didn't watch come in
+ *  hearing the room (voidHolds); nor, back from a sleep or a load, for an
+ *  undecided round the room may have voided meanwhile (wakeHolds). */
+function revealDuty(st: TableState, me: string, now: number): void {
   const res = resultOf(st);
   const ses = computedSessionForWrite(st.t);
   if (!res || !ses) return;
   const sc = scanOf(st, res);
   for (const round of res.rounds) {
     if (!round.present.includes(me)) continue;
-    if (round.decided === 'void' && !watchedClose(st, round) && voidHolds(st, sc, round, me, pub, now)) continue;
+    if (round.decided === 'void' && voidHolds(st, round, now)) continue;
+    if (wakeHolds(st, round, me, now)) continue;
     const slip = frozenSlip(sc, round, me);
     const seed = slip && seedFor(slip.c, seedCtx(st, round.r, me));
     if (!slip || !seed) continue;
@@ -1429,24 +1471,87 @@ function revealDuty(st: TableState, me: string, pub: string, now: number): void 
   }
 }
 
+/** Whether this page has heard the room without a break from
+ *  TABLE_LEASE_LAPSE_MS before `at` (when it saw a close) to now
+ *  (roomHearing heardThrough). Not across a deaf spell since; nor when the
+ *  spell ended less than that before the close came: its link back, the
+ *  room's ticks come at once and its doc catches up a moment later (a
+ *  resync), the close in that catch-up all at once with the seeds, the
+ *  forfeit or the void that followed it, every one of them read as just
+ *  come — as on a doc that slept, which waits out the same lapse (croupier
+ *  tablesAwake). What the page saw "in time" of such a close is no count of
+ *  the room's. Always true while nothing wired the hearing. */
+function heardAround(at: number, now: number): boolean {
+  return heardThrough(at - TABLE_LEASE_LAPSE_MS, now);
+}
+
+/** Whether this page watched round's close come in (watchedClose) hearing
+ *  the room around it (heardAround): one that came with the catch-up as its
+ *  link came back after a deaf spell came all at once with what followed it
+ *  (its seeds, its void), as one that came as the page woke. */
+function watchedLive(st: TableState, round: RoundView, now: number): boolean {
+  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`);
+  return raw !== undefined && watchedClose(st, round) && heardAround(raw, now);
+}
+
 /**
- * Whether the void of `round` holds this page's seed back, the round's close
- * one this page didn't watch come in (watchedClose: back from a sleep or a
- * load, as no forfeit of its own goes for it: forfeitDuty). Its seed comes
- * minutes late, and with every other frozen bettor's in (each gone before
- * its reveal, all back now), the reveals would beat the void every page has
- * shown, and the round would pay out long after its stakes went back. So
- * not the seed that would make the set whole; and each in its turn among
- * the frozen bettors' pubs (dutyRank 'forfeit', STAGGER_MS each) from when
- * this page saw the void, so that bettors back at once see each other's
- * seeds before theirs goes. A seed that leaves the set short still goes:
- * the round stays void without it, and voided at once by a griefer's
- * abandon, a forfeit from a page that watched the close may count it.
+ * Whether the void of `round` holds this page's seed back: always, the
+ * round's close one this page didn't watch come in hearing the room
+ * (watchedLive: back from a sleep or a load, or its link back after a deaf
+ * spell, as no forfeit of its own goes for it: forfeitDuty). Its seed comes
+ * late, and with every other frozen bettor's in (each gone before its
+ * reveal, all back now, or out before the void reached them), the reveals
+ * would beat the void every page has shown, and the round would pay out
+ * long after its stakes went back. Which seed would make the set whole no
+ * page back can tell: another's may be on its way to it, or written on a doc
+ * the void hadn't reached yet. Holding back only that one, and the rest each
+ * in its turn (STAGGER_MS apart), lost the race to slower links: two back at
+ * once on a 2-3 s handshake each put theirs out before the other's came
+ * (stale-cache, SIM_SEED=800). So none goes, and the void stands. (What it
+ * gives up: a griefer's abandon at once voids a round, and a bettor back
+ * within the grace, its seed in time for the forfeit that a page that
+ * watched the close writes, is dropped by that forfeit; a page that watched
+ * the close still reveals its seed, void or not.)
  */
-function voidHolds(st: TableState, sc: Scan, round: RoundView, me: string, pub: string, now: number): boolean {
-  if (round.missing.length === 0 && round.present.every((pid) => pid === me || round.revealed.includes(pid))) return true;
-  const from = seen(st, `z:${round.r}:${round.abandon!.hash}`, now);
-  return now < from + placeOf('forfeit', st.ctx, round.r, frozenPubs(sc, round), pub) * STAGGER_MS;
+function voidHolds(st: TableState, round: RoundView, now: number): boolean {
+  return !watchedLive(st, round, now);
+}
+
+/**
+ * Whether this page holds its seed back for an undecided round whose close
+ * it didn't watch come in (watchedClose: back from a sleep or a load), as
+ * the room may have voided the round meanwhile: in a room of two, the page
+ * left awake heard nobody and forfeited nothing (forfeitDuty's
+ * heardAround), and its abandon is the round's end. A seed that reaches
+ * the room after that void would beat it (every reveal in beats an abandon)
+ * and pay out a round whose stakes went back long before.
+ *
+ * While the page waits out the lapse after a wake (croupier tablesAwake),
+ * its doc catching up: the seed of a close it first saw ABANDON_MS ago or
+ * more (a second's slack aside, on its own clock). A younger close can't
+ * have been voided yet, and its seed goes at once, as before (in a grace
+ * still running it may count in time) — but not, for a round it slept
+ * through with another player's stake in it, while it hears nobody
+ * (heardThrough): a seed written then reaches the room only as its link
+ * comes back, however long that takes (a laptop's lid opened: the page runs
+ * at once, its node's link to the room dials again), maybe after the void.
+ * And past the lapse, such a round's older close waits until this page has
+ * heard the room for as long again (its link back later than its wake: the
+ * doc catches up from then). By then the void is in, if there is one, and
+ * voidHolds decides; a round still undecided gets the seed. Hearing nobody
+ * for good (every other page gone), the round ends by this page's own
+ * abandon, ABANDON_MS from its wake. A round only this page's player bets
+ * in waits for no hearing: nobody else's chips are in it, and in a room of
+ * one nobody else voids it.
+ */
+function wakeHolds(st: TableState, round: RoundView, me: string, now: number): boolean {
+  if (round.decided !== null || watchedClose(st, round)) return false;
+  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`);
+  if (raw === undefined) return false;
+  const old = now - raw >= ABANDON_MS - TABLE_CLOCK_SLACK_MS;
+  if (old && !tablesAwake(now)) return true;
+  if (raw >= clock.wakeAt || !round.present.some((pid) => pid !== me)) return false;
+  return !heardThrough(old ? now - TABLE_LEASE_LAPSE_MS : now, now);
 }
 
 /** Whether table st reads betting on its open round now (the view: a show
@@ -1595,6 +1700,30 @@ function closeDue(st: TableState, own: { key: string }, deadline: number, idx: n
   return mine ? after : after + GRACE_MAX_MS;
 }
 
+/**
+ * 4b. Ask the room, once per close, for what this page is missing, when a
+ * frozen bettor's seed (or slip) still isn't in ASK_AHEAD_MS before the
+ * least grace runs out on this page's clock (REVEAL_GRACE_MS from when it
+ * saw the close): the tip undecided (so a seed or a slip is missing: with
+ * every one in, the reveals decide it), this page's player frozen in it
+ * with their seed in. An update lost on its way here (a message dropped, a
+ * link that blinked) comes back before the forfeit falls due — one that
+ * would drop the seed, and beat the full set every page that had it showed.
+ * casinoDoc's resync, under casinoWhole's rate limit (askRoomForMissing):
+ * one ask serves both, and held back by a recent one, this one goes once
+ * that lapses, still once per close; but not held back by one from before
+ * the close came, which brought none of its seeds. Harmless when the seed
+ * is only being withheld: the room has nothing to send. Asked whether this
+ * page hears the room or not: an ask that reaches nobody brings nothing.
+ */
+function askDuty(st: TableState, me: string, now: number): void {
+  const tip = resultOf(st)?.tip;
+  if (!tip || st.askedFor === tip.close || !tip.present.includes(me) || !tip.revealed.includes(me)) return;
+  const closeSeen = seen(st, `c:${tip.r}:${tip.close}`, now);
+  if (now < closeSeen + REVEAL_GRACE_MS - ASK_AHEAD_MS) return;
+  if (askRoomForMissing(now, closeSeen)) st.askedFor = tip.close;
+}
+
 /** This page's forfeit of `round`'s close, written now: n the bettors whose
  *  seed it saw in the grace, itself always. */
 function writeForfeit(st: TableState, round: RoundView, n: string[], pub: string): void {
@@ -1616,7 +1745,14 @@ function writeForfeit(st: TableState, round: RoundView, n: string[], pub: string
  * nor twice for one close, nor for a round whose result this page showed
  * that reads otherwise only because a peer deleted what it rests on
  * (heldBack): decided again, it might count fewer seeds than it did, and a
- * forfeit outlives the put-back (it beats the reveals).
+ * forfeit outlives the put-back (it beats the reveals). Nor from a page that
+ * hasn't heard the room all the way from the close to now (heardAround: a
+ * silence of HEARD_GAP_MS since, or now, or one that ended just before the
+ * close came, which came with the room's catch-up): the seeds it missed may
+ * be its own link's loss, and its forfeit, landing as the link comes back,
+ * would beat the full set every other page showed. The pages that heard
+ * the room forfeit what truly didn't come; with none, the abandon voids the
+ * round.
  */
 function forfeitDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -1634,6 +1770,7 @@ function forfeitDuty(st: TableState, me: string, pub: string, now: number): void
     const until = closeSeen + graceOf(closeSeen, times.values());
     const idx = placeOf('forfeit', st.ctx, round.r, frozenPubs(sc, round), pub);
     if (now < until + idx * STAGGER_MS) continue;
+    if (!heardAround(closeSeen, now)) continue;
     writeForfeit(st, round, countedBy(round, times, until, me), pub);
   }
 }
@@ -1650,7 +1787,12 @@ function forfeitDuty(st: TableState, me: string, pub: string, now: number): void
  *  late. Once the grace on this page's clock is over (its count is final),
  *  once per close. Not to a forfeit that decides a round this page showed
  *  only because a peer deleted the one that decided it (heldBack): that one
- *  goes back, and an answer to the other could outrank it. */
+ *  goes back, and an answer to the other could outrank it. Nor from a page
+ *  that hasn't heard the room all the way from the close (heardAround, as
+ *  the forfeit): across a deaf spell, or of a close that came with the
+ *  catch-up after one (its own seed with it, late in the room: lone-stall,
+ *  SIM_SEED=3000), its count of seeds seen in time is no count of the
+ *  room's. */
 function answerDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
   if (!res) return;
@@ -1670,7 +1812,7 @@ function answerDuty(st: TableState, me: string, pub: string, now: number): void 
     const dropped = round.present.filter((pid) => !F.n.includes(pid) && (times.get(pid) ?? Infinity) <= until);
     if (dropped.length === 0) continue;
     const n = [...new Set([...F.n, ...dropped])].sort();
-    if (n.includes(me)) writeForfeit(st, round, n, pub);
+    if (n.includes(me) && heardAround(closeSeen, now)) writeForfeit(st, round, n, pub);
   }
 }
 

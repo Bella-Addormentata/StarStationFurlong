@@ -240,8 +240,10 @@ describe("the spike's eight", () => {
     await sim.run(RUN_MS);
     // Scoped: a lost update can rewrite a round some pages showed, in the
     // ways the design accepts (no cheat, no split, and still it happens). A
-    // seed lost on one link comes with the next resync, up to 5 s on, past
-    // the 4 s grace of the page it was lost to: that page forfeits it, and a
+    // seed lost on one link is asked for 2.5 s after the close (computedTable
+    // askDuty), and the room's answer, 300-800 ms on, is mostly in before the
+    // 4 s grace runs out; when it isn't (the answer lost too, or a seed out
+    // late on a slow link), the page it was lost to forfeits it, and a
     // valid forfeit beats the full set the others already showed (pr2-
     // verdict.md Q4, kept so that a late seed never rewrites a forfeit's
     // result; Risks: a link slower than the grace still forfeits). A page
@@ -317,7 +319,17 @@ describe("the spike's eight", () => {
     });
     await sim.run(RUN_MS);
     for (const sp of others().slice(0, 2)) if (sp.mode === 'gone') await sim.reload(sp);
-    const s = await finish(sim);
+    // Scoped (pr2-pr-notes.md Known limits: a page away mid-round forfeits
+    // unless it reveals within the grace; pr2-verdict.md Q4): a page that
+    // crashed with its felt down and is loaded again just as the grace runs
+    // out reveals from its store, its seed in time on some page and late on
+    // another; the round reads the full set on the page back (and on any it
+    // reached in time) until the forfeit of the page it was late on comes,
+    // and beats it; such a page may answer. Only where a page frozen in the
+    // round, or the forfeit's writer, was away as it closed (SIM_SEED=505
+    // at 752ef48 already: E crashed at 12 s, round 1 closed at 19.2 s with
+    // its felt, E back at 22.25 s, F's forfeit at 23.2 s).
+    const s = await finish(sim, { awayFlips: ['forfeit over reveals', 'answer forfeit'] });
     expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(15));
     // Pages loaded again checked the session in slices.
     expect(s.slices, sim.label).toBeGreaterThan(0);
@@ -1109,5 +1121,229 @@ describe('added for PR 2', () => {
     expect(s.voids, sim.label).toBeGreaterThan(0);
     expect(gone.every((sp) => sp.mode === 'up'), sim.label).toBe(true);
     expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(15));
+  }, TIMEOUT);
+
+  it('lone stall: one page at a time cut off from everyone, or deaf to them, for 5-20 s, mostly just after a close reaches it, its frames running', async () => {
+    // A wifi blip, or the node's link to the host stalling, for longer than
+    // the grace right after a close: the page hears no seeds, and nobody.
+    // Half the stalls are of its downlink alone (Net.deaf): what it sends
+    // still goes, its own seed among them, so the rest of the room shows the
+    // full set while it sees none of their seeds — the forfeit the hearing
+    // gate keeps it from writing would beat that set (pr2-verdict.md Q4).
+    const sim = await Sim.open({ name: 'lone-stall', seed: seed(18), pages: named('ABCDE') });
+    const cuts: { name: string; from: number; to: number; aimed: boolean; deaf: boolean }[] = [];
+    let cut: { sp: SimPage; until: number } | null = null;
+    let target: { sp: SimPage; aimed: boolean; was: string | null; at: number | null } | null = null;
+    let next = SIM_T0 + 15_000;
+    let last: SimPage | null = null;
+    /** The close of the tip on page sp, when its player has a felt in it. */
+    const tipOf = (sp: SimPage): string | null => {
+      sim.enter(sp);
+      const tip = sp.p.casino.computedFoldOf(T1)?.tip;
+      return tip?.present.includes(sp.pid) ? tip.close : null;
+    };
+    sim.every(() => {
+      if (cut) {
+        if (sim.T < cut.until && !sim.healed) return;
+        sim.net.groups = null;
+        sim.net.deaf.clear();
+        cuts[cuts.length - 1].to = sim.T;
+        cut = null;
+        next = sim.T + between(sim.rand, 3_000, 10_000);
+      }
+      if (sim.healed || sim.T < next) return;
+      // A page, never the one cut off last; four times in five as the next
+      // close that freezes its player's felt reaches it (0-3 s on, half the
+      // time at once or a tick or two on, while the seeds are still coming:
+      // a stall then is the one that misses some, its own or the others'),
+      // else at once, whatever it is doing.
+      if (!target) {
+        const cands = sim.pages.filter((sp) => sp !== last);
+        const sp = cands[between(sim.rand, 0, cands.length - 1)];
+        const aimed = sim.rand() < 0.8;
+        target = { sp, aimed, was: tipOf(sp), at: aimed ? null : sim.T };
+      }
+      if (target.at === null) {
+        const tip = tipOf(target.sp);
+        if (tip === null || tip === target.was) {
+          target.was = tip;
+          return;
+        }
+        target.at = sim.T + (sim.rand() < 0.5 ? between(sim.rand, 0, 2) * SIM_STEP : between(sim.rand, 500, 3_000));
+      }
+      if (sim.T < target.at) return;
+      const sp = target.sp;
+      const deaf = sim.rand() < 0.5;
+      if (deaf) sim.net.deaf.add(sp.name);
+      else sim.net.groups = [[sp.name], sim.pages.filter((q) => q !== sp).map((q) => q.name)];
+      cut = { sp, until: sim.T + between(sim.rand, 5_000, 20_000) };
+      cuts.push({ name: sp.name, from: sim.T, to: cut.until, aimed: target.aimed, deaf });
+      last = sp;
+      target = null;
+    });
+    await sim.run(RUN_MS);
+    if (cut) cuts[cuts.length - 1].to = sim.T;
+    console.log(`[sim] lone-stall seed=${sim.opts.seed}: ${cuts.length} stalls (${cuts.filter((c) => c.aimed).length} aimed, ${cuts.filter((c) => c.deaf).length} deaf only), ${Math.round(cuts.reduce((n, c) => n + c.to - c.from, 0) / 1000)} s in all`);
+    // Scoped: no page cut off alone forfeits what it couldn't hear (it hears
+    // nobody: computedTable heardThrough), so no round the room showed
+    // decided by its seeds is rewritten, and no answer is called for. Only
+    // the page cut off may read a round otherwise, while it is cut off or as
+    // it comes back (the next resync, a link's delay on): its own close of a
+    // round the room closed without it (by the chain rule, the room's), a
+    // trim's other side ('other branch', found once the run is over), or,
+    // stalled as the round closed, a forfeit of its own seed, late, by a
+    // page that heard the room, over the full set its doc showed as it
+    // caught up (pr2-pr-notes.md Known limits: a page away mid-round
+    // forfeits unless it reveals within the grace). And one exception,
+    // counted: the rest of the room may read a round otherwise by a close
+    // the page cut off wrote (just before its stall, the close lost on its
+    // way, or, deaf, without seeing the room's), heard as it came back or as
+    // it was written, that the chain rule picks by rank over the room's, no
+    // round gone on from theirs yet, decided by no forfeit of the page cut
+    // off (pr2-pr-notes.md Known limits: the close of a page whose link
+    // stalled can rewrite a round on the heal; the tie-break of two decided
+    // chains of one length is the design's, pr2-verdict.md Q2).
+    const s = await finish(sim, { flips: ['other branch', 'rival close', 'forfeit over reveals'] });
+    expect(cuts.filter((c) => c.aimed).length, sim.label).toBeGreaterThan(0);
+    expect(cuts.filter((c) => c.deaf).length, sim.label).toBeGreaterThan(0);
+    const stalled = (sp: SimPage, from: number, to: number): boolean => cuts.some((c) => c.name === sp.name && c.from <= to && from <= c.to);
+    const cutOff = (sp: SimPage, T: number): boolean => stalled(sp, T - RESYNC_MS - 1_000, T);
+    let theirs = 0;
+    let late = 0;
+    for (const sp of sim.pages) {
+      sim.enter(sp);
+      const rounds = sp.p.casino.computedFoldOf(T1)?.rounds ?? [];
+      for (const f of sp.flipEvents) {
+        const v = rounds.find((x) => x.close === f.close);
+        const why = `${sim.label} ${sp.name} ${f.kind} at ${f.T - SIM_T0}: ${sp.flipLog.join('; ')}`;
+        expect(f.kind, why).not.toBe('answer forfeit');
+        if (f.kind === 'forfeit over reveals') {
+          const at = sim.closeFirstAt(f.close) ?? f.T;
+          const F = v?.forfeit?.rec;
+          expect(stalled(sp, at, at) && F !== undefined && F.k !== sp.p.pub && !F.n.includes(sp.pid), why).toBe(true);
+          late += 1;
+          continue;
+        }
+        if (cutOff(sp, f.T)) continue;
+        const writer = sim.pages.find((q) => q !== sp && q.p.pub === v?.closeRec.k);
+        const rival = f.kind === 'rival close' && writer !== undefined && cutOff(writer, f.T) && f.fk !== writer.p.pub;
+        expect(rival, why).toBe(true);
+        theirs += 1;
+      }
+      // Every round decided or voided (the quiet period settled every page).
+      expect(sp.p.casino.computedFoldOf(T1)?.tip ?? null, `${sim.label} ${sp.name}`).toBeNull();
+    }
+    console.log(`[sim] lone-stall seed=${sim.opts.seed}: ${theirs} flips on pages not stalled, by a stalled page's close; ${late} of a stalled page's own late seed`);
+    expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(15));
+  }, TIMEOUT);
+
+  it('two pages, one away: the other page sleeps (no frames, no ticks) for 10-60 s, often just after a close freezes it, before its reveal', async () => {
+    // A backgrounded tab in a room of two: the page left awake hears nobody,
+    // so it forfeits nothing; the round voids ABANDON_MS on (its stakes
+    // back), or is decided by the sleeper's seed if it is back before then.
+    const sim = await Sim.open({ name: 'two-page-away', seed: seed(19), pages: named('AB') });
+    const [a, b] = sim.pages;
+    const { table } = a.p;
+    /** By close: rounds B slept through, frozen before its seed went (the
+     *  room's time it went, and woke). */
+    const slept = new Map<string, { r: number; from: number; to: number | null; syncing: boolean }>();
+    const episodes: { aimed: boolean; from: number; ms: number; syncing: boolean; relink: number }[] = [];
+    let armed: { aimed: boolean } | null = null;
+    let away: { from: number; syncing: boolean } | null = null;
+    /** B back in the room (its seed can reach A from now): the room's time. */
+    const backInRoom = (): void => {
+      for (const e of slept.values()) e.to ??= sim.T;
+      away = null;
+      if (!sim.healed) sim.at(sim.elapsed + between(sim.rand, 10_000, 30_000), () => { armed = { aimed: sim.rand() < 0.7 }; });
+    };
+    const goToSleep = (aimed: boolean): void => {
+      const n = episodes.length;
+      // (Long and short in turn: the void and the seed back in time both come.)
+      const ms = n % 2 === 0 ? between(sim.rand, 35_000, 60_000) : between(sim.rand, 10_000, 25_000);
+      // An offline sleep may wake to a link that takes 3-20 s to come back
+      // (a laptop's lid opened: the page runs at once, its node's link to
+      // the room dials again over the wifi), hearing nobody meanwhile: the
+      // first two do (a long and a short one), the rest half the time.
+      const syncing = n >= 2 && sim.rand() < 0.5;
+      const relink = !syncing && (n < 2 || sim.rand() < 0.5) ? between(sim.rand, 3_000, 20_000) : 0;
+      episodes.push({ aimed, from: sim.T, ms, syncing, relink });
+      sim.sleep(b, syncing);
+      away = { from: sim.T, syncing };
+      armed = null;
+      sim.at(sim.elapsed + ms, () => {
+        if (relink > 0 && !sim.healed) sim.net.groups = [[a.name], [b.name]];
+        if (b.mode === 'asleep') sim.wake(b);
+        if (relink === 0 || sim.healed) {
+          backInRoom();
+          return;
+        }
+        sim.at(sim.elapsed + relink, () => {
+          sim.net.groups = null;
+          sim.net.connect(b);
+          backInRoom();
+        });
+      });
+    };
+    sim.at(10_000, () => { armed = { aimed: true }; });
+    b.beforeFrame = () => {
+      if (!armed || sim.healed) return true;
+      const tip = b.p.casino.computedFoldOf(T1)?.tip;
+      if (armed.aimed && !(tip && tip.present.includes(b.pid) && !tip.revealed.includes(b.pid))) return true;
+      goToSleep(armed.aimed);
+      return false;
+    };
+    // A round's close that froze B's felt, B asleep before its seed went.
+    sim.every(() => {
+      if (!away) return;
+      sim.enter(a);
+      const tip = a.p.casino.computedFoldOf(T1)?.tip;
+      if (tip && tip.present.includes(b.pid) && !tip.revealed.includes(b.pid) && !slept.has(tip.close)) {
+        slept.set(tip.close, { r: tip.r, from: away.from, to: null, syncing: away.syncing });
+      }
+    });
+    // When A first read each close come, and each round decided, and how.
+    const closeAt = new Map<string, number>();
+    const decidedAt = new Map<string, { T: number; how: string }>();
+    sim.every(() => {
+      sim.enter(a);
+      for (const v of a.p.casino.computedFoldOf(T1)?.rounds ?? []) {
+        if (!closeAt.has(v.close)) closeAt.set(v.close, sim.T);
+        if (v.decided && !decidedAt.has(v.close)) decidedAt.set(v.close, { T: sim.T, how: v.decided });
+      }
+    });
+    await sim.run(RUN_MS);
+    // (Still asleep, or its link not back, as the run ends: the heal brings it back.)
+    for (const e of slept.values()) e.to ??= sim.T;
+    // Unscoped: no flips at all; the page left awake forfeits nothing.
+    const s = await finish(sim);
+    expect(episodes.filter((e) => e.aimed).length, sim.label).toBeGreaterThan(0);
+    expect(slept.size, sim.label).toBeGreaterThan(0);
+    expect(s.byForfeit, sim.label).toBe(0);
+    sim.enter(a);
+    const kept = new Map<string, string>();
+    for (const f of sim.cold(a).folds.values()) for (const v of f.res.rounds) if (v.decided) kept.set(v.close, v.decided);
+    let voids = 0;
+    let back = 0;
+    for (const [close, e] of slept) {
+      const how = kept.get(close) ?? decidedAt.get(close)?.how;
+      const label = `${sim.label} round ${e.r} (B away ${(e.from - SIM_T0) / 1000}-${e.to === null ? '…' : (e.to - SIM_T0) / 1000}s, ${e.syncing ? 'syncing' : 'offline'})`;
+      // Void, or decided by B's seed once it was back in time: before A's
+      // abandon (ABANDON_MS after it saw the close, in its turn of the two),
+      // and as A first read it decided (a void the seed beat after is a flip).
+      expect(['void', 'reveals'], label).toContain(how);
+      expect(decidedAt.get(close)?.how, label).toBe(how);
+      if (how === 'reveals') {
+        back += 1;
+        expect(e.to, label).not.toBeNull();
+        expect(e.to! - closeAt.get(close)!, label).toBeLessThan(table.ABANDON_MS + 2 * table.STAGGER_MS + 2 * SIM_STEP);
+      } else {
+        voids += 1;
+      }
+    }
+    expect(voids, sim.label).toBeGreaterThan(0);
+    expect(s.voids, sim.label).toBeGreaterThan(0);
+    expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(10));
+    // (How many came back in time, for the line.)
+    console.log(`[sim] two-page-away seed=${sim.opts.seed}: ${episodes.length} sleeps (${episodes.filter((e) => e.aimed).length} aimed, ${episodes.filter((e) => e.relink > 0).length} its link back late), ${slept.size} rounds slept through: ${voids} void, ${back} by the seed back in time`);
   }, TIMEOUT);
 });

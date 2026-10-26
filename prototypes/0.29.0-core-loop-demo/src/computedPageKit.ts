@@ -44,11 +44,18 @@ export const PAGE_CTX: FoldCtx = { room: PAGE_ROOM, t: PAGE_TABLE, inc: PAGE_INC
  *  room's players map as main.ts shows it. Its checks never run out of time
  *  unless `verify` gives them a clock and a budget (casinoDoc
  *  setComputedVerifyForTests); `resync` is what its doc calls to ask the room
- *  for what it is missing (bindCasinoDoc's, YjsSync's resync in the app). */
+ *  for what it is missing (bindCasinoDoc's, YjsSync's resync in the app).
+ *  With `hears`, its tables listen to the room as main.ts has them listen
+ *  (computedTable listenToRoom): a forfeit goes only from a page that has
+ *  heard the room since the close came, and the spec (computedSim) tells
+ *  it each tick it hears; without, it hears the room always, as a page with
+ *  no room does (offline practice, the specs that hand docs over by hand). */
 export async function loadPage(
   name: string,
   clientID: number,
-  opts: { skew?: number; pid?: string; reloadOf?: Page; resync?: () => void; verify?: { now: () => number; budgetMs: number } } = {},
+  opts: {
+    skew?: number; pid?: string; reloadOf?: Page; resync?: () => void; verify?: { now: () => number; budgetMs: number }; hears?: boolean;
+  } = {},
 ): Promise<Page> {
   const pid = opts.reloadOf?.pid ?? opts.pid ?? `player-${name}`;
   vi.resetModules();
@@ -67,6 +74,8 @@ export async function loadPage(
   const fair = await import('./fairTableSeeds');
   const fold = await import('./computedFold');
   const keypair = await import('./keypair');
+  // (This load's own modules: a reload listens afresh, as a page loaded again does.)
+  if (opts.hears) table.listenToRoom();
   const doc = new Y.Doc();
   doc.clientID = clientID;
   casino.setComputedVerifyForTests(opts.verify ?? { now: () => 0 });

@@ -17,13 +17,29 @@
  * drawn per message) and loss, first in first out on each link and in no
  * order across links: an update can reach a page before one it rests on
  * that came another way, which the doc holds back (pendingStructs) until the
- * rest comes. A partition cuts the links between its groups. Every 5 s each
+ * rest comes. A partition cuts the links between its groups; a page made
+ * deaf hears nothing while what it sends still goes (a stall of its
+ * downlink alone: the wifi's, or its node's link to the host). Every 5 s each
  * linked pair is sent the full state diff the other lacks (the room relay's
  * resync: Y.encodeStateAsUpdate against the peer's state vector), and a page
  * coming online has one sent each way at once (its handshake).
  *
  * A doc that asks the room for what it is missing (casinoDoc's resync
  * callback, as YjsSync's) is sent each linked peer's diff on the next tick.
+ *
+ * HEARTBEATS. Each page that is up sends every page it is linked to a
+ * heartbeat each step (its position tick: main.ts sends one every 50 ms
+ * while its player is in the room), over the same links: their delay and
+ * jitter, their partitions, lost at their rate, but as datagrams, each in
+ * no order with what went before it (and drawn from a random stream of
+ * their own, so the updates go as they would without them). A page asleep
+ * or gone sends none (a backgrounded tab runs no frames); one that only
+ * lags or cheats (pauseUntil, beforeFrame) still does. A page that hears
+ * one tells its tables (computedTable noteRoomHeard, as main.ts's onTick
+ * does), and an update its doc applies tells them through casinoDoc, as in
+ * the app: every page listens to the room as main.ts has it listen
+ * (listenToRoom), so a page that hears nothing (cut off, deaf, alone, or
+ * every other page asleep) forfeits nothing.
  *
  * THE CLOCK is virtual, in 250 ms steps; each page reads the room's time
  * plus its skew (a clock step is a change of skew). Everything a page does
@@ -253,6 +269,9 @@ function shownOf(v: RoundView): Shown {
  *  - 'rival close': another close of the round won (by the chain rule: the
  *    longest decided chain, then rank), decided another way ("ROUND n WAS
  *    REWRITTEN");
+ *  - 'void undone': the same close, shown void (stakes back), then decided
+ *    by the full set of reveals or a forfeit (a seed back after the void, or
+ *    a forfeit, beats an abandon): it pays out after the stakes went back;
  *  - 'blip': it read undecided or gone for a while, then as shown again (a
  *    record deleted, then put back by its author or a witness);
  *  - 'undone': it read undecided or gone, and the chain kept at the end
@@ -263,11 +282,13 @@ function shownOf(v: RoundView): Shown {
  *    side's; or it changed while the page was away);
  *  - 'checkpoint': a checkpoint that differs from the rounds it covers;
  *  - 'other': anything else. */
-export type FlipKind = 'forfeit over reveals' | 'answer forfeit' | 'rival close' | 'blip' | 'undone' | 'other branch' | 'checkpoint' | 'other';
+export type FlipKind =
+  'forfeit over reveals' | 'answer forfeit' | 'rival close' | 'void undone' | 'blip' | 'undone' | 'other branch' | 'checkpoint' | 'other';
 
 /** What took a round from `was` to `is` (both decided, not alike). */
 function changeKind(was: Shown, is: Shown): FlipKind {
   if (is.close !== was.close) return 'rival close';
+  if (was.decided === 'void') return 'void undone';
   if (was.decided === 'reveals' && is.decided === 'forfeit') return 'forfeit over reveals';
   return was.decided === 'forfeit' && is.decided === 'forfeit' ? 'answer forfeit' : 'other';
 }
@@ -383,7 +404,8 @@ export class SimPage {
 // ── 🌐 The network ───────────────────────────────────────────────────────────
 
 interface Link { delay: [number, number]; loss: number; last: number }
-interface Msg { at: number; seq: number; from: SimPage; to: SimPage; u: Uint8Array; resync: boolean }
+/** An update (`u`), or a heartbeat (`u` null). */
+interface Msg { at: number; seq: number; from: SimPage; to: SimPage; u: Uint8Array | null; resync: boolean }
 
 export interface LinkSpec { delay: [number, number]; loss: number }
 
@@ -393,10 +415,18 @@ export class Net {
   private seq = 0;
   /** A partition: pages in different groups can't reach each other. */
   groups: string[][] | null = null;
+  /** Pages that hear nothing, by name: what is sent to them is lost as it
+   *  would arrive, while what they send goes (a downlink stall). */
+  readonly deaf = new Set<string>();
   sent = 0;
   lost = 0;
+  /** Heartbeats sent, and lost on the way. */
+  beats = 0;
+  beatsLost = 0;
 
-  constructor(private readonly sim: Sim, readonly rand: Rng, public base: LinkSpec) {}
+  /** `beatRand` draws the heartbeats' losses and delays apart from the
+   *  updates' (`rand`): the updates go as they would with no heartbeats. */
+  constructor(private readonly sim: Sim, readonly rand: Rng, public base: LinkSpec, private readonly beatRand: Rng = rand) {}
 
   private link(a: SimPage, b: SimPage): Link {
     const key = `${a.name}>${b.name}`;
@@ -419,6 +449,7 @@ export class Net {
       l.loss = this.base.loss;
     }
     this.groups = null;
+    this.deaf.clear();
   }
 
   connected(p: SimPage): boolean {
@@ -440,21 +471,24 @@ export class Net {
     return a === b || this.linked(a, b);
   }
 
-  private enqueue(from: SimPage, to: SimPage, u: Uint8Array, resync: boolean, lossy: boolean): void {
+  private enqueue(from: SimPage, to: SimPage, u: Uint8Array | null, resync: boolean, lossy: boolean): void {
     const l = this.link(from, to);
-    if (lossy && this.rand() < l.loss) {
-      this.lost++;
+    const rand = u ? this.rand : this.beatRand;
+    if (lossy && rand() < l.loss) {
+      if (u) this.lost++;
+      else this.beatsLost++;
       return;
     }
-    const delay = l.delay[0] + this.rand() * (l.delay[1] - l.delay[0]);
-    // First in, first out on each link.
-    const at = Math.max(this.sim.T + delay, l.last);
-    l.last = at;
+    const delay = l.delay[0] + rand() * (l.delay[1] - l.delay[0]);
+    // First in, first out on each link; a heartbeat waits for nothing.
+    const at = u ? Math.max(this.sim.T + delay, l.last) : this.sim.T + delay;
+    if (u) l.last = at;
     const msg: Msg = { at, seq: this.seq++, from, to, u, resync };
     let i = this.queue.length;
     while (i > 0 && (this.queue[i - 1].at > at)) i--;
     this.queue.splice(i, 0, msg);
-    this.sent++;
+    if (u) this.sent++;
+    else this.beats++;
   }
 
   /** An update page `from` wrote: to every page it is linked to. */
@@ -466,6 +500,14 @@ export class Net {
   private diff(from: SimPage, to: SimPage, lossy: boolean): void {
     const u = Y.encodeStateAsUpdate(from.p.doc, Y.encodeStateVector(to.p.doc));
     this.enqueue(from, to, u, true, lossy);
+  }
+
+  /** Each up page's heartbeat to every page it is linked to (HEARTBEATS). */
+  beat(): void {
+    for (const from of this.sim.pages) {
+      if (from.mode !== 'up') continue;
+      for (const to of this.sim.pages) if (this.linked(from, to)) this.enqueue(from, to, null, false, true);
+    }
   }
 
   /** The 5 s resync: each linked pair, each way. */
@@ -498,12 +540,13 @@ export class Net {
   }
 
   /** Hand on what is due by `T` (everything, with `all`), to pages that still
-   *  hear the room and aren't cut off from the sender. */
+   *  hear the room, aren't deaf and aren't cut off from the sender. */
   async deliver(T: number, all = false): Promise<void> {
     while (this.queue.length > 0 && (all || this.queue[0].at <= T)) {
       const m = this.queue.shift()!;
-      if (!this.connected(m.to) || this.apart(m.from, m.to)) continue;
-      await this.sim.hear(m.to, m.u, m.resync);
+      if (!this.connected(m.to) || this.apart(m.from, m.to) || this.deaf.has(m.to.name)) continue;
+      if (m.u) await this.sim.hear(m.to, m.u, m.resync);
+      else this.sim.heardBeat(m.to);
     }
   }
 
@@ -656,7 +699,7 @@ export class Sim {
     this.rand = simRng(opts.seed);
     this.entropy = simRng(opts.seed ^ 0x5eed5eed);
     this.tables = opts.tables ?? ['roulette-1'];
-    this.net = new Net(this, simRng(opts.seed ^ 0x0e7), opts.link ?? { delay: [40, 150], loss: 0 });
+    this.net = new Net(this, simRng(opts.seed ^ 0x0e7), opts.link ?? { delay: [40, 150], loss: 0 }, simRng(opts.seed ^ 0xbea7));
   }
 
   /** "<name> seed=<n>": every failure message carries it, to replay the run. */
@@ -778,6 +821,7 @@ export class Sim {
         if (page && sp.p === page) this.net.ask(sp);
       },
       verify: { now: verifyClock(), budgetMs: VERIFY_BUDGET_MS },
+      hears: true,
     });
     page = p;
     sp.p = p;
@@ -1157,6 +1201,7 @@ export class Sim {
   private async tick(): Promise<void> {
     while (this.events.length > 0 && this.events[0].at <= this.T) await this.events.shift()!.fn();
     for (const hook of this.hooks) await hook(this.T);
+    this.net.beat();
     await this.net.deliver(this.T);
     this.net.answerAsks();
     const beat = (this.T - SIM_T0) % RESYNC_MS === 0;
@@ -1210,6 +1255,12 @@ export class Sim {
     if (!sp.p.casino.computedSettled()) sp.pendingHeard += 1;
     if (partial && !sp.partial) sp.partialEpisodes += 1;
     sp.partial = partial;
+  }
+
+  /** Page sp hears a heartbeat (main.ts onTick): its tables are told, on its clock. */
+  heardBeat(sp: SimPage): void {
+    const now = this.enter(sp);
+    sp.p.table.noteRoomHeard(now);
   }
 
   /** One frame of page sp: its bot, then World's frame for computed tables. */
@@ -1394,9 +1445,10 @@ export class Sim {
     }));
   }
 
-  /** A round page sp showed decided (its view's spin key named it) that now
-   *  reads otherwise — decided another way, or not at all — is a flip; so is
-   *  a checkpoint differing from what it folded of the rounds it covers. */
+  /** A round page sp showed decided (its view's spin key named it, or its
+   *  view read it settled void) that now reads otherwise — decided another
+   *  way, or not at all — is a flip; so is a checkpoint differing from what
+   *  it folded of the rounds it covers. */
   private flipsOf(sp: SimPage, t: string, inc: string, res: FoldResult, now: number): void {
     const { table } = sp.p;
     const view = table.readComputedRoulette(t, now);
@@ -1424,8 +1476,10 @@ export class Sim {
         sp.unlike.set(key, u);
       }
     };
-    if (view && view.spinKey !== '' && view.inc === inc) {
-      const r = Number(view.spinKey.split(':')[0]);
+    // (A void shows too, with no spin: "stakes back".)
+    const voidShown = view !== null && view.phase === 'settled' && view.voided === true;
+    if (view && (view.spinKey !== '' || voidShown) && view.inc === inc) {
+      const r = view.spinKey !== '' ? Number(view.spinKey.split(':')[0]) : view.round;
       const v = res.rounds.find((x) => x.r === r && x.decided !== null);
       const key = `${t}:${inc}:${r}`;
       if (v && !sp.shown.has(key)) {
@@ -1468,6 +1522,11 @@ export class Sim {
       w.cpFlipped.add(res.base.sid);
       flip('checkpoint', `${res.base.sid} differs by ${check.checkpointDiff} chips`);
     }
+  }
+
+  /** When `close` first came to any page (the room's time), or undefined. */
+  closeFirstAt(close: string): number | undefined {
+    return this.closeAt.get(close);
   }
 
   /** Flips of `kinds` that no page's absence explains: each needs a page

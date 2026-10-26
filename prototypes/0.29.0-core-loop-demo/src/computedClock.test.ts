@@ -241,7 +241,7 @@ describe('back after the round was decided', () => {
     expect(again.table.computedRoundCheck(TABLE, backAt + 30_000)!.dropped).toEqual([]);
   });
 
-  it('a void stays void when a bettor who left wakes two minutes on: no forfeit counts its late seed', async () => {
+  it('a void stays void when a bettor who left wakes two minutes on: its seed stays back, and no forfeit counts one', async () => {
     const pages = await openRoom(['A', 'B', 'C'], T0);
     const [a, b, c] = pages;
     for (const p of [a, b]) bet(p, T0);
@@ -257,7 +257,11 @@ describe('back after the round was decided', () => {
     const back = voidAt + 60_000 + STEP;
     run([a, c], back, back + 30_000, { step: STEP });
     expect(a.croupier.tablesWakeCount()).toBe(1);
-    expect(keysIn(c, 'x', 1).filter((k) => k.includes(a.pid))).toHaveLength(1);
+    // A watched the close, but slept since: back, it can't tell whether its
+    // seed is the one that would make the set whole and undo the void (B's
+    // may be on its way), so the void holds it back (computedTable
+    // voidHolds), and nothing is left for a forfeit to count.
+    expect(keysIn(c, 'x', 1).filter((k) => k.includes(a.pid))).toEqual([]);
     expect(foldOf(c).rounds[0].decided).toBe('void');
     expect(keysIn(c, 'f', 1)).toEqual([]);
     expect(c.casino.readChips(b.pid)).toBe(1_000);

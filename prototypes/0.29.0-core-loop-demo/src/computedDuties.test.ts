@@ -1046,7 +1046,7 @@ describe('the abandon', () => {
     }
   });
 
-  it('stands as all its bettors come back from a sleep through it at once: the seed that would make the set whole stays in', async () => {
+  it('stands as all its bettors come back from a sleep through it at once: their seeds stay in', async () => {
     // (computedSim's abandoned scenario found it: every bettor a close froze
     // gone before its reveal, the round voided 30 s on, and each, back, put
     // its seed out for it: every seed in, the reveals beat the void every
@@ -1064,13 +1064,44 @@ describe('the abandon', () => {
     sync(at, ...pages);
     for (const p of pages) expect(foldOf(p).rounds[0].decided).toBe('void');
     // Back together (a wake: a lapse since their last frame), each holding
-    // its seed: the first in turn puts its seed out; the other, seeing it,
-    // holds its own.
+    // its seed: neither puts it out for a close it didn't watch come in.
     for (const p of [a, b]) expect(p.fair.seedFor(slipsOf(p, 1, p.pid)[0].c, { room: CTX.room, table: seedTable(CTX), round: 1, party: p.pid, house: '' })).not.toBeNull();
-    const [first] = byRank([a, b], 'forfeit', 1);
     run(pages, at + STEP, at + 20_000, { step: STEP });
     for (const p of pages) {
-      expect(keysIn(p, 'x', 1).map((k) => k.split(':')[2])).toEqual([first.pid]);
+      expect(keysIn(p, 'x', 1)).toEqual([]);
+      expect(foldOf(p).rounds[0].decided).toBe('void');
+      expect(p.casino.readChips(a.pid)).toBe(1_000);
+      expect(p.casino.readChips(b.pid)).toBe(1_000);
+    }
+  });
+
+  it("stands as they come back at once over a handshake slower than any stagger: neither seed goes, though neither page sees the other's", async () => {
+    // (computedSim's stale-cache scenario found it, SIM_SEED=800: two
+    // bettors back at once on 2-3 s links, each in its turn 1.5 s apart,
+    // neither saw the other's seed before its own went; every seed in, the
+    // reveals beat the void every page had shown.)
+    const pages = await room(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
+    c.casino.writeMySeat(TABLE, c.pid, { stand: 2, angle: 1, at: 1 });
+    sync(T0, ...pages);
+    const closedAt = run([a, b], T0 + STEP, T0 + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    sync(closedAt, ...pages);
+    const at = run([c], closedAt + STEP, closedAt + 60_000, { step: STEP, until: () => keysIn(c, 'z', 1).length > 0 });
+    sync(at, ...pages);
+    for (const p of pages) expect(foldOf(p).rounds[0].decided).toBe('void');
+    // Back together, neither hearing the other for 8 s: past the lapse
+    // after the wake, and past the second's turn of the old stagger.
+    for (let T = at + STEP; T <= at + 8_000; T += STEP) {
+      frame(T, a);
+      frame(T, b);
+    }
+    expect(keysIn(a, 'x', 1)).toEqual([]);
+    expect(keysIn(b, 'x', 1)).toEqual([]);
+    run(pages, at + 8_000 + STEP, at + 30_000, { step: STEP });
+    for (const p of pages) {
+      expect(keysIn(p, 'x', 1)).toEqual([]);
       expect(foldOf(p).rounds[0].decided).toBe('void');
       expect(p.casino.readChips(a.pid)).toBe(1_000);
       expect(p.casino.readChips(b.pid)).toBe(1_000);

@@ -222,6 +222,7 @@ import { asCheckpoint, nextSid, parseKey, TableFold } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, SigCheck } from './computedFold';
 import { getPlayerId } from './identity';
 import { getIdentityPub, verifyIdentityStrict } from './keypair';
+import { forgetRoomHeard, noteRoomHeard } from './roomHearing';
 
 let boundDoc: Y.Doc | null = null;
 let casinoMap: Y.Map<unknown> | null = null;
@@ -267,6 +268,14 @@ export function bindCasinoDoc(doc: Y.Doc, roomId = '', resync?: () => void): voi
   boundDoc = doc;
   askResync = resync ?? null;
   askedResyncAt = -Infinity;
+  // 👂 Every update this doc applies from the room (not this page's own
+  // writes) is the room heard, for the computed tables' forfeits
+  // (roomHearing.ts); Yjs tells of one only when it changed something. A doc
+  // bound afresh has heard nothing yet.
+  forgetRoomHeard();
+  doc.on('update', (_u: Uint8Array, _origin: unknown, _doc: Y.Doc, tr: Y.Transaction) => {
+    if (boundDoc === doc && !tr.local) noteRoomHeard();
+  });
   pinPlayerKeys(doc);
   casinoMap = doc.getMap('casino');
   waitingWhole.clear();
@@ -485,9 +494,40 @@ function recountEnd(ix: ChipIndex, map: Y.Map<unknown>, key: string): void {
 }
 
 /** Calls back to ask the room for what this page is missing (YjsSync
- *  resync), at most every few seconds; none for a page-local doc. */
+ *  resync), at most every RESYNC_ASK_MS whoever asks; none for a page-local
+ *  doc. */
 let askResync: (() => void) | null = null;
 let askedResyncAt = -Infinity;
+const RESYNC_ASK_MS = 5_000;
+
+/** Ask the room for what this page is missing, unless it was asked less than
+ *  RESYNC_ASK_MS ago, by anyone: one ask brings everything the room has
+ *  that this page lacks, so it serves every reason to ask (a part held here,
+ *  a seed a computed table waits for), and none starves another — a reason
+ *  held back asks once that lapses. Only an ask at `since` or later holds
+ *  this one back (every ask so held when left out): one from before brought
+ *  nothing written since. Whether it asked now. */
+function askRoom(now: number, since = -Infinity): boolean {
+  if (!askResync) return false;
+  if (now - askedResyncAt < RESYNC_ASK_MS && now >= askedResyncAt && askedResyncAt >= since) return false;
+  askedResyncAt = now;
+  try { askResync(); } catch (err) { console.warn('[casino] resync failed:', err); }
+  return true;
+}
+
+/** Ask the room for what this page is missing (computedTable askDuty: a seed
+ *  still missing near the end of its grace), under casinoWhole's rate limit
+ *  (askRoom), held back only by an ask at `since` or later (the close the
+ *  seed is for came in then: an ask from before it, casinoWhole's for a part
+ *  it held, brought no seed for it, and waiting out its 5 s would let the
+ *  forfeit fall due first). Whether that is done with: asked now, or no
+ *  room to ask (a page-local doc); false while a recent ask holds it back
+ *  (ask again). The duty asks once per close, so this adds one ask a round
+ *  at most to casinoWhole's, and casinoWhole's next waits RESYNC_ASK_MS
+ *  from it. */
+export function askRoomForMissing(now = Date.now(), since = -Infinity): boolean {
+  return askRoom(now, since) || !askResync;
+}
 
 /** Whether the bound doc holds every update it has been given whole (and,
  *  for table `tableId`, every book of it this page has read): Yjs parks the
@@ -506,11 +546,7 @@ let askedResyncAt = -Infinity;
  *  doc no longer has (computedLost). */
 export function casinoWhole(tableId?: string): boolean {
   if (!docHoldsPart() && (tableId === undefined || !tableLost(tableId))) return true;
-  const now = Date.now();
-  if (askResync && !(now - askedResyncAt < 5_000 && now >= askedResyncAt)) {
-    askedResyncAt = now;
-    try { askResync(); } catch (err) { console.warn('[casino] resync failed:', err); }
-  }
+  askRoom(Date.now());
   return false;
 }
 
