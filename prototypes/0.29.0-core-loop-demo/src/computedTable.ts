@@ -81,6 +81,19 @@
  * void, and put back they would only be played again. A table's ended
  * incarnation (removed, or switched off) is compacted the same way into a
  * checkpoint that says it ended, whose nets go on counting.
+ *
+ * THE SWITCH. The house, with the dev flag (computedTablesEnabled), turns a
+ * roulette table computed from its ⚙ card at a quiet point: one transaction
+ * ends the owner-run incarnation as a removal does and opens the computed
+ * one (switchComputedOn); not while an earlier build drives the room's
+ * tables (the lease's `build`), which would go on opening owner-run rounds
+ * there. Back once no round is under way (switchComputedOff): a final
+ * checkpoint ends the incarnation, its nets count on, and open felts are
+ * free again. A page leaving the room first takes its player's felts down
+ * (leaveComputedTables): a felt left behind is frozen, and forfeited. Only
+ * those two (and a removal) end an incarnation: a switch a peer takes away
+ * the pages running the table put back (putSwitchBack), and one a peer
+ * writes alone, naming nothing the doc holds, the house switches off.
  */
 
 import {
@@ -90,6 +103,7 @@ import {
   computedEndedIncs,
   computedFoldOf,
   computedIncEnded,
+  computedIncFor,
   computedIncOf,
   computedRoomBytes,
   computedSeenAt,
@@ -100,11 +114,17 @@ import {
   isComputedTable,
   markComputedVerdict,
   notifyCasinoView,
+  putComputedSwitchBack,
+  readAllBets,
   readChips,
+  readCrapsTableState,
   readSeat,
   readSeats,
+  readTableState,
   transactCasino,
   writeCheckpointAndTrim,
+  writeComputedOff,
+  writeComputedOn,
 } from './casinoDoc';
 import type { EndedComputed } from './casinoDoc';
 import {
@@ -115,7 +135,9 @@ import type {
   AbandonRec, Checkpoint, CloseRec, Decision, FoldCtx, FoldResult, ForfeitRec, RecKind, RevealRec, RoundView, SignedKind,
   SlipRec,
 } from './computedFold';
-import { BET_WINDOW_MS, roomStateIn, SHOW_MS, TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount } from './croupier';
+import {
+  BET_WINDOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS, TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount,
+} from './croupier';
 import { forgetSeed, keepSeed, keyFor, REVEAL_GRACE_MS, seedFor } from './fairTableSeeds';
 import type { TableSeedContext } from './games/diceFairness';
 import { randomSeedHex } from './games/fairDice';
@@ -211,6 +233,8 @@ interface ViewEntry {
   /** The round whose frozen felts the view shows while closing. */
   holding: RoundView | null;
   bets?: Record<string, RouletteBet[]>;
+  /** This page's player's part in the round shown (computedMine). */
+  mine?: ComputedMine;
 }
 
 /** The session's keys, by kind, round and (slips, reveals) pid, read once per
@@ -288,6 +312,9 @@ interface TableState {
   burned: Map<string, number>;
   /** A felt held back by the coalescing, for round r. */
   pending: { r: number; felt: RouletteBet[] } | null;
+  /** The last round whose close came while a felt of this page's was held
+   *  back, and froze another (the status bar's "too late"). */
+  lateFelt: number | null;
   /** This page's last slip written: round and when. */
   lastSlip: { r: number; at: number } | null;
   /** A window that ran out with nothing on the felt arms again only on a
@@ -329,6 +356,12 @@ interface TableState {
    *  delete took a round it saw played off the chain, and a trim waits. */
   decidedTo: { sid: string; r: number } | null;
   shortAt: number | null;
+  /** By round: the close this page last saw decide it on the live
+   *  session's chain; and the last round this page saw that close replaced
+   *  by one that came after the round's seeds were out (the ⚙ card's flag:
+   *  a modified game rewriting a round it has seen the seeds of). */
+  chainClose: Map<number, string>;
+  replaced: number | null;
 }
 
 /** The binding the per-table state belongs to, the wake count and clock
@@ -419,10 +452,10 @@ function newTable(t: string, inc: string): TableState {
   return {
     t, inc, ctx: { room: casinoRoomId(), t, inc },
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
-    pending: null, lastSlip: null, rearm: null, tickedAt: null, reputAt: null,
+    pending: null, lateFelt: null, lastSlip: null, rearm: null, tickedAt: null, reputAt: null,
     lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, lastCheck: null,
     missingAt: new Map(), opened: new Map(), seedOutAt: null, witness: new Map(), witnessVer: 0, lost: null,
-    decidedTo: null, shortAt: null,
+    decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
   };
 }
 
@@ -496,6 +529,7 @@ function noteResult(st: TableState, res: FoldResult): void {
   const D = lastDecided(res);
   if (D) st.lastD = D;
   st.lastRes = res;
+  noteReplaced(st, res, was !== null && was.base.sid !== res.base.sid);
   // Every commitment this page has seen a reveal open stays burned for it,
   // the reveal gone or not (a peer's delete, a trim): its seed is out.
   let fresh: Set<string> | null = null;
@@ -508,6 +542,39 @@ function noteResult(st: TableState, res: FoldResult): void {
           const s = asSlip(sc.ses?.get(key));
           if (s && fresh.has(s.c)) st.burned.set(s.c, r);
         }
+      }
+    }
+  }
+}
+
+/** Note which close decides each round on the chain, and a round whose
+ *  close this page saw decide it is replaced by one this page watched come
+ *  in (watchedClose) after a seed that opens one of its frozen slips: a
+ *  close no honest page writes (a closer stands down once a seed of the
+ *  round is out), but the documented lever of a modified game, which
+ *  outgrows the chain with a round it chose knowing the seeds. Flagged on
+ *  the ⚙ card only. A session change starts the record afresh (what a
+ *  checkpoint covers is final); the flag stays. */
+function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
+  if (moved) st.chainClose.clear();
+  let sc: Scan | null = null;
+  for (const v of res.rounds) {
+    if (!v.decided) continue;
+    const was = st.chainClose.get(v.r);
+    st.chainClose.set(v.r, v.close);
+    if (was === undefined || was === v.close || !watchedClose(st, v)) continue;
+    const closeAt = computedSeenAt(st.t, `c:${v.r}:${v.close}`)!;
+    sc ??= scanOf(st, res);
+    for (const pid of v.revealed) {
+      const slip = frozenSlip(sc, v, pid);
+      const out = slip !== null && (sc.reveals.get(v.r)?.get(pid) ?? []).some((key) => {
+        const x = asReveal(sc!.ses?.get(key));
+        const at = computedSeenAt(st.t, key);
+        return x !== null && at !== undefined && at < closeAt && revealKey(x) === key && slipCommit(st.ctx, x.r, x.p, x.s) === slip.c;
+      });
+      if (out) {
+        st.replaced = v.r;
+        break;
       }
     }
   }
@@ -981,9 +1048,10 @@ export function readMyComputedBets(t: string, me: string, round: number, now = D
 }
 
 /** What became of this page's player's slip in a decided round: frozen (it
- *  played, or a void handed it back), left out (the close didn't take it, or
- *  named one the room never had: chips back), late (its seed came after the
- *  grace: forfeited), forfeited (no seed at all). */
+ *  played, or a void handed it back), left out (the close didn't take the
+ *  felt they had chips on, or named one the room never had: chips back),
+ *  late (its seed came after the grace: forfeited), forfeited (no seed at
+ *  all). A felt taken down before the close is none of these. */
 export type MySlipFate = 'frozen' | 'left-out' | 'late' | 'forfeited';
 
 /** What the ⚙ card says of the last decided round: how it was decided,
@@ -1007,7 +1075,12 @@ export interface ComputedRoundCheck {
   /** 🚩 Chips by which the checkpoint opening this session differs from what
    *  this page had folded of those rounds (0: it agrees, or can't tell). */
   checkpointDiff: number;
+  /** 🚩 The last round this page saw decided and then replaced by a close
+   *  that came after its seeds were out (noteReplaced); absent for none. */
+  replaced?: number;
 }
+
+const replacedOf = (st: TableState): { replaced?: number } => (st.replaced !== null ? { replaced: st.replaced } : {});
 
 function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRoundCheck | null {
   const D = lastDecided(res);
@@ -1015,7 +1088,7 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
   if (!D) {
     // A trim took the round out of the session: what this page said of it.
     const kept = st.lastCheck && st.lastCheck.round === res.base.u ? st.lastCheck : null;
-    return kept ? { ...kept, checkpointDiff: diff } : null;
+    return kept ? { ...kept, checkpointDiff: diff, ...replacedOf(st) } : null;
   }
   const sc = scanOf(st, res);
   const me = getPlayerId();
@@ -1023,7 +1096,10 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
   let mine: MySlipFate | null = null;
   if (D.present.includes(me)) {
     mine = D.decided === 'void' || D.counted.includes(me) ? 'frozen' : D.revealed.includes(me) ? 'late' : 'forfeited';
-  } else if (D.frozen[me] !== undefined || (sc.slips.get(D.r)?.get(me)?.length ?? 0) > 0) {
+  } else if (D.frozen[me] !== undefined || (latestOwnSlip(st, sc, D.r, me, getIdentityPub())?.b.length ?? 0) > 0) {
+    // (Left out: the close named a slip of theirs the room never had, or
+    // left out the felt they had down. Not a felt they took down before it:
+    // a close freezes felts with chips on, and theirs had none.)
     mine = 'left-out';
   }
   let dropped: string[] = [];
@@ -1055,6 +1131,7 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     dropped,
     pinMismatch,
     checkpointDiff: diff,
+    ...replacedOf(st),
   };
   st.lastCheck = out;
   return out;
@@ -1065,7 +1142,8 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
  * none): how it was decided, seeds counted n of m, who was missing, the
  * forfeit's writer, what became of this page's slip, and the flags — a
  * forfeit dropped a seed this page saw in time, a frozen slip isn't signed
- * by its player's pinned key, the checkpoint differs from what this page saw.
+ * by its player's pinned key, the checkpoint differs from what this page saw,
+ * a round this page saw decided was replaced after its seeds were out.
  */
 export function computedRoundCheck(t: string, now = Date.now()): ComputedRoundCheck | null {
   lookAtClock(now);
@@ -1223,16 +1301,18 @@ export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now =
 /**
  * Move computed tables `tableIds` along from this page (world.ts calls it
  * every frame with the room's roulette tables; each table runs at most every
- * TICK_MS): its reveals as soon as the room's state is in, then, on a whole
- * doc, awake and with every signature checked, the held felt, a burned
- * commitment renewed, the close, a forfeit, an answer to a forfeit, an
- * abandon, the re-put and the trim, each in its turn; and the compaction of
- * any ended incarnation, of these tables or not. A phase this page's clock
- * alone moved on tells the table's listeners once.
+ * TICK_MS): a switch a peer took away put back first (every frame), then its
+ * reveals as soon as the room's state is in, then, on a whole doc, awake and
+ * with every signature checked, the held felt, a burned commitment renewed,
+ * the close, a forfeit, an answer to a forfeit, an abandon, the re-put and
+ * the trim, each in its turn; and the compaction of any ended incarnation,
+ * of these tables or not. A phase this page's clock alone moved on tells the
+ * table's listeners once.
  */
 export function tickComputedTables(tableIds: Iterable<string>, now = Date.now()): void {
   lookAtClock(now);
   for (const t of tableIds) {
+    putSwitchBack(t, now);
     const at = tableOf(t);
     if (!at) continue;
     const { st } = at;
@@ -1243,6 +1323,29 @@ export function tickComputedTables(tableIds: Iterable<string>, now = Date.now())
   }
   // Ended incarnations, whatever tables were passed (a removed one isn't).
   compactDuty(getIdentityPub(), now);
+}
+
+/**
+ * 🔀 Put back the switch of the incarnation this page runs at table `t` when
+ * a peer has taken it away (or written junk, or a name the doc holds nothing
+ * of, in its place) with nothing having ended the incarnation: no build does
+ * that (the house's switch-off and a removal end it as the switch goes), and
+ * while it lasts no page runs any duty there (tableOf), its reveals and
+ * forfeits among them. A delete around a close would hold an honest seed
+ * back past its grace (forfeited), or spare a withholder's stake (no forfeit
+ * comes, and compaction voids the round). So every page that ran it puts it
+ * back on its next frame (the same bytes from each), before any duty and
+ * before compaction looks; on a whole doc, awake (casinoDoc
+ * putComputedSwitchBack has the rest). A switch naming another incarnation
+ * the doc holds records of stays: two of the house's pages switching on at
+ * once, on docs that disagreed on the table's removals, name two, and the
+ * doc keeps one (the other is compacted). Of the tables passed only: a
+ * removed one is ended, and this page runs it no more.
+ */
+function putSwitchBack(t: string, now: number): void {
+  const st = tables.get(t);
+  if (!st || computedIncOf(t) === st.inc || !tablesAwake(now) || !casinoWhole(t)) return;
+  transactCasino(() => putComputedSwitchBack(t, st.inc));
 }
 
 function tickTable(st: TableState, now: number): void {
@@ -1327,6 +1430,15 @@ function flushDuty(st: TableState, me: string, now: number): void {
   if (!p || !res) return;
   if (res.tip || res.open !== p.r) {
     st.pending = null;
+    // (The close came first, and froze the felt before it: too late.)
+    const closed = res.rounds.find((v) => v.r === p.r);
+    if (closed) {
+      const frozen = closed.present.includes(me) ? frozenSlip(scanOf(st, res), closed, me)?.b ?? [] : [];
+      if (!sameFelt(frozen, p.felt)) {
+        st.lateFelt = p.r;
+        if (st.view) st.view.mine = undefined;
+      }
+    }
     return;
   }
   const e = bettingOn(st, res, now);
@@ -1962,4 +2074,332 @@ function compactDuty(pub: string, now: number): void {
     finalizeComputed(e.t, e.inc, cp);
   }
   for (const key of [...endedAt.keys()]) if (!listed.has(key)) endedAt.delete(key);
+}
+
+/** Whether compaction has an ended incarnation to finalise (computedEndedIncs:
+ *  its sessions still in the doc), the room's tables or none: a removed
+ *  table's is, after the room's last table goes. World marks its frames as
+ *  running tables while there is one (croupier noteTablesRunning), as it
+ *  does while the room has a table: a page that stops marking them reads as
+ *  asleep a lapse later (tablesAwake), for good, and compaction waits for an
+ *  awake page. Only asked in a room with no table (World's frame), and never
+ *  throws out of it (a throw is the computed tick's to tell: it reads the
+ *  same). */
+export function computedCompactionPending(): boolean {
+  try {
+    return computedEndedIncs().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// ── 🔀 The switch ────────────────────────────────────────────────────────────
+
+/** 🧪 The dev flag as a spec sets it (null: read the page's own). */
+let enabledForTests: boolean | null = null;
+
+/** 🧪 Set the dev flag for a spec (null: the page's own again). */
+export function setComputedTablesEnabledForTests(on: boolean | null): void {
+  enabledForTests = on;
+}
+
+/** The dev flag: may this page's house switch a table to computed? Set by
+ *  `localStorage['ssf-dev-computed'] = '1'` or `?computed=1` on the page's
+ *  address (false where neither can be read). It gates only who may switch:
+ *  a table switched already runs on every page of this build, flag or not. */
+export function computedTablesEnabled(): boolean {
+  if (enabledForTests !== null) return enabledForTests;
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('ssf-dev-computed') === '1') return true;
+  } catch {
+    /* storage blocked: no flag there */
+  }
+  try {
+    const search = typeof window !== 'undefined' ? window.location?.search : undefined;
+    if (typeof search === 'string' && new URLSearchParams(search).get('computed') === '1') return true;
+  } catch {
+    /* no address to read */
+  }
+  return false;
+}
+
+/** Why the house's switch can't go now: this page asleep or waiting out a
+ *  wake ('asleep'), its doc holding part of an update or signatures to check
+ *  ('reconnecting'), a round under way ('busy'), an earlier build driving
+ *  the room's tables ('old-build'), or not a roulette table ('craps'). */
+export type ComputedSwitchRefusal = 'asleep' | 'reconnecting' | 'busy' | 'old-build' | 'craps';
+export type ComputedSwitchResult = 'ok' | ComputedSwitchRefusal;
+
+const SWITCH_RECONNECTING = 'RECONNECTING — TRY AGAIN IN A MOMENT';
+
+/** What the ⚙ card says of a refused switch-on. */
+export const SWITCH_ON_REFUSED: Readonly<Record<ComputedSwitchRefusal, string>> = {
+  asleep: SWITCH_RECONNECTING,
+  reconnecting: SWITCH_RECONNECTING,
+  busy: 'FINISH THIS ROUND FIRST',
+  'old-build': "AN OLDER VERSION OF THE GAME RUNS THIS ROOM'S TABLES — UPDATE IT FIRST",
+  craps: 'ONLY A ROULETTE TABLE CAN RUN WITHOUT THE OWNER',
+};
+
+/** …and of a refused switch-off (a round under way: its spin first). */
+export const SWITCH_OFF_REFUSED: Readonly<Record<ComputedSwitchRefusal, string>> = {
+  ...SWITCH_ON_REFUSED,
+  busy: 'WAIT FOR THE SPIN TO FINISH',
+};
+
+/** What the ⚙ card says before a switch-on: the room's default is Fair, and
+ *  a computed table isn't. */
+export const SWITCH_ON_CONFIRM = 'THIS TABLE WILL RUN FRIENDLY: SEEDS FROM THE PLAYERS ONLY';
+
+/** Whether this page may switch anything now: awake, its doc whole, every
+ *  computed table's signatures checked (as a spend waits: computedSettled). */
+function switchGate(t: string, now: number): ComputedSwitchRefusal | null {
+  if (!tablesAwake(now)) return 'asleep';
+  if (!casinoWhole(t) || !computedSettled()) return 'reconnecting';
+  return null;
+}
+
+/** Why owner-run table t can't be switched on now, or null. Quiet: no round
+ *  up, or one settled, or one betting with no list on it (a SPIN pressed is
+ *  a closing round: never quiet). */
+function onRefusal(t: string, game: 'craps' | 'roulette', now: number): ComputedSwitchRefusal | null {
+  if (game !== 'roulette' || readCrapsTableState(t) !== null) return 'craps';
+  const gate = switchGate(t, now);
+  if (gate) return gate;
+  if (leaseIsOldBuild(now)) return 'old-build';
+  const s = readTableState(t);
+  const quiet = s === null || s.phase === 'settled' || (s.phase === 'betting' && Object.keys(readAllBets(t, s.round)).length === 0);
+  return quiet ? null : 'busy';
+}
+
+/** Why computed table t can't be switched off now, or null: not while a
+ *  close of the open round is in (its seeds would go out for nothing), nor
+ *  while a forfeit's result waits: the view reads closing for both (the tip,
+ *  or the hold before the result's show). A close of the open round that
+ *  checks out is the tip, or decided (then the round is no longer open);
+ *  one still being checked leaves the table unsettled (the gate); one that
+ *  reads invalid is junk, which holds nothing back. A switch whose
+ *  incarnation a whole, checked doc holds nothing of (no session, no
+ *  checkpoint: tableOf finds no count) has no round under way either: no
+ *  build writes one so (the switch-on writes its first session with it, in
+ *  one update, and a doc holding part of one isn't whole), so it is a peer's
+ *  forgery, and it goes. Waiting for a session that never comes would leave
+ *  the table with nobody to run it, the robot standing down for good. */
+function offRefusal(t: string, now: number): ComputedSwitchRefusal | null {
+  const gate = switchGate(t, now);
+  if (gate) return gate;
+  const at = tableOf(t);
+  if (!at) return null;
+  return viewOf(at.st, at.res, now).view.phase === 'closing' ? 'busy' : null;
+}
+
+/**
+ * 🔀 The house switches roulette table `t` to computed (the ⚙ card, after
+ * its confirmation): in ONE transaction, the owner-run incarnation ends as a
+ * removal ends it (refundAndClear: its lists stop holding, what an earlier
+ * build's took is refunded, its book counts on), and the computed one starts
+ * under a name every page computes alike (computedIncFor: two of the house's
+ * pages pressing at once open one table), with its first session. Refused
+ * while the owner-run table has a round under way, while an earlier build
+ * drives the room's tables (it would go on opening owner-run rounds on this
+ * one), on a page asleep or not whole, and on a craps table. 'ok' for a
+ * table that is computed already.
+ */
+export function switchComputedOn(t: string, game: 'craps' | 'roulette' = 'roulette', now = Date.now()): ComputedSwitchResult {
+  lookAtClock(now);
+  const refused = onRefusal(t, game, now);
+  if (refused) return refused;
+  if (isComputedTable(t)) return 'ok';
+  transactCasino(() => {
+    refundAndClear(t, 'local');
+    writeComputedOn(t, computedIncFor(t));
+  });
+  return 'ok';
+}
+
+/**
+ * 🔀 The house switches computed table `t` back to owner-run: in ONE
+ * transaction, the incarnation's final checkpoint (it ended; its nets the
+ * fold's, which go on counting), every session map of it gone, its `gone:`
+ * mark (finalizeComputed), and the switch. Open felts stop holding (their
+ * chips are back), and the robot opens the table's next round on a fresh
+ * owner-run incarnation (tableIncFor counts the new mark). Refused while a
+ * round is under way (a close in, or a result still to show), and on a page
+ * asleep or not whole. 'ok' for a table that isn't computed. A switch whose
+ * incarnation the doc holds nothing of (a peer's forgery) only goes, marked
+ * ended.
+ */
+export function switchComputedOff(t: string, now = Date.now()): ComputedSwitchResult {
+  lookAtClock(now);
+  if (!isComputedTable(t)) return 'ok';
+  const refused = offRefusal(t, now);
+  if (refused) return refused;
+  const at = tableOf(t);
+  if (!at) {
+    // (Nothing of it to finalise: the switch goes, its incarnation marked
+    // ended, so a session of it turning up later is compacted as a removed
+    // table's is, its nets counted, nothing held.)
+    transactCasino(() => writeComputedOff(t));
+    return 'ok';
+  }
+  const { st, res } = at;
+  const D = lastDecided(res);
+  const u = D ? D.r : Math.max(1, res.base.u);
+  const l = D ? D.close : res.base.l ?? NO_CLOSE;
+  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
+  const done = transactCasino(() => {
+    if (!finalizeComputed(t, st.inc, cp)) return false;
+    writeComputedOff(t);
+    return true;
+  });
+  return done ? 'ok' : 'reconnecting';
+}
+
+/** What the ⚙ card shows of the switch: the row at all (`show`: the house,
+ *  with the dev flag, at a roulette table), which way it is (`on`), whether
+ *  a press would go now (`can`), and if not, why (`reason`, the card's
+ *  words). */
+export interface ComputedSwitchState {
+  show: boolean;
+  on: boolean;
+  can: boolean;
+  reason?: string;
+}
+
+export function computedSwitchState(t: string, game: 'craps' | 'roulette', house: boolean, now = Date.now()): ComputedSwitchState {
+  const on = game === 'roulette' && isComputedTable(t);
+  const show = game === 'roulette' && house && computedTablesEnabled();
+  if (!show) return { show, on, can: false };
+  lookAtClock(now);
+  const refused = on ? offRefusal(t, now) : onRefusal(t, game, now);
+  return refused ? { show, on, can: false, reason: (on ? SWITCH_OFF_REFUSED : SWITCH_ON_REFUSED)[refused] } : { show, on, can: true };
+}
+
+/** Whether an earlier build drives computed table `t` too: an owner-run
+ *  round is up on it (that build's lease holder opened it; this build's
+ *  sweeps it once its driver has gone, croupier sweepLegacyRound). */
+export function computedOldBuildDriving(t: string): boolean {
+  return isComputedTable(t) && readTableState(t) !== null;
+}
+
+// ── 🙋 This page's player at the table ───────────────────────────────────────
+
+/** What became of this page's player's felt in the round the table shows
+ *  (the one closing, or the one whose result shows), for the status bar. */
+export interface ComputedMine {
+  round: number;
+  /** A close froze a felt of theirs in it, and the room has that felt. */
+  frozen: boolean;
+  /** …and their seed is in. */
+  revealed: boolean;
+  /** The close left out the felt they had chips on (written, or held back
+   *  to go), or named one the room never had: it holds nothing, its chips
+   *  are back. */
+  leftOut: boolean;
+  /** They put down a later felt than the one the close froze (a version
+   *  that crossed the close on its way): the close had the earlier bets. */
+  tooLate: boolean;
+}
+
+function mineIn(st: TableState, res: FoldResult, R: RoundView): ComputedMine {
+  const me = getPlayerId();
+  const pub = getIdentityPub();
+  const sc = scanOf(st, res);
+  const frozenHash = R.frozen[me];
+  const frozen = R.present.includes(me);
+  const v0 = frozen ? frozenSlip(sc, R, me)?.v ?? 0 : 0;
+  let later = false;
+  if (frozen) {
+    for (const key of sc.slips.get(R.r)?.get(me) ?? []) {
+      const s = asSlip(sc.ses?.get(key));
+      if (!s || s.k !== pub || !checkedSlip(st.t, st.inc, key, s)) continue;
+      if (s.v > v0 && parseKey(key)?.h !== frozenHash) later = true;
+    }
+  }
+  // Left out only with chips down: the latest felt (a close freezes each
+  // player's latest with chips on it), or one held back that the close
+  // came before. A felt taken down before the close missed nothing.
+  const staked = !frozen && (latestOwnSlip(st, sc, R.r, me, pub)?.b.length ?? 0) > 0;
+  return {
+    round: R.r,
+    frozen,
+    revealed: frozen && R.revealed.includes(me),
+    leftOut: !frozen && (frozenHash !== undefined || staked || st.lateFelt === R.r),
+    tooLate: frozen && (later || st.lateFelt === R.r),
+  };
+}
+
+/** This page's player's latest felt of round r in the session: the version
+ *  with the highest v (then hash), as the fold reads a felt, of those
+ *  checked and signed by this page's key; null for none. */
+function latestOwnSlip(st: TableState, sc: Scan, r: number, me: string, pub: string): SlipRec | null {
+  let best: { s: SlipRec; h: string } | null = null;
+  for (const key of sc.slips.get(r)?.get(me) ?? []) {
+    const s = asSlip(sc.ses?.get(key));
+    if (!s || s.k !== pub || !checkedSlip(st.t, st.inc, key, s)) continue;
+    const h = parseKey(key)!.h;
+    if (!best || s.v > best.s.v || (s.v === best.s.v && h > best.h)) best = { s, h };
+  }
+  return best?.s ?? null;
+}
+
+/** This page's player's part in the round computed table `t` shows (null
+ *  while it takes bets, or when it isn't one). Once per view. */
+export function computedMine(t: string, now = Date.now()): ComputedMine | null {
+  lookAtClock(now);
+  const at = tableOf(t);
+  if (!at) return null;
+  const e = viewOf(at.st, at.res, now);
+  const R = e.view.phase === 'closing' ? e.holding : e.view.phase === 'settled' && e.onChain ? e.D : null;
+  if (!R) return null;
+  if (e.mine === undefined || e.mine.round !== R.r) e.mine = mineIn(at.st, e.res, R);
+  return e.mine;
+}
+
+/** The last round of computed table `t`'s live chain that is decided (its
+ *  checkpoint's, with none since), or null: a round this page showed decided
+ *  past it is undone (a delete took what it rests on, or the room kept the
+ *  other side of a split). */
+export function computedDecidedTo(t: string): number | null {
+  const at = tableOf(t);
+  return at ? lastDecided(at.res)?.r ?? at.res.base.u : null;
+}
+
+// ── 🚪 Leaving ───────────────────────────────────────────────────────────────
+
+/**
+ * Take this page's felt down from every computed table it has chips on, as
+ * the page leaves the room (main.ts leaveRoomNow, before the doc goes) or
+ * closes (pagehide): best effort, a refusal left as it is (a round closing
+ * holds the felt it froze; a page that may not write now writes nothing). A
+ * felt left behind is frozen by the next close, and with this page gone
+ * nobody reveals its seed: the round's forfeit takes it. So it does for a
+ * tab closed with no pagehide (a crash, a killed browser): leaving mid-round
+ * forfeits the stake. Only this page's felt: the one it wrote that the
+ * table counts now, or one it holds back to write. Its player's other tab
+ * (same player, same key) may have put the felt down, and that tab is still
+ * at the table, its seed with it: an empty version over it would take the
+ * bet away from under it.
+ */
+export function leaveComputedTables(now = Date.now()): void {
+  const me = getPlayerId();
+  for (const st of [...tables.values()]) {
+    if (computedIncOf(st.t) !== st.inc || !isComputedTable(st.t)) continue;
+    const held = computedFoldOf(st.t)?.felts.get(me);
+    // (Nothing waits for a flush now, nor is one held to go later: the page
+    // won't tick here again. A felt held back was never on the table.)
+    st.pending = null;
+    if (!held || held.rec.b.length === 0 || !st.mine.has(held.key)) continue;
+    st.lastSlip = null;
+    try {
+      writeComputedSlip(st.t, [], now);
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+// Best effort on page close: the write may not flush.
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('pagehide', () => leaveComputedTables());
 }

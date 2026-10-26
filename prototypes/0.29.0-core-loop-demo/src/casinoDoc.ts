@@ -1302,8 +1302,12 @@ export type TableClosing = 'local' | 'heard' | 'elsewhere';
  *  records. Held stakes go back with their lists; refunding an earlier build's
  *  lists is the CALLER's job (croupier.closeTable), done before this so the
  *  bet records are still readable. Leaves the incarnation's `gone:` mark, so
- *  a state or list written at the same moment stays ended. One transact. */
-export function clearTableKeys(tableId: string, closing: TableClosing = 'heard'): void {
+ *  a state or list written at the same moment stays ended. One transact.
+ *  🧮 A computed table's incarnation ends with it (its switch goes, a
+ *  `gone:` mark ends it: COMPUTED TABLES), unless `keepComputed`: the sweep
+ *  of an owner-run round an earlier build opened on a computed table ends
+ *  only that round's incarnation. */
+export function clearTableKeys(tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean } = {}): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
   boundDoc!.transact(() => {
@@ -1334,6 +1338,18 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard')
     // never writes them).
     map.delete(`cfg:backend:${tableId}`);
     map.delete(`cfg:fairness:${tableId}`);
+    // 🧮 And a computed table's incarnation is over (marked as a removed
+    // one is, so a switch written at the same moment stays ended): its
+    // decided nets count on, its open felts stop holding (nothing to
+    // refund: they took nothing), and its sessions stay until a page
+    // compacts them (computedTable). A table put back is owner-run, on a
+    // fresh incarnation (tableIncFor counts the mark). (A switch that is
+    // junk names nothing to end: it goes as any orphan setting does.)
+    if (!opts.keepComputed) {
+      const cinc = computedIncOf(tableId);
+      if (cinc !== null) markRemoved(map, tableId, cinc);
+      map.delete(`cfg:computed:${tableId}`);
+    }
     map.delete(`throw:${tableId}`);
     const seatPrefix = `seat:${tableId}:`;
     const seedPrefix = `fseed:${tableId}:`;
@@ -1370,6 +1386,16 @@ export function writeCroupierBeat(tableId: string, beatAt: number): void {
 // `table-operator` drives the auto tables, so a round is settled and paid once
 // (chip records add up, so two settles would pay twice). Its holder rewrites it
 // every few seconds (`beat`); croupier.ts takeTableTurn has the rules.
+//
+// 🧮 The lease also says which build drives (`build`): this one writes
+// TABLE_BUILD on every claim and renewal, and a build before it renews only
+// what it read (page, player, beat), so a lease without one is an earlier
+// build's. A computed table can't be switched on while one drives
+// (computedTable switchComputedOn): it would go on opening owner-run rounds
+// on the table, reading none of the computed records.
+
+/** The build this page's lease carries: 2 knows computed tables. */
+export const TABLE_BUILD = 2;
 
 export interface TableOperatorLease {
   /** the driving page (croupier.ts ROULETTE_PAGE_ID) */
@@ -1378,6 +1404,8 @@ export interface TableOperatorLease {
   player: string;
   /** bumped on each renewal, so other pages see it is alive */
   beat: number;
+  /** the driving page's build (TABLE_BUILD), absent on an earlier build's */
+  build?: number;
 }
 
 export const TABLE_OPERATOR_KEY = 'table-operator';
@@ -1386,11 +1414,12 @@ export function readTableOperatorLease(): TableOperatorLease | null {
   const v = ensureMap().get(TABLE_OPERATOR_KEY);
   if (typeof v !== 'object' || v === null) return null;
   const l = v as Partial<TableOperatorLease>;
-  return typeof l.page === 'string' && l.page.length > 0 && l.page.length <= 256
+  if (!(typeof l.page === 'string' && l.page.length > 0 && l.page.length <= 256
     && typeof l.player === 'string' && l.player.length > 0 && l.player.length <= 128
-    && Number.isSafeInteger(l.beat)
-    ? { page: l.page, player: l.player, beat: l.beat as number }
-    : null;
+    && Number.isSafeInteger(l.beat))) return null;
+  // (A build that is no small whole number reads as none: an earlier build's.)
+  const build = Number.isSafeInteger(l.build) && l.build! >= 1 && l.build! <= 1000 ? l.build : undefined;
+  return { page: l.page, player: l.player, beat: l.beat as number, ...(build !== undefined ? { build } : {}) };
 }
 
 export function writeTableOperatorLease(lease: TableOperatorLease): void {
@@ -2125,10 +2154,102 @@ export function isComputedTable(tableId: string): boolean {
 /** Whether incarnation `inc` of table `tableId` is over for good: a removal
  *  marked it (`gone:`), or its checkpoint says it ended (finalizeComputed
  *  writes both). A switch that is missing, or junk, ends nothing yet: a
- *  peer's delete the house puts back, and the incarnation goes on. */
+ *  peer's delete the room's pages put back (computedTable), and the
+ *  incarnation goes on. */
 export function computedIncEnded(tableId: string, inc: string): boolean {
   const casino = ensureMap();
   return casino.has(goneKey(tableId, inc)) || checkpointAt(computedMap!, tableId, inc)?.e === 1;
+}
+
+/** The name a table's next computed incarnation takes: `c` + 24 hex of the
+ *  table's removals (its `gone:` marks), as tableIncFor names an owner-run
+ *  one, under a domain of its own, so the two never meet. Not at random:
+ *  two of the house's pages switching the table on at once name it alike,
+ *  and their sessions meet on one key. Past any name the doc already holds
+ *  a session or a checkpoint of (a switch-off that ended it on a page whose
+ *  mark the doc didn't keep): that one is marked ended, and the next tried,
+ *  as freshIncFor does. In the caller's transaction. */
+export function computedIncFor(tableId: string): string {
+  const casino = ensureMap();
+  const map = computedMap!;
+  const prefix = `gone:${tableId}:`;
+  for (;;) {
+    const removals = [...casino.entries()].filter(([key]) => key.startsWith(prefix))
+      .map(([key, value]): [string, unknown] => [key.slice(prefix.length), value])
+      .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+    const named = `ssf-computed-inc-v1|${tableId}|${JSON.stringify(removals)}`;
+    const inc = 'c' + bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
+    const used = map.has(`sum:${tableId}:${inc}`) || [...map.keys()].some((key) => {
+      const at = computedKeyParts(key);
+      return at?.sid !== undefined && at.t === tableId && at.inc === inc;
+    });
+    if (!used) return inc;
+    markRemoved(casino, tableId, inc);
+  }
+}
+
+/** 🔀 Switch table `tableId` on as computed incarnation `inc`, in the
+ *  caller's transaction (the house's switch: computedTable
+ *  switchComputedOn): its switch, and the incarnation's first session, unless
+ *  the doc holds a session of it already (one written at the same moment by
+ *  another of the house's pages is the same session: the doc keeps one map,
+ *  and the records lost with the other are put back by their authors). */
+export function writeComputedOn(tableId: string, inc: string): void {
+  const casino = ensureMap();
+  const map = computedMap!;
+  boundDoc!.transact(() => {
+    casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
+    if (sessionKeysOf(map, tableId, inc).some((key) => map.get(key) instanceof Y.Map)) return;
+    map.set(sessionKey(tableId, inc, 'g'), new Y.Map<unknown>());
+  });
+}
+
+/** 🔀 Put table `tableId`'s switch back on incarnation `inc` (computedTable,
+ *  the page that runs it): when a peer took it away, or wrote junk or a
+ *  name the doc holds nothing of in its place. No build takes a switch away
+ *  but in the transaction that ends its incarnation (the house's switch-off,
+ *  a removal: both mark it), so one gone with its incarnation unended is a
+ *  peer's doing. Only while the doc holds the incarnation's live session,
+ *  and nothing has ended it; false (nothing written) otherwise. The same
+ *  bytes from every page: whichever write the doc keeps, it is the same. */
+export function putComputedSwitchBack(tableId: string, inc: string): boolean {
+  const casino = ensureMap();
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!c?.live || computedIncEnded(tableId, inc) || computedIncOf(tableId) === inc) return false;
+  const now = computedIncOf(tableId);
+  if (now !== null && computedIncs.has(`${tableId}:${now}`)) return false;
+  boundDoc!.transact(() => {
+    casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
+  });
+  return true;
+}
+
+/** Whether table `tableId`'s switch is lost: it names no incarnation (gone,
+ *  or junk) while the doc holds the live session of one nothing has ended
+ *  (putComputedSwitchBack: a peer's doing, put back by the room's pages).
+ *  The robot runs no owner-run round there meanwhile (croupier): the table's
+ *  players are mid-round on the computed one. */
+export function computedSwitchLost(tableId: string): boolean {
+  if (computedIncOf(tableId) !== null) return false;
+  for (const inc of computedIncsOf.get(tableId) ?? []) {
+    if (computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) return true;
+  }
+  return false;
+}
+
+/** 🔀 Take table `tableId`'s switch away (the house's switch-off, in the
+ *  transaction that finalises the incarnation: computedTable
+ *  switchComputedOff), the incarnation it names marked ended if it isn't
+ *  (one the doc holds nothing of, no session and no checkpoint, has nothing
+ *  to finalise: a switch a peer wrote alone). The table is owner-run again
+ *  from its next round. */
+export function writeComputedOff(tableId: string): void {
+  const casino = ensureMap();
+  boundDoc!.transact(() => {
+    const inc = computedIncOf(tableId);
+    if (inc !== null && !casino.has(goneKey(tableId, inc))) casino.set(goneKey(tableId, inc), 1);
+    casino.delete(`cfg:computed:${tableId}`);
+  });
 }
 
 // ⚖️ Signatures: strict noble, about 2 ms a check, so a page joining a busy

@@ -152,7 +152,7 @@ export function openCrapsBetting(
     ...(shooter !== undefined ? { shooter } : {}),
     ...(lastShooter !== undefined ? { lastShooter } : {}),
     fairMode: readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode(),
-    ...(isFairTable(tableId) ? { houseCommit: newHouseCommit(tableId, round) } : {}),
+    ...(isFairTable(tableId, 'craps') ? { houseCommit: newHouseCommit(tableId, round) } : {}),
     ...tableOpening(tableId),
   }));
 }

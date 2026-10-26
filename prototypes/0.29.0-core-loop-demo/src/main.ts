@@ -266,6 +266,7 @@ import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
+import { leaveComputedTables } from "./computedTable";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
@@ -3433,6 +3434,10 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     // first (bounded: a stalled transport must not hold the swap).
     leaveSlotMachineRoom();
     leaveCoinPusherRoom();
+    // 🧮 And this player's chips come down from every computed table they
+    // have some on, with the same flush: a felt left behind would be frozen
+    // by the next close, with nobody here to reveal its seed (forfeited).
+    leaveComputedTables();
     await Promise.race([
       sync.flush(),
       new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),

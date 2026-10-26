@@ -28,14 +28,22 @@
  * every bettor's (fairTableSeeds.ts) — committed at open, frozen at "no more
  * bets", revealed at the settle — so the operator can't pick the number. A
  * table the owner sets to plain RNG still spins from the operator's client.
+ *
+ * 🧮 COMPUTED TABLES (computedTable.ts) have no operator: the robot opens no
+ * round there and posts no heartbeat. It only sweeps away an owner-run round
+ * an earlier build's lease holder opened on one (sweepLegacyRound), and the
+ * lease says which build drives (`build`), so the house can't switch a table
+ * to computed while an earlier build runs the room's tables.
  */
 
 import {
   casinoDocEpoch,
   casinoWhole,
   clearTableKeys,
+  computedSwitchLost,
   creditTableOutcome,
   feltStake,
+  isComputedTable,
   putTableBack,
   readAllBets,
   readCroupierBeat,
@@ -45,6 +53,7 @@ import {
   readTableState,
   rouletteListLost,
   setTablesAwakeCheck,
+  TABLE_BUILD,
   tableEndingStakes,
   tableIncOf,
   tableOpening,
@@ -155,6 +164,20 @@ function noteLease(lease: TableOperatorLease | null, now: number): void {
 function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: string): boolean {
   return !lease || lease.player !== playerId
     || (leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
+}
+
+/** 🧮 Does an earlier build drive this room's tables: a lease without this
+ *  build's `build` (or one before it) that this page hasn't watched sit
+ *  still for a lapse? Watched on this page's clock, as takeTableTurn watches
+ *  it (the house's page may be one that never drives), so a lease left by a
+ *  page that has gone reads as nobody's once it has sat for a lapse. The
+ *  house's switch to a computed table waits for it: that page would go on
+ *  opening owner-run rounds there. */
+export function leaseIsOldBuild(now = Date.now()): boolean {
+  const lease = readTableOperatorLease();
+  noteLease(lease, now);
+  if (!lease || (lease.build ?? 0) >= TABLE_BUILD) return false;
+  return !(leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
 }
 
 /** When this page last ran its tables, in this room doc, and the earliest it
@@ -293,14 +316,16 @@ export function takeTableTurn(
     // Nor a fresh claim on a doc holding part of an update at all: the
     // driver's renewal parked there reads as no lease.
     if (!casinoWhole() || !leaseIsFree(lease, now, playerId)) return false;
-    writeTableOperatorLease({ page: pageId, player: playerId, beat: 1 });
+    writeTableOperatorLease({ page: pageId, player: playerId, beat: 1, build: TABLE_BUILD });
     leaseClaimedAt = now;
     leaseRenewedAt = now;
     return false;
   }
   if (leaseClaimedAt === null) leaseClaimedAt = now;
   if (now - leaseRenewedAt >= TABLE_LEASE_RENEW_MS) {
-    writeTableOperatorLease({ ...lease, beat: lease.beat + 1 });
+    // 🧮 The build, every time: an earlier build's page that takes the lease
+    // over renews only what it read, so its lease reads without one.
+    writeTableOperatorLease({ ...lease, beat: lease.beat + 1, build: TABLE_BUILD });
     leaseRenewedAt = now;
   }
   return now - leaseClaimedAt >= TABLE_LEASE_SETTLE_MS;
@@ -500,6 +525,10 @@ export function openBetting(tableId: string, round: number): void {
   // 📒 Not on a doc holding part of an update, where a table read as gone
   // would open anew, nor on a page just woken (tableWritable).
   if (!tableWritable(tableId)) return;
+  // 🧮 Nor on a computed table: nobody runs its rounds (computedTable). Nor
+  // while its switch is lost (a peer took it away, the room puts it back):
+  // its players are mid-round there.
+  if (isComputedTable(tableId) || computedSwitchLost(tableId)) return;
   // One transaction: a name a removal left unmarked is marked as it opens.
   transactCasino(() => writeTableState(tableId, {
     kind: 'roulette',
@@ -535,6 +564,42 @@ export function spinSeenAt(tableId: string, s: RouletteTableState, operator: str
   return now;
 }
 
+/** When this page first saw each computed table's owner-run round (its
+ *  epoch, incarnation and round, since this page last woke), by this
+ *  page's clock. */
+const legacySeen = new Map<string, { epoch: number; wake: number; inc: string; round: number; at: number }>();
+
+/**
+ * 🧮 An earlier build's lease holder knows nothing of computed tables, and
+ * opens an owner-run round on one as on any table (its players bet there,
+ * its own pages settle it into its own book, under an incarnation name that
+ * never meets the computed one's). Once this build holds the lease and has
+ * watched such a round sit for a lapse (its driver gone), it ends that
+ * round's incarnation alone, as a removal would (refundAndClear,
+ * keepComputed): its lists stop holding, what an earlier build's lists took
+ * is refunded, its book counts on, and the computed incarnation, its switch
+ * and its sessions are as they were. Only on a whole doc (the caller).
+ */
+function sweepLegacyRound(tableId: string, now: number): void {
+  const s = readTableState(tableId);
+  if (!s) {
+    legacySeen.delete(tableId);
+    return;
+  }
+  const epoch = casinoDocEpoch();
+  const wake = tablesWakeCount();
+  const inc = tableIncOf(tableId, s);
+  let seen = legacySeen.get(tableId);
+  // (A wake, or a clock gone back, starts the watch again: the time away
+  // wasn't spent watching.)
+  if (!seen || seen.epoch !== epoch || seen.wake !== wake || seen.inc !== inc || seen.round !== s.round || seen.at > now) {
+    legacySeen.set(tableId, seen = { epoch, wake, inc, round: s.round, at: now });
+  }
+  if (now - seen.at < TABLE_LEASE_LAPSE_MS) return;
+  legacySeen.delete(tableId);
+  transactCasino(() => refundAndClear(tableId, 'local', { keepComputed: true }));
+}
+
 /**
  * One operator tick for one table. Idempotent per frame — only writes on a real
  * transition. The window ARMS on the first bet (so an empty table stays quiet),
@@ -546,10 +611,17 @@ export function tickAutoCroupier(tableId: string): void {
   // 📒 Not on a doc holding part of another page's update (casinoWhole): a
   // state it rewrote reads as gone, and a table read as gone opens anew.
   if (!casinoWhole(tableId)) return;
+  const now = Date.now();
+  // 🧮 A computed table runs itself: the robot only clears away an owner-run
+  // round an earlier build opened there (sweepLegacyRound). So too while its
+  // switch is lost, until the room puts it back (or compaction ends it).
+  if (isComputedTable(tableId) || computedSwitchLost(tableId)) {
+    sweepLegacyRound(tableId, now);
+    return;
+  }
   // A state that doesn't go on from the table's book: the book's goes back
   // up first (putTableBack).
   if (putTableBack(tableId)) return;
-  const now = Date.now();
   const s = readTableState(tableId);
   if (!s) {
     openBetting(tableId, 1);
@@ -641,11 +713,12 @@ export function closeWhenWhole(tableId: string, close: () => void): void {
  *  whichever heard of the removal first, while the page driving it may be
  *  settling this very round: a bettor's refund counts unless the doc kept
  *  that settle's book, which settled their list (creditTableOutcome). Then
- *  the keys go (clearTableKeys). */
-export function refundAndClear(tableId: string, closing: TableClosing): void {
+ *  the keys go (clearTableKeys; `keepComputed`: a computed table's own
+ *  incarnation stays, for the sweep of an owner-run round on it). */
+export function refundAndClear(tableId: string, closing: TableClosing, opts: { keepComputed?: boolean } = {}): void {
   const end = tableEndingStakes(tableId);
   for (const [pid, taken] of Object.entries(end?.taken ?? {})) creditTableOutcome(tableId, end!.inc, 'end', pid, taken);
-  clearTableKeys(tableId, closing);
+  clearTableKeys(tableId, closing, opts);
 }
 
 export function beatCroupier(tableId: string): void {
