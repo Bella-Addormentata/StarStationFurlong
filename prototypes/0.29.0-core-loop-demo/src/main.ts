@@ -42,6 +42,7 @@ import {
   packTick,
   unpackTick,
   unpackAddressedTick,
+  encodeStandingYaw,
   tickKind,
   TICK_KIND_MOVEMENT,
   TICK_KIND_ALLIGATORS,
@@ -11507,11 +11508,13 @@ function animate() {
           (diving ? 32 : 0),
         x: localPos.x,
         z: localPos.z,
+        // 🧭 Standing, yaw carries the facing so a turn in place (Q / E)
+        // shows to peers; walking peers still take their facing from motion.
         yaw: seated
           ? world.getPlayer().getSeatedFacing()
           : diving
             ? world.getPlayer().getDiveFacing()
-            : 0,
+            : encodeStandingYaw(world.getPlayer().getFacing()),
         seq: localSeq++,
       };
 

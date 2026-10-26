@@ -21,3 +21,12 @@ describe('first-person Q/E turning', () => {
     expect(turnYawStep(new Set(['KeyW']), 1)).toBe(0);
   });
 });
+
+describe('room view Q/E turn direction', () => {
+  it('Q is left (1), E is right (-1), other keys 0', async () => {
+    const { turnKeyDirection } = await import('./firstPersonTurn');
+    expect(turnKeyDirection('KeyQ')).toBe(1);
+    expect(turnKeyDirection('KeyE')).toBe(-1);
+    expect(turnKeyDirection('KeyW')).toBe(0);
+  });
+});

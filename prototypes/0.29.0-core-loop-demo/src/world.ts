@@ -278,6 +278,7 @@ import { tickRomShare } from "./arcadeRomShare";
 import { arcadeScreenView, builtInEntry, countBuiltInPlay, mySeat, nativeEntry, readCabinet, seatStatus } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
+import { decodeStandingYaw } from "./network/protocol";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
 import { buildOctagonHull, buildOctagonShell } from "./octagonHull";
@@ -4667,6 +4668,11 @@ export class World {
       const dz = pos.z - avatar.lastZ;
       if (moving && Math.hypot(dx, dz) > 1e-4) {
         avatar.heading = snapTo8Ways(Math.atan2(dx, dz));
+      } else if (!moving) {
+        // 🧭 Standing still: the sender's own facing, so a turn in place
+        // (Q / E) shows here. An older sender sends none; keep the motion one.
+        const standing = decodeStandingYaw(avatar.facing);
+        if (standing !== null) avatar.heading = snapTo8Ways(standing);
       }
 
       // 🏊 Free-swimming peers paddle in place / glide — never 'walk' on water.
