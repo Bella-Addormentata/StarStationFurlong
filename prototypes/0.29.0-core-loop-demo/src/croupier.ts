@@ -41,6 +41,7 @@ import {
   casinoDocEpoch,
   casinoWhole,
   clearTableKeys,
+  COMPUTED_MIN_BUILD,
   computedIncOf,
   computedSwitchBare,
   computedSwitchLost,
@@ -170,17 +171,19 @@ function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: st
     || (leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
 }
 
-/** 🧮 Does an earlier build drive this room's tables: a lease without this
- *  build's `build` (or one before it) that this page hasn't watched sit
- *  still for a lapse? Watched on this page's clock, as takeTableTurn watches
- *  it (the house's page may be one that never drives), so a lease left by a
- *  page that has gone reads as nobody's once it has sat for a lapse. The
- *  house's switch to a computed table waits for it: that page would go on
- *  opening owner-run rounds there. */
-export function leaseIsOldBuild(now = Date.now()): boolean {
+/** 🧮 Does a build before `min` drive this room's tables: a lease whose
+ *  `build` is below it (or that has none: a build before 2) that this page
+ *  hasn't watched sit still for a lapse? Watched on this page's clock, as
+ *  takeTableTurn watches it (the house's page may be one that never drives),
+ *  so a lease left by a page that has gone reads as nobody's once it has sat
+ *  for a lapse. The house's switch to a computed table waits for it: that
+ *  page would go on opening owner-run rounds there. `min` is the first build
+ *  that knows the table's game (casinoDoc COMPUTED_MIN_BUILD; roulette's by
+ *  default). */
+export function leaseIsOldBuild(now = Date.now(), min: number = COMPUTED_MIN_BUILD.roulette): boolean {
   const lease = readTableOperatorLease();
   noteLease(lease, now);
-  if (!lease || (lease.build ?? 0) >= TABLE_BUILD) return false;
+  if (!lease || (lease.build ?? 0) >= min) return false;
   return !(leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
 }
 

@@ -1272,16 +1272,16 @@ describe('a computed table, played as World plays it', () => {
 // ── 🪪 The lease's build ─────────────────────────────────────────────────────
 
 describe('the table lease carries the build', () => {
-  it('takeTableTurn writes build: 2 on the claim and on each renewal; an earlier build\'s renewal reads without one', async () => {
+  it('takeTableTurn writes build: 3 on the claim and on each renewal; an earlier build\'s renewal reads without one', async () => {
     const [a, b] = await room(['A', 'B']);
     at(a, T0);
     a.croupier.takeTableTurn(T0);
-    expect(a.casino.readTableOperatorLease()).toEqual({ page: a.croupier.ROULETTE_PAGE_ID, player: a.pid, beat: 1, build: 2 });
+    expect(a.casino.readTableOperatorLease()).toEqual({ page: a.croupier.ROULETTE_PAGE_ID, player: a.pid, beat: 1, build: 3 });
     for (let T = T0 + STEP; T <= T0 + 2 * a.croupier.TABLE_LEASE_RENEW_MS; T += STEP) {
       at(a, T);
       a.croupier.takeTableTurn(T);
     }
-    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 3, build: 2 });
+    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 3, build: 3 });
     expect(a.croupier.leaseIsOldBuild(T0 + 4_000)).toBe(false);
     // An earlier build's page renews what it read: {page, player, beat}.
     sync(T0 + 4_000, a, b);
@@ -1293,7 +1293,7 @@ describe('the table lease carries the build', () => {
     // This build's next renewal puts it back.
     at(a, T0 + 6_000);
     a.croupier.takeTableTurn(T0 + 6_000);
-    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 5, build: 2 });
+    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 5, build: 3 });
   });
 
   it('reads a build that is no safe integer from 1 to 1000 as none', async () => {
@@ -1306,7 +1306,7 @@ describe('the table lease carries the build', () => {
       a.doc.getMap('casino').set('table-operator', { page: 'p', player: 'q', beat: 1, build });
       expect(a.casino.readTableOperatorLease()).toEqual({ page: 'p', player: 'q', beat: 1, build });
     }
-    expect(a.casino.TABLE_BUILD).toBe(2);
+    expect(a.casino.TABLE_BUILD).toBe(3);
   });
 });
 

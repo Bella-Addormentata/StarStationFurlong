@@ -12,7 +12,7 @@
  * sum gains two derived terms).
  *
  * KEYS (inside the session map `ses:<t>:<inc>:<sid>` of `casinoComputed`):
- *   s:<r>:<pid>:<h>   slip     {r, p, v, b, c, k, g}
+ *   s:<r>:<pid>:<h>   slip     {r, p, v, b, c, k, g}; at craps {r, p, v, b, o, t?, l?, c, k, g}
  *   c:<r>:<h>         close    {r, q, f, k, g}
  *   x:<r>:<pid>:<h>   reveal   {r, p, s}          (unsigned)
  *   f:<r>:<h>         forfeit  {r, x, n, k, g}
@@ -23,7 +23,12 @@
  * is never indexed. Keys parse from both ends: r and h hold no ':', pid may.
  *
  * Checkpoint `sum:<t>:<inc>` (top level of casinoComputed, LWW):
- *   {v: 1, b, u, l, n, e?, k, g}. Counted on shape alone on Friendly tables.
+ *   {v: 1, b, u, l, n, e?, k, g}; a live craps table's also holds `s`, the
+ *   state its next roll plays from. Counted on shape alone on Friendly tables.
+ *
+ * THE GAME comes from the incarnation's name (gameOfInc): `c…` is roulette,
+ * `k…` craps. Slips and checkpoints are read by that game's shapes, so a
+ * record written for one game is junk at the other.
  *
  * ONE ROUND, AS THE FOLD SEES IT:
  *   1. Players write slips: each version is the player's whole felt, and the
@@ -53,6 +58,9 @@
 
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
+import { basisOf, CARRY_POINTS, diceOf, EMPTY_CARRY, isCanonFelt, MAX_RIDERS, MAX_SHOOTER_PID, nullProtoCopy, playRoll, standingOf } from './computedCraps';
+import type { CrapsCarry, RollFate, RollSlip } from './computedCraps';
+import type { CrapsBet } from './games/craps';
 import { isRouletteBet, resolveRound } from './games/roulette';
 import type { RouletteBet } from './games/roulette';
 import { tableCommitMessage } from './games/diceFairness';
@@ -83,7 +91,7 @@ export interface FoldCtx {
   room: string;
   /** The table's furniture id. */
   t: string;
-  /** The computed incarnation, /^c[0-9a-f]{24}$/. */
+  /** The computed incarnation, /^[ck][0-9a-f]{24}$/: `c` roulette, `k` craps. */
   inc: string;
 }
 
@@ -98,6 +106,23 @@ export interface SlipRec {
   /** Signer's identity pub, base64url (43 chars). */ k: string;
   /** Signature over signBytes('slip', ctx, body), base64url (86 chars). */ g: string;
 }
+
+/** A slip at a craps table (a `k` incarnation): the same keys, commitment and
+ *  signature, with a craps felt and three fields of its own. */
+export interface CrapsSlipRec extends Omit<SlipRec, 'b'> {
+  /** The player's WHOLE felt this roll, canonical (computedCraps isCanonFelt):
+   *  one entry per spot, 0–MAX_CRAPS_SPOTS of them. An empty felt is a valid
+   *  version (everything that may come down taken down), and a close may
+   *  freeze one, though never sign over one. */ b: CrapsBet[];
+  /** computedCraps basisOf the carry the felt was BUILT on, 32 hex: a slip
+   *  built before an earlier roll changed has none of its changes applied. */ o: string;
+  /** The stand (1–7) the player stood at on the page that wrote it; absent
+   *  when that page had no table session at this table. */ t?: number;
+  /** 1 on the goodbye version a page writes as it leaves. The fold never reads it. */ l?: 1;
+}
+
+/** A slip of either game, as the fold indexes it. */
+export type AnySlipRec = SlipRec | CrapsSlipRec;
 
 export interface CloseRec {
   r: number;
@@ -131,6 +156,8 @@ export interface Checkpoint {
   /** pid → cumulative net over the incarnation, decimal bigint string
    *  (/^-?(0|[1-9]\d{0,39})$/, never "0"); ≤ MAX_CHECKPOINT_PIDS entries. */ n: Record<string, string>;
   /** 1 = the incarnation has ended. */ e?: 1;
+  /** Craps only, and only while live: the state the next roll plays from
+   *  (required then; asCrapsCheckpoint). */ s?: CrapsCarry;
   k: string;
   g: string;
 }
@@ -220,7 +247,7 @@ export function slipCommit(ctx: FoldCtx, r: number, pid: string, seed: string): 
  *  that trim the same history open the same session. 'g' when cp is null.
  *  `s` is a game's carried state (craps): absent, canon skips it, so a
  *  roulette sid is what it always was. */
-export function nextSid(ctx: FoldCtx, cp: (Pick<Checkpoint, 'b' | 'u' | 'l' | 'n' | 'e'> & { s?: unknown }) | null): string {
+export function nextSid(ctx: FoldCtx, cp: Pick<Checkpoint, 'b' | 'u' | 'l' | 'n' | 'e' | 's'> | null): string {
   if (!cp) return 'g';
   const c = canon({ t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, l: cp.l, n: cp.n, e: cp.e, s: cp.s });
   if (c === null) throw new TypeError('nextSid: the checkpoint must be canonical');
@@ -337,6 +364,11 @@ export function asAbandon(v: unknown): AbandonRec | null {
 
 export function asCheckpoint(v: unknown): Checkpoint | null {
   if (!isPlain(v) || !hasFields(v, ['v', 'b', 'u', 'l', 'n', 'k', 'g'], ['e'])) return null;
+  return checkpointBody(v);
+}
+
+/** The checks every checkpoint shares, once its fields are known. */
+function checkpointBody(v: Record<string, unknown>): Checkpoint | null {
   if (v.v !== 1 || !isSid(v.b) || !isRound(v.u) || !isHex32(v.l) || !isPub(v.k) || !isSig(v.g)) return null;
   if (v.e !== undefined && v.e !== 1) return null;
   if (!isPlain(v.n)) return null;
@@ -344,6 +376,46 @@ export function asCheckpoint(v: unknown): Checkpoint | null {
   const pids = Object.keys(n);
   if (pids.length > MAX_CHECKPOINT_PIDS) return null;
   return pids.every((pid) => isPid(pid) && isNet(n[pid])) ? (v as unknown as Checkpoint) : null;
+}
+
+/** A stand on a craps slip: one of the table's seven player stands. */
+const isStand = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 1 && (v as number) <= 7;
+
+/** A craps table's slip: the roulette slip's checks, with a canonical craps
+ *  felt in `b`, the stamp `o`, and the optional stand `t` and goodbye `l`. */
+export function asCrapsSlip(v: unknown): CrapsSlipRec | null {
+  if (!isPlain(v) || !hasFields(v, ['r', 'p', 'v', 'b', 'o', 'c', 'k', 'g'], ['t', 'l'])) return null;
+  if ((v.t !== undefined && !isStand(v.t)) || (v.l !== undefined && v.l !== 1)) return null;
+  return isRound(v.r) && isPid(v.p) && isRound(v.v) && isCanonFelt(v.b) && isHex32(v.o) && isHex64(v.c) && isPub(v.k) && isSig(v.g)
+    ? (v as unknown as CrapsSlipRec) : null;
+}
+
+/** A carry as a checkpoint stores it, held to every rule CrapsCarry states:
+ *  the point one of CARRY_POINTS; at most MAX_RIDERS riders, each a player id
+ *  with a canonical felt that has chips on it; a shooter and a last shooter
+ *  that are player ids short enough to hold the dice; `i` only with a
+ *  shooter. Every carry a roll makes passes it. */
+function isCarry(v: unknown): v is CrapsCarry {
+  if (!isPlain(v) || !hasFields(v, ['p', 'w'], ['h', 'a', 'i'])) return false;
+  if (typeof v.p !== 'number' || !CARRY_POINTS.has(v.p) || !isPlain(v.w)) return false;
+  const w = v.w;
+  const riders = Object.keys(w);
+  if (riders.length > MAX_RIDERS) return false;
+  for (const pid of riders) {
+    const f = w[pid];
+    if (!isPid(pid) || !isCanonFelt(f) || f.length === 0) return false;
+  }
+  const shooter = (x: unknown): boolean => x === undefined || (isPid(x) && x.length <= MAX_SHOOTER_PID);
+  if (!shooter(v.h) || !shooter(v.a)) return false;
+  return v.i === undefined || (v.i === 1 && v.h !== undefined);
+}
+
+/** A craps table's checkpoint: a live one carries the state its next roll
+ *  plays from (`s`, required); an ended one carries none. */
+export function asCrapsCheckpoint(v: unknown): Checkpoint | null {
+  if (!isPlain(v) || !hasFields(v, ['v', 'b', 'u', 'l', 'n', 'k', 'g'], ['e', 's'])) return null;
+  if (v.e === 1 ? v.s !== undefined : !isCarry(v.s)) return null;
+  return checkpointBody(v);
 }
 
 // ── Keys ─────────────────────────────────────────────────────────────────────
@@ -418,7 +490,7 @@ export type SigCheck = (hash: string, kind: SignedKind, pub: string, bytes: () =
 
 // ── Output ───────────────────────────────────────────────────────────────────
 
-export interface SlipInfo { key: string; hash: string; rec: SlipRec }
+export interface SlipInfo { key: string; hash: string; rec: AnySlipRec }
 
 export type Decision = 'reveals' | 'forfeit' | 'void';
 
@@ -428,7 +500,7 @@ export interface RoundView {
   closeRec: CloseRec;
   /** pid → slip hash, as the close froze them. */ frozen: Record<string, string>;
   /** P: frozen pids whose slip is present, verified and valid for (r, pid). Sorted. */ present: string[];
-  /** M: frozen pids whose slip is absent, pending, invalid or empty. Sorted. Never staked. */ missing: string[];
+  /** M: frozen pids whose slip is absent, pending, invalid, or (at roulette) empty. Sorted. Never staked. */ missing: string[];
   /** Pids in P with a reveal that opens their slip's `c`. Sorted. */ revealed: string[];
   /** null while undecided. */ decided: Decision | null;
   /** Pids whose seeds made the pocket (sorted); [] when undecided or void. */ counted: string[];
@@ -441,6 +513,25 @@ export interface RoundView {
   stakes: Map<string, bigint>;
   payouts: Map<string, bigint>;
   deltas: Map<string, bigint>;
+  /** At craps: the roll as the game played it (absent at roulette). */ craps?: CrapsRoll;
+}
+
+/** One craps roll as the fold played it. At craps a RoundView's stakes,
+ *  payouts and deltas cover every rider as well as P: riding bets play
+ *  whether or not their player wrote a slip. `payouts` is `credited`. */
+export interface CrapsRoll {
+  /** When decided by reveals or a forfeit; null otherwise. */ dice: [number, number] | null;
+  pointBefore: number | null;
+  /** The point after the roll (as before while undecided or on a void). */ pointAfter: number | null;
+  sevenOut: boolean;
+  /** pid → how its slip was taken (computedCraps RollFate). */ fates: Map<string, RollFate>;
+  /** Decided only: pid → chips returned to it. */ credited: Map<string, bigint>;
+  /** Decided only: pid → chips it added this roll and lost to a late seed. */ lost: Map<string, bigint>;
+  /** Decided only: pid → won or lost this roll, for pids with a bet decided on it. */ amounts: Map<string, bigint>;
+  /** Pids whose only bets decided this roll were pushes. */ pushes: Set<string>;
+  /** The carry it played from, and the one it hands the next roll (sIn while undecided). */
+  sIn: CrapsCarry;
+  sOut: CrapsCarry;
 }
 
 export interface FoldBase {
@@ -488,7 +579,7 @@ export interface FoldResult {
 // ── Games ────────────────────────────────────────────────────────────────────
 
 /** A frozen or felt slip as the fold indexed it. */
-export interface SlipEntry extends EntryBase<'s', SlipRec>, Signed {
+export interface SlipEntry extends EntryBase<'s', AnySlipRec>, Signed {
   /** Σ amounts — at most 400 × MAX_BET_AMOUNT, so exact as a number first. */
   stake: bigint;
 }
@@ -508,6 +599,7 @@ export interface Play<S> {
   payouts: Map<string, bigint>;
   deltas: Map<string, bigint>;
   /** The carried state the next round plays from (unused while undecided). */ sOut: S;
+  /** A craps roll's detail, for the round's view. */ craps?: CrapsRoll;
 }
 
 /**
@@ -519,7 +611,7 @@ export interface Play<S> {
  */
 export interface FoldGame<S> {
   /** The slip shape this game's records use (the session keys are the same). */
-  asSlip(v: unknown): SlipRec | null;
+  asSlip(v: unknown): AnySlipRec | null;
   /** The checkpoint shape (a game with carried state stores it as `s`). */
   asCheckpoint(v: unknown): Checkpoint | null;
   /** Whether a close may freeze this slip so that it counts: roulette needs
@@ -559,7 +651,7 @@ export const rouletteGame: FoldGame<null> = {
       // Only a counted pid is paid, and nobody is counted on a void. resolveRound
       // under a fixed key: a pid like 'constructor' must not read the result
       // object's prototype.
-      const won = pocket !== null && inPocket.has(pid) ? resolveRound({ bettor: s.rec.b }, pocket).bettor ?? 0 : 0;
+      const won = pocket !== null && inPocket.has(pid) ? resolveRound({ bettor: (s.rec as SlipRec).b }, pocket).bettor ?? 0 : 0;
       const payout = BigInt(won);
       payouts.set(pid, payout);
       // A void moves nothing: the stake was only ever held, and stops being held.
@@ -576,6 +668,100 @@ export const rouletteGame: FoldGame<null> = {
     return held;
   },
 };
+
+/** A memo key per carry, by identity: a carry is never changed once made,
+ *  and the walk hands the same objects back from the play memo. */
+const carryKeys = new WeakMap<CrapsCarry, string>();
+
+/** A craps slip as computedCraps plays it, from carry `sIn`. */
+function rollSlip(rec: CrapsSlipRec, sIn: CrapsCarry): RollSlip {
+  const basisOk = rec.o === basisOf(sIn, rec.p);
+  return rec.t === undefined ? { b: rec.b, basisOk } : { b: rec.b, basisOk, t: rec.t };
+}
+
+const bigints = (m: ReadonlyMap<string, number>): Map<string, bigint> => {
+  const out = new Map<string, bigint>();
+  for (const [pid, n] of m) out.set(pid, BigInt(n));
+  return out;
+};
+
+/** Craps: one round is one roll, played by computedCraps from the state the
+ *  rolls before it left (the point, the bets riding, who holds the dice). */
+export const crapsGame: FoldGame<CrapsCarry> = {
+  asSlip: asCrapsSlip,
+  asCheckpoint: asCrapsCheckpoint,
+  // A take-down-all is a real change at craps (riding bets come down), so a
+  // close may freeze an empty felt; signerPresent still needs chips.
+  frozenOk: () => true,
+  start: (cp) => (cp?.s ? { ...cp.s, w: nullProtoCopy(cp.s.w) } : EMPTY_CARRY),
+  key(s) {
+    let k = carryKeys.get(s);
+    if (k === undefined) {
+      k = bytesToHex(sha256(utf8ToBytes(canon(s)!))).slice(0, 32);
+      carryKeys.set(s, k);
+    }
+    return k;
+  },
+  play(ctx, r, out, P, _M, sIn) {
+    // A pid only in M plays as a rider if it has riding bets, else not at all.
+    const slips = new Map<string, RollSlip>();
+    for (const [pid, s] of P) slips.set(pid, rollSlip(s.rec as CrapsSlipRec, sIn));
+    const dice = out.decided === 'reveals' || out.decided === 'forfeit'
+      ? diceOf(seedTable(ctx), r, out.counted.map((pid) => out.seeds.get(pid)!))
+      : null;
+    const roll = playRoll({ sIn, slips, decided: out.decided, counted: out.counted, dice });
+    const credited = bigints(roll.credited);
+    return {
+      pocket: null,
+      stakes: bigints(roll.stakes),
+      payouts: credited,
+      deltas: bigints(roll.deltas),
+      sOut: roll.sOut,
+      craps: {
+        dice, pointBefore: roll.pointBefore, pointAfter: roll.pointAfter, sevenOut: roll.sevenOut, fates: roll.fates,
+        credited, lost: bigints(roll.lost), amounts: bigints(roll.amounts), pushes: roll.pushes, sIn, sOut: roll.sOut,
+      },
+    };
+  },
+  standing(sIn, felts) {
+    const latest = new Map<string, RollSlip>();
+    for (const [pid, f] of felts) latest.set(pid, rollSlip(f.rec as CrapsSlipRec, sIn));
+    return bigints(standingOf(sIn, latest));
+  },
+};
+
+export type GameName = 'roulette' | 'craps';
+
+/** The game an incarnation plays, from its name: `k…` craps, else roulette. */
+export function gameOfInc(inc: string): GameName {
+  return inc[0] === 'k' ? 'craps' : 'roulette';
+}
+
+/** The rules an incarnation's rounds are played by. */
+export function foldGameOf(ctx: Pick<FoldCtx, 'inc'>): FoldGame<unknown> {
+  return gameOfInc(ctx.inc) === 'craps' ? (crapsGame as FoldGame<unknown>) : (rouletteGame as FoldGame<unknown>);
+}
+
+/** The slip reader for an incarnation's game. */
+export function asSlipFor(ctx: Pick<FoldCtx, 'inc'>): (v: unknown) => AnySlipRec | null {
+  return foldGameOf(ctx).asSlip;
+}
+
+/** The key a slip must be stored under at an incarnation (null for junk
+ *  there, such as the other game's slip). */
+export function slipKeyFor(ctx: Pick<FoldCtx, 'inc'>): (rec: unknown) => string | null {
+  const read = foldGameOf(ctx).asSlip;
+  return (rec) => {
+    const s = read(rec);
+    const h = s && recHash(s);
+    return s && h ? `s:${s.r}:${s.p}:${h}` : null;
+  };
+}
+
+/** The checkpoint reader for an incarnation's game. */
+export function asCheckpointFor(ctx: Pick<FoldCtx, 'inc'>): (v: unknown) => Checkpoint | null {
+  return foldGameOf(ctx).asCheckpoint;
+}
 
 // ── The index ────────────────────────────────────────────────────────────────
 
@@ -724,8 +910,9 @@ export class TableFold {
    *  could sign a version under someone else's pid with a high `v` and hold
    *  their chips until a close froze the real one. Closes, decisions and
    *  nets don't read it: a close froze what its signer pinned.
-   *  `game` is the rules the rounds are played by (roulette by default). */
-  constructor(ctx: FoldCtx, check: SigCheck, keyOf?: KeyOf, game: FoldGame<unknown> = rouletteGame as FoldGame<unknown>) {
+   *  `game` is the rules the rounds are played by: by default the game the
+   *  incarnation's name says (foldGameOf). */
+  constructor(ctx: FoldCtx, check: SigCheck, keyOf?: KeyOf, game: FoldGame<unknown> = foldGameOf(ctx)) {
     this.ctx = ctx;
     this.check = check;
     this.keyOf = keyOf;
@@ -830,8 +1017,8 @@ export class TableFold {
     const size = key.length + c.length;
     switch (pk.kind) {
       case 's': {
-        const slip = rec as SlipRec;
-        const stake = BigInt(slip.b.reduce((sum, bet) => sum + bet.amount, 0));
+        const slip = rec as AnySlipRec;
+        const stake = BigInt((slip.b as readonly { amount: number }[]).reduce((sum, bet) => sum + bet.amount, 0));
         return { kind: 's', key, hash, rec: slip, size, stake };
       }
       case 'c':
@@ -1220,6 +1407,7 @@ export class TableFold {
       const view: RoundView = {
         r: best.rec.r, close: best.hash, closeRec: best.rec, frozen: best.rec.f, ...d,
         pocket: play.pocket, stakes: play.stakes, payouts: play.payouts, deltas: play.deltas,
+        ...(play.craps ? { craps: play.craps } : {}),
       };
       rounds.push(view);
       if (!view.decided) { tip = view; break; }

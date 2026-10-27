@@ -165,8 +165,8 @@ import {
   MAX_FROZEN, MAX_SLIP_BETS, parseKey, recHash, revealKey, seedTable, signBytes, slipCommit, slipKey,
 } from './computedFold';
 import type {
-  AbandonRec, Checkpoint, CloseRec, Decision, FoldCtx, FoldResult, ForfeitRec, RecKind, RevealRec, RoundView, SignedKind,
-  SlipRec,
+  AbandonRec, AnySlipRec, Checkpoint, CloseRec, Decision, FoldCtx, FoldResult, ForfeitRec, RecKind, RevealRec, RoundView,
+  SignedKind, SlipRec,
 } from './computedFold';
 import {
   BET_WINDOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS, TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake,
@@ -1098,7 +1098,7 @@ export function readComputedBets(t: string, round: number, now = Date.now()): Re
         if (s) out[pid] = s.b;
       }
     } else if (e.view.phase === 'betting') {
-      for (const [pid, s] of e.res.felts) if (s.rec.b.length > 0) out[pid] = s.rec.b;
+      for (const [pid, s] of e.res.felts) if (s.rec.b.length > 0) out[pid] = rouletteFelt(s.rec);
     }
     e.bets = out;
   }
@@ -1298,6 +1298,10 @@ function slipDue(st: TableState, o: number, deadline: number | undefined, now: n
 
 const sameFelt = (a: readonly RouletteBet[], b: readonly RouletteBet[]): boolean => canon(a) === canon(b);
 
+/** A roulette slip's felt: the fold reads a roulette incarnation's slips
+ *  with asSlip, so every felt these roulette paths see is a roulette one. */
+const rouletteFelt = (rec: AnySlipRec): RouletteBet[] => rec.b as RouletteBet[];
+
 /** The felt in the exact shape a slip carries: {type, amount}, plus `pick`
  *  for the bets that have one. Throws on anything a slip can't carry. */
 function cleanFelt(felt: readonly RouletteBet[]): RouletteBet[] {
@@ -1362,7 +1366,7 @@ export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now =
     return 'ok';
   }
   st.pending = null;
-  if (!sameFelt(cur?.rec.b ?? [], clean) && !writeSlip(st, res, o, clean, false, now)) return 'reconnecting';
+  if (!sameFelt(cur ? rouletteFelt(cur.rec) : [], clean) && !writeSlip(st, res, o, clean, false, now)) return 'reconnecting';
   return 'ok';
 }
 
@@ -1653,7 +1657,7 @@ function flushDuty(st: TableState, me: string, now: number): void {
   if (!e || !slipDue(st, p.r, e.view.phaseDeadline, now)) return;
   st.pending = null;
   const cur = res.felts.get(me);
-  if (sameFelt(cur?.rec.b ?? [], p.felt)) return;
+  if (sameFelt(cur ? rouletteFelt(cur.rec) : [], p.felt)) return;
   if (refusal(res, me, p.felt, (cur?.rec.b.length ?? 0) > 0) !== null) return;
   writeSlip(st, res, p.r, p.felt, false, now);
 }
@@ -1672,7 +1676,7 @@ function recommitDuty(st: TableState, me: string, now: number): void {
   if (!res || res.open <= playedTo(st, res) || !bettingOn(st, res, now)) return;
   const cur = res.felts.get(me);
   if (!cur || cur.rec.b.length === 0 || !burnedCommit(st, res, cur.rec.c)) return;
-  writeSlip(st, res, res.open, cur.rec.b, true, now);
+  writeSlip(st, res, res.open, rouletteFelt(cur.rec), true, now);
 }
 
 /** When this page first saw the open round's close stand down for a seed

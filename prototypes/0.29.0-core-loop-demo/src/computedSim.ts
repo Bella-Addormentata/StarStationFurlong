@@ -105,7 +105,7 @@ export const SIM_MINUTES = SIM_LONG ? 15 : 3;
 export const SIM_SEED_OFFSET = typeof process !== 'undefined' ? Number(process.env.SIM_SEED ?? 0) || 0 : 0;
 
 const NET = Symbol('sim-net');
-const COMPUTED_INC = /^c[0-9a-f]{24}$/;
+const COMPUTED_INC = /^[ck][0-9a-f]{24}$/;
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
 
 // ── 🎲 Seeded randomness ─────────────────────────────────────────────────────
@@ -1378,7 +1378,7 @@ export class Sim {
       const to = D?.r ?? res.base.u;
       let w = sp.watch.get(key);
       if (!w || w.sid !== res.base.sid) {
-        const cp = sp.p.fold.asCheckpoint(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
+        const cp = sp.p.fold.asCheckpointFor({ inc })(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
         if (cp) this.cps.set(`${key}:${sp.p.fold.nextSid({ room: PAGE_ROOM, t, inc }, cp)}`, cp);
       }
       if (!w) {
@@ -1398,7 +1398,7 @@ export class Sim {
       if (res.rawBytes > this.maxSessionBytes) {
         this.maxSessionBytes = res.rawBytes;
         const ses = casino.computedSessionForWrite(t);
-        const cp = sp.p.fold.asCheckpoint(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
+        const cp = sp.p.fold.asCheckpointFor({ inc })(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
         if (ses) {
           this.biggest = {
             bytes: res.rawBytes, ctx: { room: PAGE_ROOM, t, inc }, cp,
@@ -1707,7 +1707,7 @@ export class Sim {
     const keyOf = this.keyOf(sp);
     for (const [key, { t, inc }] of [...incs].sort(([a], [b]) => (a < b ? -1 : 1))) {
       const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
-      const cp = fold.asCheckpoint(map.get(`sum:${t}:${inc}`));
+      const cp = fold.asCheckpointFor(ctx)(map.get(`sum:${t}:${inc}`));
       const ses = map.get(`ses:${t}:${inc}:${fold.nextSid(ctx, cp)}`);
       const entries = ses instanceof Y.Map ? [...(ses as Y.Map<unknown>).entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]) : [];
       const tf = new fold.TableFold(ctx, this.checkFor(sp, ctx), keyOf);

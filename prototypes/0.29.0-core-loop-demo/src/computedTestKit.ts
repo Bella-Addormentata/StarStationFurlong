@@ -24,11 +24,15 @@ import {
   signBytes,
   slipCommit,
   slipKey,
+  slipKeyFor,
   TableFold,
 } from './computedFold';
 import type {
-  AbandonRec, Checkpoint, CloseRec, FoldCtx, FoldResult, ForfeitRec, RevealRec, SigCheck, SignedKind, SlipRec,
+  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, FoldCtx, FoldResult, ForfeitRec, RevealRec, SigCheck,
+  SignedKind, SlipRec,
 } from './computedFold';
+import type { CrapsCarry } from './computedCraps';
+import type { CrapsBet } from './games/craps';
 import type { RouletteBet } from './games/roulette';
 // Also wires noble's synchronous sha512 (keypair.ts does it at import).
 import { verifyIdentityStrict } from './keypair';
@@ -140,9 +144,21 @@ export class ComputedKit {
     return built(this.sign<SlipRec>('slip', id, { r, p, v: opts.v ?? 1, b, c }), slipKey);
   }
 
+  /** A craps slip version (a `k` table's): `b` canonical, `o` the stamp of
+   *  the carry it was built on (computedCraps basisOf), `t` the stand it was
+   *  written at, `l` a goodbye. The seed defaults as slip's does. */
+  crapsSlip(
+    id: TestIdentity, r: number, b: CrapsBet[], o: string, opts: { v?: number; seed?: string; p?: string; t?: number; l?: 1 } = {},
+  ): Built<CrapsSlipRec> {
+    const p = opts.p ?? id.pid;
+    const c = this.commit(r, p, opts.seed ?? this.seed(p, r));
+    const body = { r, p, v: opts.v ?? 1, b, o, c, ...(opts.t !== undefined ? { t: opts.t } : {}), ...(opts.l ? { l: opts.l } : {}) };
+    return built(this.sign<CrapsSlipRec>('slip', id, body), slipKeyFor(this.ctx));
+  }
+
   /** A close of round r under parent q, freezing the given slips (or a raw
    *  pid → hash map). */
-  close(id: TestIdentity, r: number, q: string, frozen: Built<SlipRec>[] | Record<string, string>): Built<CloseRec> {
+  close(id: TestIdentity, r: number, q: string, frozen: Built<AnySlipRec>[] | Record<string, string>): Built<CloseRec> {
     const f: Record<string, string> = {};
     if (Array.isArray(frozen)) for (const s of frozen) f[s.rec.p] = s.hash;
     else Object.assign(f, frozen);
@@ -163,11 +179,12 @@ export class ComputedKit {
     return built(this.sign<AbandonRec>('abandon', id, { r, x }), abandonKey);
   }
 
-  /** A checkpoint closing session `b` at round u, with nets given as bigints. */
-  checkpoint(id: TestIdentity, b: string, u: number, l: string, nets: Record<string, bigint>, e?: 1): Checkpoint {
+  /** A checkpoint closing session `b` at round u, with nets given as bigints
+   *  (and, for a live craps table, the carried state `s`). */
+  checkpoint(id: TestIdentity, b: string, u: number, l: string, nets: Record<string, bigint>, e?: 1, s?: CrapsCarry): Checkpoint {
     const n: Record<string, string> = {};
     for (const pid of Object.keys(nets).sort()) if (nets[pid] !== 0n) n[pid] = nets[pid].toString();
-    return this.sign<Checkpoint>('sum', id, { v: 1, b, u, l, n, ...(e ? { e } : {}) });
+    return this.sign<Checkpoint>('sum', id, { v: 1, b, u, l, n, ...(e ? { e } : {}), ...(s ? { s } : {}) });
   }
 
   /** The session id a checkpoint opens. */

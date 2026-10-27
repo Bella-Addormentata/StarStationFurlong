@@ -218,8 +218,8 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpoint, nextSid, parseKey, TableFold } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, SigCheck } from './computedFold';
+import { asCheckpointFor, nextSid, parseKey, TableFold } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, GameName, SigCheck } from './computedFold';
 import { getPlayerId } from './identity';
 import { getIdentityPub, verifyIdentityStrict } from './keypair';
 import { forgetRoomHeard, noteRoomHeard } from './roomHearing';
@@ -1430,8 +1430,12 @@ export function writeCroupierBeat(tableId: string, beatAt: number): void {
 // (computedTable switchComputedOn): it would go on opening owner-run rounds
 // on the table, reading none of the computed records.
 
-/** The build this page's lease carries: 2 knows computed tables. */
-export const TABLE_BUILD = 2;
+/** The build this page's lease carries: 2 knows computed roulette, 3
+ *  computed craps. */
+export const TABLE_BUILD = 3;
+/** The first build that knows each computed game: a table can't switch to
+ *  one while an earlier build drives (croupier leaseIsOldBuild). */
+export const COMPUTED_MIN_BUILD = { roulette: 2, craps: 3 } as const;
 
 export interface TableOperatorLease {
   /** the driving page (croupier.ts ROULETTE_PAGE_ID) */
@@ -2053,10 +2057,12 @@ function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
  *  checkpoint of the sessions before it. */
 let computedMap: Y.Map<unknown> | null = null;
 
-/** A computed incarnation's name: `c` + 24 hex, never one a PR 1 table takes
- *  (tableIncFor's 24 hex), so an earlier build opening a round on the table
- *  can't end the computed one by removing its own. */
-const COMPUTED_INC = /^c[0-9a-f]{24}$/;
+/** A computed incarnation's name: `c` (roulette) or `k` (craps) + 24 hex,
+ *  never one a PR 1 table takes (tableIncFor's 24 hex), so an earlier build
+ *  opening a round on the table can't end the computed one by removing its
+ *  own. The first letter is the game (computedFold gameOfInc); a build that
+ *  reads only `c` names (computed roulette's) sees a craps switch as junk. */
+const COMPUTED_INC = /^[ck][0-9a-f]{24}$/;
 /** A session's id: `g` for an incarnation's first, else nextSid's 24 hex. */
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
 
@@ -2142,19 +2148,19 @@ function computedKeyParts(key: string): { t: string; inc: string; sid?: string }
 
 const sessionKey = (t: string, inc: string, sid: string): string => `ses:${t}:${inc}:${sid}`;
 
-const checkpointCache = new WeakMap<object, Checkpoint | null>();
+const checkpointCache = new WeakMap<object, { inc: string; cp: Checkpoint | null }>();
 
-/** An incarnation's checkpoint as stored (asCheckpoint, once per value: up
- *  to 4,096 nets to check); null for none, or junk. */
+/** An incarnation's checkpoint as stored (its game's asCheckpoint, once per
+ *  value: up to 4,096 nets to check); null for none, or junk. */
 function checkpointAt(map: Y.Map<unknown>, t: string, inc: string): Checkpoint | null {
   const value = map.get(`sum:${t}:${inc}`);
   if (typeof value !== 'object' || value === null) return null;
-  let cp = checkpointCache.get(value);
-  if (cp === undefined) {
-    cp = asCheckpoint(value);
-    checkpointCache.set(value, cp);
+  let hit = checkpointCache.get(value);
+  if (hit?.inc !== inc) {
+    hit = { inc, cp: asCheckpointFor({ inc })(value) };
+    checkpointCache.set(value, hit);
   }
-  return cp;
+  return hit.cp;
 }
 
 /** The sid of the session checkpoint `cp` opens (nextSid, hashed once per
@@ -2197,15 +2203,16 @@ export function computedIncEnded(tableId: string, inc: string): boolean {
   return casino.has(goneKey(tableId, inc)) || checkpointAt(computedMap!, tableId, inc)?.e === 1;
 }
 
-/** The name a table's next computed incarnation takes: `c` + 24 hex of the
- *  table's removals (its `gone:` marks), as tableIncFor names an owner-run
- *  one, under a domain of its own, so the two never meet. Not at random:
+/** The name a table's next computed incarnation takes: `c` (roulette) or
+ *  `k` (craps) + 24 hex of the table's removals (its `gone:` marks), as
+ *  tableIncFor names an owner-run one, under a domain of each game's own, so
+ *  none of them ever meet. Not at random:
  *  two of the house's pages switching the table on at once name it alike,
  *  and their sessions meet on one key. Past any name the doc already holds
  *  a session or a checkpoint of (a switch-off that ended it on a page whose
  *  mark the doc didn't keep): that one is marked ended, and the next tried,
  *  as freshIncFor does. In the caller's transaction. */
-export function computedIncFor(tableId: string): string {
+export function computedIncFor(tableId: string, game: GameName = 'roulette'): string {
   const casino = ensureMap();
   const map = computedMap!;
   const prefix = `gone:${tableId}:`;
@@ -2213,8 +2220,8 @@ export function computedIncFor(tableId: string): string {
     const removals = [...casino.entries()].filter(([key]) => key.startsWith(prefix))
       .map(([key, value]): [string, unknown] => [key.slice(prefix.length), value])
       .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
-    const named = `ssf-computed-inc-v1|${tableId}|${JSON.stringify(removals)}`;
-    const inc = 'c' + bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
+    const named = `${game === 'craps' ? 'ssf-computed-craps-inc-v1' : 'ssf-computed-inc-v1'}|${tableId}|${JSON.stringify(removals)}`;
+    const inc = (game === 'craps' ? 'k' : 'c') + bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
     const used = map.has(`sum:${tableId}:${inc}`) || [...map.keys()].some((key) => {
       const at = computedKeyParts(key);
       return at?.sid !== undefined && at.t === tableId && at.inc === inc;
@@ -2793,7 +2800,7 @@ export function writeCheckpointAndTrim(
   ensureMap();
   const map = computedMap!;
   if (!isComputedTable(tableId) || computedIncOf(tableId) !== inc || !casinoWhole(tableId)) return false;
-  const ok = asCheckpoint(cp);
+  const ok = asCheckpointFor({ inc })(cp);
   const ctx: FoldCtx = { room: boundRoomId, t: tableId, inc };
   if (!ok || ok.e === 1 || ok.b !== nextSid(ctx, checkpointAt(map, tableId, inc))) return false;
   const next = nextSid(ctx, ok);
@@ -2828,7 +2835,7 @@ export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | 
   if (!c || !casinoWhole(tableId)) return false;
   const was = checkpointAt(map, tableId, inc);
   if (cp !== null) {
-    const ok = asCheckpoint(cp);
+    const ok = asCheckpointFor({ inc })(cp);
     if (!ok || ok.e !== 1 || ok.b !== liveSidOf(c, was)) return false;
   } else if (was?.e !== 1) {
     return false;
