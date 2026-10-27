@@ -26,17 +26,25 @@
  * deadlines. ⚖️ FAIRNESS: by default the dice come from the house's seed mixed
  * with every bettor's (fairTableSeeds.ts) — committed at open, frozen at "no
  * more bets", revealed at the settle — so the operator can't pick the roll.
+ *
+ * 🧮 A COMPUTED craps table (computedTable.ts) runs itself: the stickman opens
+ * no window and throws nothing there, nor does a ROLL press; it only clears
+ * away an owner-run round an earlier build opened (croupier
+ * sweepLegacyRound) and drops a switch nothing stands behind (dropBareSwitch,
+ * of either game's name).
  */
 
 import {
-  closeWhenWhole, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, RECONNECTING_NOTICE, refundAndClear,
-  TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount, timerOnThisClock,
+  closeWhenWhole, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, dropBareSwitch, RECONNECTING_NOTICE, refundAndClear,
+  sweepLegacyRound, TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount, timerOnThisClock,
 } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
 import { hasLocalStand, localStandOf, setLocalStand } from './localStands';
 import {
   casinoDocEpoch,
   casinoWhole,
+  computedSwitchLost,
+  isComputedFor,
   putTableBack,
   readAllCrapsBets,
   readCrapsFairnessPref,
@@ -71,6 +79,19 @@ export const CRAPS_CLOSING_MS = 2_500;
 export const SEAT_STALE_MS = 15_000;
 /** The stickman's spot on the felt (the layout's dice spot). */
 export const STICKMAN_DICE_SPOT = CRAPS_DICE_SPOT;
+/** 🧮 What a ROLL press says at a computed craps table. */
+export const NO_HAND_ROLL = "NOBODY ROLLS THIS TABLE BY HAND — THE ROLL IS DECIDED ONCE THE BETTORS' SEEDS ARE IN";
+
+/** 🧮 Whether craps table `tableId` runs itself (computedTable): a computed
+ *  one of craps, or one whose switch a peer took away, or wrote another
+ *  game's name over, while its players are mid-roll there (the room puts it
+ *  back). A roulette name here stands nothing else down: no page plays it at
+ *  a craps table (casinoDoc isComputedFor). World posts no heartbeat for a
+ *  table that runs itself. */
+export function crapsRunsItself(tableId: string): boolean {
+  return isComputedFor(tableId, 'craps') || computedSwitchLost(tableId, 'craps');
+}
+const runsItself = crapsRunsItself;
 
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
@@ -134,6 +155,8 @@ export function openCrapsBetting(
   // 📒 Not on a doc holding part of an update, where a table read as gone
   // would open anew, nor on a page just woken (tableWritable).
   if (!tableWritable(tableId)) return;
+  // 🧮 Nor on a computed table (the card's NEXT ROLL comes here too).
+  if (runsItself(tableId)) return;
   // One transaction: a name a removal left unmarked is marked as it opens.
   transactCasino(() => writeCrapsTableState(tableId, {
     kind: 'craps',
@@ -345,6 +368,8 @@ const PAGE_ID = CRAPS_PAGE_ID;
  *  driving while it holds such a turn goes on with it here
  *  (tickAutoStickman). */
 export function tickManualCraps(tableId: string, now = Date.now(), autoShowMs?: number): void {
+  // 🧮 Nobody runs a computed table's turns.
+  if (runsItself(tableId)) return;
   // Every editor samples (throttled), so whoever presses ROLL has already
   // seen the seated players' heartbeats move and can slide them the dice.
   sampleSeats(tableId, now);
@@ -445,6 +470,7 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
   // 📒 Nor while it holds part of an update: the table may read as gone
   // (casinoWhole).
   if (!tablesAwake(now) || !casinoWhole(tableId)) return RECONNECTING_NOTICE;
+  if (runsItself(tableId)) return NO_HAND_ROLL;
   if (!readCrapsTableState(tableId)) {
     // The first press only opens the window: bets go down on an open table
     // (casinoDoc STAKES ON THE FELT), and on a Fair one the bettors need to
@@ -494,10 +520,24 @@ export function pressManualRoll(tableId: string, now = Date.now()): string | nul
 export function tickAutoStickman(tableId: string): void {
   // 📒 Not on a doc holding part of another page's update (casinoWhole).
   if (!casinoWhole(tableId)) return;
+  const now = Date.now();
+  // 🧮 A computed craps table runs itself: the stickman only clears away an
+  // owner-run round an earlier build opened there, its bets back and what
+  // it paid standing (croupier sweepLegacyRound). So too while its switch is
+  // lost, until the room puts it back. A switch nothing stands behind it
+  // drops (dropBareSwitch).
+  if (runsItself(tableId)) {
+    if (!dropBareSwitch(tableId, now)) sweepLegacyRound(tableId, now, readCrapsTableState);
+    return;
+  }
+  // A bare switch of roulette's name stands nothing down here, and goes a
+  // lapse on all the same, as the robot drops one of either name at roulette
+  // (the house's craps switch-on is refused while it is up). The roll under
+  // way goes on meanwhile, and in the tick that drops it.
+  dropBareSwitch(tableId, now);
   // A state that doesn't go on from the table's book: the book's goes back
   // up first (casinoDoc putTableBack).
   if (putTableBack(tableId)) return;
-  const now = Date.now();
   sampleSeats(tableId, now);
   const s = readCrapsTableState(tableId);
   if (!s) {

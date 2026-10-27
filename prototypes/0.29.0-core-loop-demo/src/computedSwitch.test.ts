@@ -1479,7 +1479,9 @@ describe("World's frame (world.ts updateCroupier)", () => {
 
   it('ticks the computed tables every frame, every client, never throwing out of the frame', () => {
     expect(start).toBeGreaterThan(-1);
-    const tick = body.indexOf('tickComputedTables(rouletteTables.map((t) => t.id), Date.now());');
+    const tick = body.indexOf(
+      'tickComputedTables(tables.map((t): ComputedTableRef => ({ id: t.id, game: t.kind === "craps-table" ? "craps" : "roulette" })), Date.now());',
+    );
     expect(tick).toBeGreaterThan(-1);
     // Inside a try whose catch warns once.
     const tryAt = body.lastIndexOf('try {', tick);
@@ -1496,8 +1498,8 @@ describe("World's frame (world.ts updateCroupier)", () => {
     expect(world).toMatch(/import \{ computedCompactionPending, tickComputedTables \} from "\.\/computedTable";/);
   });
 
-  it("posts no heartbeat for a computed roulette table, and still runs the robot's tick (its sweep)", () => {
-    expect(body).toContain('const computed = t.kind === "roulette-table" && isComputedTable(t.id);');
+  it("posts no heartbeat for a computed table (at craps a craps one only), and still runs the robot's tick (its sweep)", () => {
+    expect(body).toContain('const computed = t.kind === "roulette-table" ? isComputedTable(t.id) : crapsRunsItself(t.id);');
     expect(body).toContain('if (beatNow && !computed) beatCroupier(t.id);');
     expect(body).not.toMatch(/if \(beatNow\) beatCroupier\(t\.id\);/);
     expect(body).toContain('else tickAutoCroupier(t.id);');

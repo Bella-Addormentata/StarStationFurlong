@@ -218,7 +218,7 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpointFor, nextSid, parseKey, TableFold } from './computedFold';
+import { asCheckpointFor, gameOfInc, nextSid, parseKey, TableFold } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, SigCheck } from './computedFold';
 import { getPlayerId } from './identity';
 import { getIdentityPub, verifyIdentityStrict } from './keypair';
@@ -1380,10 +1380,18 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard',
     // refund: they took nothing), and its sessions stay until a page
     // compacts them (computedTable). A table put back is owner-run, on a
     // fresh incarnation (tableIncFor counts the mark). (A switch that is
-    // junk names nothing to end: it goes as any orphan setting does.)
+    // junk names nothing to end: it goes as any orphan setting does.) So too
+    // every incarnation of it whose session the doc holds live and nothing
+    // has ended, the switch naming it or not: one an earlier build's removal
+    // took the switch from alone (PR 2's reads a craps name as junk, and
+    // marks nothing of it), which a page that ran it would otherwise put
+    // back on the table put back under the same id (putComputedSwitchBack).
     if (!opts.keepComputed) {
       const cinc = computedIncOf(tableId);
       if (cinc !== null) markRemoved(map, tableId, cinc);
+      for (const inc of computedIncsOf.get(tableId) ?? []) {
+        if (inc !== cinc && computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) markRemoved(map, tableId, inc);
+      }
       map.delete(`cfg:computed:${tableId}`);
     }
     map.delete(`throw:${tableId}`);
@@ -2193,6 +2201,18 @@ export function isComputedTable(tableId: string): boolean {
   return inc !== null && !casinoMap!.has(goneKey(tableId, inc)) && checkpointAt(computedMap!, tableId, inc)?.e !== 1;
 }
 
+/** Whether table `tableId` is a computed table of `game` now
+ *  (isComputedTable, the incarnation's name that game's: computedFold
+ *  gameOfInc). A switch naming the other game's incarnation leaves this
+ *  game's owner-run play going (unless this game's own is lost under it:
+ *  computedSwitchLost): no page of this build plays it there; it ends a
+ *  minute on when the doc holds its records (computedTable awayDuty), and
+ *  the lease holder drops it a lapse on when it holds none (croupier
+ *  dropBareSwitch). */
+export function isComputedFor(tableId: string, game: GameName): boolean {
+  return isComputedTable(tableId) && gameOfInc(computedIncOf(tableId)!) === game;
+}
+
 /** Whether incarnation `inc` of table `tableId` is over for good: a removal
  *  marked it (`gone:`), or its checkpoint says it ended (finalizeComputed
  *  writes both). A switch that is missing, or junk, ends nothing yet: a
@@ -2269,12 +2289,17 @@ export function putComputedSwitchBack(tableId: string, inc: string): boolean {
 
 /** Whether table `tableId`'s switch is lost: it names no incarnation (gone,
  *  or junk) while the doc holds the live session of one nothing has ended
- *  (putComputedSwitchBack: a peer's doing, put back by the room's pages).
- *  The robot runs no owner-run round there meanwhile (croupier): the table's
- *  players are mid-round on the computed one. */
-export function computedSwitchLost(tableId: string): boolean {
-  if (computedIncOf(tableId) !== null) return false;
+ *  (putComputedSwitchBack: a peer's doing, put back by the room's pages);
+ *  given `game`, one of that game's, and a switch naming the other game's
+ *  incarnation names none of this game's (a peer's write over it, put back
+ *  the same way when the doc holds nothing of the name it wrote). The robot
+ *  runs no owner-run round there meanwhile (croupier, crapsCroupier): the
+ *  table's players are mid-round on the computed one. */
+export function computedSwitchLost(tableId: string, game?: GameName): boolean {
+  const named = computedIncOf(tableId);
+  if (named !== null && (game === undefined || gameOfInc(named) === game)) return false;
   for (const inc of computedIncsOf.get(tableId) ?? []) {
+    if (game !== undefined && gameOfInc(inc) !== game) continue;
     if (computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) return true;
   }
   return false;

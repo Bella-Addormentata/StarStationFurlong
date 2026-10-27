@@ -46,7 +46,7 @@ import {
   casinoDocEpoch,
   feltStake,
   casinoRoomId,
-  isComputedTable,
+  isComputedFor,
   readAllBets,
   readAllCrapsBets,
   readCrapsFairnessPref,
@@ -90,7 +90,7 @@ type TableState = CrapsTableState | RouletteTableState;
 export function roundIsFair(tableId: string, game: TableGame): boolean {
   // 🧮 A computed table is Friendly (its seeds come from the players alone):
   // an owner-run round an earlier build opened there doesn't make it Fair.
-  if (computedRoulette(tableId, game)) return false;
+  if (computedFor(tableId, game)) return false;
   const s = readState(tableId, game);
   // A house commit this page froze keeps the round Fair even if the live
   // field is erased after the close.
@@ -103,16 +103,15 @@ export function roundIsFair(tableId: string, game: TableGame): boolean {
  *  read as Friendly. `game`: the table's (a craps caller says so). */
 export function isFairTable(tableId: string, game: TableGame = 'roulette'): boolean {
   // 🧮 Computed tables are Friendly in this build: no house seed to mix in.
-  if (computedRoulette(tableId, game)) return false;
+  if (computedFor(tableId, game)) return false;
   return (readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode()) === 'multiparty';
 }
 
-/** 🧮 Is this a computed roulette table? Only a roulette table can be one: a
- *  switch under a craps table's id (any peer can write one) is junk there,
- *  and the craps table keeps its Fair seeds, its plaque and its house
- *  commit. */
-function computedRoulette(tableId: string, game: TableGame): boolean {
-  return game === 'roulette' && isComputedTable(tableId);
+/** 🧮 Is this a computed table of its game? A switch naming the other
+ *  game's incarnation (any peer can write one) is junk there, and the table
+ *  keeps its Fair seeds, its plaque and its house commit. */
+function computedFor(tableId: string, game: TableGame): boolean {
+  return isComputedFor(tableId, game);
 }
 
 // ── Commitments + local seed keeping ─────────────────────────────────────────
@@ -436,7 +435,7 @@ function sameCommits(a: Record<string, string>, b: Record<string, string>): bool
  */
 export function tickFairSeeds(tableId: string, game: TableGame, me: string, now = Date.now(), force = false): void {
   // 🧮 A computed table's seeds go in its own records (computedTable).
-  if (computedRoulette(tableId, game)) return;
+  if (computedFor(tableId, game)) return;
   const tickKey = `${casinoDocEpoch()}:${tableId}:${me}`;
   const last = lastTick.get(tickKey) ?? 0;
   if (!force && now >= last && now - last < 200) return;

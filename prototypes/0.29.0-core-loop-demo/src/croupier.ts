@@ -32,7 +32,8 @@
  * 🧮 COMPUTED TABLES (computedTable.ts) have no operator: the robot opens no
  * round there and posts no heartbeat. It only sweeps away an owner-run round
  * an earlier build's lease holder opened on one (sweepLegacyRound), and drops
- * a switch nothing stands behind, a peer's forgery (dropBareSwitch); and the
+ * a switch nothing stands behind, a peer's forgery (dropBareSwitch); the
+ * stickman does both at a computed craps table (crapsCroupier). And the
  * lease says which build drives (`build`), so the house can't switch a table
  * to computed while an earlier build runs the room's tables.
  */
@@ -595,10 +596,15 @@ const legacySeen = new Map<string, { epoch: number; wake: number; inc: string; r
  * round's incarnation alone, as a removal would (refundAndClear,
  * keepComputed): its lists stop holding, what an earlier build's lists took
  * is refunded, its book counts on, and the computed incarnation, its switch
- * and its sessions are as they were. Only on a whole doc (the caller).
+ * and its sessions are as they were. Only on a whole doc (the caller). At
+ * craps the same, its state read by `read` (readCrapsTableState): the bets
+ * still on its felt go back, riding ones too, and what its rolls already
+ * paid stands.
  */
-function sweepLegacyRound(tableId: string, now: number): void {
-  const s = readTableState(tableId);
+export function sweepLegacyRound(
+  tableId: string, now: number, read: (tableId: string) => { round: number; inc?: string } | null = readTableState,
+): void {
+  const s = read(tableId);
   if (!s) {
     legacySeen.delete(tableId);
     return;
@@ -636,7 +642,7 @@ const bareSeen = new Map<string, { epoch: number; wake: number; inc: string; at:
  * same: the round under way is this build's own, not an earlier build's.
  * True when it dropped it (the caller's tick is over).
  */
-function dropBareSwitch(tableId: string, now: number): boolean {
+export function dropBareSwitch(tableId: string, now: number): boolean {
   const inc = computedSwitchBare(tableId) ? computedIncOf(tableId) : null;
   if (inc === null) {
     bareSeen.delete(tableId);
