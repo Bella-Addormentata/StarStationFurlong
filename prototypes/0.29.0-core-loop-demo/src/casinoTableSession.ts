@@ -2104,7 +2104,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const beatSeat = (): void => {
     if (deps.stand === null || !stand) return;
     writeMySeat(itemId, me, { stand: deps.stand, angle: Math.atan2(stand.z, stand.x), at: Date.now() });
-    if (game === 'craps') markLocalSeat(itemId, me, true);
+    if (game === 'craps') markLocalSeat(itemId, me, true, deps.stand);
   };
 
   // ── DeviceUI ──────────────────────────────────────────────────────────────

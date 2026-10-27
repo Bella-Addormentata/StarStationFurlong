@@ -124,6 +124,24 @@
  * ends the incarnation on the pages that run it; a table out of the room
  * whose switch is still on (an earlier build removed it, or no page of this
  * build heard the removal) every page ends a minute on (awayDuty).
+ *
+ * AT A CRAPS TABLE (PR 3) a round is one roll, and the fold carries the
+ * table's state from roll to roll (computedCraps.ts: the point, every bet
+ * that rides, who holds the dice). The incarnation's name says the game
+ * (`k…`; roulette's are `c…`), and every slip read here goes through that
+ * game's own reader (st.slipOf, st.keyOf). A slip holds the player's whole
+ * felt, stamped with the state it was built on (basisOf) and the stand this
+ * page's table session stands at (localStandOf), never the doc's seat
+ * record. Riders put their riding bets down each roll someone plays
+ * (rideDuty), and a page leaving writes a goodbye (`l: 1`) that lets the
+ * window let go of it (leaveComputedTables), then writes nothing more. When
+ * the dice's holder is in play, betting is followed by the wait for the
+ * throw: their page closes the roll at its own fling (noteComputedFling),
+ * every other page only once the wait is over (closeDue), and the closes,
+ * the re-commits and the burned re-puts run whenever the roll's window has
+ * started and no close is in (crapsDutyOn), not only while betting reads
+ * open. A roll everyone on it has left, or one nobody closes, takes bets
+ * again (build: the re-arms).
  */
 
 import {
@@ -141,6 +159,7 @@ import {
   computedSeenAt,
   computedSessionForWrite,
   computedSettled,
+  COMPUTED_MIN_BUILD,
   computedVerdictOf,
   finalizeComputed,
   isComputedTable,
@@ -148,6 +167,7 @@ import {
   notifyCasinoView,
   putComputedSwitchBack,
   readAllBets,
+  readAllCrapsBets,
   readChips,
   readCrapsTableState,
   readSeat,
@@ -161,24 +181,31 @@ import {
 } from './casinoDoc';
 import type { EndedComputed } from './casinoDoc';
 import {
-  abandonKey, asAbandon, asClose, asForfeit, asReveal, asSlip, canon, closeKey, dutyRank, forfeitKey, MAX_CHECKPOINT_PIDS,
-  MAX_FROZEN, MAX_SLIP_BETS, parseKey, recHash, revealKey, seedTable, signBytes, slipCommit, slipKey,
+  abandonKey, asAbandon, asClose, asForfeit, asReveal, asSlipFor, canon, closeKey, dutyRank, forfeitKey, gameOfInc,
+  MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, parseKey, recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor,
 } from './computedFold';
 import type {
-  AbandonRec, AnySlipRec, Checkpoint, CloseRec, Decision, FoldCtx, FoldResult, ForfeitRec, RecKind, RevealRec, RoundView,
-  SignedKind, SlipRec,
+  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, FoldCtx, FoldResult, ForfeitRec, GameName, RecKind,
+  RevealRec, RoundView, SignedKind, SlipInfo,
 } from './computedFold';
 import {
-  BET_WINDOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS, TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake,
-  tablesWakeCount,
+  basisOf, canonFelt, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
+} from './computedCraps';
+import type { CrapsCarry, RollFate } from './computedCraps';
+import {
+  BET_WINDOW_MS, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
+  TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake, tablesWakeCount,
 } from './croupier';
 import { forgetSeed, keepSeed, keyFor, REVEAL_GRACE_MS, seedFor } from './fairTableSeeds';
+import { isCrapsBet, MAX_BETS_PER_PLAYER } from './games/craps';
+import type { CrapsBet, CrapsTableState } from './games/craps';
 import type { TableSeedContext } from './games/diceFairness';
 import { randomSeedHex } from './games/fairDice';
 import { isRouletteBet } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 import { getIdentityPub, signIdentity } from './keypair';
+import { localStandOf } from './localStands';
 import { heardThrough, noteClockRead } from './roomHearing';
 
 // ── ⏱ Timing ─────────────────────────────────────────────────────────────────
@@ -267,8 +294,9 @@ interface ViewEntry {
   gen: number;
   builtAt: number;
   validUntil: number;
-  view: ComputedRouletteState;
-  /** What a phase change looks like: phase, round, deadline, spin key. */
+  view: ComputedRouletteState | ComputedCrapsState;
+  /** What a phase change looks like: phase, round, deadline, spin key (at
+   *  craps the roll key, the shooter and the stall). */
   key: string;
   /** The key of the first view built for this fold result: what listeners
    *  told of the result read (tellPhase). */
@@ -279,9 +307,12 @@ interface ViewEntry {
   onChain: boolean;
   /** The round whose frozen felts the view shows while closing. */
   holding: RoundView | null;
-  bets?: Record<string, RouletteBet[]>;
+  bets?: Record<string, RouletteBet[]> | Record<string, CrapsBet[]>;
   /** This page's player's part in the round shown (computedMine). */
   mine?: ComputedMine;
+  /** At craps, while the open roll's window has started: its end of
+   *  betting, W (crapsDutyOn: the close turns take it from the view). */
+  betEnd?: number;
 }
 
 /** The session's keys, by kind, round and (slips, reveals) pid, read once per
@@ -290,6 +321,8 @@ interface Scan {
   res: FoldResult;
   gen: number;
   ses: Session | null;
+  /** The incarnation's slip reader (TableState slipOf). */
+  slipOf: (v: unknown) => AnySlipRec | null;
   /** r → pid → keys */
   slips: Map<number, Map<string, string[]>>;
   reveals: Map<number, Map<string, string[]>>;
@@ -348,6 +381,12 @@ interface TableState {
   t: string;
   inc: string;
   ctx: FoldCtx;
+  /** The game its name says (gameOfInc), and that game's slip reader and
+   *  slip key: every slip this page reads or writes of it goes through
+   *  them, so no roulette reader ever reads a craps slip. */
+  game: GameName;
+  slipOf: (v: unknown) => AnySlipRec | null;
+  keyOf: (rec: unknown) => string | null;
   /** When this page first saw each session key, on its clock (seen). */
   seen: Map<string, number>;
   /** By `<close>|<decision>`: when this page saw that round decided, and for
@@ -357,8 +396,9 @@ interface TableState {
   /** Commitments this page has revealed or seen revealed (→ their round):
    *  never frozen again, nor reused for a slip. */
   burned: Map<string, number>;
-  /** A felt held back by the coalescing, for round r. */
-  pending: { r: number; felt: RouletteBet[] } | null;
+  /** A felt held back by the coalescing, for round r; at craps with the
+   *  stamp it was built on. */
+  pending: { r: number; felt: RouletteBet[] | CrapsBet[]; basis?: string } | null;
   /** The last round whose close came while a felt of this page's was held
    *  back, and froze another (the status bar's "too late"). */
   lateFelt: number | null;
@@ -367,6 +407,21 @@ interface TableState {
   /** A window that ran out with nothing on the felt arms again only on a
    *  chip seen from `at` on. */
   rearm: { r: number; at: number } | null;
+  /** When round r's window started on this page (windowOf), kept for the
+   *  round: a version that left the session (a trim) or one counted late
+   *  doesn't move it. Gone with a re-arm and with every first-seen time. */
+  window: { r: number; at: number } | null;
+  /** At craps: this page's own fling for round r (noteComputedFling), when
+   *  and with which seed; never from the throw record. A re-show of the
+   *  roll before forgets one made before it (buildCraps). */
+  flung: { r: number; at: number; seed: number } | null;
+  /** At craps: this page has said goodbye (leaveComputedTables), and
+   *  writes no slip again until the doc is bound afresh or the page comes
+   *  back from the back-forward cache. */
+  left: boolean;
+  /** At craps: how many held changes this page dropped because the roll
+   *  before changed under them (flushDuty; the table's notice). */
+  undone: number;
   tickedAt: number | null;
   reputAt: number | null;
   /** The last decided round this page saw on the chain: what the felt
@@ -472,6 +527,8 @@ function lookAtClock(now: number): void {
       st.seen.clear();
       st.decided.clear();
       st.rearm = null;
+      st.window = null;
+      st.flung = null;
       st.missingAt.clear();
       st.opened.clear();
       st.seedOutAt = null;
@@ -518,10 +575,12 @@ function seen(st: TableState, key: string, now: number): number {
 }
 
 function newTable(t: string, inc: string): TableState {
+  const ctx: FoldCtx = { room: casinoRoomId(), t, inc };
   return {
-    t, inc, ctx: { room: casinoRoomId(), t, inc },
+    t, inc, ctx, game: gameOfInc(inc), slipOf: asSlipFor(ctx), keyOf: slipKeyFor(ctx),
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
-    pending: null, lateFelt: null, lastSlip: null, rearm: null, tickedAt: null, reputAt: null,
+    pending: null, lateFelt: null, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0,
+    tickedAt: null, reputAt: null,
     lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, lastCheck: null,
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
@@ -529,10 +588,13 @@ function newTable(t: string, inc: string): TableState {
 }
 
 /** Table t's state and fold result, when it is a computed table casinoDoc
- *  has a result for. */
-function tableOf(t: string): { st: TableState; res: FoldResult } | null {
+ *  has a result for; given a game, only when the incarnation's name says
+ *  that game (a craps name under a roulette table runs nothing here, nor a
+ *  roulette one under a craps table: awayDuty ends it). */
+function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult } | null {
   if (!isComputedTable(t)) return null;
   const inc = computedIncOf(t)!;
+  if (game !== undefined && gameOfInc(inc) !== game) return null;
   const res = computedFoldOf(t);
   if (!res) return null;
   let st = tables.get(t);
@@ -609,7 +671,7 @@ function noteResult(st: TableState, res: FoldResult): void {
     for (const [r, byPid] of sc.slips) {
       for (const keys of byPid.values()) {
         for (const key of keys) {
-          const s = asSlip(sc.ses?.get(key));
+          const s = st.slipOf(sc.ses?.get(key));
           if (s && fresh.has(s.c)) st.burned.set(s.c, r);
         }
       }
@@ -652,10 +714,12 @@ function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
 
 /** Σ |checkpoint net − what `was` had for the rounds it covers| over every
  *  player; 0 when `was` hadn't folded as far as the checkpoint goes (this
- *  page can't tell). */
+ *  page can't tell). At craps also what the checkpoint hands on against the
+ *  table's state this page had after round u (carryDiff). */
 function checkpointDiff(was: FoldResult, res: FoldResult): number {
   const u = res.base.u;
-  if (!was.rounds.some((v) => v.decided && v.r === u)) return 0;
+  const at = was.rounds.find((v) => v.decided && v.r === u);
+  if (!at) return 0;
   const expect = new Map(was.base.n);
   for (const v of was.rounds) {
     if (!v.decided || v.r > u) continue;
@@ -666,7 +730,20 @@ function checkpointDiff(was: FoldResult, res: FoldResult): number {
     const d = (res.base.n.get(pid) ?? 0n) - (expect.get(pid) ?? 0n);
     diff += d < 0n ? -d : d;
   }
+  if (at.craps) diff += carryDiff(at.craps.sOut, res.base.state as CrapsCarry);
   return clampSafe(diff);
+}
+
+/** By how many chips two craps states' riding bets differ, spot by spot;
+ *  at least one when only the point or the dice's hands differ. */
+function carryDiff(a: CrapsCarry, b: CrapsCarry): bigint {
+  let d = 0n;
+  for (const pid of new Set([...Object.keys(a.w), ...Object.keys(b.w)])) {
+    const x = new Map(own(a.w, pid).map((e) => [spotKey(e), e.amount]));
+    const y = new Map(own(b.w, pid).map((e) => [spotKey(e), e.amount]));
+    for (const k of new Set([...x.keys(), ...y.keys()])) d += BigInt(Math.abs((x.get(k) ?? 0) - (y.get(k) ?? 0)));
+  }
+  return d === 0n && (a.p !== b.p || a.h !== b.h || a.a !== b.a || a.i !== b.i) ? 1n : d;
 }
 
 /** Let go of what this page wrote that `keep` doesn't keep, and of the seeds
@@ -678,9 +755,9 @@ function letGo(st: TableState, keep: (m: Mine, key: string) => boolean): void {
   for (const [key, m] of [...st.mine]) {
     if (keep(m, key)) continue;
     st.mine.delete(key);
-    if (m.kind === 's') gone.set((m.rec as SlipRec).c, m.r);
+    if (m.kind === 's') gone.set((m.rec as AnySlipRec).c, m.r);
   }
-  for (const m of st.mine.values()) if (m.kind === 's') gone.delete((m.rec as SlipRec).c);
+  for (const m of st.mine.values()) if (m.kind === 's') gone.delete((m.rec as AnySlipRec).c);
   for (const [c, r] of gone) forgetSeed(c, seedCtx(st, r, me));
 }
 
@@ -703,7 +780,7 @@ function scanOf(st: TableState, res: FoldResult): Scan {
   if (st.scan && st.scan.res === res && st.scan.gen === clock.gen) return st.scan;
   const ses = computedSessionForWrite(st.t);
   const sc: Scan = {
-    res, gen: clock.gen, ses,
+    res, gen: clock.gen, ses, slipOf: st.slipOf,
     slips: new Map(), reveals: new Map(), closes: new Map(), forfeits: new Map(), abandons: new Map(),
   };
   if (ses) {
@@ -744,9 +821,9 @@ function lastSeenOf(st: TableState, sc: Scan, now: number): number | null {
 }
 
 /** The slip a round froze for `pid`, as the session holds it. */
-function frozenSlip(sc: Scan, round: RoundView, pid: string): SlipRec | null {
+function frozenSlip(sc: Scan, round: RoundView, pid: string): AnySlipRec | null {
   const hash = round.frozen[pid];
-  return hash === undefined ? null : asSlip(sc.ses?.get(`s:${round.r}:${pid}:${hash}`));
+  return hash === undefined ? null : sc.slipOf(sc.ses?.get(`s:${round.r}:${pid}:${hash}`));
 }
 
 /** When this page first saw, for each frozen bettor whose seed has been in
@@ -857,12 +934,12 @@ function signedByMe(st: TableState, kind: SignedKind, key: string, v: object, re
 }
 
 /** Whether the slip `s` under `key` of incarnation `inc` of table `t` is a
- *  checked one: it hashes to its key and its signature checked out
- *  (casinoDoc's verdict: the fold checks what it counts, and this page's own
- *  records are marked). */
-function checkedSlip(t: string, inc: string, key: string, s: SlipRec): boolean {
+ *  checked one: it hashes to its key (`keyOf`, the incarnation's game's)
+ *  and its signature checked out (casinoDoc's verdict: the fold checks what
+ *  it counts, and this page's own records are marked). */
+function checkedSlip(t: string, inc: string, key: string, s: AnySlipRec, keyOf: (rec: unknown) => string | null): boolean {
   const h = parseKey(key)?.h;
-  return h !== undefined && computedVerdictOf(t, inc, h) === true && slipKey(s) === key;
+  return h !== undefined && computedVerdictOf(t, inc, h) === true && keyOf(s) === key;
 }
 
 /** The pubs of every checked slip in table st's session, of any round and
@@ -873,8 +950,8 @@ function checkedSlipPubs(st: TableState, sc: Scan): Set<string> {
   for (const byPid of sc.slips.values()) {
     for (const keys of byPid.values()) {
       for (const key of keys) {
-        const s = asSlip(sc.ses?.get(key));
-        if (s && !out.has(s.k) && checkedSlip(st.t, st.inc, key, s)) out.add(s.k);
+        const s = st.slipOf(sc.ses?.get(key));
+        if (s && !out.has(s.k) && checkedSlip(st.t, st.inc, key, s, st.keyOf)) out.add(s.k);
       }
     }
   }
@@ -903,8 +980,8 @@ function seedOut(st: TableState, sc: Scan, o: number): boolean {
   for (const [pid, keys] of sc.slips.get(o) ?? []) {
     const pin = keyFor(pid);
     for (const key of keys) {
-      const s = asSlip(sc.ses?.get(key));
-      if (s && opened.has(s.c) && s.k === pin && checkedSlip(st.t, st.inc, key, s)) return (sc.seedOut = true);
+      const s = st.slipOf(sc.ses?.get(key));
+      if (s && opened.has(s.c) && s.k === pin && checkedSlip(st.t, st.inc, key, s, st.keyOf)) return (sc.seedOut = true);
     }
   }
   return false;
@@ -969,20 +1046,43 @@ function showStart(st: TableState, sc: Scan, D: RoundView, onChain: boolean, now
 /** When round o's betting window started on this page: the first chip seen
  *  (a version with something on it, signed by its player's pinned key; from
  *  a re-arm on, only one seen since), or the end of the last round's show if
- *  later. Null before any chip: the window isn't armed. */
+ *  later. Null before any chip: the window isn't armed. At craps a goodbye
+ *  never starts one, nor does any version of a player whose latest one on
+ *  the roll is a goodbye: a page leaving opens no roll (and a re-arm because
+ *  everyone on the roll left isn't followed by a window the goodbye that
+ *  made it opens, or a version before it that came in with it). */
 function windowStart(st: TableState, sc: Scan, o: number, showEnd: number, now: number): number | null {
   const from = st.rearm && st.rearm.r === o ? st.rearm.at : -Infinity;
+  const craps = st.game === 'craps' && o === sc.res.open;
   let first = Infinity;
   for (const [pid, keys] of sc.slips.get(o) ?? []) {
+    if (craps && (sc.res.felts.get(pid)?.rec as CrapsSlipRec | undefined)?.l === 1) continue;
     const pin = keyFor(pid);
     for (const key of keys) {
-      const s = asSlip(sc.ses?.get(key));
-      if (!s || s.b.length === 0 || s.k !== pin) continue;
+      const s = st.slipOf(sc.ses?.get(key));
+      if (!s || s.b.length === 0 || s.k !== pin || (s as CrapsSlipRec).l === 1) continue;
       const at = seen(st, key, now);
       if (at >= from && at < first) first = at;
     }
   }
   return first === Infinity ? null : Math.max(first, showEnd);
+}
+
+/**
+ * When round o's window started on this page: the first start windowStart
+ * gave for the round, kept (st.window) so a version that left the session
+ * (a trim copies only latest versions) or one counted later at its arrival
+ * stamp doesn't move it; but never before the end of the show on screen
+ * (`showEnd`), so a late rewrite of the round before, shown again, gives
+ * every player a full window after it. A re-arm clears what was kept
+ * (build), and so does a wake.
+ */
+function windowOf(st: TableState, sc: Scan, o: number, showEnd: number, now: number): number | null {
+  const w = st.window;
+  if (w && w.r === o) return Math.max(w.at, showEnd);
+  const at = windowStart(st, sc, o, showEnd, now);
+  if (at !== null) st.window = { r: o, at };
+  return at;
 }
 
 function payoutsOf(D: RoundView): Record<string, number> {
@@ -1002,6 +1102,7 @@ function build(st: TableState, res: FoldResult, now: number): ViewEntry {
   const show = D ? showStart(st, sc, D, onChain, now) : 0;
   // A forfeit's result waits out every page's grace.
   const held = D !== null && D.decided === 'forfeit' && now < show;
+  if (st.game === 'craps') return buildCraps(st, res, sc, D, onChain, show, held, now);
   let phase: RouletteTableState['phase'];
   let round: number;
   let holding: RoundView | null = null;
@@ -1024,12 +1125,13 @@ function build(st: TableState, res: FoldResult, now: number): ViewEntry {
     phase = 'betting';
     round = res.open;
     const showEnd = D ? show + SHOW_MS : 0;
-    let start = windowStart(st, sc, round, showEnd, now);
+    let start = windowOf(st, sc, round, showEnd, now);
     // Run out with every chip taken down: arm again on the next one, as an
     // owner-run table opens a fresh round after an empty one.
     if (start !== null && now >= start + BET_WINDOW_MS && ![...res.felts.values()].some((s) => s.rec.b.length > 0)) {
       st.rearm = { r: round, at: now };
-      start = windowStart(st, sc, round, showEnd, now);
+      st.window = null;
+      start = windowOf(st, sc, round, showEnd, now);
     }
     if (start !== null) {
       deadline = start + BET_WINDOW_MS;
@@ -1072,8 +1174,8 @@ function viewOf(st: TableState, res: FoldResult, now: number): ViewEntry {
  */
 export function readComputedRoulette(t: string, now = Date.now()): ComputedRouletteState | null {
   lookAtClock(now);
-  const at = tableOf(t);
-  return at ? viewOf(at.st, at.res, now).view : null;
+  const at = tableOf(t, 'roulette');
+  return at ? viewOf(at.st, at.res, now).view as ComputedRouletteState : null;
 }
 
 /**
@@ -1085,7 +1187,7 @@ export function readComputedRoulette(t: string, now = Date.now()): ComputedRoule
  */
 export function readComputedBets(t: string, round: number, now = Date.now()): Record<string, RouletteBet[]> {
   lookAtClock(now);
-  const at = tableOf(t);
+  const at = tableOf(t, 'roulette');
   if (!at) return {};
   const e = viewOf(at.st, at.res, now);
   if (e.view.round !== round) return {};
@@ -1095,14 +1197,14 @@ export function readComputedBets(t: string, round: number, now = Date.now()): Re
       const sc = scanOf(at.st, e.res);
       for (const pid of e.holding.present) {
         const s = frozenSlip(sc, e.holding, pid);
-        if (s) out[pid] = s.b;
+        if (s) out[pid] = rouletteFelt(s);
       }
     } else if (e.view.phase === 'betting') {
       for (const [pid, s] of e.res.felts) if (s.rec.b.length > 0) out[pid] = rouletteFelt(s.rec);
     }
     e.bets = out;
   }
-  return e.bets;
+  return e.bets as Record<string, RouletteBet[]>;
 }
 
 /** Player `me`'s chips on round `round`'s felt (readComputedBets), with the
@@ -1112,9 +1214,278 @@ export function readMyComputedBets(t: string, me: string, round: number, now = D
   const st = tables.get(t);
   const p = st?.pending;
   if (p && p.r === round && me === getPlayerId() && st!.view?.view.phase === 'betting' && st!.view.view.round === round) {
-    return p.felt;
+    return p.felt as RouletteBet[];
   }
   return bets[me] ?? [];
+}
+
+// ── 🎲 The craps table's phases and view ─────────────────────────────────────
+
+/** What the holder's latest version on the roll says during the wait for
+ *  the throw (display only: no turn reads it): a goodbye ('gone'); none,
+ *  with riding bets ('absent': gone between rolls, or their page asleep);
+ *  none and no riding bets, or an empty felt ('none': no bet down); chips
+ *  and no stand ('away'); chips at a stand ('here'). */
+export type ShooterSlip = 'gone' | 'absent' | 'none' | 'away' | 'here';
+
+/**
+ * A computed craps table's state in the shape the felt draws a PR 1 craps
+ * table's in (phase, roll, point, dice, the shooter while one throws), plus
+ * its incarnation and the dice's roll key: `<roll>:<d1><d2>` of the last
+ * decided roll once its result may show, '' otherwise (the dice land again
+ * only when it changes, so an honest rival close with the same dice moves
+ * nothing, and a rewritten roll does). And what the table's own lines read.
+ */
+export interface ComputedCrapsState extends CrapsTableState {
+  inc: string;
+  rollKey: string;
+  /** Who holds the dice now (absent: the stickman's hand). */
+  holder?: string;
+  /** The holder was counted at their stand on the last roll that had dice:
+   *  the roll waits for their throw. */
+  shooterInPlay: boolean;
+  /** During the wait for the throw: the holder's latest version on the roll
+   *  (ShooterSlip), and whether it says no bet down. */
+  shooterSlip?: ShooterSlip;
+  shooterNoBet?: boolean;
+  /** Closing with no close in, on a page with no felt of its own on the
+   *  roll, once every close turn has passed: when betting opens again (the
+   *  re-arm after a crash, a hidden tab or a dead link). */
+  stallUntil?: number;
+  /** The end of the show before this roll's window (0 with none): a throw
+   *  from before a re-show of the last roll doesn't play after it. */
+  showEnd: number;
+  /** Settled: pid → won (or lost, negative) this roll, for pids with a bet
+   *  decided on it; the pids whose only decided bets pushed; who holds the
+   *  dice after the roll. */
+  amounts?: Record<string, number>;
+  pushes?: string[];
+  shooterAfter?: string;
+}
+
+/** The view of a craps incarnation (build, after its common part: the last
+ *  decided roll D, when its result shows, whether a forfeit holds it). The
+ *  same phases as roulette's, with the craps beats, then, once the window
+ *  runs out, the wait for the throw while the holder is in play, and the
+ *  re-arms that let a roll everyone left, or one nobody closes, take bets
+ *  again. */
+function buildCraps(
+  st: TableState, res: FoldResult, sc: Scan, D: RoundView | null, onChain: boolean, show: number, held: boolean, now: number,
+): ViewEntry {
+  const me = getPlayerId();
+  const carry = res.carry as CrapsCarry;
+  const showEnd = D ? show + CRAPS_SHOW_MS : 0;
+  // (A fling of this page's made before the show on screen ends came before
+  // a re-show of the roll before: the shooter throws again.)
+  if (st.flung && st.flung.at < showEnd) st.flung = null;
+  let phase: CrapsTableState['phase'];
+  let round: number;
+  let holding: RoundView | null = null;
+  let validUntil = Infinity;
+  let deadline: number | undefined;
+  let point: number | null = carry.p === 0 ? null : carry.p;
+  let holder = carry.h;
+  let inPlay = carry.i === 1;
+  let shooter: string | undefined;
+  let shooterSlip: ShooterSlip | undefined;
+  let stallUntil: number | undefined;
+  let betEnd: number | undefined;
+  if (res.tip) {
+    phase = 'closing';
+    round = res.tip.r;
+    holding = res.tip;
+  } else if (D && held) {
+    // (The roll before its result: the point and the dice's holder as they
+    // stood when it was thrown.)
+    phase = 'closing';
+    round = D.r;
+    holding = D;
+    validUntil = show;
+    point = D.craps?.pointBefore ?? null;
+    holder = D.craps?.sIn.h;
+    inPlay = D.craps?.sIn.i === 1;
+  } else if (D && now < showEnd) {
+    phase = 'settled';
+    round = D.r;
+    validUntil = showEnd;
+  } else {
+    round = res.open;
+    const waits = carry.h !== undefined && carry.i === 1;
+    // (A close of the roll still being checked: no tip yet, but no more
+    // turns, and no wait.)
+    const closeIn = res.openCloses.some((c) => c.state !== 'invalid');
+    const chips = [...res.felts.values()].filter((s) => s.rec.b.length > 0);
+    const mine = res.felts.get(me);
+    const ownChips = mine !== undefined && mine.rec.b.length > 0 && (mine.rec as CrapsSlipRec).l !== 1;
+    const n = new Set(chips.map((s) => s.rec.k)).size;
+    // W: the end of betting; then the wait; `stall`, once every ordinary
+    // close turn has passed.
+    const timesOf = (start: number): { W: number; stall: number } => {
+      const W = start + CRAPS_BET_WINDOW_MS;
+      return { W, stall: (waits ? W + CRAPS_SHOOTER_MS : W) + (n + 1) * STAGGER_MS };
+    };
+    let start = windowOf(st, sc, round, showEnd, now);
+    if (start !== null) {
+      const { W, stall } = timesOf(start);
+      // Run out with every chip taken down (roulette's rule); everyone with
+      // chips on the roll has said goodbye (at once: the window lets go of
+      // the gone); or, on a page with no felt of its own, nobody closed it
+      // well past every turn (the bettors' pages crashed, hid or lost their
+      // link), so a newcomer can bet.
+      if ((now >= W && chips.length === 0)
+        || (chips.length > 0 && chips.every((s) => (s.rec as CrapsSlipRec).l === 1))
+        || (!ownChips && !closeIn && now >= stall + GRACE_MAX_MS)) {
+        st.rearm = { r: round, at: now };
+        st.window = null;
+        start = windowOf(st, sc, round, showEnd, now);
+      }
+    }
+    if (start === null) {
+      phase = 'betting';
+    } else {
+      const { W, stall } = timesOf(start);
+      const end = W + CRAPS_SHOOTER_MS;
+      betEnd = W;
+      if (now < W) {
+        phase = 'betting';
+        deadline = W;
+      } else if (waits && !closeIn && now < end) {
+        // The wait for the throw. No fling offered on the holder's own page
+        // while their player has no felt of their own down (the stickman
+        // throws when it ends): the wait itself is the room's.
+        phase = 'closing';
+        deadline = end;
+        shooter = carry.h === me && !ownChips ? undefined : carry.h;
+        const hl = res.felts.get(carry.h!);
+        const rec = hl?.rec as CrapsSlipRec | undefined;
+        shooterSlip = !rec ? (own(carry.w, carry.h!).length > 0 ? 'absent' : 'none')
+          : rec.l === 1 ? 'gone' : rec.b.length === 0 ? 'none' : rec.t === undefined ? 'away' : 'here';
+      } else {
+        phase = 'closing';
+        if (!ownChips && !closeIn && now >= stall) stallUntil = stall + GRACE_MAX_MS;
+      }
+      for (const at of [W, end, stall, stall + GRACE_MAX_MS]) if (at > now && at < validUntil) validUntil = at;
+    }
+  }
+  const settled = phase === 'settled' && D !== null;
+  const roll = D?.craps;
+  const dice = settled && roll?.dice ? roll.dice : null;
+  const view: ComputedCrapsState = {
+    kind: 'craps',
+    phase,
+    round,
+    point: settled ? roll?.pointAfter ?? null : point,
+    dice,
+    result: dice ? dice[0] + dice[1] : null,
+    resultAt: settled ? show : 0,
+    payouts: settled ? payoutsOf(D!) : null,
+    ...(settled && roll?.sevenOut ? { sevenOut: true } : {}),
+    ...(settled && D!.decided === 'void' ? { voided: true } : {}),
+    ...(deadline !== undefined ? { phaseDeadline: deadline } : {}),
+    ...(phase === 'betting' && holder !== undefined ? { shooter: holder } : shooter !== undefined ? { shooter } : {}),
+    inc: st.inc,
+    rollKey: D && roll?.dice && !held ? `${D.r}:${roll.dice[0]}${roll.dice[1]}` : '',
+    ...(holder !== undefined ? { holder } : {}),
+    shooterInPlay: inPlay,
+    ...(shooterSlip !== undefined ? { shooterSlip, shooterNoBet: shooterSlip === 'none' } : {}),
+    ...(stallUntil !== undefined ? { stallUntil } : {}),
+    showEnd,
+    ...(settled && roll ? {
+      amounts: amountsOf(roll.amounts),
+      pushes: [...roll.pushes].sort(),
+      ...(roll.sOut.h !== undefined ? { shooterAfter: roll.sOut.h } : {}),
+    } : {}),
+  };
+  const key = `${phase}|${round}|${deadline ?? ''}|${view.rollKey}|${view.shooter ?? ''}|${stallUntil ?? ''}`;
+  return { res, gen: clock.gen, builtAt: now, validUntil, view, key, firstKey: key, D, onChain, holding, ...(betEnd !== undefined ? { betEnd } : {}) };
+}
+
+function amountsOf(m: ReadonlyMap<string, bigint>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [pid, n] of m) out[pid] = clampSafe(n);
+  return out;
+}
+
+/**
+ * The state of computed craps table `t` on this page's clock, shaped as a
+ * CrapsTableState (ComputedCrapsState): null when t isn't a computed craps
+ * table or casinoDoc has counted nothing of it yet. Cached, as roulette's.
+ */
+export function readComputedCraps(t: string, now = Date.now()): ComputedCrapsState | null {
+  lookAtClock(now);
+  const at = tableOf(t, 'craps');
+  return at ? viewOf(at.st, at.res, now).view as ComputedCrapsState : null;
+}
+
+/** The felt pid's latest version on the open roll stands for while no close
+ *  is in: its own when its stamp matches and the table rules allow the
+ *  change, else the riding bets (computedCraps standingOf's rule). */
+function standingFelt(carry: CrapsCarry, pid: string, s: SlipInfo | undefined): CrapsBet[] {
+  const C = own(carry.w, pid);
+  const rec = s?.rec as CrapsSlipRec | undefined;
+  return rec && rec.o === basisOf(carry, pid) && changeOk(C, rec.b, carry.p === 0 ? null : carry.p) ? rec.b : C;
+}
+
+/**
+ * Each player's chips on computed craps table `t`'s felt for roll `round`
+ * as this page shows them: while betting, during the wait for the throw and
+ * while nobody has closed the roll, each player's standing felt (their
+ * latest version's if it was built on the table as it stands, else their
+ * riding bets) and every rider with no version at their riding bets; while
+ * a close holds the roll (the tip, or a forfeit's roll before its result),
+ * each player's felt as the roll plays it; while settled, what rides on.
+ * Empty for any other roll.
+ */
+export function readComputedCrapsBets(t: string, round: number, now = Date.now()): Record<string, CrapsBet[]> {
+  lookAtClock(now);
+  const at = tableOf(t, 'craps');
+  if (!at) return {};
+  const e = viewOf(at.st, at.res, now);
+  if (e.view.round !== round) return {};
+  if (!e.bets) {
+    const out: Record<string, CrapsBet[]> = {};
+    const carry = e.res.carry as CrapsCarry;
+    const roll = e.holding?.craps;
+    if (e.holding && roll) {
+      const sc = scanOf(at.st, e.res);
+      for (const [pid, fate] of roll.fates) {
+        const s = fate === 'ok' ? frozenSlip(sc, e.holding, pid) : null;
+        const B = s ? s.b as CrapsBet[] : own(roll.sIn.w, pid);
+        if (B.length > 0) out[pid] = B;
+      }
+    } else if (e.view.phase === 'settled') {
+      for (const pid of Object.keys(carry.w)) out[pid] = own(carry.w, pid);
+    } else {
+      for (const pid of new Set([...Object.keys(carry.w), ...e.res.felts.keys()])) {
+        const B = standingFelt(carry, pid, e.res.felts.get(pid));
+        if (B.length > 0) out[pid] = B;
+      }
+    }
+    e.bets = out;
+  }
+  return e.bets as Record<string, CrapsBet[]>;
+}
+
+/**
+ * Player `me`'s felt on computed craps table `t`'s roll `round`, and the
+ * stamp a change of it is built on (basisOf the table as this page has it):
+ * the felt this page holds back to write when it was built on that state
+ * and betting is open on the roll (a held felt never goes once betting
+ * ends, so it isn't shown then), else the felt readComputedCrapsBets shows.
+ * A write passes the stamp back (writeComputedCrapsSlip): a felt built
+ * before the roll before changed is refused, not written over the new one.
+ */
+export function readMyComputedCrapsBets(t: string, me: string, round: number, now = Date.now()): { felt: CrapsBet[]; basis: string } {
+  const bets = readComputedCrapsBets(t, round, now);
+  const st = tables.get(t);
+  const carry = (st?.lastRes?.carry as CrapsCarry | undefined) ?? EMPTY_CARRY;
+  const basis = basisOf(carry, me);
+  const p = st?.pending;
+  const v = st?.view?.view;
+  if (p && p.r === round && p.basis === basis && me === getPlayerId() && v?.phase === 'betting' && v.round === round) {
+    return { felt: p.felt as CrapsBet[], basis };
+  }
+  return { felt: bets[me] ?? [], basis };
 }
 
 /** What became of this page's player's slip in a decided round: frozen (it
@@ -1143,11 +1514,17 @@ export interface ComputedRoundCheck {
   /** 🚩 Bettors whose frozen slip a key other than their pinned one signed. */
   pinMismatch: string[];
   /** 🚩 Chips by which the checkpoint opening this session differs from what
-   *  this page had folded of those rounds (0: it agrees, or can't tell). */
+   *  this page had folded of those rounds (0: it agrees, or can't tell); at
+   *  craps its riding bets too, spot by spot, and one for a point or a
+   *  holder that differs. */
   checkpointDiff: number;
   /** 🚩 The last round this page saw decided and then replaced by a close
    *  that came after its seeds were out (noteReplaced); absent for none. */
   replaced?: number;
+  /** 🚩 At craps: players whose slip broke a table rule on the roll (its
+   *  changes didn't apply). A slip built on a table that changed under it,
+   *  or a newcomer at a full table, is no rule broken. */
+  illegal?: string[];
 }
 
 const replacedOf = (st: TableState): { replaced?: number } => (st.replaced !== null ? { replaced: st.replaced } : {});
@@ -1202,6 +1579,7 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     pinMismatch,
     checkpointDiff: diff,
     ...replacedOf(st),
+    ...(D.craps ? { illegal: [...D.craps.fates].filter(([, f]) => f === 'illegal').map(([pid]) => pid).sort() } : {}),
   };
   st.lastCheck = out;
   return out;
@@ -1256,14 +1634,35 @@ function holds(ses: Session, key: string, m: { rec: object; bytes: string }): bo
   return v === m.rec || (v !== undefined && canon(v) === m.bytes);
 }
 
+/** A craps slip's fields besides its felt: the stamp of the table it was
+ *  built on, the stand its page stands at (none: that page has no table
+ *  session there), and the goodbye mark. */
+interface CrapsExtra {
+  o: string;
+  t?: number;
+  l?: 1;
+}
+
+/** A craps slip's own fields, as a re-commit writes them again: only the
+ *  seed, the commitment and the version change. Nothing at roulette. */
+function extraOf(st: TableState, rec: AnySlipRec): CrapsExtra | undefined {
+  if (st.game !== 'craps') return undefined;
+  const c = rec as CrapsSlipRec;
+  return { o: c.o, t: c.t, l: c.l };
+}
+
 /** Write a version of this page's player's felt on round o: the commitment
  *  of their latest one when this page holds its seed and it isn't burned
  *  (unless `fresh`), else a new seed's; v one past every version of theirs
  *  the session holds (another tab's too, under the same key: the felt the
  *  fold counts is the highest checked one), and past every one this page
  *  wrote (a trim may have taken them out of the session: a version put back
- *  later must not read as newer than this one). */
-function writeSlip(st: TableState, res: FoldResult, o: number, felt: RouletteBet[], fresh: boolean, now: number): boolean {
+ *  later must not read as newer than this one). At craps with `extra`, the
+ *  slip's other fields, signed with the felt (a craps slip without them is
+ *  no slip: its key reads null, and nothing is written). */
+function writeSlip(
+  st: TableState, res: FoldResult, o: number, felt: RouletteBet[] | CrapsBet[], fresh: boolean, now: number, extra?: CrapsExtra,
+): boolean {
   const ses = computedSessionForWrite(st.t);
   if (!ses) return false;
   const me = getPlayerId();
@@ -1280,9 +1679,12 @@ function writeSlip(st: TableState, res: FoldResult, o: number, felt: RouletteBet
   // signed under this pid, or junk carrying this page's pub, can't push v
   // past the safe range and stop every write.
   let v = cur && cur.rec.r === o ? cur.rec.v : 0;
-  for (const m of st.mine.values()) if (m.kind === 's' && m.r === o && (m.rec as SlipRec).v > v) v = (m.rec as SlipRec).v;
-  const rec = signed(st.ctx, 'slip', { r: o, p: me, v: v + 1, b: felt, c, k: pub });
-  const key = slipKey(rec);
+  for (const m of st.mine.values()) if (m.kind === 's' && m.r === o && (m.rec as AnySlipRec).v > v) v = (m.rec as AnySlipRec).v;
+  const more = extra
+    ? { o: extra.o, ...(extra.t !== undefined ? { t: extra.t } : {}), ...(extra.l === 1 ? { l: 1 as const } : {}) }
+    : {};
+  const rec = signed(st.ctx, 'slip', { r: o, p: me, v: v + 1, b: felt, ...more, c, k: pub });
+  const key = st.keyOf(rec);
   if (!key || !put(st, key, rec, o, true)) return false;
   st.lastSlip = { r: o, at: now };
   return true;
@@ -1296,7 +1698,8 @@ function slipDue(st: TableState, o: number, deadline: number | undefined, now: n
     || (deadline !== undefined && now >= deadline - FLUSH_BEFORE_MS);
 }
 
-const sameFelt = (a: readonly RouletteBet[], b: readonly RouletteBet[]): boolean => canon(a) === canon(b);
+/** The same felt, of either game (a craps felt is canonical, one spelling). */
+const sameFelt = (a: readonly (RouletteBet | CrapsBet)[], b: readonly (RouletteBet | CrapsBet)[]): boolean => canon(a) === canon(b);
 
 /** A roulette slip's felt: the fold reads a roulette incarnation's slips
  *  with asSlip, so every felt these roulette paths see is a roulette one. */
@@ -1328,7 +1731,10 @@ function refusal(res: FoldResult, me: string, felt: readonly RouletteBet[], hold
   return stake - Number(res.held.get(me) ?? 0n) > readChips(me) ? 'chips' : null;
 }
 
-export type ComputedSlipWrite = 'ok' | 'reconnecting' | 'closed' | 'full' | 'chips';
+/** …and at craps, a change the table rules don't allow now ('rules'), or
+ *  one built before the roll before changed ('changed': the felt it was
+ *  built on is gone, so nothing of it is written). */
+export type ComputedSlipWrite = 'ok' | 'reconnecting' | 'closed' | 'full' | 'chips' | 'rules' | 'changed';
 
 /**
  * Put this page's player's whole felt down on computed table `t`'s open
@@ -1344,8 +1750,9 @@ export type ComputedSlipWrite = 'ok' | 'reconnecting' | 'closed' | 'full' | 'chi
 export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now = Date.now()): ComputedSlipWrite {
   lookAtClock(now);
   if (!tablesAwake(now) || !casinoWhole(t) || !computedSettled(t)) return 'reconnecting';
-  // (Not a computed table, or nothing counted of it yet: nothing to write to.)
-  const at = tableOf(t);
+  // (Not a computed roulette table, or nothing counted of it yet: nothing
+  // to write to.)
+  const at = tableOf(t, 'roulette');
   if (!at) return 'reconnecting';
   const { st, res } = at;
   const e = viewOf(st, res, now);
@@ -1370,31 +1777,116 @@ export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now =
   return 'ok';
 }
 
-// ── 🧹 Duties ─────────────────────────────────────────────────────────────────
+/** A list of chips (a bet a chip, as the felt draws them) as the canonical
+ *  felt a craps slip carries: summed per spot, sorted. Throws on anything a
+ *  slip can't carry. */
+function cleanCrapsFelt(perChip: readonly CrapsBet[]): CrapsBet[] {
+  if (!Array.isArray(perChip) || perChip.length > MAX_BETS_PER_PLAYER) throw new TypeError('writeComputedCrapsSlip: not a felt');
+  for (const b of perChip) if (!isCrapsBet(b)) throw new TypeError('writeComputedCrapsSlip: not a craps bet');
+  const felt = canonFelt(perChip);
+  if (!isCanonFelt(felt)) throw new TypeError('writeComputedCrapsSlip: more than a slip can carry');
+  return felt;
+}
+
+/** Why craps felt `felt` may not go down for this page's player now, or
+ *  null: chips from a newcomer (no riding bets, and no felt with chips on
+ *  the roll yet) when the table has no place left as the fold counts it —
+ *  every rider at the start of the roll, gone ones and ones who took
+ *  everything down since included, and every other newcomer with chips on
+ *  it ('full'); or more chips than they have past what the felt holds now
+ *  ('chips': readChips already takes that hold off). */
+function crapsRefusal(res: FoldResult, me: string, felt: readonly CrapsBet[]): 'full' | 'chips' | null {
+  const carry = res.carry as CrapsCarry;
+  const stake = feltSum(felt);
+  const cur = res.felts.get(me);
+  if (stake > 0 && own(carry.w, me).length === 0 && !(cur && cur.rec.b.length > 0)) {
+    let n = Object.keys(carry.w).length;
+    for (const [pid, s] of res.felts) if (pid !== me && own(carry.w, pid).length === 0 && s.rec.b.length > 0) n += 1;
+    if (n >= MAX_RIDERS) return 'full';
+  }
+  return stake - Number(res.held.get(me) ?? 0n) > readChips(me) ? 'chips' : null;
+}
+
+/** Whether `cur` (this page's player's latest version on the roll) already
+ *  says `felt`, built on `basis`, at `stand`: nothing to write. */
+function crapsSlipStands(cur: SlipInfo | undefined, felt: readonly CrapsBet[], basis: string, stand: number | undefined): boolean {
+  const rec = cur?.rec as CrapsSlipRec | undefined;
+  return rec !== undefined && rec.o === basis && rec.l !== 1 && rec.t === stand && sameFelt(rec.b, felt);
+}
 
 /**
- * Move computed tables `tableIds` along from this page (world.ts calls it
- * every frame with the room's roulette tables; each table runs at most every
+ * Put this page's player's whole felt down on computed craps table `t`'s
+ * open roll, as a list of chips (canonicalised here), built on `basis`
+ * (readMyComputedCrapsBets: the table as this page had it when the change
+ * was made). 'changed' when the roll before changed since (a late seed, a
+ * rewritten roll: the felt it was built on is gone); 'rules' for a change
+ * the table rules don't allow now (a contract bet taken down, a line bet
+ * with a point on); else as writeComputedSlip, the stand this page's table
+ * session stands at signed in with it (none off the table).
+ */
+export function writeComputedCrapsSlip(t: string, perChip: readonly CrapsBet[], basis: string, now = Date.now()): ComputedSlipWrite {
+  lookAtClock(now);
+  if (!tablesAwake(now) || !casinoWhole(t) || !computedSettled(t)) return 'reconnecting';
+  const at = tableOf(t, 'craps');
+  if (!at) return 'reconnecting';
+  const { st, res } = at;
+  const e = viewOf(st, res, now);
+  // (A page that said goodbye writes nothing more: leaveComputedTables.)
+  if (e.view.phase !== 'betting' || st.left) return 'closed';
+  const o = e.view.round;
+  const clean = cleanCrapsFelt(perChip);
+  const me = getPlayerId();
+  const carry = res.carry as CrapsCarry;
+  if (basis !== basisOf(carry, me)) return 'changed';
+  if (!changeOk(own(carry.w, me), clean, carry.p === 0 ? null : carry.p)) return 'rules';
+  if (!computedSessionForWrite(t)) return 'reconnecting';
+  const refused = crapsRefusal(res, me, clean);
+  if (refused) return refused;
+  if (!slipDue(st, o, e.view.phaseDeadline, now)) {
+    st.pending = { r: o, felt: clean, basis };
+    return 'ok';
+  }
+  st.pending = null;
+  const stand = localStandOf(t, me);
+  if (!crapsSlipStands(res.felts.get(me), clean, basis, stand) && !writeSlip(st, res, o, clean, false, now, { o: basis, t: stand })) {
+    return 'reconnecting';
+  }
+  return 'ok';
+}
+
+// ── 🧹 Duties ─────────────────────────────────────────────────────────────────
+
+/** A table World passes the computed duties: its id and its game (a bare id
+ *  is a roulette table's, as World passed them before craps). */
+export type ComputedTableRef = string | { id: string; game: GameName };
+
+/**
+ * Move computed tables `tables` along from this page (world.ts calls it
+ * every frame with the room's tables; each table runs at most every
  * TICK_MS): a switch a peer took away put back first (every frame), then its
  * reveals as soon as the room's state is in, then, on a whole doc, awake and
- * with every signature checked, the held felt, a burned commitment renewed,
- * the close, an ask for a seed still missing, a forfeit, an answer to a
- * forfeit, an abandon, the re-put and the trim, each in its turn; the end of
- * a computed table no longer among them (awayDuty: `tableIds` are all the
- * room's roulette tables, as World passes them); and the compaction of any
- * ended incarnation, of these tables or not. A phase this page's clock alone
- * moved on tells the table's listeners once.
+ * with every signature checked, the held felt, the riding bets (at craps),
+ * a burned commitment renewed, the close, an ask for a seed still missing, a
+ * forfeit, an answer to a forfeit, an abandon, the re-put and the trim, each
+ * in its turn; the end of a computed table no longer among them, or whose
+ * incarnation's name says another game than the table's (awayDuty:
+ * `tables` are all the room's tables of the games World passes, with their
+ * games); and the compaction of any ended incarnation, of these tables or
+ * not. A phase this page's clock alone moved on tells the table's listeners
+ * once.
  */
-export function tickComputedTables(tableIds: Iterable<string>, now = Date.now()): void {
+export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Date.now()): void {
   lookAtClock(now);
   // (The hearing's read too: a clock gone back is a deaf spell, seen though
   // no duty asks before the clock comes round again.)
   noteClockRead(now);
-  const inRoom = new Set<string>();
-  for (const t of tableIds) {
-    inRoom.add(t);
+  const inRoom = new Map<string, GameName>();
+  for (const ref of tables) {
+    const t = typeof ref === 'string' ? ref : ref.id;
+    const game = typeof ref === 'string' ? 'roulette' : ref.game;
+    inRoom.set(t, game);
     putSwitchBack(t, now);
-    const at = tableOf(t);
+    const at = tableOf(t, game);
     if (!at) continue;
     const { st } = at;
     if (st.tickedAt !== null && now >= st.tickedAt && now - st.tickedAt < TICK_MS) continue;
@@ -1410,7 +1902,9 @@ export function tickComputedTables(tableIds: Iterable<string>, now = Date.now())
 
 /**
  * 🚪 End a computed table that is out of the room's tables (`inRoom`) while
- * its switch is still on, as its removal would have ended it (casinoDoc
+ * its switch is still on, or whose incarnation's name says another game
+ * than the table it is under (no duty runs on it: tableOf), as its removal
+ * would have ended it (casinoDoc
  * writeComputedGone: its `gone:` mark, its switch deleted), once this page
  * has seen it so for AWAY_MS, awake, its room's state in, its doc whole and
  * checked all the while (a wake, a frame that isn't, or the table back in
@@ -1429,13 +1923,13 @@ export function tickComputedTables(tableIds: Iterable<string>, now = Date.now())
  * page writes the same few keys, and only until one of them lands. Not on a
  * frame whose doc was bound afresh since this page looked at its clock.
  */
-function awayDuty(inRoom: ReadonlySet<string>, now: number): void {
+function awayDuty(inRoom: ReadonlyMap<string, GameName>, now: number): void {
   if (casinoDocEpoch() !== clock.epoch) return;
   away.clear();
   const watching = new Set<string>();
   const ready = tablesAwake(now);
   for (const { t, inc } of computedLiveTables()) {
-    if (inRoom.has(t)) continue;
+    if (inRoom.get(t) === gameOfInc(inc)) continue;
     const key = `${t}:${inc}`;
     away.add(key);
     if (!ready || !casinoWhole(t) || !computedSettled(t)) continue;
@@ -1485,6 +1979,7 @@ function tickTable(st: TableState, now: number): void {
   noteChain(st, now);
   noteWitness(st, me, now);
   flushDuty(st, me, now);
+  rideDuty(st, me, now);
   recommitDuty(st, me, now);
   noteSeedOut(st, now);
   closeDuty(st, me, pub, now);
@@ -1622,7 +2117,9 @@ function wakeHolds(st: TableState, round: RoundView, me: string, now: number): b
   if (raw === undefined) return false;
   const old = now - raw >= ABANDON_MS - TABLE_CLOCK_SLACK_MS;
   if (old && !tablesAwake(now)) return true;
-  if (raw >= clock.wakeAt || !round.present.some((pid) => pid !== me)) return false;
+  // (At craps a rider's riding bets are in the roll, slip or none.)
+  const riders = round.craps ? Object.keys(round.craps.sIn.w) : [];
+  if (raw >= clock.wakeAt || (!round.present.some((pid) => pid !== me) && !riders.some((pid) => pid !== me))) return false;
   return !heardThrough(old ? now - TABLE_LEASE_LAPSE_MS : now, now);
 }
 
@@ -1633,13 +2130,35 @@ function bettingOn(st: TableState, res: FoldResult, now: number): ViewEntry | nu
   return !res.tip && e.view.phase === 'betting' && e.view.round === res.open ? e : null;
 }
 
+/**
+ * At craps: W, the end of betting on the open roll, while its window has
+ * started and no close of it is in, whatever the view's phase (betting, the
+ * wait for the throw, or closing after it); else null. The close, the
+ * re-commit and the burned re-put run under it: past W they are the roll's
+ * only way to close (a close deleted after its seeds went out closes afresh
+ * on fresh seeds then too). W is the view's own (betEnd), so after a re-show
+ * of the roll before the turns move with the screen; during the re-show the
+ * view shows that roll, and the gate is shut.
+ */
+function crapsDutyOn(st: TableState, res: FoldResult, now: number): number | null {
+  if (res.tip) return null;
+  const e = viewOf(st, res, now);
+  return e.view.round === res.open && st.window?.r === res.open && e.betEnd !== undefined ? e.betEnd : null;
+}
+
+/** Whether the re-commit's and the burned re-put's gate is open: betting at
+ *  roulette, crapsDutyOn at craps. */
+function recommitOn(st: TableState, res: FoldResult, now: number): boolean {
+  return st.game === 'craps' ? crapsDutyOn(st, res, now) !== null : bettingOn(st, res, now) !== null;
+}
+
 /** 1. Write the felt the coalescing held back, once COALESCE_MS have passed
  *  since the last, or in the window's last second; one for a round that has
  *  moved on is dropped, as is one the chip check now refuses. */
 function flushDuty(st: TableState, me: string, now: number): void {
   const p = st.pending;
   const res = resultOf(st);
-  if (!p || !res) return;
+  if (!p || !res || st.left) return;
   if (res.tip || res.open !== p.r) {
     st.pending = null;
     // (The close came first, and froze the felt before it: too late.)
@@ -1653,13 +2172,95 @@ function flushDuty(st: TableState, me: string, now: number): void {
     }
     return;
   }
+  if (st.game === 'craps' && p.basis !== basisOf(res.carry as CrapsCarry, me)) {
+    // (The roll before changed under it: a late seed, a rewritten roll. It
+    // never went in, and built on the old table it would play as nothing.)
+    st.pending = null;
+    st.undone += 1;
+    notifyCasinoView(st.t);
+    return;
+  }
   const e = bettingOn(st, res, now);
   if (!e || !slipDue(st, p.r, e.view.phaseDeadline, now)) return;
   st.pending = null;
   const cur = res.felts.get(me);
-  if (sameFelt(cur ? rouletteFelt(cur.rec) : [], p.felt)) return;
-  if (refusal(res, me, p.felt, (cur?.rec.b.length ?? 0) > 0) !== null) return;
-  writeSlip(st, res, p.r, p.felt, false, now);
+  if (st.game === 'craps') {
+    // The stand as it is now: a felt held back goes with it (a shooter's
+    // last chips, flushed in the window's last second, count them there).
+    const felt = p.felt as CrapsBet[];
+    const stand = localStandOf(st.t, me);
+    if (crapsSlipStands(cur, felt, p.basis!, stand) || crapsRefusal(res, me, felt) !== null) return;
+    writeSlip(st, res, p.r, felt, false, now, { o: p.basis!, t: stand });
+    return;
+  }
+  const felt = p.felt as RouletteBet[];
+  if (sameFelt(cur ? rouletteFelt(cur.rec) : [], felt)) return;
+  if (refusal(res, me, felt, (cur?.rec.b.length ?? 0) > 0) !== null) return;
+  writeSlip(st, res, p.r, felt, false, now);
+}
+
+/**
+ * 1b. At craps: keep this page's player's felt on the open roll true to the
+ * table, while no close is in. Only from a page at the table (its table
+ * session stands at a stand), or for a roll someone else plays (another
+ * player's latest version has chips and isn't a goodbye): a rider off the
+ * table joins only those. Never once this page has said goodbye.
+ * - A goodbye of this player's, whoever wrote it, goes at once, whatever the
+ *   view shows (the show, betting, the wait, closing after it): this page
+ *   is here, so it no longer holds. Written again as its own felt when its
+ *   stamp is current (its take-downs stand), else the riding bets, with this
+ *   page's stand. No chip moves: either is already set aside.
+ * - While betting: a rider with no version on the roll puts their riding
+ *   bets down (the ride slip), so their seed counts and their stand with it;
+ *   a version built on a table that has since changed goes again as the
+ *   riding bets, under the current stamp.
+ * - While betting or past it (crapsDutyOn): a version without this page's
+ *   stand goes again with it, felt and stamp unchanged (held back with the
+ *   coalescing while betting; at once after), so a shooter back at their
+ *   stand during the wait is counted there. A page with no stand never takes
+ *   one off.
+ * A version this page didn't write (its player's other tab did) waits
+ * GRACE_MAX_MS from when this page first saw it before it is written over,
+ * so two tabs don't take turns rewriting each other's.
+ */
+function rideDuty(st: TableState, me: string, now: number): void {
+  if (st.game !== 'craps' || st.left) return;
+  const res = resultOf(st);
+  if (!res || res.tip) return;
+  const o = res.open;
+  const stand = localStandOf(st.t, me);
+  const others = [...res.felts.values()].some((s) => s.rec.p !== me && s.rec.b.length > 0 && (s.rec as CrapsSlipRec).l !== 1);
+  if (stand === undefined && !others) return;
+  const carry = res.carry as CrapsCarry;
+  const C = own(carry.w, me);
+  const basis = basisOf(carry, me);
+  const latest = res.felts.get(me);
+  const rec = latest?.rec as CrapsSlipRec | undefined;
+  const ours = (s: SlipInfo): boolean => st.mine.has(s.key) || now >= seen(st, s.key, now) + GRACE_MAX_MS;
+  if (rec && rec.l === 1) {
+    writeSlip(st, res, o, rec.o === basis ? rec.b : C, false, now, { o: basis, t: stand });
+    return;
+  }
+  const e = bettingOn(st, res, now);
+  if (e) {
+    if (!rec) {
+      if (C.length > 0) writeSlip(st, res, o, C, false, now, { o: basis, t: stand });
+      return;
+    }
+    if (rec.o !== basis) {
+      if (ours(latest!)) writeSlip(st, res, o, C, false, now, { o: basis, t: stand });
+      return;
+    }
+  }
+  if (stand === undefined || !rec || rec.t === stand || (!e && crapsDutyOn(st, res, now) === null)) return;
+  // (A held change goes with the stand: flushDuty.)
+  if (st.pending && st.pending.r === o) return;
+  if (!ours(latest!)) return;
+  if (e && !slipDue(st, o, e.view.phaseDeadline, now)) {
+    st.pending = { r: o, felt: rec.b, basis: rec.o };
+    return;
+  }
+  writeSlip(st, res, o, rec.b, false, now, { o: rec.o, t: stand });
 }
 
 /** 2. A felt of this page's player on the open round whose commitment is out
@@ -1673,10 +2274,18 @@ function flushDuty(st: TableState, me: string, now: number): void {
  *  session it was copied into. */
 function recommitDuty(st: TableState, me: string, now: number): void {
   const res = resultOf(st);
-  if (!res || res.open <= playedTo(st, res) || !bettingOn(st, res, now)) return;
+  if (!res || st.left || res.open <= playedTo(st, res) || !recommitOn(st, res, now)) return;
   const cur = res.felts.get(me);
-  if (!cur || cur.rec.b.length === 0 || !burnedCommit(st, res, cur.rec.c)) return;
-  writeSlip(st, res, res.open, rouletteFelt(cur.rec), true, now);
+  if (!cur || !feltCounts(st, res, cur) || !burnedCommit(st, res, cur.rec.c)) return;
+  // (At craps with its own stamp, stand and goodbye mark: a felt built on an
+  // older table stays one, and plays as the riding bets.)
+  writeSlip(st, res, res.open, cur.rec.b as RouletteBet[] | CrapsBet[], true, now, extraOf(st, cur.rec));
+}
+
+/** Whether a felt of the open round is anything to freeze: chips on it, or
+ *  at craps an empty one over riding bets (everything taken down). */
+function feltCounts(st: TableState, res: FoldResult, s: SlipInfo): boolean {
+  return s.rec.b.length > 0 || (st.game === 'craps' && own((res.carry as CrapsCarry).w, s.rec.p).length > 0);
 }
 
 /** When this page first saw the open round's close stand down for a seed
@@ -1714,11 +2323,20 @@ function noteSeedOut(st: TableState, now: number): void {
  * commitment, at most MAX_FROZEN, its own always, the rest earliest seen
  * first. Its turn moves back for a felt of its own that changed late, or
  * that its player's other tab wrote (closeDue).
+ *
+ * At craps it runs whenever the roll's window has started and no close is
+ * in (crapsDutyOn), W the end of betting; its turns while the roll waits
+ * for the throw are crapsCloseDue's. It also freezes an empty felt over
+ * riding bets (a rider who took everything down), but no goodbye that only
+ * rides, nor one built on a table that has since changed: either plays as
+ * the riding bets anyway, and its page, gone, would never send its seed.
  */
 function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
-  const e = res && bettingOn(st, res, now);
-  if (!res || !e || e.view.phaseDeadline === undefined) return;
+  if (!res) return;
+  const craps = st.game === 'craps';
+  const deadline = craps ? crapsDutyOn(st, res, now) ?? undefined : bettingOn(st, res, now)?.view.phaseDeadline;
+  if (deadline === undefined) return;
   const o = res.open;
   const own = res.felts.get(me);
   if (!own || own.rec.b.length === 0 || burnedCommit(st, res, own.rec.c)) return;
@@ -1728,10 +2346,12 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const staked = [...res.felts.values()].filter((s) => s.rec.b.length > 0);
   const pubs = staked.map((s) => s.rec.k);
   const idx = placeOf('close', st.ctx, o, pubs, pub);
-  if (now < closeDue(st, own, e.view.phaseDeadline, idx, new Set(pubs).size, now)) return;
+  const n = new Set(pubs).size;
+  const due = craps ? crapsCloseDue(st, res, own, pubs, deadline, idx, n, me, pub, now) : closeDue(st, own, deadline, idx, n, now);
+  if (now < due) return;
   // (Seen just now, as this tick noted it: noteSeedOut.)
   if (seedOut(st, sc, o) && now < (st.seedOutAt?.at ?? now) + ABANDON_MS + idx * STAGGER_MS) return;
-  const others = staked
+  const others = (craps ? [...res.felts.values()].filter((s) => crapsFreezable(res.carry as CrapsCarry, s)) : staked)
     .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c))
     .map((s) => ({ s, at: seen(st, s.key, now) }))
     .sort((a, b) => a.at - b.at || (a.s.rec.p < b.s.rec.p ? -1 : 1));
@@ -1770,6 +2390,54 @@ function closeDue(st: TableState, own: { key: string }, deadline: number, idx: n
   if (mine && changed <= turn - STAGGER_MS) return turn;
   const after = Math.max(deadline + (n + idx) * STAGGER_MS, changed + STAGGER_MS);
   return mine ? after : after + GRACE_MAX_MS;
+}
+
+/** Whether a close at craps freezes `s`, another player's latest version on
+ *  the open roll: chips on it, or an empty one over riding bets; not a
+ *  goodbye built on a table that has since changed, nor one that only
+ *  rides (its felt is its riding bets), as either plays as them anyway. */
+function crapsFreezable(carry: CrapsCarry, s: SlipInfo): boolean {
+  const rec = s.rec as CrapsSlipRec;
+  const C = own(carry.w, rec.p);
+  if (rec.b.length === 0 && C.length === 0) return false;
+  return !(rec.l === 1 && (rec.o !== basisOf(carry, rec.p) || sameFelt(rec.b, C)));
+}
+
+/**
+ * When this page's close of the open craps roll falls due (`W` the end of
+ * betting, `idx` this page's place among the `pubs` with chips on the roll,
+ * `n` of them). With nobody in play to throw it, closeDue's rule from W.
+ * While the roll waits for the holder's throw (they were counted at their
+ * stand on the last roll), up to D = W + CRAPS_SHOOTER_MS:
+ * - the holder's own page closes at its own fling (noteComputedFling, never
+ *   the throw record), or at D with none; and no sooner than STAGGER_MS
+ *   after its own felt last changed, so a close never freezes a felt the
+ *   others haven't heard. A change it first saw within STAGGER_MS of D, or
+ *   after D, gives its turn away to every other page's (they close first,
+ *   from what they heard): a late stand rewrite can't race them. A felt its
+ *   player's other tab wrote, GRACE_MAX_MS later, as closeDue.
+ * - every other page closes only once the wait is over: from D, one turn
+ *   after the holder's, in its place among the other pubs, with closeDue's
+ *   rules for a felt of its own that changed late or isn't its own.
+ */
+function crapsCloseDue(
+  st: TableState, res: FoldResult, own: SlipInfo, pubs: string[], W: number, idx: number, n: number, me: string, pub: string, now: number,
+): number {
+  const carry = res.carry as CrapsCarry;
+  if (carry.h === undefined || carry.i !== 1) return closeDue(st, own, W, idx, n, now);
+  const D = W + CRAPS_SHOOTER_MS;
+  if (me === carry.h) {
+    const T = st.flung && st.flung.r === res.open ? Math.max(W, st.flung.at) : D;
+    const changed = seen(st, own.key, now);
+    const turn = changed <= D - STAGGER_MS
+      ? Math.max(T, changed + STAGGER_MS)
+      : Math.max(D + n * STAGGER_MS, changed + STAGGER_MS);
+    return st.mine.has(own.key) ? turn : turn + GRACE_MAX_MS;
+  }
+  const hl = res.felts.get(carry.h);
+  const holderPub = hl && hl.rec.b.length > 0 ? hl.rec.k : null;
+  const after = placeOf('close', st.ctx, res.open, pubs.filter((k) => k !== holderPub), pub);
+  return closeDue(st, own, D, 1 + after, n, now);
 }
 
 /**
@@ -1955,7 +2623,7 @@ function reputDuty(st: TableState, me: string, now: number): void {
   const latest = new Map<number, { v: number; key: string }>();
   for (const [key, m] of st.mine) {
     if (m.kind !== 's') continue;
-    const v = (m.rec as SlipRec).v;
+    const v = (m.rec as AnySlipRec).v;
     const best = latest.get(m.r);
     if (!best || v > best.v || (v === best.v && key > best.key)) latest.set(m.r, { v, key });
   }
@@ -1967,9 +2635,13 @@ function reputDuty(st: TableState, me: string, now: number): void {
     if (holds(ses, key, m)) continue;
     if (m.kind === 's' && !frozen.has(key)) {
       if (latest.get(m.r)?.key !== key) continue;
-      const slip = m.rec as SlipRec;
+      const slip = m.rec as AnySlipRec;
       if (burnedCommit(st, res, slip.c)) {
-        if (m.r === res.open && m.r > playedTo(st, res) && bettingOn(st, res, now)) writeSlip(st, res, m.r, slip.b, true, now);
+        // (At craps, as the re-commit: its own stamp, stand and mark; never
+        // once this page has said goodbye.)
+        if (m.r === res.open && m.r > playedTo(st, res) && !st.left && recommitOn(st, res, now)) {
+          writeSlip(st, res, m.r, slip.b as RouletteBet[] | CrapsBet[], true, now, extraOf(st, slip));
+        }
         continue;
       }
     }
@@ -2006,7 +2678,6 @@ function keepCopy(w: Witnessed, ses: Session, key: string, rec: (v: unknown) => 
 }
 
 const closeOf = (v: unknown): string | null => { const c = asClose(v); return c && closeKey(c); };
-const slipOf = (v: unknown): string | null => { const s = asSlip(v); return s && slipKey(s); };
 const forfeitOf = (v: unknown): string | null => { const f = asForfeit(v); return f && forfeitKey(f); };
 const abandonOf = (v: unknown): string | null => { const z = asAbandon(v); return z && abandonKey(z); };
 
@@ -2054,7 +2725,7 @@ function noteWitness(st: TableState, me: string, now: number): void {
     let whole = true;
     for (const pid of round.present) {
       const key = `s:${round.r}:${pid}:${round.frozen[pid]}`;
-      if (keepCopy(w, ses, key, slipOf)) w.pubs.add((w.copies.get(key)!.v as SlipRec).k);
+      if (keepCopy(w, ses, key, st.keyOf)) w.pubs.add((w.copies.get(key)!.v as AnySlipRec).k);
       else whole = false;
     }
     if (shown) {
@@ -2062,7 +2733,7 @@ function noteWitness(st: TableState, me: string, now: number): void {
       for (const pid of round.revealed) {
         const keys = sc.reveals.get(round.r)?.get(pid) ?? [];
         if (keys.some((key) => w!.copies.has(key))) continue;
-        const slip = w.copies.get(`s:${round.r}:${pid}:${round.frozen[pid]}`)?.v as SlipRec | undefined;
+        const slip = w.copies.get(`s:${round.r}:${pid}:${round.frozen[pid]}`)?.v as AnySlipRec | undefined;
         const key = slip && keys.find((k) => {
           const x = asReveal(ses.get(k));
           return x !== null && revealKey(x) === k && slipCommit(st.ctx, x.r, x.p, x.s) === slip.c;
@@ -2251,9 +2922,13 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   const show = showStart(st, sc, D, true, now);
   const last = lastSeenOf(st, sc, now) ?? now;
   const heard = heardThrough(now - IDLE_MS, now);
+  // (At craps a seven-out too, once the hand has run long: every bet on it
+  // resolved, so its checkpoint is small, and no late change reaches back
+  // past the hand.)
   const pressed = D.r - res.base.u >= TRIM_ROUNDS
     || res.rawBytes >= TRIM_BYTES
     || (res.rawBytes >= ROOM_MIN_BYTES && computedRoomBytes() >= ROOM_BYTES)
+    || (D.craps?.sevenOut === true && D.r - res.base.u >= TRIM_SEVEN_OUT_MIN)
     || (now - last >= IDLE_MS && heard);
   if (!pressed) return;
   const pubs = frozenPubs(sc, D);
@@ -2266,7 +2941,11 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   }
   const n = netsOf(res);
   if (Object.keys(n).length > MAX_CHECKPOINT_PIDS) return;
-  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u: D.r, l: D.close, n, k: pub });
+  // (At craps with the table's state after D: the point, every bet riding,
+  // the dice's holder. The open felts' stamps were made from it, so they
+  // stay current in the next session.)
+  const carried = st.game === 'craps' ? { s: res.carry as CrapsCarry } : {};
+  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u: D.r, l: D.close, n, ...carried, k: pub });
   const copies: [string, unknown][] = [];
   for (const s of res.felts.values()) if (!burnedCommit(st, res, s.rec.c)) copies.push([s.key, sc.ses?.get(s.key)]);
   // Refused if the checkpoint moved on meanwhile (another page's trim). What
@@ -2307,10 +2986,12 @@ function sessionPubs(e: EndedComputed): Set<string> {
   if (out) return out;
   out = new Set<string>();
   for (const s of e.res.felts.values()) out.add(s.rec.k);
+  const read = asSlipFor(e);
+  const keyOf = slipKeyFor(e);
   for (const key of e.session?.keys() ?? []) {
     if (parseKey(key)?.kind !== 's') continue;
-    const s = asSlip(e.session!.get(key));
-    if (s && !out.has(s.k) && checkedSlip(e.t, e.inc, key, s)) out.add(s.k);
+    const s = read(e.session!.get(key));
+    if (s && !out.has(s.k) && checkedSlip(e.t, e.inc, key, s, keyOf)) out.add(s.k);
   }
   sessionPubsOf.set(e.res, out);
   return out;
@@ -2424,8 +3105,12 @@ export function computedTablesEnabled(): boolean {
 /** Why the house's switch can't go now: this page asleep or waiting out a
  *  wake ('asleep'), its doc holding part of an update or signatures to check
  *  ('reconnecting'), a round under way ('busy'), an earlier build driving
- *  the room's tables ('old-build'), or not a roulette table ('craps'). */
-export type ComputedSwitchRefusal = 'asleep' | 'reconnecting' | 'busy' | 'old-build' | 'craps';
+ *  the room's tables ('old-build'), the table's records another game's
+ *  ('craps': the other game's state up under its id, or a computed name for
+ *  the other game), or at craps contract bets on the felt ('contract': a
+ *  point on or a come bet on a number, before a switch-on; riding, before a
+ *  switch-off, which a second press makes anyway). */
+export type ComputedSwitchRefusal = 'asleep' | 'reconnecting' | 'busy' | 'old-build' | 'craps' | 'contract';
 export type ComputedSwitchResult = 'ok' | ComputedSwitchRefusal;
 
 const SWITCH_RECONNECTING = 'RECONNECTING — TRY AGAIN IN A MOMENT';
@@ -2437,17 +3122,33 @@ export const SWITCH_ON_REFUSED: Readonly<Record<ComputedSwitchRefusal, string>> 
   busy: 'FINISH THIS ROUND FIRST',
   'old-build': "AN OLDER VERSION OF THE GAME RUNS THIS ROOM'S TABLES — UPDATE IT FIRST",
   craps: 'ONLY A ROULETTE TABLE CAN RUN WITHOUT THE OWNER',
+  contract: 'WAIT FOR A COME-OUT WITH NO COME BETS ON A NUMBER',
 };
 
 /** …and of a refused switch-off (a round under way: its spin first). */
 export const SWITCH_OFF_REFUSED: Readonly<Record<ComputedSwitchRefusal, string>> = {
   ...SWITCH_ON_REFUSED,
   busy: 'WAIT FOR THE SPIN TO FINISH',
+  contract: 'PASS LINE AND COME BETS STILL RIDE — PRESS AGAIN TO HAND THEM BACK AND SWITCH',
+};
+
+/** …at a craps table: a roll, not a round or a spin. */
+export const CRAPS_SWITCH_ON_REFUSED: Readonly<Record<ComputedSwitchRefusal, string>> = {
+  ...SWITCH_ON_REFUSED,
+  busy: 'FINISH THIS ROLL FIRST',
+  craps: "THIS TABLE'S RECORDS ARE ANOTHER GAME'S",
+};
+export const CRAPS_SWITCH_OFF_REFUSED: Readonly<Record<ComputedSwitchRefusal, string>> = {
+  ...SWITCH_OFF_REFUSED,
+  busy: 'WAIT FOR THE ROLL TO FINISH',
+  craps: "THIS TABLE'S RECORDS ARE ANOTHER GAME'S",
 };
 
 /** What the ⚙ card says before a switch-on: the room's default is Fair, and
  *  a computed table isn't. */
 export const SWITCH_ON_CONFIRM = 'THIS TABLE WILL RUN FRIENDLY: SEEDS FROM THE PLAYERS ONLY';
+/** …and at craps beside it: the switch takes every bet down. */
+export const CRAPS_SWITCH_ON_CONFIRM = 'BETS ON THE FELT GO BACK TO THEIR PLAYERS';
 
 /** Whether this page may switch anything now: awake, its doc whole, every
  *  computed table's signatures checked (as a spend waits: computedSettled). */
@@ -2457,17 +3158,42 @@ function switchGate(t: string, now: number): ComputedSwitchRefusal | null {
   return null;
 }
 
-/** Why owner-run table t can't be switched on now, or null. Quiet: no round
- *  up, or one settled, or one betting with no list on it (a SPIN pressed is
- *  a closing round: never quiet). */
-function onRefusal(t: string, game: 'craps' | 'roulette', now: number): ComputedSwitchRefusal | null {
-  if (game !== 'roulette' || readCrapsTableState(t) !== null) return 'craps';
+/** Why owner-run table t can't be switched on now, or null. Quiet at
+ *  roulette: no round up, or one settled, or one betting with no list on it
+ *  (a SPIN pressed is a closing round: never quiet). At craps: no roll up,
+ *  or one betting or settled on a come-out ('busy' for a roll closing, its
+ *  settle in flight; 'contract' for a point on), with no come bet on a
+ *  number on any felt; the bets on it go back. Not where the table's records
+ *  are the other game's, nor while a build older than the game's least
+ *  drives the room's tables. */
+function onRefusal(t: string, game: GameName, now: number): ComputedSwitchRefusal | null {
+  if (game === 'roulette' ? readCrapsTableState(t) !== null : readTableState(t) !== null) return 'craps';
+  const inc = computedIncOf(t);
+  if (inc !== null && isComputedTable(t) && gameOfInc(inc) !== game) return 'craps';
   const gate = switchGate(t, now);
   if (gate) return gate;
-  if (leaseIsOldBuild(now)) return 'old-build';
+  if (leaseIsOldBuild(now, COMPUTED_MIN_BUILD[game])) return 'old-build';
+  if (game === 'craps') {
+    const c = readCrapsTableState(t);
+    if (c?.phase === 'closing') return 'busy';
+    if (c && c.point !== null) return 'contract';
+    const lists = Object.values(readAllCrapsBets(t));
+    return lists.some((bets) => bets.some((b) => b.type === 'come' && b.pick !== undefined)) ? 'contract' : null;
+  }
   const s = readTableState(t);
   const quiet = s === null || s.phase === 'settled' || (s.phase === 'betting' && Object.keys(readAllBets(t, s.round)).length === 0);
   return quiet ? null : 'busy';
+}
+
+/** Whether a craps state's riding bets hold a contract bet: a pass with a
+ *  point on, or a come bet on a number. */
+function contractRides(carry: CrapsCarry): boolean {
+  for (const pid of Object.keys(carry.w)) {
+    for (const b of own(carry.w, pid)) {
+      if ((b.type === 'pass' && carry.p !== 0) || (b.type === 'come' && b.pick !== undefined)) return true;
+    }
+  }
+  return false;
 }
 
 /** Why computed table t can't be switched off now, or null: not while a
@@ -2483,12 +3209,26 @@ function onRefusal(t: string, game: 'craps' | 'roulette', now: number): Computed
  *  one update, and a doc holding part of one isn't whole), so it is a peer's
  *  forgery, and it goes. Waiting for a session that never comes would leave
  *  the table with nobody to run it, the robot standing down for good. */
-function offRefusal(t: string, now: number): ComputedSwitchRefusal | null {
+function offRefusal(t: string, now: number, again = false): ComputedSwitchRefusal | null {
   const gate = switchGate(t, now);
   if (gate) return gate;
   const at = tableOf(t);
   if (!at) return null;
-  return viewOf(at.st, at.res, now).view.phase === 'closing' ? 'busy' : null;
+  const e = viewOf(at.st, at.res, now);
+  if (e.holding !== null) return 'busy';
+  if (at.st.game !== 'craps') return null;
+  // At craps: during the wait for the throw while the holder's page can
+  // still close the roll at its fling (their latest version on it has chips
+  // and isn't a goodbye), so a press from a page whose link lags doesn't
+  // finalise without a roll other pages already show. Once the wait is over,
+  // or with the holder gone, it goes, so a table a gone shooter holds is
+  // still freed. Then contract bets riding warn first: the second press
+  // hands them back with the rest.
+  const view = e.view as ComputedCrapsState;
+  if (view.phase === 'closing' && view.phaseDeadline !== undefined && (view.shooterSlip === 'here' || view.shooterSlip === 'away')) {
+    return 'busy';
+  }
+  return !again && contractRides(at.res.carry as CrapsCarry) ? 'contract' : null;
 }
 
 /**
@@ -2500,17 +3240,20 @@ function offRefusal(t: string, now: number): ComputedSwitchRefusal | null {
  * pages pressing at once open one table), with its first session. Refused
  * while the owner-run table has a round under way, while an earlier build
  * drives the room's tables (it would go on opening owner-run rounds on this
- * one), on a page asleep or not whole, and on a craps table. 'ok' for a
+ * one), and on a page asleep or not whole. At craps also while a point is on
+ * or a come bet sits on a number (contract bets: they can't come down), and
+ * the bets on the felt go back to their players, as a take-down would; its
+ * name is a craps one (`k…`), so every page plays it as craps. 'ok' for a
  * table that is computed already.
  */
-export function switchComputedOn(t: string, game: 'craps' | 'roulette' = 'roulette', now = Date.now()): ComputedSwitchResult {
+export function switchComputedOn(t: string, game: GameName = 'roulette', now = Date.now()): ComputedSwitchResult {
   lookAtClock(now);
   const refused = onRefusal(t, game, now);
   if (refused) return refused;
   if (isComputedTable(t)) return 'ok';
   transactCasino(() => {
     refundAndClear(t, 'local');
-    writeComputedOn(t, computedIncFor(t));
+    writeComputedOn(t, computedIncFor(t, game));
   });
   return 'ok';
 }
@@ -2525,12 +3268,15 @@ export function switchComputedOn(t: string, game: 'craps' | 'roulette' = 'roulet
  * round is under way (a close in, or a result still to show), and on a page
  * asleep or not whole. 'ok' for a table that isn't computed. A switch whose
  * incarnation the doc holds nothing of (a peer's forgery) only goes, marked
- * ended.
+ * ended. At craps (offRefusal) not during the wait for the throw while the
+ * holder can still throw; and while contract bets ride, only on the second
+ * press (`again`): every riding bet goes back, the final checkpoint carrying
+ * none of them.
  */
-export function switchComputedOff(t: string, now = Date.now()): ComputedSwitchResult {
+export function switchComputedOff(t: string, now = Date.now(), again = false): ComputedSwitchResult {
   lookAtClock(now);
   if (!isComputedTable(t)) return 'ok';
-  const refused = offRefusal(t, now);
+  const refused = offRefusal(t, now, again);
   if (refused) return refused;
   const at = tableOf(t);
   if (!at) {
@@ -2581,10 +3327,12 @@ export function computedSwitchState(t: string, game: 'craps' | 'roulette', house
 }
 
 /** Whether an earlier build drives computed table `t` too: an owner-run
- *  round is up on it (that build's lease holder opened it; this build's
- *  sweeps it once its driver has gone, croupier sweepLegacyRound). */
+ *  round (a roll, at craps) is up on it (that build's lease holder opened
+ *  it; this build's sweeps it once its driver has gone, croupier
+ *  sweepLegacyRound). */
 export function computedOldBuildDriving(t: string): boolean {
-  return isComputedTable(t) && readTableState(t) !== null;
+  if (!isComputedTable(t)) return false;
+  return gameOfInc(computedIncOf(t)!) === 'craps' ? readCrapsTableState(t) !== null : readTableState(t) !== null;
 }
 
 // ── 🙋 This page's player at the table ───────────────────────────────────────
@@ -2604,6 +3352,9 @@ export interface ComputedMine {
   /** They put down a later felt than the one the close froze (a version
    *  that crossed the close on its way): the close had the earlier bets. */
   tooLate: boolean;
+  /** At craps: how the roll took their felt (computedCraps RollFate), when
+   *  they had one on it or bets riding. */
+  fate?: RollFate;
 }
 
 function mineIn(st: TableState, res: FoldResult, R: RoundView): ComputedMine {
@@ -2616,8 +3367,8 @@ function mineIn(st: TableState, res: FoldResult, R: RoundView): ComputedMine {
   let later = false;
   if (frozen) {
     for (const key of sc.slips.get(R.r)?.get(me) ?? []) {
-      const s = asSlip(sc.ses?.get(key));
-      if (!s || s.k !== pub || !checkedSlip(st.t, st.inc, key, s)) continue;
+      const s = st.slipOf(sc.ses?.get(key));
+      if (!s || s.k !== pub || !checkedSlip(st.t, st.inc, key, s, st.keyOf)) continue;
       if (s.v > v0 && parseKey(key)?.h !== frozenHash) later = true;
     }
   }
@@ -2625,23 +3376,25 @@ function mineIn(st: TableState, res: FoldResult, R: RoundView): ComputedMine {
   // player's latest with chips on it), or one held back that the close
   // came before. A felt taken down before the close missed nothing.
   const staked = !frozen && (latestOwnSlip(st, sc, R.r, me, pub)?.b.length ?? 0) > 0;
+  const fate = R.craps?.fates.get(me);
   return {
     round: R.r,
     frozen,
     revealed: frozen && R.revealed.includes(me),
     leftOut: !frozen && (frozenHash !== undefined || staked || st.lateFelt === R.r),
     tooLate: frozen && (later || st.lateFelt === R.r),
+    ...(fate !== undefined ? { fate } : {}),
   };
 }
 
 /** This page's player's latest felt of round r in the session: the version
  *  with the highest v (then hash), as the fold reads a felt, of those
  *  checked and signed by this page's key; null for none. */
-function latestOwnSlip(st: TableState, sc: Scan, r: number, me: string, pub: string): SlipRec | null {
-  let best: { s: SlipRec; h: string } | null = null;
+function latestOwnSlip(st: TableState, sc: Scan, r: number, me: string, pub: string): AnySlipRec | null {
+  let best: { s: AnySlipRec; h: string } | null = null;
   for (const key of sc.slips.get(r)?.get(me) ?? []) {
-    const s = asSlip(sc.ses?.get(key));
-    if (!s || s.k !== pub || !checkedSlip(st.t, st.inc, key, s)) continue;
+    const s = st.slipOf(sc.ses?.get(key));
+    if (!s || s.k !== pub || !checkedSlip(st.t, st.inc, key, s, st.keyOf)) continue;
     const h = parseKey(key)!.h;
     if (!best || s.v > best.s.v || (s.v === best.s.v && h > best.h)) best = { s, h };
   }
@@ -2659,6 +3412,37 @@ export function computedMine(t: string, now = Date.now()): ComputedMine | null {
   if (!R) return null;
   if (e.mine === undefined || e.mine.round !== R.r) e.mine = mineIn(at.st, e.res, R);
   return e.mine;
+}
+
+/** 🎲 This page's own fling for roll `round` of computed craps table `t`,
+ *  with the seed it wrote in the throw record (the table session's two
+ *  fling paths call it): the holder's page closes the roll at it, and its
+ *  view offers no fling again for that roll. Never the throw record, which
+ *  anyone can write. */
+export function noteComputedFling(t: string, round: number, seed: number, now = Date.now()): void {
+  lookAtClock(now);
+  const st = tables.get(t);
+  if (!st || st.game !== 'craps' || computedIncOf(t) !== st.inc) return;
+  st.flung = { r: round, at: now, seed };
+}
+
+/** This page's own fling at computed craps table `t` (noteComputedFling),
+ *  or null: its roll and seed. A re-show of the roll before forgets one made
+ *  before it (the view, built here when the table moved), as does a wake. */
+export function computedFlungFor(t: string, now = Date.now()): { r: number; seed: number } | null {
+  lookAtClock(now);
+  const at = tableOf(t, 'craps');
+  if (!at) return null;
+  viewOf(at.st, at.res, now);
+  const f = at.st.flung;
+  return f ? { r: f.r, seed: f.seed } : null;
+}
+
+/** 🎲 How many held changes this page has dropped at computed craps table
+ *  `t` because the roll before changed under them (THE LAST ROLL CHANGED:
+ *  the table's notice, once per change). */
+export function computedUndoneCount(t: string): number {
+  return tables.get(t)?.undone ?? 0;
 }
 
 /** The last round of computed table `t`'s live chain that is decided (its
@@ -2690,6 +3474,10 @@ export function leaveComputedTables(now = Date.now()): void {
   const me = getPlayerId();
   for (const st of [...tables.values()]) {
     if (computedIncOf(st.t) !== st.inc || !isComputedTable(st.t)) continue;
+    if (st.game === 'craps') {
+      leaveCraps(st, me, now);
+      continue;
+    }
     const held = computedFoldOf(st.t)?.felts.get(me);
     // (Nothing waits for a flush now, nor is one held to go later: the page
     // won't tick here again. A felt held back was never on the table.)
@@ -2704,7 +3492,53 @@ export function leaveComputedTables(now = Date.now()): void {
   }
 }
 
+/**
+ * Say goodbye at craps table st: the riding bets can't come down (a pass on
+ * its point, a come bet on a number), and a rider's bets play on whether or
+ * not their page is there, so leaving writes a goodbye (`l: 1`) instead of
+ * an empty felt — the felt as it was before this roll's new chips (they go
+ * back: minPerSpot of the latest felt and the riding bets), or the riding
+ * bets themselves when the latest felt was built on a table that has since
+ * changed; and no stand. Written even when it only rides: the mark is what
+ * lets the window let go of the gone (build), and a close leaves out a
+ * goodbye that only rides. From then on this page writes no slip at the
+ * table (st.left) while its frames run on for the leave's last writes, so it
+ * can't undo its own goodbye. Only over a version this page wrote (another
+ * tab of its player's is still at the table, its seed with it), and not
+ * while a close of the roll is in (it holds what it froze).
+ */
+function leaveCraps(st: TableState, me: string, now: number): void {
+  st.left = true;
+  st.pending = null;
+  if (!tablesAwake(now) || !casinoWhole(st.t) || !computedSettled(st.t)) return;
+  const res = computedFoldOf(st.t);
+  const latest = res?.felts.get(me);
+  const rec = latest?.rec as CrapsSlipRec | undefined;
+  if (!res || !latest || !rec || !st.mine.has(latest.key) || rec.l === 1) return;
+  if (res.tip || res.openCloses.some((c) => c.state !== 'invalid')) return;
+  const carry = res.carry as CrapsCarry;
+  const C = own(carry.w, me);
+  if (rec.b.length === 0 && C.length === 0) return;
+  const basis = basisOf(carry, me);
+  st.lastSlip = null;
+  try {
+    writeSlip(st, res, res.open, rec.o === basis ? minPerSpot(rec.b, C) : C, false, now, { o: basis, l: 1 });
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Back in the room without a new binding (the back-forward cache): this
+ *  page's goodbyes no longer hold, and its slip writers run again (rideDuty
+ *  writes each goodbye again as the felt it was). */
+export function backAtComputedTables(): void {
+  for (const st of tables.values()) st.left = false;
+}
+
 // Best effort on page close: the write may not flush.
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
   window.addEventListener('pagehide', () => leaveComputedTables());
+  window.addEventListener('pageshow', (e) => {
+    if ((e as PageTransitionEvent).persisted) backAtComputedTables();
+  });
 }

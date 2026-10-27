@@ -90,6 +90,16 @@ export const CLOSING_MS = 3_000;
 /** How long the settled result + payouts stay up before the next round opens
  *  (≥ the 4 s local wheel animation, so the number lingers after it stops). */
 export const SHOW_MS = 9_000;
+/** 🎲 A craps table's betting window once the first chip lands (the clock
+ *  arms on a real bet, so a quiet come-out table never throws to an empty
+ *  felt; crapsCroupier.ts, and a computed craps table). */
+export const CRAPS_BET_WINDOW_MS = 16_000;
+/** How long a settled roll + payouts stay up before the next window opens
+ *  (≥ the local dice-tumble animation, so the number lingers after it stops). */
+export const CRAPS_SHOW_MS = 6_000;
+/** 🎲 #226: how long a shooter has to pick the dice up and fling them before
+ *  the stickman throws for them. */
+export const CRAPS_SHOOTER_MS = 20_000;
 /** 🎡 A house member's SPIN lease is honoured this long before another page
  *  (a house member's SPIN, or the robot) may take the round over: the reveal
  *  wait plus a margin. Measured on the taking page's own clock. */

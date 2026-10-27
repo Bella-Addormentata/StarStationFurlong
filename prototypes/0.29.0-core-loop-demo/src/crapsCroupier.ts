@@ -29,10 +29,11 @@
  */
 
 import {
-  closeWhenWhole, RECONNECTING_NOTICE, refundAndClear, TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount,
-  timerOnThisClock,
+  closeWhenWhole, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, RECONNECTING_NOTICE, refundAndClear,
+  TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount, timerOnThisClock,
 } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
+import { hasLocalStand, localStandOf, setLocalStand } from './localStands';
 import {
   casinoDocEpoch,
   casinoWhole,
@@ -60,17 +61,11 @@ import { getCrapsFairnessMode } from './games/diceFairness';
 // at "no more bets" (fairTableSeeds.ts).
 import { freezeCommits, frozenFields, isFairTable, newHouseCommit, roundSettleable } from './fairTableSeeds';
 
-/** Betting window once the first chip lands (the clock arms on a real bet, so a
- *  quiet come-out table never throws to an empty felt). */
-export const CRAPS_BET_WINDOW_MS = 16_000;
+/** The betting window, the show and the shooter's wait (croupier.ts, beside
+ *  roulette's: a computed craps table keeps the same beats). */
+export { CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS };
 /** "No more bets" beat before the dice fly. */
 export const CRAPS_CLOSING_MS = 2_500;
-/** How long the settled roll + payouts stay up before the next window opens
- *  (≥ the local dice-tumble animation, so the number lingers after it stops). */
-export const CRAPS_SHOW_MS = 6_000;
-/** 🎲 #226: how long a shooter has to pick the dice up and fling them before
- *  the stickman throws for them. */
-export const CRAPS_SHOOTER_MS = 20_000;
 /** A seat whose heartbeat has not moved for this long (operator clock) is
  *  gone — the page crashed or lost its connection without clearing it. */
 export const SEAT_STALE_MS = 15_000;
@@ -166,16 +161,21 @@ export function openCrapsBetting(
 const seatSeen = new Map<string, { at: number; seenAt: number; moved: boolean }>();
 let seatSeenEpoch = -1;
 
-/** `table:player` seats THIS page is writing right now (its own focused
- *  table): live by construction, so they count without waiting to see a
- *  second heartbeat. */
-const localSeats = new Set<string>();
-
-/** The focused table UI marks its own seat while it heartbeats it. */
-export function markLocalSeat(tableId: string, playerId: string, on: boolean): void {
-  if (on) localSeats.add(`${tableId}:${playerId}`);
-  else localSeats.delete(`${tableId}:${playerId}`);
+/** The focused table UI marks its own seat while it heartbeats it, with
+ *  the stand it heartbeats (localStands: live by construction, so a seat
+ *  this page writes counts without waiting to see a second heartbeat). Only
+ *  a player stand of the craps table is kept as a stand: a computed craps
+ *  slip carries it (localStandOf), and a role stand, or none, is no place
+ *  to throw from. */
+export function markLocalSeat(tableId: string, playerId: string, on: boolean, stand?: number | null): void {
+  const t = stand === undefined || stand === null ? undefined : FURNITURE_DEFS['craps-table'].stands?.[stand];
+  setLocalStand(tableId, playerId, on, t && !t.role ? stand! : null);
 }
+
+/** The player stand this page's mounted table session stands at, at a
+ *  craps table (markLocalSeat), or undefined: never the doc's seat record,
+ *  which a closed tab leaves behind and anyone can write. */
+export { localStandOf };
 
 /** How long a newly seen seat may wait for its second heartbeat before a
  *  manual ROLL stops waiting for it (a little over one beat). */
@@ -202,7 +202,7 @@ export function seatedPlayers(tableId: string, now = Date.now()): SeatedPlayer[]
     // place in the ring comes from the table's layout, not the stored angle.
     const t = FURNITURE_DEFS['craps-table'].stands?.[seat.stand];
     if (!t || t.role) continue;
-    if (localSeats.has(key) || (seen.moved && now - seen.seenAt < SEAT_STALE_MS)) {
+    if (hasLocalStand(tableId, pid) || (seen.moved && now - seen.seenAt < SEAT_STALE_MS)) {
       out.push({ pid, angle: Math.atan2(t.stand.z, t.stand.x) });
     }
   }
@@ -217,7 +217,7 @@ function seatsUnconfirmed(tableId: string, now: number): boolean {
   for (const pid of Object.keys(readSeats(tableId))) {
     const key = `${tableId}:${pid}`;
     const seen = seatSeen.get(key);
-    if (!seen || seen.moved || localSeats.has(key)) continue;
+    if (!seen || seen.moved || hasLocalStand(tableId, pid)) continue;
     if (now - seen.seenAt < SEAT_CONFIRM_MS && hasLineBet(bets[pid] ?? [])) return true;
   }
   return false;

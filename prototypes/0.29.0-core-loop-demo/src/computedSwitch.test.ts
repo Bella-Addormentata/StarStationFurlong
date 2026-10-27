@@ -246,16 +246,53 @@ describe('switch-on: refused', () => {
     expect(a.table.switchComputedOn(TABLE, 'roulette', T)).toBe('ok');
   });
 
-  it('at craps: never (by the game, and by a craps state up under the id)', async () => {
-    const [a] = await room(['A']);
+  it('at craps: on a quiet come-out, under a craps name; not mid-point, nor with a come bet on a number, a roll closing, a build older than 3, or the other game\'s records', async () => {
+    const [a, b] = await room(['A', 'B']);
     at(a, T0);
-    expect(a.table.switchComputedOn('craps-1', 'craps', T0)).toBe('craps');
+    const come = (t: string, point: number | null, phase: 'betting' | 'closing' | 'settled' = 'settled'): void => {
+      a.casino.writeCrapsTableState(t, {
+        kind: 'craps', phase, round: 1, point, dice: null, result: null, resultAt: 0, payouts: null, ...a.casino.tableOpening(t),
+      });
+    };
+    // Nothing up: it goes, under a craps name.
+    expect(a.table.switchComputedOn('craps-1', 'craps', T0)).toBe('ok');
     expect(a.table.computedSwitchState('craps-1', 'craps', true, T0)).toEqual({ show: false, on: false, can: false });
-    a.casino.writeCrapsTableState('craps-2', {
-      kind: 'craps', phase: 'settled', round: 1, point: null, dice: null, result: null, resultAt: 0, payouts: null,
-    });
+    expect(a.casino.computedIncOf('craps-1')).toMatch(/^k[0-9a-f]{24}$/);
+    // A craps state up under a roulette switch: the other game's.
+    come('craps-2', null);
     expect(a.table.switchComputedOn('craps-2', 'roulette', T0)).toBe('craps');
-    expect(a.casino.isComputedTable('craps-1') || a.casino.isComputedTable('craps-2')).toBe(false);
+    // A point on, a roll closing, a come bet on a number: refused.
+    come('craps-3', 6);
+    expect(a.table.switchComputedOn('craps-3', 'craps', T0)).toBe('contract');
+    expect(a.table.SWITCH_ON_REFUSED.contract).toBe('WAIT FOR A COME-OUT WITH NO COME BETS ON A NUMBER');
+    come('craps-4', null, 'closing');
+    expect(a.table.switchComputedOn('craps-4', 'craps', T0)).toBe('busy');
+    expect(a.table.CRAPS_SWITCH_ON_REFUSED.busy).toBe('FINISH THIS ROLL FIRST');
+    come('craps-5', null, 'betting');
+    at(b, T0);
+    sync(T0, a, b);
+    expect(b.casino.writeMyCrapsBets('craps-5', b.pid, [{ type: 'come', pick: 5, amount: 10 }])).toBe(true);
+    sync(T0, a, b);
+    at(a, T0);
+    expect(a.table.switchComputedOn('craps-5', 'craps', T0)).toBe('contract');
+    // A come bet in the box (not yet on a number) comes back with the rest.
+    expect(b.casino.writeMyCrapsBets('craps-5', b.pid, [{ type: 'come', amount: 10 }, { type: 'field', amount: 5 }])).toBe(true);
+    sync(T0, a, b);
+    at(a, T0);
+    expect(a.table.switchComputedOn('craps-5', 'craps', T0)).toBe('ok');
+    sync(T0, a, b);
+    expect(b.casino.readChips(b.pid)).toBe(1_000);
+    // Under a lease of build 2 (PR 2's): roulette goes, craps waits for 3.
+    a.casino.writeTableOperatorLease({ page: 'other-page', player: a.pid, beat: 1, build: 2 });
+    expect(a.table.switchComputedOn('craps-6', 'craps', T0)).toBe('old-build');
+    expect(a.table.switchComputedOn(OTHER, 'roulette', T0)).toBe('ok');
+    a.casino.writeTableOperatorLease({ page: 'other-page', player: a.pid, beat: 2, build: 3 });
+    expect(a.table.switchComputedOn('craps-6', 'craps', T0)).toBe('ok');
+    // A roulette name at a craps table, and a craps one at a roulette table.
+    expect(a.table.switchComputedOn('craps-7', 'roulette', T0)).toBe('ok');
+    expect(a.table.switchComputedOn('craps-7', 'craps', T0)).toBe('craps');
+    expect(a.table.switchComputedOn('craps-1', 'roulette', T0)).toBe('craps');
+    expect(['craps-2', 'craps-3', 'craps-4'].some((t) => a.casino.isComputedTable(t))).toBe(false);
   });
 });
 
