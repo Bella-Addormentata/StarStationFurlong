@@ -256,7 +256,8 @@ describe('switch-on: refused', () => {
     };
     // Nothing up: it goes, under a craps name.
     expect(a.table.switchComputedOn('craps-1', 'craps', T0)).toBe('ok');
-    expect(a.table.computedSwitchState('craps-1', 'craps', true, T0)).toEqual({ show: false, on: false, can: false });
+    // (Its house sees the switch-off row, with or without the dev flag.)
+    expect(a.table.computedSwitchState('craps-1', 'craps', true, T0)).toEqual({ show: true, on: true, can: true });
     expect(a.casino.computedIncOf('craps-1')).toMatch(/^k[0-9a-f]{24}$/);
     // A craps state up under a roulette switch: the other game's.
     come('craps-2', null);

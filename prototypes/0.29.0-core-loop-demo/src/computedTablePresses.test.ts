@@ -402,7 +402,7 @@ describe("a computed table's ⚙ card", () => {
     legacy.unmount();
   });
 
-  it("shows the house's switch row with the dev flag only, never at craps, nor to a player", () => {
+  it("shows the house's switch row with the dev flag only, at either game, never to a player", () => {
     const legacy = 'roulette-legacy';
     const row = (opts: { house: boolean; t?: string; game?: 'roulette' | 'craps' }): string => {
       const t = atTable(a, opts);
@@ -413,13 +413,17 @@ describe("a computed table's ⚙ card", () => {
     // No flag: no row.
     a.table.setComputedTablesEnabledForTests(false);
     expect(row({ house: true, t: legacy })).not.toContain('computed-');
+    expect(row({ house: true, t: 'craps-1', game: 'craps' })).not.toContain('computed-');
     a.table.setComputedTablesEnabledForTests(true);
     const off = row({ house: true, t: legacy });
     expect(off).toContain("PLAYERS' TABLE · OFF");
     expect(off).toContain('data-act="computed-on"');
     expect(off).toContain('RUN WITHOUT THE OWNER (FRIENDLY)');
     expect(row({ house: false, t: legacy })).not.toContain('computed-');
-    expect(row({ house: true, t: 'craps-1', game: 'craps' })).not.toContain('computed-');
+    const craps = row({ house: true, t: 'craps-1', game: 'craps' });
+    expect(craps).toContain('data-act="computed-on"');
+    expect(craps).toContain('RUN WITHOUT THE OWNER (FRIENDLY)');
+    expect(row({ house: false, t: 'craps-1', game: 'craps' })).not.toContain('computed-');
     switchOn(a);
     at(a, T0);
     const on = row({ house: true });

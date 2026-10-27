@@ -2132,6 +2132,16 @@ const computedTouched = new Set<string>();
  *  again (pinPlayerKeys). */
 let computedKeysMoved = false;
 const NO_COMPUTED_HELD: ReadonlyMap<string, bigint> = new Map();
+/** The page's clock as a transaction began (onComputedTransaction), or null
+ *  outside one: every arrival it brings is stamped with the same time, so a
+ *  throw and a close that came in one update read as having come together. */
+let txNow: number | null = null;
+/** 🎲 When this page first saw each dice throw (`throw:<tableId>` values,
+ *  by table, then `<round>|<by>|<seed>`): a computed craps table plays a
+ *  throw only if it came before the roll's close (computedThrowSeenAt). The
+ *  last THROWS_KEPT per table. */
+let throwSeen = new Map<string, Map<string, number>>();
+const THROWS_KEPT = 8;
 
 /** The incarnation a casinoComputed key is of: `ses:<t>:<inc>:<sid>` (with
  *  its sid) or `sum:<t>:<inc>`, parsed from the right (an incarnation and a
@@ -2517,8 +2527,29 @@ function stampArrivals(c: ComputedInc, keys: Iterable<string>): void {
   let now: number | undefined;
   for (const key of keys) {
     if (c.seen.has(key) || !parseKey(key)) continue;
-    c.seen.set(key, now ??= Date.now());
+    c.seen.set(key, now ??= txNow ?? Date.now());
   }
+}
+
+/** Stamp the dice throw table `tableId`'s `throw:` key holds now, if this
+ *  page hasn't seen it before. */
+function stampThrow(casino: Y.Map<unknown>, tableId: string): void {
+  const v = casino.get(`throw:${tableId}`);
+  if (!isDiceThrow(v)) return;
+  let m = throwSeen.get(tableId);
+  if (!m) throwSeen.set(tableId, m = new Map());
+  const key = `${v.round}|${v.by}|${v.seed}`;
+  if (m.has(key)) return;
+  m.set(key, txNow ?? Date.now());
+  while (m.size > THROWS_KEPT) m.delete(m.keys().next().value as string);
+}
+
+/** 🎲 When this page first saw dice throw `thr` at table `tableId` (its own
+ *  Date.now() as the update that brought it began, the same as a close in
+ *  that update carries: computedSeenAt), or undefined: a throw from before
+ *  this doc was bound, or from before a computed table was up. */
+export function computedThrowSeenAt(tableId: string, thr: DiceThrow): number | undefined {
+  return throwSeen.get(tableId)?.get(`${thr.round}|${thr.by}|${thr.seed}`);
 }
 
 /** What a key the live session holds holds, as the fold reads it. Yjs keeps
@@ -2642,6 +2673,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   computedKeysMoved = false;
   verifyQueued = false;
   verifySpent = 0;
+  throwSeen = new Map();
   for (const key of map.keys()) {
     const at = computedKeyParts(key);
     if (at) trackComputed(at.t, at.inc);
@@ -2658,7 +2690,18 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   });
 }
 
+/** Count what a transaction changed of the computed tables, every arrival
+ *  it brought stamped with one time (txNow). */
 function onComputedTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<unknown>): void {
+  txNow = Date.now();
+  try {
+    countTransaction(tr, map, casino);
+  } finally {
+    txNow = null;
+  }
+}
+
+function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<unknown>): void {
   verifySpent = 0;
   const dirty = new Set<ComputedInc>();
   const whole = new Set<ComputedInc>();
@@ -2722,6 +2765,8 @@ function onComputedTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y
       } else if (key.startsWith('gone:')) {
         const c = computedIncs.get(key.slice('gone:'.length));
         if (c) dirty.add(c);
+      } else if (key.startsWith('throw:')) {
+        stampThrow(casino, key.slice('throw:'.length));
       }
     }
   }

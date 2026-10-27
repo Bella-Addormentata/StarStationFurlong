@@ -119,6 +119,10 @@ export interface CasinoTableVisualHandle {
   diceThrow(from: FeltPoint, dir: FeltPoint, power: number, seed: number): void;
   /** The settled roll: the flying dice come to rest showing these faces. */
   diceLand(values: [number, number]): void;
+  /** A throw that will get no faces (a void roll, or one the table took back
+   *  to betting): the dice stop where they are, and the next diceRestAt
+   *  slides them home. */
+  diceCancel(): void;
   /** 'rest' | 'held' | 'flying' (no faces yet) | 'settling'. */
   diceState(): 'rest' | 'held' | 'flying' | 'settling';
   // 🎡 roulette
@@ -1632,6 +1636,10 @@ class TableHandle implements CasinoTableVisualHandle {
 
   diceLand(values: [number, number]): void {
     this.dice?.land(values);
+  }
+
+  diceCancel(): void {
+    this.dice?.cancel();
   }
 
   diceState(): 'rest' | 'held' | 'flying' | 'settling' {

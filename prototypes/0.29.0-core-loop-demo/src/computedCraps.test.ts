@@ -231,6 +231,7 @@ describe('merged felts pay what per-chip felts pay', () => {
     const rand = rng(29);
     let cases = 0;
     const seen = new Set<string>();
+    const differ: unknown[] = [];
     for (let i = 0; i < 400; i++) {
       const chips = randomChips(rand, 18);
       // Now and then odds far over the cap, or odds with no flat bet at all.
@@ -242,12 +243,18 @@ describe('merged felts pay what per-chip felts pay', () => {
         for (const [d1, d2] of ALL_DICE) {
           const a = resolveCrapsRound({ bettor: chips }, d1, d2, point);
           const b = resolveCrapsRound({ bettor: merged }, d1, d2, point);
-          expect(b.payouts.bettor ?? 0).toBe(a.payouts.bettor ?? 0);
-          expect(canonFelt(b.remaining.bettor)).toEqual(canonFelt(a.remaining.bettor));
+          // (Compared by hand and checked once at the end: 100,800 expects
+          // take most of vitest's 5 s.)
+          const left = JSON.stringify(canonFelt(a.remaining.bettor));
+          const right = JSON.stringify(canonFelt(b.remaining.bettor));
+          if ((b.payouts.bettor ?? 0) !== (a.payouts.bettor ?? 0) || right !== left) {
+            differ.push({ i, point, dice: [d1, d2], paid: [a.payouts.bettor ?? 0, b.payouts.bettor ?? 0], left, right });
+          }
           cases++;
         }
       }
     }
+    expect(differ.slice(0, 3)).toEqual([]);
     expect([...seen].sort()).toEqual([...TYPES].sort());
     expect(TYPES).toHaveLength(19);
     expect(cases).toBe(400 * 7 * 36);

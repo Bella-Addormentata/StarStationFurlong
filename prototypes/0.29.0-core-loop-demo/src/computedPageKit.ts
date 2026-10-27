@@ -341,6 +341,22 @@ export function rigSplit(pages: Page[], r: number, both: number, w: Page, alone:
   throw new Error(`rigSplit: no seeds for ${both} / ${alone}`);
 }
 
+/** Queue roll r's seeds on `pages` so that all of theirs and the seed of `w`
+ *  alone throw the same dice, summing to `sum`: a forfeit counting w only
+ *  decides the roll again on the same faces. */
+export function rigSame(pages: Page[], r: number, sum: number, w: Page, ctx: FoldCtx = CRAPS_CTX): void {
+  const table = seedTable(ctx);
+  for (let n = 0; n < 100_000; n++) {
+    const seeds = pages.map((p) => tagSeed(`${p.name}:${r}:same:${n}`));
+    const all = diceOf(table, r, seeds);
+    const alone = diceOf(table, r, [seeds[pages.indexOf(w)]]);
+    if (all[0] + all[1] !== sum || all[0] !== alone[0] || all[1] !== alone[1]) continue;
+    pages.forEach((p, i) => p.seeds.push(seeds[i]));
+    return;
+  }
+  throw new Error(`rigSame: no seeds for ${sum}`);
+}
+
 /** Pages `names` at craps stands `stands` (null: off the table), synced,
  *  bet the pass line on roll 1 at T (`amounts`: 10, 5, 20, 15 by default)
  *  and roll a 6: the point is on, every pass riding on it, the dice with
